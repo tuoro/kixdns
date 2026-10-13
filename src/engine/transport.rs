@@ -1533,7 +1533,7 @@ impl DohClient {
         match Self::send_once(&state, packet, &url, host, timeout_dur).await {
             Ok(bytes) => {
                 state.consecutive_errors.store(0, Ordering::Release);
-                Ok(bytes)
+                Ok(restore_query_id(packet, bytes))
             }
             Err(err) if is_transport_error(&err) => {
                 // TRANSPARENT RETRY: DNS queries are semantically idempotent, so a
@@ -1553,7 +1553,9 @@ impl DohClient {
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                Self::send_once(&state, packet, &url, host, remaining).await
+                Self::send_once(&state, packet, &url, host, remaining)
+                    .await
+                    .map(|bytes| restore_query_id(packet, bytes))
             }
             Err(e) => Err(e),
         }
@@ -1674,6 +1676,23 @@ impl DohClient {
             state.consecutive_errors.store(0, Ordering::Release);
         }
     }
+}
+
+/// Puts the query's message ID back on a DoH response. HTTP pairs each request with its
+/// response, so the ID carries no meaning over DoH (RFC 8484 §4.1) and some servers answer
+/// with 0 whatever was sent. Every other transport restores the original ID before the
+/// response reaches the engine; without this the client would get a reply whose ID does
+/// not match its query and discard it.
+/// 把查询原来的消息 ID 换回 DoH 响应。HTTP 已经把请求和响应一一配对，DoH 上的 ID 没有
+/// 意义（RFC 8484 §4.1），有的服务端不管收到什么都回 0。其他传输在响应交给引擎之前都会
+/// 恢复原 ID；不在这里换回，客户端收到的响应 ID 对不上自己的查询，会直接丢弃。
+fn restore_query_id(packet: &[u8], response: Bytes) -> Bytes {
+    if packet.len() < 2 || response.len() < 2 || response[..2] == packet[..2] {
+        return response;
+    }
+    let mut restored = BytesMut::from(response.as_ref());
+    restored[..2].copy_from_slice(&packet[..2]);
+    restored.freeze()
 }
 
 /// A transport-level error is anything that is NOT an HTTP status error: timeouts,
@@ -4422,6 +4441,153 @@ mod tests {
             permit_b.max_permits(),
             2,
             "Permit manager should match pool size for upstream B"
+        );
+    }
+
+    /// 一个不管收到什么 ID 都回 0 的 DoH 上游（RFC 8484 允许这样做）：把查询原样回过去，
+    /// ID 写成 0、标上 QR。返回监听地址和它收到的每个查询的 ID。
+    /// A DoH upstream that answers with ID 0 whatever it receives (RFC 8484 allows it): it
+    /// echoes the query with the ID set to 0 and QR set. Returns its address and the ID of
+    /// every query it received. With `drop_first` the first request is read and its
+    /// connection closed without an answer, which sends the client down its retry.
+    /// `drop_first` 时第一个请求读完就断开、不回答，让客户端走重试那条路。
+    async fn spawn_zero_id_doh_upstream(
+        drop_first: bool,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<u16>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind DoH stub");
+        let addr = listener.local_addr().expect("DoH stub address");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let dropped = Arc::new(AtomicBool::new(!drop_first));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let record = Arc::clone(&record);
+                let dropped = Arc::clone(&dropped);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    // 一条连接上可以连着来几个请求（keep-alive） / Several requests may share one connection (keep-alive)
+                    loop {
+                        let header_end = loop {
+                            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break at + 4;
+                            }
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while buf.len() < header_end + length {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let mut reply = buf[header_end..header_end + length].to_vec();
+                        buf.drain(..header_end + length);
+                        if !dropped.swap(true, Ordering::SeqCst) {
+                            return;
+                        }
+                        record
+                            .lock()
+                            .unwrap()
+                            .push(u16::from_be_bytes([reply[0], reply[1]]));
+                        reply[0] = 0;
+                        reply[1] = 0;
+                        reply[2] |= 0x80;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\n\r\n",
+                            reply.len()
+                        );
+                        if socket.write_all(head.as_bytes()).await.is_err()
+                            || socket.write_all(&reply).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    /// 上游 DoH 回 ID 0 时，DoH 客户端交回去的仍是查询自己的 ID，和其他传输一样。直接
+    /// 转发、回答后跳转再转发、后台刷新都经过这里；以前这里把 0 原样交出，客户端把响应
+    /// 当成别人的丢掉，等到超时重试才从缓存拿到答案。
+    /// When a DoH upstream answers with ID 0 the DoH client still hands back the query's
+    /// own ID, like every other transport. Direct forwards, forwards after a response jump
+    /// and background refreshes all go through here; it used to pass the 0 on, and the
+    /// client discarded the reply as someone else's until a retry was answered from cache.
+    #[tokio::test]
+    async fn doh_upstream_answering_with_id_zero_keeps_the_query_id() {
+        // reqwest + rustls 要有进程级的加密实现，明文 http 也一样
+        // reqwest + rustls needs a process-level crypto provider, plain http included
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        for drop_first in [false, true] {
+            let (addr, seen) = spawn_zero_id_doh_upstream(drop_first).await;
+            let upstream = format!("http://{addr}/dns-query");
+            let client = DohClient::new(8, 0).expect("build doh client");
+            for id in [0xBEEF_u16, 0xCAFE] {
+                let mut query = vec![0u8; 12];
+                query[..2].copy_from_slice(&id.to_be_bytes());
+                query[2] = 0x01; // RD
+                query[5] = 1; // QDCOUNT
+                query.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+                let response = timeout(
+                    Duration::from_secs(10),
+                    client.send(&query, &upstream, Duration::from_secs(5)),
+                )
+                .await
+                .expect("no hang")
+                .expect("doh answer");
+
+                assert_eq!(
+                    &response[..2],
+                    &id.to_be_bytes(),
+                    "the query's own ID comes back"
+                );
+                assert_eq!(response[2] & 0x80, 0x80, "the rest is the server's reply");
+                assert_eq!(&response[12..], &query[12..], "the question is untouched");
+            }
+            // 第一个请求被断开时，重试那一次也是带着自己的 ID 出去、换回来的
+            // When the first request was cut off, the retry also left with its own ID and got it back
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![0xBEEF, 0xCAFE],
+                "queries leave with their own IDs (drop_first = {drop_first})"
+            );
+        }
+    }
+
+    #[test]
+    fn doh_response_gets_the_query_id_back() {
+        let query = [0x12, 0x34, 0x01, 0x00];
+        // 服务端回 0：换回查询的 ID，其余字节不动 / The server answered 0: the query's ID goes back, the rest is untouched
+        let restored =
+            restore_query_id(&query, Bytes::from_static(&[0x00, 0x00, 0x81, 0x80, 0x00]));
+        assert_eq!(restored.as_ref(), &[0x12, 0x34, 0x81, 0x80, 0x00]);
+        // 已经一致：原样返回，不复制 / Already matching: returned as is, not copied
+        let echoed = Bytes::from_static(&[0x12, 0x34, 0x81, 0x80]);
+        let pointer = echoed.as_ptr();
+        assert_eq!(restore_query_id(&query, echoed).as_ptr(), pointer);
+        // 太短的包没有 ID 可换 / A packet too short to carry an ID is left alone
+        assert_eq!(
+            restore_query_id(&query, Bytes::from_static(&[0x00])).as_ref(),
+            &[0x00]
+        );
+        assert_eq!(
+            restore_query_id(&[0x12], Bytes::from_static(&[0x00, 0x00])).as_ref(),
+            &[0x00, 0x00]
         );
     }
 }
