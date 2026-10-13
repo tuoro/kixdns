@@ -48,6 +48,40 @@ impl TxtMatchMode {
 }
 
 // ============================================================================
+// Domain Suffix / 域名后缀
+// ============================================================================
+
+/// 域名后缀按点分段比较：`example.com` 命中它本身和每个子域名，`.example.com` 只命中子域名，
+/// `notexample.com` 两种都不命中。请求名在解析时已转小写、不带结尾的点，配置值在加载时已转小写。
+/// 规则、Pipeline 入口和响应阶段的 `request_domain_suffix` 都用这一个比较，按索引查到的候选和逐条检查的规则结果一致。
+///
+/// Domain suffixes compare label by label: `example.com` matches itself and every subdomain,
+/// `.example.com` subdomains only, and `notexample.com` matches neither. The query name is lowercased
+/// without a trailing dot when parsed, and the configured value is lowercased when loaded. Rules,
+/// pipeline selectors and the response-phase `request_domain_suffix` all use this one comparison, so a
+/// rule found through an index and a rule checked one by one agree.
+#[inline]
+pub(crate) fn domain_suffix_matches(qname: &str, suffix: &str) -> bool {
+    if suffix.is_empty() || suffix.starts_with('.') {
+        return qname.ends_with(suffix);
+    }
+    qname
+        .strip_suffix(suffix)
+        .is_some_and(|head| head.is_empty() || head.ends_with('.'))
+}
+
+/// 后缀索引的键：查找时从整个请求名开始，每次去掉最左边一段，所以键里不带开头的点。
+/// 带点的值（只命中子域名）同样能被查到，是否命中本身交给 [`domain_suffix_matches`]。
+///
+/// The suffix index key. A lookup starts from the whole query name and drops the leftmost label each
+/// step, so a key carries no leading dot. A dotted value (subdomains only) is found the same way, and
+/// [`domain_suffix_matches`] then decides whether the name itself counts.
+#[inline]
+pub(crate) fn domain_suffix_index_key(suffix: &str) -> &str {
+    suffix.strip_prefix('.').unwrap_or(suffix)
+}
+
+// ============================================================================
 // Matcher Helper Functions / 匹配器辅助函数
 // ============================================================================
 
@@ -215,6 +249,22 @@ pub struct RuntimePipeline {
     pub ecs: Option<crate::config::EcsMode>,
     /// Pipeline 内是否有 action 使用了 ECS 配置 / Whether any action in this pipeline uses ECS config
     pub uses_ecs: bool,
+    /// 这个 pipeline 的应答会不会因「谁在问」而不同：请求阶段有按客户端 IP、它的 GeoIP 国家或
+    /// 私有地址、请求带不带 EDNS 判断的规则，或者有转发按客户端地址带 ECS 子网，而 pipeline 级的
+    /// `ecs` 并不按客户端子网区分缓存。是的话，它给一个请求的应答，不一定是同一个问题换一个请求方
+    /// 时的应答。
+    /// Whether this pipeline's answer can differ by who is asking: a request rule matches
+    /// on the client IP, its GeoIP country or private range, or EDNS presence, or a forward
+    /// sends an ECS subnet taken from the client while the pipeline-level `ecs` does not key
+    /// the cache by the client's subnet. If so, the answer it gave one request is not
+    /// necessarily its answer to another request with the same question.
+    pub depends_on_requester: bool,
+    /// 请求阶段有没有按请求带不带 EDNS 判断的规则。后台刷新重放的请求不带 EDNS，
+    /// 经过这样的 pipeline 的路线，刷新时不一定走得一样。
+    /// Whether any request rule matches on EDNS presence. A background refresh replays
+    /// the query without EDNS, so a route through such a pipeline may not repeat when
+    /// the answer is refreshed.
+    pub matches_edns: bool,
     // Indices for O(1) lookup
     // 完全域名匹配索引（最高优先级）/ Exact domain match index (highest priority)
     pub domain_exact_index: FxHashMap<Arc<str>, Vec<usize>>,
@@ -359,6 +409,20 @@ pub struct RuntimeResponseMatcherWithOp {
 }
 
 impl RuntimePipelineConfig {
+    /// pipeline 的选择有没有按请求带不带 EDNS 判断。后台刷新重放的请求不带 EDNS，可能选到另一个 pipeline。
+    /// Whether pipeline selection matches on EDNS presence. A background refresh replays the
+    /// query without EDNS and may select another pipeline.
+    pub(crate) fn selection_matches_edns(&self) -> bool {
+        self.pipeline_select.iter().any(|rule| {
+            rule.matchers.iter().any(|m| {
+                matches!(
+                    m.matcher,
+                    RuntimePipelineSelectorMatcher::EdnsPresent { .. }
+                )
+            })
+        })
+    }
+
     pub fn from_config(cfg: PipelineConfig) -> anyhow::Result<Self> {
         // Validate cache_capacity configuration
         if cfg.settings.cache_capacity == 0 {
@@ -510,11 +574,14 @@ impl RuntimePipelineConfig {
                                 indexed = true;
                             }
                             RuntimeMatcher::DomainSuffix { value } => {
-                                domain_suffix_index
-                                    .entry(value.clone())
-                                    .or_default()
-                                    .push(idx);
-                                indexed = true;
+                                let key = domain_suffix_index_key(value);
+                                if !key.is_empty() {
+                                    domain_suffix_index
+                                        .entry(Arc::from(key))
+                                        .or_default()
+                                        .push(idx);
+                                    indexed = true;
+                                }
                             }
                             RuntimeMatcher::DomainRegex { .. }
                             | RuntimeMatcher::ClientIp { .. }
@@ -600,12 +667,56 @@ impl RuntimePipelineConfig {
                 );
             }
 
+            let request_matchers = || rules.iter().flat_map(|rule| &rule.matchers);
+            // 转发按客户端地址带 ECS 子网，缓存键却不按同样细的客户端子网区分：pipeline 级 `ecs` 不是
+            // from_client_ip，或者它的前缀比转发的短（就是上面警告的那类配置）
+            // A forward sends an ECS subnet taken from the client while the cache key does not
+            // carry the client's subnet as finely: the pipeline-level `ecs` is not from_client_ip,
+            // or its prefix is shorter than the forward's (the kind of configuration warned about above)
+            let keyed_prefixes = match p.ecs {
+                Some(crate::config::EcsMode::FromClientIp {
+                    prefix_v4,
+                    prefix_v6,
+                }) => Some((prefix_v4, prefix_v6)),
+                _ => None,
+            };
+            let forwards_client_subnet =
+                rules
+                    .iter()
+                    .flat_map(|rule| &rule.actions)
+                    .any(|action| match action {
+                        crate::config::Action::Forward {
+                            ecs:
+                                Some(crate::config::EcsMode::FromClientIp {
+                                    prefix_v4,
+                                    prefix_v6,
+                                }),
+                            ..
+                        } => keyed_prefixes.is_none_or(|(key_v4, key_v6)| {
+                            key_v4 < *prefix_v4 || key_v6 < *prefix_v6
+                        }),
+                        _ => false,
+                    });
+            let depends_on_requester = forwards_client_subnet
+                || request_matchers().any(|m| {
+                    matches!(
+                        m.matcher,
+                        RuntimeMatcher::ClientIp { .. }
+                            | RuntimeMatcher::GeoipCountry { .. }
+                            | RuntimeMatcher::GeoipPrivate { .. }
+                            | RuntimeMatcher::EdnsPresent { .. }
+                    )
+                });
+            let matches_edns =
+                request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::EdnsPresent { .. }));
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
                 uses_client_ip: pipeline_uses_client_ip,
                 ecs: p.ecs.clone(),
                 uses_ecs: pipeline_uses_ecs,
+                depends_on_requester,
+                matches_edns,
                 domain_exact_index, // 添加完全匹配索引 / Add exact match index
                 domain_suffix_index,
                 query_type_index, // 添加 query_type 索引 / Add query_type index
@@ -885,7 +996,7 @@ impl RuntimeMatcher {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
                 qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
@@ -939,7 +1050,7 @@ impl RuntimeMatcher {
                 // 完全匹配，大小写不敏感 / Exact match, case insensitive
                 qname.eq_ignore_ascii_case(value)
             }
-            RuntimeMatcher::DomainSuffix { value } => qname.ends_with(value.as_ref()),
+            RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
@@ -1112,7 +1223,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
-                qname.ends_with(value.as_ref())
+                domain_suffix_matches(qname, value)
             }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
@@ -1164,7 +1275,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
-                qname.ends_with(value.as_ref())
+                domain_suffix_matches(qname, value)
             }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
@@ -1408,7 +1519,7 @@ impl RuntimeResponseMatcher {
         match self {
             RuntimeResponseMatcher::UpstreamEquals { value } => upstream == value.as_ref(),
             RuntimeResponseMatcher::RequestDomainSuffix { value } => {
-                qname.ends_with(value.as_ref())
+                domain_suffix_matches(qname, value)
             }
             RuntimeResponseMatcher::RequestDomainRegex { regex } => regex.is_match(qname),
             RuntimeResponseMatcher::ResponseUpstreamIp { nets } => try_parse_upstream_ip(upstream)
@@ -1941,5 +2052,83 @@ mod tests {
 
         drop(guard);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 域名后缀按点分段：不带点的值命中它本身和子域名，带点的值只命中子域名，尾巴相同的别的域名都不算。
+    /// Domain suffixes compare by label: a plain value matches itself and subdomains, a dotted one subdomains
+    /// only, and another name that merely ends in the same letters matches neither.
+    #[test]
+    fn domain_suffix_matches_by_label() {
+        let cases = [
+            ("example.com", "example.com", true),
+            ("www.example.com", "example.com", true),
+            ("a.b.example.com", "example.com", true),
+            ("notexample.com", "example.com", false),
+            ("example.com.cn", "example.com", false),
+            ("example.com", ".example.com", false),
+            ("www.example.com", ".example.com", true),
+            ("notexample.com", ".example.com", false),
+            ("cn", "cn", true),
+            ("example.cn", "cn", true),
+            ("examplecn", "cn", false),
+            ("anything.test", "", true),
+        ];
+        for (qname, suffix, expected) in cases {
+            assert_eq!(
+                domain_suffix_matches(qname, suffix),
+                expected,
+                "{qname} against {suffix:?}"
+            );
+        }
+    }
+
+    /// 两种写法进后缀索引时用同一个键：查找是按点从整名往上走的，带开头的点就永远查不到。
+    /// Both spellings enter the suffix index under one key: lookups walk up the name by label, so a key with
+    /// a leading dot would never be found.
+    #[test]
+    fn domain_suffix_index_keys_drop_the_leading_dot() {
+        assert_eq!(domain_suffix_index_key(".example.com"), "example.com");
+        assert_eq!(domain_suffix_index_key("example.com"), "example.com");
+        let cfg: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "pipelines": [{
+                "id": "main",
+                "rules": [
+                    { "name": "dotted", "matchers": [{ "type": "domain_suffix", "value": ".dotted.test" }], "actions": [{ "type": "deny" }] },
+                    { "name": "plain", "matchers": [{ "type": "domain_suffix", "value": "Plain.Test" }], "actions": [{ "type": "deny" }] }
+                ]
+            }]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let index = &runtime.pipelines[0].domain_suffix_index;
+        assert_eq!(index.get("dotted.test").map(Vec::as_slice), Some(&[0][..]));
+        assert_eq!(index.get("plain.test").map(Vec::as_slice), Some(&[1][..]));
+        assert!(!index.contains_key(".dotted.test"));
+    }
+
+    /// 响应阶段的 request_domain_suffix 和请求阶段同一个比较。
+    /// The response-phase request_domain_suffix uses the same comparison as the request phase.
+    #[test]
+    fn response_request_domain_suffix_matches_by_label() {
+        let message = Message::new(0, MessageType::Response, OpCode::Query);
+        let check = |value: &str, qname: &str| {
+            RuntimeResponseMatcher::RequestDomainSuffix {
+                value: Arc::from(value),
+            }
+            .matches(
+                "udp:test",
+                qname,
+                RecordType::A,
+                DNSClass::IN,
+                &message,
+                None,
+                None,
+            )
+        };
+        assert!(check("svc.test", "svc.test"));
+        assert!(check("svc.test", "a.svc.test"));
+        assert!(!check("svc.test", "notsvc.test"));
+        assert!(!check(".svc.test", "svc.test"));
+        assert!(check(".svc.test", "a.svc.test"));
     }
 }
