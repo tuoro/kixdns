@@ -1,0 +1,324 @@
+# 面板用内核：推到 panel 就检查、构建并按日期版本发布；往 panel 的 PR 只检查和构建。
+# Kernel for the KixDNS Panel: a push to `panel` is checked, built and released under a
+# date version; a pull request into `panel` is only checked and built.
+name: Panel kernel
+
+on:
+  push:
+    branches: [panel]
+  pull_request:
+    branches: [panel]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 发布一次只跑一个，推得快时只发最新的那次；PR 上新的提交取消旧的检查。
+# One release run at a time, so rapid pushes release only the newest; on a pull request a
+# new commit cancels the older checks.
+concurrency:
+  group: panel-kernel-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_TOOLCHAIN: "1.97.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Install dependency auditor
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: Cache build
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Tests
+        run: |
+          cargo test --locked --lib
+          cargo test --locked --bin kixdns
+          cargo test --locked --test doh_integration
+          cargo test --locked --test response_log
+          cargo test --locked --test observer_api
+
+      # 漏洞、不健全、已撤回挡住发布；无人维护和通知只报告。
+      # Vulnerabilities, unsound and yanked crates block a release; unmaintained and notices are only reported.
+      - name: Audit dependencies
+        run: cargo audit --deny unsound --deny yanked
+
+      - name: Runtime contract smoke test
+        run: |
+          cargo build --locked
+          python3 panel/dns_smoke.py target/debug/kixdns
+
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      base: ${{ steps.pick.outputs.base }}
+      publish: ${{ steps.pick.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # 版本是发布那天的 UTC 日期，同一天已经有了就依次加 .2、.3。只发布 panel 的最新提交，
+      # 同一个提交只发一次：重跑旧的运行、从别的分支手动触发都只检查和构建，不发布。
+      # The version is the UTC date of the release, with .2, .3 and so on when that day
+      # already has one. Only the tip of panel is released, and each commit once: re-running
+      # an old run or dispatching from another branch only checks and builds.
+      - name: Pick the date version
+        id: pick
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          base="$(git merge-base HEAD origin/main)"
+          day="$(date -u +%Y.%m.%d)"
+          tags="$(git tag -l)"
+          version="${day}"
+          n=1
+          while grep -qxF "${version}" <<<"${tags}"; do
+            n=$((n + 1))
+            version="${day}.${n}"
+          done
+          publish=false
+          if [[ "${EVENT}" != "pull_request" && "${GITHUB_REF}" == "refs/heads/panel" ]]; then
+            tip="$(git rev-parse origin/panel)"
+            released="$(git tag --points-at "${GITHUB_SHA}" | grep -E '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' || true)"
+            if [[ "${GITHUB_SHA}" != "${tip}" ]]; then
+              echo "::notice::${GITHUB_SHA} 已经不是 panel 的最新提交（${tip}），这次不发布"
+            elif [[ -n "${released}" ]]; then
+              echo "::notice::${GITHUB_SHA} 已经发布为 ${released}，这次不发布"
+            else
+              publish=true
+            fi
+          fi
+          {
+            echo "version=${version}"
+            echo "base=${base}"
+            echo "publish=${publish}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "Version: ${version}; base: ${base}; publish: ${publish}"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [verify, version]
+    runs-on: ${{ matrix.runner }}
+    # 在 Ubuntu 22.04 里构建，GLIBC 不超过 2.35，和面板以前发的内核一样能在老系统上跑。
+    # Built on Ubuntu 22.04 so GLIBC stays at or below 2.35, running on the same older
+    # systems as the kernels the panel used to ship.
+    container:
+      image: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      GLIBC_BASELINE: "2.35"
+      VERSION: ${{ needs.version.outputs.version }}
+      BASE_COMMIT: ${{ needs.version.outputs.base }}
+      PUBLISH: ${{ needs.version.outputs.publish }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils build-essential ca-certificates cmake curl git jq perl pkg-config python3 zip
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache build
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      # 编译进健康信息的身份：基于的 fork main 提交总是写；日期版本和提交只在真要发布时写，
+      # PR 和不发布的构建报 null，不冒充一个版本。
+      # The identity compiled into health: the fork main commit it is based on, always; the
+      # date version and commit only when this build is released, so PR and unreleased
+      # builds report null instead of posing as a version.
+      - name: Build release binary
+        run: |
+          export KIXDNS_UPSTREAM_COMMIT="${BASE_COMMIT}"
+          if [[ "${PUBLISH}" == "true" ]]; then
+            export KIXDNS_RELEASE_VERSION="${VERSION}"
+            export KIXDNS_RELEASE_COMMIT="${GITHUB_SHA}"
+          fi
+          cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Verify GLIBC baseline
+        run: bash panel/verify-glibc-baseline.sh "target/${{ matrix.target }}/release/kixdns" "${GLIBC_BASELINE}"
+
+      - name: Package
+        run: |
+          protocol="$(sed -nE 's/^const PROTOCOL_VERSION: u8 = ([0-9]+);$/\1/p' src/panel.rs)"
+          [[ "${protocol}" =~ ^[0-9]+$ ]] || {
+            echo "src/panel.rs 里找不到 PROTOCOL_VERSION" >&2
+            exit 1
+          }
+          jq -e '
+            .schema_version == 1 and
+            (.config_capabilities | type == "array") and
+            ([.config_capabilities[] | type == "string" and test("^[a-z][a-z0-9_]{0,63}$")] | all) and
+            ((.config_capabilities | unique | length) == (.config_capabilities | length))
+          ' panel/capabilities.json >/dev/null
+          name="kixdns-${VERSION}-linux-${{ matrix.arch }}"
+          dir="dist/${name}"
+          install -Dm755 "target/${{ matrix.target }}/release/kixdns" "${dir}/kixdns"
+          cp panel/capabilities.json "${dir}/KIXDNS_CAPABILITIES.json"
+          jq -n \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg version "${VERSION}" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg base "${BASE_COMMIT}" \
+            --arg arch "${{ matrix.arch }}" \
+            --argjson protocol "${protocol}" \
+            '{schema_version: 1, repository: $repository, version: $version, commit: $commit, base_commit: $base, arch: $arch, control_protocol: $protocol}' \
+            > "${dir}/KIXDNS_SOURCE.json"
+          (cd "${dir}" && sha256sum kixdns KIXDNS_CAPABILITIES.json KIXDNS_SOURCE.json > SHA256SUMS)
+          (cd "${dir}" && zip -X -q "../${name}.zip" kixdns KIXDNS_CAPABILITIES.json KIXDNS_SOURCE.json SHA256SUMS)
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kernel-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Release
+    if: needs.version.outputs.publish == 'true'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BASE_COMMIT: ${{ needs.version.outputs.base }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: kernel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Write manifest and notes
+        run: |
+          protocol="$(sed -nE 's/^const PROTOCOL_VERSION: u8 = ([0-9]+);$/\1/p' src/panel.rs)"
+          assets='{}'
+          for arch in x86_64 arm64; do
+            file="dist/kixdns-${VERSION}-linux-${arch}.zip"
+            [[ -f "${file}" ]] || {
+              echo "缺少 ${file}" >&2
+              exit 1
+            }
+            assets="$(jq \
+              --arg arch "${arch}" \
+              --arg name "$(basename "${file}")" \
+              --argjson size "$(stat -c %s "${file}")" \
+              --arg sha256 "$(sha256sum "${file}" | cut -d ' ' -f1)" \
+              '. + {($arch): {name: $name, size: $size, sha256: $sha256}}' <<<"${assets}")"
+          done
+          jq -n \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg version "${VERSION}" \
+            --arg commit "${GITHUB_SHA}" \
+            --arg base "${BASE_COMMIT}" \
+            --argjson protocol "${protocol}" \
+            --slurpfile capabilities panel/capabilities.json \
+            --argjson assets "${assets}" \
+            '{schema_version: 1, repository: $repository, version: $version, commit: $commit,
+              base_commit: $base, control_protocol: $protocol,
+              config_capabilities: $capabilities[0].config_capabilities, assets: $assets}' > dist/manifest.json
+
+          # 上一个已发布的版本到这一版之间带进来的提交；第一个版本列出 panel 相对 main 多出的提交。
+          # 只认已发布的 Release：没发出去的草稿或孤立标签不算上一版
+          # Commits brought in since the previous published version; the first version lists what
+          # panel adds over main. Only published releases count: a leftover draft or orphan tag
+          # is not a previous version
+          previous="$(gh release list --repo "${GITHUB_REPOSITORY}" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""')"
+          if [[ -n "${previous}" ]] && ! git merge-base --is-ancestor "${previous}" HEAD; then
+            previous=""
+          fi
+          base="${BASE_COMMIT}"
+          {
+            echo "KixDNS 面板用内核 ${VERSION}。"
+            echo
+            echo "- 提交：\`${GITHUB_SHA}\`"
+            echo "- 基于 fork main：\`${base}\`"
+            echo "- 控制协议版本：${protocol}"
+            echo
+            if [[ -n "${previous}" ]]; then
+              echo "## 相对 ${previous} 带进的提交"
+              range="${previous}..HEAD"
+            else
+              echo "## panel 相对 main 多出的提交"
+              range="${base}..HEAD"
+            fi
+            echo
+            git log --no-merges --format='- %s（`%h`）' "${range}" | head -n 100
+            echo
+            echo "## 文件"
+            echo
+            echo "| 文件 | 大小 | SHA-256 |"
+            echo "| --- | --- | --- |"
+            jq -r '.assets[] | "| `\(.name)` | \(.size) | `\(.sha256)` |"' dist/manifest.json
+          } > dist/notes.md
+          cat dist/notes.md
+
+      - name: Publish release
+        run: |
+          gh release create "${VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "KixDNS 内核 ${VERSION}" \
+            --notes-file dist/notes.md \
+            dist/kixdns-"${VERSION}"-linux-x86_64.zip \
+            dist/kixdns-"${VERSION}"-linux-arm64.zip \
+            dist/manifest.json

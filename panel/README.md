@@ -11,6 +11,8 @@
 
 版本是发布那天的日期（UTC）：`2026.10.13`；同一天的第二个版本是 `2026.10.13.2`。只有 `panel` 有新提交时才发新版本，不会为了续期重新构建：Release 的附件不会过期。
 
+只发布 `panel` 的最新提交，同一个提交只发一次。重跑旧的运行、从别的分支手动触发，都只检查和构建，不发布。不要手动创建 Release：上游的构建流程会在手动创建的 Release 上挂上没有检查过的二进制（这条分支已经关掉了它的这个触发，见下面的提交）。
+
 推到 `panel` 以后，`.github/workflows/panel-release.yml`：
 
 1. 检查：格式、clippy、全部测试、依赖审计（漏洞、不健全、已撤回会挡住发布；无人维护和通知只报告）、`panel/dns_smoke.py` 运行契约冒烟。
@@ -27,11 +29,13 @@
 | --- | --- |
 | `kixdns` | 内核二进制 |
 | `KIXDNS_CAPABILITIES.json` | 内核支持的配置能力，即 `panel/capabilities.json` |
-| `KIXDNS_SOURCE.json` | 来源：仓库、版本、提交、控制协议版本 |
+| `KIXDNS_SOURCE.json` | 来源：仓库、版本、提交、所基于的 fork main 提交、架构、控制协议版本 |
 | `SHA256SUMS` | 上面三个文件的 SHA-256 |
 
-`manifest.json` 记录版本、提交、控制协议版本，以及每个 zip 的文件名、大小和 SHA-256。面板先读它，再下载对应架构的 zip。
+`manifest.json` 记录版本、提交、所基于的 fork main 提交、控制协议版本、配置能力，以及每个 zip 的文件名、大小和 SHA-256。面板先读它，再下载对应架构的 zip。
+
+运行中的内核在控制接口的健康信息里报 `release_version` 和 `release_commit`；本地构建这两项是 `null`。
 
 ## English summary
 
-`panel` = `main` (upstream plus fixes held to upstream-PR standards) plus panel-only code: the statistics settings, the control socket and metrics, this directory and the release workflow. Every push to `panel` is checked, built for x86_64 and arm64 (Ubuntu 22.04, GLIBC ≤ 2.35) and released under a UTC date version (`2026.10.13`, then `2026.10.13.2` the same day), with one zip per architecture and a `manifest.json`.
+`panel` = `main` (upstream plus fixes held to upstream-PR standards) plus panel-only code: the statistics settings, the control socket and metrics, this directory and the release workflow. Every push to `panel` is checked, built for x86_64 and arm64 (Ubuntu 22.04, GLIBC ≤ 2.35) and released under a UTC date version (`2026.10.13`, then `2026.10.13.2` the same day), with one zip per architecture and a `manifest.json`. Only the tip of `panel` is released, each commit once; a released binary reports `release_version` and `release_commit` in health.
