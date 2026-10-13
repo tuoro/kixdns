@@ -1241,7 +1241,6 @@ async fn handle_tcp_conn(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
