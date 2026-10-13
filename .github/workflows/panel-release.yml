@@ -117,13 +117,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 版本是发布那天的 UTC 日期，同一天已经有了就依次加 .2、.3。只发布 main 的最新提交，
+      # 版本是发布那天的北京时间日期，同一天已经有了就依次加 .2、.3。只发布 main 的最新提交，
       # 同一个提交只发一次：重跑旧的运行、从别的分支手动触发都只检查和构建，不发布。
       # 另外记下基于上游 olicesx/kixdns 的哪个提交。
-      # The version is the UTC date of the release, with .2, .3 and so on when that day
-      # already has one. Only the tip of main is released, and each commit once: re-running
-      # an old run or dispatching from another branch only checks and builds. The upstream
-      # olicesx/kixdns commit it is based on is recorded too.
+      # The version is the release's date in Beijing time, with .2, .3 and so on when that
+      # day already has one. Only the tip of main is released, and each commit once:
+      # re-running an old run or dispatching from another branch only checks and builds. The
+      # upstream olicesx/kixdns commit it is based on is recorded too.
       - name: Pick the date version
         id: pick
         env:
@@ -131,7 +131,10 @@ jobs:
         run: |
           git fetch --quiet --no-tags https://github.com/olicesx/kixdns.git main
           upstream="$(git merge-base HEAD FETCH_HEAD)"
-          day="$(date -u +%Y.%m.%d)"
+          # 北京时间没有夏令时，就是 UTC 加 8 小时；不靠时区数据库，缺了也不会悄悄退回 UTC。
+          # Beijing time has no daylight saving, so it is UTC plus 8 hours; no time zone
+          # database is needed, so a missing one cannot silently fall back to UTC.
+          day="$(date -u -d '+8 hours' +%Y.%m.%d)"
           tags="$(git tag -l)"
           version="${day}"
           n=1
