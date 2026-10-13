@@ -7,6 +7,8 @@ pub mod error_utils;
 pub mod lock;
 pub mod matcher;
 pub mod observe;
+pub mod panel;
+pub mod panel_trace;
 pub mod proto_utils;
 pub mod socket_utils;
 pub mod watcher;
