@@ -2420,3 +2420,144 @@ async fn a_fast_path_answer_that_cannot_be_built_is_reported_as_failed() {
     assert_eq!(failed.response, None);
     assert_eq!(failed.error, Some(format!("{error:#}")));
 }
+
+/// 入口只跳转、目标转发的配置 / A config whose entry only jumps and whose target forwards
+fn jump_config(upstream: &str, settings: serde_json::Value) -> String {
+    serde_json::json!({
+        "settings": settings,
+        "pipelines": [
+            {
+                "id": "main",
+                "rules": [{
+                    "name": "to-group",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                }]
+            },
+            {
+                "id": "group",
+                "rules": [{
+                    "name": "fwd",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+                }]
+            }
+        ]
+    })
+    .to_string()
+}
+
+/// 一个请求选中的 pipeline、响应缓存的查找结果和上游尝试，按发生顺序
+/// The pipelines a request selected, its response-cache lookups and outcomes, and
+/// its upstream attempts, in order
+fn cache_trail(events: &[Event], request_id: u64) -> Vec<String> {
+    events_of(events, request_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Pipeline { pipeline, .. } => Some(format!("pipeline {pipeline}")),
+            Event::CacheLookup { .. } => Some("lookup".to_owned()),
+            Event::CacheMiss { .. } => Some("miss".to_owned()),
+            Event::CacheHit { kind, .. } => Some(format!("hit {kind:?}")),
+            Event::UpstreamAttempt { .. } => Some("upstream".to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 跳转过的请求按入口和目标各查一次响应缓存，每次查找都恰好跟一个命中或未命中。
+/// 第二次查同一个名字时，目标那次查找命中，请求不再去问上游。
+/// A request that jumps looks in the response cache once for its entry pipeline and
+/// once for its target, and each lookup is followed by exactly one hit or miss.
+/// Asking for the same name again hits on the target lookup and goes nowhere upstream.
+#[tokio::test]
+async fn a_jumped_request_looks_up_the_cache_again_for_its_target() {
+    let (upstream, _echo) = spawn_echo_upstream(300).await;
+    let raw = jump_config(
+        &upstream,
+        serde_json::json!({ "default_upstream": "127.0.0.1:9", "min_ttl": 0 }),
+    );
+    let (engine, recorder) = observed_engine(&raw);
+
+    engine
+        .handle_packet(&query("jumped.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "jumped.example");
+    assert_eq!(
+        cache_trail(&events, id),
+        [
+            "pipeline main",
+            "lookup",
+            "miss",
+            "pipeline group",
+            "lookup",
+            "miss",
+            "upstream"
+        ]
+    );
+
+    engine
+        .handle_packet(&query("jumped.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "jumped.example");
+    assert_eq!(
+        cache_trail(&events, id),
+        [
+            "pipeline main",
+            "lookup",
+            "miss",
+            "pipeline group",
+            "lookup",
+            "hit Fresh"
+        ]
+    );
+}
+
+/// 跳转后找到的过期应答和不跳转时一样按 serve_stale 处理：立刻给出过期应答，由后台去刷新，
+/// 请求本身不去问上游。以前跳转过的请求要先等上游，上游失败了才拿到过期应答。
+/// An expired answer found after a jump is handled per serve_stale just as without a
+/// jump: the stale answer goes out at once and a background refresh renews it, while
+/// the request itself does not go upstream. A request that jumped used to wait for
+/// the upstream and only got the stale answer when that failed.
+#[tokio::test]
+async fn an_expired_answer_found_after_a_jump_is_served_stale() {
+    let (upstream, _echo) = spawn_echo_upstream(1).await;
+    let raw = jump_config(
+        &upstream,
+        serde_json::json!({
+            "default_upstream": "127.0.0.1:9",
+            "min_ttl": 0,
+            "serve_stale": true,
+            "serve_stale_client_timeout_ms": 0
+        }),
+    );
+    let (engine, recorder) = observed_engine(&raw);
+
+    engine
+        .handle_packet(&query("stale.example"), peer())
+        .await
+        .unwrap();
+    recorder.drain();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    engine
+        .handle_packet(&query("stale.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "stale.example");
+    assert_eq!(
+        cache_trail(&events, id),
+        [
+            "pipeline main",
+            "lookup",
+            "miss",
+            "pipeline group",
+            "lookup",
+            "hit Stale"
+        ]
+    );
+}
