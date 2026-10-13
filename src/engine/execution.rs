@@ -4705,6 +4705,51 @@ mod jump_response_cache_tests {
         assert_eq!(group_queries.load(Ordering::SeqCst), 2);
     }
 
+    /// 同一个客户端重复查询也一样：continue 之后得出的决策不进规则缓存（olicesx/kixdns#70），
+    /// 每次都从 `try-first` 开始，跳转发生在第二轮，照常转发。
+    /// The same holds for one client asking again: a decision reached after a continue
+    /// is not rule-cached (olicesx/kixdns#70), so every request starts at `try-first`,
+    /// jumps on its second pass and forwards as before.
+    #[tokio::test]
+    async fn a_repeated_request_that_continues_still_forwards_after_the_jump() {
+        let (first_upstream, first_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let (group_upstream, group_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "try-first",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream, "transport": "udp" }],
+                            "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN" }],
+                            "response_actions_on_miss": [{ "type": "continue" }]
+                        },
+                        {
+                            "name": "to-group",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                        }
+                    ]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &group_upstream)] }
+            ]
+        }));
+
+        for _ in 0..2 {
+            assert_eq!(
+                answer(&engine, "continued.example", "192.0.2.10").await,
+                Ipv4Addr::new(192, 0, 2, 2)
+            );
+        }
+        assert_eq!(first_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(group_queries.load(Ordering::SeqCst), 2);
+    }
+
     /// 目标 pipeline 按客户端判断时，跳转后不从缓存给应答：这个客户端该被拦下，
     /// 不能拿到另一个客户端转发回来、存在目标键下的应答。
     /// A target that matches on the client is not answered from the cache after a
