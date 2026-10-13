@@ -109,18 +109,25 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// evaluation or from a rule cache hit.
     fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {}
 
-    /// The response cache was consulted for the request. Exactly one
-    /// [`cache_hit`] or [`cache_miss`] follows, and neither is ever reported
-    /// without a preceding `cache_lookup` of the same request, so hits and
-    /// misses always add up to lookups. Background refresh requests bypass
-    /// the cache and report none of the three.
+    /// The response cache was consulted for the request: once before the rules
+    /// run, and possibly again under the target pipeline's key after each
+    /// request-phase `jump_to_pipeline`. Exactly one [`cache_hit`] or
+    /// [`cache_miss`] follows each lookup. The one other `cache_hit` is a request
+    /// whose upstream failed being answered from a stale entry
+    /// ([`CacheHitKind::StaleUpstreamFailure`]), reported after its misses. A
+    /// request reports at most one [`cache_hit`], so the share of requests
+    /// answered from the cache is counted by requests with a hit, not by
+    /// lookups. Background refresh requests bypass the cache and report none of
+    /// the three.
     ///
     /// [`cache_hit`]: EngineObserver::cache_hit
     /// [`cache_miss`]: EngineObserver::cache_miss
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {}
 
-    /// The response cache answered the request. Always paired with the
-    /// request's [`cache_lookup`].
+    /// The response cache answered the request. Reported at most once per
+    /// request, and paired with one of its [`cache_lookup`]s, except a
+    /// [`CacheHitKind::StaleUpstreamFailure`] hit, which follows the request's
+    /// misses (see [`cache_lookup`]).
     ///
     /// [`cache_lookup`]: EngineObserver::cache_lookup
     fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {}

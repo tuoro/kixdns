@@ -215,6 +215,22 @@ pub struct RuntimePipeline {
     pub ecs: Option<crate::config::EcsMode>,
     /// Pipeline 内是否有 action 使用了 ECS 配置 / Whether any action in this pipeline uses ECS config
     pub uses_ecs: bool,
+    /// 这个 pipeline 的应答会不会因「谁在问」而不同：请求阶段有按客户端 IP、它的 GeoIP 国家或
+    /// 私有地址、请求带不带 EDNS 判断的规则，或者有转发按客户端地址带 ECS 子网，而 pipeline 级的
+    /// `ecs` 并不按客户端子网区分缓存。是的话，它给一个请求的应答，不一定是同一个问题换一个请求方
+    /// 时的应答。
+    /// Whether this pipeline's answer can differ by who is asking: a request rule matches
+    /// on the client IP, its GeoIP country or private range, or EDNS presence, or a forward
+    /// sends an ECS subnet taken from the client while the pipeline-level `ecs` does not key
+    /// the cache by the client's subnet. If so, the answer it gave one request is not
+    /// necessarily its answer to another request with the same question.
+    pub depends_on_requester: bool,
+    /// 请求阶段有没有按请求带不带 EDNS 判断的规则。后台刷新重放的请求不带 EDNS，
+    /// 经过这样的 pipeline 的路线，刷新时不一定走得一样。
+    /// Whether any request rule matches on EDNS presence. A background refresh replays
+    /// the query without EDNS, so a route through such a pipeline may not repeat when
+    /// the answer is refreshed.
+    pub matches_edns: bool,
     // Indices for O(1) lookup
     // 完全域名匹配索引（最高优先级）/ Exact domain match index (highest priority)
     pub domain_exact_index: FxHashMap<Arc<str>, Vec<usize>>,
@@ -359,6 +375,20 @@ pub struct RuntimeResponseMatcherWithOp {
 }
 
 impl RuntimePipelineConfig {
+    /// pipeline 的选择有没有按请求带不带 EDNS 判断。后台刷新重放的请求不带 EDNS，可能选到另一个 pipeline。
+    /// Whether pipeline selection matches on EDNS presence. A background refresh replays the
+    /// query without EDNS and may select another pipeline.
+    pub(crate) fn selection_matches_edns(&self) -> bool {
+        self.pipeline_select.iter().any(|rule| {
+            rule.matchers.iter().any(|m| {
+                matches!(
+                    m.matcher,
+                    RuntimePipelineSelectorMatcher::EdnsPresent { .. }
+                )
+            })
+        })
+    }
+
     pub fn from_config(cfg: PipelineConfig) -> anyhow::Result<Self> {
         // Validate cache_capacity configuration
         if cfg.settings.cache_capacity == 0 {
@@ -600,12 +630,56 @@ impl RuntimePipelineConfig {
                 );
             }
 
+            let request_matchers = || rules.iter().flat_map(|rule| &rule.matchers);
+            // 转发按客户端地址带 ECS 子网，缓存键却不按同样细的客户端子网区分：pipeline 级 `ecs` 不是
+            // from_client_ip，或者它的前缀比转发的短（就是上面警告的那类配置）
+            // A forward sends an ECS subnet taken from the client while the cache key does not
+            // carry the client's subnet as finely: the pipeline-level `ecs` is not from_client_ip,
+            // or its prefix is shorter than the forward's (the kind of configuration warned about above)
+            let keyed_prefixes = match p.ecs {
+                Some(crate::config::EcsMode::FromClientIp {
+                    prefix_v4,
+                    prefix_v6,
+                }) => Some((prefix_v4, prefix_v6)),
+                _ => None,
+            };
+            let forwards_client_subnet =
+                rules
+                    .iter()
+                    .flat_map(|rule| &rule.actions)
+                    .any(|action| match action {
+                        crate::config::Action::Forward {
+                            ecs:
+                                Some(crate::config::EcsMode::FromClientIp {
+                                    prefix_v4,
+                                    prefix_v6,
+                                }),
+                            ..
+                        } => keyed_prefixes.is_none_or(|(key_v4, key_v6)| {
+                            key_v4 < *prefix_v4 || key_v6 < *prefix_v6
+                        }),
+                        _ => false,
+                    });
+            let depends_on_requester = forwards_client_subnet
+                || request_matchers().any(|m| {
+                    matches!(
+                        m.matcher,
+                        RuntimeMatcher::ClientIp { .. }
+                            | RuntimeMatcher::GeoipCountry { .. }
+                            | RuntimeMatcher::GeoipPrivate { .. }
+                            | RuntimeMatcher::EdnsPresent { .. }
+                    )
+                });
+            let matches_edns =
+                request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::EdnsPresent { .. }));
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
                 uses_client_ip: pipeline_uses_client_ip,
                 ecs: p.ecs.clone(),
                 uses_ecs: pipeline_uses_ecs,
+                depends_on_requester,
+                matches_edns,
                 domain_exact_index, // 添加完全匹配索引 / Add exact match index
                 domain_suffix_index,
                 query_type_index, // 添加 query_type 索引 / Add query_type index

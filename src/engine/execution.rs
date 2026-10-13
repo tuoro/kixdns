@@ -33,7 +33,7 @@ use crate::proto_utils::parse_quick;
 
 use super::observation::{ObservedRequest, report_decision, report_matched_rules};
 use super::response::build_fast_static_response;
-use super::response_log::ResponseLog;
+use super::response_log::{ResponseInfo, ResponseLog};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
 use super::utils::{engine_helpers, is_refreshing};
@@ -768,6 +768,134 @@ impl Engine {
             .await
     }
 
+    /// 在响应缓存里找能直接回答这个请求的应答：新鲜的立刻给；过期的按 serve_stale 的设置
+    /// 立刻给，或者先等后台刷新（RFC 8767 客户端超时）再给。上报一次 `cache_lookup`，
+    /// 之后恰好跟一个 `cache_hit` 或 `cache_miss`。
+    /// Look in the response cache for an answer to this request. A fresh entry is
+    /// served at once; an expired one is served per the serve_stale settings, either
+    /// at once or after waiting for the background refresh (RFC 8767 client timeout).
+    /// Reports one `cache_lookup`, followed by exactly one `cache_hit` or `cache_miss`.
+    async fn answer_from_cache(
+        &self,
+        lookup: &phases::CacheLookupContext<'_>,
+        info: &mut ResponseInfo,
+    ) -> Option<Bytes> {
+        let settings = &lookup.state.pipeline.settings;
+        if let Some((observer, ctx)) = lookup.observed {
+            observer.cache_lookup(ctx);
+        }
+        if let Some(resp_bytes) = phases::check_cache_logged(self, lookup, info) {
+            return Some(resp_bytes);
+        }
+
+        // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
+        // try upstream for client_timeout_ms before falling back to stale data.
+        // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
+        // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
+        // Corresponds to Unbound serve-expired-client-timeout
+        //
+        // Design: check_cache() already triggers spawn_background_refresh() for expired entries
+        // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
+        // when the background refresh completes. If client_timeout expires, serve stale.
+        // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
+        // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
+        if settings.serve_stale && settings.serve_stale_client_timeout_ms > 0 {
+            let has_stale = self
+                .cache
+                .get(&lookup.dedupe_hash)
+                .filter(|h| {
+                    h.qtype == u16::from(lookup.qtype)
+                        && h.pipeline_id.as_ref() == lookup.pipeline_id
+                        && h.qname.as_ref() == lookup.qname
+                        && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
+                        && h.rcode != ResponseCode::ServFail
+                        && h.rcode != ResponseCode::Refused
+                })
+                .is_some();
+
+            if has_stale {
+                // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
+                // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
+                // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
+                //
+                // 上界不能取单次上游超时：后台刷新没有外层包裹，UDP 链是
+                // hedge(T/3) + 全量(T) + TCP 回落(T)，最坏约 2.33T，按 T 截断
+                // 会把本来能成功的刷新提前掐掉，白白把新鲜应答降级成过期应答。
+                //
+                // Bound the wait by the smaller of the client wait and what is
+                // left of this request's budget. The stale answer in hand is
+                // only worth anything if it goes out before the outer request
+                // timeout; past that the client gets SERVFAIL and an answer
+                // that was ready is dropped. One upstream timeout is the wrong
+                // bound: a background refresh has no outer wrapper and its UDP
+                // chain is hedge at T/3, a full attempt at T and a TCP fallback
+                // at T, so roughly 2.33T in the worst case. Cutting at T ends
+                // refreshes that would have landed and downgrades a fresh
+                // answer to a stale one for nothing.
+                let budget = Duration::from_millis(request_timeout_ms(settings));
+                let client_timeout = Duration::from_millis(settings.serve_stale_client_timeout_ms)
+                    .min(
+                        budget
+                            .saturating_sub(lookup.start.elapsed())
+                            .saturating_sub(STALE_SERVE_RESERVE),
+                    );
+                let poll_interval = std::time::Duration::from_millis(5);
+                let wait_start = Instant::now();
+
+                // Poll cache for fresh data from background refresh
+                // 轮询缓存等待后台刷新带来的新鲜数据
+                while wait_start.elapsed() < client_timeout {
+                    tokio::time::sleep(poll_interval).await;
+                    // Check if background refresh put fresh data in cache
+                    let Some(fresh_hit) = self.cache.get(&lookup.dedupe_hash) else {
+                        break;
+                    };
+                    if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
+                        // Fresh data available! Serve it.
+                        if let Some(fresh_bytes) = phases::check_cache_logged(self, lookup, info) {
+                            tracing::debug!(
+                                event = "serve_fresh_after_client_wait",
+                                qname = %lookup.qname,
+                                wait_ms = wait_start.elapsed().as_millis() as u64,
+                                "background refresh completed within client_timeout"
+                            );
+                            return Some(fresh_bytes);
+                        }
+                    }
+                }
+
+                // Client timeout expired - serve stale response
+                // 客户端超时 - 返回过期缓存响应
+                if let Some(stale_bytes) = phases::check_stale_cache_logged(
+                    self,
+                    lookup,
+                    CacheHitKind::StaleClientTimeout,
+                    info,
+                ) {
+                    tracing::debug!(
+                        event = "serve_stale_on_client_timeout",
+                        qname = %lookup.qname,
+                        qtype = ?lookup.qtype,
+                        waited_ms = client_timeout.as_millis() as u64,
+                        configured_timeout_ms = settings.serve_stale_client_timeout_ms,
+                        client_ip = %lookup.peer.ip(),
+                        pipeline = %lookup.pipeline_id,
+                        "RFC 8767: client timeout expired, serving stale"
+                    );
+                    return Some(stale_bytes);
+                }
+                // Stale entry evicted by moka - fall through to normal processing
+            }
+        }
+
+        // The response cache had nothing usable for this request
+        // 响应缓存中没有本请求可用的条目
+        if let Some((observer, ctx)) = lookup.observed {
+            observer.cache_miss(ctx);
+        }
+        None
+    }
+
     /// Internal handle_packet implementation with skip_cache option
     /// 内部 handle_packet 实现，支持跳过缓存选项
     ///
@@ -980,129 +1108,9 @@ impl Engine {
 
             // Background refresh: Skip cache lookup when skip_cache=true
             // 后台刷新：当 skip_cache=true 时跳过缓存查找
-            if !skip_cache {
-                if let Some(observed) = &observed {
-                    observed.observer.cache_lookup(&observed.ctx);
-                }
-                if let Some(resp_bytes) = phases::check_cache_logged(
-                    self,
-                    &phases::CacheLookupContext {
-                        state: &state,
-                        qname: qname_ref,
-                        qtype,
-                        qclass,
-                        pipeline_id: &pipeline_id,
-                        dedupe_hash,
-                        tx_id,
-                        start,
-                        peer: &peer,
-                        observed: observed_ctx,
-                    },
-                    &mut response_log.info,
-                ) {
-                    return Ok(resp_bytes);
-                }
-            }
-
-            // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
-            // try upstream for client_timeout_ms before falling back to stale data.
-            // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
-            // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
-            // Corresponds to Unbound serve-expired-client-timeout
-            //
-            // Design: check_cache() already triggers spawn_background_refresh() for expired entries
-            // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
-            // when the background refresh completes. If client_timeout expires, serve stale.
-            // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
-            // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
             if !skip_cache
-                && cfg.settings.serve_stale
-                && cfg.settings.serve_stale_client_timeout_ms > 0
-            {
-                let has_stale = self
-                    .cache
-                    .get(&dedupe_hash)
-                    .filter(|h| {
-                        h.qtype == u16::from(qtype)
-                            && h.pipeline_id.as_ref() == pipeline_id.as_ref()
-                            && h.qname.as_ref() == qname_ref
-                            && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
-                            && h.rcode != ResponseCode::ServFail
-                            && h.rcode != ResponseCode::Refused
-                    })
-                    .is_some();
-
-                if has_stale {
-                    // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
-                    // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
-                    // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
-                    //
-                    // 上界不能取单次上游超时：后台刷新没有外层包裹，UDP 链是
-                    // hedge(T/3) + 全量(T) + TCP 回落(T)，最坏约 2.33T，按 T 截断
-                    // 会把本来能成功的刷新提前掐掉，白白把新鲜应答降级成过期应答。
-                    //
-                    // Bound the wait by the smaller of the client wait and what is
-                    // left of this request's budget. The stale answer in hand is
-                    // only worth anything if it goes out before the outer request
-                    // timeout; past that the client gets SERVFAIL and an answer
-                    // that was ready is dropped. One upstream timeout is the wrong
-                    // bound: a background refresh has no outer wrapper and its UDP
-                    // chain is hedge at T/3, a full attempt at T and a TCP fallback
-                    // at T, so roughly 2.33T in the worst case. Cutting at T ends
-                    // refreshes that would have landed and downgrades a fresh
-                    // answer to a stale one for nothing.
-                    let budget = Duration::from_millis(request_timeout_ms(&cfg.settings));
-                    let client_timeout =
-                        Duration::from_millis(cfg.settings.serve_stale_client_timeout_ms).min(
-                            budget
-                                .saturating_sub(start.elapsed())
-                                .saturating_sub(STALE_SERVE_RESERVE),
-                        );
-                    let poll_interval = std::time::Duration::from_millis(5);
-                    let wait_start = Instant::now();
-
-                    // Poll cache for fresh data from background refresh
-                    // 轮询缓存等待后台刷新带来的新鲜数据
-                    while wait_start.elapsed() < client_timeout {
-                        tokio::time::sleep(poll_interval).await;
-                        // Check if background refresh put fresh data in cache
-                        let Some(fresh_hit) = self.cache.get(&dedupe_hash) else {
-                            break;
-                        };
-                        if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64
-                        {
-                            // Fresh data available! Serve it.
-                            if let Some(fresh_bytes) = phases::check_cache_logged(
-                                self,
-                                &phases::CacheLookupContext {
-                                    state: &state,
-                                    qname: qname_ref,
-                                    qtype,
-                                    qclass,
-                                    pipeline_id: &pipeline_id,
-                                    dedupe_hash,
-                                    tx_id,
-                                    start,
-                                    peer: &peer,
-                                    observed: observed_ctx,
-                                },
-                                &mut response_log.info,
-                            ) {
-                                tracing::debug!(
-                                    event = "serve_fresh_after_client_wait",
-                                    qname = %qname_ref,
-                                    wait_ms = wait_start.elapsed().as_millis() as u64,
-                                    "background refresh completed within client_timeout"
-                                );
-                                return Ok(fresh_bytes);
-                            }
-                        }
-                    }
-
-                    // Client timeout expired - serve stale response
-                    // 客户端超时 - 返回过期缓存响应
-                    if let Some(stale_bytes) = phases::check_stale_cache_logged(
-                        self,
+                && let Some(resp_bytes) = self
+                    .answer_from_cache(
                         &phases::CacheLookupContext {
                             state: &state,
                             qname: qname_ref,
@@ -1115,29 +1123,11 @@ impl Engine {
                             peer: &peer,
                             observed: observed_ctx,
                         },
-                        CacheHitKind::StaleClientTimeout,
                         &mut response_log.info,
-                    ) {
-                        tracing::debug!(
-                            event = "serve_stale_on_client_timeout",
-                            qname = %qname_ref,
-                            qtype = ?qtype,
-                            waited_ms = client_timeout.as_millis() as u64,
-                            configured_timeout_ms = cfg.settings.serve_stale_client_timeout_ms,
-                            client_ip = %peer.ip(),
-                            pipeline = %pipeline_id,
-                            "RFC 8767: client timeout expired, serving stale"
-                        );
-                        return Ok(stale_bytes);
-                    }
-                    // Stale entry evicted by moka - fall through to normal processing
-                }
-            }
-
-            // The response cache had nothing usable for this request
-            // 响应缓存中没有本请求可用的条目
-            if !skip_cache && let Some(observed) = &observed {
-                observed.observer.cache_miss(&observed.ctx);
+                    )
+                    .await
+            {
+                return Ok(resp_bytes);
             }
 
             // 优化：保持 Cow<str> 以延迟分配，避免不必要的 String 分配
@@ -1149,6 +1139,8 @@ impl Engine {
             let mut current_pipeline_id = pipeline_id.clone();
             let mut current_uses_client_ip =
                 pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
+            // 这条路线上有没有按 EDNS 判断的 pipeline（见跳转后的缓存查找）/ Whether a pipeline on the route so far matches on EDNS (see the lookup after a jump)
+            let mut route_matches_edns = pipeline_opt.is_some_and(|p| p.matches_edns);
             // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
             let qname_bytes = qname.as_bytes();
             // Reuse dedupe_hash from earlier computation (includes ECS key isolation)
@@ -1228,7 +1220,10 @@ impl Engine {
             // Without this, the response_jump_limit could be bypassed via:
             //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
             let mut jump_count = 0;
+            // 决策循环的第几轮：第一轮在任何转发之前 / Which pass of the decision loop: the first runs before anything is forwarded
+            let mut pass = 0u32;
             'decision_loop: loop {
+                pass += 1;
                 while let Decision::Jump { pipeline } = &decision {
                     jump_count += 1;
                     if jump_count > response_jump_limit {
@@ -1244,6 +1239,7 @@ impl Engine {
                         current_pipeline_id = p.id.clone();
                         response_log.info.pipeline = Some(current_pipeline_id.clone());
                         current_uses_client_ip = p.uses_client_ip;
+                        route_matches_edns |= p.matches_edns;
                         if let Some(observed) = &observed {
                             observed
                                 .observer
@@ -1264,6 +1260,52 @@ impl Engine {
                             qclass,
                             jump_ecs_key.as_ref(),
                         );
+                        // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
+                        // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
+                        // 上游。以下情况不查，保持原样：
+                        // - 不在第一轮：continue 之后，请求已经越过了一个应答，后面的规则可能复用它；
+                        // - 目标的应答因「谁在问」而不同：它给别的请求方的应答不一定是给这一个的；
+                        // - 后台刷新走不回这条路线：刷新重放的请求不带 EDNS、类别固定是 IN，路线上（含
+                        //   pipeline 的选择）按 EDNS 判断，或者查询类别不是 IN 时，刷新可能走另一条路线，
+                        //   把别处的应答写进这个键，或者写进另一个键。
+                        // After a jump, look in the response cache again under the target pipeline's
+                        // key. A forwarded answer is stored under that key, while the entry lookup used
+                        // the entry pipeline's, so a request that jumped never found it and went upstream
+                        // every time. These cases do not look and keep the current behaviour:
+                        // - after the first pass: past a continue the request has passed over an answer
+                        //   that later rules may reuse;
+                        // - a target whose answer differs by who is asking: its answer to another
+                        //   requester is not necessarily its answer to this one;
+                        // - a route a background refresh cannot repeat: the refresh replays the query
+                        //   without EDNS and in class IN, so when the route (pipeline selection included)
+                        //   matches on EDNS, or the query class is not IN, it may take another route and
+                        //   write another answer under this key, or write under another key.
+                        if !skip_cache
+                            && pass == 1
+                            && !p.depends_on_requester
+                            && !route_matches_edns
+                            && qclass == DNSClass::IN
+                            && !cfg.selection_matches_edns()
+                            && let Some(resp_bytes) = self
+                                .answer_from_cache(
+                                    &phases::CacheLookupContext {
+                                        state: &state,
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        pipeline_id: &current_pipeline_id,
+                                        dedupe_hash,
+                                        tx_id,
+                                        start,
+                                        peer: &peer,
+                                        observed: observed_ctx,
+                                    },
+                                    &mut response_log.info,
+                                )
+                                .await
+                        {
+                            return Ok(resp_bytes);
+                        }
                         skip_rules.clear();
                         decision = self.apply_rules(
                             &state,
@@ -3693,6 +3735,570 @@ mod tests_multi_upstream {
                 );
             }
             _ => panic!("expected forward action"),
+        }
+    }
+}
+
+/// 跳转之后的响应缓存：转发回来的应答存在目标 pipeline 的键下，跳转后要按这个键再查一次，
+/// 否则跳转过的请求每次都去问上游。
+/// The response cache after a jump: a forwarded answer is stored under the target
+/// pipeline's key, so it has to be looked up again under that key after the jump;
+/// otherwise a request that jumped goes upstream every time.
+#[cfg(test)]
+mod jump_response_cache_tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+
+    /// UDP 上游：每个查询都答 `ip`（TTL 为 `ttl` 秒），并数一共收到几个查询
+    /// UDP upstream that answers every query with `ip` (TTL `ttl` seconds) and counts the queries it receives
+    async fn counting_upstream(ip: Ipv4Addr, ttl: u32) -> (String, Arc<AtomicUsize>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counter = queries.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(request) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = request.queries.first().cloned() else {
+                    continue;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(question.clone());
+                response.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    ttl,
+                    RData::A(A(ip)),
+                ));
+                let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+            }
+        });
+        (addr, queries)
+    }
+
+    fn engine(raw: serde_json::Value) -> Engine {
+        let config: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
+        Engine::new(runtime, "test".to_string()).expect("engine")
+    }
+
+    /// 从 `client` 查一次 `qname` 的 A 记录，返回答到的地址 / Query `qname` (A) from `client` and return the address answered
+    async fn answer(engine: &Engine, qname: &str, client: &str) -> Ipv4Addr {
+        ask(engine, qname, client, DNSClass::IN).await.0
+    }
+
+    /// 从 `client` 按类别 `class` 查一次 `qname` 的 A 记录，返回答到的地址和 TTL
+    /// Query `qname` (A, class `class`) from `client` and return the address and TTL answered
+    async fn ask(engine: &Engine, qname: &str, client: &str, class: DNSClass) -> (Ipv4Addr, u32) {
+        let mut message = Message::new(0x2a2a, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        let mut query = Query::query(Name::from_str(qname).unwrap(), RecordType::A);
+        query.set_query_class(class);
+        message.add_query(query);
+        let peer: SocketAddr = format!("{client}:53000").parse().unwrap();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&message.to_vec().unwrap(), peer),
+        )
+        .await
+        .expect("answered in time")
+        .expect("answered");
+        let response = Message::from_bytes(&bytes).unwrap();
+        match response.answers.first().map(|r| (&r.data, r.ttl)) {
+            Some((RData::A(address), ttl)) => (address.0, ttl),
+            other => panic!("expected an A answer for {qname}, got {other:?}"),
+        }
+    }
+
+    fn forward_rule(name: &str, upstream: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+        })
+    }
+
+    /// 入口 pipeline 只跳转、目标 pipeline 转发（面板把「交给上游组」写成的就是这种形状）：
+    /// 同一个名字查三次，上游只收到第一次。以前三次都到上游。
+    /// The entry pipeline only jumps and the target forwards (the shape a panel writes
+    /// for "send to an upstream group"): three queries for one name reach the upstream
+    /// once. All three used to reach it.
+    #[tokio::test]
+    async fn a_request_that_jumps_is_answered_from_the_cache() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "to-group",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                    }]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+            ]
+        }));
+
+        for _ in 0..3 {
+            assert_eq!(
+                answer(&engine, "jumped.example", "192.0.2.10").await,
+                Ipv4Addr::new(192, 0, 2, 1)
+            );
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+    }
+
+    /// 入口按客户端地址跳到不同的目标时，每个目标的应答只给跳到它的请求：
+    /// 两个客户端查同一个名字，各自拿到自己目标的地址，每个上游各收到一次。
+    /// When the entry jumps to different targets by client address, each target's
+    /// answer only serves requests that jumped to it: two clients asking for one name
+    /// each get their own target's address, and each upstream is asked once.
+    #[tokio::test]
+    async fn cached_answers_stay_with_the_target_they_came_from() {
+        let (first_upstream, first_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let (second_upstream, second_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "first-client",
+                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "first" }]
+                        },
+                        {
+                            "name": "everyone-else",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "second" }]
+                        }
+                    ]
+                },
+                { "id": "first", "rules": [forward_rule("fwd", &first_upstream)] },
+                { "id": "second", "rules": [forward_rule("fwd", &second_upstream)] }
+            ]
+        }));
+
+        for _ in 0..2 {
+            assert_eq!(
+                answer(&engine, "shared.example", "10.0.0.1").await,
+                Ipv4Addr::new(192, 0, 2, 1)
+            );
+            assert_eq!(
+                answer(&engine, "shared.example", "10.0.0.2").await,
+                Ipv4Addr::new(192, 0, 2, 2)
+            );
+        }
+        assert_eq!(first_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(second_queries.load(Ordering::SeqCst), 1);
+    }
+
+    /// continue 之后才遇到的跳转不查缓存，照常转发：那时请求已经越过了一个应答（可能被后面的
+    /// 规则复用），查缓存提前返回会绕开这些。只有还没转发过的第一轮才查。两次查询来自两个客户端：
+    /// 入口按客户端地址判断，规则缓存因此按客户端分开，两次都重新走 `try-first`。
+    /// A jump reached only after a continue is not looked up in the cache and forwards
+    /// as before: by then the request has passed over an answer (which later rules may
+    /// reuse), and returning early from the cache would bypass that. Only the first
+    /// pass, before anything was forwarded, looks up. The two queries come from two
+    /// clients: the entry matches on client address, so the rule cache keeps them apart
+    /// and both run `try-first` again.
+    #[tokio::test]
+    async fn a_jump_reached_after_a_continue_still_forwards() {
+        let (first_upstream, first_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let (group_upstream, group_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "try-first",
+                            "matchers": [{ "type": "client_ip", "cidr": "192.0.2.0/24" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream, "transport": "udp" }],
+                            "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN" }],
+                            "response_actions_on_miss": [{ "type": "continue" }]
+                        },
+                        {
+                            "name": "to-group",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                        }
+                    ]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &group_upstream)] }
+            ]
+        }));
+
+        for client in ["192.0.2.10", "192.0.2.11"] {
+            assert_eq!(
+                answer(&engine, "continued.example", client).await,
+                Ipv4Addr::new(192, 0, 2, 2)
+            );
+        }
+        assert_eq!(first_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(group_queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 目标 pipeline 按客户端判断时，跳转后不从缓存给应答：这个客户端该被拦下，
+    /// 不能拿到另一个客户端转发回来、存在目标键下的应答。
+    /// A target that matches on the client is not answered from the cache after a
+    /// jump: a client that its rules block must not get the answer another client's
+    /// forward stored under the target's key.
+    #[tokio::test]
+    async fn a_target_that_matches_on_the_client_is_not_served_from_the_cache() {
+        let (upstream, _queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "to-filter",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": "filter" }]
+                    }]
+                },
+                {
+                    "id": "filter",
+                    "rules": [
+                        {
+                            "name": "block-one-client",
+                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                            "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+                        },
+                        forward_rule("fwd", &upstream)
+                    ]
+                }
+            ]
+        }));
+
+        assert_eq!(
+            answer(&engine, "ads.example", "10.0.0.2").await,
+            Ipv4Addr::new(192, 0, 2, 1)
+        );
+        assert_eq!(
+            answer(&engine, "ads.example", "10.0.0.1").await,
+            Ipv4Addr::UNSPECIFIED
+        );
+    }
+
+    /// 路线上有按 EDNS 判断的 pipeline 时，跳转后不查缓存：后台刷新重放的请求不带 EDNS，
+    /// 可能走另一条路线，把别处的应答写进目标的键。
+    /// A route through a pipeline that matches on EDNS does not look in the cache after
+    /// the jump: a background refresh replays the query without EDNS, may take another
+    /// route and write another answer under the target's key.
+    #[tokio::test]
+    async fn a_route_through_an_edns_rule_is_not_looked_up_after_the_jump() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "edns-clients",
+                            "matchers": [{ "type": "edns_present", "expect": true }],
+                            "actions": [{ "type": "static_ip_response", "ip": "192.0.2.9" }]
+                        },
+                        {
+                            "name": "to-group",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                        }
+                    ]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+            ]
+        }));
+
+        for _ in 0..3 {
+            assert_eq!(
+                answer(&engine, "edns.example", "192.0.2.10").await,
+                Ipv4Addr::new(192, 0, 2, 1)
+            );
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 3);
+    }
+
+    /// 跳转后找到的过期应答由后台刷新，刷新写回同一个目标键：之后的请求拿到新鲜应答，
+    /// 不再去问上游，也不再拿过期应答。
+    /// An expired answer found after a jump is refreshed in the background, and the
+    /// refresh writes back under the same target key: the next request gets a fresh
+    /// answer, with no further upstream query and no stale answer.
+    #[tokio::test]
+    async fn a_refresh_started_after_a_jump_renews_the_target_entry() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
+        let engine = engine(serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "min_ttl": 0,
+                "serve_stale": true,
+                "serve_stale_ttl": 30,
+                "serve_stale_client_timeout_ms": 0
+            },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "to-group",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                    }]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+            ]
+        }));
+
+        answer(&engine, "renew.example", "192.0.2.10").await;
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // 过期：立刻给过期应答，后台刷新去问上游 / Expired: the stale answer goes out at once and a background refresh asks upstream
+        answer(&engine, "renew.example", "192.0.2.10").await;
+        let refreshed = tokio::time::timeout(Duration::from_secs(3), async {
+            while queries.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            refreshed.is_ok(),
+            "the background refresh never asked upstream"
+        );
+
+        // 刷新写回了目标键：很快就拿到新鲜应答（TTL 不超过上游给的 1 秒；过期应答的 TTL 是 30），
+        // 而且不再去问上游
+        // The refresh wrote back under the target key: a fresh answer arrives shortly (TTL at
+        // most the upstream's 1 s; a stale answer carries 30), with no further upstream query
+        let fresh = tokio::time::timeout(Duration::from_secs(3), async {
+            while ask(&engine, "renew.example", "192.0.2.10", DNSClass::IN)
+                .await
+                .1
+                > 1
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            fresh.is_ok(),
+            "no fresh answer after the background refresh"
+        );
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    fn jump_to_group(group_rules: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([
+            {
+                "id": "main",
+                "rules": [{
+                    "name": "to-group",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                }]
+            },
+            { "id": "group", "rules": group_rules }
+        ])
+    }
+
+    /// pipeline 的选择按 EDNS 判断时，跳转后也不查缓存：刷新重放的请求不带 EDNS，可能选到别的 pipeline。
+    /// Selection that matches on EDNS also turns off the lookup after a jump: the refresh
+    /// replays the query without EDNS and may select another pipeline.
+    #[tokio::test]
+    async fn edns_in_pipeline_selection_turns_off_the_lookup_after_a_jump() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipeline_select": [{
+                "pipeline": "main",
+                "matchers": [{ "type": "edns_present", "expect": false }]
+            }],
+            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream)]))
+        }));
+
+        for _ in 0..2 {
+            answer(&engine, "selected.example", "192.0.2.10").await;
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 类别不是 IN 的查询跳转后不查缓存：刷新重放的请求固定是 IN，算出的是另一个键。
+    /// A query in a class other than IN does not look after a jump: the refresh replays
+    /// in class IN and computes another key.
+    #[tokio::test]
+    async fn a_query_outside_class_in_is_not_looked_up_after_a_jump() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream)]))
+        }));
+
+        for _ in 0..2 {
+            ask(&engine, "chaos.example", "192.0.2.10", DNSClass::CH).await;
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 目标的转发按客户端地址带 ECS 子网、缓存键却不分子网时，跳转后不查缓存：
+    /// 按一个子网定制的应答不能给另一个子网的客户端。
+    /// A target whose forward sends the client's ECS subnet, while its cache key does not
+    /// carry the subnet, does not look after a jump: an answer tailored to one subnet must
+    /// not go to a client in another.
+    #[tokio::test]
+    async fn a_target_forwarding_the_client_subnet_is_not_served_across_subnets() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": jump_to_group(serde_json::json!([{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{
+                    "type": "forward",
+                    "upstream": upstream,
+                    "transport": "udp",
+                    "ecs": { "mode": "from_client_ip" }
+                }]
+            }]))
+        }));
+
+        answer(&engine, "cdn.example", "198.51.100.10").await;
+        answer(&engine, "cdn.example", "203.0.113.10").await;
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 按「谁在问」判断的四种请求匹配会让 pipeline 带上标记，按问题本身判断的不会；
+    /// 只有按 EDNS 判断的带上 `matches_edns`。
+    /// The four request matchers that look at who is asking flag the pipeline, and
+    /// those that look at the question do not; only the EDNS one sets `matches_edns`.
+    #[test]
+    fn pipelines_that_match_on_the_requester_are_flagged() {
+        let forward = |ecs: serde_json::Value| {
+            serde_json::json!({
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": "127.0.0.1:9", "ecs": ecs }]
+            })
+        };
+        let ecs_cases = [
+            // 转发按客户端带子网，pipeline 级不按客户端区分 / A forward sends the client subnet; the pipeline level does not key by it
+            (
+                serde_json::json!({ "id": "p", "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))] }),
+                true,
+            ),
+            // pipeline 级也按客户端子网区分缓存 / The pipeline level keys the cache by the client subnet too
+            (
+                serde_json::json!({
+                    "id": "p",
+                    "ecs": { "mode": "from_client_ip" },
+                    "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))]
+                }),
+                false,
+            ),
+            // pipeline 级按客户端区分，但前缀比转发的短：按 /24 定制的应答在整个 /16 里共用
+            // The pipeline level keys by the client, but with a shorter prefix than the forward:
+            // answers tailored per /24 would be shared across the whole /16
+            (
+                serde_json::json!({
+                    "id": "p",
+                    "ecs": { "mode": "from_client_ip", "prefix_v4": 16 },
+                    "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))]
+                }),
+                true,
+            ),
+            // 固定子网与客户端无关 / A fixed subnet does not depend on the client
+            (
+                serde_json::json!({ "id": "p", "rules": [forward(serde_json::json!({ "mode": "static", "ip": "198.51.100.0" }))] }),
+                false,
+            ),
+        ];
+        for (pipeline, requester) in ecs_cases {
+            let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [pipeline.clone()]
+            }))
+            .expect("parse config");
+            let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
+            assert_eq!(
+                runtime.pipelines[0].depends_on_requester, requester,
+                "{pipeline}"
+            );
+        }
+
+        let cases = [
+            (
+                serde_json::json!({ "type": "client_ip", "cidr": "10.0.0.0/8" }),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "geoip_country", "country_codes": ["cn"] }),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "geoip_private", "expect": true }),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "edns_present", "expect": true }),
+                true,
+                true,
+            ),
+            (
+                serde_json::json!({ "type": "domain_suffix", "value": "example.com" }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "qtype", "value": "A" }),
+                false,
+                false,
+            ),
+            (serde_json::json!({ "type": "any" }), false, false),
+        ];
+        for (matcher, requester, edns) in cases {
+            let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [{
+                    "id": "main",
+                    "rules": [{
+                        "name": "r",
+                        "matchers": [matcher.clone()],
+                        "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+                    }]
+                }]
+            }))
+            .expect("parse config");
+            let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
+            let pipeline = &runtime.pipelines[0];
+            assert_eq!(pipeline.depends_on_requester, requester, "{matcher}");
+            assert_eq!(pipeline.matches_edns, edns, "{matcher}");
         }
     }
 }
