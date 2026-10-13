@@ -1147,6 +1147,16 @@ impl EngineObserver for PanelMetrics {
         }
     }
 
+    fn inflight_joined(&self, ctx: &RequestContext<'_>) {
+        if let Some(trace) = &self.debug_trace {
+            trace.inflight_joined(ctx);
+        }
+        // 这次请求没有自己去问上游，等的是正在进行的同一个查询：诊断里不然就少了上游这一步
+        // This request did not ask upstream itself but waited on the same query already in
+        // flight: without this the diagnostics trace would show no upstream step at all
+        panel_trace::record("upstream", "joined", "等候正在进行的同一个查询", None);
+    }
+
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {
         if let Some(trace) = &self.debug_trace {
             trace.upstream_attempt(ctx, event);
@@ -2070,11 +2080,11 @@ mod tests {
         }
     }
 
-    /// `EngineObserver` 的全部 14 个方法，与 `TracingObserver` 写出的 `event` 字段值一一对应；
+    /// `EngineObserver` 的全部 15 个方法，与 `TracingObserver` 写出的 `event` 字段值一一对应；
     /// 少转发任何一个，`--debug` 就会悄悄丢掉那一类事件日志。
-    /// All 14 `EngineObserver` methods, paired with the `event` field value `TracingObserver`
+    /// All 15 `EngineObserver` methods, paired with the `event` field value `TracingObserver`
     /// writes for each; dropping any single forward silently loses that event kind under `--debug`.
-    const OBSERVER_EVENT_NAMES: [&str; 14] = [
+    const OBSERVER_EVENT_NAMES: [&str; 15] = [
         "request_started",
         "request_finished",
         "pipeline_selected",
@@ -2085,14 +2095,15 @@ mod tests {
         "cache_lookup",
         "cache_miss",
         "cache_hit",
+        "inflight_joined",
         "upstream_attempt",
         "upstream_result",
         "config_loaded",
         "config_reload_failed",
     ];
 
-    /// 在带目标名的 tracing 订阅者下把 14 个观察者方法各驱动一次，返回它写出的全部日志文本。
-    /// Drives each of the 14 observer methods once under a target-printing tracing subscriber
+    /// 在带目标名的 tracing 订阅者下把 15 个观察者方法各驱动一次，返回它写出的全部日志文本。
+    /// Drives each of the 15 observer methods once under a target-printing tracing subscriber
     /// and returns everything it logged.
     fn captured_observer_output(metrics: &PanelMetrics) -> String {
         use crate::config::Transport;
@@ -2177,6 +2188,7 @@ mod tests {
                     source: None,
                 },
             );
+            metrics.inflight_joined(&ctx);
             metrics.upstream_attempt(
                 &ctx,
                 &UpstreamAttempt {
@@ -2220,9 +2232,9 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// `--debug` 必须把 14 个引擎事件（含后台刷新）逐一转发给上游参考观察者；
+    /// `--debug` 必须把 15 个引擎事件（含后台刷新）逐一转发给上游参考观察者；
     /// 不带 `--debug` 时一条都不该出现。
-    /// `--debug` must forward every one of the 14 engine events (background refresh included)
+    /// `--debug` must forward every one of the 15 engine events (background refresh included)
     /// to the upstream reference observer; without `--debug` none may appear.
     /// 跳转过的请求会在目标 pipeline 下再查一次缓存，但只计一次查找：命中率按请求算，
     /// 否则跳转过的请求命中时，看板上的命中率只有一半。请求结束后不再记着它。
