@@ -437,6 +437,12 @@ pub struct PanelMetrics {
     requests_total: AtomicU64,
     requests_inflight: AtomicUsize,
     cache_lookups_total: AtomicU64,
+    /// 已经计过一次缓存查找、还没结束的请求。请求跳转后会在目标 pipeline 下再查一次，
+    /// 而命中率按请求算（一个请求最多命中一次），所以每个请求只计一次查找。
+    /// Requests still running whose cache lookup is already counted. A request looks again
+    /// under the target pipeline after a jump, while the hit rate is per request (a request
+    /// hits at most once), so each request counts one lookup.
+    cache_lookup_counted: DashMap<u64, ()>,
     cache_hits_fresh: AtomicU64,
     cache_hits_stale: AtomicU64,
     cache_stale_client_timeout: AtomicU64,
@@ -479,6 +485,7 @@ impl Default for PanelMetrics {
             requests_total: AtomicU64::new(0),
             requests_inflight: AtomicUsize::new(0),
             cache_lookups_total: AtomicU64::new(0),
+            cache_lookup_counted: DashMap::new(),
             cache_hits_fresh: AtomicU64::new(0),
             cache_hits_stale: AtomicU64::new(0),
             cache_stale_client_timeout: AtomicU64::new(0),
@@ -986,6 +993,7 @@ impl EngineObserver for PanelMetrics {
         if ctx.background_refresh {
             return;
         }
+        self.cache_lookup_counted.remove(&ctx.request_id);
         self.requests_inflight.fetch_sub(1, Ordering::Relaxed);
         let counter = match outcome.status {
             RequestStatus::Completed => &self.requests_completed,
@@ -1087,7 +1095,12 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.cache_lookup(ctx);
         }
-        if !ctx.background_refresh {
+        if !ctx.background_refresh
+            && self
+                .cache_lookup_counted
+                .insert(ctx.request_id, ())
+                .is_none()
+        {
             self.record_cache_lookup();
         }
     }
@@ -2211,6 +2224,61 @@ mod tests {
     /// 不带 `--debug` 时一条都不该出现。
     /// `--debug` must forward every one of the 14 engine events (background refresh included)
     /// to the upstream reference observer; without `--debug` none may appear.
+    /// 跳转过的请求会在目标 pipeline 下再查一次缓存，但只计一次查找：命中率按请求算，
+    /// 否则跳转过的请求命中时，看板上的命中率只有一半。请求结束后不再记着它。
+    /// A request that jumps looks in the cache again under the target pipeline but
+    /// counts one lookup: the hit rate is per request, or a jumped request's hit would
+    /// show as half a hit on the dashboard. Nothing is kept once the request ends.
+    #[test]
+    fn a_request_that_looks_again_after_a_jump_counts_one_lookup() {
+        use crate::observe::{
+            CacheHit, CacheHitKind, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
+        };
+        use hickory_proto::rr::{DNSClass, RecordType};
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let metrics = PanelMetrics::default();
+        let ctx = RequestContext {
+            request_id: 41,
+            listener_label: "default",
+            client: "192.0.2.10:53000".parse().unwrap(),
+            transport: None,
+            qname: "jumped.example",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            background_refresh: false,
+        };
+        metrics.request_started(&ctx);
+        metrics.pipeline_selected(&ctx, "main");
+        metrics.cache_lookup(&ctx);
+        metrics.cache_miss(&ctx);
+        metrics.pipeline_selected(&ctx, "upstream-default");
+        metrics.cache_lookup(&ctx);
+        metrics.cache_hit(
+            &ctx,
+            &CacheHit {
+                kind: CacheHitKind::Fresh,
+                remaining_ttl: Some(Duration::from_secs(30)),
+                original_ttl: Some(Duration::from_secs(60)),
+                source: None,
+            },
+        );
+        metrics.request_finished(
+            &ctx,
+            &RequestOutcome {
+                latency: Duration::from_millis(1),
+                status: RequestStatus::Completed,
+                response: Some(&[]),
+                error: None,
+            },
+        );
+
+        assert_eq!(metrics.cache_lookups_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.cache_hits_fresh.load(Ordering::Relaxed), 1);
+        assert!(metrics.cache_lookup_counted.is_empty());
+    }
+
     #[test]
     fn debug_forwards_engine_events_to_tracing_observer() {
         let output = captured_observer_output(&PanelMetrics::new(true));
