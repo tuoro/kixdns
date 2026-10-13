@@ -11,7 +11,7 @@
 
 ## 版本和发布
 
-版本是发布那天的日期（UTC）：`2026.10.13`；同一天的第二个版本是 `2026.10.13.2`。只有 `main` 有新提交时才发新版本，不会为了续期重新构建：Release 的附件不会过期。
+版本是发布那天的日期（北京时间）：`2026.10.13`；同一天的第二个版本是 `2026.10.13.2`。只有 `main` 有新提交时才发新版本，不会为了续期重新构建：Release 的附件不会过期。
 
 只发布 `main` 的最新提交，同一个提交只发一次。重跑旧的运行、从别的分支手动触发，都只检查和构建，不发布。不要手动创建 Release，需要补发就重跑发布流程。这个仓库已经去掉了上游构建流程在 Release 上的触发，免得它往手动创建的 Release 上挂没有检查过的二进制。
 
@@ -21,7 +21,7 @@
 2. 构建：Ubuntu 22.04 容器里构建 x86_64 和 arm64，GLIBC 不超过 2.35（`panel/verify-glibc-baseline.sh`）。
 3. 发布：每个架构一个 zip，加一份 `manifest.json`，发成标签为版本号的 Release。说明里列出这一版带进的提交和每个文件的 SHA-256。
 
-往 `main` 的 PR 只做检查和构建，不发布。每天 UTC 03:41 还会单独查一次依赖有没有新的安全公告；有就让那次运行失败，GitHub 会发邮件通知，修好后推到 `main` 会发出新版本。
+往 `main` 的 PR 只做检查和构建，不发布。每天北京时间 11:41（UTC 03:41）还会单独查一次依赖有没有新的安全公告；有就让那次运行失败，GitHub 会发邮件通知，修好后推到 `main` 会发出新版本。
 
 ## Release 里的文件
 
@@ -42,4 +42,4 @@
 
 ## English summary
 
-`main` is upstream plus fixes (held to upstream-PR standards and sent upstream from branches cut from upstream's main) plus panel-only code: the statistics settings, the control socket and metrics, this directory and the release workflow. Every push to `main` is checked, built for x86_64 and arm64 (Ubuntu 22.04, GLIBC ≤ 2.35) and released under a UTC date version (`2026.10.13`, then `2026.10.13.2` the same day), with one zip per architecture and a `manifest.json`. Only the tip of `main` is released, each commit once; a released binary reports `release_version` and `release_commit` in health. A daily run audits the dependencies.
+`main` is upstream plus fixes (held to upstream-PR standards and sent upstream from branches cut from upstream's main) plus panel-only code: the statistics settings, the control socket and metrics, this directory and the release workflow. Every push to `main` is checked, built for x86_64 and arm64 (Ubuntu 22.04, GLIBC ≤ 2.35) and released under a date version in Beijing time (`2026.10.13`, then `2026.10.13.2` the same day), with one zip per architecture and a `manifest.json`. Only the tip of `main` is released, each commit once; a released binary reports `release_version` and `release_commit` in health. A daily run audits the dependencies.
