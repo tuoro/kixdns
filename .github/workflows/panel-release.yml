@@ -1,13 +1,17 @@
-# 面板用内核：推到 panel 就检查、构建并按日期版本发布；往 panel 的 PR 只检查和构建。
-# Kernel for the KixDNS Panel: a push to `panel` is checked, built and released under a
-# date version; a pull request into `panel` is only checked and built.
+# 面板用内核：推到 main 就检查、构建并按日期版本发布；往 main 的 PR 只检查和构建；
+# 每天再查一次依赖有没有新的安全公告。
+# Kernel for the KixDNS Panel: a push to `main` is checked, built and released under a date
+# version; a pull request into `main` is only checked and built; a daily run checks the
+# dependencies for new security advisories.
 name: Panel kernel
 
 on:
   push:
-    branches: [panel]
+    branches: [main]
   pull_request:
-    branches: [panel]
+    branches: [main]
+  schedule:
+    - cron: "41 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -17,7 +21,7 @@ permissions:
 # One release run at a time, so rapid pushes release only the newest; on a pull request a
 # new commit cancels the older checks.
 concurrency:
-  group: panel-kernel-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  group: panel-kernel-${{ github.event_name == 'pull_request' && github.ref || github.event_name == 'schedule' && 'audit' || 'release' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -25,8 +29,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # 每天一次：main（就是最新发布那一版的来源）的依赖有没有新的安全公告。有就让这次运行失败，
+  # GitHub 会给设定定时的人发邮件；修好后推到 main 会发出新版本。
+  # Once a day: do main's dependencies (the source of the latest release) have new security
+  # advisories? If so the run fails and GitHub emails whoever set the schedule; the fix,
+  # pushed to main, releases a new version.
+  audit:
+    name: Daily audit
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install dependency auditor
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+
+      - name: Audit dependencies
+        run: cargo audit --deny unsound --deny yanked
+
   verify:
     name: Verify
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -73,10 +105,11 @@ jobs:
 
   version:
     name: Version
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.pick.outputs.version }}
-      base: ${{ steps.pick.outputs.base }}
+      upstream: ${{ steps.pick.outputs.upstream }}
       publish: ${{ steps.pick.outputs.publish }}
     steps:
       - name: Checkout
@@ -84,17 +117,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 版本是发布那天的 UTC 日期，同一天已经有了就依次加 .2、.3。只发布 panel 的最新提交，
+      # 版本是发布那天的 UTC 日期，同一天已经有了就依次加 .2、.3。只发布 main 的最新提交，
       # 同一个提交只发一次：重跑旧的运行、从别的分支手动触发都只检查和构建，不发布。
+      # 另外记下基于上游 olicesx/kixdns 的哪个提交。
       # The version is the UTC date of the release, with .2, .3 and so on when that day
-      # already has one. Only the tip of panel is released, and each commit once: re-running
-      # an old run or dispatching from another branch only checks and builds.
+      # already has one. Only the tip of main is released, and each commit once: re-running
+      # an old run or dispatching from another branch only checks and builds. The upstream
+      # olicesx/kixdns commit it is based on is recorded too.
       - name: Pick the date version
         id: pick
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          base="$(git merge-base HEAD origin/main)"
+          git fetch --quiet --no-tags https://github.com/olicesx/kixdns.git main
+          upstream="$(git merge-base HEAD FETCH_HEAD)"
           day="$(date -u +%Y.%m.%d)"
           tags="$(git tag -l)"
           version="${day}"
@@ -104,11 +140,11 @@ jobs:
             version="${day}.${n}"
           done
           publish=false
-          if [[ "${EVENT}" != "pull_request" && "${GITHUB_REF}" == "refs/heads/panel" ]]; then
-            tip="$(git rev-parse origin/panel)"
+          if [[ "${EVENT}" != "pull_request" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            tip="$(git rev-parse origin/main)"
             released="$(git tag --points-at "${GITHUB_SHA}" | grep -E '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' || true)"
             if [[ "${GITHUB_SHA}" != "${tip}" ]]; then
-              echo "::notice::${GITHUB_SHA} 已经不是 panel 的最新提交（${tip}），这次不发布"
+              echo "::notice::${GITHUB_SHA} 已经不是 main 的最新提交（${tip}），这次不发布"
             elif [[ -n "${released}" ]]; then
               echo "::notice::${GITHUB_SHA} 已经发布为 ${released}，这次不发布"
             else
@@ -117,10 +153,10 @@ jobs:
           fi
           {
             echo "version=${version}"
-            echo "base=${base}"
+            echo "upstream=${upstream}"
             echo "publish=${publish}"
           } >> "${GITHUB_OUTPUT}"
-          echo "Version: ${version}; base: ${base}; publish: ${publish}"
+          echo "Version: ${version}; upstream: ${upstream}; publish: ${publish}"
 
   build:
     name: Build ${{ matrix.arch }}
@@ -137,7 +173,7 @@ jobs:
     env:
       GLIBC_BASELINE: "2.35"
       VERSION: ${{ needs.version.outputs.version }}
-      BASE_COMMIT: ${{ needs.version.outputs.base }}
+      UPSTREAM_COMMIT: ${{ needs.version.outputs.upstream }}
       PUBLISH: ${{ needs.version.outputs.publish }}
     strategy:
       matrix:
@@ -170,14 +206,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # 编译进健康信息的身份：基于的 fork main 提交总是写；日期版本和提交只在真要发布时写，
+      # 编译进健康信息的身份：基于的上游提交总是写；日期版本和提交只在真要发布时写，
       # PR 和不发布的构建报 null，不冒充一个版本。
-      # The identity compiled into health: the fork main commit it is based on, always; the
+      # The identity compiled into health: the upstream commit it is based on, always; the
       # date version and commit only when this build is released, so PR and unreleased
       # builds report null instead of posing as a version.
       - name: Build release binary
         run: |
-          export KIXDNS_UPSTREAM_COMMIT="${BASE_COMMIT}"
+          export KIXDNS_UPSTREAM_COMMIT="${UPSTREAM_COMMIT}"
           if [[ "${PUBLISH}" == "true" ]]; then
             export KIXDNS_RELEASE_VERSION="${VERSION}"
             export KIXDNS_RELEASE_COMMIT="${GITHUB_SHA}"
@@ -208,10 +244,10 @@ jobs:
             --arg repository "${GITHUB_REPOSITORY}" \
             --arg version "${VERSION}" \
             --arg commit "${GITHUB_SHA}" \
-            --arg base "${BASE_COMMIT}" \
+            --arg upstream "${UPSTREAM_COMMIT}" \
             --arg arch "${{ matrix.arch }}" \
             --argjson protocol "${protocol}" \
-            '{schema_version: 1, repository: $repository, version: $version, commit: $commit, base_commit: $base, arch: $arch, control_protocol: $protocol}' \
+            '{schema_version: 1, repository: $repository, version: $version, commit: $commit, upstream_commit: $upstream, arch: $arch, control_protocol: $protocol}' \
             > "${dir}/KIXDNS_SOURCE.json"
           (cd "${dir}" && sha256sum kixdns KIXDNS_CAPABILITIES.json KIXDNS_SOURCE.json > SHA256SUMS)
           (cd "${dir}" && zip -X -q "../${name}.zip" kixdns KIXDNS_CAPABILITIES.json KIXDNS_SOURCE.json SHA256SUMS)
@@ -233,7 +269,7 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      BASE_COMMIT: ${{ needs.version.outputs.base }}
+      UPSTREAM_COMMIT: ${{ needs.version.outputs.upstream }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
@@ -269,36 +305,36 @@ jobs:
             --arg repository "${GITHUB_REPOSITORY}" \
             --arg version "${VERSION}" \
             --arg commit "${GITHUB_SHA}" \
-            --arg base "${BASE_COMMIT}" \
+            --arg upstream "${UPSTREAM_COMMIT}" \
             --argjson protocol "${protocol}" \
             --slurpfile capabilities panel/capabilities.json \
             --argjson assets "${assets}" \
             '{schema_version: 1, repository: $repository, version: $version, commit: $commit,
-              base_commit: $base, control_protocol: $protocol,
+              upstream_commit: $upstream, control_protocol: $protocol,
               config_capabilities: $capabilities[0].config_capabilities, assets: $assets}' > dist/manifest.json
 
-          # 上一个已发布的版本到这一版之间带进来的提交；第一个版本列出 panel 相对 main 多出的提交。
+          # 上一个已发布的版本到这一版之间带进来的提交；没有上一版时列出相对上游多出的提交。
           # 只认已发布的 Release：没发出去的草稿或孤立标签不算上一版
-          # Commits brought in since the previous published version; the first version lists what
-          # panel adds over main. Only published releases count: a leftover draft or orphan tag
-          # is not a previous version
+          # Commits brought in since the previous published version, or what this adds over
+          # upstream when there is none. Only published releases count: a leftover draft or
+          # orphan tag is not a previous version
           previous="$(gh release list --repo "${GITHUB_REPOSITORY}" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""')"
           if [[ -n "${previous}" ]] && ! git merge-base --is-ancestor "${previous}" HEAD; then
             previous=""
           fi
-          base="${BASE_COMMIT}"
+          base="${UPSTREAM_COMMIT}"
           {
             echo "KixDNS 面板用内核 ${VERSION}。"
             echo
             echo "- 提交：\`${GITHUB_SHA}\`"
-            echo "- 基于 fork main：\`${base}\`"
+            echo "- 基于上游 olicesx/kixdns：\`${base}\`"
             echo "- 控制协议版本：${protocol}"
             echo
             if [[ -n "${previous}" ]]; then
               echo "## 相对 ${previous} 带进的提交"
               range="${previous}..HEAD"
             else
-              echo "## panel 相对 main 多出的提交"
+              echo "## 相对上游多出的提交"
               range="${base}..HEAD"
             fi
             echo
