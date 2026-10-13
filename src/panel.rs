@@ -712,6 +712,11 @@ impl PanelMetrics {
             "status": "ok",
             "pid": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"),
+            // 发布流程编译时写进的身份：日期版本和这一版的提交。本地构建没有，报 null。
+            // The identity the release workflow compiles in: the date version and the
+            // commit of the release. A local build has neither and reports null.
+            "release_version": option_env!("KIXDNS_RELEASE_VERSION"),
+            "release_commit": option_env!("KIXDNS_RELEASE_COMMIT"),
             "upstream_commit": option_env!("KIXDNS_UPSTREAM_COMMIT").unwrap_or("unknown"),
             "patchset": option_env!("KIXDNS_PANEL_PATCHSET").unwrap_or("unknown"),
             "started_at_unix": self.started_at_unix,
@@ -2905,6 +2910,24 @@ mod diagnostic_tests {
             )
             .is_err(),
             "a trial needs a config"
+        );
+    }
+
+    /// 健康信息总带着发布身份这两个字段：发布的构建填上日期版本和提交，本地构建是 null，
+    /// 面板据此区分，不会把缺字段当成别的版本。
+    /// Health always carries the two release-identity fields: a released build fills in the
+    /// date version and commit, a local build reports null, and the panel tells them apart
+    /// instead of reading a missing field as some other version.
+    #[test]
+    fn health_reports_the_release_identity() {
+        let health = PanelMetrics::new(false).health_json();
+        assert_eq!(
+            health.get("release_version"),
+            Some(&serde_json::json!(option_env!("KIXDNS_RELEASE_VERSION")))
+        );
+        assert_eq!(
+            health.get("release_commit"),
+            Some(&serde_json::json!(option_env!("KIXDNS_RELEASE_COMMIT")))
         );
     }
 
