@@ -41,6 +41,7 @@ This document describes the implementation currently on the main branch. Configu
 
 - **MaxMind GeoIP** — MMDB lookup and country/private-IP matchers.
 - **V2Ray GeoSite** — load `.dat` or supported JSON files for domain-category matchers.
+- **GeoSite attributes** — in `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. The domains without an attribute are `geosite: google` together with `geosite_not: google@cn`.
 - **Database reload** — configured GeoSite and GeoIP `.dat` files are watched and reloaded.
 - **DoQ 0-RTT handling** — global and per-upstream settings, with rejection/timeout fallback until restart.
 
@@ -325,7 +326,7 @@ Pipeline selectors support all of the rows above. Request rules support all rows
 - When both sources are configured, MMDB decides two-letter country codes; named tags still come from `geoip_dat_path`.
 - Tag matching is case-insensitive. `country_codes` should normally be a JSON string array, for example `["CN", "cloudflare"]`; a single or comma-separated string is also accepted for compatibility.
 
-Domain suffix and GeoSite matching are also case-insensitive. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
+Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` and `request_domain_suffix` compare whole labels: `example.com` matches `example.com` itself and every subdomain such as `www.example.com`, while `.example.com` matches subdomains only; neither matches `notexample.com`. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
 
 ### Response matchers
 

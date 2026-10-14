@@ -16,6 +16,7 @@ tokio-util = { version = "0.7", features = ["rt", "io"] }
 hickory-proto = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 arc-swap = "1.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter", "local-time"] }
@@ -49,6 +50,11 @@ hyper-util = { version = "0.1", features = ["server", "tokio"] }
 http-body-util = "0.1"
 base64 = "0.22"
 prost = { version = "0.14.4", features = ["derive"] }
+
+# 面板诊断用子进程试跑草稿配置：只在 unix 下给 tokio 补 process / io-util，特性与上面那一行合并
+# The panel's draft trial runs in a child process: on unix only, tokio gains process / io-util, merged with the line above
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", features = ["process", "io-util"] }
 
 [dev-dependencies]
 criterion = "0.5"
