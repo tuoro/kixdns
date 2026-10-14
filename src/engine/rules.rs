@@ -631,17 +631,22 @@ pub(crate) async fn process_response_jump(
     let holds = |inflight_hashes: &[u64], hash: u64| {
         inflight_hashes.contains(&hash) || held_inflight.contains(&Some(hash))
     };
-    // `pipeline_selected` is reported when a pipeline is entered, not again
-    // when a `continue` resumes the same pipeline at its next rule.
-    // `pipeline_selected` 在进入 pipeline 时上报；`continue` 在同一 pipeline
-    // 的下一条规则继续时不再重复上报。
+    // Whether this pass enters a pipeline (by the jump that led here, or a
+    // later one) rather than resuming the same pipeline after a `continue`:
+    // only entering reports `pipeline_selected` and counts against the jump
+    // limit.
+    // 这一轮是不是进入一个 pipeline（经由引来的跳转或之后的跳转），而不是
+    // `continue` 后在同一 pipeline 继续：只有进入才上报 `pipeline_selected`，
+    // 也只有进入才受跳转上限约束。
     let mut entering = true;
     let join_wait = crate::engine::upstream::hedge_timeout(upstream_timeout);
 
     loop {
         response.pipeline = Some(pipeline_id.clone());
         response.upstream = None;
-        if remaining_jumps == 0 {
+        // The limit counts jumps: a `continue` resuming the same pipeline is not one
+        // 上限数的是跳转：`continue` 在同一 pipeline 继续不算一次
+        if entering && remaining_jumps == 0 {
             let resp_bytes = engine_helpers::build_servfail_response(req)?;
             for g in &mut cleanup_guards {
                 g.defuse();

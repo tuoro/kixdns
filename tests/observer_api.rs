@@ -2674,6 +2674,61 @@ async fn a_continue_inside_a_jump_target_enters_it_once() {
     echo_task.abort();
 }
 
+#[tokio::test]
+async fn a_continue_after_the_last_jump_does_not_count_as_a_jump() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    // `main`'s check jumps to `second` (one of two jumps left), whose rule-level
+    // jump to `third` uses the last one; `third` continues past an answer and
+    // its next rule answers.
+    // `main` 的检查跳到 `second`（两次跳转剩一次），`second` 的规则级跳转用掉最后一次进入
+    // `third`；`third` 越过一个应答，由下一条规则回答。
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 500,
+            "response_jump_limit": 2
+        },
+        "pipelines": [
+            forward_then_jump("main", &echo, "second"),
+            {
+                "id": "second",
+                "rules": [{
+                    "name": "onward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "jump_to_pipeline", "pipeline": "third" }]
+                }]
+            },
+            {
+                "id": "third",
+                "rules": [
+                    {
+                        "name": "pass",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+                        "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                        "response_actions_on_match": [{ "type": "continue" }]
+                    },
+                    {
+                        "name": "rest",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+    let (engine, _recorder) = observed_engine(&raw);
+    let response = engine
+        .handle_packet(&query("last.example"), peer())
+        .await
+        .unwrap();
+    assert_eq!(rcode_of(&response), ResponseCode::NoError);
+    let answer = Message::from_bytes(&response).unwrap();
+    assert_eq!(answer.answers.len(), 1, "{answer:?}");
+    echo_task.abort();
+}
+
 /// UDP upstream that answers every query like `spawn_echo_upstream`, after `delay`.
 /// 像 `spawn_echo_upstream` 一样应答每个查询，但先等 `delay`。
 async fn spawn_slow_upstream(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
