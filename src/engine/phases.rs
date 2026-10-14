@@ -1,7 +1,7 @@
 use super::Engine;
 use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
-use crate::engine::observation::{Observed, response_decision_kind};
+use crate::engine::observation::{Observed, cached_source, response_decision_kind};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
@@ -9,7 +9,7 @@ use crate::engine::types::EngineInner;
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
-use crate::matcher::{RuntimeResponseMatcherWithOp, eval_match_chain};
+use crate::matcher::{Requester, RuntimeResponseMatcherWithOp, eval_match_chain};
 use crate::observe::{CacheHit, CacheHitKind, RuleEvaluated, RuleMatched, RulePhase};
 use crate::proto_utils;
 use anyhow::Context;
@@ -43,6 +43,9 @@ pub struct CacheLookupContext<'a> {
     pub tx_id: u16,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
+    /// Whether the request carried EDNS; a background refresh replays it the same way.
+    /// 请求是否带 EDNS；后台刷新照此重放。
+    pub edns_present: bool,
     /// Observer context of the request; cache hits are reported through it.
     /// 所属请求的观察者上下文；缓存命中通过它上报。
     pub observed: Observed<'a>,
@@ -69,6 +72,7 @@ pub(crate) fn check_cache_logged(
         tx_id,
         start: _,
         peer,
+        edns_present,
         observed,
     } = *context;
 
@@ -129,7 +133,10 @@ pub(crate) fn check_cache_logged(
                             qname_ref,
                             qtype,
                             qclass,
-                            peer.ip(),
+                            Requester {
+                                address: peer.ip(),
+                                edns: edns_present,
+                            },
                         );
                     }
                     return None;
@@ -167,7 +174,10 @@ pub(crate) fn check_cache_logged(
                         qname_ref,
                         qtype,
                         qclass,
-                        peer.ip(),
+                        Requester {
+                            address: peer.ip(),
+                            edns: edns_present,
+                        },
                     );
                 }
 
@@ -193,6 +203,7 @@ pub(crate) fn check_cache_logged(
                             kind: CacheHitKind::Stale,
                             remaining_ttl: None,
                             original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                            source: cached_source(hit.upstream.as_deref()),
                         },
                     );
                 }
@@ -258,7 +269,10 @@ pub(crate) fn check_cache_logged(
                         qname_ref,
                         qtype,
                         qclass,
-                        peer.ip(),
+                        Requester {
+                            address: peer.ip(),
+                            edns: edns_present,
+                        },
                     );
                 }
 
@@ -275,6 +289,7 @@ pub(crate) fn check_cache_logged(
                                 hit.original_ttl.saturating_sub(elapsed) as u64,
                             )),
                             original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                            source: cached_source(hit.upstream.as_deref()),
                         },
                     );
                 }
@@ -319,6 +334,7 @@ pub(crate) fn check_stale_cache_logged(
         tx_id,
         start: _,
         peer,
+        edns_present,
         observed,
     } = *context;
     if !state.pipeline.settings.serve_stale {
@@ -395,7 +411,10 @@ pub(crate) fn check_stale_cache_logged(
                     qname_ref,
                     qtype,
                     qclass,
-                    peer.ip(),
+                    Requester {
+                        address: peer.ip(),
+                        edns: edns_present,
+                    },
                 );
             }
 
@@ -406,6 +425,7 @@ pub(crate) fn check_stale_cache_logged(
                         kind,
                         remaining_ttl: None,
                         original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                        source: cached_source(hit.upstream.as_deref()),
                     },
                 );
             }
@@ -494,6 +514,8 @@ pub struct ForwardDecisionContext<'a> {
     pub upstream_timeout: Duration,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
+    /// Whether the request carried EDNS / 请求是否带 EDNS
+    pub edns_present: bool,
     pub skip_cache: bool,
     pub upstream: &'a str,
     pub pre_split_upstreams: Option<&'a Arc<Vec<Arc<str>>>>,
@@ -504,6 +526,17 @@ pub struct ForwardDecisionContext<'a> {
     pub ecs: Option<&'a crate::config::EcsMode>,
     pub allow_reuse: bool,
     pub reused_response: &'a mut Option<ResponseContext>,
+    /// The inflight entry this request registered and still holds after a rule
+    /// continued. The request keeps it for the rest of the decision loop, so its
+    /// waiters get the final answer rather than one a rule continued past; a
+    /// request holding an entry never waits on one. The entry's key keeps its
+    /// waiters to requesters that the rules run after the continue treat alike
+    /// (see `RuntimePipeline::requester`).
+    /// 规则 continue 后本请求仍持有的 inflight 条目。它在决策循环余下的部分一直由
+    /// 本请求持有，等待者拿到的是最终应答，而不是规则越过的那一个；持有条目的请求
+    /// 从不等条目。条目的键只让 continue 之后运行的规则一样对待的请求方等在上面（见
+    /// `RuntimePipeline::requester`）。
+    pub held_inflight: &'a mut Option<InflightCleanupGuard>,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
 }
@@ -536,6 +569,7 @@ pub(crate) async fn handle_forward_decision_logged(
         upstream_timeout,
         start,
         peer,
+        edns_present,
         skip_cache,
         upstream,
         pre_split_upstreams,
@@ -546,6 +580,7 @@ pub(crate) async fn handle_forward_decision_logged(
         ecs,
         allow_reuse,
         reused_response,
+        held_inflight,
         observed,
     } = context;
 
@@ -569,6 +604,12 @@ pub(crate) async fn handle_forward_decision_logged(
     };
     let packet = ecs_packet.as_ref();
 
+    // Only the request that registered an entry hands it an answer. One that
+    // forwards under another's entry (a request holding an entry of its own, a
+    // waiter forwarding itself after the leader went away, or a background
+    // refresh, which registers none) leaves it to its owner.
+    // 只有登记了条目的请求才把应答交给它。在别人的条目下转发的请求（持有自己条目的
+    // 请求、领头请求离开后自己转发的等待者、不登记条目的后台刷新）把它留给条目的主人。
     let mut cleanup_guard = None;
 
     let resp = if allow_reuse {
@@ -588,6 +629,16 @@ pub(crate) async fn handle_forward_decision_logged(
                         ));
                         None
                     }
+                    // A request holding an entry (see `held_inflight`) never waits
+                    // on one: the entry may be its own, which the next rule forwards
+                    // under after a continue, or another request's that waits on
+                    // this one in turn (continue, then jump into each other's
+                    // pipeline). It forwards itself instead.
+                    // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
+                    // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
+                    // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
+                    // 自己转发。
+                    Entry::Occupied(_) if held_inflight.is_some() => None,
                     Entry::Occupied(entry) => {
                         let rx = entry.get().subscribe();
                         Some(rx)
@@ -597,6 +648,9 @@ pub(crate) async fn handle_forward_decision_logged(
                 if let Some(mut rx) = rx
                     && rx.changed().await.is_ok()
                 {
+                    if let Some((observer, ctx)) = observed {
+                        observer.inflight_joined(ctx);
+                    }
                     let result = rx.borrow().clone();
                     match &result {
                         Ok(bytes) => {
@@ -638,6 +692,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     ));
                     None
                 }
+                // See the same arm above / 同上
+                Entry::Occupied(_) if held_inflight.is_some() => None,
                 Entry::Occupied(entry) => {
                     let rx = entry.get().subscribe();
                     Some(rx)
@@ -647,6 +703,9 @@ pub(crate) async fn handle_forward_decision_logged(
             if let Some(mut rx) = rx
                 && rx.changed().await.is_ok()
             {
+                if let Some((observer, ctx)) = observed {
+                    observer.inflight_joined(ctx);
+                }
                 let result = rx.borrow().clone();
                 match &result {
                     Ok(bytes) => {
@@ -864,8 +923,8 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
+                    engine.notify_inflight_waiters(dedupe_hash, &raw).await;
                 }
-                engine.notify_inflight_waiters(dedupe_hash, &raw).await;
 
                 return Ok(ForwardResult::Success(raw));
             }
@@ -937,8 +996,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                     }
-                    engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                     response.upstream = Some(ctx.upstream);
                     Ok(ForwardResult::Success(ctx.raw))
                 }
@@ -980,8 +1039,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                     }
-                    engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                     response.upstream = Some(Arc::from("static"));
                     Ok(ForwardResult::Success(bytes))
                 }
@@ -1009,7 +1068,15 @@ pub(crate) async fn handle_forward_decision_logged(
                             min_ttl,
                             upstream_timeout,
                             skip_cache,
+                            // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
+                            carried_ecs: ecs.and_then(|mode| {
+                                crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
+                            }),
                             observed,
+                            held_inflight: [
+                                cleanup_guard.as_ref().map(|guard| guard.hash),
+                                held_inflight.as_ref().map(|guard| guard.hash),
+                            ],
                         },
                         response,
                     )
@@ -1031,35 +1098,23 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine
+                            .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                            .await;
                     }
-                    engine
-                        .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                        .await;
                     Ok(ForwardResult::Success(resp_bytes))
                 }
                 ResponseActionResult::Continue { ctx } => {
-                    // Defusing here would leave the inflight entry (dedupe_hash)
-                    // in the map without ever notifying it: concurrent same-hash
-                    // requests wait on rx.changed() forever, and — worse — the
-                    // re-evaluated next rule (execution.rs re-applies rules and
-                    // forwards again with the same dedupe_hash) finds the entry
-                    // Occupied and hangs until the outer timeout, which surfaces
-                    // as a client TIMEOUT instead of a fallback answer.
-                    // 此处 defuse 会让 inflight 条目（dedupe_hash）留在 map 中且
-                    // 永远不通知：并发同 hash 请求会永久等待 rx.changed()，更糟的
-                    // 是——continue 后重新评估的下一条规则（execution.rs 重新
-                    // apply_rules 并以相同 dedupe_hash 再次转发）会看到 Occupied
-                    // 条目并挂起直到外层超时，表现为客户端 TIMEOUT 而非 fallback。
-                    //
-                    // So: notify waiters with the response received so far, and
-                    // let the cleanup guard (kept active) remove the entry on
-                    // return, so the next Forward attempt starts fresh.
-                    // 因此：先以已收到的响应通知等待者，并让清理守卫（保持 active）
-                    // 在返回时移除条目，使下一次 Forward 尝试从全新条目开始。
-                    if let Some(ctx_ref) = ctx.as_ref() {
-                        engine
-                            .notify_inflight_waiters(dedupe_hash, &ctx_ref.raw)
-                            .await;
+                    // The rule continued past this response, so it is not the
+                    // answer: keep the entry for the rest of the decision loop
+                    // (see `held_inflight`) instead of handing it to waiters. An
+                    // entry held from an earlier continue is dropped in its place,
+                    // and its waiters forward themselves.
+                    // 规则越过了这个应答，它不是最终结果：条目留给决策循环的后续
+                    // 部分（见 `held_inflight`），不把它交给等待者。之前 continue
+                    // 时持有的条目被它替换掉，那一条的等待者自己转发。
+                    if let Some(guard) = cleanup_guard.take() {
+                        *held_inflight = Some(guard);
                     }
                     Ok(ForwardResult::Continue(Box::new(ctx)))
                 }
@@ -1067,9 +1122,15 @@ pub(crate) async fn handle_forward_decision_logged(
         }
         Err(e) => {
             if response_actions_on_miss.is_empty() {
-                // Only send SERVFAIL when upstream attempts are fully exhausted.
-                // 仅在所有上游尝试都耗尽时发送 SERVFAIL。
-                if e.downcast_ref::<UpstreamFailure>().is_none() {
+                // The stale answer and the SERVFAIL below answer a client once every
+                // upstream attempt is exhausted. A background refresh has no client and
+                // never registered in `inflight`, so it gets the failure itself, which
+                // refresh.rs logs, and neither the cached entry nor other requests'
+                // waiters are touched.
+                // 下面的过期应答和 SERVFAIL 只在所有上游尝试都耗尽时用来应答客户端。
+                // 后台刷新没有客户端，也没在 inflight 里登记，所以把失败原样交回，由
+                // refresh.rs 记录；缓存条目和别的请求的等待者都不受影响。
+                if skip_cache || e.downcast_ref::<UpstreamFailure>().is_none() {
                     return Err(e);
                 }
 
@@ -1087,9 +1148,8 @@ pub(crate) async fn handle_forward_decision_logged(
                         tx_id,
                         start,
                         peer,
-                        // A background refresh never looked the cache up, so it
-                        // must not report a hit either / 后台刷新没有查过缓存，也不能上报命中
-                        observed: if skip_cache { None } else { observed },
+                        edns_present,
+                        observed,
                     },
                     CacheHitKind::StaleUpstreamFailure,
                     response,
@@ -1106,10 +1166,10 @@ pub(crate) async fn handle_forward_decision_logged(
                     );
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine
+                            .notify_inflight_waiters(dedupe_hash, &stale_bytes)
+                            .await;
                     }
-                    engine
-                        .notify_inflight_waiters(dedupe_hash, &stale_bytes)
-                        .await;
                     return Ok(ForwardResult::Success(stale_bytes));
                 }
 
@@ -1148,10 +1208,10 @@ pub(crate) async fn handle_forward_decision_logged(
 
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
+                    engine
+                        .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                        .await;
                 }
-                engine
-                    .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                    .await;
 
                 Ok(ForwardResult::Success(resp_bytes))
             } else {
@@ -1207,12 +1267,20 @@ pub(crate) async fn handle_forward_decision_logged(
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                         }
-                        engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                         response.upstream = Some(ctx.upstream);
                         Ok(ForwardResult::Success(ctx.raw))
                     }
                     ResponseActionResult::Static { bytes, rcode, .. } => {
+                        // The upstream already failed, so a SERVFAIL here means the miss
+                        // actions found no answer either. A refresh gets the failure rather
+                        // than caching SERVFAIL over the entry it was refreshing.
+                        // 上游已经失败，这里的 SERVFAIL 说明 on_miss 动作也没拿到应答。刷新
+                        // 把失败交回，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条。
+                        if skip_cache && rcode == ResponseCode::ServFail {
+                            return Err(e);
+                        }
                         if min_ttl > Duration::from_secs(0) {
                             let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                             engine.insert_dns_cache_entry(
@@ -1230,8 +1298,8 @@ pub(crate) async fn handle_forward_decision_logged(
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                         }
-                        engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                         response.upstream = Some(Arc::from("static"));
                         Ok(ForwardResult::Success(bytes))
                     }
@@ -1268,7 +1336,15 @@ pub(crate) async fn handle_forward_decision_logged(
                                 min_ttl,
                                 upstream_timeout,
                                 skip_cache,
+                                // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
+                                carried_ecs: ecs.and_then(|mode| {
+                                    crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
+                                }),
                                 observed,
+                                held_inflight: [
+                                    cleanup_guard.as_ref().map(|guard| guard.hash),
+                                    held_inflight.as_ref().map(|guard| guard.hash),
+                                ],
                             },
                             response,
                         )
@@ -1276,19 +1352,21 @@ pub(crate) async fn handle_forward_decision_logged(
 
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine
+                                .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                                .await;
                         }
-                        engine
-                            .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                            .await;
                         Ok(ForwardResult::Success(resp_bytes))
                     }
                     ResponseActionResult::Continue { ctx } => {
-                        // Defuse cleanup guard: we're returning Continue which re-enters
-                        // the decision loop. The inflight entry must survive for waiters.
-                        // If we don't defuse, Drop will remove the inflight entry without
-                        // notifying waiters, causing them to hang forever on rx.changed().
-                        if let Some(g) = cleanup_guard.as_mut() {
-                            g.defuse();
+                        // Same as the Continue on a response above (see `held_inflight`).
+                        // Defusing the guard here used to leave the entry behind with
+                        // nobody holding it, so the next Forward waited on it until the
+                        // listener timeout.
+                        // 同上面有应答时的 Continue（见 `held_inflight`）。以前这里 defuse
+                        // 守卫，条目留在表里却没人持有，下一条转发会一直等它到监听器超时。
+                        if let Some(guard) = cleanup_guard.take() {
+                            *held_inflight = Some(guard);
                         }
                         Ok(ForwardResult::Continue(Box::new(ctx)))
                     }
@@ -1481,6 +1559,7 @@ mod refresh_response_rule_tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &crate::matcher::RequesterKey::NONE,
         );
         let request = query();
         let mut reply = Message::new(request.id, MessageType::Response, OpCode::Query);
