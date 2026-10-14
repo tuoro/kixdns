@@ -529,10 +529,13 @@ pub struct ForwardDecisionContext<'a> {
     /// The inflight entry this request registered and still holds after a rule
     /// continued. The request keeps it for the rest of the decision loop, so its
     /// waiters get the final answer rather than one a rule continued past; a
-    /// request holding an entry never waits on one.
+    /// request holding an entry never waits on one. The entry's key keeps its
+    /// waiters to requesters that the rules run after the continue treat alike
+    /// (see `RuntimePipeline::requester`).
     /// 规则 continue 后本请求仍持有的 inflight 条目。它在决策循环余下的部分一直由
     /// 本请求持有，等待者拿到的是最终应答，而不是规则越过的那一个；持有条目的请求
-    /// 从不等条目。
+    /// 从不等条目。条目的键只让 continue 之后运行的规则一样对待的请求方等在上面（见
+    /// `RuntimePipeline::requester`）。
     pub held_inflight: &'a mut Option<InflightCleanupGuard>,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
@@ -601,6 +604,12 @@ pub(crate) async fn handle_forward_decision_logged(
     };
     let packet = ecs_packet.as_ref();
 
+    // Only the request that registered an entry hands it an answer. One that
+    // forwards under another's entry (a request holding an entry of its own, a
+    // waiter forwarding itself after the leader went away, or a background
+    // refresh, which registers none) leaves it to its owner.
+    // 只有登记了条目的请求才把应答交给它。在别人的条目下转发的请求（持有自己条目的
+    // 请求、领头请求离开后自己转发的等待者、不登记条目的后台刷新）把它留给条目的主人。
     let mut cleanup_guard = None;
 
     let resp = if allow_reuse {
@@ -912,8 +921,8 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
+                    engine.notify_inflight_waiters(dedupe_hash, &raw).await;
                 }
-                engine.notify_inflight_waiters(dedupe_hash, &raw).await;
 
                 return Ok(ForwardResult::Success(raw));
             }
@@ -985,8 +994,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                     }
-                    engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                     response.upstream = Some(ctx.upstream);
                     Ok(ForwardResult::Success(ctx.raw))
                 }
@@ -1028,8 +1037,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                     }
-                    engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                     response.upstream = Some(Arc::from("static"));
                     Ok(ForwardResult::Success(bytes))
                 }
@@ -1083,18 +1092,21 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine
+                            .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                            .await;
                     }
-                    engine
-                        .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                        .await;
                     Ok(ForwardResult::Success(resp_bytes))
                 }
                 ResponseActionResult::Continue { ctx } => {
                     // The rule continued past this response, so it is not the
                     // answer: keep the entry for the rest of the decision loop
-                    // (see `held_inflight`) instead of handing it to waiters.
+                    // (see `held_inflight`) instead of handing it to waiters. An
+                    // entry held from an earlier continue is dropped in its place,
+                    // and its waiters forward themselves.
                     // 规则越过了这个应答，它不是最终结果：条目留给决策循环的后续
-                    // 部分（见 `held_inflight`），不把它交给等待者。
+                    // 部分（见 `held_inflight`），不把它交给等待者。之前 continue
+                    // 时持有的条目被它替换掉，那一条的等待者自己转发。
                     if let Some(guard) = cleanup_guard.take() {
                         *held_inflight = Some(guard);
                     }
@@ -1148,10 +1160,10 @@ pub(crate) async fn handle_forward_decision_logged(
                     );
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
+                        engine
+                            .notify_inflight_waiters(dedupe_hash, &stale_bytes)
+                            .await;
                     }
-                    engine
-                        .notify_inflight_waiters(dedupe_hash, &stale_bytes)
-                        .await;
                     return Ok(ForwardResult::Success(stale_bytes));
                 }
 
@@ -1190,10 +1202,10 @@ pub(crate) async fn handle_forward_decision_logged(
 
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
+                    engine
+                        .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                        .await;
                 }
-                engine
-                    .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                    .await;
 
                 Ok(ForwardResult::Success(resp_bytes))
             } else {
@@ -1249,8 +1261,8 @@ pub(crate) async fn handle_forward_decision_logged(
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                         }
-                        engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
                         response.upstream = Some(ctx.upstream);
                         Ok(ForwardResult::Success(ctx.raw))
                     }
@@ -1280,8 +1292,8 @@ pub(crate) async fn handle_forward_decision_logged(
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                         }
-                        engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
                         response.upstream = Some(Arc::from("static"));
                         Ok(ForwardResult::Success(bytes))
                     }
@@ -1330,10 +1342,10 @@ pub(crate) async fn handle_forward_decision_logged(
 
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
+                            engine
+                                .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                                .await;
                         }
-                        engine
-                            .notify_inflight_waiters(dedupe_hash, &resp_bytes)
-                            .await;
                         Ok(ForwardResult::Success(resp_bytes))
                     }
                     ResponseActionResult::Continue { ctx } => {
