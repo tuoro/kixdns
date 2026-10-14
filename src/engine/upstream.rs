@@ -651,6 +651,15 @@ fn label_transport(label: &str) -> Transport {
     }
 }
 
+/// The point by which an upstream should have answered: the budget of a UDP
+/// query's first attempt, after which it is retried.
+/// 上游应当已经应答的时间点：UDP 查询第一次尝试的时间预算，过了就重试。
+pub(crate) fn hedge_timeout(timeout_dur: Duration) -> Duration {
+    timeout_dur
+        .checked_div(HEDGE_TIMEOUT_DIVISOR)
+        .unwrap_or_else(|| Duration::from_millis(DEFAULT_HEDGE_TIMEOUT_MS).max(timeout_dur))
+}
+
 /// UDP forwarder with hedged retry and TCP fallback for better tail latency.
 async fn forward_udp_smart(
     engine: &Engine,
@@ -681,10 +690,7 @@ async fn forward_udp_smart_via(
 
     // Split timeout: first attempt uses 1/N budget (leaving room for TCP fallback)
     // 分割超时：第一次尝试使用 1/N 时间（为 TCP fallback 留出空间）
-    let hedge_timeout = timeout_dur
-        .checked_div(HEDGE_TIMEOUT_DIVISOR)
-        .unwrap_or_else(|| Duration::from_millis(DEFAULT_HEDGE_TIMEOUT_MS).max(timeout_dur));
-    let attempts = [hedge_timeout, timeout_dur];
+    let attempts = [hedge_timeout(timeout_dur), timeout_dur];
 
     for (idx, dur) in attempts.iter().enumerate() {
         match engine.udp_client.send(packet, upstream, *dur).await {
@@ -1133,6 +1139,7 @@ mod refresh_failure_reply_tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &crate::matcher::RequesterKey::NONE,
         )
     }
 
@@ -1195,7 +1202,9 @@ mod refresh_failure_reply_tests {
                     min_ttl: Duration::from_secs(60),
                     upstream_timeout: Duration::from_millis(200),
                     skip_cache: true,
+                    carried_ecs: None,
                     observed: None,
+                    held_inflight: [None, None],
                 },
                 &mut ResponseInfo::default(),
             ),
