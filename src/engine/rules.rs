@@ -70,6 +70,10 @@ pub struct ResponseContext {
     pub transport: Transport,
 }
 
+/// The `source` of the SERVFAIL that a response action's jump answers when no
+/// jumps are left / 响应动作的跳转没有剩余次数时给出的 SERVFAIL 的 `source`
+pub const JUMP_LIMIT: &str = "jump_limit";
+
 #[derive(Debug)]
 pub enum ResponseActionResult {
     Upstream {
@@ -343,7 +347,7 @@ pub(crate) async fn apply_response_actions_observed(
                     return Ok(ResponseActionResult::Static {
                         bytes,
                         rcode: ResponseCode::ServFail,
-                        source: "response_action",
+                        source: JUMP_LIMIT,
                     });
                 }
                 return Ok(ResponseActionResult::Jump {
@@ -627,14 +631,13 @@ pub(crate) async fn process_response_jump(
         response.pipeline = Some(pipeline_id.clone());
         response.upstream = None;
         if remaining_jumps == 0 {
-            let resp_bytes = engine_helpers::build_servfail_response(req)?;
-            for g in &mut cleanup_guards {
-                g.defuse();
-            }
-            for h in &inflight_hashes {
-                engine.notify_inflight_waiters(*h, &resp_bytes).await;
-            }
-            return Ok(resp_bytes);
+            // How many jumps a request has left here depends on the way it came
+            // along the jump path, which no key carries: the waiters on its
+            // entries may have jumps to spare. Returning drops the guards, which
+            // removes the entries, and the waiters forward themselves.
+            // 请求在这里还能跳几次取决于它沿跳转路径怎么来的，键里没有这一项：等在它条目上
+            // 的请求可能还有余量。返回时守卫被丢弃，条目随之移除，等待者自己转发。
+            return engine_helpers::build_servfail_response(req);
         }
 
         let Some(pipeline) = cfg
@@ -684,14 +687,8 @@ pub(crate) async fn process_response_jump(
         loop {
             if let Decision::Jump { pipeline } = decision {
                 if local_jumps == 0 {
-                    let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                    for g in &mut cleanup_guards {
-                        g.defuse();
-                    }
-                    for h in &inflight_hashes {
-                        engine.notify_inflight_waiters(*h, &resp_bytes).await;
-                    }
-                    return Ok(resp_bytes);
+                    // See the jump limit above / 同上面的跳转上限
+                    return engine_helpers::build_servfail_response(req);
                 }
                 pipeline_id = pipeline;
                 response.pipeline = Some(pipeline_id.clone());
@@ -1152,7 +1149,12 @@ pub(crate) async fn process_response_jump(
                                 response.upstream = Some(ctx.upstream);
                                 return Ok(ctx.raw);
                             }
-                            ResponseActionResult::Static { bytes, .. } => {
+                            ResponseActionResult::Static { bytes, source, .. } => {
+                                // A jump limit reached here is this request's own (see
+                                // the jump limit above) / 在这里到达的跳转上限只属于本请求（见上）
+                                if source == JUMP_LIMIT {
+                                    return Ok(bytes);
+                                }
                                 for g in &mut cleanup_guards {
                                     g.defuse();
                                 }
@@ -1177,23 +1179,17 @@ pub(crate) async fn process_response_jump(
                                 continue;
                             }
                             ResponseActionResult::Continue { ctx } => {
-                                // Same inflight hazard as phases.rs: keep the
-                                // entry notified and removed so the next rule's
-                                // Forward (same dedupe_hash) does not hang on an
-                                // Occupied entry. Here the guards live across the
-                                // loop, so remove the entries explicitly.
-                                // 与 phases.rs 相同的 inflight 风险：通知并移除条目，
-                                // 避免下一条规则的 Forward（相同 dedupe_hash）卡在
-                                // Occupied 条目上。此处的守卫跨循环存活，因此显式移除。
-                                if let Some(ctx_ref) = ctx.as_ref() {
-                                    for h in &inflight_hashes {
-                                        engine.notify_inflight_waiters(*h, &ctx_ref.raw).await;
-                                    }
-                                    for g in &mut cleanup_guards {
-                                        g.defuse();
-                                    }
-                                    inflight_hashes.clear();
-                                }
+                                // The rule continued past this answer, so it is not one
+                                // to hand over: drop the guards, which removes the
+                                // entries without it, and their waiters forward
+                                // themselves. The next rule's Forward (same
+                                // dedupe_hash) then finds no entry of this request's to
+                                // wait on.
+                                // 规则越过了这个应答，它不该交给别人：丢弃守卫，条目随之
+                                // 移除而不交出它，等待者自己转发。下一条规则的 Forward
+                                // （相同 dedupe_hash）也就不会等在本请求自己的条目上。
+                                cleanup_guards.clear();
+                                inflight_hashes.clear();
                                 reused_response = ctx;
                                 skip_rules.insert(rule_name.clone());
                                 continue;
