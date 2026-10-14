@@ -134,6 +134,8 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         geoip_filter_countries,
         geosite_data_paths,
         enable_tcp_fallback,
+        statistics_enabled,
+        statistics_anonymize_client_ip,
     } = settings;
 
     (
@@ -195,6 +197,8 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         geoip_filter_countries,
         geosite_data_paths,
         enable_tcp_fallback,
+        statistics_enabled,
+        statistics_anonymize_client_ip,
     )
         .hash(hasher);
 }
@@ -418,6 +422,18 @@ mod tests {
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         let mut after_config = before_config.clone();
         after_config.settings.default_upstream = "1.0.0.1:53".to_string();
+        let before = build_cache_namespaces(&before_config);
+        let after = build_cache_namespaces(&after_config);
+
+        assert_ne!(before.get("first"), after.get("first"));
+        assert_ne!(before.get("second"), after.get("second"));
+    }
+
+    #[test]
+    fn panel_statistics_setting_changes_all_namespaces() {
+        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let mut after_config = before_config.clone();
+        after_config.settings.statistics_enabled = true;
         let before = build_cache_namespaces(&before_config);
         let after = build_cache_namespaces(&after_config);
 
