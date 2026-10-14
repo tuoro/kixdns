@@ -36,6 +36,7 @@ use crate::observe::{
     RequestContext, RequestOutcome, RequestStatus, RuleCacheLookup, RuleEvaluated, RuleMatched,
     RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
 };
+use crate::panel_querylog::{self, QueryLog};
 use crate::panel_trace;
 use sha2::{Digest, Sha256};
 
@@ -475,6 +476,9 @@ pub struct PanelMetrics {
     /// reference observer can only live here and be forwarded to; otherwise the
     /// enhanced build's `--debug` never shows `kixdns::observe` events.
     debug_trace: Option<TracingObserver>,
+    /// 查询日志的交接区：面板来取时才记 / The query log's hand-off ring: records only while the
+    /// panel collects
+    query_log: QueryLog,
 }
 
 impl Default for PanelMetrics {
@@ -510,6 +514,7 @@ impl Default for PanelMetrics {
             active_config: RwLock::new(ActiveConfig::default()),
             query_stats: QueryStats::default(),
             debug_trace: None,
+            query_log: QueryLog::default(),
         }
     }
 }
@@ -730,7 +735,8 @@ impl PanelMetrics {
                 "diagnostics_trace_candidate_v1",
                 "config_static_cname_response_v1",
                 "metrics_upstream_precision_v1",
-                "metrics_upstream_response_latency_v1"
+                "metrics_upstream_response_latency_v1",
+                "querylog_v1"
             ],
         })
     }
@@ -979,6 +985,7 @@ impl EngineObserver for PanelMetrics {
                 self.record_query(ctx.qname, ctx.client.ip());
             }
         }
+        self.query_log.request_started(ctx, panel_trace::active());
         panel_trace::record(
             "request",
             "parsed",
@@ -995,6 +1002,7 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.request_finished(ctx, outcome);
         }
+        self.query_log.request_finished(ctx, outcome);
         if ctx.background_refresh {
             return;
         }
@@ -1016,6 +1024,7 @@ impl EngineObserver for PanelMetrics {
         if !ctx.background_refresh {
             self.record_pipeline_hit(pipeline);
         }
+        self.query_log.pipeline_selected(ctx, pipeline);
         if let Some(previous) = panel_trace::current_pipeline()
             && previous != pipeline
         {
@@ -1039,12 +1048,14 @@ impl EngineObserver for PanelMetrics {
             _ => "response",
         };
         self.record_rule_match(event.pipeline, event.rule, phase);
+        self.query_log.rule_matched(ctx, event);
     }
 
     fn rule_evaluated(&self, ctx: &RequestContext<'_>, event: &RuleEvaluated<'_>) {
         if let Some(trace) = &self.debug_trace {
             trace.rule_evaluated(ctx, event);
         }
+        self.query_log.rule_evaluated(ctx, event);
         let status = if event.matched { "matched" } else { "missed" };
         match event.phase {
             RulePhase::Request => panel_trace::record(
@@ -1099,6 +1110,7 @@ impl EngineObserver for PanelMetrics {
         if event.phase == RulePhase::Request {
             panel_trace::record_decision(event);
         }
+        self.query_log.decision_made(ctx, event);
     }
 
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {
@@ -1119,6 +1131,7 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.cache_miss(ctx);
         }
+        self.query_log.cache_miss(ctx);
         let pipeline = panel_trace::current_pipeline();
         panel_trace::record(
             "response_cache",
@@ -1133,6 +1146,7 @@ impl EngineObserver for PanelMetrics {
             trace.cache_hit(ctx, event);
         }
         self.record_cache_hit(event.kind);
+        self.query_log.cache_hit(ctx, event);
         let ttl = |value: Option<std::time::Duration>| value.map(|value| value.as_secs());
         match event.kind {
             CacheHitKind::Fresh => panel_trace::record(
@@ -1161,6 +1175,7 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.inflight_joined(ctx);
         }
+        self.query_log.inflight_joined(ctx);
         // 这次请求没有自己去问上游，等的是正在进行的同一个查询：诊断里不然就少了上游这一步
         // This request did not ask upstream itself but waited on the same query already in
         // flight: without this the diagnostics trace would show no upstream step at all
@@ -1198,6 +1213,7 @@ impl EngineObserver for PanelMetrics {
             _ => "error",
         };
         self.record_upstream_result(event.upstream, transport, result);
+        self.query_log.upstream_result(ctx, event);
         if !matches!(event.outcome, UpstreamOutcome::Aborted) {
             let key: Arc<str> = Arc::from(format!("{}\0{}", event.upstream, transport));
             // 超时会把整段超时时长计入平均耗时；响应耗时只看真正回了包的尝试。
@@ -1355,6 +1371,17 @@ async fn handle_request(
             Err(message) => json_response(
                 StatusCode::BAD_REQUEST,
                 error_json("stats_query_invalid", message),
+            ),
+        },
+        (&Method::GET, "/v1/querylog") => match parse_querylog_query(request.uri().query()) {
+            Ok((after, limit)) => text_response(
+                StatusCode::OK,
+                "application/json; charset=utf-8",
+                metrics.query_log.collect(after, limit, PROTOCOL_VERSION),
+            ),
+            Err(message) => json_response(
+                StatusCode::BAD_REQUEST,
+                error_json("querylog_query_invalid", message),
             ),
         },
         (&Method::POST, "/v1/stats/clear") => {
@@ -1876,6 +1903,34 @@ fn parse_stats_query(query: Option<&str>) -> Result<(u64, usize), &'static str> 
         }
     }
     Ok((window_seconds, limit))
+}
+
+/// 查询日志的游标：`after` 是面板已经取到的最后一个序号（从没取过是 0），`limit` 默认取满一页
+/// The query log cursor: `after` is the last sequence number the panel has taken (0 before the first),
+/// and `limit` defaults to a full page
+#[cfg(unix)]
+fn parse_querylog_query(query: Option<&str>) -> Result<(u64, usize), &'static str> {
+    let mut after = 0u64;
+    let mut limit = panel_querylog::MAX_PAGE;
+    for pair in query.into_iter().flat_map(|query| query.split('&')) {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err("查询参数格式无效");
+        };
+        match key {
+            "after" => after = value.parse().map_err(|_| "游标无效")?,
+            "limit" => {
+                limit = value.parse().map_err(|_| "条数无效")?;
+                if !(1..=panel_querylog::MAX_PAGE).contains(&limit) {
+                    return Err("条数必须在 1 到 2000 之间");
+                }
+            }
+            _ => return Err("包含不受支持的查询参数"),
+        }
+    }
+    Ok((after, limit))
 }
 
 #[cfg(unix)]
@@ -2948,5 +3003,196 @@ mod diagnostic_tests {
             .collect();
         assert!(capabilities.contains(&"diagnostics_trace_client_v1"));
         assert!(capabilities.contains(&"diagnostics_trace_candidate_v1"));
+    }
+
+    #[test]
+    fn health_declares_the_query_log() {
+        let health = PanelMetrics::new(false).health_json();
+        assert!(
+            health["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "querylog_v1")
+        );
+    }
+
+    #[test]
+    fn the_query_log_cursor_is_checked() {
+        use super::parse_querylog_query;
+        assert_eq!(
+            parse_querylog_query(None),
+            Ok((0, crate::panel_querylog::MAX_PAGE))
+        );
+        assert_eq!(
+            parse_querylog_query(Some("after=42&limit=10")),
+            Ok((42, 10))
+        );
+        assert!(parse_querylog_query(Some("limit=0")).is_err());
+        assert!(parse_querylog_query(Some("limit=2001")).is_err());
+        assert!(parse_querylog_query(Some("after=-1")).is_err());
+        assert!(parse_querylog_query(Some("since=1")).is_err());
+    }
+
+    /// 本机假上游：每个查询都回一条 A 1.2.3.4 / A local fake upstream answering every query with A 1.2.3.4
+    async fn fake_upstream() -> (String, tokio::task::JoinHandle<()>) {
+        use hickory_proto::op::{Message, MessageType, OpCode};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{RData, Record};
+
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; 1500];
+            while let Ok((size, peer)) = socket.recv_from(&mut buffer).await {
+                let Ok(query) = Message::from_vec(&buffer[..size]) else {
+                    continue;
+                };
+                let mut answer =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                if let Some(question) = query.queries.first() {
+                    answer.add_query(question.clone());
+                    answer.add_answer(Record::from_rdata(
+                        question.name().clone(),
+                        60,
+                        RData::A(A::new(1, 2, 3, 4)),
+                    ));
+                }
+                if let Ok(bytes) = answer.to_vec() {
+                    let _ = socket.send_to(&bytes, peer).await;
+                }
+            }
+        });
+        (address, task)
+    }
+
+    /// 回答后检查拦下、上游失败后按「否则」回答、检查后转去别的列表：都记成规则直接回应，不写上游
+    /// An answer check denying, the miss actions answering a failed upstream, and a check jumping
+    /// elsewhere: each is recorded as a rule's own answer, with no upstream named
+    #[tokio::test]
+    async fn the_query_log_follows_answer_checks_through_a_real_engine() {
+        let (upstream, task) = fake_upstream().await;
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let checked = |name: &str, actions: serde_json::Value| {
+            json!({
+                "name": name,
+                "matchers": [{ "type": "domain_suffix", "value": format!("{name}.example") }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }],
+                "response_matchers": [{ "type": "response_answer_ip", "cidr": "1.2.3.0/24" }],
+                "response_actions_on_match": actions
+            })
+        };
+        let engine = engine_for(
+            json!({
+                "settings": { "default_upstream": "127.0.0.1:9", "udp_pool_size": 1, "upstream_timeout_ms": 200 },
+                "pipelines": [
+                    {
+                        "id": "main",
+                        "rules": [
+                            checked("denied", json!([{ "type": "deny" }])),
+                            checked("moved", json!([{ "type": "jump_to_pipeline", "pipeline": "local" }])),
+                            {
+                                "name": "rescued",
+                                "matchers": [{ "type": "domain_suffix", "value": "rescued.example" }],
+                                "actions": [{ "type": "forward", "upstream": "127.0.0.1:9", "transport": "udp" }],
+                                "response_actions_on_miss": [{ "type": "static_ip_response", "ip": "10.9.9.9" }]
+                            }
+                        ]
+                    },
+                    {
+                        "id": "local",
+                        "rules": [{
+                            "name": "answer",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "static_ip_response", "ip": "10.0.0.1" }]
+                        }]
+                    }
+                ]
+            }),
+            Arc::clone(&metrics),
+        );
+        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+        let client = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
+        for name in ["denied.example", "rescued.example", "moved.example"] {
+            let (packet, _) = diagnostic_packet(name, "A").expect("packet");
+            engine.handle_packet(&packet, client).await.expect("query");
+        }
+        task.abort();
+
+        let page: serde_json::Value =
+            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
+                .unwrap();
+        let entries = page["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 3, "{page}");
+        let (denied, rescued, moved) = (&entries[0], &entries[1], &entries[2]);
+        for entry in entries {
+            assert_eq!(entry["outcome"], "static", "{entry}");
+            assert!(entry.get("upstream").is_none(), "{entry}");
+        }
+        assert_eq!(denied["rcode"], "REFUSED");
+        let check = |entry: &serde_json::Value| {
+            entry["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["phase"] == "response")
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(check(denied)["matched"], true, "{denied}");
+        assert_eq!(check(denied)["decision"], "static");
+        assert_eq!(rescued["answers"], json!(["10.9.9.9"]));
+        assert_eq!(check(rescued)["kind"], "decision", "{rescued}");
+        assert_eq!(check(rescued)["decision"], "static");
+        assert_eq!(check(moved)["decision"], "jump", "{moved}");
+        assert_eq!(check(moved)["target"], "local");
+        assert_eq!(moved["answers"], json!(["10.0.0.1"]));
+        assert_eq!(moved["pipeline"], "local");
+    }
+
+    /// 真引擎走一遍：面板取过一次以后，普通查询进日志（谁问的、哪条规则、回了什么），诊断查询不进
+    /// Through a real engine: once the panel has collected, a normal query is recorded (who asked,
+    /// which rule, what came back) and a diagnostic query is not
+    #[tokio::test]
+    async fn the_query_log_records_real_queries_and_leaves_diagnostics_out() {
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(client_split_config("192.168.1.0/24"), Arc::clone(&metrics));
+        let (packet, record_type) = diagnostic_packet("nas.example", "A").expect("packet");
+        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+
+        let home = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
+        engine.handle_packet(&packet, home).await.expect("query");
+        let assigned: IpAddr = "192.168.1.77".parse().unwrap();
+        let _ = run_diagnostic(
+            &engine,
+            &packet,
+            Some(assigned),
+            "nas.example",
+            &record_type,
+        )
+        .await;
+
+        let page: serde_json::Value =
+            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
+                .unwrap();
+        let entries = page["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "{page}");
+        let entry = &entries[0];
+        assert_eq!(entry["client"], "192.168.1.5");
+        assert_eq!(entry["qname"], "nas.example");
+        assert_eq!(entry["qtype"], "A");
+        assert_eq!(entry["outcome"], "static");
+        assert_eq!(entry["rcode"], "NOERROR");
+        assert_eq!(entry["answers"], json!(["10.0.0.1"]));
+        assert_eq!(entry["pipeline"], "main");
+        assert_eq!(entry["rule"], "home");
+        let steps = entry["steps"].as_array().expect("steps");
+        assert_eq!(steps[0]["kind"], "pipeline");
+        assert!(
+            steps.iter().any(|step| step["kind"] == "rule"
+                && step["rule"] == "home"
+                && step["decision"] == "static"),
+            "{entry}"
+        );
     }
 }
