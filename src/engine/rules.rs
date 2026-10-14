@@ -22,7 +22,7 @@ use crate::engine::response::{
 };
 use crate::engine::types::EngineInner;
 use crate::engine::types::InflightMap;
-use crate::engine::upstream::UpstreamFailure;
+use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
@@ -832,6 +832,9 @@ pub(crate) async fn process_response_jump(
                                 // watch channel 使用 changed() 等待更新
                                 match rx.changed().await {
                                     Ok(_) => {
+                                        if let Some((observer, ctx)) = observed {
+                                            observer.inflight_joined(ctx);
+                                        }
                                         // Clone result to avoid holding RwLockReadGuard across await
                                         // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
                                         let result = rx.borrow().clone();
@@ -911,6 +914,9 @@ pub(crate) async fn process_response_jump(
                             // watch channel 使用 changed() 等待更新
                             match rx.changed().await {
                                 Ok(_) => {
+                                    if let Some((observer, ctx)) = observed {
+                                        observer.inflight_joined(ctx);
+                                    }
                                     // Clone result to avoid holding RwLockReadGuard across await
                                     // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
                                     let result = rx.borrow().clone();
@@ -954,6 +960,10 @@ pub(crate) async fn process_response_jump(
                     )
                     .await
                 };
+                // As in handle_forward_decision_logged / 同 handle_forward_decision_logged
+                let resp = resp.and_then(|reply| {
+                    reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply)
+                });
 
                 match resp {
                     Ok((raw, actual_upstream)) => {
@@ -1105,6 +1115,8 @@ pub(crate) async fn process_response_jump(
 
                         match action_result {
                             ResponseActionResult::Upstream { ctx, resp_match } => {
+                                // The reply to a response action's forward / 响应动作转发拿到的应答
+                                reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
                                 // Extract TTL for cache entry (use min for RFC 1035 compliance)
                                 // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
                                 let ttl_secs_cache = extract_ttl(&ctx.msg);
@@ -1156,6 +1168,12 @@ pub(crate) async fn process_response_jump(
                             } => {
                                 pipeline_id = pipeline;
                                 remaining_jumps = next_remaining;
+                                // Rules passed by a continue belong to the pipeline
+                                // being left; the target starts from its first rule,
+                                // as on a rule-level jump.
+                                // continue 越过的规则属于要离开的 pipeline；与规则阶段的
+                                // 跳转一样，目标从第一条规则开始。
+                                skip_rules.clear();
                                 continue;
                             }
                             ResponseActionResult::Continue { ctx } => {
@@ -1183,7 +1201,10 @@ pub(crate) async fn process_response_jump(
                         }
                     }
                     Err(err) => {
-                        if err.downcast_ref::<UpstreamFailure>().is_none() {
+                        // A background refresh answers no client, so it gets the failure
+                        // itself (see handle_forward_decision_logged).
+                        // 后台刷新没有要应答的客户端，失败原样交回（同 handle_forward_decision_logged）。
+                        if skip_cache || err.downcast_ref::<UpstreamFailure>().is_none() {
                             return Err(err);
                         }
                         let resp_bytes = engine_helpers::build_servfail_response(req)?;
@@ -1208,5 +1229,111 @@ pub(crate) async fn process_response_jump(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod response_jump_tests {
+    use crate::engine::core::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    /// Local UDP upstream that answers every query with one A record.
+    /// 本机 UDP 上游：每个查询都回一条 A 记录。
+    async fn spawn_answering_upstream() -> String {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
+                ));
+                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_response_jump_starts_the_target_pipeline_from_its_first_rule() {
+        let upstream = spawn_answering_upstream().await;
+        let any = serde_json::json!([{ "type": "any" }]);
+        let forward = serde_json::json!([{ "type": "forward", "upstream": upstream }]);
+        let jump_to =
+            |target: &str| serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": target }]);
+        let answer = |ip: &str| serde_json::json!([{ "type": "static_ip_response", "ip": ip }]);
+        // "middle" continues past its rule "first", then jumps from the
+        // response phase into "last", which has a rule of the same name.
+        // "middle" 越过自己的 "first" 规则后，在响应阶段跳到 "last"，
+        // 而 "last" 里也有一条同名的规则。
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": upstream, "min_ttl": 60 },
+            "pipelines": [
+                { "id": "entry", "rules": [
+                    { "name": "hop", "matchers": any, "actions": forward,
+                      "response_actions_on_match": jump_to("middle") }
+                ]},
+                { "id": "middle", "rules": [
+                    { "name": "first", "matchers": any, "actions": forward,
+                      "response_actions_on_match": [{ "type": "continue" }] },
+                    { "name": "second", "matchers": any, "actions": forward,
+                      "response_actions_on_match": jump_to("last") }
+                ]},
+                { "id": "last", "rules": [
+                    { "name": "first", "matchers": any, "actions": answer("192.0.2.5") },
+                    { "name": "fallback", "matchers": any, "actions": answer("192.0.2.9") }
+                ]}
+            ]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(
+                &request.to_vec().unwrap(),
+                "127.0.0.1:53000".parse().unwrap(),
+            ),
+        )
+        .await
+        .expect("request finishes")
+        .expect("request succeeds");
+
+        let reply = Message::from_bytes(&bytes).expect("parse reply");
+        let answers: Vec<_> = reply
+            .answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, [Ipv4Addr::new(192, 0, 2, 5)]);
     }
 }

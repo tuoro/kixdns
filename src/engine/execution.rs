@@ -31,12 +31,12 @@ use crate::observe::{
 };
 use crate::proto_utils::parse_quick;
 
-use super::observation::{ObservedRequest, report_decision, report_matched_rules};
+use super::observation::{ObservedRequest, cached_source, report_decision, report_matched_rules};
 use super::response::build_fast_static_response;
-use super::response_log::ResponseLog;
+use super::response_log::{ResponseInfo, ResponseLog};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
-use super::utils::{engine_helpers, is_refreshing};
+use super::utils::{InflightCleanupGuard, engine_helpers, is_refreshing};
 #[cfg(test)]
 use crate::engine::rules::calculate_rule_hash;
 use crate::engine::rules::rule_cache_requester;
@@ -86,6 +86,7 @@ enum FastPathAnswer<'a> {
     Cache {
         original_ttl: u32,
         elapsed_secs: u32,
+        source: Option<&'a str>,
     },
     /// Compiled static rule matched directly / 编译后的静态规则直接命中
     StaticRule {
@@ -334,6 +335,7 @@ impl Engine {
             request_id: self.request_id_counter.fetch_add(1, Ordering::Relaxed),
             listener_label: &self.listener_label,
             client: peer,
+            transport: self.client_transport,
             qname,
             qtype,
             qclass,
@@ -343,7 +345,10 @@ impl Engine {
 
     /// Report a request that `handle_packet_fast` answered without the async
     /// path: the whole lifecycle is emitted in one batch at the answering site.
+    /// `response` is the answer, or the error that stopped the engine from
+    /// building one; the listener then answers SERVFAIL by itself.
     /// 上报由 handle_packet_fast 直接应答的请求：整个生命周期在应答处一次性上报。
+    /// `response` 是应答，或者引擎没能构造出应答的错误；此时由监听器自己回 SERVFAIL。
     fn observe_fast_path(
         &self,
         observer: &dyn EngineObserver,
@@ -351,6 +356,7 @@ impl Engine {
         ctx: &RequestContext<'_>,
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
+        response: Result<&[u8], &anyhow::Error>,
     ) {
         observer.request_started(ctx);
         observer.pipeline_selected(ctx, pipeline_id);
@@ -359,6 +365,7 @@ impl Engine {
             FastPathAnswer::Cache {
                 original_ttl,
                 elapsed_secs,
+                source,
             } => observer.cache_hit(
                 ctx,
                 &CacheHit {
@@ -367,6 +374,7 @@ impl Engine {
                         original_ttl.saturating_sub(elapsed_secs) as u64,
                     )),
                     original_ttl: Some(Duration::from_secs(original_ttl as u64)),
+                    source,
                 },
             ),
             FastPathAnswer::StaticRule {
@@ -425,11 +433,18 @@ impl Engine {
                 );
             }
         }
+        let error = response.as_ref().err().map(|error| format!("{error:#}"));
         observer.request_finished(
             ctx,
             &RequestOutcome {
                 latency: start.elapsed(),
-                status: RequestStatus::Completed,
+                status: if error.is_some() {
+                    RequestStatus::Failed
+                } else {
+                    RequestStatus::Completed
+                },
+                response: response.ok(),
+                error: error.as_deref(),
             },
         );
     }
@@ -625,7 +640,9 @@ impl Engine {
                             FastPathAnswer::Cache {
                                 original_ttl: hit.original_ttl,
                                 elapsed_secs,
+                                source: cached_source(hit.upstream.as_deref()),
                             },
+                            Ok(&hit.bytes),
                         );
                     }
                     let mut log = ResponseLog::new(
@@ -663,10 +680,12 @@ impl Engine {
                     q.edns_present,
                 )
             {
-                let resp = build_fast_static_response(
+                // Report before `?`: a response that cannot be built still ends the
+                // request here, and the listener answers SERVFAIL by itself.
+                // 在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器自己回 SERVFAIL。
+                let built = build_fast_static_response(
                     q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
-                )?;
-                self.incr_fastpath_hits();
+                );
                 if let Some((observer, start)) = observed {
                     self.observe_fast_path(
                         observer,
@@ -678,8 +697,11 @@ impl Engine {
                             rcode,
                             answers: answers.len(),
                         },
+                        built.as_deref(),
                     );
                 }
+                let resp = built?;
+                self.incr_fastpath_hits();
                 let mut log = ResponseLog::new(
                     qname_str,
                     qtype,
@@ -722,10 +744,11 @@ impl Engine {
                 } else if entry.matches(&pipeline_id, qname_str, qtype, qclass, &rule_requester)
                     && let Decision::Static { rcode, answers } = entry.decision.as_ref()
                 {
-                    let resp = build_fast_static_response(
+                    // Report before `?`, as for the compiled static rule above.
+                    // 在 `?` 之前上报，同上面的编译静态规则。
+                    let built = build_fast_static_response(
                         q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
-                    )?;
-                    self.incr_fastpath_hits();
+                    );
                     if let Some((observer, start)) = observed {
                         self.observe_fast_path(
                             observer,
@@ -733,8 +756,11 @@ impl Engine {
                             &self.fast_path_context(peer, qname_str, qtype, qclass),
                             &pipeline_id,
                             FastPathAnswer::CachedRules { record: &record },
+                            built.as_deref(),
                         );
                     }
+                    let resp = built?;
+                    self.incr_fastpath_hits();
                     let mut log = ResponseLog::new(
                         qname_str,
                         qtype,
@@ -783,6 +809,134 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed), None, None)
             .await
+    }
+
+    /// 在响应缓存里找能直接回答这个请求的应答：新鲜的立刻给；过期的按 serve_stale 的设置
+    /// 立刻给，或者先等后台刷新（RFC 8767 客户端超时）再给。上报一次 `cache_lookup`，
+    /// 之后恰好跟一个 `cache_hit` 或 `cache_miss`。
+    /// Look in the response cache for an answer to this request. A fresh entry is
+    /// served at once; an expired one is served per the serve_stale settings, either
+    /// at once or after waiting for the background refresh (RFC 8767 client timeout).
+    /// Reports one `cache_lookup`, followed by exactly one `cache_hit` or `cache_miss`.
+    async fn answer_from_cache(
+        &self,
+        lookup: &phases::CacheLookupContext<'_>,
+        info: &mut ResponseInfo,
+    ) -> Option<Bytes> {
+        let settings = &lookup.state.pipeline.settings;
+        if let Some((observer, ctx)) = lookup.observed {
+            observer.cache_lookup(ctx);
+        }
+        if let Some(resp_bytes) = phases::check_cache_logged(self, lookup, info) {
+            return Some(resp_bytes);
+        }
+
+        // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
+        // try upstream for client_timeout_ms before falling back to stale data.
+        // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
+        // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
+        // Corresponds to Unbound serve-expired-client-timeout
+        //
+        // Design: check_cache() already triggers spawn_background_refresh() for expired entries
+        // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
+        // when the background refresh completes. If client_timeout expires, serve stale.
+        // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
+        // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
+        if settings.serve_stale && settings.serve_stale_client_timeout_ms > 0 {
+            let has_stale = self
+                .cache
+                .get(&lookup.dedupe_hash)
+                .filter(|h| {
+                    h.qtype == u16::from(lookup.qtype)
+                        && h.pipeline_id.as_ref() == lookup.pipeline_id
+                        && h.qname.as_ref() == lookup.qname
+                        && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
+                        && h.rcode != ResponseCode::ServFail
+                        && h.rcode != ResponseCode::Refused
+                })
+                .is_some();
+
+            if has_stale {
+                // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
+                // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
+                // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
+                //
+                // 上界不能取单次上游超时：后台刷新没有外层包裹，UDP 链是
+                // hedge(T/3) + 全量(T) + TCP 回落(T)，最坏约 2.33T，按 T 截断
+                // 会把本来能成功的刷新提前掐掉，白白把新鲜应答降级成过期应答。
+                //
+                // Bound the wait by the smaller of the client wait and what is
+                // left of this request's budget. The stale answer in hand is
+                // only worth anything if it goes out before the outer request
+                // timeout; past that the client gets SERVFAIL and an answer
+                // that was ready is dropped. One upstream timeout is the wrong
+                // bound: a background refresh has no outer wrapper and its UDP
+                // chain is hedge at T/3, a full attempt at T and a TCP fallback
+                // at T, so roughly 2.33T in the worst case. Cutting at T ends
+                // refreshes that would have landed and downgrades a fresh
+                // answer to a stale one for nothing.
+                let budget = Duration::from_millis(request_timeout_ms(settings));
+                let client_timeout = Duration::from_millis(settings.serve_stale_client_timeout_ms)
+                    .min(
+                        budget
+                            .saturating_sub(lookup.start.elapsed())
+                            .saturating_sub(STALE_SERVE_RESERVE),
+                    );
+                let poll_interval = std::time::Duration::from_millis(5);
+                let wait_start = Instant::now();
+
+                // Poll cache for fresh data from background refresh
+                // 轮询缓存等待后台刷新带来的新鲜数据
+                while wait_start.elapsed() < client_timeout {
+                    tokio::time::sleep(poll_interval).await;
+                    // Check if background refresh put fresh data in cache
+                    let Some(fresh_hit) = self.cache.get(&lookup.dedupe_hash) else {
+                        break;
+                    };
+                    if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
+                        // Fresh data available! Serve it.
+                        if let Some(fresh_bytes) = phases::check_cache_logged(self, lookup, info) {
+                            tracing::debug!(
+                                event = "serve_fresh_after_client_wait",
+                                qname = %lookup.qname,
+                                wait_ms = wait_start.elapsed().as_millis() as u64,
+                                "background refresh completed within client_timeout"
+                            );
+                            return Some(fresh_bytes);
+                        }
+                    }
+                }
+
+                // Client timeout expired - serve stale response
+                // 客户端超时 - 返回过期缓存响应
+                if let Some(stale_bytes) = phases::check_stale_cache_logged(
+                    self,
+                    lookup,
+                    CacheHitKind::StaleClientTimeout,
+                    info,
+                ) {
+                    tracing::debug!(
+                        event = "serve_stale_on_client_timeout",
+                        qname = %lookup.qname,
+                        qtype = ?lookup.qtype,
+                        waited_ms = client_timeout.as_millis() as u64,
+                        configured_timeout_ms = settings.serve_stale_client_timeout_ms,
+                        client_ip = %lookup.peer.ip(),
+                        pipeline = %lookup.pipeline_id,
+                        "RFC 8767: client timeout expired, serving stale"
+                    );
+                    return Some(stale_bytes);
+                }
+                // Stale entry evicted by moka - fall through to normal processing
+            }
+        }
+
+        // The response cache had nothing usable for this request
+        // 响应缓存中没有本请求可用的条目
+        if let Some((observer, ctx)) = lookup.observed {
+            observer.cache_miss(ctx);
+        }
+        None
     }
 
     /// Internal handle_packet implementation with skip_cache option
@@ -929,6 +1083,12 @@ impl Engine {
         // (listener timeouts drop the future) are reported as well.
         // 本请求的观察者句柄：借用已解析的查询，drop 时上报 request_finished，
         // 因此被取消的请求（监听器超时会丢弃 future）同样会上报。
+        // In this crate only background refresh skips the cache (see the design
+        // note on handle_packet_internal). Both fields below follow this one
+        // flag, so a new use of skip_cache has to decide on it here.
+        // 本 crate 里只有后台刷新跳过缓存（见 handle_packet_internal 的设计说明）。
+        // 下面两个字段都跟着这一个判断；skip_cache 有了新用法，要在这里一起定。
+        let background_refresh = skip_cache;
         let mut observed = self.observer.as_deref().map(|observer| {
             ObservedRequest::new(
                 observer,
@@ -936,10 +1096,17 @@ impl Engine {
                     request_id,
                     listener_label: &self.listener_label,
                     client: peer,
+                    // A refresh is the engine's own query, whichever listener's request scheduled it.
+                    // 刷新是引擎自己的查询，与安排它的请求来自哪个监听器无关。
+                    transport: if background_refresh {
+                        None
+                    } else {
+                        self.client_transport
+                    },
                     qname: qname_ref,
                     qtype,
                     qclass,
-                    background_refresh: skip_cache,
+                    background_refresh,
                 },
                 start,
             )
@@ -959,6 +1126,10 @@ impl Engine {
         // observer learns the outcome; the block is awaited immediately.
         // 以下代码在多处返回响应；用 async 块包裹使所有出口汇聚到一处，便于观察者
         // 获得请求结果。该块会被立即 await。
+        // Inflight entry the request still holds after a rule continued (see
+        // `ForwardDecisionContext::held_inflight`)
+        // 规则 continue 后本请求仍持有的 inflight 条目
+        let mut held_inflight: Option<InflightCleanupGuard> = None;
         let result: anyhow::Result<Bytes> = async {
             // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
             let pipeline_opt = cfg
@@ -1005,131 +1176,9 @@ impl Engine {
 
             // Background refresh: Skip cache lookup when skip_cache=true
             // 后台刷新：当 skip_cache=true 时跳过缓存查找
-            if !skip_cache {
-                if let Some(observed) = &observed {
-                    observed.observer.cache_lookup(&observed.ctx);
-                }
-                if let Some(resp_bytes) = phases::check_cache_logged(
-                    self,
-                    &phases::CacheLookupContext {
-                        state: &state,
-                        qname: qname_ref,
-                        qtype,
-                        qclass,
-                        pipeline_id: &pipeline_id,
-                        dedupe_hash,
-                        tx_id,
-                        start,
-                        peer: &peer,
-                        edns_present,
-                        observed: observed_ctx,
-                    },
-                    &mut response_log.info,
-                ) {
-                    return Ok(resp_bytes);
-                }
-            }
-
-            // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
-            // try upstream for client_timeout_ms before falling back to stale data.
-            // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
-            // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
-            // Corresponds to Unbound serve-expired-client-timeout
-            //
-            // Design: check_cache() already triggers spawn_background_refresh() for expired entries
-            // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
-            // when the background refresh completes. If client_timeout expires, serve stale.
-            // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
-            // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
             if !skip_cache
-                && cfg.settings.serve_stale
-                && cfg.settings.serve_stale_client_timeout_ms > 0
-            {
-                let has_stale = self
-                    .cache
-                    .get(&dedupe_hash)
-                    .filter(|h| {
-                        h.qtype == u16::from(qtype)
-                            && h.pipeline_id.as_ref() == pipeline_id.as_ref()
-                            && h.qname.as_ref() == qname_ref
-                            && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
-                            && h.rcode != ResponseCode::ServFail
-                            && h.rcode != ResponseCode::Refused
-                    })
-                    .is_some();
-
-                if has_stale {
-                    // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
-                    // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
-                    // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
-                    //
-                    // 上界不能取单次上游超时：后台刷新没有外层包裹，UDP 链是
-                    // hedge(T/3) + 全量(T) + TCP 回落(T)，最坏约 2.33T，按 T 截断
-                    // 会把本来能成功的刷新提前掐掉，白白把新鲜应答降级成过期应答。
-                    //
-                    // Bound the wait by the smaller of the client wait and what is
-                    // left of this request's budget. The stale answer in hand is
-                    // only worth anything if it goes out before the outer request
-                    // timeout; past that the client gets SERVFAIL and an answer
-                    // that was ready is dropped. One upstream timeout is the wrong
-                    // bound: a background refresh has no outer wrapper and its UDP
-                    // chain is hedge at T/3, a full attempt at T and a TCP fallback
-                    // at T, so roughly 2.33T in the worst case. Cutting at T ends
-                    // refreshes that would have landed and downgrades a fresh
-                    // answer to a stale one for nothing.
-                    let budget = Duration::from_millis(request_timeout_ms(&cfg.settings));
-                    let client_timeout =
-                        Duration::from_millis(cfg.settings.serve_stale_client_timeout_ms).min(
-                            budget
-                                .saturating_sub(start.elapsed())
-                                .saturating_sub(STALE_SERVE_RESERVE),
-                        );
-                    let poll_interval = std::time::Duration::from_millis(5);
-                    let wait_start = Instant::now();
-
-                    // Poll cache for fresh data from background refresh
-                    // 轮询缓存等待后台刷新带来的新鲜数据
-                    while wait_start.elapsed() < client_timeout {
-                        tokio::time::sleep(poll_interval).await;
-                        // Check if background refresh put fresh data in cache
-                        let Some(fresh_hit) = self.cache.get(&dedupe_hash) else {
-                            break;
-                        };
-                        if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64
-                        {
-                            // Fresh data available! Serve it.
-                            if let Some(fresh_bytes) = phases::check_cache_logged(
-                                self,
-                                &phases::CacheLookupContext {
-                                    state: &state,
-                                    qname: qname_ref,
-                                    qtype,
-                                    qclass,
-                                    pipeline_id: &pipeline_id,
-                                    dedupe_hash,
-                                    tx_id,
-                                    start,
-                                    peer: &peer,
-                                    edns_present,
-                                    observed: observed_ctx,
-                                },
-                                &mut response_log.info,
-                            ) {
-                                tracing::debug!(
-                                    event = "serve_fresh_after_client_wait",
-                                    qname = %qname_ref,
-                                    wait_ms = wait_start.elapsed().as_millis() as u64,
-                                    "background refresh completed within client_timeout"
-                                );
-                                return Ok(fresh_bytes);
-                            }
-                        }
-                    }
-
-                    // Client timeout expired - serve stale response
-                    // 客户端超时 - 返回过期缓存响应
-                    if let Some(stale_bytes) = phases::check_stale_cache_logged(
-                        self,
+                && let Some(resp_bytes) = self
+                    .answer_from_cache(
                         &phases::CacheLookupContext {
                             state: &state,
                             qname: qname_ref,
@@ -1143,29 +1192,11 @@ impl Engine {
                             edns_present,
                             observed: observed_ctx,
                         },
-                        CacheHitKind::StaleClientTimeout,
                         &mut response_log.info,
-                    ) {
-                        tracing::debug!(
-                            event = "serve_stale_on_client_timeout",
-                            qname = %qname_ref,
-                            qtype = ?qtype,
-                            waited_ms = client_timeout.as_millis() as u64,
-                            configured_timeout_ms = cfg.settings.serve_stale_client_timeout_ms,
-                            client_ip = %peer.ip(),
-                            pipeline = %pipeline_id,
-                            "RFC 8767: client timeout expired, serving stale"
-                        );
-                        return Ok(stale_bytes);
-                    }
-                    // Stale entry evicted by moka - fall through to normal processing
-                }
-            }
-
-            // The response cache had nothing usable for this request
-            // 响应缓存中没有本请求可用的条目
-            if !skip_cache && let Some(observed) = &observed {
-                observed.observer.cache_miss(&observed.ctx);
+                    )
+                    .await
+            {
+                return Ok(resp_bytes);
             }
 
             // 优化：保持 Cow<str> 以延迟分配，避免不必要的 String 分配
@@ -1177,6 +1208,8 @@ impl Engine {
             let mut current_pipeline_id = pipeline_id.clone();
             let mut current_uses_client_ip =
                 pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
+            // 这条路线上有没有按 EDNS 判断的 pipeline（见跳转后的缓存查找）/ Whether a pipeline on the route so far matches on EDNS (see the lookup after a jump)
+            let mut route_matches_edns = pipeline_opt.is_some_and(|p| p.matches_edns);
             // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
             let qname_bytes = qname.as_bytes();
             // Reuse dedupe_hash from earlier computation (includes ECS key isolation)
@@ -1256,7 +1289,17 @@ impl Engine {
             // Without this, the response_jump_limit could be bypassed via:
             //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
             let mut jump_count = 0;
+            // A refresh renews the entry under `refresh_key`. Once a rule has continued
+            // past an answer, the outcome may be a static answer or come from a jump
+            // target, which do not renew it: see the Static branch and the Success arm.
+            // 刷新更新的是 `refresh_key` 下的条目。规则越过一个应答之后，结果可能是静态
+            // 应答或来自跳转目标，它们不会更新这条：见 Static 分支和 Success 分支。
+            let refresh_key = dedupe_hash;
+            let mut refresh_passed_an_answer = false;
+            // 决策循环的第几轮：第一轮在任何转发之前 / Which pass of the decision loop: the first runs before anything is forwarded
+            let mut pass = 0u32;
             'decision_loop: loop {
+                pass += 1;
                 while let Decision::Jump { pipeline } = &decision {
                     jump_count += 1;
                     if jump_count > response_jump_limit {
@@ -1272,6 +1315,7 @@ impl Engine {
                         current_pipeline_id = p.id.clone();
                         response_log.info.pipeline = Some(current_pipeline_id.clone());
                         current_uses_client_ip = p.uses_client_ip;
+                        route_matches_edns |= p.matches_edns;
                         if let Some(observed) = &observed {
                             observed
                                 .observer
@@ -1293,6 +1337,53 @@ impl Engine {
                             jump_ecs_key.as_ref(),
                             &p.requester.key(requester, Some(&self.geoip_manager)),
                         );
+                        // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
+                        // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
+                        // 上游。以下情况不查，保持原样：
+                        // - 不在第一轮：continue 之后，请求已经越过了一个应答，后面的规则可能复用它；
+                        // - 目标的应答因「谁在问」而不同：它给别的请求方的应答不一定是给这一个的；
+                        // - 后台刷新走不回这条路线：刷新重放的请求不带 EDNS、类别固定是 IN，路线上（含
+                        //   pipeline 的选择）按 EDNS 判断，或者查询类别不是 IN 时，刷新可能走另一条路线，
+                        //   把别处的应答写进这个键，或者写进另一个键。
+                        // After a jump, look in the response cache again under the target pipeline's
+                        // key. A forwarded answer is stored under that key, while the entry lookup used
+                        // the entry pipeline's, so a request that jumped never found it and went upstream
+                        // every time. These cases do not look and keep the current behaviour:
+                        // - after the first pass: past a continue the request has passed over an answer
+                        //   that later rules may reuse;
+                        // - a target whose answer differs by who is asking: its answer to another
+                        //   requester is not necessarily its answer to this one;
+                        // - a route a background refresh cannot repeat: the refresh replays the query
+                        //   without EDNS and in class IN, so when the route (pipeline selection included)
+                        //   matches on EDNS, or the query class is not IN, it may take another route and
+                        //   write another answer under this key, or write under another key.
+                        if !skip_cache
+                            && pass == 1
+                            && !p.depends_on_requester
+                            && !route_matches_edns
+                            && qclass == DNSClass::IN
+                            && !cfg.selection_matches_edns()
+                            && let Some(resp_bytes) = self
+                                .answer_from_cache(
+                                    &phases::CacheLookupContext {
+                                        state: &state,
+                                        qname,
+                                        qtype,
+                                        qclass,
+                                        pipeline_id: &current_pipeline_id,
+                                        dedupe_hash,
+                                        tx_id,
+                                        start,
+                                        peer: &peer,
+                                        edns_present,
+                                        observed: observed_ctx,
+                                    },
+                                    &mut response_log.info,
+                                )
+                                .await
+                        {
+                            return Ok(resp_bytes);
+                        }
                         skip_rules.clear();
                         decision = self.apply_rules(
                             &state,
@@ -1323,7 +1414,32 @@ impl Engine {
                         anyhow::bail!("unresolved pipeline jump");
                     }
                     Decision::Static { rcode, answers } => {
+                        // A static answer from a pipeline that matches on the client
+                        // is that client's alone: let the waiters run the rules
+                        // themselves rather than hand it to them.
+                        // 按客户端匹配的 pipeline 给出的静态应答只属于这个客户端：让
+                        // 等待者自己走规则，不把它交给它们。
+                        if current_uses_client_ip {
+                            drop(held_inflight.take());
+                        }
                         response_log.info.upstream = Some(Arc::from("static"));
+                        // After a refresh continued past an answer: a SERVFAIL here (a
+                        // jump target that does not exist, the jump limit, or a static
+                        // SERVFAIL the rules configure) ends the refresh as a failure
+                        // and the entry stays; any other static answer replaces the
+                        // entry, which handle_static_decision stores again when it
+                        // caches the answer there.
+                        // 刷新越过一个应答之后：这里的 SERVFAIL（跳转目标不存在、到了跳转
+                        // 上限，或规则配置的静态 SERVFAIL）让刷新以失败结束，条目保留；其他
+                        // 静态应答取代这条，handle_static_decision 在那里缓存应答时会重新写入。
+                        if refresh_passed_an_answer {
+                            if rcode == ResponseCode::ServFail {
+                                return Err(phases::refresh_found_no_answer(
+                                    "no answer after a continue",
+                                ));
+                            }
+                            self.cache_invalidate(&refresh_key);
+                        }
                         return phases::handle_static_decision(
                             self,
                             &phases::StaticDecisionContext {
@@ -1382,6 +1498,7 @@ impl Engine {
                                 ecs: ecs.as_ref(),
                                 allow_reuse,
                                 reused_response: &mut reused_response,
+                                held_inflight: &mut held_inflight,
                                 observed: observed_ctx,
                             },
                             &mut response_log.info,
@@ -1389,8 +1506,27 @@ impl Engine {
                         .await;
 
                         match res {
-                            Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
+                            Ok(phases::ForwardResult::Success(bytes)) => {
+                                // After a refresh continued past an answer and then
+                                // jumped, the answer is not stored under `refresh_key`:
+                                // unless it is a failure (SERVFAIL, or the target's
+                                // stale answer served on one, the only cache hit a
+                                // refresh can have), the entry there no longer matches
+                                // the rules.
+                                // 刷新越过一个应答又跳转之后，应答不会存进 `refresh_key`：
+                                // 只要不是失败（SERVFAIL，或失败时返回的目标旧结果，也是
+                                // 刷新唯一可能的缓存命中），那里的条目就已经和规则对不上。
+                                if refresh_passed_an_answer
+                                    && dedupe_hash != refresh_key
+                                    && !phases::is_servfail(&bytes)
+                                    && !response_log.info.cache_hit
+                                {
+                                    self.cache_invalidate(&refresh_key);
+                                }
+                                return Ok(bytes);
+                            }
                             Ok(phases::ForwardResult::Continue(ctx)) => {
+                                refresh_passed_an_answer |= skip_cache && ctx.is_some();
                                 reused_response = *ctx;
                                 skip_rules.insert(rule_name.clone());
                                 let skip_ref = if skip_rules.is_empty() {
@@ -1430,6 +1566,12 @@ impl Engine {
                                 continue 'decision_loop;
                             }
                             Err(e) => {
+                                // A background refresh answers no client: it gets the
+                                // failure itself, which refresh.rs logs.
+                                // 后台刷新没有要应答的客户端：失败原样交回，由 refresh.rs 记录。
+                                if skip_cache {
+                                    return Err(e);
+                                }
                                 // A rule continued (response_actions_on_match: [continue])
                                 // and the next Forward attempt failed. The client must
                                 // receive a definitive answer, never silence: DNS clients
@@ -1454,13 +1596,20 @@ impl Engine {
             }
         }
         .await;
+        // A request that continued still holds its entry here: its waiters get the
+        // final answer. On failure, or if the request is cancelled, the guard drops
+        // and removes the entry, and the waiters forward themselves.
+        // continue 过的请求走到这里仍持有条目：等待者拿到最终应答。失败或请求被
+        // 取消时，守卫被丢弃并移除条目，等待者自己转发。
+        if let Some(mut guard) = held_inflight.take()
+            && let Ok(bytes) = &result
+        {
+            guard.defuse();
+            self.notify_inflight_waiters(guard.hash, bytes).await;
+        }
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
-            observed.set_status(if result.is_ok() {
-                RequestStatus::Completed
-            } else {
-                RequestStatus::Failed
-            });
+            observed.finish(&result);
         }
         result
     }
@@ -1857,6 +2006,373 @@ mod tests {
         assert!(
             engine.cache_get(&new_target_key).is_none(),
             "the response jump must not populate the active generation"
+        );
+    }
+
+    /// 用一条 A 记录 `answer` 回应每个查询的本机 UDP 上游，并数收到了多少个查询。
+    /// A local UDP upstream that answers every query with one A record `answer`,
+    /// counting the queries it receives.
+    async fn spawn_answering_upstream(
+        answer: std::net::Ipv4Addr,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = queries.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
+                let mut resp = Message::new(query.id(), MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A(answer)),
+                ));
+                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+            }
+        });
+        (addr, queries)
+    }
+
+    /// 只收不答的本机 UDP 上游，数收到了多少个数据包。
+    /// A local UDP upstream that never answers, counting the datagrams it receives.
+    async fn spawn_silent_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        let datagrams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = datagrams.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while sock.recv_from(&mut buf).await.is_ok() {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        (addr, datagrams)
+    }
+
+    fn continue_config(
+        pipeline_select: serde_json::Value,
+        pipelines: serde_json::Value,
+    ) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 100,
+                "enable_tcp_fallback": false
+            },
+            "pipeline_select": pipeline_select,
+            "pipelines": pipelines
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    fn example_query() -> Vec<u8> {
+        let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
+        request.to_vec().unwrap()
+    }
+
+    fn first_a_record(response: anyhow::Result<Bytes>) -> Option<std::net::Ipv4Addr> {
+        let response = Message::from_bytes(&response.expect("answer")).expect("parse");
+        match response.answers.first().map(|record| &record.data) {
+            Some(RData::A(address)) => Some(address.0),
+            _ => None,
+        }
+    }
+
+    /// 同一个 example.com 查询从 `clients` 同时发出：第一个登记 inflight，第二个等在
+    /// 它上面。按顺序返回两个应答的 A 记录（没有就是 None），并断言没有留下 inflight 条目。
+    /// The same example.com query sent from `clients` at once: the first registers
+    /// in inflight and the second waits on it. Returns both answers' A records in
+    /// order (None without one) and asserts that no inflight entry is left behind.
+    async fn ask_at_once(engine: &Engine, clients: [&str; 2]) -> [Option<std::net::Ipv4Addr>; 2] {
+        let packet = example_query();
+        let [first, second] = clients.map(|client| client.parse::<SocketAddr>().unwrap());
+        // 修复前会挂到监听器超时；5 秒只用来区分「挂住」
+        // Before the fix these hung until the listener timeout; 5 s only tells a hang apart
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                engine.handle_packet(&packet, first),
+                engine.handle_packet(&packet, second)
+            )
+        })
+        .await
+        .expect("a request after a continue must not hang");
+        assert!(
+            engine.inflight.is_empty(),
+            "a finished request must not leave its inflight entry behind"
+        );
+        [first_a_record(first), first_a_record(second)]
+    }
+
+    const ONE_CLIENT: [&str; 2] = ["127.0.0.1:53000"; 2];
+
+    /// 先 continue 到下一条规则的配置：`first` 转发到 `first_upstream`，失败后 continue，
+    /// 下一条是 `next`。
+    /// A configuration that continues on a miss: `first` forwards to
+    /// `first_upstream` and continues when it fails; the next rule is `next`.
+    fn continue_on_miss_to(first_upstream: &str, next: serde_json::Value) -> RuntimePipelineConfig {
+        continue_config(
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "main",
+                "rules": [
+                    {
+                        "name": "first",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": first_upstream }],
+                        "response_actions_on_miss": [{ "type": "continue" }]
+                    },
+                    next
+                ]
+            }]),
+        )
+    }
+
+    /// 同一份配置下，一个请求单独发出和两个请求同时发出，`first` 的死上游各收到多少
+    /// 数据包。两者相等说明等待者没有自己再转发一遍。
+    /// Datagrams the dead `first` upstream receives for one request alone and for
+    /// two at once under the same configuration. Equal counts show the waiting
+    /// request did not forward again itself.
+    async fn datagrams_alone_and_at_once(
+        next: serde_json::Value,
+    ) -> (usize, usize, [Option<std::net::Ipv4Addr>; 2]) {
+        let (alone, sent_alone) = spawn_silent_upstream().await;
+        let engine = Engine::new(
+            continue_on_miss_to(&alone, next.clone()),
+            "test".to_string(),
+        )
+        .expect("engine");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&example_query(), ONE_CLIENT[0].parse().unwrap()),
+        )
+        .await
+        .expect("a request after a continue must not hang")
+        .expect("answer");
+
+        let (silent, sent) = spawn_silent_upstream().await;
+        let engine =
+            Engine::new(continue_on_miss_to(&silent, next), "test".to_string()).expect("engine");
+        let answers = ask_at_once(&engine, ONE_CLIENT).await;
+        (
+            sent_alone.load(Ordering::Relaxed),
+            sent.load(Ordering::Relaxed),
+            answers,
+        )
+    }
+
+    /// on_miss 里的 continue 要把请求交给下一条规则。以前这里卸掉清理守卫，条目留在
+    /// 表里却没人持有：下一条规则以相同 dedupe_hash 转发时等的正是这一条，请求和等在
+    /// 它上面的请求一起挂到监听器超时。现在条目由请求一直持有，等待者拿到下一条规则
+    /// 的应答，不会自己再转发一遍。
+    /// A continue in response_actions_on_miss must hand the request to the next
+    /// rule. The guard used to be defused here, leaving the entry behind with
+    /// nobody holding it: the next rule's Forward, under the same dedupe_hash,
+    /// waited on that very entry, and the request hung until the listener timeout
+    /// along with every request waiting on it. Now the request keeps holding the
+    /// entry, and waiters get the next rule's answer without forwarding again.
+    #[tokio::test]
+    async fn a_continue_on_miss_hands_the_request_to_the_next_rule() {
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let (alone, at_once, answers) = datagrams_alone_and_at_once(serde_json::json!({
+            "name": "next",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": answering }]
+        }))
+        .await;
+
+        assert_eq!(answers, [Some(answer); 2]);
+        assert_eq!(
+            at_once, alone,
+            "the waiting request must get the answer, not forward again"
+        );
+    }
+
+    /// continue 之后以静态应答结束时，等待者拿到同一个应答，不会自己再转发。
+    /// When a continue ends on a static answer, waiters get that same answer
+    /// without forwarding again.
+    #[tokio::test]
+    async fn waiters_get_a_static_answer_reached_after_a_continue() {
+        let (alone, at_once, answers) = datagrams_alone_and_at_once(serde_json::json!({
+            "name": "static",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "static_ip_response", "ip": "192.0.2.30" }]
+        }))
+        .await;
+
+        assert_eq!(answers, [Some("192.0.2.30".parse().unwrap()); 2]);
+        assert_eq!(
+            at_once, alone,
+            "the waiting request must get the answer, not forward again"
+        );
+    }
+
+    /// continue 之后下一条规则也失败：两个请求都拿到 SERVFAIL，不挂，也不留下条目。
+    /// When the next rule after a continue fails too, both requests get SERVFAIL,
+    /// neither hangs, and no entry is left behind.
+    #[tokio::test]
+    async fn a_failure_after_a_continue_answers_every_request() {
+        let (silent, _) = spawn_silent_upstream().await;
+        let engine = Engine::new(
+            continue_on_miss_to(
+                &silent,
+                serde_json::json!({
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": silent }]
+                }),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [None; 2]);
+    }
+
+    /// `check` 转发到 `checked`，应答来自它就 continue；`then` 接在后面。
+    /// `check` forwards to `checked` and continues when the answer comes from it;
+    /// `then` follows.
+    fn continue_on_match_rules(checked: &str, then: serde_json::Value) -> serde_json::Value {
+        let mut rules = vec![serde_json::json!({
+            "name": "check",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": checked }],
+            "response_matchers": [{ "type": "upstream_equals", "value": checked }],
+            "response_actions_on_match": [{ "type": "continue" }]
+        })];
+        rules.extend(then.as_array().expect("rules").iter().cloned());
+        serde_json::Value::Array(rules)
+    }
+
+    /// on_match 里的 continue：规则越过了第一个上游的应答，等待者也必须拿到最终
+    /// 应答。以前它们拿到的是被越过的那个，例如防污染配置里被判为污染的应答。
+    /// A continue in response_actions_on_match: the rule continued past the first
+    /// upstream's answer, so waiters must get the final answer too. They used to
+    /// get the one continued past, such as an answer judged poisoned.
+    #[tokio::test]
+    async fn waiters_get_the_final_answer_after_a_continue_on_match() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{
+                    "id": "main",
+                    "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }]))
+                }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [Some(answer); 2]);
+    }
+
+    /// 按客户端匹配的 pipeline 在 continue 之后给出的静态应答只属于那个客户端（例如
+    /// 只对某台设备屏蔽），不能交给等在它上面的另一个客户端。
+    /// A static answer a client-matching pipeline gives after a continue belongs to
+    /// that client alone (such as blocking one device) and must not reach another
+    /// client waiting on it.
+    #[tokio::test]
+    async fn a_client_specific_static_answer_is_not_handed_to_another_client() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([]),
+                serde_json::json!([{
+                    "id": "main",
+                    "rules": continue_on_match_rules(&checked, serde_json::json!([
+                        {
+                            "name": "block",
+                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                            "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+                        },
+                        {
+                            "name": "next",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": answering }]
+                        }
+                    ]))
+                }]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        let blocked = std::net::Ipv4Addr::UNSPECIFIED;
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some(blocked), Some(answer)]
+        );
+    }
+
+    /// 两个 pipeline 都在 continue 之后按客户端跳进对方。持有条目的请求如果还会去等
+    /// 别人，两个请求就各自持有对方在等的条目，互相等到监听器超时。
+    /// Two pipelines that each continue and then jump into the other by client. If
+    /// a request holding an entry still waited on others, each request would hold
+    /// what the other waits on, and both would wait until the listener timeout.
+    #[tokio::test]
+    async fn requests_holding_entries_never_wait_on_each_other() {
+        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let answer = "192.0.2.20".parse().unwrap();
+        let (answering, _) = spawn_answering_upstream(answer).await;
+        let pipeline = |id: &str, client: &str, other: &str| {
+            serde_json::json!({
+                "id": id,
+                "rules": continue_on_match_rules(&checked, serde_json::json!([
+                    {
+                        "name": "cross",
+                        "matchers": [{ "type": "client_ip", "cidr": client }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": other }]
+                    },
+                    {
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }
+                ]))
+            })
+        };
+        let engine = Engine::new(
+            continue_config(
+                serde_json::json!([
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ]),
+                serde_json::json!([
+                    pipeline("p1", "10.0.0.1/32", "p2"),
+                    pipeline("p2", "10.0.0.2/32", "p1")
+                ]),
+            ),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some(answer); 2]
         );
     }
 
@@ -3235,6 +3751,277 @@ mod tests {
         );
     }
 
+    /// 一条 `stale.com` 的 A 查询。 / A query for `stale.com` A.
+    fn stale_com_query() -> Vec<u8> {
+        let mut packet = vec![0u8; 12];
+        packet[0] = 0xAA;
+        packet[1] = 0xBB;
+        packet[5] = 1;
+        packet.extend_from_slice(b"\x05stale\x03com\x00\x00\x01\x00\x01");
+        packet
+    }
+
+    /// 没有人监听的本机端口：查询被拒或得不到应答，不会发到机器外面。
+    /// A local port nobody listens on: queries are refused or go unanswered, and
+    /// nothing leaves the machine.
+    const DEAD_UPSTREAM: &str = "127.0.0.1:9";
+
+    /// 只有一个死上游、上游超时很短的引擎，以及 `stale.com` 查询的去重 hash。
+    /// An engine whose only upstream is dead, with a short upstream timeout, plus
+    /// the dedupe hash of the `stale.com` query.
+    fn engine_without_an_answering_upstream(serve_stale: bool) -> (Engine, u64) {
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings: GlobalSettings {
+                    default_upstream: DEAD_UPSTREAM.to_string(),
+                    upstream_timeout_ms: 100,
+                    serve_stale,
+                    serve_stale_ttl_reset: true,
+                    ..Default::default()
+                },
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "lbl".to_string(),
+        )
+        .expect("initialize engine");
+
+        let pipeline_id: Arc<str> = Arc::from("default");
+        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+            engine.state.load().cache_namespace(&pipeline_id),
+            &pipeline_id,
+            b"stale.com",
+            RecordType::A,
+            DNSClass::IN,
+            None,
+            &crate::matcher::RequesterKey::NONE,
+        );
+        (engine, dedupe_hash)
+    }
+
+    fn engine_from_json(raw: serde_json::Value) -> Engine {
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "lbl".to_string(),
+        )
+        .expect("initialize engine")
+    }
+
+    /// 一条已经过期的 `stale.com` 缓存条目。 / An expired `stale.com` cache entry.
+    fn stale_entry(pipeline_id: &str) -> Arc<CacheEntry> {
+        Arc::new(CacheEntry {
+            bytes: Bytes::from_static(b"old_resp"),
+            rcode: ResponseCode::NoError,
+            upstream: None,
+            qname: Arc::from("stale.com"),
+            pipeline_id: Arc::from(pipeline_id),
+            qtype: u16::from(RecordType::A),
+            inserted_at: Instant::now() - Duration::from_secs(10),
+            original_ttl: 5,
+            refresh_ttl: 5,
+        })
+    }
+
+    /// 以后台刷新的身份处理 `stale.com` 查询，结果写入 `cache_hash`。
+    /// Handle the `stale.com` query as a background refresh writing to `cache_hash`.
+    async fn refresh(engine: &Engine, cache_hash: u64) -> anyhow::Result<Bytes> {
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        engine
+            .handle_packet_internal(&stale_com_query(), peer, true, None, Some(cache_hash), None)
+            .await
+    }
+
+    fn assert_upstream_failure(err: &anyhow::Error) {
+        assert!(
+            err.downcast_ref::<crate::engine::upstream::UpstreamFailure>()
+                .is_some(),
+            "the refresh must get the upstream failure itself, got: {err:#}"
+        );
+    }
+
+    /// 所有上游都失败时，后台刷新要把失败原样交回刷新任务，由它记录。以前刷新会拿
+    /// 过期应答（或合成的 SERVFAIL）当成功返回：任务不告警，开着
+    /// serve_stale_ttl_reset 时还会给一条没有任何客户端拿到的过期条目重新计时。
+    /// When every upstream fails, a background refresh must hand the failure back to
+    /// the refresh task, which logs it. It used to return the stale answer (or a
+    /// synthesized SERVFAIL) as a success: the task did not warn, and with
+    /// serve_stale_ttl_reset it re-armed an entry no client was served.
+    #[tokio::test]
+    async fn a_failed_background_refresh_reports_the_failure_and_leaves_the_entry_alone() {
+        let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
+        let stale = stale_entry("default");
+        engine.cache.insert(dedupe_hash, stale.clone());
+
+        let err = refresh(&engine, dedupe_hash)
+            .await
+            .expect_err("a refresh whose upstreams all failed must not report success");
+
+        assert_upstream_failure(&err);
+        let cached = engine
+            .cache
+            .get(&dedupe_hash)
+            .expect("a failed refresh must keep the stale entry");
+        assert!(
+            Arc::ptr_eq(&cached, &stale),
+            "a refresh serves no client, so it must not re-arm the stale entry"
+        );
+    }
+
+    /// 后台刷新不在 inflight 里登记，失败时也不能去完成同一 hash 下别的请求的
+    /// 等待者：那个请求自己的上游查询可能会成功，它的等待者不该先收到刷新的 SERVFAIL。
+    /// A background refresh never registers in `inflight`, so its failure must not
+    /// complete the waiters of another request for the same hash: that request's
+    /// own upstream query may still succeed, and its waiters must not get the
+    /// refresh's SERVFAIL first.
+    #[tokio::test]
+    async fn a_failed_background_refresh_leaves_other_requests_waiters_alone() {
+        let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
+        let (tx, rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+        engine.inflight.insert(dedupe_hash, tx);
+
+        let result = refresh(&engine, dedupe_hash).await;
+
+        assert!(
+            result.is_err(),
+            "a refresh whose upstreams all failed must fail"
+        );
+        assert!(
+            engine.inflight.contains_key(&dedupe_hash),
+            "the other request's inflight entry must stay registered"
+        );
+        assert!(
+            matches!(rx.has_changed(), Ok(false)),
+            "the other request's waiters must not receive anything from the refresh"
+        );
+    }
+
+    /// 失败的刷新一结束就释放刷新标记。开着 serve_stale_client_timeout_ms 时，请求
+    /// 要等下一次过期命中发起的刷新；标记一直占着，它们只能等到超时再拿过期应答。
+    /// A failed refresh releases its mark as soon as it ends. With
+    /// serve_stale_client_timeout_ms, requests wait for the refresh the next stale
+    /// hit starts; a mark held on would leave them waiting out the timeout instead.
+    #[tokio::test]
+    async fn a_failed_background_refresh_releases_its_mark_when_it_ends() {
+        let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
+        let marked = || {
+            is_refreshing(
+                &engine.refreshing_bitmap,
+                &engine.refreshing_set,
+                dedupe_hash,
+            )
+        };
+        engine.spawn_background_refresh(
+            engine.state.load_full(),
+            dedupe_hash,
+            "default",
+            "stale.com",
+            RecordType::A,
+            DNSClass::IN,
+            Requester {
+                address: "127.0.0.1".parse().unwrap(),
+                edns: false,
+            },
+        );
+        assert!(marked(), "the refresh must be marked while it runs");
+
+        let released = tokio::time::timeout(Duration::from_secs(3), async {
+            while marked() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "a failed refresh must release its mark when it ends"
+        );
+    }
+
+    /// 刷新经 response_actions_on_miss 跳到备用 Pipeline、备用上游也失败时，同样要把
+    /// 失败交回刷新任务，而不是一条合成的 SERVFAIL。
+    /// When a refresh jumps to a backup Pipeline through response_actions_on_miss and
+    /// the backup upstream fails too, the refresh task must still get the failure,
+    /// not a synthesized SERVFAIL.
+    #[tokio::test]
+    async fn a_failed_background_refresh_reports_the_failure_through_an_on_miss_jump() {
+        let engine = engine_from_json(serde_json::json!({
+            "settings": { "default_upstream": DEAD_UPSTREAM, "upstream_timeout_ms": 100 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "forward",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": DEAD_UPSTREAM }],
+                        "response_actions_on_miss": [
+                            { "type": "jump_to_pipeline", "pipeline": "backup" }
+                        ]
+                    }]
+                },
+                {
+                    "id": "backup",
+                    "rules": [{
+                        "name": "forward",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": DEAD_UPSTREAM }]
+                    }]
+                }
+            ]
+        }));
+
+        let err = refresh(&engine, 1)
+            .await
+            .expect_err("a refresh whose backup upstream also failed must not report success");
+
+        assert_upstream_failure(&err);
+    }
+
+    /// 上游失败、on_miss 的转发也失败时，动作合成的 SERVFAIL 不能被刷新写进缓存，
+    /// 盖掉它要刷新的过期条目（min_ttl 大于 0 时就会写）。
+    /// When the upstream fails and the on-miss forward fails too, the SERVFAIL the
+    /// actions synthesize must not be cached by the refresh over the stale entry it
+    /// was refreshing, which happens whenever min_ttl is above zero.
+    #[tokio::test]
+    async fn a_failed_background_refresh_does_not_cache_an_on_miss_servfail() {
+        let engine = engine_from_json(serde_json::json!({
+            "settings": {
+                "default_upstream": DEAD_UPSTREAM,
+                "upstream_timeout_ms": 100,
+                "min_ttl": 30,
+                "serve_stale": true
+            },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": DEAD_UPSTREAM }],
+                    "response_actions_on_miss": [
+                        { "type": "forward", "upstream": DEAD_UPSTREAM }
+                    ]
+                }]
+            }]
+        }));
+        let stale = stale_entry("main");
+        engine.cache.insert(1, stale.clone());
+
+        let err = refresh(&engine, 1)
+            .await
+            .expect_err("a refresh whose on-miss forward also failed must not report success");
+
+        assert_upstream_failure(&err);
+        let cached = engine
+            .cache
+            .get(&1)
+            .expect("a failed refresh must keep the stale entry");
+        assert!(
+            Arc::ptr_eq(&cached, &stale),
+            "a failed refresh must not cache SERVFAIL over the stale entry"
+        );
+    }
+
     #[test]
     fn test_rule_cache_entry_matches_respects_the_requester_key() {
         let pipeline_id: Arc<str> = Arc::from("test_p");
@@ -3750,6 +4537,615 @@ mod tests_multi_upstream {
                 );
             }
             _ => panic!("expected forward action"),
+        }
+    }
+}
+
+/// 跳转之后的响应缓存：转发回来的应答存在目标 pipeline 的键下，跳转后要按这个键再查一次，
+/// 否则跳转过的请求每次都去问上游。
+/// The response cache after a jump: a forwarded answer is stored under the target
+/// pipeline's key, so it has to be looked up again under that key after the jump;
+/// otherwise a request that jumped goes upstream every time.
+#[cfg(test)]
+mod jump_response_cache_tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+
+    /// UDP 上游：每个查询都答 `ip`（TTL 为 `ttl` 秒），并数一共收到几个查询
+    /// UDP upstream that answers every query with `ip` (TTL `ttl` seconds) and counts the queries it receives
+    async fn counting_upstream(ip: Ipv4Addr, ttl: u32) -> (String, Arc<AtomicUsize>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let counter = queries.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(request) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = request.queries.first().cloned() else {
+                    continue;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut response =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                response.add_query(question.clone());
+                response.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    ttl,
+                    RData::A(A(ip)),
+                ));
+                let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+            }
+        });
+        (addr, queries)
+    }
+
+    fn engine(raw: serde_json::Value) -> Engine {
+        let config: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
+        Engine::new(runtime, "test".to_string()).expect("engine")
+    }
+
+    /// 从 `client` 查一次 `qname` 的 A 记录，返回答到的地址 / Query `qname` (A) from `client` and return the address answered
+    async fn answer(engine: &Engine, qname: &str, client: &str) -> Ipv4Addr {
+        ask(engine, qname, client, DNSClass::IN).await.0
+    }
+
+    /// 从 `client` 按类别 `class` 查一次 `qname` 的 A 记录，返回答到的地址和 TTL
+    /// Query `qname` (A, class `class`) from `client` and return the address and TTL answered
+    async fn ask(engine: &Engine, qname: &str, client: &str, class: DNSClass) -> (Ipv4Addr, u32) {
+        let mut message = Message::new(0x2a2a, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        let mut query = Query::query(Name::from_str(qname).unwrap(), RecordType::A);
+        query.set_query_class(class);
+        message.add_query(query);
+        let peer: SocketAddr = format!("{client}:53000").parse().unwrap();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&message.to_vec().unwrap(), peer),
+        )
+        .await
+        .expect("answered in time")
+        .expect("answered");
+        let response = Message::from_bytes(&bytes).unwrap();
+        match response.answers.first().map(|r| (&r.data, r.ttl)) {
+            Some((RData::A(address), ttl)) => (address.0, ttl),
+            other => panic!("expected an A answer for {qname}, got {other:?}"),
+        }
+    }
+
+    fn forward_rule(name: &str, upstream: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+        })
+    }
+
+    /// 入口 pipeline 只跳转、目标 pipeline 转发（面板把「交给上游组」写成的就是这种形状）：
+    /// 同一个名字查三次，上游只收到第一次。以前三次都到上游。
+    /// The entry pipeline only jumps and the target forwards (the shape a panel writes
+    /// for "send to an upstream group"): three queries for one name reach the upstream
+    /// once. All three used to reach it.
+    #[tokio::test]
+    async fn a_request_that_jumps_is_answered_from_the_cache() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "to-group",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                    }]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+            ]
+        }));
+
+        for _ in 0..3 {
+            assert_eq!(
+                answer(&engine, "jumped.example", "192.0.2.10").await,
+                Ipv4Addr::new(192, 0, 2, 1)
+            );
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+    }
+
+    /// 入口按客户端地址跳到不同的目标时，每个目标的应答只给跳到它的请求：
+    /// 两个客户端查同一个名字，各自拿到自己目标的地址，每个上游各收到一次。
+    /// When the entry jumps to different targets by client address, each target's
+    /// answer only serves requests that jumped to it: two clients asking for one name
+    /// each get their own target's address, and each upstream is asked once.
+    #[tokio::test]
+    async fn cached_answers_stay_with_the_target_they_came_from() {
+        let (first_upstream, first_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let (second_upstream, second_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "first-client",
+                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "first" }]
+                        },
+                        {
+                            "name": "everyone-else",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "second" }]
+                        }
+                    ]
+                },
+                { "id": "first", "rules": [forward_rule("fwd", &first_upstream)] },
+                { "id": "second", "rules": [forward_rule("fwd", &second_upstream)] }
+            ]
+        }));
+
+        for _ in 0..2 {
+            assert_eq!(
+                answer(&engine, "shared.example", "10.0.0.1").await,
+                Ipv4Addr::new(192, 0, 2, 1)
+            );
+            assert_eq!(
+                answer(&engine, "shared.example", "10.0.0.2").await,
+                Ipv4Addr::new(192, 0, 2, 2)
+            );
+        }
+        assert_eq!(first_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(second_queries.load(Ordering::SeqCst), 1);
+    }
+
+    /// continue 之后才遇到的跳转不查缓存，照常转发：那时请求已经越过了一个应答（可能被后面的
+    /// 规则复用），查缓存提前返回会绕开这些。只有还没转发过的第一轮才查。两次查询来自两个客户端：
+    /// 入口按客户端地址判断，规则缓存因此按客户端分开，两次都重新走 `try-first`。
+    /// A jump reached only after a continue is not looked up in the cache and forwards
+    /// as before: by then the request has passed over an answer (which later rules may
+    /// reuse), and returning early from the cache would bypass that. Only the first
+    /// pass, before anything was forwarded, looks up. The two queries come from two
+    /// clients: the entry matches on client address, so the rule cache keeps them apart
+    /// and both run `try-first` again.
+    #[tokio::test]
+    async fn a_jump_reached_after_a_continue_still_forwards() {
+        let (first_upstream, first_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let (group_upstream, group_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "try-first",
+                            "matchers": [{ "type": "client_ip", "cidr": "192.0.2.0/24" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream, "transport": "udp" }],
+                            "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN" }],
+                            "response_actions_on_miss": [{ "type": "continue" }]
+                        },
+                        {
+                            "name": "to-group",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                        }
+                    ]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &group_upstream)] }
+            ]
+        }));
+
+        for client in ["192.0.2.10", "192.0.2.11"] {
+            assert_eq!(
+                answer(&engine, "continued.example", client).await,
+                Ipv4Addr::new(192, 0, 2, 2)
+            );
+        }
+        assert_eq!(first_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(group_queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 同一个客户端重复查询也一样：continue 之后得出的决策不进规则缓存（olicesx/kixdns#70），
+    /// 每次都从 `try-first` 开始，跳转发生在第二轮，照常转发。
+    /// The same holds for one client asking again: a decision reached after a continue
+    /// is not rule-cached (olicesx/kixdns#70), so every request starts at `try-first`,
+    /// jumps on its second pass and forwards as before.
+    #[tokio::test]
+    async fn a_repeated_request_that_continues_still_forwards_after_the_jump() {
+        let (first_upstream, first_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let (group_upstream, group_queries) =
+            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "try-first",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream, "transport": "udp" }],
+                            "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN" }],
+                            "response_actions_on_miss": [{ "type": "continue" }]
+                        },
+                        {
+                            "name": "to-group",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                        }
+                    ]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &group_upstream)] }
+            ]
+        }));
+
+        for _ in 0..2 {
+            assert_eq!(
+                answer(&engine, "continued.example", "192.0.2.10").await,
+                Ipv4Addr::new(192, 0, 2, 2)
+            );
+        }
+        assert_eq!(first_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(group_queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 目标 pipeline 按客户端判断时，跳转后不从缓存给应答：这个客户端该被拦下，
+    /// 不能拿到另一个客户端转发回来、存在目标键下的应答。
+    /// A target that matches on the client is not answered from the cache after a
+    /// jump: a client that its rules block must not get the answer another client's
+    /// forward stored under the target's key.
+    #[tokio::test]
+    async fn a_target_that_matches_on_the_client_is_not_served_from_the_cache() {
+        let (upstream, _queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "to-filter",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": "filter" }]
+                    }]
+                },
+                {
+                    "id": "filter",
+                    "rules": [
+                        {
+                            "name": "block-one-client",
+                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                            "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+                        },
+                        forward_rule("fwd", &upstream)
+                    ]
+                }
+            ]
+        }));
+
+        assert_eq!(
+            answer(&engine, "ads.example", "10.0.0.2").await,
+            Ipv4Addr::new(192, 0, 2, 1)
+        );
+        assert_eq!(
+            answer(&engine, "ads.example", "10.0.0.1").await,
+            Ipv4Addr::UNSPECIFIED
+        );
+    }
+
+    /// 路线上有按 EDNS 判断的 pipeline 时，跳转后不查缓存：后台刷新重放的请求不带 EDNS，
+    /// 可能走另一条路线，把别处的应答写进目标的键。
+    /// A route through a pipeline that matches on EDNS does not look in the cache after
+    /// the jump: a background refresh replays the query without EDNS, may take another
+    /// route and write another answer under the target's key.
+    #[tokio::test]
+    async fn a_route_through_an_edns_rule_is_not_looked_up_after_the_jump() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "edns-clients",
+                            "matchers": [{ "type": "edns_present", "expect": true }],
+                            "actions": [{ "type": "static_ip_response", "ip": "192.0.2.9" }]
+                        },
+                        {
+                            "name": "to-group",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                        }
+                    ]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+            ]
+        }));
+
+        for _ in 0..3 {
+            assert_eq!(
+                answer(&engine, "edns.example", "192.0.2.10").await,
+                Ipv4Addr::new(192, 0, 2, 1)
+            );
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 3);
+    }
+
+    /// 跳转后找到的过期应答由后台刷新，刷新写回同一个目标键：之后的请求拿到新鲜应答，
+    /// 不再去问上游，也不再拿过期应答。
+    /// An expired answer found after a jump is refreshed in the background, and the
+    /// refresh writes back under the same target key: the next request gets a fresh
+    /// answer, with no further upstream query and no stale answer.
+    #[tokio::test]
+    async fn a_refresh_started_after_a_jump_renews_the_target_entry() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
+        let engine = engine(serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "min_ttl": 0,
+                "serve_stale": true,
+                "serve_stale_ttl": 30,
+                "serve_stale_client_timeout_ms": 0
+            },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [{
+                        "name": "to-group",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                    }]
+                },
+                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+            ]
+        }));
+
+        answer(&engine, "renew.example", "192.0.2.10").await;
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // 过期：立刻给过期应答，后台刷新去问上游 / Expired: the stale answer goes out at once and a background refresh asks upstream
+        answer(&engine, "renew.example", "192.0.2.10").await;
+        let refreshed = tokio::time::timeout(Duration::from_secs(3), async {
+            while queries.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            refreshed.is_ok(),
+            "the background refresh never asked upstream"
+        );
+
+        // 刷新写回了目标键：很快就拿到新鲜应答（TTL 不超过上游给的 1 秒；过期应答的 TTL 是 30），
+        // 而且不再去问上游
+        // The refresh wrote back under the target key: a fresh answer arrives shortly (TTL at
+        // most the upstream's 1 s; a stale answer carries 30), with no further upstream query
+        let fresh = tokio::time::timeout(Duration::from_secs(3), async {
+            while ask(&engine, "renew.example", "192.0.2.10", DNSClass::IN)
+                .await
+                .1
+                > 1
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            fresh.is_ok(),
+            "no fresh answer after the background refresh"
+        );
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    fn jump_to_group(group_rules: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([
+            {
+                "id": "main",
+                "rules": [{
+                    "name": "to-group",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
+                }]
+            },
+            { "id": "group", "rules": group_rules }
+        ])
+    }
+
+    /// pipeline 的选择按 EDNS 判断时，跳转后也不查缓存：刷新重放的请求不带 EDNS，可能选到别的 pipeline。
+    /// Selection that matches on EDNS also turns off the lookup after a jump: the refresh
+    /// replays the query without EDNS and may select another pipeline.
+    #[tokio::test]
+    async fn edns_in_pipeline_selection_turns_off_the_lookup_after_a_jump() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipeline_select": [{
+                "pipeline": "main",
+                "matchers": [{ "type": "edns_present", "expect": false }]
+            }],
+            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream)]))
+        }));
+
+        for _ in 0..2 {
+            answer(&engine, "selected.example", "192.0.2.10").await;
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 类别不是 IN 的查询跳转后不查缓存：刷新重放的请求固定是 IN，算出的是另一个键。
+    /// A query in a class other than IN does not look after a jump: the refresh replays
+    /// in class IN and computes another key.
+    #[tokio::test]
+    async fn a_query_outside_class_in_is_not_looked_up_after_a_jump() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream)]))
+        }));
+
+        for _ in 0..2 {
+            ask(&engine, "chaos.example", "192.0.2.10", DNSClass::CH).await;
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 目标的转发按客户端地址带 ECS 子网、缓存键却不分子网时，跳转后不查缓存：
+    /// 按一个子网定制的应答不能给另一个子网的客户端。
+    /// A target whose forward sends the client's ECS subnet, while its cache key does not
+    /// carry the subnet, does not look after a jump: an answer tailored to one subnet must
+    /// not go to a client in another.
+    #[tokio::test]
+    async fn a_target_forwarding_the_client_subnet_is_not_served_across_subnets() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": jump_to_group(serde_json::json!([{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{
+                    "type": "forward",
+                    "upstream": upstream,
+                    "transport": "udp",
+                    "ecs": { "mode": "from_client_ip" }
+                }]
+            }]))
+        }));
+
+        answer(&engine, "cdn.example", "198.51.100.10").await;
+        answer(&engine, "cdn.example", "203.0.113.10").await;
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 按「谁在问」判断的四种请求匹配会让 pipeline 带上标记，按问题本身判断的不会；
+    /// 只有按 EDNS 判断的带上 `matches_edns`。
+    /// The four request matchers that look at who is asking flag the pipeline, and
+    /// those that look at the question do not; only the EDNS one sets `matches_edns`.
+    #[test]
+    fn pipelines_that_match_on_the_requester_are_flagged() {
+        let forward = |ecs: serde_json::Value| {
+            serde_json::json!({
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": "127.0.0.1:9", "ecs": ecs }]
+            })
+        };
+        let ecs_cases = [
+            // 转发按客户端带子网，pipeline 级不按客户端区分 / A forward sends the client subnet; the pipeline level does not key by it
+            (
+                serde_json::json!({ "id": "p", "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))] }),
+                true,
+            ),
+            // pipeline 级也按客户端子网区分缓存 / The pipeline level keys the cache by the client subnet too
+            (
+                serde_json::json!({
+                    "id": "p",
+                    "ecs": { "mode": "from_client_ip" },
+                    "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))]
+                }),
+                false,
+            ),
+            // pipeline 级按客户端区分，但前缀比转发的短：按 /24 定制的应答在整个 /16 里共用
+            // The pipeline level keys by the client, but with a shorter prefix than the forward:
+            // answers tailored per /24 would be shared across the whole /16
+            (
+                serde_json::json!({
+                    "id": "p",
+                    "ecs": { "mode": "from_client_ip", "prefix_v4": 16 },
+                    "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))]
+                }),
+                true,
+            ),
+            // 固定子网与客户端无关 / A fixed subnet does not depend on the client
+            (
+                serde_json::json!({ "id": "p", "rules": [forward(serde_json::json!({ "mode": "static", "ip": "198.51.100.0" }))] }),
+                false,
+            ),
+        ];
+        for (pipeline, requester) in ecs_cases {
+            let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [pipeline.clone()]
+            }))
+            .expect("parse config");
+            let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
+            assert_eq!(
+                runtime.pipelines[0].depends_on_requester, requester,
+                "{pipeline}"
+            );
+        }
+
+        let cases = [
+            (
+                serde_json::json!({ "type": "client_ip", "cidr": "10.0.0.0/8" }),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "geoip_country", "country_codes": ["cn"] }),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "geoip_private", "expect": true }),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "edns_present", "expect": true }),
+                true,
+                true,
+            ),
+            (
+                serde_json::json!({ "type": "domain_suffix", "value": "example.com" }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({ "type": "qtype", "value": "A" }),
+                false,
+                false,
+            ),
+            (serde_json::json!({ "type": "any" }), false, false),
+        ];
+        for (matcher, requester, edns) in cases {
+            let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [{
+                    "id": "main",
+                    "rules": [{
+                        "name": "r",
+                        "matchers": [matcher.clone()],
+                        "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+                    }]
+                }]
+            }))
+            .expect("parse config");
+            let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
+            let pipeline = &runtime.pipelines[0];
+            assert_eq!(pipeline.depends_on_requester, requester, "{matcher}");
+            assert_eq!(pipeline.matches_edns, edns, "{matcher}");
         }
     }
 }
