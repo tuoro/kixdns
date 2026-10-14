@@ -271,7 +271,15 @@ impl Engine {
             client_ip,
             include_ip,
         );
-        let allow_rule_cache_lookup = !skip_cache && skip_rules.is_none_or(|set| set.is_empty());
+        // With rules skipped (the ones a continue passed), this evaluation does not
+        // give the pipeline's decision for the name, so it neither reads nor writes
+        // the rule cache. A background refresh evaluates the whole pipeline: it does
+        // not read the cache but still writes its decision.
+        // 跳过了规则（continue 越过的那些）时，这次求值得出的不是这个 pipeline 对这个
+        // 名字的决策，所以既不读也不写规则缓存。后台刷新求值的是整条 pipeline：不读
+        // 缓存，但照常写入决策。
+        let whole_pipeline = skip_rules.is_none_or(|set| set.is_empty());
+        let allow_rule_cache_lookup = !skip_cache && whole_pipeline;
 
         if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(&rule_hash) {
             let entry = &record.entry;
@@ -364,15 +372,17 @@ impl Engine {
                 &decision,
             );
         }
-        self.insert_rule_cache(
-            rule_hash,
-            pipeline.id.clone(),
-            request,
-            decision.clone(),
-            include_ip,
-            &matched_rules,
-            decided_by_rule,
-        );
+        if whole_pipeline {
+            self.insert_rule_cache(
+                rule_hash,
+                pipeline.id.clone(),
+                request,
+                decision.clone(),
+                include_ip,
+                &matched_rules,
+                decided_by_rule,
+            );
+        }
         decision
     }
 
@@ -712,5 +722,226 @@ mod observer_rule_cache_tests {
             .expect("engine");
         let records = recorded_rules(engine).await;
         assert_eq!(records, vec![Some(1)]);
+    }
+}
+
+#[cfg(test)]
+mod continued_rule_cache_tests {
+    use std::sync::Arc;
+
+    use hickory_proto::rr::{DNSClass, RecordType};
+    use rustc_hash::FxHashSet;
+
+    use super::RuleEvaluationContext;
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::engine::rules::Decision;
+    use crate::matcher::RuntimePipelineConfig;
+
+    /// `first` forwards and continues on a miss; `next` forwards elsewhere.
+    /// `first` 转发，未命中时 continue；`next` 转发到别处。
+    fn runtime() -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+            "pipelines": [{
+                "id": "main",
+                "rules": [
+                    {
+                        "name": "first",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                        "response_actions_on_miss": [{ "type": "continue" }]
+                    },
+                    {
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:10" }]
+                    }
+                ]
+            }]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(cfg).expect("runtime config")
+    }
+
+    fn rule_of(decision: &Decision) -> &str {
+        match decision {
+            Decision::Forward { rule_name, .. } => rule_name,
+            other => panic!("expected a forward decision, got {other:?}"),
+        }
+    }
+
+    /// continue 之后，决策循环跳过越过的规则重新求值。那时得出的决策不是这个
+    /// pipeline 对这个名字的决策：以前它被写进规则缓存，在缓存过期前（最长 60 秒）
+    /// 之后的请求都直接从 `next` 开始，不经过 `first`。
+    /// After a continue, the decision loop evaluates the pipeline again without the
+    /// rules it passed. The decision it reaches then is not the pipeline's decision
+    /// for the name: it used to be written to the rule cache, so until that entry
+    /// expired (up to 60 s) later requests started at `next` and skipped `first`.
+    #[tokio::test]
+    async fn a_decision_reached_after_a_continue_is_not_cached() {
+        let engine = Engine::new(runtime(), "test".to_string()).expect("engine");
+        let state = engine.state.load_full();
+        let pipeline = &state.pipeline.pipelines[0];
+        let continued: FxHashSet<Arc<str>> = [Arc::from("first")].into_iter().collect();
+        let request = |skip_rules| {
+            RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "example.com",
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                skip_rules,
+                false,
+            )
+        };
+
+        let after_continue = engine.apply_rules(&state, pipeline, &request(Some(&continued)));
+        assert_eq!(rule_of(&after_continue), "next");
+
+        let fresh = engine.apply_rules(&state, pipeline, &request(None));
+        assert_eq!(
+            rule_of(&fresh),
+            "first",
+            "a new request must start at the first rule again"
+        );
+
+        // 正常求值的决策照常缓存 / A decision from a normal evaluation is still cached
+        engine.rule_cache.run_pending_tasks();
+        let cached: Vec<_> = engine
+            .rule_cache
+            .iter()
+            .map(|(_, record)| rule_of(&record.entry.decision).to_owned())
+            .collect();
+        assert_eq!(cached, ["first"]);
+    }
+}
+
+/// 域名后缀在每条路径上结果一样：Pipeline 入口、只有一个条件的规则（走索引）、几个条件「满足任一」的规则（逐条检查），
+/// 而且静态快速路径和普通路径各测一遍（规则的第一个动作是 log 时不走快速路径）。
+/// Domain suffixes give one answer on every path: pipeline selectors, single-condition rules (found through
+/// the index) and any-of rules (checked one by one), each on both the static fast path and the regular path
+/// (a rule whose first action is log skips the fast path).
+#[cfg(test)]
+mod domain_suffix_path_tests {
+    use std::net::Ipv4Addr;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, RecordType};
+
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+
+    fn rule(
+        name: &str,
+        operator: &str,
+        suffixes: &[&str],
+        ip: &str,
+        fast: bool,
+    ) -> serde_json::Value {
+        let matchers: Vec<_> = suffixes
+            .iter()
+            .map(|value| serde_json::json!({ "type": "domain_suffix", "value": value, "operator": operator }))
+            .collect();
+        let answer = serde_json::json!({ "type": "static_ip_response", "ip": ip });
+        let actions = if fast {
+            serde_json::json!([answer])
+        } else {
+            serde_json::json!([{ "type": "log", "level": "debug" }, answer])
+        };
+        serde_json::json!({ "name": name, "matcher_operator": operator, "matchers": matchers, "actions": actions })
+    }
+
+    fn engine() -> Engine {
+        let rules = vec![
+            rule("fast-plain", "and", &["fast.test"], "10.0.1.1", true),
+            rule("fast-dotted", "and", &[".fastdot.test"], "10.0.1.2", true),
+            rule(
+                "fast-any",
+                "or",
+                &["unused.invalid", "fastany.test"],
+                "10.0.1.3",
+                true,
+            ),
+            rule("slow-plain", "and", &["slow.test"], "10.0.2.1", false),
+            rule("slow-dotted", "and", &[".slowdot.test"], "10.0.2.2", false),
+            rule(
+                "slow-any",
+                "or",
+                &["unused.invalid", "slowany.test"],
+                "10.0.2.3",
+                false,
+            ),
+            serde_json::json!({ "name": "rest", "matchers": [{ "type": "any" }], "actions": [{ "type": "static_ip_response", "ip": "10.0.9.9" }] }),
+        ];
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipeline_select": [
+                { "pipeline": "dotted", "matchers": [{ "type": "domain_suffix", "value": ".seldot.test" }] },
+                { "pipeline": "plain", "matchers": [{ "type": "domain_suffix", "value": "sel.test" }] }
+            ],
+            "pipelines": [
+                { "id": "main", "rules": rules },
+                { "id": "dotted", "rules": [{ "name": "dotted", "matchers": [{ "type": "any" }], "actions": [{ "type": "static_ip_response", "ip": "10.0.0.1" }] }] },
+                { "id": "plain", "rules": [{ "name": "plain", "matchers": [{ "type": "any" }], "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }] }] }
+            ]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        Engine::new(runtime, "test".to_string()).expect("engine")
+    }
+
+    async fn answer(engine: &Engine, qname: &str) -> Ipv4Addr {
+        let mut message = Message::new(7, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(
+            Name::from_str_relaxed(qname).unwrap(),
+            RecordType::A,
+        ));
+        let bytes = engine
+            .handle_packet(
+                &message.to_vec().unwrap(),
+                "127.0.0.1:53000".parse().unwrap(),
+            )
+            .await
+            .expect("static answer");
+        let response = Message::from_vec(&bytes).expect("parse response");
+        match response.answers.first().map(|record| &record.data) {
+            Some(RData::A(a)) => a.0,
+            other => panic!("{qname}: expected one A record, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_suffix_matches_by_label_on_every_path() {
+        let engine = engine();
+        let rest = Ipv4Addr::new(10, 0, 9, 9);
+        let cases = [
+            // 入口 / pipeline selectors
+            ("sel.test", Ipv4Addr::new(10, 0, 0, 2)),
+            ("a.sel.test", Ipv4Addr::new(10, 0, 0, 2)),
+            ("notsel.test", rest),
+            ("seldot.test", rest),
+            ("a.seldot.test", Ipv4Addr::new(10, 0, 0, 1)),
+            // 快速路径 / static fast path
+            ("fast.test", Ipv4Addr::new(10, 0, 1, 1)),
+            ("a.fast.test", Ipv4Addr::new(10, 0, 1, 1)),
+            ("notfast.test", rest),
+            ("fastdot.test", rest),
+            ("a.fastdot.test", Ipv4Addr::new(10, 0, 1, 2)),
+            ("fastany.test", Ipv4Addr::new(10, 0, 1, 3)),
+            ("notfastany.test", rest),
+            // 普通路径 / regular path
+            ("slow.test", Ipv4Addr::new(10, 0, 2, 1)),
+            ("a.slow.test", Ipv4Addr::new(10, 0, 2, 1)),
+            ("notslow.test", rest),
+            ("slowdot.test", rest),
+            ("a.slowdot.test", Ipv4Addr::new(10, 0, 2, 2)),
+            ("slowany.test", Ipv4Addr::new(10, 0, 2, 3)),
+            ("notslowany.test", rest),
+        ];
+        for (qname, expected) in cases {
+            assert_eq!(answer(&engine, qname).await, expected, "{qname}");
+        }
     }
 }
