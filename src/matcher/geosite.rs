@@ -318,17 +318,15 @@ fn split_tag_attr(tag: &str) -> (&str, Option<&str>) {
 }
 
 /// Check if a domain's attributes satisfy the `@attr` filter
-/// `cn`   → domain must have attribute `cn`
-/// `!cn`  → domain must NOT have attribute `cn`
+/// The filter is an attribute key, compared without case, as in V2Ray:
+/// `cn`   → domain has attribute `cn`
+/// `!cn`  → domain has attribute `!cn`, a key domain-list-community uses
+///          itself, so it is not a negation
 ///
-/// Note: `!` negation is a kixdns extension. V2Ray matches `@!cn` as a literal
-/// attribute key (not negation), so configs ported from V2Ray behave differently.
+/// The domains of a tag that lack an attribute are two matchers:
+/// `geosite: google` together with `geosite_not: google@cn`.
 fn attr_filter_matches(attrs: &[String], filter: &str) -> bool {
-    if let Some(neg) = filter.strip_prefix('!') {
-        !attrs.iter().any(|a| a.eq_ignore_ascii_case(neg))
-    } else {
-        attrs.iter().any(|a| a.eq_ignore_ascii_case(filter))
-    }
+    attrs.iter().any(|a| a.eq_ignore_ascii_case(filter))
 }
 
 /// Parse a V2Ray Domain.Attribute protobuf message to extract the key field
@@ -1973,11 +1971,15 @@ mod tests {
     fn test_attr_filter_matches() {
         let cn = vec!["cn".to_string()];
         assert!(attr_filter_matches(&cn, "cn"));
-        assert!(!attr_filter_matches(&cn, "!cn"));
         assert!(!attr_filter_matches(&[], "cn"));
-        assert!(attr_filter_matches(&[], "!cn"));
+        // `!cn` is the literal key, as in V2Ray: neither `cn` nor no attribute
+        assert!(!attr_filter_matches(&cn, "!cn"));
+        assert!(!attr_filter_matches(&[], "!cn"));
+        assert!(attr_filter_matches(&["!cn".to_string()], "!cn"));
+        assert!(!attr_filter_matches(&["!cn".to_string()], "cn"));
         // case insensitive
         assert!(attr_filter_matches(&["CN".to_string()], "cn"));
+        assert!(attr_filter_matches(&["!CN".to_string()], "!cn"));
     }
 
     #[test]
@@ -2000,6 +2002,7 @@ mod tests {
         let domains = vec![
             build_domain(3, "example.com", &["cn"]), // Full match, has @cn
             build_domain(3, "other.com", &[]),       // Full match, no attrs
+            build_domain(3, "foreign.com", &["!cn"]), // Full match, has the key `!cn`
         ];
         let entry = build_geosite("TEST", &domains);
         let dat = build_dat(&[entry]);
@@ -2014,20 +2017,33 @@ mod tests {
             .unwrap();
         assert!(m1.matches("test@cn", "example.com"));
         assert!(!m1.matches("test@cn", "other.com"));
+        assert!(!m1.matches("test@cn", "foreign.com"));
 
-        // no filter: both
+        // no filter: all three
         let mut m2 = GeoSiteManager::new();
         m2.load_from_dat_file_selective(&path, &["test".to_string()])
             .unwrap();
         assert!(m2.matches("test", "example.com"));
         assert!(m2.matches("test", "other.com"));
+        assert!(m2.matches("test", "foreign.com"));
 
-        // @!cn: only other.com
+        // @!cn: the domains carrying the key `!cn`, as in V2Ray; not a negation
         let mut m3 = GeoSiteManager::new();
         m3.load_from_dat_file_selective(&path, &["test@!cn".to_string()])
             .unwrap();
         assert!(!m3.matches("test@!cn", "example.com"));
-        assert!(m3.matches("test@!cn", "other.com"));
+        assert!(!m3.matches("test@!cn", "other.com"));
+        assert!(m3.matches("test@!cn", "foreign.com"));
+
+        // Without `cn` is the tag minus `@cn`, the two matchers a rule combines
+        let mut m4 = GeoSiteManager::new();
+        m4.load_from_dat_file_selective(&path, &["test".to_string(), "test@cn".to_string()])
+            .unwrap();
+        let without_cn =
+            |domain: &str| m4.matches("test", domain) && !m4.matches("test@cn", domain);
+        assert!(!without_cn("example.com"));
+        assert!(without_cn("other.com"));
+        assert!(without_cn("foreign.com"));
 
         let _ = std::fs::remove_file(&path);
     }

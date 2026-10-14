@@ -41,6 +41,7 @@ This document describes the implementation currently on the main branch. Configu
 
 - **MaxMind GeoIP** — MMDB lookup and country/private-IP matchers.
 - **V2Ray GeoSite** — load `.dat` or supported JSON files for domain-category matchers.
+- **GeoSite attributes** — in `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. The domains without an attribute are `geosite: google` together with `geosite_not: google@cn`.
 - **Database reload** — configured GeoSite and GeoIP `.dat` files are watched and reloaded.
 - **DoQ 0-RTT handling** — global and per-upstream settings, with rejection/timeout fallback until restart.
 
