@@ -116,6 +116,7 @@ enum Event {
         id: u64,
         pipeline: String,
         rule: Option<String>,
+        phase: RulePhase,
         detail: Detail,
     },
     CacheLookup {
@@ -289,6 +290,7 @@ impl EngineObserver for Recorder {
             id: ctx.request_id,
             pipeline: event.pipeline.to_string(),
             rule: event.rule.map(str::to_string),
+            phase: event.phase,
             detail: event.detail.into(),
         });
     }
@@ -691,6 +693,7 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
                 id,
                 pipeline: "main".into(),
                 rule: Some("block".into()),
+                phase: RulePhase::Request,
                 detail: Detail::Static {
                     rcode: ResponseCode::NXDomain,
                     answers: 0,
@@ -730,6 +733,7 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
                 id,
                 pipeline: "main".into(),
                 rule: Some("block".into()),
+                phase: RulePhase::Request,
                 detail: Detail::Static {
                     rcode: ResponseCode::NXDomain,
                     answers: 0,
@@ -808,6 +812,7 @@ async fn rule_cache_hits_replay_matched_rules() {
         id,
         pipeline: "main".into(),
         rule: Some("block".into()),
+        phase: RulePhase::Request,
         detail: Detail::Static {
             rcode: ResponseCode::NXDomain,
             answers: 0,
@@ -1023,6 +1028,7 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
                 id,
                 pipeline: "main".into(),
                 rule: Some("fwd".into()),
+                phase: RulePhase::Request,
                 detail: Detail::Forward {
                     upstream: upstream.clone(),
                     transport: Some(Transport::Udp),
@@ -1607,6 +1613,7 @@ async fn doh_listener_reports_the_same_lifecycle_as_in_process_requests() {
                 id,
                 pipeline: "main".into(),
                 rule: Some("fwd".into()),
+                phase: RulePhase::Request,
                 detail: Detail::Forward {
                     upstream: upstream.clone(),
                     transport: Some(Transport::Udp),
@@ -2405,6 +2412,7 @@ async fn a_fast_path_answer_that_cannot_be_built_is_reported_as_failed() {
                 id,
                 pipeline: "main".into(),
                 rule: Some("block".into()),
+                phase: RulePhase::Request,
                 detail: Detail::Static {
                     rcode: ResponseCode::NXDomain,
                     answers: 0,
@@ -2560,6 +2568,189 @@ async fn an_expired_answer_found_after_a_jump_is_served_stale() {
             "hit Stale"
         ]
     );
+}
+
+/// Response-phase decisions of `id`: what its answer checks decided.
+/// 请求 `id` 的响应阶段决定：回答检查作出的决定。
+fn response_decisions(events: &[Event], id: u64) -> Vec<(String, Option<String>, Detail)> {
+    events_of(events, id)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Decision {
+                pipeline,
+                rule,
+                phase: RulePhase::Response,
+                detail,
+                ..
+            } => Some((pipeline, rule, detail)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn response_actions_report_the_decision_they_make() {
+    let (echo, upstream_task) = spawn_echo_upstream(60).await;
+    // The echo upstream answers 127.0.0.1, which every check below matches.
+    // 回声上游回 127.0.0.1，下面的检查都会命中它。
+    let check = |name: &str, domain: &str, actions: serde_json::Value| {
+        serde_json::json!({
+            "name": name,
+            "matchers": [{ "type": "domain_suffix", "value": domain }],
+            "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+            "response_matchers": [{ "type": "response_answer_ip", "cidr": "127.0.0.0/8" }],
+            "response_actions_on_match": actions
+        })
+    };
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 200,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [
+            {
+                "id": "main",
+                "rules": [
+                    check("deny", "deny.example", serde_json::json!([{ "type": "deny" }])),
+                    check("jump", "jump.example", serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "local" }])),
+                    check("keep", "keep.example", serde_json::json!([{ "type": "log" }])),
+                    check("pass", "pass.example", serde_json::json!([{ "type": "continue" }])),
+                    {
+                        "name": "rescue",
+                        "matchers": [{ "type": "domain_suffix", "value": "dead.example" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:9", "transport": "udp" }],
+                        "response_actions_on_miss": [{ "type": "static_ip_response", "ip": "10.9.9.9" }]
+                    },
+                    {
+                        "name": "rest",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+                    }
+                ]
+            },
+            {
+                "id": "local",
+                "rules": [{
+                    "name": "answer",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": "10.0.0.1" }]
+                }]
+            }
+        ]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    for name in [
+        "deny.example",
+        "jump.example",
+        "keep.example",
+        "pass.example",
+        "dead.example",
+    ] {
+        let _ = engine.handle_packet(&query(name), peer()).await.unwrap();
+    }
+    let events = recorder.drain();
+    let decided = |qname: &str| response_decisions(&events, request_id_for(&events, qname));
+
+    assert_eq!(
+        decided("deny.example"),
+        [(
+            "main".to_owned(),
+            Some("deny".to_owned()),
+            Detail::Static {
+                rcode: ResponseCode::Refused,
+                answers: 0
+            }
+        )]
+    );
+    assert_eq!(
+        decided("jump.example"),
+        [(
+            "main".to_owned(),
+            Some("jump".to_owned()),
+            Detail::Jump {
+                pipeline: "local".into()
+            }
+        )]
+    );
+    // Keeping the upstream's answer names the upstream that gave it.
+    // 沿用上游应答时写的是给出应答的那个上游。
+    assert_eq!(
+        decided("keep.example"),
+        [(
+            "main".to_owned(),
+            Some("keep".to_owned()),
+            Detail::Forward {
+                upstream: echo.clone(),
+                transport: Some(Transport::Udp)
+            }
+        )]
+    );
+    // `continue` decides nothing; the next rule's request-phase decision answers.
+    // `continue` 不作决定；由下一条规则在请求阶段作出决定。
+    assert!(decided("pass.example").is_empty());
+    let pass = request_id_for(&events, "pass.example");
+    assert!(events_of(&events, pass).iter().any(|event| matches!(
+        event,
+        Event::Decision { rule: Some(rule), phase: RulePhase::Request, .. } if rule == "rest"
+    )));
+    // A failed upstream with `response_actions_on_miss`: the miss actions answer.
+    // 上游失败、规则有 `response_actions_on_miss`：由 on_miss 动作应答。
+    assert_eq!(
+        decided("dead.example"),
+        [(
+            "main".to_owned(),
+            Some("rescue".to_owned()),
+            Detail::Static {
+                rcode: ResponseCode::NoError,
+                answers: 1
+            }
+        )]
+    );
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn a_kept_answer_names_the_transport_that_carried_it() {
+    // The address carries its own `tcp://` prefix and the rule names no transport.
+    // 地址自带 `tcp://` 前缀，规则不写 transport。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = spawn_tcp_dns_server(listener).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 300 },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "keep",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": format!("tcp://{address}") }],
+                "response_matchers": [{ "type": "response_answer_ip", "cidr": "127.0.0.0/8" }],
+                "response_actions_on_match": [{ "type": "log" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let _ = engine
+        .handle_packet(&query("carried.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "carried.example");
+    assert_eq!(
+        response_decisions(&events, id),
+        [(
+            "main".to_owned(),
+            Some("keep".to_owned()),
+            Detail::Forward {
+                upstream: address,
+                transport: Some(Transport::Tcp)
+            }
+        )]
+    );
+    server.abort();
 }
 
 /// A pipeline whose one rule forwards to `upstream` and, when the answer comes

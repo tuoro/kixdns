@@ -9,7 +9,7 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::config::{Action, Transport};
-use crate::engine::rules::Decision;
+use crate::engine::rules::{Decision, ResponseActionResult};
 use crate::engine::upstream::has_transport_prefix;
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
@@ -90,7 +90,26 @@ impl Drop for ObservedRequest<'_> {
 /// 缓存条目来源上游的地址，写法与 UpstreamResult::upstream 一致。条目记录的是
 /// forward_upstream 拼出的 `{传输}:{地址}`，传输部分不含冒号；规则生成的条目没有来源。
 pub(crate) fn cached_source(upstream: Option<&str>) -> Option<&str> {
-    upstream.map(|label| label.split_once(':').map_or(label, |(_, address)| address))
+    upstream.map(|label| split_upstream_label(label).0)
+}
+
+/// The address and the transport in a `{transport}:{address}` label that
+/// `forward_upstream` builds; the transport part names the transport that
+/// carried the answer and never contains a colon.
+/// `forward_upstream` 拼出的 `{传输}:{地址}` 里的地址和传输；传输是实际送回应答的那种，不含冒号。
+fn split_upstream_label(label: &str) -> (&str, Option<Transport>) {
+    let Some((carrier, address)) = label.split_once(':') else {
+        return (label, None);
+    };
+    let transport = match carrier {
+        "udp" => Some(Transport::Udp),
+        "tcp" => Some(Transport::Tcp),
+        "doh" => Some(Transport::Doh),
+        "dot" => Some(Transport::Dot),
+        "doq" => Some(Transport::Doq),
+        _ => None,
+    };
+    (address, transport)
 }
 
 /// Kind of a request-phase decision.
@@ -155,9 +174,59 @@ pub(crate) fn report_decision(
         &DecisionMade {
             pipeline,
             rule,
+            phase: RulePhase::Request,
             detail: decision_detail(decision),
         },
     );
+}
+
+/// Reports what a rule's response actions decided: a local answer, a jump, or
+/// keeping the upstream's answer. Actions that continue to the next rule decide
+/// nothing and report nothing.
+/// 上报一条规则的响应动作作出的决定：本地应答、跳转，或沿用上游应答。
+/// 继续往下的动作没有作决定，不上报。
+pub(crate) fn report_response_decision(
+    observer: &dyn EngineObserver,
+    ctx: &RequestContext<'_>,
+    pipeline: &str,
+    rule: &str,
+    result: &ResponseActionResult,
+) {
+    let detail = match result {
+        ResponseActionResult::Static { bytes, rcode, .. } => DecisionDetail::Static {
+            rcode: *rcode,
+            answers: answer_count(bytes),
+        },
+        ResponseActionResult::Jump { pipeline, .. } => DecisionDetail::Jump { pipeline },
+        ResponseActionResult::Upstream { ctx: answer, .. } => {
+            // 写实际送回应答的那种传输：配置的传输管不到带前缀的地址，也管不到改走 TCP 的情况
+            // The transport that carried the answer: the configured one says nothing about a
+            // prefixed address or a fallback to TCP
+            let (upstream, transport) = split_upstream_label(&answer.upstream);
+            DecisionDetail::Forward {
+                upstream,
+                transport,
+            }
+        }
+        ResponseActionResult::Continue { .. } => return,
+    };
+    observer.decision_made(
+        ctx,
+        &DecisionMade {
+            pipeline,
+            rule: Some(rule),
+            phase: RulePhase::Response,
+            detail,
+        },
+    );
+}
+
+/// ANCOUNT from a DNS header; 0 for a message too short to have one.
+/// DNS 头里的 ANCOUNT；报文短到没有头时为 0。
+fn answer_count(message: &[u8]) -> usize {
+    message.get(6..8).map_or(0, |count| {
+        usize::from(u16::from_be_bytes([count[0], count[1]]))
+    })
 }
 
 /// Kind of decision a response-phase action list leads to. An empty list (or

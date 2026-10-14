@@ -398,6 +398,7 @@ impl Engine {
                     &DecisionMade {
                         pipeline: pipeline_id,
                         rule: Some(rule),
+                        phase: RulePhase::Request,
                         detail: DecisionDetail::Static { rcode, answers },
                     },
                 );
