@@ -2561,3 +2561,115 @@ async fn an_expired_answer_found_after_a_jump_is_served_stale() {
         ]
     );
 }
+
+/// A pipeline whose one rule forwards to `upstream` and, when the answer comes
+/// from it, jumps to `target`.
+/// 只有一条规则的 pipeline：转发给 `upstream`，应答来自它时跳到 `target`。
+fn forward_then_jump(id: &str, upstream: &str, target: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "rules": [{
+            "name": format!("{id}-check"),
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }],
+            "response_matchers": [{ "type": "upstream_equals", "value": upstream }],
+            "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": target }]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn a_check_that_jumps_back_into_a_visited_pipeline_does_not_hang() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    // Back into a pipeline the jump path already went through, and back into
+    // the one the request entered by, whose entry the caller registered.
+    // 跳回跳转路上走过的 pipeline，以及跳回请求进来时的那个（它的条目由调用方登记）。
+    for (case, pipelines) in [
+        (
+            "jump path",
+            [
+                forward_then_jump("main", &echo, "loop"),
+                forward_then_jump("loop", &echo, "loop"),
+            ],
+        ),
+        (
+            "entry",
+            [
+                forward_then_jump("main", &echo, "loop"),
+                forward_then_jump("loop", &echo, "main"),
+            ],
+        ),
+    ] {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 500,
+                "response_jump_limit": 3
+            },
+            "pipelines": pipelines
+        })
+        .to_string();
+        let (engine, recorder) = observed_engine(&raw);
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            engine.handle_packet(&query("again.example"), peer()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the query hung"))
+        .unwrap();
+        // The jump limit ends the loop / 由跳转上限结束循环
+        assert_eq!(rcode_of(&response), ResponseCode::ServFail, "{case}");
+        let events = recorder.drain();
+        let id = request_id_for(&events, "again.example");
+        assert!(
+            !events_of(&events, id).contains(&Event::InflightJoined { id }),
+            "{case}: the request never joins its own query"
+        );
+    }
+    echo_task.abort();
+}
+
+#[tokio::test]
+async fn a_continue_inside_a_jump_target_enters_it_once() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 500 },
+        "pipelines": [
+            forward_then_jump("main", &echo, "second"),
+            {
+                "id": "second",
+                "rules": [
+                    {
+                        "name": "pass",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+                        "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                        "response_actions_on_match": [{ "type": "continue" }]
+                    },
+                    {
+                        "name": "rest",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let _ = engine
+        .handle_packet(&query("once.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "once.example");
+    let entered: Vec<String> = events_of(&events, id)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Pipeline { pipeline, .. } => Some(pipeline),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entered, ["main", "second"]);
+    echo_task.abort();
+}

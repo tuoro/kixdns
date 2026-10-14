@@ -555,6 +555,14 @@ pub(crate) struct ResponseJumpContext<'a> {
     pub skip_cache: bool,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
+    /// In-flight entries the request already holds as it jumps: the one its
+    /// forward registered, and one a `continue` kept (see
+    /// `ForwardDecisionContext::held_inflight`). Nobody else answers them, so
+    /// the jump target never waits on them.
+    /// 请求跳转时已经握着的 in-flight 条目：这次转发登记的那条，以及 `continue` 留下的
+    /// 那条（见 `ForwardDecisionContext::held_inflight`）。没有别人会应答它们，所以跳转
+    /// 目标从不等它们。
+    pub held_inflight: [Option<u64>; 2],
 }
 
 pub(crate) async fn process_response_jump(
@@ -577,6 +585,7 @@ pub(crate) async fn process_response_jump(
         upstream_timeout,
         skip_cache,
         observed,
+        held_inflight,
     } = context;
     let cfg = &state.pipeline;
     struct InflightCleanupGuard {
@@ -611,6 +620,22 @@ pub(crate) async fn process_response_jump(
     let mut reused_response: Option<ResponseContext> = None;
     let mut inflight_hashes = Vec::new();
     let mut cleanup_guards: Vec<InflightCleanupGuard> = Vec::new();
+    // The request's own entries: the ones it held before the jump and the ones
+    // it registers on the way. Waiting on one waits on itself, since only this
+    // request answers it, and the query hangs until the client gives up; it
+    // forwards by itself instead, as `handle_forward_decision` does with a held
+    // entry. Other requests' entries are still joined.
+    // 请求自己的条目：跳转前握着的，和一路上登记的。等它就是等自己（只有这个请求
+    // 会应答它），查询会一直挂到客户端放弃；改为自己转发，和 `handle_forward_decision`
+    // 对握着的条目的做法一样。别的请求的条目照旧合并等待。
+    let holds = |inflight_hashes: &[u64], hash: u64| {
+        inflight_hashes.contains(&hash) || held_inflight.contains(&Some(hash))
+    };
+    // `pipeline_selected` is reported when a pipeline is entered, not again
+    // when a `continue` resumes the same pipeline at its next rule.
+    // `pipeline_selected` 在进入 pipeline 时上报；`continue` 在同一 pipeline
+    // 的下一条规则继续时不再重复上报。
+    let mut entering = true;
 
     loop {
         response.pipeline = Some(pipeline_id.clone());
@@ -640,9 +665,10 @@ pub(crate) async fn process_response_jump(
             }
             return Ok(resp_bytes);
         };
-        if let Some((observer, ctx)) = observed {
+        if entering && let Some((observer, ctx)) = observed {
             observer.pipeline_selected(ctx, &pipeline.id);
         }
+        entering = true;
 
         let mut ecs_key = pipeline
             .ecs
@@ -799,6 +825,9 @@ pub(crate) async fn process_response_jump(
                                     inflight_hashes.push(dedupe_hash);
                                     None
                                 }
+                                // This request's own entry: forward instead (see `holds`)
+                                // 这个请求自己的条目：改为自己转发（见 `holds`）
+                                Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
                                 Entry::Occupied(entry) => {
                                     // Another request in progress, subscribe to its result
                                     // 已有请求在进行,订阅其结果
@@ -881,6 +910,8 @@ pub(crate) async fn process_response_jump(
                                 inflight_hashes.push(dedupe_hash);
                                 None
                             }
+                            // See the same arm above / 同上
+                            Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
                             Entry::Occupied(entry) => {
                                 // Another request in progress, subscribe to its result
                                 // 已有请求在进行,订阅其结果
@@ -1176,6 +1207,7 @@ pub(crate) async fn process_response_jump(
                                 }
                                 reused_response = ctx;
                                 skip_rules.insert(rule_name.clone());
+                                entering = false;
                                 continue;
                             }
                         }

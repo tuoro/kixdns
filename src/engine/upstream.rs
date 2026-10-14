@@ -1196,6 +1196,7 @@ mod refresh_failure_reply_tests {
                     upstream_timeout: Duration::from_millis(200),
                     skip_cache: true,
                     observed: None,
+                    held_inflight: [None, None],
                 },
                 &mut ResponseInfo::default(),
             ),

@@ -1038,6 +1038,10 @@ pub(crate) async fn handle_forward_decision_logged(
                             upstream_timeout,
                             skip_cache,
                             observed,
+                            held_inflight: [
+                                cleanup_guard.as_ref().map(|guard| guard.hash),
+                                held_inflight.as_ref().map(|guard| guard.hash),
+                            ],
                         },
                         response,
                     )
@@ -1294,6 +1298,10 @@ pub(crate) async fn handle_forward_decision_logged(
                                 upstream_timeout,
                                 skip_cache,
                                 observed,
+                                held_inflight: [
+                                    cleanup_guard.as_ref().map(|guard| guard.hash),
+                                    held_inflight.as_ref().map(|guard| guard.hash),
+                                ],
                             },
                             response,
                         )
