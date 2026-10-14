@@ -1139,6 +1139,7 @@ mod refresh_failure_reply_tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &crate::matcher::RequesterKey::NONE,
         )
     }
 
@@ -1201,6 +1202,7 @@ mod refresh_failure_reply_tests {
                     min_ttl: Duration::from_secs(60),
                     upstream_timeout: Duration::from_millis(200),
                     skip_cache: true,
+                    carried_ecs: None,
                     observed: None,
                     held_inflight: [None, None],
                 },
