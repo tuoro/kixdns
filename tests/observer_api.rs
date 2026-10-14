@@ -2673,3 +2673,77 @@ async fn a_continue_inside_a_jump_target_enters_it_once() {
     assert_eq!(entered, ["main", "second"]);
     echo_task.abort();
 }
+
+/// UDP upstream that answers every query like `spawn_echo_upstream`, after `delay`.
+/// 像 `spawn_echo_upstream` 一样应答每个查询，但先等 `delay`。
+async fn spawn_slow_upstream(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = socket.local_addr().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            let socket = Arc::clone(&socket);
+            let query = buf[..n].to_vec();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Some(response) = echo_answer(&query, 60) {
+                    let _ = socket.send_to(&response, peer).await;
+                }
+            });
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn requests_that_jump_into_each_others_pipeline_do_not_wait_forever() {
+    // Each client enters its own pipeline, and each pipeline's check jumps into
+    // the other: each request holds its entry pipeline's query and finds the
+    // other's in flight where it lands.
+    // 两个客户端各进各的 pipeline，两边的检查互相跳进对方：每个请求握着自己入口 pipeline
+    // 的查询，落脚处又碰上对方正在进行的那个。
+    let (slow, slow_task) = spawn_slow_upstream(Duration::from_millis(200)).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 300,
+            "response_jump_limit": 2
+        },
+        "pipeline_select": [
+            {
+                "pipeline": "p",
+                "matchers": [{ "type": "client_ip", "cidr": "127.0.0.1/32" }]
+            },
+            { "pipeline": "q", "matchers": [{ "type": "any" }] }
+        ],
+        "pipelines": [
+            forward_then_jump("p", &slow, "q"),
+            forward_then_jump("q", &slow, "p")
+        ]
+    })
+    .to_string();
+    let (engine, _recorder) = observed_engine(&raw);
+    let send = |client: &str| {
+        let engine = engine.clone();
+        let client: SocketAddr = client.parse().unwrap();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                engine.handle_packet(&query("each.example"), client),
+            )
+            .await
+        })
+    };
+    let (first, second) = (send(LEADER), send(FOLLOWER));
+    for (client, outcome) in [
+        (LEADER, first.await.unwrap()),
+        (FOLLOWER, second.await.unwrap()),
+    ] {
+        let response = outcome
+            .unwrap_or_else(|_| panic!("{client}: waited on the other request for good"))
+            .unwrap();
+        // Both loop until the jump limit / 两个都一直跳到跳转上限
+        assert_eq!(rcode_of(&response), ResponseCode::ServFail, "{client}");
+    }
+    slow_task.abort();
+}

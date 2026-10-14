@@ -636,6 +636,7 @@ pub(crate) async fn process_response_jump(
     // `pipeline_selected` 在进入 pipeline 时上报；`continue` 在同一 pipeline
     // 的下一条规则继续时不再重复上报。
     let mut entering = true;
+    let join_wait = crate::engine::upstream::hedge_timeout(upstream_timeout);
 
     loop {
         response.pipeline = Some(pipeline_id.clone());
@@ -837,43 +838,48 @@ pub(crate) async fn process_response_jump(
                             };
 
                             if let Some(mut rx) = rx {
-                                // watch channel uses changed() to wait for updates
-                                // watch channel 使用 changed() 等待更新
-                                match rx.changed().await {
-                                    Ok(_) => {
-                                        if let Some((observer, ctx)) = observed {
-                                            observer.inflight_joined(ctx);
-                                        }
-                                        // Clone result to avoid holding RwLockReadGuard across await
-                                        // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
-                                        let result = rx.borrow().clone();
-                                        match &result {
-                                            Ok(bytes) => {
-                                                // Rewrite Transaction ID for followers using BytesMut
-                                                let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                                if resp_mut.len() >= 2 {
-                                                    let id_bytes = req.metadata.id.to_be_bytes();
-                                                    resp_mut[0] = id_bytes[0];
-                                                    resp_mut[1] = id_bytes[1];
-                                                }
-                                                let resp_bytes = resp_mut.freeze();
-
-                                                for g in &mut cleanup_guards {
-                                                    g.defuse();
-                                                }
-                                                for h in &inflight_hashes {
-                                                    engine.notify_inflight_waiters(*h, bytes).await;
-                                                }
-                                                response.upstream = Some(Arc::from("inflight"));
-                                                return Ok(resp_bytes);
-                                            }
-                                            Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                                        }
+                                // The request holds entries of its own on the jump path, so the one it
+                                // waits on may in turn be waiting on it (two requests that jumped into
+                                // each other's pipeline). Wait only until an upstream should have
+                                // answered (see `hedge_timeout`), then forward by itself.
+                                // 跳转路上的请求自己握着条目，它等的那一个可能反过来也在等它（两个请求互相
+                                // 跳进了对方的 pipeline）。只等到上游应当已经应答的时间点（见
+                                // `hedge_timeout`），之后自己转发。
+                                if let Ok(Ok(())) =
+                                    tokio::time::timeout(join_wait, rx.changed()).await
+                                {
+                                    if let Some((observer, ctx)) = observed {
+                                        observer.inflight_joined(ctx);
                                     }
-                                    Err(_) => {
-                                        // sender dropped, fallthrough to attempt upstream
+                                    // Clone result to avoid holding RwLockReadGuard across await
+                                    // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                    let result = rx.borrow().clone();
+                                    match &result {
+                                        Ok(bytes) => {
+                                            // Rewrite Transaction ID for followers using BytesMut
+                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                            if resp_mut.len() >= 2 {
+                                                let id_bytes = req.metadata.id.to_be_bytes();
+                                                resp_mut[0] = id_bytes[0];
+                                                resp_mut[1] = id_bytes[1];
+                                            }
+                                            let resp_bytes = resp_mut.freeze();
+
+                                            for g in &mut cleanup_guards {
+                                                g.defuse();
+                                            }
+                                            for h in &inflight_hashes {
+                                                engine.notify_inflight_waiters(*h, bytes).await;
+                                            }
+                                            response.upstream = Some(Arc::from("inflight"));
+                                            return Ok(resp_bytes);
+                                        }
+                                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
                                     }
                                 }
+                                // Otherwise the sender dropped, or no answer came within the upstream
+                                // timeout: forward by itself
+                                // 否则发送端已丢弃，或上游超时内没等到应答：自己转发
                             }
                         }
                         crate::engine::upstream::forward_upstream(
@@ -921,43 +927,41 @@ pub(crate) async fn process_response_jump(
                         };
 
                         if let Some(mut rx) = rx {
-                            // watch channel uses changed() to wait for updates
-                            // watch channel 使用 changed() 等待更新
-                            match rx.changed().await {
-                                Ok(_) => {
-                                    if let Some((observer, ctx)) = observed {
-                                        observer.inflight_joined(ctx);
-                                    }
-                                    // Clone result to avoid holding RwLockReadGuard across await
-                                    // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
-                                    let result = rx.borrow().clone();
-                                    match &result {
-                                        Ok(bytes) => {
-                                            // Rewrite Transaction ID for followers using BytesMut
-                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                            if resp_mut.len() >= 2 {
-                                                let id_bytes = req.metadata.id.to_be_bytes();
-                                                resp_mut[0] = id_bytes[0];
-                                                resp_mut[1] = id_bytes[1];
-                                            }
-                                            let resp_bytes = resp_mut.freeze();
-
-                                            for g in &mut cleanup_guards {
-                                                g.defuse();
-                                            }
-                                            for h in &inflight_hashes {
-                                                engine.notify_inflight_waiters(*h, bytes).await;
-                                            }
-                                            response.upstream = Some(Arc::from("inflight"));
-                                            return Ok(resp_bytes);
-                                        }
-                                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                                    }
+                            // See the same wait above / 同上
+                            if let Ok(Ok(())) = tokio::time::timeout(join_wait, rx.changed()).await
+                            {
+                                if let Some((observer, ctx)) = observed {
+                                    observer.inflight_joined(ctx);
                                 }
-                                Err(_) => {
-                                    // sender dropped, fallthrough to attempt upstream
+                                // Clone result to avoid holding RwLockReadGuard across await
+                                // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                let result = rx.borrow().clone();
+                                match &result {
+                                    Ok(bytes) => {
+                                        // Rewrite Transaction ID for followers using BytesMut
+                                        let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                        if resp_mut.len() >= 2 {
+                                            let id_bytes = req.metadata.id.to_be_bytes();
+                                            resp_mut[0] = id_bytes[0];
+                                            resp_mut[1] = id_bytes[1];
+                                        }
+                                        let resp_bytes = resp_mut.freeze();
+
+                                        for g in &mut cleanup_guards {
+                                            g.defuse();
+                                        }
+                                        for h in &inflight_hashes {
+                                            engine.notify_inflight_waiters(*h, bytes).await;
+                                        }
+                                        response.upstream = Some(Arc::from("inflight"));
+                                        return Ok(resp_bytes);
+                                    }
+                                    Err(e) => return Err(anyhow::anyhow!("{}", e)),
                                 }
                             }
+                            // Otherwise the sender dropped, or no answer came within the upstream
+                            // timeout: forward by itself
+                            // 否则发送端已丢弃，或上游超时内没等到应答：自己转发
                         }
                     }
                     crate::engine::upstream::forward_upstream(
