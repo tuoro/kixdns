@@ -2561,3 +2561,244 @@ async fn an_expired_answer_found_after_a_jump_is_served_stale() {
         ]
     );
 }
+
+/// A pipeline whose one rule forwards to `upstream` and, when the answer comes
+/// from it, jumps to `target`.
+/// 只有一条规则的 pipeline：转发给 `upstream`，应答来自它时跳到 `target`。
+fn forward_then_jump(id: &str, upstream: &str, target: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "rules": [{
+            "name": format!("{id}-check"),
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }],
+            "response_matchers": [{ "type": "upstream_equals", "value": upstream }],
+            "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": target }]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn a_check_that_jumps_back_into_a_visited_pipeline_does_not_hang() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    // Back into a pipeline the jump path already went through, and back into
+    // the one the request entered by, whose entry the caller registered.
+    // 跳回跳转路上走过的 pipeline，以及跳回请求进来时的那个（它的条目由调用方登记）。
+    for (case, pipelines) in [
+        (
+            "jump path",
+            [
+                forward_then_jump("main", &echo, "loop"),
+                forward_then_jump("loop", &echo, "loop"),
+            ],
+        ),
+        (
+            "entry",
+            [
+                forward_then_jump("main", &echo, "loop"),
+                forward_then_jump("loop", &echo, "main"),
+            ],
+        ),
+    ] {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 500,
+                "response_jump_limit": 3
+            },
+            "pipelines": pipelines
+        })
+        .to_string();
+        let (engine, recorder) = observed_engine(&raw);
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            engine.handle_packet(&query("again.example"), peer()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the query hung"))
+        .unwrap();
+        // The jump limit ends the loop / 由跳转上限结束循环
+        assert_eq!(rcode_of(&response), ResponseCode::ServFail, "{case}");
+        let events = recorder.drain();
+        let id = request_id_for(&events, "again.example");
+        assert!(
+            !events_of(&events, id).contains(&Event::InflightJoined { id }),
+            "{case}: the request never joins its own query"
+        );
+    }
+    echo_task.abort();
+}
+
+#[tokio::test]
+async fn a_continue_inside_a_jump_target_enters_it_once() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 500 },
+        "pipelines": [
+            forward_then_jump("main", &echo, "second"),
+            {
+                "id": "second",
+                "rules": [
+                    {
+                        "name": "pass",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+                        "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                        "response_actions_on_match": [{ "type": "continue" }]
+                    },
+                    {
+                        "name": "rest",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let _ = engine
+        .handle_packet(&query("once.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "once.example");
+    let entered: Vec<String> = events_of(&events, id)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Pipeline { pipeline, .. } => Some(pipeline),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(entered, ["main", "second"]);
+    echo_task.abort();
+}
+
+#[tokio::test]
+async fn a_continue_after_the_last_jump_does_not_count_as_a_jump() {
+    let (echo, echo_task) = spawn_echo_upstream(60).await;
+    // `main`'s check jumps to `second` (one of two jumps left), whose rule-level
+    // jump to `third` uses the last one; `third` continues past an answer and
+    // its next rule answers.
+    // `main` 的检查跳到 `second`（两次跳转剩一次），`second` 的规则级跳转用掉最后一次进入
+    // `third`；`third` 越过一个应答，由下一条规则回答。
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 500,
+            "response_jump_limit": 2
+        },
+        "pipelines": [
+            forward_then_jump("main", &echo, "second"),
+            {
+                "id": "second",
+                "rules": [{
+                    "name": "onward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "jump_to_pipeline", "pipeline": "third" }]
+                }]
+            },
+            {
+                "id": "third",
+                "rules": [
+                    {
+                        "name": "pass",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+                        "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                        "response_actions_on_match": [{ "type": "continue" }]
+                    },
+                    {
+                        "name": "rest",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+                    }
+                ]
+            }
+        ]
+    })
+    .to_string();
+    let (engine, _recorder) = observed_engine(&raw);
+    let response = engine
+        .handle_packet(&query("last.example"), peer())
+        .await
+        .unwrap();
+    assert_eq!(rcode_of(&response), ResponseCode::NoError);
+    let answer = Message::from_bytes(&response).unwrap();
+    assert_eq!(answer.answers.len(), 1, "{answer:?}");
+    echo_task.abort();
+}
+
+/// UDP upstream that answers every query like `spawn_echo_upstream`, after `delay`.
+/// 像 `spawn_echo_upstream` 一样应答每个查询，但先等 `delay`。
+async fn spawn_slow_upstream(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = socket.local_addr().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            let socket = Arc::clone(&socket);
+            let query = buf[..n].to_vec();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Some(response) = echo_answer(&query, 60) {
+                    let _ = socket.send_to(&response, peer).await;
+                }
+            });
+        }
+    });
+    (addr, task)
+}
+
+#[tokio::test]
+async fn requests_that_jump_into_each_others_pipeline_do_not_wait_forever() {
+    // Each client enters its own pipeline, and each pipeline's check jumps into
+    // the other: each request holds its entry pipeline's query and finds the
+    // other's in flight where it lands.
+    // 两个客户端各进各的 pipeline，两边的检查互相跳进对方：每个请求握着自己入口 pipeline
+    // 的查询，落脚处又碰上对方正在进行的那个。
+    let (slow, slow_task) = spawn_slow_upstream(Duration::from_millis(200)).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 300,
+            "response_jump_limit": 2
+        },
+        "pipeline_select": [
+            {
+                "pipeline": "p",
+                "matchers": [{ "type": "client_ip", "cidr": "127.0.0.1/32" }]
+            },
+            { "pipeline": "q", "matchers": [{ "type": "any" }] }
+        ],
+        "pipelines": [
+            forward_then_jump("p", &slow, "q"),
+            forward_then_jump("q", &slow, "p")
+        ]
+    })
+    .to_string();
+    let (engine, _recorder) = observed_engine(&raw);
+    let send = |client: &str| {
+        let engine = engine.clone();
+        let client: SocketAddr = client.parse().unwrap();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                engine.handle_packet(&query("each.example"), client),
+            )
+            .await
+        })
+    };
+    let (first, second) = (send(LEADER), send(FOLLOWER));
+    for (client, outcome) in [
+        (LEADER, first.await.unwrap()),
+        (FOLLOWER, second.await.unwrap()),
+    ] {
+        let response = outcome
+            .unwrap_or_else(|_| panic!("{client}: waited on the other request for good"))
+            .unwrap();
+        // Both loop until the jump limit / 两个都一直跳到跳转上限
+        assert_eq!(rcode_of(&response), ResponseCode::ServFail, "{client}");
+    }
+    slow_task.abort();
+}
