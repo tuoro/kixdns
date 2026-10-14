@@ -1043,11 +1043,18 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.rule_matched(ctx, event);
         }
-        let phase = match event.phase {
-            RulePhase::Request => "request",
-            _ => "response",
-        };
-        self.record_rule_match(event.pipeline, event.rule, phase);
+        // 规则命中和请求数、pipeline 命中一样只算客户端请求：后台刷新会照规则再走一遍，算进去
+        // 命中数就会多于实际的查询，按命中数相减的请求分布也跟着偏
+        // Rule matches, like request and pipeline counts, cover client queries only: a background
+        // refresh walks the rules again, and counting it would put matches above the actual
+        // queries and skew the request breakdown that subtracts them
+        if !ctx.background_refresh {
+            let phase = match event.phase {
+                RulePhase::Request => "request",
+                _ => "response",
+            };
+            self.record_rule_match(event.pipeline, event.rule, phase);
+        }
         self.query_log.rule_matched(ctx, event);
     }
 
@@ -2479,6 +2486,18 @@ mod tests {
         metrics.request_started(&background);
         metrics.pipeline_selected(&background, "main");
         metrics.cache_lookup(&background);
+        for phase in [RulePhase::Request, RulePhase::Response] {
+            metrics.rule_matched(
+                &background,
+                &RuleMatched {
+                    pipeline: "main",
+                    rule: "forward-all",
+                    phase,
+                    decision: DecisionKind::Forward,
+                    fast_path: false,
+                },
+            );
+        }
 
         assert_eq!(metrics.requests_total.load(super::Ordering::Relaxed), 1);
         assert_eq!(metrics.requests_inflight.load(super::Ordering::Relaxed), 0);
@@ -2501,6 +2520,12 @@ mod tests {
                 .unwrap()
                 .load(super::Ordering::Relaxed),
             1
+        );
+        assert!(
+            metrics
+                .rule_matches
+                .get("main\0forward-all\0response")
+                .is_none()
         );
         let now = super::unix_timestamp();
         let snapshot = metrics.query_stats.snapshot(now, 3_600, 20);
