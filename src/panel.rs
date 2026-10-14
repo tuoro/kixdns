@@ -1093,7 +1093,12 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.decision_made(ctx, event);
         }
-        panel_trace::record_decision(event);
+        // 诊断的执行路径只写请求阶段的决定：回答后检查的结果已经由响应规则那一步说了
+        // The diagnostics trace shows request-phase decisions only: an answer check's
+        // outcome is already told by its response-rule step
+        if event.phase == RulePhase::Request {
+            panel_trace::record_decision(event);
+        }
     }
 
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {
@@ -2176,6 +2181,7 @@ mod tests {
                 &DecisionMade {
                     pipeline: "main",
                     rule: Some("forward-all"),
+                    phase: RulePhase::Request,
                     detail: DecisionDetail::Forward {
                         upstream: "1.1.1.1:53",
                         transport: Some(Transport::Udp),

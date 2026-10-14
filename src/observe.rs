@@ -105,8 +105,14 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`rule_evaluated`]: EngineObserver::rule_evaluated
     fn rule_matched(&self, ctx: &RequestContext<'_>, event: &RuleMatched<'_>) {}
 
-    /// A pipeline produced its decision for the request, after rule
-    /// evaluation or from a rule cache hit.
+    /// A decision was made for the request. Request phase: a pipeline produced
+    /// its decision, after rule evaluation or from a rule cache hit. Response
+    /// phase: a rule's response actions (`response_actions_on_match` or
+    /// `response_actions_on_miss`) decided what to do with the upstream's answer
+    /// or its failure: answer it locally, jump to another pipeline, or keep the
+    /// upstream's answer. Response actions that `continue` to the next rule
+    /// report no decision, and neither does a rule without response actions,
+    /// whose upstream answer stands as the request-phase decision forwarded it.
     fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {}
 
     /// The response cache was consulted for the request: once before the rules
@@ -313,7 +319,8 @@ pub struct RuleEvaluated<'a> {
     pub matchers: usize,
 }
 
-/// A pipeline produced its decision for the request.
+/// A decision was made for the request (see
+/// [`EngineObserver::decision_made`]).
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct DecisionMade<'a> {
@@ -322,6 +329,12 @@ pub struct DecisionMade<'a> {
     /// Rule that decided, or `None` when no rule matched and the default
     /// upstream applies.
     pub rule: Option<&'a str>,
+    /// `Request` for a pipeline's decision on the query, `Response` for a
+    /// rule's response actions deciding on the upstream's answer. A response
+    /// decision to keep the upstream's answer is a [`DecisionDetail::Forward`]
+    /// naming the upstream that answered and the transport that carried the
+    /// answer.
+    pub phase: RulePhase,
     /// What was decided.
     pub detail: DecisionDetail<'a>,
 }
@@ -615,6 +628,7 @@ impl EngineObserver for TracingObserver {
             request_id = ctx.request_id,
             pipeline = event.pipeline,
             rule = event.rule,
+            phase = ?event.phase,
             detail = ?event.detail,
             "decision made"
         );
@@ -788,6 +802,7 @@ mod tests {
                 &DecisionMade {
                     pipeline: "main",
                     rule: Some("static"),
+                    phase: RulePhase::Request,
                     detail: DecisionDetail::Static {
                         rcode: ResponseCode::NXDomain,
                         answers: 0,

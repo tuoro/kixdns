@@ -29,7 +29,7 @@ use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
 use crate::observe::{RuleEvaluated, RuleMatched, RulePhase};
 
-use super::observation::{Observed, response_decision_kind};
+use super::observation::{Observed, report_response_decision, response_decision_kind};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -278,9 +278,23 @@ pub(crate) async fn apply_response_actions(
 }
 
 /// [`apply_response_actions`] with the observer context of the request, so
-/// upstream attempts made by response-phase `forward` actions are reported.
-/// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报。
+/// upstream attempts made by response-phase `forward` actions are reported, and
+/// so is the decision the actions arrive at.
+/// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报，
+/// 动作最后作出的决定也一并上报。
 pub(crate) async fn apply_response_actions_observed(
+    ctx: ApplyResponseActionsContext<'_>,
+    observed: Observed<'_>,
+) -> anyhow::Result<ResponseActionResult> {
+    let (pipeline, rule) = (ctx.pipeline_id, ctx.rule_name);
+    let result = run_response_actions(ctx, observed).await?;
+    if let Some((observer, request)) = observed {
+        report_response_decision(observer, request, pipeline, rule, &result);
+    }
+    Ok(result)
+}
+
+async fn run_response_actions(
     mut ctx: ApplyResponseActionsContext<'_>,
     observed: Observed<'_>,
 ) -> anyhow::Result<ResponseActionResult> {
