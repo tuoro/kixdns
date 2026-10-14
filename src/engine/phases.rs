@@ -9,7 +9,7 @@ use crate::engine::types::EngineInner;
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
-use crate::matcher::{RuntimeResponseMatcherWithOp, eval_match_chain};
+use crate::matcher::{Requester, RuntimeResponseMatcherWithOp, eval_match_chain};
 use crate::observe::{CacheHit, CacheHitKind, RuleEvaluated, RuleMatched, RulePhase};
 use crate::proto_utils;
 use anyhow::Context;
@@ -43,6 +43,9 @@ pub struct CacheLookupContext<'a> {
     pub tx_id: u16,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
+    /// Whether the request carried EDNS; a background refresh replays it the same way.
+    /// 请求是否带 EDNS；后台刷新照此重放。
+    pub edns_present: bool,
     /// Observer context of the request; cache hits are reported through it.
     /// 所属请求的观察者上下文；缓存命中通过它上报。
     pub observed: Observed<'a>,
@@ -69,6 +72,7 @@ pub(crate) fn check_cache_logged(
         tx_id,
         start: _,
         peer,
+        edns_present,
         observed,
     } = *context;
 
@@ -129,7 +133,10 @@ pub(crate) fn check_cache_logged(
                             qname_ref,
                             qtype,
                             qclass,
-                            peer.ip(),
+                            Requester {
+                                address: peer.ip(),
+                                edns: edns_present,
+                            },
                         );
                     }
                     return None;
@@ -167,7 +174,10 @@ pub(crate) fn check_cache_logged(
                         qname_ref,
                         qtype,
                         qclass,
-                        peer.ip(),
+                        Requester {
+                            address: peer.ip(),
+                            edns: edns_present,
+                        },
                     );
                 }
 
@@ -259,7 +269,10 @@ pub(crate) fn check_cache_logged(
                         qname_ref,
                         qtype,
                         qclass,
-                        peer.ip(),
+                        Requester {
+                            address: peer.ip(),
+                            edns: edns_present,
+                        },
                     );
                 }
 
@@ -321,6 +334,7 @@ pub(crate) fn check_stale_cache_logged(
         tx_id,
         start: _,
         peer,
+        edns_present,
         observed,
     } = *context;
     if !state.pipeline.settings.serve_stale {
@@ -397,7 +411,10 @@ pub(crate) fn check_stale_cache_logged(
                     qname_ref,
                     qtype,
                     qclass,
-                    peer.ip(),
+                    Requester {
+                        address: peer.ip(),
+                        edns: edns_present,
+                    },
                 );
             }
 
@@ -497,6 +514,8 @@ pub struct ForwardDecisionContext<'a> {
     pub upstream_timeout: Duration,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
+    /// Whether the request carried EDNS / 请求是否带 EDNS
+    pub edns_present: bool,
     pub skip_cache: bool,
     pub upstream: &'a str,
     pub pre_split_upstreams: Option<&'a Arc<Vec<Arc<str>>>>,
@@ -547,6 +566,7 @@ pub(crate) async fn handle_forward_decision_logged(
         upstream_timeout,
         start,
         peer,
+        edns_present,
         skip_cache,
         upstream,
         pre_split_upstreams,
@@ -1037,6 +1057,10 @@ pub(crate) async fn handle_forward_decision_logged(
                             min_ttl,
                             upstream_timeout,
                             skip_cache,
+                            // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
+                            carried_ecs: ecs.and_then(|mode| {
+                                crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
+                            }),
                             observed,
                         },
                         response,
@@ -1106,6 +1130,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         tx_id,
                         start,
                         peer,
+                        edns_present,
                         observed,
                     },
                     CacheHitKind::StaleUpstreamFailure,
@@ -1293,6 +1318,10 @@ pub(crate) async fn handle_forward_decision_logged(
                                 min_ttl,
                                 upstream_timeout,
                                 skip_cache,
+                                // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
+                                carried_ecs: ecs.and_then(|mode| {
+                                    crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
+                                }),
                                 observed,
                             },
                             response,
@@ -1508,6 +1537,7 @@ mod refresh_response_rule_tests {
             RecordType::A,
             DNSClass::IN,
             None,
+            &crate::matcher::RequesterKey::NONE,
         );
         let request = query();
         let mut reply = Message::new(request.id, MessageType::Response, OpCode::Query);
