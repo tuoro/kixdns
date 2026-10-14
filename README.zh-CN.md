@@ -535,7 +535,7 @@ DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提
 
 Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命中去重和规则缓存会按规则对请求方的判定把它们分开，而不是按地址：客户端地址是否在各个 client_ip 网段内，是否为私有地址（geoip_private），GeoIP 国家或标签是否匹配（geoip_country），查询是否带 EDNS（edns_present、response_edns_present），以及转发从客户端取 ECS、且比 Pipeline 自身 ecs 设置更细时发送的是哪个子网。判定相同的请求方共用条目。Pipeline 的回答检查开始的响应跳转路径上的规则也算在内，因为请求在应答之前会运行它们。这条路径转发的是跳转前那次转发准备的包，连同 ECS，所以它的条目和直接进入该 Pipeline 的请求分开。规则缓存保存的是 Pipeline 自身规则的决策，因此只按该 Pipeline 的请求匹配器判定；开启 cache_background_refresh 时还按客户端地址区分，与以前相同。规则不判定任何请求方信息的 Pipeline 照旧在所有客户端之间共享。客户端自己带来的 ECS 选项原样发往上游，不进入任何键。后台刷新从同一个客户端地址重放请求，原请求带 EDNS 时也带 EDNS，因此 Pipeline 选择和请求规则读到的地址和 EDNS 与那次请求相同。
 
-启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新；刷新失败会保留现有条目。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。该客户端等待还会被本次请求 request_timeout_ms 的剩余预算截断，配得比请求预算还长也不会把过期应答拖过截止时刻。
+启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新。刷新和客户端请求一样执行规则，包括响应规则及其动作。上游给出应答时，规则接受的应答替换这个条目；规则的结果不缓存在这个条目下时（不缓存的静态应答，或经跳转得到的应答），条目会被删除，由下一个客户端请求自己执行规则。上游失败或规则没找到应答时，除非规则得出的结果缓存在这个条目下，否则条目保留。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。该客户端等待还会被本次请求 request_timeout_ms 的剩余预算截断，配得比请求预算还长也不会把过期应答拖过截止时刻。
 
 主配置 watcher 使用按 Pipeline 划分的缓存命名空间重载有效 JSON。发生变化的 Pipeline 会立即停止访问旧配置产生的响应缓存、规则缓存和进行中请求；未变化的 Pipeline 会保留热缓存。任意全局设置变化都会轮换所有 Pipeline 的缓存命名空间。旧命名空间中的条目不会被同步删除，而是继续受现有缓存容量和 TTL 策略限制。包括后台刷新和响应阶段跳转在内，每个请求都会保持选择其缓存命名空间时的配置快照，因此重载前启动的任务无法写入当前生效的缓存代际。无效的重载会保留旧配置。
 
