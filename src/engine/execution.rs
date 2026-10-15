@@ -1244,6 +1244,13 @@ impl Engine {
                         current_pipeline_id = p.id.clone();
                         response_log.info.pipeline = Some(current_pipeline_id.clone());
                         current_uses_client_ip = p.uses_client_ip;
+                        // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的。
+                        // 带过来交给这里的 allow，就会写进这个 pipeline 的键，之后直接进入这里的请求
+                        // 也会拿到它。
+                        // An answer kept for reuse belongs to the pipeline that fetched it, through
+                        // its forward and with its ECS. Handed to an allow here, it would be cached
+                        // under this pipeline's key and served to requests that come here directly.
+                        reused_response = None;
                         if let Some(observed) = &observed {
                             observed
                                 .observer
@@ -3694,5 +3701,217 @@ mod tests_multi_upstream {
             }
             _ => panic!("expected forward action"),
         }
+    }
+}
+
+#[cfg(test)]
+mod reused_answer_tests {
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+
+    use super::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+
+    /// The default upstream's answer, which an `allow` stands for.
+    /// 默认上游的应答，也就是 `allow` 该给出的。
+    const DEFAULT: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 30);
+    /// The answer a rule checks and continues past, kept for reuse.
+    /// 被规则检查后越过、留着复用的应答。
+    const CHECKED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
+
+    async fn spawn_answering(answer: Ipv4Addr) -> String {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(request) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = request.queries.first().cloned() else {
+                    continue;
+                };
+                let mut reply =
+                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+                reply.add_query(question.clone());
+                reply.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(A(answer)),
+                ));
+                let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
+            }
+        });
+        addr
+    }
+
+    fn engine(raw: serde_json::Value) -> Engine {
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine")
+    }
+
+    async fn ask(engine: &Engine, client: &str) -> Option<Ipv4Addr> {
+        let mut request = Message::new(0x2a2a, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&request.to_vec().unwrap(), client.parse().unwrap()),
+        )
+        .await
+        .expect("must not hang")
+        .expect("engine answers");
+        Message::from_bytes(&bytes)
+            .expect("parse answer")
+            .answers
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+    }
+
+    /// The rules of `via`: check the answer of `checked` and continue past it, then
+    /// jump to `target`.
+    /// `via` 的规则：检查 `checked` 的应答并越过它，然后跳到 `target`。
+    fn continue_then_jump(id: &str, checked: &str, target: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "rules": [
+            {
+                "name": "checked",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": checked }],
+                "response_matchers": [{ "type": "upstream_equals", "value": checked }],
+                "response_actions_on_match": [{ "type": "continue" }]
+            },
+            {
+                "name": "jump",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "jump_to_pipeline", "pipeline": target }]
+            }
+        ]})
+    }
+
+    fn allow(id: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "rules": [{
+            "name": "allow",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "allow" }]
+        }]})
+    }
+
+    fn settings(default: &str) -> serde_json::Value {
+        serde_json::json!({
+            "default_upstream": default,
+            "upstream_timeout_ms": 500,
+            "enable_tcp_fallback": false
+        })
+    }
+
+    /// A request-phase jump leaves the continued-past answer behind: the target's
+    /// `allow` forwards to the default upstream, and a request entering the target
+    /// directly is not handed the other pipeline's answer from the cache.
+    /// 请求阶段的跳转不把越过的应答带过去：目标的 `allow` 转发到默认上游，直接进入目标的
+    /// 请求也不会从缓存拿到另一个 pipeline 的应答。
+    #[tokio::test]
+    async fn a_request_jump_leaves_the_reused_answer_behind() {
+        let checked = spawn_answering(CHECKED).await;
+        let default = spawn_answering(DEFAULT).await;
+        let engine = engine(serde_json::json!({
+            "settings": settings(&default),
+            "pipeline_select": [
+                { "pipeline": "main", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "next", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [continue_then_jump("main", &checked, "next"), allow("next")]
+        }));
+        assert_eq!(ask(&engine, "10.0.0.1:53000").await, Some(DEFAULT));
+        assert_eq!(ask(&engine, "10.0.0.2:53000").await, Some(DEFAULT));
+    }
+
+    /// The same for a rule-level jump on the response-jump path.
+    /// 响应跳转路径上的规则级跳转也一样。
+    #[tokio::test]
+    async fn a_jump_on_the_response_jump_path_leaves_the_reused_answer_behind() {
+        let entry = spawn_answering(Ipv4Addr::new(192, 0, 2, 50)).await;
+        let checked = spawn_answering(CHECKED).await;
+        let default = spawn_answering(DEFAULT).await;
+        let engine = engine(serde_json::json!({
+            "settings": settings(&default),
+            "pipeline_select": [
+                { "pipeline": "main", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "next", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [
+                { "id": "main", "rules": [{
+                    "name": "entry",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": entry }],
+                    "response_matchers": [{ "type": "upstream_equals", "value": entry }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "via" }]
+                }]},
+                continue_then_jump("via", &checked, "next"),
+                allow("next")
+            ]
+        }));
+        assert_eq!(ask(&engine, "10.0.0.1:53000").await, Some(DEFAULT));
+        assert_eq!(ask(&engine, "10.0.0.2:53000").await, Some(DEFAULT));
+    }
+
+    /// The same for an answer check's jump on the response-jump path.
+    /// 响应跳转路径上回答检查触发的跳转也一样。
+    #[tokio::test]
+    async fn an_answer_check_jump_on_the_response_jump_path_leaves_the_reused_answer_behind() {
+        let entry = spawn_answering(Ipv4Addr::new(192, 0, 2, 50)).await;
+        let checked = spawn_answering(CHECKED).await;
+        let hop = spawn_answering(Ipv4Addr::new(192, 0, 2, 60)).await;
+        let default = spawn_answering(DEFAULT).await;
+        let engine = engine(serde_json::json!({
+            "settings": settings(&default),
+            "pipeline_select": [
+                { "pipeline": "main", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "next", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [
+                { "id": "main", "rules": [{
+                    "name": "entry",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": entry }],
+                    "response_matchers": [{ "type": "upstream_equals", "value": entry }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "via" }]
+                }]},
+                { "id": "via", "rules": [
+                    {
+                        "name": "checked",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": checked }],
+                        "response_matchers": [{ "type": "upstream_equals", "value": checked }],
+                        "response_actions_on_match": [{ "type": "continue" }]
+                    },
+                    {
+                        "name": "hop",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": hop }],
+                        "response_matchers": [{ "type": "upstream_equals", "value": hop }],
+                        "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "next" }]
+                    }
+                ]},
+                allow("next")
+            ]
+        }));
+        assert_eq!(ask(&engine, "10.0.0.1:53000").await, Some(DEFAULT));
+        assert_eq!(ask(&engine, "10.0.0.2:53000").await, Some(DEFAULT));
     }
 }
