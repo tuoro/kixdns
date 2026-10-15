@@ -304,7 +304,22 @@ impl Engine {
     /// Helper: create and insert DNS cache entry / 辅助函数：创建并插入 DNS 缓存条目
     /// Eliminate duplicate CacheEntry construction code / 消除重复的 CacheEntry 构造代码
     #[inline]
+    /// Every answer is cached through here. A truncated answer never is: it is incomplete,
+    /// and the client is meant to ask again over TCP (RFC 2181 section 9), which a cached copy
+    /// would answer with the same truncated answer for its whole TTL. A refresh that gets one
+    /// keeps the old entry.
+    /// 所有应答都经这里写进缓存。截断的应答从不缓存：它不完整，客户端本该改用 TCP 再问（RFC 2181
+    /// 第 9 节），缓存了就会在整个 TTL 内拿同一个截断的应答回答它。刷新拿到这样的应答时，旧条目保留。
     pub(crate) fn insert_dns_cache_entry(&self, cache_hash: u64, entry: CacheEntry) {
+        if crate::proto_utils::truncated_response(&entry.bytes) {
+            tracing::debug!(
+                event = "truncated_answer_not_cached",
+                qname = %entry.qname,
+                pipeline = %entry.pipeline_id,
+                "truncated answer is not cached"
+            );
+            return;
+        }
         self.cache.insert(cache_hash, Arc::new(entry));
     }
 

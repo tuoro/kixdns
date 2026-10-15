@@ -675,23 +675,23 @@ pub(crate) async fn handle_forward_decision_logged(
         .await
     };
 
-    // 被截断的 UDP 应答改用 TCP 重取一次，取到的结果照常往下走：应答经过响应规则和动作、写进缓存，
-    // 失败时走过期缓存和 on_miss 动作。原来这里直接把 TCP 应答发回，大应答因此跳过了回答检查和
-    // 缓存；TCP 也失败时直接返回错误，失败路径一步也不走。
-    // A truncated UDP answer is fetched once more over TCP, and whatever comes back goes on through
+    // 被截断的应答改用 TCP 重取一次，取到的结果照常往下走：应答经过响应规则和动作、写进缓存，失败时
+    // 走过期缓存和 on_miss 动作。UDP 转发本身已经会用 TCP 重取截断的应答，所以这里只在两种情况下
+    // 再试：它拿回的 TCP 应答仍带 TC 位；或者 `tcp+udp://` 上游双发时 TCP 那一路失败，留下了截断的
+    // UDP 应答。
+    // A truncated answer is fetched once more over TCP, and whatever comes back goes on through
     // everything below: an answer meets the response rules and actions and the cache, a failure
-    // the stale cache and the miss actions. The TCP answer used to be returned right here, so large
-    // answers skipped the answer check and the cache, and a failed TCP attempt returned its error
-    // without taking the failure path at all.
-    let mut still_truncated = false;
+    // the stale cache and the miss actions. The UDP forwarder already fetches truncated answers
+    // again over TCP, so this only tries again in two cases: the TCP answer it got still has TC
+    // set, or a `tcp+udp://` upstream's TCP leg failed and left the truncated UDP answer.
     let resp = match resp {
         Ok((raw, _))
             if transport == Some(Transport::Udp)
                 && state.pipeline.settings.enable_tcp_fallback
-                && tc_bit_set(&raw) =>
+                && proto_utils::truncated_response(&raw) =>
         {
             tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
-            let retried = crate::engine::upstream::forward_upstream(
+            crate::engine::upstream::forward_upstream(
                 engine,
                 packet,
                 upstream,
@@ -700,14 +700,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 pre_split_upstreams,
                 observed,
             )
-            .await;
-            // 重取回来的还可能是截断的，例如写明 `udp://` 的上游又一次先到。这样的应答不写缓存：原来这条
-            // 路径从不缓存它，缓存了就会在整个 TTL 内一直给出不完整的应答。
-            // What comes back can still be truncated, for example when an upstream written as
-            // `udp://` answers first again. Such an answer is not cached: this path never cached it,
-            // and caching it would hand out the incomplete answer for its whole TTL.
-            still_truncated = retried.as_ref().is_ok_and(|(raw, _)| tc_bit_set(raw));
-            retried
+            .await
         }
         resp => resp,
     };
@@ -839,7 +832,7 @@ pub(crate) async fn handle_forward_decision_logged(
             };
 
             if actions_to_run.is_empty() {
-                if effective_ttl > Duration::from_secs(0) && !still_truncated {
+                if effective_ttl > Duration::from_secs(0) {
                     let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
                     let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                     engine.insert_dns_cache_entry(
@@ -1251,12 +1244,6 @@ pub(crate) async fn handle_forward_decision_logged(
     }
 }
 
-/// Whether a DNS message has the TC (truncated) bit set.
-/// DNS 报文是否带 TC（截断）位。
-fn tc_bit_set(message: &[u8]) -> bool {
-    message.get(2).is_some_and(|flags| flags & 0x02 != 0)
-}
-
 #[cfg(test)]
 mod tcp_fallback_tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -1348,14 +1335,17 @@ mod tcp_fallback_tests {
         _closed_tcp: Option<tokio::net::TcpSocket>,
     }
 
-    /// With `tcp` false the TCP port is held but nothing listens. `partial` is a record the
-    /// truncated UDP answers carry.
-    /// `tcp` 为 false 时占着 TCP 端口但不监听。`partial` 是截断的 UDP 应答里带的记录。
-    async fn spawn_truncating_upstream(tcp: bool, partial: Option<Ipv4Addr>) -> TruncatingUpstream {
+    /// `tcp` is how long the TCP answers take; with `None` the TCP port is held but nothing
+    /// listens. `partial` is a record the truncated UDP answers carry.
+    /// `tcp` 是 TCP 应答的延迟；为 `None` 时占着 TCP 端口但不监听。`partial` 是截断的 UDP 应答里带的记录。
+    async fn spawn_truncating_upstream(
+        tcp: Option<Duration>,
+        partial: Option<Ipv4Addr>,
+    ) -> TruncatingUpstream {
         let (udp, listener, closed_tcp) = loop {
             let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = udp.local_addr().unwrap();
-            let bound = if tcp {
+            let bound = if tcp.is_some() {
                 tokio::net::TcpListener::bind(addr)
                     .await
                     .map(|listener| (Some(listener), None))
@@ -1380,9 +1370,9 @@ mod tcp_fallback_tests {
                 }
             }
         });
-        let tcp_answers = match listener {
-            Some(listener) => serve_tcp(listener, FULL, Duration::ZERO),
-            None => Arc::new(AtomicUsize::new(0)),
+        let tcp_answers = match (listener, tcp) {
+            (Some(listener), Some(delay)) => serve_tcp(listener, FULL, delay),
+            _ => Arc::new(AtomicUsize::new(0)),
         };
         TruncatingUpstream {
             addr,
@@ -1414,10 +1404,22 @@ mod tcp_fallback_tests {
     }
 
     fn engine_with_rule(upstream: &str, checks: serde_json::Value) -> Engine {
+        engine_with(
+            serde_json::json!({ "type": "forward", "upstream": upstream, "transport": "udp" }),
+            checks,
+            true,
+        )
+    }
+
+    fn engine_with(
+        action: serde_json::Value,
+        checks: serde_json::Value,
+        tcp_fallback: bool,
+    ) -> Engine {
         let mut rule = serde_json::json!({
             "name": "forward",
             "matchers": [{ "type": "any" }],
-            "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            "actions": [action]
         });
         for (key, value) in checks.as_object().unwrap() {
             rule[key] = value.clone();
@@ -1426,7 +1428,7 @@ mod tcp_fallback_tests {
             "settings": {
                 "default_upstream": "127.0.0.1:9",
                 "upstream_timeout_ms": 2000,
-                "enable_tcp_fallback": true
+                "enable_tcp_fallback": tcp_fallback
             },
             "pipelines": [{ "id": "main", "rules": [rule] }]
         });
@@ -1474,23 +1476,23 @@ mod tcp_fallback_tests {
     /// 只有一个 UDP 上游：UDP 转发自己用 TCP 重取一次被截断的应答，拿回完整应答。
     #[tokio::test]
     async fn a_truncated_answer_from_a_udp_upstream_is_fetched_over_tcp_once() {
-        let upstream = spawn_truncating_upstream(true, None).await;
+        let upstream = spawn_truncating_upstream(Some(Duration::ZERO), None).await;
         let engine = engine_with_rule(&upstream.addr, serde_json::json!({}));
         assert_eq!(addresses(&ask(&engine).await), [FULL]);
         assert_eq!(upstream.tcp_answers.load(Ordering::SeqCst), 1);
     }
 
-    // With a TCP upstream in the same rule, the UDP forwarder leaves truncated answers
-    // alone (so TCP is not sent twice), and the retry here takes over. A slow TCP upstream
-    // lets the truncated UDP answer win the race.
-    // 同一条规则里还有 TCP 上游时，UDP 转发不自己重取（免得 TCP 发两次），由这里重试。TCP
-    // 上游故意慢一些，让截断的 UDP 应答先到。
+    // With a TCP upstream in the same rule, a failed UDP exchange does not fall back to TCP
+    // (so TCP is not sent twice), but a truncated answer is still fetched again over TCP. A
+    // slow TCP upstream lets the truncated UDP answer arrive first.
+    // 同一条规则里还有 TCP 上游时，UDP 失败不再回退到 TCP（免得 TCP 发两次），但截断的应答照样用 TCP
+    // 重取。TCP 上游故意慢一些，让截断的 UDP 应答先到。
 
     /// The answer check sees the full answer fetched over TCP and acts on it.
     /// 回答检查看到的是经 TCP 取回的完整应答，并按它行事。
     #[tokio::test]
     async fn a_truncated_answer_fetched_over_tcp_goes_through_the_response_rules() {
-        let truncating = spawn_truncating_upstream(true, None).await;
+        let truncating = spawn_truncating_upstream(Some(Duration::ZERO), None).await;
         let (slow, _) = spawn_tcp_upstream(Some(Duration::from_millis(500))).await;
         let engine = engine_with_rule(
             &format!("{},{slow}", truncating.addr),
@@ -1511,7 +1513,7 @@ mod tcp_fallback_tests {
     /// 经 TCP 取回的完整应答和其他应答一样写进缓存。
     #[tokio::test]
     async fn a_truncated_answer_fetched_over_tcp_is_cached() {
-        let truncating = spawn_truncating_upstream(true, None).await;
+        let truncating = spawn_truncating_upstream(Some(Duration::ZERO), None).await;
         let (slow, _) = spawn_tcp_upstream(Some(Duration::from_millis(500))).await;
         let engine = engine_with_rule(
             &format!("{},{slow}", truncating.addr),
@@ -1530,7 +1532,7 @@ mod tcp_fallback_tests {
     /// TCP 重试也失败时走失败路径，包括 on_miss 动作。
     #[tokio::test]
     async fn a_failed_tcp_retry_takes_the_failure_path() {
-        let truncating = spawn_truncating_upstream(false, None).await;
+        let truncating = spawn_truncating_upstream(None, None).await;
         let (dead, _held) = spawn_tcp_upstream(None).await;
         let engine = engine_with_rule(
             &format!("{},{dead}", truncating.addr),
@@ -1547,26 +1549,127 @@ mod tcp_fallback_tests {
         );
     }
 
-    /// An upstream written as `udp://` stays on UDP for the retry too, so the answer can
-    /// still be truncated. It is not cached: the next query asks the upstream again.
-    /// 写成 `udp://` 的上游在重取时也还走 UDP，应答可能仍是截断的。它不写缓存：下一次查询照样去问上游。
+    /// An upstream written as `udp://` next to a TCP one: its truncated answer is fetched
+    /// again over TCP like any UDP upstream's.
+    /// 写成 `udp://`、旁边还有 TCP 上游的上游：它截断的应答和其他 UDP 上游一样用 TCP 重取。
     #[tokio::test]
-    async fn an_answer_still_truncated_after_the_retry_is_not_cached() {
-        let truncating = spawn_truncating_upstream(true, Some(PARTIAL)).await;
+    async fn a_udp_upstream_next_to_a_tcp_one_has_truncated_answers_fetched_over_tcp() {
+        let truncating = spawn_truncating_upstream(Some(Duration::ZERO), Some(PARTIAL)).await;
         let (slow, _) = spawn_tcp_upstream(Some(Duration::from_millis(500))).await;
         let engine = engine_with_rule(
             &format!("udp://{},{slow}", truncating.addr),
             serde_json::json!({}),
         );
+        let answer = ask(&engine).await;
+        assert!(!answer.metadata.truncation, "{answer:?}");
+        assert_eq!(addresses(&answer), [FULL]);
+        assert_eq!(truncating.tcp_answers.load(Ordering::SeqCst), 1);
+    }
+
+    /// `tcp_udp` sends both ways at once. A truncated UDP answer that arrives first does
+    /// not win: the TCP leg's full answer does.
+    /// `tcp_udp` 两路同时发。先到的截断 UDP 应答不算赢，赢的是 TCP 那一路的完整应答。
+    #[tokio::test]
+    async fn a_truncated_udp_answer_does_not_win_a_tcp_udp_race() {
+        let truncating =
+            spawn_truncating_upstream(Some(Duration::from_millis(200)), Some(PARTIAL)).await;
+        let engine = engine_with(
+            serde_json::json!({ "type": "forward", "upstream": truncating.addr, "transport": "tcp_udp" }),
+            serde_json::json!({}),
+            true,
+        );
+        let answer = ask(&engine).await;
+        assert!(!answer.metadata.truncation, "{answer:?}");
+        assert_eq!(addresses(&answer), [FULL]);
+    }
+
+    /// The response-jump path caches through the same place, so a truncated answer is not
+    /// cached there either: a request entering the jump target directly asks the upstream.
+    /// 响应跳转路径也经同一个地方写缓存，所以截断的应答在那里同样不缓存：直接进入跳转目标的请求照样去问上游。
+    #[tokio::test]
+    async fn a_truncated_answer_on_the_response_jump_path_is_not_cached() {
+        let truncating = spawn_truncating_upstream(None, Some(PARTIAL)).await;
+        let forward = |id: &str, then: serde_json::Value| {
+            let mut rule = serde_json::json!({
+                "name": id,
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": truncating.addr }]
+            });
+            for (key, value) in then.as_object().unwrap() {
+                rule[key] = value.clone();
+            }
+            serde_json::json!({ "id": id, "rules": [rule] })
+        };
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 2000,
+                "enable_tcp_fallback": false
+            },
+            "pipeline_select": [
+                { "pipeline": "main", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "second", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ],
+            "pipelines": [
+                forward("main", serde_json::json!({
+                    "response_matchers": [{ "type": "upstream_equals", "value": truncating.addr }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "second" }]
+                })),
+                forward("second", serde_json::json!({}))
+            ]
+        });
+        let config = crate::config::parse_config(&raw.to_string()).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+        let ask_from = |client: &'static str| {
+            let engine = &engine;
+            async move {
+                let mut request = Message::new(0x4b1d, MessageType::Query, OpCode::Query);
+                request.add_query(Query::query(
+                    Name::from_str("large.example.").unwrap(),
+                    RecordType::A,
+                ));
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    engine.handle_packet(&request.to_vec().unwrap(), client.parse().unwrap()),
+                )
+                .await
+                .expect("must not hang")
+                .expect("engine answers")
+            }
+        };
+        ask_from("10.0.0.1:53000").await;
+        let asked = truncating.udp_queries.load(Ordering::SeqCst);
+        assert_eq!(asked, 2, "main's forward and the one on the jump path");
+        ask_from("10.0.0.2:53000").await;
+        assert_eq!(
+            truncating.udp_queries.load(Ordering::SeqCst),
+            asked + 1,
+            "a request entering the jump target must ask the upstream, not get a cached truncated answer"
+        );
+    }
+
+    /// With TCP fallback turned off the client gets the truncated answer, which is not
+    /// cached: the next query asks the upstream again.
+    /// 关掉 TCP 回退时客户端拿到截断的应答，它不写缓存：下一次查询照样去问上游。
+    #[tokio::test]
+    async fn a_truncated_answer_is_never_cached() {
+        let truncating = spawn_truncating_upstream(None, Some(PARTIAL)).await;
+        let engine = engine_with(
+            serde_json::json!({ "type": "forward", "upstream": truncating.addr }),
+            serde_json::json!({}),
+            false,
+        );
         let first = ask(&engine).await;
         assert!(first.metadata.truncation, "{first:?}");
         assert_eq!(addresses(&first), [PARTIAL]);
-        let asked = truncating.udp_queries.load(Ordering::SeqCst);
-        assert_eq!(asked, 2, "the first query and its retry");
         ask(&engine).await;
         assert_eq!(
             truncating.udp_queries.load(Ordering::SeqCst),
-            asked * 2,
+            2,
             "the second query must ask the upstream again, not use a cached truncated answer"
         );
     }
