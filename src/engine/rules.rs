@@ -767,6 +767,10 @@ pub(crate) async fn process_response_jump(
                         .as_ref()
                         .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
                     skip_rules.clear();
+                    // 留着复用的应答属于上一个 pipeline，见 handle_packet_internal 里请求阶段的跳转
+                    // An answer kept for reuse belongs to the previous pipeline; see the
+                    // request-phase jump in handle_packet_internal
+                    reused_response = None;
                     decision = engine.apply_rules(
                         state,
                         next_pipeline,
@@ -1234,6 +1238,9 @@ pub(crate) async fn process_response_jump(
                                 // continue 越过的规则属于要离开的 pipeline；与规则阶段的
                                 // 跳转一样，目标从第一条规则开始。
                                 skip_rules.clear();
+                                // 同上：留着复用的应答不带进下一个 pipeline
+                                // As above: an answer kept for reuse stays behind
+                                reused_response = None;
                                 continue;
                             }
                             ResponseActionResult::Continue { ctx } => {
