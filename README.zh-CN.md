@@ -27,7 +27,7 @@ KixDNS 是使用 Rust 编写的异步、非递归 DNS 转发服务器。它接�
 - **监听器标签** — 同一服务实例可以选择不同 Pipeline。
 - **多种上游传输** — UDP、TCP、TCP+UDP、DoH（RFC 8484）、DoT 和 DoQ（RFC 9250）。
 - **URL 协议前缀** — 使用 `udp://`、`tcp://`、`doh://`、`dot://` 和 `doq://` 选择传输方式。
-- **EDNS Client Subnet（RFC 7871）** — Pipeline 级缓存隔离与 Forward action 级请求改写。
+- **EDNS Client Subnet（RFC 7871）** — Forward action 级请求改写；响应缓存按 ECS 作用范围覆盖的网段保存每份应答。
 
 ### 💾 缓存与可靠性
 
@@ -60,7 +60,7 @@ KixDNS 是使用 Rust 编写的异步、非递归 DNS 转发服务器。它接�
 - 支持监听器标签、客户端地址、域名、查询类型/类别、EDNS、GeoIP 和 GeoSite 的请求匹配器。
 - 支持响应匹配器，以及上游回退、响应过滤、响应替换和响应阶段 Pipeline 跳转。
 - 内存 DNS 缓存：容量、最大生存时间、最小 TTL、并发未命中去重、后台刷新和可选的 RFC 8767 过期缓存。
-- ECS 请求改写（RFC 7871），以及可选的 Pipeline 级 ECS 缓存隔离。
+- ECS 请求改写（RFC 7871）；缓存的应答按上游返回的作用范围区分（RFC 7871 第 7.3 节）。
 - MaxMind MMDB GeoIP 查询，以及 V2Ray GeoIP/GeoSite 数据加载。
 - 主 JSON 配置、GeoSite 文件和配置的 GeoIP .dat/JSON 文件的文件监控。
 - GeoIP .dat 转 MMDB 的命令行工具。
@@ -266,7 +266,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | flow_control_max_permits | 800 | 启用流控时的最大 permits。 |
 | flow_control_latency_threshold_ms | 100 | 自适应流控使用的延迟阈值。 |
 | flow_control_adjustment_interval_secs | 5 | permits 调整间隔。 |
-| cache_capacity | 10000 | DNS 响应缓存最大条目数；必须大于 0。 |
+| cache_capacity | 10000 | DNS 响应缓存最多存放的应答数；必须大于 0。 |
 | cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。 |
 | dashmap_shards | 0 | 内部分片设置；0 使用 DashMap 默认值，否则必须是 2 的幂。 |
 | cache_background_refresh | false | 在 TTL 过期前刷新条目。 |
@@ -289,7 +289,7 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 
 ### Pipeline 和规则
 
-每个 Pipeline 包含 id、可选的 rules 数组和可选的 Pipeline 级 ecs。规则按配置顺序处理。空匹配器列表视为匹配。规则内的匹配器按从左到右形成链；每个匹配器可以携带自己的 operator，或者在所有匹配器都省略 operator 时由规则级 matcher_operator 设置。
+每个 Pipeline 包含 id、可选的 rules 数组和可选的 Pipeline 级 ecs。Pipeline 级 ecs 是旧配置用来区分缓存的，现在不再影响缓存（改动它时，热加载后该 Pipeline 的缓存仍会重新开始）。规则按配置顺序处理。空匹配器列表视为匹配。规则内的匹配器按从左到右形成链；每个匹配器可以携带自己的 operator，或者在所有匹配器都省略 operator 时由规则级 matcher_operator 设置。
 
 响应阶段使用同样的 response_matchers、response_matcher_operator、response_actions_on_match 和 response_actions_on_miss。Forward 得到响应后执行响应动作；配置了 miss 动作时，上游尝试全部失败后也会进入 miss 路径。
 
@@ -400,10 +400,20 @@ ECS 配置在 Forward 动作中：
 支持的模式：
 
 - clear：移除请求中的 ECS 选项；
-- from_client_ip：根据客户端地址生成子网，IPv4 默认 /24、IPv6 默认 /56；私有地址、回环地址和 ULA 地址不会注入；
+- from_client_ip：根据客户端地址生成子网，IPv4 默认 /24、IPv6 默认 /56；私有地址、回环地址和 ULA 地址不会注入，客户端自己带的 ECS 选项（如果有）原样发往上游；
 - static：使用配置的 IP 和前缀注入。
 
-Pipeline 级 ecs 会改变缓存键，使不同客户端子网的响应可以隔离；它不会替代 Forward 动作的 ECS 改写设置。当 action 使用 ECS 但 Pipeline 没有 ecs 时，运行引擎会发出警告；此时使用取自客户端的 ECS 转发的应答按该动作发送的子网分别缓存。
+不写 ecs 的转发把客户端自己带的 ECS 选项原样发往上游。
+
+缓存的应答遵循 RFC 7871 第 7.3 节。每份应答只给它适用的请求方，依据是转发实际发出的 ECS，以及上游应答里的 SCOPE PREFIX-LENGTH（作用范围）：
+
+- 作用范围为 0，或者带 ECS 的查询得到不带 ECS 选项的应答（按作用范围 0 处理），适用于每个转发时发送 ECS 子网的请求；不发送 ECS 的请求问上游的是另一种查询，单独保存自己的应答；
+- 作用范围不超过发出的前缀时，适用于子网落在该网段内的请求；作用范围更长时，只适用于前缀相同的同一子网；
+- 不带 ECS 发出的查询，应答只给同样不带 ECS 的请求；前缀为 0 发出的，只给同样前缀为 0 的请求；
+- 不带 ECS 的报错应答（NOERROR、NXDOMAIN 以外的 RCODE）、回显了别的子网的应答，以及转发失败，都只对同一个子网有效；
+- 客户端的 ECS 选项不完全符合 RFC 7871 第 6 节时，应答不缓存。
+
+查找时在适用的应答中取前缀最长的一份。同一个问题最多保存 64 个网段的应答；满了时先淘汰只适用于单个子网的应答，同一类请求方共用的应答最后淘汰。并发未命中去重只合并发送相同子网的请求。没带 ECS 的客户端拿到的应答不带 ECS 选项，不论是否来自缓存；带了 ECS 的客户端拿回自己的子网，作用范围不短于 KixDNS 保存这份应答所用的范围。Pipeline 级 ecs 仍可写在配置里，但不再影响缓存。
 
 ## 配置示例
 
@@ -534,7 +544,7 @@ Pipeline 级 ecs 会改变缓存键，使不同客户端子网的响应可以隔
 
 DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提高到该下限，并受 cache_max_ttl 和 cache_capacity 限制。否定响应在存在 SOA 时使用 SOA 负缓存 TTL。相同的进行中缓存未命中会共享一次上游操作。
 
-Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命中去重和规则缓存会按规则对请求方的判定把它们分开，而不是按地址：客户端地址是否在各个 client_ip 网段内，是否为私有地址（geoip_private），GeoIP 国家或标签是否匹配（geoip_country），查询是否带 EDNS（edns_present、response_edns_present），以及转发从客户端取 ECS、且比 Pipeline 自身 ecs 设置更细时发送的是哪个子网。判定相同的请求方共用条目。Pipeline 的回答检查开始的响应跳转路径上的规则也算在内，因为请求在应答之前会运行它们。这条路径转发的是跳转前那次转发准备的包，连同 ECS，所以它的条目和直接进入该 Pipeline 的请求分开。规则缓存保存的是 Pipeline 自身规则的决策，因此只按该 Pipeline 的请求匹配器判定；开启 cache_background_refresh 时还按客户端地址区分，与以前相同。规则不判定任何请求方信息的 Pipeline 照旧在所有客户端之间共享。客户端自己带来的 ECS 选项原样发往上游，不进入任何键。后台刷新从同一个客户端地址重放请求，原请求带 EDNS 时也带 EDNS，因此 Pipeline 选择和请求规则读到的地址和 EDNS 与那次请求相同。
+Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命中去重和规则缓存会按规则对请求方的判定把它们分开，而不是按地址：客户端地址是否在各个 client_ip 网段内，是否为私有地址（geoip_private），GeoIP 国家或标签是否匹配（geoip_country），查询是否带 EDNS（edns_present、response_edns_present）。转发取自客户端的子网用来分开并发未命中的请求，缓存的应答则按 ECS 作用范围区分（见 ECS）。判定相同的请求方共用条目。Pipeline 的回答检查开始的响应跳转路径上的规则也算在内，因为请求在应答之前会运行它们。这条路径转发的是跳转前那次转发准备的包，连同 ECS，所以它的并发未命中条目和直接进入该 Pipeline 的请求分开；这条路径上得到的应答不写缓存，因为没有哪次查找用它的键。规则缓存保存的是 Pipeline 自身规则的决策，因此只按该 Pipeline 的请求匹配器判定；开启 cache_background_refresh 时还按客户端地址区分，与以前相同。规则不判定任何请求方信息的 Pipeline 照旧在所有客户端之间共享。后台刷新从同一个客户端地址重放请求，原请求带 EDNS、带客户端自己的 ECS 选项时也一样带上（不符合 RFC 7871 第 6 节的 ECS 选项不带），因此 Pipeline 选择、请求规则和发往上游的 ECS 都与那次请求相同。刷新得到的应答适用的请求方与被刷新的条目不同时（例如上游的作用范围变窄了），那个条目会被删掉，它的请求方各自重新查询。
 
 启用 cache_background_refresh 后，接近过期的条目可以触发异步刷新。刷新和客户端请求一样执行规则，包括响应规则及其动作。上游给出应答时，规则接受的应答替换这个条目；规则的结果不缓存在这个条目下时（不缓存的静态应答，或经跳转得到的应答），条目会被删除，由下一个客户端请求自己执行规则。上游失败或规则没找到应答时，除非规则得出的结果缓存在这个条目下，否则条目保留。启用 serve_stale 后，可以返回过期条目，并使用 serve_stale_ttl 作为响应 TTL，同时受 serve_stale_expire_ttl 和 serve_stale_client_timeout_ms 限制。该客户端等待还会被本次请求 request_timeout_ms 的剩余预算截断，配得比请求预算还长也不会把过期应答拖过截止时刻。
 

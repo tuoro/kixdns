@@ -259,19 +259,22 @@ pub struct RuntimePipeline {
     /// 本 pipeline 自己的请求匹配器区分请求方的依据。规则决策只取决于它，所以规则
     /// 缓存按它区分。
     pub rule_requester: RequesterScope,
-    /// Pipeline 级 ECS 配置（缓存隔离维度）/ Pipeline-level ECS config (cache isolation dimension)
+    /// Pipeline 级 ECS 配置。缓存现在按上游返回的作用范围区分应答（见 `CacheEntry::reach`），
+    /// 不再用它；保留只为照常读入旧配置。
+    /// Pipeline-level ECS config. The cache now tells answers apart by the scope the
+    /// upstream returns (see `CacheEntry::reach`) and no longer uses it; it is kept
+    /// so older configurations still load.
     pub ecs: Option<crate::config::EcsMode>,
     /// Pipeline 内是否有 action 使用了 ECS 配置 / Whether any action in this pipeline uses ECS config
     pub uses_ecs: bool,
     /// 这个 pipeline 的应答会不会因「谁在问」而不同：请求阶段有按客户端 IP、它的 GeoIP 国家或
-    /// 私有地址、请求带不带 EDNS 判断的规则，或者有转发按客户端地址带 ECS 子网，而 pipeline 级的
-    /// `ecs` 并不按客户端子网区分缓存。是的话，它给一个请求的应答，不一定是同一个问题换一个请求方
-    /// 时的应答。
+    /// 私有地址、请求带不带 EDNS 判断的规则。是的话，它给一个请求的应答，不一定是同一个问题换一个
+    /// 请求方时的应答。因 ECS 子网而不同的应答不算在内，缓存按子网区分它们（见 `CacheEntry::reach`）。
     /// Whether this pipeline's answer can differ by who is asking: a request rule matches
-    /// on the client IP, its GeoIP country or private range, or EDNS presence, or a forward
-    /// sends an ECS subnet taken from the client while the pipeline-level `ecs` does not key
-    /// the cache by the client's subnet. If so, the answer it gave one request is not
-    /// necessarily its answer to another request with the same question.
+    /// on the client IP, its GeoIP country or private range, or EDNS presence. If so, the
+    /// answer it gave one request is not necessarily its answer to another request with
+    /// the same question. Answers that differ by ECS subnet do not count: the cache tells
+    /// them apart by subnet (see `CacheEntry::reach`).
     pub depends_on_requester: bool,
     /// 请求阶段有没有按请求带不带 EDNS 判断的规则。后台刷新重放的请求不带 EDNS，
     /// 经过这样的 pipeline 的路线，刷新时不一定走得一样。
@@ -298,6 +301,19 @@ pub struct Requester {
     pub address: IpAddr,
     /// Whether the query carries EDNS / 查询是否带 EDNS
     pub edns: bool,
+    /// The ECS option the client carries itself / 客户端自己带的 ECS 选项
+    pub ecs: Option<crate::ecs::EcsKey>,
+}
+
+impl Requester {
+    /// What the response cache can tell about this requester as far as ECS goes
+    /// 响应缓存在 ECS 方面能分辨的这个请求方
+    pub fn ecs_view(&self) -> crate::ecs_scope::EcsView {
+        crate::ecs_scope::EcsView {
+            peer: self.address,
+            client: self.ecs,
+        }
+    }
 }
 
 /// One way a pipeline's rules can tell requesters apart.
@@ -345,12 +361,12 @@ impl RequesterTest {
                     prefix_v4: *prefix_v4,
                     prefix_v6: *prefix_v6,
                 };
-                match crate::ecs::EcsKey::from_pipeline_config(&mode, requester.address) {
-                    Some(subnet) => {
+                match crate::ecs::plan(Some(&mode), requester.address) {
+                    crate::ecs::EcsPlan::Set(subnet) => {
                         hasher.write_u8(1);
                         subnet.hash_into(hasher);
                     }
-                    None => hasher.write_u8(0),
+                    _ => hasher.write_u8(0),
                 }
             }
         }
@@ -395,15 +411,22 @@ impl RequesterScope {
         requester: Requester,
         geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
     ) -> RequesterKey {
-        if self.tests.is_empty() {
-            return RequesterKey::NONE;
-        }
-        let mut hasher = rustc_hash::FxHasher::default();
-        for test in &self.tests {
-            test.hash_outcome(requester, geoip_manager, &mut hasher);
-        }
+        let judge = |subnets: bool| {
+            let mut tests = self
+                .tests
+                .iter()
+                .filter(|test| matches!(test, RequesterTest::Subnet { .. }) == subnets)
+                .peekable();
+            tests.peek()?;
+            let mut hasher = rustc_hash::FxHasher::default();
+            for test in tests {
+                test.hash_outcome(requester, geoip_manager, &mut hasher);
+            }
+            Some(hasher.finish())
+        };
         RequesterKey {
-            class: Some(hasher.finish()),
+            class: judge(false),
+            subnets: judge(true),
             address: None,
         }
     }
@@ -416,8 +439,16 @@ impl RequesterScope {
 /// 这里为空，键保持原样。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RequesterKey {
-    /// How the scope's tests judge the requester / 范围内各项依据对请求方的判定
+    /// How the scope's tests other than the ECS subnets judge the requester
+    /// 范围内 ECS 子网以外的各项依据对请求方的判定
     pub class: Option<u64>,
+    /// The ECS subnets the forwards would send for the requester. Only the inflight
+    /// key carries them: a cached answer is tagged with the subnets it applies to
+    /// (see `CacheEntry::reach`), while requests can only wait on one another when
+    /// they send the same.
+    /// 转发会为这个请求方发送的 ECS 子网。只有 inflight 键带着它们：缓存的应答标着它适用的
+    /// 子网（见 `CacheEntry::reach`），而请求只有发送相同的子网才能互相等待。
+    pub subnets: Option<u64>,
     /// The client address itself, which only the rule cache adds, and only with
     /// background refresh on, as it did before scopes existed
     /// 客户端地址本身：只有规则缓存在开着后台刷新时加入，与引入范围之前一样
@@ -428,33 +459,48 @@ impl RequesterKey {
     /// No requester facts / 不含请求方信息
     pub const NONE: Self = Self {
         class: None,
+        subnets: None,
         address: None,
     };
 
     /// The key of a request on the response-jump path. That path forwards the
-    /// packet the forward before the jump sent, with `carried` as its ECS, while
-    /// a request that entered the pipeline otherwise sends a packet the
-    /// pipeline's own forwards prepare, so the two never share entries.
-    /// 响应跳转路径上的请求所用的键。跳转路径转发的是跳转前那次转发发出的包，`carried`
-    /// 是它的 ECS；以别的方式进入 pipeline 的请求发出的是本 pipeline 自己的转发准备的包，
-    /// 所以两者从不共用条目。
-    pub fn on_response_jump_path(self, carried: Option<&crate::ecs::EcsKey>) -> Self {
-        let mut hasher = rustc_hash::FxHasher::default();
-        hasher.write_u8(b'J');
-        self.class.hash(&mut hasher);
-        match carried {
-            Some(carried) => {
-                hasher.write_u8(1);
-                carried.hash_into(&mut hasher);
+    /// packet the forward before the jump sent, with the ECS `carried` describes,
+    /// while a request that entered the pipeline otherwise sends a packet the
+    /// pipeline's own forwards prepare, so the two never share entries. How the
+    /// carried ECS was derived goes into the class (a fixed one as the subnet
+    /// itself, which then is the same for everyone); the subnet a requester sends
+    /// that way goes into the inflight part, and into the steps of the answers
+    /// cached on that path.
+    /// 响应跳转路径上的请求所用的键。跳转路径转发的是跳转前那次转发发出的包，带着
+    /// `carried` 所述的 ECS；以别的方式进入 pipeline 的请求发出的是本 pipeline 自己的转发
+    /// 准备的包，所以两者从不共用条目。携带的 ECS 怎样取得进入类别（固定的 ECS 就以子网本身
+    /// 计入，它对所有人都一样）；请求方这样发出的子网进入 inflight 部分，也进入这条路径上
+    /// 缓存的应答的步骤。
+    pub fn on_response_jump_path(self, carried: &crate::ecs_scope::ForwardEcs) -> Self {
+        let mut class = rustc_hash::FxHasher::default();
+        class.write_u8(b'J');
+        self.class.hash(&mut class);
+        match carried.source {
+            crate::ecs_scope::EcsSource::Fixed => {
+                class.write_u8(0);
+                carried.sent.hash(&mut class);
             }
-            None => hasher.write_u8(0),
+            source => {
+                class.write_u8(1);
+                source.hash(&mut class);
+            }
         }
+        let mut subnets = rustc_hash::FxHasher::default();
+        self.subnets.hash(&mut subnets);
+        carried.sent.hash(&mut subnets);
         Self {
-            class: Some(hasher.finish()),
+            class: Some(class.finish()),
+            subnets: Some(subnets.finish()),
             ..self
         }
     }
 
+    /// The part of the response cache and rule cache keys / 响应缓存键和规则缓存键里的部分
     pub fn hash_into<H: Hasher>(&self, hasher: &mut H) {
         if let Some(class) = self.class {
             hasher.write_u8(1);
@@ -463,6 +509,29 @@ impl RequesterKey {
         if let Some(address) = self.address {
             hasher.write_u8(2);
             address.hash(hasher);
+        }
+    }
+
+    /// The part of the inflight key: the above, the subnets, and the client's own
+    /// ECS option, which a forward without `ecs` passes upstream
+    /// inflight 键里的部分：上面那些、子网，以及客户端自己带的 ECS 选项（不写 `ecs` 的
+    /// 转发会把它转给上游）
+    pub fn hash_inflight_into<H: Hasher>(
+        &self,
+        client_ecs: Option<&crate::ecs::EcsKey>,
+        hasher: &mut H,
+    ) {
+        // Kept apart from the slot key even when nothing below is written
+        // 即使下面什么都不写，也与槽位键分开
+        hasher.write_u8(b'I');
+        self.hash_into(hasher);
+        if let Some(subnets) = self.subnets {
+            hasher.write_u8(3);
+            subnets.hash(hasher);
+        }
+        if let Some(client_ecs) = client_ecs {
+            hasher.write_u8(4);
+            client_ecs.hash(hasher);
         }
     }
 }
@@ -474,12 +543,8 @@ struct RuleReads {
     request_matchers: RequesterScope,
     /// Request and response matchers / 请求匹配器和响应匹配器
     matchers: RequesterScope,
-    /// ECS from the client that its forwards send, which the pipeline's own
-    /// `ecs` does not already key as finely
-    /// 转发发送的取自客户端的 ECS，且 pipeline 自己的 `ecs` 没有按同样细的子网区分
-    unkeyed_subnets: RequesterScope,
-    /// Every ECS from the client that its forwards send, keyed or not
-    /// 转发发送的每种取自客户端的 ECS，不论是否已区分
+    /// The ECS subnets taken from the client that its forwards send
+    /// 转发发送的取自客户端的 ECS 子网
     forward_subnets: RequesterScope,
     /// Pipelines its answer checks jump to / 回答检查跳到的 pipeline
     response_jumps: Vec<Arc<str>>,
@@ -492,11 +557,10 @@ struct RuleReads {
 }
 
 impl RuleReads {
-    fn of(rules: &[RuntimeRule], keyed_ecs: Option<&config::EcsMode>) -> Self {
+    fn of(rules: &[RuntimeRule]) -> Self {
         let mut reads = Self {
             request_matchers: RequesterScope::default(),
             matchers: RequesterScope::default(),
-            unkeyed_subnets: RequesterScope::default(),
             forward_subnets: RequesterScope::default(),
             response_jumps: Vec::new(),
             request_jumps: Vec::new(),
@@ -535,19 +599,10 @@ impl RuleReads {
                     ..
                 } = action
                 {
-                    let test = RequesterTest::Subnet {
+                    reads.forward_subnets.add(RequesterTest::Subnet {
                         prefix_v4: *prefix_v4,
                         prefix_v6: *prefix_v6,
-                    };
-                    let keyed = matches!(
-                        keyed_ecs,
-                        Some(config::EcsMode::FromClientIp { prefix_v4: v4, prefix_v6: v6 })
-                            if v4 >= prefix_v4 && v6 >= prefix_v6
-                    );
-                    if !keyed {
-                        reads.unkeyed_subnets.add(test.clone());
-                    }
-                    reads.forward_subnets.add(test);
+                    });
                 }
             }
             reads.continues |= rule
@@ -615,7 +670,7 @@ fn requester_scopes(
     (0..reads.len())
         .map(|idx| {
             let mut scope = reads[idx].matchers.clone();
-            scope.extend(&reads[idx].unkeyed_subnets);
+            scope.extend(&reads[idx].forward_subnets);
             // After a forward, an answer check may jump, and the request runs the
             // rules along the jump path before its waiters take the answer.
             // Forwards there send the packet as it is (keys on that path carry
@@ -1035,60 +1090,22 @@ impl RuntimePipelineConfig {
                     .any(|a| matches!(a, crate::config::Action::Forward { ecs: Some(_), .. }))
             });
 
-            // Warn if Forward actions use ECS but Pipeline-level ecs is not set
-            // 当 Forward actions 使用 ECS 但 Pipeline 级 ecs 未设置时发出警告
-            if pipeline_uses_ecs && p.ecs.is_none() {
-                tracing::warn!(
-                    pipeline = %p.id,
-                    "Pipeline has Forward actions with 'ecs' but no pipeline-level 'ecs' config. \
-                     Answers of from_client_ip actions are cached per subnet they send. \
-                     Consider setting pipeline-level 'ecs' or splitting into separate pipelines. / \
-                     Pipeline 的 Forward action 有 'ecs' 但 pipeline 级未配置 'ecs'。\
-                     from_client_ip 动作的应答按它发送的子网分别缓存。建议设置 pipeline 级 'ecs' 或拆分为独立 pipeline。"
-                );
-            }
-
-            reads.push(RuleReads::of(&rules, p.ecs.as_ref()));
+            reads.push(RuleReads::of(&rules));
             let request_matchers = || rules.iter().flat_map(|rule| &rule.matchers);
-            // 转发按客户端地址带 ECS 子网，缓存键却不按同样细的客户端子网区分：pipeline 级 `ecs` 不是
-            // from_client_ip，或者它的前缀比转发的短（就是上面警告的那类配置）
-            // A forward sends an ECS subnet taken from the client while the cache key does not
-            // carry the client's subnet as finely: the pipeline-level `ecs` is not from_client_ip,
-            // or its prefix is shorter than the forward's (the kind of configuration warned about above)
-            let keyed_prefixes = match p.ecs {
-                Some(crate::config::EcsMode::FromClientIp {
-                    prefix_v4,
-                    prefix_v6,
-                }) => Some((prefix_v4, prefix_v6)),
-                _ => None,
-            };
-            let forwards_client_subnet =
-                rules
-                    .iter()
-                    .flat_map(|rule| &rule.actions)
-                    .any(|action| match action {
-                        crate::config::Action::Forward {
-                            ecs:
-                                Some(crate::config::EcsMode::FromClientIp {
-                                    prefix_v4,
-                                    prefix_v6,
-                                }),
-                            ..
-                        } => keyed_prefixes.is_none_or(|(key_v4, key_v6)| {
-                            key_v4 < *prefix_v4 || key_v6 < *prefix_v6
-                        }),
-                        _ => false,
-                    });
-            let depends_on_requester = forwards_client_subnet
-                || request_matchers().any(|m| {
-                    matches!(
-                        m.matcher,
-                        RuntimeMatcher::ClientIp { .. }
-                            | RuntimeMatcher::GeoipCountry { .. }
-                            | RuntimeMatcher::GeoipPrivate { .. }
-                            | RuntimeMatcher::EdnsPresent { .. }
-                    )
-                });
+            // A forward that sends an ECS subnet taken from the client does not count:
+            // every cached answer is tagged with the subnets it applies to (see
+            // `CacheEntry::reach`), and a lookup takes only answers for the requester's.
+            // 按客户端地址发送 ECS 子网的转发不算：缓存的每份应答都标着它适用的子网（见
+            // `CacheEntry::reach`），查找只取适用于请求方子网的应答。
+            let depends_on_requester = request_matchers().any(|m| {
+                matches!(
+                    m.matcher,
+                    RuntimeMatcher::ClientIp { .. }
+                        | RuntimeMatcher::GeoipCountry { .. }
+                        | RuntimeMatcher::GeoipPrivate { .. }
+                        | RuntimeMatcher::EdnsPresent { .. }
+                )
+            });
             let matches_edns =
                 request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::EdnsPresent { .. }));
             pipelines.push(RuntimePipeline {

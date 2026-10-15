@@ -11,14 +11,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-use crate::cache::CacheEntry;
 use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
 use crate::engine::matcher_adapter::log_match;
 use crate::engine::pipeline::RuleEvaluationContext;
 use crate::engine::response::{
-    extract_ttl, extract_ttl_for_refresh, make_static_cname_answer, make_static_ip_answer,
-    make_static_txt_answer,
+    make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
 };
 use crate::engine::types::EngineInner;
 use crate::engine::types::InflightMap;
@@ -293,6 +291,15 @@ pub struct ApplyResponseActionsContext<'a> {
     pub pipeline_id: &'a str,
     pub rule_name: &'a str,
     pub remaining_jumps: usize,
+    /// Where a forward among the actions records its reply, or its failure, and the
+    /// ECS it sends: the rule's own, as it forwards the same packet (see
+    /// `ForwardDecisionContext::trail`). None where nothing is cached.
+    /// 动作里的转发在哪里记下它的应答或失败，以及它发出的 ECS：与规则自己的转发相同，因为
+    /// 它转发的是同一个包（见 `ForwardDecisionContext::trail`）。不缓存的地方为 None。
+    pub trail: Option<(
+        &'a mut crate::ecs_scope::EcsReach,
+        crate::ecs_scope::ForwardEcs,
+    )>,
 }
 
 /// Test-only shorthand for [`apply_response_actions_observed`] without an observer context.
@@ -508,8 +515,16 @@ async fn run_response_actions(
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(result) => {
+                        if let Some((trail, ecs)) = ctx.trail.as_mut() {
+                            trail.record_reply(*ecs, &result.0);
+                        }
+                        result
+                    }
                     Err(err) => {
+                        if let Some((trail, ecs)) = ctx.trail.as_mut() {
+                            trail.record_failure(*ecs);
+                        }
                         warn!(
                             event = "response_action_failure",
                             upstream = %upstream_addr,
@@ -590,12 +605,21 @@ pub(crate) struct ResponseJumpContext<'a> {
     pub qtype: RecordType,
     pub qclass: DNSClass,
     pub edns_present: bool,
-    pub min_ttl: Duration,
+    /// The ECS option the client carries itself / 客户端自己带的 ECS 选项
+    pub client_ecs: Option<crate::ecs::EcsKey>,
     pub upstream_timeout: Duration,
     pub skip_cache: bool,
-    /// The ECS the packet carries, which the forward before the jump added, if any
-    /// 包里携带的 ECS，即跳转前那次转发加上的（如有）
-    pub carried_ecs: Option<crate::ecs::EcsKey>,
+    /// The ECS the packet carries: how the forward before the jump derived it, and
+    /// what it sent
+    /// 包里携带的 ECS：跳转前那次转发怎样取得它，以及发出了什么
+    pub carried: crate::ecs_scope::ForwardEcs,
+    /// Where the forwards on the path record their replies, for the echo the client
+    /// gets (nothing on this path is cached), and the floor from before the jump
+    /// (see `phases::client_reply`)
+    /// 这条路径上的转发在哪里记下应答，供客户端拿到的回显使用（这条路径不缓存），以及跳转之前
+    /// 的下限（见 `phases::client_reply`）
+    pub trail: &'a mut crate::ecs_scope::EcsReach,
+    pub echo_floor: u8,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
     /// In-flight entries the request already holds as it jumps: the one its
@@ -624,13 +648,20 @@ pub(crate) async fn process_response_jump(
         qtype,
         qclass,
         edns_present,
-        min_ttl,
+        client_ecs,
         upstream_timeout,
         skip_cache,
-        carried_ecs,
+        carried,
+        trail,
+        echo_floor,
         observed,
         held_inflight,
     } = context;
+    let requester = Requester {
+        address: peer.ip(),
+        edns: edns_present,
+        ecs: client_ecs,
+    };
     let cfg = &state.pipeline;
     struct InflightCleanupGuard {
         inflight: Arc<InflightMap>,
@@ -710,7 +741,16 @@ pub(crate) async fn process_response_jump(
                 g.defuse();
             }
             for h in &inflight_hashes {
-                engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                engine
+                    .notify_inflight_waiters(*h, || {
+                        crate::engine::phases::for_waiters(
+                            &resp_bytes,
+                            &requester,
+                            trail,
+                            echo_floor,
+                        )
+                    })
+                    .await;
             }
             return Ok(resp_bytes);
         };
@@ -718,11 +758,6 @@ pub(crate) async fn process_response_jump(
             observer.pipeline_selected(ctx, &pipeline.id);
         }
         entering = true;
-
-        let mut ecs_key = pipeline
-            .ecs
-            .as_ref()
-            .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
 
         let mut decision = engine.apply_rules(
             state,
@@ -762,10 +797,6 @@ pub(crate) async fn process_response_jump(
                     if let Some((observer, ctx)) = observed {
                         observer.pipeline_selected(ctx, &next_pipeline.id);
                     }
-                    ecs_key = next_pipeline
-                        .ecs
-                        .as_ref()
-                        .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()));
                     skip_rules.clear();
                     // 留着复用的应答属于上一个 pipeline，见 handle_packet_internal 里请求阶段的跳转
                     // An answer kept for reuse belongs to the previous pipeline; see the
@@ -792,7 +823,16 @@ pub(crate) async fn process_response_jump(
                         g.defuse();
                     }
                     for h in &inflight_hashes {
-                        engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                        engine
+                            .notify_inflight_waiters(*h, || {
+                                crate::engine::phases::for_waiters(
+                                    &resp_bytes,
+                                    &requester,
+                                    trail,
+                                    echo_floor,
+                                )
+                            })
+                            .await;
                     }
                     return Ok(resp_bytes);
                 }
@@ -801,45 +841,49 @@ pub(crate) async fn process_response_jump(
         }
 
         remaining_jumps = local_jumps;
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+        // Answers on this path are not cached: no lookup uses a key of the
+        // response-jump path, so they would only take up room. Only the inflight key
+        // is needed.
+        // 这条路径上的应答不写缓存：没有哪次查找用响应跳转路径的键，写进去只会占地方。这里只需要
+        // inflight 键。
+        let dedupe_hash = Engine::cache_keys(
             state.cache_namespace(&pipeline_id),
             &pipeline_id,
             qname.as_bytes(),
             qtype,
             qclass,
-            ecs_key.as_ref(),
             &cfg.requester_key(
                 &pipeline_id,
                 Requester {
                     address: peer.ip(),
                     edns: edns_present,
+                    ecs: client_ecs,
                 },
                 Some(&engine.geoip_manager),
             )
-            .on_response_jump_path(carried_ecs.as_ref()),
-        );
+            .on_response_jump_path(&carried),
+            client_ecs.as_ref(),
+        )
+        .inflight;
 
         match decision {
             Decision::Static { rcode, answers } => {
                 response.upstream = Some(Arc::from("static"));
                 let resp_bytes = build_response(req, rcode, answers)?;
-                let entry = CacheEntry {
-                    bytes: resp_bytes.clone(),
-                    rcode,
-                    upstream: None, // Static responses have no upstream
-                    qname: Arc::from(qname),
-                    pipeline_id: pipeline_id.clone(),
-                    qtype: u16::from(qtype),
-                    inserted_at: Instant::now(),
-                    original_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
-                    refresh_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
-                };
-                engine.insert_dns_cache_entry(dedupe_hash, entry);
                 for g in &mut cleanup_guards {
                     g.defuse();
                 }
                 for h in &inflight_hashes {
-                    engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                    engine
+                        .notify_inflight_waiters(*h, || {
+                            crate::engine::phases::for_waiters(
+                                &resp_bytes,
+                                &requester,
+                                trail,
+                                echo_floor,
+                            )
+                        })
+                        .await;
                 }
                 return Ok(resp_bytes);
             }
@@ -858,8 +902,11 @@ pub(crate) async fn process_response_jump(
                 allow_reuse,
             } => {
                 response.upstream = Some(upstream.clone());
+                // A reused answer is in the trail already / 复用的应答已经记在 trail 里
+                let mut reused = false;
                 let resp = if allow_reuse {
                     if let Some(ctx) = reused_response.take() {
+                        reused = true;
                         Ok((ctx.raw, ctx.upstream.to_string()))
                     } else {
                         // FIX: Background refresh must skip inflight check
@@ -924,7 +971,13 @@ pub(crate) async fn process_response_jump(
                                                 g.defuse();
                                             }
                                             for h in &inflight_hashes {
-                                                engine.notify_inflight_waiters(*h, bytes).await;
+                                                engine
+                                                    .notify_inflight_waiters(*h, || {
+                                                        crate::engine::phases::for_waiters(
+                                                            bytes, &requester, trail, echo_floor,
+                                                        )
+                                                    })
+                                                    .await;
                                             }
                                             response.upstream = Some(Arc::from("inflight"));
                                             return Ok(resp_bytes);
@@ -1006,7 +1059,13 @@ pub(crate) async fn process_response_jump(
                                             g.defuse();
                                         }
                                         for h in &inflight_hashes {
-                                            engine.notify_inflight_waiters(*h, bytes).await;
+                                            engine
+                                                .notify_inflight_waiters(*h, || {
+                                                    crate::engine::phases::for_waiters(
+                                                        bytes, &requester, trail, echo_floor,
+                                                    )
+                                                })
+                                                .await;
                                         }
                                         response.upstream = Some(Arc::from("inflight"));
                                         return Ok(resp_bytes);
@@ -1034,19 +1093,17 @@ pub(crate) async fn process_response_jump(
                 let resp = resp.and_then(|reply| {
                     reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply)
                 });
+                // Forwards here send the carried packet / 这里的转发发出的是带过来的包
+                match &resp {
+                    Ok(_) if reused => {}
+                    Ok((raw, _)) => trail.record_reply(carried, raw),
+                    Err(_) => trail.record_failure(carried),
+                }
 
                 match resp {
                     Ok((raw, actual_upstream)) => {
                         response.upstream = Some(Arc::from(actual_upstream.as_str()));
                         let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                        // Extract TTL for cache entry (use min for RFC 1035 compliance)
-                        // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
-                        let ttl_secs_cache = extract_ttl(&msg);
-                        // Extract TTL for refresh timing (use max to avoid premature refresh)
-                        // 提取 TTL 用于刷新时机 (使用最大值避免过早刷新)
-                        let ttl_secs_refresh = extract_ttl_for_refresh(&msg);
-                        let effective_ttl =
-                            Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
 
                         // Get manager references for GeoIP/GeoSite matching in response matchers
                         // Try to acquire read locks non-blockingly (fast path for concurrent reads)
@@ -1119,29 +1176,17 @@ pub(crate) async fn process_response_jump(
                         };
 
                         if actions_to_run.is_empty() {
-                            if resp_match_ok && effective_ttl > Duration::from_secs(0) {
-                                let entry = CacheEntry {
-                                    bytes: raw.clone(),
-                                    rcode: msg.metadata.response_code,
-                                    upstream: Some(Arc::from(actual_upstream.as_str())),
-                                    qname: Arc::from(qname),
-                                    pipeline_id: pipeline_id.clone(),
-                                    qtype: u16::from(qtype),
-                                    inserted_at: Instant::now(),
-                                    original_ttl: crate::proto_utils::saturating_u64_to_u32(
-                                        ttl_secs_cache,
-                                    ), // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
-                                    refresh_ttl: crate::proto_utils::saturating_u64_to_u32(
-                                        ttl_secs_refresh,
-                                    ), // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
-                                };
-                                engine.insert_dns_cache_entry(dedupe_hash, entry);
-                            }
                             for g in &mut cleanup_guards {
                                 g.defuse();
                             }
                             for h in &inflight_hashes {
-                                engine.notify_inflight_waiters(*h, &raw).await;
+                                engine
+                                    .notify_inflight_waiters(*h, || {
+                                        crate::engine::phases::for_waiters(
+                                            &raw, &requester, trail, echo_floor,
+                                        )
+                                    })
+                                    .await;
                             }
                             return Ok(raw);
                         }
@@ -1168,45 +1213,28 @@ pub(crate) async fn process_response_jump(
                             pipeline_id: &pipeline_id,
                             rule_name: &rule_name,
                             remaining_jumps,
+                            // For the echo only: nothing on this path is cached
+                            // 只为回显：这条路径上不缓存
+                            trail: Some((&mut *trail, carried)),
                         };
                         let action_result =
                             apply_response_actions_observed(apply_ctx, observed).await?;
 
                         match action_result {
-                            ResponseActionResult::Upstream { ctx, resp_match } => {
+                            ResponseActionResult::Upstream { ctx, resp_match: _ } => {
                                 // The reply to a response action's forward / 响应动作转发拿到的应答
                                 reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
-                                // Extract TTL for cache entry (use min for RFC 1035 compliance)
-                                // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
-                                let ttl_secs_cache = extract_ttl(&ctx.msg);
-                                // Extract TTL for refresh timing (use max to avoid premature refresh)
-                                // 提取 TTL 用于刷新时机 (使用最大值避免过早刷新)
-                                let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
-                                let effective_ttl =
-                                    Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
-                                if resp_match && effective_ttl > Duration::from_secs(0) {
-                                    let entry = CacheEntry {
-                                        bytes: ctx.raw.clone(),
-                                        rcode: ctx.msg.metadata.response_code,
-                                        upstream: Some(ctx.upstream.clone()),
-                                        qname: Arc::from(qname),
-                                        pipeline_id: pipeline_id.clone(),
-                                        qtype: u16::from(qtype),
-                                        inserted_at: Instant::now(),
-                                        original_ttl: crate::proto_utils::saturating_u64_to_u32(
-                                            ttl_secs_cache,
-                                        ), // Use min TTL for cache expiration / 使用最小 TTL 作为缓存过期
-                                        refresh_ttl: crate::proto_utils::saturating_u64_to_u32(
-                                            ttl_secs_refresh,
-                                        ), // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
-                                    };
-                                    engine.insert_dns_cache_entry(dedupe_hash, entry);
-                                }
                                 for g in &mut cleanup_guards {
                                     g.defuse();
                                 }
                                 for h in &inflight_hashes {
-                                    engine.notify_inflight_waiters(*h, &ctx.raw).await;
+                                    engine
+                                        .notify_inflight_waiters(*h, || {
+                                            crate::engine::phases::for_waiters(
+                                                &ctx.raw, &requester, trail, echo_floor,
+                                            )
+                                        })
+                                        .await;
                                 }
                                 response.upstream = Some(ctx.upstream);
                                 return Ok(ctx.raw);
@@ -1221,7 +1249,13 @@ pub(crate) async fn process_response_jump(
                                     g.defuse();
                                 }
                                 for h in &inflight_hashes {
-                                    engine.notify_inflight_waiters(*h, &bytes).await;
+                                    engine
+                                        .notify_inflight_waiters(*h, || {
+                                            crate::engine::phases::for_waiters(
+                                                &bytes, &requester, trail, echo_floor,
+                                            )
+                                        })
+                                        .await;
                                 }
                                 response.upstream = Some(Arc::from("static"));
                                 return Ok(bytes);
@@ -1274,7 +1308,16 @@ pub(crate) async fn process_response_jump(
                             g.defuse();
                         }
                         for h in &inflight_hashes {
-                            engine.notify_inflight_waiters(*h, &resp_bytes).await;
+                            engine
+                                .notify_inflight_waiters(*h, || {
+                                    crate::engine::phases::for_waiters(
+                                        &resp_bytes,
+                                        &requester,
+                                        trail,
+                                        echo_floor,
+                                    )
+                                })
+                                .await;
                         }
                         return Ok(resp_bytes);
                     }

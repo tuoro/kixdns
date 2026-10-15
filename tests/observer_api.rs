@@ -1971,7 +1971,6 @@ async fn failed_and_cancelled_requests_lend_no_response() {
         0x1234,
         false,
         Arc::from("main"),
-        None,
     );
     let error = engine
         .handle_packet_internal_with_pre_parsed(&packet, peer(), false, pre_parsed)

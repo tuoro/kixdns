@@ -1,5 +1,7 @@
 pub mod concurrency;
 pub mod core;
+#[cfg(test)]
+mod ecs_scope_tests;
 pub mod execution;
 pub mod matcher_adapter;
 pub(crate) mod observation;

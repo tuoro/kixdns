@@ -44,9 +44,6 @@ pub enum FastPathResponse {
         edns_present: bool,
         /// Pre-selected pipeline ID to avoid re-selecting / 预选择的 pipeline ID，避免重新选择
         pipeline_id: Arc<str>,
-        /// Pre-computed ECS cache key from fast path, avoids recomputation in handle_packet_internal
-        /// 快速路径预计算的 ECS 缓存键，避免在 handle_packet_internal 中重新计算
-        ecs_key: Option<crate::ecs::EcsKey>,
     },
 }
 

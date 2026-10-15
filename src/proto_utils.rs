@@ -11,6 +11,8 @@ pub struct QuickQuery<'a> {
     pub qtype: u16,
     pub qclass: u16,
     pub edns_present: bool,
+    /// 客户端自己带的 ECS 选项 / The ECS option the client carries itself
+    pub client_subnet: Option<crate::ecs::EcsKey>,
 }
 
 /// Check the fixed DNS header fields required by KixDNS's standard query path.
@@ -174,6 +176,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // 权衡：总是遍历完整 Additional 段并拒绝尾随数据（旧代码找到 OPT 即提前退出、容忍截断）。
     // 完整校验是为了让畸形包无法到达 cache/static 路径；成本以 ARCOUNT 记录数为界。
     let mut edns_present = false;
+    let mut client_subnet = None;
     let mut ar_pos = pos;
     for _ in 0..ar_count {
         let owner_start = ar_pos;
@@ -197,6 +200,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             }
             validate_edns_options(packet, fixed_end, rdata_end)?;
             edns_present = true;
+            client_subnet = query_subnet(packet, fixed_end..rdata_end);
         }
         ar_pos = rdata_end;
     }
@@ -220,6 +224,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         qtype,
         qclass,
         edns_present,
+        client_subnet,
     })
 }
 
@@ -308,6 +313,410 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
+/// 报文里 OPT 记录的位置 / Where a message's OPT record sits
+struct OptRecord {
+    /// 扩展 RCODE（TTL 字段的第一个字节）的偏移 / Offset of the extended RCODE (the TTL field's first byte)
+    extended_rcode_at: usize,
+    /// RDLENGTH 字段的偏移 / Offset of the RDLENGTH field
+    rdlen_at: usize,
+    /// RDATA（选项）的范围 / Range of the RDATA (the options)
+    rdata: std::ops::Range<usize>,
+    /// 是不是报文的最后一条记录。改动 OPT 的长度会挪动它后面的所有字节，后面记录里的压缩
+    /// 指针可能因此指错地方，所以只改最后一条 OPT。
+    /// Whether it is the message's last record. Changing the OPT's length moves
+    /// every byte after it, and compression pointers in later records may then
+    /// point to the wrong place, so only a last OPT is changed.
+    last: bool,
+}
+
+/// 走到报文 Additional 段里的 OPT 记录。报文结构不对、OPT 不止一条或出现在 Additional
+/// 以外时为 Err（RFC 6891 第 6.1.1 节：这样的报文是 FORMERR）。
+/// Walk a message to the OPT record in its Additional section. Err when the
+/// message is malformed, or has more than one OPT record or one outside
+/// Additional (RFC 6891 section 6.1.1: such a message is FORMERR).
+fn find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
+    if packet.len() < 12 {
+        return Err(());
+    }
+    let count = |at: usize| u16::from_be_bytes([packet[at], packet[at + 1]]) as usize;
+    let (qd_count, before_additional) = (count(4), count(6) + count(8));
+    let ar_count = count(10);
+    let mut pos = 12usize;
+    for _ in 0..qd_count {
+        pos = skip_name(packet, pos).ok_or(())?;
+        pos = pos.checked_add(4).ok_or(())?;
+    }
+    let mut found = None;
+    for index in 0..before_additional + ar_count {
+        pos = skip_name(packet, pos).ok_or(())?;
+        let fixed_end = pos.checked_add(10).ok_or(())?;
+        if fixed_end > packet.len() {
+            return Err(());
+        }
+        let rr_type = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+        let rdata_end = fixed_end.checked_add(rd_len).ok_or(())?;
+        if rdata_end > packet.len() {
+            return Err(());
+        }
+        if rr_type == 41 {
+            if index < before_additional || found.is_some() {
+                return Err(());
+            }
+            found = Some(OptRecord {
+                extended_rcode_at: pos + 4,
+                rdlen_at: pos + 8,
+                rdata: fixed_end..rdata_end,
+                last: index + 1 == before_additional + ar_count,
+            });
+        }
+        pos = rdata_end;
+    }
+    Ok(found)
+}
+
+/// OPT 里的一个 ECS 选项 / An ECS option inside OPT
+struct EcsOption {
+    /// 整个选项（含代码和长度）的范围 / Range of the whole option, code and length included
+    bytes: std::ops::Range<usize>,
+    family: u16,
+    source_prefix: u8,
+    scope: u8,
+    /// ADDRESS 的范围 / Range of the ADDRESS
+    address: std::ops::Range<usize>,
+}
+
+impl EcsOption {
+    /// 是否完全符合 RFC 7871 第 6 节：已知的地址族、前缀不超过地址长度、ADDRESS 恰好
+    /// ceil(前缀/8) 个字节、前缀之后的位为零，SCOPE 也不超过地址长度。
+    /// Whether it follows RFC 7871 section 6 to the letter: a known family, a
+    /// prefix within the address length, an ADDRESS of exactly ceil(prefix/8)
+    /// octets with zero bits beyond the prefix, and a SCOPE within the address
+    /// length too.
+    fn is_well_formed(&self, packet: &[u8]) -> bool {
+        let bits = match self.family {
+            1 => 32,
+            2 => 128,
+            _ => return false,
+        };
+        let address = &packet[self.address.clone()];
+        let spare = self.source_prefix % 8;
+        self.source_prefix <= bits
+            && self.scope <= bits
+            && address.len() == (self.source_prefix as usize).div_ceil(8)
+            && (spare == 0
+                || address
+                    .last()
+                    .is_some_and(|last| last & (0xFF >> spare) == 0))
+    }
+
+    fn subnet(&self, packet: &[u8]) -> crate::ecs::EcsKey {
+        crate::ecs::EcsKey::from_wire(
+            self.family,
+            self.source_prefix,
+            &packet[self.address.clone()],
+        )
+    }
+}
+
+/// OPT 的 RDATA 里的 ECS 选项（RFC 7871 第 6 节）。选项结构不对、或者不止一个 ECS 选项时为 Err。
+/// The ECS option in an OPT record's RDATA (RFC 7871 section 6). Err when the
+/// options are malformed or there is more than one ECS option.
+fn ecs_option(packet: &[u8], rdata: std::ops::Range<usize>) -> Result<Option<EcsOption>, ()> {
+    let mut found = None;
+    let mut pos = rdata.start;
+    while pos < rdata.end {
+        let header_end = pos.checked_add(4).ok_or(())?;
+        if header_end > rdata.end {
+            return Err(());
+        }
+        let code = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let len = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
+        let end = header_end.checked_add(len).ok_or(())?;
+        if end > rdata.end {
+            return Err(());
+        }
+        if code == 8 {
+            if len < 4 || found.is_some() {
+                return Err(());
+            }
+            found = Some(EcsOption {
+                bytes: pos..end,
+                family: u16::from_be_bytes([packet[header_end], packet[header_end + 1]]),
+                source_prefix: packet[header_end + 2],
+                scope: packet[header_end + 3],
+                address: header_end + 4..end,
+            });
+        }
+        pos = end;
+    }
+    Ok(found)
+}
+
+/// 查询（OPT 的 RDATA 在 `rdata`）里客户端自己带的 ECS。不完全合规的选项得到
+/// `EcsKey::opaque`：它照样会被原样转给上游，应答却说不准适用于谁。
+/// The ECS a query carries itself, its OPT RDATA at `rdata`. An option that does
+/// not follow the rules to the letter gets an `EcsKey::opaque`: it still goes
+/// upstream as it is, but whom the answer applies to is unclear.
+fn query_subnet(packet: &[u8], rdata: std::ops::Range<usize>) -> Option<crate::ecs::EcsKey> {
+    match ecs_option(packet, rdata.clone()) {
+        Ok(None) => None,
+        Ok(Some(option)) if option.scope == 0 && option.is_well_formed(packet) => {
+            Some(option.subnet(packet))
+        }
+        _ => Some(crate::ecs::EcsKey::opaque(&packet[rdata])),
+    }
+}
+
+/// 查询报文里客户端自己带的 ECS（见 `query_subnet`）。报文读不出来时也按读不懂的选项算。
+/// The ECS a query message carries itself (see `query_subnet`). A message that
+/// cannot be read counts as an option that cannot be read too.
+pub(crate) fn client_subnet(packet: &[u8]) -> Option<crate::ecs::EcsKey> {
+    match find_opt(packet) {
+        Ok(None) => None,
+        Ok(Some(opt)) => query_subnet(packet, opt.rdata),
+        Err(()) => Some(crate::ecs::EcsKey::opaque(packet)),
+    }
+}
+
+/// 一次转发实际发给上游的 ECS / The ECS a forward actually sends upstream
+pub(crate) fn sent_subnet(packet: &[u8]) -> crate::ecs_scope::Sent {
+    client_subnet(packet).map_or(
+        crate::ecs_scope::Sent::Absent,
+        crate::ecs_scope::Sent::Subnet,
+    )
+}
+
+/// 上游应答里的 ECS（RFC 7871 第 7.3 节据此决定应答适用于谁），以及上游是作答了（RCODE 为
+/// NOERROR 或 NXDOMAIN）还是报错。
+/// The ECS in an upstream's reply, which decides whom the answer applies to (RFC
+/// 7871 section 7.3), and whether the upstream answered (RCODE NOERROR or
+/// NXDOMAIN) rather than reported an error.
+pub(crate) fn reply_ecs(reply: &[u8]) -> (crate::ecs_scope::ReplyEcs, bool) {
+    use crate::ecs_scope::ReplyEcs;
+    let rcode = reply.get(3).map_or(u8::MAX, |flags| flags & 0x0F);
+    let Ok(opt) = find_opt(reply) else {
+        return (ReplyEcs::Unreadable, false);
+    };
+    let Some(opt) = opt else {
+        return (ReplyEcs::Absent, rcode == 0 || rcode == 3);
+    };
+    // 扩展 RCODE 不为 0（例如 BADVERS）就不是 NOERROR / A nonzero extended RCODE (BADVERS, say) is no NOERROR
+    let answered = (rcode == 0 || rcode == 3) && reply[opt.extended_rcode_at] == 0;
+    let ecs = match ecs_option(reply, opt.rdata) {
+        Ok(None) => ReplyEcs::Absent,
+        Ok(Some(option)) if option.is_well_formed(reply) => ReplyEcs::Subnet {
+            subnet: option.subnet(reply),
+            scope: option.scope,
+        },
+        _ => ReplyEcs::Unreadable,
+    };
+    (ecs, answered)
+}
+
+/// 去掉 ECS 选项后的应答：缓存的应答可能交给别的子网的请求方，不能带着原来那个请求方的
+/// 子网。没有 ECS 选项时原样交回；报文或选项读不出来、或者 ECS 选项去不掉（OPT 后面还有
+/// 记录，见 `OptRecord::last`）时以 Err 原样交回，这样的应答不缓存。
+/// The reply without its ECS options: a cached reply may go to requesters in other
+/// subnets and must not carry the subnet of the one it was fetched for. Handed
+/// back as it is when it has none; handed back as it is in Err when the message
+/// or its options cannot be read, or the ECS option cannot be taken out (records
+/// follow the OPT, see `OptRecord::last`), and such a reply is not cached.
+pub(crate) fn without_ecs(reply: Bytes) -> Result<Bytes, Bytes> {
+    let opt = match find_opt(&reply) {
+        Ok(Some(opt)) => opt,
+        Ok(None) => return Ok(reply),
+        Err(()) => return Err(reply),
+    };
+    if !opt.last {
+        // Nothing to move round when there is no ECS option; otherwise see
+        // `OptRecord::last`. A client that sent ECS gets its echo through hickory then
+        // (see `echo_ecs`), so a reply hickory cannot read is not kept either: it would
+        // go to such clients without an echo.
+        // 没有 ECS 选项就不用挪动；否则见 `OptRecord::last`。这时带 ECS 的客户端要经 hickory
+        // 拿到回显（见 `echo_ecs`），所以 hickory 读不了的应答也不保留：它会不带回显地交给
+        // 这样的客户端。
+        return match ecs_option(&reply, opt.rdata.clone()) {
+            Ok(None) if Message::from_vec(&reply).is_ok() => Ok(reply),
+            _ => Err(reply),
+        };
+    }
+    let mut kept = Vec::new();
+    let mut found = false;
+    let mut pos = opt.rdata.start;
+    while pos < opt.rdata.end {
+        let Some(end) = pos
+            .checked_add(4)
+            .filter(|&header_end| header_end <= opt.rdata.end)
+            .map(|header_end| {
+                header_end + u16::from_be_bytes([reply[pos + 2], reply[pos + 3]]) as usize
+            })
+            .filter(|&end| end <= opt.rdata.end)
+        else {
+            return Err(reply);
+        };
+        if u16::from_be_bytes([reply[pos], reply[pos + 1]]) == 8 {
+            found = true;
+        } else {
+            kept.push(pos..end);
+        }
+        pos = end;
+    }
+    if !found {
+        return Ok(reply);
+    }
+    let rd_len: usize = kept.iter().map(|option| option.len()).sum();
+    let mut out = Vec::with_capacity(reply.len());
+    out.extend_from_slice(&reply[..opt.rdata.start]);
+    for option in kept {
+        out.extend_from_slice(&reply[option]);
+    }
+    out.extend_from_slice(&reply[opt.rdata.end..]);
+    out[opt.rdlen_at..opt.rdlen_at + 2].copy_from_slice(&(rd_len as u16).to_be_bytes());
+    Ok(Bytes::from(out))
+}
+
+/// 给缓存里的应答换上回显客户端自己 ECS 的选项，作用范围为 `scope`（RFC 7871 第 7.2.2 节：
+/// 查询带 ECS，应答就要带），取代它原有的 ECS 选项；应答没有 OPT 时补一条。报文读不出来、
+/// OPT 后面还有记录（见 `OptRecord::last`），或者最后一条记录是 TSIG（OPT 不能排在它后面）
+/// 时为 None。
+/// Give a cached reply an option echoing the client's own ECS with `scope`
+/// (RFC 7871 section 7.2.2: a query with ECS gets a reply with it), in place of
+/// any ECS option it has, adding an OPT record when the reply has none. None
+/// when the message cannot be read, records follow its OPT (see
+/// `OptRecord::last`), or its last record is a TSIG, which OPT may not follow.
+pub(crate) fn with_ecs_echo(
+    stored: &[u8],
+    subnet: &crate::ecs::EcsKey,
+    scope: u8,
+) -> Option<Vec<u8>> {
+    let address = &subnet.addr[..subnet.addr_len as usize];
+    let mut option = Vec::with_capacity(8 + address.len());
+    option.extend_from_slice(&8u16.to_be_bytes());
+    option.extend_from_slice(&(4 + address.len() as u16).to_be_bytes());
+    option.extend_from_slice(&subnet.family.to_be_bytes());
+    option.push(subnet.source_prefix);
+    option.push(scope);
+    option.extend_from_slice(address);
+
+    match find_opt(stored).ok()? {
+        // See `OptRecord::last` / 见 `OptRecord::last`
+        Some(opt) if !opt.last => None,
+        Some(opt) => {
+            // 已有的 ECS 选项换成这一个 / An ECS option already there is replaced by this one
+            let kept = match ecs_option(stored, opt.rdata.clone()).ok()? {
+                Some(existing) => existing.bytes,
+                None => opt.rdata.end..opt.rdata.end,
+            };
+            let rd_len = u16::try_from(opt.rdata.len() - kept.len() + option.len()).ok()?;
+            let mut out = Vec::with_capacity(stored.len() + option.len());
+            out.extend_from_slice(&stored[..kept.start]);
+            out.extend_from_slice(&stored[kept.end..opt.rdata.end]);
+            out.extend_from_slice(&option);
+            out.extend_from_slice(&stored[opt.rdata.end..]);
+            out[opt.rdlen_at..opt.rdlen_at + 2].copy_from_slice(&rd_len.to_be_bytes());
+            Some(out)
+        }
+        None => {
+            let end = valid_message_len(stored)?;
+            if last_record_is_tsig(stored) {
+                return None;
+            }
+            let ar_count = u16::from_be_bytes([stored[10], stored[11]]).checked_add(1)?;
+            let mut out = Vec::with_capacity(end + 11 + option.len());
+            out.extend_from_slice(&stored[..end]);
+            // 根名、TYPE OPT、CLASS 即 UDP 载荷大小、扩展 RCODE 与标志全 0
+            // Root owner, TYPE OPT, CLASS as the UDP payload size, extended RCODE and flags all 0
+            out.push(0);
+            out.extend_from_slice(&41u16.to_be_bytes());
+            out.extend_from_slice(&1232u16.to_be_bytes());
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            out.extend_from_slice(&(option.len() as u16).to_be_bytes());
+            out.extend_from_slice(&option);
+            out[10..12].copy_from_slice(&ar_count.to_be_bytes());
+            Some(out)
+        }
+    }
+}
+
+/// 同 `with_ecs_echo`，它不肯改写时（OPT 后面还有记录）改由 hickory 读出整个报文、换上回显
+/// 再重新编码（OPT 放到最后）。读不了、写不出，或者最后一条记录是 TSIG 时为 None。
+/// As `with_ecs_echo`, falling back, where that declines (records after the OPT),
+/// to reading the whole message with hickory, setting the echo and encoding it
+/// again (OPT last). None when it cannot be read or written, or its last record
+/// is a TSIG.
+pub(crate) fn echo_ecs(stored: &[u8], subnet: &crate::ecs::EcsKey, scope: u8) -> Option<Vec<u8>> {
+    with_ecs_echo(stored, subnet, scope).or_else(|| rewrite_ecs(stored, Some((subnet, scope))))
+}
+
+/// 应答去掉 ECS 选项后交给客户端：`without_ecs` 去不掉时（OPT 后面还有记录）改由 hickory
+/// 重新编码。都不行时原样交回。
+/// The reply without its ECS option, for a client: where `without_ecs` cannot take
+/// it out (records after the OPT), hickory encodes it again. Handed back as it is
+/// when neither can.
+pub(crate) fn ecs_removed(reply: Bytes) -> Bytes {
+    without_ecs(reply).unwrap_or_else(|kept| rewrite_ecs(&kept, None).map_or(kept, Bytes::from))
+}
+
+/// 用 hickory 改写报文里的 ECS 选项：`echo` 为 Some 时换成这个回显，None 时去掉
+/// Rewrite a message's ECS option through hickory: the echo `echo` names, or none
+fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Option<Vec<u8>> {
+    use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+    if last_record_is_tsig(message) {
+        return None;
+    }
+    let mut msg = Message::from_vec(message).ok()?;
+    match echo {
+        Some((subnet, scope)) => {
+            let address = subnet.ip()?;
+            let edns = msg.edns.get_or_insert_with(|| {
+                let mut edns = hickory_proto::op::Edns::new();
+                edns.set_max_payload(1232);
+                edns
+            });
+            edns.options_mut().remove(EdnsCode::Subnet);
+            edns.options_mut()
+                .insert(EdnsOption::Subnet(ClientSubnet::new(
+                    address,
+                    subnet.source_prefix,
+                    scope,
+                )));
+        }
+        None => {
+            msg.edns.as_mut()?.options_mut().remove(EdnsCode::Subnet);
+        }
+    }
+    msg.to_vec().ok()
+}
+
+/// 报文最后一条记录是不是 TSIG（RFC 8945 要求它排在最后）
+/// Whether a message's last record is a TSIG (RFC 8945 keeps it last)
+fn last_record_is_tsig(packet: &[u8]) -> bool {
+    if packet.len() < 12 {
+        return false;
+    }
+    let count = |at: usize| u16::from_be_bytes([packet[at], packet[at + 1]]) as usize;
+    let mut pos = 12usize;
+    for _ in 0..count(4) {
+        let Some(next) = skip_name(packet, pos) else {
+            return false;
+        };
+        pos = next + 4;
+    }
+    let mut last_type = None;
+    for _ in 0..count(6) + count(8) + count(10) {
+        let Some(next) = skip_name(packet, pos) else {
+            return false;
+        };
+        if next + 10 > packet.len() {
+            return false;
+        }
+        last_type = Some(u16::from_be_bytes([packet[next], packet[next + 1]]));
+        pos = next + 10 + u16::from_be_bytes([packet[next + 8], packet[next + 9]]) as usize;
+    }
+    last_type == Some(250)
+}
+
 /// Byte length of the last complete record, or `None` on malformed structure.
 ///
 /// hickory's bounded encoder rolls back its write offset but not the backing
@@ -366,7 +775,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
     /// assert!(query.qname_matches("google.com"));  // 完全匹配
     /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
     /// assert!(!query.qname_matches("example.com"));  // 不匹配
@@ -411,7 +820,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
     /// println!("qname: {}", query.qname_str());  // "google.com"
     /// ```
     #[inline]
@@ -455,7 +864,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
     /// let qname_str = query.qname_str_unchecked();  // &str
     /// ```
     #[inline]
@@ -483,7 +892,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
     /// let hash = query.qname_hash();
     /// ```
     #[inline]
@@ -1323,5 +1732,286 @@ mod tests {
         );
         // Truncated question
         assert!(!question_matches(&query, &query[..20]));
+    }
+
+    mod ecs_wire {
+        use super::super::*;
+        use crate::ecs::EcsKey;
+        use crate::ecs_scope::ReplyEcs;
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        fn subnet(address: &str, prefix: u8) -> EcsKey {
+            EcsKey::from_ip(address.parse().unwrap(), prefix, prefix)
+        }
+
+        /// 一条 A 记录的应答；`opt` 为假时不带 OPT，`ecs` 是其中的 ECS（地址、SOURCE、SCOPE），
+        /// `extra` 再加一个别的选项
+        /// A reply with one A record; no OPT unless `opt`, `ecs` its ECS (address,
+        /// SOURCE, SCOPE), `extra` one more option
+        fn reply(opt: bool, ecs: Option<(&str, u8, u8)>, extra: bool) -> Vec<u8> {
+            let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
+            let name = Name::from_str("example.com.").unwrap();
+            msg.add_query(Query::query(name.clone(), RecordType::A));
+            msg.add_answer(Record::from_rdata(
+                name,
+                300,
+                RData::A(hickory_proto::rr::rdata::A("192.0.2.1".parse().unwrap())),
+            ));
+            if opt {
+                let mut edns = Edns::new();
+                edns.set_max_payload(1232);
+                if extra {
+                    edns.options_mut()
+                        .insert(EdnsOption::Unknown(65001, vec![1, 2, 3, 4]));
+                }
+                if let Some((address, source, scope)) = ecs {
+                    edns.options_mut()
+                        .insert(EdnsOption::Subnet(ClientSubnet::new(
+                            address.parse().unwrap(),
+                            source,
+                            scope,
+                        )));
+                }
+                msg.edns = Some(edns);
+            }
+            msg.to_vec().unwrap()
+        }
+
+        fn parsed_ecs(packet: &[u8]) -> Option<(IpAddr, u8, u8)> {
+            let msg = Message::from_vec(packet).expect("still a valid message");
+            match msg.edns.as_ref()?.options().get(EdnsCode::Subnet)? {
+                EdnsOption::Subnet(subnet) => {
+                    Some((subnet.addr(), subnet.source_prefix(), subnet.scope_prefix()))
+                }
+                _ => None,
+            }
+        }
+
+        #[test]
+        fn reply_ecs_reads_the_option() {
+            assert_eq!(
+                reply_ecs(&reply(false, None, false)),
+                (ReplyEcs::Absent, true)
+            );
+            assert_eq!(
+                reply_ecs(&reply(true, None, true)),
+                (ReplyEcs::Absent, true)
+            );
+            assert_eq!(
+                reply_ecs(&reply(true, Some(("198.51.100.0", 24, 16)), true)),
+                (
+                    ReplyEcs::Subnet {
+                        subnet: subnet("198.51.100.0", 24),
+                        scope: 16
+                    },
+                    true
+                )
+            );
+            let mut servfail = reply(true, None, false);
+            servfail[3] = (servfail[3] & 0xF0) | 2;
+            assert_eq!(reply_ecs(&servfail), (ReplyEcs::Absent, false));
+            let packet = reply(true, Some(("198.51.100.0", 24, 16)), false);
+            assert_eq!(
+                reply_ecs(&packet[..packet.len() - 1]),
+                (ReplyEcs::Unreadable, false)
+            );
+        }
+
+        /// 两条 OPT，或 OPT 出现在 Additional 以外：报文不合规（RFC 6891），读不出 ECS，
+        /// 也不缓存
+        /// Two OPT records, or OPT outside Additional: the message is malformed (RFC
+        /// 6891), its ECS cannot be read, and it is not cached
+        #[test]
+        fn a_second_or_misplaced_opt_makes_the_reply_unreadable() {
+            let packet = reply(true, Some(("198.51.100.0", 24, 24)), false);
+            // The reply is the question, one answer, then the OPT record
+            // 应答依次是问题、一条回答、OPT 记录
+            let question_end = skip_name(&packet, 12).unwrap() + 4;
+            let answer_fixed = skip_name(&packet, question_end).unwrap();
+            let answer_end = answer_fixed
+                + 10
+                + u16::from_be_bytes([packet[answer_fixed + 8], packet[answer_fixed + 9]]) as usize;
+            let opt = packet[answer_end..].to_vec();
+            // A second OPT at the end / 末尾再加一条 OPT
+            let mut twice = packet.clone();
+            twice.extend_from_slice(&opt);
+            twice[11] += 1;
+            assert_eq!(reply_ecs(&twice), (ReplyEcs::Unreadable, false));
+            let twice = Bytes::from(twice);
+            assert_eq!(without_ecs(twice.clone()), Err(twice));
+            // The OPT counted as an Authority record / 把 OPT 当作 Authority 记录
+            let mut misplaced = packet.clone();
+            misplaced[9] = 1;
+            misplaced[11] = 0;
+            assert_eq!(reply_ecs(&misplaced), (ReplyEcs::Unreadable, false));
+        }
+
+        #[test]
+        fn without_ecs_drops_only_the_ecs_option() {
+            let packet = Bytes::from(reply(true, Some(("198.51.100.0", 24, 16)), true));
+            let stripped = without_ecs(packet).expect("readable");
+            assert_eq!(parsed_ecs(&stripped), None);
+            let msg = Message::from_vec(&stripped).unwrap();
+            assert_eq!(msg.answers.len(), 1);
+            assert!(
+                msg.edns
+                    .as_ref()
+                    .unwrap()
+                    .options()
+                    .get(EdnsCode::Unknown(65001))
+                    .is_some()
+            );
+            let plain = Bytes::from(reply(true, None, true));
+            assert_eq!(without_ecs(plain.clone()), Ok(plain));
+        }
+
+        #[test]
+        fn the_echo_carries_the_clients_subnet_and_the_scope() {
+            let client = subnet("203.0.113.0", 24);
+            for stored in [reply(true, None, true), reply(false, None, false)] {
+                let echoed = with_ecs_echo(&stored, &client, 16).expect("echo");
+                assert_eq!(
+                    parsed_ecs(&echoed),
+                    Some(("203.0.113.0".parse().unwrap(), 24, 16))
+                );
+                assert_eq!(Message::from_vec(&echoed).unwrap().answers.len(), 1);
+            }
+            // 已有的 ECS 被取代 / An ECS option already there is replaced
+            let other = reply(true, Some(("198.51.100.0", 24, 24)), true);
+            let echoed = with_ecs_echo(&other, &client, 0).expect("echo");
+            assert_eq!(
+                parsed_ecs(&echoed),
+                Some(("203.0.113.0".parse().unwrap(), 24, 0))
+            );
+            let v6 = subnet("2001:db8:aa00::", 40);
+            let echoed = with_ecs_echo(&reply(true, None, false), &v6, 40).expect("echo");
+            assert_eq!(
+                parsed_ecs(&echoed),
+                Some(("2001:db8:aa00::".parse().unwrap(), 40, 40))
+            );
+        }
+
+        /// OPT 后面还有记录时不改动它：后面记录的压缩指针会指错地方。这样的应答去不掉
+        /// ECS（不缓存），也不加回显
+        /// An OPT with records after it is left alone, since their compression
+        /// pointers would point to the wrong place: the reply keeps its ECS (and is
+        /// not cached) and gets no echo
+        #[test]
+        fn an_opt_followed_by_records_is_left_alone() {
+            let packet = reply(true, Some(("198.51.100.0", 24, 24)), false);
+            // An A record named by a pointer to the question, after the OPT
+            // OPT 之后一条名字指向问题的 A 记录
+            let mut after = packet.clone();
+            after.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+            after[11] += 1;
+            assert!(Message::from_vec(&after).is_ok());
+            let after = Bytes::from(after);
+            assert_eq!(without_ecs(after.clone()), Err(after.clone()));
+            assert_eq!(with_ecs_echo(&after, &subnet("203.0.113.0", 24), 0), None);
+            // Without ECS there is nothing to move, so it is stored as it is
+            // 没有 ECS 就不用挪动，原样存放
+            let plain = Bytes::from(reply(true, None, true));
+            let mut plain_after = plain.to_vec();
+            plain_after.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+            plain_after[11] += 1;
+            let plain_after = Bytes::from(plain_after);
+            assert_eq!(without_ecs(plain_after.clone()), Ok(plain_after));
+            // unless hickory cannot read it: then no echo could be written for it
+            // 除非 hickory 读不了它：那就没法给它写回显
+            let mut unreadable = plain.to_vec();
+            // A NULL record with empty RDATA, which hickory refuses / 一条 RDATA 为空的 NULL 记录，hickory 拒收
+            unreadable.extend_from_slice(&[0xC0, 12, 0, 10, 0, 1, 0, 0, 0, 60, 0, 0]);
+            unreadable[11] += 1;
+            assert!(Message::from_vec(&unreadable).is_err());
+            let unreadable = Bytes::from(unreadable);
+            assert_eq!(without_ecs(unreadable.clone()), Err(unreadable));
+        }
+
+        /// 查询里 SCOPE 不为 0 的 ECS 选项不合规（RFC 7871 第 6 节）
+        /// An ECS option with a nonzero SCOPE in a query does not follow RFC 7871 section 6
+        #[test]
+        fn a_query_ecs_with_a_scope_is_opaque() {
+            let mut query = Message::new(0x1234, MessageType::Query, OpCode::Query);
+            query.add_query(Query::query(
+                Name::from_str("example.com.").unwrap(),
+                RecordType::A,
+            ));
+            let mut edns = Edns::new();
+            edns.options_mut()
+                .insert(EdnsOption::Subnet(ClientSubnet::new(
+                    "198.51.100.0".parse().unwrap(),
+                    24,
+                    8,
+                )));
+            query.edns = Some(edns);
+            let packet = query.to_vec().unwrap();
+            let mut buf = [0u8; 256];
+            let parsed = parse_quick(&packet, &mut buf)
+                .unwrap()
+                .client_subnet
+                .unwrap();
+            assert!(parsed.is_opaque());
+            assert_eq!(client_subnet(&packet), Some(parsed));
+        }
+
+        /// 太短的报文不会让改写出错 / A message too short to read never trips the rewriting
+        #[test]
+        fn short_messages_are_left_alone() {
+            for short in [Vec::new(), vec![0u8; 5], vec![0u8; 11]] {
+                assert_eq!(
+                    ecs_removed(Bytes::from(short.clone())),
+                    Bytes::from(short.clone())
+                );
+                assert_eq!(echo_ecs(&short, &subnet("203.0.113.0", 24), 0), None);
+                assert!(!last_record_is_tsig(&short));
+            }
+        }
+
+        /// OPT 不能排在 TSIG 之后，带 TSIG 的报文不加回显
+        /// OPT may not follow a TSIG, so a message ending in one gets no echo
+        #[test]
+        fn no_echo_is_added_after_a_tsig() {
+            let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
+            let name = Name::from_str("example.com.").unwrap();
+            msg.add_query(Query::query(name.clone(), RecordType::A));
+            let mut packet = msg.to_vec().unwrap();
+            // A TSIG-typed record at the end of Additional / Additional 末尾一条 TSIG 类型的记录
+            packet.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0]);
+            packet[11] = 1;
+            assert_eq!(with_ecs_echo(&packet, &subnet("203.0.113.0", 24), 0), None);
+            packet[11] = 0;
+            packet.truncate(packet.len() - 11);
+            assert!(with_ecs_echo(&packet, &subnet("203.0.113.0", 24), 0).is_some());
+        }
+
+        #[test]
+        fn parse_quick_reads_the_clients_ecs() {
+            let mut query = Message::new(0x1234, MessageType::Query, OpCode::Query);
+            query.add_query(Query::query(
+                Name::from_str("example.com.").unwrap(),
+                RecordType::A,
+            ));
+            let plain = query.to_vec().unwrap();
+            let mut edns = Edns::new();
+            edns.options_mut()
+                .insert(EdnsOption::Subnet(ClientSubnet::new(
+                    "198.51.100.7".parse().unwrap(),
+                    24,
+                    0,
+                )));
+            query.edns = Some(edns);
+            let with_ecs = query.to_vec().unwrap();
+            let mut buf = [0u8; 256];
+            assert_eq!(parse_quick(&plain, &mut buf).unwrap().client_subnet, None);
+            let mut buf = [0u8; 256];
+            assert_eq!(
+                parse_quick(&with_ecs, &mut buf).unwrap().client_subnet,
+                Some(subnet("198.51.100.0", 24))
+            );
+        }
     }
 }

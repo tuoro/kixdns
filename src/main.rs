@@ -878,7 +878,6 @@ async fn run_udp_worker(
                     tx_id,
                     edns_present,
                     pipeline_id,
-                    ecs_key,
                 })) => {
                     // 缓存未命中，使用预解析的数据避免重复解析
                     // Cache miss, use pre-parsed data to avoid re-parsing
@@ -909,7 +908,6 @@ async fn run_udp_worker(
                                         tx_id,
                                         edns_present,
                                         pipeline_id,
-                                        ecs_key,
                                     ),
                                 ),
                             )
@@ -1127,7 +1125,6 @@ async fn handle_tcp_conn(
                 tx_id,
                 edns_present,
                 pipeline_id,
-                ecs_key,
             })) => {
                 // 缓存未命中：使用预解析数据避免重复解析
                 // Cache miss: use pre-parsed data to avoid re-parsing
@@ -1137,15 +1134,7 @@ async fn handle_tcp_conn(
                         &packet_bytes,
                         peer,
                         false,
-                        PreParsedData::new(
-                            qname,
-                            qtype,
-                            qclass,
-                            tx_id,
-                            edns_present,
-                            pipeline_id,
-                            ecs_key,
-                        ),
+                        PreParsedData::new(qname, qtype, qclass, tx_id, edns_present, pipeline_id),
                     ),
                 )
                 .await

@@ -786,10 +786,12 @@ impl PanelMetrics {
     #[cfg(unix)]
     fn render_prometheus(&self, engine: &Engine) -> String {
         let mut output = String::with_capacity(8_192);
+        // Answers, not slots: one question can hold answers for several ECS networks
+        // 按应答份数计，而不是槽位数：一个问题可以存多个 ECS 网段的应答
         metric(
             &mut output,
             "kixdns_cache_entries",
-            engine.cache.entry_count(),
+            engine.cache.weighted_size(),
         );
         self.render_counters(&mut output);
         output
@@ -1404,7 +1406,8 @@ async fn handle_request(
             diagnostic_trace_candidate(request, engine).await
         }
         (&Method::POST, "/v1/cache/flush") => {
-            let response_entries_before = engine.cache.entry_count();
+            engine.cache.run_pending_tasks();
+            let response_entries_before = engine.cache.weighted_size();
             let rule_entries_before = engine.rule_cache.entry_count();
             engine.cache.invalidate_all();
             engine.rule_cache.invalidate_all();
@@ -1415,7 +1418,7 @@ async fn handle_request(
                 json!({
                     "protocol_version": PROTOCOL_VERSION,
                     "response_entries_before": response_entries_before,
-                    "response_entries_after": engine.cache.entry_count(),
+                    "response_entries_after": engine.cache.weighted_size(),
                     "rule_entries_before": rule_entries_before,
                     "rule_entries_after": engine.rule_cache.entry_count(),
                 }),
