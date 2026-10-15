@@ -1194,6 +1194,15 @@ impl Engine {
                     client_ecs,
                 )
             };
+        // A refresh replays its request's ECS from the key the cache kept, as an option
+        // nobody can read does not survive into the replayed packet (see
+        // `RefreshTarget::client_ecs`)
+        // 刷新按缓存留下的键重放请求的 ECS：读不懂的选项进不了重放的包（见
+        // `RefreshTarget::client_ecs`）
+        let client_ecs = refresh
+            .as_ref()
+            .and_then(|target| target.client_ecs)
+            .or(client_ecs);
 
         let qname_ref = &qname_cow;
         let start = std::time::Instant::now();
@@ -1672,18 +1681,20 @@ impl Engine {
                             Ok(phases::ForwardResult::Success(bytes)) => {
                                 // After a refresh continued past an answer and then
                                 // jumped, the answer is not stored under `refresh_key`:
-                                // unless it is a failure (SERVFAIL, or the target's
-                                // stale answer served on one, the only cache hit a
-                                // refresh can have), the entry there no longer matches
-                                // the rules.
+                                // unless it is a failure (SERVFAIL, a truncated answer,
+                                // or the target's stale answer served on one, the only
+                                // cache hit a refresh can have), the entry there no
+                                // longer matches the rules.
                                 // 刷新越过一个应答又跳转之后，应答不会存进 `refresh_key`：
-                                // 只要不是失败（SERVFAIL，或失败时返回的目标旧结果，也是
-                                // 刷新唯一可能的缓存命中），那里的条目就已经和规则对不上。
+                                // 只要不是失败（SERVFAIL、截断的应答，或失败时返回的目标旧
+                                // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
+                                // 对不上。
                                 if refresh_passed_an_answer
                                     && !refresh_fell_back
                                     && let Some(target) = &refresh
                                     && keys.slot != target.slot
                                     && !phases::is_servfail(&bytes)
+                                    && !crate::proto_utils::truncated_response(&bytes)
                                     && !response_log.info.cache_hit
                                 {
                                     drop_refreshed(target);
@@ -1777,14 +1788,21 @@ impl Engine {
         };
         // A refresh is after an answer to renew its entry with. SERVFAIL is none,
         // whatever produced it (the jump limit, a jump target that does not exist, a
-        // static SERVFAIL), so the refresh ends as a failure, which refresh.rs logs,
-        // and the entry stays as it is.
+        // static SERVFAIL), and neither is a truncated answer, which is never cached:
+        // the refresh ends as a failure, which refresh.rs logs, and the entry stays as
+        // it is.
         // 刷新要的是拿来更新条目的应答。SERVFAIL 不是，不论它从哪里来（跳转上限、跳转目标
-        // 不存在、静态 SERVFAIL），所以刷新以失败结束，由 refresh.rs 记录，条目保持原样。
+        // 不存在、静态 SERVFAIL）；截断的应答也不是，它从不写缓存。刷新以失败结束，由
+        // refresh.rs 记录，条目保持原样。
         let result = match result {
             Ok(bytes) if refresh.is_some() && phases::is_servfail(&bytes) => Err(
                 phases::refresh_found_no_answer("the rules answered SERVFAIL"),
             ),
+            Ok(bytes) if refresh.is_some() && crate::proto_utils::truncated_response(&bytes) => {
+                Err(phases::refresh_found_no_answer(
+                    "only a truncated answer came back",
+                ))
+            }
             result => result,
         };
         if let Some(mut guard) = held_inflight.take()

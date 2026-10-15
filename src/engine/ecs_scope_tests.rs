@@ -1687,3 +1687,205 @@ async fn from_client_ip_takes_the_ipv4_subnet_of_a_mapped_client() {
     );
     assert_eq!(*up.seen.lock(), vec![Some((ip("198.51.100.0"), 24)), None]);
 }
+
+/// 客户端带的 ECS 读不懂（这里是查询里 SCOPE 不为 0，RFC 7871 第 6 节不允许）：它允许给上游
+/// 多少地址无从得知，`from_client_ip` 既不转发这个选项，也不替它加上来源地址的子网
+/// （第 7.1 节）。公网和私有地址的客户端都一样，发给上游的是同一个不带 ECS 的查询，共用应答。
+/// A client ECS nobody can read (here a nonzero SCOPE in a query, which RFC 7871
+/// section 6 does not allow): how much of its address it lets go upstream is
+/// unknown, so `from_client_ip` neither passes the option on nor adds the source
+/// address's subnet in its place (section 7.1). Public and private clients alike
+/// send the same query without ECS upstream, and share its answer.
+#[tokio::test]
+async fn from_client_ip_sends_no_address_for_an_unreadable_client_ecs() {
+    let up = upstream(Echo::Scope(24)).await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    let unreadable = query_with_ecs_option(&[0, 1, 0, 5]);
+    for client in ["198.51.100.7", "192.168.1.10"] {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&unreadable, peer(client)),
+        )
+        .await
+        .expect("answer in time")
+        .expect("answer");
+        assert_eq!(first_a(&reply), Some(NO_SUBNET), "{client}");
+    }
+    assert_eq!(*up.seen.lock(), vec![None]);
+    assert_eq!(up.queries(), 1);
+}
+
+/// 查询 example.com A，带一个 ECS 选项，选项内容（FAMILY、SOURCE、SCOPE、ADDRESS）照原样写进去
+/// A query for example.com A carrying one ECS option whose data (FAMILY, SOURCE,
+/// SCOPE, ADDRESS) is written as given
+fn query_with_ecs_option(data: &[u8]) -> Vec<u8> {
+    let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+    request.metadata.recursion_desired = true;
+    request.add_query(Query::query(
+        Name::from_str("example.com").unwrap(),
+        RecordType::A,
+    ));
+    let mut packet = request.to_vec().unwrap();
+    // ARCOUNT 1, then the OPT record: root name, type 41, payload 1232, TTL 0
+    // ARCOUNT 为 1，接着是 OPT 记录：根名、类型 41、载荷 1232、TTL 0
+    packet[11] = 1;
+    packet.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0]);
+    let rdlen = 4 + data.len();
+    packet.extend_from_slice(&(rdlen as u16).to_be_bytes());
+    packet.extend_from_slice(&8u16.to_be_bytes());
+    packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
+    packet.extend_from_slice(data);
+    packet
+}
+
+/// 读不懂的 ECS 选项也要去掉，包括 hickory 解不开的（地址族未知、前缀超长）
+/// An ECS option nobody can read goes too, including ones hickory cannot decode
+/// (an unknown family, a prefix too long)
+#[tokio::test]
+async fn from_client_ip_removes_ecs_options_hickory_cannot_decode() {
+    let up = upstream(Echo::Scope(24)).await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    for (case, data) in [
+        ("unknown family", vec![0, 3, 24, 0, 1, 2, 3]),
+        (
+            "an IPv4 prefix over 32",
+            vec![0, 1, 33, 0, 198, 51, 100, 7, 1],
+        ),
+        ("a nonzero SCOPE", vec![0, 1, 24, 5, 198, 51, 100]),
+    ] {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&query_with_ecs_option(&data), peer("198.51.100.7")),
+        )
+        .await
+        .expect("answer in time")
+        .expect("answer");
+        assert_eq!(first_a(&reply), Some(NO_SUBNET), "{case}");
+    }
+    // 三次请求发给上游的都不带 ECS，所以第一次之后都从缓存拿
+    // All three send the upstream a query without ECS, so after the first they come from the cache
+    assert_eq!(*up.seen.lock(), vec![None]);
+}
+
+/// 后台刷新照样不加地址：刷新重放的包放不进读不懂的选项，按缓存记下的请求方判断，和原请求一样
+/// 发出不带 ECS 的查询，换下的也是原来那份应答。
+/// A background refresh adds no address either: the replayed packet cannot carry
+/// the unreadable option, so the refresh judges by the requester the cache
+/// recorded, sends a query without ECS as the request did, and renews that same
+/// answer.
+#[tokio::test]
+async fn a_refresh_for_an_unreadable_client_ecs_sends_no_address() {
+    let up = upstream_with(Echo::Scope(24), ResponseCode::NoError, 10, Duration::ZERO).await;
+    let engine = engine_with(
+        serde_json::json!({
+            "cache_background_refresh": true,
+            "cache_refresh_threshold_percent": 95,
+            "cache_refresh_min_ttl": 0
+        }),
+        forward_all(&up.address, from_client_ip()),
+    );
+    let unreadable = query_with_ecs_option(&[0, 1, 0, 5]);
+    let ask_unreadable = || async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&unreadable, peer("198.51.100.7")),
+        )
+        .await
+        .expect("answer in time")
+        .expect("answer")
+    };
+    ask_unreadable().await;
+    // 一秒之后到了刷新时机（10 秒还剩 9 秒），这次命中发起刷新
+    // A second on the entry is due for a refresh (9 of 10 seconds left); this hit starts it
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    ask_unreadable().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while up.queries() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refresh reaches the upstream");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 刷新回来的应答换下了原来那份，下一次照样命中缓存
+    // The refreshed answer replaced the one before, so the next request still hits the cache
+    assert_eq!(first_a(&ask_unreadable().await), Some(NO_SUBNET));
+    assert_eq!(*up.seen.lock(), vec![None, None]);
+    assert_eq!(up.queries(), 2);
+}
+
+/// 查询名用一个指向后面的压缩指针，指到 OPT 里 ECS 选项的地址字节上（那里写着
+/// example.com），选项后面紧跟着另一段写着 evil.com 的字节。RFC 1035 第 4.1.4 节只许指针指向
+/// 前面已经出现过的名字；这种查询要被拒绝，否则去掉 ECS 选项后字节前移，指针就落到 evil.com
+/// 上：规则看到的是 example.com，上游解析的却是 evil.com。
+/// The query name is a compression pointer pointing forward, at the ECS option's
+/// address bytes in the OPT record (which spell example.com), and another option
+/// spelling evil.com follows. RFC 1035 section 4.1.4 allows pointers only to a name
+/// that came before; such a query must be refused, or removing the ECS option moves
+/// the bytes and the pointer lands on evil.com: the rules see example.com while the
+/// upstream resolves evil.com.
+#[tokio::test]
+async fn a_query_name_pointing_forward_is_refused() {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream = sock.local_addr().unwrap().to_string();
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = received.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while sock.recv_from(&mut buf).await.is_ok() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let engine = engine(serde_json::json!([{ "id": "main", "rules": [
+        {
+            "name": "block", "matchers": [{ "type": "domain_suffix", "value": "evil.com" }],
+            "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+        },
+        {
+            "name": "all", "matchers": [{ "type": "any" }],
+            "actions": [forward_to(&upstream, Some(serde_json::json!({ "mode": "clear" })))]
+        }
+    ] }]));
+    let mut packet = vec![0xbe, 0xef, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1];
+    // QNAME: a pointer to offset 37, then QTYPE A, QCLASS IN
+    // QNAME：指向偏移 37 的指针，接着 QTYPE A、QCLASS IN
+    packet.extend_from_slice(&[0xc0, 37, 0, 1, 0, 1]);
+    let example = b"\x07example\x03com\x00";
+    let evil = b"\x04evil\x03com\x00";
+    let ecs_len = 4 + example.len();
+    let other_len = 4 + evil.len();
+    let rdlen = 4 + ecs_len + 4 + other_len;
+    // OPT: root name, type 41, payload 1232, TTL 0, RDLENGTH
+    packet.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0]);
+    packet.extend_from_slice(&(rdlen as u16).to_be_bytes());
+    // ECS option: family 3 (unknown), source 24, scope 0, then the address bytes at offset 37
+    // ECS 选项：地址族 3（未知）、前缀 24、SCOPE 0，地址字节从偏移 37 开始
+    packet.extend_from_slice(&8u16.to_be_bytes());
+    packet.extend_from_slice(&(ecs_len as u16).to_be_bytes());
+    packet.extend_from_slice(&[0, 3, 24, 0]);
+    assert_eq!(packet.len(), 37);
+    packet.extend_from_slice(example);
+    // Another option: 4 bytes of padding, then evil.com, which lands at offset 37 once
+    // the ECS option is gone / 另一个选项：4 字节填充，接着是 evil.com，去掉 ECS 选项后它正好在偏移 37
+    packet.extend_from_slice(&65001u16.to_be_bytes());
+    packet.extend_from_slice(&(other_len as u16).to_be_bytes());
+    packet.extend_from_slice(&[0, 0, 0, 0]);
+    packet.extend_from_slice(evil);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.handle_packet(&packet, peer("198.51.100.7")),
+    )
+    .await
+    .expect("answer in time");
+    assert!(outcome.is_err(), "{outcome:?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(received.load(Ordering::SeqCst), 0);
+    assert!(crate::proto_utils::parse_quick(&packet, &mut [0u8; 256]).is_none());
+    // Taking the ECS option out at the wire level must not move the name either: the
+    // packet is left as it is / 在报文层去掉 ECS 选项也不能挪动名字：包保持原样
+    assert_eq!(
+        crate::ecs::apply_ecs(&packet, &crate::config::EcsMode::Clear, ip("198.51.100.7")),
+        packet
+    );
+}

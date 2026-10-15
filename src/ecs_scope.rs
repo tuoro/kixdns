@@ -52,12 +52,12 @@ pub enum EcsSource {
     /// 客户端自己带的 ECS：转发没写 `ecs`，或者固定 IP 无效
     /// The client's own ECS: the forward has no `ecs`, or its static IP is invalid
     Client,
-    /// `from_client_ip`：客户端自己带了 ECS 时，它的子网按这些前缀截短；没带、读不懂或者是私有网段时，
-    /// 来源地址按这些前缀取子网，私有地址则不加（见 `crate::ecs::plan`）
+    /// `from_client_ip`：客户端自己带了 ECS 时，它的子网按这些前缀截短；读不懂时什么也不发；没带或者
+    /// 是私有网段时，来源地址按这些前缀取子网，私有地址则不加（见 `crate::ecs::plan`）
     /// `from_client_ip`: the client's own subnet cut to these prefixes when it sent
-    /// ECS; when it sent none, one nobody can read or a private network, the
-    /// address's subnet at these prefixes, or nothing for a private address (see
-    /// `crate::ecs::plan`)
+    /// ECS; nothing when it sent one nobody can read; when it sent none or a private
+    /// network, the address's subnet at these prefixes, or nothing for a private
+    /// address (see `crate::ecs::plan`)
     Peer { prefix_v4: u8, prefix_v6: u8 },
     /// 与请求方无关：`clear`，或有效的固定 IP
     /// Independent of the requester: `clear`, or a valid static IP

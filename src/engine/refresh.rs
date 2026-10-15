@@ -26,6 +26,12 @@ pub struct RefreshTarget {
     /// 刷新开始的时刻：之后取得的应答来自刷新本身或别的请求
     /// When the refresh started: answers fetched later come from the refresh or other requests
     pub started: Instant,
+    /// 被刷新的请求自己带的 ECS 选项，按缓存看到的样子。读不懂的选项放不回重放的包里，所以刷新
+    /// 按这一项判断，而不是从重放的包里读
+    /// The ECS option the renewed request carried itself, as the cache saw it. One
+    /// nobody can read cannot be put back into the replayed packet, so the refresh
+    /// judges by this rather than by what it reads out of that packet
+    pub client_ecs: Option<crate::ecs::EcsKey>,
 }
 
 impl RefreshTarget {
@@ -36,7 +42,15 @@ impl RefreshTarget {
             reach,
             fetched_at,
             started: Instant::now(),
+            client_ecs: None,
         }
+    }
+
+    /// 同上，带着被刷新请求自己的 ECS 选项（见 `client_ecs`）
+    /// The same, with the renewed request's own ECS option (see `client_ecs`)
+    pub fn with_client_ecs(mut self, client_ecs: Option<crate::ecs::EcsKey>) -> Self {
+        self.client_ecs = client_ecs;
+        self
     }
 
     /// 刷新标记的键：每个条目各一个，同一槽位里不同子网的条目可以同时刷新
@@ -101,7 +115,8 @@ pub fn spawn_background_refresh(
         renewed.pipeline_id.clone(),
         renewed.reach.clone(),
         renewed.fetched_at,
-    );
+    )
+    .with_client_ecs(requester.ecs);
 
     // Step 1: Construct standard DNS query packet
     // 步骤 1：构造标准 DNS 查询包

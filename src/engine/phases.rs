@@ -608,7 +608,8 @@ pub(crate) async fn handle_forward_decision_logged(
     // 仅在缓存未命中路径执行 — 缓存命中和静态响应不受影响。
     let ecs_packet: std::borrow::Cow<[u8]> = match ecs {
         Some(mode) => {
-            let modified = crate::ecs::apply_ecs(packet, mode, peer.ip());
+            let modified =
+                crate::ecs::apply_ecs_for(packet, mode, peer.ip(), requester.ecs.as_ref());
             tracing::debug!(
                 ecs_mode = ?mode,
                 modified = modified.len() != packet.len(),
@@ -1142,7 +1143,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     // 时这里的条目已经和规则对不上，删掉（同 Static 分支）。目标没拿到应答
                     // 时，刷新以失败结束，条目保留。
                     if skip_cache {
-                        if is_servfail(&resp_bytes) {
+                        if is_servfail(&resp_bytes) || proto_utils::truncated_response(&resp_bytes)
+                        {
                             return Err(refresh_found_no_answer("the jump target found no answer"));
                         }
                         if let Some(target) = refresh {
@@ -1583,6 +1585,12 @@ mod refresh_response_rule_tests {
     /// Local UDP upstream that answers every query with one A record.
     /// 本机 UDP 上游：每个查询都回一条 A 记录。
     async fn spawn_upstream_answering(ip: Ipv4Addr) -> String {
+        spawn_upstream_answering_with(ip, false).await
+    }
+
+    /// The same, the answers truncated (TC set) when `truncated` is
+    /// 同上，`truncated` 为真时应答带 TC 位
+    async fn spawn_upstream_answering_with(ip: Ipv4Addr, truncated: bool) -> String {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -1595,6 +1603,7 @@ mod refresh_response_rule_tests {
                     continue;
                 };
                 let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+                resp.metadata.truncation = truncated;
                 resp.add_query(question.clone());
                 resp.add_answer(a_record(&question, ip));
                 let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
@@ -2449,6 +2458,44 @@ mod refresh_response_rule_tests {
                 "{actions}"
             );
         }
+    }
+
+    /// Only a truncated answer comes back (TCP fallback is off): it is not cached, so
+    /// there is nothing to renew the entry with, and the refresh fails
+    /// 只拿到被截断的应答（关了 TCP 回退）：它不写缓存，没有拿来更新条目的应答，刷新算失败
+    #[tokio::test]
+    async fn a_refresh_that_gets_only_a_truncated_answer_fails() {
+        let truncating = spawn_upstream_answering_with(FINAL, true).await;
+        let (engine, key) = engine_with_a_cached_answer(
+            json!({ "enable_tcp_fallback": false }),
+            json!([{ "id": "main", "rules": [rule("all", forward(&truncating), json!({}))] }]),
+        );
+        assert_eq!(
+            refresh_succeeds(&engine, key).await,
+            (false, Some(vec![OLD]))
+        );
+    }
+
+    /// The same past a continue and a rule-level jump, or through a response jump:
+    /// the refresh fails, and the entry stays as on a SERVFAIL there
+    /// 越过一个应答再规则级跳转，或者经响应跳转，也一样：刷新失败，条目和那里遇到 SERVFAIL
+    /// 时一样保留
+    #[tokio::test]
+    async fn a_refresh_whose_jump_target_gets_only_a_truncated_answer_keeps_the_entry() {
+        let truncating = spawn_upstream_answering_with(FINAL, true).await;
+        let target = rule("target", forward(&truncating), json!({}));
+        let settings = json!({ "enable_tcp_fallback": false });
+        let after_a_continue = refresh_with_actions_on_the_answer(
+            settings.clone(),
+            continue_(),
+            vec![rule("jump", jump_to("other"), json!({}))],
+            target.clone(),
+        )
+        .await;
+        assert_eq!(after_a_continue, Some(vec![OLD]));
+        let through_a_response_jump =
+            refresh_with_actions_on_the_answer(settings, jump_to("other"), vec![], target).await;
+        assert_eq!(through_a_response_jump, Some(vec![OLD]));
     }
 
     #[tokio::test]
