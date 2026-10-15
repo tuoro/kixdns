@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
+#[cfg(unix)]
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
