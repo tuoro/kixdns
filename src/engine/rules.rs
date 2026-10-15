@@ -232,8 +232,21 @@ pub fn fast_hash_str(s: &str) -> u64 {
 /// Helper function: Acquire GeoIP and GeoSite locks (with non-blocking fast path)
 ///
 /// 优化：消除重复的锁获取逻辑 / Optimization: Eliminate duplicate lock acquisition logic
+///
+/// 有争用时，先放掉已经拿到的那把，再按固定顺序阻塞读取：先 GeoSite、后 GeoIP，和 `select_pipeline`
+/// 一样。不这样做会卡死，原因有两个：
+/// - 再读一次已经持有的锁：parking_lot 的 `read()` 在有写者排队时要等那个写者，而写者在等这个线程
+///   放掉第一次读；
+/// - 拿着一把、按相反的顺序等另一把：两边的写者同时排队时，几方互相等待。
+///
+/// On contention, drop whichever lock was taken and block in one fixed order, GeoSite then GeoIP,
+/// as `select_pipeline` does. Otherwise it can deadlock in two ways:
+/// - reading a held lock again: parking_lot's `read()` waits behind a queued writer, which waits
+///   for this thread's first read;
+/// - holding one lock while waiting for the other in the opposite order: once writers queue on
+///   both, the parties wait on each other.
 #[inline]
-fn acquire_geo_locks<'a>(
+pub(crate) fn acquire_geo_locks<'a>(
     engine: &'a Engine,
 ) -> (
     Option<crate::lock::RwLockReadGuard<'a, crate::matcher::geoip::GeoIpManager>>,
@@ -248,8 +261,10 @@ fn acquire_geo_locks<'a>(
     // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
     if geoip_manager.is_none() || geosite_manager.is_none() {
         tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
-        geoip_manager = Some(engine.geoip_manager.read());
+        drop(geoip_manager.take());
+        drop(geosite_manager.take());
         geosite_manager = Some(engine.geosite_manager.read());
+        geoip_manager = Some(engine.geoip_manager.read());
     }
 
     (geoip_manager, geosite_manager)
@@ -1036,18 +1051,7 @@ pub(crate) async fn process_response_jump(
                         // 尝试非阻塞获取读锁（并发读的快速路径）
                         // 使用作用域确保锁在使用后立即释放
                         let resp_match_ok = {
-                            let mut geoip_manager = engine.geoip_manager.try_read();
-                            let mut geosite_manager = engine.geosite_manager.try_read();
-
-                            // Fallback to blocking read if try_read fails (rare write operation in progress)
-                            // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
-                            if geoip_manager.is_none() || geosite_manager.is_none() {
-                                tracing::debug!(
-                                    "GeoIP/GeoSite lock contention, falling back to blocking read"
-                                );
-                                geoip_manager = Some(engine.geoip_manager.read());
-                                geosite_manager = Some(engine.geosite_manager.read());
-                            }
+                            let (geoip_manager, geosite_manager) = acquire_geo_locks(engine);
 
                             let geoip_manager_ref = geoip_manager.as_deref();
                             let geosite_manager_ref = geosite_manager.as_deref();
@@ -1386,5 +1390,134 @@ mod response_jump_tests {
             })
             .collect();
         assert_eq!(answers, [Ipv4Addr::new(192, 0, 2, 5)]);
+    }
+}
+
+#[cfg(test)]
+mod geo_lock_tests {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::acquire_geo_locks;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+
+    fn engine() -> Engine {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine")
+    }
+
+    /// GeoIP is being written, so the reader gets only GeoSite and waits for GeoIP.
+    /// Meanwhile a GeoSite writer queues behind the reader's read. Reading GeoSite a
+    /// second time would wait behind that writer, which waits for the reader: a deadlock.
+    /// GeoIP 正在写入，读者只拿到 GeoSite，然后等 GeoIP；这时一个 GeoSite 写者排在它的读锁
+    /// 后面。再读一次 GeoSite 就要等那个写者，而写者在等读者，两边卡死。
+    #[tokio::test]
+    async fn waiting_for_one_geo_lock_never_reads_the_other_again() {
+        let engine = engine();
+        let geoip = engine.geoip_manager.clone();
+        let geosite = engine.geosite_manager.clone();
+
+        let geoip_write = geoip.write();
+        let (done, finished) = mpsc::channel();
+        let reader_engine = engine.clone();
+        let reader = std::thread::spawn(move || {
+            let (geoip_read, geosite_read) = acquire_geo_locks(&reader_engine);
+            let both = geoip_read.is_some() && geosite_read.is_some();
+            drop((geoip_read, geosite_read));
+            let _ = done.send(both);
+        });
+
+        // The reader holds GeoSite once its try_read succeeded; it then waits for GeoIP.
+        // 读者的 try_read 拿到 GeoSite 后就一直持有，接着等 GeoIP。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !geosite.is_locked() {
+            assert!(Instant::now() < deadline, "the reader never took GeoSite");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let queued = geosite.clone();
+        let writer = std::thread::spawn(move || drop(queued.write()));
+        // Give the writer time to queue behind the reader's read.
+        // 给写者时间排到读者的读锁后面。
+        std::thread::sleep(Duration::from_millis(200));
+
+        drop(geoip_write);
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the reader must get both locks without reading GeoSite twice"
+        );
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }
+
+    /// Another reader, like `select_pipeline`, holds GeoSite and goes on to read GeoIP. A GeoSite
+    /// writer queues behind it, so the helper gets GeoIP but not GeoSite. Had the helper kept
+    /// GeoIP and waited for GeoSite, a GeoIP writer queued behind it would stop the other
+    /// reader's GeoIP read, and the four would wait on each other.
+    /// 另一个读者像 `select_pipeline` 那样拿着 GeoSite、接着读 GeoIP；一个 GeoSite 写者排在它后面，
+    /// 于是辅助函数拿到 GeoIP、拿不到 GeoSite。要是它拿着 GeoIP 等 GeoSite，排在它后面的 GeoIP 写者
+    /// 会挡住另一个读者读 GeoIP，四方互相等待。
+    #[tokio::test]
+    async fn the_fallback_takes_geosite_before_geoip_as_select_pipeline_does() {
+        let engine = engine();
+        let geoip = engine.geoip_manager.clone();
+        let geosite = engine.geosite_manager.clone();
+        let pause = || std::thread::sleep(Duration::from_millis(200));
+
+        let (go, wait_for_go) = mpsc::channel::<()>();
+        let (holding, held) = mpsc::channel::<()>();
+        let (other_done, other_finished) = mpsc::channel::<()>();
+        let (other_geosite, other_geoip) = (geosite.clone(), geoip.clone());
+        let other = std::thread::spawn(move || {
+            let geosite_read = other_geosite.read();
+            holding.send(()).unwrap();
+            wait_for_go.recv().unwrap();
+            let geoip_read = other_geoip.read();
+            drop((geoip_read, geosite_read));
+            let _ = other_done.send(());
+        });
+        held.recv().unwrap();
+
+        let queued_geosite = geosite.clone();
+        let geosite_writer = std::thread::spawn(move || drop(queued_geosite.write()));
+        pause();
+
+        let (done, finished) = mpsc::channel();
+        let reader_engine = engine.clone();
+        let reader = std::thread::spawn(move || {
+            let (geoip_read, geosite_read) = acquire_geo_locks(&reader_engine);
+            let both = geoip_read.is_some() && geosite_read.is_some();
+            drop((geoip_read, geosite_read));
+            let _ = done.send(both);
+        });
+        pause();
+
+        let queued_geoip = geoip.clone();
+        let geoip_writer = std::thread::spawn(move || drop(queued_geoip.write()));
+        pause();
+        go.send(()).unwrap();
+
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the helper must wait for GeoSite holding nothing, then take GeoIP"
+        );
+        assert!(
+            other_finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the other reader must get GeoIP"
+        );
+        for thread in [other, geosite_writer, reader, geoip_writer] {
+            thread.join().unwrap();
+        }
     }
 }
