@@ -242,6 +242,12 @@ pub struct GlobalSettings {
     /// UDP 失败时是否自动 fallback 到 TCP（默认 true）。 / UDP failure automatically fallbacks to TCP (default true)
     #[serde(default = "default_enable_tcp_fallback")]
     pub enable_tcp_fallback: bool,
+    /// 是否记录面板查询排行（默认 false）。/ Enable bounded query rankings for the panel (default false).
+    #[serde(default)]
+    pub statistics_enabled: bool,
+    /// 是否将客户端 IP 截断为网段后再统计（默认 false）。/ Truncate client IPs to a subnet in statistics (default false).
+    #[serde(default)]
+    pub statistics_anonymize_client_ip: bool,
 }
 
 impl Default for GlobalSettings {
@@ -294,6 +300,8 @@ impl Default for GlobalSettings {
             geoip_filter_countries: Vec::new(),
             geosite_data_paths: Vec::new(),
             enable_tcp_fallback: default_enable_tcp_fallback(),
+            statistics_enabled: false,
+            statistics_anonymize_client_ip: false,
         }
     }
 }
