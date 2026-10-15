@@ -41,6 +41,8 @@ This document describes the implementation currently on the main branch. Configu
 
 - **MaxMind GeoIP** — MMDB lookup and country/private-IP matchers.
 - **V2Ray GeoSite** — load `.dat` or supported JSON files for domain-category matchers.
+- **GeoSite entries** — written as in V2Ray's domain lists (domain-list-community). `domain:example.com` and a bare `example.com` match the domain and every subdomain by whole labels (not `notexample.com`); unlike `domain_suffix`, a leading dot changes nothing here. `full:example.com` matches the domain only, `keyword:` and `regexp:` match a keyword or a regular expression, and a bare value with `*` is a wildcard. JSON entries with an unknown prefix, no value or an invalid regex are skipped with a warning.
+- **GeoSite attributes** — in `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. The domains without an attribute are `geosite: google` together with `geosite_not: google@cn`.
 - **Database reload** — configured GeoSite and GeoIP `.dat` files are watched and reloaded.
 - **DoQ 0-RTT handling** — global and per-upstream settings, with rejection/timeout fallback until restart.
 
@@ -325,7 +327,7 @@ Pipeline selectors support all of the rows above. Request rules support all rows
 - When both sources are configured, MMDB decides two-letter country codes; named tags still come from `geoip_dat_path`.
 - Tag matching is case-insensitive. `country_codes` should normally be a JSON string array, for example `["CN", "cloudflare"]`; a single or comma-separated string is also accepted for compatibility.
 
-Domain suffix and GeoSite matching are also case-insensitive. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
+Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` and `request_domain_suffix` compare whole labels: `example.com` matches `example.com` itself and every subdomain such as `www.example.com`, while `.example.com` matches subdomains only; neither matches `notexample.com`. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax.
 
 ### Response matchers
 
@@ -408,7 +410,7 @@ The supported modes are:
 - from_client_ip: derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6; private, loopback, and ULA addresses are not injected;
 - static: inject a configured IP and prefix.
 
-A pipeline-level ecs object changes the cache key so responses can be isolated by client subnet. It does not replace the Forward action's ECS rewrite setting. The engine warns when an action uses ECS without a pipeline-level ecs setting.
+A pipeline-level ecs object changes the cache key so responses can be isolated by client subnet. It does not replace the Forward action's ECS rewrite setting. The engine warns when an action uses ECS without a pipeline-level ecs setting; answers forwarded with ECS derived from the client are then cached per subnet the action sends.
 
 ## Configuration examples
 
@@ -539,7 +541,9 @@ A pipeline-level ecs object changes the cache key so responses can be isolated b
 
 The DNS response cache uses the upstream response's minimum TTL, raised to min_ttl when configured, and is capped by cache_max_ttl and cache_capacity. Negative responses use the SOA negative-cache TTL when an SOA is present. Identical in-flight cache misses share one upstream operation.
 
-When cache_background_refresh is enabled, entries near expiry can trigger an asynchronous refresh. A failed refresh leaves the existing entry in place. When serve_stale is enabled, an expired entry can be returned with serve_stale_ttl, subject to serve_stale_expire_ttl and serve_stale_client_timeout_ms. That client wait is additionally bounded by the remaining request_timeout_ms budget, so a wait configured longer than the request budget cannot push the stale answer past the deadline.
+When a pipeline's answer can depend on who is asking, the response cache, the in-flight deduplication, and the rule cache keep requesters apart by how its rules judge them, not by address: whether the client address is in each client_ip network, whether it is private (geoip_private), whether its GeoIP country or tag matches (geoip_country), whether the query carries EDNS (edns_present, response_edns_present), and which subnet a forward sends when it derives ECS from the client more finely than the pipeline's own ecs setting. Requesters judged alike share entries. The rules along the response-jump paths that a pipeline's answer checks start count too, because a request runs them before it answers. Such a path forwards the packet that the forward before the jump prepared, ECS included, so its entries are kept apart from those of requests that enter the pipeline directly. The rule cache holds the decisions of a pipeline's own rules and so judges by that pipeline's request matchers only; with cache_background_refresh on it also keys by client address, as before. A pipeline whose rules judge no requester facts shares entries between all clients as before. An ECS option that a client sends itself is passed upstream as it is and is not part of any key. A background refresh replays the request from the same client address, and with EDNS when the request carried it, so pipeline selection and request rules read the same address and EDNS presence as for that request.
+
+When cache_background_refresh is enabled, entries near expiry can trigger an asynchronous refresh. A refresh runs the rules as a client query does, response rules and their actions included. When the upstream answers, an answer the rules accept replaces the entry, and when the rules end in an answer that is not cached under it (a static answer that is not cached, or an answer reached through a jump), the entry is removed so the next client query runs the rules itself. When the upstream fails or the rules find no answer, the entry stays unless what the rules produce is cached under it. When serve_stale is enabled, an expired entry can be returned with serve_stale_ttl, subject to serve_stale_expire_ttl and serve_stale_client_timeout_ms. That client wait is additionally bounded by the remaining request_timeout_ms budget, so a wait configured longer than the request budget cannot push the stale answer past the deadline.
 
 The main configuration watcher reloads a valid JSON file using per-pipeline cache namespaces. A changed pipeline immediately stops addressing response-cache, rule-cache, and in-flight entries created by its previous configuration; an unchanged pipeline keeps its warm caches. A change to global settings rotates every pipeline namespace. Old namespace entries are not synchronously deleted and remain bounded by the existing cache capacity and TTL policies. Each request, including background refresh and response-phase jumps, keeps the configuration snapshot that selected its namespace, so work started before a reload cannot write into the active generation. Invalid reloads leave the previous configuration active.
 

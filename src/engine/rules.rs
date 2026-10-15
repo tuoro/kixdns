@@ -22,14 +22,15 @@ use crate::engine::response::{
 };
 use crate::engine::types::EngineInner;
 use crate::engine::types::InflightMap;
-use crate::engine::upstream::UpstreamFailure;
+use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
+use crate::matcher::{Requester, RequesterKey, RuntimePipeline};
 use crate::observe::{RuleEvaluated, RuleMatched, RulePhase};
 
-use super::observation::{Observed, response_decision_kind};
+use super::observation::{Observed, report_response_decision, response_decision_kind};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -69,6 +70,10 @@ pub struct ResponseContext {
     pub transport: Transport,
 }
 
+/// The `source` of the SERVFAIL that a response action's jump answers when no
+/// jumps are left / 响应动作的跳转没有剩余次数时给出的 SERVFAIL 的 `source`
+pub const JUMP_LIMIT: &str = "jump_limit";
+
 #[derive(Debug)]
 pub enum ResponseActionResult {
     Upstream {
@@ -96,8 +101,7 @@ pub fn calculate_rule_hash(
     qname: &str,
     qtype: RecordType,
     qclass: DNSClass,
-    client_ip: IpAddr,
-    uses_client_ip: bool,
+    requester: &RequesterKey,
 ) -> u64 {
     let mut hasher = FxHasher::default();
     cache_namespace.hash(&mut hasher);
@@ -105,10 +109,27 @@ pub fn calculate_rule_hash(
     qname.hash(&mut hasher);
     u16::from(qtype).hash(&mut hasher);
     u16::from(qclass).hash(&mut hasher);
-    if uses_client_ip {
-        client_ip.hash(&mut hasher);
-    }
+    requester.hash_into(&mut hasher);
     hasher.finish()
+}
+
+/// The requester's part of a rule cache key for `pipeline`: how its own request
+/// matchers judge the requester (see `RuntimePipeline::rule_requester`). With
+/// background refresh on, it also carries the client address, as the rule
+/// cache did before scopes existed.
+/// `pipeline` 的规则缓存键里属于请求方的部分：它自己的请求匹配器对请求方的判定（见
+/// `RuntimePipeline::rule_requester`）。开着后台刷新时还带上客户端地址，和引入范围
+/// 之前的规则缓存一样。
+pub fn rule_cache_requester(
+    pipeline: &RuntimePipeline,
+    background_refresh: bool,
+    requester: Requester,
+    geoip_manager: Option<&Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
+) -> RequesterKey {
+    RequesterKey {
+        address: background_refresh.then_some(requester.address),
+        ..pipeline.rule_requester.key(requester, geoip_manager)
+    }
 }
 
 #[derive(Clone)]
@@ -117,7 +138,9 @@ pub struct RuleCacheEntry {
     pub qname_hash: u64,
     pub qtype: u16,
     pub qclass: u16,
-    pub client_ip: Option<IpAddr>,
+    /// The requester the decision was made for, as far as the key separates it
+    /// 决策是为哪个请求方做的（以键区分到的程度为限）
+    pub requester: RequesterKey,
     pub decision: Arc<Decision>,
     /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
     pub expires_at: Option<Instant>,
@@ -145,20 +168,15 @@ impl RuleCacheEntry {
         qname: &str,
         qtype: RecordType,
         qclass: DNSClass,
-        client_ip: IpAddr,
+        requester: RequesterKey,
         decision: Decision,
-        uses_client_ip: bool,
     ) -> Self {
         Self {
             pipeline_id,
             qname_hash: fast_hash_str(qname),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
-            client_ip: if uses_client_ip {
-                Some(client_ip)
-            } else {
-                None
-            },
+            requester,
             decision: Arc::new(decision),
             expires_at: None,
         }
@@ -171,8 +189,7 @@ impl RuleCacheEntry {
         qname: &str,
         qtype: RecordType,
         qclass: DNSClass,
-        client_ip: IpAddr,
-        uses_client_ip: bool,
+        requester: &RequesterKey,
     ) -> bool {
         // Check expiration first / 首先检查过期
         if let Some(expires) = self.expires_at
@@ -185,13 +202,7 @@ impl RuleCacheEntry {
             return false;
         }
 
-        if uses_client_ip {
-            if self.client_ip != Some(client_ip) {
-                return false;
-            }
-        } else if self.client_ip.is_some() {
-            // Entry has IP but we don't care now?
-            // This case shouldn't happen if we use the same uses_client_ip for both hash and entry.
+        if self.requester != *requester {
             return false;
         }
 
@@ -221,8 +232,21 @@ pub fn fast_hash_str(s: &str) -> u64 {
 /// Helper function: Acquire GeoIP and GeoSite locks (with non-blocking fast path)
 ///
 /// 优化：消除重复的锁获取逻辑 / Optimization: Eliminate duplicate lock acquisition logic
+///
+/// 有争用时，先放掉已经拿到的那把，再按固定顺序阻塞读取：先 GeoSite、后 GeoIP，和 `select_pipeline`
+/// 一样。不这样做会卡死，原因有两个：
+/// - 再读一次已经持有的锁：parking_lot 的 `read()` 在有写者排队时要等那个写者，而写者在等这个线程
+///   放掉第一次读；
+/// - 拿着一把、按相反的顺序等另一把：两边的写者同时排队时，几方互相等待。
+///
+/// On contention, drop whichever lock was taken and block in one fixed order, GeoSite then GeoIP,
+/// as `select_pipeline` does. Otherwise it can deadlock in two ways:
+/// - reading a held lock again: parking_lot's `read()` waits behind a queued writer, which waits
+///   for this thread's first read;
+/// - holding one lock while waiting for the other in the opposite order: once writers queue on
+///   both, the parties wait on each other.
 #[inline]
-fn acquire_geo_locks<'a>(
+pub(crate) fn acquire_geo_locks<'a>(
     engine: &'a Engine,
 ) -> (
     Option<crate::lock::RwLockReadGuard<'a, crate::matcher::geoip::GeoIpManager>>,
@@ -237,8 +261,10 @@ fn acquire_geo_locks<'a>(
     // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
     if geoip_manager.is_none() || geosite_manager.is_none() {
         tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
-        geoip_manager = Some(engine.geoip_manager.read());
+        drop(geoip_manager.take());
+        drop(geosite_manager.take());
         geosite_manager = Some(engine.geosite_manager.read());
+        geoip_manager = Some(engine.geoip_manager.read());
     }
 
     (geoip_manager, geosite_manager)
@@ -278,9 +304,23 @@ pub(crate) async fn apply_response_actions(
 }
 
 /// [`apply_response_actions`] with the observer context of the request, so
-/// upstream attempts made by response-phase `forward` actions are reported.
-/// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报。
+/// upstream attempts made by response-phase `forward` actions are reported, and
+/// so is the decision the actions arrive at.
+/// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报，
+/// 动作最后作出的决定也一并上报。
 pub(crate) async fn apply_response_actions_observed(
+    ctx: ApplyResponseActionsContext<'_>,
+    observed: Observed<'_>,
+) -> anyhow::Result<ResponseActionResult> {
+    let (pipeline, rule) = (ctx.pipeline_id, ctx.rule_name);
+    let result = run_response_actions(ctx, observed).await?;
+    if let Some((observer, request)) = observed {
+        report_response_decision(observer, request, pipeline, rule, &result);
+    }
+    Ok(result)
+}
+
+async fn run_response_actions(
     mut ctx: ApplyResponseActionsContext<'_>,
     observed: Observed<'_>,
 ) -> anyhow::Result<ResponseActionResult> {
@@ -336,7 +376,7 @@ pub(crate) async fn apply_response_actions_observed(
                     return Ok(ResponseActionResult::Static {
                         bytes,
                         rcode: ResponseCode::ServFail,
-                        source: "response_action",
+                        source: JUMP_LIMIT,
                     });
                 }
                 return Ok(ResponseActionResult::Jump {
@@ -553,8 +593,19 @@ pub(crate) struct ResponseJumpContext<'a> {
     pub min_ttl: Duration,
     pub upstream_timeout: Duration,
     pub skip_cache: bool,
+    /// The ECS the packet carries, which the forward before the jump added, if any
+    /// 包里携带的 ECS，即跳转前那次转发加上的（如有）
+    pub carried_ecs: Option<crate::ecs::EcsKey>,
     /// Observer context of the request / 所属请求的观察者上下文
     pub observed: Observed<'a>,
+    /// In-flight entries the request already holds as it jumps: the one its
+    /// forward registered, and one a `continue` kept (see
+    /// `ForwardDecisionContext::held_inflight`). Nobody else answers them, so
+    /// the jump target never waits on them.
+    /// 请求跳转时已经握着的 in-flight 条目：这次转发登记的那条，以及 `continue` 留下的
+    /// 那条（见 `ForwardDecisionContext::held_inflight`）。没有别人会应答它们，所以跳转
+    /// 目标从不等它们。
+    pub held_inflight: [Option<u64>; 2],
 }
 
 pub(crate) async fn process_response_jump(
@@ -576,7 +627,9 @@ pub(crate) async fn process_response_jump(
         min_ttl,
         upstream_timeout,
         skip_cache,
+        carried_ecs,
         observed,
+        held_inflight,
     } = context;
     let cfg = &state.pipeline;
     struct InflightCleanupGuard {
@@ -611,19 +664,40 @@ pub(crate) async fn process_response_jump(
     let mut reused_response: Option<ResponseContext> = None;
     let mut inflight_hashes = Vec::new();
     let mut cleanup_guards: Vec<InflightCleanupGuard> = Vec::new();
+    // The request's own entries: the ones it held before the jump and the ones
+    // it registers on the way. Waiting on one waits on itself, since only this
+    // request answers it, and the query hangs until the client gives up; it
+    // forwards by itself instead, as `handle_forward_decision` does with a held
+    // entry. Other requests' entries are still joined.
+    // 请求自己的条目：跳转前握着的，和一路上登记的。等它就是等自己（只有这个请求
+    // 会应答它），查询会一直挂到客户端放弃；改为自己转发，和 `handle_forward_decision`
+    // 对握着的条目的做法一样。别的请求的条目照旧合并等待。
+    let holds = |inflight_hashes: &[u64], hash: u64| {
+        inflight_hashes.contains(&hash) || held_inflight.contains(&Some(hash))
+    };
+    // Whether this pass enters a pipeline (by the jump that led here, or a
+    // later one) rather than resuming the same pipeline after a `continue`:
+    // only entering reports `pipeline_selected` and counts against the jump
+    // limit.
+    // 这一轮是不是进入一个 pipeline（经由引来的跳转或之后的跳转），而不是
+    // `continue` 后在同一 pipeline 继续：只有进入才上报 `pipeline_selected`，
+    // 也只有进入才受跳转上限约束。
+    let mut entering = true;
+    let join_wait = crate::engine::upstream::hedge_timeout(upstream_timeout);
 
     loop {
         response.pipeline = Some(pipeline_id.clone());
         response.upstream = None;
-        if remaining_jumps == 0 {
-            let resp_bytes = engine_helpers::build_servfail_response(req)?;
-            for g in &mut cleanup_guards {
-                g.defuse();
-            }
-            for h in &inflight_hashes {
-                engine.notify_inflight_waiters(*h, &resp_bytes).await;
-            }
-            return Ok(resp_bytes);
+        // The limit counts jumps: a `continue` resuming the same pipeline is not one.
+        // How many jumps a request has left here depends on the way it came along
+        // the jump path, which no key carries: the waiters on its entries may have
+        // jumps to spare. Returning drops the guards, which removes the entries,
+        // and the waiters forward themselves.
+        // 上限数的是跳转：`continue` 在同一 pipeline 继续不算一次。请求在这里还能跳几次
+        // 取决于它沿跳转路径怎么来的，键里没有这一项：等在它条目上的请求可能还有余量。
+        // 返回时守卫被丢弃，条目随之移除，等待者自己转发。
+        if entering && remaining_jumps == 0 {
+            return engine_helpers::build_servfail_response(req);
         }
 
         let Some(pipeline) = cfg
@@ -640,9 +714,10 @@ pub(crate) async fn process_response_jump(
             }
             return Ok(resp_bytes);
         };
-        if let Some((observer, ctx)) = observed {
+        if entering && let Some((observer, ctx)) = observed {
             observer.pipeline_selected(ctx, &pipeline.id);
         }
+        entering = true;
 
         let mut ecs_key = pipeline
             .ecs
@@ -673,14 +748,8 @@ pub(crate) async fn process_response_jump(
         loop {
             if let Decision::Jump { pipeline } = decision {
                 if local_jumps == 0 {
-                    let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                    for g in &mut cleanup_guards {
-                        g.defuse();
-                    }
-                    for h in &inflight_hashes {
-                        engine.notify_inflight_waiters(*h, &resp_bytes).await;
-                    }
-                    return Ok(resp_bytes);
+                    // See the jump limit above / 同上面的跳转上限
+                    return engine_helpers::build_servfail_response(req);
                 }
                 pipeline_id = pipeline;
                 response.pipeline = Some(pipeline_id.clone());
@@ -735,6 +804,15 @@ pub(crate) async fn process_response_jump(
             qtype,
             qclass,
             ecs_key.as_ref(),
+            &cfg.requester_key(
+                &pipeline_id,
+                Requester {
+                    address: peer.ip(),
+                    edns: edns_present,
+                },
+                Some(&engine.geoip_manager),
+            )
+            .on_response_jump_path(carried_ecs.as_ref()),
         );
 
         match decision {
@@ -799,6 +877,9 @@ pub(crate) async fn process_response_jump(
                                     inflight_hashes.push(dedupe_hash);
                                     None
                                 }
+                                // This request's own entry: forward instead (see `holds`)
+                                // 这个请求自己的条目：改为自己转发（见 `holds`）
+                                Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
                                 Entry::Occupied(entry) => {
                                     // Another request in progress, subscribe to its result
                                     // 已有请求在进行,订阅其结果
@@ -808,40 +889,48 @@ pub(crate) async fn process_response_jump(
                             };
 
                             if let Some(mut rx) = rx {
-                                // watch channel uses changed() to wait for updates
-                                // watch channel 使用 changed() 等待更新
-                                match rx.changed().await {
-                                    Ok(_) => {
-                                        // Clone result to avoid holding RwLockReadGuard across await
-                                        // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
-                                        let result = rx.borrow().clone();
-                                        match &result {
-                                            Ok(bytes) => {
-                                                // Rewrite Transaction ID for followers using BytesMut
-                                                let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                                if resp_mut.len() >= 2 {
-                                                    let id_bytes = req.metadata.id.to_be_bytes();
-                                                    resp_mut[0] = id_bytes[0];
-                                                    resp_mut[1] = id_bytes[1];
-                                                }
-                                                let resp_bytes = resp_mut.freeze();
-
-                                                for g in &mut cleanup_guards {
-                                                    g.defuse();
-                                                }
-                                                for h in &inflight_hashes {
-                                                    engine.notify_inflight_waiters(*h, bytes).await;
-                                                }
-                                                response.upstream = Some(Arc::from("inflight"));
-                                                return Ok(resp_bytes);
-                                            }
-                                            Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                                        }
+                                // The request holds entries of its own on the jump path, so the one it
+                                // waits on may in turn be waiting on it (two requests that jumped into
+                                // each other's pipeline). Wait only until an upstream should have
+                                // answered (see `hedge_timeout`), then forward by itself.
+                                // 跳转路上的请求自己握着条目，它等的那一个可能反过来也在等它（两个请求互相
+                                // 跳进了对方的 pipeline）。只等到上游应当已经应答的时间点（见
+                                // `hedge_timeout`），之后自己转发。
+                                if let Ok(Ok(())) =
+                                    tokio::time::timeout(join_wait, rx.changed()).await
+                                {
+                                    if let Some((observer, ctx)) = observed {
+                                        observer.inflight_joined(ctx);
                                     }
-                                    Err(_) => {
-                                        // sender dropped, fallthrough to attempt upstream
+                                    // Clone result to avoid holding RwLockReadGuard across await
+                                    // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                    let result = rx.borrow().clone();
+                                    match &result {
+                                        Ok(bytes) => {
+                                            // Rewrite Transaction ID for followers using BytesMut
+                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                            if resp_mut.len() >= 2 {
+                                                let id_bytes = req.metadata.id.to_be_bytes();
+                                                resp_mut[0] = id_bytes[0];
+                                                resp_mut[1] = id_bytes[1];
+                                            }
+                                            let resp_bytes = resp_mut.freeze();
+
+                                            for g in &mut cleanup_guards {
+                                                g.defuse();
+                                            }
+                                            for h in &inflight_hashes {
+                                                engine.notify_inflight_waiters(*h, bytes).await;
+                                            }
+                                            response.upstream = Some(Arc::from("inflight"));
+                                            return Ok(resp_bytes);
+                                        }
+                                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
                                     }
                                 }
+                                // Otherwise the sender dropped, or no answer came within the upstream
+                                // timeout: forward by itself
+                                // 否则发送端已丢弃，或上游超时内没等到应答：自己转发
                             }
                         }
                         crate::engine::upstream::forward_upstream(
@@ -878,6 +967,8 @@ pub(crate) async fn process_response_jump(
                                 inflight_hashes.push(dedupe_hash);
                                 None
                             }
+                            // See the same arm above / 同上
+                            Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
                             Entry::Occupied(entry) => {
                                 // Another request in progress, subscribe to its result
                                 // 已有请求在进行,订阅其结果
@@ -887,40 +978,41 @@ pub(crate) async fn process_response_jump(
                         };
 
                         if let Some(mut rx) = rx {
-                            // watch channel uses changed() to wait for updates
-                            // watch channel 使用 changed() 等待更新
-                            match rx.changed().await {
-                                Ok(_) => {
-                                    // Clone result to avoid holding RwLockReadGuard across await
-                                    // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
-                                    let result = rx.borrow().clone();
-                                    match &result {
-                                        Ok(bytes) => {
-                                            // Rewrite Transaction ID for followers using BytesMut
-                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                            if resp_mut.len() >= 2 {
-                                                let id_bytes = req.metadata.id.to_be_bytes();
-                                                resp_mut[0] = id_bytes[0];
-                                                resp_mut[1] = id_bytes[1];
-                                            }
-                                            let resp_bytes = resp_mut.freeze();
-
-                                            for g in &mut cleanup_guards {
-                                                g.defuse();
-                                            }
-                                            for h in &inflight_hashes {
-                                                engine.notify_inflight_waiters(*h, bytes).await;
-                                            }
-                                            response.upstream = Some(Arc::from("inflight"));
-                                            return Ok(resp_bytes);
-                                        }
-                                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                                    }
+                            // See the same wait above / 同上
+                            if let Ok(Ok(())) = tokio::time::timeout(join_wait, rx.changed()).await
+                            {
+                                if let Some((observer, ctx)) = observed {
+                                    observer.inflight_joined(ctx);
                                 }
-                                Err(_) => {
-                                    // sender dropped, fallthrough to attempt upstream
+                                // Clone result to avoid holding RwLockReadGuard across await
+                                // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
+                                let result = rx.borrow().clone();
+                                match &result {
+                                    Ok(bytes) => {
+                                        // Rewrite Transaction ID for followers using BytesMut
+                                        let mut resp_mut = BytesMut::from(bytes.as_ref());
+                                        if resp_mut.len() >= 2 {
+                                            let id_bytes = req.metadata.id.to_be_bytes();
+                                            resp_mut[0] = id_bytes[0];
+                                            resp_mut[1] = id_bytes[1];
+                                        }
+                                        let resp_bytes = resp_mut.freeze();
+
+                                        for g in &mut cleanup_guards {
+                                            g.defuse();
+                                        }
+                                        for h in &inflight_hashes {
+                                            engine.notify_inflight_waiters(*h, bytes).await;
+                                        }
+                                        response.upstream = Some(Arc::from("inflight"));
+                                        return Ok(resp_bytes);
+                                    }
+                                    Err(e) => return Err(anyhow::anyhow!("{}", e)),
                                 }
                             }
+                            // Otherwise the sender dropped, or no answer came within the upstream
+                            // timeout: forward by itself
+                            // 否则发送端已丢弃，或上游超时内没等到应答：自己转发
                         }
                     }
                     crate::engine::upstream::forward_upstream(
@@ -934,6 +1026,10 @@ pub(crate) async fn process_response_jump(
                     )
                     .await
                 };
+                // As in handle_forward_decision_logged / 同 handle_forward_decision_logged
+                let resp = resp.and_then(|reply| {
+                    reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply)
+                });
 
                 match resp {
                     Ok((raw, actual_upstream)) => {
@@ -955,18 +1051,7 @@ pub(crate) async fn process_response_jump(
                         // 尝试非阻塞获取读锁（并发读的快速路径）
                         // 使用作用域确保锁在使用后立即释放
                         let resp_match_ok = {
-                            let mut geoip_manager = engine.geoip_manager.try_read();
-                            let mut geosite_manager = engine.geosite_manager.try_read();
-
-                            // Fallback to blocking read if try_read fails (rare write operation in progress)
-                            // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
-                            if geoip_manager.is_none() || geosite_manager.is_none() {
-                                tracing::debug!(
-                                    "GeoIP/GeoSite lock contention, falling back to blocking read"
-                                );
-                                geoip_manager = Some(engine.geoip_manager.read());
-                                geosite_manager = Some(engine.geosite_manager.read());
-                            }
+                            let (geoip_manager, geosite_manager) = acquire_geo_locks(engine);
 
                             let geoip_manager_ref = geoip_manager.as_deref();
                             let geosite_manager_ref = geosite_manager.as_deref();
@@ -1085,6 +1170,8 @@ pub(crate) async fn process_response_jump(
 
                         match action_result {
                             ResponseActionResult::Upstream { ctx, resp_match } => {
+                                // The reply to a response action's forward / 响应动作转发拿到的应答
+                                reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
                                 // Extract TTL for cache entry (use min for RFC 1035 compliance)
                                 // 提取 TTL 用于缓存条目 (使用最小值符合 RFC 1035)
                                 let ttl_secs_cache = extract_ttl(&ctx.msg);
@@ -1120,7 +1207,12 @@ pub(crate) async fn process_response_jump(
                                 response.upstream = Some(ctx.upstream);
                                 return Ok(ctx.raw);
                             }
-                            ResponseActionResult::Static { bytes, .. } => {
+                            ResponseActionResult::Static { bytes, source, .. } => {
+                                // A jump limit reached here is this request's own (see
+                                // the jump limit above) / 在这里到达的跳转上限只属于本请求（见上）
+                                if source == JUMP_LIMIT {
+                                    return Ok(bytes);
+                                }
                                 for g in &mut cleanup_guards {
                                     g.defuse();
                                 }
@@ -1136,34 +1228,38 @@ pub(crate) async fn process_response_jump(
                             } => {
                                 pipeline_id = pipeline;
                                 remaining_jumps = next_remaining;
+                                // Rules passed by a continue belong to the pipeline
+                                // being left; the target starts from its first rule,
+                                // as on a rule-level jump.
+                                // continue 越过的规则属于要离开的 pipeline；与规则阶段的
+                                // 跳转一样，目标从第一条规则开始。
+                                skip_rules.clear();
                                 continue;
                             }
                             ResponseActionResult::Continue { ctx } => {
-                                // Same inflight hazard as phases.rs: keep the
-                                // entry notified and removed so the next rule's
-                                // Forward (same dedupe_hash) does not hang on an
-                                // Occupied entry. Here the guards live across the
-                                // loop, so remove the entries explicitly.
-                                // 与 phases.rs 相同的 inflight 风险：通知并移除条目，
-                                // 避免下一条规则的 Forward（相同 dedupe_hash）卡在
-                                // Occupied 条目上。此处的守卫跨循环存活，因此显式移除。
-                                if let Some(ctx_ref) = ctx.as_ref() {
-                                    for h in &inflight_hashes {
-                                        engine.notify_inflight_waiters(*h, &ctx_ref.raw).await;
-                                    }
-                                    for g in &mut cleanup_guards {
-                                        g.defuse();
-                                    }
-                                    inflight_hashes.clear();
-                                }
+                                // The rule continued past this answer, so it is not one
+                                // to hand over: drop the guards, which removes the
+                                // entries without it, and their waiters forward
+                                // themselves. The next rule's Forward (same
+                                // dedupe_hash) then finds no entry of this request's to
+                                // wait on.
+                                // 规则越过了这个应答，它不该交给别人：丢弃守卫，条目随之
+                                // 移除而不交出它，等待者自己转发。下一条规则的 Forward
+                                // （相同 dedupe_hash）也就不会等在本请求自己的条目上。
+                                cleanup_guards.clear();
+                                inflight_hashes.clear();
                                 reused_response = ctx;
                                 skip_rules.insert(rule_name.clone());
+                                entering = false;
                                 continue;
                             }
                         }
                     }
                     Err(err) => {
-                        if err.downcast_ref::<UpstreamFailure>().is_none() {
+                        // A background refresh answers no client, so it gets the failure
+                        // itself (see handle_forward_decision_logged).
+                        // 后台刷新没有要应答的客户端，失败原样交回（同 handle_forward_decision_logged）。
+                        if skip_cache || err.downcast_ref::<UpstreamFailure>().is_none() {
                             return Err(err);
                         }
                         let resp_bytes = engine_helpers::build_servfail_response(req)?;
@@ -1187,6 +1283,241 @@ pub(crate) async fn process_response_jump(
                     return Ok(resp_bytes);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_jump_tests {
+    use crate::engine::core::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::serialize::binary::BinDecodable;
+    use std::net::Ipv4Addr;
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    /// Local UDP upstream that answers every query with one A record.
+    /// 本机 UDP 上游：每个查询都回一条 A 记录。
+    async fn spawn_answering_upstream() -> String {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let Some(question) = query.queries.first().cloned() else {
+                    continue;
+                };
+                let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+                resp.add_query(question.clone());
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
+                ));
+                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_response_jump_starts_the_target_pipeline_from_its_first_rule() {
+        let upstream = spawn_answering_upstream().await;
+        let any = serde_json::json!([{ "type": "any" }]);
+        let forward = serde_json::json!([{ "type": "forward", "upstream": upstream }]);
+        let jump_to =
+            |target: &str| serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": target }]);
+        let answer = |ip: &str| serde_json::json!([{ "type": "static_ip_response", "ip": ip }]);
+        // "middle" continues past its rule "first", then jumps from the
+        // response phase into "last", which has a rule of the same name.
+        // "middle" 越过自己的 "first" 规则后，在响应阶段跳到 "last"，
+        // 而 "last" 里也有一条同名的规则。
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": upstream, "min_ttl": 60 },
+            "pipelines": [
+                { "id": "entry", "rules": [
+                    { "name": "hop", "matchers": any, "actions": forward,
+                      "response_actions_on_match": jump_to("middle") }
+                ]},
+                { "id": "middle", "rules": [
+                    { "name": "first", "matchers": any, "actions": forward,
+                      "response_actions_on_match": [{ "type": "continue" }] },
+                    { "name": "second", "matchers": any, "actions": forward,
+                      "response_actions_on_match": jump_to("last") }
+                ]},
+                { "id": "last", "rules": [
+                    { "name": "first", "matchers": any, "actions": answer("192.0.2.5") },
+                    { "name": "fallback", "matchers": any, "actions": answer("192.0.2.9") }
+                ]}
+            ]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
+
+        let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(
+                &request.to_vec().unwrap(),
+                "127.0.0.1:53000".parse().unwrap(),
+            ),
+        )
+        .await
+        .expect("request finishes")
+        .expect("request succeeds");
+
+        let reply = Message::from_bytes(&bytes).expect("parse reply");
+        let answers: Vec<_> = reply
+            .answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, [Ipv4Addr::new(192, 0, 2, 5)]);
+    }
+}
+
+#[cfg(test)]
+mod geo_lock_tests {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use super::acquire_geo_locks;
+    use crate::engine::Engine;
+    use crate::matcher::RuntimePipelineConfig;
+
+    fn engine() -> Engine {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine")
+    }
+
+    /// GeoIP is being written, so the reader gets only GeoSite and waits for GeoIP.
+    /// Meanwhile a GeoSite writer queues behind the reader's read. Reading GeoSite a
+    /// second time would wait behind that writer, which waits for the reader: a deadlock.
+    /// GeoIP 正在写入，读者只拿到 GeoSite，然后等 GeoIP；这时一个 GeoSite 写者排在它的读锁
+    /// 后面。再读一次 GeoSite 就要等那个写者，而写者在等读者，两边卡死。
+    #[tokio::test]
+    async fn waiting_for_one_geo_lock_never_reads_the_other_again() {
+        let engine = engine();
+        let geoip = engine.geoip_manager.clone();
+        let geosite = engine.geosite_manager.clone();
+
+        let geoip_write = geoip.write();
+        let (done, finished) = mpsc::channel();
+        let reader_engine = engine.clone();
+        let reader = std::thread::spawn(move || {
+            let (geoip_read, geosite_read) = acquire_geo_locks(&reader_engine);
+            let both = geoip_read.is_some() && geosite_read.is_some();
+            drop((geoip_read, geosite_read));
+            let _ = done.send(both);
+        });
+
+        // The reader holds GeoSite once its try_read succeeded; it then waits for GeoIP.
+        // 读者的 try_read 拿到 GeoSite 后就一直持有，接着等 GeoIP。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !geosite.is_locked() {
+            assert!(Instant::now() < deadline, "the reader never took GeoSite");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let queued = geosite.clone();
+        let writer = std::thread::spawn(move || drop(queued.write()));
+        // Give the writer time to queue behind the reader's read.
+        // 给写者时间排到读者的读锁后面。
+        std::thread::sleep(Duration::from_millis(200));
+
+        drop(geoip_write);
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the reader must get both locks without reading GeoSite twice"
+        );
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }
+
+    /// Another reader, like `select_pipeline`, holds GeoSite and goes on to read GeoIP. A GeoSite
+    /// writer queues behind it, so the helper gets GeoIP but not GeoSite. Had the helper kept
+    /// GeoIP and waited for GeoSite, a GeoIP writer queued behind it would stop the other
+    /// reader's GeoIP read, and the four would wait on each other.
+    /// 另一个读者像 `select_pipeline` 那样拿着 GeoSite、接着读 GeoIP；一个 GeoSite 写者排在它后面，
+    /// 于是辅助函数拿到 GeoIP、拿不到 GeoSite。要是它拿着 GeoIP 等 GeoSite，排在它后面的 GeoIP 写者
+    /// 会挡住另一个读者读 GeoIP，四方互相等待。
+    #[tokio::test]
+    async fn the_fallback_takes_geosite_before_geoip_as_select_pipeline_does() {
+        let engine = engine();
+        let geoip = engine.geoip_manager.clone();
+        let geosite = engine.geosite_manager.clone();
+        let pause = || std::thread::sleep(Duration::from_millis(200));
+
+        let (go, wait_for_go) = mpsc::channel::<()>();
+        let (holding, held) = mpsc::channel::<()>();
+        let (other_done, other_finished) = mpsc::channel::<()>();
+        let (other_geosite, other_geoip) = (geosite.clone(), geoip.clone());
+        let other = std::thread::spawn(move || {
+            let geosite_read = other_geosite.read();
+            holding.send(()).unwrap();
+            wait_for_go.recv().unwrap();
+            let geoip_read = other_geoip.read();
+            drop((geoip_read, geosite_read));
+            let _ = other_done.send(());
+        });
+        held.recv().unwrap();
+
+        let queued_geosite = geosite.clone();
+        let geosite_writer = std::thread::spawn(move || drop(queued_geosite.write()));
+        pause();
+
+        let (done, finished) = mpsc::channel();
+        let reader_engine = engine.clone();
+        let reader = std::thread::spawn(move || {
+            let (geoip_read, geosite_read) = acquire_geo_locks(&reader_engine);
+            let both = geoip_read.is_some() && geosite_read.is_some();
+            drop((geoip_read, geosite_read));
+            let _ = done.send(both);
+        });
+        pause();
+
+        let queued_geoip = geoip.clone();
+        let geoip_writer = std::thread::spawn(move || drop(queued_geoip.write()));
+        pause();
+        go.send(()).unwrap();
+
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the helper must wait for GeoSite holding nothing, then take GeoIP"
+        );
+        assert!(
+            other_finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the other reader must get GeoIP"
+        );
+        for thread in [other, geosite_writer, reader, geoip_writer] {
+            thread.join().unwrap();
         }
     }
 }
