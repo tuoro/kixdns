@@ -242,10 +242,14 @@ pub struct GlobalSettings {
     /// UDP 失败时是否自动 fallback 到 TCP（默认 true）。 / UDP failure automatically fallbacks to TCP (default true)
     #[serde(default = "default_enable_tcp_fallback")]
     pub enable_tcp_fallback: bool,
-    /// 是否记录面板查询排行（默认 false）。/ Enable bounded query rankings for the panel (default false).
+    /// 已不起作用：开了控制通道，面板的查询排行就一直在统计。留着字段，旧配置照样能读。
+    /// No longer has any effect: with the control socket open, the panel's query
+    /// rankings are always collected. The field stays so older configs still load.
     #[serde(default)]
     pub statistics_enabled: bool,
-    /// 是否将客户端 IP 截断为网段后再统计（默认 false）。/ Truncate client IPs to a subnet in statistics (default false).
+    /// 已不起作用：排行记完整的客户端地址。留着字段，旧配置照样能读。
+    /// No longer has any effect: rankings record whole client addresses. The field
+    /// stays so older configs still load.
     #[serde(default)]
     pub statistics_anonymize_client_ip: bool,
 }

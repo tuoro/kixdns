@@ -5,7 +5,7 @@
 `main` 是上游加上两类提交：
 
 - **修复**：按给上游提 PR 的标准做，提给上游时从上游的 main 另切分支，原样提交。
-- **只给面板用的**：配置里的统计开关、控制接口和指标（`src/panel.rs`、`src/panel_trace.rs`）、这个目录和发布流程。这些不提给上游，提交标题以 `panel:` 或 `ci:` 开头。
+- **只给面板用的**：查询排行、控制接口和指标（`src/panel.rs`、`src/panel_trace.rs`）、这个目录和发布流程。这些不提给上游，提交标题以 `panel:` 或 `ci:` 开头。
 
 每个改动都先开 PR 到 `main`，检查和构建通过后用合并提交合进去。上游有新提交时，开 PR 把上游合进 `main`。
 
@@ -42,4 +42,4 @@
 
 ## English summary
 
-`main` is upstream plus fixes (held to upstream-PR standards and sent upstream from branches cut from upstream's main) plus panel-only code: the statistics settings, the control socket and metrics, this directory and the release workflow. Every push to `main` is checked, built for x86_64 and arm64 (Ubuntu 22.04, GLIBC ≤ 2.35) and released under a date version in Beijing time (`2026.10.13`, then `2026.10.13.2` the same day), with one zip per architecture and a `manifest.json`. Only the tip of `main` is released, each commit once; a released binary reports `release_version` and `release_commit` in health. A daily run audits the dependencies.
+`main` is upstream plus fixes (held to upstream-PR standards and sent upstream from branches cut from upstream's main) plus panel-only code: the query rankings, the control socket and metrics, this directory and the release workflow. Every push to `main` is checked, built for x86_64 and arm64 (Ubuntu 22.04, GLIBC ≤ 2.35) and released under a date version in Beijing time (`2026.10.13`, then `2026.10.13.2` the same day), with one zip per architecture and a `manifest.json`. Only the tip of `main` is released, each commit once; a released binary reports `release_version` and `release_commit` in health. A daily run audits the dependencies.

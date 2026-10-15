@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -54,9 +54,6 @@ const QUERY_STATS_BUCKETS: usize = 24;
 const QUERY_STATS_SHARDS: usize = 16;
 const QUERY_STATS_DOMAIN_CAP: usize = 4_096;
 const QUERY_STATS_CLIENT_CAP: usize = 1_024;
-const QUERY_STATS_CONFIGURED: u8 = 0b100;
-const QUERY_STATS_ENABLED: u8 = 0b001;
-const QUERY_STATS_ANONYMIZED: u8 = 0b010;
 
 #[derive(Clone, Default)]
 struct ActiveConfig {
@@ -67,54 +64,6 @@ struct ActiveConfig {
     last_reload_error: Option<String>,
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-enum ClientKey {
-    V4(u32, bool),
-    V6(u64, u64, bool),
-}
-
-impl ClientKey {
-    fn new(address: IpAddr, anonymized: bool) -> Self {
-        match address {
-            IpAddr::V4(address) => {
-                let mut value = u32::from(address);
-                if anonymized {
-                    value &= u32::MAX << 8;
-                }
-                Self::V4(value, anonymized)
-            }
-            IpAddr::V6(address) => {
-                let value = u128::from(address);
-                let high = (value >> 64) as u64;
-                let low = if anonymized { 0 } else { value as u64 };
-                Self::V6(high, low, anonymized)
-            }
-        }
-    }
-
-    #[cfg_attr(not(unix), allow(dead_code))]
-    fn label(self) -> String {
-        match self {
-            Self::V4(value, anonymized) => {
-                let address = Ipv4Addr::from(value).to_string();
-                if anonymized {
-                    format!("{address}/24")
-                } else {
-                    address
-                }
-            }
-            Self::V6(high, low, anonymized) => {
-                let address = Ipv6Addr::from(((high as u128) << 64) | low as u128).to_string();
-                if anonymized {
-                    format!("{address}/64")
-                } else {
-                    address
-                }
-            }
-        }
-    }
-}
-
 struct QueryStatsBucket {
     epoch: AtomicU64,
     requests: AtomicU64,
@@ -123,7 +72,7 @@ struct QueryStatsBucket {
     client_entries: AtomicUsize,
     rotate_lock: Mutex<()>,
     domains: DashMap<Arc<str>, AtomicU64>,
-    clients: DashMap<ClientKey, AtomicU64>,
+    clients: DashMap<IpAddr, AtomicU64>,
 }
 
 impl QueryStatsBucket {
@@ -159,6 +108,7 @@ impl QueryStatsBucket {
         true
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn clear(&self) {
         let _guard = self.rotate_lock.lock();
         self.domains.clear();
@@ -178,6 +128,12 @@ impl QueryStatsBucket {
             }
             TryResult::Locked => return false,
             TryResult::Absent => {}
+        }
+        // 满了就不再为新名字分配、抢写锁：随机子域名一多，这条路每个查询都会走
+        // Full: no allocation or write lock for a new name, a path every query takes
+        // once random subdomains pour in
+        if self.domain_entries.load(Ordering::Relaxed) >= QUERY_STATS_DOMAIN_CAP {
+            return false;
         }
         let Some(entry) = self.domains.try_entry(Arc::from(domain)) else {
             return false;
@@ -199,7 +155,7 @@ impl QueryStatsBucket {
         }
     }
 
-    fn record_client(&self, client: ClientKey) -> bool {
+    fn record_client(&self, client: IpAddr) -> bool {
         match self.clients.try_get(&client) {
             TryResult::Present(counter) => {
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -207,6 +163,9 @@ impl QueryStatsBucket {
             }
             TryResult::Locked => return false,
             TryResult::Absent => {}
+        }
+        if self.client_entries.load(Ordering::Relaxed) >= QUERY_STATS_CLIENT_CAP {
+            return false;
         }
         let Some(entry) = self.clients.try_entry(client) else {
             return false;
@@ -229,17 +188,18 @@ impl QueryStatsBucket {
     }
 }
 
+/// 查询排行：开了控制通道就一直统计，客户端地址照原样记。配置里的 `statistics_enabled` 和
+/// `statistics_anonymize_client_ip` 还能读，但不再起作用。
+/// Query rankings: always collected while the control socket is open, with client
+/// addresses as they are. The config's `statistics_enabled` and
+/// `statistics_anonymize_client_ip` still load but no longer do anything.
 struct QueryStats {
-    settings: AtomicU8,
-    settings_lock: Mutex<()>,
     buckets: Box<[QueryStatsBucket]>,
 }
 
 impl Default for QueryStats {
     fn default() -> Self {
         Self {
-            settings: AtomicU8::new(0),
-            settings_lock: Mutex::new(()),
             buckets: (0..QUERY_STATS_BUCKETS)
                 .map(|_| QueryStatsBucket::new())
                 .collect(),
@@ -255,8 +215,6 @@ struct TopStat {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 struct QueryStatsSnapshot {
-    enabled: bool,
-    anonymized_clients: bool,
     requests_observed: u64,
     dropped_updates: u64,
     clients: Vec<TopStat>,
@@ -264,20 +222,7 @@ struct QueryStatsSnapshot {
 }
 
 impl QueryStats {
-    fn configure(&self, enabled: bool, anonymized: bool) {
-        let desired = QUERY_STATS_CONFIGURED
-            | (u8::from(enabled) * QUERY_STATS_ENABLED)
-            | (u8::from(anonymized) * QUERY_STATS_ANONYMIZED);
-        if self.settings.load(Ordering::Relaxed) == desired {
-            return;
-        }
-        let _guard = self.settings_lock.lock();
-        if self.settings.load(Ordering::Relaxed) != desired {
-            self.clear();
-            self.settings.store(desired, Ordering::Release);
-        }
-    }
-
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn clear(&self) {
         for bucket in &self.buckets {
             bucket.clear();
@@ -286,15 +231,10 @@ impl QueryStats {
 
     #[inline]
     fn record(&self, domain: &str, client: IpAddr) {
-        let settings = self.settings.load(Ordering::Acquire);
-        if settings & QUERY_STATS_ENABLED == 0 {
-            return;
-        }
-        let anonymized = settings & QUERY_STATS_ANONYMIZED != 0;
-        self.record_at(domain, client, anonymized, unix_timestamp());
+        self.record_at(domain, client, unix_timestamp());
     }
 
-    fn record_at(&self, domain: &str, client: IpAddr, anonymized: bool, now: u64) {
+    fn record_at(&self, domain: &str, client: IpAddr, now: u64) {
         let epoch = now - now % QUERY_STATS_BUCKET_SECONDS;
         let index = (epoch / QUERY_STATS_BUCKET_SECONDS) as usize % QUERY_STATS_BUCKETS;
         let bucket = &self.buckets[index];
@@ -303,7 +243,7 @@ impl QueryStats {
         }
         bucket.requests.fetch_add(1, Ordering::Relaxed);
         let domain_recorded = bucket.record_domain(domain);
-        let client_recorded = bucket.record_client(ClientKey::new(client, anonymized));
+        let client_recorded = bucket.record_client(client);
         if !domain_recorded || !client_recorded {
             bucket.dropped_updates.fetch_add(1, Ordering::Relaxed);
         }
@@ -311,25 +251,11 @@ impl QueryStats {
 
     #[cfg_attr(not(unix), allow(dead_code))]
     fn snapshot(&self, now: u64, window_seconds: u64, limit: usize) -> QueryStatsSnapshot {
-        let settings = self.settings.load(Ordering::Acquire);
-        let enabled = settings & QUERY_STATS_ENABLED != 0;
-        let anonymized_clients = settings & QUERY_STATS_ANONYMIZED != 0;
-        if !enabled {
-            return QueryStatsSnapshot {
-                enabled,
-                anonymized_clients,
-                requests_observed: 0,
-                dropped_updates: 0,
-                clients: Vec::new(),
-                domains: Vec::new(),
-            };
-        }
-
         let oldest = now.saturating_sub(window_seconds);
         let mut requests_observed = 0u64;
         let mut dropped_updates = 0u64;
         let mut domains = HashMap::<Arc<str>, u64>::new();
-        let mut clients = HashMap::<ClientKey, u64>::new();
+        let mut clients = HashMap::<IpAddr, u64>::new();
         for bucket in &self.buckets {
             let epoch = bucket.epoch.load(Ordering::Acquire);
             if epoch == 0
@@ -362,7 +288,7 @@ impl QueryStats {
         let mut clients = clients
             .into_iter()
             .map(|(client, count)| TopStat {
-                name: client.label(),
+                name: client.to_string(),
                 count,
             })
             .collect::<Vec<_>>();
@@ -370,8 +296,6 @@ impl QueryStats {
         sort_and_truncate(&mut clients, limit);
 
         QueryStatsSnapshot {
-            enabled,
-            anonymized_clients,
             requests_observed,
             dropped_updates,
             clients,
@@ -470,6 +394,10 @@ pub struct PanelMetrics {
     reload_sequence: AtomicU64,
     active_config: RwLock<ActiveConfig>,
     query_stats: QueryStats,
+    /// 排行只能经控制通道读到；没开控制通道时没人读，就不统计（见 `without_rankings`）
+    /// Rankings can only be read over the control socket; without one nobody reads
+    /// them, so none are collected (see `without_rankings`)
+    collect_rankings: bool,
     /// 面板观察者独占了引擎唯一的观察者槽位，所以 `--debug` 的参考观察者只能挂在这里转发；
     /// 否则增强版的 `--debug` 永远看不到 `kixdns::observe` 事件。
     /// The panel observer owns the engine's single observer slot, so the `--debug`
@@ -513,6 +441,7 @@ impl Default for PanelMetrics {
             reload_sequence: AtomicU64::new(0),
             active_config: RwLock::new(ActiveConfig::default()),
             query_stats: QueryStats::default(),
+            collect_rankings: true,
             debug_trace: None,
             query_log: QueryLog::default(),
         }
@@ -530,6 +459,16 @@ impl PanelMetrics {
         }
     }
 
+    /// 不统计查询排行：没开控制通道时用，统计了也没人读得到。
+    /// Collects no query rankings: for running without a control socket, where
+    /// nothing could read them.
+    pub fn without_rankings(self) -> Self {
+        Self {
+            collect_rankings: false,
+            ..self
+        }
+    }
+
     #[cfg_attr(not(unix), allow(dead_code))]
     #[inline]
     fn uptime_seconds(&self) -> u64 {
@@ -543,7 +482,9 @@ impl PanelMetrics {
 
     #[inline]
     fn record_query(&self, domain: &str, client: IpAddr) {
-        self.query_stats.record(domain, client);
+        if self.collect_rankings {
+            self.query_stats.record(domain, client);
+        }
     }
 
     #[inline]
@@ -676,14 +617,8 @@ impl PanelMetrics {
         self.reload_sequence.fetch_add(1, Ordering::Release);
     }
 
-    /// 从观察者收到的配置原文更新摘要与查询统计开关。/ Refresh digest and query-stats switches from the loaded source.
+    /// 从观察者收到的配置原文更新摘要。/ Refresh the digest from the loaded source.
     fn record_config_loaded(&self, source: &str) {
-        if let Ok(config) = crate::config::parse_config(source) {
-            self.query_stats.configure(
-                config.settings.statistics_enabled,
-                config.settings.statistics_anonymize_client_ip,
-            );
-        }
         let sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
         let initial = self.active_config.read().generation == 0;
         if initial {
@@ -742,11 +677,7 @@ impl PanelMetrics {
     }
 
     #[cfg(unix)]
-    fn stats_json(&self, engine: &Engine, window_seconds: u64, limit: usize) -> serde_json::Value {
-        let state = engine.state.load();
-        let enabled = state.pipeline.settings.statistics_enabled;
-        let anonymized = state.pipeline.settings.statistics_anonymize_client_ip;
-        self.query_stats.configure(enabled, anonymized);
+    fn stats_json(&self, window_seconds: u64, limit: usize) -> serde_json::Value {
         let now = unix_timestamp();
         let snapshot = self.query_stats.snapshot(now, window_seconds, limit);
         let clients = snapshot
@@ -759,10 +690,12 @@ impl PanelMetrics {
             .into_iter()
             .map(|row| json!({"name": row.name, "count": row.count}))
             .collect::<Vec<_>>();
+        // The two fields stay for panels that read them: on whenever the control socket is
+        // open, never anonymized / 这两个字段留给读它们的面板：开了控制通道就开着，从不脱敏
         json!({
             "protocol_version": PROTOCOL_VERSION,
-            "enabled": snapshot.enabled,
-            "anonymized_clients": snapshot.anonymized_clients,
+            "enabled": self.collect_rankings,
+            "anonymized_clients": false,
             "window_seconds": window_seconds,
             "retention_seconds": QUERY_STATS_BUCKET_SECONDS * QUERY_STATS_BUCKETS as u64,
             "generated_at_unix": now,
@@ -774,12 +707,7 @@ impl PanelMetrics {
     }
 
     #[cfg(unix)]
-    fn clear_stats(&self, engine: &Engine) {
-        let state = engine.state.load();
-        self.query_stats.configure(
-            state.pipeline.settings.statistics_enabled,
-            state.pipeline.settings.statistics_anonymize_client_ip,
-        );
+    fn clear_stats(&self) {
         self.query_stats.clear();
     }
 
@@ -1373,10 +1301,9 @@ async fn handle_request(
             metrics.render_prometheus(&engine),
         ),
         (&Method::GET, "/v1/stats/top") => match parse_stats_query(request.uri().query()) {
-            Ok((window_seconds, limit)) => json_response(
-                StatusCode::OK,
-                metrics.stats_json(&engine, window_seconds, limit),
-            ),
+            Ok((window_seconds, limit)) => {
+                json_response(StatusCode::OK, metrics.stats_json(window_seconds, limit))
+            }
             Err(message) => json_response(
                 StatusCode::BAD_REQUEST,
                 error_json("stats_query_invalid", message),
@@ -1394,7 +1321,7 @@ async fn handle_request(
             ),
         },
         (&Method::POST, "/v1/stats/clear") => {
-            metrics.clear_stats(&engine);
+            metrics.clear_stats();
             json_response(
                 StatusCode::OK,
                 json!({"protocol_version": PROTOCOL_VERSION, "cleared": true}),
@@ -2134,9 +2061,12 @@ fn unix_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr};
 
-    use super::{MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_DOMAIN_CAP, QueryStats};
+    use super::{
+        MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_CLIENT_CAP, QUERY_STATS_DOMAIN_CAP,
+        QueryStats,
+    };
 
     #[derive(Clone, Default)]
     struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -2537,7 +2467,6 @@ mod tests {
         );
         let now = super::unix_timestamp();
         let snapshot = metrics.query_stats.snapshot(now, 3_600, 20);
-        assert!(snapshot.enabled);
         assert_eq!(snapshot.requests_observed, 1);
         assert_eq!(snapshot.domains[0].name, "example.com");
 
@@ -2554,7 +2483,15 @@ mod tests {
         assert_eq!(active.generation, 2);
         assert_eq!(metrics.reload_failure.load(super::Ordering::Relaxed), 1);
         assert_eq!(metrics.reload_success.load(super::Ordering::Relaxed), 1);
-        assert!(!metrics.query_stats.snapshot(now, 3_600, 20).enabled);
+        // A reload leaves the rankings alone, whatever the config says about them
+        // 重载不动排行，不管配置里怎么写
+        assert_eq!(
+            metrics
+                .query_stats
+                .snapshot(now, 3_600, 20)
+                .requests_observed,
+            1
+        );
     }
 
     #[test]
@@ -2752,52 +2689,118 @@ mod tests {
     }
 
     #[test]
-    fn ranks_domains_and_clients_with_anonymization() {
+    fn ranks_domains_and_clients_by_their_full_address() {
         let stats = QueryStats::default();
-        stats.configure(true, true);
         let now = 100 * super::QUERY_STATS_BUCKET_SECONDS + 120;
         for _ in 0..3 {
-            stats.record_at("example.com", "192.168.1.42".parse().unwrap(), true, now);
+            stats.record_at("example.com", "192.168.1.42".parse().unwrap(), now);
         }
-        stats.record_at("other.test", "192.168.2.9".parse().unwrap(), true, now);
+        stats.record_at("other.test", "192.168.1.9".parse().unwrap(), now);
+        stats.record_at("other.test", "2001:db8::1".parse().unwrap(), now);
 
         let snapshot = stats.snapshot(now, 3_600, 20);
-        assert!(snapshot.enabled);
-        assert!(snapshot.anonymized_clients);
-        assert_eq!(snapshot.requests_observed, 4);
+        assert_eq!(snapshot.requests_observed, 5);
         assert_eq!(snapshot.domains[0].name, "example.com");
         assert_eq!(snapshot.domains[0].count, 3);
-        assert_eq!(snapshot.clients[0].name, "192.168.1.0/24");
+        assert_eq!(snapshot.clients[0].name, "192.168.1.42");
         assert_eq!(snapshot.clients[0].count, 3);
+        let mut others = snapshot.clients[1..]
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>();
+        others.sort_unstable();
+        assert_eq!(others, ["192.168.1.9", "2001:db8::1"]);
     }
 
+    /// 配置里关掉统计、打开脱敏的写法照样能读，但排行照常统计完整地址
+    /// A config that switches statistics off and anonymization on still loads, and
+    /// the rankings go on counting whole addresses
     #[test]
-    fn clears_rankings_when_collection_is_disabled() {
-        let stats = QueryStats::default();
-        let client: IpAddr = "127.0.0.1".parse().unwrap();
-        stats.configure(true, false);
-        stats.record_at("example.com", client, false, 3_600);
-        assert_eq!(stats.snapshot(3_600, 3_600, 20).requests_observed, 1);
-
-        stats.configure(false, false);
-        let snapshot = stats.snapshot(3_600, 3_600, 20);
-        assert!(!snapshot.enabled);
-        assert!(snapshot.domains.is_empty());
-        assert!(snapshot.clients.is_empty());
+    fn old_statistics_settings_load_and_change_nothing() {
+        let config = crate::config::parse_config(
+            r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
+        )
+        .expect("old settings still load");
+        assert!(!config.settings.statistics_enabled);
+        let metrics = PanelMetrics::new(false);
+        metrics.record_config_loaded(
+            r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
+        );
+        metrics.record_query("example.com", "192.168.1.42".parse().unwrap());
+        let snapshot = metrics
+            .query_stats
+            .snapshot(super::unix_timestamp(), 3_600, 20);
+        assert_eq!(snapshot.requests_observed, 1);
+        assert_eq!(snapshot.clients[0].name, "192.168.1.42");
     }
 
     #[test]
     fn caps_unique_domains_and_reports_dropped_updates() {
         let stats = QueryStats::default();
-        stats.configure(true, false);
         let client: IpAddr = "127.0.0.1".parse().unwrap();
         for index in 0..QUERY_STATS_DOMAIN_CAP + 8 {
-            stats.record_at(&format!("{index}.example"), client, false, 3_600);
+            stats.record_at(&format!("{index}.example"), client, 3_600);
         }
 
         let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_DOMAIN_CAP + 8);
         assert_eq!(snapshot.domains.len(), QUERY_STATS_DOMAIN_CAP);
         assert_eq!(snapshot.dropped_updates, 8);
+
+        // 满了以后已经在榜上的名字照样计数 / Once full, names already ranked still count
+        stats.record_at("0.example", client, 3_600);
+        let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_DOMAIN_CAP + 8);
+        assert_eq!(snapshot.domains[0].name, "0.example");
+        assert_eq!(snapshot.domains[0].count, 2);
+        assert_eq!(snapshot.dropped_updates, 8);
+    }
+
+    #[test]
+    fn caps_unique_clients_and_keeps_counting_ranked_ones() {
+        let stats = QueryStats::default();
+        let client = |index: usize| IpAddr::from(Ipv4Addr::from(0x0a00_0000 + index as u32));
+        for index in 0..QUERY_STATS_CLIENT_CAP + 8 {
+            stats.record_at("example.com", client(index), 3_600);
+        }
+        stats.record_at("example.com", client(0), 3_600);
+
+        let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_CLIENT_CAP + 8);
+        assert_eq!(snapshot.clients.len(), QUERY_STATS_CLIENT_CAP);
+        assert_eq!(snapshot.dropped_updates, 8);
+        assert_eq!(snapshot.clients[0].name, "10.0.0.0");
+        assert_eq!(snapshot.clients[0].count, 2);
+    }
+
+    /// 没开控制通道时不统计排行 / No rankings are collected without a control socket
+    #[test]
+    fn collects_no_rankings_without_a_control_socket() {
+        let metrics = PanelMetrics::new(false).without_rankings();
+        metrics.record_query("example.com", "192.168.1.42".parse().unwrap());
+        let snapshot = metrics
+            .query_stats
+            .snapshot(super::unix_timestamp(), 3_600, 20);
+        assert_eq!(snapshot.requests_observed, 0);
+    }
+
+    /// 排行接口照旧带着 enabled 和 anonymized_clients，写的是一直开着、不脱敏；清空后从零开始
+    /// The rankings endpoint still carries enabled and anonymized_clients, saying always
+    /// on and not anonymized; after a clear it starts from zero
+    #[cfg(unix)]
+    #[test]
+    fn stats_json_says_always_on_with_whole_addresses_and_clears() {
+        let metrics = PanelMetrics::default();
+        metrics.record_query("example.com", "192.168.1.42".parse().unwrap());
+        let stats = metrics.stats_json(3_600, 20);
+        assert_eq!(stats["enabled"], true);
+        assert_eq!(stats["anonymized_clients"], false);
+        assert_eq!(stats["requests_observed"], 1);
+        assert_eq!(stats["clients"][0]["name"], "192.168.1.42");
+        assert_eq!(stats["domains"][0]["name"], "example.com");
+
+        metrics.clear_stats();
+        let stats = metrics.stats_json(3_600, 20);
+        assert_eq!(stats["requests_observed"], 0);
+        assert_eq!(stats["clients"], serde_json::json!([]));
+        assert_eq!(stats["domains"], serde_json::json!([]));
     }
 }
 
@@ -2819,7 +2822,7 @@ mod diagnostic_tests {
     /// 家里网段回 10.0.0.1，其余回 10.0.0.2：只靠静态回答，不出网 / The home subnet gets 10.0.0.1 and everyone else 10.0.0.2: static answers only, no network
     fn client_split_config(home: &str) -> serde_json::Value {
         json!({
-            "settings": { "default_upstream": "1.1.1.1:53", "udp_pool_size": 1, "statistics_enabled": true },
+            "settings": { "default_upstream": "1.1.1.1:53", "udp_pool_size": 1 },
             "pipelines": [{
                 "id": "main",
                 "rules": [
@@ -2910,7 +2913,6 @@ mod diagnostic_tests {
     #[tokio::test]
     async fn diagnostic_queries_stay_out_of_the_query_ranking() {
         let metrics = Arc::new(PanelMetrics::new(false));
-        metrics.query_stats.configure(true, false);
         let engine = engine_for(client_split_config("192.168.1.0/24"), Arc::clone(&metrics));
         let (packet, record_type) = diagnostic_packet("probe.example", "A").expect("packet");
         let assigned: IpAddr = "192.168.1.77".parse().unwrap();

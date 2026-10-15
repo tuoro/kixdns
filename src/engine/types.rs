@@ -131,8 +131,10 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         geoip_filter_countries,
         geosite_data_paths,
         enable_tcp_fallback,
-        statistics_enabled,
-        statistics_anonymize_client_ip,
+        // No longer have any effect (see `GlobalSettings`), so they leave the caches alone
+        // 已不起作用（见 `GlobalSettings`），不让缓存换代
+        statistics_enabled: _,
+        statistics_anonymize_client_ip: _,
     } = settings;
 
     (
@@ -194,8 +196,6 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         geoip_filter_countries,
         geosite_data_paths,
         enable_tcp_fallback,
-        statistics_enabled,
-        statistics_anonymize_client_ip,
     )
         .hash(hasher);
 }
@@ -426,15 +426,19 @@ mod tests {
         assert_ne!(before.get("second"), after.get("second"));
     }
 
+    /// 统计的两个设置已不起作用，改它们不让缓存换代
+    /// The two statistics settings no longer do anything, so changing them leaves
+    /// the caches alone
     #[test]
-    fn panel_statistics_setting_changes_all_namespaces() {
+    fn panel_statistics_settings_leave_namespaces_alone() {
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         let mut after_config = before_config.clone();
         after_config.settings.statistics_enabled = true;
+        after_config.settings.statistics_anonymize_client_ip = true;
         let before = build_cache_namespaces(&before_config);
         let after = build_cache_namespaces(&after_config);
 
-        assert_ne!(before.get("first"), after.get("first"));
-        assert_ne!(before.get("second"), after.get("second"));
+        assert_eq!(before.get("first"), after.get("first"));
+        assert_eq!(before.get("second"), after.get("second"));
     }
 }
