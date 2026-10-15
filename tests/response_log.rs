@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
@@ -360,11 +360,13 @@ async fn tcp_fallback_answer_is_labelled_with_the_transport_that_carried_it() {
 }
 
 #[tokio::test]
-async fn unparsable_answer_delivered_to_the_client_is_still_a_response() {
+async fn unparsable_answer_after_a_tcp_retry_is_one_servfail_response() {
     let log = Log::default();
     let _capture = log.capture();
-    // The first TCP answer is truncated again, so the engine retries over TCP
-    // and relays the second, non-DNS body as-is.
+    // The first TCP answer is truncated again, so the engine retries over TCP.
+    // The second, non-DNS body fails to parse like an unparsable answer on any
+    // other path: the client gets SERVFAIL, counted as one response. The retry
+    // used to relay the body as-is, without parsing it.
     let (addr, task) = truncating_upstream(|n, request| {
         if n == 0 {
             truncated(&Message::from_bytes(request).unwrap())
@@ -380,10 +382,11 @@ async fn unparsable_answer_delivered_to_the_client_is_still_a_response() {
         .await
         .unwrap();
     task.abort();
-    assert_eq!(answer.len(), 13, "the client receives the non-DNS body");
+    let answer = Message::from_bytes(&answer).expect("the client receives a DNS answer");
+    assert_eq!(answer.metadata.response_code, ResponseCode::ServFail);
     assert!(log.events("dns_request_finished").is_empty());
     let responses = log.responses();
     assert_eq!(responses.len(), 1, "{responses:?}");
     assert_eq!(responses[0]["status"], "completed");
-    assert!(responses[0].get("rcode").is_none());
+    assert_eq!(responses[0]["rcode"], "ServFail");
 }
