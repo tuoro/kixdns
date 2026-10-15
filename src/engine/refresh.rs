@@ -1,12 +1,60 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use hickory_proto::rr::{DNSClass, RecordType};
 use tracing::{debug, error, warn};
 
+use crate::ecs_scope::EcsReach;
 use crate::engine::Engine;
 use crate::engine::types::EngineInner;
 use crate::engine::utils::{RefreshingGuard, is_refreshing};
 use crate::matcher::Requester;
+
+/// 后台刷新要更新的缓存条目：它所在的槽位，以及它适用的请求方
+/// The cache entry a background refresh renews: its slot, and the requesters it
+/// applies to
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshTarget {
+    pub slot: u64,
+    /// The pipeline the slot belongs to / 槽位所属的 pipeline
+    pub pipeline: Arc<str>,
+    pub reach: EcsReach,
+    /// 被刷新那份应答取得的时刻（见 `CacheEntry::fetched_at`）：据此认出它
+    /// When the renewed answer was fetched (see `CacheEntry::fetched_at`): it is
+    /// recognised by this
+    pub fetched_at: Instant,
+    /// 刷新开始的时刻：之后取得的应答来自刷新本身或别的请求
+    /// When the refresh started: answers fetched later come from the refresh or other requests
+    pub started: Instant,
+}
+
+impl RefreshTarget {
+    pub fn new(slot: u64, pipeline: Arc<str>, reach: EcsReach, fetched_at: Instant) -> Self {
+        Self {
+            slot,
+            pipeline,
+            reach,
+            fetched_at,
+            started: Instant::now(),
+        }
+    }
+
+    /// 刷新标记的键：每个条目各一个，同一槽位里不同子网的条目可以同时刷新
+    /// The key of the refresh mark: one per entry, so entries for different subnets
+    /// in one slot refresh independently
+    pub fn mark(&self) -> u64 {
+        Self::mark_of(self.slot, &self.reach)
+    }
+
+    /// 槽位 `slot` 里适用于 `reach` 的条目的刷新标记 / The refresh mark of the entry for `reach` in slot `slot`
+    pub fn mark_of(slot: u64, reach: &EcsReach) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        slot.hash(&mut hasher);
+        reach.hash(&mut hasher);
+        hasher.finish()
+    }
+}
 
 /// spawn_background_refresh spawns a task to refresh a DNS record in the background.
 ///
@@ -25,37 +73,53 @@ use crate::matcher::Requester;
 /// 必须使用真实客户端 IP 而非回环地址，以确保：
 /// - ECS 注入 (RFC 7871) 使用正确的客户端子网
 /// - Pipeline 选择与原始请求路径一致
+///
+/// `renewed` is the cached answer to renew, in slot `slot`: its question
+/// (pipeline, name, type) is the one replayed, in class `qclass`.
+/// `renewed` 是槽位 `slot` 里要更新的那份应答：重放的就是它的问题（pipeline、名字、类型），
+/// 类别为 `qclass`。
 pub fn spawn_background_refresh(
     engine: &Engine,
     state: Arc<EngineInner>,
-    cache_hash: u64,
-    pipeline_id: &str,
-    qname: &str,
-    qtype: RecordType,
+    renewed: &crate::cache::CacheEntry,
+    slot: u64,
     qclass: DNSClass,
     requester: Requester,
 ) {
+    let (pipeline_id, qname) = (renewed.pipeline_id.as_ref(), renewed.qname.as_ref());
+    let qtype = RecordType::from(renewed.qtype);
     // FIX: Check if already refreshing to prevent duplicate refreshes
     // 修复：检查是否已在刷新，防止重复刷新
     // OPTIMIZATION: Hybrid bloom filter + DashSet check
     // 优化：混合布隆过滤器 + DashSet 检查
-    if is_refreshing(
-        &engine.refreshing_bitmap,
-        &engine.refreshing_set,
-        cache_hash,
-    ) {
+    let mark = RefreshTarget::mark_of(slot, &renewed.reach);
+    if is_refreshing(&engine.refreshing_bitmap, &engine.refreshing_set, mark) {
         return;
     }
+    let target = RefreshTarget::new(
+        slot,
+        renewed.pipeline_id.clone(),
+        renewed.reach.clone(),
+        renewed.fetched_at,
+    );
 
     // Step 1: Construct standard DNS query packet
     // 步骤 1：构造标准 DNS 查询包
-    // Replay the request as its client sent it, as far as routing can tell:
-    // from the same address, with or without EDNS. Pipeline selection and rules
-    // can depend on either, and the answer is stored under the key the request
-    // looked up.
-    // 按客户端发来的样子重放，以路由能分辨的为限：同一个地址，带或不带 EDNS。
-    // pipeline 的选择和规则都可能取决于它们，而应答会存进请求查过的那个键。
-    let packet = match engine.construct_dns_packet(qname, qtype, qclass, requester.edns) {
+    // Replay the request as its client sent it, as far as routing and ECS can
+    // tell: from the same address, with or without EDNS, with the client's own ECS.
+    // Pipeline selection and rules can depend on the first two, a forward without
+    // `ecs` passes the last upstream, and the answer is stored in the slot the
+    // request looked up.
+    // 按客户端发来的样子重放，以路由和 ECS 能分辨的为限：同一个地址，带或不带 EDNS，带着
+    // 客户端自己的 ECS。pipeline 的选择和规则都可能取决于前两项，不写 `ecs` 的转发会把最后
+    // 一项转给上游，而应答会存进请求查过的那个槽位。
+    let packet = match engine.construct_dns_packet(
+        qname,
+        qtype,
+        qclass,
+        requester.edns,
+        requester.ecs.as_ref(),
+    ) {
         Ok(pkt) => pkt,
         Err(e) => {
             error!(
@@ -73,11 +137,7 @@ pub fn spawn_background_refresh(
     // 步骤 2：创建 RefreshingGuard 并生成后台任务
     // RefreshingGuard will auto-clear the bitmap on drop via RAII
     // RefreshingGuard 会在 drop 时通过 RAII 自动清除位图标记
-    let _guard = RefreshingGuard::new(
-        &engine.refreshing_bitmap,
-        &engine.refreshing_set,
-        cache_hash,
-    );
+    let _guard = RefreshingGuard::new(&engine.refreshing_bitmap, &engine.refreshing_set, mark);
     let engine = engine.clone();
     let qname_owned = qname.to_string();
     let pipeline_id_owned = pipeline_id.to_string();
@@ -94,21 +154,14 @@ pub fn spawn_background_refresh(
         // 端口无关 — 下游仅消费 .ip()。
         let peer_addr = std::net::SocketAddr::new(requester.address, 53);
 
-        // Call handle_packet_internal with skip_cache=true and explicit cache_hash.
+        // Call handle_packet_internal with skip_cache=true and the entry it renews.
         // Together with the original peer_ip, this ensures the background refresh
         // both writes to the correct cache slot AND injects the correct ECS (RFC 7871).
         //
-        // 调用 handle_packet_internal 并设置 skip_cache=true，传入显式 cache_hash。
+        // 调用 handle_packet_internal 并设置 skip_cache=true，传入要更新的条目。
         // 配合原始 peer_ip，确保后台刷新既写入正确的缓存槽，又注入正确的 ECS (RFC 7871)。
         let result = engine
-            .handle_packet_internal(
-                &packet,
-                peer_addr,
-                true,
-                None,
-                Some(cache_hash),
-                Some(state),
-            )
+            .handle_packet_internal(&packet, peer_addr, true, None, Some(target), Some(state))
             .await;
 
         match result {

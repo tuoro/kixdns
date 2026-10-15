@@ -12,13 +12,16 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::{info, warn};
 
 use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
-use crate::cache::{CacheEntry, DnsCache, new_cache};
+use crate::cache::{CacheEntry, CacheSlot, CachedQuestion, DnsCache, new_cache};
+use crate::ecs_scope::EcsView;
+use crate::engine::refresh::RefreshTarget;
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::compile_pipelines;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
+use moka::ops::compute::Op;
 
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::RuleCacheRecord;
@@ -29,6 +32,10 @@ use super::types::{EngineInner, InflightMap, build_cache_namespaces};
 pub struct Engine {
     pub(crate) state: Arc<ArcSwap<EngineInner>>,
     pub(crate) cache: DnsCache,
+    /// The cache's `time_to_live` (`cache_max_ttl`), which each answer in a slot keeps
+    /// to on its own (see `CacheEntry::stored_at`)
+    /// 缓存的 `time_to_live`（`cache_max_ttl`），槽位里的每份应答各自遵守（见 `CacheEntry::stored_at`）
+    pub(crate) cache_max_age: Option<Duration>,
     pub(crate) udp_client: Arc<UdpClient>,
     pub(crate) tcp_mux: Arc<TcpMultiplexer>,
     pub(crate) doh_client: Arc<DohClient>,
@@ -452,6 +459,7 @@ impl Engine {
 
         Ok(Self {
             state,
+            cache_max_age: cache.policy().time_to_live(),
             cache,
             udp_client: Arc::new(UdpClient::new(udp_pool_size).context("initialize UDP client")?),
             tcp_mux,
@@ -501,19 +509,177 @@ impl Engine {
         })
     }
 
-    /// Retrieve a cached entry by hash / 通过哈希获取缓存条目
-    pub(crate) fn cache_get(&self, hash: &u64) -> Option<Arc<CacheEntry>> {
-        self.cache.get(hash)
+    /// 槽位 `slot` 里 `question` 的、适用于 `view` 的那份应答（见 `CacheSlot::select`）
+    /// The answer to `question` in slot `slot` that applies to `view` (see
+    /// `CacheSlot::select`)
+    /// `now` 是查找的时刻，调用方用同一个时刻算应答已经存了多久，免得每次命中多读一次时钟。
+    /// `now` is the time of the lookup; callers age the answer from the same instant,
+    /// so a hit reads the clock once.
+    pub(crate) fn cache_get(
+        &self,
+        slot: u64,
+        view: &EcsView,
+        question: &CachedQuestion<'_>,
+        now: std::time::Instant,
+    ) -> Option<Arc<CacheEntry>> {
+        self.cache.get(&slot)?.select(
+            view,
+            |entry| question.matches(entry),
+            self.cache_max_age,
+            now,
+        )
     }
 
-    /// Invalidate a cached entry by hash / 通过哈希使缓存条目失效
-    pub(crate) fn cache_invalidate(&self, hash: &u64) {
-        self.cache.invalidate(hash);
+    /// 从槽位 `slot` 去掉 `remove` 选中的应答 / Remove from slot `slot` the answers `remove` picks
+    pub(crate) fn cache_remove(&self, slot: u64, remove: impl Fn(&CacheEntry) -> bool) {
+        self.cache
+            .entry(slot)
+            .and_compute_with(|current| match current {
+                None => Op::Nop,
+                Some(current) => match current.value().without(&remove) {
+                    None => Op::Nop,
+                    Some(rest) if rest.is_empty() => Op::Remove,
+                    Some(rest) => Op::Put(Arc::new(rest)),
+                },
+            });
     }
 
-    /// Insert a cached entry / 插入缓存条目
-    pub(crate) fn cache_insert(&self, hash: u64, entry: Arc<CacheEntry>) {
-        self.cache.insert(hash, entry);
+    /// 从槽位 `slot` 去掉这一份应答 / Remove this one answer from slot `slot`
+    pub(crate) fn cache_invalidate(&self, slot: u64, entry: &Arc<CacheEntry>) {
+        self.cache_remove(slot, |cached| std::ptr::eq(cached, entry.as_ref()));
+    }
+
+    /// 把槽位 `slot` 里的 `old` 这一份换成 `new`；`old` 已经不在（被取代或去掉）时什么都不做。
+    /// 过期应答续期用它，不碰槽位里的其他应答。
+    /// Replace `old` itself in slot `slot` with `new`; nothing happens when `old` is
+    /// gone (replaced or removed). Renewing a stale answer uses it, leaving the
+    /// slot's other answers alone.
+    pub(crate) fn cache_replace(&self, slot: u64, old: &Arc<CacheEntry>, new: CacheEntry) {
+        let new = Arc::new(new);
+        self.cache
+            .entry(slot)
+            .and_compute_with(|current| match current {
+                None => Op::Nop,
+                Some(current) => match current.value().replacing(old, new) {
+                    None => Op::Nop,
+                    Some(slot) => Op::Put(Arc::new(slot)),
+                },
+            });
+    }
+
+    /// 去掉后台刷新发现已和规则对不上的条目：刷新的就是这个槽位时，去掉它要更新的那条；
+    /// 否则（刷新走到了别的 pipeline）去掉这个槽位里适用于它的请求方、在刷新开始之前取得的
+    /// 条目；之后取得的来自别的请求，不动。
+    /// Drop the entry a background refresh found no longer matches the rules: the
+    /// one it renews when it renews this slot, otherwise (the refresh went to
+    /// another pipeline) the ones in this slot for its requester fetched before
+    /// the refresh started; later ones come from other requests and stay.
+    pub(crate) fn drop_refreshed(
+        &self,
+        slot: u64,
+        question: &CachedQuestion<'_>,
+        view: &EcsView,
+        target: &RefreshTarget,
+    ) {
+        self.cache_remove(slot, |entry| {
+            question.matches(entry)
+                && if target.slot == slot {
+                    // The renewed answer itself, whatever renewed or copied it since
+                    // 就是被刷新的那份应答，不论之后被续用或复制过
+                    entry.reach == target.reach && entry.fetched_at == target.fetched_at
+                } else {
+                    entry.reach.admits(view) && entry.fetched_at < target.started
+                }
+        });
+    }
+
+    /// 后台刷新成功之后整理它刷新的槽位（见 `CacheSlot::after_refresh`）
+    /// Tidy the slot a background refresh renewed once it succeeded (see
+    /// `CacheSlot::after_refresh`)
+    pub(crate) fn settle_refresh(
+        &self,
+        target: &RefreshTarget,
+        written: &crate::ecs_scope::EcsReach,
+        qname: &str,
+        qtype: u16,
+    ) {
+        let question = CachedQuestion {
+            qname,
+            pipeline_id: &target.pipeline,
+            qtype,
+        };
+        self.cache
+            .entry(target.slot)
+            .and_compute_with(|current| match current {
+                None => Op::Nop,
+                Some(current) => {
+                    match current.value().after_refresh(
+                        &question,
+                        &target.reach,
+                        target.fetched_at,
+                        written,
+                        target.started,
+                    ) {
+                        None => Op::Nop,
+                        Some(rest) if rest.is_empty() => Op::Remove,
+                        Some(rest) => Op::Put(Arc::new(rest)),
+                    }
+                }
+            });
+    }
+
+    /// 把一份应答存进槽位 `slot`（见 `CacheSlot::with`）。写入只经过这里和
+    /// `insert_dns_cache_entry`。
+    /// Store an answer in slot `slot` (see `CacheSlot::with`). Writes go through
+    /// here and `insert_dns_cache_entry` only.
+    pub(crate) fn cache_insert(&self, slot: u64, entry: Arc<CacheEntry>) {
+        let max_age = self.cache_max_age;
+        self.cache.entry(slot).and_compute_with(|current| {
+            let slot = match current {
+                Some(current) => current.into_value().with(entry, max_age),
+                None => CacheSlot::default().with(entry, max_age),
+            };
+            Op::Put(Arc::new(slot))
+        });
+    }
+
+    /// 测试用：槽位 `slot` 里的所有应答 / For tests: every answer in slot `slot`
+    #[cfg(test)]
+    pub(crate) fn cached_entries(&self, slot: u64) -> Vec<Arc<CacheEntry>> {
+        self.cache
+            .get(&slot)
+            .map(|slot| slot.entries().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 测试用：刷新槽位 `slot` 里唯一那份应答的目标；槽位为空时是一个什么都不指的目标
+    /// For tests: the target of a refresh of the one answer in slot `slot`; one
+    /// naming nothing when the slot is empty
+    #[cfg(test)]
+    pub(crate) fn refresh_of(&self, slot: u64) -> RefreshTarget {
+        match self.cached(slot) {
+            Some(entry) => RefreshTarget::new(
+                slot,
+                entry.pipeline_id.clone(),
+                entry.reach.clone(),
+                entry.fetched_at,
+            ),
+            None => RefreshTarget::new(
+                slot,
+                Arc::from(""),
+                Default::default(),
+                std::time::Instant::now(),
+            ),
+        }
+    }
+
+    /// 测试用：槽位 `slot` 里唯一的那份应答；不止一份时 panic
+    /// For tests: the one answer in slot `slot`; panics when it holds more
+    #[cfg(test)]
+    pub(crate) fn cached(&self, slot: u64) -> Option<Arc<CacheEntry>> {
+        let entries = self.cached_entries(slot);
+        assert!(entries.len() <= 1, "slot holds {} answers", entries.len());
+        entries.into_iter().next()
     }
 
     /// The observer installed via [`EngineBuilder::observer`], if any.

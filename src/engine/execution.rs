@@ -37,11 +37,24 @@ use super::response_log::{ResponseInfo, ResponseLog};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
 use super::utils::{InflightCleanupGuard, engine_helpers, is_refreshing};
+use crate::cache::CachedQuestion;
+use crate::ecs_scope::EcsReach;
+use crate::engine::refresh::RefreshTarget;
 #[cfg(test)]
 use crate::engine::rules::calculate_rule_hash;
 use crate::engine::rules::rule_cache_requester;
 use crate::engine::rules::{Decision, ResponseContext};
 use crate::matcher::{Requester, RequesterKey};
+
+/// The keys of one request in one pipeline (see `Engine::cache_keys`)
+/// 一个请求在一个 pipeline 里的键（见 `Engine::cache_keys`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheKeys {
+    /// Response cache slot / 响应缓存槽位
+    pub slot: u64,
+    /// Inflight entry / inflight 条目
+    pub inflight: u64,
+}
 
 /// Pre-parsed data from handle_packet_fast to avoid re-parsing
 /// 来自 handle_packet_fast 的预解析数据，避免重新解析
@@ -53,9 +66,6 @@ pub struct PreParsedData {
     tx_id: u16,
     edns_present: bool,
     pipeline_id: Arc<str>,
-    /// Pre-computed ECS cache key from fast path (avoids recomputation)
-    /// 快速路径预计算的 ECS 缓存键（避免重算）
-    ecs_key: Option<crate::ecs::EcsKey>,
 }
 impl PreParsedData {
     pub fn new(
@@ -65,7 +75,6 @@ impl PreParsedData {
         tx_id: u16,
         edns_present: bool,
         pipeline_id: Arc<str>,
-        ecs_key: Option<crate::ecs::EcsKey>,
     ) -> Self {
         Self {
             qname,
@@ -74,8 +83,20 @@ impl PreParsedData {
             tx_id,
             edns_present,
             pipeline_id,
-            ecs_key,
         }
+    }
+}
+
+/// A static answer built on the fast path, as its client gets it: a client that
+/// sent ECS gets the echo of its own subnet (see `phases::client_reply`), and a
+/// static answer, carrying no ECS, goes to the others as it is.
+/// 快速路径上构造的静态应答，按客户端该收到的样子：带了 ECS 的客户端拿到回显它自己子网的
+/// 应答（见 `phases::client_reply`）；静态应答本来不带 ECS，原样交给其他客户端。
+fn fast_client_reply(reply: Bytes, client: Option<&crate::ecs::EcsKey>) -> Bytes {
+    match client {
+        // A static answer depends on no ECS / 静态应答不取决于任何 ECS
+        Some(_) => phases::client_reply(reply, client, 0),
+        None => reply,
     }
 }
 
@@ -280,16 +301,62 @@ impl Engine {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The response cache slot and the inflight entry of a request. The slot holds
+    /// every answer to the question, each tagged with the ECS subnets it applies to
+    /// (see `CacheEntry::reach`), so its key carries no subnet; requests wait on one
+    /// another only when they send the same, so the inflight key carries the
+    /// subnets the forwards would send for the requester and the client's own ECS.
+    /// 请求的响应缓存槽位和 inflight 条目。槽位存放这个问题的所有应答，每份标着它适用的
+    /// ECS 子网（见 `CacheEntry::reach`），所以它的键不含子网；请求只有发送相同的子网才能
+    /// 互相等待，所以 inflight 键带上转发会为这个请求方发送的子网，以及客户端自己带的 ECS。
     #[inline]
-    pub fn calculate_cache_hash_for_dedupe(
+    pub fn cache_keys(
         cache_namespace: u64,
         pipeline_id: &str,
         qname: &[u8],
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
-        ecs_key: Option<&crate::ecs::EcsKey>,
+        requester: &RequesterKey,
+        client_ecs: Option<&crate::ecs::EcsKey>,
+    ) -> CacheKeys {
+        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
+        let mut inflight = h.clone();
+        // The requester, for a pipeline whose answer depends on it (see
+        // `RuntimePipeline::requester`); nothing otherwise, so the key is unchanged
+        // 请求方，仅当 pipeline 的应答取决于它时（见 `RuntimePipeline::requester`）；
+        // 否则不写入，键不变
+        requester.hash_into(&mut h);
+        requester.hash_inflight_into(client_ecs, &mut inflight);
+        CacheKeys {
+            slot: h.finish(),
+            inflight: inflight.finish(),
+        }
+    }
+
+    /// The slot of `cache_keys` alone, for a lookup that registers no inflight entry
+    /// 只算 `cache_keys` 的槽位，用于不登记 inflight 条目的查找
+    #[inline]
+    pub fn cache_slot(
+        cache_namespace: u64,
+        pipeline_id: &str,
+        qname: &[u8],
+        qtype: hickory_proto::rr::RecordType,
+        qclass: hickory_proto::rr::DNSClass,
         requester: &RequesterKey,
     ) -> u64 {
+        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
+        requester.hash_into(&mut h);
+        h.finish()
+    }
+
+    #[inline]
+    fn question_hasher(
+        cache_namespace: u64,
+        pipeline_id: &str,
+        qname: &[u8],
+        qtype: hickory_proto::rr::RecordType,
+        qclass: hickory_proto::rr::DNSClass,
+    ) -> FxHasher {
         let mut h = FxHasher::default();
         cache_namespace.hash(&mut h);
         pipeline_id.hash(&mut h);
@@ -302,29 +369,19 @@ impl Engine {
         u16::from(qtype).hash(&mut h);
         // DNSClass implements Copy+Debug, hash by its u16 representation / DNSClass 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qclass).hash(&mut h);
-        // ECS key for cache isolation by client subnet (RFC 7871)
-        // ECS key 用于按客户端子网隔离缓存 (RFC 7871)
-        if let Some(ecs) = ecs_key {
-            ecs.hash_into(&mut h);
-        }
-        // The requester, for a pipeline whose answer depends on it (see
-        // `RuntimePipeline::requester`); nothing otherwise, so the key is unchanged
-        // 请求方，仅当 pipeline 的应答取决于它时（见 `RuntimePipeline::requester`）；
-        // 否则不写入，键不变
-        requester.hash_into(&mut h);
-        h.finish()
+        h
     }
 
-    /// Helper: create and insert DNS cache entry / 辅助函数：创建并插入 DNS 缓存条目
-    /// Eliminate duplicate CacheEntry construction code / 消除重复的 CacheEntry 构造代码
-    #[inline]
     /// Every answer is cached through here. A truncated answer never is: it is incomplete,
     /// and the client is meant to ask again over TCP (RFC 2181 section 9), which a cached copy
     /// would answer with the same truncated answer for its whole TTL. A refresh that gets one
-    /// keeps the old entry.
+    /// keeps the old entry. The answer is stored without its ECS option: it may be served to
+    /// requesters in other subnets, which get their own echo (see `phases::served_from_cache`).
     /// 所有应答都经这里写进缓存。截断的应答从不缓存：它不完整，客户端本该改用 TCP 再问（RFC 2181
     /// 第 9 节），缓存了就会在整个 TTL 内拿同一个截断的应答回答它。刷新拿到这样的应答时，旧条目保留。
-    pub(crate) fn insert_dns_cache_entry(&self, cache_hash: u64, entry: CacheEntry) {
+    /// 应答去掉 ECS 选项后存放：它可能交给别的子网的请求方，它们各自得到自己的回显（见
+    /// `phases::served_from_cache`）。
+    pub(crate) fn insert_dns_cache_entry(&self, slot: u64, mut entry: CacheEntry) {
         if crate::proto_utils::truncated_response(&entry.bytes) {
             tracing::debug!(
                 event = "truncated_answer_not_cached",
@@ -334,7 +391,20 @@ impl Engine {
             );
             return;
         }
-        self.cache.insert(cache_hash, Arc::new(entry));
+        if entry.reach.is_uncacheable() {
+            tracing::debug!(
+                event = "ecs_answer_not_cached",
+                qname = %entry.qname,
+                pipeline = %entry.pipeline_id,
+                "the ECS sent upstream is not the one worked out, so the answer is not cached"
+            );
+            return;
+        }
+        let Ok(bytes) = crate::proto_utils::without_ecs(entry.bytes) else {
+            return;
+        };
+        entry.bytes = bytes;
+        self.cache_insert(slot, Arc::new(entry));
     }
 
     /// Observer context for a request answered on the fast path.
@@ -539,146 +609,159 @@ impl Engine {
         );
 
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        // Compute ECS cache key from pipeline config + peer IP (RFC 7871)
-        // 从 Pipeline ECS 配置 + peer IP 计算 ECS 缓存键 (RFC 7871)
-        let ecs_key = pipeline_opt.and_then(|p| {
-            p.ecs
-                .as_ref()
-                .and_then(|mode| crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip()))
-        });
         let cache_namespace = state.cache_namespace(&pipeline_id);
         let requester = Requester {
             address: peer.ip(),
             edns: q.edns_present,
+            ecs: q.client_subnet,
         };
+        let view = requester.ecs_view();
         let requester_key = pipeline_opt.map_or(RequesterKey::NONE, |p| {
             p.requester.key(requester, Some(&self.geoip_manager))
         });
-        let cache_hash = Self::calculate_cache_hash_for_dedupe(
+        let slot = Self::cache_slot(
             cache_namespace,
             &pipeline_id,
             q.qname_bytes,
             qtype,
             qclass,
-            ecs_key.as_ref(),
             &requester_key,
         );
 
-        if let Some(hit) = self.cache.get(&cache_hash) {
-            // Verify collision / 验证冲突
-            if hit.qtype == u16::from(qtype)
-                && q.qname_matches(hit.qname.as_ref())
-                && hit.pipeline_id == pipeline_id
-            {
-                // Check if expired / 检查是否已过期
-                let elapsed_secs =
-                    crate::proto_utils::saturating_u64_to_u32(hit.inserted_at.elapsed().as_secs());
-                if elapsed_secs >= hit.original_ttl {
-                    // RFC 8767: When serve_stale is enabled, keep stale entries for fallback
-                    // RFC 8767: 当 serve_stale 启用时，保留过期条目以便 fallback
-                    if !cfg.settings.serve_stale {
-                        self.cache.invalidate(&cache_hash);
-                    }
-                } else {
-                    // Cache background refresh: trigger async refresh when TTL < threshold percentage
-                    // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新
-                    // Only refresh cache entries that came from an upstream server
-                    // 只有来自 upstream 的缓存条目才进行预取刷新
-                    if cfg.settings.cache_background_refresh
-                        && hit.upstream.is_some()
-                        && hit.refresh_ttl >= cfg.settings.cache_refresh_min_ttl
-                    {
-                        // Calculate remaining TTL and refresh threshold
-                        // 计算剩余 TTL 和刷新阈值
-                        let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed_secs);
-                        let threshold = (hit.refresh_ttl as u64
-                            * cfg.settings.cache_refresh_threshold_percent as u64)
-                            / 100;
+        let now = Instant::now();
+        if let Some(hit) = self.cache_get(
+            slot,
+            &view,
+            &CachedQuestion {
+                qname: qname_str,
+                pipeline_id: &pipeline_id,
+                qtype: u16::from(qtype),
+            },
+            now,
+        ) {
+            // Check if expired / 检查是否已过期
+            let elapsed_secs = crate::proto_utils::saturating_u64_to_u32(
+                now.saturating_duration_since(hit.inserted_at).as_secs(),
+            );
+            if elapsed_secs >= hit.original_ttl {
+                // An expired answer is left to the async path, whose lookup picks this
+                // same answer and decides: serve it stale, or drop it and forward.
+                // Dropping it here would let that lookup fall back to a wider, older
+                // answer the upstream no longer meant for this requester.
+                // 过期的应答留给异步路径：那里的查找选中的是同一份，由它决定是过期续用，还是
+                // 删掉后重新转发。在这里删掉，那次查找就会退到一份更宽、更旧的应答上，而上游
+                // 已不再把它给这个请求方。
+            } else {
+                // Cache background refresh: trigger async refresh when TTL < threshold percentage
+                // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新
+                // Only refresh cache entries that came from an upstream server
+                // 只有来自 upstream 的缓存条目才进行预取刷新
+                if cfg.settings.cache_background_refresh
+                    && hit.upstream.is_some()
+                    && hit.refresh_ttl >= cfg.settings.cache_refresh_min_ttl
+                {
+                    // Calculate remaining TTL and refresh threshold
+                    // 计算剩余 TTL 和刷新阈值
+                    let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed_secs);
+                    let threshold = (hit.refresh_ttl as u64
+                        * cfg.settings.cache_refresh_threshold_percent as u64)
+                        / 100;
 
-                        // OPTIMIZATION: Hybrid bloom filter + DashSet check / 优化：混合布隆过滤器 + DashSet 检查
-                        let is_refreshing = is_refreshing(
+                    // Only an entry due for a refresh needs its mark looked up
+                    // 只有到了刷新时机的条目才需要查它的刷新标记
+                    // OPTIMIZATION: Hybrid bloom filter + DashSet check / 优化：混合布隆过滤器 + DashSet 检查
+                    let due = remaining_ttl as u64 <= threshold;
+                    let is_refreshing = due
+                        && is_refreshing(
                             &self.refreshing_bitmap,
                             &self.refreshing_set,
-                            cache_hash,
+                            RefreshTarget::mark_of(slot, &hit.reach),
                         );
 
+                    tracing::debug!(
+                        original_ttl = hit.original_ttl,
+                        refresh_ttl = hit.refresh_ttl,
+                        elapsed_secs = elapsed_secs,
+                        remaining_ttl = remaining_ttl,
+                        threshold_percent = cfg.settings.cache_refresh_threshold_percent,
+                        threshold_value = threshold,
+                        min_ttl = cfg.settings.cache_refresh_min_ttl,
+                        is_refreshing = is_refreshing,
+                        should_trigger = due && !is_refreshing,
+                        upstream = ?hit.upstream,
+                        qname = %q.qname_str_unchecked(),  // Use unchecked for performance / 使用未检查版本以提高性能
+                        "cache background refresh check"
+                    );
+
+                    if due && !is_refreshing {
+                        // Trigger background refresh (async, don't block current request)
+                        // 触发后台刷新（异步，不阻塞当前请求）
+                        // Note: RefreshingGuard inside spawn_background_refresh will handle cleanup
+                        // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理清理
+                        let qname_str = q.qname_str_unchecked(); // Zero-allocation / 零分配
                         tracing::debug!(
+                            qname = %qname_str,
                             original_ttl = hit.original_ttl,
                             refresh_ttl = hit.refresh_ttl,
-                            elapsed_secs = elapsed_secs,
                             remaining_ttl = remaining_ttl,
-                            threshold_percent = cfg.settings.cache_refresh_threshold_percent,
-                            threshold_value = threshold,
-                            min_ttl = cfg.settings.cache_refresh_min_ttl,
-                            is_refreshing = is_refreshing,
-                            should_trigger = !is_refreshing && remaining_ttl as u64 <= threshold,
-                            upstream = ?hit.upstream,
-                            qname = %q.qname_str_unchecked(),  // Use unchecked for performance / 使用未检查版本以提高性能
-                            "cache background refresh check"
+                            "triggering background cache refresh"
                         );
-
-                        if !is_refreshing && remaining_ttl as u64 <= threshold {
-                            // Trigger background refresh (async, don't block current request)
-                            // 触发后台刷新（异步，不阻塞当前请求）
-                            // Note: RefreshingGuard inside spawn_background_refresh will handle cleanup
-                            // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理清理
-                            let qname_str = q.qname_str_unchecked(); // Zero-allocation / 零分配
-                            tracing::debug!(
-                                qname = %qname_str,
-                                original_ttl = hit.original_ttl,
-                                refresh_ttl = hit.refresh_ttl,
-                                remaining_ttl = remaining_ttl,
-                                "triggering background cache refresh"
-                            );
-                            self.spawn_background_refresh(
-                                state.clone(),
-                                cache_hash,
-                                &pipeline_id,
-                                qname_str,
-                                qtype,
-                                qclass,
-                                requester,
-                            );
-                        }
+                        self.spawn_background_refresh(state.clone(), &hit, slot, qclass, requester);
                     }
+                }
 
-                    // Return current cache immediately, don't wait for refresh to complete
-                    // 直接返回当前缓存，不等待刷新完成
-                    // Next query will automatically use refreshed new cache (if completed)
-                    // 下次查询时会自动使用刷新后的新缓存（如果已完成）
-                    self.incr_fastpath_hits();
-                    if let Some((observer, start)) = observed {
-                        self.observe_fast_path(
-                            observer,
-                            start,
-                            &self.fast_path_context(peer, qname_str, qtype, qclass),
-                            &pipeline_id,
-                            FastPathAnswer::Cache {
-                                original_ttl: hit.original_ttl,
-                                elapsed_secs,
-                                source: cached_source(hit.upstream.as_deref()),
-                            },
-                            Ok(&hit.bytes),
-                        );
-                    }
-                    let mut log = ResponseLog::new(
-                        qname_str,
-                        qtype,
-                        peer,
-                        pipeline_id.clone(),
-                        log_start,
-                        false,
+                // Return current cache immediately, don't wait for refresh to complete
+                // 直接返回当前缓存，不等待刷新完成
+                // Next query will automatically use refreshed new cache (if completed)
+                // 下次查询时会自动使用刷新后的新缓存（如果已完成）
+                self.incr_fastpath_hits();
+                // A client that sent ECS gets the echo of its own subnet, built here
+                // (see `phases::served_from_cache`); the rest get the stored bytes,
+                // which carry no ECS, and the listener ages them
+                // 带了 ECS 的客户端在这里拿到回显它自己子网的应答（见
+                // `phases::served_from_cache`）；其余的拿到存着的字节（不带 ECS），由监听器修正 TTL
+                let echoed = q.client_subnet.map(|_| {
+                    phases::served_from_cache(
+                        &hit,
+                        q.tx_id,
+                        &view,
+                        phases::ServedTtl::Elapsed(elapsed_secs),
+                    )
+                });
+                if let Some((observer, start)) = observed {
+                    self.observe_fast_path(
+                        observer,
+                        start,
+                        &self.fast_path_context(peer, qname_str, qtype, qclass),
+                        &pipeline_id,
+                        FastPathAnswer::Cache {
+                            original_ttl: hit.original_ttl,
+                            elapsed_secs,
+                            source: cached_source(hit.upstream.as_deref()),
+                        },
+                        Ok(echoed.as_ref().unwrap_or(&hit.bytes)),
                     );
-                    log.info.cache_hit = true;
-                    log.info.upstream =
-                        Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
-                    log.answered(&hit.bytes);
-                    return Ok(Some(FastPathResponse::CacheHit {
+                }
+                let mut log = ResponseLog::new(
+                    qname_str,
+                    qtype,
+                    peer,
+                    pipeline_id.clone(),
+                    log_start,
+                    false,
+                );
+                log.info.cache_hit = true;
+                log.info.upstream =
+                    Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
+                log.answered(&hit.bytes);
+                return Ok(Some(match echoed {
+                    Some(reply) => FastPathResponse::Direct(reply),
+                    None => FastPathResponse::CacheHit {
                         cached: hit.bytes.clone(),
                         tx_id: q.tx_id,
                         inserted_at: hit.inserted_at,
-                    }));
-                }
+                    },
+                }));
             }
         }
 
@@ -702,7 +785,8 @@ impl Engine {
                 // 在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器自己回 SERVFAIL。
                 let built = build_fast_static_response(
                     q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
-                );
+                )
+                .map(|reply| fast_client_reply(reply, q.client_subnet.as_ref()));
                 if let Some((observer, start)) = observed {
                     self.observe_fast_path(
                         observer,
@@ -765,7 +849,8 @@ impl Engine {
                     // 在 `?` 之前上报，同上面的编译静态规则。
                     let built = build_fast_static_response(
                         q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
-                    );
+                    )
+                    .map(|reply| fast_client_reply(reply, q.client_subnet.as_ref()));
                     if let Some((observer, start)) = observed {
                         self.observe_fast_path(
                             observer,
@@ -803,7 +888,6 @@ impl Engine {
             tx_id: q.tx_id,
             edns_present: q.edns_present,
             pipeline_id,
-            ecs_key, // Pass pre-computed ECS key to avoid recomputation / 传递预计算的 ECS key 避免重算
         }))
     }
 
@@ -860,14 +944,16 @@ impl Engine {
         // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
         // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
         if settings.serve_stale && settings.serve_stale_client_timeout_ms > 0 {
+            let view = lookup.requester.ecs_view();
+            let question = CachedQuestion {
+                qname: lookup.qname,
+                pipeline_id: lookup.pipeline_id,
+                qtype: u16::from(lookup.qtype),
+            };
             let has_stale = self
-                .cache
-                .get(&lookup.dedupe_hash)
+                .cache_get(lookup.slot, &view, &question, Instant::now())
                 .filter(|h| {
-                    h.qtype == u16::from(lookup.qtype)
-                        && h.pipeline_id.as_ref() == lookup.pipeline_id
-                        && h.qname.as_ref() == lookup.qname
-                        && h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
+                    h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
                         && h.rcode != ResponseCode::ServFail
                         && h.rcode != ResponseCode::Refused
                 })
@@ -907,7 +993,9 @@ impl Engine {
                 while wait_start.elapsed() < client_timeout {
                     tokio::time::sleep(poll_interval).await;
                     // Check if background refresh put fresh data in cache
-                    let Some(fresh_hit) = self.cache.get(&lookup.dedupe_hash) else {
+                    let Some(fresh_hit) =
+                        self.cache_get(lookup.slot, &view, &question, Instant::now())
+                    else {
                         break;
                     };
                     if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
@@ -971,17 +1059,16 @@ impl Engine {
     /// pre_parsed: Optional pre-parsed data from handle_packet_fast to avoid re-parsing
     /// pre_parsed: 来自 handle_packet_fast 的可选预解析数据，避免重新解析
     ///
-    /// explicit_cache_hash: Optional pre-computed cache hash for background refresh.
-    /// When provided, skips ECS key computation to ensure the same hash as the original request.
-    /// explicit_cache_hash: 后台刷新用的预计算 cache hash。
-    /// 提供时跳过 ECS key 计算，确保与原始请求的 hash 一致。
+    /// refresh: for a background refresh, the entry it renews. The refresh writes into
+    /// that entry's slot, the one the original request looked up.
+    /// refresh：后台刷新时，它要更新的条目。刷新写进这个条目的槽位，即原请求查过的那个。
     pub(crate) async fn handle_packet_internal(
         &self,
         packet: &[u8],
         peer: SocketAddr,
         skip_cache: bool,
         pre_parsed: Option<PreParsedData>,
-        explicit_cache_hash: Option<u64>,
+        refresh: Option<RefreshTarget>,
         state_override: Option<Arc<EngineInner>>,
     ) -> anyhow::Result<Bytes> {
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
@@ -1005,7 +1092,7 @@ impl Engine {
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
 
         // Use pre-parsed data if available, otherwise parse / 如果有预解析数据则使用，否则解析
-        let (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id, pre_ecs_key) =
+        let (qname_cow, qtype, qclass, tx_id, edns_present, pipeline_id, client_ecs) =
             if let Some(pre) = pre_parsed {
                 (
                     std::borrow::Cow::Owned(pre.qname),
@@ -1014,7 +1101,8 @@ impl Engine {
                     pre.tx_id,
                     pre.edns_present,
                     pre.pipeline_id,
-                    pre.ecs_key,
+                    // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
+                    crate::proto_utils::client_subnet(packet),
                 )
             } else {
                 // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
@@ -1023,7 +1111,8 @@ impl Engine {
                 let mut qname_buf = [0u8; 256];
                 let q = parse_quick(packet, &mut qname_buf);
 
-                let (qname_cow, qtype, qclass, tx_id, edns_present) = if let Some(q) = q {
+                let (qname_cow, qtype, qclass, tx_id, edns_present, client_ecs) = if let Some(q) = q
+                {
                     // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
                     // SAFETY: qname_bytes is validated ASCII from parse_quick()
                     // ASCII is always valid UTF-8, so this is safe
@@ -1036,6 +1125,7 @@ impl Engine {
                         DNSClass::from(q.qclass),
                         q.tx_id,
                         q.edns_present,
+                        q.client_subnet,
                     )
                 } else {
                     // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
@@ -1049,6 +1139,7 @@ impl Engine {
                         question.query_class(),
                         req.metadata.id,
                         req.edns.is_some(),
+                        crate::proto_utils::client_subnet(packet),
                     )
                 };
 
@@ -1080,7 +1171,7 @@ impl Engine {
                     tx_id,
                     edns_present,
                     pipeline_id,
-                    None,
+                    client_ecs,
                 )
             };
 
@@ -1147,6 +1238,16 @@ impl Engine {
         // `ForwardDecisionContext::held_inflight`)
         // 规则 continue 后本请求仍持有的 inflight 条目
         let mut held_inflight: Option<InflightCleanupGuard> = None;
+        // The forwards passed in the current pipeline (see `ForwardDecisionContext::trail`);
+        // after the request, what its last answer was cached with
+        // 在当前 pipeline 里经过的转发（见 `ForwardDecisionContext::trail`）；请求结束后就是
+        // 它最后一份应答缓存时带的那份
+        let mut trail = EcsReach::default();
+        // How many bits of the client's ECS the answer depends on through the pipelines
+        // the request left by a jump, whose trails are gone (see `phases::client_reply`)
+        // 经由请求跳离的 pipeline（它们的 trail 已经清掉）应答依赖客户端 ECS 的多少位（见
+        // `phases::client_reply`）
+        let mut echo_floor = 0u8;
         let result: anyhow::Result<Bytes> = async {
             // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
             let pipeline_opt = cfg
@@ -1156,40 +1257,27 @@ impl Engine {
 
             // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
             let qname_bytes = qname_ref.as_bytes();
-            // Compute dedupe hash: use explicit hash for background refresh, or pre-computed ECS key,
-            // otherwise compute with ECS key from pipeline config
-            // 计算 dedupe hash：后台刷新用显式 hash，或用预计算 ECS key，否则从 pipeline 配置计算
-            // Who is asking, as far as rules can tell / 规则能分辨的请求方
+            // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
             let requester = Requester {
                 address: peer.ip(),
                 edns: edns_present,
+                ecs: client_ecs,
             };
-            let ecs_key = if explicit_cache_hash.is_some() {
-                None // explicit hash overrides; ecs_key not needed / 显式 hash 优先；不需要 ecs_key
-            } else {
-                pre_ecs_key.or_else(|| {
-                    pipeline_opt.and_then(|p| {
-                        p.ecs.as_ref().and_then(|mode| {
-                            crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
-                        })
-                    })
-                })
-            };
-            let dedupe_hash = if let Some(h) = explicit_cache_hash {
-                h
-            } else {
-                Self::calculate_cache_hash_for_dedupe(
-                    state.cache_namespace(&pipeline_id),
-                    &pipeline_id,
-                    qname_bytes,
-                    qtype,
-                    qclass,
-                    ecs_key.as_ref(),
-                    &pipeline_opt.map_or(RequesterKey::NONE, |p| {
-                        p.requester.key(requester, Some(&self.geoip_manager))
-                    }),
-                )
-            };
+            let mut keys = Self::cache_keys(
+                state.cache_namespace(&pipeline_id),
+                &pipeline_id,
+                qname_bytes,
+                qtype,
+                qclass,
+                &pipeline_opt.map_or(RequesterKey::NONE, |p| {
+                    p.requester.key(requester, Some(&self.geoip_manager))
+                }),
+                client_ecs.as_ref(),
+            );
+            // A refresh writes into the slot of the entry it renews / 刷新写进它要更新的条目的槽位
+            if let Some(target) = &refresh {
+                keys.slot = target.slot;
+            }
 
             // Background refresh: Skip cache lookup when skip_cache=true
             // 后台刷新：当 skip_cache=true 时跳过缓存查找
@@ -1202,11 +1290,11 @@ impl Engine {
                             qtype,
                             qclass,
                             pipeline_id: &pipeline_id,
-                            dedupe_hash,
+                            slot: keys.slot,
                             tx_id,
                             start,
                             peer: &peer,
-                            edns_present,
+                            requester,
                             observed: observed_ctx,
                         },
                         &mut response_log.info,
@@ -1229,9 +1317,6 @@ impl Engine {
             let mut route_matches_edns = pipeline_opt.is_some_and(|p| p.matches_edns);
             // Convert qname to bytes for hash calculation / 将 qname 转换为 bytes 进行哈希计算
             let qname_bytes = qname.as_bytes();
-            // Reuse dedupe_hash from earlier computation (includes ECS key isolation)
-            // 复用之前计算的 dedupe_hash（已含 ECS key 隔离维度）
-            let mut dedupe_hash = dedupe_hash;
             let mut reused_response: Option<ResponseContext> = None;
 
             let mut decision = match pipeline_opt {
@@ -1306,12 +1391,20 @@ impl Engine {
             // Without this, the response_jump_limit could be bypassed via:
             //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
             let mut jump_count = 0;
-            // A refresh renews the entry under `refresh_key`. Once a rule has continued
-            // past an answer, the outcome may be a static answer or come from a jump
-            // target, which do not renew it: see the Static branch and the Success arm.
-            // 刷新更新的是 `refresh_key` 下的条目。规则越过一个应答之后，结果可能是静态
-            // 应答或来自跳转目标，它们不会更新这条：见 Static 分支和 Success 分支。
-            let refresh_key = dedupe_hash;
+            // A refresh renews the entry `refresh` names. Once a rule has continued past an
+            // answer, the outcome may be a static answer or come from a jump target, which
+            // do not renew it: see the Static branch and the Success arm.
+            // 刷新更新的是 `refresh` 所指的条目。规则越过一个应答之后，结果可能是静态应答或
+            // 来自跳转目标，它们不会更新这条：见 Static 分支和 Success 分支。
+            let view = requester.ecs_view();
+            let drop_refreshed = |target: &RefreshTarget| {
+                let question = CachedQuestion {
+                    qname: qname_ref,
+                    pipeline_id: &target.pipeline,
+                    qtype: u16::from(qtype),
+                };
+                self.drop_refreshed(target.slot, &question, &view, target);
+            };
             let mut refresh_passed_an_answer = false;
             // 决策循环的第几轮：第一轮在任何转发之前 / Which pass of the decision loop: the first runs before anything is forwarded
             let mut pass = 0u32;
@@ -1346,27 +1439,28 @@ impl Engine {
                         // its forward and with its ECS. Handed to an allow here, it would be cached
                         // under this pipeline's key and served to requests that come here directly.
                         reused_response = None;
+                        // So do the forwards behind it: this pipeline's answers depend on its
+                        // own forwards only. What they made the answer depend on still counts
+                        // for the echo.
+                        // 它之前的转发也一样：这个 pipeline 的应答只取决于它自己的转发。它们让
+                        // 应答依赖的部分，回显时仍要算上。
+                        echo_floor = echo_floor.max(trail.echo_scope(&requester.ecs_view()));
+                        trail = EcsReach::default();
                         route_matches_edns |= p.matches_edns;
                         if let Some(observed) = &observed {
                             observed
                                 .observer
                                 .pipeline_selected(&observed.ctx, &current_pipeline_id);
                         }
-                        // Must recompute ECS key + dedupe_hash: pipeline changed via Jump,
-                        // so the target pipeline's ECS config may differ from the source.
-                        // 必须重算 ECS key + dedupe_hash：pipeline 因 Jump 改变，
-                        // 目标 pipeline 的 ECS 配置可能与源 pipeline 不同。
-                        let jump_ecs_key = p.ecs.as_ref().and_then(|mode| {
-                            crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
-                        });
-                        dedupe_hash = Self::calculate_cache_hash_for_dedupe(
+                        // The keys follow the pipeline / 键随 pipeline 改变
+                        keys = Self::cache_keys(
                             state.cache_namespace(&current_pipeline_id),
                             &current_pipeline_id,
                             qname_bytes,
                             qtype,
                             qclass,
-                            jump_ecs_key.as_ref(),
                             &p.requester.key(requester, Some(&self.geoip_manager)),
+                            client_ecs.as_ref(),
                         );
                         // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
                         // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
@@ -1402,11 +1496,11 @@ impl Engine {
                                         qtype,
                                         qclass,
                                         pipeline_id: &current_pipeline_id,
-                                        dedupe_hash,
+                                        slot: keys.slot,
                                         tx_id,
                                         start,
                                         peer: &peer,
-                                        edns_present,
+                                        requester,
                                         observed: observed_ctx,
                                     },
                                     &mut response_log.info,
@@ -1461,7 +1555,9 @@ impl Engine {
                                     "no answer after a continue",
                                 ));
                             }
-                            self.cache_invalidate(&refresh_key);
+                            if let Some(target) = &refresh {
+                                drop_refreshed(target);
+                            }
                         }
                         return phases::handle_static_decision(
                             self,
@@ -1470,7 +1566,8 @@ impl Engine {
                                 qname,
                                 qtype,
                                 pipeline_id: &current_pipeline_id,
-                                dedupe_hash,
+                                slot: keys.slot,
+                                reach: &trail,
                                 min_ttl,
                                 start,
                                 peer: &peer,
@@ -1505,13 +1602,16 @@ impl Engine {
                                 tx_id,
                                 pipeline_id: &current_pipeline_id,
                                 rule_name: &rule_name,
-                                dedupe_hash,
+                                keys,
                                 min_ttl,
                                 upstream_timeout,
                                 start,
                                 peer: &peer,
-                                edns_present,
+                                requester,
                                 skip_cache,
+                                refresh: refresh.as_ref(),
+                                trail: &mut trail,
+                                echo_floor,
                                 upstream: &upstream,
                                 pre_split_upstreams: pre_split_upstreams.as_ref(),
                                 response_matchers: &response_matchers,
@@ -1540,11 +1640,12 @@ impl Engine {
                                 // 只要不是失败（SERVFAIL，或失败时返回的目标旧结果，也是
                                 // 刷新唯一可能的缓存命中），那里的条目就已经和规则对不上。
                                 if refresh_passed_an_answer
-                                    && dedupe_hash != refresh_key
+                                    && let Some(target) = &refresh
+                                    && keys.slot != target.slot
                                     && !phases::is_servfail(&bytes)
                                     && !response_log.info.cache_hit
                                 {
-                                    self.cache_invalidate(&refresh_key);
+                                    drop_refreshed(target);
                                 }
                                 return Ok(bytes);
                             }
@@ -1627,12 +1728,33 @@ impl Engine {
         // continue 过的请求走到这里仍持有条目，等待者拿到最终应答：条目的键只让 continue
         // 之后运行的规则一样对待的请求方等在上面（见 `RuntimePipeline::requester`）。请求
         // 返回错误或被取消时，守卫被丢弃并移除条目，等待者自己转发。
+        let requester = Requester {
+            address: peer.ip(),
+            edns: edns_present,
+            ecs: client_ecs,
+        };
         if let Some(mut guard) = held_inflight.take()
             && let Ok(bytes) = &result
         {
             guard.defuse();
-            self.notify_inflight_waiters(guard.hash, bytes).await;
+            self.notify_inflight_waiters(guard.hash, || {
+                phases::for_waiters(bytes, &requester, &trail, echo_floor)
+            })
+            .await;
         }
+        if let (Some(target), Ok(_)) = (&refresh, &result) {
+            self.settle_refresh(target, &trail, qname_ref, u16::from(qtype));
+        }
+        // Every reply leaves with the ECS option its client should see; waiters were
+        // handed the reply before this and do the same for their own clients
+        // 每个应答都带着它的客户端该看到的 ECS 选项离开；等待者在这之前拿到应答，各自为自己的
+        // 客户端做同样的处理
+        let result = if skip_cache {
+            result
+        } else {
+            let at_least = echo_floor.max(trail.echo_scope(&requester.ecs_view()));
+            result.map(|bytes| phases::client_reply(bytes, client_ecs.as_ref(), at_least))
+        };
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
             observed.finish(&result);
@@ -1640,15 +1762,22 @@ impl Engine {
         result
     }
 
-    pub(crate) async fn notify_inflight_waiters(&self, dedupe_hash: u64, bytes: &Bytes) {
+    /// `reply` is built only when someone waits / 有请求在等时才构造 `reply`
+    pub(crate) async fn notify_inflight_waiters(
+        &self,
+        dedupe_hash: u64,
+        reply: impl FnOnce() -> Bytes,
+    ) {
         // ========== NEW: Use tokio::watch for lock-free notification ==========
         // 使用 tokio::watch 实现无锁通知
         // Remove the watch sender from inflight map and send result
         // 从 inflight map 移除 watch sender 并发送结果
-        if let Some((_, tx)) = self.inflight.remove(&dedupe_hash) {
+        if let Some((_, tx)) = self.inflight.remove(&dedupe_hash)
+            && tx.receiver_count() > 0
+        {
             // Send result to all waiters (lock-free)
             // 向所有等待者发送结果 (无锁)
-            let _ = tx.send(Ok(bytes.clone()));
+            let _ = tx.send(Ok(reply()));
         }
     }
 
@@ -1663,22 +1792,13 @@ impl Engine {
     pub(crate) fn spawn_background_refresh(
         &self,
         state: Arc<EngineInner>,
-        cache_hash: u64,
-        pipeline_id: &str,
-        qname: &str,
-        qtype: hickory_proto::rr::RecordType,
+        renewed: &CacheEntry,
+        slot: u64,
         qclass: DNSClass,
         requester: Requester,
     ) {
         crate::engine::refresh::spawn_background_refresh(
-            self,
-            state,
-            cache_hash,
-            pipeline_id,
-            qname,
-            qtype,
-            qclass,
-            requester,
+            self, state, renewed, slot, qclass, requester,
         )
     }
 
@@ -1693,14 +1813,16 @@ impl Engine {
     /// - 生成有效的 TXID（不是 0）
     /// - 设置正确的标志（需要递归）
     /// - 正确编码 QNAME
-    /// - Carries EDNS when `edns` is set, as the request being replayed did
-    /// - `edns` 为真时带上 EDNS，与被重放的请求一致
+    /// - Carries EDNS when `edns` is set, and the client's own ECS `ecs`, as the
+    ///   request being replayed did
+    /// - `edns` 为真时带上 EDNS，并带上客户端自己的 ECS `ecs`，与被重放的请求一致
     pub(crate) fn construct_dns_packet(
         &self,
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
         _qclass: DNSClass, // Currently defaults to IN class, parameter reserved for future use
         edns: bool,
+        ecs: Option<&crate::ecs::EcsKey>,
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
         use hickory_proto::rr::Name;
@@ -1723,9 +1845,22 @@ impl Engine {
         let name = Name::from_str(qname)?;
         let query = Query::query(name.clone(), qtype);
         msg.add_query(query);
-        if edns {
+        // An ECS option only travels inside EDNS / ECS 选项只能放在 EDNS 里
+        if edns || ecs.is_some() {
             let mut opt = hickory_proto::op::Edns::new();
             opt.set_max_payload(REFRESH_EDNS_PAYLOAD);
+            if let Some(subnet) = ecs
+                && let Some(address) = subnet.ip()
+            {
+                opt.options_mut()
+                    .insert(hickory_proto::rr::rdata::opt::EdnsOption::Subnet(
+                        hickory_proto::rr::rdata::opt::ClientSubnet::new(
+                            address,
+                            subnet.source_prefix,
+                            0,
+                        ),
+                    ));
+            }
             msg.edns = Some(opt);
         }
 
@@ -1795,19 +1930,27 @@ mod tests {
         let original = runtime_with_upstream("8.8.8.8:53");
         let engine = Engine::new(original.clone(), "test".to_string()).expect("create engine");
         let original_namespace = engine.state.load().cache_namespace("main");
-        let old_key = Engine::calculate_cache_hash_for_dedupe(
+        let old_key = Engine::cache_keys(
             original_namespace,
             "main",
             b"example.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
+        // A real reply: the cache keeps only replies it can read through to their ECS
+        // 真实的应答：缓存只存它能读到 ECS 为止的应答
+        let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
+        reply.add_query(Query::query(
+            Name::from_str("example.com").unwrap(),
+            RecordType::A,
+        ));
         engine.insert_dns_cache_entry(
             old_key,
             CacheEntry::from_response(
-                Bytes::from_static(b"cached response"),
+                Bytes::from(reply.to_vec().unwrap()),
                 ResponseCode::NoError,
                 Some(Arc::from("8.8.8.8:53")),
                 "example.com",
@@ -1823,7 +1966,7 @@ mod tests {
             engine.state.load().cache_namespace("main"),
             "an unchanged pipeline should retain its cache namespace"
         );
-        assert!(engine.cache_get(&old_key).is_some());
+        assert!(engine.cached(old_key).is_some());
 
         engine.reload(runtime_with_upstream("8.8.4.4:53"));
         let changed_namespace = engine.state.load().cache_namespace("main");
@@ -1832,18 +1975,19 @@ mod tests {
             "a changed pipeline must stop addressing entries from the old configuration"
         );
 
-        let new_key = Engine::calculate_cache_hash_for_dedupe(
+        let new_key = Engine::cache_keys(
             changed_namespace,
             "main",
             b"example.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
         assert_ne!(old_key, new_key);
         assert!(
-            engine.cache_get(&new_key).is_none(),
+            engine.cached(new_key).is_none(),
             "the changed pipeline must not address the previous response cache entry"
         );
     }
@@ -1854,27 +1998,29 @@ mod tests {
             .expect("create engine");
         let old_state = engine.state.load_full();
         let old_namespace = old_state.cache_namespace("main");
-        let old_key = Engine::calculate_cache_hash_for_dedupe(
+        let old_key = Engine::cache_keys(
             old_namespace,
             "main",
             b"example.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         engine.reload(runtime_with_static_ip("192.0.2.2"));
         let new_namespace = engine.state.load().cache_namespace("main");
-        let new_key = Engine::calculate_cache_hash_for_dedupe(
+        let new_key = Engine::cache_keys(
             new_namespace,
             "main",
             b"example.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
         request.add_query(Query::query(
@@ -1887,7 +2033,7 @@ mod tests {
                 "127.0.0.1:53000".parse().unwrap(),
                 true,
                 None,
-                Some(old_key),
+                Some(engine.refresh_of(old_key)),
                 Some(old_state),
             )
             .await
@@ -1898,9 +2044,9 @@ mod tests {
             response.answers.first().map(|record| &record.data),
             Some(RData::A(address)) if address.0 == "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
         ));
-        assert!(engine.cache_get(&old_key).is_some());
+        assert!(engine.cached(old_key).is_some());
         assert!(
-            engine.cache_get(&new_key).is_none(),
+            engine.cached(new_key).is_none(),
             "work from the old snapshot must not populate the active generation"
         );
     }
@@ -1965,47 +2111,27 @@ mod tests {
         RuntimePipelineConfig::from_config(config).expect("build runtime config")
     }
 
+    /// 响应跳转执行请求所用配置快照里的目标 pipeline，并且不写缓存：没有哪次查找用响应跳转
+    /// 路径的键，以前写在那里的应答从来没人读。
+    /// A response jump runs the target pipeline of the request's configuration
+    /// snapshot, and caches nothing: no lookup uses a key of the response-jump
+    /// path, and answers once written there were never read.
     #[tokio::test]
-    async fn response_jump_writes_only_into_its_own_generation() {
+    async fn a_response_jump_runs_its_own_generation_and_caches_nothing() {
         let upstream = spawn_echo_upstream().await;
         let engine =
             Engine::new(jump_config(&upstream, "192.0.2.1"), "test".to_string()).expect("engine");
         let old_state = engine.state.load_full();
-        let old_target_key = Engine::calculate_cache_hash_for_dedupe(
-            old_state.cache_namespace("target"),
-            "target",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            None,
-            // Keys on the response-jump path are kept apart from direct ones
-            // 响应跳转路径上的键与直接进入的分开
-            &RequesterKey::NONE.on_response_jump_path(None),
-        );
 
         // Reload changes only the jump target, so "target" rotates its
         // namespace while the entry pipeline stays warm.
         engine.reload(jump_config(&upstream, "192.0.2.2"));
-        let new_state = engine.state.load_full();
-        let new_target_key = Engine::calculate_cache_hash_for_dedupe(
-            new_state.cache_namespace("target"),
-            "target",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            None,
-            // Keys on the response-jump path are kept apart from direct ones
-            // 响应跳转路径上的键与直接进入的分开
-            &RequesterKey::NONE.on_response_jump_path(None),
-        );
 
         let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
         request.add_query(Query::query(
             Name::from_str("example.com").unwrap(),
             RecordType::A,
         ));
-        // No explicit cache hash: the jump-path key must be recomputed from
-        // the request snapshot, exercising the phases.rs threading.
         let response = engine
             .handle_packet_internal(
                 &request.to_vec().unwrap(),
@@ -2025,13 +2151,11 @@ mod tests {
             response.answers.first().map(|record| &record.data),
             Some(RData::A(address)) if address.0 == "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
         ));
-        assert!(
-            engine.cache_get(&old_target_key).is_some(),
-            "the response jump must cache under the snapshot generation's key"
-        );
-        assert!(
-            engine.cache_get(&new_target_key).is_none(),
-            "the response jump must not populate the active generation"
+        engine.cache.run_pending_tasks();
+        assert_eq!(
+            engine.cache.entry_count(),
+            0,
+            "nothing on the response-jump path is cached"
         );
     }
 
@@ -2633,19 +2757,20 @@ mod tests {
             "test".to_string(),
         )
         .expect("engine");
-        let key = Engine::calculate_cache_hash_for_dedupe(
+        let keys = Engine::cache_keys(
             engine.state.load().cache_namespace("main"),
             "main",
             b"example.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &RequesterKey::NONE,
+            None,
         );
-        // 另一个请求在刷新的键下登记的条目 / Another request's entry under the refresh's key
+        let key = keys.slot;
+        // 另一个请求在刷新所用的 inflight 键下登记的条目 / Another request's entry under the refresh's inflight key
         let (owner, waiter) =
             tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
-        engine.inflight.insert(key, owner);
+        engine.inflight.insert(keys.inflight, owner);
 
         let refreshed = tokio::time::timeout(
             Duration::from_secs(5),
@@ -2654,7 +2779,7 @@ mod tests {
                 "10.0.0.1:53000".parse().unwrap(),
                 true,
                 None,
-                Some(key),
+                Some(engine.refresh_of(key)),
                 None,
             ),
         )
@@ -2667,7 +2792,7 @@ mod tests {
                 .expect("the entry's owner is still there"),
             "the refresh must not hand its answer to another request's entry"
         );
-        assert!(engine.inflight.contains_key(&key));
+        assert!(engine.inflight.contains_key(&keys.inflight));
     }
 
     /// continue 之后还能跳几次，取决于请求一路怎么来的，键里没有这一项。经过两次跳转才到
@@ -3652,6 +3777,7 @@ mod tests {
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
+            trail: None,
         };
         let result = apply_response_actions(ctx)
             .await
@@ -3698,6 +3824,7 @@ mod tests {
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
+            trail: None,
         };
         let result = apply_response_actions(ctx)
             .await
@@ -3748,6 +3875,7 @@ mod tests {
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
+            trail: None,
         };
         let result = apply_response_actions(ctx)
             .await
@@ -3789,6 +3917,7 @@ mod tests {
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
+            trail: None,
         };
         let result = apply_response_actions(ctx)
             .await
@@ -3836,6 +3965,7 @@ mod tests {
                 pipeline_id: "pipeline",
                 rule_name: "rule",
                 remaining_jumps: 10,
+                trail: None,
             };
             apply_response_actions(ctx)
         };
@@ -3920,6 +4050,7 @@ mod tests {
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
+            trail: None,
         };
 
         match apply_response_actions(ctx).await.expect("static cname") {
@@ -3960,7 +4091,8 @@ mod tests {
             qname: "example.com",
             qtype: RecordType::A,
             pipeline_id: &Arc::from("p1"),
-            dedupe_hash: 4242,
+            slot: 4242,
+            reach: &EcsReach::default(),
             min_ttl: Duration::from_secs(60),
             start: Instant::now(),
             peer: &peer,
@@ -3971,7 +4103,7 @@ mod tests {
 
         // Assert: no dns_cache entry written
         assert!(
-            engine.cache_get(&4242).is_none(),
+            engine.cached(4242).is_none(),
             "static decision with client_ip matcher must not pollute dns_cache"
         );
 
@@ -3981,7 +4113,8 @@ mod tests {
             qname: "example.com",
             qtype: RecordType::A,
             pipeline_id: &Arc::from("p1"),
-            dedupe_hash: 4243,
+            slot: 4243,
+            reach: &EcsReach::default(),
             min_ttl: Duration::from_secs(60),
             start: Instant::now(),
             peer: &peer,
@@ -3991,7 +4124,7 @@ mod tests {
             .expect("static decision");
 
         assert!(
-            engine.cache_get(&4243).is_some(),
+            engine.cached(4243).is_some(),
             "static decision without client_ip matcher should still be cached"
         );
     }
@@ -4036,6 +4169,7 @@ mod tests {
             hash(class(1)),
             hash(RequesterKey {
                 class: Some(1),
+                subnets: None,
                 address: Some(ip1)
             })
         );
@@ -4049,15 +4183,16 @@ mod tests {
         let qname = "expire.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+        let dedupe_hash = Engine::cache_keys(
             0,
             &pipeline_id,
             qname.as_bytes(),
             qtype,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
@@ -4070,8 +4205,11 @@ mod tests {
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5, // Expired 5 seconds ago
             refresh_ttl: 5,
+            reach: Default::default(),
+            stored_at: Instant::now(),
+            fetched_at: Instant::now(),
         };
-        engine.cache.insert(dedupe_hash, Arc::new(entry));
+        engine.cache_insert(dedupe_hash, Arc::new(entry));
 
         // Act: Create DNS query packet and check fast path
         let mut packet = vec![0u8; 12];
@@ -4080,7 +4218,7 @@ mod tests {
         packet[5] = 1; // QDCOUNT
         packet.extend_from_slice(b"\x06expire\x03com\x00\x00\x01\x00\x01");
 
-        let peer = "127.0.0.1:12345".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let fast_res = engine.handle_packet_fast(&packet, peer).unwrap();
 
         // Assert: Expired cache should NOT be served — should fall through to AsyncNeeded
@@ -4100,9 +4238,39 @@ mod tests {
             }
         }
 
+        // The fast path leaves the expired entry to the async path's lookup, which a
+        // listener runs next: that lookup picks the same entry and, with serve_stale
+        // off (build_test_engine), removes it before the request forwards
+        // 快速路径把过期条目留给异步路径的查找（监听器接着就会走它）：那次查找选中同一条，
+        // serve_stale 关着（build_test_engine），在请求转发之前把它删掉
+        assert!(engine.cached(dedupe_hash).is_some());
+        let state = engine.state.load_full();
+        let requester = Requester {
+            address: peer.ip(),
+            edns: false,
+            ecs: None,
+        };
+        let looked_up = phases::check_cache(
+            &engine,
+            &phases::CacheLookupContext {
+                state: &state,
+                qname,
+                qtype,
+                qclass,
+                pipeline_id: &pipeline_id,
+                slot: dedupe_hash,
+                tx_id: 0xAABB,
+                start: Instant::now(),
+                peer: &peer,
+                requester,
+                observed: None,
+            },
+        );
+        assert!(looked_up.is_none(), "an expired entry is not served");
+
         // Assert: Verify cache entry was invalidated (serve_stale disabled in build_test_engine)
         assert!(
-            engine.cache.get(&dedupe_hash).is_none(),
+            engine.cached(dedupe_hash).is_none(),
             "Cache entry should be removed after expiration check"
         );
     }
@@ -4172,16 +4340,17 @@ mod tests {
 
         let pipeline_id: Arc<str> = Arc::from("default");
         let qname = "stale.com";
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+        let dedupe_hash = Engine::cache_keys(
             engine.state.load().cache_namespace(&pipeline_id),
             &pipeline_id,
             qname.as_bytes(),
             RecordType::A,
             DNSClass::IN,
-            None,
             &RequesterKey::NONE,
-        );
-        engine.cache.insert(
+            None,
+        )
+        .slot;
+        engine.cache_insert(
             dedupe_hash,
             Arc::new(CacheEntry {
                 bytes: Bytes::from_static(b"old_resp"),
@@ -4193,6 +4362,9 @@ mod tests {
                 inserted_at: Instant::now() - Duration::from_secs(10),
                 original_ttl: 5,
                 refresh_ttl: 5,
+                reach: Default::default(),
+                stored_at: Instant::now(),
+                fetched_at: Instant::now(),
             }),
         );
 
@@ -4249,16 +4421,17 @@ mod tests {
 
         let pipeline_id: Arc<str> = Arc::from("default");
         let qname = "stale.com";
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
+        let dedupe_hash = Engine::cache_keys(
             engine.state.load().cache_namespace(&pipeline_id),
             &pipeline_id,
             qname.as_bytes(),
             RecordType::A,
             DNSClass::IN,
-            None,
             &RequesterKey::NONE,
-        );
-        engine.cache.insert(
+            None,
+        )
+        .slot;
+        engine.cache_insert(
             dedupe_hash,
             Arc::new(CacheEntry {
                 bytes: Bytes::from_static(b"old_resp"),
@@ -4270,6 +4443,9 @@ mod tests {
                 inserted_at: Instant::now() - Duration::from_secs(10),
                 original_ttl: 5,
                 refresh_ttl: 5,
+                reach: Default::default(),
+                stored_at: Instant::now(),
+                fetched_at: Instant::now(),
             }),
         );
 
@@ -4284,7 +4460,7 @@ mod tests {
             .expect("parse query");
 
         assert!(
-            engine.cache.get(&dedupe_hash).is_some(),
+            engine.cached(dedupe_hash).is_some(),
             "serve_stale enabled by the reload must keep the expired entry"
         );
     }
@@ -4325,17 +4501,21 @@ mod tests {
         )
         .expect("initialize engine");
 
-        let pipeline_id: Arc<str> = Arc::from("default");
-        let dedupe_hash = Engine::calculate_cache_hash_for_dedupe(
-            engine.state.load().cache_namespace(&pipeline_id),
-            &pipeline_id,
+        let dedupe_hash = stale_com_keys(&engine).slot;
+        (engine, dedupe_hash)
+    }
+
+    /// The keys of the `stale.com` query in the default pipeline / 默认 pipeline 里 `stale.com` 查询的键
+    fn stale_com_keys(engine: &Engine) -> CacheKeys {
+        Engine::cache_keys(
+            engine.state.load().cache_namespace("default"),
+            "default",
             b"stale.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &crate::matcher::RequesterKey::NONE,
-        );
-        (engine, dedupe_hash)
+            None,
+        )
     }
 
     fn engine_from_json(raw: serde_json::Value) -> Engine {
@@ -4360,6 +4540,9 @@ mod tests {
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5,
             refresh_ttl: 5,
+            reach: Default::default(),
+            stored_at: Instant::now(),
+            fetched_at: Instant::now(),
         })
     }
 
@@ -4368,7 +4551,14 @@ mod tests {
     async fn refresh(engine: &Engine, cache_hash: u64) -> anyhow::Result<Bytes> {
         let peer = "127.0.0.1:12345".parse().unwrap();
         engine
-            .handle_packet_internal(&stale_com_query(), peer, true, None, Some(cache_hash), None)
+            .handle_packet_internal(
+                &stale_com_query(),
+                peer,
+                true,
+                None,
+                Some(engine.refresh_of(cache_hash)),
+                None,
+            )
             .await
     }
 
@@ -4391,7 +4581,7 @@ mod tests {
     async fn a_failed_background_refresh_reports_the_failure_and_leaves_the_entry_alone() {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
         let stale = stale_entry("default");
-        engine.cache.insert(dedupe_hash, stale.clone());
+        engine.cache_insert(dedupe_hash, stale.clone());
 
         let err = refresh(&engine, dedupe_hash)
             .await
@@ -4399,8 +4589,7 @@ mod tests {
 
         assert_upstream_failure(&err);
         let cached = engine
-            .cache
-            .get(&dedupe_hash)
+            .cached(dedupe_hash)
             .expect("a failed refresh must keep the stale entry");
         assert!(
             Arc::ptr_eq(&cached, &stale),
@@ -4417,8 +4606,11 @@ mod tests {
     #[tokio::test]
     async fn a_failed_background_refresh_leaves_other_requests_waiters_alone() {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
+        // Another request registered under the inflight key a forward of this query uses
+        // 另一个请求在这个查询转发时所用的 inflight 键下登记了条目
+        let inflight = stale_com_keys(&engine).inflight;
         let (tx, rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
-        engine.inflight.insert(dedupe_hash, tx);
+        engine.inflight.insert(inflight, tx);
 
         let result = refresh(&engine, dedupe_hash).await;
 
@@ -4427,7 +4619,7 @@ mod tests {
             "a refresh whose upstreams all failed must fail"
         );
         assert!(
-            engine.inflight.contains_key(&dedupe_hash),
+            engine.inflight.contains_key(&inflight),
             "the other request's inflight entry must stay registered"
         );
         assert!(
@@ -4444,23 +4636,18 @@ mod tests {
     #[tokio::test]
     async fn a_failed_background_refresh_releases_its_mark_when_it_ends() {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
-        let marked = || {
-            is_refreshing(
-                &engine.refreshing_bitmap,
-                &engine.refreshing_set,
-                dedupe_hash,
-            )
-        };
+        let renewed = stale_entry("default");
+        let mark = RefreshTarget::mark_of(dedupe_hash, &renewed.reach);
+        let marked = || is_refreshing(&engine.refreshing_bitmap, &engine.refreshing_set, mark);
         engine.spawn_background_refresh(
             engine.state.load_full(),
+            &renewed,
             dedupe_hash,
-            "default",
-            "stale.com",
-            RecordType::A,
             DNSClass::IN,
             Requester {
                 address: "127.0.0.1".parse().unwrap(),
                 edns: false,
+                ecs: None,
             },
         );
         assert!(marked(), "the refresh must be marked while it runs");
@@ -4543,7 +4730,7 @@ mod tests {
             }]
         }));
         let stale = stale_entry("main");
-        engine.cache.insert(1, stale.clone());
+        engine.cache_insert(1, stale.clone());
 
         let err = refresh(&engine, 1)
             .await
@@ -4551,8 +4738,7 @@ mod tests {
 
         assert_upstream_failure(&err);
         let cached = engine
-            .cache
-            .get(&1)
+            .cached(1)
             .expect("a failed refresh must keep the stale entry");
         assert!(
             Arc::ptr_eq(&cached, &stale),
@@ -4669,24 +4855,26 @@ mod tests {
         let qclass_ch = DNSClass::CH;
 
         // Act: Calculate hashes for same QNAME+QTYPE but different QCLASS
-        let hash_in = Engine::calculate_cache_hash_for_dedupe(
+        let hash_in = Engine::cache_keys(
             0,
             pipeline_id,
             qname.as_bytes(),
             qtype,
             qclass_in,
-            None,
             &RequesterKey::NONE,
-        );
-        let hash_ch = Engine::calculate_cache_hash_for_dedupe(
+            None,
+        )
+        .slot;
+        let hash_ch = Engine::cache_keys(
             0,
             pipeline_id,
             qname.as_bytes(),
             qtype,
             qclass_ch,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         // Assert: Verify different QCLASS produces different hashes
         assert_ne!(
@@ -4695,15 +4883,16 @@ mod tests {
         );
 
         // Act: Calculate hash for same QCLASS to verify consistency
-        let hash_in2 = Engine::calculate_cache_hash_for_dedupe(
+        let hash_in2 = Engine::cache_keys(
             0,
             pipeline_id,
             qname.as_bytes(),
             qtype,
             qclass_in,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         // Assert: Verify same QCLASS produces same hash
         assert_eq!(
@@ -4728,33 +4917,36 @@ mod tests {
         // So we simulate that behavior by lowercasing the input first
         // 注意：在 parse_quick() 中，qname 在传递给此函数之前已经转为小写
         // 所以我们通过先小写输入来模拟这种行为
-        let hash1 = Engine::calculate_cache_hash_for_dedupe(
+        let hash1 = Engine::cache_keys(
             0,
             pipeline_id,
             qname_lower.to_lowercase().as_bytes(),
             qtype,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
-        let hash2 = Engine::calculate_cache_hash_for_dedupe(
+            None,
+        )
+        .slot;
+        let hash2 = Engine::cache_keys(
             0,
             pipeline_id,
             qname_upper.to_lowercase().as_bytes(),
             qtype,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
-        let hash3 = Engine::calculate_cache_hash_for_dedupe(
+            None,
+        )
+        .slot;
+        let hash3 = Engine::cache_keys(
             0,
             pipeline_id,
             qname_mixed.to_lowercase().as_bytes(),
             qtype,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         // Assert: Verify case-insensitive hashing produces same results
         assert_eq!(hash1, hash2, "QNAME hash should be case-insensitive");
@@ -4772,24 +4964,26 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QTYPE values
-        let hash_a = Engine::calculate_cache_hash_for_dedupe(
+        let hash_a = Engine::cache_keys(
             0,
             pipeline_id,
             qname.as_bytes(),
             qtype_a,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
-        let hash_aaaa = Engine::calculate_cache_hash_for_dedupe(
+            None,
+        )
+        .slot;
+        let hash_aaaa = Engine::cache_keys(
             0,
             pipeline_id,
             qname.as_bytes(),
             qtype_aaaa,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         // Assert: Verify different QTYPE produces different hashes
         assert_ne!(
@@ -4809,24 +5003,26 @@ mod tests {
         let qclass = DNSClass::IN;
 
         // Act: Calculate hashes for different QNAME values
-        let hash1 = Engine::calculate_cache_hash_for_dedupe(
+        let hash1 = Engine::cache_keys(
             0,
             pipeline_id,
             qname1.as_bytes(),
             qtype,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
-        let hash2 = Engine::calculate_cache_hash_for_dedupe(
+            None,
+        )
+        .slot;
+        let hash2 = Engine::cache_keys(
             0,
             pipeline_id,
             qname2.as_bytes(),
             qtype,
             qclass,
-            None,
             &RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
 
         // Assert: Verify different QNAME produces different hashes
         assert_ne!(
@@ -5266,6 +5462,19 @@ mod jump_response_cache_tests {
     /// UDP 上游：每个查询都答 `ip`（TTL 为 `ttl` 秒），并数一共收到几个查询
     /// UDP upstream that answers every query with `ip` (TTL `ttl` seconds) and counts the queries it receives
     async fn counting_upstream(ip: Ipv4Addr, ttl: u32) -> (String, Arc<AtomicUsize>) {
+        counting_upstream_echoing(ip, ttl, None).await
+    }
+
+    /// 同上，并把查询带来的 ECS 原样回显，作用范围为 `scope`（None 表示应答不带 ECS），像支持
+    /// ECS 的上游那样
+    /// The same, echoing the ECS the query carries with scope `scope` (None: the
+    /// reply carries no ECS), as an ECS-aware upstream does
+    async fn counting_upstream_echoing(
+        ip: Ipv4Addr,
+        ttl: u32,
+        scope: Option<u8>,
+    ) -> (String, Arc<AtomicUsize>) {
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap().to_string();
         let queries = Arc::new(AtomicUsize::new(0));
@@ -5288,6 +5497,21 @@ mod jump_response_cache_tests {
                     ttl,
                     RData::A(A(ip)),
                 ));
+                if let Some(scope) = scope
+                    && let Some(EdnsOption::Subnet(subnet)) = request
+                        .edns
+                        .as_ref()
+                        .and_then(|edns| edns.options().get(EdnsCode::Subnet))
+                {
+                    let mut edns = hickory_proto::op::Edns::new();
+                    edns.options_mut()
+                        .insert(EdnsOption::Subnet(ClientSubnet::new(
+                            subnet.addr(),
+                            subnet.source_prefix(),
+                            scope,
+                        )));
+                    response.edns = Some(edns);
+                }
                 let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
             }
         });
@@ -5711,14 +5935,16 @@ mod jump_response_cache_tests {
         assert_eq!(queries.load(Ordering::SeqCst), 2);
     }
 
-    /// 目标的转发按客户端地址带 ECS 子网、缓存键却不分子网时，跳转后不查缓存：
-    /// 按一个子网定制的应答不能给另一个子网的客户端。
-    /// A target whose forward sends the client's ECS subnet, while its cache key does not
-    /// carry the subnet, does not look after a jump: an answer tailored to one subnet must
-    /// not go to a client in another.
+    /// 目标的转发按客户端地址带 ECS 子网时，跳转后照常查缓存，但按一个子网定制的应答（作用
+    /// 范围 /24）不会给另一个子网的客户端；同一个子网的客户端在跳转之后从缓存拿到它。
+    /// A target whose forward sends the client's ECS subnet is looked up after a jump
+    /// as usual, but an answer tailored to one subnet (scope /24) does not go to a
+    /// client in another; a client in the same subnet gets it from the cache after
+    /// the jump.
     #[tokio::test]
     async fn a_target_forwarding_the_client_subnet_is_not_served_across_subnets() {
-        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let (upstream, queries) =
+            counting_upstream_echoing(Ipv4Addr::new(192, 0, 2, 1), 300, Some(24)).await;
         let engine = engine(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": jump_to_group(serde_json::json!([{
@@ -5736,6 +5962,34 @@ mod jump_response_cache_tests {
         answer(&engine, "cdn.example", "198.51.100.10").await;
         answer(&engine, "cdn.example", "203.0.113.10").await;
         assert_eq!(queries.load(Ordering::SeqCst), 2);
+        answer(&engine, "cdn.example", "198.51.100.77").await;
+        assert_eq!(queries.load(Ordering::SeqCst), 2);
+    }
+
+    /// 上游的应答不带 ECS 时，按 RFC 7871 第 7.3 节当作作用范围 0：跳转后别的子网的客户端也从
+    /// 缓存拿到它。
+    /// A reply without ECS counts as scope 0 (RFC 7871 section 7.3): after the jump,
+    /// a client in another subnet gets it from the cache too.
+    #[tokio::test]
+    async fn a_target_answer_without_ecs_is_shared_across_subnets() {
+        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
+            "pipelines": jump_to_group(serde_json::json!([{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{
+                    "type": "forward",
+                    "upstream": upstream,
+                    "transport": "udp",
+                    "ecs": { "mode": "from_client_ip" }
+                }]
+            }]))
+        }));
+
+        answer(&engine, "cdn.example", "198.51.100.10").await;
+        answer(&engine, "cdn.example", "203.0.113.10").await;
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
     }
 
     /// 按「谁在问」判断的四种请求匹配会让 pipeline 带上标记，按问题本身判断的不会；
@@ -5751,33 +6005,26 @@ mod jump_response_cache_tests {
                 "actions": [{ "type": "forward", "upstream": "127.0.0.1:9", "ecs": ecs }]
             })
         };
+        // 转发怎样发送 ECS 都不算：因 ECS 子网而不同的应答由缓存按子网区分（见 `CacheEntry::reach`，
+        // 以及 `a_target_forwarding_the_client_subnet_is_not_served_across_subnets`）。pipeline 级
+        // 的 `ecs` 也不再起作用。
+        // No way of sending ECS counts: answers that differ by ECS subnet are told apart
+        // by the cache (see `CacheEntry::reach`, and
+        // `a_target_forwarding_the_client_subnet_is_not_served_across_subnets`). The
+        // pipeline-level `ecs` no longer counts either.
         let ecs_cases = [
-            // 转发按客户端带子网，pipeline 级不按客户端区分 / A forward sends the client subnet; the pipeline level does not key by it
             (
                 serde_json::json!({ "id": "p", "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))] }),
-                true,
-            ),
-            // pipeline 级也按客户端子网区分缓存 / The pipeline level keys the cache by the client subnet too
-            (
-                serde_json::json!({
-                    "id": "p",
-                    "ecs": { "mode": "from_client_ip" },
-                    "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))]
-                }),
                 false,
             ),
-            // pipeline 级按客户端区分，但前缀比转发的短：按 /24 定制的应答在整个 /16 里共用
-            // The pipeline level keys by the client, but with a shorter prefix than the forward:
-            // answers tailored per /24 would be shared across the whole /16
             (
                 serde_json::json!({
                     "id": "p",
                     "ecs": { "mode": "from_client_ip", "prefix_v4": 16 },
                     "rules": [forward(serde_json::json!({ "mode": "from_client_ip" }))]
                 }),
-                true,
+                false,
             ),
-            // 固定子网与客户端无关 / A fixed subnet does not depend on the client
             (
                 serde_json::json!({ "id": "p", "rules": [forward(serde_json::json!({ "mode": "static", "ip": "198.51.100.0" }))] }),
                 false,
@@ -5921,9 +6168,10 @@ mod requester_scope_tests {
     const NO_SUBNET: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 99);
 
     /// 按查询带来的 ECS 子网作答的本机上游：应答的地址就是子网地址，没有 ECS 时是
-    /// NO_SUBNET。并计数。
+    /// NO_SUBNET。像按子网作答的上游那样回显查询的 ECS，作用范围就是查询的前缀。并计数。
     /// A local upstream that answers with the ECS subnet the query carries, or
-    /// NO_SUBNET without one, counting the queries.
+    /// NO_SUBNET without one, echoing the query's ECS with its prefix as the scope
+    /// as an upstream answering per subnet does, counting the queries.
     async fn subnet_echo() -> (String, Arc<AtomicUsize>) {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap().to_string();
@@ -5939,17 +6187,16 @@ mod requester_scope_tests {
                     continue;
                 };
                 counted.fetch_add(1, Ordering::Relaxed);
-                let subnet = query
-                    .edns
-                    .as_ref()
-                    .and_then(|edns| match edns.options().get(EdnsCode::Subnet) {
-                        Some(EdnsOption::Subnet(subnet)) => match subnet.addr() {
-                            IpAddr::V4(v4) => Some(v4),
-                            IpAddr::V6(_) => None,
-                        },
+                let sent = query.edns.as_ref().and_then(|edns| {
+                    match edns.options().get(EdnsCode::Subnet) {
+                        Some(EdnsOption::Subnet(subnet)) => Some(*subnet),
                         _ => None,
-                    })
-                    .unwrap_or(NO_SUBNET);
+                    }
+                });
+                let subnet = match sent.map(|subnet| subnet.addr()) {
+                    Some(IpAddr::V4(v4)) => v4,
+                    _ => NO_SUBNET,
+                };
                 let mut resp =
                     Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
                 resp.add_query(question.clone());
@@ -5958,6 +6205,17 @@ mod requester_scope_tests {
                     300,
                     RData::A(hickory_proto::rr::rdata::A(subnet)),
                 ));
+                if let Some(sent) = sent {
+                    let mut edns = Edns::new();
+                    edns.options_mut().insert(EdnsOption::Subnet(
+                        hickory_proto::rr::rdata::opt::ClientSubnet::new(
+                            sent.addr(),
+                            sent.source_prefix(),
+                            sent.source_prefix(),
+                        ),
+                    ));
+                    resp.edns = Some(edns);
+                }
                 let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
             }
         });
@@ -6138,7 +6396,10 @@ mod requester_scope_tests {
             ("answer-edns", vec!["edns"]),
             ("twice", vec!["net 10.0.0.1/32"]),
             ("ecs-unkeyed", vec!["subnet 24/56"]),
-            ("ecs-keyed", vec![]),
+            // The pipeline-level `ecs` keys nothing any more, so the forward's subnet
+            // has to keep waiting requests apart itself
+            // pipeline 级 `ecs` 不再进任何键，转发的子网要自己把等待的请求分开
+            ("ecs-keyed", vec!["subnet 24/56"]),
             ("ecs-finer", vec!["subnet 24/56"]),
         ] {
             assert_eq!(tests_of(&config, pipeline), expected, "{pipeline}");
@@ -6188,7 +6449,9 @@ mod requester_scope_tests {
             ("ecs-source", vec!["subnet 24/56"]),
             // 跳转路径的键带着包里的 ECS / The jump path's keys carry the packet's ECS
             ("ecs-target", vec![]),
-            ("keyed-source", vec![]),
+            // As "ecs-keyed" above: the pipeline-level `ecs` keys nothing any more
+            // 同上面的 "ecs-keyed"：pipeline 级 `ecs` 不再进任何键
+            ("keyed-source", vec!["subnet 24/56"]),
             ("keyed-target", vec![]),
             ("path-source", vec![]),
             ("ecs-on-path", vec!["subnet 24/56"]),
@@ -6297,7 +6560,9 @@ mod requester_scope_tests {
             ("continue-to-client", vec!["net 10.0.0.1/32"]),
             ("to-client", vec![]),
             ("continue-to-ecs", vec!["subnet 24/56"]),
-            ("ecs-keyed", vec![]),
+            // As in `a_scope_has_the_tests_the_rules_tell_requesters_apart_by`
+            // 同 `a_scope_has_the_tests_the_rules_tell_requesters_apart_by`
+            ("ecs-keyed", vec!["subnet 24/56"]),
         ] {
             assert_eq!(tests_of(&config, pipeline), expected, "{pipeline}");
         }

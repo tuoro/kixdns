@@ -266,6 +266,8 @@ impl Engine {
             Requester {
                 address: client_ip,
                 edns: edns_present,
+                // Rule decisions never depend on ECS / 规则决策从不取决于 ECS
+                ecs: None,
             },
             Some(&self.geoip_manager),
         );

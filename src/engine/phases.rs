@@ -1,7 +1,10 @@
 use super::Engine;
-use crate::cache::CacheEntry;
+use crate::cache::{CacheEntry, CachedQuestion};
 use crate::config::{Action, Transport};
+use crate::ecs_scope::{EcsReach, EcsView, ForwardEcs};
+use crate::engine::execution::CacheKeys;
 use crate::engine::observation::{Observed, cached_source, response_decision_kind};
+use crate::engine::refresh::RefreshTarget;
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
@@ -39,13 +42,15 @@ pub struct CacheLookupContext<'a> {
     pub qtype: RecordType,
     pub qclass: DNSClass,
     pub pipeline_id: &'a str,
-    pub dedupe_hash: u64,
+    /// Response cache slot / 响应缓存槽位
+    pub slot: u64,
     pub tx_id: u16,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
-    /// Whether the request carried EDNS; a background refresh replays it the same way.
-    /// 请求是否带 EDNS；后台刷新照此重放。
-    pub edns_present: bool,
+    /// Who is asking: picks the answer in the slot, and a background refresh replays
+    /// the request the same way (address, EDNS, the client's own ECS).
+    /// 谁在问：据此在槽位里挑应答，后台刷新也照此重放请求（地址、EDNS、客户端自己的 ECS）。
+    pub requester: Requester,
     /// Observer context of the request; cache hits are reported through it.
     /// 所属请求的观察者上下文；缓存命中通过它上报。
     pub observed: Observed<'a>,
@@ -68,236 +73,219 @@ pub(crate) fn check_cache_logged(
         qtype,
         qclass,
         pipeline_id,
-        dedupe_hash,
+        slot,
         tx_id,
         start: _,
         peer,
-        edns_present,
+        requester,
         observed,
     } = *context;
+    let view = requester.ecs_view();
+    let question = CachedQuestion {
+        qname: qname_ref,
+        pipeline_id,
+        qtype: u16::from(qtype),
+    };
 
     // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
-    if let Some(hit) = engine.cache_get(&dedupe_hash) {
-        // Validate hit against query parameters to avoid collisions
-        if hit.qtype == u16::from(qtype)
-            && hit.pipeline_id.as_ref() == pipeline_id
-            && hit.qname.as_ref() == qname_ref
-        {
-            let elapsed_secs = hit.inserted_at.elapsed().as_secs();
+    let now = Instant::now();
+    let hit = engine.cache_get(slot, &view, &question, now)?;
+    let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
 
-            // Check manual expiration (in case moka hasn't evicted it yet or for strict TTL compliance)
-            if elapsed_secs >= hit.original_ttl as u64 {
-                // serve_stale disabled → invalidate and miss
-                if !state.pipeline.settings.serve_stale {
-                    engine.cache_invalidate(&dedupe_hash);
-                    return None;
-                }
-                // Don't serve SERVFAIL/REFUSED as stale
-                if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
-                    engine.cache_invalidate(&dedupe_hash);
-                    return None;
-                }
-
-                // Check serve_stale_expire_ttl: how long past original TTL has this been stale?
-                // 检查 serve_stale_expire_ttl：此条目已过期多长时间？
-                let stale_age = elapsed_secs - hit.original_ttl as u64;
-                if state.pipeline.settings.serve_stale_expire_ttl > 0
-                    && stale_age > state.pipeline.settings.serve_stale_expire_ttl
-                {
-                    // Stale entry has exceeded the maximum stale window
-                    // 过期条目已超过最大过期窗口
-                    engine.cache_invalidate(&dedupe_hash);
-                    debug!(
-                        event = "serve_stale_expired",
-                        qname = %qname_ref,
-                        qtype = ?qtype,
-                        stale_age = stale_age,
-                        serve_stale_expire_ttl = state.pipeline.settings.serve_stale_expire_ttl,
-                        "stale entry exceeded serve_stale_expire_ttl, invalidating"
-                    );
-                    return None;
-                }
-
-                // serve_stale_client_timeout_ms > 0: don't serve stale here, let the caller
-                // try upstream first with a short timeout (handled in handle_packet_internal).
-                // serve_stale_client_timeout_ms > 0: 不在此处返回 stale，
-                // 让调用者先尝试上游查询（在 handle_packet_internal 中处理）。
-                if state.pipeline.settings.serve_stale_client_timeout_ms > 0 {
-                    // Don't invalidate - we still need the stale entry for the client_timeout path.
-                    // Spawn background refresh proactively.
-                    if hit.upstream.is_some() {
-                        engine.spawn_background_refresh(
-                            (*state).clone(),
-                            dedupe_hash,
-                            pipeline_id,
-                            qname_ref,
-                            qtype,
-                            qclass,
-                            Requester {
-                                address: peer.ip(),
-                                edns: edns_present,
-                            },
-                        );
-                    }
-                    return None;
-                }
-
-                // serve_stale_client_timeout_ms == 0: Serve stale immediately (optimistic mode)
-                // RFC 8767: 立即返回 stale 数据 + 后台刷新
-                let stale_ttl = state.pipeline.settings.serve_stale_ttl;
-                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
-                resp_bytes.extend_from_slice(&hit.bytes);
-
-                // Set all TTLs to serve_stale_ttl
-                crate::proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl);
-
-                // Rewrite Transaction ID
-                if resp_bytes.len() >= 2 {
-                    let id_bytes = tx_id.to_be_bytes();
-                    resp_bytes[0] = id_bytes[0];
-                    resp_bytes[1] = id_bytes[1];
-                }
-
-                // serve_stale_ttl_reset: reset stale expiry timer by re-inserting with shifted inserted_at
-                // 重置过期计时器：通过重新插入条目并将 inserted_at 设置为"刚过期"的时间点
-                if state.pipeline.settings.serve_stale_ttl_reset {
-                    let new_entry = hit.clone_with_refreshed_ttl();
-                    engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
-                }
-
-                // Trigger background refresh to get fresh data
-                if hit.upstream.is_some() {
-                    engine.spawn_background_refresh(
-                        (*state).clone(),
-                        dedupe_hash,
-                        pipeline_id,
-                        qname_ref,
-                        qtype,
-                        qclass,
-                        Requester {
-                            address: peer.ip(),
-                            edns: edns_present,
-                        },
-                    );
-                }
-
-                debug!(
-                    event = "serve_stale_on_ttl_expiry",
-                    qname = %qname_ref,
-                    qtype = ?qtype,
-                    rcode = ?hit.rcode,
-                    original_ttl = hit.original_ttl,
-                    elapsed_secs = elapsed_secs,
-                    stale_ttl = stale_ttl,
-                    stale_age = stale_age,
-                    ttl_reset = state.pipeline.settings.serve_stale_ttl_reset,
-                    client_ip = %peer.ip(),
-                    pipeline = %pipeline_id,
-                    "RFC 8767: serving stale cache entry on TTL expiry"
-                );
-
-                if let Some((observer, ctx)) = observed {
-                    observer.cache_hit(
-                        ctx,
-                        &CacheHit {
-                            kind: CacheHitKind::Stale,
-                            remaining_ttl: None,
-                            original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
-                            source: cached_source(hit.upstream.as_deref()),
-                        },
-                    );
-                }
-                response.cache_hit = true;
-                response.upstream =
-                    Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
-                return Some(resp_bytes.freeze());
-            } else {
-                // Cache hit is valid
-
-                // clone bytes and rewrite transaction ID to match requester / 克隆字节并重写事务 ID 以匹配请求者
-                let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
-                resp_bytes.extend_from_slice(&hit.bytes);
-
-                // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                let elapsed = crate::proto_utils::saturating_u64_to_u32(elapsed_secs);
-                if elapsed > 0 {
-                    crate::proto_utils::patch_all_ttls(&mut resp_bytes, elapsed);
-                }
-
-                // Rewrite Transaction ID
-                if resp_bytes.len() >= 2 {
-                    let id_bytes = tx_id.to_be_bytes();
-                    resp_bytes[0] = id_bytes[0];
-                    resp_bytes[1] = id_bytes[1];
-                }
-                let resp_bytes = resp_bytes.freeze();
-
-                // ========== NEW: Trigger background refresh before returning cached response ==========
-                let cfg = &state.pipeline;
-
-                let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed);
-
-                // Check if we should trigger background refresh
-                let should_refresh = if cfg.settings.cache_background_refresh
-                    && hit.upstream.is_some()
-                    && hit.refresh_ttl >= cfg.settings.cache_refresh_min_ttl
-                {
-                    let threshold = (hit.refresh_ttl as u64
-                        * cfg.settings.cache_refresh_threshold_percent as u64)
-                        / 100;
-                    remaining_ttl as u64 <= threshold
-                } else {
-                    false
-                };
-
-                if should_refresh {
-                    // Trigger background refresh asynchronously
-                    debug!(
-                        event = "cache_background_refresh_trigger",
-                        qname = %qname_ref,
-                        qtype = ?qtype,
-                        remaining_ttl = remaining_ttl,
-                        original_ttl = hit.original_ttl,
-                        refresh_ttl = hit.refresh_ttl,
-                        "Triggering background refresh for cached entry"
-                    );
-
-                    engine.spawn_background_refresh(
-                        (*state).clone(),
-                        dedupe_hash,
-                        pipeline_id,
-                        qname_ref,
-                        qtype,
-                        qclass,
-                        Requester {
-                            address: peer.ip(),
-                            edns: edns_present,
-                        },
-                    );
-                }
-
-                response.cache_hit = true;
-                response.upstream =
-                    Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
-
-                if let Some((observer, ctx)) = observed {
-                    observer.cache_hit(
-                        ctx,
-                        &CacheHit {
-                            kind: CacheHitKind::Fresh,
-                            remaining_ttl: Some(Duration::from_secs(
-                                hit.original_ttl.saturating_sub(elapsed) as u64,
-                            )),
-                            original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
-                            source: cached_source(hit.upstream.as_deref()),
-                        },
-                    );
-                }
-                return Some(resp_bytes);
-            }
+    // Check manual expiration (in case moka hasn't evicted it yet or for strict TTL compliance)
+    if elapsed_secs >= hit.original_ttl as u64 {
+        // serve_stale disabled → invalidate and miss
+        if !state.pipeline.settings.serve_stale {
+            engine.cache_invalidate(slot, &hit);
+            return None;
         }
+        // Don't serve SERVFAIL/REFUSED as stale
+        if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
+            engine.cache_invalidate(slot, &hit);
+            return None;
+        }
+
+        // Check serve_stale_expire_ttl: how long past original TTL has this been stale?
+        // 检查 serve_stale_expire_ttl：此条目已过期多长时间？
+        let stale_age = elapsed_secs - hit.original_ttl as u64;
+        if state.pipeline.settings.serve_stale_expire_ttl > 0
+            && stale_age > state.pipeline.settings.serve_stale_expire_ttl
+        {
+            // Stale entry has exceeded the maximum stale window
+            // 过期条目已超过最大过期窗口
+            engine.cache_invalidate(slot, &hit);
+            debug!(
+                event = "serve_stale_expired",
+                qname = %qname_ref,
+                qtype = ?qtype,
+                stale_age = stale_age,
+                serve_stale_expire_ttl = state.pipeline.settings.serve_stale_expire_ttl,
+                "stale entry exceeded serve_stale_expire_ttl, invalidating"
+            );
+            return None;
+        }
+
+        // serve_stale_client_timeout_ms > 0: don't serve stale here, let the caller
+        // try upstream first with a short timeout (handled in handle_packet_internal).
+        // serve_stale_client_timeout_ms > 0: 不在此处返回 stale，
+        // 让调用者先尝试上游查询（在 handle_packet_internal 中处理）。
+        if state.pipeline.settings.serve_stale_client_timeout_ms > 0 {
+            // Don't invalidate - we still need the stale entry for the client_timeout path.
+            // Spawn background refresh proactively.
+            if hit.upstream.is_some() {
+                engine.spawn_background_refresh((*state).clone(), &hit, slot, qclass, requester);
+            }
+            return None;
+        }
+
+        // serve_stale_client_timeout_ms == 0: Serve stale immediately (optimistic mode)
+        // RFC 8767: 立即返回 stale 数据 + 后台刷新
+        let stale_ttl = state.pipeline.settings.serve_stale_ttl;
+        let resp_bytes = served_from_cache(&hit, tx_id, &view, ServedTtl::Stale(stale_ttl));
+
+        // serve_stale_ttl_reset: reset stale expiry timer by re-inserting with shifted inserted_at
+        // 重置过期计时器：通过重新插入条目并将 inserted_at 设置为"刚过期"的时间点
+        if state.pipeline.settings.serve_stale_ttl_reset {
+            let new_entry = hit.clone_with_refreshed_ttl();
+            engine.cache_replace(slot, &hit, new_entry);
+        }
+
+        // Trigger background refresh to get fresh data
+        if hit.upstream.is_some() {
+            engine.spawn_background_refresh((*state).clone(), &hit, slot, qclass, requester);
+        }
+
+        debug!(
+            event = "serve_stale_on_ttl_expiry",
+            qname = %qname_ref,
+            qtype = ?qtype,
+            rcode = ?hit.rcode,
+            original_ttl = hit.original_ttl,
+            elapsed_secs = elapsed_secs,
+            stale_ttl = stale_ttl,
+            stale_age = stale_age,
+            ttl_reset = state.pipeline.settings.serve_stale_ttl_reset,
+            client_ip = %peer.ip(),
+            pipeline = %pipeline_id,
+            "RFC 8767: serving stale cache entry on TTL expiry"
+        );
+
+        if let Some((observer, ctx)) = observed {
+            observer.cache_hit(
+                ctx,
+                &CacheHit {
+                    kind: CacheHitKind::Stale,
+                    remaining_ttl: None,
+                    original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                    source: cached_source(hit.upstream.as_deref()),
+                },
+            );
+        }
+        response.cache_hit = true;
+        response.upstream = Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
+        Some(resp_bytes)
+    } else {
+        // Cache hit is valid
+
+        // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
+        let elapsed = crate::proto_utils::saturating_u64_to_u32(elapsed_secs);
+        let resp_bytes = served_from_cache(&hit, tx_id, &view, ServedTtl::Elapsed(elapsed));
+
+        // ========== NEW: Trigger background refresh before returning cached response ==========
+        let cfg = &state.pipeline;
+
+        let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed);
+
+        // Check if we should trigger background refresh
+        let should_refresh = if cfg.settings.cache_background_refresh
+            && hit.upstream.is_some()
+            && hit.refresh_ttl >= cfg.settings.cache_refresh_min_ttl
+        {
+            let threshold = (hit.refresh_ttl as u64
+                * cfg.settings.cache_refresh_threshold_percent as u64)
+                / 100;
+            remaining_ttl as u64 <= threshold
+        } else {
+            false
+        };
+
+        if should_refresh {
+            // Trigger background refresh asynchronously
+            debug!(
+                event = "cache_background_refresh_trigger",
+                qname = %qname_ref,
+                qtype = ?qtype,
+                remaining_ttl = remaining_ttl,
+                original_ttl = hit.original_ttl,
+                refresh_ttl = hit.refresh_ttl,
+                "Triggering background refresh for cached entry"
+            );
+
+            engine.spawn_background_refresh((*state).clone(), &hit, slot, qclass, requester);
+        }
+
+        response.cache_hit = true;
+        response.upstream = Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
+
+        if let Some((observer, ctx)) = observed {
+            observer.cache_hit(
+                ctx,
+                &CacheHit {
+                    kind: CacheHitKind::Fresh,
+                    remaining_ttl: Some(Duration::from_secs(
+                        hit.original_ttl.saturating_sub(elapsed) as u64,
+                    )),
+                    original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                    source: cached_source(hit.upstream.as_deref()),
+                },
+            );
+        }
+        Some(resp_bytes)
     }
-    None
+}
+
+/// How a reply served from the cache gets its TTLs / 从缓存给出的应答怎样设置 TTL
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ServedTtl {
+    /// Fresh: every TTL lowered by the seconds the answer has been cached
+    /// 新鲜：每个 TTL 减去应答已经缓存的秒数
+    Elapsed(u32),
+    /// Stale (RFC 8767): every TTL set to this / 过期（RFC 8767）：每个 TTL 设为这个值
+    Stale(u32),
+}
+
+/// The reply a cache hit sends: the cached answer with the request's ID, its TTLs
+/// as `ttl` says, and the ECS option RFC 7871 section 7.2.2 asks for. A client
+/// that sent no ECS gets none (the cached answer has none, see
+/// `insert_dns_cache_entry`); one that sent ECS gets its own subnet back, with
+/// the scope the answer has for it.
+/// 缓存命中时发出的应答：缓存的应答，换上请求的 ID，按 `ttl` 设置 TTL，并带上 RFC 7871
+/// 第 7.2.2 节要求的 ECS 选项。没带 ECS 的客户端拿到的应答不带 ECS（缓存的应答本就去掉了，
+/// 见 `insert_dns_cache_entry`）；带了 ECS 的客户端拿回它自己的子网，作用范围是这份应答
+/// 对它的作用范围。
+pub(crate) fn served_from_cache(
+    hit: &CacheEntry,
+    tx_id: u16,
+    view: &EcsView,
+    ttl: ServedTtl,
+) -> Bytes {
+    // An ECS option nobody can read gets no echo: there is nothing well-formed to send back
+    // 谁也读不懂的 ECS 选项不回显：没有合规的内容可以发回
+    let echoed = view
+        .client
+        .filter(|client| !client.is_opaque())
+        .and_then(|client| proto_utils::echo_ecs(&hit.bytes, &client, hit.reach.echo_scope(view)));
+    let mut resp_bytes = BytesMut::from(echoed.as_deref().unwrap_or(&hit.bytes));
+    match ttl {
+        ServedTtl::Elapsed(0) => {}
+        ServedTtl::Elapsed(elapsed) => proto_utils::patch_all_ttls(&mut resp_bytes, elapsed),
+        ServedTtl::Stale(stale_ttl) => proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl),
+    }
+    // Rewrite Transaction ID / 改写事务 ID
+    if resp_bytes.len() >= 2 {
+        resp_bytes[..2].copy_from_slice(&tx_id.to_be_bytes());
+    }
+    resp_bytes.freeze()
 }
 
 /// RFC 8767: Check if a stale (expired but still in moka) cache entry exists.
@@ -330,111 +318,91 @@ pub(crate) fn check_stale_cache_logged(
         qtype,
         qclass,
         pipeline_id,
-        dedupe_hash,
+        slot,
         tx_id,
         start: _,
         peer,
-        edns_present,
+        requester,
         observed,
     } = *context;
     if !state.pipeline.settings.serve_stale {
         return None;
     }
+    let view = requester.ecs_view();
+    let question = CachedQuestion {
+        qname: qname_ref,
+        pipeline_id,
+        qtype: u16::from(qtype),
+    };
 
-    if let Some(hit) = engine.cache_get(&dedupe_hash)
-        && hit.qtype == u16::from(qtype)
-        && hit.pipeline_id.as_ref() == pipeline_id
-        && hit.qname.as_ref() == qname_ref
-    {
-        let elapsed_secs = hit.inserted_at.elapsed().as_secs();
+    let now = Instant::now();
+    let hit = engine.cache_get(slot, &view, &question, now)?;
+    let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
 
-        // Only serve stale when TTL has actually expired
-        // 仅当 TTL 已过期时才提供 stale 数据
-        if elapsed_secs >= hit.original_ttl as u64 {
-            // Don't serve SERVFAIL/REFUSED as stale / 不提供 SERVFAIL/REFUSED 作为 stale
-            if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
-                return None;
-            }
-
-            // Check serve_stale_expire_ttl: max stale age window
-            // 检查 serve_stale_expire_ttl：过期数据的最大可用窗口
-            let stale_age = elapsed_secs - hit.original_ttl as u64;
-            if state.pipeline.settings.serve_stale_expire_ttl > 0
-                && stale_age > state.pipeline.settings.serve_stale_expire_ttl
-            {
-                return None;
-            }
-
-            let stale_ttl = state.pipeline.settings.serve_stale_ttl;
-
-            let mut resp_bytes = BytesMut::with_capacity(hit.bytes.len());
-            resp_bytes.extend_from_slice(&hit.bytes);
-
-            // RFC 8767 §4: Set all TTLs to serve_stale_ttl
-            crate::proto_utils::set_all_ttls(&mut resp_bytes, stale_ttl);
-
-            // Rewrite Transaction ID
-            if resp_bytes.len() >= 2 {
-                let id_bytes = tx_id.to_be_bytes();
-                resp_bytes[0] = id_bytes[0];
-                resp_bytes[1] = id_bytes[1];
-            }
-
-            // serve_stale_ttl_reset: reset stale expiry timer
-            // 重置过期计时器
-            if state.pipeline.settings.serve_stale_ttl_reset {
-                let new_entry = hit.clone_with_refreshed_ttl();
-                engine.cache_insert(dedupe_hash, std::sync::Arc::new(new_entry));
-            }
-
-            debug!(
-                event = "serve_stale",
-                qname = %qname_ref,
-                qtype = ?qtype,
-                rcode = ?hit.rcode,
-                original_ttl = hit.original_ttl,
-                elapsed_secs = elapsed_secs,
-                stale_age = stale_age,
-                stale_ttl = stale_ttl,
-                client_ip = %peer.ip(),
-                pipeline = %pipeline_id,
-                "RFC 8767: serving stale cache entry on upstream failure"
-            );
-
-            // Also trigger background refresh to try to get fresh data
-            // 同时触发后台刷新以尝试获取新数据
-            if hit.upstream.is_some() {
-                engine.spawn_background_refresh(
-                    (*state).clone(),
-                    dedupe_hash,
-                    pipeline_id,
-                    qname_ref,
-                    qtype,
-                    qclass,
-                    Requester {
-                        address: peer.ip(),
-                        edns: edns_present,
-                    },
-                );
-            }
-
-            if let Some((observer, ctx)) = observed {
-                observer.cache_hit(
-                    ctx,
-                    &CacheHit {
-                        kind,
-                        remaining_ttl: None,
-                        original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
-                        source: cached_source(hit.upstream.as_deref()),
-                    },
-                );
-            }
-            response.cache_hit = true;
-            response.upstream = Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
-            return Some(resp_bytes.freeze());
-        }
+    // Only serve stale when TTL has actually expired
+    // 仅当 TTL 已过期时才提供 stale 数据
+    if elapsed_secs < hit.original_ttl as u64 {
+        return None;
     }
-    None
+    // Don't serve SERVFAIL/REFUSED as stale / 不提供 SERVFAIL/REFUSED 作为 stale
+    if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
+        return None;
+    }
+
+    // Check serve_stale_expire_ttl: max stale age window
+    // 检查 serve_stale_expire_ttl：过期数据的最大可用窗口
+    let stale_age = elapsed_secs - hit.original_ttl as u64;
+    if state.pipeline.settings.serve_stale_expire_ttl > 0
+        && stale_age > state.pipeline.settings.serve_stale_expire_ttl
+    {
+        return None;
+    }
+
+    // RFC 8767 §4: Set all TTLs to serve_stale_ttl
+    let stale_ttl = state.pipeline.settings.serve_stale_ttl;
+    let resp_bytes = served_from_cache(&hit, tx_id, &view, ServedTtl::Stale(stale_ttl));
+
+    // serve_stale_ttl_reset: reset stale expiry timer
+    // 重置过期计时器
+    if state.pipeline.settings.serve_stale_ttl_reset {
+        let new_entry = hit.clone_with_refreshed_ttl();
+        engine.cache_replace(slot, &hit, new_entry);
+    }
+
+    debug!(
+        event = "serve_stale",
+        qname = %qname_ref,
+        qtype = ?qtype,
+        rcode = ?hit.rcode,
+        original_ttl = hit.original_ttl,
+        elapsed_secs = elapsed_secs,
+        stale_age = stale_age,
+        stale_ttl = stale_ttl,
+        client_ip = %peer.ip(),
+        pipeline = %pipeline_id,
+        "RFC 8767: serving stale cache entry on upstream failure"
+    );
+
+    // Also trigger background refresh to try to get fresh data
+    // 同时触发后台刷新以尝试获取新数据
+    if hit.upstream.is_some() {
+        engine.spawn_background_refresh((*state).clone(), &hit, slot, qclass, requester);
+    }
+
+    if let Some((observer, ctx)) = observed {
+        observer.cache_hit(
+            ctx,
+            &CacheHit {
+                kind,
+                remaining_ttl: None,
+                original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
+                source: cached_source(hit.upstream.as_deref()),
+            },
+        );
+    }
+    response.cache_hit = true;
+    response.upstream = Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
+    Some(resp_bytes)
 }
 /// Request data required to build and cache a static DNS response.
 pub struct StaticDecisionContext<'a> {
@@ -442,7 +410,12 @@ pub struct StaticDecisionContext<'a> {
     pub qname: &'a str,
     pub qtype: RecordType,
     pub pipeline_id: &'a Arc<str>,
-    pub dedupe_hash: u64,
+    /// Response cache slot / 响应缓存槽位
+    pub slot: u64,
+    /// Whom the answer applies to: the forwards the request passed before it
+    /// (see `ForwardDecisionContext::trail`)
+    /// 应答适用于谁：请求在它之前经过的转发（见 `ForwardDecisionContext::trail`）
+    pub reach: &'a EcsReach,
     pub min_ttl: Duration,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
@@ -466,7 +439,8 @@ pub fn handle_static_decision(
         qname,
         qtype,
         pipeline_id: current_pipeline_id,
-        dedupe_hash,
+        slot,
+        reach,
         min_ttl,
         start: _,
         peer: _,
@@ -476,13 +450,13 @@ pub fn handle_static_decision(
     let req = Message::from_bytes(packet).context("parse request for static")?;
     let resp_bytes = build_response(&req, rcode, answers)?;
 
-    // Skip dns_cache when the pipeline matches on client_ip: dedupe_hash has no
+    // Skip dns_cache when the pipeline matches on client_ip: the slot has no
     // client dimension, so a cached static answer could leak across clients.
     // rule_cache already caches static decisions with client-IP isolation.
     if !uses_client_ip && min_ttl > Duration::from_secs(0) {
         let ttl = crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
         engine.insert_dns_cache_entry(
-            dedupe_hash,
+            slot,
             CacheEntry::from_response(
                 resp_bytes.clone(),
                 rcode,
@@ -491,7 +465,8 @@ pub fn handle_static_decision(
                 current_pipeline_id.clone(),
                 u16::from(qtype),
                 (ttl, ttl),
-            ),
+            )
+            .with_reach(reach.clone()),
         );
     }
 
@@ -509,14 +484,28 @@ pub struct ForwardDecisionContext<'a> {
     pub tx_id: u16,
     pub pipeline_id: &'a str,
     pub rule_name: &'a str,
-    pub dedupe_hash: u64,
+    pub keys: CacheKeys,
     pub min_ttl: Duration,
     pub upstream_timeout: Duration,
     pub start: Instant,
     pub peer: &'a std::net::SocketAddr,
-    /// Whether the request carried EDNS / 请求是否带 EDNS
-    pub edns_present: bool,
+    /// Who is asking (address, EDNS, the client's own ECS) / 谁在问（地址、EDNS、客户端自己的 ECS）
+    pub requester: Requester,
     pub skip_cache: bool,
+    /// For a background refresh, the entry it renews / 后台刷新时，它要更新的条目
+    pub refresh: Option<&'a RefreshTarget>,
+    /// The forwards the request passed in this pipeline so far, each with the ECS
+    /// it sent and whom its reply applies to; every answer the request caches
+    /// applies to the requesters all of them admit (see `CacheEntry::reach`). A
+    /// forward adds its own here.
+    /// 请求在这个 pipeline 里到目前为止经过的转发，每次都记着它发出的 ECS 和应答适用于谁；
+    /// 请求缓存的每份应答适用于它们全都接受的请求方（见 `CacheEntry::reach`）。转发把自己
+    /// 的这一次记在这里。
+    pub trail: &'a mut EcsReach,
+    /// What pipelines the request left by a jump made the answer depend on (see
+    /// `client_reply`), for the echo
+    /// 请求跳离的 pipeline 让应答依赖的部分（见 `client_reply`），回显时用
+    pub echo_floor: u8,
     pub upstream: &'a str,
     pub pre_split_upstreams: Option<&'a Arc<Vec<Arc<str>>>>,
     pub response_matchers: &'a [RuntimeResponseMatcherWithOp],
@@ -564,13 +553,16 @@ pub(crate) async fn handle_forward_decision_logged(
         tx_id,
         pipeline_id,
         rule_name,
-        dedupe_hash,
+        keys,
         min_ttl,
         upstream_timeout,
         start,
         peer,
-        edns_present,
+        requester,
         skip_cache,
+        refresh,
+        trail,
+        echo_floor,
         upstream,
         pre_split_upstreams,
         response_matchers,
@@ -585,6 +577,15 @@ pub(crate) async fn handle_forward_decision_logged(
     } = context;
 
     response.upstream = Some(Arc::from(upstream));
+    let view = requester.ecs_view();
+    let question = CachedQuestion {
+        qname,
+        pipeline_id,
+        qtype: u16::from(qtype),
+    };
+    // What this forward sends as ECS, which decides whom its reply applies to
+    // 这次转发发出的 ECS，它决定应答适用于谁
+    let forward_ecs = ForwardEcs::of(ecs, &view);
     // ECS request rewriting (RFC 7871): modify outgoing packet before forwarding.
     // Only runs on cache-miss path — cache hits and static responses are unaffected.
     //
@@ -603,6 +604,19 @@ pub(crate) async fn handle_forward_decision_logged(
         None => std::borrow::Cow::Borrowed(packet),
     };
     let packet = ecs_packet.as_ref();
+    // The cache relies on `forward_ecs` being what goes out. When it is not (an ECS
+    // option the rewrite could not parse goes out as it is, say), or what goes out is
+    // an option nobody can read, whom the reply applies to is unknown: nothing the
+    // request gets from here on is cached.
+    // 缓存依赖 `forward_ecs` 就是实际发出的 ECS。不一致（例如改写解析不了客户端的 ECS 选项，
+    // 包原样发出），或者发出的是谁也读不懂的选项时，应答适用于谁说不准：此后请求得到的应答
+    // 一律不缓存。
+    let actually_sent = proto_utils::sent_subnet(packet);
+    if actually_sent != forward_ecs.sent
+        || matches!(actually_sent, crate::ecs_scope::Sent::Subnet(subnet) if subnet.is_opaque())
+    {
+        trail.mark_uncacheable();
+    }
 
     // Only the request that registered an entry hands it an answer. One that
     // forwards under another's entry (a request holding an entry of its own, a
@@ -611,21 +625,25 @@ pub(crate) async fn handle_forward_decision_logged(
     // 只有登记了条目的请求才把应答交给它。在别人的条目下转发的请求（持有自己条目的
     // 请求、领头请求离开后自己转发的等待者、不登记条目的后台刷新）把它留给条目的主人。
     let mut cleanup_guard = None;
+    // An answer a rule continued past, reused here: the trail already has its forward
+    // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里
+    let mut reused = false;
 
     let resp = if allow_reuse {
         if let Some(ctx) = reused_response.take() {
+            reused = true;
             Ok((ctx.raw, ctx.upstream.to_string()))
         } else {
             if !skip_cache {
                 use dashmap::mapref::entry::Entry;
-                let rx = match engine.inflight.entry(dedupe_hash) {
+                let rx = match engine.inflight.entry(keys.inflight) {
                     Entry::Vacant(entry) => {
                         let (tx, _rx) =
                             tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
                         entry.insert(tx);
                         cleanup_guard = Some(InflightCleanupGuard::new(
                             engine.inflight.clone(),
-                            dedupe_hash,
+                            keys.inflight,
                         ));
                         None
                     }
@@ -681,14 +699,14 @@ pub(crate) async fn handle_forward_decision_logged(
     } else {
         if !skip_cache {
             use dashmap::mapref::entry::Entry;
-            let rx = match engine.inflight.entry(dedupe_hash) {
+            let rx = match engine.inflight.entry(keys.inflight) {
                 Entry::Vacant(entry) => {
                     let (tx, _rx) =
                         tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
                     entry.insert(tx);
                     cleanup_guard = Some(InflightCleanupGuard::new(
                         engine.inflight.clone(),
-                        dedupe_hash,
+                        keys.inflight,
                     ));
                     None
                 }
@@ -750,6 +768,9 @@ pub(crate) async fn handle_forward_decision_logged(
                 && proto_utils::truncated_response(&raw) =>
         {
             tracing::debug!(event = "tc_flag_retry", upstream = %upstream, "response truncated, retrying with tcp");
+            // What comes back is a reply of this forward's own, reused or not before
+            // 取回的是这次转发自己的应答，不论之前是不是复用的
+            reused = false;
             crate::engine::upstream::forward_upstream(
                 engine,
                 packet,
@@ -774,6 +795,14 @@ pub(crate) async fn handle_forward_decision_logged(
     // on_miss 动作），也不缓存这个应答（见 reject_failure_reply_on_refresh）。
     let resp = resp
         .and_then(|reply| reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply));
+
+    // The reply, or the failure, decides whom every answer reached from here applies to
+    // 应答（或失败）决定此后得到的每份应答适用于谁
+    match &resp {
+        Ok(_) if reused => {}
+        Ok((raw, _)) => trail.record_reply(forward_ecs, raw),
+        Err(_) => trail.record_failure(forward_ecs),
+    }
 
     match resp {
         Ok((raw, actual_upstream)) => {
@@ -898,7 +927,7 @@ pub(crate) async fn handle_forward_decision_logged(
                     let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
                     let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                     engine.insert_dns_cache_entry(
-                        dedupe_hash,
+                        keys.slot,
                         CacheEntry::from_response(
                             raw.clone(),
                             rcode,
@@ -907,12 +936,17 @@ pub(crate) async fn handle_forward_decision_logged(
                             Arc::from(pipeline_id),
                             u16::from(qtype),
                             (cache_ttl, refresh_ttl),
-                        ),
+                        )
+                        .with_reach(trail.clone()),
                     );
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
-                    engine.notify_inflight_waiters(dedupe_hash, &raw).await;
+                    engine
+                        .notify_inflight_waiters(keys.inflight, || {
+                            for_waiters(&raw, &requester, trail, echo_floor)
+                        })
+                        .await;
                 }
 
                 return Ok(ForwardResult::Success(raw));
@@ -954,6 +988,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 pipeline_id,
                 rule_name,
                 remaining_jumps: response_jump_limit,
+                trail: Some((&mut *trail, forward_ecs)),
             };
 
             let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
@@ -971,7 +1006,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
                         let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                         engine.insert_dns_cache_entry(
-                            dedupe_hash,
+                            keys.slot,
                             CacheEntry::from_response(
                                 ctx.raw.clone(),
                                 ctx.msg.metadata.response_code,
@@ -980,12 +1015,17 @@ pub(crate) async fn handle_forward_decision_logged(
                                 Arc::from(pipeline_id),
                                 u16::from(qtype),
                                 (cache_ttl, refresh_ttl),
-                            ),
+                            )
+                            .with_reach(trail.clone()),
                         );
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
-                        engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
+                        engine
+                            .notify_inflight_waiters(keys.inflight, || {
+                                for_waiters(&ctx.raw, &requester, trail, echo_floor)
+                            })
+                            .await;
                     }
                     response.upstream = Some(ctx.upstream);
                     Ok(ForwardResult::Success(ctx.raw))
@@ -1008,7 +1048,7 @@ pub(crate) async fn handle_forward_decision_logged(
                     if min_ttl > Duration::from_secs(0) {
                         let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                         engine.insert_dns_cache_entry(
-                            dedupe_hash,
+                            keys.slot,
                             CacheEntry::from_response(
                                 bytes.clone(),
                                 rcode,
@@ -1017,18 +1057,25 @@ pub(crate) async fn handle_forward_decision_logged(
                                 Arc::from(pipeline_id),
                                 u16::from(qtype),
                                 (ttl, ttl),
-                            ),
+                            )
+                            .with_reach(trail.clone()),
                         );
                     } else if skip_cache {
                         // An answer that is not cached cannot renew the entry, so the
                         // refresh drops it and the next client request runs the rules.
                         // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端
                         // 请求自己执行规则。
-                        engine.cache_invalidate(&dedupe_hash);
+                        if let Some(target) = refresh {
+                            engine.drop_refreshed(keys.slot, &question, &view, target);
+                        }
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
-                        engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
+                        engine
+                            .notify_inflight_waiters(keys.inflight, || {
+                                for_waiters(&bytes, &requester, trail, echo_floor)
+                            })
+                            .await;
                     }
                     response.upstream = Some(Arc::from("static"));
                     Ok(ForwardResult::Success(bytes))
@@ -1054,13 +1101,13 @@ pub(crate) async fn handle_forward_decision_logged(
                             qtype,
                             qclass,
                             edns_present,
-                            min_ttl,
+                            client_ecs: requester.ecs,
                             upstream_timeout,
                             skip_cache,
                             // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
-                            carried_ecs: ecs.and_then(|mode| {
-                                crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
-                            }),
+                            carried: forward_ecs,
+                            trail: &mut *trail,
+                            echo_floor,
                             observed,
                             held_inflight: [
                                 cleanup_guard.as_ref().map(|guard| guard.hash),
@@ -1083,12 +1130,16 @@ pub(crate) async fn handle_forward_decision_logged(
                         if is_servfail(&resp_bytes) {
                             return Err(refresh_found_no_answer("the jump target found no answer"));
                         }
-                        engine.cache_invalidate(&dedupe_hash);
+                        if let Some(target) = refresh {
+                            engine.drop_refreshed(keys.slot, &question, &view, target);
+                        }
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
                         engine
-                            .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                            .notify_inflight_waiters(keys.inflight, || {
+                                for_waiters(&resp_bytes, &requester, trail, echo_floor)
+                            })
                             .await;
                     }
                     Ok(ForwardResult::Success(resp_bytes))
@@ -1133,11 +1184,11 @@ pub(crate) async fn handle_forward_decision_logged(
                         qtype,
                         qclass,
                         pipeline_id,
-                        dedupe_hash,
+                        slot: keys.slot,
                         tx_id,
                         start,
                         peer,
-                        edns_present,
+                        requester,
                         observed,
                     },
                     CacheHitKind::StaleUpstreamFailure,
@@ -1156,7 +1207,9 @@ pub(crate) async fn handle_forward_decision_logged(
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.defuse();
                         engine
-                            .notify_inflight_waiters(dedupe_hash, &stale_bytes)
+                            .notify_inflight_waiters(keys.inflight, || {
+                                for_waiters(&stale_bytes, &requester, trail, echo_floor)
+                            })
                             .await;
                     }
                     return Ok(ForwardResult::Success(stale_bytes));
@@ -1198,7 +1251,9 @@ pub(crate) async fn handle_forward_decision_logged(
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.defuse();
                     engine
-                        .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                        .notify_inflight_waiters(keys.inflight, || {
+                            for_waiters(&resp_bytes, &requester, trail, echo_floor)
+                        })
                         .await;
                 }
 
@@ -1227,6 +1282,7 @@ pub(crate) async fn handle_forward_decision_logged(
                     pipeline_id,
                     rule_name,
                     remaining_jumps: response_jump_limit,
+                    trail: Some((&mut *trail, forward_ecs)),
                 };
                 let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
 
@@ -1242,7 +1298,7 @@ pub(crate) async fn handle_forward_decision_logged(
                             let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
                             let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                             engine.insert_dns_cache_entry(
-                                dedupe_hash,
+                                keys.slot,
                                 CacheEntry::from_response(
                                     ctx.raw.clone(),
                                     ctx.msg.metadata.response_code,
@@ -1251,12 +1307,17 @@ pub(crate) async fn handle_forward_decision_logged(
                                     Arc::from(pipeline_id),
                                     u16::from(qtype),
                                     (cache_ttl, refresh_ttl),
-                                ),
+                                )
+                                .with_reach(trail.clone()),
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
-                            engine.notify_inflight_waiters(dedupe_hash, &ctx.raw).await;
+                            engine
+                                .notify_inflight_waiters(keys.inflight, || {
+                                    for_waiters(&ctx.raw, &requester, trail, echo_floor)
+                                })
+                                .await;
                         }
                         response.upstream = Some(ctx.upstream);
                         Ok(ForwardResult::Success(ctx.raw))
@@ -1273,7 +1334,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         if min_ttl > Duration::from_secs(0) {
                             let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                             engine.insert_dns_cache_entry(
-                                dedupe_hash,
+                                keys.slot,
                                 CacheEntry::from_response(
                                     bytes.clone(),
                                     rcode,
@@ -1282,12 +1343,17 @@ pub(crate) async fn handle_forward_decision_logged(
                                     Arc::from(pipeline_id),
                                     u16::from(qtype),
                                     (ttl, ttl),
-                                ),
+                                )
+                                .with_reach(trail.clone()),
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
-                            engine.notify_inflight_waiters(dedupe_hash, &bytes).await;
+                            engine
+                                .notify_inflight_waiters(keys.inflight, || {
+                                    for_waiters(&bytes, &requester, trail, echo_floor)
+                                })
+                                .await;
                         }
                         response.upstream = Some(Arc::from("static"));
                         Ok(ForwardResult::Success(bytes))
@@ -1322,13 +1388,13 @@ pub(crate) async fn handle_forward_decision_logged(
                                 qtype,
                                 qclass,
                                 edns_present,
-                                min_ttl,
+                                client_ecs: requester.ecs,
                                 upstream_timeout,
                                 skip_cache,
                                 // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
-                                carried_ecs: ecs.and_then(|mode| {
-                                    crate::ecs::EcsKey::from_pipeline_config(mode, peer.ip())
-                                }),
+                                carried: forward_ecs,
+                                trail: &mut *trail,
+                                echo_floor,
                                 observed,
                                 held_inflight: [
                                     cleanup_guard.as_ref().map(|guard| guard.hash),
@@ -1342,7 +1408,9 @@ pub(crate) async fn handle_forward_decision_logged(
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
                             engine
-                                .notify_inflight_waiters(dedupe_hash, &resp_bytes)
+                                .notify_inflight_waiters(keys.inflight, || {
+                                    for_waiters(&resp_bytes, &requester, trail, echo_floor)
+                                })
                                 .await;
                         }
                         Ok(ForwardResult::Success(resp_bytes))
@@ -1370,6 +1438,76 @@ pub(crate) async fn handle_forward_decision_logged(
 /// 后台刷新的规则没找到应答时以这个错误结束：算作刷新失败，缓存条目保留。
 pub(crate) fn refresh_found_no_answer(reason: &'static str) -> anyhow::Error {
     anyhow::Error::new(UpstreamFailure::new(anyhow::anyhow!(reason)))
+}
+
+/// The reply as it goes to the client, with the ECS option RFC 7871 section 7.2.2
+/// asks for. A client that sent no ECS gets none: a forward may have added one
+/// for it (`from_client_ip`, `static`). A client that sent ECS gets its own subnet
+/// back, with a scope of at least `at_least`: how many bits of the client's ECS
+/// the forwards this request passed made the answer depend on (see
+/// `EcsReach::echo_scope`), which is what the cache keeps the answer for. The
+/// reply itself may say more: an echo of that subnet keeps a longer scope; an
+/// error without ECS, or an echo of another subnet (a forward that replaced the
+/// client's), says nothing of how far the answer reaches beyond the client's
+/// subnet, so it takes the client's own prefix. Answers from the cache already
+/// carry their echo (see `served_from_cache`). An ECS option nobody can read is
+/// left alone.
+/// 交给客户端的应答，带上 RFC 7871 第 7.2.2 节要求的 ECS 选项。没带 ECS 的客户端拿到的应答
+/// 不带 ECS：转发可能替它加过（`from_client_ip`、`static`）。带了 ECS 的客户端拿回自己的子网，
+/// 作用范围至少为 `at_least`：这个请求经过的转发让应答依赖客户端 ECS 的多少位（见
+/// `EcsReach::echo_scope`），缓存也是按这个范围保存应答的。应答本身可能说得更多：回显了这个
+/// 子网就保留更长的作用范围；不带 ECS 的报错、或回显了别的子网（转发换掉了客户端的），没说明
+/// 应答在客户端子网之外适用到多大范围，于是取客户端自己的前缀。缓存里的应答已经带着回显（见
+/// `served_from_cache`）。谁也读不懂的 ECS 选项不动。
+pub(crate) fn client_reply(
+    reply: Bytes,
+    client: Option<&crate::ecs::EcsKey>,
+    at_least: u8,
+) -> Bytes {
+    use crate::ecs_scope::ReplyEcs;
+    let Some(client) = client else {
+        return proto_utils::ecs_removed(reply);
+    };
+    if client.is_opaque() {
+        return reply;
+    }
+    let scope = match proto_utils::reply_ecs(&reply) {
+        (ReplyEcs::Subnet { subnet, scope }, _) if subnet == *client => {
+            if scope >= at_least {
+                return reply;
+            }
+            at_least
+        }
+        (ReplyEcs::Subnet { .. }, _) | (ReplyEcs::Absent, false) => {
+            client.source_prefix.max(at_least)
+        }
+        (ReplyEcs::Absent, true) => at_least,
+        (ReplyEcs::Unreadable, _) => return reply,
+    };
+    proto_utils::echo_ecs(&reply, client, scope).map_or(reply, Bytes::from)
+}
+
+/// What the waiters on this request's entry get: the reply as this request's
+/// own client gets it (see `client_reply`). They send the same ECS, which the
+/// inflight key carries, so the echo is theirs too and their own `client_reply`
+/// keeps it.
+/// 等在这个请求条目上的请求拿到的应答：和这个请求自己的客户端拿到的一样（见
+/// `client_reply`）。它们发送的 ECS 相同（inflight 键带着它），回显也就是它们的，它们自己的
+/// `client_reply` 会保留它。
+pub(crate) fn for_waiters(
+    reply: &Bytes,
+    requester: &Requester,
+    trail: &EcsReach,
+    echo_floor: u8,
+) -> Bytes {
+    match requester.ecs {
+        None => reply.clone(),
+        Some(client) => client_reply(
+            reply.clone(),
+            Some(&client),
+            echo_floor.max(trail.echo_scope(&requester.ecs_view())),
+        ),
+    }
 }
 
 /// Whether a response carries SERVFAIL / 响应是否为 SERVFAIL
@@ -1541,19 +1679,33 @@ mod refresh_response_rule_tests {
     /// 为 `pipeline` 缓存一条带 `ip` 的应答，TTL 为给定值（0 表示已经过期），返回它的键。
     fn cache_an_answer(engine: &Engine, pipeline: &str, ip: Ipv4Addr, ttl: u32) -> u64 {
         let state = engine.state.load_full();
-        let key = Engine::calculate_cache_hash_for_dedupe(
+        let key = Engine::cache_keys(
             state.cache_namespace(pipeline),
             pipeline,
             b"example.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &crate::matcher::RequesterKey::NONE,
-        );
+            None,
+        )
+        .slot;
         let request = query();
         let mut reply = Message::new(request.id, MessageType::Response, OpCode::Query);
         reply.add_query(request.queries[0].clone());
         reply.add_answer(a_record(&request.queries[0], ip));
+        // What a client without ECS gets from a forward without `ecs`: the reach a real
+        // request in these pipelines caches with, so a refresh replaces it as usual
+        // 不带 ECS 的客户端经不写 `ecs` 的转发得到的应答：这些 pipeline 里真实请求缓存时带的
+        // 适用范围，刷新照常取代它
+        let mut reach = crate::ecs_scope::EcsReach::default();
+        reach.record(
+            crate::ecs_scope::ForwardEcs {
+                source: crate::ecs_scope::EcsSource::Client,
+                sent: crate::ecs_scope::Sent::Absent,
+            },
+            crate::ecs_scope::ReplyEcs::Absent,
+            true,
+        );
         engine.insert_dns_cache_entry(
             key,
             CacheEntry::from_response(
@@ -1564,7 +1716,8 @@ mod refresh_response_rule_tests {
                 Arc::from(pipeline),
                 u16::from(RecordType::A),
                 (ttl, ttl),
-            ),
+            )
+            .with_reach(reach),
         );
         key
     }
@@ -1574,6 +1727,15 @@ mod refresh_response_rule_tests {
     /// 执行与 `spawn_background_refresh` 相同的调用，返回之后那个键里的 A 记录，
     /// 被删掉时返回 None。
     async fn refresh(engine: &Engine, key: u64) -> Option<Vec<Ipv4Addr>> {
+        refresh_as(engine, key, engine.refresh_of(key)).await
+    }
+
+    /// The same, renewing what `target` names / 同上，更新 `target` 所指的条目
+    async fn refresh_as(
+        engine: &Engine,
+        key: u64,
+        target: crate::engine::refresh::RefreshTarget,
+    ) -> Option<Vec<Ipv4Addr>> {
         let client: SocketAddr = CLIENT.parse().unwrap();
         let state = engine.state.load_full();
         let _ = tokio::time::timeout(
@@ -1583,13 +1745,13 @@ mod refresh_response_rule_tests {
                 client,
                 true,
                 None,
-                Some(key),
+                Some(target),
                 Some(state),
             ),
         )
         .await
         .expect("refresh finishes");
-        engine.cache.get(&key).map(|entry| a_records(&entry.bytes))
+        engine.cached(key).map(|entry| a_records(&entry.bytes))
     }
 
     /// Rule `first` asks the upstream answering [`PASSED_OVER`] with the given
@@ -1669,6 +1831,58 @@ mod refresh_response_rule_tests {
             refresh_with_actions_on_the_answer(json!({}), answer_static(), vec![], static_target())
                 .await;
         assert_eq!(cached, None);
+    }
+
+    /// 刷新进行中，这条过期应答被续用（serve_stale_ttl_reset）：它仍是刷新要更新的那份，
+    /// 刷新照样把它删掉，否则续用可以让过时的应答一直留着。
+    /// The stale answer renewed (serve_stale_ttl_reset) while its refresh runs is
+    /// still the answer the refresh renews, and the refresh drops it all the same;
+    /// otherwise renewals could keep an outdated answer forever.
+    #[tokio::test]
+    async fn a_refresh_drops_the_entry_renewed_while_it_ran() {
+        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let (engine, key) = engine_with_a_cached_answer(
+            json!({}),
+            json!([
+                { "id": "main", "rules": [rule(
+                    "first",
+                    forward(&first),
+                    json!({ "response_actions_on_match": answer_static() })
+                )] },
+                { "id": "other", "rules": [static_target()] }
+            ]),
+        );
+        let target = engine.refresh_of(key);
+        let original = engine.cached(key).expect("cached");
+        engine.cache_replace(key, &original, original.clone_with_refreshed_ttl());
+        assert_eq!(refresh_as(&engine, key, target).await, None);
+    }
+
+    /// 刷新进行中，另一个请求给同样的请求方写进一份新应答：刷新要删的是它更新的那份，不是这份。
+    /// While the refresh runs, another request writes a new answer for the same
+    /// requesters: the refresh drops the answer it renews, not this one.
+    #[tokio::test]
+    async fn a_refresh_leaves_an_answer_another_request_wrote_meanwhile() {
+        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let (engine, key) = engine_with_a_cached_answer(
+            json!({}),
+            json!([
+                { "id": "main", "rules": [rule(
+                    "first",
+                    forward(&first),
+                    json!({ "response_actions_on_match": answer_static() })
+                )] },
+                { "id": "other", "rules": [static_target()] }
+            ]),
+        );
+        let target = engine.refresh_of(key);
+        let original = engine.cached(key).expect("cached");
+        let newer = CacheEntry {
+            fetched_at: std::time::Instant::now(),
+            ..(*original).clone()
+        };
+        engine.cache_insert(key, Arc::new(newer));
+        assert_eq!(refresh_as(&engine, key, target).await, Some(vec![OLD]));
     }
 
     #[tokio::test]
@@ -1822,7 +2036,7 @@ mod refresh_response_rule_tests {
             )]}]),
         );
         refresh(&engine, key).await;
-        let cached = engine.cache.get(&key).expect("the refresh caches the deny");
+        let cached = engine.cached(key).expect("the refresh caches the deny");
         assert_eq!(cached.rcode, ResponseCode::Refused);
     }
 

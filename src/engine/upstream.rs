@@ -1180,15 +1180,16 @@ mod refresh_failure_reply_tests {
 
     fn cache_key(engine: &Engine, pipeline: &str) -> u64 {
         let state = engine.state.load_full();
-        Engine::calculate_cache_hash_for_dedupe(
+        Engine::cache_keys(
             state.cache_namespace(pipeline),
             pipeline,
             b"example.com",
             RecordType::A,
             DNSClass::IN,
-            None,
             &crate::matcher::RequesterKey::NONE,
+            None,
         )
+        .slot
     }
 
     /// The entry a client request leaves under `key`, holding an answer.
@@ -1202,7 +1203,7 @@ mod refresh_failure_reply_tests {
         .await
         .expect("client request finishes")
         .expect("client request succeeds");
-        let cached = engine.cache.get(&key).expect("the client answer is cached");
+        let cached = engine.cached(key).expect("the client answer is cached");
         assert_eq!(cached.rcode, ResponseCode::NoError);
         cached
     }
@@ -1218,7 +1219,7 @@ mod refresh_failure_reply_tests {
                 client,
                 true,
                 None,
-                Some(key),
+                Some(engine.refresh_of(key)),
                 Some(state),
             ),
         )
@@ -1247,10 +1248,15 @@ mod refresh_failure_reply_tests {
                     qtype: RecordType::A,
                     qclass: DNSClass::IN,
                     edns_present: false,
-                    min_ttl: Duration::from_secs(60),
+                    client_ecs: None,
                     upstream_timeout: Duration::from_millis(200),
                     skip_cache: true,
-                    carried_ecs: None,
+                    carried: crate::ecs_scope::ForwardEcs {
+                        source: crate::ecs_scope::EcsSource::Client,
+                        sent: crate::ecs_scope::Sent::Absent,
+                    },
+                    trail: &mut Default::default(),
+                    echo_floor: 0,
                     observed: None,
                     held_inflight: [None, None],
                 },
@@ -1262,7 +1268,7 @@ mod refresh_failure_reply_tests {
     }
 
     fn assert_still_cached(engine: &Engine, key: u64, entry: &Arc<crate::cache::CacheEntry>) {
-        let cached = engine.cache.get(&key).expect("the entry stays cached");
+        let cached = engine.cached(key).expect("the entry stays cached");
         assert!(
             Arc::ptr_eq(&cached, entry),
             "the refresh replaced the entry"

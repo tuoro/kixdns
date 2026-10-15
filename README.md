@@ -28,7 +28,7 @@ This document describes the implementation currently on the main branch. Configu
 - **Listener labels** — select different pipelines from the same server instance.
 - **Multiple upstream transports** — UDP, TCP, TCP+UDP, DoH (RFC 8484), DoT, and DoQ (RFC 9250).
 - **URL protocol prefixes** — `udp://`, `tcp://`, `doh://`, `dot://`, and `doq://` select the transport.
-- **EDNS Client Subnet (RFC 7871)** — pipeline-level cache isolation plus Forward-action request rewriting.
+- **EDNS Client Subnet (RFC 7871)** — Forward-action request rewriting, and a response cache that keeps each answer for the networks its ECS scope covers.
 
 ### Cache & Reliability
 
@@ -62,7 +62,7 @@ This document describes the implementation currently on the main branch. Configu
 - Request matchers for listener label, client address, domain, query type/class, EDNS, GeoIP, and GeoSite.
 - Response matchers and response actions for upstream fallback, filtering, response replacement, and response-based pipeline jumps.
 - An in-memory DNS cache with configurable capacity, maximum lifetime, minimum TTL floor, concurrent miss deduplication, background refresh, and optional RFC 8767 stale serving.
-- ECS request rewriting (RFC 7871) at Forward-action level, with optional pipeline-level ECS cache isolation.
+- ECS request rewriting (RFC 7871) at Forward-action level; cached answers follow the scope the upstream returns (RFC 7871 section 7.3).
 - MaxMind MMDB GeoIP lookup and V2Ray GeoIP/GeoSite data loading.
 - File watchers for the main JSON configuration, configured GeoSite files, and the configured GeoIP .dat/JSON file.
 - A command-line GeoIP .dat to MMDB converter.
@@ -273,7 +273,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | flow_control_max_permits | 800 | Maximum permits when flow control is enabled. |
 | flow_control_latency_threshold_ms | 100 | Latency threshold used by adaptive flow control. |
 | flow_control_adjustment_interval_secs | 5 | Permit adjustment interval. |
-| cache_capacity | 10000 | Maximum entries in the DNS response cache; must be greater than zero. |
+| cache_capacity | 10000 | Maximum answers in the DNS response cache; must be greater than zero. |
 | cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. |
 | dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
 | cache_background_refresh | false | Refresh entries before their TTL expires. |
@@ -296,7 +296,7 @@ Each item in pipeline_select has a pipeline id, an optional matcher list, and an
 
 ### Pipelines and rules
 
-Each pipeline has an id, an optional rules array, and an optional pipeline-level ecs object. Rules are evaluated in configuration order. An empty matcher list matches. Within a rule, matchers form a left-to-right chain; each matcher can carry its own operator, or the rule-level matcher_operator can set the operator for a list whose item operators are all omitted.
+Each pipeline has an id, an optional rules array, and an optional pipeline-level ecs object, which older configurations used for caching and which no longer affects it (changing it still starts that pipeline's cache afresh on reload). Rules are evaluated in configuration order. An empty matcher list matches. Within a rule, matchers form a left-to-right chain; each matcher can carry its own operator, or the rule-level matcher_operator can set the operator for a list whose item operators are all omitted.
 
 The same structure is used for response_matchers, response_matcher_operator, response_actions_on_match, and response_actions_on_miss. Response actions run after a Forward response, or on the miss path after upstream attempts fail when miss actions are configured.
 
@@ -407,10 +407,20 @@ ECS is configured on a Forward action:
 The supported modes are:
 
 - clear: remove the request ECS option;
-- from_client_ip: derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6; private, loopback, and ULA addresses are not injected;
+- from_client_ip: derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6; private, loopback, and ULA addresses are not injected, and the client's own ECS option, if any, goes upstream as it is;
 - static: inject a configured IP and prefix.
 
-A pipeline-level ecs object changes the cache key so responses can be isolated by client subnet. It does not replace the Forward action's ECS rewrite setting. The engine warns when an action uses ECS without a pipeline-level ecs setting; answers forwarded with ECS derived from the client are then cached per subnet the action sends.
+A forward without ecs passes the client's own ECS option upstream as it is.
+
+Cached answers follow RFC 7871 section 7.3. Each answer is kept for the requesters it applies to, judged by the ECS the forward actually sent and the SCOPE PREFIX-LENGTH in the upstream's reply:
+
+- scope 0, or a reply without an ECS option to a query that carried one (which counts as scope 0), serves every request whose forward sends an ECS subnet; a request that sends none asks the upstream a different query and keeps an answer of its own;
+- a scope no longer than the prefix sent serves requests whose subnet lies in that network; a longer scope serves only the same subnet at the same prefix;
+- a query sent without ECS serves only requests that send none either, and one sent with prefix 0 only those sending prefix 0;
+- an error reply without ECS (anything but NOERROR and NXDOMAIN), a reply echoing another subnet, and a failed forward hold only for the same subnet;
+- an answer to an ECS option that does not follow RFC 7871 section 6 to the letter is not cached.
+
+A lookup takes the longest prefix among the answers that apply. One question keeps answers for at most 64 networks; when that is full, answers for single subnets go before the ones every requester of a kind shares. In-flight deduplication joins only requests that send the same subnet. A client that sent no ECS gets replies without an ECS option, cached or not; a client that sent ECS gets its own subnet echoed back, with a scope at least as long as the one KixDNS keeps the answer for. The pipeline-level ecs object is still accepted but no longer affects caching.
 
 ## Configuration examples
 
@@ -541,7 +551,7 @@ A pipeline-level ecs object changes the cache key so responses can be isolated b
 
 The DNS response cache uses the upstream response's minimum TTL, raised to min_ttl when configured, and is capped by cache_max_ttl and cache_capacity. Negative responses use the SOA negative-cache TTL when an SOA is present. Identical in-flight cache misses share one upstream operation.
 
-When a pipeline's answer can depend on who is asking, the response cache, the in-flight deduplication, and the rule cache keep requesters apart by how its rules judge them, not by address: whether the client address is in each client_ip network, whether it is private (geoip_private), whether its GeoIP country or tag matches (geoip_country), whether the query carries EDNS (edns_present, response_edns_present), and which subnet a forward sends when it derives ECS from the client more finely than the pipeline's own ecs setting. Requesters judged alike share entries. The rules along the response-jump paths that a pipeline's answer checks start count too, because a request runs them before it answers. Such a path forwards the packet that the forward before the jump prepared, ECS included, so its entries are kept apart from those of requests that enter the pipeline directly. The rule cache holds the decisions of a pipeline's own rules and so judges by that pipeline's request matchers only; with cache_background_refresh on it also keys by client address, as before. A pipeline whose rules judge no requester facts shares entries between all clients as before. An ECS option that a client sends itself is passed upstream as it is and is not part of any key. A background refresh replays the request from the same client address, and with EDNS when the request carried it, so pipeline selection and request rules read the same address and EDNS presence as for that request.
+When a pipeline's answer can depend on who is asking, the response cache, the in-flight deduplication, and the rule cache keep requesters apart by how its rules judge them, not by address: whether the client address is in each client_ip network, whether it is private (geoip_private), whether its GeoIP country or tag matches (geoip_country), and whether the query carries EDNS (edns_present, response_edns_present). The subnet a forward derives from the client keeps in-flight requests apart, while cached answers are told apart by their ECS scope (see ECS). Requesters judged alike share entries. The rules along the response-jump paths that a pipeline's answer checks start count too, because a request runs them before it answers. Such a path forwards the packet that the forward before the jump prepared, ECS included, so its in-flight entries are kept apart from those of requests that enter the pipeline directly; answers reached on it are not cached, as no lookup uses its keys. The rule cache holds the decisions of a pipeline's own rules and so judges by that pipeline's request matchers only; with cache_background_refresh on it also keys by client address, as before. A pipeline whose rules judge no requester facts shares entries between all clients as before. A background refresh replays the request from the same client address, with EDNS and the client's own ECS option when the request carried them (an ECS option that does not follow RFC 7871 section 6 is left out), so pipeline selection, request rules and the ECS sent upstream are the same as for that request. When the refreshed answer applies to other requesters than the entry it renews (the upstream narrowed its scope, say), that entry is removed and its requesters ask again.
 
 When cache_background_refresh is enabled, entries near expiry can trigger an asynchronous refresh. A refresh runs the rules as a client query does, response rules and their actions included. When the upstream answers, an answer the rules accept replaces the entry, and when the rules end in an answer that is not cached under it (a static answer that is not cached, or an answer reached through a jump), the entry is removed so the next client query runs the rules itself. When the upstream fails or the rules find no answer, the entry stays unless what the rules produce is cached under it. When serve_stale is enabled, an expired entry can be returned with serve_stale_ttl, subject to serve_stale_expire_ttl and serve_stale_client_timeout_ms. That client wait is additionally bounded by the remaining request_timeout_ms budget, so a wait configured longer than the request budget cannot push the stale answer past the deadline.
 

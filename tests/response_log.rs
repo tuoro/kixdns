@@ -166,7 +166,7 @@ async fn background_refresh_is_not_a_client_response() {
     let _capture = log.capture();
     let (addr, task) = upstream().await;
     let engine = engine(&addr);
-    let pre = PreParsedData::new("cache.test".into(), 1, 1, 42, false, "default".into(), None);
+    let pre = PreParsedData::new("cache.test".into(), 1, 1, 42, false, "default".into());
     engine
         .handle_packet_internal_with_pre_parsed(&query(), peer(), true, pre)
         .await

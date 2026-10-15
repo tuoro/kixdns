@@ -253,6 +253,10 @@ pub struct RequestOutcome<'a> {
     /// records that do not fit and lowers the advertised EDNS payload size to
     /// the client's. The response code is not changed.
     ///
+    /// Its ECS option is already the one the client gets (RFC 7871 section
+    /// 7.2.2): none for a client that sent none, an echo of the client's own
+    /// subnet for one that sent ECS.
+    ///
     /// [`status`]: RequestOutcome::status
     pub response: Option<&'a [u8]>,
     /// Why the engine failed the request, with its cause chain. Set exactly
