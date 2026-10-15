@@ -102,12 +102,120 @@ impl GeoSiteEntry {
     }
 }
 
+/// 一个 tag 的匹配器，按查找方式分开存放。完整域名和后缀放进哈希集合，查找时从整个域名开始、
+/// 每次去掉最左边一段去查，次数只取决于域名有几段，和这个 tag 有多少条无关；关键词、正则和
+/// 少见的写法仍逐条比较。结果和对每一条调用 [`DomainMatcher::matches`] 完全相同。
+/// One tag's matchers, stored by how they are looked up. Full names and suffixes go into
+/// hash sets, found by starting from the whole name and dropping the leftmost label each
+/// step, so the cost depends on how many labels the name has, not on how many entries the
+/// tag has; keywords, regexes and rare spellings are still tried one by one. The result is
+/// exactly that of calling [`DomainMatcher::matches`] on every entry.
+#[derive(Debug, Default)]
+pub struct TagMatchers {
+    /// `Full` 条目，小写 / `Full` entries, lowercased
+    full: FxHashSet<Box<str>>,
+    /// `Suffix` 条目去掉开头一个点后的值，小写 / `Suffix` entries with one leading dot removed, lowercased
+    suffixes: FxHashSet<Box<str>>,
+    /// 其余条目，按加载顺序 / Every other entry, in load order
+    others: Vec<DomainMatcher>,
+}
+
+impl TagMatchers {
+    fn new(matchers: Vec<DomainMatcher>) -> Self {
+        let mut tag = Self::default();
+        for matcher in matchers {
+            match &matcher {
+                DomainMatcher::Full(name) => {
+                    tag.full.insert(name.to_ascii_lowercase().into_boxed_str());
+                }
+                DomainMatcher::Suffix(suffix) => {
+                    let value = suffix.strip_prefix('.').unwrap_or(suffix);
+                    if value.is_empty() {
+                        // 匹配不到任何域名（见 `DomainMatcher::matches`）/ Matches no domain (see `DomainMatcher::matches`)
+                        continue;
+                    }
+                    if value.starts_with('.') {
+                        // 两个点开头的值按字符串结尾比较，不按整段，所以逐条比
+                        // A value with two leading dots compares by string ending, not by label,
+                        // so it is tried as it is
+                        tag.others.push(matcher);
+                        continue;
+                    }
+                    tag.suffixes
+                        .insert(value.to_ascii_lowercase().into_boxed_str());
+                }
+                DomainMatcher::Keyword(_) | DomainMatcher::Regex(_) => tag.others.push(matcher),
+            }
+        }
+        tag
+    }
+
+    fn matches(&self, domain: &str) -> bool {
+        let lowered;
+        let name = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            lowered = domain.to_ascii_lowercase();
+            lowered.as_str()
+        } else {
+            domain
+        };
+        self.full.contains(name)
+            || self.suffix_matches(name)
+            || self.others.iter().any(|matcher| matcher.matches(domain))
+    }
+
+    /// 域名本身，或它某个点之后的部分，是不是一个后缀条目：正是 [`domain_suffix_matches`]
+    /// 对不带开头点的后缀的判断
+    /// Whether the name itself, or what follows one of its dots, is a suffix entry: exactly
+    /// what [`domain_suffix_matches`] decides for a suffix without a leading dot
+    fn suffix_matches(&self, name: &str) -> bool {
+        !self.suffixes.is_empty()
+            && (self.suffixes.contains(name)
+                || name
+                    .match_indices('.')
+                    .any(|(dot, _)| self.suffixes.contains(&name[dot + 1..])))
+    }
+
+    fn len(&self) -> usize {
+        self.full.len() + self.suffixes.len() + self.others.len()
+    }
+
+    /// 条目重新展开成匹配器列表（调试用，顺序不保留）
+    /// The entries as a list of matchers again (for debugging; order is not kept)
+    fn to_matchers(&self) -> Vec<DomainMatcher> {
+        self.full
+            .iter()
+            .map(|name| DomainMatcher::Full(name.to_string()))
+            .chain(
+                self.suffixes
+                    .iter()
+                    .map(|suffix| DomainMatcher::Suffix(suffix.to_string())),
+            )
+            .chain(self.others.iter().cloned())
+            .collect()
+    }
+}
+
+/// 被替换下来的 tag 交给另一个线程释放：释放一个大 tag 的索引和建它差不多费时，而调用方这时
+/// 正持有管理器的写锁。起不了线程时就在这里释放。
+/// Frees replaced tags on another thread: freeing a large tag's index takes about as
+/// long as building it, and the caller holds the manager's write lock meanwhile.
+/// When no thread can be started they are freed here.
+fn retire(retired: Vec<TagMatchers>) {
+    if retired.is_empty() {
+        return;
+    }
+    // On failure the closure, and `retired` with it, is dropped right here
+    // 失败时闭包连同 `retired` 就在这里释放
+    let _ = thread::Builder::new()
+        .name("geosite-retire".to_string())
+        .spawn(move || drop(retired));
+}
+
 /// GeoSite 数据库管理器 / GeoSite database manager
 /// 使用 FxHashMap 实现高性能查找（由外层 RwLock 保护线程安全）/ Uses FxHashMap for high-performance lookup (thread-safety protected by outer RwLock)
 pub struct GeoSiteManager {
-    // Tag -> Domain matchers
-    database: FxHashMap<String, Vec<DomainMatcher>>,
-    // Suffix index for O(1) lookup
+    // Tag -> its matchers, indexed (see `TagMatchers`)
+    database: FxHashMap<String, TagMatchers>,
     // Query cache: hash(tag, domain) -> bool (零分配优化 / zero-allocation optimization)
     cache: MokaCache<u64, bool>,
     // 每个数据文件贡献的 tag，重载时据此只替换该文件的条目
@@ -116,8 +224,11 @@ pub struct GeoSiteManager {
 }
 
 /// 一个数据文件解析出的 tag 与域名匹配器，尚未进入管理器
-/// Tags and matchers parsed out of one data file, not yet applied to a manager
-pub type ParsedGeoSite = Vec<(String, Vec<DomainMatcher>)>;
+/// Tags and matchers parsed out of one data file, not yet applied to a manager.
+/// They come indexed already (see [`TagMatchers`]): the index is built while
+/// parsing, outside the manager's write lock, so applying them only swaps them in.
+/// 已经建好索引（见 [`TagMatchers`]）：索引在解析时、管理器的写锁之外建好，应用时只是换进去。
+pub type ParsedGeoSite = Vec<(String, TagMatchers)>;
 
 impl Default for GeoSiteManager {
     fn default() -> Self {
@@ -140,7 +251,7 @@ impl GeoSiteManager {
     fn rebuild_cache(&mut self) {
         // 根据实际加载的域名数量设置缓存大小
         // 统计所有标签的域名总数
-        let total_domains: usize = self.database.values().map(|matchers| matchers.len()).sum();
+        let total_domains: usize = self.database.values().map(TagMatchers::len).sum();
 
         // 缓存大小为域名总数的 2 倍，最小 10000，最大 1000000
         let cache_capacity = (total_domains * 2).clamp(10_000, 1_000_000) as u64;
@@ -159,7 +270,8 @@ impl GeoSiteManager {
     pub fn add_entry(&mut self, entry: GeoSiteEntry) {
         // 在添加时自动标准化 / Auto-normalize on add
         let normalized = entry.normalized();
-        self.database.insert(normalized.tag, normalized.matchers);
+        self.database
+            .insert(normalized.tag, TagMatchers::new(normalized.matchers));
     }
 
     /// 检查域名是否匹配指定的 GeoSite 标签 / Check if domain matches specified GeoSite tag
@@ -195,21 +307,9 @@ impl GeoSiteManager {
         // 不区分大小写：将 tag 转换为小写再查找 / Case insensitive: convert tag to lowercase before lookup
         let tag_lower = tag.to_ascii_lowercase();
 
-        if let Some(matchers) = self.database.get(&tag_lower) {
-            for matcher in matchers {
-                if self.matcher_matches(matcher, domain) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// 检查单个域名匹配器：和 [`DomainMatcher::matches`] 是同一套比较
-    /// Check a single domain matcher, with the same comparison as [`DomainMatcher::matches`]
-    #[inline]
-    fn matcher_matches(&self, matcher: &DomainMatcher, domain: &str) -> bool {
-        matcher.matches(domain)
+        self.database
+            .get(&tag_lower)
+            .is_some_and(|matchers| matchers.matches(domain))
     }
 
     /// 获取已加载的标签列表 / Get list of loaded tags
@@ -227,7 +327,7 @@ impl GeoSiteManager {
     /// 获取标签的所有域名匹配器（仅用于调试）/ Get all domain matchers for a tag (debug only)
     #[inline]
     pub fn get_tag_matchers(&self, tag: &str) -> Option<Vec<DomainMatcher>> {
-        self.database.get(tag).cloned()
+        self.database.get(tag).map(TagMatchers::to_matchers)
     }
 }
 
@@ -522,7 +622,7 @@ impl GeoSiteManager {
                     let tag_lower = tag.to_lowercase();
                     tracing::debug!(target = "geosite", original_tag = %tag, tag_lower = %tag_lower,
                                  "inserting tag into database");
-                    parsed.push((tag_lower, matchers));
+                    parsed.push((tag_lower, TagMatchers::new(matchers)));
                 } else if !tag.is_empty() {
                     tracing::warn!(target = "geosite", tag = %tag,
                                   "tag has no valid domains, skipping");
@@ -560,7 +660,7 @@ impl GeoSiteManager {
             .into_iter()
             .map(|entry| {
                 let normalized = entry.normalized();
-                (normalized.tag, normalized.matchers)
+                (normalized.tag, TagMatchers::new(normalized.matchers))
             })
             .collect())
     }
@@ -608,8 +708,9 @@ impl GeoSiteManager {
         let previous = self.sources.remove(&key).unwrap_or_default();
 
         let mut tags = Vec::with_capacity(parsed.len());
+        let mut retired = Vec::new();
         for (tag, matchers) in parsed {
-            self.database.insert(tag.clone(), matchers);
+            retired.extend(self.database.insert(tag.clone(), matchers));
             tags.push(tag);
         }
 
@@ -636,18 +737,19 @@ impl GeoSiteManager {
             match self.other_source_providing(&key, &tag) {
                 Some(other) => takeovers.entry(other).or_default().push(tag),
                 None => {
-                    self.database.remove(&tag);
+                    retired.extend(self.database.remove(&tag));
                 }
             }
         }
         for (path, wanted) in takeovers {
-            self.reload_tags_from(&path, &wanted);
+            self.reload_tags_from(&path, &wanted, &mut retired);
         }
 
         let loaded_count = tags.len();
         self.sources.insert(key, tags);
 
         self.rebuild_cache();
+        retire(retired);
         loaded_count
     }
 
@@ -670,13 +772,13 @@ impl GeoSiteManager {
     /// Re-read a single tag from another data file; leave the index as it is when
     /// that fails and let the other file's own reload fix it, which beats leaving
     /// the tag empty.
-    fn reload_tags_from(&mut self, path: &Path, wanted: &[String]) {
+    fn reload_tags_from(&mut self, path: &Path, wanted: &[String], retired: &mut Vec<TagMatchers>) {
         match Self::parse_file(path, wanted) {
             Ok(parsed) => {
                 let mut taken = 0usize;
                 for (tag, matchers) in parsed {
                     if wanted.contains(&tag) {
-                        self.database.insert(tag, matchers);
+                        retired.extend(self.database.insert(tag, matchers));
                         taken += 1;
                     }
                 }
@@ -898,7 +1000,7 @@ impl GeoSiteManager {
                                   domain_count = matchers.len(),
                                   attr_filter = ?attr_filter,
                                   "loaded GeoSite tag with domains");
-                            parsed.push((store_tag.clone(), matchers));
+                            parsed.push((store_tag.clone(), TagMatchers::new(matchers)));
                         } else {
                             warn!(target = "geosite", tag = %store_tag,
                                   attr_filter = ?attr_filter,
@@ -2199,5 +2301,85 @@ mod tests {
         assert!(DomainMatcher::Suffix(".github.com".to_string()).matches("github.com"));
         assert!(!DomainMatcher::Suffix(String::new()).matches("github.com"));
         assert!(!DomainMatcher::Suffix(".".to_string()).matches("github.com"));
+    }
+
+    /// 索引查找和逐条比较的结果完全相同：随机生成条目和域名，包括大小写、开头的点、两个点、
+    /// 空值、结尾的点、关键词和正则
+    /// The index gives exactly what trying every entry gives: random entries and names,
+    /// with mixed case, leading dots, double dots, empty values, trailing dots, keywords
+    /// and regexes
+    #[test]
+    fn the_index_matches_exactly_as_every_entry_would() {
+        const LABELS: [&str; 8] = ["a", "B", "ex", "Ex", "cn", "com", "", "xn--p1ai"];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let name = |next: &mut dyn FnMut(usize) -> usize| {
+            let labels = 1 + next(4);
+            let mut out = (0..labels)
+                .map(|_| LABELS[next(LABELS.len())])
+                .collect::<Vec<_>>()
+                .join(".");
+            match next(8) {
+                0 => out.insert(0, '.'),
+                1 => out.push('.'),
+                _ => {}
+            }
+            out
+        };
+        let regexes = ["^a\\.", "Ex", "cn$", "^$"];
+        for round in 0..400 {
+            let mut matchers = Vec::new();
+            for _ in 0..next(12) {
+                let value = name(&mut next);
+                matchers.push(match next(6) {
+                    0 => DomainMatcher::Full(value),
+                    1 => DomainMatcher::Suffix(format!(".{value}")),
+                    2 => DomainMatcher::Suffix(format!("..{value}")),
+                    3 => DomainMatcher::Keyword(LABELS[next(LABELS.len())].to_string()),
+                    4 => DomainMatcher::Regex(Regex::new(regexes[next(regexes.len())]).unwrap()),
+                    _ => DomainMatcher::Suffix(value),
+                });
+            }
+            let indexed = TagMatchers::new(matchers.clone());
+            for _ in 0..60 {
+                let domain = name(&mut next);
+                assert_eq!(
+                    indexed.matches(&domain),
+                    matchers.iter().any(|matcher| matcher.matches(&domain)),
+                    "round {round}: {domain:?} against {matchers:?}"
+                );
+            }
+        }
+    }
+
+    /// 后缀条目按整段命中，开头的点不计，大小写不计；完整域名只命中它自己
+    /// Suffix entries match by whole labels, ignoring one leading dot and case; a full
+    /// name matches itself only
+    #[test]
+    fn the_index_matches_suffixes_by_label_and_full_names_exactly() {
+        let indexed = TagMatchers::new(vec![
+            DomainMatcher::Suffix(".Example.com".to_string()),
+            DomainMatcher::Full("only.test".to_string()),
+            DomainMatcher::Keyword("ads".to_string()),
+        ]);
+        for (domain, expected) in [
+            ("example.com", true),
+            ("WWW.example.COM", true),
+            ("a.b.example.com", true),
+            ("notexample.com", false),
+            ("example.com.cn", false),
+            ("only.test", true),
+            ("ONLY.test", true),
+            ("www.only.test", false),
+            ("myads.net", true),
+            ("net", false),
+        ] {
+            assert_eq!(indexed.matches(domain), expected, "{domain}");
+        }
     }
 }
