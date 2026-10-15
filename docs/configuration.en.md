@@ -193,7 +193,7 @@ ECS is configured on a Forward action:
 The supported modes are:
 
 - clear: remove the request ECS option;
-- from_client_ip: derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6; private, loopback, and ULA addresses are not injected, and the client's own ECS option, if any, goes upstream as it is;
+- from_client_ip: when the client sent ECS itself, forward its own subnet, cut to the prefix set here when it is longer, and a prefix of 0 as it is, adding no address (RFC 7871 section 7.1); a private or IPv4-mapped (`::ffff:a.b.c.d`) network the client sent counts as none and does not go upstream (section 11.3). Otherwise derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6, injecting nothing for private, loopback, and ULA addresses;
 - static: inject a configured IP and prefix.
 
 A forward without ecs passes the client's own ECS option upstream as it is.

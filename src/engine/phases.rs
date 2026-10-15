@@ -1478,6 +1478,17 @@ pub(crate) fn client_reply(
             }
             at_least
         }
+        // The forward cut the client's subnet short (`from_client_ip`, RFC 7871
+        // section 7.1): the echo names the client's own network, so its scope holds
+        // for the client, as on a cache hit
+        // 转发把客户端的子网截短了（`from_client_ip`，RFC 7871 第 7.1 节）：回显的是客户端自己
+        // 所在的网段，它的作用范围对客户端同样成立，和命中缓存时一样
+        (ReplyEcs::Subnet { subnet, scope }, _)
+            if subnet.source_prefix < client.source_prefix
+                && client.truncated(subnet.source_prefix) == subnet =>
+        {
+            scope.max(at_least)
+        }
         (ReplyEcs::Subnet { .. }, _) | (ReplyEcs::Absent, false) => {
             client.source_prefix.max(at_least)
         }

@@ -361,7 +361,7 @@ impl RequesterTest {
                     prefix_v4: *prefix_v4,
                     prefix_v6: *prefix_v6,
                 };
-                match crate::ecs::plan(Some(&mode), requester.address) {
+                match crate::ecs::plan(Some(&mode), requester.address, requester.ecs.as_ref()) {
                     crate::ecs::EcsPlan::Set(subnet) => {
                         hasher.write_u8(1);
                         subnet.hash_into(hasher);
