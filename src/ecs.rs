@@ -51,7 +51,21 @@ pub fn apply_ecs(packet: &[u8], mode: &EcsMode, peer_ip: IpAddr) -> Vec<u8> {
         EcsMode::FromClientIp { .. } => crate::proto_utils::client_subnet(packet),
         _ => None,
     };
-    match plan(Some(mode), peer_ip, client.as_ref()) {
+    apply_ecs_for(packet, mode, peer_ip, client.as_ref())
+}
+
+/// [`apply_ecs`] for a request whose own ECS option the caller already holds, as
+/// the engine does: a background refresh replays a packet that cannot carry an
+/// option nobody can read (see `RefreshTarget::client_ecs`).
+/// 调用方已经拿着请求自己 ECS 选项时的 [`apply_ecs`]，引擎就是这样：后台刷新重放的包带不了
+/// 读不懂的选项（见 `RefreshTarget::client_ecs`）。
+pub(crate) fn apply_ecs_for(
+    packet: &[u8],
+    mode: &EcsMode,
+    peer_ip: IpAddr,
+    client: Option<&EcsKey>,
+) -> Vec<u8> {
+    match plan(Some(mode), peer_ip, client) {
         EcsPlan::Strip => strip_ecs(packet),
         EcsPlan::Keep => packet.to_vec(),
         EcsPlan::Set(subnet) => inject_ecs(packet, subnet),
@@ -104,11 +118,17 @@ pub(crate) fn plan(mode: Option<&EcsMode>, peer_ip: IpAddr, client: Option<&EcsK
                     EcsPlan::Set(own.truncated(limit))
                 }
             }
+            // How much of its address the client lets go upstream cannot be read, so
+            // none goes, and neither does the option itself (section 7.1)
+            // 读不出客户端允许给上游多少地址，所以一点也不给，选项本身也不转发（第 7.1 节）
+            OwnEcs::Unreadable => EcsPlan::Strip,
             // A private client's packet goes as it came, less a private network
             // 私有地址客户端的包原样发出，只去掉私有网段
             OwnEcs::Private if is_private_ip(&peer_ip) => EcsPlan::Strip,
-            _ if is_private_ip(&peer_ip) => EcsPlan::Keep,
-            _ => EcsPlan::Set(EcsKey::from_ip(peer_ip, *prefix_v4, *prefix_v6)),
+            OwnEcs::Private | OwnEcs::Absent if !is_private_ip(&peer_ip) => {
+                EcsPlan::Set(EcsKey::from_ip(peer_ip, *prefix_v4, *prefix_v6))
+            }
+            OwnEcs::Private | OwnEcs::Absent => EcsPlan::Keep,
         },
         Some(EcsMode::Static { ip, prefix }) => match ip.parse::<IpAddr>() {
             Ok(parsed) => EcsPlan::Set(EcsKey::from_ip(parsed, *prefix, *prefix)),
@@ -134,16 +154,18 @@ enum OwnEcs<'a> {
     /// 私有网段，或 IPv4 映射形式的网段（RFC 6890 把 ::ffff:0:0/96 列为不可全球路由）：
     /// 第 11.3 节说按解析器自己的身份对待，它说明不了客户端在哪里，不发给上游
     Private,
-    /// No option, or one nobody can read / 没带，或者读不懂
-    Unknown,
+    /// An option nobody can read (see `EcsKey::opaque`) / 读不懂的选项（见 `EcsKey::opaque`）
+    Unreadable,
+    /// No option / 没带
+    Absent,
 }
 
 fn own_ecs(client: Option<&EcsKey>) -> OwnEcs<'_> {
     match client {
-        Some(own) if own.is_opaque() => OwnEcs::Unknown,
+        Some(own) if own.is_opaque() => OwnEcs::Unreadable,
         Some(own) if own.source_prefix > 0 && own.ip().is_none_or(is_unroutable) => OwnEcs::Private,
         Some(own) => OwnEcs::Forwarded(own),
-        None => OwnEcs::Unknown,
+        None => OwnEcs::Absent,
     }
 }
 
@@ -160,8 +182,8 @@ fn is_unroutable(ip: IpAddr) -> bool {
 pub(crate) fn forwards_own_ecs(peer_ip: IpAddr, client: Option<&EcsKey>) -> bool {
     match own_ecs(client) {
         OwnEcs::Forwarded(_) => true,
-        OwnEcs::Private => false,
-        OwnEcs::Unknown => is_private_ip(&peer_ip),
+        OwnEcs::Private | OwnEcs::Unreadable => false,
+        OwnEcs::Absent => is_private_ip(&peer_ip),
     }
 }
 
@@ -234,7 +256,16 @@ fn inject_ecs(packet: &[u8], subnet: EcsKey) -> Vec<u8> {
 ///
 /// If no ECS option exists, returns the original packet unchanged.
 /// 如果不存在 ECS 选项，原样返回原始包。
+///
+/// The options are cut out of the OPT record as they stand, so one hickory cannot
+/// decode (an unknown family, a prefix too long) goes too; hickory only steps in
+/// when records follow the OPT record (see `proto_utils::without_ecs`).
+/// 选项按报文原样从 OPT 记录里删掉，所以 hickory 解不开的选项（地址族未知、前缀过长）也能删；
+/// 只有 OPT 后面还有记录时才交给 hickory（见 `proto_utils::without_ecs`）。
 fn strip_ecs(packet: &[u8]) -> Vec<u8> {
+    if let Ok(stripped) = crate::proto_utils::without_ecs(bytes::Bytes::copy_from_slice(packet)) {
+        return stripped.to_vec();
+    }
     let mut msg = match Message::from_vec(packet) {
         Ok(m) => m,
         Err(_) => return packet.to_vec(),
@@ -375,14 +406,15 @@ impl EcsKey {
     }
 
     /// 读不懂、或不完全符合 RFC 7871 第 6 节的 ECS 选项（地址族未知、前缀超长、地址长度不对、
-    /// 前缀之后的位不为零、查询里 SCOPE 不为 0、不止一个 ECS 选项）。这样的选项会原样转给上游，
-    /// 应答适用于谁说不准；键由选项的原始字节决定，不会和任何真实子网相等。
+    /// 前缀之后的位不为零、查询里 SCOPE 不为 0、不止一个 ECS 选项）。透传客户端 ECS 的转发会把
+    /// 这样的选项原样发给上游，应答适用于谁说不准（`from_client_ip` 会去掉它）；键由选项的原始
+    /// 字节决定，不会和任何真实子网相等。
     /// An ECS option that cannot be read, or does not follow RFC 7871 section 6 to
     /// the letter (an unknown family, a prefix too long, the wrong address length,
     /// bits set beyond the prefix, a nonzero SCOPE in a query, more than one ECS
-    /// option). Such an option goes upstream as it is, and whom the answer applies
-    /// to is unclear; its key comes from the option's raw bytes and never equals a
-    /// real subnet.
+    /// option). A forward that passes the client's ECS on sends such an option as it
+    /// is, and whom the answer applies to is unclear (`from_client_ip` removes it);
+    /// its key comes from the option's raw bytes and never equals a real subnet.
     pub(crate) fn opaque(raw: &[u8]) -> Self {
         let mut addr = [0u8; 16];
         for (half, seed) in addr.chunks_mut(8).zip([1u8, 2u8]) {
@@ -845,15 +877,14 @@ mod tests {
                 EcsPlan::Set(own("2001:db8:1::", 56))
             );
         }
-        // 读不懂的选项照旧：公网客户端换成来源地址的子网，私有地址的原样转发
-        // An option nobody can read, as before: a public client gets its address's
-        // subnet instead, a private one's goes on as it is
+        // 读不懂的选项：读不出客户端允许给多少地址，所以去掉选项，也不加来源地址的子网
+        // An option nobody can read: how much address the client allows cannot be
+        // read, so the option goes and no subnet of the source address is added
         let opaque = EcsKey::opaque(b"not an ECS option");
-        assert_eq!(
-            plan(Some(&mode), public, Some(&opaque)),
-            EcsPlan::Set(own("198.51.100.0", 24))
-        );
-        assert_eq!(plan(Some(&mode), private, Some(&opaque)), EcsPlan::Keep);
+        assert_eq!(plan(Some(&mode), public, Some(&opaque)), EcsPlan::Strip);
+        assert_eq!(plan(Some(&mode), private, Some(&opaque)), EcsPlan::Strip);
+        assert!(!forwards_own_ecs(public, Some(&opaque)));
+        assert!(!forwards_own_ecs(private, Some(&opaque)));
     }
 
     /// RFC 7871 第 11.3 节：客户端自己带的私有网段按解析器自己的身份对待，不发给上游：公网

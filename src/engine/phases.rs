@@ -608,7 +608,8 @@ pub(crate) async fn handle_forward_decision_logged(
     // 仅在缓存未命中路径执行 — 缓存命中和静态响应不受影响。
     let ecs_packet: std::borrow::Cow<[u8]> = match ecs {
         Some(mode) => {
-            let modified = crate::ecs::apply_ecs(packet, mode, peer.ip());
+            let modified =
+                crate::ecs::apply_ecs_for(packet, mode, peer.ip(), requester.ecs.as_ref());
             tracing::debug!(
                 ecs_mode = ?mode,
                 modified = modified.len() != packet.len(),

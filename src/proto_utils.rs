@@ -79,6 +79,16 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
                 jumped = true;
             }
             let offset = (((len as u16) & 0x3F) << 8) | (packet[current_pos + 1] as u16);
+            // RFC 1035 section 4.1.4: a pointer refers to a prior occurrence, so it must
+            // point before itself (hickory refuses others too). One pointing forward could
+            // land on bytes that move when the packet is rewritten, and the name sent
+            // upstream would no longer be the one routed on.
+            // RFC 1035 第 4.1.4 节：指针指向前面出现过的名字，必须指在自己前面（hickory 也拒绝
+            // 别的）。指向后面的指针可能落在改写报文时会挪动的字节上，发给上游的名字就不再是
+            // 路由时看到的那个。
+            if offset as usize >= current_pos {
+                return None;
+            }
             current_pos = offset as usize;
             max_jumps -= 1;
             if max_jumps == 0 {
@@ -291,7 +301,9 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
             }
             encoded_end.get_or_insert(pointer_end);
             let offset = (((len & 0x3F) as usize) << 8) | packet[pos + 1] as usize;
-            if offset >= packet_len {
+            // Only to a prior occurrence (RFC 1035 section 4.1.4), as in `parse_quick`
+            // 只能指向前面出现过的名字（RFC 1035 第 4.1.4 节），同 `parse_quick`
+            if offset >= pos {
                 return None;
             }
             jumps += 1;

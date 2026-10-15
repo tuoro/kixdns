@@ -1194,6 +1194,15 @@ impl Engine {
                     client_ecs,
                 )
             };
+        // A refresh replays its request's ECS from the key the cache kept, as an option
+        // nobody can read does not survive into the replayed packet (see
+        // `RefreshTarget::client_ecs`)
+        // 刷新按缓存留下的键重放请求的 ECS：读不懂的选项进不了重放的包（见
+        // `RefreshTarget::client_ecs`）
+        let client_ecs = refresh
+            .as_ref()
+            .and_then(|target| target.client_ecs)
+            .or(client_ecs);
 
         let qname_ref = &qname_cow;
         let start = std::time::Instant::now();
