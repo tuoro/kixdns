@@ -255,9 +255,14 @@ fn peer(client: &str) -> SocketAddr {
 
 /// 整个应答 / The whole reply
 async fn reply(engine: &Engine, client: &str, subnet: Option<(&str, u8)>) -> Bytes {
+    reply_from(engine, peer(client), subnet).await
+}
+
+/// 同上，来源地址照原样给出 / The same, with the source address given as it is
+async fn reply_from(engine: &Engine, peer: SocketAddr, subnet: Option<(&str, u8)>) -> Bytes {
     tokio::time::timeout(
         Duration::from_secs(5),
-        engine.handle_packet(&query(subnet), peer(client)),
+        engine.handle_packet(&query(subnet), peer),
     )
     .await
     .expect("answer in time")
@@ -1541,4 +1546,25 @@ async fn waiters_on_the_response_jump_path_get_the_full_echo() {
     for reply in [one.unwrap(), two.unwrap()] {
         assert_eq!(reply_ecs(&reply), Some((ip("198.51.100.0"), 24, 24)));
     }
+}
+
+/// 双栈套接字上的 IPv4 客户端（::ffff:a.b.c.d）：`from_client_ip` 按它的 IPv4 地址取子网，
+/// 私有地址照样不加。
+/// An IPv4 client on a dual-stack socket (::ffff:a.b.c.d): `from_client_ip` takes
+/// the subnet of its IPv4 address, and adds none for a private one as usual.
+#[tokio::test]
+async fn from_client_ip_takes_the_ipv4_subnet_of_a_mapped_client() {
+    let up = upstream(Echo::Scope(24)).await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    let public: SocketAddr = "[::ffff:198.51.100.7]:53000".parse().unwrap();
+    let private: SocketAddr = "[::ffff:192.168.1.5]:53000".parse().unwrap();
+    assert_eq!(
+        first_a(&reply_from(&engine, public, None).await),
+        v4("198.51.100.0")
+    );
+    assert_eq!(
+        first_a(&reply_from(&engine, private, None).await),
+        Some(NO_SUBNET)
+    );
+    assert_eq!(*up.seen.lock(), vec![Some((ip("198.51.100.0"), 24)), None]);
 }

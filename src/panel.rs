@@ -1555,7 +1555,12 @@ async fn run_diagnostic(
 ) -> (StatusCode, serde_json::Value) {
     use hickory_proto::op::Message;
 
-    let client = std::net::SocketAddr::new(client_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)), 0);
+    // The engine judges an IPv4-mapped address by its IPv4 address, and the reply says so
+    // 引擎按 IPv4 地址看待 IPv4 映射地址，回复里也这样写
+    let client = std::net::SocketAddr::new(
+        client_ip.map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |ip| ip.to_canonical()),
+        0,
+    );
     let started = Instant::now();
     let future = crate::panel_trace::capture(engine.handle_packet(packet, client));
     let (result, steps, trace_truncated) =
@@ -2874,6 +2879,20 @@ mod diagnostic_tests {
         );
         let parsed = body["trace"][0]["detail"].as_str().unwrap_or_default();
         assert!(parsed.contains("客户端：192.168.1.9"), "{parsed}");
+
+        // 写成 IPv4 映射形式的地址按 IPv4 地址判断，回复里也这样写
+        // An address in the IPv4-mapped form is judged, and reported, as the IPv4 address
+        let mapped: IpAddr = "::ffff:192.168.1.9".parse().unwrap();
+        let (status, body) =
+            run_diagnostic(&engine, &packet, Some(mapped), "nas.example", &record_type).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["client_ip"], "192.168.1.9");
+        assert!(
+            answers(&body)
+                .iter()
+                .any(|answer| answer.contains("10.0.0.1")),
+            "{body}"
+        );
 
         // 不填就是本机回环，落到「其余」 / Omitted means loopback, which lands on "rest"
         let (status, body) =

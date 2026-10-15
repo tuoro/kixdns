@@ -194,7 +194,8 @@ pub struct RequestContext<'a> {
     pub request_id: u64,
     /// Listener label of the engine that handles the request.
     pub listener_label: &'a str,
-    /// Client address as seen by the listener.
+    /// Client address as seen by the listener; an IPv4 client on a dual-stack
+    /// socket appears by its IPv4 address rather than the IPv4-mapped one.
     pub client: SocketAddr,
     /// Transport the query arrived over, as tagged by the listener that
     /// received it. `None` for background refreshes, and for requests handed

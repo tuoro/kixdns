@@ -1357,6 +1357,25 @@ fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> V
         .collect()
 }
 
+/// A `client_ip` network. The engine sees an IPv4 client on a dual-stack socket by
+/// its IPv4 address (see `client_address` in engine/execution.rs), so a network
+/// written in the IPv4-mapped form (`::ffff:a.b.c.d/n`, n of 96 or more) becomes
+/// the IPv4 network it names.
+/// `client_ip` 网段。引擎按 IPv4 地址看待双栈套接字上的 IPv4 客户端（见 engine/execution.rs
+/// 的 `client_address`），所以写成 IPv4 映射形式的网段（`::ffff:a.b.c.d/n`，n 不小于 96）换成
+/// 它所指的 IPv4 网段。
+fn client_net(cidr: &str) -> Result<IpNet, ipnet::AddrParseError> {
+    let net: IpNet = cidr.parse()?;
+    if let IpNet::V6(v6) = net
+        && let Some(v4) = v6.network().to_ipv4_mapped()
+        && let Some(prefix) = v6.prefix_len().checked_sub(96)
+        && let Ok(v4) = ipnet::Ipv4Net::new(v4, prefix)
+    {
+        return Ok(IpNet::V4(v4));
+    }
+    Ok(net)
+}
+
 impl RuntimeMatcher {
     fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
         Ok(match m {
@@ -1364,7 +1383,9 @@ impl RuntimeMatcher {
             config::Matcher::DomainSuffix { value } => RuntimeMatcher::DomainSuffix {
                 value: Arc::from(value.to_ascii_lowercase()),
             },
-            config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp { net: cidr.parse()? },
+            config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp {
+                net: client_net(&cidr)?,
+            },
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
                 regex: RegexBuilder::new(&value)
                     .size_limit(1_000_000)
@@ -1529,7 +1550,9 @@ impl RuntimePipelineSelectorMatcher {
                 }
             }
             config::PipelineSelectorMatcher::ClientIp { cidr } => {
-                RuntimePipelineSelectorMatcher::ClientIp { net: cidr.parse()? }
+                RuntimePipelineSelectorMatcher::ClientIp {
+                    net: client_net(&cidr)?,
+                }
             }
             config::PipelineSelectorMatcher::DomainSuffix { value } => {
                 RuntimePipelineSelectorMatcher::DomainSuffix {
@@ -2083,6 +2106,32 @@ fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
         _ => anyhow::bail!("unsupported qtype: {upper}"),
     };
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod client_net_tests {
+    use super::client_net;
+
+    #[test]
+    fn an_ipv4_mapped_network_becomes_the_ipv4_network() {
+        for (written, net) in [
+            ("::ffff:198.51.100.0/120", "198.51.100.0/24"),
+            ("::ffff:198.51.100.7/128", "198.51.100.7/32"),
+            ("::ffff:0:0/96", "0.0.0.0/0"),
+            ("198.51.100.0/24", "198.51.100.0/24"),
+            // 不全在映射范围内的 IPv6 网段照旧 / IPv6 networks beyond the mapped range stay as they are
+            ("::/0", "::/0"),
+            ("::ffff:0:0/80", "::ffff:0:0/80"),
+            ("2001:db8::/32", "2001:db8::/32"),
+        ] {
+            assert_eq!(
+                client_net(written).unwrap(),
+                net.parse::<ipnet::IpNet>().unwrap(),
+                "{written}"
+            );
+        }
+        assert!(client_net("not a network").is_err());
+    }
 }
 
 #[cfg(test)]
