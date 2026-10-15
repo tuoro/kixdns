@@ -214,7 +214,7 @@ Forward 的 transport 值为 udp、tcp、tcp_udp、doh、dot、doq。upstream �
 - serve_stale_ttl_reset
 - serve_stale_client_timeout_ms
 
-这些字段的默认值和运行语义以根目录 README 与 src/config.rs 为准。
+这些字段的默认值和运行语义以 [docs/configuration.md](../docs/configuration.md) 与 src/config.rs 为准。
 
 ### ECS（RFC 7871）
 

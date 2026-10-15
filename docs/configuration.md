@@ -1,224 +1,10 @@
-# KixDNS
+# 配置参考
 
-**[English](./README.md)** | **[简体中文](./README.zh-CN.md)**
-
-> **注意：本项目完全由 AI 构建（内容、文档与初始实现均由 AI 生成）。**
-
-KixDNS 是使用 Rust 编写的异步、非递归 DNS 转发服务器。它接收 UDP/TCP 查询，也可以启用入站 DoH，然后按照有序的 Pipeline 规则进行转发或直接构造响应。
+**简体中文** | [English](configuration.en.md)
 
 本文档以当前 main 分支代码为准。配置类型可以反序列化但运行引擎尚未读取的字段会明确标注。
 
-## 特性
-
-### 🚀 高性能
-
-- **零拷贝 UDP 处理** — 基于 `BytesMut` 的数据包处理，尽量减少内存复制。
-- **延迟请求解析** — 不需要匹配解析字段时，转发路径可以避免完整反序列化。
-- **轻量响应扫描** — 提取缓存和响应规则所需的响应元数据。
-- **快速哈希** — 适用的内部数据结构使用 `rustc-hash`（FxHash）。
-- **异步 I/O** — 基于 `tokio`，并使用 `DashMap` 与 `moka` 管理并发状态。
-- **按 worker 管理 UDP socket** — Unix worker 使用平台 reuse-port 能力；非 Unix 构建共享一个 UDP socket。
-
-### 🔧 灵活路由
-
-- **Pipeline 选择规则** — 支持按监听器标签、客户端 IP、域名、QCLASS、EDNS、GeoIP、GeoSite 和查询类型路由。
-- **匹配器逻辑运算** — 使用 `and`、`or`、`and_not`、`or_not`、`not` 组合有序匹配链。
-- **两阶段处理** — 请求匹配之后可以继续进行响应匹配和响应动作处理。
-- **监听器标签** — 同一服务实例可以选择不同 Pipeline。
-- **多种上游传输** — UDP、TCP、TCP+UDP、DoH（RFC 8484）、DoT 和 DoQ（RFC 9250）。
-- **URL 协议前缀** — 使用 `udp://`、`tcp://`、`doh://`、`dot://` 和 `doq://` 选择传输方式。
-- **EDNS Client Subnet（RFC 7871）** — Forward action 级请求改写；响应缓存按 ECS 作用范围覆盖的网段保存每份应答。
-
-### 💾 缓存与可靠性
-
-- **内存缓存** — 支持配置容量、最大生存时间、最小 TTL 和过期缓存服务行为。
-- **并发未命中去重** — 相同的进行中缓存未命中共享一次上游操作。
-- **后台刷新** — 接近过期的条目可以异步刷新。
-- **Serve Stale（RFC 8767）** — 可选在上游访问失败时返回过期缓存条目。
-
-### 🌍 GeoIP、GeoSite 与 DoQ
-
-- **MaxMind GeoIP** — 支持 MMDB 查询以及国家和私有 IP 匹配器。
-- **V2Ray GeoSite** — 加载 `.dat` 或支持的 JSON 文件，用于域名分类匹配。
-- **GeoSite 条目** — 写法与 V2Ray 的域名列表（domain-list-community）相同。`domain:example.com` 和不带前缀的 `example.com` 按整段匹配域名本身及其所有子域名（不匹配 `notexample.com`）；和 domain_suffix 不同，这里开头加点不改变含义。`full:example.com` 只匹配域名本身，`keyword:`、`regexp:` 按关键词、正则匹配，不带前缀且含 `*` 的值按通配符匹配。JSON 里前缀不认识、没有值或正则无效的条目会跳过并给出警告。
-- **数据库重载** — 配置的 GeoSite 文件和 GeoIP `.dat` 文件会被监控并重载。
-- **DoQ 0-RTT 处理** — 支持全局和单上游配置；拒绝或超时后会回退，直到进程重启。
-
-### 📊 运维
-
-- **配置热重载** — 有效 JSON 变更会通过文件 watcher 重载；无效变更保留之前的配置。
-- **DoH TLS 证书热更新** — 证书/私钥 PEM 续期后自动生效，无需重启；文件无效时保留旧证书继续服务。
-- **结构化 tracing** — 默认输出文本，过滤级别由 `--debug` 和 `RUST_LOG` 控制。
-- **GeoIP 转换** — 可通过命令行将 V2Ray GeoIP `.dat` 转换为 MMDB。
-
-## 当前实现
-
-- 入站 DNS over UDP 和 TCP。
-- 可选的入站 DNS over HTTPS（DoH，RFC 8484），使用 PEM 证书和私钥。
-- 出站 UDP、TCP、TCP+UDP 对冲请求、DoH、DoT 和 DoQ。
-- 按顺序进行 Pipeline 选择和请求规则匹配。
-- 支持监听器标签、客户端地址、域名、查询类型/类别、EDNS、GeoIP 和 GeoSite 的请求匹配器。
-- 支持响应匹配器，以及上游回退、响应过滤、响应替换和响应阶段 Pipeline 跳转。
-- 内存 DNS 缓存：容量、最大生存时间、最小 TTL、并发未命中去重、后台刷新和可选的 RFC 8767 过期缓存。
-- ECS 请求改写（RFC 7871）；缓存的应答按上游返回的作用范围区分（RFC 7871 第 7.3 节）。
-- MaxMind MMDB GeoIP 查询，以及 V2Ray GeoIP/GeoSite 数据加载。
-- 主 JSON 配置、GeoSite 文件和配置的 GeoIP .dat/JSON 文件的文件监控。
-- GeoIP .dat 转 MMDB 的命令行工具。
-
-Unix 构建会为 UDP worker 创建独立 socket，并使用平台提供的 reuse-port 能力；非 Unix 构建使用由多个 worker 共享的 UDP socket。这是实现细节，不代表固定吞吐承诺。
-
-## 快速开始
-
-> 💡 **第一次配置 KixDNS？** 可以使用 **[可视化配置编辑器](#配置编辑器)**，在浏览器中生成 `pipeline.json`。
-
-![配置编辑器预览](docs/images/config-editor.png)
-
-### 构建和运行
-
-仓库使用 Rust edition 2024。项目没有声明 MSRV，请使用支持 edition 2024 的工具链。
-
-~~~bash
-cargo build --release
-
-# 不带子命令：使用 config/pipeline.json 和默认 listener label
-./target/release/kixdns
-
-# 显式使用 run 子命令
-./target/release/kixdns run -c config/pipeline.json
-~~~
-
-UDP 和 TCP 默认监听 0.0.0.0:5353，默认上游是 1.1.1.1:53。所有路径都会按原样传给文件系统；相对路径相对于进程工作目录。
-
-### CLI
-
-~~~text
-kixdns [COMMAND]
-
-COMMANDS:
-  run              运行 DNS 服务器
-  convert-geo-ip   将 GeoIP .dat 转换为 MMDB
-  help             显示帮助
-~~~
-
-run 选项：
-
-~~~text
--c, --config <FILE>             配置路径（默认：config/pipeline.json）
-    --listener-label <LABEL>    Pipeline 选择使用的监听器标签（默认：default）
-    --debug                     启用 debug 级别日志
-    --udp-workers <NUM>         UDP worker 数量（0 表示使用可用 CPU 并行度）
--h, --help                      显示帮助
--V, --version                   显示版本
-~~~
-
-GeoIP 转换选项：
-
-~~~text
--i, --input <FILE>              输入 V2Ray GeoIP .dat 文件
--o, --output <FILE>             输出 MMDB 文件
--f, --filter <CODES>            逗号分隔的国家代码，例如 CN,US,JP
-~~~
-
-日志订阅器默认输出文本，时间戳使用 RFC 3339 格式并跟随系统本地时区。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
-
-响应统计可启用 `RUST_LOG=warn,kixdns::engine::phases=info`。
-`event="dns_response"` 对引擎产出的每个应答记录一次，覆盖快速路径、
-新鲜/过期缓存、静态应答及并发合并应答；它不证明客户端已收到报文。
-监听器在并发许可耗尽时直接返回的过载 SERVFAIL 不经过引擎，不计入此事件。
-内部后台刷新和中间转发尝试也不计入。`cache_hit` 仅在响应缓存提供应答时为真；
-旧的 `cache` 字段已移除，因为它曾表示“结果可缓存”，改名后含义会静默翻转。
-RCODE 取自实际应答，应答无法解析为 DNS 时省略。
-失败或取消且没有应答的请求使用 `event="dns_request_finished"` 和 `status`，不猜测 RCODE。
-并发合并的跟随请求标为 `upstream="inflight"`，因为共享结果不携带原请求的上游身份。
-
-旧日志没有 `cache_hit`，其中 `cache=true` 可能表示上游应答可缓存，部分响应路径也未记录。
-不能把新旧日志混合后宣称得到准确的历史命中率或完整请求量。
-
-### systemd
-
-创建 /etc/systemd/system/kixdns.service：
-
-~~~ini
-[Unit]
-Description=KixDNS
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/kixdns run -c /etc/kixdns/pipeline.json
-Restart=on-failure
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-~~~
-
-~~~bash
-sudo install -m 0755 target/release/kixdns /usr/local/bin/kixdns
-sudo mkdir -p /etc/kixdns
-sudo cp config/pipeline.json /etc/kixdns/
-sudo systemctl daemon-reload
-sudo systemctl enable --now kixdns
-~~~
-
-## 网络协议
-
-### 入站
-
-UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
-
-入站监听器行为：
-
-- 只处理标准单 question 的 QUERY 消息。畸形包、非 QUERY opcode 和 DNS 响应包会被静默丢弃。
-- 监听器处理错误、整体请求超时或流控 permit 耗尽时，对合法查询返回 SERVFAIL。
-- 大于客户端声明大小（EDNS 载荷大小；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试。
-
-只有设置 settings.bind_doh 后才会启用入站 DoH。启用时必须同时设置 settings.doh_tls_cert 和 settings.doh_tls_key，且路径指向 PEM 文件。路径默认为 /dns-query，可通过 settings.doh_path 修改。
-
-入站 DoH 处理器：
-
-- 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
-- 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
-- 拒绝大于 64 KiB 的 DNS 请求体；
-- 成功处理后返回 application/dns-message。
-
-DoT 和 DoQ 只作为出站传输实现，代码没有入站 DoT/DoQ 监听器。
-
-### 出站
-
-Forward 动作的 transport 字段可选以下值：
-
-| 值 | 传输 |
-|---|---|
-| udp | DNS over UDP |
-| tcp | DNS over TCP |
-| tcp_udp | 同时发送 TCP 和 UDP，使用第一个可接受的响应 |
-| doh | DNS over HTTPS |
-| dot | DNS over TLS |
-| doq | DNS over QUIC |
-
-upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多个上游会并发查询并返回第一个可接受的响应；在多个上游选择时，SERVFAIL 和 REFUSED 响应不会被接受。
-
-以下协议前缀会覆盖 transport 字段：
-
-| 前缀 | 传输 | 别名 |
-|---|---|---|
-| udp:// | UDP | |
-| tcp:// | TCP | |
-| tcp+udp://、udp+tcp:// | TCP+UDP | |
-| doh:// | DoH | https:// |
-| dot:// | DoT | tls:// |
-| doq:// | DoQ | quic:// |
-
-没有协议前缀时，省略 transport 默认为 UDP。没有路径的 DoH URL 使用 /dns-query。DoH 支持使用 host 查询参数覆盖 HTTP Host；该参数不会继续发送给上游。
-
-DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
-
-DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；某个上游超时或被拒绝后，会在进程重启前对该上游禁用 0-RTT。被拒绝既包括明确报告拒绝，也包括对端直接关闭或重置连接——拒收早期数据的服务器常常是这么回应的。
-
-UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通过 settings.enable_tcp_fallback 禁用。该 fallback 属于转发路径，不是额外监听器。
-
-## 配置
+## 配置文件
 
 配置格式为 JSON：
 
@@ -322,6 +108,13 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 
 域名后缀和 GeoSite 标签匹配也不区分大小写。domain_suffix 和 request_domain_suffix 按整段域名比较：`example.com` 命中它本身和 `www.example.com` 这样的子域名，`.example.com` 只命中子域名；两种写法都不命中 `notexample.com`。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
 
+#### GeoSite 条目
+
+- 写法与 V2Ray 的域名列表（domain-list-community）相同。`domain:example.com` 和不带前缀的 `example.com` 按整段匹配域名本身及其所有子域名（不匹配 `notexample.com`）；和 domain_suffix 不同，这里开头加点不改变含义。
+- `full:example.com` 只匹配域名本身，`keyword:`、`regexp:` 按关键词、正则匹配，不带前缀且含 `*` 的值按通配符匹配。
+- `.dat` 文件里的标签可以带属性键，写作 `tag@attr`（如 `google@cn`），和 V2Ray 一样按字面键匹配：`google@!cn` 选的是标记为 `!cn` 的域名。不带属性的域名用 `geosite: google` 加上 `geosite_not: google@cn` 选出。
+- JSON 里前缀不认识、没有值或正则无效的条目会跳过并给出警告。
+
 ### 响应匹配器
 
 | 类型 | 字段 |
@@ -414,6 +207,63 @@ ECS 配置在 Forward 动作中：
 - 客户端的 ECS 选项不完全符合 RFC 7871 第 6 节时，应答不缓存。
 
 查找时在适用的应答中取前缀最长的一份。同一个问题最多保存 64 个网段的应答；满了时先淘汰只适用于单个子网的应答，同一类请求方共用的应答最后淘汰。并发未命中去重只合并发送相同子网的请求。没带 ECS 的客户端拿到的应答不带 ECS 选项，不论是否来自缓存；带了 ECS 的客户端拿回自己的子网，作用范围不短于 KixDNS 保存这份应答所用的范围。Pipeline 级 ecs 仍可写在配置里，但不再影响缓存。
+
+## 网络协议
+
+### 入站
+
+UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
+
+入站监听器行为：
+
+- 只处理标准单 question 的 QUERY 消息。畸形包、非 QUERY opcode 和 DNS 响应包会被静默丢弃。
+- 监听器处理错误、整体请求超时或流控 permit 耗尽时，对合法查询返回 SERVFAIL。
+- 大于客户端声明大小（EDNS 载荷大小；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试。
+
+只有设置 settings.bind_doh 后才会启用入站 DoH。启用时必须同时设置 settings.doh_tls_cert 和 settings.doh_tls_key，且路径指向 PEM 文件。路径默认为 /dns-query，可通过 settings.doh_path 修改。
+
+入站 DoH 处理器：
+
+- 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
+- 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
+- 拒绝大于 64 KiB 的 DNS 请求体；
+- 成功处理后返回 application/dns-message。
+
+DoT 和 DoQ 只作为出站传输实现，代码没有入站 DoT/DoQ 监听器。
+
+### 出站
+
+Forward 动作的 transport 字段可选以下值：
+
+| 值 | 传输 |
+|---|---|
+| udp | DNS over UDP |
+| tcp | DNS over TCP |
+| tcp_udp | 同时发送 TCP 和 UDP，使用第一个可接受的响应 |
+| doh | DNS over HTTPS |
+| dot | DNS over TLS |
+| doq | DNS over QUIC |
+
+upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多个上游会并发查询并返回第一个可接受的响应；在多个上游选择时，SERVFAIL 和 REFUSED 响应不会被接受。
+
+以下协议前缀会覆盖 transport 字段：
+
+| 前缀 | 传输 | 别名 |
+|---|---|---|
+| udp:// | UDP | |
+| tcp:// | TCP | |
+| tcp+udp://、udp+tcp:// | TCP+UDP | |
+| doh:// | DoH | https:// |
+| dot:// | DoT | tls:// |
+| doq:// | DoQ | quic:// |
+
+没有协议前缀时，省略 transport 默认为 UDP。没有路径的 DoH URL 使用 /dns-query。DoH 支持使用 host 查询参数覆盖 HTTP Host；该参数不会继续发送给上游。
+
+DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
+
+DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；某个上游超时或被拒绝后，会在进程重启前对该上游禁用 0-RTT。被拒绝既包括明确报告拒绝，也包括对端直接关闭或重置连接——拒收早期数据的服务器常常是这么回应的。
+
+UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通过 settings.enable_tcp_fallback 禁用。该 fallback 属于转发路径，不是额外监听器。
 
 ## 配置示例
 
@@ -553,51 +403,3 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。唯一的例外是 DoH TLS 证书：证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。
 
 geosite_data_paths 中的 GeoSite 文件会被监控并重载。geoip_dat_path 指定的 GeoIP 文件会被监控并重载。geoip_db_path 指定的 MMDB 在启动时加载；当前 watcher 监控的是 geoip_dat_path，不是 MMDB 路径。
-
-## 技术栈
-
-- **tokio** — 异步运行时
-- **hickory-proto** — DNS 协议和 wire message
-- **serde / serde_json** — 配置序列化
-- **moka / dashmap** — 并发缓存和映射
-- **rustc-hash** — 快速哈希
-- **quinn** — QUIC/DoQ 传输
-- **reqwest / hyper** — HTTP 和 DoH 客户端/服务端
-- **tokio-rustls / rustls** — DoT、DoQ 和入站 DoH 的 TLS
-- **maxminddb / maxminddb-writer** — GeoIP MMDB 查询和转换
-- **arc-swap / notify** — 配置状态和文件监控
-- **clap / tracing** — CLI 解析和日志
-
-## 工具
-
-### 配置编辑器
-
-tools/config_editor.html 是浏览器端配置编辑器，可以编辑 settings、Pipeline selector、Pipeline、规则、匹配器、动作、ECS、TXT 动作和响应规则，支持导入 JSON、预览 JSON、下载 JSON 以及 Mermaid 流程图。
-
-该文件从公共 CDN 加载 Vue、Bootstrap 和 Mermaid，因此浏览器需要能访问这些 URL。可以直接打开文件，导入或编辑配置，下载 JSON，然后通过启动 KixDNS 验证：
-
-~~~text
-tools/config_editor.html
-~~~
-
-工具专用说明见 [tools/README.md](tools/README.md)。
-
-tools/diagnose.html 是用于检查编辑器 Vue/TXT/匹配器代码的浏览器 smoke-check 页面，不是 DNS 查询服务，也不提供 WebSocket API。
-
-tools/check_geosite_tags.rs 是仓库中的独立源码文件。Cargo.toml 没有将它声明为 bin 或 example target。
-
-## 构建和测试
-
-~~~bash
-cargo build --release
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-~~~
-
-Release profile 设置 opt-level = 3、lto = fat、codegen-units = 1、panic = abort 和 strip = true。
-
-主要依赖包括 tokio、hickory-proto、serde、moka、dashmap、reqwest、tokio-rustls、quinn、maxminddb、notify、clap 和 tracing；具体版本以 Cargo.toml 和 Cargo.lock 为准。
-
-## 许可证
-
-[GPL-3.0](LICENSE)
