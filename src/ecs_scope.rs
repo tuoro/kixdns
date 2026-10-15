@@ -52,9 +52,12 @@ pub enum EcsSource {
     /// 客户端自己带的 ECS：转发没写 `ecs`，或者固定 IP 无效
     /// The client's own ECS: the forward has no `ecs`, or its static IP is invalid
     Client,
-    /// `from_client_ip`：来源地址按这些前缀取子网，私有地址则同 `Client`
-    /// `from_client_ip`: the address's subnet at these prefixes, or as `Client`
-    /// for a private address
+    /// `from_client_ip`：客户端自己带了 ECS 时，它的子网按这些前缀截短；没带、读不懂或者是私有网段时，
+    /// 来源地址按这些前缀取子网，私有地址则不加（见 `crate::ecs::plan`）
+    /// `from_client_ip`: the client's own subnet cut to these prefixes when it sent
+    /// ECS; when it sent none, one nobody can read or a private network, the
+    /// address's subnet at these prefixes, or nothing for a private address (see
+    /// `crate::ecs::plan`)
     Peer { prefix_v4: u8, prefix_v6: u8 },
     /// 与请求方无关：`clear`，或有效的固定 IP
     /// Independent of the requester: `clear`, or a valid static IP
@@ -97,18 +100,22 @@ impl EcsSource {
                     prefix_v4,
                     prefix_v6,
                 };
-                Some(Sent::of(plan(Some(&mode), view.peer), view))
+                Some(Sent::of(
+                    plan(Some(&mode), view.peer, view.client.as_ref()),
+                    view,
+                ))
             }
             Self::Fixed => None,
         }
     }
 
-    /// 这样的转发为 `view` 的请求发出的 ECS 是否就是客户端自己带的
-    /// Whether the ECS such a forward sends for `view`'s request is the client's own
+    /// 这样的转发为 `view` 的请求发出的 ECS 是否取自客户端自己带的（原样或截短）
+    /// Whether the ECS such a forward sends for `view`'s request comes from the
+    /// client's own, as it is or cut short
     fn sends_client_subnet(&self, view: &EcsView) -> bool {
         match *self {
             Self::Client => true,
-            Self::Peer { .. } => crate::ecs::is_private_ip(&view.peer),
+            Self::Peer { .. } => crate::ecs::forwards_own_ecs(view.peer, view.client.as_ref()),
             Self::Fixed => false,
         }
     }
@@ -131,7 +138,7 @@ impl ForwardEcs {
     pub fn of(mode: Option<&EcsMode>, view: &EcsView) -> Self {
         Self {
             source: EcsSource::of(mode),
-            sent: Sent::of(plan(mode, view.peer), view),
+            sent: Sent::of(plan(mode, view.peer, view.client.as_ref()), view),
         }
     }
 }
@@ -604,10 +611,26 @@ mod tests {
             echoed("198.51.100.0/24", 24),
             true,
         );
-        // 公网客户端发的是来源地址的子网，与它自己带的 ECS 无关
-        // A public client sends its address's subnet, whatever ECS it carries
+        // 带了 ECS 的客户端，公网的也一样，发出的是它自己的子网（RFC 7871 第 7.1 节）
+        // A client that sent ECS, public or not, has its own subnet sent (RFC 7871
+        // section 7.1)
         assert_eq!(
-            by_peer.echo_scope(&view("198.51.100.9", Some("203.0.113.0/24"))),
+            by_peer.echo_scope(&view("198.51.100.9", Some("198.51.100.0/24"))),
+            24
+        );
+        // 带着读不懂的 ECS 选项的公网客户端，发出的是来源地址的子网，与那个选项无关
+        // A public client carrying an ECS option nobody can read sends its address's
+        // subnet, whatever the option says
+        let unreadable = EcsView {
+            peer: "198.51.100.9".parse().unwrap(),
+            client: Some(EcsKey::opaque(b"not an ECS option")),
+        };
+        assert_eq!(by_peer.echo_scope(&unreadable), 0);
+        // 带着私有网段的公网客户端也是：私有网段不发给上游（RFC 7871 第 11.3 节）
+        // So does a public client carrying a private network, which does not go
+        // upstream (RFC 7871 section 11.3)
+        assert_eq!(
+            by_peer.echo_scope(&view("198.51.100.9", Some("10.1.2.0/24"))),
             0
         );
         assert_eq!(

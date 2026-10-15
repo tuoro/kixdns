@@ -1,6 +1,6 @@
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -45,6 +45,24 @@ use crate::engine::rules::calculate_rule_hash;
 use crate::engine::rules::rule_cache_requester;
 use crate::engine::rules::{Decision, ResponseContext};
 use crate::matcher::{Requester, RequesterKey};
+
+/// The address the engine judges a client by. A dual-stack socket (an inbound DoH
+/// listener on `[::]`, say) reports an IPv4 client as an IPv4-mapped IPv6 address
+/// (::ffff:a.b.c.d); rules, GeoIP, ECS and the cache see the IPv4 address it
+/// carries, as they would on an IPv4 socket. Replies still go to the address the
+/// listener received from.
+/// 引擎据以判断客户端的地址。双栈套接字（例如监听 `[::]` 的入站 DoH）把 IPv4 客户端报成
+/// IPv4 映射的 IPv6 地址（::ffff:a.b.c.d）；规则、GeoIP、ECS 和缓存看到的是它背后的 IPv4
+/// 地址，和在 IPv4 套接字上一样。应答仍发往监听器收到请求的那个地址。
+fn client_address(peer: SocketAddr) -> SocketAddr {
+    match peer {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+            None => peer,
+        },
+        SocketAddr::V4(_) => peer,
+    }
+}
 
 /// The keys of one request in one pipeline (see `Engine::cache_keys`)
 /// 一个请求在一个 pipeline 里的键（见 `Engine::cache_keys`）
@@ -562,6 +580,7 @@ impl Engine {
         packet: &[u8],
         peer: SocketAddr,
     ) -> anyhow::Result<Option<FastPathResponse>> {
+        let peer = client_address(peer);
         let log_start = Instant::now();
         // Quick parsing, avoiding full Message parsing and massive allocations / 快速解析，避免完整 Message 解析和大量分配
         // Use stack buffer to avoid String allocation / 使用栈上缓冲区避免 String 分配
@@ -1071,6 +1090,7 @@ impl Engine {
         refresh: Option<RefreshTarget>,
         state_override: Option<Arc<EngineInner>>,
     ) -> anyhow::Result<Bytes> {
+        let peer = client_address(peer);
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let request_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.incr_total_requests();

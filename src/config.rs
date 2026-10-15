@@ -1210,8 +1210,11 @@ pub enum EcsMode {
     /// 从客户端来源 IP（peer address）推导 ECS 子网。
     /// Derive ECS subnet from the client source IP (peer address).
     ///
-    /// 私有 IP（RFC 1918/ULA/loopback）不注入 ECS。
-    /// Private IPs (RFC 1918/ULA/loopback) are not injected with ECS.
+    /// 私有 IP（RFC 1918/ULA/loopback）不注入 ECS。客户端自己带了 ECS 时，转发它自己的
+    /// 子网，前缀比这里的长就截短，前缀为 0 的原样转发（RFC 7871 第 7.1 节）。
+    /// Private IPs (RFC 1918/ULA/loopback) are not injected with ECS. A client that
+    /// sent ECS itself has its own subnet forwarded, cut to these prefixes when
+    /// longer, and a prefix of 0 forwarded as it is (RFC 7871 section 7.1).
     FromClientIp {
         /// IPv4 source prefix length (default: 24)
         #[serde(default = "default_ecs_prefix_v4")]

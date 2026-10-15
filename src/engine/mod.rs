@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod client_address_tests;
 pub mod concurrency;
 pub mod core;
 #[cfg(test)]

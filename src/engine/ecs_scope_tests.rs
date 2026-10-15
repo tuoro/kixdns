@@ -255,9 +255,14 @@ fn peer(client: &str) -> SocketAddr {
 
 /// 整个应答 / The whole reply
 async fn reply(engine: &Engine, client: &str, subnet: Option<(&str, u8)>) -> Bytes {
+    reply_from(engine, peer(client), subnet).await
+}
+
+/// 同上，来源地址照原样给出 / The same, with the source address given as it is
+async fn reply_from(engine: &Engine, peer: SocketAddr, subnet: Option<(&str, u8)>) -> Bytes {
     tokio::time::timeout(
         Duration::from_secs(5),
-        engine.handle_packet(&query(subnet), peer(client)),
+        engine.handle_packet(&query(subnet), peer),
     )
     .await
     .expect("answer in time")
@@ -1541,4 +1546,144 @@ async fn waiters_on_the_response_jump_path_get_the_full_echo() {
     for reply in [one.unwrap(), two.unwrap()] {
         assert_eq!(reply_ecs(&reply), Some((ip("198.51.100.0"), 24, 24)));
     }
+}
+
+/// RFC 7871 第 7.1 节：客户端自己带了 ECS 时，由它决定给上游多少地址。`from_client_ip` 转发它
+/// 自己的子网：前缀不超过这里的设置时原样转发，更长时截短到设置的前缀，前缀为 0 的不加地址；
+/// 公网和私有地址的客户端都一样。缓存按实际发出的子网保存应答。
+/// RFC 7871 section 7.1: a client that sent ECS itself decides how much of its
+/// address goes upstream. `from_client_ip` forwards the client's own subnet: as it
+/// is when its prefix is no longer than the one set here, cut to that prefix when
+/// it is longer, and a prefix of 0 adds no address; public and private clients
+/// alike. The cache keeps each answer for the subnet that actually went out.
+#[tokio::test]
+async fn from_client_ip_sends_no_more_of_a_client_subnet_than_the_client_did() {
+    // 作用范围比任何发出的前缀都长：每份应答只给它那个子网
+    // A scope longer than any prefix sent: every answer is for its own subnet only
+    let up = upstream(Echo::Scope(32)).await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    assert_eq!(
+        ask(&engine, "198.51.100.7", Some(("0.0.0.0", 0))).await,
+        v4("0.0.0.0")
+    );
+    assert_eq!(
+        ask(&engine, "198.51.100.7", Some(("203.0.0.0", 16))).await,
+        v4("203.0.0.0")
+    );
+    let long = reply(&engine, "198.51.100.7", Some(("203.0.113.9", 32))).await;
+    assert_eq!(first_a(&long), v4("203.0.113.0"));
+    assert_eq!(reply_ecs(&long), Some((ip("203.0.113.9"), 32, 32)));
+    assert_eq!(
+        ask(&engine, "192.168.1.10", Some(("198.18.0.1", 32))).await,
+        v4("198.18.0.0")
+    );
+    assert_eq!(
+        *up.seen.lock(),
+        vec![
+            Some((ip("0.0.0.0"), 0)),
+            Some((ip("203.0.0.0"), 16)),
+            Some((ip("203.0.113.0"), 24)),
+            Some((ip("198.18.0.0"), 24)),
+        ]
+    );
+    // 别的客户端发出同样的子网时，拿缓存里的这几份 / Another client sending the same subnet takes these from the cache
+    assert_eq!(
+        ask(&engine, "203.0.113.50", Some(("203.0.113.77", 32))).await,
+        v4("203.0.113.0")
+    );
+    assert_eq!(
+        ask(&engine, "203.0.113.50", Some(("0.0.0.0", 0))).await,
+        v4("0.0.0.0")
+    );
+    assert_eq!(up.queries(), 4);
+}
+
+/// RFC 7871 第 11.3 节：客户端自己带的私有网段不发给上游。公网客户端照样发来源地址的子网，
+/// 私有地址的客户端什么也不发；缓存按实际发出的保存应答。
+/// RFC 7871 section 11.3: a private network in the client's own ECS does not go
+/// upstream. A public client sends its address's subnet as usual, a private client
+/// sends nothing, and the cache keeps each answer for what actually went out.
+#[tokio::test]
+async fn from_client_ip_does_not_pass_on_a_private_client_network() {
+    let up = upstream(Echo::Scope(16)).await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    let public = reply(&engine, "198.51.100.7", Some(("10.1.2.0", 28))).await;
+    assert_eq!(first_a(&public), v4("198.51.100.0"));
+    // 回显的作用范围说的是来源地址的子网，与客户端的网段无关，所以报客户端自己的前缀
+    // The echoed scope speaks of the source address's subnet, not the client's
+    // network, so the client's own prefix is reported
+    assert_eq!(reply_ecs(&public), Some((ip("10.1.2.0"), 28, 28)));
+    assert_eq!(
+        ask(&engine, "192.168.1.10", Some(("10.1.2.0", 28))).await,
+        Some(NO_SUBNET)
+    );
+    assert_eq!(*up.seen.lock(), vec![Some((ip("198.51.100.0"), 24)), None]);
+    // 同样的请求再来一次，都从缓存拿 / The same requests again come from the cache
+    ask(&engine, "198.51.100.7", Some(("10.1.2.0", 28))).await;
+    ask(&engine, "192.168.1.10", Some(("10.1.2.0", 28))).await;
+    assert_eq!(up.queries(), 2);
+}
+
+/// 转发把客户端的 /32 截短成 /24：第一次的应答和之后命中缓存的应答，回显的都是客户端自己的
+/// 子网和上游给的作用范围。
+/// The forward cuts the client's /32 to /24: the first reply and the cache hits
+/// after it echo the client's own subnet with the scope the upstream gave.
+#[tokio::test]
+async fn the_echo_after_a_cut_reports_the_upstream_scope() {
+    let up = upstream(Echo::Scope(24)).await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    let first = reply(&engine, "198.51.100.7", Some(("203.0.113.9", 32))).await;
+    assert_eq!(reply_ecs(&first), Some((ip("203.0.113.9"), 32, 24)));
+    let hit = reply(&engine, "198.51.100.8", Some(("203.0.113.77", 32))).await;
+    assert_eq!(first_a(&hit), v4("203.0.113.0"));
+    assert_eq!(reply_ecs(&hit), Some((ip("203.0.113.77"), 32, 24)));
+    assert_eq!(up.queries(), 1);
+}
+
+/// 两个公网客户端同时到达、带着同一个子网：`from_client_ip` 为二者发出的都是这个子网，后到的
+/// 等在先到的请求上，上游只问一次。
+/// Two public clients arrive at once carrying the same subnet: `from_client_ip`
+/// sends that subnet for both, so the later one waits on the earlier and the
+/// upstream is asked once.
+#[tokio::test]
+async fn clients_sending_the_same_subnet_through_from_client_ip_wait_together() {
+    let up = upstream_with(
+        Echo::Scope(16),
+        ResponseCode::NoError,
+        300,
+        Duration::from_millis(150),
+    )
+    .await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    assert_eq!(
+        ask_at_once(
+            &engine,
+            ("198.51.100.7", Some(("203.0.0.0", 16))),
+            ("192.0.2.200", Some(("203.0.0.0", 16)))
+        )
+        .await,
+        [v4("203.0.0.0"), v4("203.0.0.0")]
+    );
+    assert_eq!(up.queries(), 1);
+}
+
+/// 双栈套接字上的 IPv4 客户端（::ffff:a.b.c.d）：`from_client_ip` 按它的 IPv4 地址取子网，
+/// 私有地址照样不加。
+/// An IPv4 client on a dual-stack socket (::ffff:a.b.c.d): `from_client_ip` takes
+/// the subnet of its IPv4 address, and adds none for a private one as usual.
+#[tokio::test]
+async fn from_client_ip_takes_the_ipv4_subnet_of_a_mapped_client() {
+    let up = upstream(Echo::Scope(24)).await;
+    let engine = engine(forward_all(&up.address, from_client_ip()));
+    let public: SocketAddr = "[::ffff:198.51.100.7]:53000".parse().unwrap();
+    let private: SocketAddr = "[::ffff:192.168.1.5]:53000".parse().unwrap();
+    assert_eq!(
+        first_a(&reply_from(&engine, public, None).await),
+        v4("198.51.100.0")
+    );
+    assert_eq!(
+        first_a(&reply_from(&engine, private, None).await),
+        Some(NO_SUBNET)
+    );
+    assert_eq!(*up.seen.lock(), vec![Some((ip("198.51.100.0"), 24)), None]);
 }

@@ -193,7 +193,7 @@ ECS 配置在 Forward 动作中：
 支持的模式：
 
 - clear：移除请求中的 ECS 选项；
-- from_client_ip：根据客户端地址生成子网，IPv4 默认 /24、IPv6 默认 /56；私有地址、回环地址和 ULA 地址不会注入，客户端自己带的 ECS 选项（如果有）原样发往上游；
+- from_client_ip：客户端自己带了 ECS 时，转发它自己的子网，前缀比这里设置的长就截短到设置的长度，前缀为 0 的原样转发、不加地址（RFC 7871 第 7.1 节）；客户端带的是私有网段或 IPv4 映射形式（`::ffff:a.b.c.d`）的网段时当作没带，不发给上游（第 11.3 节）。没带时根据客户端地址生成子网，IPv4 默认 /24、IPv6 默认 /56，私有地址、回环地址和 ULA 地址不注入；
 - static：使用配置的 IP 和前缀注入。
 
 不写 ecs 的转发把客户端自己带的 ECS 选项原样发往上游。
@@ -219,6 +219,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 - 只处理标准单 question 的 QUERY 消息。畸形包、非 QUERY opcode 和 DNS 响应包会被静默丢弃。
 - 监听器处理错误、整体请求超时或流控 permit 耗尽时，对合法查询返回 SERVFAIL。
 - 大于客户端声明大小（EDNS 载荷大小；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试。
+- 双栈套接字（例如监听 `[::]` 的入站 DoH）把 IPv4 客户端报成 `::ffff:a.b.c.d`。规则、GeoIP、ECS 和缓存都按它背后的 IPv4 地址判断，client_ip 照常写 IPv4 网段；写成 `::ffff:a.b.c.d/n` 的网段按它所指的 IPv4 网段处理。
 
 只有设置 settings.bind_doh 后才会启用入站 DoH。启用时必须同时设置 settings.doh_tls_cert 和 settings.doh_tls_key，且路径指向 PEM 文件。路径默认为 /dns-query，可通过 settings.doh_path 修改。
 

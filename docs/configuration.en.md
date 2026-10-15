@@ -193,7 +193,7 @@ ECS is configured on a Forward action:
 The supported modes are:
 
 - clear: remove the request ECS option;
-- from_client_ip: derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6; private, loopback, and ULA addresses are not injected, and the client's own ECS option, if any, goes upstream as it is;
+- from_client_ip: when the client sent ECS itself, forward its own subnet, cut to the prefix set here when it is longer, and a prefix of 0 as it is, adding no address (RFC 7871 section 7.1); a private or IPv4-mapped (`::ffff:a.b.c.d`) network the client sent counts as none and does not go upstream (section 11.3). Otherwise derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6, injecting nothing for private, loopback, and ULA addresses;
 - static: inject a configured IP and prefix.
 
 A forward without ecs passes the client's own ECS option upstream as it is.
@@ -219,6 +219,7 @@ Inbound listener behavior:
 - Only standard single-question QUERY messages are processed. Malformed packets, non-QUERY opcodes, and DNS response packets are silently dropped.
 - A listener processing error, an overall request timeout, or an exhausted flow-control permit returns SERVFAIL to the client for a valid query.
 - UDP responses larger than the client's advertised size (the EDNS payload size, or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP.
+- A dual-stack socket (inbound DoH listening on `[::]`, say) reports an IPv4 client as `::ffff:a.b.c.d`. Rules, GeoIP, ECS and the cache all judge it by the IPv4 address it carries, so client_ip takes IPv4 networks as usual; a network written as `::ffff:a.b.c.d/n` counts as the IPv4 network it names.
 
 Inbound DoH is disabled unless settings.bind_doh is set. When it is set, settings.doh_tls_cert and settings.doh_tls_key are required and must point to PEM files. The path defaults to /dns-query and can be changed with settings.doh_path.
 

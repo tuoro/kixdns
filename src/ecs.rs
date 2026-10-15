@@ -34,17 +34,24 @@ pub const DEFAULT_PREFIX_V6: u8 = 56;
 ///
 /// Returns the original packet bytes if:
 /// - Mode is `Clear` but no ECS exists (no-op)
-/// - Client IP is private (privacy protection, RFC 1918/ULA/loopback)
+/// - Mode is `FromClientIp` and the client's own ECS goes on as it is, or the client
+///   sent none and its IP is private (privacy protection, RFC 1918/ULA/loopback);
+///   see `plan`
 /// - Static IP is invalid
 /// - Message parsing fails (malformed query)
 ///
 /// 以下情况返回原始包字节：
 /// - 模式为 `Clear` 但不存在 ECS（无需操作）
-/// - 客户端 IP 为私有地址（隐私保护，RFC 1918/ULA/loopback）
+/// - 模式为 `FromClientIp`，客户端自己的 ECS 原样转发，或者客户端没带 ECS 而 IP 为私有地址
+///   （隐私保护，RFC 1918/ULA/loopback）；见 `plan`
 /// - 静态 IP 无效
 /// - 消息解析失败（畸形查询）
 pub fn apply_ecs(packet: &[u8], mode: &EcsMode, peer_ip: IpAddr) -> Vec<u8> {
-    match plan(Some(mode), peer_ip) {
+    let client = match mode {
+        EcsMode::FromClientIp { .. } => crate::proto_utils::client_subnet(packet),
+        _ => None,
+    };
+    match plan(Some(mode), peer_ip, client.as_ref()) {
         EcsPlan::Strip => strip_ecs(packet),
         EcsPlan::Keep => packet.to_vec(),
         EcsPlan::Set(subnet) => inject_ecs(packet, subnet),
@@ -65,24 +72,44 @@ pub(crate) enum EcsPlan {
 }
 
 /// The plan of a forward with `ecs` (None: the forward has no `ecs` setting) for a
-/// request from `peer_ip`. `apply_ecs` carries it out; the response cache reads it
-/// to know what the upstream was asked with.
-/// 带 `ecs`（None 表示转发没写 `ecs`）的转发对来自 `peer_ip` 的请求怎么处理 ECS。
-/// `apply_ecs` 照此执行；响应缓存据此知道上游被问的是什么。
-pub(crate) fn plan(mode: Option<&EcsMode>, peer_ip: IpAddr) -> EcsPlan {
+/// request from `peer_ip` carrying the ECS option `client` (see
+/// `proto_utils::client_subnet`). `apply_ecs` carries it out; the response cache
+/// reads it to know what the upstream was asked with.
+/// 带 `ecs`（None 表示转发没写 `ecs`）的转发对来自 `peer_ip`、带着 ECS 选项 `client`（见
+/// `proto_utils::client_subnet`）的请求怎么处理 ECS。`apply_ecs` 照此执行；响应缓存据此知道
+/// 上游被问的是什么。
+pub(crate) fn plan(mode: Option<&EcsMode>, peer_ip: IpAddr, client: Option<&EcsKey>) -> EcsPlan {
     match mode {
         None => EcsPlan::Keep,
         Some(EcsMode::Clear) => EcsPlan::Strip,
         Some(EcsMode::FromClientIp {
             prefix_v4,
             prefix_v6,
-        }) => {
-            if is_private_ip(&peer_ip) {
-                EcsPlan::Keep
-            } else {
-                EcsPlan::Set(EcsKey::from_ip(peer_ip, *prefix_v4, *prefix_v6))
+        }) => match own_ecs(client) {
+            // RFC 7871 section 7.1: a client that sent ECS itself decides how much of
+            // its address goes upstream. Its own subnet goes on, cut to the prefix set
+            // here when it is longer; a prefix of 0, which asks for no address at all,
+            // goes on as it is.
+            // RFC 7871 第 7.1 节：客户端自己带了 ECS，就由它决定给上游多少地址。转发它自己的
+            // 子网，比这里设置的前缀长时截短；前缀为 0 表示不要任何地址，原样转发。
+            OwnEcs::Forwarded(own) => {
+                let limit = if own.family == 1 {
+                    *prefix_v4
+                } else {
+                    *prefix_v6
+                };
+                if own.source_prefix <= limit {
+                    EcsPlan::Keep
+                } else {
+                    EcsPlan::Set(own.truncated(limit))
+                }
             }
-        }
+            // A private client's packet goes as it came, less a private network
+            // 私有地址客户端的包原样发出，只去掉私有网段
+            OwnEcs::Private if is_private_ip(&peer_ip) => EcsPlan::Strip,
+            _ if is_private_ip(&peer_ip) => EcsPlan::Keep,
+            _ => EcsPlan::Set(EcsKey::from_ip(peer_ip, *prefix_v4, *prefix_v6)),
+        },
         Some(EcsMode::Static { ip, prefix }) => match ip.parse::<IpAddr>() {
             Ok(parsed) => EcsPlan::Set(EcsKey::from_ip(parsed, *prefix, *prefix)),
             Err(_) => {
@@ -90,6 +117,51 @@ pub(crate) fn plan(mode: Option<&EcsMode>, peer_ip: IpAddr) -> EcsPlan {
                 EcsPlan::Keep
             }
         },
+    }
+}
+
+/// What `from_client_ip` makes of the ECS option a client sent itself
+/// `from_client_ip` 怎么看客户端自己带的 ECS 选项
+enum OwnEcs<'a> {
+    /// A subnet to pass on (RFC 7871 section 7.1): well-formed, and either /0 or
+    /// a public network
+    /// 要转发的子网（RFC 7871 第 7.1 节）：合规，并且是 /0 或公网网段
+    Forwarded(&'a EcsKey),
+    /// A private network, or an IPv4-mapped one (RFC 6890 lists ::ffff:0:0/96 as
+    /// not globally reachable), which section 11.3 says to take as the resolver's
+    /// own identity: it says nothing about where the client is, and does not go
+    /// upstream
+    /// 私有网段，或 IPv4 映射形式的网段（RFC 6890 把 ::ffff:0:0/96 列为不可全球路由）：
+    /// 第 11.3 节说按解析器自己的身份对待，它说明不了客户端在哪里，不发给上游
+    Private,
+    /// No option, or one nobody can read / 没带，或者读不懂
+    Unknown,
+}
+
+fn own_ecs(client: Option<&EcsKey>) -> OwnEcs<'_> {
+    match client {
+        Some(own) if own.is_opaque() => OwnEcs::Unknown,
+        Some(own) if own.source_prefix > 0 && own.ip().is_none_or(is_unroutable) => OwnEcs::Private,
+        Some(own) => OwnEcs::Forwarded(own),
+        None => OwnEcs::Unknown,
+    }
+}
+
+/// A network address an ECS option should not carry upstream: a private one, or
+/// an IPv4-mapped one / ECS 选项不该带给上游的网段地址：私有地址，或 IPv4 映射形式的地址
+fn is_unroutable(ip: IpAddr) -> bool {
+    is_private_ip(&ip) || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some())
+}
+
+/// Whether `from_client_ip` sends a request's own ECS (`client`, from `peer_ip`):
+/// its subnet as it is or cut short, or the packet as the client sent it
+/// `from_client_ip` 是否发出请求自己的 ECS（来自 `peer_ip` 的 `client`）：它的子网原样或截短，
+/// 或者包按客户端发来的原样发出
+pub(crate) fn forwards_own_ecs(peer_ip: IpAddr, client: Option<&EcsKey>) -> bool {
+    match own_ecs(client) {
+        OwnEcs::Forwarded(_) => true,
+        OwnEcs::Private => false,
+        OwnEcs::Unknown => is_private_ip(&peer_ip),
     }
 }
 
@@ -734,10 +806,94 @@ mod tests {
 
     /// The subnet `plan` sets, if any / `plan` 设置的子网（如有）
     fn planned(mode: &EcsMode, peer: IpAddr) -> Option<EcsKey> {
-        match plan(Some(mode), peer) {
+        match plan(Some(mode), peer, None) {
             EcsPlan::Set(subnet) => Some(subnet),
             EcsPlan::Strip | EcsPlan::Keep => None,
         }
+    }
+
+    /// RFC 7871 第 7.1 节：客户端自己带的 ECS 决定给上游多少地址，公网和私有地址的客户端都一样
+    /// RFC 7871 section 7.1: the client's own ECS decides how much of its address
+    /// goes upstream, for public and private clients alike
+    #[test]
+    fn from_client_ip_follows_the_clients_own_ecs() {
+        let mode = EcsMode::FromClientIp {
+            prefix_v4: 24,
+            prefix_v6: 56,
+        };
+        let own =
+            |address: &str, prefix: u8| EcsKey::from_ip(address.parse().unwrap(), prefix, prefix);
+        let public: IpAddr = "198.51.100.7".parse().unwrap();
+        let private: IpAddr = "192.168.1.10".parse().unwrap();
+        for peer in [public, private] {
+            // 前缀 0 表示不要地址；不比设置长的原样转发
+            // A prefix of 0 asks for no address; one no longer than the setting goes on as it is
+            for kept in [
+                own("0.0.0.0", 0),
+                own("203.0.0.0", 16),
+                own("203.0.113.0", 24),
+            ] {
+                assert_eq!(plan(Some(&mode), peer, Some(&kept)), EcsPlan::Keep);
+            }
+            // 更长的截短到设置的前缀 / A longer one is cut to the setting
+            assert_eq!(
+                plan(Some(&mode), peer, Some(&own("203.0.113.9", 32))),
+                EcsPlan::Set(own("203.0.113.0", 24))
+            );
+            assert_eq!(
+                plan(Some(&mode), peer, Some(&own("2001:db8:1:2::", 64))),
+                EcsPlan::Set(own("2001:db8:1::", 56))
+            );
+        }
+        // 读不懂的选项照旧：公网客户端换成来源地址的子网，私有地址的原样转发
+        // An option nobody can read, as before: a public client gets its address's
+        // subnet instead, a private one's goes on as it is
+        let opaque = EcsKey::opaque(b"not an ECS option");
+        assert_eq!(
+            plan(Some(&mode), public, Some(&opaque)),
+            EcsPlan::Set(own("198.51.100.0", 24))
+        );
+        assert_eq!(plan(Some(&mode), private, Some(&opaque)), EcsPlan::Keep);
+    }
+
+    /// RFC 7871 第 11.3 节：客户端自己带的私有网段按解析器自己的身份对待，不发给上游：公网
+    /// 客户端照样发来源地址的子网，私有地址的客户端什么也不发
+    /// RFC 7871 section 11.3: a private network in the client's own ECS is taken as
+    /// the resolver's own identity and does not go upstream: a public client gets its
+    /// address's subnet as usual, and a private client gets nothing
+    #[test]
+    fn from_client_ip_does_not_pass_on_a_private_network() {
+        let mode = EcsMode::FromClientIp {
+            prefix_v4: 24,
+            prefix_v6: 56,
+        };
+        let own =
+            |address: &str, prefix: u8| EcsKey::from_ip(address.parse().unwrap(), prefix, prefix);
+        let public: IpAddr = "198.51.100.7".parse().unwrap();
+        let private: IpAddr = "192.168.1.10".parse().unwrap();
+        for network in [
+            own("10.1.2.0", 24),
+            own("fd00:1::", 48),
+            own("127.0.0.0", 8),
+            // IPv4 映射形式的网段，私有的和公网的都不发 / IPv4-mapped networks, private and public alike
+            own("::ffff:10.1.2.0", 120),
+            own("::ffff:203.0.113.0", 120),
+        ] {
+            assert_eq!(
+                plan(Some(&mode), public, Some(&network)),
+                EcsPlan::Set(own("198.51.100.0", 24))
+            );
+            assert_eq!(plan(Some(&mode), private, Some(&network)), EcsPlan::Strip);
+            assert!(!forwards_own_ecs(public, Some(&network)));
+            assert!(!forwards_own_ecs(private, Some(&network)));
+        }
+        // 前缀 0 不带地址，不算私有网段 / A prefix of 0 carries no address and is no private network
+        assert!(forwards_own_ecs(public, Some(&own("0.0.0.0", 0))));
+        assert!(forwards_own_ecs(public, Some(&own("203.0.0.0", 16))));
+        // 没带 ECS：只有私有地址的客户端，包按原样发出
+        // No ECS: only a private client's packet goes as it was sent
+        assert!(!forwards_own_ecs(public, None));
+        assert!(forwards_own_ecs(private, None));
     }
 
     #[test]
