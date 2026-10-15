@@ -830,7 +830,7 @@ pub(crate) async fn process_response_jump(
                     original_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
                     refresh_ttl: crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs()),
                 };
-                engine.cache.insert(dedupe_hash, Arc::new(entry));
+                engine.insert_dns_cache_entry(dedupe_hash, entry);
                 for g in &mut cleanup_guards {
                     g.defuse();
                 }
@@ -1131,7 +1131,7 @@ pub(crate) async fn process_response_jump(
                                         ttl_secs_refresh,
                                     ), // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                 };
-                                engine.cache.insert(dedupe_hash, Arc::new(entry));
+                                engine.insert_dns_cache_entry(dedupe_hash, entry);
                             }
                             for g in &mut cleanup_guards {
                                 g.defuse();
@@ -1196,7 +1196,7 @@ pub(crate) async fn process_response_jump(
                                             ttl_secs_refresh,
                                         ), // Use max TTL for refresh timing / 使用最大 TTL 作为刷新时机
                                     };
-                                    engine.cache.insert(dedupe_hash, Arc::new(entry));
+                                    engine.insert_dns_cache_entry(dedupe_hash, entry);
                                 }
                                 for g in &mut cleanup_guards {
                                     g.defuse();

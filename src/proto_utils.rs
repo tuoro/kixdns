@@ -768,6 +768,15 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     })
 }
 
+/// Whether a DNS message is a response with the TC (truncated) bit set. TC only means
+/// something in a response, so a message without QR is never truncated.
+/// DNS 报文是否是带 TC（截断）位的应答。TC 只在应答里有意义，所以没有 QR 位的报文不算截断。
+pub fn truncated_response(message: &[u8]) -> bool {
+    message
+        .get(2)
+        .is_some_and(|flags| flags & 0x80 != 0 && flags & 0x02 != 0)
+}
+
 /// Re-encode an oversized downstream UDP response so it respects the payload size
 /// advertised by the client (RFC 6891). Queries without EDNS are limited to the
 /// classic 512-byte DNS/UDP payload.
@@ -1113,6 +1122,22 @@ mod tests {
         edns.set_max_payload(4096);
         message.set_edns(edns);
         encode_message(&message)
+    }
+
+    #[test]
+    fn truncated_response_needs_both_qr_and_tc() {
+        // byte 2 holds QR (0x80) and TC (0x02) / 第 3 个字节里是 QR（0x80）和 TC（0x02）
+        assert!(truncated_response(&[0, 0, 0x82, 0]));
+        assert!(truncated_response(&[0, 0, 0x83, 0x80]));
+        assert!(
+            !truncated_response(&[0, 0, 0x80, 0]),
+            "a response without TC"
+        );
+        assert!(
+            !truncated_response(&[0, 0, 0x02, 0]),
+            "TC without QR is not a response"
+        );
+        assert!(!truncated_response(&[0, 0]), "too short to carry the flags");
     }
 
     #[test]

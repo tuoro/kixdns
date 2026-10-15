@@ -195,7 +195,13 @@ async fn forward_tcp_udp_dual(
 
     let udp_task = tokio::spawn(async move {
         // Disable TCP fallback here to avoid duplicate TCP sends when dual-send is enabled.
-        forward_udp_smart(&engine_udp, &packet_udp, &addr_udp, timeout_dur, false).await
+        // A truncated answer waits for the TCP leg below instead.
+        // 双发时这里不改用 TCP，免得重复发送；截断的应答改为在下面等 TCP 那一路。
+        let tcp = UdpTcpFallback {
+            retry_truncated: false,
+            on_failure: false,
+        };
+        forward_udp_smart(&engine_udp, &packet_udp, &addr_udp, timeout_dur, tcp).await
     });
 
     let tcp_task = tokio::spawn(async move {
@@ -209,7 +215,27 @@ async fn forward_tcp_udp_dual(
 
     // Wait for first successful response / 等待第一个成功响应
     match select(udp_task, tcp_task).await {
-        futures::future::Either::Left((result, tcp_task)) => match result {
+        futures::future::Either::Left((result, mut tcp_task)) => match result {
+            // A truncated UDP answer does not win: the TCP leg is asking the same upstream
+            // for the full answer, so wait for it, and fall back to the truncated answer only
+            // if it fails.
+            // 截断的 UDP 应答不算赢：TCP 那一路正在向同一个上游要完整应答，所以等它；它失败了才
+            // 退回这个截断的应答。
+            Ok(Ok(bytes)) if crate::proto_utils::truncated_response(&bytes) => {
+                let remaining = timeout_dur
+                    .checked_sub(start.elapsed())
+                    .unwrap_or_else(|| Duration::from_millis(0));
+                match timeout(remaining, &mut tcp_task).await {
+                    Ok(Ok(Ok(full))) => Ok((full, "tcp")),
+                    other => {
+                        if other.is_err() {
+                            tcp_task.abort();
+                        }
+                        debug!(event = "tc_udp_answer_kept", upstream = %addr, "tcp leg gave no answer, keeping the truncated udp answer");
+                        Ok((bytes, "udp"))
+                    }
+                }
+            }
             Ok(Ok(bytes)) => {
                 tcp_task.abort();
                 Ok((bytes, "udp"))
@@ -325,7 +351,11 @@ pub async fn forward_upstream(
         // back to TCP) / `via` 为实际带回答案的传输（UDP 可能回退到 TCP）
         let (res, proto, via): (anyhow::Result<Bytes>, &str, Transport) = match transport_for_addr {
             Transport::Udp => {
-                match forward_udp_smart_via(engine, packet, addr, timeout_dur, true).await {
+                let tcp = UdpTcpFallback {
+                    retry_truncated: true,
+                    on_failure: true,
+                };
+                match forward_udp_smart_via(engine, packet, addr, timeout_dur, tcp).await {
                     Ok((bytes, via)) => (Ok(bytes), via_label(via), via),
                     Err(err) => (Err(err), "udp", Transport::Udp),
                 }
@@ -431,8 +461,10 @@ pub async fn forward_upstream(
     let mut pending: Option<Vec<(String, Transport, std::time::Instant)>> =
         observed.map(|_| Vec::new());
 
-    // If any TCP/TCP+UDP upstream is present, avoid UDP->TCP fallback to prevent duplicate TCP sends
-    // 如果同一批次已有 TCP/TCP+UDP 上游，禁用 UDP->TCP fallback，避免重复 TCP 发送
+    // If any TCP/TCP+UDP upstream is present, a failed UDP attempt does not fall back to TCP, to
+    // prevent duplicate TCP sends (truncated answers are still fetched again over TCP)
+    // 如果同一批次已有 TCP/TCP+UDP 上游，UDP 失败时不再回退到 TCP，避免重复 TCP 发送（截断的应答照样用
+    // TCP 重取）
     let has_tcp_task = upstreams.iter().any(|up| {
         let (_, t) = parse_upstream_addr(up, default_transport);
         matches!(t, Transport::Tcp | Transport::TcpUdp)
@@ -467,14 +499,15 @@ pub async fn forward_upstream(
             let start = std::time::Instant::now();
             let (proto, res, via) = match transport_for_task {
                 Transport::Udp => {
-                    match forward_udp_smart_via(
-                        &engine,
-                        &packet,
-                        &addr_owned,
-                        timeout_dur,
-                        !has_tcp_task,
-                    )
-                    .await
+                    // A truncated answer is still fetched again over TCP: the batch's TCP
+                    // upstreams do not give this upstream's full answer.
+                    // 截断的应答照样用 TCP 重取：同批的 TCP 上游给不出这个上游的完整应答。
+                    let tcp = UdpTcpFallback {
+                        retry_truncated: true,
+                        on_failure: !has_tcp_task,
+                    };
+                    match forward_udp_smart_via(&engine, &packet, &addr_owned, timeout_dur, tcp)
+                        .await
                     {
                         Ok((bytes, via)) => (via_label(via), Ok(bytes), via),
                         Err(err) => ("udp", Err(err), Transport::Udp),
@@ -666,11 +699,25 @@ async fn forward_udp_smart(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    allow_tcp_fallback: bool,
+    tcp: UdpTcpFallback,
 ) -> anyhow::Result<Bytes> {
-    forward_udp_smart_via(engine, packet, upstream, timeout_dur, allow_tcp_fallback)
+    forward_udp_smart_via(engine, packet, upstream, timeout_dur, tcp)
         .await
         .map(|(bytes, _)| bytes)
+}
+
+/// When the UDP forwarder turns to TCP, on top of `enable_tcp_fallback`. A truncated
+/// answer and a failed UDP exchange are separate cases: a batch that already sends TCP to
+/// other upstreams still needs this upstream's full answer, but should not add a TCP
+/// attempt for a UDP failure.
+/// UDP 转发在 `enable_tcp_fallback` 之外何时改用 TCP。截断的应答和 UDP 失败是两回事：同批里已经
+/// 有别的上游走 TCP 时，这个上游的完整应答照样要取，但 UDP 失败时不再另加一次 TCP 尝试。
+#[derive(Clone, Copy)]
+struct UdpTcpFallback {
+    /// Fetch a truncated answer again over TCP / 截断的应答用 TCP 重取
+    retry_truncated: bool,
+    /// Try TCP when every UDP attempt failed / UDP 全部失败时试 TCP
+    on_failure: bool,
 }
 
 /// [`forward_udp_smart`] that also returns the transport that carried the
@@ -681,12 +728,13 @@ async fn forward_udp_smart_via(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    allow_tcp_fallback: bool,
+    tcp: UdpTcpFallback,
 ) -> anyhow::Result<(Bytes, Transport)> {
     // 获取 TCP fallback 配置（Copy bool 值，避免持有 Guard 跨 await）
     // Get TCP fallback config (Copy bool value to avoid holding Guard across await)
-    let enable_tcp_fallback =
-        allow_tcp_fallback && engine.state.load().pipeline.settings.enable_tcp_fallback;
+    let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
+    let retry_truncated = tcp.retry_truncated && enable_tcp_fallback;
+    let fallback_on_failure = tcp.on_failure && enable_tcp_fallback;
 
     // Split timeout: first attempt uses 1/N budget (leaving room for TCP fallback)
     // 分割超时：第一次尝试使用 1/N 时间（为 TCP fallback 留出空间）
@@ -695,11 +743,8 @@ async fn forward_udp_smart_via(
     for (idx, dur) in attempts.iter().enumerate() {
         match engine.udp_client.send(packet, upstream, *dur).await {
             Ok(bytes) => {
-                // RFC 1035: Check TC (Truncated) flag using quick parse - 使用快速解析检查 TC 标志
-                if let Some(qr) = crate::proto_utils::parse_response_quick(&bytes)
-                    && qr.truncated
-                    && enable_tcp_fallback
-                {
+                // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
+                if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
                     debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
                     return engine
                         .tcp_mux
@@ -718,7 +763,7 @@ async fn forward_udp_smart_via(
                     error = %err,
                     "udp forward attempt failed",
                 );
-                if idx + 1 == attempts.len() && enable_tcp_fallback {
+                if idx + 1 == attempts.len() && fallback_on_failure {
                     // Last UDP attempt, try TCP fallback before failing.
                     debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
                     return engine
@@ -996,7 +1041,10 @@ mod tests {
             &packet,
             &upstream_addr.to_string(),
             Duration::from_millis(500),
-            false,
+            UdpTcpFallback {
+                retry_truncated: false,
+                on_failure: false,
+            },
         )
         .await
         .expect("udp response");
