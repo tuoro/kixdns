@@ -999,8 +999,8 @@ mod tests {
         let v4: [u8; 4] = [1, 2, 3, 0];
         let dat = build_dat("CN", Some((v4, 24)), Some((v6, 32)));
 
-        let mut path = std::env::temp_dir();
-        path.push("geoip_test_v6.dat");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip_test_v6.dat");
         std::fs::write(&path, &dat).unwrap();
 
         let mut mgr = GeoIpManager::new(None).unwrap();
@@ -1034,8 +1034,8 @@ mod tests {
                 }
             ]
         }"#;
-        let mut path = std::env::temp_dir();
-        path.push("geoip_test_v6.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip_test_v6.json");
         std::fs::write(&path, json).unwrap();
 
         let mut mgr = GeoIpManager::new(None).unwrap();
@@ -1137,8 +1137,8 @@ mod tests {
     #[test]
     fn test_lookup_nested_overlap_most_specific() {
         let dat = build_nested_dat();
-        let mut path = std::env::temp_dir();
-        path.push("geoip_test_nested.dat");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip_test_nested.dat");
         std::fs::write(&path, &dat).unwrap();
 
         let mut mgr = GeoIpManager::new(None).unwrap();
@@ -1177,7 +1177,8 @@ mod tests {
                 }
             ]
         }"#;
-        let path = std::env::temp_dir().join("geoip_test_same_tag_nested.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip_test_same_tag_nested.json");
         std::fs::write(&path, json).unwrap();
 
         let mut mgr = GeoIpManager::new(None).unwrap();
@@ -1205,8 +1206,8 @@ mod tests {
         let mut dat = build_dat("AU", Some(([1, 1, 1, 0], 24)), None);
         dat.extend(build_dat("cloudflare", Some(([1, 1, 1, 0], 24)), None));
 
-        let mut path = std::env::temp_dir();
-        path.push("geoip_test_overlapping_tags.dat");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip_test_overlapping_tags.dat");
         std::fs::write(&path, &dat).unwrap();
 
         let mut mgr = GeoIpManager::new(None).unwrap();
@@ -1229,8 +1230,8 @@ mod tests {
     #[test]
     fn test_lookup_preserves_named_tag_only_dat_behavior() {
         let dat = build_dat("cloudflare", Some(([1, 1, 1, 0], 24)), None);
-        let mut path = std::env::temp_dir();
-        path.push("geoip_test_named_tag_only.dat");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip_test_named_tag_only.dat");
         std::fs::write(&path, &dat).unwrap();
 
         let mut mgr = GeoIpManager::new(None).unwrap();
@@ -1248,10 +1249,10 @@ mod tests {
         let mmdb_source = build_dat("US", None, Some((network, 32)));
         let mut dat = build_dat("CN", None, Some((network, 16)));
         dat.extend(build_dat("CLOUDFLARE", None, Some((network, 16))));
-        let temp_dir = std::env::temp_dir();
-        let mmdb_source_path = temp_dir.join("geoip_test_mmdb_source.dat");
-        let dat_path = temp_dir.join("geoip_test_mmdb_precedence.dat");
-        let mmdb_path = temp_dir.join("geoip_test_mmdb_precedence.mmdb");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mmdb_source_path = temp_dir.path().join("geoip_test_mmdb_source.dat");
+        let dat_path = temp_dir.path().join("geoip_test_mmdb_precedence.dat");
+        let mmdb_path = temp_dir.path().join("geoip_test_mmdb_precedence.mmdb");
         std::fs::write(&mmdb_source_path, mmdb_source).unwrap();
         std::fs::write(&dat_path, dat).unwrap();
         GeoIpManager::convert_dat_to_mmdb(&mmdb_source_path, &mmdb_path, None).unwrap();

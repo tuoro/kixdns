@@ -2284,10 +2284,21 @@ mod tests {
         pipeline_select: serde_json::Value,
         pipelines: serde_json::Value,
     ) -> RuntimePipelineConfig {
+        continue_config_with_timeout(pipeline_select, pipelines, 100)
+    }
+
+    /// The same with `upstream_timeout_ms`, for tests whose upstreams answer slowly on
+    /// purpose: 100 ms leaves too little room on a busy machine
+    /// 同上，可设 `upstream_timeout_ms`，给上游故意慢答的测试用：100 毫秒在机器忙时余量不够
+    fn continue_config_with_timeout(
+        pipeline_select: serde_json::Value,
+        pipelines: serde_json::Value,
+        upstream_timeout_ms: u64,
+    ) -> RuntimePipelineConfig {
         let raw = serde_json::json!({
             "settings": {
                 "default_upstream": "127.0.0.1:9",
-                "upstream_timeout_ms": 100,
+                "upstream_timeout_ms": upstream_timeout_ms,
                 "enable_tcp_fallback": false
             },
             "pipeline_select": pipeline_select,
@@ -2763,7 +2774,7 @@ mod tests {
             )
         };
         let engine = Engine::new(
-            continue_config(
+            continue_config_with_timeout(
                 serde_json::json!([
                     { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
                     { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
@@ -2780,6 +2791,7 @@ mod tests {
                         }]))
                     }
                 ]),
+                1000,
             ),
             "test".to_string(),
         )
@@ -2875,7 +2887,7 @@ mod tests {
         let raw = serde_json::json!({
             "settings": {
                 "default_upstream": "127.0.0.1:9",
-                "upstream_timeout_ms": 100,
+                "upstream_timeout_ms": 1000,
                 "enable_tcp_fallback": false,
                 "response_jump_limit": 3
             },

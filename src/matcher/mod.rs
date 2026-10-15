@@ -2270,7 +2270,8 @@ mod tests {
                 { "country_code": "cloudflare", "ips": ["104.16.0.0/12", "2606:4700::/32"] }
             ]
         }"#;
-        let path = std::env::temp_dir().join("geoip_runtime_matchers.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip_runtime_matchers.json");
         std::fs::write(&path, json).unwrap();
 
         let mut manager = geoip::GeoIpManager::new(None).unwrap();

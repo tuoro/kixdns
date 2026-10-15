@@ -162,7 +162,12 @@ async fn upstream(echo: Echo) -> Upstream {
 fn engine_with(settings: serde_json::Value, pipelines: serde_json::Value) -> Engine {
     let mut all = serde_json::json!({
         "default_upstream": "127.0.0.1:9",
-        "upstream_timeout_ms": 1000,
+        // A UDP query is sent again after a third of this (`upstream::hedge_timeout`). The
+        // tests count upstream queries, and on a busy machine 1 s let an answer arrive
+        // after that point now and then; tests that wait on a silent upstream set less.
+        // UDP 查询过了这个时间的三分之一会再发一次（`upstream::hedge_timeout`）。这些测试数上游
+        // 收到的查询，机器忙时 1 秒偶尔会让应答晚过这个点；要等上游不应答的测试自己设得更短。
+        "upstream_timeout_ms": 3000,
         "enable_tcp_fallback": false
     });
     all.as_object_mut()

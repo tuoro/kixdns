@@ -297,10 +297,17 @@ async fn truncating_upstream(
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // UDP first so the shared-port bind does not flake.
-    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // UDP first, and another pair when the TCP port of the same number is taken
+    // already (by another test's connection, say), so the shared-port bind does not flake.
+    let (udp, listener) = loop {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        match tokio::net::TcpListener::bind(udp.local_addr().unwrap()).await {
+            Ok(listener) => break (udp, listener),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(err) => panic!("bind tcp on the udp port: {err}"),
+        }
+    };
     let addr = udp.local_addr().unwrap();
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let task = tokio::spawn(async move {
         tokio::spawn(async move {
             let mut buf = [0; 1500];

@@ -2005,8 +2005,8 @@ mod tests {
         let entry = build_geosite("TEST", &domains);
         let dat = build_dat(&[entry]);
 
-        let dir = std::env::temp_dir();
-        let path = dir.join("kixdns_test_attr.dat");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kixdns_test_attr.dat");
         std::fs::write(&path, &dat).unwrap();
 
         // @cn: only example.com
@@ -2056,8 +2056,8 @@ mod tests {
         let entry = build_geosite("DUAL", &domains);
         let dat = build_dat(&[entry]);
 
-        let dir = std::env::temp_dir();
-        let path = dir.join("kixdns_test_dual.dat");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kixdns_test_dual.dat");
         std::fs::write(&path, &dat).unwrap();
 
         let mut m = GeoSiteManager::new();
