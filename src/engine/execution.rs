@@ -1540,24 +1540,26 @@ impl Engine {
                     }
                     Decision::Static { rcode, answers } => {
                         response_log.info.upstream = Some(Arc::from("static"));
-                        // After a refresh continued past an answer: a SERVFAIL here (a
-                        // jump target that does not exist, the jump limit, or a static
-                        // SERVFAIL the rules configure) ends the refresh as a failure
-                        // and the entry stays; any other static answer replaces the
-                        // entry, which handle_static_decision stores again when it
-                        // caches the answer there.
-                        // 刷新越过一个应答之后：这里的 SERVFAIL（跳转目标不存在、到了跳转
-                        // 上限，或规则配置的静态 SERVFAIL）让刷新以失败结束，条目保留；其他
-                        // 静态应答取代这条，handle_static_decision 在那里缓存应答时会重新写入。
-                        if refresh_passed_an_answer {
-                            if rcode == ResponseCode::ServFail {
-                                return Err(phases::refresh_found_no_answer(
-                                    "no answer after a continue",
-                                ));
-                            }
-                            if let Some(target) = &refresh {
-                                drop_refreshed(target);
-                            }
+                        // On a refresh, a SERVFAIL here (a jump target that does not
+                        // exist, or a static SERVFAIL the rules configure) is no answer:
+                        // the refresh ends as a failure before anything is cached over
+                        // its entry, which stays. After a refresh continued past an
+                        // answer, any other static answer replaces the entry, which
+                        // handle_static_decision stores again when it caches the answer
+                        // there.
+                        // 刷新时这里的 SERVFAIL（跳转目标不存在，或规则配置的静态 SERVFAIL）
+                        // 不是应答：刷新在往缓存写任何东西之前以失败结束，条目保留。刷新越过
+                        // 一个应答之后，其他静态应答取代这条，handle_static_decision 在那里缓存
+                        // 应答时会重新写入。
+                        if rcode == ResponseCode::ServFail
+                            && (refresh.is_some() || refresh_passed_an_answer)
+                        {
+                            return Err(phases::refresh_found_no_answer(
+                                "the rules answered SERVFAIL",
+                            ));
+                        }
+                        if refresh_passed_an_answer && let Some(target) = &refresh {
+                            drop_refreshed(target);
                         }
                         return phases::handle_static_decision(
                             self,
@@ -1732,6 +1734,18 @@ impl Engine {
             address: peer.ip(),
             edns: edns_present,
             ecs: client_ecs,
+        };
+        // A refresh is after an answer to renew its entry with. SERVFAIL is none,
+        // whatever produced it (the jump limit, a jump target that does not exist, a
+        // static SERVFAIL), so the refresh ends as a failure, which refresh.rs logs,
+        // and the entry stays as it is.
+        // 刷新要的是拿来更新条目的应答。SERVFAIL 不是，不论它从哪里来（跳转上限、跳转目标
+        // 不存在、静态 SERVFAIL），所以刷新以失败结束，由 refresh.rs 记录，条目保持原样。
+        let result = match result {
+            Ok(bytes) if refresh.is_some() && phases::is_servfail(&bytes) => Err(
+                phases::refresh_found_no_answer("the rules answered SERVFAIL"),
+            ),
+            result => result,
         };
         if let Some(mut guard) = held_inflight.take()
             && let Ok(bytes) = &result

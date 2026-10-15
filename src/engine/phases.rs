@@ -1405,6 +1405,12 @@ pub(crate) async fn handle_forward_decision_logged(
                         )
                         .await?;
 
+                        // The target found no answer either: a refresh gets the upstream
+                        // failure, as in the Static arm
+                        // 目标也没拿到应答：刷新拿到的是上游的失败，同 Static 分支
+                        if skip_cache && is_servfail(&resp_bytes) {
+                            return Err(e);
+                        }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
                             engine
@@ -1656,6 +1662,13 @@ mod refresh_response_rule_tests {
     /// 引擎的 "main" pipeline 里缓存着一条 [`OLD`] 应答，就像客户端请求留下的那样；
     /// 返回刷新它时用的键。
     fn engine_with_a_cached_answer(settings: Value, pipelines: Value) -> (Engine, u64) {
+        let engine = engine_with(settings, pipelines);
+        let key = cache_an_answer(&engine, "main", OLD, 300);
+        (engine, key)
+    }
+
+    /// The same engine with nothing cached / 同样的引擎，缓存里什么也没有
+    fn engine_with(settings: Value, pipelines: Value) -> Engine {
         let mut all_settings =
             json!({ "default_upstream": DEAD_UPSTREAM, "upstream_timeout_ms": 200 });
         for (key, value) in settings.as_object().unwrap() {
@@ -1664,14 +1677,11 @@ mod refresh_response_rule_tests {
         let config: crate::config::PipelineConfig =
             serde_json::from_value(json!({ "settings": all_settings, "pipelines": pipelines }))
                 .expect("parse config");
-        let engine = Engine::new(
+        Engine::new(
             RuntimePipelineConfig::from_config(config).expect("build runtime config"),
             "test".to_string(),
         )
-        .expect("engine");
-
-        let key = cache_an_answer(&engine, "main", OLD, 300);
-        (engine, key)
+        .expect("engine")
     }
 
     /// Caches an answer with `ip` for `pipeline` with the given TTL (0: already
@@ -1728,6 +1738,35 @@ mod refresh_response_rule_tests {
     /// 被删掉时返回 None。
     async fn refresh(engine: &Engine, key: u64) -> Option<Vec<Ipv4Addr>> {
         refresh_as(engine, key, engine.refresh_of(key)).await
+    }
+
+    /// The same, also telling whether the refresh counts as a success, which is
+    /// what refresh.rs logs
+    /// 同上，另外给出刷新算不算成功，也就是 refresh.rs 记录的结果
+    async fn refresh_succeeds(engine: &Engine, key: u64) -> (bool, Option<Vec<Ipv4Addr>>) {
+        let result = refresh_result(engine, key).await;
+        (
+            result.is_ok(),
+            engine.cached(key).map(|entry| a_records(&entry.bytes)),
+        )
+    }
+
+    /// What the refresh call returns / 刷新调用的返回值
+    async fn refresh_result(engine: &Engine, key: u64) -> anyhow::Result<Bytes> {
+        let client: SocketAddr = CLIENT.parse().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet_internal(
+                &query().to_vec().unwrap(),
+                client,
+                true,
+                None,
+                Some(engine.refresh_of(key)),
+                Some(engine.state.load_full()),
+            ),
+        )
+        .await
+        .expect("refresh finishes")
     }
 
     /// The same, renewing what `target` names / 同上，更新 `target` 所指的条目
@@ -2099,6 +2138,118 @@ mod refresh_response_rule_tests {
             refresh_with_actions_on_the_answer(json!({}), continue_(), later, static_target())
                 .await;
         assert_eq!(cached, Some(vec![OLD]));
+    }
+
+    /// A refresh is after an answer to renew the entry with; one that ends in
+    /// SERVFAIL found none, whatever produced it, and counts as a failure. With a
+    /// `min_ttl` the SERVFAIL is not cached over the entry either.
+    /// 刷新要的是拿来更新条目的应答；以 SERVFAIL 结束的刷新没拿到应答，不论 SERVFAIL 从
+    /// 哪里来，都算失败。设了 `min_ttl` 时也不会把 SERVFAIL 缓存进来盖掉条目。
+    #[tokio::test]
+    async fn a_refresh_that_ends_in_servfail_fails() {
+        let cases = [
+            (
+                "the jump limit",
+                json!({ "response_jump_limit": 1 }),
+                json!([
+                    { "id": "main", "rules": [rule("jump", jump_to("other"), json!({}))] },
+                    { "id": "other", "rules": [rule("back", jump_to("main"), json!({}))] }
+                ]),
+            ),
+            (
+                "a jump target that does not exist",
+                json!({}),
+                json!([{ "id": "main", "rules": [rule("jump", jump_to("nowhere"), json!({}))] }]),
+            ),
+            (
+                "a static SERVFAIL",
+                json!({}),
+                json!([{ "id": "main", "rules": [rule(
+                    "servfail",
+                    json!([{ "type": "static_response", "rcode": "SERVFAIL" }]),
+                    json!({})
+                )] }]),
+            ),
+            (
+                "a miss action jumping to a pipeline that does not exist",
+                json!({}),
+                json!([{ "id": "main", "rules": [rule(
+                    "dead",
+                    forward(DEAD_UPSTREAM),
+                    json!({ "response_actions_on_miss": jump_to("nowhere") })
+                )] }]),
+            ),
+        ];
+        for (case, settings, pipelines) in cases {
+            for min_ttl in [0, 60] {
+                let mut settings = settings.clone();
+                settings["min_ttl"] = json!(min_ttl);
+                let (engine, key) = engine_with_a_cached_answer(settings, pipelines.clone());
+                assert_eq!(
+                    refresh_succeeds(&engine, key).await,
+                    (false, Some(vec![OLD])),
+                    "{case}, min_ttl {min_ttl}"
+                );
+            }
+        }
+    }
+
+    /// The upstream failed and the miss action found no answer either: the refresh
+    /// reports the upstream's failure, which says why
+    /// 上游失败，on_miss 动作也没拿到应答：刷新报的是上游的失败，说明了原因
+    #[tokio::test]
+    async fn a_refresh_whose_miss_action_finds_nothing_reports_the_upstream_failure() {
+        let (engine, key) = engine_with_a_cached_answer(
+            json!({}),
+            json!([{ "id": "main", "rules": [rule(
+                "dead",
+                forward(DEAD_UPSTREAM),
+                json!({ "response_actions_on_miss": jump_to("nowhere") })
+            )] }]),
+        );
+        let error = format!("{:#}", refresh_result(&engine, key).await.unwrap_err());
+        assert!(!error.contains("the rules answered SERVFAIL"), "{error}");
+    }
+
+    /// A client still gets the SERVFAIL the rules answer, as a reply
+    /// 客户端照样拿到规则给出的 SERVFAIL 应答
+    #[tokio::test]
+    async fn a_client_gets_the_servfail_the_rules_answer() {
+        for actions in [
+            json!([{ "type": "static_response", "rcode": "SERVFAIL" }]),
+            jump_to("nowhere"),
+        ] {
+            let engine = engine_with(
+                json!({ "min_ttl": 60 }),
+                json!([{ "id": "main", "rules": [rule("servfail", actions.clone(), json!({}))] }]),
+            );
+            let client: SocketAddr = CLIENT.parse().unwrap();
+            let reply = tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.handle_packet(&query().to_vec().unwrap(), client),
+            )
+            .await
+            .expect("answer in time")
+            .expect("a reply, not an error");
+            assert_eq!(
+                Message::from_bytes(&reply).unwrap().metadata.response_code,
+                ResponseCode::ServFail,
+                "{actions}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_gets_an_answer_succeeds() {
+        let answering = spawn_upstream_answering(FINAL).await;
+        let (engine, key) = engine_with_a_cached_answer(
+            json!({}),
+            json!([{ "id": "main", "rules": [rule("all", forward(&answering), json!({}))] }]),
+        );
+        assert_eq!(
+            refresh_succeeds(&engine, key).await,
+            (true, Some(vec![FINAL]))
+        );
     }
 
     #[tokio::test]
