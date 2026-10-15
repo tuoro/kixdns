@@ -1406,6 +1406,17 @@ impl Engine {
                 self.drop_refreshed(target.slot, &question, &view, target);
             };
             let mut refresh_passed_an_answer = false;
+            // A refresh whose upstream failed and whose rules went on (a miss action's
+            // continue) has no new answer from the route the entry came by: whatever
+            // the later rules give is a fallback, like a miss action's own answer (see
+            // `ForwardResult::Fallback`), and leaves the entry in place. The last
+            // continue decides: one past a fresh answer after that means the rules now
+            // pass over an answer they may have given before.
+            // 上游失败后规则接着往下走（on_miss 的 continue）的刷新，没有拿到条目来路上的新应答：
+            // 后面的规则给出的都是兜底，和 on_miss 动作自己给出的应答一样（见
+            // `ForwardResult::Fallback`），不删条目。以最后一次 continue 为准：之后又越过一个
+            // 新拿到的应答，说明规则现在越过了它以前可能给出的应答。
+            let mut refresh_fell_back = false;
             // 决策循环的第几轮：第一轮在任何转发之前 / Which pass of the decision loop: the first runs before anything is forwarded
             let mut pass = 0u32;
             'decision_loop: loop {
@@ -1546,11 +1557,11 @@ impl Engine {
                         // its entry, which stays. After a refresh continued past an
                         // answer, any other static answer replaces the entry, which
                         // handle_static_decision stores again when it caches the answer
-                        // there.
+                        // there, unless it is a fallback after an upstream failure.
                         // 刷新时这里的 SERVFAIL（跳转目标不存在，或规则配置的静态 SERVFAIL）
                         // 不是应答：刷新在往缓存写任何东西之前以失败结束，条目保留。刷新越过
                         // 一个应答之后，其他静态应答取代这条，handle_static_decision 在那里缓存
-                        // 应答时会重新写入。
+                        // 应答时会重新写入；上游失败之后的兜底除外。
                         if rcode == ResponseCode::ServFail
                             && (refresh.is_some() || refresh_passed_an_answer)
                         {
@@ -1558,7 +1569,10 @@ impl Engine {
                                 "the rules answered SERVFAIL",
                             ));
                         }
-                        if refresh_passed_an_answer && let Some(target) = &refresh {
+                        if refresh_passed_an_answer
+                            && !refresh_fell_back
+                            && let Some(target) = &refresh
+                        {
                             drop_refreshed(target);
                         }
                         return phases::handle_static_decision(
@@ -1631,6 +1645,10 @@ impl Engine {
                         .await;
 
                         match res {
+                            // The target's upstream failed: as when the rule's own upstream
+                            // fails, the refresh has no new answer and the entry stays
+                            // 目标的上游失败：和规则自己的上游失败时一样，刷新没有新应答，条目保留
+                            Ok(phases::ForwardResult::Fallback(bytes)) => return Ok(bytes),
                             Ok(phases::ForwardResult::Success(bytes)) => {
                                 // After a refresh continued past an answer and then
                                 // jumped, the answer is not stored under `refresh_key`:
@@ -1642,6 +1660,7 @@ impl Engine {
                                 // 只要不是失败（SERVFAIL，或失败时返回的目标旧结果，也是
                                 // 刷新唯一可能的缓存命中），那里的条目就已经和规则对不上。
                                 if refresh_passed_an_answer
+                                    && !refresh_fell_back
                                     && let Some(target) = &refresh
                                     && keys.slot != target.slot
                                     && !phases::is_servfail(&bytes)
@@ -1651,8 +1670,9 @@ impl Engine {
                                 }
                                 return Ok(bytes);
                             }
-                            Ok(phases::ForwardResult::Continue(ctx)) => {
+                            Ok(phases::ForwardResult::Continue { ctx, after_failure }) => {
                                 refresh_passed_an_answer |= skip_cache && ctx.is_some();
+                                refresh_fell_back = skip_cache && after_failure;
                                 reused_response = *ctx;
                                 skip_rules.insert(rule_name.clone());
                                 let skip_ref = if skip_rules.is_empty() {
