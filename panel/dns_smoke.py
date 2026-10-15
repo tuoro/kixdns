@@ -264,6 +264,14 @@ def assert_fast_path_metric(socket_path: Path) -> None:
         raise SmokeFailure("编译静态快速路径没有导出规则命中计数")
 
 
+def assert_rankings(socket_path: Path, queries: int) -> None:
+    stats = get_json(socket_path, "/v1/stats/top")
+    if stats.get("enabled") is not True or stats.get("requests_observed", 0) < queries:
+        raise SmokeFailure("查询排行没有统计到刚才的查询")
+    if DOMAIN not in [row.get("name") for row in stats.get("domains", [])]:
+        raise SmokeFailure(f"查询排行里没有 {DOMAIN}")
+
+
 def run_contract(binary: Path, directory: Path, log: TextIO) -> None:
     port = reserve_dns_port()
     config_path = directory / "pipeline.json"
@@ -306,6 +314,7 @@ def run_contract(binary: Path, directory: Path, log: TextIO) -> None:
             "结构化热加载回执",
         )
         query_a(port, RELOADED_IP)
+        assert_rankings(socket_path, 2)
         check_diagnostics(socket_path, port, list(health.get("capabilities", [])), RELOADED_IP, process.pid)
     finally:
         process.terminate()

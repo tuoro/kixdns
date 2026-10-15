@@ -198,7 +198,14 @@ async fn run_dns_server(
 
     // The enhanced build installs the panel observer in the single observer
     // slot; it forwards to the --debug reference observer itself / 增强版在唯一的观察者槽位安装面板观察者，由它自行转发给 --debug 参考观察者
-    let panel_metrics = Arc::new(kixdns::panel::PanelMetrics::new(debug));
+    let panel_metrics = kixdns::panel::PanelMetrics::new(debug);
+    // 查询排行只经控制通道读；没开控制通道时不统计 / Query rankings are only read over the
+    // control socket; without one they are not collected
+    let panel_metrics = Arc::new(if cfg!(unix) && admin_socket.is_some() {
+        panel_metrics
+    } else {
+        panel_metrics.without_rankings()
+    });
     let engine = Engine::builder(cfg)
         .listener_label(listener_label.clone())
         .config_source(&config, config_source)
