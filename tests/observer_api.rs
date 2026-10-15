@@ -1516,11 +1516,19 @@ async fn spawn_tcp_dns_server(listener: tokio::net::TcpListener) -> tokio::task:
 async fn tcp_fallback_reports_the_transport_that_answered() {
     // UDP never answers; a DNS-over-TCP responder listens on the same port
     // UDP 只收不回；同一端口上有 DNS-over-TCP 应答者
-    let silent_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // The TCP port of the UDP socket's number can be taken already (by another
+    // test's connection, say): take another pair then
+    // 和 UDP 同号的 TCP 端口可能已被占用（例如被别的测试的连接占着）：那就换一对
+    let (silent_udp, listener) = loop {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = udp.local_addr().unwrap().port();
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => break (udp, listener),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(err) => panic!("bind tcp on the udp port: {err}"),
+        }
+    };
     let port = silent_udp.local_addr().unwrap().port();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .unwrap();
     let _tcp = spawn_tcp_dns_server(listener).await;
     let upstream = format!("127.0.0.1:{port}");
     let raw = serde_json::json!({

@@ -86,17 +86,20 @@ mod tests {
     fn test_rwlock_read_write_blocking() {
         let lock = Arc::new(RwLock::new(42));
         let lock_clone = Arc::clone(&lock);
+        let (held, acquired) = std::sync::mpsc::channel();
 
         // Spawn a thread that holds the read lock
         let read_handle = thread::spawn(move || {
             let r = lock_clone.read();
+            held.send(()).unwrap();
             // Hold the lock for a bit
             thread::sleep(std::time::Duration::from_millis(50));
             *r
         });
 
-        // Give the read lock time to be acquired
-        thread::sleep(std::time::Duration::from_millis(10));
+        // Wait until the read lock is held: a fixed sleep let the writer go first on a
+        // busy machine / 等读锁真的拿到：固定的等待在机器忙时会让写线程先拿到锁
+        acquired.recv().unwrap();
 
         // Clone again for the write handle
         let lock_for_write = Arc::clone(&lock);
