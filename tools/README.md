@@ -20,7 +20,7 @@ tools/config_editor.html 是一个静态 HTML 配置编辑器。它使用 Vue 3�
 - **MMDB 与 .dat 路径**：配置 MaxMind MMDB 和 V2Ray GeoIP `.dat`/JSON 文件路径。
 - **多文件支持**：`geosite_data_paths` 支持多个 GeoSite 数据文件。
 - **GeoIP 匹配器**：支持 `geoip_country` 和 `geoip_private`。
-- **GeoSite 匹配器**：支持 `geosite` 和 `geosite_not`，以及响应阶段的请求域名 GeoSite 匹配器。
+- **GeoSite 匹配器**：支持 `geo_site` 和 `geo_site_not`，以及响应阶段的请求域名 GeoSite 匹配器。
 - **调用语法**：界面识别 `geosite:cn`、`geoip:CN` 和 `geoip:CN,US`，并将其写入服务端字段。
 
 编辑器中的 `geoip_auto_convert`、`geoip_filter_countries` 和顶层 `background_refresh_rule` 会被界面维护或输出，但当前运行引擎不会读取它们。GeoIP 转换时的国家过滤请使用主程序命令：
@@ -118,8 +118,8 @@ Pipeline selector 支持：
 - domain_regex
 - qclass
 - edns_present
-- geosite
-- geosite_not
+- geo_site
+- geo_site_not
 - geoip_country
 - geoip_private
 - qtype
@@ -137,8 +137,8 @@ Pipeline selector 支持：
 - response_answer_ip
 - response_answer_ip_geoip_country
 - response_answer_ip_geoip_private
-- response_request_domain_geosite
-- response_request_domain_geosite_not
+- response_request_domain_geo_site
+- response_request_domain_geo_site_not
 - response_txt_content
 
 GeoSite 和 GeoIP 的输入值在编辑器中可以使用普通字段。编辑器还会识别 geosite:tag 和 geoip:COUNTRY 形式并将参数写入对应字段；`COUNTRY` 也可以是 `cloudflare`、`netflix` 等 V2Ray GeoIP 标签。GeoIP 标签大小写不敏感，且同一 IP 可以同时匹配国家代码和命名标签；服务端最终仍按 Rust 配置枚举解析。

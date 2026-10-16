@@ -6,7 +6,8 @@
     "cache_refresh_threshold_percent": 80,
     "cache_refresh_min_ttl": 5,
     "cache_capacity": 10000,
-    "cache_max_ttl": 3600
+    "cache_max_ttl": 3600,
+    "geosite_data_paths": ["data/geosite.dat"]
   },
   "pipelines": [
     {
@@ -16,14 +17,14 @@
           "name": "gfw",
           "matchers": [
             {
-              "matcher": "geosite",
-              "tag": "gfw"
+              "type": "geo_site",
+              "value": "gfw"
             }
           ],
           "actions": [
             {
-              "action": "forward",
-              "upstream": ["8.8.8.8:53", "1.1.1.1:53"]
+              "type": "forward",
+              "upstream": "8.8.8.8:53,1.1.1.1:53"
             }
           ]
         }

@@ -90,8 +90,8 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 | domain_regex | value |
 | qclass | value：IN、CH/CHAOS 或 HS |
 | edns_present | expect：布尔值 |
-| geosite | value：GeoSite tag |
-| geosite_not | value：GeoSite tag |
+| geo_site | value：GeoSite tag |
+| geo_site_not | value：GeoSite tag |
 | geoip_country | country_codes：字符串数组 |
 | geoip_private | expect：布尔值 |
 | qtype | value：A、AAAA、CNAME、MX、TXT、NS、PTR、SOA、SRV 或 OPT |
@@ -112,7 +112,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 
 - 写法与 V2Ray 的域名列表（domain-list-community）相同。`domain:example.com` 和不带前缀的 `example.com` 按整段匹配域名本身及其所有子域名（不匹配 `notexample.com`）；和 domain_suffix 不同，这里开头加点不改变含义。
 - `full:example.com` 只匹配域名本身，`keyword:`、`regexp:` 按关键词、正则匹配，不带前缀且含 `*` 的值按通配符匹配。
-- `.dat` 文件里的标签可以带属性键，写作 `tag@attr`（如 `google@cn`），和 V2Ray 一样按字面键匹配：`google@!cn` 选的是标记为 `!cn` 的域名。不带属性的域名用 `geosite: google` 加上 `geosite_not: google@cn` 选出。
+- `.dat` 文件里的标签可以带属性键，写作 `tag@attr`（如 `google@cn`），和 V2Ray 一样按字面键匹配：`google@!cn` 选的是标记为 `!cn` 的域名。不带属性的域名用 `geo_site: google` 加上 `geo_site_not: google@cn` 选出。
 - JSON 里前缀不认识、没有值或正则无效的条目会跳过并给出警告。
 
 ### 响应匹配器
@@ -130,8 +130,8 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | response_edns_present | expect：布尔值 |
 | response_answer_ip_geoip_country | country_codes：字符串数组 |
 | response_answer_ip_geoip_private | expect：布尔值 |
-| response_request_domain_geosite | value：GeoSite tag |
-| response_request_domain_geosite_not | value：GeoSite tag |
+| response_request_domain_geo_site | value：GeoSite tag |
+| response_request_domain_geo_site_not | value：GeoSite tag |
 | response_txt_content | mode：exact、prefix 或 regex；value 为文本/模式 |
 
 响应地址匹配范围如下：

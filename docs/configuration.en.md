@@ -90,8 +90,8 @@ The same structure is used for response_matchers, response_matcher_operator, res
 | domain_regex | value |
 | qclass | value: IN, CH/CHAOS, or HS |
 | edns_present | expect: boolean |
-| geosite | value: GeoSite tag |
-| geosite_not | value: GeoSite tag |
+| geo_site | value: GeoSite tag |
+| geo_site_not | value: GeoSite tag |
 | geoip_country | country_codes: string array |
 | geoip_private | expect: boolean |
 | qtype | value: A, AAAA, CNAME, MX, TXT, NS, PTR, SOA, SRV, or OPT |
@@ -112,7 +112,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 
 - Entries are written as in V2Ray's domain lists (domain-list-community). `domain:example.com` and a bare `example.com` match the domain and every subdomain by whole labels (not `notexample.com`); unlike `domain_suffix`, a leading dot changes nothing here.
 - `full:example.com` matches the domain only, `keyword:` and `regexp:` match a keyword or a regular expression, and a bare value with `*` is a wildcard.
-- In `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. The domains without an attribute are `geosite: google` together with `geosite_not: google@cn`.
+- In `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. The domains without an attribute are `geo_site: google` together with `geo_site_not: google@cn`.
 - JSON entries with an unknown prefix, no value or an invalid regex are skipped with a warning.
 
 ### Response matchers
@@ -130,8 +130,8 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 | response_edns_present | expect: boolean |
 | response_answer_ip_geoip_country | country_codes: string array |
 | response_answer_ip_geoip_private | expect: boolean |
-| response_request_domain_geosite | value: GeoSite tag |
-| response_request_domain_geosite_not | value: GeoSite tag |
+| response_request_domain_geo_site | value: GeoSite tag |
+| response_request_domain_geo_site_not | value: GeoSite tag |
 | response_txt_content | mode: exact, prefix, or regex; value is the text/pattern |
 
 Response address matching uses these scopes:

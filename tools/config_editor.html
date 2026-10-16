@@ -511,7 +511,7 @@
                 
                 <!-- Dynamic Inputs based on type -->
                 <input v-if="hasField(m.type, 'value')" type="text" class="form-control" v-model="m.value"
-                    :placeholder="m.type === 'geo_site' || m.type === 'geo_site_not' || m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not' ? 'cn 或 geosite:cn' : 'Value'">
+                    :placeholder="m.type === 'geo_site' || m.type === 'geo_site_not' || m.type === 'response_request_domain_geo_site' || m.type === 'response_request_domain_geo_site_not' ? 'cn 或 geosite:cn' : 'Value'">
                 <input v-if="hasField(m.type, 'cidr')" type="text" class="form-control" v-model="m.cidr" placeholder="CIDR 或逗号分隔列表 (e.g. 127.0.0.0/8,0.0.0.0/8)">
                 <div v-if="hasField(m.type, 'expect')" class="input-group-text bg-white">
                     <input type="checkbox" class="form-check-input mt-0" v-model="m.expect"> &nbsp;Expect
@@ -676,8 +676,8 @@
             'response_answer_ip': ['cidr'],
             'response_answer_ip_geoip_country': ['country_codes'],
             'response_answer_ip_geoip_private': ['expect'],
-            'response_request_domain_geosite': ['value'],
-            'response_request_domain_geosite_not': ['value'],
+            'response_request_domain_geo_site': ['value'],
+            'response_request_domain_geo_site_not': ['value'],
             'response_txt_content': ['mode', 'value'],
             'any': []
         };
@@ -735,7 +735,7 @@
                         m._callSyntax = false; // Track if using call syntax
                     }
                     if (hasField(type, 'value') && (type === 'geo_site' || type === 'geo_site_not' ||
-                        type === 'response_request_domain_geosite' || type === 'response_request_domain_geosite_not')) {
+                        type === 'response_request_domain_geo_site' || type === 'response_request_domain_geo_site_not')) {
                         m._callSyntax = false; // Track if using call syntax
                     }
                     if (!m.operator) m.operator = DEFAULT_MATCH_OPERATOR;
@@ -745,7 +745,7 @@
                 const parseCallSyntaxForMatcher = (m) => {
                     // Handle GeoSite matchers (request and response)
                     if (m.type === 'geo_site' || m.type === 'geo_site_not' ||
-                        m.type === 'response_request_domain_geosite' || m.type === 'response_request_domain_geosite_not') {
+                        m.type === 'response_request_domain_geo_site' || m.type === 'response_request_domain_geo_site_not') {
                         if (m.value && m.value.includes(':')) {
                             const parsed = parseCallSyntax(m.value);
                             if (parsed && parsed.type === 'geosite') {
@@ -1001,8 +1001,8 @@
                     'response_answer_ip': 'Answer IP (CIDR)',
                     'response_answer_ip_geoip_country': 'Answer IP GeoIP Country',
                     'response_answer_ip_geoip_private': 'Answer IP GeoIP Private',
-                    'response_request_domain_geosite': 'Req Domain GeoSite',
-                    'response_request_domain_geosite_not': 'Req Domain GeoSite Not',
+                    'response_request_domain_geo_site': 'Req Domain GeoSite',
+                    'response_request_domain_geo_site_not': 'Req Domain GeoSite Not',
                     'response_txt_content': 'TXT Content'
                 };
 
