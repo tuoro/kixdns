@@ -8,7 +8,7 @@ use crate::engine::refresh::RefreshTarget;
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
-use crate::engine::types::EngineInner;
+use crate::engine::types::{EngineInner, inflight_pending};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
@@ -654,8 +654,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 use dashmap::mapref::entry::Entry;
                 let rx = match engine.inflight.entry(keys.inflight) {
                     Entry::Vacant(entry) => {
-                        let (tx, _rx) =
-                            tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                        let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
                         entry.insert(tx);
                         cleanup_guard = Some(InflightCleanupGuard::new(
                             engine.inflight.clone(),
@@ -717,8 +716,7 @@ pub(crate) async fn handle_forward_decision_logged(
             use dashmap::mapref::entry::Entry;
             let rx = match engine.inflight.entry(keys.inflight) {
                 Entry::Vacant(entry) => {
-                    let (tx, _rx) =
-                        tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+                    let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
                     entry.insert(tx);
                     cleanup_guard = Some(InflightCleanupGuard::new(
                         engine.inflight.clone(),

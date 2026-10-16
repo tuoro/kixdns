@@ -19,7 +19,7 @@ use crate::engine::response::{
     make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
 };
 use crate::engine::types::EngineInner;
-use crate::engine::types::InflightMap;
+use crate::engine::types::{InflightMap, inflight_pending};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
@@ -917,9 +917,7 @@ pub(crate) async fn process_response_jump(
                                 Entry::Vacant(entry) => {
                                     // No other request in progress, create watch channel
                                     // 没有其他请求在进行,创建 watch channel
-                                    let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(
-                                        anyhow::anyhow!("Pending"),
-                                    )));
+                                    let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
                                     entry.insert(tx);
                                     cleanup_guards.push(InflightCleanupGuard::new(
                                         engine.inflight.clone(),
@@ -1013,9 +1011,7 @@ pub(crate) async fn process_response_jump(
                             Entry::Vacant(entry) => {
                                 // No other request in progress, create watch channel
                                 // 没有其他请求在进行,创建 watch channel
-                                let (tx, _rx) = tokio::sync::watch::channel(Err(Arc::new(
-                                    anyhow::anyhow!("Pending"),
-                                )));
+                                let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
                                 entry.insert(tx);
                                 cleanup_guards.push(InflightCleanupGuard::new(
                                     engine.inflight.clone(),
