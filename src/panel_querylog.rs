@@ -22,7 +22,8 @@ use dashmap::DashMap;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 
 use crate::config::Transport;
 use crate::observe::{
@@ -161,55 +162,176 @@ enum StepKind {
         via: &'static str,
         result: &'static str,
         latency_us: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        rcode: Option<String>,
+        #[serde(
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_rcode"
+        )]
+        rcode: Option<ResponseCode>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<Box<str>>,
     },
 }
 
-/// 一条查询记录 / One query record
-#[derive(Serialize)]
+/// 一条查询记录。响应码、回答，以及由它们决定的结果和来源，都在面板来取时才读出（见下面的
+/// `Serialize`）：记录时只存客户端收到的应答原文。查询多到交接区装满时，还没被取走就挤掉的记录不必解析。
+/// One query record. The response code, the answers, and the outcome and source they decide are read
+/// out only when the panel collects the record (see `Serialize` below): recording keeps just the response
+/// the client got. When queries outrun the ring, a record pushed out before anyone collected it is never
+/// parsed.
 struct Entry {
     seq: u64,
     time_unix_ms: u64,
-    client: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    client: IpAddr,
     transport: Option<&'static str>,
     qname: Box<str>,
-    qtype: String,
+    qtype: RecordType,
     latency_us: u64,
-    /// `completed`、`failed`（引擎出错，客户端收到 SERVFAIL）或 `cancelled`
-    /// `completed`, `failed` (the engine erred and the client got SERVFAIL) or `cancelled`
-    status: &'static str,
-    /// 答案从哪来：`forwarded`、`cached`、`stale`、`joined`、`static`（规则直接回应，包括回答后检查拦截或改写）、
-    /// `failed`（引擎出错，或客户端收到的不是缓存里的 SERVFAIL）或 `cancelled`
-    /// Where the answer came from: `forwarded`, `cached`, `stale`, `joined`, `static` (a rule answered,
-    /// an answer check's block or rewrite included), `failed` (the engine erred, or the client got a
-    /// SERVFAIL that did not come from the cache) or `cancelled`
-    outcome: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rcode: Option<String>,
-    answers: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Status,
+    /// 命中的是哪种缓存 / Which kind of cache hit answered
+    cache: Option<CacheHitKind>,
+    joined: bool,
+    /// 最后一次决定是规则直接回应 / The last decision was a rule's own answer
+    decided_static: bool,
+    response: Response,
     error: Option<Box<str>>,
     /// 最后进入的 Pipeline：请求在哪里结束（缓存在规则之前就回了的，也有它）
     /// The pipeline entered last: where the request ended (a cache answer given before any rule ran has
     /// one too)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pipeline: Option<Box<str>>,
     /// 最后一次决定的规则；那个 Pipeline 只负责转发时，它可能在更早的 Pipeline 里
     /// The rule of the last decision; when the final pipeline only forwards, it may sit in an earlier one
-    #[serde(skip_serializing_if = "Option::is_none")]
     rule: Option<Box<str>>,
-    /// 答案来自哪个上游：转发的是回答的那个，缓存的是当初回答的那个；规则直接回应、合并和失败的没有
-    /// Which upstream the answer came from: for a forward the one that answered, for a cache hit the one
-    /// that answered originally; none for a rule's own answer, a joined query or a failure
-    #[serde(skip_serializing_if = "Option::is_none")]
-    upstream: Option<Box<str>>,
+    /// 缓存的答案当初是哪个上游回答的 / Which upstream originally answered a cached answer
+    cache_source: Option<Box<str>>,
+    /// 最后一个回了可用答案的上游 / The last upstream that returned a usable answer
+    answered_by: Option<Box<str>>,
     steps: Vec<Step>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     steps_truncated: bool,
+}
+
+/// 请求怎么结束的 / How the request ended
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Completed,
+    /// 引擎出错，客户端收到 SERVFAIL / The engine erred and the client got SERVFAIL
+    Failed,
+    Cancelled,
+}
+
+impl Status {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// 存到交接区里的应答。比这长的当场读出，交接区里不存大块原文
+/// A response held in the ring. Anything longer is read on the spot, so the ring holds no large blobs
+const MAX_KEPT_RESPONSE: usize = 2_048;
+
+/// 客户端收到的应答 / The response the client got
+enum Response {
+    /// 没有应答（失败或取消） / No response (failed or cancelled)
+    None,
+    /// 应答原文，面板来取时再读 / The response bytes, read when the panel collects the record
+    Kept(Box<[u8]>),
+    /// 太长的应答，当场读出的响应码和回答 / An over-long response, its code and answers read on the spot
+    Read(Option<ResponseCode>, Vec<String>),
+}
+
+impl Response {
+    fn keep(bytes: Option<&[u8]>) -> Self {
+        match bytes {
+            None => Self::None,
+            Some(bytes) if bytes.len() <= MAX_KEPT_RESPONSE => Self::Kept(bytes.into()),
+            Some(bytes) => {
+                let (rcode, answers) = read_response(bytes);
+                Self::Read(rcode, answers)
+            }
+        }
+    }
+
+    fn read(&self) -> (Option<ResponseCode>, Vec<String>) {
+        match self {
+            Self::None => (None, Vec::new()),
+            Self::Kept(bytes) => read_response(bytes),
+            Self::Read(rcode, answers) => (*rcode, answers.clone()),
+        }
+    }
+}
+
+impl Entry {
+    /// 答案从哪来：`forwarded`、`cached`、`stale`、`joined`、`static`（规则直接回应，包括回答后检查拦截或改写）、
+    /// `failed`（引擎出错，或客户端收到的不是缓存里的 SERVFAIL）或 `cancelled`。缓存里拿到的 SERVFAIL 还算缓存
+    /// （照实说答案从哪来）；别的 SERVFAIL 都是没解析出来
+    /// Where the answer came from: `forwarded`, `cached`, `stale`, `joined`, `static` (a rule answered,
+    /// an answer check's block or rewrite included), `failed` (the engine erred, or the client got a
+    /// SERVFAIL that did not come from the cache) or `cancelled`. A SERVFAIL taken from the cache still
+    /// counts as cached (it says where the answer came from); any other SERVFAIL means the name was not
+    /// resolved
+    fn outcome(&self, rcode: Option<ResponseCode>) -> &'static str {
+        match self.status {
+            Status::Completed if self.cache == Some(CacheHitKind::Fresh) => "cached",
+            Status::Completed if self.cache.is_some() => "stale",
+            Status::Completed if rcode == Some(ResponseCode::ServFail) => "failed",
+            Status::Completed if self.joined => "joined",
+            Status::Completed if self.decided_static => "static",
+            Status::Completed => "forwarded",
+            Status::Failed => "failed",
+            Status::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl Serialize for Entry {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (rcode, answers) = self.response.read();
+        let outcome = self.outcome(rcode);
+        // 答案来自哪个上游：转发的是回答的那个，缓存的是当初回答的那个；规则直接回应、合并和失败的没有
+        // Which upstream the answer came from: for a forward the one that answered, for a cache hit the one
+        // that answered originally; none for a rule's own answer, a joined query or a failure
+        let upstream = match outcome {
+            "cached" | "stale" => self.cache_source.as_deref(),
+            "forwarded" => self.answered_by.as_deref(),
+            _ => None,
+        };
+        let mut entry = serializer.serialize_struct("Entry", 17)?;
+        entry.serialize_field("seq", &self.seq)?;
+        entry.serialize_field("time_unix_ms", &self.time_unix_ms)?;
+        entry.serialize_field("client", &self.client)?;
+        if let Some(transport) = self.transport {
+            entry.serialize_field("transport", transport)?;
+        }
+        entry.serialize_field("qname", &self.qname)?;
+        entry.serialize_field("qtype", &self.qtype.to_string())?;
+        entry.serialize_field("latency_us", &self.latency_us)?;
+        entry.serialize_field("status", self.status.label())?;
+        entry.serialize_field("outcome", outcome)?;
+        if let Some(rcode) = rcode {
+            entry.serialize_field("rcode", &rcode_name(rcode))?;
+        }
+        entry.serialize_field("answers", &answers)?;
+        if let Some(error) = &self.error {
+            entry.serialize_field("error", error)?;
+        }
+        if let Some(pipeline) = &self.pipeline {
+            entry.serialize_field("pipeline", pipeline)?;
+        }
+        if let Some(rule) = &self.rule {
+            entry.serialize_field("rule", rule)?;
+        }
+        if let Some(upstream) = upstream {
+            entry.serialize_field("upstream", upstream)?;
+        }
+        entry.serialize_field("steps", &self.steps)?;
+        if self.steps_truncated {
+            entry.serialize_field("steps_truncated", &true)?;
+        }
+        entry.end()
+    }
 }
 
 /// 一次取走的结果 / One collection
@@ -501,7 +623,7 @@ impl QueryLog {
                 via: transport_label(event.via),
                 result,
                 latency_us: u64::try_from(event.latency.as_micros()).unwrap_or(u64::MAX),
-                rcode: event.rcode.map(rcode_name),
+                rcode: event.rcode,
                 error: event.error.map(|error| clip(&format!("{error:#}")).into()),
             });
         });
@@ -580,52 +702,32 @@ impl QueryLog {
 
 /// 请求结束：把攒下的步骤和响应拼成一条记录 / The request ended: its steps and response become a record
 fn finish(mut pending: Pending, outcome: &RequestOutcome<'_>) -> Entry {
-    let (rcode, answers) = outcome.response.map_or((None, Vec::new()), read_response);
-    let stale = pending
-        .cache
-        .is_some_and(|kind| kind != CacheHitKind::Fresh);
-    let decided_static = matches!(pending.decision, Some((_, DecisionKind::Static)));
-    // 缓存里拿到的 SERVFAIL 还算缓存（照实说答案从哪来）；别的 SERVFAIL 都是没解析出来
-    // A SERVFAIL taken from the cache still counts as cached (it says where the answer came from); any
-    // other SERVFAIL means the name was not resolved
-    let label = match outcome.status {
-        RequestStatus::Completed if pending.cache == Some(CacheHitKind::Fresh) => "cached",
-        RequestStatus::Completed if stale => "stale",
-        RequestStatus::Completed if rcode == Some(ResponseCode::ServFail) => "failed",
-        RequestStatus::Completed if pending.joined => "joined",
-        RequestStatus::Completed if decided_static => "static",
-        RequestStatus::Completed => "forwarded",
-        RequestStatus::Failed => "failed",
-        _ => "cancelled",
-    };
     let status = match outcome.status {
-        RequestStatus::Completed => "completed",
-        RequestStatus::Failed => "failed",
-        _ => "cancelled",
+        RequestStatus::Completed => Status::Completed,
+        RequestStatus::Failed => Status::Failed,
+        _ => Status::Cancelled,
     };
-    let upstream = match label {
-        "cached" | "stale" => pending.cache_source,
-        "forwarded" => pending.answered_by,
-        _ => None,
-    };
+    let decided_static = matches!(pending.decision, Some((_, DecisionKind::Static)));
     let rule = pending.decision.and_then(|(rule, _)| rule);
     pending.steps.shrink_to_fit();
     Entry {
         seq: 0,
         time_unix_ms: pending.time_unix_ms,
-        client: pending.client.to_string(),
+        client: pending.client,
         transport: pending.transport.map(client_transport_label),
         qname: pending.qname,
-        qtype: pending.qtype.to_string(),
+        qtype: pending.qtype,
         latency_us: u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX),
         status,
-        outcome: label,
-        rcode: rcode.map(rcode_name),
-        answers,
+        cache: pending.cache,
+        joined: pending.joined,
+        decided_static,
+        response: Response::keep(outcome.response),
         error: outcome.error.map(|error| clip(error).into()),
         pipeline: pending.pipeline,
         rule,
-        upstream,
+        cache_source: pending.cache_source,
+        answered_by: pending.answered_by,
         steps: pending.steps,
         steps_truncated: pending.steps_truncated,
     }
@@ -651,6 +753,17 @@ fn read_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
                 .map(|flags| ResponseCode::from(0, flags & 0x0F)),
             Vec::new(),
         ),
+    }
+}
+
+/// 上游那一步的响应码，取走时写成助记名 / An upstream step's response code, named when collected
+fn serialize_rcode<S: Serializer>(
+    code: &Option<ResponseCode>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match code {
+        Some(code) => serializer.serialize_str(&rcode_name(*code)),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -745,7 +858,10 @@ mod tests {
     use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
     use serde_json::Value;
 
-    use super::{CAPACITY, MAX_PAGE, MAX_STEPS, MAX_TEXT, QueryLog, clip};
+    use super::{
+        CAPACITY, MAX_ANSWERS, MAX_KEPT_RESPONSE, MAX_PAGE, MAX_STEPS, MAX_TEXT, QueryLog,
+        Response, clip,
+    };
     use crate::config::Transport;
     use crate::observe::{
         CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
@@ -882,6 +998,41 @@ mod tests {
             .as_array()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// 应答原文存着、面板来取时才读；超过上限的当场读出，交接区里不存大块原文。两种取出来都一样
+    /// Responses are kept as bytes and read when the panel collects them; over-long ones are read on the
+    /// spot so the ring holds no large blobs. Both read out the same
+    #[test]
+    fn responses_are_read_when_collected_and_long_ones_on_the_spot() {
+        let log = QueryLog::default();
+        let _ = page(&log, 0, 1);
+        let short = response(ResponseCode::NoError, &[[192, 0, 2, 1], [192, 0, 2, 2]]);
+        let many: Vec<[u8; 4]> = (0..200u8).map(|i| [198, 51, 100, i]).collect();
+        let long = response(ResponseCode::NoError, &many);
+        assert!(short.len() <= MAX_KEPT_RESPONSE && long.len() > MAX_KEPT_RESPONSE);
+        for (id, bytes) in [(1, &short), (2, &long)] {
+            let request = ctx(id);
+            log.request_started(&request, false);
+            finish(&log, &request, RequestStatus::Completed, Some(bytes));
+        }
+        {
+            let ring = log.ring.lock();
+            assert!(matches!(ring.entries[0].response, Response::Kept(_)));
+            assert!(matches!(ring.entries[1].response, Response::Read(..)));
+        }
+        let got = entries(&log);
+        assert_eq!(
+            got[0]["answers"],
+            serde_json::json!(["192.0.2.1", "192.0.2.2"])
+        );
+        let long_answers = got[1]["answers"].as_array().expect("answers");
+        assert_eq!(long_answers.len(), MAX_ANSWERS);
+        assert_eq!(long_answers[0], "198.51.100.0");
+        for entry in &got {
+            assert_eq!(entry["rcode"], "NOERROR");
+            assert_eq!(entry["outcome"], "forwarded");
+        }
     }
 
     fn kinds(entry: &Value) -> Vec<String> {
