@@ -380,7 +380,13 @@ impl Engine {
                 &decision,
             );
         }
-        if whole_pipeline {
+        // 规则直接回应的决定都存，快速路径靠它回重复的查询；转发和跳转只在有正则条件的 pipeline 里存，
+        // 别的 pipeline 重算一遍比存一条缓存便宜（见 `RuntimePipeline::matches_regex`）
+        // A rule's own answer is always kept, the fast path answers repeated queries from it; forward and
+        // jump decisions are kept only in a pipeline with regex conditions, since elsewhere computing them
+        // again is cheaper than storing an entry (see `RuntimePipeline::matches_regex`)
+        let worth_keeping = pipeline.matches_regex || matches!(decision, Decision::Static { .. });
+        if whole_pipeline && worth_keeping {
             self.insert_rule_cache(
                 rule_hash,
                 pipeline.id.clone(),
@@ -746,8 +752,10 @@ mod continued_rule_cache_tests {
     use crate::engine::rules::Decision;
     use crate::matcher::RuntimePipelineConfig;
 
-    /// `first` forwards and continues on a miss; `next` forwards elsewhere.
-    /// `first` 转发，未命中时 continue；`next` 转发到别处。
+    /// `first` forwards and continues on a miss; `next` forwards elsewhere. `first` matches by
+    /// regex: only a pipeline with regex conditions keeps forward decisions in the rule cache.
+    /// `first` 转发，未命中时 continue；`next` 转发到别处。`first` 用正则条件：只有带正则条件的
+    /// pipeline 才把转发决定存进规则缓存。
     fn runtime() -> RuntimePipelineConfig {
         let raw = serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
@@ -756,7 +764,7 @@ mod continued_rule_cache_tests {
                 "rules": [
                     {
                         "name": "first",
-                        "matchers": [{ "type": "any" }],
+                        "matchers": [{ "type": "domain_regex", "value": "example" }],
                         "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
                         "response_actions_on_miss": [{ "type": "continue" }]
                     },
@@ -822,6 +830,119 @@ mod continued_rule_cache_tests {
             .map(|(_, record)| rule_of(&record.entry.decision).to_owned())
             .collect();
         assert_eq!(cached, ["first"]);
+    }
+}
+
+/// 规则缓存存什么：规则直接回应的决定（快速路径靠它回重复的拦截查询）都存；转发决定只在带正则条件的
+/// pipeline 里存，别处重算一遍比为每个新名字存一条缓存便宜。
+/// What the rule cache keeps: a rule's own answer always (the fast path answers repeated blocked
+/// queries from it); a forward decision only in a pipeline with regex conditions, since elsewhere
+/// computing it again is cheaper than storing an entry for every new name.
+#[cfg(test)]
+mod rule_cache_policy_tests {
+    use hickory_proto::rr::{DNSClass, RecordType};
+
+    use super::RuleEvaluationContext;
+    use crate::config::PipelineConfig;
+    use crate::engine::Engine;
+    use crate::engine::rules::Decision;
+    use crate::matcher::RuntimePipelineConfig;
+
+    fn runtime() -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [
+                {
+                    "id": "plain",
+                    "rules": [
+                        {
+                            "name": "block",
+                            "matchers": [{ "type": "domain_suffix", "value": "ads.example" }],
+                            "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                        },
+                        {
+                            "name": "rest",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+                        }
+                    ]
+                },
+                {
+                    "id": "regex",
+                    "rules": [
+                        {
+                            "name": "www",
+                            "matchers": [{ "type": "domain_regex", "value": "^www\\." }],
+                            "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+                        },
+                        {
+                            "name": "rest",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+                        }
+                    ]
+                }
+            ]
+        });
+        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(cfg).expect("runtime config")
+    }
+
+    #[tokio::test]
+    async fn own_answers_are_kept_and_forwards_only_where_regexes_run() {
+        let engine = Engine::new(runtime(), "test".to_string()).expect("engine");
+        let state = engine.state.load_full();
+        let [plain, regex] = [0, 1].map(|index| &state.pipeline.pipelines[index]);
+        assert!(!plain.matches_regex);
+        assert!(regex.matches_regex);
+        let ask = |pipeline, name| {
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            engine.apply_rules(&state, pipeline, &request)
+        };
+        assert!(matches!(ask(plain, "ads.example"), Decision::Static { .. }));
+        assert!(matches!(
+            ask(plain, "example.com"),
+            Decision::Forward { .. }
+        ));
+        assert!(matches!(
+            ask(regex, "www.example.com"),
+            Decision::Forward { .. }
+        ));
+        assert!(matches!(
+            ask(regex, "example.com"),
+            Decision::Forward { .. }
+        ));
+
+        engine.rule_cache.run_pending_tasks();
+        let mut kept: Vec<(String, &str)> = engine
+            .rule_cache
+            .iter()
+            .map(|(_, record)| {
+                let kind = match record.entry.decision.as_ref() {
+                    Decision::Static { .. } => "static",
+                    Decision::Forward { .. } => "forward",
+                    _ => "other",
+                };
+                (record.entry.pipeline_id.to_string(), kind)
+            })
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                ("plain".to_owned(), "static"),
+                ("regex".to_owned(), "forward"),
+                ("regex".to_owned(), "forward"),
+            ]
+        );
     }
 }
 

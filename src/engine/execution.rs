@@ -6818,16 +6818,17 @@ mod requester_scope_tests {
     }
 
     /// 转发带取自客户端的 ECS、pipeline 没有自己的 ecs 时，应答按 ECS 子网分开：同一子网
-    /// 的客户端共用，私有地址不发送 ECS，也共用。
+    /// 的客户端共用，私有地址不发送 ECS，也共用。规则用正则条件，转发决定才进规则缓存。
     /// A forward that sends ECS from the client, in a pipeline without an ecs of
     /// its own, keeps answers apart by subnet: clients in one subnet share, and so
-    /// do private addresses, which send no ECS.
+    /// do private addresses, which send no ECS. The rule matches by regex, so its
+    /// forward decision goes into the rule cache.
     #[tokio::test]
     async fn answers_by_ecs_subnet_stay_apart_and_are_shared_within_a_subnet() {
         let (echo, queries) = subnet_echo().await;
         let engine = engine(
             serde_json::json!([]),
-            serde_json::json!([{ "id": "main", "rules": [rule("rest", any(), serde_json::json!([{
+            serde_json::json!([{ "id": "main", "rules": [rule("rest", serde_json::json!([{ "type": "domain_regex", "value": "example" }]), serde_json::json!([{
                 "type": "forward", "upstream": echo,
                 "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }
             }]))] }]),

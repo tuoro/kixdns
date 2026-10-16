@@ -282,6 +282,15 @@ pub struct RuntimePipeline {
     /// the query without EDNS, so a route through such a pipeline may not repeat when
     /// the answer is refreshed.
     pub matches_edns: bool,
+    /// 请求阶段有没有正则条件。规则缓存只给这样的 pipeline 存转发和跳转的决定：正则要一条条试，同一个名字
+    /// 再来时值得省下；别的条件靠索引或几次比较就能算完，为每个新名字存一条缓存反而比重算还贵。规则直接
+    /// 回应的决定不论哪个 pipeline 都存：快速路径靠它直接回重复的拦截查询。
+    /// Whether any request rule has a regex condition. The rule cache keeps forward and jump decisions
+    /// only for such pipelines: regexes are tried one by one, which is worth saving when the same name
+    /// comes back, while other conditions finish with an index lookup or a few comparisons, and storing
+    /// an entry for every new name costs more than computing them again. A rule's own answer is kept
+    /// whatever the pipeline: the fast path answers repeated blocked queries from it.
+    pub matches_regex: bool,
     // Indices for O(1) lookup
     // 完全域名匹配索引（最高优先级）/ Exact domain match index (highest priority)
     pub domain_exact_index: FxHashMap<Arc<str>, Vec<usize>>,
@@ -1108,6 +1117,8 @@ impl RuntimePipelineConfig {
             });
             let matches_edns =
                 request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::EdnsPresent { .. }));
+            let matches_regex =
+                request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::DomainRegex { .. }));
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
@@ -1119,6 +1130,7 @@ impl RuntimePipelineConfig {
                 uses_ecs: pipeline_uses_ecs,
                 depends_on_requester,
                 matches_edns,
+                matches_regex,
                 domain_exact_index, // 添加完全匹配索引 / Add exact match index
                 domain_suffix_index,
                 query_type_index, // 添加 query_type 索引 / Add query_type index
