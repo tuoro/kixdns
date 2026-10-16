@@ -9,6 +9,99 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+/// 内核进程用 mimalloc 分配内存，不用 glibc 的 malloc。在不断有新名字进出缓存的负载下，glibc 的堆会
+/// 碎成许多散块：真正在用的内存只有十几到一百多 MiB，进程占的却能到它的十倍（实测 20 万条应答缓存时
+/// 在用约 135 MiB、进程 1.3 GiB），定期 `malloc_trim` 又要锁住分配器几十毫秒。mimalloc 按页归还空闲内存，
+/// 同样的负载下进程内存跟着在用的走，查询也更快。只影响这个可执行文件，作为库使用时由调用方自己选分配器。
+/// The kernel process allocates with mimalloc rather than glibc's malloc. Under a load that keeps
+/// moving new names through the caches, glibc's heap breaks into scattered pieces: the memory in use
+/// stays between ten and a hundred-odd MiB while the process holds up to ten times that (measured
+/// with 200,000 cached answers: about 135 MiB in use, 1.3 GiB held), and a periodic `malloc_trim`
+/// locks the allocator for tens of milliseconds. mimalloc returns free memory page by page, so under
+/// the same load the process follows the memory in use, and queries are faster too. This applies to
+/// this executable only; as a library the caller picks its own allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// mimalloc 的两个设置，在任何分配之前设好。家用时内核大部分时间闲着：默认设置下，mimalloc 把释放的内存
+/// 留着备用，加载 GeoSite 用过的临时内存闲下来也不归还（实测空闲时多占约 70 MiB）。改成释放即还、不预先
+/// 提交整块内存以后，空闲和高负载时的内存都不比原来用 glibc 时高，查询仍快得多。「不预先提交」只对设好之后
+/// 才建的内存区生效，所以要赶在第一次分配之前：Linux 和 FreeBSD 上放进 `.init_array`，程序装载时、Rust
+/// 运行时分配内存之前就执行；别的平台在 main 一开始设。
+/// Two mimalloc settings, applied before any allocation. At home the kernel sits idle most of the
+/// time: by default mimalloc keeps freed memory for reuse, and the temporary memory used to load GeoSite
+/// is not returned once things go quiet (measured at about 70 MiB extra while idle). Purging freed
+/// memory at once and not committing whole arenas up front keeps memory no higher than it was with
+/// glibc, idle and under load, and queries stay much faster. Not committing up front applies only to
+/// arenas created after it is set, so it has to beat the first allocation: on Linux and FreeBSD it sits
+/// in `.init_array` and runs when the program is loaded, before the Rust runtime allocates anything;
+/// elsewhere it is set at the start of main.
+mod allocator_tuning {
+    use std::ffi::{c_int, c_long};
+
+    unsafe extern "C" {
+        #[cfg(test)]
+        fn mi_option_get(option: c_int) -> c_long;
+        fn mi_option_set(option: c_int, value: c_long);
+    }
+
+    // mimalloc v3 `mi_option_e` 里的编号（libmimalloc-sys 自带的常量还是旧版本的）；依赖升级、编号变了时，
+    // 下面的测试会报错 / Positions in mimalloc v3's `mi_option_e` (libmimalloc-sys still ships the old
+    // constants); the test below fails should a dependency update move them
+    /// `mi_option_purge_delay`：释放后多久归还系统，毫秒 / How long after a free memory is purged, in ms
+    const PURGE_DELAY: c_int = 15;
+    /// `mi_option_arena_eager_commit`：是否预先提交整块内存 / Whether whole arenas are committed up front
+    const ARENA_EAGER_COMMIT: c_int = 4;
+
+    // 测试程序里不装：下面的测试要读到选项的默认值 / Not installed in the test binary: the test below reads
+    // the options' defaults
+    #[cfg(all(not(test), any(target_os = "linux", target_os = "freebsd")))]
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static APPLY_ON_LOAD: extern "C" fn() = apply_on_load;
+
+    #[cfg(all(not(test), any(target_os = "linux", target_os = "freebsd")))]
+    extern "C" fn apply_on_load() {
+        apply();
+    }
+
+    pub(crate) fn apply() {
+        // SAFETY: 在程序装载时或 main 一开始调用，还没有别的线程；这两个选项随时可以改
+        // SAFETY: called while the program loads or at the very start of main, before any other thread
+        // exists; both options may change at any time
+        unsafe {
+            mi_option_set(PURGE_DELAY, 0);
+            mi_option_set(ARENA_EAGER_COMMIT, 0);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ARENA_EAGER_COMMIT, PURGE_DELAY, apply, mi_option_get};
+
+        /// 两个编号还对应这两个选项（默认值分别是 1000 毫秒和 2），`apply` 把它们都设成 0
+        /// The two positions still name these options (their defaults are 1000 ms and 2), and `apply` sets
+        /// both to 0
+        #[test]
+        fn mimalloc_options_are_found_and_set() {
+            // SAFETY: 只读选项 / Only reads the options
+            let read = || unsafe {
+                (
+                    mi_option_get(PURGE_DELAY),
+                    mi_option_get(ARENA_EAGER_COMMIT),
+                )
+            };
+            assert_eq!(
+                read(),
+                (1_000, 2),
+                "the defaults of purge_delay and arena_eager_commit"
+            );
+            apply();
+            assert_eq!(read(), (0, 0));
+        }
+    }
+}
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -65,6 +158,8 @@ enum Commands {
 }
 
 fn main() {
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    allocator_tuning::apply();
     // 先装 panic 钩子再做任何事：journald 只按每行开头的 `<N>` 定优先级，而默认 panic 输出和
     // `Termination` 打印的 `Error: …` 都没有前缀，会被记成 info（6），面板只看 ≤3 的错误过滤器
     // 恰好把“为什么没启动”这一行藏掉。
