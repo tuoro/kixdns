@@ -59,6 +59,20 @@ where
         .await
 }
 
+/// 记一步诊断轨迹，只在诊断查询正在记录时才拼说明文字。每个普通查询都要经过观察者的这些回调，
+/// 先拼好、因为不是诊断又丢掉的字符串，原来占了回调开销里不小的一块。
+/// Records one diagnostics trace step, building its text only while a diagnostic query is
+/// recording. Every ordinary query passes through these observer callbacks, and strings built
+/// only to be dropped because no diagnosis was running were a sizeable share of their cost.
+macro_rules! trace_step {
+    ($stage:expr, $status:expr, $label:expr, $detail:expr $(,)?) => {
+        if $crate::panel_trace::active() {
+            $crate::panel_trace::record($stage, $status, $label, $detail);
+        }
+    };
+}
+pub(crate) use trace_step;
+
 pub fn record(
     stage: &'static str,
     status: &'static str,
@@ -83,6 +97,10 @@ pub fn record(
 }
 
 pub fn record_decision(event: &DecisionMade<'_>) {
+    // 不在诊断时什么也不记：下面的说明文字不必拼 / Outside a diagnosis nothing is recorded, so the text below need not be built
+    if !active() {
+        return;
+    }
     match event.detail {
         DecisionDetail::Static { rcode, answers } => record(
             "decision",
@@ -166,6 +184,28 @@ fn truncate(mut value: String, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{MAX_STEPS, capture, record};
+    use std::cell::Cell;
+
+    /// 不在诊断时，说明文字连拼都不拼；在诊断里照常拼、照常记
+    /// Outside a diagnosis the text is not even built; inside one it is built and recorded as before
+    #[tokio::test]
+    async fn trace_text_is_built_only_while_a_diagnosis_records() {
+        let built = Cell::new(0);
+        let label = || {
+            built.set(built.get() + 1);
+            "step".to_owned()
+        };
+        trace_step!("stage", "status", label(), None);
+        assert_eq!(built.get(), 0, "no diagnosis: nothing built");
+        let ((), steps, _) = capture(async {
+            trace_step!("stage", "status", label(), Some(label()));
+        })
+        .await;
+        assert_eq!(built.get(), 2, "label and detail built once each");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].label, "step");
+        assert_eq!(steps[0].detail.as_deref(), Some("step"));
+    }
 
     #[tokio::test]
     async fn captures_bounded_steps_only_inside_scope() {
