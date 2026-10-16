@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::IpAddr;
 #[cfg(unix)]
 use std::net::Ipv4Addr;
@@ -47,6 +49,7 @@ const PROTOCOL_VERSION: u8 = 1;
 const MAX_ERROR_LENGTH: usize = 2_048;
 const MAX_METRIC_SERIES_PER_MAP: usize = 1_024;
 const MAX_METRIC_KEY_BYTES: usize = 512;
+
 #[cfg(unix)]
 const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
 #[cfg(unix)]
@@ -56,6 +59,43 @@ const QUERY_STATS_BUCKETS: usize = 24;
 const QUERY_STATS_SHARDS: usize = 16;
 const QUERY_STATS_DOMAIN_CAP: usize = 4_096;
 const QUERY_STATS_CLIENT_CAP: usize = 1_024;
+
+thread_local! {
+    /// 拼统计键的缓冲，每个线程一份、反复使用：已有的统计项按它直接查到，计数时不再为键分配内存
+    /// The buffer metric keys are built in, one per thread and reused: an existing series is found
+    /// by it directly, so counting allocates nothing for the key
+    static METRIC_KEY: RefCell<String> = RefCell::new(String::with_capacity(MAX_METRIC_KEY_BYTES));
+}
+
+/// 在线程的缓冲里拼一个统计键，交给 `use_key`。缓冲正被占用时（不会发生，`use_key` 里不再拼键）
+/// 退回一个临时字符串，不会因此出错
+/// Builds a metric key in the thread's buffer and hands it to `use_key`. Should the buffer be in
+/// use (it never is: `use_key` builds no key of its own) a temporary string is used instead, so
+/// this cannot fail
+fn with_metric_key<R>(build: impl FnOnce(&mut String), use_key: impl FnOnce(&str) -> R) -> R {
+    METRIC_KEY.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffer) => {
+            buffer.clear();
+            build(&mut buffer);
+            use_key(&buffer)
+        }
+        Err(_) => {
+            let mut buffer = String::new();
+            build(&mut buffer);
+            use_key(&buffer)
+        }
+    })
+}
+
+/// 统计键的各段用 `\0` 隔开 / The parts of a metric key are separated by `\0`
+fn push_key_parts(buffer: &mut String, parts: &[&str]) {
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            buffer.push('\0');
+        }
+        buffer.push_str(part);
+    }
+}
 
 #[derive(Clone, Default)]
 struct ActiveConfig {
@@ -518,10 +558,10 @@ impl PanelMetrics {
     fn record_upstream_latency(
         &self,
         map: &DashMap<Arc<str>, LatencySum>,
-        key: Arc<str>,
+        key: &str,
         latency: std::time::Duration,
     ) {
-        if let Some(entry) = map.get(&key) {
+        if let Some(entry) = map.get(key) {
             entry.add(latency);
             return;
         }
@@ -530,12 +570,12 @@ impl PanelMetrics {
             return;
         }
         let _guard = self.metric_series_insert_lock.lock();
-        if let Some(entry) = map.get(&key) {
+        if let Some(entry) = map.get(key) {
             entry.add(latency);
         } else if map.len() < MAX_METRIC_SERIES_PER_MAP {
             let sum = LatencySum::default();
             sum.add(latency);
-            map.insert(key, sum);
+            map.insert(Arc::from(key), sum);
         } else {
             self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -543,30 +583,30 @@ impl PanelMetrics {
 
     #[inline]
     fn record_pipeline_hit(&self, pipeline: &str) {
-        self.increment(&self.pipeline_hits, Arc::from(pipeline));
+        self.increment(&self.pipeline_hits, pipeline);
     }
 
     #[inline]
     fn record_rule_match(&self, pipeline: &str, rule: &str, phase: &str) {
-        self.increment(
-            &self.rule_matches,
-            Arc::from(format!("{pipeline}\0{rule}\0{phase}")),
+        with_metric_key(
+            |key| push_key_parts(key, &[pipeline, rule, phase]),
+            |key| self.increment(&self.rule_matches, key),
         );
     }
 
     #[inline]
     fn record_upstream_attempt(&self, upstream: &str, transport: &str) {
-        self.increment(
-            &self.upstream_attempts,
-            Arc::from(format!("{upstream}\0{transport}")),
+        with_metric_key(
+            |key| push_key_parts(key, &[upstream, transport]),
+            |key| self.increment(&self.upstream_attempts, key),
         );
     }
 
     #[inline]
     fn record_upstream_result(&self, upstream: &str, transport: &str, result: &str) {
-        self.increment(
-            &self.upstream_results,
-            Arc::from(format!("{upstream}\0{transport}\0{result}")),
+        with_metric_key(
+            |key| push_key_parts(key, &[upstream, transport, result]),
+            |key| self.increment(&self.upstream_results, key),
         );
     }
 
@@ -590,9 +630,11 @@ impl PanelMetrics {
         self.reload_sequence.fetch_add(1, Ordering::Release);
     }
 
+    /// 按借来的键计数，只有第一次出现的统计项才分配它的键
+    /// Counts by a borrowed key; only a series seen for the first time allocates its key
     #[inline]
-    fn increment(&self, map: &DashMap<Arc<str>, AtomicU64>, key: Arc<str>) {
-        if let Some(counter) = map.get(&key) {
+    fn increment(&self, map: &DashMap<Arc<str>, AtomicU64>, key: &str) {
+        if let Some(counter) = map.get(key) {
             counter.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -602,10 +644,10 @@ impl PanelMetrics {
         }
 
         let _guard = self.metric_series_insert_lock.lock();
-        if let Some(counter) = map.get(&key) {
+        if let Some(counter) = map.get(key) {
             counter.fetch_add(1, Ordering::Relaxed);
         } else if map.len() < MAX_METRIC_SERIES_PER_MAP {
-            map.insert(key, AtomicU64::new(1));
+            map.insert(Arc::from(key), AtomicU64::new(1));
         } else {
             self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -918,7 +960,7 @@ impl EngineObserver for PanelMetrics {
             }
         }
         self.query_log.request_started(ctx, panel_trace::active());
-        panel_trace::record(
+        panel_trace::trace_step!(
             "request",
             "parsed",
             format!("{} {}", ctx.qtype, ctx.qname),
@@ -960,7 +1002,7 @@ impl EngineObserver for PanelMetrics {
         if let Some(previous) = panel_trace::current_pipeline()
             && previous != pipeline
         {
-            panel_trace::record(
+            panel_trace::trace_step!(
                 "pipeline",
                 "jump",
                 format!("{previous} -> {pipeline}"),
@@ -968,7 +1010,7 @@ impl EngineObserver for PanelMetrics {
             );
         }
         panel_trace::set_pipeline(pipeline);
-        panel_trace::record("pipeline", "selected", pipeline, None);
+        panel_trace::trace_step!("pipeline", "selected", pipeline, None);
     }
 
     fn rule_matched(&self, ctx: &RequestContext<'_>, event: &RuleMatched<'_>) {
@@ -997,7 +1039,7 @@ impl EngineObserver for PanelMetrics {
         self.query_log.rule_evaluated(ctx, event);
         let status = if event.matched { "matched" } else { "missed" };
         match event.phase {
-            RulePhase::Request => panel_trace::record(
+            RulePhase::Request => panel_trace::trace_step!(
                 "rule",
                 status,
                 event.rule,
@@ -1006,7 +1048,7 @@ impl EngineObserver for PanelMetrics {
                     event.pipeline, event.matchers
                 )),
             ),
-            _ => panel_trace::record(
+            _ => panel_trace::trace_step!(
                 "response_rule",
                 status,
                 format!(
@@ -1023,14 +1065,14 @@ impl EngineObserver for PanelMetrics {
             trace.rule_cache_lookup(ctx, event);
         }
         if event.hit {
-            panel_trace::record(
+            panel_trace::trace_step!(
                 "rule_cache",
                 "hit",
                 format!("命中管线 {} 的规则缓存", event.pipeline),
                 Some(format!("已匹配规则：{}", event.matched_rules)),
             );
         } else {
-            panel_trace::record(
+            panel_trace::trace_step!(
                 "rule_cache",
                 "miss",
                 format!("管线 {} 的规则缓存未命中", event.pipeline),
@@ -1072,7 +1114,7 @@ impl EngineObserver for PanelMetrics {
         }
         self.query_log.cache_miss(ctx);
         let pipeline = panel_trace::current_pipeline();
-        panel_trace::record(
+        panel_trace::trace_step!(
             "response_cache",
             "miss",
             "响应缓存未命中",
@@ -1088,25 +1130,27 @@ impl EngineObserver for PanelMetrics {
         self.query_log.cache_hit(ctx, event);
         let ttl = |value: Option<std::time::Duration>| value.map(|value| value.as_secs());
         match event.kind {
-            CacheHitKind::Fresh => panel_trace::record(
+            CacheHitKind::Fresh => panel_trace::trace_step!(
                 "response_cache",
                 "fresh",
                 "命中新鲜响应缓存",
                 ttl(event.remaining_ttl).map(|seconds| format!("剩余 TTL：{seconds} 秒")),
             ),
-            CacheHitKind::Stale => panel_trace::record(
+            CacheHitKind::Stale => panel_trace::trace_step!(
                 "response_cache",
                 "stale",
                 "命中过期响应缓存",
                 ttl(event.original_ttl).map(|seconds| format!("原始 TTL：{seconds} 秒")),
             ),
-            CacheHitKind::StaleClientTimeout => panel_trace::record(
+            CacheHitKind::StaleClientTimeout => panel_trace::trace_step!(
                 "response_cache",
                 "stale",
                 "客户端等待超时，返回过期缓存",
                 None,
             ),
-            _ => panel_trace::record("response_cache", "stale", "上游失败，返回过期缓存", None),
+            _ => {
+                panel_trace::trace_step!("response_cache", "stale", "上游失败，返回过期缓存", None)
+            }
         }
     }
 
@@ -1118,7 +1162,7 @@ impl EngineObserver for PanelMetrics {
         // 这次请求没有自己去问上游，等的是正在进行的同一个查询：诊断里不然就少了上游这一步
         // This request did not ask upstream itself but waited on the same query already in
         // flight: without this the diagnostics trace would show no upstream step at all
-        panel_trace::record("upstream", "joined", "等候正在进行的同一个查询", None);
+        panel_trace::trace_step!("upstream", "joined", "等候正在进行的同一个查询", None);
     }
 
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {
@@ -1128,7 +1172,7 @@ impl EngineObserver for PanelMetrics {
         let transport = transport_label(event.transport);
         self.record_upstream_attempt(event.upstream, transport);
         let (rule, decided_transport) = panel_trace::current_decision();
-        panel_trace::record(
+        panel_trace::trace_step!(
             "upstream",
             "started",
             format!("准备转发到 {}", event.upstream),
@@ -1154,39 +1198,47 @@ impl EngineObserver for PanelMetrics {
         self.record_upstream_result(event.upstream, transport, result);
         self.query_log.upstream_result(ctx, event);
         if !matches!(event.outcome, UpstreamOutcome::Aborted) {
-            let key: Arc<str> = Arc::from(format!("{}\0{}", event.upstream, transport));
-            // 超时会把整段超时时长计入平均耗时；响应耗时只看真正回了包的尝试。
-            // A timeout adds its whole timeout to the average; the response latency
-            // only looks at attempts that actually got a reply.
-            if matches!(
-                event.outcome,
-                UpstreamOutcome::Success | UpstreamOutcome::Rejected
-            ) {
-                self.record_upstream_latency(
-                    &self.upstream_response_latency,
-                    Arc::clone(&key),
-                    event.latency,
-                );
-            }
-            self.record_upstream_latency(&self.upstream_latency, key, event.latency);
-            self.increment(
-                &self.upstream_via,
-                Arc::from(format!(
-                    "{}\0{}\0{}",
-                    event.upstream,
-                    transport,
-                    transport_label(event.via)
-                )),
+            with_metric_key(
+                |key| push_key_parts(key, &[event.upstream, transport]),
+                |key| {
+                    // 超时会把整段超时时长计入平均耗时；响应耗时只看真正回了包的尝试。
+                    // A timeout adds its whole timeout to the average; the response latency
+                    // only looks at attempts that actually got a reply.
+                    if matches!(
+                        event.outcome,
+                        UpstreamOutcome::Success | UpstreamOutcome::Rejected
+                    ) {
+                        self.record_upstream_latency(
+                            &self.upstream_response_latency,
+                            key,
+                            event.latency,
+                        );
+                    }
+                    self.record_upstream_latency(&self.upstream_latency, key, event.latency);
+                },
+            );
+            with_metric_key(
+                |key| {
+                    push_key_parts(
+                        key,
+                        &[event.upstream, transport, transport_label(event.via)],
+                    )
+                },
+                |key| self.increment(&self.upstream_via, key),
             );
             if let Some(rcode) = event.rcode {
-                self.increment(
-                    &self.upstream_rcodes,
-                    Arc::from(format!("{}\0{:?}", event.upstream, rcode)),
+                with_metric_key(
+                    |key| {
+                        key.push_str(event.upstream);
+                        key.push('\0');
+                        let _ = write!(key, "{rcode:?}");
+                    },
+                    |key| self.increment(&self.upstream_rcodes, key),
                 );
             }
         }
         match event.outcome {
-            UpstreamOutcome::Success => panel_trace::record(
+            UpstreamOutcome::Success => panel_trace::trace_step!(
                 "upstream",
                 "succeeded",
                 event.upstream,
@@ -1199,7 +1251,7 @@ impl EngineObserver for PanelMetrics {
                     event.truncated.unwrap_or(false)
                 )),
             ),
-            _ => panel_trace::record(
+            _ => panel_trace::trace_step!(
                 "upstream",
                 "failed",
                 event.upstream,
@@ -2359,6 +2411,31 @@ mod tests {
                 .unwrap()
                 .load(super::Ordering::Relaxed),
             2
+        );
+    }
+
+    /// 键在线程缓冲里拼：同一个统计项再计一次时累加在原来那条上，存下的键和以前拼出来的一样
+    /// Keys are built in the thread's buffer: counting a series again adds to the same entry, and the
+    /// stored key reads as it always did
+    #[test]
+    fn counting_again_adds_to_the_series_under_the_same_key() {
+        let metrics = PanelMetrics::default();
+        for _ in 0..3 {
+            metrics.record_rule_match("main", "ads", "request");
+            metrics.record_upstream_attempt("udp://192.0.2.1:53", "udp");
+        }
+        metrics.record_rule_match("main", "cn", "request");
+        let count = |map: &super::DashMap<super::Arc<str>, super::AtomicU64>, key: &str| {
+            map.get(key)
+                .map(|counter| counter.load(super::Ordering::Relaxed))
+        };
+        assert_eq!(metrics.rule_matches.len(), 2);
+        assert_eq!(count(&metrics.rule_matches, "main\0ads\0request"), Some(3));
+        assert_eq!(count(&metrics.rule_matches, "main\0cn\0request"), Some(1));
+        assert_eq!(metrics.upstream_attempts.len(), 1);
+        assert_eq!(
+            count(&metrics.upstream_attempts, "udp://192.0.2.1:53\0udp"),
+            Some(3)
         );
     }
 
