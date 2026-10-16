@@ -2,17 +2,15 @@
 // 支持基于域名分类的路由决策 / Supports routing decisions based on domain categorization
 
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
-use moka::sync::Cache as MokaCache;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
-use regex::{Regex, RegexBuilder};
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -103,26 +101,110 @@ impl GeoSiteEntry {
 }
 
 /// 一个 tag 的匹配器，按查找方式分开存放。完整域名和后缀放进哈希集合，查找时从整个域名开始、
-/// 每次去掉最左边一段去查，次数只取决于域名有几段，和这个 tag 有多少条无关；关键词、正则和
-/// 少见的写法仍逐条比较。结果和对每一条调用 [`DomainMatcher::matches`] 完全相同。
+/// 每次去掉最左边一段去查，次数只取决于域名有几段，和这个 tag 有多少条无关；正则合成一组，
+/// 一遍扫完；关键词和少见的写法仍逐条比较。结果和对每一条调用 [`DomainMatcher::matches`] 完全相同。
 /// One tag's matchers, stored by how they are looked up. Full names and suffixes go into
 /// hash sets, found by starting from the whole name and dropping the leftmost label each
 /// step, so the cost depends on how many labels the name has, not on how many entries the
-/// tag has; keywords, regexes and rare spellings are still tried one by one. The result is
-/// exactly that of calling [`DomainMatcher::matches`] on every entry.
+/// tag has; regexes are combined into one set and scanned in a single pass; keywords and
+/// rare spellings are still tried one by one. The result is exactly that of calling
+/// [`DomainMatcher::matches`] on every entry.
 #[derive(Debug, Default)]
 pub struct TagMatchers {
     /// `Full` 条目，小写 / `Full` entries, lowercased
     full: FxHashSet<Box<str>>,
     /// `Suffix` 条目去掉开头一个点后的值，小写 / `Suffix` entries with one leading dot removed, lowercased
     suffixes: FxHashSet<Box<str>>,
-    /// 其余条目，按加载顺序 / Every other entry, in load order
+    /// `Regex` 条目 / `Regex` entries
+    regexes: Regexes,
+    /// 其余条目（关键词、两个点开头的后缀），按加载顺序 / Every other entry (keywords, suffixes with two leading dots), in load order
     others: Vec<DomainMatcher>,
+}
+
+/// 一个 tag 的正则条目。多条合成一个 [`RegexSet`]，一遍扫描就知道有没有哪条命中：
+/// `geolocation-!cn` 这样带上百条正则的 tag，逐条比较要几微秒，合起来不到一微秒。
+/// 合不成（超出大小上限）时退回逐条比较。
+/// One tag's regex entries. Several are combined into one [`RegexSet`], so a single scan
+/// tells whether any of them matches: a tag like `geolocation-!cn` with over a hundred
+/// regexes takes microseconds one by one and well under one combined. When they cannot
+/// be combined (over the size limit) they are tried one by one instead.
+#[derive(Debug, Default)]
+enum Regexes {
+    #[default]
+    None,
+    Set(RegexSet),
+    Each(Vec<Regex>),
+}
+
+impl Regexes {
+    /// 合成的正则集合编译后的大小上限：每条正则解析时的上限乘以条数，合起来不会比逐条编译时更宽
+    /// The compiled size limit of a combined set: the per-regex limit used while parsing
+    /// times the number of regexes, so combining allows no more than compiling them one by one
+    const SIZE_LIMIT_EACH: usize = 1_000_000;
+
+    fn new(each: Vec<Regex>) -> Self {
+        Self::with_size_limit(each, Self::SIZE_LIMIT_EACH)
+    }
+
+    fn with_size_limit(each: Vec<Regex>, limit_each: usize) -> Self {
+        match each.len() {
+            0 => Self::None,
+            1 => Self::Each(each),
+            count => match RegexSetBuilder::new(each.iter().map(Regex::as_str))
+                .size_limit(limit_each.saturating_mul(count))
+                .build()
+            {
+                Ok(set) => Self::Set(set),
+                Err(err) => {
+                    warn!(target = "geosite", regexes = count, error = %err,
+                        "GeoSite regexes too large to combine, matching them one by one");
+                    Self::Each(each)
+                }
+            },
+        }
+    }
+
+    fn is_match(&self, domain: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Set(set) => set.is_match(domain),
+            Self::Each(each) => each.iter().any(|regex| regex.is_match(domain)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Set(set) => set.len(),
+            Self::Each(each) => each.len(),
+        }
+    }
+
+    /// 正则重新展开成一条条（调试用） / The regexes one by one again (for debugging)
+    fn to_regexes(&self) -> Vec<Regex> {
+        match self {
+            Self::None => Vec::new(),
+            // 集合里的每一条单独编译时都没超过上限，这里照样编译得出来
+            // Every pattern in a set compiled within the limit on its own, so it compiles here again
+            Self::Set(set) => set
+                .patterns()
+                .iter()
+                .filter_map(|pattern| {
+                    RegexBuilder::new(pattern)
+                        .size_limit(Self::SIZE_LIMIT_EACH)
+                        .build()
+                        .ok()
+                })
+                .collect(),
+            Self::Each(each) => each.clone(),
+        }
+    }
 }
 
 impl TagMatchers {
     fn new(matchers: Vec<DomainMatcher>) -> Self {
         let mut tag = Self::default();
+        let mut regexes = Vec::new();
         for matcher in matchers {
             match &matcher {
                 DomainMatcher::Full(name) => {
@@ -144,9 +226,11 @@ impl TagMatchers {
                     tag.suffixes
                         .insert(value.to_ascii_lowercase().into_boxed_str());
                 }
-                DomainMatcher::Keyword(_) | DomainMatcher::Regex(_) => tag.others.push(matcher),
+                DomainMatcher::Regex(regex) => regexes.push(regex.clone()),
+                DomainMatcher::Keyword(_) => tag.others.push(matcher),
             }
         }
+        tag.regexes = Regexes::new(regexes);
         tag
     }
 
@@ -160,6 +244,7 @@ impl TagMatchers {
         };
         self.full.contains(name)
             || self.suffix_matches(name)
+            || self.regexes.is_match(domain)
             || self.others.iter().any(|matcher| matcher.matches(domain))
     }
 
@@ -176,7 +261,7 @@ impl TagMatchers {
     }
 
     fn len(&self) -> usize {
-        self.full.len() + self.suffixes.len() + self.others.len()
+        self.full.len() + self.suffixes.len() + self.regexes.len() + self.others.len()
     }
 
     /// 条目重新展开成匹配器列表（调试用，顺序不保留）
@@ -189,6 +274,12 @@ impl TagMatchers {
                 self.suffixes
                     .iter()
                     .map(|suffix| DomainMatcher::Suffix(suffix.to_string())),
+            )
+            .chain(
+                self.regexes
+                    .to_regexes()
+                    .into_iter()
+                    .map(DomainMatcher::Regex),
             )
             .chain(self.others.iter().cloned())
             .collect()
@@ -214,10 +305,12 @@ fn retire(retired: Vec<TagMatchers>) {
 /// GeoSite 数据库管理器 / GeoSite database manager
 /// 使用 FxHashMap 实现高性能查找（由外层 RwLock 保护线程安全）/ Uses FxHashMap for high-performance lookup (thread-safety protected by outer RwLock)
 pub struct GeoSiteManager {
-    // Tag -> its matchers, indexed (see `TagMatchers`)
+    // Tag -> its matchers, indexed (see `TagMatchers`). Matching needs no cache in front: it is
+    // a few hash lookups plus one regex-set scan, cheaper than a cache lookup and insert, and a
+    // cache keyed by every name ever asked grew to hundreds of megabytes on unique names
+    // 匹配不再经过缓存：几次哈希查找加一遍正则集合扫描，比查一次缓存、写一条缓存还快；按问过的每个
+    // 名字存结果的缓存，在全是新名字时会涨到几百兆
     database: FxHashMap<String, TagMatchers>,
-    // Query cache: hash(tag, domain) -> bool (零分配优化 / zero-allocation optimization)
-    cache: MokaCache<u64, bool>,
     // 每个数据文件贡献的 tag，重载时据此只替换该文件的条目
     // Tags contributed by each data file, so a reload replaces only that file's entries
     sources: FxHashMap<PathBuf, Vec<String>>,
@@ -239,31 +332,20 @@ impl Default for GeoSiteManager {
 impl GeoSiteManager {
     /// 创建新的 GeoSite 管理器 / Create new GeoSite manager
     pub fn new() -> Self {
-        // 初始时创建一个小缓存，加载数据后会根据实际条数重建
         Self {
             database: FxHashMap::default(),
-            cache: MokaCache::builder().max_capacity(1000).build(),
             sources: FxHashMap::default(),
         }
     }
 
-    /// 重建缓存（在加载数据后调用）/ Rebuild cache (call after loading data)
-    fn rebuild_cache(&mut self) {
-        // 根据实际加载的域名数量设置缓存大小
-        // 统计所有标签的域名总数
+    /// 记下加载后的规模（加载完数据后调用）/ Log the size after loading (call after loading data)
+    fn log_totals(&self) {
         let total_domains: usize = self.database.values().map(TagMatchers::len).sum();
-
-        // 缓存大小为域名总数的 2 倍，最小 10000，最大 1000000
-        let cache_capacity = (total_domains * 2).clamp(10_000, 1_000_000) as u64;
-
         tracing::info!(
             geosite_tags = self.database.len(),
             total_domains = total_domains,
-            cache_capacity = cache_capacity,
-            "Rebuilding GeoSite cache"
+            "GeoSite data loaded"
         );
-
-        self.cache = MokaCache::builder().max_capacity(cache_capacity).build();
     }
 
     /// 添加 GeoSite 条目 / Add GeoSite entry
@@ -285,30 +367,18 @@ impl GeoSiteManager {
     /// - `false`: 域名不匹配该标签 / Domain does not match the tag
     #[inline]
     pub fn matches(&self, tag: &str, domain: &str) -> bool {
-        // 零分配优化：使用哈希值作为缓存键 / Zero-allocation optimization: use hash as cache key
-        // 使用 FxHasher 计算组合哈希 / Use FxHasher to compute combined hash
-        let mut hasher = FxHasher::default();
-        tag.hash(&mut hasher);
-        domain.hash(&mut hasher);
-        let key = hasher.finish();
-
-        // 检查缓存 / Check cache
-        if let Some(result) = self.cache.get(&key) {
-            return result;
-        }
-
-        let result = self.matches_impl(tag, domain);
-        self.cache.insert(key, result);
-        result
-    }
-
-    /// 检查域名是否匹配指定的 GeoSite 标签（内部实现）/ Internal implementation
-    fn matches_impl(&self, tag: &str, domain: &str) -> bool {
-        // 不区分大小写：将 tag 转换为小写再查找 / Case insensitive: convert tag to lowercase before lookup
-        let tag_lower = tag.to_ascii_lowercase();
-
+        // 不区分大小写：按小写的 tag 查找；配置里的 tag 一般已是小写，就不另分配一份
+        // Case insensitive: looked up by the lowercased tag; tags in a config are usually lowercase
+        // already, and then no lowercased copy is made
+        let lowered;
+        let tag = if tag.bytes().any(|b| b.is_ascii_uppercase()) {
+            lowered = tag.to_ascii_lowercase();
+            lowered.as_str()
+        } else {
+            tag
+        };
         self.database
-            .get(&tag_lower)
+            .get(tag)
             .is_some_and(|matchers| matchers.matches(domain))
     }
 
@@ -699,10 +769,9 @@ impl GeoSiteManager {
     /// Replace the tags a data file contributed with its freshly parsed content
     ///
     /// 文件里删掉的 tag 随之消失，其它文件贡献的 tag 保持不变
-    /// （`geosite_data_paths` 接受多个文件），查询缓存一并重建。
+    /// （`geosite_data_paths` 接受多个文件）。
     /// Tags dropped from the file disappear with it while tags from other files
-    /// stay (`geosite_data_paths` accepts several files); the query cache is
-    /// rebuilt along the way.
+    /// stay (`geosite_data_paths` accepts several files).
     pub fn apply_source<P: AsRef<Path>>(&mut self, path: P, parsed: ParsedGeoSite) -> usize {
         let key = Self::source_key(path.as_ref());
         let previous = self.sources.remove(&key).unwrap_or_default();
@@ -748,7 +817,7 @@ impl GeoSiteManager {
         let loaded_count = tags.len();
         self.sources.insert(key, tags);
 
-        self.rebuild_cache();
+        self.log_totals();
         retire(retired);
         loaded_count
     }
@@ -1266,8 +1335,7 @@ impl GeoSiteManager {
             self.add_entry(entry);
         }
 
-        // 根据实际加载的条数重建缓存
-        self.rebuild_cache();
+        self.log_totals();
 
         Ok(count)
     }
@@ -2381,5 +2449,58 @@ mod tests {
         ] {
             assert_eq!(indexed.matches(domain), expected, "{domain}");
         }
+    }
+
+    /// 多条正则合成一组以后，命中与否和逐条比较完全一样；合不成时退回逐条比较，结果也一样
+    /// Combined into one set, regexes match exactly as they do one by one; when they cannot be
+    /// combined they fall back to one by one, with the same results
+    #[test]
+    fn combined_regexes_match_exactly_as_each_one_does() {
+        let patterns = [
+            "^a\\.",
+            "Ex",
+            "cn$",
+            "^$",
+            "(^|\\.)google\\.[a-z]{2,3}$",
+            "^www\\d+\\.",
+        ];
+        let each: Vec<Regex> = patterns.iter().map(|p| Regex::new(p).unwrap()).collect();
+        let combined = Regexes::new(each.clone());
+        assert!(
+            matches!(combined, Regexes::Set(_)),
+            "several regexes combine into one set"
+        );
+        let separate = Regexes::with_size_limit(each.clone(), 1);
+        assert!(
+            matches!(separate, Regexes::Each(_)),
+            "over the size limit they stay one by one"
+        );
+        for domain in [
+            "a.example",
+            "A.example",
+            "Example.org",
+            "example.org",
+            "www.163.cn",
+            "",
+            "mail.google.com",
+            "google.community",
+            "www12.site.net",
+            "site.net",
+        ] {
+            let expected = each.iter().any(|regex| regex.is_match(domain));
+            assert_eq!(combined.is_match(domain), expected, "set: {domain:?}");
+            assert_eq!(
+                separate.is_match(domain),
+                expected,
+                "one by one: {domain:?}"
+            );
+        }
+        assert_eq!(combined.len(), patterns.len());
+        let listed: Vec<String> = combined
+            .to_regexes()
+            .iter()
+            .map(|regex| regex.as_str().to_owned())
+            .collect();
+        assert_eq!(listed, patterns);
     }
 }
