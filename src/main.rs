@@ -29,6 +29,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// 提交整块内存以后，空闲和高负载时的内存都不比原来用 glibc 时高，查询仍快得多。「不预先提交」只对设好之后
 /// 才建的内存区生效，所以要赶在第一次分配之前：Linux 和 FreeBSD 上放进 `.init_array`，程序装载时、Rust
 /// 运行时分配内存之前就执行；别的平台在 main 一开始设。
+///
+/// 另外在 Linux 上只对本进程关掉透明大页，不改系统设置。用了透明大页，零碎归还过的内存再用到时，系统要把
+/// 整块 2 MiB 清零，单核上事件循环会停住（外部压测在 mimalloc 默认设置下测到 p99 上百毫秒）。不预先提交时
+/// mimalloc 已经不为内存区申请大页，但透明大页设成 always 的系统不申请也会给，所以直接关掉。
 /// Two mimalloc settings, applied before any allocation. At home the kernel sits idle most of the
 /// time: by default mimalloc keeps freed memory for reuse, and the temporary memory used to load GeoSite
 /// is not returned once things go quiet (measured at about 70 MiB extra while idle). Purging freed
@@ -37,7 +41,16 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// arenas created after it is set, so it has to beat the first allocation: on Linux and FreeBSD it sits
 /// in `.init_array` and runs when the program is loaded, before the Rust runtime allocates anything;
 /// elsewhere it is set at the start of main.
+///
+/// On Linux transparent huge pages are also turned off for this process alone, leaving the system
+/// setting as it is. With them, memory that was returned piecemeal and is touched again makes the
+/// system zero a whole 2 MiB page, which stalls the event loop on a single core (an external load test
+/// measured p99 in the hundreds of milliseconds with mimalloc's defaults). Without committing up front
+/// mimalloc no longer asks for huge pages, but a system set to `always` hands them out unasked, so they
+/// are turned off outright.
 mod allocator_tuning {
+    #[cfg(target_os = "linux")]
+    use std::ffi::c_ulong;
     use std::ffi::{c_int, c_long};
 
     unsafe extern "C" {
@@ -74,17 +87,35 @@ mod allocator_tuning {
             mi_option_set(PURGE_DELAY, 0);
             mi_option_set(ARENA_EAGER_COMMIT, 0);
         }
+        // 内核早于 3.15 时不认这个选项、返回错误，那就照旧 / Kernels before 3.15 reject the option, and
+        // things stay as they were
+        // SAFETY: 只改本进程的一个标记，不碰内存；参数按内核要求都是 unsigned long
+        // SAFETY: only flips a flag of this process and touches no memory; every argument is an
+        // unsigned long, as the kernel reads them
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_THP_DISABLE,
+                1 as c_ulong,
+                0 as c_ulong,
+                0 as c_ulong,
+                0 as c_ulong,
+            );
+        }
     }
 
     #[cfg(test)]
     mod tests {
+        #[cfg(target_os = "linux")]
+        use super::c_ulong;
         use super::{ARENA_EAGER_COMMIT, PURGE_DELAY, apply, mi_option_get};
 
-        /// 两个编号还对应这两个选项（默认值分别是 1000 毫秒和 2），`apply` 把它们都设成 0
-        /// The two positions still name these options (their defaults are 1000 ms and 2), and `apply` sets
-        /// both to 0
+        /// 两个编号还对应这两个选项（默认值分别是 1000 毫秒和 2），`apply` 把它们都设成 0，
+        /// 在 Linux 上还关掉本进程的透明大页
+        /// The two positions still name these options (their defaults are 1000 ms and 2), `apply` sets
+        /// both to 0, and on Linux it also turns transparent huge pages off for the process
         #[test]
-        fn mimalloc_options_are_found_and_set() {
+        fn allocator_tuning_is_found_and_applied() {
             // SAFETY: 只读选项 / Only reads the options
             let read = || unsafe {
                 (
@@ -99,6 +130,21 @@ mod allocator_tuning {
             );
             apply();
             assert_eq!(read(), (0, 0));
+            // SAFETY: 只读本进程的标记 / Only reads a flag of this process
+            #[cfg(target_os = "linux")]
+            assert_eq!(
+                unsafe {
+                    libc::prctl(
+                        libc::PR_GET_THP_DISABLE,
+                        0 as c_ulong,
+                        0 as c_ulong,
+                        0 as c_ulong,
+                        0 as c_ulong,
+                    )
+                },
+                1,
+                "transparent huge pages are off for the process"
+            );
         }
     }
 }
