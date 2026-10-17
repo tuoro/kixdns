@@ -8,7 +8,7 @@ use crate::engine::refresh::RefreshTarget;
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
-use crate::engine::types::{EngineInner, inflight_pending};
+use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion, inflight_pending};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::InflightCleanupGuard;
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
@@ -641,6 +641,22 @@ pub(crate) async fn handle_forward_decision_logged(
     // 只有登记了条目的请求才把应答交给它。在别人的条目下转发的请求（持有自己条目的
     // 请求、领头请求离开后自己转发的等待者、不登记条目的后台刷新）把它留给条目的主人。
     let mut cleanup_guard = None;
+    // What this forward registers or waits under in the inflight map
+    // 这次转发在 inflight 表里登记或等待的问题
+    let inflight_question = InflightQuestion {
+        namespace: state.cache_namespace(pipeline_id),
+        pipeline_id,
+        qname: qname.as_bytes(),
+        qtype,
+        qclass,
+        requester: keys.requester,
+        client_ecs: requester.ecs,
+    };
+    debug_assert_eq!(
+        inflight_question.key(),
+        keys.inflight,
+        "the inflight question is what the inflight key was computed from"
+    );
     // An answer a rule continued past, reused here: the trail already has its forward
     // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里
     let mut reused = false;
@@ -655,7 +671,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 let rx = match engine.inflight.entry(keys.inflight) {
                     Entry::Vacant(entry) => {
                         let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                        entry.insert(tx);
+                        entry.insert(InflightEntry::new(&inflight_question, tx));
                         cleanup_guard = Some(InflightCleanupGuard::new(
                             engine.inflight.clone(),
                             keys.inflight,
@@ -672,8 +688,14 @@ pub(crate) async fn handle_forward_decision_logged(
                     // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
                     // 自己转发。
                     Entry::Occupied(_) if held_inflight.is_some() => None,
+                    // Another question's entry under the same key: the key is only a hash (see
+                    // `InflightQuestion`), and waiting on it would hand this request another
+                    // question's answer. It forwards itself instead.
+                    // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
+                    // 别的问题的应答交给这个请求。它自己转发。
+                    Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
                     Entry::Occupied(entry) => {
-                        let rx = entry.get().subscribe();
+                        let rx = entry.get().tx.subscribe();
                         Some(rx)
                     }
                 };
@@ -717,7 +739,7 @@ pub(crate) async fn handle_forward_decision_logged(
             let rx = match engine.inflight.entry(keys.inflight) {
                 Entry::Vacant(entry) => {
                     let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                    entry.insert(tx);
+                    entry.insert(InflightEntry::new(&inflight_question, tx));
                     cleanup_guard = Some(InflightCleanupGuard::new(
                         engine.inflight.clone(),
                         keys.inflight,
@@ -726,8 +748,10 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
                 // See the same arm above / 同上
                 Entry::Occupied(_) if held_inflight.is_some() => None,
+                // See the same arm above / 同上
+                Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
                 Entry::Occupied(entry) => {
-                    let rx = entry.get().subscribe();
+                    let rx = entry.get().tx.subscribe();
                     Some(rx)
                 }
             };

@@ -1,10 +1,13 @@
 use crate::config::{Action, EcsMode, GlobalSettings, MatchOperator};
+use crate::ecs::EcsKey;
+use crate::engine::Engine;
 use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::{
-    RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher,
+    RequesterKey, RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
+use hickory_proto::rr::{DNSClass, RecordType};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -13,8 +16,90 @@ use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use tokio::sync::watch;
 
-pub type InflightMap =
-    DashMap<u64, watch::Sender<Result<Bytes, Arc<anyhow::Error>>>, FxBuildHasher>;
+pub type InflightMap = DashMap<u64, InflightEntry, FxBuildHasher>;
+
+/// 合并查询的结果：领头请求拿到的应答，或它失败的原因 / The result of a merged query: the answer the
+/// leading request got, or why it failed
+pub type InflightResult = Result<Bytes, Arc<anyhow::Error>>;
+
+/// 一个请求在 inflight 表里登记或等待时问的是什么：算它的 inflight 键用到的全部输入（见
+/// `Engine::cache_keys`）。键只是这些输入的哈希，而且不带密钥，落在同一个键上的两个不同问题可以算出来；
+/// 所以登记时把问题存进条目，等待之前先核对（见 `InflightEntry::asks`），对不上就自己转发。
+/// What a request registers or waits under in the inflight map: everything its inflight key is
+/// computed from (see `Engine::cache_keys`). The key is only a hash of these, and an unkeyed one, so
+/// two different questions landing on one key can be computed; the question is therefore stored in the
+/// entry when it is registered and checked before waiting (see `InflightEntry::asks`), and a request
+/// whose question differs forwards by itself.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InflightQuestion<'a> {
+    pub namespace: u64,
+    pub pipeline_id: &'a str,
+    pub qname: &'a [u8],
+    pub qtype: RecordType,
+    pub qclass: DNSClass,
+    pub requester: RequesterKey,
+    pub client_ecs: Option<EcsKey>,
+}
+
+impl InflightQuestion<'_> {
+    /// 它的 inflight 键 / Its inflight key
+    pub(crate) fn key(&self) -> u64 {
+        Engine::cache_keys(
+            self.namespace,
+            self.pipeline_id,
+            self.qname,
+            self.qtype,
+            self.qclass,
+            &self.requester,
+            self.client_ecs.as_ref(),
+        )
+        .inflight
+    }
+}
+
+/// inflight 表里的条目：领头请求发出结果的通道，和它问的是什么
+/// An entry of the inflight map: the channel the leading request sends its result on, and what it
+/// asked
+#[derive(Debug)]
+pub struct InflightEntry {
+    pub(crate) tx: watch::Sender<InflightResult>,
+    namespace: u64,
+    pipeline_id: Box<str>,
+    qname: Box<[u8]>,
+    qtype: RecordType,
+    qclass: DNSClass,
+    requester: RequesterKey,
+    client_ecs: Option<EcsKey>,
+}
+
+impl InflightEntry {
+    /// `question` 的条目，结果从 `tx` 发出 / The entry of `question`, whose result goes out on `tx`
+    pub(crate) fn new(question: &InflightQuestion<'_>, tx: watch::Sender<InflightResult>) -> Self {
+        Self {
+            tx,
+            namespace: question.namespace,
+            pipeline_id: question.pipeline_id.into(),
+            qname: question.qname.into(),
+            qtype: question.qtype,
+            qclass: question.qclass,
+            requester: question.requester,
+            client_ecs: question.client_ecs,
+        }
+    }
+
+    /// 条目是不是 `question` 的：只有问的完全一样，才能等它的结果
+    /// Whether the entry is `question`'s: only a request asking exactly the same may wait on its
+    /// result
+    pub(crate) fn asks(&self, question: &InflightQuestion<'_>) -> bool {
+        self.namespace == question.namespace
+            && *self.pipeline_id == *question.pipeline_id
+            && *self.qname == *question.qname
+            && self.qtype == question.qtype
+            && self.qclass == question.qclass
+            && self.requester == question.requester
+            && self.client_ecs == question.client_ecs
+    }
+}
 
 /// 合并查询的通道在领头请求拿到结果之前的值。等待的请求只在领头请求发出结果之后才读
 /// （`changed()`），从来读不到它，所以所有通道共用这一个：每次缓存没命中都新建一个错误要分配内存，
@@ -23,10 +108,77 @@ pub type InflightMap =
 /// read only after the leader sends one (`changed()`) and never see it, so every channel shares this
 /// one: building a new error on each cache miss allocates, and with `RUST_BACKTRACE` set it also
 /// captures a whole backtrace (measured at 18% less throughput for new names).
-pub(crate) fn inflight_pending() -> Result<Bytes, Arc<anyhow::Error>> {
+pub(crate) fn inflight_pending() -> InflightResult {
     static PENDING: LazyLock<Arc<anyhow::Error>> =
         LazyLock::new(|| Arc::new(anyhow::anyhow!("Pending")));
     Err(Arc::clone(&PENDING))
+}
+
+#[cfg(test)]
+mod inflight_entry_tests {
+    use super::{InflightEntry, InflightQuestion, inflight_pending};
+    use crate::ecs::EcsKey;
+    use crate::matcher::RequesterKey;
+    use hickory_proto::rr::{DNSClass, RecordType};
+
+    /// 条目只认问得完全一样的请求：问题的任何一部分不同都不算 / An entry is only for a request asking
+    /// exactly the same: any part of the question differing rules it out
+    #[test]
+    fn an_entry_is_only_for_its_own_question() {
+        let question = InflightQuestion {
+            namespace: 1,
+            pipeline_id: "main",
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        };
+        let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
+        let entry = InflightEntry::new(&question, tx);
+        assert!(entry.asks(&question));
+        let others = [
+            InflightQuestion {
+                namespace: 2,
+                ..question
+            },
+            InflightQuestion {
+                pipeline_id: "other",
+                ..question
+            },
+            InflightQuestion {
+                qname: b"example.org",
+                ..question
+            },
+            InflightQuestion {
+                qtype: RecordType::AAAA,
+                ..question
+            },
+            InflightQuestion {
+                qclass: DNSClass::CH,
+                ..question
+            },
+            InflightQuestion {
+                requester: RequesterKey {
+                    class: Some(1),
+                    ..RequesterKey::NONE
+                },
+                ..question
+            },
+            InflightQuestion {
+                client_ecs: Some(EcsKey {
+                    family: 1,
+                    source_prefix: 24,
+                    addr: [198, 51, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    addr_len: 3,
+                }),
+                ..question
+            },
+        ];
+        for other in others {
+            assert!(!entry.asks(&other), "{other:?}");
+        }
+    }
 }
 
 #[cfg(test)]
