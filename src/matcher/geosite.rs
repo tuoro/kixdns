@@ -3,19 +3,123 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Duration;
 
+use std::hash::BuildHasher;
+use std::io::Read;
+
 use anyhow::Context;
+use hashbrown::HashTable;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use super::domain_suffix_matches;
 use crate::lock::RwLock;
+
+/// 编译 GeoSite 数据里的一条正则。数据是给 v2ray 写的，v2ray 用 Go 的正则，那里 `\w`、`\d`、`\s`、`\b` 只认
+/// ASCII；Rust 的正则默认按 Unicode 理解，`\w{5}` 要展开整张 Unicode 字母表，`cn` 里这样的正则让进程多占好几 MiB。
+/// 所以先把这几类写法改成 Go 的 ASCII 写法（见 [`go_classes`]），其余照旧；改写后编译不了（不该发生）就按原样编译。
+/// 只含 ASCII 的名字两种写法结果相同，含其他字符的名字按 v2ray 的理解。
+/// Compiles one regex of GeoSite data. The data is written for v2ray, whose Go regexes treat
+/// `\w`, `\d`, `\s` and `\b` as ASCII only; Rust regexes default to Unicode, where `\w{5}` spells
+/// out the whole Unicode alphabet, and such regexes in `cn` cost the process several MiB. So these
+/// classes are first rewritten the Go way (see [`go_classes`]) and the rest is left as it is; a
+/// rewrite that does not compile (it should not happen) compiles as written instead. Names of
+/// ASCII alone match the same either way; names with other characters match as v2ray reads the
+/// pattern.
+fn compile_geosite_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    let build = |pattern: &str| {
+        RegexBuilder::new(pattern)
+            .size_limit(1_000_000)
+            .dfa_size_limit(1_000_000)
+            .build()
+    };
+    match go_classes(pattern) {
+        std::borrow::Cow::Owned(rewritten) => build(&rewritten).or_else(|_| build(pattern)),
+        std::borrow::Cow::Borrowed(pattern) => build(pattern),
+    }
+}
+
+/// `pattern` 里的 `\w`、`\d`、`\s`、`\b` 及其大写的取反形式改成 Go 正则的 ASCII 含义：字符类外写成一个字符类
+/// （`\b` 写成 `(?-u:\b)`），字符类里展开成范围（取反的写成嵌套的字符类）。转义的反斜杠和别的转义原样保留。
+/// `\w`, `\d`, `\s` and `\b` in `pattern`, and their negated capitals, rewritten to their ASCII
+/// meaning in Go regexes: outside a class each becomes a class (`\b` becomes `(?-u:\b)`), inside a
+/// class it becomes ranges (a negated one a nested class). Escaped backslashes and other escapes
+/// stay as they are.
+fn go_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
+    const WORD: &str = "0-9A-Za-z_";
+    const DIGIT: &str = "0-9";
+    const SPACE: &str = r"\t\n\f\r ";
+    if !pattern.contains('\\') {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut changed = false;
+    // 字符类嵌套的层数，和刚开始一个字符类（这时的 `]` 是字面字符）
+    // How deep in character classes, and whether one just began (where `]` is a literal)
+    let (mut depth, mut class_start) = (0usize, false);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        let starting = std::mem::take(&mut class_start);
+        match c {
+            '\\' => {
+                let Some(next) = chars.next() else {
+                    out.push(c);
+                    break;
+                };
+                let class = match next.to_ascii_lowercase() {
+                    'w' => Some(WORD),
+                    'd' => Some(DIGIT),
+                    's' => Some(SPACE),
+                    _ => None,
+                };
+                match (class, next.is_ascii_uppercase(), depth > 0) {
+                    (Some(class), false, true) => out.push_str(class),
+                    (Some(class), negated, _) => {
+                        out.push_str(if negated { "[^" } else { "[" });
+                        out.push_str(class);
+                        out.push(']');
+                    }
+                    (None, _, false) if matches!(next, 'b' | 'B') => {
+                        out.push_str("(?-u:\\");
+                        out.push(next);
+                        out.push(')');
+                    }
+                    _ => {
+                        out.push(c);
+                        out.push(next);
+                        continue;
+                    }
+                }
+                changed = true;
+            }
+            '[' => {
+                depth += 1;
+                class_start = true;
+                out.push(c);
+            }
+            '^' if starting => {
+                class_start = true;
+                out.push(c);
+            }
+            ']' if depth > 0 && !starting => {
+                depth -= 1;
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    }
+}
 
 /// 域名匹配器类型 / Domain matcher type
 #[derive(Debug, Clone)]
@@ -100,6 +204,120 @@ impl GeoSiteEntry {
     }
 }
 
+/// 一组小写域名，存在一整块内存里：名字首尾相接，各自前面两个字节记长度，哈希表只记每个名字的起点。
+/// 几十万条名字只占两块大内存。每条单独分配时，几十万个小块和加载时的临时内存交错在一起，临时内存
+/// 释放后整页还不回去：三个常用的 tag（约 33 万条）存的数据只有 13 MiB，进程却为它们多占 24 MiB。
+/// A set of lowercase names kept in one block of memory: the names back to back, each preceded
+/// by two bytes holding its length, and a hash table recording only where each name starts.
+/// Hundreds of thousands of names take two large blocks. Allocated one by one, they were hundreds
+/// of thousands of small blocks interleaved with the temporary memory of loading, and the pages
+/// could not be returned once that was freed: three common tags (about 330,000 names) held 13 MiB
+/// of data while the process took 24 MiB more for them.
+#[derive(Default)]
+struct NameSet {
+    /// 每个名字是两个字节的长度（小端）加上名字本身 / Each name is a two-byte length (little-endian) followed by the name
+    bytes: Vec<u8>,
+    /// 每个名字在 `bytes` 里的起点 / Where each name starts in `bytes`
+    starts: HashTable<u32>,
+}
+
+impl NameSet {
+    /// 能放下 `names` 个、总长 `total` 字节的名字 / Room for `names` names of `total` bytes together
+    fn with_capacity(names: usize, total: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(total + 2 * names),
+            starts: HashTable::with_capacity(names),
+        }
+    }
+
+    fn hash(name: &[u8]) -> u64 {
+        FxBuildHasher.hash_one(name)
+    }
+
+    /// 从 `start` 开始的那个名字 / The name starting at `start`
+    fn name_at(bytes: &[u8], start: u32) -> &[u8] {
+        let start = start as usize;
+        let len = u16::from_le_bytes([bytes[start], bytes[start + 1]]) as usize;
+        &bytes[start + 2..start + 2 + len]
+    }
+
+    /// 加入 `name` 的小写形式，已经有了就不变。名字长到两个字节记不下（超过 65535 字节），或这块
+    /// 内存超过 4 GiB 时放不进来，返回 false。
+    /// Adds `name` lowercased; nothing changes when it is there already. Returns false when it
+    /// cannot go in: a name too long for two bytes to hold (over 65535 bytes), or this block
+    /// past 4 GiB.
+    fn insert(&mut self, name: &str) -> bool {
+        let (Ok(len), Ok(start)) = (u16::try_from(name.len()), u32::try_from(self.bytes.len()))
+        else {
+            return false;
+        };
+        let Self { bytes, starts } = self;
+        // 先写进去，按写好的小写形式算哈希、找重复；重复就撤回
+        // Written first, so the hash and the duplicate check use the lowercased form; withdrawn
+        // when it is a duplicate
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+        let written = Self::name_at(bytes, start);
+        let hash = Self::hash(written);
+        if starts
+            .find(hash, |&other| Self::name_at(bytes, other) == written)
+            .is_some()
+        {
+            bytes.truncate(start as usize);
+        } else {
+            starts.insert_unique(hash, start, |&other| {
+                Self::hash(Self::name_at(bytes, other))
+            });
+        }
+        true
+    }
+
+    /// 去掉多余的容量：边加边建时按需翻倍增长，最后可能空着将近一半
+    /// Drops spare capacity: grown by doubling while built entry by entry, it may end almost half
+    /// empty
+    fn shrink_to_fit(&mut self) {
+        let Self { bytes, starts } = self;
+        bytes.shrink_to_fit();
+        starts.shrink_to_fit(|&start| Self::hash(Self::name_at(bytes, start)));
+    }
+
+    /// 有没有 `name` 这个名字（调用方已转成小写） / Whether `name` is one of the names (the caller lowercased it)
+    fn contains(&self, name: &str) -> bool {
+        !self.starts.is_empty()
+            && self
+                .starts
+                .find(Self::hash(name.as_bytes()), |&start| {
+                    Self::name_at(&self.bytes, start) == name.as_bytes()
+                })
+                .is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
+    /// 所有名字（调试用，顺序不保留） / Every name (for debugging; order is not kept)
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.starts.iter().map(|&start| {
+            std::str::from_utf8(Self::name_at(&self.bytes, start))
+                .expect("names go in as str and are lowercased by ASCII only")
+        })
+    }
+}
+
+impl std::fmt::Debug for NameSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NameSet")
+            .field("names", &self.len())
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// 一个 tag 的匹配器，按查找方式分开存放。完整域名和后缀放进哈希集合，查找时从整个域名开始、
 /// 每次去掉最左边一段去查，次数只取决于域名有几段，和这个 tag 有多少条无关；正则合成一组，
 /// 一遍扫完；关键词和少见的写法仍逐条比较。结果和对每一条调用 [`DomainMatcher::matches`] 完全相同。
@@ -112,9 +330,9 @@ impl GeoSiteEntry {
 #[derive(Debug, Default)]
 pub struct TagMatchers {
     /// `Full` 条目，小写 / `Full` entries, lowercased
-    full: FxHashSet<Box<str>>,
+    full: NameSet,
     /// `Suffix` 条目去掉开头一个点后的值，小写 / `Suffix` entries with one leading dot removed, lowercased
-    suffixes: FxHashSet<Box<str>>,
+    suffixes: NameSet,
     /// `Regex` 条目 / `Regex` entries
     regexes: Regexes,
     /// 其余条目（关键词、两个点开头的后缀），按加载顺序 / Every other entry (keywords, suffixes with two leading dots), in load order
@@ -201,37 +419,92 @@ impl Regexes {
     }
 }
 
+/// 一边加条目一边建的 [`TagMatchers`]。解析数据文件时每读出一条就加进来，不必先把整个 tag 的条目收齐：
+/// 收齐再建时，几十万条的临时字符串和数组用完以后，有好几 MiB 留在分配器里还不回去（只加载 `cn` 时进程
+/// 多占 9 MiB，其中 tag 本身的数据只有 2.5 MiB）。
+/// A [`TagMatchers`] built as entries are added. Parsing a data file adds each entry as it is
+/// read instead of first collecting the whole tag: collected first, the hundreds of thousands of
+/// temporary strings and the arrays holding them left several MiB in the allocator once freed
+/// (with only `cn` loaded the process took 9 MiB more, of which the tag's own data was 2.5 MiB).
+#[derive(Default)]
+struct TagBuilder {
+    tag: TagMatchers,
+    regexes: Vec<Regex>,
+}
+
+impl TagBuilder {
+    /// 能放下 `full` 和 `suffixes`（各是条数和总长）的 builder / A builder with room for `full` and
+    /// `suffixes` (each a count and a total length)
+    fn with_capacity(full: (usize, usize), suffixes: (usize, usize)) -> Self {
+        Self {
+            tag: TagMatchers {
+                full: NameSet::with_capacity(full.0, full.1),
+                suffixes: NameSet::with_capacity(suffixes.0, suffixes.1),
+                ..TagMatchers::default()
+            },
+            regexes: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, matcher: DomainMatcher) {
+        let tag = &mut self.tag;
+        match &matcher {
+            DomainMatcher::Full(name) => {
+                if !tag.full.insert(name) {
+                    // 放不进去的（长得不像域名）照原样逐条比较 / One that does not fit (no real name is that long) is tried as it is
+                    tag.others.push(matcher);
+                }
+            }
+            DomainMatcher::Suffix(suffix) => {
+                let value = suffix.strip_prefix('.').unwrap_or(suffix);
+                if value.is_empty() {
+                    // 匹配不到任何域名（见 `DomainMatcher::matches`）/ Matches no domain (see `DomainMatcher::matches`)
+                    return;
+                }
+                if value.starts_with('.') {
+                    // 两个点开头的值按字符串结尾比较，不按整段，所以逐条比
+                    // A value with two leading dots compares by string ending, not by label,
+                    // so it is tried as it is
+                    tag.others.push(matcher);
+                    return;
+                }
+                if !tag.suffixes.insert(value) {
+                    // 同上 / As above
+                    tag.others.push(matcher);
+                }
+            }
+            DomainMatcher::Regex(regex) => self.regexes.push(regex.clone()),
+            DomainMatcher::Keyword(_) => tag.others.push(matcher),
+        }
+    }
+
+    fn finish(self) -> TagMatchers {
+        let mut tag = self.tag;
+        tag.regexes = Regexes::new(self.regexes);
+        tag.full.shrink_to_fit();
+        tag.suffixes.shrink_to_fit();
+        tag
+    }
+}
+
 impl TagMatchers {
     fn new(matchers: Vec<DomainMatcher>) -> Self {
-        let mut tag = Self::default();
-        let mut regexes = Vec::new();
-        for matcher in matchers {
-            match &matcher {
-                DomainMatcher::Full(name) => {
-                    tag.full.insert(name.to_ascii_lowercase().into_boxed_str());
-                }
+        // 先数好条数和总长，两组名字各一次分配到位 / Count first, so each set of names is allocated once
+        let (mut full, mut suffixes) = ((0, 0), (0, 0));
+        for matcher in &matchers {
+            match matcher {
+                DomainMatcher::Full(name) => (full.0, full.1) = (full.0 + 1, full.1 + name.len()),
                 DomainMatcher::Suffix(suffix) => {
-                    let value = suffix.strip_prefix('.').unwrap_or(suffix);
-                    if value.is_empty() {
-                        // 匹配不到任何域名（见 `DomainMatcher::matches`）/ Matches no domain (see `DomainMatcher::matches`)
-                        continue;
-                    }
-                    if value.starts_with('.') {
-                        // 两个点开头的值按字符串结尾比较，不按整段，所以逐条比
-                        // A value with two leading dots compares by string ending, not by label,
-                        // so it is tried as it is
-                        tag.others.push(matcher);
-                        continue;
-                    }
-                    tag.suffixes
-                        .insert(value.to_ascii_lowercase().into_boxed_str());
+                    (suffixes.0, suffixes.1) = (suffixes.0 + 1, suffixes.1 + suffix.len())
                 }
-                DomainMatcher::Regex(regex) => regexes.push(regex.clone()),
-                DomainMatcher::Keyword(_) => tag.others.push(matcher),
+                _ => {}
             }
         }
-        tag.regexes = Regexes::new(regexes);
-        tag
+        let mut builder = TagBuilder::with_capacity(full, suffixes);
+        for matcher in matchers {
+            builder.add(matcher);
+        }
+        builder.finish()
     }
 
     fn matches(&self, domain: &str) -> bool {
@@ -269,11 +542,11 @@ impl TagMatchers {
     fn to_matchers(&self) -> Vec<DomainMatcher> {
         self.full
             .iter()
-            .map(|name| DomainMatcher::Full(name.to_string()))
+            .map(|name| DomainMatcher::Full(name.to_owned()))
             .chain(
                 self.suffixes
                     .iter()
-                    .map(|suffix| DomainMatcher::Suffix(suffix.to_string())),
+                    .map(|suffix| DomainMatcher::Suffix(suffix.to_owned())),
             )
             .chain(
                 self.regexes
@@ -512,6 +785,77 @@ fn parse_attribute_key(data: &[u8]) -> Option<String> {
 }
 
 /// 解析 varint / Parse varint
+/// .dat 文件的顺序读取：按需读出字段、跳过不要的部分，不把整个文件读进内存
+/// Sequential reading of a .dat file: fields are read as needed and the rest skipped, without
+/// reading the whole file into memory
+struct DatReader {
+    file: std::io::BufReader<fs::File>,
+    /// 当前在文件里的位置 / The current position in the file
+    pos: usize,
+    /// 打开时的文件长度 / The file's length when opened
+    len: usize,
+}
+
+impl DatReader {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        let file = fs::File::open(path)?;
+        let len = usize::try_from(file.metadata()?.len())?;
+        Ok(Self {
+            file: std::io::BufReader::with_capacity(64 * 1024, file),
+            pos: 0,
+            len,
+        })
+    }
+
+    /// 下一个字节，文件读完了是 None / The next byte, or None at the end of the file
+    fn byte(&mut self) -> anyhow::Result<Option<u8>> {
+        if self.pos >= self.len {
+            return Ok(None);
+        }
+        let mut byte = [0u8];
+        self.file.read_exact(&mut byte)?;
+        self.pos += 1;
+        Ok(Some(byte[0]))
+    }
+
+    /// 下一个字节，必须有 / The next byte, which must be there
+    fn next_byte(&mut self) -> anyhow::Result<u8> {
+        self.byte()?
+            .ok_or_else(|| anyhow::anyhow!("unexpected end of file"))
+    }
+
+    /// 和 [`parse_varint`] 一样读一个变长整数 / Reads a varint as [`parse_varint`] does
+    fn varint(&mut self) -> anyhow::Result<usize> {
+        let mut result = 0usize;
+        let mut shift = 0;
+        loop {
+            let byte = self.next_byte()?;
+            result |= ((byte & 0x7F) as usize) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                return Ok(result);
+            }
+        }
+    }
+
+    /// 接下来的 `len` 个字节，读进 `buf` / The next `len` bytes, read into `buf`
+    fn read(&mut self, buf: &mut Vec<u8>, len: usize) -> anyhow::Result<()> {
+        buf.clear();
+        buf.resize(len, 0);
+        self.file.read_exact(buf)?;
+        self.pos += len;
+        Ok(())
+    }
+
+    /// 移到文件里的 `pos` / Moves to `pos` in the file
+    fn seek_to(&mut self, pos: usize) -> anyhow::Result<()> {
+        let offset = i64::try_from(pos)? - i64::try_from(self.pos)?;
+        self.file.seek_relative(offset)?;
+        self.pos = pos;
+        Ok(())
+    }
+}
+
 fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
     let mut result = 0usize;
     let mut shift = 0;
@@ -952,135 +1296,140 @@ impl GeoSiteManager {
         info!(target = "geosite", requested_tags = ?tags,
              "loading GeoSite data selectively from .dat file");
 
-        // 读取文件内容 / Read file content
-        let content = fs::read(path.as_ref())
+        // 按条目顺序读，不把整个文件读进内存：一次读进 11 MB 的文件，释放以后约有 6 MiB 留在分配器里
+        // 还不回去
+        // Read entry by entry instead of reading the whole file into memory: an 11 MB file read
+        // at once left about 6 MiB in the allocator after it was freed
+        let mut file = DatReader::open(path.as_ref())
             .with_context(|| format!("read .dat file: {}", path.as_ref().display()))?;
-
-        let mut pos = 0;
+        // 一个字段的内容，各字段轮流使用 / One field's content, reused for every field
+        let mut field = Vec::new();
         let mut parsed: ParsedGeoSite = Vec::new();
 
-        while pos < content.len() {
-            if pos >= content.len() {
-                break;
-            }
-
-            let field_tag = content[pos];
-            pos += 1;
-
-            let entry_len = parse_varint(&content, &mut pos)?;
+        while let Some(field_tag) = file.byte()? {
+            let entry_len = file.varint()?;
+            let pos = file.pos;
 
             // 截断的文件同样整份拒绝，理由见 parse_dat_file
             // A truncated file is rejected here too, see parse_dat_file
-            if pos + entry_len > content.len() {
+            if pos + entry_len > file.len {
                 anyhow::bail!(
                     "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
-                    content.len() - pos
+                    file.len - pos
                 );
             }
 
+            let entry_start = pos;
             let entry_end = pos + entry_len;
 
-            // field_tag = 0x0A 表示 GeoSite 条目
-            if field_tag == 0x0A {
-                let mut tag = String::new();
+            // field_tag = 0x0A 表示 GeoSite 条目 / 0x0A is a GeoSite entry
+            if field_tag != 0x0A {
+                file.seek_to(entry_end)?;
+                continue;
+            }
+            let mut tag = String::new();
 
-                // 先解析 tag，判断是否需要加载 / Parse tag first to check if we need to load it
-                let temp_pos = pos;
-                // Clone matching requests out of the map to release the borrow before mutating self
-                let matching_requests: Option<Vec<(String, Option<String>)>> = loop {
-                    if pos >= entry_end {
-                        break None;
-                    }
-                    let inner_tag = content[pos];
-                    pos += 1;
-                    let inner_len = parse_varint(&content, &mut pos)?;
-                    if pos + inner_len > entry_end {
-                        break None;
-                    }
-                    // 0x0A: tag/country_code (string, field 1)
-                    if inner_tag == 0x0A {
-                        if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len]) {
-                            tag = tag_str.to_string();
-                            let tag_lower = tag.to_lowercase();
-                            // Match against base tags (supports `@attr` split)
-                            if let Some(reqs) = tag_requests.get(&tag_lower) {
-                                debug!(target = "geosite", tag = %tag_str,
-                                      "loading requested tag");
-                                break Some(reqs.clone());
-                            } else {
-                                debug!(target = "geosite", tag = %tag_str,
-                                       "skipping unwanted tag");
-                            }
-                        }
-                        break None;
-                    }
-                    pos += inner_len;
-                };
-
-                if let Some(requests) = matching_requests {
-                    // 重新解析整个条目，提取 domains + attributes
-                    pos = temp_pos;
-                    let mut all_domains: Vec<(DomainMatcher, Vec<String>)> = Vec::new();
-
-                    while pos < entry_end {
-                        let inner_tag = content[pos];
-                        pos += 1;
-                        let inner_len = parse_varint(&content, &mut pos)?;
-                        if pos + inner_len > entry_end {
-                            break;
-                        }
-                        match inner_tag {
-                            0x0A => {
-                                pos += inner_len;
-                            }
-                            0x12 => {
-                                let domains_data = &content[pos..pos + inner_len];
-                                match Self::parse_v2ray_domains(domains_data) {
-                                    Ok(parsed) => {
-                                        all_domains.extend(parsed);
-                                    }
-                                    Err(err) => {
-                                        warn!(target = "geosite", tag = %tag, error = %err,
-                                             "failed to parse V2Ray domains, skipping domain entry");
-                                    }
-                                }
-                                pos += inner_len;
-                            }
-                            _ => {
-                                pos += inner_len;
-                            }
-                        }
-                    }
-
-                    // For each request, apply attribute filter and store under original tag
-                    for (store_tag, attr_filter) in &requests {
-                        let matchers: Vec<DomainMatcher> = all_domains
-                            .iter()
-                            .filter(|(_, attrs)| match attr_filter {
-                                None => true,
-                                Some(f) => attr_filter_matches(attrs, f),
-                            })
-                            .cloned()
-                            .map(|(m, _)| m)
-                            .collect();
-
-                        if !matchers.is_empty() {
-                            info!(target = "geosite", tag = %store_tag,
-                                  domain_count = matchers.len(),
-                                  attr_filter = ?attr_filter,
-                                  "loaded GeoSite tag with domains");
-                            parsed.push((store_tag.clone(), TagMatchers::new(matchers)));
-                        } else {
-                            warn!(target = "geosite", tag = %store_tag,
-                                  attr_filter = ?attr_filter,
-                                  "no domains matched attribute filter");
-                        }
-                    }
-                } else {
-                    pos = entry_end;
+            // 先解析 tag，判断是否需要加载 / Parse tag first to check if we need to load it
+            // Clone matching requests out of the map to release the borrow before mutating self
+            let matching_requests: Option<Vec<(String, Option<String>)>> = loop {
+                if file.pos >= entry_end {
+                    break None;
                 }
-            } else {
-                pos = entry_end;
+                let inner_tag = file.next_byte()?;
+                let inner_len = file.varint()?;
+                if file.pos + inner_len > entry_end {
+                    break None;
+                }
+                // 0x0A: tag/country_code (string, field 1)
+                if inner_tag == 0x0A {
+                    file.read(&mut field, inner_len)?;
+                    if let Ok(tag_str) = std::str::from_utf8(&field) {
+                        tag = tag_str.to_string();
+                        let tag_lower = tag.to_lowercase();
+                        // Match against base tags (supports `@attr` split)
+                        if let Some(reqs) = tag_requests.get(&tag_lower) {
+                            debug!(target = "geosite", tag = %tag_str,
+                                  "loading requested tag");
+                            break Some(reqs.clone());
+                        } else {
+                            debug!(target = "geosite", tag = %tag_str,
+                                   "skipping unwanted tag");
+                        }
+                    }
+                    break None;
+                }
+                file.seek_to(file.pos + inner_len)?;
+            };
+
+            let Some(requests) = matching_requests else {
+                file.seek_to(entry_end)?;
+                continue;
+            };
+
+            // 先数一遍要存的名字，builder 一次分配到位（见 `count_names`）
+            // Count the names to store first, so each builder is allocated once (see `count_names`)
+            file.seek_to(entry_start)?;
+            let (full, suffixes) = Self::count_names(&mut file, &mut field, entry_end)?;
+
+            // 再读一遍，每读出一条就交给各个请求的 builder，不先收齐整个 tag（见 `TagBuilder`）
+            // Read again, handing each entry to every request's builder as it is read rather
+            // than collecting the whole tag first (see `TagBuilder`)
+            file.seek_to(entry_start)?;
+            let mut builders: Vec<(TagBuilder, usize)> = requests
+                .iter()
+                .map(|_| (TagBuilder::with_capacity(full, suffixes), 0))
+                .collect();
+
+            while file.pos < entry_end {
+                let inner_tag = file.next_byte()?;
+                let inner_len = file.varint()?;
+                if file.pos + inner_len > entry_end {
+                    break;
+                }
+                if inner_tag != 0x12 {
+                    file.seek_to(file.pos + inner_len)?;
+                    continue;
+                }
+                file.read(&mut field, inner_len)?;
+                match Self::parse_v2ray_domains(&field) {
+                    Ok(domains) => {
+                        for (matcher, attrs) in domains {
+                            for ((builder, count), (_, attr_filter)) in
+                                builders.iter_mut().zip(&requests)
+                            {
+                                if attr_filter
+                                    .as_deref()
+                                    .is_none_or(|f| attr_filter_matches(&attrs, f))
+                                {
+                                    builder.add(matcher.clone());
+                                    *count += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(target = "geosite", tag = %tag, error = %err,
+                             "failed to parse V2Ray domains, skipping domain entry");
+                    }
+                }
+            }
+            file.seek_to(entry_end)?;
+
+            // Store each request's tag under its original name
+            // 每个请求的 tag 按原来的名字存放
+            for ((builder, count), (store_tag, attr_filter)) in builders.into_iter().zip(&requests)
+            {
+                if count > 0 {
+                    info!(target = "geosite", tag = %store_tag,
+                          domain_count = count,
+                          attr_filter = ?attr_filter,
+                          "loaded GeoSite tag with domains");
+                    parsed.push((store_tag.clone(), builder.finish()));
+                } else {
+                    warn!(target = "geosite", tag = %store_tag,
+                          attr_filter = ?attr_filter,
+                          "no domains matched attribute filter");
+                }
             }
         }
 
@@ -1127,11 +1476,7 @@ impl GeoSiteManager {
                 dat_format::TYPE_FULL => DomainMatcher::Full(domain),
                 dat_format::TYPE_SUBDOMAIN => DomainMatcher::Suffix(domain),
                 dat_format::TYPE_KEYWORD => DomainMatcher::Keyword(domain),
-                dat_format::TYPE_REGEX => match RegexBuilder::new(&domain)
-                    .size_limit(1_000_000) // 1MB state space limit
-                    .dfa_size_limit(1_000_000) // 1MB DFA limit
-                    .build()
-                {
+                dat_format::TYPE_REGEX => match compile_geosite_regex(&domain) {
                     Ok(re) => DomainMatcher::Regex(re),
                     Err(err) => {
                         warn!(target = "geosite", pattern = %domain, error = %err,
@@ -1166,6 +1511,73 @@ impl GeoSiteManager {
     /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
     /// Returns (DomainMatcher, attribute_keys) pairs — attribute keys enable `@attr` filtering
     #[allow(clippy::regex_creation_in_loops)]
+    /// 一个 GeoSite 条目里（从 `file` 当前位置到 `entry_end`）完整域名和后缀各有几条、共多长，好一次
+    /// 分配到位；只读类型和值的长度，属性筛选不计，所以带 `@` 的 tag 只会多留一些容量（见
+    /// [`TagBuilder::finish`]）
+    /// How many full names and suffixes one GeoSite entry (from `file`'s position to `entry_end`)
+    /// holds, and their total length, so the builder is allocated once; only types and value
+    /// lengths are read and attribute filters are not applied, so a tag with `@` merely reserves
+    /// some extra room (see [`TagBuilder::finish`])
+    fn count_names(
+        file: &mut DatReader,
+        field: &mut Vec<u8>,
+        entry_end: usize,
+    ) -> anyhow::Result<((usize, usize), (usize, usize))> {
+        let (mut full, mut suffixes) = ((0, 0), (0, 0));
+        while file.pos < entry_end {
+            let inner_tag = file.next_byte()?;
+            let inner_len = file.varint()?;
+            if file.pos + inner_len > entry_end {
+                break;
+            }
+            if inner_tag != 0x12 {
+                file.seek_to(file.pos + inner_len)?;
+                continue;
+            }
+            file.read(field, inner_len)?;
+            match Self::domain_type_and_len(field) {
+                // 和 `parse_v2ray_domains` 一样：2 是后缀，3 和不认识的类型按完整域名
+                // As in `parse_v2ray_domains`: 2 is a suffix, 3 and unknown types are full names
+                Some((2, len)) => (suffixes.0, suffixes.1) = (suffixes.0 + 1, suffixes.1 + len),
+                Some((kind, len)) if kind >= 3 => (full.0, full.1) = (full.0 + 1, full.1 + len),
+                _ => {}
+            }
+        }
+        Ok((full, suffixes))
+    }
+
+    /// 一条 Domain 消息的类型和值的长度，读法和 [`Self::parse_v2ray_domains`] 一样，但不取出值
+    /// One Domain message's type and value length, read as [`Self::parse_v2ray_domains`] reads
+    /// them but without taking the value
+    fn domain_type_and_len(data: &[u8]) -> Option<(usize, usize)> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let (field, wire_type) = (data[pos] >> 3, data[pos] & 0x07);
+            pos += 1;
+            match (field, wire_type) {
+                (1, 0) => {
+                    let kind = parse_varint(data, &mut pos).ok()?;
+                    if data.get(pos)? >> 3 != 2 {
+                        return None;
+                    }
+                    pos += 1;
+                    return Some((kind, parse_varint(data, &mut pos).ok()?));
+                }
+                (_, 0) => {
+                    parse_varint(data, &mut pos).ok()?;
+                }
+                (_, 1) => pos += 8,
+                (_, 5) => pos += 4,
+                (_, 2) => {
+                    let len = parse_varint(data, &mut pos).ok()?;
+                    pos += len;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
         let mut results = Vec::new();
         let mut pos = 0;
@@ -1214,16 +1626,16 @@ impl GeoSiteManager {
                         0 => DomainMatcher::Keyword(domain_value), // Plain
                         1 => {
                             // Regex
-                            match RegexBuilder::new(&domain_value)
-                                .size_limit(1_000_000)
-                                .dfa_size_limit(1_000_000)
-                                .build()
-                            {
+                            match compile_geosite_regex(&domain_value) {
                                 Ok(re) => DomainMatcher::Regex(re),
                                 Err(err) => {
                                     warn!(target = "geosite", pattern = %domain_value, error = %err,
                                          "invalid regex pattern, using empty regex");
-                                    DomainMatcher::Regex(Regex::new(r"^$").unwrap())
+                                    // 只匹配空名字的正则，编译一次，之后每次只是克隆
+                                    // A regex matching only the empty name, compiled once and cloned after
+                                    static EMPTY: LazyLock<Regex> =
+                                        LazyLock::new(|| Regex::new(r"^$").unwrap());
+                                    DomainMatcher::Regex(EMPTY.clone())
                                 }
                             }
                         }
@@ -1401,10 +1813,7 @@ impl GeoSiteManager {
             return None;
         }
         let build_regex = |pattern: &str| {
-            RegexBuilder::new(pattern)
-                .size_limit(1_000_000)
-                .dfa_size_limit(1_000_000)
-                .build()
+            compile_geosite_regex(pattern)
                 .ok()
                 .map(DomainMatcher::Regex)
         };
@@ -2423,6 +2832,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// GeoSite 正则里的 `\w`、`\d`、`\s`、`\b` 按 Go（v2ray）的 ASCII 含义改写，字符类里外各有写法，别的转义
+    /// 和转义的反斜杠不动
+    /// `\w`, `\d`, `\s` and `\b` in GeoSite regexes take their Go (v2ray) ASCII meaning, written
+    /// one way outside a class and another inside, while other escapes and escaped backslashes
+    /// stay
+    #[test]
+    fn geosite_regex_classes_are_rewritten_the_go_way() {
+        for (pattern, rewritten) in [
+            (r"cdn\d-x", r"cdn[0-9]-x"),
+            (r"^\w{5}\.com$", r"^[0-9A-Za-z_]{5}\.com$"),
+            (r"a\Sb\Dc\Wd", r"a[^\t\n\f\r ]b[^0-9]c[^0-9A-Za-z_]d"),
+            (r"[\w-]+", r"[0-9A-Za-z_-]+"),
+            (r"[^\d.]", r"[^0-9.]"),
+            (r"[a\W]", r"[a[^0-9A-Za-z_]]"),
+            (r"[]\d]", r"[]0-9]"),
+            (r"[[:alpha:]\d]x\d", r"[[:alpha:]0-9]x[0-9]"),
+            (r"\bfoo\B", r"(?-u:\b)foo(?-u:\B)"),
+            (r"\\d", r"\\d"),
+            (r"\p{L}\.\[\d\]", r"\p{L}\.\[[0-9]\]"),
+        ] {
+            assert_eq!(go_classes(pattern), rewritten, "{pattern}");
+        }
+        assert!(matches!(
+            go_classes(r"plain\.com$"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+
+        // 只含 ASCII 的名字结果和按 Unicode 编译时相同，`\w` 不认非 ASCII 字母，和 v2ray 一样
+        // Names of ASCII alone match as compiled for Unicode, and `\w` takes no non-ASCII letter,
+        // as in v2ray
+        let word = r"^r+[0-9]+(---|\.)sn-(2x3|ni5|j5o)\w{5}\.googlevideo\.com$";
+        let go = compile_geosite_regex(word).unwrap();
+        let unicode = Regex::new(word).unwrap();
+        for name in [
+            "r1---sn-2x3abcde.googlevideo.com",
+            "rr22.sn-ni5x_y9z.googlevideo.com",
+            "r1---sn-2x3abcd.googlevideo.com",
+        ] {
+            assert_eq!(go.is_match(name), unicode.is_match(name), "{name}");
+        }
+        assert!(!go.is_match("r1---sn-2x3abcdé.googlevideo.com"));
+        assert!(unicode.is_match("r1---sn-2x3abcdé.googlevideo.com"));
+        assert!(compile_geosite_regex("(unclosed").is_err());
+    }
+
+    /// 名字集合按小写存一份：大小写不同的同一个名字只存一次，重复加入什么都不变；查找时调用方
+    /// 已经转成小写
+    /// A name set keeps one lowercase copy: the same name in another case is stored once, adding
+    /// it again changes nothing, and lookups come lowercased from the caller
+    #[test]
+    fn a_name_set_keeps_each_lowercase_name_once() {
+        let mut set = NameSet::with_capacity(3, 31);
+        assert!(set.insert("Example.COM"));
+        assert!(set.insert("example.com"));
+        assert!(set.insert("other.test"));
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("example.com"));
+        assert!(set.contains("other.test"));
+        assert!(!set.contains("Example.COM"));
+        assert!(!set.contains("example.co"));
+        assert!(!set.contains("xample.com"));
+        let mut names = set.iter().collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["example.com", "other.test"]);
+    }
+
+    /// 长度两个字节记不下的值放不进名字集合，就按原样逐条比较，命中与否不变
+    /// A value whose length two bytes cannot hold does not go into a name set and is tried as
+    /// it is, matching just the same
+    #[test]
+    fn a_value_too_long_for_a_name_set_still_matches_as_written() {
+        let long = format!("{}.test", "a".repeat(70_000));
+        let indexed = TagMatchers::new(vec![
+            DomainMatcher::Full(long.to_ascii_uppercase()),
+            DomainMatcher::Suffix(format!("x.{long}")),
+        ]);
+        assert!(indexed.full.is_empty() && indexed.suffixes.is_empty());
+        assert!(indexed.matches(&long));
+        assert!(indexed.matches(&format!("www.x.{long}")));
+        assert!(!indexed.matches(&format!("y.{long}")));
+        assert!(!indexed.matches("a.test"));
     }
 
     /// 后缀条目按整段命中，开头的点不计，大小写不计；完整域名只命中它自己

@@ -1144,6 +1144,7 @@ dependencies = [
  "ctor",
  "dashmap",
  "futures",
+ "hashbrown 0.17.1",
  "hickory-proto",
  "http-body-util",
  "hyper",
