@@ -23,6 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter",
 notify = "6"
 clap = { version = "4.5", features = ["derive"] }
 dashmap = "6"
+hashbrown = { version = "0.17", default-features = false }
 ipnet = "2"
 anyhow = "1"
 bytes = "1"
