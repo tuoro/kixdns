@@ -356,22 +356,34 @@ pub struct TagMatchers {
     others: Vec<DomainMatcher>,
 }
 
-/// 一个 tag 的正则条目。多条合成一个 [`RegexSet`]，一遍扫描就知道有没有哪条命中：
-/// `geolocation-!cn` 这样带上百条正则的 tag，逐条比较要几微秒，合起来不到一微秒。
+/// 一个 tag 的正则条目。每 [`Regexes::SET_SIZE`] 条合成一个 [`RegexSet`]，一遍扫描就知道一组里
+/// 有没有哪条命中：`geolocation-!cn` 这样带上百条正则的 tag，逐条比较要几微秒，合起来不到一微秒。
 /// 合不成（超出大小上限）时退回逐条比较。
-/// One tag's regex entries. Several are combined into one [`RegexSet`], so a single scan
-/// tells whether any of them matches: a tag like `geolocation-!cn` with over a hundred
-/// regexes takes microseconds one by one and well under one combined. When they cannot
-/// be combined (over the size limit) they are tried one by one instead.
+/// One tag's regex entries. Every [`Regexes::SET_SIZE`] of them combine into one [`RegexSet`], so
+/// a single scan tells whether any in that group matches: a tag like `geolocation-!cn` with over a
+/// hundred regexes takes microseconds one by one and well under one combined. When they cannot be
+/// combined (over the size limit) they are tried one by one instead.
 #[derive(Debug, Default)]
 enum Regexes {
     #[default]
     None,
-    Set(RegexSet),
+    Sets(Vec<RegexSet>),
     Each(Vec<Regex>),
 }
 
 impl Regexes {
+    /// 一个集合最多合这么多条。集合在匹配时边走边建状态，存在一块有上限的缓存里；条数多了状态装不下，
+    /// 缓存一次次清空以后就退回慢上千倍的做法。拦截列表里常见的通配符正则，一千多条合成一个集合时，
+    /// 每个没命中的名字要比 2 毫秒左右（1500 条时单核每秒只答得了四百多个查询）；分成每组 256 条，
+    /// 和只有七百条时一样快。
+    /// The most regexes one set combines. A set builds its states while matching and keeps them in
+    /// a cache of bounded size; with too many regexes the states do not fit, and once the cache has
+    /// been cleared over and over matching falls back to a way a thousand times slower. Over a
+    /// thousand of the wildcard regexes common in blocklists, combined into one set, took about two
+    /// milliseconds for every name none of them matched (with 1500 one core answered some four
+    /// hundred queries a second); in groups of 256 they match as fast as seven hundred did.
+    const SET_SIZE: usize = 256;
+
     /// 每条正则编译后的大小上限；合成的集合是它乘以条数，合起来不会比逐条编译时更宽
     /// The compiled size limit of each regex; a combined set gets it times the number of
     /// regexes, so combining allows no more than compiling them one by one
@@ -385,8 +397,8 @@ impl Regexes {
             .build()
     }
 
-    /// 由各条正则的写法建成：多条合成一个集合，只编译这一次
-    /// Built from the regexes' patterns: several combine into one set, compiled this once
+    /// 由各条正则的写法建成：多条分组合成集合，只编译这一次
+    /// Built from the regexes' patterns: several combine into sets, compiled this once
     fn new(patterns: Vec<String>) -> Self {
         Self::with_size_limit(patterns, Self::SIZE_LIMIT_EACH)
     }
@@ -398,11 +410,16 @@ impl Regexes {
         match patterns.len() {
             0 => Self::None,
             1 => Self::Each(Self::compile_each(&patterns)),
-            count => match RegexSetBuilder::new(&patterns)
-                .size_limit(limit_each.saturating_mul(count))
-                .build()
+            count => match patterns
+                .chunks(Self::SET_SIZE)
+                .map(|group| {
+                    RegexSetBuilder::new(group)
+                        .size_limit(limit_each.saturating_mul(group.len()))
+                        .build()
+                })
+                .collect()
             {
-                Ok(set) => Self::Set(set),
+                Ok(sets) => Self::Sets(sets),
                 Err(err) => {
                     warn!(target = "geosite", regexes = count, error = %err,
                         "GeoSite regexes too large to combine, matching them one by one");
@@ -430,7 +447,7 @@ impl Regexes {
     fn is_match(&self, domain: &str) -> bool {
         match self {
             Self::None => false,
-            Self::Set(set) => set.is_match(domain),
+            Self::Sets(sets) => sets.iter().any(|set| set.is_match(domain)),
             Self::Each(each) => each.iter().any(|regex| regex.is_match(domain)),
         }
     }
@@ -438,7 +455,7 @@ impl Regexes {
     fn len(&self) -> usize {
         match self {
             Self::None => 0,
-            Self::Set(set) => set.len(),
+            Self::Sets(sets) => sets.iter().map(RegexSet::len).sum(),
             Self::Each(each) => each.len(),
         }
     }
@@ -449,9 +466,9 @@ impl Regexes {
             Self::None => Vec::new(),
             // 集合里的每一条单独编译时都没超过上限，这里照样编译得出来
             // Every pattern in a set compiled within the limit on its own, so it compiles here again
-            Self::Set(set) => set
-                .patterns()
+            Self::Sets(sets) => sets
                 .iter()
+                .flat_map(RegexSet::patterns)
                 .filter_map(|pattern| Self::compile(pattern).ok())
                 .collect(),
             Self::Each(each) => each.clone(),
@@ -1991,7 +2008,7 @@ mod tests {
 
         let parsed = GeoSiteManager::parse_dat_file_selective(&path, &["r".to_string()]).unwrap();
         let (_, tag) = &parsed[0];
-        assert!(matches!(tag.regexes, Regexes::Set(_)));
+        assert!(matches!(tag.regexes, Regexes::Sets(_)));
         assert!(tag.matches("cdn7.example.com"));
         assert!(tag.matches("a.test"));
         assert!(tag.matches(""));
@@ -2849,7 +2866,7 @@ mod tests {
         let written = || patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         let combined = Regexes::new(written());
         assert!(
-            matches!(combined, Regexes::Set(_)),
+            matches!(&combined, Regexes::Sets(sets) if sets.len() == 1),
             "several regexes combine into one set"
         );
         let separate = Regexes::with_size_limit(written(), 1);
@@ -2884,5 +2901,29 @@ mod tests {
             .map(|regex| regex.as_str().to_owned())
             .collect();
         assert_eq!(listed, patterns);
+    }
+
+    /// 正则多于一组时分成几个集合，命中与否和逐条比较完全一样；分组前后的条目都能命中
+    /// More regexes than one group holds split into several sets and match exactly as they do one
+    /// by one; entries before and after a group boundary all match
+    #[test]
+    fn many_regexes_split_into_groups_and_match_as_each_one_does() {
+        let count = Regexes::SET_SIZE * 2 + 1;
+        let patterns: Vec<String> = (0..count)
+            .map(|i| format!(r"^(?:.*\.)?ad{i}x\.example\.com$"))
+            .collect();
+        let regexes = Regexes::new(patterns);
+        assert!(
+            matches!(&regexes, Regexes::Sets(sets) if sets.len() == 3),
+            "{count} regexes make three groups"
+        );
+        assert_eq!(regexes.len(), count);
+        assert_eq!(regexes.to_regexes().len(), count);
+        // 每个名字只有一条正则命中，所以每一组都得问到 / Each name matches one regex only, so
+        // every group must be asked
+        for i in [0, Regexes::SET_SIZE - 1, Regexes::SET_SIZE, count - 1] {
+            assert!(regexes.is_match(&format!("cdn.ad{i}x.example.com")), "{i}");
+        }
+        assert!(!regexes.is_match(&format!("cdn.ad{count}x.example.com")));
     }
 }
