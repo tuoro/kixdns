@@ -235,8 +235,15 @@ impl UdpClient {
                                     buf[0] = orig_bytes[0];
                                     buf[1] = orig_bytes[1];
 
-                                    // 零拷贝优化：使用 split_to 复用已有容量，避免分配新内存
-                                    let response = buf.split_to(len).freeze();
+                                    // 拷出一份正好大小的应答，缓冲区留着下次接着收。以前切下缓冲区的一段交出去
+                                    // （split_to），应答就一直挂在 4 KiB 的缓冲区上：缓存里每条应答平均占着
+                                    // 148 字节，缓冲区也要不停重新分配。TCP 和 DoT 的读取同样处理。
+                                    // Copy out an answer of exactly its size and keep the buffer for the
+                                    // next read. Handing out a slice of the buffer (split_to) kept each
+                                    // answer on a 4 KiB buffer: every cached answer held 148 bytes of one
+                                    // on average, and the buffer kept being reallocated. The TCP and DoT
+                                    // readers do the same.
+                                    let response = Bytes::copy_from_slice(&buf[..len]);
                                     let resp_len = response.len();
 
                                     if tx.send(Ok(response)).is_err() {
@@ -784,8 +791,9 @@ impl TcpMuxClient {
                 if let Some((_, p)) = pending.remove(&resp_id) {
                     let orig = p.original_id;
                     reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
-                    // Split off the used portion to send, keeping capacity for reuse
-                    let response = reusable_buf.split_to(resp_len).freeze();
+                    // Copy it out and keep the buffer, as the UDP reader does
+                    // 拷出一份、缓冲区留着，和 UDP 的读取一样
+                    let response = Bytes::copy_from_slice(&reusable_buf[..resp_len]);
                     match p.tx.send(Ok(response)) {
                         Ok(()) => {
                             tracing::trace!(
@@ -1987,7 +1995,9 @@ impl DotMuxClient {
                 if let Some((_, p)) = pending.remove(&resp_id) {
                     let orig = p.original_id;
                     reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
-                    let response = reusable_buf.split_to(resp_len).freeze();
+                    // Copy it out and keep the buffer, as the UDP reader does
+                    // 拷出一份、缓冲区留着，和 UDP 的读取一样
+                    let response = Bytes::copy_from_slice(&reusable_buf[..resp_len]);
                     let _ = p.tx.send(Ok(response));
                     tracing::trace!(
                         target = "dot_mux",
