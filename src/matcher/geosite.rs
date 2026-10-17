@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -33,17 +33,38 @@ use crate::lock::RwLock;
 /// ASCII alone match the same either way; names with other characters match as v2ray reads the
 /// pattern.
 fn compile_geosite_regex(pattern: &str) -> Result<Regex, regex::Error> {
-    let build = |pattern: &str| {
-        RegexBuilder::new(pattern)
-            .size_limit(1_000_000)
-            .dfa_size_limit(1_000_000)
-            .build()
-    };
-    match go_classes(pattern) {
-        std::borrow::Cow::Owned(rewritten) => build(&rewritten).or_else(|_| build(pattern)),
-        std::borrow::Cow::Borrowed(pattern) => build(pattern),
-    }
+    // 原样的写法也不对时，按原样编译拿到正则自己的报错 / When the pattern as written is wrong too,
+    // compiling it as written gives the regex's own error
+    Regexes::compile(&geosite_regex_pattern(pattern).unwrap_or_else(|_| pattern.to_owned()))
 }
+
+/// 一条 GeoSite 正则实际要编译的写法：按 Go 的含义改写过字符类的（见 [`go_classes`]），改写后语法不对（不该发生）
+/// 就用原样，原样也不对时返回语法错误。只检查语法、不编译：数据文件里一个 tag 的正则读完以后合成一个集合，只编译
+/// 这一次（见 [`Regexes::new`]）；以前每条先单独编译一次，`geolocation-!cn` 的 151 条因此多占好几 MiB。
+/// The pattern a GeoSite regex actually compiles as: with its classes rewritten the Go way (see
+/// [`go_classes`]), as written when the rewrite does not parse (it should not happen), and a
+/// syntax error when that does not parse either. Only the syntax is checked, nothing compiles:
+/// a data file's regexes for one tag are combined into one set once read, which is the only
+/// compile (see [`Regexes::new`]); compiling each one first as well cost several MiB for the
+/// 151 regexes of `geolocation-!cn`.
+fn geosite_regex_pattern(pattern: &str) -> Result<String, Box<regex_syntax::Error>> {
+    let check = |pattern: &str| {
+        regex_syntax::Parser::new()
+            .parse(pattern)
+            .map(drop)
+            .map_err(Box::new)
+    };
+    if let std::borrow::Cow::Owned(rewritten) = go_classes(pattern)
+        && check(&rewritten).is_ok()
+    {
+        return Ok(rewritten);
+    }
+    check(pattern).map(|()| pattern.to_owned())
+}
+
+/// 只匹配空名字的正则，写错的正则用它顶替 / A regex matching only the empty name, standing in for
+/// one written wrong
+const EMPTY_NAME: &str = "^$";
 
 /// `pattern` 里的 `\w`、`\d`、`\s`、`\b` 及其大写的取反形式改成 Go 正则的 ASCII 含义：字符类外写成一个字符类
 /// （`\b` 写成 `(?-u:\b)`），字符类里展开成范围（取反的写成嵌套的字符类）。转义的反斜杠和别的转义原样保留。
@@ -355,20 +376,33 @@ enum Regexes {
 }
 
 impl Regexes {
-    /// 合成的正则集合编译后的大小上限：每条正则解析时的上限乘以条数，合起来不会比逐条编译时更宽
-    /// The compiled size limit of a combined set: the per-regex limit used while parsing
-    /// times the number of regexes, so combining allows no more than compiling them one by one
+    /// 每条正则编译后的大小上限；合成的集合是它乘以条数，合起来不会比逐条编译时更宽
+    /// The compiled size limit of each regex; a combined set gets it times the number of
+    /// regexes, so combining allows no more than compiling them one by one
     const SIZE_LIMIT_EACH: usize = 1_000_000;
 
-    fn new(each: Vec<Regex>) -> Self {
-        Self::with_size_limit(each, Self::SIZE_LIMIT_EACH)
+    /// 编译一条正则，用每条的上限 / Compiles one regex within the per-regex limit
+    fn compile(pattern: &str) -> Result<Regex, regex::Error> {
+        RegexBuilder::new(pattern)
+            .size_limit(Self::SIZE_LIMIT_EACH)
+            .dfa_size_limit(Self::SIZE_LIMIT_EACH)
+            .build()
     }
 
-    fn with_size_limit(each: Vec<Regex>, limit_each: usize) -> Self {
-        match each.len() {
+    /// 由各条正则的写法建成：多条合成一个集合，只编译这一次
+    /// Built from the regexes' patterns: several combine into one set, compiled this once
+    fn new(patterns: Vec<String>) -> Self {
+        Self::with_size_limit(patterns, Self::SIZE_LIMIT_EACH)
+    }
+
+    /// 同上，集合的上限按每条 `limit_each` 计（测试用来逼出合不成的情形）
+    /// The same with the set's limit counted as `limit_each` per regex (tests use it to force a
+    /// set that cannot combine)
+    fn with_size_limit(patterns: Vec<String>, limit_each: usize) -> Self {
+        match patterns.len() {
             0 => Self::None,
-            1 => Self::Each(each),
-            count => match RegexSetBuilder::new(each.iter().map(Regex::as_str))
+            1 => Self::Each(Self::compile_each(&patterns)),
+            count => match RegexSetBuilder::new(&patterns)
                 .size_limit(limit_each.saturating_mul(count))
                 .build()
             {
@@ -376,10 +410,25 @@ impl Regexes {
                 Err(err) => {
                     warn!(target = "geosite", regexes = count, error = %err,
                         "GeoSite regexes too large to combine, matching them one by one");
-                    Self::Each(each)
+                    Self::Each(Self::compile_each(&patterns))
                 }
             },
         }
+    }
+
+    /// 逐条编译；编译不了的（超出上限）照旧只匹配空名字 / Compiles one by one; one that does not
+    /// compile (over the limit) matches only the empty name, as before
+    fn compile_each(patterns: &[String]) -> Vec<Regex> {
+        patterns
+            .iter()
+            .map(|pattern| {
+                Self::compile(pattern).unwrap_or_else(|err| {
+                    warn!(target = "geosite", pattern = %pattern, error = %err,
+                         "invalid regex pattern, using empty regex");
+                    Regex::new(EMPTY_NAME).expect("a valid regex")
+                })
+            })
+            .collect()
     }
 
     fn is_match(&self, domain: &str) -> bool {
@@ -407,12 +456,7 @@ impl Regexes {
             Self::Set(set) => set
                 .patterns()
                 .iter()
-                .filter_map(|pattern| {
-                    RegexBuilder::new(pattern)
-                        .size_limit(Self::SIZE_LIMIT_EACH)
-                        .build()
-                        .ok()
-                })
+                .filter_map(|pattern| Self::compile(pattern).ok())
                 .collect(),
             Self::Each(each) => each.clone(),
         }
@@ -429,7 +473,8 @@ impl Regexes {
 #[derive(Default)]
 struct TagBuilder {
     tag: TagMatchers,
-    regexes: Vec<Regex>,
+    /// 正则的写法，到 `finish` 才合成编译 / The regexes' patterns, combined and compiled in `finish`
+    regexes: Vec<String>,
 }
 
 impl TagBuilder {
@@ -473,8 +518,23 @@ impl TagBuilder {
                     tag.others.push(matcher);
                 }
             }
-            DomainMatcher::Regex(regex) => self.regexes.push(regex.clone()),
+            DomainMatcher::Regex(regex) => self.regexes.push(regex.as_str().to_owned()),
             DomainMatcher::Keyword(_) => tag.others.push(matcher),
+        }
+    }
+
+    /// 加入数据文件里读出的一条 / Adds one entry read from a data file
+    fn add_entry(&mut self, entry: DatEntry) {
+        match entry {
+            DatEntry::Matcher(matcher) => self.add(matcher),
+            DatEntry::Regex(pattern) => {
+                let pattern = geosite_regex_pattern(&pattern).unwrap_or_else(|err| {
+                    warn!(target = "geosite", pattern = %pattern, error = %err,
+                         "invalid regex pattern, using empty regex");
+                    EMPTY_NAME.to_owned()
+                });
+                self.regexes.push(pattern);
+            }
         }
     }
 
@@ -744,6 +804,15 @@ fn attr_filter_matches(attrs: &[String], filter: &str) -> bool {
     attrs.iter().any(|a| a.eq_ignore_ascii_case(filter))
 }
 
+/// 数据文件里读出的一条。正则只留写法，等整个 tag 读完合成一个集合时才编译（见 [`Regexes::new`]）
+/// One entry read from a data file. A regex keeps only its pattern, compiled when the whole tag
+/// is read and combined into one set (see [`Regexes::new`])
+#[derive(Clone)]
+enum DatEntry {
+    Matcher(DomainMatcher),
+    Regex(String),
+}
+
 /// 一条 V2Ray Domain 消息里用到的字段（见 [`GeoSiteManager::read_domain`]）
 /// The fields of a V2Ray Domain message used here (see [`GeoSiteManager::read_domain`])
 struct V2rayDomain<'a> {
@@ -986,7 +1055,8 @@ impl GeoSiteManager {
             // field_tag = 0x0A indicates GeoSite entry (field 1, wire type 2: string)
             if field_tag == 0x0A {
                 let mut tag = String::new();
-                let mut matchers: Vec<DomainMatcher> = Vec::new();
+                // 这个条目的匹配器和条数 / This entry's matchers and how many
+                let (mut builder, mut domain_count) = (TagBuilder::default(), 0);
 
                 // 解析 GeoSite 条目内容 / Parse GeoSite entry content
                 while pos < entry_end {
@@ -1019,7 +1089,10 @@ impl GeoSiteManager {
                             match Self::parse_v2ray_domains(domains_data) {
                                 Ok(parsed) => {
                                     let count = parsed.len();
-                                    matchers.extend(parsed.into_iter().map(|(m, _)| m));
+                                    for (entry, _) in parsed {
+                                        builder.add_entry(entry);
+                                    }
+                                    domain_count += count;
                                     tracing::debug!(target = "geosite", tag = %tag,
                                                  count = count,
                                                  "parsed domains from V2Ray protobuf format");
@@ -1039,15 +1112,15 @@ impl GeoSiteManager {
                 }
 
                 // 使用解析好的 matchers / Use parsed matchers
-                if !tag.is_empty() && !matchers.is_empty() {
-                    tracing::info!(target = "geosite", tag = %tag, 
-                                domain_count = matchers.len(),
+                if !tag.is_empty() && domain_count > 0 {
+                    tracing::info!(target = "geosite", tag = %tag,
+                                domain_count = domain_count,
                                 "loaded GeoSite tag with domains");
                     // 将 tag 转换为小写以支持大小写不敏感的匹配 / Convert tag to lowercase for case-insensitive matching
                     let tag_lower = tag.to_lowercase();
                     tracing::debug!(target = "geosite", original_tag = %tag, tag_lower = %tag_lower,
                                  "inserting tag into database");
-                    parsed.push((tag_lower, TagMatchers::new(matchers)));
+                    parsed.push((tag_lower, builder.finish()));
                 } else if !tag.is_empty() {
                     tracing::warn!(target = "geosite", tag = %tag,
                                   "tag has no valid domains, skipping");
@@ -1404,7 +1477,7 @@ impl GeoSiteManager {
                 file.read(&mut field, inner_len)?;
                 match Self::parse_v2ray_domains(&field) {
                     Ok(domains) => {
-                        for (matcher, attrs) in domains {
+                        for (entry, attrs) in domains {
                             for ((builder, count), (_, attr_filter)) in
                                 builders.iter_mut().zip(&requests)
                             {
@@ -1412,7 +1485,7 @@ impl GeoSiteManager {
                                     .as_deref()
                                     .is_none_or(|f| attr_filter_matches(&attrs, f))
                                 {
-                                    builder.add(matcher.clone());
+                                    builder.add_entry(entry.clone());
                                     *count += 1;
                                 }
                             }
@@ -1657,7 +1730,7 @@ impl GeoSiteManager {
         Ok(domain)
     }
 
-    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
+    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DatEntry, Vec<String>)>> {
         tracing::debug!(
             target = "geosite",
             data_len = data.len(),
@@ -1671,38 +1744,24 @@ impl GeoSiteManager {
         let domain_value = String::from_utf8_lossy(value).into_owned();
 
         // 根据 V2Ray Domain.Type 创建匹配器 / Create matcher based on V2Ray Domain.Type
-        let matcher = match domain.kind {
-            0 => DomainMatcher::Keyword(domain_value), // Plain
-            1 => {
-                // Regex
-                match compile_geosite_regex(&domain_value) {
-                    Ok(re) => DomainMatcher::Regex(re),
-                    Err(err) => {
-                        warn!(target = "geosite", pattern = %domain_value, error = %err,
-                             "invalid regex pattern, using empty regex");
-                        // 只匹配空名字的正则，编译一次，之后每次只是克隆
-                        // A regex matching only the empty name, compiled once and cloned after
-                        static EMPTY: LazyLock<Regex> =
-                            LazyLock::new(|| Regex::new(r"^$").unwrap());
-                        DomainMatcher::Regex(EMPTY.clone())
-                    }
-                }
-            }
+        let entry = match domain.kind {
+            0 => DatEntry::Matcher(DomainMatcher::Keyword(domain_value)), // Plain
+            1 => DatEntry::Regex(domain_value),                           // Regex
             2 => {
                 // RootDomain - 转换为 Suffix 匹配器 / Convert to Suffix matcher
-                DomainMatcher::Suffix(format!(".{}", domain_value))
+                DatEntry::Matcher(DomainMatcher::Suffix(format!(".{}", domain_value)))
             }
-            3 => DomainMatcher::Full(domain_value), // Full
+            3 => DatEntry::Matcher(DomainMatcher::Full(domain_value)), // Full
             kind => {
                 warn!(target = "geosite", type = kind,
                      "unknown V2Ray domain type, using full matcher");
-                DomainMatcher::Full(domain_value)
+                DatEntry::Matcher(DomainMatcher::Full(domain_value))
             }
         };
 
         tracing::debug!(target = "geosite", "parsed V2Ray domains");
 
-        Ok(vec![(matcher, domain.attrs)])
+        Ok(vec![(entry, domain.attrs)])
     }
 
     /// 从 V2Ray 格式字符串加载 GeoSite 数据 / Load GeoSite data from V2Ray format string
@@ -2050,6 +2109,40 @@ mod tests {
         manager.load_from_dat_file(&path).unwrap();
         assert!(manager.matches("g", "www.google.com"));
         assert!(manager.matches("g", "only.test"));
+    }
+
+    /// 数据文件里的正则读完一个 tag 才合成编译；写错的一条照旧换成只匹配空名字的正则，不连累同一个 tag
+    /// 的其他正则。按需加载和全部加载都是这样。
+    /// A data file's regexes compile once the tag is read; one written wrong still stands as a
+    /// regex matching only the empty name and spoils none of the tag's others. Both selective and
+    /// full loading do so.
+    #[test]
+    fn a_broken_regex_in_a_data_file_spoils_none_of_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[build_geosite(
+                "R",
+                &[
+                    build_domain(1, "(unclosed", &[]),
+                    build_domain(1, r"^cdn\d\.example\.com$", &[]),
+                    build_domain(1, r"^a\.", &[]),
+                ],
+            )],
+        );
+
+        let parsed = GeoSiteManager::parse_dat_file_selective(&path, &["r".to_string()]).unwrap();
+        let (_, tag) = &parsed[0];
+        assert!(matches!(tag.regexes, Regexes::Set(_)));
+        assert!(tag.matches("cdn7.example.com"));
+        assert!(tag.matches("a.test"));
+        assert!(tag.matches(""));
+        assert!(!tag.matches("cdnx.example.com"));
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+        assert!(manager.matches("r", "cdn7.example.com"));
+        assert!(!manager.matches("r", "b.test"));
     }
 
     #[test]
@@ -2965,12 +3058,13 @@ mod tests {
             "^www\\d+\\.",
         ];
         let each: Vec<Regex> = patterns.iter().map(|p| Regex::new(p).unwrap()).collect();
-        let combined = Regexes::new(each.clone());
+        let written = || patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let combined = Regexes::new(written());
         assert!(
             matches!(combined, Regexes::Set(_)),
             "several regexes combine into one set"
         );
-        let separate = Regexes::with_size_limit(each.clone(), 1);
+        let separate = Regexes::with_size_limit(written(), 1);
         assert!(
             matches!(separate, Regexes::Each(_)),
             "over the size limit they stay one by one"
