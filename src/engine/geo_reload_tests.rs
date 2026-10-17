@@ -322,3 +322,98 @@ async fn after_a_reload_the_geoip_watch_follows_the_new_file() {
         "the old file must no longer be watched"
     );
 }
+
+/// GeoIP 数据文件只读规则用到的标签；热加载用到新标签时再读进来
+/// A GeoIP data file is read only for the tags rules use; a tag first used after a hot reload
+/// is read in then
+#[tokio::test]
+async fn only_the_geoip_tags_rules_use_are_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("geoip.json");
+    std::fs::write(
+        &data,
+        r#"{"entries":[
+            {"country_code":"TESTNET","ips":["198.51.100.0/24"]},
+            {"country_code":"OTHERNET","ips":["203.0.113.0/24"]}
+        ]}"#,
+    )
+    .unwrap();
+    let settings = json!({ "geoip_dat_path": data.to_str().unwrap() });
+    let rule = |codes: &[&str]| json!({ "type": "geoip_country", "country_codes": codes });
+
+    let engine = engine(config(settings.clone(), rule(&["testnet"])));
+    assert_eq!(engine.geoip_manager.read().ip_range_count(), 1);
+    let other: SocketAddr = "203.0.113.7:53000".parse().unwrap();
+    assert_eq!(ask_from(&engine, "a.test", other).await, Some(OTHER));
+
+    engine.reload(config(settings, rule(&["TESTNET", "OTHERNET"])));
+    assert_eq!(engine.geoip_manager.read().ip_range_count(), 2);
+    assert_eq!(ask_from(&engine, "b.test", other).await, Some(MATCHED));
+}
+
+/// 有 MMDB 时国家代码只查它：数据文件只读命名标签，规则只用国家代码时数据文件不读；规则只用命名
+/// 标签时 MMDB 不读
+/// With an MMDB country codes are looked up there alone: the data file is read only for named
+/// tags, and not at all when rules use country codes only; when rules use named tags only the
+/// MMDB is not read
+#[tokio::test]
+async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
+    let dir = tempfile::tempdir().unwrap();
+    let mmdb_source = dir.path().join("mmdb-source.json");
+    std::fs::write(
+        &mmdb_source,
+        r#"{"entries":[{"country_code":"US","ips":["198.51.100.0/24"]}]}"#,
+    )
+    .unwrap();
+    let mmdb = dir.path().join("country.mmdb");
+    crate::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&mmdb_source, &mmdb, None).unwrap();
+    let data = dir.path().join("geoip.json");
+    std::fs::write(
+        &data,
+        r#"{"entries":[
+            {"country_code":"US","ips":["192.0.2.0/24"]},
+            {"country_code":"TESTNET","ips":["203.0.113.0/24"]}
+        ]}"#,
+    )
+    .unwrap();
+    let settings = json!({
+        "geoip_db_path": mmdb.to_str().unwrap(),
+        "geoip_dat_path": data.to_str().unwrap(),
+    });
+    let rule = |codes: &[&str]| json!({ "type": "geoip_country", "country_codes": codes });
+    let us: SocketAddr = "198.51.100.7:53000".parse().unwrap();
+    let testnet: SocketAddr = "203.0.113.7:53000".parse().unwrap();
+
+    let engine = engine(config(settings.clone(), rule(&["US", "TESTNET"])));
+    {
+        let manager = engine.geoip_manager.read();
+        assert!(manager.has_mmdb());
+        assert_eq!(
+            manager.ip_range_count(),
+            1,
+            "the data file's US entry must not be read when the MMDB answers US"
+        );
+    }
+    assert_eq!(ask_from(&engine, "a.test", us).await, Some(MATCHED));
+    assert_eq!(ask_from(&engine, "a.test", testnet).await, Some(MATCHED));
+
+    engine.reload(config(settings.clone(), rule(&["US"])));
+    {
+        let manager = engine.geoip_manager.read();
+        assert!(manager.has_mmdb());
+        assert_eq!(
+            manager.ip_range_count(),
+            0,
+            "the data file must not be read"
+        );
+    }
+    assert_eq!(ask_from(&engine, "b.test", us).await, Some(MATCHED));
+
+    engine.reload(config(settings, rule(&["TESTNET"])));
+    {
+        let manager = engine.geoip_manager.read();
+        assert!(!manager.has_mmdb(), "the MMDB must not be read");
+        assert_eq!(manager.ip_range_count(), 1);
+    }
+    assert_eq!(ask_from(&engine, "c.test", testnet).await, Some(MATCHED));
+}

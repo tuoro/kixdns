@@ -320,47 +320,47 @@ pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<Stri
     tags_set.into_iter().map(|s| s.to_string()).collect()
 }
 
-/// 检查配置是否使用 GeoIP 匹配器 / Check if configuration uses GeoIP matchers
-///
-/// 扫描配置以确定是否使用了GeoIP匹配器，这样我们可以对MMDB文件实现延迟加载 / Scans the configuration to determine if any GeoIP matchers are used, so we can implement lazy loading for the MMDB file.
-pub fn uses_geoip_matchers(cfg: &RuntimePipelineConfig) -> bool {
-    if cfg.pipeline_select.iter().any(|rule| {
-        rule.matchers.iter().any(|matcher| {
-            matches!(
-                matcher.matcher,
-                crate::matcher::RuntimePipelineSelectorMatcher::GeoipCountry { .. }
-            )
-        })
-    }) {
-        return true;
-    }
-
-    // Scan all pipeline rules / 扫描所有 pipeline 规则
-    for pipeline in &cfg.pipelines {
-        for rule in &pipeline.rules {
-            // Check request matchers / 检查请求匹配器
-            for matcher in &rule.matchers {
-                if matches!(
-                    matcher.matcher,
-                    crate::matcher::RuntimeMatcher::GeoipCountry { .. }
-                ) {
-                    return true;
-                }
+/// 规则按 GeoIP 匹配的国家代码和命名标签（已经是大写），排好序、去掉重复；`geoip_private` 不需要
+/// GeoIP 数据，不算在内
+/// The country codes and named tags rules match on GeoIP (uppercase already), sorted and
+/// deduplicated; `geoip_private` needs no GeoIP data and does not count
+pub fn extract_geoip_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
+    let selector_codes = cfg
+        .pipeline_select
+        .iter()
+        .flat_map(|rule| &rule.matchers)
+        .filter_map(|matcher| match &matcher.matcher {
+            crate::matcher::RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
+                Some(country_codes)
             }
+            _ => None,
+        });
+    let rules = cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules);
+    let request_codes = rules
+        .clone()
+        .flat_map(|rule| &rule.matchers)
+        .filter_map(|matcher| match &matcher.matcher {
+            crate::matcher::RuntimeMatcher::GeoipCountry { country_codes } => Some(country_codes),
+            _ => None,
+        });
+    let response_codes = rules
+        .flat_map(|rule| &rule.response_matchers)
+        .filter_map(|matcher| match &matcher.matcher {
+            crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
+                country_codes,
+            } => Some(country_codes),
+            _ => None,
+        });
 
-            // Check response matchers / 检查响应匹配器
-            for matcher in &rule.response_matchers {
-                if matches!(
-                    matcher.matcher,
-                    crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { .. }
-                ) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
+    let mut tags: Vec<String> = selector_codes
+        .chain(request_codes)
+        .chain(response_codes)
+        .flatten()
+        .map(|code| code.to_string())
+        .collect();
+    tags.sort_unstable();
+    tags.dedup();
+    tags
 }
 
 /// 将字符串形式的 DNS Rcode 解析为 ResponseCode
@@ -383,7 +383,7 @@ pub(crate) fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::uses_geoip_matchers;
+    use super::extract_geoip_tags_from_config;
     use crate::{config::PipelineConfig, matcher::RuntimePipelineConfig};
 
     fn runtime_config(json: &str) -> RuntimePipelineConfig {
@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn geoip_loading_detection_covers_selectors_but_not_private_matchers() {
+    fn geoip_tags_cover_selectors_but_not_private_matchers() {
         let selector = runtime_config(
             r#"{
                 "pipeline_select": [{
@@ -402,7 +402,7 @@ mod tests {
                 "pipelines": [{"id":"default"}]
             }"#,
         );
-        assert!(uses_geoip_matchers(&selector));
+        assert_eq!(extract_geoip_tags_from_config(&selector), ["CN"]);
 
         let private_only = runtime_config(
             r#"{
@@ -419,6 +419,6 @@ mod tests {
                 }]
             }"#,
         );
-        assert!(!uses_geoip_matchers(&private_only));
+        assert!(extract_geoip_tags_from_config(&private_only).is_empty());
     }
 }

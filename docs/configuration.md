@@ -104,6 +104,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 - `geoip_dat_path` 加载 V2Ray protobuf `.dat` 或兼容 JSON。这里的 JSON 是 GeoIP 数据文件，不是 KixDNS 主配置文件；格式示例：`{"entries":[{"country_code":"CLOUDFLARE","ips":["1.1.1.0/24"]}]}`。
 - V2Ray 数据既可以包含国家代码，也可以包含 `CLOUDFLARE`、`NETFLIX`、`TELEGRAM` 等命名标签；同一 IP 可以属于多个标签。
 - 同时配置两种数据源时，两位国家代码以 MMDB 为准；命名标签仍从 `geoip_dat_path` 读取。
+- 只读入规则用到的国家代码和标签。MMDB 只在规则用到两位国家代码时读入；`geoip_dat_path` 只读入规则用到、又不由 MMDB 判断的标签，所以配置了 MMDB、规则只用两位国家代码时，这个文件不读。规则用到的标签不在文件里时会记一条告警，这样的规则不会命中。
 - 标签匹配不区分大小写。`country_codes` 建议使用 JSON 字符串数组，例如 `["CN", "cloudflare"]`；为兼容旧配置，也接受单个字符串或逗号分隔字符串。
 
 域名后缀和 GeoSite 标签匹配也不区分大小写。domain_suffix 和 request_domain_suffix 按整段域名比较：`example.com` 命中它本身和 `www.example.com` 这样的子域名，`.example.com` 只命中子域名；两种写法都不命中 `notexample.com`。domain_regex 和 request_domain_regex 使用 Rust 正则语法。
@@ -403,4 +404,4 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。唯一的例外是 DoH TLS 证书：证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。
 
-geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只在有规则按 GeoIP 匹配（geoip_country、response_answer_ip_geoip_country）时读入。热加载改变了规则用到的 GeoSite 标签、这几个文件路径，或是否有规则按 GeoIP 匹配时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。
+geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只读入规则（geoip_country、response_answer_ip_geoip_country）用到的国家代码和标签（见上文 GeoIP 数据源与标签），不读的文件也不监控。热加载改变了规则用到的 GeoSite 或 GeoIP 标签，或这几个文件路径时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。

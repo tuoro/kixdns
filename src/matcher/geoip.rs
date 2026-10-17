@@ -1,11 +1,12 @@
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use moka::sync::Cache as MokaCache;
 use prost::Message;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 
 // Re-export from geoip_converter module
@@ -13,17 +14,21 @@ use serde::Deserialize;
 pub use crate::lock::RwLock;
 pub use crate::matcher::geoip_converter::{ConversionStats, convert_dat_to_mmdb};
 
-/// MaxMind GeoLite2-Country 数据库结构 / MaxMind GeoLite2-Country database structure
+/// MaxMind GeoLite2-Country 数据库结构，字符串直接借用数据库里的字节
+/// MaxMind GeoLite2-Country database structure, its strings borrowed from the database's bytes
 #[derive(Deserialize)]
-struct MaxMindCountryRecord {
-    country: Option<MaxMindCountry>,
-    registered_country: Option<MaxMindCountry>,
-    represented_country: Option<MaxMindCountry>,
+struct MaxMindCountryRecord<'a> {
+    #[serde(borrow)]
+    country: Option<MaxMindCountry<'a>>,
+    #[serde(borrow)]
+    registered_country: Option<MaxMindCountry<'a>>,
+    #[serde(borrow)]
+    represented_country: Option<MaxMindCountry<'a>>,
 }
 
 #[derive(Deserialize)]
-struct MaxMindCountry {
-    iso_code: Option<String>,
+struct MaxMindCountry<'a> {
+    iso_code: Option<&'a str>,
 }
 
 /// V2Ray GeoIP .dat 文件格式 / V2Ray GeoIP .dat file format
@@ -161,8 +166,8 @@ pub struct ParsedGeoIp {
 }
 
 pub struct GeoIpManager {
-    /// MaxMind DB reader (使用内存映射，线程安全) / MaxMind DB reader (memory-mapped, thread-safe)
-    reader: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
+    /// MaxMind DB 和它每条数据记录的国家代码 / The MaxMind DB and the country code of each of its data records
+    mmdb: Option<Mmdb>,
     /// MMDB 文件路径（用于延迟加载）/ MMDB file path (for lazy loading)
     /// Note: Reserved for future hot-reload functionality
     #[allow(dead_code)]
@@ -170,8 +175,90 @@ pub struct GeoIpManager {
     /// 按标签分组的 IP 范围索引（从 .dat/JSON 文件加载）
     /// IP range indexes grouped by tag (loaded from .dat/JSON files)
     tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex>,
-    /// 查询结果缓存（IP -> GeoIP 结果） / Query result cache (IP -> GeoIP result)
-    cache: MokaCache<IpAddr, GeoIpResult>,
+}
+
+/// MaxMind 数据库，加上每条数据记录的国家代码。同一个国家的网段指向同一条记录（GeoLite2-Country
+/// 一百多万个网段只有六千来条记录），所以加载时每条记录解一次，查询只走查找树再查一次表，约
+/// 105 ns。此前每次查询解一整条记录约 800 ns，前面按 IP 挡一层缓存，命中要 240 ns，未命中连插入
+/// 近 2 µs，缓存还随问到的不同地址涨到上百 MiB。
+/// The MaxMind database, plus the country code of each of its data records. All networks of a
+/// country point at the same record (GeoLite2-Country has some six thousand records for over a
+/// million networks), so each record is decoded once when loading, and a query walks the search
+/// tree and looks the table up, in about 105 ns. Each query used to decode a whole record, in
+/// about 800 ns, behind a per-IP cache that took 240 ns on a hit, nearly 2 µs on a miss with
+/// its insert, and grew past a hundred MiB with the distinct addresses asked about.
+struct Mmdb {
+    reader: maxminddb::Reader<Vec<u8>>,
+    /// 数据记录在文件里的位置 → 国家代码 / A data record's offset in the file → its country code
+    countries: FxHashMap<usize, Option<Arc<str>>>,
+}
+
+impl Mmdb {
+    fn open(path: &str) -> Result<Self, maxminddb::MaxMindDbError> {
+        let reader = maxminddb::Reader::open_readfile(path)?;
+        let mut countries = FxHashMap::default();
+        if let Err(e) = Self::index(&reader, &mut countries) {
+            // 没解到的记录查询时当场解，结果不变 / Records left out are decoded when asked about, with the same result
+            tracing::warn!(geoip_db = %path, error = %e, "could not index every GeoIP database record, the rest are decoded per query");
+        }
+        Ok(Self { reader, countries })
+    }
+
+    /// 把每条数据记录的国家代码（大写）记进 `countries`，同一个代码共用一份
+    /// Records the country code (uppercase) of every data record in `countries`, records of
+    /// the same code sharing one string
+    fn index(
+        reader: &maxminddb::Reader<Vec<u8>>,
+        countries: &mut FxHashMap<usize, Option<Arc<str>>>,
+    ) -> Result<(), maxminddb::MaxMindDbError> {
+        let mut interned: FxHashMap<String, Arc<str>> = FxHashMap::default();
+        for network in reader.networks(Default::default())? {
+            let found = network?;
+            let Some(offset) = found.offset() else {
+                continue;
+            };
+            if countries.contains_key(&offset) {
+                continue;
+            }
+            let code = record_country(&found).map(|code| {
+                let code = code.to_ascii_uppercase();
+                Arc::clone(
+                    interned
+                        .entry(code)
+                        .or_insert_with_key(|code| Arc::from(code.as_str())),
+                )
+            });
+            countries.insert(offset, code);
+        }
+        Ok(())
+    }
+
+    /// `ip` 的国家代码，按数据库里的写法，比较时不分大小写
+    /// The country code of `ip` as the database writes it; compare it ignoring case
+    #[inline]
+    fn country(&self, ip: IpAddr) -> Option<&str> {
+        let found = self.reader.lookup(ip).ok()?;
+        match self.countries.get(&found.offset()?) {
+            Some(code) => code.as_deref(),
+            // 加载时每条记录都解过，到不了这里；真到了就当场解
+            // Every record was decoded when loading, so this is not reached; if it is, the
+            // record is decoded here
+            None => record_country(&found),
+        }
+    }
+}
+
+/// 一条记录的国家代码：先看 country，没有再看 registered_country、represented_country；解不出来
+/// 当作没有
+/// A record's country code: country first, then registered_country, then represented_country;
+/// a record that cannot be decoded has none
+fn record_country<'a>(found: &maxminddb::LookupResult<'a, Vec<u8>>) -> Option<&'a str> {
+    let record = found.decode::<MaxMindCountryRecord<'a>>().ok()??;
+    record
+        .country
+        .or(record.registered_country)
+        .or(record.represented_country)
+        .and_then(|country| country.iso_code)
 }
 
 /// GeoIP 查询结果 / GeoIP query result
@@ -193,16 +280,13 @@ impl GeoIpManager {
     /// 此方法会立即加载 MMDB 文件（如果配置了路径），不再使用懒加载。
     /// This method loads the MMDB file immediately (if path is configured), no longer using lazy loading.
     pub fn new(db_path: Option<String>) -> anyhow::Result<Self> {
-        // 初始时创建一个小缓存，加载数据后会根据实际条数重建
-        let cache = MokaCache::builder().max_capacity(1000).build();
-
         // 立即加载 MMDB 文件（如果配置了）/ Load MMDB file immediately (if configured)
-        let reader = if let Some(ref path) = db_path {
+        let mmdb = if let Some(ref path) = db_path {
             if std::path::Path::new(path).exists() {
-                match maxminddb::Reader::open_readfile(path) {
-                    Ok(r) => {
-                        tracing::info!(geoip_db = %path, "GeoIP database loaded successfully");
-                        Some(r)
+                match Mmdb::open(path) {
+                    Ok(mmdb) => {
+                        tracing::info!(geoip_db = %path, records = mmdb.countries.len(), "GeoIP database loaded successfully");
+                        Some(mmdb)
                     }
                     Err(e) => {
                         tracing::warn!(geoip_db = %path, error = %e, "Failed to open GeoIP database");
@@ -218,27 +302,17 @@ impl GeoIpManager {
         };
 
         Ok(Self {
-            reader: Arc::new(reader),
+            mmdb,
             db_path,
             tag_indexes: FxHashMap::default(),
-            cache,
         })
     }
 
-    /// 重建缓存（在加载数据后调用）/ Rebuild cache (call after loading data)
-    fn rebuild_cache(&mut self) {
-        // 根据实际加载的 IP 范围数量设置缓存大小
-        // 缓存大小为实际条数的 2 倍，最小 10000，最大 1000000
-        let entry_count = self.ip_range_count();
-        let cache_capacity = (entry_count * 2).clamp(10_000, 1_000_000) as u64;
-
-        tracing::info!(
-            geoip_entries = entry_count,
-            cache_capacity = cache_capacity,
-            "Rebuilding GeoIP cache"
-        );
-
-        self.cache = MokaCache::builder().max_capacity(cache_capacity).build();
+    /// MMDB 是否已加载；加载了，两个字母的国家代码就只按它判断
+    /// Whether an MMDB is loaded; when one is, two-letter country codes are judged by it alone
+    #[inline]
+    pub fn has_mmdb(&self) -> bool {
+        self.mmdb.is_some()
     }
 
     /// 查询 IP 的 GeoIP 信息 / Lookup GeoIP information for an IP address
@@ -248,64 +322,19 @@ impl GeoIpManager {
     ///
     /// # 返回 / Returns
     /// GeoIP 查询结果（包含国家代码和私有 IP 标志） / GeoIP result (with country code and private IP flag)
-    #[inline]
     pub fn lookup(&self, ip: IpAddr) -> GeoIpResult {
-        // 先查缓存 / Check cache first
-        if let Some(result) = self.cache.get(&ip) {
-            return result.clone();
-        }
-
-        // 查询 MMDB 或 IP 范围 / Query MMDB or IP ranges
-        let result = if let Some(reader) = self.reader.as_ref() {
-            self.lookup_mmdb(reader, ip)
-        } else if !self.tag_indexes.is_empty() {
+        let country_code = match &self.mmdb {
+            Some(mmdb) => mmdb
+                .country(ip)
+                .map(|code| Arc::from(code.to_ascii_uppercase())),
             // 使用 .dat/JSON 文件中的国家标签 / Use country tags from .dat/JSON files
-            self.lookup_dat_country(ip)
-        } else {
+            None if !self.tag_indexes.is_empty() => self.lookup_dat_country(ip),
             // 没有 MMDB 文件，只检测私有 IP / No MMDB file, only check private IP
-            GeoIpResult {
-                country_code: None,
-                is_private: is_private_ip(ip),
-            }
+            None => None,
         };
-
-        // 更新缓存 / Update cache
-        self.cache.insert(ip, result.clone());
-        result
-    }
-
-    /// 从 MMDB 查询 / Lookup from MMDB
-    fn lookup_mmdb(&self, reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> GeoIpResult {
-        // 使用 MaxMind 数据结构进行查询 / Use MaxMind data structure for lookup
-        match reader
-            .lookup(ip)
-            .and_then(|result| result.decode::<MaxMindCountryRecord>())
-        {
-            Ok(Some(record)) => {
-                // 尝试从多个字段获取国家代码 / Try to get country code from multiple fields
-                // 优先级: country > registered_country > represented_country
-                // Priority: country > registered_country > represented_country
-                // 零拷贝优化：使用 Arc<str> 避免克隆时的内存分配
-                // Zero-copy optimization: use Arc<str> to avoid allocation on clone
-                let country_code = record
-                    .country
-                    .or(record.registered_country)
-                    .or(record.represented_country)
-                    .and_then(|c| c.iso_code)
-                    .map(|s| Arc::from(s.to_uppercase().as_str()));
-
-                GeoIpResult {
-                    country_code,
-                    is_private: is_private_ip(ip),
-                }
-            }
-            Ok(None) | Err(_) => {
-                // 查询失败，回退到私有 IP 检测 / Lookup failed, fallback to private IP check
-                GeoIpResult {
-                    country_code: None,
-                    is_private: is_private_ip(ip),
-                }
-            }
+        GeoIpResult {
+            country_code,
+            is_private: is_private_ip(ip),
         }
     }
 
@@ -320,10 +349,11 @@ impl GeoIpManager {
             &normalized
         };
 
-        if self.reader.as_ref().is_some() && is_country_tag(tag) {
-            return self
-                .lookup(ip)
-                .country_code
+        if let Some(mmdb) = &self.mmdb
+            && is_country_tag(tag)
+        {
+            return mmdb
+                .country(ip)
                 .is_some_and(|code| code.eq_ignore_ascii_case(tag));
         }
 
@@ -335,8 +365,8 @@ impl GeoIpManager {
     /// 检查 IP 是否属于任一指定标签 / Check whether an IP belongs to any requested tag.
     #[inline]
     pub fn matches_any_tag(&self, ip: IpAddr, tags: &[Arc<str>]) -> bool {
-        let has_mmdb = self.reader.as_ref().is_some();
-        let mmdb_country = has_mmdb.then(|| self.lookup(ip).country_code).flatten();
+        // 用到国家代码时才查 MMDB，只查一次 / The MMDB is asked once, and only when a country code needs it
+        let mut mmdb_country: Option<Option<&str>> = None;
 
         for tag in tags {
             let normalized;
@@ -347,9 +377,11 @@ impl GeoIpManager {
                 &normalized
             };
 
-            if has_mmdb && is_country_tag(tag) {
+            if let Some(mmdb) = &self.mmdb
+                && is_country_tag(tag)
+            {
                 if mmdb_country
-                    .as_ref()
+                    .get_or_insert_with(|| mmdb.country(ip))
                     .is_some_and(|country_code| country_code.eq_ignore_ascii_case(tag))
                 {
                     return true;
@@ -371,7 +403,7 @@ impl GeoIpManager {
     /// 返回 IP 命中的全部标签，主要用于诊断和管理接口。
     /// Return all tags matching an IP, primarily for diagnostics and management APIs.
     pub fn lookup_tags(&self, ip: IpAddr) -> Vec<Arc<str>> {
-        let has_mmdb = self.reader.as_ref().is_some();
+        let has_mmdb = self.has_mmdb();
         let mut tags: Vec<_> = self.lookup(ip).country_code.into_iter().collect();
         tags.extend(
             self.tag_indexes
@@ -386,7 +418,7 @@ impl GeoIpManager {
 
     /// 从 .dat/JSON 数据中查询传统单标签结果，优先返回两位国家代码。
     /// Lookup the legacy single-tag result, preferring a two-letter country code.
-    fn lookup_dat_country(&self, ip: IpAddr) -> GeoIpResult {
+    fn lookup_dat_country(&self, ip: IpAddr) -> Option<Arc<str>> {
         let mut country_match = None;
         let mut named_match = None;
 
@@ -405,10 +437,7 @@ impl GeoIpManager {
             }
         }
 
-        GeoIpResult {
-            country_code: country_match.or(named_match).map(|(tag, _, _)| tag),
-            is_private: is_private_ip(ip),
-        }
+        country_match.or(named_match).map(|(tag, _, _)| tag)
     }
 
     /// 重新加载 MMDB 数据库 / Reload MMDB database
@@ -417,10 +446,9 @@ impl GeoIpManager {
     /// - `db_path`: 新的 MMDB 文件路径 / New MMDB file path
     pub fn reload(&mut self, db_path: Option<String>) -> anyhow::Result<()> {
         if let Some(path) = db_path {
-            match maxminddb::Reader::open_readfile(&path) {
-                Ok(reader) => {
-                    self.reader = Arc::new(Some(reader));
-                    self.cache.invalidate_all();
+            match Mmdb::open(&path) {
+                Ok(mmdb) => {
+                    self.mmdb = Some(mmdb);
                     tracing::info!(
                         geoip_db = %path,
                         "GeoIP database reloaded successfully"
@@ -445,7 +473,7 @@ impl GeoIpManager {
     /// 检查 GeoIP 数据是否已加载 / Check whether any GeoIP data is loaded.
     #[inline]
     pub fn is_loaded(&self) -> bool {
-        self.reader.is_some() || !self.tag_indexes.is_empty()
+        self.mmdb.is_some() || !self.tag_indexes.is_empty()
     }
 
     /// 获取去重合并后的 IP 范围数量（仅用于调试）。
@@ -490,25 +518,80 @@ impl GeoIpManager {
     /// heaviest part of a reload and moving only the read and the decode would
     /// leave most of it behind.
     pub fn parse_dat_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
-        let data = std::fs::read(path)?;
+        Self::parse_dat_entries(path, &|_| true)
+    }
 
-        // 使用 Google 标准 protobuf 库 (prost) 解析，与 dae pkg/geodata 对齐。
-        // 手写 wire 解析假设字段顺序固定、无未知字段，任何 .dat 格式变体
-        // 都会产生静默错位或错误网段。
-        let list = super::geoip_proto::GeoIPList::decode(data.as_slice())
-            .context("failed to decode geoip.dat as protobuf GeoIPList")?;
-
+    /// 解析 .dat 文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）。按条目顺序读，不把整个
+    /// 文件读进内存：每个条目先只解国家代码，要的条目才整个解，一百多万个网段里规则只用到几个标签时，
+    /// 别的标签既不解也不留。
+    /// 使用 Google 标准 protobuf 库 (prost) 解码条目，与 dae pkg/geodata 对齐：手写 wire 解析假设
+    /// 字段顺序固定、无未知字段，任何 .dat 格式变体都会产生静默错位或错误网段。
+    /// Parses the entries of a .dat file that `wanted` accepts (given the uppercase country code
+    /// or tag). The file is read entry by entry rather than into memory whole: each entry's
+    /// country code is decoded first and only wanted entries are decoded whole, so when rules use
+    /// a few tags out of over a million networks the other tags are neither decoded nor kept.
+    /// Entries are decoded with Google's standard protobuf library (prost), in line with dae's
+    /// pkg/geodata: hand-written wire parsing assumes a fixed field order and no unknown fields,
+    /// and any .dat variant would silently shift fields or yield wrong networks.
+    fn parse_dat_entries(
+        path: &Path,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> anyhow::Result<ParsedGeoIp> {
+        let file = File::open(path)?;
+        let mut remaining = file.metadata()?.len();
+        let mut file = BufReader::with_capacity(64 * 1024, file);
+        // 一个条目的内容，各条目轮流使用 / One entry's bytes, reused for every entry
+        let mut entry = Vec::new();
         let mut tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex> = FxHashMap::default();
         let mut count = 0;
         let mut ipv4_count = 0;
         let mut ipv6_count = 0;
 
-        for entry in list.entry {
-            let country_code = entry.country_code.to_ascii_uppercase();
-            if country_code.is_empty() {
+        // GeoIPList 顶层只有 `repeated GeoIP entry = 1`，别的字段跳过
+        // GeoIPList holds only `repeated GeoIP entry = 1` at the top; other fields are skipped
+        while remaining > 0 {
+            let key = read_varint(&mut file, &mut remaining)?;
+            let (field, wire_type) = (key >> 3, key & 0x7);
+            let len = match wire_type {
+                0 => {
+                    read_varint(&mut file, &mut remaining)?;
+                    continue;
+                }
+                1 => 8,
+                2 => read_varint(&mut file, &mut remaining)?,
+                5 => 4,
+                other => anyhow::bail!("invalid wire type {other} in .dat file"),
+            };
+            anyhow::ensure!(
+                field != 1 || wire_type == 2,
+                "invalid wire type {wire_type} for a GeoIP entry"
+            );
+            anyhow::ensure!(
+                len <= remaining,
+                "truncated .dat file: a field needs {len} bytes, {remaining} left"
+            );
+            remaining -= len;
+            if field != 1 {
+                file.seek_relative(i64::try_from(len)?)?;
                 continue;
             }
-            for cidr in entry.cidr {
+            entry.clear();
+            entry.resize(usize::try_from(len)?, 0);
+            file.read_exact(&mut entry)?;
+
+            // 先只解国家代码（其余字段跳过不解），要的条目才整个解
+            // Decode the country code alone first (other fields are skipped undecoded), and
+            // the whole entry only when it is wanted
+            let country_code = super::geoip_proto::GeoIPCode::decode(entry.as_slice())
+                .context("failed to decode a geoip.dat entry")?
+                .country_code
+                .to_ascii_uppercase();
+            if country_code.is_empty() || !wanted(&country_code) {
+                continue;
+            }
+            let geoip = super::geoip_proto::GeoIP::decode(entry.as_slice())
+                .context("failed to decode a geoip.dat entry")?;
+            for cidr in geoip.cidr {
                 match cidr.ip.len() {
                     4 => {
                         let mut ip_bytes = [0u8; 4];
@@ -572,8 +655,8 @@ impl GeoIpManager {
         })
     }
 
-    /// 用解析结果整体替换索引，并重建查询缓存
-    /// Replace the indexes wholesale with a parsed result and rebuild the cache
+    /// 用解析结果整体替换索引
+    /// Replace the indexes wholesale with a parsed result
     ///
     /// GeoIP 只有一个数据文件（`geoip_dat_path` 是单值），所以这里不需要
     /// geosite 那套按来源记账：两个 loader 本来就是整体替换，解析失败时
@@ -595,7 +678,6 @@ impl GeoIpManager {
             "loaded GeoIP tag indexes"
         );
 
-        self.rebuild_cache();
         parsed.count
     }
 
@@ -604,26 +686,51 @@ impl GeoIpManager {
         Ok(self.apply_parsed(parsed))
     }
 
-    /// 按扩展名解析数据文件，不触碰管理器状态：`.dat` 走 [`Self::parse_dat_file`]，其余按 JSON
-    /// 读（[`Self::parse_v2ray_file`]）
-    /// Parses a data file by its extension without touching manager state: `.dat` goes
-    /// through [`Self::parse_dat_file`] and anything else is read as JSON
-    /// ([`Self::parse_v2ray_file`])
-    pub fn parse_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
+    /// 按扩展名解析数据文件里 `tags` 这几个标签（不分大小写），其余条目不解，不触碰管理器状态：
+    /// `.dat` 按条目读（见 [`Self::parse_dat_file`]），其余按 JSON 读（[`Self::parse_v2ray_file`]）。
+    /// 文件里没有的标签记一条告警，用它的规则不会命中。
+    /// Parses the `tags` of a data file (ignoring case) by its extension, leaving the other
+    /// entries undecoded and the manager untouched: `.dat` is read entry by entry (see
+    /// [`Self::parse_dat_file`]) and anything else as JSON ([`Self::parse_v2ray_file`]). Tags
+    /// the file lacks are logged as a warning, since rules using them never match.
+    pub fn parse_file(path: &Path, tags: &[String]) -> anyhow::Result<ParsedGeoIp> {
+        let wanted: FxHashSet<String> = tags.iter().map(|tag| tag.to_ascii_uppercase()).collect();
+        let is_wanted = |code: &str| wanted.contains(code);
         let is_dat = path
             .extension()
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.eq_ignore_ascii_case("dat"));
-        if is_dat {
-            Self::parse_dat_file(path)
+        let parsed = if is_dat {
+            Self::parse_dat_entries(path, &is_wanted)
         } else {
-            Self::parse_v2ray_file(path)
+            Self::parse_v2ray_entries(path, &is_wanted)
+        }?;
+
+        let mut missing: Vec<&str> = wanted
+            .iter()
+            .map(String::as_str)
+            .filter(|tag| !parsed.tag_indexes.contains_key(*tag))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            tracing::warn!(target = "geoip", path = %path.display(), tags = ?missing, "GeoIP tags used by rules are not in the data file and never match");
         }
+        Ok(parsed)
     }
 
     /// 解析 JSON 格式的数据文件，不触碰管理器状态
     /// Parse a JSON data file without touching manager state
     pub fn parse_v2ray_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
+        Self::parse_v2ray_entries(path, &|_| true)
+    }
+
+    /// 解析 JSON 数据文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）
+    /// Parses the entries of a JSON data file that `wanted` accepts (given the uppercase
+    /// country code or tag)
+    fn parse_v2ray_entries(
+        path: &Path,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> anyhow::Result<ParsedGeoIp> {
         let data = std::fs::read_to_string(path)?;
         let list: V2RayGeoIPList = serde_json::from_str(&data)?;
         let mut tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex> = FxHashMap::default();
@@ -633,7 +740,7 @@ impl GeoIpManager {
 
         for geoip in list.entries {
             let tag = geoip.country_code.to_ascii_uppercase();
-            if tag.is_empty() {
+            if tag.is_empty() || !wanted(&tag) {
                 continue;
             }
             let index = get_or_insert_tag_index(&mut tag_indexes, &tag);
@@ -738,6 +845,26 @@ impl GeoIpManager {
     }
 }
 
+/// 从 `file` 读一个 protobuf 变长整数，`remaining` 是文件里还剩的字节数
+/// Reads a protobuf varint from `file`, `remaining` being the bytes left in the file
+fn read_varint(file: &mut impl Read, remaining: &mut u64) -> anyhow::Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        anyhow::ensure!(
+            *remaining > 0,
+            "truncated .dat file: a varint runs past the end"
+        );
+        let mut byte = [0u8];
+        file.read_exact(&mut byte)?;
+        *remaining -= 1;
+        value |= u64::from(byte[0] & 0x7F) << shift;
+        if byte[0] & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    anyhow::bail!("invalid varint in .dat file")
+}
+
 fn get_or_insert_tag_index<'a>(
     indexes: &'a mut FxHashMap<Arc<str>, GeoIpTagIndex>,
     tag: &str,
@@ -798,8 +925,10 @@ fn most_specific_ipv6(ranges: &[Ipv6Range], ip: u128) -> Option<Ipv6Range> {
         .copied()
 }
 
+/// 是否两个字母的国家代码；有 MMDB 时只有这样的标签查 MMDB
+/// Whether a tag is a two-letter country code; with an MMDB only such tags are looked up there
 #[inline]
-fn is_country_tag(tag: &str) -> bool {
+pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
@@ -1153,10 +1282,6 @@ mod tests {
             mgr.lookup_tags(ip),
             vec![Arc::from("CLOUDFLARE"), Arc::from("US")]
         );
-        assert!(
-            mgr.cache.get(&ip).is_some(),
-            "MMDB matches should use cache"
-        );
 
         let mmdb_miss: IpAddr = "2001:db9::1".parse().unwrap();
         assert!(!mgr.matches_tag(mmdb_miss, "CN"));
@@ -1168,5 +1293,155 @@ mod tests {
         let _ = std::fs::remove_file(mmdb_source_path);
         let _ = std::fs::remove_file(dat_path);
         let _ = std::fs::remove_file(mmdb_path);
+    }
+
+    fn tags(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// 只解析规则用到的标签，请求不分大小写；别的条目不留，文件里没有的标签不算错
+    /// Only the tags rules use are parsed, requested in any case; other entries are not kept,
+    /// and a tag the file lacks is not an error
+    #[test]
+    fn parse_file_keeps_only_the_wanted_dat_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.dat");
+        let mut dat = build_dat("CN", Some(([10, 0, 0, 0], 8)), None);
+        dat.extend(build_dat("US", Some(([20, 0, 0, 0], 8)), None));
+        dat.extend(build_dat("private", Some(([192, 168, 0, 0], 16)), None));
+        std::fs::write(&path, &dat).unwrap();
+
+        let mut manager = GeoIpManager::new(None).unwrap();
+        let parsed = GeoIpManager::parse_file(&path, &tags(&["cn", "PRIVATE", "XX"])).unwrap();
+        assert_eq!(manager.apply_parsed(parsed), 2);
+        assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "CN"));
+        assert!(manager.matches_tag("192.168.1.1".parse().unwrap(), "private"));
+        assert!(
+            !manager.matches_tag("20.1.2.3".parse().unwrap(), "US"),
+            "a tag rules do not use must not be loaded"
+        );
+        assert_eq!(manager.ip_range_count(), 2);
+    }
+
+    /// JSON 数据文件同样只留用到的标签 / A JSON data file keeps only the tags used too
+    #[test]
+    fn parse_file_keeps_only_the_wanted_json_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.json");
+        std::fs::write(
+            &path,
+            r#"{"entries":[
+                {"country_code":"JP","ips":["198.51.100.0/24"]},
+                {"country_code":"US","ips":["203.0.113.0/24"]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let mut manager = GeoIpManager::new(None).unwrap();
+        manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["jp"])).unwrap());
+        assert!(manager.matches_tag("198.51.100.7".parse().unwrap(), "JP"));
+        assert!(!manager.matches_tag("203.0.113.7".parse().unwrap(), "US"));
+        assert_eq!(manager.ip_range_count(), 1);
+    }
+
+    /// 条目里的字段不论先后，国家代码写在网段后面也认得出来；文件顶层不认识的字段跳过
+    /// An entry's fields come in any order, so a country code written after the networks is
+    /// still recognised; unknown fields at the top of the file are skipped
+    #[test]
+    fn parse_file_reads_entries_whatever_their_field_order() {
+        // CIDR { ip = 10.0.0.0, prefix = 8 }, then reverse_match = true (field 3), then
+        // country_code = "CN"
+        let cidr = [0x0A, 4, 10, 0, 0, 0, 0x10, 8];
+        let mut entry = vec![0x12, cidr.len() as u8];
+        entry.extend(cidr);
+        entry.extend([0x18, 0x01]);
+        entry.extend([0x0A, 2, b'C', b'N']);
+        // 不认识的顶层字段：2 号变长整数、3 号字节串、4 号 32 位、5 号 64 位
+        // Unknown top-level fields: field 2 a varint, field 3 bytes, field 4 32-bit, field 5 64-bit
+        let mut dat = vec![0x10, 0x01, 0x1A, 3, 1, 2, 3, 0x25, 1, 2, 3, 4];
+        dat.extend([0x29, 1, 2, 3, 4, 5, 6, 7, 8]);
+        dat.extend([0x0A, entry.len() as u8]);
+        dat.extend(&entry);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.dat");
+        std::fs::write(&path, &dat).unwrap();
+
+        let mut manager = GeoIpManager::new(None).unwrap();
+        manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["CN"])).unwrap());
+        assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "CN"));
+    }
+
+    /// 国家代码写了不止一次时和 protobuf 一样以最后一次为准
+    /// A country code written more than once counts by its last value, as in protobuf
+    #[test]
+    fn the_last_country_code_of_an_entry_counts() {
+        let cidr = [0x0A, 4, 10, 0, 0, 0, 0x10, 8];
+        let mut entry = vec![0x0A, 2, b'U', b'S', 0x12, cidr.len() as u8];
+        entry.extend(cidr);
+        entry.extend([0x0A, 2, b'C', b'N']);
+        let mut dat = vec![0x0A, entry.len() as u8];
+        dat.extend(&entry);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.dat");
+        std::fs::write(&path, &dat).unwrap();
+
+        let only_us = GeoIpManager::parse_file(&path, &tags(&["US"])).unwrap();
+        assert_eq!(only_us.count, 0, "the entry is CN, not US");
+        let mut manager = GeoIpManager::new(None).unwrap();
+        manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["CN"])).unwrap());
+        assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "CN"));
+    }
+
+    /// 截断的文件整份拒绝，不论读全部还是只读部分标签
+    /// A truncated file is rejected whole, whether every tag or only some are read
+    #[test]
+    fn a_truncated_dat_fails_to_parse() {
+        let dat = build_dat("CN", Some(([10, 0, 0, 0], 8)), None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.dat");
+        std::fs::write(&path, &dat[..dat.len() - 2]).unwrap();
+
+        assert!(GeoIpManager::parse_dat_file(&path).is_err());
+        assert!(GeoIpManager::parse_file(&path, &tags(&["CN"])).is_err());
+    }
+
+    /// MMDB 的每条数据记录加载时都进了表，查表和逐条解码得到同样的国家代码
+    /// Every MMDB data record is in the table after loading, and the table gives the same
+    /// country code as decoding the record
+    #[test]
+    fn every_mmdb_record_is_in_the_country_table() {
+        let mut source = build_dat("CN", Some(([10, 0, 0, 0], 8)), None);
+        source.extend(build_dat(
+            "US",
+            Some(([20, 0, 0, 0], 8)),
+            Some((
+                [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                32,
+            )),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.dat");
+        let mmdb_path = dir.path().join("test.mmdb");
+        std::fs::write(&source_path, source).unwrap();
+        GeoIpManager::convert_dat_to_mmdb(&source_path, &mmdb_path, None).unwrap();
+
+        let mmdb = Mmdb::open(mmdb_path.to_str().unwrap()).unwrap();
+        for (ip, want) in [
+            ("10.1.2.3", Some("CN")),
+            ("20.1.2.3", Some("US")),
+            ("2001:db8::1", Some("US")),
+            ("30.1.2.3", None),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            let found = mmdb.reader.lookup(ip).unwrap();
+            if let Some(offset) = found.offset() {
+                assert!(
+                    mmdb.countries.contains_key(&offset),
+                    "{ip}: record not indexed"
+                );
+            }
+            assert_eq!(record_country(&found), want, "{ip}");
+            assert_eq!(mmdb.country(ip), want, "{ip}");
+        }
     }
 }
