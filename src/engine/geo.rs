@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
+use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::geoip::GeoIpManager;
+use crate::matcher::geoip::{GeoIpManager, is_country_tag};
 use crate::matcher::geosite::GeoSiteManager;
 use crate::watcher::{FileWatch, PendingWatch, load_with_retry};
 
@@ -36,27 +36,36 @@ impl GeoSiteSpec {
     }
 }
 
-/// 配置里决定加载哪些 GeoIP 数据的部分；规则不按 GeoIP 匹配时什么都不加载
-/// The part of a configuration that decides which GeoIP data is loaded; nothing is loaded
-/// when no rule matches on GeoIP
+/// 配置里决定加载哪些 GeoIP 数据的部分：规则按 GeoIP 匹配的国家代码和命名标签，以及要读的文件。
+/// 只有两个字母的国家代码会查 MMDB，所以没有国家代码时 MMDB 不读；规则不按 GeoIP 匹配时什么都不读
+/// The part of a configuration that decides which GeoIP data is loaded: the country codes and
+/// named tags rules match on GeoIP, and the files to read. Only two-letter country codes are
+/// looked up in the MMDB, so without any it is not read; when no rule matches on GeoIP nothing
+/// is read
 #[derive(Debug, PartialEq, Eq)]
 struct GeoIpSpec {
+    /// 大写，排好序 / Uppercase and sorted
+    tags: Vec<String>,
     db_path: Option<String>,
     dat_path: Option<String>,
 }
 
 impl GeoIpSpec {
     fn of(cfg: &RuntimePipelineConfig) -> Self {
-        if uses_geoip_matchers(cfg) {
-            Self {
-                db_path: cfg.settings.geoip_db_path.clone(),
-                dat_path: cfg.settings.geoip_dat_path.clone(),
-            }
-        } else {
-            Self {
-                db_path: None,
-                dat_path: None,
-            }
+        let tags = extract_geoip_tags_from_config(cfg);
+        let wants_countries = tags.iter().any(|tag| is_country_tag(tag));
+        Self {
+            db_path: cfg
+                .settings
+                .geoip_db_path
+                .clone()
+                .filter(|_| wants_countries),
+            dat_path: cfg
+                .settings
+                .geoip_dat_path
+                .clone()
+                .filter(|_| !tags.is_empty()),
+            tags,
         }
     }
 }
@@ -122,7 +131,7 @@ impl GeoSources {
         }
         let spec = GeoIpSpec::of(cfg);
         if !self.geoip.is_current(&spec) {
-            info!(target = "geoip", db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
+            info!(target = "geoip", tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
             self.geoip.watch = None;
             self.geoip = load_geoip(spec, geoip);
         }
@@ -245,10 +254,21 @@ fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<Geo
         GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed")
     });
 
+    // MMDB 加载上了，国家代码就只查它（见 GeoIpManager::matches_any_tag），数据文件只读其余的标签
+    // With an MMDB loaded country codes are looked up there alone (see
+    // GeoIpManager::matches_any_tag), so the data file is read only for the other tags
+    let dat_tags: Vec<String> = spec
+        .tags
+        .iter()
+        .filter(|tag| !(fresh.has_mmdb() && is_country_tag(tag)))
+        .cloned()
+        .collect();
     let mut files = Vec::new();
     if let Some(dat_path) = &spec.dat_path {
         let path = PathBuf::from(dat_path);
-        if path.exists() {
+        if dat_tags.is_empty() {
+            info!(path = %path.display(), "every GeoIP tag rules use is a country code the GeoIP database answers, skipping the GeoIP data file");
+        } else if path.exists() {
             files.push(path);
         } else {
             warn!(path = %path.display(), "GeoIP data file not found, skipping");
@@ -259,10 +279,10 @@ fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<Geo
     let pending = pending_watch("GeoIP data", &files);
     for path in &files {
         // 解析失败的文件和 GeoSite 一样照样监视 / A file that failed to parse is watched, as for GeoSite
-        match GeoIpManager::parse_file(path) {
+        match GeoIpManager::parse_file(path, &dat_tags) {
             Ok(parsed) => {
                 let count = fresh.apply_parsed(parsed);
-                info!(path = %path.display(), loaded_count = count, "loaded GeoIP data from file");
+                info!(path = %path.display(), loaded_count = count, used_tags = dat_tags.len(), "loaded GeoIP data from file");
             }
             Err(e) => {
                 warn!(path = %path.display(), error = %e, "failed to load GeoIP data, waiting for the file to change");
@@ -275,7 +295,7 @@ fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<Geo
 
     let manager = Arc::clone(shared);
     let watch = start_watch(pending, "geoip-watch", move |path| {
-        reload_geoip_file(&manager, path);
+        reload_geoip_file(&manager, path, &dat_tags);
     });
     Loaded {
         spec,
@@ -290,9 +310,9 @@ fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<Geo
 /// the lock, which is held only for the swap. Matching takes the read lock, and with the
 /// whole reload under the write lock a .dat of 300k networks stalled every GeoIP match for
 /// 961 ms
-fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path) {
+fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String]) {
     let what = format!("GeoIP data {}", path.display());
-    if let Some(parsed) = load_with_retry(&what, || GeoIpManager::parse_file(path)) {
+    if let Some(parsed) = load_with_retry(&what, || GeoIpManager::parse_file(path, tags)) {
         let count = manager.write().apply_parsed(parsed);
         info!(target = "geoip_watcher", path = %path.display(), loaded_count = count, "GeoIP data reloaded");
     }

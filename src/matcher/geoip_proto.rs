@@ -23,6 +23,15 @@ pub struct GeoIP {
     pub cidr: Vec<Cidr>,
 }
 
+/// GeoIP 条目里只取国家代码，其余字段跳过不解：先用它判断条目要不要，要的再按 [`GeoIP`] 整个解
+/// Just a GeoIP entry's country code, the other fields skipped undecoded: it decides whether
+/// an entry is wanted, and wanted entries are then decoded whole as [`GeoIP`]
+#[derive(Clone, PartialEq, Message)]
+pub struct GeoIPCode {
+    #[prost(string, tag = "1")]
+    pub country_code: String,
+}
+
 /// Cidr:`bytes ip = 1; uint32 prefix = 2`(ip 为 4 字节 IPv4 或 16 字节 IPv6)
 #[derive(Clone, PartialEq, Message)]
 pub struct Cidr {
