@@ -9,9 +9,8 @@ use dashmap::{DashMap, DashSet};
 use moka::sync::Cache;
 use parking_lot::Mutex;
 use rustc_hash::{FxBuildHasher, FxHashMap};
-use tracing::{info, warn};
 
-use super::utils::{extract_geosite_tags_from_config, uses_geoip_matchers};
+use super::geo::GeoSources;
 use crate::cache::{CacheEntry, CacheSlot, CachedQuestion, DnsCache, new_cache};
 use crate::ecs_scope::EcsView;
 use crate::engine::refresh::RefreshTarget;
@@ -51,9 +50,11 @@ pub struct Engine {
     // Active configuration generation: 1 at startup, +1 per reload / 当前配置代数：启动为 1，每次重载 +1
     pub(crate) config_generation: Arc<AtomicU64>,
     // Serialises reloads so the stored state, the generation and the
-    // config_loaded event of one reload cannot interleave with another's.
-    // 串行化重载，使一次重载的状态存储、代数分配与 config_loaded 事件不与另一次交错。
-    pub(crate) reload_lock: Arc<Mutex<()>>,
+    // config_loaded event of one reload cannot interleave with another's. It
+    // also keeps where the Geo data came from, which only a reload changes.
+    // 串行化重载，使一次重载的状态存储、代数分配与 config_loaded 事件不与另一次交错；
+    // 同时保管 Geo 数据的来源，只有重载会改它。
+    pub(crate) reload_lock: Arc<Mutex<GeoSources>>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
     pub(crate) rule_cache: Cache<u64, RuleCacheRecord>,
@@ -223,25 +224,11 @@ impl Engine {
         let tcp_max_age_secs = cfg.settings.tcp_connection_max_age_seconds;
         let tcp_idle_timeout_secs = cfg.settings.tcp_connection_idle_timeout_seconds;
 
-        // Extract GeoIP settings before moving cfg / 在 move cfg 之前提取 GeoIP 设置
-        let uses_geoip = uses_geoip_matchers(&cfg);
-        let geoip_db_path = if uses_geoip {
-            cfg.settings.geoip_db_path.clone()
-        } else {
-            None
-        };
-        let geoip_dat_path = if uses_geoip {
-            cfg.settings.geoip_dat_path.clone()
-        } else {
-            None
-        };
-
-        // Extract GeoSite settings before moving cfg / 在 move cfg 之前提取 GeoSite 设置
-        let geosite_data_paths = cfg.settings.geosite_data_paths.clone();
-
-        // Extract GeoSite tags used in configuration before moving cfg
-        // 在 move cfg 之前提取配置中使用的 GeoSite tags
-        let used_geosite_tags = extract_geosite_tags_from_config(&cfg);
+        let geoip_manager = Arc::new(RwLock::new(
+            GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed"),
+        ));
+        let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::new()));
+        let geo_sources = GeoSources::load(&cfg, &geosite_manager, &geoip_manager);
 
         let compiled = compile_pipelines(&cfg);
 
@@ -258,130 +245,6 @@ impl Engine {
             compiled_pipelines: compiled,
             pipeline_index,
         }));
-
-        // Initialize GeoIpManager / 初始化 GeoIpManager
-        let mut geoip_manager = match GeoIpManager::new(geoip_db_path) {
-            Ok(manager) => manager,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to initialize GeoIpManager, running without GeoIP support");
-                // Create a dummy manager that always returns empty results
-                // This should never fail with None parameter
-                GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed")
-            }
-        };
-
-        // Load GeoIP data from .dat file if configured / 如果配置了 .dat 文件，则加载 GeoIP 数据
-        let mut geoip_dat_path_for_watcher = None;
-        if let Some(ref path_str) = geoip_dat_path {
-            let path = std::path::PathBuf::from(path_str);
-            if path.exists() {
-                // 检测文件格式 / Detect file format
-                let is_dat = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("dat"))
-                    .unwrap_or(false);
-
-                let load_result = if is_dat {
-                    geoip_manager.load_from_dat_file(&path)
-                } else {
-                    geoip_manager.load_from_v2ray_file(&path)
-                };
-
-                match load_result {
-                    Ok(count) => {
-                        info!(path = %path.display(), loaded_count = count, "loaded GeoIP data from file");
-                        geoip_dat_path_for_watcher = Some(path);
-                    }
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e, "failed to load GeoIP data, skipping");
-                    }
-                }
-            } else {
-                warn!(path = %path.display(), "GeoIP data file not found, skipping");
-            }
-        }
-
-        let geoip_manager = Arc::new(RwLock::new(geoip_manager));
-
-        // Initialize GeoSiteManager / 初始化 GeoSiteManager
-        // GeoSiteManager starts empty and is populated via add_entry() calls
-        // Cache will be automatically rebuilt after loading data
-        let geosite_manager = Arc::new(RwLock::new(crate::matcher::geosite::GeoSiteManager::new()));
-
-        // Load GeoSite data from configured files / 从配置的文件加载 GeoSite 数据
-        let mut geosite_paths_for_watcher = Vec::new();
-        for path_str in &geosite_data_paths {
-            let path = std::path::PathBuf::from(path_str);
-            if path.exists() {
-                // Load data from file / 从文件加载数据
-                // GeoSiteManager 使用 FxHashMap 实现高性能查找，由外层 RwLock 保护线程安全
-                // GeoSiteManager uses FxHashMap for high-performance lookup, thread-safety protected by outer RwLock
-
-                // 检测文件格式 / Detect file format
-                let is_dat = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("dat"))
-                    .unwrap_or(false);
-
-                let load_result = if is_dat {
-                    // 使用按需加载 / Use selective loading
-                    if used_geosite_tags.is_empty() {
-                        // 没有使用 GeoSite 标签，跳过加载 / No GeoSite tags used, skip loading
-                        info!("No GeoSite tags used in config, skipping GeoSite data loading");
-                        Ok(0)
-                    } else {
-                        // 在锁外解析，只在替换数据时持写锁
-                        // Parse outside the lock, hold the write lock only for the swap
-                        crate::matcher::geosite::GeoSiteManager::parse_dat_file_selective(
-                            &path,
-                            &used_geosite_tags,
-                        )
-                        .map(|parsed| geosite_manager.write().apply_source(&path, parsed))
-                    }
-                } else {
-                    // JSON 格式：全量加载 / JSON format: load all
-                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
-                    let mut manager = geosite_manager.write();
-                    manager.load_from_v2ray_file(&path)
-                };
-
-                match load_result {
-                    Ok(count) => {
-                        info!(path = %path.display(), loaded_count = count,
-                             used_tags = used_geosite_tags.len(),
-                             "loaded GeoSite data from file");
-                    }
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e, "failed to load GeoSite data, waiting for the file to change");
-                    }
-                }
-                // 解析失败也交给 watcher：写了一半或被截断的文件在下次写入完成时
-                // 能自己恢复，不必重启进程。
-                // Register with the watcher even when the parse failed: a
-                // half-written or truncated file heals itself on the next write
-                // instead of needing a restart.
-                geosite_paths_for_watcher.push(path);
-            } else {
-                warn!(path = %path.display(), "GeoSite data file not found, skipping");
-            }
-        }
-
-        // Start GeoSite watcher for hot-reload / 启动 GeoSite watcher 用于热重载
-        if !geosite_paths_for_watcher.is_empty() {
-            crate::matcher::geosite::spawn_geosite_watcher(
-                geosite_paths_for_watcher,
-                Arc::clone(&geosite_manager),
-                used_geosite_tags,
-            );
-        }
-
-        // Start GeoIP watcher for hot-reload / 启动 GeoIP watcher 用于热重载
-        crate::matcher::geoip::spawn_geoip_watcher(
-            geoip_dat_path_for_watcher,
-            Arc::clone(&geoip_manager),
-        );
 
         // 根据配置决定是否启用流控 / Decide whether to enable flow control based on configuration
         // 如果禁用流控，使用usize::MAX作为max_permits，实现"无限制"模式
@@ -470,7 +333,7 @@ impl Engine {
             client_transport: None,
             observer,
             config_generation: Arc::new(AtomicU64::new(1)),
-            reload_lock: Arc::new(Mutex::new(())),
+            reload_lock: Arc::new(Mutex::new(geo_sources)),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
             metrics_total_requests: Arc::new(AtomicU64::new(0)),

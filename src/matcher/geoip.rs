@@ -1,11 +1,9 @@
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::thread;
 
 use anyhow::Context;
 use moka::sync::Cache as MokaCache;
-use notify::Watcher;
 use prost::Message;
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -606,6 +604,23 @@ impl GeoIpManager {
         Ok(self.apply_parsed(parsed))
     }
 
+    /// 按扩展名解析数据文件，不触碰管理器状态：`.dat` 走 [`Self::parse_dat_file`]，其余按 JSON
+    /// 读（[`Self::parse_v2ray_file`]）
+    /// Parses a data file by its extension without touching manager state: `.dat` goes
+    /// through [`Self::parse_dat_file`] and anything else is read as JSON
+    /// ([`Self::parse_v2ray_file`])
+    pub fn parse_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
+        let is_dat = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("dat"));
+        if is_dat {
+            Self::parse_dat_file(path)
+        } else {
+            Self::parse_v2ray_file(path)
+        }
+    }
+
     /// 解析 JSON 格式的数据文件，不触碰管理器状态
     /// Parse a JSON data file without touching manager state
     pub fn parse_v2ray_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
@@ -821,137 +836,6 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
                 || (seg0 & 0xfe00) == 0xfc00 // Unique Local Addresses (fc00::/7)
         }
     }
-}
-
-/// 启动 GeoIP watcher 用于热重载 / Spawn GeoIP watcher for hot-reload
-///
-/// 监听 .dat 文件变化并自动重新加载 GeoIP 数据
-/// Watches .dat file changes and automatically reloads GeoIP data
-///
-/// 注意：通过监控父目录而非直接监控文件本身来支持原子替换（mv）操作。
-/// Linux inotify 监控 inode，原子替换创建新 inode，直接监控文件会丢失事件。
-/// Note: Watches the parent directory instead of the file itself to support
-/// atomic replacement (mv). Linux inotify watches inodes; atomic replacement
-/// creates a new inode that would be missed when watching the file directly.
-pub fn spawn_geoip_watcher(dat_path: Option<PathBuf>, manager: Arc<RwLock<GeoIpManager>>) {
-    let path = match dat_path {
-        Some(p) => p,
-        None => return,
-    };
-
-    // 使用阻塞线程持有watcher，避免异步生命周期问题
-    // Use blocking thread to hold watcher, avoiding async lifetime issues
-    thread::spawn(move || {
-        if let Err(err) = run_geoip_watcher(path, manager) {
-            tracing::warn!(target = "geoip_watcher", error = %err, "GeoIP watcher exited with error");
-        }
-    });
-}
-
-/// 运行 GeoIP watcher / Run GeoIP watcher
-fn run_geoip_watcher(path: PathBuf, manager: Arc<RwLock<GeoIpManager>>) -> notify::Result<()> {
-    // Watch the parent directory instead of the file itself,
-    // so that atomic replacement (mv newfile geoip.dat) is properly detected.
-    let parent_dir = path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-    let target_file_name = path
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_default();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut watcher: notify::RecommendedWatcher =
-        notify::Watcher::new(tx, notify::Config::default())?;
-
-    watcher.watch(&parent_dir, notify::RecursiveMode::NonRecursive)?;
-    tracing::info!(target = "geoip_watcher", path = %parent_dir.display(), filename = ?target_file_name, "watching GeoIP file parent directory (atomic-replacement safe)");
-
-    tracing::info!(target = "geoip_watcher", "GeoIP watcher started");
-
-    for res in rx {
-        match res {
-            Ok(event) => {
-                // Check if the event is for the file we care about
-                let is_target_file = event
-                    .paths
-                    .iter()
-                    .any(|p| p.file_name() == Some(&target_file_name));
-                if !is_target_file {
-                    continue;
-                }
-
-                // 仅在数据更改时重载 / Only reload on data changes
-                if !event.kind.is_modify() && !event.kind.is_create() {
-                    continue;
-                }
-
-                // 检测文件格式 / Detect file format
-                let is_dat = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.eq_ignore_ascii_case("dat"))
-                    .unwrap_or(false);
-
-                // 简单的重试机制来处理文件写入竞争 / Simple retry mechanism to handle file write races
-                let mut retries = 5;
-                while retries > 0 {
-                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
-                    // parking_lot::RwLock does not have poison state
-                    // 先在锁外解析（读取、解码、建索引、finalize），再短暂持写锁
-                    // 整体替换。此前整个重载都在写锁里，匹配走读锁，所以一次
-                    // 重载期间所有 geo 匹配请求全程停等：三十万网段的 .dat 实测
-                    // 停 961 ms，其中读取与解码只占 292 ms，大头在 finalize
-                    // 与缓存重建，所以 finalize 也搬到了锁外。
-                    // Parse outside the lock first — read, decode, build the
-                    // indexes, finalise — then hold the write lock only for the
-                    // wholesale swap. The entire reload used to run under the
-                    // write lock while matching takes the read lock, so every
-                    // geo match stalled for all of it: a .dat with 300k networks
-                    // measured a 961 ms stall, of which reading and decoding was
-                    // only 292 ms, the bulk being finalise and the cache
-                    // rebuild, which is why finalise moved out too.
-                    let load_result = if is_dat {
-                        GeoIpManager::parse_dat_file(&path)
-                    } else {
-                        GeoIpManager::parse_v2ray_file(&path)
-                    }
-                    .map(|parsed| manager.write().apply_parsed(parsed));
-
-                    match load_result {
-                        Ok(count) => {
-                            tracing::info!(
-                                target = "geoip_watcher",
-                                path = %path.display(),
-                                loaded_count = count,
-                                "GeoIP data reloaded"
-                            );
-                            break;
-                        }
-                        Err(err) => {
-                            retries -= 1;
-                            if retries == 0 {
-                                tracing::warn!(
-                                    target = "geoip_watcher",
-                                    path = %path.display(),
-                                    error = %err,
-                                    "GeoIP reload failed after retries"
-                                );
-                            } else {
-                                // 稍等后重试 / Wait a bit and retry
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(target = "geoip_watcher", error = %err, "watcher event error");
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

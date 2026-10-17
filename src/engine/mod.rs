@@ -5,6 +5,9 @@ pub mod core;
 #[cfg(test)]
 mod ecs_scope_tests;
 pub mod execution;
+mod geo;
+#[cfg(test)]
+mod geo_reload_tests;
 pub mod matcher_adapter;
 pub(crate) mod observation;
 pub mod phases;

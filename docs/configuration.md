@@ -403,4 +403,4 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。唯一的例外是 DoH TLS 证书：证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。
 
-geosite_data_paths 中的 GeoSite 文件会被监控并重载。geoip_dat_path 指定的 GeoIP 文件会被监控并重载。geoip_db_path 指定的 MMDB 在启动时加载；当前 watcher 监控的是 geoip_dat_path，不是 MMDB 路径。
+geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只在有规则按 GeoIP 匹配（geoip_country、response_answer_ip_geoip_country）时读入。热加载改变了规则用到的 GeoSite 标签、这几个文件路径，或是否有规则按 GeoIP 匹配时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。
