@@ -223,7 +223,11 @@ impl Engine {
         // Store, generation and event stay together under the reload lock, so
         // the reported generation is the one this reload allocated.
         // 存储、代数与事件在重载锁内一起完成，事件中的代数就是本次分配的值。
-        let _reload_guard = self.reload_lock.lock();
+        let mut geo_sources = self.reload_lock.lock();
+        // Geo 数据先跟上新配置，新规则一生效就能用上新的标签和文件
+        // The Geo data follows the new configuration first, so the new rules
+        // find the new tags and files from their first query
+        geo_sources.follow(&new_cfg, &self.geosite_manager, &self.geoip_manager);
         self.state.store(Arc::new(EngineInner {
             cache_namespaces: build_cache_namespaces(&new_cfg),
             pipeline: new_cfg,

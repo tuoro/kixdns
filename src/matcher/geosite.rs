@@ -3,23 +3,19 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use std::hash::BuildHasher;
 use std::io::Read;
 
 use anyhow::Context;
 use hashbrown::HashTable;
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use super::domain_suffix_matches;
-use crate::lock::RwLock;
 
 /// 编译 GeoSite 数据里的一条正则。数据是给 v2ray 写的，v2ray 用 Go 的正则，那里 `\w`、`\d`、`\s`、`\b` 只认
 /// ASCII；Rust 的正则默认按 Unicode 理解，`\w{5}` 要展开整张 Unicode 字母表，`cn` 里这样的正则让进程多占好几 MiB。
@@ -1875,144 +1871,6 @@ impl GeoSiteManager {
     }
 }
 
-/// 启动 GeoSite 数据文件热重载监控 / Start GeoSite data file hot-reload monitoring
-///
-/// # 参数 / Parameters
-/// - `paths`: GeoSite 数据文件路径列表 / GeoSite data file path list
-/// - `manager`: GeoSiteManager 实例（通过 Arc 共享）/ GeoSiteManager instance (shared via Arc)
-/// - `tags`: 需要加载的 tag 列表（空表示全部加载）/ List of tags to load (empty means load all)
-pub fn spawn_geosite_watcher(
-    paths: Vec<PathBuf>,
-    manager: Arc<RwLock<GeoSiteManager>>,
-    tags: Vec<String>,
-) {
-    if paths.is_empty() {
-        return;
-    }
-
-    // 使用阻塞线程持有watcher，避免异步生命周期问题
-    // Use blocking thread to hold watcher, avoiding async lifetime issues
-    thread::spawn(move || {
-        if let Err(err) = run_geosite_watcher(paths, manager, tags) {
-            warn!(target = "geosite_watcher", error = %err, "GeoSite watcher exited with error");
-        }
-    });
-}
-
-/// 运行 GeoSite watcher / Run GeoSite watcher
-fn run_geosite_watcher(
-    paths: Vec<PathBuf>,
-    manager: Arc<RwLock<GeoSiteManager>>,
-    tags: Vec<String>,
-) -> notify::Result<()> {
-    // Watch parent directories instead of individual files.
-    // Linux inotify watches inodes; atomic replacement (mv newfile oldfile)
-    // creates a new inode that would be missed when watching files directly.
-    // By watching parent directories, we capture IN_MOVED_TO/IN_CREATE events
-    // for the target filenames, properly detecting atomic replacements.
-
-    // Collect unique parent directories and their target filenames
-    let mut dir_watches: FxHashMap<PathBuf, Vec<std::ffi::OsString>> = FxHashMap::default();
-    for p in &paths {
-        let parent = p
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .to_path_buf();
-        let fname = p.file_name().map(|s| s.to_os_string()).unwrap_or_default();
-        dir_watches.entry(parent).or_default().push(fname);
-    }
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut watcher: RecommendedWatcher = Watcher::new(tx, Config::default())?;
-
-    // Watch all unique parent directories
-    for (dir, file_names) in &dir_watches {
-        watcher.watch(dir, RecursiveMode::NonRecursive)?;
-        info!(target = "geosite_watcher", path = %dir.display(), filenames = ?file_names, "watching GeoSite file parent directory (atomic-replacement safe)");
-    }
-
-    info!(target = "geosite_watcher", "GeoSite watcher started");
-
-    // Build a set of target filenames for quick event matching
-    let target_filenames: FxHashSet<std::ffi::OsString> = dir_watches
-        .values()
-        .flat_map(|v| v.iter().cloned())
-        .collect();
-
-    for res in rx {
-        match res {
-            Ok(event) => {
-                // Check if the event is for any file we care about
-                let is_target_file = event.paths.iter().any(|p| {
-                    p.file_name()
-                        .is_some_and(|fname| target_filenames.contains(fname))
-                });
-                if !is_target_file {
-                    continue;
-                }
-
-                // 仅在数据更改时重载 / Only reload on data changes
-                if !event.kind.is_modify() && !event.kind.is_create() {
-                    continue;
-                }
-
-                // Find the matching original path for this event
-                let matching_path = event.paths.iter().find(|p| {
-                    p.file_name()
-                        .is_some_and(|fname| target_filenames.contains(fname))
-                });
-                let path = match matching_path {
-                    Some(p) => p.clone(),
-                    None => continue,
-                };
-
-                // 简单的重试机制来处理文件写入竞争 / Simple retry mechanism to handle file write races
-                let mut retries = 5;
-                while retries > 0 {
-                    // parking_lot::RwLock::write() 返回 guard 直接，不会中毒
-                    // parking_lot::RwLock does not have poison state
-                    // 两种格式走同一条路：按扩展名选解析器，在锁外读完，再短暂
-                    // 持写锁按来源替换。此前 JSON 分支是整库重载，会把别的文件
-                    // 贡献的 tag 连同来源记录一起清空，而且整个文件的读取与解析
-                    // 都在写锁内。
-                    // Both formats take one path: the extension picks the parser,
-                    // the file is read outside the lock, and the write lock is
-                    // held only for the replace-by-source. The JSON branch used
-                    // to reload the whole database, wiping the tags other files
-                    // contributed along with their source records, and it read
-                    // and parsed the whole file under the write lock.
-                    let load_result = GeoSiteManager::parse_file(&path, &tags)
-                        .map(|parsed| manager.write().apply_source(&path, parsed));
-
-                    match load_result {
-                        Ok(loaded_count) => {
-                            info!(target = "geosite_watcher", path = %path.display(),
-                                 loaded_count = loaded_count,
-                                 "GeoSite data reloaded");
-                            break;
-                        }
-                        Err(err) => {
-                            retries -= 1;
-                            if retries == 0 {
-                                warn!(target = "geosite_watcher", path = %path.display(),
-                                     error = %err,
-                                     "GeoSite reload failed, keeping old data");
-                            } else {
-                                // 稍等后重试 / Wait a bit and retry
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(target = "geosite_watcher", error = %err, "watcher event error");
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2389,76 +2247,6 @@ mod tests {
         assert!(
             !manager.matches("ads", "www.ads.example"),
             "entries from the file that dropped the tag must not survive"
-        );
-    }
-
-    /// watcher 路径：JSON 文件变更触发的重载，不能带走 .dat 贡献的 tag。
-    /// 此前 watcher 的 JSON 分支走整库重载，会把数据表和来源记录一起清空；
-    /// 这条用例直接驱动真实的 watcher 线程，而不是绕开它调加载函数。
-    /// The watcher path: a reload triggered by a JSON file changing must not
-    /// take the tags a .dat contributed with it. The watcher's JSON branch used
-    /// to reload the whole database, clearing the table and the source records
-    /// together. This drives the real watcher thread instead of going around it
-    /// through the loader.
-    #[test]
-    fn the_watcher_reloading_json_keeps_the_tags_a_dat_file_provides() {
-        let dir = tempfile::tempdir().unwrap();
-        let dat = dir.path().join("a.dat");
-        let json = dir.path().join("b.json");
-        std::fs::write(
-            &dat,
-            build_dat(&[build_geosite("CN", &[build_domain(2, "baidu.com", &[])])]),
-        )
-        .unwrap();
-        std::fs::write(
-            &json,
-            r#"{"entries":[{"tag":"ads","domains":["domain:before.example"]}]}"#,
-        )
-        .unwrap();
-
-        let manager = Arc::new(RwLock::new(GeoSiteManager::new()));
-        {
-            let mut guard = manager.write();
-            guard.load_from_v2ray_file(&dat).unwrap();
-            guard.load_from_v2ray_file(&json).unwrap();
-        }
-        assert!(manager.read().matches("cn", "www.baidu.com"));
-
-        spawn_geosite_watcher(
-            vec![dat.clone(), json.clone()],
-            Arc::clone(&manager),
-            Vec::new(),
-        );
-
-        // watcher 监视父目录，先让它把 watch 装上再写文件
-        // The watcher watches the parent directory; let it install the watch
-        // before the file changes.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        std::fs::write(
-            &json,
-            r#"{"entries":[{"tag":"ads","domains":["domain:after.example"]}]}"#,
-        )
-        .unwrap();
-
-        // 轮询到重载生效为止，命中即退出；只有 watcher 真的坏了才会等满
-        // Poll until the reload lands and leave as soon as it does; only a
-        // broken watcher waits the whole deadline.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if manager.read().matches("ads", "after.example") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-
-        let guard = manager.read();
-        assert!(
-            guard.matches("ads", "after.example"),
-            "the watcher must reload the changed JSON file"
-        );
-        assert!(
-            guard.matches("cn", "www.baidu.com"),
-            "a watcher JSON reload must not take the .dat file's tags with it"
         );
     }
 
