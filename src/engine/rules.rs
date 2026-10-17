@@ -19,7 +19,7 @@ use crate::engine::response::{
     make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
 };
 use crate::engine::types::EngineInner;
-use crate::engine::types::{InflightMap, inflight_pending};
+use crate::engine::types::{InflightEntry, InflightMap, InflightQuestion, inflight_pending};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
@@ -846,25 +846,26 @@ pub(crate) async fn process_response_jump(
         // is needed.
         // 这条路径上的应答不写缓存：没有哪次查找用响应跳转路径的键，写进去只会占地方。这里只需要
         // inflight 键。
-        let dedupe_hash = Engine::cache_keys(
-            state.cache_namespace(&pipeline_id),
-            &pipeline_id,
-            qname.as_bytes(),
+        let inflight_question = InflightQuestion {
+            namespace: state.cache_namespace(&pipeline_id),
+            pipeline_id: &pipeline_id,
+            qname: qname.as_bytes(),
             qtype,
             qclass,
-            &cfg.requester_key(
-                &pipeline_id,
-                Requester {
-                    address: peer.ip(),
-                    edns: edns_present,
-                    ecs: client_ecs,
-                },
-                Some(&engine.geoip_manager),
-            )
-            .on_response_jump_path(&carried),
-            client_ecs.as_ref(),
-        )
-        .inflight;
+            requester: cfg
+                .requester_key(
+                    &pipeline_id,
+                    Requester {
+                        address: peer.ip(),
+                        edns: edns_present,
+                        ecs: client_ecs,
+                    },
+                    Some(&engine.geoip_manager),
+                )
+                .on_response_jump_path(&carried),
+            client_ecs,
+        };
+        let dedupe_hash = inflight_question.key();
 
         match decision {
             Decision::Static { rcode, answers } => {
@@ -918,7 +919,7 @@ pub(crate) async fn process_response_jump(
                                     // No other request in progress, create watch channel
                                     // 没有其他请求在进行,创建 watch channel
                                     let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                                    entry.insert(tx);
+                                    entry.insert(InflightEntry::new(&inflight_question, tx));
                                     cleanup_guards.push(InflightCleanupGuard::new(
                                         engine.inflight.clone(),
                                         dedupe_hash,
@@ -929,10 +930,16 @@ pub(crate) async fn process_response_jump(
                                 // This request's own entry: forward instead (see `holds`)
                                 // 这个请求自己的条目：改为自己转发（见 `holds`）
                                 Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
+                                // Another question's entry under the same key: forward instead (see
+                                // `InflightQuestion`)
+                                // 同一个键下别的问题的条目：改为自己转发（见 `InflightQuestion`）
+                                Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => {
+                                    None
+                                }
                                 Entry::Occupied(entry) => {
                                     // Another request in progress, subscribe to its result
                                     // 已有请求在进行,订阅其结果
-                                    let rx = entry.get().subscribe();
+                                    let rx = entry.get().tx.subscribe();
                                     Some(rx)
                                 }
                             };
@@ -1012,7 +1019,7 @@ pub(crate) async fn process_response_jump(
                                 // No other request in progress, create watch channel
                                 // 没有其他请求在进行,创建 watch channel
                                 let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                                entry.insert(tx);
+                                entry.insert(InflightEntry::new(&inflight_question, tx));
                                 cleanup_guards.push(InflightCleanupGuard::new(
                                     engine.inflight.clone(),
                                     dedupe_hash,
@@ -1022,10 +1029,12 @@ pub(crate) async fn process_response_jump(
                             }
                             // See the same arm above / 同上
                             Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
+                            // See the same arm above / 同上
+                            Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
                             Entry::Occupied(entry) => {
                                 // Another request in progress, subscribe to its result
                                 // 已有请求在进行,订阅其结果
-                                let rx = entry.get().subscribe();
+                                let rx = entry.get().tx.subscribe();
                                 Some(rx)
                             }
                         };

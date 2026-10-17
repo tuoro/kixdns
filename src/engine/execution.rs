@@ -72,6 +72,11 @@ pub struct CacheKeys {
     pub slot: u64,
     /// Inflight entry / inflight 条目
     pub inflight: u64,
+    /// The requester's part the keys were computed with; with the question it makes up
+    /// what the inflight entry is checked against (see `InflightQuestion`)
+    /// 算这些键时用的请求方部分；它和问题一起就是 inflight 条目要核对的内容（见
+    /// `InflightQuestion`）
+    pub requester: RequesterKey,
 }
 
 /// Pre-parsed data from handle_packet_fast to avoid re-parsing
@@ -348,6 +353,7 @@ impl Engine {
         CacheKeys {
             slot: h.finish(),
             inflight: inflight.finish(),
+            requester: *requester,
         }
     }
 
@@ -1844,12 +1850,12 @@ impl Engine {
         // 使用 tokio::watch 实现无锁通知
         // Remove the watch sender from inflight map and send result
         // 从 inflight map 移除 watch sender 并发送结果
-        if let Some((_, tx)) = self.inflight.remove(&dedupe_hash)
-            && tx.receiver_count() > 0
+        if let Some((_, entry)) = self.inflight.remove(&dedupe_hash)
+            && entry.tx.receiver_count() > 0
         {
             // Send result to all waiters (lock-free)
             // 向所有等待者发送结果 (无锁)
-            let _ = tx.send(Ok(reply()));
+            let _ = entry.tx.send(Ok(reply()));
         }
     }
 
@@ -1953,6 +1959,7 @@ mod tests {
     use crate::config::{Action, GlobalSettings, MatchOperator};
     use crate::engine::response::*;
     use crate::engine::rules::*;
+    use crate::engine::types::{InflightEntry, InflightQuestion};
     use crate::matcher::RuntimeResponseMatcherWithOp;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, UpdateMessage};
     use hickory_proto::rr::RecordType;
@@ -2334,6 +2341,210 @@ mod tests {
             RecordType::A,
         ));
         request.to_vec().unwrap()
+    }
+
+    /// 两个落在同一个 inflight 键上的不同名字。FxHasher 对每个字节算 (h + b) * K mod 2^64，两个等长的名字
+    /// 只在第一个标签上不同时，两个键的差是各字节的差乘上 K 的各次幂之和，与前面写入的命名空间和 pipeline
+    /// 无关。用格基约简找到一组都在 ±25 以内、这个和为 0 的差，换成小写字母就是这两个标签。
+    /// Two different names landing on one inflight key. FxHasher computes (h + b) * K mod 2^64 for
+    /// every byte, so for two names of equal length that differ only in their first label the keys
+    /// differ by the byte differences times powers of K, summed, whatever namespace and pipeline were
+    /// written before. Lattice reduction found differences within ±25 for which that sum is zero,
+    /// and lowercase letters spell them as these two labels.
+    const COLLIDING_NAMES: [&str; 2] = [
+        "abacaacgbafgoaca.example.com",
+        "jafaekaaaiaaaaad.example.com",
+    ];
+
+    fn query_for(name: &str) -> Vec<u8> {
+        let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        request.to_vec().unwrap()
+    }
+
+    /// The name of the question a reply answers / 应答回答的那个问题的名字
+    fn answered_name(reply: &Bytes) -> String {
+        let reply = Message::from_bytes(reply).expect("parse");
+        reply
+            .queries
+            .first()
+            .expect("a question")
+            .name()
+            .to_string()
+    }
+
+    /// 先问 `COLLIDING_NAMES` 的第一个名字，它还在等上游时问第二个，返回两个应答
+    /// Ask the first of `COLLIDING_NAMES`, then the second while the first still waits for its
+    /// upstream, and return both replies
+    async fn ask_colliding_names(engine: &Engine, clients: [&str; 2]) -> [Bytes; 2] {
+        let first = async {
+            engine
+                .handle_packet(&query_for(COLLIDING_NAMES[0]), clients[0].parse().unwrap())
+                .await
+        };
+        let second = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            engine
+                .handle_packet(&query_for(COLLIDING_NAMES[1]), clients[1].parse().unwrap())
+                .await
+        };
+        let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("both answer in time");
+        [first.expect("an answer"), second.expect("an answer")]
+    }
+
+    /// 同 `continue_config_with_timeout`，上游超时 1 秒，默认上游是 `default_upstream`
+    /// The same as `continue_config_with_timeout` with a 1 s upstream timeout and
+    /// `default_upstream` as the default upstream
+    fn config_with_default_upstream(
+        pipeline_select: serde_json::Value,
+        pipelines: serde_json::Value,
+        default_upstream: &str,
+    ) -> RuntimePipelineConfig {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": default_upstream,
+                "upstream_timeout_ms": 1000,
+                "enable_tcp_fallback": false
+            },
+            "pipeline_select": pipeline_select,
+            "pipelines": pipelines
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    /// 把查询发往上游的两种动作：明写的 forward，和发往默认上游、可以复用规则越过的应答的 allow
+    /// The two actions that send a query upstream: an explicit forward, and allow, which goes to
+    /// the default upstream and may reuse an answer a rule continued past
+    fn forwarding_actions(upstream: &str) -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({ "type": "forward", "upstream": upstream }),
+            serde_json::json!({ "type": "allow" }),
+        ]
+    }
+
+    /// 合并查询只合并问同一个问题的请求。另一个问题的条目落在同一个键上时，请求自己转发，拿到的是自己
+    /// 问题的应答，而不是那个条目交出的别的问题的应答。
+    /// Merging only merges requests asking the same question. When another question's entry lands
+    /// on the same key, the request forwards by itself and gets the answer to its own question,
+    /// not the other question's answer that entry hands out.
+    #[tokio::test]
+    async fn a_request_never_takes_another_questions_answer_from_a_shared_key() {
+        let (slow, queries) = spawn_answering_upstream_after(
+            "192.0.2.20".parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .await;
+        for action in forwarding_actions(&slow) {
+            let engine = Engine::new(
+                config_with_default_upstream(
+                    serde_json::json!([]),
+                    serde_json::json!([{ "id": "main", "rules": [{
+                        "name": "all",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [action]
+                    }] }]),
+                    &slow,
+                ),
+                "test".to_string(),
+            )
+            .expect("engine");
+            let keys = COLLIDING_NAMES.map(|name| {
+                Engine::cache_keys(
+                    engine.state.load().cache_namespace("main"),
+                    "main",
+                    name.as_bytes(),
+                    RecordType::A,
+                    DNSClass::IN,
+                    &RequesterKey::NONE,
+                    None,
+                )
+                .inflight
+            });
+            assert_eq!(
+                keys[0], keys[1],
+                "the two names land on the same inflight key"
+            );
+
+            let before = queries.load(Ordering::Relaxed);
+            let [_, second] =
+                ask_colliding_names(&engine, ["10.0.0.1:53000", "10.0.0.1:53001"]).await;
+            assert_eq!(
+                answered_name(&second),
+                format!("{}.", COLLIDING_NAMES[1]),
+                "{action}"
+            );
+            assert_eq!(
+                queries.load(Ordering::Relaxed) - before,
+                2,
+                "{action}: each name asked upstream itself"
+            );
+        }
+    }
+
+    /// 响应跳转路径上也一样：两个请求从不同的 pipeline 跳进同一个 pipeline，跳转路径上的键相同时，
+    /// 后来的请求不等前一个的条目。
+    /// The same on the response-jump path: two requests jump into one pipeline from different
+    /// pipelines, and when their keys on the jump path are the same the later one does not wait on
+    /// the earlier one's entry.
+    #[tokio::test]
+    async fn a_request_on_the_jump_path_never_takes_another_questions_answer() {
+        let (pre, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let (slow, queries) = spawn_answering_upstream_after(
+            "192.0.2.20".parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .await;
+        let entry = |id: &str| {
+            serde_json::json!({ "id": id, "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": pre }],
+                "response_matchers": [{ "type": "upstream_equals", "value": pre }],
+                "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
+            }] })
+        };
+        for action in forwarding_actions(&slow) {
+            let engine = Engine::new(
+                config_with_default_upstream(
+                    serde_json::json!([
+                        { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                        { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                    ]),
+                    serde_json::json!([
+                        entry("a"),
+                        entry("b"),
+                        { "id": "other", "rules": [{
+                            "name": "all",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [action]
+                        }] }
+                    ]),
+                    &slow,
+                ),
+                "test".to_string(),
+            )
+            .expect("engine");
+
+            let before = queries.load(Ordering::Relaxed);
+            let [_, second] =
+                ask_colliding_names(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await;
+            assert_eq!(
+                answered_name(&second),
+                format!("{}.", COLLIDING_NAMES[1]),
+                "{action}"
+            );
+            assert_eq!(
+                queries.load(Ordering::Relaxed) - before,
+                2,
+                "{action}: each name asked upstream itself"
+            );
+        }
     }
 
     fn first_a_record(response: anyhow::Result<Bytes>) -> Option<std::net::Ipv4Addr> {
@@ -2841,20 +3052,31 @@ mod tests {
             "test".to_string(),
         )
         .expect("engine");
+        let question = InflightQuestion {
+            namespace: engine.state.load().cache_namespace("main"),
+            pipeline_id: "main",
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        };
         let keys = Engine::cache_keys(
-            engine.state.load().cache_namespace("main"),
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            &RequesterKey::NONE,
+            question.namespace,
+            question.pipeline_id,
+            question.qname,
+            question.qtype,
+            question.qclass,
+            &question.requester,
             None,
         );
         let key = keys.slot;
         // 另一个请求在刷新所用的 inflight 键下登记的条目 / Another request's entry under the refresh's inflight key
         let (owner, waiter) =
             tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
-        engine.inflight.insert(keys.inflight, owner);
+        engine
+            .inflight
+            .insert(keys.inflight, InflightEntry::new(&question, owner));
 
         let refreshed = tokio::time::timeout(
             Duration::from_secs(5),
@@ -4591,15 +4813,30 @@ mod tests {
 
     /// The keys of the `stale.com` query in the default pipeline / 默认 pipeline 里 `stale.com` 查询的键
     fn stale_com_keys(engine: &Engine) -> CacheKeys {
+        let question = stale_com_question(engine);
         Engine::cache_keys(
-            engine.state.load().cache_namespace("default"),
-            "default",
-            b"stale.com",
-            RecordType::A,
-            DNSClass::IN,
-            &crate::matcher::RequesterKey::NONE,
+            question.namespace,
+            question.pipeline_id,
+            question.qname,
+            question.qtype,
+            question.qclass,
+            &question.requester,
             None,
         )
+    }
+
+    /// The inflight question of the `stale.com` query in the default pipeline
+    /// 默认 pipeline 里 `stale.com` 查询的 inflight 问题
+    fn stale_com_question(engine: &Engine) -> InflightQuestion<'static> {
+        InflightQuestion {
+            namespace: engine.state.load().cache_namespace("default"),
+            pipeline_id: "default",
+            qname: b"stale.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            requester: crate::matcher::RequesterKey::NONE,
+            client_ecs: None,
+        }
     }
 
     fn engine_from_json(raw: serde_json::Value) -> Engine {
@@ -4694,7 +4931,10 @@ mod tests {
         // 另一个请求在这个查询转发时所用的 inflight 键下登记了条目
         let inflight = stale_com_keys(&engine).inflight;
         let (tx, rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
-        engine.inflight.insert(inflight, tx);
+        engine.inflight.insert(
+            inflight,
+            InflightEntry::new(&stale_com_question(&engine), tx),
+        );
 
         let result = refresh(&engine, dedupe_hash).await;
 
