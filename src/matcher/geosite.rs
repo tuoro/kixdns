@@ -744,6 +744,17 @@ fn attr_filter_matches(attrs: &[String], filter: &str) -> bool {
     attrs.iter().any(|a| a.eq_ignore_ascii_case(filter))
 }
 
+/// 一条 V2Ray Domain 消息里用到的字段（见 [`GeoSiteManager::read_domain`]）
+/// The fields of a V2Ray Domain message used here (see [`GeoSiteManager::read_domain`])
+struct V2rayDomain<'a> {
+    /// `type`，没写时是 0（关键词） / `type`, 0 (keyword) when left out
+    kind: usize,
+    /// `value`，没写时没有 / `value`, absent when left out
+    value: Option<&'a [u8]>,
+    /// 各个 `attribute` 的 key / The key of each `attribute`
+    attrs: Vec<String>,
+}
+
 /// Parse a V2Ray Domain.Attribute protobuf message to extract the key field
 /// Attribute { string key = 1; oneof typed_value { ... } }
 fn parse_attribute_key(data: &[u8]) -> Option<String> {
@@ -1546,51 +1557,29 @@ impl GeoSiteManager {
         Ok((full, suffixes))
     }
 
-    /// 一条 Domain 消息的类型和值的长度，读法和 [`Self::parse_v2ray_domains`] 一样，但不取出值
-    /// One Domain message's type and value length, read as [`Self::parse_v2ray_domains`] reads
-    /// them but without taking the value
+    /// 一条 Domain 消息的类型和值的长度（见 [`Self::read_domain`]），给 [`Self::count_names`] 用
+    /// One Domain message's type and value length (see [`Self::read_domain`]), for
+    /// [`Self::count_names`]
     fn domain_type_and_len(data: &[u8]) -> Option<(usize, usize)> {
-        let mut pos = 0;
-        while pos < data.len() {
-            let (field, wire_type) = (data[pos] >> 3, data[pos] & 0x07);
-            pos += 1;
-            match (field, wire_type) {
-                (1, 0) => {
-                    let kind = parse_varint(data, &mut pos).ok()?;
-                    if data.get(pos)? >> 3 != 2 {
-                        return None;
-                    }
-                    pos += 1;
-                    return Some((kind, parse_varint(data, &mut pos).ok()?));
-                }
-                (_, 0) => {
-                    parse_varint(data, &mut pos).ok()?;
-                }
-                (_, 1) => pos += 8,
-                (_, 5) => pos += 4,
-                (_, 2) => {
-                    let len = parse_varint(data, &mut pos).ok()?;
-                    pos += len;
-                }
-                _ => return None,
-            }
-        }
-        None
+        let domain = Self::read_domain(data, false).ok()?;
+        Some((domain.kind, domain.value?.len()))
     }
 
-    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
-        let mut results = Vec::new();
+    /// 读出一条 V2Ray Domain 消息的类型（字段 1）、值（字段 2）和属性（字段 3，`with_attrs` 时才取），字段不论先后。
+    /// proto3 不写取默认值的字段：没有字段 1 时类型是 0（Plain，即关键词），v2ray 数据里的关键词条目正是这样写的；
+    /// 值为空时同样不写，这样的条目没有值。
+    /// Reads one V2Ray Domain message's type (field 1), value (field 2) and attributes (field 3,
+    /// taken only `with_attrs`), in whatever order they come. proto3 leaves out fields holding
+    /// their default: without field 1 the type is 0 (Plain, that is a keyword), which is exactly
+    /// how keyword entries are written in v2ray data; an empty value is left out the same way, and
+    /// such an entry has no value.
+    fn read_domain(data: &[u8], with_attrs: bool) -> anyhow::Result<V2rayDomain<'_>> {
+        let mut domain = V2rayDomain {
+            kind: 0,
+            value: None,
+            attrs: Vec::new(),
+        };
         let mut pos = 0;
-
-        let mut current_matcher: Option<DomainMatcher> = None;
-        let mut current_attrs: Vec<String> = Vec::new();
-
-        tracing::debug!(
-            target = "geosite",
-            data_len = data.len(),
-            "starting to parse V2Ray domains"
-        );
-
         while pos < data.len() {
             // 读取 field tag 和 wire type / Read field tag and wire type
             let field_tag = data[pos] >> 3;
@@ -1603,57 +1592,10 @@ impl GeoSiteManager {
                     if wire_type != 0 {
                         anyhow::bail!("invalid wire type for type field");
                     }
-                    let domain_type = parse_varint(data, &mut pos)?;
-
-                    // 读取 field 2: value (string, wire_type 2)
-                    if pos >= data.len() || data[pos] >> 3 != 2 {
-                        anyhow::bail!("missing value field after type field");
-                    }
-                    pos += 1; // skip field tag
-
-                    let value_len = parse_varint(data, &mut pos)?;
-
-                    if pos + value_len > data.len() {
-                        anyhow::bail!("invalid domain data: incomplete value string");
-                    }
-
-                    let domain_value =
-                        String::from_utf8_lossy(&data[pos..pos + value_len]).to_string();
-                    pos += value_len;
-
-                    // 根据 V2Ray Domain.Type 创建匹配器 / Create matcher based on V2Ray Domain.Type
-                    let matcher = match domain_type {
-                        0 => DomainMatcher::Keyword(domain_value), // Plain
-                        1 => {
-                            // Regex
-                            match compile_geosite_regex(&domain_value) {
-                                Ok(re) => DomainMatcher::Regex(re),
-                                Err(err) => {
-                                    warn!(target = "geosite", pattern = %domain_value, error = %err,
-                                         "invalid regex pattern, using empty regex");
-                                    // 只匹配空名字的正则，编译一次，之后每次只是克隆
-                                    // A regex matching only the empty name, compiled once and cloned after
-                                    static EMPTY: LazyLock<Regex> =
-                                        LazyLock::new(|| Regex::new(r"^$").unwrap());
-                                    DomainMatcher::Regex(EMPTY.clone())
-                                }
-                            }
-                        }
-                        2 => {
-                            // RootDomain - 转换为 Suffix 匹配器 / Convert to Suffix matcher
-                            DomainMatcher::Suffix(format!(".{}", domain_value))
-                        }
-                        3 => DomainMatcher::Full(domain_value), // Full
-                        _ => {
-                            warn!(target = "geosite", type = domain_type,
-                                 "unknown V2Ray domain type, using full matcher");
-                            DomainMatcher::Full(domain_value)
-                        }
-                    };
-                    current_matcher = Some(matcher);
+                    domain.kind = parse_varint(data, &mut pos)?;
                 }
                 2 => {
-                    // field 2: value (string, wire_type 2) — standalone, skip
+                    // field 2: value (string, wire_type 2)
                     if wire_type != 2 {
                         anyhow::bail!("invalid wire type for value field");
                     }
@@ -1661,6 +1603,7 @@ impl GeoSiteManager {
                     if pos + value_len > data.len() {
                         anyhow::bail!("invalid domain data: incomplete value string");
                     }
+                    domain.value = Some(&data[pos..pos + value_len]);
                     pos += value_len;
                 }
                 3 => {
@@ -1673,8 +1616,9 @@ impl GeoSiteManager {
                     if pos + attr_len > data.len() {
                         anyhow::bail!("invalid domain data: incomplete attribute");
                     }
-                    if let Some(key) = parse_attribute_key(&data[pos..pos + attr_len]) {
-                        current_attrs.push(key);
+                    if with_attrs && let Some(key) = parse_attribute_key(&data[pos..pos + attr_len])
+                    {
+                        domain.attrs.push(key);
                     }
                     pos += attr_len;
                 }
@@ -1710,18 +1654,55 @@ impl GeoSiteManager {
                 }
             }
         }
+        Ok(domain)
+    }
 
-        if let Some(matcher) = current_matcher.take() {
-            results.push((matcher, std::mem::take(&mut current_attrs)));
-        }
-
+    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DomainMatcher, Vec<String>)>> {
         tracing::debug!(
             target = "geosite",
-            result_count = results.len(),
-            "parsed V2Ray domains"
+            data_len = data.len(),
+            "starting to parse V2Ray domains"
         );
 
-        Ok(results)
+        let domain = Self::read_domain(data, true)?;
+        let Some(value) = domain.value else {
+            return Ok(Vec::new());
+        };
+        let domain_value = String::from_utf8_lossy(value).into_owned();
+
+        // 根据 V2Ray Domain.Type 创建匹配器 / Create matcher based on V2Ray Domain.Type
+        let matcher = match domain.kind {
+            0 => DomainMatcher::Keyword(domain_value), // Plain
+            1 => {
+                // Regex
+                match compile_geosite_regex(&domain_value) {
+                    Ok(re) => DomainMatcher::Regex(re),
+                    Err(err) => {
+                        warn!(target = "geosite", pattern = %domain_value, error = %err,
+                             "invalid regex pattern, using empty regex");
+                        // 只匹配空名字的正则，编译一次，之后每次只是克隆
+                        // A regex matching only the empty name, compiled once and cloned after
+                        static EMPTY: LazyLock<Regex> =
+                            LazyLock::new(|| Regex::new(r"^$").unwrap());
+                        DomainMatcher::Regex(EMPTY.clone())
+                    }
+                }
+            }
+            2 => {
+                // RootDomain - 转换为 Suffix 匹配器 / Convert to Suffix matcher
+                DomainMatcher::Suffix(format!(".{}", domain_value))
+            }
+            3 => DomainMatcher::Full(domain_value), // Full
+            kind => {
+                warn!(target = "geosite", type = kind,
+                     "unknown V2Ray domain type, using full matcher");
+                DomainMatcher::Full(domain_value)
+            }
+        };
+
+        tracing::debug!(target = "geosite", "parsed V2Ray domains");
+
+        Ok(vec![(matcher, domain.attrs)])
     }
 
     /// 从 V2Ray 格式字符串加载 GeoSite 数据 / Load GeoSite data from V2Ray format string
@@ -2042,6 +2023,33 @@ mod tests {
         let path = dir.path().join("geosite.dat");
         std::fs::write(&path, build_dat(entries)).unwrap();
         path
+    }
+
+    /// proto3 不写取默认值的字段：v2ray 数据里的关键词条目没有类型字段，只有值，照样是关键词；字段不论先后。
+    /// 按需加载和全部加载都是这样。
+    /// proto3 leaves out fields holding their default: a keyword entry in v2ray data has no type
+    /// field, only its value, and is a keyword all the same; fields come in any order. Both
+    /// selective and full loading read it so.
+    #[test]
+    fn a_keyword_without_a_type_field_is_still_a_keyword() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value_first = encode_str(2, "only.test");
+        value_first.extend(encode_varint_field(1, 3));
+        let path = write_dat(
+            &dir,
+            &[build_geosite("G", &[encode_str(2, "google"), value_first])],
+        );
+
+        let parsed = GeoSiteManager::parse_dat_file_selective(&path, &["g".to_string()]).unwrap();
+        let (_, tag) = &parsed[0];
+        assert!(tag.matches("www.google.com"));
+        assert!(tag.matches("only.test"));
+        assert!(!tag.matches("www.only.test"));
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+        assert!(manager.matches("g", "www.google.com"));
+        assert!(manager.matches("g", "only.test"));
     }
 
     #[test]
