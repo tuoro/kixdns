@@ -24,23 +24,28 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// mimalloc 的两个设置，在任何分配之前设好。家用时内核大部分时间闲着：默认设置下，mimalloc 把释放的内存
-/// 留着备用，加载 GeoSite 用过的临时内存闲下来也不归还（实测空闲时多占约 70 MiB）。改成释放即还、不预先
-/// 提交整块内存以后，空闲和高负载时的内存都不比原来用 glibc 时高，查询仍快得多。「不预先提交」只对设好之后
-/// 才建的内存区生效，所以要赶在第一次分配之前：Linux 和 FreeBSD 上放进 `.init_array`，程序装载时、Rust
-/// 运行时分配内存之前就执行；别的平台在 main 一开始设。
+/// mimalloc 的一个设置，在任何分配之前设好：不预先提交整块内存。预先提交的内存区，mimalloc 会为它申请
+/// 透明大页，问题见下面。这个设置只对设好之后才建的内存区生效，所以要赶在第一次分配之前：Linux 和 FreeBSD
+/// 上放进 `.init_array`，程序装载时、Rust 运行时分配内存之前就执行；别的平台在 main 一开始设。
+///
+/// 释放的内存按 mimalloc 默认的延迟（1 秒）归还系统，不改成释放即还。释放即还时，新名字用到的内存页多半
+/// 是刚还回去又要回来的，几乎每个查询都多一次缺页，新名字的吞吐少约一成；省下的内存实测只有约 1 MiB
+/// （空闲时、GeoSite 规则压测后、20 万条缓存压满后都是）。到期的归还在之后的分配里顺带完成。
 ///
 /// 另外在 Linux 上只对本进程关掉透明大页，不改系统设置。用了透明大页，零碎归还过的内存再用到时，系统要把
 /// 整块 2 MiB 清零，单核上事件循环会停住（外部压测在 mimalloc 默认设置下测到 p99 上百毫秒）。不预先提交时
 /// mimalloc 已经不为内存区申请大页，但透明大页设成 always 的系统不申请也会给，所以直接关掉。
-/// Two mimalloc settings, applied before any allocation. At home the kernel sits idle most of the
-/// time: by default mimalloc keeps freed memory for reuse, and the temporary memory used to load GeoSite
-/// is not returned once things go quiet (measured at about 70 MiB extra while idle). Purging freed
-/// memory at once and not committing whole arenas up front keeps memory no higher than it was with
-/// glibc, idle and under load, and queries stay much faster. Not committing up front applies only to
-/// arenas created after it is set, so it has to beat the first allocation: on Linux and FreeBSD it sits
-/// in `.init_array` and runs when the program is loaded, before the Rust runtime allocates anything;
-/// elsewhere it is set at the start of main.
+/// One mimalloc setting, applied before any allocation: whole arenas are not committed up front. For
+/// an arena committed up front mimalloc asks for transparent huge pages, the trouble with which is
+/// described below. The setting applies only to arenas created after it is set, so it has to beat the
+/// first allocation: on Linux and FreeBSD it sits in `.init_array` and runs when the program is loaded,
+/// before the Rust runtime allocates anything; elsewhere it is set at the start of main.
+///
+/// Freed memory goes back to the system after mimalloc's default delay (one second) rather than at
+/// once. Purging at once makes most pages a new name touches ones that were just handed back and are
+/// taken again, so nearly every query costs one more page fault and new names lose about a tenth of
+/// their throughput; the memory it saves measured about 1 MiB (idle, after a GeoSite rule load test,
+/// and with 200,000 cached answers alike). Purges that fall due are carried out by later allocations.
 ///
 /// On Linux transparent huge pages are also turned off for this process alone, leaving the system
 /// setting as it is. With them, memory that was returned piecemeal and is touched again makes the
@@ -62,7 +67,9 @@ mod allocator_tuning {
     // mimalloc v3 `mi_option_e` 里的编号（libmimalloc-sys 自带的常量还是旧版本的）；依赖升级、编号变了时，
     // 下面的测试会报错 / Positions in mimalloc v3's `mi_option_e` (libmimalloc-sys still ships the old
     // constants); the test below fails should a dependency update move them
-    /// `mi_option_purge_delay`：释放后多久归还系统，毫秒 / How long after a free memory is purged, in ms
+    /// `mi_option_purge_delay`：释放后多久归还系统，毫秒；保持默认值（见上）/ How long after a free memory
+    /// is purged, in ms; left at its default (see above)
+    #[cfg(test)]
     const PURGE_DELAY: c_int = 15;
     /// `mi_option_arena_eager_commit`：是否预先提交整块内存 / Whether whole arenas are committed up front
     const ARENA_EAGER_COMMIT: c_int = 4;
@@ -80,11 +87,10 @@ mod allocator_tuning {
     }
 
     pub(crate) fn apply() {
-        // SAFETY: 在程序装载时或 main 一开始调用，还没有别的线程；这两个选项随时可以改
+        // SAFETY: 在程序装载时或 main 一开始调用，还没有别的线程；这个选项随时可以改
         // SAFETY: called while the program loads or at the very start of main, before any other thread
-        // exists; both options may change at any time
+        // exists; the option may change at any time
         unsafe {
-            mi_option_set(PURGE_DELAY, 0);
             mi_option_set(ARENA_EAGER_COMMIT, 0);
         }
         // 内核早于 3.15 时不认这个选项、返回错误，那就照旧 / Kernels before 3.15 reject the option, and
@@ -110,10 +116,11 @@ mod allocator_tuning {
         use super::c_ulong;
         use super::{ARENA_EAGER_COMMIT, PURGE_DELAY, apply, mi_option_get};
 
-        /// 两个编号还对应这两个选项（默认值分别是 1000 毫秒和 2），`apply` 把它们都设成 0，
-        /// 在 Linux 上还关掉本进程的透明大页
-        /// The two positions still name these options (their defaults are 1000 ms and 2), `apply` sets
-        /// both to 0, and on Linux it also turns transparent huge pages off for the process
+        /// 两个编号还对应这两个选项（默认值分别是 1000 毫秒和 2）；`apply` 把预先提交设成 0，归还延迟
+        /// 留着默认值，在 Linux 上还关掉本进程的透明大页
+        /// The two positions still name these options (their defaults are 1000 ms and 2); `apply` sets
+        /// eager commit to 0, leaves the purge delay at its default, and on Linux also turns transparent
+        /// huge pages off for the process
         #[test]
         fn allocator_tuning_is_found_and_applied() {
             // SAFETY: 只读选项 / Only reads the options
@@ -129,7 +136,7 @@ mod allocator_tuning {
                 "the defaults of purge_delay and arena_eager_commit"
             );
             apply();
-            assert_eq!(read(), (0, 0));
+            assert_eq!(read(), (1_000, 0), "the purge delay stays at its default");
             // SAFETY: 只读本进程的标记 / Only reads a flag of this process
             #[cfg(target_os = "linux")]
             assert_eq!(
