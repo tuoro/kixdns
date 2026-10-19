@@ -11,6 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use anyhow::Context;
+use arc_swap::ArcSwap;
 #[cfg(unix)]
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -28,7 +29,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
+use rustc_hash::FxHashMap;
 #[cfg(unix)]
 use serde::Deserialize;
 #[cfg(unix)]
@@ -396,6 +398,152 @@ impl RequestLatency {
     }
 }
 
+/// 按名字分的一组统计项（每个 Pipeline、规则、上游各一项）。键只由配置里的名字、固定标签和上游回的
+/// 响应码拼成，不来自客户端，所以用快的 FxHash 也没人能凑出冲突。计数只读表、不加锁；头一次出现的统计项
+/// 才在 `metric_series_insert_lock` 里复制整张表、加上自己再换上去。表里存的是 `Arc`，经旧表和新表计的
+/// 是同一个数。
+/// Series keyed by name (one per pipeline, rule or upstream). Keys are made only of names in the
+/// config, fixed labels and the response codes upstreams return, never of anything a client sends, so
+/// the fast FxHash leaves nobody a way to force collisions.
+/// Counting only reads the table and takes no lock; a series seen for the first time copies the table
+/// under `metric_series_insert_lock`, adds itself and swaps the copy in. The table holds `Arc`s, so
+/// counts made through the old table and the new one land on the same value.
+struct Series<V> {
+    table: ArcSwap<FxHashMap<Arc<str>, Arc<V>>>,
+}
+
+impl<V> Default for Series<V> {
+    fn default() -> Self {
+        Self {
+            table: ArcSwap::from_pointee(FxHashMap::default()),
+        }
+    }
+}
+
+impl<V> Series<V> {
+    /// 把 `key` 那一项交给 `read`；没有这一项时为 None / Hands the series under `key` to `read`; None
+    /// when there is none
+    #[inline]
+    fn with<R>(&self, key: &str, read: impl FnOnce(&V) -> R) -> Option<R> {
+        self.table.load().get(key).map(|value| read(value))
+    }
+
+    fn len(&self) -> usize {
+        self.table.load().len()
+    }
+
+    /// 此刻的整张表，导出时用 / The whole table as it is now, for export
+    fn snapshot(&self) -> Arc<FxHashMap<Arc<str>, Arc<V>>> {
+        self.table.load_full()
+    }
+
+    /// 加上一项。`_locked` 是 `metric_series_insert_lock` 的锁：两个新项不会各拿一份旧表、互相覆盖
+    /// Adds a series. `_locked` is the guard of `metric_series_insert_lock`: two new series never each
+    /// copy the old table and overwrite each other
+    fn insert(&self, _locked: &MutexGuard<'_, ()>, key: &str, value: V) {
+        let mut table = (**self.table.load()).clone();
+        table.insert(Arc::from(key), Arc::new(value));
+        self.table.store(Arc::new(table));
+    }
+}
+
+/// 同时在跟的请求按编号直接定位的槽位数，2 的幂 / Slots the running requests are placed in by number, a
+/// power of two
+const LOOKUP_SLOTS: usize = 4_096;
+
+/// 已经计过一次缓存查找、还没结束的请求。请求跳转后会在目标 pipeline 下再查一次，而命中率按请求算
+/// （一个请求最多命中一次），所以每个请求只计一次查找。请求编号直接定位一个槽位，里面存「编号 + 1」
+/// （0 表示空），请求结束时清掉；槽位正被另一个还没结束的请求占着时（同时在处理的请求要多过槽位数），
+/// 这个请求改记在共享表里。一个请求的几次查找前后相继、不会同时发生，查它在不在共享表里的也只有它自己。
+/// Requests still running whose cache lookup is already counted. A request looks again under the
+/// target pipeline after a jump, while the hit rate is per request (a request hits at most once), so
+/// each request counts one lookup. The request number picks a slot directly, which holds the number
+/// plus one (0 is empty) and is cleared when the request finishes; when another running request holds
+/// that slot (more requests are in progress than there are slots), the request is noted in a shared
+/// map instead. One request's lookups follow one another and never overlap, and only the request
+/// itself asks whether it is in the shared map.
+struct LookupsCounted {
+    slots: Box<[AtomicU64]>,
+    overflow: DashMap<u64, ()>,
+    /// `overflow` 里有几条：为 0 时不碰共享表 / How many requests `overflow` holds: at 0 the map is not
+    /// touched
+    overflow_len: AtomicUsize,
+}
+
+impl Default for LookupsCounted {
+    fn default() -> Self {
+        Self::with_slots(LOOKUP_SLOTS)
+    }
+}
+
+impl LookupsCounted {
+    fn with_slots(slots: usize) -> Self {
+        assert!(slots.is_power_of_two(), "the slot count is a power of two");
+        Self {
+            slots: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            overflow: DashMap::new(),
+            overflow_len: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn slot(&self, request_id: u64) -> &AtomicU64 {
+        &self.slots[request_id as usize & (self.slots.len() - 1)]
+    }
+
+    /// `request_id` 第一次查缓存时为真 / True on `request_id`'s first cache lookup
+    #[inline]
+    fn first(&self, request_id: u64) -> bool {
+        let mark = request_id.wrapping_add(1);
+        let slot = self.slot(request_id);
+        let held = slot.load(Ordering::Relaxed);
+        if held == mark {
+            return false;
+        }
+        if self.overflow_len.load(Ordering::Relaxed) > 0 && self.overflow.contains_key(&request_id)
+        {
+            return false;
+        }
+        if held == 0
+            && slot
+                .compare_exchange(0, mark, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            return true;
+        }
+        self.overflow.insert(request_id, ());
+        self.overflow_len.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// `request_id` 结束了 / `request_id` finished
+    #[inline]
+    fn finished(&self, request_id: u64) {
+        let mark = request_id.wrapping_add(1);
+        if self
+            .slot(request_id)
+            .compare_exchange(mark, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        if self.overflow_len.load(Ordering::Relaxed) > 0
+            && self.overflow.remove(&request_id).is_some()
+        {
+            self.overflow_len.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.slots
+            .iter()
+            .all(|slot| slot.load(Ordering::Relaxed) == 0)
+            && self.overflow.is_empty()
+            && self.overflow_len.load(Ordering::Relaxed) == 0
+    }
+}
+
 pub struct PanelMetrics {
     #[cfg_attr(not(unix), allow(dead_code))]
     started_at_unix: u64,
@@ -404,12 +552,9 @@ pub struct PanelMetrics {
     requests_total: AtomicU64,
     requests_inflight: AtomicUsize,
     cache_lookups_total: AtomicU64,
-    /// 已经计过一次缓存查找、还没结束的请求。请求跳转后会在目标 pipeline 下再查一次，
-    /// 而命中率按请求算（一个请求最多命中一次），所以每个请求只计一次查找。
-    /// Requests still running whose cache lookup is already counted. A request looks again
-    /// under the target pipeline after a jump, while the hit rate is per request (a request
-    /// hits at most once), so each request counts one lookup.
-    cache_lookup_counted: DashMap<u64, ()>,
+    /// 每个请求只计一次缓存查找（见 `LookupsCounted`） / Each request counts one cache lookup (see
+    /// `LookupsCounted`)
+    cache_lookup_counted: LookupsCounted,
     cache_hits_fresh: AtomicU64,
     cache_hits_stale: AtomicU64,
     cache_stale_client_timeout: AtomicU64,
@@ -418,17 +563,17 @@ pub struct PanelMetrics {
     requests_failed: AtomicU64,
     requests_cancelled: AtomicU64,
     request_latency: RequestLatency,
-    upstream_latency: DashMap<Arc<str>, LatencySum>,
+    upstream_latency: Series<LatencySum>,
     /// 只算拿到响应的尝试（成功或被拒绝），超时与连接错误不计入。
     /// Only attempts that received a response (success or rejected); timeouts and
     /// connection errors are left out.
-    upstream_response_latency: DashMap<Arc<str>, LatencySum>,
-    upstream_rcodes: DashMap<Arc<str>, AtomicU64>,
-    upstream_via: DashMap<Arc<str>, AtomicU64>,
-    pipeline_hits: DashMap<Arc<str>, AtomicU64>,
-    rule_matches: DashMap<Arc<str>, AtomicU64>,
-    upstream_attempts: DashMap<Arc<str>, AtomicU64>,
-    upstream_results: DashMap<Arc<str>, AtomicU64>,
+    upstream_response_latency: Series<LatencySum>,
+    upstream_rcodes: Series<AtomicU64>,
+    upstream_via: Series<AtomicU64>,
+    pipeline_hits: Series<AtomicU64>,
+    rule_matches: Series<AtomicU64>,
+    upstream_attempts: Series<AtomicU64>,
+    upstream_results: Series<AtomicU64>,
     metric_series_insert_lock: Mutex<()>,
     metric_series_dropped: AtomicU64,
     reload_success: AtomicU64,
@@ -459,7 +604,7 @@ impl Default for PanelMetrics {
             requests_total: AtomicU64::new(0),
             requests_inflight: AtomicUsize::new(0),
             cache_lookups_total: AtomicU64::new(0),
-            cache_lookup_counted: DashMap::new(),
+            cache_lookup_counted: LookupsCounted::default(),
             cache_hits_fresh: AtomicU64::new(0),
             cache_hits_stale: AtomicU64::new(0),
             cache_stale_client_timeout: AtomicU64::new(0),
@@ -468,14 +613,14 @@ impl Default for PanelMetrics {
             requests_failed: AtomicU64::new(0),
             requests_cancelled: AtomicU64::new(0),
             request_latency: RequestLatency::default(),
-            upstream_latency: DashMap::new(),
-            upstream_response_latency: DashMap::new(),
-            upstream_rcodes: DashMap::new(),
-            upstream_via: DashMap::new(),
-            pipeline_hits: DashMap::new(),
-            rule_matches: DashMap::new(),
-            upstream_attempts: DashMap::new(),
-            upstream_results: DashMap::new(),
+            upstream_latency: Series::default(),
+            upstream_response_latency: Series::default(),
+            upstream_rcodes: Series::default(),
+            upstream_via: Series::default(),
+            pipeline_hits: Series::default(),
+            rule_matches: Series::default(),
+            upstream_attempts: Series::default(),
+            upstream_results: Series::default(),
             metric_series_insert_lock: Mutex::new(()),
             metric_series_dropped: AtomicU64::new(0),
             reload_success: AtomicU64::new(0),
@@ -557,28 +702,11 @@ impl PanelMetrics {
     /// 累计一次上游耗时；序列数量与键长度受同一上限约束。
     fn record_upstream_latency(
         &self,
-        map: &DashMap<Arc<str>, LatencySum>,
+        series: &Series<LatencySum>,
         key: &str,
         latency: std::time::Duration,
     ) {
-        if let Some(entry) = map.get(key) {
-            entry.add(latency);
-            return;
-        }
-        if key.len() > MAX_METRIC_KEY_BYTES {
-            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let _guard = self.metric_series_insert_lock.lock();
-        if let Some(entry) = map.get(key) {
-            entry.add(latency);
-        } else if map.len() < MAX_METRIC_SERIES_PER_MAP {
-            let sum = LatencySum::default();
-            sum.add(latency);
-            map.insert(Arc::from(key), sum);
-        } else {
-            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
-        }
+        self.update_series(series, key, |sum| sum.add(latency));
     }
 
     #[inline]
@@ -633,24 +761,37 @@ impl PanelMetrics {
     /// 按借来的键计数，只有第一次出现的统计项才分配它的键
     /// Counts by a borrowed key; only a series seen for the first time allocates its key
     #[inline]
-    fn increment(&self, map: &DashMap<Arc<str>, AtomicU64>, key: &str) {
-        if let Some(counter) = map.get(key) {
+    fn increment(&self, series: &Series<AtomicU64>, key: &str) {
+        self.update_series(series, key, |counter| {
             counter.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// 把 `key` 那一项交给 `update`。头一次出现的统计项在锁里加上；键太长或这一组已满时不加，只计一次
+    /// 丢弃。
+    /// Hands the series under `key` to `update`. A series seen for the first time is added under the
+    /// lock; a key too long or a full set adds nothing and counts one dropped series.
+    #[inline]
+    fn update_series<V: Default>(&self, series: &Series<V>, key: &str, update: impl Fn(&V)) {
+        if series.with(key, &update).is_some() {
             return;
         }
         if key.len() > MAX_METRIC_KEY_BYTES {
             self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-
-        let _guard = self.metric_series_insert_lock.lock();
-        if let Some(counter) = map.get(key) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        } else if map.len() < MAX_METRIC_SERIES_PER_MAP {
-            map.insert(Arc::from(key), AtomicU64::new(1));
-        } else {
-            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+        let locked = self.metric_series_insert_lock.lock();
+        // 等锁的时候别的线程可能已经加上了 / Another thread may have added it while this one waited
+        if series.with(key, &update).is_some() {
+            return;
         }
+        if series.len() >= MAX_METRIC_SERIES_PER_MAP {
+            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let value = V::default();
+        update(&value);
+        series.insert(&locked, key, value);
     }
 
     fn record_reload_failure(&self, error: &str) {
@@ -980,7 +1121,7 @@ impl EngineObserver for PanelMetrics {
         if ctx.background_refresh {
             return;
         }
-        self.cache_lookup_counted.remove(&ctx.request_id);
+        self.cache_lookup_counted.finished(ctx.request_id);
         self.requests_inflight.fetch_sub(1, Ordering::Relaxed);
         let counter = match outcome.status {
             RequestStatus::Completed => &self.requests_completed,
@@ -1098,12 +1239,7 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.cache_lookup(ctx);
         }
-        if !ctx.background_refresh
-            && self
-                .cache_lookup_counted
-                .insert(ctx.request_id, ())
-                .is_none()
-        {
+        if !ctx.background_refresh && self.cache_lookup_counted.first(ctx.request_id) {
             self.record_cache_lookup();
         }
     }
@@ -2002,20 +2138,11 @@ fn error_json(code: &str, message: &str) -> serde_json::Value {
     json!({ "protocol_version": PROTOCOL_VERSION, "error": { "code": code, "message": message } })
 }
 
-fn append_map(
-    output: &mut String,
-    name: &str,
-    map: &DashMap<Arc<str>, AtomicU64>,
-    labels: &[&str],
-) {
-    let mut rows = map
+fn append_map(output: &mut String, name: &str, series: &Series<AtomicU64>, labels: &[&str]) {
+    let mut rows = series
+        .snapshot()
         .iter()
-        .map(|entry| {
-            (
-                entry.key().to_string(),
-                entry.value().load(Ordering::Relaxed),
-            )
-        })
+        .map(|(key, counter)| (key.to_string(), counter.load(Ordering::Relaxed)))
         .collect::<Vec<_>>();
     rows.sort_by(|left, right| left.0.cmp(&right.0));
     for (key, value) in rows {
@@ -2035,16 +2162,17 @@ fn append_map(
 fn append_latency_map(
     output: &mut String,
     name: &str,
-    map: &DashMap<Arc<str>, LatencySum>,
+    series: &Series<LatencySum>,
     labels: &[&str],
 ) {
-    let mut rows = map
+    let mut rows = series
+        .snapshot()
         .iter()
-        .map(|entry| {
+        .map(|(key, sum)| {
             (
-                entry.key().to_string(),
-                entry.value().micros.load(Ordering::Relaxed),
-                entry.value().count.load(Ordering::Relaxed),
+                key.to_string(),
+                sum.micros.load(Ordering::Relaxed),
+                sum.count.load(Ordering::Relaxed),
             )
         })
         .collect::<Vec<_>>();
@@ -2405,12 +2533,9 @@ mod tests {
             10
         );
         assert_eq!(
-            metrics
-                .pipeline_hits
-                .get("pipeline-0")
-                .unwrap()
-                .load(super::Ordering::Relaxed),
-            2
+            metrics.pipeline_hits.with("pipeline-0", |counter| counter
+                .load(super::Ordering::Relaxed)),
+            Some(2)
         );
     }
 
@@ -2425,9 +2550,8 @@ mod tests {
             metrics.record_upstream_attempt("udp://192.0.2.1:53", "udp");
         }
         metrics.record_rule_match("main", "cn", "request");
-        let count = |map: &super::DashMap<super::Arc<str>, super::AtomicU64>, key: &str| {
-            map.get(key)
-                .map(|counter| counter.load(super::Ordering::Relaxed))
+        let count = |series: &super::Series<super::AtomicU64>, key: &str| {
+            series.with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(metrics.rule_matches.len(), 2);
         assert_eq!(count(&metrics.rule_matches, "main\0ads\0request"), Some(3));
@@ -2437,6 +2561,77 @@ mod tests {
             count(&metrics.upstream_attempts, "udp://192.0.2.1:53\0udp"),
             Some(3)
         );
+    }
+
+    /// 新的统计项换表时，正在计数的线程不会丢数：每个线程反复计一个公共项，同时各自加上新项
+    /// Swapping the table for a new series loses no counts made meanwhile: every thread keeps counting a
+    /// shared series while each adds new ones of its own
+    #[test]
+    fn counting_while_new_series_swap_the_table_loses_nothing() {
+        let metrics = super::Arc::new(PanelMetrics::default());
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                let metrics = metrics.clone();
+                std::thread::spawn(move || {
+                    for index in 0..1_000 {
+                        metrics.record_pipeline_hit("shared");
+                        if index % 20 == 0 {
+                            metrics.record_pipeline_hit(&format!("thread-{thread}-{index}"));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let count = |key: &str| {
+            metrics
+                .pipeline_hits
+                .with(key, |counter| counter.load(super::Ordering::Relaxed))
+        };
+        assert_eq!(count("shared"), Some(8_000));
+        assert_eq!(metrics.pipeline_hits.len(), 1 + 8 * 50);
+        assert_eq!(count("thread-7-980"), Some(1));
+        assert_eq!(
+            metrics.metric_series_dropped.load(super::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// 一个请求只在第一次查缓存时计数；结束后槽位清空
+    /// A request counts only its first cache lookup; its slot is empty once it finishes
+    #[test]
+    fn a_request_counts_its_first_lookup_once() {
+        let counted = super::LookupsCounted::default();
+        assert!(counted.first(7));
+        assert!(!counted.first(7));
+        assert!(counted.first(8));
+        counted.finished(7);
+        counted.finished(8);
+        assert!(counted.is_empty());
+        // 没查过缓存的请求结束时什么都不动 / A request that never looked finishes without touching anything
+        counted.finished(9);
+        assert!(counted.is_empty());
+    }
+
+    /// 槽位被另一个还没结束的请求占着时，这个请求记在共享表里；之后槽位空出来，它再查一次也不重复计数
+    /// When another running request holds the slot, the request is noted in the shared map; once the slot
+    /// frees up, looking again still does not count twice
+    #[test]
+    fn a_request_whose_slot_is_taken_is_noted_aside() {
+        let counted = super::LookupsCounted::with_slots(4);
+        assert!(counted.first(1));
+        assert!(counted.first(5), "slot 1 is taken by request 1");
+        assert!(!counted.first(5));
+        assert!(!counted.first(1));
+        counted.finished(1);
+        assert!(!counted.first(5), "request 5 is still counted aside");
+        assert!(counted.first(9), "the freed slot goes to the next request");
+        counted.finished(5);
+        assert!(!counted.first(9));
+        counted.finished(9);
+        assert!(counted.is_empty());
     }
 
     #[test]
@@ -2522,27 +2717,17 @@ mod tests {
             metrics.cache_lookups_total.load(super::Ordering::Relaxed),
             1
         );
+        let count = |series: &super::Series<super::AtomicU64>, key: &str| {
+            series.with(key, |counter| counter.load(super::Ordering::Relaxed))
+        };
+        assert_eq!(count(&metrics.pipeline_hits, "main"), Some(1));
         assert_eq!(
-            metrics
-                .pipeline_hits
-                .get("main")
-                .unwrap()
-                .load(super::Ordering::Relaxed),
-            1
+            count(&metrics.rule_matches, "main\0forward-all\0request"),
+            Some(1)
         );
         assert_eq!(
-            metrics
-                .rule_matches
-                .get("main\0forward-all\0request")
-                .unwrap()
-                .load(super::Ordering::Relaxed),
-            1
-        );
-        assert!(
-            metrics
-                .rule_matches
-                .get("main\0forward-all\0response")
-                .is_none()
+            count(&metrics.rule_matches, "main\0forward-all\0response"),
+            None
         );
         let now = super::unix_timestamp();
         let snapshot = metrics.query_stats.snapshot(now, 3_600, 20);
