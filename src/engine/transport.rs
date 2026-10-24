@@ -2703,7 +2703,12 @@ pub struct DoqMuxClient {
     /// 跟踪服务器是否拒绝了 0-RTT，用于自动回退
     /// Once rejected, 0-RTT will be skipped for subsequent connections
     /// 一旦被拒绝，后续连接将跳过 0-RTT
-    zero_rtt_rejected: std::sync::atomic::AtomicBool,
+    ///
+    /// 同一个上游连接池里的所有连接共用这个标记：一条连接学到的事，其余连接不必再各
+    /// 失败一次、各等满一次超时
+    /// Shared by every connection in the upstream's pool: what one connection
+    /// learned, the others need not each fail and sit out a timeout to learn again
+    zero_rtt_rejected: Arc<AtomicBool>,
     /// 健康检查：连续错误计数 / Health check: consecutive error count
     consecutive_errors: AtomicUsize,
     /// 健康检查：错误阈值 / Health check: error threshold
@@ -2802,11 +2807,13 @@ impl DoqClient {
             .pools
             .entry(upstream_key.clone())
             .or_insert_with(|| {
+                let zero_rtt_rejected = Arc::new(AtomicBool::new(false));
                 let mut clients = Vec::with_capacity(self.pool_size);
                 for _ in 0..self.pool_size {
                     clients.push(Arc::new(DoqMuxClient::new(
                         upstream_key.clone(),
                         Arc::clone(&self.runtime),
+                        Arc::clone(&zero_rtt_rejected),
                     )));
                 }
                 Arc::new(DoqConnectionPool {
@@ -2822,13 +2829,17 @@ impl DoqClient {
 }
 
 impl DoqMuxClient {
-    fn new(upstream: Arc<str>, runtime: Arc<DoqRuntime>) -> Self {
+    fn new(
+        upstream: Arc<str>,
+        runtime: Arc<DoqRuntime>,
+        zero_rtt_rejected: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             upstream,
             target: Mutex::new(None),
             connection: Mutex::new(None),
             runtime,
-            zero_rtt_rejected: std::sync::atomic::AtomicBool::new(false),
+            zero_rtt_rejected,
             consecutive_errors: AtomicUsize::new(0),
             health_threshold: AtomicUsize::new(3),
             conn_create_time: AtomicU64::new(0),
@@ -4937,7 +4948,11 @@ mod tests {
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
         });
-        DoqMuxClient::new(Arc::from(upstream), runtime)
+        DoqMuxClient::new(
+            Arc::from(upstream),
+            runtime,
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     /// 阿里的 DoQ 服务器大约 10 秒就关掉空闲连接，比 15 秒一次的保活还短。池里那条已经
@@ -5422,5 +5437,39 @@ mod tests {
              Drop cannot await: the reader token and the connection permit"
         );
         peer.abort();
+    }
+
+    /// 每个 DoQ 上游有一组连接轮流用（默认 16 条）。"0-RTT 不稳定"此前是每条连接各记
+    /// 各的：0-RTT 在跨境线路上发不出去时，每条连接都要先失败一次、等满超时（默认 9 秒）
+    /// 才不再用它。
+    /// Each DoQ upstream has a set of connections used in turn (16 by default).
+    /// "0-RTT is unreliable" used to be recorded per connection: where 0-RTT
+    /// cannot get through, every connection had to fail once and sit out the
+    /// timeout (9 s by default) before it stopped using it.
+    #[tokio::test]
+    async fn doq_pool_shares_what_one_connection_learned_about_0rtt() {
+        let client = DoqClient::new(2, 60, 15_000, true).expect("build DoQ client");
+        // 发一个连不上的查询，只为建出这个上游的连接池
+        // A query nothing answers, only to build this upstream's pool
+        let upstream = "127.0.0.1:9?sni=localhost";
+        let _ = client
+            .send(
+                &udp_test_query("pool.example"),
+                upstream,
+                Duration::from_millis(50),
+            )
+            .await;
+        let pool = client
+            .pools
+            .get(upstream)
+            .map(|pool| Arc::clone(&pool))
+            .expect("the first query builds the pool");
+        assert_eq!(pool.clients.len(), 2);
+
+        pool.clients[0].disable_zero_rtt();
+        assert!(
+            pool.clients[1].zero_rtt_rejected.load(Ordering::Relaxed),
+            "what one connection learned about 0-RTT holds for the whole upstream"
+        );
     }
 }
