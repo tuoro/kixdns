@@ -106,6 +106,10 @@ struct ActiveConfig {
     loaded_at_unix: u64,
     last_reload_success: bool,
     last_reload_error: Option<String>,
+    /// 当前配置改了、但要重启才生效的设置（见 `ConfigLoaded::restart_pending`）
+    /// Settings the current configuration changes that take a restart to apply (see
+    /// `ConfigLoaded::restart_pending`)
+    restart_pending: Vec<String>,
 }
 
 struct QueryStatsBucket {
@@ -738,22 +742,24 @@ impl PanelMetrics {
         );
     }
 
-    fn record_initial_config(&self, sha256: String) {
+    fn record_initial_config(&self, sha256: String, restart_pending: Vec<String>) {
         let mut active = self.active_config.write();
         active.generation = 1;
         active.sha256 = sha256;
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
         active.last_reload_error = None;
+        active.restart_pending = restart_pending;
     }
 
-    fn record_reload_success(&self, sha256: String) {
+    fn record_reload_success(&self, sha256: String, restart_pending: Vec<String>) {
         let mut active = self.active_config.write();
         active.generation = active.generation.saturating_add(1).max(1);
         active.sha256 = sha256;
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
         active.last_reload_error = None;
+        active.restart_pending = restart_pending;
         self.reload_success.fetch_add(1, Ordering::Relaxed);
         self.reload_sequence.fetch_add(1, Ordering::Release);
     }
@@ -803,29 +809,39 @@ impl PanelMetrics {
     }
 
     /// 从观察者收到的配置原文更新摘要。/ Refresh the digest from the loaded source.
-    fn record_config_loaded(&self, source: &str) {
+    fn record_config_loaded(&self, source: &str, restart_pending: Vec<String>) {
         let sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
         let initial = self.active_config.read().generation == 0;
         if initial {
-            self.record_initial_config(sha256);
+            self.record_initial_config(sha256, restart_pending);
         } else {
-            self.record_reload_success(sha256);
+            self.record_reload_success(sha256, restart_pending);
         }
     }
 
     #[cfg(unix)]
     fn config_json(&self) -> serde_json::Value {
-        let active = self.active_config.read().clone();
+        // 重载序号和配置状态在同一把锁里读：重载在写锁里改状态、加序号，此前序号在锁外读，可能
+        // 拿到新序号配旧状态，而面板正是按序号判断保存是否已经生效的
+        // The reload sequence is read under the same lock as the state: a reload changes
+        // the state and bumps the sequence under the write lock, and a sequence read
+        // outside it could pair a new sequence with the old state, while the panel tells
+        // by the sequence whether a save took effect
+        let (active, reload_sequence) = {
+            let active = self.active_config.read();
+            (active.clone(), self.reload_sequence.load(Ordering::Acquire))
+        };
         json!({
             "protocol_version": PROTOCOL_VERSION,
             "generation": active.generation,
             "sha256": active.sha256,
             "loaded_at_unix": active.loaded_at_unix,
-            "reload_sequence": self.reload_sequence.load(Ordering::Acquire),
+            "reload_sequence": reload_sequence,
             "last_reload": {
                 "success": active.last_reload_success,
                 "error": active.last_reload_error,
-            }
+            },
+            "restart_pending": active.restart_pending,
         })
     }
 
@@ -1400,11 +1416,16 @@ impl EngineObserver for PanelMetrics {
         if let Some(trace) = &self.debug_trace {
             trace.config_loaded(event);
         }
+        let restart_pending = event
+            .restart_pending
+            .iter()
+            .map(|setting| setting.to_string())
+            .collect();
         match event.source {
-            Some(source) => self.record_config_loaded(source),
+            Some(source) => self.record_config_loaded(source, restart_pending),
             None => {
                 let sha256 = self.active_config.read().sha256.clone();
-                self.record_reload_success(sha256);
+                self.record_reload_success(sha256, restart_pending);
             }
         }
     }
@@ -2415,6 +2436,7 @@ mod tests {
                 path: None,
                 generation: 1,
                 source: Some("{}"),
+                restart_pending: &[],
             });
             metrics.config_reload_failed(&ConfigReloadFailed {
                 path: std::path::Path::new("pipeline.json"),
@@ -2648,6 +2670,7 @@ mod tests {
             path: Some(std::path::Path::new("pipeline.json")),
             generation: 1,
             source: Some(source),
+            restart_pending: &[],
         });
         {
             let active = metrics.active_config.read();
@@ -2742,6 +2765,7 @@ mod tests {
             path: Some(std::path::Path::new("pipeline.json")),
             generation: 2,
             source: Some("{}"),
+            restart_pending: &[],
         });
         let active = metrics.active_config.read();
         assert_eq!(active.generation, 2);
@@ -2989,6 +3013,7 @@ mod tests {
         let metrics = PanelMetrics::new(false);
         metrics.record_config_loaded(
             r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
+            Vec::new(),
         );
         metrics.record_query("example.com", "192.168.1.42".parse().unwrap());
         let snapshot = metrics
@@ -3114,6 +3139,49 @@ mod diagnostic_tests {
             .observer(metrics)
             .build()
             .expect("build engine")
+    }
+
+    /// 控制通道的 config 列出改了但要重启才生效的设置；改回去以后不再列
+    /// The control channel's config lists the settings changed that take a restart to
+    /// apply; once changed back they are no longer listed
+    #[tokio::test]
+    async fn config_reports_the_settings_waiting_for_a_restart() {
+        let raw = |bind: &str, timeout_ms: u64| {
+            serde_json::json!({
+                "settings": {
+                    "bind_udp": bind,
+                    "default_upstream": "127.0.0.1:9",
+                    "upstream_timeout_ms": timeout_ms
+                },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "rest", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+                }] }]
+            })
+        };
+        let runtime = |raw: serde_json::Value| {
+            let config: crate::config::PipelineConfig =
+                serde_json::from_value(raw).expect("parse config");
+            RuntimePipelineConfig::from_config(config).expect("build runtime config")
+        };
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw("127.0.0.1:5353", 2000), Arc::clone(&metrics));
+        assert_eq!(
+            metrics.config_json()["restart_pending"],
+            serde_json::json!([])
+        );
+
+        engine.reload(runtime(raw("127.0.0.1:5354", 3000)));
+        assert_eq!(
+            metrics.config_json()["restart_pending"],
+            serde_json::json!(["bind_udp"]),
+            "the listener only moves on a restart, the timeout applies at once"
+        );
+        engine.reload(runtime(raw("127.0.0.1:5353", 3000)));
+        assert_eq!(
+            metrics.config_json()["restart_pending"],
+            serde_json::json!([])
+        );
     }
 
     fn answers(body: &serde_json::Value) -> Vec<String> {

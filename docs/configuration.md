@@ -263,7 +263,7 @@ upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多�
 
 DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
 
-DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；某个上游超时或被拒绝后，会在进程重启前对该上游禁用 0-RTT。被拒绝既包括明确报告拒绝，也包括对端直接关闭或重置连接——拒收早期数据的服务器常常是这么回应的。
+DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；用了 0-RTT 的连接超时或被拒绝后，会在进程重启前对该上游的所有连接禁用 0-RTT。被拒绝既包括明确报告拒绝，也包括对端直接关闭或重置连接——拒收早期数据的服务器常常是这么回应的；没用 0-RTT 的连接超时只算回答慢，不影响 0-RTT。
 
 UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通过 settings.enable_tcp_fallback 禁用。该 fallback 属于转发路径，不是额外监听器。
 
@@ -402,6 +402,8 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 主配置 watcher 使用按 Pipeline 划分的缓存命名空间重载有效 JSON。发生变化的 Pipeline 会立即停止访问旧配置产生的响应缓存、规则缓存和进行中请求；未变化的 Pipeline 会保留热缓存。任意全局设置变化都会轮换所有 Pipeline 的缓存命名空间。旧命名空间中的条目不会被同步删除，而是继续受现有缓存容量和 TTL 策略限制。包括后台刷新和响应阶段跳转在内，每个请求都会保持选择其缓存命名空间时的配置快照，因此重载前启动的任务无法写入当前生效的缓存代际。无效的重载会保留旧配置。
 
-监听地址、UDP worker 数量、TLS DoH 监听器、连接池构造、缓存构造和其他 Engine 初始化参数均在启动时创建；修改这些设置后应重启服务。唯一的例外是 DoH TLS 证书：证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。
+下面这些全局设置只在启动时读取，重载不会让它们生效，修改后要重启服务：`bind_udp`、`bind_tcp`、`bind_doh`、`doh_path`、`doh_tls_cert`、`doh_tls_key`、`cache_capacity`、`cache_max_ttl`、`dashmap_shards`、`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`doh_health_check_error_threshold`、`dot_pool_size`、`doq_pool_size`、`tcp_health_check_error_threshold`、`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`、`doq_connection_idle_timeout_seconds`、`doq_keepalive_interval_ms`、`doq_enable_0rtt` 和全部 `flow_control_*`。其余全局设置重载即生效。重载后，配置里改过、还在等重启的设置会出现在控制通道 `config` 结果的 `restart_pending` 里；改回启动时的值，或者重启以后，它就不再出现。UDP worker 数量由命令行指定，同样只在启动时生效。DoH TLS 证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。
+
+重载后，配置里不再出现的上游会关闭它们的 TCP、DoT、DoQ 连接；正在使用这些连接的请求处理完之后才会关闭。
 
 geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只读入规则（geoip_country、response_answer_ip_geoip_country）用到的国家代码和标签（见上文 GeoIP 数据源与标签），不读的文件也不监控。热加载改变了规则用到的 GeoSite 或 GeoIP 标签，或这几个文件路径时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。

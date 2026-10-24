@@ -49,6 +49,9 @@ pub struct Engine {
     pub(crate) observer: Option<Arc<dyn EngineObserver>>,
     // Active configuration generation: 1 at startup, +1 per reload / 当前配置代数：启动为 1，每次重载 +1
     pub(crate) config_generation: Arc<AtomicU64>,
+    // The settings the process started with: those read only at startup keep
+    // these values until a restart / 进程启动时的设置：只在启动时读取的那些，到重启前一直是这些值
+    pub(crate) running_settings: Arc<crate::config::GlobalSettings>,
     // Serialises reloads so the stored state, the generation and the
     // config_loaded event of one reload cannot interleave with another's. It
     // also keeps where the Geo data came from, which only a reload changes.
@@ -190,6 +193,7 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
         // moka cache capacity and max TTL are configurable via settings
+        let running_settings = Arc::new(cfg.settings.clone());
         let cache_capacity = cfg.settings.cache_capacity;
         let cache_max_ttl = cfg.settings.cache_max_ttl;
         let cache = new_cache(cache_capacity, cache_max_ttl);
@@ -333,6 +337,7 @@ impl Engine {
             client_transport: None,
             observer,
             config_generation: Arc::new(AtomicU64::new(1)),
+            running_settings,
             reload_lock: Arc::new(Mutex::new(geo_sources)),
             rule_cache,
             metrics_inflight: Arc::new(AtomicUsize::new(0)),
@@ -565,10 +570,17 @@ impl Engine {
         source: Option<&str>,
     ) {
         if let Some(observer) = &self.observer {
+            let restart_pending = self
+                .state
+                .load()
+                .pipeline
+                .settings
+                .restart_pending(&self.running_settings);
             observer.config_loaded(&ConfigLoaded {
                 path,
                 generation,
                 source,
+                restart_pending: &restart_pending,
             });
         }
     }
