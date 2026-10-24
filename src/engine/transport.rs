@@ -586,6 +586,12 @@ pub struct TcpMuxClient {
     last_health_check_time: AtomicU64,
     /// Reader 取消令牌 / Reader cancellation token
     read_cancel: Mutex<CancellationToken>,
+    /// 这条客户端的 reader 读到的应答帧总数。查询超时时拿它判断连接是不是还活着：
+    /// 本查询写出之后数字涨过，说明连接照常在回答，慢的只是这一个
+    /// Answer frames this client's readers have read. A timed-out query uses it to
+    /// tell whether the connection is still alive: if it grew after the query was
+    /// written, the connection kept answering and only this one answer is slow
+    answers_read: Arc<AtomicU64>,
 }
 
 struct Pending {
@@ -676,6 +682,7 @@ impl TcpMuxClient {
             idle_timeout_ms: AtomicU64::new(60_000), // 1 分钟
             last_health_check_time: AtomicU64::new(0),
             read_cancel: Mutex::new(CancellationToken::new()),
+            answers_read: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -706,6 +713,7 @@ impl TcpMuxClient {
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
         let conn_permit = Arc::clone(&self.conn_permit); // Clone conn_permit
+        let answers_read = Arc::clone(&self.answers_read);
 
         tokio::spawn(async move {
             // Pre-allocate a reusable buffer for TCP reads
@@ -784,6 +792,9 @@ impl TcpMuxClient {
                     }
                 }
 
+                // 读满一整帧就算这条连接在回答，不管它对不对得上号
+                // A whole frame read counts as the connection answering, matched or not
+                answers_read.fetch_add(1, Ordering::Release);
                 if resp_len < 2 {
                     continue;
                 }
@@ -1081,6 +1092,8 @@ impl TcpMuxClient {
             }
         }
 
+        let answers_at_write = self.answers_read.load(Ordering::Acquire);
+
         // 3. Wait for response
         // 3. 等待响应
         let elapsed_after_write = start.elapsed();
@@ -1103,11 +1116,19 @@ impl TcpMuxClient {
         let final_remaining = timeout_dur - elapsed_after_write;
 
         let resp = match timeout(final_remaining, rx).await {
-            Ok(Ok(r)) => {
+            Ok(Ok(Ok(response))) => {
                 // Record success and clear error count
                 // 记录成功并清零错误计数
                 self.record_success();
-                r?
+                response
+            }
+            Ok(Ok(Err(err))) => {
+                // 连接在等待期间断开或被重置，所有等待的查询都被告知了；这不是成功，
+                // 是否换新连接重发由 send() 决定
+                // The connection broke or was reset while this query waited, and
+                // every waiter was told. That is no success; send() decides on a
+                // retry over a fresh connection
+                return Err(err);
             }
             Ok(Err(_canceled)) => {
                 // Guard will remove pending entry automatically
@@ -1122,6 +1143,19 @@ impl TcpMuxClient {
             }
             Err(_elapsed) => {
                 // Guard will remove pending entry automatically
+
+                // 写出之后这条连接还在回答别的查询：连接是活的，只是这一个回答慢。重建
+                // 连接只会让同一条连接上其他查询的回答跟着丢掉，也不算连接出错
+                // The connection kept answering other queries after this one was
+                // written: it is alive and only this answer is slow. Rebuilding it
+                // would only lose the other answers on it, and it is no connection error
+                if self.answers_read.load(Ordering::Acquire) > answers_at_write {
+                    return Err(anyhow::anyhow!(
+                        "TCP response timeout from upstream {upstream} (remaining: {timeout_ms}ms); the connection is still answering",
+                        upstream = self.upstream,
+                        timeout_ms = final_remaining.as_millis()
+                    ));
+                }
 
                 // Record error and FORCE RESET on response timeout (connection likely dead/stalled)
                 // 记录错误并在响应超时时强制重置（连接可能死锁/停滞）
@@ -1338,30 +1372,28 @@ impl TcpMuxClient {
         *permit_guard = None;
     }
 
-    /// Reset connection: cancel reader task, then drop write half and release permit
-    /// 重置连接：取消 reader 任务，然后丢弃写半部并释放许可
+    /// Reset connection: cancel reader task, then drop write half, fail every
+    /// waiting query and release permit
+    /// 重置连接：取消 reader 任务，然后丢弃写半部、让所有等待中的查询失败并释放许可
     ///
     /// The cancellation token interrupts the reader's blocked read so it
-    /// exits immediately instead of leaking the TCP connection.
-    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TCP 连接。
+    /// exits immediately instead of leaking the TCP connection. With the reader
+    /// gone nothing can answer the queries still waiting on this connection, so
+    /// they are failed at once: each can then retry over a fresh connection
+    /// instead of sitting out its whole deadline and resetting the next
+    /// connection in turn.
+    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TCP 连接。reader 没了，
+    /// 这条连接上还在等的查询再也等不到回答，所以立刻让它们失败：各自可以换新连接重发，
+    /// 而不是干等到截止时间、再轮流把下一条连接也重置掉。
     async fn reset(&self) {
         self.read_cancel.lock().await.cancel();
-        Self::reset_conn(&self.conn, &self.conn_permit).await;
-    }
-
-    /// Reset TCP connection and release connection-level permit
-    /// 重置 TCP 连接并释放连接级别 permit
-    async fn reset_conn(
-        conn: &Arc<Mutex<Option<OwnedWriteHalf>>>,
-        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
-    ) {
-        let mut cg = conn.lock().await;
-        *cg = None;
-
-        // Release connection-level permit
-        // 释放连接级别 permit
-        let mut permit_guard = conn_permit.lock().await;
-        *permit_guard = None;
+        Self::fail_all_async(
+            &self.pending,
+            anyhow::anyhow!("TCP connection reset"),
+            &self.conn,
+            &self.conn_permit,
+        )
+        .await;
     }
 }
 
@@ -1811,6 +1843,12 @@ pub struct DotMuxClient {
     last_health_check_time: AtomicU64,
     /// Reader 取消令牌 / Reader cancellation token
     read_cancel: Mutex<CancellationToken>,
+    /// 这条客户端的 reader 读到的应答帧总数。查询超时时拿它判断连接是不是还活着：
+    /// 本查询写出之后数字涨过，说明连接照常在回答，慢的只是这一个
+    /// Answer frames this client's readers have read. A timed-out query uses it to
+    /// tell whether the connection is still alive: if it grew after the query was
+    /// written, the connection kept answering and only this one answer is slow
+    answers_read: Arc<AtomicU64>,
 }
 
 impl DotMultiplexer {
@@ -1899,6 +1937,7 @@ impl DotMuxClient {
             idle_timeout_ms: AtomicU64::new(60_000),
             last_health_check_time: AtomicU64::new(0),
             read_cancel: Mutex::new(CancellationToken::new()),
+            answers_read: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1927,6 +1966,7 @@ impl DotMuxClient {
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
         let conn_permit = Arc::clone(&self.conn_permit);
+        let answers_read = Arc::clone(&self.answers_read);
 
         tokio::spawn(async move {
             let mut reusable_buf = BytesMut::with_capacity(4096);
@@ -1988,6 +2028,9 @@ impl DotMuxClient {
                     }
                 }
 
+                // 读满一整帧就算这条连接在回答，不管它对不对得上号
+                // A whole frame read counts as the connection answering, matched or not
+                answers_read.fetch_add(1, Ordering::Release);
                 if resp_len < 2 {
                     continue;
                 }
@@ -2177,6 +2220,8 @@ impl DotMuxClient {
             }
         }
 
+        let answers_at_write = self.answers_read.load(Ordering::Acquire);
+
         let elapsed_after_write = start.elapsed();
         if elapsed_after_write >= timeout_dur {
             self.record_error().await;
@@ -2193,9 +2238,14 @@ impl DotMuxClient {
         let final_remaining = timeout_dur - elapsed_after_write;
 
         let resp = match timeout(final_remaining, rx).await {
-            Ok(Ok(r)) => {
+            Ok(Ok(Ok(response))) => {
                 self.record_success();
-                r?
+                response
+            }
+            Ok(Ok(Err(err))) => {
+                // 连接在等待期间断开或被重置，见 TCP 那边的同一处
+                // The connection broke or was reset while waiting, as on the TCP side
+                return Err(err);
             }
             Ok(Err(_canceled)) => {
                 self.record_error().await;
@@ -2205,6 +2255,16 @@ impl DotMuxClient {
                 ));
             }
             Err(_) => {
+                // 连接还在回答别的查询时，慢的只是这一个，见 TCP 那边的同一处
+                // A connection still answering other queries is alive and only this
+                // answer is slow, as on the TCP side
+                if self.answers_read.load(Ordering::Acquire) > answers_at_write {
+                    return Err(anyhow::anyhow!(
+                        "DoT response timeout from upstream {upstream} (remaining: {timeout_ms}ms); the connection is still answering",
+                        upstream = self.upstream,
+                        timeout_ms = final_remaining.as_millis()
+                    ));
+                }
                 self.record_error().await;
                 self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
@@ -2386,25 +2446,28 @@ impl DotMuxClient {
         *permit_guard = None;
     }
 
-    /// Reset connection: cancel reader task, then drop write half and release permit
-    /// 重置连接：取消 reader 任务，然后丢弃写半部并释放许可
+    /// Reset connection: cancel reader task, then drop write half, fail every
+    /// waiting query and release permit
+    /// 重置连接：取消 reader 任务，然后丢弃写半部、让所有等待中的查询失败并释放许可
     ///
     /// The cancellation token interrupts the reader's blocked read so it
-    /// exits immediately instead of leaking the TLS connection.
-    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TLS 连接。
+    /// exits immediately instead of leaking the TLS connection. With the reader
+    /// gone nothing can answer the queries still waiting on this connection, so
+    /// they are failed at once: each can then retry over a fresh connection
+    /// instead of sitting out its whole deadline and resetting the next
+    /// connection in turn.
+    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TLS 连接。reader 没了，
+    /// 这条连接上还在等的查询再也等不到回答，所以立刻让它们失败：各自可以换新连接重发，
+    /// 而不是干等到截止时间、再轮流把下一条连接也重置掉。
     async fn reset(&self) {
         self.read_cancel.lock().await.cancel();
-        Self::reset_conn(&self.conn, &self.conn_permit).await;
-    }
-
-    async fn reset_conn(
-        conn: &Arc<Mutex<Option<DotWriteHalf>>>,
-        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
-    ) {
-        let mut cg = conn.lock().await;
-        *cg = None;
-        let mut permit_guard = conn_permit.lock().await;
-        *permit_guard = None;
+        Self::fail_all_async(
+            &self.pending,
+            anyhow::anyhow!("DoT connection reset"),
+            &self.conn,
+            &self.conn_permit,
+        )
+        .await;
     }
 }
 
@@ -4868,5 +4931,234 @@ mod tests {
             !client.zero_rtt_rejected.load(Ordering::Relaxed),
             "a timeout on a connection that did not use 0-RTT says nothing about 0-RTT"
         );
+    }
+
+    /// 本机 TCP 测试上游；`tls` 给了就是 DoT。问题名第一个标签是 `slow` 的永不回答，
+    /// `late` 的 400 ms 后回答，`mid` 的 100 ms 后回答，其余立刻回答；同一条连接上的
+    /// 查询各自独立回答，先到先回。
+    /// Local TCP test upstream, DoT when `tls` is given. A question whose first
+    /// label is `slow` is never answered, `late` after 400 ms, `mid` after
+    /// 100 ms, anything else at once; queries on one connection are answered
+    /// independently, whichever is ready first.
+    async fn spawn_stream_upstream(tls: Option<rustls::ServerConfig>) -> SocketAddr {
+        async fn serve<S>(stream: S)
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+        {
+            let (mut reader, writer) = tokio::io::split(stream);
+            let writer = Arc::new(Mutex::new(writer));
+            loop {
+                let mut len = [0u8; 2];
+                if reader.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
+                if reader.read_exact(&mut frame).await.is_err() {
+                    return;
+                }
+                let writer = Arc::clone(&writer);
+                tokio::spawn(async move {
+                    let delay = match first_label(&frame).as_str() {
+                        "slow" => return,
+                        "late" => Duration::from_millis(400),
+                        "mid" => Duration::from_millis(100),
+                        _ => Duration::ZERO,
+                    };
+                    tokio::time::sleep(delay).await;
+                    frame[2] |= 0x80;
+                    let mut writer = writer.lock().await;
+                    let _ = writer.write_all(&len).await;
+                    let _ = writer.write_all(&frame).await;
+                });
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the stream test upstream");
+        let addr = listener.local_addr().expect("read the stream test address");
+        let acceptor = tls.map(|config| tokio_rustls::TlsAcceptor::from(Arc::new(config)));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    match acceptor {
+                        Some(acceptor) => {
+                            if let Ok(tls) = acceptor.accept(stream).await {
+                                serve(tls).await;
+                            }
+                        }
+                        None => serve(stream).await,
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// TCP 和 DoT 的多路复用客户端是同一套写法，下面几条测试对两者一视同仁
+    /// The TCP and DoT multiplexing clients share one design, so the tests
+    /// below hold both to the same behaviour
+    trait StreamMux {
+        async fn query(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes>;
+        fn connection_generation(&self) -> u64;
+        async fn drop_connection(&self);
+    }
+
+    impl StreamMux for TcpMuxClient {
+        async fn query(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
+            self.send(packet, timeout_dur).await
+        }
+        fn connection_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+        async fn drop_connection(&self) {
+            self.reset().await;
+        }
+    }
+
+    impl StreamMux for DotMuxClient {
+        async fn query(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
+            self.send(packet, timeout_dur).await
+        }
+        fn connection_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+        async fn drop_connection(&self) {
+            self.reset().await;
+        }
+    }
+
+    async fn tcp_test_client() -> TcpMuxClient {
+        let addr = spawn_stream_upstream(None).await;
+        TcpMuxClient::new(Arc::from(addr.to_string()), Arc::new(PermitManager::new(1)))
+    }
+
+    async fn dot_test_client() -> DotMuxClient {
+        let (server, client_tls) = localhost_tls(&[]);
+        let addr = spawn_stream_upstream(Some(server)).await;
+        DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(client_tls),
+            Arc::new(PermitManager::new(1)),
+        )
+    }
+
+    /// 一个查询超时、这条连接上又再没有回答时，连接会被重建。此前同一条连接上还在等
+    /// 的查询被晾着：reader 已经取消，它们的回答再也到不了，只能等满自己的截止时间，
+    /// 然后各自再重置一次连接，把新连接上的查询也连累进去。
+    /// When a query times out and nothing else answered on the connection, the
+    /// connection is rebuilt. The other queries waiting on it used to be left
+    /// hanging: with the reader cancelled their answers could never arrive, so
+    /// each sat out its full deadline and then reset the connection again,
+    /// dragging in the queries on the new one.
+    async fn a_slow_answer_does_not_cost_its_neighbours_theirs(client: &impl StreamMux) {
+        client
+            .query(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+
+        let started = tokio::time::Instant::now();
+        let slow_query = udp_test_query("slow.example");
+        let late_query = udp_test_query("late.example");
+        let (slow, late) = tokio::join!(
+            client.query(&slow_query, Duration::from_millis(300)),
+            client.query(&late_query, Duration::from_secs(2)),
+        );
+        assert!(slow.is_err(), "the upstream never answers `slow`");
+        assert!(
+            late.is_ok(),
+            "`late` is answered after 400 ms, but got {:?} after {:?}",
+            late.err(),
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "`late` waited {:?} instead of retrying over a fresh connection",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_tcp_answer_does_not_cost_its_neighbours_theirs() {
+        a_slow_answer_does_not_cost_its_neighbours_theirs(&tcp_test_client().await).await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_dot_answer_does_not_cost_its_neighbours_theirs() {
+        a_slow_answer_does_not_cost_its_neighbours_theirs(&dot_test_client().await).await;
+    }
+
+    /// 这条连接在慢查询写出之后还回答了别的查询：连接是活的，不能因为一个回答慢就重建
+    /// The connection answered another query after the slow one was written: it
+    /// is alive and must not be rebuilt over one slow answer
+    async fn a_slow_answer_keeps_a_live_connection(client: &impl StreamMux) {
+        client
+            .query(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        let generation = client.connection_generation();
+
+        let slow_query = udp_test_query("slow.example");
+        let mid_query = udp_test_query("mid.example");
+        let (slow, mid) = tokio::join!(
+            client.query(&slow_query, Duration::from_millis(300)),
+            client.query(&mid_query, Duration::from_secs(2)),
+        );
+        assert!(slow.is_err(), "the upstream never answers `slow`");
+        assert!(
+            mid.is_ok(),
+            "`mid` is answered after 100 ms: {:?}",
+            mid.err()
+        );
+        client
+            .query(&udp_test_query("after.example"), Duration::from_secs(2))
+            .await
+            .expect("the connection still answers");
+        assert_eq!(
+            client.connection_generation(),
+            generation,
+            "one slow answer on a connection that keeps answering must not rebuild it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_tcp_answer_keeps_a_live_connection() {
+        a_slow_answer_keeps_a_live_connection(&tcp_test_client().await).await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_dot_answer_keeps_a_live_connection() {
+        a_slow_answer_keeps_a_live_connection(&dot_test_client().await).await;
+    }
+
+    /// reset 之后连接上再也不会有回答，等着的查询要立刻得到失败，而不是等满截止时间。
+    /// 连接老化（默认 5 分钟）、连续出错达到阈值都会走这里。
+    /// After a reset no answer can arrive on the connection, so a waiting query
+    /// must fail at once rather than at its deadline. Connection ageing (5
+    /// minutes by default) and the error threshold both come through here.
+    async fn a_reset_fails_waiting_queries_at_once(client: &impl StreamMux) {
+        let started = tokio::time::Instant::now();
+        let slow_query = udp_test_query("slow.example");
+        let (result, ()) = tokio::join!(client.query(&slow_query, Duration::from_secs(3)), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client.drop_connection().await;
+        });
+        assert!(result.is_err(), "the upstream never answers `slow`");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the waiting query was only released after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tcp_reset_fails_waiting_queries_at_once() {
+        a_reset_fails_waiting_queries_at_once(&tcp_test_client().await).await;
+    }
+
+    #[tokio::test]
+    async fn a_dot_reset_fails_waiting_queries_at_once() {
+        a_reset_fails_waiting_queries_at_once(&dot_test_client().await).await;
     }
 }
