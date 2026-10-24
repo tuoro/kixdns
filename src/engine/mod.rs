@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod client_address_tests;
 pub mod concurrency;
+#[cfg(test)]
+mod cookie_tests;
 pub mod core;
 #[cfg(test)]
 mod ecs_scope_tests;
