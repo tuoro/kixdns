@@ -411,6 +411,15 @@ pub struct TcpConnectionPool {
 }
 
 impl TcpMultiplexer {
+    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
+    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
+    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
+    /// upstream the configuration no longer names is dropped: queries using it hold on to
+    /// it until they finish, and its connections close after that.
+    pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
+        self.pools.retain(|upstream, _| keep(upstream));
+    }
+
     pub fn new(
         pool_size: usize,
         health_error_threshold: usize,
@@ -670,6 +679,17 @@ impl<W> Drop for TcpWriteGuard<'_, W> {
             *self.slot = None;
             self.needs_reset.store(true, Ordering::Release);
         }
+    }
+}
+
+/// 客户端被丢掉（它的上游在重载后不在配置里了）时，让读取任务结束：读取任务拿着写半边的共享引用，
+/// 不结束的话连接会一直开着。
+/// When the client is dropped (its upstream left the configuration on a reload), its
+/// reader task is ended: the reader holds a share of the write half, and the connection
+/// would stay open while it runs.
+impl Drop for TcpMuxClient {
+    fn drop(&mut self) {
+        self.read_cancel.get_mut().cancel();
     }
 }
 
@@ -1866,6 +1886,15 @@ pub struct DotMuxClient {
 }
 
 impl DotMultiplexer {
+    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
+    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
+    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
+    /// upstream the configuration no longer names is dropped: queries using it hold on to
+    /// it until they finish, and its connections close after that.
+    pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
+        self.pools.retain(|upstream, _| keep(upstream));
+    }
+
     pub fn new(
         pool_size: usize,
         health_error_threshold: usize,
@@ -1924,6 +1953,17 @@ impl DotMultiplexer {
 
         let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
         pool.clients[idx].send(packet, timeout_dur).await
+    }
+}
+
+/// 客户端被丢掉（它的上游在重载后不在配置里了）时，让读取任务结束：读取任务拿着写半边的共享引用，
+/// 不结束的话连接会一直开着。
+/// When the client is dropped (its upstream left the configuration on a reload), its
+/// reader task is ended: the reader holds a share of the write half, and the connection
+/// would stay open while it runs.
+impl Drop for DotMuxClient {
+    fn drop(&mut self) {
+        self.read_cancel.get_mut().cancel();
     }
 }
 
@@ -2734,6 +2774,15 @@ pub struct DoqMuxClient {
 }
 
 impl DoqClient {
+    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
+    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
+    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
+    /// upstream the configuration no longer names is dropped: queries using it hold on to
+    /// it until they finish, and its connections close after that.
+    pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
+        self.pools.retain(|upstream, _| keep(upstream));
+    }
+
     pub fn new(
         pool_size: usize,
         idle_timeout_secs: u64,
@@ -4965,6 +5014,15 @@ mod tests {
         client_tls: ClientConfig,
         enable_0rtt: bool,
     ) -> DoqMuxClient {
+        DoqMuxClient::new(
+            Arc::from(upstream),
+            doq_test_runtime(client_tls, enable_0rtt),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// 只信任 `client_tls` 里那张证书的 DoQ 端点 / DoQ endpoints trusting only the certificate in `client_tls`
+    fn doq_test_runtime(client_tls: ClientConfig, enable_0rtt: bool) -> Arc<DoqRuntime> {
         let crypto = QuicClientConfig::try_from(client_tls).expect("quic client crypto");
         let config = quinn::ClientConfig::new(Arc::new(crypto));
         let mut endpoint_v4 =
@@ -4977,17 +5035,12 @@ mod tests {
             }
             Err(_) => endpoint_v4.clone(),
         };
-        let runtime = Arc::new(DoqRuntime {
+        Arc::new(DoqRuntime {
             endpoint_v4,
             endpoint_v6,
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
-        });
-        DoqMuxClient::new(
-            Arc::from(upstream),
-            runtime,
-            Arc::new(AtomicBool::new(false)),
-        )
+        })
     }
 
     /// 阿里的 DoQ 服务器大约 10 秒就关掉空闲连接，比 15 秒一次的保活还短。池里那条已经
@@ -5506,5 +5559,200 @@ mod tests {
             pool.clients[1].zero_rtt_rejected.load(Ordering::Relaxed),
             "what one connection learned about 0-RTT holds for the whole upstream"
         );
+    }
+
+    /// 立刻回答每个查询、每条连接结束时发一个信号的本机 TCP 上游；`tls` 给了就是 DoT
+    /// A local TCP upstream answering every query at once and signalling whenever a
+    /// connection ends; DoT when `tls` is given
+    async fn upstream_noting_closes(
+        tls: Option<rustls::ServerConfig>,
+    ) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        async fn serve<S>(mut stream: S)
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            loop {
+                let mut len = [0u8; 2];
+                if stream.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
+                if stream.read_exact(&mut frame).await.is_err() {
+                    return;
+                }
+                frame[2] |= 0x80;
+                if stream.write_all(&len).await.is_err() || stream.write_all(&frame).await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let acceptor = tls.map(|config| tokio_rustls::TlsAcceptor::from(Arc::new(config)));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (acceptor, closed) = (acceptor.clone(), closed_tx.clone());
+                tokio::spawn(async move {
+                    match acceptor {
+                        Some(acceptor) => {
+                            if let Ok(tls) = acceptor.accept(stream).await {
+                                serve(tls).await;
+                            }
+                        }
+                        None => serve(stream).await,
+                    }
+                    let _ = closed.send(());
+                });
+            }
+        });
+        (addr, closed_rx)
+    }
+
+    /// 连接池被留下时连接不断，被丢掉以后连接关闭
+    /// A kept pool keeps its connection; once the pool is dropped the connection closes
+    async fn kept_then_dropped(
+        closed: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+        retain: impl Fn(bool),
+    ) {
+        retain(true);
+        assert!(
+            timeout(Duration::from_millis(300), closed.recv())
+                .await
+                .is_err(),
+            "a kept upstream keeps its connection"
+        );
+        retain(false);
+        timeout(Duration::from_secs(2), closed.recv())
+            .await
+            .expect("the connection closes once its pool is dropped");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_tcp_pool_closes_its_connection() {
+        let (addr, mut closed) = upstream_noting_closes(None).await;
+        let mux = TcpMultiplexer::new(2, 3, 300, 60);
+        mux.send(
+            &udp_test_query("a.example"),
+            &addr.to_string(),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the upstream answers");
+        kept_then_dropped(&mut closed, |keep| mux.retain_upstreams(|_| keep)).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_dot_pool_closes_its_connection() {
+        let (server, client_tls) = localhost_tls(&[]);
+        let (addr, mut closed) = upstream_noting_closes(Some(server)).await;
+        let mux = DotMultiplexer {
+            pools: dashmap::DashMap::with_hasher(FxBuildHasher),
+            pool_size: 2,
+            tls_config: Arc::new(client_tls),
+            health_error_threshold: 3,
+            max_age_secs: 300,
+            idle_timeout_secs: 60,
+        };
+        mux.send(
+            &udp_test_query("a.example"),
+            &format!("{addr}?sni=localhost"),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the upstream answers");
+        kept_then_dropped(&mut closed, |keep| mux.retain_upstreams(|_| keep)).await;
+    }
+
+    /// DoQ 连接带着保活，不关掉的话会一直给旧上游发包
+    /// A DoQ connection carries a keep-alive and would go on pinging the old upstream
+    #[tokio::test]
+    async fn dropping_a_doq_pool_closes_its_connection() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
+        let endpoint = QuicEndpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("bind the DoQ test upstream");
+        let addr = endpoint.local_addr().unwrap();
+        let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let closed = closed_tx.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        if let Ok(mut frame) = recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
+                            frame[4] |= 0x80;
+                            let _ = send.write_all(&frame).await;
+                            let _ = send.finish();
+                        }
+                    }
+                    let _ = closed.send(());
+                });
+            }
+        });
+        let client = DoqClient {
+            pools: DashMap::with_hasher(FxBuildHasher),
+            pool_size: 1,
+            runtime: doq_test_runtime(client_tls, false),
+        };
+        client
+            .send(
+                &udp_test_query("a.example"),
+                &format!("{addr}?sni=localhost"),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("the upstream answers");
+        kept_then_dropped(&mut closed, |keep| client.retain_upstreams(|_| keep)).await;
+    }
+
+    /// 重载换掉上游以后，旧上游的连接关闭；上游没变的重载不碰它
+    /// After a reload replaces the upstream, the old one's connection closes; a reload
+    /// that keeps the upstream leaves it alone
+    #[tokio::test]
+    async fn a_reload_closes_the_connections_of_upstreams_it_drops() {
+        let (addr, mut closed) = upstream_noting_closes(None).await;
+        let runtime = |upstream: &str| {
+            let raw = serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 2000 },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "all", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": upstream }]
+                }] }]
+            });
+            let config: crate::config::PipelineConfig =
+                serde_json::from_value(raw).expect("parse config");
+            crate::matcher::RuntimePipelineConfig::from_config(config)
+                .expect("build runtime config")
+        };
+        let tcp_upstream = format!("tcp://{addr}");
+        let engine =
+            crate::engine::Engine::new(runtime(&tcp_upstream), "test".to_string()).expect("engine");
+        let peer: SocketAddr = "192.0.2.10:53000".parse().unwrap();
+        timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(&udp_test_query("a.example"), peer),
+        )
+        .await
+        .expect("answer in time")
+        .expect("answer");
+
+        engine.reload(runtime(&tcp_upstream));
+        assert!(
+            timeout(Duration::from_millis(300), closed.recv())
+                .await
+                .is_err(),
+            "a reload that keeps the upstream keeps its connection"
+        );
+        engine.reload(runtime("udp://127.0.0.1:9"));
+        timeout(Duration::from_secs(2), closed.recv())
+            .await
+            .expect("the dropped upstream's connection closes");
     }
 }
