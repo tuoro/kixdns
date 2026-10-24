@@ -301,7 +301,38 @@ const DEFAULT_HEDGE_TIMEOUT_MS: u64 = 100;
 ///
 /// `observed` is the observer context of the request; every attempt and its
 /// result is reported through it. / `observed` 为所属请求的观察者上下文，每次尝试及其结果都经它上报。
+///
+/// DNS cookie（RFC 7873）只在相邻两跳之间有效，这里两头把关：查询去掉客户端的 cookie 再发出，
+/// 应答去掉 cookie 再交回，于是它既不会进缓存，也不会交给别的客户端。所有发往上游的查询都经过这里。
+/// DNS cookies (RFC 7873) hold between two neighbouring hops only, so both ends are
+/// guarded here: a query goes out without the client's cookie and a reply comes back
+/// without any, so no cookie enters the cache or reaches another client. Every query
+/// for an upstream passes through here.
 pub async fn forward_upstream(
+    engine: &Engine,
+    packet: &[u8],
+    upstream: &str,
+    timeout_dur: Duration,
+    transport: Option<Transport>,
+    pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
+    observed: Observed<'_>,
+) -> anyhow::Result<(Bytes, String)> {
+    let packet = crate::proto_utils::query_without_cookie(packet);
+    let (reply, winner) = forward_upstream_as_is(
+        engine,
+        &packet,
+        upstream,
+        timeout_dur,
+        transport,
+        pre_split_upstreams,
+        observed,
+    )
+    .await?;
+    Ok((crate::proto_utils::reply_without_cookie(reply), winner))
+}
+
+/// [`forward_upstream`] 去掉 cookie 之前的部分 / [`forward_upstream`] short of its cookie guard
+async fn forward_upstream_as_is(
     engine: &Engine,
     packet: &[u8],
     upstream: &str,

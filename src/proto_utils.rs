@@ -553,21 +553,33 @@ pub(crate) fn without_ecs(reply: Bytes) -> Result<Bytes, Bytes> {
             _ => Err(reply),
         };
     }
+    match without_option(&reply, &opt, 8) {
+        Ok(Some(out)) => Ok(Bytes::from(out)),
+        Ok(None) => Ok(reply),
+        Err(()) => Err(reply),
+    }
+}
+
+/// 去掉 OPT 里代码为 `code` 的选项之后的报文。OPT 必须是最后一条记录（见 `OptRecord::last`）。
+/// 没有这个选项时为 Ok(None)，选项结构不对时为 Err。
+/// The message without the options coded `code` in its OPT, which must be the
+/// last record (see `OptRecord::last`). Ok(None) when there is no such option,
+/// Err when the options are malformed.
+fn without_option(message: &[u8], opt: &OptRecord, code: u16) -> Result<Option<Vec<u8>>, ()> {
+    debug_assert!(opt.last, "only a last OPT can change its length");
     let mut kept = Vec::new();
     let mut found = false;
     let mut pos = opt.rdata.start;
     while pos < opt.rdata.end {
-        let Some(end) = pos
+        let end = pos
             .checked_add(4)
             .filter(|&header_end| header_end <= opt.rdata.end)
             .map(|header_end| {
-                header_end + u16::from_be_bytes([reply[pos + 2], reply[pos + 3]]) as usize
+                header_end + u16::from_be_bytes([message[pos + 2], message[pos + 3]]) as usize
             })
             .filter(|&end| end <= opt.rdata.end)
-        else {
-            return Err(reply);
-        };
-        if u16::from_be_bytes([reply[pos], reply[pos + 1]]) == 8 {
+            .ok_or(())?;
+        if u16::from_be_bytes([message[pos], message[pos + 1]]) == code {
             found = true;
         } else {
             kept.push(pos..end);
@@ -575,17 +587,87 @@ pub(crate) fn without_ecs(reply: Bytes) -> Result<Bytes, Bytes> {
         pos = end;
     }
     if !found {
-        return Ok(reply);
+        return Ok(None);
     }
     let rd_len: usize = kept.iter().map(|option| option.len()).sum();
-    let mut out = Vec::with_capacity(reply.len());
-    out.extend_from_slice(&reply[..opt.rdata.start]);
+    let mut out = Vec::with_capacity(message.len());
+    out.extend_from_slice(&message[..opt.rdata.start]);
     for option in kept {
-        out.extend_from_slice(&reply[option]);
+        out.extend_from_slice(&message[option]);
     }
-    out.extend_from_slice(&reply[opt.rdata.end..]);
+    out.extend_from_slice(&message[opt.rdata.end..]);
     out[opt.rdlen_at..opt.rdlen_at + 2].copy_from_slice(&(rd_len as u16).to_be_bytes());
-    Ok(Bytes::from(out))
+    Ok(Some(out))
+}
+
+/// RFC 7873 的 COOKIE 选项代码 / The COOKIE option code of RFC 7873
+const COOKIE: u16 = 10;
+
+/// OPT 的 RDATA（在 `rdata`）里有没有代码为 `code` 的选项；选项结构不对时为 false
+/// Whether the OPT RDATA at `rdata` has an option coded `code`; false when the
+/// options are malformed
+fn has_option(message: &[u8], rdata: std::ops::Range<usize>, code: u16) -> bool {
+    let mut pos = rdata.start;
+    while let Some(end) = pos
+        .checked_add(4)
+        .filter(|&header_end| header_end <= rdata.end)
+        .map(|header_end| {
+            header_end + u16::from_be_bytes([message[pos + 2], message[pos + 3]]) as usize
+        })
+        .filter(|&end| end <= rdata.end)
+    {
+        if u16::from_be_bytes([message[pos], message[pos + 1]]) == code {
+            return true;
+        }
+        pos = end;
+    }
+    false
+}
+
+/// 报文去掉 DNS cookie 之后的样子。没有 cookie，或者去不掉（OPT 后面还有记录、最后一条是
+/// TSIG：改了签名就不对了；或者 hickory 读不了）时为 None。
+/// The message without its DNS cookie. None when it has none, or when it cannot
+/// be taken out: records follow the OPT and the last one is a TSIG, which a
+/// change would invalidate, or hickory cannot read the message.
+fn cookie_removed(message: &[u8]) -> Option<Vec<u8>> {
+    let opt = find_opt(message).ok()??;
+    if opt.last {
+        return without_option(message, &opt, COOKIE).ok().flatten();
+    }
+    // 改 OPT 的长度会挪动它后面的记录（见 `OptRecord::last`），确有 cookie 时交给 hickory 重新编码
+    // Changing the OPT's length would move the records after it (see
+    // `OptRecord::last`), so hickory encodes the message again when a cookie is there
+    if !has_option(message, opt.rdata, COOKIE) || last_record_is_tsig(message) {
+        return None;
+    }
+    let mut msg = Message::from_vec(message).ok()?;
+    msg.edns
+        .as_mut()?
+        .options_mut()
+        .remove(hickory_proto::rr::rdata::opt::EdnsCode::Cookie);
+    msg.to_vec().ok()
+}
+
+/// 发往上游的查询去掉 DNS cookie。cookie 只在相邻两跳之间有效（RFC 7873）：客户端的
+/// cookie 是它和 KixDNS 之间的，转给上游的话，上游会把它带回来，随应答进缓存，再交给别的
+/// 客户端。没有 cookie 或者去不掉时原样交回（见 `cookie_removed`）。
+/// The query for an upstream without its DNS cookie. A cookie holds between two
+/// neighbouring hops only (RFC 7873): a client's cookie belongs between it and
+/// KixDNS, and forwarded it comes back from the upstream, enters the cache with
+/// the answer and goes to other clients. Handed back as it is when it has none or
+/// the cookie cannot be taken out (see `cookie_removed`).
+pub(crate) fn query_without_cookie(query: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    cookie_removed(query).map_or(std::borrow::Cow::Borrowed(query), std::borrow::Cow::Owned)
+}
+
+/// 上游应答去掉 DNS cookie。KixDNS 不发也不核对自己的 cookie，应答里的 cookie 只可能是上游
+/// 自己塞的（查询已经不带了），不该进缓存、也不该交给客户端。去不掉时原样交回。
+/// An upstream reply without its DNS cookie. KixDNS neither sends nor checks a
+/// cookie of its own, so one in a reply can only be the upstream's own addition
+/// (queries no longer carry any), which belongs neither in the cache nor in a
+/// client's reply. Handed back as it is when it cannot be taken out.
+pub(crate) fn reply_without_cookie(reply: Bytes) -> Bytes {
+    cookie_removed(&reply).map_or(reply, Bytes::from)
 }
 
 /// 给缓存里的应答换上回显客户端自己 ECS 的选项，作用范围为 `scope`（RFC 7871 第 7.2.2 节：
@@ -2024,6 +2106,112 @@ mod tests {
                 parse_quick(&with_ecs, &mut buf).unwrap().client_subnet,
                 Some(subnet("198.51.100.0", 24))
             );
+        }
+    }
+
+    mod cookie_wire {
+        use super::super::*;
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::borrow::Cow;
+        use std::str::FromStr;
+
+        /// 查询 example.com A；`cookie` 时带一个 8 字节的客户端 cookie，`ecs` 时再带一个 ECS 选项，
+        /// 两者都没有就不带 OPT
+        /// A query for example.com A; an 8-byte client cookie when `cookie`, an ECS
+        /// option as well when `ecs`, and no OPT when neither
+        fn query(cookie: bool, ecs: bool) -> Vec<u8> {
+            let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+            msg.add_query(Query::query(
+                Name::from_str("example.com.").unwrap(),
+                RecordType::A,
+            ));
+            if cookie || ecs {
+                let mut edns = Edns::new();
+                edns.set_max_payload(1232);
+                if ecs {
+                    edns.options_mut()
+                        .insert(EdnsOption::Subnet(ClientSubnet::new(
+                            "198.51.100.0".parse().unwrap(),
+                            24,
+                            0,
+                        )));
+                }
+                if cookie {
+                    edns.options_mut()
+                        .insert(EdnsOption::Unknown(COOKIE, b"CLIENT-1".to_vec()));
+                }
+                msg.edns = Some(edns);
+            }
+            msg.to_vec().unwrap()
+        }
+
+        fn has_cookie(packet: &[u8]) -> bool {
+            Message::from_vec(packet)
+                .expect("still a valid message")
+                .edns
+                .is_some_and(|edns| edns.options().get(EdnsCode::Cookie).is_some())
+        }
+
+        #[test]
+        fn a_message_without_a_cookie_is_handed_back_untouched() {
+            for packet in [query(false, false), query(false, true)] {
+                assert!(matches!(query_without_cookie(&packet), Cow::Borrowed(_)));
+                let reply = Bytes::from(packet);
+                assert_eq!(reply_without_cookie(reply.clone()).as_ptr(), reply.as_ptr());
+            }
+        }
+
+        #[test]
+        fn the_cookie_is_taken_out_and_the_other_options_kept() {
+            let packet = query(true, true);
+            let stripped = query_without_cookie(&packet);
+            assert!(!has_cookie(&stripped));
+            assert_eq!(
+                stripped.len(),
+                packet.len() - 12,
+                "the option header and 8 bytes go"
+            );
+            let msg = Message::from_vec(&stripped).expect("still a valid message");
+            let edns = msg.edns.expect("the OPT record stays");
+            assert!(edns.options().get(EdnsCode::Subnet).is_some(), "ECS stays");
+            assert_eq!(edns.max_payload(), 1232);
+            // 只有 cookie 一个选项时，OPT 留下，选项为空 / With the cookie alone, the OPT stays empty
+            let alone = query_without_cookie(&query(true, false)).into_owned();
+            assert!(!has_cookie(&alone));
+            assert!(Message::from_vec(&alone).unwrap().edns.is_some());
+        }
+
+        /// OPT 后面还有记录时挪不动它，交给 hickory 重新编码；后面的记录照样在
+        /// Records after the OPT cannot be moved, so hickory encodes the message
+        /// again, and those records are still there
+        #[test]
+        fn a_cookie_before_later_records_is_taken_out_through_hickory() {
+            let mut packet = query(true, false);
+            // An A record named by a pointer to the question, after the OPT
+            // OPT 之后一条名字指向问题的 A 记录
+            packet.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
+            packet[11] += 1;
+            assert!(has_cookie(&packet));
+            let stripped = reply_without_cookie(Bytes::from(packet));
+            assert!(!has_cookie(&stripped));
+            assert_eq!(
+                Message::from_vec(&stripped).unwrap().additionals.len(),
+                1,
+                "the record after the OPT stays"
+            );
+        }
+
+        /// 最后一条是 TSIG 时不动：改了报文签名就不对了
+        /// A message ending in a TSIG is left alone: any change would break the signature
+        #[test]
+        fn a_cookie_before_a_tsig_is_left_alone() {
+            let mut packet = query(true, false);
+            // A TSIG-typed record at the end of Additional / Additional 末尾一条 TSIG 类型的记录
+            packet.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0]);
+            packet[11] += 1;
+            assert!(matches!(query_without_cookie(&packet), Cow::Borrowed(_)));
         }
     }
 }
