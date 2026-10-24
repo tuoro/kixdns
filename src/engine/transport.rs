@@ -636,15 +636,18 @@ impl Drop for TcpPendingGuard {
 /// error or resetting it until a later request fails. Clearing the slot is
 /// enough, since the next `ensure_connection` rebuilds it. The hot path pays
 /// one stack construction and one boolean store.
-struct TcpWriteGuard<'a> {
-    slot: &'a mut Option<OwnedWriteHalf>,
+///
+/// DoT 的写半边换成 TLS 流，用的是同一个 guard。
+/// DoT, whose write half is a TLS stream, uses the same guard.
+struct TcpWriteGuard<'a, W> {
+    slot: &'a mut Option<W>,
     /// 取消时置位，交给下一次 `ensure_connection` 做完整 reset
     /// Set on cancellation so the next `ensure_connection` does a full reset
     needs_reset: &'a AtomicBool,
     armed: bool,
 }
 
-impl Drop for TcpWriteGuard<'_> {
+impl<W> Drop for TcpWriteGuard<'_, W> {
     fn drop(&mut self) {
         if self.armed {
             // 立刻丢掉写半边，半条帧不会再被别人续写；`reset()` 还要取消 reader
@@ -1829,6 +1832,9 @@ pub struct DotMuxClient {
     target: Mutex<Option<DotTarget>>,
     tls_config: Arc<ClientConfig>,
     conn: Arc<Mutex<Option<DotWriteHalf>>>,
+    /// 上一次写入被取消，下次使用前需要完整 reset（同 TCP）
+    /// A write was cancelled; the connection needs a full reset before reuse (as for TCP)
+    write_cancelled: AtomicBool,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
     pub permit_manager: Arc<PermitManager>,
@@ -1924,6 +1930,7 @@ impl DotMuxClient {
             target: Mutex::new(None),
             tls_config,
             conn: Arc::new(Mutex::new(None)),
+            write_cancelled: AtomicBool::new(false),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
             permit_manager,
@@ -2187,8 +2194,35 @@ impl DotMuxClient {
             // Frame already contains length prefix + payload — write directly, no second copy.
             // 帧已包含长度前缀 + 负载——直接写入，无二次拷贝。
             let mut guard = self.conn.lock().await;
-            let writer = guard.as_mut().context("dot write half missing")?;
-            if let Err(e) = writer.write_all(&new_packet).await {
+            if guard.is_none() {
+                anyhow::bail!("dot write half missing");
+            }
+            // 写入期间被取消时丢弃连接，避免半条帧留在池里（见 TcpWriteGuard）
+            // Drop the connection if the write is cancelled, so half a frame
+            // cannot stay pooled (see TcpWriteGuard)
+            let mut write_guard = TcpWriteGuard {
+                slot: &mut guard,
+                needs_reset: &self.write_cancelled,
+                armed: true,
+            };
+            let writer = write_guard
+                .slot
+                .as_mut()
+                .expect("connection presence checked above");
+            // TLS 流在 socket 写满时会先收下明文、返回"已写入"，加密后的记录留在缓冲
+            // 里，要等下一次写或 flush 才发出去；不 flush 的话，流量少时这个查询可能
+            // 一直等到超时
+            // When the socket is full a TLS stream accepts the plaintext and
+            // reports it written while the encrypted records stay buffered until
+            // the next write or flush; without the flush, on a quiet connection
+            // the query could wait out its whole timeout
+            let mut result = writer.write_all(&new_packet).await;
+            if result.is_ok() {
+                result = writer.flush().await;
+            }
+            // 走到这里说明写入已经结束 / Reaching here means the write finished
+            write_guard.armed = false;
+            if let Err(e) = result {
                 return Err(anyhow::anyhow!(e).context("dot write failed"));
             }
             Ok::<(), anyhow::Error>(())
@@ -2284,13 +2318,19 @@ impl DotMuxClient {
     /// `budget` 同时约束 TCP 建连和 TLS 握手；失败时立即释放锁和 permit。
     async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         let errors = self.consecutive_errors.load(Ordering::Acquire);
-        let needs_reset = errors > 0;
+        // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补齐 reader token 与连接级
+        // permit（同 TCP）
+        // A cancelled write already dropped the write half in Drop; this picks up
+        // the reader token and the connection permit (as for TCP)
+        let write_cancelled = self.write_cancelled.swap(false, Ordering::AcqRel);
+        let needs_reset = errors > 0 || write_cancelled;
 
         if needs_reset {
             debug!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
-                "DoT connection has errors, resetting before ensure"
+                write_cancelled,
+                "DoT connection needs a reset before ensure"
             );
             self.reset().await;
         }
@@ -2489,6 +2529,28 @@ fn build_server_name(name: &str) -> anyhow::Result<ServerName<'static>> {
     }
 }
 
+/// URL 里的主机，IPv6 地址不带方括号。`Url::host_str` 会把方括号原样带上，拼地址时
+/// 就成了 `[[…]]:853`，拿去当证书名或判断是不是 IP 也都对不上。
+/// The URL's host, an IPv6 address without its brackets. `Url::host_str` keeps
+/// the brackets, which turned into `[[…]]:853` once joined with the port and
+/// matched neither a certificate name nor an IP check.
+fn url_host(url: &Url) -> Option<String> {
+    Some(match url.host()? {
+        url::Host::Domain(domain) => domain.to_string(),
+        url::Host::Ipv4(addr) => addr.to_string(),
+        url::Host::Ipv6(addr) => addr.to_string(),
+    })
+}
+
+/// `主机:端口`，IPv6 地址加上方括号 / `host:port`, with brackets around an IPv6 address
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
     let url = if upstream.contains("://") {
         Url::parse(upstream)
@@ -2497,7 +2559,7 @@ fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
     }
     .context("invalid dot upstream url")?;
 
-    let host = url.host_str().context("dot upstream missing host")?;
+    let host = url_host(&url).context("dot upstream missing host")?;
     let port = url.port().unwrap_or(853);
 
     if !url.path().is_empty() && url.path() != "/" {
@@ -2515,13 +2577,8 @@ fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
         }
     }
 
-    let connect_addr = if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-
-    let sni_value = sni.unwrap_or_else(|| host.to_string());
+    let connect_addr = host_port(&host, port);
+    let sni_value = sni.unwrap_or(host);
 
     Ok(DotTarget {
         connect_addr: Arc::from(connect_addr.as_str()),
@@ -2906,11 +2963,24 @@ impl DoqMuxClient {
             self.check_connection_health().await;
 
             let start = tokio::time::Instant::now();
+            // 解析上游名字、等连接锁、握手和等回答共用这一份预算。此前握手和回答各拿
+            // 一整份超时，一个请求最多能跑到配置值的两倍，系统解析上游名字则完全不受限
+            // Resolving the upstream name, waiting for the connection lock, the
+            // handshake and the answer share this one budget. The handshake and
+            // the answer used to get a full timeout each, so a request could run
+            // to twice the configured value, and resolving the name had no bound
             let DoqConnectionInfo {
                 conn,
                 used_0rtt,
                 reused,
-            } = self.get_or_connect(target, timeout_dur).await?;
+            } = match timeout(timeout_dur, self.get_or_connect(target, timeout_dur)).await {
+                Ok(info) => info?,
+                Err(_) => anyhow::bail!("doq connect timeout after {}ms", timeout_dur.as_millis()),
+            };
+            let query_budget = timeout_dur.saturating_sub(start.elapsed());
+            if query_budget.is_zero() {
+                anyhow::bail!("doq timeout before sending the query");
+            }
 
             // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
             // with a 2-octet length field, followed by the DNS message content.
@@ -2918,7 +2988,7 @@ impl DoqMuxClient {
             // is signalled by FIN.
             // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
             // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
-            let resp = timeout(timeout_dur, async {
+            let resp = timeout(query_budget, async {
                 // 内层返回带类型的失败，而不是 anyhow：每一步都被 context 包过
                 // 之后，anyhow 的 to_string 只剩最外层那一句，quinn 的原始错误
                 // 到不了判定处。
@@ -3231,7 +3301,7 @@ impl DoqMuxClient {
         target: &DoqTarget,
         timeout_dur: Duration,
     ) -> anyhow::Result<(QuicConnection, bool)> {
-        let addr_str = format!("{}:{}", target.host, target.port);
+        let addr_str = host_port(&target.host, target.port);
         let addrs = tokio::net::lookup_host(&addr_str)
             .await
             .context("doq resolve failed")?;
@@ -3338,7 +3408,7 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
     }
     .context("invalid doq upstream url")?;
 
-    let host = url.host_str().context("doq upstream missing host")?;
+    let host = url_host(&url).context("doq upstream missing host")?;
     let port = url.port().unwrap_or(853);
 
     if !url.path().is_empty() && url.path() != "/" {
@@ -3375,7 +3445,7 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
         );
     }
 
-    let sni_value = sni.unwrap_or_else(|| host.to_string());
+    let sni_value = sni.unwrap_or_else(|| host.clone());
 
     Ok(DoqTarget {
         host: Arc::from(host),
@@ -4711,11 +4781,19 @@ mod tests {
     /// A self-signed certificate for `localhost` and a client config trusting
     /// only it, both sides offering `alpn`
     fn localhost_tls(alpn: &[&[u8]]) -> (rustls::ServerConfig, ClientConfig) {
+        self_signed_tls(&["localhost"], alpn)
+    }
+
+    /// 给 `names` 签的自签证书（IP 地址成为 IP 类型的名字）和只信任它的客户端配置
+    /// A self-signed certificate for `names` (an IP address becomes an IP name)
+    /// and a client config trusting only it
+    fn self_signed_tls(names: &[&str], alpn: &[&[u8]]) -> (rustls::ServerConfig, ClientConfig) {
         use rcgen::{CertificateParams, KeyPair};
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
         let key_pair = KeyPair::generate().expect("generate key pair");
-        let cert = CertificateParams::new(vec!["localhost".to_string()])
+        let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        let cert = CertificateParams::new(names)
             .expect("certificate params")
             .self_signed(&key_pair)
             .expect("self-signed certificate");
@@ -4766,13 +4844,23 @@ mod tests {
         accept_delay: Duration,
         reply: fn(usize, &str) -> DoqReply,
     ) -> SocketAddr {
+        spawn_doq_upstream_on("127.0.0.1:0".parse().unwrap(), server, accept_delay, reply)
+            .expect("bind the DoQ test upstream")
+    }
+
+    /// 同 [`spawn_doq_upstream`]，绑在 `bind` 上；该地址族不可用时为 None
+    /// As [`spawn_doq_upstream`], bound to `bind`; `None` when that address
+    /// family is unavailable on this host
+    fn spawn_doq_upstream_on(
+        bind: SocketAddr,
+        server: rustls::ServerConfig,
+        accept_delay: Duration,
+        reply: fn(usize, &str) -> DoqReply,
+    ) -> Option<SocketAddr> {
         let crypto =
             quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
-        let endpoint = QuicEndpoint::server(
-            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
-            "127.0.0.1:0".parse().unwrap(),
-        )
-        .expect("bind the DoQ test upstream");
+        let endpoint =
+            QuicEndpoint::server(quinn::ServerConfig::with_crypto(Arc::new(crypto)), bind).ok()?;
         let addr = endpoint.local_addr().expect("read the DoQ test address");
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -4822,7 +4910,7 @@ mod tests {
                 });
             }
         });
-        addr
+        Some(addr)
     }
 
     /// 只信任 `client_tls` 里那张证书的 DoQ 客户端 / A DoQ client trusting only the certificate in `client_tls`
@@ -4832,12 +4920,20 @@ mod tests {
         enable_0rtt: bool,
     ) -> DoqMuxClient {
         let crypto = QuicClientConfig::try_from(client_tls).expect("quic client crypto");
-        let mut endpoint =
+        let config = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut endpoint_v4 =
             QuicEndpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind the DoQ client");
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        endpoint_v4.set_default_client_config(config.clone());
+        let endpoint_v6 = match QuicEndpoint::client("[::1]:0".parse().unwrap()) {
+            Ok(mut endpoint) => {
+                endpoint.set_default_client_config(config);
+                endpoint
+            }
+            Err(_) => endpoint_v4.clone(),
+        };
         let runtime = Arc::new(DoqRuntime {
-            endpoint_v4: endpoint.clone(),
-            endpoint_v6: endpoint,
+            endpoint_v4,
+            endpoint_v6,
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
         });
@@ -4941,6 +5037,18 @@ mod tests {
     /// 100 ms, anything else at once; queries on one connection are answered
     /// independently, whichever is ready first.
     async fn spawn_stream_upstream(tls: Option<rustls::ServerConfig>) -> SocketAddr {
+        spawn_stream_upstream_on("127.0.0.1:0", tls)
+            .await
+            .expect("bind the stream test upstream")
+    }
+
+    /// 同 [`spawn_stream_upstream`]，绑在 `bind` 上；该地址族不可用时为 None
+    /// As [`spawn_stream_upstream`], bound to `bind`; `None` when that address
+    /// family is unavailable on this host
+    async fn spawn_stream_upstream_on(
+        bind: &str,
+        tls: Option<rustls::ServerConfig>,
+    ) -> Option<SocketAddr> {
         async fn serve<S>(stream: S)
         where
             S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
@@ -4973,9 +5081,7 @@ mod tests {
             }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the stream test upstream");
+        let listener = tokio::net::TcpListener::bind(bind).await.ok()?;
         let addr = listener.local_addr().expect("read the stream test address");
         let acceptor = tls.map(|config| tokio_rustls::TlsAcceptor::from(Arc::new(config)));
         tokio::spawn(async move {
@@ -4993,7 +5099,7 @@ mod tests {
                 });
             }
         });
-        addr
+        Some(addr)
     }
 
     /// TCP 和 DoT 的多路复用客户端是同一套写法，下面几条测试对两者一视同仁
@@ -5160,5 +5266,161 @@ mod tests {
     #[tokio::test]
     async fn a_dot_reset_fails_waiting_queries_at_once() {
         a_reset_fails_waiting_queries_at_once(&dot_test_client().await).await;
+    }
+
+    /// 握手被压住 250 ms、回答再等 250 ms：300 ms 预算的请求曾跑满 560 ms 才成功
+    /// A handshake held back 250 ms and an answer after another 250 ms: a request
+    /// with a 300 ms budget used to run the full 560 ms and succeed
+    #[tokio::test]
+    async fn doq_handshake_and_answer_share_one_budget() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let addr = spawn_doq_upstream(server, Duration::from_millis(250), |_, _| {
+            DoqReply::Answer(Duration::from_millis(250))
+        })
+        .await;
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        let started = tokio::time::Instant::now();
+        let result = client
+            .send(
+                &udp_test_query("budget.example"),
+                Duration::from_millis(300),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err(), "the answer cannot arrive within 300 ms");
+        assert!(
+            elapsed < Duration::from_millis(420),
+            "a 300 ms request ran for {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn dot_target_accepts_an_ipv6_literal() {
+        let target = parse_dot_target("[2400:3200::1]:853").expect("parse an IPv6 DoT upstream");
+        assert_eq!(&*target.connect_addr, "[2400:3200::1]:853");
+        assert_eq!(&*target.sni, "2400:3200::1");
+        assert!(
+            matches!(build_server_name(&target.sni), Ok(ServerName::IpAddress(_))),
+            "the server name for an IP literal must be the address itself"
+        );
+    }
+
+    #[test]
+    fn doq_target_with_an_ipv6_literal_requires_sni() {
+        assert!(
+            parse_doq_target("[2400:3200::1]:853").is_err(),
+            "an IPv6 literal without sni must be refused like an IPv4 one"
+        );
+        let target = parse_doq_target("[2400:3200::1]:853?sni=dns.alidns.com")
+            .expect("an IPv6 literal with sni is fine");
+        assert_eq!(host_port(&target.host, target.port), "[2400:3200::1]:853");
+    }
+
+    /// `tls://[…]` 写法的上游此前根本连不上：地址被拼成 `[[…]]:853`
+    /// An upstream written `tls://[…]` could not connect at all: the address came
+    /// out as `[[…]]:853`
+    #[tokio::test]
+    async fn dot_reaches_an_ipv6_literal_upstream() {
+        let (server, client_tls) = self_signed_tls(&["::1"], &[]);
+        let Some(addr) = spawn_stream_upstream_on("[::1]:0", Some(server)).await else {
+            eprintln!("skipped: IPv6 loopback unavailable on this host");
+            return;
+        };
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://[::1]:{}", addr.port())),
+            Arc::new(client_tls),
+            Arc::new(PermitManager::new(1)),
+        );
+        client
+            .send(&udp_test_query("v6.example"), Duration::from_secs(2))
+            .await
+            .expect("an IPv6 literal DoT upstream answers");
+    }
+
+    #[tokio::test]
+    async fn doq_reaches_an_ipv6_literal_upstream() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let answer = |_: usize, _: &str| DoqReply::Answer(Duration::ZERO);
+        let Some(addr) =
+            spawn_doq_upstream_on("[::1]:0".parse().unwrap(), server, Duration::ZERO, answer)
+        else {
+            eprintln!("skipped: IPv6 loopback unavailable on this host");
+            return;
+        };
+        let client = doq_test_client(
+            format!("doq://[::1]:{}?sni=localhost", addr.port()),
+            client_tls,
+            false,
+        );
+        client
+            .send(&udp_test_query("v6.example"), Duration::from_secs(2))
+            .await
+            .expect("an IPv6 literal DoQ upstream answers");
+    }
+
+    /// TCP 早有的保护 DoT 此前没有：写到一半被取消（多上游竞速时输掉的请求会被
+    /// abort），半条帧留在 TLS 流里，下一个请求接着往后写，对端按长度前缀读就会错位
+    /// The guard TCP already had, which DoT lacked: a write cancelled part way
+    /// (the losers of a multi-upstream race are aborted) left half a frame in the
+    /// TLS stream for the next request to append to, desynchronising a peer
+    /// that reads by length prefix
+    #[tokio::test]
+    async fn a_cancelled_dot_write_drops_the_pooled_connection() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // 对端握手之后一个字节也不读，发送缓冲区会被填满
+        // The peer completes the handshake and never reads, so the send buffer fills
+        let (server, client_tls) = localhost_tls(&[]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let held = acceptor.accept(stream).await.expect("TLS handshake");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+
+        let client = Arc::new(DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(client_tls),
+            Arc::new(PermitManager::new(1)),
+        ));
+        client
+            .ensure_connection(Duration::from_secs(2))
+            .await
+            .expect("connect to the test peer");
+
+        // 把发送缓冲区填满，让后续写入必然停在 await 上
+        // Fill the send buffer so any later write must park on an await
+        {
+            let mut guard = client.conn.lock().await;
+            let writer = guard.as_mut().unwrap();
+            let chunk = vec![0u8; 65536];
+            while tokio::time::timeout(Duration::from_millis(300), writer.write_all(&chunk))
+                .await
+                .is_ok_and(|written| written.is_ok())
+            {}
+        }
+
+        // 写入停在 await 上时取消这次发送 / Cancel the send while the write is parked
+        let sender = Arc::clone(&client);
+        let query = udp_test_query("cancelled.example");
+        let task = tokio::spawn(async move { sender.send(&query, Duration::from_secs(30)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            client.conn.lock().await.is_none(),
+            "a write cancelled part way through must drop the connection instead of \
+             leaving a possibly half-written frame in the pool"
+        );
+        assert!(
+            client.write_cancelled.load(Ordering::Acquire),
+            "the next ensure_connection must be told to finish the cleanup that \
+             Drop cannot await: the reader token and the connection permit"
+        );
+        peer.abort();
     }
 }
