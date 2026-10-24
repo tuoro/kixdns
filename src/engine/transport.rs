@@ -2494,6 +2494,9 @@ struct DoqRuntime {
 struct DoqConnectionInfo {
     conn: QuicConnection,
     used_0rtt: bool,
+    /// 连接取自连接池，而不是为这次查询新建的
+    /// The connection came from the pool rather than being made for this query
+    reused: bool,
 }
 
 /// DoQ (DNS over QUIC) 连接池
@@ -2840,9 +2843,11 @@ impl DoqMuxClient {
             self.check_connection_health().await;
 
             let start = tokio::time::Instant::now();
-            let info = self.get_or_connect(target, timeout_dur).await?;
-            let conn = info.conn;
-            let used_0rtt = info.used_0rtt;
+            let DoqConnectionInfo {
+                conn,
+                used_0rtt,
+                reused,
+            } = self.get_or_connect(target, timeout_dur).await?;
 
             // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
             // with a 2-octet length field, followed by the DNS message content.
@@ -2958,21 +2963,36 @@ impl DoqMuxClient {
                         // Only reset if record_error() didn't already reset (below threshold)
                         self.reset_connection().await;
                     }
-                    if allow_retry
-                        && used_0rtt
+                    let retry = if !allow_retry {
+                        false
+                    } else if used_0rtt
                         && self.zero_rtt_retry_allowed(target)
                         && Self::zero_rtt_likely_rejected(&failure)
                     {
                         self.disable_zero_rtt();
-                        let remaining = timeout_dur.saturating_sub(start.elapsed());
-                        if remaining.is_zero() {
-                            return Err(anyhow::Error::new(failure));
-                        }
                         warn!(
                             upstream = %self.upstream,
                             error = %failure,
                             "DoQ 0-RTT likely rejected, retrying without 0-RTT"
                         );
+                        true
+                    } else if reused && Self::connection_gone(&failure) {
+                        // 池里的连接在两次查询之间断了（服务器的空闲超时可能比保活间隔还短），
+                        // 这次查询本身没问题：换一条新连接再发一次
+                        // The pooled connection died between two queries (a server's
+                        // idle timeout can be shorter than our keep-alive interval);
+                        // the query itself is fine, so send it again on a fresh one
+                        debug!(
+                            upstream = %self.upstream,
+                            error = %failure,
+                            "DoQ pooled connection is gone, retrying on a fresh connection"
+                        );
+                        true
+                    } else {
+                        false
+                    };
+                    let remaining = timeout_dur.saturating_sub(start.elapsed());
+                    if retry && !remaining.is_zero() {
                         allow_retry = false;
                         timeout_dur = remaining;
                         continue;
@@ -2980,44 +3000,27 @@ impl DoqMuxClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(_) => {
-                    if allow_retry && used_0rtt {
+                    // 只有用了 0-RTT 的连接超时才算 0-RTT 的嫌疑；普通连接上的超时
+                    // 只是这次回答慢，不能因此把 0-RTT 永久关掉
+                    // Only a timeout on a connection that used 0-RTT puts 0-RTT
+                    // under suspicion; on a normal connection it just means a slow
+                    // answer and must not switch 0-RTT off for good
+                    if used_0rtt {
                         self.disable_zero_rtt();
-                        let remaining = timeout_dur.saturating_sub(start.elapsed());
-                        if remaining.is_zero() {
+                        if allow_retry {
+                            let remaining = timeout_dur.saturating_sub(start.elapsed());
                             self.reset_connection().await;
-                            return Err(anyhow::anyhow!("doq timeout"));
+                            if remaining.is_zero() {
+                                return Err(anyhow::anyhow!("doq timeout"));
+                            }
+                            warn!(
+                                upstream = %self.upstream,
+                                "DoQ 0-RTT timeout detected, retrying without 0-RTT"
+                            );
+                            allow_retry = false;
+                            timeout_dur = remaining;
+                            continue;
                         }
-                        warn!(
-                            upstream = %self.upstream,
-                            "DoQ 0-RTT timeout detected, retrying without 0-RTT"
-                        );
-                        self.reset_connection().await;
-                        allow_retry = false;
-                        timeout_dur = remaining;
-                        continue;
-                    }
-
-                    // Timeout occurred - check if this was a 0-RTT connection
-                    // 超时发生 - 检查是否是 0-RTT 连接
-                    let was_rejected = self
-                        .zero_rtt_rejected
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if !was_rejected {
-                        // Mark 0-RTT as rejected for this upstream (cached until restart)
-                        // 标记此上游的 0-RTT 为被拒绝（缓存直到重启）
-                        self.zero_rtt_rejected
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        warn!(
-                            upstream = %self.upstream,
-                            // 粘滞位绕不过去：connect_new 用的是
-                            // enable_0rtt && !was_rejected，所以 ?0rtt=true 也
-                            // 不会让它重新启用，只能重启进程。
-                            // The sticky bit cannot be bypassed: connect_new
-                            // takes enable_0rtt && !was_rejected, so ?0rtt=true
-                            // does not re-enable it either; only a restart does.
-                            "DoQ 0-RTT timeout detected, automatically disabling 0-RTT for this upstream. \
-                            Future connections will use normal handshake. This status is cached until a restart."
-                        );
                     }
                     let already_reset = self.record_error().await;
                     if !already_reset {
@@ -3067,6 +3070,26 @@ impl DoqMuxClient {
         }
     }
 
+    /// 这次失败是否说明连接本身已经没了（而不是这一次查询出了问题）
+    /// Whether this failure means the connection itself is gone, rather than
+    /// something being wrong with this one query
+    ///
+    /// 开流失败、写或读的时候连接丢了，都算；流被对端重置、应答不合协议都不算，
+    /// 换连接重发也不会更好。
+    /// A failed stream open and a connection lost during the write or the read
+    /// count. A stream reset by the peer or a malformed answer do not, as
+    /// sending again on another connection would not help.
+    fn connection_gone(failure: &DoqFailure) -> bool {
+        matches!(
+            failure,
+            DoqFailure::OpenStream(_)
+                | DoqFailure::Write(quinn::WriteError::ConnectionLost(_))
+                | DoqFailure::Read(quinn::ReadToEndError::Read(
+                    quinn::ReadError::ConnectionLost(_)
+                ))
+        )
+    }
+
     /// 在这条连接上是否还允许关掉 0-RTT 重试：配置开着、且还没被标记过拒绝
     /// Whether a 0-RTT retry is still allowed here: enabled by configuration and
     /// not already marked as rejected
@@ -3102,10 +3125,26 @@ impl DoqMuxClient {
         // 防止两个协程同时通过第一次检查后都创建连接、浪费一个的竞态。
         let mut guard = self.connection.lock().await;
         if let Some(conn) = guard.as_ref() {
-            return Ok(DoqConnectionInfo {
-                conn: conn.clone(),
-                used_0rtt: false,
-            });
+            // 对端关掉的、或者空闲超时的连接还留在这里的话，拿去用只会让这次查询失败
+            // A connection the peer closed, or one that idled out, would only
+            // fail this query if handed out again
+            match conn.close_reason() {
+                None => {
+                    return Ok(DoqConnectionInfo {
+                        conn: conn.clone(),
+                        used_0rtt: false,
+                        reused: true,
+                    });
+                }
+                Some(reason) => {
+                    debug!(
+                        upstream = %self.upstream,
+                        reason = %reason,
+                        "DoQ pooled connection already closed, reconnecting"
+                    );
+                    *guard = None;
+                }
+            }
         }
 
         let (conn, used_0rtt) = self.connect_new(target, timeout_dur).await?;
@@ -3117,7 +3156,11 @@ impl DoqMuxClient {
         self.conn_create_time.store(now, Ordering::Release);
         self.last_request_time.store(now, Ordering::Release);
 
-        Ok(DoqConnectionInfo { conn, used_0rtt })
+        Ok(DoqConnectionInfo {
+            conn,
+            used_0rtt,
+            reused: false,
+        })
     }
 
     async fn connect_new(
@@ -4598,6 +4641,232 @@ mod tests {
         assert_eq!(
             restore_query_id(&[0x12], Bytes::from_static(&[0x00, 0x00])).as_ref(),
             &[0x00, 0x00]
+        );
+    }
+
+    /// `localhost` 的自签证书，以及只信任它的客户端配置；`alpn` 两边都用
+    /// A self-signed certificate for `localhost` and a client config trusting
+    /// only it, both sides offering `alpn`
+    fn localhost_tls(alpn: &[&[u8]]) -> (rustls::ServerConfig, ClientConfig) {
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let key_pair = KeyPair::generate().expect("generate key pair");
+        let cert = CertificateParams::new(vec!["localhost".to_string()])
+            .expect("certificate params")
+            .self_signed(&key_pair)
+            .expect("self-signed certificate");
+        let cert_der: CertificateDer<'static> = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let mut server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server config");
+        server.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).expect("trust the test certificate");
+        let mut client = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        (server, client)
+    }
+
+    /// DNS 消息里问题名的第一个标签 / First label of the question name in a DNS message
+    fn first_label(message: &[u8]) -> String {
+        let len = message[12] as usize;
+        String::from_utf8_lossy(&message[13..13 + len]).into_owned()
+    }
+
+    /// 本机 DoQ 测试上游怎么对待一个查询 / How the local DoQ test upstream treats one query
+    #[derive(Clone, Copy)]
+    enum DoqReply {
+        /// 隔这么久照常回答 / Answer after this long
+        Answer(Duration),
+        /// 回答，100 ms 后关掉整条连接 / Answer, then close the whole connection 100 ms later
+        AnswerThenClose,
+        /// 读完查询就关掉整条连接，不回答 / Read the query and close the connection unanswered
+        Close,
+        /// 一直不回答 / Never answer
+        Silence,
+    }
+
+    /// 本机 DoQ 上游：握手先压住 `accept_delay`；每条连接上第 n 个查询（从 0 数）按
+    /// `reply(n, 问题名第一个标签)` 处理，应答是置了 QR 位的原查询。
+    /// Local DoQ upstream: the handshake is held back for `accept_delay`; the
+    /// n-th query on each connection (counting from 0) is treated as
+    /// `reply(n, first label of the question)`, the answer being the query
+    /// with QR set.
+    async fn spawn_doq_upstream(
+        server: rustls::ServerConfig,
+        accept_delay: Duration,
+        reply: fn(usize, &str) -> DoqReply,
+    ) -> SocketAddr {
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
+        let endpoint = QuicEndpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("bind the DoQ test upstream");
+        let addr = endpoint.local_addr().expect("read the DoQ test address");
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(accept_delay).await;
+                    let Ok(conn) = incoming.await else { return };
+                    let mut index = 0;
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let n = index;
+                        index += 1;
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            let Ok(mut frame) = recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await
+                            else {
+                                return;
+                            };
+                            let close = || conn.close(quinn::VarInt::from_u32(0), b"closing");
+                            let action = reply(n, &first_label(&frame[2..]));
+                            let delay = match action {
+                                DoqReply::Silence => {
+                                    // 拿着发送端不放：一放手流就结束了，客户端会读到空应答
+                                    // Hold on to the send side: dropping it ends
+                                    // the stream and the client reads an empty answer
+                                    tokio::time::sleep(Duration::from_secs(30)).await;
+                                    drop(send);
+                                    return;
+                                }
+                                DoqReply::Close => {
+                                    close();
+                                    return;
+                                }
+                                DoqReply::Answer(delay) => delay,
+                                DoqReply::AnswerThenClose => Duration::ZERO,
+                            };
+                            tokio::time::sleep(delay).await;
+                            // 长度前缀之后第 3 个字节是 QR 所在的标志位
+                            // The flags byte carrying QR sits third after the length prefix
+                            frame[4] |= 0x80;
+                            let _ = send.write_all(&frame).await;
+                            let _ = send.finish();
+                            if matches!(action, DoqReply::AnswerThenClose) {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                close();
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// 只信任 `client_tls` 里那张证书的 DoQ 客户端 / A DoQ client trusting only the certificate in `client_tls`
+    fn doq_test_client(
+        upstream: String,
+        client_tls: ClientConfig,
+        enable_0rtt: bool,
+    ) -> DoqMuxClient {
+        let crypto = QuicClientConfig::try_from(client_tls).expect("quic client crypto");
+        let mut endpoint =
+            QuicEndpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind the DoQ client");
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let runtime = Arc::new(DoqRuntime {
+            endpoint_v4: endpoint.clone(),
+            endpoint_v6: endpoint,
+            enable_0rtt,
+            zero_rtt_notice: std::sync::Once::new(),
+        });
+        DoqMuxClient::new(Arc::from(upstream), runtime)
+    }
+
+    /// 阿里的 DoQ 服务器大约 10 秒就关掉空闲连接，比 15 秒一次的保活还短。池里那条已经
+    /// 关掉的连接曾被原样拿去用，这次查询直接失败；每个上游有 16 条连接轮流用，空闲之后
+    /// 头 16 个查询就一个接一个失败。
+    /// Alibaba's DoQ servers drop an idle connection after about 10 s, sooner
+    /// than the 15 s keep-alive. The closed connection used to be handed out as
+    /// it was and the query failed outright; with 16 pooled connections per
+    /// upstream used in turn, the first 16 queries after a quiet spell failed
+    /// one after another.
+    #[tokio::test]
+    async fn doq_replaces_a_pooled_connection_the_server_already_closed() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let addr =
+            spawn_doq_upstream(server, Duration::ZERO, |_, _| DoqReply::AnswerThenClose).await;
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        client
+            .send(&udp_test_query("first.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+
+        // 服务器在应答 100 ms 后关掉连接 / The server closes the connection 100 ms after answering
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let second = client
+            .send(&udp_test_query("second.example"), Duration::from_secs(2))
+            .await;
+        assert!(
+            second.is_ok(),
+            "a connection the server already closed must be replaced, not used: {:?}",
+            second.err()
+        );
+    }
+
+    /// 连接在检查之后、查询途中才断时，靠的是换一条新连接再发一次
+    /// When the connection only dies after the check, during the query, the one
+    /// retry on a fresh connection is what saves the query
+    #[tokio::test]
+    async fn doq_retries_once_when_the_pooled_connection_dies_under_the_query() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let addr = spawn_doq_upstream(server, Duration::ZERO, |n, _| {
+            if n == 0 {
+                DoqReply::Answer(Duration::ZERO)
+            } else {
+                DoqReply::Close
+            }
+        })
+        .await;
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        client
+            .send(&udp_test_query("first.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+
+        let second = client
+            .send(&udp_test_query("second.example"), Duration::from_secs(2))
+            .await;
+        assert!(
+            second.is_ok(),
+            "a pooled connection closed under the query must be retried on a fresh one: {:?}",
+            second.err()
+        );
+    }
+
+    /// 没用 0-RTT 的连接上一次回答慢，曾被当成 0-RTT 被拒，把这个上游的 0-RTT 关到
+    /// 重启为止；而断连之后要重连，0-RTT 正好省下一个往返。
+    /// One slow answer on a connection that did not use 0-RTT used to count as
+    /// 0-RTT being rejected and switched it off for the upstream until a
+    /// restart, while 0-RTT is exactly what saves a round trip on every
+    /// reconnect after a dropped connection.
+    #[tokio::test]
+    async fn a_doq_timeout_without_0rtt_leaves_0rtt_on() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let addr = spawn_doq_upstream(server, Duration::ZERO, |_, label| {
+            if label == "slow" {
+                DoqReply::Silence
+            } else {
+                DoqReply::Answer(Duration::ZERO)
+            }
+        })
+        .await;
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, true);
+        let result = client
+            .send(&udp_test_query("slow.example"), Duration::from_millis(300))
+            .await;
+        assert!(result.is_err(), "the upstream never answers `slow`");
+        assert!(
+            !client.zero_rtt_rejected.load(Ordering::Relaxed),
+            "a timeout on a connection that did not use 0-RTT says nothing about 0-RTT"
         );
     }
 }
