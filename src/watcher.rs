@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use tracing::{error, info, warn};
@@ -15,6 +15,15 @@ use crate::matcher::RuntimePipelineConfig;
 /// rides out non-atomic writes (e.g. truncate+write) observed mid-way.
 const RELOAD_RETRIES: u32 = 5;
 const RELOAD_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// 一次保存常常带来好几个事件：改名盖过目标文件时，notify 为它报一个「改名到这里」，再报一个
+/// 同时列出两端的「改名」。收到第一个以后再等这么久，把同一次保存的事件收齐，每个文件只回调一次，
+/// 否则面板的每次保存都会让配置完整重载两遍。
+/// One save often brings several events: a rename over the target is reported once as
+/// "renamed to" and again as a rename naming both ends. After the first one, events are
+/// gathered for this long so each file is called back once per save; otherwise every save
+/// from the panel reloaded the configuration twice.
+const COALESCE_WINDOW: Duration = Duration::from_millis(50);
 
 pub fn spawn(path: PathBuf, engine: Engine) {
     // 使用阻塞线程持有watcher，避免异步生命周期问题。 / Use blocking thread to hold watcher, avoiding async lifetime issues.
@@ -204,7 +213,7 @@ impl Targets {
     }
 
     /// 这个事件改了数据的文件，按配置里写的路径 / The files whose data this event changed, as configured
-    fn changed<'a>(&'a self, event: &'a notify::Event) -> impl Iterator<Item = &'a Path> {
+    fn changed<'a>(&'a self, event: &notify::Event) -> impl Iterator<Item = &'a Path> {
         // Only data changes count / 只算数据的变化
         let data_change = event.kind.is_modify() || event.kind.is_create();
         self.files
@@ -214,17 +223,48 @@ impl Targets {
     }
 }
 
-/// 把变化交给 `on_change`，直到收到停止消息或通道关闭
-/// Hands changes to `on_change` until told to stop or the channel closes
+/// 把变化交给 `on_change`，直到收到停止消息或通道关闭。一个文件的变化先收齐
+/// [`COALESCE_WINDOW`] 内的事件再回调一次。
+/// Hands changes to `on_change` until told to stop or the channel closes. A file's change
+/// is called back once, after the events within [`COALESCE_WINDOW`] are gathered.
 fn pump(targets: &Targets, rx: &Receiver<Message>, mut on_change: impl FnMut(&Path)) {
-    for message in rx {
-        match message {
-            Message::Event(Ok(event)) => targets.changed(&event).for_each(&mut on_change),
-            Message::Event(Err(err)) => {
-                warn!(target = "watcher", error = %err, "watcher event error");
-            }
-            Message::Stop => break,
+    while let Ok(message) = rx.recv() {
+        let mut changed = Vec::new();
+        if !gather(targets, message, &mut changed) {
+            return;
         }
+        if changed.is_empty() {
+            continue;
+        }
+        let deadline = Instant::now() + COALESCE_WINDOW;
+        while let Ok(message) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            if !gather(targets, message, &mut changed) {
+                return;
+            }
+        }
+        changed.into_iter().for_each(&mut on_change);
+    }
+}
+
+/// 处理一条消息：它改了数据的文件记进 `changed`，同一个文件只记一次。收到停止消息时返回 false。
+/// Takes one message: the files whose data it changed go into `changed`, each file once.
+/// False on the stop message.
+fn gather<'a>(targets: &'a Targets, message: Message, changed: &mut Vec<&'a Path>) -> bool {
+    match message {
+        Message::Event(Ok(event)) => {
+            for path in targets.changed(&event) {
+                if !changed.contains(&path) {
+                    changed.push(path);
+                }
+            }
+            true
+        }
+        Message::Event(Err(err)) => {
+            warn!(target = "watcher", error = %err, "watcher event error");
+            true
+        }
+        Message::Stop => false,
     }
 }
 
@@ -442,6 +482,37 @@ mod tests {
         assert_eq!(
             attempts, RELOAD_RETRIES,
             "must attempt exactly RELOAD_RETRIES times"
+        );
+    }
+
+    /// 改名盖过目标文件只回调一次。notify 为这一次改名报两个事件（「改名到这里」和列出两端的
+    /// 「改名」），此前每个都回调，面板的每次保存都让配置完整重载两遍。
+    /// Renaming over the target calls back once. notify reports two events for that one
+    /// rename ("renamed to" and a rename naming both ends), and each used to call back, so
+    /// every save from the panel reloaded the configuration twice.
+    #[test]
+    fn an_atomic_replacement_calls_back_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target.file");
+        std::fs::write(&target, "v1").expect("seed file");
+
+        let (tx, rx) = mpsc::channel();
+        let _watch = PendingWatch::new(std::slice::from_ref(&target))
+            .expect("watch")
+            .start("test-watch", move |_| {
+                let _ = tx.send(());
+            })
+            .expect("start");
+
+        let tmp = dir.path().join("target.renew.tmp");
+        std::fs::write(&tmp, "v2").expect("write tmp");
+        std::fs::rename(&tmp, &target).expect("atomic rename");
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the replacement is called back");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "one replacement, one call back"
         );
     }
 }

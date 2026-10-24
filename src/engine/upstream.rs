@@ -111,6 +111,68 @@ fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Trans
     }
 }
 
+/// 一份配置里的上游在各连接池里的键，按传输分开；DoH 自己清理不用的上游，不在这里
+/// The pool keys of a configuration's upstreams, by transport; DoH prunes the upstreams it
+/// stops using on its own, so it is not here
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PoolKeys {
+    pub(crate) tcp: rustc_hash::FxHashSet<String>,
+    pub(crate) dot: rustc_hash::FxHashSet<String>,
+    pub(crate) doq: rustc_hash::FxHashSet<String>,
+}
+
+/// `cfg` 用到的每个上游在连接池里的键，和转发时的算法一样（见 [`parse_upstream_addr`]）：默认上游，
+/// 以及请求阶段和回答阶段每个转发动作的上游（没写就是默认上游）。UDP 上游在应答被截断或失败时改用
+/// TCP，所以也算一个 TCP 键。
+/// The pool key of every upstream `cfg` uses, worked out as a forward does (see
+/// [`parse_upstream_addr`]): the default upstream, and the upstream of every forward
+/// action in the request and response phases (the default upstream when it names none). A
+/// UDP upstream falls back to TCP on a truncated or failed answer, so it has a TCP key too.
+pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys {
+    let mut keys = PoolKeys::default();
+    let mut add = |upstreams: &str, transport: Option<Transport>| {
+        for upstream in upstreams
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (addr, transport) =
+                parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp));
+            let set = match transport {
+                Transport::Udp | Transport::Tcp | Transport::TcpUdp => &mut keys.tcp,
+                Transport::Dot => &mut keys.dot,
+                Transport::Doq => &mut keys.doq,
+                Transport::Doh => continue,
+            };
+            set.insert(addr.to_owned());
+        }
+    };
+    add(&cfg.settings.default_upstream, None);
+    for rule in cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules) {
+        for action in rule
+            .actions
+            .iter()
+            .chain(&rule.response_actions_on_match)
+            .chain(&rule.response_actions_on_miss)
+        {
+            if let crate::config::Action::Forward {
+                upstream,
+                transport,
+                ..
+            } = action
+            {
+                add(
+                    upstream
+                        .as_deref()
+                        .unwrap_or(&cfg.settings.default_upstream),
+                    *transport,
+                );
+            }
+        }
+    }
+    keys
+}
+
 /// Hedge 超时除数：第一次尝试使用 1/N 的时间，为 TCP fallback 预留时间 / Hedge timeout divisor: first attempt uses 1/N of the budget to reserve time for TCP fallback
 const HEDGE_TIMEOUT_DIVISOR: u32 = 3;
 
@@ -1384,5 +1446,53 @@ mod refresh_failure_reply_tests {
             assert!(!is_failure_reply(code), "{code}");
             assert!(reject_failure_reply_on_refresh(true, &reply(code)).is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod pool_key_tests {
+    use super::*;
+
+    fn runtime(raw: serde_json::Value) -> crate::matcher::RuntimePipelineConfig {
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        crate::matcher::RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    fn set(items: &[&str]) -> rustc_hash::FxHashSet<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// 连接池的键和转发时算的一样：带协议前缀的去掉前缀，不带的按动作的传输方式，没写上游的用
+    /// 默认上游；回答阶段的转发也算，DoH 不算
+    /// Pool keys come out as a forward works them out: a scheme is stripped, an address
+    /// without one takes the action's transport, an action naming no upstream uses the
+    /// default one; response-phase forwards count too, and DoH does not
+    #[test]
+    fn pool_keys_follow_how_a_forward_reads_its_upstreams() {
+        let keys = pool_keys(&runtime(serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": [
+                { "name": "encrypted", "matchers": [{ "type": "domain_suffix", "value": "a.test" }],
+                  "actions": [{ "type": "forward",
+                                "upstream": "tls://dns.alidns.com, quic://dns.alidns.com:853?sni=x" }] },
+                { "name": "dot by transport", "matchers": [{ "type": "domain_suffix", "value": "b.test" }],
+                  "actions": [{ "type": "forward", "upstream": "8.8.8.8:853", "transport": "dot" }] },
+                { "name": "dual", "matchers": [{ "type": "domain_suffix", "value": "c.test" }],
+                  "actions": [{ "type": "forward", "upstream": "tcp+udp://9.9.9.9:53" }] },
+                { "name": "default over doq", "matchers": [{ "type": "domain_suffix", "value": "d.test" }],
+                  "actions": [{ "type": "forward", "upstream": null, "transport": "doq" }] },
+                { "name": "checked", "matchers": [{ "type": "any" }],
+                  "actions": [{ "type": "forward", "upstream": "https://doh.example/dns-query" }],
+                  "response_matchers": [{ "type": "response_rcode", "value": "SERVFAIL" }],
+                  "response_actions_on_match": [{ "type": "forward", "upstream": "tls://dns.google" }] }
+            ] }]
+        })));
+        assert_eq!(keys.tcp, set(&["1.1.1.1:53", "9.9.9.9:53"]));
+        assert_eq!(
+            keys.dot,
+            set(&["dns.alidns.com", "8.8.8.8:853", "dns.google"])
+        );
+        assert_eq!(keys.doq, set(&["dns.alidns.com:853?sni=x", "1.1.1.1:53"]));
     }
 }

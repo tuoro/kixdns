@@ -214,6 +214,7 @@ impl Engine {
         source: Option<&str>,
     ) {
         let compiled = compile_pipelines(&new_cfg);
+        let pool_keys = super::upstream::pool_keys(&new_cfg);
         // Build O(1) compiled pipeline lookup index / 构建 O(1) 编译管道查找索引
         let pipeline_index: FxHashMap<Arc<str>, usize> = compiled
             .iter()
@@ -236,6 +237,17 @@ impl Engine {
         }));
         let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.report_config_loaded(generation, path, source);
+        // 新配置不再用到的上游，连接池就此丢掉。此前它们一直留到重启：TCP 和 DoT 连接开着，
+        // DoQ 连接每过一个保活间隔还要给旧上游发一次包。
+        // The pools of upstreams the new configuration no longer uses are dropped. They
+        // used to stay until a restart: TCP and DoT connections stayed open, and DoQ
+        // connections kept pinging the old upstream every keep-alive interval.
+        self.tcp_mux
+            .retain_upstreams(|upstream| pool_keys.tcp.contains(upstream));
+        self.dot_mux
+            .retain_upstreams(|upstream| pool_keys.dot.contains(upstream));
+        self.doq_client
+            .retain_upstreams(|upstream| pool_keys.doq.contains(upstream));
         // Cache keys include a per-pipeline configuration namespace. Changed
         // pipelines become unreachable immediately, while unchanged pipelines
         // keep their warm response and rule caches.
