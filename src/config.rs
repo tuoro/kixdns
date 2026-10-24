@@ -779,6 +779,112 @@ pub struct DohListenerConfig {
 }
 
 impl GlobalSettings {
+    /// 和 `running`（进程启动时的设置）相比，改了以后要重启 KixDNS 才生效的设置名。这些设置只在启动时
+    /// 读一次：监听地址、连接池、各传输的连接参数、缓存容量、自动限流；其余设置重载即生效。这里逐项列出
+    /// 全部字段，新增设置时编译会要求决定它属于哪一类。
+    /// The names of the settings that differ from `running` (those the process started
+    /// with) and take a restart of KixDNS to apply. They are read once at startup:
+    /// listener addresses, connection pools, per-transport connection parameters, cache
+    /// capacity and flow control; every other setting applies on a reload. Every field is
+    /// listed here, so a new setting forces a decision on which kind it is.
+    pub fn restart_pending(&self, running: &GlobalSettings) -> Vec<&'static str> {
+        let GlobalSettings {
+            // 重载即生效（统计开关和 GeoIP 自动转换、国家过滤已经不起作用）
+            // Applied on a reload (the statistics switches, GeoIP auto-conversion and
+            // country filter no longer do anything)
+            min_ttl: _,
+            default_upstream: _,
+            default_upstream_pre_split: _,
+            upstream_timeout_ms: _,
+            request_timeout_ms: _,
+            response_jump_limit: _,
+            enable_tcp_fallback: _,
+            serve_stale: _,
+            serve_stale_ttl: _,
+            serve_stale_expire_ttl: _,
+            serve_stale_ttl_reset: _,
+            serve_stale_client_timeout_ms: _,
+            cache_background_refresh: _,
+            cache_refresh_threshold_percent: _,
+            cache_refresh_min_ttl: _,
+            geoip_db_path: _,
+            geoip_dat_path: _,
+            geoip_auto_convert: _,
+            geoip_filter_countries: _,
+            geosite_data_paths: _,
+            statistics_enabled: _,
+            statistics_anonymize_client_ip: _,
+            // 只在启动时读取 / Read at startup only
+            bind_udp,
+            bind_tcp,
+            bind_doh,
+            doh_tls_cert,
+            doh_tls_key,
+            doh_path,
+            cache_capacity,
+            cache_max_ttl,
+            dashmap_shards,
+            udp_pool_size,
+            tcp_pool_size,
+            doh_pool_size,
+            doh_health_check_error_threshold,
+            dot_pool_size,
+            doq_pool_size,
+            tcp_health_check_error_threshold,
+            tcp_connection_max_age_seconds,
+            tcp_connection_idle_timeout_seconds,
+            doq_connection_idle_timeout_seconds,
+            doq_keepalive_interval_ms,
+            doq_enable_0rtt,
+            flow_control_enabled,
+            flow_control_initial_permits,
+            flow_control_min_permits,
+            flow_control_max_permits,
+            flow_control_latency_threshold_ms,
+            flow_control_adjustment_interval_secs,
+        } = self;
+        let mut pending = Vec::new();
+        macro_rules! compare {
+            ($($field:ident),* $(,)?) => {
+                $(
+                    if *$field != running.$field {
+                        pending.push(stringify!($field));
+                    }
+                )*
+            };
+        }
+        compare!(
+            bind_udp,
+            bind_tcp,
+            bind_doh,
+            doh_tls_cert,
+            doh_tls_key,
+            doh_path,
+            cache_capacity,
+            cache_max_ttl,
+            dashmap_shards,
+            udp_pool_size,
+            tcp_pool_size,
+            doh_pool_size,
+            doh_health_check_error_threshold,
+            dot_pool_size,
+            doq_pool_size,
+            tcp_health_check_error_threshold,
+            tcp_connection_max_age_seconds,
+            tcp_connection_idle_timeout_seconds,
+            doq_connection_idle_timeout_seconds,
+            doq_keepalive_interval_ms,
+            doq_enable_0rtt,
+            flow_control_enabled,
+            flow_control_initial_permits,
+            flow_control_min_permits,
+            flow_control_max_permits,
+            flow_control_latency_threshold_ms,
+            flow_control_adjustment_interval_secs,
+        );
+        pending
+    }
+
     /// Parse the listener addresses and check the DoH prerequisites the way
     /// server startup does; a configuration that fails here cannot be served.
     /// Both the server and [`validate`] call this.
@@ -1404,5 +1510,32 @@ mod validation_tests {
         let err =
             validate(r#"{ "settings": { "cache_capacity": 0 } }"#).expect_err("zero capacity");
         assert!(format!("{err:#}").contains("cache_capacity"));
+    }
+
+    /// 只列出启动时才读的设置；重载即生效的改了不算，改回去以后也不再列
+    /// Only settings read at startup are listed; ones applied on a reload do not count,
+    /// and a setting changed back is no longer listed
+    #[test]
+    fn restart_pending_names_only_settings_read_at_startup() {
+        let running = super::GlobalSettings::default();
+        let mut configured = running.clone();
+        assert!(configured.restart_pending(&running).is_empty());
+
+        configured.bind_udp = "0.0.0.0:5300".to_string();
+        configured.cache_capacity += 1;
+        configured.flow_control_enabled = !configured.flow_control_enabled;
+        configured.upstream_timeout_ms += 1;
+        configured.serve_stale = !configured.serve_stale;
+        configured.default_upstream = "9.9.9.9:53".to_string();
+        assert_eq!(
+            configured.restart_pending(&running),
+            ["bind_udp", "cache_capacity", "flow_control_enabled"]
+        );
+
+        configured.bind_udp = running.bind_udp.clone();
+        assert_eq!(
+            configured.restart_pending(&running),
+            ["cache_capacity", "flow_control_enabled"]
+        );
     }
 }

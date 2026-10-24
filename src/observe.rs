@@ -507,6 +507,13 @@ pub struct ConfigLoaded<'a> {
     /// Raw configuration text, when the loader supplied it. Observers that
     /// need a fingerprint derive it from this text.
     pub source: Option<&'a str>,
+    /// Settings this configuration changes that take a restart of KixDNS to
+    /// apply, compared with those the process started with (see
+    /// [`crate::config::GlobalSettings::restart_pending`]); empty for the
+    /// initial configuration.
+    /// 这份配置改了、但要重启 KixDNS 才生效的设置，和进程启动时的设置相比（见
+    /// [`crate::config::GlobalSettings::restart_pending`]）；初始配置时为空。
+    pub restart_pending: &'a [&'static str],
 }
 
 /// A hot reload failed and the previous configuration remains active.
@@ -863,6 +870,7 @@ mod tests {
                 path: Some(Path::new("config/pipeline.json")),
                 generation: 1,
                 source: Some("{}"),
+                restart_pending: &[],
             });
             observer.config_reload_failed(&ConfigReloadFailed {
                 path: Path::new("config/pipeline.json"),
