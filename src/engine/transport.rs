@@ -183,8 +183,16 @@ impl UdpClient {
         let socket_clone = socket.clone();
         let inflight_clone = inflight.clone();
         tokio::spawn(async move {
-            // Use BytesMut for efficient buffer management
-            let mut buf = BytesMut::with_capacity(4096);
+            // Use BytesMut for efficient buffer management. It holds the largest DNS
+            // message: EDNS lets a UDP answer be negotiated up to 65535 bytes, and a
+            // datagram longer than the buffer loses its tail without notice, so a
+            // 4096-byte buffer turned such answers into parse failures. Most of the
+            // buffer is never written; with the default 64 sockets the resident set
+            // measured about 1 MiB larger than with 4096-byte buffers.
+            // 缓冲区容得下最大的 DNS 报文：EDNS 允许把 UDP 应答协商到 65535 字节，比缓冲区长的
+            // 数据报会被悄悄截掉尾部，4096 字节的缓冲区因此把这样的应答变成了解析失败。缓冲区大部分
+            // 从不被写到；默认 64 个 socket 时，实测常驻内存比 4096 字节的缓冲区多约 1 MiB。
+            let mut buf = BytesMut::with_capacity(MAX_DNS_MESSAGE_SIZE);
             loop {
                 // Reset buffer: keep capacity but length=0
                 // 重置缓冲区：保留容量但长度设为 0
@@ -193,8 +201,8 @@ impl UdpClient {
                 // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
                 // avoid zero-filling overhead from resize()
                 // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
-                if buf.capacity() < 4096 {
-                    buf.reserve(4096 - buf.capacity());
+                if buf.capacity() < MAX_DNS_MESSAGE_SIZE {
+                    buf.reserve(MAX_DNS_MESSAGE_SIZE - buf.capacity());
                 }
 
                 match socket_clone.recv_buf_from(&mut buf).await {
@@ -3764,6 +3772,33 @@ mod tests {
             .await
             .expect("case-scrambled answer must be accepted");
         assert_eq!(&response[0..2], &[0x12, 0x34], "original ID restored");
+    }
+
+    /// EDNS 允许把 UDP 应答协商到 65535 字节。接收缓冲区此前只有 4096 字节，更大的应答被
+    /// 系统截掉尾部，解析失败，客户端拿到 SERVFAIL；公共 DNS 一般封顶 1232 字节，自建的、
+    /// 缓冲开得大的上游才会发这么大的应答。
+    /// EDNS lets a UDP answer be negotiated up to 65535 bytes. The receive buffer
+    /// used to hold 4096, so a larger answer lost its tail, failed to parse and
+    /// the client got SERVFAIL; public resolvers usually stop at 1232, but a
+    /// self-hosted upstream with a larger buffer sends answers this big.
+    #[tokio::test]
+    async fn udp_send_receives_an_answer_larger_than_4096_bytes() {
+        let (upstream, _) = spawn_udp_upstream(|query| {
+            let mut answer = udp_echo_response(query);
+            answer.resize(5_000, 0);
+            vec![answer]
+        })
+        .await;
+        let client = UdpClient::new(1).expect("build UDP client");
+        let answer = client
+            .send(
+                &udp_test_query("big.example"),
+                &upstream,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("the upstream answers");
+        assert_eq!(answer.len(), 5_000, "the whole datagram must arrive");
     }
 
     #[tokio::test]
