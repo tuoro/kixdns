@@ -4,9 +4,43 @@
 #[cfg(unix)]
 use socket2::Socket;
 use std::io;
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+
+/// How long an accept loop waits after an accept error before accepting again.
+///
+/// An accept loop must not end on an error: the listener would stop for good
+/// while the process lives on (UDP still answers), so nothing restarts it.
+/// Running out of descriptors or memory lasts a while, so the loop backs off
+/// 100 ms instead of spinning; other errors (a peer that reset before the
+/// accept, for instance) wait 10 ms, short enough not to matter and long enough
+/// not to spin on an error that keeps coming back.
+///
+/// 接受连接出错以后，等多久再接着接受。接受循环不能因为出错就退出：监听口会从此停掉，进程却还活着
+/// （UDP 照答），没有谁会把它重启。句柄、内存用光会持续一阵，等 100 毫秒，不空转；别的错误（对端在
+/// 接受前就断了等）等 10 毫秒，短到无所谓，又不会在反复出现的错误上空转。
+pub fn accept_retry_delay(err: &io::Error) -> Duration {
+    #[cfg(unix)]
+    let exhausted = matches!(
+        err.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    );
+    // WSAEMFILE, WSAENOBUFS
+    #[cfg(windows)]
+    let exhausted = matches!(err.raw_os_error(), Some(10024 | 10055));
+    #[cfg(not(any(unix, windows)))]
+    let exhausted = {
+        let _ = err;
+        true
+    };
+    if exhausted {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_millis(10)
+    }
+}
 
 /// Safely set IPV6_V6ONLY option on a socket
 /// 安全地设置 socket 的 IPV6_V6ONLY 选项
