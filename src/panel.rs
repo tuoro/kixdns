@@ -1463,7 +1463,16 @@ pub async fn serve_admin(
     tracing::info!(target = "panel", path = %path.display(), "panel control socket started");
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                // Never end the loop on an accept error (see accept_retry_delay)
+                // 接受出错不退出循环（见 accept_retry_delay）
+                tracing::warn!(target = "panel", error = %err, "control socket accept failed, retrying");
+                tokio::time::sleep(crate::socket_utils::accept_retry_delay(&err)).await;
+                continue;
+            }
+        };
         let engine = engine.clone();
         let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {

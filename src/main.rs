@@ -1156,7 +1156,16 @@ async fn run_udp_worker(
 
 async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                // Never end the loop on an accept error (see accept_retry_delay)
+                // 接受出错不退出循环（见 accept_retry_delay）
+                warn!(error = %err, "tcp accept failed, retrying");
+                tokio::time::sleep(kixdns::socket_utils::accept_retry_delay(&err)).await;
+                continue;
+            }
+        };
         // RFC 1035 §4.2.2: DNS-over-TCP uses a 2-byte length prefix per message.
         // Disable Nagle's algorithm (TCP_NODELAY) to prevent the length-prefix write
         // and body write from being coalesced, which interacts badly with the peer's

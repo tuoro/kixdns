@@ -27,7 +27,7 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
 use crate::observe::ClientTransport;
@@ -47,6 +47,12 @@ const MAX_DNS_MESSAGE: usize = 64 * 1024;
 /// request head while keeping half-sent requests from pinning a task and a
 /// file descriptor indefinitely.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// A client that connects and never finishes the TLS handshake is dropped after
+/// this long, as a silent DNS-over-TCP client is; it used to hold its task and
+/// descriptor for good.
+/// 连上以后迟迟不完成 TLS 握手的客户端，过这么久就断开，和 DNS over TCP 上不说话的客户端一样；
+/// 以前它会一直占着任务和句柄。
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// TLS acceptor shared between the accept loop and the certificate watcher:
 /// wait-free snapshot per connection, swapped wholesale on reload — the same
@@ -85,15 +91,24 @@ pub async fn run_doh_with_listener(
     spawn_cert_watcher(cert_path, key_path, Arc::clone(&acceptor));
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                // Never end the loop on an accept error (see accept_retry_delay)
+                // 接受出错不退出循环（见 accept_retry_delay）
+                warn!(error = %err, "DoH accept failed, retrying");
+                tokio::time::sleep(crate::socket_utils::accept_retry_delay(&err)).await;
+                continue;
+            }
+        };
         // Snapshot the current acceptor for this connection; in-flight
         // connections keep serving with the certificate they were established with.
         let acceptor = acceptor.load_full();
         let engine = engine.clone();
         let doh_path = doh_path.clone();
         tokio::spawn(async move {
-            match acceptor.accept(stream).await {
-                Ok(tls_stream) => {
+            match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(tls_stream)) => {
                     // hyper 1.x 需要 TokioIo 适配器包装 IO
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
@@ -113,8 +128,14 @@ pub async fn run_doh_with_listener(
                         .serve_connection(io, svc)
                         .await;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(error = %e, "DoH TLS handshake failed");
+                }
+                Err(_) => {
+                    // Quiet, like a silent DNS-over-TCP client timing out: a flood of
+                    // them must not flood the log as well
+                    // 不出声，和 DNS over TCP 上不说话的客户端超时一样：一大批这样的连接不能把日志也刷满
+                    debug!(%peer, "DoH TLS handshake timed out");
                 }
             }
         });

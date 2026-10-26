@@ -703,3 +703,26 @@ async fn test_doh_tls_cert_reload_failure_keeps_last_good() {
         "retired identity must be gone after recovery"
     );
 }
+
+/// A client that connects and never sends a ClientHello is dropped once the
+/// handshake timeout runs out; it used to hold its task and descriptor for good,
+/// so enough of them could exhaust the server's descriptors.
+/// 连上以后一直不发 ClientHello 的客户端，握手时限一到就被断开；以前它会一直占着任务和句柄，
+/// 这样的连接多了就能把服务端的句柄耗光。
+#[tokio::test]
+async fn doh_drops_a_client_that_never_finishes_the_tls_handshake() {
+    let (_dir, cert_path, key_path) = make_test_cert();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    spawn_doh(listener, make_static_ip_engine(), &cert_path, &key_path).await;
+
+    let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(15), silent.read(&mut buf)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "the server must close a connection that never finishes the handshake, got {closed:?}"
+    );
+}
