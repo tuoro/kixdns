@@ -172,10 +172,16 @@ impl GeoIpConverter {
         let mut count = 0;
 
         for geoip in list.entries {
+            // 国家代码一律大写，和 .dat 一样，过滤条件才认得 / Country codes in capitals, as
+            // for .dat, so that the filter knows them
+            let country_code = geoip.country_code.to_uppercase();
+            if country_code.is_empty() {
+                continue;
+            }
             for ip_str in &geoip.ips {
                 if let Ok(net) = ip_str.parse::<IpNet>() {
                     self.country_to_nets
-                        .entry(geoip.country_code.clone())
+                        .entry(country_code.clone())
                         .or_default()
                         .push(net);
                     count += 1;
