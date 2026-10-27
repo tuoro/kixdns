@@ -387,6 +387,11 @@ pub enum Matcher {
     DomainSuffix {
         value: String,
     },
+    /// 只匹配这个域名本身，不含子域名，大小写不敏感。 / Match this domain name itself, not its
+    /// subdomains, case insensitive
+    DomainExact {
+        value: String,
+    },
     /// 域名正则匹配（Rust 正则语法，默认大小写不敏感请自行使用 (?i)）。 / Domain regex matching (Rust regex syntax, use (?i) for case insensitivity by default)
     DomainRegex {
         value: String,
@@ -435,6 +440,8 @@ pub enum PipelineSelectorMatcher {
     ClientIp { cidr: String },
     /// 请求域名后缀。 / Request domain suffix
     DomainSuffix { value: String },
+    /// 请求域名本身，不含子域名。 / The request domain itself, not its subdomains
+    DomainExact { value: String },
     /// 请求域名正则。 / Request domain regex
     DomainRegex { value: String },
     /// 任意请求（总是匹配）。 / Any request (always matches)
@@ -498,6 +505,8 @@ pub enum ResponseMatcher {
     UpstreamEquals { value: String },
     /// 复用请求域名后缀匹配（便于上游+域名组合策略）。 / Reuse request domain suffix matching (convenient for upstream+domain combination strategy)
     RequestDomainSuffix { value: String },
+    /// 请求域名本身，不含子域名。 / The request domain itself, not its subdomains
+    RequestDomainExact { value: String },
     /// 请求域名正则匹配。 / Request domain regex matching
     RequestDomainRegex { value: String },
     /// 匹配响应所来自的上游 IP（支持 CIDR）。 / Match the upstream IP from which the response originated (supports CIDR)
@@ -1426,6 +1435,11 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             {
                 found.push(format!("{place}: {EMPTY_DOMAIN_MATCHER}"));
             }
+            if let PipelineSelectorMatcher::DomainExact { value } = &matcher.matcher
+                && value.is_empty()
+            {
+                found.push(format!("{place}: {EMPTY_EXACT_MATCHER}"));
+            }
         }
     }
     for pipeline in &cfg.pipelines {
@@ -1452,6 +1466,7 @@ pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
 }
 
 const EMPTY_DOMAIN_MATCHER: &str = "an empty domain matcher matches every name";
+const EMPTY_EXACT_MATCHER: &str = "an empty domain_exact matches only the root name";
 
 /// 逗号分隔的上游，和转发时的拆法一样 / Comma-separated upstreams, split as a forward splits them
 fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
@@ -1474,12 +1489,22 @@ fn rule_problems(
         {
             report(EMPTY_DOMAIN_MATCHER.to_string());
         }
+        if let Matcher::DomainExact { value } = &matcher.matcher
+            && value.is_empty()
+        {
+            report(EMPTY_EXACT_MATCHER.to_string());
+        }
     }
     for matcher in &rule.response_matchers {
         if let ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
             && value.is_empty()
         {
             report(EMPTY_DOMAIN_MATCHER.to_string());
+        }
+        if let ResponseMatcher::RequestDomainExact { value } = &matcher.matcher
+            && value.is_empty()
+        {
+            report(EMPTY_EXACT_MATCHER.to_string());
         }
     }
     let actions = rule
@@ -1669,6 +1694,40 @@ mod validation_tests {
 
     fn problems_of(config: serde_json::Value) -> Vec<String> {
         super::problems(&super::parse_config(&config.to_string()).expect("parses"))
+    }
+
+    /// 空的 domain_exact 只命中根域名，不是「匹配所有名字」，提示照实说
+    /// An empty domain_exact matches only the root name, not every name, and the problem says so
+    #[test]
+    fn an_empty_domain_exact_is_named_for_what_it_does() {
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipeline_select": [{ "pipeline": "main", "matchers": [{ "type": "domain_exact", "value": "" }] }],
+            "pipelines": [{ "id": "main", "rules": [
+                rule("exact", serde_json::json!([{ "type": "domain_exact", "value": "" }]), serde_json::json!([{ "type": "allow" }])),
+                {
+                    "name": "late",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
+                    "response_matchers": [{ "type": "request_domain_exact", "value": "" }],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }
+            ]}]
+        });
+        let found = problems_of(config);
+        for place in ["pipeline_select 1", "rule \"exact\"", "rule \"late\""] {
+            assert!(
+                found.iter().any(|problem| problem.contains(place)
+                    && problem.contains("empty domain_exact matches only the root name")),
+                "missing {place} in {found:#?}"
+            );
+        }
+        assert!(
+            !found
+                .iter()
+                .any(|problem| problem.contains("matches every name")),
+            "{found:#?}"
+        );
     }
 
     /// 会悄悄做成别的事的写法，每一种都报出来，带上在哪条规则

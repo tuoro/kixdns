@@ -506,6 +506,7 @@ fn hash_runtime_response_matcher(matcher: &RuntimeResponseMatcher, hasher: &mut 
     match matcher {
         RuntimeResponseMatcher::UpstreamEquals { value }
         | RuntimeResponseMatcher::RequestDomainSuffix { value }
+        | RuntimeResponseMatcher::RequestDomainExact { value }
         | RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value }
         | RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => value.hash(hasher),
         RuntimeResponseMatcher::RequestDomainRegex { regex } => regex.as_str().hash(hasher),
