@@ -478,42 +478,12 @@ async fn forward_upstream_as_is(
         let start = std::time::Instant::now();
         // `via` is the transport that actually carried the answer (UDP may fall
         // back to TCP) / `via` 为实际带回答案的传输（UDP 可能回退到 TCP）
-        let (res, proto, via): (anyhow::Result<Bytes>, &str, Transport) = match transport_for_addr {
-            Transport::Udp => {
-                let tcp = UdpTcpFallback {
-                    retry_truncated: true,
-                    on_failure: true,
-                };
-                match forward_udp_smart_via(engine, packet, addr, timeout_dur, tcp).await {
-                    Ok((bytes, via)) => (Ok(bytes), via_label(via), via),
-                    Err(err) => (Err(err), "udp", Transport::Udp),
-                }
-            }
-            Transport::Tcp => {
-                let r = engine.tcp_mux.send(packet, addr, timeout_dur).await;
-                (r, "tcp", Transport::Tcp)
-            }
-            Transport::TcpUdp => {
-                // Dual-send: spawn both TCP and UDP concurrently, use first response
-                // 双发：同时发送 TCP 和 UDP，使用第一个响应
-                forward_tcp_udp_dual(engine, packet, addr, timeout_dur)
-                    .await
-                    .map(|(bytes, proto)| (Ok(bytes), proto, label_transport(proto)))
-                    .unwrap_or_else(|e| (Err(e), "udp", Transport::TcpUdp))
-            }
-            Transport::Doh => {
-                let r = engine.doh_client.send(packet, addr, timeout_dur).await;
-                (r, "doh", Transport::Doh)
-            }
-            Transport::Dot => {
-                let r = engine.dot_mux.send(packet, addr, timeout_dur).await;
-                (r, "dot", Transport::Dot)
-            }
-            Transport::Doq => {
-                let r = engine.doq_client.send(packet, addr, timeout_dur).await;
-                (r, "doq", Transport::Doq)
-            }
+        let tcp = UdpTcpFallback {
+            retry_truncated: true,
+            on_failure: true,
         };
+        let (res, proto, via) =
+            send_to_upstream(engine, packet, addr, timeout_dur, transport_for_addr, tcp).await;
         let dur = start.elapsed();
 
         let upstream_with_proto = format!("{}:{}", proto, addr);
@@ -626,53 +596,22 @@ async fn forward_upstream_as_is(
 
         tasks.spawn(async move {
             let start = std::time::Instant::now();
-            let (proto, res, via) = match transport_for_task {
-                Transport::Udp => {
-                    // A truncated answer is still fetched again over TCP: the batch's TCP
-                    // upstreams do not give this upstream's full answer.
-                    // 截断的应答照样用 TCP 重取：同批的 TCP 上游给不出这个上游的完整应答。
-                    let tcp = UdpTcpFallback {
-                        retry_truncated: true,
-                        on_failure: !has_tcp_task,
-                    };
-                    match forward_udp_smart_via(&engine, &packet, &addr_owned, timeout_dur, tcp)
-                        .await
-                    {
-                        Ok((bytes, via)) => (via_label(via), Ok(bytes), via),
-                        Err(err) => ("udp", Err(err), Transport::Udp),
-                    }
-                }
-                Transport::Tcp => {
-                    let r = engine.tcp_mux.send(&packet, &addr_owned, timeout_dur).await;
-                    ("tcp", r, Transport::Tcp)
-                }
-                Transport::TcpUdp => {
-                    // Dual-send: spawn both TCP and UDP concurrently, use first response
-                    // 双发：同时发送 TCP 和 UDP，使用第一个响应
-                    match forward_tcp_udp_dual(&engine, &packet, &addr_owned, timeout_dur).await {
-                        Ok((bytes, proto)) => (proto, Ok(bytes), label_transport(proto)),
-                        Err(e) => ("udp", Err(e), Transport::TcpUdp),
-                    }
-                }
-                Transport::Doh => {
-                    let r = engine
-                        .doh_client
-                        .send(&packet, &addr_owned, timeout_dur)
-                        .await;
-                    ("doh", r, Transport::Doh)
-                }
-                Transport::Dot => {
-                    let r = engine.dot_mux.send(&packet, &addr_owned, timeout_dur).await;
-                    ("dot", r, Transport::Dot)
-                }
-                Transport::Doq => {
-                    let r = engine
-                        .doq_client
-                        .send(&packet, &addr_owned, timeout_dur)
-                        .await;
-                    ("doq", r, Transport::Doq)
-                }
+            // A truncated answer is still fetched again over TCP: the batch's TCP
+            // upstreams do not give this upstream's full answer.
+            // 截断的应答照样用 TCP 重取：同批的 TCP 上游给不出这个上游的完整应答。
+            let tcp = UdpTcpFallback {
+                retry_truncated: true,
+                on_failure: !has_tcp_task,
             };
+            let (res, proto, via) = send_to_upstream(
+                &engine,
+                &packet,
+                &addr_owned,
+                timeout_dur,
+                transport_for_task,
+                tcp,
+            )
+            .await;
 
             // Note: for TcpUdp, timing includes both tasks' spawn/abort overhead
             // 注意：对于 TcpUdp，计时包含两个任务的 spawn/abort 开销
@@ -799,6 +738,64 @@ fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::ti
     }
 }
 
+/// Sends `packet` to one upstream over `transport`, and returns the answer with the label
+/// and the transport that carried it (a UDP query may end up over TCP). Each transport's
+/// exchange is allocated on its own, sized to that transport: held inline, it made every
+/// query waiting on an upstream reserve room for the largest of them (DoT, about 2 KB),
+/// whatever the query went over.
+/// 把 `packet` 经 `transport` 发给一个上游，返回应答以及实际带回应答的传输的标签和传输本身（UDP 查询
+/// 可能最后走了 TCP）。每种传输的收发单独在堆上分配，大小按这种传输来：放在调用方里时，等上游的每个
+/// 查询不管走的是哪种传输，都得按最大的那种（DoT，约 2 KB）预留。
+async fn send_to_upstream(
+    engine: &Engine,
+    packet: &[u8],
+    addr: &str,
+    timeout_dur: Duration,
+    transport: Transport,
+    tcp: UdpTcpFallback,
+) -> (anyhow::Result<Bytes>, &'static str, Transport) {
+    match transport {
+        Transport::Udp => {
+            let r = Box::pin(forward_udp_smart_via(
+                engine,
+                packet,
+                addr,
+                timeout_dur,
+                tcp,
+            ))
+            .await;
+            match r {
+                Ok((bytes, via)) => (Ok(bytes), via_label(via), via),
+                Err(err) => (Err(err), "udp", Transport::Udp),
+            }
+        }
+        Transport::Tcp => {
+            let r = Box::pin(engine.tcp_mux.send(packet, addr, timeout_dur)).await;
+            (r, "tcp", Transport::Tcp)
+        }
+        Transport::TcpUdp => {
+            // Dual-send: spawn both TCP and UDP concurrently, use first response
+            // 双发：同时发送 TCP 和 UDP，使用第一个响应
+            match Box::pin(forward_tcp_udp_dual(engine, packet, addr, timeout_dur)).await {
+                Ok((bytes, proto)) => (Ok(bytes), proto, label_transport(proto)),
+                Err(e) => (Err(e), "udp", Transport::TcpUdp),
+            }
+        }
+        Transport::Doh => {
+            let r = Box::pin(engine.doh_client.send(packet, addr, timeout_dur)).await;
+            (r, "doh", Transport::Doh)
+        }
+        Transport::Dot => {
+            let r = Box::pin(engine.dot_mux.send(packet, addr, timeout_dur)).await;
+            (r, "dot", Transport::Dot)
+        }
+        Transport::Doq => {
+            let r = Box::pin(engine.doq_client.send(packet, addr, timeout_dur)).await;
+            (r, "doq", Transport::Doq)
+        }
+    }
+}
+
 /// Label for the transport that carried a UDP-path answer (TC fallback may use TCP) / UDP 路径应答实际承载传输的标签（TC 回退可能走 TCP）
 fn via_label(via: Transport) -> &'static str {
     if via == Transport::Tcp { "tcp" } else { "udp" }
@@ -875,9 +872,11 @@ async fn forward_udp_smart_via(
                 // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
                 if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
                     debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
-                    return engine
-                        .tcp_mux
-                        .send(packet, upstream, timeout_dur)
+                    // TCP 的收发单独在堆上分配：只有截断或 UDP 失败时才走 TCP，等 UDP 应答的查询不必为它
+                    // 预留地方
+                    // The TCP exchange is allocated on its own: TCP is only taken for a truncated
+                    // answer or a UDP failure, so a query waiting on UDP reserves no room for it
+                    return Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur))
                         .await
                         .map(|bytes| (bytes, Transport::Tcp));
                 }
@@ -895,9 +894,8 @@ async fn forward_udp_smart_via(
                 if idx + 1 == attempts.len() && fallback_on_failure {
                     // Last UDP attempt, try TCP fallback before failing.
                     debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
-                    return engine
-                        .tcp_mux
-                        .send(packet, upstream, timeout_dur)
+                    // 单独在堆上分配，见上 / Allocated on its own, see above
+                    return Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur))
                         .await
                         .map(|bytes| (bytes, Transport::Tcp));
                 }
