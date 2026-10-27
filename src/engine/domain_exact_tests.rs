@@ -3,19 +3,16 @@
 //! domain_exact matches the name itself only, and a trailing dot on a domain value changes
 //! nothing. The fast and the full path, rules, pipeline_select and response matchers agree.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{RData, Record};
-use hickory_proto::serialize::binary::BinDecodable;
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
-use crate::matcher::RuntimePipelineConfig;
+use crate::engine::test_support::{self as support, engine_from, first_a, peer};
 
 /// 规则命中时的应答 / The answer when the rule matches
 const MATCHED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 50);
@@ -24,21 +21,9 @@ const OTHER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 60);
 /// 假上游的应答 / The fake upstream's answer
 const UPSTREAM: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 1);
 
-const CLIENT: &str = "127.0.0.1:53000";
-
-fn engine_of(config: Value) -> Engine {
-    let config: crate::config::PipelineConfig =
-        serde_json::from_value(config).expect("parse config");
-    Engine::new(
-        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-        "test".to_string(),
-    )
-    .expect("engine")
-}
-
 /// `matcher` 命中时回 [`MATCHED`]，其余回 [`OTHER`] / [`MATCHED`] when `matcher` matches, else [`OTHER`]
 fn engine_matching(matcher: Value) -> Engine {
-    engine_of(json!({
+    engine_from(json!({
         "settings": { "default_upstream": "127.0.0.1:9" },
         "pipelines": [{ "id": "main", "rules": [
             {
@@ -67,35 +52,20 @@ fn query(name: &str, trailing: &[u8]) -> Vec<u8> {
     packet
 }
 
-fn first_a(reply: &Bytes) -> Option<Ipv4Addr> {
-    match Message::from_bytes(reply)
-        .expect("parse reply")
-        .answers
-        .first()
-        .map(|record| &record.data)
-    {
-        Some(RData::A(address)) => Some(address.0),
-        _ => None,
-    }
-}
-
 /// 只走完整路径 / The full path alone
 async fn full_path(engine: &Engine, packet: &[u8]) -> Option<Ipv4Addr> {
-    let peer: SocketAddr = CLIENT.parse().unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), engine.handle_packet(packet, peer))
-        .await
-        .expect("answer in time")
-        .expect("answer");
-    first_a(&reply)
+    first_a(&support::ask(engine, packet, peer()).await)
 }
 
 /// 两条路径都问一遍：快速路径读得了的直接问，结尾多一个字节的同一个查询走完整路径
 /// Ask both ways: the query as it is on the fast path, and the same query with a trailing
 /// byte, which the fast path leaves to the full one
 async fn both_paths(engine: &Engine, name: &str) -> [Option<Ipv4Addr>; 2] {
-    let peer: SocketAddr = CLIENT.parse().unwrap();
     let packet = query(name, b"");
-    let fast = match engine.handle_packet_fast(&packet, peer).expect("fast path") {
+    let fast = match engine
+        .handle_packet_fast(&packet, peer())
+        .expect("fast path")
+    {
         Some(crate::engine::FastPathResponse::Direct(reply)) => first_a(&reply),
         other => panic!("a static answer is direct, got {other:?}"),
     };
@@ -155,7 +125,7 @@ async fn a_trailing_dot_on_a_domain_value_changes_nothing() {
 
 #[tokio::test]
 async fn pipeline_select_takes_domain_exact() {
-    let engine = engine_of(json!({
+    let engine = engine_from(json!({
         "settings": { "default_upstream": "127.0.0.1:9" },
         "pipeline_select": [
             { "pipeline": "picked", "matchers": [{ "type": "domain_exact", "value": "picked.test" }] }
@@ -176,35 +146,28 @@ async fn pipeline_select_takes_domain_exact() {
 
 /// 回答 [`UPSTREAM`] 的本机 UDP 上游 / A local UDP upstream answering [`UPSTREAM`]
 async fn upstream() -> String {
-    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let address = sock.local_addr().unwrap().to_string();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-            let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                continue;
-            };
-            let Some(question) = query.queries.first().cloned() else {
-                continue;
-            };
-            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-            reply.metadata.recursion_desired = query.metadata.recursion_desired;
-            reply.add_query(question.clone());
-            reply.add_answer(Record::from_rdata(
-                question.name().clone(),
-                300,
-                RData::A(A(UPSTREAM)),
-            ));
-            let _ = sock.send_to(&reply.to_vec().unwrap(), peer).await;
-        }
-    });
-    address
+    support::upstream(|query| {
+        let Some(question) = query.queries.first() else {
+            return Vec::new();
+        };
+        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        reply.metadata.recursion_desired = query.metadata.recursion_desired;
+        reply.add_query(question.clone());
+        reply.add_answer(Record::from_rdata(
+            question.name().clone(),
+            300,
+            RData::A(A(UPSTREAM)),
+        ));
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    })
+    .await
+    .address
 }
 
 #[tokio::test]
 async fn response_matchers_take_request_domain_exact() {
     let upstream = upstream().await;
-    let engine = engine_of(json!({
+    let engine = engine_from(json!({
         "settings": { "default_upstream": upstream },
         "pipelines": [{ "id": "main", "rules": [{
             "name": "checked",

@@ -10,24 +10,17 @@
 //! 配置上跑真的程序（以前它不声不响地回 NXDOMAIN）：启动时记下问题、照旧应答；保留着问题的重载
 //! 被拒绝，正在用的配置不变；问题改掉以后重载才生效。
 
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, UdpSocket};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 
-fn free_port() -> u16 {
-    loop {
-        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return port;
-        }
-    }
-}
+mod common;
+use common::{Kernel, free_port};
 
 /// The reply to an A query for `name`, if one comes
 fn ask(port: u16, name: &str) -> Option<Message> {
@@ -95,15 +88,6 @@ fn eventually(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     false
-}
-
-struct Kernel(Child);
-
-impl Drop for Kernel {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 #[test]

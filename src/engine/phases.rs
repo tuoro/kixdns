@@ -884,45 +884,38 @@ pub(crate) async fn handle_forward_decision_logged(
         match resp {
             Ok((raw, actual_upstream)) => {
                 response.upstream = Some(Arc::from(actual_upstream.as_str()));
-                let (rcode, ttl_secs_cache, ttl_secs_refresh, msg_opt) = if response_matchers
-                    .is_empty()
+                // Response rules read the parsed message, so they always take hickory's.
+                // Otherwise the quick parse is cached as read for a reply whose structure
+                // holds up (see `well_formed_reply`); any other is cached as hickory reads
+                // it, or, when only the quick parse can read it, not at all and goes on as it
+                // is; a reply neither can read fails the request
+                // 响应规则要读解析好的报文，所以总用 hickory 的。没有响应规则时，结构经得起检查的应答
+                // 照快速解析的结果缓存（见 `well_formed_reply`）；其余的照 hickory 读出的结果缓存，只有
+                // 快速解析读得了的不缓存、照样交出去；两边都读不了的，这次请求出错
+                let rules_read_the_reply = !(response_matchers.is_empty()
                     && response_actions_on_match.is_empty()
-                    && response_actions_on_miss.is_empty()
-                {
-                    // The quick parse is cached as read only for a reply whose structure
-                    // holds up (see `well_formed_reply`); any other is cached as hickory
-                    // reads it, or not at all when hickory cannot, and goes on as it is
-                    // 只有结构经得起检查的应答才照快速解析的结果缓存（见 `well_formed_reply`）；
-                    // 其余的照 hickory 读出的结果缓存，hickory 也读不了就不缓存，应答照样交出去
-                    let quick = proto_utils::parse_response_quick(&raw);
-                    if let Some(qr) = quick
-                        .as_ref()
-                        .filter(|_| proto_utils::well_formed_reply(&raw))
-                    {
+                    && response_actions_on_miss.is_empty());
+                let quick = (!rules_read_the_reply)
+                    .then(|| proto_utils::parse_response_quick(&raw))
+                    .flatten();
+                let (rcode, ttl_secs_cache, ttl_secs_refresh, msg_opt) = match quick {
+                    Some(qr) if proto_utils::well_formed_reply(&raw) => {
                         (qr.rcode, qr.min_ttl as u64, qr.max_ttl as u64, None)
-                    } else if let (Some(qr), Err(_)) = (quick.as_ref(), Message::from_bytes(&raw)) {
-                        (qr.rcode, 0, 0, None)
-                    } else {
-                        let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                        let ttl_cache = extract_ttl(&msg);
-                        let ttl_refresh = extract_ttl_for_refresh(&msg);
-                        (
-                            msg.metadata.response_code,
-                            ttl_cache,
-                            ttl_refresh,
-                            Some(msg),
-                        )
                     }
-                } else {
-                    let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                    let ttl_cache = extract_ttl(&msg);
-                    let ttl_refresh = extract_ttl_for_refresh(&msg);
-                    (
-                        msg.metadata.response_code,
-                        ttl_cache,
-                        ttl_refresh,
-                        Some(msg),
-                    )
+                    quick => match (Message::from_bytes(&raw), quick) {
+                        (Ok(msg), _) => (
+                            msg.metadata.response_code,
+                            extract_ttl(&msg),
+                            extract_ttl_for_refresh(&msg),
+                            Some(msg),
+                        ),
+                        (Err(_), Some(qr)) => (qr.rcode, 0, 0, None),
+                        (Err(error), None) => {
+                            return Err(
+                                anyhow::Error::new(error).context("parse upstream response")
+                            );
+                        }
+                    },
                 };
 
                 let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);

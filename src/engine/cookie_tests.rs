@@ -1,22 +1,17 @@
 //! DNS cookie（RFC 7873）只在相邻两跳之间有效：引擎层面的测试。
 //! DNS cookies (RFC 7873) hold between two neighbouring hops only: engine-level tests.
 
-use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use parking_lot::Mutex;
 
 use crate::engine::Engine;
-use crate::matcher::RuntimePipelineConfig;
+use crate::engine::test_support::{self as support, Upstream, counting_settings, engine_from};
 
 /// 测试上游给出的服务器 cookie / The server cookie the test upstream hands out
 const SERVER_COOKIE: &[u8] = b"SRVCOOKI";
@@ -32,15 +27,6 @@ enum Cookies {
     Always,
 }
 
-/// 假上游 / A fake upstream
-struct Upstream {
-    address: String,
-    /// 收到的查询个数 / How many queries it received
-    queries: Arc<AtomicUsize>,
-    /// 每个查询带来的 cookie / The cookie each query brought
-    seen: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
-}
-
 /// 消息里的 cookie 选项 / The cookie option in a message
 fn cookie_of(message: &Message) -> Option<Vec<u8>> {
     // hickory 不认识 cookie，按未知选项保存 / hickory keeps a cookie as an unknown option
@@ -53,74 +39,46 @@ fn cookie_of(message: &Message) -> Option<Vec<u8>> {
 /// 回答 example.com A 192.0.2.1 的本机 UDP 上游，cookie 按 `cookies` 处理
 /// A local UDP upstream answering example.com A 192.0.2.1, treating cookies as `cookies` says
 async fn upstream(cookies: Cookies) -> Upstream {
-    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let address = sock.local_addr().unwrap().to_string();
-    let queries = Arc::new(AtomicUsize::new(0));
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let (counted, recorded) = (queries.clone(), seen.clone());
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-            let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                continue;
-            };
-            let Some(question) = query.queries.first().cloned() else {
-                continue;
-            };
-            counted.fetch_add(1, Ordering::SeqCst);
-            let client_cookie =
-                cookie_of(&query).map(|cookie| cookie[..8.min(cookie.len())].to_vec());
-            recorded.lock().push(client_cookie.clone());
-            let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-            resp.add_query(question.clone());
-            resp.add_answer(Record::from_rdata(
-                question.name().clone(),
-                300,
-                RData::A(A::new(192, 0, 2, 1)),
-            ));
-            let cookie = match (cookies, client_cookie) {
-                (_, Some(client)) => Some([client.as_slice(), SERVER_COOKIE].concat()),
-                (Cookies::Always, None) => Some([b"STRANGER".as_slice(), SERVER_COOKIE].concat()),
-                (Cookies::Echo, None) => None,
-            };
-            if query.edns.is_some() || cookie.is_some() {
-                let mut edns = Edns::new();
-                edns.set_max_payload(1232);
-                if let Some(cookie) = cookie {
-                    edns.options_mut()
-                        .insert(EdnsOption::Unknown(u16::from(EdnsCode::Cookie), cookie));
-                }
-                resp.edns = Some(edns);
+    support::upstream(move |query| {
+        let Some(question) = query.queries.first() else {
+            return Vec::new();
+        };
+        let client_cookie = cookie_of(query).map(|cookie| cookie[..8.min(cookie.len())].to_vec());
+        let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        resp.add_query(question.clone());
+        resp.add_answer(Record::from_rdata(
+            question.name().clone(),
+            300,
+            RData::A(A::new(192, 0, 2, 1)),
+        ));
+        let cookie = match (cookies, client_cookie) {
+            (_, Some(client)) => Some([client.as_slice(), SERVER_COOKIE].concat()),
+            (Cookies::Always, None) => Some([b"STRANGER".as_slice(), SERVER_COOKIE].concat()),
+            (Cookies::Echo, None) => None,
+        };
+        if query.edns.is_some() || cookie.is_some() {
+            let mut edns = Edns::new();
+            edns.set_max_payload(1232);
+            if let Some(cookie) = cookie {
+                edns.options_mut()
+                    .insert(EdnsOption::Unknown(u16::from(EdnsCode::Cookie), cookie));
             }
-            let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+            resp.edns = Some(edns);
         }
-    });
-    Upstream {
-        address,
-        queries,
-        seen,
-    }
+        vec![(Duration::ZERO, resp.to_vec().unwrap())]
+    })
+    .await
 }
 
 fn engine(upstream: &str) -> Engine {
-    let raw = serde_json::json!({
-        "settings": {
-            "default_upstream": "127.0.0.1:9",
-            "upstream_timeout_ms": 3000,
-            "enable_tcp_fallback": false
-        },
+    engine_from(serde_json::json!({
+        "settings": counting_settings(serde_json::json!({})),
         "pipeline_select": [],
         "pipelines": [{ "id": "main", "rules": [{
             "name": "all", "matchers": [{ "type": "any" }],
             "actions": [{ "type": "forward", "upstream": upstream }]
         }] }]
-    });
-    let config: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-    Engine::new(
-        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-        "test".to_string(),
-    )
-    .expect("engine")
+    }))
 }
 
 /// 查询 example.com A，带上客户端 cookie `cookie`（None 时 EDNS 也不带）
@@ -145,14 +103,8 @@ fn query(cookie: Option<&[u8; 8]>) -> Vec<u8> {
 }
 
 async fn reply(engine: &Engine, client: &str, cookie: Option<&[u8; 8]>) -> Message {
-    let peer: SocketAddr = format!("{client}:53000").parse().unwrap();
-    let bytes: Bytes = tokio::time::timeout(
-        Duration::from_secs(5),
-        engine.handle_packet(&query(cookie), peer),
-    )
-    .await
-    .expect("answer in time")
-    .expect("answer");
+    let peer = format!("{client}:53000").parse().unwrap();
+    let bytes = support::ask(engine, &query(cookie), peer).await;
     Message::from_bytes(&bytes).expect("parse the reply")
 }
 
@@ -170,15 +122,19 @@ async fn a_client_cookie_stays_off_the_upstream_and_out_of_the_cache() {
 
     let first = reply(&engine, "192.168.1.10", Some(b"CLIENT-1")).await;
     assert_eq!(
-        upstream.seen.lock().as_slice(),
-        &[None],
+        upstream
+            .received()
+            .iter()
+            .map(cookie_of)
+            .collect::<Vec<_>>(),
+        [None],
         "the client's cookie must not be forwarded"
     );
     assert_eq!(cookie_of(&first), None, "the reply carries no cookie back");
 
     let second = reply(&engine, "192.168.1.20", Some(b"CLIENT-2")).await;
     assert_eq!(
-        upstream.queries.load(Ordering::SeqCst),
+        upstream.queries(),
         1,
         "the second client is answered from the cache"
     );
@@ -210,7 +166,7 @@ async fn a_cookie_the_upstream_adds_reaches_no_client() {
     );
     let second = reply(&engine, "192.168.1.20", None).await;
     assert_eq!(
-        upstream.queries.load(Ordering::SeqCst),
+        upstream.queries(),
         1,
         "the second client is answered from the cache"
     );

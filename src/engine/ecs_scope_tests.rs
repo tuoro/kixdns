@@ -4,7 +4,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,10 +13,11 @@ use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_proto::rr::rdata::{A, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use parking_lot::Mutex;
 
 use crate::engine::Engine;
-use crate::matcher::RuntimePipelineConfig;
+use crate::engine::test_support::{
+    self as support, Upstream, counting_settings, engine_from, first_a,
+};
 
 /// 查询没带 ECS 时应答的地址 / The address answered when a query carries no ECS
 const NO_SUBNET: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 99);
@@ -32,23 +33,21 @@ enum Echo {
     Other(&'static str, u8, u8),
 }
 
-/// 每个查询带来的 ECS（地址、前缀）/ The ECS (address, prefix) each query carried
-type Seen = Arc<Mutex<Vec<Option<(IpAddr, u8)>>>>;
-
-/// 假上游 / A fake upstream
-struct Upstream {
-    address: String,
-    /// 收到的查询个数 / How many queries it received
-    queries: Arc<AtomicUsize>,
-    seen: Seen,
-    /// 置位后不再应答 / Once set, it stops answering
-    silent: Arc<AtomicBool>,
+/// 查询带来的 ECS / The ECS a query carries
+fn subnet_of(query: &Message) -> Option<ClientSubnet> {
+    match query.edns.as_ref()?.options().get(EdnsCode::Subnet)? {
+        EdnsOption::Subnet(subnet) => Some(*subnet),
+        _ => None,
+    }
 }
 
-impl Upstream {
-    fn queries(&self) -> usize {
-        self.queries.load(Ordering::SeqCst)
-    }
+/// 上游收到的每个查询带来的 ECS（地址、前缀）/ The ECS (address, prefix) each query the
+/// upstream received carried
+fn seen(up: &Upstream) -> Vec<Option<(IpAddr, u8)>> {
+    up.received()
+        .iter()
+        .map(|query| subnet_of(query).map(|s| (s.addr(), s.source_prefix())))
+        .collect()
 }
 
 /// 按查询带来的 ECS 子网作答的本机上游：应答的地址就是子网地址（没有 ECS 时是 NO_SUBNET），
@@ -68,91 +67,55 @@ async fn upstream_answering(
     rcode: ResponseCode,
     delay: Duration,
 ) -> Upstream {
-    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let address = sock.local_addr().unwrap().to_string();
-    let queries = Arc::new(AtomicUsize::new(0));
-    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
-    let silent = Arc::new(AtomicBool::new(false));
-    let (counted, recorded, muted) = (queries.clone(), seen.clone(), silent.clone());
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-            let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                continue;
+    support::upstream(move |query| {
+        let Some(question) = query.queries.first() else {
+            return Vec::new();
+        };
+        let subnet = subnet_of(query);
+        let (echo, ttl) = per_query(subnet);
+        let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        resp.metadata.response_code = rcode;
+        resp.add_query(question.clone());
+        if rcode == ResponseCode::NoError {
+            let answer = match subnet.map(|subnet| subnet.addr()) {
+                Some(IpAddr::V4(v4)) => v4,
+                _ => NO_SUBNET,
             };
-            let Some(question) = query.queries.first().cloned() else {
-                continue;
-            };
-            counted.fetch_add(1, Ordering::SeqCst);
-            let subnet =
-                query
-                    .edns
-                    .as_ref()
-                    .and_then(|edns| match edns.options().get(EdnsCode::Subnet) {
-                        Some(EdnsOption::Subnet(subnet)) => Some(*subnet),
-                        _ => None,
-                    });
-            recorded
-                .lock()
-                .push(subnet.map(|s| (s.addr(), s.source_prefix())));
-            if muted.load(Ordering::SeqCst) {
-                continue;
-            }
-            let (echo, ttl) = per_query(subnet);
-            let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-            resp.metadata.response_code = rcode;
-            resp.add_query(question.clone());
-            if rcode == ResponseCode::NoError {
-                let answer = match subnet.map(|subnet| subnet.addr()) {
-                    Some(IpAddr::V4(v4)) => v4,
-                    _ => NO_SUBNET,
-                };
-                resp.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    ttl,
-                    RData::A(A(answer)),
-                ));
-            } else {
-                let zone = Name::from_str("example.com.").unwrap();
-                resp.add_authority(Record::from_rdata(
-                    zone.clone(),
-                    ttl,
-                    RData::SOA(SOA::new(zone.clone(), zone, 1, 60, 60, 60, ttl)),
-                ));
-            }
-            if query.edns.is_some() {
-                let mut edns = Edns::new();
-                edns.set_max_payload(1232);
-                let echoed = match (echo, subnet) {
-                    (Echo::Scope(scope), Some(subnet)) => Some(ClientSubnet::new(
-                        subnet.addr(),
-                        subnet.source_prefix(),
-                        scope,
-                    )),
-                    (Echo::Other(address, source, scope), Some(_)) => {
-                        Some(ClientSubnet::new(address.parse().unwrap(), source, scope))
-                    }
-                    _ => None,
-                };
-                if let Some(echoed) = echoed {
-                    edns.options_mut().insert(EdnsOption::Subnet(echoed));
-                }
-                resp.edns = Some(edns);
-            }
-            let resp = resp.to_vec().unwrap();
-            let sock = sock.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                let _ = sock.send_to(&resp, peer).await;
-            });
+            resp.add_answer(Record::from_rdata(
+                question.name().clone(),
+                ttl,
+                RData::A(A(answer)),
+            ));
+        } else {
+            let zone = Name::from_str("example.com.").unwrap();
+            resp.add_authority(Record::from_rdata(
+                zone.clone(),
+                ttl,
+                RData::SOA(SOA::new(zone.clone(), zone, 1, 60, 60, 60, ttl)),
+            ));
         }
-    });
-    Upstream {
-        address,
-        queries,
-        seen,
-        silent,
-    }
+        if query.edns.is_some() {
+            let mut edns = Edns::new();
+            edns.set_max_payload(1232);
+            let echoed = match (echo, subnet) {
+                (Echo::Scope(scope), Some(subnet)) => Some(ClientSubnet::new(
+                    subnet.addr(),
+                    subnet.source_prefix(),
+                    scope,
+                )),
+                (Echo::Other(address, source, scope), Some(_)) => {
+                    Some(ClientSubnet::new(address.parse().unwrap(), source, scope))
+                }
+                _ => None,
+            };
+            if let Some(echoed) = echoed {
+                edns.options_mut().insert(EdnsOption::Subnet(echoed));
+            }
+            resp.edns = Some(edns);
+        }
+        vec![(delay, resp.to_vec().unwrap())]
+    })
+    .await
 }
 
 async fn upstream(echo: Echo) -> Upstream {
@@ -160,30 +123,11 @@ async fn upstream(echo: Echo) -> Upstream {
 }
 
 fn engine_with(settings: serde_json::Value, pipelines: serde_json::Value) -> Engine {
-    let mut all = serde_json::json!({
-        "default_upstream": "127.0.0.1:9",
-        // A UDP query is sent again after a third of this (`upstream::hedge_timeout`). The
-        // tests count upstream queries, and on a busy machine 1 s let an answer arrive
-        // after that point now and then; tests that wait on a silent upstream set less.
-        // UDP 查询过了这个时间的三分之一会再发一次（`upstream::hedge_timeout`）。这些测试数上游
-        // 收到的查询，机器忙时 1 秒偶尔会让应答晚过这个点；要等上游不应答的测试自己设得更短。
-        "upstream_timeout_ms": 3000,
-        "enable_tcp_fallback": false
-    });
-    all.as_object_mut()
-        .unwrap()
-        .extend(settings.as_object().unwrap().clone());
-    let raw = serde_json::json!({
-        "settings": all,
+    engine_from(serde_json::json!({
+        "settings": counting_settings(settings),
         "pipeline_select": [],
         "pipelines": pipelines
-    });
-    let config: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-    Engine::new(
-        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-        "test".to_string(),
-    )
-    .expect("engine")
+    }))
 }
 
 fn engine(pipelines: serde_json::Value) -> Engine {
@@ -235,14 +179,6 @@ fn query(subnet: Option<(&str, u8)>) -> Vec<u8> {
     request.to_vec().unwrap()
 }
 
-fn first_a(response: &Bytes) -> Option<Ipv4Addr> {
-    let response = Message::from_bytes(response).expect("parse");
-    match response.answers.first().map(|record| &record.data) {
-        Some(RData::A(address)) => Some(address.0),
-        _ => None,
-    }
-}
-
 /// 应答里的 ECS：地址、SOURCE、SCOPE / The ECS in a reply: address, SOURCE, SCOPE
 fn reply_ecs(response: &Bytes) -> Option<(IpAddr, u8, u8)> {
     let response = Message::from_bytes(response).expect("parse");
@@ -265,13 +201,7 @@ async fn reply(engine: &Engine, client: &str, subnet: Option<(&str, u8)>) -> Byt
 
 /// 同上，来源地址照原样给出 / The same, with the source address given as it is
 async fn reply_from(engine: &Engine, peer: SocketAddr, subnet: Option<(&str, u8)>) -> Bytes {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        engine.handle_packet(&query(subnet), peer),
-    )
-    .await
-    .expect("answer in time")
-    .expect("answer")
+    support::ask(engine, &query(subnet), peer).await
 }
 
 /// 应答里的第一个地址 / The first address in the reply
@@ -279,42 +209,16 @@ async fn ask(engine: &Engine, client: &str, subnet: Option<(&str, u8)>) -> Optio
     first_a(&reply(engine, client, subnet).await)
 }
 
-/// 像监听器那样应答：先走快速路径，需要时再走异步路径
-/// Answer as a listener does: the fast path first, then the async path when needed
+/// 像监听器那样应答（见 [`support::ask_fast_path_first`]）/ Answer as a listener does (see
+/// [`support::ask_fast_path_first`])
 async fn ask_like_a_listener(
     engine: &Engine,
     client: &str,
     subnet: Option<(&str, u8)>,
 ) -> Option<Ipv4Addr> {
-    use crate::engine::{FastPathResponse, PreParsedData};
-    let packet = query(subnet);
-    let reply = match engine
-        .handle_packet_fast(&packet, peer(client))
-        .expect("fast path")
-    {
-        Some(FastPathResponse::Direct(reply)) => reply,
-        Some(FastPathResponse::CacheHit { cached, .. }) => cached,
-        Some(FastPathResponse::AsyncNeeded {
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            edns_present,
-            pipeline_id,
-        }) => tokio::time::timeout(
-            Duration::from_secs(5),
-            engine.handle_packet_internal_with_pre_parsed(
-                &packet,
-                peer(client),
-                false,
-                PreParsedData::new(qname, qtype, qclass, tx_id, edns_present, pipeline_id),
-            ),
-        )
+    let reply = support::ask_fast_path_first(engine, &query(subnet), peer(client))
         .await
-        .expect("answer in time")
-        .expect("answer"),
-        None => panic!("a query the fast path cannot read"),
-    };
+        .expect("a query the fast path can read");
     first_a(&reply)
 }
 
@@ -616,7 +520,7 @@ async fn an_answer_to_a_malformed_client_ecs_is_not_cached() {
         ask(&engine, "10.0.0.1", Some(("198.51.127.0", 20))).await,
         v4("198.51.127.0")
     );
-    assert_eq!(up.seen.lock()[0], Some((ip("198.51.127.0"), 20)));
+    assert_eq!(seen(&up)[0], Some((ip("198.51.127.0"), 20)));
     assert_eq!(
         ask(&engine, "10.0.0.2", Some(("203.0.113.0", 24))).await,
         v4("203.0.113.0")
@@ -753,7 +657,7 @@ async fn a_background_refresh_replays_the_clients_ecs() {
     })
     .await
     .expect("both refreshes reach the upstream");
-    let mut refreshed = up.seen.lock()[2..4].to_vec();
+    let mut refreshed = seen(&up)[2..4].to_vec();
     refreshed.sort();
     // Each refreshed answer replaced its subnet's entry / 每份刷新回来的应答都换下了它那个子网的条目
     let slot = Engine::cache_keys(
@@ -809,7 +713,7 @@ async fn the_stale_fallback_serves_the_requesters_own_subnet() {
         );
         ask(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
         ask(&engine, "10.0.0.2", Some(("203.0.113.0", 24))).await;
-        up.silent.store(true, Ordering::SeqCst);
+        up.silence(true);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(
             ask(&engine, "10.0.0.3", Some(("203.0.113.0", 24))).await,
@@ -968,7 +872,7 @@ async fn the_fallback_after_a_failed_forward_serves_the_requesters_own_subnet() 
     );
     ask(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
     ask(&engine, "10.0.0.2", Some(("203.0.113.0", 24))).await;
-    up.silent.store(true, Ordering::SeqCst);
+    up.silence(true);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(
         ask(&engine, "10.0.0.3", Some(("203.0.113.0", 24))).await,
@@ -1071,7 +975,7 @@ async fn the_echo_keeps_the_scope_of_an_answer_continued_past() {
 #[tokio::test]
 async fn an_answer_after_a_failed_forward_stays_with_its_subnet() {
     let up = upstream(Echo::Scope(24)).await;
-    up.silent.store(true, Ordering::SeqCst);
+    up.silence(true);
     let engine = engine_with(
         serde_json::json!({ "min_ttl": 60, "upstream_timeout_ms": 200 }),
         serde_json::json!([{ "id": "main", "rules": [{
@@ -1085,7 +989,7 @@ async fn an_answer_after_a_failed_forward_stays_with_its_subnet() {
         v4("192.0.2.53")
     );
     let failed = up.queries();
-    up.silent.store(false, Ordering::SeqCst);
+    up.silence(false);
     assert_eq!(
         ask(&engine, "10.0.0.2", Some(("203.0.113.0", 24))).await,
         v4("203.0.113.0")
@@ -1100,7 +1004,7 @@ async fn an_answer_after_a_failed_forward_stays_with_its_subnet() {
 async fn a_failed_response_action_forward_stays_with_its_subnet() {
     let checked = upstream(Echo::Nothing).await;
     let second = upstream(Echo::Scope(24)).await;
-    second.silent.store(true, Ordering::SeqCst);
+    second.silence(true);
     let engine = engine_with(
         serde_json::json!({ "min_ttl": 60, "upstream_timeout_ms": 200 }),
         serde_json::json!([{ "id": "main", "rules": [{
@@ -1112,7 +1016,7 @@ async fn a_failed_response_action_forward_stays_with_its_subnet() {
     );
     reply(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
     let failed = second.queries();
-    second.silent.store(false, Ordering::SeqCst);
+    second.silence(false);
     assert_eq!(
         ask(&engine, "10.0.0.2", Some(("203.0.113.0", 24))).await,
         v4("203.0.113.0")
@@ -1146,7 +1050,7 @@ async fn renewing_a_stale_answer_stores_the_same_answer_again() {
     .slot;
     let before = engine.cached(slot).expect("cached");
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    up.silent.store(true, Ordering::SeqCst);
+    up.silence(true);
     assert_eq!(
         ask(&engine, "10.0.0.2", Some(("198.51.100.0", 24))).await,
         v4("198.51.100.0")
@@ -1530,12 +1434,7 @@ async fn waiters_on_the_response_jump_path_get_the_full_echo() {
             }] }
         ]
     });
-    let config: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-    let engine = Engine::new(
-        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-        "test".to_string(),
-    )
-    .expect("engine");
+    let engine = engine_from(raw);
     let subnet = Some(("198.51.100.0", 24));
     let (one, two) = (query(subnet), query(subnet));
     let (one, two) = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1586,7 +1485,7 @@ async fn from_client_ip_sends_no_more_of_a_client_subnet_than_the_client_did() {
         v4("198.18.0.0")
     );
     assert_eq!(
-        *up.seen.lock(),
+        seen(&up),
         vec![
             Some((ip("0.0.0.0"), 0)),
             Some((ip("203.0.0.0"), 16)),
@@ -1625,7 +1524,7 @@ async fn from_client_ip_does_not_pass_on_a_private_client_network() {
         ask(&engine, "192.168.1.10", Some(("10.1.2.0", 28))).await,
         Some(NO_SUBNET)
     );
-    assert_eq!(*up.seen.lock(), vec![Some((ip("198.51.100.0"), 24)), None]);
+    assert_eq!(seen(&up), vec![Some((ip("198.51.100.0"), 24)), None]);
     // 同样的请求再来一次，都从缓存拿 / The same requests again come from the cache
     ask(&engine, "198.51.100.7", Some(("10.1.2.0", 28))).await;
     ask(&engine, "192.168.1.10", Some(("10.1.2.0", 28))).await;
@@ -1693,7 +1592,7 @@ async fn from_client_ip_takes_the_ipv4_subnet_of_a_mapped_client() {
         first_a(&reply_from(&engine, private, None).await),
         Some(NO_SUBNET)
     );
-    assert_eq!(*up.seen.lock(), vec![Some((ip("198.51.100.0"), 24)), None]);
+    assert_eq!(seen(&up), vec![Some((ip("198.51.100.0"), 24)), None]);
 }
 
 /// 客户端带的 ECS 读不懂（这里是查询里 SCOPE 不为 0，RFC 7871 第 6 节不允许）：它允许给上游
@@ -1719,7 +1618,7 @@ async fn from_client_ip_sends_no_address_for_an_unreadable_client_ecs() {
         .expect("answer");
         assert_eq!(first_a(&reply), Some(NO_SUBNET), "{client}");
     }
-    assert_eq!(*up.seen.lock(), vec![None]);
+    assert_eq!(seen(&up), vec![None]);
     assert_eq!(up.queries(), 1);
 }
 
@@ -1772,7 +1671,7 @@ async fn from_client_ip_removes_ecs_options_hickory_cannot_decode() {
     }
     // 三次请求发给上游的都不带 ECS，所以第一次之后都从缓存拿
     // All three send the upstream a query without ECS, so after the first they come from the cache
-    assert_eq!(*up.seen.lock(), vec![None]);
+    assert_eq!(seen(&up), vec![None]);
 }
 
 /// 后台刷新照样不加地址：刷新重放的包放不进读不懂的选项，按缓存记下的请求方判断，和原请求一样
@@ -1818,7 +1717,7 @@ async fn a_refresh_for_an_unreadable_client_ecs_sends_no_address() {
     // 刷新回来的应答换下了原来那份，下一次照样命中缓存
     // The refreshed answer replaced the one before, so the next request still hits the cache
     assert_eq!(first_a(&ask_unreadable().await), Some(NO_SUBNET));
-    assert_eq!(*up.seen.lock(), vec![None, None]);
+    assert_eq!(seen(&up), vec![None, None]);
     assert_eq!(up.queries(), 2);
 }
 

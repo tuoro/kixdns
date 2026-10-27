@@ -4,21 +4,20 @@
 //! `proto_utils::QueryFlags`): the cache, the merging of inflight queries and the
 //! background refresh keep requests apart by them.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use parking_lot::Mutex;
 
-use crate::engine::{Engine, FastPathResponse, PreParsedData};
-use crate::matcher::{RequesterKey, RuntimePipelineConfig};
+use crate::engine::Engine;
+use crate::engine::test_support::{
+    self as support, Upstream, counting_settings, engine_from, first_a, peer,
+};
+use crate::matcher::RequesterKey;
 use crate::proto_utils::QueryFlags;
 
 /// 三个查询位的全部八种组合 / All eight combinations of the three query bits
@@ -48,23 +47,21 @@ fn address_for(flags: QueryFlags) -> Ipv4Addr {
     Ipv4Addr::new(192, 0, 2, 10 + flags.bits())
 }
 
-/// 假上游 / A fake upstream
-struct Upstream {
-    address: String,
-    /// 收到的查询个数 / How many queries it received
-    queries: Arc<AtomicUsize>,
-    /// 每个查询带来的查询位 / The query bits each query carried
-    seen: Arc<Mutex<Vec<QueryFlags>>>,
+/// 查询带来的查询位 / The query bits a query carries
+fn flags_of(query: &Message) -> QueryFlags {
+    QueryFlags::new(
+        query.metadata.recursion_desired,
+        query.metadata.checking_disabled,
+        query
+            .edns
+            .as_ref()
+            .is_some_and(|edns| edns.flags().dnssec_ok),
+    )
 }
 
-impl Upstream {
-    fn queries(&self) -> usize {
-        self.queries.load(Ordering::SeqCst)
-    }
-
-    fn seen(&self) -> Vec<QueryFlags> {
-        self.seen.lock().clone()
-    }
+/// 上游收到的每个查询带来的查询位 / The query bits each query the upstream received carried
+fn seen(up: &Upstream) -> Vec<QueryFlags> {
+    up.received().iter().map(flags_of).collect()
 }
 
 /// 按查询位作答的本机上游：应答的地址是 [`address_for`] 查询位，TTL 为 `ttl`，每个应答晚
@@ -73,83 +70,43 @@ impl Upstream {
 /// them, at TTL `ttl`, every reply `delay` late; RD, CD and DO are copied from the
 /// query, as a real upstream does.
 async fn upstream(ttl: u32, delay: Duration) -> Upstream {
-    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let address = sock.local_addr().unwrap().to_string();
-    let queries = Arc::new(AtomicUsize::new(0));
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let (counted, recorded) = (queries.clone(), seen.clone());
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-            let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                continue;
-            };
-            let Some(question) = query.queries.first().cloned() else {
-                continue;
-            };
-            let flags = QueryFlags::of(&buf[..n]);
-            counted.fetch_add(1, Ordering::SeqCst);
-            recorded.lock().push(flags);
-            let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-            resp.metadata.recursion_desired = flags.recursion_desired();
-            resp.metadata.checking_disabled = flags.checking_disabled();
-            resp.metadata.recursion_available = true;
-            resp.add_query(question.clone());
-            resp.add_answer(Record::from_rdata(
-                question.name().clone(),
-                ttl,
-                RData::A(A(address_for(flags))),
-            ));
-            if query.edns.is_some() {
-                let mut edns = Edns::new();
-                edns.set_max_payload(1232);
-                edns.set_dnssec_ok(flags.dnssec_ok());
-                resp.edns = Some(edns);
-            }
-            let resp = resp.to_vec().unwrap();
-            let sock = sock.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                let _ = sock.send_to(&resp, peer).await;
-            });
+    support::upstream(move |query| {
+        let Some(question) = query.queries.first() else {
+            return Vec::new();
+        };
+        let flags = flags_of(query);
+        let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        resp.metadata.recursion_desired = flags.recursion_desired();
+        resp.metadata.checking_disabled = flags.checking_disabled();
+        resp.metadata.recursion_available = true;
+        resp.add_query(question.clone());
+        resp.add_answer(Record::from_rdata(
+            question.name().clone(),
+            ttl,
+            RData::A(A(address_for(flags))),
+        ));
+        if query.edns.is_some() {
+            let mut edns = Edns::new();
+            edns.set_max_payload(1232);
+            edns.set_dnssec_ok(flags.dnssec_ok());
+            resp.edns = Some(edns);
         }
-    });
-    Upstream {
-        address,
-        queries,
-        seen,
-    }
+        vec![(delay, resp.to_vec().unwrap())]
+    })
+    .await
 }
 
 /// 把所有请求转发给 `upstream` 的引擎，再加上 `settings` / An engine forwarding everything
 /// to `upstream`, with `settings` on top
 fn engine(upstream: &str, settings: serde_json::Value) -> Engine {
-    let mut all = serde_json::json!({
-        "default_upstream": "127.0.0.1:9",
-        // A UDP query is sent again after a third of this (`upstream::hedge_timeout`),
-        // and the tests count upstream queries
-        // UDP 查询过了这个时间的三分之一会再发一次（`upstream::hedge_timeout`），而这些测试
-        // 数上游收到的查询
-        "upstream_timeout_ms": 3000,
-        "enable_tcp_fallback": false
-    });
-    all.as_object_mut()
-        .unwrap()
-        .extend(settings.as_object().unwrap().clone());
-    let config: crate::config::PipelineConfig = serde_json::from_value(serde_json::json!({
-        "settings": all,
+    engine_from(serde_json::json!({
+        "settings": counting_settings(settings),
         "pipeline_select": [],
         "pipelines": [{ "id": "main", "rules": [{
             "name": "all", "matchers": [{ "type": "any" }],
             "actions": [{ "type": "forward", "upstream": upstream }]
         }] }]
     }))
-    .expect("parse config");
-    Engine::new(
-        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-        "test".to_string(),
-    )
-    .expect("engine")
 }
 
 /// 带着 `flags` 查询 example.com A，都带 EDNS，所以 DO 是唯一可能的不同
@@ -170,54 +127,12 @@ fn query(flags: QueryFlags) -> Vec<u8> {
     request.to_vec().unwrap()
 }
 
-fn peer() -> SocketAddr {
-    "127.0.0.1:53000".parse().unwrap()
-}
-
-fn first_a(reply: &Bytes) -> Option<Ipv4Addr> {
-    match Message::from_bytes(reply)
-        .expect("parse reply")
-        .answers
-        .first()
-        .map(|record| &record.data)
-    {
-        Some(RData::A(address)) => Some(address.0),
-        _ => None,
-    }
-}
-
-/// 像监听器那样问：先走快速路径，需要时再走异步路径；返回应答里的地址
-/// Ask as a listener does: the fast path first, then the async path when needed;
-/// the address in the reply
+/// 像监听器那样问（见 [`support::ask_fast_path_first`]）；返回应答里的地址
+/// Ask as a listener does (see [`support::ask_fast_path_first`]); the address in the reply
 async fn ask_like_a_listener(engine: &Engine, flags: QueryFlags) -> Option<Ipv4Addr> {
-    let packet = query(flags);
-    let reply = match engine
-        .handle_packet_fast(&packet, peer())
-        .expect("fast path")
-    {
-        Some(FastPathResponse::Direct(reply)) => reply,
-        Some(FastPathResponse::CacheHit { cached, .. }) => cached,
-        Some(FastPathResponse::AsyncNeeded {
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            edns_present,
-            pipeline_id,
-        }) => tokio::time::timeout(
-            Duration::from_secs(5),
-            engine.handle_packet_internal_with_pre_parsed(
-                &packet,
-                peer(),
-                false,
-                PreParsedData::new(qname, qtype, qclass, tx_id, edns_present, pipeline_id),
-            ),
-        )
+    let reply = support::ask_fast_path_first(engine, &query(flags), peer())
         .await
-        .expect("answer in time")
-        .expect("answer"),
-        None => panic!("a query the fast path cannot read"),
-    };
+        .expect("a query the fast path can read");
     first_a(&reply)
 }
 
@@ -240,7 +155,7 @@ async fn each_set_of_query_bits_gets_its_own_answer() {
     // The upstream was asked once per set of bits, with those bits
     // 上游对每种查询位只被问了一次，问的时候带着那几位
     assert_eq!(up.queries(), 8);
-    assert_eq!(sorted(up.seen()), sorted(every_flags()));
+    assert_eq!(sorted(seen(&up)), sorted(every_flags()));
 }
 
 /// 只差 DO 位的两个查询同时到达，各问各的上游，不合并
@@ -309,7 +224,7 @@ async fn a_background_refresh_asks_with_the_entrys_query_bits() {
     })
     .await
     .expect("every refresh reaches the upstream");
-    assert_eq!(sorted(up.seen()[8..].to_vec()), sorted(every_flags()));
+    assert_eq!(sorted(seen(&up)[8..].to_vec()), sorted(every_flags()));
     // Each refreshed answer replaced the entry for its own bits
     // 每份刷新回来的应答都换下了它那几位的条目
     let namespace = engine.state.load().cache_namespace("main");
