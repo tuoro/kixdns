@@ -1298,6 +1298,9 @@ mod refresh_failure_reply_tests {
 
     fn query() -> Message {
         let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
+        // A client asks recursively, as the entries here are stored (`QueryFlags::RECURSIVE`)
+        // 客户端按递归方式问，和这里存条目时一样（`QueryFlags::RECURSIVE`）
+        request.metadata.recursion_desired = true;
         request.add_query(Query::query(
             Name::from_str("example.com.").unwrap(),
             RecordType::A,
@@ -1313,6 +1316,7 @@ mod refresh_failure_reply_tests {
             b"example.com",
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &crate::matcher::RequesterKey::NONE,
             None,
         )

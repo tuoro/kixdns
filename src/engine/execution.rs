@@ -73,6 +73,9 @@ pub struct CacheKeys {
     pub slot: u64,
     /// Inflight entry / inflight 条目
     pub inflight: u64,
+    /// The query bits the keys were computed with (see `QueryFlags`)
+    /// 算这些键时用的查询位（见 `QueryFlags`）
+    pub flags: crate::proto_utils::QueryFlags,
     /// The requester's part the keys were computed with; with the question it makes up
     /// what the inflight entry is checked against (see `InflightQuestion`)
     /// 算这些键时用的请求方部分；它和问题一起就是 inflight 条目要核对的内容（见
@@ -350,16 +353,19 @@ impl Engine {
     /// ECS 子网（见 `CacheEntry::reach`），所以它的键不含子网；请求只有发送相同的子网才能
     /// 互相等待，所以 inflight 键带上转发会为这个请求方发送的子网，以及客户端自己带的 ECS。
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn cache_keys(
         cache_namespace: u64,
         pipeline_id: &str,
         qname: &[u8],
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
+        flags: crate::proto_utils::QueryFlags,
         requester: &RequesterKey,
         client_ecs: Option<&crate::ecs::EcsKey>,
     ) -> CacheKeys {
-        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
+        let mut h =
+            Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass, flags);
         let mut inflight = h.clone();
         // The requester, for a pipeline whose answer depends on it (see
         // `RuntimePipeline::requester`); nothing otherwise, so the key is unchanged
@@ -370,6 +376,7 @@ impl Engine {
         CacheKeys {
             slot: h.finish(),
             inflight: inflight.finish(),
+            flags,
             requester: *requester,
         }
     }
@@ -383,9 +390,11 @@ impl Engine {
         qname: &[u8],
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
+        flags: crate::proto_utils::QueryFlags,
         requester: &RequesterKey,
     ) -> u64 {
-        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
+        let mut h =
+            Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass, flags);
         requester.hash_into(&mut h);
         h.finish()
     }
@@ -397,6 +406,7 @@ impl Engine {
         qname: &[u8],
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
+        flags: crate::proto_utils::QueryFlags,
     ) -> FxHasher {
         let mut h = FxHasher::default();
         cache_namespace.hash(&mut h);
@@ -410,6 +420,7 @@ impl Engine {
         u16::from(qtype).hash(&mut h);
         // DNSClass implements Copy+Debug, hash by its u16 representation / DNSClass 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qclass).hash(&mut h);
+        flags.bits().hash(&mut h);
         h
     }
 
@@ -688,6 +699,7 @@ impl Engine {
             q.qname_bytes,
             qtype,
             qclass,
+            q.flags,
             &requester_key,
         );
 
@@ -699,6 +711,7 @@ impl Engine {
                 qname: qname_str,
                 pipeline_id: &pipeline_id,
                 qtype: u16::from(qtype),
+                flags: q.flags,
             },
             now,
         ) {
@@ -1012,6 +1025,7 @@ impl Engine {
                 qname: lookup.qname,
                 pipeline_id: lookup.pipeline_id,
                 qtype: u16::from(lookup.qtype),
+                flags: lookup.flags,
             };
             let has_stale = self
                 .cache_get(lookup.slot, &view, &question, Instant::now())
@@ -1135,6 +1149,8 @@ impl Engine {
         state_override: Option<Arc<EngineInner>>,
     ) -> anyhow::Result<Bytes> {
         let peer = client_address(peer);
+        // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
+        let flags = crate::proto_utils::QueryFlags::of(packet);
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let request_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
         self.incr_total_requests();
@@ -1341,6 +1357,7 @@ impl Engine {
                 qname_bytes,
                 qtype,
                 qclass,
+                flags,
                 &pipeline_opt.map_or(RequesterKey::NONE, |p| {
                     p.requester.key(requester, Some(&self.geoip_manager))
                 }),
@@ -1361,6 +1378,7 @@ impl Engine {
                             qname: qname_ref,
                             qtype,
                             qclass,
+                            flags,
                             pipeline_id: &pipeline_id,
                             slot: keys.slot,
                             tx_id,
@@ -1474,6 +1492,7 @@ impl Engine {
                     qname: qname_ref,
                     pipeline_id: &target.pipeline,
                     qtype: u16::from(qtype),
+                    flags,
                 };
                 self.drop_refreshed(target.slot, &question, &view, target);
             };
@@ -1542,6 +1561,7 @@ impl Engine {
                             qname_bytes,
                             qtype,
                             qclass,
+                            flags,
                             &p.requester.key(requester, Some(&self.geoip_manager)),
                             client_ecs.as_ref(),
                         );
@@ -1578,6 +1598,7 @@ impl Engine {
                                         qname,
                                         qtype,
                                         qclass,
+                                        flags,
                                         pipeline_id: &current_pipeline_id,
                                         slot: keys.slot,
                                         tx_id,
@@ -1655,6 +1676,7 @@ impl Engine {
                                 qtype,
                                 pipeline_id: &current_pipeline_id,
                                 slot: keys.slot,
+                                flags,
                                 reach: &trail,
                                 min_ttl,
                                 start,
@@ -1858,7 +1880,7 @@ impl Engine {
             .await;
         }
         if let (Some(target), Ok(_)) = (&refresh, &result) {
-            self.settle_refresh(target, &trail, qname_ref, u16::from(qtype));
+            self.settle_refresh(target, &trail, qname_ref, u16::from(qtype), flags);
         }
         // Every reply leaves with the ECS option its client should see; waiters were
         // handed the reply before this and do the same for their own clients
@@ -1923,10 +1945,11 @@ impl Engine {
     /// Design: Use hickory-proto to ensure RFC compliance
     /// 设计：使用 hickory-proto 确保 RFC 合规性
     /// - Generates valid TXID (not 0)
-    /// - Sets proper flags (recursion desired)
+    /// - Sets the query bits `flags` the replayed request had (RD, CD, DO), so its
+    ///   answer is fetched and stored the same way
     /// - Encodes QNAME correctly
     /// - 生成有效的 TXID（不是 0）
-    /// - 设置正确的标志（需要递归）
+    /// - 带上被重放的请求的查询位 `flags`（RD、CD、DO），应答按同样的方式取回、存放
     /// - 正确编码 QNAME
     /// - Carries EDNS when `edns` is set, and the client's own ECS `ecs`, as the
     ///   request being replayed did
@@ -1938,6 +1961,7 @@ impl Engine {
         _qclass: DNSClass, // Currently defaults to IN class, parameter reserved for future use
         edns: bool,
         ecs: Option<&crate::ecs::EcsKey>,
+        flags: crate::proto_utils::QueryFlags,
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
 
@@ -1947,12 +1971,13 @@ impl Engine {
 
         // Build DNS query message
         // 构建 DNS 查询消息
-        // hickory-proto 0.26: Message::new() defaults RD=false (was true in 0.24).
-        // Upstream queries MUST set RD=true for recursive resolution.
-        // hickory-proto 0.26: Message::new() 默认 RD=false（0.24 中为 true）。
-        // 上游查询必须设置 RD=true 以获得递归解析。
+        // hickory-proto 0.26: Message::new() defaults RD=false (was true in 0.24), so RD
+        // is set from the replayed request.
+        // hickory-proto 0.26: Message::new() 默认 RD=false（0.24 中为 true），所以 RD 按被重放的
+        // 请求设置。
         let mut msg = Message::new(tx_id, MessageType::Query, hickory_proto::op::OpCode::Query);
-        msg.metadata.recursion_desired = true;
+        msg.metadata.recursion_desired = flags.recursion_desired();
+        msg.metadata.checking_disabled = flags.checking_disabled();
 
         // Add question section
         // 添加问题部分
@@ -1960,10 +1985,11 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("query name text {qname:?}"))?;
         let query = Query::query(name.clone(), qtype);
         msg.add_query(query);
-        // An ECS option only travels inside EDNS / ECS 选项只能放在 EDNS 里
-        if edns || ecs.is_some() {
+        // An ECS option and the DO bit only travel inside EDNS / ECS 选项和 DO 位只能放在 EDNS 里
+        if edns || ecs.is_some() || flags.dnssec_ok() {
             let mut opt = hickory_proto::op::Edns::new();
             opt.set_max_payload(REFRESH_EDNS_PAYLOAD);
+            opt.set_dnssec_ok(flags.dnssec_ok());
             if let Some(subnet) = ecs
                 && let Some(address) = subnet.ip()
             {
@@ -2052,6 +2078,7 @@ mod tests {
             b"example.com",
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -2072,6 +2099,7 @@ mod tests {
                 "example.com",
                 Arc::from("main"),
                 u16::from(RecordType::A),
+                crate::proto_utils::QueryFlags::RECURSIVE,
                 (60, 60),
             ),
         );
@@ -2097,6 +2125,7 @@ mod tests {
             b"example.com",
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -2120,6 +2149,7 @@ mod tests {
             b"example.com",
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -2133,6 +2163,7 @@ mod tests {
             b"example.com",
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -2498,6 +2529,7 @@ mod tests {
                     name.as_bytes(),
                     RecordType::A,
                     DNSClass::IN,
+                    crate::proto_utils::QueryFlags::RECURSIVE,
                     &RequesterKey::NONE,
                     None,
                 )
@@ -3090,6 +3122,7 @@ mod tests {
         )
         .expect("engine");
         let question = InflightQuestion {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: engine.state.load().cache_namespace("main"),
             pipeline_id: "main",
             qname: b"example.com",
@@ -3104,6 +3137,7 @@ mod tests {
             question.qname,
             question.qtype,
             question.qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &question.requester,
             None,
         );
@@ -4519,6 +4553,7 @@ mod tests {
 
         // Act: uses_client_ip=true must NOT write into dns_cache (client isolation)
         let ctx = phases::StaticDecisionContext {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
             packet: &packet,
             qname: "example.com",
             qtype: RecordType::A,
@@ -4541,6 +4576,7 @@ mod tests {
 
         // Control: uses_client_ip=false DOES write into dns_cache
         let ctx_plain = phases::StaticDecisionContext {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
             packet: &packet,
             qname: "example.com",
             qtype: RecordType::A,
@@ -4621,6 +4657,7 @@ mod tests {
             qname.as_bytes(),
             qtype,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -4628,6 +4665,7 @@ mod tests {
 
         // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
             bytes: Bytes::from_static(b"old_resp"),
             rcode: ResponseCode::NoError,
             upstream: None,
@@ -4685,6 +4723,7 @@ mod tests {
         let looked_up = phases::check_cache(
             &engine,
             &phases::CacheLookupContext {
+                flags: crate::proto_utils::QueryFlags::RECURSIVE,
                 state: &state,
                 qname,
                 qtype,
@@ -4778,6 +4817,7 @@ mod tests {
             qname.as_bytes(),
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -4785,6 +4825,7 @@ mod tests {
         engine.cache_insert(
             dedupe_hash,
             Arc::new(CacheEntry {
+                flags: crate::proto_utils::QueryFlags::RECURSIVE,
                 bytes: Bytes::from_static(b"old_resp"),
                 rcode: ResponseCode::NoError,
                 upstream: None,
@@ -4859,6 +4900,7 @@ mod tests {
             qname.as_bytes(),
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -4866,6 +4908,7 @@ mod tests {
         engine.cache_insert(
             dedupe_hash,
             Arc::new(CacheEntry {
+                flags: crate::proto_utils::QueryFlags::RECURSIVE,
                 bytes: Bytes::from_static(b"old_resp"),
                 rcode: ResponseCode::NoError,
                 upstream: None,
@@ -4946,6 +4989,7 @@ mod tests {
             question.qname,
             question.qtype,
             question.qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &question.requester,
             None,
         )
@@ -4955,6 +4999,7 @@ mod tests {
     /// 默认 pipeline 里 `stale.com` 查询的 inflight 问题
     fn stale_com_question(engine: &Engine) -> InflightQuestion<'static> {
         InflightQuestion {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: engine.state.load().cache_namespace("default"),
             pipeline_id: "default",
             qname: b"stale.com",
@@ -4978,6 +5023,7 @@ mod tests {
     /// 一条已经过期的 `stale.com` 缓存条目。 / An expired `stale.com` cache entry.
     fn stale_entry(pipeline_id: &str) -> Arc<CacheEntry> {
         Arc::new(CacheEntry {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
             bytes: Bytes::from_static(b"old_resp"),
             rcode: ResponseCode::NoError,
             upstream: None,
@@ -5311,6 +5357,7 @@ mod tests {
             qname.as_bytes(),
             qtype,
             qclass_in,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5321,6 +5368,7 @@ mod tests {
             qname.as_bytes(),
             qtype,
             qclass_ch,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5339,6 +5387,7 @@ mod tests {
             qname.as_bytes(),
             qtype,
             qclass_in,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5373,6 +5422,7 @@ mod tests {
             qname_lower.to_lowercase().as_bytes(),
             qtype,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5383,6 +5433,7 @@ mod tests {
             qname_upper.to_lowercase().as_bytes(),
             qtype,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5393,6 +5444,7 @@ mod tests {
             qname_mixed.to_lowercase().as_bytes(),
             qtype,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5420,6 +5472,7 @@ mod tests {
             qname.as_bytes(),
             qtype_a,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5430,6 +5483,7 @@ mod tests {
             qname.as_bytes(),
             qtype_aaaa,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5459,6 +5513,7 @@ mod tests {
             qname1.as_bytes(),
             qtype,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )
@@ -5469,6 +5524,7 @@ mod tests {
             qname2.as_bytes(),
             qtype,
             qclass,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &RequesterKey::NONE,
             None,
         )

@@ -56,6 +56,8 @@ pub struct CacheLookupContext<'a> {
     pub qname: &'a str,
     pub qtype: RecordType,
     pub qclass: DNSClass,
+    /// The query bits (see `QueryFlags`) / 查询位（见 `QueryFlags`）
+    pub flags: proto_utils::QueryFlags,
     pub pipeline_id: &'a str,
     /// Response cache slot / 响应缓存槽位
     pub slot: u64,
@@ -87,6 +89,7 @@ pub(crate) fn check_cache_logged(
         qname: qname_ref,
         qtype,
         qclass,
+        flags,
         pipeline_id,
         slot,
         tx_id,
@@ -100,6 +103,7 @@ pub(crate) fn check_cache_logged(
         qname: qname_ref,
         pipeline_id,
         qtype: u16::from(qtype),
+        flags,
     };
 
     // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
@@ -349,6 +353,7 @@ pub(crate) fn check_stale_cache_logged(
         qname: qname_ref,
         qtype,
         qclass,
+        flags,
         pipeline_id,
         slot,
         tx_id,
@@ -365,6 +370,7 @@ pub(crate) fn check_stale_cache_logged(
         qname: qname_ref,
         pipeline_id,
         qtype: u16::from(qtype),
+        flags,
     };
 
     let now = Instant::now();
@@ -444,6 +450,8 @@ pub struct StaticDecisionContext<'a> {
     pub pipeline_id: &'a Arc<str>,
     /// Response cache slot / 响应缓存槽位
     pub slot: u64,
+    /// The query bits the slot was computed with / 算槽位时用的查询位
+    pub flags: proto_utils::QueryFlags,
     /// Whom the answer applies to: the forwards the request passed before it
     /// (see `ForwardDecisionContext::trail`)
     /// 应答适用于谁：请求在它之前经过的转发（见 `ForwardDecisionContext::trail`）
@@ -472,6 +480,7 @@ pub fn handle_static_decision(
         qtype,
         pipeline_id: current_pipeline_id,
         slot,
+        flags,
         reach,
         min_ttl,
         start: _,
@@ -496,6 +505,7 @@ pub fn handle_static_decision(
                 qname,
                 current_pipeline_id.clone(),
                 u16::from(qtype),
+                flags,
                 (ttl, ttl),
             )
             .with_reach(reach.clone()),
@@ -614,6 +624,7 @@ pub(crate) async fn handle_forward_decision_logged(
         qname,
         pipeline_id,
         qtype: u16::from(qtype),
+        flags: keys.flags,
     };
     // What this forward sends as ECS, which decides whom its reply applies to
     // 这次转发发出的 ECS，它决定应答适用于谁
@@ -666,6 +677,7 @@ pub(crate) async fn handle_forward_decision_logged(
         qname: qname.as_bytes(),
         qtype,
         qclass,
+        flags: keys.flags,
         requester: keys.requester,
         client_ecs: requester.ecs,
     };
@@ -998,6 +1010,7 @@ pub(crate) async fn handle_forward_decision_logged(
                                 qname,
                                 Arc::from(pipeline_id),
                                 u16::from(qtype),
+                                keys.flags,
                                 (cache_ttl, refresh_ttl),
                             )
                             .with_reach(trail.clone()),
@@ -1084,6 +1097,7 @@ pub(crate) async fn handle_forward_decision_logged(
                                     qname,
                                     Arc::from(pipeline_id),
                                     u16::from(qtype),
+                                    keys.flags,
                                     (cache_ttl, refresh_ttl),
                                 )
                                 .with_reach(trail.clone()),
@@ -1126,6 +1140,7 @@ pub(crate) async fn handle_forward_decision_logged(
                                     qname,
                                     Arc::from(pipeline_id),
                                     u16::from(qtype),
+                                    keys.flags,
                                     (ttl, ttl),
                                 )
                                 .with_reach(trail.clone()),
@@ -1261,6 +1276,7 @@ pub(crate) async fn handle_forward_decision_logged(
                             qname,
                             qtype,
                             qclass,
+                            flags: keys.flags,
                             pipeline_id,
                             slot: keys.slot,
                             tx_id,
@@ -1385,6 +1401,7 @@ pub(crate) async fn handle_forward_decision_logged(
                                         qname,
                                         Arc::from(pipeline_id),
                                         u16::from(qtype),
+                                        keys.flags,
                                         (cache_ttl, refresh_ttl),
                                     )
                                     .with_reach(trail.clone()),
@@ -1421,6 +1438,7 @@ pub(crate) async fn handle_forward_decision_logged(
                                         qname,
                                         Arc::from(pipeline_id),
                                         u16::from(qtype),
+                                        keys.flags,
                                         (ttl, ttl),
                                     )
                                     .with_reach(trail.clone()),
@@ -1708,6 +1726,9 @@ mod refresh_response_rule_tests {
 
     fn query() -> Message {
         let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
+        // A client asks recursively, as the entries here are stored (`QueryFlags::RECURSIVE`)
+        // 客户端按递归方式问，和这里存条目时一样（`QueryFlags::RECURSIVE`）
+        request.metadata.recursion_desired = true;
         request.add_query(Query::query(
             Name::from_str("example.com.").unwrap(),
             RecordType::A,
@@ -1820,6 +1841,7 @@ mod refresh_response_rule_tests {
                 "example.com",
                 Arc::from(pipeline),
                 u16::from(RecordType::A),
+                crate::proto_utils::QueryFlags::RECURSIVE,
                 (ttl, ttl),
             )
             .with_reach(reach),
@@ -1836,6 +1858,7 @@ mod refresh_response_rule_tests {
             b"example.com",
             RecordType::A,
             DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             &crate::matcher::RequesterKey::NONE,
             None,
         )

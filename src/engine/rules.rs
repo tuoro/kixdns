@@ -852,6 +852,7 @@ pub(crate) async fn process_response_jump(
             qname: qname.as_bytes(),
             qtype,
             qclass,
+            flags: crate::proto_utils::QueryFlags::of(packet),
             requester: cfg
                 .requester_key(
                     &pipeline_id,

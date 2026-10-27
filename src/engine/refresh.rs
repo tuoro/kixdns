@@ -120,20 +120,23 @@ pub fn spawn_background_refresh(
 
     // Step 1: Construct standard DNS query packet
     // 步骤 1：构造标准 DNS 查询包
-    // Replay the request as its client sent it, as far as routing and ECS can
-    // tell: from the same address, with or without EDNS, with the client's own ECS.
-    // Pipeline selection and rules can depend on the first two, a forward without
-    // `ecs` passes the last upstream, and the answer is stored in the slot the
-    // request looked up.
-    // 按客户端发来的样子重放，以路由和 ECS 能分辨的为限：同一个地址，带或不带 EDNS，带着
-    // 客户端自己的 ECS。pipeline 的选择和规则都可能取决于前两项，不写 `ecs` 的转发会把最后
-    // 一项转给上游，而应答会存进请求查过的那个槽位。
+    // Replay the request as its client sent it, as far as routing, ECS and the cache
+    // can tell: from the same address, with or without EDNS, with the client's own
+    // ECS and its query bits (see `QueryFlags`). Pipeline selection and rules can
+    // depend on the first two, a forward without `ecs` passes the ECS upstream, the
+    // query bits change the answer and are part of its key, and the answer is
+    // stored in the slot the request looked up.
+    // 按客户端发来的样子重放，以路由、ECS 和缓存能分辨的为限：同一个地址，带或不带 EDNS，带着
+    // 客户端自己的 ECS 和它的查询位（见 `QueryFlags`）。pipeline 的选择和规则都可能取决于前两项，
+    // 不写 `ecs` 的转发会把 ECS 转给上游，查询位会改变应答、也是它的键的一部分，而应答会存进请求
+    // 查过的那个槽位。
     let packet = match engine.construct_dns_packet(
         qname,
         qtype,
         qclass,
         requester.edns,
         requester.ecs.as_ref(),
+        renewed.flags,
     ) {
         Ok(pkt) => pkt,
         Err(e) => {

@@ -7,6 +7,7 @@ use moka::sync::Cache;
 use smallvec::SmallVec;
 
 use crate::ecs_scope::{EcsReach, EcsView};
+use crate::proto_utils::QueryFlags;
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
@@ -18,6 +19,7 @@ pub struct CacheEntry {
     pub qname: Arc<str>,
     pub pipeline_id: Arc<str>,
     pub qtype: u16,
+    pub flags: QueryFlags,
     /// RFC 1035 §5.2: Record insertion time for TTL decrement / RFC 1035 §5.2：记录插入时间用于TTL递减
     pub inserted_at: Instant,
     /// Original minimum TTL from upstream response / 上游响应的原始最小TTL
@@ -62,6 +64,7 @@ impl CacheEntry {
         qname: &str,
         pipeline_id: Arc<str>,
         qtype: u16,
+        flags: QueryFlags,
         ttls: (u32, u32),
     ) -> Self {
         Self {
@@ -71,6 +74,7 @@ impl CacheEntry {
             qname: Arc::from(qname),
             pipeline_id,
             qtype,
+            flags,
             inserted_at: Instant::now(),
             original_ttl: ttls.0,
             refresh_ttl: ttls.1,
@@ -93,6 +97,7 @@ impl CacheEntry {
 
     fn same_question(&self, other: &Self) -> bool {
         self.qtype == other.qtype
+            && self.flags == other.flags
             && self.qname == other.qname
             && self.pipeline_id == other.pipeline_id
     }
@@ -113,6 +118,7 @@ impl CacheEntry {
             qname: self.qname.clone(),
             pipeline_id: self.pipeline_id.clone(),
             qtype: self.qtype,
+            flags: self.flags,
             inserted_at: Instant::now() - Duration::from_secs(self.original_ttl as u64),
             original_ttl: self.original_ttl,
             refresh_ttl: self.refresh_ttl,
@@ -131,11 +137,13 @@ pub struct CachedQuestion<'a> {
     pub qname: &'a str,
     pub pipeline_id: &'a str,
     pub qtype: u16,
+    pub flags: QueryFlags,
 }
 
 impl CachedQuestion<'_> {
     pub fn matches(&self, entry: &CacheEntry) -> bool {
         entry.qtype == self.qtype
+            && entry.flags == self.flags
             && entry.qname.as_ref() == self.qname
             && entry.pipeline_id.as_ref() == self.pipeline_id
     }
@@ -314,6 +322,7 @@ mod tests {
     use crate::ecs_scope::{EcsSource, ForwardEcs, ReplyEcs, Sent};
 
     const QUESTION: CachedQuestion<'static> = CachedQuestion {
+        flags: crate::proto_utils::QueryFlags::RECURSIVE,
         qname: "example.com",
         pipeline_id: "main",
         qtype: 1,
@@ -362,6 +371,7 @@ mod tests {
             "example.com",
             Arc::from("main"),
             1,
+            crate::proto_utils::QueryFlags::RECURSIVE,
             (ttl, ttl),
         )
         .with_reach(reach);
@@ -378,6 +388,54 @@ mod tests {
             None,
             Instant::now(),
         )
+    }
+
+    /// 查询位不同的应答各存各的：新应答不取代另一种查询位的，查找也只认自己那几位
+    /// Answers for other query bits are kept apart: a new answer does not replace
+    /// one for other bits, and a lookup only takes its own
+    #[test]
+    fn an_answer_is_only_for_its_own_query_bits() {
+        let for_bits = |flags| {
+            Arc::new(
+                CacheEntry::from_response(
+                    Bytes::new(),
+                    ResponseCode::NoError,
+                    None,
+                    "example.com",
+                    Arc::from("main"),
+                    1,
+                    flags,
+                    (300, 300),
+                )
+                .with_reach(reach("198.51.100.0/24", None)),
+            )
+        };
+        let dnssec = QueryFlags::new(true, false, true);
+        let (plain_answer, dnssec_answer) = (for_bits(QueryFlags::RECURSIVE), for_bits(dnssec));
+        let slot = CacheSlot::default()
+            .with(plain_answer.clone(), None)
+            .with(dnssec_answer.clone(), None);
+        assert_eq!(slot.len(), 2);
+        for (flags, answer) in [
+            (QueryFlags::RECURSIVE, &plain_answer),
+            (dnssec, &dnssec_answer),
+        ] {
+            let question = CachedQuestion { flags, ..QUESTION };
+            let selected = slot
+                .select(
+                    &view("198.51.100.0/24"),
+                    |entry| question.matches(entry),
+                    None,
+                    Instant::now(),
+                )
+                .expect("its own answer");
+            assert!(Arc::ptr_eq(&selected, answer), "{flags:?}");
+        }
+        let unanswered = CachedQuestion {
+            flags: QueryFlags::new(true, true, false),
+            ..QUESTION
+        };
+        assert!(!slot.entries().any(|entry| unanswered.matches(entry)));
     }
 
     #[test]
