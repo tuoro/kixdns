@@ -1140,8 +1140,9 @@ impl TcpMuxClient {
                 // Guard will remove pending entry automatically
                 // Guard 会自动移除 pending 条目
 
-                // Record error and FORCE RESET on write failure (socket likely dead)
-                // 记录错误并在写入失败时强制重置（socket 可能已死）
+                // The socket is likely dead: record the error and reset the connection, failing
+                // the queries still waiting on it (see `reset`)
+                // socket 多半已经死了：记一次错误并复位连接，还在等这条连接的查询一起失败（见 `reset`）
                 self.record_error().await;
                 self.reset().await;
                 self.consecutive_errors.store(0, Ordering::Release);
@@ -1154,8 +1155,9 @@ impl TcpMuxClient {
             Err(_) => {
                 // Guard will remove pending entry automatically
 
-                // Record error and FORCE RESET on write timeout
-                // 记录错误并在写入超时时强制重置
+                // The write timed out: reset the connection, or have the next connect reset
+                // it when the lock is busy (see `reset_after_deadline`)
+                // 写入超时：复位连接，锁被占着时交给下一次建连去复位（见 `reset_after_deadline`）
                 self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
@@ -1174,8 +1176,9 @@ impl TcpMuxClient {
         if elapsed_after_write >= timeout_dur {
             // Guard will remove pending entry automatically
 
-            // Record error and FORCE RESET on prereq timeout
-            // 记录错误并在超时时强制重置
+            // The deadline passed before waiting began: reset the connection, or have the
+            // next connect reset it when the lock is busy (see `reset_after_deadline`)
+            // 还没开始等就到了时限：复位连接，锁被占着时交给下一次建连去复位（见 `reset_after_deadline`）
             self.reset_after_deadline().await;
 
             return Err(anyhow::anyhow!(
@@ -1229,8 +1232,11 @@ impl TcpMuxClient {
                     ));
                 }
 
-                // Record error and FORCE RESET on response timeout (connection likely dead/stalled)
-                // 记录错误并在响应超时时强制重置（连接可能死锁/停滞）
+                // No answer in time and the connection has gone quiet (likely dead or
+                // stalled): reset it, or have the next connect reset it when the lock is busy
+                // (see `reset_after_deadline`)
+                // 时限内没有回答，连接也没了动静（多半已死或卡住）：复位它，锁被占着时交给下一次建连去
+                // 复位（见 `reset_after_deadline`）
                 self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
