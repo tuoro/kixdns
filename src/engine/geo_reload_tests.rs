@@ -417,3 +417,114 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
     }
     assert_eq!(ask_from(&engine, "c.test", testnet).await, Some(MATCHED));
 }
+
+/// GeoIP .dat 内容：一个标签一个 IPv4 网段 / GeoIP .dat content: one tag with one IPv4 network
+fn geoip_dat(tag: &str, network: [u8; 4], prefix: u8) -> Vec<u8> {
+    // CIDR { ip, prefix (varint) }
+    let cidr = [field(1, &network), vec![0x10, prefix]].concat();
+    field(1, &[field(1, tag.as_bytes()), field(2, &cidr)].concat())
+}
+
+/// `rounds` 次、每次一个新名字地问，绕开缓存；每次都要得到 `want`
+/// Asks `rounds` times, a new name each time so no cache answers, expecting `want` every time
+async fn keeps_answering(
+    engine: &Engine,
+    peer: SocketAddr,
+    suffix: &str,
+    want: Ipv4Addr,
+    what: &str,
+) {
+    for round in 0..20 {
+        let name = format!("n{round}.{suffix}");
+        assert_eq!(
+            ask_from(engine, &name, peer).await,
+            Some(want),
+            "{what}, round {round}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// GeoSite 数据文件被换成空文件（下载失败、磁盘写满会留下这样的文件），规则用到的标签照旧在：
+/// 以前空文件被当成没有任何标签的合法数据读进去，规则一下子全不命中。
+/// A GeoSite data file replaced by an empty one (what a failed download or a full disk leaves
+/// behind) keeps the tags rules use: the empty file used to be read as valid data with no
+/// tags, and the rules stopped matching at once.
+#[tokio::test]
+async fn an_empty_geosite_file_keeps_the_tags_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("geosite.dat");
+    std::fs::write(&path, geosite_dat(&[("testa", "geo.test")])).unwrap();
+    let engine = engine(geosite_config(&[&path], "testa"));
+    let peer = "203.0.113.9:53000".parse().unwrap();
+    assert_eq!(ask(&engine, "first.geo.test").await, Some(MATCHED));
+
+    replace(&path, b"");
+    keeps_answering(
+        &engine,
+        peer,
+        "geo.test",
+        MATCHED,
+        "the empty file must not wipe the tag",
+    )
+    .await;
+
+    // 文件再写好时照常读进来 / A good file written again is read in as usual
+    replace(&path, &geosite_dat(&[("testa", "geo2.test")]));
+    let manager = &engine.geosite_manager;
+    wait_for("the good file must be read", || {
+        manager.read().matches("testa", "x.geo2.test")
+    })
+    .await;
+    assert!(!manager.read().matches("testa", "x.geo.test"));
+}
+
+/// GeoIP 的 .dat 数据文件被换成空文件，规则用到的标签照旧在，和 GeoSite 一样
+/// A GeoIP .dat data file replaced by an empty one keeps the tags rules use, as for GeoSite
+#[tokio::test]
+async fn an_empty_geoip_file_keeps_the_tags_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("geoip.dat");
+    std::fs::write(&path, geoip_dat("TESTNET", [203, 0, 113, 0], 24)).unwrap();
+    let engine = engine(config(
+        json!({ "geoip_dat_path": path.to_str().unwrap() }),
+        json!({ "type": "geoip_country", "country_codes": ["TESTNET"] }),
+    ));
+    let peer = "203.0.113.9:53000".parse().unwrap();
+    assert_eq!(ask_from(&engine, "first.test", peer).await, Some(MATCHED));
+
+    replace(&path, b"");
+    keeps_answering(
+        &engine,
+        peer,
+        "test",
+        MATCHED,
+        "the empty file must not wipe the tag",
+    )
+    .await;
+
+    replace(&path, &geoip_dat("TESTNET", [198, 51, 100, 0], 24));
+    let manager = &engine.geoip_manager;
+    let tags: [Arc<str>; 1] = [Arc::from("TESTNET")];
+    wait_for("the good file must be read", || {
+        manager
+            .read()
+            .matches_any_tag("198.51.100.1".parse().unwrap(), &tags)
+    })
+    .await;
+}
+
+/// 规则用到、却没有数据文件提供的 GeoSite 标签能被认出来（用来记告警），不分大小写
+/// The GeoSite tags rules use that no data file provides are found (for the warning), ignoring case
+#[tokio::test]
+async fn geosite_tags_no_file_provides_are_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("geosite.dat");
+    std::fs::write(&path, geosite_dat(&[("testa", "geo.test")])).unwrap();
+    let engine = engine(geosite_config(&[&path], "testa"));
+    let manager = engine.geosite_manager.read();
+    let used = ["TestA".to_string(), "gone".to_string(), "Gone".to_string()];
+    assert_eq!(manager.missing_tags(&used), ["gone"]);
+    assert!(manager.source_provides_any(&path, &used));
+    assert!(!manager.source_provides_any(&path, &["gone".to_string()]));
+}
