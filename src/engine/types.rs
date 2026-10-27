@@ -532,7 +532,6 @@ mod tests {
     use super::build_cache_namespaces;
     use crate::config::PipelineConfig;
     use crate::matcher::RuntimePipelineConfig;
-    use hickory_proto::rr::RecordType;
     use std::sync::Arc;
 
     fn runtime_config(first_upstream: &str, second_upstream: &str) -> RuntimePipelineConfig {
@@ -580,18 +579,9 @@ mod tests {
     fn namespace_is_stable_for_identical_configuration() {
         let first = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         let mut second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        // Derived data is deliberately excluded from the semantic fingerprint.
+        // Mutating it must not rotate a cache namespace.
         second.settings.default_upstream_pre_split = Some(Arc::new(vec![Arc::from("derived")]));
-        // Derived lookup indexes are deliberately excluded from the semantic
-        // fingerprint. Mutating them must not rotate a cache namespace.
-        second.pipelines[0]
-            .domain_exact_index
-            .insert(Arc::from("derived.example"), vec![0]);
-        second.pipelines[0]
-            .domain_suffix_index
-            .insert(Arc::from("derived.example"), vec![1]);
-        second.pipelines[0]
-            .query_type_index
-            .insert(RecordType::AAAA, vec![2]);
 
         assert_eq!(
             build_cache_namespaces(&first),

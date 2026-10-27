@@ -425,47 +425,14 @@ impl Engine {
         // 借用而非克隆：state 在整个函数生命周期内存活，零堆分配
         let upstream_default = &state.pipeline.settings.default_upstream;
 
-        // 2. Candidate Selection (compiled index if available)
+        // 2. Candidate Selection: every pipeline is compiled, and its index gives every rule
+        // that can match (see `RuleIndex::add_rule`)
+        // 2. 候选规则：每个 pipeline 都编译过，它的索引给出所有可能命中的规则（见 `RuleIndex::add_rule`）
         // SmallVec<[usize; 32]> avoids heap allocation for typical rule sets (<= 32 candidates)
-        let mut candidate_indices: SmallVec<[usize; 32]> =
-            if let Some(compiled) = self.compiled_for(state, &pipeline.id) {
-                compiled.index.get_candidates(qname, qtype)
-            } else {
-                SmallVec::new()
-            };
-
-        if candidate_indices.is_empty() {
-            // Fallback to runtime indices
-            candidate_indices.extend_from_slice(&pipeline.always_check_rules);
-
-            // 最高优先级：完全域名匹配（O(1)查找）/ Highest priority: exact domain match (O(1) lookup)
-            if let Some(indices) = pipeline.domain_exact_index.get(qname) {
-                candidate_indices.extend_from_slice(indices);
-            }
-
-            // 高频优化：使用 query_type 索引快速过滤
-            // High-frequency optimization: use query_type index for fast filtering
-            if let Some(indices) = pipeline.query_type_index.get(&qtype) {
-                candidate_indices.extend_from_slice(indices);
-            }
-
-            let mut search_name = qname;
-            loop {
-                // 零拷贝优化：Arc<str>可以通过&str查找 / Zero-copy: Arc<str> can be looked up by &str
-                if let Some(indices) = pipeline.domain_suffix_index.get(search_name) {
-                    candidate_indices.extend_from_slice(indices);
-                }
-
-                if let Some(idx) = search_name.find('.') {
-                    search_name = &search_name[idx + 1..];
-                } else {
-                    break;
-                }
-            }
-
-            candidate_indices.sort_unstable();
-            candidate_indices.dedup();
-        }
+        let candidate_indices: SmallVec<[usize; 32]> = self
+            .compiled_for(state, &pipeline.id)
+            .map(|compiled| compiled.index.get_candidates(qname, qtype))
+            .unwrap_or_default();
 
         // 3. Execute Rules
         // 优化：提取 MatcherContext 到循环外部，避免重复构造

@@ -29,6 +29,8 @@ mod question_case_tests;
 pub mod refresh;
 pub mod response;
 pub(crate) mod response_log;
+#[cfg(test)]
+mod rule_index_tests;
 pub mod rules;
 #[cfg(test)]
 mod tcp_pool_tests;
