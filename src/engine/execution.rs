@@ -1362,6 +1362,16 @@ impl Engine {
         // `phases::client_reply`）
         let mut echo_floor = 0u8;
         let result: anyhow::Result<Bytes> = async {
+            // RFC 6891 section 6.1.3, as on the fast path: an unsupported EDNS version is
+            // answered BADVERS. Read off the packet itself, so a query the fast parser
+            // cannot read (trailing bytes, a name that needs escapes) meets it too
+            // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS。从包本身读，
+            // 快速解析读不了的查询（结尾多了字节、名字要转义）也一样
+            if crate::proto_utils::edns_version(packet).is_some_and(|version| version != 0) {
+                return crate::proto_utils::badvers_response(packet)
+                    .context("build BADVERS response");
+            }
+
             // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
             let pipeline_opt = cfg
                 .pipeline_id_index
@@ -3784,6 +3794,67 @@ mod tests {
         let (_, reply) = ask(0);
         assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
         assert_eq!(reply.answers.len(), 1);
+    }
+
+    /// 快速解析读不了的查询（结尾多一个字节、名字要转义）走完整路径，EDNS 版本不是 0 时同样回
+    /// BADVERS；以前照版本 0 回答。版本 0 的照常回答。
+    /// A query the fast parser cannot read (a trailing byte, a name that needs escapes) takes
+    /// the full path, and an EDNS version other than 0 is answered BADVERS there too; it used
+    /// to be answered as if it were version 0. Version 0 is answered as usual.
+    #[tokio::test]
+    async fn the_full_path_answers_an_unsupported_edns_version_badvers() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "static",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+                }]
+            }]
+        });
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let peer = "127.0.0.1:53000".parse().unwrap();
+        for (label, trailing) in [(&b"example"[..], &b"\0"[..]), (b"a b", b"")] {
+            for version in [1u8, 0] {
+                let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+                request.metadata.recursion_desired = true;
+                request.add_query(Query::query(
+                    Name::from_labels([label, b"com"]).unwrap(),
+                    RecordType::A,
+                ));
+                let mut edns = hickory_proto::op::Edns::new();
+                edns.set_version(version);
+                request.edns = Some(edns);
+                let mut packet = request.to_vec().unwrap();
+                packet.extend_from_slice(trailing);
+                let case = format!("{label:?} + {trailing:?}, version {version}");
+                assert!(
+                    matches!(engine.handle_packet_fast(&packet, peer), Ok(None)),
+                    "{case}: the fast parser leaves it to the full path"
+                );
+                let reply = engine.handle_packet(&packet, peer).await.expect(&case);
+                let reply = Message::from_vec(&reply).expect("parse reply");
+                assert_eq!(reply.metadata.id, 0xBEEF, "{case}");
+                assert_eq!(reply.queries, request.queries, "{case}");
+                if version == 0 {
+                    assert_eq!(
+                        reply.metadata.response_code,
+                        ResponseCode::NoError,
+                        "{case}"
+                    );
+                    assert_eq!(reply.answers.len(), 1, "{case}");
+                } else {
+                    // Compared as a number, see above / 按数值比较，见上
+                    assert_eq!(u16::from(reply.metadata.response_code), 16, "{case}");
+                    assert!(reply.answers.is_empty(), "{case}");
+                    assert_eq!(reply.edns.as_ref().map(|edns| edns.version()), Some(0));
+                }
+            }
+        }
     }
 
     #[tokio::test]
