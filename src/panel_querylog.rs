@@ -152,10 +152,11 @@ enum StepKind {
     /// 同一时刻已有相同的查询在问上游，这次用了它的答案 / An identical query was already asking
     /// upstream, and this request took its answer
     Joined,
-    /// 一次上游尝试：`success`、`rejected`（回了 SERVFAIL/REFUSED 被丢掉）、`error` 或 `aborted`（别的上游先回了，
-    /// 这个被取消）
-    /// One upstream attempt: `success`, `rejected` (a SERVFAIL/REFUSED reply was dropped), `error`, or
-    /// `aborted` (another upstream answered first and this one was cancelled)
+    /// 一次上游尝试：`success`、`rejected`（回了失败应答被丢掉，见 `is_failure_reply`）、`error` 或 `aborted`
+    /// （别的上游先回了，这个被取消）
+    /// One upstream attempt: `success`, `rejected` (a failure reply was dropped, see
+    /// `is_failure_reply`), `error`, or `aborted` (another upstream answered first and this one
+    /// was cancelled)
     Upstream {
         upstream: Box<str>,
         transport: &'static str,

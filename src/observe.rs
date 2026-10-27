@@ -481,8 +481,9 @@ pub struct UpstreamResult<'a> {
 pub enum UpstreamOutcome {
     /// A usable response was received.
     Success,
-    /// A response was received but discarded (SERVFAIL/REFUSED while other
-    /// upstreams of a concurrent set were still pending).
+    /// A response was received but discarded: a failure reply (see
+    /// `engine::upstream::is_failure_reply`) while other upstreams of a concurrent set were
+    /// still pending.
     Rejected,
     /// The attempt failed (timeout, transport error, task failure).
     Error,
