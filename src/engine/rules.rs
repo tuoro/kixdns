@@ -728,6 +728,9 @@ pub(crate) async fn process_response_jump(
         // 取决于它沿跳转路径怎么来的，键里没有这一项：等在它条目上的请求可能还有余量。
         // 返回时守卫被丢弃，条目随之移除，等待者自己转发。
         if entering && remaining_jumps == 0 {
+            // 本地给的 SERVFAIL，日志记成 static，和请求阶段的跳转上限一样
+            // A local SERVFAIL, logged as static as at the request-phase jump limit
+            response.upstream = Some(Arc::from("static"));
             return engine_helpers::build_servfail_response(req);
         }
 
@@ -784,6 +787,7 @@ pub(crate) async fn process_response_jump(
             if let Decision::Jump { pipeline } = decision {
                 if local_jumps == 0 {
                     // See the jump limit above / 同上面的跳转上限
+                    response.upstream = Some(Arc::from("static"));
                     return engine_helpers::build_servfail_response(req);
                 }
                 pipeline_id = pipeline;
@@ -1160,6 +1164,7 @@ pub(crate) async fn process_response_jump(
                                 // A jump limit reached here is this request's own (see
                                 // the jump limit above) / 在这里到达的跳转上限只属于本请求（见上）
                                 if source == JUMP_LIMIT {
+                                    response.upstream = Some(Arc::from("static"));
                                     return Ok(bytes);
                                 }
                                 for g in &mut cleanup_guards {
