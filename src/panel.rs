@@ -56,6 +56,14 @@ const MAX_METRIC_KEY_BYTES: usize = 512;
 const MAX_CONFIG_BODY: usize = 4 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_DIAGNOSTIC_BODY: usize = 2 * 1024;
+/// 控制通道上请求头、请求正文各自最多等这么久，长连接上等下一个请求也算在请求头里。面板在同一台
+/// 机器上，每个请求一下子就发完；以前只发了一半就不动的连接会一直占着一个任务和一个句柄。
+/// How long the control socket waits for a request head, and again for a request
+/// body; on a keep-alive connection the wait for the next request counts as the
+/// head. The panel runs on the same host and sends each request at once; a
+/// connection that stopped half way used to hold a task and a descriptor for good.
+#[cfg(unix)]
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const QUERY_STATS_BUCKET_SECONDS: u64 = 3_600;
 const QUERY_STATS_BUCKETS: usize = 24;
 const QUERY_STATS_SHARDS: usize = 16;
@@ -1477,7 +1485,11 @@ pub async fn serve_admin(
         let metrics = Arc::clone(&metrics);
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
+            // hyper 只在装了 timer 时才执行 header_read_timeout（见 doh_server）
+            // hyper enforces header_read_timeout only with a timer installed (see doh_server)
             if let Err(error) = hyper::server::conn::http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(REQUEST_READ_TIMEOUT)
                 .serve_connection(
                     io,
                     service_fn(move |request| {
@@ -1749,14 +1761,44 @@ async fn run_diagnostic(
     )
 }
 
+/// 读请求正文为什么失败 / Why reading a request body failed
+#[cfg(unix)]
+enum BodyFailure {
+    TooLarge,
+    Unreadable,
+    /// [`REQUEST_READ_TIMEOUT`] 之内没发完 / Not finished within [`REQUEST_READ_TIMEOUT`]
+    Late,
+}
+
+/// 读请求正文，最多 `limit` 字节，最多等 [`REQUEST_READ_TIMEOUT`]
+/// Read a request body of at most `limit` bytes, waiting at most [`REQUEST_READ_TIMEOUT`]
+#[cfg(unix)]
+async fn collect_body(request: Request<Incoming>, limit: usize) -> Result<Bytes, BodyFailure> {
+    let body = Limited::new(request.into_body(), limit).collect();
+    match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
+        Ok(Ok(body)) => Ok(body.to_bytes()),
+        Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
+            Err(BodyFailure::TooLarge)
+        }
+        Ok(Err(_)) => Err(BodyFailure::Unreadable),
+        Err(_) => Err(BodyFailure::Late),
+    }
+}
+
+#[cfg(unix)]
+fn late_body_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::REQUEST_TIMEOUT,
+        error_json("request_body_late", "请求正文没有在 10 秒内发完"),
+    )
+}
+
 #[cfg(unix)]
 async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Response<Full<Bytes>> {
-    let body = match Limited::new(request.into_body(), MAX_DIAGNOSTIC_BODY)
-        .collect()
-        .await
-    {
-        Ok(body) => body.to_bytes(),
-        Err(_) => {
+    let body = match collect_body(request, MAX_DIAGNOSTIC_BODY).await {
+        Ok(body) => body,
+        Err(BodyFailure::Late) => return late_body_response(),
+        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
             return json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 error_json("diagnostic_body_invalid", "诊断请求不能超过 2 KiB"),
@@ -1811,12 +1853,10 @@ async fn diagnostic_trace_candidate(
     request: Request<Incoming>,
     engine: Engine,
 ) -> Response<Full<Bytes>> {
-    let body = match Limited::new(request.into_body(), MAX_TRIAL_BODY)
-        .collect()
-        .await
-    {
-        Ok(body) => body.to_bytes(),
-        Err(_) => {
+    let body = match collect_body(request, MAX_TRIAL_BODY).await {
+        Ok(body) => body,
+        Err(BodyFailure::Late) => return late_body_response(),
+        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
             return json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 error_json("diagnostic_body_invalid", "试跑请求不能超过 4 MiB"),
@@ -2097,20 +2137,18 @@ fn parse_querylog_query(query: Option<&str>) -> Result<(u64, usize), &'static st
 
 #[cfg(unix)]
 async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
-    let body = match Limited::new(request.into_body(), MAX_CONFIG_BODY)
-        .collect()
-        .await
-    {
-        Ok(body) => body.to_bytes(),
-        Err(error) => {
-            let message = if error.is::<http_body_util::LengthLimitError>() {
-                "配置不能超过 4 MiB".to_owned()
+    let body = match collect_body(request, MAX_CONFIG_BODY).await {
+        Ok(body) => body,
+        Err(BodyFailure::Late) => return late_body_response(),
+        Err(failure) => {
+            let message = if matches!(failure, BodyFailure::TooLarge) {
+                "配置不能超过 4 MiB"
             } else {
-                "读取配置请求失败".to_owned()
+                "读取配置请求失败"
             };
             return json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("config_body_invalid", &message),
+                error_json("config_body_invalid", message),
             );
         }
     };
