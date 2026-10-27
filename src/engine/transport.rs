@@ -613,6 +613,9 @@ pub struct TcpMuxClient {
 
 struct Pending {
     original_id: u16,
+    /// 写出去的帧（长度前缀加查询），回答到了用来比对问题
+    /// The frame that was written (length prefix plus query), for checking the answer's question
+    frame: Bytes,
     tx: oneshot::Sender<anyhow::Result<Bytes>>,
 }
 
@@ -830,7 +833,31 @@ impl TcpMuxClient {
                     continue;
                 }
                 let resp_id = u16::from_be_bytes([reusable_buf[0], reusable_buf[1]]);
-                if let Some((_, p)) = pending.remove(&resp_id) {
+                // RFC 5452 §9.1, as on UDP: a matching ID is not enough, the
+                // question has to match too. An answer to another question under
+                // this ID (a late answer to an earlier query that had the same ID,
+                // say) is dropped, and the query keeps waiting for its own.
+                // RFC 5452 §9.1，和 UDP 一样：ID 相符还不够，问题也要一致。这个 ID 下回答别的问题的
+                // （比如之前用过同一个 ID 的查询迟到的回答）丢掉，查询接着等自己的回答。
+                let matched = match pending.entry(resp_id) {
+                    entry::Entry::Occupied(e)
+                        if crate::proto_utils::question_matches(
+                            &e.get().frame[2..],
+                            &reusable_buf[..resp_len],
+                        ) =>
+                    {
+                        Some(e.remove())
+                    }
+                    entry::Entry::Occupied(_) => {
+                        warn!(target = "tcp_mux", upstream = %upstream, resp_id, "TCP response question mismatch, dropped");
+                        None
+                    }
+                    entry::Entry::Vacant(_) => {
+                        debug!(target = "tcp_mux", upstream = %upstream, resp_id, "response with unknown id");
+                        None
+                    }
+                };
+                if let Some(p) = matched {
                     let orig = p.original_id;
                     reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
                     // Copy it out and keep the buffer, as the UDP reader does
@@ -857,8 +884,6 @@ impl TcpMuxClient {
                             );
                         }
                     }
-                } else {
-                    debug!(target = "tcp_mux", upstream = %upstream, resp_id, "response with unknown id");
                 }
             }
         });
@@ -1336,14 +1361,23 @@ impl TcpMuxClient {
         Ok(())
     }
 
-    /// Rewrite DNS transaction ID and register in pending map atomically, returning BytesMut for efficient further operations
-    /// 原子操作：重写 DNS 事务 ID 并注册到 pending map，返回 BytesMut 以进行高效的后续操作
+    /// Rewrite DNS transaction ID and register in pending map atomically, returning the frame to write
+    /// 原子操作：重写 DNS 事务 ID 并注册到 pending map，返回要写出的帧
     async fn register_pending(
         &self,
         packet: &[u8],
         original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<(BytesMut, u16)> {
+    ) -> anyhow::Result<(Bytes, u16)> {
+        // Build complete TCP wire frame (2-byte length prefix + DNS message). Caller writes
+        // it directly without further copying, and the same buffer stays in the pending
+        // entry for the answer's question check, as on UDP.
+        // 构建完整 TCP wire frame（2 字节长度前缀 + DNS 消息）。调用方直接写入、无需二次拷贝；
+        // 同一份缓冲还留在 pending 条目里供应答比对问题，和 UDP 一样。
+        let mut frame = BytesMut::with_capacity(2 + packet.len());
+        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        frame.extend_from_slice(packet);
+
         // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
         // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
         let conn_guard = self.conn.lock().await;
@@ -1352,15 +1386,22 @@ impl TcpMuxClient {
         }
 
         let mut tries = 0;
-        let new_id = loop {
+        let (frame, new_id) = loop {
             let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
             tries += 1;
 
             // Use Entry API to check vacancy and insert atomically
             // 使用 Entry API 检查空位并原子插入
             if let entry::Entry::Vacant(e) = self.pending.entry(cand) {
-                e.insert(Pending { original_id, tx });
-                break cand;
+                // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
+                frame[2..4].copy_from_slice(&cand.to_be_bytes());
+                let frame = frame.freeze();
+                e.insert(Pending {
+                    original_id,
+                    frame: frame.clone(),
+                    tx,
+                });
+                break (frame, cand);
             }
 
             if tries > u16::MAX as usize {
@@ -1368,17 +1409,6 @@ impl TcpMuxClient {
             }
         };
         drop(conn_guard);
-
-        // Build complete TCP wire frame (2-byte length prefix + DNS message with rewritten ID).
-        // Caller writes this directly without further copying — saves one memcpy per request.
-        // 构建完整 TCP wire frame（2 字节长度前缀 + 改写 ID 后的 DNS 消息）。
-        // 调用方直接写入此帧，无需二次拷贝——每请求省一次 memcpy。
-        let mut frame = BytesMut::with_capacity(2 + packet.len());
-        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-        frame.extend_from_slice(packet);
-        let id_bytes = new_id.to_be_bytes();
-        frame[2] = id_bytes[0]; // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
-        frame[3] = id_bytes[1];
         Ok((frame, new_id))
     }
 
@@ -1431,10 +1461,10 @@ impl TcpMuxClient {
 // ===================== DoH (DNS over HTTPS) =====================
 
 /// Marker for an answer the server did send but that cannot be used: an HTTP
-/// error status, another media type, or a body longer than any DNS message. The
-/// connection itself is healthy, so retrying won't help (only transport-level
-/// errors indicate a possibly dead connection).
-/// 服务器回了、但用不了的回答的标记：HTTP 错误状态码、别的媒体类型，或者比任何 DNS 消息都长的正文。
+/// error status, another media type, a body longer than any DNS message, or an
+/// answer to another question. The connection itself is healthy, so retrying
+/// won't help (only transport-level errors indicate a possibly dead connection).
+/// 服务器回了、但用不了的回答的标记：HTTP 错误状态码、别的媒体类型、比任何 DNS 消息都长的正文，或者答的是别的问题。
 /// 连接本身正常，重试无益（只有传输层错误才指示连接可能已死）
 #[derive(Debug)]
 struct DohAnswerError(anyhow::Error);
@@ -1702,7 +1732,16 @@ impl DohClient {
                 )));
             }
 
-            read_doh_body(resp).await
+            let body = read_doh_body(resp).await?;
+            // RFC 5452 §9.1, as on the other transports: the answer has to be for
+            // this question
+            // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
+            if !crate::proto_utils::question_matches(packet, &body) {
+                return Err(doh_answer_error(
+                    "doh answer does not match the question".to_string(),
+                ));
+            }
+            Ok(body)
         })
         .await;
 
@@ -2148,7 +2187,31 @@ impl DotMuxClient {
                     continue;
                 }
                 let resp_id = u16::from_be_bytes([reusable_buf[0], reusable_buf[1]]);
-                if let Some((_, p)) = pending.remove(&resp_id) {
+                // RFC 5452 §9.1, as on UDP: a matching ID is not enough, the
+                // question has to match too. An answer to another question under
+                // this ID (a late answer to an earlier query that had the same ID,
+                // say) is dropped, and the query keeps waiting for its own.
+                // RFC 5452 §9.1，和 UDP 一样：ID 相符还不够，问题也要一致。这个 ID 下回答别的问题的
+                // （比如之前用过同一个 ID 的查询迟到的回答）丢掉，查询接着等自己的回答。
+                let matched = match pending.entry(resp_id) {
+                    entry::Entry::Occupied(e)
+                        if crate::proto_utils::question_matches(
+                            &e.get().frame[2..],
+                            &reusable_buf[..resp_len],
+                        ) =>
+                    {
+                        Some(e.remove())
+                    }
+                    entry::Entry::Occupied(_) => {
+                        warn!(target = "dot_mux", upstream = %upstream, resp_id, "DoT response question mismatch, dropped");
+                        None
+                    }
+                    entry::Entry::Vacant(_) => {
+                        debug!(target = "dot_mux", upstream = %upstream, resp_id, "dot response with unknown id");
+                        None
+                    }
+                };
+                if let Some(p) = matched {
                     let orig = p.original_id;
                     reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
                     // Copy it out and keep the buffer, as the UDP reader does
@@ -2163,8 +2226,6 @@ impl DotMuxClient {
                         response_len = resp_len,
                         "DoT response sent"
                     );
-                } else {
-                    debug!(target = "dot_mux", upstream = %upstream, resp_id, "dot response with unknown id");
                 }
             }
         });
@@ -2536,7 +2597,16 @@ impl DotMuxClient {
         packet: &[u8],
         original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<(BytesMut, u16)> {
+    ) -> anyhow::Result<(Bytes, u16)> {
+        // Build complete DoT wire frame (2-byte length prefix + DNS message). Caller writes
+        // it directly without further copying, and the same buffer stays in the pending
+        // entry for the answer's question check, as on UDP.
+        // 构建完整 DoT wire frame（2 字节长度前缀 + DNS 消息）。调用方直接写入、无需二次拷贝；
+        // 同一份缓冲还留在 pending 条目里供应答比对问题，和 UDP 一样。
+        let mut frame = BytesMut::with_capacity(2 + packet.len());
+        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        frame.extend_from_slice(packet);
+
         // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
         // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
         let conn_guard = self.conn.lock().await;
@@ -2545,29 +2615,25 @@ impl DotMuxClient {
         }
 
         let mut tries = 0;
-        let new_id = loop {
+        let (frame, new_id) = loop {
             let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
             tries += 1;
             if let entry::Entry::Vacant(e) = self.pending.entry(cand) {
-                e.insert(Pending { original_id, tx });
-                break cand;
+                // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
+                frame[2..4].copy_from_slice(&cand.to_be_bytes());
+                let frame = frame.freeze();
+                e.insert(Pending {
+                    original_id,
+                    frame: frame.clone(),
+                    tx,
+                });
+                break (frame, cand);
             }
             if tries > u16::MAX as usize {
                 anyhow::bail!("no available dns ids for dot mux");
             }
         };
         drop(conn_guard);
-
-        // Build complete DoT wire frame (2-byte length prefix + DNS message with rewritten ID).
-        // Caller writes this directly without further copying — saves one memcpy per request.
-        // 构建完整 DoT wire frame（2 字节长度前缀 + 改写 ID 后的 DNS 消息）。
-        // 调用方直接写入此帧，无需二次拷贝——每请求省一次 memcpy。
-        let mut frame = BytesMut::with_capacity(2 + packet.len());
-        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-        frame.extend_from_slice(packet);
-        let id_bytes = new_id.to_be_bytes();
-        frame[2] = id_bytes[0]; // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
-        frame[3] = id_bytes[1];
         Ok((frame, new_id))
     }
 
@@ -3199,6 +3265,14 @@ impl DoqMuxClient {
                     return Err(DoqFailure::Protocol(format!(
                         "doq DNS message too short: {msg_len} bytes"
                     )));
+                }
+                // RFC 5452 §9.1, as on the other transports: the answer has to be
+                // for this question
+                // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
+                if !crate::proto_utils::question_matches(packet, buf) {
+                    return Err(DoqFailure::Protocol(
+                        "doq answer does not match the question".to_string(),
+                    ));
                 }
                 // Restore original DNS Message ID in-place (Vec<u8> is mutable).
                 // Bytes::from(Vec) takes ownership of the heap allocation (zero-copy).
@@ -4664,6 +4738,7 @@ mod tests {
                 id,
                 Pending {
                     original_id: id,
+                    frame: Bytes::new(),
                     tx: oneshot::channel().0,
                 },
             );
@@ -5119,6 +5194,32 @@ mod tests {
         assert_eq!(*paths.lock().unwrap(), vec!["/dns-query".to_string()]);
     }
 
+    /// DoH 上一个查询只有一个回答：答的是别的问题就算失败，不交出去，也不重试。
+    /// Over DoH a query gets a single answer: one to another question fails the
+    /// query instead of being handed on, with no retry.
+    #[tokio::test]
+    async fn a_doh_answer_to_another_question_fails_the_query() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (addr, paths) = spawn_doh_upstream(|_, query| {
+            DohReply::Raw(http_ok(
+                Some(DOH_MEDIA_TYPE),
+                &udp_response_with_question(query, "other.example"),
+            ))
+        })
+        .await;
+        let client = DohClient::new(8, 0).expect("build doh client");
+        let err = client
+            .send(
+                &udp_test_query("swap.example"),
+                &format!("http://{addr}/dns-query"),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect_err("an answer to another question");
+        assert!(!is_transport_error(&err), "no retry: {err:#}");
+        assert_eq!(paths.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn doh_response_gets_the_query_id_back() {
         let query = [0x12, 0x34, 0x01, 0x00];
@@ -5195,6 +5296,8 @@ mod tests {
         Close,
         /// 一直不回答 / Never answer
         Silence,
+        /// 回答别的问题 / Answer another question
+        AnotherQuestion,
     }
 
     /// 本机 DoQ 上游：握手先压住 `accept_delay`；每条连接上第 n 个查询（从 0 数）按
@@ -5256,6 +5359,16 @@ mod tests {
                                     close();
                                     return;
                                 }
+                                DoqReply::AnotherQuestion => {
+                                    let other =
+                                        udp_response_with_question(&frame[2..], "other.example");
+                                    let _ =
+                                        send.write_all(&(other.len() as u16).to_be_bytes()).await;
+                                    let _ = send.write_all(&other).await;
+                                    let _ = send.finish();
+                                    let _ = send.stopped().await;
+                                    return;
+                                }
                                 DoqReply::Answer(delay) => delay,
                                 DoqReply::AnswerThenClose => Duration::ZERO,
                             };
@@ -5310,6 +5423,25 @@ mod tests {
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
         })
+    }
+
+    /// DoQ 上一个查询只有一个回答：答的是别的问题就算失败，不交出去。
+    /// Over DoQ a query gets a single answer: one to another question fails the
+    /// query instead of being handed on.
+    #[tokio::test]
+    async fn a_doq_answer_to_another_question_fails_the_query() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let addr =
+            spawn_doq_upstream(server, Duration::ZERO, |_, _| DoqReply::AnotherQuestion).await;
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        let err = client
+            .send(&udp_test_query("swap.example"), Duration::from_secs(2))
+            .await
+            .expect_err("an answer to another question");
+        assert!(
+            format!("{err:#}").contains("does not match the question"),
+            "{err:#}"
+        );
     }
 
     /// 阿里的 DoQ 服务器大约 10 秒就关掉空闲连接，比 15 秒一次的保活还短。池里那条已经
@@ -5438,12 +5570,24 @@ mod tests {
                 }
                 let writer = Arc::clone(&writer);
                 tokio::spawn(async move {
-                    let delay = match first_label(&frame).as_str() {
+                    let label = first_label(&frame);
+                    let delay = match label.as_str() {
                         "slow" => return,
                         "late" => Duration::from_millis(400),
                         "mid" => Duration::from_millis(100),
                         _ => Duration::ZERO,
                     };
+                    if label == "swap" {
+                        // 先在同一个 ID 下回一个别的问题的回答，过一会儿再回真正的
+                        // First an answer to another question under the same ID, the real one a moment later
+                        let other = udp_response_with_question(&frame, "other.example");
+                        let mut writer = writer.lock().await;
+                        let _ = writer.write_all(&(other.len() as u16).to_be_bytes()).await;
+                        let _ = writer.write_all(&other).await;
+                        let _ = writer.flush().await;
+                        drop(writer);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                     tokio::time::sleep(delay).await;
                     frame[2] |= 0x80;
                     let mut writer = writer.lock().await;
@@ -5520,6 +5664,31 @@ mod tests {
             Arc::new(client_tls),
             Arc::new(PermitManager::new(1)),
         )
+    }
+
+    /// 同一个 ID 下回答别的问题的不收，查询接着等自己的回答，和 UDP 一样。此前只按 ID 对号：
+    /// 连接上 ID 转了一圈以后，之前用过这个 ID 的查询迟到的回答会被交给现在的查询，还会进缓存。
+    /// An answer to another question under the same ID is dropped and the query
+    /// keeps waiting for its own, as on UDP. Answers used to be matched by ID only:
+    /// once the IDs on a connection had come round, a late answer to an earlier
+    /// query with that ID was handed to the current one, and cached.
+    async fn an_answer_to_another_question_is_dropped(client: &impl StreamMux) {
+        let query = udp_test_query("swap.example");
+        let answer = client
+            .query(&query, Duration::from_secs(2))
+            .await
+            .expect("the real answer follows");
+        assert_eq!(answer.as_ref(), udp_echo_response(&query).as_slice());
+    }
+
+    #[tokio::test]
+    async fn a_tcp_answer_to_another_question_is_dropped() {
+        an_answer_to_another_question_is_dropped(&tcp_test_client().await).await;
+    }
+
+    #[tokio::test]
+    async fn a_dot_answer_to_another_question_is_dropped() {
+        an_answer_to_another_question_is_dropped(&dot_test_client().await).await;
     }
 
     /// 一个查询超时、这条连接上又再没有回答时，连接会被重建。此前同一条连接上还在等
