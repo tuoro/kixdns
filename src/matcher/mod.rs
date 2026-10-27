@@ -62,6 +62,19 @@ impl TxtMatchMode {
 /// pipeline selectors and the response-phase `request_domain_suffix` all use this one comparison, so a
 /// rule found through an index and a rule checked one by one agree.
 #[inline]
+/// 配置里写的域名值，按名字文本的写法存（见 `proto_utils::name_text`）：转小写，去掉结尾的点。
+/// 名字文本不带结尾的点，写了点的值以前永远匹配不上。只有一个点的值保持原样。
+/// A domain value from the configuration, kept the way name text is written (see
+/// `proto_utils::name_text`): lowercased, without the trailing dot. Name text carries no
+/// trailing dot, so a value written with one used to match nothing. A lone dot stays as it is.
+pub(crate) fn domain_value(value: &str) -> Arc<str> {
+    let value = value.to_ascii_lowercase();
+    match value.strip_suffix('.') {
+        Some(head) if !head.is_empty() => Arc::from(head),
+        _ => Arc::from(value),
+    }
+}
+
 pub(crate) fn domain_suffix_matches(qname: &str, suffix: &str) -> bool {
     if suffix.is_empty() || suffix.starts_with('.') {
         return qname.ends_with(suffix);
@@ -770,6 +783,7 @@ pub enum RuntimePipelineSelectorMatcher {
     ListenerLabel { value: Arc<str> },
     ClientIp { net: IpNet },
     DomainSuffix { value: Arc<str> },
+    DomainExact { value: Arc<str> },
     DomainRegex { regex: Regex },
     Any,
     Qclass { value: DNSClass },
@@ -793,6 +807,9 @@ pub enum RuntimeResponseMatcher {
         value: Arc<str>,
     },
     RequestDomainSuffix {
+        value: Arc<str>,
+    },
+    RequestDomainExact {
         value: Arc<str>,
     },
     RequestDomainRegex {
@@ -1393,7 +1410,10 @@ impl RuntimeMatcher {
         Ok(match m {
             config::Matcher::Any => RuntimeMatcher::Any,
             config::Matcher::DomainSuffix { value } => RuntimeMatcher::DomainSuffix {
-                value: Arc::from(value.to_ascii_lowercase()),
+                value: domain_value(&value),
+            },
+            config::Matcher::DomainExact { value } => RuntimeMatcher::DomainExact {
+                value: domain_value(&value),
             },
             config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp {
                 net: client_net(&cidr)?,
@@ -1568,7 +1588,12 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::DomainSuffix { value } => {
                 RuntimePipelineSelectorMatcher::DomainSuffix {
-                    value: Arc::from(value.to_ascii_lowercase()),
+                    value: domain_value(&value),
+                }
+            }
+            config::PipelineSelectorMatcher::DomainExact { value } => {
+                RuntimePipelineSelectorMatcher::DomainExact {
+                    value: domain_value(&value),
                 }
             }
             config::PipelineSelectorMatcher::DomainRegex { value } => {
@@ -1686,6 +1711,9 @@ impl RuntimePipelineSelectorMatcher {
             RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
                 domain_suffix_matches(qname, value)
             }
+            RuntimePipelineSelectorMatcher::DomainExact { value } => {
+                qname.eq_ignore_ascii_case(value)
+            }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
             RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
@@ -1737,6 +1765,9 @@ impl RuntimePipelineSelectorMatcher {
             RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
                 domain_suffix_matches(qname, value)
+            }
+            RuntimePipelineSelectorMatcher::DomainExact { value } => {
+                qname.eq_ignore_ascii_case(value)
             }
             RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimePipelineSelectorMatcher::Any => true,
@@ -1853,7 +1884,12 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::RequestDomainSuffix { value } => {
                 RuntimeResponseMatcher::RequestDomainSuffix {
-                    value: Arc::from(value.to_ascii_lowercase()),
+                    value: domain_value(&value),
+                }
+            }
+            config::ResponseMatcher::RequestDomainExact { value } => {
+                RuntimeResponseMatcher::RequestDomainExact {
+                    value: domain_value(&value),
                 }
             }
             config::ResponseMatcher::RequestDomainRegex { value } => {
@@ -1981,6 +2017,9 @@ impl RuntimeResponseMatcher {
             RuntimeResponseMatcher::UpstreamEquals { value } => upstream == value.as_ref(),
             RuntimeResponseMatcher::RequestDomainSuffix { value } => {
                 domain_suffix_matches(qname, value)
+            }
+            RuntimeResponseMatcher::RequestDomainExact { value } => {
+                qname.eq_ignore_ascii_case(value)
             }
             RuntimeResponseMatcher::RequestDomainRegex { regex } => regex.is_match(qname),
             RuntimeResponseMatcher::ResponseUpstreamIp { nets } => try_parse_upstream_ip(upstream)
