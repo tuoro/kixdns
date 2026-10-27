@@ -608,20 +608,12 @@ impl Engine {
     /// Return Ok(Some(bytes)) means cache hit, can return directly / 返回 Ok(Some(bytes)) 表示缓存命中，可直接返回
     /// Return Ok(None) means async processing needed (upstream forwarding) / 返回 Ok(None) 表示需要异步处理（上游转发）
     /// Return Err means parsing error / 返回 Err 表示解析错误
+    /// Every answer goes back with what it copies from the query as the client wrote it
+    /// (see `proto_utils::reply_as_asked`), and the observer is lent that same answer
+    /// 每个回答照抄查询的部分都照客户端的写法发回（见 `proto_utils::reply_as_asked`），出借给
+    /// 观察者的也是这同一份
     #[inline]
     pub fn handle_packet_fast(
-        &self,
-        packet: &[u8],
-        peer: SocketAddr,
-    ) -> anyhow::Result<Option<FastPathResponse>> {
-        // Whatever answers, the question goes back as the client wrote it
-        // 不论谁作答，问题都照客户端的写法发回
-        Ok(self
-            .answer_fast(packet, peer)?
-            .map(|response| response.for_query(packet)))
-    }
-
-    fn answer_fast(
         &self,
         packet: &[u8],
         peer: SocketAddr,
@@ -663,8 +655,10 @@ impl Engine {
         // RFC 6891 section 6.1.3: an unsupported EDNS version is answered BADVERS rather
         // than as if it were version 0
         if q.edns_version != 0 {
-            let reply =
-                crate::proto_utils::badvers_response(packet).context("build BADVERS response")?;
+            let reply = crate::proto_utils::reply_as_asked(
+                crate::proto_utils::badvers_response(packet).context("build BADVERS response")?,
+                packet,
+            );
             if let Some((observer, start)) = observed {
                 let ctx = self.fast_path_context(peer, qname_str, qtype, qclass);
                 observer.request_started(&ctx);
@@ -805,17 +799,25 @@ impl Engine {
                 self.incr_fastpath_hits();
                 // A client that sent ECS gets the echo of its own subnet, built here
                 // (see `phases::served_from_cache`); the rest get the stored bytes,
-                // which carry no ECS, and the listener ages them
+                // which carry no ECS, and the listener ages them. Either way the
+                // answer is shaped as this client asked
                 // 带了 ECS 的客户端在这里拿到回显它自己子网的应答（见
-                // `phases::served_from_cache`）；其余的拿到存着的字节（不带 ECS），由监听器修正 TTL
-                let echoed = q.client_subnet.map(|_| {
-                    phases::served_from_cache(
-                        &hit,
-                        q.tx_id,
-                        &view,
-                        phases::ServedTtl::Elapsed(elapsed_secs),
-                    )
-                });
+                // `phases::served_from_cache`）；其余的拿到存着的字节（不带 ECS），由监听器修正
+                // TTL。两种都按这个客户端问的样子规整
+                let echoed = q.client_subnet.is_some();
+                let reply = crate::proto_utils::reply_as_asked(
+                    if echoed {
+                        phases::served_from_cache(
+                            &hit,
+                            q.tx_id,
+                            &view,
+                            phases::ServedTtl::Elapsed(elapsed_secs),
+                        )
+                    } else {
+                        hit.bytes.clone()
+                    },
+                    packet,
+                );
                 if let Some((observer, start)) = observed {
                     self.observe_fast_path(
                         observer,
@@ -827,7 +829,7 @@ impl Engine {
                             elapsed_secs,
                             source: cached_source(hit.upstream.as_deref()),
                         },
-                        Ok(echoed.as_ref().unwrap_or(&hit.bytes)),
+                        Ok(&reply),
                     );
                 }
                 let mut log = ResponseLog::new(
@@ -841,14 +843,15 @@ impl Engine {
                 log.info.cache_hit = true;
                 log.info.upstream =
                     Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
-                log.answered(&hit.bytes);
-                return Ok(Some(match echoed {
-                    Some(reply) => FastPathResponse::Direct(reply),
-                    None => FastPathResponse::CacheHit {
-                        cached: hit.bytes.clone(),
+                log.answered(&reply);
+                return Ok(Some(if echoed {
+                    FastPathResponse::Direct(reply)
+                } else {
+                    FastPathResponse::CacheHit {
+                        cached: reply,
                         tx_id: q.tx_id,
                         inserted_at: hit.inserted_at,
-                    },
+                    }
                 }));
             }
         }
@@ -874,7 +877,12 @@ impl Engine {
                 let built = build_fast_static_response(
                     q.tx_id, qname_str, q.qtype, q.qclass, rcode, &answers,
                 )
-                .map(|reply| fast_client_reply(reply, q.client_subnet.as_ref()));
+                .map(|reply| {
+                    crate::proto_utils::reply_as_asked(
+                        fast_client_reply(reply, q.client_subnet.as_ref()),
+                        packet,
+                    )
+                });
                 if let Some((observer, start)) = observed {
                     self.observe_fast_path(
                         observer,
@@ -938,7 +946,12 @@ impl Engine {
                     let built = build_fast_static_response(
                         q.tx_id, qname_str, q.qtype, q.qclass, *rcode, answers,
                     )
-                    .map(|reply| fast_client_reply(reply, q.client_subnet.as_ref()));
+                    .map(|reply| {
+                        crate::proto_utils::reply_as_asked(
+                            fast_client_reply(reply, q.client_subnet.as_ref()),
+                            packet,
+                        )
+                    });
                     if let Some((observer, start)) = observed {
                         self.observe_fast_path(
                             observer,
@@ -1894,17 +1907,17 @@ impl Engine {
         if let (Some(target), Ok(_)) = (&refresh, &result) {
             self.settle_refresh(target, &trail, qname_ref, u16::from(qtype), flags);
         }
-        // Every reply leaves with the ECS option its client should see and its question
-        // as the client wrote it; waiters were handed the reply before this and do the
-        // same for their own clients
-        // 每个应答都带着它的客户端该看到的 ECS 选项、照客户端写法的问题离开；等待者在这之前
-        // 拿到应答，各自为自己的客户端做同样的处理
+        // Every reply leaves with the ECS option its client should see, and with what it
+        // copies from the query as the client wrote it (see `proto_utils::reply_as_asked`);
+        // waiters were handed the reply before this and do the same for their own clients
+        // 每个应答都带着它的客户端该看到的 ECS 选项、照客户端写法的照抄部分离开（见
+        // `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的处理
         let result = if skip_cache {
             result
         } else {
             let at_least = echo_floor.max(trail.echo_scope(&requester.ecs_view()));
             result.map(|bytes| {
-                crate::proto_utils::question_as_asked(
+                crate::proto_utils::reply_as_asked(
                     phases::client_reply(bytes, client_ecs.as_ref(), at_least),
                     packet,
                 )

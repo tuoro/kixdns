@@ -96,7 +96,9 @@ pub mod engine_helpers {
             return None;
         }
 
-        build_servfail_response(&request_message).ok()
+        build_servfail_response(&request_message)
+            .ok()
+            .map(|reply| crate::proto_utils::reply_as_asked(reply, request))
     }
 
     /// Build a SERVFAIL response directly from a DNS wire request.
@@ -128,7 +130,10 @@ pub mod engine_helpers {
             return header_only(request);
         };
 
-        build_servfail_response(&request_message).unwrap_or_else(|_| header_only(request))
+        build_servfail_response(&request_message).map_or_else(
+            |_| header_only(request),
+            |reply| crate::proto_utils::reply_as_asked(reply, request),
+        )
     }
 
     /// 快速构建错误响应（ServFail），避免解析完整请求

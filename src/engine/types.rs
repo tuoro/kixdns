@@ -240,29 +240,6 @@ pub enum FastPathResponse {
     },
 }
 
-impl FastPathResponse {
-    /// 同一个回答，问题名照 `query` 的写法（见 `proto_utils::question_as_asked`）
-    /// The same answer with its question name as `query` wrote it (see
-    /// `proto_utils::question_as_asked`)
-    pub(crate) fn for_query(self, query: &[u8]) -> Self {
-        match self {
-            Self::Direct(reply) => {
-                Self::Direct(crate::proto_utils::question_as_asked(reply, query))
-            }
-            Self::CacheHit {
-                cached,
-                tx_id,
-                inserted_at,
-            } => Self::CacheHit {
-                cached: crate::proto_utils::question_as_asked(cached, query),
-                tx_id,
-                inserted_at,
-            },
-            async_needed @ Self::AsyncNeeded { .. } => async_needed,
-        }
-    }
-}
-
 pub struct EngineInner {
     pub pipeline: RuntimePipelineConfig,
     pub compiled_pipelines: Vec<CompiledPipeline>,
