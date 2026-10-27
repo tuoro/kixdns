@@ -165,6 +165,13 @@ pub struct ParsedGeoIp {
     source: &'static str,
 }
 
+impl ParsedGeoIp {
+    /// 解析出的标签数（只解析了规则用到的那些）/ How many tags were parsed (only those rules use are)
+    pub fn tag_count(&self) -> usize {
+        self.tag_indexes.len()
+    }
+}
+
 pub struct GeoIpManager {
     /// MaxMind DB 和它每条数据记录的国家代码 / The MaxMind DB and the country code of each of its data records
     mmdb: Option<Mmdb>,
@@ -665,6 +672,11 @@ impl GeoIpManager {
     /// of geosite's per-source bookkeeping applies here: both loaders already
     /// replace wholesale and a failed parse leaves the manager untouched, so
     /// failure atomicity was never the gap.
+    /// 数据文件给出的标签数（只算规则用到的那些）/ How many tags the data file gives (only those rules use)
+    pub fn tag_count(&self) -> usize {
+        self.tag_indexes.len()
+    }
+
     pub fn apply_parsed(&mut self, parsed: ParsedGeoIp) -> usize {
         self.tag_indexes = parsed.tag_indexes;
 

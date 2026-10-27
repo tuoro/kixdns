@@ -218,6 +218,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 入站监听器行为：
 
 - 只处理标准单 question 的 QUERY 消息。畸形包、非 QUERY opcode 和 DNS 响应包会被静默丢弃。
+- EDNS 版本不是 0 的查询回 BADVERS（RFC 6891 第 6.1.3 节），回答里的 OPT 写版本 0。
 - 监听器处理错误、整体请求超时或流控 permit 耗尽时，对合法查询返回 SERVFAIL。
 - 大于客户端声明大小（EDNS 载荷大小；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试。
 - 双栈套接字（例如监听 `[::]` 的入站 DoH）把 IPv4 客户端报成 `::ffff:a.b.c.d`。规则、GeoIP、ECS 和缓存都按它背后的 IPv4 地址判断，client_ip 照常写 IPv4 网段；写成 `::ffff:a.b.c.d/n` 的网段按它所指的 IPv4 网段处理。
@@ -410,4 +411,4 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 重载后，配置里不再出现的上游会关闭它们的 TCP、DoT、DoQ 连接；正在使用这些连接的请求处理完之后才会关闭。
 
-geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只读入规则（geoip_country、response_answer_ip_geoip_country）用到的国家代码和标签（见上文 GeoIP 数据源与标签），不读的文件也不监控。热加载改变了规则用到的 GeoSite 或 GeoIP 标签，或这几个文件路径时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。
+geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只读入规则（geoip_country、response_answer_ip_geoip_country）用到的国家代码和标签（见上文 GeoIP 数据源与标签），不读的文件也不监控。热加载改变了规则用到的 GeoSite 或 GeoIP 标签，或这几个文件路径时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。被监控的文件重新读出来以后，规则用到的标签一个都没有了、而它此前提供过（比如下载失败留下的空文件），这次不替换，正在用的数据保留到文件下次改动。规则用到、却没有一个 GeoSite 数据文件提供的标签会记一条告警，和 GeoIP 一样。
