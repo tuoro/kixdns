@@ -603,17 +603,13 @@ impl GeoIpManager {
                     4 => {
                         let mut ip_bytes = [0u8; 4];
                         ip_bytes.copy_from_slice(&cidr.ip);
-                        let start = u32::from_be_bytes(ip_bytes);
-                        let end = if cidr.prefix >= 32 {
-                            // /32 或异常前缀按单 IP 处理
-                            start
-                        } else if cidr.prefix == 0 {
-                            // /0 表示整个 IPv4 空间
-                            u32::MAX
-                        } else {
-                            let host_count = 1u32.wrapping_shl(32 - cidr.prefix);
-                            start.saturating_add(host_count).saturating_sub(1)
-                        };
+                        // 地址里的主机位清掉（1.2.3.4/24 就是 1.2.3.0/24）；超过 32 的前缀按单个
+                        // 地址算，/0 是整个 IPv4 空间
+                        // Host bits in the address are cleared (1.2.3.4/24 is 1.2.3.0/24); a
+                        // prefix over 32 is one address, /0 the whole IPv4 space
+                        let mask = u32::MAX.checked_shl(32 - cidr.prefix.min(32)).unwrap_or(0);
+                        let start = u32::from_be_bytes(ip_bytes) & mask;
+                        let end = start | !mask;
                         get_or_insert_tag_index(&mut tag_indexes, &country_code)
                             .ipv4_ranges
                             .push(Ipv4Range { start, end });
@@ -623,15 +619,12 @@ impl GeoIpManager {
                     16 => {
                         let mut ip_bytes = [0u8; 16];
                         ip_bytes.copy_from_slice(&cidr.ip);
-                        let start = u128::from_be_bytes(ip_bytes);
-                        let end = if cidr.prefix >= 128 {
-                            start
-                        } else if cidr.prefix == 0 {
-                            u128::MAX
-                        } else {
-                            let host_count = 1u128.wrapping_shl(128 - cidr.prefix);
-                            start.saturating_add(host_count).saturating_sub(1)
-                        };
+                        // 同上 / As above
+                        let mask = u128::MAX
+                            .checked_shl(128 - cidr.prefix.min(128))
+                            .unwrap_or(0);
+                        let start = u128::from_be_bytes(ip_bytes) & mask;
+                        let end = start | !mask;
                         get_or_insert_tag_index(&mut tag_indexes, &country_code)
                             .ipv6_ranges
                             .push(Ipv6Range { start, end });
@@ -1047,6 +1040,59 @@ mod tests {
         assert_eq!(mgr.lookup(v4ip).country_code.as_deref(), Some("CN"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// .dat 里带主机位的网段（1.2.3.4/24）按它所在的整个网段算：主机位清掉，不往后错位
+    /// A .dat CIDR with host bits set (1.2.3.4/24) stands for its whole network: the host
+    /// bits are cleared rather than shifting the range
+    #[test]
+    fn a_dat_cidr_with_host_bits_covers_its_network() {
+        let mut v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        v6[15] = 1;
+        let dat = build_dat("CN", Some(([1, 2, 3, 4], 24)), Some((v6, 32)));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geoip.dat");
+        std::fs::write(&path, &dat).unwrap();
+        let mut mgr = GeoIpManager::new(None).unwrap();
+        mgr.load_from_dat_file(&path).unwrap();
+
+        for inside in [
+            "1.2.3.0",
+            "1.2.3.1",
+            "1.2.3.255",
+            "2001:db8::",
+            "2001:db8:ffff::1",
+        ] {
+            assert!(mgr.matches_tag(inside.parse().unwrap(), "CN"), "{inside}");
+        }
+        for outside in ["1.2.2.255", "1.2.4.0", "1.2.4.3", "2001:db9::"] {
+            assert!(
+                !mgr.matches_tag(outside.parse().unwrap(), "CN"),
+                "{outside}"
+            );
+        }
+    }
+
+    /// JSON 里写成小写的国家代码，转换成 MMDB 时照样认得过滤条件里的大写代码
+    /// A country code the JSON writes in lowercase still meets the filter's uppercase code
+    /// when converting to MMDB
+    #[test]
+    fn a_lowercase_json_country_passes_the_conversion_filter() {
+        let json = r#"{ "entries": [
+            { "country_code": "cn", "ips": ["198.51.100.0/24"] },
+            { "country_code": "jp", "ips": ["203.0.113.0/24"] }
+        ] }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("geoip.json");
+        let mmdb = dir.path().join("geoip.mmdb");
+        std::fs::write(&source, json).unwrap();
+        let stats =
+            GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, Some(&["CN".to_string()])).unwrap();
+        assert_eq!(stats.countries_count, 1);
+
+        let mgr = GeoIpManager::new(Some(mmdb.to_string_lossy().into_owned())).unwrap();
+        assert!(mgr.matches_tag("198.51.100.7".parse().unwrap(), "CN"));
+        assert!(!mgr.matches_tag("203.0.113.7".parse().unwrap(), "JP"));
     }
 
     #[test]

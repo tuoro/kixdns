@@ -181,15 +181,19 @@ impl DomainMatcher {
                 }
             }
             DomainMatcher::Keyword(keyword) => {
-                // 智能检查：先看是否需要转换 / Smart check: see if conversion is needed
-                if domain.bytes().all(|b| !b.is_ascii_uppercase()) {
-                    // domain 已经是小写，零分配比较 / domain already lowercase, zero-allocation
-                    domain.contains(keyword)
-                } else {
-                    // 需要转换 / Need conversion
+                // 两边都没有大写时零分配比较，否则都转小写，和 Suffix 一样
+                // With no capitals on either side compare without allocating, otherwise
+                // lowercase both, as for Suffix
+                if domain
+                    .bytes()
+                    .chain(keyword.bytes())
+                    .any(|b| b.is_ascii_uppercase())
+                {
                     domain
                         .to_ascii_lowercase()
                         .contains(&keyword.to_ascii_lowercase())
+                } else {
+                    domain.contains(keyword.as_str())
                 }
             }
             DomainMatcher::Regex(regex) => regex.is_match(domain),
@@ -532,7 +536,12 @@ impl TagBuilder {
                 }
             }
             DomainMatcher::Regex(regex) => self.regexes.push(regex.as_str().to_owned()),
-            DomainMatcher::Keyword(_) => tag.others.push(matcher),
+            // 请求名是小写的，keyword 也存成小写，数据文件里写成大写的才命中得了
+            // Request names are lowercase, so the keyword is stored lowercase too, or one
+            // the data file writes in capitals never matches
+            DomainMatcher::Keyword(keyword) => tag
+                .others
+                .push(DomainMatcher::Keyword(keyword.to_ascii_lowercase())),
         }
     }
 
@@ -952,16 +961,15 @@ impl DatReader {
 
     /// 和 [`parse_varint`] 一样读一个变长整数 / Reads a varint as [`parse_varint`] does
     fn varint(&mut self) -> anyhow::Result<usize> {
-        let mut result = 0usize;
-        let mut shift = 0;
-        loop {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
             let byte = self.next_byte()?;
-            result |= ((byte & 0x7F) as usize) << shift;
-            shift += 7;
+            value |= u64::from(byte & 0x7F) << shift;
             if byte & 0x80 == 0 {
-                return Ok(result);
+                return varint_len(value);
             }
         }
+        anyhow::bail!("invalid varint in .dat file")
     }
 
     /// 接下来的 `len` 个字节，读进 `buf` / The next `len` bytes, read into `buf`
@@ -982,24 +990,27 @@ impl DatReader {
     }
 }
 
+/// 读一个变长整数：最多 10 个字节，多了就是坏文件 / Reads a varint: 10 bytes at most,
+/// more means a broken file
 fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
-    let mut result = 0usize;
-    let mut shift = 0;
-
-    loop {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
         if *pos >= data.len() {
             anyhow::bail!("unexpected end of file");
         }
         let byte = data[*pos];
         *pos += 1;
-        result |= ((byte & 0x7F) as usize) << shift;
-        shift += 7;
+        value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
-            break;
+            return varint_len(value);
         }
     }
+    anyhow::bail!("invalid varint in .dat file")
+}
 
-    Ok(result)
+/// 变长整数当作长度或位置用 / A varint used as a length or position
+fn varint_len(value: u64) -> anyhow::Result<usize> {
+    usize::try_from(value).context("varint in .dat file too large")
 }
 
 impl GeoSiteManager {
@@ -2958,5 +2969,38 @@ mod tests {
             assert!(regexes.is_match(&format!("cdn.ad{i}x.example.com")), "{i}");
         }
         assert!(!regexes.is_match(&format!("cdn.ad{count}x.example.com")));
+    }
+
+    /// 数据文件里写成大写的 keyword 照样命中：请求名是小写的，keyword 也得是小写。按需加载和全部加载
+    /// 都是这样。
+    /// A keyword the data file writes in capitals still matches: request names are lowercase,
+    /// so the keyword has to be too. Both selective and full loading read it so.
+    #[test]
+    fn a_keyword_written_in_capitals_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(&dir, &[build_geosite("K", &[encode_str(2, "GooGle")])]);
+
+        let parsed = GeoSiteManager::parse_dat_file_selective(&path, &["k".to_string()]).unwrap();
+        assert!(parsed[0].1.matches("www.google.com"));
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+        assert!(manager.matches("k", "www.google.com"));
+        assert!(!manager.matches("k", "www.example.com"));
+    }
+
+    /// 超过 10 个字节的变长整数是坏文件，按需加载和全部加载都报错，不读出一个错位的长度
+    /// A varint longer than 10 bytes means a broken file: both selective and full loading
+    /// refuse it rather than read a length out of it
+    #[test]
+    fn a_varint_too_long_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geosite.dat");
+        let mut data = vec![0x0A];
+        data.extend([0xFF; 11]);
+        data.push(0x01);
+        std::fs::write(&path, data).unwrap();
+        assert!(GeoSiteManager::parse_dat_file(&path).is_err());
+        assert!(GeoSiteManager::parse_dat_file_selective(&path, &["x".to_string()]).is_err());
     }
 }
