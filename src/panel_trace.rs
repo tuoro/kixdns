@@ -113,16 +113,23 @@ pub fn record_decision(event: &DecisionMade<'_>) {
             transport,
         } => {
             let rule = event.rule.unwrap_or("default");
+            // 没有统一的传输时由各地址的前缀定，上游那一步再写每次尝试自己的传输
+            // Without one transport for all, each address's prefix decides, and the
+            // upstream step names each attempt's own
+            let transport = transport.map(crate::panel::transport_label);
             let _ = TRACE.try_with(|trace| {
                 let mut trace = trace.borrow_mut();
                 trace.decision_rule = Some(rule.to_owned());
-                trace.decision_transport = Some(format!("{transport:?}"));
+                trace.decision_transport = transport.map(str::to_owned);
             });
             record(
                 "decision",
                 "selected",
                 format!("规则 {rule} 转发"),
-                Some(format!("目标：{upstream}；传输：{transport:?}")),
+                Some(format!(
+                    "目标：{upstream}；传输：{}",
+                    transport.unwrap_or("按各地址的前缀")
+                )),
             )
         }
         DecisionDetail::Jump { pipeline } => record(
@@ -220,5 +227,48 @@ mod tests {
         assert_eq!(value, 7);
         assert_eq!(steps.len(), MAX_STEPS);
         assert!(truncated);
+    }
+
+    /// 转发决策的传输写成面板的名字（udp、tcp……），不是 `Some(Udp)`；按各地址的前缀定传输时照实说，
+    /// 上游那一步再用每次尝试自己的传输
+    /// A forward decision names its transport as the panel does (udp, tcp…), not
+    /// `Some(Udp)`; when each address's prefix decides, it says so, and the upstream step
+    /// takes each attempt's own transport
+    #[tokio::test]
+    async fn a_forward_decision_names_its_transport_plainly() {
+        use crate::config::Transport;
+        use crate::observe::{DecisionDetail, DecisionMade, RulePhase};
+        let ((), steps, _) = capture(async {
+            for transport in [Some(Transport::Udp), Some(Transport::TcpUdp), None] {
+                super::record_decision(&DecisionMade {
+                    pipeline: "main",
+                    rule: Some("r"),
+                    phase: RulePhase::Request,
+                    detail: DecisionDetail::Forward {
+                        upstream: "192.0.2.1:53",
+                        transport,
+                    },
+                });
+                let (_, decided) = super::current_decision();
+                record("check", "decided", decided.unwrap_or_default(), None);
+            }
+        })
+        .await;
+        let details: Vec<_> = steps.iter().map(|step| step.detail.as_deref()).collect();
+        let labels: Vec<_> = steps.iter().map(|step| step.label.as_str()).collect();
+        assert_eq!(
+            details,
+            [
+                Some("目标：192.0.2.1:53；传输：udp"),
+                None,
+                Some("目标：192.0.2.1:53；传输：tcp_udp"),
+                None,
+                Some("目标：192.0.2.1:53；传输：按各地址的前缀"),
+                None,
+            ]
+        );
+        assert_eq!(labels[1], "udp");
+        assert_eq!(labels[3], "tcp_udp");
+        assert_eq!(labels[5], "");
     }
 }
