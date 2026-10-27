@@ -11,6 +11,8 @@ mod geo;
 #[cfg(test)]
 mod geo_reload_tests;
 pub mod matcher_adapter;
+#[cfg(test)]
+mod name_text_tests;
 pub(crate) mod observation;
 pub mod phases;
 pub mod pipeline;

@@ -25,7 +25,8 @@ pub(crate) fn build_fast_static_response(
     msg.metadata.response_code = rcode;
 
     // Build question from quick parse data
-    let name = Name::from_str(qname)?;
+    let name = crate::proto_utils::name_from_text(qname)
+        .ok_or_else(|| anyhow::anyhow!("query name text {qname:?}"))?;
     let mut query = Query::new();
     query.set_name(name);
     query.set_query_type(hickory_proto::rr::RecordType::from(qtype));
@@ -50,7 +51,7 @@ pub(crate) fn make_static_ip_answer(
     qtype: RecordType,
     ips: &str,
 ) -> (ResponseCode, Vec<Record>) {
-    let Ok(name) = Name::from_str(qname) else {
+    let Some(name) = crate::proto_utils::name_from_text(qname) else {
         return (ResponseCode::ServFail, Vec::new());
     };
 
@@ -116,7 +117,10 @@ pub(crate) fn make_static_cname_answer(
     target: &str,
     ttl: u32,
 ) -> (ResponseCode, Vec<Record>) {
-    let (Ok(name), Some(target)) = (Name::from_str(qname), static_cname_target(target)) else {
+    let (Some(name), Some(target)) = (
+        crate::proto_utils::name_from_text(qname),
+        static_cname_target(target),
+    ) else {
         return (ResponseCode::ServFail, Vec::new());
     };
 
@@ -140,7 +144,7 @@ pub(crate) fn make_static_txt_answer(
         return (ResponseCode::ServFail, Vec::new());
     }
 
-    if let Ok(name) = Name::from_str(qname) {
+    if let Some(name) = crate::proto_utils::name_from_text(qname) {
         let txt = TXT::new(text.to_vec());
         let record = Record::from_rdata(name, ttl, RData::TXT(txt));
         return (ResponseCode::NoError, vec![record]);

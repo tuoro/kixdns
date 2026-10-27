@@ -3,10 +3,9 @@ use crate::matcher::RuntimePipelineConfig;
 use bytes::Bytes;
 use dashmap::DashSet;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::rr::{DNSClass, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 use rustc_hash::FxHashSet;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -147,7 +146,8 @@ pub mod engine_helpers {
         msg.metadata.recursion_desired = rd;
         msg.metadata.recursion_available = true;
 
-        let name = Name::from_str(qname)?;
+        let name = crate::proto_utils::name_from_text(qname)
+            .ok_or_else(|| anyhow::anyhow!("query name text {qname:?}"))?;
         let mut query = Query::new();
         query.set_name(name);
         query.set_query_type(RecordType::from(qtype));

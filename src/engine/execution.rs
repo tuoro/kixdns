@@ -1195,9 +1195,8 @@ impl Engine {
                     let req = Message::from_bytes(packet).context("parse request")?;
                     let question = req.queries.first().context("empty question")?;
                     (
-                        // Name::to_lowercase() returns Name, .to_string() converts to String
-                        // Name::to_lowercase() 返回 Name，.to_string() 转换为 String
-                        std::borrow::Cow::Owned(question.name().to_lowercase().to_string()),
+                        // The text parse_quick would have built / parse_quick 会拼出的同一段文本
+                        std::borrow::Cow::Owned(crate::proto_utils::name_text(question.name())),
                         question.query_type(),
                         question.query_class(),
                         req.metadata.id,
