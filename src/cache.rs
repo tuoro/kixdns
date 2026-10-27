@@ -48,14 +48,6 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
-    /// Derive source label from upstream field / 从 upstream 字段推导来源标签
-    pub fn source(&self) -> &str {
-        match &self.upstream {
-            Some(u) => u.as_ref(),
-            None => "static",
-        }
-    }
-
     /// Build a cache entry from a DNS response and its cache/refresh TTLs.
     pub fn from_response(
         bytes: Bytes,

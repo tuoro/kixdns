@@ -47,44 +47,6 @@ pub struct V2RayGeoIPList {
     pub entries: Vec<V2RayGeoIP>,
 }
 
-/// IP 段（用于快速匹配）/ IP range for fast matching
-#[derive(Debug, Clone)]
-pub struct IpRange {
-    /// 起始 IP 地址 / Start IP address
-    pub start: u32,
-    /// 结束 IP 地址 / End IP address
-    pub end: u32,
-    /// 国家代码 / Country code
-    pub country_code: String,
-}
-
-impl IpRange {
-    /// 检查 IP 是否在范围内 / Check if IP is in range
-    #[inline]
-    pub fn contains(&self, ip: u32) -> bool {
-        ip >= self.start && ip <= self.end
-    }
-}
-
-/// IPv6 段（用于快速匹配）/ IPv6 range for fast matching
-#[derive(Debug, Clone)]
-pub struct IpRangeV6 {
-    /// 起始 IP 地址（u128 大端序）/ Start IP address (u128 big-endian)
-    pub start: u128,
-    /// 结束 IP 地址（u128 大端序）/ End IP address (u128 big-endian)
-    pub end: u128,
-    /// 国家代码 / Country code
-    pub country_code: String,
-}
-
-impl IpRangeV6 {
-    /// 检查 IPv6 是否在范围内 / Check if IPv6 is in range
-    #[inline]
-    pub fn contains(&self, ip: u128) -> bool {
-        ip >= self.start && ip <= self.end
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct Ipv4Range {
     start: u32,
@@ -101,18 +63,10 @@ struct Ipv6Range {
 struct GeoIpTagIndex {
     ipv4_ranges: Vec<Ipv4Range>,
     ipv6_ranges: Vec<Ipv6Range>,
-    raw_ipv4_ranges: Vec<Ipv4Range>,
-    raw_ipv6_ranges: Vec<Ipv6Range>,
 }
 
 impl GeoIpTagIndex {
     fn finalize(&mut self) {
-        self.raw_ipv4_ranges = self.ipv4_ranges.clone();
-        self.raw_ipv4_ranges
-            .sort_unstable_by_key(|range| range.start);
-        self.raw_ipv6_ranges = self.ipv6_ranges.clone();
-        self.raw_ipv6_ranges
-            .sort_unstable_by_key(|range| range.start);
         merge_ipv4_ranges(&mut self.ipv4_ranges);
         merge_ipv6_ranges(&mut self.ipv6_ranges);
     }
@@ -130,18 +84,6 @@ impl GeoIpTagIndex {
                 let index = self.ipv6_ranges.partition_point(|range| range.start <= ip);
                 index > 0 && self.ipv6_ranges[index - 1].end >= ip
             }
-        }
-    }
-
-    fn matching_range(&self, ip: IpAddr) -> Option<(u128, u128)> {
-        match ip {
-            IpAddr::V4(ip) => {
-                let ip = u32::from(ip);
-                most_specific_ipv4(&self.raw_ipv4_ranges, ip)
-                    .map(|range| (u128::from(range.start), u128::from(range.end)))
-            }
-            IpAddr::V6(ip) => most_specific_ipv6(&self.raw_ipv6_ranges, u128::from(ip))
-                .map(|range| (range.start, range.end)),
         }
     }
 
@@ -175,10 +117,6 @@ impl ParsedGeoIp {
 pub struct GeoIpManager {
     /// MaxMind DB 和它每条数据记录的国家代码 / The MaxMind DB and the country code of each of its data records
     mmdb: Option<Mmdb>,
-    /// MMDB 文件路径（用于延迟加载）/ MMDB file path (for lazy loading)
-    /// Note: Reserved for future hot-reload functionality
-    #[allow(dead_code)]
-    db_path: Option<String>,
     /// 按标签分组的 IP 范围索引（从 .dat/JSON 文件加载）
     /// IP range indexes grouped by tag (loaded from .dat/JSON files)
     tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex>,
@@ -268,16 +206,6 @@ fn record_country<'a>(found: &maxminddb::LookupResult<'a, Vec<u8>>) -> Option<&'
         .and_then(|country| country.iso_code)
 }
 
-/// GeoIP 查询结果 / GeoIP query result
-#[derive(Debug, Clone)]
-pub struct GeoIpResult {
-    /// ISO 3166-1 alpha-2 国家代码（如 "CN", "US"） / ISO 3166-1 alpha-2 country code (e.g., "CN", "US")
-    /// 使用 Arc<str> 实现零拷贝 clone / Use Arc<str> for zero-copy clone
-    pub country_code: Option<Arc<str>>,
-    /// 是否为私有 IP 地址 / Whether it's a private IP address
-    pub is_private: bool,
-}
-
 impl GeoIpManager {
     /// 创建新的 GeoIP 管理器 / Create new GeoIP manager
     ///
@@ -310,7 +238,6 @@ impl GeoIpManager {
 
         Ok(Self {
             mmdb,
-            db_path,
             tag_indexes: FxHashMap::default(),
         })
     }
@@ -320,29 +247,6 @@ impl GeoIpManager {
     #[inline]
     pub fn has_mmdb(&self) -> bool {
         self.mmdb.is_some()
-    }
-
-    /// 查询 IP 的 GeoIP 信息 / Lookup GeoIP information for an IP address
-    ///
-    /// # 参数 / Parameters
-    /// - `ip`: 要查询的 IP 地址 / IP address to lookup
-    ///
-    /// # 返回 / Returns
-    /// GeoIP 查询结果（包含国家代码和私有 IP 标志） / GeoIP result (with country code and private IP flag)
-    pub fn lookup(&self, ip: IpAddr) -> GeoIpResult {
-        let country_code = match &self.mmdb {
-            Some(mmdb) => mmdb
-                .country(ip)
-                .map(|code| Arc::from(code.to_ascii_uppercase())),
-            // 使用 .dat/JSON 文件中的国家标签 / Use country tags from .dat/JSON files
-            None if !self.tag_indexes.is_empty() => self.lookup_dat_country(ip),
-            // 没有 MMDB 文件，只检测私有 IP / No MMDB file, only check private IP
-            None => None,
-        };
-        GeoIpResult {
-            country_code,
-            is_private: is_private_ip(ip),
-        }
     }
 
     /// 检查 IP 是否属于指定标签 / Check whether an IP belongs to a tag.
@@ -405,82 +309,6 @@ impl GeoIpManager {
             }
         }
         false
-    }
-
-    /// 返回 IP 命中的全部标签，主要用于诊断和管理接口。
-    /// Return all tags matching an IP, primarily for diagnostics and management APIs.
-    pub fn lookup_tags(&self, ip: IpAddr) -> Vec<Arc<str>> {
-        let has_mmdb = self.has_mmdb();
-        let mut tags: Vec<_> = self.lookup(ip).country_code.into_iter().collect();
-        tags.extend(
-            self.tag_indexes
-                .iter()
-                .filter(|(tag, index)| index.contains(ip) && (!has_mmdb || !is_country_tag(tag)))
-                .map(|(tag, _)| Arc::clone(tag)),
-        );
-        tags.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
-        tags.dedup();
-        tags
-    }
-
-    /// 从 .dat/JSON 数据中查询传统单标签结果，优先返回两位国家代码。
-    /// Lookup the legacy single-tag result, preferring a two-letter country code.
-    fn lookup_dat_country(&self, ip: IpAddr) -> Option<Arc<str>> {
-        let mut country_match = None;
-        let mut named_match = None;
-
-        for (tag, index) in &self.tag_indexes {
-            let Some((start, end)) = index.matching_range(ip) else {
-                continue;
-            };
-
-            let target = if is_country_tag(tag) {
-                &mut country_match
-            } else {
-                &mut named_match
-            };
-            if is_more_specific(target, tag, start, end) {
-                *target = Some((Arc::clone(tag), start, end));
-            }
-        }
-
-        country_match.or(named_match).map(|(tag, _, _)| tag)
-    }
-
-    /// 重新加载 MMDB 数据库 / Reload MMDB database
-    ///
-    /// # 参数 / Parameters
-    /// - `db_path`: 新的 MMDB 文件路径 / New MMDB file path
-    pub fn reload(&mut self, db_path: Option<String>) -> anyhow::Result<()> {
-        if let Some(path) = db_path {
-            match Mmdb::open(&path) {
-                Ok(mmdb) => {
-                    self.mmdb = Some(mmdb);
-                    tracing::info!(
-                        geoip_db = %path,
-                        "GeoIP database reloaded successfully"
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        geoip_db = %path,
-                        error = %e,
-                        "Failed to reload GeoIP database"
-                    );
-                    Err(e.into())
-                }
-            }
-        } else {
-            tracing::debug!("No GeoIP database path to reload");
-            Ok(())
-        }
-    }
-
-    /// 检查 GeoIP 数据是否已加载 / Check whether any GeoIP data is loaded.
-    #[inline]
-    pub fn is_loaded(&self) -> bool {
-        self.mmdb.is_some() || !self.tag_indexes.is_empty()
     }
 
     /// 获取去重合并后的 IP 范围数量（仅用于调试）。
@@ -800,54 +628,6 @@ impl GeoIpManager {
     ) -> anyhow::Result<ConversionStats> {
         convert_dat_to_mmdb(dat_path, mmdb_path, filter_countries)
     }
-
-    /// 自动转换并加载
-    /// Auto-convert and load
-    ///
-    /// 如果 MMDB 文件不存在但 .dat 文件存在，自动转换并加载
-    /// If MMDB file doesn't exist but .dat file exists, auto-convert and load
-    ///
-    /// # 参数 / Parameters
-    /// - `dat_path`: V2Ray .dat 文件路径 / V2Ray .dat file path
-    /// - `mmdb_path`: 输出 MMDB 文件路径 / Output MMDB file path
-    pub fn auto_convert_and_load(dat_path: &Path, mmdb_path: &Path) -> anyhow::Result<Self> {
-        // Check if MMDB already exists
-        if mmdb_path.exists() {
-            tracing::info!(
-                mmdb = %mmdb_path.display(),
-                "MMDB file already exists, loading directly"
-            );
-            return Self::new(Some(mmdb_path.to_string_lossy().to_string()));
-        }
-
-        // Check if .dat file exists
-        if !dat_path.exists() {
-            anyhow::bail!(
-                "Neither MMDB nor .dat file exists: mmdb={}, dat={}",
-                mmdb_path.display(),
-                dat_path.display()
-            );
-        }
-
-        tracing::info!(
-            dat = %dat_path.display(),
-            mmdb = %mmdb_path.display(),
-            "MMDB not found, converting from .dat file"
-        );
-
-        // Perform conversion
-        let stats = Self::convert_dat_to_mmdb(dat_path, mmdb_path, None)?;
-
-        tracing::info!(
-            "Conversion successful: {} countries, {} IPv4 ranges, {} IPv6 ranges",
-            stats.countries_count,
-            stats.ipv4_ranges_count,
-            stats.ipv6_ranges_count
-        );
-
-        // Load the converted MMDB
-        Self::new(Some(mmdb_path.to_string_lossy().to_string()))
-    }
 }
 
 /// 从 `file` 读一个 protobuf 变长整数，`remaining` 是文件里还剩的字节数
@@ -912,47 +692,11 @@ fn merge_ipv6_ranges(ranges: &mut Vec<Ipv6Range>) {
     *ranges = merged;
 }
 
-fn most_specific_ipv4(ranges: &[Ipv4Range], ip: u32) -> Option<Ipv4Range> {
-    let index = ranges.partition_point(|range| range.start <= ip);
-    ranges[..index]
-        .iter()
-        .filter(|range| range.end >= ip)
-        .min_by_key(|range| (range.end - range.start, std::cmp::Reverse(range.start)))
-        .copied()
-}
-
-fn most_specific_ipv6(ranges: &[Ipv6Range], ip: u128) -> Option<Ipv6Range> {
-    let index = ranges.partition_point(|range| range.start <= ip);
-    ranges[..index]
-        .iter()
-        .filter(|range| range.end >= ip)
-        .min_by_key(|range| (range.end - range.start, std::cmp::Reverse(range.start)))
-        .copied()
-}
-
 /// 是否两个字母的国家代码；有 MMDB 时只有这样的标签查 MMDB
 /// Whether a tag is a two-letter country code; with an MMDB only such tags are looked up there
 #[inline]
 pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
-}
-
-fn is_more_specific(
-    current: &Option<(Arc<str>, u128, u128)>,
-    tag: &str,
-    start: u128,
-    end: u128,
-) -> bool {
-    match current {
-        None => true,
-        Some((current_tag, current_start, current_end)) => {
-            let span = end - start;
-            let current_span = *current_end - *current_start;
-            span < current_span
-                || (span == current_span && start > *current_start)
-                || (span == current_span && start == *current_start && tag < current_tag.as_ref())
-        }
-    }
 }
 
 /// 检测 IP 是否为私有地址 / Detect if IP is private address
@@ -1028,16 +772,15 @@ mod tests {
 
         // IPv6 查询应匹配国家 / IPv6 lookup should match the country
         let ip: std::net::IpAddr = "2001:db8::1".parse().unwrap();
-        let res = mgr.lookup(ip);
-        assert_eq!(res.country_code.as_deref(), Some("CN"));
+        assert!(mgr.matches_tag(ip, "CN"));
 
         // 不在段内的 IPv6 不应误匹配 / IPv6 outside the range must not match
         let miss: std::net::IpAddr = "2001:db9::1".parse().unwrap();
-        assert_eq!(mgr.lookup(miss).country_code, None);
+        assert!(!mgr.matches_tag(miss, "CN"));
 
         // IPv4 查询仍然正常 / IPv4 lookup still works
         let v4ip: std::net::IpAddr = "1.2.3.5".parse().unwrap();
-        assert_eq!(mgr.lookup(v4ip).country_code.as_deref(), Some("CN"));
+        assert!(mgr.matches_tag(v4ip, "CN"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1115,8 +858,7 @@ mod tests {
         assert_eq!(mgr.ip_range_count(), 2, "JSON IPv4 和 IPv6 段都应保留");
 
         let ip: std::net::IpAddr = "2001:db8:1::1234".parse().unwrap();
-        let res = mgr.lookup(ip);
-        assert_eq!(res.country_code.as_deref(), Some("JP"));
+        assert!(mgr.matches_tag(ip, "JP"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1188,25 +930,41 @@ mod tests {
         list.encode_to_vec()
     }
 
+    /// 交叉重叠的网段合并以后，两段里的地址都算在内，两段之外的不算
+    /// Crossing ranges merged still hold every address of both, and nothing beyond them
     #[test]
-    fn test_most_specific_handles_crossing_overlaps() {
-        let ipv4_ranges = [
-            Ipv4Range { start: 40, end: 55 },
-            Ipv4Range { start: 45, end: 70 },
-        ];
-        let ipv4_match = most_specific_ipv4(&ipv4_ranges, 50).unwrap();
-        assert_eq!((ipv4_match.start, ipv4_match.end), (40, 55));
-
-        let ipv6_ranges = [
-            Ipv6Range { start: 40, end: 55 },
-            Ipv6Range { start: 45, end: 70 },
-        ];
-        let ipv6_match = most_specific_ipv6(&ipv6_ranges, 50).unwrap();
-        assert_eq!((ipv6_match.start, ipv6_match.end), (40, 55));
+    fn crossing_ranges_merge_into_one() {
+        let mut index = GeoIpTagIndex {
+            ipv4_ranges: vec![
+                Ipv4Range { start: 45, end: 70 },
+                Ipv4Range { start: 40, end: 55 },
+            ],
+            ipv6_ranges: vec![
+                Ipv6Range { start: 45, end: 70 },
+                Ipv6Range { start: 40, end: 55 },
+            ],
+        };
+        index.finalize();
+        assert_eq!(index.range_count(), 2);
+        for (ip, inside) in [(39, false), (40, true), (50, true), (70, true), (71, false)] {
+            assert_eq!(
+                index.contains(IpAddr::from(std::net::Ipv4Addr::from(ip))),
+                inside,
+                "v4 {ip}"
+            );
+            assert_eq!(
+                index.contains(IpAddr::from(std::net::Ipv6Addr::from(u128::from(ip)))),
+                inside,
+                "v6 {ip}"
+            );
+        }
     }
 
+    /// 嵌套的网段各管各的：US 的 /24 在 CN 的 /8 里面，里面的地址两个标签都算，/24 外面只算 CN
+    /// Nested networks each keep their own: US's /24 sits inside CN's /8, so an address in it
+    /// is under both tags and one outside the /24 under CN alone
     #[test]
-    fn test_lookup_nested_overlap_most_specific() {
+    fn nested_networks_match_each_tag() {
         let dat = build_nested_dat();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("geoip_test_nested.dat");
@@ -1215,27 +973,25 @@ mod tests {
         let mut mgr = GeoIpManager::new(None).unwrap();
         mgr.load_from_dat_file(&path).unwrap();
 
-        let us: IpAddr = "10.1.2.5".parse().unwrap();
-        assert_eq!(mgr.lookup(us).country_code.as_deref(), Some("US"));
-        let b1: IpAddr = "10.1.2.255".parse().unwrap();
-        assert_eq!(mgr.lookup(b1).country_code.as_deref(), Some("US"));
-        let cn: IpAddr = "10.1.3.5".parse().unwrap();
-        assert_eq!(mgr.lookup(cn).country_code.as_deref(), Some("CN"));
-        let b2: IpAddr = "10.1.3.0".parse().unwrap();
-        assert_eq!(mgr.lookup(b2).country_code.as_deref(), Some("CN"));
-        let cn2: IpAddr = "10.200.1.1".parse().unwrap();
-        assert_eq!(mgr.lookup(cn2).country_code.as_deref(), Some("CN"));
-
-        let us6: IpAddr = "2001:db8:1::1".parse().unwrap();
-        assert_eq!(mgr.lookup(us6).country_code.as_deref(), Some("US"));
-        let cn6: IpAddr = "2001:db8:2::1".parse().unwrap();
-        assert_eq!(mgr.lookup(cn6).country_code.as_deref(), Some("CN"));
+        for (ip, us) in [
+            ("10.1.2.5", true),
+            ("10.1.2.255", true),
+            ("10.1.3.5", false),
+            ("10.1.3.0", false),
+            ("10.200.1.1", false),
+            ("2001:db8:1::1", true),
+            ("2001:db8:2::1", false),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(mgr.matches_tag(ip, "CN"), "{ip}");
+            assert_eq!(mgr.matches_tag(ip, "US"), us, "{ip}");
+        }
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn test_lookup_preserves_same_tag_nested_specificity() {
+    fn same_tag_nested_networks_match() {
         let json = r#"{
             "entries": [
                 {
@@ -1258,16 +1014,21 @@ mod tests {
         let cn4: IpAddr = "10.1.1.1".parse().unwrap();
         assert!(mgr.matches_tag(cn4, "CN"));
         assert!(mgr.matches_tag(cn4, "US"));
-        assert_eq!(mgr.lookup(cn4).country_code.as_deref(), Some("CN"));
         let us4: IpAddr = "10.2.1.1".parse().unwrap();
-        assert_eq!(mgr.lookup(us4).country_code.as_deref(), Some("US"));
+        assert!(mgr.matches_tag(us4, "US"));
+        assert!(mgr.matches_tag(us4, "CN"));
+        let cn_only4: IpAddr = "10.200.1.1".parse().unwrap();
+        assert!(mgr.matches_tag(cn_only4, "CN"));
+        assert!(!mgr.matches_tag(cn_only4, "US"));
 
         let cn6: IpAddr = "2001:db8:1::1".parse().unwrap();
         assert!(mgr.matches_tag(cn6, "CN"));
         assert!(mgr.matches_tag(cn6, "US"));
-        assert_eq!(mgr.lookup(cn6).country_code.as_deref(), Some("CN"));
         let us6: IpAddr = "2001:db8:2::1".parse().unwrap();
-        assert_eq!(mgr.lookup(us6).country_code.as_deref(), Some("US"));
+        assert!(mgr.matches_tag(us6, "US"));
+        assert!(mgr.matches_tag(us6, "CN"));
+        let cn_only6: IpAddr = "2001:db9::1".parse().unwrap();
+        assert!(!mgr.matches_tag(cn_only6, "CN"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -1289,17 +1050,16 @@ mod tests {
         assert!(mgr.matches_tag(ip, "cloudflare"));
         assert!(!mgr.matches_tag(ip, "netflix"));
         assert!(mgr.matches_any_tag(ip, &[Arc::from("NETFLIX"), Arc::from("CLOUDFLARE")]));
-        assert_eq!(mgr.lookup(ip).country_code.as_deref(), Some("AU"));
-        assert_eq!(
-            mgr.lookup_tags(ip),
-            vec![Arc::from("AU"), Arc::from("CLOUDFLARE")]
-        );
+        let outside: IpAddr = "1.1.2.1".parse().unwrap();
+        assert!(!mgr.matches_any_tag(outside, &[Arc::from("AU"), Arc::from("CLOUDFLARE")]));
 
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 只有命名标签（不是国家代码）的数据照样按标签匹配，不分大小写
+    /// Data holding a named tag alone (no country code) matches by that tag, ignoring case
     #[test]
-    fn test_lookup_preserves_named_tag_only_dat_behavior() {
+    fn a_named_tag_alone_matches() {
         let dat = build_dat("cloudflare", Some(([1, 1, 1, 0], 24)), None);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("geoip_test_named_tag_only.dat");
@@ -1309,7 +1069,9 @@ mod tests {
         mgr.load_from_dat_file(&path).unwrap();
 
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
-        assert_eq!(mgr.lookup(ip).country_code.as_deref(), Some("CLOUDFLARE"));
+        assert!(mgr.matches_tag(ip, "CLOUDFLARE"));
+        assert!(mgr.matches_tag(ip, "cloudflare"));
+        assert!(!mgr.matches_tag("1.1.2.1".parse().unwrap(), "CLOUDFLARE"));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1336,16 +1098,11 @@ mod tests {
         assert!(!mgr.matches_tag(ip, "CN"));
         assert!(mgr.matches_tag(ip, "CLOUDFLARE"));
         assert!(mgr.matches_any_tag(ip, &[Arc::from("CN"), Arc::from("CLOUDFLARE")]));
-        assert_eq!(
-            mgr.lookup_tags(ip),
-            vec![Arc::from("CLOUDFLARE"), Arc::from("US")]
-        );
 
         let mmdb_miss: IpAddr = "2001:db9::1".parse().unwrap();
         assert!(!mgr.matches_tag(mmdb_miss, "CN"));
         assert!(mgr.matches_tag(mmdb_miss, "CLOUDFLARE"));
-        assert_eq!(mgr.lookup(mmdb_miss).country_code, None);
-        assert_eq!(mgr.lookup_tags(mmdb_miss), vec![Arc::from("CLOUDFLARE")]);
+        assert!(!mgr.matches_tag(mmdb_miss, "US"));
 
         drop(mgr);
         let _ = std::fs::remove_file(mmdb_source_path);

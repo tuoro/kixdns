@@ -575,15 +575,6 @@ pub struct ForwardDecisionContext<'a> {
     pub observed: Observed<'a>,
 }
 
-/// Does not emit the `dns_response` record; only the engine request path logs it.
-/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
-pub async fn handle_forward_decision(
-    engine: &Engine,
-    context: ForwardDecisionContext<'_>,
-) -> anyhow::Result<ForwardResult> {
-    handle_forward_decision_logged(engine, context, &mut ResponseInfo::default()).await
-}
-
 pub(crate) async fn handle_forward_decision_logged(
     engine: &Engine,
     context: ForwardDecisionContext<'_>,

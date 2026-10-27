@@ -5,7 +5,7 @@ use std::path::Path;
 #[cfg(test)]
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -255,28 +255,6 @@ impl Engine {
         // Cache keys include a per-pipeline configuration namespace. Changed
         // pipelines become unreachable immediately, while unchanged pipelines
         // keep their warm response and rule caches.
-        // Reset background refresh rule to allow re-initialization with new config
-        // 重置后台刷新规则以允许使用新配置重新初始化
-        // Note: OnceLock cannot be reset, so we rely on the fact that the rule is
-        // initialized from the current pipeline config via get_background_refresh_rule()
-        // 注意：OnceLock 无法重置，所以我们依赖规则通过 get_background_refresh_rule()
-        // 从当前 pipeline 配置初始化的事实
-    }
-
-    /// Get or initialize the background refresh dedicated rule
-    /// 获取或初始化后台刷新专用规则
-    ///
-    /// Design: Uses OnceLock for thread-safe lazy initialization
-    /// 设计：使用 OnceLock 实现线程安全的延迟初始化
-    /// - First call: Creates rule from config or default
-    /// - Subsequent calls: Returns cached rule
-    /// - 首次调用：从配置或默认创建规则
-    /// - 后续调用：返回缓存的规则
-    #[allow(dead_code)]
-    fn get_background_refresh_rule(&self) -> Option<Arc<crate::matcher::RuntimeRule>> {
-        // 暂时返回 None，等待 RuntimePipelineConfig 结构更新
-        // Temporarily return None, waiting for RuntimePipelineConfig structure update
-        None
     }
 
     /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
@@ -306,42 +284,6 @@ impl Engine {
     #[inline]
     pub fn get_request_timeout_ms(&self) -> u64 {
         request_timeout_ms(&self.state.load().pipeline.settings)
-    }
-
-    /// Get parse_quick failure statistics
-    /// 获取快速解析失败统计信息
-    ///
-    /// Returns (total_requests, parse_quick_failures, failure_rate)
-    /// 返回 (总请求数, 快速解析失败数, 失败率)
-    #[inline]
-    pub fn get_parse_quick_stats(&self) -> (u64, u64, f64) {
-        let total = self.metrics_total_requests.load(Ordering::Relaxed);
-        let failures = self.metrics_parse_quick_failures.load(Ordering::Relaxed);
-        let rate = if total > 0 {
-            (failures as f64) / (total as f64) * 100.0
-        } else {
-            0.0
-        };
-        (total, failures, rate)
-    }
-
-    /// Increment total_requests counter using simple atomic operation
-    #[inline]
-    fn incr_total_requests(&self) {
-        self.metrics_total_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment fastpath_hits counter using simple atomic operation
-    #[inline]
-    fn incr_fastpath_hits(&self) {
-        self.metrics_fastpath_hits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment parse_quick_failures counter using simple atomic operation
-    #[inline]
-    fn incr_parse_quick_failures(&self) {
-        self.metrics_parse_quick_failures
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// The response cache slot and the inflight entry of a request. The slot holds
@@ -587,23 +529,6 @@ impl Engine {
         );
     }
 
-    #[allow(dead_code)]
-    pub fn metrics_snapshot(&self) -> String {
-        let inflight = self.metrics_inflight.load(Ordering::Relaxed);
-        let total = self.metrics_total_requests.load(Ordering::Relaxed);
-        let fast = self.metrics_fastpath_hits.load(Ordering::Relaxed);
-        let up_ns = self.metrics_upstream_ns_total.load(Ordering::Relaxed);
-        let up_calls = self.metrics_upstream_calls.load(Ordering::Relaxed);
-        let avg_up_ns = up_ns.checked_div(up_calls).unwrap_or(0);
-        format!(
-            "inflight={} total={} fastpath_hits={} upstream_avg_us={}",
-            inflight,
-            total,
-            fast,
-            avg_up_ns as f64 / 1000.0
-        )
-    }
-
     /// Fast path: synchronous cache hit attempt / 快速路径：同步尝试缓存命中
     /// Return Ok(Some(bytes)) means cache hit, can return directly / 返回 Ok(Some(bytes)) 表示缓存命中，可直接返回
     /// Return Ok(None) means async processing needed (upstream forwarding) / 返回 Ok(None) 表示需要异步处理（上游转发）
@@ -627,12 +552,9 @@ impl Engine {
             Some(q) => q,
             None => {
                 // Quick parse failed, fallback to async path / 快速解析失败，回退到异步路径
-                self.incr_parse_quick_failures();
                 return Ok(None);
             }
         };
-        // Count incoming quick-parsed requests / 计数进入的快速解析请求
-        self.incr_total_requests();
         // Observer: requests answered here are reported in one batch at the
         // answering site; requests that fall through are reported by the async path.
         // 观察者：在此应答的请求在应答处一次性上报；回落的请求由异步路径上报。
@@ -796,7 +718,6 @@ impl Engine {
                 // 直接返回当前缓存，不等待刷新完成
                 // Next query will automatically use refreshed new cache (if completed)
                 // 下次查询时会自动使用刷新后的新缓存（如果已完成）
-                self.incr_fastpath_hits();
                 // A client that sent ECS gets the echo of its own subnet, built here
                 // (see `phases::served_from_cache`); the rest get the stored bytes,
                 // which carry no ECS, and the listener ages them. Either way the
@@ -898,7 +819,6 @@ impl Engine {
                     );
                 }
                 let resp = built?;
-                self.incr_fastpath_hits();
                 let mut log = ResponseLog::new(
                     qname_str,
                     qtype,
@@ -963,7 +883,6 @@ impl Engine {
                         );
                     }
                     let resp = built?;
-                    self.incr_fastpath_hits();
                     let mut log = ResponseLog::new(
                         qname_str,
                         qtype,
@@ -1178,15 +1097,6 @@ impl Engine {
         let flags = crate::proto_utils::QueryFlags::of(packet);
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let request_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
-        self.incr_total_requests();
-        struct InflightGuard<'a>(&'a AtomicUsize);
-        impl<'a> Drop for InflightGuard<'a> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        self.metrics_inflight.fetch_add(1, Ordering::Relaxed);
-        let _inflight_guard = InflightGuard(&self.metrics_inflight);
         // A request uses one immutable configuration snapshot from selection
         // through response actions and cache writes. Background refresh passes
         // the snapshot that produced its cache key via `state_override`.

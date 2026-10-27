@@ -67,7 +67,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | geoip_dat_path | null | V2Ray GeoIP data path: either a protobuf `.dat` file or the compatible JSON format described below. |
 | geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. |
 
-The following fields are deserialized by the current config type but are not read by the running engine: geoip_auto_convert and geoip_filter_countries. Use convert-geo-ip with --filter for conversion-time filtering. The top-level background_refresh_rule is also currently ignored by runtime configuration compilation.
+The following fields are deserialized by the current config type but are not read by the running engine: geoip_auto_convert and geoip_filter_countries. Use convert-geo-ip with --filter for conversion-time filtering. The top-level background_refresh_rule is still read but has no effect: a background refresh replays the original request through its own rules. A configuration that has it loads as usual, with a warning at startup and on every reload; the entry can be removed.
 
 ### Pipeline selection
 

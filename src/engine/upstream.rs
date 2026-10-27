@@ -512,13 +512,6 @@ async fn forward_upstream_as_is(
                     );
                 }
                 // 记录成功指标 / Record success metrics
-                // Increment upstream metrics - 原子操作
-                engine
-                    .metrics_upstream_calls
-                    .fetch_add(1, Ordering::Relaxed);
-                engine
-                    .metrics_upstream_ns_total
-                    .fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
                 engine
                     .metrics_last_upstream_latency_ns
                     .store(dur.as_nanos() as u64, Ordering::Relaxed);
@@ -674,12 +667,6 @@ async fn forward_upstream_as_is(
 
                         if should_accept {
                             report(UpstreamOutcome::Success, rcode, truncated, None);
-                            engine
-                                .metrics_upstream_calls
-                                .fetch_add(1, Ordering::Relaxed);
-                            engine
-                                .metrics_upstream_ns_total
-                                .fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
                             engine
                                 .metrics_last_upstream_latency_ns
                                 .store(dur.as_nanos() as u64, Ordering::Relaxed);

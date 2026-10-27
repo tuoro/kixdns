@@ -1,5 +1,3 @@
-use std::hash::Hasher;
-
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
@@ -1312,22 +1310,6 @@ impl QuickQuery<'_> {
         unsafe {
             std::str::from_utf8_unchecked(self.qname_bytes)
         }
-    }
-
-    /// 获取 qname 的哈希值（用于缓存键计算）
-    /// Get hash value of qname (for cache key calculation)
-    ///
-    /// # Examples
-    /// ```
-    /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
-    /// let hash = query.qname_hash();
-    /// ```
-    #[inline]
-    pub fn qname_hash(&self) -> u64 {
-        let mut h = rustc_hash::FxHasher::default();
-        h.write(self.qname_bytes);
-        h.finish()
     }
 }
 

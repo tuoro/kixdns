@@ -61,13 +61,6 @@ pub struct Engine {
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
     pub(crate) rule_cache: Cache<u64, RuleCacheRecord>,
-    // Runtime metrics for diagnosing concurrency and upstream latency / 运行时指标，用于诊断并发和上游延迟
-    pub metrics_inflight: Arc<AtomicUsize>,
-    pub metrics_total_requests: Arc<AtomicU64>,
-    pub metrics_fastpath_hits: Arc<AtomicU64>,
-    pub metrics_parse_quick_failures: Arc<AtomicU64>,
-    pub metrics_upstream_ns_total: Arc<AtomicU64>,
-    pub metrics_upstream_calls: Arc<AtomicU64>,
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
     // In-flight dedupe map: cache_hash -> waiters / 进行中的去重映射：缓存哈希 -> 等待者
@@ -99,14 +92,6 @@ pub struct Engine {
     // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
     // 使用 RwLock 允许并发读操作，写操作独占 / Uses RwLock for concurrent reads, exclusive writes
     pub geosite_manager: Arc<RwLock<GeoSiteManager>>,
-    // Background refresh dedicated rule / 后台刷新专用规则
-    // Design: Background refresh calls handle_packet(skip_cache=true) with this rule
-    // 设计：后台刷新调用 handle_packet(skip_cache=true) 使用此规则
-    // Uses OnceLock for lazy initialization and thread-safe one-time setup
-    // 使用 OnceLock 实现延迟初始化和线程安全的一次性设置
-    // Note: Currently reserved for future implementation
-    #[allow(dead_code)]
-    pub(crate) background_refresh_rule: std::sync::OnceLock<Arc<crate::matcher::RuntimeRule>>,
 }
 
 /// Configures and constructs an [`Engine`]. Obtain one via [`Engine::builder`].
@@ -348,12 +333,6 @@ impl Engine {
             running_settings,
             reload_lock: Arc::new(Mutex::new(geo_sources)),
             rule_cache,
-            metrics_inflight: Arc::new(AtomicUsize::new(0)),
-            metrics_total_requests: Arc::new(AtomicU64::new(0)),
-            metrics_fastpath_hits: Arc::new(AtomicU64::new(0)),
-            metrics_parse_quick_failures: Arc::new(AtomicU64::new(0)),
-            metrics_upstream_ns_total: Arc::new(AtomicU64::new(0)),
-            metrics_upstream_calls: Arc::new(AtomicU64::new(0)),
             metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
             // DashMap configuration: shard count and initial capacity
@@ -380,8 +359,6 @@ impl Engine {
             geoip_manager,
             // GeoSite manager / GeoSite 管理器
             geosite_manager,
-            // Background refresh dedicated rule (lazy initialization) / 后台刷新专用规则（延迟初始化）
-            background_refresh_rule: std::sync::OnceLock::new(),
         })
     }
 

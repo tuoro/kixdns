@@ -339,6 +339,7 @@ async fn run_dns_server(
     for problem in kixdns::config::problems(&cfg) {
         warn!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
     }
+    kixdns::config::warn_ignored_settings(&cfg);
     let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
     // Listener addresses and DoH prerequisites, checked exactly as
     // config::validate does / 监听地址与 DoH 前置条件，检查方式与 config::validate 一致
