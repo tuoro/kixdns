@@ -155,6 +155,14 @@ impl EngineBuilder {
 }
 
 impl Engine {
+    /// 应答带的、缓存用的 TTL 最长多少：`cache_max_ttl`
+    /// The longest TTL an answer may carry or be cached with: `cache_max_ttl`
+    pub(crate) fn ttl_cap(&self) -> u32 {
+        self.cache_max_age.map_or(u32::MAX, |age| {
+            crate::proto_utils::saturating_u64_to_u32(age.as_secs())
+        })
+    }
+
     /// Start configuring an engine for `cfg`.
     pub fn builder(cfg: RuntimePipelineConfig) -> EngineBuilder {
         EngineBuilder {

@@ -23,7 +23,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
-| min_ttl | 0 | 上游/缓存 TTL 下限，单位秒。 |
+| min_ttl | 0 | 上游回答的 TTL 下限，单位秒：回答里每条记录的 TTL 至少提高到这个值，缓存也至少留这么久。 |
 | bind_udp | 0.0.0.0:5353 | UDP 监听地址。 |
 | bind_tcp | 0.0.0.0:5353 | TCP 监听地址。 |
 | bind_doh | null | 入站 DoH 监听地址；null 表示禁用。 |
@@ -53,7 +53,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | flow_control_latency_threshold_ms | 100 | 自适应流控使用的延迟阈值。 |
 | flow_control_adjustment_interval_secs | 5 | permits 调整间隔。 |
 | cache_capacity | 10000 | DNS 响应缓存最多存放的应答数；必须大于 0。 |
-| cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。 |
+| cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。上游回答里每条记录的 TTL 也不超过它，和 min_ttl 冲突时以它为准。 |
 | dashmap_shards | 0 | 内部分片设置；0 使用 DashMap 默认值，否则必须是 2 的幂。 |
 | cache_background_refresh | false | 在 TTL 过期前刷新条目。 |
 | cache_refresh_threshold_percent | 10 | 按剩余 TTL 百分比触发刷新；必须小于 100，取 100 时每次缓存命中都会刷新上游。 |
@@ -396,7 +396,7 @@ UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通�
 
 ## 缓存和重载行为
 
-DNS 响应缓存使用上游响应的最小 TTL；配置 min_ttl 时会将其提高到该下限，并受 cache_max_ttl 和 cache_capacity 限制。否定响应在存在 SOA 时使用 SOA 负缓存 TTL。相同的进行中缓存未命中会共享一次上游操作。
+上游回答交出去、写进缓存之前，每条记录的 TTL 先收进 min_ttl 到 cache_max_ttl 之间（两者冲突时以 cache_max_ttl 为准），客户端留一份回答的时间就和缓存一样长。DNS 响应缓存使用回答的最小 TTL，否定响应在存在 SOA 时使用 SOA 负缓存 TTL，同样收进这个范围，并受 cache_capacity 限制；没有 SOA 的否定响应不缓存（RFC 2308 第 4 节）。相同的进行中缓存未命中会共享一次上游操作。
 
 Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命中去重和规则缓存会按规则对请求方的判定把它们分开，而不是按地址：客户端地址是否在各个 client_ip 网段内，是否为私有地址（geoip_private），GeoIP 国家或标签是否匹配（geoip_country），查询是否带 EDNS（edns_present、response_edns_present）。转发取自客户端的子网用来分开并发未命中的请求，缓存的应答则按 ECS 作用范围区分（见 ECS）。判定相同的请求方共用条目。Pipeline 的回答检查开始的响应跳转路径上的规则也算在内，因为请求在应答之前会运行它们。这条路径转发的是跳转前那次转发准备的包，连同 ECS，所以它的并发未命中条目和直接进入该 Pipeline 的请求分开；这条路径上得到的应答不写缓存，因为没有哪次查找用它的键。规则缓存保存的是 Pipeline 自身规则的决策，因此只按该 Pipeline 的请求匹配器判定；开启 cache_background_refresh 时还按客户端地址区分，与以前相同。规则不判定任何请求方信息的 Pipeline 照旧在所有客户端之间共享。后台刷新从同一个客户端地址重放请求，原请求带 EDNS、带客户端自己的 ECS 选项时也一样带上（不符合 RFC 7871 第 6 节的 ECS 选项不带），因此 Pipeline 选择、请求规则和发往上游的 ECS 都与那次请求相同。刷新得到的应答适用的请求方与被刷新的条目不同时（例如上游的作用范围变窄了），那个条目会被删掉，它的请求方各自重新查询。
 

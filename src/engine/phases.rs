@@ -259,6 +259,23 @@ pub(crate) fn check_cache_logged(
     }
 }
 
+/// 缓存留一份应答多久：它自己的 TTL（记录里最小的，否定应答用 SOA 的负缓存 TTL）收进
+/// `min_ttl..=cache_max_ttl`，和应答带的 TTL 一样（见 `forward_upstream`）；0 就不缓存。
+/// 它自己的 TTL 为 0 时不缓存：要么没有可依据的 TTL（没有 SOA 的否定应答，RFC 2308 第 4 节说不要
+/// 缓存），要么 min_ttl 为 0 时记录的 TTL 就是 0。
+/// How long the cache keeps an answer: its own TTL (the least of its records', the
+/// SOA negative TTL for a negative answer) brought into `min_ttl..=cache_max_ttl`,
+/// as the TTLs the answer carries are (see `forward_upstream`); 0 means not cached.
+/// An own TTL of 0 is not cached: either the answer gives no TTL to go by (a
+/// negative answer without SOA, which RFC 2308 section 4 says not to cache), or,
+/// with min_ttl 0, its records have TTL 0.
+fn ttl_to_cache(engine: &Engine, answer_ttl: u64, min_ttl: Duration) -> u32 {
+    if answer_ttl == 0 {
+        return 0;
+    }
+    proto_utils::saturating_u64_to_u32(answer_ttl.max(min_ttl.as_secs())).min(engine.ttl_cap())
+}
+
 /// How a reply served from the cache gets its TTLs / 从缓存给出的应答怎样设置 TTL
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ServedTtl {
@@ -874,7 +891,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 )
             };
 
-            let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
+            let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
 
             // Try to acquire read locks non-blockingly (fast path for concurrent reads)
             // 尝试非阻塞获取读锁（并发读的快速路径）
@@ -961,8 +978,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 };
 
             if actions_to_run.is_empty() {
-                if effective_ttl > Duration::from_secs(0) {
-                    let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
+                if cache_ttl > 0 {
                     let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                     engine.insert_dns_cache_entry(
                         keys.slot,
@@ -1039,9 +1055,8 @@ pub(crate) async fn handle_forward_decision_logged(
                     reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
                     let ttl_secs_cache = extract_ttl(&ctx.msg);
                     let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
-                    let effective_ttl = Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
-                    if effective_ttl > Duration::from_secs(0) {
-                        let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
+                    let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
+                    if cache_ttl > 0 {
                         let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                         engine.insert_dns_cache_entry(
                             keys.slot,
@@ -1334,10 +1349,8 @@ pub(crate) async fn handle_forward_decision_logged(
                         reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
                         let ttl_secs_cache = extract_ttl(&ctx.msg);
                         let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
-                        let effective_ttl =
-                            Duration::from_secs(ttl_secs_cache.max(min_ttl.as_secs()));
-                        if effective_ttl > Duration::from_secs(0) {
-                            let cache_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_cache);
+                        let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
+                        if cache_ttl > 0 {
                             let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                             engine.insert_dns_cache_entry(
                                 keys.slot,
@@ -1613,30 +1626,33 @@ mod refresh_response_rule_tests {
     /// The same, the answers truncated (TC set) when `truncated` is
     /// 同上，`truncated` 为真时应答带 TC 位
     async fn spawn_upstream_answering_with(ip: Ipv4Addr, truncated: bool) -> String {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-                let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = query.queries.first().cloned() else {
-                    continue;
-                };
-                let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
-                resp.metadata.truncation = truncated;
-                resp.add_query(question.clone());
-                resp.add_answer(a_record(&question, ip));
-                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
-            }
-        });
-        addr
+        spawn_upstream_replying(move |query, question| {
+            let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+            resp.metadata.truncation = truncated;
+            resp.add_query(question.clone());
+            resp.add_answer(a_record(question, ip));
+            resp
+        })
+        .await
     }
 
     /// Local UDP upstream that answers every query SERVFAIL.
     /// 本机 UDP 上游：每个查询都回 SERVFAIL。
     async fn spawn_upstream_answering_servfail() -> String {
+        spawn_upstream_replying(|query, question| {
+            let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+            resp.metadata.response_code = ResponseCode::ServFail;
+            resp.add_query(question.clone());
+            resp
+        })
+        .await
+    }
+
+    /// 本机 UDP 上游：每个带问题的查询都回 `reply(查询, 问题)`
+    /// Local UDP upstream answering every query with a question by `reply(query, question)`
+    async fn spawn_upstream_replying(
+        reply: impl Fn(&Message, &Query) -> Message + Send + 'static,
+    ) -> String {
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -1645,11 +1661,10 @@ mod refresh_response_rule_tests {
                 let Ok(query) = Message::from_bytes(&buf[..n]) else {
                     continue;
                 };
-                let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
-                resp.metadata.response_code = ResponseCode::ServFail;
-                if let Some(question) = query.queries.first() {
-                    resp.add_query(question.clone());
-                }
+                let Some(question) = query.queries.first() else {
+                    continue;
+                };
+                let resp = reply(&query, question);
                 let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
             }
         });
@@ -1751,17 +1766,7 @@ mod refresh_response_rule_tests {
     /// stale) and returns its key.
     /// 为 `pipeline` 缓存一条带 `ip` 的应答，TTL 为给定值（0 表示已经过期），返回它的键。
     fn cache_an_answer(engine: &Engine, pipeline: &str, ip: Ipv4Addr, ttl: u32) -> u64 {
-        let state = engine.state.load_full();
-        let key = Engine::cache_keys(
-            state.cache_namespace(pipeline),
-            pipeline,
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            &crate::matcher::RequesterKey::NONE,
-            None,
-        )
-        .slot;
+        let key = slot_of(engine, pipeline);
         let request = query();
         let mut reply = Message::new(request.id, MessageType::Response, OpCode::Query);
         reply.add_query(request.queries[0].clone());
@@ -1793,6 +1798,183 @@ mod refresh_response_rule_tests {
             .with_reach(reach),
         );
         key
+    }
+
+    /// [`query`] 在 `pipeline` 里的缓存槽位 / The cache slot of [`query`] in `pipeline`
+    fn slot_of(engine: &Engine, pipeline: &str) -> u64 {
+        let state = engine.state.load_full();
+        Engine::cache_keys(
+            state.cache_namespace(pipeline),
+            pipeline,
+            b"example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &crate::matcher::RequesterKey::NONE,
+            None,
+        )
+        .slot
+    }
+
+    /// 三条会写缓存的路径，各一条规则，回答都来自 `upstream`：直接转发、应答之后响应动作的转发、
+    /// 上游失败后 on_miss 的转发
+    /// The three paths that cache, one rule each with its answer from `upstream`: a
+    /// plain forward, a response action's forward after an answer, an on_miss
+    /// forward after the upstream failed
+    fn caching_paths(upstream: &str) -> [(&'static str, Value); 3] {
+        [
+            ("forward", rule("all", forward(upstream), json!({}))),
+            (
+                "response action",
+                rule(
+                    "all",
+                    forward(upstream),
+                    json!({
+                        "response_matchers": [{ "type": "upstream_equals", "value": upstream }],
+                        "response_actions_on_match": forward(upstream)
+                    }),
+                ),
+            ),
+            (
+                "miss action",
+                rule(
+                    "all",
+                    forward(DEAD_UPSTREAM),
+                    json!({ "response_actions_on_miss": forward(upstream) }),
+                ),
+            ),
+        ]
+    }
+
+    /// 回答里每条记录的 TTL，按段的先后 / The TTL of every record in a reply, section by section
+    fn record_ttls(bytes: &[u8]) -> Vec<u32> {
+        let msg = Message::from_bytes(bytes).expect("parse reply");
+        msg.answers
+            .iter()
+            .chain(&msg.authorities)
+            .map(|record| record.ttl)
+            .collect()
+    }
+
+    /// 上游回答里每条记录的 TTL 都收进 min_ttl 到 cache_max_ttl 之间，缓存也照收过的存，客户端留一份
+    /// 回答的时间就和缓存一样长；两者冲突时以 cache_max_ttl 为准。此前 min_ttl 只决定存不存，条目还是
+    /// 照上游的 TTL 过期；cache_max_ttl 只限制条目存多久，客户端拿到的仍是上游的 TTL。
+    /// The TTL of every record in an upstream answer is brought into min_ttl to
+    /// cache_max_ttl and the cache keeps what was brought in, so a client keeps an
+    /// answer as long as the cache does; cache_max_ttl wins when the two cross.
+    /// min_ttl used to decide only whether an answer was cached, the entry still
+    /// expiring by the upstream's TTL; cache_max_ttl only bounded how long an entry
+    /// was kept, clients still getting the upstream's TTL.
+    #[tokio::test]
+    async fn answers_carry_and_are_cached_with_ttls_within_min_ttl_and_cache_max_ttl() {
+        let upstream = spawn_upstream_replying(|query, question| {
+            let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+            resp.add_query(question.clone());
+            for (ttl, last) in [(5, 1), (100_000, 2)] {
+                resp.add_answer(Record::from_rdata(
+                    question.name().clone(),
+                    ttl,
+                    RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, last))),
+                ));
+            }
+            resp
+        })
+        .await;
+        let rules = caching_paths(&upstream);
+        let cases = [
+            (
+                json!({ "min_ttl": 60, "cache_max_ttl": 3600 }),
+                [60, 3600],
+                (60, 3600),
+            ),
+            (
+                json!({ "min_ttl": 600, "cache_max_ttl": 300 }),
+                [300, 300],
+                (300, 300),
+            ),
+            (json!({}), [5, 86_400], (5, 86_400)),
+        ];
+        for (path, rule) in &rules {
+            for (settings, carried, cached) in &cases {
+                let engine =
+                    engine_with(settings.clone(), json!([{ "id": "main", "rules": [rule] }]));
+                for round in ["miss", "hit"] {
+                    let reply = engine
+                        .handle_packet(&query().to_vec().unwrap(), CLIENT.parse().unwrap())
+                        .await
+                        .expect("answered");
+                    let ttls = record_ttls(&reply);
+                    // 命中时减去已经缓存的秒数，跨过一秒的边界时少 1 / A hit takes off the seconds cached, 1 past a second boundary
+                    assert!(
+                        ttls == *carried || ttls == carried.map(|ttl| ttl - 1),
+                        "{path} {settings} {round}: {ttls:?}"
+                    );
+                }
+                let entry = engine.cached(slot_of(&engine, "main")).expect("cached");
+                assert_eq!(
+                    (entry.original_ttl, entry.refresh_ttl),
+                    *cached,
+                    "{path} {settings}"
+                );
+            }
+        }
+    }
+
+    /// 否定回答按 SOA 的负缓存 TTL 缓存，同样收进 min_ttl 到 cache_max_ttl 之间；没有 SOA 的照旧不缓存
+    /// （RFC 2308 第 4 节）。
+    /// A negative answer is cached by its SOA negative TTL, brought into min_ttl to
+    /// cache_max_ttl as well; one without SOA is still not cached (RFC 2308 section 4).
+    #[tokio::test]
+    async fn negative_answers_are_cached_within_min_ttl_and_cache_max_ttl() {
+        for (soa, settings, carried, cached) in [
+            (Some((10, 5)), json!({ "min_ttl": 60 }), vec![60], Some(60)),
+            (
+                Some((100_000, 100_000)),
+                json!({ "cache_max_ttl": 3600 }),
+                vec![3600],
+                Some(3600),
+            ),
+            (None, json!({ "min_ttl": 60 }), vec![], None),
+        ] {
+            let upstream = spawn_upstream_replying(move |query, question| {
+                let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+                resp.metadata.response_code = ResponseCode::NXDomain;
+                resp.add_query(question.clone());
+                if let Some((ttl, minimum)) = soa {
+                    let soa = hickory_proto::rr::rdata::SOA::new(
+                        Name::from_str("ns.example.com.").unwrap(),
+                        Name::from_str("admin.example.com.").unwrap(),
+                        1,
+                        3600,
+                        900,
+                        1_209_600,
+                        minimum,
+                    );
+                    resp.add_authority(Record::from_rdata(
+                        Name::from_str("example.com.").unwrap(),
+                        ttl,
+                        RData::SOA(soa),
+                    ));
+                }
+                resp
+            })
+            .await;
+            for (path, rule) in caching_paths(&upstream) {
+                let engine =
+                    engine_with(settings.clone(), json!([{ "id": "main", "rules": [rule] }]));
+                let reply = engine
+                    .handle_packet(&query().to_vec().unwrap(), CLIENT.parse().unwrap())
+                    .await
+                    .expect("answered");
+                assert_eq!(record_ttls(&reply), carried, "{path} {settings}");
+                assert_eq!(
+                    engine
+                        .cached(slot_of(&engine, "main"))
+                        .map(|entry| entry.original_ttl),
+                    cached,
+                    "{path} {settings}"
+                );
+            }
+        }
     }
 
     /// Runs the call `spawn_background_refresh` makes and returns what the

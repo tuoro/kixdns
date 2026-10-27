@@ -1,6 +1,6 @@
 use std::hash::Hasher;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use hickory_proto::op::Message;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 
@@ -1419,72 +1419,11 @@ pub fn saturating_u64_to_u32(value: u64) -> u32 {
 /// 批量修正 DNS 响应包中的 TTL 值 / Batch patch TTL values in a DNS response packet
 /// decrement: 需要减少的秒数 / seconds to decrement
 pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
-    if decrement == 0 || packet.len() < 12 {
+    if decrement == 0 {
         return;
     }
-
-    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
-    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
-    let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
-
-    let mut pos = 12;
-    let packet_len = packet.len();
-
-    // 1. Skip Questions
-    for _ in 0..qd_count {
-        if let Some(next) = skip_name(packet, pos) {
-            pos = next + 4;
-        } else {
-            return;
-        }
-    }
-
-    // 2. Patch Answer, Authority, and Additional sections
-    let total_records = an_count as usize + ns_count as usize + ar_count as usize;
-    for _ in 0..total_records {
-        if let Some(next) = skip_name(packet, pos) {
-            pos = next;
-        } else {
-            return;
-        }
-
-        if pos + 10 > packet_len {
-            return;
-        }
-
-        // Type(2) Class(2) TTL(4) RDLen(2)
-        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-
-        // Skip OPT (type 41) pseudo-records: their TTL field contains EDNS extended
-        // RCODE and flags (including the DO bit), NOT an actual TTL value.
-        // 跳过 OPT（类型 41）伪记录：其 TTL 字段包含 EDNS 扩展 RCODE 和标志（包括 DO 位），不是真正的 TTL。
-        if rtype != 41 {
-            let ttl_offset = pos + 4;
-            let old_ttl = u32::from_be_bytes([
-                packet[ttl_offset],
-                packet[ttl_offset + 1],
-                packet[ttl_offset + 2],
-                packet[ttl_offset + 3],
-            ]);
-
-            // RFC 1035: Decrement TTL, floor at 0
-            let new_ttl = old_ttl.saturating_sub(decrement);
-            let ttl_bytes = new_ttl.to_be_bytes();
-            packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
-        }
-
-        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-
-        // Ensure the entire record (10 bytes header + RData) fits within remaining packet
-        // and handle potential overflow for the next iteration's position
-        let record_total_len = 10usize.saturating_add(rd_len);
-        if pos.saturating_add(record_total_len) > packet_len {
-            return;
-        }
-
-        pos += record_total_len;
-    }
+    // RFC 1035: Decrement TTL, floor at 0
+    map_record_ttls(packet, |ttl| ttl.saturating_sub(decrement));
 }
 
 /// Set all record TTLs in a DNS packet to an absolute value.
@@ -1492,6 +1431,30 @@ pub fn patch_all_ttls(packet: &mut [u8], decrement: u32) {
 /// 将 DNS 报文中所有记录的 TTL 设为绝对值。
 /// 用于 RFC 8767 stale 服务，将 TTL 设置为 serve_stale_ttl。
 pub fn set_all_ttls(packet: &mut [u8], new_ttl: u32) {
+    map_record_ttls(packet, |_| new_ttl);
+}
+
+/// 上游应答的每条记录 TTL 都收进 `floor..=cap`，两者冲突时以 `cap` 为准。只有一处持有这份应答时
+/// 原地改写，不复制。最后一条是 TSIG 的应答原样交回：改了签名就不对了。
+/// An upstream reply with the TTL of every record brought into `floor..=cap`,
+/// `cap` winning when the two cross. Rewritten in place, uncopied, when nothing
+/// else holds the reply. A reply whose last record is a TSIG is handed back as it
+/// is, since a change would invalidate the signature.
+pub(crate) fn reply_within_ttls(reply: Bytes, floor: u32, cap: u32) -> Bytes {
+    if last_record_is_tsig(&reply) {
+        return reply;
+    }
+    let mut reply = BytesMut::from(reply);
+    map_record_ttls(&mut reply, |ttl| ttl.max(floor).min(cap));
+    reply.freeze()
+}
+
+/// 用 `f` 改写报文里每条记录的 TTL；遇到放不下的记录就停。OPT（类型 41）伪记录跳过：它的 TTL
+/// 字段装的是 EDNS 扩展 RCODE 和标志（包括 DO 位），不是 TTL。
+/// Rewrites the TTL of every record in `packet` with `f`, stopping at the first
+/// record that does not fit. OPT (type 41) pseudo-records are skipped: their TTL
+/// field holds the EDNS extended RCODE and flags (the DO bit among them), not a TTL.
+fn map_record_ttls(packet: &mut [u8], mut f: impl FnMut(u32) -> u32) {
     if packet.len() < 12 {
         return;
     }
@@ -1513,9 +1476,8 @@ pub fn set_all_ttls(packet: &mut [u8], new_ttl: u32) {
         }
     }
 
-    // 2. Set TTL for Answer, Authority, and Additional sections
+    // 2. Answer, Authority, and Additional sections
     let total_records = an_count as usize + ns_count as usize + ar_count as usize;
-    let ttl_bytes = new_ttl.to_be_bytes();
     for _ in 0..total_records {
         if let Some(next) = skip_name(packet, pos) {
             pos = next;
@@ -1529,16 +1491,21 @@ pub fn set_all_ttls(packet: &mut [u8], new_ttl: u32) {
 
         // Type(2) Class(2) TTL(4) RDLen(2)
         let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-
-        // Skip OPT (type 41) pseudo-records: their TTL field contains EDNS extended
-        // RCODE and flags (including the DO bit), NOT an actual TTL value.
-        // 跳过 OPT（类型 41）伪记录：其 TTL 字段包含 EDNS 扩展 RCODE 和标志（包括 DO 位），不是真正的 TTL。
         if rtype != 41 {
             let ttl_offset = pos + 4;
-            packet[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl_bytes);
+            let old_ttl = u32::from_be_bytes([
+                packet[ttl_offset],
+                packet[ttl_offset + 1],
+                packet[ttl_offset + 2],
+                packet[ttl_offset + 3],
+            ]);
+            packet[ttl_offset..ttl_offset + 4].copy_from_slice(&f(old_ttl).to_be_bytes());
         }
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
+
+        // Ensure the entire record (10 bytes header + RData) fits within remaining packet
+        // and handle potential overflow for the next iteration's position
         let record_total_len = 10usize.saturating_add(rd_len);
         if pos.saturating_add(record_total_len) > packet_len {
             return;
@@ -1551,6 +1518,76 @@ pub fn set_all_ttls(packet: &mut [u8], new_ttl: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一个回答：两条 A 记录（TTL 5 和 100000），外加一条带 DO 位的 OPT
+    /// An answer of two A records (TTLs 5 and 100000) and an OPT with the DO bit set
+    fn answer_with_ttls_and_opt() -> Vec<u8> {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        use std::str::FromStr;
+        let name = Name::from_str("example.com.").unwrap();
+        let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+        for (ttl, last) in [(5, 1), (100_000, 2)] {
+            msg.add_answer(Record::from_rdata(
+                name.clone(),
+                ttl,
+                RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, last)),
+            ));
+        }
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        msg.set_edns(edns);
+        msg.to_vec().unwrap()
+    }
+
+    #[test]
+    fn reply_within_ttls_brings_every_record_in_and_leaves_opt_alone() {
+        let ttls = |bytes: &[u8]| {
+            let msg = Message::from_vec(bytes).unwrap();
+            let dnssec_ok = msg.edns.as_ref().unwrap().flags().dnssec_ok;
+            (
+                msg.answers.iter().map(|r| r.ttl).collect::<Vec<_>>(),
+                dnssec_ok,
+            )
+        };
+        let answer = Bytes::from(answer_with_ttls_and_opt());
+        assert_eq!(
+            ttls(&reply_within_ttls(answer.clone(), 60, 3600)),
+            (vec![60, 3600], true)
+        );
+        // 两者冲突时以上限为准 / The cap wins when the two cross
+        assert_eq!(
+            ttls(&reply_within_ttls(answer.clone(), 600, 300)),
+            (vec![300, 300], true)
+        );
+        assert_eq!(
+            ttls(&reply_within_ttls(answer, 0, u32::MAX)),
+            (vec![5, 100_000], true)
+        );
+    }
+
+    #[test]
+    fn reply_within_ttls_leaves_a_signed_reply_alone() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        use std::str::FromStr;
+        let name = Name::from_str("example.com.").unwrap();
+        let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+        msg.add_answer(Record::from_rdata(
+            name,
+            5,
+            RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, 1)),
+        ));
+        let mut signed = msg.to_vec().unwrap();
+        // 末尾一条 TSIG（根名、类型 250、类别 ANY、TTL 0、空 RDATA）
+        // A trailing TSIG (root name, type 250, class ANY, TTL 0, empty RDATA)
+        signed[11] = 1;
+        signed.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0]);
+        let reply = Bytes::from(signed);
+        assert_eq!(reply_within_ttls(reply.clone(), 60, 3600), reply);
+    }
 
     fn query_with_label(label: &[u8]) -> Vec<u8> {
         let mut packet = vec![
