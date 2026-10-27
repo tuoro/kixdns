@@ -998,9 +998,14 @@ impl TcpMuxClient {
 
         // Check if we are reusing an existing connection (for potential retry strategy)
         // 检查我们是否在重用现有连接（用于潜在的重试策略）
-        let is_reused = {
-            let guard = self.conn.lock().await;
-            guard.is_some()
+        // 不等连接锁：这一步在预算之外，以前前面有查询占着锁时会一直等。锁正被拿着，多半是有查询
+        // 在用这条连接，就当复用
+        // Without waiting for the connection lock: this step lies outside the budget
+        // and used to wait as long as the lock was held ahead of it. A held lock most
+        // likely means a query is using the connection, so it counts as reused
+        let is_reused = match self.conn.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
         };
 
         match self.send_attempt(packet, timeout_dur).await {
@@ -1062,7 +1067,20 @@ impl TcpMuxClient {
         let (tx, rx) = oneshot::channel();
 
         // 原子操作：分配 ID 并注册到 pending map，避免竞态条件
-        let (new_packet, new_id) = self.register_pending(packet, original_id, tx).await?;
+        // 注册要等连接锁，也受剩余预算约束：以前排在一长串注册后面的查询，会远远超出自己的时限
+        // Registration waits for the connection lock, so it is bounded by what is left
+        // of the budget too: a query queued behind a long run of registrations used to
+        // run far past its own deadline
+        let Ok(registered) =
+            timeout(remaining, self.register_pending(packet, original_id, tx)).await
+        else {
+            anyhow::bail!(
+                "TCP timeout waiting to register for upstream {upstream}",
+                upstream = self.upstream
+            );
+        };
+        let (new_packet, new_id) = registered?;
+        let remaining = timeout_dur.saturating_sub(start.elapsed());
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
@@ -1136,9 +1154,7 @@ impl TcpMuxClient {
 
                 // Record error and FORCE RESET on write timeout
                 // 记录错误并在写入超时时强制重置
-                self.record_error().await;
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
+                self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
                     "TCP write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
@@ -1158,9 +1174,7 @@ impl TcpMuxClient {
 
             // Record error and FORCE RESET on prereq timeout
             // 记录错误并在超时时强制重置
-            self.record_error().await;
-            self.reset().await;
-            self.consecutive_errors.store(0, Ordering::Release);
+            self.reset_after_deadline().await;
 
             return Err(anyhow::anyhow!(
                 "TCP timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
@@ -1215,9 +1229,7 @@ impl TcpMuxClient {
 
                 // Record error and FORCE RESET on response timeout (connection likely dead/stalled)
                 // 记录错误并在响应超时时强制重置（连接可能死锁/停滞）
-                self.record_error().await;
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
+                self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
                     "TCP response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
@@ -1248,6 +1260,7 @@ impl TcpMuxClient {
     /// released immediately.
     /// `budget` 约束建连；失败时立即释放锁和 permit。
     async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
+        let started = tokio::time::Instant::now();
         // First, check if we need to reconnect based on error state
         // 首先，根据错误状态检查是否需要重连
         let errors = self.consecutive_errors.load(Ordering::Acquire);
@@ -1266,10 +1279,33 @@ impl TcpMuxClient {
                 write_cancelled,
                 "TCP connection needs a reset before ensure"
             );
-            self.reset().await;
+            // 欠着的复位也守预算：前面的写入占着锁时不能等过时限；没做完下次再做
+            // An owed reset keeps to the budget too: with writes holding the lock
+            // ahead of it, it must not wait past the deadline; if unfinished, the next
+            // connect does it
+            if timeout(budget, self.reset()).await.is_err() {
+                if write_cancelled {
+                    self.write_cancelled.store(true, Ordering::Release);
+                }
+                anyhow::bail!(
+                    "tcp timeout resetting the connection after {}ms",
+                    budget.as_millis()
+                );
+            }
         }
 
-        let mut guard = self.conn.lock().await;
+        // 等连接锁也算在预算里：前面有查询占着锁时，不能等过自己的时限
+        // Waiting for the connection lock counts against the budget too: with the lock
+        // held ahead of it, a query must not wait past its own deadline
+        let Ok(mut guard) =
+            timeout(budget.saturating_sub(started.elapsed()), self.conn.lock()).await
+        else {
+            anyhow::bail!(
+                "tcp timeout waiting for the connection after {}ms",
+                budget.as_millis()
+            );
+        };
+        let budget = budget.saturating_sub(started.elapsed());
 
         if guard.is_none() {
             // Acquire connection-level permit (non-blocking)
@@ -1404,6 +1440,17 @@ impl TcpMuxClient {
                 break (frame, cand);
             }
 
+            // 头一个 ID 就被占着时看看是不是全被占了：65536 个 ID 都被等着的查询占着时立刻说没有，
+            // 不在连接锁下把每个 ID 都试一遍。以前一大批这样的查询排着队各试一遍，后面的都远远超出
+            // 时限。数一遍要锁每个分片，所以平常拿到空 ID 时不数
+            // The first ID taken, see whether all are: with all 65536 held by waiting
+            // queries, say so at once rather than try every ID under the connection
+            // lock. A crowd of such queries used to take turns trying them all, the later
+            // ones running far past their deadlines. Counting locks every shard, so it
+            // is skipped while the first ID is free
+            if tries == 1 && self.pending.len() > u16::MAX as usize {
+                anyhow::bail!("no available dns ids for tcp mux");
+            }
             if tries > u16::MAX as usize {
                 anyhow::bail!("no available dns ids for tcp mux");
             }
@@ -1418,10 +1465,20 @@ impl TcpMuxClient {
         conn: &Arc<Mutex<Option<OwnedWriteHalf>>>,
         conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
-        let err_msg = err.to_string();
         // Hold the connection lock while resetting and draining. register_pending uses the same
         // lock, so it either registers before this drain or observes the closed connection.
         let mut conn_guard = conn.lock().await;
+        Self::fail_all_locked(pending, err, &mut conn_guard, conn_permit).await;
+    }
+
+    /// [`fail_all_async`](Self::fail_all_async)，连接锁已经拿在手里 / [`fail_all_async`](Self::fail_all_async) with the connection lock already held
+    async fn fail_all_locked(
+        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
+        err: anyhow::Error,
+        conn_guard: &mut Option<OwnedWriteHalf>,
+        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
+    ) {
+        let err_msg = err.to_string();
         *conn_guard = None;
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
         for key in keys {
@@ -1455,6 +1512,30 @@ impl TcpMuxClient {
             &self.conn_permit,
         )
         .await;
+    }
+
+    /// 时限已经到了的查询复位连接。连接锁空着就马上复位；被别人拿着时（多半是排着队的写入）不等，
+    /// 记一次错误，下一次建连会先复位（见 `ensure_connection`）。以前这里一直等锁，排在长队后面的
+    /// 查询要远远超出时限才返回。
+    /// Reset the connection for a query whose deadline has passed. With the
+    /// connection lock free it resets at once; held by someone else (most likely a
+    /// queue of writes) it does not wait but records an error, and the next connect
+    /// resets first (see `ensure_connection`). It used to wait for the lock, so a
+    /// query at the back of a long queue returned far past its deadline.
+    async fn reset_after_deadline(&self) {
+        let Ok(mut conn) = self.conn.try_lock() else {
+            self.consecutive_errors.fetch_add(1, Ordering::Release);
+            return;
+        };
+        self.read_cancel.lock().await.cancel();
+        Self::fail_all_locked(
+            &self.pending,
+            anyhow::anyhow!("TCP connection reset"),
+            &mut conn,
+            &self.conn_permit,
+        )
+        .await;
+        self.consecutive_errors.store(0, Ordering::Release);
     }
 }
 
@@ -2302,9 +2383,10 @@ impl DotMuxClient {
             anyhow::bail!("dns packet too short for dot");
         }
 
-        let is_reused = {
-            let guard = self.conn.lock().await;
-            guard.is_some()
+        // 见 TcpMuxClient::send / See TcpMuxClient::send
+        let is_reused = match self.conn.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
         };
 
         match self.send_attempt(packet, timeout_dur).await {
@@ -2350,7 +2432,20 @@ impl DotMuxClient {
 
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
         let (tx, rx) = oneshot::channel();
-        let (new_packet, new_id) = self.register_pending(packet, original_id, tx).await?;
+        // 注册要等连接锁，也受剩余预算约束：以前排在一长串注册后面的查询，会远远超出自己的时限
+        // Registration waits for the connection lock, so it is bounded by what is left
+        // of the budget too: a query queued behind a long run of registrations used to
+        // run far past its own deadline
+        let Ok(registered) =
+            timeout(remaining, self.register_pending(packet, original_id, tx)).await
+        else {
+            anyhow::bail!(
+                "DoT timeout waiting to register for upstream {upstream}",
+                upstream = self.upstream
+            );
+        };
+        let (new_packet, new_id) = registered?;
+        let remaining = timeout_dur.saturating_sub(start.elapsed());
 
         let _guard = TcpPendingGuard {
             pending: self.pending.clone(),
@@ -2409,9 +2504,7 @@ impl DotMuxClient {
                 ));
             }
             Err(_) => {
-                self.record_error().await;
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
+                self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
                     "DoT write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
@@ -2425,9 +2518,7 @@ impl DotMuxClient {
 
         let elapsed_after_write = start.elapsed();
         if elapsed_after_write >= timeout_dur {
-            self.record_error().await;
-            self.reset().await;
-            self.consecutive_errors.store(0, Ordering::Release);
+            self.reset_after_deadline().await;
 
             return Err(anyhow::anyhow!(
                 "DoT timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
@@ -2466,9 +2557,7 @@ impl DotMuxClient {
                         timeout_ms = final_remaining.as_millis()
                     ));
                 }
-                self.record_error().await;
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
+                self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
                     "DoT response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
@@ -2484,6 +2573,7 @@ impl DotMuxClient {
     /// failure the lock and the permit are released immediately.
     /// `budget` 同时约束 TCP 建连和 TLS 握手；失败时立即释放锁和 permit。
     async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
+        let started = tokio::time::Instant::now();
         let errors = self.consecutive_errors.load(Ordering::Acquire);
         // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补齐 reader token 与连接级
         // permit（同 TCP）
@@ -2499,10 +2589,31 @@ impl DotMuxClient {
                 write_cancelled,
                 "DoT connection needs a reset before ensure"
             );
-            self.reset().await;
+            // 欠着的复位也守预算：前面的写入占着锁时不能等过时限；没做完下次再做
+            // An owed reset keeps to the budget too: with writes holding the lock
+            // ahead of it, it must not wait past the deadline; if unfinished, the next
+            // connect does it
+            if timeout(budget, self.reset()).await.is_err() {
+                if write_cancelled {
+                    self.write_cancelled.store(true, Ordering::Release);
+                }
+                anyhow::bail!(
+                    "dot timeout resetting the connection after {}ms",
+                    budget.as_millis()
+                );
+            }
         }
 
-        let mut guard = self.conn.lock().await;
+        // 见 TcpMuxClient::ensure_connection / See TcpMuxClient::ensure_connection
+        let Ok(mut guard) =
+            timeout(budget.saturating_sub(started.elapsed()), self.conn.lock()).await
+        else {
+            anyhow::bail!(
+                "dot timeout waiting for the connection after {}ms",
+                budget.as_millis()
+            );
+        };
+        let budget = budget.saturating_sub(started.elapsed());
         if guard.is_none() {
             let permit = self
                 .permit_manager
@@ -2629,6 +2740,10 @@ impl DotMuxClient {
                 });
                 break (frame, cand);
             }
+            // 见 TcpMuxClient::register_pending / See TcpMuxClient::register_pending
+            if tries == 1 && self.pending.len() > u16::MAX as usize {
+                anyhow::bail!("no available dns ids for dot mux");
+            }
             if tries > u16::MAX as usize {
                 anyhow::bail!("no available dns ids for dot mux");
             }
@@ -2643,10 +2758,20 @@ impl DotMuxClient {
         conn: &Arc<Mutex<Option<DotWriteHalf>>>,
         conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
-        let err_msg = err.to_string();
         // Hold the connection lock while resetting and draining. register_pending uses the same
         // lock, so it either registers before this drain or observes the closed connection.
         let mut conn_guard = conn.lock().await;
+        Self::fail_all_locked(pending, err, &mut conn_guard, conn_permit).await;
+    }
+
+    /// [`fail_all_async`](Self::fail_all_async)，连接锁已经拿在手里 / [`fail_all_async`](Self::fail_all_async) with the connection lock already held
+    async fn fail_all_locked(
+        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
+        err: anyhow::Error,
+        conn_guard: &mut Option<DotWriteHalf>,
+        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
+    ) {
+        let err_msg = err.to_string();
         *conn_guard = None;
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
         for key in keys {
@@ -2680,6 +2805,23 @@ impl DotMuxClient {
             &self.conn_permit,
         )
         .await;
+    }
+
+    /// 见 [`TcpMuxClient::reset_after_deadline`] / See [`TcpMuxClient::reset_after_deadline`]
+    async fn reset_after_deadline(&self) {
+        let Ok(mut conn) = self.conn.try_lock() else {
+            self.consecutive_errors.fetch_add(1, Ordering::Release);
+            return;
+        };
+        self.read_cancel.lock().await.cancel();
+        Self::fail_all_locked(
+            &self.pending,
+            anyhow::anyhow!("DoT connection reset"),
+            &mut conn,
+            &self.conn_permit,
+        )
+        .await;
+        self.consecutive_errors.store(0, Ordering::Release);
     }
 }
 
@@ -5670,6 +5812,9 @@ mod tests {
         async fn query(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes>;
         fn connection_generation(&self) -> u64;
         async fn drop_connection(&self);
+        fn pending(&self) -> &DashMap<u16, Pending, FxBuildHasher>;
+        /// 拿着连接锁 `hold` 这么久 / Hold the connection lock for `hold`
+        async fn hold_connection(&self, hold: Duration);
     }
 
     impl StreamMux for TcpMuxClient {
@@ -5682,6 +5827,13 @@ mod tests {
         async fn drop_connection(&self) {
             self.reset().await;
         }
+        fn pending(&self) -> &DashMap<u16, Pending, FxBuildHasher> {
+            &self.pending
+        }
+        async fn hold_connection(&self, hold: Duration) {
+            let _held = self.conn.lock().await;
+            tokio::time::sleep(hold).await;
+        }
     }
 
     impl StreamMux for DotMuxClient {
@@ -5693,6 +5845,13 @@ mod tests {
         }
         async fn drop_connection(&self) {
             self.reset().await;
+        }
+        fn pending(&self) -> &DashMap<u16, Pending, FxBuildHasher> {
+            &self.pending
+        }
+        async fn hold_connection(&self, hold: Duration) {
+            let _held = self.conn.lock().await;
+            tokio::time::sleep(hold).await;
         }
     }
 
@@ -5709,6 +5868,172 @@ mod tests {
             Arc::new(client_tls),
             Arc::new(PermitManager::new(1)),
         )
+    }
+
+    /// 一条连接上 65536 个 ID 全被等着的查询占着时，新查询立刻失败，连接照常用。此前每个新查询
+    /// 都要在连接锁下把 65536 个 ID 挨个试一遍，一大批这样的查询排着队，后面的远远超出时限。
+    /// With all 65536 IDs on a connection held by waiting queries, a new query fails
+    /// at once and the connection stays in use. Each new query used to try all 65536
+    /// IDs one by one under the connection lock, and a crowd of them queued up, the
+    /// later ones running far past their deadlines.
+    async fn a_full_id_space_fails_queries_at_once(client: &impl StreamMux) {
+        client
+            .query(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        let generation = client.connection_generation();
+        for id in 0..=u16::MAX {
+            client.pending().insert(
+                id,
+                Pending {
+                    original_id: id,
+                    frame: Bytes::new(),
+                    tx: oneshot::channel().0,
+                },
+            );
+        }
+
+        let started = tokio::time::Instant::now();
+        let query = udp_test_query("full.example");
+        let results = futures::future::join_all(
+            (0..2000).map(|_| client.query(&query, Duration::from_secs(1))),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_err), "no ID is free");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "2000 queries took {:?} to fail",
+            started.elapsed()
+        );
+        assert_eq!(client.connection_generation(), generation);
+
+        client.pending().clear();
+        client
+            .query(&udp_test_query("again.example"), Duration::from_secs(2))
+            .await
+            .expect("the same connection answers once IDs are free");
+        assert_eq!(client.connection_generation(), generation);
+    }
+
+    #[tokio::test]
+    async fn a_full_tcp_id_space_fails_queries_at_once() {
+        a_full_id_space_fails_queries_at_once(&tcp_test_client().await).await;
+    }
+
+    #[tokio::test]
+    async fn a_full_dot_id_space_fails_queries_at_once() {
+        a_full_id_space_fails_queries_at_once(&dot_test_client().await).await;
+    }
+
+    /// 连接锁被别人拿着时，查询等锁也守自己的时限，时限到了只有它失败，连接照常用。此前看连接
+    /// 是不是复用的、建连、登记都要等这把锁，要等多久就等多久：排在长队后面的查询远远超出时限，
+    /// 最后还把连接重建了。
+    /// With the connection lock held by someone else, a query waiting for it keeps to
+    /// its own deadline, and when that passes only the query fails while the
+    /// connection stays in use. Checking for a reused connection, connecting and
+    /// registering all waited for this lock as long as it took: a query at the back
+    /// of a long queue ran far past its deadline and then rebuilt the connection.
+    async fn waiting_for_the_connection_keeps_to_the_deadline(client: &impl StreamMux) {
+        client
+            .query(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        let generation = client.connection_generation();
+
+        let query = udp_test_query("queued.example");
+        let (_, (result, took)) =
+            tokio::join!(client.hold_connection(Duration::from_millis(800)), async {
+                // 等锁先被拿住 / Let the lock be taken first
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let started = tokio::time::Instant::now();
+                let result = client.query(&query, Duration::from_millis(200)).await;
+                (result, started.elapsed())
+            });
+        assert!(result.is_err(), "the lock is held past the deadline");
+        assert!(
+            took < Duration::from_millis(450),
+            "the query failed after {took:?}"
+        );
+        assert_eq!(
+            client.connection_generation(),
+            generation,
+            "nothing was wrong with the connection"
+        );
+        client
+            .query(&udp_test_query("after.example"), Duration::from_secs(2))
+            .await
+            .expect("the same connection answers");
+        assert_eq!(client.connection_generation(), generation);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_tcp_connection_keeps_to_the_deadline() {
+        waiting_for_the_connection_keeps_to_the_deadline(&tcp_test_client().await).await;
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_dot_connection_keeps_to_the_deadline() {
+        waiting_for_the_connection_keeps_to_the_deadline(&dot_test_client().await).await;
+    }
+
+    /// 时限到了的查询要复位连接、锁却被别人拿着时，它不等，按时返回；复位留给下一次建连。此前它
+    /// 要等到锁放开，排在长队后面的查询远远超出时限才返回。
+    /// A query past its deadline that has to reset the connection while someone else
+    /// holds the lock does not wait but returns on time, leaving the reset to the
+    /// next connect. It used to wait for the lock, so a query at the back of a long
+    /// queue returned far past its deadline.
+    async fn a_reset_past_the_deadline_does_not_wait_for_the_lock(client: &impl StreamMux) {
+        client
+            .query(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        let generation = client.connection_generation();
+
+        let query = udp_test_query("slow.example");
+        let next = udp_test_query("next.example");
+        let ((result, took, next_took), _) = tokio::join!(
+            async {
+                let started = tokio::time::Instant::now();
+                let result = client.query(&query, Duration::from_millis(300)).await;
+                let took = started.elapsed();
+                // 锁还被拿着：下一个查询做欠着的复位时也守自己的时限
+                // The lock is still held: the next query keeps to its own deadline
+                // while doing the owed reset
+                let started = tokio::time::Instant::now();
+                let next = client.query(&next, Duration::from_millis(200)).await;
+                assert!(next.is_err(), "the lock is still held");
+                (result, took, started.elapsed())
+            },
+            async {
+                // 查询的时限到之前把锁拿住 / Take the lock before the query's deadline
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                client.hold_connection(Duration::from_millis(800)).await;
+            }
+        );
+        assert!(result.is_err(), "the upstream never answers `slow`");
+        assert!(took < Duration::from_millis(500), "returned after {took:?}");
+        assert!(
+            next_took < Duration::from_millis(450),
+            "the next query returned after {next_took:?}"
+        );
+
+        // 下一次建连先把欠着的复位做完，再换新连接回答
+        // The next connect first does the owed reset, then answers over a new connection
+        client
+            .query(&udp_test_query("after.example"), Duration::from_secs(2))
+            .await
+            .expect("a new connection answers");
+        assert_eq!(client.connection_generation(), generation + 1);
+    }
+
+    #[tokio::test]
+    async fn a_tcp_reset_past_the_deadline_does_not_wait_for_the_lock() {
+        a_reset_past_the_deadline_does_not_wait_for_the_lock(&tcp_test_client().await).await;
+    }
+
+    #[tokio::test]
+    async fn a_dot_reset_past_the_deadline_does_not_wait_for_the_lock() {
+        a_reset_past_the_deadline_does_not_wait_for_the_lock(&dot_test_client().await).await;
     }
 
     /// 同一个 ID 下回答别的问题的不收，查询接着等自己的回答，和 UDP 一样。此前只按 ID 对号：
