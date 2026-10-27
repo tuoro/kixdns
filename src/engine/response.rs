@@ -56,13 +56,9 @@ pub(crate) fn make_static_ip_answer(
 
     // Parse the complete list first so invalid entries still fail atomically,
     // even when their address family is not relevant to this query.
-    let mut parsed_ips = Vec::new();
-    for ip in ips.split(',') {
-        let Ok(ip_addr) = ip.trim().parse::<IpAddr>() else {
-            return (ResponseCode::ServFail, Vec::new());
-        };
-        parsed_ips.push(ip_addr);
-    }
+    let Some(parsed_ips) = static_ips(ips) else {
+        return (ResponseCode::ServFail, Vec::new());
+    };
 
     let answers = parsed_ips
         .into_iter()
@@ -77,18 +73,50 @@ pub(crate) fn make_static_ip_answer(
     (ResponseCode::NoError, answers)
 }
 
+/// `static_ip_response` 的地址：逗号分隔的 IPv4/IPv6 地址，有一个读不出来就是 None
+/// The addresses of a `static_ip_response`: comma-separated IPv4/IPv6 addresses;
+/// None when any of them cannot be read
+pub(crate) fn static_ips(ips: &str) -> Option<Vec<IpAddr>> {
+    ips.split(',').map(|ip| ip.trim().parse().ok()).collect()
+}
+
+/// `static_cname_response` 的目标域名；空的或读不出来就是 None
+/// The target of a `static_cname_response`; None when empty or unreadable
+pub(crate) fn static_cname_target(target: &str) -> Option<Name> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Name::from_str(target).ok()
+}
+
+/// 单个 TXT 段最长 255 字节（RFC 1035 第 3.3 节） / A TXT segment is at most 255 bytes (RFC 1035 section 3.3)
+const MAX_TXT_SEGMENT: usize = 255;
+/// 一条 TXT 记录全部段加起来最长 65535 字节 / All segments of one TXT record are at most 65535 bytes together
+const MAX_TXT_TOTAL: usize = 65535;
+
+/// TXT 内容放不进一条记录时说明原因 / Why TXT content does not fit one record, when it does not
+pub(crate) fn txt_size_problem(text: &[String]) -> Option<String> {
+    if let Some(segment) = text.iter().find(|segment| segment.len() > MAX_TXT_SEGMENT) {
+        return Some(format!(
+            "a TXT segment of {} bytes is longer than {MAX_TXT_SEGMENT}",
+            segment.len()
+        ));
+    }
+    let total = text
+        .iter()
+        .fold(0usize, |total, segment| total.saturating_add(segment.len()));
+    (total > MAX_TXT_TOTAL)
+        .then(|| format!("TXT content of {total} bytes is longer than {MAX_TXT_TOTAL}"))
+}
+
 /// 创建静态 CNAME 记录响应 / Create a static CNAME record response
 pub(crate) fn make_static_cname_answer(
     qname: &str,
     target: &str,
     ttl: u32,
 ) -> (ResponseCode, Vec<Record>) {
-    let target = target.trim();
-    if target.is_empty() {
-        return (ResponseCode::ServFail, Vec::new());
-    }
-
-    let (Ok(name), Ok(target)) = (Name::from_str(qname), Name::from_str(target)) else {
+    let (Ok(name), Some(target)) = (Name::from_str(qname), static_cname_target(target)) else {
         return (ResponseCode::ServFail, Vec::new());
     };
 
@@ -107,31 +135,9 @@ pub(crate) fn make_static_txt_answer(
     ttl: u32,
 ) -> (ResponseCode, Vec<Record>) {
     // 验证TXT记录大小 / Validate TXT record size
-    const MAX_SEGMENT_SIZE: usize = 255;
-    const MAX_TOTAL_SIZE: usize = 65535;
-
-    let mut total_size = 0usize;
-    for txt_part in text {
-        // 检查单个段大小 / Check individual segment size
-        if txt_part.len() > MAX_SEGMENT_SIZE {
-            warn!(
-                qname = %qname,
-                size = txt_part.len(),
-                max = MAX_SEGMENT_SIZE,
-                "TXT record segment exceeds 255 bytes"
-            );
-            return (ResponseCode::ServFail, Vec::new());
-        }
-        total_size = total_size.saturating_add(txt_part.len());
-        if total_size > MAX_TOTAL_SIZE {
-            warn!(
-                qname = %qname,
-                size = total_size,
-                max = MAX_TOTAL_SIZE,
-                "TXT record total size exceeds 65535 bytes"
-            );
-            return (ResponseCode::ServFail, Vec::new());
-        }
+    if let Some(problem) = txt_size_problem(text) {
+        warn!(qname = %qname, %problem, "static TXT answer does not fit a record");
+        return (ResponseCode::ServFail, Vec::new());
     }
 
     if let Ok(name) = Name::from_str(qname) {

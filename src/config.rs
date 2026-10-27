@@ -1377,6 +1377,7 @@ pub struct ValidationReport {
 /// 启动时的监听检查（绑定地址与 DoH TLS 材料）。错误带完整原因链；JSON 语法错误包含行列位置。
 pub fn validate(raw: &str) -> Result<ValidationReport> {
     let cfg = parse_config(raw)?;
+    refuse_problems(&cfg)?;
     let version = cfg.version.clone();
     let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
     runtime.settings.listeners().context("validate listeners")?;
@@ -1385,6 +1386,151 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
         pipeline_count: runtime.pipelines.len(),
         rule_count: runtime.pipelines.iter().map(|p| p.rules.len()).sum(),
     })
+}
+
+/// 配置里会悄悄做成别的事的写法：读不懂的上游地址、拼错的 rcode、无效的静态 IP 或 CNAME 目标、
+/// 装不进一条记录的 TXT、跳到不存在的 pipeline、会匹配所有域名的空域名匹配器。以前这些都照常加载：
+/// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
+///
+/// 启动时只记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
+/// 拒绝它们，下一次改配置时就得改掉。
+///
+/// Ways of writing a configuration that silently do something else: an upstream
+/// address nothing can read, a misspelt rcode, an invalid static IP or CNAME target,
+/// TXT content that does not fit a record, a jump to a pipeline that does not exist,
+/// an empty domain matcher that matches every name. These all used to load as
+/// usual: the upstream kept failing, the rcode became NXDOMAIN, the static answer
+/// became SERVFAIL, the empty suffix matched everything.
+///
+/// Startup only logs them and loads as before, so a configuration in use keeps its
+/// behaviour across an upgrade; a reload and the panel's validation (see
+/// [`validate`]) refuse them, so the next change has to fix them.
+pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
+    let pipelines: rustc_hash::FxHashSet<&str> =
+        cfg.pipelines.iter().map(|p| p.id.as_str()).collect();
+    let mut found = Vec::new();
+    for upstream in split_upstreams(&cfg.settings.default_upstream) {
+        if let Some(problem) = crate::engine::upstream::upstream_problem(upstream, Transport::Udp) {
+            found.push(format!("default_upstream: {problem}"));
+        }
+    }
+    for (index, select) in cfg.pipeline_select.iter().enumerate() {
+        let place = format!("pipeline_select {}", index + 1);
+        if !pipelines.contains(select.pipeline.as_str()) {
+            found.push(format!("{place}: no pipeline \"{}\"", select.pipeline));
+        }
+        for matcher in &select.matchers {
+            if let PipelineSelectorMatcher::DomainSuffix { value }
+            | PipelineSelectorMatcher::DomainRegex { value } = &matcher.matcher
+                && value.is_empty()
+            {
+                found.push(format!("{place}: {EMPTY_DOMAIN_MATCHER}"));
+            }
+        }
+    }
+    for pipeline in &cfg.pipelines {
+        for rule in &pipeline.rules {
+            let place = format!("pipeline \"{}\" rule \"{}\"", pipeline.id, rule.name);
+            rule_problems(rule, &pipelines, |problem| {
+                found.push(format!("{place}: {problem}"))
+            });
+        }
+    }
+    if let Some(rule) = &cfg.background_refresh_rule {
+        rule_problems(rule, &pipelines, |problem| {
+            found.push(format!("background_refresh_rule: {problem}"))
+        });
+    }
+    found
+}
+
+/// [`problems`] 有一条就失败，列出全部 / Fail on any of [`problems`], listing them all
+pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
+    let found = problems(cfg);
+    anyhow::ensure!(found.is_empty(), "{}", found.join("; "));
+    Ok(())
+}
+
+const EMPTY_DOMAIN_MATCHER: &str = "an empty domain matcher matches every name";
+
+/// 逗号分隔的上游，和转发时的拆法一样 / Comma-separated upstreams, split as a forward splits them
+fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
+    upstreams
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn rule_problems(
+    rule: &Rule,
+    pipelines: &rustc_hash::FxHashSet<&str>,
+    mut report: impl FnMut(String),
+) {
+    use crate::engine::response::{static_cname_target, static_ips, txt_size_problem};
+
+    for matcher in &rule.matchers {
+        if let Matcher::DomainSuffix { value } | Matcher::DomainRegex { value } = &matcher.matcher
+            && value.is_empty()
+        {
+            report(EMPTY_DOMAIN_MATCHER.to_string());
+        }
+    }
+    for matcher in &rule.response_matchers {
+        if let ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
+            && value.is_empty()
+        {
+            report(EMPTY_DOMAIN_MATCHER.to_string());
+        }
+    }
+    let actions = rule
+        .actions
+        .iter()
+        .chain(&rule.response_actions_on_match)
+        .chain(&rule.response_actions_on_miss);
+    for action in actions {
+        match action {
+            Action::Forward {
+                upstream: Some(upstreams),
+                transport,
+                ..
+            } => {
+                for upstream in split_upstreams(upstreams) {
+                    if let Some(problem) = crate::engine::upstream::upstream_problem(
+                        upstream,
+                        transport.unwrap_or(Transport::Udp),
+                    ) {
+                        report(problem);
+                    }
+                }
+            }
+            Action::StaticResponse { rcode }
+                if crate::engine::utils::parse_rcode(rcode).is_none() =>
+            {
+                report(format!(
+                    "rcode \"{rcode}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED"
+                ));
+            }
+            Action::StaticIpResponse { ip } if static_ips(ip).is_none() => {
+                report(format!(
+                    "ip \"{ip}\" is not a comma-separated list of IP addresses"
+                ));
+            }
+            Action::StaticCnameResponse { target, .. } if static_cname_target(target).is_none() => {
+                report(format!("cname target \"{target}\" is not a domain name"));
+            }
+            Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text } => {
+                if let Some(problem) = txt_size_problem(text) {
+                    report(problem);
+                }
+            }
+            Action::JumpToPipeline { pipeline } if !pipelines.contains(pipeline.as_str()) => {
+                report(format!(
+                    "jump to pipeline \"{pipeline}\", which does not exist"
+                ));
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1510,6 +1656,130 @@ mod validation_tests {
         let err =
             validate(r#"{ "settings": { "cache_capacity": 0 } }"#).expect_err("zero capacity");
         assert!(format!("{err:#}").contains("cache_capacity"));
+    }
+
+    /// 一条规则，带上给定的匹配器和动作 / One rule with the given matchers and actions
+    fn rule(
+        name: &str,
+        matchers: serde_json::Value,
+        actions: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({ "name": name, "matchers": matchers, "actions": actions })
+    }
+
+    fn problems_of(config: serde_json::Value) -> Vec<String> {
+        super::problems(&super::parse_config(&config.to_string()).expect("parses"))
+    }
+
+    /// 会悄悄做成别的事的写法，每一种都报出来，带上在哪条规则
+    /// Every way of writing that silently does something else is named, with where it is
+    #[test]
+    fn problems_name_what_would_silently_do_something_else() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "dns.example:53" },
+            "pipeline_select": [{ "pipeline": "gone", "matchers": [{ "type": "domain_suffix", "value": "" }] }],
+            "pipelines": [{ "id": "main", "rules": [
+                rule("port", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "1.1.1.1:99999" }])),
+                rule("name", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "nonsense" }])),
+                rule("scheme", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "http://1.1.1.1:53" }])),
+                rule("doq", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "doq://223.5.5.5:853" }])),
+                rule("rcode", any.clone(), serde_json::json!([{ "type": "static_response", "rcode": "WHATEVER" }])),
+                rule("ip", any.clone(), serde_json::json!([{ "type": "static_ip_response", "ip": "192.0.2.1, nope" }])),
+                rule("noip", any.clone(), serde_json::json!([{ "type": "static_ip_response", "ip": "" }])),
+                rule("cname", any.clone(), serde_json::json!([{ "type": "static_cname_response", "target": "" }])),
+                rule("txt", any.clone(), serde_json::json!([{ "type": "static_txt_response", "text": "x".repeat(256) }])),
+                rule("jump", any.clone(), serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "gone" }])),
+                rule("suffix", serde_json::json!([{ "type": "domain_suffix", "value": "" }]), serde_json::json!([{ "type": "allow" }])),
+                rule("regex", serde_json::json!([{ "type": "domain_regex", "value": "" }]), serde_json::json!([{ "type": "allow" }])),
+                {
+                    "name": "late",
+                    "matchers": any,
+                    "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
+                    "response_matchers": [{ "type": "request_domain_regex", "value": "" }],
+                    "response_actions_on_miss": [{ "type": "forward", "upstream": "udp+tcp://dns.example:53" }]
+                }
+            ]}]
+        });
+        let found = problems_of(config);
+        for (place, fragment) in [
+            ("default_upstream", "dns.example:53"),
+            ("pipeline_select 1", "no pipeline \"gone\""),
+            ("pipeline_select 1", "empty domain matcher"),
+            ("rule \"port\"", "1.1.1.1:99999"),
+            ("rule \"name\"", "nonsense"),
+            ("rule \"scheme\"", "unknown prefix \"http://\""),
+            ("rule \"doq\"", "sni"),
+            ("rule \"rcode\"", "WHATEVER"),
+            ("rule \"ip\"", "192.0.2.1, nope"),
+            ("rule \"noip\"", "ip \"\""),
+            ("rule \"cname\"", "cname target"),
+            ("rule \"txt\"", "256 bytes"),
+            ("rule \"jump\"", "\"gone\", which does not exist"),
+            ("rule \"suffix\"", "empty domain matcher"),
+            ("rule \"regex\"", "empty domain matcher"),
+            ("rule \"late\"", "empty domain matcher"),
+            ("rule \"late\"", "udp+tcp://dns.example:53"),
+        ] {
+            assert!(
+                found
+                    .iter()
+                    .any(|problem| problem.contains(place) && problem.contains(fragment)),
+                "missing {place} / {fragment} in {found:#?}"
+            );
+        }
+        assert_eq!(found.len(), 17, "{found:#?}");
+    }
+
+    /// 平常的正确写法一条都不报 / The ordinary right ways of writing raise nothing
+    #[test]
+    fn problems_leave_the_right_ways_of_writing_alone() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let forward = |upstream: &str, transport: Option<&str>| {
+            let mut action = serde_json::json!({ "type": "forward", "upstream": upstream });
+            if let Some(transport) = transport {
+                action["transport"] = serde_json::json!(transport);
+            }
+            serde_json::json!([action])
+        };
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53, [2001:db8::1]:53" },
+            "pipeline_select": [{ "pipeline": "other", "matchers": [{ "type": "domain_suffix", "value": "example.com" }] }],
+            "pipelines": [
+                { "id": "main", "rules": [
+                    rule("udp", any.clone(), forward("udp://9.9.9.9:53", None)),
+                    rule("tcp name", any.clone(), forward("dns.example:53", Some("tcp"))),
+                    rule("tcp prefix", any.clone(), forward("tcp://dns.example:53", None)),
+                    rule("doh", any.clone(), forward("https://dns.example/dns-query, doh://dns.example", None)),
+                    rule("dot", any.clone(), forward("tls://1.1.1.1?sni=one.one.one.one", None)),
+                    rule("doq", any.clone(), forward("dns.example:853", Some("doq"))),
+                    rule("ips", any.clone(), serde_json::json!([{ "type": "static_ip_response", "ip": "192.0.2.1, 2001:db8::1" }])),
+                    rule("cname", any.clone(), serde_json::json!([{ "type": "static_cname_response", "target": "target.example" }])),
+                    rule("txt", any.clone(), serde_json::json!([{ "type": "static_txt_response", "text": ["a", "b"] }])),
+                    rule("rcode", any.clone(), serde_json::json!([{ "type": "static_response", "rcode": "refused" }])),
+                    rule("jump", serde_json::json!([{ "type": "domain_suffix", "value": ".example" }]), serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "other" }]))
+                ]},
+                { "id": "other", "rules": [] }
+            ]
+        });
+        assert_eq!(problems_of(config), Vec::<String>::new());
+    }
+
+    /// 面板的校验拒绝这些写法，一次列出全部 / The panel's validation refuses these, listing them all at once
+    #[test]
+    fn validate_refuses_the_problems_and_lists_them_all() {
+        let config = serde_json::json!({
+            "pipelines": [{ "id": "main", "rules": [
+                rule("rcode", serde_json::json!([{ "type": "any" }]), serde_json::json!([{ "type": "static_response", "rcode": "WHATEVER" }])),
+                rule("jump", serde_json::json!([{ "type": "any" }]), serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "gone" }]))
+            ]}]
+        });
+        let err = validate(&config.to_string()).expect_err("refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("WHATEVER") && message.contains("\"gone\""),
+            "{message}"
+        );
     }
 
     /// 只列出启动时才读的设置；重载即生效的改了不算，改回去以后也不再列

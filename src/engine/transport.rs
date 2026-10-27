@@ -2723,6 +2723,51 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// 一个上游地址（不带前缀）用 `transport` 读不读得懂，读法和各个客户端连接时一样
+/// Whether `transport` can read one upstream address (prefix removed), read the
+/// way each client reads it when it connects
+pub(crate) fn check_upstream_address(
+    address: &str,
+    transport: crate::config::Transport,
+) -> anyhow::Result<()> {
+    use crate::config::Transport;
+
+    // UDP 只认 IP 和端口（见 UdpClient::send）；TCP 交给 TcpStream::connect，也认域名
+    // UDP takes an IP and a port only (see UdpClient::send); TCP goes to
+    // TcpStream::connect, which takes a name too
+    let socket_address = |address: &str| -> anyhow::Result<()> {
+        let parsed: SocketAddr = address
+            .parse()
+            .context("expected an IP address and a port")?;
+        anyhow::ensure!(parsed.port() != 0, "port 0");
+        Ok(())
+    };
+    match transport {
+        Transport::Udp | Transport::TcpUdp => socket_address(address),
+        Transport::Tcp => {
+            if socket_address(address).is_ok() {
+                return Ok(());
+            }
+            let (host, port) = address
+                .rsplit_once(':')
+                .context("expected a host and a port")?;
+            let port: u16 = port.parse().context("invalid port")?;
+            anyhow::ensure!(port != 0, "port 0");
+            anyhow::ensure!(
+                !host.is_empty()
+                    && host
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.'),
+                "invalid host \"{host}\""
+            );
+            Ok(())
+        }
+        Transport::Doh => build_doh_url(address).map(drop),
+        Transport::Dot => parse_dot_target(address).map(drop),
+        Transport::Doq => parse_doq_target(address).map(drop),
+    }
+}
+
 fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
     let url = if upstream.contains("://") {
         Url::parse(upstream)

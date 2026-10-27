@@ -33,7 +33,10 @@ pub fn spawn(path: PathBuf, engine: Engine) {
             let observed = engine.observer().is_some();
             let mut last_error = None;
             let loaded = load_with_retry("config", || {
+                // 启动时只记警告的那些写法，重载时拒绝（见 config::problems）
+                // What startup only warns about, a reload refuses (see config::problems)
                 let result = config::load_config_with_source(&path).and_then(|(cfg, raw)| {
+                    config::refuse_problems(&cfg)?;
                     RuntimePipelineConfig::from_config(cfg).map(|cfg| (cfg, raw))
                 });
                 if observed && let Err(err) = &result {
