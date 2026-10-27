@@ -1653,7 +1653,7 @@ type Rejection = (StatusCode, serde_json::Value);
 #[cfg(unix)]
 fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String), Rejection> {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RecordType};
+    use hickory_proto::rr::RecordType;
     use std::str::FromStr;
 
     if domain.len() > 253 {
@@ -1662,10 +1662,20 @@ fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String
             error_json("diagnostic_domain_invalid", "域名过长"),
         ));
     }
-    let name = Name::from_ascii(domain).map_err(|error| {
+    // 和查询日志、规则看到的名字是同一种写法（见 `proto_utils::name_text`）：`\DDD` 是三位十进制，
+    // 和 RFC 1035 一样。hickory 自己的解析按八进制读，查询日志里的 `www\046matched.test` 拿来诊断
+    // 就成了别的名字
+    // The same text the query log and the rules show a name in (see
+    // `proto_utils::name_text`): `\DDD` is three decimal digits, as in RFC 1035. hickory's own
+    // parser reads them as octal, so `www\046matched.test` from the query log asked for
+    // another name
+    let name = crate::proto_utils::name_from_text(domain).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            error_json("diagnostic_domain_invalid", &format!("域名无效：{error}")),
+            error_json(
+                "diagnostic_domain_invalid",
+                "域名无效：标签只能用可打印的 ASCII 字符，其余字节、标签里的点和反斜杠写成 \\DDD（三位十进制）",
+            ),
         )
     })?;
     let record_type = record_type.trim().to_ascii_uppercase();
@@ -3238,6 +3248,61 @@ mod diagnostic_tests {
             .iter()
             .map(|answer| answer.as_str().unwrap_or_default().to_owned())
             .collect()
+    }
+
+    /// 诊断的域名按查询日志写名字的方式读（见 `proto_utils::name_text`）：`\DDD` 是十进制，大小写
+    /// 照写；查询日志写出的名字拿来诊断，问的就是同一个名字
+    /// A diagnostic domain is read the way the query log writes names (see
+    /// `proto_utils::name_text`): `\DDD` is decimal and the case is kept; a name taken from
+    /// the query log asks for that same name
+    #[test]
+    fn a_diagnostic_domain_is_read_as_the_query_log_writes_it() {
+        use hickory_proto::op::Message;
+        let labels = |domain: &str| {
+            let (packet, _) = diagnostic_packet(domain, "A").expect(domain);
+            let message = Message::from_vec(&packet).expect("a readable query");
+            message.queries[0]
+                .name()
+                .iter()
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>()
+        };
+        // Decimal 101 is `e`; read as octal it would be `A`
+        // 十进制 101 是 `e`，按八进制读会是 `A`
+        assert_eq!(labels(r"x\101y.example"), [&b"xey"[..], b"example"]);
+        assert_eq!(
+            labels(r"www\046matched.test"),
+            [&b"www.matched"[..], b"test"]
+        );
+        assert_eq!(
+            labels(r"caf\195\169.example"),
+            [&b"caf\xc3\xa9"[..], b"example"]
+        );
+        assert_eq!(
+            labels("WWW.Example.COM."),
+            [&b"WWW"[..], b"Example", b"COM"]
+        );
+        for labels_in in [
+            vec![&b"x\xffy"[..], b"blocked", b"test"],
+            vec![&b"a b"[..], b"back\\slash", b"test"],
+        ] {
+            let name = hickory_proto::rr::Name::from_labels(labels_in.clone()).unwrap();
+            assert_eq!(labels(&crate::proto_utils::name_text(&name)), labels_in);
+        }
+        for invalid in [
+            "a..b",
+            r"x\9y.test",
+            r"x\256y.test",
+            "caf\u{e9}.example",
+            "a b.test",
+        ] {
+            let (status, body) = diagnostic_packet(invalid, "A").expect_err(invalid);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+            assert_eq!(
+                body["error"]["code"], "diagnostic_domain_invalid",
+                "{invalid}"
+            );
+        }
     }
 
     #[tokio::test]
