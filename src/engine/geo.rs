@@ -14,7 +14,7 @@ use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_con
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::{GeoIpManager, is_country_tag};
-use crate::matcher::geosite::GeoSiteManager;
+use crate::matcher::geosite::{GeoSiteManager, parsed_provides_any};
 use crate::watcher::{FileWatch, PendingWatch, load_with_retry};
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
@@ -209,6 +209,9 @@ fn load_geosite(spec: GeoSiteSpec, shared: &Arc<RwLock<GeoSiteManager>>) -> Load
             }
         }
     }
+    if !files.is_empty() {
+        warn_missing_geosite_tags(&fresh.missing_tags(&spec.tags));
+    }
     // 旧数据在锁外释放 / The old data is freed outside the lock
     let old = mem::replace(&mut *shared.write(), fresh);
     drop(old);
@@ -233,8 +236,32 @@ fn load_geosite(spec: GeoSiteSpec, shared: &Arc<RwLock<GeoSiteManager>>) -> Load
 fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[String]) {
     let what = format!("GeoSite data {}", path.display());
     if let Some(parsed) = load_with_retry(&what, || GeoSiteManager::parse_file(path, tags)) {
-        let count = manager.write().apply_source(path, parsed);
+        // 这份文件此前提供着规则用到的标签，新读出来却一个都没有了：多半是空文件或写坏了的文件（下载
+        // 失败、磁盘写满）。换进去会让这些规则一下子全不命中，所以留着正在用的数据，等文件下次改动
+        // The file provided tags rules use until now, yet the new read has none of them: most
+        // likely an empty or broken file (a failed download, a full disk). Swapping it in would
+        // stop those rules matching at once, so the data in use stays until the file changes again
+        if !tags.is_empty()
+            && !parsed_provides_any(&parsed, tags)
+            && manager.read().source_provides_any(path, tags)
+        {
+            warn!(target = "geosite_watcher", path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
+            return;
+        }
+        let mut manager = manager.write();
+        let count = manager.apply_source(path, parsed);
+        let missing = manager.missing_tags(tags);
+        drop(manager);
         info!(target = "geosite_watcher", path = %path.display(), loaded_count = count, "GeoSite data reloaded");
+        warn_missing_geosite_tags(&missing);
+    }
+}
+
+/// 规则用到、却没有一个 GeoSite 数据文件提供的标签记一条告警，和 GeoIP 一样
+/// Logs the tags rules use that no GeoSite data file provides, as GeoIP does
+fn warn_missing_geosite_tags(missing: &[String]) {
+    if !missing.is_empty() {
+        warn!(target = "geosite", tags = ?missing, "GeoSite tags used by rules are not in any data file and never match");
     }
 }
 
@@ -313,6 +340,13 @@ fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<Geo
 fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String]) {
     let what = format!("GeoIP data {}", path.display());
     if let Some(parsed) = load_with_retry(&what, || GeoIpManager::parse_file(path, tags)) {
+        // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
+        // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
+        // none of them any more, most likely a broken file, so the data in use stays
+        if parsed.tag_count() == 0 && manager.read().tag_count() > 0 {
+            warn!(target = "geoip_watcher", path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
+            return;
+        }
         let count = manager.write().apply_parsed(parsed);
         info!(target = "geoip_watcher", path = %path.display(), loaded_count = count, "GeoIP data reloaded");
     }

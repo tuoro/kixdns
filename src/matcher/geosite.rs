@@ -740,11 +740,44 @@ impl GeoSiteManager {
         self.database.contains_key(tag)
     }
 
+    /// `tags`（规则用到的，不分大小写）里哪些没有一个数据文件提供：用它们的规则永远不会命中
+    /// The tags among `tags` (the ones rules use, ignoring case) that no data file provides:
+    /// rules using them never match
+    pub fn missing_tags(&self, tags: &[String]) -> Vec<String> {
+        let mut missing: Vec<String> = tags
+            .iter()
+            .map(|tag| tag.to_ascii_lowercase())
+            .filter(|tag| !self.database.contains_key(tag))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
+    }
+
+    /// 数据文件 `path` 眼下有没有提供 `tags`（不分大小写）里的标签
+    /// Whether data file `path` provides any of `tags` (ignoring case) right now
+    pub fn source_provides_any(&self, path: &Path, tags: &[String]) -> bool {
+        self.sources
+            .get(&Self::source_key(path))
+            .is_some_and(|provided| provided.iter().any(|tag| is_one_of(tag, tags)))
+    }
+
     /// 获取标签的所有域名匹配器（仅用于调试）/ Get all domain matchers for a tag (debug only)
     #[inline]
     pub fn get_tag_matchers(&self, tag: &str) -> Option<Vec<DomainMatcher>> {
         self.database.get(tag).map(TagMatchers::to_matchers)
     }
+}
+
+/// 解析出的这份数据有没有 `tags`（规则用到的，不分大小写）里的标签
+/// Whether this parsed data has any of `tags` (the ones rules use, ignoring case)
+pub fn parsed_provides_any(parsed: &ParsedGeoSite, tags: &[String]) -> bool {
+    parsed.iter().any(|(tag, _)| is_one_of(tag, tags))
+}
+
+/// `tag`（已是小写）是不是 `tags` 里的一个，不分大小写 / Whether `tag` (lowercase already) is one of `tags`, ignoring case
+fn is_one_of(tag: &str, tags: &[String]) -> bool {
+    tags.iter().any(|wanted| wanted.eq_ignore_ascii_case(tag))
 }
 
 /// V2Ray .dat 文件格式常量 / V2Ray .dat file format constants

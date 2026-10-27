@@ -568,6 +568,38 @@ async fn test_doh_half_sent_request_head_is_closed_after_timeout() {
     );
 }
 
+/// 请求头发完、正文只发了一部分就停的请求，时限一到回 408 并断开。以前只有请求头有时限，这样的
+/// 连接会一直开着。
+/// A request whose head is in but whose body stops part way is answered 408 and
+/// dropped once the time runs out. Only the head used to be bounded, so such a
+/// connection stayed open for good.
+#[tokio::test]
+async fn test_doh_half_sent_body_is_answered_408_after_timeout() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let mut stream = raw_tls_connect(&server).await;
+    let query = make_dns_query("example.com", 1);
+    let head = format!(
+        "POST /dns-query HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+        query.len()
+    );
+    stream.write_all(head.as_bytes()).await.expect("write head");
+    stream
+        .write_all(&query[..query.len() / 2])
+        .await
+        .expect("write half the body");
+
+    let started = std::time::Instant::now();
+    let status = tokio::time::timeout(Duration::from_secs(30), read_status_line(&mut stream))
+        .await
+        .expect("the server must answer instead of waiting for the rest of the body");
+    let elapsed = started.elapsed();
+    assert!(status.starts_with("HTTP/1.1 408"), "got {status:?}");
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(20),
+        "answered after {elapsed:?}"
+    );
+}
+
 // ============================================================================
 // Concurrent request test
 // ============================================================================
