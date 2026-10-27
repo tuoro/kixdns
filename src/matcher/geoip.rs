@@ -662,6 +662,11 @@ impl GeoIpManager {
         })
     }
 
+    /// 数据文件给出的标签数（只算规则用到的那些）/ How many tags the data file gives (only those rules use)
+    pub fn tag_count(&self) -> usize {
+        self.tag_indexes.len()
+    }
+
     /// 用解析结果整体替换索引
     /// Replace the indexes wholesale with a parsed result
     ///
@@ -672,11 +677,6 @@ impl GeoIpManager {
     /// of geosite's per-source bookkeeping applies here: both loaders already
     /// replace wholesale and a failed parse leaves the manager untouched, so
     /// failure atomicity was never the gap.
-    /// 数据文件给出的标签数（只算规则用到的那些）/ How many tags the data file gives (only those rules use)
-    pub fn tag_count(&self) -> usize {
-        self.tag_indexes.len()
-    }
-
     pub fn apply_parsed(&mut self, parsed: ParsedGeoIp) -> usize {
         self.tag_indexes = parsed.tag_indexes;
 
