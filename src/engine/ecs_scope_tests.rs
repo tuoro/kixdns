@@ -248,6 +248,42 @@ fn ip(text: &str) -> IpAddr {
     text.parse().unwrap()
 }
 
+/// `from_client_ip` 把 0.0.0.0 当作内网地址，255.255.255.255 不当作（`geoip_private` 正相反，见
+/// `private_address_tests`）：
+/// - 来源地址是 0.0.0.0 时不加 ECS，是 255.255.255.255 时加它的 /24；
+/// - 公网客户端自己带的 0.0.0.0/8 不发给上游，换成来源地址的子网；255.255.255.0/24 原样转发。
+///
+/// `from_client_ip` counts 0.0.0.0 as a local network address and 255.255.255.255 not
+/// (`geoip_private` the other way round, see `private_address_tests`):
+/// - a source address of 0.0.0.0 gets no ECS, one of 255.255.255.255 its /24;
+/// - a public client's own 0.0.0.0/8 does not go upstream and the source address's
+///   subnet goes instead, while its own 255.255.255.0/24 goes on as it is.
+#[tokio::test]
+async fn from_client_ip_counts_0_0_0_0_as_private_but_not_255_255_255_255() {
+    let up = upstream(Echo::Nothing).await;
+    // 每个请求一个新引擎：不带 ECS 的应答会给所有子网共用（见 `a_reply_without_ecs_is_shared_by_every_client_subnet`）
+    // A fresh engine per request: an answer without ECS is shared by every subnet (see
+    // `a_reply_without_ecs_is_shared_by_every_client_subnet`)
+    for (client, subnet) in [
+        ("0.0.0.0", None),
+        ("255.255.255.255", None),
+        ("198.51.100.7", Some(("0.0.0.0", 8))),
+        ("198.51.100.7", Some(("255.255.255.0", 24))),
+    ] {
+        let engine = engine(forward_all(&up.address, from_client_ip()));
+        reply(&engine, client, subnet).await;
+    }
+    assert_eq!(
+        seen(&up),
+        [
+            None,
+            Some((ip("255.255.255.0"), 24)),
+            Some((ip("198.51.100.0"), 24)),
+            Some((ip("255.255.255.0"), 24)),
+        ]
+    );
+}
+
 /// 不写 `ecs` 的转发把客户端自己带的 ECS 原样转给上游。上游按子网作答（作用范围 /24），
 /// 另一个子网的客户端不能从缓存拿到这份应答。
 /// A forward without `ecs` passes the client's own ECS upstream. The upstream

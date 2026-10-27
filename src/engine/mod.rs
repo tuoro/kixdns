@@ -23,6 +23,8 @@ pub(crate) mod observation;
 pub mod phases;
 pub mod pipeline;
 #[cfg(test)]
+mod private_address_tests;
+#[cfg(test)]
 mod query_flags_tests;
 #[cfg(test)]
 mod question_case_tests;

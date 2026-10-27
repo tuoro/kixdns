@@ -699,21 +699,35 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-/// 检测 IP 是否为私有地址 / Detect if IP is private address
+/// `geoip_private` 和 ECS 都算作内网的地址：IPv4 的 RFC 1918 私有网段、回环、链路本地，IPv6 的
+/// 回环、未指定地址、ULA（fc00::/7）、链路本地（fe80::/10）。两边各自再多算一个地址，见
+/// [`is_private_ip`] 和 `ecs::is_private_ip`
+/// The addresses both `geoip_private` and ECS count as local network ones: for IPv4 the
+/// RFC 1918 private networks, loopback and link-local; for IPv6 loopback, the
+/// unspecified address, ULA (fc00::/7) and link-local (fe80::/10). Each counts one more
+/// address of its own, see [`is_private_ip`] and `ecs::is_private_ip`
 #[inline]
-pub fn is_private_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_local_network(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ipv4) => {
-            ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local() || ipv4.is_broadcast()
-        }
-        IpAddr::V6(ipv6) => {
-            let seg0 = ipv6.segments()[0];
-            ipv6.is_loopback()
-                || ipv6.is_unspecified()
-                || (seg0 & 0xffc0) == 0xfe80  // Link-local addresses (fe80::/10)
-                || (seg0 & 0xfe00) == 0xfc00 // Unique Local Addresses (fc00::/7)
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
         }
     }
+}
+
+/// `geoip_private` 匹配器眼里的内网地址 / A local network address as `geoip_private` sees it
+#[inline]
+pub fn is_private_ip(ip: IpAddr) -> bool {
+    // 受限广播地址 255.255.255.255 只在本链路上发、出不了本地网络，所以 geoip_private 一直把它
+    // 算作内网地址；ECS 那边不算（见 `ecs::is_private_ip`）
+    // The limited broadcast address 255.255.255.255 only goes out on the local link and
+    // never leaves the local network, so geoip_private has always counted it as a local
+    // one; ECS does not (see `ecs::is_private_ip`)
+    is_local_network(ip) || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
 }
 
 #[cfg(test)]
