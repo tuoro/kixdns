@@ -7,7 +7,7 @@ use tracing::{debug, error, warn};
 use crate::ecs_scope::EcsReach;
 use crate::engine::Engine;
 use crate::engine::types::EngineInner;
-use crate::engine::utils::{RefreshingGuard, is_refreshing};
+use crate::engine::utils::RefreshingGuard;
 use crate::matcher::Requester;
 
 /// 后台刷新要更新的缓存条目：它所在的槽位，以及它适用的请求方
@@ -74,7 +74,7 @@ impl RefreshTarget {
 ///
 /// 防止无限循环的保护措施：
 /// Protection against infinite loops:
-/// 1. 检查 is_refreshing
+/// 1. 打得上刷新标记才刷新（`RefreshingGuard::try_new`）
 /// 2. 后台请求设置 skip_cache=true
 /// 3. RefreshingGuard 确保刷新标记在任务完成后被清除
 ///
@@ -102,14 +102,17 @@ pub fn spawn_background_refresh(
 ) {
     let (pipeline_id, qname) = (renewed.pipeline_id.as_ref(), renewed.qname.as_ref());
     let qtype = RecordType::from(renewed.qtype);
-    // FIX: Check if already refreshing to prevent duplicate refreshes
-    // 修复：检查是否已在刷新，防止重复刷新
-    // OPTIMIZATION: Hybrid bloom filter + DashSet check
-    // 优化：混合布隆过滤器 + DashSet 检查
+    // 先打上刷新标记，打不上就是已经有人在刷新（见 `RefreshingGuard::try_new`）；guard 在任务
+    // 结束时清掉标记，下面提前返回时也一样
+    // Set the refresh mark first; failing that, someone is refreshing already (see
+    // `RefreshingGuard::try_new`). The guard clears the mark when the task ends, and on
+    // the early return below too
     let mark = RefreshTarget::mark_of(slot, &renewed.reach);
-    if is_refreshing(&engine.refreshing_bitmap, &engine.refreshing_set, mark) {
+    let Some(guard) =
+        RefreshingGuard::try_new(&engine.refreshing_bitmap, &engine.refreshing_set, mark)
+    else {
         return;
-    }
+    };
     let target = RefreshTarget::new(
         slot,
         renewed.pipeline_id.clone(),
@@ -151,11 +154,8 @@ pub fn spawn_background_refresh(
         }
     };
 
-    // Step 2: Create RefreshingGuard and spawn background task
-    // 步骤 2：创建 RefreshingGuard 并生成后台任务
-    // RefreshingGuard will auto-clear the bitmap on drop via RAII
-    // RefreshingGuard 会在 drop 时通过 RAII 自动清除位图标记
-    let _guard = RefreshingGuard::new(&engine.refreshing_bitmap, &engine.refreshing_set, mark);
+    // Step 2: Spawn the background task, which holds the refresh mark's guard
+    // 步骤 2：生成后台任务，刷新标记的 guard 交给它
     let engine = engine.clone();
     let qname_owned = qname.to_string();
     let pipeline_id_owned = pipeline_id.to_string();
@@ -163,7 +163,7 @@ pub fn spawn_background_refresh(
     tokio::spawn(async move {
         // Move guard into the async task so it clears when task completes
         // 将 guard 移动到异步任务中，这样任务完成时会清除标记
-        let _guard = _guard;
+        let _guard = guard;
 
         // Use original client peer IP for correct ECS injection (RFC 7871) and pipeline selection.
         // Port is irrelevant — only .ip() is consumed downstream.

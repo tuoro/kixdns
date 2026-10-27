@@ -1119,9 +1119,10 @@ pub(crate) async fn handle_forward_decision_logged(
                         pipeline,
                         remaining_jumps,
                     } => {
-                        let edns_present = proto_utils::parse_quick(packet, &mut [0u8; 256])
-                            .map(|p| p.edns_present)
-                            .unwrap_or(false);
+                        // 客户端自己的查询带不带 EDNS；`packet` 可能是转发时加过 ECS 的
+                        // Whether the client's own query carries EDNS; `packet` may have had an ECS
+                        // option added by the forward
+                        let edns_present = requester.edns;
 
                         // 单独在堆上分配，见上 / Allocated on its own, see above
                         let resp_bytes = Box::pin(rules::process_response_jump(
@@ -1389,9 +1390,10 @@ pub(crate) async fn handle_forward_decision_logged(
                             pipeline,
                             remaining_jumps,
                         } => {
-                            let edns_present = proto_utils::parse_quick(packet, &mut [0u8; 256])
-                                .map(|p| p.edns_present)
-                                .unwrap_or(false);
+                            // 客户端自己的查询带不带 EDNS；`packet` 可能是转发时加过 ECS 的
+                            // Whether the client's own query carries EDNS; `packet` may have had an ECS
+                            // option added by the forward
+                            let edns_present = requester.edns;
                             let req = if let Ok(r) = Message::from_bytes(packet) {
                                 r
                             } else {
