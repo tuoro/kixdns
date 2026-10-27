@@ -63,23 +63,15 @@ pub struct Engine {
     pub(crate) rule_cache: Cache<u64, RuleCacheRecord>,
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
-    // In-flight dedupe map: cache_hash -> waiters / 进行中的去重映射：缓存哈希 -> 等待者
-    // 优化：SmallVec<[_; 8]>避免典型Singleflight场景的堆分配（<=8个等待者）
-    // Optimization: SmallVec<[_; 8]> avoids heap allocation for typical Singleflight scenarios (<=8 waiters)
-    // 使用 FxBuildHasher 提供更快的哈希计算 / Use FxBuildHasher for faster hashing
     /// In-flight request deduplication map using tokio::watch for lock-free concurrent waiting
     /// 使用 tokio::watch 实现无锁并发等待的进行中请求去重 map
-    /// Key: dedupe_hash (pipeline_id + qname + qtype + qclass)
+    /// Key: the hash of the question asked (see `InflightQuestion::key`)
     /// Value: watch sender that will be notified when upstream query completes
-    /// Note: Using Arc<anyhow::Error> to make the type Send + Clone
+    /// 键：所问问题的哈希（见 `InflightQuestion::key`）；值：上游查询结束时通知的 watch sender
     pub inflight: Arc<InflightMap>,
-    // Background refresh tracking: hybrid bloom filter + DashSet for concurrent refresh deduplication
-    // 后台刷新跟踪：混合布隆过滤器 + DashSet 用于并发刷新去重
-    // AtomicU64 bloom filter provides O(1) fast-path (~1ns) for the common case (no refresh).
-    // DashSet provides exact deduplication when bloom filter indicates a possible hit.
-    // AtomicU64 布隆过滤器在常见情况（无刷新）下提供 O(1) 快速路径（~1ns）。
-    // DashSet 在布隆过滤器指示可能命中时提供精确去重。
-    pub refreshing_bitmap: Arc<AtomicU64>,
+    /// 正在刷新的条目的刷新标记（见 `RefreshingGuard`）：同一条同时只刷新一次
+    /// The refresh marks of the entries being refreshed (see `RefreshingGuard`): one
+    /// refresh of an entry at a time
     pub refreshing_set: Arc<DashSet<u64>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
@@ -347,7 +339,6 @@ impl Engine {
                     dashmap_shards,
                 ))
             },
-            refreshing_bitmap: Arc::new(AtomicU64::new(0)),
             refreshing_set: Arc::new(DashSet::new()),
             permit_manager,
             flow_control_state,

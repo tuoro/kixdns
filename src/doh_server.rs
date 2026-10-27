@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
+use crate::engine::{Engine, FastPathResponse, engine_helpers};
 use crate::observe::ClientTransport;
 use crate::proto_utils;
 use crate::watcher;
@@ -247,22 +247,10 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             }
             resp_buf.freeze()
         }
-        Ok(Some(FastPathResponse::AsyncNeeded {
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            edns_present,
-            pipeline_id,
-        })) => {
+        Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
             match tokio::time::timeout(
                 timeout_dur,
-                engine.handle_packet_internal_with_pre_parsed(
-                    packet,
-                    peer,
-                    false,
-                    PreParsedData::new(qname, qtype, qclass, tx_id, edns_present, pipeline_id),
-                ),
+                engine.handle_packet_internal_with_pre_parsed(packet, peer, false, pre_parsed),
             )
             .await
             {

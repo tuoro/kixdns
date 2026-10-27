@@ -61,7 +61,7 @@ impl FlowControlState {
             );
         }
 
-        // Check for permit leakage and recover / 检查permit泄漏并恢复
+        // Log when the permit pool is full, at most once a minute / permit 池满了就记一条，每分钟最多一次
         permit_manager.check_and_recover();
 
         // 决策逻辑：如果延迟高或进行中请求多，减少 permits
