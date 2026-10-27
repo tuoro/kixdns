@@ -2250,8 +2250,11 @@ pub(crate) fn check_upstream_address(
             Ok(())
         }
         Transport::Doh => build_doh_url(address).map(drop),
-        Transport::Dot => parse_dot_target(address).map(drop),
-        Transport::Doq => parse_doq_target(address).map(drop),
+        // 建连时拿 SNI 做 TLS 服务器名，做不成的名字（`%20`、`.`）每次建连都会失败
+        // A connect makes the TLS server name from the SNI, so a name that makes none
+        // (`%20`, `.`) would fail every connect
+        Transport::Dot => build_server_name(&parse_dot_target(address)?.sni).map(drop),
+        Transport::Doq => build_server_name(&parse_doq_target(address)?.sni).map(drop),
     }
 }
 
@@ -4348,6 +4351,45 @@ mod tests {
             .expect("pending waiter was not notified")
             .expect("pending sender was dropped without a result");
         assert!(result.is_err(), "reader failure should reach the waiter");
+    }
+
+    /// DoT、DoQ 的上游必须有建连时用得上的主机名：空的不行，做不成 TLS 服务器名的（`%20`、`.`）
+    /// 也不行，建连时都必然失败
+    /// A DoT or DoQ upstream needs a host its connect can use: not an empty one, nor one that
+    /// makes no TLS server name (`%20`, `.`), which would fail every connect
+    #[test]
+    fn a_dot_or_doq_upstream_without_a_usable_host_is_refused() {
+        use crate::config::Transport;
+        for address in [
+            "",
+            ":853",
+            "?sni=dns.example",
+            "%20",
+            ".",
+            ".:853",
+            "dns.example?sni=%20",
+        ] {
+            assert!(
+                check_upstream_address(address, Transport::Dot).is_err(),
+                "dot {address:?}"
+            );
+        }
+        for address in [
+            "",
+            ":853",
+            "?sni=dns.example",
+            "%20",
+            ".",
+            ".:853",
+            "dns.example?sni=%20",
+        ] {
+            assert!(
+                check_upstream_address(address, Transport::Doq).is_err(),
+                "doq {address:?}"
+            );
+        }
+        assert!(check_upstream_address("dns.example:853", Transport::Dot).is_ok());
+        assert!(check_upstream_address("dns.example:853", Transport::Doq).is_ok());
     }
 
     /// 预热建的连接池和发送时现建的一样大，客户端共用一个同样大的 permit manager
