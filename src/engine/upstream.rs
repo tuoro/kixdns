@@ -40,12 +40,16 @@ impl std::error::Error for UpstreamFailure {
 }
 
 /// Whether a reply's response code makes it a failed attempt: [`forward_upstream`]
-/// rejects a SERVFAIL or REFUSED reply for a rule with several upstreams, and hands
-/// it back as the answer only when the rule has a single upstream.
-/// 应答的响应码是否表示一次失败的尝试：规则有多个上游时，[`forward_upstream`] 拒绝
-/// SERVFAIL 或 REFUSED 应答；只有规则只有一个上游时，才把它当作应答交回。
+/// rejects such a reply for a rule with several upstreams, and hands it back as the
+/// answer only when the rule has a single upstream. SERVFAIL and REFUSED are, and so
+/// is every extended RCODE (16 and up: BADVERS, the TSIG errors, BADCOOKIE and so on),
+/// which reports on the exchange rather than answering the question.
+/// 应答的响应码是否表示一次失败的尝试：规则有多个上游时，[`forward_upstream`] 拒绝这样的
+/// 应答；只有规则只有一个上游时，才把它当作应答交回。SERVFAIL 和 REFUSED 是，所有扩展
+/// RCODE（16 及以上：BADVERS、TSIG 的各种错误、BADCOOKIE 等）也是：它们说的是这次往来出了
+/// 问题，不是对问题的回答。
 pub(crate) fn is_failure_reply(rcode: ResponseCode) -> bool {
-    matches!(rcode, ResponseCode::ServFail | ResponseCode::Refused)
+    matches!(rcode, ResponseCode::ServFail | ResponseCode::Refused) || u16::from(rcode) >= 16
 }
 
 /// A background refresh does not cache a failure reply (see [`is_failure_reply`]),
@@ -1467,20 +1471,40 @@ mod refresh_failure_reply_tests {
         assert_still_cached(&engine, key, &entry);
     }
 
+    /// SERVFAIL、REFUSED 和扩展 RCODE 是失败应答，其余不是。扩展 RCODE 的低 4 位可能和 SERVFAIL
+    /// （BADTIME 18）、REFUSED（BADALG 21）、NOERROR（BADVERS 16）一样，读的时候算上 OPT 里的部分
+    /// SERVFAIL, REFUSED and the extended RCODEs are failure replies, the rest are not. An
+    /// extended RCODE's low 4 bits may equal SERVFAIL's (BADTIME 18), REFUSED's (BADALG
+    /// 21) or NOERROR's (BADVERS 16), so it is read with the OPT's part
     #[test]
-    fn only_servfail_and_refused_are_failure_replies() {
+    fn failure_replies_are_servfail_refused_and_extended_rcodes() {
         let reply = |code: ResponseCode| {
             let mut reply = Message::new(1, MessageType::Response, OpCode::Query);
             reply.metadata.response_code = code;
+            if code.high() > 0 {
+                reply.set_edns(hickory_proto::op::Edns::new());
+            }
             reply.to_vec().unwrap()
         };
-        for code in [ResponseCode::ServFail, ResponseCode::Refused] {
+        for code in [
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::BADVERS,
+            ResponseCode::BADTIME,
+            ResponseCode::BADALG,
+            ResponseCode::BADCOOKIE,
+        ] {
             assert!(is_failure_reply(code), "{code}");
             let err = reject_failure_reply_on_refresh(true, &reply(code)).unwrap_err();
             assert!(err.downcast_ref::<UpstreamFailure>().is_some());
             assert!(reject_failure_reply_on_refresh(false, &reply(code)).is_ok());
         }
-        for code in [ResponseCode::NoError, ResponseCode::NXDomain] {
+        for code in [
+            ResponseCode::NoError,
+            ResponseCode::NXDomain,
+            ResponseCode::FormErr,
+            ResponseCode::NotImp,
+        ] {
             assert!(!is_failure_reply(code), "{code}");
             assert!(reject_failure_reply_on_refresh(true, &reply(code)).is_ok());
         }
