@@ -218,6 +218,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 入站监听器行为：
 
 - 只处理标准单 question 的 QUERY 消息。畸形包、非 QUERY opcode 和 DNS 响应包会被静默丢弃。
+- EDNS 版本不是 0 的查询回 BADVERS（RFC 6891 第 6.1.3 节），回答里的 OPT 写版本 0。
 - 监听器处理错误、整体请求超时或流控 permit 耗尽时，对合法查询返回 SERVFAIL。
 - 大于客户端声明大小（EDNS 载荷大小；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试。
 - 双栈套接字（例如监听 `[::]` 的入站 DoH）把 IPv4 客户端报成 `::ffff:a.b.c.d`。规则、GeoIP、ECS 和缓存都按它背后的 IPv4 地址判断，client_ip 照常写 IPv4 网段；写成 `::ffff:a.b.c.d/n` 的网段按它所指的 IPv4 网段处理。

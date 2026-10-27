@@ -635,6 +635,27 @@ impl Engine {
         // Use unchecked conversion for performance (qname_bytes is validated UTF-8)
         // 使用未检查转换以提高性能（qname_bytes 是已验证的 UTF-8）
         let qname_str = q.qname_str_unchecked();
+        // RFC 6891 第 6.1.3 节：不支持请求的 EDNS 版本时回 BADVERS，而不是照版本 0 去答
+        // RFC 6891 section 6.1.3: an unsupported EDNS version is answered BADVERS rather
+        // than as if it were version 0
+        if q.edns_version != 0 {
+            let reply =
+                crate::proto_utils::badvers_response(packet).context("build BADVERS response")?;
+            if let Some((observer, start)) = observed {
+                let ctx = self.fast_path_context(peer, qname_str, qtype, qclass);
+                observer.request_started(&ctx);
+                observer.request_finished(
+                    &ctx,
+                    &RequestOutcome {
+                        latency: start.elapsed(),
+                        status: RequestStatus::Completed,
+                        response: Some(&reply),
+                        error: None,
+                    },
+                );
+            }
+            return Ok(Some(FastPathResponse::Direct(reply)));
+        }
         let (pipeline_opt, pipeline_id) = select_pipeline(
             cfg,
             &PipelineSelectionContext {
@@ -3642,6 +3663,62 @@ mod tests {
             assert_eq!(rcode, ResponseCode::ServFail, "input: {ips:?}");
             assert!(answers.is_empty(), "input: {ips:?}");
         }
+    }
+
+    /// 请求的 EDNS 版本不受支持（不是 0）时回 BADVERS，带上版本为 0 的 OPT 和原来的问题；以前照
+    /// 版本 0 回答。版本 0 的请求照常回答。
+    /// A request with an unsupported EDNS version (anything but 0) is answered BADVERS with an
+    /// OPT of version 0 and its own question; it used to be answered as if it were version 0.
+    /// A version 0 request is answered as usual.
+    #[tokio::test]
+    async fn an_unsupported_edns_version_is_answered_badvers() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "static",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+                }]
+            }]
+        });
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let peer = "127.0.0.1:53000".parse().unwrap();
+        let ask = |version: u8| {
+            let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+            request.metadata.recursion_desired = true;
+            request.add_query(Query::query(
+                Name::from_ascii("example.com.").unwrap(),
+                RecordType::A,
+            ));
+            let mut edns = hickory_proto::op::Edns::new();
+            edns.set_version(version);
+            request.edns = Some(edns);
+            let packet = request.to_vec().unwrap();
+            let Ok(Some(FastPathResponse::Direct(reply))) =
+                engine.handle_packet_fast(&packet, peer)
+            else {
+                panic!("version {version}: answered on the fast path");
+            };
+            (request, Message::from_vec(&reply).expect("parse reply"))
+        };
+
+        let (request, reply) = ask(1);
+        // 16 同时登记为 BADVERS（OPT）和 BADSIG（TSIG），hickory 读出来叫 BADSIG，所以比较数值
+        // 16 is registered both as BADVERS (OPT) and BADSIG (TSIG), and hickory reads it as
+        // BADSIG, so the value is compared
+        assert_eq!(u16::from(reply.metadata.response_code), 16);
+        assert_eq!(reply.metadata.id, 0xBEEF);
+        assert_eq!(reply.queries, request.queries);
+        assert!(reply.answers.is_empty());
+        assert_eq!(reply.edns.as_ref().map(|edns| edns.version()), Some(0));
+
+        let (_, reply) = ask(0);
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
     }
 
     #[tokio::test]
