@@ -12,15 +12,18 @@
 #![cfg(unix)]
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, TcpStream, UdpSocket};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RecordType};
+
+mod common;
+use common::{Kernel, control_answers, free_port};
 
 /// Descriptors the process may hold: a few dozen are taken at start-up, so a
 /// hundred-odd client connections use the rest up.
@@ -30,16 +33,6 @@ const NOFILE: libc::rlim_t = 128;
 #[ctor::ctor]
 fn init() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-fn free_port() -> u16 {
-    loop {
-        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return port;
-        }
-    }
 }
 
 fn query(name: &str, id: u16) -> Vec<u8> {
@@ -80,19 +73,6 @@ fn tcp_answers(port: u16) -> bool {
     attempt().unwrap_or(false)
 }
 
-fn control_answers(path: &std::path::Path) -> bool {
-    let attempt = || -> std::io::Result<bool> {
-        let mut stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream
-            .write_all(b"GET /v1/health HTTP/1.1\r\nHost: kixdns\r\nConnection: close\r\n\r\n")?;
-        let mut head = [0u8; 12];
-        stream.read_exact(&mut head)?;
-        Ok(head.starts_with(b"HTTP/1.1 200"))
-    };
-    attempt().unwrap_or(false)
-}
-
 async fn doh_answers(port: u16) -> bool {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -122,15 +102,6 @@ where
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
-}
-
-struct Kernel(Child);
-
-impl Drop for Kernel {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

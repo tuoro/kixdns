@@ -7,10 +7,8 @@
 //! includes the OPT's extended part, an extended RCODE counting as a failed attempt (see
 //! `upstream::is_failure_reply`).
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,51 +19,12 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 
 use crate::engine::Engine;
-use crate::matcher::RuntimePipelineConfig;
+use crate::engine::test_support::{
+    self as support, counting_settings, engine_from, peer, upstream,
+};
 
 /// 真正的应答给的地址 / The address the real answer gives
 const ANSWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
-
-/// 假上游对一个查询发出的应答：每个在多久之后发、发什么
-/// What the fake upstream sends for one query: each reply, and how long after it
-type Replies = Vec<(Duration, Vec<u8>)>;
-
-/// 假上游；`queries` 是它收到的查询个数 / A fake upstream; `queries` counts what it received
-struct Upstream {
-    address: String,
-    queries: Arc<AtomicUsize>,
-}
-
-impl Upstream {
-    fn queries(&self) -> usize {
-        self.queries.load(Ordering::SeqCst)
-    }
-}
-
-/// 按 `replies` 对每个查询作答的本机上游 / A local upstream answering each query as `replies` says
-async fn upstream(replies: impl Fn(&Message) -> Replies + Send + 'static) -> Upstream {
-    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let address = sock.local_addr().unwrap().to_string();
-    let queries = Arc::new(AtomicUsize::new(0));
-    let counted = queries.clone();
-    tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-            let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                continue;
-            };
-            counted.fetch_add(1, Ordering::SeqCst);
-            for (delay, reply) in replies(&query) {
-                let sock = sock.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = sock.send_to(&reply, peer).await;
-                });
-            }
-        }
-    });
-    Upstream { address, queries }
-}
 
 /// `query` 的应答：照抄 ID、RD 和问题，RCODE 为 `rcode`，带上 `answers`
 /// The reply to `query`: its ID, RD and question, RCODE `rcode`, with `answers`
@@ -93,28 +52,14 @@ fn answer(query: &Message) -> Vec<u8> {
 
 /// 把请求都转发给 `upstreams` 的引擎 / An engine forwarding everything to `upstreams`
 fn engine(upstreams: &[&str]) -> Engine {
-    let config: crate::config::PipelineConfig = serde_json::from_value(serde_json::json!({
-        "settings": {
-            "default_upstream": "127.0.0.1:9",
-            // A UDP query is sent again after a third of this (`upstream::hedge_timeout`),
-            // and the tests count upstream queries
-            // UDP 查询过了这个时间的三分之一会再发一次（`upstream::hedge_timeout`），而这些测试
-            // 数上游收到的查询
-            "upstream_timeout_ms": 3000,
-            "enable_tcp_fallback": false
-        },
+    engine_from(serde_json::json!({
+        "settings": counting_settings(serde_json::json!({})),
         "pipelines": [{ "id": "main", "rules": [{
             "name": "all",
             "matchers": [{ "type": "any" }],
             "actions": [{ "type": "forward", "upstream": upstreams }]
         }]}]
     }))
-    .expect("parse config");
-    Engine::new(
-        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-        "test".to_string(),
-    )
-    .expect("engine")
 }
 
 fn query(name: &str, qtype: RecordType) -> Vec<u8> {
@@ -124,18 +69,8 @@ fn query(name: &str, qtype: RecordType) -> Vec<u8> {
     request.to_vec().unwrap()
 }
 
-fn peer() -> SocketAddr {
-    "127.0.0.1:53000".parse().unwrap()
-}
-
 async fn ask(engine: &Engine, name: &str, qtype: RecordType) -> Bytes {
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        engine.handle_packet(&query(name, qtype), peer()),
-    )
-    .await
-    .expect("answer in time")
-    .expect("answer")
+    support::ask(engine, &query(name, qtype), peer()).await
 }
 
 /// 应答的 RCODE 和第一条 A 记录（地址、TTL）/ A reply's RCODE and its first A record (address, TTL)
@@ -230,6 +165,34 @@ async fn a_reply_hickory_cannot_read_is_passed_on_but_not_cached() {
         let reply = ask(&engine, "example.com.", RecordType::A).await;
         assert_eq!(&reply[reply.len() - 2..], [0xAB, 0xCD], "round {round}");
         assert_eq!(up.queries(), round, "round {round}");
+    }
+}
+
+/// 记录框架坏掉、快速解析和 hickory 都读不了的应答（应答段说有一条记录，报文却到问题段就完了）：
+/// 这次请求按出错处理，客户端拿到 SERVFAIL，什么也不缓存
+/// A reply whose record framing is broken, so neither the quick parse nor hickory can
+/// read it (the answer count says one record, but the message ends after the question):
+/// the request ends in an error, the client gets SERVFAIL, and nothing is cached
+#[tokio::test]
+async fn a_reply_neither_parser_reads_is_answered_servfail() {
+    let up = upstream(|query| {
+        let mut reply = reply_to(query, ResponseCode::NoError, Vec::new())
+            .to_vec()
+            .unwrap();
+        reply[7] = 1;
+        assert!(crate::proto_utils::parse_response_quick(&reply).is_none());
+        assert!(Message::from_vec(&reply).is_err());
+        vec![(Duration::ZERO, reply)]
+    })
+    .await;
+    let engine = engine(&[&up.address]);
+    for round in 1..=2 {
+        assert_eq!(
+            read(&ask(&engine, "example.com.", RecordType::A).await),
+            (ResponseCode::ServFail, None),
+            "round {round}"
+        );
+        assert_eq!(up.queries(), round, "round {round}: nothing cached");
     }
 }
 
