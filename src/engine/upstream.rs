@@ -94,21 +94,45 @@ pub(crate) fn has_transport_prefix(addr: &str) -> bool {
 /// - "1.1.1.1:53" -> ("1.1.1.1:53", default_transport)
 fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Transport) {
     if let Some(idx) = addr.find("://") {
-        let protocol = &addr[..idx];
         let address = &addr[idx + 3..];
-        let transport = match protocol.to_lowercase().as_str() {
-            "tcp" => Transport::Tcp,
-            "udp" => Transport::Udp,
-            "tcp+udp" | "udp+tcp" => Transport::TcpUdp,
-            "doh" | "https" => Transport::Doh,
-            "dot" | "tls" => Transport::Dot,
-            "doq" | "quic" => Transport::Doq,
-            _ => default_transport,
-        };
+        let transport = transport_for_scheme(&addr[..idx]).unwrap_or(default_transport);
         (address, transport)
     } else {
         (addr, default_transport)
     }
+}
+
+/// 上游地址前缀对应的传输；不认识的前缀为 None（[`parse_upstream_addr`] 这时用默认传输）
+/// The transport an upstream prefix names; None for a prefix it does not know
+/// ([`parse_upstream_addr`] then takes the default transport)
+pub(crate) fn transport_for_scheme(scheme: &str) -> Option<Transport> {
+    Some(match scheme.to_lowercase().as_str() {
+        "tcp" => Transport::Tcp,
+        "udp" => Transport::Udp,
+        "tcp+udp" | "udp+tcp" => Transport::TcpUdp,
+        "doh" | "https" => Transport::Doh,
+        "dot" | "tls" => Transport::Dot,
+        "doq" | "quic" => Transport::Doq,
+        _ => return None,
+    })
+}
+
+/// 一个上游写得对不对：前缀认识，地址是它的传输读得懂的。说明为什么不对。
+/// Whether one upstream is written right: a known prefix, and an address its
+/// transport can read. Says why not.
+pub(crate) fn upstream_problem(upstream: &str, default_transport: Transport) -> Option<String> {
+    if let Some(idx) = upstream.find("://")
+        && transport_for_scheme(&upstream[..idx]).is_none()
+    {
+        return Some(format!(
+            "upstream \"{upstream}\" starts with an unknown prefix \"{}://\"",
+            &upstream[..idx]
+        ));
+    }
+    let (address, transport) = parse_upstream_addr(upstream, default_transport);
+    crate::engine::transport::check_upstream_address(address, transport)
+        .err()
+        .map(|error| format!("upstream \"{upstream}\" is not usable: {error:#}"))
 }
 
 /// 一份配置里的上游在各连接池里的键，按传输分开；DoH 自己清理不用的上游，不在这里

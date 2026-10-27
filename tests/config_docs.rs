@@ -5,7 +5,9 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use kixdns::config::{Action, Matcher, PipelineSelectorMatcher, ResponseMatcher, parse_config};
+use kixdns::config::{
+    Action, Matcher, PipelineSelectorMatcher, ResponseMatcher, parse_config, refuse_problems,
+};
 use serde::de::DeserializeOwned;
 
 /// 中英文两份配置参考，各自三张类型表的标题 / The two configuration references and the headings of their three type tables
@@ -96,7 +98,7 @@ fn documented_type_names_are_the_accepted_ones() {
 }
 
 #[test]
-fn documented_config_examples_parse() {
+fn documented_config_examples_load() {
     for (path, _) in DOCS {
         let doc = read(path);
         // 只有完整配置才单独解析；ECS 那段只是一个动作 / Only whole configurations parse on their own; the ECS snippet is a single action
@@ -111,15 +113,17 @@ fn documented_config_examples_parse() {
             "{path}: no configuration examples found"
         );
         for example in examples {
-            if let Err(err) = parse_config(example) {
-                panic!("{path}: example does not parse: {err:#}\n{example}");
+            // 面板保存时会拒绝的写法，示例里也不能有（见 config::problems）
+            // Nothing the panel would refuse to save may appear in an example either (see config::problems)
+            if let Err(err) = parse_config(example).and_then(|cfg| refuse_problems(&cfg)) {
+                panic!("{path}: example does not load: {err:#}\n{example}");
             }
         }
     }
 }
 
 #[test]
-fn shipped_example_configs_parse() {
+fn shipped_example_configs_load() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("config");
     let mut checked = 0;
     for entry in std::fs::read_dir(&dir).expect("read config/") {
@@ -128,8 +132,8 @@ fn shipped_example_configs_parse() {
             continue;
         }
         let raw = std::fs::read_to_string(&path).expect("read example config");
-        if let Err(err) = parse_config(&raw) {
-            panic!("{} does not parse: {err:#}", path.display());
+        if let Err(err) = parse_config(&raw).and_then(|cfg| refuse_problems(&cfg)) {
+            panic!("{} does not load: {err:#}", path.display());
         }
         checked += 1;
     }

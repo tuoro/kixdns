@@ -333,6 +333,12 @@ async fn run_dns_server(
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
+    // 启动时只记警告、照旧加载，升级以后已经在用的配置行为不变；重载和面板的校验会拒绝它们
+    // Startup only warns and loads as before, so a configuration in use keeps its
+    // behaviour across an upgrade; a reload and the panel's validation refuse these
+    for problem in kixdns::config::problems(&cfg) {
+        warn!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
+    }
     let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
     // Listener addresses and DoH prerequisites, checked exactly as
     // config::validate does / 监听地址与 DoH 前置条件，检查方式与 config::validate 一致
