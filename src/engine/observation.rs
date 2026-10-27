@@ -13,7 +13,7 @@ use crate::engine::rules::{Decision, ResponseActionResult};
 use crate::engine::upstream::has_transport_prefix;
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
-    RequestStatus, RuleMatched, RulePhase,
+    RequestStatus, RuleEvaluated, RuleMatched, RulePhase,
 };
 
 /// Observer and request context of the request being processed. The engine
@@ -219,6 +219,48 @@ pub(crate) fn report_response_decision(
             detail,
         },
     );
+}
+
+/// 上报一条规则的响应匹配器求值的结果，命中时连同它的动作要作的决定；没有响应匹配器的规则
+/// 不上报
+/// Reports how a rule's response matchers evaluated and, on a match, the decision its
+/// actions lead to; a rule without response matchers reports nothing
+pub(crate) fn report_response_rule(
+    observed: Observed<'_>,
+    pipeline: &str,
+    rule: &str,
+    matchers: usize,
+    matched: bool,
+    on_match: &[Action],
+) {
+    let Some((observer, ctx)) = observed else {
+        return;
+    };
+    if matchers == 0 {
+        return;
+    }
+    observer.rule_evaluated(
+        ctx,
+        &RuleEvaluated {
+            pipeline,
+            rule,
+            phase: RulePhase::Response,
+            matched,
+            matchers,
+        },
+    );
+    if matched {
+        observer.rule_matched(
+            ctx,
+            &RuleMatched {
+                pipeline,
+                rule,
+                phase: RulePhase::Response,
+                decision: response_decision_kind(on_match),
+                fast_path: false,
+            },
+        );
+    }
 }
 
 /// ANCOUNT from a DNS header; 0 for a message too short to have one.

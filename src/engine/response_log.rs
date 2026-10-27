@@ -17,6 +17,16 @@ pub(crate) struct ResponseInfo {
     pub cache_hit: bool,
 }
 
+impl ResponseInfo {
+    /// 应答取自缓存的 `hit`：来源记成它的上游，规则给的本地应答记成 "static"
+    /// The answer comes from the cached `hit`: its upstream is the source, or "static"
+    /// for a local answer the rules gave
+    pub(crate) fn served_from_cache(&mut self, hit: &crate::cache::CacheEntry) {
+        self.cache_hit = true;
+        self.upstream = Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
+    }
+}
+
 pub(crate) struct ResponseLog<'a> {
     pub info: ResponseInfo,
     qname: &'a str,

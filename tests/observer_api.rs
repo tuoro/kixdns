@@ -3169,3 +3169,47 @@ async fn requests_that_jump_into_each_others_pipeline_do_not_wait_forever() {
     }
     slow_task.abort();
 }
+
+/// 开着 serve_stale_client_timeout_ms 时，过期应答在客户端等待时间里等不到刷新回来，就当作 stale
+/// 提供，按 StaleClientTimeout 上报，不是 Stale
+/// With serve_stale_client_timeout_ms on, an expired answer whose refresh does not come
+/// back within the client wait is served stale and reported as StaleClientTimeout, not
+/// Stale
+#[tokio::test]
+async fn a_stale_answer_after_the_client_wait_is_reported_as_a_client_timeout() {
+    let (upstream, echo) = spawn_echo_upstream(1).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "min_ttl": 0,
+            "serve_stale": true,
+            "serve_stale_client_timeout_ms": 200
+        },
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "fwd",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+        }] }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    engine
+        .handle_packet(&query("wait.example"), peer())
+        .await
+        .unwrap();
+    // 上游不再应答，刷新回不来 / The upstream answers no more, so no refresh comes back
+    echo.abort();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    recorder.drain();
+
+    engine
+        .handle_packet(&query("wait.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let id = request_id_for(&events, "wait.example");
+    assert_eq!(
+        cache_trail(&events, id),
+        ["pipeline main", "lookup", "hit StaleClientTimeout"]
+    );
+}
