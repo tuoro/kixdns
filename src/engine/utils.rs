@@ -232,15 +232,25 @@ pub struct RefreshingGuard {
 }
 
 impl RefreshingGuard {
-    /// Create a new guard that will clear the refresh mark on drop
-    /// 创建一个在 drop 时清除刷新标记的 guard
-    pub fn new(bitmap: &Arc<AtomicU64>, set: &Arc<DashSet<u64>>, cache_hash: u64) -> Self {
-        mark_refreshing(bitmap, set, cache_hash);
-        Self {
+    /// 打上刷新标记，返回一个 drop 时清掉它的 guard；标记已经有人打了就是 None。查和打是同一步
+    /// （`DashSet::insert`），同时来的几个里只有一个拿得到
+    /// Set the refresh mark and return a guard that clears it on drop; None when it is
+    /// set already. Checking and setting is one step (`DashSet::insert`), so of several
+    /// arriving at once only one gets it
+    pub fn try_new(
+        bitmap: &Arc<AtomicU64>,
+        set: &Arc<DashSet<u64>>,
+        cache_hash: u64,
+    ) -> Option<Self> {
+        bitmap.fetch_or(bloom_bit(cache_hash), Ordering::Release);
+        if !set.insert(cache_hash) {
+            return None;
+        }
+        Some(Self {
             bitmap: Some(Arc::clone(bitmap)),
             set: Some(Arc::clone(set)),
             cache_hash: Some(cache_hash),
-        }
+        })
     }
 
     /// Defuse the guard so it won't clear the mark on drop

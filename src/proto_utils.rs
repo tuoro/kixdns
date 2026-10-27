@@ -458,15 +458,22 @@ pub(crate) fn answers_query(query: &[u8], response: &[u8]) -> bool {
 /// 交给客户端的应答，按标准要求照抄查询的部分都照 `query` 写：问题名的写法（见
 /// [`question_as_asked`]）、RD 和 CD 位（见 [`header_as_asked`]）、带不带 OPT 和 DO 位（见
 /// [`edns_as_asked`]）。缓存里的、合并的在途查询拿到的应答都是别的客户端问的样子，KixDNS 自己
-/// 构造的回答（静态回答、SERVFAIL）也不一定照抄了这些。什么都不用改时不复制。
+/// 构造的回答（静态回答、SERVFAIL）也不一定照抄了这些。什么都不用改时不复制；TSIG 签过的应答
+/// 原样返回。
 /// The reply for a client, with what the standards have copied from the query
 /// written as `query` has it: the question name's spelling (see
 /// [`question_as_asked`]), the RD and CD bits (see [`header_as_asked`]), and whether an
 /// OPT comes back and its DO bit (see [`edns_as_asked`]). An answer from the cache or
 /// handed to a merged inflight query is shaped as another client asked, and answers
 /// KixDNS builds itself (static answers, SERVFAIL) do not always copy these either.
-/// Nothing is copied when nothing changes.
+/// Nothing is copied when nothing changes, and a TSIG-signed reply is returned as it is.
 pub(crate) fn reply_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    // TSIG 的 MAC 盖着整个报文（RFC 8945 第 4.3 节），改哪一位签名都失效：签过的应答原样交出
+    // A TSIG's MAC covers the whole message (RFC 8945 section 4.3) and any change breaks
+    // it, so a signed reply goes out as it is
+    if last_record_is_tsig(&reply) {
+        return reply;
+    }
     edns_as_asked(
         header_as_asked(question_as_asked(reply, query), query),
         query,
@@ -2493,6 +2500,47 @@ mod tests {
         assert_eq!(msg.answers.len(), 1);
     }
 
+    /// 末尾加上一条 hickory 读得了的 TSIG（RFC 8945 第 4.2 节）：密钥名 `key.`、算法 hmac-sha256、
+    /// 32 字节的 MAC、原始 ID、没有错误、没有其他数据
+    /// The message with a TSIG hickory reads appended (RFC 8945 section 4.2): key name
+    /// `key.`, algorithm hmac-sha256, a 32-byte MAC, the original ID, no error, no other data
+    fn signed(mut message: Vec<u8>) -> Bytes {
+        let mut rdata = vec![11];
+        rdata.extend_from_slice(b"hmac-sha256");
+        rdata.push(0);
+        rdata.extend_from_slice(&[0, 0, 0x65, 0, 0, 0, 1, 44, 0, 32]);
+        rdata.extend_from_slice(&[0xAB; 32]);
+        rdata.extend_from_slice(&[0x12, 0x34, 0, 0, 0, 0]);
+        message[11] += 1;
+        message.extend_from_slice(b"\x03key\x00");
+        message.extend_from_slice(&[0, 250, 0, 255, 0, 0, 0, 0]);
+        message.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        message.extend_from_slice(&rdata);
+        assert!(
+            Message::from_vec(&message).is_ok(),
+            "hickory reads the TSIG"
+        );
+        Bytes::from(message)
+    }
+
+    /// TSIG 签过的应答一位都不改：MAC 盖着整个报文（RFC 8945 第 4.3 节），改哪一位签名都失效。DO
+    /// 位、RD 和 CD 位、问题名的写法都不照查询改；没签过的同一份应答照常改
+    /// A TSIG-signed reply has not a bit changed: the MAC covers the whole message (RFC
+    /// 8945 section 4.3), so any change breaks the signature. Neither the DO bit, RD and
+    /// CD, nor the question's spelling follows the query; the same reply unsigned does
+    #[test]
+    fn a_signed_reply_is_not_rewritten_at_all() {
+        use hickory_proto::op::MessageType::{Query, Response};
+        let mut query = edns_message(Query, Some(true));
+        query[2] |= 0x01;
+        query[3] |= 0x10;
+        query[13] = b'E';
+        let unsigned = Bytes::from(edns_message(Response, Some(false)));
+        assert_ne!(reply_as_asked(unsigned.clone(), &query), unsigned);
+        let reply = signed(edns_message(Response, Some(false)));
+        assert_eq!(reply_as_asked(reply.clone(), &query), reply);
+    }
+
     /// 带扩展 RCODE 的 OPT 不去掉，TSIG 签过的应答不动，读不出的查询也不动
     /// An OPT with an extended RCODE stays, a TSIG-signed reply is left alone, and so is
     /// everything when the query cannot be read
@@ -2504,34 +2552,12 @@ mod tests {
         // BADVERS: extended RCODE 1 in the OPT / BADVERS：OPT 里的扩展 RCODE 为 1
         let badvers = badvers_response(&edns_query).unwrap();
         assert_eq!(edns_as_asked(badvers.clone(), &plain_query), badvers);
-        // A TSIG hickory reads (RFC 8945 section 4.2): key name `key.`, algorithm
-        // hmac-sha256, a 32-byte MAC, the original ID, no error, no other data
-        // 一条 hickory 读得了的 TSIG（RFC 8945 第 4.2 节）：密钥名 `key.`、算法 hmac-sha256、
-        // 32 字节的 MAC、原始 ID、没有错误、没有其他数据
-        let tsig = |mut message: Vec<u8>| {
-            let mut rdata = vec![11];
-            rdata.extend_from_slice(b"hmac-sha256");
-            rdata.push(0);
-            rdata.extend_from_slice(&[0, 0, 0x65, 0, 0, 0, 1, 44, 0, 32]);
-            rdata.extend_from_slice(&[0xAB; 32]);
-            rdata.extend_from_slice(&[0x12, 0x34, 0, 0, 0, 0]);
-            message[11] += 1;
-            message.extend_from_slice(b"\x03key\x00");
-            message.extend_from_slice(&[0, 250, 0, 255, 0, 0, 0, 0]);
-            message.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-            message.extend_from_slice(&rdata);
-            assert!(
-                Message::from_vec(&message).is_ok(),
-                "hickory reads the TSIG"
-            );
-            Bytes::from(message)
-        };
-        let signed_with_opt = tsig(edns_message(Response, Some(false)));
+        let signed_with_opt = signed(edns_message(Response, Some(false)));
         assert_eq!(
             edns_as_asked(signed_with_opt.clone(), &plain_query),
             signed_with_opt
         );
-        let signed_without_opt = tsig(edns_message(Response, None));
+        let signed_without_opt = signed(edns_message(Response, None));
         assert_eq!(
             edns_as_asked(signed_without_opt.clone(), &edns_query),
             signed_without_opt
