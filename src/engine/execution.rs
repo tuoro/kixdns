@@ -5286,6 +5286,81 @@ mod tests {
         );
     }
 
+    /// 好几个请求同时为同一个条目发起后台刷新，只刷新一次：查标记和打标记是同一步，不会两个都看见
+    /// 「没在刷新」再各刷一次
+    /// Several requests starting the background refresh of one entry at once refresh it
+    /// once: checking and setting the mark is a single step, so no two both see "not
+    /// refreshing" and refresh each
+    #[test]
+    fn concurrent_refreshes_of_one_entry_start_once() {
+        use hickory_proto::op::{Message, MessageType, OpCode};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let up = runtime.block_on(crate::engine::test_support::upstream(|query| {
+            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            reply.metadata.recursion_desired = query.metadata.recursion_desired;
+            reply.add_queries(query.queries.iter().cloned());
+            vec![(Duration::from_millis(50), reply.to_vec().unwrap())]
+        }));
+        // 引擎要在运行时里建 / The engine is built inside the runtime
+        let _runtime = runtime.enter();
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings: GlobalSettings {
+                    default_upstream: up.address.clone(),
+                    upstream_timeout_ms: 3000,
+                    enable_tcp_fallback: false,
+                    ..Default::default()
+                },
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "lbl".to_string(),
+        )
+        .expect("initialize engine");
+        let slot = stale_com_keys(&engine).slot;
+        let renewed = stale_entry("default");
+        let mark = RefreshTarget::mark_of(slot, &renewed.reach);
+        let requester = Requester {
+            address: "127.0.0.1".parse().unwrap(),
+            edns: false,
+            ecs: None,
+        };
+        const STARTERS: usize = 8;
+        for round in 1..=30 {
+            let barrier = std::sync::Barrier::new(STARTERS);
+            std::thread::scope(|scope| {
+                for _ in 0..STARTERS {
+                    scope.spawn(|| {
+                        let _runtime = runtime.enter();
+                        barrier.wait();
+                        engine.spawn_background_refresh(
+                            engine.state.load_full(),
+                            &renewed,
+                            slot,
+                            DNSClass::IN,
+                            requester,
+                        );
+                    });
+                }
+            });
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while is_refreshing(&engine.refreshing_bitmap, &engine.refreshing_set, mark) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("the refresh ends");
+            });
+            assert_eq!(up.queries(), round, "round {round}: one refresh per round");
+        }
+    }
+
     /// 失败的刷新一结束就释放刷新标记。开着 serve_stale_client_timeout_ms 时，请求
     /// 要等下一次过期命中发起的刷新；标记一直占着，它们只能等到超时再拿过期应答。
     /// A failed refresh releases its mark as soon as it ends. With
@@ -7368,6 +7443,64 @@ mod requester_scope_tests {
             ),
             (1, 1)
         );
+    }
+
+    /// 转发时加上的 ECS 不算客户端带了 EDNS：响应跳转以后，按 EDNS 分流的规则看的仍是客户端发来
+    /// 的查询。跳转的三条路都是：应答匹配、应答不匹配、转发失败
+    /// An ECS option a forward adds does not count as EDNS from the client: after a
+    /// response jump, a rule split by EDNS still sees the query the client sent. So on all
+    /// three ways to jump: the reply matching, the reply not matching, the forward failing
+    #[tokio::test]
+    async fn an_ecs_a_forward_adds_is_no_edns_on_the_jump_path() {
+        for way in ["match", "miss", "failure"] {
+            let (pre, _) = upstream(NORMAL, 300).await;
+            let (with_edns, with_queries) = upstream(OTHER, 300).await;
+            let (without, without_queries) = upstream(NORMAL, 300).await;
+            let jump = serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "other" }]);
+            let forwarded_to = if way == "failure" {
+                "127.0.0.1:9"
+            } else {
+                pre.as_str()
+            };
+            let mut first = serde_json::json!({
+                "name": "pre", "matchers": any(),
+                "actions": [{
+                    "type": "forward", "upstream": forwarded_to,
+                    "ecs": { "mode": "static", "ip": "203.0.113.0" }
+                }]
+            });
+            match way {
+                "match" => {
+                    first["response_matchers"] =
+                        serde_json::json!([{ "type": "upstream_equals", "value": pre }]);
+                    first["response_actions_on_match"] = jump;
+                }
+                "miss" => {
+                    first["response_matchers"] = serde_json::json!([{ "type": "upstream_equals", "value": "192.0.2.255:53" }]);
+                    first["response_actions_on_miss"] = jump;
+                }
+                _ => first["response_actions_on_miss"] = jump,
+            }
+            let engine = engine(
+                serde_json::json!([]),
+                serde_json::json!([
+                    { "id": "main", "rules": [first] },
+                    { "id": "other", "rules": [
+                        rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns)),
+                        rule("rest", any(), forward(&without))
+                    ] }
+                ]),
+            );
+            assert_eq!(ask(&engine, "10.0.0.1", false).await, Some(NORMAL), "{way}");
+            assert_eq!(
+                (
+                    with_queries.load(Ordering::Relaxed),
+                    without_queries.load(Ordering::Relaxed)
+                ),
+                (0, 1),
+                "{way}"
+            );
+        }
     }
 
     /// 按客户端地址的 GeoIP 分流（这里用私有地址判断）时，应答按地址分开。
