@@ -761,9 +761,7 @@ impl Engine {
                     log_start,
                     false,
                 );
-                log.info.cache_hit = true;
-                log.info.upstream =
-                    Some(hit.upstream.clone().unwrap_or_else(|| Arc::from("static")));
+                log.info.served_from_cache(&hit);
                 log.answered(&reply);
                 return Ok(Some(if echoed {
                     FastPathResponse::Direct(reply)
@@ -1818,11 +1816,7 @@ impl Engine {
         if let Some(mut guard) = held_inflight.take()
             && let Ok(bytes) = &result
         {
-            guard.defuse();
-            self.notify_inflight_waiters(guard.hash, || {
-                phases::for_waiters(bytes, &requester, &trail, echo_floor)
-            })
-            .await;
+            guard.hand_over(|| phases::for_waiters(bytes, &requester, &trail, echo_floor));
         }
         if let (Some(target), Ok(_)) = (&refresh, &result) {
             self.settle_refresh(target, &trail, qname_ref, u16::from(qtype), flags);
@@ -1848,25 +1842,6 @@ impl Engine {
             observed.finish(&result);
         }
         result
-    }
-
-    /// `reply` is built only when someone waits / 有请求在等时才构造 `reply`
-    pub(crate) async fn notify_inflight_waiters(
-        &self,
-        dedupe_hash: u64,
-        reply: impl FnOnce() -> Bytes,
-    ) {
-        // ========== NEW: Use tokio::watch for lock-free notification ==========
-        // 使用 tokio::watch 实现无锁通知
-        // Remove the watch sender from inflight map and send result
-        // 从 inflight map 移除 watch sender 并发送结果
-        if let Some((_, entry)) = self.inflight.remove(&dedupe_hash)
-            && entry.tx.receiver_count() > 0
-        {
-            // Send result to all waiters (lock-free)
-            // 向所有等待者发送结果 (无锁)
-            let _ = entry.tx.send(Ok(reply()));
-        }
     }
 
     /// 缓存后台刷新：当TTL即将过期时，异步刷新缓存条目
@@ -4263,8 +4238,12 @@ mod tests {
 
         // Assert: Verify Allow action returns upstream result with match=true
         match result {
-            ResponseActionResult::Upstream { ctx, resp_match } => {
-                assert!(resp_match, "Allow action should match response type");
+            ResponseActionResult::Upstream { ctx } => {
+                assert_eq!(
+                    ctx.raw.as_ref(),
+                    b"resp",
+                    "Allow keeps the upstream's answer"
+                );
                 assert_eq!(
                     ctx.upstream.as_ref(),
                     TEST_UPSTREAM,
@@ -4272,6 +4251,45 @@ mod tests {
                 );
             }
             _ => panic!("expected upstream result"),
+        }
+    }
+
+    /// `allow` 交出手上的应答，排在它后面的动作不再执行
+    /// `allow` hands over the answer in hand, and the actions after it do not run
+    #[tokio::test]
+    async fn response_actions_stop_at_allow() {
+        let engine = build_test_engine();
+        let req = Message::new(0, MessageType::Query, OpCode::Query);
+        let actions = [
+            Action::Allow,
+            Action::StaticIpResponse {
+                ip: "192.0.2.9".to_string(),
+            },
+        ];
+        let packet = [0u8];
+        let ctx = crate::engine::rules::ApplyResponseActionsContext {
+            engine: &engine,
+            actions: &actions,
+            ctx_opt: Some(build_response_context()),
+            req: &req,
+            packet: &packet,
+            upstream_timeout: Duration::from_secs(1),
+            response_matchers: &[],
+            qname: "example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            client_ip: "10.0.0.1".parse().unwrap(),
+            upstream_default: TEST_UPSTREAM,
+            pipeline_id: "pipeline",
+            rule_name: "rule",
+            remaining_jumps: 10,
+            trail: None,
+        };
+        match apply_response_actions(ctx).await.expect("response actions") {
+            ResponseActionResult::Upstream { ctx, .. } => {
+                assert_eq!(ctx.raw.as_ref(), b"resp", "the upstream's answer goes out");
+            }
+            other => panic!("expected the upstream's answer, got {other:?}"),
         }
     }
 
@@ -4321,7 +4339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_actions_allow_reports_miss_when_matchers_fail() {
+    async fn response_actions_allow_keeps_the_answer_when_matchers_fail() {
         // Arrange: Build test engine and response context with non-matching response matcher
         let engine = build_test_engine();
         let ctx = build_response_context();
@@ -4359,10 +4377,15 @@ mod tests {
             .await
             .expect("response actions allow should succeed even on miss");
 
-        // Assert: Verify Allow action reports match failure
+        // Assert: Allow keeps the upstream's answer whether or not the matchers hold
         match result {
-            ResponseActionResult::Upstream { resp_match, .. } => {
-                assert!(!resp_match, "Allow should report matcher miss")
+            ResponseActionResult::Upstream { ctx } => {
+                assert_eq!(
+                    ctx.raw.as_ref(),
+                    b"resp",
+                    "Allow keeps the upstream's answer"
+                );
+                assert_eq!(ctx.upstream.as_ref(), TEST_UPSTREAM);
             }
             _ => panic!("expected upstream result"),
         }
@@ -5049,6 +5072,194 @@ mod tests {
             stored_at: Instant::now(),
             fetched_at: Instant::now(),
         })
+    }
+
+    /// 两个请求同时问 `stale.com`，缓存里都没有；先到的那个转发，上游不应答。这期间缓存里有了一条
+    /// 过期应答，转发失败以后拿它兜底（RFC 8767），等着的那个拿到同一份，不再自己去问
+    /// Two requests for `stale.com` at once, neither found in the cache; the earlier one
+    /// forwards and the upstream never answers. Meanwhile an expired answer lands in the
+    /// cache, which serves once the forward fails (RFC 8767); the waiting one gets the
+    /// same and does not ask itself
+    #[tokio::test]
+    async fn waiters_get_the_stale_answer_a_failed_forward_falls_back_on() {
+        use crate::engine::test_support::{ask, first_a, upstream};
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record};
+
+        let silent = upstream(|_| Vec::new()).await;
+        let engine = engine_from_json(serde_json::json!({
+            "settings": {
+                "default_upstream": silent.address,
+                "upstream_timeout_ms": 300,
+                "enable_tcp_fallback": false,
+                "serve_stale": true,
+                "serve_stale_client_timeout_ms": 0
+            },
+            "pipelines": []
+        }));
+        let stale = std::net::Ipv4Addr::new(192, 0, 2, 66);
+        let name = Name::from_ascii("stale.com.").unwrap();
+        let mut answer = Message::new(0, MessageType::Response, OpCode::Query);
+        answer.add_query(Query::query(name.clone(), RecordType::A));
+        answer.add_answer(Record::from_rdata(name, 5, RData::A(A(stale))));
+        let entry = Arc::new(CacheEntry {
+            bytes: Bytes::from(answer.to_vec().unwrap()),
+            ..(*stale_entry("default")).clone()
+        });
+        let slot = stale_com_keys(&engine).slot;
+        // RD 置位，和 `QueryFlags::RECURSIVE` 一样 / RD set, as in `QueryFlags::RECURSIVE`
+        let mut packet = stale_com_query();
+        packet[2] = 0x01;
+        let peer = |last| SocketAddr::from(([10, 0, 0, last], 53000));
+        let (one, two, ()) = tokio::join!(
+            ask(&engine, &packet, peer(1)),
+            ask(&engine, &packet, peer(2)),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                engine.cache_insert(slot, entry);
+            }
+        );
+        assert_eq!([first_a(&one), first_a(&two)], [Some(stale); 2]);
+        // 先到的那个两次 UDP 尝试（见 `upstream::hedge_timeout`）
+        // The earlier one's two UDP attempts (see `upstream::hedge_timeout`)
+        assert_eq!(
+            silent.queries(),
+            2,
+            "the second request waited on the first"
+        );
+    }
+
+    /// 只有 `stale.com` 一条过期应答的引擎，`settings` 决定 serve_stale 的几个设置；连同查它用的上下文
+    /// An engine holding one expired answer for `stale.com`, `settings` setting the
+    /// serve_stale options; with the context to look it up
+    fn engine_with_a_stale_answer(settings: GlobalSettings) -> (Engine, u64) {
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings: GlobalSettings {
+                    default_upstream: DEAD_UPSTREAM.to_string(),
+                    upstream_timeout_ms: 100,
+                    serve_stale: true,
+                    ..settings
+                },
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "lbl".to_string(),
+        )
+        .expect("initialize engine");
+        let slot = stale_com_keys(&engine).slot;
+        engine.cache_insert(slot, stale_entry("default"));
+        (engine, slot)
+    }
+
+    /// 查 `stale.com` 用的上下文 / The context `stale.com` is looked up with
+    fn stale_com_lookup<'a>(
+        state: &'a Arc<crate::engine::types::EngineInner>,
+        peer: &'a SocketAddr,
+        slot: u64,
+    ) -> phases::CacheLookupContext<'a> {
+        phases::CacheLookupContext {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            state,
+            qname: "stale.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            pipeline_id: "default",
+            slot,
+            tx_id: 0xAABB,
+            start: Instant::now(),
+            peer,
+            requester: Requester {
+                address: peer.ip(),
+                edns: false,
+                ecs: None,
+            },
+            observed: None,
+        }
+    }
+
+    /// 过期超过 serve_stale_expire_ttl 的应答不再当作 stale 提供：查缓存时删掉，上游失败时的兜底
+    /// 也不用它（但不删）；还在窗口里的两处都照常提供。`stale_entry` 过期了 5 秒
+    /// An answer expired for longer than serve_stale_expire_ttl is no longer served
+    /// stale: a lookup drops it, and the fallback after an upstream failure passes it by
+    /// (leaving it in place); one still within the window serves on both. `stale_entry`
+    /// expired 5 seconds ago
+    #[tokio::test]
+    async fn a_stale_answer_past_the_expire_window_is_not_served() {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        for (expire_ttl, served) in [(3, false), (10, true), (0, true)] {
+            let (engine, slot) = engine_with_a_stale_answer(GlobalSettings {
+                serve_stale_expire_ttl: expire_ttl,
+                ..Default::default()
+            });
+            let state = engine.state.load_full();
+            let context = stale_com_lookup(&state, &peer, slot);
+            assert_eq!(
+                phases::check_stale_cache(
+                    &engine,
+                    &context,
+                    crate::observe::CacheHitKind::StaleUpstreamFailure
+                )
+                .is_some(),
+                served,
+                "expire_ttl {expire_ttl}: the fallback"
+            );
+            assert!(
+                engine.cached(slot).is_some(),
+                "expire_ttl {expire_ttl}: the fallback leaves the entry"
+            );
+            engine.cache_insert(slot, stale_entry("default"));
+            assert_eq!(
+                phases::check_cache(&engine, &context).is_some(),
+                served,
+                "expire_ttl {expire_ttl}: the lookup"
+            );
+            assert_eq!(
+                engine.cached(slot).is_some(),
+                served,
+                "expire_ttl {expire_ttl}: the lookup drops an answer past the window"
+            );
+        }
+    }
+
+    /// 开着 serve_stale_ttl_reset，每次当作 stale 提供都让这条应答重新从刚过期算起，查缓存和上游
+    /// 失败时的兜底都一样；关着就不动
+    /// With serve_stale_ttl_reset on, every time an answer is served stale it counts as
+    /// just expired again, on a lookup and on the fallback after an upstream failure
+    /// alike; with it off nothing changes
+    #[tokio::test]
+    async fn serving_stale_restarts_the_expiry_with_ttl_reset_on() {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        for reset in [true, false] {
+            for fallback in [false, true] {
+                let (engine, slot) = engine_with_a_stale_answer(GlobalSettings {
+                    serve_stale_ttl_reset: reset,
+                    ..Default::default()
+                });
+                let state = engine.state.load_full();
+                let context = stale_com_lookup(&state, &peer, slot);
+                let served = if fallback {
+                    phases::check_stale_cache(
+                        &engine,
+                        &context,
+                        crate::observe::CacheHitKind::StaleUpstreamFailure,
+                    )
+                } else {
+                    phases::check_cache(&engine, &context)
+                };
+                assert!(served.is_some(), "reset {reset}, fallback {fallback}");
+                let entry = engine.cached(slot).expect("still cached");
+                // `stale_entry` 10 秒前写入、TTL 5 秒 / `stale_entry` went in 10 s ago with a TTL of 5 s
+                let stale_for = entry.inserted_at.elapsed().as_secs() - entry.original_ttl as u64;
+                assert_eq!(
+                    stale_for,
+                    if reset { 0 } else { 5 },
+                    "reset {reset}, fallback {fallback}"
+                );
+            }
+        }
     }
 
     /// 失败应答（SERVFAIL、REFUSED、扩展 RCODE，见 `upstream::is_failure_reply`）过期以后不当作

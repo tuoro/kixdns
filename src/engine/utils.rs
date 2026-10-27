@@ -29,6 +29,20 @@ impl InflightCleanupGuard {
     pub fn defuse(&mut self) {
         self.active = false;
     }
+
+    /// 把应答交给等在这个条目上的请求：移除条目，有请求在等时才构造 `reply` 发给它们；
+    /// 之后丢弃守卫不再动这张表
+    /// Hand the answer to the requests waiting on this entry: remove the entry, and build
+    /// `reply` and send it only when someone waits; dropping the guard afterwards leaves
+    /// the map alone
+    pub fn hand_over(&mut self, reply: impl FnOnce() -> Bytes) {
+        self.defuse();
+        if let Some((_, entry)) = self.inflight.remove(&self.hash)
+            && entry.tx.receiver_count() > 0
+        {
+            let _ = entry.tx.send(Ok(reply()));
+        }
+    }
 }
 
 impl Drop for InflightCleanupGuard {
@@ -36,6 +50,16 @@ impl Drop for InflightCleanupGuard {
         if self.active {
             self.inflight.remove(&self.hash);
         }
+    }
+}
+
+/// 把报文开头的事务 ID 改成 `id`；不到两个字节的报文原样不动
+/// Set the transaction ID at the head of `message` to `id`; a message shorter than two
+/// bytes stays as it is
+#[inline]
+pub(crate) fn set_id(message: &mut [u8], id: u16) {
+    if let Some(head) = message.get_mut(..2) {
+        head.copy_from_slice(&id.to_be_bytes());
     }
 }
 
