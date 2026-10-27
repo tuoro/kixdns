@@ -370,6 +370,10 @@ const DEFAULT_HEDGE_TIMEOUT_MS: u64 = 100;
 /// guarded here: a query goes out without the client's cookie and a reply comes back
 /// without any, so no cookie enters the cache or reaches another client. Every query
 /// for an upstream passes through here.
+///
+/// 应答交回之前，每条记录的 TTL 收进 `min_ttl..=cache_max_ttl`：客户端留一份应答的时间和缓存一样长。
+/// Before the reply is handed back, the TTL of every record is brought into
+/// `min_ttl..=cache_max_ttl`, so a client keeps an answer as long as the cache does.
 pub async fn forward_upstream(
     engine: &Engine,
     packet: &[u8],
@@ -390,7 +394,15 @@ pub async fn forward_upstream(
         observed,
     )
     .await?;
-    Ok((crate::proto_utils::reply_without_cookie(reply), winner))
+    let reply = crate::proto_utils::reply_without_cookie(reply);
+    // 用当前配置的 min_ttl，而不是请求开始时那份：改 min_ttl 会轮换所有缓存命名空间，一个跨过重载
+    // 的应答只会交给它自己的客户端
+    // min_ttl comes from the current configuration rather than the request's own:
+    // changing it rotates every cache namespace, so a reply in flight across a
+    // reload reaches only its own client
+    let floor = engine.state.load().pipeline.settings.min_ttl;
+    let reply = crate::proto_utils::reply_within_ttls(reply, floor, engine.ttl_cap());
+    Ok((reply, winner))
 }
 
 /// [`forward_upstream`] 去掉 cookie 之前的部分 / [`forward_upstream`] short of its cookie guard

@@ -23,7 +23,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 
 | Field | Default | Meaning |
 |---|---:|---|
-| min_ttl | 0 | Minimum upstream/cache TTL in seconds. |
+| min_ttl | 0 | Minimum TTL of upstream answers in seconds: every record of an answer has its TTL raised to at least this, and the cache keeps the answer at least this long. |
 | bind_udp | 0.0.0.0:5353 | UDP listen address. |
 | bind_tcp | 0.0.0.0:5353 | TCP listen address. |
 | bind_doh | null | Inbound DoH listen address; null disables it. |
@@ -53,7 +53,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | flow_control_latency_threshold_ms | 100 | Latency threshold used by adaptive flow control. |
 | flow_control_adjustment_interval_secs | 5 | Permit adjustment interval. |
 | cache_capacity | 10000 | Maximum answers in the DNS response cache; must be greater than zero. |
-| cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. |
+| cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. No record of an upstream answer carries a longer TTL either, and it wins over min_ttl when the two cross. |
 | dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
 | cache_background_refresh | false | Refresh entries before their TTL expires. |
 | cache_refresh_threshold_percent | 10 | Refresh threshold as a percentage of the entry TTL; must be below 100, since at 100 every cache hit refreshes upstream. |
@@ -394,7 +394,7 @@ When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fa
 
 ## Cache and reload behavior
 
-The DNS response cache uses the upstream response's minimum TTL, raised to min_ttl when configured, and is capped by cache_max_ttl and cache_capacity. Negative responses use the SOA negative-cache TTL when an SOA is present. Identical in-flight cache misses share one upstream operation.
+Before an upstream answer is handed on or cached, the TTL of every record is brought into min_ttl to cache_max_ttl (cache_max_ttl winning when the two cross), so a client keeps an answer as long as the cache does. The DNS response cache uses the answer's minimum TTL, or the SOA negative-cache TTL for a negative response with an SOA, brought into the same range and bounded by cache_capacity; a negative response without an SOA is not cached (RFC 2308 section 4). Identical in-flight cache misses share one upstream operation.
 
 When a pipeline's answer can depend on who is asking, the response cache, the in-flight deduplication, and the rule cache keep requesters apart by how its rules judge them, not by address: whether the client address is in each client_ip network, whether it is private (geoip_private), whether its GeoIP country or tag matches (geoip_country), and whether the query carries EDNS (edns_present, response_edns_present). The subnet a forward derives from the client keeps in-flight requests apart, while cached answers are told apart by their ECS scope (see ECS). Requesters judged alike share entries. The rules along the response-jump paths that a pipeline's answer checks start count too, because a request runs them before it answers. Such a path forwards the packet that the forward before the jump prepared, ECS included, so its in-flight entries are kept apart from those of requests that enter the pipeline directly; answers reached on it are not cached, as no lookup uses its keys. The rule cache holds the decisions of a pipeline's own rules and so judges by that pipeline's request matchers only; with cache_background_refresh on it also keys by client address, as before. A pipeline whose rules judge no requester facts shares entries between all clients as before. A background refresh replays the request from the same client address, with EDNS and the client's own ECS option when the request carried them (an ECS option that does not follow RFC 7871 section 6 is left out), so pipeline selection, request rules and the ECS sent upstream are the same as for that request. When the refreshed answer applies to other requesters than the entry it renews (the upstream narrowed its scope, say), that entry is removed and its requesters ask again.
 
