@@ -5070,6 +5070,66 @@ mod tests {
         })
     }
 
+    /// 失败应答（SERVFAIL、REFUSED、扩展 RCODE，见 `upstream::is_failure_reply`）过期以后不当作
+    /// stale 提供：查缓存时删掉，上游失败时的兜底也不用它；NOERROR 的照常留着、照常兜底
+    /// An expired failure reply (SERVFAIL, REFUSED, an extended RCODE, see
+    /// `upstream::is_failure_reply`) is never served stale: a lookup drops it and the
+    /// fallback after an upstream failure passes it by, while a NOERROR one stays and
+    /// serves as usual
+    #[tokio::test]
+    async fn an_expired_failure_reply_is_never_served_stale() {
+        let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        for (rcode, served) in [
+            (ResponseCode::NoError, true),
+            (ResponseCode::ServFail, false),
+            (ResponseCode::Refused, false),
+            (ResponseCode::BADVERS, false),
+            (ResponseCode::BADCOOKIE, false),
+        ] {
+            let entry = Arc::new(CacheEntry {
+                rcode,
+                ..(*stale_entry("default")).clone()
+            });
+            let state = engine.state.load_full();
+            let context = phases::CacheLookupContext {
+                flags: crate::proto_utils::QueryFlags::RECURSIVE,
+                state: &state,
+                qname: "stale.com",
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                pipeline_id: "default",
+                slot: dedupe_hash,
+                tx_id: 0xAABB,
+                start: Instant::now(),
+                peer: &peer,
+                requester: Requester {
+                    address: peer.ip(),
+                    edns: false,
+                    ecs: None,
+                },
+                observed: None,
+            };
+            engine.cache_insert(dedupe_hash, entry.clone());
+            assert_eq!(
+                phases::check_stale_cache(
+                    &engine,
+                    &context,
+                    crate::observe::CacheHitKind::StaleUpstreamFailure
+                )
+                .is_some(),
+                served,
+                "{rcode}: the fallback"
+            );
+            phases::check_cache(&engine, &context);
+            assert_eq!(
+                engine.cached(dedupe_hash).is_some(),
+                served,
+                "{rcode}: the lookup"
+            );
+        }
+    }
+
     /// 以后台刷新的身份处理 `stale.com` 查询，结果写入 `cache_hash`。
     /// Handle the `stale.com` query as a background refresh writing to `cache_hash`.
     async fn refresh(engine: &Engine, cache_hash: u64) -> anyhow::Result<Bytes> {

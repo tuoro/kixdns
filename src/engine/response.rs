@@ -9,6 +9,8 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use tracing::warn;
 
+use crate::proto_utils::received_ttl;
+
 #[inline]
 pub(crate) fn build_fast_static_response(
     tx_id: u16,
@@ -155,7 +157,7 @@ pub(crate) fn make_static_txt_answer(
 /// 从 DNS 响应中提取最大 TTL 用于后台刷新时机 / Extract maximum TTL from DNS response for background refresh timing
 #[inline]
 pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
-    let answer_max = msg.answers.iter().map(|r| r.ttl as u64).max();
+    let answer_max = msg.answers.iter().map(|r| received_ttl(r.ttl) as u64).max();
     match answer_max {
         Some(t) => t,
         // No answers: negative response (NXDOMAIN/NODATA) — use SOA from authority
@@ -174,7 +176,7 @@ pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
 /// min(SOA.minimum, SOA.ttl)。无 SOA 时返回 0（按 RFC 2308 §4 不可缓存）。
 #[inline]
 pub fn extract_ttl(msg: &Message) -> u64 {
-    let answer_min = msg.answers.iter().map(|r| r.ttl as u64).min();
+    let answer_min = msg.answers.iter().map(|r| received_ttl(r.ttl) as u64).min();
     match answer_min {
         Some(t) => t,
         // No answers: negative response (NXDOMAIN/NODATA) — use SOA from authority
@@ -184,6 +186,7 @@ pub fn extract_ttl(msg: &Message) -> u64 {
 }
 
 /// Extract negative caching TTL from SOA in the authority section (RFC 2308 §5).
+/// TTLs here and above are read as `proto_utils::received_ttl` reads them (RFC 2181 §8).
 /// Returns min(SOA.minimum_field, SOA.ttl), or 0 if no SOA present.
 ///
 /// 从 authority 中的 SOA 提取负缓存 TTL (RFC 2308 §5)。
@@ -192,8 +195,9 @@ pub fn extract_ttl(msg: &Message) -> u64 {
 fn extract_soa_negative_ttl(msg: &Message) -> u64 {
     for record in &msg.authorities {
         if let RData::SOA(soa) = &record.data {
-            let soa_min = soa.minimum as u64;
-            let soa_ttl = record.ttl as u64;
+            // MINIMUM serves as the negative answer's TTL / MINIMUM 用作否定应答的 TTL
+            let soa_min = received_ttl(soa.minimum) as u64;
+            let soa_ttl = received_ttl(record.ttl) as u64;
             return soa_min.min(soa_ttl);
         }
     }
@@ -276,6 +280,36 @@ mod tests {
         msg.add_authority(rec);
 
         assert_eq!(extract_ttl(&msg), 30); // min(3600, 30)
+    }
+
+    /// 最高位为 1 的 TTL 按 0 算（RFC 2181 第 8 节），SOA 的 MINIMUM 也一样
+    /// A TTL with the top bit set counts as 0 (RFC 2181 section 8), and so does SOA MINIMUM
+    #[test]
+    fn test_extract_ttl_takes_a_top_bit_ttl_as_zero() {
+        let name = Name::from_str("example.com.").unwrap();
+        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+        for ttl in [300, 0x8000_0001] {
+            msg.add_answer(Record::from_rdata(
+                name.clone(),
+                ttl,
+                RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
+            ));
+        }
+        assert_eq!(extract_ttl(&msg), 0);
+        assert_eq!(extract_ttl_for_refresh(&msg), 300);
+
+        for (soa_ttl, minimum) in [(0x8000_0000, 60), (300, 0xFFFF_FFFF)] {
+            let mut negative = Message::new(0, MessageType::Response, OpCode::Query);
+            negative.metadata.response_code = ResponseCode::NXDomain;
+            let soa = SOA::new(name.clone(), name.clone(), 1, 3600, 900, 1209600, minimum);
+            negative.add_authority(Record::from_rdata(name.clone(), soa_ttl, RData::SOA(soa)));
+            assert_eq!(extract_ttl(&negative), 0, "{soa_ttl:#x} {minimum:#x}");
+            assert_eq!(
+                extract_ttl_for_refresh(&negative),
+                0,
+                "{soa_ttl:#x} {minimum:#x}"
+            );
+        }
     }
 
     #[test]

@@ -118,8 +118,9 @@ pub(crate) fn check_cache_logged(
             engine.cache_invalidate(slot, &hit);
             return None;
         }
-        // Don't serve SERVFAIL/REFUSED as stale
-        if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
+        // Don't serve a failure reply (SERVFAIL, REFUSED, an extended RCODE, see
+        // `is_failure_reply`) as stale
+        if crate::engine::upstream::is_failure_reply(hit.rcode) {
             engine.cache_invalidate(slot, &hit);
             return None;
         }
@@ -382,8 +383,10 @@ pub(crate) fn check_stale_cache_logged(
     if elapsed_secs < hit.original_ttl as u64 {
         return None;
     }
-    // Don't serve SERVFAIL/REFUSED as stale / 不提供 SERVFAIL/REFUSED 作为 stale
-    if hit.rcode == ResponseCode::ServFail || hit.rcode == ResponseCode::Refused {
+    // Don't serve a failure reply (SERVFAIL, REFUSED, an extended RCODE, see
+    // `is_failure_reply`) as stale
+    // 不把失败应答（SERVFAIL、REFUSED、扩展 RCODE，见 `is_failure_reply`）当作 stale 提供
+    if crate::engine::upstream::is_failure_reply(hit.rcode) {
         return None;
     }
 
@@ -886,8 +889,19 @@ pub(crate) async fn handle_forward_decision_logged(
                     && response_actions_on_match.is_empty()
                     && response_actions_on_miss.is_empty()
                 {
-                    if let Some(qr) = proto_utils::parse_response_quick(&raw) {
+                    // The quick parse is cached as read only for a reply whose structure
+                    // holds up (see `well_formed_reply`); any other is cached as hickory
+                    // reads it, or not at all when hickory cannot, and goes on as it is
+                    // 只有结构经得起检查的应答才照快速解析的结果缓存（见 `well_formed_reply`）；
+                    // 其余的照 hickory 读出的结果缓存，hickory 也读不了就不缓存，应答照样交出去
+                    let quick = proto_utils::parse_response_quick(&raw);
+                    if let Some(qr) = quick
+                        .as_ref()
+                        .filter(|_| proto_utils::well_formed_reply(&raw))
+                    {
                         (qr.rcode, qr.min_ttl as u64, qr.max_ttl as u64, None)
+                    } else if let (Some(qr), Err(_)) = (quick.as_ref(), Message::from_bytes(&raw)) {
+                        (qr.rcode, 0, 0, None)
                     } else {
                         let msg = Message::from_bytes(&raw).context("parse upstream response")?;
                         let ttl_cache = extract_ttl(&msg);

@@ -29,6 +29,8 @@ pub mod rules;
 pub mod transport;
 pub mod types;
 pub mod upstream;
+#[cfg(test)]
+mod upstream_reply_tests;
 pub mod utils;
 
 pub use concurrency::PermitManager;

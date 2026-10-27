@@ -224,16 +224,18 @@ impl UdpClient {
                                         actual_addr = %src,
                                         "UDP response address mismatch, possible spoofing or routing anomaly"
                                     );
-                                } else if !crate::proto_utils::question_matches(query, &buf) {
+                                } else if !crate::proto_utils::answers_query(query, &buf) {
                                     // RFC 5452 §9.1: matching ID and address are not enough,
-                                    // the question must match too. Keep waiting for the real one.
-                                    // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致；
-                                    // 保留条目继续等待真正的应答。
+                                    // the question must match too, in a reply to this query
+                                    // (see `answers_query`). Keep waiting for the real one.
+                                    // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致，
+                                    // 而且得是这个查询的应答（见 `answers_query`）；保留条目继续
+                                    // 等待真正的应答。
                                     tracing::warn!(
                                         socket_idx = idx,
                                         response_id = id,
                                         upstream = %src,
-                                        "UDP response question mismatch, possible spoofing"
+                                        "UDP response does not answer the query, possible spoofing"
                                     );
                                 } else {
                                     let (_, (original_id, _, _, tx)) = entry.remove_entry();
@@ -841,7 +843,7 @@ impl TcpMuxClient {
                 // （比如之前用过同一个 ID 的查询迟到的回答）丢掉，查询接着等自己的回答。
                 let matched = match pending.entry(resp_id) {
                     entry::Entry::Occupied(e)
-                        if crate::proto_utils::question_matches(
+                        if crate::proto_utils::answers_query(
                             &e.get().frame[2..],
                             &reusable_buf[..resp_len],
                         ) =>
@@ -849,7 +851,7 @@ impl TcpMuxClient {
                         Some(e.remove())
                     }
                     entry::Entry::Occupied(_) => {
-                        warn!(target = "tcp_mux", upstream = %upstream, resp_id, "TCP response question mismatch, dropped");
+                        warn!(target = "tcp_mux", upstream = %upstream, resp_id, "TCP response does not answer the query, dropped");
                         None
                     }
                     entry::Entry::Vacant(_) => {
@@ -1817,9 +1819,9 @@ impl DohClient {
             // RFC 5452 §9.1, as on the other transports: the answer has to be for
             // this question
             // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
-            if !crate::proto_utils::question_matches(packet, &body) {
+            if !crate::proto_utils::answers_query(packet, &body) {
                 return Err(doh_answer_error(
-                    "doh answer does not match the question".to_string(),
+                    "doh reply does not answer the query".to_string(),
                 ));
             }
             Ok(body)
@@ -2276,7 +2278,7 @@ impl DotMuxClient {
                 // （比如之前用过同一个 ID 的查询迟到的回答）丢掉，查询接着等自己的回答。
                 let matched = match pending.entry(resp_id) {
                     entry::Entry::Occupied(e)
-                        if crate::proto_utils::question_matches(
+                        if crate::proto_utils::answers_query(
                             &e.get().frame[2..],
                             &reusable_buf[..resp_len],
                         ) =>
@@ -2284,7 +2286,7 @@ impl DotMuxClient {
                         Some(e.remove())
                     }
                     entry::Entry::Occupied(_) => {
-                        warn!(target = "dot_mux", upstream = %upstream, resp_id, "DoT response question mismatch, dropped");
+                        warn!(target = "dot_mux", upstream = %upstream, resp_id, "DoT response does not answer the query, dropped");
                         None
                     }
                     entry::Entry::Vacant(_) => {
@@ -3456,9 +3458,9 @@ impl DoqMuxClient {
                 // RFC 5452 §9.1, as on the other transports: the answer has to be
                 // for this question
                 // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
-                if !crate::proto_utils::question_matches(packet, buf) {
+                if !crate::proto_utils::answers_query(packet, buf) {
                     return Err(DoqFailure::Protocol(
-                        "doq answer does not match the question".to_string(),
+                        "doq reply does not answer the query".to_string(),
                     ));
                 }
                 // Restore original DNS Message ID in-place (Vec<u8> is mutable).
@@ -5626,7 +5628,7 @@ mod tests {
             .await
             .expect_err("an answer to another question");
         assert!(
-            format!("{err:#}").contains("does not match the question"),
+            format!("{err:#}").contains("does not answer the query"),
             "{err:#}"
         );
     }

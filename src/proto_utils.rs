@@ -395,8 +395,10 @@ pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
     Some(Bytes::from(out))
 }
 
-/// Whether `response` answers `query`: RFC 5452 §9.1 requires the question
-/// section of a reply to match the query before the reply is accepted, in
+/// Whether `response` answers `query`. RFC 1035 section 4.1.1: a reply has QR set
+/// and carries the query's opcode; a message without QR (the query itself coming
+/// back, say) or with another opcode answers nothing. RFC 5452 §9.1 requires the
+/// question section of a reply to match the query before the reply is accepted, in
 /// addition to the ID and the source address. The name is compared ignoring
 /// ASCII case so 0x20 case-randomizing upstreams still match; QTYPE and QCLASS
 /// must be identical.
@@ -408,7 +410,9 @@ pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
 /// reply that omits the question but carries records has no legitimate reason
 /// to and is rejected.
 /// Zero-copy: two name walks and a bounded byte comparison, no allocation.
-/// 判断 `response` 是否应答 `query`：RFC 5452 §9.1 要求应答的 question 段与查询一致
+/// 判断 `response` 是否应答 `query`。RFC 1035 第 4.1.1 节：应答的 QR 置位、opcode 和查询的
+/// 一样；没有 QR 的报文（比如查询原样弹了回来）或 opcode 不同的报文什么都没回答。
+/// RFC 5452 §9.1 要求应答的 question 段与查询一致
 /// 才能接受（ID 和源地址之外的第三道校验）。名称比较忽略 ASCII 大小写（兼容 0x20
 /// 随机化的上游），QTYPE/QCLASS 必须相同。
 ///
@@ -416,8 +420,13 @@ pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
 /// 接受：有些上游对 FORMERR/NOTIMP 这样回，这种应答无记录可入缓存、无法投毒，
 /// 保留它就保留了上游快速报错的路径；不回显 question 却带记录的应答没有正当理由，拒绝。
 /// 零拷贝：两次名称遍历加一次有界字节比较，无分配。
-pub(crate) fn question_matches(query: &[u8], response: &[u8]) -> bool {
-    if response.len() < 12 {
+pub(crate) fn answers_query(query: &[u8], response: &[u8]) -> bool {
+    if response.len() < 12 || query.len() < 12 {
+        return false;
+    }
+    // QR set, and the opcode (bits 3-6 of the third byte) the query's
+    // QR 置位，opcode（第三个字节的第 3～6 位）和查询的一样
+    if response[2] & 0x80 == 0 || (response[2] ^ query[2]) & 0x78 != 0 {
         return false;
     }
     match u16::from_be_bytes([response[4], response[5]]) {
@@ -1359,12 +1368,12 @@ fn extract_soa_negative_ttl_wire(packet: &[u8], qd_count: u16, ns_count: u16) ->
             return None;
         }
         let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-        let ttl = u32::from_be_bytes([
+        let ttl = received_ttl(u32::from_be_bytes([
             packet[pos + 4],
             packet[pos + 5],
             packet[pos + 6],
             packet[pos + 7],
-        ]);
+        ]));
         let rdlength = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
         pos += 10; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
 
@@ -1389,12 +1398,14 @@ fn extract_soa_negative_ttl_wire(packet: &[u8], qd_count: u16, ns_count: u16) ->
             }
             // MINIMUM is the last 4 bytes of the fixed fields
             // MINIMUM 是固定字段的最后 4 字节
-            let minimum = u32::from_be_bytes([
+            // MINIMUM serves as the negative answer's TTL, so it is read as one too
+            // MINIMUM 用作否定应答的 TTL，所以也按 TTL 读
+            let minimum = received_ttl(u32::from_be_bytes([
                 packet[fixed_fields_start + 16],
                 packet[fixed_fields_start + 17],
                 packet[fixed_fields_start + 18],
                 packet[fixed_fields_start + 19],
-            ]);
+            ]));
             // RFC 2308 §5: negative TTL = min(SOA.minimum, SOA.ttl)
             return Some(minimum.min(ttl));
         }
@@ -1404,6 +1415,165 @@ fn extract_soa_negative_ttl_wire(packet: &[u8], qd_count: u16, ns_count: u16) ->
     }
 
     None
+}
+
+/// 应答的记录结构经得起完整走一遍，可以照快速解析的结果缓存：
+/// - 每个名字都是规范的标签（不超过 63 字节），整个名字不超过 255 字节，压缩指针只往前指（见
+///   [`strict_name_end`]）；
+/// - 每条记录的 RDATA 都在报文之内；
+/// - 记录都是这里逐字节检查过的类型：A、AAAA 的长度对；NS、CNAME、PTR、DNAME、MX、SOA、SRV 里的
+///   名字恰好填满 RDATA；TXT 的字符串、HINFO 的两个字符串恰好填满 RDATA；OPT 只在 Additional 段、
+///   最多一条、属主是根名，选项结构完整，ECS 选项合乎 RFC 7871 第 6 节。
+///
+/// 不合格不等于读不了：别的类型（HTTPS、DNSSEC 记录、TSIG 等）hickory 会细读内容，这里不照搬，
+/// 调用方改由 hickory 读，hickory 也读不了的不缓存。
+/// Whether a reply's record structure holds up to a complete walk, so it can be
+/// cached as the quick parse read it:
+/// - every name is made of proper labels (at most 63 bytes), at most 255 bytes in all,
+///   with compression pointers that only point back (see [`strict_name_end`]);
+/// - every record's RDATA lies within the message;
+/// - every record is of a type checked here byte by byte: A and AAAA of the right
+///   length; NS, CNAME, PTR, DNAME, MX, SOA and SRV with names that fill their RDATA
+///   exactly; TXT strings and the two HINFO strings filling it exactly; OPT only in
+///   Additional, at most once, owned by the root, with whole options and an ECS option
+///   as RFC 7871 section 6 has it.
+///
+/// Failing this does not mean unreadable: hickory reads the contents of other types
+/// (HTTPS, the DNSSEC records, TSIG and so on) in detail, which is not repeated here.
+/// The caller has hickory read the reply instead, and caches nothing hickory cannot
+/// read either.
+pub(crate) fn well_formed_reply(packet: &[u8]) -> bool {
+    well_formed_records(packet).is_some()
+}
+
+fn well_formed_records(packet: &[u8]) -> Option<()> {
+    let count = |at: usize| {
+        packet
+            .get(at..at + 2)
+            .map(|n| u16::from_be_bytes([n[0], n[1]]) as usize)
+    };
+    let (before_additional, additional) = (count(6)? + count(8)?, count(10)?);
+    let mut pos = 12usize;
+    for _ in 0..count(4)? {
+        pos = strict_name_end(packet, pos)?.checked_add(4)?;
+        if pos > packet.len() {
+            return None;
+        }
+    }
+    let mut opt_seen = false;
+    for index in 0..before_additional + additional {
+        let owner = pos;
+        pos = strict_name_end(packet, pos)?;
+        let fixed_end = pos.checked_add(10)?;
+        let header = packet.get(pos..fixed_end)?;
+        let rr_type = u16::from_be_bytes([header[0], header[1]]);
+        let rd_len = u16::from_be_bytes([header[8], header[9]]) as usize;
+        let rdata = fixed_end..fixed_end.checked_add(rd_len)?;
+        if rdata.end > packet.len() {
+            return None;
+        }
+        if rr_type == 41 {
+            if index < before_additional || opt_seen || packet[owner] != 0 {
+                return None;
+            }
+            opt_seen = true;
+            validate_edns_options(packet, rdata.start, rdata.end)?;
+            match ecs_option(packet, rdata.clone()) {
+                Ok(None) => {}
+                Ok(Some(ecs)) if ecs.is_well_formed(packet) => {}
+                _ => return None,
+            }
+        } else {
+            well_formed_rdata(packet, rr_type, rdata.clone())?;
+        }
+        pos = rdata.end;
+    }
+    Some(())
+}
+
+/// 一条记录的 RDATA 结构对不对；不在这里检查的类型都算不对（见 [`well_formed_reply`]）
+/// Whether one record's RDATA is well formed; a type not checked here is not (see
+/// [`well_formed_reply`])
+fn well_formed_rdata(packet: &[u8], rr_type: u16, rdata: std::ops::Range<usize>) -> Option<()> {
+    // A name starting at `at` that ends exactly where the RDATA does
+    // 从 `at` 开始、恰好在 RDATA 结尾处结束的名字
+    let last_name =
+        |at: usize| (at < rdata.end && strict_name_end(packet, at)? == rdata.end).then_some(());
+    // How many character strings, each with its length byte, fill the RDATA exactly
+    // 恰好填满 RDATA 的字符串（各带长度字节）有几个
+    let strings = || {
+        let (mut at, mut count) = (rdata.start, 0usize);
+        while at < rdata.end {
+            at += 1 + packet[at] as usize;
+            count += 1;
+        }
+        (at == rdata.end).then_some(count)
+    };
+    match rr_type {
+        1 => (rdata.len() == 4).then_some(()),
+        28 => (rdata.len() == 16).then_some(()),
+        // NS, CNAME, PTR, DNAME
+        2 | 5 | 12 | 39 => last_name(rdata.start),
+        // MX: preference, exchange / MX：优先级、交换主机
+        15 => last_name(rdata.start + 2),
+        // SRV: priority, weight, port, target / SRV：优先级、权重、端口、目标
+        33 => last_name(rdata.start + 6),
+        // SOA: MNAME, RNAME, five 32-bit fields / SOA：MNAME、RNAME、五个 32 位字段
+        6 => {
+            let after_rname = strict_name_end(packet, strict_name_end(packet, rdata.start)?)?;
+            (after_rname.checked_add(20)? == rdata.end).then_some(())
+        }
+        // HINFO: CPU and OS / HINFO：CPU 和操作系统
+        13 => (strings()? == 2).then_some(()),
+        // TXT: one or more strings / TXT：一个或多个字符串
+        16 => (strings()? >= 1).then_some(()),
+        _ => None,
+    }
+}
+
+/// 严格读一个名字，返回它在 `start` 处的编码结束的位置：标签不超过 63 字节，整个名字不超过 255
+/// 字节；压缩指针跳过去以后读到的每个字节都在指针所在那段的开头之前，所以指针只能往前指，不会
+/// 绕圈，也不会读进跳出来的那段（和 hickory 的规则一样）。
+/// Read a name strictly and return where its encoding at `start` ends: labels of at
+/// most 63 bytes and at most 255 bytes in all; everything read after a compression
+/// pointer lies before the start of the part the pointer is in, so a pointer can only
+/// point back, cannot loop, and cannot read into the part it jumped from (hickory's
+/// rule too).
+fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
+    let (mut pos, mut part_start, mut limit) = (start, start, usize::MAX);
+    let (mut end, mut length) = (None, 1usize);
+    loop {
+        if pos >= limit {
+            return None;
+        }
+        let len = *packet.get(pos)? as usize;
+        match len {
+            0 => return Some(end.unwrap_or(pos + 1)),
+            1..=63 => {
+                length += 1 + len;
+                if length > 255 {
+                    return None;
+                }
+                pos += 1 + len;
+            }
+            0xC0..=0xFF => {
+                let target = (len & 0x3F) << 8 | *packet.get(pos + 1)? as usize;
+                end.get_or_insert(pos + 2);
+                (pos, limit, part_start) = (target, part_start, target);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// 读到的 TTL 当作多少秒：最高位为 1 的值当作 0（RFC 2181 第 8 节：TTL 只用低 31 位，最高位
+/// 置位的值整个按 0 处理）。
+/// What a TTL as received counts as: a value with the top bit set counts as 0 (RFC 2181
+/// section 8: a TTL uses the low 31 bits, and a value with the most significant bit set
+/// is treated as if the entire value were zero).
+#[inline]
+pub(crate) fn received_ttl(raw: u32) -> u32 {
+    if raw & 0x8000_0000 != 0 { 0 } else { raw }
 }
 
 /// Skip a DNS name at the given position, following compression pointers.
@@ -1449,8 +1619,14 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     let flags_byte2 = packet[2];
     let truncated = (flags_byte2 & 0x02) != 0; // TC bit at position 1
 
-    let rcode_u8 = packet[3] & 0x0F;
-    let rcode = hickory_proto::op::ResponseCode::from(0, rcode_u8);
+    // RFC 6891 section 6.1.3: the OPT's extended RCODE holds the upper 8 bits of the
+    // 12-bit RCODE, the header the lower 4
+    // RFC 6891 第 6.1.3 节：12 位 RCODE 的高 8 位在 OPT 的扩展 RCODE 里，低 4 位在头部
+    let extended_rcode = match find_opt(packet) {
+        Ok(Some(opt)) => packet[opt.extended_rcode_at],
+        _ => 0,
+    };
+    let rcode = hickory_proto::op::ResponseCode::from(extended_rcode, packet[3] & 0x0F);
 
     // 2. Counts / 计数
     let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
@@ -1558,12 +1734,12 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         // Offset 4: TTL / 偏移量 4：TTL
         // Offset 8: RDLen / 偏移量 8：数据长度
 
-        let ttl = u32::from_be_bytes([
+        let ttl = received_ttl(u32::from_be_bytes([
             packet[pos + 4],
             packet[pos + 5],
             packet[pos + 6],
             packet[pos + 7],
-        ]);
+        ]));
         if ttl < min_ttl {
             min_ttl = ttl;
         }
@@ -1768,11 +1944,13 @@ pub(crate) fn reply_within_ttls(reply: Bytes, floor: u32, cap: u32) -> Bytes {
     reply.freeze()
 }
 
-/// 用 `f` 改写报文里每条记录的 TTL；遇到放不下的记录就停。OPT（类型 41）伪记录跳过：它的 TTL
-/// 字段装的是 EDNS 扩展 RCODE 和标志（包括 DO 位），不是 TTL。
-/// Rewrites the TTL of every record in `packet` with `f`, stopping at the first
-/// record that does not fit. OPT (type 41) pseudo-records are skipped: their TTL
-/// field holds the EDNS extended RCODE and flags (the DO bit among them), not a TTL.
+/// 用 `f` 改写报文里每条记录的 TTL（`f` 拿到的是 [`received_ttl`] 读出的值）；遇到放不下的记录
+/// 就停。OPT（类型 41）伪记录跳过：它的 TTL 字段装的是 EDNS 扩展 RCODE 和标志（包括 DO 位），
+/// 不是 TTL。
+/// Rewrites the TTL of every record in `packet` with `f` (which gets the value
+/// [`received_ttl`] reads), stopping at the first record that does not fit. OPT (type
+/// 41) pseudo-records are skipped: their TTL field holds the EDNS extended RCODE and
+/// flags (the DO bit among them), not a TTL.
 fn map_record_ttls(packet: &mut [u8], mut f: impl FnMut(u32) -> u32) {
     if packet.len() < 12 {
         return;
@@ -1818,7 +1996,8 @@ fn map_record_ttls(packet: &mut [u8], mut f: impl FnMut(u32) -> u32) {
                 packet[ttl_offset + 2],
                 packet[ttl_offset + 3],
             ]);
-            packet[ttl_offset..ttl_offset + 4].copy_from_slice(&f(old_ttl).to_be_bytes());
+            packet[ttl_offset..ttl_offset + 4]
+                .copy_from_slice(&f(received_ttl(old_ttl)).to_be_bytes());
         }
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
@@ -2429,15 +2608,265 @@ mod tests {
         }
     }
 
+    /// 最高位为 1 的 TTL 按 0 算：快速解析的最小、最大 TTL，否定应答的 SOA（TTL 和 MINIMUM），以及
+    /// 改写 TTL 的时候
+    /// A TTL with the top bit set counts as 0: in the quick parse's least and greatest
+    /// TTL, in a negative answer's SOA (its TTL and MINIMUM), and when TTLs are rewritten
+    #[test]
+    fn a_ttl_with_the_top_bit_set_counts_as_zero() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::{A, SOA};
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        assert_eq!(received_ttl(0x7FFF_FFFF), 0x7FFF_FFFF);
+        assert_eq!(received_ttl(0x8000_0000), 0);
+        assert_eq!(received_ttl(u32::MAX), 0);
+        let name = Name::from_ascii("example.com.").unwrap();
+        let reply = |answers: &[u32], soa: Option<(u32, u32)>| {
+            let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+            msg.add_query(Query::query(name.clone(), RecordType::A));
+            for ttl in answers {
+                msg.add_answer(Record::from_rdata(
+                    name.clone(),
+                    *ttl,
+                    RData::A(A::new(192, 0, 2, 1)),
+                ));
+            }
+            if let Some((ttl, minimum)) = soa {
+                let soa = SOA::new(name.clone(), name.clone(), 1, 60, 60, 60, minimum);
+                msg.add_authority(Record::from_rdata(name.clone(), ttl, RData::SOA(soa)));
+            }
+            msg.to_vec().unwrap()
+        };
+        let quick = parse_response_quick(&reply(&[300, 0x8000_0001], None)).unwrap();
+        assert_eq!((quick.min_ttl, quick.max_ttl), (0, 300));
+        for soa in [(0x8000_0000, 60), (300, 0x8000_0000)] {
+            let quick = parse_response_quick(&reply(&[], Some(soa))).unwrap();
+            assert_eq!((quick.min_ttl, quick.max_ttl), (0, 0), "{soa:x?}");
+        }
+        let rewritten = |floor, cap| {
+            let out = reply_within_ttls(Bytes::from(reply(&[300, 0x8000_0001], None)), floor, cap);
+            Message::from_vec(&out)
+                .unwrap()
+                .answers
+                .iter()
+                .map(|record| record.ttl)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rewritten(0, 86400), [300, 0]);
+        assert_eq!(rewritten(60, 86400), [300, 60]);
+    }
+
+    /// 快速解析的 RCODE 带上 OPT 里的扩展部分（RFC 6891 第 6.1.3 节）
+    /// The quick parse's RCODE includes the OPT's extended part (RFC 6891 section 6.1.3)
+    #[test]
+    fn parse_response_quick_reads_the_extended_rcode() {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RecordType};
+        for code in [
+            ResponseCode::NoError,
+            ResponseCode::ServFail,
+            ResponseCode::BADVERS,
+            ResponseCode::BADTIME,
+            ResponseCode::BADALG,
+            ResponseCode::BADCOOKIE,
+        ] {
+            let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+            msg.add_query(Query::query(
+                Name::from_ascii("example.com.").unwrap(),
+                RecordType::A,
+            ));
+            msg.metadata.response_code = code;
+            msg.set_edns(Edns::new());
+            let reply = msg.to_vec().unwrap();
+            // Compared as numbers: 16 is both BADVERS and BADSIG, and hickory reads BADSIG
+            // 按数值比较：16 既是 BADVERS 也是 BADSIG，hickory 读成 BADSIG
+            assert_eq!(
+                u16::from(parse_response_quick(&reply).unwrap().rcode),
+                u16::from(code)
+            );
+        }
+    }
+
+    /// 结构经得起检查的应答：常见的各种类型；以及经不起的：每种毛病各一个
+    /// Replies whose structure holds up, of the usual types, and ones that do not, one
+    /// for each fault
+    #[test]
+    fn well_formed_reply_walks_the_whole_structure() {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+        use hickory_proto::rr::rdata::{A, AAAA, CNAME, HINFO, MX, NS, SOA, SRV, TXT};
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        let name = Name::from_ascii("www.example.com.").unwrap();
+        let other = Name::from_ascii("cdn.example.net.").unwrap();
+        let record = |data: RData| Record::from_rdata(name.clone(), 300, data);
+        let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+        msg.add_query(Query::query(name.clone(), RecordType::ANY));
+        msg.add_answer(record(RData::CNAME(CNAME(other.clone()))));
+        msg.add_answer(record(RData::A(A::new(192, 0, 2, 1))));
+        msg.add_answer(record(RData::AAAA(AAAA::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
+        ))));
+        msg.add_answer(record(RData::MX(MX::new(10, other.clone()))));
+        msg.add_answer(record(RData::SRV(SRV::new(1, 2, 443, other.clone()))));
+        msg.add_answer(record(RData::TXT(TXT::new(vec!["a".into(), "bc".into()]))));
+        msg.add_answer(record(RData::HINFO(HINFO::new(
+            "RFC8482".into(),
+            String::new(),
+        ))));
+        msg.add_authority(record(RData::NS(NS(other.clone()))));
+        msg.add_authority(record(RData::SOA(SOA::new(
+            other.clone(),
+            name.clone(),
+            1,
+            60,
+            60,
+            60,
+            60,
+        ))));
+        msg.add_additional(Record::from_rdata(
+            other.clone(),
+            300,
+            RData::A(A::new(192, 0, 2, 9)),
+        ));
+        let mut edns = Edns::new();
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                "198.51.100.0".parse().unwrap(),
+                24,
+                24,
+            )));
+        msg.set_edns(edns);
+        let good = msg.to_vec().unwrap();
+        assert!(well_formed_reply(&good));
+        let bare = {
+            let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+            msg.add_query(Query::query(name.clone(), RecordType::A));
+            msg.add_answer(record(RData::A(A::new(192, 0, 2, 1))));
+            msg.to_vec().unwrap()
+        };
+        assert!(well_formed_reply(&bare));
+        // The answer's A record in `bare` starts right after the question
+        // `bare` 里应答的 A 记录紧跟在问题后面
+        let a_at = 12 + 17 + 4;
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            ("cut short", good[..good.len() - 3].to_vec()),
+            ("a pointer forward", {
+                let mut m = bare.clone();
+                m[a_at + 1] = (a_at + 2) as u8;
+                m
+            }),
+            ("a pointer to itself", {
+                let mut m = bare.clone();
+                m[a_at + 1] = a_at as u8;
+                m
+            }),
+            ("a reserved label type", {
+                let mut m = bare.clone();
+                m[12] = 0x43;
+                m
+            }),
+            ("an A record of 3 bytes", {
+                let mut m = bare.clone();
+                m[a_at + 11] = 3;
+                m.pop();
+                m
+            }),
+            ("a type it does not check", {
+                let mut m = bare.clone();
+                m[a_at + 3] = 99;
+                m
+            }),
+            ("an OPT owned by the root, in the answer section", {
+                let mut m = bare[..a_at].to_vec();
+                m.extend_from_slice(&[0, 0, 41, 4, 0xD0, 0, 0, 0, 0, 0, 0]);
+                m
+            }),
+            ("an OPT not owned by the root", {
+                let mut m = bare.clone();
+                m[7] = 0;
+                m[11] = 1;
+                m[a_at + 3] = 41;
+                m
+            }),
+            ("a CNAME whose name stops short of its RDATA", {
+                let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+                msg.add_query(Query::query(name.clone(), RecordType::CNAME));
+                msg.add_answer(record(RData::CNAME(CNAME(other.clone()))));
+                let mut m = msg.to_vec().unwrap();
+                let rd_len_at = m.len() - 2 - 17;
+                m[rd_len_at + 1] += 1;
+                m.push(0);
+                m
+            }),
+            ("a TXT string past its RDATA", {
+                let mut msg = Message::new(1, MessageType::Response, OpCode::Query);
+                msg.add_query(Query::query(name.clone(), RecordType::TXT));
+                msg.add_answer(record(RData::TXT(TXT::new(vec!["abc".into()]))));
+                let mut m = msg.to_vec().unwrap();
+                let at = m.len() - 4;
+                m[at] = 9;
+                m
+            }),
+            ("an ECS option with an unknown family", {
+                let mut m = good.clone();
+                let ecs = m.windows(4).position(|w| w == [0, 8, 0, 7]).unwrap();
+                m[ecs + 5] = 3;
+                m
+            }),
+            ("two OPT records", {
+                let mut m = good.clone();
+                m[11] += 1;
+                m.extend_from_slice(&[0, 0, 41, 4, 0xD0, 0, 0, 0, 0, 0, 0]);
+                m
+            }),
+        ];
+        for (fault, message) in bad {
+            assert!(!well_formed_reply(&message), "{fault}");
+        }
+        // Found by a randomized run: a pointer into the middle of the question's first
+        // label, whose bytes then read as labels running into the name the pointer is
+        // in. hickory refuses both (overlapping labels)
+        // 随机测试找到的：指针指进问题名第一个标签的中间，从那里按标签读下去会读进指针所在的这个
+        // 名字。hickory 两个都不读（标签重叠）
+        let unhex = |hex: &str| {
+            (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        };
+        for hex in [
+            "6a518180000100010000000101330a7050614b385562337a42096b54564b565f4351583f324b65756c6b31485034434e4f454d6a59423364626d48774966394b3330506558786f6b3749506f56763135725f626b787177536c5a4b6e656b5050376f420541565832610000410001c00d001c00010001524b001009a57000f619b9dee7acb9daf542f451000029ffff0000000000240008000600020f000c7e000a00169ee4cbb461593ffdca6fd9e689f475d15cc4bb44f441",
+            "fee9819000010004000000010c336c76397a4268326268767507455237674d456e0c38756a57686a6c4d6b365132047570315600000f0001c00c00050001000034190002c00dc00c001000010000ecfd0007067457514a3377c00c0006000100014ddd00420177055448647a39016402543700045f52475f02704e0b704f633335416a57624737016908445f4341785837780000000395000091ee0000781400012de700012157c00c000600010000c2fb003e054432346c41000a7947785749465635337a0c5242337577513634543032320948725541375037704400000027630000f09700015abe000121cb00008dcc0000291000000100000000",
+        ] {
+            let message = unhex(hex);
+            assert!(Message::from_vec(&message).is_err());
+            assert!(!well_formed_reply(&message), "{hex}");
+        }
+        // A name of 255 bytes is the most a name may be / 名字最长 255 字节
+        let long = |last: usize| {
+            let mut m = bare[..12].to_vec();
+            m[7] = 0;
+            for len in [63, 63, 63, last] {
+                m.push(len as u8);
+                m.extend(std::iter::repeat_n(b'a', len));
+            }
+            m.push(0);
+            m.extend_from_slice(&[0, 1, 0, 1]);
+            m
+        };
+        assert!(well_formed_reply(&long(61)), "255 bytes");
+        assert!(!well_formed_reply(&long(62)), "256 bytes");
+    }
+
     #[test]
     fn saturating_u64_to_u32_caps_large_values() {
         assert_eq!(saturating_u64_to_u32(42), 42);
         assert_eq!(saturating_u64_to_u32(u64::MAX), u32::MAX);
     }
 
-    // ---- question_matches ----
+    // ---- answers_query ----
 
-    fn question_matches_query(name: &str) -> Vec<u8> {
+    fn a_query_for(name: &str) -> Vec<u8> {
         use hickory_proto::op::{Message, MessageType, OpCode, Query};
         use hickory_proto::rr::{Name, RecordType};
         use std::str::FromStr;
@@ -2447,16 +2876,16 @@ mod tests {
     }
 
     #[test]
-    fn question_matches_ignores_ascii_case_only() {
-        let query = question_matches_query("example.com.");
-        let mut response = question_matches_query("ExAmPlE.CoM.");
+    fn answers_query_ignores_ascii_case_only() {
+        let query = a_query_for("example.com.");
+        let mut response = a_query_for("ExAmPlE.CoM.");
         response[2] |= 0x80;
-        assert!(question_matches(&query, &response), "0x20 case must match");
+        assert!(answers_query(&query, &response), "0x20 case must match");
 
-        let mut other = question_matches_query("example.org.");
+        let mut other = a_query_for("example.org.");
         other[2] |= 0x80;
         assert!(
-            !question_matches(&query, &other),
+            !answers_query(&query, &other),
             "different name must not match"
         );
 
@@ -2464,14 +2893,14 @@ mod tests {
         let type_pos = other_type.len() - 4;
         other_type[type_pos + 1] = 28; // AAAA
         assert!(
-            !question_matches(&query, &other_type),
+            !answers_query(&query, &other_type),
             "different QTYPE must not match"
         );
     }
 
     #[test]
-    fn question_matches_reply_without_question_only_when_empty() {
-        let query = question_matches_query("example.com.");
+    fn answers_query_reply_without_question_only_when_empty() {
+        let query = a_query_for("example.com.");
         // Header-only FORMERR with QDCOUNT = 0 and no records: accepted, it
         // cannot poison anything and keeps the upstream's fast failure.
         let mut bare_error = query[..12].to_vec();
@@ -2479,7 +2908,7 @@ mod tests {
         bare_error[3] = 0x01; // RCODE = FORMERR
         bare_error[5] = 0;
         assert!(
-            question_matches(&query, &bare_error),
+            answers_query(&query, &bare_error),
             "record-less reply without a question must be accepted"
         );
         // QDCOUNT = 0 but ANCOUNT = 1: records without a question, rejected.
@@ -2487,11 +2916,37 @@ mod tests {
         with_records[3] = 0x00;
         with_records[7] = 1;
         assert!(
-            !question_matches(&query, &with_records),
+            !answers_query(&query, &with_records),
             "reply carrying records without a question must be rejected"
         );
         // Truncated question
-        assert!(!question_matches(&query, &query[..20]));
+        assert!(!answers_query(&query, &query[..20]));
+    }
+
+    #[test]
+    fn answers_query_needs_qr_and_the_querys_opcode() {
+        let query = a_query_for("example.com.");
+        let mut reply = query.clone();
+        reply[2] |= 0x80;
+        assert!(answers_query(&query, &reply));
+        assert!(
+            !answers_query(&query, &query),
+            "the query itself, QR not set"
+        );
+        for opcode in [1u8, 2, 4, 5, 15] {
+            let mut other = reply.clone();
+            other[2] = (other[2] & !0x78) | (opcode << 3);
+            assert!(!answers_query(&query, &other), "opcode {opcode}");
+        }
+        // The same holds for a reply without a question / 没有问题段的应答也一样
+        let mut bare_error = reply[..12].to_vec();
+        bare_error[3] = 0x01;
+        bare_error[5] = 0;
+        assert!(answers_query(&query, &bare_error));
+        bare_error[2] &= !0x80;
+        assert!(!answers_query(&query, &bare_error));
+        bare_error[2] |= 0x80 | (2 << 3);
+        assert!(!answers_query(&query, &bare_error));
     }
 
     mod ecs_wire {
