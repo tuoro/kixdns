@@ -274,14 +274,6 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     }
 
     // Return slice of buf as zero-copy reference
-    // Performance optimization: ASCII-only validation (10x faster than UTF-8)
-    // 性能优化：仅 ASCII 验证（比 UTF-8 快 10 倍）
-    // RFC 1035: DNS labels are LDH (Letters, Digits, Hyphen) + dots, which is ASCII subset
-    // RFC 1035：DNS 标签是 LDH（字母、数字、连字符）+ 点号，属于 ASCII 子集
-    // Strategy: Reject non-ASCII for performance (similar to Unbound)
-    // 策略：为性能拒绝非 ASCII（类似 Unbound）
-    // Trade-off: 0.001% queries rejected for 10% performance gain
-    // 权衡：拒绝 0.001% 的查询以获得 10% 的性能提升
     // The buf already contains the lowercased domain name from the parsing loop above.
     Some(QuickQuery {
         tx_id,
@@ -491,7 +483,7 @@ fn header_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
 /// (section 7), so one is taken out; the DO bit is the query's (RFC 3225 section 3).
 /// An OPT carrying an extended RCODE stays, since taking it out would change the
 /// RCODE; a message that cannot be read, or a reply signed with TSIG, is left as it is.
-pub(crate) fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     let asked_dnssec_ok = match find_opt(query) {
         Ok(Some(opt)) => Some(query[opt.extended_rcode_at + 2] & 0x80 != 0),
         Ok(None) => None,
@@ -570,7 +562,7 @@ fn without_opt(message: &[u8], opt: &OptRecord) -> Option<Vec<u8>> {
 /// spelling, a static answer is written in lowercase, some upstreams rewrite the case,
 /// and a client randomizing the case (0x20) checks it. Another name, or one that cannot
 /// be read uncompressed, leaves the reply as it is; so does the same spelling, uncopied.
-pub(crate) fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     let Some(end) = question_name_end(query) else {
         return reply;
     };
@@ -2098,14 +2090,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_quick_rejects_qname_control_characters() {
-        let packet = query_with_label(b"bad\nlabel");
-        let mut qname = [0u8; 256];
-
-        assert!(parse_quick(&packet, &mut qname).is_none());
-    }
-
-    #[test]
     fn parse_quick_accepts_regular_ascii_qname() {
         let packet = query_with_label(b"example");
         let mut qname = [0u8; 256];
@@ -2116,7 +2100,14 @@ mod tests {
     #[test]
     fn parse_quick_leaves_names_that_need_escapes_to_the_full_parser() {
         let mut qname = [0u8; 256];
-        for label in [&b"a.b"[..], b"a\\b", b"a b", b"\xff", b"caf\xc3\xa9"] {
+        for label in [
+            &b"a.b"[..],
+            b"a\\b",
+            b"a b",
+            b"bad\nlabel",
+            b"\xff",
+            b"caf\xc3\xa9",
+        ] {
             assert!(
                 parse_quick(&query_with_label(label), &mut qname).is_none(),
                 "{label:?}"
