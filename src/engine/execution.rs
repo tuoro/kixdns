@@ -614,6 +614,18 @@ impl Engine {
         packet: &[u8],
         peer: SocketAddr,
     ) -> anyhow::Result<Option<FastPathResponse>> {
+        // Whatever answers, the question goes back as the client wrote it
+        // 不论谁作答，问题都照客户端的写法发回
+        Ok(self
+            .answer_fast(packet, peer)?
+            .map(|response| response.for_query(packet)))
+    }
+
+    fn answer_fast(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+    ) -> anyhow::Result<Option<FastPathResponse>> {
         let peer = client_address(peer);
         let log_start = Instant::now();
         // Quick parsing, avoiding full Message parsing and massive allocations / 快速解析，避免完整 Message 解析和大量分配
@@ -1882,15 +1894,21 @@ impl Engine {
         if let (Some(target), Ok(_)) = (&refresh, &result) {
             self.settle_refresh(target, &trail, qname_ref, u16::from(qtype), flags);
         }
-        // Every reply leaves with the ECS option its client should see; waiters were
-        // handed the reply before this and do the same for their own clients
-        // 每个应答都带着它的客户端该看到的 ECS 选项离开；等待者在这之前拿到应答，各自为自己的
-        // 客户端做同样的处理
+        // Every reply leaves with the ECS option its client should see and its question
+        // as the client wrote it; waiters were handed the reply before this and do the
+        // same for their own clients
+        // 每个应答都带着它的客户端该看到的 ECS 选项、照客户端写法的问题离开；等待者在这之前
+        // 拿到应答，各自为自己的客户端做同样的处理
         let result = if skip_cache {
             result
         } else {
             let at_least = echo_floor.max(trail.echo_scope(&requester.ecs_view()));
-            result.map(|bytes| phases::client_reply(bytes, client_ecs.as_ref(), at_least))
+            result.map(|bytes| {
+                crate::proto_utils::question_as_asked(
+                    phases::client_reply(bytes, client_ecs.as_ref(), at_least),
+                    packet,
+                )
+            })
         };
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {

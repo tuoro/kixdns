@@ -439,6 +439,53 @@ pub(crate) fn question_matches(query: &[u8], response: &[u8]) -> bool {
         && query[12..query_name_end].eq_ignore_ascii_case(&response[12..response_name_end])
 }
 
+/// 应答的问题名照客户端发来的写法（RFC 1035 第 4.1.1 节：问题段由查询照抄）。两者忽略大小写
+/// 相同（RFC 4343）而写法不同时，把查询里的名字抄进应答：缓存里存的、合并的在途查询拿到的
+/// 都是别的客户端问的写法，静态回答写的是小写，有的上游也会改写大小写，而用 0x20 打乱大小写
+/// 的客户端要核对它。名字不同、或者读不出不压缩的名字时原样返回；写法本来就一样时不复制。
+/// The reply with its question name written as the client wrote it (RFC 1035 section
+/// 4.1.1: the question is copied from the query). When the two are equal ignoring case
+/// (RFC 4343) but written differently, the query's name is copied into the reply: a
+/// cached answer or one handed to a merged inflight query carries another client's
+/// spelling, a static answer is written in lowercase, some upstreams rewrite the case,
+/// and a client randomizing the case (0x20) checks it. Another name, or one that cannot
+/// be read uncompressed, leaves the reply as it is; so does the same spelling, uncopied.
+pub(crate) fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    let Some(end) = question_name_end(query) else {
+        return reply;
+    };
+    let asked = &query[12..end];
+    if question_name_end(&reply) != Some(end)
+        || reply[12..end] == *asked
+        || !reply[12..end].eq_ignore_ascii_case(asked)
+    {
+        return reply;
+    }
+    let mut copy = BytesMut::from(&reply[..]);
+    copy[12..end].copy_from_slice(asked);
+    copy.freeze()
+}
+
+/// 第一个问题名（不压缩，从偏移 12 开始）结束的位置；没有问题段时为 None
+/// Where the first question name ends, written uncompressed from offset 12; None
+/// without a question
+fn question_name_end(packet: &[u8]) -> Option<usize> {
+    if packet.len() < 12 || packet[4..6] == [0, 0] {
+        return None;
+    }
+    let mut pos = 12;
+    loop {
+        let len = *packet.get(pos)? as usize;
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if len > 63 {
+            return None;
+        }
+        pos += 1 + len;
+    }
+}
+
 /// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
 #[inline]
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
@@ -2067,6 +2114,58 @@ mod tests {
                     assert_eq!(QueryFlags::of(&packet), expected, "{case}, trailing byte");
                 }
             }
+        }
+    }
+
+    /// 只差大小写时抄成查询的写法，别的都不动；写法一样时不复制
+    /// Only a difference in case is copied over from the query, nothing else; the same
+    /// spelling is not copied
+    #[test]
+    fn question_as_asked_copies_only_the_case() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        // `Name::from_ascii` keeps the case, `Name::from_str` would lowercase it
+        // `Name::from_ascii` 保留大小写，`Name::from_str` 会转成小写
+        let message = |name: &str, kind: MessageType| {
+            let name = Name::from_ascii(name).unwrap();
+            let mut msg = Message::new(0x1234, kind, OpCode::Query);
+            msg.add_query(Query::query(name.clone(), RecordType::A));
+            if kind == MessageType::Response {
+                msg.add_answer(Record::from_rdata(
+                    name,
+                    300,
+                    RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, 1)),
+                ));
+            }
+            msg.to_vec().unwrap()
+        };
+        let query = message("Example.COM.", MessageType::Query);
+        let reply = Bytes::from(message("example.com.", MessageType::Response));
+        assert_ne!(reply[12..25], query[12..25]);
+        let echoed = question_as_asked(reply.clone(), &query);
+        assert_eq!(echoed[12..25], query[12..25]);
+        let mut expected = reply.to_vec();
+        expected[12..25].copy_from_slice(&query[12..25]);
+        assert_eq!(echoed, expected, "nothing else changes");
+
+        let same = Bytes::from(message("Example.COM.", MessageType::Response));
+        assert_eq!(
+            question_as_asked(same.clone(), &query).as_ptr(),
+            same.as_ptr()
+        );
+        // Another name of the same length / 长度相同的另一个名字
+        let other = Bytes::from(message("examplf.com.", MessageType::Response));
+        assert_eq!(question_as_asked(other.clone(), &query), other);
+        // A reply without a question, and queries that cannot be read
+        // 没有问题段的应答，以及读不出来的查询
+        let mut no_question = reply.to_vec();
+        no_question[5] = 0;
+        let no_question = Bytes::from(no_question);
+        assert_eq!(question_as_asked(no_question.clone(), &query), no_question);
+        let mut compressed = query[..12].to_vec();
+        compressed.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]);
+        for unreadable in [&query[..20], &query[..11], &compressed[..]] {
+            assert_eq!(question_as_asked(reply.clone(), unreadable), reply);
         }
     }
 
