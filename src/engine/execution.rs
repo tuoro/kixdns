@@ -4116,6 +4116,39 @@ mod tests {
 
     const TEST_UPSTREAM: &str = "1.1.1.1:53";
 
+    // 每个等上游的查询都带着这份状态，三万个在途查询就是三万份。以前是 10 KB 多：应答回来以后的处理
+    // （包括响应动作和响应跳转）和最大的那种传输（DoT）都按最坏的情况预留着。这两样单独分配以后剩
+    // 3.8 KB；上限给编译器版本的差别留了余量，哪一样重新放回来都会超
+    // Every query waiting on an upstream carries this state, thirty thousand copies for
+    // thirty thousand queries in flight. It was over 10 KB: what happens once the reply is
+    // in (the response actions and the response jump included) and the largest transport
+    // (DoT) both reserved room for the worst case. With the two allocated on their own it is
+    // 3.8 KB; the limit leaves room for compiler differences, and putting either back goes
+    // over it
+    #[tokio::test]
+    async fn a_pending_query_stays_small() {
+        const LIMIT: usize = 4608;
+        let engine = build_test_engine();
+        let peer: SocketAddr = "127.0.0.1:5300".parse().expect("peer");
+        let packet = [0u8; 12];
+        let full = engine.handle_packet(&packet, peer);
+        let pre_parsed = engine.handle_packet_internal_with_pre_parsed(
+            &packet,
+            peer,
+            false,
+            PreParsedData::new("a.test".to_string(), 1, 1, 0, false, Arc::from("main")),
+        );
+        for (entry, size) in [
+            ("handle_packet", std::mem::size_of_val(&full)),
+            ("pre-parsed", std::mem::size_of_val(&pre_parsed)),
+        ] {
+            assert!(
+                size <= LIMIT,
+                "{entry}: a pending query holds {size} bytes, over {LIMIT}"
+            );
+        }
+    }
+
     fn build_test_engine() -> Engine {
         let runtime = RuntimePipelineConfig {
             settings: GlobalSettings {

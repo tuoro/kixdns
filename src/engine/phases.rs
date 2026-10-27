@@ -859,15 +859,34 @@ pub(crate) async fn handle_forward_decision_logged(
         Err(_) => trail.record_failure(forward_ecs),
     }
 
-    match resp {
-        Ok((raw, actual_upstream)) => {
-            response.upstream = Some(Arc::from(actual_upstream.as_str()));
-            let (rcode, ttl_secs_cache, ttl_secs_refresh, msg_opt) = if response_matchers.is_empty()
-                && response_actions_on_match.is_empty()
-                && response_actions_on_miss.is_empty()
-            {
-                if let Some(qr) = proto_utils::parse_response_quick(&raw) {
-                    (qr.rcode, qr.min_ttl as u64, qr.max_ttl as u64, None)
+    // 应答回来以后的处理单独在堆上分配：它的状态（解析出来的报文、响应动作的结果等）只在应答回来
+    // 以后才用得着，放在这个函数里，等上游的每个查询都得替它多留一千多字节
+    // What happens once the reply is in is allocated on its own: its state (the parsed
+    // message, the response actions' result and so on) is only needed once the reply is
+    // in, and held in this function it made every query waiting on an upstream reserve
+    // over a kilobyte more
+    Box::pin(async {
+        match resp {
+            Ok((raw, actual_upstream)) => {
+                response.upstream = Some(Arc::from(actual_upstream.as_str()));
+                let (rcode, ttl_secs_cache, ttl_secs_refresh, msg_opt) = if response_matchers
+                    .is_empty()
+                    && response_actions_on_match.is_empty()
+                    && response_actions_on_miss.is_empty()
+                {
+                    if let Some(qr) = proto_utils::parse_response_quick(&raw) {
+                        (qr.rcode, qr.min_ttl as u64, qr.max_ttl as u64, None)
+                    } else {
+                        let msg = Message::from_bytes(&raw).context("parse upstream response")?;
+                        let ttl_cache = extract_ttl(&msg);
+                        let ttl_refresh = extract_ttl_for_refresh(&msg);
+                        (
+                            msg.metadata.response_code,
+                            ttl_cache,
+                            ttl_refresh,
+                            Some(msg),
+                        )
+                    }
                 } else {
                     let msg = Message::from_bytes(&raw).context("parse upstream response")?;
                     let ttl_cache = extract_ttl(&msg);
@@ -878,96 +897,86 @@ pub(crate) async fn handle_forward_decision_logged(
                         ttl_refresh,
                         Some(msg),
                     )
-                }
-            } else {
-                let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-                let ttl_cache = extract_ttl(&msg);
-                let ttl_refresh = extract_ttl_for_refresh(&msg);
-                (
-                    msg.metadata.response_code,
-                    ttl_cache,
-                    ttl_refresh,
-                    Some(msg),
-                )
-            };
+                };
 
-            let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
+                let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
 
-            // Try to acquire read locks non-blockingly (fast path for concurrent reads)
-            // 尝试非阻塞获取读锁（并发读的快速路径）
-            let (resp_match_ok, msg) = {
-                let (geoip_manager, geosite_manager) = rules::acquire_geo_locks(engine);
+                // Try to acquire read locks non-blockingly (fast path for concurrent reads)
+                // 尝试非阻塞获取读锁（并发读的快速路径）
+                let (resp_match_ok, msg) = {
+                    let (geoip_manager, geosite_manager) = rules::acquire_geo_locks(engine);
 
-                let geoip_manager_ref = geoip_manager.as_deref();
-                let geosite_manager_ref = geosite_manager.as_deref();
+                    let geoip_manager_ref = geoip_manager.as_deref();
+                    let geosite_manager_ref = geosite_manager.as_deref();
 
-                if let Some(m) = msg_opt {
-                    let matched = eval_match_chain(
-                        response_matchers,
-                        |m| m.operator,
-                        |matcher_op| {
-                            matcher_op.matcher.matches(
-                                upstream,
-                                qname,
-                                qtype,
-                                qclass,
-                                &m,
-                                geoip_manager_ref,
-                                geosite_manager_ref,
-                            )
-                        },
-                    );
-                    (matched, m)
-                } else {
-                    (
-                        false,
-                        Message::new(
-                            0,
-                            hickory_proto::op::MessageType::Query,
-                            hickory_proto::op::OpCode::Query,
-                        ),
-                    )
-                }
-            };
+                    if let Some(m) = msg_opt {
+                        let matched = eval_match_chain(
+                            response_matchers,
+                            |m| m.operator,
+                            |matcher_op| {
+                                matcher_op.matcher.matches(
+                                    upstream,
+                                    qname,
+                                    qtype,
+                                    qclass,
+                                    &m,
+                                    geoip_manager_ref,
+                                    geosite_manager_ref,
+                                )
+                            },
+                        );
+                        (matched, m)
+                    } else {
+                        (
+                            false,
+                            Message::new(
+                                0,
+                                hickory_proto::op::MessageType::Query,
+                                hickory_proto::op::OpCode::Query,
+                            ),
+                        )
+                    }
+                };
 
-            // A refresh reports these too: it acts on the response rules like a client
-            // request, and the observer tells the two apart by background_refresh.
-            // 刷新同样上报：它和客户端请求一样按响应规则行事，观察者按 background_refresh 区分。
-            if !response_matchers.is_empty()
-                && let Some((observer, ctx)) = observed
-            {
-                observer.rule_evaluated(
-                    ctx,
-                    &RuleEvaluated {
-                        pipeline: pipeline_id,
-                        rule: rule_name,
-                        phase: RulePhase::Response,
-                        matched: resp_match_ok,
-                        matchers: response_matchers.len(),
-                    },
-                );
-                if resp_match_ok {
-                    observer.rule_matched(
+                // A refresh reports these too: it acts on the response rules like a client
+                // request, and the observer tells the two apart by background_refresh.
+                // 刷新同样上报：它和客户端请求一样按响应规则行事，观察者按 background_refresh 区分。
+                if !response_matchers.is_empty()
+                    && let Some((observer, ctx)) = observed
+                {
+                    observer.rule_evaluated(
                         ctx,
-                        &RuleMatched {
+                        &RuleEvaluated {
                             pipeline: pipeline_id,
                             rule: rule_name,
                             phase: RulePhase::Response,
-                            decision: response_decision_kind(response_actions_on_match),
-                            fast_path: false,
+                            matched: resp_match_ok,
+                            matchers: response_matchers.len(),
                         },
                     );
+                    if resp_match_ok {
+                        observer.rule_matched(
+                            ctx,
+                            &RuleMatched {
+                                pipeline: pipeline_id,
+                                rule: rule_name,
+                                phase: RulePhase::Response,
+                                decision: response_decision_kind(response_actions_on_match),
+                                fast_path: false,
+                            },
+                        );
+                    }
                 }
-            }
 
-            // A background refresh applies the response rules as a client request
-            // does (a failure reply never gets here, see above): an answer a rule
-            // continues past, or replaces, must not be what the refresh caches.
-            // 后台刷新和客户端请求一样执行响应规则（失败应答到不了这里，见上）：规则
-            // 越过或替换掉的应答，不能成为刷新写进缓存的结果。
-            let empty_actions = Vec::new();
-            let actions_to_run =
-                if !response_actions_on_match.is_empty() || !response_actions_on_miss.is_empty() {
+                // A background refresh applies the response rules as a client request
+                // does (a failure reply never gets here, see above): an answer a rule
+                // continues past, or replaces, must not be what the refresh caches.
+                // 后台刷新和客户端请求一样执行响应规则（失败应答到不了这里，见上）：规则
+                // 越过或替换掉的应答，不能成为刷新写进缓存的结果。
+                let empty_actions = Vec::new();
+                let actions_to_run = if !response_actions_on_match.is_empty()
+                    || !response_actions_on_miss.is_empty()
+                {
                     if resp_match_ok {
                         response_actions_on_match
                     } else {
@@ -977,93 +986,15 @@ pub(crate) async fn handle_forward_decision_logged(
                     &empty_actions
                 };
 
-            if actions_to_run.is_empty() {
-                if cache_ttl > 0 {
-                    let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
-                    engine.insert_dns_cache_entry(
-                        keys.slot,
-                        CacheEntry::from_response(
-                            raw.clone(),
-                            rcode,
-                            Some(Arc::from(actual_upstream.as_str())),
-                            qname,
-                            Arc::from(pipeline_id),
-                            u16::from(qtype),
-                            (cache_ttl, refresh_ttl),
-                        )
-                        .with_reach(trail.clone()),
-                    );
-                }
-                if let Some(g) = cleanup_guard.as_mut() {
-                    g.defuse();
-                    engine
-                        .notify_inflight_waiters(keys.inflight, || {
-                            for_waiters(&raw, &requester, trail, echo_floor)
-                        })
-                        .await;
-                }
-
-                return Ok(ForwardResult::Success(raw));
-            }
-
-            // Handle Actions
-            let req_full = if let Ok(r) = Message::from_bytes(packet) {
-                r
-            } else {
-                Message::new(
-                    0,
-                    hickory_proto::op::MessageType::Query,
-                    hickory_proto::op::OpCode::Query,
-                )
-            };
-            let ctx = ResponseContext {
-                raw: raw.clone(),
-                msg,
-                upstream: Arc::from(actual_upstream.as_str()),
-                transport: transport.unwrap_or(Transport::Udp),
-            };
-
-            let default_upstream = state.pipeline.settings.default_upstream.as_str();
-            let response_jump_limit = state.pipeline.settings.response_jump_limit as usize;
-
-            let ctx = rules::ApplyResponseActionsContext {
-                engine,
-                actions: actions_to_run,
-                ctx_opt: Some(ctx),
-                req: &req_full,
-                packet,
-                upstream_timeout,
-                response_matchers,
-                qname,
-                qtype,
-                qclass,
-                client_ip: peer.ip(),
-                upstream_default: default_upstream,
-                pipeline_id,
-                rule_name,
-                remaining_jumps: response_jump_limit,
-                trail: Some((&mut *trail, forward_ecs)),
-            };
-
-            let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
-
-            match action_result {
-                ResponseActionResult::Upstream { ctx, resp_match: _ } => {
-                    // The reply to a response action's forward (see
-                    // reject_failure_reply_on_refresh)
-                    // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
-                    reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
-                    let ttl_secs_cache = extract_ttl(&ctx.msg);
-                    let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
-                    let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
+                if actions_to_run.is_empty() {
                     if cache_ttl > 0 {
                         let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                         engine.insert_dns_cache_entry(
                             keys.slot,
                             CacheEntry::from_response(
-                                ctx.raw.clone(),
-                                ctx.msg.metadata.response_code,
-                                Some(ctx.upstream.clone()),
+                                raw.clone(),
+                                rcode,
+                                Some(Arc::from(actual_upstream.as_str())),
                                 qname,
                                 Arc::from(pipeline_id),
                                 u16::from(qtype),
@@ -1076,258 +1007,39 @@ pub(crate) async fn handle_forward_decision_logged(
                         g.defuse();
                         engine
                             .notify_inflight_waiters(keys.inflight, || {
-                                for_waiters(&ctx.raw, &requester, trail, echo_floor)
+                                for_waiters(&raw, &requester, trail, echo_floor)
                             })
                             .await;
                     }
-                    response.upstream = Some(ctx.upstream);
-                    Ok(ForwardResult::Success(ctx.raw))
-                }
-                ResponseActionResult::Static { bytes, rcode, .. } => {
-                    // A SERVFAIL here mostly means the response actions found no
-                    // answer either (a response-phase forward failed or ran past its
-                    // limit, or the jump limit was reached); a static SERVFAIL the
-                    // rules configure is taken the same way. A refresh ends as a
-                    // failure rather than cache SERVFAIL over the entry it was
-                    // refreshing.
-                    // 这里的 SERVFAIL 多半说明响应动作也没拿到应答（响应阶段的转发失败或
-                    // 超过次数上限，或到了跳转上限）；规则里配置的静态 SERVFAIL 也按这个
-                    // 处理。刷新以失败结束，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条。
-                    if skip_cache && rcode == ResponseCode::ServFail {
-                        return Err(refresh_found_no_answer(
-                            "the response actions found no answer",
-                        ));
-                    }
-                    if min_ttl > Duration::from_secs(0) {
-                        let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
-                        engine.insert_dns_cache_entry(
-                            keys.slot,
-                            CacheEntry::from_response(
-                                bytes.clone(),
-                                rcode,
-                                None,
-                                qname,
-                                Arc::from(pipeline_id),
-                                u16::from(qtype),
-                                (ttl, ttl),
-                            )
-                            .with_reach(trail.clone()),
-                        );
-                    } else if skip_cache {
-                        // An answer that is not cached cannot renew the entry, so the
-                        // refresh drops it and the next client request runs the rules.
-                        // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端
-                        // 请求自己执行规则。
-                        if let Some(target) = refresh {
-                            engine.drop_refreshed(keys.slot, &question, &view, target);
-                        }
-                    }
-                    if let Some(g) = cleanup_guard.as_mut() {
-                        g.defuse();
-                        engine
-                            .notify_inflight_waiters(keys.inflight, || {
-                                for_waiters(&bytes, &requester, trail, echo_floor)
-                            })
-                            .await;
-                    }
-                    response.upstream = Some(Arc::from("static"));
-                    Ok(ForwardResult::Success(bytes))
-                }
-                ResponseActionResult::Jump {
-                    pipeline,
-                    remaining_jumps,
-                } => {
-                    let edns_present = proto_utils::parse_quick(packet, &mut [0u8; 256])
-                        .map(|p| p.edns_present)
-                        .unwrap_or(false);
 
-                    let resp_bytes = rules::process_response_jump(
-                        engine,
-                        rules::ResponseJumpContext {
-                            state,
-                            pipeline_id: pipeline,
-                            remaining_jumps,
-                            req: &req_full,
-                            packet,
-                            peer: *peer,
-                            qname,
-                            qtype,
-                            qclass,
-                            edns_present,
-                            client_ecs: requester.ecs,
-                            upstream_timeout,
-                            skip_cache,
-                            // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
-                            carried: forward_ecs,
-                            trail: &mut *trail,
-                            echo_floor,
-                            observed,
-                            held_inflight: [
-                                cleanup_guard.as_ref().map(|guard| guard.hash),
-                                held_inflight.as_ref().map(|guard| guard.hash),
-                            ],
-                        },
-                        response,
+                    return Ok(ForwardResult::Success(raw));
+                }
+
+                // Handle Actions
+                let req_full = if let Ok(r) = Message::from_bytes(packet) {
+                    r
+                } else {
+                    Message::new(
+                        0,
+                        hickory_proto::op::MessageType::Query,
+                        hickory_proto::op::OpCode::Query,
                     )
-                    .await?;
-
-                    // The target pipeline's answer is not stored under this key (it
-                    // caches under its own, if at all), so on a refresh the entry here
-                    // no longer matches the rules and is dropped (see the Static arm).
-                    // If the target found no answer, the refresh ends as a failure and
-                    // the entry stays.
-                    // 目标 pipeline 的应答不会存进这个键（要存也存在它自己的键下），所以刷新
-                    // 时这里的条目已经和规则对不上，删掉（同 Static 分支）。目标没拿到应答
-                    // 时，刷新以失败结束，条目保留。
-                    if skip_cache {
-                        if is_servfail(&resp_bytes) || proto_utils::truncated_response(&resp_bytes)
-                        {
-                            return Err(refresh_found_no_answer("the jump target found no answer"));
-                        }
-                        if let Some(target) = refresh {
-                            engine.drop_refreshed(keys.slot, &question, &view, target);
-                        }
-                    }
-                    if let Some(g) = cleanup_guard.as_mut() {
-                        g.defuse();
-                        engine
-                            .notify_inflight_waiters(keys.inflight, || {
-                                for_waiters(&resp_bytes, &requester, trail, echo_floor)
-                            })
-                            .await;
-                    }
-                    Ok(ForwardResult::Success(resp_bytes))
-                }
-                ResponseActionResult::Continue { ctx } => {
-                    // The rule continued past this response, so it is not the
-                    // answer: keep the entry for the rest of the decision loop
-                    // (see `held_inflight`) instead of handing it to waiters. An
-                    // entry held from an earlier continue is dropped in its place,
-                    // and its waiters forward themselves.
-                    // 规则越过了这个应答，它不是最终结果：条目留给决策循环的后续
-                    // 部分（见 `held_inflight`），不把它交给等待者。之前 continue
-                    // 时持有的条目被它替换掉，那一条的等待者自己转发。
-                    if let Some(guard) = cleanup_guard.take() {
-                        *held_inflight = Some(guard);
-                    }
-                    Ok(ForwardResult::Continue {
-                        ctx: Box::new(ctx),
-                        after_failure: false,
-                    })
-                }
-            }
-        }
-        Err(e) => {
-            if response_actions_on_miss.is_empty() {
-                // The stale answer and the SERVFAIL below answer a client once every
-                // upstream attempt is exhausted. A background refresh has no client and
-                // never registered in `inflight`, so it gets the failure itself, which
-                // refresh.rs logs, and neither the cached entry nor other requests'
-                // waiters are touched.
-                // 下面的过期应答和 SERVFAIL 只在所有上游尝试都耗尽时用来应答客户端。
-                // 后台刷新没有客户端，也没在 inflight 里登记，所以把失败原样交回，由
-                // refresh.rs 记录；缓存条目和别的请求的等待者都不受影响。
-                if skip_cache || e.downcast_ref::<UpstreamFailure>().is_none() {
-                    return Err(e);
-                }
-
-                // RFC 8767: Try to serve stale cache entry before returning SERVFAIL
-                // RFC 8767: 在返回 SERVFAIL 之前尝试提供过期缓存
-                if let Some(stale_bytes) = check_stale_cache_logged(
-                    engine,
-                    &CacheLookupContext {
-                        state,
-                        qname,
-                        qtype,
-                        qclass,
-                        pipeline_id,
-                        slot: keys.slot,
-                        tx_id,
-                        start,
-                        peer,
-                        requester,
-                        observed,
-                    },
-                    CacheHitKind::StaleUpstreamFailure,
-                    response,
-                ) {
-                    warn!(
-                        event = "serve_stale_on_upstream_failure",
-                        upstream = %upstream,
-                        qname = %qname,
-                        qtype = ?qtype,
-                        client_ip = %peer.ip(),
-                        pipeline = %pipeline_id,
-                        error = %e,
-                        "RFC 8767: upstream failed, serving stale cache"
-                    );
-                    if let Some(g) = cleanup_guard.as_mut() {
-                        g.defuse();
-                        engine
-                            .notify_inflight_waiters(keys.inflight, || {
-                                for_waiters(&stale_bytes, &requester, trail, echo_floor)
-                            })
-                            .await;
-                    }
-                    return Ok(ForwardResult::Fallback(stale_bytes));
-                }
-
-                let rcode = ResponseCode::ServFail;
-                warn!(
-                   event = "upstream_failure",
-                   upstream = %upstream,
-                   qname = %qname,
-                   qtype = ?qtype,
-                   rcode = ?rcode,
-                   client_ip = %peer.ip(),
-                   error = %e,
-                   pipeline = %pipeline_id,
-                   transport = ?transport,
-                   "upstream failed"
-                );
-                // Fast build SERVFAIL without full request parse
-                let rd = packet.get(2).map(|b| b & 0x01 != 0).unwrap_or(false);
-                let resp_bytes = match build_servfail_response_fast(
-                    tx_id,
-                    qname,
-                    u16::from(qtype),
-                    u16::from(qclass),
-                    rd,
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        // Fallback to full parse if fast build fails
-                        let req = match Message::from_bytes(packet) {
-                            Ok(r) => r,
-                            Err(_) => return Err(e),
-                        };
-                        build_response(&req, rcode, Vec::new()).unwrap_or_default()
-                    }
+                };
+                let ctx = ResponseContext {
+                    raw: raw.clone(),
+                    msg,
+                    upstream: Arc::from(actual_upstream.as_str()),
+                    transport: transport.unwrap_or(Transport::Udp),
                 };
 
-                if let Some(g) = cleanup_guard.as_mut() {
-                    g.defuse();
-                    engine
-                        .notify_inflight_waiters(keys.inflight, || {
-                            for_waiters(&resp_bytes, &requester, trail, echo_floor)
-                        })
-                        .await;
-                }
-
-                Ok(ForwardResult::Fallback(resp_bytes))
-            } else {
-                let req = match Message::from_bytes(packet) {
-                    Ok(r) => r,
-                    Err(_) => return Err(e),
-                };
                 let default_upstream = state.pipeline.settings.default_upstream.as_str();
                 let response_jump_limit = state.pipeline.settings.response_jump_limit as usize;
 
                 let ctx = rules::ApplyResponseActionsContext {
                     engine,
-                    actions: response_actions_on_miss,
-                    ctx_opt: None,
-                    req: &req,
+                    actions: actions_to_run,
+                    ctx_opt: Some(ctx),
+                    req: &req_full,
                     packet,
                     upstream_timeout,
                     response_matchers,
@@ -1341,11 +1053,22 @@ pub(crate) async fn handle_forward_decision_logged(
                     remaining_jumps: response_jump_limit,
                     trail: Some((&mut *trail, forward_ecs)),
                 };
-                let action_result = rules::apply_response_actions_observed(ctx, observed).await?;
+
+                // 响应动作和响应跳转的状态单独在堆上分配：不走这两条路的查询就不必为它们预留地方。
+                // 以前每个等待中的查询都按最大的那条路（跳转）留着 8 KB，慢上游上挂着三万个查询时，
+                // 光这一项就占掉两百多兆
+                // The response actions' and the response jump's state are allocated on the heap
+                // of their own, so a query that takes neither path reserves no room for them.
+                // Every waiting query used to reserve 8 KB for the largest path (the jump), over
+                // two hundred megabytes for thirty thousand queries on a slow upstream
+                let action_result =
+                    Box::pin(rules::apply_response_actions_observed(ctx, observed)).await?;
 
                 match action_result {
                     ResponseActionResult::Upstream { ctx, resp_match: _ } => {
-                        // The reply to a miss action's forward / on_miss 动作转发拿到的应答
+                        // The reply to a response action's forward (see
+                        // reject_failure_reply_on_refresh)
+                        // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                         reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
                         let ttl_secs_cache = extract_ttl(&ctx.msg);
                         let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
@@ -1375,16 +1098,22 @@ pub(crate) async fn handle_forward_decision_logged(
                                 .await;
                         }
                         response.upstream = Some(ctx.upstream);
-                        Ok(ForwardResult::Fallback(ctx.raw))
+                        Ok(ForwardResult::Success(ctx.raw))
                     }
                     ResponseActionResult::Static { bytes, rcode, .. } => {
-                        // The upstream already failed, so a SERVFAIL here means the miss
-                        // actions found no answer either. A refresh gets the failure rather
-                        // than caching SERVFAIL over the entry it was refreshing.
-                        // 上游已经失败，这里的 SERVFAIL 说明 on_miss 动作也没拿到应答。刷新
-                        // 把失败交回，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条。
+                        // A SERVFAIL here mostly means the response actions found no
+                        // answer either (a response-phase forward failed or ran past its
+                        // limit, or the jump limit was reached); a static SERVFAIL the
+                        // rules configure is taken the same way. A refresh ends as a
+                        // failure rather than cache SERVFAIL over the entry it was
+                        // refreshing.
+                        // 这里的 SERVFAIL 多半说明响应动作也没拿到应答（响应阶段的转发失败或
+                        // 超过次数上限，或到了跳转上限）；规则里配置的静态 SERVFAIL 也按这个
+                        // 处理。刷新以失败结束，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条。
                         if skip_cache && rcode == ResponseCode::ServFail {
-                            return Err(e);
+                            return Err(refresh_found_no_answer(
+                                "the response actions found no answer",
+                            ));
                         }
                         if min_ttl > Duration::from_secs(0) {
                             let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
@@ -1401,6 +1130,14 @@ pub(crate) async fn handle_forward_decision_logged(
                                 )
                                 .with_reach(trail.clone()),
                             );
+                        } else if skip_cache {
+                            // An answer that is not cached cannot renew the entry, so the
+                            // refresh drops it and the next client request runs the rules.
+                            // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端
+                            // 请求自己执行规则。
+                            if let Some(target) = refresh {
+                                engine.drop_refreshed(keys.slot, &question, &view, target);
+                            }
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
@@ -1411,7 +1148,7 @@ pub(crate) async fn handle_forward_decision_logged(
                                 .await;
                         }
                         response.upstream = Some(Arc::from("static"));
-                        Ok(ForwardResult::Fallback(bytes))
+                        Ok(ForwardResult::Success(bytes))
                     }
                     ResponseActionResult::Jump {
                         pipeline,
@@ -1420,23 +1157,15 @@ pub(crate) async fn handle_forward_decision_logged(
                         let edns_present = proto_utils::parse_quick(packet, &mut [0u8; 256])
                             .map(|p| p.edns_present)
                             .unwrap_or(false);
-                        let req = if let Ok(r) = Message::from_bytes(packet) {
-                            r
-                        } else {
-                            Message::new(
-                                0,
-                                hickory_proto::op::MessageType::Query,
-                                hickory_proto::op::OpCode::Query,
-                            )
-                        };
 
-                        let resp_bytes = rules::process_response_jump(
+                        // 单独在堆上分配，见上 / Allocated on its own, see above
+                        let resp_bytes = Box::pin(rules::process_response_jump(
                             engine,
                             rules::ResponseJumpContext {
                                 state,
                                 pipeline_id: pipeline,
                                 remaining_jumps,
-                                req: &req,
+                                req: &req_full,
                                 packet,
                                 peer: *peer,
                                 qname,
@@ -1457,14 +1186,28 @@ pub(crate) async fn handle_forward_decision_logged(
                                 ],
                             },
                             response,
-                        )
+                        ))
                         .await?;
 
-                        // The target found no answer either: a refresh gets the upstream
-                        // failure, as in the Static arm
-                        // 目标也没拿到应答：刷新拿到的是上游的失败，同 Static 分支
-                        if skip_cache && is_servfail(&resp_bytes) {
-                            return Err(e);
+                        // The target pipeline's answer is not stored under this key (it
+                        // caches under its own, if at all), so on a refresh the entry here
+                        // no longer matches the rules and is dropped (see the Static arm).
+                        // If the target found no answer, the refresh ends as a failure and
+                        // the entry stays.
+                        // 目标 pipeline 的应答不会存进这个键（要存也存在它自己的键下），所以刷新
+                        // 时这里的条目已经和规则对不上，删掉（同 Static 分支）。目标没拿到应答
+                        // 时，刷新以失败结束，条目保留。
+                        if skip_cache {
+                            if is_servfail(&resp_bytes)
+                                || proto_utils::truncated_response(&resp_bytes)
+                            {
+                                return Err(refresh_found_no_answer(
+                                    "the jump target found no answer",
+                                ));
+                            }
+                            if let Some(target) = refresh {
+                                engine.drop_refreshed(keys.slot, &question, &view, target);
+                            }
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.defuse();
@@ -1474,27 +1217,311 @@ pub(crate) async fn handle_forward_decision_logged(
                                 })
                                 .await;
                         }
-                        Ok(ForwardResult::Fallback(resp_bytes))
+                        Ok(ForwardResult::Success(resp_bytes))
                     }
                     ResponseActionResult::Continue { ctx } => {
-                        // Same as the Continue on a response above (see `held_inflight`).
-                        // Defusing the guard here used to leave the entry behind with
-                        // nobody holding it, so the next Forward waited on it until the
-                        // listener timeout.
-                        // 同上面有应答时的 Continue（见 `held_inflight`）。以前这里 defuse
-                        // 守卫，条目留在表里却没人持有，下一条转发会一直等它到监听器超时。
+                        // The rule continued past this response, so it is not the
+                        // answer: keep the entry for the rest of the decision loop
+                        // (see `held_inflight`) instead of handing it to waiters. An
+                        // entry held from an earlier continue is dropped in its place,
+                        // and its waiters forward themselves.
+                        // 规则越过了这个应答，它不是最终结果：条目留给决策循环的后续
+                        // 部分（见 `held_inflight`），不把它交给等待者。之前 continue
+                        // 时持有的条目被它替换掉，那一条的等待者自己转发。
                         if let Some(guard) = cleanup_guard.take() {
                             *held_inflight = Some(guard);
                         }
                         Ok(ForwardResult::Continue {
                             ctx: Box::new(ctx),
-                            after_failure: true,
+                            after_failure: false,
                         })
                     }
                 }
             }
+            Err(e) => {
+                if response_actions_on_miss.is_empty() {
+                    // The stale answer and the SERVFAIL below answer a client once every
+                    // upstream attempt is exhausted. A background refresh has no client and
+                    // never registered in `inflight`, so it gets the failure itself, which
+                    // refresh.rs logs, and neither the cached entry nor other requests'
+                    // waiters are touched.
+                    // 下面的过期应答和 SERVFAIL 只在所有上游尝试都耗尽时用来应答客户端。
+                    // 后台刷新没有客户端，也没在 inflight 里登记，所以把失败原样交回，由
+                    // refresh.rs 记录；缓存条目和别的请求的等待者都不受影响。
+                    if skip_cache || e.downcast_ref::<UpstreamFailure>().is_none() {
+                        return Err(e);
+                    }
+
+                    // RFC 8767: Try to serve stale cache entry before returning SERVFAIL
+                    // RFC 8767: 在返回 SERVFAIL 之前尝试提供过期缓存
+                    if let Some(stale_bytes) = check_stale_cache_logged(
+                        engine,
+                        &CacheLookupContext {
+                            state,
+                            qname,
+                            qtype,
+                            qclass,
+                            pipeline_id,
+                            slot: keys.slot,
+                            tx_id,
+                            start,
+                            peer,
+                            requester,
+                            observed,
+                        },
+                        CacheHitKind::StaleUpstreamFailure,
+                        response,
+                    ) {
+                        warn!(
+                            event = "serve_stale_on_upstream_failure",
+                            upstream = %upstream,
+                            qname = %qname,
+                            qtype = ?qtype,
+                            client_ip = %peer.ip(),
+                            pipeline = %pipeline_id,
+                            error = %e,
+                            "RFC 8767: upstream failed, serving stale cache"
+                        );
+                        if let Some(g) = cleanup_guard.as_mut() {
+                            g.defuse();
+                            engine
+                                .notify_inflight_waiters(keys.inflight, || {
+                                    for_waiters(&stale_bytes, &requester, trail, echo_floor)
+                                })
+                                .await;
+                        }
+                        return Ok(ForwardResult::Fallback(stale_bytes));
+                    }
+
+                    let rcode = ResponseCode::ServFail;
+                    warn!(
+                       event = "upstream_failure",
+                       upstream = %upstream,
+                       qname = %qname,
+                       qtype = ?qtype,
+                       rcode = ?rcode,
+                       client_ip = %peer.ip(),
+                       error = %e,
+                       pipeline = %pipeline_id,
+                       transport = ?transport,
+                       "upstream failed"
+                    );
+                    // Fast build SERVFAIL without full request parse
+                    let rd = packet.get(2).map(|b| b & 0x01 != 0).unwrap_or(false);
+                    let resp_bytes = match build_servfail_response_fast(
+                        tx_id,
+                        qname,
+                        u16::from(qtype),
+                        u16::from(qclass),
+                        rd,
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            // Fallback to full parse if fast build fails
+                            let req = match Message::from_bytes(packet) {
+                                Ok(r) => r,
+                                Err(_) => return Err(e),
+                            };
+                            build_response(&req, rcode, Vec::new()).unwrap_or_default()
+                        }
+                    };
+
+                    if let Some(g) = cleanup_guard.as_mut() {
+                        g.defuse();
+                        engine
+                            .notify_inflight_waiters(keys.inflight, || {
+                                for_waiters(&resp_bytes, &requester, trail, echo_floor)
+                            })
+                            .await;
+                    }
+
+                    Ok(ForwardResult::Fallback(resp_bytes))
+                } else {
+                    let req = match Message::from_bytes(packet) {
+                        Ok(r) => r,
+                        Err(_) => return Err(e),
+                    };
+                    let default_upstream = state.pipeline.settings.default_upstream.as_str();
+                    let response_jump_limit = state.pipeline.settings.response_jump_limit as usize;
+
+                    let ctx = rules::ApplyResponseActionsContext {
+                        engine,
+                        actions: response_actions_on_miss,
+                        ctx_opt: None,
+                        req: &req,
+                        packet,
+                        upstream_timeout,
+                        response_matchers,
+                        qname,
+                        qtype,
+                        qclass,
+                        client_ip: peer.ip(),
+                        upstream_default: default_upstream,
+                        pipeline_id,
+                        rule_name,
+                        remaining_jumps: response_jump_limit,
+                        trail: Some((&mut *trail, forward_ecs)),
+                    };
+                    // 单独在堆上分配，见上 / Allocated on its own, see above
+                    let action_result =
+                        Box::pin(rules::apply_response_actions_observed(ctx, observed)).await?;
+
+                    match action_result {
+                        ResponseActionResult::Upstream { ctx, resp_match: _ } => {
+                            // The reply to a miss action's forward / on_miss 动作转发拿到的应答
+                            reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
+                            let ttl_secs_cache = extract_ttl(&ctx.msg);
+                            let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
+                            let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
+                            if cache_ttl > 0 {
+                                let refresh_ttl =
+                                    proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
+                                engine.insert_dns_cache_entry(
+                                    keys.slot,
+                                    CacheEntry::from_response(
+                                        ctx.raw.clone(),
+                                        ctx.msg.metadata.response_code,
+                                        Some(ctx.upstream.clone()),
+                                        qname,
+                                        Arc::from(pipeline_id),
+                                        u16::from(qtype),
+                                        (cache_ttl, refresh_ttl),
+                                    )
+                                    .with_reach(trail.clone()),
+                                );
+                            }
+                            if let Some(g) = cleanup_guard.as_mut() {
+                                g.defuse();
+                                engine
+                                    .notify_inflight_waiters(keys.inflight, || {
+                                        for_waiters(&ctx.raw, &requester, trail, echo_floor)
+                                    })
+                                    .await;
+                            }
+                            response.upstream = Some(ctx.upstream);
+                            Ok(ForwardResult::Fallback(ctx.raw))
+                        }
+                        ResponseActionResult::Static { bytes, rcode, .. } => {
+                            // The upstream already failed, so a SERVFAIL here means the miss
+                            // actions found no answer either. A refresh gets the failure rather
+                            // than caching SERVFAIL over the entry it was refreshing.
+                            // 上游已经失败，这里的 SERVFAIL 说明 on_miss 动作也没拿到应答。刷新
+                            // 把失败交回，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条。
+                            if skip_cache && rcode == ResponseCode::ServFail {
+                                return Err(e);
+                            }
+                            if min_ttl > Duration::from_secs(0) {
+                                let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
+                                engine.insert_dns_cache_entry(
+                                    keys.slot,
+                                    CacheEntry::from_response(
+                                        bytes.clone(),
+                                        rcode,
+                                        None,
+                                        qname,
+                                        Arc::from(pipeline_id),
+                                        u16::from(qtype),
+                                        (ttl, ttl),
+                                    )
+                                    .with_reach(trail.clone()),
+                                );
+                            }
+                            if let Some(g) = cleanup_guard.as_mut() {
+                                g.defuse();
+                                engine
+                                    .notify_inflight_waiters(keys.inflight, || {
+                                        for_waiters(&bytes, &requester, trail, echo_floor)
+                                    })
+                                    .await;
+                            }
+                            response.upstream = Some(Arc::from("static"));
+                            Ok(ForwardResult::Fallback(bytes))
+                        }
+                        ResponseActionResult::Jump {
+                            pipeline,
+                            remaining_jumps,
+                        } => {
+                            let edns_present = proto_utils::parse_quick(packet, &mut [0u8; 256])
+                                .map(|p| p.edns_present)
+                                .unwrap_or(false);
+                            let req = if let Ok(r) = Message::from_bytes(packet) {
+                                r
+                            } else {
+                                Message::new(
+                                    0,
+                                    hickory_proto::op::MessageType::Query,
+                                    hickory_proto::op::OpCode::Query,
+                                )
+                            };
+
+                            // 单独在堆上分配，见上 / Allocated on its own, see above
+                            let resp_bytes = Box::pin(rules::process_response_jump(
+                                engine,
+                                rules::ResponseJumpContext {
+                                    state,
+                                    pipeline_id: pipeline,
+                                    remaining_jumps,
+                                    req: &req,
+                                    packet,
+                                    peer: *peer,
+                                    qname,
+                                    qtype,
+                                    qclass,
+                                    edns_present,
+                                    client_ecs: requester.ecs,
+                                    upstream_timeout,
+                                    skip_cache,
+                                    // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
+                                    carried: forward_ecs,
+                                    trail: &mut *trail,
+                                    echo_floor,
+                                    observed,
+                                    held_inflight: [
+                                        cleanup_guard.as_ref().map(|guard| guard.hash),
+                                        held_inflight.as_ref().map(|guard| guard.hash),
+                                    ],
+                                },
+                                response,
+                            ))
+                            .await?;
+
+                            // The target found no answer either: a refresh gets the upstream
+                            // failure, as in the Static arm
+                            // 目标也没拿到应答：刷新拿到的是上游的失败，同 Static 分支
+                            if skip_cache && is_servfail(&resp_bytes) {
+                                return Err(e);
+                            }
+                            if let Some(g) = cleanup_guard.as_mut() {
+                                g.defuse();
+                                engine
+                                    .notify_inflight_waiters(keys.inflight, || {
+                                        for_waiters(&resp_bytes, &requester, trail, echo_floor)
+                                    })
+                                    .await;
+                            }
+                            Ok(ForwardResult::Fallback(resp_bytes))
+                        }
+                        ResponseActionResult::Continue { ctx } => {
+                            // Same as the Continue on a response above (see `held_inflight`).
+                            // Defusing the guard here used to leave the entry behind with
+                            // nobody holding it, so the next Forward waited on it until the
+                            // listener timeout.
+                            // 同上面有应答时的 Continue（见 `held_inflight`）。以前这里 defuse
+                            // 守卫，条目留在表里却没人持有，下一条转发会一直等它到监听器超时。
+                            if let Some(guard) = cleanup_guard.take() {
+                                *held_inflight = Some(guard);
+                            }
+                            Ok(ForwardResult::Continue {
+                                ctx: Box::new(ctx),
+                                after_failure: true,
+                            })
+                        }
+                    }
+                }
+            }
         }
-    }
+    })
+    .await
 }
 
 /// The error a background refresh ends with when its rules found no answer: the
