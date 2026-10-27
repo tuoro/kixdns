@@ -1097,7 +1097,7 @@ impl PanelMetrics {
     }
 }
 
-fn transport_label(transport: crate::config::Transport) -> &'static str {
+pub(crate) fn transport_label(transport: crate::config::Transport) -> &'static str {
     use crate::config::Transport;
     match transport {
         Transport::Udp => "udp",
@@ -1431,9 +1431,15 @@ impl EngineObserver for PanelMetrics {
             .collect();
         match event.source {
             Some(source) => self.record_config_loaded(source, restart_pending),
+            // 没带原文时摘要照旧；第一次加载（代数 1）不算重载
+            // Without the text the digest stays; the first load (generation 1) is no reload
             None => {
                 let sha256 = self.active_config.read().sha256.clone();
-                self.record_reload_success(sha256, restart_pending);
+                if event.generation <= 1 {
+                    self.record_initial_config(sha256, restart_pending);
+                } else {
+                    self.record_reload_success(sha256, restart_pending);
+                }
             }
         }
     }
@@ -2516,6 +2522,32 @@ mod tests {
     /// 不带 `--debug` 时一条都不该出现。
     /// `--debug` must forward every one of the 15 engine events (background refresh included)
     /// to the upstream reference observer; without `--debug` none may appear.
+    /// 第一次加载的配置没带原文时也不算一次重载：重载次数和重载序号不变，代数是 1；之后的加载才算
+    /// The first configuration loaded without its text is no reload either: the reload
+    /// count and sequence stay, the generation is 1; the loads after it are reloads
+    #[test]
+    fn the_first_load_without_its_text_is_no_reload() {
+        use crate::observe::{ConfigLoaded, EngineObserver};
+        use std::sync::atomic::Ordering;
+        let metrics = PanelMetrics::default();
+        let load = |generation| {
+            metrics.config_loaded(&ConfigLoaded {
+                path: None,
+                generation,
+                source: None,
+                restart_pending: &[],
+            })
+        };
+        load(1);
+        assert_eq!(metrics.reload_success.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.reload_sequence.load(Ordering::Acquire), 0);
+        assert_eq!(metrics.active_config.read().generation, 1);
+        load(2);
+        assert_eq!(metrics.reload_success.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.reload_sequence.load(Ordering::Acquire), 1);
+        assert_eq!(metrics.active_config.read().generation, 2);
+    }
+
     /// 跳转过的请求会在目标 pipeline 下再查一次缓存，但只计一次查找：命中率按请求算，
     /// 否则跳转过的请求命中时，看板上的命中率只有一半。请求结束后不再记着它。
     /// A request that jumps looks in the cache again under the target pipeline but
