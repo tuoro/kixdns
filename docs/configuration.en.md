@@ -259,7 +259,7 @@ The following prefixes override the transport field:
 | dot:// | DoT | tls:// |
 | doq:// | DoQ | quic:// |
 
-Without a prefix, an omitted transport means UDP. DoH URLs without a path use /dns-query. DoH supports a host query parameter as an HTTP Host override; that parameter is removed before the request is sent.
+Without a prefix, an omitted transport means UDP. DoH URLs without a path use /dns-query. DoH supports a host query parameter as an HTTP Host override; that parameter is removed before the request is sent. A DoH answer is taken only with a success status, the application/dns-message media type and at most 65535 bytes; a redirect (3xx) is not followed and fails the upstream like any other error status.
 
 DoT uses port 853 when no port is supplied. Its optional TLS name is supplied with sni or servername and it must not contain a DNS path.
 

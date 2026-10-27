@@ -1430,20 +1430,30 @@ impl TcpMuxClient {
 
 // ===================== DoH (DNS over HTTPS) =====================
 
-/// Marker for HTTP status errors: the connection itself is healthy, so retrying
-/// won't help (only transport-level errors indicate a possibly dead connection).
-/// HTTP 状态码错误标记：连接本身正常，重试无益
-/// （只有传输层错误才指示连接可能已死）
+/// Marker for an answer the server did send but that cannot be used: an HTTP
+/// error status, another media type, or a body longer than any DNS message. The
+/// connection itself is healthy, so retrying won't help (only transport-level
+/// errors indicate a possibly dead connection).
+/// 服务器回了、但用不了的回答的标记：HTTP 错误状态码、别的媒体类型，或者比任何 DNS 消息都长的正文。
+/// 连接本身正常，重试无益（只有传输层错误才指示连接可能已死）
 #[derive(Debug)]
-struct DohHttpStatusError(anyhow::Error);
+struct DohAnswerError(anyhow::Error);
 
-impl std::fmt::Display for DohHttpStatusError {
+impl std::fmt::Display for DohAnswerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::error::Error for DohHttpStatusError {}
+impl std::error::Error for DohAnswerError {}
+
+fn doh_answer_error(message: String) -> anyhow::Error {
+    anyhow::Error::new(DohAnswerError(anyhow::anyhow!(message)))
+}
+
+/// The media type of DNS messages over HTTPS (RFC 8484 §6)
+/// DNS over HTTPS 里 DNS 消息的媒体类型（RFC 8484 第 6 节）
+const DOH_MEDIA_TYPE: &str = "application/dns-message";
 
 /// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
 const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
@@ -1502,6 +1512,11 @@ impl DohClient {
     /// 构建新的 reqwest 客户端，用于初始构造和连接池重建（后者驱逐死/半开连接）
     fn build_client(pool_max_idle_per_host: usize) -> anyhow::Result<DohHttpClient> {
         DohHttpClient::builder()
+            // A DoH server has no reason to redirect, and following one could send
+            // the query elsewhere, plain HTTP included; a 3xx fails like any other
+            // non-success status
+            // DoH 服务器没有理由跳转，跟着跳可能把查询发到别处，包括明文 HTTP；3xx 和别的非成功状态一样算失败
+            .redirect(reqwest::redirect::Policy::none())
             .http2_adaptive_window(true)
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(pool_max_idle_per_host.max(1))
@@ -1649,8 +1664,8 @@ impl DohClient {
 
         let mut req = client
             .post(url.clone())
-            .header(ACCEPT, "application/dns-message")
-            .header(CONTENT_TYPE, "application/dns-message")
+            .header(ACCEPT, DOH_MEDIA_TYPE)
+            .header(CONTENT_TYPE, DOH_MEDIA_TYPE)
             .body(packet.to_vec());
 
         if let Some(host) = host_override {
@@ -1666,15 +1681,28 @@ impl DohClient {
 
             let status = resp.status();
             if !status.is_success() {
-                // Wrap as DohHttpStatusError so the caller knows the connection is
+                // Wrap as DohAnswerError so the caller knows the connection is
                 // fine and a retry won't help.
-                // 包装为 DohHttpStatusError，让调用方知道连接正常、重试无益
-                return Err(anyhow::Error::new(DohHttpStatusError(anyhow::anyhow!(
-                    "doh http status {status}"
-                ))));
+                // 包装为 DohAnswerError，让调用方知道连接正常、重试无益
+                return Err(doh_answer_error(format!("doh http status {status}")));
+            }
+            // Anything but a DNS message (a captive portal's HTML page, say) is
+            // not an answer
+            // 不是 DNS 消息的（比如强制门户的 HTML 页面）不算回答
+            let media_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim);
+            if !media_type.is_some_and(|media| media.eq_ignore_ascii_case(DOH_MEDIA_TYPE)) {
+                return Err(doh_answer_error(format!(
+                    "doh answer is not {DOH_MEDIA_TYPE} but {}",
+                    media_type.unwrap_or("untyped")
+                )));
             }
 
-            resp.bytes().await.context("read doh response body")
+            read_doh_body(resp).await
         })
         .await;
 
@@ -1766,13 +1794,43 @@ fn restore_query_id(packet: &[u8], response: Bytes) -> Bytes {
     restored.freeze()
 }
 
-/// A transport-level error is anything that is NOT an HTTP status error: timeouts,
-/// connection failures, and IO errors all indicate a possibly dead connection and
-/// are safe to retry once (DoH queries are semantically idempotent).
-/// 传输层错误 = 非 HTTP 状态码错误：超时、连接失败、IO 错误都指示连接可能已死，
+/// Read a DoH answer body, at most one DNS message long. A server sending without
+/// end used to have every byte kept until the request timed out, gigabytes for a
+/// single answer.
+/// 读 DoH 回答的正文，最多一条 DNS 消息那么长。以前一个不停往回发的服务器发多少就收多少，直到请求超时，
+/// 一个回答就能占掉几个 GB。
+async fn read_doh_body(mut resp: reqwest::Response) -> anyhow::Result<Bytes> {
+    let Some(first) = resp.chunk().await.context("read doh response body")? else {
+        return Ok(Bytes::new());
+    };
+    // An answer usually arrives in one piece, handed on as it is
+    // 回答一般一块就到齐，那时原样交出
+    let mut length = first.len();
+    let mut joined: Option<BytesMut> = None;
+    loop {
+        if length > MAX_DNS_MESSAGE_SIZE {
+            return Err(doh_answer_error(format!(
+                "doh answer longer than {MAX_DNS_MESSAGE_SIZE} bytes"
+            )));
+        }
+        let Some(chunk) = resp.chunk().await.context("read doh response body")? else {
+            return Ok(joined.map_or(first, BytesMut::freeze));
+        };
+        length += chunk.len();
+        joined
+            .get_or_insert_with(|| BytesMut::from(first.as_ref()))
+            .extend_from_slice(&chunk);
+    }
+}
+
+/// A transport-level error is anything that is NOT an unusable answer (see
+/// [`DohAnswerError`]): timeouts, connection failures, and IO errors all indicate a
+/// possibly dead connection and are safe to retry once (DoH queries are
+/// semantically idempotent).
+/// 传输层错误 = 不是用不了的回答（见 [`DohAnswerError`]）：超时、连接失败、IO 错误都指示连接可能已死，
 /// 单次重试安全（DoH 查询语义幂等）
 fn is_transport_error(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<DohHttpStatusError>().is_none()
+    err.downcast_ref::<DohAnswerError>().is_none()
 }
 
 fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
@@ -4502,10 +4560,10 @@ mod tests {
 
     #[test]
     fn doh_is_transport_error_classifies_correctly() {
-        // Only HTTP status errors are non-transport (connection is healthy, retry is
+        // Only unusable answers are non-transport (connection is healthy, retry is
         // useless). Everything else (timeout / connect / IO) indicates a possibly
         // dead connection and is safe to retry once (DoH queries are idempotent).
-        // 只有 HTTP 状态码错误是非传输的（连接健康，重试无益）。
+        // 只有用不了的回答是非传输的（连接健康，重试无益）。
         // 其余（超时/连接/IO）都指示连接可能已死，单次重试安全（DoH 查询语义幂等）。
         let timeout_err = anyhow::anyhow!("doh request timeout");
         assert!(
@@ -4514,18 +4572,16 @@ mod tests {
         );
 
         // A reqwest-style error wrapped via .context() must still classify as
-        // transport (downcast finds no DohHttpStatusError at the top of the chain).
+        // transport (downcast finds no DohAnswerError at the top of the chain).
         // 经 .context() 包装的 reqwest 风格错误仍须归类为传输错误
-        // （downcast 在链顶找不到 DohHttpStatusError）。
+        // （downcast 在链顶找不到 DohAnswerError）。
         let send_err = anyhow::anyhow!("doh request send failed").context("wrapped");
         assert!(
             is_transport_error(&send_err),
             "wrapped send error is transport-level"
         );
 
-        let status_err = anyhow::Error::new(DohHttpStatusError(anyhow::anyhow!(
-            "doh http status 503 Server Error"
-        )));
+        let status_err = doh_answer_error("doh http status 503 Server Error".to_string());
         assert!(
             !is_transport_error(&status_err),
             "HTTP status is NOT transport-level"
@@ -4725,6 +4781,43 @@ mod tests {
         );
     }
 
+    /// `socket` 上的下一个 HTTP/1.1 请求：请求头（转成小写）和正文。`buf` 存着上一个请求之后多读的字节；
+    /// 客户端走了就是 None
+    /// The next HTTP/1.1 request on `socket`: its head (lower-cased) and body. `buf`
+    /// holds the bytes read past the previous request; `None` once the client is gone
+    async fn next_http_request(
+        socket: &mut tokio::net::TcpStream,
+        buf: &mut Vec<u8>,
+    ) -> Option<(String, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+
+        let mut chunk = [0u8; 2048];
+        let header_end = loop {
+            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buf.len() < header_end + length {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let body = buf[header_end..header_end + length].to_vec();
+        buf.drain(..header_end + length);
+        Some((head, body))
+    }
+
     /// 一个不管收到什么 ID 都回 0 的 DoH 上游（RFC 8484 允许这样做）：把查询原样回过去，
     /// ID 写成 0、标上 QR。返回监听地址和它收到的每个查询的 ID。
     /// A DoH upstream that answers with ID 0 whatever it receives (RFC 8484 allows it): it
@@ -4735,7 +4828,7 @@ mod tests {
     async fn spawn_zero_id_doh_upstream(
         drop_first: bool,
     ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<u16>>>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -4750,32 +4843,9 @@ mod tests {
                 let dropped = Arc::clone(&dropped);
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
-                    let mut chunk = [0u8; 2048];
                     // 一条连接上可以连着来几个请求（keep-alive） / Several requests may share one connection (keep-alive)
-                    loop {
-                        let header_end = loop {
-                            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                break at + 4;
-                            }
-                            match socket.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        };
-                        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
-                        let length = head
-                            .lines()
-                            .find_map(|line| line.strip_prefix("content-length:"))
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                        while buf.len() < header_end + length {
-                            match socket.read(&mut chunk).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                            }
-                        }
-                        let mut reply = buf[header_end..header_end + length].to_vec();
-                        buf.drain(..header_end + length);
+                    while let Some((_, mut reply)) = next_http_request(&mut socket, &mut buf).await
+                    {
                         if !dropped.swap(true, Ordering::SeqCst) {
                             return;
                         }
@@ -4848,6 +4918,205 @@ mod tests {
                 "queries leave with their own IDs (drop_first = {drop_first})"
             );
         }
+    }
+
+    /// 本机 DoH 测试上游怎么回一个请求 / How the local DoH test upstream answers one request
+    enum DohReply {
+        /// 把这些字节当作整个 HTTP 响应写回去 / Write these bytes back as the whole HTTP response
+        Raw(Vec<u8>),
+        /// 200，分块的正文永远发不完 / A 200 whose chunked body never ends
+        Endless,
+    }
+
+    /// 本机明文 DoH 上游：每个请求按 `reply(路径, 正文)` 回答。返回监听地址和它被请求过的路径（按先后）
+    /// Local plain-HTTP DoH upstream: each request is answered by `reply(path, body)`.
+    /// Returns its address and the paths it was asked for, in order
+    async fn spawn_doh_upstream(
+        reply: fn(&str, &[u8]) -> DohReply,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind DoH stub");
+        let addr = listener.local_addr().expect("DoH stub address");
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&paths);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let record = Arc::clone(&record);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    while let Some((head, body)) = next_http_request(&mut socket, &mut buf).await {
+                        let path = head
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+                        record.lock().unwrap().push(path.clone());
+                        match reply(&path, &body) {
+                            DohReply::Raw(response) => {
+                                if socket.write_all(&response).await.is_err() {
+                                    return;
+                                }
+                            }
+                            DohReply::Endless => {
+                                let head = format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: {DOH_MEDIA_TYPE}\r\ntransfer-encoding: chunked\r\n\r\n"
+                                );
+                                let piece = [0u8; 16 * 1024];
+                                let chunk =
+                                    [format!("{:x}\r\n", piece.len()).as_bytes(), &piece, b"\r\n"]
+                                        .concat();
+                                if socket.write_all(head.as_bytes()).await.is_ok() {
+                                    while socket.write_all(&chunk).await.is_ok() {}
+                                }
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, paths)
+    }
+
+    /// 200 应答，带给定的媒体类型（None 就不带）和正文 / A 200 with the given media type (none for None) and body
+    fn http_ok(media_type: Option<&str>, body: &[u8]) -> Vec<u8> {
+        let mut head = String::from("HTTP/1.1 200 OK\r\n");
+        if let Some(media_type) = media_type {
+            head.push_str(&format!("content-type: {media_type}\r\n"));
+        }
+        head.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
+        [head.as_bytes(), body].concat()
+    }
+
+    /// 问 `label.test` 的 A 记录 / An A query for `label.test`
+    fn doh_test_query(label: &str) -> Vec<u8> {
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+        query.extend_from_slice(b"\x04test\x00\x00\x01\x00\x01");
+        query
+    }
+
+    /// 标上 QR 的查询本身，当作它的回答 / The query itself with QR set, as its answer
+    fn echo_answer(query: &[u8]) -> Vec<u8> {
+        let mut answer = query.to_vec();
+        answer[2] |= 0x80;
+        answer
+    }
+
+    /// 一个回答最多一条 DNS 消息那么长。此前正文有多长就收多长：服务器不停往回发时，一个查询几秒内
+    /// 就能占掉几个 GB，一直到超时。
+    /// An answer is at most one DNS message long. The body used to be taken whole:
+    /// with a server sending without end, one query took gigabytes within seconds,
+    /// until it timed out.
+    #[tokio::test]
+    async fn doh_refuses_an_answer_longer_than_a_dns_message() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (addr, _) = spawn_doh_upstream(|_, query| {
+            let mut answer = echo_answer(query);
+            match &query[13..17] {
+                b"full" => answer.resize(MAX_DNS_MESSAGE_SIZE, 0),
+                b"over" => answer.resize(MAX_DNS_MESSAGE_SIZE + 1, 0),
+                _ => return DohReply::Endless,
+            }
+            DohReply::Raw(http_ok(Some(DOH_MEDIA_TYPE), &answer))
+        })
+        .await;
+        let upstream = format!("http://{addr}/dns-query");
+        let client = DohClient::new(8, 0).expect("build doh client");
+
+        // 正好一条最长的 DNS 消息：照收，分几块到也拼得回来
+        // Exactly one longest DNS message: taken, put back together from its pieces
+        let query = doh_test_query("full");
+        let answer = client
+            .send(&query, &upstream, Duration::from_secs(5))
+            .await
+            .expect("a 65535-byte answer is an answer");
+        assert_eq!(answer.len(), MAX_DNS_MESSAGE_SIZE);
+        assert_eq!(&answer[..query.len()], &echo_answer(&query)[..]);
+
+        for label in ["over", "more"] {
+            let start = tokio::time::Instant::now();
+            let err = client
+                .send(&doh_test_query(label), &upstream, Duration::from_secs(5))
+                .await
+                .expect_err("longer than a DNS message");
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{label}: refused as soon as it is too long, not at the timeout"
+            );
+            assert!(
+                !is_transport_error(&err),
+                "{label}: the server answered, a retry would get the same: {err:#}"
+            );
+        }
+    }
+
+    /// 回答必须是 DNS 消息的媒体类型。此前强制门户或出错的代理回的网页也被当成回答交出去。
+    /// An answer has to carry the DNS message media type. A web page from a captive
+    /// portal or a broken proxy used to be handed on as an answer.
+    #[tokio::test]
+    async fn doh_refuses_an_answer_of_another_media_type() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (addr, _) = spawn_doh_upstream(|_, query| {
+            let media_type = match &query[13..17] {
+                b"html" => Some("text/html"),
+                b"none" => None,
+                b"case" => Some("Application/DNS-Message"),
+                _ => Some("application/dns-message; charset=binary"),
+            };
+            DohReply::Raw(http_ok(media_type, &echo_answer(query)))
+        })
+        .await;
+        let upstream = format!("http://{addr}/dns-query");
+        let client = DohClient::new(8, 0).expect("build doh client");
+        for label in ["html", "none"] {
+            let err = client
+                .send(&doh_test_query(label), &upstream, Duration::from_secs(5))
+                .await
+                .expect_err("not a DNS message");
+            assert!(!is_transport_error(&err), "{label}: no retry: {err:#}");
+        }
+        // 媒体类型不分大小写，参数不管 / Media types ignore case, and parameters do not matter
+        for label in ["case", "parm"] {
+            client
+                .send(&doh_test_query(label), &upstream, Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|err| panic!("{label}: a DNS message: {err:#}"));
+        }
+    }
+
+    /// DoH 客户端不跟随跳转：服务器没有理由跳转，跟着跳可能把查询发到别处，包括明文 HTTP。
+    /// The DoH client follows no redirect: a server has no reason to send one, and
+    /// following it could take the query elsewhere, plain HTTP included.
+    #[tokio::test]
+    async fn doh_does_not_follow_redirects() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (addr, paths) = spawn_doh_upstream(|path, query| {
+            if path == "/dns-query" {
+                DohReply::Raw(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nlocation: /elsewhere\r\ncontent-length: 0\r\n\r\n"
+                        .to_vec(),
+                )
+            } else {
+                DohReply::Raw(http_ok(Some(DOH_MEDIA_TYPE), &echo_answer(query)))
+            }
+        })
+        .await;
+        let client = DohClient::new(8, 0).expect("build doh client");
+        let err = client
+            .send(
+                &doh_test_query("move"),
+                &format!("http://{addr}/dns-query"),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a redirect is not an answer");
+        assert!(!is_transport_error(&err), "no retry: {err:#}");
+        assert_eq!(*paths.lock().unwrap(), vec!["/dns-query".to_string()]);
     }
 
     #[test]

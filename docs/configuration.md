@@ -259,7 +259,7 @@ upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多�
 | dot:// | DoT | tls:// |
 | doq:// | DoQ | quic:// |
 
-没有协议前缀时，省略 transport 默认为 UDP。没有路径的 DoH URL 使用 /dns-query。DoH 支持使用 host 查询参数覆盖 HTTP Host；该参数不会继续发送给上游。
+没有协议前缀时，省略 transport 默认为 UDP。没有路径的 DoH URL 使用 /dns-query。DoH 支持使用 host 查询参数覆盖 HTTP Host；该参数不会继续发送给上游。DoH 只接受状态为成功、媒体类型为 application/dns-message、不超过 65535 字节的回答；跳转（3xx）不跟随，和其他错误状态一样算这个上游失败。
 
 DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
 
