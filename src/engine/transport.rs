@@ -534,9 +534,12 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         self.pools.retain(|upstream, _| keep(upstream));
     }
 
-    /// `upstream` 的一个连接池，`size` 个客户端共用一个 permit manager
-    /// A pool for `upstream` of `size` clients sharing one permit manager
-    fn new_pool(&self, upstream: &Arc<str>, size: usize) -> Arc<StreamConnectionPool<T>> {
+    /// `upstream` 的连接池：`pool_size` 个客户端（0 按 1 算），共用一个同样大的 permit manager。
+    /// 预热和发送都用它，两边建的池才一样大
+    /// The pool for `upstream`: `pool_size` clients (0 taken as 1) sharing a permit
+    /// manager of that size. Warm-up and send both use it, so their pools are alike
+    fn new_pool(&self, upstream: &Arc<str>) -> Arc<StreamConnectionPool<T>> {
+        let size = self.pool_size.max(1);
         // Create per-upstream permit manager to avoid global TCP limit
         // 为每个 upstream 创建独立的 permit manager，避免全局 TCP 限制
         let permit_mgr = Arc::new(PermitManager::new(size));
@@ -561,13 +564,13 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         })
     }
 
-    /// `upstream` 的连接池，还没有就按 `pool_size` 建一个（0 按 1 算）
-    /// The pool for `upstream`, built with `pool_size` clients (0 taken as 1) if there is none
+    /// `upstream` 的连接池，还没有就建一个（见 [`Self::new_pool`]）
+    /// The pool for `upstream`, built if there is none (see [`Self::new_pool`])
     fn pool(&self, upstream: &str) -> Arc<StreamConnectionPool<T>> {
         let upstream_key: Arc<str> = Arc::from(upstream);
         self.pools
             .entry(upstream_key.clone())
-            .or_insert_with(|| self.new_pool(&upstream_key, self.pool_size.max(1)))
+            .or_insert_with(|| self.new_pool(&upstream_key))
             .clone()
     }
 
@@ -607,12 +610,11 @@ impl TcpMultiplexer {
         )
     }
 
-    /// Warm up connection pools for given upstreams.
-    /// 为给定的 upstream 预热连接池。
-    ///
-    /// This creates a minimal pool with 1 connection per upstream to avoid
-    /// lazy initialization overhead on first query.
-    /// 这会为每个 upstream 创建只包含 1 个连接的最小连接池，以避免首次查询时的懒加载开销。
+    /// 为配置里的 TCP 上游建好连接池，和发送时现建的一样大（`pool_size`），首个查询就不用再建。
+    /// 只建客户端，连接要等查询用到时才建立。
+    /// Build the pools of the configuration's TCP upstreams, as large as one built on
+    /// first send (`pool_size`), so the first query need not build it. Only the clients
+    /// are built; each connects when a query first needs it.
     pub fn warm_up_pools(&self, upstreams: &rustc_hash::FxHashSet<String>) {
         if upstreams.is_empty() {
             info!("No TCP upstreams to warm up");
@@ -628,11 +630,9 @@ impl TcpMultiplexer {
             let upstream_key: Arc<str> = Arc::from(upstream.as_str());
             // Use entry().or_insert_with() to create pool only if it doesn't exist
             // 使用 entry().or_insert_with() 仅在连接池不存在时创建
-            // Warm up: create only 1 client instead of full pool_size
-            // 预热：只创建 1 个客户端而不是完整的 pool_size
             self.pools
                 .entry(upstream_key.clone())
-                .or_insert_with(|| self.new_pool(&upstream_key, 1));
+                .or_insert_with(|| self.new_pool(&upstream_key));
         }
 
         info!(
@@ -4348,6 +4348,22 @@ mod tests {
             .expect("pending waiter was not notified")
             .expect("pending sender was dropped without a result");
         assert!(result.is_err(), "reader failure should reach the waiter");
+    }
+
+    /// 预热建的连接池和发送时现建的一样大，客户端共用一个同样大的 permit manager
+    /// A warmed-up pool is as large as one built on first send, its clients sharing a
+    /// permit manager of that size
+    #[test]
+    fn a_warmed_up_pool_has_every_client() {
+        let mux = TcpMultiplexer::new(3, 3, 0, 0);
+        mux.warm_up_pools(&["127.0.0.1:53".to_string()].into_iter().collect());
+        let pool = mux
+            .pools
+            .get("127.0.0.1:53")
+            .expect("the upstream is warmed up")
+            .clone();
+        assert_eq!(pool.clients.len(), 3);
+        assert_eq!(pool.clients[0].permit_manager.max_permits(), 3);
     }
 
     #[test]
