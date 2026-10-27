@@ -218,6 +218,7 @@ UDP and TCP listeners are always created from settings.bind_udp and settings.bin
 Inbound listener behavior:
 
 - Only standard single-question QUERY messages are processed. Malformed packets, non-QUERY opcodes, and DNS response packets are silently dropped.
+- A query whose EDNS version is not 0 is answered BADVERS (RFC 6891 section 6.1.3), with an OPT of version 0 in the reply.
 - A listener processing error, an overall request timeout, or an exhausted flow-control permit returns SERVFAIL to the client for a valid query.
 - UDP responses larger than the client's advertised size (the EDNS payload size, or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP.
 - A dual-stack socket (inbound DoH listening on `[::]`, say) reports an IPv4 client as `::ffff:a.b.c.d`. Rules, GeoIP, ECS and the cache all judge it by the IPv4 address it carries, so client_ip takes IPv4 networks as usual; a network written as `::ffff:a.b.c.d/n` counts as the IPv4 network it names.
