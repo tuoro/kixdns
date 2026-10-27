@@ -1197,12 +1197,22 @@ async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
 /// one round trip.
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 同一条入站 TCP 连接上最多同时处理这么多个查询。RFC 7766 第 6.2.1.1 节：流水线发来的查询要并发
+/// 处理、答完就回；以前一个接一个地处理，一个慢查询把后面的快查询都挡住。满了就先不读下一个，一个
+/// 客户端开不出没有上限的任务。
+/// At most this many queries are handled at once on one inbound TCP connection. RFC 7766
+/// section 6.2.1.1: pipelined queries are handled concurrently and answered as they complete;
+/// they used to be handled one after another, a slow one holding up every fast one behind
+/// it. With all slots taken the next query is not read yet, so one client cannot start an
+/// unbounded number of tasks.
+const TCP_MAX_QUERIES_PER_CONN: usize = 64;
+
 async fn handle_tcp_conn(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer: SocketAddr,
     engine: Engine,
 ) -> anyhow::Result<()> {
-    let engine = engine.with_client_transport(ClientTransport::Tcp);
+    let engine = Arc::new(engine.with_client_transport(ClientTransport::Tcp));
     const MAX_TCP_FRAME: usize = 64 * 1024;
     let mut len_buf = [0u8; 2];
 
@@ -1210,22 +1220,28 @@ async fn handle_tcp_conn(
     // 使用 BytesMut 以支持零拷贝操作 / Use BytesMut for zero-copy operations
     let mut buf = bytes::BytesMut::with_capacity(MAX_TCP_FRAME);
 
+    let (mut reader, writer) = stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let slots = Arc::new(tokio::sync::Semaphore::new(TCP_MAX_QUERIES_PER_CONN));
+    let mut pending = tokio::task::JoinSet::<()>::new();
+
     loop {
-        match tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut len_buf)).await {
-            // 空闲超时：关闭连接，释放任务与文件描述符 / Idle timeout: close the
-            // connection and release the task and the file descriptor.
-            Err(_) => return Ok(()),
-            Ok(Err(err)) => {
-                if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                    return Err(err.into());
-                }
-                return Ok(());
-            }
-            Ok(Ok(_)) => {}
+        // 收掉已经答完的 / Reap the ones already answered
+        while pending.try_join_next().is_some() {}
+        // 空闲超时：不再读，还在处理的查询写完回答后关闭连接，释放任务与文件描述符；对方读到头或出错
+        // 同样结束
+        // Idle timeout: reading stops, and once the queries still being handled have written
+        // their answers the connection closes, releasing the task and the file descriptor;
+        // the peer's end of stream or an error ends it too.
+        if !matches!(
+            tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut len_buf)).await,
+            Ok(Ok(_))
+        ) {
+            break;
         }
         let frame_len = u16::from_be_bytes(len_buf) as usize;
         if frame_len == 0 || frame_len > MAX_TCP_FRAME {
-            return Ok(());
+            break;
         }
 
         // Reuse buffer: resize to exact frame length / 复用缓冲区：调整到精确帧长度
@@ -1236,34 +1252,27 @@ async fn handle_tcp_conn(
         // A half-sent message is bounded too: a sender that stops after the
         // length prefix cannot keep the connection hanging.
         if !matches!(
-            tokio::time::timeout(TCP_READ_TIMEOUT, stream.read_exact(&mut buf)).await,
+            tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut buf)).await,
             Ok(Ok(_))
         ) {
-            return Ok(());
+            break;
         }
 
-        // ✅ 优化：使用 handle_packet_fast 进行快速路径检查
-        // ✅ Optimization: Use handle_packet_fast for fast path check
-        // 统一 UDP 和 TCP 的行为，避免重复解析
-        // Unify UDP and TCP behavior to avoid re-parsing
         let packet_bytes = buf.split().freeze();
         if !is_standard_query_header(&packet_bytes) {
-            return Ok(());
+            break;
         }
-        // 每帧重新取整体请求超时（含 hedge 与 TCP fallback）。RFC 7766 的客户端会
-        // 把一条连接用很久，热重载改了 request_timeout 之后，这条连接上的后续查询
-        // 必须跟着新值走；UDP 路径本来就是每请求读一次。
-        // Re-read the overall request timeout (hedge and TCP fallback included)
-        // per frame. An RFC 7766 client keeps one connection open for a long
-        // time, so queries that follow a reload must use the new
-        // request_timeout; the UDP path already reads it per request.
-        let timeout_ms = engine.get_request_timeout_ms();
-        let timeout_dur = Duration::from_millis(timeout_ms);
 
-        let resp = match engine.handle_packet_fast(&packet_bytes, peer) {
+        // ✅ 优化：使用 handle_packet_fast 进行快速路径检查；当场能答的直接写回，要等上游的交给
+        // 单独的任务，答完就回
+        // ✅ Optimization: Use handle_packet_fast for fast path check; what it answers on the
+        // spot is written back at once, and what waits on an upstream goes to its own task,
+        // answered when done
+        let async_needed = match engine.handle_packet_fast(&packet_bytes, peer) {
             Ok(Some(FastPathResponse::Direct(bytes))) => {
                 // 快速路径命中：直接返回 / Fast path hit: return directly
-                bytes
+                write_tcp_answer(&writer, &bytes).await;
+                continue;
             }
             Ok(Some(FastPathResponse::CacheHit {
                 cached,
@@ -1286,7 +1295,8 @@ async fn handle_tcp_conn(
                     resp_buf[0] = id_bytes[0];
                     resp_buf[1] = id_bytes[1];
                 }
-                resp_buf.freeze()
+                write_tcp_answer(&writer, &resp_buf).await;
+                continue;
             }
             Ok(Some(FastPathResponse::AsyncNeeded {
                 qname,
@@ -1298,103 +1308,137 @@ async fn handle_tcp_conn(
             })) => {
                 // 缓存未命中：使用预解析数据避免重复解析
                 // Cache miss: use pre-parsed data to avoid re-parsing
-                match tokio::time::timeout(
-                    timeout_dur,
-                    engine.handle_packet_internal_with_pre_parsed(
-                        &packet_bytes,
-                        peer,
-                        false,
-                        PreParsedData::new(qname, qtype, qclass, tx_id, edns_present, pipeline_id),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(error)) => {
-                        debug!(%error, "TCP request processing error, returning SERVFAIL");
-                        let Some(response) =
-                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
-                        else {
-                            return Ok(());
-                        };
-                        response
-                    }
-                    Err(_) => {
-                        warn!(
-                            timeout_ms,
-                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                            "TCP request timeout after hedge and fallback exhausted"
-                        );
-                        let Some(response) =
-                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
-                        else {
-                            return Ok(());
-                        };
-                        response
-                    }
-                }
+                Some(PreParsedData::new(
+                    qname,
+                    qtype,
+                    qclass,
+                    tx_id,
+                    edns_present,
+                    pipeline_id,
+                ))
             }
-            Ok(None) => {
-                // 快速解析失败，回退到完整处理
-                // Fast parse failed, fallback to full processing
-                match tokio::time::timeout(timeout_dur, engine.handle_packet(&packet_bytes, peer))
-                    .await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(error)) => {
-                        debug!(%error, "TCP request processing error, returning SERVFAIL");
-                        let Some(response) =
-                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
-                        else {
-                            return Ok(());
-                        };
-                        response
-                    }
-                    Err(_) => {
-                        warn!(
-                            timeout_ms,
-                            upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                            "TCP request timeout"
-                        );
-                        let Some(response) =
-                            engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
-                        else {
-                            return Ok(());
-                        };
-                        response
-                    }
-                }
-            }
+            // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
+            Ok(None) => None,
             Err(error) => {
                 debug!(%error, "TCP fast-path error, returning SERVFAIL for valid query");
-                let Some(response) =
+                if let Some(response) =
                     engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
-                else {
-                    return Ok(());
-                };
-                response
+                {
+                    write_tcp_answer(&writer, &response).await;
+                }
+                continue;
             }
         };
 
-        if resp.len() <= u16::MAX as usize {
-            // DNS-over-TCP framing must be written completely; write_vectored may be
-            // partial, so use write_all_vectored: scatter-gather single syscall with
-            // no frame allocation (write_all would copy prefix+body into a new Vec).
-            //
-            // 长度前缀 + 包体用 write_all_vectored 保证完整写入，保持单 syscall 零分配；
-            // write_all 需要拼帧（一次堆分配 + 拷贝）。
-            let len_bytes = (resp.len() as u16).to_be_bytes();
-            let mut bufs = [
-                std::io::IoSlice::new(&len_bytes),
-                std::io::IoSlice::new(&resp),
-            ];
-            if tokio_util::io::write_all_vectored(&mut stream, &mut bufs)
-                .await
-                .is_err()
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            break;
+        };
+        let engine = Arc::clone(&engine);
+        let writer = Arc::clone(&writer);
+        pending.spawn(async move {
+            let _slot = slot;
+            if let Some(response) =
+                answer_tcp_query(&engine, &packet_bytes, peer, async_needed).await
             {
-                return Ok(());
+                write_tcp_answer(&writer, &response).await;
             }
+        });
+    }
+
+    // 读完了：等还在处理的查询把回答写出去再关连接，半关闭的客户端照样拿到回答
+    // Reading is over: the queries still being handled write their answers before the
+    // connection closes, so a half-closed client still gets them
+    while pending.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// 要等上游的查询：在整体请求时限内回答，出错或超时回 SERVFAIL；连 SERVFAIL 都构造不出时为 None。
+/// `pre_parsed` 为 None 时快速解析没成，走完整处理。
+/// A query that waits on an upstream: answered within the overall request timeout, SERVFAIL on
+/// an error or a timeout; None when not even a SERVFAIL can be built. With `pre_parsed` None
+/// the quick parse failed and the full path runs.
+async fn answer_tcp_query(
+    engine: &Engine,
+    packet: &[u8],
+    peer: SocketAddr,
+    pre_parsed: Option<PreParsedData>,
+) -> Option<bytes::Bytes> {
+    // 每个查询重新取整体请求超时（含 hedge 与 TCP fallback）。RFC 7766 的客户端会把一条连接用很久，
+    // 热重载改了 request_timeout 之后，这条连接上的后续查询必须跟着新值走；UDP 路径本来就是每请求
+    // 读一次。
+    // Re-read the overall request timeout (hedge and TCP fallback included) per query. An RFC
+    // 7766 client keeps one connection open for a long time, so queries that follow a reload
+    // must use the new request_timeout; the UDP path already reads it per request.
+    let timeout_ms = engine.get_request_timeout_ms();
+    let timeout_dur = Duration::from_millis(timeout_ms);
+    let full_path = pre_parsed.is_none();
+    let answered = match pre_parsed {
+        Some(pre_parsed) => {
+            tokio::time::timeout(
+                timeout_dur,
+                engine.handle_packet_internal_with_pre_parsed(packet, peer, false, pre_parsed),
+            )
+            .await
         }
+        None => tokio::time::timeout(timeout_dur, engine.handle_packet(packet, peer)).await,
+    };
+    match answered {
+        Ok(Ok(response)) => return Some(response),
+        Ok(Err(error)) => {
+            debug!(%error, "TCP request processing error, returning SERVFAIL");
+        }
+        Err(_) if full_path => {
+            warn!(
+                timeout_ms,
+                upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                "TCP request timeout"
+            );
+        }
+        Err(_) => {
+            warn!(
+                timeout_ms,
+                upstream_timeout_ms = engine.get_upstream_timeout_ms(),
+                "TCP request timeout after hedge and fallback exhausted"
+            );
+        }
+    }
+    engine_helpers::try_build_servfail_response_from_wire(packet)
+}
+
+/// 写回一个回答：长度前缀加正文一次写完，写端加锁，不会和别的回答穿插。写不出去或 [`TCP_READ_TIMEOUT`]
+/// 内写不完（对方不读）时关掉写端：后面的回答立刻失败，任务不会一个个卡在这里。
+/// Writes one answer back: length prefix and body in one go under the writer's lock, so it
+/// cannot interleave with another answer. When it cannot be written, or not within
+/// [`TCP_READ_TIMEOUT`] (the peer does not read), the write side is shut: later answers fail
+/// at once instead of each task getting stuck here.
+async fn write_tcp_answer(
+    writer: &tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
+    response: &[u8],
+) {
+    use tokio::io::AsyncWriteExt;
+
+    if response.len() > u16::MAX as usize {
+        return;
+    }
+    // DNS-over-TCP framing must be written completely; write_vectored may be
+    // partial, so use write_all_vectored: scatter-gather single syscall with
+    // no frame allocation (write_all would copy prefix+body into a new Vec).
+    //
+    // 长度前缀 + 包体用 write_all_vectored 保证完整写入，保持单 syscall 零分配；
+    // write_all 需要拼帧（一次堆分配 + 拷贝）。
+    let len_bytes = (response.len() as u16).to_be_bytes();
+    let mut bufs = [
+        std::io::IoSlice::new(&len_bytes),
+        std::io::IoSlice::new(response),
+    ];
+    let mut writer = writer.lock().await;
+    let written = tokio::time::timeout(
+        TCP_READ_TIMEOUT,
+        tokio_util::io::write_all_vectored(&mut *writer, &mut bufs),
+    )
+    .await;
+    if !matches!(written, Ok(Ok(()))) {
+        let _ = writer.shutdown().await;
     }
 }
 
@@ -1906,6 +1950,196 @@ mod tests {
         let message = Message::from_bytes(&response).unwrap();
         assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
         elapsed
+    }
+
+    /// 本机 UDP 上游：每个查询隔 `delay` 才回（标上 QR 的查询本身）
+    /// Local UDP upstream answering every query after `delay` (the query itself with QR set)
+    async fn spawn_slow_udp_upstream(delay: Duration) -> SocketAddr {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let mut answer = buf[..n].to_vec();
+                answer[2] |= 0x80;
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = socket.send_to(&answer, peer).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// slow.test 转发给 `upstream`，fast.test 静态回答 / slow.test forwards to `upstream`, fast.test answers statically
+    fn slow_and_fast_engine(upstream: SocketAddr) -> Engine {
+        let config: kixdns::config::PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "upstream_timeout_ms": 2000,
+                "request_timeout_ms": 4000
+            },
+            "pipelines": [{ "id": "main", "rules": [
+                {
+                    "name": "slow",
+                    "matchers": [{ "type": "domain_suffix", "value": "slow.test" }],
+                    "actions": [{ "type": "forward", "upstream": upstream.to_string() }]
+                },
+                {
+                    "name": "fast",
+                    "matchers": [{ "type": "domain_suffix", "value": "fast.test" }],
+                    "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+                }
+            ]}]
+        }))
+        .expect("parse config");
+        Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("runtime config"),
+            "test".to_string(),
+        )
+        .expect("initialize engine")
+    }
+
+    /// `name` 的 A 查询，ID 为 `id`，带长度前缀 / An A query for `name` with ID `id`, length-prefixed
+    fn tcp_frame(name: &str, id: u16) -> Vec<u8> {
+        let mut request = Message::new(id, MessageType::Query, OpCode::Query);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        let query = request.to_vec().unwrap();
+        [(query.len() as u16).to_be_bytes().to_vec(), query].concat()
+    }
+
+    /// 从连接上读一个回答，返回它的 ID / Reads one answer off the connection and returns its ID
+    async fn read_answer_id(client: &mut TcpStream) -> u16 {
+        let mut len_buf = [0u8; 2];
+        client
+            .read_exact(&mut len_buf)
+            .await
+            .expect("length prefix");
+        let mut answer = vec![0u8; u16::from_be_bytes(len_buf) as usize];
+        client.read_exact(&mut answer).await.expect("answer");
+        u16::from_be_bytes([answer[0], answer[1]])
+    }
+
+    /// 连在 `engine` 上的一条入站 TCP 连接，和处理它的任务 / An inbound TCP connection to `engine` and the task handling it
+    async fn tcp_connection(
+        engine: Engine,
+    ) -> (TcpStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        (client, tokio::spawn(handle_tcp_conn(stream, peer, engine)))
+    }
+
+    /// 同一条连接上，快查询不等它前面的慢查询，答完就回（RFC 7766 第 6.2.1.1 节）。此前一个接一个地
+    /// 处理，快查询要陪着慢查询等。
+    /// On one connection a fast query does not wait for the slow one before it and is
+    /// answered when done (RFC 7766 section 6.2.1.1). Queries used to be handled one after
+    /// another, the fast one waiting out the slow one.
+    #[tokio::test]
+    async fn a_fast_tcp_query_is_not_held_behind_a_slow_one() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(800)).await;
+        let (mut client, _server) = tcp_connection(slow_and_fast_engine(upstream)).await;
+        let started = std::time::Instant::now();
+        client
+            .write_all(&[tcp_frame("a.slow.test.", 1), tcp_frame("a.fast.test.", 2)].concat())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_answer_id(&mut client).await,
+            2,
+            "the fast answer comes first"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "the fast answer took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(read_answer_id(&mut client).await, 1, "then the slow one");
+    }
+
+    /// 客户端发完查询就关掉发送方向，还在处理的查询照样把回答写回去，然后连接关闭
+    /// A client that shuts its sending side after its query still gets the answers being
+    /// worked on, and then the connection closes
+    #[tokio::test]
+    async fn a_half_closed_tcp_client_gets_its_pending_answers() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
+        let (mut client, server) = tcp_connection(slow_and_fast_engine(upstream)).await;
+        client
+            .write_all(&tcp_frame("b.slow.test.", 7))
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(read_answer_id(&mut client).await, 7);
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "the connection closes after the answer");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the handler ends")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// 一条连接上同时处理的查询有上限：一次发来 100 个慢查询，全都答了，前 64 个一起答完，剩下的接着
+    /// 一起答完——并发了，也没有一下子开 100 个任务。
+    /// The queries handled at once on one connection are capped: 100 slow queries sent in one
+    /// go are all answered, the first 64 together and the rest together after them, so they
+    /// run concurrently without 100 tasks starting at once.
+    #[tokio::test]
+    async fn tcp_queries_run_concurrently_up_to_the_per_connection_cap() {
+        // UDP 转发每次尝试等上游超时的三分之一，延迟要短于它，一次就答上
+        // A UDP forward waits a third of the upstream timeout per attempt; the delay stays
+        // below that so one attempt answers
+        const DELAY: Duration = Duration::from_millis(400);
+        let upstream = spawn_slow_udp_upstream(DELAY).await;
+        let (mut client, _server) = tcp_connection(slow_and_fast_engine(upstream)).await;
+        let frames: Vec<u8> = (0..100)
+            .flat_map(|i| tcp_frame(&format!("q{i}.slow.test."), i))
+            .collect();
+        let started = std::time::Instant::now();
+        client.write_all(&frames).await.unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..100 {
+            ids.push(read_answer_id(&mut client).await);
+        }
+        let took = started.elapsed();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..100).collect::<Vec<u16>>());
+        assert!(
+            took >= DELAY * 2 && took < DELAY * 2 + Duration::from_millis(600),
+            "two rounds of {DELAY:?} expected, took {took:?}"
+        );
+    }
+
+    /// 不读回答的客户端：写回在时限内写不完就关掉写端，处理这条连接的任务能结束，而不是永远卡在写上
+    /// A client that never reads its answers: a write not done within the limit shuts the
+    /// write side, and the task handling the connection ends instead of hanging on the write
+    #[tokio::test]
+    async fn a_tcp_client_that_never_reads_does_not_hold_the_handler() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(10)).await;
+        let (mut client, server) = tcp_connection(slow_and_fast_engine(upstream)).await;
+        // 一直发、从不读，直到发不出去：服务端的写回早就堵住了
+        // Keep sending, never reading, until sending stalls: the server's writes are long blocked
+        let frame = tcp_frame("c.fast.test.", 9);
+        let burst: Vec<u8> = frame
+            .iter()
+            .copied()
+            .cycle()
+            .take(frame.len() * 4096)
+            .collect();
+        while tokio::time::timeout(Duration::from_millis(500), client.write_all(&burst))
+            .await
+            .is_ok()
+        {}
+        tokio::time::timeout(TCP_READ_TIMEOUT * 4, server)
+            .await
+            .expect("the handler ends once its blocked write times out")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -11,6 +11,8 @@ pub struct QuickQuery<'a> {
     pub qtype: u16,
     pub qclass: u16,
     pub edns_present: bool,
+    /// 请求 OPT 里的 EDNS 版本，没有 OPT 时为 0 / The EDNS version in the request's OPT, 0 without one
+    pub edns_version: u8,
     /// 客户端自己带的 ECS 选项 / The ECS option the client carries itself
     pub client_subnet: Option<crate::ecs::EcsKey>,
 }
@@ -186,6 +188,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // 权衡：总是遍历完整 Additional 段并拒绝尾随数据（旧代码找到 OPT 即提前退出、容忍截断）。
     // 完整校验是为了让畸形包无法到达 cache/static 路径；成本以 ARCOUNT 记录数为界。
     let mut edns_present = false;
+    let mut edns_version = 0;
     let mut client_subnet = None;
     let mut ar_pos = pos;
     for _ in 0..ar_count {
@@ -210,6 +213,8 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             }
             validate_edns_options(packet, fixed_end, rdata_end)?;
             edns_present = true;
+            // TTL 字段依次是扩展 RCODE、版本和标志 / The TTL field holds the extended RCODE, the version and the flags
+            edns_version = packet[next_pos + 5];
             client_subnet = query_subnet(packet, fixed_end..rdata_end);
         }
         ar_pos = rdata_end;
@@ -234,8 +239,38 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         qtype,
         qclass,
         edns_present,
+        edns_version,
         client_subnet,
     })
+}
+
+/// 请求的 EDNS 版本不受支持时的回答（RFC 6891 第 6.1.3 节）：RCODE 为 BADVERS（16：头部写低 4 位的
+/// 0，OPT 里的扩展 RCODE 写 1），OPT 写 KixDNS 支持的版本 0，问题段照抄。请求读不出问题段时为 None。
+/// The answer when the request's EDNS version is not supported (RFC 6891 section 6.1.3):
+/// RCODE BADVERS (16: 0 in the header's low 4 bits, extended RCODE 1 in the OPT), an OPT
+/// carrying version 0, the one KixDNS supports, and the question copied. None when the
+/// question cannot be read.
+pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
+    let question_end = skip_name(query, 12)?.checked_add(4)?;
+    if question_end > query.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(question_end + 11);
+    out.extend_from_slice(&query[..2]);
+    // QR、操作码 QUERY，照抄 RD；RA，照抄 CD / QR, opcode QUERY, RD copied; RA, CD copied
+    out.push(0x80 | (query[2] & 0x01));
+    out.push(0x80 | (query[3] & 0x10));
+    // 一个问题、一条附加记录（OPT）/ One question, one additional record (the OPT)
+    out.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 1]);
+    out.extend_from_slice(&query[12..question_end]);
+    // 根名、TYPE OPT、CLASS 即 UDP 载荷大小、扩展 RCODE 1、版本 0、标志 0
+    // Root owner, TYPE OPT, CLASS as the UDP payload size, extended RCODE 1, version 0, flags 0
+    out.push(0);
+    out.extend_from_slice(&41u16.to_be_bytes());
+    out.extend_from_slice(&1232u16.to_be_bytes());
+    out.extend_from_slice(&[1, 0, 0, 0]);
+    out.extend_from_slice(&0u16.to_be_bytes());
+    Some(Bytes::from(out))
 }
 
 /// Whether `response` answers `query`: RFC 5452 §9.1 requires the question
@@ -869,7 +904,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
     /// assert!(query.qname_matches("google.com"));  // 完全匹配
     /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
     /// assert!(!query.qname_matches("example.com"));  // 不匹配
@@ -914,7 +949,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
     /// println!("qname: {}", query.qname_str());  // "google.com"
     /// ```
     #[inline]
@@ -958,7 +993,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
     /// let qname_str = query.qname_str_unchecked();  // &str
     /// ```
     #[inline]
@@ -986,7 +1021,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
     /// let hash = query.qname_hash();
     /// ```
     #[inline]
