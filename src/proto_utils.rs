@@ -323,9 +323,21 @@ pub fn name_text(name: &hickory_proto::rr::Name) -> String {
 /// 空标签、坏掉的转义、它本该转义的字节。为查询名构造的应答都从这里取名字：文本保存了标签的
 /// 每个字节，名字可以原样还原。
 pub fn name_from_text(text: &str) -> Option<hickory_proto::rr::Name> {
+    let labels = labels_from_text(text)?;
+    if labels.is_empty() {
+        return Some(hickory_proto::rr::Name::root());
+    }
+    hickory_proto::rr::Name::from_labels(labels.iter().map(Vec::as_slice)).ok()
+}
+
+/// [`name_from_text`] 读出的各个标签，还没组成名字；组成名字时才查每个标签不超过 63 字节、整个
+/// 名字在线上不超过 255 字节。根名没有标签。
+/// The labels [`name_from_text`] reads, before they make up a name, which is where a
+/// label is held to 63 bytes and the whole name to 255 on the wire. The root has none.
+pub(crate) fn labels_from_text(text: &str) -> Option<Vec<Vec<u8>>> {
     let text = text.strip_suffix('.').unwrap_or(text);
     if text.is_empty() {
-        return Some(hickory_proto::rr::Name::root());
+        return Some(Vec::new());
     }
     let bytes = text.as_bytes();
     let mut labels = vec![Vec::new()];
@@ -350,7 +362,7 @@ pub fn name_from_text(text: &str) -> Option<hickory_proto::rr::Name> {
     if labels.iter().any(Vec::is_empty) {
         return None;
     }
-    hickory_proto::rr::Name::from_labels(labels.iter().map(Vec::as_slice)).ok()
+    Some(labels)
 }
 
 /// A label byte the name's text holds as it is (see `name_text`) / 名字文本原样保存的标签字节
