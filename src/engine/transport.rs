@@ -86,6 +86,27 @@ struct UdpSocketState {
     inflight: Arc<UdpInflightMap>,
 }
 
+/// 上游 UDP socket 接收出错以后，歇多久再接着收；None 是马上接着收。
+///
+/// Windows 上没有连接的 UDP socket 收到 ICMP 端口不可达时，`recv_from` 会报 ConnectionReset
+/// （WSAECONNRESET）。这只说明之前发出的某个查询没人收，socket 本身好好的；歇着只会耽误这个 socket
+/// 上别的查询的应答，所以马上接着收。别的错误照旧歇 100 ms，免得反复出错时空转。
+///
+/// How long to pause after a receive error on an upstream UDP socket before reading on;
+/// None reads on at once.
+///
+/// On Windows, an unconnected UDP socket that gets an ICMP port unreachable reports
+/// ConnectionReset (WSAECONNRESET) from `recv_from`. That only says some earlier query
+/// reached nobody; the socket itself is fine, and pausing would only delay the answers to
+/// the other queries on it, so it reads on at once. Any other error still pauses 100 ms,
+/// so a repeating one does not spin.
+fn recv_error_pause(error: &std::io::Error) -> Option<Duration> {
+    match error.kind() {
+        std::io::ErrorKind::ConnectionReset => None,
+        _ => Some(Duration::from_millis(100)),
+    }
+}
+
 pub struct UdpClient {
     /// IPv4 sockets, one ephemeral port each. / IPv4 socket，各占一个临时端口。
     pool: Vec<UdpSocketState>,
@@ -279,7 +300,9 @@ impl UdpClient {
                     }
                     Err(e) => {
                         tracing::error!("UDP pool recv error: {}", e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if let Some(pause) = recv_error_pause(&e) {
+                            tokio::time::sleep(pause).await;
+                        }
                     }
                 }
             }
@@ -4359,6 +4382,29 @@ mod tests {
         }
         assert!(check_upstream_address("dns.example:853", Transport::Dot).is_ok());
         assert!(check_upstream_address("dns.example:853", Transport::Doq).is_ok());
+    }
+
+    /// 接收报 ConnectionReset（Windows 上 ICMP 端口不可达）时马上接着收，别的错误照旧歇 100 ms
+    /// ConnectionReset from a receive (an ICMP port unreachable on Windows) reads on at once;
+    /// any other error still pauses 100 ms
+    #[test]
+    fn a_connection_reset_on_receive_reads_on_at_once() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            recv_error_pause(&Error::from(ErrorKind::ConnectionReset)),
+            None
+        );
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::OutOfMemory,
+        ] {
+            assert_eq!(
+                recv_error_pause(&Error::from(kind)),
+                Some(Duration::from_millis(100)),
+                "{kind:?}"
+            );
+        }
     }
 
     /// 预热建的连接池和发送时现建的一样大，客户端共用一个同样大的 permit manager
