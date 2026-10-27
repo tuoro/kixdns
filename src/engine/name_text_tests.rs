@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use hickory_proto::op::Message;
-use hickory_proto::rr::RData;
+use hickory_proto::rr::{DNSClass, RData, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use serde_json::json;
 
@@ -135,4 +135,21 @@ async fn a_dot_inside_a_label_is_not_a_label_boundary() {
         ask(&engine, &query(&[b"matched.test"], b"")).await,
         (Some(OTHER), false)
     );
+}
+
+#[tokio::test]
+async fn a_refresh_asks_again_for_the_name_the_client_asked() {
+    let engine = engine();
+    let packet = engine
+        .construct_dns_packet(
+            r"www\046matched.te\255st",
+            RecordType::A,
+            DNSClass::IN,
+            false,
+            None,
+        )
+        .expect("refresh packet");
+    let request = Message::from_bytes(&packet).expect("parse refresh packet");
+    let labels: Vec<&[u8]> = request.queries[0].name().iter().collect();
+    assert_eq!(labels, [&b"www.matched"[..], b"te\xffst"]);
 }

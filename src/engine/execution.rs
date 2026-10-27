@@ -2,6 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+#[cfg(test)]
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1939,7 +1940,6 @@ impl Engine {
         ecs: Option<&crate::ecs::EcsKey>,
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
-        use hickory_proto::rr::Name;
 
         // Generate unique TXID (not 0!)
         // 生成唯一的 TXID（不是 0！）
@@ -1956,7 +1956,8 @@ impl Engine {
 
         // Add question section
         // 添加问题部分
-        let name = Name::from_str(qname)?;
+        let name = crate::proto_utils::name_from_text(qname)
+            .ok_or_else(|| anyhow::anyhow!("query name text {qname:?}"))?;
         let query = Query::query(name.clone(), qtype);
         msg.add_query(query);
         // An ECS option only travels inside EDNS / ECS 选项只能放在 EDNS 里
