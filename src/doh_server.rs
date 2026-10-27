@@ -47,6 +47,12 @@ const MAX_DNS_MESSAGE: usize = 64 * 1024;
 /// request head while keeping half-sent requests from pinning a task and a
 /// file descriptor indefinitely.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// POST 请求头之后，客户端最多有这么久发完正文；超时回 408、断开连接。以前只有请求头有时限，
+/// 正文发到一半就停的连接会一直占着一个任务和一个文件描述符。
+/// Time a client has, once a POST head is in, to send the whole body; past it the
+/// server answers 408 and drops the connection. Only the head used to be bounded,
+/// so a body that stopped half way held a task and a file descriptor for good.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// A client that connects and never finishes the TLS handshake is dropped after
 /// this long, as a silent DNS-over-TCP client is; it used to hold its task and
 /// descriptor for good.
@@ -165,15 +171,14 @@ async fn handle_doh_request(
             if declared.is_some_and(|len| len > MAX_DNS_MESSAGE as u64) {
                 return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
             }
-            match Limited::new(req.into_body(), MAX_DNS_MESSAGE)
-                .collect()
-                .await
-            {
-                Ok(collected) => collected.to_bytes(),
-                Err(err) if err.is::<LengthLimitError>() => {
+            let body = Limited::new(req.into_body(), MAX_DNS_MESSAGE).collect();
+            match tokio::time::timeout(BODY_READ_TIMEOUT, body).await {
+                Ok(Ok(collected)) => collected.to_bytes(),
+                Ok(Err(err)) if err.is::<LengthLimitError>() => {
                     return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
                 }
-                Err(_) => return Ok(error_response(StatusCode::BAD_REQUEST)),
+                Ok(Err(_)) => return Ok(error_response(StatusCode::BAD_REQUEST)),
+                Err(_) => return Ok(error_response(StatusCode::REQUEST_TIMEOUT)),
             }
         }
         (&Method::GET, path) if path == doh_path => {
