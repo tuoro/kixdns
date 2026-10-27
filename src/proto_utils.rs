@@ -15,6 +15,64 @@ pub struct QuickQuery<'a> {
     pub edns_version: u8,
     /// 客户端自己带的 ECS 选项 / The ECS option the client carries itself
     pub client_subnet: Option<crate::ecs::EcsKey>,
+    /// 问题之外还决定应答的查询位（见 [`QueryFlags`]）/ The query bits besides the question that
+    /// decide the answer (see [`QueryFlags`])
+    pub flags: QueryFlags,
+}
+
+/// 问题之外还决定应答的查询位：RD（要求递归）、CD（不做验证，RFC 4035 第 3.2.2 节）和 EDNS 的 DO
+/// 位（要 DNSSEC 记录，RFC 3225）。上游对这几位不同的请求给的应答不同，所以缓存和合并都把它们分开。
+/// The query bits besides the question that decide the answer: RD (recursion desired), CD
+/// (checking disabled, RFC 4035 section 3.2.2) and the EDNS DO bit (DNSSEC records wanted,
+/// RFC 3225). An upstream answers requests that differ in them differently, so the cache and
+/// the merging of requests keep them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct QueryFlags(u8);
+
+impl QueryFlags {
+    const RECURSION_DESIRED: u8 = 1;
+    const CHECKING_DISABLED: u8 = 2;
+    const DNSSEC_OK: u8 = 4;
+
+    /// 普通的递归查询：RD 置位，CD 和 DO 都没有（多数客户端发的就是这样）
+    /// A plain recursive query: RD set, neither CD nor DO (what most clients send)
+    pub const RECURSIVE: Self = Self(Self::RECURSION_DESIRED);
+
+    pub fn new(recursion_desired: bool, checking_disabled: bool, dnssec_ok: bool) -> Self {
+        let bit = |set: bool, bit: u8| if set { bit } else { 0 };
+        Self(
+            bit(recursion_desired, Self::RECURSION_DESIRED)
+                | bit(checking_disabled, Self::CHECKING_DISABLED)
+                | bit(dnssec_ok, Self::DNSSEC_OK),
+        )
+    }
+
+    /// 从查询报文读出，和 `parse_quick` 读出的一样 / Read off a query packet, as `parse_quick` reads them
+    pub fn of(query: &[u8]) -> Self {
+        let dnssec_ok = matches!(find_opt(query), Ok(Some(opt)) if query[opt.extended_rcode_at + 2] & 0x80 != 0);
+        Self::new(
+            query.get(2).is_some_and(|byte| byte & 0x01 != 0),
+            query.get(3).is_some_and(|byte| byte & 0x10 != 0),
+            dnssec_ok,
+        )
+    }
+
+    pub fn recursion_desired(self) -> bool {
+        self.0 & Self::RECURSION_DESIRED != 0
+    }
+
+    pub fn checking_disabled(self) -> bool {
+        self.0 & Self::CHECKING_DISABLED != 0
+    }
+
+    pub fn dnssec_ok(self) -> bool {
+        self.0 & Self::DNSSEC_OK != 0
+    }
+
+    /// 写进缓存键的值 / The value hashed into cache keys
+    pub fn bits(self) -> u8 {
+        self.0
+    }
 }
 
 /// Check the fixed DNS header fields required by KixDNS's standard query path.
@@ -179,6 +237,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // 完整校验是为了让畸形包无法到达 cache/static 路径；成本以 ARCOUNT 记录数为界。
     let mut edns_present = false;
     let mut edns_version = 0;
+    let mut dnssec_ok = false;
     let mut client_subnet = None;
     let mut ar_pos = pos;
     for _ in 0..ar_count {
@@ -205,6 +264,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             edns_present = true;
             // TTL 字段依次是扩展 RCODE、版本和标志 / The TTL field holds the extended RCODE, the version and the flags
             edns_version = packet[next_pos + 5];
+            dnssec_ok = packet[next_pos + 6] & 0x80 != 0;
             client_subnet = query_subnet(packet, fixed_end..rdata_end);
         }
         ar_pos = rdata_end;
@@ -231,6 +291,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         edns_present,
         edns_version,
         client_subnet,
+        flags: QueryFlags::new(packet[2] & 0x01 != 0, packet[3] & 0x10 != 0, dnssec_ok),
     })
 }
 
@@ -965,7 +1026,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
     /// assert!(query.qname_matches("google.com"));  // 完全匹配
     /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
     /// assert!(!query.qname_matches("example.com"));  // 不匹配
@@ -1010,7 +1071,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
     /// println!("qname: {}", query.qname_str());  // "google.com"
     /// ```
     #[inline]
@@ -1054,7 +1115,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
     /// let qname_str = query.qname_str_unchecked();  // &str
     /// ```
     #[inline]
@@ -1082,7 +1143,7 @@ impl QuickQuery<'_> {
     /// # Examples
     /// ```
     /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None };
+    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
     /// let hash = query.qname_hash();
     /// ```
     #[inline]
@@ -1963,6 +2024,50 @@ mod tests {
         let mut qname = [0u8; 256];
         let query = parse_quick(&packet, &mut qname).expect("valid EDNS query");
         assert!(query.edns_present);
+    }
+
+    /// `parse_quick` 和 `QueryFlags::of` 读出同样的查询位，别的头部位不算在内；快速解析读不了
+    /// 的查询，`QueryFlags::of` 照样读得出
+    /// `parse_quick` and `QueryFlags::of` read the same query bits, and no other header
+    /// bit counts; `QueryFlags::of` reads them off a query the fast parser cannot read
+    #[test]
+    fn parse_quick_reads_the_query_bits_as_query_flags_of_does() {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::str::FromStr;
+        let mut qname = [0u8; 256];
+        for recursion_desired in [false, true] {
+            for checking_disabled in [false, true] {
+                for edns in [None, Some(false), Some(true)] {
+                    let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+                    msg.metadata.recursion_desired = recursion_desired;
+                    msg.metadata.checking_disabled = checking_disabled;
+                    // AD in a query only asks for the AD bit back (RFC 6840 section 5.7)
+                    // 查询里的 AD 只是要应答带回 AD 位（RFC 6840 第 5.7 节）
+                    msg.metadata.authentic_data = true;
+                    msg.add_query(Query::query(
+                        Name::from_str("example.com.").unwrap(),
+                        RecordType::A,
+                    ));
+                    if let Some(dnssec_ok) = edns {
+                        let mut opt = Edns::new();
+                        opt.set_dnssec_ok(dnssec_ok);
+                        msg.set_edns(opt);
+                    }
+                    let mut packet = msg.to_vec().unwrap();
+                    let expected =
+                        QueryFlags::new(recursion_desired, checking_disabled, edns == Some(true));
+                    let case =
+                        format!("RD {recursion_desired}, CD {checking_disabled}, EDNS {edns:?}");
+                    let quick = parse_quick(&packet, &mut qname).expect(&case).flags;
+                    assert_eq!(quick, expected, "{case}");
+                    assert_eq!(QueryFlags::of(&packet), expected, "{case}");
+                    packet.push(0);
+                    assert!(parse_quick(&packet, &mut qname).is_none(), "{case}");
+                    assert_eq!(QueryFlags::of(&packet), expected, "{case}, trailing byte");
+                }
+            }
+        }
     }
 
     #[test]

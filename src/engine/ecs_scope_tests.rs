@@ -762,6 +762,7 @@ async fn a_background_refresh_replays_the_clients_ecs() {
         b"example.com",
         RecordType::A,
         hickory_proto::rr::DNSClass::IN,
+        crate::proto_utils::QueryFlags::RECURSIVE,
         &crate::matcher::RequesterKey::NONE,
         None,
     )
@@ -1138,6 +1139,7 @@ async fn renewing_a_stale_answer_stores_the_same_answer_again() {
         b"example.com",
         RecordType::A,
         hickory_proto::rr::DNSClass::IN,
+        crate::proto_utils::QueryFlags::RECURSIVE,
         &crate::matcher::RequesterKey::NONE,
         None,
     )
@@ -1198,6 +1200,7 @@ async fn a_refresh_with_a_narrower_scope_retires_the_wider_answer() {
         b"example.com",
         RecordType::A,
         hickory_proto::rr::DNSClass::IN,
+        crate::proto_utils::QueryFlags::RECURSIVE,
         &crate::matcher::RequesterKey::NONE,
         None,
     )

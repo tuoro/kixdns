@@ -478,11 +478,13 @@ impl Engine {
         written: &crate::ecs_scope::EcsReach,
         qname: &str,
         qtype: u16,
+        flags: crate::proto_utils::QueryFlags,
     ) {
         let question = CachedQuestion {
             qname,
             pipeline_id: &target.pipeline,
             qtype,
+            flags,
         };
         self.cache
             .entry(target.slot)

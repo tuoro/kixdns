@@ -147,6 +147,7 @@ async fn a_refresh_asks_again_for_the_name_the_client_asked() {
             DNSClass::IN,
             false,
             None,
+            crate::proto_utils::QueryFlags::RECURSIVE,
         )
         .expect("refresh packet");
     let request = Message::from_bytes(&packet).expect("parse refresh packet");

@@ -16,6 +16,8 @@ mod name_text_tests;
 pub(crate) mod observation;
 pub mod phases;
 pub mod pipeline;
+#[cfg(test)]
+mod query_flags_tests;
 pub mod refresh;
 pub mod response;
 pub(crate) mod response_log;

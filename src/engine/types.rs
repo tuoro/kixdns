@@ -5,6 +5,7 @@ use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::{
     RequesterKey, RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher,
 };
+use crate::proto_utils::QueryFlags;
 use bytes::Bytes;
 use dashmap::DashMap;
 use hickory_proto::rr::{DNSClass, RecordType};
@@ -37,6 +38,7 @@ pub(crate) struct InflightQuestion<'a> {
     pub qname: &'a [u8],
     pub qtype: RecordType,
     pub qclass: DNSClass,
+    pub flags: QueryFlags,
     pub requester: RequesterKey,
     pub client_ecs: Option<EcsKey>,
 }
@@ -50,6 +52,7 @@ impl InflightQuestion<'_> {
             self.qname,
             self.qtype,
             self.qclass,
+            self.flags,
             &self.requester,
             self.client_ecs.as_ref(),
         )
@@ -68,6 +71,7 @@ pub struct InflightEntry {
     qname: Box<[u8]>,
     qtype: RecordType,
     qclass: DNSClass,
+    flags: QueryFlags,
     requester: RequesterKey,
     client_ecs: Option<EcsKey>,
 }
@@ -82,6 +86,7 @@ impl InflightEntry {
             qname: question.qname.into(),
             qtype: question.qtype,
             qclass: question.qclass,
+            flags: question.flags,
             requester: question.requester,
             client_ecs: question.client_ecs,
         }
@@ -96,6 +101,7 @@ impl InflightEntry {
             && *self.qname == *question.qname
             && self.qtype == question.qtype
             && self.qclass == question.qclass
+            && self.flags == question.flags
             && self.requester == question.requester
             && self.client_ecs == question.client_ecs
     }
@@ -126,6 +132,7 @@ mod inflight_entry_tests {
     #[test]
     fn an_entry_is_only_for_its_own_question() {
         let question = InflightQuestion {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: 1,
             pipeline_id: "main",
             qname: b"example.com",
@@ -156,6 +163,10 @@ mod inflight_entry_tests {
             },
             InflightQuestion {
                 qclass: DNSClass::CH,
+                ..question
+            },
+            InflightQuestion {
+                flags: crate::proto_utils::QueryFlags::new(true, false, true),
                 ..question
             },
             InflightQuestion {
