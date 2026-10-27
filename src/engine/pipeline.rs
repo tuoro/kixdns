@@ -632,7 +632,7 @@ impl Engine {
                             );
                         }
                         Action::StaticTxtResponse { text, ttl } => {
-                            if let Ok(name) = std::str::FromStr::from_str(qname) {
+                            if let Some(name) = crate::proto_utils::name_from_text(qname) {
                                 let ttl = ttl.unwrap_or(300);
                                 let txt = TXT::new(text.to_vec());
                                 let record = Record::from_rdata(name, ttl, RData::TXT(txt));

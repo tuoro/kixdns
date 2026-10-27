@@ -119,6 +119,15 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 
         let label_bytes = &packet[current_pos..current_pos + label_len];
 
+        // A byte the name's text writes escaped (see `name_text`) leaves the query to the full
+        // parser, so both parsers give every name the same text. The bytes taken here are
+        // printable ASCII, safe in structured logs too.
+        // 名字文本里要转义的字节（见 `name_text`）留给完整解析，两个解析器给每个名字的文本才一样。
+        // 这里收下的都是可打印 ASCII，写进结构化日志也安全。
+        if !label_bytes.iter().all(|&b| is_plain_name_byte(b)) {
+            return None;
+        }
+
         // Performance optimization: Check if label needs lowercasing
         // Most DNS labels are already lowercase, so we can avoid the copy in common case
         // Use simple loop for better cache locality and early break
@@ -148,25 +157,6 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         }
 
         current_pos += label_len;
-    }
-
-    // Fast ASCII validation (zero-allocation, early exit)
-    // 快速 ASCII 验证（零分配，提前退出）
-    // DNS domain names should be LDH (Letters, Digits, Hyphen) + dots
-    // Reject control characters so qnames are safe to include in structured logs.
-    // 域名应该是 LDH（字母、数字、连字符）+ 点号
-    // 拒绝控制字符，确保 qname 可安全写入结构化日志。
-    // This is ~10x faster than full UTF-8 validation
-    // 这比完整的 UTF-8 验证快约 10 倍
-    let is_safe_ascii = buf[..buf_pos]
-        .iter()
-        .all(|b| b.is_ascii() && !b.is_ascii_control());
-    if !is_safe_ascii {
-        // Reject non-ASCII domain names and control characters
-        // Similar to Unbound's strategy: reject invalid input for performance
-        // 拒绝非 ASCII 域名和控制字符
-        // 类似 Unbound 的策略：为了性能拒绝无效输入
-        return None;
     }
 
     // 4. QType / 查询类型
@@ -242,6 +232,77 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         edns_version,
         client_subnet,
     })
+}
+
+/// The text a query name is matched, cached and logged under: its labels lowercased and
+/// joined with '.', without the trailing dot, and every label byte that is not printable
+/// ASCII, or is a '.' or '\' inside a label, written as `\DDD` (decimal, as in zone files,
+/// RFC 1035 section 5.1). `parse_quick` builds the same text for the names it takes, which
+/// need no escape; every other name gets it from here. So whichever parser read the query,
+/// the text is the same, and so are the rules it meets and the cache entry it finds.
+/// 查询名用来匹配规则、查缓存和记日志的文本：各标签转成小写、用 '.' 连起来，不带结尾的点；
+/// 标签里不是可打印 ASCII 的字节，以及标签内部的 '.' 和 '\'，写成 `\DDD`（十进制，同区域文件，
+/// RFC 1035 第 5.1 节）。`parse_quick` 收下的名字都不需要转义，它拼出的就是这段文本；其余名字
+/// 从这里得到。所以不论哪个解析器读的查询，文本都一样，遇到的规则和找到的缓存也一样。
+pub fn name_text(name: &hickory_proto::rr::Name) -> String {
+    use std::fmt::Write;
+    let mut text = String::with_capacity(name.len());
+    for (index, label) in name.iter().enumerate() {
+        if index > 0 {
+            text.push('.');
+        }
+        for &byte in label {
+            if is_plain_name_byte(byte) {
+                text.push(byte.to_ascii_lowercase() as char);
+            } else {
+                let _ = write!(text, "\\{byte:03}");
+            }
+        }
+    }
+    text
+}
+
+/// The name `name_text` wrote `text` for (upper case and a trailing dot are taken too).
+/// None for text it never writes: an empty label, a broken escape, a byte it would have
+/// escaped. Answers built for a query name start from here: the text holds every label
+/// byte, so the name comes back exactly.
+/// `name_text` 为它写出 `text` 的那个名字（大写和结尾的点也接受）。不是它会写出的文本为 None：
+/// 空标签、坏掉的转义、它本该转义的字节。为查询名构造的应答都从这里取名字：文本保存了标签的
+/// 每个字节，名字可以原样还原。
+pub fn name_from_text(text: &str) -> Option<hickory_proto::rr::Name> {
+    let text = text.strip_suffix('.').unwrap_or(text);
+    if text.is_empty() {
+        return Some(hickory_proto::rr::Name::root());
+    }
+    let bytes = text.as_bytes();
+    let mut labels = vec![Vec::new()];
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'.' => labels.push(Vec::new()),
+            b'\\' => {
+                let digits = bytes.get(index + 1..index + 4)?;
+                if !digits.iter().all(u8::is_ascii_digit) {
+                    return None;
+                }
+                let value: u8 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+                labels.last_mut()?.push(value);
+                index += 3;
+            }
+            byte if is_plain_name_byte(byte) => labels.last_mut()?.push(byte),
+            _ => return None,
+        }
+        index += 1;
+    }
+    if labels.iter().any(Vec::is_empty) {
+        return None;
+    }
+    hickory_proto::rr::Name::from_labels(labels.iter().map(Vec::as_slice)).ok()
+}
+
+/// A label byte the name's text holds as it is (see `name_text`) / 名字文本原样保存的标签字节
+fn is_plain_name_byte(byte: u8) -> bool {
+    byte.is_ascii_graphic() && byte != b'.' && byte != b'\\'
 }
 
 /// 请求的 EDNS 版本不受支持时的回答（RFC 6891 第 6.1.3 节）：RCODE 为 BADVERS（16：头部写低 4 位的
@@ -1648,6 +1709,75 @@ mod tests {
         let mut qname = [0u8; 256];
 
         assert!(parse_quick(&packet, &mut qname).is_some());
+    }
+
+    #[test]
+    fn parse_quick_leaves_names_that_need_escapes_to_the_full_parser() {
+        let mut qname = [0u8; 256];
+        for label in [&b"a.b"[..], b"a\\b", b"a b", b"\xff", b"caf\xc3\xa9"] {
+            assert!(
+                parse_quick(&query_with_label(label), &mut qname).is_none(),
+                "{label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_text_is_what_parse_quick_builds_and_escapes_the_rest() {
+        let name_of = |packet: &[u8]| Message::from_vec(packet).unwrap().queries[0].name().clone();
+        let mut qname = [0u8; 256];
+        for label in [&b"Example"[..], b"x-y_z", b"A1~!*"] {
+            let packet = query_with_label(label);
+            let quick = parse_quick(&packet, &mut qname)
+                .expect("a plain name")
+                .qname_bytes
+                .to_vec();
+            assert_eq!(name_text(&name_of(&packet)).as_bytes(), quick, "{label:?}");
+        }
+        for (label, text) in [
+            (&b"a.b"[..], r"a\046b"),
+            (b"a\\b", r"a\092b"),
+            (b"A b", r"a\032b"),
+            (b"\xffZ", r"\255z"),
+        ] {
+            assert_eq!(name_text(&name_of(&query_with_label(label))), text);
+        }
+        let name = hickory_proto::rr::Name::from_ascii("WWW.Example.COM.").unwrap();
+        assert_eq!(name_text(&name), "www.example.com");
+        assert_eq!(name_text(&hickory_proto::rr::Name::root()), "");
+    }
+
+    #[test]
+    fn name_from_text_gives_back_the_name_name_text_wrote() {
+        use hickory_proto::rr::Name;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..5000 {
+            let labels: Vec<Vec<u8>> = (0..1 + next() % 4)
+                .map(|_| (0..1 + next() % 20).map(|_| next() as u8).collect())
+                .collect();
+            let name = Name::from_labels(labels.iter().map(Vec::as_slice)).unwrap();
+            let back = name_from_text(&name_text(&name)).expect("round trip");
+            let lower =
+                |n: &Name| -> Vec<Vec<u8>> { n.iter().map(|l| l.to_ascii_lowercase()).collect() };
+            assert_eq!(lower(&back), lower(&name), "{labels:?}");
+        }
+        assert_eq!(
+            name_from_text("example.com."),
+            name_from_text("example.com")
+        );
+        assert_eq!(name_from_text(""), Some(Name::root()));
+        assert_eq!(name_from_text("."), Some(Name::root()));
+        for broken in [
+            "a..b", r"a\04", r"a\2x5b", r"a\256", "a b", "a\u{1}b", "café",
+        ] {
+            assert_eq!(name_from_text(broken), None, "{broken}");
+        }
     }
 
     fn encode_message(message: &Message) -> Vec<u8> {
