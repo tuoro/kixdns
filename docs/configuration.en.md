@@ -265,6 +265,8 @@ DoT uses port 853 when no port is supplied. Its optional TLS name is supplied wi
 
 DoQ uses port 853 when no port is supplied. Its optional query parameters are sni/servername and 0rtt/enable_0rtt. A DoQ upstream written with an IP literal requires an explicit SNI. 0-RTT is enabled globally by default, can be overridden per upstream, and is disabled for every connection to that upstream until the process restarts once a connection that used 0-RTT times out or is rejected, counting both an explicit rejection and the peer closing or resetting the connection, which is how a server refusing early data often answers. A timeout on a connection that did not use 0-RTT only means a slow answer and leaves 0-RTT alone.
 
+An upstream answer is taken only when it answers this query's question (the name ignoring case, the same type and class). Over UDP, TCP and DoT an answer that does not match is dropped and the query keeps waiting for the real one; over DoH and DoQ a query gets a single answer, so a mismatch fails that upstream. An error answer with no question section and no records at all, which is how some upstreams send FORMERR or NOTIMP, is still taken.
+
 When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fallback is enabled by default and can be disabled with settings.enable_tcp_fallback. The fallback is applied by the forwarding path; it is not an additional listener.
 
 ## Configuration examples
