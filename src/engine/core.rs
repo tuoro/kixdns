@@ -328,8 +328,8 @@ impl Engine {
             .context("initialize DoQ client")?,
         );
 
-        // Warm up TCP connection pools (create 1 connection per upstream)
-        // 预热 TCP 连接池（每个 upstream 创建 1 个连接）
+        // Warm up TCP connection pools (see `TcpMultiplexer::warm_up_pools`)
+        // 预热 TCP 连接池（见 `TcpMultiplexer::warm_up_pools`）
         tcp_mux.warm_up_pools(&tcp_upstreams);
 
         Ok(Self {

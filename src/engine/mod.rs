@@ -29,6 +29,8 @@ pub mod response;
 pub(crate) mod response_log;
 pub mod rules;
 #[cfg(test)]
+mod tcp_pool_tests;
+#[cfg(test)]
 mod test_support;
 pub mod transport;
 pub mod types;
