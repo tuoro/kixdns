@@ -395,10 +395,95 @@ impl UdpClient {
     }
 }
 
-/// TCP 连接复用器，使用 DashMap 管理连接池 / TCP connection multiplexer, managing connection pool with DashMap
-pub struct TcpMultiplexer {
-    pools: dashmap::DashMap<Arc<str>, Arc<TcpConnectionPool>, FxBuildHasher>,
+// ===================== TCP and DoT (DNS over TCP, DNS over TLS) =====================
+
+/// 用两字节长度前缀收发 DNS 报文的流式传输：TCP（RFC 7766）和 DoT（RFC 7858）。两者共用下面同一套
+/// 多路复用器、连接池和客户端，只在怎样建连上不同。
+/// A stream transport carrying DNS messages behind a two-byte length prefix: TCP (RFC
+/// 7766) and DoT (RFC 7858). Both share the multiplexer, pool and client below and
+/// differ only in how they connect.
+pub trait StreamTransport: Send + Sync + 'static {
+    type Read: tokio::io::AsyncRead + Unpin + Send + 'static;
+    type Write: tokio::io::AsyncWrite + Unpin + Send + 'static;
+    /// 每次建连都要用、整个多路复用器共用的东西（DoT 的 TLS 配置）/ What every connect
+    /// needs, shared by the whole multiplexer (DoT's TLS configuration)
+    type Shared: Clone + Send + Sync + 'static;
+    /// 错误文字里的名字 / The name in error texts
+    const LABEL: &'static str;
+    /// 日志里的名字 / The name in logs
+    const NAME: &'static str;
+    /// 日志的 `target` 字段 / The logs' `target` field
+    const LOG_TARGET: &'static str;
+
+    /// 在 `budget` 内建好一条到 `upstream` 的连接 / Connect to `upstream` within `budget`
+    fn connect(
+        shared: &Self::Shared,
+        upstream: &str,
+        budget: Duration,
+    ) -> impl Future<Output = anyhow::Result<(Self::Read, Self::Write)>> + Send;
+}
+
+/// DNS over TCP（RFC 7766）/ DNS over TCP (RFC 7766)
+pub struct Tcp;
+
+impl StreamTransport for Tcp {
+    type Read = OwnedReadHalf;
+    type Write = OwnedWriteHalf;
+    type Shared = ();
+    const LABEL: &'static str = "tcp";
+    const NAME: &'static str = "TCP";
+    const LOG_TARGET: &'static str = "tcp_mux";
+
+    async fn connect(
+        _: &(),
+        upstream: &str,
+        budget: Duration,
+    ) -> anyhow::Result<(OwnedReadHalf, OwnedWriteHalf)> {
+        // Establish TCP connection within the budget. Unbounded, a blackholed
+        // SYN blocks here until the kernel gives up (minutes) while every
+        // other request on this client waits for the lock.
+        // 在预算内建立 TCP 连接。不设限时 SYN 被黑洞会在此阻塞到内核放弃（分钟级），
+        // 期间该客户端的其他请求都在等这把锁。
+        let stream = match timeout(budget, TcpStream::connect(upstream)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => anyhow::bail!("tcp connect failed: {e}"),
+            Err(_) => anyhow::bail!("tcp connect timeout after {}ms", budget.as_millis()),
+        };
+        tune_stream_socket(&stream, upstream);
+        Ok(stream.into_split())
+    }
+}
+
+/// 刚建好的 TCP 连接（DoT 在握手之前也是）：关掉 Nagle，打开激进的 keepalive
+/// A freshly connected TCP stream (DoT's too, before its handshake): Nagle off and an
+/// aggressive keepalive on
+fn tune_stream_socket(stream: &TcpStream, upstream: &str) {
+    // Configure socket options for robustness
+    // 配置 socket 选项以增强健壮性
+    let _ = stream.set_nodelay(true);
+
+    // Set Check to 5s to detect dead connections faster (Aggressive Keepalive)
+    let sock = SockRef::from(stream);
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(5))
+        .with_interval(Duration::from_secs(2));
+
+    // Explicitly enable SO_KEEPALIVE (Essential for Windows/Linux)
+    if let Err(e) = sock.set_keepalive(true) {
+        warn!(upstream = %upstream, error = %e, "Failed to enable SO_KEEPALIVE");
+    }
+    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+        warn!(upstream = %upstream, error = %e, "Failed to set TCP keepalive params");
+    }
+}
+
+/// TCP 或 DoT 的连接复用器：每个上游一个连接池，用 DashMap 管理 / The TCP or DoT
+/// connection multiplexer: one connection pool per upstream, managed with DashMap
+pub struct StreamMultiplexer<T: StreamTransport> {
+    pools: dashmap::DashMap<Arc<str>, Arc<StreamConnectionPool<T>>, FxBuildHasher>,
     pool_size: usize,
+    /// 建连用的共享部分 / What connects share
+    shared: T::Shared,
     /// Per-upstream permit manager is created when pool is initialized
     /// 每个 upstream 在初始化连接池时创建独立的 permit manager
     /// 健康检查配置 / Health check configuration
@@ -407,12 +492,39 @@ pub struct TcpMultiplexer {
     idle_timeout_secs: u64,
 }
 
-pub struct TcpConnectionPool {
-    clients: Vec<Arc<TcpMuxClient>>,
+/// TCP 连接复用器 / TCP connection multiplexer
+pub type TcpMultiplexer = StreamMultiplexer<Tcp>;
+
+/// DoT (DNS over TLS) 多路复用器，参考 RFC 7858 实现
+/// DoT (DNS over TLS) multiplexer, implementing RFC 7858
+pub type DotMultiplexer = StreamMultiplexer<Dot>;
+
+pub struct StreamConnectionPool<T: StreamTransport> {
+    clients: Vec<Arc<StreamMuxClient<T>>>,
     next_idx: AtomicUsize,
 }
 
-impl TcpMultiplexer {
+pub type TcpConnectionPool = StreamConnectionPool<Tcp>;
+pub type DotConnectionPool = StreamConnectionPool<Dot>;
+
+impl<T: StreamTransport> StreamMultiplexer<T> {
+    fn with_shared(
+        shared: T::Shared,
+        pool_size: usize,
+        health_error_threshold: usize,
+        max_age_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            pools: dashmap::DashMap::with_hasher(FxBuildHasher),
+            pool_size,
+            shared,
+            health_error_threshold,
+            max_age_secs,
+            idle_timeout_secs,
+        }
+    }
+
     /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
     /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
     /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
@@ -422,19 +534,77 @@ impl TcpMultiplexer {
         self.pools.retain(|upstream, _| keep(upstream));
     }
 
+    /// `upstream` 的一个连接池，`size` 个客户端共用一个 permit manager
+    /// A pool for `upstream` of `size` clients sharing one permit manager
+    fn new_pool(&self, upstream: &Arc<str>, size: usize) -> Arc<StreamConnectionPool<T>> {
+        // Create per-upstream permit manager to avoid global TCP limit
+        // 为每个 upstream 创建独立的 permit manager，避免全局 TCP 限制
+        let permit_mgr = Arc::new(PermitManager::new(size));
+        let clients = (0..size)
+            .map(|_| {
+                let client = Arc::new(StreamMuxClient::with_shared(
+                    self.shared.clone(),
+                    upstream.clone(),
+                    Arc::clone(&permit_mgr),
+                ));
+                client.set_health_check_config(
+                    self.health_error_threshold,
+                    self.max_age_secs,
+                    self.idle_timeout_secs,
+                );
+                client
+            })
+            .collect();
+        Arc::new(StreamConnectionPool {
+            clients,
+            next_idx: AtomicUsize::new(0),
+        })
+    }
+
+    /// `upstream` 的连接池，还没有就按 `pool_size` 建一个（0 按 1 算）
+    /// The pool for `upstream`, built with `pool_size` clients (0 taken as 1) if there is none
+    fn pool(&self, upstream: &str) -> Arc<StreamConnectionPool<T>> {
+        let upstream_key: Arc<str> = Arc::from(upstream);
+        self.pools
+            .entry(upstream_key.clone())
+            .or_insert_with(|| self.new_pool(&upstream_key, self.pool_size.max(1)))
+            .clone()
+    }
+
+    /// Test-only helper to initialize or get a pool without network operations
+    /// This mirrors the production pool initialization logic used in send().
+    #[cfg(test)]
+    pub fn get_or_init_pool_for_test(&self, upstream: &str) -> Arc<StreamConnectionPool<T>> {
+        self.pool(upstream)
+    }
+
+    #[inline]
+    pub async fn send(
+        &self,
+        packet: &[u8],
+        upstream: &str,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Bytes> {
+        let pool = self.pool(upstream);
+        let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
+        pool.clients[idx].send(packet, timeout_dur).await
+    }
+}
+
+impl TcpMultiplexer {
     pub fn new(
         pool_size: usize,
         health_error_threshold: usize,
         max_age_secs: u64,
         idle_timeout_secs: u64,
     ) -> Self {
-        Self {
-            pools: dashmap::DashMap::with_hasher(FxBuildHasher),
+        Self::with_shared(
+            (),
             pool_size,
             health_error_threshold,
             max_age_secs,
             idle_timeout_secs,
-        }
+        )
     }
 
     /// Warm up connection pools for given upstreams.
@@ -444,8 +614,6 @@ impl TcpMultiplexer {
     /// lazy initialization overhead on first query.
     /// 这会为每个 upstream 创建只包含 1 个连接的最小连接池，以避免首次查询时的懒加载开销。
     pub fn warm_up_pools(&self, upstreams: &rustc_hash::FxHashSet<String>) {
-        use tracing::info;
-
         if upstreams.is_empty() {
             info!("No TCP upstreams to warm up");
             return;
@@ -460,27 +628,11 @@ impl TcpMultiplexer {
             let upstream_key: Arc<str> = Arc::from(upstream.as_str());
             // Use entry().or_insert_with() to create pool only if it doesn't exist
             // 使用 entry().or_insert_with() 仅在连接池不存在时创建
-            self.pools.entry(upstream_key.clone()).or_insert_with(|| {
-                // Warm up: create only 1 client instead of full pool_size
-                // 预热：只创建 1 个客户端而不是完整的 pool_size
-                let permit_mgr = Arc::new(PermitManager::new(1));
-                let client = Arc::new(TcpMuxClient::new(
-                    upstream_key.clone(),
-                    Arc::clone(&permit_mgr),
-                ));
-                client.set_health_check_config(
-                    self.health_error_threshold,
-                    self.max_age_secs,
-                    self.idle_timeout_secs,
-                );
-                Arc::new(TcpConnectionPool {
-                    clients: vec![client],
-                    next_idx: AtomicUsize::new(0),
-                })
-            });
-
-            // Drop the reference immediately, we just wanted to ensure the pool exists
-            // 立即释放引用，我们只是想确保连接池存在
+            // Warm up: create only 1 client instead of full pool_size
+            // 预热：只创建 1 个客户端而不是完整的 pool_size
+            self.pools
+                .entry(upstream_key.clone())
+                .or_insert_with(|| self.new_pool(&upstream_key, 1));
         }
 
         info!(
@@ -488,93 +640,33 @@ impl TcpMultiplexer {
             "TCP connection pools warmed up successfully"
         );
     }
+}
 
-    /// Test-only helper to initialize or get a pool without network operations
-    /// This mirrors the production pool initialization logic used in send().
-    #[cfg(test)]
-    pub fn get_or_init_pool_for_test(&self, upstream: &str) -> Arc<TcpConnectionPool> {
-        let upstream_key: Arc<str> = Arc::from(upstream);
-        self.pools
-            .entry(upstream_key.clone())
-            .or_insert_with(|| {
-                let mut clients = Vec::with_capacity(self.pool_size);
-                let size = if self.pool_size == 0 {
-                    1
-                } else {
-                    self.pool_size
-                };
-                // Create per-upstream permit manager to avoid global TCP limit
-                let permit_mgr = Arc::new(PermitManager::new(size));
-                for _ in 0..size {
-                    let client = Arc::new(TcpMuxClient::new(
-                        upstream_key.clone(),
-                        Arc::clone(&permit_mgr),
-                    ));
-                    client.set_health_check_config(
-                        self.health_error_threshold,
-                        self.max_age_secs,
-                        self.idle_timeout_secs,
-                    );
-                    clients.push(client);
-                }
-                Arc::new(TcpConnectionPool {
-                    clients,
-                    next_idx: AtomicUsize::new(0),
-                })
-            })
-            .clone()
-    }
-
-    #[inline]
-    pub async fn send(
-        &self,
-        packet: &[u8],
-        upstream: &str,
-        timeout_dur: Duration,
-    ) -> anyhow::Result<Bytes> {
-        let upstream_key: Arc<str> = Arc::from(upstream);
-        let pool = self
-            .pools
-            .entry(upstream_key.clone())
-            .or_insert_with(|| {
-                let mut clients = Vec::with_capacity(self.pool_size);
-                let size = if self.pool_size == 0 {
-                    1
-                } else {
-                    self.pool_size
-                };
-                // Create per-upstream permit manager to avoid global TCP limit
-                // 为每个 upstream 创建独立的 permit manager，避免全局 TCP 限制
-                let permit_mgr = Arc::new(PermitManager::new(size));
-                for _ in 0..size {
-                    let client = Arc::new(TcpMuxClient::new(
-                        upstream_key.clone(),
-                        Arc::clone(&permit_mgr),
-                    ));
-                    // 设置健康检查配置
-                    client.set_health_check_config(
-                        self.health_error_threshold,
-                        self.max_age_secs,
-                        self.idle_timeout_secs,
-                    );
-                    clients.push(client);
-                }
-                Arc::new(TcpConnectionPool {
-                    clients,
-                    next_idx: AtomicUsize::new(0),
-                })
-            })
-            .clone();
-
-        let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
-        pool.clients[idx].send(packet, timeout_dur).await
+impl DotMultiplexer {
+    pub fn new(
+        pool_size: usize,
+        health_error_threshold: usize,
+        max_age_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> anyhow::Result<Self> {
+        let tls_config = build_tls_client_config()?;
+        Ok(Self::with_shared(
+            Arc::new(tls_config),
+            pool_size,
+            health_error_threshold,
+            max_age_secs,
+            idle_timeout_secs,
+        ))
     }
 }
 
-pub struct TcpMuxClient {
+/// 一个上游的一条多路复用连接（TCP 或 DoT）/ One multiplexed connection to an upstream (TCP or DoT)
+pub struct StreamMuxClient<T: StreamTransport> {
     pub upstream: Arc<str>,
+    /// 建连用的共享部分 / What connects share
+    shared: T::Shared,
     /// Write half protected by Mutex - serves as both connection storage and write serialization
-    conn: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    conn: Arc<Mutex<Option<T::Write>>>,
     /// 上一次写入被取消，下次使用前需要完整 reset
     /// A write was cancelled; the connection needs a full reset before reuse
     write_cancelled: AtomicBool,
@@ -613,6 +705,9 @@ pub struct TcpMuxClient {
     answers_read: Arc<AtomicU64>,
 }
 
+pub type TcpMuxClient = StreamMuxClient<Tcp>;
+pub type DotMuxClient = StreamMuxClient<Dot>;
+
 struct Pending {
     original_id: u16,
     /// 写出去的帧（长度前缀加查询），回答到了用来比对问题
@@ -621,7 +716,7 @@ struct Pending {
     tx: oneshot::Sender<anyhow::Result<Bytes>>,
 }
 
-/// RAII Guard for TCP pending requests to ensure cleanup on cancellation
+/// RAII Guard for TCP and DoT pending requests to ensure cleanup on cancellation
 struct TcpPendingGuard {
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     id: u16,
@@ -692,16 +787,39 @@ impl<W> Drop for TcpWriteGuard<'_, W> {
 /// When the client is dropped (its upstream left the configuration on a reload), its
 /// reader task is ended: the reader holds a share of the write half, and the connection
 /// would stay open while it runs.
-impl Drop for TcpMuxClient {
+impl<T: StreamTransport> Drop for StreamMuxClient<T> {
     fn drop(&mut self) {
         self.read_cancel.get_mut().cancel();
     }
 }
 
+#[cfg(test)]
 impl TcpMuxClient {
     fn new(upstream: Arc<str>, permit_manager: Arc<PermitManager>) -> Self {
+        Self::with_shared((), upstream, permit_manager)
+    }
+}
+
+#[cfg(test)]
+impl DotMuxClient {
+    fn new(
+        upstream: Arc<str>,
+        tls_config: Arc<ClientConfig>,
+        permit_manager: Arc<PermitManager>,
+    ) -> Self {
+        Self::with_shared(tls_config, upstream, permit_manager)
+    }
+}
+
+impl<T: StreamTransport> StreamMuxClient<T> {
+    fn with_shared(
+        shared: T::Shared,
+        upstream: Arc<str>,
+        permit_manager: Arc<PermitManager>,
+    ) -> Self {
         Self {
             upstream,
+            shared,
             conn: Arc::new(Mutex::new(None)),
             write_cancelled: AtomicBool::new(false),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
@@ -709,7 +827,7 @@ impl TcpMuxClient {
             permit_manager,
             generation: Arc::new(AtomicU64::new(0)),
             conn_permit: Arc::new(Mutex::new(None)),
-            // 初始化健康检查字段（默认值，实际值会在 TcpMultiplexer 中设置）
+            // 初始化健康检查字段（默认值，实际值会在 StreamMultiplexer 中设置）
             consecutive_errors: AtomicUsize::new(0),
             health_threshold: AtomicUsize::new(3),
             conn_create_time: AtomicU64::new(0),
@@ -740,7 +858,7 @@ impl TcpMuxClient {
 
     async fn spawn_reader(
         &self,
-        mut reader: OwnedReadHalf,
+        mut reader: T::Read,
         cancel_token: CancellationToken,
         my_generation: u64,
         global_generation: Arc<AtomicU64>,
@@ -752,14 +870,14 @@ impl TcpMuxClient {
         let answers_read = Arc::clone(&self.answers_read);
 
         tokio::spawn(async move {
-            // Pre-allocate a reusable buffer for TCP reads
+            // Pre-allocate a reusable buffer for reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
             let mut reusable_buf = BytesMut::with_capacity(4096);
             loop {
                 // Check if this reader is still valid (Zombie Check)
                 // 检查此 reader 是否仍然有效（僵尸检测）
                 if global_generation.load(Ordering::Relaxed) != my_generation {
-                    debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader detected older generation, exiting silently");
+                    debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader detected older generation, exiting silently", T::NAME);
                     return;
                 }
 
@@ -774,23 +892,23 @@ impl TcpMuxClient {
                 // 取消机制：select! 在 reset 时中断阻塞的 read_exact
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader cancelled by reset, exiting");
+                        debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader cancelled by reset, exiting", T::NAME);
                         return;
                     }
                     result = reader.read_exact(&mut len_buf) => {
                         if let Err(err) = result {
                             // Check generation again before resetting anything
                             if global_generation.load(Ordering::Relaxed) == my_generation {
-                                debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read len failed");
+                                debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read len failed", T::LABEL);
                                 Self::fail_all_async(
                                     &pending,
-                                    anyhow::anyhow!("tcp read len failed"),
+                                    anyhow::anyhow!("{} read len failed", T::LABEL),
                                     &conn,
                                     &conn_permit,
                                 )
                                 .await;
                             } else {
-                                debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader failed but generation changed, ignoring");
+                                debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader failed but generation changed, ignoring", T::NAME);
                             }
                             break;
                         }
@@ -807,17 +925,17 @@ impl TcpMuxClient {
 
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        debug!(target = "tcp_mux", upstream = %upstream, gen = my_generation, "TCP reader cancelled by reset during body read, exiting");
+                        debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader cancelled by reset during body read, exiting", T::NAME);
                         return;
                     }
                     result = reader.read_exact(&mut reusable_buf[..resp_len]) => {
                         if let Err(err) = result {
                             // Check generation again
                             if global_generation.load(Ordering::Relaxed) == my_generation {
-                                debug!(target = "tcp_mux", upstream = %upstream, error = %err, "tcp read body failed");
+                                debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read body failed", T::LABEL);
                                 Self::fail_all_async(
                                     &pending,
-                                    anyhow::anyhow!("tcp read body failed"),
+                                    anyhow::anyhow!("{} read body failed", T::LABEL),
                                     &conn,
                                     &conn_permit,
                                 )
@@ -851,11 +969,11 @@ impl TcpMuxClient {
                         Some(e.remove())
                     }
                     entry::Entry::Occupied(_) => {
-                        warn!(target = "tcp_mux", upstream = %upstream, resp_id, "TCP response does not answer the query, dropped");
+                        warn!(target = T::LOG_TARGET, upstream = %upstream, resp_id, "{} response does not answer the query, dropped", T::NAME);
                         None
                     }
                     entry::Entry::Vacant(_) => {
-                        debug!(target = "tcp_mux", upstream = %upstream, resp_id, "response with unknown id");
+                        debug!(target = T::LOG_TARGET, upstream = %upstream, resp_id, "response with unknown id");
                         None
                     }
                 };
@@ -868,21 +986,23 @@ impl TcpMuxClient {
                     match p.tx.send(Ok(response)) {
                         Ok(()) => {
                             tracing::trace!(
-                                target = "tcp_mux",
+                                target = T::LOG_TARGET,
                                 upstream = %upstream,
                                 resp_id,
                                 original_id = orig,
                                 response_len = resp_len,
-                                "TCP mux response sent successfully"
+                                "{} mux response sent successfully",
+                                T::NAME
                             );
                         }
                         Err(_) => {
                             tracing::debug!(
-                                target = "tcp_mux",
+                                target = T::LOG_TARGET,
                                 upstream = %upstream,
                                 resp_id,
                                 original_id = orig,
-                                "TCP mux response send failed, channel already closed"
+                                "{} mux response send failed, channel already closed",
+                                T::NAME
                             );
                         }
                     }
@@ -912,7 +1032,8 @@ impl TcpMuxClient {
             upstream = %self.upstream,
             consecutive_errors = errors,
             threshold = threshold,
-            "TCP connection error recorded"
+            "{} connection error recorded",
+            T::NAME
         );
 
         // Check if threshold exceeded / 检查是否超过阈值
@@ -921,7 +1042,8 @@ impl TcpMuxClient {
                 upstream = %self.upstream,
                 consecutive_errors = errors,
                 threshold = threshold,
-                "TCP connection error threshold exceeded, resetting connection"
+                "{} connection error threshold exceeded, resetting connection",
+                T::NAME
             );
             self.reset().await;
             // Clear error counter to avoid immediate re-triggering on next error
@@ -959,7 +1081,8 @@ impl TcpMuxClient {
                     upstream = %self.upstream,
                     age_ms = age_ms,
                     max_age_ms = max_age,
-                    "TCP connection too old, resetting"
+                    "{} connection too old, resetting",
+                    T::NAME
                 );
                 self.reset().await;
                 // Clear error counter since we're starting fresh
@@ -979,7 +1102,8 @@ impl TcpMuxClient {
                     upstream = %self.upstream,
                     idle_ms = idle_ms,
                     idle_timeout_ms = idle_timeout,
-                    "TCP connection idle timeout, resetting"
+                    "{} connection idle timeout, resetting",
+                    T::NAME
                 );
                 self.reset().await;
                 // Clear error counter since we're starting fresh
@@ -995,7 +1119,7 @@ impl TcpMuxClient {
     async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
         let start = tokio::time::Instant::now();
         if packet.len() < 2 {
-            anyhow::bail!("dns packet too short for tcp");
+            anyhow::bail!("dns packet too short for {}", T::LABEL);
         }
 
         // Check if we are reusing an existing connection (for potential retry strategy)
@@ -1059,7 +1183,7 @@ impl TcpMuxClient {
 
         let elapsed = start.elapsed();
         if elapsed >= timeout_dur {
-            anyhow::bail!("tcp timeout before processing");
+            anyhow::bail!("{} timeout before processing", T::LABEL);
         }
         let remaining = timeout_dur - elapsed;
 
@@ -1077,7 +1201,8 @@ impl TcpMuxClient {
             timeout(remaining, self.register_pending(packet, original_id, tx)).await
         else {
             anyhow::bail!(
-                "TCP timeout waiting to register for upstream {upstream}",
+                "{name} timeout waiting to register for upstream {upstream}",
+                name = T::NAME,
                 upstream = self.upstream
             );
         };
@@ -1102,7 +1227,7 @@ impl TcpMuxClient {
             // 连接必须存在（ensure_connection 已在之前调用）
             // Pre-flight check: if writer is closed or broken, fail fast
             if guard.is_none() {
-                anyhow::bail!("tcp write half missing");
+                anyhow::bail!("{} write half missing", T::LABEL);
             }
 
             // Note: OwnedWriteHalf doesn't support peek/checking error directly easily without shared socket access.
@@ -1121,14 +1246,24 @@ impl TcpMuxClient {
                 .slot
                 .as_mut()
                 .expect("connection presence checked above");
-            let result = writer.write_all(&new_packet).await;
+            // TLS 流在 socket 写满时会先收下明文、返回"已写入"，加密后的记录留在缓冲
+            // 里，要等下一次写或 flush 才发出去；不 flush 的话，流量少时这个查询可能
+            // 一直等到超时。TCP 的 flush 什么也不做。
+            // When the socket is full a TLS stream accepts the plaintext and
+            // reports it written while the encrypted records stay buffered until
+            // the next write or flush; without the flush, on a quiet connection
+            // the query could wait out its whole timeout. A TCP flush does nothing.
+            let mut result = writer.write_all(&new_packet).await;
+            if result.is_ok() {
+                result = writer.flush().await;
+            }
             // 走到这里说明写入已经结束：成功则帧是完整的，失败则下面会 reset。
             // Reaching here means the write finished: complete on success, and
             // the caller resets on failure.
             write_guard.armed = false;
 
             if let Err(e) = result {
-                return Err(anyhow::anyhow!(e).context("tcp write failed"));
+                return Err(anyhow::anyhow!(e).context(format!("{} write failed", T::LABEL)));
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -1148,7 +1283,8 @@ impl TcpMuxClient {
                 self.consecutive_errors.store(0, Ordering::Release);
 
                 return Err(err).context(format!(
-                    "TCP write/connect failed for upstream {upstream}",
+                    "{name} write/connect failed for upstream {upstream}",
+                    name = T::NAME,
                     upstream = self.upstream
                 ));
             }
@@ -1161,7 +1297,8 @@ impl TcpMuxClient {
                 self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
-                    "TCP write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
+                    "{name} write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
+                    name = T::NAME,
                     upstream = self.upstream,
                     timeout_ms = remaining.as_millis()
                 ));
@@ -1182,7 +1319,8 @@ impl TcpMuxClient {
             self.reset_after_deadline().await;
 
             return Err(anyhow::anyhow!(
-                "TCP timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
+                "{name} timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
+                name = T::NAME,
                 upstream = self.upstream,
                 elapsed_ms = elapsed_after_write.as_millis(),
                 timeout_ms = timeout_dur.as_millis()
@@ -1212,7 +1350,8 @@ impl TcpMuxClient {
                 // 记录错误但不重置 - Mux 会处理被忽略的响应
                 self.record_error().await;
                 return Err(anyhow::anyhow!(
-                    "TCP response canceled for upstream {upstream}",
+                    "{name} response canceled for upstream {upstream}",
+                    name = T::NAME,
                     upstream = self.upstream
                 ));
             }
@@ -1226,7 +1365,8 @@ impl TcpMuxClient {
                 // would only lose the other answers on it, and it is no connection error
                 if self.answers_read.load(Ordering::Acquire) > answers_at_write {
                     return Err(anyhow::anyhow!(
-                        "TCP response timeout from upstream {upstream} (remaining: {timeout_ms}ms); the connection is still answering",
+                        "{name} response timeout from upstream {upstream} (remaining: {timeout_ms}ms); the connection is still answering",
+                        name = T::NAME,
                         upstream = self.upstream,
                         timeout_ms = final_remaining.as_millis()
                     ));
@@ -1240,7 +1380,8 @@ impl TcpMuxClient {
                 self.reset_after_deadline().await;
 
                 return Err(anyhow::anyhow!(
-                    "TCP response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
+                    "{name} response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
+                    name = T::NAME,
                     upstream = self.upstream,
                     timeout_ms = final_remaining.as_millis()
                 ));
@@ -1249,8 +1390,8 @@ impl TcpMuxClient {
         Ok(resp)
     }
 
-    /// Ensure TCP connection exists, acquiring connection-level permit if needed
-    /// 确保 TCP 连接存在，如果需要则获取连接级别 permit
+    /// Ensure the connection exists, acquiring connection-level permit if needed
+    /// 确保连接存在，如果需要则获取连接级别 permit
     ///
     /// Connection-level permit semantics:
     /// - Acquired when connection is established
@@ -1264,9 +1405,9 @@ impl TcpMuxClient {
     /// - 连接关闭/重置时释放
     /// - 允许同一连接上无限请求（TCP 多路复用）
     ///
-    /// `budget` bounds the connect; on failure the lock and the permit are
-    /// released immediately.
-    /// `budget` 约束建连；失败时立即释放锁和 permit。
+    /// `budget` bounds the connect (DoT's TLS handshake included); on failure
+    /// the lock and the permit are released immediately.
+    /// `budget` 约束建连（包括 DoT 的 TLS 握手）；失败时立即释放锁和 permit。
     async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         let started = tokio::time::Instant::now();
         // First, check if we need to reconnect based on error state
@@ -1285,7 +1426,8 @@ impl TcpMuxClient {
                 upstream = %self.upstream,
                 consecutive_errors = errors,
                 write_cancelled,
-                "TCP connection needs a reset before ensure"
+                "{} connection needs a reset before ensure",
+                T::NAME
             );
             // 欠着的复位也守预算：前面的写入占着锁时不能等过时限；没做完下次再做
             // An owed reset keeps to the budget too: with writes holding the lock
@@ -1296,7 +1438,8 @@ impl TcpMuxClient {
                     self.write_cancelled.store(true, Ordering::Release);
                 }
                 anyhow::bail!(
-                    "tcp timeout resetting the connection after {}ms",
+                    "{} timeout resetting the connection after {}ms",
+                    T::LABEL,
                     budget.as_millis()
                 );
             }
@@ -1309,7 +1452,8 @@ impl TcpMuxClient {
             timeout(budget.saturating_sub(started.elapsed()), self.conn.lock()).await
         else {
             anyhow::bail!(
-                "tcp timeout waiting for the connection after {}ms",
+                "{} timeout waiting for the connection after {}ms",
+                T::LABEL,
                 budget.as_millis()
             );
         };
@@ -1321,38 +1465,9 @@ impl TcpMuxClient {
             let permit = self
                 .permit_manager
                 .try_acquire()
-                .ok_or_else(|| anyhow::anyhow!("tcp connection limit exceeded"))?;
+                .ok_or_else(|| anyhow::anyhow!("{} connection limit exceeded", T::LABEL))?;
 
-            // Establish TCP connection within the budget. Unbounded, a blackholed
-            // SYN blocks here until the kernel gives up (minutes) while every
-            // other request on this client waits for the lock.
-            // 在预算内建立 TCP 连接。不设限时 SYN 被黑洞会在此阻塞到内核放弃（分钟级），
-            // 期间该客户端的其他请求都在等这把锁。
-            let stream = match timeout(budget, TcpStream::connect(&*self.upstream)).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => anyhow::bail!("tcp connect failed: {e}"),
-                Err(_) => anyhow::bail!("tcp connect timeout after {}ms", budget.as_millis()),
-            };
-
-            // Configure socket options for robustness
-            // 配置 socket 选项以增强健壮性
-            let _ = stream.set_nodelay(true);
-
-            // Set Check to 5s to detect dead connections faster (Aggressive Keepalive)
-            let sock = SockRef::from(&stream);
-            let mut ka = TcpKeepalive::new();
-            ka = ka.with_time(Duration::from_secs(5));
-            ka = ka.with_interval(Duration::from_secs(2));
-
-            // Explicitly enable SO_KEEPALIVE (Essential for Windows/Linux)
-            if let Err(e) = sock.set_keepalive(true) {
-                warn!(upstream = %self.upstream, error = %e, "Failed to enable SO_KEEPALIVE");
-            }
-            if let Err(e) = sock.set_tcp_keepalive(&ka) {
-                warn!(upstream = %self.upstream, error = %e, "Failed to set TCP keepalive params");
-            }
-
-            let (read_half, write_half) = stream.into_split();
+            let (read_half, write_half) = T::connect(&self.shared, &self.upstream, budget).await?;
 
             *guard = Some(write_half);
 
@@ -1396,10 +1511,7 @@ impl TcpMuxClient {
             // 清除新连接的错误计数
             self.consecutive_errors.store(0, Ordering::Release);
 
-            info!(
-                upstream = %self.upstream,
-                "TCP connection established"
-            );
+            info!(upstream = %self.upstream, "{} connection established", T::NAME);
         }
 
         Ok(())
@@ -1413,10 +1525,10 @@ impl TcpMuxClient {
         original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
     ) -> anyhow::Result<(Bytes, u16)> {
-        // Build complete TCP wire frame (2-byte length prefix + DNS message). Caller writes
+        // Build complete TCP/DoT wire frame (2-byte length prefix + DNS message). Caller writes
         // it directly without further copying, and the same buffer stays in the pending
         // entry for the answer's question check, as on UDP.
-        // 构建完整 TCP wire frame（2 字节长度前缀 + DNS 消息）。调用方直接写入、无需二次拷贝；
+        // 构建完整 TCP/DoT wire frame（2 字节长度前缀 + DNS 消息）。调用方直接写入、无需二次拷贝；
         // 同一份缓冲还留在 pending 条目里供应答比对问题，和 UDP 一样。
         let mut frame = BytesMut::with_capacity(2 + packet.len());
         frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
@@ -1457,10 +1569,10 @@ impl TcpMuxClient {
             // ones running far past their deadlines. Counting locks every shard, so it
             // is skipped while the first ID is free
             if tries == 1 && self.pending.len() > u16::MAX as usize {
-                anyhow::bail!("no available dns ids for tcp mux");
+                anyhow::bail!("no available dns ids for {} mux", T::LABEL);
             }
             if tries > u16::MAX as usize {
-                anyhow::bail!("no available dns ids for tcp mux");
+                anyhow::bail!("no available dns ids for {} mux", T::LABEL);
             }
         };
         drop(conn_guard);
@@ -1470,7 +1582,7 @@ impl TcpMuxClient {
     async fn fail_all_async(
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
-        conn: &Arc<Mutex<Option<OwnedWriteHalf>>>,
+        conn: &Arc<Mutex<Option<T::Write>>>,
         conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
         // Hold the connection lock while resetting and draining. register_pending uses the same
@@ -1483,7 +1595,7 @@ impl TcpMuxClient {
     async fn fail_all_locked(
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
-        conn_guard: &mut Option<OwnedWriteHalf>,
+        conn_guard: &mut Option<T::Write>,
         conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
         let err_msg = err.to_string();
@@ -1503,19 +1615,19 @@ impl TcpMuxClient {
     /// 重置连接：取消 reader 任务，然后丢弃写半部、让所有等待中的查询失败并释放许可
     ///
     /// The cancellation token interrupts the reader's blocked read so it
-    /// exits immediately instead of leaking the TCP connection. With the reader
+    /// exits immediately instead of leaking the connection. With the reader
     /// gone nothing can answer the queries still waiting on this connection, so
     /// they are failed at once: each can then retry over a fresh connection
     /// instead of sitting out its whole deadline and resetting the next
     /// connection in turn.
-    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TCP 连接。reader 没了，
+    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏连接。reader 没了，
     /// 这条连接上还在等的查询再也等不到回答，所以立刻让它们失败：各自可以换新连接重发，
     /// 而不是干等到截止时间、再轮流把下一条连接也重置掉。
     async fn reset(&self) {
         self.read_cancel.lock().await.cancel();
         Self::fail_all_async(
             &self.pending,
-            anyhow::anyhow!("TCP connection reset"),
+            anyhow::anyhow!("{} connection reset", T::NAME),
             &self.conn,
             &self.conn_permit,
         )
@@ -1538,7 +1650,7 @@ impl TcpMuxClient {
         self.read_cancel.lock().await.cancel();
         Self::fail_all_locked(
             &self.pending,
-            anyhow::anyhow!("TCP connection reset"),
+            anyhow::anyhow!("{} connection reset", T::NAME),
             &mut conn,
             &self.conn_permit,
         )
@@ -2003,8 +2115,6 @@ fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
 // ===================== DoT (DNS over TLS) =====================
 
 type DotTlsStream = tokio_rustls::client::TlsStream<TcpStream>;
-type DotReadHalf = tokio::io::ReadHalf<DotTlsStream>;
-type DotWriteHalf = tokio::io::WriteHalf<DotTlsStream>;
 
 #[derive(Clone)]
 struct DotTarget {
@@ -2012,824 +2122,51 @@ struct DotTarget {
     sni: Arc<str>,
 }
 
-/// DoT (DNS over TLS) 多路复用器，管理多个上游的连接池
-/// DoT (DNS over TLS) multiplexer, managing connection pools for multiple upstreams
-///
-/// 参考 RFC 7858 (DNS over TLS) 实现
-/// Implements RFC 7858 (DNS over TLS)
-pub struct DotMultiplexer {
-    pools: dashmap::DashMap<Arc<str>, Arc<DotConnectionPool>, FxBuildHasher>,
-    pool_size: usize,
-    tls_config: Arc<ClientConfig>,
-    health_error_threshold: usize,
-    max_age_secs: u64,
-    idle_timeout_secs: u64,
-}
+/// DNS over TLS（RFC 7858），多路复用见 [`StreamMultiplexer`]
+/// DNS over TLS (RFC 7858), multiplexed by [`StreamMultiplexer`]
+pub struct Dot;
 
-/// DoT (DNS over TLS) 连接池
-/// DoT (DNS over TLS) connection pool
-///
-/// 参考 RFC 7858 (DNS over TLS) 实现
-/// Implements RFC 7858 (DNS over TLS)
-pub struct DotConnectionPool {
-    clients: Vec<Arc<DotMuxClient>>,
-    next_idx: AtomicUsize,
-}
+impl StreamTransport for Dot {
+    type Read = tokio::io::ReadHalf<DotTlsStream>;
+    type Write = tokio::io::WriteHalf<DotTlsStream>;
+    type Shared = Arc<ClientConfig>;
+    const LABEL: &'static str = "dot";
+    const NAME: &'static str = "DoT";
+    const LOG_TARGET: &'static str = "dot_mux";
 
-/// DoT (DNS over TLS) 多路复用客户端，管理单个上游的 TLS 连接
-/// DoT (DNS over TLS) multiplexing client, managing TLS connection for a single upstream
-///
-/// 参考 RFC 7858 (DNS over TLS) 实现
-/// Implements RFC 7858 (DNS over TLS)
-pub struct DotMuxClient {
-    pub upstream: Arc<str>,
-    target: Mutex<Option<DotTarget>>,
-    tls_config: Arc<ClientConfig>,
-    conn: Arc<Mutex<Option<DotWriteHalf>>>,
-    /// 上一次写入被取消，下次使用前需要完整 reset（同 TCP）
-    /// A write was cancelled; the connection needs a full reset before reuse (as for TCP)
-    write_cancelled: AtomicBool,
-    pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
-    next_id: AtomicU16,
-    pub permit_manager: Arc<PermitManager>,
-    generation: Arc<AtomicU64>,
-    conn_permit: Arc<Mutex<Option<PermitGuard>>>,
-    consecutive_errors: AtomicUsize,
-    health_threshold: AtomicUsize,
-    conn_create_time: AtomicU64,
-    max_age_ms: AtomicU64,
-    last_request_time: AtomicU64,
-    idle_timeout_ms: AtomicU64,
-    last_health_check_time: AtomicU64,
-    /// Reader 取消令牌 / Reader cancellation token
-    read_cancel: Mutex<CancellationToken>,
-    /// 这条客户端的 reader 读到的应答帧总数。查询超时时拿它判断连接是不是还活着：
-    /// 本查询写出之后数字涨过，说明连接照常在回答，慢的只是这一个
-    /// Answer frames this client's readers have read. A timed-out query uses it to
-    /// tell whether the connection is still alive: if it grew after the query was
-    /// written, the connection kept answering and only this one answer is slow
-    answers_read: Arc<AtomicU64>,
-}
-
-impl DotMultiplexer {
-    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
-    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
-    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
-    /// upstream the configuration no longer names is dropped: queries using it hold on to
-    /// it until they finish, and its connections close after that.
-    pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
-        self.pools.retain(|upstream, _| keep(upstream));
-    }
-
-    pub fn new(
-        pool_size: usize,
-        health_error_threshold: usize,
-        max_age_secs: u64,
-        idle_timeout_secs: u64,
-    ) -> anyhow::Result<Self> {
-        let tls_config = build_tls_client_config()?;
-        Ok(Self {
-            pools: dashmap::DashMap::with_hasher(FxBuildHasher),
-            pool_size,
-            tls_config: Arc::new(tls_config),
-            health_error_threshold,
-            max_age_secs,
-            idle_timeout_secs,
-        })
-    }
-
-    #[inline]
-    pub async fn send(
-        &self,
-        packet: &[u8],
+    async fn connect(
+        tls_config: &Arc<ClientConfig>,
         upstream: &str,
-        timeout_dur: Duration,
-    ) -> anyhow::Result<Bytes> {
-        let upstream_key: Arc<str> = Arc::from(upstream);
-        let pool = self
-            .pools
-            .entry(upstream_key.clone())
-            .or_insert_with(|| {
-                let mut clients = Vec::with_capacity(self.pool_size.max(1));
-                let size = if self.pool_size == 0 {
-                    1
-                } else {
-                    self.pool_size
-                };
-                let permit_mgr = Arc::new(PermitManager::new(size));
-                for _ in 0..size {
-                    let client = Arc::new(DotMuxClient::new(
-                        upstream_key.clone(),
-                        Arc::clone(&self.tls_config),
-                        Arc::clone(&permit_mgr),
-                    ));
-                    client.set_health_check_config(
-                        self.health_error_threshold,
-                        self.max_age_secs,
-                        self.idle_timeout_secs,
-                    );
-                    clients.push(client);
-                }
-                Arc::new(DotConnectionPool {
-                    clients,
-                    next_idx: AtomicUsize::new(0),
-                })
-            })
-            .clone();
+        budget: Duration,
+    ) -> anyhow::Result<(Self::Read, Self::Write)> {
+        let target = parse_dot_target(upstream)?;
 
-        let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
-        pool.clients[idx].send(packet, timeout_dur).await
-    }
-}
-
-/// 客户端被丢掉（它的上游在重载后不在配置里了）时，让读取任务结束：读取任务拿着写半边的共享引用，
-/// 不结束的话连接会一直开着。
-/// When the client is dropped (its upstream left the configuration on a reload), its
-/// reader task is ended: the reader holds a share of the write half, and the connection
-/// would stay open while it runs.
-impl Drop for DotMuxClient {
-    fn drop(&mut self) {
-        self.read_cancel.get_mut().cancel();
-    }
-}
-
-impl DotMuxClient {
-    fn new(
-        upstream: Arc<str>,
-        tls_config: Arc<ClientConfig>,
-        permit_manager: Arc<PermitManager>,
-    ) -> Self {
-        Self {
-            upstream,
-            target: Mutex::new(None),
-            tls_config,
-            conn: Arc::new(Mutex::new(None)),
-            write_cancelled: AtomicBool::new(false),
-            pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
-            next_id: AtomicU16::new(1),
-            permit_manager,
-            generation: Arc::new(AtomicU64::new(0)),
-            conn_permit: Arc::new(Mutex::new(None)),
-            consecutive_errors: AtomicUsize::new(0),
-            health_threshold: AtomicUsize::new(3),
-            conn_create_time: AtomicU64::new(0),
-            max_age_ms: AtomicU64::new(300_000),
-            last_request_time: AtomicU64::new(0),
-            idle_timeout_ms: AtomicU64::new(60_000),
-            last_health_check_time: AtomicU64::new(0),
-            read_cancel: Mutex::new(CancellationToken::new()),
-            answers_read: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    fn set_health_check_config(
-        &self,
-        error_threshold: usize,
-        max_age_secs: u64,
-        idle_timeout_secs: u64,
-    ) {
-        self.health_threshold
-            .store(error_threshold, Ordering::Release);
-        self.max_age_ms
-            .store(max_age_secs * 1000, Ordering::Release);
-        self.idle_timeout_ms
-            .store(idle_timeout_secs * 1000, Ordering::Release);
-    }
-
-    async fn spawn_reader(
-        &self,
-        mut reader: DotReadHalf,
-        cancel_token: CancellationToken,
-        my_generation: u64,
-        global_generation: Arc<AtomicU64>,
-    ) {
-        let pending = Arc::clone(&self.pending);
-        let upstream = self.upstream.clone();
-        let conn = Arc::clone(&self.conn);
-        let conn_permit = Arc::clone(&self.conn_permit);
-        let answers_read = Arc::clone(&self.answers_read);
-
-        tokio::spawn(async move {
-            let mut reusable_buf = BytesMut::with_capacity(4096);
-            loop {
-                if global_generation.load(Ordering::Relaxed) != my_generation {
-                    debug!(target = "dot_mux", upstream = %upstream, gen = my_generation, "DoT reader older generation, exiting");
-                    return;
-                }
-
-                let mut len_buf = [0u8; 2];
-                // Cancellation: select! interrupts blocked read_exact on reset
-                // 取消机制：select! 在 reset 时中断阻塞的 read_exact
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        debug!(target = "dot_mux", upstream = %upstream, gen = my_generation, "DoT reader cancelled by reset, exiting");
-                        return;
-                    }
-                    result = reader.read_exact(&mut len_buf) => {
-                        if let Err(err) = result {
-                            if global_generation.load(Ordering::Relaxed) == my_generation {
-                                debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read len failed");
-                                Self::fail_all_async(
-                                    &pending,
-                                    anyhow::anyhow!("dot read len failed"),
-                                    &conn,
-                                    &conn_permit,
-                                )
-                                .await;
-                            }
-                            break;
-                        }
-                    }
-                }
-                let resp_len = u16::from_be_bytes(len_buf) as usize;
-                if reusable_buf.capacity() < resp_len {
-                    reusable_buf.reserve(resp_len.max(4096));
-                }
-                reusable_buf.resize(resp_len, 0);
-
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        debug!(target = "dot_mux", upstream = %upstream, gen = my_generation, "DoT reader cancelled by reset during body read, exiting");
-                        return;
-                    }
-                    result = reader.read_exact(&mut reusable_buf[..resp_len]) => {
-                        if let Err(err) = result {
-                            if global_generation.load(Ordering::Relaxed) == my_generation {
-                                debug!(target = "dot_mux", upstream = %upstream, error = %err, "dot read body failed");
-                                Self::fail_all_async(
-                                    &pending,
-                                    anyhow::anyhow!("dot read body failed"),
-                                    &conn,
-                                    &conn_permit,
-                                )
-                                .await;
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                // 读满一整帧就算这条连接在回答，不管它对不对得上号
-                // A whole frame read counts as the connection answering, matched or not
-                answers_read.fetch_add(1, Ordering::Release);
-                if resp_len < 2 {
-                    continue;
-                }
-                let resp_id = u16::from_be_bytes([reusable_buf[0], reusable_buf[1]]);
-                // RFC 5452 §9.1, as on UDP: a matching ID is not enough, the
-                // question has to match too. An answer to another question under
-                // this ID (a late answer to an earlier query that had the same ID,
-                // say) is dropped, and the query keeps waiting for its own.
-                // RFC 5452 §9.1，和 UDP 一样：ID 相符还不够，问题也要一致。这个 ID 下回答别的问题的
-                // （比如之前用过同一个 ID 的查询迟到的回答）丢掉，查询接着等自己的回答。
-                let matched = match pending.entry(resp_id) {
-                    entry::Entry::Occupied(e)
-                        if crate::proto_utils::answers_query(
-                            &e.get().frame[2..],
-                            &reusable_buf[..resp_len],
-                        ) =>
-                    {
-                        Some(e.remove())
-                    }
-                    entry::Entry::Occupied(_) => {
-                        warn!(target = "dot_mux", upstream = %upstream, resp_id, "DoT response does not answer the query, dropped");
-                        None
-                    }
-                    entry::Entry::Vacant(_) => {
-                        debug!(target = "dot_mux", upstream = %upstream, resp_id, "dot response with unknown id");
-                        None
-                    }
-                };
-                if let Some(p) = matched {
-                    let orig = p.original_id;
-                    reusable_buf[0..2].copy_from_slice(&p.original_id.to_be_bytes());
-                    // Copy it out and keep the buffer, as the UDP reader does
-                    // 拷出一份、缓冲区留着，和 UDP 的读取一样
-                    let response = Bytes::copy_from_slice(&reusable_buf[..resp_len]);
-                    let _ = p.tx.send(Ok(response));
-                    tracing::trace!(
-                        target = "dot_mux",
-                        upstream = %upstream,
-                        resp_id,
-                        original_id = orig,
-                        response_len = resp_len,
-                        "DoT response sent"
-                    );
-                }
-            }
-        });
-    }
-
-    async fn record_error(&self) -> bool {
-        let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
-        let threshold = self.health_threshold.load(Ordering::Acquire);
-
-        if threshold > 0 && errors >= threshold {
-            warn!(
-                upstream = %self.upstream,
-                consecutive_errors = errors,
-                threshold = threshold,
-                "DoT connection error threshold exceeded, resetting"
-            );
-            self.reset().await;
-            self.consecutive_errors.store(0, Ordering::Release);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn record_success(&self) {
-        self.consecutive_errors.store(0, Ordering::Release);
-        let now = unix_time_millis();
-        self.last_request_time.store(now, Ordering::Release);
-    }
-
-    async fn check_connection_health(&self) -> bool {
-        let now = unix_time_millis();
-
-        let create_time = self.conn_create_time.load(Ordering::Acquire);
-        let max_age = self.max_age_ms.load(Ordering::Acquire);
-        if create_time > 0 && max_age > 0 {
-            let age_ms = now.saturating_sub(create_time);
-            if age_ms > max_age {
-                info!(
-                    upstream = %self.upstream,
-                    age_ms = age_ms,
-                    max_age_ms = max_age,
-                    "DoT connection too old, resetting"
-                );
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
-                return true;
-            }
-        }
-
-        let last_req = self.last_request_time.load(Ordering::Acquire);
-        let idle_timeout = self.idle_timeout_ms.load(Ordering::Acquire);
-        if last_req > 0 && idle_timeout > 0 {
-            let idle_ms = now.saturating_sub(last_req);
-            if idle_ms > idle_timeout {
-                info!(
-                    upstream = %self.upstream,
-                    idle_ms = idle_ms,
-                    idle_timeout_ms = idle_timeout,
-                    "DoT connection idle timeout, resetting"
-                );
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
-                return true;
-            }
-        }
-
-        false
-    }
-
-    async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
-        let start = tokio::time::Instant::now();
-        if packet.len() < 2 {
-            anyhow::bail!("dns packet too short for dot");
-        }
-
-        // 见 TcpMuxClient::send / See TcpMuxClient::send
-        let is_reused = match self.conn.try_lock() {
-            Ok(guard) => guard.is_some(),
-            Err(_) => true,
+        // Connect and complete the TLS handshake within the budget: an
+        // upstream that accepts and stays silent would otherwise hold the
+        // lock, and every request queued behind it, indefinitely.
+        // 在预算内建连并完成 TLS 握手：accept 后沉默的上游否则会无限期占住锁，
+        // 排在后面的请求一起被钉死。
+        let tls_connector = TlsConnector::from(tls_config.clone());
+        let server_name = build_server_name(&target.sni)?;
+        let connect = async {
+            let stream = TcpStream::connect(&*target.connect_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
+            tune_stream_socket(&stream, upstream);
+            tls_connector
+                .connect(server_name, stream)
+                .await
+                .context("dot tls handshake failed")
         };
-
-        match self.send_attempt(packet, timeout_dur).await {
-            Ok(res) => Ok(res),
-            Err(err) => {
-                if is_reused {
-                    let remaining = timeout_dur.saturating_sub(start.elapsed());
-                    if remaining < MIN_RETRY_BUDGET {
-                        return Err(err);
-                    }
-                    debug!(
-                        upstream = %self.upstream,
-                        error = %err,
-                        retry_timeout_ms = remaining.as_millis() as u64,
-                        "DoT reuse failed, retrying with fresh connection"
-                    );
-                    return self.send_attempt(packet, remaining).await;
-                }
-                Err(err)
-            }
-        }
-    }
-
-    async fn send_attempt(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
-        let start = tokio::time::Instant::now();
-
-        const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000;
-        let now = unix_time_millis();
-        let last_check = self.last_health_check_time.load(Ordering::Relaxed);
-        if last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS {
-            self.check_connection_health().await;
-            self.last_health_check_time.store(now, Ordering::Relaxed);
-        }
-
-        self.ensure_connection(timeout_dur.saturating_sub(start.elapsed()))
-            .await?;
-
-        let elapsed = start.elapsed();
-        if elapsed >= timeout_dur {
-            anyhow::bail!("dot timeout before processing");
-        }
-        let remaining = timeout_dur - elapsed;
-
-        let original_id = u16::from_be_bytes([packet[0], packet[1]]);
-        let (tx, rx) = oneshot::channel();
-        // 注册要等连接锁，也受剩余预算约束：以前排在一长串注册后面的查询，会远远超出自己的时限
-        // Registration waits for the connection lock, so it is bounded by what is left
-        // of the budget too: a query queued behind a long run of registrations used to
-        // run far past its own deadline
-        let Ok(registered) =
-            timeout(remaining, self.register_pending(packet, original_id, tx)).await
-        else {
-            anyhow::bail!(
-                "DoT timeout waiting to register for upstream {upstream}",
-                upstream = self.upstream
-            );
-        };
-        let (new_packet, new_id) = registered?;
-        let remaining = timeout_dur.saturating_sub(start.elapsed());
-
-        let _guard = TcpPendingGuard {
-            pending: self.pending.clone(),
-            id: new_id,
-        };
-
-        let write_res = timeout(remaining, async {
-            // Frame already contains length prefix + payload — write directly, no second copy.
-            // 帧已包含长度前缀 + 负载——直接写入，无二次拷贝。
-            let mut guard = self.conn.lock().await;
-            if guard.is_none() {
-                anyhow::bail!("dot write half missing");
-            }
-            // 写入期间被取消时丢弃连接，避免半条帧留在池里（见 TcpWriteGuard）
-            // Drop the connection if the write is cancelled, so half a frame
-            // cannot stay pooled (see TcpWriteGuard)
-            let mut write_guard = TcpWriteGuard {
-                slot: &mut guard,
-                needs_reset: &self.write_cancelled,
-                armed: true,
-            };
-            let writer = write_guard
-                .slot
-                .as_mut()
-                .expect("connection presence checked above");
-            // TLS 流在 socket 写满时会先收下明文、返回"已写入"，加密后的记录留在缓冲
-            // 里，要等下一次写或 flush 才发出去；不 flush 的话，流量少时这个查询可能
-            // 一直等到超时
-            // When the socket is full a TLS stream accepts the plaintext and
-            // reports it written while the encrypted records stay buffered until
-            // the next write or flush; without the flush, on a quiet connection
-            // the query could wait out its whole timeout
-            let mut result = writer.write_all(&new_packet).await;
-            if result.is_ok() {
-                result = writer.flush().await;
-            }
-            // 走到这里说明写入已经结束 / Reaching here means the write finished
-            write_guard.armed = false;
-            if let Err(e) = result {
-                return Err(anyhow::anyhow!(e).context("dot write failed"));
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await;
-
-        match write_res {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                self.record_error().await;
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
-
-                return Err(err).context(format!(
-                    "DoT write/connect failed for upstream {upstream}",
-                    upstream = self.upstream
-                ));
-            }
-            Err(_) => {
-                self.reset_after_deadline().await;
-
-                return Err(anyhow::anyhow!(
-                    "DoT write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
-                    upstream = self.upstream,
-                    timeout_ms = remaining.as_millis()
-                ));
-            }
-        }
-
-        let answers_at_write = self.answers_read.load(Ordering::Acquire);
-
-        let elapsed_after_write = start.elapsed();
-        if elapsed_after_write >= timeout_dur {
-            self.reset_after_deadline().await;
-
-            return Err(anyhow::anyhow!(
-                "DoT timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
-                upstream = self.upstream,
-                elapsed_ms = elapsed_after_write.as_millis(),
-                timeout_ms = timeout_dur.as_millis()
-            ));
-        }
-        let final_remaining = timeout_dur - elapsed_after_write;
-
-        let resp = match timeout(final_remaining, rx).await {
-            Ok(Ok(Ok(response))) => {
-                self.record_success();
-                response
-            }
-            Ok(Ok(Err(err))) => {
-                // 连接在等待期间断开或被重置，见 TCP 那边的同一处
-                // The connection broke or was reset while waiting, as on the TCP side
-                return Err(err);
-            }
-            Ok(Err(_canceled)) => {
-                self.record_error().await;
-                return Err(anyhow::anyhow!(
-                    "DoT response canceled for upstream {upstream}",
-                    upstream = self.upstream
-                ));
-            }
-            Err(_) => {
-                // 连接还在回答别的查询时，慢的只是这一个，见 TCP 那边的同一处
-                // A connection still answering other queries is alive and only this
-                // answer is slow, as on the TCP side
-                if self.answers_read.load(Ordering::Acquire) > answers_at_write {
-                    return Err(anyhow::anyhow!(
-                        "DoT response timeout from upstream {upstream} (remaining: {timeout_ms}ms); the connection is still answering",
-                        upstream = self.upstream,
-                        timeout_ms = final_remaining.as_millis()
-                    ));
-                }
-                self.reset_after_deadline().await;
-
-                return Err(anyhow::anyhow!(
-                    "DoT response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
-                    upstream = self.upstream,
-                    timeout_ms = final_remaining.as_millis()
-                ));
-            }
-        };
-        Ok(resp)
-    }
-
-    /// `budget` bounds the TCP connect and the TLS handshake together; on
-    /// failure the lock and the permit are released immediately.
-    /// `budget` 同时约束 TCP 建连和 TLS 握手；失败时立即释放锁和 permit。
-    async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
-        let started = tokio::time::Instant::now();
-        let errors = self.consecutive_errors.load(Ordering::Acquire);
-        // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补齐 reader token 与连接级
-        // permit（同 TCP）
-        // A cancelled write already dropped the write half in Drop; this picks up
-        // the reader token and the connection permit (as for TCP)
-        let write_cancelled = self.write_cancelled.swap(false, Ordering::AcqRel);
-        let needs_reset = errors > 0 || write_cancelled;
-
-        if needs_reset {
-            debug!(
-                upstream = %self.upstream,
-                consecutive_errors = errors,
-                write_cancelled,
-                "DoT connection needs a reset before ensure"
-            );
-            // 欠着的复位也守预算：前面的写入占着锁时不能等过时限；没做完下次再做
-            // An owed reset keeps to the budget too: with writes holding the lock
-            // ahead of it, it must not wait past the deadline; if unfinished, the next
-            // connect does it
-            if timeout(budget, self.reset()).await.is_err() {
-                if write_cancelled {
-                    self.write_cancelled.store(true, Ordering::Release);
-                }
-                anyhow::bail!(
-                    "dot timeout resetting the connection after {}ms",
-                    budget.as_millis()
-                );
-            }
-        }
-
-        // 见 TcpMuxClient::ensure_connection / See TcpMuxClient::ensure_connection
-        let Ok(mut guard) =
-            timeout(budget.saturating_sub(started.elapsed()), self.conn.lock()).await
-        else {
-            anyhow::bail!(
-                "dot timeout waiting for the connection after {}ms",
+        let tls_stream = match timeout(budget, connect).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => anyhow::bail!(
+                "dot connect/handshake timeout after {}ms",
                 budget.as_millis()
-            );
+            ),
         };
-        let budget = budget.saturating_sub(started.elapsed());
-        if guard.is_none() {
-            let permit = self
-                .permit_manager
-                .try_acquire()
-                .ok_or_else(|| anyhow::anyhow!("dot connection limit exceeded"))?;
-
-            let target = {
-                let mut guard = self.target.lock().await;
-                if guard.is_none() {
-                    *guard = Some(parse_dot_target(&self.upstream)?);
-                }
-                guard
-                    .as_ref()
-                    .context("dot target missing after initialization")?
-                    .clone()
-            };
-
-            // Connect and complete the TLS handshake within the budget: an
-            // upstream that accepts and stays silent would otherwise hold the
-            // lock, and every request queued behind it, indefinitely.
-            // 在预算内建连并完成 TLS 握手：accept 后沉默的上游否则会无限期占住锁，
-            // 排在后面的请求一起被钉死。
-            let tls_connector = TlsConnector::from(self.tls_config.clone());
-            let server_name = build_server_name(&target.sni)?;
-            let connect = async {
-                let stream = TcpStream::connect(&*target.connect_addr)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
-
-                let _ = stream.set_nodelay(true);
-                let sock = SockRef::from(&stream);
-                let mut ka = TcpKeepalive::new();
-                ka = ka.with_time(Duration::from_secs(5));
-                ka = ka.with_interval(Duration::from_secs(2));
-                let _ = sock.set_keepalive(true);
-                let _ = sock.set_tcp_keepalive(&ka);
-
-                tls_connector
-                    .connect(server_name, stream)
-                    .await
-                    .context("dot tls handshake failed")
-            };
-            let tls_stream = match timeout(budget, connect).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => anyhow::bail!(
-                    "dot connect/handshake timeout after {}ms",
-                    budget.as_millis()
-                ),
-            };
-
-            let (read_half, write_half) = tokio::io::split(tls_stream);
-            *guard = Some(write_half);
-
-            let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // Create fresh cancellation token for this connection lifecycle
-            // 为此连接生命周期创建新的取消令牌
-            let new_token = CancellationToken::new();
-
-            self.spawn_reader(
-                read_half,
-                new_token.clone(),
-                new_gen,
-                self.generation.clone(),
-            )
-            .await;
-
-            // Store token AFTER spawn so reset() can only cancel a live reader
-            // 在 spawn 之后存储 token，确保 reset() 只能取消已启动的 reader
-            {
-                let mut token_guard = self.read_cancel.lock().await;
-                *token_guard = new_token;
-            }
-
-            let mut conn_permit_guard = self.conn_permit.lock().await;
-            *conn_permit_guard = Some(permit);
-
-            let now = unix_time_millis();
-            self.conn_create_time.store(now, Ordering::Release);
-            self.last_request_time.store(now, Ordering::Release);
-            self.consecutive_errors.store(0, Ordering::Release);
-
-            info!(upstream = %self.upstream, "DoT connection established");
-        }
-
-        Ok(())
-    }
-
-    async fn register_pending(
-        &self,
-        packet: &[u8],
-        original_id: u16,
-        tx: oneshot::Sender<anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<(Bytes, u16)> {
-        // Build complete DoT wire frame (2-byte length prefix + DNS message). Caller writes
-        // it directly without further copying, and the same buffer stays in the pending
-        // entry for the answer's question check, as on UDP.
-        // 构建完整 DoT wire frame（2 字节长度前缀 + DNS 消息）。调用方直接写入、无需二次拷贝；
-        // 同一份缓冲还留在 pending 条目里供应答比对问题，和 UDP 一样。
-        let mut frame = BytesMut::with_capacity(2 + packet.len());
-        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-        frame.extend_from_slice(packet);
-
-        // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
-        // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
-        let conn_guard = self.conn.lock().await;
-        if conn_guard.is_none() {
-            anyhow::bail!("connection closed before registration");
-        }
-
-        let mut tries = 0;
-        let (frame, new_id) = loop {
-            let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
-            tries += 1;
-            if let entry::Entry::Vacant(e) = self.pending.entry(cand) {
-                // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
-                frame[2..4].copy_from_slice(&cand.to_be_bytes());
-                let frame = frame.freeze();
-                e.insert(Pending {
-                    original_id,
-                    frame: frame.clone(),
-                    tx,
-                });
-                break (frame, cand);
-            }
-            // 见 TcpMuxClient::register_pending / See TcpMuxClient::register_pending
-            if tries == 1 && self.pending.len() > u16::MAX as usize {
-                anyhow::bail!("no available dns ids for dot mux");
-            }
-            if tries > u16::MAX as usize {
-                anyhow::bail!("no available dns ids for dot mux");
-            }
-        };
-        drop(conn_guard);
-        Ok((frame, new_id))
-    }
-
-    async fn fail_all_async(
-        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
-        err: anyhow::Error,
-        conn: &Arc<Mutex<Option<DotWriteHalf>>>,
-        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
-    ) {
-        // Hold the connection lock while resetting and draining. register_pending uses the same
-        // lock, so it either registers before this drain or observes the closed connection.
-        let mut conn_guard = conn.lock().await;
-        Self::fail_all_locked(pending, err, &mut conn_guard, conn_permit).await;
-    }
-
-    /// [`fail_all_async`](Self::fail_all_async)，连接锁已经拿在手里 / [`fail_all_async`](Self::fail_all_async) with the connection lock already held
-    async fn fail_all_locked(
-        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
-        err: anyhow::Error,
-        conn_guard: &mut Option<DotWriteHalf>,
-        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
-    ) {
-        let err_msg = err.to_string();
-        *conn_guard = None;
-        let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
-        for key in keys {
-            if let Some((_, p)) = pending.remove(&key) {
-                let _ = p.tx.send(Err(anyhow::anyhow!(err_msg.clone())));
-            }
-        }
-        let mut permit_guard = conn_permit.lock().await;
-        *permit_guard = None;
-    }
-
-    /// Reset connection: cancel reader task, then drop write half, fail every
-    /// waiting query and release permit
-    /// 重置连接：取消 reader 任务，然后丢弃写半部、让所有等待中的查询失败并释放许可
-    ///
-    /// The cancellation token interrupts the reader's blocked read so it
-    /// exits immediately instead of leaking the TLS connection. With the reader
-    /// gone nothing can answer the queries still waiting on this connection, so
-    /// they are failed at once: each can then retry over a fresh connection
-    /// instead of sitting out its whole deadline and resetting the next
-    /// connection in turn.
-    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏 TLS 连接。reader 没了，
-    /// 这条连接上还在等的查询再也等不到回答，所以立刻让它们失败：各自可以换新连接重发，
-    /// 而不是干等到截止时间、再轮流把下一条连接也重置掉。
-    async fn reset(&self) {
-        self.read_cancel.lock().await.cancel();
-        Self::fail_all_async(
-            &self.pending,
-            anyhow::anyhow!("DoT connection reset"),
-            &self.conn,
-            &self.conn_permit,
-        )
-        .await;
-    }
-
-    /// 见 [`TcpMuxClient::reset_after_deadline`] / See [`TcpMuxClient::reset_after_deadline`]
-    async fn reset_after_deadline(&self) {
-        let Ok(mut conn) = self.conn.try_lock() else {
-            self.consecutive_errors.fetch_add(1, Ordering::Release);
-            return;
-        };
-        self.read_cancel.lock().await.cancel();
-        Self::fail_all_locked(
-            &self.pending,
-            anyhow::anyhow!("DoT connection reset"),
-            &mut conn,
-            &self.conn_permit,
-        )
-        .await;
-        self.consecutive_errors.store(0, Ordering::Release);
+        Ok(tokio::io::split(tls_stream))
     }
 }
 
@@ -5825,26 +5162,7 @@ mod tests {
         async fn hold_connection(&self, hold: Duration);
     }
 
-    impl StreamMux for TcpMuxClient {
-        async fn query(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
-            self.send(packet, timeout_dur).await
-        }
-        fn connection_generation(&self) -> u64 {
-            self.generation.load(Ordering::Acquire)
-        }
-        async fn drop_connection(&self) {
-            self.reset().await;
-        }
-        fn pending(&self) -> &DashMap<u16, Pending, FxBuildHasher> {
-            &self.pending
-        }
-        async fn hold_connection(&self, hold: Duration) {
-            let _held = self.conn.lock().await;
-            tokio::time::sleep(hold).await;
-        }
-    }
-
-    impl StreamMux for DotMuxClient {
+    impl<T: StreamTransport> StreamMux for StreamMuxClient<T> {
         async fn query(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
             self.send(packet, timeout_dur).await
         }
@@ -6464,14 +5782,7 @@ mod tests {
     async fn dropping_a_dot_pool_closes_its_connection() {
         let (server, client_tls) = localhost_tls(&[]);
         let (addr, mut closed) = upstream_noting_closes(Some(server)).await;
-        let mux = DotMultiplexer {
-            pools: dashmap::DashMap::with_hasher(FxBuildHasher),
-            pool_size: 2,
-            tls_config: Arc::new(client_tls),
-            health_error_threshold: 3,
-            max_age_secs: 300,
-            idle_timeout_secs: 60,
-        };
+        let mux = DotMultiplexer::with_shared(Arc::new(client_tls), 2, 3, 300, 60);
         mux.send(
             &udp_test_query("a.example"),
             &format!("{addr}?sni=localhost"),
