@@ -10,7 +10,7 @@
 //! 热路径（缓存命中 / 静态响应）完全不受影响。
 
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
@@ -297,29 +297,13 @@ fn strip_ecs(packet: &[u8]) -> Vec<u8> {
 /// Private addresses must never be leaked via ECS.
 /// 私有地址绝不能通过 ECS 泄露。
 pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private()       // RFC 1918: 10/8, 172.16/12, 192.168/16
-            || v4.is_loopback()   // 127/8
-            || v4.is_link_local() // 169.254/16
-            || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()                    // ::1
-            || v6.is_unspecified()              // ::
-            || is_ula_v6(v6)                    // fc00::/7 (RFC 4193)
-            || v6.is_unicast_link_local() // fe80::/10
-        }
-    }
-}
-
-/// Check if IPv6 address is Unique Local Address (ULA, fc00::/7).
-/// 检查 IPv6 地址是否为唯一本地地址 (ULA, fc00::/7)。
-fn is_ula_v6(v6: &Ipv6Addr) -> bool {
-    // ULA range: fc00::/7 — check first byte's top 7 bits
-    // ULA 范围：fc00::/7 — 检查首字节的高 7 位
-    let octets = v6.octets();
-    (octets[0] & 0xFE) == 0xFC
+    // 0.0.0.0 不是哪台主机的地址，拿它算出子网发给上游说明不了客户端在哪里，所以 ECS 一直把它
+    // 当作内网地址；geoip_private 那边不算（见 `matcher::geoip::is_private_ip`）
+    // 0.0.0.0 is no host's address, and a subnet worked out from it says nothing about
+    // where the client is, so ECS has always counted it as a local network one;
+    // geoip_private does not (see `matcher::geoip::is_private_ip`)
+    crate::matcher::geoip::is_local_network(*ip)
+        || matches!(ip, IpAddr::V4(v4) if v4.is_unspecified())
 }
 
 // ============================================================================
@@ -589,7 +573,7 @@ mod tests {
     #[test]
     fn test_inject_ecs_v6() {
         let query = make_query("example.com", 0x1234);
-        let v6: Ipv6Addr = "2001:db8:abcd:1234::5".parse().unwrap();
+        let v6: std::net::Ipv6Addr = "2001:db8:abcd:1234::5".parse().unwrap();
         let modified = inject_ecs(&query, EcsKey::from_ip(IpAddr::V6(v6), 56, 56));
 
         assert!(has_ecs(&modified));
