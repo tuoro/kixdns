@@ -358,6 +358,14 @@ fn is_plain_name_byte(byte: u8) -> bool {
     byte.is_ascii_graphic() && byte != b'.' && byte != b'\\'
 }
 
+/// 报文带的 EDNS 版本（OPT 的 TTL 字段第二个字节）；没有 OPT 或报文读不出来时为 None
+/// The EDNS version a message carries (the second byte of the OPT's TTL field); None
+/// without an OPT, or when the message cannot be read
+pub(crate) fn edns_version(packet: &[u8]) -> Option<u8> {
+    let opt = find_opt(packet).ok()??;
+    Some(packet[opt.extended_rcode_at + 1])
+}
+
 /// 请求的 EDNS 版本不受支持时的回答（RFC 6891 第 6.1.3 节）：RCODE 为 BADVERS（16：头部写低 4 位的
 /// 0，OPT 里的扩展 RCODE 写 1），OPT 写 KixDNS 支持的版本 0，问题段照抄。请求读不出问题段时为 None。
 /// The answer when the request's EDNS version is not supported (RFC 6891 section 6.1.3):
