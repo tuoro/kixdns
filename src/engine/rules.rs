@@ -698,10 +698,10 @@ pub(crate) async fn process_response_jump(
     // The request's own entries: the ones it held before the jump and the ones
     // it registers on the way. Waiting on one waits on itself, since only this
     // request answers it, and the query hangs until the client gives up; it
-    // forwards by itself instead, as `handle_forward_decision` does with a held
+    // forwards by itself instead, as `handle_forward_decision_logged` does with a held
     // entry. Other requests' entries are still joined.
     // 请求自己的条目：跳转前握着的，和一路上登记的。等它就是等自己（只有这个请求
-    // 会应答它），查询会一直挂到客户端放弃；改为自己转发，和 `handle_forward_decision`
+    // 会应答它），查询会一直挂到客户端放弃；改为自己转发，和 `handle_forward_decision_logged`
     // 对握着的条目的做法一样。别的请求的条目照旧合并等待。
     let holds = |inflight_hashes: &[u64], hash: u64| {
         inflight_hashes.contains(&hash) || held_inflight.contains(&Some(hash))

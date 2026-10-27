@@ -9,7 +9,7 @@ use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::matcher::RuntimePipelineConfig;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PipelineConfig {
@@ -23,53 +23,12 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub pipelines: Vec<Pipeline>,
 
-    /// 后台刷新专用规则（可选）。如果未配置，将使用默认规则（Any 匹配 + Forward 到原始 upstream）。
-    /// Background refresh dedicated rule (optional). If not configured, will use default rule (Any matcher + Forward to original upstream).
-    ///
-    /// # Purpose
-    ///
-    /// 为后台刷新提供独立的规则配置，允许自定义后台刷新的行为。
-    /// Provide independent rule configuration for background refresh, allowing custom behavior.
-    ///
-    /// # Design Philosophy
-    ///
-    /// **后台刷新 = 调用 handle_packet(skip_cache=true)**
-    ///
-    /// 后台刷新本质上就是向规则引擎发起一个特殊的查询请求，
-    /// 使用"后台刷新专用规则"，完全复用规则引擎的所有逻辑。
-    ///
-    /// **Background refresh = Call handle_packet(skip_cache=true)**
-    ///
-    /// 后台刷新与正常查询的唯一区别：
-    /// - 正常查询：检查缓存 → 规则引擎 → 执行查询
-    /// - 后台刷新：跳过缓存 → 规则引擎 → 执行查询
-    ///
-    /// # Example
-    ///
-    /// ```json
-    /// {
-    ///   "background_refresh_rule": {
-    ///     "name": "后台刷新专用规则",
-    ///     "matchers": [
-    ///       {
-    ///         "type": "any",
-    ///         "operator": "and"
-    ///       }
-    ///     ],
-    ///     "actions": [
-    ///       {
-    ///         "type": "forward",
-    ///         "upstream": "8.8.8.8:53",  // 将在运行时替换为实际 upstream
-    ///         "transport": "tcp"
-    ///       }
-    ///     ],
-    ///     "response_matchers": [],
-    ///     "response_matcher_operator": "and",
-    ///     "response_actions_on_match": [],
-    ///     "response_actions_on_miss": []
-    ///   }
-    /// }
-    /// ```
+    /// 旧配置里的后台刷新专用规则。照样能读，但不会生效：后台刷新按原请求走过的规则重放（见
+    /// `engine::refresh`）。写了它，启动和每次重载时各记一条 warn（见 [`warn_ignored_settings`]）。
+    /// The background refresh rule of older configurations. It is still read but never
+    /// takes effect: a background refresh replays the original request through the rules
+    /// it went through (see `engine::refresh`). When present, startup and every reload log
+    /// a warn (see [`warn_ignored_settings`]).
     #[serde(default)]
     pub background_refresh_rule: Option<Rule>,
 }
@@ -984,10 +943,6 @@ fn default_match_operator() -> MatchOperator {
     MatchOperator::And
 }
 
-pub fn load_config(path: &Path) -> Result<PipelineConfig> {
-    load_config_with_source(path).map(|(cfg, _)| cfg)
-}
-
 /// Load the configuration file at `path` and return it together with the
 /// text it was parsed from, so callers can fingerprint the active
 /// configuration. / 加载配置文件并连同原始文本一起返回，便于调用方计算指纹。
@@ -1331,11 +1286,11 @@ pub enum EcsMode {
 }
 
 fn default_ecs_prefix_v4() -> u8 {
-    24 // RFC 7871 §11.1 recommended default
+    crate::ecs::DEFAULT_PREFIX_V4
 }
 
 fn default_ecs_prefix_v6() -> u8 {
-    56 // Common ISP allocation boundary
+    crate::ecs::DEFAULT_PREFIX_V6
 }
 
 /// Summary of a configuration that passed [`validate`].
@@ -1429,12 +1384,18 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             });
         }
     }
-    if let Some(rule) = &cfg.background_refresh_rule {
-        rule_problems(rule, &pipelines, |problem| {
-            found.push(format!("background_refresh_rule: {problem}"))
-        });
-    }
     found
+}
+
+/// 照样能读、但不会生效的配置项：启动和每次重载时各记一条 warn，不算 [`problems`]
+/// Settings still read but never in effect: each gets a warn at startup and on every
+/// reload, and none counts among [`problems`]
+pub fn warn_ignored_settings(cfg: &PipelineConfig) {
+    if cfg.background_refresh_rule.is_some() {
+        warn!(
+            "background_refresh_rule has no effect: a background refresh replays the original request through its own rules; the entry can be removed"
+        );
+    }
 }
 
 /// [`problems`] 有一条就失败，列出全部 / Fail on any of [`problems`], listing them all
@@ -1769,6 +1730,51 @@ mod validation_tests {
                 .any(|problem| problem.contains("matches every name")),
             "{found:#?}"
         );
+    }
+
+    /// ECS 没写前缀时的默认值：from_client_ip 是 IPv4 24、IPv6 56，static 是 24
+    /// The ECS prefixes when none is written: 24 for IPv4 and 56 for IPv6 with
+    /// from_client_ip, 24 with static
+    #[test]
+    fn ecs_prefixes_default_to_24_and_56() {
+        let from_client: super::EcsMode =
+            serde_json::from_value(serde_json::json!({ "mode": "from_client_ip" })).unwrap();
+        assert!(
+            matches!(
+                from_client,
+                super::EcsMode::FromClientIp {
+                    prefix_v4: 24,
+                    prefix_v6: 56
+                }
+            ),
+            "{from_client:?}"
+        );
+        let fixed: super::EcsMode =
+            serde_json::from_value(serde_json::json!({ "mode": "static", "ip": "192.0.2.1" }))
+                .unwrap();
+        assert!(
+            matches!(fixed, super::EcsMode::Static { prefix: 24, .. }),
+            "{fixed:?}"
+        );
+    }
+
+    /// 旧配置里的 background_refresh_rule 不会生效，所以不算问题：配置照样通过检查，规则本身写得
+    /// 对不对都一样（这里它跳去一个不存在的 pipeline）
+    /// A background_refresh_rule from an older configuration never takes effect, so it is
+    /// no problem: the configuration passes the check whether or not the rule itself is
+    /// written right (here it jumps to a pipeline that does not exist)
+    #[test]
+    fn a_background_refresh_rule_is_no_problem() {
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [],
+            "background_refresh_rule": rule(
+                "refresh",
+                serde_json::json!([{ "type": "any" }]),
+                serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "gone" }])
+            )
+        });
+        assert_eq!(problems_of(config), Vec::<String>::new());
     }
 
     /// 一个上游也没写的转发（`upstream` 写成空的）、空的 default_upstream，每个查询都必然失败，改配置

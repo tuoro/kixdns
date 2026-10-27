@@ -1113,44 +1113,6 @@ impl RuntimePipelineConfig {
             }
         }
 
-        // ✅ 新增：处理后台刷新专用规则
-        // ✅ New: Process background refresh dedicated rule
-        // Note: Currently unused, reserved for future implementation
-        let _background_refresh_rule = match cfg.background_refresh_rule {
-            Some(rule) => {
-                // 转换配置的规则为运行时规则
-                // Convert configured rule to runtime rule
-                let mut matchers = Vec::new();
-                for m in rule.matchers {
-                    matchers.push(RuntimeMatcherWithOp {
-                        operator: m.operator,
-                        matcher: RuntimeMatcher::from_config(m.matcher)?,
-                    });
-                }
-
-                let mut response_matchers = Vec::new();
-                for rm in rule.response_matchers {
-                    response_matchers.push(RuntimeResponseMatcherWithOp {
-                        operator: rm.operator,
-                        matcher: RuntimeResponseMatcher::from_config(rm.matcher)?,
-                    });
-                }
-
-                Some(RuntimeRule {
-                    name: Arc::from(rule.name),
-                    matcher_operator: rule.matcher_operator,
-                    matchers,
-                    actions: rule.actions,
-                    response_matchers,
-                    response_matcher_operator: rule.response_matcher_operator,
-                    response_actions_on_match: rule.response_actions_on_match,
-                    response_actions_on_miss: rule.response_actions_on_miss,
-                    merged_forward: rule.merged_forward,
-                })
-            }
-            None => None, // 未配置，将在 Engine::new 中使用默认规则
-        };
-
         // Build O(1) pipeline id lookup index / 构建 O(1) pipeline id 查找索引
         let pipeline_id_index: FxHashMap<Arc<str>, usize> = pipelines
             .iter()
@@ -1172,7 +1134,6 @@ impl RuntimePipelineConfig {
             pipeline_select,
             pipelines,
             pipeline_id_index,
-            // background_refresh_rule,  // ✅ 暂时注释，等待 RuntimePipelineConfig 结构更新
         })
     }
 
@@ -1363,70 +1324,6 @@ impl RuntimeMatcher {
     }
 
     #[inline]
-    pub fn matches(
-        &self,
-        qname: &str,
-        qclass: DNSClass,
-        client_ip: IpAddr,
-        edns_present: bool,
-    ) -> bool {
-        self.matches_with_geoip(qname, qclass, client_ip, edns_present, None, None)
-    }
-
-    #[inline]
-    pub fn matches_with_geoip(
-        &self,
-        qname: &str,
-        qclass: DNSClass,
-        client_ip: IpAddr,
-        edns_present: bool,
-        geoip_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
-        >,
-        geosite_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
-        >,
-    ) -> bool {
-        match self {
-            RuntimeMatcher::Any => true,
-            RuntimeMatcher::DomainExact { value } => {
-                // 完全匹配，大小写不敏感 / Exact match, case insensitive
-                qname.eq_ignore_ascii_case(value)
-            }
-            RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
-            RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
-            RuntimeMatcher::GeoipCountry { country_codes } => {
-                // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager.map(|mgr| mgr.read()).is_some_and(|guard| {
-                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
-                })
-            }
-            RuntimeMatcher::GeoipPrivate { expect } => {
-                crate::matcher::geoip::is_private_ip(client_ip) == *expect
-            }
-            RuntimeMatcher::Qclass { value } => &qclass == value,
-            RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimeMatcher::GeoSite { tag } => {
-                // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
-                geosite_manager
-                    .map(|mgr| mgr.read())
-                    .is_some_and(|guard| matcher_helpers::match_geosite(&guard, qname, tag))
-            }
-            RuntimeMatcher::GeoSiteNot { tag } => {
-                // 按需获取锁：只在GeoSite matcher时才获取
-                if let Some(manager) = geosite_manager {
-                    let guard = manager.read();
-                    !matcher_helpers::match_geosite(&guard, qname, tag)
-                } else {
-                    true // 无GeoSite管理器时，GeoSiteNot返回true
-                }
-            }
-            RuntimeMatcher::Qtype { .. } => false, // Qtype matching requires qtype parameter
-        }
-    }
-
-    #[inline]
     pub fn matches_with_qtype(
         &self,
         qname: &str,
@@ -1557,32 +1454,6 @@ impl RuntimePipelineSelectorMatcher {
         })
     }
 
-    #[inline]
-    pub fn matches(
-        &self,
-        listener_label: &str,
-        client_ip: IpAddr,
-        qname: &str,
-        qclass: DNSClass,
-        edns_present: bool,
-        geoip_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
-        >,
-        geosite_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
-        >,
-    ) -> bool {
-        let query = PipelineSelectorQuery {
-            listener_label,
-            client_ip,
-            qname,
-            qclass,
-            edns_present,
-            qtype: hickory_proto::rr::RecordType::A,
-        };
-        self.matches_with_qtype(&query, geoip_manager, geosite_manager)
-    }
-
     /// Returns true if this matcher requires the GeoSite manager to evaluate.
     /// Used to skip unnecessary RwLock acquisition in the hot path.
     ///
@@ -1654,81 +1525,6 @@ impl RuntimePipelineSelectorMatcher {
             }
             RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
         }
-    }
-
-    #[inline]
-    pub fn matches_with_qtype(
-        &self,
-        query: &PipelineSelectorQuery<'_>,
-        geoip_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
-        >,
-        geosite_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
-        >,
-    ) -> bool {
-        let PipelineSelectorQuery {
-            listener_label,
-            client_ip,
-            qname,
-            qclass,
-            edns_present,
-            qtype,
-        } = *query;
-
-        match self {
-            RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
-                value.eq_ignore_ascii_case(listener_label)
-            }
-            RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
-                domain_suffix_matches(qname, value)
-            }
-            RuntimePipelineSelectorMatcher::DomainExact { value } => {
-                qname.eq_ignore_ascii_case(value)
-            }
-            RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
-            RuntimePipelineSelectorMatcher::Any => true,
-            RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
-            RuntimePipelineSelectorMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimePipelineSelectorMatcher::GeoSite { tag } => {
-                // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
-                geosite_manager
-                    .map(|mgr| mgr.read())
-                    .is_some_and(|guard| guard.matches(tag, qname))
-            }
-            RuntimePipelineSelectorMatcher::GeoSiteNot { tag } => {
-                // 按需获取锁：只在GeoSite matcher时才获取
-                if let Some(manager) = geosite_manager {
-                    let guard = manager.read();
-                    !guard.matches(tag, qname)
-                } else {
-                    false
-                }
-            }
-            RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager
-                    .map(|mgr| mgr.read())
-                    .is_some_and(|guard| guard.matches_any_tag(client_ip, country_codes))
-            }
-            RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
-                crate::matcher::geoip::is_private_ip(client_ip) == *expect
-            }
-            RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[inline]
-pub fn apply_match_operator(op: &MatchOperator, mut results: impl Iterator<Item = bool>) -> bool {
-    match op {
-        MatchOperator::And => results.all(|b| b),
-        MatchOperator::Or => results.any(|b| b),
-        MatchOperator::AndNot => !results.any(|b| b),
-        MatchOperator::OrNot => !results.all(|b| b),
-        MatchOperator::Not => !results.any(|b| b),
     }
 }
 

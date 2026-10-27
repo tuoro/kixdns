@@ -4,7 +4,6 @@ pub mod doh_server;
 pub mod ecs;
 pub mod ecs_scope;
 pub mod engine;
-pub mod error_utils;
 pub mod lock;
 pub mod matcher;
 pub mod observe;

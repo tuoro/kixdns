@@ -789,25 +789,6 @@ fn is_one_of(tag: &str, tags: &[String]) -> bool {
     tags.iter().any(|wanted| wanted.eq_ignore_ascii_case(tag))
 }
 
-/// V2Ray .dat 文件格式常量 / V2Ray .dat file format constants
-mod dat_format {
-    /// 文件头魔数 / File header magic number
-    /// Note: Reserved for future dat file format parsing
-    #[allow(dead_code)]
-    pub const HEADER_MAGIC: &[u8; 4] = b"\x0D\x0A\x0D\x0A";
-
-    /// 域名类型常量 / Domain type constants
-    /// Note: Reserved for future use in dat file parsing
-    #[allow(dead_code)]
-    pub const TYPE_FULL: u8 = 0x01; // 完整匹配 / Full match
-    #[allow(dead_code)]
-    pub const TYPE_SUBDOMAIN: u8 = 0x02; // 子域名匹配 / Subdomain match
-    #[allow(dead_code)]
-    pub const TYPE_KEYWORD: u8 = 0x03; // 关键词匹配 / Keyword match
-    #[allow(dead_code)]
-    pub const TYPE_REGEX: u8 = 0x04; // 正则匹配 / Regex match
-}
-
 /// V2Ray GeoSite 数据格式 / V2Ray GeoSite data format
 #[derive(Debug, Clone, Deserialize)]
 pub struct V2RayGeoSite {
@@ -822,19 +803,6 @@ pub struct V2RayGeoSite {
 pub struct V2RayGeoSiteList {
     /// GeoSite 条目列表 / GeoSite entries
     pub entries: Vec<V2RayGeoSite>,
-}
-
-/// .dat 文件索引条目 / .dat file index entry
-/// Note: Reserved for future optimization of dat file parsing
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct DatIndexEntry {
-    /// Tag 名称 / Tag name
-    tag: String,
-    /// 在数据段中的偏移量 / Offset in data section
-    offset: u32,
-    /// 数据长度 / Data length
-    length: u32,
 }
 
 /// Split a GeoSite tag with optional `@attr` filter into (base, Option<attr>)
@@ -1584,74 +1552,6 @@ impl GeoSiteManager {
         Ok(parsed)
     }
 
-    /// 解析 .dat 格式的域名列表 / Parse domain list in .dat format
-    /// Note: Reserved for future use in dat file parsing
-    #[allow(dead_code)]
-    #[allow(clippy::regex_creation_in_loops)]
-    fn parse_dat_domain_list(&self, data: &[u8]) -> anyhow::Result<Vec<DomainMatcher>> {
-        let mut matchers = Vec::new();
-        let mut pos = 0;
-
-        while pos < data.len() {
-            // 读取域名类型 / Read domain type
-            let domain_type = data[pos];
-            pos += 1;
-
-            // 读取域名长度 / Read domain length
-            if pos + 2 > data.len() {
-                break;
-            }
-            let domain_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-
-            if pos + domain_len > data.len() {
-                anyhow::bail!("invalid domain data: incomplete domain string");
-            }
-
-            // 读取域名字符串 / Read domain string
-            let domain = String::from_utf8_lossy(&data[pos..pos + domain_len]).to_string();
-            pos += domain_len;
-
-            // 根据类型创建匹配器 / Create matcher based on type
-            let matcher = match domain_type {
-                dat_format::TYPE_FULL => DomainMatcher::Full(domain),
-                dat_format::TYPE_SUBDOMAIN => DomainMatcher::Suffix(domain),
-                dat_format::TYPE_KEYWORD => DomainMatcher::Keyword(domain),
-                dat_format::TYPE_REGEX => match compile_geosite_regex(&domain) {
-                    Ok(re) => DomainMatcher::Regex(re),
-                    Err(err) => {
-                        warn!(target = "geosite", pattern = %domain, error = %err,
-                                 "invalid regex pattern, using empty regex");
-                        DomainMatcher::Regex(Regex::new(r"^$").unwrap())
-                    }
-                },
-                _ => {
-                    warn!(target = "geosite", type = domain_type, 
-                         "unknown domain type, using suffix matcher");
-                    DomainMatcher::Suffix(domain)
-                }
-            };
-
-            matchers.push(matcher);
-        }
-
-        Ok(matchers)
-    }
-
-    /// 解析 V2Ray protobuf 格式的 Domain 消息列表 / Parse V2Ray protobuf format Domain message list
-    ///
-    /// V2Ray .dat 文件中的 domains 字段是 repeated Domain 消息
-    /// The domains field in V2Ray .dat file is repeated Domain messages
-    /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
-    /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
-    /// 解析 V2Ray protobuf 格式的 Domain 消息列表 / Parse V2Ray protobuf format Domain message list
-    ///
-    /// V2Ray .dat 文件中的 domains 字段是 repeated Domain 消息
-    /// The domains field in V2Ray .dat file is repeated Domain messages
-    /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
-    /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
-    /// Returns (DomainMatcher, attribute_keys) pairs — attribute keys enable `@attr` filtering
-    #[allow(clippy::regex_creation_in_loops)]
     /// 一个 GeoSite 条目里（从 `file` 当前位置到 `entry_end`）完整域名和后缀各有几条、共多长，好一次
     /// 分配到位；只读类型和值的长度，属性筛选不计，所以带 `@` 的 tag 只会多留一些容量（见
     /// [`TagBuilder::finish`]）
@@ -1787,6 +1687,14 @@ impl GeoSiteManager {
         Ok(domain)
     }
 
+    /// 解析 V2Ray protobuf 格式的 Domain 消息列表 / Parse V2Ray protobuf format Domain message list
+    ///
+    /// V2Ray .dat 文件中的 domains 字段是 repeated Domain 消息
+    /// The domains field in V2Ray .dat file is repeated Domain messages
+    /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
+    /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
+    /// Returns (DomainMatcher, attribute_keys) pairs — attribute keys enable `@attr` filtering
+    #[allow(clippy::regex_creation_in_loops)]
     fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DatEntry, Vec<String>)>> {
         tracing::debug!(
             target = "geosite",

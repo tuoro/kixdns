@@ -675,11 +675,6 @@ impl PanelMetrics {
     }
 
     #[inline]
-    pub fn record_request(&self) {
-        self.requests_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
     fn record_query(&self, domain: &str, client: IpAddr) {
         if self.collect_rankings {
             self.query_stats.record(domain, client);

@@ -37,6 +37,7 @@ pub fn spawn(path: PathBuf, engine: Engine) {
                 // What startup only warns about, a reload refuses (see config::problems)
                 let result = config::load_config_with_source(&path).and_then(|(cfg, raw)| {
                     config::refuse_problems(&cfg)?;
+                    config::warn_ignored_settings(&cfg);
                     RuntimePipelineConfig::from_config(cfg).map(|cfg| (cfg, raw))
                 });
                 if observed && let Err(err) = &result {

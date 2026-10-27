@@ -2,11 +2,11 @@
 //! EDNS 客户端子网 (ECS) wire 操作 — RFC 7871
 //!
 //! Provides request-side ECS injection/stripping for the `Forward` action.
-//! Only runs on cache-miss path (inside `handle_forward_decision`), so the
+//! Only runs on cache-miss path (inside `handle_forward_decision_logged`), so the
 //! hot path (cache hit / static response) is never affected.
 //!
 //! 为 `Forward` 动作提供请求侧 ECS 注入/剥离。
-//! 仅在缓存未命中路径（`handle_forward_decision` 内部）执行，
+//! 仅在缓存未命中路径（`handle_forward_decision_logged` 内部）执行，
 //! 热路径（缓存命中 / 静态响应）完全不受影响。
 
 use std::hash::{Hash, Hasher};
