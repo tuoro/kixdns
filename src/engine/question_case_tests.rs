@@ -77,8 +77,11 @@ async fn upstream(spelling: Spelling, delay: Duration) -> Upstream {
     Upstream { address, queries }
 }
 
-/// 名字以 `matched.test` 结尾的请求得到静态的 [`STATIC`]，其余转发给 `upstream`
-/// A name ending in `matched.test` gets the static [`STATIC`]; the rest go to `upstream`
+/// 名字以 `matched.test` 结尾的请求得到静态的 [`STATIC`]，以 `text.test` 结尾的得到静态 TXT（它不能
+/// 预先算好，第一次走完整路径，之后从规则缓存作答），其余转发给 `upstream`
+/// A name ending in `matched.test` gets the static [`STATIC`], one ending in `text.test` a
+/// static TXT (which cannot be computed ahead, so the full path answers it first and the
+/// rule cache afterwards), and the rest go to `upstream`
 fn engine(upstream: &str) -> Engine {
     let config: crate::config::PipelineConfig = serde_json::from_value(serde_json::json!({
         "settings": {
@@ -95,6 +98,11 @@ fn engine(upstream: &str) -> Engine {
                 "name": "static",
                 "matchers": [{ "type": "domain_suffix", "value": "matched.test" }],
                 "actions": [{ "type": "static_ip_response", "ip": STATIC.to_string() }]
+            },
+            {
+                "name": "text",
+                "matchers": [{ "type": "domain_suffix", "value": "text.test" }],
+                "actions": [{ "type": "static_txt_response", "text": ["hello"] }]
             },
             {
                 "name": "all",
@@ -115,9 +123,14 @@ fn engine(upstream: &str) -> Engine {
 /// An A query for `name`, then `trailing`; the name is written as given
 /// (`Name::from_str` would lowercase it)
 fn query(name: &str, trailing: &[u8]) -> Vec<u8> {
+    query_of_type(name, RecordType::A, trailing)
+}
+
+/// 同上，查询类型为 `qtype` / The same, for `qtype`
+fn query_of_type(name: &str, qtype: RecordType, trailing: &[u8]) -> Vec<u8> {
     let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
     request.metadata.recursion_desired = true;
-    request.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+    request.add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
     let mut packet = request.to_vec().unwrap();
     packet.extend_from_slice(trailing);
     packet
@@ -244,9 +257,9 @@ async fn merged_queries_each_get_their_own_spelling() {
     assert_eq!(up.queries.load(Ordering::SeqCst), 1, "merged");
 }
 
-/// 静态回答拿回客户端的写法，不论是当场构造的、规则缓存里的还是完整路径上的
-/// A static answer goes back with the client's spelling, whether built on the spot,
-/// from the rule cache or on the full path
+/// 静态回答拿回客户端的写法，不论是快速路径当场构造的还是完整路径上的（规则缓存见下一个测试）
+/// A static answer goes back with the client's spelling, whether built on the spot on
+/// the fast path or on the full path (the rule cache has the next test)
 #[tokio::test]
 async fn a_static_answer_goes_back_with_the_askers_spelling() {
     let engine = engine("127.0.0.1:9");
@@ -268,6 +281,33 @@ async fn a_static_answer_goes_back_with_the_askers_spelling() {
             ask(&engine, &query(name, b"")).await,
             answered(name, STATIC)
         );
+    }
+}
+
+/// 规则缓存里的静态回答也拿回客户端的写法
+/// A static answer from the rule cache goes back with the client's spelling too
+#[tokio::test]
+async fn a_static_answer_from_the_rule_cache_goes_back_with_the_askers_spelling() {
+    let engine = engine("127.0.0.1:9");
+    // The full path answers first and caches the rule's decision
+    // 第一次由完整路径作答，并缓存规则的决定
+    ask(
+        &engine,
+        &query_of_type("first.text.test.", RecordType::TXT, b""),
+    )
+    .await;
+    for name in ["WWW.Text.TEST.", "www.TEXT.test.", "first.Text.Test."] {
+        let packet = query_of_type(name, RecordType::TXT, b"");
+        // Asked once on the full path, so the rule cache holds the decision for it
+        // 先在完整路径上问一次，规则缓存里就有了它的决定
+        ask(&engine, &packet).await;
+        let Some(FastPathResponse::Direct(reply)) = engine
+            .handle_packet_fast(&packet, peer())
+            .expect("fast path")
+        else {
+            panic!("{name}: the rule cache answers on the fast path");
+        };
+        assert_eq!(read(&reply).0, name);
     }
 }
 

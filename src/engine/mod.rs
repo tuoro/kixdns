@@ -6,6 +6,8 @@ mod cookie_tests;
 pub mod core;
 #[cfg(test)]
 mod ecs_scope_tests;
+#[cfg(test)]
+mod edns_reply_tests;
 pub mod execution;
 mod geo;
 #[cfg(test)]

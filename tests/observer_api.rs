@@ -389,6 +389,33 @@ fn query(qname: &str) -> Vec<u8> {
     message.to_vec().unwrap()
 }
 
+/// 换一种问法：名字照原样写（`Name::from_str` 会转成小写），带 EDNS，DO 位为 `dnssec_ok`
+/// Asked another way: the name written as given (`Name::from_str` would lowercase it),
+/// with EDNS and the DO bit `dnssec_ok`
+fn query_asked_otherwise(qname: &str, dnssec_ok: bool) -> Vec<u8> {
+    let mut message = Message::new(0x4321, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(
+        Name::from_ascii(qname).unwrap(),
+        RecordType::A,
+    ));
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_max_payload(1232);
+    edns.set_dnssec_ok(dnssec_ok);
+    message.set_edns(edns);
+    message.to_vec().unwrap()
+}
+
+/// 应答的问题名（照写法）和 DO 位（没有 OPT 时为 None）/ A reply's question name, as
+/// written, and its DO bit (None without an OPT)
+fn asked_as(bytes: &[u8]) -> (String, Option<bool>) {
+    let message = Message::from_bytes(bytes).unwrap();
+    (
+        message.queries[0].name().to_string(),
+        message.edns.map(|edns| edns.flags().dnssec_ok),
+    )
+}
+
 fn rcode_of(bytes: &[u8]) -> ResponseCode {
     Message::from_bytes(bytes).unwrap().metadata.response_code
 }
@@ -1904,8 +1931,24 @@ async fn request_finished_lends_the_response_the_engine_produced() {
     else {
         panic!("a static rule must answer on the fast path");
     };
+    // Asked another way, the static answer is lent as it goes to that client
+    // 换一种问法，静态回答按发给那个客户端的样子出借
+    let Some(FastPathResponse::Direct(otherwise)) = engine
+        .handle_packet_fast(&query_asked_otherwise("Other.EXAMPLE", true), peer())
+        .unwrap()
+    else {
+        panic!("a static rule must answer on the fast path");
+    };
+    assert_eq!(
+        asked_as(&otherwise),
+        ("Other.EXAMPLE.".to_string(), Some(true))
+    );
     let events = recorder.events();
-    for (qname, sent) in [("slow.example", &slow[..]), ("fast.example", &fast[..])] {
+    for (qname, sent) in [
+        ("slow.example", &slow[..]),
+        ("fast.example", &fast[..]),
+        ("other.example", &otherwise[..]),
+    ] {
         let outcome = recorder.outcome(request_id_for(&events, qname));
         assert_eq!(outcome.status, RequestStatus::Completed);
         assert_eq!(outcome.response.as_deref(), Some(sent), "{qname}");
@@ -1957,6 +2000,34 @@ async fn request_finished_lends_the_response_the_engine_produced() {
     assert_eq!(
         recorder.outcome(ids[1]).response.as_deref(),
         Some(&cached[..])
+    );
+    // Asked another way, the cached answer is lent as it goes to that client (DO=1 would
+    // be another cache key)
+    // 换一种问法，缓存里的应答按发给那个客户端的样子出借（DO=1 就是另一个缓存键了）
+    let Some(FastPathResponse::CacheHit {
+        cached: otherwise, ..
+    }) = engine
+        .handle_packet_fast(&query_asked_otherwise("CACHED.Example", false), peer())
+        .unwrap()
+    else {
+        panic!("a query asked another way must be a fast-path cache hit");
+    };
+    assert_eq!(
+        asked_as(&otherwise),
+        ("CACHED.Example.".to_string(), Some(false))
+    );
+    let events = recorder.events();
+    let last = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Started { id, qname, .. } if qname == "cached.example" => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        recorder.outcome(last).response.as_deref(),
+        Some(&otherwise[..])
     );
     task.abort();
 }

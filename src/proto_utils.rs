@@ -439,6 +439,117 @@ pub(crate) fn question_matches(query: &[u8], response: &[u8]) -> bool {
         && query[12..query_name_end].eq_ignore_ascii_case(&response[12..response_name_end])
 }
 
+/// 交给客户端的应答，按标准要求照抄查询的部分都照 `query` 写：问题名的写法（见
+/// [`question_as_asked`]）、RD 和 CD 位（见 [`header_as_asked`]）、带不带 OPT 和 DO 位（见
+/// [`edns_as_asked`]）。缓存里的、合并的在途查询拿到的应答都是别的客户端问的样子，KixDNS 自己
+/// 构造的回答（静态回答、SERVFAIL）也不一定照抄了这些。什么都不用改时不复制。
+/// The reply for a client, with what the standards have copied from the query
+/// written as `query` has it: the question name's spelling (see
+/// [`question_as_asked`]), the RD and CD bits (see [`header_as_asked`]), and whether an
+/// OPT comes back and its DO bit (see [`edns_as_asked`]). An answer from the cache or
+/// handed to a merged inflight query is shaped as another client asked, and answers
+/// KixDNS builds itself (static answers, SERVFAIL) do not always copy these either.
+/// Nothing is copied when nothing changes.
+pub(crate) fn reply_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    edns_as_asked(
+        header_as_asked(question_as_asked(reply, query), query),
+        query,
+    )
+}
+
+/// 应答的 RD 位（RFC 1035 第 4.1.1 节）和 CD 位（RFC 4035 第 3.2.2 节）照抄查询的
+/// The reply with the query's RD bit (RFC 1035 section 4.1.1) and CD bit (RFC 4035
+/// section 3.2.2)
+fn header_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    if reply.len() < 12 || query.len() < 12 {
+        return reply;
+    }
+    let (rd, cd) = (query[2] & 0x01, query[3] & 0x10);
+    if reply[2] & 0x01 == rd && reply[3] & 0x10 == cd {
+        return reply;
+    }
+    let mut copy = BytesMut::from(&reply[..]);
+    copy[2] = (copy[2] & !0x01) | rd;
+    copy[3] = (copy[3] & !0x10) | cd;
+    copy.freeze()
+}
+
+/// 应答的 EDNS 跟着查询走（RFC 6891）：查询带 OPT，应答就带（第 6.1.1 节），没有时在末尾补一条；
+/// 查询不带，应答就不带（第 7 节），有就去掉；DO 位照抄查询（RFC 3225 第 3 节）。应答的 OPT 带着
+/// 扩展 RCODE 时不去掉，去掉就改了 RCODE；读不出的报文、TSIG 签过的应答原样返回。
+/// The reply's EDNS following the query (RFC 6891): a query with an OPT gets one back
+/// (section 6.1.1), appended when the reply has none; a query without gets none
+/// (section 7), so one is taken out; the DO bit is the query's (RFC 3225 section 3).
+/// An OPT carrying an extended RCODE stays, since taking it out would change the
+/// RCODE; a message that cannot be read, or a reply signed with TSIG, is left as it is.
+pub(crate) fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    let asked_dnssec_ok = match find_opt(query) {
+        Ok(Some(opt)) => Some(query[opt.extended_rcode_at + 2] & 0x80 != 0),
+        Ok(None) => None,
+        Err(()) => return reply,
+    };
+    let Ok(opt) = find_opt(&reply) else {
+        return reply;
+    };
+    let changed = match (asked_dnssec_ok, opt) {
+        (Some(dnssec_ok), None) => with_opt(&reply, dnssec_ok),
+        (Some(dnssec_ok), Some(opt)) => {
+            let flags_at = opt.extended_rcode_at + 2;
+            ((reply[flags_at] & 0x80 != 0) != dnssec_ok).then(|| {
+                let mut copy = reply.to_vec();
+                copy[flags_at] ^= 0x80;
+                copy
+            })
+        }
+        (None, Some(opt)) if reply[opt.extended_rcode_at] == 0 => without_opt(&reply, &opt),
+        (None, _) => None,
+    };
+    changed.map_or(reply, Bytes::from)
+}
+
+/// 末尾补一条 OPT 的报文：根名、载荷大小 1232、扩展 RCODE 和版本 0、DO 位为 `dnssec_ok`、没有
+/// 选项。读不出或最后一条是 TSIG（它必须排在最后）时为 None。
+/// The message with an OPT appended: root owner, payload size 1232, extended RCODE and
+/// version 0, the DO bit `dnssec_ok`, no options. None when it cannot be read or its
+/// last record is a TSIG, which must stay last.
+fn with_opt(message: &[u8], dnssec_ok: bool) -> Option<Vec<u8>> {
+    let end = valid_message_len(message)?;
+    if last_record_is_tsig(message) {
+        return None;
+    }
+    let ar_count = u16::from_be_bytes([message[10], message[11]]).checked_add(1)?;
+    let mut out = Vec::with_capacity(end + 11);
+    out.extend_from_slice(&message[..end]);
+    out.push(0);
+    out.extend_from_slice(&41u16.to_be_bytes());
+    out.extend_from_slice(&1232u16.to_be_bytes());
+    out.extend_from_slice(&[0, 0, if dnssec_ok { 0x80 } else { 0 }, 0]);
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out[10..12].copy_from_slice(&ar_count.to_be_bytes());
+    Some(out)
+}
+
+/// 去掉 OPT 的报文。OPT 是最后一条记录时直接截掉（见 `OptRecord::last`），否则由 hickory 重新编码；
+/// 读不了、写不出，或者最后一条是 TSIG 时为 None。
+/// The message without its OPT: cut off when it is the last record (see
+/// `OptRecord::last`), encoded again through hickory otherwise. None when it cannot be
+/// read or written, or its last record is a TSIG.
+fn without_opt(message: &[u8], opt: &OptRecord) -> Option<Vec<u8>> {
+    if last_record_is_tsig(message) {
+        return None;
+    }
+    if !opt.last {
+        let mut msg = Message::from_vec(message).ok()?;
+        msg.edns = None;
+        return msg.to_vec().ok();
+    }
+    let ar_count = u16::from_be_bytes([message[10], message[11]]).checked_sub(1)?;
+    let mut out = Vec::with_capacity(message.len());
+    out.extend_from_slice(&message[..opt.start]);
+    out[10..12].copy_from_slice(&ar_count.to_be_bytes());
+    Some(out)
+}
+
 /// 应答的问题名照客户端发来的写法（RFC 1035 第 4.1.1 节：问题段由查询照抄）。两者忽略大小写
 /// 相同（RFC 4343）而写法不同时，把查询里的名字抄进应答：缓存里存的、合并的在途查询拿到的
 /// 都是别的客户端问的写法，静态回答写的是小写，有的上游也会改写大小写，而用 0x20 打乱大小写
@@ -531,6 +642,8 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 
 /// 报文里 OPT 记录的位置 / Where a message's OPT record sits
 struct OptRecord {
+    /// 记录开头（属主名）的偏移 / Offset of the record's start (its owner name)
+    start: usize,
     /// 扩展 RCODE（TTL 字段的第一个字节）的偏移 / Offset of the extended RCODE (the TTL field's first byte)
     extended_rcode_at: usize,
     /// RDLENGTH 字段的偏移 / Offset of the RDLENGTH field
@@ -564,6 +677,7 @@ fn find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
     }
     let mut found = None;
     for index in 0..before_additional + ar_count {
+        let start = pos;
         pos = skip_name(packet, pos).ok_or(())?;
         let fixed_end = pos.checked_add(10).ok_or(())?;
         if fixed_end > packet.len() {
@@ -580,6 +694,7 @@ fn find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
                 return Err(());
             }
             found = Some(OptRecord {
+                start,
                 extended_rcode_at: pos + 4,
                 rdlen_at: pos + 8,
                 rdata: fixed_end..rdata_end,
@@ -2166,6 +2281,151 @@ mod tests {
         compressed.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]);
         for unreadable in [&query[..20], &query[..11], &compressed[..]] {
             assert_eq!(question_as_asked(reply.clone(), unreadable), reply);
+        }
+    }
+
+    /// 一个 A 查询或应答，`edns` 为 Some(DO 位) 时带 OPT / An A query or reply, with an OPT
+    /// when `edns` is Some(the DO bit)
+    fn edns_message(kind: hickory_proto::op::MessageType, edns: Option<bool>) -> Vec<u8> {
+        use hickory_proto::op::{Edns, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, Record, RecordType};
+        let name = Name::from_ascii("example.com.").unwrap();
+        let mut msg = Message::new(0x1234, kind, OpCode::Query);
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+        if kind == hickory_proto::op::MessageType::Response {
+            msg.add_answer(Record::from_rdata(
+                name,
+                300,
+                RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, 1)),
+            ));
+        }
+        if let Some(dnssec_ok) = edns {
+            let mut opt = Edns::new();
+            opt.set_max_payload(1232);
+            opt.set_dnssec_ok(dnssec_ok);
+            msg.set_edns(opt);
+        }
+        msg.to_vec().unwrap()
+    }
+
+    /// 应答带不带 OPT、DO 位是什么（None：没有 OPT）/ Whether a reply has an OPT and its DO bit
+    fn reply_edns(reply: &[u8]) -> Option<bool> {
+        Message::from_vec(reply)
+            .expect("a readable reply")
+            .edns
+            .map(|edns| edns.flags().dnssec_ok)
+    }
+
+    /// 查询带 OPT 时应答补上，DO 照抄；不带时去掉；已经一样时不复制
+    /// A query with an OPT gets one appended with its DO; one without gets it taken out;
+    /// nothing is copied when they already agree
+    #[test]
+    fn edns_as_asked_follows_the_query() {
+        use hickory_proto::op::MessageType::{Query, Response};
+        for query_edns in [None, Some(false), Some(true)] {
+            let query = edns_message(Query, query_edns);
+            for reply_edns_was in [None, Some(false), Some(true)] {
+                let reply = Bytes::from(edns_message(Response, reply_edns_was));
+                let out = edns_as_asked(reply.clone(), &query);
+                let case = format!("query {query_edns:?}, reply {reply_edns_was:?}");
+                assert_eq!(reply_edns(&out), query_edns, "{case}");
+                assert_eq!(
+                    out.as_ptr() == reply.as_ptr(),
+                    query_edns == reply_edns_was,
+                    "{case}: copied only when changed"
+                );
+                // Exactly the OPT changes: the same message as one built that way
+                // 只有 OPT 变了：和直接这样构造的报文一样
+                assert_eq!(out, edns_message(Response, query_edns), "{case}");
+            }
+        }
+    }
+
+    /// OPT 后面还有记录时，经 hickory 去掉 OPT，别的记录都留着
+    /// With records after the OPT, hickory takes the OPT out and keeps the rest
+    #[test]
+    fn edns_as_asked_takes_out_an_opt_that_is_not_last() {
+        use hickory_proto::op::MessageType::{Query, Response};
+        let mut reply = edns_message(Response, Some(false));
+        // An A record after the OPT, its owner pointing at the question
+        // OPT 后面的一条 A 记录，属主指向问题名
+        reply[11] += 1;
+        reply.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 9]);
+        let out = edns_as_asked(Bytes::from(reply), &edns_message(Query, None));
+        let msg = Message::from_vec(&out).unwrap();
+        assert!(msg.edns.is_none());
+        assert_eq!(msg.additionals.len(), 1);
+        assert_eq!(msg.answers.len(), 1);
+    }
+
+    /// 带扩展 RCODE 的 OPT 不去掉，TSIG 签过的应答不动，读不出的查询也不动
+    /// An OPT with an extended RCODE stays, a TSIG-signed reply is left alone, and so is
+    /// everything when the query cannot be read
+    #[test]
+    fn edns_as_asked_leaves_what_it_must_not_change() {
+        use hickory_proto::op::MessageType::{Query, Response};
+        let plain_query = edns_message(Query, None);
+        let edns_query = edns_message(Query, Some(true));
+        // BADVERS: extended RCODE 1 in the OPT / BADVERS：OPT 里的扩展 RCODE 为 1
+        let badvers = badvers_response(&edns_query).unwrap();
+        assert_eq!(edns_as_asked(badvers.clone(), &plain_query), badvers);
+        // A TSIG hickory reads (RFC 8945 section 4.2): key name `key.`, algorithm
+        // hmac-sha256, a 32-byte MAC, the original ID, no error, no other data
+        // 一条 hickory 读得了的 TSIG（RFC 8945 第 4.2 节）：密钥名 `key.`、算法 hmac-sha256、
+        // 32 字节的 MAC、原始 ID、没有错误、没有其他数据
+        let tsig = |mut message: Vec<u8>| {
+            let mut rdata = vec![11];
+            rdata.extend_from_slice(b"hmac-sha256");
+            rdata.push(0);
+            rdata.extend_from_slice(&[0, 0, 0x65, 0, 0, 0, 1, 44, 0, 32]);
+            rdata.extend_from_slice(&[0xAB; 32]);
+            rdata.extend_from_slice(&[0x12, 0x34, 0, 0, 0, 0]);
+            message[11] += 1;
+            message.extend_from_slice(b"\x03key\x00");
+            message.extend_from_slice(&[0, 250, 0, 255, 0, 0, 0, 0]);
+            message.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            message.extend_from_slice(&rdata);
+            assert!(
+                Message::from_vec(&message).is_ok(),
+                "hickory reads the TSIG"
+            );
+            Bytes::from(message)
+        };
+        let signed_with_opt = tsig(edns_message(Response, Some(false)));
+        assert_eq!(
+            edns_as_asked(signed_with_opt.clone(), &plain_query),
+            signed_with_opt
+        );
+        let signed_without_opt = tsig(edns_message(Response, None));
+        assert_eq!(
+            edns_as_asked(signed_without_opt.clone(), &edns_query),
+            signed_without_opt
+        );
+        let reply = Bytes::from(edns_message(Response, Some(false)));
+        assert_eq!(edns_as_asked(reply.clone(), &edns_query[..20]), reply);
+    }
+
+    /// RD 和 CD 照抄查询的，其余头部位不动；已经一样时不复制
+    /// RD and CD are the query's and no other header bit changes; nothing is copied when
+    /// they already agree
+    #[test]
+    fn header_as_asked_copies_rd_and_cd() {
+        let reply = Bytes::from(edns_message(hickory_proto::op::MessageType::Response, None));
+        for (byte2, byte3) in [(0x00, 0x00), (0x01, 0x00), (0x00, 0x10), (0x01, 0x10)] {
+            let mut query = edns_message(hickory_proto::op::MessageType::Query, None);
+            // AA and AD in the query are not copied / 查询里的 AA 和 AD 不照抄
+            query[2] = byte2 | 0x04;
+            query[3] = byte3 | 0x20;
+            let out = header_as_asked(reply.clone(), &query);
+            assert_eq!(out[2] & 0x01, byte2);
+            assert_eq!(out[3] & 0x10, byte3);
+            assert_eq!(out[2] & !0x01, reply[2] & !0x01);
+            assert_eq!(out[3] & !0x10, reply[3] & !0x10);
+            assert_eq!(out[4..], reply[4..]);
+            assert_eq!(
+                out.as_ptr() == reply.as_ptr(),
+                (byte2, byte3) == (reply[2] & 0x01, reply[3] & 0x10)
+            );
         }
     }
 
