@@ -1656,12 +1656,6 @@ fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String
     use hickory_proto::rr::RecordType;
     use std::str::FromStr;
 
-    if domain.len() > 253 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            error_json("diagnostic_domain_invalid", "域名过长"),
-        ));
-    }
     // 和查询日志、规则看到的名字是同一种写法（见 `proto_utils::name_text`）：`\DDD` 是三位十进制，
     // 和 RFC 1035 一样。hickory 自己的解析按八进制读，查询日志里的 `www\046matched.test` 拿来诊断
     // 就成了别的名字
@@ -1669,7 +1663,7 @@ fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String
     // `proto_utils::name_text`): `\DDD` is three decimal digits, as in RFC 1035. hickory's own
     // parser reads them as octal, so `www\046matched.test` from the query log asked for
     // another name
-    let name = crate::proto_utils::name_from_text(domain).ok_or_else(|| {
+    let invalid = || {
         (
             StatusCode::BAD_REQUEST,
             error_json(
@@ -1677,7 +1671,21 @@ fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String
                 "域名无效：标签只能用可打印的 ASCII 字符，其余字节、标签里的点和反斜杠写成 \\DDD（三位十进制）",
             ),
         )
-    })?;
+    };
+    let labels = crate::proto_utils::labels_from_text(domain).ok_or_else(invalid)?;
+    // RFC 1035 第 2.3.4 节：名字在线上最多 255 字节，每个标签带一个长度字节，最后是根。按文本长度量
+    // 不对：\DDD 一个字节要写四个字符
+    // RFC 1035 section 2.3.4: a name is at most 255 bytes on the wire, each label with its
+    // length byte, then the root. Its text is no measure: \DDD writes one byte in four
+    // characters
+    if labels.iter().map(|label| label.len() + 1).sum::<usize>() + 1 > 255 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            error_json("diagnostic_domain_invalid", "域名过长"),
+        ));
+    }
+    let name = hickory_proto::rr::Name::from_labels(labels.iter().map(Vec::as_slice))
+        .map_err(|_| invalid())?;
     let record_type = record_type.trim().to_ascii_uppercase();
     if !matches!(
         record_type.as_str(),
@@ -3303,6 +3311,54 @@ mod diagnostic_tests {
                 "{invalid}"
             );
         }
+    }
+
+    /// 诊断域名的长度按线上字节算（最多 255），不按文本：每个字节都写成 \\DDD 的 255 字节名字，文本
+    /// 有一千多个字符，也照收；多一个字节就是「域名过长」
+    /// A diagnostic domain is measured on the wire (at most 255 bytes), not by its text: a
+    /// 255-byte name with every byte written \\DDD, over a thousand characters, is taken; one
+    /// byte more is 「域名过长」
+    #[test]
+    fn a_diagnostic_domain_is_measured_on_the_wire() {
+        use hickory_proto::op::Message;
+        let escaped = |sizes: &[usize]| {
+            sizes
+                .iter()
+                .map(|&size| r"\255".repeat(size))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let plain = |sizes: &[usize]| {
+            sizes
+                .iter()
+                .zip(b'a'..)
+                .map(|(&size, letter)| (letter as char).to_string().repeat(size))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let longest = escaped(&[63, 63, 63, 61]);
+        assert!(longest.len() > 1000);
+        let plain_longest = plain(&[63, 63, 63, 61]);
+        assert_eq!(plain_longest.len(), 253);
+        for (domain, first) in [(&longest, 0xFF), (&plain_longest, b'a')] {
+            let (packet, _) = diagnostic_packet(domain, "A").expect("a 255-byte name");
+            let message = Message::from_vec(&packet).expect("a readable query");
+            let name = message.queries[0].name();
+            assert_eq!(
+                name.iter().map(<[u8]>::len).collect::<Vec<_>>(),
+                [63, 63, 63, 61]
+            );
+            assert_eq!(name.iter().next().unwrap()[0], first);
+        }
+        for too_long in [escaped(&[63, 63, 63, 62]), plain(&[63, 63, 63, 62])] {
+            let (status, body) = diagnostic_packet(&too_long, "A").expect_err("256 bytes");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "diagnostic_domain_invalid");
+            assert_eq!(body["error"]["message"], "域名过长");
+        }
+        // A label of 64 bytes is invalid, whatever the length / 64 字节的标签无效，与总长无关
+        let (_, body) = diagnostic_packet(&plain(&[64]), "A").expect_err("64-byte label");
+        assert_eq!(body["error"]["code"], "diagnostic_domain_invalid");
     }
 
     #[tokio::test]
