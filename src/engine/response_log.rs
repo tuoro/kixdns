@@ -85,7 +85,14 @@ impl Drop for ResponseLog<'_> {
         if !self.enabled {
             return;
         }
-        let rcode = self.rcode.map(|code| format!("{code:?}"));
+        // 头部和 OPT 合起来的 16 只会是 BADVERS（TSIG 的 BADSIG 写在 TSIG 记录里，头部是 NOTAUTH），
+        // hickory 却把它读成 BADSIG
+        // 16 from the header and the OPT together can only be BADVERS (TSIG's BADSIG goes in
+        // the TSIG record, with NOTAUTH in the header), which hickory reads as BADSIG
+        let rcode = self.rcode.map(|code| match u16::from(code) {
+            16 => "BADVERS".to_owned(),
+            _ => format!("{code:?}"),
+        });
         // Keep the existing target so deployed RUST_LOG filters still work.
         tracing::info!(
             target: "kixdns::engine::phases",
