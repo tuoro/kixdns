@@ -385,13 +385,8 @@ pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
     // 一个问题、一条附加记录（OPT）/ One question, one additional record (the OPT)
     out.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 1]);
     out.extend_from_slice(&query[12..question_end]);
-    // 根名、TYPE OPT、CLASS 即 UDP 载荷大小、扩展 RCODE 1、版本 0、标志 0
-    // Root owner, TYPE OPT, CLASS as the UDP payload size, extended RCODE 1, version 0, flags 0
-    out.push(0);
-    out.extend_from_slice(&41u16.to_be_bytes());
-    out.extend_from_slice(&1232u16.to_be_bytes());
-    out.extend_from_slice(&[1, 0, 0, 0]);
-    out.extend_from_slice(&0u16.to_be_bytes());
+    // 扩展 RCODE 1 / Extended RCODE 1
+    push_opt(&mut out, 1, false, &[]);
     Some(Bytes::from(out))
 }
 
@@ -501,7 +496,7 @@ pub(crate) fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
         return reply;
     };
     let changed = match (asked_dnssec_ok, opt) {
-        (Some(dnssec_ok), None) => with_opt(&reply, dnssec_ok),
+        (Some(dnssec_ok), None) => with_opt(&reply, dnssec_ok, &[]),
         (Some(dnssec_ok), Some(opt)) => {
             let flags_at = opt.extended_rcode_at + 2;
             ((reply[flags_at] & 0x80 != 0) != dnssec_ok).then(|| {
@@ -516,26 +511,36 @@ pub(crate) fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     changed.map_or(reply, Bytes::from)
 }
 
-/// 末尾补一条 OPT 的报文：根名、载荷大小 1232、扩展 RCODE 和版本 0、DO 位为 `dnssec_ok`、没有
-/// 选项。读不出或最后一条是 TSIG（它必须排在最后）时为 None。
-/// The message with an OPT appended: root owner, payload size 1232, extended RCODE and
-/// version 0, the DO bit `dnssec_ok`, no options. None when it cannot be read or its
-/// last record is a TSIG, which must stay last.
-fn with_opt(message: &[u8], dnssec_ok: bool) -> Option<Vec<u8>> {
+/// 末尾补一条 OPT 的报文（扩展 RCODE 0，见 [`push_opt`]），带着选项 `options`。读不出或最后
+/// 一条是 TSIG（它必须排在最后）时为 None。
+/// The message with an OPT appended (extended RCODE 0, see [`push_opt`]) carrying
+/// `options`. None when it cannot be read or its last record is a TSIG, which must stay
+/// last.
+fn with_opt(message: &[u8], dnssec_ok: bool, options: &[u8]) -> Option<Vec<u8>> {
     let end = valid_message_len(message)?;
     if last_record_is_tsig(message) {
         return None;
     }
     let ar_count = u16::from_be_bytes([message[10], message[11]]).checked_add(1)?;
-    let mut out = Vec::with_capacity(end + 11);
+    let mut out = Vec::with_capacity(end + 11 + options.len());
     out.extend_from_slice(&message[..end]);
+    push_opt(&mut out, 0, dnssec_ok, options);
+    out[10..12].copy_from_slice(&ar_count.to_be_bytes());
+    Some(out)
+}
+
+/// 在 `out` 末尾写一条 OPT 记录：根名、TYPE OPT、CLASS 即 UDP 载荷大小 1232、扩展 RCODE
+/// `extended_rcode`、版本 0、DO 位为 `dnssec_ok` 的标志、选项 `options`。选项不超过 65535 字节。
+/// Write an OPT record at the end of `out`: root owner, TYPE OPT, CLASS as the UDP
+/// payload size 1232, extended RCODE `extended_rcode`, version 0, flags with the DO bit
+/// `dnssec_ok`, and `options`, at most 65535 bytes of them.
+fn push_opt(out: &mut Vec<u8>, extended_rcode: u8, dnssec_ok: bool, options: &[u8]) {
     out.push(0);
     out.extend_from_slice(&41u16.to_be_bytes());
     out.extend_from_slice(&1232u16.to_be_bytes());
-    out.extend_from_slice(&[0, 0, if dnssec_ok { 0x80 } else { 0 }, 0]);
-    out.extend_from_slice(&0u16.to_be_bytes());
-    out[10..12].copy_from_slice(&ar_count.to_be_bytes());
-    Some(out)
+    out.extend_from_slice(&[extended_rcode, 0, if dnssec_ok { 0x80 } else { 0 }, 0]);
+    out.extend_from_slice(&(options.len() as u16).to_be_bytes());
+    out.extend_from_slice(options);
 }
 
 /// 去掉 OPT 的报文。OPT 是最后一条记录时直接截掉（见 `OptRecord::last`），否则由 hickory 重新编码；
@@ -1039,25 +1044,7 @@ pub(crate) fn with_ecs_echo(
             out[opt.rdlen_at..opt.rdlen_at + 2].copy_from_slice(&rd_len.to_be_bytes());
             Some(out)
         }
-        None => {
-            let end = valid_message_len(stored)?;
-            if last_record_is_tsig(stored) {
-                return None;
-            }
-            let ar_count = u16::from_be_bytes([stored[10], stored[11]]).checked_add(1)?;
-            let mut out = Vec::with_capacity(end + 11 + option.len());
-            out.extend_from_slice(&stored[..end]);
-            // 根名、TYPE OPT、CLASS 即 UDP 载荷大小、扩展 RCODE 与标志全 0
-            // Root owner, TYPE OPT, CLASS as the UDP payload size, extended RCODE and flags all 0
-            out.push(0);
-            out.extend_from_slice(&41u16.to_be_bytes());
-            out.extend_from_slice(&1232u16.to_be_bytes());
-            out.extend_from_slice(&[0, 0, 0, 0]);
-            out.extend_from_slice(&(option.len() as u16).to_be_bytes());
-            out.extend_from_slice(&option);
-            out[10..12].copy_from_slice(&ar_count.to_be_bytes());
-            Some(out)
-        }
+        None => with_opt(stored, false, &option),
     }
 }
 

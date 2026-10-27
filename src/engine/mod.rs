@@ -26,6 +26,8 @@ pub mod refresh;
 pub mod response;
 pub(crate) mod response_log;
 pub mod rules;
+#[cfg(test)]
+mod test_support;
 pub mod transport;
 pub mod types;
 pub mod upstream;

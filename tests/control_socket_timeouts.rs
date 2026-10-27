@@ -15,34 +15,12 @@
 #![cfg(unix)]
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn free_port() -> u16 {
-    loop {
-        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return port;
-        }
-    }
-}
-
-fn health_answers(path: &Path) -> bool {
-    let attempt = || -> std::io::Result<bool> {
-        let mut stream = UnixStream::connect(path)?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream
-            .write_all(b"GET /v1/health HTTP/1.1\r\nHost: kixdns\r\nConnection: close\r\n\r\n")?;
-        let mut head = [0u8; 12];
-        stream.read_exact(&mut head)?;
-        Ok(head.starts_with(b"HTTP/1.1 200"))
-    };
-    attempt().unwrap_or(false)
-}
+mod common;
+use common::{Kernel, control_answers, free_port};
 
 /// Everything the server sends until it closes, and how long that took; None
 /// when it is still open after `limit`
@@ -66,15 +44,6 @@ fn read_until_closed(stream: &mut UnixStream, limit: Duration) -> Option<(Vec<u8
         }
     }
     None
-}
-
-struct Kernel(Child);
-
-impl Drop for Kernel {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 #[test]
@@ -104,7 +73,7 @@ fn the_control_socket_drops_a_request_that_stops_part_way() {
             .unwrap(),
     );
     let started = Instant::now();
-    while !health_answers(&control) {
+    while !control_answers(&control) {
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "kernel did not start"
@@ -125,7 +94,7 @@ fn the_control_socket_drops_a_request_that_stops_part_way() {
     let mut silent = UnixStream::connect(&control).unwrap();
 
     // 等着的时候，控制通道照常回答别人 / Meanwhile the control socket answers others as usual
-    assert!(health_answers(&control));
+    assert!(control_answers(&control));
 
     // 三条一起等，最多 15 秒 / All three waited on together, 15 s at most
     let limit = Duration::from_secs(15);
@@ -150,5 +119,8 @@ fn the_control_socket_drops_a_request_that_stops_part_way() {
         "a late body is answered 408: {}",
         String::from_utf8_lossy(&reply)
     );
-    assert!(health_answers(&control), "the control socket still answers");
+    assert!(
+        control_answers(&control),
+        "the control socket still answers"
+    );
 }

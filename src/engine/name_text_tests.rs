@@ -4,29 +4,25 @@
 //! `proto_utils::name_text`): a query the fast parser cannot read (trailing bytes, a label
 //! byte that needs an escape) meets the same rules.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::net::Ipv4Addr;
 
-use bytes::Bytes;
 use hickory_proto::op::Message;
-use hickory_proto::rr::{DNSClass, RData, RecordType};
+use hickory_proto::rr::{DNSClass, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use serde_json::json;
 
 use crate::engine::Engine;
-use crate::matcher::RuntimePipelineConfig;
+use crate::engine::test_support::{self as support, engine_from, first_a, peer};
 
 /// 规则命中时的应答 / The answer when the rule matches
 const MATCHED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 50);
 /// 其余请求的应答 / The answer to everything else
 const OTHER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 60);
 
-const CLIENT: &str = "127.0.0.1:53000";
-
 /// 名字以 `matched.test` 结尾的请求得到 [`MATCHED`]，其余得到 [`OTHER`]
 /// A name ending in `matched.test` gets [`MATCHED`], every other one [`OTHER`]
 fn engine() -> Engine {
-    let config: crate::config::PipelineConfig = serde_json::from_value(json!({
+    engine_from(json!({
         "settings": { "default_upstream": "127.0.0.1:9" },
         "pipelines": [{ "id": "main", "rules": [
             {
@@ -41,12 +37,6 @@ fn engine() -> Engine {
             }
         ]}]
     }))
-    .expect("parse config");
-    Engine::new(
-        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-        "test".to_string(),
-    )
-    .expect("engine")
 }
 
 /// 一个 A 查询，名字由 `labels` 组成，后面再接 `trailing` / An A query for `labels`, then `trailing`
@@ -65,30 +55,16 @@ fn query(labels: &[&[u8]], trailing: &[u8]) -> Vec<u8> {
 /// Ask as a listener does: the full path only when the fast path cannot answer; the
 /// address in the reply, and whether the fast path could read the query
 async fn ask(engine: &Engine, packet: &[u8]) -> (Option<Ipv4Addr>, bool) {
-    let peer: SocketAddr = CLIENT.parse().unwrap();
-    let fast = engine.handle_packet_fast(packet, peer).expect("fast path");
+    let fast = engine
+        .handle_packet_fast(packet, peer())
+        .expect("fast path");
     let read_fast = fast.is_some();
     let reply = match fast {
         Some(crate::engine::FastPathResponse::Direct(reply)) => reply,
         Some(other) => panic!("a static answer is direct, got {other:?}"),
-        None => tokio::time::timeout(Duration::from_secs(5), engine.handle_packet(packet, peer))
-            .await
-            .expect("answer in time")
-            .expect("answer"),
+        None => support::ask(engine, packet, peer()).await,
     };
     (first_a(&reply), read_fast)
-}
-
-fn first_a(reply: &Bytes) -> Option<Ipv4Addr> {
-    match Message::from_bytes(reply)
-        .expect("parse reply")
-        .answers
-        .first()
-        .map(|record| &record.data)
-    {
-        Some(RData::A(address)) => Some(address.0),
-        _ => None,
-    }
 }
 
 #[tokio::test]
