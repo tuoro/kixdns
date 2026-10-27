@@ -397,3 +397,112 @@ async fn unparsable_answer_after_a_tcp_retry_is_one_servfail_response() {
     assert_eq!(responses[0]["status"], "completed");
     assert_eq!(responses[0]["rcode"], "ServFail");
 }
+
+/// 响应跳转路径上到了跳转上限，回的是本地给的 SERVFAIL，日志的 upstream 记成 "static"，和请求
+/// 阶段的跳转上限一样；以前要么空着，要么留着之前那次转发的上游。到上限的地方有三处：
+/// - 进入下一个 pipeline 时；
+/// - 规则级跳转一路跳下去时；
+/// - 跳转路径上转发以后，响应动作还要跳转时。
+///
+/// A jump limit reached on the response jump path answers a local SERVFAIL, which the log
+/// labels "static" as for the request-phase jump limit; it used to be left empty, or to
+/// keep the upstream of an earlier forward. The limit is reached in three places:
+/// - when entering the next pipeline;
+/// - when rule-level jumps run on;
+/// - when a response action wants to jump after a forward on the jump path.
+#[tokio::test]
+async fn a_jump_limit_on_the_response_jump_path_is_logged_as_static() {
+    let (addr, task) = upstream().await;
+    let jump = |to: &str| json!([{ "type": "jump_to_pipeline", "pipeline": to }]);
+    let forward_then = |name: &str, then: Value| {
+        json!({
+            "name": name, "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": addr }],
+            "response_matchers": [{ "type": "upstream_equals", "value": addr }],
+            "response_actions_on_match": then
+        })
+    };
+    let jump_rule = |name: &str, to: &str| json!({ "name": name, "matchers": [{ "type": "any" }], "actions": jump(to) });
+    let answer_rule = json!({
+        "name": "answer", "matchers": [{ "type": "any" }],
+        "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
+    });
+    let cases = [
+        // 进入 second 时已经没有跳转次数 / No jumps left when entering second
+        (
+            1,
+            json!([
+                { "id": "main", "rules": [forward_then("ask", jump("second"))] },
+                { "id": "second", "rules": [answer_rule] }
+            ]),
+        ),
+        // second 里规则级跳转一路跳下去 / Rule-level jumps from second run on
+        (
+            2,
+            json!([
+                { "id": "main", "rules": [forward_then("ask", jump("second"))] },
+                { "id": "second", "rules": [jump_rule("on", "third")] },
+                { "id": "third", "rules": [jump_rule("on", "fourth")] },
+                { "id": "fourth", "rules": [jump_rule("on", "main")] }
+            ]),
+        ),
+        // third 里转发以后，响应动作还要跳转 / After a forward in third a response action wants to jump
+        (
+            2,
+            json!([
+                { "id": "main", "rules": [forward_then("ask", jump("second"))] },
+                { "id": "second", "rules": [jump_rule("on", "third")] },
+                { "id": "third", "rules": [forward_then("again", jump("main"))] }
+            ]),
+        ),
+    ];
+    for (limit, pipelines) in cases {
+        let log = Log::default();
+        let _capture = log.capture();
+        let engine = configured(json!({
+            "settings": { "default_upstream": addr, "response_jump_limit": limit },
+            "pipelines": pipelines
+        }));
+        let reply = engine.handle_packet(&query(), peer()).await.unwrap();
+        assert_eq!(
+            Message::from_bytes(&reply).unwrap().metadata.response_code,
+            ResponseCode::ServFail,
+            "{pipelines}"
+        );
+        let responses = log.responses();
+        assert_eq!(responses.len(), 1, "{pipelines}");
+        assert_eq!(responses[0]["rcode"], "ServFail", "{pipelines}");
+        assert_eq!(responses[0]["upstream"], "static", "{pipelines}");
+    }
+    task.abort();
+}
+
+/// 不支持的 EDNS 版本回 BADVERS（16），完整路径的日志也记 BADVERS。头部和 OPT 合起来的 RCODE 16 只会是
+/// BADVERS：TSIG 的 BADSIG 写在 TSIG 记录里，头部是 NOTAUTH。hickory 把 16 读成 BADSIG，日志以前
+/// 跟着记成 BADSIG
+/// An unsupported EDNS version is answered BADVERS (16), and the full path logs it so. RCODE 16
+/// from the header and the OPT together can only be BADVERS: TSIG's BADSIG goes in the
+/// TSIG record, with NOTAUTH in the header. hickory reads 16 as BADSIG, and the log used
+/// to follow it
+#[tokio::test]
+async fn an_unsupported_edns_version_is_logged_as_badvers() {
+    let log = Log::default();
+    let _capture = log.capture();
+    let engine = engine("127.0.0.1:9");
+    let mut message = Message::from_bytes(&query()).unwrap();
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_version(1);
+    message.edns = Some(edns);
+    let reply = engine
+        .handle_packet(&message.to_vec().unwrap(), peer())
+        .await
+        .unwrap();
+    // 按数值比较：hickory 把 16 读成 BADSIG / Compared as a number: hickory reads 16 as BADSIG
+    assert_eq!(
+        u16::from(Message::from_bytes(&reply).unwrap().metadata.response_code),
+        16
+    );
+    let responses = log.responses();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["rcode"], "BADVERS");
+}
