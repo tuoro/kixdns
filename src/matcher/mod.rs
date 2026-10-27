@@ -304,15 +304,6 @@ pub struct RuntimePipeline {
     /// an entry for every new name costs more than computing them again. A rule's own answer is kept
     /// whatever the pipeline: the fast path answers repeated blocked queries from it.
     pub matches_regex: bool,
-    // Indices for O(1) lookup
-    // 完全域名匹配索引（最高优先级）/ Exact domain match index (highest priority)
-    pub domain_exact_index: FxHashMap<Arc<str>, Vec<usize>>,
-    // Maps domain suffix -> list of rule indices that MUST be checked
-    pub domain_suffix_index: FxHashMap<Arc<str>, Vec<usize>>,
-    // Maps query type -> list of rule indices (高频过滤条件 / High-frequency filter)
-    pub query_type_index: FxHashMap<RecordType, Vec<usize>>,
-    // Rules that are NOT indexed by domain (must always be checked)
-    pub always_check_rules: Vec<usize>,
 }
 
 /// Who is asking, as far as rules can tell.
@@ -1012,75 +1003,6 @@ impl RuntimePipelineConfig {
                 });
             }
 
-            // Build Indices - 优化：索引所有可索引的匹配器，而不只是第一个
-            // Build Indices - Optimized: index all indexable matchers, not just the first one
-            let mut domain_suffix_index: FxHashMap<Arc<str>, Vec<usize>> = FxHashMap::default();
-            let mut domain_exact_index: FxHashMap<Arc<str>, Vec<usize>> = FxHashMap::default();
-            let mut query_type_index: FxHashMap<RecordType, Vec<usize>> = FxHashMap::default();
-            let mut always_check_rules = Vec::new();
-
-            for (idx, rule) in rules.iter().enumerate() {
-                let mut indexed = false;
-
-                // 性能优化：只在 AND 链中索引，OR 链放入 always_check
-                // Performance optimization: only index in AND chains, put OR chains in always_check
-                if rule.matcher_operator == MatchOperator::And {
-                    // 索引所有可索引的匹配器 / Index all indexable matchers
-                    for m in &rule.matchers {
-                        match &m.matcher {
-                            RuntimeMatcher::DomainExact { value } => {
-                                domain_exact_index
-                                    .entry(value.clone())
-                                    .or_default()
-                                    .push(idx);
-                                indexed = true;
-                            }
-                            RuntimeMatcher::DomainSuffix { value } => {
-                                let key = domain_suffix_index_key(value);
-                                if !key.is_empty() {
-                                    domain_suffix_index
-                                        .entry(Arc::from(key))
-                                        .or_default()
-                                        .push(idx);
-                                    indexed = true;
-                                }
-                            }
-                            RuntimeMatcher::DomainRegex { .. }
-                            | RuntimeMatcher::ClientIp { .. }
-                            | RuntimeMatcher::GeoipCountry { .. }
-                            | RuntimeMatcher::GeoipPrivate { .. }
-                            | RuntimeMatcher::GeoSite { .. }
-                            | RuntimeMatcher::GeoSiteNot { .. }
-                            | RuntimeMatcher::EdnsPresent { .. } => {
-                                // 这些匹配器无法基于域名/类型索引，跳过
-                                // These matchers cannot be indexed by domain/type, skip
-                            }
-                            RuntimeMatcher::Qtype { value } => {
-                                query_type_index.entry(*value).or_default().push(idx);
-                                indexed = true;
-                            }
-                            RuntimeMatcher::Qclass { .. } => {
-                                // Qclass 通常固定为 IN，索引价值不大
-                                // Qclass is usually IN, indexing provides little value
-                            }
-                            RuntimeMatcher::Any => {
-                                // Any 匹配所有域名，不适合索引
-                                // Any matches all domains, not suitable for indexing
-                            }
-                        }
-                    }
-                }
-
-                if !indexed {
-                    always_check_rules.push(idx);
-                }
-            }
-
-            // 合并索引：_domain_exact 和 _query_type 可以直接使用
-            // Merge indices: _domain_exact and _query_type can be used directly
-            // 注意：当前实现只使用了 domain_suffix_index，未来可以扩展使用其他索引
-            // Note: current implementation only uses domain_suffix_index, can be extended to use other indices
-
             let mut pipeline_uses_client_ip = false;
             let mut pipeline_uses_geoip = false;
             let mut pipeline_uses_geosite = false;
@@ -1148,10 +1070,6 @@ impl RuntimePipelineConfig {
                 depends_on_requester,
                 matches_edns,
                 matches_regex,
-                domain_exact_index, // 添加完全匹配索引 / Add exact match index
-                domain_suffix_index,
-                query_type_index, // 添加 query_type 索引 / Add query_type index
-                always_check_rules,
             });
         }
 
@@ -2627,7 +2545,8 @@ mod tests {
         }))
         .expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        let index = &runtime.pipelines[0].domain_suffix_index;
+        let compiled = crate::matcher::advanced_rule::compile_pipelines(&runtime);
+        let index = &compiled[0].index.domain_suffix;
         assert_eq!(index.get("dotted.test").map(Vec::as_slice), Some(&[0][..]));
         assert_eq!(index.get("plain.test").map(Vec::as_slice), Some(&[1][..]));
         assert!(!index.contains_key(".dotted.test"));

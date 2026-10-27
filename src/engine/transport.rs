@@ -545,17 +545,16 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         let permit_mgr = Arc::new(PermitManager::new(size));
         let clients = (0..size)
             .map(|_| {
-                let client = Arc::new(StreamMuxClient::with_shared(
+                Arc::new(StreamMuxClient::with_shared(
                     self.shared.clone(),
                     upstream.clone(),
                     Arc::clone(&permit_mgr),
-                ));
-                client.set_health_check_config(
-                    self.health_error_threshold,
-                    self.max_age_secs,
-                    self.idle_timeout_secs,
-                );
-                client
+                    StreamHealth {
+                        error_threshold: self.health_error_threshold,
+                        max_age_ms: self.max_age_secs * 1000,
+                        idle_timeout_ms: self.idle_timeout_secs * 1000,
+                    },
+                ))
             })
             .collect();
         Arc::new(StreamConnectionPool {
@@ -683,16 +682,12 @@ pub struct StreamMuxClient<T: StreamTransport> {
     conn_permit: Arc<Mutex<Option<PermitGuard>>>,
     /// 健康检查：连续错误计数 / Health check: consecutive error count
     consecutive_errors: AtomicUsize,
-    /// 健康检查：错误阈值 / Health check: error threshold (Atomic for thread-safe updates)
-    health_threshold: AtomicUsize,
+    /// 健康检查的设置 / Health check settings
+    health: StreamHealth,
     /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
     conn_create_time: AtomicU64,
-    /// 连接老化：最大存活时间（毫秒）/ Connection aging: max age (ms)
-    max_age_ms: AtomicU64,
     /// 空闲超时：最后请求时间（毫秒）/ Idle timeout: last request time (ms)
     last_request_time: AtomicU64,
-    /// 空闲超时：空闲超时时间（毫秒）/ Idle timeout: idle timeout (ms)
-    idle_timeout_ms: AtomicU64,
     /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
     last_health_check_time: AtomicU64,
     /// Reader 取消令牌 / Reader cancellation token
@@ -703,6 +698,29 @@ pub struct StreamMuxClient<T: StreamTransport> {
     /// tell whether the connection is still alive: if it grew after the query was
     /// written, the connection kept answering and only this one answer is slow
     answers_read: Arc<AtomicU64>,
+}
+
+/// 一条 TCP/DoT 连接的健康检查设置，建客户端时给定，之后不变
+/// A TCP/DoT connection's health check settings, given when the client is built and fixed after
+#[derive(Debug, Clone, Copy)]
+struct StreamHealth {
+    /// 连续错误达到这个数就复位；0 不按次数复位 / Reset after this many errors in a row; 0 never by count
+    error_threshold: usize,
+    /// 连接最长存活多久（毫秒），0 不限 / How long a connection may live (ms), 0 for no limit
+    max_age_ms: u64,
+    /// 空闲多久（毫秒）就复位，0 不限 / How long it may sit idle (ms) before a reset, 0 for no limit
+    idle_timeout_ms: u64,
+}
+
+impl Default for StreamHealth {
+    /// 3 次错误、5 分钟、1 分钟 / 3 errors, 5 minutes, 1 minute
+    fn default() -> Self {
+        Self {
+            error_threshold: 3,
+            max_age_ms: 300_000,
+            idle_timeout_ms: 60_000,
+        }
+    }
 }
 
 pub type TcpMuxClient = StreamMuxClient<Tcp>;
@@ -796,7 +814,7 @@ impl<T: StreamTransport> Drop for StreamMuxClient<T> {
 #[cfg(test)]
 impl TcpMuxClient {
     fn new(upstream: Arc<str>, permit_manager: Arc<PermitManager>) -> Self {
-        Self::with_shared((), upstream, permit_manager)
+        Self::with_shared((), upstream, permit_manager, StreamHealth::default())
     }
 }
 
@@ -807,7 +825,12 @@ impl DotMuxClient {
         tls_config: Arc<ClientConfig>,
         permit_manager: Arc<PermitManager>,
     ) -> Self {
-        Self::with_shared(tls_config, upstream, permit_manager)
+        Self::with_shared(
+            tls_config,
+            upstream,
+            permit_manager,
+            StreamHealth::default(),
+        )
     }
 }
 
@@ -816,6 +839,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         shared: T::Shared,
         upstream: Arc<str>,
         permit_manager: Arc<PermitManager>,
+        health: StreamHealth,
     ) -> Self {
         Self {
             upstream,
@@ -827,33 +851,14 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             permit_manager,
             generation: Arc::new(AtomicU64::new(0)),
             conn_permit: Arc::new(Mutex::new(None)),
-            // 初始化健康检查字段（默认值，实际值会在 StreamMultiplexer 中设置）
             consecutive_errors: AtomicUsize::new(0),
-            health_threshold: AtomicUsize::new(3),
+            health,
             conn_create_time: AtomicU64::new(0),
-            max_age_ms: AtomicU64::new(300_000), // 5 分钟
             last_request_time: AtomicU64::new(0),
-            idle_timeout_ms: AtomicU64::new(60_000), // 1 分钟
             last_health_check_time: AtomicU64::new(0),
             read_cancel: Mutex::new(CancellationToken::new()),
             answers_read: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    /// 设置健康检查参数
-    /// Set health check parameters
-    fn set_health_check_config(
-        &self,
-        error_threshold: usize,
-        max_age_secs: u64,
-        idle_timeout_secs: u64,
-    ) {
-        self.health_threshold
-            .store(error_threshold, Ordering::Release);
-        self.max_age_ms
-            .store(max_age_secs * 1000, Ordering::Release);
-        self.idle_timeout_ms
-            .store(idle_timeout_secs * 1000, Ordering::Release);
     }
 
     async fn spawn_reader(
@@ -1026,7 +1031,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // 而不是"每次错误都重置连接"。
         // A threshold of 0 disables the health check, as README and config.rs
         // describe, rather than resetting the connection on every error.
-        let threshold = self.health_threshold.load(Ordering::Acquire);
+        let threshold = self.health.error_threshold;
 
         debug!(
             upstream = %self.upstream,
@@ -1073,7 +1078,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
         // Check connection aging / 检查连接老化
         let create_time = self.conn_create_time.load(Ordering::Acquire);
-        let max_age = self.max_age_ms.load(Ordering::Acquire);
+        let max_age = self.health.max_age_ms;
         if create_time > 0 && max_age > 0 {
             let age_ms = now.saturating_sub(create_time);
             if age_ms > max_age {
@@ -1094,7 +1099,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
         // Check idle timeout / 检查空闲超时
         let last_req = self.last_request_time.load(Ordering::Acquire);
-        let idle_timeout = self.idle_timeout_ms.load(Ordering::Acquire);
+        let idle_timeout = self.health.idle_timeout_ms;
         if last_req > 0 && idle_timeout > 0 {
             let idle_ms = now.saturating_sub(last_req);
             if idle_ms > idle_timeout {
@@ -2416,10 +2421,6 @@ pub struct DoqMuxClient {
     /// Shared by every connection in the upstream's pool: what one connection
     /// learned, the others need not each fail and sit out a timeout to learn again
     zero_rtt_rejected: Arc<AtomicBool>,
-    /// 健康检查：连续错误计数 / Health check: consecutive error count
-    consecutive_errors: AtomicUsize,
-    /// 健康检查：错误阈值 / Health check: error threshold
-    health_threshold: AtomicUsize,
     /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
     conn_create_time: AtomicU64,
     /// 连接老化：最大存活时间（毫秒）/ Connection aging: max age (ms)
@@ -2556,8 +2557,6 @@ impl DoqMuxClient {
             connection: Mutex::new(None),
             runtime,
             zero_rtt_rejected,
-            consecutive_errors: AtomicUsize::new(0),
-            health_threshold: AtomicUsize::new(3),
             conn_create_time: AtomicU64::new(0),
             max_age_ms: AtomicU64::new(30 * 60 * 1000), // 30 minutes default
             last_request_time: AtomicU64::new(0),
@@ -2566,30 +2565,8 @@ impl DoqMuxClient {
         }
     }
 
-    /// Record an error and check if connection should be reset
-    /// 记录错误并检查是否需要重置连接
-    async fn record_error(&self) -> bool {
-        let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
-        let threshold = self.health_threshold.load(Ordering::Acquire);
-        if threshold > 0 && errors >= threshold {
-            warn!(
-                upstream = %self.upstream,
-                consecutive_errors = errors,
-                threshold = threshold,
-                "DoQ connection error threshold exceeded, resetting connection"
-            );
-            self.reset_connection().await;
-            self.consecutive_errors.store(0, Ordering::Release);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Record success and clear error counter
-    /// 记录成功并清零错误计数
+    /// Record a success / 记一次成功
     fn record_success(&self) {
-        self.consecutive_errors.store(0, Ordering::Release);
         let now = unix_time_millis();
         self.last_request_time.store(now, Ordering::Release);
     }
@@ -2619,7 +2596,6 @@ impl DoqMuxClient {
                     "DoQ connection too old, resetting"
                 );
                 self.reset_connection().await;
-                self.consecutive_errors.store(0, Ordering::Release);
                 return true;
             }
         }
@@ -2637,7 +2613,6 @@ impl DoqMuxClient {
                     "DoQ connection idle too long, resetting"
                 );
                 self.reset_connection().await;
-                self.consecutive_errors.store(0, Ordering::Release);
                 return true;
             }
         }
@@ -2826,11 +2801,8 @@ impl DoqMuxClient {
                     return Ok(bytes);
                 }
                 Ok(Err(failure)) => {
-                    let already_reset = self.record_error().await;
-                    if !already_reset {
-                        // Only reset if record_error() didn't already reset (below threshold)
-                        self.reset_connection().await;
-                    }
+                    // 每次失败都复位连接 / Every failure resets the connection
+                    self.reset_connection().await;
                     let retry = if !allow_retry {
                         false
                     } else if used_0rtt
@@ -2890,10 +2862,7 @@ impl DoqMuxClient {
                             continue;
                         }
                     }
-                    let already_reset = self.record_error().await;
-                    if !already_reset {
-                        self.reset_connection().await;
-                    }
+                    self.reset_connection().await;
                     return Err(anyhow::anyhow!("doq timeout"));
                 }
             }
@@ -5123,6 +5092,38 @@ mod tests {
         );
     }
 
+    /// 一次查询失败（回答的不是这个问题，或者超时）以后连接被复位，下一个查询走新连接
+    /// After a failed query (an answer to another question, or a timeout) the
+    /// connection is reset and the next query goes over a fresh one
+    #[tokio::test]
+    async fn a_failed_doq_query_resets_the_connection() {
+        for (failing, budget) in [
+            ("wrong", Duration::from_secs(2)),
+            ("slow", Duration::from_millis(300)),
+        ] {
+            let (server, client_tls) = localhost_tls(&[b"doq"]);
+            // 只有一条连接上的第一个查询照常回答：还在旧连接上问，就等不到回答
+            // Only the first query on a connection is answered as asked: asking again
+            // on the old connection gets no answer
+            let addr = spawn_doq_upstream(server, Duration::ZERO, |n, label| match label {
+                "wrong" => DoqReply::AnotherQuestion,
+                "slow" => DoqReply::Silence,
+                _ if n == 0 => DoqReply::Answer(Duration::ZERO),
+                _ => DoqReply::Silence,
+            })
+            .await;
+            let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+            let result = client
+                .send(&udp_test_query(&format!("{failing}.example")), budget)
+                .await;
+            assert!(result.is_err(), "`{failing}` gets no usable answer");
+            client
+                .send(&udp_test_query("after.example"), Duration::from_secs(2))
+                .await
+                .unwrap_or_else(|err| panic!("after `{failing}`, the next query got {err:#}"));
+        }
+    }
+
     /// 本机 TCP 测试上游；`tls` 给了就是 DoT。问题名第一个标签是 `slow` 的永不回答，
     /// `late` 的 400 ms 后回答，`mid` 的 100 ms 后回答，其余立刻回答；同一条连接上的
     /// 查询各自独立回答，先到先回。
@@ -5849,6 +5850,55 @@ mod tests {
         .await
         .expect("the upstream answers");
         kept_then_dropped(&mut closed, |keep| mux.retain_upstreams(|_| keep)).await;
+    }
+
+    /// 连接池里的客户端用的是建多路复用器时给的健康设置：错误阈值、连接最长存活、空闲时长
+    /// A pool's clients take the health settings the multiplexer was built with: the error
+    /// threshold, the longest a connection may live and how long it may sit idle
+    #[tokio::test]
+    async fn pool_clients_take_the_configured_health_settings() {
+        let mux = TcpMultiplexer::new(1, 2, 0, 0);
+        let client = Arc::clone(&mux.get_or_init_pool_for_test("127.0.0.1:9").clients[0]);
+        assert!(
+            !client.record_error().await,
+            "one error is below a threshold of 2"
+        );
+        assert!(client.record_error().await, "the second error reaches it");
+
+        // 把连接的出生时间或上次请求时间往前拨 2 秒，再让下一次发送做健康检查：设成 1 秒的
+        // 那一项会让旧连接被关掉
+        // Wind the connection's birth or its last request back 2 seconds and have the next
+        // send run the health check: the setting given as 1 second closes the old connection
+        let wind_back = |stamp: fn(&TcpMuxClient) -> &AtomicU64| {
+            move |client: &TcpMuxClient| {
+                stamp(client).store(unix_time_millis() - 2_000, Ordering::Release);
+                client.last_health_check_time.store(0, Ordering::Relaxed);
+            }
+        };
+        for (mux, age) in [
+            (
+                TcpMultiplexer::new(1, 3, 1, 0),
+                wind_back(|client| &client.conn_create_time),
+            ),
+            (
+                TcpMultiplexer::new(1, 3, 0, 1),
+                wind_back(|client| &client.last_request_time),
+            ),
+        ] {
+            let (addr, mut closed) = upstream_noting_closes(None).await;
+            let upstream = addr.to_string();
+            let query = udp_test_query("a.example");
+            mux.send(&query, &upstream, Duration::from_secs(2))
+                .await
+                .expect("the upstream answers");
+            age(&mux.get_or_init_pool_for_test(&upstream).clients[0]);
+            mux.send(&query, &upstream, Duration::from_secs(2))
+                .await
+                .expect("the upstream answers again");
+            timeout(Duration::from_secs(2), closed.recv())
+                .await
+                .expect("the health check closes the old connection");
+        }
     }
 
     /// DoQ 连接带着保活，不关掉的话会一直给旧上游发包
