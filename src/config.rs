@@ -643,6 +643,7 @@ impl Rule {
 
         let mut tcp_upstreams: FxHashSet<String> = FxHashSet::default();
         let mut udp_upstreams: FxHashSet<String> = FxHashSet::default();
+        let mut tcp_udp_upstreams: FxHashSet<String> = FxHashSet::default();
         let mut doh_upstreams: FxHashSet<String> = FxHashSet::default();
         let mut dot_upstreams: FxHashSet<String> = FxHashSet::default();
         let mut doq_upstreams: FxHashSet<String> = FxHashSet::default();
@@ -660,74 +661,45 @@ impl Rule {
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                 {
-                    if addr.contains("://") {
-                        if addr.starts_with("tcp://") {
-                            tcp_upstreams.insert(addr.to_string());
-                        } else if addr.starts_with("udp://") {
-                            udp_upstreams.insert(addr.to_string());
-                        } else if addr.starts_with("tcp+udp://") || addr.starts_with("udp+tcp://") {
-                            tcp_upstreams.insert(addr.to_string());
-                            udp_upstreams.insert(addr.to_string());
-                        } else if addr.starts_with("doh://") || addr.starts_with("https://") {
-                            doh_upstreams.insert(addr.to_string());
-                        } else if addr.starts_with("dot://") || addr.starts_with("tls://") {
-                            dot_upstreams.insert(addr.to_string());
-                        } else if addr.starts_with("doq://") || addr.starts_with("quic://") {
-                            doq_upstreams.insert(addr.to_string());
-                        }
-                    } else {
-                        match action_transport {
-                            Transport::Tcp => {
-                                tcp_upstreams.insert(format!("tcp://{}", addr));
-                            }
-                            Transport::Udp => {
-                                udp_upstreams.insert(format!("udp://{}", addr));
-                            }
-                            Transport::TcpUdp => {
-                                tcp_upstreams.insert(format!("tcp://{}", addr));
-                                udp_upstreams.insert(format!("udp://{}", addr));
-                            }
-                            Transport::Doh => {
-                                doh_upstreams.insert(format!("doh://{}", addr));
-                            }
-                            Transport::Dot => {
-                                dot_upstreams.insert(format!("dot://{}", addr));
-                            }
-                            Transport::Doq => {
-                                doq_upstreams.insert(format!("doq://{}", addr));
-                            }
-                        }
-                    }
+                    // 前缀照单个转发那样认（不分大小写，见 `upstream::parse_upstream_addr`），
+                    // 没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的上游只记一份，
+                    // 合并后仍然双发
+                    // The prefix is read as for a single forward (ignoring case, see
+                    // `upstream::parse_upstream_addr`), the action's transport taken without
+                    // one or for one it does not know. An upstream asked over TCP and UDP at
+                    // once is recorded once and still asked both ways after the merge
+                    let (address, transport) = match addr.find("://") {
+                        Some(idx) => (
+                            &addr[idx + 3..],
+                            crate::engine::upstream::transport_for_scheme(&addr[..idx])
+                                .unwrap_or(action_transport),
+                        ),
+                        None => (addr, action_transport),
+                    };
+                    let (set, scheme) = match transport {
+                        Transport::Tcp => (&mut tcp_upstreams, "tcp"),
+                        Transport::Udp => (&mut udp_upstreams, "udp"),
+                        Transport::TcpUdp => (&mut tcp_udp_upstreams, "tcp+udp"),
+                        Transport::Doh => (&mut doh_upstreams, "doh"),
+                        Transport::Dot => (&mut dot_upstreams, "dot"),
+                        Transport::Doq => (&mut doq_upstreams, "doq"),
+                    };
+                    set.insert(format!("{scheme}://{address}"));
                 }
             }
         }
 
         let mut all_upstreams: Vec<std::sync::Arc<str>> = Vec::new();
-        all_upstreams.extend(
-            tcp_upstreams
-                .iter()
-                .map(|s| std::sync::Arc::from(s.as_str())),
-        );
-        all_upstreams.extend(
-            udp_upstreams
-                .iter()
-                .map(|s| std::sync::Arc::from(s.as_str())),
-        );
-        all_upstreams.extend(
-            doh_upstreams
-                .iter()
-                .map(|s| std::sync::Arc::from(s.as_str())),
-        );
-        all_upstreams.extend(
-            dot_upstreams
-                .iter()
-                .map(|s| std::sync::Arc::from(s.as_str())),
-        );
-        all_upstreams.extend(
-            doq_upstreams
-                .iter()
-                .map(|s| std::sync::Arc::from(s.as_str())),
-        );
+        for set in [
+            &tcp_upstreams,
+            &udp_upstreams,
+            &tcp_udp_upstreams,
+            &doh_upstreams,
+            &dot_upstreams,
+            &doq_upstreams,
+        ] {
+            all_upstreams.extend(set.iter().map(|s| std::sync::Arc::from(s.as_str())));
+        }
 
         if all_upstreams.is_empty() {
             tracing::info!(
@@ -742,6 +714,7 @@ impl Rule {
                 forward_count,
                 tcp_count = tcp_upstreams.len(),
                 udp_count = udp_upstreams.len(),
+                tcp_udp_count = tcp_udp_upstreams.len(),
                 doh_count = doh_upstreams.len(),
                 dot_count = dot_upstreams.len(),
                 doq_count = doq_upstreams.len(),
@@ -1418,6 +1391,12 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     let pipelines: rustc_hash::FxHashSet<&str> =
         cfg.pipelines.iter().map(|p| p.id.as_str()).collect();
     let mut found = Vec::new();
+    if split_upstreams(&cfg.settings.default_upstream)
+        .next()
+        .is_none()
+    {
+        found.push(format!("default_upstream: {NO_UPSTREAM}"));
+    }
     for upstream in split_upstreams(&cfg.settings.default_upstream) {
         if let Some(problem) = crate::engine::upstream::upstream_problem(upstream, Transport::Udp) {
             found.push(format!("default_upstream: {problem}"));
@@ -1467,6 +1446,9 @@ pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
 
 const EMPTY_DOMAIN_MATCHER: &str = "an empty domain matcher matches every name";
 const EMPTY_EXACT_MATCHER: &str = "an empty domain_exact matches only the root name";
+
+/// 一个上游也没写：每个查询都会失败 / Not a single upstream written: every query would fail
+const NO_UPSTREAM: &str = "no upstream is written, so every query it gets would fail";
 
 /// 逗号分隔的上游，和转发时的拆法一样 / Comma-separated upstreams, split as a forward splits them
 fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
@@ -1519,6 +1501,9 @@ fn rule_problems(
                 transport,
                 ..
             } => {
+                if split_upstreams(upstreams).next().is_none() {
+                    report(NO_UPSTREAM.to_string());
+                }
                 for upstream in split_upstreams(upstreams) {
                     if let Some(problem) = crate::engine::upstream::upstream_problem(
                         upstream,
@@ -1587,6 +1572,62 @@ mod tests {
             panic!("unexpected response matcher variant");
         };
         assert_eq!(country_codes, ["CN", "cloudflare"]);
+    }
+}
+
+#[cfg(test)]
+mod merged_forward_tests {
+    use super::Rule;
+    use serde_json::json;
+
+    /// 一条规则的几个转发动作合并出的上游列表，排好序 / The upstream list a rule's forward
+    /// actions merge into, sorted
+    fn merged(actions: serde_json::Value) -> Vec<String> {
+        let mut rule: Rule = serde_json::from_value(json!({
+            "name": "r", "matchers": [{ "type": "any" }], "actions": actions
+        }))
+        .expect("parse rule");
+        rule.compute_merged_forward();
+        let mut list: Vec<String> = rule
+            .merged_forward
+            .expect("several forwards merge")
+            .upstream_list
+            .iter()
+            .map(|upstream| upstream.to_string())
+            .collect();
+        list.sort();
+        list
+    }
+
+    /// TCP 和 UDP 双发的上游合并后只出现一次，仍然双发，和只有一个转发时一样：写成 `tcp+udp://`
+    /// 前缀和写成 `tcp_udp` 传输都是
+    /// An upstream asked over TCP and UDP at once appears once after the merge and is still
+    /// asked both ways, as with a single forward, whether written with the `tcp+udp://` prefix
+    /// or the `tcp_udp` transport
+    #[test]
+    fn a_tcp_and_udp_upstream_is_merged_once() {
+        assert_eq!(
+            merged(json!([
+                { "type": "forward", "upstream": "tcp+udp://192.0.2.1:53" },
+                { "type": "forward", "upstream": "udp+tcp://192.0.2.1:53" },
+                { "type": "forward", "upstream": "192.0.2.2:53", "transport": "tcp_udp" }
+            ])),
+            ["tcp+udp://192.0.2.1:53", "tcp+udp://192.0.2.2:53"]
+        );
+    }
+
+    /// 前缀不分大小写，和单个转发一样；以前写成大写的上游合并时被丢掉
+    /// Prefixes ignore case, as for a single forward; an upstream written in capitals used
+    /// to be dropped by the merge
+    #[test]
+    fn a_prefix_in_capitals_is_kept() {
+        assert_eq!(
+            merged(json!([
+                { "type": "forward", "upstream": "TCP://192.0.2.1:53" },
+                { "type": "forward", "upstream": "Udp://192.0.2.2:53" }
+            ])),
+            ["tcp://192.0.2.1:53", "udp://192.0.2.2:53"]
+        );
     }
 }
 
@@ -1728,6 +1769,31 @@ mod validation_tests {
                 .any(|problem| problem.contains("matches every name")),
             "{found:#?}"
         );
+    }
+
+    /// 一个上游也没写的转发（`upstream` 写成空的）、空的 default_upstream，每个查询都必然失败，改配置
+    /// 时就报出来
+    /// A forward naming no upstream at all (`upstream` written empty) and an empty
+    /// default_upstream would fail every query, so they are named when the config changes
+    #[test]
+    fn a_forward_or_default_with_no_upstream_is_named() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let config = serde_json::json!({
+            "settings": { "default_upstream": " , " },
+            "pipelines": [{ "id": "main", "rules": [
+                rule("empty", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "" }])),
+                rule("commas", any.clone(), serde_json::json!([{ "type": "forward", "upstream": " , " }]))
+            ]}]
+        });
+        let found = problems_of(config);
+        for place in ["default_upstream", "rule \"empty\"", "rule \"commas\""] {
+            assert!(
+                found
+                    .iter()
+                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                "missing {place} in {found:#?}"
+            );
+        }
     }
 
     /// 会悄悄做成别的事的写法，每一种都报出来，带上在哪条规则
