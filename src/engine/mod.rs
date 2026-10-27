@@ -18,6 +18,8 @@ pub mod phases;
 pub mod pipeline;
 #[cfg(test)]
 mod query_flags_tests;
+#[cfg(test)]
+mod question_case_tests;
 pub mod refresh;
 pub mod response;
 pub(crate) mod response_log;
