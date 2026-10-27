@@ -906,111 +906,13 @@ pub(crate) async fn process_response_jump(
                 response.upstream = Some(upstream.clone());
                 // A reused answer is in the trail already / 复用的应答已经记在 trail 里
                 let mut reused = false;
-                let resp = if allow_reuse {
-                    if let Some(ctx) = reused_response.take() {
-                        reused = true;
-                        Ok((ctx.raw, ctx.upstream.to_string()))
-                    } else {
-                        // FIX: Background refresh must skip inflight check
-                        // 修复：后台刷新必须跳过 inflight 检查
-                        if !skip_cache {
-                            use dashmap::mapref::entry::Entry;
-                            let rx = match engine.inflight.entry(dedupe_hash) {
-                                Entry::Vacant(entry) => {
-                                    // No other request in progress, create watch channel
-                                    // 没有其他请求在进行,创建 watch channel
-                                    let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                                    entry.insert(InflightEntry::new(&inflight_question, tx));
-                                    cleanup_guards.push(InflightCleanupGuard::new(
-                                        engine.inflight.clone(),
-                                        dedupe_hash,
-                                    ));
-                                    inflight_hashes.push(dedupe_hash);
-                                    None
-                                }
-                                // This request's own entry: forward instead (see `holds`)
-                                // 这个请求自己的条目：改为自己转发（见 `holds`）
-                                Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
-                                // Another question's entry under the same key: forward instead (see
-                                // `InflightQuestion`)
-                                // 同一个键下别的问题的条目：改为自己转发（见 `InflightQuestion`）
-                                Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => {
-                                    None
-                                }
-                                Entry::Occupied(entry) => {
-                                    // Another request in progress, subscribe to its result
-                                    // 已有请求在进行,订阅其结果
-                                    let rx = entry.get().tx.subscribe();
-                                    Some(rx)
-                                }
-                            };
-
-                            if let Some(mut rx) = rx {
-                                // The request holds entries of its own on the jump path, so the one it
-                                // waits on may in turn be waiting on it (two requests that jumped into
-                                // each other's pipeline). Wait only until an upstream should have
-                                // answered (see `hedge_timeout`), then forward by itself.
-                                // 跳转路上的请求自己握着条目，它等的那一个可能反过来也在等它（两个请求互相
-                                // 跳进了对方的 pipeline）。只等到上游应当已经应答的时间点（见
-                                // `hedge_timeout`），之后自己转发。
-                                if let Ok(Ok(())) =
-                                    tokio::time::timeout(join_wait, rx.changed()).await
-                                {
-                                    if let Some((observer, ctx)) = observed {
-                                        observer.inflight_joined(ctx);
-                                    }
-                                    // Clone result to avoid holding RwLockReadGuard across await
-                                    // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
-                                    let result = rx.borrow().clone();
-                                    match &result {
-                                        Ok(bytes) => {
-                                            // Rewrite Transaction ID for followers using BytesMut
-                                            let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                            if resp_mut.len() >= 2 {
-                                                let id_bytes = req.metadata.id.to_be_bytes();
-                                                resp_mut[0] = id_bytes[0];
-                                                resp_mut[1] = id_bytes[1];
-                                            }
-                                            let resp_bytes = resp_mut.freeze();
-
-                                            for g in &mut cleanup_guards {
-                                                g.defuse();
-                                            }
-                                            for h in &inflight_hashes {
-                                                engine
-                                                    .notify_inflight_waiters(*h, || {
-                                                        crate::engine::phases::for_waiters(
-                                                            bytes, &requester, trail, echo_floor,
-                                                        )
-                                                    })
-                                                    .await;
-                                            }
-                                            response.upstream = Some(Arc::from("inflight"));
-                                            return Ok(resp_bytes);
-                                        }
-                                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                                    }
-                                }
-                                // Otherwise the sender dropped, or no answer came within the upstream
-                                // timeout: forward by itself
-                                // 否则发送端已丢弃，或上游超时内没等到应答：自己转发
-                            }
-                        }
-                        crate::engine::upstream::forward_upstream(
-                            engine,
-                            packet,
-                            &upstream,
-                            upstream_timeout,
-                            transport,
-                            pre_split_upstreams.as_ref(),
-                            observed,
-                        )
-                        .await
-                    }
+                // 规则越过的应答只在决定允许时复用（见 `handle_forward_decision_logged`）
+                // An answer a rule continued past is reused only where the decision allows
+                // it (see `handle_forward_decision_logged`)
+                let resp = if let Some(ctx) = reused_response.take_if(|_| allow_reuse) {
+                    reused = true;
+                    Ok((ctx.raw, ctx.upstream.to_string()))
                 } else {
-                    // If reuse is not allowed (e.g. explicit Forward action), we must clear any reused response
-                    // and force a new request.
-
                     // FIX: Background refresh must skip inflight check
                     // 修复：后台刷新必须跳过 inflight 检查
                     if !skip_cache {
@@ -1028,9 +930,12 @@ pub(crate) async fn process_response_jump(
                                 inflight_hashes.push(dedupe_hash);
                                 None
                             }
-                            // See the same arm above / 同上
+                            // This request's own entry: forward instead (see `holds`)
+                            // 这个请求自己的条目：改为自己转发（见 `holds`）
                             Entry::Occupied(_) if holds(&inflight_hashes, dedupe_hash) => None,
-                            // See the same arm above / 同上
+                            // Another question's entry under the same key: forward instead (see
+                            // `InflightQuestion`)
+                            // 同一个键下别的问题的条目：改为自己转发（见 `InflightQuestion`）
                             Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
                             Entry::Occupied(entry) => {
                                 // Another request in progress, subscribe to its result
@@ -1041,7 +946,13 @@ pub(crate) async fn process_response_jump(
                         };
 
                         if let Some(mut rx) = rx {
-                            // See the same wait above / 同上
+                            // The request holds entries of its own on the jump path, so the one it
+                            // waits on may in turn be waiting on it (two requests that jumped into
+                            // each other's pipeline). Wait only until an upstream should have
+                            // answered (see `hedge_timeout`), then forward by itself.
+                            // 跳转路上的请求自己握着条目，它等的那一个可能反过来也在等它（两个请求互相
+                            // 跳进了对方的 pipeline）。只等到上游应当已经应答的时间点（见
+                            // `hedge_timeout`），之后自己转发。
                             if let Ok(Ok(())) = tokio::time::timeout(join_wait, rx.changed()).await
                             {
                                 if let Some((observer, ctx)) = observed {

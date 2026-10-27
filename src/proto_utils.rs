@@ -1665,28 +1665,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // Skip Questions / 跳过问题部分
     for _ in 0..qd_count {
         // Skip Name / 跳过名称
-        loop {
-            if pos >= packet_len {
-                return None;
-            }
-            let len = packet[pos];
-            if len == 0 {
-                pos += 1;
-                break;
-            }
-            if (len & 0xC0) == 0xC0 {
-                if pos + 2 > packet_len {
-                    return None;
-                }
-                pos += 2;
-                break;
-            }
-            let jump_len = 1 + (len as usize);
-            if pos + jump_len > packet_len {
-                return None;
-            }
-            pos += jump_len;
-        }
+        pos = skip_dns_name_wire(packet, pos)?;
         // Skip Type(2) + Class(2) / 跳过类型(2) + 类别(2)
         if pos + 4 > packet_len {
             return None;
@@ -1700,28 +1679,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // Scan Answers / 扫描应答部分
     for _ in 0..an_count {
         // Skip Name / 跳过名称
-        loop {
-            if pos >= packet_len {
-                return None;
-            }
-            let len = packet[pos];
-            if len == 0 {
-                pos += 1;
-                break;
-            }
-            if (len & 0xC0) == 0xC0 {
-                if pos + 2 > packet_len {
-                    return None;
-                }
-                pos += 2;
-                break;
-            }
-            let jump_len = 1 + (len as usize);
-            if pos + jump_len > packet_len {
-                return None;
-            }
-            pos += jump_len;
-        }
+        pos = skip_dns_name_wire(packet, pos)?;
 
         if pos + 10 > packet_len {
             return None;

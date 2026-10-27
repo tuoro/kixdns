@@ -693,78 +693,14 @@ pub(crate) async fn handle_forward_decision_logged(
     // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里
     let mut reused = false;
 
-    let resp = if allow_reuse {
-        if let Some(ctx) = reused_response.take() {
-            reused = true;
-            Ok((ctx.raw, ctx.upstream.to_string()))
-        } else {
-            if !skip_cache {
-                use dashmap::mapref::entry::Entry;
-                let rx = match engine.inflight.entry(keys.inflight) {
-                    Entry::Vacant(entry) => {
-                        let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                        entry.insert(InflightEntry::new(&inflight_question, tx));
-                        cleanup_guard = Some(InflightCleanupGuard::new(
-                            engine.inflight.clone(),
-                            keys.inflight,
-                        ));
-                        None
-                    }
-                    // A request holding an entry (see `held_inflight`) never waits
-                    // on one: the entry may be its own, which the next rule forwards
-                    // under after a continue, or another request's that waits on
-                    // this one in turn (continue, then jump into each other's
-                    // pipeline). It forwards itself instead.
-                    // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
-                    // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
-                    // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
-                    // 自己转发。
-                    Entry::Occupied(_) if held_inflight.is_some() => None,
-                    // Another question's entry under the same key: the key is only a hash (see
-                    // `InflightQuestion`), and waiting on it would hand this request another
-                    // question's answer. It forwards itself instead.
-                    // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
-                    // 别的问题的应答交给这个请求。它自己转发。
-                    Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
-                    Entry::Occupied(entry) => {
-                        let rx = entry.get().tx.subscribe();
-                        Some(rx)
-                    }
-                };
-
-                if let Some(mut rx) = rx
-                    && rx.changed().await.is_ok()
-                {
-                    if let Some((observer, ctx)) = observed {
-                        observer.inflight_joined(ctx);
-                    }
-                    let result = rx.borrow().clone();
-                    match &result {
-                        Ok(bytes) => {
-                            let mut resp_mut = BytesMut::from(bytes.as_ref());
-                            if resp_mut.len() >= 2 {
-                                let id_bytes = tx_id.to_be_bytes();
-                                resp_mut[0] = id_bytes[0];
-                                resp_mut[1] = id_bytes[1];
-                            }
-                            response.upstream = Some(Arc::from("inflight"));
-                            return Ok(ForwardResult::Success(resp_mut.freeze()));
-                        }
-                        Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                    }
-                }
-            }
-            crate::engine::upstream::forward_upstream(
-                engine,
-                packet,
-                upstream,
-                upstream_timeout,
-                transport,
-                pre_split_upstreams,
-                observed,
-            )
-            .await
-        }
+    // An answer a rule continued past is reused only where the decision allows it (an
+    // `allow` after a continue); any other forward asks, or waits on whoever already
+    // asks, for its own
+    // 规则越过的应答只在决定允许时复用（continue 之后的 `allow`）；其余的转发自己去问，或者
+    // 等已经在问的那个
+    let resp = if let Some(ctx) = reused_response.take_if(|_| allow_reuse) {
+        reused = true;
+        Ok((ctx.raw, ctx.upstream.to_string()))
     } else {
         if !skip_cache {
             use dashmap::mapref::entry::Entry;
@@ -778,9 +714,21 @@ pub(crate) async fn handle_forward_decision_logged(
                     ));
                     None
                 }
-                // See the same arm above / 同上
+                // A request holding an entry (see `held_inflight`) never waits
+                // on one: the entry may be its own, which the next rule forwards
+                // under after a continue, or another request's that waits on
+                // this one in turn (continue, then jump into each other's
+                // pipeline). It forwards itself instead.
+                // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
+                // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
+                // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
+                // 自己转发。
                 Entry::Occupied(_) if held_inflight.is_some() => None,
-                // See the same arm above / 同上
+                // Another question's entry under the same key: the key is only a hash (see
+                // `InflightQuestion`), and waiting on it would hand this request another
+                // question's answer. It forwards itself instead.
+                // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
+                // 别的问题的应答交给这个请求。它自己转发。
                 Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
                 Entry::Occupied(entry) => {
                     let rx = entry.get().tx.subscribe();
@@ -873,6 +821,28 @@ pub(crate) async fn handle_forward_decision_logged(
         Ok((raw, _)) => trail.record_reply(forward_ecs, raw),
         Err(_) => trail.record_failure(forward_ecs),
     }
+
+    // 在这次转发的问题下写一条缓存 / Cache an answer under this forward's question
+    let cache = |bytes: &Bytes,
+                 rcode: ResponseCode,
+                 upstream: Option<Arc<str>>,
+                 ttls: (u32, u32),
+                 reach: &EcsReach| {
+        engine.insert_dns_cache_entry(
+            keys.slot,
+            CacheEntry::from_response(
+                bytes.clone(),
+                rcode,
+                upstream,
+                qname,
+                Arc::from(pipeline_id),
+                u16::from(qtype),
+                keys.flags,
+                ttls,
+            )
+            .with_reach(reach.clone()),
+        );
+    };
 
     // 应答回来以后的处理单独在堆上分配：它的状态（解析出来的报文、响应动作的结果等）只在应答回来
     // 以后才用得着，放在这个函数里，等上游的每个查询都得替它多留一千多字节
@@ -1008,19 +978,12 @@ pub(crate) async fn handle_forward_decision_logged(
                 if actions_to_run.is_empty() {
                     if cache_ttl > 0 {
                         let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
-                        engine.insert_dns_cache_entry(
-                            keys.slot,
-                            CacheEntry::from_response(
-                                raw.clone(),
-                                rcode,
-                                Some(Arc::from(actual_upstream.as_str())),
-                                qname,
-                                Arc::from(pipeline_id),
-                                u16::from(qtype),
-                                keys.flags,
-                                (cache_ttl, refresh_ttl),
-                            )
-                            .with_reach(trail.clone()),
+                        cache(
+                            &raw,
+                            rcode,
+                            Some(Arc::from(actual_upstream.as_str())),
+                            (cache_ttl, refresh_ttl),
+                            trail,
                         );
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
@@ -1095,19 +1058,12 @@ pub(crate) async fn handle_forward_decision_logged(
                         let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
                         if cache_ttl > 0 {
                             let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
-                            engine.insert_dns_cache_entry(
-                                keys.slot,
-                                CacheEntry::from_response(
-                                    ctx.raw.clone(),
-                                    ctx.msg.metadata.response_code,
-                                    Some(ctx.upstream.clone()),
-                                    qname,
-                                    Arc::from(pipeline_id),
-                                    u16::from(qtype),
-                                    keys.flags,
-                                    (cache_ttl, refresh_ttl),
-                                )
-                                .with_reach(trail.clone()),
+                            cache(
+                                &ctx.raw,
+                                ctx.msg.metadata.response_code,
+                                Some(ctx.upstream.clone()),
+                                (cache_ttl, refresh_ttl),
+                                trail,
                             );
                         }
                         if let Some(g) = cleanup_guard.as_mut() {
@@ -1138,20 +1094,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         }
                         if min_ttl > Duration::from_secs(0) {
                             let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
-                            engine.insert_dns_cache_entry(
-                                keys.slot,
-                                CacheEntry::from_response(
-                                    bytes.clone(),
-                                    rcode,
-                                    None,
-                                    qname,
-                                    Arc::from(pipeline_id),
-                                    u16::from(qtype),
-                                    keys.flags,
-                                    (ttl, ttl),
-                                )
-                                .with_reach(trail.clone()),
-                            );
+                            cache(&bytes, rcode, None, (ttl, ttl), trail);
                         } else if skip_cache {
                             // An answer that is not cached cannot renew the entry, so the
                             // refresh drops it and the next client request runs the rules.
@@ -1399,19 +1342,12 @@ pub(crate) async fn handle_forward_decision_logged(
                             if cache_ttl > 0 {
                                 let refresh_ttl =
                                     proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
-                                engine.insert_dns_cache_entry(
-                                    keys.slot,
-                                    CacheEntry::from_response(
-                                        ctx.raw.clone(),
-                                        ctx.msg.metadata.response_code,
-                                        Some(ctx.upstream.clone()),
-                                        qname,
-                                        Arc::from(pipeline_id),
-                                        u16::from(qtype),
-                                        keys.flags,
-                                        (cache_ttl, refresh_ttl),
-                                    )
-                                    .with_reach(trail.clone()),
+                                cache(
+                                    &ctx.raw,
+                                    ctx.msg.metadata.response_code,
+                                    Some(ctx.upstream.clone()),
+                                    (cache_ttl, refresh_ttl),
+                                    trail,
                                 );
                             }
                             if let Some(g) = cleanup_guard.as_mut() {
@@ -1436,20 +1372,7 @@ pub(crate) async fn handle_forward_decision_logged(
                             }
                             if min_ttl > Duration::from_secs(0) {
                                 let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
-                                engine.insert_dns_cache_entry(
-                                    keys.slot,
-                                    CacheEntry::from_response(
-                                        bytes.clone(),
-                                        rcode,
-                                        None,
-                                        qname,
-                                        Arc::from(pipeline_id),
-                                        u16::from(qtype),
-                                        keys.flags,
-                                        (ttl, ttl),
-                                    )
-                                    .with_reach(trail.clone()),
-                                );
+                                cache(&bytes, rcode, None, (ttl, ttl), trail);
                             }
                             if let Some(g) = cleanup_guard.as_mut() {
                                 g.defuse();
@@ -2296,6 +2219,64 @@ mod refresh_response_rule_tests {
             )]}]),
         );
         assert_eq!(refresh(&engine, key).await, Some(vec![FINAL]));
+    }
+
+    /// 上游失败以后 on_miss 动作给出的静态答案，有 min_ttl 时按它缓存
+    /// A static answer the miss actions give once the upstream failed is cached under min_ttl
+    #[tokio::test]
+    async fn a_refresh_caches_a_static_miss_answer_after_a_failure_under_min_ttl() {
+        let failing = spawn_upstream_answering_servfail().await;
+        let (engine, key) = engine_with_a_cached_answer(
+            json!({ "min_ttl": 60 }),
+            json!([{ "id": "main", "rules": [rule(
+                "first",
+                forward(&failing),
+                json!({ "response_actions_on_miss": answer_static() })
+            )]}]),
+        );
+        assert_eq!(
+            refresh(&engine, key).await,
+            Some(vec![STATIC.parse().unwrap()])
+        );
+    }
+
+    /// 响应跳转以后，规则越过的应答交给下一条 `allow` 规则复用，不再去问默认上游
+    /// After a response jump, an answer a rule continued past is reused by the next
+    /// `allow` rule rather than asking the default upstream
+    #[tokio::test]
+    async fn an_allow_after_a_continue_on_the_jump_path_reuses_the_answer() {
+        let pre = spawn_upstream_answering(OLD).await;
+        let passed = spawn_upstream_answering(PASSED_OVER).await;
+        let default = spawn_upstream_answering(FINAL).await;
+        let engine = engine_with(
+            json!({ "default_upstream": default, "upstream_timeout_ms": 1000 }),
+            json!([
+                { "id": "main", "rules": [rule(
+                    "first",
+                    forward(&pre),
+                    json!({
+                        "response_matchers": [{ "type": "upstream_equals", "value": pre }],
+                        "response_actions_on_match": jump_to("other")
+                    })
+                )] },
+                { "id": "other", "rules": [
+                    rule(
+                        "passed",
+                        forward(&passed),
+                        json!({
+                            "response_matchers": [{ "type": "upstream_equals", "value": passed }],
+                            "response_actions_on_match": continue_()
+                        })
+                    ),
+                    rule("allow", json!([{ "type": "allow" }]), json!({}))
+                ] }
+            ]),
+        );
+        let packet = query().to_vec().unwrap();
+        let reply =
+            crate::engine::test_support::ask(&engine, &packet, crate::engine::test_support::peer())
+                .await;
+        assert_eq!(a_records(&reply), vec![PASSED_OVER]);
     }
 
     #[tokio::test]
