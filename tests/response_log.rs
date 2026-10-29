@@ -299,7 +299,13 @@ async fn truncating_upstream(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // UDP first, and another pair when the TCP port of the same number is taken
     // already (by another test's connection, say), so the shared-port bind does not flake.
+    let mut tries = 0;
     let (udp, listener) = loop {
+        tries += 1;
+        assert!(
+            tries <= 20,
+            "port conflict: no port free for both UDP and TCP in 20 tries"
+        );
         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         match tokio::net::TcpListener::bind(udp.local_addr().unwrap()).await {
             Ok(listener) => break (udp, listener),

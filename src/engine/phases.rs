@@ -1337,7 +1337,7 @@ pub(crate) fn is_servfail(bytes: &[u8]) -> bool {
 mod refresh_response_rule_tests {
     use crate::cache::CacheEntry;
     use crate::engine::core::Engine;
-    use crate::matcher::RuntimePipelineConfig;
+    use crate::engine::test_support::{self as support, answering_upstream, engine_from};
     use bytes::Bytes;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
@@ -1360,18 +1360,12 @@ mod refresh_response_rule_tests {
     const FINAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
     const STATIC: &str = "192.0.2.5";
 
-    /// Local UDP upstream that answers every query with one A record.
-    /// 本机 UDP 上游：每个查询都回一条 A 记录。
-    async fn spawn_upstream_answering(ip: Ipv4Addr) -> String {
-        spawn_upstream_answering_with(ip, false).await
-    }
-
-    /// The same, the answers truncated (TC set) when `truncated` is
-    /// 同上，`truncated` 为真时应答带 TC 位
-    async fn spawn_upstream_answering_with(ip: Ipv4Addr, truncated: bool) -> String {
+    /// 本机 UDP 上游：每个查询都回一条 A 记录，应答带 TC 位
+    /// Local UDP upstream that answers every query with one A record, truncated (TC set)
+    async fn spawn_upstream_truncating(ip: Ipv4Addr) -> String {
         spawn_upstream_replying(move |query, question| {
             let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
-            resp.metadata.truncation = truncated;
+            resp.metadata.truncation = true;
             resp.add_query(question.clone());
             resp.add_answer(a_record(question, ip));
             resp
@@ -1396,22 +1390,12 @@ mod refresh_response_rule_tests {
     async fn spawn_upstream_replying(
         reply: impl Fn(&Message, &Query) -> Message + Send + 'static,
     ) -> String {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-                let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = query.queries.first() else {
-                    continue;
-                };
-                let resp = reply(&query, question);
-                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
-            }
-        });
-        addr
+        support::upstream(move |query| match query.queries.first() {
+            Some(question) => vec![(Duration::ZERO, reply(query, question).to_vec().unwrap())],
+            None => Vec::new(),
+        })
+        .await
+        .address
     }
 
     fn a_record(question: &Query, ip: Ipv4Addr) -> Record {
@@ -1498,14 +1482,7 @@ mod refresh_response_rule_tests {
         for (key, value) in settings.as_object().unwrap() {
             all_settings[key] = value.clone();
         }
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(json!({ "settings": all_settings, "pipelines": pipelines }))
-                .expect("parse config");
-        Engine::new(
-            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-            "test".to_string(),
-        )
-        .expect("engine")
+        engine_from(json!({ "settings": all_settings, "pipelines": pipelines }))
     }
 
     /// Caches an answer with `ip` for `pipeline` with the given TTL (0: already
@@ -1737,15 +1714,19 @@ mod refresh_response_rule_tests {
     /// what refresh.rs logs
     /// 同上，另外给出刷新算不算成功，也就是 refresh.rs 记录的结果
     async fn refresh_succeeds(engine: &Engine, key: u64) -> (bool, Option<Vec<Ipv4Addr>>) {
-        let result = refresh_result(engine, key).await;
+        let result = refresh_result(engine, engine.refresh_of(key)).await;
         (
             result.is_ok(),
             engine.cached(key).map(|entry| a_records(&entry.bytes)),
         )
     }
 
-    /// What the refresh call returns / 刷新调用的返回值
-    async fn refresh_result(engine: &Engine, key: u64) -> anyhow::Result<Bytes> {
+    /// 更新 `target` 所指条目的刷新调用的返回值
+    /// What the refresh call renewing what `target` names returns
+    async fn refresh_result(
+        engine: &Engine,
+        target: crate::engine::refresh::RefreshTarget,
+    ) -> anyhow::Result<Bytes> {
         let client: SocketAddr = CLIENT.parse().unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1754,7 +1735,7 @@ mod refresh_response_rule_tests {
                 client,
                 true,
                 None,
-                Some(engine.refresh_of(key)),
+                Some(target),
                 Some(engine.state.load_full()),
             ),
         )
@@ -1762,27 +1743,14 @@ mod refresh_response_rule_tests {
         .expect("refresh finishes")
     }
 
-    /// The same, renewing what `target` names / 同上，更新 `target` 所指的条目
+    /// 同 [`refresh`]，更新 `target` 所指的条目 / The same as [`refresh`], renewing what
+    /// `target` names
     async fn refresh_as(
         engine: &Engine,
         key: u64,
         target: crate::engine::refresh::RefreshTarget,
     ) -> Option<Vec<Ipv4Addr>> {
-        let client: SocketAddr = CLIENT.parse().unwrap();
-        let state = engine.state.load_full();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            engine.handle_packet_internal(
-                &query().to_vec().unwrap(),
-                client,
-                true,
-                None,
-                Some(target),
-                Some(state),
-            ),
-        )
-        .await
-        .expect("refresh finishes");
+        let _ = refresh_result(engine, target).await;
         engine.cached(key).map(|entry| a_records(&entry.bytes))
     }
 
@@ -1793,8 +1761,8 @@ mod refresh_response_rule_tests {
     async fn refresh_past_the_first_answer(
         response_rules: impl FnOnce(&str, &str) -> Value,
     ) -> Option<Vec<Ipv4Addr>> {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
-        let second = spawn_upstream_answering(FINAL).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
+        let second = answering_upstream(FINAL, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([{ "id": "main", "rules": [
@@ -1816,7 +1784,7 @@ mod refresh_response_rule_tests {
         later_rules: Vec<Value>,
         target: Value,
     ) -> Option<Vec<Ipv4Addr>> {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
         let mut rules = vec![rule(
             "first",
             forward(&first),
@@ -1872,7 +1840,7 @@ mod refresh_response_rule_tests {
     /// otherwise renewals could keep an outdated answer forever.
     #[tokio::test]
     async fn a_refresh_drops_the_entry_renewed_while_it_ran() {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([
@@ -1895,7 +1863,7 @@ mod refresh_response_rule_tests {
     /// requesters: the refresh drops the answer it renews, not this one.
     #[tokio::test]
     async fn a_refresh_leaves_an_answer_another_request_wrote_meanwhile() {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([
@@ -1977,7 +1945,7 @@ mod refresh_response_rule_tests {
     #[tokio::test]
     async fn a_refresh_runs_the_miss_actions_on_a_failure_reply() {
         let failing = spawn_upstream_answering_servfail().await;
-        let backup = spawn_upstream_answering(FINAL).await;
+        let backup = answering_upstream(FINAL, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([{ "id": "main", "rules": [rule(
@@ -2013,9 +1981,9 @@ mod refresh_response_rule_tests {
     /// `allow` rule rather than asking the default upstream
     #[tokio::test]
     async fn an_allow_after_a_continue_on_the_jump_path_reuses_the_answer() {
-        let pre = spawn_upstream_answering(OLD).await;
-        let passed = spawn_upstream_answering(PASSED_OVER).await;
-        let default = spawn_upstream_answering(FINAL).await;
+        let pre = answering_upstream(OLD, 300).await.address;
+        let passed = answering_upstream(PASSED_OVER, 300).await.address;
+        let default = answering_upstream(FINAL, 300).await.address;
         let engine = engine_with(
             json!({ "default_upstream": default, "upstream_timeout_ms": 1000 }),
             json!([
@@ -2041,9 +2009,7 @@ mod refresh_response_rule_tests {
             ]),
         );
         let packet = query().to_vec().unwrap();
-        let reply =
-            crate::engine::test_support::ask(&engine, &packet, crate::engine::test_support::peer())
-                .await;
+        let reply = support::ask(&engine, &packet, support::peer()).await;
         assert_eq!(a_records(&reply), vec![PASSED_OVER]);
     }
 
@@ -2093,7 +2059,7 @@ mod refresh_response_rule_tests {
 
     #[tokio::test]
     async fn a_refresh_drops_the_entry_when_a_continue_jumps_to_an_answering_target() {
-        let answering = spawn_upstream_answering(FINAL).await;
+        let answering = answering_upstream(FINAL, 300).await.address;
         let later = vec![rule("jump", jump_to("other"), json!({}))];
         let target = rule("target", forward(&answering), json!({}));
         let cached =
@@ -2103,7 +2069,7 @@ mod refresh_response_rule_tests {
 
     #[tokio::test]
     async fn a_refresh_caches_the_answer_of_a_response_action_forward() {
-        let replacement = spawn_upstream_answering(FINAL).await;
+        let replacement = answering_upstream(FINAL, 300).await.address;
         let cached = refresh_with_actions_on_the_answer(
             json!({}),
             forward(&replacement),
@@ -2116,7 +2082,7 @@ mod refresh_response_rule_tests {
 
     #[tokio::test]
     async fn a_refresh_caches_a_deny_under_min_ttl() {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({ "min_ttl": 60 }),
             json!([{ "id": "main", "rules": [rule(
@@ -2148,7 +2114,7 @@ mod refresh_response_rule_tests {
 
     #[tokio::test]
     async fn a_refresh_keeps_the_entry_when_a_continue_jumps_to_a_target_serving_stale() {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({ "serve_stale": true }),
             json!([
@@ -2209,7 +2175,7 @@ mod refresh_response_rule_tests {
     /// 时一样（见下一个测试），刷新没有拿到这个条目的新应答，条目保留。
     #[tokio::test]
     async fn a_refresh_keeps_the_entry_when_a_continue_jumps_to_a_target_that_falls_back() {
-        let backup = spawn_upstream_answering(FINAL).await;
+        let backup = answering_upstream(FINAL, 300).await.address;
         for actions in [answer_static(), forward(&backup)] {
             let later = vec![rule("jump", jump_to("other"), json!({}))];
             let cached = refresh_with_actions_on_the_answer(
@@ -2227,7 +2193,7 @@ mod refresh_response_rule_tests {
     /// 目标的 on_miss 动作跳到另一个作答的 pipeline 时也一样
     #[tokio::test]
     async fn a_refresh_keeps_the_entry_when_the_target_falls_back_by_a_jump() {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([
@@ -2318,8 +2284,8 @@ mod refresh_response_rule_tests {
     /// 都一样。
     #[tokio::test]
     async fn a_refresh_keeps_the_entry_when_a_continue_after_a_failure_answers() {
-        let first = spawn_upstream_answering(PASSED_OVER).await;
-        let backup = spawn_upstream_answering(FINAL).await;
+        let first = answering_upstream(PASSED_OVER, 300).await.address;
+        let backup = answering_upstream(FINAL, 300).await.address;
         let passed = || {
             rule(
                 "first",
@@ -2405,7 +2371,7 @@ mod refresh_response_rule_tests {
     /// 上游失败时一样，删掉条目。
     #[tokio::test]
     async fn a_refresh_drops_the_entry_when_it_passes_a_fresh_answer_after_a_failure() {
-        let second = spawn_upstream_answering(PASSED_OVER).await;
+        let second = answering_upstream(PASSED_OVER, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([{ "id": "main", "rules": [
@@ -2438,7 +2404,12 @@ mod refresh_response_rule_tests {
                 json!({ "response_actions_on_miss": jump_to("nowhere") })
             )] }]),
         );
-        let error = format!("{:#}", refresh_result(&engine, key).await.unwrap_err());
+        let error = format!(
+            "{:#}",
+            refresh_result(&engine, engine.refresh_of(key))
+                .await
+                .unwrap_err()
+        );
         assert!(!error.contains("the rules answered SERVFAIL"), "{error}");
     }
 
@@ -2462,7 +2433,12 @@ mod refresh_response_rule_tests {
                     { "id": "other", "rules": [rule("servfail", servfail.clone(), json!({}))] }
                 ]),
             );
-            let error = format!("{:#}", refresh_result(&engine, key).await.unwrap_err());
+            let error = format!(
+                "{:#}",
+                refresh_result(&engine, engine.refresh_of(key))
+                    .await
+                    .unwrap_err()
+            );
             assert!(!error.contains("found no answer"), "{on_miss}: {error}");
             assert_eq!(
                 engine.cached(key).map(|entry| a_records(&entry.bytes)),
@@ -2524,7 +2500,7 @@ mod refresh_response_rule_tests {
     /// 只拿到被截断的应答（关了 TCP 回退）：它不写缓存，没有拿来更新条目的应答，刷新算失败
     #[tokio::test]
     async fn a_refresh_that_gets_only_a_truncated_answer_fails() {
-        let truncating = spawn_upstream_answering_with(FINAL, true).await;
+        let truncating = spawn_upstream_truncating(FINAL).await;
         let (engine, key) = engine_with_a_cached_answer(
             json!({ "enable_tcp_fallback": false }),
             json!([{ "id": "main", "rules": [rule("all", forward(&truncating), json!({}))] }]),
@@ -2541,7 +2517,7 @@ mod refresh_response_rule_tests {
     /// 时一样保留
     #[tokio::test]
     async fn a_refresh_whose_jump_target_gets_only_a_truncated_answer_keeps_the_entry() {
-        let truncating = spawn_upstream_answering_with(FINAL, true).await;
+        let truncating = spawn_upstream_truncating(FINAL).await;
         let target = rule("target", forward(&truncating), json!({}));
         let settings = json!({ "enable_tcp_fallback": false });
         let after_a_continue = refresh_with_actions_on_the_answer(
@@ -2559,7 +2535,7 @@ mod refresh_response_rule_tests {
 
     #[tokio::test]
     async fn a_refresh_that_gets_an_answer_succeeds() {
-        let answering = spawn_upstream_answering(FINAL).await;
+        let answering = answering_upstream(FINAL, 300).await.address;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([{ "id": "main", "rules": [rule("all", forward(&answering), json!({}))] }]),
@@ -2685,7 +2661,13 @@ mod tcp_fallback_tests {
         tcp: Option<Duration>,
         partial: Option<Ipv4Addr>,
     ) -> TruncatingUpstream {
+        let mut tries = 0;
         let (udp, listener, closed_tcp) = loop {
+            tries += 1;
+            assert!(
+                tries <= 20,
+                "port conflict: no port free for both UDP and TCP in 20 tries"
+            );
             let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr = udp.local_addr().unwrap();
             let bound = if tcp.is_some() {

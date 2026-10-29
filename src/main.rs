@@ -1964,9 +1964,26 @@ mod tests {
     /// A local upstream on one port for UDP and TCP: it takes queries and connections and
     /// never answers
     async fn spawn_silent_upstream() -> SocketAddr {
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // 先拿 UDP 端口，再在同号上绑 TCP：TCP 挑临时端口时不看 UDP 的占用，反过来更容易撞上别的
+        // 测试占着的 UDP 端口。同号的 TCP 端口正被占着时换一对，最多试 20 次
+        // The UDP port first, then TCP on the same number: the TCP ephemeral allocator
+        // does not look at UDP, so the other order runs into UDP ports other tests hold
+        // more often. Another pair when that TCP port is taken, at most 20 tries
+        let mut tries = 0;
+        let (tcp, udp) = loop {
+            tries += 1;
+            assert!(
+                tries <= 20,
+                "port conflict: no port free for both UDP and TCP in 20 tries"
+            );
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            match TcpListener::bind(udp.local_addr().unwrap()).await {
+                Ok(tcp) => break (tcp, udp),
+                Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(err) => panic!("bind tcp on the udp port: {err}"),
+            }
+        };
         let addr = tcp.local_addr().unwrap();
-        let udp = UdpSocket::bind(addr).await.unwrap();
         tokio::spawn(async move {
             let mut held = Vec::new();
             let mut buf = [0u8; 512];

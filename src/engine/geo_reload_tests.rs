@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RData, RecordType};
-use hickory_proto::serialize::binary::BinDecodable;
+use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
+use crate::engine::test_support::first_a;
 use crate::matcher::RuntimePipelineConfig;
 
 /// 规则命中时的应答 / The answer when the rule matches
@@ -98,15 +98,7 @@ async fn ask_from(engine: &Engine, name: &str, peer: SocketAddr) -> Option<Ipv4A
         .await
         .expect("answer in time")
         .expect("answer");
-    match Message::from_bytes(&reply)
-        .expect("parse reply")
-        .answers
-        .first()
-        .map(|record| &record.data)
-    {
-        Some(RData::A(address)) => Some(address.0),
-        _ => None,
-    }
+    first_a(&reply)
 }
 
 async fn ask(engine: &Engine, name: &str) -> Option<Ipv4Addr> {

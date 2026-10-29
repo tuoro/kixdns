@@ -9,14 +9,21 @@ use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::process::Child;
 
 /// A local port free for both TCP and UDP / 本机上 TCP 和 UDP 都空着的端口
+///
+/// 先拿 UDP 端口再看同号的 TCP：TCP 挑临时端口时不看 UDP 的占用，反过来更容易撞上别的测试占着的
+/// UDP 端口。最多试 20 次。
+/// The UDP port first, then TCP on the same number: the TCP ephemeral allocator does
+/// not look at UDP, so the other order runs into UDP ports other tests hold more often.
+/// At most 20 tries.
 pub fn free_port() -> u16 {
-    loop {
-        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = tcp.local_addr().unwrap().port();
-        if UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+    for _ in 0..20 {
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = udp.local_addr().unwrap().port();
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
             return port;
         }
     }
+    panic!("port conflict: no port free for both UDP and TCP in 20 tries");
 }
 
 /// The running binary, ended when the test ends, a failing one too
