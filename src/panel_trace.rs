@@ -141,7 +141,6 @@ pub fn record_decision(event: &DecisionMade<'_>) {
     }
 }
 
-/// 记录当前请求最近选中的管线，供缺少管线上下文的事件补充明细。
 /// 当前任务是否在诊断作用域里：诊断查询不进查询排行，免得测试用的域名和客户端 IP 混进统计
 /// Whether the current task runs inside a diagnostic scope: diagnostic queries stay out of the
 /// query ranking, so test domains and client IPs never mix into the statistics
@@ -149,6 +148,9 @@ pub fn active() -> bool {
     TRACE.try_with(|_| ()).is_ok()
 }
 
+/// 记下当前请求最近选中的管线，供缺少管线上下文的事件补充明细
+/// Notes the pipeline the current request selected last, for events that lack pipeline
+/// context
 pub fn set_pipeline(pipeline: &str) {
     let _ = TRACE.try_with(|trace| {
         trace.borrow_mut().pipeline = Some(pipeline.to_owned());
