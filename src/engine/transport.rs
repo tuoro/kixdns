@@ -1653,7 +1653,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 /// 服务器回了、但用不了的回答的标记：HTTP 错误状态码、别的媒体类型、比任何 DNS 消息都长的正文，或者答的是别的问题。
 /// 连接本身正常，重试无益（只有传输层错误才指示连接可能已死）
 #[derive(Debug)]
-struct DohAnswerError(anyhow::Error);
+struct DohAnswerError(String);
 
 impl std::fmt::Display for DohAnswerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1664,7 +1664,7 @@ impl std::fmt::Display for DohAnswerError {
 impl std::error::Error for DohAnswerError {}
 
 fn doh_answer_error(message: String) -> anyhow::Error {
-    anyhow::Error::new(DohAnswerError(anyhow::anyhow!(message)))
+    anyhow::Error::new(DohAnswerError(message))
 }
 
 /// The media type of DNS messages over HTTPS (RFC 8484 §6)
@@ -1843,7 +1843,7 @@ impl DohClient {
                 // the retry then loads the fresh client (new connections).
                 // 透明重试：DNS 查询语义幂等，单次重试安全。
                 // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
-                let rebuilt = self.record_error(upstream);
+                let rebuilt = self.record_error(upstream, &state);
                 let remaining = timeout_dur.saturating_sub(start.elapsed());
                 if remaining < MIN_RETRY_BUDGET {
                     return Err(err);
@@ -1931,15 +1931,12 @@ impl DohClient {
         })
         .await;
 
-        match result {
-            Ok(Ok(bytes)) => Ok(bytes),
-            // reqwest send / IO / body error — transport-level, retryable
-            // reqwest 发送 / IO / 响应体错误 —— 传输层，可重试
-            Ok(Err(e)) => Err(e),
-            // Timeout — transport-level, retryable
-            // 超时 —— 传输层，可重试
-            Err(_elapsed) => Err(anyhow::anyhow!("doh request timeout")),
-        }
+        // 超时算传输层错误，可以重试；内层的错误照原样交出：发送、IO、正文出错可以重试，
+        // DohAnswerError 不行（见 `is_transport_error`）
+        // A timeout is a transport error and can be retried; inner errors go out as they
+        // are: send, IO and body errors can be retried, a DohAnswerError cannot (see
+        // `is_transport_error`)
+        result.map_err(|_elapsed| anyhow::anyhow!("doh request timeout"))?
     }
 
     /// Record a consecutive transport error for the upstream. When the count
@@ -1947,14 +1944,7 @@ impl DohClient {
     /// its dead connection pool) and reset the counter. Returns true if rebuilt.
     /// 记录 upstream 的连续传输错误。计数达阈值时重建该上游的 reqwest 客户端
     /// （驱逐其死连接池）并清零计数。重建返回 true。
-    fn record_error(&self, upstream: &str) -> bool {
-        let state = match self.upstream(upstream) {
-            Ok(state) => state,
-            Err(e) => {
-                warn!(upstream = upstream, error = %e, "failed to build DoH client");
-                return false;
-            }
-        };
+    fn record_error(&self, upstream: &str, state: &DohUpstream) -> bool {
         let count = state.consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
         if self.health_error_threshold > 0 && count >= self.health_error_threshold {
             match Self::build_client(self.pool_max_idle_per_host) {
@@ -1990,6 +1980,13 @@ impl DohClient {
             );
             false
         }
+    }
+
+    /// [`Self::record_error`] for `upstream` by its name / 按名字找到 `upstream` 再 [`Self::record_error`]
+    #[cfg(test)]
+    fn record_error_of(&self, upstream: &str) -> bool {
+        let state = self.upstream(upstream).expect("doh upstream state");
+        self.record_error(upstream, &state)
     }
 
     /// Clear the consecutive error counter of `upstream` (what a successful
@@ -2243,31 +2240,41 @@ pub(crate) fn check_upstream_address(
     }
 }
 
-fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
+/// DoT、DoQ 上游地址共有的部分：没写协议时补上 `scheme`，主机，端口（默认 853），不许带路径，
+/// `sni`/`servername` 参数（空的不算，多个时取最后一个）。错误文字里的协议名就是 `scheme`
+/// What DoT and DoQ upstream addresses share: `scheme` added when none is written, the
+/// host, the port (853 by default), no path, and the `sni`/`servername` parameter (an
+/// empty one does not count, the last of several wins). The errors name `scheme`
+fn parse_tls_upstream(
+    upstream: &str,
+    scheme: &str,
+) -> anyhow::Result<(Url, String, u16, Option<String>)> {
     let url = if upstream.contains("://") {
         Url::parse(upstream)
     } else {
-        Url::parse(&format!("dot://{}", upstream))
+        Url::parse(&format!("{scheme}://{upstream}"))
     }
-    .context("invalid dot upstream url")?;
+    .with_context(|| format!("invalid {scheme} upstream url"))?;
 
-    let host = url_host(&url).context("dot upstream missing host")?;
+    let host = url_host(&url).with_context(|| format!("{scheme} upstream missing host"))?;
     let port = url.port().unwrap_or(853);
 
     if !url.path().is_empty() && url.path() != "/" {
-        anyhow::bail!("dot upstream should not contain path");
+        anyhow::bail!("{scheme} upstream should not contain path");
     }
 
-    let mut sni: Option<String> = None;
-    if url.query().is_some() {
-        for (k, v) in url.query_pairs() {
-            if (k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername"))
-                && !v.is_empty()
-            {
-                sni = Some(v.to_string());
-            }
-        }
-    }
+    let sni = url
+        .query_pairs()
+        .filter(|(k, v)| {
+            (k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername")) && !v.is_empty()
+        })
+        .last()
+        .map(|(_, v)| v.to_string());
+    Ok((url, host, port, sni))
+}
+
+fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
+    let (_, host, port, sni) = parse_tls_upstream(upstream, "dot")?;
 
     let connect_addr = host_port(&host, port);
     let sni_value = sni.unwrap_or(host);
@@ -2318,11 +2325,6 @@ struct DoqConnectionInfo {
 /// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
 pub type DoqConnectionPool = ConnectionPool<DoqMuxClient>;
 
-/// DoQ (DNS over QUIC) 客户端，管理多个上游的 QUIC 连接池
-/// DoQ (DNS over QUIC) client, managing QUIC connection pools for multiple upstreams
-///
-/// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
-/// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
 /// DoQ 一次尝试的失败原因，按类型保留 quinn 的原始错误
 /// Why one DoQ attempt failed, keeping quinn's own error by type
 ///
@@ -2372,6 +2374,11 @@ impl std::error::Error for DoqFailure {
     }
 }
 
+/// DoQ (DNS over QUIC) 客户端，管理多个上游的 QUIC 连接池
+/// DoQ (DNS over QUIC) client, managing QUIC connection pools for multiple upstreams
+///
+/// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
+/// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
 pub struct DoqClient {
     pools: UpstreamPools<DoqMuxClient>,
     /// 每个池几个客户端，至少一个 / How many clients a pool has, at least one
@@ -2401,15 +2408,16 @@ pub struct DoqMuxClient {
     zero_rtt_rejected: Arc<AtomicBool>,
     /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
     conn_create_time: AtomicU64,
-    /// 连接老化：最大存活时间（毫秒）/ Connection aging: max age (ms)
-    max_age_ms: AtomicU64,
     /// 空闲超时：最后请求时间（毫秒）/ Idle timeout: last request time (ms)
     last_request_time: AtomicU64,
-    /// 空闲超时：空闲超时时间（毫秒）/ Idle timeout: idle timeout (ms)
-    idle_timeout_ms: AtomicU64,
     /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
     last_health_check_time: AtomicU64,
 }
+
+/// DoQ 连接最长用多久（毫秒）：30 分钟 / How long a DoQ connection may live (ms): 30 minutes
+const DOQ_MAX_AGE_MS: u64 = 30 * 60 * 1000;
+/// DoQ 连接空闲多久（毫秒）就换新的：5 分钟 / How long a DoQ connection may sit idle (ms) before a new one: 5 minutes
+const DOQ_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 impl DoqClient {
     /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
@@ -2427,11 +2435,7 @@ impl DoqClient {
         keepalive_interval_ms: u64,
         enable_0rtt: bool,
     ) -> anyhow::Result<Self> {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
-        let mut tls = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let mut tls = build_tls_client_config()?;
         tls.alpn_protocols = vec![b"doq".to_vec()];
         tls.enable_early_data = enable_0rtt;
 
@@ -2527,9 +2531,7 @@ impl DoqMuxClient {
             runtime,
             zero_rtt_rejected,
             conn_create_time: AtomicU64::new(0),
-            max_age_ms: AtomicU64::new(30 * 60 * 1000), // 30 minutes default
             last_request_time: AtomicU64::new(0),
-            idle_timeout_ms: AtomicU64::new(5 * 60 * 1000), // 5 minutes default
             last_health_check_time: AtomicU64::new(0),
         }
     }
@@ -2554,8 +2556,8 @@ impl DoqMuxClient {
 
         // Check connection aging
         let create_time = self.conn_create_time.load(Ordering::Acquire);
-        let max_age = self.max_age_ms.load(Ordering::Acquire);
-        if create_time > 0 && max_age > 0 {
+        let max_age = DOQ_MAX_AGE_MS;
+        if create_time > 0 {
             let age_ms = now.saturating_sub(create_time);
             if age_ms > max_age {
                 info!(
@@ -2571,8 +2573,8 @@ impl DoqMuxClient {
 
         // Check idle timeout
         let last_req = self.last_request_time.load(Ordering::Acquire);
-        let idle_timeout = self.idle_timeout_ms.load(Ordering::Acquire);
-        if last_req > 0 && idle_timeout > 0 {
+        let idle_timeout = DOQ_IDLE_TIMEOUT_MS;
+        if last_req > 0 {
             let idle_ms = now.saturating_sub(last_req);
             if idle_ms > idle_timeout {
                 info!(
@@ -2605,8 +2607,7 @@ impl DoqMuxClient {
             anyhow::bail!("invalid doq upstream: {}", self.upstream);
         }
 
-        self.send_with_retry(&target, packet, timeout_dur, true)
-            .await
+        self.send_with_retry(&target, packet, timeout_dur).await
     }
 
     async fn send_with_retry(
@@ -2614,7 +2615,6 @@ impl DoqMuxClient {
         target: &DoqTarget,
         packet: &[u8],
         timeout_dur: Duration,
-        allow_retry: bool,
     ) -> anyhow::Result<Bytes> {
         // RFC 9250 §4.2.1: DNS Message ID over DoQ MUST be set to 0.
         // We preserve original ID for local correlation and restore it in the final response.
@@ -2625,7 +2625,8 @@ impl DoqMuxClient {
         }
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-        let mut allow_retry = allow_retry;
+        // 一次查询最多重试一次 / A query is retried at most once
+        let mut allow_retry = true;
         let mut timeout_dur = timeout_dur;
 
         loop {
@@ -2653,12 +2654,6 @@ impl DoqMuxClient {
                 anyhow::bail!("doq timeout before sending the query");
             }
 
-            // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
-            // with a 2-octet length field, followed by the DNS message content.
-            // Each query uses a separate bidirectional stream; the message boundary
-            // is signalled by FIN.
-            // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
-            // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
             let resp = timeout(query_budget, async {
                 // 内层返回带类型的失败，而不是 anyhow：每一步都被 context 包过
                 // 之后，anyhow 的 to_string 只剩最外层那一句，quinn 的原始错误
@@ -2901,18 +2896,14 @@ impl DoqMuxClient {
     /// not already marked as rejected
     fn zero_rtt_retry_allowed(&self, target: &DoqTarget) -> bool {
         target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt)
-            && !self
-                .zero_rtt_rejected
-                .load(std::sync::atomic::Ordering::Relaxed)
+            && !self.zero_rtt_rejected.load(Ordering::Relaxed)
     }
 
+    /// 给这个上游关掉 0-RTT；查和改是同一步，同时来的几个里只有一个记 warn
+    /// Switch 0-RTT off for this upstream; checking and setting is one step, so of
+    /// several arriving at once only one logs the warn
     fn disable_zero_rtt(&self) {
-        let was_rejected = self
-            .zero_rtt_rejected
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if !was_rejected {
-            self.zero_rtt_rejected
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        if !self.zero_rtt_rejected.swap(true, Ordering::Relaxed) {
             warn!(
                 upstream = %self.upstream,
                 "DoQ 0-RTT rejected or unstable, disabling 0-RTT for this upstream until restart"
@@ -3001,20 +2992,10 @@ impl DoqMuxClient {
             .connect(addr, target.sni.as_ref())
             .context("doq connect failed")?;
 
-        // Determine whether to enable 0-RTT for this specific upstream
-        // 决定是否为此特定上游启用 0-RTT
-        // Priority: target setting > global setting
-        // 优先级：上游设置 > 全局设置
-        let enable_0rtt = target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt);
-
-        // Auto-fallback: if 0-RTT was previously rejected, skip it for this connection
-        // 自动回退：如果 0-RTT 之前被拒绝，跳过本次连接的 0-RTT
-        let was_rejected = self
-            .zero_rtt_rejected
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let should_try_0rtt = enable_0rtt && !was_rejected;
-
-        if should_try_0rtt {
+        // 0-RTT：上游设置优先于全局设置，之前被拒绝过就跳过（见 `zero_rtt_retry_allowed`）
+        // 0-RTT: the upstream's setting before the global one, skipped once it was
+        // rejected (see `zero_rtt_retry_allowed`)
+        let connecting = if self.zero_rtt_retry_allowed(target) {
             // Security warning: 0-RTT (early data) is vulnerable to replay attacks
             // per RFC 8446 §8 and RFC 9001 §5.4. DNS queries are idempotent, so
             // replay impact is limited to redundant lookups and potential cache
@@ -3047,16 +3028,13 @@ impl DoqMuxClient {
                     );
                     return Ok((conn, true));
                 }
-                Err(connecting) => {
-                    // 0-RTT not available (no previous session), fall back to normal connect
-                    // 0-RTT 不可用（无先前会话），回退到正常连接
-                    let connection = timeout(timeout_dur, connecting)
-                        .await
-                        .context("doq connect timeout")??;
-                    return Ok((connection, false));
-                }
+                // 0-RTT not available (no previous session), fall back to normal connect
+                // 0-RTT 不可用（无先前会话），回退到正常连接
+                Err(connecting) => connecting,
             }
-        }
+        } else {
+            connecting
+        };
 
         let connection = timeout(timeout_dur, connecting)
             .await
@@ -3074,40 +3052,21 @@ impl DoqMuxClient {
 }
 
 fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
-    let url = if upstream.contains("://") {
-        Url::parse(upstream)
-    } else {
-        Url::parse(&format!("doq://{}", upstream))
-    }
-    .context("invalid doq upstream url")?;
+    let (url, host, port, sni) = parse_tls_upstream(upstream, "doq")?;
 
-    let host = url_host(&url).context("doq upstream missing host")?;
-    let port = url.port().unwrap_or(853);
-
-    if !url.path().is_empty() && url.path() != "/" {
-        anyhow::bail!("doq upstream should not contain path");
-    }
-
-    let mut sni: Option<String> = None;
     let mut enable_0rtt: Option<bool> = None;
-    if url.query().is_some() {
-        for (k, v) in url.query_pairs() {
-            if k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername") {
-                if !v.is_empty() {
-                    sni = Some(v.to_string());
+    for (k, v) in url.query_pairs() {
+        if k.eq_ignore_ascii_case("0rtt") || k.eq_ignore_ascii_case("enable_0rtt") {
+            // Parse 0rtt parameter: true/false/1/0
+            // 解析 0rtt 参数：true/false/1/0
+            enable_0rtt = match v.to_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                _ => {
+                    warn!("invalid doq 0rtt value: {}, ignoring", v);
+                    None
                 }
-            } else if k.eq_ignore_ascii_case("0rtt") || k.eq_ignore_ascii_case("enable_0rtt") {
-                // Parse 0rtt parameter: true/false/1/0
-                // 解析 0rtt 参数：true/false/1/0
-                enable_0rtt = match v.to_lowercase().as_str() {
-                    "true" | "1" | "yes" | "on" => Some(true),
-                    "false" | "0" | "no" | "off" => Some(false),
-                    _ => {
-                        warn!("invalid doq 0rtt value: {}, ignoring", v);
-                        None
-                    }
-                };
-            }
+            };
         }
     }
 
@@ -3859,7 +3818,7 @@ mod tests {
 
         for attempt in 1..=5 {
             assert!(
-                !client.record_error(upstream),
+                !client.record_error_of(upstream),
                 "a disabled health check must never rebuild (error {attempt})"
             );
         }
@@ -3997,11 +3956,11 @@ mod tests {
             Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
         // Two errors stay below the threshold (3): no rebuild.
         assert!(
-            !client.record_error(upstream),
+            !client.record_error_of(upstream),
             "no rebuild before threshold (1/3)"
         );
         assert!(
-            !client.record_error(upstream),
+            !client.record_error_of(upstream),
             "no rebuild before threshold (2/3)"
         );
         assert_eq!(
@@ -4010,7 +3969,10 @@ mod tests {
             "client pointer must be unchanged below threshold"
         );
         // Third error reaches the threshold: pool rebuilt.
-        assert!(client.record_error(upstream), "rebuild at threshold (3/3)");
+        assert!(
+            client.record_error_of(upstream),
+            "rebuild at threshold (3/3)"
+        );
         assert_ne!(
             Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize,
             ptr_before,
@@ -4036,9 +3998,9 @@ mod tests {
             Arc::as_ptr(&client.upstream(failing).unwrap().client.load_full()) as usize;
 
         for _ in 0..2 {
-            assert!(!client.record_error(failing));
+            assert!(!client.record_error_of(failing));
         }
-        assert!(client.record_error(failing), "third error rebuilds");
+        assert!(client.record_error_of(failing), "third error rebuilds");
 
         assert_ne!(
             Arc::as_ptr(&client.upstream(failing).unwrap().client.load_full()) as usize,
@@ -4060,20 +4022,20 @@ mod tests {
         let client = DohClient::new(8, 3).expect("build doh client");
         let upstream = "doh:1.1.1.1";
 
-        client.record_error(upstream);
-        client.record_error(upstream);
+        client.record_error_of(upstream);
+        client.record_error_of(upstream);
         client.record_success(upstream); // reset to 0
         // Counter restarted: need 3 more to rebuild, not just 1.
         assert!(
-            !client.record_error(upstream),
+            !client.record_error_of(upstream),
             "counter reset: 1/3 after success"
         );
         assert!(
-            !client.record_error(upstream),
+            !client.record_error_of(upstream),
             "counter reset: 2/3 after success"
         );
         assert!(
-            client.record_error(upstream),
+            client.record_error_of(upstream),
             "counter reset: rebuild at 3/3"
         );
     }
@@ -4086,13 +4048,13 @@ mod tests {
         // 一个 upstream 的错误不得累加到另一个 upstream。
         let client = DohClient::new(8, 3).expect("build doh client");
 
-        client.record_error("doh:8.8.8.8");
-        client.record_error("doh:8.8.8.8");
+        client.record_error_of("doh:8.8.8.8");
+        client.record_error_of("doh:8.8.8.8");
         // A success on a *different* upstream must not touch 8.8.8.8's count.
         client.record_success("doh:1.1.1.1");
         // 8.8.8.8 still at 2 — the 3rd error rebuilds.
         assert!(
-            client.record_error("doh:8.8.8.8"),
+            client.record_error_of("doh:8.8.8.8"),
             "isolated counter reaches threshold independently"
         );
     }
@@ -4475,6 +4437,103 @@ mod tests {
             .get(upstream)
             .expect("the first query builds the pool");
         assert_eq!(pool.clients.len(), 1);
+    }
+
+    /// 上游拒绝过 0-RTT 以后，新连接不再发早期数据：同一张会话票据，没标记时恢复出的连接用 0-RTT，
+    /// 标记以后就不用
+    /// Once an upstream rejected 0-RTT, new connections send no early data: with the same
+    /// session ticket, a resumed connection uses 0-RTT before the mark and not after it
+    #[tokio::test]
+    async fn doq_skips_0rtt_once_it_was_rejected() {
+        let (mut server, mut client_tls) = localhost_tls(&[b"doq"]);
+        server.max_early_data_size = u32::MAX;
+        client_tls.enable_early_data = true;
+        let addr = spawn_doq_upstream(server, Duration::ZERO, |_, _| {
+            DoqReply::Answer(Duration::ZERO)
+        })
+        .await;
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, true);
+        let target = parse_doq_target(&client.upstream).expect("doq target");
+        // 第一条连接完整握手，拿到会话票据 / The first connection shakes hands in full and gets a ticket
+        client
+            .send(&udp_test_query("first.example"), Duration::from_secs(2))
+            .await
+            .expect("the upstream answers");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        client.reset_connection().await;
+        let resumed = client
+            .get_or_connect(&target, Duration::from_secs(2))
+            .await
+            .expect("connect");
+        assert!(resumed.used_0rtt, "a resumed connection offers early data");
+
+        client.reset_connection().await;
+        client.disable_zero_rtt();
+        let after = client
+            .get_or_connect(&target, Duration::from_secs(2))
+            .await
+            .expect("connect");
+        assert!(!after.used_0rtt, "no early data once 0-RTT was rejected");
+    }
+
+    /// DoQ 连接用了超过 30 分钟，或者空闲超过 5 分钟，健康检查就把它换掉；没到时不动
+    /// A DoQ connection over 30 minutes old, or idle for over 5 minutes, is replaced by the
+    /// health check; short of that it stays
+    #[tokio::test]
+    async fn a_doq_connection_is_replaced_when_too_old_or_idle_too_long() {
+        let (_, client_tls) = localhost_tls(&[b"doq"]);
+        let client = doq_test_client(
+            "doq://127.0.0.1:853?sni=localhost".into(),
+            client_tls,
+            false,
+        );
+        let minute = 60 * 1000;
+        let check = |born: u64, last_request: u64| {
+            let client = &client;
+            async move {
+                let now = unix_time_millis();
+                client.last_health_check_time.store(0, Ordering::Release);
+                client.conn_create_time.store(now - born, Ordering::Release);
+                client
+                    .last_request_time
+                    .store(now - last_request, Ordering::Release);
+                client.check_connection_health().await
+            }
+        };
+        assert!(
+            !check(29 * minute, 4 * minute).await,
+            "young and busy enough"
+        );
+        assert!(check(31 * minute, 0).await, "too old");
+        assert!(check(minute, 6 * minute).await, "idle too long");
+    }
+
+    /// DoT 和 DoQ 的上游地址：`sni`/`servername` 取最后一个非空的；出错时错误文字带着协议名
+    /// DoT and DoQ upstream addresses: the last non-empty `sni`/`servername` counts, and the
+    /// errors name the protocol
+    #[test]
+    fn dot_and_doq_addresses_take_the_last_sni_and_name_their_protocol_in_errors() {
+        for (upstream, sni) in [
+            ("1.1.1.1:853?sni=a.example&sni=b.example", "b.example"),
+            ("1.1.1.1:853?sni=a.example&sni=", "a.example"),
+            ("1.1.1.1:853?servername=c.example", "c.example"),
+        ] {
+            assert_eq!(parse_dot_target(upstream).expect("dot").sni.as_ref(), sni);
+            assert_eq!(parse_doq_target(upstream).expect("doq").sni.as_ref(), sni);
+        }
+        let dot_error = |upstream: &str| format!("{:#}", parse_dot_target(upstream).err().unwrap());
+        let doq_error = |upstream: &str| format!("{:#}", parse_doq_target(upstream).err().unwrap());
+        assert_eq!(
+            dot_error("dns.example/path"),
+            "dot upstream should not contain path"
+        );
+        assert_eq!(
+            doq_error("dns.example/path?sni=dns.example"),
+            "doq upstream should not contain path"
+        );
+        assert!(dot_error("dot://[::1").starts_with("invalid dot upstream url"));
+        assert!(doq_error("doq://[::1").starts_with("invalid doq upstream url"));
     }
 
     /// `socket` 上的下一个 HTTP/1.1 请求：请求头（转成小写）和正文。`buf` 存着上一个请求之后多读的字节；
