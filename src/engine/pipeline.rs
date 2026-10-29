@@ -4,8 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::rdata::TXT;
-use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, RecordType};
 use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
@@ -29,7 +28,7 @@ use super::rules::{
     RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, fast_hash_str, rule_cache_requester,
 };
 use super::types::EngineInner;
-use super::{make_static_cname_answer, make_static_ip_answer};
+use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_answer};
 use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
 
 /// Request and manager references required to select a runtime pipeline.
@@ -552,21 +551,12 @@ impl Engine {
                             );
                         }
                         Action::StaticTxtResponse { text, ttl } => {
-                            if let Some(name) = crate::proto_utils::name_from_text(qname) {
-                                let ttl = ttl.unwrap_or(300);
-                                let txt = TXT::new(text.to_vec());
-                                let record = Record::from_rdata(name, ttl, RData::TXT(txt));
-                                let d = Decision::Static {
-                                    rcode: ResponseCode::NoError,
-                                    answers: vec![record],
-                                };
-                                return Some(d);
-                            }
-                            let d = Decision::Static {
-                                rcode: ResponseCode::ServFail,
-                                answers: Vec::new(),
-                            };
-                            return Some(d);
+                            // 和响应阶段一样：装不进一条记录的文本回 SERVFAIL
+                            // As in the response phase: text that does not fit a record is
+                            // answered SERVFAIL
+                            let (rcode, answers) =
+                                make_static_txt_answer(qname, text, ttl.unwrap_or(300));
+                            return Some(Decision::Static { rcode, answers });
                         }
                         Action::ReplaceTxtResponse { .. } => {
                             continue 'rules;
