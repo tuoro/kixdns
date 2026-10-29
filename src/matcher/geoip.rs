@@ -45,43 +45,74 @@ pub struct V2RayGeoIPList {
     pub entries: Vec<V2RayGeoIP>,
 }
 
+/// 一段连续的地址，两端都含：u32 是 IPv4，u128 是 IPv6
+/// A run of addresses, both ends included: u32 for IPv4, u128 for IPv6
 #[derive(Debug, Clone, Copy)]
-struct Ipv4Range {
-    start: u32,
-    end: u32,
+struct AddrRange<T> {
+    start: T,
+    end: T,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Ipv6Range {
-    start: u128,
-    end: u128,
+/// 区间的端点：IPv4 的 u32 和 IPv6 的 u128 / A range bound: IPv4's u32 and IPv6's u128
+trait Bound: Copy + Ord {
+    /// 下一个地址，到顶就不再加 / The next address, saturating at the top
+    fn next(self) -> Self;
+}
+
+impl Bound for u32 {
+    fn next(self) -> Self {
+        self.saturating_add(1)
+    }
+}
+
+impl Bound for u128 {
+    fn next(self) -> Self {
+        self.saturating_add(1)
+    }
+}
+
+impl<T: Bound> AddrRange<T> {
+    /// 按起点排好，合并重叠和相邻的区间 / Sort by start and merge overlapping and adjacent ranges
+    fn merge(ranges: &mut Vec<Self>) {
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut merged: Vec<Self> = Vec::with_capacity(ranges.len());
+        for range in ranges.drain(..) {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end.next()
+            {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+            merged.push(range);
+        }
+        *ranges = merged;
+    }
+
+    /// 排好、合并过的 `ranges` 里有没有含 `ip` 的 / Whether sorted, merged `ranges` hold `ip`
+    #[inline]
+    fn any_contains(ranges: &[Self], ip: T) -> bool {
+        let index = ranges.partition_point(|range| range.start <= ip);
+        index > 0 && ranges[index - 1].end >= ip
+    }
 }
 
 #[derive(Debug, Default)]
 struct GeoIpTagIndex {
-    ipv4_ranges: Vec<Ipv4Range>,
-    ipv6_ranges: Vec<Ipv6Range>,
+    ipv4_ranges: Vec<AddrRange<u32>>,
+    ipv6_ranges: Vec<AddrRange<u128>>,
 }
 
 impl GeoIpTagIndex {
     fn finalize(&mut self) {
-        merge_ipv4_ranges(&mut self.ipv4_ranges);
-        merge_ipv6_ranges(&mut self.ipv6_ranges);
+        AddrRange::merge(&mut self.ipv4_ranges);
+        AddrRange::merge(&mut self.ipv6_ranges);
     }
 
     #[inline]
     fn contains(&self, ip: IpAddr) -> bool {
         match ip {
-            IpAddr::V4(ip) => {
-                let ip = u32::from(ip);
-                let index = self.ipv4_ranges.partition_point(|range| range.start <= ip);
-                index > 0 && self.ipv4_ranges[index - 1].end >= ip
-            }
-            IpAddr::V6(ip) => {
-                let ip = u128::from(ip);
-                let index = self.ipv6_ranges.partition_point(|range| range.start <= ip);
-                index > 0 && self.ipv6_ranges[index - 1].end >= ip
-            }
+            IpAddr::V4(ip) => AddrRange::any_contains(&self.ipv4_ranges, u32::from(ip)),
+            IpAddr::V6(ip) => AddrRange::any_contains(&self.ipv6_ranges, u128::from(ip)),
         }
     }
 
@@ -436,7 +467,7 @@ impl GeoIpManager {
                         let end = start | !mask;
                         get_or_insert_tag_index(&mut tag_indexes, &country_code)
                             .ipv4_ranges
-                            .push(Ipv4Range { start, end });
+                            .push(AddrRange { start, end });
                         count += 1;
                         ipv4_count += 1;
                     }
@@ -451,7 +482,7 @@ impl GeoIpManager {
                         let end = start | !mask;
                         get_or_insert_tag_index(&mut tag_indexes, &country_code)
                             .ipv6_ranges
-                            .push(Ipv6Range { start, end });
+                            .push(AddrRange { start, end });
                         count += 1;
                         ipv6_count += 1;
                     }
@@ -577,7 +608,7 @@ impl GeoIpManager {
             for ip_str in &geoip.ips {
                 match ip_str.parse::<ipnet::IpNet>() {
                     Ok(ipnet::IpNet::V4(v4net)) => {
-                        index.ipv4_ranges.push(Ipv4Range {
+                        index.ipv4_ranges.push(AddrRange {
                             start: u32::from(v4net.network()),
                             end: u32::from(v4net.broadcast()),
                         });
@@ -585,7 +616,7 @@ impl GeoIpManager {
                         ipv4_count += 1;
                     }
                     Ok(ipnet::IpNet::V6(v6net)) => {
-                        index.ipv6_ranges.push(Ipv6Range {
+                        index.ipv6_ranges.push(AddrRange {
                             start: u128::from(v6net.network()),
                             end: u128::from(v6net.broadcast()),
                         });
@@ -656,36 +687,6 @@ fn get_or_insert_tag_index<'a>(
     indexes
         .get_mut(tag)
         .expect("GeoIP tag index must exist after insertion")
-}
-
-fn merge_ipv4_ranges(ranges: &mut Vec<Ipv4Range>) {
-    ranges.sort_unstable_by_key(|range| range.start);
-    let mut merged: Vec<Ipv4Range> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(last) = merged.last_mut()
-            && range.start <= last.end.saturating_add(1)
-        {
-            last.end = last.end.max(range.end);
-            continue;
-        }
-        merged.push(range);
-    }
-    *ranges = merged;
-}
-
-fn merge_ipv6_ranges(ranges: &mut Vec<Ipv6Range>) {
-    ranges.sort_unstable_by_key(|range| range.start);
-    let mut merged: Vec<Ipv6Range> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(last) = merged.last_mut()
-            && range.start <= last.end.saturating_add(1)
-        {
-            last.end = last.end.max(range.end);
-            continue;
-        }
-        merged.push(range);
-    }
-    *ranges = merged;
 }
 
 /// 是否两个字母的国家代码；有 MMDB 时只有这样的标签查 MMDB
@@ -940,18 +941,72 @@ mod tests {
         list.encode_to_vec()
     }
 
+    /// 相邻的网段（前一段的末尾紧挨着后一段的开头）合并成一段，隔开一个地址的不合并；IPv4、IPv6
+    /// 一样，到顶的那一段也不越界
+    /// Adjacent ranges (one ending right before the next begins) merge into one, ranges
+    /// one address apart do not; the same for IPv4 and IPv6, and a range reaching the top
+    /// does not wrap
+    #[test]
+    fn adjacent_ranges_merge_and_ones_apart_stay_apart() {
+        let mut index = GeoIpTagIndex {
+            ipv4_ranges: vec![
+                AddrRange { start: 20, end: 29 },
+                AddrRange { start: 10, end: 19 },
+                AddrRange { start: 31, end: 40 },
+                AddrRange {
+                    start: u32::MAX - 5,
+                    end: u32::MAX,
+                },
+                AddrRange {
+                    start: u32::MAX - 9,
+                    end: u32::MAX - 6,
+                },
+            ],
+            ipv6_ranges: vec![
+                AddrRange { start: 20, end: 29 },
+                AddrRange { start: 10, end: 19 },
+                AddrRange { start: 31, end: 40 },
+                AddrRange {
+                    start: u128::MAX - 5,
+                    end: u128::MAX,
+                },
+                AddrRange {
+                    start: u128::MAX - 9,
+                    end: u128::MAX - 6,
+                },
+            ],
+        };
+        index.finalize();
+        assert_eq!(
+            index
+                .ipv4_ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(10, 29), (31, 40), (u32::MAX - 9, u32::MAX)]
+        );
+        assert_eq!(
+            index
+                .ipv6_ranges
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            [(10, 29), (31, 40), (u128::MAX - 9, u128::MAX)]
+        );
+    }
+
     /// 交叉重叠的网段合并以后，两段里的地址都算在内，两段之外的不算
     /// Crossing ranges merged still hold every address of both, and nothing beyond them
     #[test]
     fn crossing_ranges_merge_into_one() {
         let mut index = GeoIpTagIndex {
             ipv4_ranges: vec![
-                Ipv4Range { start: 45, end: 70 },
-                Ipv4Range { start: 40, end: 55 },
+                AddrRange { start: 45, end: 70 },
+                AddrRange { start: 40, end: 55 },
             ],
             ipv6_ranges: vec![
-                Ipv6Range { start: 45, end: 70 },
-                Ipv6Range { start: 40, end: 55 },
+                AddrRange { start: 45, end: 70 },
+                AddrRange { start: 40, end: 55 },
             ],
         };
         index.finalize();

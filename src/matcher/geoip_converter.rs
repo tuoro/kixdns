@@ -8,26 +8,11 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use maxminddb_writer::paths::IpAddrWithMask;
 use prost::Message;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use tracing::info;
-
-/// V2Ray GeoIP .dat 文件格式
-/// V2Ray GeoIP .dat file format
-#[derive(Debug, Clone, Deserialize)]
-pub struct V2RayGeoIP {
-    pub country_code: String,
-    pub ips: Vec<String>,
-}
-
-/// V2Ray GeoIP 列表格式
-/// V2Ray GeoIP list format
-#[derive(Debug, Clone, Deserialize)]
-pub struct V2RayGeoIPList {
-    pub entries: Vec<V2RayGeoIP>,
-}
 
 /// MMDB 输出数据结构
 /// MMDB output data structure
@@ -136,7 +121,7 @@ impl GeoIpConverter {
         let data = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read JSON file: {}", path.display()))?;
 
-        let list: V2RayGeoIPList =
+        let list: super::geoip::V2RayGeoIPList =
             serde_json::from_str(&data).context("Failed to parse V2Ray GeoIP JSON")?;
 
         let mut count = 0;
@@ -183,17 +168,9 @@ impl GeoIpConverter {
                 }
             }
 
-            // Sort and merge IPv4
-            if !ipv4_nets.is_empty() {
-                ipv4_nets.sort();
-                ipv4_nets = merge_ipv4_nets(ipv4_nets);
-            }
-
-            // Sort and merge IPv6
-            if !ipv6_nets.is_empty() {
-                ipv6_nets.sort();
-                ipv6_nets = merge_ipv6_nets(ipv6_nets);
-            }
+            // 两族各自排序、合并 / Sort and merge each family
+            ipv4_nets = merge_ipv4_nets(ipv4_nets);
+            ipv6_nets = merge_ipv6_nets(ipv6_nets);
 
             // Put back
             for net in ipv4_nets {
@@ -337,114 +314,84 @@ impl Default for GeoIpConverter {
     }
 }
 
-/// 合并 IPv4 网络
-/// Merge IPv4 networks
-///
-/// 标准 CIDR 精确合并：完全包含取大者；同前缀的兄弟子网（低半 + 高半）
-/// 合并为父网络；否则保持独立。合并后回退与已合并的前一个网络再尝试
-/// 合并（链式），确保 4 个连续 /24 → /22。
-fn merge_ipv4_nets(mut nets: Vec<Ipv4Net>) -> Vec<Ipv4Net> {
-    nets.sort();
+/// IPv4、IPv6 各一份的网段合并，除了类型逐字相同
+/// Network merging, one copy for IPv4 and one for IPv6, word for word the same but for
+/// the types
+macro_rules! net_merging {
+    ($merge:ident, $try_merge:ident, $net:ty, $addr:ty, $bits:ty, $width:expr) => {
+        /// 合并网段
+        /// Merge networks
+        ///
+        /// 标准 CIDR 精确合并：完全包含取大者；同前缀的兄弟子网（低半 + 高半）
+        /// 合并为父网络；否则保持独立。合并后回退与已合并的前一个网络再尝试
+        /// 合并（链式），确保 4 个连续 /24 → /22。
+        fn $merge(mut nets: Vec<$net>) -> Vec<$net> {
+            nets.sort();
 
-    let mut merged: Vec<Ipv4Net> = Vec::new();
-    for net in nets {
-        let mut current = net;
-        loop {
-            if let Some(last) = merged.last() {
-                if last.contains(&current.addr()) && last.contains(&current.broadcast()) {
-                    // current 完全被 last 覆盖，丢弃
+            let mut merged: Vec<$net> = Vec::new();
+            for net in nets {
+                let mut current = net;
+                loop {
+                    if let Some(last) = merged.last() {
+                        if last.contains(&current.addr()) && last.contains(&current.broadcast()) {
+                            // current 完全被 last 覆盖，丢弃
+                            break;
+                        }
+                        if current.contains(&last.addr()) && current.contains(&last.broadcast()) {
+                            // last 完全被 current 覆盖，替换 last 后继续尝试与更前的合并
+                            merged.pop();
+                            continue;
+                        }
+                        if let Some(combined) = $try_merge(last, &current) {
+                            merged.pop();
+                            current = combined;
+                            continue;
+                        }
+                    }
+                    merged.push(current);
                     break;
                 }
-                if current.contains(&last.addr()) && current.contains(&last.broadcast()) {
-                    // last 完全被 current 覆盖，替换 last 后继续尝试与更前的合并
-                    merged.pop();
-                    continue;
-                }
-                if let Some(combined) = try_merge_ipv4(last, &current) {
-                    merged.pop();
-                    current = combined;
-                    continue;
-                }
             }
-            merged.push(current);
-            break;
+            merged
         }
-    }
-    merged
-}
 
-/// 合并 IPv6 网络
-/// Merge IPv6 networks
-fn merge_ipv6_nets(mut nets: Vec<Ipv6Net>) -> Vec<Ipv6Net> {
-    nets.sort();
-
-    let mut merged: Vec<Ipv6Net> = Vec::new();
-    for net in nets {
-        let mut current = net;
-        loop {
-            if let Some(last) = merged.last() {
-                if last.contains(&current.addr()) && last.contains(&current.broadcast()) {
-                    break;
-                }
-                if current.contains(&last.addr()) && current.contains(&last.broadcast()) {
-                    merged.pop();
-                    continue;
-                }
-                if let Some(combined) = try_merge_ipv6(last, &current) {
-                    merged.pop();
-                    current = combined;
-                    continue;
-                }
+        /// 尝试将两个网络精确合并为父网络
+        /// Try to merge two networks into their parent network
+        ///
+        /// 仅当 `a` 是父网络的下半子网、`b` 是其相邻的高半兄弟子网时才可合并，
+        /// 合并结果恰好等于两者的并集（不会多覆盖地址）。返回 `None` 表示不可合并。
+        fn $try_merge(a: &$net, b: &$net) -> Option<$net> {
+            if a.prefix_len() != b.prefix_len() || a.prefix_len() == 0 {
+                return None;
             }
-            merged.push(current);
-            break;
+            let shift = $width - a.prefix_len();
+            let a_addr = <$bits>::from(a.addr());
+            let b_addr = <$bits>::from(b.addr());
+            if (a_addr & (1 << shift)) == 0 && b_addr == (a_addr | (1 << shift)) {
+                <$net>::new(<$addr>::from(a_addr & !(1 << shift)), a.prefix_len() - 1).ok()
+            } else {
+                None
+            }
         }
-    }
-    merged
+    };
 }
 
-/// 尝试将两个 IPv4 网络精确合并为父网络
-/// Try to merge two IPv4 networks into their parent network
-///
-/// 仅当 `a` 是父网络的下半子网、`b` 是其相邻的高半兄弟子网时才可合并，
-/// 合并结果恰好等于两者的并集（不会多覆盖地址）。返回 `None` 表示不可合并。
-fn try_merge_ipv4(a: &Ipv4Net, b: &Ipv4Net) -> Option<Ipv4Net> {
-    if a.prefix_len() != b.prefix_len() || a.prefix_len() == 0 {
-        return None;
-    }
-    let shift = 32 - a.prefix_len();
-    let a_addr = u32::from(a.addr());
-    let b_addr = u32::from(b.addr());
-    if (a_addr & (1 << shift)) == 0 && b_addr == (a_addr | (1 << shift)) {
-        Ipv4Net::new(
-            std::net::Ipv4Addr::from(a_addr & !(1 << shift)),
-            a.prefix_len() - 1,
-        )
-        .ok()
-    } else {
-        None
-    }
-}
-
-/// 尝试将两个 IPv6 网络精确合并为父网络
-/// Try to merge two IPv6 networks into their parent network
-fn try_merge_ipv6(a: &Ipv6Net, b: &Ipv6Net) -> Option<Ipv6Net> {
-    if a.prefix_len() != b.prefix_len() || a.prefix_len() == 0 {
-        return None;
-    }
-    let shift = 128 - a.prefix_len();
-    let a_addr = u128::from(a.addr());
-    let b_addr = u128::from(b.addr());
-    if (a_addr & (1 << shift)) == 0 && b_addr == (a_addr | (1 << shift)) {
-        Ipv6Net::new(
-            std::net::Ipv6Addr::from(a_addr & !(1 << shift)),
-            a.prefix_len() - 1,
-        )
-        .ok()
-    } else {
-        None
-    }
-}
+net_merging!(
+    merge_ipv4_nets,
+    try_merge_ipv4,
+    Ipv4Net,
+    std::net::Ipv4Addr,
+    u32,
+    32
+);
+net_merging!(
+    merge_ipv6_nets,
+    try_merge_ipv6,
+    Ipv6Net,
+    std::net::Ipv6Addr,
+    u128,
+    128
+);
 
 /// 转换 .dat 为 MMDB 格式
 /// Convert .dat to MMDB format
@@ -510,6 +457,41 @@ mod tests {
     }
     fn v6net(s: &str) -> Ipv6Net {
         s.parse().unwrap()
+    }
+
+    /// 网段不论原来什么顺序，合并结果都一样：乱序给出的兄弟子网照样合并，被包含的照样丢掉；
+    /// 经 `merge_cidrs` 也一样
+    /// Networks merge the same whatever their order: siblings given out of order still
+    /// merge and a contained one is still dropped; through `merge_cidrs` as well
+    #[test]
+    fn nets_merge_the_same_whatever_their_order() {
+        let merged = merge_ipv4_nets(vec![
+            v4net("1.2.3.0/24"),
+            v4net("1.2.2.128/25"),
+            v4net("1.2.2.0/24"),
+        ]);
+        assert_eq!(merged, [v4net("1.2.2.0/23")]);
+        let merged = merge_ipv6_nets(vec![v6net("2001:db8:8000::/33"), v6net("2001:db8::/33")]);
+        assert_eq!(merged, [v6net("2001:db8::/32")]);
+
+        let mut converter = GeoIpConverter::new();
+        converter.country_to_nets.insert(
+            "CN".to_string(),
+            vec![
+                IpNet::V4(v4net("1.2.3.0/24")),
+                IpNet::V6(v6net("2001:db8:8000::/33")),
+                IpNet::V4(v4net("1.2.2.0/24")),
+                IpNet::V6(v6net("2001:db8::/33")),
+            ],
+        );
+        converter.merge_cidrs();
+        assert_eq!(
+            converter.country_to_nets["CN"],
+            [
+                IpNet::V4(v4net("1.2.2.0/23")),
+                IpNet::V6(v6net("2001:db8::/32"))
+            ]
+        );
     }
 
     #[test]
