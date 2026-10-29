@@ -25,12 +25,12 @@ use parking_lot::Mutex;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
-use crate::config::Transport;
 use crate::observe::{
     CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
     RequestContext, RequestOutcome, RequestStatus, RuleEvaluated, RuleMatched, RulePhase,
     UpstreamOutcome, UpstreamResult,
 };
+use crate::panel::{outcome_label, phase_label, transport_label};
 
 /// 交接区最多留多少条。面板每秒取一次，家用流量远到不了；满了丢最旧的，面板从序号的空缺看出漏了几条。
 /// How many records the hand-off ring keeps. The panel collects every second, far beyond home traffic;
@@ -609,12 +609,7 @@ impl QueryLog {
 
     pub(crate) fn upstream_result(&self, ctx: &RequestContext<'_>, event: &UpstreamResult<'_>) {
         self.with_pending(ctx, |pending| {
-            let result = match event.outcome {
-                UpstreamOutcome::Success => "success",
-                UpstreamOutcome::Rejected => "rejected",
-                UpstreamOutcome::Aborted => "aborted",
-                _ => "error",
-            };
+            let result = outcome_label(event.outcome);
             if event.outcome == UpstreamOutcome::Success {
                 pending.answered_by = Some(event.upstream.into());
             }
@@ -706,7 +701,7 @@ fn finish(mut pending: Pending, outcome: &RequestOutcome<'_>) -> Entry {
     let status = match outcome.status {
         RequestStatus::Completed => Status::Completed,
         RequestStatus::Failed => Status::Failed,
-        _ => Status::Cancelled,
+        RequestStatus::Cancelled => Status::Cancelled,
     };
     let decided_static = matches!(pending.decision, Some((_, DecisionKind::Static)));
     let rule = pending.decision.and_then(|(rule, _)| rule);
@@ -748,12 +743,7 @@ fn read_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
                 .map(|record| clip(&record.data.to_string()))
                 .collect(),
         ),
-        Err(_) => (
-            bytes
-                .get(3)
-                .map(|flags| ResponseCode::from(0, flags & 0x0F)),
-            Vec::new(),
-        ),
+        Err(_) => (crate::observe::header_rcode(bytes), Vec::new()),
     }
 }
 
@@ -792,14 +782,7 @@ fn decision_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Static => "static",
         DecisionKind::Forward => "forward",
         DecisionKind::Jump => "jump",
-        _ => "continue",
-    }
-}
-
-fn phase_label(phase: RulePhase) -> &'static str {
-    match phase {
-        RulePhase::Request => "request",
-        _ => "response",
+        DecisionKind::Continue => "continue",
     }
 }
 
@@ -808,7 +791,7 @@ fn cache_label(kind: CacheHitKind) -> &'static str {
         CacheHitKind::Fresh => "fresh",
         CacheHitKind::Stale => "stale",
         CacheHitKind::StaleClientTimeout => "stale_timeout",
-        _ => "stale_failure",
+        CacheHitKind::StaleUpstreamFailure => "stale_failure",
     }
 }
 
@@ -816,18 +799,7 @@ fn client_transport_label(transport: ClientTransport) -> &'static str {
     match transport {
         ClientTransport::Udp => "udp",
         ClientTransport::Tcp => "tcp",
-        _ => "doh",
-    }
-}
-
-fn transport_label(transport: Transport) -> &'static str {
-    match transport {
-        Transport::Udp => "udp",
-        Transport::Tcp => "tcp",
-        Transport::TcpUdp => "tcp_udp",
-        Transport::Doh => "doh",
-        Transport::Dot => "dot",
-        Transport::Doq => "doq",
+        ClientTransport::Doh => "doh",
     }
 }
 
@@ -999,6 +971,112 @@ mod tests {
             .as_array()
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// 上游那一步写成面板认得的短名：六种传输（记下的和实际走的）、四种结果都是。读不出的应答，响应码
+    /// 取报文头的低四位，不列答案
+    /// An upstream step is written in the short names the panel reads: all six transports
+    /// (the one recorded and the one actually used) and all four outcomes. For a response
+    /// that cannot be read, the response code is the header's low four bits and no answer
+    /// is listed
+    #[test]
+    fn every_transport_and_outcome_gets_its_short_name() {
+        let transports = [
+            (Transport::Udp, "udp"),
+            (Transport::Tcp, "tcp"),
+            (Transport::TcpUdp, "tcp_udp"),
+            (Transport::Doh, "doh"),
+            (Transport::Dot, "dot"),
+            (Transport::Doq, "doq"),
+        ];
+        let outcomes = [
+            (UpstreamOutcome::Success, "success"),
+            (UpstreamOutcome::Rejected, "rejected"),
+            (UpstreamOutcome::Error, "error"),
+            (UpstreamOutcome::Aborted, "aborted"),
+        ];
+        let log = QueryLog::default();
+        let _ = page(&log, 0, 1);
+        let request = ctx(1);
+        log.request_started(&request, false);
+        log.pipeline_selected(&request, "main");
+        for (index, (transport, _)) in transports.iter().enumerate() {
+            log.upstream_result(
+                &request,
+                &UpstreamResult {
+                    upstream: "192.0.2.53:53",
+                    transport: *transport,
+                    via: transports[(index + 1) % transports.len()].0,
+                    outcome: outcomes[index % outcomes.len()].0,
+                    latency: Duration::from_millis(20),
+                    rcode: None,
+                    truncated: None,
+                    error: None,
+                },
+            );
+        }
+        // 只有六个字节，读不出；报文头说 NXDOMAIN / Six bytes only, unreadable; the header says NXDOMAIN
+        finish(
+            &log,
+            &request,
+            RequestStatus::Completed,
+            Some(&[0x12, 0x34, 0x81, 0x83, 0x00, 0x01]),
+        );
+
+        let entry = entries(&log).pop().expect("one record");
+        let steps: Vec<&Value> = entry["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| step["kind"] == "upstream")
+            .collect();
+        assert_eq!(steps.len(), transports.len(), "{entry}");
+        for (index, step) in steps.iter().enumerate() {
+            assert_eq!(step["transport"], transports[index].1, "{step}");
+            assert_eq!(
+                step["via"],
+                transports[(index + 1) % transports.len()].1,
+                "{step}"
+            );
+            assert_eq!(step["result"], outcomes[index % outcomes.len()].1, "{step}");
+        }
+        assert_eq!(entry["rcode"], "NXDOMAIN", "{entry}");
+        assert!(
+            entry["answers"].as_array().is_none_or(Vec::is_empty),
+            "{entry}"
+        );
+    }
+
+    /// 客户端的三种传输也写成短名：udp、tcp、doh
+    /// The client's three transports are written in short names too: udp, tcp, doh
+    #[test]
+    fn every_client_transport_gets_its_short_name() {
+        let log = QueryLog::default();
+        let _ = page(&log, 0, 1);
+        let transports = [
+            (ClientTransport::Udp, "udp"),
+            (ClientTransport::Tcp, "tcp"),
+            (ClientTransport::Doh, "doh"),
+        ];
+        for (index, (transport, _)) in transports.iter().enumerate() {
+            let request = RequestContext {
+                transport: Some(*transport),
+                ..ctx(index as u64 + 1)
+            };
+            log.request_started(&request, false);
+            finish(&log, &request, RequestStatus::Completed, None);
+        }
+        let written: Vec<Value> = entries(&log)
+            .iter()
+            .map(|entry| entry["transport"].clone())
+            .collect();
+        assert_eq!(
+            written,
+            transports
+                .iter()
+                .map(|(_, name)| Value::from(*name))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// 应答原文存着、面板来取时才读；超过上限的当场读出，交接区里不存大块原文。两种取出来都一样
