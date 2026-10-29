@@ -3385,3 +3385,89 @@ async fn a_hit_above_the_refresh_threshold_starts_no_background_refresh() {
     );
     assert_eq!(background_refreshes(&recorder.events(), "early.test"), 0);
 }
+
+/// 一段超过 255 字节、总长超过 65535 字节的静态 TXT / Static TXT with a segment over 255
+/// bytes, and with a total over 65535 bytes
+fn oversize_txt_config() -> String {
+    serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9" },
+        "pipelines": [{
+            "id": "main",
+            "rules": [
+                {
+                    "name": "segment",
+                    "matchers": [{ "type": "domain_suffix", "value": "segment.test" }],
+                    "actions": [{ "type": "static_txt_response", "text": ["x".repeat(256)] }]
+                },
+                {
+                    "name": "total",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_txt_response", "text": vec!["y".repeat(250); 300] }]
+                }
+            ]
+        }]
+    })
+    .to_string()
+}
+
+/// 装不进一条记录的静态 TXT，请求阶段和响应阶段一样回 SERVFAIL：引擎自己答，请求照常结束。以前
+/// 请求阶段遇到超长的一段时请求以错误结束（观察者看到 Failed），SERVFAIL 由监听器自己构造；总长
+/// 超长时拼出一个 NOERROR、TC 置位、没有答案的应答，后面跟着一大段没人认的字节。
+/// A static TXT that does not fit a record is answered SERVFAIL in the request phase as in
+/// the response phase: by the engine, the request completing as usual. A segment that was
+/// too long used to end the request with an error (Failed to the observer), the listener
+/// building the SERVFAIL itself; a total that was too long gave a NOERROR answer with TC
+/// set and no records, trailed by a run of bytes nobody reads.
+#[tokio::test]
+async fn a_static_txt_that_does_not_fit_a_record_is_answered_servfail() {
+    let (engine, recorder) = observed_engine(&oversize_txt_config());
+    for qname in ["segment.test", "total.test"] {
+        let answer = engine
+            .handle_packet(&query(qname), peer())
+            .await
+            .unwrap_or_else(|error| panic!("{qname}: {error:#}"));
+        let message = Message::from_bytes(&answer).unwrap();
+        assert_eq!(
+            message.metadata.response_code,
+            ResponseCode::ServFail,
+            "{qname}"
+        );
+        assert!(!message.metadata.truncation, "{qname}");
+        assert!(message.answers.is_empty(), "{qname}");
+    }
+    let finished: Vec<RequestStatus> = recorder
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            Event::Finished { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, [RequestStatus::Completed; 2]);
+}
+
+/// 请求阶段的静态 TXT 没写 ttl 时，记录的 TTL 是 300 秒 / A request-phase static TXT without
+/// a ttl answers with a TTL of 300 seconds
+#[tokio::test]
+async fn a_static_txt_without_a_ttl_answers_for_300_seconds() {
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9" },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "txt",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "static_txt_response", "text": ["hello"] }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, _recorder) = observed_engine(&raw);
+    let answer = engine
+        .handle_packet(&query("txt.test"), peer())
+        .await
+        .unwrap();
+    let message = Message::from_bytes(&answer).unwrap();
+    assert_eq!(message.answers.len(), 1);
+    assert_eq!(message.answers[0].ttl, 300);
+}

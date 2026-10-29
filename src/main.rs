@@ -2146,4 +2146,60 @@ mod tests {
         );
         assert_eq!(ipv4_listen_addr(addr("[::1]:53")), None);
     }
+
+    /// 装不进一条记录的静态 TXT（一段超过 255 字节，或者总长超过 65535），UDP 和 TCP 都收到
+    /// SERVFAIL，不带 TC。以前总长超长时两边收到的都是 NOERROR、TC 置位、没有答案的应答
+    /// A static TXT that does not fit a record (a segment over 255 bytes, or a total over
+    /// 65535) is SERVFAIL over UDP and TCP alike, without TC. A total that was too long
+    /// used to give both a NOERROR answer with TC set and no records
+    #[tokio::test]
+    async fn a_static_txt_that_does_not_fit_a_record_is_servfail_over_udp_and_tcp() {
+        let config: kixdns::config::PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "p",
+                "rules": [
+                    {
+                        "name": "segment",
+                        "matchers": [{ "type": "domain_suffix", "value": "segment.test" }],
+                        "actions": [{ "type": "static_txt_response", "text": ["x".repeat(256)] }]
+                    },
+                    {
+                        "name": "total",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{
+                            "type": "static_txt_response",
+                            "text": vec!["y".repeat(250); 300]
+                        }]
+                    }
+                ]
+            }]
+        }))
+        .expect("parse config");
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("initialize engine");
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut tcp, connection) = tcp_connection(engine).await;
+
+        for (id, qname) in [(1, "segment.test"), (2, "total.test")] {
+            let (udp, _) = udp_exchange(&client, server_addr, &query(qname, id)).await;
+            let (tcp, _) = tcp_exchange(&mut tcp, &query(qname, id)).await;
+            for (transport, answer) in [("UDP", udp), ("TCP", tcp)] {
+                assert_eq!(
+                    (answer.metadata.response_code, answer.metadata.truncation),
+                    (ResponseCode::ServFail, false),
+                    "{qname} over {transport}"
+                );
+            }
+        }
+
+        worker.abort();
+        connection.abort();
+    }
 }
