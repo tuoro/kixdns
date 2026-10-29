@@ -153,13 +153,7 @@ impl QueryStatsBucket {
             return false;
         };
         if self.epoch.load(Ordering::Relaxed) != epoch {
-            self.domains.clear();
-            self.clients.clear();
-            self.requests.store(0, Ordering::Relaxed);
-            self.dropped_updates.store(0, Ordering::Relaxed);
-            self.domain_entries.store(0, Ordering::Relaxed);
-            self.client_entries.store(0, Ordering::Relaxed);
-            self.epoch.store(epoch, Ordering::Release);
+            self.reset(epoch);
         }
         true
     }
@@ -167,79 +161,88 @@ impl QueryStatsBucket {
     #[cfg_attr(not(unix), allow(dead_code))]
     fn clear(&self) {
         let _guard = self.rotate_lock.lock();
+        self.reset(0);
+    }
+
+    /// 清空这一格、换成 `epoch` 那个钟头；调用方拿着 `rotate_lock`
+    /// Empties this bucket for the hour `epoch`; the caller holds `rotate_lock`
+    fn reset(&self, epoch: u64) {
         self.domains.clear();
         self.clients.clear();
         self.requests.store(0, Ordering::Relaxed);
         self.dropped_updates.store(0, Ordering::Relaxed);
         self.domain_entries.store(0, Ordering::Relaxed);
         self.client_entries.store(0, Ordering::Relaxed);
-        self.epoch.store(0, Ordering::Release);
+        self.epoch.store(epoch, Ordering::Release);
     }
 
     fn record_domain(&self, domain: &str) -> bool {
-        match self.domains.try_get(domain) {
-            TryResult::Present(counter) => {
-                counter.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-            TryResult::Locked => return false,
-            TryResult::Absent => {}
-        }
-        // 满了就不再为新名字分配、抢写锁：随机子域名一多，这条路每个查询都会走
-        // Full: no allocation or write lock for a new name, a path every query takes
-        // once random subdomains pour in
-        if self.domain_entries.load(Ordering::Relaxed) >= QUERY_STATS_DOMAIN_CAP {
-            return false;
-        }
-        let Some(entry) = self.domains.try_entry(Arc::from(domain)) else {
-            return false;
-        };
-        match entry {
-            Entry::Occupied(entry) => {
-                entry.get().fetch_add(1, Ordering::Relaxed);
-                true
-            }
-            Entry::Vacant(entry) => {
-                let index = self.domain_entries.fetch_add(1, Ordering::Relaxed);
-                if index >= QUERY_STATS_DOMAIN_CAP {
-                    self.domain_entries.fetch_sub(1, Ordering::Relaxed);
-                    return false;
-                }
-                entry.insert(AtomicU64::new(1));
-                true
-            }
-        }
+        record_capped(
+            &self.domains,
+            &self.domain_entries,
+            QUERY_STATS_DOMAIN_CAP,
+            domain,
+            || Arc::from(domain),
+        )
     }
 
     fn record_client(&self, client: IpAddr) -> bool {
-        match self.clients.try_get(&client) {
-            TryResult::Present(counter) => {
-                counter.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-            TryResult::Locked => return false,
-            TryResult::Absent => {}
+        record_capped(
+            &self.clients,
+            &self.client_entries,
+            QUERY_STATS_CLIENT_CAP,
+            &client,
+            || client,
+        )
+    }
+}
+
+/// 给 `map` 里的 `key` 记一次；没有这一项时新建，`entries` 记着已有几项，到了 `cap` 就不再新建。
+/// 锁被别人占着、或者满了，都不记，返回 false
+/// Counts `key` once in `map`, adding it when absent; `entries` holds how many there
+/// are, and none is added once it reaches `cap`. Nothing is counted when the lock is
+/// taken or the map is full, and then it returns false
+fn record_capped<K, Q>(
+    map: &DashMap<K, AtomicU64>,
+    entries: &AtomicUsize,
+    cap: usize,
+    key: &Q,
+    owned: impl FnOnce() -> K,
+) -> bool
+where
+    K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
+    Q: Eq + std::hash::Hash + ?Sized,
+{
+    match map.try_get(key) {
+        TryResult::Present(counter) => {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
-        if self.client_entries.load(Ordering::Relaxed) >= QUERY_STATS_CLIENT_CAP {
-            return false;
+        TryResult::Locked => return false,
+        TryResult::Absent => {}
+    }
+    // 满了就不再为新的一项分配、抢写锁：随机子域名一多，这条路每个查询都会走
+    // Full: no allocation or write lock for a new entry, a path every query takes once
+    // random subdomains pour in
+    if entries.load(Ordering::Relaxed) >= cap {
+        return false;
+    }
+    let Some(entry) = map.try_entry(owned()) else {
+        return false;
+    };
+    match entry {
+        Entry::Occupied(entry) => {
+            entry.get().fetch_add(1, Ordering::Relaxed);
+            true
         }
-        let Some(entry) = self.clients.try_entry(client) else {
-            return false;
-        };
-        match entry {
-            Entry::Occupied(entry) => {
-                entry.get().fetch_add(1, Ordering::Relaxed);
-                true
+        Entry::Vacant(entry) => {
+            let index = entries.fetch_add(1, Ordering::Relaxed);
+            if index >= cap {
+                entries.fetch_sub(1, Ordering::Relaxed);
+                return false;
             }
-            Entry::Vacant(entry) => {
-                let index = self.client_entries.fetch_add(1, Ordering::Relaxed);
-                if index >= QUERY_STATS_CLIENT_CAP {
-                    self.client_entries.fetch_sub(1, Ordering::Relaxed);
-                    return false;
-                }
-                entry.insert(AtomicU64::new(1));
-                true
-            }
+            entry.insert(AtomicU64::new(1));
+            true
         }
     }
 }
@@ -267,6 +270,32 @@ impl Default for QueryStats {
 struct TopStat {
     name: String,
     count: u64,
+}
+
+/// 把一格里 `counts` 的每一项加进 `totals` / Adds each entry of one bucket's `counts` into `totals`
+#[cfg_attr(not(unix), allow(dead_code))]
+fn add_counts<K: Clone + Eq + std::hash::Hash>(
+    totals: &mut HashMap<K, u64>,
+    counts: &DashMap<K, AtomicU64>,
+) {
+    for entry in counts {
+        let total = totals.entry(entry.key().clone()).or_default();
+        *total = total.saturating_add(entry.value().load(Ordering::Relaxed));
+    }
+}
+
+/// `totals` 里排在前 `limit` 的几项 / The top `limit` entries of `totals`
+#[cfg_attr(not(unix), allow(dead_code))]
+fn top<K: std::fmt::Display>(totals: HashMap<K, u64>, limit: usize) -> Vec<TopStat> {
+    let mut rows = totals
+        .into_iter()
+        .map(|(key, count)| TopStat {
+            name: key.to_string(),
+            count,
+        })
+        .collect::<Vec<_>>();
+    sort_and_truncate(&mut rows, limit);
+    rows
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -324,38 +353,15 @@ impl QueryStats {
                 requests_observed.saturating_add(bucket.requests.load(Ordering::Relaxed));
             dropped_updates =
                 dropped_updates.saturating_add(bucket.dropped_updates.load(Ordering::Relaxed));
-            for entry in &bucket.domains {
-                let total = domains.entry(Arc::clone(entry.key())).or_default();
-                *total = total.saturating_add(entry.value().load(Ordering::Relaxed));
-            }
-            for entry in &bucket.clients {
-                let total = clients.entry(*entry.key()).or_default();
-                *total = total.saturating_add(entry.value().load(Ordering::Relaxed));
-            }
+            add_counts(&mut domains, &bucket.domains);
+            add_counts(&mut clients, &bucket.clients);
         }
-
-        let mut domains = domains
-            .into_iter()
-            .map(|(name, count)| TopStat {
-                name: name.to_string(),
-                count,
-            })
-            .collect::<Vec<_>>();
-        let mut clients = clients
-            .into_iter()
-            .map(|(client, count)| TopStat {
-                name: client.to_string(),
-                count,
-            })
-            .collect::<Vec<_>>();
-        sort_and_truncate(&mut domains, limit);
-        sort_and_truncate(&mut clients, limit);
 
         QueryStatsSnapshot {
             requests_observed,
             dropped_updates,
-            clients,
-            domains,
+            clients: top(clients, limit),
+            domains: top(domains, limit),
         }
     }
 }
@@ -884,16 +890,11 @@ impl PanelMetrics {
     fn stats_json(&self, window_seconds: u64, limit: usize) -> serde_json::Value {
         let now = unix_timestamp();
         let snapshot = self.query_stats.snapshot(now, window_seconds, limit);
-        let clients = snapshot
-            .clients
-            .into_iter()
-            .map(|row| json!({"name": row.name, "count": row.count}))
-            .collect::<Vec<_>>();
-        let domains = snapshot
-            .domains
-            .into_iter()
-            .map(|row| json!({"name": row.name, "count": row.count}))
-            .collect::<Vec<_>>();
+        let rows = |rows: Vec<TopStat>| {
+            rows.into_iter()
+                .map(|row| json!({"name": row.name, "count": row.count}))
+                .collect::<Vec<_>>()
+        };
         // The two fields stay for panels that read them: on whenever the control socket is
         // open, never anonymized / 这两个字段留给读它们的面板：开了控制通道就开着，从不脱敏
         json!({
@@ -905,8 +906,8 @@ impl PanelMetrics {
             "generated_at_unix": now,
             "requests_observed": snapshot.requests_observed,
             "dropped_updates": snapshot.dropped_updates,
-            "clients": clients,
-            "domains": domains,
+            "clients": rows(snapshot.clients),
+            "domains": rows(snapshot.domains),
         })
     }
 
@@ -1655,7 +1656,6 @@ type Rejection = (StatusCode, serde_json::Value);
 fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String), Rejection> {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::RecordType;
-    use std::str::FromStr;
 
     // 和查询日志、规则看到的名字是同一种写法（见 `proto_utils::name_text`）：`\DDD` 是三位十进制，
     // 和 RFC 1035 一样。hickory 自己的解析按八进制读，查询日志里的 `www\046matched.test` 拿来诊断
@@ -1688,24 +1688,23 @@ fn diagnostic_packet(domain: &str, record_type: &str) -> Result<(Vec<u8>, String
     let name = hickory_proto::rr::Name::from_labels(labels.iter().map(Vec::as_slice))
         .map_err(|_| invalid())?;
     let record_type = record_type.trim().to_ascii_uppercase();
-    if !matches!(
-        record_type.as_str(),
-        "A" | "AAAA" | "CNAME" | "MX" | "NS" | "PTR" | "SOA" | "SRV" | "TXT"
-    ) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            error_json("diagnostic_record_type_invalid", "不支持的 DNS 记录类型"),
-        ));
-    }
-    let parsed = RecordType::from_str(&record_type).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            error_json(
-                "diagnostic_record_type_invalid",
-                &format!("记录类型无效：{error}"),
-            ),
-        )
-    })?;
+    let parsed = match record_type.as_str() {
+        "A" => RecordType::A,
+        "AAAA" => RecordType::AAAA,
+        "CNAME" => RecordType::CNAME,
+        "MX" => RecordType::MX,
+        "NS" => RecordType::NS,
+        "PTR" => RecordType::PTR,
+        "SOA" => RecordType::SOA,
+        "SRV" => RecordType::SRV,
+        "TXT" => RecordType::TXT,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                error_json("diagnostic_record_type_invalid", "不支持的 DNS 记录类型"),
+            ));
+        }
+    };
     let request_id = (unix_timestamp() as u16) ^ (std::process::id() as u16);
     let mut message = Message::new(request_id, MessageType::Query, OpCode::Query);
     message.metadata.recursion_desired = true;
@@ -1812,6 +1811,39 @@ fn late_body_response() -> Response<Full<Bytes>> {
     )
 }
 
+/// 把一个拒绝写成回答 / A rejection written out as the answer
+#[cfg(unix)]
+fn respond((status, body): Rejection) -> Response<Full<Bytes>> {
+    json_response(status, body)
+}
+
+/// 请求正文不是要的 JSON：400，「{what}无效：{error}」
+/// A request body that is not the JSON asked for: 400, "{what}无效：{error}"
+#[cfg(unix)]
+fn request_invalid(what: &str, error: impl std::fmt::Display) -> Rejection {
+    (
+        StatusCode::BAD_REQUEST,
+        error_json(
+            "diagnostic_request_invalid",
+            &format!("{what}无效：{error}"),
+        ),
+    )
+}
+
+/// 配置用不了：422，错误连同原因链，截到 [`MAX_ERROR_LENGTH`]
+/// A configuration that cannot be used: 422, the error with its cause chain, cut to
+/// [`MAX_ERROR_LENGTH`]
+#[cfg(unix)]
+fn config_invalid(error: &anyhow::Error) -> Rejection {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        error_json(
+            "config_invalid",
+            &truncate(&format!("{error:#}"), MAX_ERROR_LENGTH),
+        ),
+    )
+}
+
 #[cfg(unix)]
 async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Response<Full<Bytes>> {
     let body = match collect_body(request, MAX_DIAGNOSTIC_BODY).await {
@@ -1826,19 +1858,11 @@ async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Respons
     };
     let request = match serde_json::from_slice::<DiagnosticRequest>(&body) {
         Ok(request) => request,
-        Err(error) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                error_json(
-                    "diagnostic_request_invalid",
-                    &format!("诊断请求无效：{error}"),
-                ),
-            );
-        }
+        Err(error) => return respond(request_invalid("诊断请求", error)),
     };
     let (packet, record_type) = match diagnostic_packet(&request.domain, &request.record_type) {
         Ok(prepared) => prepared,
-        Err((status, body)) => return json_response(status, body),
+        Err(rejection) => return respond(rejection),
     };
     let (status, body) = run_diagnostic(
         &engine,
@@ -1884,19 +1908,11 @@ async fn diagnostic_trace_candidate(
     };
     let request = match serde_json::from_slice::<CandidateTraceRequest>(&body) {
         Ok(request) => request,
-        Err(error) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                error_json(
-                    "diagnostic_request_invalid",
-                    &format!("试跑请求无效：{error}"),
-                ),
-            );
-        }
+        Err(error) => return respond(request_invalid("试跑请求", error)),
     };
     // 查询字段先在这里查，错了不必起子进程 / Check the query fields here first; a bad one needs no child
-    if let Err((status, body)) = diagnostic_packet(&request.domain, &request.record_type) {
-        return json_response(status, body);
+    if let Err(rejection) = diagnostic_packet(&request.domain, &request.record_type) {
+        return respond(rejection);
     }
     let input = match serde_json::to_vec(&TrialInput {
         request,
@@ -2015,13 +2031,7 @@ pub async fn trial_from_stdio() -> anyhow::Result<()> {
         .context("读取试跑请求失败")?;
     let (status, body) = match serde_json::from_slice::<TrialInput>(&raw) {
         Ok(input) => run_trial(input).await,
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            error_json(
-                "diagnostic_request_invalid",
-                &format!("试跑请求无效：{error}"),
-            ),
-        ),
+        Err(error) => request_invalid("试跑请求", error),
     };
     let output = serde_json::to_vec(&TrialOutput {
         status: status.as_u16(),
@@ -2053,34 +2063,19 @@ async fn run_trial(input: TrialInput) -> (StatusCode, serde_json::Value) {
     // without it the first DoH/DoT upstream panics
     let _ = rustls::crypto::ring::default_provider().install_default();
     let raw = request.config.to_string();
-    if let Err(error) = crate::config::validate(&raw) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            error_json(
-                "config_invalid",
-                &truncate(&format!("{error:#}"), MAX_ERROR_LENGTH),
-            ),
-        );
-    }
-    let built = crate::config::parse_config(&raw).and_then(|mut config| {
-        config.settings.cache_background_refresh = false;
-        let runtime = crate::matcher::RuntimePipelineConfig::from_config(config)?;
-        Engine::builder(runtime)
-            .listener_label(listener_label)
-            .observer(Arc::new(PanelMetrics::new(false)))
-            .build()
-    });
+    let built = crate::config::validate(&raw)
+        .and_then(|_| crate::config::parse_config(&raw))
+        .and_then(|mut config| {
+            config.settings.cache_background_refresh = false;
+            let runtime = crate::matcher::RuntimePipelineConfig::from_config(config)?;
+            Engine::builder(runtime)
+                .listener_label(listener_label)
+                .observer(Arc::new(PanelMetrics::new(false)))
+                .build()
+        });
     let engine = match built {
         Ok(engine) => engine,
-        Err(error) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                error_json(
-                    "config_invalid",
-                    &truncate(&format!("{error:#}"), MAX_ERROR_LENGTH),
-                ),
-            );
-        }
+        Err(error) => return config_invalid(&error),
     };
     let (status, mut body) = run_diagnostic(
         &engine,
@@ -2184,13 +2179,7 @@ async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
                 "rule_count": report.rule_count,
             }),
         ),
-        Err(error) => json_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            error_json(
-                "config_invalid",
-                &truncate(&format!("{error:#}"), MAX_ERROR_LENGTH),
-            ),
-        ),
+        Err(error) => respond(config_invalid(&error)),
     }
 }
 
@@ -2290,7 +2279,6 @@ fn format_millis(micros: u64) -> String {
 }
 
 fn metric(output: &mut String, name: &str, value: impl std::fmt::Display) {
-    use std::fmt::Write;
     let _ = writeln!(output, "{name} {value}");
 }
 
@@ -2300,7 +2288,6 @@ fn labeled_metric(
     labels: &[(&str, &str)],
     value: impl std::fmt::Display,
 ) {
-    use std::fmt::Write;
     let _ = write!(output, "{name}{{");
     for (index, (label, label_value)) in labels.iter().enumerate() {
         if index > 0 {
@@ -2333,8 +2320,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_CLIENT_CAP, QUERY_STATS_DOMAIN_CAP,
-        QueryStats,
+        MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_BUCKET_SECONDS, QUERY_STATS_BUCKETS,
+        QUERY_STATS_CLIENT_CAP, QUERY_STATS_DOMAIN_CAP, QueryStats, TopStat,
     };
 
     #[derive(Clone, Default)]
@@ -3151,6 +3138,86 @@ mod tests {
         assert_eq!(snapshot.clients[0].count, 2);
     }
 
+    /// 一个钟头一格，24 格轮着用：同一格过了一天再用到时，先清空再记，旧的计数、名字、客户端和丢弃数
+    /// 都不留，满了的名字上限也重新算
+    /// One bucket per hour, 24 used in turn: when a bucket comes round again a day later it
+    /// is emptied before recording, keeping none of the old counts, names, clients or
+    /// dropped updates, and the full name cap starts over
+    #[test]
+    fn a_bucket_used_again_a_day_later_starts_from_nothing() {
+        let stats = QueryStats::default();
+        let hour = QUERY_STATS_BUCKET_SECONDS;
+        let day = hour * QUERY_STATS_BUCKETS as u64;
+        let old_client = IpAddr::from(Ipv4Addr::new(10, 0, 0, 1));
+        for index in 0..=QUERY_STATS_DOMAIN_CAP {
+            stats.record_at(&format!("d{index}.example"), old_client, hour);
+        }
+        let before = stats.snapshot(hour, hour, 1);
+        assert_eq!(before.requests_observed, QUERY_STATS_DOMAIN_CAP as u64 + 1);
+        assert_eq!(before.dropped_updates, 1);
+
+        let new_client = IpAddr::from(Ipv4Addr::new(10, 0, 0, 2));
+        stats.record_at("new.example", new_client, hour + day);
+        let after = stats.snapshot(hour + day, day, 10);
+        assert_eq!(after.requests_observed, 1);
+        assert_eq!(after.dropped_updates, 0);
+        let rows = |rows: &[TopStat]| {
+            rows.iter()
+                .map(|row| (row.name.clone(), row.count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&after.domains), [("new.example".to_string(), 1)]);
+        assert_eq!(rows(&after.clients), [("10.0.0.2".to_string(), 1)]);
+    }
+
+    /// 诊断只接受九种记录类型，大小写和两边的空白不论，编出的查询问的就是那种类型；别的类型一律拒绝
+    /// A diagnostic takes nine record types only, whatever their case and surrounding
+    /// blanks, and the query it encodes asks for that type; any other type is refused
+    #[cfg(unix)]
+    #[test]
+    fn a_diagnostic_asks_one_of_nine_record_types() {
+        use hickory_proto::rr::RecordType;
+        for (written, expected) in [
+            ("A", RecordType::A),
+            (" aaaa ", RecordType::AAAA),
+            ("cname", RecordType::CNAME),
+            ("Mx", RecordType::MX),
+            ("NS", RecordType::NS),
+            ("ptr", RecordType::PTR),
+            ("SOA", RecordType::SOA),
+            ("srv", RecordType::SRV),
+            ("TXT", RecordType::TXT),
+        ] {
+            let (packet, normalized) = super::diagnostic_packet("nas.example", written).unwrap();
+            let message = hickory_proto::op::Message::from_vec(&packet).unwrap();
+            assert_eq!(message.queries[0].query_type(), expected, "{written}");
+            assert_eq!(normalized, written.trim().to_ascii_uppercase());
+        }
+        for written in ["HTTPS", "ANY", "AXFR", "", "A AAAA", "TYPE1"] {
+            let (status, body) = super::diagnostic_packet("nas.example", written).unwrap_err();
+            assert_eq!(status, super::StatusCode::BAD_REQUEST, "{written}");
+            assert_eq!(body["error"]["code"], "diagnostic_record_type_invalid");
+            assert_eq!(body["error"]["message"], "不支持的 DNS 记录类型");
+        }
+    }
+
+    /// 同一个名字、同一个客户端分在几个钟头里记，窗口覆盖到的几格加起来算
+    /// The same name and client recorded in several hours add up over the buckets the
+    /// window covers
+    #[test]
+    fn counts_from_several_hours_add_up() {
+        let stats = QueryStats::default();
+        let hour = QUERY_STATS_BUCKET_SECONDS;
+        let client = IpAddr::from(Ipv4Addr::new(10, 0, 0, 1));
+        stats.record_at("a.example", client, hour);
+        stats.record_at("a.example", client, 2 * hour);
+        stats.record_at("a.example", client, 2 * hour + 1);
+        let snapshot = stats.snapshot(2 * hour, 2 * hour, 10);
+        assert_eq!(snapshot.requests_observed, 3);
+        assert_eq!(snapshot.domains[0].count, 3);
+        assert_eq!(snapshot.clients[0].count, 3);
+    }
+
     /// 没开控制通道时不统计排行 / No rankings are collected without a control socket
     #[test]
     fn collects_no_rankings_without_a_control_socket() {
@@ -3500,6 +3567,34 @@ mod diagnostic_tests {
                 .any(|answer| answer.contains("10.0.0.1")),
             "{body}"
         );
+    }
+
+    /// 试跑和校验一样拒绝候选配置：解析得了、但有配置问题（读不懂的上游），或者监听设置不对，都回
+    /// 422 config_invalid
+    /// A trial refuses a candidate as validation does: one that parses but has a
+    /// configuration problem (an upstream nothing can read), or whose listener settings
+    /// are wrong, gets 422 config_invalid
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_trial_refuses_a_candidate_validation_would_refuse() {
+        let configs = [
+            json!({ "settings": { "default_upstream": "1.1.1.1:53" }, "pipelines": [{ "id": "main", "rules": [{ "name": "x", "matchers": [{ "type": "any" }], "actions": [{ "type": "forward", "upstream": "nonsense" }] }] }] }),
+            json!({ "settings": { "default_upstream": "1.1.1.1:53", "bind_udp": "not an address" }, "pipelines": [{ "id": "main", "rules": [] }] }),
+        ];
+        for config in configs {
+            let input = TrialInput {
+                request: CandidateTraceRequest {
+                    domain: "nas.example".to_owned(),
+                    record_type: "A".to_owned(),
+                    client_ip: None,
+                    config: config.clone(),
+                },
+                listener_label: "default".to_owned(),
+            };
+            let (status, body) = run_trial(input).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{config}: {body}");
+            assert_eq!(body["error"]["code"], "config_invalid", "{body}");
+        }
     }
 
     #[tokio::test]
