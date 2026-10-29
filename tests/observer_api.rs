@@ -1546,7 +1546,13 @@ async fn tcp_fallback_reports_the_transport_that_answered() {
     // The TCP port of the UDP socket's number can be taken already (by another
     // test's connection, say): take another pair then
     // 和 UDP 同号的 TCP 端口可能已被占用（例如被别的测试的连接占着）：那就换一对
+    let mut tries = 0;
     let (silent_udp, listener) = loop {
+        tries += 1;
+        assert!(
+            tries <= 20,
+            "port conflict: no port free for both UDP and TCP in 20 tries"
+        );
         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = udp.local_addr().unwrap().port();
         match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {

@@ -89,6 +89,16 @@ pub(crate) async fn upstream(replies: impl Fn(&Message) -> Replies + Send + 'sta
 /// 每个查询回一条 TTL 为 `ttl` 的 A 记录 `address` 的本机 UDP 上游
 /// A local UDP upstream answering every query with one A record `address` of TTL `ttl`
 pub(crate) async fn answering_upstream(address: Ipv4Addr, ttl: u32) -> Upstream {
+    answering_upstream_after(address, ttl, Duration::ZERO).await
+}
+
+/// 同 [`answering_upstream`]，但每个应答晚 `delay` 才发出
+/// The same as [`answering_upstream`], with every answer sent `delay` late
+pub(crate) async fn answering_upstream_after(
+    address: Ipv4Addr,
+    ttl: u32,
+    delay: Duration,
+) -> Upstream {
     upstream(move |query| {
         let Some(question) = query.queries.first() else {
             return Vec::new();
@@ -101,7 +111,7 @@ pub(crate) async fn answering_upstream(address: Ipv4Addr, ttl: u32) -> Upstream 
             ttl,
             RData::A(A(address)),
         ));
-        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+        vec![(delay, reply.to_vec().unwrap())]
     })
     .await
 }
@@ -110,9 +120,26 @@ pub(crate) async fn answering_upstream(address: Ipv4Addr, ttl: u32) -> Upstream 
 /// A local upstream on one port for UDP and TCP: it takes queries and connections and
 /// never answers
 pub(crate) async fn silent_upstream() -> SocketAddr {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // 先拿 UDP 端口，再在同号上绑 TCP（顺序的道理见 upstream.rs 测试里的
+    // `bind_udp_and_tcp_on_one_port`）；同号的 TCP 端口正被占着时换一对，最多试 20 次
+    // The UDP port first, then TCP on the same number (see `bind_udp_and_tcp_on_one_port`
+    // in the upstream.rs tests for the order); another pair when that TCP port is
+    // taken, at most 20 tries
+    let mut tries = 0;
+    let (tcp, udp) = loop {
+        tries += 1;
+        assert!(
+            tries <= 20,
+            "port conflict: no port free for both UDP and TCP in 20 tries"
+        );
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        match tokio::net::TcpListener::bind(udp.local_addr().unwrap()).await {
+            Ok(tcp) => break (tcp, udp),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(err) => panic!("bind tcp on the udp port: {err}"),
+        }
+    };
     let address = tcp.local_addr().unwrap();
-    let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
     tokio::spawn(async move {
         let mut held = Vec::new();
         let mut buf = [0u8; 1500];

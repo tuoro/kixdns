@@ -1086,45 +1086,19 @@ pub(crate) async fn process_response_jump(
 
 #[cfg(test)]
 mod response_jump_tests {
-    use crate::engine::core::Engine;
-    use crate::matcher::RuntimePipelineConfig;
+    use crate::engine::test_support::{answering_upstream, engine_from};
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::rr::{Name, RData, RecordType};
     use hickory_proto::serialize::binary::BinDecodable;
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use std::time::Duration;
 
-    /// Local UDP upstream that answers every query with one A record.
-    /// 本机 UDP 上游：每个查询都回一条 A 记录。
-    async fn spawn_answering_upstream() -> String {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-                let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = query.queries.first().cloned() else {
-                    continue;
-                };
-                let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
-                resp.add_query(question.clone());
-                resp.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    300,
-                    RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
-                ));
-                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
-            }
-        });
-        addr
-    }
-
     #[tokio::test]
     async fn a_response_jump_starts_the_target_pipeline_from_its_first_rule() {
-        let upstream = spawn_answering_upstream().await;
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300)
+            .await
+            .address;
         let any = serde_json::json!([{ "type": "any" }]);
         let forward = serde_json::json!([{ "type": "forward", "upstream": upstream }]);
         let jump_to =
@@ -1153,13 +1127,7 @@ mod response_jump_tests {
                 ]}
             ]
         });
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        let engine = Engine::new(
-            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let engine = engine_from(raw);
 
         let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
         request.add_query(Query::query(
@@ -1197,20 +1165,13 @@ mod geo_lock_tests {
 
     use super::acquire_geo_locks;
     use crate::engine::Engine;
-    use crate::matcher::RuntimePipelineConfig;
+    use crate::engine::test_support::engine_from;
 
     fn engine() -> Engine {
-        let raw = serde_json::json!({
+        engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9" },
             "pipelines": [{ "id": "main", "rules": [] }]
-        });
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        Engine::new(
-            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-            "test".to_string(),
-        )
-        .expect("engine")
+        }))
     }
 
     /// GeoIP is being written, so the reader gets only GeoSite and waits for GeoIP.

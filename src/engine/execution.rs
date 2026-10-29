@@ -1,11 +1,7 @@
-#[cfg(test)]
-use rustc_hash::FxHashMap;
 use rustc_hash::{FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-#[cfg(test)]
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -16,10 +12,6 @@ use bytes::Bytes;
 
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::DNSClass;
-#[cfg(test)]
-use hickory_proto::rr::Name;
-#[cfg(test)]
-use hickory_proto::rr::rdata::A;
 
 use hickory_proto::serialize::binary::BinDecodable;
 use tracing::warn;
@@ -42,8 +34,6 @@ use super::utils::{InflightCleanupGuard, engine_helpers};
 use crate::cache::CachedQuestion;
 use crate::ecs_scope::EcsReach;
 use crate::engine::refresh::{RefreshCheck, RefreshTarget};
-#[cfg(test)]
-use crate::engine::rules::calculate_rule_hash;
 use crate::engine::rules::rule_cache_requester;
 use crate::engine::rules::{Decision, ResponseContext};
 use crate::matcher::{Requester, RequesterKey};
@@ -1816,11 +1806,16 @@ mod tests {
     use crate::config::{Action, GlobalSettings};
     use crate::engine::response::*;
     use crate::engine::rules::*;
+    use crate::engine::test_support::{
+        self as support, answering_upstream, answering_upstream_after, engine_from,
+    };
     use crate::engine::types::{InflightEntry, InflightQuestion};
-    use hickory_proto::op::{Message, MessageType, OpCode, Query, UpdateMessage};
-    use hickory_proto::rr::RecordType;
-    use hickory_proto::rr::{RData, Record};
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use rustc_hash::FxHashMap;
     use std::net::IpAddr;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     fn runtime_with_upstream(upstream: &str) -> RuntimePipelineConfig {
@@ -1991,35 +1986,6 @@ mod tests {
         );
     }
 
-    /// Minimal UDP upstream that echoes each query back as a NOERROR response
-    /// with a single A record, so the forward path completes without network
-    /// access. / 最小 UDP 上游：把查询回显为带一条 A 记录的 NOERROR 响应。
-    async fn spawn_echo_upstream() -> String {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-                let query = match Message::from_bytes(&buf[..n]) {
-                    Ok(q) => q,
-                    Err(_) => continue,
-                };
-                let Some(question) = query.queries.first().cloned() else {
-                    continue;
-                };
-                let mut resp = Message::new(query.id(), MessageType::Response, OpCode::Query);
-                resp.add_query(question.clone());
-                resp.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    300,
-                    RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::LOCALHOST)),
-                ));
-                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
-            }
-        });
-        addr
-    }
-
     fn jump_config(upstream: &str, target_ip: &str) -> RuntimePipelineConfig {
         let raw = serde_json::json!({
             "settings": { "default_upstream": "1.1.1.1:53", "min_ttl": 60 },
@@ -2058,7 +2024,9 @@ mod tests {
     /// path, and answers once written there were never read.
     #[tokio::test]
     async fn a_response_jump_runs_its_own_generation_and_caches_nothing() {
-        let upstream = spawn_echo_upstream().await;
+        let upstream = answering_upstream(std::net::Ipv4Addr::LOCALHOST, 300)
+            .await
+            .address;
         let engine =
             Engine::new(jump_config(&upstream, "192.0.2.1"), "test".to_string()).expect("engine");
         let old_state = engine.state.load_full();
@@ -2099,77 +2067,10 @@ mod tests {
         );
     }
 
-    /// 用一条 A 记录 `answer` 回应每个查询的本机 UDP 上游，并数收到了多少个查询。
-    /// A local UDP upstream that answers every query with one A record `answer`,
-    /// counting the queries it receives.
-    async fn spawn_answering_upstream(
-        answer: std::net::Ipv4Addr,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        spawn_answering_upstream_after(answer, Duration::ZERO).await
-    }
-
-    /// 同上，但每个应答都晚 `delay` 才发出。
-    /// The same, with every answer sent `delay` late.
-    async fn spawn_answering_upstream_after(
-        answer: std::net::Ipv4Addr,
-        delay: Duration,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let addr = sock.local_addr().unwrap().to_string();
-        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = queries.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-                let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = query.queries.first().cloned() else {
-                    continue;
-                };
-                counted.fetch_add(1, Ordering::Relaxed);
-                let mut resp = Message::new(query.id(), MessageType::Response, OpCode::Query);
-                resp.add_query(question.clone());
-                resp.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    300,
-                    RData::A(hickory_proto::rr::rdata::A(answer)),
-                ));
-                let resp = resp.to_vec().unwrap();
-                if delay.is_zero() {
-                    let _ = sock.send_to(&resp, peer).await;
-                } else {
-                    let sock = sock.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = sock.send_to(&resp, peer).await;
-                    });
-                }
-            }
-        });
-        (addr, queries)
-    }
-
-    /// 只收不答的本机 UDP 上游，数收到了多少个数据包。
-    /// A local UDP upstream that never answers, counting the datagrams it receives.
-    async fn spawn_silent_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap().to_string();
-        let datagrams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = datagrams.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while sock.recv_from(&mut buf).await.is_ok() {
-                counted.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        (addr, datagrams)
-    }
-
     fn continue_config(
         pipeline_select: serde_json::Value,
         pipelines: serde_json::Value,
-    ) -> RuntimePipelineConfig {
+    ) -> serde_json::Value {
         continue_config_with_timeout(pipeline_select, pipelines, 100)
     }
 
@@ -2180,8 +2081,8 @@ mod tests {
         pipeline_select: serde_json::Value,
         pipelines: serde_json::Value,
         upstream_timeout_ms: u64,
-    ) -> RuntimePipelineConfig {
-        let raw = serde_json::json!({
+    ) -> serde_json::Value {
+        serde_json::json!({
             "settings": {
                 "default_upstream": "127.0.0.1:9",
                 "upstream_timeout_ms": upstream_timeout_ms,
@@ -2189,10 +2090,7 @@ mod tests {
             },
             "pipeline_select": pipeline_select,
             "pipelines": pipelines
-        });
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+        })
     }
 
     fn example_query() -> Vec<u8> {
@@ -2264,8 +2162,8 @@ mod tests {
         pipeline_select: serde_json::Value,
         pipelines: serde_json::Value,
         default_upstream: &str,
-    ) -> RuntimePipelineConfig {
-        let raw = serde_json::json!({
+    ) -> serde_json::Value {
+        serde_json::json!({
             "settings": {
                 "default_upstream": default_upstream,
                 "upstream_timeout_ms": 1000,
@@ -2273,10 +2171,7 @@ mod tests {
             },
             "pipeline_select": pipeline_select,
             "pipelines": pipelines
-        });
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+        })
     }
 
     /// 把查询发往上游的两种动作：明写的 forward，和发往默认上游、可以复用规则越过的应答的 allow
@@ -2296,25 +2191,22 @@ mod tests {
     /// not the other question's answer that entry hands out.
     #[tokio::test]
     async fn a_request_never_takes_another_questions_answer_from_a_shared_key() {
-        let (slow, queries) = spawn_answering_upstream_after(
+        let slow = answering_upstream_after(
             "192.0.2.20".parse().unwrap(),
+            300,
             Duration::from_millis(200),
         )
         .await;
-        for action in forwarding_actions(&slow) {
-            let engine = Engine::new(
-                config_with_default_upstream(
-                    serde_json::json!([]),
-                    serde_json::json!([{ "id": "main", "rules": [{
-                        "name": "all",
-                        "matchers": [{ "type": "any" }],
-                        "actions": [action]
-                    }] }]),
-                    &slow,
-                ),
-                "test".to_string(),
-            )
-            .expect("engine");
+        for action in forwarding_actions(&slow.address) {
+            let engine = engine_from(config_with_default_upstream(
+                serde_json::json!([]),
+                serde_json::json!([{ "id": "main", "rules": [{
+                    "name": "all",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [action]
+                }] }]),
+                &slow.address,
+            ));
             let keys = COLLIDING_NAMES.map(|name| {
                 Engine::cache_keys(
                     engine.state.load().cache_namespace("main"),
@@ -2333,7 +2225,7 @@ mod tests {
                 "the two names land on the same inflight key"
             );
 
-            let before = queries.load(Ordering::Relaxed);
+            let before = slow.queries();
             let [_, second] =
                 ask_colliding_names(&engine, ["10.0.0.1:53000", "10.0.0.1:53001"]).await;
             assert_eq!(
@@ -2342,7 +2234,7 @@ mod tests {
                 "{action}"
             );
             assert_eq!(
-                queries.load(Ordering::Relaxed) - before,
+                slow.queries() - before,
                 2,
                 "{action}: each name asked upstream itself"
             );
@@ -2356,9 +2248,12 @@ mod tests {
     /// the earlier one's entry.
     #[tokio::test]
     async fn a_request_on_the_jump_path_never_takes_another_questions_answer() {
-        let (pre, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
-        let (slow, queries) = spawn_answering_upstream_after(
+        let pre = answering_upstream("192.0.2.10".parse().unwrap(), 300)
+            .await
+            .address;
+        let slow = answering_upstream_after(
             "192.0.2.20".parse().unwrap(),
+            300,
             Duration::from_millis(200),
         )
         .await;
@@ -2371,29 +2266,25 @@ mod tests {
                 "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
             }] })
         };
-        for action in forwarding_actions(&slow) {
-            let engine = Engine::new(
-                config_with_default_upstream(
-                    serde_json::json!([
-                        { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-                        { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-                    ]),
-                    serde_json::json!([
-                        entry("a"),
-                        entry("b"),
-                        { "id": "other", "rules": [{
-                            "name": "all",
-                            "matchers": [{ "type": "any" }],
-                            "actions": [action]
-                        }] }
-                    ]),
-                    &slow,
-                ),
-                "test".to_string(),
-            )
-            .expect("engine");
+        for action in forwarding_actions(&slow.address) {
+            let engine = engine_from(config_with_default_upstream(
+                serde_json::json!([
+                    { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ]),
+                serde_json::json!([
+                    entry("a"),
+                    entry("b"),
+                    { "id": "other", "rules": [{
+                        "name": "all",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [action]
+                    }] }
+                ]),
+                &slow.address,
+            ));
 
-            let before = queries.load(Ordering::Relaxed);
+            let before = slow.queries();
             let [_, second] =
                 ask_colliding_names(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await;
             assert_eq!(
@@ -2402,19 +2293,17 @@ mod tests {
                 "{action}"
             );
             assert_eq!(
-                queries.load(Ordering::Relaxed) - before,
+                slow.queries() - before,
                 2,
                 "{action}: each name asked upstream itself"
             );
         }
     }
 
+    /// 应答里的第一个 A 记录，请求必须得到了应答 / The first A record in the reply a request
+    /// must have got
     fn first_a_record(response: anyhow::Result<Bytes>) -> Option<std::net::Ipv4Addr> {
-        let response = Message::from_bytes(&response.expect("answer")).expect("parse");
-        match response.answers.first().map(|record| &record.data) {
-            Some(RData::A(address)) => Some(address.0),
-            _ => None,
-        }
+        support::first_a(&response.expect("answer"))
     }
 
     /// 同一个 example.com 查询从 `clients` 同时发出：第一个登记 inflight，第二个等在
@@ -2455,7 +2344,7 @@ mod tests {
     /// 下一条是 `next`。
     /// A configuration that continues on a miss: `first` forwards to
     /// `first_upstream` and continues when it fails; the next rule is `next`.
-    fn continue_on_miss_to(first_upstream: &str, next: serde_json::Value) -> RuntimePipelineConfig {
+    fn continue_on_miss_to(first_upstream: &str, next: serde_json::Value) -> serde_json::Value {
         continue_config(
             serde_json::json!([]),
             serde_json::json!([{
@@ -2481,12 +2370,8 @@ mod tests {
     async fn datagrams_alone_and_at_once(
         next: serde_json::Value,
     ) -> (usize, usize, [Option<std::net::Ipv4Addr>; 2]) {
-        let (alone, sent_alone) = spawn_silent_upstream().await;
-        let engine = Engine::new(
-            continue_on_miss_to(&alone, next.clone()),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let alone = support::upstream(|_| Vec::new()).await;
+        let engine = engine_from(continue_on_miss_to(&alone.address, next.clone()));
         tokio::time::timeout(
             Duration::from_secs(5),
             engine.handle_packet(&example_query(), ONE_CLIENT[0].parse().unwrap()),
@@ -2495,15 +2380,10 @@ mod tests {
         .expect("a request after a continue must not hang")
         .expect("answer");
 
-        let (silent, sent) = spawn_silent_upstream().await;
-        let engine =
-            Engine::new(continue_on_miss_to(&silent, next), "test".to_string()).expect("engine");
+        let silent = support::upstream(|_| Vec::new()).await;
+        let engine = engine_from(continue_on_miss_to(&silent.address, next));
         let answers = ask_at_once(&engine, ONE_CLIENT).await;
-        (
-            sent_alone.load(Ordering::Relaxed),
-            sent.load(Ordering::Relaxed),
-            answers,
-        )
+        (alone.queries(), silent.queries(), answers)
     }
 
     /// on_miss 里的 continue 要把请求交给下一条规则。以前这里卸掉清理守卫，条目留在
@@ -2519,7 +2399,7 @@ mod tests {
     #[tokio::test]
     async fn a_continue_on_miss_hands_the_request_to_the_next_rule() {
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
+        let answering = answering_upstream(answer, 300).await.address;
         let (alone, at_once, answers) = datagrams_alone_and_at_once(serde_json::json!({
             "name": "next",
             "matchers": [{ "type": "any" }],
@@ -2558,19 +2438,15 @@ mod tests {
     /// neither hangs, and no entry is left behind.
     #[tokio::test]
     async fn a_failure_after_a_continue_answers_every_request() {
-        let (silent, _) = spawn_silent_upstream().await;
-        let engine = Engine::new(
-            continue_on_miss_to(
-                &silent,
-                serde_json::json!({
-                    "name": "next",
-                    "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "forward", "upstream": silent }]
-                }),
-            ),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let silent = support::upstream(|_| Vec::new()).await.address;
+        let engine = engine_from(continue_on_miss_to(
+            &silent,
+            serde_json::json!({
+                "name": "next",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": silent }]
+            }),
+        ));
 
         assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [None; 2]);
     }
@@ -2597,24 +2473,22 @@ mod tests {
     /// get the one continued past, such as an answer judged poisoned.
     #[tokio::test]
     async fn waiters_get_the_final_answer_after_a_continue_on_match() {
-        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let checked = answering_upstream("192.0.2.10".parse().unwrap(), 300)
+            .await
+            .address;
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
-        let engine = Engine::new(
-            continue_config(
-                serde_json::json!([]),
-                serde_json::json!([{
-                    "id": "main",
-                    "rules": continue_on_match_rules(&checked, serde_json::json!([{
-                        "name": "next",
-                        "matchers": [{ "type": "any" }],
-                        "actions": [{ "type": "forward", "upstream": answering }]
-                    }]))
-                }]),
-            ),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let answering = answering_upstream(answer, 300).await.address;
+        let engine = engine_from(continue_config(
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "main",
+                "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                    "name": "next",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }]
+                }]))
+            }]),
+        ));
 
         assert_eq!(ask_at_once(&engine, ONE_CLIENT).await, [Some(answer); 2]);
     }
@@ -2626,31 +2500,29 @@ mod tests {
     /// client waiting on it.
     #[tokio::test]
     async fn a_client_specific_static_answer_is_not_handed_to_another_client() {
-        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let checked = answering_upstream("192.0.2.10".parse().unwrap(), 300)
+            .await
+            .address;
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
-        let engine = Engine::new(
-            continue_config(
-                serde_json::json!([]),
-                serde_json::json!([{
-                    "id": "main",
-                    "rules": continue_on_match_rules(&checked, serde_json::json!([
-                        {
-                            "name": "block",
-                            "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
-                            "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
-                        },
-                        {
-                            "name": "next",
-                            "matchers": [{ "type": "any" }],
-                            "actions": [{ "type": "forward", "upstream": answering }]
-                        }
-                    ]))
-                }]),
-            ),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let answering = answering_upstream(answer, 300).await.address;
+        let engine = engine_from(continue_config(
+            serde_json::json!([]),
+            serde_json::json!([{
+                "id": "main",
+                "rules": continue_on_match_rules(&checked, serde_json::json!([
+                    {
+                        "name": "block",
+                        "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
+                        "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+                    },
+                    {
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }
+                ]))
+            }]),
+        ));
 
         let blocked = std::net::Ipv4Addr::UNSPECIFIED;
         assert_eq!(
@@ -2695,12 +2567,18 @@ mod tests {
     /// is, 10.0.0.2 waiting on it must get its own answer.
     #[tokio::test]
     async fn a_client_specific_answer_after_a_continue_is_not_handed_to_another_client() {
-        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
-        let (relay, _) = spawn_answering_upstream("192.0.2.40".parse().unwrap()).await;
-        let (sinkhole, _) = spawn_answering_upstream(std::net::Ipv4Addr::UNSPECIFIED).await;
-        let (silent, _) = spawn_silent_upstream().await;
+        let checked = answering_upstream("192.0.2.10".parse().unwrap(), 300)
+            .await
+            .address;
+        let relay = answering_upstream("192.0.2.40".parse().unwrap(), 300)
+            .await
+            .address;
+        let sinkhole = answering_upstream(std::net::Ipv4Addr::UNSPECIFIED, 300)
+            .await
+            .address;
+        let silent = support::upstream(|_| Vec::new()).await.address;
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
+        let answering = answering_upstream(answer, 300).await.address;
 
         let next = serde_json::json!({
             "name": "next",
@@ -2772,11 +2650,7 @@ mod tests {
         ];
         let mut handed_over = Vec::new();
         for (path, pipelines) in paths {
-            let engine = Engine::new(
-                continue_config(serde_json::json!([]), pipelines),
-                "test".to_string(),
-            )
-            .expect("engine");
+            let engine = engine_from(continue_config(serde_json::json!([]), pipelines));
             let answers = ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await;
             if answers != [Some(std::net::Ipv4Addr::UNSPECIFIED), Some(answer)] {
                 handed_over.push((path, answers));
@@ -2799,7 +2673,9 @@ mod tests {
     /// after a continue cannot send the other request on without forwarding.
     #[tokio::test]
     async fn requests_holding_entries_never_wait_on_each_other() {
-        let (checked, _) = spawn_answering_upstream("192.0.2.10".parse().unwrap()).await;
+        let checked = answering_upstream("192.0.2.10".parse().unwrap(), 300)
+            .await
+            .address;
         let pipeline = |id: &str, other: &str| {
             serde_json::json!({
                 "id": id,
@@ -2823,13 +2699,7 @@ mod tests {
             ],
             "pipelines": [pipeline("p1", "p2"), pipeline("p2", "p1")]
         });
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        let engine = Engine::new(
-            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let engine = engine_from(raw);
 
         assert_eq!(
             ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
@@ -2844,16 +2714,20 @@ mod tests {
     /// The waiter must get the final answer, not the one continued past.
     #[tokio::test]
     async fn a_waiter_on_a_jump_path_does_not_get_an_answer_continued_past() {
-        let (entry, _) = spawn_answering_upstream("192.0.2.50".parse().unwrap()).await;
+        let entry = answering_upstream("192.0.2.50".parse().unwrap(), 300)
+            .await
+            .address;
         // 慢一点，保证第二个请求到达时第一个还在等它
         // Slow, so the second request arrives while the first still waits on it
-        let (checked, _) = spawn_answering_upstream_after(
+        let checked = answering_upstream_after(
             "192.0.2.10".parse().unwrap(),
+            300,
             Duration::from_millis(50),
         )
-        .await;
+        .await
+        .address;
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
+        let answering = answering_upstream(answer, 300).await.address;
         let enter = |id: &str| {
             pipeline_of(
                 id,
@@ -2864,29 +2738,25 @@ mod tests {
                 }),
             )
         };
-        let engine = Engine::new(
-            continue_config_with_timeout(
-                serde_json::json!([
-                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-                ]),
-                serde_json::json!([
-                    enter("p1"),
-                    enter("p2"),
-                    {
-                        "id": "shared",
-                        "rules": continue_on_match_rules(&checked, serde_json::json!([{
-                            "name": "next",
-                            "matchers": [{ "type": "any" }],
-                            "actions": [{ "type": "forward", "upstream": answering }]
-                        }]))
-                    }
-                ]),
-                1000,
-            ),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let engine = engine_from(continue_config_with_timeout(
+            serde_json::json!([
+                { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ]),
+            serde_json::json!([
+                enter("p1"),
+                enter("p2"),
+                {
+                    "id": "shared",
+                    "rules": continue_on_match_rules(&checked, serde_json::json!([{
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }]))
+                }
+            ]),
+            1000,
+        ));
 
         assert_eq!(
             ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
@@ -2901,19 +2771,17 @@ mod tests {
     /// actions, and its answer may be the one a rule would continue past.
     #[tokio::test]
     async fn a_background_refresh_hands_nothing_to_an_entry_it_did_not_register() {
-        let (answering, _) = spawn_answering_upstream("192.0.2.20".parse().unwrap()).await;
-        let engine = Engine::new(
-            continue_config(
-                serde_json::json!([]),
-                serde_json::json!([{ "id": "main", "rules": [{
-                    "name": "next",
-                    "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "forward", "upstream": answering }]
-                }] }]),
-            ),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let answering = answering_upstream("192.0.2.20".parse().unwrap(), 300)
+            .await
+            .address;
+        let engine = engine_from(continue_config(
+            serde_json::json!([]),
+            serde_json::json!([{ "id": "main", "rules": [{
+                "name": "next",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": answering }]
+            }] }]),
+        ));
         let question = InflightQuestion {
             flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: engine.state.load().cache_namespace("main"),
@@ -2974,13 +2842,15 @@ mod tests {
     /// and must not get its SERVFAIL.
     #[tokio::test]
     async fn a_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
-        let (checked, _) = spawn_answering_upstream_after(
+        let checked = answering_upstream_after(
             "192.0.2.10".parse().unwrap(),
+            300,
             Duration::from_millis(50),
         )
-        .await;
+        .await
+        .address;
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
+        let answering = answering_upstream(answer, 300).await.address;
         let jump = |name: &str, target: &str| {
             serde_json::json!({
                 "name": name,
@@ -3011,13 +2881,7 @@ mod tests {
                 }] }
             ]
         });
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        let engine = Engine::new(
-            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let engine = engine_from(raw);
 
         assert_eq!(
             ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
@@ -3033,7 +2897,7 @@ mod tests {
     #[tokio::test]
     async fn a_jump_limit_servfail_is_not_cached_for_another_request() {
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
+        let answering = answering_upstream(answer, 300).await.address;
         let jump = |name: &str, target: &str| {
             serde_json::json!({
                 "name": name,
@@ -3063,13 +2927,7 @@ mod tests {
                 }] }
             ]
         });
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        let engine = Engine::new(
-            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-            "test".to_string(),
-        )
-        .expect("engine");
+        let engine = engine_from(raw);
         let ask = |client: &str| {
             let peer = client.parse().unwrap();
             let engine = &engine;
@@ -3100,20 +2958,26 @@ mod tests {
     /// must not reach a request that jumped there from `p2` with jumps to spare.
     #[tokio::test]
     async fn a_jump_path_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
-        let (entry, _) = spawn_answering_upstream("192.0.2.50".parse().unwrap()).await;
+        let entry = answering_upstream("192.0.2.50".parse().unwrap(), 300)
+            .await
+            .address;
         // p2 慢一点，第一个请求先在 s 登记 / p2 is slower, so the first request registers at s first
-        let (later_entry, _) = spawn_answering_upstream_after(
+        let later_entry = answering_upstream_after(
             "192.0.2.51".parse().unwrap(),
+            300,
             Duration::from_millis(30),
         )
-        .await;
-        let (slow, _) = spawn_answering_upstream_after(
+        .await
+        .address;
+        let slow = answering_upstream_after(
             "192.0.2.10".parse().unwrap(),
+            300,
             Duration::from_millis(100),
         )
-        .await;
+        .await
+        .address;
         let answer = "192.0.2.20".parse().unwrap();
-        let (answering, _) = spawn_answering_upstream(answer).await;
+        let answering = answering_upstream(answer, 300).await.address;
         let checked_jump = |id: &str, upstream: &str, target: &str| {
             pipeline_of(
                 id,
@@ -3194,13 +3058,7 @@ mod tests {
                 ],
                 "pipelines": pipelines
             });
-            let config: crate::config::PipelineConfig =
-                serde_json::from_value(raw).expect("parse config");
-            let engine = Engine::new(
-                RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-                "test".to_string(),
-            )
-            .expect("engine");
+            let engine = engine_from(raw);
             assert_eq!(
                 ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
                 [None, Some(answer)],
@@ -3509,9 +3367,7 @@ mod tests {
                 }]
             }]
         });
-        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let engine = engine_from(raw);
         let peer = "127.0.0.1:53000".parse().unwrap();
         let ask = |version: u8| {
             let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
@@ -3565,9 +3421,7 @@ mod tests {
                 }]
             }]
         });
-        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let engine = engine_from(raw);
         let peer = "127.0.0.1:53000".parse().unwrap();
         for (label, trailing) in [(&b"example"[..], &b"\0"[..]), (b"a b", b"")] {
             for version in [1u8, 0] {
@@ -3624,9 +3478,7 @@ mod tests {
                 }]
             }]
         });
-        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let engine = engine_from(raw);
         let peer = "127.0.0.1:53000".parse().unwrap();
 
         let assert_response = |qtype, expected_ips: &[IpAddr]| {
@@ -3692,9 +3544,7 @@ mod tests {
                 }]
             }]
         });
-        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        let engine = engine_from(raw);
         let peer = "127.0.0.1:53000".parse().unwrap();
 
         let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
@@ -4036,16 +3886,22 @@ mod tests {
     }
 
     fn build_test_engine() -> Engine {
-        let runtime = RuntimePipelineConfig {
-            settings: GlobalSettings {
-                default_upstream: TEST_UPSTREAM.to_string(),
-                ..Default::default()
-            },
+        let runtime = runtime_with_settings(GlobalSettings {
+            default_upstream: TEST_UPSTREAM.to_string(),
+            ..Default::default()
+        });
+        Engine::new(runtime, "lbl".to_string()).expect("initialize test engine")
+    }
+
+    /// 只有全局设置 `settings`、没有 pipeline 的运行配置
+    /// A runtime configuration with the global `settings` alone and no pipelines
+    fn runtime_with_settings(settings: GlobalSettings) -> RuntimePipelineConfig {
+        RuntimePipelineConfig {
+            settings,
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
-        };
-        Engine::new(runtime, "lbl".to_string()).expect("initialize test engine")
+        }
     }
 
     fn build_response_context() -> ResponseContext {
@@ -4061,6 +3917,35 @@ mod tests {
         }
     }
 
+    /// 在 `engine` 上为 `req`（来自 10.0.0.1 的 example.com A 查询）执行 `actions` 的上下文，
+    /// 手上的应答是 `ctx_opt`
+    /// The context for running `actions` on `engine` for `req` (an example.com A query from
+    /// 10.0.0.1), with `ctx_opt` the answer in hand
+    fn response_actions_context<'a>(
+        engine: &'a Engine,
+        actions: &'a [Action],
+        ctx_opt: Option<ResponseContext>,
+        req: &'a Message,
+        packet: &'a [u8],
+    ) -> ApplyResponseActionsContext<'a> {
+        ApplyResponseActionsContext {
+            engine,
+            actions,
+            ctx_opt,
+            req,
+            packet,
+            upstream_timeout: Duration::from_secs(1),
+            qname: "example.com",
+            qtype: RecordType::A,
+            client_ip: "10.0.0.1".parse().unwrap(),
+            upstream_default: TEST_UPSTREAM,
+            pipeline_id: "pipeline",
+            rule_name: "rule",
+            remaining_jumps: 10,
+            trail: None,
+        }
+    }
+
     #[tokio::test]
     async fn response_actions_allow_returns_the_upstream_answer() {
         // Arrange: Build test engine and response context
@@ -4069,25 +3954,9 @@ mod tests {
         let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Allow];
         let packet = [0u8];
-        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // Act: Apply response actions with Allow action
-        let ctx = crate::engine::rules::ApplyResponseActionsContext {
-            engine: &engine,
-            actions: &actions,
-            ctx_opt: Some(ctx),
-            req: &req,
-            packet: &packet,
-            upstream_timeout: Duration::from_secs(1),
-            qname: "example.com",
-            qtype: RecordType::A,
-            client_ip,
-            upstream_default: TEST_UPSTREAM,
-            pipeline_id: "pipeline",
-            rule_name: "rule",
-            remaining_jumps: 10,
-            trail: None,
-        };
+        let ctx = response_actions_context(&engine, &actions, Some(ctx), &req, &packet);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed");
@@ -4123,22 +3992,13 @@ mod tests {
             },
         ];
         let packet = [0u8];
-        let ctx = crate::engine::rules::ApplyResponseActionsContext {
-            engine: &engine,
-            actions: &actions,
-            ctx_opt: Some(build_response_context()),
-            req: &req,
-            packet: &packet,
-            upstream_timeout: Duration::from_secs(1),
-            qname: "example.com",
-            qtype: RecordType::A,
-            client_ip: "10.0.0.1".parse().unwrap(),
-            upstream_default: TEST_UPSTREAM,
-            pipeline_id: "pipeline",
-            rule_name: "rule",
-            remaining_jumps: 10,
-            trail: None,
-        };
+        let ctx = response_actions_context(
+            &engine,
+            &actions,
+            Some(build_response_context()),
+            &req,
+            &packet,
+        );
         match apply_response_actions(ctx).await.expect("response actions") {
             ResponseActionResult::Upstream { ctx, .. } => {
                 assert_eq!(ctx.raw.as_ref(), b"resp", "the upstream's answer goes out");
@@ -4155,25 +4015,9 @@ mod tests {
         let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Continue];
         let packet = [0u8];
-        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // Act: Apply response actions with Continue action
-        let ctx = crate::engine::rules::ApplyResponseActionsContext {
-            engine: &engine,
-            actions: &actions,
-            ctx_opt: Some(ctx),
-            req: &req,
-            packet: &packet,
-            upstream_timeout: Duration::from_secs(1),
-            qname: "example.com",
-            qtype: RecordType::A,
-            client_ip,
-            upstream_default: TEST_UPSTREAM,
-            pipeline_id: "pipeline",
-            rule_name: "rule",
-            remaining_jumps: 10,
-            trail: None,
-        };
+        let ctx = response_actions_context(&engine, &actions, Some(ctx), &req, &packet);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions continue should succeed");
@@ -4198,25 +4042,9 @@ mod tests {
         let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Log { level: None }, Action::Allow];
         let packet = [0u8];
-        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // Act: Apply response actions with Allow action and non-matching matcher
-        let ctx = crate::engine::rules::ApplyResponseActionsContext {
-            engine: &engine,
-            actions: &actions,
-            ctx_opt: Some(ctx),
-            req: &req,
-            packet: &packet,
-            upstream_timeout: Duration::from_secs(1),
-            qname: "example.com",
-            qtype: RecordType::A,
-            client_ip,
-            upstream_default: TEST_UPSTREAM,
-            pipeline_id: "pipeline",
-            rule_name: "rule",
-            remaining_jumps: 10,
-            trail: None,
-        };
+        let ctx = response_actions_context(&engine, &actions, Some(ctx), &req, &packet);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed even on miss");
@@ -4242,25 +4070,9 @@ mod tests {
         let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Deny];
         let packet = [0u8];
-        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         // Act: Apply response actions with Deny action
-        let ctx = crate::engine::rules::ApplyResponseActionsContext {
-            engine: &engine,
-            actions: &actions,
-            ctx_opt: None,
-            req: &req,
-            packet: &packet,
-            upstream_timeout: Duration::from_secs(1),
-            qname: "example.com",
-            qtype: RecordType::A,
-            client_ip,
-            upstream_default: TEST_UPSTREAM,
-            pipeline_id: "pipeline",
-            rule_name: "rule",
-            remaining_jumps: 10,
-            trail: None,
-        };
+        let ctx = response_actions_context(&engine, &actions, None, &req, &packet);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions deny should return static");
@@ -4287,24 +4099,11 @@ mod tests {
             ip: "192.0.2.1,2001:db8::1,192.0.2.2".to_string(),
         }];
         let packet = [0u8];
-        let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         let run = |qtype: RecordType| {
-            let ctx = crate::engine::rules::ApplyResponseActionsContext {
-                engine: &engine,
-                actions: &actions,
-                ctx_opt: None,
-                req: &req,
-                packet: &packet,
-                upstream_timeout: Duration::from_secs(1),
-                qname: "example.com",
+            let ctx = ApplyResponseActionsContext {
                 qtype,
-                client_ip,
-                upstream_default: TEST_UPSTREAM,
-                pipeline_id: "pipeline",
-                rule_name: "rule",
-                remaining_jumps: 10,
-                trail: None,
+                ..response_actions_context(&engine, &actions, None, &req, &packet)
             };
             apply_response_actions(ctx)
         };
@@ -4372,21 +4171,9 @@ mod tests {
             ttl: Some(60),
         }];
         let packet = req.to_vec().unwrap();
-        let ctx = crate::engine::rules::ApplyResponseActionsContext {
-            engine: &engine,
-            actions: &actions,
-            ctx_opt: None,
-            req: &req,
-            packet: &packet,
-            upstream_timeout: Duration::from_secs(1),
+        let ctx = ApplyResponseActionsContext {
             qname: "alias.example",
-            qtype: RecordType::A,
-            client_ip: "10.0.0.1".parse().unwrap(),
-            upstream_default: TEST_UPSTREAM,
-            pipeline_id: "pipeline",
-            rule_name: "rule",
-            remaining_jumps: 10,
-            trail: None,
+            ..response_actions_context(&engine, &actions, None, &req, &packet)
         };
 
         match apply_response_actions(ctx).await.expect("static cname") {
@@ -4530,19 +4317,8 @@ mod tests {
 
         // Insert an entry that expired 5 seconds ago
         let entry = CacheEntry {
-            flags: crate::proto_utils::QueryFlags::RECURSIVE,
-            bytes: Bytes::from_static(b"old_resp"),
-            rcode: ResponseCode::NoError,
-            upstream: None,
             qname: Arc::from(qname),
-            pipeline_id: pipeline_id.clone(),
-            qtype: u16::from(qtype),
-            inserted_at: Instant::now() - Duration::from_secs(10),
-            original_ttl: 5, // Expired 5 seconds ago
-            refresh_ttl: 5,
-            reach: Default::default(),
-            stored_at: Instant::now(),
-            fetched_at: Instant::now(),
+            ..(*stale_entry("default")).clone()
         };
         engine.cache_insert(dedupe_hash, Arc::new(entry));
 
@@ -4620,19 +4396,14 @@ mod tests {
     #[tokio::test]
     async fn flow_control_starts_at_the_configured_initial_permits() {
         let engine = Engine::new(
-            RuntimePipelineConfig {
-                settings: GlobalSettings {
-                    default_upstream: TEST_UPSTREAM.to_string(),
-                    flow_control_enabled: true,
-                    flow_control_min_permits: 100,
-                    flow_control_initial_permits: 500,
-                    flow_control_max_permits: 800,
-                    ..Default::default()
-                },
-                pipeline_select: Vec::new(),
-                pipelines: Vec::new(),
-                pipeline_id_index: FxHashMap::default(),
-            },
+            runtime_with_settings(GlobalSettings {
+                default_upstream: TEST_UPSTREAM.to_string(),
+                flow_control_enabled: true,
+                flow_control_min_permits: 100,
+                flow_control_initial_permits: 500,
+                flow_control_max_permits: 800,
+                ..Default::default()
+            }),
             "lbl".to_string(),
         )
         .expect("initialize engine");
@@ -4659,58 +4430,20 @@ mod tests {
         const CLIENT_WAIT_MS: u64 = 1500;
 
         let engine = build_test_engine();
-        engine.reload(RuntimePipelineConfig {
-            settings: GlobalSettings {
-                // TEST-NET-1：可路由地发出去、永远没有应答
-                // TEST-NET-1: the datagram leaves and nothing ever answers
-                default_upstream: "192.0.2.1:53".to_string(),
-                serve_stale: true,
-                serve_stale_client_timeout_ms: CLIENT_WAIT_MS,
-                upstream_timeout_ms: UPSTREAM_TIMEOUT_MS,
-                ..Default::default()
-            },
-            pipeline_select: Vec::new(),
-            pipelines: Vec::new(),
-            pipeline_id_index: FxHashMap::default(),
-        });
+        engine.reload(runtime_with_settings(GlobalSettings {
+            // TEST-NET-1：可路由地发出去、永远没有应答
+            // TEST-NET-1: the datagram leaves and nothing ever answers
+            default_upstream: "192.0.2.1:53".to_string(),
+            serve_stale: true,
+            serve_stale_client_timeout_ms: CLIENT_WAIT_MS,
+            upstream_timeout_ms: UPSTREAM_TIMEOUT_MS,
+            ..Default::default()
+        }));
 
-        let pipeline_id: Arc<str> = Arc::from("default");
-        let qname = "stale.com";
-        let dedupe_hash = Engine::cache_keys(
-            engine.state.load().cache_namespace(&pipeline_id),
-            &pipeline_id,
-            qname.as_bytes(),
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-        engine.cache_insert(
-            dedupe_hash,
-            Arc::new(CacheEntry {
-                flags: crate::proto_utils::QueryFlags::RECURSIVE,
-                bytes: Bytes::from_static(b"old_resp"),
-                rcode: ResponseCode::NoError,
-                upstream: None,
-                qname: Arc::from(qname),
-                pipeline_id: pipeline_id.clone(),
-                qtype: u16::from(RecordType::A),
-                inserted_at: Instant::now() - Duration::from_secs(10),
-                original_ttl: 5,
-                refresh_ttl: 5,
-                reach: Default::default(),
-                stored_at: Instant::now(),
-                fetched_at: Instant::now(),
-            }),
-        );
+        let dedupe_hash = stale_com_keys(&engine).slot;
+        engine.cache_insert(dedupe_hash, stale_entry("default"));
 
-        let mut packet = vec![0u8; 12];
-        packet[0] = 0xAA;
-        packet[1] = 0xBB;
-        packet[5] = 1;
-        packet.extend_from_slice(b"\x05stale\x03com\x00\x00\x01\x00\x01");
+        let packet = stale_com_query();
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         let start = Instant::now();
@@ -4746,54 +4479,16 @@ mod tests {
     #[tokio::test]
     async fn reloaded_serve_stale_setting_keeps_expired_entries() {
         let engine = build_test_engine();
-        engine.reload(RuntimePipelineConfig {
-            settings: GlobalSettings {
-                default_upstream: TEST_UPSTREAM.to_string(),
-                serve_stale: true,
-                ..Default::default()
-            },
-            pipeline_select: Vec::new(),
-            pipelines: Vec::new(),
-            pipeline_id_index: FxHashMap::default(),
-        });
+        engine.reload(runtime_with_settings(GlobalSettings {
+            default_upstream: TEST_UPSTREAM.to_string(),
+            serve_stale: true,
+            ..Default::default()
+        }));
 
-        let pipeline_id: Arc<str> = Arc::from("default");
-        let qname = "stale.com";
-        let dedupe_hash = Engine::cache_keys(
-            engine.state.load().cache_namespace(&pipeline_id),
-            &pipeline_id,
-            qname.as_bytes(),
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-        engine.cache_insert(
-            dedupe_hash,
-            Arc::new(CacheEntry {
-                flags: crate::proto_utils::QueryFlags::RECURSIVE,
-                bytes: Bytes::from_static(b"old_resp"),
-                rcode: ResponseCode::NoError,
-                upstream: None,
-                qname: Arc::from(qname),
-                pipeline_id: pipeline_id.clone(),
-                qtype: u16::from(RecordType::A),
-                inserted_at: Instant::now() - Duration::from_secs(10),
-                original_ttl: 5,
-                refresh_ttl: 5,
-                reach: Default::default(),
-                stored_at: Instant::now(),
-                fetched_at: Instant::now(),
-            }),
-        );
+        let dedupe_hash = stale_com_keys(&engine).slot;
+        engine.cache_insert(dedupe_hash, stale_entry("default"));
 
-        let mut packet = vec![0u8; 12];
-        packet[0] = 0xAA;
-        packet[1] = 0xBB;
-        packet[5] = 1;
-        packet.extend_from_slice(b"\x05stale\x03com\x00\x00\x01\x00\x01");
+        let packet = stale_com_query();
         let peer = "127.0.0.1:12345".parse().unwrap();
         engine
             .handle_packet_fast(&packet, peer)
@@ -4825,18 +4520,13 @@ mod tests {
     /// the dedupe hash of the `stale.com` query.
     fn engine_without_an_answering_upstream(serve_stale: bool) -> (Engine, u64) {
         let engine = Engine::new(
-            RuntimePipelineConfig {
-                settings: GlobalSettings {
-                    default_upstream: DEAD_UPSTREAM.to_string(),
-                    upstream_timeout_ms: 100,
-                    serve_stale,
-                    serve_stale_ttl_reset: true,
-                    ..Default::default()
-                },
-                pipeline_select: Vec::new(),
-                pipelines: Vec::new(),
-                pipeline_id_index: FxHashMap::default(),
-            },
+            runtime_with_settings(GlobalSettings {
+                default_upstream: DEAD_UPSTREAM.to_string(),
+                upstream_timeout_ms: 100,
+                serve_stale,
+                serve_stale_ttl_reset: true,
+                ..Default::default()
+            }),
             "lbl".to_string(),
         )
         .expect("initialize engine");
@@ -4965,17 +4655,12 @@ mod tests {
     /// serve_stale options; with the context to look it up
     fn engine_with_a_stale_answer(settings: GlobalSettings) -> (Engine, u64) {
         let engine = Engine::new(
-            RuntimePipelineConfig {
-                settings: GlobalSettings {
-                    default_upstream: DEAD_UPSTREAM.to_string(),
-                    upstream_timeout_ms: 100,
-                    serve_stale: true,
-                    ..settings
-                },
-                pipeline_select: Vec::new(),
-                pipelines: Vec::new(),
-                pipeline_id_index: FxHashMap::default(),
-            },
+            runtime_with_settings(GlobalSettings {
+                default_upstream: DEAD_UPSTREAM.to_string(),
+                upstream_timeout_ms: 100,
+                serve_stale: true,
+                ..settings
+            }),
             "lbl".to_string(),
         )
         .expect("initialize engine");
@@ -5259,17 +4944,12 @@ mod tests {
         // 引擎要在运行时里建 / The engine is built inside the runtime
         let _runtime = runtime.enter();
         let engine = Engine::new(
-            RuntimePipelineConfig {
-                settings: GlobalSettings {
-                    default_upstream: up.address.clone(),
-                    upstream_timeout_ms: 3000,
-                    enable_tcp_fallback: false,
-                    ..Default::default()
-                },
-                pipeline_select: Vec::new(),
-                pipelines: Vec::new(),
-                pipeline_id_index: FxHashMap::default(),
-            },
+            runtime_with_settings(GlobalSettings {
+                default_upstream: up.address.clone(),
+                upstream_timeout_ms: 3000,
+                enable_tcp_fallback: false,
+                ..Default::default()
+            }),
             "lbl".to_string(),
         )
         .expect("initialize engine");
@@ -5812,13 +5492,7 @@ mod tests {
                 "settings": { "default_upstream": "127.0.0.1:9" },
                 "pipelines": [{ "id": "main", "rules": rules }]
             });
-            let cfg: crate::config::PipelineConfig =
-                serde_json::from_value(raw).expect("parse config");
-            let engine = Engine::new(
-                RuntimePipelineConfig::from_config(cfg).expect("runtime config"),
-                "test".to_string(),
-            )
-            .expect("engine");
+            let engine = engine_from(raw);
             engine
                 .geoip_manager
                 .write()
@@ -6140,8 +5814,6 @@ mod tests_multi_upstream {
 mod jump_response_cache_tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::str::FromStr;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -6151,71 +5823,44 @@ mod jump_response_cache_tests {
 
     use crate::config::PipelineConfig;
     use crate::engine::Engine;
+    use crate::engine::test_support::{self as support, Upstream, answering_upstream, engine_from};
     use crate::matcher::RuntimePipelineConfig;
 
-    /// UDP 上游：每个查询都答 `ip`（TTL 为 `ttl` 秒），并数一共收到几个查询
-    /// UDP upstream that answers every query with `ip` (TTL `ttl` seconds) and counts the queries it receives
-    async fn counting_upstream(ip: Ipv4Addr, ttl: u32) -> (String, Arc<AtomicUsize>) {
-        counting_upstream_echoing(ip, ttl, None).await
-    }
-
-    /// 同上，并把查询带来的 ECS 原样回显，作用范围为 `scope`（None 表示应答不带 ECS），像支持
-    /// ECS 的上游那样
-    /// The same, echoing the ECS the query carries with scope `scope` (None: the
-    /// reply carries no ECS), as an ECS-aware upstream does
-    async fn counting_upstream_echoing(
-        ip: Ipv4Addr,
-        ttl: u32,
-        scope: Option<u8>,
-    ) -> (String, Arc<AtomicUsize>) {
+    /// 每个查询都答 `ip`（TTL 为 `ttl` 秒）的 UDP 上游，并把查询带来的 ECS 原样回显，作用范围为
+    /// `scope`，像支持 ECS 的上游那样
+    /// UDP upstream that answers every query with `ip` (TTL `ttl` seconds), echoing the ECS
+    /// the query carries with scope `scope`, as an ECS-aware upstream does
+    async fn upstream_echoing(ip: Ipv4Addr, ttl: u32, scope: u8) -> Upstream {
         use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap().to_string();
-        let queries = Arc::new(AtomicUsize::new(0));
-        let counter = queries.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
-                let Ok(request) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = request.queries.first().cloned() else {
-                    continue;
-                };
-                counter.fetch_add(1, Ordering::SeqCst);
-                let mut response =
-                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
-                response.add_query(question.clone());
-                response.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    ttl,
-                    RData::A(A(ip)),
-                ));
-                if let Some(scope) = scope
-                    && let Some(EdnsOption::Subnet(subnet)) = request
-                        .edns
-                        .as_ref()
-                        .and_then(|edns| edns.options().get(EdnsCode::Subnet))
-                {
-                    let mut edns = hickory_proto::op::Edns::new();
-                    edns.options_mut()
-                        .insert(EdnsOption::Subnet(ClientSubnet::new(
-                            subnet.addr(),
-                            subnet.source_prefix(),
-                            scope,
-                        )));
-                    response.edns = Some(edns);
-                }
-                let _ = socket.send_to(&response.to_vec().unwrap(), peer).await;
+        support::upstream(move |request| {
+            let Some(question) = request.queries.first().cloned() else {
+                return Vec::new();
+            };
+            let mut response =
+                Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
+            response.add_query(question.clone());
+            response.add_answer(Record::from_rdata(
+                question.name().clone(),
+                ttl,
+                RData::A(A(ip)),
+            ));
+            if let Some(EdnsOption::Subnet(subnet)) = request
+                .edns
+                .as_ref()
+                .and_then(|edns| edns.options().get(EdnsCode::Subnet))
+            {
+                let mut edns = hickory_proto::op::Edns::new();
+                edns.options_mut()
+                    .insert(EdnsOption::Subnet(ClientSubnet::new(
+                        subnet.addr(),
+                        subnet.source_prefix(),
+                        scope,
+                    )));
+                response.edns = Some(edns);
             }
-        });
-        (addr, queries)
-    }
-
-    fn engine(raw: serde_json::Value) -> Engine {
-        let config: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
-        Engine::new(runtime, "test".to_string()).expect("engine")
+            vec![(Duration::ZERO, response.to_vec().unwrap())]
+        })
+        .await
     }
 
     /// 从 `client` 查一次 `qname` 的 A 记录，返回答到的地址 / Query `qname` (A) from `client` and return the address answered
@@ -6261,8 +5906,8 @@ mod jump_response_cache_tests {
     /// once. All three used to reach it.
     #[tokio::test]
     async fn a_request_that_jumps_is_answered_from_the_cache() {
-        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let engine = engine(serde_json::json!({
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": [
                 {
@@ -6273,7 +5918,7 @@ mod jump_response_cache_tests {
                         "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
                     }]
                 },
-                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+                { "id": "group", "rules": [forward_rule("fwd", &upstream.address)] }
             ]
         }));
 
@@ -6283,7 +5928,7 @@ mod jump_response_cache_tests {
                 Ipv4Addr::new(192, 0, 2, 1)
             );
         }
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.queries(), 1);
     }
 
     /// 入口按客户端地址跳到不同的目标时，每个目标的应答只给跳到它的请求：
@@ -6293,11 +5938,9 @@ mod jump_response_cache_tests {
     /// each get their own target's address, and each upstream is asked once.
     #[tokio::test]
     async fn cached_answers_stay_with_the_target_they_came_from() {
-        let (first_upstream, first_queries) =
-            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let (second_upstream, second_queries) =
-            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
-        let engine = engine(serde_json::json!({
+        let first_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let second_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": [
                 {
@@ -6315,8 +5958,8 @@ mod jump_response_cache_tests {
                         }
                     ]
                 },
-                { "id": "first", "rules": [forward_rule("fwd", &first_upstream)] },
-                { "id": "second", "rules": [forward_rule("fwd", &second_upstream)] }
+                { "id": "first", "rules": [forward_rule("fwd", &first_upstream.address)] },
+                { "id": "second", "rules": [forward_rule("fwd", &second_upstream.address)] }
             ]
         }));
 
@@ -6330,8 +5973,8 @@ mod jump_response_cache_tests {
                 Ipv4Addr::new(192, 0, 2, 2)
             );
         }
-        assert_eq!(first_queries.load(Ordering::SeqCst), 1);
-        assert_eq!(second_queries.load(Ordering::SeqCst), 1);
+        assert_eq!(first_upstream.queries(), 1);
+        assert_eq!(second_upstream.queries(), 1);
     }
 
     /// continue 之后才遇到的跳转不查缓存，照常转发：那时请求已经越过了一个应答（可能被后面的
@@ -6345,11 +5988,9 @@ mod jump_response_cache_tests {
     /// and both run `try-first` again.
     #[tokio::test]
     async fn a_jump_reached_after_a_continue_still_forwards() {
-        let (first_upstream, first_queries) =
-            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let (group_upstream, group_queries) =
-            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
-        let engine = engine(serde_json::json!({
+        let first_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let group_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": [
                 {
@@ -6358,7 +5999,7 @@ mod jump_response_cache_tests {
                         {
                             "name": "try-first",
                             "matchers": [{ "type": "client_ip", "cidr": "192.0.2.0/24" }],
-                            "actions": [{ "type": "forward", "upstream": first_upstream, "transport": "udp" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream.address, "transport": "udp" }],
                             "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN" }],
                             "response_actions_on_miss": [{ "type": "continue" }]
                         },
@@ -6369,7 +6010,7 @@ mod jump_response_cache_tests {
                         }
                     ]
                 },
-                { "id": "group", "rules": [forward_rule("fwd", &group_upstream)] }
+                { "id": "group", "rules": [forward_rule("fwd", &group_upstream.address)] }
             ]
         }));
 
@@ -6379,8 +6020,8 @@ mod jump_response_cache_tests {
                 Ipv4Addr::new(192, 0, 2, 2)
             );
         }
-        assert_eq!(first_queries.load(Ordering::SeqCst), 2);
-        assert_eq!(group_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(first_upstream.queries(), 2);
+        assert_eq!(group_upstream.queries(), 2);
     }
 
     /// 同一个客户端重复查询也一样：continue 之后得出的决策不进规则缓存（olicesx/kixdns#70），
@@ -6390,11 +6031,9 @@ mod jump_response_cache_tests {
     /// jumps on its second pass and forwards as before.
     #[tokio::test]
     async fn a_repeated_request_that_continues_still_forwards_after_the_jump() {
-        let (first_upstream, first_queries) =
-            counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let (group_upstream, group_queries) =
-            counting_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
-        let engine = engine(serde_json::json!({
+        let first_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let group_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": [
                 {
@@ -6403,7 +6042,7 @@ mod jump_response_cache_tests {
                         {
                             "name": "try-first",
                             "matchers": [{ "type": "any" }],
-                            "actions": [{ "type": "forward", "upstream": first_upstream, "transport": "udp" }],
+                            "actions": [{ "type": "forward", "upstream": first_upstream.address, "transport": "udp" }],
                             "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN" }],
                             "response_actions_on_miss": [{ "type": "continue" }]
                         },
@@ -6414,7 +6053,7 @@ mod jump_response_cache_tests {
                         }
                     ]
                 },
-                { "id": "group", "rules": [forward_rule("fwd", &group_upstream)] }
+                { "id": "group", "rules": [forward_rule("fwd", &group_upstream.address)] }
             ]
         }));
 
@@ -6424,8 +6063,8 @@ mod jump_response_cache_tests {
                 Ipv4Addr::new(192, 0, 2, 2)
             );
         }
-        assert_eq!(first_queries.load(Ordering::SeqCst), 2);
-        assert_eq!(group_queries.load(Ordering::SeqCst), 2);
+        assert_eq!(first_upstream.queries(), 2);
+        assert_eq!(group_upstream.queries(), 2);
     }
 
     /// 目标 pipeline 按客户端判断时，跳转后不从缓存给应答：这个客户端该被拦下，
@@ -6435,8 +6074,8 @@ mod jump_response_cache_tests {
     /// forward stored under the target's key.
     #[tokio::test]
     async fn a_target_that_matches_on_the_client_is_not_served_from_the_cache() {
-        let (upstream, _queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let engine = engine(serde_json::json!({
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": [
                 {
@@ -6455,7 +6094,7 @@ mod jump_response_cache_tests {
                             "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }],
                             "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
                         },
-                        forward_rule("fwd", &upstream)
+                        forward_rule("fwd", &upstream.address)
                     ]
                 }
             ]
@@ -6478,8 +6117,8 @@ mod jump_response_cache_tests {
     /// route and write another answer under the target's key.
     #[tokio::test]
     async fn a_route_through_an_edns_rule_is_not_looked_up_after_the_jump() {
-        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let engine = engine(serde_json::json!({
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": [
                 {
@@ -6497,7 +6136,7 @@ mod jump_response_cache_tests {
                         }
                     ]
                 },
-                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+                { "id": "group", "rules": [forward_rule("fwd", &upstream.address)] }
             ]
         }));
 
@@ -6507,7 +6146,7 @@ mod jump_response_cache_tests {
                 Ipv4Addr::new(192, 0, 2, 1)
             );
         }
-        assert_eq!(queries.load(Ordering::SeqCst), 3);
+        assert_eq!(upstream.queries(), 3);
     }
 
     /// 跳转后找到的过期应答由后台刷新，刷新写回同一个目标键：之后的请求拿到新鲜应答，
@@ -6517,8 +6156,8 @@ mod jump_response_cache_tests {
     /// answer, with no further upstream query and no stale answer.
     #[tokio::test]
     async fn a_refresh_started_after_a_jump_renews_the_target_entry() {
-        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
-        let engine = engine(serde_json::json!({
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
+        let engine = engine_from(serde_json::json!({
             "settings": {
                 "default_upstream": "127.0.0.1:9",
                 "min_ttl": 0,
@@ -6535,18 +6174,18 @@ mod jump_response_cache_tests {
                         "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
                     }]
                 },
-                { "id": "group", "rules": [forward_rule("fwd", &upstream)] }
+                { "id": "group", "rules": [forward_rule("fwd", &upstream.address)] }
             ]
         }));
 
         answer(&engine, "renew.example", "192.0.2.10").await;
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.queries(), 1);
         tokio::time::sleep(Duration::from_millis(1200)).await;
 
         // 过期：立刻给过期应答，后台刷新去问上游 / Expired: the stale answer goes out at once and a background refresh asks upstream
         answer(&engine, "renew.example", "192.0.2.10").await;
         let refreshed = tokio::time::timeout(Duration::from_secs(3), async {
-            while queries.load(Ordering::SeqCst) < 2 {
+            while upstream.queries() < 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -6574,7 +6213,7 @@ mod jump_response_cache_tests {
             fresh.is_ok(),
             "no fresh answer after the background refresh"
         );
-        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream.queries(), 2);
     }
 
     fn jump_to_group(group_rules: serde_json::Value) -> serde_json::Value {
@@ -6596,20 +6235,20 @@ mod jump_response_cache_tests {
     /// replays the query without EDNS and may select another pipeline.
     #[tokio::test]
     async fn edns_in_pipeline_selection_turns_off_the_lookup_after_a_jump() {
-        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let engine = engine(serde_json::json!({
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipeline_select": [{
                 "pipeline": "main",
                 "matchers": [{ "type": "edns_present", "expect": false }]
             }],
-            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream)]))
+            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream.address)]))
         }));
 
         for _ in 0..2 {
             answer(&engine, "selected.example", "192.0.2.10").await;
         }
-        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream.queries(), 2);
     }
 
     /// 类别不是 IN 的查询跳转后不查缓存：刷新重放的请求固定是 IN，算出的是另一个键。
@@ -6617,16 +6256,16 @@ mod jump_response_cache_tests {
     /// in class IN and computes another key.
     #[tokio::test]
     async fn a_query_outside_class_in_is_not_looked_up_after_a_jump() {
-        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let engine = engine(serde_json::json!({
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
-            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream)]))
+            "pipelines": jump_to_group(serde_json::json!([forward_rule("fwd", &upstream.address)]))
         }));
 
         for _ in 0..2 {
             ask(&engine, "chaos.example", "192.0.2.10", DNSClass::CH).await;
         }
-        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream.queries(), 2);
     }
 
     /// 目标的转发按客户端地址带 ECS 子网时，跳转后照常查缓存，但按一个子网定制的应答（作用
@@ -6637,16 +6276,15 @@ mod jump_response_cache_tests {
     /// the jump.
     #[tokio::test]
     async fn a_target_forwarding_the_client_subnet_is_not_served_across_subnets() {
-        let (upstream, queries) =
-            counting_upstream_echoing(Ipv4Addr::new(192, 0, 2, 1), 300, Some(24)).await;
-        let engine = engine(serde_json::json!({
+        let upstream = upstream_echoing(Ipv4Addr::new(192, 0, 2, 1), 300, 24).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": jump_to_group(serde_json::json!([{
                 "name": "fwd",
                 "matchers": [{ "type": "any" }],
                 "actions": [{
                     "type": "forward",
-                    "upstream": upstream,
+                    "upstream": upstream.address,
                     "transport": "udp",
                     "ecs": { "mode": "from_client_ip" }
                 }]
@@ -6655,9 +6293,9 @@ mod jump_response_cache_tests {
 
         answer(&engine, "cdn.example", "198.51.100.10").await;
         answer(&engine, "cdn.example", "203.0.113.10").await;
-        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream.queries(), 2);
         answer(&engine, "cdn.example", "198.51.100.77").await;
-        assert_eq!(queries.load(Ordering::SeqCst), 2);
+        assert_eq!(upstream.queries(), 2);
     }
 
     /// 上游的应答不带 ECS 时，按 RFC 7871 第 7.3 节当作作用范围 0：跳转后别的子网的客户端也从
@@ -6666,15 +6304,15 @@ mod jump_response_cache_tests {
     /// a client in another subnet gets it from the cache too.
     #[tokio::test]
     async fn a_target_answer_without_ecs_is_shared_across_subnets() {
-        let (upstream, queries) = counting_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
-        let engine = engine(serde_json::json!({
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
             "pipelines": jump_to_group(serde_json::json!([{
                 "name": "fwd",
                 "matchers": [{ "type": "any" }],
                 "actions": [{
                     "type": "forward",
-                    "upstream": upstream,
+                    "upstream": upstream.address,
                     "transport": "udp",
                     "ecs": { "mode": "from_client_ip" }
                 }]
@@ -6683,7 +6321,7 @@ mod jump_response_cache_tests {
 
         answer(&engine, "cdn.example", "198.51.100.10").await;
         answer(&engine, "cdn.example", "203.0.113.10").await;
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.queries(), 1);
     }
 
     /// 按「谁在问」判断的四种请求匹配会让 pipeline 带上标记，按问题本身判断的不会；
@@ -6797,67 +6435,21 @@ mod jump_response_cache_tests {
 #[cfg(test)]
 mod requester_scope_tests {
     use super::*;
+    use crate::engine::rules::calculate_rule_hash;
     use crate::matcher::RequesterTest;
     use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
-    use std::sync::atomic::AtomicUsize;
+
+    use crate::engine::test_support::{
+        self as support, Upstream, answering_upstream, answering_upstream_after,
+    };
 
     const SINK: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
     const NORMAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 20);
     const OTHER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 30);
-
-    /// 用一条 TTL 为 `ttl` 的 A 记录 `answer` 回应每个查询的本机上游，并计数。
-    /// A local upstream answering every query with one A record `answer` of TTL
-    /// `ttl`, counting the queries.
-    async fn upstream(answer: Ipv4Addr, ttl: u32) -> (String, Arc<AtomicUsize>) {
-        upstream_after(answer, ttl, Duration::ZERO).await
-    }
-
-    /// 同上，但每个应答晚 `delay` 才发出 / The same, with every answer sent `delay` late
-    async fn upstream_after(
-        answer: Ipv4Addr,
-        ttl: u32,
-        delay: Duration,
-    ) -> (String, Arc<AtomicUsize>) {
-        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let addr = sock.local_addr().unwrap().to_string();
-        let queries = Arc::new(AtomicUsize::new(0));
-        let counted = queries.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-                let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = query.queries.first().cloned() else {
-                    continue;
-                };
-                counted.fetch_add(1, Ordering::Relaxed);
-                let mut resp =
-                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-                resp.add_query(question.clone());
-                resp.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    ttl,
-                    RData::A(hickory_proto::rr::rdata::A(answer)),
-                ));
-                let resp = resp.to_vec().unwrap();
-                if delay.is_zero() {
-                    let _ = sock.send_to(&resp, peer).await;
-                } else {
-                    let sock = sock.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = sock.send_to(&resp, peer).await;
-                    });
-                }
-            }
-        });
-        (addr, queries)
-    }
 
     const NO_SUBNET: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 99);
 
@@ -6866,54 +6458,44 @@ mod requester_scope_tests {
     /// A local upstream that answers with the ECS subnet the query carries, or
     /// NO_SUBNET without one, echoing the query's ECS with its prefix as the scope
     /// as an upstream answering per subnet does, counting the queries.
-    async fn subnet_echo() -> (String, Arc<AtomicUsize>) {
-        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = sock.local_addr().unwrap().to_string();
-        let queries = Arc::new(AtomicUsize::new(0));
-        let counted = queries.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
-                let Ok(query) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = query.queries.first().cloned() else {
-                    continue;
-                };
-                counted.fetch_add(1, Ordering::Relaxed);
-                let sent = query.edns.as_ref().and_then(|edns| {
-                    match edns.options().get(EdnsCode::Subnet) {
+    async fn subnet_echo() -> Upstream {
+        support::upstream(|query| {
+            let Some(question) = query.queries.first().cloned() else {
+                return Vec::new();
+            };
+            let sent =
+                query
+                    .edns
+                    .as_ref()
+                    .and_then(|edns| match edns.options().get(EdnsCode::Subnet) {
                         Some(EdnsOption::Subnet(subnet)) => Some(*subnet),
                         _ => None,
-                    }
-                });
-                let subnet = match sent.map(|subnet| subnet.addr()) {
-                    Some(IpAddr::V4(v4)) => v4,
-                    _ => NO_SUBNET,
-                };
-                let mut resp =
-                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-                resp.add_query(question.clone());
-                resp.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    300,
-                    RData::A(hickory_proto::rr::rdata::A(subnet)),
+                    });
+            let subnet = match sent.map(|subnet| subnet.addr()) {
+                Some(IpAddr::V4(v4)) => v4,
+                _ => NO_SUBNET,
+            };
+            let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            resp.add_query(question.clone());
+            resp.add_answer(Record::from_rdata(
+                question.name().clone(),
+                300,
+                RData::A(hickory_proto::rr::rdata::A(subnet)),
+            ));
+            if let Some(sent) = sent {
+                let mut edns = Edns::new();
+                edns.options_mut().insert(EdnsOption::Subnet(
+                    hickory_proto::rr::rdata::opt::ClientSubnet::new(
+                        sent.addr(),
+                        sent.source_prefix(),
+                        sent.source_prefix(),
+                    ),
                 ));
-                if let Some(sent) = sent {
-                    let mut edns = Edns::new();
-                    edns.options_mut().insert(EdnsOption::Subnet(
-                        hickory_proto::rr::rdata::opt::ClientSubnet::new(
-                            sent.addr(),
-                            sent.source_prefix(),
-                            sent.source_prefix(),
-                        ),
-                    ));
-                    resp.edns = Some(edns);
-                }
-                let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+                resp.edns = Some(edns);
             }
-        });
-        (addr, queries)
+            vec![(Duration::ZERO, resp.to_vec().unwrap())]
+        })
+        .await
     }
 
     fn runtime_config(
@@ -6981,12 +6563,10 @@ mod requester_scope_tests {
         request.to_vec().unwrap()
     }
 
+    /// 应答里的第一个 A 记录，请求必须得到了应答 / The first A record in the reply a request
+    /// must have got
     fn first_a(response: anyhow::Result<Bytes>) -> Option<Ipv4Addr> {
-        let response = Message::from_bytes(&response.expect("answer")).expect("parse");
-        match response.answers.first().map(|record| &record.data) {
-            Some(RData::A(address)) => Some(address.0),
-            _ => None,
-        }
+        support::first_a(&response.expect("answer"))
     }
 
     async fn ask(engine: &Engine, client: &str, edns: bool) -> Option<Ipv4Addr> {
@@ -7197,8 +6777,8 @@ mod requester_scope_tests {
     /// the client here). Even within one subnet the two must not share entries.
     #[tokio::test]
     async fn a_response_jump_path_does_not_share_with_direct_requests() {
-        let (relay, _) = upstream(OTHER, 300).await;
-        let (echo, _) = subnet_echo().await;
+        let relay = answering_upstream(OTHER, 300).await.address;
+        let echo = subnet_echo().await.address;
         let engine = engine(
             serde_json::json!([
                 { "pipeline": "geo", "matchers": [{ "type": "client_ip", "cidr": "198.51.100.50/32" }] },
@@ -7269,8 +6849,8 @@ mod requester_scope_tests {
     /// same route at once must not get that answer.
     #[tokio::test]
     async fn an_ecs_answer_after_a_continue_stays_with_its_subnet() {
-        let (relay, _) = upstream(OTHER, 300).await;
-        let (echo, _) = subnet_echo().await;
+        let relay = answering_upstream(OTHER, 300).await.address;
+        let echo = subnet_echo().await.address;
         let engine = engine(
             serde_json::json!([]),
             serde_json::json!([
@@ -7298,17 +6878,17 @@ mod requester_scope_tests {
     /// 只给 10.0.0.1 换上游的 pipeline：sink 回 0.0.0.0，其余请求走 normal。
     /// A pipeline that sends 10.0.0.1 alone to another upstream: sink answers
     /// 0.0.0.0, every other request goes to normal.
-    async fn device_split() -> (Engine, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let (sink, sink_queries) = upstream(SINK, 300).await;
-        let (normal, normal_queries) = upstream(NORMAL, 300).await;
+    async fn device_split() -> (Engine, Upstream, Upstream) {
+        let sink = answering_upstream(SINK, 300).await;
+        let normal = answering_upstream(NORMAL, 300).await;
         let engine = engine(
             serde_json::json!([]),
             serde_json::json!([{ "id": "main", "rules": [
-                rule("device", device(), forward(&sink)),
-                rule("rest", any(), forward(&normal))
+                rule("device", device(), forward(&sink.address)),
+                rule("rest", any(), forward(&normal.address))
             ] }]),
         );
-        (engine, sink_queries, normal_queries)
+        (engine, sink, normal)
     }
 
     /// 一台设备的转发应答不能从缓存交给另一个客户端，而每个客户端照样用得上自己的缓存。
@@ -7316,7 +6896,7 @@ mod requester_scope_tests {
     /// while each client still gets its own cached answer.
     #[tokio::test]
     async fn a_device_specific_answer_is_not_served_to_another_client_from_the_cache() {
-        let (engine, sink_queries, normal_queries) = device_split().await;
+        let (engine, sink, normal) = device_split().await;
         let mut answers = Vec::new();
         for client in ["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.2", "10.0.0.3"] {
             answers.push(ask(&engine, client, false).await);
@@ -7334,13 +6914,7 @@ mod requester_scope_tests {
         // 每个客户端的第二次、以及规则一样对待的其他客户端，都从缓存拿
         // Each client's second query, and any other client the rules treat alike,
         // comes from the cache
-        assert_eq!(
-            (
-                sink_queries.load(Ordering::Relaxed),
-                normal_queries.load(Ordering::Relaxed)
-            ),
-            (1, 1)
-        );
+        assert_eq!((sink.queries(), normal.queries()), (1, 1));
         // 快速路径查的是同一个键 / The fast path looks up the same key
         for (client, expected) in [("10.0.0.1", SINK), ("10.0.0.2", NORMAL)] {
             let peer: SocketAddr = format!("{client}:53000").parse().unwrap();
@@ -7370,13 +6944,13 @@ mod requester_scope_tests {
     /// the response cache and the rule cache must both keep them apart.
     #[tokio::test]
     async fn answers_split_by_edns_presence_stay_apart() {
-        let (with_edns, with_queries) = upstream(OTHER, 300).await;
-        let (without, without_queries) = upstream(NORMAL, 300).await;
+        let with_edns = answering_upstream(OTHER, 300).await;
+        let without = answering_upstream(NORMAL, 300).await;
         let engine = engine(
             serde_json::json!([]),
             serde_json::json!([{ "id": "main", "rules": [
-                rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns)),
-                rule("rest", any(), forward(&without))
+                rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns.address)),
+                rule("rest", any(), forward(&without.address))
             ] }]),
         );
         let mut answers = Vec::new();
@@ -7387,13 +6961,7 @@ mod requester_scope_tests {
             answers,
             [Some(OTHER), Some(NORMAL), Some(OTHER), Some(NORMAL)]
         );
-        assert_eq!(
-            (
-                with_queries.load(Ordering::Relaxed),
-                without_queries.load(Ordering::Relaxed)
-            ),
-            (1, 1)
-        );
+        assert_eq!((with_edns.queries(), without.queries()), (1, 1));
     }
 
     /// 转发时加上的 ECS 不算客户端带了 EDNS：响应跳转以后，按 EDNS 分流的规则看的仍是客户端发来
@@ -7404,9 +6972,9 @@ mod requester_scope_tests {
     #[tokio::test]
     async fn an_ecs_a_forward_adds_is_no_edns_on_the_jump_path() {
         for way in ["match", "miss", "failure"] {
-            let (pre, _) = upstream(NORMAL, 300).await;
-            let (with_edns, with_queries) = upstream(OTHER, 300).await;
-            let (without, without_queries) = upstream(NORMAL, 300).await;
+            let pre = answering_upstream(NORMAL, 300).await.address;
+            let with_edns = answering_upstream(OTHER, 300).await;
+            let without = answering_upstream(NORMAL, 300).await;
             let jump = serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "other" }]);
             let forwarded_to = if way == "failure" {
                 "127.0.0.1:9"
@@ -7437,20 +7005,13 @@ mod requester_scope_tests {
                 serde_json::json!([
                     { "id": "main", "rules": [first] },
                     { "id": "other", "rules": [
-                        rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns)),
-                        rule("rest", any(), forward(&without))
+                        rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns.address)),
+                        rule("rest", any(), forward(&without.address))
                     ] }
                 ]),
             );
             assert_eq!(ask(&engine, "10.0.0.1", false).await, Some(NORMAL), "{way}");
-            assert_eq!(
-                (
-                    with_queries.load(Ordering::Relaxed),
-                    without_queries.load(Ordering::Relaxed)
-                ),
-                (0, 1),
-                "{way}"
-            );
+            assert_eq!((with_edns.queries(), without.queries()), (0, 1), "{way}");
         }
     }
 
@@ -7458,13 +7019,13 @@ mod requester_scope_tests {
     /// Split by the client's GeoIP (private addresses here), answers stay apart by address.
     #[tokio::test]
     async fn answers_split_by_client_geoip_stay_apart() {
-        let (private, private_queries) = upstream(OTHER, 300).await;
-        let (public, public_queries) = upstream(NORMAL, 300).await;
+        let private = answering_upstream(OTHER, 300).await;
+        let public = answering_upstream(NORMAL, 300).await;
         let engine = engine(
             serde_json::json!([]),
             serde_json::json!([{ "id": "main", "rules": [
-                rule("private", serde_json::json!([{ "type": "geoip_private", "expect": true }]), forward(&private)),
-                rule("rest", any(), forward(&public))
+                rule("private", serde_json::json!([{ "type": "geoip_private", "expect": true }]), forward(&private.address)),
+                rule("rest", any(), forward(&public.address))
             ] }]),
         );
         let mut answers = Vec::new();
@@ -7476,13 +7037,7 @@ mod requester_scope_tests {
             [Some(OTHER), Some(NORMAL), Some(OTHER), Some(NORMAL)]
         );
         // 同为私有或同为公网的客户端共用一份 / Private clients share, and so do public ones
-        assert_eq!(
-            (
-                private_queries.load(Ordering::Relaxed),
-                public_queries.load(Ordering::Relaxed)
-            ),
-            (1, 1)
-        );
+        assert_eq!((private.queries(), public.queries()), (1, 1));
     }
 
     /// 转发带取自客户端的 ECS、pipeline 没有自己的 ecs 时，应答按 ECS 子网分开：同一子网
@@ -7493,11 +7048,11 @@ mod requester_scope_tests {
     /// forward decision goes into the rule cache.
     #[tokio::test]
     async fn answers_by_ecs_subnet_stay_apart_and_are_shared_within_a_subnet() {
-        let (echo, queries) = subnet_echo().await;
+        let echo = subnet_echo().await;
         let engine = engine(
             serde_json::json!([]),
             serde_json::json!([{ "id": "main", "rules": [rule("rest", serde_json::json!([{ "type": "domain_regex", "value": "example" }]), serde_json::json!([{
-                "type": "forward", "upstream": echo,
+                "type": "forward", "upstream": echo.address,
                 "ecs": { "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }
             }]))] }]),
         );
@@ -7522,7 +7077,7 @@ mod requester_scope_tests {
                 Some(NO_SUBNET)
             ]
         );
-        assert_eq!(queries.load(Ordering::Relaxed), 3);
+        assert_eq!(echo.queries(), 3);
         // 规则的决策不看子网，规则缓存里只有一份 / The rule decision ignores the subnet,
         // so the rule cache holds one entry for everyone
         let rule_key = calculate_rule_hash(
@@ -7545,7 +7100,7 @@ mod requester_scope_tests {
     /// another subnet taking the same route at once may get it.
     #[tokio::test]
     async fn ecs_carried_into_a_response_jump_keeps_answers_apart() {
-        let (echo, _) = subnet_echo().await;
+        let echo = subnet_echo().await.address;
         let engine = engine(
             serde_json::json!([
                 { "pipeline": "geo", "matchers": [{ "type": "client_ip", "cidr": "203.0.113.50/32" }] },
@@ -7580,7 +7135,9 @@ mod requester_scope_tests {
     /// Inside a pipeline that splits by client the device gets a static answer, or
     /// a forward to a slow sink upstream.
     async fn device_actions() -> [(&'static str, serde_json::Value); 2] {
-        let (sink, _) = upstream_after(SINK, 300, Duration::from_millis(100)).await;
+        let sink = answering_upstream_after(SINK, 300, Duration::from_millis(100))
+            .await
+            .address;
         [
             (
                 "static",
@@ -7597,8 +7154,8 @@ mod requester_scope_tests {
     /// wait on the device's own forward there.
     #[tokio::test]
     async fn an_answer_from_a_response_jump_into_a_client_split_stays_with_its_client() {
-        let (relay, _) = upstream(OTHER, 300).await;
-        let (normal, _) = upstream(NORMAL, 300).await;
+        let relay = answering_upstream(OTHER, 300).await.address;
+        let normal = answering_upstream(NORMAL, 300).await.address;
         for (device_does, action) in device_actions().await {
             let engine = engine(
                 serde_json::json!([]),
@@ -7627,7 +7184,7 @@ mod requester_scope_tests {
     /// must not wait on the device's forward there.
     #[tokio::test]
     async fn a_jump_into_a_client_split_keeps_answers_apart() {
-        let (normal, _) = upstream(NORMAL, 300).await;
+        let normal = answering_upstream(NORMAL, 300).await.address;
         for (device_does, action) in device_actions().await {
             let engine = engine(
                 serde_json::json!([]),
@@ -7653,8 +7210,8 @@ mod requester_scope_tests {
     /// splits by client: no waiter on any entry along the chain may get the device's answer.
     #[tokio::test]
     async fn a_jump_chain_into_a_client_split_keeps_answers_apart() {
-        let (relay, _) = upstream(OTHER, 300).await;
-        let (normal, _) = upstream(NORMAL, 300).await;
+        let relay = answering_upstream(OTHER, 300).await.address;
+        let normal = answering_upstream(NORMAL, 300).await.address;
         let checked_jump = |id: &str, target: &str| {
             serde_json::json!({ "id": id, "rules": [{
                 "name": id, "matchers": any(), "actions": forward(&relay),
@@ -7691,10 +7248,10 @@ mod requester_scope_tests {
     /// clients, with or without EDNS, ask the upstream once.
     #[tokio::test]
     async fn requester_independent_answers_are_still_shared() {
-        let (normal, queries) = upstream(NORMAL, 300).await;
+        let normal = answering_upstream(NORMAL, 300).await;
         let engine = engine(
             serde_json::json!([]),
-            serde_json::json!([{ "id": "main", "rules": [rule("rest", any(), forward(&normal))] }]),
+            serde_json::json!([{ "id": "main", "rules": [rule("rest", any(), forward(&normal.address))] }]),
         );
         for (client, edns) in [
             ("10.0.0.1", false),
@@ -7703,12 +7260,12 @@ mod requester_scope_tests {
         ] {
             assert_eq!(ask(&engine, client, edns).await, Some(NORMAL));
         }
-        assert_eq!(queries.load(Ordering::Relaxed), 1);
+        assert_eq!(normal.queries(), 1);
         assert_eq!(
             ask_at_once(&engine, ["10.0.0.3", "10.0.0.4"]).await,
             [Some(NORMAL); 2]
         );
-        assert_eq!(queries.load(Ordering::Relaxed), 1);
+        assert_eq!(normal.queries(), 1);
     }
 
     /// 后台刷新要按请求原来的样子重放：带 EDNS 的请求刷新时也带 EDNS，否则按 EDNS 分流的
@@ -7722,8 +7279,8 @@ mod requester_scope_tests {
         for fast_path in [true, false] {
             // 两秒的 TTL，阈值 99%：一秒之后的命中会触发刷新
             // A two-second TTL at a 99% threshold: a hit after one second refreshes
-            let (with_edns, with_queries) = upstream(OTHER, 2).await;
-            let (without, without_queries) = upstream(NORMAL, 2).await;
+            let with_edns = answering_upstream(OTHER, 2).await;
+            let without = answering_upstream(NORMAL, 2).await;
             let engine = Engine::new(
                 runtime_config(
                     serde_json::json!({
@@ -7733,8 +7290,8 @@ mod requester_scope_tests {
                     }),
                     serde_json::json!([]),
                     serde_json::json!([{ "id": "main", "rules": [
-                        rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns)),
-                        rule("rest", any(), forward(&without))
+                        rule("edns", serde_json::json!([{ "type": "edns_present", "expect": true }]), forward(&with_edns.address)),
+                        rule("rest", any(), forward(&without.address))
                     ] }]),
                 ),
                 "test".to_string(),
@@ -7761,10 +7318,7 @@ mod requester_scope_tests {
             .expect("the refresh finishes");
 
             assert_eq!(
-                (
-                    with_queries.load(Ordering::Relaxed),
-                    without_queries.load(Ordering::Relaxed)
-                ),
+                (with_edns.queries(), without.queries()),
                 (2, 0),
                 "the refresh must take the EDNS route (fast path: {fast_path})"
             );
@@ -7784,12 +7338,11 @@ mod reused_answer_tests {
     use std::time::Duration;
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::rdata::A;
-    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use hickory_proto::rr::{Name, RData, RecordType};
     use hickory_proto::serialize::binary::BinDecodable;
 
     use super::Engine;
-    use crate::matcher::RuntimePipelineConfig;
+    use crate::engine::test_support::{answering_upstream, engine_from};
 
     /// The default upstream's answer, which an `allow` stands for.
     /// 默认上游的应答，也就是 `allow` 该给出的。
@@ -7797,42 +7350,6 @@ mod reused_answer_tests {
     /// The answer a rule checks and continues past, kept for reuse.
     /// 被规则检查后越过、留着复用的应答。
     const CHECKED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
-
-    async fn spawn_answering(answer: Ipv4Addr) -> String {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
-                let Ok(request) = Message::from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let Some(question) = request.queries.first().cloned() else {
-                    continue;
-                };
-                let mut reply =
-                    Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
-                reply.add_query(question.clone());
-                reply.add_answer(Record::from_rdata(
-                    question.name().clone(),
-                    300,
-                    RData::A(A(answer)),
-                ));
-                let _ = socket.send_to(&reply.to_vec().unwrap(), peer).await;
-            }
-        });
-        addr
-    }
-
-    fn engine(raw: serde_json::Value) -> Engine {
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        Engine::new(
-            RuntimePipelineConfig::from_config(config).expect("build runtime config"),
-            "test".to_string(),
-        )
-        .expect("engine")
-    }
 
     async fn ask(engine: &Engine, client: &str) -> Option<Ipv4Addr> {
         let mut request = Message::new(0x2a2a, MessageType::Query, OpCode::Query);
@@ -7900,9 +7417,9 @@ mod reused_answer_tests {
     /// 请求也不会从缓存拿到另一个 pipeline 的应答。
     #[tokio::test]
     async fn a_request_jump_leaves_the_reused_answer_behind() {
-        let checked = spawn_answering(CHECKED).await;
-        let default = spawn_answering(DEFAULT).await;
-        let engine = engine(serde_json::json!({
+        let checked = answering_upstream(CHECKED, 300).await.address;
+        let default = answering_upstream(DEFAULT, 300).await.address;
+        let engine = engine_from(serde_json::json!({
             "settings": settings(&default),
             "pipeline_select": [
                 { "pipeline": "main", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
@@ -7918,10 +7435,12 @@ mod reused_answer_tests {
     /// 响应跳转路径上的规则级跳转也一样。
     #[tokio::test]
     async fn a_jump_on_the_response_jump_path_leaves_the_reused_answer_behind() {
-        let entry = spawn_answering(Ipv4Addr::new(192, 0, 2, 50)).await;
-        let checked = spawn_answering(CHECKED).await;
-        let default = spawn_answering(DEFAULT).await;
-        let engine = engine(serde_json::json!({
+        let entry = answering_upstream(Ipv4Addr::new(192, 0, 2, 50), 300)
+            .await
+            .address;
+        let checked = answering_upstream(CHECKED, 300).await.address;
+        let default = answering_upstream(DEFAULT, 300).await.address;
+        let engine = engine_from(serde_json::json!({
             "settings": settings(&default),
             "pipeline_select": [
                 { "pipeline": "main", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
@@ -7947,11 +7466,15 @@ mod reused_answer_tests {
     /// 响应跳转路径上回答检查触发的跳转也一样。
     #[tokio::test]
     async fn an_answer_check_jump_on_the_response_jump_path_leaves_the_reused_answer_behind() {
-        let entry = spawn_answering(Ipv4Addr::new(192, 0, 2, 50)).await;
-        let checked = spawn_answering(CHECKED).await;
-        let hop = spawn_answering(Ipv4Addr::new(192, 0, 2, 60)).await;
-        let default = spawn_answering(DEFAULT).await;
-        let engine = engine(serde_json::json!({
+        let entry = answering_upstream(Ipv4Addr::new(192, 0, 2, 50), 300)
+            .await
+            .address;
+        let checked = answering_upstream(CHECKED, 300).await.address;
+        let hop = answering_upstream(Ipv4Addr::new(192, 0, 2, 60), 300)
+            .await
+            .address;
+        let default = answering_upstream(DEFAULT, 300).await.address;
+        let engine = engine_from(serde_json::json!({
             "settings": settings(&default),
             "pipeline_select": [
                 { "pipeline": "main", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },

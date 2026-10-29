@@ -657,17 +657,16 @@ mod continued_rule_cache_tests {
     use rustc_hash::FxHashSet;
 
     use super::RuleEvaluationContext;
-    use crate::config::PipelineConfig;
     use crate::engine::Engine;
     use crate::engine::rules::Decision;
-    use crate::matcher::RuntimePipelineConfig;
+    use crate::engine::test_support::engine_from;
 
     /// `first` forwards and continues on a miss; `next` forwards elsewhere. `first` matches by
     /// regex: only a pipeline with regex conditions keeps forward decisions in the rule cache.
     /// `first` 转发，未命中时 continue；`next` 转发到别处。`first` 用正则条件：只有带正则条件的
     /// pipeline 才把转发决定存进规则缓存。
-    fn runtime() -> RuntimePipelineConfig {
-        let raw = serde_json::json!({
+    fn engine() -> Engine {
+        engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
             "pipelines": [{
                 "id": "main",
@@ -685,9 +684,7 @@ mod continued_rule_cache_tests {
                     }
                 ]
             }]
-        });
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        RuntimePipelineConfig::from_config(cfg).expect("runtime config")
+        }))
     }
 
     fn rule_of(decision: &Decision) -> &str {
@@ -706,7 +703,7 @@ mod continued_rule_cache_tests {
     /// expired (up to 60 s) later requests started at `next` and skipped `first`.
     #[tokio::test]
     async fn a_decision_reached_after_a_continue_is_not_cached() {
-        let engine = Engine::new(runtime(), "test".to_string()).expect("engine");
+        let engine = engine();
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
         let continued: FxHashSet<Arc<str>> = [Arc::from("first")].into_iter().collect();
@@ -753,13 +750,14 @@ mod rule_cache_policy_tests {
     use hickory_proto::rr::{DNSClass, RecordType};
 
     use super::RuleEvaluationContext;
-    use crate::config::PipelineConfig;
     use crate::engine::Engine;
     use crate::engine::rules::Decision;
-    use crate::matcher::RuntimePipelineConfig;
+    use crate::engine::test_support::engine_from;
 
-    fn runtime() -> RuntimePipelineConfig {
-        let raw = serde_json::json!({
+    /// `plain` pipeline 只有后缀和 any 条件，`regex` pipeline 带正则条件
+    /// The `plain` pipeline has suffix and any conditions only, the `regex` one a regex condition
+    fn engine() -> Engine {
+        engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9" },
             "pipelines": [
                 {
@@ -793,14 +791,12 @@ mod rule_cache_policy_tests {
                     ]
                 }
             ]
-        });
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        RuntimePipelineConfig::from_config(cfg).expect("runtime config")
+        }))
     }
 
     #[tokio::test]
     async fn own_answers_are_kept_and_forwards_only_where_regexes_run() {
-        let engine = Engine::new(runtime(), "test".to_string()).expect("engine");
+        let engine = engine();
         let state = engine.state.load_full();
         let [plain, regex] = [0, 1].map(|index| &state.pipeline.pipelines[index]);
         assert!(!plain.matches_regex);
@@ -868,9 +864,8 @@ mod domain_suffix_path_tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, RecordType};
 
-    use crate::config::PipelineConfig;
     use crate::engine::Engine;
-    use crate::matcher::RuntimePipelineConfig;
+    use crate::engine::test_support::engine_from;
 
     fn rule(
         name: &str,
@@ -926,9 +921,7 @@ mod domain_suffix_path_tests {
                 { "id": "plain", "rules": [{ "name": "plain", "matchers": [{ "type": "any" }], "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }] }] }
             ]
         });
-        let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        Engine::new(runtime, "test".to_string()).expect("engine")
+        engine_from(raw)
     }
 
     async fn answer(engine: &Engine, qname: &str) -> Ipv4Addr {
