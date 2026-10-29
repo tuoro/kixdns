@@ -119,7 +119,9 @@ pub fn set_reuseport(socket: &Socket, enabled: bool) -> io::Result<()> {
 /// but does NOT distribute incoming packets — all traffic goes to one socket.
 /// `SO_REUSEPORT_LB` (0x00010000) is FreeBSD's separate option that enables
 /// hash-based packet distribution across sockets in the reuseport group.
-/// 为多 worker UDP 设置带内核级负载均衡的 SO_REUSEPORT。
+/// FreeBSD 上，`SO_REUSEPORT` 允许多个 socket 绑定同一个端口，但不分发收到的包——流量全进一个
+/// socket。`SO_REUSEPORT_LB`（0x00010000）是 FreeBSD 另设的选项，在 reuseport 组的 socket 之间
+/// 按哈希分发。
 ///
 /// On Linux, `SO_REUSEPORT` already includes hash-based distribution, so we
 /// use it directly.
@@ -134,17 +136,15 @@ pub fn set_reuseport(socket: &Socket, enabled: bool) -> io::Result<()> {
 #[cfg(unix)]
 #[inline]
 pub fn set_reuseport_lb(socket: &Socket) -> io::Result<()> {
-    use libc::{SOL_SOCKET, c_int, setsockopt, socklen_t};
-    use std::os::fd::AsRawFd;
-
-    let val: c_int = 1;
-    let fd = socket.as_raw_fd();
-
     // FreeBSD: SO_REUSEPORT_LB (0x00010000) enables hash-based load balancing
     // FreeBSD: SO_REUSEPORT_LB (0x00010000) 启用基于哈希的负载均衡
     #[cfg(target_os = "freebsd")]
     {
+        use libc::{SOL_SOCKET, c_int, setsockopt, socklen_t};
+
         const SO_REUSEPORT_LB: c_int = 0x00010000;
+        let val: c_int = 1;
+        let fd = socket.as_raw_fd();
         let ret = unsafe {
             setsockopt(
                 fd,
@@ -163,22 +163,7 @@ pub fn set_reuseport_lb(socket: &Socket) -> io::Result<()> {
 
     // Linux and fallback: plain SO_REUSEPORT already does load balancing on Linux
     // Linux 和回退：普通 SO_REUSEPORT 在 Linux 上已自带负载均衡
-    use libc::SO_REUSEPORT;
-    let ret = unsafe {
-        setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_REUSEPORT,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as socklen_t,
-        )
-    };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    set_reuseport(socket, true)
 }
 
 #[cfg(not(unix))]

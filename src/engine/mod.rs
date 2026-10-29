@@ -16,6 +16,7 @@ mod geo;
 mod geo_reload_tests;
 #[cfg(test)]
 mod inflight_wait_tests;
+pub mod listener;
 pub mod matcher_adapter;
 #[cfg(test)]
 mod name_text_tests;
@@ -39,7 +40,7 @@ pub mod rules;
 #[cfg(test)]
 mod tcp_pool_tests;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 pub mod transport;
 pub mod types;
 pub mod upstream;
@@ -50,6 +51,7 @@ pub mod utils;
 pub use concurrency::PermitManager;
 pub use core::{Engine, EngineBuilder};
 pub use execution::PreParsedData;
+pub use listener::write_cache_hit;
 pub use matcher_adapter::*;
 pub use pipeline::select_pipeline;
 pub use types::{EngineInner, FastPathResponse};

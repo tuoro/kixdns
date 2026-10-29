@@ -29,9 +29,8 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::engine::{Engine, FastPathResponse, engine_helpers};
+use crate::engine::{Engine, FastPathResponse, engine_helpers, write_cache_hit};
 use crate::observe::ClientTransport;
-use crate::proto_utils;
 use crate::watcher;
 
 const MAX_DNS_MESSAGE: usize = 64 * 1024;
@@ -222,65 +221,29 @@ fn extract_get_dns_param(query: &str) -> Option<Bytes> {
 /// 处理 DNS wire 报文，返回响应 bytes
 /// 完全复用 Engine 的 handle_packet_fast 快速路径 + handle_packet 完整路径
 async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> Bytes {
-    let timeout_ms = engine.get_request_timeout_ms();
-    let timeout_dur = Duration::from_millis(timeout_ms);
-
-    match engine.handle_packet_fast(packet, peer) {
-        Ok(Some(FastPathResponse::Direct(bytes))) => bytes,
+    let pre_parsed = match engine.handle_packet_fast(packet, peer) {
+        Ok(Some(FastPathResponse::Direct(bytes))) => return bytes,
         Ok(Some(FastPathResponse::CacheHit {
             cached,
             tx_id,
             inserted_at,
         })) => {
-            let mut resp_buf = bytes::BytesMut::with_capacity(cached.len());
-            resp_buf.extend_from_slice(&cached);
-
-            let elapsed = proto_utils::saturating_u64_to_u32(inserted_at.elapsed().as_secs());
-            if elapsed > 0 {
-                proto_utils::patch_all_ttls(&mut resp_buf, elapsed);
-            }
-
-            if resp_buf.len() >= 2 {
-                let id_bytes = tx_id.to_be_bytes();
-                resp_buf[0] = id_bytes[0];
-                resp_buf[1] = id_bytes[1];
-            }
-            resp_buf.freeze()
+            let mut answer = bytes::BytesMut::new();
+            write_cache_hit(&mut answer, &cached, tx_id, inserted_at);
+            return answer.freeze();
         }
-        Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
-            match tokio::time::timeout(
-                timeout_dur,
-                engine.handle_packet_internal_with_pre_parsed(packet, peer, false, pre_parsed),
-            )
-            .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "DoH request processing error");
-                    empty_dns_response(packet)
-                }
-                Err(_) => {
-                    warn!(timeout_ms, "DoH request timeout");
-                    empty_dns_response(packet)
-                }
-            }
+        Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => Some(pre_parsed),
+        // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
+        Ok(None) => None,
+        Err(error) => {
+            engine.log_fast_path_error(&error);
+            return empty_dns_response(packet);
         }
-        Ok(None) => {
-            // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
-            match tokio::time::timeout(timeout_dur, engine.handle_packet(packet, peer)).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "DoH full parse error");
-                    empty_dns_response(packet)
-                }
-                Err(_) => {
-                    warn!(timeout_ms, "DoH request timeout (full)");
-                    empty_dns_response(packet)
-                }
-            }
-        }
-        Err(_) => empty_dns_response(packet),
-    }
+    };
+    engine
+        .answer_after_fast_path(packet, peer, pre_parsed)
+        .await
+        .unwrap_or_else(|| empty_dns_response(packet))
 }
 
 /// 构造空 DNS 响应（SERVFAIL） / Build empty SERVFAIL response
@@ -604,6 +567,147 @@ mod tests {
         assert!(
             build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).is_ok(),
             "valid cert/key pair must build an acceptor"
+        );
+    }
+
+    // ---- 快速路径之后 / After the fast path ----
+
+    /// 把查询都用 UDP 转发给 `upstream` 的引擎，`settings` 覆盖在默认设置上
+    /// An engine forwarding every query over UDP to `upstream`, with `settings` on top of
+    /// the defaults
+    fn forwarding_engine(upstream: &str, settings: serde_json::Value) -> Engine {
+        let mut all = serde_json::json!({ "default_upstream": upstream });
+        all.as_object_mut()
+            .unwrap()
+            .extend(settings.as_object().unwrap().clone());
+        crate::engine::test_support::engine_from(serde_json::json!({
+            "settings": all,
+            "pipelines": [{
+                "id": "p",
+                "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+                }]
+            }]
+        }))
+    }
+
+    /// 经 DoH 问一次，读回回答 / Ask once over DoH and read the answer back
+    async fn ask(engine: &Engine, query: &[u8]) -> Message {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        Message::from_bytes(&process_dns_wire(query, peer, engine).await).expect("dns answer")
+    }
+
+    /// 缓存命中的应答带着这条查询自己的事务 ID；TTL 按应答在缓存里停留的整秒数调低（RFC 1035
+    /// 第 5.2 节），停留不到一秒时原样不动
+    /// A cache hit carries the query's own transaction ID, and its TTLs are lowered by the
+    /// whole seconds the answer sat in the cache (RFC 1035 section 5.2), untouched under a
+    /// second
+    #[tokio::test]
+    async fn a_cache_hit_carries_the_query_id_and_ages_its_ttls() {
+        let upstream = crate::engine::test_support::answering_upstream(
+            std::net::Ipv4Addr::new(192, 0, 2, 7),
+            300,
+        )
+        .await;
+        let engine = forwarding_engine(&upstream.address, serde_json::json!({}));
+
+        // 第一次转发给上游，写进缓存 / The first goes to the upstream and into the cache
+        let forwarded = ask(&engine, &make_dns_query_a("cached.test", 1)).await;
+        assert_eq!((forwarded.metadata.id, forwarded.answers[0].ttl), (1, 300));
+
+        // 停留不到一秒：只换 ID / Under a second in the cache: only the ID changes
+        let hit = ask(&engine, &make_dns_query_a("cached.test", 2)).await;
+        assert_eq!((hit.metadata.id, hit.answers[0].ttl), (2, 300));
+
+        // 停留过一秒：TTL 跟着调低 / Past a second in the cache the TTL goes down too
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let aged = ask(&engine, &make_dns_query_a("cached.test", 3)).await;
+        assert_eq!(aged.metadata.id, 3);
+        let ttl = aged.answers[0].ttl;
+        assert!((295..300).contains(&ttl), "aged TTL {ttl}");
+    }
+
+    /// 引擎在请求时限内答不上来时，到点回 SERVFAIL：不早于时限，也不等引擎自己放弃。快速解析读得了的
+    /// 查询和要从头解析的一样
+    /// When the engine cannot answer within the request timeout, the answer is SERVFAIL
+    /// when it runs out: not before, and without waiting for the engine to give up. A query
+    /// the quick parse reads and one parsed from scratch alike
+    #[tokio::test]
+    async fn the_answer_is_servfail_when_the_request_timeout_runs_out() {
+        // 上游从不回答：引擎先用 UDP 试三分之一个时限、再试一个时限，再改用 TCP 等一个时限，加起来比
+        // 请求时限长得多，所以先到点的是这里的计时
+        // The upstream never answers: the engine tries UDP for a third of the timeout and
+        // then a whole one, then TCP for another, far longer than the request timeout, so
+        // the timer here runs out first
+        const TIMEOUT: Duration = Duration::from_millis(300);
+        let upstream = crate::engine::test_support::silent_upstream().await;
+        let engine = forwarding_engine(
+            &upstream.to_string(),
+            serde_json::json!({
+                "upstream_timeout_ms": TIMEOUT.as_millis() as u64,
+                "request_timeout_ms": TIMEOUT.as_millis() as u64,
+                "enable_tcp_fallback": true
+            }),
+        );
+        // 第一个标签里有一个空格：快速解析读不了，要从头解析
+        // A space in the first label: the quick parse cannot read it, so it is parsed
+        // from scratch
+        let mut parsed_from_scratch = make_dns_query_a("xslow.test", 8);
+        parsed_from_scratch[13] = b' ';
+        assert!(crate::proto_utils::parse_quick(&parsed_from_scratch, &mut [0u8; 256]).is_none());
+
+        for (case, query) in [
+            ("quick parse", make_dns_query_a("quick.test", 7)),
+            ("full parse", parsed_from_scratch),
+        ] {
+            let start = std::time::Instant::now();
+            let answer = ask(&engine, &query).await;
+            let took = start.elapsed();
+            assert_eq!(
+                (answer.metadata.id, answer.metadata.response_code),
+                (
+                    u16::from_be_bytes([query[0], query[1]]),
+                    ResponseCode::ServFail
+                ),
+                "{case}"
+            );
+            assert!(
+                took >= TIMEOUT && took < TIMEOUT * 2,
+                "{case} took {took:?}"
+            );
+        }
+    }
+
+    /// 快速路径构造不出应答（名字超长，hickory 不接受）时，回一个只有报头的 SERVFAIL
+    /// When the fast path cannot build its answer (an overlong name hickory rejects), the
+    /// answer is a header-only SERVFAIL
+    #[tokio::test]
+    async fn a_fast_path_answer_that_cannot_be_built_is_answered_servfail() {
+        let engine = make_static_engine("NXDOMAIN");
+        // 点分形式 256 字节：快速路径自己的解析器接受，hickory 不接受（在线格式最多 255 字节）
+        // 256 bytes dotted: the fast path's own parser accepts it, hickory does not (at most
+        // 255 bytes on the wire)
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62),
+        ] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]); // root, QTYPE A, QCLASS IN
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        assert!(engine.handle_packet_fast(&query, peer).is_err());
+
+        let answer = process_dns_wire(&query, peer, &engine).await;
+        assert_eq!(
+            &answer[..],
+            [0x12, 0x34, 0x81, 0x82, 0, 0, 0, 0, 0, 0, 0, 0],
+            "TXID, QR + RD, RA + SERVFAIL, no records"
         );
     }
 }
