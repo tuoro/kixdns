@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 use moka::sync::Cache;
 use parking_lot::Mutex;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::FxBuildHasher;
 
 use super::geo::GeoSources;
 use crate::cache::{CacheEntry, CacheSlot, CachedQuestion, DnsCache, new_cache};
@@ -16,7 +16,6 @@ use crate::ecs_scope::EcsView;
 use crate::engine::refresh::RefreshTarget;
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::advanced_rule::compile_pipelines;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
@@ -25,7 +24,7 @@ use moka::ops::compute::Op;
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::RuleCacheRecord;
 use super::transport::{DohClient, DoqClient, DotMultiplexer, TcpMultiplexer, UdpClient};
-use super::types::{EngineInner, InflightMap, build_cache_namespaces};
+use super::types::{EngineInner, InflightMap};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -179,9 +178,8 @@ impl Engine {
         // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
         // moka cache capacity and max TTL are configurable via settings
         let running_settings = Arc::new(cfg.settings.clone());
-        let cache_capacity = cfg.settings.cache_capacity;
-        let cache_max_ttl = cfg.settings.cache_max_ttl;
-        let cache = new_cache(cache_capacity, cache_max_ttl);
+        let settings = Arc::clone(&running_settings);
+        let cache = new_cache(settings.cache_capacity, settings.cache_max_ttl);
         // Rule cache: 10k entries, long default TTL (managed manually per-entry)
         // 规则缓存：1万条，默认长 TTL（通过条目内部 expires_at 手动管理）
         let rule_cache = Cache::builder()
@@ -189,56 +187,18 @@ impl Engine {
             .time_to_live(Duration::from_secs(60))
             .build();
 
-        // Extract flow control settings before moving cfg / 在 move cfg 之前提取流控设置
-        let udp_pool_size = cfg.settings.udp_pool_size;
-        let tcp_pool_size = cfg.settings.tcp_pool_size;
-        let doh_pool_size = cfg.settings.doh_pool_size;
-        let doh_health_error_threshold = cfg.settings.doh_health_check_error_threshold;
-        let dot_pool_size = cfg.settings.dot_pool_size;
-        let doq_pool_size = cfg.settings.doq_pool_size;
-        let doq_idle_timeout_secs = cfg.settings.doq_connection_idle_timeout_seconds;
-        let doq_keepalive_interval_ms = cfg.settings.doq_keepalive_interval_ms;
-        let doq_enable_0rtt = cfg.settings.doq_enable_0rtt;
-        let flow_control_enabled = cfg.settings.flow_control_enabled;
-        let flow_control_initial_permits = cfg.settings.flow_control_initial_permits;
-        let flow_control_min_permits = cfg.settings.flow_control_min_permits;
-        let flow_control_max_permits = cfg.settings.flow_control_max_permits;
-        let flow_control_latency_threshold_ms = cfg.settings.flow_control_latency_threshold_ms;
-        let flow_control_adjustment_interval_secs =
-            cfg.settings.flow_control_adjustment_interval_secs;
-        let dashmap_shards = cfg.settings.dashmap_shards;
-
-        // Extract TCP health check settings / 提取 TCP 健康检查配置
-        let tcp_health_error_threshold = cfg.settings.tcp_health_check_error_threshold;
-        let tcp_max_age_secs = cfg.settings.tcp_connection_max_age_seconds;
-        let tcp_idle_timeout_secs = cfg.settings.tcp_connection_idle_timeout_seconds;
-
         let geoip_manager = Arc::new(RwLock::new(
             GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed"),
         ));
         let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::new()));
         let geo_sources = GeoSources::load(&cfg, &geosite_manager, &geoip_manager);
 
-        let compiled = compile_pipelines(&cfg);
-
-        // Build O(1) compiled pipeline lookup index / 构建 O(1) 编译管道查找索引
-        let pipeline_index: FxHashMap<Arc<str>, usize> = compiled
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.id.clone(), i))
-            .collect();
-
-        let state = Arc::new(ArcSwap::from_pointee(EngineInner {
-            cache_namespaces: build_cache_namespaces(&cfg),
-            pipeline: cfg,
-            compiled_pipelines: compiled,
-            pipeline_index,
-        }));
+        let state = Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg)));
 
         // 根据配置决定是否启用流控 / Decide whether to enable flow control based on configuration
         // 如果禁用流控，使用usize::MAX作为max_permits，实现"无限制"模式
         // When flow control is disabled, use usize::MAX as max_permits for "unlimited" mode
-        let (permit_manager, flow_control_state) = if flow_control_enabled {
+        let (permit_manager, flow_control_state) = if settings.flow_control_enabled {
             // PermitManager.max_permits 是"当前上限"，FlowControlState.max_permits
             // 是天花板。此前紧接着的一行把当前上限直接写成天花板，
             // flow_control_initial_permits 当场失效，开了流控的部署实际从 800
@@ -250,15 +210,16 @@ impl Engine {
             // flow-controlled deployment at 800 rather than the documented 500.
             // It now starts at the initial value and adjust climbs toward the
             // ceiling.
-            let pm = Arc::new(PermitManager::new(flow_control_initial_permits));
+            let pm = Arc::new(PermitManager::new(settings.flow_control_initial_permits));
             (
                 pm,
                 Some(Arc::new(FlowControlState {
-                    max_permits: AtomicUsize::new(flow_control_max_permits),
-                    min_permits: flow_control_min_permits,
+                    max_permits: AtomicUsize::new(settings.flow_control_max_permits),
+                    min_permits: settings.flow_control_min_permits,
                     last_adjustment_ms: AtomicU64::new(0),
-                    critical_latency_threshold_ns: flow_control_latency_threshold_ms * 1_000_000,
-                    adjustment_interval_ms: flow_control_adjustment_interval_secs * 1000,
+                    critical_latency_threshold_ns: settings.flow_control_latency_threshold_ms
+                        * 1_000_000,
+                    adjustment_interval_ms: settings.flow_control_adjustment_interval_secs * 1000,
                 })),
             )
         } else {
@@ -275,32 +236,35 @@ impl Engine {
         let tcp_upstreams = state.load().pipeline.collect_tcp_upstreams();
 
         let tcp_mux = Arc::new(TcpMultiplexer::new(
-            tcp_pool_size,
-            tcp_health_error_threshold,
-            tcp_max_age_secs,
-            tcp_idle_timeout_secs,
+            settings.tcp_pool_size,
+            settings.tcp_health_check_error_threshold,
+            settings.tcp_connection_max_age_seconds,
+            settings.tcp_connection_idle_timeout_seconds,
         ));
 
         let dot_mux = Arc::new(
             DotMultiplexer::new(
-                dot_pool_size,
-                tcp_health_error_threshold,
-                tcp_max_age_secs,
-                tcp_idle_timeout_secs,
+                settings.dot_pool_size,
+                settings.tcp_health_check_error_threshold,
+                settings.tcp_connection_max_age_seconds,
+                settings.tcp_connection_idle_timeout_seconds,
             )
             .context("initialize DoT multiplexer")?,
         );
 
         let doh_client = Arc::new(
-            DohClient::new(doh_pool_size, doh_health_error_threshold)
-                .context("initialize DoH client")?,
+            DohClient::new(
+                settings.doh_pool_size,
+                settings.doh_health_check_error_threshold,
+            )
+            .context("initialize DoH client")?,
         );
         let doq_client = Arc::new(
             DoqClient::new(
-                doq_pool_size,
-                doq_idle_timeout_secs,
-                doq_keepalive_interval_ms,
-                doq_enable_0rtt,
+                settings.doq_pool_size,
+                settings.doq_connection_idle_timeout_seconds,
+                settings.doq_keepalive_interval_ms,
+                settings.doq_enable_0rtt,
             )
             .context("initialize DoQ client")?,
         );
@@ -313,7 +277,9 @@ impl Engine {
             state,
             cache_max_age: cache.policy().time_to_live(),
             cache,
-            udp_client: Arc::new(UdpClient::new(udp_pool_size).context("initialize UDP client")?),
+            udp_client: Arc::new(
+                UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?,
+            ),
             tcp_mux,
             doh_client,
             dot_mux,
@@ -330,13 +296,13 @@ impl Engine {
             // DashMap configuration: shard count and initial capacity
             // If dashmap_shards is 0, use DashMap default (num_cpus * 4)
             // More shards = less lock contention but more memory overhead
-            inflight: if dashmap_shards == 0 {
+            inflight: if settings.dashmap_shards == 0 {
                 Arc::new(DashMap::with_capacity_and_hasher(128, FxBuildHasher))
             } else {
                 Arc::new(DashMap::with_capacity_and_hasher_and_shard_amount(
                     128,
                     FxBuildHasher,
-                    dashmap_shards,
+                    settings.dashmap_shards,
                 ))
             },
             refreshing_set: Arc::new(DashSet::new()),

@@ -4,11 +4,48 @@ use std::time::Instant;
 use hickory_proto::rr::{DNSClass, RecordType};
 use tracing::{debug, error, warn};
 
+use crate::cache::CacheEntry;
+use crate::config::GlobalSettings;
 use crate::ecs_scope::EcsReach;
 use crate::engine::Engine;
 use crate::engine::types::EngineInner;
 use crate::engine::utils::RefreshingGuard;
 use crate::matcher::Requester;
+
+/// 一条缓存命中的刷新时机。后台刷新开着、应答来自上游、可刷新的 TTL 不低于下限时才有；剩余的
+/// TTL 不超过阈值时，就到了刷新的时候
+/// When a cache hit is due for a background refresh. There is one only with background
+/// refresh on, for an answer from an upstream whose refreshable TTL is not below the
+/// minimum; it is due once the remaining TTL is at most the threshold
+#[derive(Clone, Copy)]
+pub(crate) struct RefreshCheck {
+    /// 可刷新的 TTL 还剩几秒 / Seconds left of the refreshable TTL
+    pub(crate) remaining_ttl: u32,
+    /// 剩到几秒以内就刷新 / Refresh once this many seconds or fewer are left
+    pub(crate) threshold: u64,
+}
+
+impl RefreshCheck {
+    pub(crate) fn of(
+        settings: &GlobalSettings,
+        hit: &CacheEntry,
+        elapsed_secs: u32,
+    ) -> Option<Self> {
+        (settings.cache_background_refresh
+            && hit.upstream.is_some()
+            && hit.refresh_ttl >= settings.cache_refresh_min_ttl)
+            .then(|| Self {
+                remaining_ttl: hit.refresh_ttl.saturating_sub(elapsed_secs),
+                threshold: (hit.refresh_ttl as u64
+                    * settings.cache_refresh_threshold_percent as u64)
+                    / 100,
+            })
+    }
+
+    pub(crate) fn due(&self) -> bool {
+        self.remaining_ttl as u64 <= self.threshold
+    }
+}
 
 /// 后台刷新要更新的缓存条目：它所在的槽位，以及它适用的请求方
 /// The cache entry a background refresh renews: its slot, and the requesters it

@@ -9,11 +9,11 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::config::{Action, Transport};
-use crate::engine::rules::{Decision, ResponseActionResult};
+use crate::engine::rules::{Decision, ResponseActionResult, RuleCacheRecord};
 use crate::engine::upstream::has_transport_prefix;
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
-    RequestStatus, RuleEvaluated, RuleMatched, RulePhase,
+    RequestStatus, RuleCacheLookup, RuleEvaluated, RuleMatched, RulePhase,
 };
 
 /// Observer and request context of the request being processed. The engine
@@ -323,6 +323,46 @@ pub(crate) fn report_matched_rules(
             },
         );
     }
+}
+
+/// 规则缓存命中：照当初求值的样子重放上报——查到了、命中过哪些规则、哪条规则作出的决策，以及
+/// 决策本身
+/// A rule-cache hit replays what the evaluation it stands for reported: the lookup, the
+/// rules that matched, the rule that decided, and the decision itself
+pub(crate) fn report_rule_cache_hit(
+    observer: &dyn EngineObserver,
+    ctx: &RequestContext<'_>,
+    pipeline: &str,
+    record: &RuleCacheRecord,
+    fast_path: bool,
+) {
+    let recorded = record.matched_rules.as_deref();
+    observer.rule_cache_lookup(
+        ctx,
+        &RuleCacheLookup {
+            pipeline,
+            hit: true,
+            matched_rules: recorded.map_or(0, <[Arc<str>]>::len),
+        },
+    );
+    let deciding_rule = record.decided_by_rule.then(|| recorded?.last()).flatten();
+    if let Some(rules) = recorded {
+        report_matched_rules(
+            observer,
+            ctx,
+            pipeline,
+            rules,
+            deciding_rule.map(|_| decision_kind(&record.entry.decision)),
+            fast_path,
+        );
+    }
+    report_decision(
+        observer,
+        ctx,
+        pipeline,
+        deciding_rule.map(AsRef::as_ref),
+        &record.entry.decision,
+    );
 }
 
 #[cfg(test)]

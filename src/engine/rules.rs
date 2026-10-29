@@ -52,6 +52,24 @@ pub enum Decision {
     },
 }
 
+impl Decision {
+    /// 没有规则作出决策时：用 UDP 转发给默认上游 / When no rule decides: forwarded over UDP to
+    /// the default upstream
+    pub(crate) fn default_forward(settings: &crate::config::GlobalSettings) -> Self {
+        Decision::Forward {
+            upstream: Arc::from(settings.default_upstream.as_str()),
+            pre_split_upstreams: settings.default_upstream_pre_split.clone(),
+            response_matchers: Vec::new(),
+            response_actions_on_match: Vec::new(),
+            response_actions_on_miss: Vec::new(),
+            rule_name: Arc::from("default"),
+            transport: Some(Transport::Udp),
+            ecs: None,
+            allow_reuse: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResponseContext {
     pub raw: Bytes,
@@ -656,11 +674,7 @@ pub(crate) async fn process_response_jump(
             return engine_helpers::build_servfail_response(req);
         }
 
-        let Some(pipeline) = cfg
-            .pipeline_id_index
-            .get(pipeline_id.as_ref())
-            .and_then(|&idx| cfg.pipelines.get(idx))
-        else {
+        let Some(pipeline) = cfg.pipeline(&pipeline_id) else {
             let resp_bytes = engine_helpers::build_servfail_response(req)?;
             for g in &mut cleanup_guards {
                 g.hand_over(|| {
@@ -683,11 +697,8 @@ pub(crate) async fn process_response_jump(
                 qtype,
                 qclass,
                 edns_present,
-                if skip_rules.is_empty() {
-                    None
-                } else {
-                    Some(&skip_rules)
-                },
+                // 空集和 None 一样：一条也不跳过 / An empty set is as None: nothing skipped
+                Some(&skip_rules),
                 skip_cache,
             )
             .with_observed(observed),
@@ -705,11 +716,7 @@ pub(crate) async fn process_response_jump(
                 pipeline_id = pipeline;
                 response.pipeline = Some(pipeline_id.clone());
                 local_jumps -= 1;
-                if let Some(next_pipeline) = cfg
-                    .pipeline_id_index
-                    .get(pipeline_id.as_ref())
-                    .and_then(|&idx| cfg.pipelines.get(idx))
-                {
+                if let Some(next_pipeline) = cfg.pipeline(&pipeline_id) {
                     if let Some((observer, ctx)) = observed {
                         observer.pipeline_selected(ctx, &next_pipeline.id);
                     }
