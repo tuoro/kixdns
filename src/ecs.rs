@@ -220,27 +220,7 @@ fn inject_ecs(packet: &[u8], subnet: EcsKey) -> Vec<u8> {
     };
     let subnet = ClientSubnet::new(addr, subnet.source_prefix, 0);
 
-    // Insert or replace ECS option in the EDNS extensions.
-    // hickory-proto 0.26 OPT uses Vec (not HashMap): insert() always pushes,
-    // so we must explicitly remove any existing Subnet to avoid duplicates.
-    //
-    // 在 EDNS 扩展中插入或替换 ECS 选项。
-    // hickory-proto 0.26 的 OPT 使用 Vec（非 HashMap）：insert() 总是追加，
-    // 因此必须先显式移除已有的 Subnet 以避免重复。
-    match &mut msg.edns {
-        Some(edns) => {
-            edns.options_mut().remove(EdnsCode::Subnet);
-            edns.options_mut().insert(EdnsOption::Subnet(subnet));
-        }
-        None => {
-            // No existing OPT record — create one with default EDNS parameters and insert ECS
-            // 不存在 OPT 记录 — 创建默认 EDNS 参数并插入 ECS
-            let mut edns = hickory_proto::op::Edns::new();
-            edns.set_max_payload(1232);
-            edns.options_mut().insert(EdnsOption::Subnet(subnet));
-            msg.edns = Some(edns);
-        }
-    }
+    set_ecs_option(&mut msg, subnet);
 
     match msg.to_vec() {
         Ok(buf) => buf,
@@ -249,6 +229,21 @@ fn inject_ecs(packet: &[u8], subnet: EcsKey) -> Vec<u8> {
             packet.to_vec()
         }
     }
+}
+
+/// 把报文 OPT 里的 ECS 换成 `subnet`；没有 OPT 时新建一个，负载上限 1232 字节。hickory-proto
+/// 0.26 的 OPT 用 Vec 存选项，insert() 总是追加，所以先去掉已有的 ECS，免得重复。
+/// Make `subnet` the ECS of the message's OPT, creating one with a 1232-byte payload
+/// when there is none. hickory-proto 0.26 keeps OPT options in a Vec whose insert()
+/// always appends, so any existing ECS is removed first to avoid duplicates.
+pub(crate) fn set_ecs_option(msg: &mut Message, subnet: ClientSubnet) {
+    let edns = msg.edns.get_or_insert_with(|| {
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(1232);
+        edns
+    });
+    edns.options_mut().remove(EdnsCode::Subnet);
+    edns.options_mut().insert(EdnsOption::Subnet(subnet));
 }
 
 /// Strip ECS OPT option from a DNS wire packet.
@@ -334,31 +329,8 @@ impl EcsKey {
     /// 从 IP 地址和前缀掩码构建 EcsKey。
     pub(crate) fn from_ip(ip: IpAddr, prefix_v4: u8, prefix_v6: u8) -> Self {
         match ip {
-            IpAddr::V4(v4) => {
-                let mut addr = [0u8; 16];
-                addr[..4].copy_from_slice(&v4.octets());
-                let p = prefix_v4.min(32);
-                mask_address(&mut addr, p, 32);
-                let bytes_used = (p as usize).div_ceil(8);
-                Self {
-                    family: 1,
-                    source_prefix: p,
-                    addr,
-                    addr_len: bytes_used.min(4) as u8,
-                }
-            }
-            IpAddr::V6(v6) => {
-                let mut addr = v6.octets();
-                let p = prefix_v6.min(128);
-                mask_address(&mut addr, p, 128);
-                let bytes_used = (p as usize).div_ceil(8);
-                Self {
-                    family: 2,
-                    source_prefix: p,
-                    addr,
-                    addr_len: bytes_used.min(16) as u8,
-                }
-            }
+            IpAddr::V4(v4) => Self::from_wire(1, prefix_v4.min(32), &v4.octets()),
+            IpAddr::V6(v6) => Self::from_wire(2, prefix_v6.min(128), &v6.octets()),
         }
     }
 
@@ -380,7 +352,7 @@ impl EcsKey {
             _ => (given * 8) as u8,
         };
         let bits = source_prefix.min(total_bits);
-        mask_address(&mut addr, bits, 128);
+        mask_address(&mut addr, bits);
         Self {
             family,
             source_prefix,
@@ -427,7 +399,7 @@ impl EcsKey {
     pub(crate) fn truncated(&self, prefix: u8) -> Self {
         let prefix = prefix.min(self.source_prefix);
         let mut addr = self.addr;
-        mask_address(&mut addr, prefix, 128);
+        mask_address(&mut addr, prefix);
         Self {
             family: self.family,
             source_prefix: prefix,
@@ -460,24 +432,29 @@ impl EcsKey {
     }
 }
 
-/// Mask an address buffer to the given prefix length (in-place).
-/// 将地址缓冲区掩码到指定前缀长度（原地操作）。
-fn mask_address(addr: &mut [u8], prefix: u8, total_bits: u8) {
-    if prefix >= total_bits {
+/// Mask a 16-byte address buffer to the given prefix length (in-place).
+/// 将 16 字节的地址缓冲区掩码到指定前缀长度（原地操作）。
+fn mask_address(addr: &mut [u8; 16], prefix: u8) {
+    if prefix >= 128 {
         return;
     }
     let p = prefix as usize;
     let bytes_used = p.div_ceil(8);
     let bit = p % 8;
-    if bit > 0 && bytes_used > 0 {
+    if bit > 0 {
         addr[bytes_used - 1] &= 0xFF << (8 - bit);
     }
-    // Compute end index before mutable borrow to avoid borrow checker conflict
-    // 在可变借用前计算结束索引以避免借用检查器冲突
-    let end = (total_bits as usize / 8).min(addr.len());
-    for b in &mut addr[bytes_used..end] {
+    for b in &mut addr[bytes_used..] {
         *b = 0;
     }
+}
+
+/// 测试辅助：`"地址/前缀"` 写的子网 / Test helper: the subnet written `"address/prefix"`
+#[cfg(test)]
+pub(crate) fn subnet(text: &str) -> EcsKey {
+    let (address, prefix) = text.split_once('/').unwrap();
+    let prefix: u8 = prefix.parse().unwrap();
+    EcsKey::from_ip(address.parse().unwrap(), prefix, prefix)
 }
 
 /// Trivial test helper: check if ECS exists in a wire packet.
@@ -517,6 +494,34 @@ pub(crate) fn extract_ecs_info(packet: &[u8]) -> Option<(IpAddr, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 前缀比地址还长时按地址的长度算：IPv4 最多 32 位、IPv6 最多 128 位（例如静态 ECS 写成
+    /// `/33`）
+    /// A prefix longer than the address counts as the address's length: at most 32 bits
+    /// for IPv4 and 128 for IPv6 (a static ECS written `/33`, for one)
+    #[test]
+    fn a_prefix_longer_than_the_address_is_capped_at_its_length() {
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(EcsKey::from_ip(v4, 33, 0), EcsKey::from_ip(v4, 32, 0));
+        assert_eq!(EcsKey::from_ip(v4, 33, 0).source_prefix, 32);
+        assert_eq!(EcsKey::from_ip(v6, 0, 129), EcsKey::from_ip(v6, 0, 128));
+        assert_eq!(EcsKey::from_ip(v6, 0, 129).source_prefix, 128);
+    }
+
+    /// 查询没有 OPT 时为 ECS 新建一个，负载上限 1232 字节 / A query without an OPT gets one
+    /// for its ECS, advertising 1232 bytes
+    #[test]
+    fn an_opt_made_for_the_ecs_advertises_1232_bytes() {
+        let query = make_query("example.com", 0x1234);
+        assert!(Message::from_vec(&query).unwrap().edns.is_none());
+        let modified = inject_ecs(
+            &query,
+            EcsKey::from_ip("203.0.113.5".parse().unwrap(), 24, 24),
+        );
+        let edns = Message::from_vec(&modified).unwrap().edns.expect("an OPT");
+        assert_eq!(edns.max_payload(), 1232);
+    }
     use hickory_proto::op::{Message, OpCode, Query};
     use hickory_proto::rr::{Name, RecordType};
     use std::str::FromStr;
