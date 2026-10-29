@@ -39,7 +39,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | doh_pool_size | 8 | Maximum idle DoH connections per upstream. |
 | dot_pool_size | 64 | DoT connections per upstream pool. |
 | doq_pool_size | 16 | DoQ connections per upstream pool. |
-| tcp_health_check_error_threshold | 3 | Reset a TCP/DoT connection after this many consecutive errors; 0 disables this check. |
+| tcp_health_check_error_threshold | 3 | Currently has no effect; kept only so older configurations still load. A TCP/DoT connection is rebuilt at once after a failed write or read, or when a query times out and the connection has gone quiet, whatever this count says. DoQ does not read it. |
 | tcp_connection_max_age_seconds | 300 | Maximum TCP/DoT connection age; 0 disables aging. |
 | tcp_connection_idle_timeout_seconds | 60 | TCP/DoT idle timeout; 0 disables it. |
 | doq_connection_idle_timeout_seconds | 60 | DoQ idle timeout; 0 disables it. |

@@ -39,7 +39,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doh_pool_size | 8 | 每个上游最多保留的 DoH 空闲连接数。 |
 | dot_pool_size | 64 | 每个上游的 DoT 连接池大小。 |
 | doq_pool_size | 16 | 每个上游的 DoQ 连接池大小。 |
-| tcp_health_check_error_threshold | 3 | 连续错误达到该次数后重置 TCP/DoT 连接；0 禁用。 |
+| tcp_health_check_error_threshold | 3 | 目前不起作用，保留只为兼容旧配置。TCP/DoT 连接写失败、读失败，或者等到超时而连接上已经没有动静时，都会马上重建，不看这个次数。DoQ 不读这一项。 |
 | tcp_connection_max_age_seconds | 300 | TCP/DoT 连接最大存活时间；0 禁用。 |
 | tcp_connection_idle_timeout_seconds | 60 | TCP/DoT 空闲超时；0 禁用。 |
 | doq_connection_idle_timeout_seconds | 60 | DoQ 空闲超时；0 禁用。 |
