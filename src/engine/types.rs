@@ -1,7 +1,7 @@
 use crate::config::{Action, EcsMode, GlobalSettings, MatchOperator};
 use crate::ecs::EcsKey;
 use crate::engine::Engine;
-use crate::matcher::advanced_rule::CompiledPipeline;
+use crate::matcher::advanced_rule::{CompiledPipeline, compile_pipelines};
 use crate::matcher::{
     RequesterKey, RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher,
 };
@@ -245,6 +245,25 @@ pub struct EngineInner {
 }
 
 impl EngineInner {
+    /// 从运行时配置建：编译各 pipeline，建按 id 的查找索引，算出缓存命名空间
+    /// Built from a runtime configuration: the pipelines compiled, the lookup index by
+    /// id, and the cache namespaces
+    pub(crate) fn new(cfg: RuntimePipelineConfig) -> Self {
+        let compiled_pipelines = compile_pipelines(&cfg);
+        // Build O(1) compiled pipeline lookup index / 构建 O(1) 编译管道查找索引
+        let pipeline_index = compiled_pipelines
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.clone(), i))
+            .collect();
+        Self {
+            cache_namespaces: build_cache_namespaces(&cfg),
+            pipeline: cfg,
+            compiled_pipelines,
+            pipeline_index,
+        }
+    }
+
     #[inline]
     pub(crate) fn cache_namespace(&self, pipeline_id: &str) -> u64 {
         self.cache_namespaces

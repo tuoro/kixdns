@@ -21,7 +21,9 @@ use crate::matcher::{
 
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};
-use super::observation::{Observed, decision_kind, report_decision, report_matched_rules};
+use super::observation::{
+    Observed, decision_kind, report_decision, report_matched_rules, report_rule_cache_hit,
+};
 use super::rules::Decision;
 use super::rules::{
     RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, fast_hash_str, rule_cache_requester,
@@ -101,8 +103,7 @@ pub fn select_pipeline<'a>(
                     .matches_with_ready_managers(&selector_query, geoip_ref, geosite_ref)
             },
         );
-        if matched && let Some(&idx) = cfg.pipeline_id_index.get(rule.pipeline.as_str()) {
-            let p = &cfg.pipelines[idx];
+        if matched && let Some(p) = cfg.pipeline(&rule.pipeline) {
             return (Some(p), p.id.clone());
         }
     }
@@ -299,33 +300,7 @@ impl Engine {
                 self.rule_cache.remove(&rule_hash);
             } else if entry.matches(&pipeline.id, qname, qtype, qclass, &requester_key) {
                 if let Some((observer, ctx)) = request.observed {
-                    let recorded = record.matched_rules.as_deref();
-                    observer.rule_cache_lookup(
-                        ctx,
-                        &RuleCacheLookup {
-                            pipeline: &pipeline.id,
-                            hit: true,
-                            matched_rules: recorded.map_or(0, <[Arc<str>]>::len),
-                        },
-                    );
-                    let deciding_rule = record.decided_by_rule.then(|| recorded?.last()).flatten();
-                    if let Some(rules) = recorded {
-                        report_matched_rules(
-                            observer,
-                            ctx,
-                            &pipeline.id,
-                            rules,
-                            deciding_rule.map(|_| decision_kind(&entry.decision)),
-                            false,
-                        );
-                    }
-                    report_decision(
-                        observer,
-                        ctx,
-                        &pipeline.id,
-                        deciding_rule.map(AsRef::as_ref),
-                        &entry.decision,
-                    );
+                    report_rule_cache_hit(observer, ctx, &pipeline.id, &record, false);
                 }
                 return (*entry.decision).clone();
             }
@@ -347,17 +322,8 @@ impl Engine {
         let mut matched_rules: SmallVec<[Arc<str>; 4]> = SmallVec::new();
         let decided = self.evaluate_rules(state, pipeline, request, &mut matched_rules);
         let decided_by_rule = decided.is_some();
-        let decision = decided.unwrap_or_else(|| Decision::Forward {
-            upstream: Arc::from(state.pipeline.settings.default_upstream.as_str()),
-            pre_split_upstreams: None,
-            response_matchers: Vec::new(),
-            response_actions_on_match: Vec::new(),
-            response_actions_on_miss: Vec::new(),
-            rule_name: Arc::from("default"),
-            transport: Some(Transport::Udp),
-            ecs: None,
-            allow_reuse: false,
-        });
+        let decision =
+            decided.unwrap_or_else(|| Decision::default_forward(&state.pipeline.settings));
 
         if let Some((observer, ctx)) = request.observed {
             report_matched_rules(

@@ -1141,6 +1141,13 @@ impl RuntimePipelineConfig {
         std::time::Duration::from_secs(self.settings.min_ttl as u64)
     }
 
+    /// id 为 `id` 的 pipeline / The pipeline whose id is `id`
+    pub fn pipeline(&self, id: &str) -> Option<&RuntimePipeline> {
+        self.pipeline_id_index
+            .get(id)
+            .and_then(|&idx| self.pipelines.get(idx))
+    }
+
     /// The requester's part of the keys for `pipeline` (none for an unknown pipeline).
     /// `pipeline` 的键里属于请求方的部分（pipeline 不存在时为空）。
     pub fn requester_key(
@@ -1149,11 +1156,9 @@ impl RuntimePipelineConfig {
         requester: Requester,
         geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
     ) -> RequesterKey {
-        self.pipeline_id_index
-            .get(pipeline)
-            .map_or(RequesterKey::NONE, |&idx| {
-                self.pipelines[idx].requester.key(requester, geoip_manager)
-            })
+        self.pipeline(pipeline).map_or(RequesterKey::NONE, |p| {
+            p.requester.key(requester, geoip_manager)
+        })
     }
 
     pub fn upstream_timeout(&self) -> std::time::Duration {

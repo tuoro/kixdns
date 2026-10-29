@@ -3213,3 +3213,175 @@ async fn a_stale_answer_after_the_client_wait_is_reported_as_a_client_timeout() 
         ["pipeline main", "lookup", "hit StaleClientTimeout"]
     );
 }
+
+/// 先各问一遍写进缓存；一秒之后各从完整路径和快速路径命中一次。应答的 TTL 是 60 秒、刷新阈值
+/// 99% 时，这时刚好到了刷新时机（还剩 59 秒）
+/// Ask each once into the cache; a second later hit each once from the full and once
+/// from the fast path. With a 60-second TTL and a 99% threshold the refresh is just due
+/// then (59 seconds left)
+async fn ask_then_hit_on_both_paths(engine: &Engine, qnames: [&str; 2]) {
+    for qname in qnames {
+        engine.handle_packet(&query(qname), peer()).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    for qname in qnames {
+        engine.handle_packet(&query(qname), peer()).await.unwrap();
+        engine.handle_packet_fast(&query(qname), peer()).unwrap();
+    }
+}
+
+/// 为 `qname` 发起过的后台刷新 / The background refreshes started for `qname`
+fn background_refreshes(events: &[Event], qname: &str) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, Event::Started { qname: name, background: true, .. } if name == qname)
+        })
+        .count()
+}
+
+/// 后台刷新只给上游来的应答：缓存里的静态应答命中时不发起刷新，完整路径和快速路径一样。同一份
+/// 设置下，上游来的应答照常刷新，说明刷新时机确实到了。
+/// A background refresh is only for answers from an upstream: a static answer in the
+/// cache starts none when hit, on the full and the fast path alike. With the same
+/// settings an upstream's answer is refreshed, so the refresh was due.
+#[tokio::test]
+async fn a_cached_static_answer_starts_no_background_refresh() {
+    let (upstream, _echo) = spawn_echo_upstream(60).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            // 静态应答按 min_ttl 写进缓存 / A static answer is cached for min_ttl
+            "min_ttl": 60,
+            "cache_background_refresh": true,
+            "cache_refresh_threshold_percent": 99,
+            "cache_refresh_min_ttl": 0
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [
+                {
+                    "name": "static",
+                    "matchers": [{ "type": "domain_suffix", "value": "static.test" }],
+                    "actions": [{ "type": "static_txt_response", "text": ["hello"] }]
+                },
+                {
+                    "name": "fwd",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    ask_then_hit_on_both_paths(&engine, ["static.test", "forwarded.test"]).await;
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                background_refreshes(events, "forwarded.test") > 0
+            })
+            .await,
+        "the upstream's answer is refreshed: {:#?}",
+        recorder.events()
+    );
+    assert_eq!(background_refreshes(&recorder.events(), "static.test"), 0);
+}
+
+/// 可刷新的 TTL 低于 `cache_refresh_min_ttl` 的应答，命中时不发起后台刷新，完整路径和快速路径
+/// 一样；不低于它的照常刷新。
+/// An answer whose refreshable TTL is below `cache_refresh_min_ttl` starts no background
+/// refresh when hit, on the full and the fast path alike; one not below it is refreshed.
+#[tokio::test]
+async fn an_answer_below_the_refresh_minimum_starts_no_background_refresh() {
+    let (short, _short) = spawn_echo_upstream(20).await;
+    let (long, _long) = spawn_echo_upstream(60).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "min_ttl": 0,
+            "cache_background_refresh": true,
+            "cache_refresh_threshold_percent": 99,
+            "cache_refresh_min_ttl": 40
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [
+                {
+                    "name": "short",
+                    "matchers": [{ "type": "domain_suffix", "value": "short.test" }],
+                    "actions": [{ "type": "forward", "upstream": short, "transport": "udp" }]
+                },
+                {
+                    "name": "long",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": long, "transport": "udp" }]
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    ask_then_hit_on_both_paths(&engine, ["short.test", "long.test"]).await;
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                background_refreshes(events, "long.test") > 0
+            })
+            .await,
+        "the answer at the minimum is refreshed: {:#?}",
+        recorder.events()
+    );
+    assert_eq!(background_refreshes(&recorder.events(), "short.test"), 0);
+}
+
+/// 剩余 TTL 还没降到阈值以下的命中不发起后台刷新：阈值 50%、TTL 60 秒的应答，一秒之后还剩 59
+/// 秒，不刷新；TTL 2 秒的应答一秒之后只剩 1 秒，照常刷新。完整路径和快速路径一样。
+/// A hit whose remaining TTL is still above the threshold starts no background refresh:
+/// with a 50% threshold, an answer of TTL 60 has 59 seconds left a second later and is not
+/// refreshed, while one of TTL 2 has 1 second left and is. The same on both paths.
+#[tokio::test]
+async fn a_hit_above_the_refresh_threshold_starts_no_background_refresh() {
+    let (early, _early) = spawn_echo_upstream(60).await;
+    let (due, _due) = spawn_echo_upstream(2).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "min_ttl": 0,
+            "cache_background_refresh": true,
+            "cache_refresh_threshold_percent": 50,
+            "cache_refresh_min_ttl": 0
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [
+                {
+                    "name": "due",
+                    "matchers": [{ "type": "domain_suffix", "value": "due.test" }],
+                    "actions": [{ "type": "forward", "upstream": due, "transport": "udp" }]
+                },
+                {
+                    "name": "early",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": early, "transport": "udp" }]
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    ask_then_hit_on_both_paths(&engine, ["early.test", "due.test"]).await;
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                background_refreshes(events, "due.test") > 0
+            })
+            .await,
+        "the answer past its threshold is refreshed: {:#?}",
+        recorder.events()
+    );
+    assert_eq!(background_refreshes(&recorder.events(), "early.test"), 0);
+}

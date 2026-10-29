@@ -4,7 +4,7 @@ use crate::config::{Action, Transport};
 use crate::ecs_scope::{EcsReach, EcsView, ForwardEcs};
 use crate::engine::execution::CacheKeys;
 use crate::engine::observation::{Observed, cached_source, report_response_rule};
-use crate::engine::refresh::RefreshTarget;
+use crate::engine::refresh::{RefreshCheck, RefreshTarget};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
@@ -194,22 +194,8 @@ pub(crate) fn check_cache_logged(
         // Trigger a background refresh before returning the cached answer / 返回缓存的应答之前，看要不要发起后台刷新
         let cfg = &state.pipeline;
 
-        let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed);
-
-        // Check if we should trigger background refresh
-        let should_refresh = if cfg.settings.cache_background_refresh
-            && hit.upstream.is_some()
-            && hit.refresh_ttl >= cfg.settings.cache_refresh_min_ttl
-        {
-            let threshold = (hit.refresh_ttl as u64
-                * cfg.settings.cache_refresh_threshold_percent as u64)
-                / 100;
-            remaining_ttl as u64 <= threshold
-        } else {
-            false
-        };
-
-        if should_refresh {
+        let refresh = RefreshCheck::of(&cfg.settings, &hit, elapsed);
+        if let Some(RefreshCheck { remaining_ttl, .. }) = refresh.filter(RefreshCheck::due) {
             // Trigger background refresh asynchronously
             debug!(
                 event = "cache_background_refresh_trigger",
