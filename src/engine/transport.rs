@@ -3091,16 +3091,13 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
 mod tests {
     use super::*;
 
-    /// 0-RTT 判定必须按类型走。此前它比对 `anyhow::Error::to_string()`，而内层
-    /// 每一步都被 `.context()` 包过，那个字符串永远只是三句固定短语之一或一条
-    /// bail 文本，于是 quinn 明说的 `ZeroRttRejected` 从来没有被识别过：判定
-    /// 返回 false，0-RTT 不被禁用，下次连接又用 0-RTT，该上游一直失败到重启。
-    /// The 0-RTT decision has to go by type. It used to compare
-    /// `anyhow::Error::to_string()`, and since every inner step was wrapped in
-    /// `.context()` that string was only ever one of three fixed phrases or a
-    /// bail text, so quinn saying `ZeroRttRejected` outright was never
-    /// recognised: the check returned false, 0-RTT stayed on, the next
-    /// connection used it again and the upstream kept failing until a restart.
+    /// reqwest + rustls 要有进程级的加密实现，明文 http 也一样
+    /// reqwest + rustls needs a process-level crypto provider, plain http included
+    #[ctor::ctor]
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     /// 写入中途被取消时，这条池化连接必须被丢弃。取消点与 RemoveOnDrop
     /// 兜的是同一个：外层请求超时先到，或者双发路径上 UDP 先返回导致
     /// tcp_task.abort()。此前只有待处理表那一侧被清理，连接仍然留在池里，
@@ -3113,8 +3110,6 @@ mod tests {
     /// append its frame to a possibly half-written one.
     #[tokio::test]
     async fn a_cancelled_write_drops_the_pooled_connection() {
-        use tokio::io::AsyncWriteExt as _;
-
         // 对端只 accept 不读，发送缓冲区会被填满，写入因此停在 await 上
         // The peer accepts and never reads, so the send buffer fills and the
         // write parks on an await
@@ -3185,6 +3180,16 @@ mod tests {
         peer.abort();
     }
 
+    /// 0-RTT 判定必须按类型走。此前它比对 `anyhow::Error::to_string()`，而内层
+    /// 每一步都被 `.context()` 包过，那个字符串永远只是三句固定短语之一或一条
+    /// bail 文本，于是 quinn 明说的 `ZeroRttRejected` 从来没有被识别过：判定
+    /// 返回 false，0-RTT 不被禁用，下次连接又用 0-RTT，该上游一直失败到重启。
+    /// The 0-RTT decision has to go by type. It used to compare
+    /// `anyhow::Error::to_string()`, and since every inner step was wrapped in
+    /// `.context()` that string was only ever one of three fixed phrases or a
+    /// bail text, so quinn saying `ZeroRttRejected` outright was never
+    /// recognised: the check returned false, 0-RTT stayed on, the next
+    /// connection used it again and the upstream kept failing until a restart.
     #[test]
     fn doq_zero_rtt_rejection_is_classified_by_type() {
         use quinn::{ConnectionError, ReadError, ReadToEndError, WriteError};
@@ -3235,8 +3240,6 @@ mod tests {
     }
 
     use futures::future::join_all;
-    use std::time::Duration;
-    use tokio::time::timeout;
 
     /// UDP "upstream" for UdpClient tests: records the (transaction id, source
     /// port) of every query it receives and answers with each datagram of
@@ -3246,9 +3249,19 @@ mod tests {
     async fn spawn_udp_upstream(
         reply: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
     ) -> (String, Arc<std::sync::Mutex<Vec<(u16, u16)>>>) {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        spawn_udp_upstream_on("127.0.0.1:0", reply)
             .await
-            .expect("bind UDP test upstream");
+            .expect("bind UDP test upstream")
+    }
+
+    /// 同 [`spawn_udp_upstream`]，绑在 `bind` 上；该地址族不可用时为 None
+    /// As [`spawn_udp_upstream`], bound to `bind`; `None` when that address family is
+    /// unavailable on this host
+    async fn spawn_udp_upstream_on(
+        bind: &str,
+        reply: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
+    ) -> Option<(String, Arc<std::sync::Mutex<Vec<(u16, u16)>>>)> {
+        let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
         let addr = socket.local_addr().expect("read UDP test address");
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
@@ -3263,7 +3276,7 @@ mod tests {
                 }
             }
         });
-        (addr.to_string(), seen)
+        Some((addr.to_string(), seen))
     }
 
     /// A query for `name` (A, IN) with a fixed transaction id.
@@ -3278,11 +3291,11 @@ mod tests {
         msg.to_vec().expect("encode test query")
     }
 
-    /// Flip the QR bit so `query` becomes a (empty) response to itself.
-    fn udp_echo_response(query: &[u8]) -> Vec<u8> {
-        let mut response = query.to_vec();
-        response[2] |= 0x80;
-        response
+    /// 标上 QR 的查询本身，当作它的回答 / The query itself with QR set, as its answer
+    fn echo_answer(query: &[u8]) -> Vec<u8> {
+        let mut answer = query.to_vec();
+        answer[2] |= 0x80;
+        answer
     }
 
     /// Response to `query` whose question section names `name` instead.
@@ -3306,7 +3319,7 @@ mod tests {
         // pairs was fully predictable.
         // RFC 5452 §4.3/§9.2：TXID 和源端口都不能可预测。此前每个 socket 的 ID 从
         // 0 顺序递增、socket 轮询选择，(ID, 端口) 序列完全可预测。
-        let (upstream, seen) = spawn_udp_upstream(|query| vec![udp_echo_response(query)]).await;
+        let (upstream, seen) = spawn_udp_upstream(|query| vec![echo_answer(query)]).await;
         let client = UdpClient::new(4).expect("create UDP client");
         let sends = 16;
         for _ in 0..sends {
@@ -3394,7 +3407,7 @@ mod tests {
     #[tokio::test]
     async fn udp_send_receives_an_answer_larger_than_4096_bytes() {
         let (upstream, _) = spawn_udp_upstream(|query| {
-            let mut answer = udp_echo_response(query);
+            let mut answer = echo_answer(query);
             answer.resize(5_000, 0);
             vec![answer]
         })
@@ -3447,7 +3460,7 @@ mod tests {
         let (upstream, _seen) = spawn_udp_upstream(|query| {
             vec![
                 udp_response_with_question(query, "evil.example."),
-                udp_echo_response(query),
+                echo_answer(query),
             ]
         })
         .await;
@@ -3634,20 +3647,12 @@ mod tests {
         );
     }
 
+    /// 绑定在 `bind` 上、把每个查询置 QR 位后原样回显的 UDP 上游；该地址族不可用时为 None。
     /// UDP upstream on `bind` that echoes every query back with QR set, or
     /// `None` when the address family is unavailable on this host.
-    /// 绑定在 `bind` 上、把每个查询置 QR 位后原样回显的 UDP 上游；该地址族不可用时为 None。
     async fn spawn_udp_echo_upstream(bind: &str) -> Option<String> {
-        let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
-        let addr = socket.local_addr().expect("read UDP echo address");
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
-                buf[2] |= 0x80;
-                let _ = socket.send_to(&buf[..n], src).await;
-            }
-        });
-        Some(addr.to_string())
+        let (addr, _) = spawn_udp_upstream_on(bind, |query| vec![echo_answer(query)]).await?;
+        Some(addr)
     }
 
     /// v6 池此前无条件预建：默认 udp_pool_size=64 时，哪怕一个 IPv6 上游都没有
@@ -4098,8 +4103,6 @@ mod tests {
         // DohClient 连接池重建自愈的实证基础：drop reqwest::Client 会关闭其连接池中
         // 的 keep-alive 连接。若不成立，重建客户端（store 新 Arc<Client>）无法驱逐
         // 死/半开连接，issue #41 将无法解决。
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         // Minimal HTTP/1.1 keep-alive server: serve one request, then block reading
         // until the peer closes the connection.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4544,8 +4547,6 @@ mod tests {
         socket: &mut tokio::net::TcpStream,
         buf: &mut Vec<u8>,
     ) -> Option<(String, Vec<u8>)> {
-        use tokio::io::AsyncReadExt;
-
         let mut chunk = [0u8; 2048];
         let header_end = loop {
             if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -4573,60 +4574,6 @@ mod tests {
         Some((head, body))
     }
 
-    /// 一个不管收到什么 ID 都回 0 的 DoH 上游（RFC 8484 允许这样做）：把查询原样回过去，
-    /// ID 写成 0、标上 QR。返回监听地址和它收到的每个查询的 ID。
-    /// A DoH upstream that answers with ID 0 whatever it receives (RFC 8484 allows it): it
-    /// echoes the query with the ID set to 0 and QR set. Returns its address and the ID of
-    /// every query it received. With `drop_first` the first request is read and its
-    /// connection closed without an answer, which sends the client down its retry.
-    /// `drop_first` 时第一个请求读完就断开、不回答，让客户端走重试那条路。
-    async fn spawn_zero_id_doh_upstream(
-        drop_first: bool,
-    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<u16>>>) {
-        use tokio::io::AsyncWriteExt;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind DoH stub");
-        let addr = listener.local_addr().expect("DoH stub address");
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = Arc::clone(&seen);
-        let dropped = Arc::new(AtomicBool::new(!drop_first));
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let record = Arc::clone(&record);
-                let dropped = Arc::clone(&dropped);
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    // 一条连接上可以连着来几个请求（keep-alive） / Several requests may share one connection (keep-alive)
-                    while let Some((_, mut reply)) = next_http_request(&mut socket, &mut buf).await
-                    {
-                        if !dropped.swap(true, Ordering::SeqCst) {
-                            return;
-                        }
-                        record
-                            .lock()
-                            .unwrap()
-                            .push(u16::from_be_bytes([reply[0], reply[1]]));
-                        reply[0] = 0;
-                        reply[1] = 0;
-                        reply[2] |= 0x80;
-                        let head = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\n\r\n",
-                            reply.len()
-                        );
-                        if socket.write_all(head.as_bytes()).await.is_err()
-                            || socket.write_all(&reply).await.is_err()
-                        {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
-        (addr, seen)
-    }
-
     /// 上游 DoH 回 ID 0 时，DoH 客户端交回去的仍是查询自己的 ID，和其他传输一样。直接
     /// 转发、回答后跳转再转发、后台刷新都经过这里；以前这里把 0 原样交出，客户端把响应
     /// 当成别人的丢掉，等到超时重试才从缓存拿到答案。
@@ -4636,11 +4583,29 @@ mod tests {
     /// client discarded the reply as someone else's until a retry was answered from cache.
     #[tokio::test]
     async fn doh_upstream_answering_with_id_zero_keeps_the_query_id() {
-        // reqwest + rustls 要有进程级的加密实现，明文 http 也一样
-        // reqwest + rustls needs a process-level crypto provider, plain http included
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         for drop_first in [false, true] {
-            let (addr, seen) = spawn_zero_id_doh_upstream(drop_first).await;
+            // 不管收到什么 ID 都回 0 的上游（RFC 8484 允许这样做）：把查询原样回过去，ID 写成 0、
+            // 标上 QR。`drop_first` 时第一个请求读完就断开、不回答，让客户端走重试那条路。
+            // An upstream answering with ID 0 whatever it receives (RFC 8484 allows it): it
+            // echoes the query with the ID set to 0 and QR set. With `drop_first` the first
+            // request is read and its connection closed without an answer, which sends the
+            // client down its retry.
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let record = Arc::clone(&seen);
+            let dropped = AtomicBool::new(!drop_first);
+            let (addr, _) = spawn_doh_upstream(move |_, query| {
+                if !dropped.swap(true, Ordering::SeqCst) {
+                    return DohReply::Close;
+                }
+                record
+                    .lock()
+                    .unwrap()
+                    .push(u16::from_be_bytes([query[0], query[1]]));
+                let mut answer = echo_answer(query);
+                answer[..2].copy_from_slice(&[0, 0]);
+                DohReply::Raw(http_ok(Some(DOH_MEDIA_TYPE), &answer))
+            })
+            .await;
             let upstream = format!("http://{addr}/dns-query");
             let client = DohClient::new(8, 0).expect("build doh client");
             for id in [0xBEEF_u16, 0xCAFE] {
@@ -4681,16 +4646,17 @@ mod tests {
         Raw(Vec<u8>),
         /// 200，分块的正文永远发不完 / A 200 whose chunked body never ends
         Endless,
+        /// 读完请求就断开，不回答 / Read the request and close the connection unanswered
+        Close,
     }
 
     /// 本机明文 DoH 上游：每个请求按 `reply(路径, 正文)` 回答。返回监听地址和它被请求过的路径（按先后）
     /// Local plain-HTTP DoH upstream: each request is answered by `reply(path, body)`.
     /// Returns its address and the paths it was asked for, in order
     async fn spawn_doh_upstream(
-        reply: fn(&str, &[u8]) -> DohReply,
+        reply: impl Fn(&str, &[u8]) -> DohReply + Send + Sync + 'static,
     ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
-        use tokio::io::AsyncWriteExt;
-
+        let reply = Arc::new(reply);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind DoH stub");
@@ -4700,6 +4666,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let record = Arc::clone(&record);
+                let reply = Arc::clone(&reply);
                 tokio::spawn(async move {
                     let mut buf = Vec::new();
                     while let Some((head, body)) = next_http_request(&mut socket, &mut buf).await {
@@ -4728,6 +4695,7 @@ mod tests {
                                 }
                                 return;
                             }
+                            DohReply::Close => return,
                         }
                     }
                 });
@@ -4755,13 +4723,6 @@ mod tests {
         query
     }
 
-    /// 标上 QR 的查询本身，当作它的回答 / The query itself with QR set, as its answer
-    fn echo_answer(query: &[u8]) -> Vec<u8> {
-        let mut answer = query.to_vec();
-        answer[2] |= 0x80;
-        answer
-    }
-
     /// 一个回答最多一条 DNS 消息那么长。此前正文有多长就收多长：服务器不停往回发时，一个查询几秒内
     /// 就能占掉几个 GB，一直到超时。
     /// An answer is at most one DNS message long. The body used to be taken whole:
@@ -4769,7 +4730,6 @@ mod tests {
     /// until it timed out.
     #[tokio::test]
     async fn doh_refuses_an_answer_longer_than_a_dns_message() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (addr, _) = spawn_doh_upstream(|_, query| {
             let mut answer = echo_answer(query);
             match &query[13..17] {
@@ -4815,7 +4775,6 @@ mod tests {
     /// portal or a broken proxy used to be handed on as an answer.
     #[tokio::test]
     async fn doh_refuses_an_answer_of_another_media_type() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (addr, _) = spawn_doh_upstream(|_, query| {
             let media_type = match &query[13..17] {
                 b"html" => Some("text/html"),
@@ -4849,7 +4808,6 @@ mod tests {
     /// following it could take the query elsewhere, plain HTTP included.
     #[tokio::test]
     async fn doh_does_not_follow_redirects() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (addr, paths) = spawn_doh_upstream(|path, query| {
             if path == "/dns-query" {
                 DohReply::Raw(
@@ -4879,7 +4837,6 @@ mod tests {
     /// query instead of being handed on, with no retry.
     #[tokio::test]
     async fn a_doh_answer_to_another_question_fails_the_query() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (addr, paths) = spawn_doh_upstream(|_, query| {
             DohReply::Raw(http_ok(
                 Some(DOH_MEDIA_TYPE),
@@ -4991,18 +4948,27 @@ mod tests {
         accept_delay: Duration,
         reply: fn(usize, &str) -> DoqReply,
     ) -> SocketAddr {
-        spawn_doq_upstream_on("127.0.0.1:0".parse().unwrap(), server, accept_delay, reply)
-            .expect("bind the DoQ test upstream")
+        spawn_doq_upstream_on(
+            "127.0.0.1:0".parse().unwrap(),
+            server,
+            accept_delay,
+            reply,
+            None,
+        )
+        .expect("bind the DoQ test upstream")
     }
 
-    /// 同 [`spawn_doq_upstream`]，绑在 `bind` 上；该地址族不可用时为 None
+    /// 同 [`spawn_doq_upstream`]，绑在 `bind` 上；该地址族不可用时为 None。给了 `closed`，每条连接
+    /// 结束时往里发一个信号
     /// As [`spawn_doq_upstream`], bound to `bind`; `None` when that address
-    /// family is unavailable on this host
+    /// family is unavailable on this host. With `closed`, a signal goes there
+    /// whenever a connection ends
     fn spawn_doq_upstream_on(
         bind: SocketAddr,
         server: rustls::ServerConfig,
         accept_delay: Duration,
         reply: fn(usize, &str) -> DoqReply,
+        closed: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     ) -> Option<SocketAddr> {
         let crypto =
             quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
@@ -5011,6 +4977,7 @@ mod tests {
         let addr = endpoint.local_addr().expect("read the DoQ test address");
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
+                let closed = closed.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(accept_delay).await;
                     let Ok(conn) = incoming.await else { return };
@@ -5063,6 +5030,9 @@ mod tests {
                                 close();
                             }
                         });
+                    }
+                    if let Some(closed) = closed {
+                        let _ = closed.send(());
                     }
                 });
             }
@@ -5253,17 +5223,20 @@ mod tests {
     /// 100 ms, anything else at once; queries on one connection are answered
     /// independently, whichever is ready first.
     async fn spawn_stream_upstream(tls: Option<rustls::ServerConfig>) -> SocketAddr {
-        spawn_stream_upstream_on("127.0.0.1:0", tls)
+        spawn_stream_upstream_on("127.0.0.1:0", tls, None)
             .await
             .expect("bind the stream test upstream")
     }
 
-    /// 同 [`spawn_stream_upstream`]，绑在 `bind` 上；该地址族不可用时为 None
+    /// 同 [`spawn_stream_upstream`]，绑在 `bind` 上；该地址族不可用时为 None。给了 `closed`，每条
+    /// 连接结束时往里发一个信号
     /// As [`spawn_stream_upstream`], bound to `bind`; `None` when that address
-    /// family is unavailable on this host
+    /// family is unavailable on this host. With `closed`, a signal goes there
+    /// whenever a connection ends
     async fn spawn_stream_upstream_on(
         bind: &str,
         tls: Option<rustls::ServerConfig>,
+        closed: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     ) -> Option<SocketAddr> {
         async fn serve<S>(stream: S)
         where
@@ -5314,7 +5287,7 @@ mod tests {
         let acceptor = tls.map(|config| tokio_rustls::TlsAcceptor::from(Arc::new(config)));
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let acceptor = acceptor.clone();
+                let (acceptor, closed) = (acceptor.clone(), closed.clone());
                 tokio::spawn(async move {
                     match acceptor {
                         Some(acceptor) => {
@@ -5323,6 +5296,9 @@ mod tests {
                             }
                         }
                         None => serve(stream).await,
+                    }
+                    if let Some(closed) = closed {
+                        let _ = closed.send(());
                     }
                 });
             }
@@ -5553,7 +5529,7 @@ mod tests {
             .query(&query, Duration::from_secs(2))
             .await
             .expect("the real answer follows");
-        assert_eq!(answer.as_ref(), udp_echo_response(&query).as_slice());
+        assert_eq!(answer.as_ref(), echo_answer(&query).as_slice());
     }
 
     #[tokio::test]
@@ -5738,7 +5714,7 @@ mod tests {
     #[tokio::test]
     async fn dot_reaches_an_ipv6_literal_upstream() {
         let (server, client_tls) = self_signed_tls(&["::1"], &[]);
-        let Some(addr) = spawn_stream_upstream_on("[::1]:0", Some(server)).await else {
+        let Some(addr) = spawn_stream_upstream_on("[::1]:0", Some(server), None).await else {
             eprintln!("skipped: IPv6 loopback unavailable on this host");
             return;
         };
@@ -5756,9 +5732,13 @@ mod tests {
     async fn doq_reaches_an_ipv6_literal_upstream() {
         let (server, client_tls) = localhost_tls(&[b"doq"]);
         let answer = |_: usize, _: &str| DoqReply::Answer(Duration::ZERO);
-        let Some(addr) =
-            spawn_doq_upstream_on("[::1]:0".parse().unwrap(), server, Duration::ZERO, answer)
-        else {
+        let Some(addr) = spawn_doq_upstream_on(
+            "[::1]:0".parse().unwrap(),
+            server,
+            Duration::ZERO,
+            answer,
+            None,
+        ) else {
             eprintln!("skipped: IPv6 loopback unavailable on this host");
             return;
         };
@@ -5781,8 +5761,6 @@ mod tests {
     /// that reads by length prefix
     #[tokio::test]
     async fn a_cancelled_dot_write_drops_the_pooled_connection() {
-        use tokio::io::AsyncWriteExt as _;
-
         // 对端握手之后一个字节也不读，发送缓冲区会被填满
         // The peer completes the handshake and never reads, so the send buffer fills
         let (server, client_tls) = localhost_tls(&[]);
@@ -5872,53 +5850,16 @@ mod tests {
         );
     }
 
-    /// 立刻回答每个查询、每条连接结束时发一个信号的本机 TCP 上游；`tls` 给了就是 DoT
-    /// A local TCP upstream answering every query at once and signalling whenever a
+    /// 每条连接结束时发一个信号的本机 TCP 上游（见 [`spawn_stream_upstream`]）；`tls` 给了就是 DoT
+    /// A local TCP upstream (see [`spawn_stream_upstream`]) signalling whenever a
     /// connection ends; DoT when `tls` is given
     async fn upstream_noting_closes(
         tls: Option<rustls::ServerConfig>,
     ) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<()>) {
-        async fn serve<S>(mut stream: S)
-        where
-            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-        {
-            loop {
-                let mut len = [0u8; 2];
-                if stream.read_exact(&mut len).await.is_err() {
-                    return;
-                }
-                let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
-                if stream.read_exact(&mut frame).await.is_err() {
-                    return;
-                }
-                frame[2] |= 0x80;
-                if stream.write_all(&len).await.is_err() || stream.write_all(&frame).await.is_err()
-                {
-                    return;
-                }
-            }
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
-        let acceptor = tls.map(|config| tokio_rustls::TlsAcceptor::from(Arc::new(config)));
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let (acceptor, closed) = (acceptor.clone(), closed_tx.clone());
-                tokio::spawn(async move {
-                    match acceptor {
-                        Some(acceptor) => {
-                            if let Ok(tls) = acceptor.accept(stream).await {
-                                serve(tls).await;
-                            }
-                        }
-                        None => serve(stream).await,
-                    }
-                    let _ = closed.send(());
-                });
-            }
-        });
+        let addr = spawn_stream_upstream_on("127.0.0.1:0", tls, Some(closed_tx))
+            .await
+            .expect("bind the stream test upstream");
         (addr, closed_rx)
     }
 
@@ -6024,31 +5965,15 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_doq_pool_closes_its_connection() {
         let (server, client_tls) = localhost_tls(&[b"doq"]);
-        let crypto =
-            quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
-        let endpoint = QuicEndpoint::server(
-            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+        let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
+        let addr = spawn_doq_upstream_on(
             "127.0.0.1:0".parse().unwrap(),
+            server,
+            Duration::ZERO,
+            |_, _| DoqReply::Answer(Duration::ZERO),
+            Some(closed_tx),
         )
         .expect("bind the DoQ test upstream");
-        let addr = endpoint.local_addr().unwrap();
-        let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                let closed = closed_tx.clone();
-                tokio::spawn(async move {
-                    let Ok(conn) = incoming.await else { return };
-                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                        if let Ok(mut frame) = recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await {
-                            frame[4] |= 0x80;
-                            let _ = send.write_all(&frame).await;
-                            let _ = send.finish();
-                        }
-                    }
-                    let _ = closed.send(());
-                });
-            }
-        });
         let client = DoqClient {
             pools: UpstreamPools::new(),
             pool_size: 1,
