@@ -30,8 +30,6 @@ use tracing::{debug, info, warn};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
 
-use super::concurrency::{PermitGuard, PermitManager};
-
 #[inline]
 fn unix_time_millis() -> u64 {
     std::time::SystemTime::now()
@@ -66,16 +64,16 @@ type UdpInflightMap = DashMap<
     FxBuildHasher,
 >;
 
-/// RAII Guard to ensure inflight entries are removed even on cancellation/panic
-/// RAII Guard 确保即使在取消或 panic 时也能移除 inflight 条目
-struct InflightGuard {
-    inflight: Arc<UdpInflightMap>,
+/// drop 时从 `map` 里删掉 `id` 那一条，取消、提前返回或 panic 时也一样
+/// Removes `id` from `map` on drop, on cancellation, an early return or a panic too
+struct RemoveOnDrop<V> {
+    map: Arc<DashMap<u16, V, FxBuildHasher>>,
     id: u16,
 }
 
-impl Drop for InflightGuard {
+impl<V> Drop for RemoveOnDrop<V> {
     fn drop(&mut self) {
-        self.inflight.remove(&self.id);
+        self.map.remove(&self.id);
     }
 }
 
@@ -201,8 +199,6 @@ impl UdpClient {
             inflight: inflight.clone(),
         };
 
-        let socket_clone = socket.clone();
-        let inflight_clone = inflight.clone();
         tokio::spawn(async move {
             // Use BytesMut for efficient buffer management. It holds the largest DNS
             // message: EDNS lets a UDP answer be negotiated up to 65535 bytes, and a
@@ -220,20 +216,19 @@ impl UdpClient {
                 buf.clear();
 
                 // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
-                // avoid zero-filling overhead from resize()
-                // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销
-                if buf.capacity() < MAX_DNS_MESSAGE_SIZE {
-                    buf.reserve(MAX_DNS_MESSAGE_SIZE - buf.capacity());
-                }
+                // avoid zero-filling overhead from resize(). The buffer is never split, so it
+                // keeps the capacity it was built with.
+                // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销。
+                // 缓冲区从不被切开，容量一直是建的时候那么大。
 
-                match socket_clone.recv_buf_from(&mut buf).await {
+                match socket.recv_buf_from(&mut buf).await {
                     Ok((_len, src)) => {
                         let len = buf.len();
                         if len >= 2 {
                             let id = u16::from_be_bytes([buf[0], buf[1]]);
                             // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
                             // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
-                            if let entry::Entry::Occupied(entry) = inflight_clone.entry(id) {
+                            if let entry::Entry::Occupied(entry) = inflight.entry(id) {
                                 let (_, expected_addr, query, _) = entry.get();
                                 if src != *expected_addr {
                                     // Address mismatch: keep entry and wait for correct response
@@ -335,10 +330,6 @@ impl UdpClient {
         } else {
             &self.pool
         };
-        if pool.is_empty() {
-            return Err(anyhow::anyhow!("UDP pool not initialized"));
-        }
-
         // RFC 5452 §4.3 / §9.2: neither the transaction ID nor the source port
         // may be predictable, or a forged answer only has to guess the next
         // value. One draw from the thread-local RNG serves both: the high half
@@ -397,8 +388,8 @@ impl UdpClient {
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // (e.g. timeout, cancel, early return)
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
-        let _guard = InflightGuard {
-            inflight: state.inflight.clone(),
+        let _guard = RemoveOnDrop {
+            map: state.inflight.clone(),
             id: new_id,
         };
 
@@ -500,15 +491,75 @@ fn tune_stream_socket(stream: &TcpStream, upstream: &str) {
     }
 }
 
-/// TCP 或 DoT 的连接复用器：每个上游一个连接池，用 DashMap 管理 / The TCP or DoT
-/// connection multiplexer: one connection pool per upstream, managed with DashMap
+/// 一个上游的连接池：几个客户端轮流用 / One upstream's pool: a few clients taken in turn
+pub struct ConnectionPool<C> {
+    clients: Vec<Arc<C>>,
+    next_idx: AtomicUsize,
+}
+
+impl<C> ConnectionPool<C> {
+    fn new(clients: Vec<Arc<C>>) -> Self {
+        Self {
+            clients,
+            next_idx: AtomicUsize::new(0),
+        }
+    }
+
+    /// 轮到的那个客户端 / The client whose turn it is
+    fn pick(&self) -> &Arc<C> {
+        &self.clients[self.next_idx.fetch_add(1, Ordering::Relaxed) % self.clients.len()]
+    }
+}
+
+/// 每个上游一个连接池 / One connection pool per upstream
+struct UpstreamPools<C> {
+    pools: DashMap<Arc<str>, Arc<ConnectionPool<C>>, FxBuildHasher>,
+}
+
+impl<C> UpstreamPools<C> {
+    fn new() -> Self {
+        Self {
+            pools: DashMap::with_hasher(FxBuildHasher),
+        }
+    }
+
+    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
+    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
+    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
+    /// upstream the configuration no longer names is dropped: queries using it hold on to
+    /// it until they finish, and its connections close after that.
+    fn retain(&self, keep: impl Fn(&str) -> bool) {
+        self.pools.retain(|upstream, _| keep(upstream));
+    }
+
+    /// `upstream` 的连接池，还没有就用 `clients` 建一个 / The pool for `upstream`, built from
+    /// `clients` if there is none
+    fn get_or_create(
+        &self,
+        upstream: &str,
+        clients: impl FnOnce(&Arc<str>) -> Vec<Arc<C>>,
+    ) -> Arc<ConnectionPool<C>> {
+        let upstream_key: Arc<str> = Arc::from(upstream);
+        self.pools
+            .entry(upstream_key.clone())
+            .or_insert_with(|| Arc::new(ConnectionPool::new(clients(&upstream_key))))
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn get(&self, upstream: &str) -> Option<Arc<ConnectionPool<C>>> {
+        self.pools.get(upstream).map(|pool| Arc::clone(&pool))
+    }
+}
+
+/// TCP 或 DoT 的连接复用器：每个上游一个连接池 / The TCP or DoT connection multiplexer:
+/// one connection pool per upstream
 pub struct StreamMultiplexer<T: StreamTransport> {
-    pools: dashmap::DashMap<Arc<str>, Arc<StreamConnectionPool<T>>, FxBuildHasher>,
+    pools: UpstreamPools<StreamMuxClient<T>>,
+    /// 每个池几个客户端，至少一个 / How many clients a pool has, at least one
     pool_size: usize,
     /// 建连用的共享部分 / What connects share
     shared: T::Shared,
-    /// Per-upstream permit manager is created when pool is initialized
-    /// 每个 upstream 在初始化连接池时创建独立的 permit manager
     /// 健康检查配置 / Health check configuration
     health_error_threshold: usize,
     max_age_secs: u64,
@@ -522,11 +573,7 @@ pub type TcpMultiplexer = StreamMultiplexer<Tcp>;
 /// DoT (DNS over TLS) multiplexer, implementing RFC 7858
 pub type DotMultiplexer = StreamMultiplexer<Dot>;
 
-pub struct StreamConnectionPool<T: StreamTransport> {
-    clients: Vec<Arc<StreamMuxClient<T>>>,
-    next_idx: AtomicUsize,
-}
-
+pub type StreamConnectionPool<T> = ConnectionPool<StreamMuxClient<T>>;
 pub type TcpConnectionPool = StreamConnectionPool<Tcp>;
 pub type DotConnectionPool = StreamConnectionPool<Dot>;
 
@@ -539,8 +586,8 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         idle_timeout_secs: u64,
     ) -> Self {
         Self {
-            pools: dashmap::DashMap::with_hasher(FxBuildHasher),
-            pool_size,
+            pools: UpstreamPools::new(),
+            pool_size: pool_size.max(1),
             shared,
             health_error_threshold,
             max_age_secs,
@@ -554,46 +601,29 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
     /// upstream the configuration no longer names is dropped: queries using it hold on to
     /// it until they finish, and its connections close after that.
     pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
-        self.pools.retain(|upstream, _| keep(upstream));
+        self.pools.retain(keep);
     }
 
-    /// `upstream` 的连接池：`pool_size` 个客户端（0 按 1 算），共用一个同样大的 permit manager。
-    /// 预热和发送都用它，两边建的池才一样大
-    /// The pool for `upstream`: `pool_size` clients (0 taken as 1) sharing a permit
-    /// manager of that size. Warm-up and send both use it, so their pools are alike
-    fn new_pool(&self, upstream: &Arc<str>) -> Arc<StreamConnectionPool<T>> {
-        let size = self.pool_size.max(1);
-        // Create per-upstream permit manager to avoid global TCP limit
-        // 为每个 upstream 创建独立的 permit manager，避免全局 TCP 限制
-        let permit_mgr = Arc::new(PermitManager::new(size));
-        let clients = (0..size)
-            .map(|_| {
-                Arc::new(StreamMuxClient::with_shared(
-                    self.shared.clone(),
-                    upstream.clone(),
-                    Arc::clone(&permit_mgr),
-                    StreamHealth {
-                        error_threshold: self.health_error_threshold,
-                        max_age_ms: self.max_age_secs * 1000,
-                        idle_timeout_ms: self.idle_timeout_secs * 1000,
-                    },
-                ))
-            })
-            .collect();
-        Arc::new(StreamConnectionPool {
-            clients,
-            next_idx: AtomicUsize::new(0),
-        })
-    }
-
-    /// `upstream` 的连接池，还没有就建一个（见 [`Self::new_pool`]）
-    /// The pool for `upstream`, built if there is none (see [`Self::new_pool`])
+    /// `upstream` 的连接池：`pool_size` 个客户端，每个客户端最多一条连接；还没有就建一个。预热和
+    /// 发送都用它，两边建的池才一样大
+    /// The pool for `upstream`: `pool_size` clients, each holding at most one connection,
+    /// built if there is none. Warm-up and send both use it, so their pools are alike
     fn pool(&self, upstream: &str) -> Arc<StreamConnectionPool<T>> {
-        let upstream_key: Arc<str> = Arc::from(upstream);
-        self.pools
-            .entry(upstream_key.clone())
-            .or_insert_with(|| self.new_pool(&upstream_key))
-            .clone()
+        self.pools.get_or_create(upstream, |upstream| {
+            (0..self.pool_size)
+                .map(|_| {
+                    Arc::new(StreamMuxClient::with_shared(
+                        self.shared.clone(),
+                        upstream.clone(),
+                        StreamHealth {
+                            error_threshold: self.health_error_threshold,
+                            max_age_ms: self.max_age_secs * 1000,
+                            idle_timeout_ms: self.idle_timeout_secs * 1000,
+                        },
+                    ))
+                })
+                .collect()
+        })
     }
 
     /// Test-only helper to initialize or get a pool without network operations
@@ -611,8 +641,7 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         let pool = self.pool(upstream);
-        let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
-        pool.clients[idx].send(packet, timeout_dur).await
+        pool.pick().send(packet, timeout_dur).await
     }
 }
 
@@ -649,12 +678,7 @@ impl TcpMultiplexer {
         );
 
         for upstream in upstreams {
-            let upstream_key: Arc<str> = Arc::from(upstream.as_str());
-            // Use entry().or_insert_with() to create pool only if it doesn't exist
-            // 使用 entry().or_insert_with() 仅在连接池不存在时创建
-            self.pools
-                .entry(upstream_key.clone())
-                .or_insert_with(|| self.new_pool(&upstream_key));
+            self.pool(upstream);
         }
 
         info!(
@@ -694,15 +718,9 @@ pub struct StreamMuxClient<T: StreamTransport> {
     write_cancelled: AtomicBool,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
-    /// Per-upstream permit manager for TCP connection-level control
-    /// TCP 连接级别并发控制的 per-upstream permit manager
-    pub permit_manager: Arc<PermitManager>,
     /// Generation counter to detect stale readers
     /// 代数计数器，用于检测过期的 reader (Wrapped in Arc for sharing with spawned tasks)
     generation: Arc<AtomicU64>,
-    /// Connection-level permit (acquired when connection is established, held for connection lifetime)
-    /// 连接级别 permit（连接建立时获取，连接生命周期内持有）
-    conn_permit: Arc<Mutex<Option<PermitGuard>>>,
     /// 健康检查：连续错误计数 / Health check: consecutive error count
     consecutive_errors: AtomicUsize,
     /// 健康检查的设置 / Health check settings
@@ -758,24 +776,13 @@ struct Pending {
 }
 
 /// RAII Guard for TCP and DoT pending requests to ensure cleanup on cancellation
-struct TcpPendingGuard {
-    pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
-    id: u16,
-}
-
-impl Drop for TcpPendingGuard {
-    fn drop(&mut self) {
-        self.pending.remove(&self.id);
-    }
-}
-
 /// 写入期间被取消时丢弃这条连接
 /// Drops the connection if the write is cancelled part way through
 ///
-/// 与 [`TcpPendingGuard`] 是同一个取消点：`send_attempt` 可以在任意 await 处
+/// 与 [`RemoveOnDrop`] 是同一个取消点：`send_attempt` 可以在任意 await 处
 /// 被丢弃——外层请求超时先到（`validate_timeouts` 只要求 request >= upstream，
 /// 取等时就会），或者双发路径上 UDP 先返回导致 `tcp_task.abort()`。待处理表
-/// 那一侧已经由 `TcpPendingGuard` 兜住，写入这一侧此前没有：`write_all` 只写
+/// 那一侧已经由 `RemoveOnDrop` 兜住，写入这一侧此前没有：`write_all` 只写
 /// 进去一部分就被丢弃时，连接仍然留在池里，下一个请求把自己的帧接在半条帧
 /// 后面，对端按长度前缀读就会错位，而且不计错误也不重置，只能等下一次失败
 /// 才自愈。
@@ -783,11 +790,11 @@ impl Drop for TcpPendingGuard {
 /// 这里把连接置空即可，下一次 `ensure_connection` 会重建。代价是热路径上多
 /// 一次栈上构造和一次布尔写。
 ///
-/// The same cancellation point as [`TcpPendingGuard`]: `send_attempt` can be
+/// The same cancellation point as [`RemoveOnDrop`]: `send_attempt` can be
 /// dropped at any await, either because the outer request timeout fires first
 /// (`validate_timeouts` only requires request >= upstream, so equality allows
 /// it) or because UDP answered first on the dual-send path and aborted the TCP
-/// task. The pending-map side was already covered by `TcpPendingGuard`; the
+/// task. The pending-map side was already covered by `RemoveOnDrop`; the
 /// write side was not. A `write_all` dropped after a partial write leaves the
 /// connection in the pool, the next request appends its frame to half a frame,
 /// and a peer reading by length prefix desynchronises, with nothing counting an
@@ -836,34 +843,20 @@ impl<T: StreamTransport> Drop for StreamMuxClient<T> {
 
 #[cfg(test)]
 impl TcpMuxClient {
-    fn new(upstream: Arc<str>, permit_manager: Arc<PermitManager>) -> Self {
-        Self::with_shared((), upstream, permit_manager, StreamHealth::default())
+    fn new(upstream: Arc<str>) -> Self {
+        Self::with_shared((), upstream, StreamHealth::default())
     }
 }
 
 #[cfg(test)]
 impl DotMuxClient {
-    fn new(
-        upstream: Arc<str>,
-        tls_config: Arc<ClientConfig>,
-        permit_manager: Arc<PermitManager>,
-    ) -> Self {
-        Self::with_shared(
-            tls_config,
-            upstream,
-            permit_manager,
-            StreamHealth::default(),
-        )
+    fn new(upstream: Arc<str>, tls_config: Arc<ClientConfig>) -> Self {
+        Self::with_shared(tls_config, upstream, StreamHealth::default())
     }
 }
 
 impl<T: StreamTransport> StreamMuxClient<T> {
-    fn with_shared(
-        shared: T::Shared,
-        upstream: Arc<str>,
-        permit_manager: Arc<PermitManager>,
-        health: StreamHealth,
-    ) -> Self {
+    fn with_shared(shared: T::Shared, upstream: Arc<str>, health: StreamHealth) -> Self {
         Self {
             upstream,
             shared,
@@ -871,9 +864,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             write_cancelled: AtomicBool::new(false),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
-            permit_manager,
             generation: Arc::new(AtomicU64::new(0)),
-            conn_permit: Arc::new(Mutex::new(None)),
             consecutive_errors: AtomicUsize::new(0),
             health,
             conn_create_time: AtomicU64::new(0),
@@ -884,17 +875,16 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         }
     }
 
-    async fn spawn_reader(
+    fn spawn_reader(
         &self,
         mut reader: T::Read,
         cancel_token: CancellationToken,
         my_generation: u64,
-        global_generation: Arc<AtomicU64>,
     ) {
+        let global_generation = Arc::clone(&self.generation);
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
-        let conn_permit = Arc::clone(&self.conn_permit); // Clone conn_permit
         let answers_read = Arc::clone(&self.answers_read);
 
         tokio::spawn(async move {
@@ -907,12 +897,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 if global_generation.load(Ordering::Relaxed) != my_generation {
                     debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader detected older generation, exiting silently", T::NAME);
                     return;
-                }
-
-                // Ensure buffer has enough space for length prefix
-                // 确保缓冲区有足够空间读取长度前缀
-                if reusable_buf.capacity() < 2 {
-                    reusable_buf.reserve(4096);
                 }
 
                 let mut len_buf = [0u8; 2];
@@ -932,7 +916,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                                     &pending,
                                     anyhow::anyhow!("{} read len failed", T::LABEL),
                                     &conn,
-                                    &conn_permit,
                                 )
                                 .await;
                             } else {
@@ -965,7 +948,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                                     &pending,
                                     anyhow::anyhow!("{} read body failed", T::LABEL),
                                     &conn,
-                                    &conn_permit,
                                 )
                                 .await;
                             }
@@ -1239,8 +1221,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
-        let _guard = TcpPendingGuard {
-            pending: self.pending.clone(),
+        let _guard = RemoveOnDrop {
+            map: self.pending.clone(),
             id: new_id,
         };
 
@@ -1488,13 +1470,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         let budget = budget.saturating_sub(started.elapsed());
 
         if guard.is_none() {
-            // Acquire connection-level permit (non-blocking)
-            // 获取连接级别 permit（非阻塞）
-            let permit = self
-                .permit_manager
-                .try_acquire()
-                .ok_or_else(|| anyhow::anyhow!("{} connection limit exceeded", T::LABEL))?;
-
             let (read_half, write_half) = T::connect(&self.shared, &self.upstream, budget).await?;
 
             *guard = Some(write_half);
@@ -1509,13 +1484,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
             // Spawn reader while holding the lock to prevent races
             // 持有锁时启动 reader 以防止竞争
-            self.spawn_reader(
-                read_half,
-                new_token.clone(),
-                new_gen,
-                self.generation.clone(),
-            )
-            .await;
+            self.spawn_reader(read_half, new_token.clone(), new_gen);
 
             // Store token AFTER spawn so reset() can only cancel a live reader
             // 在 spawn 之后存储 token，确保 reset() 只能取消已启动的 reader
@@ -1523,11 +1492,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 let mut token_guard = self.read_cancel.lock().await;
                 *token_guard = new_token;
             }
-
-            // Store permit in connection (held for connection lifetime)
-            // 将 permit 保存在连接中（连接生命周期内持有）
-            let mut conn_permit_guard = self.conn_permit.lock().await;
-            *conn_permit_guard = Some(permit);
 
             // 设置连接创建时间
             // Set connection creation time
@@ -1611,20 +1575,18 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
         conn: &Arc<Mutex<Option<T::Write>>>,
-        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
         // Hold the connection lock while resetting and draining. register_pending uses the same
         // lock, so it either registers before this drain or observes the closed connection.
         let mut conn_guard = conn.lock().await;
-        Self::fail_all_locked(pending, err, &mut conn_guard, conn_permit).await;
+        Self::fail_all_locked(pending, err, &mut conn_guard);
     }
 
     /// [`fail_all_async`](Self::fail_all_async)，连接锁已经拿在手里 / [`fail_all_async`](Self::fail_all_async) with the connection lock already held
-    async fn fail_all_locked(
+    fn fail_all_locked(
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
         conn_guard: &mut Option<T::Write>,
-        conn_permit: &Arc<Mutex<Option<PermitGuard>>>,
     ) {
         let err_msg = err.to_string();
         *conn_guard = None;
@@ -1634,13 +1596,11 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 let _ = p.tx.send(Err(anyhow::anyhow!(err_msg.clone())));
             }
         }
-        let mut permit_guard = conn_permit.lock().await;
-        *permit_guard = None;
     }
 
-    /// Reset connection: cancel reader task, then drop write half, fail every
-    /// waiting query and release permit
-    /// 重置连接：取消 reader 任务，然后丢弃写半部、让所有等待中的查询失败并释放许可
+    /// Reset connection: cancel reader task, then drop write half and fail every
+    /// waiting query
+    /// 重置连接：取消 reader 任务，然后丢弃写半部、让所有等待中的查询失败
     ///
     /// The cancellation token interrupts the reader's blocked read so it
     /// exits immediately instead of leaking the connection. With the reader
@@ -1657,7 +1617,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             &self.pending,
             anyhow::anyhow!("{} connection reset", T::NAME),
             &self.conn,
-            &self.conn_permit,
         )
         .await;
     }
@@ -1680,9 +1639,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             &self.pending,
             anyhow::anyhow!("{} connection reset", T::NAME),
             &mut conn,
-            &self.conn_permit,
-        )
-        .await;
+        );
         self.consecutive_errors.store(0, Ordering::Release);
     }
 }
@@ -2359,10 +2316,7 @@ struct DoqConnectionInfo {
 ///
 /// 参考 RFC 9250 (DNS over Dedicated QUIC Connections) 实现
 /// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
-pub struct DoqConnectionPool {
-    clients: Vec<Arc<DoqMuxClient>>,
-    next_idx: AtomicUsize,
-}
+pub type DoqConnectionPool = ConnectionPool<DoqMuxClient>;
 
 /// DoQ (DNS over QUIC) 客户端，管理多个上游的 QUIC 连接池
 /// DoQ (DNS over QUIC) client, managing QUIC connection pools for multiple upstreams
@@ -2419,7 +2373,8 @@ impl std::error::Error for DoqFailure {
 }
 
 pub struct DoqClient {
-    pools: DashMap<Arc<str>, Arc<DoqConnectionPool>, FxBuildHasher>,
+    pools: UpstreamPools<DoqMuxClient>,
+    /// 每个池几个客户端，至少一个 / How many clients a pool has, at least one
     pool_size: usize,
     runtime: Arc<DoqRuntime>,
 }
@@ -2463,7 +2418,7 @@ impl DoqClient {
     /// upstream the configuration no longer names is dropped: queries using it hold on to
     /// it until they finish, and its connections close after that.
     pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
-        self.pools.retain(|upstream, _| keep(upstream));
+        self.pools.retain(keep);
     }
 
     pub fn new(
@@ -2530,8 +2485,8 @@ impl DoqClient {
         });
 
         Ok(Self {
-            pools: DashMap::with_hasher(FxBuildHasher),
-            pool_size: if pool_size == 0 { 1 } else { pool_size },
+            pools: UpstreamPools::new(),
+            pool_size: pool_size.max(1),
             runtime,
         })
     }
@@ -2542,29 +2497,20 @@ impl DoqClient {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        let upstream_key: Arc<str> = Arc::from(upstream);
-        let pool = self
-            .pools
-            .entry(upstream_key.clone())
-            .or_insert_with(|| {
-                let zero_rtt_rejected = Arc::new(AtomicBool::new(false));
-                let mut clients = Vec::with_capacity(self.pool_size);
-                for _ in 0..self.pool_size {
-                    clients.push(Arc::new(DoqMuxClient::new(
-                        upstream_key.clone(),
+        let pool = self.pools.get_or_create(upstream, |upstream| {
+            // 一个池的连接共用对 0-RTT 的了解 / A pool's connections share what they learn about 0-RTT
+            let zero_rtt_rejected = Arc::new(AtomicBool::new(false));
+            (0..self.pool_size)
+                .map(|_| {
+                    Arc::new(DoqMuxClient::new(
+                        upstream.clone(),
                         Arc::clone(&self.runtime),
                         Arc::clone(&zero_rtt_rejected),
-                    )));
-                }
-                Arc::new(DoqConnectionPool {
-                    clients,
-                    next_idx: AtomicUsize::new(0),
+                    ))
                 })
-            })
-            .clone();
-
-        let idx = pool.next_idx.fetch_add(1, Ordering::Relaxed) % pool.clients.len();
-        pool.clients[idx].send(packet, timeout_dur).await
+                .collect()
+        });
+        pool.pick().send(packet, timeout_dur).await
     }
 }
 
@@ -3196,12 +3142,12 @@ mod tests {
     /// bail text, so quinn saying `ZeroRttRejected` outright was never
     /// recognised: the check returned false, 0-RTT stayed on, the next
     /// connection used it again and the upstream kept failing until a restart.
-    /// 写入中途被取消时，这条池化连接必须被丢弃。取消点与 TcpPendingGuard
+    /// 写入中途被取消时，这条池化连接必须被丢弃。取消点与 RemoveOnDrop
     /// 兜的是同一个：外层请求超时先到，或者双发路径上 UDP 先返回导致
     /// tcp_task.abort()。此前只有待处理表那一侧被清理，连接仍然留在池里，
     /// 下一个请求会把自己的帧接在可能只写了一半的帧后面。
     /// A pooled connection has to be dropped when the write is cancelled part
-    /// way through. The cancellation point is the one TcpPendingGuard already
+    /// way through. The cancellation point is the one RemoveOnDrop already
     /// covers: the outer request timeout firing first, or the dual-send path
     /// aborting the TCP task once UDP answered. Only the pending-map side used
     /// to be cleaned up, leaving the connection pooled for the next request to
@@ -3221,10 +3167,7 @@ mod tests {
             drop(held);
         });
 
-        let client = Arc::new(TcpMuxClient::new(
-            Arc::from(addr.to_string().as_str()),
-            Arc::new(PermitManager::new_unlimited()),
-        ));
+        let client = Arc::new(TcpMuxClient::new(Arc::from(addr.to_string().as_str())));
 
         // 直接建连，不走查询——查询超时会自己 reset 掉连接
         // Connect directly: a query would time out and reset the connection
@@ -3626,10 +3569,7 @@ mod tests {
         // ensure_connection 曾在持有连接锁时无超时地 connect：上游黑洞时请求（以及排在
         // 锁后的所有请求）会等满内核 SYN 超时，配置的 upstream 超时形同虚设。
         let blackhole = blackholed_tcp_listener().await;
-        let client = TcpMuxClient::new(
-            Arc::from(blackhole.addr.to_string()),
-            Arc::new(PermitManager::new(1)),
-        );
+        let client = TcpMuxClient::new(Arc::from(blackhole.addr.to_string()));
         let started = tokio::time::Instant::now();
         let result = timeout(
             Duration::from_secs(3),
@@ -3654,7 +3594,6 @@ mod tests {
         let client = DotMuxClient::new(
             Arc::from(format!("dot://{addr}?sni=localhost")),
             Arc::new(build_tls_client_config().expect("tls config")),
-            Arc::new(PermitManager::new(1)),
         );
         let started = tokio::time::Instant::now();
         let result = timeout(
@@ -3717,8 +3656,7 @@ mod tests {
         // 复用连接失败后的透明重试曾无条件给 1.5 s 保底：预算 200 ms 的请求在卡住的
         // 复用连接上要跑约 1.7 s。
         let addr = answer_once_then_stall_tcp_upstream().await;
-        let client =
-            TcpMuxClient::new(Arc::from(addr.to_string()), Arc::new(PermitManager::new(1)));
+        let client = TcpMuxClient::new(Arc::from(addr.to_string()));
         let query = [0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
         client
             .send(&query, Duration::from_millis(500))
@@ -4256,8 +4194,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
         // Arrange: Prepare a TCP client with many pending IDs to force contention
-        let permit_manager = Arc::new(PermitManager::new(128)); // Default TCP limit
-        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0"), permit_manager));
+        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
         let (write_half, _server) = connected_tcp_write_half().await;
         *client.conn.lock().await = Some(write_half);
         for id in 1u16..200u16 {
@@ -4300,8 +4237,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_fail_all_cannot_miss_a_concurrent_registration() {
-        let permit_manager = Arc::new(PermitManager::new(1));
-        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0"), permit_manager));
+        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
         let (write_half, _server) = connected_tcp_write_half().await;
         *client.conn.lock().await = Some(write_half);
 
@@ -4320,15 +4256,8 @@ mod tests {
 
         let pending = Arc::clone(&client.pending);
         let conn = Arc::clone(&client.conn);
-        let conn_permit = Arc::clone(&client.conn_permit);
         let fail_all = tokio::spawn(async move {
-            TcpMuxClient::fail_all_async(
-                &pending,
-                anyhow::anyhow!("reader failed"),
-                &conn,
-                &conn_permit,
-            )
-            .await;
+            TcpMuxClient::fail_all_async(&pending, anyhow::anyhow!("reader failed"), &conn).await;
         });
         tokio::task::yield_now().await;
         drop(conn_guard);
@@ -4407,9 +4336,9 @@ mod tests {
         }
     }
 
-    /// 预热建的连接池和发送时现建的一样大，客户端共用一个同样大的 permit manager
-    /// A warmed-up pool is as large as one built on first send, its clients sharing a
-    /// permit manager of that size
+    /// 预热建的连接池和发送时现建的一样大，每个客户端各有自己的连接位
+    /// A warmed-up pool is as large as one built on first send, each client with a
+    /// connection slot of its own
     #[test]
     fn a_warmed_up_pool_has_every_client() {
         let mux = TcpMultiplexer::new(3, 3, 0, 0);
@@ -4420,45 +4349,132 @@ mod tests {
             .expect("the upstream is warmed up")
             .clone();
         assert_eq!(pool.clients.len(), 3);
-        assert_eq!(pool.clients[0].permit_manager.max_permits(), 3);
+        assert!(!Arc::ptr_eq(&pool.clients[0].conn, &pool.clients[1].conn));
     }
 
-    #[test]
-    fn test_tcp_pool_per_upstream_permit_manager_isolated() {
-        // ========== Arrange ==========
+    /// 同一个池的客户端各用各的连接，不同上游各有各的池：经池里两个客户端各发一个查询，上游收到两条
+    /// 连接
+    /// The clients of one pool each keep a connection of their own, and each upstream has
+    /// a pool of its own: a query sent through each of a pool's two clients reaches the
+    /// upstream over two connections
+    #[tokio::test]
+    async fn the_clients_of_one_pool_each_keep_a_connection_of_their_own() {
+        use std::sync::atomic::AtomicUsize;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        let mut len = [0u8; 2];
+                        if stream.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
+                        if stream.read_exact(&mut frame).await.is_err() {
+                            return;
+                        }
+                        frame[2] |= 0x80;
+                        if stream.write_all(&len).await.is_err()
+                            || stream.write_all(&frame).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
         let mux = TcpMultiplexer::new(2, 3, 0, 0);
-
-        // ========== Act ==========
-        let pool_a = mux.get_or_init_pool_for_test("1.1.1.1:53");
-        let pool_b = mux.get_or_init_pool_for_test("8.8.8.8:53");
-        let permit_a = Arc::clone(&pool_a.clients[0].permit_manager);
-        let permit_b = Arc::clone(&pool_b.clients[0].permit_manager);
-
-        // ========== Assert ==========
-        assert_eq!(pool_a.clients.len(), 2, "Pool A should have two clients");
-        assert_eq!(pool_b.clients.len(), 2, "Pool B should have two clients");
-        assert!(
-            Arc::ptr_eq(&permit_a, &pool_a.clients[1].permit_manager),
-            "All clients in the same pool should share one permit manager"
-        );
-        assert!(
-            Arc::ptr_eq(&permit_b, &pool_b.clients[1].permit_manager),
-            "All clients in the same pool should share one permit manager"
-        );
-        assert!(
-            !Arc::ptr_eq(&permit_a, &permit_b),
-            "Different upstreams should have distinct permit managers"
-        );
+        let pool = mux.get_or_init_pool_for_test(&addr);
+        assert_eq!(pool.clients.len(), 2);
+        for client in &pool.clients {
+            client
+                .send(&udp_test_query("a.example"), Duration::from_secs(2))
+                .await
+                .expect("the upstream answers");
+        }
         assert_eq!(
-            permit_a.max_permits(),
+            accepted.load(Ordering::SeqCst),
             2,
-            "Permit manager should match pool size for upstream A"
+            "one connection per client"
         );
+        let other = mux.get_or_init_pool_for_test("192.0.2.53:53");
+        assert!(
+            !Arc::ptr_eq(&pool, &other),
+            "each upstream has its own pool"
+        );
+    }
+
+    /// 查询超时以后，它在 UDP socket 的 inflight 表、TCP 连接的 pending 表里的那一条都已经删掉
+    /// Once a query times out, its entry is gone from the UDP socket's inflight map and
+    /// from the TCP connection's pending map
+    #[tokio::test]
+    async fn a_timed_out_query_leaves_no_entry_behind() {
+        // 收下查询、从不回答的本机上游 / Local upstreams that take queries and never answer
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp.local_addr().unwrap().to_string();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    Ok((stream, _)) = tcp.accept() => held.push(stream),
+                    _ = udp.recv_from(&mut buf) => {}
+                }
+            }
+        });
+
+        let client = UdpClient::new(2).expect("udp client");
+        let result = client
+            .send(
+                &udp_test_query("a.example"),
+                &udp_addr,
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(result.is_err(), "the upstream never answers");
+        assert!(client.pool.iter().all(|socket| socket.inflight.is_empty()));
+
+        let tcp_client = TcpMuxClient::new(Arc::from(tcp_addr.as_str()));
+        let result = tcp_client
+            .send(&udp_test_query("a.example"), Duration::from_millis(100))
+            .await;
+        assert!(result.is_err(), "the upstream never answers");
+        assert!(tcp_client.pending.is_empty());
+    }
+
+    /// 连接池大小写成 0 时按 1 算：TCP（DoT 用同一套）和 DoQ 的池里都有一个客户端
+    /// A pool size of 0 counts as 1: TCP pools (DoT shares their code) and DoQ pools both
+    /// get one client
+    #[tokio::test]
+    async fn a_pool_size_of_zero_gives_one_client() {
+        let tcp = TcpMultiplexer::new(0, 3, 0, 0);
         assert_eq!(
-            permit_b.max_permits(),
-            2,
-            "Permit manager should match pool size for upstream B"
+            tcp.get_or_init_pool_for_test("192.0.2.1:53").clients.len(),
+            1
         );
+
+        let doq = DoqClient::new(0, 60, 15_000, false).expect("build DoQ client");
+        // 发一个连不上的查询，只为建出这个上游的连接池
+        // A query nothing answers, only to build this upstream's pool
+        let upstream = "127.0.0.1:9?sni=localhost";
+        let _ = doq
+            .send(
+                &udp_test_query("pool.example"),
+                upstream,
+                Duration::from_millis(50),
+            )
+            .await;
+        let pool = doq
+            .pools
+            .get(upstream)
+            .expect("the first query builds the pool");
+        assert_eq!(pool.clients.len(), 1);
     }
 
     /// `socket` 上的下一个 HTTP/1.1 请求：请求头（转成小写）和正文。`buf` 存着上一个请求之后多读的字节；
@@ -5288,7 +5304,7 @@ mod tests {
 
     async fn tcp_test_client() -> TcpMuxClient {
         let addr = spawn_stream_upstream(None).await;
-        TcpMuxClient::new(Arc::from(addr.to_string()), Arc::new(PermitManager::new(1)))
+        TcpMuxClient::new(Arc::from(addr.to_string()))
     }
 
     async fn dot_test_client() -> DotMuxClient {
@@ -5297,7 +5313,6 @@ mod tests {
         DotMuxClient::new(
             Arc::from(format!("dot://{addr}?sni=localhost")),
             Arc::new(client_tls),
-            Arc::new(PermitManager::new(1)),
         )
     }
 
@@ -5671,7 +5686,6 @@ mod tests {
         let client = DotMuxClient::new(
             Arc::from(format!("dot://[::1]:{}", addr.port())),
             Arc::new(client_tls),
-            Arc::new(PermitManager::new(1)),
         );
         client
             .send(&udp_test_query("v6.example"), Duration::from_secs(2))
@@ -5726,7 +5740,6 @@ mod tests {
         let client = Arc::new(DotMuxClient::new(
             Arc::from(format!("dot://{addr}?sni=localhost")),
             Arc::new(client_tls),
-            Arc::new(PermitManager::new(1)),
         ));
         client
             .ensure_connection(Duration::from_secs(2))
@@ -5978,7 +5991,7 @@ mod tests {
             }
         });
         let client = DoqClient {
-            pools: DashMap::with_hasher(FxBuildHasher),
+            pools: UpstreamPools::new(),
             pool_size: 1,
             runtime: doq_test_runtime(client_tls, false),
         };
