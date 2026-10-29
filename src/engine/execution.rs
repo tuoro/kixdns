@@ -7320,6 +7320,53 @@ mod requester_scope_tests {
         );
     }
 
+    /// 一条规则里写了几个 forward 时，它们合成一次转发、同时问所有上游，发出的 ECS 只有一个：几个
+    /// forward 的 ecs 写得一样时照它发（以前合并时 ecs 被丢掉，一个也不发）；写得不一样时和不写 ecs
+    /// 一样，客户端没带 ECS 就不发
+    /// The forwards of one rule merge into one forward asking every upstream at once, and
+    /// it sends one ECS: the forwards' ecs when they all write the same (the merge used
+    /// to drop it and send none); as without ecs when they differ, so a client sending
+    /// no ECS has none sent
+    #[tokio::test]
+    async fn forwards_merged_in_one_rule_send_the_ecs_they_share() {
+        let echoes = [subnet_echo().await.address, subnet_echo().await.address];
+        let from_client =
+            serde_json::json!({ "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 });
+        let fixed = serde_json::json!({ "mode": "static", "ip": "203.0.113.0", "prefix": 24 });
+        let subnet = |text: &str| Some(text.parse::<Ipv4Addr>().unwrap());
+        for (ecs, sent) in [
+            ([&from_client, &from_client], subnet("198.51.100.0")),
+            ([&fixed, &fixed], subnet("203.0.113.0")),
+            ([&from_client, &fixed], Some(NO_SUBNET)),
+        ] {
+            let actions: Vec<serde_json::Value> = echoes
+                .iter()
+                .zip(ecs)
+                .map(|(upstream, ecs)| {
+                    serde_json::json!({ "type": "forward", "upstream": upstream, "ecs": ecs })
+                })
+                .collect();
+            // 和启动、重载一样经 `parse_config` 读配置：几个 forward 在那里合并好
+            // Read through `parse_config` as startup and reload do: that is where the forwards
+            // are merged
+            let raw = serde_json::json!({
+                "settings": {
+                    "default_upstream": "127.0.0.1:9",
+                    "upstream_timeout_ms": 500,
+                    "enable_tcp_fallback": false
+                },
+                "pipelines": [{ "id": "main", "rules": [rule("both", any(), serde_json::json!(actions))] }]
+            });
+            let config = crate::config::parse_config(&raw.to_string()).expect("parse config");
+            let engine = Engine::new(
+                RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+                "test".to_string(),
+            )
+            .expect("engine");
+            assert_eq!(ask(&engine, "198.51.100.7", false).await, sent, "{ecs:?}");
+        }
+    }
+
     /// 进入按客户端分流的 pipeline 后，这台设备得到静态应答，或者转发给一个慢的 sink 上游。
     /// Inside a pipeline that splits by client the device gets a static answer, or
     /// a forward to a slow sink upstream.

@@ -463,7 +463,7 @@ impl Engine {
                         response_actions_on_miss: rule.response_actions_on_miss.clone(),
                         rule_name: rule.name.clone(),
                         transport: None, // Each upstream decides its own transport / 每个 upstream 自行决定 transport
-                        ecs: None,
+                        ecs: merged.ecs.clone(),
                         allow_reuse: false,
                     };
                     return Some(d);
