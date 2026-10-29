@@ -1894,7 +1894,7 @@ impl Engine {
         &self,
         qname: &str,
         qtype: hickory_proto::rr::RecordType,
-        _qclass: DNSClass, // Currently defaults to IN class, parameter reserved for future use
+        qclass: DNSClass,
         edns: bool,
         ecs: Option<&crate::ecs::EcsKey>,
         flags: crate::proto_utils::QueryFlags,
@@ -1919,7 +1919,11 @@ impl Engine {
         // 添加问题部分
         let name = crate::proto_utils::name_from_text(qname)
             .ok_or_else(|| anyhow::anyhow!("query name text {qname:?}"))?;
-        let query = Query::query(name.clone(), qtype);
+        // 按客户端问的类别问：缓存槽位分类别，刷新拿回的应答会写回这个类别的槽位
+        // In the class the client asked: cache slots are kept apart by class, and the
+        // refreshed answer goes back into this class's slot
+        let mut query = Query::query(name.clone(), qtype);
+        query.set_query_class(qclass);
         msg.add_query(query);
         // An ECS option and the DO bit only travel inside EDNS / ECS 选项和 DO 位只能放在 EDNS 里
         if edns || ecs.is_some() || flags.dnssec_ok() {
