@@ -29,6 +29,8 @@ mod query_flags_tests;
 #[cfg(test)]
 mod question_case_tests;
 pub mod refresh;
+#[cfg(test)]
+mod refresh_class_tests;
 pub mod response;
 pub(crate) mod response_log;
 #[cfg(test)]
