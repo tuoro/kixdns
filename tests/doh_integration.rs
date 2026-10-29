@@ -34,16 +34,16 @@ fn init() {
 // Helpers / 辅助函数
 // ============================================================================
 
-/// Build an Engine that always returns a static NXDOMAIN for any query.
-fn make_nxdomain_engine() -> Engine {
+/// 对任何查询都按 `action` 作答的引擎 / An engine answering every query with `action`
+fn static_engine(action: serde_json::Value) -> Engine {
     let raw = serde_json::json!({
         "settings": { "default_upstream": "127.0.0.1:5300" },
         "pipelines": [{
             "id": "p",
             "rules": [{
-                "name": "block-all",
+                "name": "static",
                 "matchers": [{ "type": "any" }],
-                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                "actions": [action]
             }]
         }]
     });
@@ -52,22 +52,14 @@ fn make_nxdomain_engine() -> Engine {
     Engine::new(runtime, "test".to_string()).expect("initialize test engine")
 }
 
+/// Build an Engine that always returns a static NXDOMAIN for any query.
+fn make_nxdomain_engine() -> Engine {
+    static_engine(serde_json::json!({ "type": "static_response", "rcode": "NXDOMAIN" }))
+}
+
 /// Build an Engine that returns a fixed static IP (1.2.3.4) for A queries.
 fn make_static_ip_engine() -> Engine {
-    let raw = serde_json::json!({
-        "settings": { "default_upstream": "127.0.0.1:5300" },
-        "pipelines": [{
-            "id": "p",
-            "rules": [{
-                "name": "static-ip",
-                "matchers": [{ "type": "any" }],
-                "actions": [{ "type": "static_ip_response", "ip": "1.2.3.4" }]
-            }]
-        }]
-    });
-    let cfg: PipelineConfig = serde_json::from_value(raw).expect("parse config");
-    let runtime = RuntimePipelineConfig::from_config(cfg).expect("build runtime");
-    Engine::new(runtime, "test".to_string()).expect("initialize test engine")
+    static_engine(serde_json::json!({ "type": "static_ip_response", "ip": "1.2.3.4" }))
 }
 
 /// Generate a fresh self-signed cert/key PEM pair in memory. The common name
@@ -136,10 +128,7 @@ fn make_client_trusting(cert_pem: &str) -> reqwest::Client {
 
 /// Do a DoH POST query; true iff the server answered OK over a verified TLS chain.
 async fn doh_query_ok(client: &reqwest::Client, port: u16, txid: u16) -> bool {
-    client
-        .post(doh_url(port))
-        .header("content-type", "application/dns-message")
-        .body(make_dns_query("reload.example.com", txid))
+    post(client, port, make_dns_query("reload.example.com", txid))
         .send()
         .await
         .is_ok_and(|r| r.status() == reqwest::StatusCode::OK)
@@ -153,36 +142,15 @@ fn atomically_replace(path: &Path, contents: &str) {
     std::fs::rename(&tmp, path).expect("atomic rename");
 }
 
-/// Spawn the DoH server on a pre-bound listener and wait for it to enter the
-/// accept loop.
-async fn spawn_doh(
-    listener: tokio::net::TcpListener,
-    engine: Engine,
-    cert_path: &str,
-    key_path: &str,
-) {
-    let cert_path = cert_path.to_string();
-    let key_path = key_path.to_string();
-    tokio::spawn(async move {
-        let _ = run_doh_with_listener(
-            listener,
-            &cert_path,
-            &key_path,
-            engine,
-            "/dns-query".to_string(),
-        )
-        .await;
-    });
-
-    // Brief delay to let the spawned task load certs and enter accept loop
-    tokio::time::sleep(Duration::from_millis(50)).await;
-}
-
 /// Holds the running DoH test server and keeps temp cert files alive.
 struct DohTestServer {
     port: u16,
     /// PEM of the certificate the server presents, for clients that verify it.
     cert_pem: String,
+    /// 服务端读的证书和私钥文件，换证书的测试改写它们 / The certificate and key files the
+    /// server reads, rewritten by the renewal tests
+    cert_path: String,
+    key_path: String,
     _cert_dir: tempfile::TempDir,
 }
 
@@ -196,11 +164,19 @@ async fn start_doh(engine: Engine) -> DohTestServer {
         .expect("bind listener");
     let port = listener.local_addr().expect("local addr").port();
 
-    spawn_doh(listener, engine, &cert_path, &key_path).await;
+    let (cert, key) = (cert_path.clone(), key_path.clone());
+    tokio::spawn(async move {
+        let _ =
+            run_doh_with_listener(listener, &cert, &key, engine, "/dns-query".to_string()).await;
+    });
+    // Brief delay to let the spawned task load certs and enter accept loop
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     DohTestServer {
         port,
         cert_pem: std::fs::read_to_string(&cert_path).expect("read cert pem"),
+        cert_path,
+        key_path,
         _cert_dir: dir,
     }
 }
@@ -247,6 +223,14 @@ fn doh_url(port: u16) -> String {
     format!("https://127.0.0.1:{port}/dns-query")
 }
 
+/// 以 POST 发 `body` 的 DoH 请求 / A DoH request POSTing `body`
+fn post(client: &reqwest::Client, port: u16, body: Vec<u8>) -> reqwest::RequestBuilder {
+    client
+        .post(doh_url(port))
+        .header("content-type", "application/dns-message")
+        .body(body)
+}
+
 // ============================================================================
 // POST method tests (RFC 8484 §4.1)
 // ============================================================================
@@ -257,10 +241,7 @@ async fn test_doh_post_nxdomain() {
     let client = make_https_client();
 
     let query = make_dns_query("blocked.example.com", 0x1234);
-    let resp = client
-        .post(doh_url(server.port))
-        .header("content-type", "application/dns-message")
-        .body(query)
+    let resp = post(&client, server.port, query)
         .send()
         .await
         .expect("POST request");
@@ -293,10 +274,7 @@ async fn test_doh_post_static_ip() {
     let client = make_https_client();
 
     let query = make_dns_query("static.example.com", 0xBEEF);
-    let resp = client
-        .post(doh_url(server.port))
-        .header("content-type", "application/dns-message")
-        .body(query)
+    let resp = post(&client, server.port, query)
         .send()
         .await
         .expect("POST request");
@@ -413,10 +391,7 @@ async fn test_doh_post_too_large() {
     // 70 KiB body, well over the 64 KiB limit
     let oversized = vec![0xAAu8; 70 * 1024];
 
-    let resp = client
-        .post(doh_url(server.port))
-        .header("content-type", "application/dns-message")
-        .body(oversized)
+    let resp = post(&client, server.port, oversized)
         .send()
         .await
         .expect("POST request");
@@ -432,10 +407,7 @@ async fn test_doh_post_short_body() {
     // Body shorter than 12-byte DNS header
     let short = vec![0x00u8; 5];
 
-    let resp = client
-        .post(doh_url(server.port))
-        .header("content-type", "application/dns-message")
-        .body(short)
+    let resp = post(&client, server.port, short)
         .send()
         .await
         .expect("POST request");
@@ -510,10 +482,7 @@ async fn test_doh_post_body_at_limit_still_processed() {
 
     let at_limit = vec![0xAAu8; 64 * 1024];
 
-    let resp = client
-        .post(doh_url(server.port))
-        .header("content-type", "application/dns-message")
-        .body(at_limit)
+    let resp = post(&client, server.port, at_limit)
         .send()
         .await
         .expect("POST request");
@@ -607,17 +576,13 @@ async fn test_doh_half_sent_body_is_answered_408_after_timeout() {
 #[tokio::test]
 async fn test_doh_concurrent_requests() {
     let server = start_doh(make_nxdomain_engine()).await;
-    let client = make_https_client().clone();
+    let client = make_https_client();
 
     let urls: Vec<_> = (0..10u16)
         .map(|i| {
             let query = make_dns_query(&format!("r{i}.example.com"), i);
 
-            client
-                .post(doh_url(server.port))
-                .header("content-type", "application/dns-message")
-                .body(query)
-                .send()
+            post(&client, server.port, query).send()
         })
         .collect();
 
@@ -655,14 +620,9 @@ async fn poll_until_served(client: &reqwest::Client, port: u16, txid: u16) -> bo
 /// connections must verify against the renewed identity without a restart.
 #[tokio::test]
 async fn test_doh_tls_cert_auto_reload() {
-    let (_dir, cert_path, key_path) = make_test_cert();
-    let cert_a_pem = std::fs::read_to_string(&cert_path).expect("read cert A");
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind listener");
-    let port = listener.local_addr().expect("local addr").port();
-    spawn_doh(listener, make_nxdomain_engine(), &cert_path, &key_path).await;
+    let server = start_doh(make_nxdomain_engine()).await;
+    let (port, cert_a_pem) = (server.port, server.cert_pem.clone());
+    let (cert_path, key_path) = (&server.cert_path, &server.key_path);
 
     let (cert_b_pem, key_b_pem) = generate_cert_pem_pair("kixdns-test-renewed");
     let client_a = make_client_trusting(&cert_a_pem);
@@ -679,8 +639,8 @@ async fn test_doh_tls_cert_auto_reload() {
     );
 
     // Renewal: atomically swap both files, like acme.sh/certbot deploy hooks.
-    atomically_replace(Path::new(&cert_path), &cert_b_pem);
-    atomically_replace(Path::new(&key_path), &key_b_pem);
+    atomically_replace(Path::new(cert_path), &cert_b_pem);
+    atomically_replace(Path::new(key_path), &key_b_pem);
 
     assert!(
         poll_until_served(&client_b, port, 0x0003).await,
@@ -699,21 +659,16 @@ async fn test_doh_tls_cert_auto_reload() {
 /// it keeps serving the last good certificate and adopts new files once valid.
 #[tokio::test]
 async fn test_doh_tls_cert_reload_failure_keeps_last_good() {
-    let (_dir, cert_path, key_path) = make_test_cert();
-    let cert_a_pem = std::fs::read_to_string(&cert_path).expect("read cert A");
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind listener");
-    let port = listener.local_addr().expect("local addr").port();
-    spawn_doh(listener, make_nxdomain_engine(), &cert_path, &key_path).await;
+    let server = start_doh(make_nxdomain_engine()).await;
+    let (port, cert_a_pem) = (server.port, server.cert_pem.clone());
+    let (cert_path, key_path) = (&server.cert_path, &server.key_path);
 
     let (cert_b_pem, key_b_pem) = generate_cert_pem_pair("kixdns-test-recovered");
     let client_a = make_client_trusting(&cert_a_pem);
     let client_b = make_client_trusting(&cert_b_pem);
 
     // Corrupt the key: reload attempts must fail and keep serving A.
-    atomically_replace(Path::new(&key_path), "definitely not a pem\n");
+    atomically_replace(Path::new(key_path), "definitely not a pem\n");
     // Give the watcher time to attempt (and reject) the broken state.
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
@@ -722,8 +677,8 @@ async fn test_doh_tls_cert_reload_failure_keeps_last_good() {
     );
 
     // Once cert+key are valid again, the server adopts them.
-    atomically_replace(Path::new(&cert_path), &cert_b_pem);
-    atomically_replace(Path::new(&key_path), &key_b_pem);
+    atomically_replace(Path::new(cert_path), &cert_b_pem);
+    atomically_replace(Path::new(key_path), &key_b_pem);
     assert!(
         poll_until_served(&client_b, port, 0x0012).await,
         "server must adopt the certificate once files are valid again"
@@ -743,12 +698,9 @@ async fn test_doh_tls_cert_reload_failure_keeps_last_good() {
 /// 这样的连接多了就能把服务端的句柄耗光。
 #[tokio::test]
 async fn doh_drops_a_client_that_never_finishes_the_tls_handshake() {
-    let (_dir, cert_path, key_path) = make_test_cert();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    spawn_doh(listener, make_static_ip_engine(), &cert_path, &key_path).await;
+    let server = start_doh(make_static_ip_engine()).await;
 
-    let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
         .await
         .unwrap();
     let mut buf = [0u8; 1];
