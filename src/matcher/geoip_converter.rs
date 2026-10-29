@@ -52,7 +52,6 @@ pub struct ConversionStats {
     pub countries_count: usize,
     pub ipv4_ranges_count: usize,
     pub ipv6_ranges_count: usize,
-    pub filtered_countries: Option<Vec<String>>,
 }
 
 impl std::fmt::Display for ConversionStats {
@@ -63,34 +62,7 @@ impl std::fmt::Display for ConversionStats {
         writeln!(f, "  Countries: {}", self.countries_count)?;
         writeln!(f, "  IPv4 ranges: {}", self.ipv4_ranges_count)?;
         writeln!(f, "  IPv6 ranges: {}", self.ipv6_ranges_count)?;
-        if let Some(ref filtered) = self.filtered_countries {
-            writeln!(f, "  Filtered countries: {:?}", filtered)?;
-        }
         Ok(())
-    }
-}
-
-/// 转换配置
-/// Conversion configuration
-#[derive(Debug, Clone)]
-pub struct ConversionConfig {
-    pub source_path: Box<Path>,
-    pub output_path: Box<Path>,
-    pub filter_countries: Option<Vec<String>>,
-}
-
-impl ConversionConfig {
-    pub fn new(source: &Path, output: &Path) -> Self {
-        Self {
-            source_path: source.to_path_buf().into_boxed_path(),
-            output_path: output.to_path_buf().into_boxed_path(),
-            filter_countries: None,
-        }
-    }
-
-    pub fn with_filter(mut self, countries: Vec<String>) -> Self {
-        self.filter_countries = Some(countries);
-        self
     }
 }
 
@@ -107,8 +79,6 @@ impl GeoIpConverter {
         }
     }
 
-    /// 从 V2Ray .dat 文件加载
-    /// Load from V2Ray .dat file
     /// 从 V2Ray .dat 文件加载
     /// Load from V2Ray .dat file
     pub fn load_from_dat_file(&mut self, path: &Path) -> Result<usize> {
@@ -294,9 +264,7 @@ impl GeoIpConverter {
                 .with_context(|| format!("Failed to insert data for country: {}", country_code))?;
 
             for net in nets {
-                let Some(path) = ip_net_to_mmdb_path(net) else {
-                    continue;
-                };
+                let path = ip_net_to_mmdb_path(net);
                 inserts.push((path.mask, data_ref, path));
                 match net {
                     IpNet::V4(_) => ipv4_count += 1,
@@ -332,7 +300,6 @@ impl GeoIpConverter {
             countries_count: self.country_to_nets.len(),
             ipv4_ranges_count: ipv4_count,
             ipv6_ranges_count: ipv6_count,
-            filtered_countries: None,
         })
     }
 }
@@ -344,7 +311,7 @@ impl GeoIpConverter {
 /// reader（Rust / libmaxminddb / Python）查询 IPv4 时都从树第 96 位（::/96
 /// 子树根）开始。maxminddb-writer 0.1.1 本身不处理嵌入，直接插树根会导致
 /// IPv4 网段全部落空。
-fn ip_net_to_mmdb_path(net: &IpNet) -> Option<IpAddrWithMask> {
+fn ip_net_to_mmdb_path(net: &IpNet) -> IpAddrWithMask {
     match net {
         IpNet::V4(v4) => {
             let o = v4.addr().octets();
@@ -358,15 +325,9 @@ fn ip_net_to_mmdb_path(net: &IpNet) -> Option<IpAddrWithMask> {
                 ((o[0] as u16) << 8) | o[1] as u16,
                 ((o[2] as u16) << 8) | o[3] as u16,
             );
-            Some(IpAddrWithMask::new(
-                std::net::IpAddr::V6(ipv6),
-                v4.prefix_len() + 96,
-            ))
+            IpAddrWithMask::new(std::net::IpAddr::V6(ipv6), v4.prefix_len() + 96)
         }
-        IpNet::V6(v6) => Some(IpAddrWithMask::new(
-            std::net::IpAddr::V6(v6.addr()),
-            v6.prefix_len(),
-        )),
+        IpNet::V6(v6) => IpAddrWithMask::new(std::net::IpAddr::V6(v6.addr()), v6.prefix_len()),
     }
 }
 

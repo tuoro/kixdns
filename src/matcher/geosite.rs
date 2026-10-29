@@ -737,12 +737,6 @@ impl GeoSiteManager {
             .is_some_and(|matchers| matchers.matches(domain))
     }
 
-    /// 获取已加载的标签列表 / Get list of loaded tags
-    #[inline]
-    pub fn tags(&self) -> Vec<String> {
-        self.database.keys().cloned().collect()
-    }
-
     /// 检查标签是否已加载 / Check if tag is loaded
     #[inline]
     pub fn has_tag(&self, tag: &str) -> bool {
@@ -1051,10 +1045,6 @@ impl GeoSiteManager {
 
         while pos < content.len() {
             // 读取外层字段标签 / Read outer field tag
-            if pos >= content.len() {
-                break;
-            }
-
             let field_tag = content[pos];
             pos += 1;
 
@@ -1113,8 +1103,8 @@ impl GeoSiteManager {
                             let domains_data = &content[pos..pos + inner_len];
                             match Self::parse_v2ray_domains(domains_data) {
                                 Ok(parsed) => {
-                                    let count = parsed.len();
-                                    for (entry, _) in parsed {
+                                    let count = usize::from(parsed.is_some());
+                                    if let Some((entry, _)) = parsed {
                                         builder.add_entry(entry);
                                     }
                                     domain_count += count;
@@ -1333,29 +1323,6 @@ impl GeoSiteManager {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
-    /// 解析 varint / Parse varint
-    /// Note: Reserved for future use in dat file parsing
-    #[allow(dead_code)]
-    fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
-        let mut result = 0usize;
-        let mut shift = 0;
-
-        loop {
-            if *pos >= data.len() {
-                anyhow::bail!("unexpected end of file");
-            }
-            let byte = data[*pos];
-            *pos += 1;
-            result |= ((byte & 0x7F) as usize) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-
-        Ok(result)
-    }
-
     /// 从 .dat 文件按需加载指定的 GeoSite tags / Load specified GeoSite tags from .dat file on-demand
     ///
     /// # 参数 / Parameters
@@ -1502,7 +1469,7 @@ impl GeoSiteManager {
                 file.read(&mut field, inner_len)?;
                 match Self::parse_v2ray_domains(&field) {
                     Ok(domains) => {
-                        for (entry, attrs) in domains {
+                        if let Some((entry, attrs)) = domains {
                             for ((builder, count), (_, attr_filter)) in
                                 builders.iter_mut().zip(&requests)
                             {
@@ -1693,9 +1660,9 @@ impl GeoSiteManager {
     /// The domains field in V2Ray .dat file is repeated Domain messages
     /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
     /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
-    /// Returns (DomainMatcher, attribute_keys) pairs — attribute keys enable `@attr` filtering
-    #[allow(clippy::regex_creation_in_loops)]
-    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Vec<(DatEntry, Vec<String>)>> {
+    /// Returns the entry and its attribute keys, which enable `@attr` filtering; None for a
+    /// domain without a value
+    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Option<(DatEntry, Vec<String>)>> {
         tracing::debug!(
             target = "geosite",
             data_len = data.len(),
@@ -1704,7 +1671,7 @@ impl GeoSiteManager {
 
         let domain = Self::read_domain(data, true)?;
         let Some(value) = domain.value else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let domain_value = String::from_utf8_lossy(value).into_owned();
 
@@ -1726,7 +1693,7 @@ impl GeoSiteManager {
 
         tracing::debug!(target = "geosite", "parsed V2Ray domains");
 
-        Ok(vec![(entry, domain.attrs)])
+        Ok(Some((entry, domain.attrs)))
     }
 
     /// 从 V2Ray 格式字符串加载 GeoSite 数据 / Load GeoSite data from V2Ray format string
@@ -1916,6 +1883,49 @@ mod tests {
     /// proto3 leaves out fields holding their default: a keyword entry in v2ray data has no type
     /// field, only its value, and is a keyword all the same; fields come in any order. Both
     /// selective and full loading read it so.
+    /// 没有值的 Domain 条目（proto3 不写空字符串，值就不在）不算一条域名：它不匹配任何名字，只有这种
+    /// 条目的 tag 也不存下来。按需加载和全部加载都是这样
+    /// A Domain entry without a value (proto3 leaves an empty string out, so the value is
+    /// missing) is no entry: it matches no name, and a tag of only such entries is not
+    /// stored either. Both selective and full loading do so
+    #[test]
+    fn a_domain_without_a_value_is_no_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        // 一条只写了类型 full，一条什么都没写（类型 0 是关键词）
+        // One with only its type (full) written, one with nothing written (type 0 is a keyword)
+        let valueless = [encode_varint_field(1, 3), Vec::new()];
+        let path = write_dat(
+            &dir,
+            &[
+                build_geosite(
+                    "V",
+                    &[&valueless[..], &[build_domain(3, "a.example", &[])]].concat(),
+                ),
+                build_geosite("E", &valueless),
+            ],
+        );
+
+        let parsed =
+            GeoSiteManager::parse_dat_file_selective(&path, &["v".to_string(), "e".to_string()])
+                .unwrap();
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["v"]
+        );
+        let (_, tag) = &parsed[0];
+        assert!(tag.matches("a.example"));
+        assert!(!tag.matches("b.example"));
+
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&path).unwrap();
+        assert!(manager.matches("v", "a.example"));
+        assert!(!manager.matches("v", "b.example"));
+        assert!(!manager.has_tag("e"));
+    }
+
     #[test]
     fn a_keyword_without_a_type_field_is_still_a_keyword() {
         let dir = tempfile::tempdir().unwrap();

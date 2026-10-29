@@ -9,9 +9,7 @@ use prost::Message;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 
-// Re-export from geoip_converter module
-// Note: geoip_converter is a sibling module at the crate root level
-pub use crate::lock::RwLock;
+// Re-export from the sibling geoip_converter module
 pub use crate::matcher::geoip_converter::{ConversionStats, convert_dat_to_mmdb};
 
 /// MaxMind GeoLite2-Country 数据库结构，字符串直接借用数据库里的字节
@@ -93,8 +91,6 @@ impl GeoIpTagIndex {
     }
 }
 
-/// V2Ray .dat 文件使用 protobuf 格式
-/// MaxMind GeoIP 数据库管理器 / MaxMind GeoIP database manager
 /// 一个数据文件解析出的 GeoIP 索引，已 finalize，尚未进入管理器
 /// GeoIP indexes parsed out of one data file, already finalised and not yet
 /// applied to a manager
