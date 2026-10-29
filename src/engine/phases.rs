@@ -1258,7 +1258,7 @@ pub(crate) async fn handle_forward_decision_logged(
 /// refresh counts as failed and the cached entry stays.
 /// 后台刷新的规则没找到应答时以这个错误结束：算作刷新失败，缓存条目保留。
 pub(crate) fn refresh_found_no_answer(reason: &'static str) -> anyhow::Error {
-    anyhow::Error::new(UpstreamFailure::new(anyhow::anyhow!(reason)))
+    UpstreamFailure::error(anyhow::anyhow!(reason))
 }
 
 /// The reply as it goes to the client, with the ECS option RFC 7871 section 7.2.2
