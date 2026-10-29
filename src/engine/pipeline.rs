@@ -24,8 +24,7 @@ use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::observation::{Observed, decision_kind, report_decision, report_matched_rules};
 use super::rules::Decision;
 use super::rules::{
-    RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, contains_continue, fast_hash_str,
-    rule_cache_requester,
+    RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, fast_hash_str, rule_cache_requester,
 };
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer};
@@ -169,8 +168,13 @@ impl Engine {
             .and_then(|&idx| state.compiled_pipelines.get(idx))
     }
 
+    /// `state` 是求出这个决定的那份配置：决定的有效期按它的 min_ttl 算，求值期间重载了也一样
+    /// `state` is the configuration the decision was made under: its min_ttl sets how long
+    /// the decision holds, even if a reload came in meanwhile
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_rule_cache(
         &self,
+        state: &EngineInner,
         hash: u64,
         pipeline_id: Arc<str>,
         request: &RuleEvaluationContext<'_>,
@@ -185,7 +189,6 @@ impl Engine {
             qclass,
             ..
         } = *request;
-        let state = self.state.load();
         let ttl = match &decision {
             Decision::Static { answers, .. } => {
                 let min_ttl = answers.iter().map(|r| r.ttl).min();
@@ -209,8 +212,7 @@ impl Engine {
                 }
             }
             _ => {
-                // Jump, Allow, Deny: 120秒 TTL（之前是永久）
-                // Jump, Allow, Deny: 120 second TTL (previously permanent)
+                // Jump：120 秒 TTL / Jump: a 120 second TTL
                 Some(Duration::from_secs(120))
             }
         };
@@ -349,14 +351,11 @@ impl Engine {
             upstream: Arc::from(state.pipeline.settings.default_upstream.as_str()),
             pre_split_upstreams: None,
             response_matchers: Vec::new(),
-            response_matcher_operator: crate::config::MatchOperator::And,
             response_actions_on_match: Vec::new(),
             response_actions_on_miss: Vec::new(),
             rule_name: Arc::from("default"),
             transport: Some(Transport::Udp),
             ecs: None,
-            continue_on_match: false,
-            continue_on_miss: false,
             allow_reuse: false,
         });
 
@@ -388,6 +387,7 @@ impl Engine {
         let worth_keeping = pipeline.matches_regex || matches!(decision, Decision::Static { .. });
         if whole_pipeline && worth_keeping {
             self.insert_rule_cache(
+                state,
                 rule_hash,
                 pipeline.id.clone(),
                 request,
@@ -494,14 +494,11 @@ impl Engine {
                         upstream: merged.upstream_str.clone(),
                         pre_split_upstreams: Some(merged.upstream_list.clone()),
                         response_matchers: rule.response_matchers.clone(),
-                        response_matcher_operator: rule.response_matcher_operator,
                         response_actions_on_match: rule.response_actions_on_match.clone(),
                         response_actions_on_miss: rule.response_actions_on_miss.clone(),
                         rule_name: rule.name.clone(),
                         transport: None, // Each upstream decides its own transport / 每个 upstream 自行决定 transport
                         ecs: None,
-                        continue_on_match: false,
-                        continue_on_miss: false,
                         allow_reuse: false,
                     };
                     return Some(d);
@@ -541,14 +538,11 @@ impl Engine {
                                 upstream: Arc::from(upstream_default.as_str()),
                                 pre_split_upstreams: None,
                                 response_matchers: Vec::new(),
-                                response_matcher_operator: crate::config::MatchOperator::And,
                                 response_actions_on_match: Vec::new(),
                                 response_actions_on_miss: Vec::new(),
                                 rule_name: rule.name.clone(),
                                 transport: Some(Transport::Udp),
                                 ecs: None,
-                                continue_on_match: false,
-                                continue_on_miss: false,
                                 allow_reuse: true,
                             };
                             return Some(d);
@@ -570,22 +564,15 @@ impl Engine {
                                 .as_ref()
                                 .map(|s| Arc::from(s.as_str()))
                                 .unwrap_or_else(|| Arc::from(upstream_default.as_str()));
-                            let continue_on_match =
-                                contains_continue(&rule.response_actions_on_match);
-                            let continue_on_miss =
-                                contains_continue(&rule.response_actions_on_miss);
                             let d = Decision::Forward {
                                 upstream: upstream_addr,
                                 pre_split_upstreams: pre_split_upstreams.clone(),
                                 response_matchers: rule.response_matchers.clone(),
-                                response_matcher_operator: rule.response_matcher_operator,
                                 response_actions_on_match: rule.response_actions_on_match.clone(),
                                 response_actions_on_miss: rule.response_actions_on_miss.clone(),
                                 rule_name: rule.name.clone(),
                                 transport: Some(transport.unwrap_or(Transport::Udp)),
                                 ecs: ecs.clone(),
-                                continue_on_match,
-                                continue_on_miss,
                                 allow_reuse: false,
                             };
                             return Some(d);

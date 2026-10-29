@@ -37,20 +37,14 @@ pub enum Decision {
     Forward {
         upstream: Arc<str>,
         /// Pre-split upstream list (performance optimization) / 预分割的 upstream 列表（性能优化）
-        #[allow(dead_code)]
         pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
         response_matchers: Vec<RuntimeResponseMatcherWithOp>,
-        response_matcher_operator: crate::config::MatchOperator,
         response_actions_on_match: Vec<Action>,
         response_actions_on_miss: Vec<Action>,
         rule_name: Arc<str>,
         transport: Option<Transport>, // None means each upstream decides itself (via protocol prefix) / None 表示每个 upstream 自己决定（通过协议前缀）
         /// EDNS Client Subnet (RFC 7871) request rewriting mode / EDNS 客户端子网 (RFC 7871) 请求改写模式
         ecs: Option<crate::config::EcsMode>,
-        #[allow(dead_code)]
-        continue_on_match: bool,
-        #[allow(dead_code)]
-        continue_on_miss: bool,
         allow_reuse: bool,
     },
     Jump {
@@ -63,7 +57,6 @@ pub struct ResponseContext {
     pub raw: Bytes,
     pub msg: Message,
     pub upstream: Arc<str>,
-    pub transport: Transport,
 }
 
 /// The `source` of the SERVFAIL that a response action's jump answers when no
@@ -303,13 +296,6 @@ pub(crate) fn response_matches(
     )
 }
 
-#[inline]
-pub fn contains_continue(actions: &[Action]) -> bool {
-    actions
-        .iter()
-        .any(|action| matches!(action, Action::Continue))
-}
-
 pub struct ApplyResponseActionsContext<'a> {
     pub engine: &'a Engine,
     pub actions: &'a [Action],
@@ -317,10 +303,8 @@ pub struct ApplyResponseActionsContext<'a> {
     pub req: &'a Message,
     pub packet: &'a [u8],
     pub upstream_timeout: Duration,
-    pub response_matchers: &'a [RuntimeResponseMatcherWithOp],
     pub qname: &'a str,
     pub qtype: RecordType,
-    pub qclass: DNSClass,
     pub client_ip: IpAddr,
     pub upstream_default: &'a str,
     pub pipeline_id: &'a str,
@@ -539,7 +523,6 @@ async fn run_response_actions(
                     raw,
                     msg,
                     upstream: Arc::from(actual_upstream.as_str()), // Use actual responding upstream
-                    transport: use_transport,
                 });
             }
         }
@@ -816,14 +799,11 @@ pub(crate) async fn process_response_jump(
                 upstream,
                 pre_split_upstreams,
                 response_matchers,
-                response_matcher_operator: _response_matcher_operator,
                 response_actions_on_match,
                 response_actions_on_miss,
                 rule_name,
                 transport,
                 ecs: _,
-                continue_on_match: _,
-                continue_on_miss: _,
                 allow_reuse,
             } => {
                 response.upstream = Some(upstream.clone());
@@ -973,7 +953,6 @@ pub(crate) async fn process_response_jump(
                             raw,
                             msg,
                             upstream: Arc::from(actual_upstream.as_str()), // Use actual responding upstream
-                            transport: transport.unwrap_or(Transport::Udp),
                         };
                         let apply_ctx = ApplyResponseActionsContext {
                             engine,
@@ -982,10 +961,8 @@ pub(crate) async fn process_response_jump(
                             req,
                             packet,
                             upstream_timeout,
-                            response_matchers: &response_matchers,
                             qname,
                             qtype,
-                            qclass,
                             client_ip: peer.ip(),
                             upstream_default: cfg.settings.default_upstream.as_str(),
                             pipeline_id: &pipeline_id,

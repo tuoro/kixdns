@@ -53,14 +53,10 @@ impl RefreshTarget {
         self
     }
 
-    /// 刷新标记的键：每个条目各一个，同一槽位里不同子网的条目可以同时刷新
-    /// The key of the refresh mark: one per entry, so entries for different subnets
-    /// in one slot refresh independently
-    pub fn mark(&self) -> u64 {
-        Self::mark_of(self.slot, &self.reach)
-    }
-
-    /// 槽位 `slot` 里适用于 `reach` 的条目的刷新标记 / The refresh mark of the entry for `reach` in slot `slot`
+    /// 槽位 `slot` 里适用于 `reach` 的条目的刷新标记：每个条目各一个，同一槽位里不同子网的条目可以
+    /// 同时刷新
+    /// The refresh mark of the entry for `reach` in slot `slot`: one per entry, so entries
+    /// for different subnets in one slot refresh independently
     pub fn mark_of(slot: u64, reach: &EcsReach) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
@@ -78,15 +74,12 @@ impl RefreshTarget {
 /// 2. 后台请求设置 skip_cache=true
 /// 3. RefreshingGuard 确保刷新标记在任务完成后被清除
 ///
-/// `peer_ip` is the original client IP from the request that triggered this refresh.
-/// It must be the real client IP — not loopback — so that:
-/// - ECS injection (RFC 7871) uses the correct client subnet
-/// - Pipeline selection matches the original request path
+/// `requester` is who sent the request that triggered this refresh: its real address
+/// (not loopback), whether it sent EDNS, and its own ECS, so that ECS (RFC 7871) and
+/// pipeline selection go as they did for that request.
 ///
-/// `peer_ip` 是触发刷新的原始请求的客户端 IP。
-/// 必须使用真实客户端 IP 而非回环地址，以确保：
-/// - ECS 注入 (RFC 7871) 使用正确的客户端子网
-/// - Pipeline 选择与原始请求路径一致
+/// `requester` 是触发刷新的那个请求的发送方：它的真实地址（不是回环地址）、带没带 EDNS、它自己的
+/// ECS，这样 ECS（RFC 7871）和 pipeline 选择都和那个请求一样。
 ///
 /// `renewed` is the cached answer to renew, in slot `slot`: its question
 /// (pipeline, name, type) is the one replayed, in class `qclass`.
@@ -108,9 +101,7 @@ pub fn spawn_background_refresh(
     // `RefreshingGuard::try_new`). The guard clears the mark when the task ends, and on
     // the early return below too
     let mark = RefreshTarget::mark_of(slot, &renewed.reach);
-    let Some(guard) =
-        RefreshingGuard::try_new(&engine.refreshing_bitmap, &engine.refreshing_set, mark)
-    else {
+    let Some(guard) = RefreshingGuard::try_new(&engine.refreshing_set, mark) else {
         return;
     };
     let target = RefreshTarget::new(

@@ -48,8 +48,6 @@ pub enum ForwardResult {
 }
 use hickory_proto::serialize::binary::BinDecodable;
 
-/// Standard cache check logic that replicates `handle_packet_internal`'s behavior.
-/// Checks Moka cache, validates TTL, patches response, and triggers background refresh if needed.
 /// Immutable cache lookup data shared by normal and refresh-wait paths.
 pub struct CacheLookupContext<'a> {
     pub state: &'a Arc<EngineInner>,
@@ -79,6 +77,10 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
     check_cache_logged(engine, context, &mut ResponseInfo::default())
 }
 
+/// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
+/// background refresh; an expired one is served stale or dropped as serve_stale says.
+/// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期的按 serve_stale
+/// 的设置当作 stale 提供，或者删掉。
 pub(crate) fn check_cache_logged(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
@@ -189,7 +191,7 @@ pub(crate) fn check_cache_logged(
         let elapsed = crate::proto_utils::saturating_u64_to_u32(elapsed_secs);
         let resp_bytes = served_from_cache(&hit, tx_id, &view, ServedTtl::Elapsed(elapsed));
 
-        // ========== NEW: Trigger background refresh before returning cached response ==========
+        // Trigger a background refresh before returning the cached answer / 返回缓存的应答之前，看要不要发起后台刷新
         let cfg = &state.pipeline;
 
         let remaining_ttl = hit.refresh_ttl.saturating_sub(elapsed);
@@ -456,8 +458,6 @@ pub struct StaticDecisionContext<'a> {
     /// 应答适用于谁：请求在它之前经过的转发（见 `ForwardDecisionContext::trail`）
     pub reach: &'a EcsReach,
     pub min_ttl: Duration,
-    pub start: Instant,
-    pub peer: &'a std::net::SocketAddr,
     /// Pipeline uses a client_ip matcher: skip dns_cache to avoid cross-client
     /// reuse (rule_cache already isolates by client IP in that case).
     pub uses_client_ip: bool,
@@ -482,8 +482,6 @@ pub fn handle_static_decision(
         flags,
         reach,
         min_ttl,
-        start: _,
-        peer: _,
         uses_client_ip,
     } = *context;
     // Need full request for building response / 需要完整请求来构建响应
@@ -514,8 +512,7 @@ pub fn handle_static_decision(
     Ok(resp_bytes)
 }
 
-/// Handles Decision::Forward.
-/// Manages Singleflight, upstream forwarding, response matching, and caching.
+/// Request data a forward decision needs / 转发决定需要的请求数据
 pub struct ForwardDecisionContext<'a> {
     pub state: &'a Arc<EngineInner>,
     pub packet: &'a [u8],
@@ -571,6 +568,9 @@ pub struct ForwardDecisionContext<'a> {
     pub observed: Observed<'a>,
 }
 
+/// Handles Decision::Forward: joins or registers in the inflight map, forwards upstream,
+/// applies the response rules and caches the answer.
+/// 处理转发决定：合并等待或登记 inflight，转发给上游，执行响应规则，缓存应答。
 pub(crate) async fn handle_forward_decision_logged(
     engine: &Engine,
     context: ForwardDecisionContext<'_>,
@@ -950,7 +950,6 @@ pub(crate) async fn handle_forward_decision_logged(
                     raw,
                     msg,
                     upstream: Arc::from(actual_upstream.as_str()),
-                    transport: transport.unwrap_or(Transport::Udp),
                 };
                 (actions_to_run, Some(ctx), req_full, None)
             }
@@ -1075,10 +1074,8 @@ pub(crate) async fn handle_forward_decision_logged(
             req: &req,
             packet,
             upstream_timeout,
-            response_matchers,
             qname,
             qtype,
-            qclass,
             client_ip: peer.ip(),
             upstream_default: default_upstream,
             pipeline_id,

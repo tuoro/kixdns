@@ -14,7 +14,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, FastPathResponse, PreParsedData};
+use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RuntimePipelineConfig;
 
 /// 假上游对一个查询发出的应答：每个在多久之后发、发什么
@@ -187,21 +187,9 @@ pub(super) async fn ask_fast_path_first(
         {
             FastPathResponse::Direct(reply) => reply,
             FastPathResponse::CacheHit { cached, .. } => cached,
-            FastPathResponse::AsyncNeeded {
-                qname,
-                qtype,
-                qclass,
-                tx_id,
-                edns_present,
-                pipeline_id,
-            } => tokio::time::timeout(
+            FastPathResponse::AsyncNeeded(pre_parsed) => tokio::time::timeout(
                 Duration::from_secs(5),
-                engine.handle_packet_internal_with_pre_parsed(
-                    packet,
-                    peer,
-                    false,
-                    PreParsedData::new(qname, qtype, qclass, tx_id, edns_present, pipeline_id),
-                ),
+                engine.handle_packet_internal_with_pre_parsed(packet, peer, false, pre_parsed),
             )
             .await
             .expect("answer in time")

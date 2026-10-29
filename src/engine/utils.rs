@@ -7,7 +7,6 @@ use hickory_proto::rr::{DNSClass, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// RAII Guard for cleaning up inflight request map
 /// 为清理进行中请求映射的 RAII Guard
@@ -197,62 +196,10 @@ pub mod engine_helpers {
     }
 }
 
-// ============================================================================
-// Refreshing Helpers / 刷新辅助函数
-// ============================================================================
-//
-// Hybrid approach: AtomicU64 bloom filter (fast path) + DashSet<u64> (exact backend).
-// The bloom filter provides O(1) atomic check (~1ns) for the common case where
-// nothing is refreshing. Only when the bloom filter bit is set do we fall back
-// to the DashSet for an exact check (~30ns). This preserves correctness while
-// keeping the hot-path overhead minimal.
-//
-// 混合方案：AtomicU64 布隆过滤器（快速路径）+ DashSet<u64>（精确后端）。
-// 布隆过滤器在常见情况（无刷新）下提供 O(1) 原子检查（~1ns）。
-// 仅当布隆位已设置时才回退到 DashSet 做精确检查（~30ns）。
-// 在保证正确性的同时，最小化热路径开销。
-
-/// Bit index for bloom filter / 布隆过滤器的位索引
-#[inline]
-fn bloom_bit(cache_hash: u64) -> u64 {
-    1u64 << (cache_hash % 64)
-}
-
-/// 检查缓存哈希是否正在刷新 / Check if a cache hash is currently being refreshed
-/// Fast path: AtomicU64 bloom filter (~1ns). Slow path: DashSet exact check.
-#[inline]
-pub fn is_refreshing(bitmap: &AtomicU64, set: &DashSet<u64>, cache_hash: u64) -> bool {
-    // Fast path: if bloom filter bit is NOT set, definitely not refreshing
-    if bitmap.load(Ordering::Relaxed) & bloom_bit(cache_hash) == 0 {
-        return false;
-    }
-    // Slow path: bloom filter hit, verify with exact set lookup
-    set.contains(&cache_hash)
-}
-
-/// 标记缓存哈希为正在刷新 / Mark a cache hash as being refreshed
-#[inline]
-pub fn mark_refreshing(bitmap: &AtomicU64, set: &DashSet<u64>, cache_hash: u64) {
-    bitmap.fetch_or(bloom_bit(cache_hash), Ordering::Release);
-    set.insert(cache_hash);
-}
-
-/// 清除缓存哈希的刷新标记 / Clear the refreshing mark for a cache hash
-#[inline]
-pub fn clear_refreshing(_bitmap: &AtomicU64, set: &DashSet<u64>, cache_hash: u64) {
-    set.remove(&cache_hash);
-    // Note: we don't clear the bloom bit because bloom false positives are harmless
-    // (they only cause an extra DashSet lookup, not incorrect behavior).
-    // Clearing would require expensive synchronization to avoid races.
-    // 注：不清除布隆位，因为布隆假阳性无害（只多一次 DashSet 查找，不会导致错误行为）。
-}
-
-/// RAII Guard for auto-clearing the refreshing set
-/// RAII Guard 用于自动清除刷新标记
+/// 刷新标记：打上的 guard 在 drop 时清掉它 / A refresh mark, cleared when its guard drops
 pub struct RefreshingGuard {
-    bitmap: Option<Arc<AtomicU64>>,
-    set: Option<Arc<DashSet<u64>>>,
-    cache_hash: Option<u64>,
+    set: Arc<DashSet<u64>>,
+    cache_hash: u64,
 }
 
 impl RefreshingGuard {
@@ -261,45 +208,17 @@ impl RefreshingGuard {
     /// Set the refresh mark and return a guard that clears it on drop; None when it is
     /// set already. Checking and setting is one step (`DashSet::insert`), so of several
     /// arriving at once only one gets it
-    pub fn try_new(
-        bitmap: &Arc<AtomicU64>,
-        set: &Arc<DashSet<u64>>,
-        cache_hash: u64,
-    ) -> Option<Self> {
-        bitmap.fetch_or(bloom_bit(cache_hash), Ordering::Release);
-        if !set.insert(cache_hash) {
-            return None;
-        }
-        Some(Self {
-            bitmap: Some(Arc::clone(bitmap)),
-            set: Some(Arc::clone(set)),
-            cache_hash: Some(cache_hash),
+    pub fn try_new(set: &Arc<DashSet<u64>>, cache_hash: u64) -> Option<Self> {
+        set.insert(cache_hash).then(|| Self {
+            set: Arc::clone(set),
+            cache_hash,
         })
-    }
-
-    /// Defuse the guard so it won't clear the mark on drop
-    /// 让 guard 失效，drop 时不会清除标记
-    pub fn defuse(&mut self) {
-        self.bitmap = None;
-        self.set = None;
-        self.cache_hash = None;
-    }
-
-    /// Manually clear the refresh mark early
-    /// 手动提前清除刷新标记
-    pub fn clear(&mut self) {
-        if let (Some(bitmap), Some(set), Some(hash)) = (&self.bitmap, &self.set, self.cache_hash) {
-            clear_refreshing(bitmap, set, hash);
-        }
-        self.defuse();
     }
 }
 
 impl Drop for RefreshingGuard {
     fn drop(&mut self) {
-        if let (Some(bitmap), Some(set), Some(hash)) = (&self.bitmap, &self.set, self.cache_hash) {
-            clear_refreshing(bitmap, set, hash);
-        }
+        self.set.remove(&self.cache_hash);
     }
 }
 

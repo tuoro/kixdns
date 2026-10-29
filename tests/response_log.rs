@@ -506,3 +506,31 @@ async fn an_unsupported_edns_version_is_logged_as_badvers() {
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0]["rcode"], "BADVERS");
 }
+
+/// 快速路径回 BADVERS 时也记一条响应日志，字段和完整路径的那条一样（耗时除外）；以前快速路径
+/// 只上报观察者，不写这条日志
+/// A BADVERS answered on the fast path gets a response record too, with the same fields as
+/// the full path's (latency aside); the fast path used to tell only the observer
+#[tokio::test]
+async fn a_badvers_on_the_fast_path_is_logged_as_on_the_full_path() {
+    let log = Log::default();
+    let _capture = log.capture();
+    let engine = engine("127.0.0.1:9");
+    let mut message = Message::from_bytes(&query()).unwrap();
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_version(1);
+    message.edns = Some(edns);
+    let packet = message.to_vec().unwrap();
+    assert!(matches!(
+        engine.handle_packet_fast(&packet, peer()).unwrap(),
+        Some(FastPathResponse::Direct(_))
+    ));
+    engine.handle_packet(&packet, peer()).await.unwrap();
+    let mut responses = log.responses();
+    assert_eq!(responses.len(), 2, "one record for each path");
+    for response in &mut responses {
+        response.as_object_mut().unwrap().remove("latency_ms");
+    }
+    assert_eq!(responses[0], responses[1]);
+    assert_eq!(responses[0]["rcode"], "BADVERS");
+}

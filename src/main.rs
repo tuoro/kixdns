@@ -1033,14 +1033,7 @@ async fn run_udp_worker(
                         send_udp_response(&socket, &packet_bytes, &send_buf, peer).await;
                     }
                 }
-                Ok(Some(FastPathResponse::AsyncNeeded {
-                    qname,
-                    qtype,
-                    qclass,
-                    tx_id,
-                    edns_present,
-                    pipeline_id,
-                })) => {
+                Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                     // 缓存未命中，使用预解析的数据避免重复解析
                     // Cache miss, use pre-parsed data to avoid re-parsing
                     let permit_mgr = Arc::clone(&engine.permit_manager);
@@ -1063,14 +1056,7 @@ async fn run_udp_worker(
                                     &packet_bytes,
                                     peer,
                                     false,
-                                    PreParsedData::new(
-                                        qname,
-                                        qtype,
-                                        qclass,
-                                        tx_id,
-                                        edns_present,
-                                        pipeline_id,
-                                    ),
+                                    pre_parsed,
                                 ),
                             )
                             .await
@@ -1095,13 +1081,7 @@ async fn run_udp_worker(
                     } else {
                         // 过载保护：permit 耗尽，用预解析数据快速构造 SERVFAIL 并非阻塞发送（背压丢弃）
                         // Overload: permit exhausted, fast SERVFAIL from pre-parsed data with non-blocking send
-                        if let Ok(resp) = engine_helpers::build_servfail_response_fast(
-                            tx_id,
-                            &qname,
-                            qtype,
-                            qclass,
-                            packet_bytes[2] & 0x01 != 0,
-                        ) {
+                        if let Ok(resp) = pre_parsed.servfail(packet_bytes[2] & 0x01 != 0) {
                             try_send_udp_response(&socket, &packet_bytes, &resp, peer);
                         }
                     }
@@ -1299,24 +1279,10 @@ async fn handle_tcp_conn(
                 write_tcp_answer(&writer, &resp_buf).await;
                 continue;
             }
-            Ok(Some(FastPathResponse::AsyncNeeded {
-                qname,
-                qtype,
-                qclass,
-                tx_id,
-                edns_present,
-                pipeline_id,
-            })) => {
+            Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                 // 缓存未命中：使用预解析数据避免重复解析
                 // Cache miss: use pre-parsed data to avoid re-parsing
-                Some(PreParsedData::new(
-                    qname,
-                    qtype,
-                    qclass,
-                    tx_id,
-                    edns_present,
-                    pipeline_id,
-                ))
+                Some(pre_parsed)
             }
             // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
             Ok(None) => None,
@@ -1786,6 +1752,12 @@ mod tests {
         assert_eq!(response.metadata.id, 0xCAFE);
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(response.queries.len(), 1);
+        // 过载时的 SERVFAIL 照查询带回 RD 位和问题 / The overload SERVFAIL carries the query's RD bit and question
+        assert!(response.metadata.recursion_desired);
+        assert_eq!(
+            response.queries,
+            Message::from_bytes(&dns_query()).unwrap().queries
+        );
 
         client.send_to(&[0x12, 0x34], server_addr).await.unwrap();
         assert!(

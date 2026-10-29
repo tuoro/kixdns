@@ -37,7 +37,7 @@ use super::response::build_fast_static_response;
 use super::response_log::{ResponseInfo, ResponseLog};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse, build_cache_namespaces};
-use super::utils::{InflightCleanupGuard, engine_helpers, is_refreshing};
+use super::utils::{InflightCleanupGuard, engine_helpers};
 use crate::cache::CachedQuestion;
 use crate::ecs_scope::EcsReach;
 use crate::engine::refresh::RefreshTarget;
@@ -85,7 +85,7 @@ pub struct CacheKeys {
 
 /// Pre-parsed data from handle_packet_fast to avoid re-parsing
 /// 来自 handle_packet_fast 的预解析数据，避免重新解析
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreParsedData {
     qname: String,
     qtype: hickory_proto::rr::RecordType,
@@ -111,6 +111,19 @@ impl PreParsedData {
             edns_present,
             pipeline_id,
         }
+    }
+
+    /// 直接用预解析的内容构造 SERVFAIL，不必再解析请求；RD 位照查询的 `recursion_desired`
+    /// A SERVFAIL built straight from the pre-parsed query, with no parse of the request;
+    /// RD as the query's `recursion_desired`
+    pub fn servfail(&self, recursion_desired: bool) -> anyhow::Result<Bytes> {
+        engine_helpers::build_servfail_response_fast(
+            self.tx_id,
+            &self.qname,
+            u16::from(self.qtype),
+            u16::from(self.qclass),
+            recursion_desired,
+        )
     }
 }
 
@@ -573,6 +586,20 @@ impl Engine {
         // Use unchecked conversion for performance (qname_bytes is validated UTF-8)
         // 使用未检查转换以提高性能（qname_bytes 是已验证的 UTF-8）
         let qname_str = q.qname_str_unchecked();
+        let (pipeline_opt, pipeline_id) = select_pipeline(
+            cfg,
+            &PipelineSelectionContext {
+                qname: qname_str,
+                client_ip: peer.ip(),
+                qclass,
+                edns_present: q.edns_present,
+                qtype,
+                listener_label: &self.listener_label,
+                geosite_manager: Some(&self.geosite_manager),
+                geoip_manager: Some(&self.geoip_manager),
+            },
+        );
+
         // RFC 6891 第 6.1.3 节：不支持请求的 EDNS 版本时回 BADVERS，而不是照版本 0 去答
         // RFC 6891 section 6.1.3: an unsupported EDNS version is answered BADVERS rather
         // than as if it were version 0
@@ -594,21 +621,19 @@ impl Engine {
                     },
                 );
             }
+            // 和完整路径一样记一条响应日志，pipeline 是选中的那个
+            // A response record as the full path writes, with the pipeline picked
+            let mut log = ResponseLog::new(
+                qname_str,
+                qtype,
+                peer,
+                pipeline_id.clone(),
+                log_start,
+                false,
+            );
+            log.answered(&reply);
             return Ok(Some(FastPathResponse::Direct(reply)));
         }
-        let (pipeline_opt, pipeline_id) = select_pipeline(
-            cfg,
-            &PipelineSelectionContext {
-                qname: qname_str,
-                client_ip: peer.ip(),
-                qclass,
-                edns_present: q.edns_present,
-                qtype,
-                listener_label: &self.listener_label,
-                geosite_manager: Some(&self.geosite_manager),
-                geoip_manager: Some(&self.geoip_manager),
-            },
-        );
 
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
         let cache_namespace = state.cache_namespace(&pipeline_id);
@@ -671,16 +696,10 @@ impl Engine {
                         * cfg.settings.cache_refresh_threshold_percent as u64)
                         / 100;
 
-                    // Only an entry due for a refresh needs its mark looked up
-                    // 只有到了刷新时机的条目才需要查它的刷新标记
-                    // OPTIMIZATION: Hybrid bloom filter + DashSet check / 优化：混合布隆过滤器 + DashSet 检查
+                    // 已经在刷新的由 spawn_background_refresh 认出来（见 `RefreshingGuard`）
+                    // One already being refreshed is told by spawn_background_refresh (see
+                    // `RefreshingGuard`)
                     let due = remaining_ttl as u64 <= threshold;
-                    let is_refreshing = due
-                        && is_refreshing(
-                            &self.refreshing_bitmap,
-                            &self.refreshing_set,
-                            RefreshTarget::mark_of(slot, &hit.reach),
-                        );
 
                     tracing::debug!(
                         original_ttl = hit.original_ttl,
@@ -690,14 +709,13 @@ impl Engine {
                         threshold_percent = cfg.settings.cache_refresh_threshold_percent,
                         threshold_value = threshold,
                         min_ttl = cfg.settings.cache_refresh_min_ttl,
-                        is_refreshing = is_refreshing,
-                        should_trigger = due && !is_refreshing,
+                        should_trigger = due,
                         upstream = ?hit.upstream,
                         qname = %q.qname_str_unchecked(),  // Use unchecked for performance / 使用未检查版本以提高性能
                         "cache background refresh check"
                     );
 
-                    if due && !is_refreshing {
+                    if due {
                         // Trigger background refresh (async, don't block current request)
                         // 触发后台刷新（异步，不阻塞当前请求）
                         // Note: RefreshingGuard inside spawn_background_refresh will handle cleanup
@@ -899,14 +917,14 @@ impl Engine {
         // Cache miss, need async processing / 缓存未命中，需要异步处理
         // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
         // 返回 AsyncNeeded 包含预解析数据，避免在 handle_packet 中重新解析
-        Ok(Some(FastPathResponse::AsyncNeeded {
-            qname: qname_str.to_string(),
-            qtype: q.qtype,
-            qclass: q.qclass,
-            tx_id: q.tx_id,
-            edns_present: q.edns_present,
+        Ok(Some(FastPathResponse::AsyncNeeded(PreParsedData::new(
+            qname_str.to_string(),
+            q.qtype,
+            q.qclass,
+            q.tx_id,
+            q.edns_present,
             pipeline_id,
-        }))
+        ))))
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
@@ -1383,14 +1401,11 @@ impl Engine {
                         upstream,
                         pre_split_upstreams: pre_split,
                         response_matchers: Vec::new(),
-                        response_matcher_operator: crate::config::MatchOperator::And,
                         response_actions_on_match: Vec::new(),
                         response_actions_on_miss: Vec::new(),
                         rule_name: Arc::from("default"),
                         transport: Some(Transport::Udp),
                         ecs: None,
-                        continue_on_match: false,
-                        continue_on_miss: false,
                         allow_reuse: false,
                     };
                     if let Some((observer, ctx)) = observed_ctx {
@@ -1622,8 +1637,6 @@ impl Engine {
                                 flags,
                                 reach: &trail,
                                 min_ttl,
-                                start,
-                                peer: &peer,
                                 uses_client_ip: current_uses_client_ip,
                             },
                             rcode,
@@ -1634,14 +1647,11 @@ impl Engine {
                         upstream,
                         pre_split_upstreams,
                         response_matchers,
-                        response_matcher_operator: _,
                         response_actions_on_match,
                         response_actions_on_miss,
                         rule_name,
                         transport,
                         ecs,
-                        continue_on_match: _,
-                        continue_on_miss: _,
                         allow_reuse,
                     } => {
                         let res = phases::handle_forward_decision_logged(
@@ -1688,12 +1698,12 @@ impl Engine {
                             Ok(phases::ForwardResult::Fallback(bytes)) => return Ok(bytes),
                             Ok(phases::ForwardResult::Success(bytes)) => {
                                 // After a refresh continued past an answer and then
-                                // jumped, the answer is not stored under `refresh_key`:
+                                // jumped, the answer is not stored in the refreshed slot:
                                 // unless it is a failure (SERVFAIL, a truncated answer,
                                 // or the target's stale answer served on one, the only
                                 // cache hit a refresh can have), the entry there no
                                 // longer matches the rules.
-                                // 刷新越过一个应答又跳转之后，应答不会存进 `refresh_key`：
+                                // 刷新越过一个应答又跳转之后，应答不会存进被刷新的槽位：
                                 // 只要不是失败（SERVFAIL、截断的应答，或失败时返回的目标旧
                                 // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
                                 // 对不上。
@@ -1891,8 +1901,8 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
 
-        // Generate unique TXID (not 0!)
-        // 生成唯一的 TXID（不是 0！）
+        // A TXID from the request counter, which wraps through 0 like any other value
+        // 从请求计数器取 TXID，回绕时和别的值一样会经过 0
         let tx_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed) as u16;
 
         // Build DNS query message
@@ -1945,11 +1955,10 @@ use super::phases;
 #[allow(unnameable_test_items)]
 mod tests {
     use super::*;
-    use crate::config::{Action, GlobalSettings, MatchOperator};
+    use crate::config::{Action, GlobalSettings};
     use crate::engine::response::*;
     use crate::engine::rules::*;
     use crate::engine::types::{InflightEntry, InflightQuestion};
-    use crate::matcher::RuntimeResponseMatcherWithOp;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, UpdateMessage};
     use hickory_proto::rr::RecordType;
     use hickory_proto::rr::{RData, Record};
@@ -3502,7 +3511,6 @@ mod tests {
     // ========================================================================
     // Original Engine Tests / 原有引擎测试
     // ========================================================================
-    use crate::matcher::RuntimeResponseMatcher;
     use std::net::Ipv4Addr;
     use tokio::time::Duration;
 
@@ -4043,7 +4051,6 @@ mod tests {
             Decision::Forward {
                 upstream,
                 response_matchers,
-                response_matcher_operator,
                 ..
             } => {
                 assert_eq!(
@@ -4057,7 +4064,7 @@ mod tests {
                     "Forward should have one response matcher"
                 );
                 assert_eq!(
-                    response_matcher_operator,
+                    response_matchers[0].operator,
                     crate::config::MatchOperator::And,
                     "Forward should use AND operator"
                 );
@@ -4193,23 +4200,16 @@ mod tests {
             raw: Bytes::from_static(b"resp"),
             msg,
             upstream: Arc::from(TEST_UPSTREAM),
-            transport: Transport::Udp,
         }
     }
 
     #[tokio::test]
-    async fn response_actions_allow_returns_upstream_on_match() {
+    async fn response_actions_allow_returns_the_upstream_answer() {
         // Arrange: Build test engine and response context
         let engine = build_test_engine();
         let ctx = build_response_context();
         let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Allow];
-        let response_matchers = vec![RuntimeResponseMatcherWithOp {
-            operator: MatchOperator::And,
-            matcher: RuntimeResponseMatcher::ResponseType {
-                value: RecordType::A,
-            },
-        }];
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -4221,10 +4221,8 @@ mod tests {
             req: &req,
             packet: &packet,
             upstream_timeout: Duration::from_secs(1),
-            response_matchers: &response_matchers,
             qname: "example.com",
             qtype: RecordType::A,
-            qclass: DNSClass::IN,
             client_ip,
             upstream_default: TEST_UPSTREAM,
             pipeline_id: "pipeline",
@@ -4274,10 +4272,8 @@ mod tests {
             req: &req,
             packet: &packet,
             upstream_timeout: Duration::from_secs(1),
-            response_matchers: &[],
             qname: "example.com",
             qtype: RecordType::A,
-            qclass: DNSClass::IN,
             client_ip: "10.0.0.1".parse().unwrap(),
             upstream_default: TEST_UPSTREAM,
             pipeline_id: "pipeline",
@@ -4311,10 +4307,8 @@ mod tests {
             req: &req,
             packet: &packet,
             upstream_timeout: Duration::from_secs(1),
-            response_matchers: &[],
             qname: "example.com",
             qtype: RecordType::A,
-            qclass: DNSClass::IN,
             client_ip,
             upstream_default: TEST_UPSTREAM,
             pipeline_id: "pipeline",
@@ -4339,18 +4333,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_actions_allow_keeps_the_answer_when_matchers_fail() {
+    async fn response_actions_allow_after_a_log_keeps_the_answer() {
         // Arrange: Build test engine and response context with non-matching response matcher
         let engine = build_test_engine();
         let ctx = build_response_context();
         let req = Message::new(0, MessageType::Query, OpCode::Query);
-        let actions = [Action::Allow];
-        let response_matchers = vec![RuntimeResponseMatcherWithOp {
-            operator: MatchOperator::And,
-            matcher: RuntimeResponseMatcher::ResponseType {
-                value: RecordType::AAAA,
-            },
-        }];
+        let actions = [Action::Log { level: None }, Action::Allow];
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -4362,10 +4350,8 @@ mod tests {
             req: &req,
             packet: &packet,
             upstream_timeout: Duration::from_secs(1),
-            response_matchers: &response_matchers,
             qname: "example.com",
             qtype: RecordType::A,
-            qclass: DNSClass::IN,
             client_ip,
             upstream_default: TEST_UPSTREAM,
             pipeline_id: "pipeline",
@@ -4397,7 +4383,6 @@ mod tests {
         let engine = build_test_engine();
         let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Deny];
-        let response_matchers: Vec<RuntimeResponseMatcherWithOp> = Vec::new();
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -4409,10 +4394,8 @@ mod tests {
             req: &req,
             packet: &packet,
             upstream_timeout: Duration::from_secs(1),
-            response_matchers: &response_matchers,
             qname: "example.com",
             qtype: RecordType::A,
-            qclass: DNSClass::IN,
             client_ip,
             upstream_default: TEST_UPSTREAM,
             pipeline_id: "pipeline",
@@ -4445,7 +4428,6 @@ mod tests {
         let actions = [Action::StaticIpResponse {
             ip: "192.0.2.1,2001:db8::1,192.0.2.2".to_string(),
         }];
-        let response_matchers: Vec<RuntimeResponseMatcherWithOp> = Vec::new();
         let packet = [0u8];
         let client_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
@@ -4457,10 +4439,8 @@ mod tests {
                 req: &req,
                 packet: &packet,
                 upstream_timeout: Duration::from_secs(1),
-                response_matchers: &response_matchers,
                 qname: "example.com",
                 qtype,
-                qclass: DNSClass::IN,
                 client_ip,
                 upstream_default: TEST_UPSTREAM,
                 pipeline_id: "pipeline",
@@ -4533,7 +4513,6 @@ mod tests {
             target: "origin.example.".to_string(),
             ttl: Some(60),
         }];
-        let response_matchers: Vec<RuntimeResponseMatcherWithOp> = Vec::new();
         let packet = req.to_vec().unwrap();
         let ctx = crate::engine::rules::ApplyResponseActionsContext {
             engine: &engine,
@@ -4542,10 +4521,8 @@ mod tests {
             req: &req,
             packet: &packet,
             upstream_timeout: Duration::from_secs(1),
-            response_matchers: &response_matchers,
             qname: "alias.example",
             qtype: RecordType::A,
-            qclass: DNSClass::IN,
             client_ip: "10.0.0.1".parse().unwrap(),
             upstream_default: TEST_UPSTREAM,
             pipeline_id: "pipeline",
@@ -4583,7 +4560,6 @@ mod tests {
             RecordType::A,
         ));
         let packet = request.to_vec().unwrap();
-        let peer = "10.0.0.1:53000".parse().unwrap();
         let (rcode, answers) = make_static_ip_answer("example.com", RecordType::A, "192.0.2.1");
 
         // Act: uses_client_ip=true must NOT write into dns_cache (client isolation)
@@ -4596,8 +4572,6 @@ mod tests {
             slot: 4242,
             reach: &EcsReach::default(),
             min_ttl: Duration::from_secs(60),
-            start: Instant::now(),
-            peer: &peer,
             uses_client_ip: true,
         };
         phases::handle_static_decision(&engine, &ctx, rcode, answers.clone())
@@ -4619,8 +4593,6 @@ mod tests {
             slot: 4243,
             reach: &EcsReach::default(),
             min_ttl: Duration::from_secs(60),
-            start: Instant::now(),
-            peer: &peer,
             uses_client_ip: false,
         };
         phases::handle_static_decision(&engine, &ctx_plain, rcode, answers)
@@ -4732,7 +4704,7 @@ mod tests {
             Some(FastPathResponse::CacheHit { .. }) => {
                 panic!("Expired cache entry should not be served as CacheHit");
             }
-            Some(FastPathResponse::AsyncNeeded { .. }) => { /* correct: requery needed */ }
+            Some(FastPathResponse::AsyncNeeded(_)) => { /* correct: requery needed */ }
             Some(FastPathResponse::Direct(_)) => {
                 panic!("Expired cache should not produce a Direct response");
             }
@@ -5471,7 +5443,7 @@ mod tests {
             });
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while is_refreshing(&engine.refreshing_bitmap, &engine.refreshing_set, mark) {
+                    while engine.refreshing_set.contains(&mark) {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
@@ -5492,7 +5464,7 @@ mod tests {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
         let renewed = stale_entry("default");
         let mark = RefreshTarget::mark_of(dedupe_hash, &renewed.reach);
-        let marked = || is_refreshing(&engine.refreshing_bitmap, &engine.refreshing_set, mark);
+        let marked = || engine.refreshing_set.contains(&mark);
         engine.spawn_background_refresh(
             engine.state.load_full(),
             &renewed,

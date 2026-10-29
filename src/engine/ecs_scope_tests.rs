@@ -593,7 +593,7 @@ async fn the_fast_path_hands_out_no_other_clients_subnet() {
     reply(&passing, "10.0.0.1", None).await;
     assert!(matches!(
         passing.handle_packet_fast(&query(Some(("198.51.100.0", 24))), peer("10.0.0.1")),
-        Ok(Some(FastPathResponse::AsyncNeeded { .. }))
+        Ok(Some(FastPathResponse::AsyncNeeded(_)))
     ));
     assert_eq!(
         ask(&passing, "10.0.0.1", Some(("198.51.100.0", 24))).await,
