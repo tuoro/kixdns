@@ -159,7 +159,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kixdns::config::load_config_with_source;
-use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers};
+use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, write_cache_hit};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::ClientTransport;
 use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
@@ -346,10 +346,6 @@ async fn run_dns_server(
     let listeners = cfg.settings.listeners()?;
     let bind_addr = listeners.udp;
     let bind_tcp = listeners.tcp;
-    // 在 cfg 被 move 到 Engine 之前提取 DoH 配置 / Extract DoH config before cfg is moved into Engine
-    let doh_config: Option<(SocketAddr, String, String, String)> = listeners
-        .doh
-        .map(|doh| (doh.bind, doh.tls_cert, doh.tls_key, doh.path));
 
     // The enhanced build installs the panel observer in the single observer
     // slot; it forwards to the --debug reference observer itself / 增强版在唯一的观察者槽位安装面板观察者，由它自行转发给 --debug 参考观察者
@@ -409,27 +405,21 @@ async fn run_dns_server(
         // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
         // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
 
-        // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
-        // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
-        // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
-        // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
-
         // 根据配置地址决定创建哪种 socket / Determine which socket type to create based on config
         // IPv6 unspecified address (::) 需要同时创建 IPv4 和 IPv6 socket
         // IPv6 other addresses 只创建 IPv6 socket
         // IPv4 addresses 只创建 IPv4 socket
-        let needs_ipv4 =
-            bind_addr.is_ipv4() || (bind_addr.is_ipv6() && bind_addr.ip().is_unspecified());
+        let ipv4_addr = ipv4_listen_addr(bind_addr);
         let needs_ipv6 = bind_addr.is_ipv6();
+        let workers_per_family = if ipv4_addr.is_some() && needs_ipv6 {
+            udp_workers_final.div_ceil(2)
+        } else {
+            udp_workers_final
+        };
 
-        if needs_ipv4 {
-            let workers_per_family = if needs_ipv6 {
-                udp_workers_final.div_ceil(2)
-            } else {
-                udp_workers_final
-            };
-            spawn_ipv4_udp_workers(
-                bind_addr,
+        if let Some(ipv4_addr) = ipv4_addr {
+            spawn_udp_workers(
+                ipv4_addr,
                 workers_per_family,
                 engine.clone(),
                 &mut all_handles,
@@ -437,12 +427,7 @@ async fn run_dns_server(
         }
 
         if needs_ipv6 {
-            let workers_per_family = if needs_ipv4 {
-                udp_workers_final.div_ceil(2)
-            } else {
-                udp_workers_final
-            };
-            spawn_ipv6_udp_workers(
+            spawn_udp_workers(
                 bind_addr,
                 workers_per_family,
                 engine.clone(),
@@ -477,25 +462,7 @@ async fn run_dns_server(
             }
         }
 
-        // Set buffer sizes to prevent packet loss under load
-        // Try 4MB first, then fall back to 1MB if it fails
-        let desired_size = 4 * 1024 * 1024;
-        let fallback_size = 1024 * 1024;
-
-        if let Err(e) = socket.set_recv_buffer_size(desired_size) {
-            debug!(
-                "failed to set udp recv buffer to {} bytes: {}, trying {}",
-                desired_size, e, fallback_size
-            );
-            let _ = socket.set_recv_buffer_size(fallback_size);
-        }
-        if let Err(e) = socket.set_send_buffer_size(desired_size) {
-            debug!(
-                "failed to set udp send buffer to {} bytes: {}, trying {}",
-                desired_size, e, fallback_size
-            );
-            let _ = socket.set_send_buffer_size(fallback_size);
-        }
+        set_udp_buffers(&socket);
 
         socket.set_nonblocking(true).context("set nonblocking")?;
         socket.bind(&bind_addr.into()).context("bind socket")?;
@@ -515,28 +482,11 @@ async fn run_dns_server(
 
     // TCP listener / TCP 监听器
     // ✅ 双 socket 方案，与 UDP 行为一致 / Dual-socket approach, consistent with UDP
-    let needs_ipv4_tcp =
-        bind_tcp.is_ipv4() || (bind_tcp.is_ipv6() && bind_tcp.ip().is_unspecified());
-
     // --- 启动 IPv4 TCP 监听 / Start IPv4 TCP listener ---
-    if needs_ipv4_tcp {
-        let addr = if bind_tcp.is_ipv4() {
-            bind_tcp
-        } else {
-            SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-                bind_tcp.port(),
-            )
-        };
+    if let Some(addr) = ipv4_listen_addr(bind_tcp) {
         // 纯 IPv4 绑定，不受 bindv6only 影响 / Pure IPv4 bind, unaffected by bindv6only
         let listener = TcpListener::bind(addr).await.context("bind ipv4 tcp")?;
-        let engine = engine.clone();
-        let h = tokio::spawn(async move {
-            if let Err(err) = run_tcp(listener, engine).await {
-                error!(error = %err, "ipv4 tcp server exited");
-            }
-        });
-        all_handles.push(h);
+        all_handles.push(spawn_tcp(listener, engine.clone(), "ipv4"));
     }
 
     // --- 启动 IPv6 TCP 监听 / Start IPv6 TCP listener ---
@@ -558,21 +508,16 @@ async fn run_dns_server(
         socket.set_nonblocking(true)?;
 
         let listener = TcpListener::from_std(socket.into())?;
-        let engine = engine.clone();
-        let h = tokio::spawn(async move {
-            if let Err(err) = run_tcp(listener, engine).await {
-                error!(error = %err, "ipv6 tcp server exited");
-            }
-        });
-        all_handles.push(h);
+        all_handles.push(spawn_tcp(listener, engine.clone(), "ipv6"));
     }
 
     // DoH listener — 仅在配置了 bind_doh 时启动 / DoH listener — only if bind_doh is configured
-    if let Some((doh_addr, cert_path, key_path, doh_path)) = doh_config {
+    if let Some(doh) = listeners.doh {
         let engine = engine.clone();
         let h = tokio::spawn(async move {
             if let Err(err) =
-                kixdns::doh_server::run_doh(doh_addr, &cert_path, &key_path, engine, doh_path).await
+                kixdns::doh_server::run_doh(doh.bind, &doh.tls_cert, &doh.tls_key, engine, doh.path)
+                    .await
             {
                 error!(error = %err, "DoH server exited");
             }
@@ -722,26 +667,49 @@ fn journal_priority(level: tracing::Level) -> u8 {
     }
 }
 
-// 为 IPv4 地址创建并启动 UDP workers / Create and spawn UDP workers for IPv4 address
+/// 要单独监听的 IPv4 地址：IPv4 地址本身，或者 `[::]` 的同伴 `0.0.0.0`（端口相同）；别的 IPv6 地址
+/// 没有
+/// The IPv4 address to listen on separately: an IPv4 address itself, or `0.0.0.0` on the
+/// same port as the twin of `[::]`; other IPv6 addresses have none
+fn ipv4_listen_addr(addr: SocketAddr) -> Option<SocketAddr> {
+    match addr {
+        SocketAddr::V4(_) => Some(addr),
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => Some(SocketAddr::new(
+            std::net::Ipv4Addr::UNSPECIFIED.into(),
+            addr.port(),
+        )),
+        SocketAddr::V6(_) => None,
+    }
+}
+
+/// 在 `listener` 上跑 TCP 服务；`family` 是日志里的地址族
+/// Run the TCP server on `listener`; `family` names the address family in the logs
+fn spawn_tcp(
+    listener: TcpListener,
+    engine: Engine,
+    family: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = run_tcp(listener, engine).await {
+            error!(error = %err, "{family} tcp server exited");
+        }
+    })
+}
+
+// 为一个地址创建并启动 UDP workers / Create and spawn UDP workers for one address
 #[cfg(unix)]
-fn spawn_ipv4_udp_workers(
-    bind_addr: SocketAddr,
+fn spawn_udp_workers(
+    addr: SocketAddr,
     worker_count: usize,
     engine: Engine,
     all_handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
-    let ipv4_addr: SocketAddr = if bind_addr.is_ipv4() {
-        bind_addr
+    let (family, lowercase) = if addr.is_ipv4() {
+        ("IPv4", "ipv4")
     } else {
-        // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
-        // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
-        SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-            bind_addr.port(),
-        )
+        ("IPv6", "ipv6")
     };
-
-    info!(bind_addr = %ipv4_addr, workers = worker_count, "Starting IPv4 UDP workers");
+    info!(bind_addr = %addr, workers = worker_count, "Starting {family} UDP workers");
 
     // ✅ Per-worker SO_REUSEPORT_LB sockets: each worker gets its own fd.
     // On FreeBSD, SO_REUSEPORT_LB enables kernel hash-based packet distribution
@@ -756,51 +724,12 @@ fn spawn_ipv4_udp_workers(
     // 无 Arc<UdpSocket> 共享，无 reactor 惊群效应。
     for worker_id in 0..worker_count {
         let engine = engine.clone();
-        let std_socket = create_reuseport_udp_socket(ipv4_addr)
-            .with_context(|| format!("create ipv4 udp socket for worker {}", worker_id))?;
+        let std_socket = create_reuseport_udp_socket(addr)
+            .with_context(|| format!("create {lowercase} udp socket for worker {worker_id}"))?;
         let socket = Arc::new(UdpSocket::from_std(std_socket)?);
         let handle = tokio::spawn(async move {
             if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                error!(worker_id, error = %err, "IPv4 udp worker exited");
-            }
-        });
-        all_handles.push(handle);
-    }
-
-    Ok(())
-}
-
-// 为 IPv6 地址创建并启动 UDP workers / Create and spawn UDP workers for IPv6 address
-#[cfg(unix)]
-fn spawn_ipv6_udp_workers(
-    bind_addr: SocketAddr,
-    worker_count: usize,
-    engine: Engine,
-    all_handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<()> {
-    let ipv6_addr: SocketAddr = if bind_addr.is_ipv6() {
-        bind_addr
-    } else {
-        // 预编译的常量地址，避免 unwrap / Precompiled constant address, avoid unwrap
-        // 使用配置中的端口号而非硬编码 / Use port from config instead of hardcoded
-        SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)),
-            bind_addr.port(),
-        )
-    };
-
-    info!(bind_addr = %ipv6_addr, workers = worker_count, "Starting IPv6 UDP workers");
-
-    // ✅ Per-worker SO_REUSEPORT_LB sockets (same rationale as IPv4)
-    // ✅ 每 worker 独立 SO_REUSEPORT_LB socket（同 IPv4）
-    for worker_id in 0..worker_count {
-        let engine = engine.clone();
-        let std_socket = create_reuseport_udp_socket(ipv6_addr)
-            .with_context(|| format!("create ipv6 udp socket for worker {}", worker_id))?;
-        let socket = Arc::new(UdpSocket::from_std(std_socket)?);
-        let handle = tokio::spawn(async move {
-            if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                error!(worker_id, error = %err, "IPv6 udp worker exited");
+                error!(worker_id, error = %err, "{family} udp worker exited");
             }
         });
         all_handles.push(handle);
@@ -849,8 +778,17 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
         }
     }
 
-    // Set buffer sizes to prevent packet loss under load
-    // Try 4MB first, then fall back to 1MB if it fails
+    set_udp_buffers(&socket);
+
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+/// 设置 UDP 收发缓冲区，免得负载高时丢包：先试 4 MiB，设不上再退到 1 MiB
+/// Set the UDP buffer sizes to prevent packet loss under load: 4 MiB first, falling back
+/// to 1 MiB if that fails
+fn set_udp_buffers(socket: &socket2::Socket) {
     let desired_size = 4 * 1024 * 1024;
     let fallback_size = 1024 * 1024;
 
@@ -868,10 +806,6 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
         );
         let _ = socket.set_send_buffer_size(fallback_size);
     }
-
-    socket.set_nonblocking(true)?;
-    socket.bind(&addr.into())?;
-    Ok(socket.into())
 }
 
 /// 发送 UDP 数据报：try_send_to 优先（避免 reactor 开销），WouldBlock 回退异步
@@ -933,7 +867,7 @@ async fn run_udp_worker(
     // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
     use bytes::BytesMut;
     let mut buf = BytesMut::with_capacity(4096);
-    // 复用发送缓冲区：用于缓存命中时 patch TXID，避免每包堆分配 / Reuse send buffer to patch TXID on cache hits, avoiding per-packet heap allocation
+    // 复用发送缓冲区：缓存命中时在这里改 TTL 和 TXID，避免每包堆分配 / Reuse send buffer to patch TTLs and the TXID on cache hits, avoiding per-packet heap allocation
     let mut send_buf = BytesMut::with_capacity(512);
 
     // 自适应流控：每 100 个请求检查一次是否需要调整 permits
@@ -995,150 +929,66 @@ async fn run_udp_worker(
                     tx_id,
                     inserted_at,
                 })) => {
-                    // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                    let elapsed =
-                        kixdns::proto_utils::saturating_u64_to_u32(inserted_at.elapsed().as_secs());
-
-                    if elapsed == 0 && cached.len() >= 2 {
-                        // Fast path: TTL hasn't decayed, only TXID (2 bytes) needs patching.
-                        // Copy to reusable send_buf, patch TXID only, use try_send_to
-                        // (non-blocking) to avoid tokio reactor overhead. Falls back to
-                        // async send_to on EAGAIN.
-                        //
-                        // 快速路径：TTL 未衰减，只需 patch TXID（2 字节）。
-                        // 拷贝到复用的 send_buf，仅 patch TXID，使用 try_send_to（非阻塞）
-                        // 避免 tokio reactor 开销。EAGAIN 时回退到异步 send_to。
-                        send_buf.clear();
-                        send_buf.extend_from_slice(&cached);
-                        let id_bytes = tx_id.to_be_bytes();
-                        send_buf[0] = id_bytes[0];
-                        send_buf[1] = id_bytes[1];
-                        send_udp_response(&socket, &packet_bytes, &send_buf, peer).await;
-                    } else {
-                        // Slow path: TTL has decayed, must patch all TTLs in-place.
-                        // 慢速路径：TTL 已衰减，必须原地 patch 所有 TTL。
-                        send_buf.clear();
-                        if send_buf.capacity() < cached.len() {
-                            send_buf.reserve(cached.len() - send_buf.capacity());
-                        }
-                        send_buf.extend_from_slice(&cached);
-                        if elapsed > 0 {
-                            kixdns::proto_utils::patch_all_ttls(&mut send_buf, elapsed);
-                        }
-                        if send_buf.len() >= 2 {
-                            let id_bytes = tx_id.to_be_bytes();
-                            send_buf[0] = id_bytes[0];
-                            send_buf[1] = id_bytes[1];
-                        }
-                        send_udp_response(&socket, &packet_bytes, &send_buf, peer).await;
-                    }
+                    write_cache_hit(&mut send_buf, &cached, tx_id, inserted_at);
+                    send_udp_response(&socket, &packet_bytes, &send_buf, peer).await;
                 }
                 Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                     // 缓存未命中，使用预解析的数据避免重复解析
                     // Cache miss, use pre-parsed data to avoid re-parsing
-                    let permit_mgr = Arc::clone(&engine.permit_manager);
-                    let timeout_ms = engine.get_request_timeout_ms();
-                    let timeout_dur = Duration::from_millis(timeout_ms);
-
-                    // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
-                    if let Some(permit) = permit_mgr.try_acquire() {
-                        let engine = engine.clone();
-                        let socket = Arc::clone(&socket);
-                        let packet_bytes = packet_bytes.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit; // 自动释放 / Auto-release on drop
-
-                            // ✅ 传递预解析数据给 handle_packet_internal，避免重复解析
-                            // ✅ Pass pre-parsed data to handle_packet_internal to avoid re-parsing
-                            match tokio::time::timeout(
-                                timeout_dur,
-                                engine.handle_packet_internal_with_pre_parsed(
-                                    &packet_bytes,
-                                    peer,
-                                    false,
-                                    pre_parsed,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(Ok(resp)) => {
-                                    send_udp_response(&socket, &packet_bytes, &resp, peer).await;
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(error = %e, "handle_packet error, returning SERVFAIL");
-                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        timeout_ms,
-                                        upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                                        "request timeout after hedge and fallback exhausted"
-                                    );
-                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
-                                }
-                            }
-                        });
-                    } else {
-                        // 过载保护：permit 耗尽，用预解析数据快速构造 SERVFAIL 并非阻塞发送（背压丢弃）
-                        // Overload: permit exhausted, fast SERVFAIL from pre-parsed data with non-blocking send
-                        if let Ok(resp) = pre_parsed.servfail(packet_bytes[2] & 0x01 != 0) {
-                            try_send_udp_response(&socket, &packet_bytes, &resp, peer);
-                        }
-                    }
+                    spawn_udp_answer(&engine, &socket, packet_bytes, peer, Some(pre_parsed));
                 }
                 Ok(None) => {
                     // 快速解析失败，回退到完整处理
                     // Fast parse failed, fallback to full processing
-                    let permit_mgr = Arc::clone(&engine.permit_manager);
-                    let timeout_ms = engine.get_request_timeout_ms();
-                    let timeout_dur = Duration::from_millis(timeout_ms);
-
-                    // 非阻塞式 try_acquire，避免在接收循环中 await / Non-blocking try_acquire to avoid await in receive loop
-                    if let Some(permit) = permit_mgr.try_acquire() {
-                        let engine = engine.clone();
-                        let socket = Arc::clone(&socket);
-                        let packet_bytes = packet_bytes.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit; // 自动释放 / Auto-release on drop
-                            match tokio::time::timeout(
-                                timeout_dur,
-                                engine.handle_packet(&packet_bytes, peer),
-                            )
-                            .await
-                            {
-                                Ok(Ok(resp)) => {
-                                    send_udp_response(&socket, &packet_bytes, &resp, peer).await;
-                                }
-                                Ok(Err(e)) => {
-                                    debug!(error = %e, "handle_packet error, returning SERVFAIL");
-                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        timeout_ms,
-                                        upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                                        "request timeout"
-                                    );
-                                    send_udp_servfail(&socket, &packet_bytes, peer).await;
-                                }
-                            }
-                        });
-                    } else {
-                        // 过载保护：permit 耗尽且 parse_quick 已失败（大概率畸形/非标准包）。
-                        // 直接静默丢弃——过载时应做最便宜的拒绝，对已失败包做完整解析
-                        // 只会加剧过载，且 hickory 大概率同样失败（解析白做）。
-                        // Overload: permit exhausted and parse_quick already failed (likely
-                        // malformed/non-standard). Drop silently — overload rejection must be
-                        // cheap, and a full parse of an already-failed packet wastes CPU.
-                    }
+                    spawn_udp_answer(&engine, &socket, packet_bytes, peer, None);
                 }
                 Err(error) => {
-                    debug!(%error, "UDP fast-path error, returning SERVFAIL for valid query");
+                    engine.log_fast_path_error(&error);
                     send_udp_servfail(&socket, &packet_bytes, peer).await;
                 }
             }
         }
     }
+}
+
+/// 要等上游的查询交给单独的任务，在请求时限内回答，答不上回 SERVFAIL。接收循环里不等 permit：没有空闲的
+/// permit 时（过载），快速解析成了的立刻回一个现成的 SERVFAIL，非阻塞发送（发送缓冲满就丢掉，背压）；没成
+/// 的多半是畸形包，静默丢弃——过载时要做最便宜的拒绝，对已经解析失败的包再完整解析一遍只会加重过载，
+/// hickory 大概率同样失败。
+/// A query that waits on an upstream goes to its own task, answered within the request
+/// timeout and SERVFAIL when it cannot be. The receive loop does not wait for a permit:
+/// without a free one (overload), a query the quick parse read gets a ready-made SERVFAIL at
+/// once, sent without blocking (dropped when the send buffer is full, as backpressure); one
+/// it could not read is most likely malformed and dropped silently. Overload rejection must
+/// be cheap, and a full parse of an already-failed packet wastes CPU, as hickory most
+/// likely fails too.
+fn spawn_udp_answer(
+    engine: &Engine,
+    socket: &Arc<UdpSocket>,
+    packet: bytes::Bytes,
+    peer: SocketAddr,
+    pre_parsed: Option<PreParsedData>,
+) {
+    let Some(permit) = engine.permit_manager.try_acquire() else {
+        if let Some(pre_parsed) = pre_parsed
+            && let Ok(response) = pre_parsed.servfail(packet[2] & 0x01 != 0)
+        {
+            try_send_udp_response(socket, &packet, &response, peer);
+        }
+        return;
+    };
+    let engine = engine.clone();
+    let socket = Arc::clone(socket);
+    tokio::spawn(async move {
+        let _permit = permit; // 自动释放 / Auto-release on drop
+        match engine
+            .answer_after_fast_path(&packet, peer, pre_parsed)
+            .await
+        {
+            Some(response) => send_udp_response(&socket, &packet, &response, peer).await,
+            None => send_udp_servfail(&socket, &packet, peer).await,
+        }
+    });
 }
 
 async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
@@ -1221,7 +1071,7 @@ async fn handle_tcp_conn(
             break;
         }
         let frame_len = u16::from_be_bytes(len_buf) as usize;
-        if frame_len == 0 || frame_len > MAX_TCP_FRAME {
+        if frame_len == 0 {
             break;
         }
 
@@ -1260,23 +1110,9 @@ async fn handle_tcp_conn(
                 tx_id,
                 inserted_at,
             })) => {
-                // 缓存命中：patch TXID / Cache hit: patch TXID
-                let mut resp_buf = bytes::BytesMut::with_capacity(cached.len());
-                resp_buf.extend_from_slice(&cached);
-
-                // RFC 1035 §5.2: Patch TTL based on residence time / 根据停留时间修正 TTL
-                let elapsed =
-                    kixdns::proto_utils::saturating_u64_to_u32(inserted_at.elapsed().as_secs());
-                if elapsed > 0 {
-                    kixdns::proto_utils::patch_all_ttls(&mut resp_buf, elapsed);
-                }
-
-                if resp_buf.len() >= 2 {
-                    let id_bytes = tx_id.to_be_bytes();
-                    resp_buf[0] = id_bytes[0];
-                    resp_buf[1] = id_bytes[1];
-                }
-                write_tcp_answer(&writer, &resp_buf).await;
+                let mut answer = bytes::BytesMut::new();
+                write_cache_hit(&mut answer, &cached, tx_id, inserted_at);
+                write_tcp_answer(&writer, &answer).await;
                 continue;
             }
             Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
@@ -1287,7 +1123,7 @@ async fn handle_tcp_conn(
             // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
             Ok(None) => None,
             Err(error) => {
-                debug!(%error, "TCP fast-path error, returning SERVFAIL for valid query");
+                engine.log_fast_path_error(&error);
                 if let Some(response) =
                     engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
                 {
@@ -1304,10 +1140,12 @@ async fn handle_tcp_conn(
         let writer = Arc::clone(&writer);
         pending.spawn(async move {
             let _slot = slot;
-            if let Some(response) =
-                answer_tcp_query(&engine, &packet_bytes, peer, async_needed).await
-            {
-                write_tcp_answer(&writer, &response).await;
+            let answer = engine
+                .answer_after_fast_path(&packet_bytes, peer, async_needed)
+                .await
+                .or_else(|| engine_helpers::try_build_servfail_response_from_wire(&packet_bytes));
+            if let Some(answer) = answer {
+                write_tcp_answer(&writer, &answer).await;
             }
         });
     }
@@ -1317,59 +1155,6 @@ async fn handle_tcp_conn(
     // connection closes, so a half-closed client still gets them
     while pending.join_next().await.is_some() {}
     Ok(())
-}
-
-/// 要等上游的查询：在整体请求时限内回答，出错或超时回 SERVFAIL；连 SERVFAIL 都构造不出时为 None。
-/// `pre_parsed` 为 None 时快速解析没成，走完整处理。
-/// A query that waits on an upstream: answered within the overall request timeout, SERVFAIL on
-/// an error or a timeout; None when not even a SERVFAIL can be built. With `pre_parsed` None
-/// the quick parse failed and the full path runs.
-async fn answer_tcp_query(
-    engine: &Engine,
-    packet: &[u8],
-    peer: SocketAddr,
-    pre_parsed: Option<PreParsedData>,
-) -> Option<bytes::Bytes> {
-    // 每个查询重新取整体请求超时（含 hedge 与 TCP fallback）。RFC 7766 的客户端会把一条连接用很久，
-    // 热重载改了 request_timeout 之后，这条连接上的后续查询必须跟着新值走；UDP 路径本来就是每请求
-    // 读一次。
-    // Re-read the overall request timeout (hedge and TCP fallback included) per query. An RFC
-    // 7766 client keeps one connection open for a long time, so queries that follow a reload
-    // must use the new request_timeout; the UDP path already reads it per request.
-    let timeout_ms = engine.get_request_timeout_ms();
-    let timeout_dur = Duration::from_millis(timeout_ms);
-    let full_path = pre_parsed.is_none();
-    let answered = match pre_parsed {
-        Some(pre_parsed) => {
-            tokio::time::timeout(
-                timeout_dur,
-                engine.handle_packet_internal_with_pre_parsed(packet, peer, false, pre_parsed),
-            )
-            .await
-        }
-        None => tokio::time::timeout(timeout_dur, engine.handle_packet(packet, peer)).await,
-    };
-    match answered {
-        Ok(Ok(response)) => return Some(response),
-        Ok(Err(error)) => {
-            debug!(%error, "TCP request processing error, returning SERVFAIL");
-        }
-        Err(_) if full_path => {
-            warn!(
-                timeout_ms,
-                upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                "TCP request timeout"
-            );
-        }
-        Err(_) => {
-            warn!(
-                timeout_ms,
-                upstream_timeout_ms = engine.get_upstream_timeout_ms(),
-                "TCP request timeout after hedge and fallback exhausted"
-            );
-        }
-    }
-    engine_helpers::try_build_servfail_response_from_wire(packet)
 }
 
 /// 写回一个回答：长度前缀加正文一次写完，写端加锁，不会和别的回答穿插。写不出去或 [`TCP_READ_TIMEOUT`]
@@ -1583,25 +1368,8 @@ mod tests {
             .expect("udp answer")
             .unwrap();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (server_stream, peer) = listener.accept().await.unwrap();
-        let connection = tokio::spawn(handle_tcp_conn(server_stream, peer, engine.clone()));
-        let query = dns_query();
-        client
-            .write_all(&(query.len() as u16).to_be_bytes())
-            .await
-            .unwrap();
-        client.write_all(&query).await.unwrap();
-        let mut len_buf = [0u8; 2];
-        client
-            .read_exact(&mut len_buf)
-            .await
-            .expect("length prefix");
-        let mut response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
-        client.read_exact(&mut response).await.expect("dns frame");
+        let (mut client, connection) = tcp_connection(engine.clone()).await;
+        tcp_exchange(&mut client, &dns_query()).await;
 
         assert_eq!(
             *recorder.0.lock().unwrap(),
@@ -1612,13 +1380,7 @@ mod tests {
     }
 
     fn dns_query() -> Vec<u8> {
-        let mut message = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
-        message.metadata.recursion_desired = true;
-        message.add_query(Query::query(
-            Name::from_str("data.xiaoheihe.cn").unwrap(),
-            RecordType::A,
-        ));
-        message.to_vec().unwrap()
+        query("data.xiaoheihe.cn", 0xCAFE)
     }
 
     #[tokio::test]
@@ -1790,15 +1552,7 @@ mod tests {
 
     #[tokio::test]
     async fn udp_hanging_doh_returns_servfail() {
-        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let blackhole_addr = blackhole.local_addr().unwrap();
-        let blackhole_task = tokio::spawn(async move {
-            if let Ok((_stream, _)) = blackhole.accept().await {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
-
-        let upstream = format!("https://{blackhole_addr}/dns-query");
+        let upstream = format!("https://{}/dns-query", spawn_silent_upstream().await);
         let engine = doh_timeout_engine(&upstream);
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
@@ -1818,7 +1572,6 @@ mod tests {
         assert_eq!(response.queries.len(), 1);
 
         worker.abort();
-        blackhole_task.abort();
     }
 
     /// 只连接不发数据的客户端此前可以永久占用一个任务和一个文件描述符；
@@ -1860,16 +1613,7 @@ mod tests {
         // 只接不答的上游，让每条查询都跑满整体请求超时
         // An upstream that accepts and never answers, so every query runs the
         // whole request timeout
-        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let blackhole_addr = blackhole.local_addr().unwrap();
-        let blackhole_task = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = blackhole.accept().await {
-                held.push(stream);
-            }
-        });
-
-        let upstream = format!("https://{blackhole_addr}/dns-query");
+        let upstream = format!("https://{}/dns-query", spawn_silent_upstream().await);
         const BEFORE_MS: u64 = 120;
         const AFTER_MS: u64 = 900;
         let engine = Engine::new(doh_timeout_config(&upstream, BEFORE_MS), "test".to_string())
@@ -1897,30 +1641,13 @@ mod tests {
         );
 
         server_task.abort();
-        blackhole_task.abort();
     }
 
     /// 在一条已建立的连接上发一次查询并读回完整应答，返回耗时
     /// Send one query on an established connection, read the whole answer back
     /// and return how long it took
     async fn time_one_tcp_query(client: &mut TcpStream) -> Duration {
-        let query = dns_query();
-        let mut frame = Vec::with_capacity(2 + query.len());
-        frame.extend_from_slice(&(query.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&query);
-
-        let start = std::time::Instant::now();
-        client.write_all(&frame).await.unwrap();
-        let mut len_buf = [0u8; 2];
-        client
-            .read_exact(&mut len_buf)
-            .await
-            .expect("length prefix");
-        let mut response = vec![0u8; u16::from_be_bytes(len_buf) as usize];
-        client.read_exact(&mut response).await.expect("dns frame");
-        let elapsed = start.elapsed();
-
-        let message = Message::from_bytes(&response).unwrap();
+        let (message, elapsed) = tcp_exchange(client, &dns_query()).await;
         assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
         elapsed
     }
@@ -1976,23 +1703,26 @@ mod tests {
 
     /// `name` 的 A 查询，ID 为 `id`，带长度前缀 / An A query for `name` with ID `id`, length-prefixed
     fn tcp_frame(name: &str, id: u16) -> Vec<u8> {
-        let mut request = Message::new(id, MessageType::Query, OpCode::Query);
-        request.metadata.recursion_desired = true;
-        request.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
-        let query = request.to_vec().unwrap();
-        [(query.len() as u16).to_be_bytes().to_vec(), query].concat()
+        let packet = query(name, id);
+        [&(packet.len() as u16).to_be_bytes()[..], &packet].concat()
     }
 
     /// 从连接上读一个回答，返回它的 ID / Reads one answer off the connection and returns its ID
     async fn read_answer_id(client: &mut TcpStream) -> u16 {
+        let answer = read_tcp_answer(client).await;
+        u16::from_be_bytes([answer[0], answer[1]])
+    }
+
+    /// 从连接上读一个回答 / Reads one answer off the connection
+    async fn read_tcp_answer(client: &mut TcpStream) -> Vec<u8> {
         let mut len_buf = [0u8; 2];
         client
             .read_exact(&mut len_buf)
             .await
             .expect("length prefix");
         let mut answer = vec![0u8; u16::from_be_bytes(len_buf) as usize];
-        client.read_exact(&mut answer).await.expect("answer");
-        u16::from_be_bytes([answer[0], answer[1]])
+        client.read_exact(&mut answer).await.expect("dns frame");
+        answer
     }
 
     /// 连在 `engine` 上的一条入站 TCP 连接，和处理它的任务 / An inbound TCP connection to `engine` and the task handling it
@@ -2117,50 +1847,20 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_hanging_doh_returns_complete_servfail_frame() {
-        let blackhole = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let blackhole_addr = blackhole.local_addr().unwrap();
-        let blackhole_task = tokio::spawn(async move {
-            if let Ok((_stream, _)) = blackhole.accept().await {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        });
-
-        let upstream = format!("https://{blackhole_addr}/dns-query");
+        let upstream = format!("https://{}/dns-query", spawn_silent_upstream().await);
         let engine = doh_timeout_engine(&upstream);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let listener_addr = listener.local_addr().unwrap();
-        let client_task = tokio::spawn(async move {
-            let mut client = TcpStream::connect(listener_addr).await.unwrap();
-            let query = dns_query();
-            let mut frame = Vec::with_capacity(2 + query.len());
-            frame.extend_from_slice(&(query.len() as u16).to_be_bytes());
-            frame.extend_from_slice(&query);
-            client.write_all(&frame).await.unwrap();
-
-            let mut len_buf = [0u8; 2];
-            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut len_buf))
-                .await
-                .expect("TCP query should receive a length prefix")
-                .unwrap();
-            let response_len = u16::from_be_bytes(len_buf) as usize;
-            let mut response = vec![0u8; response_len];
-            tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
-                .await
-                .expect("TCP query should receive the complete DNS frame")
-                .unwrap();
-            response
-        });
-
-        let (server_stream, peer) = listener.accept().await.unwrap();
-        let server_task = tokio::spawn(handle_tcp_conn(server_stream, peer, engine));
-        let response_bytes = client_task.await.unwrap();
-        let response = Message::from_bytes(&response_bytes).unwrap();
+        let (mut client, server_task) = tcp_connection(engine).await;
+        let (response, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            tcp_exchange(&mut client, &dns_query()),
+        )
+        .await
+        .expect("TCP query should receive the complete DNS frame");
         assert_eq!(response.metadata.id, 0xCAFE);
         assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(response.queries.len(), 1);
 
         server_task.abort();
-        blackhole_task.abort();
     }
 
     #[tokio::test]
@@ -2207,5 +1907,243 @@ mod tests {
         assert!(resp.metadata.truncation, "TC bit must be set");
         assert_eq!(resp.queries.len(), 1);
         assert_eq!(resp.metadata.id, 0xCAFE);
+    }
+
+    /// 名字为 `name`、ID 为 `id`、带 RD 的 A 查询 / An A query for `name` with ID `id` and RD set
+    fn query(name: &str, id: u16) -> Vec<u8> {
+        let mut request = Message::new(id, MessageType::Query, OpCode::Query);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        request.to_vec().unwrap()
+    }
+
+    /// 快速解析读不了、要从头解析的查询：第一个标签里有一个空格
+    /// A query the quick parse cannot read and the full parse can: a space in its first label
+    fn query_parsed_from_scratch(id: u16) -> Vec<u8> {
+        let mut packet = query("xslow.test", id);
+        // 12 字节的报头之后是第一个标签的长度，再往后是它的第一个字节
+        // The 12-byte header is followed by the first label's length, then its first byte
+        packet[13] = b' ';
+        assert!(kixdns::proto_utils::parse_quick(&packet, &mut [0u8; 256]).is_none());
+        assert!(Message::from_bytes(&packet).is_ok());
+        packet
+    }
+
+    /// 本机 UDP 上游：每个查询回一条 TTL 300 的 A 记录
+    /// A local UDP upstream answering every query with one A record of TTL 300
+    async fn spawn_answering_udp_upstream() -> SocketAddr {
+        use hickory_proto::rr::{RData, Record, rdata::A};
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(query) = Message::from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                let mut answer =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                answer.metadata.recursion_desired = query.metadata.recursion_desired;
+                answer.metadata.recursion_available = true;
+                for question in query.queries {
+                    answer.add_answer(Record::from_rdata(
+                        question.name().clone(),
+                        300,
+                        RData::A(A(std::net::Ipv4Addr::new(192, 0, 2, 7))),
+                    ));
+                    answer.add_query(question);
+                }
+                let _ = socket.send_to(&answer.to_vec().unwrap(), peer).await;
+            }
+        });
+        addr
+    }
+
+    /// 本机上游，UDP 和 TCP 占同一个端口：收下查询、接下连接，从不回答
+    /// A local upstream on one port for UDP and TCP: it takes queries and connections and
+    /// never answers
+    async fn spawn_silent_upstream() -> SocketAddr {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    Ok((stream, _)) = tcp.accept() => held.push(stream),
+                    Ok(_) = udp.recv_from(&mut buf) => {}
+                    else => break,
+                }
+            }
+        });
+        addr
+    }
+
+    /// 把查询都用 UDP 转发给 `upstream` 的引擎，`settings` 覆盖在默认设置上
+    /// An engine forwarding every query over UDP to `upstream`, with `settings` on top of
+    /// the defaults
+    fn engine_forwarding_to(upstream: SocketAddr, settings: serde_json::Value) -> Engine {
+        let mut all = serde_json::json!({ "default_upstream": upstream.to_string() });
+        all.as_object_mut()
+            .unwrap()
+            .extend(settings.as_object().unwrap().clone());
+        let config: kixdns::config::PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": all,
+            "pipelines": [{
+                "id": "p",
+                "rules": [{
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{
+                        "type": "forward",
+                        "upstream": upstream.to_string(),
+                        "transport": "udp"
+                    }]
+                }]
+            }]
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
+        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+    }
+
+    /// 发一个 UDP 查询、读回回答，连同用时一起返回
+    /// Send one UDP query, read the answer back, and return it with the time it took
+    async fn udp_exchange(
+        client: &UdpSocket,
+        server: SocketAddr,
+        query: &[u8],
+    ) -> (Message, Duration) {
+        let start = std::time::Instant::now();
+        client.send_to(query, server).await.unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .expect("udp answer")
+            .unwrap();
+        (Message::from_bytes(&buf[..n]).unwrap(), start.elapsed())
+    }
+
+    /// 在一条连接上发一个查询、读回回答，连同用时一起返回
+    /// Send one query on a connection, read the answer back, and return it with the time
+    /// it took
+    async fn tcp_exchange(client: &mut TcpStream, query: &[u8]) -> (Message, Duration) {
+        let start = std::time::Instant::now();
+        client
+            .write_all(&[&(query.len() as u16).to_be_bytes()[..], query].concat())
+            .await
+            .unwrap();
+        let answer = read_tcp_answer(client).await;
+        (Message::from_bytes(&answer).unwrap(), start.elapsed())
+    }
+
+    /// 缓存命中的应答带着这条查询自己的事务 ID；TTL 按应答在缓存里停留的整秒数调低（RFC 1035
+    /// 第 5.2 节），停留不到一秒时原样不动。UDP 和 TCP 一样
+    /// A cache hit carries the query's own transaction ID, and its TTLs are lowered by the
+    /// whole seconds the answer sat in the cache (RFC 1035 section 5.2), untouched under a
+    /// second. The same over UDP and over TCP
+    #[tokio::test]
+    async fn a_cache_hit_carries_the_query_id_and_ages_its_ttls() {
+        let engine =
+            engine_forwarding_to(spawn_answering_udp_upstream().await, serde_json::json!({}));
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut tcp, connection) = tcp_connection(engine).await;
+
+        // 第一次转发给上游，写进缓存 / The first goes to the upstream and into the cache
+        let (forwarded, _) = udp_exchange(&client, server_addr, &query("cached.test", 1)).await;
+        assert_eq!((forwarded.metadata.id, forwarded.answers[0].ttl), (1, 300));
+
+        // 停留不到一秒：只换 ID / Under a second in the cache: only the ID changes
+        let (udp_hit, _) = udp_exchange(&client, server_addr, &query("cached.test", 2)).await;
+        let (tcp_hit, _) = tcp_exchange(&mut tcp, &query("cached.test", 3)).await;
+        assert_eq!((udp_hit.metadata.id, udp_hit.answers[0].ttl), (2, 300));
+        assert_eq!((tcp_hit.metadata.id, tcp_hit.answers[0].ttl), (3, 300));
+
+        // 停留过一秒：TTL 跟着调低 / Past a second in the cache the TTL goes down too
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (udp_aged, _) = udp_exchange(&client, server_addr, &query("cached.test", 4)).await;
+        let (tcp_aged, _) = tcp_exchange(&mut tcp, &query("cached.test", 5)).await;
+        assert_eq!(udp_aged.metadata.id, 4);
+        assert_eq!(tcp_aged.metadata.id, 5);
+        for aged in [&udp_aged, &tcp_aged] {
+            let ttl = aged.answers[0].ttl;
+            assert!((295..300).contains(&ttl), "aged TTL {ttl}");
+        }
+
+        worker.abort();
+        connection.abort();
+    }
+
+    /// 引擎在请求时限内答不上来时，监听器到点回 SERVFAIL：不早于时限，也不等引擎自己放弃。快速解析
+    /// 读得了的查询和要从头解析的一样，UDP 和 TCP 一样
+    /// When the engine cannot answer within the request timeout, the listener answers
+    /// SERVFAIL when it runs out: not before, and without waiting for the engine to give up.
+    /// A query the quick parse reads and one parsed from scratch alike, over UDP as over TCP
+    #[tokio::test]
+    async fn listeners_answer_servfail_when_the_request_timeout_runs_out() {
+        // 上游从不回答：引擎先用 UDP 试三分之一个时限、再试一个时限，再改用 TCP 等一个时限，加起来比
+        // 请求时限长得多，所以先到点的是监听器自己的计时
+        // The upstream never answers: the engine tries UDP for a third of the timeout and
+        // then a whole one, then TCP for another, far longer than the request timeout, so
+        // the listener's own timer runs out first
+        const TIMEOUT: Duration = Duration::from_millis(300);
+        let engine = engine_forwarding_to(
+            spawn_silent_upstream().await,
+            serde_json::json!({
+                "upstream_timeout_ms": TIMEOUT.as_millis() as u64,
+                "request_timeout_ms": TIMEOUT.as_millis() as u64,
+                "enable_tcp_fallback": true
+            }),
+        );
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut tcp_client, connection) = tcp_connection(engine).await;
+
+        for (case, packet) in [
+            ("quick parse", query("quick.test", 7)),
+            ("full parse", query_parsed_from_scratch(8)),
+        ] {
+            let id = u16::from_be_bytes([packet[0], packet[1]]);
+            let udp = udp_exchange(&client, server_addr, &packet).await;
+            let tcp = tcp_exchange(&mut tcp_client, &packet).await;
+            for (transport, (answer, took)) in [("UDP", udp), ("TCP", tcp)] {
+                assert_eq!(
+                    (answer.metadata.id, answer.metadata.response_code),
+                    (id, ResponseCode::ServFail),
+                    "{case} over {transport}"
+                );
+                assert!(
+                    took >= TIMEOUT && took < TIMEOUT * 2,
+                    "{case} over {transport} took {took:?}"
+                );
+            }
+        }
+
+        worker.abort();
+        connection.abort();
+    }
+
+    /// 要单独监听的 IPv4 地址：IPv4 地址本身；`[::]` 的同伴 `0.0.0.0`，端口相同；别的 IPv6 地址没有
+    /// The IPv4 address listened on separately: an IPv4 address itself; `0.0.0.0` on the same
+    /// port as the twin of `[::]`; none for other IPv6 addresses
+    #[test]
+    fn the_ipv4_listen_address_is_the_address_itself_or_the_twin_of_any() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            ipv4_listen_addr(addr("192.0.2.1:53")),
+            Some(addr("192.0.2.1:53"))
+        );
+        assert_eq!(
+            ipv4_listen_addr(addr("[::]:5353")),
+            Some(addr("0.0.0.0:5353"))
+        );
+        assert_eq!(ipv4_listen_addr(addr("[::1]:53")), None);
     }
 }

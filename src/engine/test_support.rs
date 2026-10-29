@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use hickory_proto::op::Message;
-use hickory_proto::rr::RData;
+use hickory_proto::op::{Message, MessageType, OpCode};
+use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::{RData, Record};
 use hickory_proto::serialize::binary::BinDecodable;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -22,8 +23,8 @@ use crate::matcher::RuntimePipelineConfig;
 pub(super) type Replies = Vec<(Duration, Vec<u8>)>;
 
 /// 假上游 / A fake upstream
-pub(super) struct Upstream {
-    pub(super) address: String,
+pub(crate) struct Upstream {
+    pub(crate) address: String,
     /// 收到的每个查询 / Every query it received
     received: Arc<Mutex<Vec<Vec<u8>>>>,
     /// 置位后照样收、照样记，只是不再应答 / Once set, it still receives and records but no
@@ -53,7 +54,7 @@ impl Upstream {
 }
 
 /// 按 `replies` 对每个查询作答的本机 UDP 上游 / A local UDP upstream answering each query as `replies` says
-pub(super) async fn upstream(replies: impl Fn(&Message) -> Replies + Send + 'static) -> Upstream {
+pub(crate) async fn upstream(replies: impl Fn(&Message) -> Replies + Send + 'static) -> Upstream {
     let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let address = sock.local_addr().unwrap().to_string();
     let received = Arc::new(Mutex::new(Vec::new()));
@@ -85,8 +86,49 @@ pub(super) async fn upstream(replies: impl Fn(&Message) -> Replies + Send + 'sta
     }
 }
 
+/// 每个查询回一条 TTL 为 `ttl` 的 A 记录 `address` 的本机 UDP 上游
+/// A local UDP upstream answering every query with one A record `address` of TTL `ttl`
+pub(crate) async fn answering_upstream(address: Ipv4Addr, ttl: u32) -> Upstream {
+    upstream(move |query| {
+        let Some(question) = query.queries.first() else {
+            return Vec::new();
+        };
+        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        reply.metadata.recursion_desired = query.metadata.recursion_desired;
+        reply.add_query(question.clone());
+        reply.add_answer(Record::from_rdata(
+            question.name().clone(),
+            ttl,
+            RData::A(A(address)),
+        ));
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    })
+    .await
+}
+
+/// UDP 和 TCP 占同一个端口的本机上游：收下查询、接下连接，从不回答
+/// A local upstream on one port for UDP and TCP: it takes queries and connections and
+/// never answers
+pub(crate) async fn silent_upstream() -> SocketAddr {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        let mut buf = [0u8; 1500];
+        loop {
+            tokio::select! {
+                Ok((stream, _)) = tcp.accept() => held.push(stream),
+                Ok(_) = udp.recv_from(&mut buf) => {}
+                else => break,
+            }
+        }
+    });
+    address
+}
+
 /// 照 `config` 建的引擎 / An engine built from `config`
-pub(super) fn engine_from(config: Value) -> Engine {
+pub(crate) fn engine_from(config: Value) -> Engine {
     let config: crate::config::PipelineConfig =
         serde_json::from_value(config).expect("parse config");
     Engine::new(

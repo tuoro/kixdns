@@ -4,11 +4,7 @@
 //! nothing. The fast and the full path, rules, pipeline_select and response matchers agree.
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
-use hickory_proto::op::{Message, MessageType, OpCode};
-use hickory_proto::rr::rdata::A;
-use hickory_proto::rr::{RData, Record};
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
@@ -146,22 +142,7 @@ async fn pipeline_select_takes_domain_exact() {
 
 /// 回答 [`UPSTREAM`] 的本机 UDP 上游 / A local UDP upstream answering [`UPSTREAM`]
 async fn upstream() -> String {
-    support::upstream(|query| {
-        let Some(question) = query.queries.first() else {
-            return Vec::new();
-        };
-        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-        reply.metadata.recursion_desired = query.metadata.recursion_desired;
-        reply.add_query(question.clone());
-        reply.add_answer(Record::from_rdata(
-            question.name().clone(),
-            300,
-            RData::A(A(UPSTREAM)),
-        ));
-        vec![(Duration::ZERO, reply.to_vec().unwrap())]
-    })
-    .await
-    .address
+    support::answering_upstream(UPSTREAM, 300).await.address
 }
 
 #[tokio::test]
