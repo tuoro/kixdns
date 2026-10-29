@@ -696,6 +696,47 @@ impl OptRecord {
     }
 }
 
+/// 报文头里第 `index` 段（0 问题、1 Answer、2 Authority、3 Additional）的计数；报文至少 12 字节
+/// The count of section `index` (0 questions, 1 Answer, 2 Authority, 3 Additional) in
+/// a message header; the message holds at least 12 bytes
+fn section_count(packet: &[u8], index: usize) -> usize {
+    u16::from_be_bytes([packet[4 + 2 * index], packet[5 + 2 * index]]) as usize
+}
+
+/// 跳过从 12 字节处开始的 `count` 个问题（名字加上类型和类别的 4 个字节），返回其后的位置。
+/// 名字读不出时为 None；问题的末尾超出报文不在这里检查，下一个名字读不出、或调用方自己会查到。
+/// Skips `count` questions from byte 12 on (each a name plus 4 bytes of type and class)
+/// and returns the position after them. None when a name cannot be read; a question
+/// ending past the message is not checked here: the next name then cannot be read, or
+/// the caller checks.
+fn skip_questions(packet: &[u8], count: usize) -> Option<usize> {
+    (0..count).try_fold(12usize, |pos, _| skip_name(packet, pos)?.checked_add(4))
+}
+
+/// 报文里 `start` 处的一条记录：属主名之后的 10 个固定字节必须在报文之内，RDATA 只算出范围、
+/// 不检查它是否超出报文，要不要查由调用方定
+/// One record of a message, at `start`: the 10 fixed bytes after its owner name must be
+/// inside the message; the RDATA's range is only worked out, not checked against the
+/// message's end, which the caller checks or not
+struct RecordAt {
+    /// 固定字段（类型、类别、TTL、RDLENGTH）的开头 / Start of the fixed fields (type, class, TTL, RDLENGTH)
+    fixed: usize,
+    rr_type: u16,
+    rdata: std::ops::Range<usize>,
+}
+
+fn record_at(packet: &[u8], start: usize) -> Option<RecordAt> {
+    let fixed = skip_name(packet, start)?;
+    let header = packet.get(fixed..fixed.checked_add(10)?)?;
+    let rdata_start = fixed + 10;
+    let rd_len = u16::from_be_bytes([header[8], header[9]]) as usize;
+    Some(RecordAt {
+        fixed,
+        rr_type: u16::from_be_bytes([header[0], header[1]]),
+        rdata: rdata_start..rdata_start.checked_add(rd_len)?,
+    })
+}
+
 /// 走到报文 Additional 段里的 OPT 记录。报文结构不对、OPT 不止一条或出现在 Additional
 /// 以外时为 Err（RFC 6891 第 6.1.1 节：这样的报文是 FORMERR）。
 /// Walk a message to the OPT record in its Additional section. Err when the
@@ -705,41 +746,28 @@ fn find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
     if packet.len() < 12 {
         return Err(());
     }
-    let count = |at: usize| u16::from_be_bytes([packet[at], packet[at + 1]]) as usize;
-    let (qd_count, before_additional) = (count(4), count(6) + count(8));
-    let ar_count = count(10);
-    let mut pos = 12usize;
-    for _ in 0..qd_count {
-        pos = skip_name(packet, pos).ok_or(())?;
-        pos = pos.checked_add(4).ok_or(())?;
-    }
+    let before_additional = section_count(packet, 1) + section_count(packet, 2);
+    let records = before_additional + section_count(packet, 3);
+    let mut pos = skip_questions(packet, section_count(packet, 0)).ok_or(())?;
     let mut found = None;
-    for index in 0..before_additional + ar_count {
-        let start = pos;
-        pos = skip_name(packet, pos).ok_or(())?;
-        let fixed_end = pos.checked_add(10).ok_or(())?;
-        if fixed_end > packet.len() {
+    for index in 0..records {
+        let record = record_at(packet, pos).ok_or(())?;
+        if record.rdata.end > packet.len() {
             return Err(());
         }
-        let rr_type = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-        let rdata_end = fixed_end.checked_add(rd_len).ok_or(())?;
-        if rdata_end > packet.len() {
-            return Err(());
-        }
-        if rr_type == 41 {
+        if record.rr_type == 41 {
             if index < before_additional || found.is_some() {
                 return Err(());
             }
             found = Some(OptRecord {
-                start,
-                extended_rcode_at: pos + 4,
-                rdlen_at: pos + 8,
-                rdata: fixed_end..rdata_end,
-                last: index + 1 == before_additional + ar_count,
+                start: pos,
+                extended_rcode_at: record.fixed + 4,
+                rdlen_at: record.fixed + 8,
+                rdata: record.rdata.clone(),
+                last: index + 1 == records,
             });
         }
-        pos = rdata_end;
+        pos = record.rdata.end;
     }
     Ok(found)
 }
@@ -1117,24 +1145,18 @@ fn last_record_is_tsig(packet: &[u8]) -> bool {
     if packet.len() < 12 {
         return false;
     }
-    let count = |at: usize| u16::from_be_bytes([packet[at], packet[at + 1]]) as usize;
-    let mut pos = 12usize;
-    for _ in 0..count(4) {
-        let Some(next) = skip_name(packet, pos) else {
-            return false;
-        };
-        pos = next + 4;
-    }
+    let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
+        return false;
+    };
     let mut last_type = None;
-    for _ in 0..count(6) + count(8) + count(10) {
-        let Some(next) = skip_name(packet, pos) else {
+    for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
+        // 最后一条的 RDATA 超出报文也照样算（原来如此）/ A last record whose RDATA runs
+        // past the message still counts (as it always has)
+        let Some(record) = record_at(packet, pos) else {
             return false;
         };
-        if next + 10 > packet.len() {
-            return false;
-        }
-        last_type = Some(u16::from_be_bytes([packet[next], packet[next + 1]]));
-        pos = next + 10 + u16::from_be_bytes([packet[next + 8], packet[next + 9]]) as usize;
+        last_type = Some(record.rr_type);
+        pos = record.rdata.end;
     }
     last_type == Some(250)
 }
@@ -1151,26 +1173,9 @@ fn valid_message_len(packet: &[u8]) -> Option<usize> {
         return None;
     }
 
-    let qd_count = u16::from_be_bytes([packet[4], packet[5]]) as usize;
-    let an_count = u16::from_be_bytes([packet[6], packet[7]]) as usize;
-    let ns_count = u16::from_be_bytes([packet[8], packet[9]]) as usize;
-    let ar_count = u16::from_be_bytes([packet[10], packet[11]]) as usize;
-
-    let mut pos = 12usize;
-    // Questions: NAME + QTYPE + QCLASS.
-    for _ in 0..qd_count {
-        pos = skip_name(packet, pos)?;
-        pos = pos.checked_add(4)?;
-    }
-    // Resource records: NAME + TYPE/CLASS/TTL/RDLENGTH + RDATA.
-    for _ in 0..an_count + ns_count + ar_count {
-        pos = skip_name(packet, pos)?;
-        let fixed_end = pos.checked_add(10)?;
-        if fixed_end > packet.len() {
-            return None;
-        }
-        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-        pos = fixed_end.checked_add(rd_len)?;
+    let mut pos = skip_questions(packet, section_count(packet, 0))?;
+    for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
+        pos = record_at(packet, pos)?.rdata.end;
     }
     (pos <= packet.len()).then_some(pos)
 }
@@ -1695,25 +1700,13 @@ fn build_minimal_truncated_response(
     let mut copied_questions = false;
 
     if request_packet.len() >= 12 {
-        let qd_count = u16::from_be_bytes([request_packet[4], request_packet[5]]);
-        let mut pos = 12usize;
-        let mut valid = true;
-        for _ in 0..qd_count {
-            let Some(name_end) = skip_name(request_packet, pos) else {
-                valid = false;
-                break;
-            };
-            let Some(next) = name_end.checked_add(4) else {
-                valid = false;
-                break;
-            };
-            if next > request_packet.len() {
-                valid = false;
-                break;
-            }
-            pos = next;
-        }
-        if valid && pos <= max_payload {
+        // 中间某个问题超出报文时，下一个名字读不出；最后一个由 `pos <= len` 查到
+        // A question in the middle running past the message leaves the next name
+        // unreadable; the last one is caught by `pos <= len`
+        if let Some(pos) = skip_questions(request_packet, section_count(request_packet, 0))
+            && pos <= request_packet.len()
+            && pos <= max_payload
+        {
             question_end = pos;
             copied_questions = true;
         }
@@ -1794,66 +1787,129 @@ fn map_record_ttls(packet: &mut [u8], mut f: impl FnMut(u32) -> u32) {
         return;
     }
 
-    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
-    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
-    let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
-
-    let mut pos = 12;
-    let packet_len = packet.len();
-
-    // 1. Skip Questions
-    for _ in 0..qd_count {
-        if let Some(next) = skip_name(packet, pos) {
-            pos = next + 4;
-        } else {
+    let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
+        return;
+    };
+    for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
+        let Some(record) = record_at(packet, pos) else {
+            return;
+        };
+        if record.rr_type != 41 {
+            let ttl = record.fixed + 4..record.fixed + 8;
+            let old_ttl = u32::from_be_bytes(packet[ttl.clone()].try_into().unwrap());
+            packet[ttl].copy_from_slice(&f(received_ttl(old_ttl)).to_be_bytes());
+        }
+        // 放不下的记录也已改过 TTL，到这里才停（原来如此）/ A record that does not fit has
+        // had its TTL rewritten too, and only now is it stopped at (as it always has been)
+        if record.rdata.end > packet.len() {
             return;
         }
-    }
-
-    // 2. Answer, Authority, and Additional sections
-    let total_records = an_count as usize + ns_count as usize + ar_count as usize;
-    for _ in 0..total_records {
-        if let Some(next) = skip_name(packet, pos) {
-            pos = next;
-        } else {
-            return;
-        }
-
-        if pos + 10 > packet_len {
-            return;
-        }
-
-        // Type(2) Class(2) TTL(4) RDLen(2)
-        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-        if rtype != 41 {
-            let ttl_offset = pos + 4;
-            let old_ttl = u32::from_be_bytes([
-                packet[ttl_offset],
-                packet[ttl_offset + 1],
-                packet[ttl_offset + 2],
-                packet[ttl_offset + 3],
-            ]);
-            packet[ttl_offset..ttl_offset + 4]
-                .copy_from_slice(&f(received_ttl(old_ttl)).to_be_bytes());
-        }
-
-        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-
-        // Ensure the entire record (10 bytes header + RData) fits within remaining packet
-        // and handle potential overflow for the next iteration's position
-        let record_total_len = 10usize.saturating_add(rd_len);
-        if pos.saturating_add(record_total_len) > packet_len {
-            return;
-        }
-
-        pos += record_total_len;
+        pos = record.rdata.end;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 各段计数为 `counts`（问题、Answer、Authority、Additional）的应答报文头
+    /// A reply header with section counts `counts` (questions, Answer, Authority, Additional)
+    fn header_with(counts: [u16; 4]) -> Vec<u8> {
+        let mut header = vec![0x12, 0x34, 0x81, 0x80];
+        for count in counts {
+            header.extend_from_slice(&count.to_be_bytes());
+        }
+        header
+    }
+
+    /// a.test 的线上格式 / a.test on the wire
+    const A_TEST: [u8; 8] = [1, b'a', 4, b't', b'e', b's', b't', 0];
+
+    /// 最后一条记录的类型是 TSIG 就算，它的 RDATA 超出报文也一样；固定字段不全时不算。
+    /// 这是现有的行为，记录遍历合并后照旧
+    /// The last record counts as a TSIG by its type, even when its RDATA runs past the
+    /// message; not when its fixed fields are cut. This is the current behaviour, kept
+    /// as it is by the shared record walk
+    #[test]
+    fn a_last_tsig_counts_even_when_its_rdata_runs_past_the_message() {
+        let record = |rr_type: u8, rd_len: u8, rdata: &[u8]| {
+            let mut packet = header_with([0, 0, 0, 1]);
+            packet.push(0);
+            packet.extend_from_slice(&[0, rr_type, 0, 255, 0, 0, 0, 0, 0, rd_len]);
+            packet.extend_from_slice(rdata);
+            packet
+        };
+        assert!(last_record_is_tsig(&record(250, 2, &[1, 2])));
+        assert!(last_record_is_tsig(&record(250, 9, &[1, 2])));
+        assert!(!last_record_is_tsig(&record(1, 2, &[1, 2])));
+        let mut cut = record(250, 2, &[1, 2]);
+        cut.truncate(12 + 1 + 8);
+        assert!(!last_record_is_tsig(&cut));
+    }
+
+    /// 改写 TTL 时，放不下的那条记录也先改了 TTL，然后才停下：后面的记录不再看。
+    /// 这是现有的行为，记录遍历合并后照旧
+    /// While rewriting TTLs, the record that does not fit has its TTL rewritten too
+    /// before the walk stops, and the records after it are not looked at. This is the
+    /// current behaviour, kept as it is by the shared record walk
+    #[test]
+    fn a_record_that_does_not_fit_has_its_ttl_rewritten_before_the_walk_stops() {
+        let mut packet = header_with([1, 3, 0, 0]);
+        packet.extend_from_slice(&A_TEST);
+        packet.extend_from_slice(&[0, 1, 0, 1]);
+        let fits_ttl = packet.len() + 2 + 4;
+        packet.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 192, 0, 2, 1]);
+        let cut_ttl = packet.len() + 2 + 4;
+        // RDLENGTH 20，只带了 4 个字节 / RDLENGTH 20 with 4 bytes carried
+        packet.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 1, 44, 0, 20, 192, 0, 2, 2]);
+        map_record_ttls(&mut packet, |_| 7);
+        assert_eq!(packet[fits_ttl..fits_ttl + 4], 7u32.to_be_bytes());
+        assert_eq!(packet[cut_ttl..cut_ttl + 4], 7u32.to_be_bytes());
+    }
+
+    /// 问题段在报文末尾被截断、又没有记录时，`find_opt` 不报错，只说没有 OPT；有记录时报错。
+    /// 这是现有的行为，记录遍历合并后照旧
+    /// With the question section cut at the end of the message and no records, `find_opt`
+    /// reports no OPT rather than an error; with a record it is an error. This is the
+    /// current behaviour, kept as it is by the shared record walk
+    #[test]
+    fn a_cut_question_without_records_finds_no_opt() {
+        let cut = |counts: [u16; 4]| {
+            let mut packet = header_with(counts);
+            packet.extend_from_slice(&A_TEST);
+            packet.extend_from_slice(&[0, 1]);
+            packet
+        };
+        assert!(matches!(find_opt(&cut([1, 0, 0, 0])), Ok(None)));
+        assert!(find_opt(&cut([1, 0, 0, 1])).is_err());
+    }
+
+    /// 兜底的截断应答只抄完整的问题：最后一个问题超出请求、或者问题数比请求里的多时，一个也不抄
+    /// The fallback truncated reply copies only whole questions: when the last question
+    /// runs past the request, or the request counts more questions than it carries,
+    /// none is copied
+    #[test]
+    fn a_truncated_reply_copies_no_question_running_past_the_request() {
+        let request = |count: u16, tail: &[u8]| {
+            let mut packet = header_with([count, 0, 0, 0]);
+            packet[2] = 0x01;
+            packet[3] = 0x00;
+            packet.extend_from_slice(&A_TEST);
+            packet.extend_from_slice(tail);
+            packet
+        };
+        let response = header_with([1, 0, 0, 0]);
+        let whole = request(1, &[0, 1, 0, 1]);
+        let reply = build_minimal_truncated_response(&whole, &response, 512);
+        assert_eq!(reply[4..6], 1u16.to_be_bytes());
+        assert_eq!(reply[12..], whole[12..]);
+        for broken in [request(1, &[0, 1]), request(2, &[0, 1, 0, 1])] {
+            let reply = build_minimal_truncated_response(&broken, &response, 512);
+            assert_eq!(reply.len(), 12);
+            assert_eq!(reply[4..6], 0u16.to_be_bytes());
+            assert_eq!(reply[2] & 0x02, 0x02, "TC");
+        }
+    }
 
     /// 末尾加一条类型为 TSIG 的记录（根名、类别 ANY、TTL 0、空 RDATA），记进 Additional 的计数
     /// Append a TSIG-typed record (root name, class ANY, TTL 0, empty RDATA), counted in
