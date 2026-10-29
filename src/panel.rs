@@ -751,26 +751,27 @@ impl PanelMetrics {
         );
     }
 
-    fn record_initial_config(&self, sha256: String, restart_pending: Vec<String>) {
+    /// 一份配置生效了：第一次加载时代数是 1；之后每次重载加一，并在写锁里计一次重载成功、加重载序号
+    /// （见 `config_json`）
+    /// A configuration became active: generation 1 on the first load; each reload after
+    /// that adds one and, under the write lock, counts a reload success and bumps the
+    /// reload sequence (see `config_json`)
+    fn config_became_active(&self, sha256: String, initial: bool, restart_pending: Vec<String>) {
         let mut active = self.active_config.write();
-        active.generation = 1;
+        active.generation = if initial {
+            1
+        } else {
+            active.generation.saturating_add(1)
+        };
         active.sha256 = sha256;
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
         active.last_reload_error = None;
         active.restart_pending = restart_pending;
-    }
-
-    fn record_reload_success(&self, sha256: String, restart_pending: Vec<String>) {
-        let mut active = self.active_config.write();
-        active.generation = active.generation.saturating_add(1).max(1);
-        active.sha256 = sha256;
-        active.loaded_at_unix = unix_timestamp();
-        active.last_reload_success = true;
-        active.last_reload_error = None;
-        active.restart_pending = restart_pending;
-        self.reload_success.fetch_add(1, Ordering::Relaxed);
-        self.reload_sequence.fetch_add(1, Ordering::Release);
+        if !initial {
+            self.reload_success.fetch_add(1, Ordering::Relaxed);
+            self.reload_sequence.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// 按借来的键计数，只有第一次出现的统计项才分配它的键
@@ -821,11 +822,7 @@ impl PanelMetrics {
     fn record_config_loaded(&self, source: &str, restart_pending: Vec<String>) {
         let sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
         let initial = self.active_config.read().generation == 0;
-        if initial {
-            self.record_initial_config(sha256, restart_pending);
-        } else {
-            self.record_reload_success(sha256, restart_pending);
-        }
+        self.config_became_active(sha256, initial, restart_pending);
     }
 
     #[cfg(unix)]
@@ -1105,11 +1102,36 @@ pub(crate) fn transport_label(transport: crate::config::Transport) -> &'static s
     }
 }
 
+/// 上游一次尝试的结果，写成面板认得的短名 / An upstream attempt's outcome in the short name the panel reads
+pub(crate) fn outcome_label(outcome: UpstreamOutcome) -> &'static str {
+    match outcome {
+        UpstreamOutcome::Success => "success",
+        UpstreamOutcome::Rejected => "rejected",
+        UpstreamOutcome::Error => "error",
+        UpstreamOutcome::Aborted => "aborted",
+    }
+}
+
+/// 规则匹配的阶段，写成面板认得的短名 / A rule's matching phase in the short name the panel reads
+pub(crate) fn phase_label(phase: RulePhase) -> &'static str {
+    match phase {
+        RulePhase::Request => "request",
+        RulePhase::Response => "response",
+    }
+}
+
+/// `--debug` 时把事件也交给 [`TracingObserver`] / With `--debug`, the event goes to the [`TracingObserver`] too
+macro_rules! debug_forward {
+    ($panel:ident.$event:ident($($arg:expr),*)) => {
+        if let Some(trace) = &$panel.debug_trace {
+            trace.$event($($arg),*);
+        }
+    };
+}
+
 impl EngineObserver for PanelMetrics {
     fn request_started(&self, ctx: &RequestContext<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.request_started(ctx);
-        }
+        debug_forward!(self.request_started(ctx));
         if !ctx.background_refresh {
             self.requests_total.fetch_add(1, Ordering::Relaxed);
             self.requests_inflight.fetch_add(1, Ordering::Relaxed);
@@ -1134,9 +1156,7 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome) {
-        if let Some(trace) = &self.debug_trace {
-            trace.request_finished(ctx, outcome);
-        }
+        debug_forward!(self.request_finished(ctx, outcome));
         self.query_log.request_finished(ctx, outcome);
         if ctx.background_refresh {
             return;
@@ -1146,16 +1166,14 @@ impl EngineObserver for PanelMetrics {
         let counter = match outcome.status {
             RequestStatus::Completed => &self.requests_completed,
             RequestStatus::Failed => &self.requests_failed,
-            _ => &self.requests_cancelled,
+            RequestStatus::Cancelled => &self.requests_cancelled,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         self.request_latency.observe(outcome.latency);
     }
 
     fn pipeline_selected(&self, ctx: &RequestContext<'_>, pipeline: &str) {
-        if let Some(trace) = &self.debug_trace {
-            trace.pipeline_selected(ctx, pipeline);
-        }
+        debug_forward!(self.pipeline_selected(ctx, pipeline));
         if !ctx.background_refresh {
             self.record_pipeline_hit(pipeline);
         }
@@ -1175,28 +1193,20 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn rule_matched(&self, ctx: &RequestContext<'_>, event: &RuleMatched<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.rule_matched(ctx, event);
-        }
+        debug_forward!(self.rule_matched(ctx, event));
         // 规则命中和请求数、pipeline 命中一样只算客户端请求：后台刷新会照规则再走一遍，算进去
         // 命中数就会多于实际的查询，按命中数相减的请求分布也跟着偏
         // Rule matches, like request and pipeline counts, cover client queries only: a background
         // refresh walks the rules again, and counting it would put matches above the actual
         // queries and skew the request breakdown that subtracts them
         if !ctx.background_refresh {
-            let phase = match event.phase {
-                RulePhase::Request => "request",
-                _ => "response",
-            };
-            self.record_rule_match(event.pipeline, event.rule, phase);
+            self.record_rule_match(event.pipeline, event.rule, phase_label(event.phase));
         }
         self.query_log.rule_matched(ctx, event);
     }
 
     fn rule_evaluated(&self, ctx: &RequestContext<'_>, event: &RuleEvaluated<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.rule_evaluated(ctx, event);
-        }
+        debug_forward!(self.rule_evaluated(ctx, event));
         self.query_log.rule_evaluated(ctx, event);
         let status = if event.matched { "matched" } else { "missed" };
         match event.phase {
@@ -1222,9 +1232,7 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn rule_cache_lookup(&self, ctx: &RequestContext<'_>, event: &RuleCacheLookup<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.rule_cache_lookup(ctx, event);
-        }
+        debug_forward!(self.rule_cache_lookup(ctx, event));
         if event.hit {
             panel_trace::trace_step!(
                 "rule_cache",
@@ -1243,9 +1251,7 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.decision_made(ctx, event);
-        }
+        debug_forward!(self.decision_made(ctx, event));
         // 诊断的执行路径只写请求阶段的决定：回答后检查的结果已经由响应规则那一步说了
         // The diagnostics trace shows request-phase decisions only: an answer check's
         // outcome is already told by its response-rule step
@@ -1256,18 +1262,14 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.cache_lookup(ctx);
-        }
+        debug_forward!(self.cache_lookup(ctx));
         if !ctx.background_refresh && self.cache_lookup_counted.first(ctx.request_id) {
             self.record_cache_lookup();
         }
     }
 
     fn cache_miss(&self, ctx: &RequestContext<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.cache_miss(ctx);
-        }
+        debug_forward!(self.cache_miss(ctx));
         self.query_log.cache_miss(ctx);
         let pipeline = panel_trace::current_pipeline();
         panel_trace::trace_step!(
@@ -1279,9 +1281,7 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
-        if let Some(trace) = &self.debug_trace {
-            trace.cache_hit(ctx, event);
-        }
+        debug_forward!(self.cache_hit(ctx, event));
         self.record_cache_hit(event.kind);
         self.query_log.cache_hit(ctx, event);
         let ttl = |value: Option<std::time::Duration>| value.map(|value| value.as_secs());
@@ -1311,9 +1311,7 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn inflight_joined(&self, ctx: &RequestContext<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.inflight_joined(ctx);
-        }
+        debug_forward!(self.inflight_joined(ctx));
         self.query_log.inflight_joined(ctx);
         // 这次请求没有自己去问上游，等的是正在进行的同一个查询：诊断里不然就少了上游这一步
         // This request did not ask upstream itself but waited on the same query already in
@@ -1322,9 +1320,7 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.upstream_attempt(ctx, event);
-        }
+        debug_forward!(self.upstream_attempt(ctx, event));
         let transport = transport_label(event.transport);
         self.record_upstream_attempt(event.upstream, transport);
         let (rule, decided_transport) = panel_trace::current_decision();
@@ -1341,17 +1337,9 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn upstream_result(&self, ctx: &RequestContext<'_>, event: &UpstreamResult<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.upstream_result(ctx, event);
-        }
+        debug_forward!(self.upstream_result(ctx, event));
         let transport = transport_label(event.transport);
-        let result = match event.outcome {
-            UpstreamOutcome::Success => "success",
-            UpstreamOutcome::Rejected => "rejected",
-            UpstreamOutcome::Aborted => "aborted",
-            _ => "error",
-        };
-        self.record_upstream_result(event.upstream, transport, result);
+        self.record_upstream_result(event.upstream, transport, outcome_label(event.outcome));
         self.query_log.upstream_result(ctx, event);
         if !matches!(event.outcome, UpstreamOutcome::Aborted) {
             with_metric_key(
@@ -1417,9 +1405,7 @@ impl EngineObserver for PanelMetrics {
     }
 
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.config_loaded(event);
-        }
+        debug_forward!(self.config_loaded(event));
         let restart_pending = event
             .restart_pending
             .iter()
@@ -1431,19 +1417,13 @@ impl EngineObserver for PanelMetrics {
             // Without the text the digest stays; the first load (generation 1) is no reload
             None => {
                 let sha256 = self.active_config.read().sha256.clone();
-                if event.generation <= 1 {
-                    self.record_initial_config(sha256, restart_pending);
-                } else {
-                    self.record_reload_success(sha256, restart_pending);
-                }
+                self.config_became_active(sha256, event.generation <= 1, restart_pending);
             }
         }
     }
 
     fn config_reload_failed(&self, event: &ConfigReloadFailed<'_>) {
-        if let Some(trace) = &self.debug_trace {
-            trace.config_reload_failed(event);
-        }
+        debug_forward!(self.config_reload_failed(event));
         self.record_reload_failure(event.error);
     }
 }

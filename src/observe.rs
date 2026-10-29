@@ -550,7 +550,7 @@ const TRACE_TARGET: &str = "kixdns::observe";
 /// Response code from a DNS header: the low four bits of byte 3. The
 /// extended bits an OPT record may carry are not read; this is a log field,
 /// not a parser.
-fn header_rcode(message: &[u8]) -> Option<ResponseCode> {
+pub(crate) fn header_rcode(message: &[u8]) -> Option<ResponseCode> {
     message
         .get(3)
         .map(|flags| ResponseCode::from(0, flags & 0x0F))
