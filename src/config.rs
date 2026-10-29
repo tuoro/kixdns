@@ -71,7 +71,7 @@ pub struct GlobalSettings {
     pub default_upstream: String,
     /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
     #[serde(skip)]
-    pub default_upstream_pre_split: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
+    pub default_upstream_pre_split: Option<Arc<Vec<Arc<str>>>>,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
     /// 单次上游请求的超时时间
     #[serde(default = "default_upstream_timeout_ms")]
@@ -550,7 +550,7 @@ pub enum Action {
         ecs: Option<EcsMode>,
         /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
         #[serde(skip)]
-        pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
+        pre_split_upstreams: Option<Arc<Vec<Arc<str>>>>,
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
@@ -573,12 +573,9 @@ impl Action {
             ..
         } = self
         {
-            let split: Vec<std::sync::Arc<str>> = upstream_str
-                .split(',')
-                .map(|s| std::sync::Arc::from(s.trim()))
-                .filter(|s: &std::sync::Arc<str>| !s.is_empty())
-                .collect();
-            *pre_split_upstreams = Some(std::sync::Arc::new(split));
+            *pre_split_upstreams = Some(Arc::new(
+                split_upstreams(upstream_str).map(Arc::from).collect(),
+            ));
         }
     }
 }
@@ -627,12 +624,17 @@ impl Rule {
             return;
         }
 
-        let mut tcp_upstreams: FxHashSet<String> = FxHashSet::default();
-        let mut udp_upstreams: FxHashSet<String> = FxHashSet::default();
-        let mut tcp_udp_upstreams: FxHashSet<String> = FxHashSet::default();
-        let mut doh_upstreams: FxHashSet<String> = FxHashSet::default();
-        let mut dot_upstreams: FxHashSet<String> = FxHashSet::default();
-        let mut doq_upstreams: FxHashSet<String> = FxHashSet::default();
+        // 每种传输一组，各组按这里的顺序排进合并后的列表 / One set per transport, each going
+        // into the merged list in this order
+        const SCHEMES: [(Transport, &str); 6] = [
+            (Transport::Tcp, "tcp"),
+            (Transport::Udp, "udp"),
+            (Transport::TcpUdp, "tcp+udp"),
+            (Transport::Doh, "doh"),
+            (Transport::Dot, "dot"),
+            (Transport::Doq, "doq"),
+        ];
+        let mut sets: [FxHashSet<String>; 6] = Default::default();
 
         for action in &self.actions {
             if let Action::Forward {
@@ -642,11 +644,7 @@ impl Rule {
             } = action
             {
                 let action_transport = transport.unwrap_or(Transport::Udp);
-                for addr in upstream
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                {
+                for addr in split_upstreams(upstream) {
                     // 前缀照单个转发那样认（不分大小写，见 `upstream::parse_upstream_addr`），
                     // 没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的上游只记一份，
                     // 合并后仍然双发
@@ -662,30 +660,19 @@ impl Rule {
                         ),
                         None => (addr, action_transport),
                     };
-                    let (set, scheme) = match transport {
-                        Transport::Tcp => (&mut tcp_upstreams, "tcp"),
-                        Transport::Udp => (&mut udp_upstreams, "udp"),
-                        Transport::TcpUdp => (&mut tcp_udp_upstreams, "tcp+udp"),
-                        Transport::Doh => (&mut doh_upstreams, "doh"),
-                        Transport::Dot => (&mut dot_upstreams, "dot"),
-                        Transport::Doq => (&mut doq_upstreams, "doq"),
-                    };
-                    set.insert(format!("{scheme}://{address}"));
+                    let slot = SCHEMES
+                        .iter()
+                        .position(|(scheme_transport, _)| *scheme_transport == transport)
+                        .expect("every transport has a set");
+                    sets[slot].insert(format!("{}://{address}", SCHEMES[slot].1));
                 }
             }
         }
 
-        let mut all_upstreams: Vec<std::sync::Arc<str>> = Vec::new();
-        for set in [
-            &tcp_upstreams,
-            &udp_upstreams,
-            &tcp_udp_upstreams,
-            &doh_upstreams,
-            &dot_upstreams,
-            &doq_upstreams,
-        ] {
-            all_upstreams.extend(set.iter().map(|s| std::sync::Arc::from(s.as_str())));
-        }
+        let all_upstreams: Vec<Arc<str>> = sets
+            .iter()
+            .flat_map(|set| set.iter().map(|s| Arc::from(s.as_str())))
+            .collect();
 
         if all_upstreams.is_empty() {
             tracing::info!(
@@ -698,12 +685,12 @@ impl Rule {
             tracing::info!(
                 rule = %self.name,
                 forward_count,
-                tcp_count = tcp_upstreams.len(),
-                udp_count = udp_upstreams.len(),
-                tcp_udp_count = tcp_udp_upstreams.len(),
-                doh_count = doh_upstreams.len(),
-                dot_count = dot_upstreams.len(),
-                doq_count = doq_upstreams.len(),
+                tcp_count = sets[0].len(),
+                udp_count = sets[1].len(),
+                tcp_udp_count = sets[2].len(),
+                doh_count = sets[3].len(),
+                dot_count = sets[4].len(),
+                doq_count = sets[5].len(),
                 total_upstreams = all_upstreams.len(),
                 "pre-computed merged forward actions with transport-specific deduplication"
             );
@@ -759,101 +746,85 @@ impl GlobalSettings {
     /// capacity and flow control; every other setting applies on a reload. Every field is
     /// listed here, so a new setting forces a decision on which kind it is.
     pub fn restart_pending(&self, running: &GlobalSettings) -> Vec<&'static str> {
-        let GlobalSettings {
+        // 每个字段只写一次：解构不带 `..`，新增设置时编译会要求把它放进其中一张表；只在启动时读取的
+        // 逐个和 `running` 比较，按表里的顺序记下
+        // Each field is written once: the destructuring has no `..`, so a new setting must
+        // go into one of the lists to compile; those read at startup only are compared
+        // with `running` one by one and noted in list order
+        macro_rules! restart_pending {
+            (reload: [$($reload:ident),* $(,)?], startup: [$($startup:ident),* $(,)?] $(,)?) => {{
+                let GlobalSettings {
+                    $($reload: _,)*
+                    $($startup,)*
+                } = self;
+                let mut pending = Vec::new();
+                $(
+                    if *$startup != running.$startup {
+                        pending.push(stringify!($startup));
+                    }
+                )*
+                pending
+            }};
+        }
+        restart_pending!(
             // 重载即生效（统计开关和 GeoIP 自动转换、国家过滤已经不起作用）
             // Applied on a reload (the statistics switches, GeoIP auto-conversion and
             // country filter no longer do anything)
-            min_ttl: _,
-            default_upstream: _,
-            default_upstream_pre_split: _,
-            upstream_timeout_ms: _,
-            request_timeout_ms: _,
-            response_jump_limit: _,
-            enable_tcp_fallback: _,
-            serve_stale: _,
-            serve_stale_ttl: _,
-            serve_stale_expire_ttl: _,
-            serve_stale_ttl_reset: _,
-            serve_stale_client_timeout_ms: _,
-            cache_background_refresh: _,
-            cache_refresh_threshold_percent: _,
-            cache_refresh_min_ttl: _,
-            geoip_db_path: _,
-            geoip_dat_path: _,
-            geoip_auto_convert: _,
-            geoip_filter_countries: _,
-            geosite_data_paths: _,
-            statistics_enabled: _,
-            statistics_anonymize_client_ip: _,
+            reload: [
+                min_ttl,
+                default_upstream,
+                default_upstream_pre_split,
+                upstream_timeout_ms,
+                request_timeout_ms,
+                response_jump_limit,
+                enable_tcp_fallback,
+                serve_stale,
+                serve_stale_ttl,
+                serve_stale_expire_ttl,
+                serve_stale_ttl_reset,
+                serve_stale_client_timeout_ms,
+                cache_background_refresh,
+                cache_refresh_threshold_percent,
+                cache_refresh_min_ttl,
+                geoip_db_path,
+                geoip_dat_path,
+                geoip_auto_convert,
+                geoip_filter_countries,
+                geosite_data_paths,
+                statistics_enabled,
+                statistics_anonymize_client_ip,
+            ],
             // 只在启动时读取 / Read at startup only
-            bind_udp,
-            bind_tcp,
-            bind_doh,
-            doh_tls_cert,
-            doh_tls_key,
-            doh_path,
-            cache_capacity,
-            cache_max_ttl,
-            dashmap_shards,
-            udp_pool_size,
-            tcp_pool_size,
-            doh_pool_size,
-            doh_health_check_error_threshold,
-            dot_pool_size,
-            doq_pool_size,
-            tcp_health_check_error_threshold,
-            tcp_connection_max_age_seconds,
-            tcp_connection_idle_timeout_seconds,
-            doq_connection_idle_timeout_seconds,
-            doq_keepalive_interval_ms,
-            doq_enable_0rtt,
-            flow_control_enabled,
-            flow_control_initial_permits,
-            flow_control_min_permits,
-            flow_control_max_permits,
-            flow_control_latency_threshold_ms,
-            flow_control_adjustment_interval_secs,
-        } = self;
-        let mut pending = Vec::new();
-        macro_rules! compare {
-            ($($field:ident),* $(,)?) => {
-                $(
-                    if *$field != running.$field {
-                        pending.push(stringify!($field));
-                    }
-                )*
-            };
-        }
-        compare!(
-            bind_udp,
-            bind_tcp,
-            bind_doh,
-            doh_tls_cert,
-            doh_tls_key,
-            doh_path,
-            cache_capacity,
-            cache_max_ttl,
-            dashmap_shards,
-            udp_pool_size,
-            tcp_pool_size,
-            doh_pool_size,
-            doh_health_check_error_threshold,
-            dot_pool_size,
-            doq_pool_size,
-            tcp_health_check_error_threshold,
-            tcp_connection_max_age_seconds,
-            tcp_connection_idle_timeout_seconds,
-            doq_connection_idle_timeout_seconds,
-            doq_keepalive_interval_ms,
-            doq_enable_0rtt,
-            flow_control_enabled,
-            flow_control_initial_permits,
-            flow_control_min_permits,
-            flow_control_max_permits,
-            flow_control_latency_threshold_ms,
-            flow_control_adjustment_interval_secs,
-        );
-        pending
+            startup: [
+                bind_udp,
+                bind_tcp,
+                bind_doh,
+                doh_tls_cert,
+                doh_tls_key,
+                doh_path,
+                cache_capacity,
+                cache_max_ttl,
+                dashmap_shards,
+                udp_pool_size,
+                tcp_pool_size,
+                doh_pool_size,
+                doh_health_check_error_threshold,
+                dot_pool_size,
+                doq_pool_size,
+                tcp_health_check_error_threshold,
+                tcp_connection_max_age_seconds,
+                tcp_connection_idle_timeout_seconds,
+                doq_connection_idle_timeout_seconds,
+                doq_keepalive_interval_ms,
+                doq_enable_0rtt,
+                flow_control_enabled,
+                flow_control_initial_permits,
+                flow_control_min_permits,
+                flow_control_max_permits,
+                flow_control_latency_threshold_ms,
+                flow_control_adjustment_interval_secs,
+            ],
+        )
     }
 
     /// Parse the listener addresses and check the DoH prerequisites the way
@@ -890,14 +861,11 @@ impl GlobalSettings {
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
     #[inline]
     pub fn pre_split_default_upstream(&mut self) {
-        let split: Vec<std::sync::Arc<str>> = self
-            .default_upstream
-            .split(',')
-            .map(|s| std::sync::Arc::from(s.trim()))
-            .filter(|s: &std::sync::Arc<str>| !s.is_empty())
+        let split: Vec<Arc<str>> = split_upstreams(&self.default_upstream)
+            .map(Arc::from)
             .collect();
         if split.len() > 1 {
-            self.default_upstream_pre_split = Some(std::sync::Arc::new(split));
+            self.default_upstream_pre_split = Some(Arc::new(split));
         }
     }
 
@@ -995,9 +963,9 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
 pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
     let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
 
-    // 轻量校验：CIDR提前解析，便于后续快速匹配。 / Lightweight validation: parse CIDR in advance for subsequent fast matching
-    // 预分割 upstream 字符串以提高性能 / Pre-split upstream strings for better performance
-    // 预分割默认 upstream 以支持并发查询 / Pre-split default upstream for concurrent queries
+    // 预分割上游字符串，转发时不必每次再拆；默认上游有几个时同时问 / Pre-split the upstream
+    // strings so a forward does not split them each time; several default upstreams are
+    // asked at once
     cfg.settings.pre_split_default_upstream();
 
     for pipeline in &mut cfg.pipelines {
@@ -1010,6 +978,9 @@ pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
             // 预计算多 Forward 规则的合并上游（性能优化）。
             // 消除热路径上每请求的 FxHashSet + format! + join 开销。
             rule.compute_merged_forward();
+            // 下面的 CIDR 只在这里先解析一遍，好早点报出写错的；匹配器建好时会再解析
+            // The CIDRs below are parsed here only to report a bad one early; the matchers
+            // parse them again when built
             for matcher in &rule.matchers {
                 if let Matcher::ClientIp { cidr } = &matcher.matcher {
                     let _parsed: IpNet = cidr.parse()?;
@@ -1021,20 +992,11 @@ pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
                 {
                     anyhow::bail!("response_matcher request_domain_suffix empty");
                 }
-                if let ResponseMatcher::ResponseUpstreamIp { cidr } = &matcher.matcher {
-                    for part in cidr.split(',') {
-                        let s = part.trim();
-                        if !s.is_empty() {
-                            let _parsed: IpNet = s.parse()?;
-                        }
-                    }
-                }
-                if let ResponseMatcher::ResponseAnswerIp { cidr } = &matcher.matcher {
-                    for part in cidr.split(',') {
-                        let s = part.trim();
-                        if !s.is_empty() {
-                            let _parsed: IpNet = s.parse()?;
-                        }
+                if let ResponseMatcher::ResponseUpstreamIp { cidr }
+                | ResponseMatcher::ResponseAnswerIp { cidr } = &matcher.matcher
+                {
+                    for part in cidr.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        let _parsed: IpNet = part.parse()?;
                     }
                 }
             }
@@ -1655,6 +1617,62 @@ mod merged_forward_tests {
         );
     }
 
+    /// 合并后的列表按传输分组排：tcp、udp、tcp+udp、doh、dot、doq。几个上游是同时发出的，但这个顺序
+    /// 看得见：按它逐个发出，观察者按它收到每次尝试，转发决定里的上游列表也照它排。组内是集合的遍历
+    /// 顺序；这里钉住分组的先后和每组有哪些
+    /// The merged list is grouped by transport: tcp, udp, tcp+udp, doh, dot, doq. The
+    /// upstreams are asked at once, yet the order shows: they are sent one by one in it,
+    /// observers get each attempt in it, and the forward decision lists the upstreams in
+    /// it. Within a group it is the set's iteration order; this pins the group order and
+    /// what each group holds
+    #[test]
+    fn a_merged_list_is_grouped_by_transport_in_a_fixed_order() {
+        let mut rule: Rule = serde_json::from_value(json!({
+            "name": "r", "matchers": [{ "type": "any" }], "actions": [
+                { "type": "forward", "upstream": "doq://192.0.2.6:853, dot://192.0.2.5:853" },
+                { "type": "forward", "upstream": "doh://dns.example/dns-query" },
+                { "type": "forward", "upstream": "192.0.2.3:53, 192.0.2.4:53", "transport": "tcp_udp" },
+                { "type": "forward", "upstream": "udp://192.0.2.2:53, 192.0.2.7:53" },
+                { "type": "forward", "upstream": "tcp://192.0.2.1:53, tcp://192.0.2.8:53" }
+            ]
+        }))
+        .expect("parse rule");
+        rule.compute_merged_forward();
+        let merged = rule.merged_forward.expect("several forwards merge");
+        let list: Vec<String> = merged
+            .upstream_list
+            .iter()
+            .map(|upstream| upstream.to_string())
+            .collect();
+        assert_eq!(merged.upstream_str.as_ref(), list.join(","));
+        let mut groups: Vec<&str> = list
+            .iter()
+            .map(|upstream| upstream.split("://").next().unwrap())
+            .collect();
+        groups.dedup();
+        assert_eq!(
+            groups,
+            ["tcp", "udp", "tcp+udp", "doh", "dot", "doq"],
+            "{list:?}"
+        );
+        let mut members = list.clone();
+        members.sort();
+        assert_eq!(
+            members,
+            [
+                "doh://dns.example/dns-query",
+                "doq://192.0.2.6:853",
+                "dot://192.0.2.5:853",
+                "tcp+udp://192.0.2.3:53",
+                "tcp+udp://192.0.2.4:53",
+                "tcp://192.0.2.1:53",
+                "tcp://192.0.2.8:53",
+                "udp://192.0.2.2:53",
+                "udp://192.0.2.7:53",
+            ]
+        );
+    }
+
     /// TCP 和 UDP 双发的上游合并后只出现一次，仍然双发，和只有一个转发时一样：写成 `tcp+udp://`
     /// 前缀和写成 `tcp_udp` 传输都是
     /// An upstream asked over TCP and UDP at once appears once after the merge and is still
@@ -1941,6 +1959,53 @@ mod validation_tests {
                 "{place}: {found:?}"
             );
         }
+    }
+
+    /// 读配置时就拦下写错的 CIDR：响应规则的 response_upstream_ip、response_answer_ip 两种都是
+    /// A CIDR written wrong is refused as the configuration is read, in both
+    /// response_upstream_ip and response_answer_ip
+    #[test]
+    fn a_bad_response_cidr_is_refused_as_the_configuration_is_read() {
+        for kind in ["response_upstream_ip", "response_answer_ip"] {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
+                    "response_matchers": [{ "type": kind, "cidr": "10.0.0.0/8, nonsense" }],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }] }]
+            });
+            assert!(super::parse_config(&config.to_string()).is_err(), "{kind}");
+        }
+    }
+
+    /// 默认上游写了几个时，读配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
+    /// Several default upstreams are split as the configuration is read (each trimmed,
+    /// empty ones skipped); a single one is not
+    #[test]
+    fn several_default_upstreams_are_split_ahead() {
+        let split = |default_upstream: &str| {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": default_upstream },
+                "pipelines": [{ "id": "main", "rules": [] }]
+            });
+            super::parse_config(&config.to_string())
+                .expect("parses")
+                .settings
+                .default_upstream_pre_split
+                .map(|list| {
+                    list.iter()
+                        .map(|upstream| upstream.to_string())
+                        .collect::<Vec<_>>()
+                })
+        };
+        assert_eq!(
+            split(" 1.1.1.1:53 ,, 8.8.8.8:53"),
+            Some(vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()])
+        );
+        assert_eq!(split("1.1.1.1:53"), None);
     }
 
     #[test]
