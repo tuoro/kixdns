@@ -1087,7 +1087,7 @@ pub(crate) fn ecs_removed(reply: Bytes) -> Bytes {
 /// 用 hickory 改写报文里的 ECS 选项：`echo` 为 Some 时换成这个回显，None 时去掉
 /// Rewrite a message's ECS option through hickory: the echo `echo` names, or none
 fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Option<Vec<u8>> {
-    use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+    use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode};
     if last_record_is_tsig(message) {
         return None;
     }
@@ -1095,18 +1095,10 @@ fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Optio
     match echo {
         Some((subnet, scope)) => {
             let address = subnet.ip()?;
-            let edns = msg.edns.get_or_insert_with(|| {
-                let mut edns = hickory_proto::op::Edns::new();
-                edns.set_max_payload(1232);
-                edns
-            });
-            edns.options_mut().remove(EdnsCode::Subnet);
-            edns.options_mut()
-                .insert(EdnsOption::Subnet(ClientSubnet::new(
-                    address,
-                    subnet.source_prefix,
-                    scope,
-                )));
+            crate::ecs::set_ecs_option(
+                &mut msg,
+                ClientSubnet::new(address, subnet.source_prefix, scope),
+            );
         }
         None => {
             msg.edns.as_mut()?.options_mut().remove(EdnsCode::Subnet);

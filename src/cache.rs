@@ -87,11 +87,14 @@ impl CacheEntry {
         self.inserted_at.elapsed().as_secs() < u64::from(self.original_ttl)
     }
 
-    fn same_question(&self, other: &Self) -> bool {
-        self.qtype == other.qtype
-            && self.flags == other.flags
-            && self.qname == other.qname
-            && self.pipeline_id == other.pipeline_id
+    /// 这份应答回答的问题 / The question this answer answers
+    pub fn question(&self) -> CachedQuestion<'_> {
+        CachedQuestion {
+            qname: &self.qname,
+            pipeline_id: &self.pipeline_id,
+            qtype: self.qtype,
+            flags: self.flags,
+        }
     }
 
     /// 存了 `max_age` 以上：单独存放时缓存本来就会淘汰它
@@ -104,21 +107,11 @@ impl CacheEntry {
     /// Sets `inserted_at` to `now - original_ttl` so the entry appears freshly expired / 将 inserted_at 设置为 now - original_ttl，使条目看上去刚刚过期
     pub fn clone_with_refreshed_ttl(&self) -> Self {
         Self {
-            bytes: self.bytes.clone(),
-            rcode: self.rcode,
-            upstream: self.upstream.clone(),
-            qname: self.qname.clone(),
-            pipeline_id: self.pipeline_id.clone(),
-            qtype: self.qtype,
-            flags: self.flags,
             inserted_at: Instant::now() - Duration::from_secs(self.original_ttl as u64),
-            original_ttl: self.original_ttl,
-            refresh_ttl: self.refresh_ttl,
-            reach: self.reach.clone(),
             // A renewed entry is written again, which restarted the key's clock before
             // slots existed / 续期的条目重新写入，在有槽位之前这会让键重新计时
             stored_at: Instant::now(),
-            fetched_at: self.fetched_at,
+            ..self.clone()
         }
     }
 }
@@ -197,7 +190,7 @@ impl CacheSlot {
             .entries
             .iter()
             .filter(|old| {
-                !(old.same_question(&entry) && old.reach == entry.reach)
+                !(entry.question().matches(old) && old.reach == entry.reach)
                     && !old.outlived(max_age, now)
             })
             .cloned()
@@ -310,7 +303,7 @@ pub fn new_cache(max_capacity: u64, ttl_secs: u64) -> DnsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecs::EcsKey;
+    use crate::ecs::subnet;
     use crate::ecs_scope::{EcsSource, ForwardEcs, ReplyEcs, Sent};
 
     const QUESTION: CachedQuestion<'static> = CachedQuestion {
@@ -319,12 +312,6 @@ mod tests {
         pipeline_id: "main",
         qtype: 1,
     };
-
-    fn subnet(text: &str) -> EcsKey {
-        let (address, prefix) = text.split_once('/').unwrap();
-        let prefix: u8 = prefix.parse().unwrap();
-        EcsKey::from_ip(address.parse().unwrap(), prefix, prefix)
-    }
 
     fn view(client: &str) -> EcsView {
         EcsView {

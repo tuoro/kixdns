@@ -266,20 +266,10 @@ impl EcsReach {
     /// The same for a forward that got no reply: whether the failure, and the
     /// answer reached after it, holds for other subnets is unknown, so it applies
     /// only to requests that send the same ECS.
+    /// 和读不懂 ECS 的报错应答一样，见 `reach_of` / As an error reply whose ECS cannot be read,
+    /// see `reach_of`
     pub fn record_failure(&mut self, ecs: ForwardEcs) {
-        let ForwardEcs { source, sent } = ecs;
-        if source == EcsSource::Fixed {
-            return;
-        }
-        let (reach, scope) = match sent {
-            Sent::Absent => (Reach::NoEcs, 0),
-            Sent::Subnet(subnet) => (Reach::Exactly(subnet), subnet.source_prefix),
-        };
-        self.push(Step {
-            source,
-            reach,
-            scope,
-        });
+        self.record(ecs, ReplyEcs::Unreadable, false);
     }
 
     /// 实际发出的 ECS 与推算的不一样，见 `uncacheable` / The ECS actually sent differs, see `uncacheable`
@@ -350,7 +340,7 @@ fn reach_of(sent: Sent, reply: ReplyEcs, answered: bool) -> Option<(Reach, u8)> 
         // 前缀为 0 的查询拿到的应答，只给同样前缀为 0 的查询（第 7.3.1 节），不论应答怎样
         // An answer to a query with prefix 0 serves only queries with prefix 0
         // (section 7.3.1), whatever the reply says
-        return Some((Reach::Exactly(subnet), 0));
+        return exactly;
     }
     match reply {
         // RFC 7871 第 7.3 节：带 ECS 的查询得到不带 ECS 的应答，按作用范围 0 处理。报错的应答
@@ -390,13 +380,7 @@ fn reach_of(sent: Sent, reply: ReplyEcs, answered: bool) -> Option<(Reach, u8)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn subnet(text: &str) -> EcsKey {
-        let (address, prefix) = text.split_once('/').unwrap();
-        let address: IpAddr = address.parse().unwrap();
-        let prefix: u8 = prefix.parse().unwrap();
-        EcsKey::from_ip(address, prefix, prefix)
-    }
+    use crate::ecs::subnet;
 
     fn view(peer: &str, client: Option<&str>) -> EcsView {
         EcsView {
