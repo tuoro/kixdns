@@ -1808,6 +1808,7 @@ mod tests {
     use crate::engine::rules::*;
     use crate::engine::test_support::{
         self as support, answering_upstream, answering_upstream_after, engine_from,
+        engine_with_steps,
     };
     use crate::engine::types::{InflightEntry, InflightQuestion};
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -2136,15 +2137,26 @@ mod tests {
     /// Ask the first of `COLLIDING_NAMES`, then the second while the first still waits for its
     /// upstream, and return both replies
     async fn ask_colliding_names(engine: &Engine, clients: [&str; 2]) -> [Bytes; 2] {
+        ask_two(engine, COLLIDING_NAMES, clients).await
+    }
+
+    /// 和 `COLLIDING_NAMES` 的哪个都不落在同一个键上的名字，对照用：两个请求都问它
+    /// A name on no key of `COLLIDING_NAMES`, for the controls: both requests ask it
+    const SAME_NAME: &str = "same.example.com";
+
+    /// 先问 `names` 的第一个，它还在等上游时问第二个，返回两个应答
+    /// Ask the first of `names`, then the second while the first still waits for its
+    /// upstream, and return both replies
+    async fn ask_two(engine: &Engine, names: [&str; 2], clients: [&str; 2]) -> [Bytes; 2] {
         let first = async {
             engine
-                .handle_packet(&query_for(COLLIDING_NAMES[0]), clients[0].parse().unwrap())
+                .handle_packet(&query_for(names[0]), clients[0].parse().unwrap())
                 .await
         };
         let second = async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             engine
-                .handle_packet(&query_for(COLLIDING_NAMES[1]), clients[1].parse().unwrap())
+                .handle_packet(&query_for(names[1]), clients[1].parse().unwrap())
                 .await
         };
         let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2198,7 +2210,7 @@ mod tests {
         )
         .await;
         for action in forwarding_actions(&slow.address) {
-            let engine = engine_from(config_with_default_upstream(
+            let (engine, steps) = engine_with_steps(config_with_default_upstream(
                 serde_json::json!([]),
                 serde_json::json!([{ "id": "main", "rules": [{
                     "name": "all",
@@ -2238,6 +2250,38 @@ mod tests {
                 2,
                 "{action}: each name asked upstream itself"
             );
+            // 第二个问题自己的转发发出时，第一个的转发还在等慢上游：它查到的键正被别的问题占着，自己去问，
+            // 没有挂上去
+            // The second question's own forward went out while the first's still waited on the
+            // slow upstream: the key it looked up was held by another question, and it asked
+            // itself rather than join
+            assert!(
+                steps.forwarded_while_waiting(
+                    ("10.0.0.1:53000", &slow.address),
+                    ("10.0.0.1:53001", &slow.address)
+                ),
+                "{action}: {:?}",
+                steps.taken()
+            );
+            assert!(!steps.joined("10.0.0.1:53001"), "{action}");
+
+            // 对照：两个请求问同一个问题、时序一样，第二个挂在第一个的条目上，拿到第一个的应答，上游只问一次
+            // Control: two requests asking the same question with the same timing; the second
+            // joins the first one's entry and takes its answer, and the upstream is asked once
+            let before = slow.queries();
+            let [_, second] = ask_two(
+                &engine,
+                [SAME_NAME; 2],
+                ["10.0.0.1:53002", "10.0.0.1:53003"],
+            )
+            .await;
+            assert_eq!(answered_name(&second), format!("{SAME_NAME}."), "{action}");
+            assert!(
+                steps.joined("10.0.0.1:53003"),
+                "{action}: {:?}",
+                steps.taken()
+            );
+            assert_eq!(slow.queries() - before, 1, "{action}: asked once");
         }
     }
 
@@ -2267,7 +2311,7 @@ mod tests {
             }] })
         };
         for action in forwarding_actions(&slow.address) {
-            let engine = engine_from(config_with_default_upstream(
+            let (engine, steps) = engine_with_steps(config_with_default_upstream(
                 serde_json::json!([
                     { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
                     { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
@@ -2297,6 +2341,38 @@ mod tests {
                 2,
                 "{action}: each name asked upstream itself"
             );
+            // 第二个问题自己的转发发出时，第一个的转发还在等慢上游：它查到的键正被别的问题占着，自己去问，
+            // 没有挂上去
+            // The second question's own forward went out while the first's still waited on the
+            // slow upstream: the key it looked up was held by another question, and it asked
+            // itself rather than join
+            assert!(
+                steps.forwarded_while_waiting(
+                    ("10.0.0.1:53000", &slow.address),
+                    ("10.0.0.2:53000", &slow.address)
+                ),
+                "{action}: {:?}",
+                steps.taken()
+            );
+            assert!(!steps.joined("10.0.0.2:53000"), "{action}");
+
+            // 对照：两个请求问同一个问题、时序一样，第二个挂在第一个的条目上，拿到第一个的应答，上游只问一次
+            // Control: two requests asking the same question with the same timing; the second
+            // joins the first one's entry and takes its answer, and the upstream is asked once
+            let before = slow.queries();
+            let [_, second] = ask_two(
+                &engine,
+                [SAME_NAME; 2],
+                ["10.0.0.1:53002", "10.0.0.2:53002"],
+            )
+            .await;
+            assert_eq!(answered_name(&second), format!("{SAME_NAME}."), "{action}");
+            assert!(
+                steps.joined("10.0.0.2:53002"),
+                "{action}: {:?}",
+                steps.taken()
+            );
+            assert_eq!(slow.queries() - before, 1, "{action}: asked once");
         }
     }
 
@@ -2717,12 +2793,15 @@ mod tests {
         let entry = answering_upstream("192.0.2.50".parse().unwrap(), 300)
             .await
             .address;
-        // 慢一点，保证第二个请求到达时第一个还在等它
-        // Slow, so the second request arrives while the first still waits on it
+        // 慢一点，保证后到的请求到达时先到的还在等它。两个请求先各自问 `entry`，谁先拿到回答不定，所以谁先到
+        // `checked` 也不定
+        // Slow, so the later request arrives while the earlier one still waits on it. Each
+        // first asks `entry`, and which gets its answer first may go either way, so either may
+        // reach `checked` first
         let checked = answering_upstream_after(
             "192.0.2.10".parse().unwrap(),
             300,
-            Duration::from_millis(50),
+            Duration::from_millis(200),
         )
         .await
         .address;
@@ -2738,29 +2817,62 @@ mod tests {
                 }),
             )
         };
-        let engine = engine_from(continue_config_with_timeout(
-            serde_json::json!([
-                { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-                { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-            ]),
-            serde_json::json!([
-                enter("p1"),
-                enter("p2"),
-                {
-                    "id": "shared",
-                    "rules": continue_on_match_rules(&checked, serde_json::json!([{
-                        "name": "next",
-                        "matchers": [{ "type": "any" }],
-                        "actions": [{ "type": "forward", "upstream": answering }]
-                    }]))
-                }
-            ]),
-            1000,
-        ));
+        let config = |shared_rules: serde_json::Value| {
+            continue_config_with_timeout(
+                serde_json::json!([
+                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ]),
+                serde_json::json!([
+                    enter("p1"),
+                    enter("p2"),
+                    { "id": "shared", "rules": shared_rules }
+                ]),
+                1000,
+            )
+        };
+        let (engine, steps) = engine_with_steps(config(continue_on_match_rules(
+            &checked,
+            serde_json::json!([{
+                "name": "next",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": answering }]
+            }]),
+        )));
 
         assert_eq!(
             ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
             [Some(answer); 2]
+        );
+        // 后一个请求走到 `checked` 那一步时，先到的那个在那里的转发还在等：它等在先到的那个的条目上；先到的越过了
+        // 那个应答，条目放掉以后，它才自己去问，没有挂上去拿应答
+        // When the later request got to the forward to `checked`, the earlier one's forward there
+        // still waited: it waited on the earlier one's entry, and once that one continued past the
+        // answer, letting the entry go, it asked itself rather than take an answer from it
+        let clients = ["10.0.0.1:53000", "10.0.0.2:53000"];
+        assert!(
+            steps.one_waited_on_the_other(&checked, clients),
+            "{:?}",
+            steps.taken()
+        );
+        assert!(!clients.iter().any(|client| steps.joined(client)));
+
+        // 对照：shared 的规则不越过应答，同样两个请求，后到的挂在先到的条目上，拿到 `checked` 的应答
+        // Control: the rule in shared does not continue past the answer; with the same two
+        // requests the later one joins the earlier one's entry and takes `checked`'s answer
+        let (engine, steps) = engine_with_steps(config(serde_json::json!([{
+            "name": "checked",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": checked }]
+        }])));
+        assert_eq!(
+            ask_at_once(&engine, clients).await,
+            [Some("192.0.2.10".parse().unwrap()); 2]
+        );
+        assert!(
+            clients.iter().any(|client| steps.joined(client)),
+            "{:?}",
+            steps.taken()
         );
     }
 
@@ -2858,35 +2970,67 @@ mod tests {
                 "actions": [{ "type": "jump_to_pipeline", "pipeline": target }]
             })
         };
-        let raw = serde_json::json!({
-            "settings": {
-                "default_upstream": "127.0.0.1:9",
-                "upstream_timeout_ms": 1000,
-                "enable_tcp_fallback": false,
-                "response_jump_limit": 3
-            },
-            "pipeline_select": [
-                { "pipeline": "a1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-                { "pipeline": "r", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-            ],
-            "pipelines": [
-                { "id": "a1", "rules": [jump("a1", "a2")] },
-                { "id": "a2", "rules": [jump("a2", "r")] },
-                { "id": "r", "rules": continue_on_match_rules(&checked, serde_json::json!([jump("to-t", "t")])) },
-                { "id": "t", "rules": [jump("to-u", "u")] },
-                { "id": "u", "rules": [{
-                    "name": "next",
-                    "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "forward", "upstream": answering }]
-                }] }
-            ]
-        });
-        let engine = engine_from(raw);
+        let raw = |r_rules: serde_json::Value| {
+            serde_json::json!({
+                "settings": {
+                    "default_upstream": "127.0.0.1:9",
+                    "upstream_timeout_ms": 1000,
+                    "enable_tcp_fallback": false,
+                    "response_jump_limit": 3
+                },
+                "pipeline_select": [
+                    { "pipeline": "a1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                    { "pipeline": "r", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+                ],
+                "pipelines": [
+                    { "id": "a1", "rules": [jump("a1", "a2")] },
+                    { "id": "a2", "rules": [jump("a2", "r")] },
+                    { "id": "r", "rules": r_rules },
+                    { "id": "t", "rules": [jump("to-u", "u")] },
+                    { "id": "u", "rules": [{
+                        "name": "next",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": answering }]
+                    }] }
+                ]
+            })
+        };
+        let (engine, steps) = engine_with_steps(raw(continue_on_match_rules(
+            &checked,
+            serde_json::json!([jump("to-t", "t")]),
+        )));
 
         assert_eq!(
             ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
             [None, Some(answer)]
         );
+        // 第二个请求走到 `checked` 那一步时，第一个在那里的转发还在等：它等在第一个的条目上；第一个用完了跳转次数，
+        // 条目放掉以后，它才自己去问，没有挂上去拿应答
+        // When the second request got to the forward to `checked`, the first one's forward there
+        // still waited: it waited on the first one's entry, and once the first ran out of jumps,
+        // letting the entry go, it asked itself rather than take an answer from it
+        assert!(
+            steps.waited_on("10.0.0.1:53000", &checked, "10.0.0.2:53000"),
+            "{:?}",
+            steps.taken()
+        );
+        assert!(!steps.joined("10.0.0.2:53000"));
+
+        // 对照：r 的规则不越过应答，第一个也就用不完跳转次数；同样两个请求，第二个挂在第一个的条目上，
+        // 拿到 `checked` 的应答
+        // Control: r's rule does not continue past the answer, so the first does not run out of
+        // jumps either; with the same two requests the second joins the first one's entry and
+        // takes `checked`'s answer
+        let (engine, steps) = engine_with_steps(raw(serde_json::json!([{
+            "name": "checked",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": checked }]
+        }])));
+        assert_eq!(
+            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+            [Some("192.0.2.10".parse().unwrap()); 2]
+        );
+        assert!(steps.joined("10.0.0.2:53000"), "{:?}", steps.taken());
     }
 
     /// 请求阶段到达跳转上限给出的 SERVFAIL 只属于这个请求：开着 min_ttl 时也不缓存给
@@ -3058,11 +3202,40 @@ mod tests {
                 ],
                 "pipelines": pipelines
             });
-            let engine = engine_from(raw);
+            // 对照用：跳转次数放宽到用不完 / For the control: the jump limit raised so none runs out
+            let mut roomy = raw.clone();
+            roomy["settings"]["response_jump_limit"] = serde_json::json!(limit + 10);
+            let (engine, steps) = engine_with_steps(raw);
             assert_eq!(
                 ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
                 [None, Some(answer)],
                 "{where_it_runs_out}"
+            );
+            // 第二个请求走到 `slow` 那一步时，第一个在那里的转发还在等：它等在第一个的条目上；第一个用完了跳转次数，
+            // 条目放掉以后，它才自己去问，没有挂上去拿应答
+            // When the second request got to the forward to `slow`, the first one's forward there
+            // still waited: it waited on the first one's entry, and once the first ran out of jumps,
+            // letting the entry go, it asked itself rather than take an answer from it
+            assert!(
+                steps.waited_on("10.0.0.1:53000", &slow, "10.0.0.2:53000"),
+                "{where_it_runs_out}: {:?}",
+                steps.taken()
+            );
+            assert!(!steps.joined("10.0.0.2:53000"));
+
+            // 对照：跳转次数用不完时，同样两个请求，第二个挂在第一个的条目上，拿到最终的应答
+            // Control: with jumps to spare, the same two requests: the second joins the first
+            // one's entry and takes the final answer
+            let (engine, steps) = engine_with_steps(roomy);
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
+                [Some(answer); 2],
+                "{where_it_runs_out}"
+            );
+            assert!(
+                steps.joined("10.0.0.2:53000"),
+                "{where_it_runs_out}: {:?}",
+                steps.taken()
             );
         }
     }
@@ -6529,6 +6702,18 @@ mod requester_scope_tests {
         .expect("engine")
     }
 
+    /// 同 `engine`，由 [`support::Steps`] 观察 / As `engine`, observed by [`support::Steps`]
+    fn engine_observed(
+        pipeline_select: serde_json::Value,
+        pipelines: serde_json::Value,
+    ) -> (Engine, Arc<support::Steps>) {
+        support::runtime_with_steps(runtime_config(
+            serde_json::json!({}),
+            pipeline_select,
+            pipelines,
+        ))
+    }
+
     fn rule(
         name: &str,
         matchers: serde_json::Value,
@@ -6584,8 +6769,12 @@ mod requester_scope_tests {
     /// 两个客户端同时问 / Two clients asking at once
     async fn ask_at_once(engine: &Engine, clients: [&str; 2]) -> [Option<Ipv4Addr>; 2] {
         let packet = query(false);
-        let [first, second] =
-            clients.map(|client| format!("{client}:53000").parse::<SocketAddr>().unwrap());
+        let [first, second] = clients.map(|client| {
+            // 不带端口时用 53000 / Port 53000 when none is given
+            client
+                .parse::<SocketAddr>()
+                .unwrap_or_else(|_| format!("{client}:53000").parse().unwrap())
+        });
         let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 engine.handle_packet(&packet, first),
@@ -7134,17 +7323,18 @@ mod requester_scope_tests {
     /// 进入按客户端分流的 pipeline 后，这台设备得到静态应答，或者转发给一个慢的 sink 上游。
     /// Inside a pipeline that splits by client the device gets a static answer, or
     /// a forward to a slow sink upstream.
-    async fn device_actions() -> [(&'static str, serde_json::Value); 2] {
+    async fn device_actions() -> (String, [(&'static str, serde_json::Value); 2]) {
         let sink = answering_upstream_after(SINK, 300, Duration::from_millis(100))
             .await
             .address;
-        [
+        let actions = [
             (
                 "static",
                 serde_json::json!([{ "type": "static_ip_response", "ip": "0.0.0.0" }]),
             ),
             ("slow forward", forward(&sink)),
-        ]
+        ];
+        (sink, actions)
     }
 
     /// 转发之后回答检查跳进按客户端分流的 pipeline：等在这次转发上的另一个客户端不能拿到
@@ -7156,25 +7346,54 @@ mod requester_scope_tests {
     async fn an_answer_from_a_response_jump_into_a_client_split_stays_with_its_client() {
         let relay = answering_upstream(OTHER, 300).await.address;
         let normal = answering_upstream(NORMAL, 300).await.address;
-        for (device_does, action) in device_actions().await {
-            let engine = engine(
-                serde_json::json!([]),
-                serde_json::json!([
-                    { "id": "main", "rules": [{
-                        "name": "check", "matchers": any(), "actions": forward(&relay),
-                        "response_matchers": [{ "type": "upstream_equals", "value": relay }],
-                        "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "split" }]
-                    }] },
-                    { "id": "split", "rules": [
-                        rule("device", device(), action),
-                        rule("rest", any(), forward(&normal))
-                    ] }
-                ]),
-            );
+        let (_, actions) = device_actions().await;
+        for (device_does, action) in actions {
+            let select = serde_json::json!([]);
+            let pipelines = serde_json::json!([
+                { "id": "main", "rules": [{
+                    "name": "check", "matchers": any(), "actions": forward(&relay),
+                    "response_matchers": [{ "type": "upstream_equals", "value": relay }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "split" }]
+                }] },
+                { "id": "split", "rules": [
+                    rule("device", device(), action),
+                    rule("rest", any(), forward(&normal))
+                ] }
+            ]);
+            let (engine, steps) = engine_observed(select.clone(), pipelines.clone());
             assert_eq!(
                 ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
                 [Some(SINK), Some(NORMAL)],
                 "{device_does}"
+            );
+            // 第二个客户端自己的转发发出时，设备的转发还在等：两边各问各的，没有挂上去
+            // The second client's own forward went out while the device's still waited: each asked
+            // for itself, and it did not join
+            assert!(
+                steps.forwarded_while_waiting(
+                    ("10.0.0.1:53000", &relay),
+                    ("10.0.0.2:53000", &relay)
+                ),
+                "{device_does}: {:?}",
+                steps.taken()
+            );
+            assert!(!steps.joined("10.0.0.2:53000"), "{device_does}");
+
+            // 对照：同一个客户端发两次（端口不同），第二个挂在第一个的条目上，拿到同样的应答。不同客户端之间
+            // 守住串答的，是从入口起就按客户端分开的键
+            // Control: one client asking twice (another port): the second joins the first one's
+            // entry and takes the same answer. Between different clients, what keeps answers
+            // apart is the key split by client from the entry on
+            let (engine, steps) = engine_observed(select, pipelines);
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1:53001", "10.0.0.1:53002"]).await,
+                [Some(SINK); 2],
+                "{device_does}"
+            );
+            assert!(
+                steps.joined("10.0.0.1:53002"),
+                "{device_does}: {:?}",
+                steps.taken()
             );
         }
     }
@@ -7185,22 +7404,57 @@ mod requester_scope_tests {
     #[tokio::test]
     async fn a_jump_into_a_client_split_keeps_answers_apart() {
         let normal = answering_upstream(NORMAL, 300).await.address;
-        for (device_does, action) in device_actions().await {
-            let engine = engine(
-                serde_json::json!([]),
-                serde_json::json!([
-                    { "id": "main", "rules": [rule("all", any(), serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "split" }]))] },
-                    { "id": "split", "rules": [
-                        rule("device", device(), action),
-                        rule("rest", any(), forward(&normal))
-                    ] }
-                ]),
-            );
+        let (sink, actions) = device_actions().await;
+        for (device_does, action) in actions {
+            let select = serde_json::json!([]);
+            let pipelines = serde_json::json!([
+                { "id": "main", "rules": [rule("all", any(), serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "split" }]))] },
+                { "id": "split", "rules": [
+                    rule("device", device(), action),
+                    rule("rest", any(), forward(&normal))
+                ] }
+            ]);
+            let (engine, steps) = engine_observed(select.clone(), pipelines.clone());
             assert_eq!(
                 ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
                 [Some(SINK), Some(NORMAL)],
                 "{device_does}"
             );
+            // 设备给静态应答时没有转发可等 / A device answered statically has no forward to wait on
+            if device_does == "slow forward" {
+                // 第二个客户端自己的转发发出时，设备的转发还在等：两边各问各的，没有挂上去
+                // The second client's own forward went out while the device's still waited: each asked
+                // for itself, and it did not join
+                assert!(
+                    steps.forwarded_while_waiting(
+                        ("10.0.0.1:53000", &sink),
+                        ("10.0.0.2:53000", &normal)
+                    ),
+                    "{device_does}: {:?}",
+                    steps.taken()
+                );
+            }
+            assert!(!steps.joined("10.0.0.2:53000"), "{device_does}");
+
+            // 设备给静态应答时不登记条目，没有可挂的 / A device answered statically registers no entry to join
+            if device_does == "slow forward" {
+                // 对照：同一个客户端发两次（端口不同），第二个挂在第一个的条目上，拿到同样的应答。不同客户端之间
+                // 守住串答的，是从入口起就按客户端分开的键
+                // Control: one client asking twice (another port): the second joins the first one's
+                // entry and takes the same answer. Between different clients, what keeps answers
+                // apart is the key split by client from the entry on
+                let (engine, steps) = engine_observed(select, pipelines);
+                assert_eq!(
+                    ask_at_once(&engine, ["10.0.0.1:53001", "10.0.0.1:53002"]).await,
+                    [Some(SINK); 2],
+                    "{device_does}"
+                );
+                assert!(
+                    steps.joined("10.0.0.1:53002"),
+                    "{device_does}: {:?}",
+                    steps.taken()
+                );
+            }
         }
     }
 
@@ -7211,34 +7465,73 @@ mod requester_scope_tests {
     #[tokio::test]
     async fn a_jump_chain_into_a_client_split_keeps_answers_apart() {
         let relay = answering_upstream(OTHER, 300).await.address;
+        // mid 用自己的上游，事件里分得清是哪一跳；它慢一点，保证后到 mid 的请求到达时先到的还在等它。两个请求
+        // 先各自问 `relay`，谁先拿到回答不定，所以谁先到 mid 也不定
+        // mid has an upstream of its own, so the steps tell the hops apart; it is slow, so the
+        // later request reaches mid while the earlier one still waits on it. Each first asks
+        // `relay`, and which gets its answer first may go either way, so either may reach mid
+        // first
+        let mid_relay = answering_upstream_after(OTHER, 300, Duration::from_millis(200))
+            .await
+            .address;
         let normal = answering_upstream(NORMAL, 300).await.address;
-        let checked_jump = |id: &str, target: &str| {
+        let checked_jump = |id: &str, relay: &str, target: &str| {
             serde_json::json!({ "id": id, "rules": [{
-                "name": id, "matchers": any(), "actions": forward(&relay),
+                "name": id, "matchers": any(), "actions": forward(relay),
                 "response_matchers": [{ "type": "upstream_equals", "value": relay }],
                 "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": target }]
             }] })
         };
-        for (device_does, action) in device_actions().await {
-            let engine = engine(
-                serde_json::json!([
-                    { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-                    { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-                ]),
-                serde_json::json!([
-                    checked_jump("p1", "mid"),
-                    checked_jump("p2", "mid"),
-                    checked_jump("mid", "split"),
-                    { "id": "split", "rules": [
-                        rule("device", device(), action),
-                        rule("rest", any(), forward(&normal))
-                    ] }
-                ]),
-            );
+        let (_, actions) = device_actions().await;
+        for (device_does, action) in actions {
+            let select = serde_json::json!([
+                { "pipeline": "p1", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
+                { "pipeline": "p2", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
+            ]);
+            let pipelines = serde_json::json!([
+                checked_jump("p1", &relay, "mid"),
+                checked_jump("p2", &relay, "mid"),
+                checked_jump("mid", &mid_relay, "split"),
+                { "id": "split", "rules": [
+                    rule("device", device(), action),
+                    rule("rest", any(), forward(&normal))
+                ] }
+            ]);
+            let (engine, steps) = engine_observed(select.clone(), pipelines.clone());
             assert_eq!(
                 ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
                 [Some(SINK), Some(NORMAL)],
                 "{device_does}"
+            );
+            // 两个客户端在 mid 的转发同时在等：后到的那个自己转发，两边各问各的，没有挂上去
+            // The two clients' forwards at mid waited at once: the later one forwarded itself,
+            // each asked for itself, and neither joined
+            let clients = ["10.0.0.1:53000", "10.0.0.2:53000"];
+            assert!(
+                steps.forwarded_together(&mid_relay, clients),
+                "{device_does}: {:?}",
+                steps.taken()
+            );
+            assert!(
+                !clients.iter().any(|client| steps.joined(client)),
+                "{device_does}"
+            );
+
+            // 对照：同一个客户端发两次（端口不同），第二个挂在第一个的条目上，拿到同样的应答。不同客户端之间
+            // 守住串答的，是从入口起就按客户端分开的键
+            // Control: one client asking twice (another port): the second joins the first one's
+            // entry and takes the same answer. Between different clients, what keeps answers
+            // apart is the key split by client from the entry on
+            let (engine, steps) = engine_observed(select, pipelines);
+            assert_eq!(
+                ask_at_once(&engine, ["10.0.0.1:53001", "10.0.0.1:53002"]).await,
+                [Some(SINK); 2],
+                "{device_does}"
+            );
+            assert!(
+                steps.joined("10.0.0.1:53002"),
+                "{device_does}: {:?}",
+                steps.taken()
             );
         }
     }

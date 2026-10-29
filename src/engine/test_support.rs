@@ -165,6 +165,155 @@ pub(crate) fn engine_from(config: Value) -> Engine {
     .expect("engine")
 }
 
+/// 和「等在别人的条目上」有关的观察者事件，按先后记下：哪个客户端的请求开始了、发出了转发、拿到了上游的
+/// 结果、挂到了别人的条目上
+/// The observer events that bear on waiting on another request's entry, in order: which
+/// client's request started, forwarded, got an upstream's result, or joined another's entry
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Step {
+    Started(SocketAddr),
+    Forwarded(SocketAddr, String),
+    Answered(SocketAddr, String),
+    Joined(SocketAddr),
+}
+
+/// 按先后记下 [`Step`] 的观察者 / An observer recording [`Step`]s in order
+#[derive(Default)]
+pub(crate) struct Steps(Mutex<Vec<Step>>);
+
+impl Steps {
+    fn position(&self, step: &Step) -> Option<usize> {
+        self.0.lock().iter().position(|taken| taken == step)
+    }
+
+    /// `client` 的请求挂到了别人的条目上 / `client`'s request joined another's entry
+    pub(crate) fn joined(&self, client: &str) -> bool {
+        self.position(&Step::Joined(client.parse().unwrap()))
+            .is_some()
+    }
+
+    /// `later` 发往 `later_upstream` 的转发，在 `leader` 发往 `upstream` 的转发拿到结果之前就发出了：
+    /// 两个请求同时在等，`later` 查 inflight 表时 `leader` 的条目还在，它自己转发而没有等
+    /// `later`'s forward to `later_upstream` went out before `leader`'s forward to `upstream`
+    /// got its result: both waited at once, so `leader`'s entry was there when `later` looked
+    /// in the inflight map, and it forwarded itself instead of waiting
+    pub(crate) fn forwarded_while_waiting(
+        &self,
+        (leader, upstream): (&str, &str),
+        (later, later_upstream): (&str, &str),
+    ) -> bool {
+        let (leader, later) = (leader.parse().unwrap(), later.parse().unwrap());
+        let steps = self.0.lock();
+        let at = |step: &Step| steps.iter().position(|taken| taken == step);
+        match (
+            at(&Step::Forwarded(leader, upstream.to_string())),
+            at(&Step::Forwarded(later, later_upstream.to_string())),
+            at(&Step::Answered(leader, upstream.to_string())),
+        ) {
+            (Some(first), Some(second), Some(answered)) => first < second && second < answered,
+            _ => false,
+        }
+    }
+
+    /// `later` 等在了 `leader` 发往 `upstream` 的那次转发的条目上：那次转发还在等结果时，`later` 已经
+    /// 走到了（记下了别的事件），却没有同时发往 `upstream`；它自己发往那里的转发在那次转发拿到结果之后
+    /// `later` waited on the entry of `leader`'s forward to `upstream`: while that forward
+    /// still waited for its result `later` had got there (recorded other steps) without
+    /// forwarding to `upstream` as well, and its own forward there came after that result
+    pub(crate) fn waited_on(&self, leader: &str, upstream: &str, later: &str) -> bool {
+        let (leader, later): (SocketAddr, SocketAddr) =
+            (leader.parse().unwrap(), later.parse().unwrap());
+        let steps = self.0.lock();
+        let at = |step: &Step| steps.iter().position(|taken| taken == step);
+        let (Some(forwarded), Some(answered)) = (
+            at(&Step::Forwarded(leader, upstream.to_string())),
+            at(&Step::Answered(leader, upstream.to_string())),
+        ) else {
+            return false;
+        };
+        let of_later = |step: &Step| match step {
+            Step::Started(client) | Step::Joined(client) => *client == later,
+            Step::Forwarded(client, _) | Step::Answered(client, _) => *client == later,
+        };
+        let meanwhile = &steps[forwarded + 1..answered];
+        meanwhile.iter().any(of_later)
+            && !meanwhile.contains(&Step::Forwarded(later, upstream.to_string()))
+            && steps[answered..].contains(&Step::Forwarded(later, upstream.to_string()))
+    }
+
+    /// 两个请求发往 `upstream` 的转发同时在等：后发出的那个，在先发出的那个拿到结果之前就发出了。谁先到那一步不定
+    /// The two requests' forwards to `upstream` waited at once: the later one went out before
+    /// the earlier one got its result. Which got there first may go either way
+    pub(crate) fn forwarded_together(&self, upstream: &str, [a, b]: [&str; 2]) -> bool {
+        self.forwarded_while_waiting((a, upstream), (b, upstream))
+            || self.forwarded_while_waiting((b, upstream), (a, upstream))
+    }
+
+    /// 两个请求里有一个等在了另一个发往 `upstream` 的那次转发的条目上（见 [`Self::waited_on`]）。谁先到那一步不定
+    /// One of the two requests waited on the entry of the other's forward to `upstream` (see
+    /// [`Self::waited_on`]). Which got there first may go either way
+    pub(crate) fn one_waited_on_the_other(&self, upstream: &str, [a, b]: [&str; 2]) -> bool {
+        self.waited_on(a, upstream, b) || self.waited_on(b, upstream, a)
+    }
+
+    /// 记下的全部事件，断言失败时看 / Every step recorded, for a failing assertion
+    pub(crate) fn taken(&self) -> Vec<Step> {
+        self.0.lock().clone()
+    }
+}
+
+impl crate::observe::EngineObserver for Steps {
+    fn request_started(&self, ctx: &crate::observe::RequestContext<'_>) {
+        if !ctx.background_refresh {
+            self.0.lock().push(Step::Started(ctx.client));
+        }
+    }
+
+    fn upstream_attempt(
+        &self,
+        ctx: &crate::observe::RequestContext<'_>,
+        event: &crate::observe::UpstreamAttempt<'_>,
+    ) {
+        self.0
+            .lock()
+            .push(Step::Forwarded(ctx.client, event.upstream.to_string()));
+    }
+
+    fn upstream_result(
+        &self,
+        ctx: &crate::observe::RequestContext<'_>,
+        event: &crate::observe::UpstreamResult<'_>,
+    ) {
+        self.0
+            .lock()
+            .push(Step::Answered(ctx.client, event.upstream.to_string()));
+    }
+
+    fn inflight_joined(&self, ctx: &crate::observe::RequestContext<'_>) {
+        self.0.lock().push(Step::Joined(ctx.client));
+    }
+}
+
+/// 照 `config` 建的、由 [`Steps`] 观察的引擎 / An engine built from `config`, observed by
+/// [`Steps`]
+pub(crate) fn engine_with_steps(config: Value) -> (Engine, Arc<Steps>) {
+    let config: crate::config::PipelineConfig =
+        serde_json::from_value(config).expect("parse config");
+    runtime_with_steps(RuntimePipelineConfig::from_config(config).expect("build runtime config"))
+}
+
+/// 同 [`engine_with_steps`]，从建好的运行时配置建 / As [`engine_with_steps`], from a built
+/// runtime configuration
+pub(crate) fn runtime_with_steps(runtime: RuntimePipelineConfig) -> (Engine, Arc<Steps>) {
+    let steps = Arc::new(Steps::default());
+    let engine = Engine::builder(runtime)
+        .listener_label("test".to_string())
+        .observer(steps.clone())
+        .build()
+        .expect("engine");
+    (engine, steps)
+}
+
 /// 数上游查询的测试用的设置，`extra` 覆盖在上面 / Settings for tests that count upstream
 /// queries, with `extra` on top
 pub(super) fn counting_settings(extra: Value) -> Value {
