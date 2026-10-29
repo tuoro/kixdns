@@ -106,46 +106,6 @@ pub(crate) fn domain_suffix_index_key(suffix: &str) -> &str {
 mod matcher_helpers {
     use super::*;
 
-    /// 检查 IP 是否匹配指定的 GeoIP 标签列表（大小写不敏感）
-    /// Check whether an IP matches the specified GeoIP tags (case insensitive)
-    ///
-    /// # 参数 / Parameters
-    /// - `manager`: GeoIpManager 引用 / GeoIpManager reference
-    /// - `ip`: 要检查的 IP 地址 / IP address to check
-    /// - `country_codes`: 允许的国家代码或命名标签 / Allowed country codes or named tags
-    ///
-    /// # 返回 / Returns
-    /// - `true`: IP 属于指定的国家之一 / IP belongs to one of the specified countries
-    /// - `false`: IP 不属于任何指定的国家 / IP does not belong to any specified country
-    #[inline]
-    pub fn match_geoip_country(
-        manager: &crate::matcher::geoip::GeoIpManager,
-        ip: IpAddr,
-        country_codes: &[Arc<str>],
-    ) -> bool {
-        manager.matches_any_tag(ip, country_codes)
-    }
-
-    /// 检查域名是否属于指定的 GeoSite 分类
-    /// Check if domain belongs to the specified GeoSite category
-    ///
-    /// # 参数 / Parameters
-    /// - `manager`: GeoSiteManager 引用 / GeoSiteManager reference
-    /// - `domain`: 要检查的域名 / Domain to check
-    /// - `tag`: GeoSite 标签 / GeoSite tag
-    ///
-    /// # 返回 / Returns
-    /// - `true`: 域名属于该分类 / Domain belongs to the category
-    /// - `false`: 域名不属于该分类 / Domain does not belong to the category
-    #[inline]
-    pub fn match_geosite(
-        manager: &crate::matcher::geosite::GeoSiteManager,
-        domain: &str,
-        tag: &str,
-    ) -> bool {
-        manager.matches(tag, domain)
-    }
-
     fn svc_param_ips_match<F>(
         svc_params: &[(
             hickory_proto::rr::rdata::svcb::SvcParamKey,
@@ -216,27 +176,18 @@ mod matcher_helpers {
         all_rdata_ips_match(data, &mut has_ip, predicate) && has_ip
     }
 
-    /// 检查响应消息中是否有任意 IP 匹配指定的 CIDR 列表
-    /// Check if any IP in response message matches the specified CIDR list
-    ///
-    /// # 参数 / Parameters
-    /// - `msg`: DNS 响应消息 / DNS response message
-    /// - `nets`: CIDR 网络列表 / CIDR network list
-    ///
-    /// # 返回 / Returns
-    /// - `true`: 至少有一个 IP 匹配 / At least one IP matches
-    /// - `false`: 没有IP匹配 / No IP matches
-    pub fn any_ip_matches_nets(msg: &Message, nets: &[IpNet]) -> bool {
-        let mut matches_net = |ip| nets.iter().any(|net| net.contains(&ip));
-
-        // Check Answer first, then Additionals. HTTPS/SVCB hints are part of their RDATA.
+    /// 应答里有没有满足 `predicate` 的 IP：先看 Answer 段，再看 Additional 段；HTTPS/SVCB 的地址
+    /// 提示算在它们的 RDATA 里
+    /// Whether any IP in the response passes `predicate`: the Answer section first,
+    /// then the Additionals. HTTPS/SVCB hints are part of their RDATA.
+    pub fn any_ip_matches(msg: &Message, mut predicate: impl FnMut(IpAddr) -> bool) -> bool {
         msg.answers
             .iter()
-            .any(|record| rdata_has_matching_ip(&record.data, &mut matches_net))
+            .any(|record| rdata_has_matching_ip(&record.data, &mut predicate))
             || msg
                 .additionals
                 .iter()
-                .any(|record| rdata_has_matching_ip(&record.data, &mut matches_net))
+                .any(|record| rdata_has_matching_ip(&record.data, &mut predicate))
     }
 }
 
@@ -278,8 +229,6 @@ pub struct RuntimePipeline {
     /// upstream returns (see `CacheEntry::reach`) and no longer uses it; it is kept
     /// so older configurations still load.
     pub ecs: Option<crate::config::EcsMode>,
-    /// Pipeline 内是否有 action 使用了 ECS 配置 / Whether any action in this pipeline uses ECS config
-    pub uses_ecs: bool,
     /// 这个 pipeline 的应答会不会因「谁在问」而不同：请求阶段有按客户端 IP、它的 GeoIP 国家或
     /// 私有地址、请求带不带 EDNS 判断的规则。是的话，它给一个请求的应答，不一定是同一个问题换一个
     /// 请求方时的应答。因 ECS 子网而不同的应答不算在内，缓存按子网区分它们（见 `CacheEntry::reach`）。
@@ -361,9 +310,7 @@ impl RequesterTest {
             Self::InNet(net) => net.contains(&requester.address).hash(hasher),
             Self::Private => geoip::is_private_ip(requester.address).hash(hasher),
             Self::Country(codes) => geoip_manager
-                .is_some_and(|manager| {
-                    matcher_helpers::match_geoip_country(&manager.read(), requester.address, codes)
-                })
+                .is_some_and(|manager| manager.read().matches_any_tag(requester.address, codes))
                 .hash(hasher),
             Self::Edns => requester.edns.hash(hasher),
             Self::Subnet {
@@ -726,7 +673,6 @@ fn requester_scopes(
 #[derive(Debug, Clone)]
 pub struct RuntimeRule {
     pub name: Arc<str>,
-    #[allow(dead_code)]
     pub matcher_operator: MatchOperator,
     pub matchers: Vec<RuntimeMatcherWithOp>,
     pub actions: Vec<Action>,
@@ -743,8 +689,6 @@ pub struct RuntimeRule {
 pub struct RuntimePipelineSelectRule {
     pub pipeline: String,
     pub matchers: Vec<RuntimePipelineSelectorMatcherWithOp>,
-    #[allow(dead_code)]
-    pub matcher_operator: MatchOperator,
 }
 
 #[derive(Debug, Clone)]
@@ -951,45 +895,31 @@ impl RuntimePipelineConfig {
         for p in cfg.pipelines {
             let mut rules = Vec::new();
             for r in p.rules {
-                let mut matchers = Vec::new();
-                let mut matchers_all_default = true;
-                for m in r.matchers {
-                    if m.operator != MatchOperator::And {
-                        matchers_all_default = false;
-                    }
-                    matchers.push(RuntimeMatcherWithOp {
-                        operator: m.operator,
-                        matcher: RuntimeMatcher::from_config(m.matcher)?,
-                    });
-                }
-                if matchers_all_default
-                    && !matchers.is_empty()
-                    && r.matcher_operator != MatchOperator::And
-                {
-                    for m in &mut matchers {
-                        m.operator = r.matcher_operator;
-                    }
-                }
+                let mut matchers = r
+                    .matchers
+                    .into_iter()
+                    .map(|m| {
+                        Ok(RuntimeMatcherWithOp {
+                            operator: m.operator,
+                            matcher: RuntimeMatcher::from_config(m.matcher)?,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                apply_rule_operator(&mut matchers, r.matcher_operator, |m| &mut m.operator);
 
-                let mut response_matchers = Vec::new();
-                let mut resp_all_default = true;
-                for rm in r.response_matchers {
-                    if rm.operator != MatchOperator::And {
-                        resp_all_default = false;
-                    }
-                    response_matchers.push(RuntimeResponseMatcherWithOp {
-                        operator: rm.operator,
-                        matcher: RuntimeResponseMatcher::from_config(rm.matcher)?,
-                    });
-                }
-                if resp_all_default
-                    && !response_matchers.is_empty()
-                    && r.response_matcher_operator != MatchOperator::And
-                {
-                    for rm in &mut response_matchers {
-                        rm.operator = r.response_matcher_operator;
-                    }
-                }
+                let mut response_matchers = r
+                    .response_matchers
+                    .into_iter()
+                    .map(|rm| {
+                        Ok(RuntimeResponseMatcherWithOp {
+                            operator: rm.operator,
+                            matcher: RuntimeResponseMatcher::from_config(rm.matcher)?,
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                apply_rule_operator(&mut response_matchers, r.response_matcher_operator, |rm| {
+                    &mut rm.operator
+                });
                 rules.push(RuntimeRule {
                     name: Arc::from(r.name),
                     matcher_operator: r.matcher_operator,
@@ -1003,43 +933,10 @@ impl RuntimePipelineConfig {
                 });
             }
 
-            let mut pipeline_uses_client_ip = false;
-            let mut pipeline_uses_geoip = false;
-            let mut pipeline_uses_geosite = false;
-            for r in &rules {
-                for m in &r.matchers {
-                    if matches!(m.matcher, RuntimeMatcher::ClientIp { .. }) {
-                        pipeline_uses_client_ip = true;
-                        break;
-                    }
-                    if matches!(
-                        m.matcher,
-                        RuntimeMatcher::GeoipCountry { .. } | RuntimeMatcher::GeoipPrivate { .. }
-                    ) {
-                        pipeline_uses_geoip = true;
-                    }
-                    if matches!(
-                        m.matcher,
-                        RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
-                    ) {
-                        pipeline_uses_geosite = true;
-                    }
-                }
-                if pipeline_uses_client_ip && pipeline_uses_geoip && pipeline_uses_geosite {
-                    break;
-                }
-            }
-
-            // Detect ECS usage: check if any Forward action has ecs configured
-            // 检测 ECS 使用：检查是否有 Forward action 配置了 ecs
-            let pipeline_uses_ecs = rules.iter().any(|r| {
-                r.actions
-                    .iter()
-                    .any(|a| matches!(a, crate::config::Action::Forward { ecs: Some(_), .. }))
-            });
-
             reads.push(RuleReads::of(&rules));
             let request_matchers = || rules.iter().flat_map(|rule| &rule.matchers);
+            let uses_client_ip =
+                request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::ClientIp { .. }));
             // A forward that sends an ECS subnet taken from the client does not count:
             // every cached answer is tagged with the subnets it applies to (see
             // `CacheEntry::reach`), and a lookup takes only answers for the requester's.
@@ -1061,12 +958,11 @@ impl RuntimePipelineConfig {
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
-                uses_client_ip: pipeline_uses_client_ip,
+                uses_client_ip,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 requester: RequesterScope::default(),
                 rule_requester: RequesterScope::default(),
                 ecs: p.ecs.clone(),
-                uses_ecs: pipeline_uses_ecs,
                 depends_on_requester,
                 matches_edns,
                 matches_regex,
@@ -1075,42 +971,30 @@ impl RuntimePipelineConfig {
 
         let mut pipeline_select = Vec::new();
         for s in cfg.pipeline_select {
-            let mut matchers = Vec::new();
-            let mut all_default = true;
-            for m in s.matchers {
-                if m.operator != MatchOperator::And {
-                    all_default = false;
-                }
-                matchers.push(RuntimePipelineSelectorMatcherWithOp {
-                    operator: m.operator,
-                    matcher: RuntimePipelineSelectorMatcher::from_config(m.matcher)?,
-                });
-            }
-            if all_default && !matchers.is_empty() && s.matcher_operator != MatchOperator::And {
-                for m in &mut matchers {
-                    m.operator = s.matcher_operator;
-                }
-            }
+            let mut matchers = s
+                .matchers
+                .into_iter()
+                .map(|m| {
+                    Ok(RuntimePipelineSelectorMatcherWithOp {
+                        operator: m.operator,
+                        matcher: RuntimePipelineSelectorMatcher::from_config(m.matcher)?,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            apply_rule_operator(&mut matchers, s.matcher_operator, |m| &mut m.operator);
             pipeline_select.push(RuntimePipelineSelectRule {
                 pipeline: s.pipeline,
                 matchers,
-                matcher_operator: s.matcher_operator,
             });
         }
 
         // 预处理所有 Forward action 的 upstream 字段（性能优化）/ Pre-process all Forward upstreams (performance optimization)
-        for pipeline in &mut pipelines {
-            for rule in &mut pipeline.rules {
-                for action in &mut rule.actions {
-                    action.pre_split_upstreams();
-                }
-                for action in &mut rule.response_actions_on_match {
-                    action.pre_split_upstreams();
-                }
-                for action in &mut rule.response_actions_on_miss {
-                    action.pre_split_upstreams();
-                }
-            }
+        for rule in pipelines.iter_mut().flat_map(|p| &mut p.rules) {
+            rule.actions
+                .iter_mut()
+                .chain(&mut rule.response_actions_on_match)
+                .chain(&mut rule.response_actions_on_miss)
+                .for_each(Action::pre_split_upstreams);
         }
 
         // Build O(1) pipeline id lookup index / 构建 O(1) pipeline id 查找索引
@@ -1174,66 +1058,54 @@ impl RuntimePipelineConfig {
         use crate::config::Transport;
         let mut upstreams = FxHashSet::default();
 
-        for pipeline in &self.pipelines {
-            for rule in &pipeline.rules {
-                // Check request phase actions / 检查请求阶段 actions
-                for action in &rule.actions {
-                    if let crate::config::Action::Forward {
-                        upstream,
-                        transport,
-                        ..
-                    } = action
-                    {
-                        let transport = transport.unwrap_or(Transport::Udp);
-                        if matches!(transport, Transport::Tcp | Transport::TcpUdp)
-                            && let Some(u) = upstream
-                        {
-                            // Handle comma-separated upstreams / 处理逗号分隔的 upstreams
-                            for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                                upstreams.insert(normalize_upstream_addr(addr));
-                            }
-                        }
-                    }
-                }
-                // Check response phase actions / 检查响应阶段 actions
-                for action in &rule.response_actions_on_match {
-                    if let crate::config::Action::Forward {
-                        upstream,
-                        transport,
-                        ..
-                    } = action
-                    {
-                        let transport = transport.unwrap_or(Transport::Udp);
-                        if matches!(transport, Transport::Tcp | Transport::TcpUdp)
-                            && let Some(u) = upstream
-                        {
-                            for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                                upstreams.insert(normalize_upstream_addr(addr));
-                            }
-                        }
-                    }
-                }
-                for action in &rule.response_actions_on_miss {
-                    if let crate::config::Action::Forward {
-                        upstream,
-                        transport,
-                        ..
-                    } = action
-                    {
-                        let transport = transport.unwrap_or(Transport::Udp);
-                        if matches!(transport, Transport::Tcp | Transport::TcpUdp)
-                            && let Some(u) = upstream
-                        {
-                            for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                                upstreams.insert(normalize_upstream_addr(addr));
-                            }
-                        }
-                    }
+        let actions = self
+            .pipelines
+            .iter()
+            .flat_map(|p| &p.rules)
+            .flat_map(|rule| {
+                rule.actions
+                    .iter()
+                    .chain(&rule.response_actions_on_match)
+                    .chain(&rule.response_actions_on_miss)
+            });
+        for action in actions {
+            if let crate::config::Action::Forward {
+                upstream: Some(u),
+                transport,
+                ..
+            } = action
+                && matches!(
+                    transport.unwrap_or(Transport::Udp),
+                    Transport::Tcp | Transport::TcpUdp
+                )
+            {
+                // Handle comma-separated upstreams / 处理逗号分隔的 upstreams
+                for addr in u.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    upstreams.insert(normalize_upstream_addr(addr));
                 }
             }
         }
 
         upstreams
+    }
+}
+
+/// 规则级的运算符：每个匹配器都还是默认的 and 时，由它替所有匹配器定运算符
+/// The rule-level operator: while every matcher still has the default `and`, it sets
+/// the operator of them all
+fn apply_rule_operator<T>(
+    matchers: &mut [T],
+    rule_operator: MatchOperator,
+    operator: impl Fn(&mut T) -> &mut MatchOperator,
+) {
+    if rule_operator != MatchOperator::And
+        && matchers
+            .iter_mut()
+            .all(|m| *operator(m) == MatchOperator::And)
+    {
+        for m in matchers {
+            *operator(m) = rule_operator;
+        }
     }
 }
 
@@ -1270,6 +1142,25 @@ fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> V
         .collect()
 }
 
+/// 域名匹配器的正则：状态空间和 DFA 各限 1 MB，防止复杂度攻击
+/// A domain matcher's regex: the state space and the DFA each capped at 1 MB against
+/// complexity attacks
+fn domain_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern)
+        .size_limit(1_000_000)
+        .dfa_size_limit(1_000_000)
+        .build()
+}
+
+/// 逗号分隔的 CIDR 列表，空项跳过 / A comma-separated CIDR list, empty items skipped
+fn cidr_list(cidr: &str) -> Result<Vec<IpNet>, ipnet::AddrParseError> {
+    cidr.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::parse)
+        .collect()
+}
+
 /// A `client_ip` network. The engine sees an IPv4 client on a dual-stack socket by
 /// its IPv4 address (see `client_address` in engine/execution.rs), so a network
 /// written in the IPv4-mapped form (`::ffff:a.b.c.d/n`, n of 96 or more) becomes
@@ -1303,10 +1194,7 @@ impl RuntimeMatcher {
                 net: client_net(&cidr)?,
             },
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
-                regex: RegexBuilder::new(&value)
-                    .size_limit(1_000_000)
-                    .dfa_size_limit(1_000_000)
-                    .build()?,
+                regex: domain_regex(&value)?,
             },
             config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
                 country_codes: normalize_geoip_country_codes(country_codes, "geoip_country"),
@@ -1354,9 +1242,9 @@ impl RuntimeMatcher {
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
                 // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager.map(|mgr| mgr.read()).is_some_and(|guard| {
-                    matcher_helpers::match_geoip_country(&guard, client_ip, country_codes)
-                })
+                geoip_manager
+                    .map(|mgr| mgr.read())
+                    .is_some_and(|guard| guard.matches_any_tag(client_ip, country_codes))
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 crate::matcher::geoip::is_private_ip(client_ip) == *expect
@@ -1367,13 +1255,13 @@ impl RuntimeMatcher {
                 // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
                 geosite_manager
                     .map(|mgr| mgr.read())
-                    .is_some_and(|guard| matcher_helpers::match_geosite(&guard, qname, tag))
+                    .is_some_and(|guard| guard.matches(tag, qname))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
                 // 按需获取锁：只在GeoSite matcher时才获取
                 if let Some(manager) = geosite_manager {
                     let guard = manager.read();
-                    !matcher_helpers::match_geosite(&guard, qname, tag)
+                    !guard.matches(tag, qname)
                 } else {
                     true // 无GeoSite管理器时，GeoSiteNot返回true
                 }
@@ -1418,10 +1306,7 @@ impl RuntimePipelineSelectorMatcher {
             }
             config::PipelineSelectorMatcher::DomainRegex { value } => {
                 RuntimePipelineSelectorMatcher::DomainRegex {
-                    regex: RegexBuilder::new(&value)
-                        .size_limit(1_000_000)
-                        .dfa_size_limit(1_000_000)
-                        .build()?,
+                    regex: domain_regex(&value)?,
                 }
             }
             config::PipelineSelectorMatcher::Any => RuntimePipelineSelectorMatcher::Any,
@@ -1547,39 +1432,18 @@ pub fn eval_match_chain<T>(
     };
     let mut acc = pred(first);
     for item in iter {
-        let op = op_of(item);
-        match op {
-            MatchOperator::And => {
-                if !acc {
-                    continue;
-                }
-                acc = acc && pred(item);
-            }
-            MatchOperator::Or => {
-                if acc {
-                    continue;
-                }
-                acc = acc || pred(item);
-            }
-            MatchOperator::AndNot => {
-                if !acc {
-                    continue;
-                }
-                acc = acc && !pred(item);
-            }
-            MatchOperator::OrNot => {
-                if acc {
-                    continue;
-                }
-                acc = acc || !pred(item);
-            }
-            MatchOperator::Not => {
-                if !acc {
-                    continue;
-                }
-                acc = acc && !pred(item);
-            }
+        // 前面的结果等于 `needs` 时才看这一项（否则短路），看了就取它的结果，`negate` 时取反
+        // The item is looked at only when the result so far equals `needs` (otherwise
+        // it short-circuits), and then gives its result, negated with `negate`
+        let (needs, negate) = match op_of(item) {
+            MatchOperator::And => (true, false),
+            MatchOperator::Or => (false, false),
+            MatchOperator::AndNot | MatchOperator::Not => (true, true),
+            MatchOperator::OrNot => (false, true),
         };
+        if acc == needs {
+            acc = pred(item) != negate;
+        }
     }
     acc
 }
@@ -1613,33 +1477,18 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::RequestDomainRegex { value } => {
                 RuntimeResponseMatcher::RequestDomainRegex {
-                    regex: RegexBuilder::new(&value)
-                        .size_limit(1_000_000)
-                        .dfa_size_limit(1_000_000)
-                        .build()?,
+                    regex: domain_regex(&value)?,
                 }
             }
             config::ResponseMatcher::ResponseUpstreamIp { cidr } => {
-                let mut nets = Vec::new();
-                for part in cidr.split(',') {
-                    let s = part.trim();
-                    if s.is_empty() {
-                        continue;
-                    }
-                    nets.push(s.parse()?);
+                RuntimeResponseMatcher::ResponseUpstreamIp {
+                    nets: cidr_list(&cidr)?,
                 }
-                RuntimeResponseMatcher::ResponseUpstreamIp { nets }
             }
             config::ResponseMatcher::ResponseAnswerIp { cidr } => {
-                let mut nets = Vec::new();
-                for part in cidr.split(',') {
-                    let s = part.trim();
-                    if s.is_empty() {
-                        continue;
-                    }
-                    nets.push(s.parse()?);
+                RuntimeResponseMatcher::ResponseAnswerIp {
+                    nets: cidr_list(&cidr)?,
                 }
-                RuntimeResponseMatcher::ResponseAnswerIp { nets }
             }
             config::ResponseMatcher::ResponseType { value } => {
                 RuntimeResponseMatcher::ResponseType {
@@ -1746,7 +1595,7 @@ impl RuntimeResponseMatcher {
                 .unwrap_or(false),
             RuntimeResponseMatcher::ResponseAnswerIp { nets } => {
                 // 使用辅助函数检查是否有任意 IP 匹配 CIDR / Use helper to check if any IP matches CIDR
-                matcher_helpers::any_ip_matches_nets(msg, nets)
+                matcher_helpers::any_ip_matches(msg, |ip| nets.iter().any(|net| net.contains(&ip)))
             }
             RuntimeResponseMatcher::ResponseType { value } => {
                 let rrty = msg
@@ -1784,8 +1633,7 @@ impl RuntimeResponseMatcher {
                     return false;
                 };
                 let mut has_ip = false;
-                let mut matches_country =
-                    |ip| matcher_helpers::match_geoip_country(manager, ip, country_codes);
+                let mut matches_country = |ip| manager.matches_any_tag(ip, country_codes);
                 let all_match = msg.answers.iter().all(|record| {
                     matcher_helpers::all_rdata_ips_match(
                         &record.data,
@@ -1796,23 +1644,16 @@ impl RuntimeResponseMatcher {
                 all_match && has_ip
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {
-                let mut is_private = crate::matcher::geoip::is_private_ip;
-                let has_private_ip = msg.answers.iter().any(|record| {
-                    matcher_helpers::rdata_has_matching_ip(&record.data, &mut is_private)
-                }) || msg.additionals.iter().any(|record| {
-                    matcher_helpers::rdata_has_matching_ip(&record.data, &mut is_private)
-                });
-
-                has_private_ip == *expect
+                matcher_helpers::any_ip_matches(msg, crate::matcher::geoip::is_private_ip)
+                    == *expect
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
                 // 使用辅助函数检查请求域名是否属于指定的 GeoSite 分类 / Use helper to check if request domain belongs to GeoSite category
-                geosite_manager.is_some_and(|mgr| matcher_helpers::match_geosite(mgr, qname, value))
+                geosite_manager.is_some_and(|mgr| mgr.matches(value, qname))
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
                 // 使用辅助函数检查请求域名是否不属于指定的 GeoSite 分类 / Use helper to check if request domain does NOT belong to GeoSite category
-                geosite_manager
-                    .is_some_and(|mgr| !matcher_helpers::match_geosite(mgr, qname, value))
+                geosite_manager.is_some_and(|mgr| !mgr.matches(value, qname))
             }
             RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
                 // 从响应中提取 TXT 记录 / Extract TXT records from response
@@ -1907,6 +1748,357 @@ mod client_net_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 规则级的运算符只在每个匹配器都还是默认的 and 时才替它们定；有一个写了别的运算符，就都照各自写的。
+    /// 请求规则、响应规则、pipeline 选择三处一样
+    /// The rule-level operator only sets the matchers' operators while every one of them
+    /// still has the default `and`; once one names another operator, each keeps its own.
+    /// The same for request rules, response rules and pipeline selection
+    #[test]
+    fn a_rule_operator_applies_only_while_every_matcher_has_the_default() {
+        use MatchOperator::{And, AndNot, Or};
+        let config = |default_ops: bool| {
+            let second = |kind: &str| {
+                if default_ops {
+                    serde_json::json!({ "type": kind, "value": "b.test" })
+                } else {
+                    serde_json::json!({ "type": kind, "value": "b.test", "operator": "and_not" })
+                }
+            };
+            runtime_of(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipeline_select": [{
+                    "pipeline": "main",
+                    "matcher_operator": "or",
+                    "matchers": [
+                        { "type": "domain_suffix", "value": "a.test" },
+                        second("domain_suffix")
+                    ]
+                }],
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matcher_operator": "or",
+                    "matchers": [
+                        { "type": "domain_suffix", "value": "a.test" },
+                        second("domain_suffix")
+                    ],
+                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                    "response_matcher_operator": "or",
+                    "response_matchers": [
+                        { "type": "request_domain_suffix", "value": "a.test" },
+                        second("request_domain_suffix")
+                    ],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }] }]
+            }))
+            .expect("build runtime config")
+        };
+        for (default_ops, expected) in [(true, [Or, Or]), (false, [And, AndNot])] {
+            let config = config(default_ops);
+            let rule = &config.pipelines[0].rules[0];
+            let ops = |ops: Vec<MatchOperator>| <[MatchOperator; 2]>::try_from(ops).unwrap();
+            assert_eq!(
+                ops(rule.matchers.iter().map(|m| m.operator).collect()),
+                expected
+            );
+            assert_eq!(
+                ops(rule.response_matchers.iter().map(|m| m.operator).collect()),
+                expected
+            );
+            assert_eq!(
+                ops(config.pipeline_select[0]
+                    .matchers
+                    .iter()
+                    .map(|m| m.operator)
+                    .collect()),
+                expected
+            );
+        }
+    }
+
+    /// 按 JSON 建运行时配置 / A runtime configuration built from JSON
+    fn runtime_of(raw: serde_json::Value) -> anyhow::Result<RuntimePipelineConfig> {
+        RuntimePipelineConfig::from_config(serde_json::from_value(raw).expect("parse config"))
+    }
+
+    /// 只有一条规则、规则只有 `matchers` 的 pipeline / A pipeline of one rule with `matchers`
+    fn one_rule(matchers: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": matchers,
+                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+            }] }]
+        })
+    }
+
+    /// pipeline 有一条规则按客户端 IP 判断时，就算它不是第一条，也算「按客户端 IP」；按 GeoIP、
+    /// GeoSite 判断的不算
+    /// A pipeline with a rule matching on the client IP counts as matching on it, even
+    /// when that rule is not the first; rules matching on GeoIP or GeoSite do not count
+    #[test]
+    fn a_pipeline_uses_the_client_ip_when_any_rule_matches_on_it() {
+        let uses_client_ip = |rules: serde_json::Value| {
+            runtime_of(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [{ "id": "main", "rules": rules }]
+            }))
+            .expect("build runtime config")
+            .pipelines[0]
+                .uses_client_ip
+        };
+        let rule = |name: &str, matcher: serde_json::Value| {
+            serde_json::json!({
+                "name": name,
+                "matchers": [matcher],
+                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+            })
+        };
+        let geo = rule(
+            "geo",
+            serde_json::json!({ "type": "geoip_private", "expect": true }),
+        );
+        let site = rule(
+            "site",
+            serde_json::json!({ "type": "geo_site", "value": "cn" }),
+        );
+        let client = rule(
+            "client",
+            serde_json::json!({ "type": "client_ip", "cidr": "10.0.0.0/8" }),
+        );
+        assert!(!uses_client_ip(serde_json::json!([geo, site])));
+        assert!(uses_client_ip(serde_json::json!([geo, site, client])));
+        assert!(uses_client_ip(serde_json::json!([client, geo])));
+    }
+
+    /// CIDR 列表按逗号分开，各项去掉两边的空白，空项跳过；两种响应匹配器一样
+    /// A CIDR list splits on commas, each item trimmed, empty items skipped; the same
+    /// for both response matchers
+    #[test]
+    fn a_cidr_list_trims_its_items_and_skips_empty_ones() {
+        let expected: Vec<IpNet> = vec![
+            "10.0.0.0/8".parse().unwrap(),
+            "192.0.2.0/24".parse().unwrap(),
+        ];
+        for kind in ["response_answer_ip", "response_upstream_ip"] {
+            let config = runtime_of(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                    "response_matchers": [{ "type": kind, "cidr": " 10.0.0.0/8 , ,192.0.2.0/24," }],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }] }]
+            }))
+            .expect("build runtime config");
+            let nets = match &config.pipelines[0].rules[0].response_matchers[0].matcher {
+                RuntimeResponseMatcher::ResponseAnswerIp { nets }
+                | RuntimeResponseMatcher::ResponseUpstreamIp { nets } => nets.clone(),
+                other => panic!("{kind}: {other:?}"),
+            };
+            assert_eq!(nets, expected, "{kind}");
+        }
+    }
+
+    /// 三种域名正则（请求规则、pipeline 选择、响应规则）编译时都限 1 MB：`\w{20}` 编得出，
+    /// `\w{50}` 超出上限、配置读不进来（默认上限下它编得出）
+    /// The three domain regexes (request rules, pipeline selection, response rules) all
+    /// compile within 1 MB: `\w{20}` compiles, while `\w{50}` exceeds the limit and the
+    /// configuration is refused (it compiles under the default limits)
+    #[test]
+    fn a_domain_regex_is_limited_to_a_megabyte() {
+        assert!(regex::Regex::new(r"\w{50}").is_ok());
+        let configs = |pattern: &str| {
+            [
+                one_rule(serde_json::json!([{ "type": "domain_regex", "value": pattern }])),
+                serde_json::json!({
+                    "settings": { "default_upstream": "127.0.0.1:9" },
+                    "pipeline_select": [{
+                        "pipeline": "main",
+                        "matchers": [{ "type": "domain_regex", "value": pattern }]
+                    }],
+                    "pipelines": [{ "id": "main", "rules": [] }]
+                }),
+                serde_json::json!({
+                    "settings": { "default_upstream": "127.0.0.1:9" },
+                    "pipelines": [{ "id": "main", "rules": [{
+                        "name": "r",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                        "response_matchers": [{ "type": "request_domain_regex", "value": pattern }],
+                        "response_actions_on_match": [{ "type": "allow" }]
+                    }] }]
+                }),
+            ]
+        };
+        for (which, (small, large)) in configs(r"\w{20}")
+            .into_iter()
+            .zip(configs(r"\w{50}"))
+            .enumerate()
+        {
+            assert!(runtime_of(small).is_ok(), "matcher {which}");
+            assert!(runtime_of(large).is_err(), "matcher {which}");
+        }
+    }
+
+    /// 请求阶段、命中后和未命中时三类动作里的 forward，读配置时就把逗号分开的上游拆好（各项去掉两边的
+    /// 空白，空项跳过），转发时不用每次再拆
+    /// The forwards of the request-phase, on-match and on-miss actions get their
+    /// comma-separated upstreams split when the configuration is read (each item trimmed,
+    /// empty items skipped), so forwarding does not split them again each time
+    #[test]
+    fn every_action_phase_has_its_forward_upstreams_split_ahead() {
+        let config = runtime_of(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": "192.0.2.1:53, 192.0.2.2:53" }],
+                "response_matchers": [{ "type": "upstream_equals", "value": "192.0.2.1:53" }],
+                "response_actions_on_match": [{ "type": "forward", "upstream": "192.0.2.3:53" }],
+                "response_actions_on_miss": [
+                    { "type": "forward", "upstream": " 192.0.2.4:53 ,, 192.0.2.5:53" }
+                ]
+            }] }]
+        }))
+        .expect("build runtime config");
+        let rule = &config.pipelines[0].rules[0];
+        let split_ahead = |actions: &[Action]| match &actions[0] {
+            Action::Forward {
+                pre_split_upstreams,
+                ..
+            } => pre_split_upstreams
+                .as_ref()
+                .map(|list| list.iter().map(|u| u.to_string()).collect::<Vec<_>>()),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            split_ahead(&rule.actions),
+            Some(vec!["192.0.2.1:53".to_string(), "192.0.2.2:53".to_string()])
+        );
+        assert_eq!(
+            split_ahead(&rule.response_actions_on_match),
+            Some(vec!["192.0.2.3:53".to_string()])
+        );
+        assert_eq!(
+            split_ahead(&rule.response_actions_on_miss),
+            Some(vec!["192.0.2.4:53".to_string(), "192.0.2.5:53".to_string()])
+        );
+    }
+
+    /// 预热收集请求阶段、命中后和未命中时三类动作里用 TCP（含 tcp_udp）转发的上游，逗号分开的各算
+    /// 一个，去掉协议前缀；UDP 的不算
+    /// Warm-up collects the upstreams forwarded to over TCP (tcp_udp included) by the
+    /// request-phase, on-match and on-miss actions, each of a comma-separated list on its
+    /// own, protocol prefix removed; UDP ones do not count
+    #[test]
+    fn warm_up_collects_the_tcp_upstreams_of_every_action_phase() {
+        let config = runtime_of(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "any" }],
+                "actions": [
+                    { "type": "forward", "upstream": "192.0.2.1:53, 192.0.2.2:53", "transport": "tcp" },
+                    { "type": "forward", "upstream": "192.0.2.9:53", "transport": "udp" }
+                ],
+                "response_matchers": [{ "type": "upstream_equals", "value": "192.0.2.1:53" }],
+                "response_actions_on_match": [
+                    { "type": "forward", "upstream": "tcp://192.0.2.3:53", "transport": "tcp_udp" }
+                ],
+                "response_actions_on_miss": [
+                    { "type": "forward", "upstream": "192.0.2.4:53", "transport": "tcp" },
+                    { "type": "forward", "upstream": "192.0.2.8:53" }
+                ]
+            }] }]
+        }))
+        .expect("build runtime config");
+        let mut upstreams: Vec<String> = config.collect_tcp_upstreams().into_iter().collect();
+        upstreams.sort();
+        assert_eq!(
+            upstreams,
+            [
+                "192.0.2.1:53",
+                "192.0.2.2:53",
+                "192.0.2.3:53",
+                "192.0.2.4:53"
+            ]
+        );
+    }
+
+    /// 每项带着自己的运算符，从左到右和前面的结果合起来，并且短路：and、and_not、not 只在前面
+    /// 成立时看这一项，or、or_not 只在前面不成立时看；and_not、not、or_not 取这一项的反。空链成立。
+    /// 两项、三项的链逐个穷举，核对结果和哪些项被求值了。
+    /// Each item carries its own operator and combines with the result so far from left
+    /// to right, short-circuiting: and, and_not and not look at the item only when the
+    /// result so far holds, or and or_not only when it does not; and_not, not and or_not
+    /// take the item negated. An empty chain holds. Chains of two and three items are
+    /// enumerated one by one, checking the result and which items were evaluated.
+    #[test]
+    fn a_match_chain_combines_left_to_right_and_short_circuits() {
+        const OPERATORS: [MatchOperator; 5] = [
+            MatchOperator::And,
+            MatchOperator::Or,
+            MatchOperator::AndNot,
+            MatchOperator::OrNot,
+            MatchOperator::Not,
+        ];
+        // 参考：一项一项照定义算 / Reference: one item at a time, by the definition
+        let reference = |items: &[(MatchOperator, bool)]| {
+            let mut evaluated = vec![0];
+            let mut acc = items[0].1;
+            for (idx, &(operator, value)) in items.iter().enumerate().skip(1) {
+                let (looks, negated) = match operator {
+                    MatchOperator::And => (acc, false),
+                    MatchOperator::Or => (!acc, false),
+                    MatchOperator::AndNot | MatchOperator::Not => (acc, true),
+                    MatchOperator::OrNot => (!acc, true),
+                };
+                if looks {
+                    evaluated.push(idx);
+                    acc = value != negated;
+                }
+            }
+            (acc, evaluated)
+        };
+        let check = |items: Vec<(MatchOperator, bool)>| {
+            let mut evaluated = Vec::new();
+            let result = eval_match_chain(
+                &items.iter().enumerate().collect::<Vec<_>>(),
+                |(_, (operator, _))| *operator,
+                |(idx, (_, value))| {
+                    evaluated.push(*idx);
+                    *value
+                },
+            );
+            assert_eq!((result, evaluated), reference(&items), "{items:?}");
+        };
+
+        assert!(eval_match_chain(
+            &[] as &[()],
+            |_| MatchOperator::And,
+            |_| false
+        ));
+        for first in [false, true] {
+            check(vec![(MatchOperator::And, first)]);
+            for second_op in OPERATORS {
+                for second in [false, true] {
+                    check(vec![(MatchOperator::And, first), (second_op, second)]);
+                    for third_op in OPERATORS {
+                        for third in [false, true] {
+                            check(vec![
+                                (MatchOperator::And, first),
+                                (second_op, second),
+                                (third_op, third),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+    }
     use hickory_proto::{
         op::{MessageType, OpCode},
         rr::{
