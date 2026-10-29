@@ -471,14 +471,15 @@ pub(crate) fn has_ecs(packet: &[u8]) -> bool {
         .is_some()
 }
 
-/// Extract ECS subnet info from a wire packet (for testing).
+/// Extract ECS subnet info from a wire packet (for testing): its address, SOURCE and
+/// SCOPE. The packet must be a valid message.
 /// hickory-proto 0.26+ exposes ClientSubnet fields via accessors.
 ///
-/// 从 wire 包中提取 ECS 子网信息（用于测试）。
+/// 从 wire 包中提取 ECS 子网信息（用于测试）：地址、SOURCE、SCOPE。报文必须读得出来。
 /// hickory-proto 0.26+ 通过访问器暴露 ClientSubnet 字段。
 #[cfg(test)]
 pub(crate) fn extract_ecs_info(packet: &[u8]) -> Option<(IpAddr, u8, u8)> {
-    let msg = Message::from_vec(packet).ok()?;
+    let msg = Message::from_vec(packet).expect("a valid message");
     let edns = msg.edns.as_ref()?;
     let cs = match edns.options().get(EdnsCode::Subnet)? {
         EdnsOption::Subnet(cs) => cs,

@@ -47,7 +47,7 @@ impl QueryFlags {
 
     /// 从查询报文读出，和 `parse_quick` 读出的一样 / Read off a query packet, as `parse_quick` reads them
     pub fn of(query: &[u8]) -> Self {
-        let dnssec_ok = matches!(find_opt(query), Ok(Some(opt)) if query[opt.extended_rcode_at + 2] & 0x80 != 0);
+        let dnssec_ok = matches!(find_opt(query), Ok(Some(opt)) if opt.dnssec_ok(query));
         Self::new(
             query.get(2).is_some_and(|byte| byte & 0x01 != 0),
             query.get(3).is_some_and(|byte| byte & 0x10 != 0),
@@ -258,7 +258,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             if edns_present || packet.get(owner_start) != Some(&0) {
                 return None;
             }
-            validate_edns_options(packet, fixed_end, rdata_end)?;
+            edns_options(packet, fixed_end..rdata_end)
+                .all(|option| option.is_ok())
+                .then_some(())?;
             edns_present = true;
             // TTL 字段依次是扩展 RCODE、版本和标志 / The TTL field holds the extended RCODE, the version and the flags
             edns_version = packet[next_pos + 5];
@@ -505,7 +507,7 @@ fn header_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
 /// RCODE; a message that cannot be read, or a reply signed with TSIG, is left as it is.
 fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     let asked_dnssec_ok = match find_opt(query) {
-        Ok(Some(opt)) => Some(query[opt.extended_rcode_at + 2] & 0x80 != 0),
+        Ok(Some(opt)) => Some(opt.dnssec_ok(query)),
         Ok(None) => None,
         Err(()) => return reply,
     };
@@ -514,14 +516,11 @@ fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     };
     let changed = match (asked_dnssec_ok, opt) {
         (Some(dnssec_ok), None) => with_opt(&reply, dnssec_ok, &[]),
-        (Some(dnssec_ok), Some(opt)) => {
-            let flags_at = opt.extended_rcode_at + 2;
-            ((reply[flags_at] & 0x80 != 0) != dnssec_ok).then(|| {
-                let mut copy = reply.to_vec();
-                copy[flags_at] ^= 0x80;
-                copy
-            })
-        }
+        (Some(dnssec_ok), Some(opt)) => (opt.dnssec_ok(&reply) != dnssec_ok).then(|| {
+            let mut copy = reply.to_vec();
+            copy[opt.extended_rcode_at + 2] ^= 0x80;
+            copy
+        }),
         (None, Some(opt)) if reply[opt.extended_rcode_at] == 0 => without_opt(&reply, &opt),
         (None, _) => None,
     };
@@ -689,6 +688,14 @@ struct OptRecord {
     last: bool,
 }
 
+impl OptRecord {
+    /// 这条 OPT 的 DO 位（TTL 字段第三个字节的最高位，RFC 3225 第 3 节） / This OPT's DO bit (the
+    /// top bit of the TTL field's third byte, RFC 3225 section 3)
+    fn dnssec_ok(&self, message: &[u8]) -> bool {
+        message[self.extended_rcode_at + 2] & 0x80 != 0
+    }
+}
+
 /// 走到报文 Additional 段里的 OPT 记录。报文结构不对、OPT 不止一条或出现在 Additional
 /// 以外时为 Err（RFC 6891 第 6.1.1 节：这样的报文是 FORMERR）。
 /// Walk a message to the OPT record in its Additional section. Err when the
@@ -781,36 +788,54 @@ impl EcsOption {
     }
 }
 
+/// OPT 的 RDATA（在 `rdata`）里的选项，依次给出代码和整个选项（含 4 字节的头）的范围。选项结构
+/// 不对（头或内容超出 RDATA）时给出一个 Err，之后就结束。
+/// The options in the OPT RDATA at `rdata`, in order, each its code and the range
+/// of the whole option (its 4-byte header included). A malformed option (its header
+/// or content past the RDATA) gives one Err, and then the options end.
+fn edns_options(
+    packet: &[u8],
+    rdata: std::ops::Range<usize>,
+) -> impl Iterator<Item = Result<(u16, std::ops::Range<usize>), ()>> + '_ {
+    let mut pos = rdata.start;
+    std::iter::from_fn(move || {
+        if pos >= rdata.end {
+            return None;
+        }
+        let option = pos
+            .checked_add(4)
+            .filter(|&header_end| header_end <= rdata.end)
+            .and_then(|header_end| {
+                header_end
+                    .checked_add(u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize)
+            })
+            .filter(|&end| end <= rdata.end)
+            .map(|end| (u16::from_be_bytes([packet[pos], packet[pos + 1]]), pos..end));
+        pos = option.as_ref().map_or(rdata.end, |(_, bytes)| bytes.end);
+        Some(option.ok_or(()))
+    })
+}
+
 /// OPT 的 RDATA 里的 ECS 选项（RFC 7871 第 6 节）。选项结构不对、或者不止一个 ECS 选项时为 Err。
 /// The ECS option in an OPT record's RDATA (RFC 7871 section 6). Err when the
 /// options are malformed or there is more than one ECS option.
 fn ecs_option(packet: &[u8], rdata: std::ops::Range<usize>) -> Result<Option<EcsOption>, ()> {
     let mut found = None;
-    let mut pos = rdata.start;
-    while pos < rdata.end {
-        let header_end = pos.checked_add(4).ok_or(())?;
-        if header_end > rdata.end {
-            return Err(());
-        }
-        let code = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-        let len = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
-        let end = header_end.checked_add(len).ok_or(())?;
-        if end > rdata.end {
-            return Err(());
-        }
+    for option in edns_options(packet, rdata) {
+        let (code, bytes) = option?;
         if code == 8 {
-            if len < 4 || found.is_some() {
+            let header_end = bytes.start + 4;
+            if bytes.end - header_end < 4 || found.is_some() {
                 return Err(());
             }
             found = Some(EcsOption {
-                bytes: pos..end,
                 family: u16::from_be_bytes([packet[header_end], packet[header_end + 1]]),
                 source_prefix: packet[header_end + 2],
                 scope: packet[header_end + 3],
-                address: header_end + 4..end,
+                address: header_end + 4..bytes.end,
+                bytes,
             });
         }
-        pos = end;
     }
     Ok(found)
 }
@@ -919,22 +944,13 @@ fn without_option(message: &[u8], opt: &OptRecord, code: u16) -> Result<Option<V
     debug_assert!(opt.last, "only a last OPT can change its length");
     let mut kept = Vec::new();
     let mut found = false;
-    let mut pos = opt.rdata.start;
-    while pos < opt.rdata.end {
-        let end = pos
-            .checked_add(4)
-            .filter(|&header_end| header_end <= opt.rdata.end)
-            .map(|header_end| {
-                header_end + u16::from_be_bytes([message[pos + 2], message[pos + 3]]) as usize
-            })
-            .filter(|&end| end <= opt.rdata.end)
-            .ok_or(())?;
-        if u16::from_be_bytes([message[pos], message[pos + 1]]) == code {
+    for option in edns_options(message, opt.rdata.clone()) {
+        let (option_code, bytes) = option?;
+        if option_code == code {
             found = true;
         } else {
-            kept.push(pos..end);
+            kept.push(bytes);
         }
-        pos = end;
     }
     if !found {
         return Ok(None);
@@ -957,21 +973,9 @@ const COOKIE: u16 = 10;
 /// Whether the OPT RDATA at `rdata` has an option coded `code`; false when the
 /// options are malformed
 fn has_option(message: &[u8], rdata: std::ops::Range<usize>, code: u16) -> bool {
-    let mut pos = rdata.start;
-    while let Some(end) = pos
-        .checked_add(4)
-        .filter(|&header_end| header_end <= rdata.end)
-        .map(|header_end| {
-            header_end + u16::from_be_bytes([message[pos + 2], message[pos + 3]]) as usize
-        })
-        .filter(|&end| end <= rdata.end)
-    {
-        if u16::from_be_bytes([message[pos], message[pos + 1]]) == code {
-            return true;
-        }
-        pos = end;
-    }
-    false
+    edns_options(message, rdata)
+        .map_while(Result::ok)
+        .any(|(option_code, _)| option_code == code)
 }
 
 /// 报文去掉 DNS cookie 之后的样子。没有 cookie，或者去不掉（OPT 后面还有记录、最后一条是
@@ -1171,97 +1175,7 @@ fn valid_message_len(packet: &[u8]) -> Option<usize> {
     (pos <= packet.len()).then_some(pos)
 }
 
-fn validate_edns_options(packet: &[u8], mut pos: usize, end: usize) -> Option<()> {
-    while pos < end {
-        let header_end = pos.checked_add(4)?;
-        if header_end > end {
-            return None;
-        }
-        let option_len = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
-        pos = header_end.checked_add(option_len)?;
-        if pos > end {
-            return None;
-        }
-    }
-    (pos == end).then_some(())
-}
-
 impl QuickQuery<'_> {
-    /// 检查 qname 是否匹配指定的域名（忽略大小写）
-    /// Check if qname matches the specified domain name (case-insensitive)
-    ///
-    /// # Examples
-    /// ```
-    /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
-    /// assert!(query.qname_matches("google.com"));  // 完全匹配
-    /// assert!(query.qname_matches("GOOGLE.COM"));  // 大写匹配
-    /// assert!(!query.qname_matches("example.com"));  // 不匹配
-    /// ```
-    ///
-    /// # Performance
-    /// This function is optimized for hot path usage:
-    /// - No allocation / 无分配
-    /// - Early exit on length mismatch / 长度不匹配时提前退出
-    /// - Byte-by-byte comparison with ASCII lowercasing / 逐字节比较并转为小写
-    #[inline]
-    pub fn qname_matches(&self, pattern: &str) -> bool {
-        // Fast path: length check / 快速路径：长度检查
-        if self.qname_bytes.len() != pattern.len() {
-            return false;
-        }
-
-        // Byte-by-byte comparison with ASCII lowercasing / 逐字节比较并转为小写
-        // qname_bytes is already lowercased from parse_quick() / qname_bytes 在 parse_quick() 中已经转为小写
-        // So we only need to lowercase the pattern bytes / 所以我们只需要将 pattern 字节转为小写
-        self.qname_bytes
-            .iter()
-            .zip(pattern.as_bytes())
-            .all(|(a, b)| *a == b.to_ascii_lowercase())
-    }
-
-    /// 获取 qname 的字符串表示（用于调试和日志）
-    /// Get string representation of qname (for debugging and logging)
-    ///
-    /// # Performance Warning
-    /// This function allocates a new String. Use sparingly in hot paths.
-    /// 此函数分配新的 String。在热路径中谨慎使用。
-    ///
-    /// # Safety
-    /// qname_bytes is guaranteed to be valid ASCII (and thus UTF-8) by parse_quick().
-    /// parse_quick() validates ASCII before returning QuickQuery.
-    /// ASCII is always valid UTF-8, so from_utf8_unchecked is safe.
-    /// qname_bytes 由 parse_quick() 保证为有效的 ASCII（因此也是 UTF-8）。
-    /// parse_quick() 在返回 QuickQuery 之前验证 ASCII。
-    /// ASCII 始终是有效的 UTF-8，所以 from_utf8_unchecked 是安全的。
-    ///
-    /// # Examples
-    /// ```
-    /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
-    /// println!("qname: {}", query.qname_str());  // "google.com"
-    /// ```
-    #[inline]
-    pub fn qname_str(&self) -> String {
-        // SAFETY: qname_bytes is validated ASCII from parse_quick()
-        // ASCII is always valid UTF-8
-        // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
-        // ASCII 始终是有效的 UTF-8
-        //
-        // In debug builds, we validate to catch any issues early
-        // 在 debug 构建中，我们验证以尽早发现问题
-        #[cfg(debug_assertions)]
-        {
-            std::str::from_utf8(self.qname_bytes)
-                .expect("qname_bytes should be valid UTF-8")
-                .to_string()
-        }
-        #[cfg(not(debug_assertions))]
-        unsafe {
-            std::str::from_utf8_unchecked(self.qname_bytes).to_string()
-        }
-    }
-
     /// 获取 qname 的 &str 表示（零分配，但受生命周期限制）
     /// Get &str representation of qname (zero-allocation, but lifetime-bound)
     ///
@@ -1314,7 +1228,6 @@ pub struct QuickResponse {
     /// 最大 TTL，用于后台刷新触发决策 / Maximum TTL, used for background refresh trigger decision
     pub max_ttl: u32,
     /// TC (Truncated) flag - 响应被截断，应使用 TCP 重试 / Response was truncated, retry with TCP
-    #[allow(dead_code)]
     pub truncated: bool,
 }
 
@@ -1457,7 +1370,7 @@ fn well_formed_records(packet: &[u8]) -> Option<()> {
                 return None;
             }
             opt_seen = true;
-            validate_edns_options(packet, rdata.start, rdata.end)?;
+            // 选项结构不对时 `ecs_option` 也是 Err / `ecs_option` is Err for malformed options too
             match ecs_option(packet, rdata.clone()) {
                 Ok(None) => {}
                 Ok(Some(ecs)) if ecs.is_well_formed(packet) => {}
@@ -1612,8 +1525,6 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
     let an_count = u16::from_be_bytes([packet[6], packet[7]]);
     let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
-    // We don't strictly need NS and AR counts for TTL, but we iterate through them if we want to be thorough. / 对于 TTL，我们并不严格需要 NS 和 AR 计数，但如果想彻底，可以遍历它们
-    // For caching, we usually care about Answer section TTLs. / 对于缓存，我们通常关心 Answer 部分的 TTL
 
     if an_count == 0 {
         // RFC 2308 §5: For negative responses (NXDOMAIN/NODATA), the negative
@@ -1622,20 +1533,14 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         //
         // RFC 2308 §5: 对于否定响应 (NXDOMAIN/NODATA)，负缓存 TTL 为 authority 中
         // SOA 的 min(SOA.minimum, SOA.ttl)。无 SOA 时返回 TTL=0（按 RFC 2308 §4 不可缓存）。
-        if ns_count > 0
-            && let Some(neg_ttl) = extract_soa_negative_ttl_wire(packet, qd_count, ns_count)
-        {
-            return Some(QuickResponse {
-                rcode,
-                min_ttl: neg_ttl,
-                max_ttl: neg_ttl,
-                truncated,
-            });
-        }
+        let ttl = (ns_count > 0)
+            .then(|| extract_soa_negative_ttl_wire(packet, qd_count, ns_count))
+            .flatten()
+            .unwrap_or(0);
         return Some(QuickResponse {
             rcode,
-            min_ttl: 0,
-            max_ttl: 0,
+            min_ttl: ttl,
+            max_ttl: ttl,
             truncated,
         });
     }
@@ -1654,6 +1559,8 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         pos += 4;
     }
 
+    // 至少有一条应答记录（上面已返回 an_count 为 0 的情况），所以两者都会被下面设过
+    // There is at least one answer record (an_count 0 returned above), so both get set below
     let mut min_ttl = u32::MAX;
     let mut max_ttl = u32::MIN;
 
@@ -1687,13 +1594,6 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
         pos += 10 + rd_len;
-    }
-
-    if min_ttl == u32::MAX {
-        min_ttl = 0;
-    }
-    if max_ttl == u32::MIN {
-        max_ttl = 0;
     }
 
     Some(QuickResponse {
@@ -1955,6 +1855,14 @@ fn map_record_ttls(packet: &mut [u8], mut f: impl FnMut(u32) -> u32) {
 mod tests {
     use super::*;
 
+    /// 末尾加一条类型为 TSIG 的记录（根名、类别 ANY、TTL 0、空 RDATA），记进 Additional 的计数
+    /// Append a TSIG-typed record (root name, class ANY, TTL 0, empty RDATA), counted in
+    /// Additional
+    fn push_bare_tsig(message: &mut Vec<u8>) {
+        message.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0]);
+        message[11] += 1;
+    }
+
     /// 一个回答：两条 A 记录（TTL 5 和 100000），外加一条带 DO 位的 OPT
     /// An answer of two A records (TTLs 5 and 100000) and an OPT with the DO bit set
     fn answer_with_ttls_and_opt() -> Vec<u8> {
@@ -2017,10 +1925,7 @@ mod tests {
             RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, 1)),
         ));
         let mut signed = msg.to_vec().unwrap();
-        // 末尾一条 TSIG（根名、类型 250、类别 ANY、TTL 0、空 RDATA）
-        // A trailing TSIG (root name, type 250, class ANY, TTL 0, empty RDATA)
-        signed[11] = 1;
-        signed.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0]);
+        push_bare_tsig(&mut signed);
         let reply = Bytes::from(signed);
         assert_eq!(reply_within_ttls(reply.clone(), 60, 3600), reply);
     }
@@ -2953,13 +2858,155 @@ mod tests {
         }
 
         fn parsed_ecs(packet: &[u8]) -> Option<(IpAddr, u8, u8)> {
-            let msg = Message::from_vec(packet).expect("still a valid message");
-            match msg.edns.as_ref()?.options().get(EdnsCode::Subnet)? {
-                EdnsOption::Subnet(subnet) => {
-                    Some((subnet.addr(), subnet.source_prefix(), subnet.scope_prefix()))
-                }
-                _ => None,
+            crate::ecs::extract_ecs_info(packet)
+        }
+
+        /// 把 `options` 原样放进 `message` 的 OPT：OPT 必须是最后一条记录，RDATA 为空
+        /// Put `options` as they are into `message`'s OPT, which must be the last record
+        /// and have empty RDATA
+        fn with_raw_options(mut message: Vec<u8>, options: &[u8]) -> Vec<u8> {
+            let rdlen_at = message.len() - 2;
+            assert_eq!(message[rdlen_at..], [0, 0], "an OPT with empty RDATA last");
+            message[rdlen_at..].copy_from_slice(&(options.len() as u16).to_be_bytes());
+            message.extend_from_slice(options);
+            message
+        }
+
+        /// 带 OPT、OPT 里没有选项的 example.com A 查询 / A query for example.com A with an
+        /// OPT that has no options
+        fn query_with_opt() -> Vec<u8> {
+            let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+            msg.add_query(Query::query(
+                Name::from_str("example.com.").unwrap(),
+                RecordType::A,
+            ));
+            let mut edns = Edns::new();
+            edns.set_max_payload(1232);
+            msg.edns = Some(edns);
+            msg.to_vec().unwrap()
+        }
+
+        /// 198.51.100.0/24 的 ECS 选项，SCOPE 0 / The ECS option for 198.51.100.0/24, SCOPE 0
+        const ECS: [u8; 11] = [0, 8, 0, 7, 0, 1, 24, 0, 198, 51, 100];
+        /// 一个结构正确的别的选项 / Another, well-formed option
+        const OTHER: [u8; 6] = [0xFD, 0xE9, 0, 2, 7, 7];
+        /// 头只有两个字节的选项 / An option with only two bytes of header
+        const CUT_HEADER: [u8; 2] = [0, 10];
+        /// 说有 9 个字节、只带了 2 个的选项 / An option claiming 9 bytes and carrying 2
+        const OVERRUN: [u8; 6] = [0, 10, 0, 9, 1, 2];
+
+        /// 结构不对的选项：不止一个 ECS、ECS 不足 4 个字节，或者某个选项的头或内容超出了 RDATA
+        /// （不论在 ECS 之前还是之后）
+        /// Malformed options: more than one ECS, an ECS of fewer than 4 bytes, or an
+        /// option whose header or content runs past the RDATA (before the ECS or after it)
+        fn malformed_options() -> Vec<(&'static str, Vec<u8>)> {
+            vec![
+                ("two ECS options", [ECS, ECS].concat()),
+                ("an ECS of 3 bytes", vec![0, 8, 0, 3, 0, 1, 24]),
+                (
+                    "a cut header after the ECS",
+                    [&ECS[..], &CUT_HEADER].concat(),
+                ),
+                ("an overrun after the ECS", [&ECS[..], &OVERRUN].concat()),
+                ("a cut header alone", CUT_HEADER.to_vec()),
+                ("an overrun alone", OVERRUN.to_vec()),
+            ]
+        }
+
+        /// 应答的选项结构不对时，它的 ECS 读不出来；结构对的照常读出
+        /// A reply whose options are malformed has an ECS that cannot be read; well-formed
+        /// ones are read as usual
+        #[test]
+        fn malformed_options_make_the_replys_ecs_unreadable() {
+            let reply_with = |options: &[u8]| with_raw_options(reply(true, None, false), options);
+            for (what, options) in malformed_options() {
+                assert_eq!(
+                    reply_ecs(&reply_with(&options)),
+                    (ReplyEcs::Unreadable, true),
+                    "{what}"
+                );
             }
+            let read = ReplyEcs::Subnet {
+                subnet: subnet("198.51.100.0", 24),
+                scope: 0,
+            };
+            assert_eq!(reply_ecs(&reply_with(&ECS)), (read, true));
+            assert_eq!(
+                reply_ecs(&reply_with(&[&OTHER[..], &ECS, &OTHER].concat())),
+                (read, true)
+            );
+            assert_eq!(reply_ecs(&reply_with(&OTHER)), (ReplyEcs::Absent, true));
+        }
+
+        /// 选项的头或内容超出 OPT 的 RDATA 时，应答去不掉 ECS，原样以 Err 交回（不论坏选项在 ECS 之前
+        /// 还是之后）。结构对的去掉每一个 ECS 选项（两个也好、不足 4 个字节也好），留下别的选项
+        /// A reply whose options' header or content runs past the OPT's RDATA cannot lose
+        /// its ECS and is handed back in Err, whether the bad option comes before the ECS
+        /// or after it. A well-formed one loses every ECS option (two of them, or one of
+        /// fewer than 4 bytes, as well) and keeps the others
+        #[test]
+        fn a_reply_whose_options_run_past_the_opt_is_not_kept() {
+            let reply_with = |options: &[u8]| with_raw_options(reply(true, None, false), options);
+            for (what, options) in [
+                (
+                    "a cut header after the ECS",
+                    [&ECS[..], &CUT_HEADER].concat(),
+                ),
+                ("an overrun after the ECS", [&ECS[..], &OVERRUN].concat()),
+                ("a cut header alone", CUT_HEADER.to_vec()),
+                ("an overrun alone", OVERRUN.to_vec()),
+            ] {
+                let packet = Bytes::from(reply_with(&options));
+                assert_eq!(without_ecs(packet.clone()), Err(packet), "{what}");
+            }
+            let without = |options: &[u8]| without_ecs(Bytes::from(reply_with(options)));
+            assert_eq!(
+                without(&[&OTHER[..], &ECS, &OTHER].concat()),
+                Ok(Bytes::from(reply_with(&[OTHER, OTHER].concat())))
+            );
+            assert_eq!(
+                without(&[ECS, ECS].concat()),
+                Ok(Bytes::from(reply_with(&[])))
+            );
+            assert_eq!(
+                without(&[0, 8, 0, 3, 0, 1, 24]),
+                Ok(Bytes::from(reply_with(&[])))
+            );
+        }
+
+        /// 查询的选项头或内容超出 OPT 的 RDATA 时，查询读不出来；结构对的照常读出
+        /// A query whose options' header or content runs past the OPT's RDATA cannot be
+        /// read; a well-formed one is read as usual
+        #[test]
+        fn a_query_whose_options_run_past_the_opt_is_not_read() {
+            let mut buf = [0u8; 256];
+            for (what, options) in [
+                ("a cut header", CUT_HEADER.to_vec()),
+                ("an overrun", OVERRUN.to_vec()),
+                (
+                    "a cut header after another",
+                    [&OTHER[..], &CUT_HEADER].concat(),
+                ),
+                ("an overrun after another", [&OTHER[..], &OVERRUN].concat()),
+            ] {
+                assert!(
+                    parse_quick(&with_raw_options(query_with_opt(), &options), &mut buf).is_none(),
+                    "{what}"
+                );
+            }
+            let query = with_raw_options(query_with_opt(), &[OTHER, OTHER].concat());
+            assert!(parse_quick(&query, &mut buf).is_some());
+        }
+
+        /// 选项结构不对的应答不算结构完整；结构对的算
+        /// A reply whose options are malformed is not well formed; a well-formed one is
+        #[test]
+        fn a_reply_with_malformed_options_is_not_well_formed() {
+            let reply_with = |options: &[u8]| with_raw_options(reply(true, None, false), options);
+            for (what, options) in malformed_options() {
+                assert!(!well_formed_reply(&reply_with(&options)), "{what}");
+            }
+            assert!(well_formed_reply(&reply_with(&[&OTHER[..], &ECS].concat())));
         }
 
         #[test]
@@ -3150,9 +3197,7 @@ mod tests {
             let name = Name::from_str("example.com.").unwrap();
             msg.add_query(Query::query(name.clone(), RecordType::A));
             let mut packet = msg.to_vec().unwrap();
-            // A TSIG-typed record at the end of Additional / Additional 末尾一条 TSIG 类型的记录
-            packet.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0]);
-            packet[11] = 1;
+            super::push_bare_tsig(&mut packet);
             assert_eq!(with_ecs_echo(&packet, &subnet("203.0.113.0", 24), 0), None);
             packet[11] = 0;
             packet.truncate(packet.len() - 11);
@@ -3285,9 +3330,7 @@ mod tests {
         #[test]
         fn a_cookie_before_a_tsig_is_left_alone() {
             let mut packet = query(true, false);
-            // A TSIG-typed record at the end of Additional / Additional 末尾一条 TSIG 类型的记录
-            packet.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0]);
-            packet[11] += 1;
+            super::push_bare_tsig(&mut packet);
             assert!(matches!(query_without_cookie(&packet), Cow::Borrowed(_)));
         }
     }
