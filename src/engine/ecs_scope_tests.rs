@@ -181,13 +181,7 @@ fn query(subnet: Option<(&str, u8)>) -> Vec<u8> {
 
 /// 应答里的 ECS：地址、SOURCE、SCOPE / The ECS in a reply: address, SOURCE, SCOPE
 fn reply_ecs(response: &Bytes) -> Option<(IpAddr, u8, u8)> {
-    let response = Message::from_bytes(response).expect("parse");
-    match response.edns.as_ref()?.options().get(EdnsCode::Subnet)? {
-        EdnsOption::Subnet(subnet) => {
-            Some((subnet.addr(), subnet.source_prefix(), subnet.scope_prefix()))
-        }
-        _ => None,
-    }
+    crate::ecs::extract_ecs_info(response)
 }
 
 fn peer(client: &str) -> SocketAddr {
