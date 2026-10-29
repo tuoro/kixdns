@@ -851,20 +851,20 @@ fn skip_field(data: &[u8], pos: &mut usize, wire_type: u8) -> anyhow::Result<()>
             parse_varint(data, pos)?;
         }
         1 => {
-            if *pos + 8 > data.len() {
+            if runs_past(*pos, 8, data.len()) {
                 anyhow::bail!("invalid domain data: incomplete fixed64");
             }
             *pos += 8;
         }
         5 => {
-            if *pos + 4 > data.len() {
+            if runs_past(*pos, 4, data.len()) {
                 anyhow::bail!("invalid domain data: incomplete fixed32");
             }
             *pos += 4;
         }
         2 => {
             let len = parse_varint(data, pos)?;
-            if *pos + len > data.len() {
+            if runs_past(*pos, len, data.len()) {
                 anyhow::bail!("invalid domain data: incomplete length-delimited");
             }
             *pos += len;
@@ -886,7 +886,7 @@ fn parse_attribute_key(data: &[u8]) -> Option<String> {
         match field_tag {
             1 => {
                 let len = parse_varint(data, &mut pos).ok()?;
-                if pos + len > data.len() {
+                if runs_past(pos, len, data.len()) {
                     return None;
                 }
                 return std::str::from_utf8(&data[pos..pos + len])
@@ -995,6 +995,15 @@ fn varint_len(value: u64) -> anyhow::Result<usize> {
     usize::try_from(value).context("varint in .dat file too large")
 }
 
+/// 从 `pos` 起的 `len` 个字节是否越出 `end`。`len` 是文件里读出来的，可以接近 u64::MAX：
+/// 加起来溢出也算越出，不能让回绕成的小数通过检查、把读的位置退回前面
+/// Whether `len` bytes from `pos` run past `end`. `len` is read from the file and may come
+/// close to u64::MAX: a sum that overflows runs past too, rather than wrapping to a small
+/// number that passes the check and moves the reading position back
+fn runs_past(pos: usize, len: usize, end: usize) -> bool {
+    pos.checked_add(len).is_none_or(|stop| stop > end)
+}
+
 impl GeoSiteManager {
     /// 从 V2Ray 格式文件加载 GeoSite 数据 / Load GeoSite data from V2Ray format file
     ///
@@ -1071,7 +1080,7 @@ impl GeoSiteManager {
             // caught in the act) is rejected outright: otherwise the caller takes
             // the part that was read as the complete file and drops every tag the
             // rest of it holds.
-            if pos + entry_len > content.len() {
+            if runs_past(pos, entry_len, content.len()) {
                 anyhow::bail!(
                     "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
                     content.len() - pos
@@ -1094,7 +1103,7 @@ impl GeoSiteManager {
 
                     let inner_len = parse_varint(&content, &mut pos)?;
 
-                    if pos + inner_len > entry_end {
+                    if runs_past(pos, inner_len, entry_end) {
                         break;
                     }
 
@@ -1426,7 +1435,7 @@ impl GeoSiteManager {
             // caught in the act) is rejected outright: otherwise the caller takes
             // the part that was read as the complete file and drops every tag the
             // rest of it holds.
-            if pos + entry_len > file.len {
+            if runs_past(pos, entry_len, file.len) {
                 anyhow::bail!(
                     "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
                     file.len - pos
@@ -1451,7 +1460,7 @@ impl GeoSiteManager {
                 }
                 let inner_tag = file.next_byte()?;
                 let inner_len = file.varint()?;
-                if file.pos + inner_len > entry_end {
+                if runs_past(file.pos, inner_len, entry_end) {
                     break None;
                 }
                 // 0x0A: tag/country_code (string, field 1)
@@ -1508,7 +1517,7 @@ impl GeoSiteManager {
             while file.pos < entry_end {
                 let inner_tag = file.next_byte()?;
                 let inner_len = file.varint()?;
-                if file.pos + inner_len > entry_end {
+                if runs_past(file.pos, inner_len, entry_end) {
                     break;
                 }
                 if inner_tag != 0x12 {
@@ -1594,7 +1603,7 @@ impl GeoSiteManager {
         while file.pos < entry_end {
             let inner_tag = file.next_byte()?;
             let inner_len = file.varint()?;
-            if file.pos + inner_len > entry_end {
+            if runs_past(file.pos, inner_len, entry_end) {
                 break;
             }
             if inner_tag != 0x12 {
@@ -1656,7 +1665,7 @@ impl GeoSiteManager {
                         anyhow::bail!("invalid wire type for value field");
                     }
                     let value_len = parse_varint(data, &mut pos)?;
-                    if pos + value_len > data.len() {
+                    if runs_past(pos, value_len, data.len()) {
                         anyhow::bail!("invalid domain data: incomplete value string");
                     }
                     domain.value = Some(&data[pos..pos + value_len]);
@@ -1669,7 +1678,7 @@ impl GeoSiteManager {
                         anyhow::bail!("invalid wire type for attribute field");
                     }
                     let attr_len = parse_varint(data, &mut pos)?;
-                    if pos + attr_len > data.len() {
+                    if runs_past(pos, attr_len, data.len()) {
                         anyhow::bail!("invalid domain data: incomplete attribute");
                     }
                     if with_attrs && let Some(key) = parse_attribute_key(&data[pos..pos + attr_len])
@@ -2519,6 +2528,119 @@ mod tests {
         let mut attribute = vec![(4 << 3) | 3];
         attribute.extend(encode_str(1, "ads"));
         assert_eq!(parse_attribute_key(&attribute), None);
+    }
+
+    /// 在另一个线程里跑 `parse`，5 秒内要有结果：坏的长度既不能让解析 panic，也不能让它原地打转
+    /// Runs `parse` on another thread and wants its result within 5 s: a bad length may
+    /// neither make parsing panic nor leave it going round in circles
+    fn within_five_seconds<T: Send + 'static>(parse: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(parse());
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("parsing must neither panic nor hang")
+    }
+
+    /// 文件里读出的长度大到「位置 + 长度」溢出时（u64::MAX，或者刚好回绕到 0）：外层条目的长度让整份
+    /// 文件被拒绝；条目里某个字段的长度让这个条目到此为止，和别的越出条目的字段一样；Domain、
+    /// Attribute 消息里的长度让它读不出。都不 panic、不原地打转。按需、全部和完整三种解析都验。
+    /// 只有损坏或特意构造的数据文件会碰到
+    /// A length read from the file so large that position plus length overflows (u64::MAX,
+    /// or one that wraps to exactly 0): an outer entry's length gets the whole file
+    /// refused; a field's length inside an entry ends that entry there, like any other
+    /// field running past its entry; a length inside a Domain or Attribute message leaves
+    /// it unreadable. None panics or goes round in circles. Selective, every-tag and full
+    /// parsing are all checked. Only a broken or deliberately crafted data file gets here
+    #[test]
+    fn a_length_that_overflows_the_position_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = build_geosite("CN", &[build_domain(3, "good.example", &[])]);
+        // 长度 varint 之后的位置是 11（1 字节字段头加 10 字节 varint），所以 2^64 - 11 刚好回绕到 0
+        // The position after the length varint is 11 (a 1-byte key and a 10-byte varint),
+        // so 2^64 - 11 wraps to exactly 0
+        for huge in [usize::MAX, usize::MAX - 10] {
+            for before in [Vec::new(), encode_ld(1, &good)] {
+                let mut data = before.clone();
+                data.push(0x0A);
+                data.extend(encode_varint(huge));
+                let path = dir.path().join("outer.dat");
+                std::fs::write(&path, data).unwrap();
+                let tags = vec!["cn".to_string()];
+                for every in [false, true] {
+                    let (path, tags) = (path.clone(), tags.clone());
+                    let parsed = within_five_seconds(move || {
+                        if every {
+                            GeoSiteManager::parse_file(&path, &[]).map(|_| ())
+                        } else {
+                            GeoSiteManager::parse_dat_file_selective(&path, &tags).map(|_| ())
+                        }
+                    });
+                    assert!(parsed.is_err(), "outer {huge}, every tag {every}");
+                }
+                let full =
+                    within_five_seconds(move || GeoSiteManager::parse_dat_file(&path).map(|_| ()));
+                assert!(full.is_err(), "outer {huge}, full");
+            }
+
+            // 条目里的字段：放在 tag 前面时整个条目不要，放在一条好域名后面时只留下那条
+            // A field inside an entry: before the tag it drops the whole entry, after a good
+            // domain only that domain stays
+            let mut bad_field = vec![0x12];
+            bad_field.extend(encode_varint(huge));
+            let mut tag_first = encode_str(1, "CN");
+            tag_first.extend(encode_ld(2, &build_domain(3, "good.example", &[])));
+            tag_first.extend(&bad_field);
+            let mut field_first = bad_field.clone();
+            field_first.extend(encode_str(1, "CN"));
+            for (entry, kept) in [(tag_first, true), (field_first, false)] {
+                let path = dir.path().join("inner.dat");
+                std::fs::write(&path, build_dat(&[entry])).unwrap();
+                let tags = vec!["cn".to_string()];
+                let (selective, every, full) = within_five_seconds(move || {
+                    let found = |parsed: anyhow::Result<ParsedGeoSite>| {
+                        parsed
+                            .unwrap()
+                            .iter()
+                            .any(|(tag, matchers)| tag == "cn" && matchers.matches("good.example"))
+                    };
+                    (
+                        found(GeoSiteManager::parse_dat_file_selective(&path, &tags)),
+                        found(GeoSiteManager::parse_file(&path, &[])),
+                        found(GeoSiteManager::parse_dat_file(&path)),
+                    )
+                });
+                assert_eq!(
+                    [selective, every, full],
+                    [kept; 3],
+                    "inner {huge}, kept {kept}"
+                );
+            }
+
+            // Domain、Attribute 消息里的值、属性和未知字段 / Values, attributes and unknown
+            // fields in Domain and Attribute messages
+            for key in [(2 << 3) | 2, (3 << 3) | 2, (7 << 3) | 2] {
+                let mut message = vec![key];
+                message.extend(encode_varint(huge));
+                assert!(
+                    within_five_seconds({
+                        let message = message.clone();
+                        move || GeoSiteManager::read_domain(&message, true).is_err()
+                    }),
+                    "domain field {key:#x}, {huge}"
+                );
+            }
+            for key in [(1 << 3) | 2, (7 << 3) | 2] {
+                let mut message = vec![key];
+                message.extend(encode_varint(huge));
+                assert_eq!(
+                    within_five_seconds(move || parse_attribute_key(&message)),
+                    None,
+                    "attribute field {key:#x}, {huge}"
+                );
+            }
+        }
     }
 
     /// 截断的文件（写入中断）必须整份拒绝，而不是把读到的部分当成完整版本。
