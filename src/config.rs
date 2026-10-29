@@ -308,6 +308,11 @@ pub struct MergedForward {
     /// Pre-split upstream list with transport prefixes (for Decision::Forward.pre_split_upstreams)
     /// 预分割的带协议前缀的上游列表（用于 Decision::Forward.pre_split_upstreams）
     pub upstream_list: Arc<Vec<Arc<str>>>,
+    /// 合并后这一次转发发出的 ECS：几个 forward 的 ecs 写得一样时就是它，写得不一样时为 None，
+    /// 和不写 ecs 一样（见 `Rule::shared_forward_ecs`）
+    /// The ECS this one merged forward sends: the forwards' ecs when they all write the
+    /// same, None when they differ, as without ecs (see `Rule::shared_forward_ecs`)
+    pub ecs: Option<EcsMode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -580,6 +585,28 @@ impl Action {
 
 /// Rule helper functions / Rule 辅助函数
 impl Rule {
+    /// 合并转发时问的那几个 forward（写了 upstream 的）共用的 ecs：写得一样时就是它，
+    /// 写得不一样时为 Err。合并后只有一次转发，只能发一个 ECS
+    /// The ecs shared by the forwards a merged forward asks (those with an upstream
+    /// written): it when they all write the same, Err when they differ. The merge is a
+    /// single forward and can send only one ECS
+    pub(crate) fn shared_forward_ecs(&self) -> Result<Option<&EcsMode>, ()> {
+        let mut ecs = self.actions.iter().filter_map(|action| match action {
+            Action::Forward {
+                upstream: Some(_),
+                ecs,
+                ..
+            } => Some(ecs.as_ref()),
+            _ => None,
+        });
+        let first = ecs.next().flatten();
+        if ecs.all(|other| other == first) {
+            Ok(first)
+        } else {
+            Err(())
+        }
+    }
+
     /// Pre-compute merged upstream list for rules with multiple Forward actions.
     /// Extracts the transport-aware merge logic from the runtime hot path into a one-time
     /// computation at config load, eliminating per-request FxHashSet + format! + join overhead.
@@ -688,6 +715,9 @@ impl Rule {
             self.merged_forward = Some(MergedForward {
                 upstream_str: Arc::from(merged_str.as_str()),
                 upstream_list: Arc::new(all_upstreams),
+                // 写得不一样时不发，启动时 `problems` 记一条警告 / None when they differ;
+                // at startup `problems` logs a warning
+                ecs: self.shared_forward_ecs().ok().flatten().cloned(),
             });
         }
     }
@@ -1247,7 +1277,7 @@ fn default_enable_tcp_fallback() -> bool {
 /// - `Clear`: 剥离客户端自带的 ECS（隐私保护）/ Strip client-provided ECS (privacy)
 /// - `FromClientIp`: 从客户端来源 IP 推导 ECS 子网 / Derive ECS subnet from client source IP
 /// - `Static`: 使用固定 IP/前缀（伪装特定地理位置）/ Use fixed IP/prefix (spoof geo-location)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum EcsMode {
     /// 剥离查询中的 ECS OPT 选项。
@@ -1406,6 +1436,11 @@ pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
 }
 
 const EMPTY_DOMAIN_MATCHER: &str = "an empty domain matcher matches every name";
+
+/// 一条规则里几个 forward 的 ecs 写得不一样：它们合成一次转发，只能发一个 ECS，所以一个也不发
+/// A rule whose forwards write different ecs: they merge into one forward, which can send
+/// one ECS only, so none is sent
+const MERGED_ECS_DIFFER: &str = "its forward actions are asked together as one forward, which sends one ECS, but their ecs settings differ, so none of them is sent; write the same ecs on each, or split them into separate rules";
 const EMPTY_EXACT_MATCHER: &str = "an empty domain_exact matches only the root name";
 
 /// 一个上游也没写：每个查询都会失败 / Not a single upstream written: every query would fail
@@ -1426,6 +1461,14 @@ fn rule_problems(
 ) {
     use crate::engine::response::{static_cname_target, static_ips, txt_size_problem};
 
+    let forwards = rule
+        .actions
+        .iter()
+        .filter(|action| matches!(action, Action::Forward { .. }))
+        .count();
+    if forwards > 1 && rule.shared_forward_ecs().is_err() {
+        report(MERGED_ECS_DIFFER.to_string());
+    }
     for matcher in &rule.matchers {
         if let Matcher::DomainSuffix { value } | Matcher::DomainRegex { value } = &matcher.matcher
             && value.is_empty()
@@ -1558,6 +1601,58 @@ mod merged_forward_tests {
             .collect();
         list.sort();
         list
+    }
+
+    /// 合并后的这一次转发只能发一个 ECS：几个 forward 的 ecs 写得一样时就是它；写得不一样（包括有的写、
+    /// 有的不写）时为 None，和不写 ecs 一样。没写 upstream 的 forward 不在合并里，它的 ecs 不算
+    /// The one merged forward can send one ECS only: the forwards' ecs when they all write
+    /// the same; None when they differ (some written and some not, too), as without ecs. A
+    /// forward without an upstream is not in the merge, and its ecs does not count
+    #[test]
+    fn a_merged_forward_sends_the_ecs_its_forwards_share() {
+        let ecs_of = |actions: serde_json::Value| {
+            let mut rule: Rule = serde_json::from_value(json!({
+                "name": "r", "matchers": [{ "type": "any" }], "actions": actions
+            }))
+            .expect("parse rule");
+            rule.compute_merged_forward();
+            rule.merged_forward.expect("several forwards merge").ecs
+        };
+        let from_client = json!({ "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 });
+        let forward = |upstream: &str, ecs: &serde_json::Value| json!({ "type": "forward", "upstream": upstream, "ecs": ecs });
+        let shared = Some(super::EcsMode::FromClientIp {
+            prefix_v4: 24,
+            prefix_v6: 56,
+        });
+        assert_eq!(
+            ecs_of(json!([
+                forward("192.0.2.1:53", &from_client),
+                forward("192.0.2.2:53", &from_client)
+            ])),
+            shared
+        );
+        assert_eq!(
+            ecs_of(json!([
+                forward("192.0.2.1:53", &from_client),
+                forward("192.0.2.2:53", &json!({ "mode": "clear" }))
+            ])),
+            None
+        );
+        assert_eq!(
+            ecs_of(json!([
+                forward("192.0.2.1:53", &from_client),
+                { "type": "forward", "upstream": "192.0.2.2:53" }
+            ])),
+            None
+        );
+        assert_eq!(
+            ecs_of(json!([
+                forward("192.0.2.1:53", &from_client),
+                forward("192.0.2.2:53", &from_client),
+                { "type": "forward", "upstream": null, "ecs": { "mode": "clear" } }
+            ])),
+            shared
+        );
     }
 
     /// TCP 和 UDP 双发的上游合并后只出现一次，仍然双发，和只有一个转发时一样：写成 `tcp+udp://`
@@ -1804,6 +1899,50 @@ mod validation_tests {
 
     /// 会悄悄做成别的事的写法，每一种都报出来，带上在哪条规则
     /// Every way of writing that silently does something else is named, with where it is
+    /// 一条规则里几个 forward 的 ecs 写得不一样时（包括有的写、有的不写），是一条配置问题：写明规则，说清怎么改。
+    /// 写得一样、都不写、只有一个 forward 时不算
+    /// A rule whose forwards write different ecs (some written and some not, too) is a
+    /// configuration problem naming the rule and saying how to fix it. The same ecs on
+    /// each, none at all, or a single forward is no problem
+    #[test]
+    fn forwards_with_different_ecs_in_one_rule_are_a_problem() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let from_client = serde_json::json!({ "mode": "from_client_ip" });
+        let forward = |upstream: &str, ecs: &serde_json::Value| serde_json::json!({ "type": "forward", "upstream": upstream, "ecs": ecs });
+        let plain = |upstream: &str| serde_json::json!({ "type": "forward", "upstream": upstream });
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": [
+                rule("mixed", any.clone(), serde_json::json!([
+                    forward("1.1.1.1:53", &from_client),
+                    forward("8.8.8.8:53", &serde_json::json!({ "mode": "clear" }))
+                ])),
+                rule("half", any.clone(), serde_json::json!([
+                    forward("1.1.1.1:53", &from_client),
+                    plain("8.8.8.8:53")
+                ])),
+                rule("same", any.clone(), serde_json::json!([
+                    forward("1.1.1.1:53", &from_client),
+                    forward("8.8.8.8:53", &serde_json::json!({ "mode": "from_client_ip", "prefix_v4": 24, "prefix_v6": 56 }))
+                ])),
+                rule("none", any.clone(), serde_json::json!([plain("1.1.1.1:53"), plain("8.8.8.8:53")])),
+                rule("single", any.clone(), serde_json::json!([forward("1.1.1.1:53", &from_client)]))
+            ]}]
+        });
+        let found = problems_of(config);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for place in ["mixed", "half"] {
+            assert!(
+                found.iter().any(|problem| {
+                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                        && problem.contains("ecs settings differ")
+                        && problem.contains("separate rules")
+                }),
+                "{place}: {found:?}"
+            );
+        }
+    }
+
     #[test]
     fn problems_name_what_would_silently_do_something_else() {
         let any = serde_json::json!([{ "type": "any" }]);

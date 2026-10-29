@@ -201,6 +201,8 @@ ECS 配置在 Forward 动作中：
 
 不写 ecs 的转发把客户端自己带的 ECS 选项原样发往上游。
 
+一条规则里写了几个 forward 时，它们合成一次转发，同时问所有上游，发出的 ECS 也只有一个：几个 forward 的 ecs 写得一样时照它发；写得不一样时（包括有的写、有的不写），这条规则和不写 ecs 一样，这是一条配置问题（见「缓存和重载行为」）。
+
 缓存的应答遵循 RFC 7871 第 7.3 节。每份应答只给它适用的请求方，依据是转发实际发出的 ECS，以及上游应答里的 SCOPE PREFIX-LENGTH（作用范围）：
 
 - 作用范围为 0，或者带 ECS 的查询得到不带 ECS 选项的应答（按作用范围 0 处理），适用于每个转发时发送 ECS 子网的请求；不发送 ECS 的请求问上游的是另一种查询，单独保存自己的应答；
@@ -407,7 +409,7 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 主配置 watcher 使用按 Pipeline 划分的缓存命名空间重载有效 JSON。发生变化的 Pipeline 会立即停止访问旧配置产生的响应缓存、规则缓存和进行中请求；未变化的 Pipeline 会保留热缓存。任意全局设置变化都会轮换所有 Pipeline 的缓存命名空间。旧命名空间中的条目不会被同步删除，而是继续受现有缓存容量和 TTL 策略限制。包括后台刷新和响应阶段跳转在内，每个请求都会保持选择其缓存命名空间时的配置快照，因此重载前启动的任务无法写入当前生效的缓存代际。无效的重载会保留旧配置。
 
-下面这些写法以前能加载，却会悄悄做成别的事：读不懂的上游地址（端口不对、UDP 上游不是 IP 地址、不认识的前缀如 `http://`、IP 字面量的 DoQ 没写 SNI）、拼错的 rcode（以前回 NXDOMAIN）、无效的静态 IP 或 CNAME 目标、装不进一条记录的 TXT（以前回 SERVFAIL）、跳到不存在的 Pipeline（跳转动作或 pipeline_select），以及空的 domain_suffix 或 domain_regex（以前匹配所有域名）。启动时遇到它们只在日志里记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和控制通道的配置校验会拒绝，并一次列出全部问题，所以下一次改配置时要把它们改掉。
+下面这些写法以前能加载，却会悄悄做成别的事：读不懂的上游地址（端口不对、UDP 上游不是 IP 地址、不认识的前缀如 `http://`、IP 字面量的 DoQ 没写 SNI）、拼错的 rcode（以前回 NXDOMAIN）、无效的静态 IP 或 CNAME 目标、装不进一条记录的 TXT（以前回 SERVFAIL）、跳到不存在的 Pipeline（跳转动作或 pipeline_select），空的 domain_suffix 或 domain_regex（以前匹配所有域名），以及同一条规则里几个 forward 的 ecs 写得不一样（以前一个也不发）。启动时遇到它们只在日志里记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和控制通道的配置校验会拒绝，并一次列出全部问题，所以下一次改配置时要把它们改掉。
 
 下面这些全局设置只在启动时读取，重载不会让它们生效，修改后要重启服务：`bind_udp`、`bind_tcp`、`bind_doh`、`doh_path`、`doh_tls_cert`、`doh_tls_key`、`cache_capacity`、`cache_max_ttl`、`dashmap_shards`、`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`doh_health_check_error_threshold`、`dot_pool_size`、`doq_pool_size`、`tcp_health_check_error_threshold`、`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`、`doq_connection_idle_timeout_seconds`、`doq_keepalive_interval_ms`、`doq_enable_0rtt` 和全部 `flow_control_*`。其余全局设置重载即生效。重载后，配置里改过、还在等重启的设置会出现在控制通道 `config` 结果的 `restart_pending` 里；改回启动时的值，或者重启以后，它就不再出现。UDP worker 数量由命令行指定，同样只在启动时生效。DoH TLS 证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。
 
