@@ -201,7 +201,7 @@ The supported modes are:
 
 A forward without ecs passes the client's own ECS option upstream as it is.
 
-The forwards of one rule merge into one forward that asks every upstream at once, so it sends one ECS: the forwards' ecs when they all write the same; when they differ (some written and some not, too) the rule acts as if no ecs were written, and this is a configuration problem (see "Cache and reload behavior").
+The forwards of one rule merge into one forward that asks every upstream at once, so it sends one ECS: the forwards' ecs when they all write the same; when they differ (some written and some not, too) the rule acts as if no ecs were written, and this is a configuration problem (see "Cache and reload behavior"). A forward whose upstream is written empty (or commas only) is not part of the merge: it is skipped, its ecs does not count, and as long as another forward names an address it is no configuration problem.
 
 Cached answers follow RFC 7871 section 7.3. Each answer is kept for the requesters it applies to, judged by the ECS the forward actually sent and the SCOPE PREFIX-LENGTH in the upstream's reply:
 

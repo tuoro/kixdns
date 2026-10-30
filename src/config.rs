@@ -582,18 +582,18 @@ impl Action {
 
 /// Rule helper functions / Rule 辅助函数
 impl Rule {
-    /// 合并转发时问的那几个 forward（写了 upstream 的）共用的 ecs：写得一样时就是它，
-    /// 写得不一样时为 Err。合并后只有一次转发，只能发一个 ECS
-    /// The ecs shared by the forwards a merged forward asks (those with an upstream
-    /// written): it when they all write the same, Err when they differ. The merge is a
-    /// single forward and can send only one ECS
+    /// 合并转发时问的那几个 forward（写了地址的，见 `compute_merged_forward`）共用的 ecs：写得一样
+    /// 时就是它，写得不一样时为 Err。合并后只有一次转发，只能发一个 ECS
+    /// The ecs shared by the forwards a merged forward asks (those naming an address, see
+    /// `compute_merged_forward`): it when they all write the same, Err when they differ. The
+    /// merge is a single forward and can send only one ECS
     pub(crate) fn shared_forward_ecs(&self) -> Result<Option<&EcsMode>, ()> {
         let mut ecs = self.actions.iter().filter_map(|action| match action {
             Action::Forward {
-                upstream: Some(_),
+                upstream: Some(upstream),
                 ecs,
                 ..
-            } => Some(ecs.as_ref()),
+            } if names_an_address(upstream) => Some(ecs.as_ref()),
             _ => None,
         });
         let first = ecs.next().flatten();
@@ -1412,6 +1412,11 @@ fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
         .filter(|s| !s.is_empty())
 }
 
+/// 拆得出至少一个地址 / Splits into at least one address
+fn names_an_address(upstreams: &str) -> bool {
+    split_upstreams(upstreams).next().is_some()
+}
+
 fn rule_problems(
     rule: &Rule,
     pipelines: &rustc_hash::FxHashSet<&str>,
@@ -1427,6 +1432,13 @@ fn rule_problems(
     if forwards > 1 && rule.shared_forward_ecs().is_err() {
         report(MERGED_ECS_DIFFER.to_string());
     }
+    // 几个 forward 合成一次转发、其中有写了地址的：写成空的那个只是被跳过，查询照样有上游作答
+    // Several forwards merged into one with an address among them: one written empty is only
+    // skipped, and the query still has upstreams to answer it
+    let merge_has_an_address = forwards > 1
+        && rule.actions.iter().any(|action| {
+            matches!(action, Action::Forward { upstream: Some(upstreams), .. } if names_an_address(upstreams))
+        });
     for matcher in &rule.matchers {
         if let Matcher::DomainSuffix { value } | Matcher::DomainRegex { value } = &matcher.matcher
             && value.is_empty()
@@ -1451,19 +1463,26 @@ fn rule_problems(
             report(EMPTY_EXACT_MATCHER.to_string());
         }
     }
+    // 回答动作里的 forward 各自转发，不合并 / The forwards among the answer actions forward
+    // each on its own and do not merge
     let actions = rule
         .actions
         .iter()
-        .chain(&rule.response_actions_on_match)
-        .chain(&rule.response_actions_on_miss);
-    for action in actions {
+        .map(|action| (action, merge_has_an_address))
+        .chain(
+            rule.response_actions_on_match
+                .iter()
+                .chain(&rule.response_actions_on_miss)
+                .map(|action| (action, false)),
+        );
+    for (action, skipped_when_empty) in actions {
         match action {
             Action::Forward {
                 upstream: Some(upstreams),
                 transport,
                 ..
             } => {
-                if split_upstreams(upstreams).next().is_none() {
+                if !names_an_address(upstreams) && !skipped_when_empty {
                     report(NO_UPSTREAM.to_string());
                 }
                 for upstream in split_upstreams(upstreams) {
@@ -1611,6 +1630,20 @@ mod merged_forward_tests {
             ])),
             shared
         );
+        // 写成空的（或者只有逗号）的 upstream 也一样：合并时跳过它，它的 ecs 不算
+        // An upstream written empty (or commas only) is the same: the merge skips it, and its
+        // ecs does not count
+        for empty in ["", " , "] {
+            assert_eq!(
+                ecs_of(json!([
+                    forward("192.0.2.1:53", &from_client),
+                    forward("192.0.2.2:53", &from_client),
+                    forward(empty, &json!({ "mode": "clear" }))
+                ])),
+                shared,
+                "{empty:?}"
+            );
+        }
     }
 
     /// 合并后的列表按传输分组排：tcp、udp、tcp+udp、doh、dot、doq。几个上游是同时发出的，但这个顺序
@@ -1902,6 +1935,66 @@ mod validation_tests {
         });
         let found = problems_of(config);
         for place in ["default_upstream", "rule \"empty\"", "rule \"commas\""] {
+            assert!(
+                found
+                    .iter()
+                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                "missing {place} in {found:#?}"
+            );
+        }
+    }
+
+    /// 一条规则里几个 forward 合成一次转发时，写成空的那个只是被跳过，查询照样由别的上游作答：不算问题，
+    /// 它的 ecs 也不算进「ecs 写得不一样」。全都是空的、或者回答动作里的空 forward，照旧要报
+    /// When a rule's forwards merge into one, one written empty is only skipped and the
+    /// others answer the query: no problem, and its ecs does not count towards "ecs settings
+    /// differ". All of them empty, or an empty forward among the answer actions, is named as
+    /// before
+    #[test]
+    fn an_empty_forward_beside_real_ones_is_no_problem() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let forward =
+            |upstream: &str| serde_json::json!({ "type": "forward", "upstream": upstream });
+        let with_ecs = |upstream: &str, mode: &str| serde_json::json!({ "type": "forward", "upstream": upstream, "ecs": { "mode": mode } });
+        let config = |rules: serde_json::Value| {
+            serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{ "id": "main", "rules": rules }]
+            })
+        };
+        for empty in ["", " , "] {
+            assert_eq!(
+                problems_of(config(serde_json::json!([
+                    rule(
+                        "beside",
+                        any.clone(),
+                        serde_json::json!([forward(empty), forward("127.0.0.1:53")])
+                    ),
+                    rule(
+                        "shared",
+                        any.clone(),
+                        serde_json::json!([
+                            with_ecs(empty, "clear"),
+                            with_ecs("127.0.0.1:53", "from_client_ip"),
+                            with_ecs("127.0.0.2:53", "from_client_ip")
+                        ])
+                    )
+                ]))),
+                Vec::<String>::new(),
+                "{empty:?}"
+            );
+        }
+
+        let found = problems_of(config(serde_json::json!([
+            rule("all empty", any.clone(), serde_json::json!([forward(""), forward(" , ")])),
+            {
+                "name": "answer",
+                "matchers": any,
+                "actions": [forward("127.0.0.1:53"), forward("127.0.0.2:53")],
+                "response_actions_on_miss": [forward("")]
+            }
+        ])));
+        for place in ["rule \"all empty\"", "rule \"answer\""] {
             assert!(
                 found
                     .iter()
