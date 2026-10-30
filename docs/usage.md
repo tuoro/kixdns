@@ -58,6 +58,8 @@ Unix 构建会为 UDP worker 创建独立 socket，并使用平台提供的 reus
 
 日志订阅器默认输出文本，时间戳使用 RFC 3339 格式并跟随系统本地时区。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
 
+DoH 上游回 429 Too Many Requests 时，只在它开始暂停那一刻记一条 warn，写着上游、暂停秒数和是不是照 Retry-After 定的（见配置文档）；暂停中再回的 429，以及这期间没问它的转发，只在 debug 级别记录。
+
 响应统计可启用 `RUST_LOG=warn,kixdns::engine::phases=info`。
 `event="dns_response"` 对引擎产出的每个应答记录一次，覆盖快速路径、
 新鲜/过期缓存、静态应答及并发合并应答；它不证明客户端已收到报文。

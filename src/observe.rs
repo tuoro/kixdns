@@ -171,6 +171,16 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`upstream_attempt`]: EngineObserver::upstream_attempt
     fn upstream_result(&self, ctx: &RequestContext<'_>, event: &UpstreamResult<'_>) {}
 
+    /// An upstream of a concurrent set was left out of this forward without being
+    /// asked (see [`UpstreamSkipReason`]). It is not an attempt: no
+    /// [`upstream_attempt`] or [`upstream_result`] is reported for it. Only a set of
+    /// several upstreams leaves one out, and only while another of the set is still
+    /// asked.
+    ///
+    /// [`upstream_attempt`]: EngineObserver::upstream_attempt
+    /// [`upstream_result`]: EngineObserver::upstream_result
+    fn upstream_skipped(&self, ctx: &RequestContext<'_>, event: &UpstreamSkipped<'_>) {}
+
     /// A configuration became active: the initial load (`build`) and every
     /// successful `reload` / `reload_from`.
     ///
@@ -471,7 +481,8 @@ pub struct UpstreamResult<'a> {
     /// TC bit of the received answer; `None` when no answer was received or
     /// it could not be parsed.
     pub truncated: Option<bool>,
-    /// Error for [`UpstreamOutcome::Error`]; `None` otherwise.
+    /// Error for [`UpstreamOutcome::Error`] and [`UpstreamOutcome::Throttled`]; `None`
+    /// otherwise.
     pub error: Option<&'a anyhow::Error>,
 }
 
@@ -490,6 +501,33 @@ pub enum UpstreamOutcome {
     /// The attempt was still in flight when another upstream of the same
     /// concurrent set answered, and was cancelled.
     Aborted,
+    /// The query was sent and the DoH upstream answered HTTP 429 Too Many Requests.
+    /// It is not retried; the upstream is left out of concurrent sets for a while
+    /// (see [`EngineObserver::upstream_skipped`]).
+    Throttled,
+}
+
+/// An upstream of a concurrent set was left out of a forward.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct UpstreamSkipped<'a> {
+    /// Upstream address without the transport prefix.
+    pub upstream: &'a str,
+    /// Transport selected for this address.
+    pub transport: Transport,
+    /// Why it was left out.
+    pub reason: UpstreamSkipReason,
+}
+
+/// Why an upstream was left out of a forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum UpstreamSkipReason {
+    /// The DoH upstream answered HTTP 429 Too Many Requests a moment ago and is
+    /// paused: for the seconds its `Retry-After` gives, brought into 1 to 60, or
+    /// 1 second without a number there (an HTTP date counts as none). While every
+    /// upstream of the set is paused, all are asked.
+    Throttled,
 }
 
 /// A configuration became active. Reported by `Engine::builder(..).build()`
@@ -719,6 +757,18 @@ impl EngineObserver for TracingObserver {
         );
     }
 
+    fn upstream_skipped(&self, ctx: &RequestContext<'_>, event: &UpstreamSkipped<'_>) {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            event = "upstream_skipped",
+            request_id = ctx.request_id,
+            upstream = event.upstream,
+            transport = ?event.transport,
+            reason = ?event.reason,
+            "upstream skipped"
+        );
+    }
+
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
         tracing::debug!(
             target: TRACE_TARGET,
@@ -845,6 +895,14 @@ mod tests {
                     rcode: None,
                     truncated: None,
                     error: Some(&error),
+                },
+            );
+            observer.upstream_skipped(
+                &ctx,
+                &UpstreamSkipped {
+                    upstream: "doh.example/dns-query",
+                    transport: Transport::Doh,
+                    reason: UpstreamSkipReason::Throttled,
                 },
             );
             // A SERVFAIL header, so the tracing observer reads a response code.
