@@ -169,13 +169,13 @@ The aliases and-not, andnot, or-not, and ornot are also accepted.
 | static_response | rcode | Returns NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, or REFUSED. |
 | static_ip_response | ip | Returns A or AAAA records matching the query type (both for ANY queries). Other query types, including HTTPS and SVCB, receive NODATA; this action does not synthesize IP hints. `ip` accepts one address or a comma-separated list of IPv4/IPv6 addresses (for example, `192.0.2.1,2001:db8::1`). Addresses are returned as-is; a very large list may exceed the UDP response size limit. |
 | static_cname_response | target, ttl (optional) | Returns a CNAME record for every query type that maps the queried name to `target`; ttl defaults to 300. The target is not resolved server-side and its address records are not included, so the client or resolver must follow the alias. Clients that do not follow a bare CNAME may report no data. Invalid owner or target names return SERVFAIL. |
-| static_txt_response | text, ttl (optional) | Returns a TXT response. text accepts a string or string array; ttl defaults to 300. |
+| static_txt_response | text, ttl (optional) | Returns a TXT response. text accepts a string or string array; ttl defaults to 300. Each string is at most 255 bytes; the whole answer has to fit one DNS message (65535 bytes, keeping room for EDNS and an ECS echo, each string taking one length byte more), otherwise it is SERVFAIL, and text that fits no question at all is a configuration problem. |
 | jump_to_pipeline | pipeline | Starts processing the referenced pipeline. |
 | allow | none | Request phase: forward with the global default UDP upstream. Response phase: keep the current upstream response. |
 | deny | none | Returns REFUSED. |
 | forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream uses default_upstream. |
 | continue | none | Continues with the next request rule, or the next pipeline decision in the response flow. |
-| replace_txt_response | text | Response-phase action that replaces TXT records in the current response. In the request phase it does not produce a response. |
+| replace_txt_response | text | Response-phase action that replaces TXT records in the current response. In the request phase it does not produce a response. text has the same size limits as static_txt_response. |
 
 ### ECS
 

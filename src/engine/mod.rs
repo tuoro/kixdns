@@ -48,6 +48,8 @@ mod tcp_pool_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod transport;
+#[cfg(test)]
+mod txt_answer_tests;
 pub mod types;
 pub mod upstream;
 #[cfg(test)]

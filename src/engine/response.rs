@@ -95,22 +95,53 @@ pub(crate) fn static_cname_target(target: &str) -> Option<Name> {
 
 /// 单个 TXT 段最长 255 字节（RFC 1035 第 3.3 节） / A TXT segment is at most 255 bytes (RFC 1035 section 3.3)
 const MAX_TXT_SEGMENT: usize = 255;
-/// 一条 TXT 记录全部段加起来最长 65535 字节 / All segments of one TXT record are at most 65535 bytes together
-const MAX_TXT_TOTAL: usize = 65535;
+/// 一个 DNS 报文最长 65535 字节：TCP 上报文前面的长度只有 16 位（RFC 1035 第 4.2.2 节）
+/// A DNS message is at most 65535 bytes: over TCP the length in front of it has 16 bits
+/// (RFC 1035 section 4.2.2)
+const MAX_MESSAGE: usize = 65535;
 
-/// TXT 内容放不进一条记录时说明原因 / Why TXT content does not fit one record, when it does not
-pub(crate) fn txt_size_problem(text: &[String]) -> Option<String> {
+/// 名字编码以后的长度：每个标签多一个长度字节，最后是根标签的一个字节
+/// A name's length once encoded: one length byte more per label, and the root label's one
+/// byte at the end
+pub(crate) fn name_wire_len(name: &Name) -> usize {
+    name.iter().map(|label| label.len() + 1).sum::<usize>() + 1
+}
+
+/// 问 `name_len` 字节长的名字时，一条静态 TXT 的 RDATA 最多能有多长：报文去掉报文头 12，问题段（名字加
+/// 类型、类别 4），这条记录的名字（压缩成指针 2）和类型、类别、TTL、RDATA 长度 10，再给交给客户端时可能
+/// 补上的 OPT 11 和它回显的 ECS 选项（最长 4 + 4 + 16）留出地方。所以不管客户端带不带 EDNS，应答都装得下
+/// How long a static TXT's RDATA can be when a name `name_len` bytes long is asked: the
+/// message less the header (12), the question (the name plus type and class, 4), this
+/// record's name (compressed to a pointer, 2) and its type, class, TTL and RDATA length
+/// (10), keeping room for the OPT a client may get (11) and the ECS option it echoes (at
+/// most 4 + 4 + 16). The answer then fits whether the client asked with EDNS or not
+fn txt_room(name_len: usize) -> usize {
+    MAX_MESSAGE.saturating_sub(12 + name_len + 4 + 2 + 10 + 11 + 24)
+}
+
+/// TXT 内容放不进问 `name_len` 字节长的名字时的应答时说明原因：一段超过 255 字节，或者 RDATA（每段的内容
+/// 加一个长度字节）超过 [`txt_room`]。配置检查不知道会问什么名字，按最短的根名字（1 字节）算：这时还装不下，
+/// 问什么都装不下
+/// Why TXT content does not fit the answer for a name `name_len` bytes long, when it does
+/// not: a segment over 255 bytes, or RDATA (each segment's content plus one length byte)
+/// over [`txt_room`]. The configuration check does not know what will be asked and takes
+/// the shortest name, the root (1 byte): what does not fit then fits no question at all
+pub(crate) fn txt_size_problem(text: &[String], name_len: usize) -> Option<String> {
     if let Some(segment) = text.iter().find(|segment| segment.len() > MAX_TXT_SEGMENT) {
         return Some(format!(
             "a TXT segment of {} bytes is longer than {MAX_TXT_SEGMENT}",
             segment.len()
         ));
     }
-    let total = text
-        .iter()
-        .fold(0usize, |total, segment| total.saturating_add(segment.len()));
-    (total > MAX_TXT_TOTAL)
-        .then(|| format!("TXT content of {total} bytes is longer than {MAX_TXT_TOTAL}"))
+    let rdata = text.iter().fold(0usize, |total, segment| {
+        total.saturating_add(segment.len() + 1)
+    });
+    let room = txt_room(name_len);
+    (rdata > room).then(|| {
+        format!(
+            "TXT content takes {rdata} bytes in its record (one length byte per segment), more than the {room} that fit in an answer"
+        )
+    })
 }
 
 /// 创建静态 CNAME 记录响应 / Create a static CNAME record response
@@ -132,26 +163,23 @@ pub(crate) fn make_static_cname_answer(
 
 /// 创建静态TXT记录响应 / Create static TXT record response
 ///
-/// RFC 1035 TXT记录规范:
-/// - 单个TXT段最大255字节
-/// - 总大小不超过65535字节
+/// 装不进这个名字的应答时（见 [`txt_size_problem`]）回 SERVFAIL
+/// SERVFAIL when it does not fit the answer for this name (see [`txt_size_problem`])
 pub(crate) fn make_static_txt_answer(
     qname: &str,
     text: &[String],
     ttl: u32,
 ) -> (ResponseCode, Vec<Record>) {
-    // 验证TXT记录大小 / Validate TXT record size
-    if let Some(problem) = txt_size_problem(text) {
-        warn!(qname = %qname, %problem, "static TXT answer does not fit a record");
+    let Some(name) = crate::proto_utils::name_from_text(qname) else {
+        return (ResponseCode::ServFail, Vec::new());
+    };
+    if let Some(problem) = txt_size_problem(text, name_wire_len(&name)) {
+        warn!(qname = %qname, %problem, "static TXT answer does not fit a message");
         return (ResponseCode::ServFail, Vec::new());
     }
-
-    if let Some(name) = crate::proto_utils::name_from_text(qname) {
-        let txt = TXT::new(text.to_vec());
-        let record = Record::from_rdata(name, ttl, RData::TXT(txt));
-        return (ResponseCode::NoError, vec![record]);
-    }
-    (ResponseCode::ServFail, Vec::new())
+    let txt = TXT::new(text.to_vec());
+    let record = Record::from_rdata(name, ttl, RData::TXT(txt));
+    (ResponseCode::NoError, vec![record])
 }
 
 /// 从 DNS 响应中提取最大 TTL 用于后台刷新时机 / Extract maximum TTL from DNS response for background refresh timing
