@@ -920,17 +920,37 @@ mod tests {
         );
     }
 
-    fn checked(log: &QueryLog, request: &RequestContext<'_>, rule: &str, verdict: bool) {
+    /// 回答检查照引擎的发法（`report_response_rule`）：先记判断，命中时再记它的动作要作的决定
+    /// An answer check reported the way the engine does (`report_response_rule`): the verdict,
+    /// then on a match the decision its actions lead to
+    fn checked(
+        log: &QueryLog,
+        request: &RequestContext<'_>,
+        rule: &str,
+        on_match: Option<DecisionKind>,
+    ) {
         log.rule_evaluated(
             request,
             &RuleEvaluated {
                 pipeline: "main",
                 rule,
                 phase: RulePhase::Response,
-                matched: verdict,
+                matched: on_match.is_some(),
                 matchers: 1,
             },
         );
+        if let Some(decision) = on_match {
+            log.rule_matched(
+                request,
+                &RuleMatched {
+                    pipeline: "main",
+                    rule,
+                    phase: RulePhase::Response,
+                    decision,
+                    fast_path: false,
+                },
+            );
+        }
     }
 
     fn decide(
@@ -959,6 +979,18 @@ mod tests {
         upstream: "192.0.2.53:53",
         transport: Some(Transport::Udp),
     };
+
+    /// 时钟起点在三分钟前的日志：「上次取」记的是起点之后的毫秒数，记成 1 就是三分钟前取过
+    /// A log whose clock starts three minutes back: the last collection is stored as
+    /// milliseconds after that start, so 1 means it was three minutes ago
+    fn started_three_minutes_ago() -> QueryLog {
+        QueryLog {
+            epoch: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(180))
+                .expect("the monotonic clock goes back three minutes"),
+            ..QueryLog::default()
+        }
+    }
 
     fn page(log: &QueryLog, after: u64, limit: usize) -> Value {
         serde_json::from_str(&log.collect(after, limit, 1)).expect("a page is JSON")
@@ -1158,12 +1190,7 @@ mod tests {
 
     #[test]
     fn recording_stops_two_minutes_after_the_last_collection() {
-        let log = QueryLog {
-            epoch: std::time::Instant::now()
-                .checked_sub(Duration::from_secs(180))
-                .expect("the monotonic clock goes back three minutes"),
-            ..QueryLog::default()
-        };
+        let log = started_three_minutes_ago();
         assert!(!log.recording(), "never collected");
         let _ = page(&log, 0, 1);
         assert!(log.recording());
@@ -1182,12 +1209,7 @@ mod tests {
 
     #[test]
     fn stopping_empties_the_ring_and_the_gap_is_reported() {
-        let log = QueryLog {
-            epoch: std::time::Instant::now()
-                .checked_sub(Duration::from_secs(180))
-                .expect("the monotonic clock goes back three minutes"),
-            ..QueryLog::default()
-        };
+        let log = started_three_minutes_ago();
         let _ = page(&log, 0, 1);
         cancelled(&log, 1..=3);
         // 面板取到 1 以后再没来 / The panel took 1 and then stayed away
@@ -1293,17 +1315,7 @@ mod tests {
         // 污染了，拦下 / Polluted: denied
         let denied = ctx(1);
         forwarded(&denied, "polluted");
-        checked(&log, &denied, "polluted", true);
-        log.rule_matched(
-            &denied,
-            &RuleMatched {
-                pipeline: "main",
-                rule: "polluted",
-                phase: RulePhase::Response,
-                decision: DecisionKind::Static,
-                fast_path: false,
-            },
-        );
+        checked(&log, &denied, "polluted", Some(DecisionKind::Static));
         decide(
             &log,
             &denied,
@@ -1324,7 +1336,7 @@ mod tests {
         // 没问题，照用上游的回答 / Nothing wrong: the upstream's answer is kept
         let kept = ctx(2);
         forwarded(&kept, "checked");
-        checked(&log, &kept, "checked", false);
+        checked(&log, &kept, "checked", None);
         decide(&log, &kept, Some("checked"), RulePhase::Response, FORWARD);
         finish(&log, &kept, RequestStatus::Completed, Some(&ok));
 
@@ -1332,17 +1344,7 @@ mod tests {
         // check's step only
         let passed = ctx(3);
         forwarded(&passed, "pass");
-        checked(&log, &passed, "pass", true);
-        log.rule_matched(
-            &passed,
-            &RuleMatched {
-                pipeline: "main",
-                rule: "pass",
-                phase: RulePhase::Response,
-                decision: DecisionKind::Continue,
-                fast_path: false,
-            },
-        );
+        checked(&log, &passed, "pass", Some(DecisionKind::Continue));
         finish(&log, &passed, RequestStatus::Completed, Some(&ok));
 
         // 没写检查条件的规则：回答阶段的动作单独记一步 / A rule without response matchers: its
@@ -1400,7 +1402,7 @@ mod tests {
         let _ = entries(&log);
         let request = ctx(5);
         log.request_started(&request, false);
-        checked(&log, &request, "again", false);
+        checked(&log, &request, "again", None);
         decide(&log, &request, Some("again"), RulePhase::Request, FORWARD);
         finish(&log, &request, RequestStatus::Cancelled, None);
         let entry = entries(&log).pop().unwrap();
@@ -1420,17 +1422,7 @@ mod tests {
         log.request_started(&request, false);
         matched(&log, &request, "r1", DecisionKind::Forward);
         decide(&log, &request, Some("r1"), RulePhase::Request, FORWARD);
-        checked(&log, &request, "r1", true);
-        log.rule_matched(
-            &request,
-            &RuleMatched {
-                pipeline: "main",
-                rule: "r1",
-                phase: RulePhase::Response,
-                decision: DecisionKind::Continue,
-                fast_path: false,
-            },
-        );
+        checked(&log, &request, "r1", Some(DecisionKind::Continue));
         // 第二轮：同一条规则又转发，上游失败，由「否则」直接回答 / Second pass: the same rule
         // forwards again, the upstream fails, and the miss actions answer
         matched(&log, &request, "r1", DecisionKind::Forward);
@@ -1450,12 +1442,7 @@ mod tests {
 
     #[test]
     fn a_request_that_finds_recording_already_stopped_does_not_record() {
-        let log = QueryLog {
-            epoch: std::time::Instant::now()
-                .checked_sub(Duration::from_secs(180))
-                .expect("the monotonic clock goes back three minutes"),
-            ..QueryLog::default()
-        };
+        let log = started_three_minutes_ago();
         // 读到的还是三分钟前那次，另一个请求已经把它停了 / What it read is the collection three
         // minutes ago, and another request has already stopped recording
         assert!(!log.recording_after(1));
