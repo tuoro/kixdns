@@ -173,7 +173,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | jump_to_pipeline | pipeline | 开始处理指定 Pipeline。 |
 | allow | 无 | 请求阶段：使用全局默认 UDP 上游；响应阶段：保留当前上游响应。 |
 | deny | 无 | 返回 REFUSED。 |
-| forward | upstream（可选）、transport（可选）、ecs（可选） | 转发到指定上游；缺少 upstream 时使用 default_upstream。 |
+| forward | upstream（可选）、transport（可选）、ecs（可选） | 转发到指定上游；缺少 upstream（或写成 null、[]）时使用 default_upstream，写成空字符串不算缺少。 |
 | continue | 无 | 继续处理下一个请求规则，或继续响应流程中的下一个 Pipeline 决策。 |
 | replace_txt_response | text | 响应阶段替换当前响应中的 TXT 记录；请求阶段不会产生响应。 |
 

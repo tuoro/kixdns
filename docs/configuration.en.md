@@ -173,7 +173,7 @@ The aliases and-not, andnot, or-not, and ornot are also accepted.
 | jump_to_pipeline | pipeline | Starts processing the referenced pipeline. |
 | allow | none | Request phase: forward with the global default UDP upstream. Response phase: keep the current upstream response. |
 | deny | none | Returns REFUSED. |
-| forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream uses default_upstream. |
+| forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream (or null, or []) uses default_upstream; an empty string is not missing. |
 | continue | none | Continues with the next request rule, or the next pipeline decision in the response flow. |
 | replace_txt_response | text | Response-phase action that replaces TXT records in the current response. In the request phase it does not produce a response. |
 

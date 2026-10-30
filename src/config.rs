@@ -537,10 +537,15 @@ pub enum Action {
     Allow,
     /// 终止并丢弃（返回 REFUSED）。 / Terminate and drop (return REFUSED)
     Deny,
-    /// 透传上游；upstream为空则使用全局默认；支持逗号分隔或数组格式的多个上游（并发请求取最快结果）；transport缺省udp。
-    /// 支持 udp/tcp/tcp_udp/doh/dot/doq。/ Forward to upstream; use global default if upstream is empty; supports comma-separated or array format for multiple upstreams (concurrent requests, take fastest result); transport defaults to udp; supports udp/tcp/tcp_udp/doh/dot/doq.
+    /// 透传上游；不写 upstream（或写成 null、[]）时用全局默认上游，写成空字符串不算，那是一个也没写的上游
+    /// （见 `problems`）；支持逗号分隔或数组格式的多个上游（并发请求取最快结果）；transport缺省udp。
+    /// 支持 udp/tcp/tcp_udp/doh/dot/doq。/ Forward to upstream; without upstream (or with
+    /// null or []) the global default upstream is used, while an empty string is not, being an
+    /// upstream list that names none (see `problems`); supports comma-separated or array
+    /// format for multiple upstreams (concurrent requests, take fastest result); transport
+    /// defaults to udp; supports udp/tcp/tcp_udp/doh/dot/doq.
     Forward {
-        #[serde(deserialize_with = "deserialize_upstream")]
+        #[serde(default, deserialize_with = "deserialize_upstream")]
         upstream: Option<String>,
         #[serde(default)]
         transport: Option<Transport>,
@@ -1942,6 +1947,59 @@ mod validation_tests {
                 "missing {place} in {found:#?}"
             );
         }
+    }
+
+    /// forward 不写 upstream 时用 default_upstream，和文档说的一样。以前缺了这个字段整份配置读不进来
+    /// （「missing field `upstream`」），启动直接失败；写成 null 或 [] 时才用默认上游
+    /// A forward without upstream uses default_upstream, as the documentation says. A missing
+    /// field used to make the whole configuration unreadable ("missing field `upstream`") and
+    /// startup fail; only null or [] used the default upstream
+    #[tokio::test]
+    async fn a_forward_without_upstream_uses_the_default() {
+        let default = crate::engine::test_support::answering_upstream(
+            std::net::Ipv4Addr::new(192, 0, 2, 7),
+            300,
+        )
+        .await;
+        let config = serde_json::json!({
+            "settings": { "default_upstream": default.address, "upstream_timeout_ms": 3000 },
+            "pipelines": [{ "id": "main", "rules": [
+                rule("plain", serde_json::json!([{ "type": "any" }]), serde_json::json!([{ "type": "forward" }]))
+            ]}]
+        });
+        let parsed =
+            super::parse_config(&config.to_string()).expect("a forward without upstream parses");
+        assert!(matches!(
+            parsed.pipelines[0].rules[0].actions[0],
+            super::Action::Forward { upstream: None, .. }
+        ));
+        assert_eq!(super::problems(&parsed), Vec::<String>::new());
+
+        let engine = crate::engine::test_support::engine_from(config);
+        let mut query = hickory_proto::op::Message::new(
+            0x7777,
+            hickory_proto::op::MessageType::Query,
+            hickory_proto::op::OpCode::Query,
+        );
+        query.metadata.recursion_desired = true;
+        query.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii("plain.test.").unwrap(),
+            hickory_proto::rr::RecordType::A,
+        ));
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.handle_packet(&query.to_vec().unwrap(), "127.0.0.1:53000".parse().unwrap()),
+        )
+        .await
+        .expect("answer in time")
+        .expect("answer");
+        let reply = hickory_proto::op::Message::from_vec(&reply).unwrap();
+        assert_eq!(
+            reply.answers.first().map(|record| record.data.clone()),
+            Some(hickory_proto::rr::RData::A(
+                hickory_proto::rr::rdata::A::new(192, 0, 2, 7)
+            ))
+        );
     }
 
     /// 一条规则里几个 forward 合成一次转发时，写成空的那个只是被跳过，查询照样由别的上游作答：不算问题，
