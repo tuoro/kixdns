@@ -2348,6 +2348,53 @@ mod tests {
         "config_reload_failed",
     ];
 
+    /// 测试用的一个请求：问 A / IN，不是后台刷新 / A test request: A / IN, not a background refresh
+    fn request(
+        request_id: u64,
+        client: &str,
+        qname: &'static str,
+    ) -> crate::observe::RequestContext<'static> {
+        crate::observe::RequestContext {
+            request_id,
+            listener_label: "default",
+            client: client.parse().unwrap(),
+            transport: None,
+            qname,
+            qtype: hickory_proto::rr::RecordType::A,
+            qclass: hickory_proto::rr::DNSClass::IN,
+            background_refresh: false,
+        }
+    }
+
+    /// 正常结束，回了一个空应答 / Completed with an empty response
+    fn completed(millis: u64) -> crate::observe::RequestOutcome<'static> {
+        crate::observe::RequestOutcome {
+            latency: std::time::Duration::from_millis(millis),
+            status: crate::observe::RequestStatus::Completed,
+            response: Some(&[]),
+            error: None,
+        }
+    }
+
+    /// 1.1.1.1:53 按 UDP 问的一次结果 / One attempt at 1.1.1.1:53 configured as UDP
+    fn udp_result(
+        outcome: crate::observe::UpstreamOutcome,
+        via: crate::config::Transport,
+        rcode: Option<hickory_proto::op::ResponseCode>,
+        millis: u64,
+    ) -> crate::observe::UpstreamResult<'static> {
+        crate::observe::UpstreamResult {
+            upstream: "1.1.1.1:53",
+            transport: crate::config::Transport::Udp,
+            via,
+            outcome,
+            latency: std::time::Duration::from_millis(millis),
+            rcode,
+            truncated: Some(false),
+            error: None,
+        }
+    }
+
     /// 在带目标名的 tracing 订阅者下把 15 个观察者方法各驱动一次，返回它写出的全部日志文本。
     /// Drives each of the 15 observer methods once under a target-printing tracing subscriber
     /// and returns everything it logged.
@@ -2355,9 +2402,8 @@ mod tests {
         use crate::config::Transport;
         use crate::observe::{
             CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionKind,
-            DecisionMade, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
-            RuleCacheLookup, RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt,
-            UpstreamOutcome, UpstreamResult,
+            DecisionMade, EngineObserver, RequestContext, RuleCacheLookup, RuleEvaluated,
+            RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome,
         };
         use hickory_proto::op::ResponseCode;
         use std::time::Duration;
@@ -2372,14 +2418,8 @@ mod tests {
                 .with_writer(buffer.clone()),
         );
         let ctx = RequestContext {
-            request_id: 7,
-            listener_label: "default",
-            client: "127.0.0.1:53000".parse().unwrap(),
-            transport: None,
-            qname: "example.com",
-            qtype: hickory_proto::rr::RecordType::A,
-            qclass: hickory_proto::rr::DNSClass::IN,
             background_refresh: true,
+            ..request(7, "127.0.0.1:53000", "example.com")
         };
         tracing::subscriber::with_default(subscriber, || {
             metrics.request_started(&ctx);
@@ -2445,26 +2485,14 @@ mod tests {
             );
             metrics.upstream_result(
                 &ctx,
-                &UpstreamResult {
-                    upstream: "1.1.1.1:53",
-                    transport: Transport::Udp,
-                    via: Transport::Udp,
-                    outcome: UpstreamOutcome::Success,
-                    latency: Duration::from_millis(12),
-                    rcode: Some(ResponseCode::NoError),
-                    truncated: Some(false),
-                    error: None,
-                },
+                &udp_result(
+                    UpstreamOutcome::Success,
+                    Transport::Udp,
+                    Some(ResponseCode::NoError),
+                    12,
+                ),
             );
-            metrics.request_finished(
-                &ctx,
-                &RequestOutcome {
-                    latency: Duration::from_millis(13),
-                    status: RequestStatus::Completed,
-                    response: Some(&[]),
-                    error: None,
-                },
-            );
+            metrics.request_finished(&ctx, &completed(13));
             metrics.config_loaded(&ConfigLoaded {
                 path: None,
                 generation: 1,
@@ -2480,10 +2508,6 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// `--debug` 必须把 15 个引擎事件（含后台刷新）逐一转发给上游参考观察者；
-    /// 不带 `--debug` 时一条都不该出现。
-    /// `--debug` must forward every one of the 15 engine events (background refresh included)
-    /// to the upstream reference observer; without `--debug` none may appear.
     /// 第一次加载的配置没带原文时也不算一次重载：重载次数和重载序号不变，代数是 1；之后的加载才算
     /// The first configuration loaded without its text is no reload either: the reload
     /// count and sequence stay, the generation is 1; the loads after it are reloads
@@ -2517,24 +2541,12 @@ mod tests {
     /// show as half a hit on the dashboard. Nothing is kept once the request ends.
     #[test]
     fn a_request_that_looks_again_after_a_jump_counts_one_lookup() {
-        use crate::observe::{
-            CacheHit, CacheHitKind, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
-        };
-        use hickory_proto::rr::{DNSClass, RecordType};
+        use crate::observe::{CacheHit, CacheHitKind, EngineObserver};
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
         let metrics = PanelMetrics::default();
-        let ctx = RequestContext {
-            request_id: 41,
-            listener_label: "default",
-            client: "192.0.2.10:53000".parse().unwrap(),
-            transport: None,
-            qname: "jumped.example",
-            qtype: RecordType::A,
-            qclass: DNSClass::IN,
-            background_refresh: false,
-        };
+        let ctx = request(41, "192.0.2.10:53000", "jumped.example");
         metrics.request_started(&ctx);
         metrics.pipeline_selected(&ctx, "main");
         metrics.cache_lookup(&ctx);
@@ -2550,21 +2562,17 @@ mod tests {
                 source: None,
             },
         );
-        metrics.request_finished(
-            &ctx,
-            &RequestOutcome {
-                latency: Duration::from_millis(1),
-                status: RequestStatus::Completed,
-                response: Some(&[]),
-                error: None,
-            },
-        );
+        metrics.request_finished(&ctx, &completed(1));
 
         assert_eq!(metrics.cache_lookups_total.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.cache_hits_fresh.load(Ordering::Relaxed), 1);
         assert!(metrics.cache_lookup_counted.is_empty());
     }
 
+    /// `--debug` 必须把 15 个引擎事件（含后台刷新）逐一转发给上游参考观察者；
+    /// 不带 `--debug` 时一条都不该出现。
+    /// `--debug` must forward every one of the 15 engine events (background refresh included)
+    /// to the upstream reference observer; without `--debug` none may appear.
     #[test]
     fn debug_forwards_engine_events_to_tracing_observer() {
         let output = captured_observer_output(&PanelMetrics::new(true));
@@ -2719,9 +2727,8 @@ mod tests {
     fn observer_events_drive_counters_and_config_state() {
         use crate::observe::{
             ConfigLoaded, ConfigReloadFailed, DecisionKind, EngineObserver, RequestContext,
-            RequestOutcome, RequestStatus, RuleMatched, RulePhase,
+            RuleMatched, RulePhase,
         };
-        use hickory_proto::rr::{DNSClass, RecordType};
 
         let metrics = PanelMetrics::default();
         let source = r#"{"settings":{"statistics_enabled":true}}"#;
@@ -2739,16 +2746,7 @@ mod tests {
         }
         assert_eq!(metrics.reload_success.load(super::Ordering::Relaxed), 0);
 
-        let ctx = RequestContext {
-            request_id: 1,
-            listener_label: "default",
-            client: "192.168.1.9:5353".parse().unwrap(),
-            transport: None,
-            qname: "example.com",
-            qtype: RecordType::A,
-            qclass: DNSClass::IN,
-            background_refresh: false,
-        };
+        let ctx = request(1, "192.168.1.9:5353", "example.com");
         metrics.request_started(&ctx);
         metrics.pipeline_selected(&ctx, "main");
         metrics.cache_lookup(&ctx);
@@ -2763,15 +2761,7 @@ mod tests {
             },
         );
         assert_eq!(metrics.requests_inflight.load(super::Ordering::Relaxed), 1);
-        metrics.request_finished(
-            &ctx,
-            &RequestOutcome {
-                latency: std::time::Duration::from_millis(1),
-                status: RequestStatus::Completed,
-                response: Some(&[]),
-                error: None,
-            },
-        );
+        metrics.request_finished(&ctx, &completed(1));
 
         let background = RequestContext {
             background_refresh: true,
@@ -2844,32 +2834,12 @@ mod tests {
     #[test]
     fn response_latency_counts_only_attempts_that_got_a_reply() {
         use crate::config::Transport;
-        use crate::observe::{EngineObserver, RequestContext, UpstreamOutcome, UpstreamResult};
+        use crate::observe::{EngineObserver, UpstreamOutcome};
         use hickory_proto::op::ResponseCode;
-        use hickory_proto::rr::{DNSClass, RecordType};
-        use std::time::Duration;
 
         let metrics = PanelMetrics::default();
-        let ctx = RequestContext {
-            request_id: 1,
-            listener_label: "default",
-            client: "127.0.0.1:5353".parse().unwrap(),
-            transport: None,
-            qname: "example.com",
-            qtype: RecordType::A,
-            qclass: DNSClass::IN,
-            background_refresh: false,
-        };
-        let result = |outcome, rcode, millis| UpstreamResult {
-            upstream: "1.1.1.1:53",
-            transport: Transport::Udp,
-            outcome,
-            via: Transport::Udp,
-            latency: Duration::from_millis(millis),
-            rcode,
-            truncated: Some(false),
-            error: None,
-        };
+        let ctx = request(1, "127.0.0.1:5353", "example.com");
+        let result = |outcome, rcode, millis| udp_result(outcome, Transport::Udp, rcode, millis);
         metrics.upstream_result(
             &ctx,
             &result(UpstreamOutcome::Success, Some(ResponseCode::NoError), 12),
@@ -2904,37 +2874,16 @@ mod tests {
     fn latency_rcode_via_and_stale_reason_series_render() {
         use crate::config::Transport;
         use crate::observe::{
-            CacheHit, CacheHitKind, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
-            UpstreamOutcome, UpstreamResult,
+            CacheHit, CacheHitKind, EngineObserver, RequestOutcome, RequestStatus, UpstreamOutcome,
         };
         use hickory_proto::op::ResponseCode;
-        use hickory_proto::rr::{DNSClass, RecordType};
         use std::time::Duration;
 
         let metrics = PanelMetrics::default();
-        let ctx = RequestContext {
-            request_id: 1,
-            listener_label: "default",
-            client: "127.0.0.1:5353".parse().unwrap(),
-            transport: None,
-            qname: "example.com",
-            qtype: RecordType::A,
-            qclass: DNSClass::IN,
-            background_refresh: false,
-        };
-        let result = |outcome, via, rcode, millis| UpstreamResult {
-            upstream: "1.1.1.1:53",
-            transport: Transport::Udp,
-            outcome,
-            via,
-            latency: Duration::from_millis(millis),
-            rcode,
-            truncated: Some(false),
-            error: None,
-        };
+        let ctx = request(1, "127.0.0.1:5353", "example.com");
         metrics.upstream_result(
             &ctx,
-            &result(
+            &udp_result(
                 UpstreamOutcome::Success,
                 Transport::Udp,
                 Some(ResponseCode::NoError),
@@ -2943,7 +2892,7 @@ mod tests {
         );
         metrics.upstream_result(
             &ctx,
-            &result(
+            &udp_result(
                 UpstreamOutcome::Success,
                 Transport::Tcp,
                 Some(ResponseCode::NXDomain),
@@ -2953,7 +2902,7 @@ mod tests {
         // 竞争落败不计入耗时、响应码和传输 / aborted attempts never reach latency, rcode or via
         metrics.upstream_result(
             &ctx,
-            &result(UpstreamOutcome::Aborted, Transport::Udp, None, 500),
+            &udp_result(UpstreamOutcome::Aborted, Transport::Udp, None, 500),
         );
 
         for (kind, remaining) in [
@@ -2974,15 +2923,7 @@ mod tests {
         }
 
         metrics.request_started(&ctx);
-        metrics.request_finished(
-            &ctx,
-            &RequestOutcome {
-                latency: Duration::from_millis(7),
-                status: RequestStatus::Completed,
-                response: Some(&[]),
-                error: None,
-            },
-        );
+        metrics.request_finished(&ctx, &completed(7));
         metrics.request_started(&ctx);
         metrics.request_finished(
             &ctx,
@@ -3269,11 +3210,15 @@ mod diagnostic_tests {
         })
     }
 
+    /// 照启动和重载的路子读配置（`parse_config`）/ Reads a config the way startup and reload do
+    /// (`parse_config`)
+    fn runtime_for(raw: serde_json::Value) -> RuntimePipelineConfig {
+        let config = crate::config::parse_config(&raw.to_string()).expect("parse config");
+        RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
     fn engine_for(raw: serde_json::Value, metrics: Arc<PanelMetrics>) -> Engine {
-        let config: crate::config::PipelineConfig =
-            serde_json::from_value(raw).expect("parse config");
-        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
-        Engine::builder(runtime)
+        Engine::builder(runtime_for(raw))
             .listener_label("default")
             .observer(metrics)
             .build()
@@ -3298,11 +3243,6 @@ mod diagnostic_tests {
                 }] }]
             })
         };
-        let runtime = |raw: serde_json::Value| {
-            let config: crate::config::PipelineConfig =
-                serde_json::from_value(raw).expect("parse config");
-            RuntimePipelineConfig::from_config(config).expect("build runtime config")
-        };
         let metrics = Arc::new(PanelMetrics::new(false));
         let engine = engine_for(raw("127.0.0.1:5353", 2000), Arc::clone(&metrics));
         assert_eq!(
@@ -3310,26 +3250,26 @@ mod diagnostic_tests {
             serde_json::json!([])
         );
 
-        engine.reload(runtime(raw("127.0.0.1:5354", 3000)));
+        engine.reload(runtime_for(raw("127.0.0.1:5354", 3000)));
         assert_eq!(
             metrics.config_json()["restart_pending"],
             serde_json::json!(["bind_udp"]),
             "the listener only moves on a restart, the timeout applies at once"
         );
-        engine.reload(runtime(raw("127.0.0.1:5353", 3000)));
+        engine.reload(runtime_for(raw("127.0.0.1:5353", 3000)));
         assert_eq!(
             metrics.config_json()["restart_pending"],
             serde_json::json!([])
         );
     }
 
-    fn answers(body: &serde_json::Value) -> Vec<String> {
+    /// 诊断回复里有一条回答写着这个地址 / Some answer in the diagnostic reply names this address
+    fn answered(body: &serde_json::Value, address: &str) -> bool {
         body["answers"]
             .as_array()
             .expect("answers")
             .iter()
-            .map(|answer| answer.as_str().unwrap_or_default().to_owned())
-            .collect()
+            .any(|answer| answer.as_str().unwrap_or_default().contains(address))
     }
 
     /// 诊断的域名按查询日志写名字的方式读（见 `proto_utils::name_text`）：`\DDD` 是十进制，大小写
@@ -3448,12 +3388,7 @@ mod diagnostic_tests {
             run_diagnostic(&engine, &packet, Some(home), "nas.example", &record_type).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["client_ip"], "192.168.1.9");
-        assert!(
-            answers(&body)
-                .iter()
-                .any(|answer| answer.contains("10.0.0.1")),
-            "{body}"
-        );
+        assert!(answered(&body, "10.0.0.1"), "{body}");
         let parsed = body["trace"][0]["detail"].as_str().unwrap_or_default();
         assert!(parsed.contains("客户端：192.168.1.9"), "{parsed}");
 
@@ -3464,24 +3399,14 @@ mod diagnostic_tests {
             run_diagnostic(&engine, &packet, Some(mapped), "nas.example", &record_type).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["client_ip"], "192.168.1.9");
-        assert!(
-            answers(&body)
-                .iter()
-                .any(|answer| answer.contains("10.0.0.1")),
-            "{body}"
-        );
+        assert!(answered(&body, "10.0.0.1"), "{body}");
 
         // 不填就是本机回环，落到「其余」 / Omitted means loopback, which lands on "rest"
         let (status, body) =
             run_diagnostic(&engine, &packet, None, "nas.example", &record_type).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["client_ip"], "127.0.0.1");
-        assert!(
-            answers(&body)
-                .iter()
-                .any(|answer| answer.contains("10.0.0.2")),
-            "{body}"
-        );
+        assert!(answered(&body, "10.0.0.2"), "{body}");
     }
 
     #[tokio::test]
@@ -3541,12 +3466,7 @@ mod diagnostic_tests {
         assert_eq!(body["candidate"], true);
         assert_eq!(body["record_type"], "A");
         assert_eq!(body["client_ip"], "10.8.0.3");
-        assert!(
-            answers(&body)
-                .iter()
-                .any(|answer| answer.contains("10.0.0.1")),
-            "{body}"
-        );
+        assert!(answered(&body, "10.0.0.1"), "{body}");
     }
 
     /// 试跑和校验一样拒绝候选配置：解析得了、但有配置问题（读不懂的上游），或者监听设置不对，都回
@@ -3643,29 +3563,34 @@ mod diagnostic_tests {
         );
     }
 
-    #[test]
-    fn health_declares_both_new_diagnostic_capabilities() {
+    fn capabilities() -> Vec<String> {
         let health = PanelMetrics::new(false).health_json();
-        let capabilities: Vec<&str> = health["capabilities"]
+        health["capabilities"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|value| value.as_str())
-            .collect();
-        assert!(capabilities.contains(&"diagnostics_trace_client_v1"));
-        assert!(capabilities.contains(&"diagnostics_trace_candidate_v1"));
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn health_declares_both_new_diagnostic_capabilities() {
+        let capabilities = capabilities();
+        assert!(
+            capabilities
+                .iter()
+                .any(|name| name == "diagnostics_trace_client_v1")
+        );
+        assert!(
+            capabilities
+                .iter()
+                .any(|name| name == "diagnostics_trace_candidate_v1")
+        );
     }
 
     #[test]
     fn health_declares_the_query_log() {
-        let health = PanelMetrics::new(false).health_json();
-        assert!(
-            health["capabilities"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "querylog_v1")
-        );
+        assert!(capabilities().iter().any(|name| name == "querylog_v1"));
     }
 
     #[test]
