@@ -41,6 +41,7 @@ use crate::observe::{
     CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionMade, EngineObserver,
     RequestContext, RequestOutcome, RequestStatus, RuleCacheLookup, RuleEvaluated, RuleMatched,
     RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
+    UpstreamSkipReason, UpstreamSkipped,
 };
 use crate::panel_querylog::{self, QueryLog};
 use crate::panel_trace;
@@ -1109,6 +1110,15 @@ pub(crate) fn outcome_label(outcome: UpstreamOutcome) -> &'static str {
         UpstreamOutcome::Rejected => "rejected",
         UpstreamOutcome::Error => "error",
         UpstreamOutcome::Aborted => "aborted",
+        UpstreamOutcome::Throttled => "throttled",
+    }
+}
+
+/// 上游这次没问的原因，写成面板认得的短名 / Why an upstream was not asked, in the short name
+/// the panel reads
+pub(crate) fn skip_reason_label(reason: UpstreamSkipReason) -> &'static str {
+    match reason {
+        UpstreamSkipReason::Throttled => "throttled",
     }
 }
 
@@ -1341,7 +1351,13 @@ impl EngineObserver for PanelMetrics {
         let transport = transport_label(event.transport);
         self.record_upstream_result(event.upstream, transport, outcome_label(event.outcome));
         self.query_log.upstream_result(ctx, event);
-        if !matches!(event.outcome, UpstreamOutcome::Aborted) {
+        // 取消的尝试没有回答；回了 429 的是服务器不肯答，不是 DNS 应答。两种都不计耗时、实际传输和响应码
+        // A cancelled attempt has no answer; a 429 is the server declining to answer, not a
+        // DNS reply. Neither counts towards latency, the transport used or response codes
+        if !matches!(
+            event.outcome,
+            UpstreamOutcome::Aborted | UpstreamOutcome::Throttled
+        ) {
             with_metric_key(
                 |key| push_key_parts(key, &[event.upstream, transport]),
                 |key| {
@@ -1395,6 +1411,18 @@ impl EngineObserver for PanelMetrics {
                     event.truncated.unwrap_or(false)
                 )),
             ),
+            UpstreamOutcome::Throttled => panel_trace::trace_step!(
+                "upstream",
+                "throttled",
+                event.upstream,
+                Some(
+                    match event.error.and_then(crate::engine::transport::throttle_of) {
+                        Some(throttle) =>
+                            format!("HTTP 状态码：429；暂停：{} 秒", throttle.pause.as_secs()),
+                        None => "HTTP 状态码：429".to_owned(),
+                    }
+                ),
+            ),
             _ => panel_trace::trace_step!(
                 "upstream",
                 "failed",
@@ -1402,6 +1430,18 @@ impl EngineObserver for PanelMetrics {
                 event.error.map(|error| format!("{error:#}")),
             ),
         }
+    }
+
+    fn upstream_skipped(&self, ctx: &RequestContext<'_>, event: &UpstreamSkipped<'_>) {
+        debug_forward!(self.upstream_skipped(ctx, event));
+        // 没问就不是一次尝试，不进任何指标 / Not asked is no attempt, and counts in no metric
+        self.query_log.upstream_skipped(ctx, event);
+        panel_trace::trace_step!(
+            "upstream",
+            "skipped",
+            event.upstream,
+            Some("正在限速，这次没问它".to_owned()),
+        );
     }
 
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
@@ -2326,11 +2366,11 @@ mod tests {
         }
     }
 
-    /// `EngineObserver` 的全部 15 个方法，与 `TracingObserver` 写出的 `event` 字段值一一对应；
+    /// `EngineObserver` 的全部 16 个方法，与 `TracingObserver` 写出的 `event` 字段值一一对应；
     /// 少转发任何一个，`--debug` 就会悄悄丢掉那一类事件日志。
-    /// All 15 `EngineObserver` methods, paired with the `event` field value `TracingObserver`
+    /// All 16 `EngineObserver` methods, paired with the `event` field value `TracingObserver`
     /// writes for each; dropping any single forward silently loses that event kind under `--debug`.
-    const OBSERVER_EVENT_NAMES: [&str; 15] = [
+    const OBSERVER_EVENT_NAMES: [&str; 16] = [
         "request_started",
         "request_finished",
         "pipeline_selected",
@@ -2344,6 +2384,7 @@ mod tests {
         "inflight_joined",
         "upstream_attempt",
         "upstream_result",
+        "upstream_skipped",
         "config_loaded",
         "config_reload_failed",
     ];
@@ -2395,15 +2436,16 @@ mod tests {
         }
     }
 
-    /// 在带目标名的 tracing 订阅者下把 15 个观察者方法各驱动一次，返回它写出的全部日志文本。
-    /// Drives each of the 15 observer methods once under a target-printing tracing subscriber
+    /// 在带目标名的 tracing 订阅者下把 16 个观察者方法各驱动一次，返回它写出的全部日志文本。
+    /// Drives each of the 16 observer methods once under a target-printing tracing subscriber
     /// and returns everything it logged.
     fn captured_observer_output(metrics: &PanelMetrics) -> String {
         use crate::config::Transport;
         use crate::observe::{
             CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionKind,
             DecisionMade, EngineObserver, RequestContext, RuleCacheLookup, RuleEvaluated,
-            RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome,
+            RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome, UpstreamSkipReason,
+            UpstreamSkipped,
         };
         use hickory_proto::op::ResponseCode;
         use std::time::Duration;
@@ -2492,6 +2534,14 @@ mod tests {
                     12,
                 ),
             );
+            metrics.upstream_skipped(
+                &ctx,
+                &UpstreamSkipped {
+                    upstream: "doh.example/dns-query",
+                    transport: Transport::Doh,
+                    reason: UpstreamSkipReason::Throttled,
+                },
+            );
             metrics.request_finished(&ctx, &completed(13));
             metrics.config_loaded(&ConfigLoaded {
                 path: None,
@@ -2569,9 +2619,9 @@ mod tests {
         assert!(metrics.cache_lookup_counted.is_empty());
     }
 
-    /// `--debug` 必须把 15 个引擎事件（含后台刷新）逐一转发给上游参考观察者；
+    /// `--debug` 必须把 16 个引擎事件（含后台刷新）逐一转发给上游参考观察者；
     /// 不带 `--debug` 时一条都不该出现。
-    /// `--debug` must forward every one of the 15 engine events (background refresh included)
+    /// `--debug` must forward every one of the 16 engine events (background refresh included)
     /// to the upstream reference observer; without `--debug` none may appear.
     #[test]
     fn debug_forwards_engine_events_to_tracing_observer() {
@@ -2868,6 +2918,69 @@ mod tests {
         assert!(has(
             "kixdns_upstream_response_latency_ms_count{upstream=\"1.1.1.1:53\",transport=\"udp\"} 2"
         ));
+    }
+
+    /// DoH 上游回了 429：算一次尝试和一个 `throttled` 结果，不进耗时、实际传输和响应码；暂停中没问的
+    /// 上游不进任何指标
+    /// A DoH upstream answering 429 counts one attempt and one `throttled` result, and stays
+    /// out of latency, transport used and response codes; an upstream not asked during its
+    /// pause is in no metric at all
+    #[test]
+    fn a_throttled_answer_counts_as_an_attempt_and_a_result_only() {
+        use crate::config::Transport;
+        use crate::observe::{
+            EngineObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason,
+            UpstreamSkipped,
+        };
+        use std::time::Duration;
+
+        let metrics = PanelMetrics::default();
+        let ctx = request(1, "127.0.0.1:5353", "example.com");
+        let upstream = "doh.example/dns-query";
+        let error = anyhow::anyhow!("doh http status 429 Too Many Requests");
+        metrics.upstream_attempt(
+            &ctx,
+            &UpstreamAttempt {
+                upstream,
+                transport: Transport::Doh,
+            },
+        );
+        metrics.upstream_result(
+            &ctx,
+            &UpstreamResult {
+                upstream,
+                transport: Transport::Doh,
+                via: Transport::Doh,
+                outcome: UpstreamOutcome::Throttled,
+                latency: Duration::from_millis(3),
+                rcode: None,
+                truncated: None,
+                error: Some(&error),
+            },
+        );
+        metrics.upstream_skipped(
+            &ctx,
+            &UpstreamSkipped {
+                upstream,
+                transport: Transport::Doh,
+                reason: UpstreamSkipReason::Throttled,
+            },
+        );
+
+        let mut output = String::new();
+        metrics.render_counters(&mut output);
+        let series: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains(upstream))
+            .collect();
+        assert_eq!(
+            series,
+            vec![
+                "kixdns_upstream_attempts_total{upstream=\"doh.example/dns-query\",transport=\"doh\"} 1",
+                "kixdns_upstream_results_total{upstream=\"doh.example/dns-query\",transport=\"doh\",result=\"throttled\"} 1",
+            ],
+            "{output}"
+        );
     }
 
     #[test]
@@ -3769,6 +3882,156 @@ mod diagnostic_tests {
                 && step["rule"] == "home"
                 && step["decision"] == "static"),
             "{entry}"
+        );
+    }
+
+    /// 两个上游一起问、DoH 那个回了 429 的引擎，DoH 走明文 http / An engine asking two
+    /// upstreams together, the DoH one answering 429, DoH over plain http
+    async fn throttling_engine(
+        metrics: &Arc<PanelMetrics>,
+    ) -> (Engine, crate::engine::test_support::Throttling) {
+        let udp = crate::engine::test_support::answering_upstream_after(
+            Ipv4Addr::new(192, 0, 2, 1),
+            300,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        let doh = crate::engine::test_support::Throttling::spawn(Some("120")).await;
+        let engine = engine_for(
+            json!({
+                "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 3000 },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "both",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": [udp.address.clone(), doh.url.clone()] }]
+                }] }]
+            }),
+            Arc::clone(metrics),
+        );
+        engine.doh_client.use_plain_http();
+        (engine, doh)
+    }
+
+    /// 查询日志里，回了 429 的那次是 `upstream` 一步、结果 `throttled`，带耗时和错误原文；暂停中没问的
+    /// 是单独的 `upstream_skipped` 一步，没有 `upstream` 那一步
+    /// In the query log a 429 is an `upstream` step with result `throttled`, its latency and
+    /// error text; an upstream not asked during its pause is an `upstream_skipped` step of its
+    /// own, with no `upstream` step
+    #[tokio::test]
+    async fn the_query_log_shows_throttled_and_skipped_upstreams() {
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let (engine, doh) = throttling_engine(&metrics).await;
+        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+        let client = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
+        for name in ["first.example", "second.example"] {
+            let (packet, _) = diagnostic_packet(name, "A").expect("packet");
+            engine.handle_packet(&packet, client).await.expect("query");
+        }
+
+        let page: serde_json::Value =
+            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
+                .unwrap();
+        let entries = page["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 2, "{page}");
+        let steps_at = |entry: &serde_json::Value| -> Vec<serde_json::Value> {
+            entry["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|step| step["upstream"] == doh.address.as_str())
+                .map(|step| {
+                    let mut step = step.clone();
+                    step.as_object_mut().unwrap().remove("at_us");
+                    step
+                })
+                .collect()
+        };
+
+        let first = steps_at(&entries[0]);
+        assert_eq!(first.len(), 1, "{}", entries[0]);
+        assert!(
+            first[0]["latency_us"].as_u64().unwrap() > 0,
+            "{}",
+            entries[0]
+        );
+        let mut throttled = first[0].clone();
+        throttled.as_object_mut().unwrap().remove("latency_us");
+        assert_eq!(
+            throttled,
+            json!({
+                "kind": "upstream",
+                "upstream": doh.address,
+                "transport": "doh",
+                "via": "doh",
+                "result": "throttled",
+                "error": "doh http status 429 Too Many Requests"
+            })
+        );
+        assert_eq!(
+            steps_at(&entries[1]),
+            vec![json!({
+                "kind": "upstream_skipped",
+                "upstream": doh.address,
+                "transport": "doh",
+                "reason": "throttled"
+            })],
+            "{}",
+            entries[1]
+        );
+        assert_eq!(doh.asked(), 1);
+    }
+
+    /// 诊断里回了 429 的上游是 `throttled` 一步，写着 HTTP 状态码和实际暂停的秒数（Retry-After 120
+    /// 收成 60）；暂停中没问的是 `skipped` 一步
+    /// In diagnostics an upstream answering 429 is a `throttled` step naming the HTTP status
+    /// and the pause actually applied (Retry-After 120 brought down to 60); one not asked
+    /// during its pause is a `skipped` step
+    #[tokio::test]
+    async fn diagnostics_show_throttled_and_skipped_upstreams() {
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let (engine, doh) = throttling_engine(&metrics).await;
+        let mut traces = Vec::new();
+        for name in ["first.example", "second.example"] {
+            let (packet, record_type) = diagnostic_packet(name, "A").expect("packet");
+            let (status, body) = run_diagnostic(&engine, &packet, None, name, &record_type).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let steps: Vec<serde_json::Value> = body["trace"]
+                .as_array()
+                .expect("trace")
+                .iter()
+                .filter(|step| {
+                    step["label"]
+                        .as_str()
+                        .is_some_and(|label| label.contains(&doh.address))
+                })
+                .map(|step| json!([step["stage"], step["status"], step["label"], step["detail"]]))
+                .collect();
+            traces.push(steps);
+        }
+        assert_eq!(
+            traces,
+            vec![
+                vec![
+                    json!([
+                        "upstream",
+                        "started",
+                        format!("准备转发到 {}", doh.address),
+                        "规则：both；传输：doh"
+                    ]),
+                    json!([
+                        "upstream",
+                        "throttled",
+                        doh.address,
+                        "HTTP 状态码：429；暂停：60 秒"
+                    ]),
+                ],
+                vec![json!([
+                    "upstream",
+                    "skipped",
+                    doh.address,
+                    "正在限速，这次没问它"
+                ])],
+            ]
         );
     }
 }

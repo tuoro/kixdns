@@ -28,9 +28,9 @@ use serde::{Serialize, Serializer};
 use crate::observe::{
     CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
     RequestContext, RequestOutcome, RequestStatus, RuleEvaluated, RuleMatched, RulePhase,
-    UpstreamOutcome, UpstreamResult,
+    UpstreamOutcome, UpstreamResult, UpstreamSkipped,
 };
-use crate::panel::{outcome_label, phase_label, transport_label};
+use crate::panel::{outcome_label, phase_label, skip_reason_label, transport_label};
 
 /// 交接区最多留多少条。面板每秒取一次，家用流量远到不了；满了丢最旧的，面板从序号的空缺看出漏了几条。
 /// How many records the hand-off ring keeps. The panel collects every second, far beyond home traffic;
@@ -152,11 +152,11 @@ enum StepKind {
     /// 同一时刻已有相同的查询在问上游，这次用了它的答案 / An identical query was already asking
     /// upstream, and this request took its answer
     Joined,
-    /// 一次上游尝试：`success`、`rejected`（回了失败应答被丢掉，见 `is_failure_reply`）、`error` 或 `aborted`
-    /// （别的上游先回了，这个被取消）
+    /// 一次上游尝试：`success`、`rejected`（回了失败应答被丢掉，见 `is_failure_reply`）、`error`、`aborted`
+    /// （别的上游先回了，这个被取消）或 `throttled`（DoH 上游回了 HTTP 429）
     /// One upstream attempt: `success`, `rejected` (a failure reply was dropped, see
-    /// `is_failure_reply`), `error`, or `aborted` (another upstream answered first and this one
-    /// was cancelled)
+    /// `is_failure_reply`), `error`, `aborted` (another upstream answered first and this one
+    /// was cancelled) or `throttled` (the DoH upstream answered HTTP 429)
     Upstream {
         upstream: Box<str>,
         transport: &'static str,
@@ -170,6 +170,17 @@ enum StepKind {
         rcode: Option<ResponseCode>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<Box<str>>,
+    },
+    /// 一组上游里这个这次没问，不算一次尝试；`reason` 只有 `throttled`（刚回过 429，正在暂停）。用单独的
+    /// kind：旧面板不认得的 kind 整步不显示，`upstream` 带着不认得的结果却会显示成出错
+    /// An upstream of a set that was not asked this time, which is no attempt; `reason` is only
+    /// `throttled` (it answered 429 a moment ago and is paused). A kind of its own: an older
+    /// panel leaves out a kind it does not know, but shows an `upstream` step with a result it
+    /// does not know as an error
+    UpstreamSkipped {
+        upstream: Box<str>,
+        transport: &'static str,
+        reason: &'static str,
     },
 }
 
@@ -625,6 +636,16 @@ impl QueryLog {
         });
     }
 
+    pub(crate) fn upstream_skipped(&self, ctx: &RequestContext<'_>, event: &UpstreamSkipped<'_>) {
+        self.with_pending(ctx, |pending| {
+            pending.push(StepKind::UpstreamSkipped {
+                upstream: event.upstream.into(),
+                transport: transport_label(event.transport),
+                reason: skip_reason_label(event.reason),
+            });
+        });
+    }
+
     pub(crate) fn request_finished(&self, ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return;
@@ -1005,10 +1026,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// 上游那一步写成面板认得的短名：六种传输（记下的和实际走的）、四种结果都是。读不出的应答，响应码
+    /// 上游那一步写成面板认得的短名：六种传输（记下的和实际走的）、五种结果都是。读不出的应答，响应码
     /// 取报文头的低四位，不列答案
     /// An upstream step is written in the short names the panel reads: all six transports
-    /// (the one recorded and the one actually used) and all four outcomes. For a response
+    /// (the one recorded and the one actually used) and all five outcomes. For a response
     /// that cannot be read, the response code is the header's low four bits and no answer
     /// is listed
     #[test]
@@ -1026,6 +1047,7 @@ mod tests {
             (UpstreamOutcome::Rejected, "rejected"),
             (UpstreamOutcome::Error, "error"),
             (UpstreamOutcome::Aborted, "aborted"),
+            (UpstreamOutcome::Throttled, "throttled"),
         ];
         let log = QueryLog::default();
         let _ = page(&log, 0, 1);

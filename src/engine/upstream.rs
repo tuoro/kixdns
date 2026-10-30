@@ -10,7 +10,9 @@ use tracing::debug;
 
 use super::Engine;
 use crate::config::Transport;
-use crate::observe::{UpstreamAttempt, UpstreamOutcome, UpstreamResult};
+use crate::observe::{
+    UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
+};
 
 use super::observation::Observed;
 
@@ -413,6 +415,10 @@ async fn forward_tcp_udp_dual(
 /// 应答交回之前，每条记录的 TTL 收进 `min_ttl..=cache_max_ttl`：客户端留一份应答的时间和缓存一样长。
 /// Before the reply is handed back, the TTL of every record is brought into
 /// `min_ttl..=cache_max_ttl`, so a client keeps an answer as long as the cache does.
+///
+/// 几个上游一起问时，刚回过 429、正在暂停的 DoH 上游这次不问（见 [`without_paused`]）。
+/// When several upstreams are asked together, a DoH upstream that answered 429 a moment
+/// ago and is paused is not asked this time (see [`without_paused`]).
 pub async fn forward_upstream(
     engine: &Engine,
     packet: &[u8],
@@ -472,6 +478,10 @@ async fn forward_upstream_as_is(
             .filter(|s: &std::sync::Arc<str>| !s.is_empty())
             .collect()
     };
+    // 剩下一个上游时，它走下面只有一个上游的那条路，和只写了这一个上游一样
+    // With one upstream left it takes the single-upstream path below, as if it were the
+    // only one written
+    let upstreams = without_paused(engine, upstreams, default_transport, observed);
 
     // 快速路径：只有一个上游时，直接调用避免 spawn 开销
     // Fast path: direct call when only one upstream, avoiding spawn overhead
@@ -533,6 +543,7 @@ async fn forward_upstream_as_is(
                 return Ok((bytes.clone(), upstream_with_proto));
             }
             Err(err) => {
+                let outcome = failed_outcome(&err);
                 if let Some((observer, ctx)) = observed {
                     observer.upstream_result(
                         ctx,
@@ -540,7 +551,7 @@ async fn forward_upstream_as_is(
                             upstream: addr,
                             transport: transport_for_addr,
                             via: transport_for_addr,
-                            outcome: UpstreamOutcome::Error,
+                            outcome,
                             latency: dur,
                             rcode: None,
                             truncated: None,
@@ -548,8 +559,14 @@ async fn forward_upstream_as_is(
                         },
                     );
                 }
-                // 失败时不构造 prefix，只 warn
-                tracing::warn!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
+                // 失败时不构造 prefix，只 warn；回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
+                // No prefix is built on failure, only a warn; a 429 logs at debug, the DoH
+                // client having logged one warn as the pause began
+                if outcome == UpstreamOutcome::Throttled {
+                    tracing::debug!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
+                } else {
+                    tracing::warn!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
+                }
                 return Err(UpstreamFailure::error(err));
             }
         }
@@ -694,8 +711,15 @@ async fn forward_upstream_as_is(
                         report(UpstreamOutcome::Rejected, rcode, truncated, None);
                     }
                     Err(err) => {
-                        report(UpstreamOutcome::Error, None, None, Some(&err));
-                        tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                        let outcome = failed_outcome(&err);
+                        report(outcome, None, None, Some(&err));
+                        // 回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
+                        // A 429 logs at debug: the DoH client logged one warn as the pause began
+                        if outcome == UpstreamOutcome::Throttled {
+                            tracing::debug!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
+                        } else {
+                            tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                        }
                         last_err = Some(err);
                     }
                 }
@@ -715,6 +739,67 @@ async fn forward_upstream_as_is(
     // 所有上游都失败 / All upstreams failed
     let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
     Err(UpstreamFailure::error(err))
+}
+
+/// 一组上游里去掉正在暂停的 DoH 上游（见 `DohClient::is_paused`），逐个报给观察者。只有一个上游时，
+/// 或者全都在暂停时，一个也不去：暂停只是让别的上游来答，不会让一次转发谁都不问。
+/// Takes the paused DoH upstreams out of a set (see `DohClient::is_paused`), reporting each
+/// to the observer. A single upstream, or a set whose every upstream is paused, keeps them
+/// all: a pause only lets the others answer, it never leaves a forward with nobody to ask.
+fn without_paused(
+    engine: &Engine,
+    upstreams: Vec<std::sync::Arc<str>>,
+    default_transport: Transport,
+    observed: Observed<'_>,
+) -> Vec<std::sync::Arc<str>> {
+    // 通常没有上游在暂停：只花一次原子读取，地址都不解析
+    // Usually no upstream is paused: one atomic load, and no address is parsed
+    if upstreams.len() < 2 || !engine.doh_client.any_paused() {
+        return upstreams;
+    }
+    let paused: Vec<bool> = upstreams
+        .iter()
+        .map(|up| {
+            let (addr, transport) = parse_upstream_addr(up, default_transport);
+            transport == Transport::Doh && engine.doh_client.is_paused(addr)
+        })
+        .collect();
+    if !paused.contains(&true) || !paused.contains(&false) {
+        return upstreams;
+    }
+    upstreams
+        .into_iter()
+        .zip(paused)
+        .filter_map(|(up, paused)| {
+            if !paused {
+                return Some(up);
+            }
+            let (addr, transport) = parse_upstream_addr(&up, default_transport);
+            if let Some((observer, ctx)) = observed {
+                observer.upstream_skipped(
+                    ctx,
+                    &UpstreamSkipped {
+                        upstream: addr,
+                        transport,
+                        reason: UpstreamSkipReason::Throttled,
+                    },
+                );
+            }
+            debug!(upstream = %up, "DoH upstream paused after a 429, left out of this forward");
+            None
+        })
+        .collect()
+}
+
+/// 一次失败的尝试算哪种结果：DoH 上游回了 429 是 Throttled，其余是 Error
+/// The outcome of a failed attempt: Throttled for a DoH upstream answering 429, Error
+/// otherwise
+fn failed_outcome(err: &anyhow::Error) -> UpstreamOutcome {
+    if crate::engine::transport::throttle_of(err).is_some() {
+        UpstreamOutcome::Throttled
+    } else {
+        UpstreamOutcome::Error
+    }
 }
 
 /// Report every attempt still in flight as aborted / 把仍在飞的尝试上报为已取消

@@ -58,6 +58,8 @@ Unix builds create separate UDP sockets for workers with the platform's reuse-po
 
 The logging subscriber is text formatted by default, with RFC 3339 timestamps following the system's local timezone. The default filter is error unless --debug or the RUST_LOG environment variable changes it. The code does not configure JSON log output.
 
+When a DoH upstream answers 429 Too Many Requests, one warning is logged as its pause starts, naming the upstream, the seconds and whether Retry-After set them (see the configuration document); further 429s during the pause, and the forwards that leave it out meanwhile, log at debug level only.
+
 For response statistics, enable `RUST_LOG=warn,kixdns::engine::phases=info`.
 `event="dns_response"` records one answer produced by the engine,
 including fast-path, fresh/stale cache, static and singleflight answers. It is

@@ -266,6 +266,8 @@ upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多�
 
 没有协议前缀时，省略 transport 默认为 UDP。没有路径的 DoH URL 使用 /dns-query。DoH 支持使用 host 查询参数覆盖 HTTP Host；该参数不会继续发送给上游。DoH 只接受状态为成功、媒体类型为 application/dns-message、不超过 65535 字节的回答；跳转（3xx）不跟随，和其他错误状态一样算这个上游失败。
 
+DoH 上游回 429 Too Many Requests 时不重试，也不计入 doh_health_check_error_threshold，这个上游从这时起暂停一会儿：秒数按 Retry-After，收进 1 到 60 秒；没写、写的是日期或读不懂时暂停 1 秒。暂停期间，几个上游一起问（一个 upstream 里写了几个，或一条规则写了几个 forward）时不问它，由别的上游作答；一组里全都在暂停时照常全问，只写了这一个上游的转发也照问。暂停开始时记一条 warn。
+
 DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
 
 DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；用了 0-RTT 的连接超时或被拒绝后，会在进程重启前对该上游的所有连接禁用 0-RTT。被拒绝既包括明确报告拒绝，也包括对端直接关闭或重置连接——拒收早期数据的服务器常常是这么回应的；没用 0-RTT 的连接超时只算回答慢，不影响 0-RTT。

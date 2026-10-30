@@ -8,7 +8,7 @@ use quinn::{
     Connection as QuicConnection, Endpoint as QuicEndpoint, TransportConfig as QuicTransportConfig,
 };
 use reqwest::Client as DohHttpClient;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST, HeaderValue, RETRY_AFTER};
 use rustc_hash::FxBuildHasher;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -1653,35 +1653,85 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 /// 服务器回了、但用不了的回答的标记：HTTP 错误状态码、别的媒体类型、比任何 DNS 消息都长的正文，或者答的是别的问题。
 /// 连接本身正常，重试无益（只有传输层错误才指示连接可能已死）
 #[derive(Debug)]
-struct DohAnswerError(String);
+struct DohAnswerError {
+    message: String,
+    /// 回的是 429 Too Many Requests 时，这个上游因此暂停多久
+    /// For a 429 Too Many Requests, how long its upstream is paused because of it
+    throttle: Option<Throttle>,
+}
 
 impl std::fmt::Display for DohAnswerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.message)
     }
 }
 
 impl std::error::Error for DohAnswerError {}
 
 fn doh_answer_error(message: String) -> anyhow::Error {
-    anyhow::Error::new(DohAnswerError(message))
+    anyhow::Error::new(DohAnswerError {
+        message,
+        throttle: None,
+    })
+}
+
+/// 一个 429 让它的上游暂停多久，以及时长是不是照 Retry-After 定的
+/// How long a 429 pauses its upstream, and whether Retry-After set the length
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Throttle {
+    pub(crate) pause: Duration,
+    from_retry_after: bool,
+}
+
+/// 回了 429 的上游最短、最长暂停的秒数；没带能用的 Retry-After 时取最短的
+/// The shortest and longest pause, in seconds, of an upstream that answered 429; the
+/// shortest when it gave no usable Retry-After
+const DOH_THROTTLE_MIN_SECS: u64 = 1;
+const DOH_THROTTLE_MAX_SECS: u64 = 60;
+
+/// 429 回答让上游暂停多久：Retry-After 写的秒数，收进 1 到 60 秒之间；没写、写的是 HTTP 日期或读不懂时
+/// 1 秒。数字大得装不下时按最长算：它要的是很久。
+/// How long a 429 pauses its upstream: the seconds Retry-After gives, brought into 1 to 60;
+/// 1 second without one, or with an HTTP date or anything unreadable. A number too large to
+/// hold counts as the longest: what it asks for is a long wait.
+fn throttle_after(retry_after: Option<&HeaderValue>) -> Throttle {
+    let seconds = retry_after
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|digits| digits.parse::<u64>().unwrap_or(u64::MAX));
+    Throttle {
+        pause: Duration::from_secs(
+            seconds
+                .unwrap_or(DOH_THROTTLE_MIN_SECS)
+                .clamp(DOH_THROTTLE_MIN_SECS, DOH_THROTTLE_MAX_SECS),
+        ),
+        from_retry_after: seconds.is_some(),
+    }
+}
+
+/// 这次失败是上游回了 429 时，它因此暂停多久 / For a failure that was a 429, how long its
+/// upstream is paused because of it
+pub(crate) fn throttle_of(err: &anyhow::Error) -> Option<Throttle> {
+    err.downcast_ref::<DohAnswerError>()
+        .and_then(|answer| answer.throttle)
 }
 
 /// The media type of DNS messages over HTTPS (RFC 8484 §6)
 /// DNS over HTTPS 里 DNS 消息的媒体类型（RFC 8484 第 6 节）
-const DOH_MEDIA_TYPE: &str = "application/dns-message";
+pub(crate) const DOH_MEDIA_TYPE: &str = "application/dns-message";
 
 /// 多久没被用过就算可以清理 / How long an entry must sit unused to be pruned
 const DOH_UPSTREAM_IDLE: Duration = Duration::from_secs(600);
 /// 两次清理之间的最小间隔 / Shortest gap between two prunes
 const DOH_UPSTREAM_PRUNE_EVERY: Duration = Duration::from_secs(60);
 
-/// One DoH upstream's state: its own reqwest client (connection pool) and its
-/// consecutive transport-error count. Rebuilding a pool after repeated
-/// failures therefore only evicts that upstream's connections; the other DoH
-/// upstreams keep their keep-alive connections.
-/// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）和连续传输错误计数。连续失败后
-/// 重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
+/// One DoH upstream's state: its own reqwest client (connection pool), its
+/// consecutive transport-error count and its pause after a 429. Rebuilding a pool
+/// after repeated failures therefore only evicts that upstream's connections; the
+/// other DoH upstreams keep their keep-alive connections.
+/// 单个 DoH 上游的状态：独立的 reqwest 客户端（连接池）、连续传输错误计数，以及回了 429 以后的暂停。
+/// 连续失败后重建连接池只影响该上游，其它 DoH 上游的 keep-alive 连接不受牵连。
 struct DohUpstream {
     /// Hot-swappable reqwest client (its connection pool). Replacing it drops the
     /// old pool, which is the only way to evict half-open/dead connections that
@@ -1696,6 +1746,9 @@ struct DohUpstream {
     /// 最近一次使用的时刻，用于清理热重载换掉的旧上游
     /// When the entry was last used, so upstreams dropped by a reload can be pruned
     last_used_millis: AtomicU64,
+    /// 回了 429 以后暂停到什么时候，从 `DohClient::epoch` 起算的毫秒数；没暂停过是 0
+    /// Until when a 429 paused it, in milliseconds from `DohClient::epoch`; 0 if it never was
+    paused_until: AtomicU64,
 }
 
 pub struct DohClient {
@@ -1708,6 +1761,21 @@ pub struct DohClient {
     health_error_threshold: usize,
     /// 上次清理空闲上游的时刻 / When idle upstreams were last pruned
     last_prune_millis: AtomicU64,
+    /// 暂停时刻的起点。用单调时钟，调系统时间不会让暂停变长或变短
+    /// The origin of pause deadlines. A monotonic clock, so setting the system time makes
+    /// no pause longer or shorter
+    epoch: std::time::Instant,
+    /// 所有上游里最晚的暂停结束时刻（同样从 `epoch` 起算），过了就清回 0。合并转发先看它：
+    /// 没有上游在暂停时，判断只花这一次读取
+    /// The latest pause end over all upstreams (from `epoch` too), cleared back to 0 once
+    /// past. A merged forward looks at it first: with no upstream paused, the check costs
+    /// this one load
+    latest_pause_end: AtomicU64,
+    /// 测试里改走明文 http：引擎把 DoH 上游一律当 https，本机的假 DoH 上游只会说 http
+    /// Plain http in tests: the engine takes every DoH upstream as https, and the local fake
+    /// DoH upstream speaks http only
+    #[cfg(test)]
+    plain_http: AtomicBool,
 }
 
 impl DohClient {
@@ -1720,7 +1788,25 @@ impl DohClient {
             pool_max_idle_per_host,
             health_error_threshold,
             last_prune_millis: AtomicU64::new(unix_time_millis()),
+            epoch: std::time::Instant::now(),
+            latest_pause_end: AtomicU64::new(0),
+            #[cfg(test)]
+            plain_http: AtomicBool::new(false),
         })
+    }
+
+    /// 之后的请求都走明文 http（见 `plain_http`）/ Later requests go over plain http (see `plain_http`)
+    #[cfg(test)]
+    pub(crate) fn use_plain_http(&self) {
+        self.plain_http.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn scheme_for_tests(&self, mut url: Url) -> Url {
+        if self.plain_http.load(Ordering::Relaxed) {
+            let _ = url.set_scheme("http");
+        }
+        url
     }
 
     /// Build a fresh reqwest client. Used for both initial construction and pool
@@ -1771,6 +1857,7 @@ impl DohClient {
                     client: ArcSwap::from_pointee(Self::build_client(self.pool_max_idle_per_host)?),
                     consecutive_errors: AtomicUsize::new(0),
                     last_used_millis: AtomicU64::new(now),
+                    paused_until: AtomicU64::new(0),
                 });
                 slot.insert(Arc::clone(&state));
                 Ok(state)
@@ -1828,14 +1915,16 @@ impl DohClient {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         let (url, host_override) = build_doh_url(upstream)?;
+        #[cfg(test)]
+        let url = self.scheme_for_tests(url);
         let host = host_override.as_deref();
         let state = self.upstream(upstream)?;
 
         let start = tokio::time::Instant::now();
-        match Self::send_once(&state, packet, &url, host, timeout_dur).await {
+        let result = match Self::send_once(&state, packet, &url, host, timeout_dur).await {
             Ok(bytes) => {
                 state.consecutive_errors.store(0, Ordering::Release);
-                Ok(restore_query_id(packet, bytes))
+                return Ok(restore_query_id(packet, bytes));
             }
             Err(err) if is_transport_error(&err) => {
                 // TRANSPARENT RETRY: DNS queries are semantically idempotent, so a
@@ -1855,12 +1944,78 @@ impl DohClient {
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                Self::send_once(&state, packet, &url, host, remaining)
-                    .await
-                    .map(|bytes| restore_query_id(packet, bytes))
+                Self::send_once(&state, packet, &url, host, remaining).await
             }
             Err(e) => Err(e),
+        };
+        // 429，不管是第一次还是重试时回的：这个上游暂停一会儿
+        // A 429, whether to the first send or to the retry: the upstream pauses for a while
+        if let Err(err) = &result
+            && let Some(throttle) = throttle_of(err)
+        {
+            self.pause(upstream, &state, throttle);
         }
+        result.map(|bytes| restore_query_id(packet, bytes))
+    }
+
+    /// 从 `epoch` 到现在的毫秒数 / Milliseconds from `epoch` to now
+    fn millis_since_epoch(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// `upstream` 回了 429：从现在起暂停 `throttle.pause`。同时回来的几个 429 只把结束时刻往后推，
+    /// 不往前拉。暂停开始时记一条 warn，暂停中再回 429 只记 debug。
+    /// `upstream` answered 429: it pauses for `throttle.pause` from now. Several 429s at once
+    /// only move the end later, never earlier. A pause starting logs one warn; another 429
+    /// during the pause logs at debug only.
+    fn pause(&self, upstream: &str, state: &DohUpstream, throttle: Throttle) {
+        let now = self.millis_since_epoch();
+        let until =
+            now.saturating_add(u64::try_from(throttle.pause.as_millis()).unwrap_or(u64::MAX));
+        let previous = state.paused_until.fetch_max(until, Ordering::Relaxed);
+        self.latest_pause_end.fetch_max(until, Ordering::Relaxed);
+        if previous <= now {
+            warn!(
+                upstream = upstream,
+                pause_secs = throttle.pause.as_secs(),
+                retry_after = throttle.from_retry_after,
+                "DoH upstream answered 429 Too Many Requests, leaving it out of forwards with other upstreams for a while"
+            );
+        } else {
+            debug!(
+                upstream = upstream,
+                pause_secs = throttle.pause.as_secs(),
+                retry_after = throttle.from_retry_after,
+                "DoH upstream answered 429 Too Many Requests again while paused"
+            );
+        }
+    }
+
+    /// 有没有哪个 DoH 上游正在暂停。通常没有，这时只花一次原子读取
+    /// Whether any DoH upstream is paused. Usually none is, and then this costs one atomic load
+    pub(crate) fn any_paused(&self) -> bool {
+        let latest = self.latest_pause_end.load(Ordering::Relaxed);
+        if latest == 0 {
+            return false;
+        }
+        if self.millis_since_epoch() < latest {
+            return true;
+        }
+        // 全都过了：清回 0，之后连时钟都不用读。这期间又有上游暂停时，它的结束时刻比 latest 晚，
+        // 交换失败，照样留着
+        // All of them are over: back to 0, so later checks read no clock either. An upstream
+        // paused meanwhile ends after latest, so the exchange fails and that pause stays
+        let _ =
+            self.latest_pause_end
+                .compare_exchange(latest, 0, Ordering::Relaxed, Ordering::Relaxed);
+        false
+    }
+
+    /// `upstream` 回了 429、此刻还在暂停 / `upstream` answered 429 and is still paused
+    pub(crate) fn is_paused(&self, upstream: &str) -> bool {
+        self.upstreams.get(upstream).is_some_and(|state| {
+            state.paused_until.load(Ordering::Relaxed) > self.millis_since_epoch()
+        })
     }
 
     /// Single attempt: send the request and read the body within a timeout.
@@ -1896,6 +2051,15 @@ impl DohClient {
             let resp = req.send().await.context("doh request send failed")?;
 
             let status = resp.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                // 服务器嫌问得太快。和别的错误状态一样不重试，另外记下它要等多久
+                // The server finds the queries too fast. No retry, as for any error status,
+                // and note how long it wants a wait
+                return Err(anyhow::Error::new(DohAnswerError {
+                    message: format!("doh http status {status}"),
+                    throttle: Some(throttle_after(resp.headers().get(RETRY_AFTER))),
+                }));
+            }
             if !status.is_success() {
                 // Wrap as DohAnswerError so the caller knows the connection is
                 // fine and a retry won't help.
@@ -3090,6 +3254,7 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::test_support::{DohReply, http_ok, spawn_doh_upstream};
 
     /// reqwest + rustls 要有进程级的加密实现，明文 http 也一样
     /// reqwest + rustls needs a process-level crypto provider, plain http included
@@ -4539,41 +4704,6 @@ mod tests {
         assert!(doq_error("doq://[::1").starts_with("invalid doq upstream url"));
     }
 
-    /// `socket` 上的下一个 HTTP/1.1 请求：请求头（转成小写）和正文。`buf` 存着上一个请求之后多读的字节；
-    /// 客户端走了就是 None
-    /// The next HTTP/1.1 request on `socket`: its head (lower-cased) and body. `buf`
-    /// holds the bytes read past the previous request; `None` once the client is gone
-    async fn next_http_request(
-        socket: &mut tokio::net::TcpStream,
-        buf: &mut Vec<u8>,
-    ) -> Option<(String, Vec<u8>)> {
-        let mut chunk = [0u8; 2048];
-        let header_end = loop {
-            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break at + 4;
-            }
-            match socket.read(&mut chunk).await {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            }
-        };
-        let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
-        let length = head
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        while buf.len() < header_end + length {
-            match socket.read(&mut chunk).await {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            }
-        }
-        let body = buf[header_end..header_end + length].to_vec();
-        buf.drain(..header_end + length);
-        Some((head, body))
-    }
-
     /// 上游 DoH 回 ID 0 时，DoH 客户端交回去的仍是查询自己的 ID，和其他传输一样。直接
     /// 转发、回答后跳转再转发、后台刷新都经过这里；以前这里把 0 原样交出，客户端把响应
     /// 当成别人的丢掉，等到超时重试才从缓存拿到答案。
@@ -4638,80 +4768,6 @@ mod tests {
                 "queries leave with their own IDs (drop_first = {drop_first})"
             );
         }
-    }
-
-    /// 本机 DoH 测试上游怎么回一个请求 / How the local DoH test upstream answers one request
-    enum DohReply {
-        /// 把这些字节当作整个 HTTP 响应写回去 / Write these bytes back as the whole HTTP response
-        Raw(Vec<u8>),
-        /// 200，分块的正文永远发不完 / A 200 whose chunked body never ends
-        Endless,
-        /// 读完请求就断开，不回答 / Read the request and close the connection unanswered
-        Close,
-    }
-
-    /// 本机明文 DoH 上游：每个请求按 `reply(路径, 正文)` 回答。返回监听地址和它被请求过的路径（按先后）
-    /// Local plain-HTTP DoH upstream: each request is answered by `reply(path, body)`.
-    /// Returns its address and the paths it was asked for, in order
-    async fn spawn_doh_upstream(
-        reply: impl Fn(&str, &[u8]) -> DohReply + Send + Sync + 'static,
-    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
-        let reply = Arc::new(reply);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind DoH stub");
-        let addr = listener.local_addr().expect("DoH stub address");
-        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = Arc::clone(&paths);
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let record = Arc::clone(&record);
-                let reply = Arc::clone(&reply);
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    while let Some((head, body)) = next_http_request(&mut socket, &mut buf).await {
-                        let path = head
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap_or_default()
-                            .to_string();
-                        record.lock().unwrap().push(path.clone());
-                        match reply(&path, &body) {
-                            DohReply::Raw(response) => {
-                                if socket.write_all(&response).await.is_err() {
-                                    return;
-                                }
-                            }
-                            DohReply::Endless => {
-                                let head = format!(
-                                    "HTTP/1.1 200 OK\r\ncontent-type: {DOH_MEDIA_TYPE}\r\ntransfer-encoding: chunked\r\n\r\n"
-                                );
-                                let piece = [0u8; 16 * 1024];
-                                let chunk =
-                                    [format!("{:x}\r\n", piece.len()).as_bytes(), &piece, b"\r\n"]
-                                        .concat();
-                                if socket.write_all(head.as_bytes()).await.is_ok() {
-                                    while socket.write_all(&chunk).await.is_ok() {}
-                                }
-                                return;
-                            }
-                            DohReply::Close => return,
-                        }
-                    }
-                });
-            }
-        });
-        (addr, paths)
-    }
-
-    /// 200 应答，带给定的媒体类型（None 就不带）和正文 / A 200 with the given media type (none for None) and body
-    fn http_ok(media_type: Option<&str>, body: &[u8]) -> Vec<u8> {
-        let mut head = String::from("HTTP/1.1 200 OK\r\n");
-        if let Some(media_type) = media_type {
-            head.push_str(&format!("content-type: {media_type}\r\n"));
-        }
-        head.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
-        [head.as_bytes(), body].concat()
     }
 
     /// 问 `label.test` 的 A 记录 / An A query for `label.test`
@@ -4855,6 +4911,153 @@ mod tests {
             .expect_err("an answer to another question");
         assert!(!is_transport_error(&err), "no retry: {err:#}");
         assert_eq!(paths.lock().unwrap().len(), 1);
+    }
+
+    /// Retry-After 按秒数读，收进 1 到 60 秒：0 算 1 秒，超过 60 的、大得装不下的都算 60 秒；没写、
+    /// 写的是 HTTP 日期或读不懂时 1 秒，也不算照 Retry-After 定的
+    /// Retry-After is read as seconds and brought into 1 to 60: 0 counts as 1, anything
+    /// above 60 or too large to hold as 60; without one, or with an HTTP date or anything
+    /// unreadable, 1 second, not counted as set by Retry-After
+    #[test]
+    fn a_429_pauses_for_retry_after_seconds_within_one_to_sixty() {
+        let pause = |value: Option<&'static str>| {
+            let throttle = throttle_after(value.map(HeaderValue::from_static).as_ref());
+            (throttle.pause, throttle.from_retry_after)
+        };
+        let seconds = Duration::from_secs;
+        assert_eq!(pause(None), (seconds(1), false));
+        assert_eq!(pause(Some("30")), (seconds(30), true));
+        assert_eq!(pause(Some("1")), (seconds(1), true));
+        assert_eq!(pause(Some("60")), (seconds(60), true));
+        assert_eq!(pause(Some("0")), (seconds(1), true));
+        assert_eq!(pause(Some("61")), (seconds(60), true));
+        assert_eq!(pause(Some("120")), (seconds(60), true));
+        assert_eq!(pause(Some("99999999999999999999999")), (seconds(60), true));
+        for unreadable in [
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            "soon",
+            "-5",
+            "2.5",
+            "1e3",
+            "",
+        ] {
+            assert_eq!(
+                pause(Some(unreadable)),
+                (seconds(1), false),
+                "{unreadable:?}"
+            );
+        }
+    }
+
+    /// 429 不重试，也不算一次传输错误，连接池不重建；这个上游从现在起照 Retry-After 暂停。错误原文和
+    /// 别的错误状态一样
+    /// A 429 is not retried and is no transport error, so the pool is not rebuilt; the
+    /// upstream pauses from now for what Retry-After says. The error text is as for any
+    /// other error status
+    #[tokio::test]
+    async fn a_429_is_not_retried_and_pauses_its_upstream() {
+        let (addr, paths) = spawn_doh_upstream(|_, _| {
+            DohReply::Raw(
+                b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/html\r\nretry-after: 120\r\ncontent-length: 0\r\n\r\n"
+                    .to_vec(),
+            )
+        })
+        .await;
+        let upstream = format!("http://{addr}/dns-query");
+        // 阈值 1：记一次传输错误就会重建 / Threshold 1: a single transport error would rebuild
+        let client = DohClient::new(8, 1).expect("build doh client");
+        assert!(!client.any_paused());
+        let state = client.upstream(&upstream).expect("doh upstream state");
+        let pool = Arc::as_ptr(&state.client.load_full());
+
+        let err = client
+            .send(&doh_test_query("slow"), &upstream, Duration::from_secs(5))
+            .await
+            .expect_err("a 429 is no answer");
+        assert_eq!(format!("{err:#}"), "doh http status 429 Too Many Requests");
+        assert!(!is_transport_error(&err), "no retry: {err:#}");
+        assert_eq!(paths.lock().unwrap().len(), 1, "sent once");
+        assert_eq!(state.consecutive_errors.load(Ordering::Acquire), 0);
+        assert_eq!(
+            Arc::as_ptr(&state.client.load_full()),
+            pool,
+            "the pool is kept"
+        );
+
+        assert_eq!(
+            throttle_of(&err).map(|throttle| throttle.pause),
+            Some(Duration::from_secs(60)),
+            "Retry-After 120 brought down to 60"
+        );
+        assert!(client.any_paused());
+        assert!(client.is_paused(&upstream));
+        assert!(!client.is_paused("other.example/dns-query"));
+        let left = state
+            .paused_until
+            .load(Ordering::Relaxed)
+            .saturating_sub(client.millis_since_epoch());
+        assert!((59_000..=60_000).contains(&left), "{left} ms left");
+    }
+
+    /// 几个 429 同时回来：暂停只往后推，不往前拉；只有暂停开始那一次记 warn，带上游、秒数和是不是照
+    /// Retry-After
+    /// Several 429s at once: a pause only moves later, never earlier; only its start logs a
+    /// warn, with the upstream, the seconds and whether Retry-After set them
+    #[test]
+    fn concurrent_429s_only_move_a_pause_later_and_warn_once() {
+        let client = DohClient::new(8, 0).expect("build doh client");
+        let upstream = "doh.example/dns-query";
+        let state = client.upstream(upstream).expect("doh upstream state");
+        let throttle = |seconds, from_retry_after| Throttle {
+            pause: Duration::from_secs(seconds),
+            from_retry_after,
+        };
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        client.pause(upstream, &state, throttle(5, true));
+        let until = state.paused_until.load(Ordering::Relaxed);
+        client.pause(upstream, &state, throttle(1, false));
+        assert_eq!(
+            state.paused_until.load(Ordering::Relaxed),
+            until,
+            "a shorter pause does not cut it short"
+        );
+        client.pause(upstream, &state, throttle(10, true));
+        assert!(state.paused_until.load(Ordering::Relaxed) > until);
+        drop(guard);
+
+        let lines = warnings.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        for field in [
+            "upstream=\"doh.example/dns-query\"",
+            "pause_secs=5",
+            "retry_after=true",
+        ] {
+            assert!(lines[0].contains(field), "{field} in {}", lines[0]);
+        }
+    }
+
+    /// 暂停到期以后上游又能问了，`any_paused` 也清回 0，之后的检查连时钟都不读
+    /// Once a pause ends the upstream can be asked again, and `any_paused` clears back to 0,
+    /// so later checks read no clock
+    #[test]
+    fn a_pause_ends_on_time_and_the_shared_gate_clears() {
+        let client = DohClient::new(8, 0).expect("build doh client");
+        let upstream = "doh.example/dns-query";
+        let state = client.upstream(upstream).expect("doh upstream state");
+        client.pause(
+            upstream,
+            &state,
+            Throttle {
+                pause: Duration::from_secs(1),
+                from_retry_after: false,
+            },
+        );
+        assert!(client.any_paused());
+        assert!(client.is_paused(upstream));
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(!client.is_paused(upstream));
+        assert!(!client.any_paused());
+        assert_eq!(client.latest_pause_end.load(Ordering::Relaxed), 0);
     }
 
     #[test]

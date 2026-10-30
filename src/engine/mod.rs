@@ -5,6 +5,8 @@ pub mod concurrency;
 mod cookie_tests;
 pub mod core;
 #[cfg(test)]
+mod doh_throttle_tests;
+#[cfg(test)]
 mod domain_exact_tests;
 #[cfg(test)]
 mod ecs_scope_tests;

@@ -14,7 +14,9 @@ use hickory_proto::rr::{RData, Record};
 use hickory_proto::serialize::binary::BinDecodable;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::engine::transport::DOH_MEDIA_TYPE;
 use crate::engine::{Engine, FastPathResponse};
 use crate::matcher::RuntimePipelineConfig;
 
@@ -423,5 +425,210 @@ pub(super) async fn ask_like_a_listener(engine: &Engine, packet: &[u8], peer: So
     match ask_fast_path_first(engine, packet, peer).await {
         Some(reply) => reply,
         None => ask(engine, packet, peer).await,
+    }
+}
+
+/// 每个请求都回 429 的本机 DoH 上游，像常见的限速网关那样带一页 HTML
+/// A local DoH upstream answering every request with a 429 and an HTML page, as a common
+/// rate-limiting gateway does
+pub(crate) struct Throttling {
+    /// 写进配置的样子 / As written in the configuration
+    pub(crate) url: String,
+    /// 观察者事件里的样子：去掉前缀的地址 / As in observer events: the address without its prefix
+    pub(crate) address: String,
+    asked: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Throttling {
+    /// `retry_after` 是 Retry-After 头的值，None 就不带 / `retry_after` is the Retry-After
+    /// header's value, none for None
+    pub(crate) async fn spawn(retry_after: Option<&'static str>) -> Self {
+        let (addr, asked) = spawn_doh_upstream(move |_, _| {
+            let body = "<html><body>429 Too Many Requests</body></html>";
+            let retry_after =
+                retry_after.map_or_else(String::new, |value| format!("retry-after: {value}\r\n"));
+            DohReply::Raw(
+                format!(
+                    "HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/html\r\n{retry_after}content-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes(),
+            )
+        })
+        .await;
+        Self {
+            url: format!("https://{addr}/dns-query"),
+            address: format!("{addr}/dns-query"),
+            asked,
+        }
+    }
+
+    /// 收到过几个请求 / How many requests it got
+    pub(crate) fn asked(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+}
+
+/// 本机 DoH 测试上游怎么回一个请求 / How the local DoH test upstream answers one request
+pub(crate) enum DohReply {
+    /// 把这些字节当作整个 HTTP 响应写回去 / Write these bytes back as the whole HTTP response
+    Raw(Vec<u8>),
+    /// 200，分块的正文永远发不完 / A 200 whose chunked body never ends
+    Endless,
+    /// 读完请求就断开，不回答 / Read the request and close the connection unanswered
+    Close,
+}
+
+/// 本机明文 DoH 上游：每个请求按 `reply(路径, 正文)` 回答。返回监听地址和它被请求过的路径（按先后）
+/// Local plain-HTTP DoH upstream: each request is answered by `reply(path, body)`.
+/// Returns its address and the paths it was asked for, in order
+pub(crate) async fn spawn_doh_upstream(
+    reply: impl Fn(&str, &[u8]) -> DohReply + Send + Sync + 'static,
+) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    let reply = Arc::new(reply);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind DoH stub");
+    let addr = listener.local_addr().expect("DoH stub address");
+    let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&paths);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let record = Arc::clone(&record);
+            let reply = Arc::clone(&reply);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                while let Some((head, body)) = next_http_request(&mut socket, &mut buf).await {
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    record.lock().unwrap().push(path.clone());
+                    match reply(&path, &body) {
+                        DohReply::Raw(response) => {
+                            if socket.write_all(&response).await.is_err() {
+                                return;
+                            }
+                        }
+                        DohReply::Endless => {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: {DOH_MEDIA_TYPE}\r\ntransfer-encoding: chunked\r\n\r\n"
+                            );
+                            let piece = [0u8; 16 * 1024];
+                            let chunk =
+                                [format!("{:x}\r\n", piece.len()).as_bytes(), &piece, b"\r\n"]
+                                    .concat();
+                            if socket.write_all(head.as_bytes()).await.is_ok() {
+                                while socket.write_all(&chunk).await.is_ok() {}
+                            }
+                            return;
+                        }
+                        DohReply::Close => return,
+                    }
+                }
+            });
+        }
+    });
+    (addr, paths)
+}
+
+/// 200 应答，带给定的媒体类型（None 就不带）和正文 / A 200 with the given media type (none for None) and body
+pub(crate) fn http_ok(media_type: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let mut head = String::from("HTTP/1.1 200 OK\r\n");
+    if let Some(media_type) = media_type {
+        head.push_str(&format!("content-type: {media_type}\r\n"));
+    }
+    head.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
+    [head.as_bytes(), body].concat()
+}
+
+/// `socket` 上的下一个 HTTP/1.1 请求：请求头（转成小写）和正文。`buf` 存着上一个请求之后多读的字节；
+/// 客户端走了就是 None
+/// The next HTTP/1.1 request on `socket`: its head (lower-cased) and body. `buf`
+/// holds the bytes read past the previous request; `None` once the client is gone
+async fn next_http_request(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut Vec<u8>,
+) -> Option<(String, Vec<u8>)> {
+    let mut chunk = [0u8; 2048];
+    let header_end = loop {
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at + 4;
+        }
+        match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let length = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while buf.len() < header_end + length {
+        match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let body = buf[header_end..header_end + length].to_vec();
+    buf.drain(..header_end + length);
+    Some((head, body))
+}
+
+/// 测试期间记下的 warn 及以上的日志 / The warn-and-above log lines written during a test
+#[derive(Clone, Default)]
+pub(crate) struct Warnings(Arc<Mutex<Vec<u8>>>);
+
+impl Warnings {
+    /// 从现在起记下这个线程上的 warn 及以上的日志，直到返回的守卫被丢掉；`#[tokio::test]` 默认的单线程
+    /// 运行时里，引擎派生的任务也在这个线程上
+    /// Records this thread's warn-and-above lines from now until the returned guard is
+    /// dropped; on the single-threaded runtime `#[tokio::test]` uses by default, the
+    /// tasks the engine spawns run on this thread too
+    pub(crate) fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        // 只登记着一个订阅者时，tracing 按碰到回调点的那个线程自己的订阅者缓存回调点要不要记：别的测试
+        // 线程（没装订阅者）先碰到引擎里的某个 warn，这里就再也收不到它。全局放一个什么都不收的订阅者，
+        // 抓日志时登记的就总有两个，回调点改成每次都问当前线程的订阅者
+        // With a single subscriber registered, tracing caches whether a callsite is wanted by
+        // asking the subscriber of whichever thread hits it first: another test thread (with
+        // none installed) hitting one of the engine's warns first would hide it from here for
+        // good. A global subscriber that takes nothing keeps two registered while a test
+        // captures, so callsites ask the current thread's subscriber every time
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ =
+                tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::new());
+        });
+        let warnings = Self::default();
+        let writer = warnings.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (warnings, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// 记下的各行 / The lines recorded
+    pub(crate) fn lines(&self) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock())
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl std::io::Write for Warnings {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
