@@ -1,9 +1,11 @@
 //! Lock abstraction layer.
 //!
-//! This module provides a unified interface for RwLock that can be easily switched
-//! between std::sync::RwLock and parking_lot::RwLock for performance testing.
+//! This module re-exports parking_lot's RwLock as the one lock type the crate uses.
+//! It is no drop-in for std::sync::RwLock: std's guards come wrapped in a
+//! `LockResult` for poisoning, so switching would change every call site.
 //!
-//! 锁抽象层。提供 RwLock 的统一接口，可在 std::sync::RwLock 和 parking_lot::RwLock 之间切换。
+//! 锁抽象层：把 parking_lot 的 RwLock 作为整个 crate 统一使用的锁转出来。它不能直接换成
+//! std::sync::RwLock：std 的锁返回包在 `LockResult` 里的守卫（为了处理中毒），换的话每个调用处都要改。
 //!
 //! # Performance
 //!

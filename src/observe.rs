@@ -538,7 +538,8 @@ impl EngineObserver for NoopObserver {}
 /// `DEBUG` level under the `kixdns::observe` target, with the event kind in
 /// the `event` field.
 ///
-/// The `kixdns` binary installs it when started with `--debug`. Library users
+/// With `--debug` the `kixdns` binary's panel observer hands every event on to it (see
+/// `panel::PanelMetrics`). Library users
 /// install it themselves via `Engine::builder(cfg).observer(Arc::new(TracingObserver))`;
 /// nothing is installed by default. Narrow the output with
 /// `RUST_LOG=kixdns::observe=debug`.

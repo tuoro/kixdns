@@ -61,7 +61,6 @@ prost = { version = "0.14.4", features = ["derive"] }
 tokio = { version = "1", features = ["process", "io-util"] }
 
 [dev-dependencies]
-criterion = "0.5"
 ctor = "0.2"
 rcgen = "0.13"
 tempfile = "3"

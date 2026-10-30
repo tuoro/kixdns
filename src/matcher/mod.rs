@@ -1438,7 +1438,7 @@ pub fn eval_match_chain<T>(
         let (needs, negate) = match op_of(item) {
             MatchOperator::And => (true, false),
             MatchOperator::Or => (false, false),
-            MatchOperator::AndNot | MatchOperator::Not => (true, true),
+            MatchOperator::AndNot => (true, true),
             MatchOperator::OrNot => (false, true),
         };
         if acc == needs {
@@ -1816,6 +1816,45 @@ mod tests {
         }
     }
 
+    /// 配置里写 "not" 就是 and_not：读进来是同一个运算符，匹配结果也一样
+    /// "not" in a configuration is and_not: it reads as the same operator and matches the
+    /// same
+    #[test]
+    fn the_not_operator_is_and_not() {
+        let matched = |operator: &str| {
+            let config = runtime_of(one_rule(serde_json::json!([
+                { "type": "domain_suffix", "value": "example.com" },
+                { "type": "domain_suffix", "value": "ads.example.com", "operator": operator }
+            ])))
+            .expect("build runtime config");
+            let rule = &config.pipelines[0].rules[0];
+            assert_eq!(
+                rule.matchers[1].operator,
+                MatchOperator::AndNot,
+                "{operator}"
+            );
+            ["www.example.com", "x.ads.example.com", "other.test"].map(|qname| {
+                eval_match_chain(
+                    &rule.matchers,
+                    |m| m.operator,
+                    |m| {
+                        m.matcher.matches_with_qtype(
+                            qname,
+                            DNSClass::IN,
+                            IpAddr::from([192, 0, 2, 1]),
+                            false,
+                            RecordType::A,
+                            None,
+                            None,
+                        )
+                    },
+                )
+            })
+        };
+        assert_eq!(matched("not"), [true, false, false]);
+        assert_eq!(matched("and_not"), matched("not"));
+    }
+
     /// 按 JSON 建运行时配置 / A runtime configuration built from JSON
     fn runtime_of(raw: serde_json::Value) -> anyhow::Result<RuntimePipelineConfig> {
         RuntimePipelineConfig::from_config(serde_json::from_value(raw).expect("parse config"))
@@ -2028,22 +2067,22 @@ mod tests {
         );
     }
 
-    /// 每项带着自己的运算符，从左到右和前面的结果合起来，并且短路：and、and_not、not 只在前面
-    /// 成立时看这一项，or、or_not 只在前面不成立时看；and_not、not、or_not 取这一项的反。空链成立。
-    /// 两项、三项的链逐个穷举，核对结果和哪些项被求值了。
+    /// 每项带着自己的运算符，从左到右和前面的结果合起来，并且短路：and、and_not 只在前面成立时看
+    /// 这一项，or、or_not 只在前面不成立时看；and_not、or_not 取这一项的反（配置里的 not 就是
+    /// and_not）。空链成立。两项、三项的链逐个穷举，核对结果和哪些项被求值了。
     /// Each item carries its own operator and combines with the result so far from left
-    /// to right, short-circuiting: and, and_not and not look at the item only when the
-    /// result so far holds, or and or_not only when it does not; and_not, not and or_not
-    /// take the item negated. An empty chain holds. Chains of two and three items are
-    /// enumerated one by one, checking the result and which items were evaluated.
+    /// to right, short-circuiting: and and and_not look at the item only when the result
+    /// so far holds, or and or_not only when it does not; and_not and or_not take the item
+    /// negated ("not" in a configuration is and_not). An empty chain holds. Chains of two
+    /// and three items are enumerated one by one, checking the result and which items were
+    /// evaluated.
     #[test]
     fn a_match_chain_combines_left_to_right_and_short_circuits() {
-        const OPERATORS: [MatchOperator; 5] = [
+        const OPERATORS: [MatchOperator; 4] = [
             MatchOperator::And,
             MatchOperator::Or,
             MatchOperator::AndNot,
             MatchOperator::OrNot,
-            MatchOperator::Not,
         ];
         // 参考：一项一项照定义算 / Reference: one item at a time, by the definition
         let reference = |items: &[(MatchOperator, bool)]| {
@@ -2053,7 +2092,7 @@ mod tests {
                 let (looks, negated) = match operator {
                     MatchOperator::And => (acc, false),
                     MatchOperator::Or => (!acc, false),
-                    MatchOperator::AndNot | MatchOperator::Not => (acc, true),
+                    MatchOperator::AndNot => (acc, true),
                     MatchOperator::OrNot => (!acc, true),
                 };
                 if looks {
