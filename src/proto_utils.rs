@@ -459,14 +459,17 @@ pub(crate) fn answers_query(query: &[u8], response: &[u8]) -> bool {
 /// [`question_as_asked`]）、RD 和 CD 位（见 [`header_as_asked`]）、带不带 OPT 和 DO 位（见
 /// [`edns_as_asked`]）。缓存里的、合并的在途查询拿到的应答都是别的客户端问的样子，KixDNS 自己
 /// 构造的回答（静态回答、SERVFAIL）也不一定照抄了这些。什么都不用改时不复制；TSIG 签过的应答
-/// 原样返回。
+/// 原样返回：它不进缓存，也不交给等待者（见 `Engine::insert_dns_cache_entry`、
+/// `InflightCleanupGuard::hand_over`），所以只会是这个客户端自己那次转发拿到的。
 /// The reply for a client, with what the standards have copied from the query
 /// written as `query` has it: the question name's spelling (see
 /// [`question_as_asked`]), the RD and CD bits (see [`header_as_asked`]), and whether an
 /// OPT comes back and its DO bit (see [`edns_as_asked`]). An answer from the cache or
 /// handed to a merged inflight query is shaped as another client asked, and answers
 /// KixDNS builds itself (static answers, SERVFAIL) do not always copy these either.
-/// Nothing is copied when nothing changes, and a TSIG-signed reply is returned as it is.
+/// Nothing is copied when nothing changes, and a TSIG-signed reply is returned as it is:
+/// it is never cached or handed to waiters (see `Engine::insert_dns_cache_entry`,
+/// `InflightCleanupGuard::hand_over`), so it is always this client's own forward's.
 pub(crate) fn reply_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     // TSIG 的 MAC 盖着整个报文（RFC 8945 第 4.3 节），改哪一位签名都失效：签过的应答原样交出
     // A TSIG's MAC covers the whole message (RFC 8945 section 4.3) and any change breaks
@@ -1141,7 +1144,7 @@ fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Optio
 
 /// 报文最后一条记录是不是 TSIG（RFC 8945 要求它排在最后）
 /// Whether a message's last record is a TSIG (RFC 8945 keeps it last)
-fn last_record_is_tsig(packet: &[u8]) -> bool {
+pub(crate) fn last_record_is_tsig(packet: &[u8]) -> bool {
     if packet.len() < 12 {
         return false;
     }

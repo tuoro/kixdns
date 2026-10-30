@@ -42,6 +42,8 @@ pub(crate) mod response_log;
 mod rule_index_tests;
 pub mod rules;
 #[cfg(test)]
+mod signed_answer_tests;
+#[cfg(test)]
 mod tcp_pool_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
