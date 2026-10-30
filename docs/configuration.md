@@ -169,13 +169,13 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | static_response | rcode | 返回 NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP 或 REFUSED。 |
 | static_ip_response | ip | 按查询类型返回 A 或 AAAA 记录（ANY 查询返回两者）；HTTPS、SVCB 等其他查询类型返回 NODATA，且不会合成 IP hints。`ip` 支持单个地址或逗号分隔的 IPv4/IPv6 地址列表（例如 `192.0.2.1,2001:db8::1`）。地址列表原样返回；列表过大时响应可能超过 UDP 大小限制。 |
 | static_cname_response | target、ttl（可选） | 对所有查询类型返回将查询域名映射到 `target` 的 CNAME 记录；ttl 默认 300。服务端不会继续解析目标域名，也不会附带目标地址记录，客户端或解析器必须自行追踪别名；不能追踪裸 CNAME 的客户端可能返回无数据。查询域名或目标域名无效时返回 SERVFAIL。 |
-| static_txt_response | text、ttl（可选） | 返回 TXT 响应；text 支持字符串或字符串数组，ttl 默认 300。 |
+| static_txt_response | text、ttl（可选） | 返回 TXT 响应；text 支持字符串或字符串数组，ttl 默认 300。每个字符串最长 255 字节；整个应答要装进一个 DNS 报文（65535 字节，并给 EDNS 和 ECS 回显留出地方，每个字符串另占一个长度字节），装不下时回 SERVFAIL，不管问什么名字都装不下时算配置问题。 |
 | jump_to_pipeline | pipeline | 开始处理指定 Pipeline。 |
 | allow | 无 | 请求阶段：使用全局默认 UDP 上游；响应阶段：保留当前上游响应。 |
 | deny | 无 | 返回 REFUSED。 |
 | forward | upstream（可选）、transport（可选）、ecs（可选） | 转发到指定上游；缺少 upstream（或写成 null、[]）时使用 default_upstream，写成空字符串不算缺少。 |
 | continue | 无 | 继续处理下一个请求规则，或继续响应流程中的下一个 Pipeline 决策。 |
-| replace_txt_response | text | 响应阶段替换当前响应中的 TXT 记录；请求阶段不会产生响应。 |
+| replace_txt_response | text | 响应阶段替换当前响应中的 TXT 记录；请求阶段不会产生响应。text 的大小限制和 static_txt_response 一样。 |
 
 ### ECS
 

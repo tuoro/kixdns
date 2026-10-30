@@ -30,16 +30,22 @@ impl InflightCleanupGuard {
     }
 
     /// 把应答交给等在这个条目上的请求：移除条目，有请求在等时才构造 `reply` 发给它们；
-    /// 之后丢弃守卫不再动这张表
+    /// 之后丢弃守卫不再动这张表。TSIG 签过的应答只对签它的那个请求有效（RFC 8945），不交出去：
+    /// 条目照样移除，等待者各自转发
     /// Hand the answer to the requests waiting on this entry: remove the entry, and build
     /// `reply` and send it only when someone waits; dropping the guard afterwards leaves
-    /// the map alone
+    /// the map alone. A TSIG-signed answer holds for the one request that was signed (RFC
+    /// 8945) and is not handed on: the entry goes all the same, and the waiters forward
+    /// themselves
     pub fn hand_over(&mut self, reply: impl FnOnce() -> Bytes) {
         self.defuse();
         if let Some((_, entry)) = self.inflight.remove(&self.hash)
             && entry.tx.receiver_count() > 0
         {
-            let _ = entry.tx.send(Ok(reply()));
+            let reply = reply();
+            if !crate::proto_utils::last_record_is_tsig(&reply) {
+                let _ = entry.tx.send(Ok(reply));
+            }
         }
     }
 }
