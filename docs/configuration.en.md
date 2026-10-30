@@ -77,7 +77,7 @@ Each item in pipeline_select has a pipeline id, an optional matcher list, and an
 
 Each pipeline has an id, an optional rules array, and an optional pipeline-level ecs object, which older configurations used for caching and which no longer affects it (changing it still starts that pipeline's cache afresh on reload). Rules are evaluated in configuration order. An empty matcher list matches. Within a rule, matchers form a left-to-right chain; each matcher can carry its own operator, or the rule-level matcher_operator can set the operator for a list whose item operators are all omitted.
 
-The same structure is used for response_matchers, response_matcher_operator, response_actions_on_match, and response_actions_on_miss. Response actions run after a Forward response, or on the miss path after upstream attempts fail when miss actions are configured.
+The same structure is used for response_matchers, response_matcher_operator, response_actions_on_match, and response_actions_on_miss. Response actions run after a Forward response, or on the miss path after upstream attempts fail when miss actions are configured. When several upstreams asked together all fail and at least one replied with a failure (SERVFAIL, REFUSED or an extended RCODE), the first such reply still goes to the answer check: when the check passes and response_actions_on_match has actions, the match actions run with that reply, as they do with a single upstream. When the check fails, or passes with no match actions, it is handled as an upstream failure as before: the miss actions run without a response when configured, otherwise a stale entry or SERVFAIL answers. An answer check that a SERVFAIL reply satisfies (such as switching to another group when the upstream answers SERVFAIL or REFUSED, or a negated IP condition) therefore applies however many upstreams are written. A background refresh does not do this: when every upstream replies with a failure, the refresh still counts as failed and the entry stays.
 
 ### Pipeline selector and request matchers
 
@@ -251,7 +251,7 @@ The Forward action has an optional transport field:
 | dot | DNS over TLS |
 | doq | DNS over QUIC |
 
-The upstream field accepts a string, a comma-separated string, or a JSON string array. Multiple upstreams are queried concurrently and the first accepted response is returned. A response with SERVFAIL or REFUSED is not accepted when choosing among multiple upstreams.
+The upstream field accepts a string, a comma-separated string, or a JSON string array. Multiple upstreams are queried concurrently and the first accepted response is returned. A response with SERVFAIL or REFUSED is not accepted when choosing among multiple upstreams; when none is accepted, the first of them still goes to the answer check (see Pipelines and rules).
 
 The following prefixes override the transport field:
 

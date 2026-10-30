@@ -772,6 +772,22 @@ pub(crate) async fn handle_forward_decision_logged(
         resp => resp,
     };
 
+    // 几个上游都回了失败应答时，规则的回答检查照样看得到最先收到的那个（见
+    // `rules::check_failure_reply`）；刷新随后照旧拒收它
+    // When several upstreams all replied with a failure, the rule's answer check still sees
+    // the first of those replies (see `rules::check_failure_reply`); a refresh still rejects
+    // it right after
+    let resp = rules::check_failure_reply(resp, response_actions_on_match, |msg| {
+        rules::response_matches(
+            engine,
+            response_matchers,
+            upstream,
+            qname,
+            qtype,
+            qclass,
+            Some(msg),
+        )
+    });
     // Now that a refresh runs the response rules, it takes a failure reply as a
     // failed attempt before they see it, as forward_upstream does for a rule with
     // several upstreams: the refresh takes the failure path such a rule takes,

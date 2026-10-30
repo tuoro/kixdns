@@ -276,6 +276,38 @@ pub(crate) fn acquire_geo_locks<'a>(
     (geoip_manager, geosite_manager)
 }
 
+/// 几个上游一起问、全都失败、其中有上游回了失败应答时（见 `UpstreamFailure`），把最先收到的那个
+/// 应答交给规则的回答检查 `check`：检查通过、而且通过后有动作（`on_match`）要执行时，它就是这次转发
+/// 的应答，和只问一个上游时一样。其余情况照旧是失败：检查不通过时 on_miss 照旧在没有应答的情况下
+/// 执行，没有 on_miss 时照旧是过期缓存或 SERVFAIL。后台刷新不受影响：两处调用之后紧跟着
+/// `reject_failure_reply_on_refresh`，刷新照旧拿到失败，缓存的条目不动。
+/// When several upstreams asked together all failed and one of them replied with a failure
+/// (see `UpstreamFailure`), the first such reply goes to the rule's answer check `check`:
+/// when it passes and has actions to run (`on_match`), that reply is this forward's answer,
+/// as with a single upstream. Otherwise it stays a failure: when the check fails on_miss
+/// still runs without an answer, and without on_miss the stale entry or SERVFAIL still
+/// answers. A background refresh is not affected: both callers run
+/// `reject_failure_reply_on_refresh` right after, so the refresh still gets the failure
+/// and leaves the cached entry alone.
+pub(crate) fn check_failure_reply(
+    resp: anyhow::Result<(Bytes, String)>,
+    on_match: &[Action],
+    check: impl FnOnce(&Message) -> bool,
+) -> anyhow::Result<(Bytes, String)> {
+    let Err(err) = resp else {
+        return resp;
+    };
+    if on_match.is_empty() {
+        return Err(err);
+    }
+    match UpstreamFailure::reply_of(&err) {
+        Some((raw, upstream)) if Message::from_bytes(raw).is_ok_and(|msg| check(&msg)) => {
+            Ok((raw.clone(), upstream.clone()))
+        }
+        _ => Err(err),
+    }
+}
+
 /// 响应匹配器对应答 `msg` 是否成立；没有应答（`None`）时不成立。没有匹配器时成立，也不用去拿
 /// GeoIP、GeoSite 的读锁；有匹配器时读锁只在求值时拿着
 /// Whether the response matchers hold for the answer `msg`; without an answer (`None`)
@@ -907,6 +939,17 @@ pub(crate) async fn process_response_jump(
                     .await
                 };
                 // As in handle_forward_decision_logged / 同 handle_forward_decision_logged
+                let resp = check_failure_reply(resp, &response_actions_on_match, |msg| {
+                    response_matches(
+                        engine,
+                        &response_matchers,
+                        &upstream,
+                        qname,
+                        qtype,
+                        qclass,
+                        Some(msg),
+                    )
+                });
                 let resp = resp.and_then(|reply| {
                     reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply)
                 });
