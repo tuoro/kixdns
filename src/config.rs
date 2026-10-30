@@ -931,10 +931,6 @@ pub enum MatchOperator {
     AndNot,
     #[serde(alias = "or_not", alias = "or-not", alias = "ornot")]
     OrNot,
-    /// Backward compatibility placeholder (not constructed) / 向后兼容占位符（不构造）
-    #[serde(skip)]
-    #[allow(dead_code)]
-    Not,
 }
 
 fn default_match_operator() -> MatchOperator {
