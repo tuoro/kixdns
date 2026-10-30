@@ -229,8 +229,8 @@ impl Engine {
             (pm, None)
         };
 
-        // TCP pool size is per-upstream; each upstream gets its own permit manager
-        // TCP 连接池大小为"每个 upstream"独立配置；每个 upstream 有各自的 permit manager
+        // TCP pool size is per upstream: each upstream keeps up to that many connections
+        // TCP 连接池大小按每个 upstream 算：每个 upstream 最多保留这么多条连接
 
         // Collect TCP upstreams for warmup / 收集 TCP upstream 用于预热
         let tcp_upstreams = state.load().pipeline.collect_tcp_upstreams();

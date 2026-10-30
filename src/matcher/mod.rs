@@ -52,16 +52,6 @@ impl TxtMatchMode {
 // Domain Suffix / 域名后缀
 // ============================================================================
 
-/// 域名后缀按点分段比较：`example.com` 命中它本身和每个子域名，`.example.com` 只命中子域名，
-/// `notexample.com` 两种都不命中。请求名在解析时已转小写、不带结尾的点，配置值在加载时已转小写。
-/// 规则、Pipeline 入口和响应阶段的 `request_domain_suffix` 都用这一个比较，按索引查到的候选和逐条检查的规则结果一致。
-///
-/// Domain suffixes compare label by label: `example.com` matches itself and every subdomain,
-/// `.example.com` subdomains only, and `notexample.com` matches neither. The query name is lowercased
-/// without a trailing dot when parsed, and the configured value is lowercased when loaded. Rules,
-/// pipeline selectors and the response-phase `request_domain_suffix` all use this one comparison, so a
-/// rule found through an index and a rule checked one by one agree.
-#[inline]
 /// 配置里写的域名值，按名字文本的写法存（见 `proto_utils::name_text`）：转小写，去掉结尾的点。
 /// 名字文本不带结尾的点，写了点的值以前永远匹配不上。只有一个点的值保持原样。
 /// A domain value from the configuration, kept the way name text is written (see
@@ -75,6 +65,16 @@ pub(crate) fn domain_value(value: &str) -> Arc<str> {
     }
 }
 
+/// 域名后缀按点分段比较：`example.com` 命中它本身和每个子域名，`.example.com` 只命中子域名，
+/// `notexample.com` 两种都不命中。请求名在解析时已转小写、不带结尾的点，配置值在加载时已转小写。
+/// 规则、Pipeline 入口和响应阶段的 `request_domain_suffix` 都用这一个比较，按索引查到的候选和逐条检查的规则结果一致。
+///
+/// Domain suffixes compare label by label: `example.com` matches itself and every subdomain,
+/// `.example.com` subdomains only, and `notexample.com` matches neither. The query name is lowercased
+/// without a trailing dot when parsed, and the configured value is lowercased when loaded. Rules,
+/// pipeline selectors and the response-phase `request_domain_suffix` all use this one comparison, so a
+/// rule found through an index and a rule checked one by one agree.
+#[inline]
 pub(crate) fn domain_suffix_matches(qname: &str, suffix: &str) -> bool {
     if suffix.is_empty() || suffix.starts_with('.') {
         return qname.ends_with(suffix);

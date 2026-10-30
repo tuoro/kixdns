@@ -234,6 +234,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 - 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
 - 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
 - 拒绝大于 64 KiB 的 DNS 请求体；
+- 和 UDP、TCP 一样只回答标准查询：QR=1 的应答、问题数不是 1、opcode 不是 0 等报文回 400；
 - 成功处理后返回 application/dns-message。
 
 DoT 和 DoQ 只作为出站传输实现，代码没有入站 DoT/DoQ 监听器。

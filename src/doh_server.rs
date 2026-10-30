@@ -189,7 +189,12 @@ async fn handle_doh_request(
         _ => return Ok(error_response(StatusCode::NOT_FOUND)),
     };
 
-    if dns_wire.len() < 12 {
+    // 和 UDP、TCP 一样只回答标准查询：QR=1 的应答、问题数不是 1、opcode 不是 0 等不是查询。UDP 丢掉它们、
+    // TCP 断开，DoH 回 400，和报文太短时一样
+    // As over UDP and TCP, only a standard query is answered: a response with QR=1, a
+    // question count other than 1, an opcode other than 0 and so on are no queries. UDP
+    // drops them and TCP closes; DoH says 400, as for a message too short
+    if !crate::proto_utils::is_standard_query_header(&dns_wire) {
         return Ok(error_response(StatusCode::BAD_REQUEST));
     }
 

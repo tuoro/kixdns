@@ -416,6 +416,58 @@ async fn test_doh_post_short_body() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+/// 不是标准查询的报文（QR=1 的应答、问题数不是 1、opcode 不是 0 等）和 UDP、TCP 一样不回答：UDP 丢掉、TCP
+/// 断开，DoH 回 400，和报文太短时一样。以前 DoH 都回 200：QR=1 的应答和 opcode 为 STATUS 的报文被当成查询
+/// 答了，问题数不是 1 或者带着回答的回 SERVFAIL；QR=1 的应答换来应答，可以拿来反射
+/// A message that is not a standard query (a response with QR=1, a question count other
+/// than 1, an opcode other than 0 and so on) gets no answer, as over UDP and TCP: UDP drops
+/// it and TCP closes, DoH says 400, as for a message too short. DoH used to say 200 to all:
+/// a response with QR=1 and a STATUS opcode were answered as queries, and a question count
+/// other than 1 or carried answers got SERVFAIL; a response bought a response, open to
+/// reflection
+#[tokio::test]
+async fn test_doh_post_non_query_is_bad_request() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let client = make_https_client();
+    let query = make_dns_query("reflect.example.com", 0x4242);
+    let with = |change: fn(&mut Vec<u8>)| {
+        let mut packet = query.clone();
+        change(&mut packet);
+        packet
+    };
+    for (case, packet) in [
+        ("QR=1", with(|packet| packet[2] |= 0x80)),
+        ("QDCOUNT=0", with(|packet| packet[5] = 0)),
+        ("QDCOUNT=2", with(|packet| packet[5] = 2)),
+        (
+            "opcode STATUS",
+            with(|packet| packet[2] = (packet[2] & 0x87) | (2 << 3)),
+        ),
+        ("ANCOUNT=1", with(|packet| packet[7] = 1)),
+    ] {
+        let resp = post(&client, server.port, packet)
+            .send()
+            .await
+            .expect("POST request");
+        let status = resp.status();
+        let body = resp.bytes().await.expect("body").len();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{case}: {status} with a {body}-byte body"
+        );
+    }
+    let resp = post(&client, server.port, query)
+        .send()
+        .await
+        .expect("POST request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a plain query is still answered"
+    );
+}
+
 // ============================================================================
 // POST body limit tests: reject before buffering (RFC 8484 §4.1 message size)
 // ============================================================================
@@ -480,15 +532,18 @@ async fn test_doh_post_body_at_limit_still_processed() {
     let server = start_doh(make_nxdomain_engine()).await;
     let client = make_https_client();
 
-    let at_limit = vec![0xAAu8; 64 * 1024];
+    // A standard query header (QR=0, opcode 0, one question) so it passes the
+    // query check, then 0xAA up to the limit: the question cannot be read.
+    let mut at_limit = vec![0xAAu8; 64 * 1024];
+    at_limit[2..12].copy_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
 
     let resp = post(&client, server.port, at_limit)
         .send()
         .await
         .expect("POST request");
 
-    // 64 KiB of 0xAA is not a parseable query, so the engine answers SERVFAIL;
-    // what matters here is that the size guard let it through.
+    // The question is not readable, so the engine answers SERVFAIL; what
+    // matters here is that the size guard let it through.
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.bytes().await.expect("read body");
     assert_eq!(

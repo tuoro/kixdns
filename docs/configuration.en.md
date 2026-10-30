@@ -234,6 +234,7 @@ The inbound DoH handler:
 - accepts POST requests at the configured path and reads a DNS wire message body;
 - accepts GET requests at the configured path with a dns base64url-without-padding query parameter;
 - rejects DNS bodies larger than 64 KiB;
+- answers standard queries only, as UDP and TCP do: a response with QR=1, a question count other than 1, an opcode other than 0 and the like get 400;
 - returns application/dns-message for a successful DNS response.
 
 DoT and DoQ are implemented as outbound transports. There are no inbound DoT or DoQ listeners.

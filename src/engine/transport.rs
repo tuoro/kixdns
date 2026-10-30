@@ -816,13 +816,13 @@ impl<W> Drop for TcpWriteGuard<'_, W> {
     fn drop(&mut self) {
         if self.armed {
             // 立刻丢掉写半边，半条帧不会再被别人续写；`reset()` 还要取消 reader
-            // 的 token 并释放连接级 permit，那两件事不能在 Drop 里 await，所以
+            // 的 token、让还在等这条连接的查询失败，那两件事不能在 Drop 里 await，所以
             // 置位让下一次 `ensure_connection` 顺着既有的 `errors > 0` 那条路
             // 一起收口。
             // Drop the write half at once so nothing can append to half a frame.
-            // A full `reset()` also cancels the reader's token and releases the
-            // connection permit, neither of which can await inside Drop, so this
-            // flags the next `ensure_connection` to take the existing
+            // A full `reset()` also cancels the reader's token and fails the queries
+            // still waiting on the connection, neither of which can await inside
+            // Drop, so this flags the next `ensure_connection` to take the existing
             // `errors > 0` path and finish the job in one place.
             *self.slot = None;
             self.needs_reset.store(true, Ordering::Release);
@@ -1185,9 +1185,9 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             self.last_health_check_time.store(now, Ordering::Relaxed);
         }
 
-        // 1. Ensure connection exists (acquires connection-level permit if needed),
-        //    within what is left of the budget
-        // 确保连接存在（如果需要则获取连接级别 permit），受剩余预算约束
+        // 1. Ensure the connection exists (connecting if needed), within what is left
+        //    of the budget
+        // 确保连接存在（没有就建连），受剩余预算约束
         self.ensure_connection(timeout_dur.saturating_sub(start.elapsed()))
             .await?;
 
@@ -1400,34 +1400,23 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         Ok(resp)
     }
 
-    /// Ensure the connection exists, acquiring connection-level permit if needed
-    /// 确保连接存在，如果需要则获取连接级别 permit
-    ///
-    /// Connection-level permit semantics:
-    /// - Acquired when connection is established
-    /// - Held for the entire connection lifetime
-    /// - Released when connection is closed/reset
-    /// - Allows unlimited requests on the same connection (TCP multiplexing)
-    ///
-    /// 连接级别 permit 语义：
-    /// - 连接建立时获取
-    /// - 连接生命周期内持有
-    /// - 连接关闭/重置时释放
-    /// - 允许同一连接上无限请求（TCP 多路复用）
+    /// Ensure the connection exists, connecting if needed. One connection carries
+    /// any number of queries at once (multiplexing).
+    /// 确保连接存在，没有就建连。一条连接上可以同时跑任意多个查询（多路复用）。
     ///
     /// `budget` bounds the connect (DoT's TLS handshake included); on failure
-    /// the lock and the permit are released immediately.
-    /// `budget` 约束建连（包括 DoT 的 TLS 握手）；失败时立即释放锁和 permit。
+    /// the lock is released immediately.
+    /// `budget` 约束建连（包括 DoT 的 TLS 握手）；失败时立即释放锁。
     async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         let started = tokio::time::Instant::now();
         // First, check if we need to reconnect based on error state
         // 首先，根据错误状态检查是否需要重连
         let errors = self.consecutive_errors.load(Ordering::Acquire);
-        // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补齐 reader token 与
-        // 连接级 permit，让清理和普通错误路径完全对称。
-        // A cancelled write already dropped the write half in Drop; this picks
-        // up the reader token and the connection permit so the cleanup matches
-        // the ordinary error path exactly.
+        // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补上取消 reader token、
+        // 让还在等的查询失败，让清理和普通错误路径完全对称。
+        // A cancelled write already dropped the write half in Drop; this cancels
+        // the reader token and fails the queries still waiting, so the cleanup
+        // matches the ordinary error path exactly.
         let write_cancelled = self.write_cancelled.swap(false, Ordering::AcqRel);
         let needs_reset = errors > 0 || write_cancelled;
 
@@ -3328,7 +3317,7 @@ mod tests {
         assert!(
             client.write_cancelled.load(Ordering::Acquire),
             "the next ensure_connection must be told to finish the cleanup that \
-             Drop cannot await: the reader token and the connection permit"
+             Drop cannot await: the reader token and the queries still waiting"
         );
 
         // 下一次建连要真的走完整 reset，并把标志清掉
@@ -6014,7 +6003,7 @@ mod tests {
         assert!(
             client.write_cancelled.load(Ordering::Acquire),
             "the next ensure_connection must be told to finish the cleanup that \
-             Drop cannot await: the reader token and the connection permit"
+             Drop cannot await: the reader token and the queries still waiting"
         );
         peer.abort();
     }
