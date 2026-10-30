@@ -173,7 +173,7 @@ The aliases and-not, andnot, or-not, and ornot are also accepted.
 | jump_to_pipeline | pipeline | Starts processing the referenced pipeline. |
 | allow | none | Request phase: forward with the global default UDP upstream. Response phase: keep the current upstream response. |
 | deny | none | Returns REFUSED. |
-| forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream uses default_upstream. |
+| forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream (or null, or []) uses default_upstream; an empty string is not missing. |
 | continue | none | Continues with the next request rule, or the next pipeline decision in the response flow. |
 | replace_txt_response | text | Response-phase action that replaces TXT records in the current response. In the request phase it does not produce a response. text has the same size limits as static_txt_response. |
 
@@ -201,7 +201,7 @@ The supported modes are:
 
 A forward without ecs passes the client's own ECS option upstream as it is.
 
-The forwards of one rule merge into one forward that asks every upstream at once, so it sends one ECS: the forwards' ecs when they all write the same; when they differ (some written and some not, too) the rule acts as if no ecs were written, and this is a configuration problem (see "Cache and reload behavior").
+The forwards of one rule merge into one forward that asks every upstream at once, so it sends one ECS: the forwards' ecs when they all write the same; when they differ (some written and some not, too) the rule acts as if no ecs were written, and this is a configuration problem (see "Cache and reload behavior"). A forward whose upstream is written empty (or commas only) is not part of the merge: it is skipped, its ecs does not count, and as long as another forward names an address it is no configuration problem.
 
 Cached answers follow RFC 7871 section 7.3. Each answer is kept for the requesters it applies to, judged by the ECS the forward actually sent and the SCOPE PREFIX-LENGTH in the upstream's reply:
 
