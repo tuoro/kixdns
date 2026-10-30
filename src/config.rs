@@ -2004,6 +2004,174 @@ mod validation_tests {
         assert_eq!(split("1.1.1.1:53"), None);
     }
 
+    /// 基础设置的默认值逐个写在这里：配置里不写时读进来的、`GlobalSettings::default()` 给的，都要是
+    /// 这些值，两者的 Debug 输出也一样。面板的基础设置也照这些值显示「默认 …」
+    /// Every basic setting's default is written out here: what a configuration that leaves
+    /// it out reads as, and what `GlobalSettings::default()` gives, must be these values,
+    /// and the two print the same. The panel's basic settings show these values as their
+    /// defaults too
+    #[test]
+    fn every_setting_has_the_default_written_here() {
+        use super::GlobalSettings;
+        let read: GlobalSettings =
+            serde_json::from_str("{}").expect("an empty settings object reads");
+        assert_eq!(
+            format!("{read:?}"),
+            format!("{:?}", GlobalSettings::default())
+        );
+        for settings in [read, GlobalSettings::default()] {
+            assert_eq!(settings.min_ttl, 0, "min_ttl");
+            assert_eq!(settings.bind_udp, "0.0.0.0:5353", "bind_udp");
+            assert_eq!(settings.bind_tcp, "0.0.0.0:5353", "bind_tcp");
+            assert_eq!(settings.bind_doh, None, "bind_doh");
+            assert_eq!(settings.doh_tls_cert, None, "doh_tls_cert");
+            assert_eq!(settings.doh_tls_key, None, "doh_tls_key");
+            assert_eq!(settings.doh_path, "/dns-query", "doh_path");
+            assert_eq!(settings.cache_capacity, 10_000, "cache_capacity");
+            assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
+            assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
+            assert_eq!(settings.default_upstream, "1.1.1.1:53", "default_upstream");
+            assert!(
+                settings.default_upstream_pre_split.is_none(),
+                "default_upstream_pre_split"
+            );
+            assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");
+            assert_eq!(settings.request_timeout_ms, None, "request_timeout_ms");
+            assert_eq!(settings.response_jump_limit, 10, "response_jump_limit");
+            assert_eq!(settings.udp_pool_size, 64, "udp_pool_size");
+            assert_eq!(settings.tcp_pool_size, 64, "tcp_pool_size");
+            assert_eq!(settings.doh_pool_size, 8, "doh_pool_size");
+            assert_eq!(
+                settings.doh_health_check_error_threshold, 3,
+                "doh_health_check_error_threshold"
+            );
+            assert_eq!(settings.dot_pool_size, 64, "dot_pool_size");
+            assert_eq!(settings.doq_pool_size, 16, "doq_pool_size");
+            assert_eq!(
+                settings.tcp_health_check_error_threshold, 3,
+                "tcp_health_check_error_threshold"
+            );
+            assert_eq!(
+                settings.tcp_connection_max_age_seconds, 300,
+                "tcp_connection_max_age_seconds"
+            );
+            assert_eq!(
+                settings.tcp_connection_idle_timeout_seconds, 60,
+                "tcp_connection_idle_timeout_seconds"
+            );
+            assert_eq!(
+                settings.doq_connection_idle_timeout_seconds, 60,
+                "doq_connection_idle_timeout_seconds"
+            );
+            assert_eq!(
+                settings.doq_keepalive_interval_ms, 15_000,
+                "doq_keepalive_interval_ms"
+            );
+            assert!(settings.doq_enable_0rtt, "doq_enable_0rtt");
+            assert!(!settings.flow_control_enabled, "flow_control_enabled");
+            assert_eq!(
+                settings.flow_control_initial_permits, 500,
+                "flow_control_initial_permits"
+            );
+            assert_eq!(
+                settings.flow_control_min_permits, 100,
+                "flow_control_min_permits"
+            );
+            assert_eq!(
+                settings.flow_control_max_permits, 800,
+                "flow_control_max_permits"
+            );
+            assert_eq!(
+                settings.flow_control_latency_threshold_ms, 100,
+                "flow_control_latency_threshold_ms"
+            );
+            assert_eq!(
+                settings.flow_control_adjustment_interval_secs, 5,
+                "flow_control_adjustment_interval_secs"
+            );
+            assert!(!settings.serve_stale, "serve_stale");
+            assert_eq!(settings.serve_stale_ttl, 30, "serve_stale_ttl");
+            assert_eq!(
+                settings.serve_stale_expire_ttl, 86400,
+                "serve_stale_expire_ttl"
+            );
+            assert!(settings.serve_stale_ttl_reset, "serve_stale_ttl_reset");
+            assert_eq!(
+                settings.serve_stale_client_timeout_ms, 0,
+                "serve_stale_client_timeout_ms"
+            );
+            assert!(
+                !settings.cache_background_refresh,
+                "cache_background_refresh"
+            );
+            assert_eq!(
+                settings.cache_refresh_threshold_percent, 10,
+                "cache_refresh_threshold_percent"
+            );
+            assert_eq!(settings.cache_refresh_min_ttl, 5, "cache_refresh_min_ttl");
+            assert_eq!(settings.geoip_db_path, None, "geoip_db_path");
+            assert_eq!(settings.geoip_dat_path, None, "geoip_dat_path");
+            assert!(!settings.geoip_auto_convert, "geoip_auto_convert");
+            assert!(
+                settings.geoip_filter_countries.is_empty(),
+                "geoip_filter_countries"
+            );
+            assert!(settings.geosite_data_paths.is_empty(), "geosite_data_paths");
+            assert!(settings.enable_tcp_fallback, "enable_tcp_fallback");
+            assert!(!settings.statistics_enabled, "statistics_enabled");
+            assert!(
+                !settings.statistics_anonymize_client_ip,
+                "statistics_anonymize_client_ip"
+            );
+        }
+    }
+
+    /// 只写了一部分设置时，写了的照写的读，没写的取默认值。挑的十来个字段类型各不相同：字符串、
+    /// 数字、bool、Option、列表
+    /// With only some settings written, those are read as written and the rest take
+    /// their defaults. The dozen or so fields picked are of different types: strings,
+    /// numbers, bools, Options, lists
+    #[test]
+    fn written_settings_are_read_and_the_rest_take_their_defaults() {
+        use super::GlobalSettings;
+        {
+            let countries = serde_json::json!(["cn", "us"]);
+            let read: GlobalSettings = serde_json::from_value(serde_json::json!({
+                "bind_udp": "127.0.0.1:53",
+                "bind_doh": "127.0.0.1:443",
+                "default_upstream": "9.9.9.9:53",
+                "cache_capacity": 5,
+                "min_ttl": 7,
+                "dashmap_shards": 4,
+                "cache_refresh_threshold_percent": 50,
+                "upstream_timeout_ms": 777,
+                "request_timeout_ms": 1234,
+                "doq_enable_0rtt": false,
+                "flow_control_enabled": true,
+                "geoip_filter_countries": countries,
+                "geosite_data_paths": ["a.dat"]
+            }))
+            .expect("settings read");
+            let expected = GlobalSettings {
+                bind_udp: "127.0.0.1:53".to_string(),
+                bind_doh: Some("127.0.0.1:443".to_string()),
+                default_upstream: "9.9.9.9:53".to_string(),
+                cache_capacity: 5,
+                min_ttl: 7,
+                dashmap_shards: 4,
+                cache_refresh_threshold_percent: 50,
+                upstream_timeout_ms: 777,
+                request_timeout_ms: Some(1234),
+                doq_enable_0rtt: false,
+                flow_control_enabled: true,
+                geoip_filter_countries: vec!["cn".to_string(), "us".to_string()],
+                geosite_data_paths: vec!["a.dat".to_string()],
+                ..GlobalSettings::default()
+            };
+            assert_eq!(format!("{read:?}"), format!("{expected:?}"));
+        }
+    }
+
     #[test]
     fn problems_name_what_would_silently_do_something_else() {
         let any = serde_json::json!([{ "type": "any" }]);
