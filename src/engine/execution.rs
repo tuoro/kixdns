@@ -362,12 +362,15 @@ impl Engine {
     /// Every answer is cached through here. A truncated answer never is: it is incomplete,
     /// and the client is meant to ask again over TCP (RFC 2181 section 9), which a cached copy
     /// would answer with the same truncated answer for its whole TTL. A refresh that gets one
-    /// keeps the old entry. The answer is stored without its ECS option: it may be served to
+    /// keeps the old entry. Neither is a TSIG-signed answer: its signature holds for the one
+    /// request that was signed (RFC 8945), and another client gets it unaltered, spelled as
+    /// that request asked. The answer is stored without its ECS option: it may be served to
     /// requesters in other subnets, which get their own echo (see `phases::served_from_cache`).
     /// 所有应答都经这里写进缓存。截断的应答从不缓存：它不完整，客户端本该改用 TCP 再问（RFC 2181
     /// 第 9 节），缓存了就会在整个 TTL 内拿同一个截断的应答回答它。刷新拿到这样的应答时，旧条目保留。
-    /// 应答去掉 ECS 选项后存放：它可能交给别的子网的请求方，它们各自得到自己的回显（见
-    /// `phases::served_from_cache`）。
+    /// TSIG 签过的应答也不缓存：签名只对签它的那个请求有效（RFC 8945），别的客户端拿到的是原封不动、
+    /// 照那个请求写法的应答。应答去掉 ECS 选项后存放：它可能交给别的子网的请求方，它们各自得到自己的
+    /// 回显（见 `phases::served_from_cache`）。
     pub(crate) fn insert_dns_cache_entry(&self, slot: u64, mut entry: CacheEntry) {
         if crate::proto_utils::truncated_response(&entry.bytes) {
             tracing::debug!(
@@ -375,6 +378,15 @@ impl Engine {
                 qname = %entry.qname,
                 pipeline = %entry.pipeline_id,
                 "truncated answer is not cached"
+            );
+            return;
+        }
+        if crate::proto_utils::last_record_is_tsig(&entry.bytes) {
+            tracing::debug!(
+                event = "signed_answer_not_cached",
+                qname = %entry.qname,
+                pipeline = %entry.pipeline_id,
+                "TSIG-signed answer is not cached"
             );
             return;
         }

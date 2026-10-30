@@ -483,6 +483,16 @@ async fn run_response_actions(
                         .map(|q| q.name().clone())
                         .ok_or_else(|| anyhow::anyhow!("No query name"))?;
 
+                    // 和静态 TXT 一样，装不进应答时回 SERVFAIL（见 `txt_size_problem`）
+                    // As for a static TXT, SERVFAIL when it does not fit the answer (see
+                    // `txt_size_problem`)
+                    if let Some(problem) = crate::engine::response::txt_size_problem(
+                        text,
+                        crate::engine::response::name_wire_len(&name),
+                    ) {
+                        warn!(qname = %ctx.qname, %problem, "replaced TXT answer does not fit a message");
+                        return response_action_servfail(ctx.req);
+                    }
                     // Create new TXT record / 创建新的 TXT 记录
                     let txt = TXT::new(text.to_vec());
                     let record = Record::from_rdata(name, 300, RData::TXT(txt));
