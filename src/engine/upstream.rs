@@ -21,11 +21,21 @@ use super::observation::Observed;
 #[derive(Debug)]
 pub struct UpstreamFailure {
     source: anyhow::Error,
+    /// 几个上游一起问时最先收到的失败应答（见 [`is_failure_reply`]）和回它的上游（`传输:地址`）；
+    /// 全是传输出错时没有。规则的回答检查还要看它（见 `rules::check_failure_reply`）
+    /// The first failure reply (see [`is_failure_reply`]) received when several upstreams
+    /// were asked together, with the upstream that sent it (`transport:address`); none when
+    /// every attempt was a transport error. The rule's answer check still reads it (see
+    /// `rules::check_failure_reply`)
+    reply: Option<(Bytes, String)>,
 }
 
 impl UpstreamFailure {
     pub fn new(source: anyhow::Error) -> Self {
-        Self { source }
+        Self {
+            source,
+            reply: None,
+        }
     }
 
     /// `source` 包成「上游都失败了」的错误，调用方据此认出它（见 `downcast_ref`）
@@ -33,6 +43,20 @@ impl UpstreamFailure {
     /// `downcast_ref`
     pub fn error(source: anyhow::Error) -> anyhow::Error {
         anyhow::Error::new(Self::new(source))
+    }
+
+    /// 同 [`Self::error`]，带着最先收到的失败应答 / As [`Self::error`], carrying the first
+    /// failure reply received
+    fn with_reply(source: anyhow::Error, reply: Option<(Bytes, String)>) -> anyhow::Error {
+        anyhow::Error::new(Self { source, reply })
+    }
+
+    /// `err` 是上游都失败了、而且带着失败应答时，那个应答和回它的上游
+    /// The failure reply `err` carries, and the upstream that sent it, when `err` is an
+    /// every-upstream-failed error with one
+    pub(crate) fn reply_of(err: &anyhow::Error) -> Option<&(Bytes, String)> {
+        err.downcast_ref::<Self>()
+            .and_then(|failure| failure.reply.as_ref())
     }
 }
 
@@ -429,7 +453,17 @@ pub async fn forward_upstream(
     observed: Observed<'_>,
 ) -> anyhow::Result<(Bytes, String)> {
     let packet = crate::proto_utils::query_without_cookie(packet);
-    let (reply, winner) = forward_upstream_as_is(
+    let guarded = |reply| {
+        let reply = crate::proto_utils::reply_without_cookie(reply);
+        // 用当前配置的 min_ttl，而不是请求开始时那份：改 min_ttl 会轮换所有缓存命名空间，一个跨过重载
+        // 的应答只会交给它自己的客户端
+        // min_ttl comes from the current configuration rather than the request's own:
+        // changing it rotates every cache namespace, so a reply in flight across a
+        // reload reaches only its own client
+        let floor = engine.state.load().pipeline.settings.min_ttl;
+        crate::proto_utils::reply_within_ttls(reply, floor, engine.ttl_cap())
+    };
+    match forward_upstream_as_is(
         engine,
         &packet,
         upstream,
@@ -438,16 +472,21 @@ pub async fn forward_upstream(
         pre_split_upstreams,
         observed,
     )
-    .await?;
-    let reply = crate::proto_utils::reply_without_cookie(reply);
-    // 用当前配置的 min_ttl，而不是请求开始时那份：改 min_ttl 会轮换所有缓存命名空间，一个跨过重载
-    // 的应答只会交给它自己的客户端
-    // min_ttl comes from the current configuration rather than the request's own:
-    // changing it rotates every cache namespace, so a reply in flight across a
-    // reload reaches only its own client
-    let floor = engine.state.load().pipeline.settings.min_ttl;
-    let reply = crate::proto_utils::reply_within_ttls(reply, floor, engine.ttl_cap());
-    Ok((reply, winner))
+    .await
+    {
+        Ok((reply, winner)) => Ok((guarded(reply), winner)),
+        // 失败带着的失败应答也可能交到客户端手里（见 `rules::check_failure_reply`），一样把关
+        // The failure reply a failure carries may reach a client too (see
+        // `rules::check_failure_reply`), so it passes the same guards
+        Err(mut err) => {
+            if let Some(failure) = err.downcast_mut::<UpstreamFailure>()
+                && let Some((reply, _)) = failure.reply.as_mut()
+            {
+                *reply = guarded(std::mem::take(reply));
+            }
+            Err(err)
+        }
+    }
 }
 
 /// [`forward_upstream`] 去掉 cookie 之前的部分 / [`forward_upstream`] short of its cookie guard
@@ -579,6 +618,10 @@ async fn forward_upstream_as_is(
     // 使用 Bytes 实现低成本克隆（引用计数）而非 Vec 全量拷贝
     let packet_owned = Bytes::copy_from_slice(packet);
     let mut last_err: Option<anyhow::Error> = None;
+    // 最先收到的失败应答，全都失败时带出去（见 `UpstreamFailure::reply`）
+    // The first failure reply received, carried out when every attempt fails (see
+    // `UpstreamFailure::reply`)
+    let mut first_failure_reply: Option<(Bytes, String)> = None;
     // Attempts that have not reported a result yet, so losers of the race can
     // be reported as aborted; only tracked for an observer.
     // 尚未上报结果的尝试，用于把竞争失败者上报为已取消；仅在有观察者时跟踪。
@@ -709,6 +752,7 @@ async fn forward_upstream_as_is(
                             return Ok((bytes, up_proto));
                         }
                         report(UpstreamOutcome::Rejected, rcode, truncated, None);
+                        first_failure_reply.get_or_insert((bytes, up_proto));
                     }
                     Err(err) => {
                         let outcome = failed_outcome(&err);
@@ -738,7 +782,7 @@ async fn forward_upstream_as_is(
 
     // 所有上游都失败 / All upstreams failed
     let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
-    Err(UpstreamFailure::error(err))
+    Err(UpstreamFailure::with_reply(err, first_failure_reply))
 }
 
 /// 一组上游里去掉正在暂停的 DoH 上游（见 `DohClient::is_paused`），逐个报给观察者。只有一个上游时，

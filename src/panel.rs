@@ -4032,4 +4032,93 @@ mod diagnostic_tests {
             ]
         );
     }
+
+    /// 几个上游都回 SERVFAIL、回答检查改问备用组时，查询日志里写着这一步：两个上游都被丢掉
+    /// （rejected），回答检查通过、跳去备用组，答案来自备用组
+    /// When several upstreams all answer SERVFAIL and the answer check falls back, the query
+    /// log says so: both upstreams rejected, the check passed and jumped to the fallback group,
+    /// whose upstream gave the answer
+    #[tokio::test]
+    async fn the_query_log_shows_a_fallback_after_failure_replies() {
+        let failing = || {
+            crate::engine::test_support::upstream(|query| {
+                let mut reply = hickory_proto::op::Message::new(
+                    query.metadata.id,
+                    hickory_proto::op::MessageType::Response,
+                    hickory_proto::op::OpCode::Query,
+                );
+                reply.metadata.recursion_desired = query.metadata.recursion_desired;
+                reply.metadata.response_code = hickory_proto::op::ResponseCode::ServFail;
+                reply.add_queries(query.queries.iter().cloned());
+                vec![(std::time::Duration::ZERO, reply.to_vec().unwrap())]
+            })
+        };
+        let (first, second) = (failing().await, failing().await);
+        let backup =
+            crate::engine::test_support::answering_upstream(Ipv4Addr::new(192, 0, 2, 53), 300)
+                .await;
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(
+            json!({
+                "settings": { "default_upstream": "127.0.0.1:9", "upstream_timeout_ms": 3000 },
+                "pipelines": [
+                    { "id": "main", "rules": [{
+                        "name": "group",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": [first.address.clone(), second.address.clone()] }],
+                        "response_matchers": [
+                            { "type": "response_rcode", "value": "SERVFAIL" },
+                            { "type": "response_rcode", "value": "REFUSED" }
+                        ],
+                        "response_matcher_operator": "or",
+                        "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "fallback" }]
+                    }] },
+                    { "id": "fallback", "rules": [{
+                        "name": "backup",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": backup.address.clone() }]
+                    }] }
+                ]
+            }),
+            Arc::clone(&metrics),
+        );
+        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+        let client = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
+        let (packet, _) = diagnostic_packet("broken.example", "A").expect("packet");
+        engine.handle_packet(&packet, client).await.expect("query");
+
+        let page: serde_json::Value =
+            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
+                .unwrap();
+        let entry = &page["entries"][0];
+        assert_eq!(entry["answers"], json!(["192.0.2.53"]), "{entry}");
+        assert_eq!(entry["pipeline"], "fallback", "{entry}");
+        let steps = entry["steps"].as_array().expect("steps");
+        let upstream_steps = |result: &str| {
+            let mut upstreams: Vec<String> = steps
+                .iter()
+                .filter(|step| step["kind"] == "upstream" && step["result"] == result)
+                .map(|step| step["upstream"].as_str().unwrap().to_string())
+                .collect();
+            upstreams.sort();
+            upstreams
+        };
+        let mut both = vec![first.address.clone(), second.address.clone()];
+        both.sort();
+        assert_eq!(upstream_steps("rejected"), both, "{entry}");
+        assert_eq!(
+            upstream_steps("success"),
+            vec![backup.address.clone()],
+            "{entry}"
+        );
+        assert!(
+            steps.iter().any(|step| step["kind"] == "rule"
+                && step["rule"] == "group"
+                && step["phase"] == "response"
+                && step["matched"] == true
+                && step["decision"] == "jump"
+                && step["target"] == "fallback"),
+            "{entry}"
+        );
+    }
 }

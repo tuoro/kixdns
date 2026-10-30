@@ -21,6 +21,8 @@ mod inflight_wait_tests;
 pub mod listener;
 pub mod matcher_adapter;
 #[cfg(test)]
+mod merged_failure_check_tests;
+#[cfg(test)]
 mod name_text_tests;
 pub(crate) mod observation;
 pub mod phases;

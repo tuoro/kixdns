@@ -77,7 +77,7 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 
 每个 Pipeline 包含 id、可选的 rules 数组和可选的 Pipeline 级 ecs。Pipeline 级 ecs 是旧配置用来区分缓存的，现在不再影响缓存（改动它时，热加载后该 Pipeline 的缓存仍会重新开始）。规则按配置顺序处理。空匹配器列表视为匹配。规则内的匹配器按从左到右形成链；每个匹配器可以携带自己的 operator，或者在所有匹配器都省略 operator 时由规则级 matcher_operator 设置。
 
-响应阶段使用同样的 response_matchers、response_matcher_operator、response_actions_on_match 和 response_actions_on_miss。Forward 得到响应后执行响应动作；配置了 miss 动作时，上游尝试全部失败后也会进入 miss 路径。
+响应阶段使用同样的 response_matchers、response_matcher_operator、response_actions_on_match 和 response_actions_on_miss。Forward 得到响应后执行响应动作；配置了 miss 动作时，上游尝试全部失败后也会进入 miss 路径。几个上游一起问、全都失败、其中有上游回了失败应答（SERVFAIL、REFUSED 或扩展 RCODE）时，最先收到的那个应答照样交给回答检查：检查通过、而且 response_actions_on_match 有动作时，按这个应答执行 match 动作，和只问一个上游时一样。检查不通过，或者通过了但没有 match 动作时，照旧按上游失败处理：有 miss 动作时在没有应答的情况下执行，否则给过期缓存或 SERVFAIL。因此，SERVFAIL 也能满足的回答检查（例如「上游回 SERVFAIL 或 REFUSED 时改问」，或取反的 IP 条件）不管写了几个上游都会生效。后台刷新不这样做：上游都回失败应答时，刷新照旧算失败，条目保留。
 
 ### Pipeline selector 和请求匹配器
 
@@ -251,7 +251,7 @@ Forward 动作的 transport 字段可选以下值：
 | dot | DNS over TLS |
 | doq | DNS over QUIC |
 
-upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多个上游会并发查询并返回第一个可接受的响应；在多个上游选择时，SERVFAIL 和 REFUSED 响应不会被接受。
+upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多个上游会并发查询并返回第一个可接受的响应；在多个上游选择时，SERVFAIL 和 REFUSED 响应不会被接受；全都没有可接受的响应时，最先收到的那个仍会交给回答检查（见「Pipeline 和规则」）。
 
 以下协议前缀会覆盖 transport 字段：
 
