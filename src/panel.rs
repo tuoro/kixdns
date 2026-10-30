@@ -1436,12 +1436,10 @@ impl EngineObserver for PanelMetrics {
         debug_forward!(self.upstream_skipped(ctx, event));
         // 没问就不是一次尝试，不进任何指标 / Not asked is no attempt, and counts in no metric
         self.query_log.upstream_skipped(ctx, event);
-        panel_trace::trace_step!(
-            "upstream",
-            "skipped",
-            event.upstream,
-            Some("正在限速，这次没问它".to_owned()),
-        );
+        let why = match event.reason {
+            UpstreamSkipReason::Throttled => "正在限速，这次没问它",
+        };
+        panel_trace::trace_step!("upstream", "skipped", event.upstream, Some(why.to_owned()));
     }
 
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
