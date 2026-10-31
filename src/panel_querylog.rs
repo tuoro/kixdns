@@ -12,18 +12,23 @@
 //! back) and leaves the panel's interpretation to the panel: whether a static answer is a block or a
 //! custom answer, and what a rule is called on the config page, are read from the config there.
 
+use std::borrow::{Borrow, Cow};
+use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use parking_lot::Mutex;
+use rustc_hash::FxHashSet;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
+use smallvec::SmallVec;
 
 use crate::observe::{
     CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
@@ -43,11 +48,71 @@ pub(crate) const MAX_PAGE: usize = 2_000;
 /// At most this many requests tracked at once: beyond it requests are only counted (`untracked`), so
 /// the panel can still say how many it missed
 const MAX_PENDING: usize = 4_096;
+/// 在跟的请求按编号直接定位的槽位数，2 的幂；同时在跟的多过它时，多出来的记在共享表里
+/// Slots the tracked requests are placed in by number, a power of two; requests beyond them at once go
+/// to a shared map
+const PENDING_SLOTS: usize = 1_024;
+/// 每个线程记住的名字上限：一份配置里的 Pipeline、规则和上游地址通常不过几十个，多过这个数就从头记
+/// The most names a thread remembers: a config's pipelines, rules and upstream addresses usually number a
+/// few dozen, and past this the thread starts over
+const KNOWN_NAMES: usize = 512;
 const MAX_STEPS: usize = 64;
 const MAX_ANSWERS: usize = 8;
 const MAX_TEXT: usize = 256;
 /// 面板多久没来取就停记 / How long without a collection before recording stops
 const IDLE_AFTER: Duration = Duration::from_secs(120);
+
+/// 配置里的名字：Pipeline、规则、上游地址。来来回回就那几个，每个线程记住见过的，同一个名字一份内存，
+/// 记一步只加一次引用计数，不再每一步复制一份字符串
+/// A name from the config: a pipeline, rule or upstream address. The same few come again and again, so
+/// each thread remembers the ones it has seen and a name is held once; recording a step bumps a
+/// reference count instead of copying a string each time
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ConfigName(Arc<str>);
+
+thread_local! {
+    static KNOWN: RefCell<FxHashSet<ConfigName>> = RefCell::new(FxHashSet::default());
+}
+
+impl ConfigName {
+    fn of(text: &str) -> Self {
+        KNOWN.with_borrow_mut(|known| {
+            if let Some(name) = known.get(text) {
+                return name.clone();
+            }
+            if known.len() >= KNOWN_NAMES {
+                known.clear();
+            }
+            let name = Self(Arc::from(text));
+            known.insert(name.clone());
+            name
+        })
+    }
+}
+
+impl Borrow<str> for ConfigName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ConfigName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for ConfigName {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+/// 一个槽位：空着，或放着一个在跟的请求（编号和它攒下的记录） / One slot: empty, or holding a tracked
+/// request (its number and the record so far)
+type Slot = Mutex<Option<(u64, Pending)>>;
 
 pub(crate) struct QueryLog {
     epoch: Instant,
@@ -63,9 +128,18 @@ pub(crate) struct QueryLog {
     /// 超出在途上限、没能记下的请求数（自内核启动起累计） / Requests left unrecorded because too many
     /// were in flight (cumulative since the kernel started)
     untracked: AtomicU64,
-    pending: DashMap<u64, Pending>,
-    /// `pending` 里有几条：为 0 时别的事件一次原子读就返回，不碰哈希表 / How many requests `pending`
-    /// holds: at 0 every other event returns after one atomic load without touching the map
+    /// 在跟的请求，按编号直接定位槽位：不算哈希、不碰共享表的锁。槽位被另一个还没结束的请求占着时
+    /// （同时在跟的多过槽位数），这个请求记在 `overflow` 里
+    /// Tracked requests, placed in a slot by number: no hashing and no shared map lock. When another
+    /// request still running holds the slot (more are tracked at once than there are slots), the request
+    /// goes to `overflow`
+    slots: Box<[Slot]>,
+    overflow: DashMap<u64, Pending>,
+    /// `overflow` 里有几条：为 0 时不碰共享表 / How many requests `overflow` holds: at 0 the map is not
+    /// touched
+    overflow_len: AtomicUsize,
+    /// 在跟的请求数：为 0 时别的事件一次原子读就返回 / How many requests are tracked: at 0 every other
+    /// event returns after one atomic load
     pending_count: AtomicUsize,
     ring: Mutex<Ring>,
 }
@@ -84,19 +158,21 @@ struct Pending {
     transport: Option<ClientTransport>,
     qname: Box<str>,
     qtype: RecordType,
-    steps: Vec<Step>,
+    /// 多数请求不过四步，放得下就不另外分配 / Most requests take four steps or fewer, which need no
+    /// allocation of their own
+    steps: SmallVec<[Step; 4]>,
     steps_truncated: bool,
     cache: Option<CacheHitKind>,
-    cache_source: Option<Box<str>>,
+    cache_source: Option<ConfigName>,
     joined: bool,
     /// 最后进入的 Pipeline / The pipeline entered last
-    pipeline: Option<Box<str>>,
+    pipeline: Option<ConfigName>,
     /// 最后一次决定：哪条规则（没有规则命中时是 None）、决定了什么；回答后检查的决定也算
     /// The last decision: which rule (None when no rule matched) and what it decided; an answer check's
     /// decision counts too
-    decision: Option<(Option<Box<str>>, DecisionKind)>,
+    decision: Option<(Option<ConfigName>, DecisionKind)>,
     /// 最后一个回了可用答案的上游 / The last upstream that returned a usable answer
-    answered_by: Option<Box<str>>,
+    answered_by: Option<ConfigName>,
 }
 
 #[derive(Serialize)]
@@ -112,34 +188,34 @@ struct Step {
 enum StepKind {
     /// 进入一个 Pipeline：选中入口时一次，之后每跳一次一次 / Entered a pipeline: once at selection,
     /// once more after every jump
-    Pipeline { pipeline: Box<str> },
+    Pipeline { pipeline: ConfigName },
     /// 一条规则命中（请求阶段），或回答后检查的结果（`phase` 为 `response`，`matched` 是检查的结论）；
     /// `decision` 和 `target` 由随后的决定补上：跳去的 Pipeline，或转发用的上游（沿用上游回答时是回答的那个）
     /// A rule matched (request phase), or an answer check's result (`phase` is `response`, `matched` its
     /// verdict); `decision` and `target` come from the decision that follows: the pipeline it jumps to,
     /// or the upstreams it forwards to (the upstream that answered, when an answer is kept)
     Rule {
-        pipeline: Box<str>,
-        rule: Box<str>,
+        pipeline: ConfigName,
+        rule: ConfigName,
         phase: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         matched: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         decision: Option<&'static str>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        target: Option<Box<str>>,
+        target: Option<ConfigName>,
     },
     /// 前面没有对应规则那一步的决定：没有规则命中时 Pipeline 的默认决定，或没写回答检查条件的规则的回答阶段动作
     /// A decision with no rule step before it: a pipeline's default decision when no rule matched, or the
     /// response actions of a rule that has no response matchers
     Decision {
-        pipeline: Box<str>,
+        pipeline: ConfigName,
         #[serde(skip_serializing_if = "Option::is_none")]
-        rule: Option<Box<str>>,
+        rule: Option<ConfigName>,
         phase: &'static str,
         decision: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
-        target: Option<Box<str>>,
+        target: Option<ConfigName>,
     },
     /// 响应缓存：`fresh`、`stale`、`stale_timeout`、`stale_failure` 或 `miss`；命中时 `source` 是当初回答的上游
     /// The response cache: `fresh`, `stale`, `stale_timeout`, `stale_failure` or `miss`; on a hit `source`
@@ -147,7 +223,7 @@ enum StepKind {
     Cache {
         result: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
-        source: Option<Box<str>>,
+        source: Option<ConfigName>,
     },
     /// 同一时刻已有相同的查询在问上游，这次用了它的答案 / An identical query was already asking
     /// upstream, and this request took its answer
@@ -158,7 +234,7 @@ enum StepKind {
     /// `is_failure_reply`), `error`, `aborted` (another upstream answered first and this one
     /// was cancelled) or `throttled` (the DoH upstream answered HTTP 429)
     Upstream {
-        upstream: Box<str>,
+        upstream: ConfigName,
         transport: &'static str,
         via: &'static str,
         result: &'static str,
@@ -178,7 +254,7 @@ enum StepKind {
     /// panel leaves out a kind it does not know, but shows an `upstream` step with a result it
     /// does not know as an error
     UpstreamSkipped {
-        upstream: Box<str>,
+        upstream: ConfigName,
         transport: &'static str,
         reason: &'static str,
     },
@@ -209,15 +285,17 @@ struct Entry {
     /// 最后进入的 Pipeline：请求在哪里结束（缓存在规则之前就回了的，也有它）
     /// The pipeline entered last: where the request ended (a cache answer given before any rule ran has
     /// one too)
-    pipeline: Option<Box<str>>,
+    pipeline: Option<ConfigName>,
     /// 最后一次决定的规则；那个 Pipeline 只负责转发时，它可能在更早的 Pipeline 里
     /// The rule of the last decision; when the final pipeline only forwards, it may sit in an earlier one
-    rule: Option<Box<str>>,
+    rule: Option<ConfigName>,
     /// 缓存的答案当初是哪个上游回答的 / Which upstream originally answered a cached answer
-    cache_source: Option<Box<str>>,
+    cache_source: Option<ConfigName>,
     /// 最后一个回了可用答案的上游 / The last upstream that returned a usable answer
-    answered_by: Option<Box<str>>,
-    steps: Vec<Step>,
+    answered_by: Option<ConfigName>,
+    /// 缓存命中只有两步，放得下就不另外分配 / A cache hit takes two steps, which need no allocation of
+    /// their own
+    steps: SmallVec<[Step; 2]>,
     steps_truncated: bool,
 }
 
@@ -318,7 +396,9 @@ impl Serialize for Entry {
             entry.serialize_field("transport", transport)?;
         }
         entry.serialize_field("qname", &self.qname)?;
-        entry.serialize_field("qtype", &self.qtype.to_string())?;
+        // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
+        // hickory's `Display` writes it, without allocating a string first
+        entry.serialize_field("qtype", <&'static str>::from(self.qtype))?;
         entry.serialize_field("latency_us", &self.latency_us)?;
         entry.serialize_field("status", self.status.label())?;
         entry.serialize_field("outcome", outcome)?;
@@ -338,7 +418,7 @@ impl Serialize for Entry {
         if let Some(upstream) = upstream {
             entry.serialize_field("upstream", upstream)?;
         }
-        entry.serialize_field("steps", &self.steps)?;
+        entry.serialize_field("steps", &self.steps[..])?;
         if self.steps_truncated {
             entry.serialize_field("steps_truncated", &true)?;
         }
@@ -389,7 +469,9 @@ impl QueryLog {
             max_pending: MAX_PENDING,
             collected: AtomicU64::new(0),
             untracked: AtomicU64::new(0),
-            pending: DashMap::new(),
+            slots: (0..PENDING_SLOTS).map(|_| Mutex::new(None)).collect(),
+            overflow: DashMap::new(),
+            overflow_len: AtomicUsize::new(0),
             pending_count: AtomicUsize::new(0),
             ring: Mutex::new(Ring {
                 entries: VecDeque::new(),
@@ -399,48 +481,70 @@ impl QueryLog {
     }
 
     fn since_epoch_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+        self.ms_since_epoch(Instant::now())
+    }
+
+    fn ms_since_epoch(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg(test)]
+    fn recording(&self) -> bool {
+        self.recording_after(self.collected.load(Ordering::Acquire))
+            .is_some()
     }
 
     /// 面板最近两分钟来取过。时钟只在记着的时候读；超过两分钟就停下并清空交接区（序号照旧往后数，
     /// 面板回来时从空缺看出漏了几条），之后的请求又只读那一个数。停下用比较交换：同时来取的面板赢。
+    /// `collected` 是刚读到的那个数。在记时给出为此读到的时刻，请求的起点就用它，不再读一次时钟
     /// The panel collected within the last two minutes. The clock is read only while recording; past
     /// two minutes recording stops and the ring is emptied (numbering carries on, so a returning panel
     /// sees from the gap how many it missed), and later requests read the one number again. Stopping
-    /// uses compare-and-exchange, so a collection arriving at the same moment wins.
-    fn recording(&self) -> bool {
-        self.recording_after(self.collected.load(Ordering::Acquire))
-    }
-
-    /// `collected` 是刚读到的那个数 / `collected` is the value just read
-    fn recording_after(&self, collected: u64) -> bool {
+    /// uses compare-and-exchange, so a collection arriving at the same moment wins. `collected` is the
+    /// value just read. While recording, gives the moment read for it, which serves as the request's
+    /// start instead of reading the clock again
+    fn recording_after(&self, collected: u64) -> Option<Instant> {
         if collected == 0 {
-            return false;
+            return None;
         }
-        let idle = self.since_epoch_ms().saturating_sub(collected - 1);
+        let now = Instant::now();
+        let idle = self.ms_since_epoch(now).saturating_sub(collected - 1);
         if idle < u64::try_from(IDLE_AFTER.as_millis()).unwrap_or(u64::MAX) {
-            return true;
+            return Some(now);
         }
         // 交换失败：要么面板刚来取过（接着记），要么别的请求已经停下了（不记）
         // The exchange failed: either the panel just collected (keep recording) or another request
         // already stopped it (do not record)
-        if let Err(now) =
+        if let Err(current) =
             self.collected
                 .compare_exchange(collected, 0, Ordering::AcqRel, Ordering::Acquire)
         {
-            return now != 0;
+            return (current != 0).then_some(now);
         }
         let mut ring = self.ring.lock();
         ring.entries.clear();
         ring.entries.shrink_to_fit();
-        false
+        None
+    }
+
+    #[inline]
+    fn slot(&self, request_id: u64) -> &Slot {
+        &self.slots[request_id as usize & (self.slots.len() - 1)]
     }
 
     fn with_pending(&self, ctx: &RequestContext<'_>, update: impl FnOnce(&mut Pending)) {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return;
         }
-        if let Some(mut pending) = self.pending.get_mut(&ctx.request_id) {
+        if let Some((id, pending)) = &mut *self.slot(ctx.request_id).lock()
+            && *id == ctx.request_id
+        {
+            update(pending);
+            return;
+        }
+        if self.overflow_len.load(Ordering::Relaxed) > 0
+            && let Some(mut pending) = self.overflow.get_mut(&ctx.request_id)
+        {
             update(&mut pending);
         }
     }
@@ -449,21 +553,24 @@ impl QueryLog {
     /// Background refreshes and diagnostic queries are not recorded: the former are not client
     /// queries, the latter carry test domains and an assigned client IP
     pub(crate) fn request_started(&self, ctx: &RequestContext<'_>, diagnostic: bool) {
-        if ctx.background_refresh || diagnostic || !self.recording() {
+        if ctx.background_refresh || diagnostic {
             return;
         }
+        let Some(started) = self.recording_after(self.collected.load(Ordering::Acquire)) else {
+            return;
+        };
         if self.pending_count.load(Ordering::Relaxed) >= self.max_pending {
             self.untracked.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let pending = Pending {
-            started: Instant::now(),
+            started,
             time_unix_ms: unix_ms(),
             client: ctx.client.ip().to_canonical(),
             transport: ctx.transport,
             qname: ctx.qname.into(),
             qtype: ctx.qtype,
-            steps: Vec::with_capacity(8),
+            steps: SmallVec::new(),
             steps_truncated: false,
             cache: None,
             cache_source: None,
@@ -472,17 +579,31 @@ impl QueryLog {
             decision: None,
             answered_by: None,
         };
-        if self.pending.insert(ctx.request_id, pending).is_none() {
-            self.pending_count.fetch_add(1, Ordering::Relaxed);
+        // 同一个请求号又开始一次时替换掉原来那条，不多算一条（和原先用共享表时一样）
+        // The same request number starting again replaces its record without counting another (as
+        // when a shared map held them all)
+        let mut slot = self.slot(ctx.request_id).lock();
+        match &*slot {
+            None => {
+                *slot = Some((ctx.request_id, pending));
+                self.pending_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Some((held, _)) if *held == ctx.request_id => *slot = Some((ctx.request_id, pending)),
+            Some(_) => {
+                drop(slot);
+                if self.overflow.insert(ctx.request_id, pending).is_none() {
+                    self.overflow_len.fetch_add(1, Ordering::Relaxed);
+                    self.pending_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
     pub(crate) fn pipeline_selected(&self, ctx: &RequestContext<'_>, pipeline: &str) {
         self.with_pending(ctx, |pending| {
-            pending.pipeline = Some(pipeline.into());
-            pending.push(StepKind::Pipeline {
-                pipeline: pipeline.into(),
-            });
+            let pipeline = ConfigName::of(pipeline);
+            pending.pipeline = Some(pipeline.clone());
+            pending.push(StepKind::Pipeline { pipeline });
         });
     }
 
@@ -495,8 +616,8 @@ impl QueryLog {
         }
         self.with_pending(ctx, |pending| {
             pending.push(StepKind::Rule {
-                pipeline: event.pipeline.into(),
-                rule: event.rule.into(),
+                pipeline: ConfigName::of(event.pipeline),
+                rule: ConfigName::of(event.rule),
                 phase: "response",
                 matched: Some(event.matched),
                 decision: None,
@@ -523,8 +644,8 @@ impl QueryLog {
                 return;
             }
             pending.push(StepKind::Rule {
-                pipeline: event.pipeline.into(),
-                rule: event.rule.into(),
+                pipeline: ConfigName::of(event.pipeline),
+                rule: ConfigName::of(event.rule),
                 phase: "request",
                 matched: None,
                 decision: Some(decision_label(event.decision)),
@@ -540,14 +661,16 @@ impl QueryLog {
     /// a step of its own
     pub(crate) fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {
         self.with_pending(ctx, |pending| {
-            let (kind, target): (DecisionKind, Option<Box<str>>) = match event.detail {
+            let (kind, target): (DecisionKind, Option<ConfigName>) = match event.detail {
                 DecisionDetail::Static { .. } => (DecisionKind::Static, None),
                 DecisionDetail::Forward { upstream, .. } => {
-                    (DecisionKind::Forward, Some(upstream.into()))
+                    (DecisionKind::Forward, Some(ConfigName::of(upstream)))
                 }
-                DecisionDetail::Jump { pipeline } => (DecisionKind::Jump, Some(pipeline.into())),
+                DecisionDetail::Jump { pipeline } => {
+                    (DecisionKind::Jump, Some(ConfigName::of(pipeline)))
+                }
             };
-            pending.decision = Some((event.rule.map(Into::into), kind));
+            pending.decision = Some((event.rule.map(ConfigName::of), kind));
             let phase = phase_label(event.phase);
             let label = decision_label(kind);
             // 只看这条规则最近的那一步：它是同一阶段、还没有去处时才补上。再往前的是更早的一轮
@@ -581,8 +704,8 @@ impl QueryLog {
                     *slot = target;
                 }
                 None => pending.push(StepKind::Decision {
-                    pipeline: event.pipeline.into(),
-                    rule: event.rule.map(Into::into),
+                    pipeline: ConfigName::of(event.pipeline),
+                    rule: event.rule.map(ConfigName::of),
                     phase,
                     decision: label,
                     target,
@@ -593,11 +716,12 @@ impl QueryLog {
 
     pub(crate) fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {
         self.with_pending(ctx, |pending| {
+            let source = event.source.map(ConfigName::of);
             pending.cache = Some(event.kind);
-            pending.cache_source = event.source.map(Into::into);
+            pending.cache_source.clone_from(&source);
             pending.push(StepKind::Cache {
                 result: cache_label(event.kind),
-                source: event.source.map(Into::into),
+                source,
             });
         });
     }
@@ -621,11 +745,12 @@ impl QueryLog {
     pub(crate) fn upstream_result(&self, ctx: &RequestContext<'_>, event: &UpstreamResult<'_>) {
         self.with_pending(ctx, |pending| {
             let result = outcome_label(event.outcome);
+            let upstream = ConfigName::of(event.upstream);
             if event.outcome == UpstreamOutcome::Success {
-                pending.answered_by = Some(event.upstream.into());
+                pending.answered_by = Some(upstream.clone());
             }
             pending.push(StepKind::Upstream {
-                upstream: event.upstream.into(),
+                upstream,
                 transport: transport_label(event.transport),
                 via: transport_label(event.via),
                 result,
@@ -639,7 +764,7 @@ impl QueryLog {
     pub(crate) fn upstream_skipped(&self, ctx: &RequestContext<'_>, event: &UpstreamSkipped<'_>) {
         self.with_pending(ctx, |pending| {
             pending.push(StepKind::UpstreamSkipped {
-                upstream: event.upstream.into(),
+                upstream: ConfigName::of(event.upstream),
                 transport: transport_label(event.transport),
                 reason: skip_reason_label(event.reason),
             });
@@ -650,21 +775,47 @@ impl QueryLog {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return;
         }
-        let Some((_, pending)) = self.pending.remove(&ctx.request_id) else {
+        let pending = {
+            let mut slot = self.slot(ctx.request_id).lock();
+            match &*slot {
+                Some((id, _)) if *id == ctx.request_id => slot.take().map(|(_, pending)| pending),
+                _ => None,
+            }
+        };
+        let pending = pending.or_else(|| {
+            if self.overflow_len.load(Ordering::Relaxed) == 0 {
+                return None;
+            }
+            let (_, pending) = self.overflow.remove(&ctx.request_id)?;
+            self.overflow_len.fetch_sub(1, Ordering::Relaxed);
+            Some(pending)
+        });
+        let Some(pending) = pending else {
             return;
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
         self.push(finish(pending, outcome));
     }
 
-    fn push(&self, mut entry: Entry) {
-        let mut ring = self.ring.lock();
-        ring.newest += 1;
-        entry.seq = ring.newest;
-        if ring.entries.len() >= self.capacity {
-            ring.entries.pop_front();
-        }
-        ring.entries.push_back(Arc::new(entry));
+    fn push(&self, entry: Entry) {
+        // 分配和释放都在锁外：锁里只给序号、换进换出 / Allocating and freeing happen outside the lock:
+        // inside it the record only gets its number and is swapped in
+        let mut entry = Arc::new(entry);
+        let evicted = {
+            let mut ring = self.ring.lock();
+            ring.newest += 1;
+            if let Some(unshared) = Arc::get_mut(&mut entry) {
+                unshared.seq = ring.newest;
+            }
+            let evicted = if ring.entries.len() >= self.capacity {
+                ring.entries.pop_front()
+            } else {
+                None
+            };
+            ring.entries.push_back(entry);
+            evicted
+        };
+        drop(evicted);
     }
 
     /// 取走 `after` 之后的记录（最多 `limit` 条），同时续上「面板在取」，返回 JSON 文本（不先建中间的 JSON 树）。
@@ -718,7 +869,7 @@ impl QueryLog {
 }
 
 /// 请求结束：把攒下的步骤和响应拼成一条记录 / The request ended: its steps and response become a record
-fn finish(mut pending: Pending, outcome: &RequestOutcome<'_>) -> Entry {
+fn finish(pending: Pending, outcome: &RequestOutcome<'_>) -> Entry {
     let status = match outcome.status {
         RequestStatus::Completed => Status::Completed,
         RequestStatus::Failed => Status::Failed,
@@ -726,7 +877,6 @@ fn finish(mut pending: Pending, outcome: &RequestOutcome<'_>) -> Entry {
     };
     let decided_static = matches!(pending.decision, Some((_, DecisionKind::Static)));
     let rule = pending.decision.and_then(|(rule, _)| rule);
-    pending.steps.shrink_to_fit();
     Entry {
         seq: 0,
         time_unix_ms: pending.time_unix_ms,
@@ -745,15 +895,31 @@ fn finish(mut pending: Pending, outcome: &RequestOutcome<'_>) -> Entry {
         rule,
         cache_source: pending.cache_source,
         answered_by: pending.answered_by,
-        steps: pending.steps,
+        steps: pending.steps.into_iter().collect(),
         steps_truncated: pending.steps_truncated,
     }
 }
 
-/// 响应码和回答记录（只取记录的数据部分，最多 8 条）；解析不了就只读包头的响应码
+/// 响应码和回答记录（只取记录的数据部分，最多 8 条）；解析不了就只读包头的响应码。
+/// 结构过得了 [`crate::proto_utils::well_formed_reply`]（缓存靠的也是它）、前 8 条回答都是地址或名字的应答自己读：
+/// 地址直接写出来，名字交给 hickory 的 `Name` 读，写出来和 hickory 整份解析的一字不差，省下整份解析；
+/// 别的照旧整份解析
 /// The response code and the answer records (data only, at most eight); when the message cannot be
-/// parsed, only the header's response code is read
+/// parsed, only the header's response code is read. A reply whose structure passes
+/// [`crate::proto_utils::well_formed_reply`] (which the cache relies on too) and whose first eight answers
+/// are addresses or names is read here: addresses are written directly and names read by hickory's
+/// `Name`, word for word what hickory's whole parse writes, without that parse; anything else is still
+/// parsed whole
 fn read_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
+    if crate::proto_utils::well_formed_reply(bytes)
+        && let Some(read) = read_plain_response(bytes)
+    {
+        return read;
+    }
+    read_whole_response(bytes)
+}
+
+fn read_whole_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
     match Message::from_vec(bytes) {
         Ok(message) => (
             Some(message.metadata.response_code),
@@ -761,10 +927,71 @@ fn read_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
                 .answers
                 .iter()
                 .take(MAX_ANSWERS)
-                .map(|record| clip(&record.data.to_string()))
+                .map(|record| clip_owned(record.data.to_string()))
                 .collect(),
         ),
         Err(_) => (crate::observe::header_rcode(bytes), Vec::new()),
+    }
+}
+
+/// 结构已经检查过的应答：响应码（加上 EDNS 里的高位，和 hickory 一样）和前 8 条回答。回答里有地址、名字以外的
+/// 类型时为 None，交给 hickory
+/// A reply whose structure is already checked: the response code (with the high bits from EDNS, as hickory
+/// merges them) and the first eight answers. None when an answer is of a type other than an address or a
+/// name, which is left to hickory
+fn read_plain_response(packet: &[u8]) -> Option<(Option<ResponseCode>, Vec<String>)> {
+    let count = |at: usize| {
+        packet
+            .get(at..at + 2)
+            .map(|n| usize::from(u16::from_be_bytes([n[0], n[1]])))
+    };
+    let answers = count(6)?;
+    let additional_from = answers + count(8)?;
+    let records = additional_from + count(10)?;
+    let mut pos = 12;
+    for _ in 0..count(4)? {
+        pos = name_end(packet, pos)?.checked_add(4)?;
+    }
+    let mut texts = Vec::with_capacity(answers.min(MAX_ANSWERS));
+    let mut high = 0;
+    for index in 0..records {
+        pos = name_end(packet, pos)?;
+        let header = packet.get(pos..pos.checked_add(10)?)?;
+        let rr_type = u16::from_be_bytes([header[0], header[1]]);
+        let rdata = pos + 10;
+        let end = rdata.checked_add(usize::from(u16::from_be_bytes([header[8], header[9]])))?;
+        let data = packet.get(rdata..end)?;
+        if index < answers.min(MAX_ANSWERS) {
+            let text = match RecordType::from(rr_type) {
+                RecordType::A => Ipv4Addr::from(<[u8; 4]>::try_from(data).ok()?).to_string(),
+                RecordType::AAAA => Ipv6Addr::from(<[u8; 16]>::try_from(data).ok()?).to_string(),
+                RecordType::CNAME | RecordType::NS | RecordType::PTR => {
+                    let mut decoder = BinDecoder::new(packet).clone(u16::try_from(rdata).ok()?);
+                    Name::read(&mut decoder).ok()?.to_string()
+                }
+                _ => return None,
+            };
+            texts.push(clip_owned(text));
+        } else if index >= additional_from && rr_type == u16::from(RecordType::OPT) {
+            // OPT 的 TTL 第一个字节是扩展响应码的高位 / The first byte of OPT's TTL is the extended
+            // response code's high bits
+            high = header[4];
+        }
+        pos = end;
+    }
+    Some((Some(ResponseCode::from(high, packet[3] & 0x0F)), texts))
+}
+
+/// 一个名字在报文里结束的位置（压缩指针占两个字节，之后不再往下读） / Where a name ends in the message (a
+/// compression pointer takes two bytes and ends it)
+fn name_end(packet: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *packet.get(pos)?;
+        match len {
+            0 => return Some(pos + 1),
+            _ if len & 0xC0 == 0xC0 => return Some(pos + 2),
+            _ => pos += 1 + usize::from(len),
+        }
     }
 }
 
@@ -781,20 +1008,20 @@ fn serialize_rcode<S: Serializer>(
 
 /// 响应码的助记名（NOERROR、NXDOMAIN……），和配置里写的一样 / The response code mnemonic
 /// (NOERROR, NXDOMAIN, …), as written in the config
-fn rcode_name(code: ResponseCode) -> String {
+fn rcode_name(code: ResponseCode) -> Cow<'static, str> {
     match u16::from(code) {
-        0 => "NOERROR".to_owned(),
-        1 => "FORMERR".to_owned(),
-        2 => "SERVFAIL".to_owned(),
-        3 => "NXDOMAIN".to_owned(),
-        4 => "NOTIMP".to_owned(),
-        5 => "REFUSED".to_owned(),
-        6 => "YXDOMAIN".to_owned(),
-        7 => "YXRRSET".to_owned(),
-        8 => "NXRRSET".to_owned(),
-        9 => "NOTAUTH".to_owned(),
-        10 => "NOTZONE".to_owned(),
-        other => format!("RCODE{other}"),
+        0 => Cow::Borrowed("NOERROR"),
+        1 => Cow::Borrowed("FORMERR"),
+        2 => Cow::Borrowed("SERVFAIL"),
+        3 => Cow::Borrowed("NXDOMAIN"),
+        4 => Cow::Borrowed("NOTIMP"),
+        5 => Cow::Borrowed("REFUSED"),
+        6 => Cow::Borrowed("YXDOMAIN"),
+        7 => Cow::Borrowed("YXRRSET"),
+        8 => Cow::Borrowed("NXRRSET"),
+        9 => Cow::Borrowed("NOTAUTH"),
+        10 => Cow::Borrowed("NOTZONE"),
+        other => Cow::Owned(format!("RCODE{other}")),
     }
 }
 
@@ -832,6 +1059,15 @@ fn clip(text: &str) -> String {
     }
 }
 
+/// 同 [`clip`]，短的原样交回，不再复制一份 / As [`clip`], handing a short text back as it is without
+/// copying it
+fn clip_owned(text: String) -> String {
+    match text.char_indices().nth(MAX_TEXT) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text,
+    }
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -853,8 +1089,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        CAPACITY, MAX_ANSWERS, MAX_KEPT_RESPONSE, MAX_PAGE, MAX_STEPS, MAX_TEXT, QueryLog,
-        Response, clip,
+        CAPACITY, ConfigName, KNOWN_NAMES, MAX_ANSWERS, MAX_KEPT_RESPONSE, MAX_PAGE, MAX_STEPS,
+        MAX_TEXT, PENDING_SLOTS, QueryLog, Response, clip, read_response, read_whole_response,
     };
     use crate::config::Transport;
     use crate::observe::{
@@ -1467,7 +1703,7 @@ mod tests {
         let log = started_three_minutes_ago();
         // 读到的还是三分钟前那次，另一个请求已经把它停了 / What it read is the collection three
         // minutes ago, and another request has already stopped recording
-        assert!(!log.recording_after(1));
+        assert!(log.recording_after(1).is_none());
     }
 
     #[test]
@@ -1659,6 +1895,188 @@ mod tests {
         let page = page(&log, 0, 10);
         assert_eq!(seqs(&page), [1]);
         assert_eq!(page["untracked"], 1);
+    }
+
+    /// 两个同时在跟的请求落在同一个槽位：后来的那个记在共享表里，两条记录各是各的，都完整，结束以后两边都空了
+    /// Two requests tracked at once that fall in the same slot: the later one goes to the shared map, the
+    /// two records stay apart and whole, and both places are empty afterwards
+    /// 自己读的应答和 hickory 整份解析的写出来一字不差：地址、名字、别的类型、名字压缩、EDNS 的扩展响应码、
+    /// 超过 8 条的回答；改坏一个字节或截短的也一样（读不了的照旧只有包头的响应码）
+    /// Replies read here come out word for word as hickory's whole parse writes them: addresses, names,
+    /// other types, name compression, EDNS extended response codes and more than eight answers; and so do
+    /// ones with one byte changed or cut short (an unreadable one still gives the header's code only)
+    #[test]
+    fn plain_replies_read_exactly_as_hickory_reads_them() {
+        use hickory_proto::op::Edns;
+        use hickory_proto::rr::rdata::{AAAA, CNAME, MX, NS, PTR, TXT};
+
+        let mut state = 0x2026_1031_u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let suffixes = [
+            "example.com.",
+            "cdn.example.net.",
+            "a.b.example.org.",
+            "xn--fiqs8s.cn.",
+        ];
+        let mut read_here = 0;
+        for id in 0..20_000_u16 {
+            let mut message = Message::new(id, MessageType::Response, OpCode::Query);
+            message.metadata.response_code = [
+                ResponseCode::NoError,
+                ResponseCode::NXDomain,
+                ResponseCode::ServFail,
+                ResponseCode::BADVERS,
+            ][next(4) as usize];
+            let name = |next: &mut dyn FnMut(u64) -> u64| {
+                Name::from_str(&format!("h{}.{}", next(50), suffixes[next(4) as usize])).unwrap()
+            };
+            message.add_query(hickory_proto::op::Query::query(
+                name(&mut next),
+                RecordType::A,
+            ));
+            // 前 8 条回答都是地址或名字时，没改坏的应答一定由这里自己读 / With only addresses and names among
+            // the first eight answers, an intact reply is always read here
+            let mut plain = true;
+            for index in 0..next(12) {
+                let kind = next(8);
+                plain &= index >= MAX_ANSWERS as u64 || kind < 6;
+                let data = match kind {
+                    0 | 1 => RData::A(A::new(10, 0, next(256) as u8, next(256) as u8)),
+                    2 => RData::AAAA(AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, next(65536) as u16)),
+                    3 => RData::CNAME(CNAME(name(&mut next))),
+                    4 => RData::NS(NS(name(&mut next))),
+                    5 => RData::PTR(PTR(name(&mut next))),
+                    6 => RData::MX(MX::new(10, name(&mut next))),
+                    _ => RData::TXT(TXT::new(vec![format!("v={}", next(1000))])),
+                };
+                message
+                    .answers
+                    .push(Record::from_rdata(name(&mut next), 300, data));
+            }
+            if next(3) == 0 {
+                message.authorities.push(Record::from_rdata(
+                    name(&mut next),
+                    60,
+                    RData::NS(NS(name(&mut next))),
+                ));
+            }
+            if next(2) == 0 {
+                message.edns = Some(Edns::new());
+            }
+            let whole = message.to_vec().unwrap();
+            let mut variants = vec![
+                whole.clone(),
+                whole[..whole.len() - 1 - next(whole.len() as u64 - 1) as usize].to_vec(),
+            ];
+            let mut changed = whole.clone();
+            let at = next(changed.len() as u64) as usize;
+            changed[at] ^= 1 << next(8);
+            variants.push(changed);
+            let quick = |bytes: &[u8]| {
+                crate::proto_utils::well_formed_reply(bytes)
+                    && super::read_plain_response(bytes).is_some()
+            };
+            assert_eq!(quick(&whole), plain, "{message:?}");
+            read_here += usize::from(plain);
+            for bytes in variants {
+                assert_eq!(
+                    read_response(&bytes),
+                    read_whole_response(&bytes),
+                    "{bytes:?}"
+                );
+            }
+        }
+        assert!(read_here > 5_000, "{read_here} intact replies read here");
+    }
+
+    #[test]
+    fn requests_sharing_a_slot_keep_their_own_records() {
+        let log = QueryLog::default();
+        let _ = entries(&log);
+        let first = ctx(5);
+        let second = RequestContext {
+            qname: "second.example",
+            ..ctx(5 + PENDING_SLOTS as u64)
+        };
+        log.request_started(&first, false);
+        log.request_started(&second, false);
+        assert_eq!(
+            log.overflow_len.load(Relaxed),
+            1,
+            "the second request takes the shared map"
+        );
+        // 又开始一次的替换掉原来那条，不多算 / Starting again replaces the record without counting another
+        log.request_started(&first, false);
+        log.request_started(&second, false);
+        assert_eq!(log.pending_count.load(Relaxed), 2);
+        assert_eq!(log.overflow_len.load(Relaxed), 1);
+        log.pipeline_selected(&second, "abroad");
+        log.pipeline_selected(&first, "main");
+        upstream(
+            &log,
+            &second,
+            "udp://198.51.100.2:53",
+            UpstreamOutcome::Success,
+        );
+        upstream(
+            &log,
+            &first,
+            "udp://192.0.2.53:53",
+            UpstreamOutcome::Success,
+        );
+        let answer = response(ResponseCode::NoError, &[[203, 0, 113, 9]]);
+        // 共享表里那个先结束：这时槽位还被另一个占着，不能拿错 / The one in the shared map finishes first,
+        // while the other still holds the slot, which must not be taken by mistake
+        finish(&log, &second, RequestStatus::Completed, Some(&answer));
+        finish(&log, &first, RequestStatus::Completed, Some(&answer));
+        let entries = entries(&log);
+        assert_eq!(entries.len(), 2);
+        let by_name = |qname: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["qname"] == qname)
+                .expect("recorded")
+        };
+        for (qname, pipeline, upstream) in [
+            ("www.example.com", "main", "udp://192.0.2.53:53"),
+            ("second.example", "abroad", "udp://198.51.100.2:53"),
+        ] {
+            let entry = by_name(qname);
+            assert_eq!(entry["pipeline"], pipeline, "{entry}");
+            assert_eq!(entry["upstream"], upstream, "{entry}");
+            assert_eq!(entry["steps"].as_array().map(Vec::len), Some(2), "{entry}");
+        }
+        assert_eq!(log.pending_count.load(Relaxed), 0);
+        assert_eq!(log.overflow_len.load(Relaxed), 0);
+        assert!(log.overflow.is_empty());
+        assert!(log.slots.iter().all(|slot| slot.lock().is_none()));
+    }
+
+    /// 同一个线程里同一个名字共用一份；记过的名字多过上限就从头记，取到的照样是那个名字
+    /// On one thread a name is held once; past the limit the remembered names start over, and every
+    /// name taken is still the right one
+    #[test]
+    fn names_are_shared_and_stay_right_past_the_limit() {
+        std::thread::spawn(|| {
+            let first = ConfigName::of("main");
+            assert!(std::sync::Arc::ptr_eq(&first.0, &ConfigName::of("main").0));
+            assert!(!std::sync::Arc::ptr_eq(
+                &first.0,
+                &ConfigName::of("abroad").0
+            ));
+            for index in 0..KNOWN_NAMES * 2 {
+                let text = format!("rule-{index}");
+                assert_eq!(&*ConfigName::of(&text), text);
+            }
+            assert_eq!(&*ConfigName::of("main"), "main");
+        })
+        .join()
+        .expect("the names thread");
     }
 
     #[test]
