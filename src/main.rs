@@ -876,7 +876,10 @@ async fn run_udp_worker(
     socket: Arc<UdpSocket>,
     engine: Engine,
 ) -> anyhow::Result<()> {
-    let engine = engine.with_client_transport(ClientTransport::Udp);
+    // 共享不复制：要等上游的查询各自起一个任务，每个只加一次引用计数，不复制整个 Engine（二十多个 Arc）
+    // Shared, not copied: each query that waits on an upstream gets its own task, which takes one
+    // reference count instead of a copy of the whole Engine (twenty-odd Arcs)
+    let engine = Arc::new(engine.with_client_transport(ClientTransport::Udp));
     info!(worker_id, "UDP worker started");
     #[cfg(target_os = "linux")]
     receive_in_batches(&socket, &engine).await;
@@ -887,7 +890,7 @@ async fn run_udp_worker(
 /// 一个 worker 的接收循环里，快速路径要用的几样东西 / What the fast path needs in one worker's receive loop
 struct UdpAnswering<'a> {
     socket: &'a Arc<UdpSocket>,
-    engine: &'a Engine,
+    engine: &'a Arc<Engine>,
     /// 自适应流控：每 100 个请求检查一次是否需要调整 permits / Adaptive flow control: check if adjustment needed every 100 requests
     request_count: u32,
 }
@@ -956,7 +959,7 @@ impl UdpAnswering<'_> {
 /// this saves each datagram its own trip into the kernel; when idle a batch holds one, the same as single
 /// receives and sends. With nothing to read the worker yields to tokio and does not spin.
 #[cfg(target_os = "linux")]
-async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Engine) -> ! {
+async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! {
     use kixdns::socket_utils::udp_batch::{Received, Replies};
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
@@ -1029,7 +1032,7 @@ async fn send_replies(socket: &UdpSocket, replies: &kixdns::socket_utils::udp_ba
 /// falls back to async on EAGAIN: under load this eliminates the per-packet tokio reactor overhead (epoll_wait
 /// plus the task wake/schedule cycle), and when idle the worker yields and does not waste CPU.
 #[cfg_attr(target_os = "linux", allow(dead_code))] // Linux 上只有测试用 / On Linux only the tests use it
-async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Engine) -> ! {
+async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! {
     let mut buf = vec![0; 4096];
     // 复用发送缓冲区：缓存命中时在这里改 TTL 和 TXID，避免每包堆分配 / Reuse send buffer to patch TTLs and the TXID on cache hits, avoiding per-packet heap allocation
     let mut reply = BytesMut::with_capacity(512);
@@ -1070,7 +1073,7 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Engine) -> ! {
 /// be cheap, and a full parse of an already-failed packet wastes CPU, as hickory most
 /// likely fails too.
 fn spawn_udp_answer(
-    engine: &Engine,
+    engine: &Arc<Engine>,
     socket: &Arc<UdpSocket>,
     packet: bytes::Bytes,
     peer: SocketAddr,
@@ -1084,7 +1087,7 @@ fn spawn_udp_answer(
         }
         return;
     };
-    let engine = engine.clone();
+    let engine = Arc::clone(engine);
     let socket = Arc::clone(socket);
     tokio::spawn(async move {
         let _permit = permit; // 自动释放 / Auto-release on drop
@@ -1607,11 +1610,11 @@ mod tests {
     async fn every_queued_query_gets_its_own_answer() {
         #[cfg(target_os = "linux")]
         every_queued_query_is_answered_by(|server, engine| {
-            tokio::spawn(async move { receive_in_batches(&server, &engine).await })
+            tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
         })
         .await;
         every_queued_query_is_answered_by(|server, engine| {
-            tokio::spawn(async move { receive_one_by_one(&server, &engine).await })
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
         })
         .await;
     }
