@@ -49,8 +49,9 @@ url = "2"
 quinn = { version = "0.11", features = ["runtime-tokio", "rustls"] }
 
 # DoH inbound server (RFC 8484)
-hyper = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util = { version = "0.1", features = ["server", "tokio"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "client-legacy", "http2"] }
+tower-service = "0.3"
 http-body-util = "0.1"
 base64 = "0.22"
 prost = { version = "0.14.4", features = ["derive"] }

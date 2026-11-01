@@ -4,6 +4,9 @@ pub mod concurrency;
 #[cfg(test)]
 mod cookie_tests;
 pub mod core;
+mod doh_h2;
+#[cfg(test)]
+mod doh_h2_tests;
 #[cfg(test)]
 mod doh_throttle_tests;
 #[cfg(test)]
