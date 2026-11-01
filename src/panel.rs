@@ -600,10 +600,6 @@ pub struct PanelMetrics {
     reload_sequence: AtomicU64,
     active_config: RwLock<ActiveConfig>,
     query_stats: QueryStats,
-    /// 排行只能经控制通道读到；没开控制通道时没人读，就不统计（见 `without_rankings`）
-    /// Rankings can only be read over the control socket; without one nobody reads
-    /// them, so none are collected (see `without_rankings`)
-    collect_rankings: bool,
     /// 面板观察者独占了引擎唯一的观察者槽位，所以 `--debug` 的参考观察者只能挂在这里转发；
     /// 否则增强版的 `--debug` 永远看不到 `kixdns::observe` 事件。
     /// The panel observer owns the engine's single observer slot, so the `--debug`
@@ -647,7 +643,6 @@ impl Default for PanelMetrics {
             reload_sequence: AtomicU64::new(0),
             active_config: RwLock::new(ActiveConfig::default()),
             query_stats: QueryStats::default(),
-            collect_rankings: true,
             debug_trace: None,
             query_log: QueryLog::default(),
         }
@@ -665,16 +660,6 @@ impl PanelMetrics {
         }
     }
 
-    /// 不统计查询排行：没开控制通道时用，统计了也没人读得到。
-    /// Collects no query rankings: for running without a control socket, where
-    /// nothing could read them.
-    pub fn without_rankings(self) -> Self {
-        Self {
-            collect_rankings: false,
-            ..self
-        }
-    }
-
     #[cfg_attr(not(unix), allow(dead_code))]
     #[inline]
     fn uptime_seconds(&self) -> u64 {
@@ -683,9 +668,7 @@ impl PanelMetrics {
 
     #[inline]
     fn record_query(&self, domain: &str, client: IpAddr) {
-        if self.collect_rankings {
-            self.query_stats.record(domain, client);
-        }
+        self.query_stats.record(domain, client);
     }
 
     #[inline]
@@ -897,7 +880,7 @@ impl PanelMetrics {
         // open, never anonymized / 这两个字段留给读它们的面板：开了控制通道就开着，从不脱敏
         json!({
             "protocol_version": PROTOCOL_VERSION,
-            "enabled": self.collect_rankings,
+            "enabled": true,
             "anonymized_clients": false,
             "window_seconds": window_seconds,
             "retention_seconds": QUERY_STATS_BUCKET_SECONDS * QUERY_STATS_BUCKETS as u64,
@@ -3248,17 +3231,6 @@ mod tests {
         assert_eq!(snapshot.requests_observed, 3);
         assert_eq!(snapshot.domains[0].count, 3);
         assert_eq!(snapshot.clients[0].count, 3);
-    }
-
-    /// 没开控制通道时不统计排行 / No rankings are collected without a control socket
-    #[test]
-    fn collects_no_rankings_without_a_control_socket() {
-        let metrics = PanelMetrics::new(false).without_rankings();
-        metrics.record_query("example.com", "192.168.1.42".parse().unwrap());
-        let snapshot = metrics
-            .query_stats
-            .snapshot(super::unix_timestamp(), 3_600, 20);
-        assert_eq!(snapshot.requests_observed, 0);
     }
 
     /// 排行接口照旧带着 enabled 和 anonymized_clients，写的是一直开着、不脱敏；清空后从零开始
