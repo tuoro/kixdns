@@ -1,6 +1,6 @@
 //! DoH (DNS over HTTPS) inbound server — RFC 8484
 //!
-//! 架构：TLS terminator → HTTP/1.1 handler → Engine 入口
+//! 架构：TLS terminator → HTTP/2 或 HTTP/1.1 handler（按 TLS 握手时协商的 ALPN）→ Engine 入口
 //! 完全复用 Engine 的 `handle_packet_fast` / `handle_packet_internal_with_pre_parsed`，
 //! 不重复任何 DNS 处理逻辑。
 //! TLS 证书/私钥文件变更时热更新 acceptor（如 acme 续期），失败保持旧证书。
@@ -20,7 +20,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::serialize::binary::BinDecodable;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Body;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use rustls::ServerConfig;
@@ -58,6 +58,11 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// 连上以后迟迟不完成 TLS 握手的客户端，过这么久就断开，和 DNS over TCP 上不说话的客户端一样；
 /// 以前它会一直占着任务和句柄。
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 一条 HTTP/2 连接上最多同时处理这么多个请求（RFC 9113 第 6.5.2 节建议不低于 100）
+/// At most this many requests are handled at once on one HTTP/2 connection (RFC 9113
+/// section 6.5.2 recommends no fewer than 100)
+const MAX_CONCURRENT_STREAMS: u32 = 100;
 
 /// TLS acceptor shared between the accept loop and the certificate watcher:
 /// wait-free snapshot per connection, swapped wholesale on reload — the same
@@ -114,8 +119,15 @@ pub async fn run_doh_with_listener(
         tokio::spawn(async move {
             match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls_stream)) => {
+                    // 客户端在握手时选了 h2 就走 HTTP/2，否则 HTTP/1.1 / HTTP/2 when the client
+                    // picked h2 during the handshake, HTTP/1.1 otherwise
+                    let http2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
                     // hyper 1.x 需要 TokioIo 适配器包装 IO
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    if http2 {
+                        serve_http2(io, peer, engine, doh_path).await;
+                        return;
+                    }
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
                         let engine = engine.clone();
                         let doh_path = doh_path.clone();
@@ -147,6 +159,105 @@ pub async fn run_doh_with_listener(
     }
 }
 
+/// 一条 HTTP/2 连接上请求的进出：正在处理几个、最后一个什么时候结束
+/// The comings and goings of requests on one HTTP/2 connection: how many are being
+/// handled, and when the last one ended
+struct Http2Activity {
+    started: std::time::Instant,
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// 最后一个请求结束时离连接建立多少毫秒 / When the last request ended, in milliseconds since the connection was made
+    last_end_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Http2Activity {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            last_end_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// 连接空了多久；有请求在处理时没有空 / How long the connection has been idle; never while a request is being handled
+    fn idle_for(&self) -> Option<Duration> {
+        use std::sync::atomic::Ordering;
+
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        let last_end = Duration::from_millis(self.last_end_ms.load(Ordering::Acquire));
+        Some(self.started.elapsed().saturating_sub(last_end))
+    }
+}
+
+/// 一个请求在处理：放下时记下结束的时间 / A request being handled: dropping it records when it ended
+struct Http2Request(Arc<Http2Activity>);
+
+impl Http2Request {
+    fn start(activity: &Arc<Http2Activity>) -> Self {
+        activity
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(activity))
+    }
+}
+
+impl Drop for Http2Request {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        let ended = u64::try_from(self.0.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.0.last_end_ms.fetch_max(ended, Ordering::AcqRel);
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// HTTP/2 连接：一条连接上的请求同时处理，每个流照样经 [`handle_doh_request`]。空着
+/// [`HEADER_READ_TIMEOUT`]（没有请求在处理，也没有新请求来）就发 GOAWAY 关掉，和 HTTP/1.1 keep-alive 连接
+/// 空着的时限一样；还没发完的请求由它自己的时限管
+/// An HTTP/2 connection: its requests are handled at once, each stream through
+/// [`handle_doh_request`] as before. Idle for [`HEADER_READ_TIMEOUT`] (nothing being handled and
+/// nothing new coming) it is closed with GOAWAY, the same bound as an idle HTTP/1.1 keep-alive
+/// connection; a request still arriving is bounded by its own limits
+async fn serve_http2<I>(io: I, peer: SocketAddr, engine: Engine, doh_path: String)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let activity = Arc::new(Http2Activity::new());
+    let svc = {
+        let activity = Arc::clone(&activity);
+        service_fn(move |req: Request<hyper::body::Incoming>| {
+            let request = Http2Request::start(&activity);
+            let engine = engine.clone();
+            let doh_path = doh_path.clone();
+            async move {
+                let _request = request;
+                handle_doh_request(req, peer, engine, &doh_path).await
+            }
+        })
+    };
+    let conn = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .timer(hyper_util::rt::TokioTimer::new())
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .serve_connection(io, svc);
+    tokio::pin!(conn);
+    let mut closing = false;
+    loop {
+        // 下一次看看空了没有：最早也要在最后一个请求结束 HEADER_READ_TIMEOUT 以后 / When to look
+        // again whether it is idle: no earlier than HEADER_READ_TIMEOUT after the last request ended
+        let wait = HEADER_READ_TIMEOUT.saturating_sub(activity.idle_for().unwrap_or_default());
+        tokio::select! {
+            _ = conn.as_mut() => return,
+            () = tokio::time::sleep(wait), if !closing => {
+                if activity.idle_for().is_some_and(|idle| idle >= HEADER_READ_TIMEOUT) {
+                    conn.as_mut().graceful_shutdown();
+                    closing = true;
+                }
+            }
+        }
+    }
+}
+
 /// 处理单个 DoH 请求 / Handle a single DoH request
 async fn handle_doh_request(
     req: Request<hyper::body::Incoming>,
@@ -171,7 +282,15 @@ async fn handle_doh_request(
                 return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
             }
             let body = Limited::new(req.into_body(), MAX_DNS_MESSAGE).collect();
-            match tokio::time::timeout(BODY_READ_TIMEOUT, body).await {
+            // 正文几乎总是和请求头一起到：先看一眼，到齐了就不必开定时器；没到齐才计时
+            // The body nearly always arrives with the head: a first look that finds it whole
+            // needs no timer, which is armed only when it is still coming
+            let mut body = std::pin::pin!(body);
+            let collected = match futures::FutureExt::now_or_never(body.as_mut()) {
+                Some(collected) => Ok(collected),
+                None => tokio::time::timeout(BODY_READ_TIMEOUT, body).await,
+            };
+            match collected {
                 Ok(Ok(collected)) => collected.to_bytes(),
                 Ok(Err(err)) if err.is::<LengthLimitError>() => {
                     return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
@@ -201,12 +320,17 @@ async fn handle_doh_request(
     // ✅ 复用 Engine 公共入口 — 与 TCP/UDP 入站完全一致
     let resp = process_dns_wire(&dns_wire, peer, &engine).await;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/dns-message")
-        .header("cache-control", "max-age=0")
-        .body(Full::new(resp))
-        .unwrap())
+    let mut response = Response::new(Full::new(resp));
+    let headers = response.headers_mut();
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/dns-message"),
+    );
+    headers.insert(
+        hyper::header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static("max-age=0"),
+    );
+    Ok(response)
 }
 
 /// 从 GET ?dns=base64url 提取 DNS 报文 / Extract DNS wire from GET ?dns=base64url
@@ -245,8 +369,12 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             return empty_dns_response(packet);
         }
     };
-    engine
-        .answer_after_fast_path(packet, peer, pre_parsed)
+    // 要等上游的这一路放到堆上：它的状态有 4 KB 多，留在每个请求的 future 里，当场答完的请求也要跟着
+    // 搬一遍，HTTP/2 下每个请求还要按这个大小分配
+    // The path that waits on an upstream goes on the heap: its state is over 4 KB, and left inside
+    // every request's future it is moved along with requests answered on the spot, and under HTTP/2
+    // allocated at that size for each of them
+    Box::pin(engine.answer_after_fast_path(packet, peer, pre_parsed))
         .await
         .unwrap_or_else(|| empty_dns_response(packet))
 }
@@ -270,10 +398,13 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
     anyhow::ensure!(!certs.is_empty(), "no certificates found in {cert_path}");
     let key = load_private_key(key_path)?;
 
-    let tls_config = ServerConfig::builder()
+    let mut tls_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .with_context(|| format!("build TLS server config (cert: {cert_path}, key: {key_path})"))?;
+    // 先 HTTP/2 后 HTTP/1.1：两种都会的客户端用 HTTP/2，不发 ALPN 的照旧 HTTP/1.1
+    // HTTP/2 before HTTP/1.1: a client that speaks both gets HTTP/2, one that sends no ALPN keeps HTTP/1.1
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 

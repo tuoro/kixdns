@@ -1,6 +1,6 @@
 //! DoH (RFC 8484) integration tests
 //!
-//! Full-stack tests: self-signed TLS cert → HTTP/1.1 → DNS engine → wire response.
+//! Full-stack tests: self-signed TLS cert → HTTP/2 or HTTP/1.1 → DNS engine → wire response.
 //! Tests both POST (RFC 8484 §4.1) and GET (§4.1.5) methods, error paths,
 //! the 64 KiB message-size guard, and TLS certificate hot-reload.
 
@@ -621,6 +621,156 @@ async fn test_doh_half_sent_body_is_answered_408_after_timeout() {
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(20),
         "answered after {elapsed:?}"
+    );
+}
+
+// ============================================================================
+// HTTP/2
+// ============================================================================
+
+/// 握手时选了 h2 的客户端走 HTTP/2，只会 HTTP/1.1 的照旧 HTTP/1.1，两种都答对
+/// A client that picks h2 in the handshake gets HTTP/2, one that only speaks HTTP/1.1 keeps it,
+/// and both are answered right
+#[tokio::test]
+async fn test_doh_speaks_http2_and_still_http1() {
+    let server = start_doh(make_static_ip_engine()).await;
+    let http1_only = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http1_only()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build client");
+    for (client, version) in [
+        (make_https_client(), reqwest::Version::HTTP_2),
+        (http1_only, reqwest::Version::HTTP_11),
+    ] {
+        let resp = post(&client, server.port, make_dns_query("v.example.com", 7))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.version(), version);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let msg = Message::from_bytes(&resp.bytes().await.unwrap()).expect("dns answer");
+        assert_eq!(msg.metadata.id, 7);
+        assert_eq!(msg.answers.len(), 1);
+
+        let get = client
+            .get(format!(
+                "{}?dns={}",
+                doh_url(server.port),
+                URL_SAFE_NO_PAD.encode(make_dns_query("g.example.com", 8))
+            ))
+            .send()
+            .await
+            .expect("get request");
+        assert_eq!(get.version(), version);
+        assert_eq!(
+            Message::from_bytes(&get.bytes().await.unwrap())
+                .unwrap()
+                .metadata
+                .id,
+            8
+        );
+    }
+}
+
+/// 打开一条 HTTP/2 连接：握手时只报 h2 / Opens one HTTP/2 connection, offering only h2 in the handshake
+async fn http2_connect(
+    server: &DohTestServer,
+) -> (
+    hyper::client::conn::http2::SendRequest<http_body_util::Full<bytes::Bytes>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(server.cert_pem.as_bytes()).expect("parse cert pem"))
+        .expect("add root");
+    let mut config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .expect("tcp connect");
+    let tls = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("tls handshake");
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+    let (sender, conn) = hyper::client::conn::http2::handshake(
+        hyper_util::rt::TokioExecutor::new(),
+        hyper_util::rt::TokioIo::new(tls),
+    )
+    .await
+    .expect("http2 handshake");
+    (
+        sender,
+        tokio::spawn(async move {
+            let _ = conn.await;
+        }),
+    )
+}
+
+/// 在这条 HTTP/2 连接上问一次，返回回答的 TXID / Asks once on this HTTP/2 connection and returns the answer's TXID
+async fn http2_ask(
+    sender: &mut hyper::client::conn::http2::SendRequest<http_body_util::Full<bytes::Bytes>>,
+    txid: u16,
+) -> Result<u16, hyper::Error> {
+    use http_body_util::BodyExt;
+
+    let req = hyper::Request::post("https://localhost/dns-query")
+        .header("content-type", "application/dns-message")
+        .body(http_body_util::Full::new(bytes::Bytes::from(
+            make_dns_query("h2.example.com", txid),
+        )))
+        .unwrap();
+    let resp = sender.send_request(req).await?;
+    assert_eq!(resp.status(), hyper::StatusCode::OK);
+    let body = resp.into_body().collect().await?.to_bytes();
+    Ok(u16::from_be_bytes([body[0], body[1]]))
+}
+
+/// 一条 HTTP/2 连接上同时发比并发上限还多的请求，每个都拿到自己的回答
+/// More requests than the concurrency cap at once on one HTTP/2 connection each get their own answer
+#[tokio::test]
+async fn test_doh_http2_many_requests_on_one_connection() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let (sender, _conn) = http2_connect(&server).await;
+    let asks = (0..300u16).map(|txid| {
+        let mut sender = sender.clone();
+        async move { (txid, http2_ask(&mut sender, txid).await) }
+    });
+    for (txid, answer) in futures::future::join_all(asks).await {
+        assert_eq!(answer.expect("answered"), txid);
+    }
+}
+
+/// 一直在用的 HTTP/2 连接不会因为连得久被关；空下来以后，过了和 HTTP/1.1 一样的空闲时限才关
+/// An HTTP/2 connection in use is not closed for having lasted long; once idle it is closed after the
+/// same idle limit as HTTP/1.1
+#[tokio::test]
+async fn test_doh_http2_connection_closes_only_once_idle() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let (mut sender, conn) = http2_connect(&server).await;
+    for txid in 0..4 {
+        assert_eq!(
+            http2_ask(&mut sender, txid).await.expect("still open"),
+            txid
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+    let idle_from = std::time::Instant::now() - Duration::from_secs(4);
+    tokio::time::timeout(Duration::from_secs(30), conn)
+        .await
+        .expect("the idle connection is closed")
+        .unwrap();
+    let idle = idle_from.elapsed();
+    assert!(
+        idle >= Duration::from_secs(9) && idle < Duration::from_secs(20),
+        "closed after {idle:?} idle"
     );
 }
 
