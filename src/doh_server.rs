@@ -91,7 +91,11 @@ pub async fn run_doh_with_listener(
     engine: Engine,
     doh_path: String,
 ) -> anyhow::Result<()> {
-    let engine = engine.with_client_transport(ClientTransport::Doh);
+    // 引擎和路径都只共享不复制：每个请求只加一次引用计数，不再复制整个 Engine（二十多个 Arc）和路径字符串
+    // The engine and the path are shared, not copied: each request takes one reference count
+    // instead of copying the whole Engine (twenty-odd Arcs) and the path string
+    let engine = Arc::new(engine.with_client_transport(ClientTransport::Doh));
+    let doh_path: Arc<str> = Arc::from(doh_path);
     let acceptor: SharedTlsAcceptor = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
         cert_path, key_path,
     )?));
@@ -114,8 +118,8 @@ pub async fn run_doh_with_listener(
         // Snapshot the current acceptor for this connection; in-flight
         // connections keep serving with the certificate they were established with.
         let acceptor = acceptor.load_full();
-        let engine = engine.clone();
-        let doh_path = doh_path.clone();
+        let engine = Arc::clone(&engine);
+        let doh_path = Arc::clone(&doh_path);
         tokio::spawn(async move {
             match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls_stream)) => {
@@ -129,9 +133,9 @@ pub async fn run_doh_with_listener(
                         return;
                     }
                     let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
-                        let engine = engine.clone();
-                        let doh_path = doh_path.clone();
-                        async move { handle_doh_request(req, peer, engine, &doh_path).await }
+                        let engine = Arc::clone(&engine);
+                        let doh_path = Arc::clone(&doh_path);
+                        async move { handle_doh_request(req, peer, &engine, &doh_path).await }
                     });
                     // hyper 只在装了 timer 时才执行 header_read_timeout，否则静默
                     // 禁用；TokioTimer 是零大小类型，每连接无额外开销。
@@ -219,7 +223,7 @@ impl Drop for Http2Request {
 /// [`handle_doh_request`] as before. Idle for [`HEADER_READ_TIMEOUT`] (nothing being handled and
 /// nothing new coming) it is closed with GOAWAY, the same bound as an idle HTTP/1.1 keep-alive
 /// connection; a request still arriving is bounded by its own limits
-async fn serve_http2<I>(io: I, peer: SocketAddr, engine: Engine, doh_path: String)
+async fn serve_http2<I>(io: I, peer: SocketAddr, engine: Arc<Engine>, doh_path: Arc<str>)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -228,11 +232,11 @@ where
         let activity = Arc::clone(&activity);
         service_fn(move |req: Request<hyper::body::Incoming>| {
             let request = Http2Request::start(&activity);
-            let engine = engine.clone();
-            let doh_path = doh_path.clone();
+            let engine = Arc::clone(&engine);
+            let doh_path = Arc::clone(&doh_path);
             async move {
                 let _request = request;
-                handle_doh_request(req, peer, engine, &doh_path).await
+                handle_doh_request(req, peer, &engine, &doh_path).await
             }
         })
     };
@@ -262,7 +266,7 @@ where
 async fn handle_doh_request(
     req: Request<hyper::body::Incoming>,
     peer: SocketAddr,
-    engine: Engine,
+    engine: &Engine,
     doh_path: &str,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     // RFC 8484 §4.1: POST with application/dns-message
@@ -318,7 +322,7 @@ async fn handle_doh_request(
     }
 
     // ✅ 复用 Engine 公共入口 — 与 TCP/UDP 入站完全一致
-    let resp = process_dns_wire(&dns_wire, peer, &engine).await;
+    let resp = process_dns_wire(&dns_wire, peer, engine).await;
 
     let mut response = Response::new(Full::new(resp));
     let headers = response.headers_mut();
