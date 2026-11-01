@@ -57,10 +57,10 @@ pub struct GlobalSettings {
     /// / DoH query path, defaults to /dns-query. Can be customized to any path to avoid detection.
     #[serde(default = "default_doh_path")]
     pub doh_path: String,
-    /// Moka 缓存最大条目数（默认 10000） / Moka cache max entries (default 10000)
+    /// 响应缓存最多存放的应答份数（默认 10000） / Most answers the response cache holds (default 10000)
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
-    /// Moka 缓存最大生存时间（秒，默认 86400） / Moka cache max TTL (seconds, default 86400)
+    /// 响应缓存里的应答最多存多久（秒，默认 86400） / Longest the response cache keeps an answer (seconds, default 86400)
     #[serde(default = "default_cache_max_ttl")]
     pub cache_max_ttl: u64,
     /// DashMap shard 数量（0=自动，默认 0）。更多 shards=更少锁竞争但更多内存开销 / DashMap shard count (0=auto, default 0). More shards=less lock contention but more memory overhead

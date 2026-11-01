@@ -1568,12 +1568,10 @@ async fn handle_request(
             diagnostic_trace_candidate(request, engine).await
         }
         (&Method::POST, "/v1/cache/flush") => {
-            engine.cache.run_pending_tasks();
             let response_entries_before = engine.cache.weighted_size();
             let rule_entries_before = engine.rule_cache.entry_count();
             engine.cache.invalidate_all();
             engine.rule_cache.invalidate_all();
-            engine.cache.run_pending_tasks();
             engine.rule_cache.run_pending_tasks();
             json_response(
                 StatusCode::OK,

@@ -108,12 +108,13 @@ pub(crate) fn check_cache_logged(
         flags,
     };
 
-    // moka 同步缓存自动处理过期，无需检查 expires_at / moka sync cache automatically handles expiration, no need to check expires_at
+    // 缓存只去掉存了 cache_max_ttl 以上的应答，应答自己的 TTL 到没到在下面判断
+    // The cache only drops answers stored cache_max_ttl or longer ago; whether the answer's own TTL ran out is decided below
     let now = Instant::now();
     let hit = engine.cache_get(slot, &view, &question, now)?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
 
-    // Check manual expiration (in case moka hasn't evicted it yet or for strict TTL compliance)
+    // The answer's own TTL ran out / 应答自己的 TTL 到了
     if elapsed_secs >= hit.original_ttl as u64 {
         // serve_stale disabled → invalidate and miss
         if !state.pipeline.settings.serve_stale {
@@ -287,9 +288,9 @@ pub(crate) fn served_from_cache(
     resp_bytes.freeze()
 }
 
-/// RFC 8767: Check if a stale (expired but still in moka) cache entry exists.
+/// RFC 8767: Check if a stale (expired but still in the cache) cache entry exists.
 /// Returns the stale response bytes with TTL set to serve_stale_ttl.
-/// RFC 8767: 检查是否存在过期但仍在 moka 中的缓存条目。
+/// RFC 8767: 检查是否存在过期但仍在缓存中的缓存条目。
 /// 返回 TTL 设置为 serve_stale_ttl 的过期响应字节。
 ///
 /// `kind` names the stale-serving path for the observer (client timeout or
