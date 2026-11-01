@@ -471,15 +471,20 @@ pub(crate) fn answers_query(query: &[u8], response: &[u8]) -> bool {
 /// it is never cached or handed to waiters (see `Engine::insert_dns_cache_entry`,
 /// `InflightCleanupGuard::hand_over`), so it is always this client's own forward's.
 pub(crate) fn reply_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    // 应答的记录只走一遍：问题名的写法和 RD、CD 位改的都是原位的字节，记录的位置不动，后面找 OPT 用的就是这一遍
+    // The reply's records are walked once: the question name's spelling and the RD and CD
+    // bits change bytes in place without moving any record, so the OPT is taken from this walk
+    let walk = walk_records(&reply);
     // TSIG 的 MAC 盖着整个报文（RFC 8945 第 4.3 节），改哪一位签名都失效：签过的应答原样交出
     // A TSIG's MAC covers the whole message (RFC 8945 section 4.3) and any change breaks
     // it, so a signed reply goes out as it is
-    if last_record_is_tsig(&reply) {
+    if walk.last_is_tsig {
         return reply;
     }
-    edns_as_asked(
+    edns_as_asked_with(
         header_as_asked(question_as_asked(reply, query), query),
         query,
+        walk.opt,
     )
 }
 
@@ -508,13 +513,21 @@ fn header_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
 /// (section 7), so one is taken out; the DO bit is the query's (RFC 3225 section 3).
 /// An OPT carrying an extended RCODE stays, since taking it out would change the
 /// RCODE; a message that cannot be read, or a reply signed with TSIG, is left as it is.
+#[cfg(test)]
 fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    let opt = find_opt(&reply);
+    edns_as_asked_with(reply, query, opt)
+}
+
+/// [`edns_as_asked`]，应答的 OPT（[`find_opt`] 的结论）已经找过 / [`edns_as_asked`] with the
+/// reply's OPT (what [`find_opt`] concludes) already looked for
+fn edns_as_asked_with(reply: Bytes, query: &[u8], opt: Result<Option<OptRecord>, ()>) -> Bytes {
     let asked_dnssec_ok = match find_opt(query) {
         Ok(Some(opt)) => Some(opt.dnssec_ok(query)),
         Ok(None) => None,
         Err(()) => return reply,
     };
-    let Ok(opt) = find_opt(&reply) else {
+    let Ok(opt) = opt else {
         return reply;
     };
     let changed = match (asked_dnssec_ok, opt) {
@@ -674,6 +687,7 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
 }
 
 /// 报文里 OPT 记录的位置 / Where a message's OPT record sits
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct OptRecord {
     /// 记录开头（属主名）的偏移 / Offset of the record's start (its owner name)
     start: usize,
@@ -746,33 +760,64 @@ fn record_at(packet: &[u8], start: usize) -> Option<RecordAt> {
 /// message is malformed, or has more than one OPT record or one outside
 /// Additional (RFC 6891 section 6.1.1: such a message is FORMERR).
 fn find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
+    walk_records(packet).opt
+}
+
+/// 把报文的记录走一遍，同时得出 [`find_opt`] 和 [`last_record_is_tsig`] 两者的结论：照应答规整时
+/// 两样都要，同一份应答不必走两遍
+/// Walks a message's records once for what [`find_opt`] and [`last_record_is_tsig`] each
+/// conclude: shaping a reply needs both, and one walk serves them
+struct RecordsWalk {
+    opt: Result<Option<OptRecord>, ()>,
+    last_is_tsig: bool,
+}
+
+fn walk_records(packet: &[u8]) -> RecordsWalk {
+    const UNREADABLE: RecordsWalk = RecordsWalk {
+        opt: Err(()),
+        last_is_tsig: false,
+    };
     if packet.len() < 12 {
-        return Err(());
+        return UNREADABLE;
     }
     let before_additional = section_count(packet, 1) + section_count(packet, 2);
     let records = before_additional + section_count(packet, 3);
-    let mut pos = skip_questions(packet, section_count(packet, 0)).ok_or(())?;
-    let mut found = None;
+    let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
+        return UNREADABLE;
+    };
+    let mut opt = Ok(None);
+    let mut last_type = None;
     for index in 0..records {
-        let record = record_at(packet, pos).ok_or(())?;
+        let Some(record) = record_at(packet, pos) else {
+            return UNREADABLE;
+        };
+        // RDATA 超出报文的记录让 OPT 读不成；最后一条这样的记录照样算作最后一条（原来如此）
+        // A record whose RDATA runs past the message leaves the OPT unreadable; as the last
+        // record it still counts as the last one (as it always has)
         if record.rdata.end > packet.len() {
-            return Err(());
-        }
-        if record.rr_type == 41 {
+            opt = Err(());
+        } else if record.rr_type == 41
+            && let Ok(found) = &mut opt
+        {
             if index < before_additional || found.is_some() {
-                return Err(());
+                opt = Err(());
+            } else {
+                *found = Some(OptRecord {
+                    start: pos,
+                    extended_rcode_at: record.fixed + 4,
+                    rdlen_at: record.fixed + 8,
+                    rdata: record.rdata.clone(),
+                    last: index + 1 == records,
+                });
             }
-            found = Some(OptRecord {
-                start: pos,
-                extended_rcode_at: record.fixed + 4,
-                rdlen_at: record.fixed + 8,
-                rdata: record.rdata.clone(),
-                last: index + 1 == records,
-            });
         }
+        last_type = Some(record.rr_type);
         pos = record.rdata.end;
     }
-    Ok(found)
+    RecordsWalk {
+        opt,
+        last_is_tsig: last_type == Some(250),
+    }
 }
 
 /// OPT 里的一个 ECS 选项 / An ECS option inside OPT
@@ -1145,23 +1190,7 @@ fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Optio
 /// 报文最后一条记录是不是 TSIG（RFC 8945 要求它排在最后）
 /// Whether a message's last record is a TSIG (RFC 8945 keeps it last)
 pub(crate) fn last_record_is_tsig(packet: &[u8]) -> bool {
-    if packet.len() < 12 {
-        return false;
-    }
-    let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
-        return false;
-    };
-    let mut last_type = None;
-    for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
-        // 最后一条的 RDATA 超出报文也照样算（原来如此）/ A last record whose RDATA runs
-        // past the message still counts (as it always has)
-        let Some(record) = record_at(packet, pos) else {
-            return false;
-        };
-        last_type = Some(record.rr_type);
-        pos = record.rdata.end;
-    }
-    last_type == Some(250)
+    walk_records(packet).last_is_tsig
 }
 
 /// Byte length of the last complete record, or `None` on malformed structure.
@@ -3391,6 +3420,216 @@ mod tests {
             let mut packet = query(true, false);
             super::push_bare_tsig(&mut packet);
             assert!(matches!(query_without_cookie(&packet), Cow::Borrowed(_)));
+        }
+    }
+}
+
+/// 一遍走完记录（[`walk_records`]）和原来分开走的两遍结论一样：原来的两个函数原样留在这里对照，
+/// 拿一批真实形状的报文和它们截断、改字节、改计数以后的样子逐个比
+/// One walk over the records ([`walk_records`]) concludes what the two separate walks used
+/// to: the two former functions stay here as they were, and each of a set of real-shaped
+/// messages, truncated, with bytes changed and with counts changed, is compared
+#[cfg(test)]
+mod one_walk_tests {
+    use super::*;
+    use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+
+    // 原来的 find_opt / The former find_opt
+    fn reference_find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
+        if packet.len() < 12 {
+            return Err(());
+        }
+        let before_additional = section_count(packet, 1) + section_count(packet, 2);
+        let records = before_additional + section_count(packet, 3);
+        let mut pos = skip_questions(packet, section_count(packet, 0)).ok_or(())?;
+        let mut found = None;
+        for index in 0..records {
+            let record = record_at(packet, pos).ok_or(())?;
+            if record.rdata.end > packet.len() {
+                return Err(());
+            }
+            if record.rr_type == 41 {
+                if index < before_additional || found.is_some() {
+                    return Err(());
+                }
+                found = Some(OptRecord {
+                    start: pos,
+                    extended_rcode_at: record.fixed + 4,
+                    rdlen_at: record.fixed + 8,
+                    rdata: record.rdata.clone(),
+                    last: index + 1 == records,
+                });
+            }
+            pos = record.rdata.end;
+        }
+        Ok(found)
+    }
+
+    // 原来的 last_record_is_tsig / The former last_record_is_tsig
+    fn reference_last_record_is_tsig(packet: &[u8]) -> bool {
+        if packet.len() < 12 {
+            return false;
+        }
+        let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
+            return false;
+        };
+        let mut last_type = None;
+        for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
+            // 最后一条的 RDATA 超出报文也照样算（原来如此）/ A last record whose RDATA runs
+            // past the message still counts (as it always has)
+            let Some(record) = record_at(packet, pos) else {
+                return false;
+            };
+            last_type = Some(record.rr_type);
+            pos = record.rdata.end;
+        }
+        last_type == Some(250)
+    }
+
+    /// 真实形状的报文：查询和应答、带不带 OPT、几条回答、CNAME 链带压缩指针、Authority 段、末尾的 TSIG
+    /// Real-shaped messages: queries and replies, with and without OPT, several answers, a
+    /// CNAME chain with compression pointers, an Authority section, a trailing TSIG
+    fn seeds() -> Vec<Vec<u8>> {
+        let name = Name::from_ascii("www.Example.com.").unwrap();
+        let target = Name::from_ascii("edge.example.net.").unwrap();
+        let mut seeds = Vec::new();
+        for (kind, edns, do_bit, answers) in [
+            (MessageType::Query, false, false, 0),
+            (MessageType::Query, true, false, 0),
+            (MessageType::Query, true, true, 0),
+            (MessageType::Response, false, false, 1),
+            (MessageType::Response, true, false, 1),
+            (MessageType::Response, true, true, 4),
+        ] {
+            let mut m = Message::new(0x1234, kind, OpCode::Query);
+            m.add_query(Query::query(name.clone(), RecordType::A));
+            if answers > 0 {
+                m.add_answer(Record::from_rdata(
+                    name.clone(),
+                    60,
+                    RData::CNAME(hickory_proto::rr::rdata::CNAME(target.clone())),
+                ));
+                for i in 0..answers {
+                    m.add_answer(Record::from_rdata(
+                        target.clone(),
+                        300,
+                        RData::A(hickory_proto::rr::rdata::A::new(192, 0, 2, i)),
+                    ));
+                }
+                m.add_authority(Record::from_rdata(
+                    Name::from_ascii("example.net.").unwrap(),
+                    300,
+                    RData::NS(hickory_proto::rr::rdata::NS(target.clone())),
+                ));
+            }
+            if edns {
+                let mut e = Edns::new();
+                e.set_max_payload(1232);
+                e.set_dnssec_ok(do_bit);
+                m.edns = Some(e);
+            }
+            seeds.push(m.to_vec().unwrap());
+        }
+        // 末尾补一条 TSIG（类型 250）/ A TSIG (type 250) appended at the end
+        for base in seeds.clone() {
+            let mut signed = base;
+            let ar = u16::from_be_bytes([signed[10], signed[11]]) + 1;
+            signed[10..12].copy_from_slice(&ar.to_be_bytes());
+            signed.extend_from_slice(&[0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 3, 1, 2, 3]);
+            seeds.push(signed);
+        }
+        seeds
+    }
+
+    /// 截断、改一个字节、改各段计数、把记录类型改成 OPT 或 TSIG 以后的样子
+    /// Each message truncated, with one byte changed, with section counts changed, and with
+    /// record types turned into OPT or TSIG
+    fn variants() -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for seed in seeds() {
+            for len in 0..=seed.len() {
+                out.push(seed[..len].to_vec());
+            }
+            for _ in 0..400 {
+                let mut changed = seed.clone();
+                let at = next() as usize % changed.len();
+                changed[at] = match next() % 4 {
+                    0 => 41,
+                    1 => 250,
+                    2 => 0,
+                    _ => next() as u8,
+                };
+                out.push(changed);
+            }
+            for _ in 0..200 {
+                let mut changed = seed.clone();
+                let at = 4 + (next() as usize % 8);
+                changed[at] = (next() % 4) as u8;
+                out.push(changed);
+            }
+            out.push(seed);
+        }
+        out
+    }
+
+    #[test]
+    fn one_walk_concludes_what_the_two_walks_did() {
+        let messages = variants();
+        assert!(messages.len() > 5000);
+        for message in &messages {
+            let walk = walk_records(message);
+            assert_eq!(walk.opt, reference_find_opt(message), "{message:?}");
+            assert_eq!(
+                walk.last_is_tsig,
+                reference_last_record_is_tsig(message),
+                "{message:?}"
+            );
+        }
+    }
+
+    /// 照应答规整时只走一遍应答：结果和问题名、RD/CD 改完以后再找一遍 OPT 一样
+    /// Shaping a reply walks it once, with the result of looking for the OPT again after
+    /// the question name and RD/CD were changed
+    #[test]
+    fn shaping_a_reply_with_one_walk_matches_walking_it_again() {
+        let messages = variants();
+        let queries: Vec<Vec<u8>> = seeds()
+            .into_iter()
+            .filter(|m| m[2] & 0x80 == 0)
+            .flat_map(|q| {
+                let mut lower = q.clone();
+                lower[12..].make_ascii_lowercase();
+                let mut flags = q.clone();
+                flags[2] ^= 0x01;
+                flags[3] ^= 0x10;
+                [q, lower, flags]
+            })
+            .collect();
+        for reply in &messages {
+            for query in &queries {
+                let reply = Bytes::from(reply.clone());
+                let expected = if reference_last_record_is_tsig(&reply) {
+                    reply.clone()
+                } else {
+                    edns_as_asked(
+                        header_as_asked(question_as_asked(reply.clone(), query), query),
+                        query,
+                    )
+                };
+                assert_eq!(
+                    reply_as_asked(reply.clone(), query),
+                    expected,
+                    "{reply:?} {query:?}"
+                );
+            }
         }
     }
 }
