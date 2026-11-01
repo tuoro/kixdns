@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::{Bytes, BytesMut};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -876,90 +877,183 @@ async fn run_udp_worker(
     engine: Engine,
 ) -> anyhow::Result<()> {
     let engine = engine.with_client_transport(ClientTransport::Udp);
-    // 预分配缓冲区 / Pre-allocate buffer
-    // 使用 BytesMut 避免 Bytes::copy_from_slice 的内存分配 / Use BytesMut to avoid memory allocation in Bytes::copy_from_slice
-    use bytes::BytesMut;
-    let mut buf = BytesMut::with_capacity(4096);
-    // 复用发送缓冲区：缓存命中时在这里改 TTL 和 TXID，避免每包堆分配 / Reuse send buffer to patch TTLs and the TXID on cache hits, avoiding per-packet heap allocation
-    let mut send_buf = BytesMut::with_capacity(512);
-
-    // 自适应流控：每 100 个请求检查一次是否需要调整 permits
-    // Adaptive flow control: check if adjustment needed every 100 requests
-    let mut request_count = 0u32;
-
     info!(worker_id, "UDP worker started");
+    #[cfg(target_os = "linux")]
+    receive_in_batches(&socket, &engine).await;
+    #[cfg(not(target_os = "linux"))]
+    receive_one_by_one(&socket, &engine).await;
+}
 
-    loop {
-        // 确保有足够的空间 / Ensure sufficient space
-        if buf.capacity() < 4096 {
-            buf.reserve(4096 - buf.len());
+/// 一个 worker 的接收循环里，快速路径要用的几样东西 / What the fast path needs in one worker's receive loop
+struct UdpAnswering<'a> {
+    socket: &'a Arc<UdpSocket>,
+    engine: &'a Engine,
+    /// 自适应流控：每 100 个请求检查一次是否需要调整 permits / Adaptive flow control: check if adjustment needed every 100 requests
+    request_count: u32,
+}
+
+impl UdpAnswering<'_> {
+    /// 处理收到的一个报文。快速路径当场答得上的（缓存命中、静态规则、解析出错的 SERVFAIL），把回答写进 `reply`
+    /// 并返回 true，超过客户端上限的已经截断；要等上游的交给单独的任务，不是查询的丢掉，都返回 false。
+    /// Handles one received datagram. What the fast path answers on the spot (a cache hit, a static rule, the
+    /// SERVFAIL for an error) is written to `reply`, already cut to the client's limit, and gives true; a query
+    /// that waits on an upstream goes to its own task and anything that is not a query is dropped, both giving false.
+    fn answer(&mut self, packet: &[u8], peer: SocketAddr, reply: &mut BytesMut) -> bool {
+        if !is_standard_query_header(packet) {
+            return false;
         }
+        self.request_count += 1;
+        if self.request_count >= 100 {
+            self.request_count = 0;
+            self.engine.adjust_flow_control(); // Now synchronous with atomic CAS
+        }
+        // ✅ 优化：使用 handle_packet_fast 避免重复解析 / ✅ Optimization: Use handle_packet_fast to avoid re-parsing
+        match self.engine.handle_packet_fast(packet, peer) {
+            Ok(Some(FastPathResponse::Direct(bytes))) => {
+                // 已包含正确 TXID / Already contains correct TXID
+                reply.clear();
+                reply.extend_from_slice(&bytes);
+            }
+            Ok(Some(FastPathResponse::CacheHit {
+                cached,
+                tx_id,
+                inserted_at,
+            })) => write_cache_hit(reply, &cached, tx_id, inserted_at),
+            Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
+                // 缓存未命中，使用预解析的数据避免重复解析 / Cache miss, use pre-parsed data to avoid re-parsing
+                let packet = Bytes::copy_from_slice(packet);
+                spawn_udp_answer(self.engine, self.socket, packet, peer, Some(pre_parsed));
+                return false;
+            }
+            Ok(None) => {
+                // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
+                let packet = Bytes::copy_from_slice(packet);
+                spawn_udp_answer(self.engine, self.socket, packet, peer, None);
+                return false;
+            }
+            Err(error) => {
+                self.engine.log_fast_path_error(&error);
+                let Some(servfail) = engine_helpers::try_build_servfail_response_from_wire(packet)
+                else {
+                    return false;
+                };
+                reply.clear();
+                reply.extend_from_slice(&servfail);
+            }
+        }
+        // 截断超限响应，避免 UDP 报文超过客户端声明上限 / Truncate to the client's advertised UDP limit
+        if let Some(truncated) = truncate_udp_response(packet, reply) {
+            reply.clear();
+            reply.extend_from_slice(&truncated);
+        }
+        true
+    }
+}
 
-        // ✅ Hybrid recv: try non-blocking first, fall back to async on EAGAIN.
-        // Under load, this eliminates tokio reactor overhead (epoll_wait +
-        // task wake/schedule cycle) per packet. Under no load, falls back to
-        // async await so the worker yields and doesn't waste CPU.
-        //
-        // ✅ 混合接收：先尝试非阻塞，EAGAIN 时回退到异步。
-        // 高负载时消除每包的 tokio reactor 开销（epoll_wait + 任务唤醒/调度循环）。
-        // 空闲时回退到异步 await，worker 让出 CPU 不浪费。
-        let (_len, peer) = match socket.try_recv_buf_from(&mut buf) {
+/// Linux：一次系统调用收一批、回一批（recvmmsg / sendmmsg）。满负荷时省下每个报文各自进出内核的那一趟；
+/// 空闲时一批只有一个，和单收单发一样。没有报文时让出 tokio，worker 不空转。
+/// Linux: one system call takes a batch and one sends the replies (recvmmsg / sendmmsg). Under full load
+/// this saves each datagram its own trip into the kernel; when idle a batch holds one, the same as single
+/// receives and sends. With nothing to read the worker yields to tokio and does not spin.
+#[cfg(target_os = "linux")]
+async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Engine) -> ! {
+    use kixdns::socket_utils::udp_batch::{Received, Replies};
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    let fd = socket.as_raw_fd();
+    let mut received = Received::default();
+    let mut replies = Replies::default();
+    let mut answering = UdpAnswering {
+        socket,
+        engine,
+        request_count: 0,
+    };
+    loop {
+        match socket.try_io(Interest::READABLE, || received.recv(fd)) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                // 当前无包可读 — 让出 tokio / No packet available right now — yield to tokio
+                let _ = socket.readable().await;
+                continue;
+            }
+            Err(_) => continue,
+        }
+        for k in 0..received.len() {
+            let Some((packet, peer)) = received.get(k) else {
+                continue;
+            };
+            if answering.answer(packet, peer.addr(), replies.next_buf()) {
+                replies.push(peer);
+            }
+        }
+        send_replies(socket, &replies).await;
+        replies.clear();
+    }
+}
+
+/// 一批回答发出去：发送缓冲满时等到能写再接着发，和单发时一样；发不出去的那个记下来跳过
+/// Sends a batch of replies: when the send buffer is full it waits until writable and goes on, as single
+/// sends do; a reply that cannot be sent is logged and skipped
+#[cfg(target_os = "linux")]
+async fn send_replies(socket: &UdpSocket, replies: &kixdns::socket_utils::udp_batch::Replies) {
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    let fd = socket.as_raw_fd();
+    let mut next = 0;
+    while next < replies.len() {
+        match socket.try_io(Interest::WRITABLE, || replies.send(fd, next)) {
+            // sendmmsg 要么至少发出一个，要么报错；0 只当发不出去 / sendmmsg sends at least one or
+            // fails; a 0 is taken as nothing more can be sent
+            Ok(0) => return,
+            Ok(sent) => next += sent,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if socket.writable().await.is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                if let Some((response, peer)) = replies.get(next) {
+                    debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
+                }
+                next += 1;
+            }
+        }
+    }
+}
+
+/// 其他平台：一个一个收、一个一个回。先尝试非阻塞，EAGAIN 时回退到异步：高负载时消除每包的 tokio reactor
+/// 开销（epoll_wait + 任务唤醒/调度循环），空闲时让出 CPU 不浪费。
+/// Other platforms: one datagram received and answered at a time. A non-blocking receive comes first and
+/// falls back to async on EAGAIN: under load this eliminates the per-packet tokio reactor overhead (epoll_wait
+/// plus the task wake/schedule cycle), and when idle the worker yields and does not waste CPU.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux 上只有测试用 / On Linux only the tests use it
+async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Engine) -> ! {
+    let mut buf = vec![0; 4096];
+    // 复用发送缓冲区：缓存命中时在这里改 TTL 和 TXID，避免每包堆分配 / Reuse send buffer to patch TTLs and the TXID on cache hits, avoiding per-packet heap allocation
+    let mut reply = BytesMut::with_capacity(512);
+    let mut answering = UdpAnswering {
+        socket,
+        engine,
+        request_count: 0,
+    };
+    loop {
+        let (len, peer) = match socket.try_recv_from(&mut buf) {
             Ok(result) => result,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No packet available right now — yield to tokio / 当前无包可读 — 让出 tokio
-                match socket.recv_buf_from(&mut buf).await {
+                // 当前无包可读 — 让出 tokio / No packet available right now — yield to tokio
+                match socket.recv_from(&mut buf).await {
                     Ok(result) => result,
                     Err(_) => continue,
                 }
             }
             Err(_) => continue,
         };
+        if answering.answer(&buf[..len], peer, &mut reply)
+            && let Err(error) = send_udp_datagram(socket, &reply, peer).await
         {
-            // 零拷贝获取 Bytes / Zero-copy obtain Bytes
-            let packet_bytes = buf.split().freeze();
-            if !is_standard_query_header(&packet_bytes) {
-                continue;
-            }
-
-            // 每 100 个请求检查一次流控调整 / Check flow control adjustment every 100 requests
-            request_count += 1;
-            if request_count >= 100 {
-                request_count = 0;
-                engine.adjust_flow_control(); // Now synchronous with atomic CAS
-            }
-
-            // ✅ 优化：使用 handle_packet_fast 避免重复解析
-            // ✅ Optimization: Use handle_packet_fast to avoid re-parsing
-            // 如果缓存命中，直接返回；如果缓存未命中，返回预解析的数据
-            // If cache hit, return directly; if cache miss, return pre-parsed data
-            match engine.handle_packet_fast(&packet_bytes, peer) {
-                Ok(Some(FastPathResponse::Direct(bytes))) => {
-                    // 已包含正确 TXID，可直接发送 / Already contains correct TXID
-                    send_udp_response(&socket, &packet_bytes, &bytes, peer).await;
-                }
-                Ok(Some(FastPathResponse::CacheHit {
-                    cached,
-                    tx_id,
-                    inserted_at,
-                })) => {
-                    write_cache_hit(&mut send_buf, &cached, tx_id, inserted_at);
-                    send_udp_response(&socket, &packet_bytes, &send_buf, peer).await;
-                }
-                Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
-                    // 缓存未命中，使用预解析的数据避免重复解析
-                    // Cache miss, use pre-parsed data to avoid re-parsing
-                    spawn_udp_answer(&engine, &socket, packet_bytes, peer, Some(pre_parsed));
-                }
-                Ok(None) => {
-                    // 快速解析失败，回退到完整处理
-                    // Fast parse failed, fallback to full processing
-                    spawn_udp_answer(&engine, &socket, packet_bytes, peer, None);
-                }
-                Err(error) => {
-                    engine.log_fast_path_error(&error);
-                    send_udp_servfail(&socket, &packet_bytes, peer).await;
-                }
-            }
+            debug!(%peer, %error, response_len = reply.len(), "failed to send UDP response");
         }
     }
 }
@@ -1411,6 +1505,113 @@ mod tests {
 
     fn dns_query() -> Vec<u8> {
         query("data.xiaoheihe.cn", 0xCAFE)
+    }
+
+    /// 一批里的每个查询都拿到自己的回答：几个客户端排着的查询比一批还多，中间夹着坏包和不是查询的报文。
+    /// 批量收发和一个一个收发的两种循环都这样
+    /// Every query in a batch gets its own answer: several clients queue more queries than one batch
+    /// holds, with malformed datagrams and non-queries among them. Both the batched and the one-by-one
+    /// receive loops do so
+    #[tokio::test]
+    async fn every_queued_query_gets_its_own_answer() {
+        #[cfg(target_os = "linux")]
+        every_queued_query_is_answered_by(|server, engine| {
+            tokio::spawn(async move { receive_in_batches(&server, &engine).await })
+        })
+        .await;
+        every_queued_query_is_answered_by(|server, engine| {
+            tokio::spawn(async move { receive_one_by_one(&server, &engine).await })
+        })
+        .await;
+    }
+
+    /// 记录每个请求的客户端地址 / Records each request's client address
+    #[derive(Default)]
+    struct ClientRecorder(std::sync::Mutex<Vec<SocketAddr>>);
+
+    impl kixdns::observe::EngineObserver for ClientRecorder {
+        fn request_started(&self, ctx: &kixdns::observe::RequestContext<'_>) {
+            self.0.lock().unwrap().push(ctx.client);
+        }
+    }
+
+    async fn every_queued_query_is_answered_by(
+        receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
+    ) {
+        let recorder = Arc::new(ClientRecorder::default());
+        let engine = Engine::builder(static_runtime())
+            .observer(recorder.clone())
+            .build()
+            .expect("initialize engine");
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..6 {
+            clients.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        }
+        // worker 起来之前全排进接收队列：第一次收就是满满一批，后面还有 / All queued before the
+        // worker starts: the first receive is a full batch, with more behind it
+        const PER_CLIENT: u16 = 12;
+        for (c, client) in (0u16..).zip(&clients) {
+            for q in 0..PER_CLIENT {
+                let name = format!("q{q}.c{c}.example");
+                client
+                    .send_to(&query(&name, c * 100 + q), server_addr)
+                    .await
+                    .unwrap();
+            }
+            client.send_to(&[0x12, 0x34], server_addr).await.unwrap();
+            let mut answer_not_query = query("x.example", 0x7777);
+            answer_not_query[2] |= 0x80;
+            client
+                .send_to(&answer_not_query, server_addr)
+                .await
+                .unwrap();
+        }
+        let worker = receive(Arc::clone(&server), engine);
+
+        for (c, client) in (0u16..).zip(&clients) {
+            let mut ids = Vec::new();
+            for _ in 0..PER_CLIENT {
+                let mut buf = [0u8; 512];
+                let (len, _) =
+                    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                        .await
+                        .expect("every query is answered")
+                        .unwrap();
+                let response = Message::from_bytes(&buf[..len]).unwrap();
+                let id = response.metadata.id;
+                assert_eq!(id / 100, c, "an answer reached the wrong client");
+                assert_eq!(
+                    response.queries[0].name().to_string(),
+                    format!("q{}.c{c}.example.", id % 100)
+                );
+                assert_eq!(response.answers.len(), 1);
+                ids.push(id);
+            }
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                (0..PER_CLIENT).map(|q| c * 100 + q).collect::<Vec<_>>()
+            );
+            let mut buf = [0u8; 512];
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut buf))
+                    .await
+                    .is_err(),
+                "malformed datagrams and non-queries get no answer"
+            );
+        }
+        worker.abort();
+        // 引擎看到的客户端就是发来这个查询的那个 / The engine sees as the client the one that sent the query
+        let mut seen = recorder.0.lock().unwrap().clone();
+        seen.sort_unstable();
+        let mut sent = Vec::new();
+        for client in &clients {
+            sent.extend([client.local_addr().unwrap(); PER_CLIENT as usize]);
+        }
+        sent.sort_unstable();
+        assert_eq!(seen, sent);
     }
 
     #[tokio::test]
