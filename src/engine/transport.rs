@@ -1738,6 +1738,22 @@ struct DohUpstream {
     /// 回了 429 以后暂停到什么时候，从 `DohClient::epoch` 起算的毫秒数；没暂停过是 0
     /// Until when a 429 paused it, in milliseconds from `DohClient::epoch`; 0 if it never was
     paused_until: AtomicU64,
+    /// 请求发往的 URL 和覆盖的 Host（见 [`build_doh_url`]）：第一次发请求时算好，之后每个请求直接用
+    /// The URL requests go to and the Host override (see [`build_doh_url`]): worked out at the
+    /// first send and taken as they are by every request after
+    target: std::sync::OnceLock<(Url, Option<String>)>,
+}
+
+impl DohUpstream {
+    /// `upstream` 的 URL 和覆盖的 Host；写错的 URL 每次都报同样的错，不记下来
+    /// `upstream`'s URL and Host override; a malformed URL gives the same error each time and is not kept
+    fn target(&self, upstream: &str) -> anyhow::Result<&(Url, Option<String>)> {
+        if let Some(target) = self.target.get() {
+            return Ok(target);
+        }
+        let built = build_doh_url(upstream)?;
+        Ok(self.target.get_or_init(|| built))
+    }
 }
 
 pub struct DohClient {
@@ -1847,6 +1863,7 @@ impl DohClient {
                     consecutive_errors: AtomicUsize::new(0),
                     last_used_millis: AtomicU64::new(now),
                     paused_until: AtomicU64::new(0),
+                    target: std::sync::OnceLock::new(),
                 });
                 slot.insert(Arc::clone(&state));
                 Ok(state)
@@ -1903,14 +1920,14 @@ impl DohClient {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        let (url, host_override) = build_doh_url(upstream)?;
-        #[cfg(test)]
-        let url = self.scheme_for_tests(url);
-        let host = host_override.as_deref();
         let state = self.upstream(upstream)?;
+        let (url, host_override) = state.target(upstream)?;
+        #[cfg(test)]
+        let url = &self.scheme_for_tests(url.clone());
+        let host = host_override.as_deref();
 
         let start = tokio::time::Instant::now();
-        let result = match Self::send_once(&state, packet, &url, host, timeout_dur).await {
+        let result = match Self::send_once(&state, packet, url, host, timeout_dur).await {
             Ok(bytes) => {
                 state.consecutive_errors.store(0, Ordering::Release);
                 return Ok(restore_query_id(packet, bytes));
@@ -1933,7 +1950,7 @@ impl DohClient {
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                Self::send_once(&state, packet, &url, host, remaining).await
+                Self::send_once(&state, packet, url, host, remaining).await
             }
             Err(e) => Err(e),
         };
