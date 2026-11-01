@@ -161,7 +161,8 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kixdns::config::load_config_with_source;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, write_cache_hit};
 use kixdns::matcher::RuntimePipelineConfig;
-use kixdns::observe::ClientTransport;
+use kixdns::observe::{ClientTransport, EngineObserver, TracingObserver};
+use kixdns::panel::PanelMetrics;
 use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
 use kixdns::watcher;
 
@@ -347,22 +348,19 @@ async fn run_dns_server(
     let bind_addr = listeners.udp;
     let bind_tcp = listeners.tcp;
 
-    // The enhanced build installs the panel observer in the single observer
-    // slot; it forwards to the --debug reference observer itself / 增强版在唯一的观察者槽位安装面板观察者，由它自行转发给 --debug 参考观察者
-    let panel_metrics = kixdns::panel::PanelMetrics::new(debug);
-    // 查询排行只经控制通道读；没开控制通道时不统计 / Query rankings are only read over the
-    // control socket; without one they are not collected
-    let panel_metrics = Arc::new(if cfg!(unix) && admin_socket.is_some() {
-        panel_metrics
-    } else {
-        panel_metrics.without_rankings()
-    });
-    let engine = Engine::builder(cfg)
+    // 面板的统计只能经控制通道读，所以只在开了控制通道时装面板观察者 / The panel's statistics can
+    // only be read over the control socket, so the panel observer is installed only with one
+    let panel_metrics = admin_socket
+        .as_ref()
+        .filter(|_| cfg!(unix))
+        .map(|_| Arc::new(PanelMetrics::new(debug)));
+    let mut engine = Engine::builder(cfg)
         .listener_label(listener_label.clone())
-        .config_source(&config, config_source)
-        .observer(panel_metrics.clone())
-        .build()
-        .context("initialize DNS engine")?;
+        .config_source(&config, config_source);
+    if let Some(observer) = engine_observer(panel_metrics.as_ref(), debug) {
+        engine = engine.observer(observer);
+    }
+    let engine = engine.build().context("initialize DNS engine")?;
 
     watcher::spawn(config.clone(), engine.clone());
 
@@ -380,9 +378,8 @@ async fn run_dns_server(
     let mut all_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     #[cfg(unix)]
-    if let Some(path) = admin_socket {
+    if let (Some(path), Some(panel_metrics)) = (admin_socket, panel_metrics) {
         let engine = engine.clone();
-        let panel_metrics = Arc::clone(&panel_metrics);
         all_handles.push(tokio::spawn(async move {
             if let Err(err) = kixdns::panel::serve_admin(path, engine, panel_metrics).await {
                 error!(target = "panel", error = %err, "panel control socket exited");
@@ -531,6 +528,22 @@ async fn run_dns_server(
     }
 
     Ok(())
+}
+
+/// 引擎的观察者：有面板时是面板观察者，`--debug` 的事件由它转发；没有面板时和上游一样，
+/// 只有 `--debug` 才装参考观察者，否则不装，请求不付任何观察的开销
+/// The engine's observer: with the panel, the panel observer, which forwards the `--debug`
+/// events itself; without the panel, as upstream, the reference observer only with `--debug`
+/// and otherwise none, so requests pay nothing for observation
+fn engine_observer(
+    panel_metrics: Option<&Arc<PanelMetrics>>,
+    debug: bool,
+) -> Option<Arc<dyn EngineObserver>> {
+    match panel_metrics {
+        Some(panel_metrics) => Some(panel_metrics.clone()),
+        None if debug => Some(Arc::new(TracingObserver)),
+        None => None,
+    }
 }
 
 fn init_tracing(debug: bool) {
@@ -1301,6 +1314,23 @@ mod tests {
         assert_eq!(super::panic_message(formatted.as_ref()), "formatted 42");
         let opaque: Box<dyn std::any::Any + Send> = Box::new(42u8);
         assert_eq!(super::panic_message(opaque.as_ref()), "Box<dyn Any>");
+    }
+
+    /// 没有面板时和上游一样：不带 `--debug` 不装观察者，带了装参考观察者；有面板时装的就是面板观察者
+    /// Without the panel, as upstream: no observer without `--debug` and the reference observer
+    /// with it; with the panel, the panel observer itself
+    #[test]
+    fn only_the_panel_brings_the_panel_observer() {
+        assert!(super::engine_observer(None, false).is_none());
+        assert!(super::engine_observer(None, true).is_some());
+        let panel = Arc::new(super::PanelMetrics::new(false));
+        for debug in [false, true] {
+            let observer = super::engine_observer(Some(&panel), debug).unwrap();
+            assert!(std::ptr::addr_eq(
+                Arc::as_ptr(&observer),
+                Arc::as_ptr(&panel)
+            ));
+        }
     }
     use super::*;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
