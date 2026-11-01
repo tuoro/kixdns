@@ -674,6 +674,49 @@ async fn test_doh_speaks_http2_and_still_http1() {
     }
 }
 
+/// 新连接上的第一个请求不等对端的延迟确认：服务端关了 Nagle。开着时 TLS 握手和应答的几段小写入里，
+/// 后一段要等约 40 ms 的延迟确认才发出去，每个新连接的第一个请求都慢这么多
+/// The first request on a new connection does not wait for the peer's delayed ACK: the server
+/// turns Nagle off. With it on, a later one of the few small writes of the TLS handshake and the
+/// answer waits about 40 ms for a delayed ACK, slowing the first request on every new connection
+#[tokio::test]
+async fn test_doh_first_request_on_a_new_connection_is_not_held_by_nagle() {
+    let server = start_doh(make_static_ip_engine()).await;
+    let fresh = |http1_only: bool| {
+        let builder = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(0)
+            .timeout(Duration::from_secs(5));
+        if http1_only {
+            builder.http1_only()
+        } else {
+            builder
+        }
+        .build()
+        .expect("build client")
+    };
+    for http1_only in [true, false] {
+        let mut took = Vec::new();
+        for txid in 0..7 {
+            // 每次一个新客户端，连接不复用 / A new client each time, so no connection is reused
+            let client = fresh(http1_only);
+            let started = std::time::Instant::now();
+            let resp = post(&client, server.port, make_dns_query("n.example.com", txid))
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            resp.bytes().await.expect("body");
+            took.push(started.elapsed());
+        }
+        took.sort_unstable();
+        assert!(
+            took[3] < Duration::from_millis(30),
+            "http1_only={http1_only}: {took:?}"
+        );
+    }
+}
+
 /// 打开一条 HTTP/2 连接：握手时只报 h2 / Opens one HTTP/2 connection, offering only h2 in the handshake
 async fn http2_connect(
     server: &DohTestServer,
