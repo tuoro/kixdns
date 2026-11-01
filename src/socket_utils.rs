@@ -227,6 +227,43 @@ pub mod udp_batch {
     }
 
     impl Peer {
+        /// `addr` 这个对端：转发回来的回答不是这一批收到的，按地址建出内核要的形式
+        /// The peer at `addr`: a reply that came back from a forward was not received in this
+        /// batch, so the kernel's form is built from the address
+        pub fn of(addr: SocketAddr) -> Self {
+            // SAFETY: 普通 C 结构，全零是合法值 / SAFETY: a plain C struct, all zeroes is valid
+            let mut raw: libc::sockaddr_storage = unsafe { zeroed() };
+            let raw_len = match addr {
+                SocketAddr::V4(v4) => {
+                    // SAFETY: sockaddr_storage 对 sockaddr_in 够大、对齐 / SAFETY: sockaddr_storage is large and aligned enough for a sockaddr_in
+                    let sin = unsafe {
+                        &mut *(&mut raw as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>()
+                    };
+                    sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                    sin.sin_port = v4.port().to_be();
+                    sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                    size_of::<libc::sockaddr_in>()
+                }
+                SocketAddr::V6(v6) => {
+                    // SAFETY: 同上，sockaddr_in6 / SAFETY: as above, for a sockaddr_in6
+                    let sin6 = unsafe {
+                        &mut *(&mut raw as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
+                    };
+                    sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                    sin6.sin6_port = v6.port().to_be();
+                    sin6.sin6_flowinfo = v6.flowinfo();
+                    sin6.sin6_addr.s6_addr = v6.ip().octets();
+                    sin6.sin6_scope_id = v6.scope_id();
+                    size_of::<libc::sockaddr_in6>()
+                }
+            };
+            Self {
+                raw,
+                raw_len: raw_len as libc::socklen_t,
+                addr,
+            }
+        }
+
         pub fn addr(&self) -> SocketAddr {
             self.addr
         }
@@ -372,8 +409,8 @@ pub mod udp_batch {
     }
 
     impl Replies {
-        /// 下一个回答写进这里；一批最多 `BATCH` 个，不比收到的多
-        /// The next reply is written here; a batch holds at most `BATCH`, no more than were received
+        /// 下一个回答写进这里；一批最多 `BATCH` 个（见 `is_full`）
+        /// The next reply is written here; a batch holds at most `BATCH` (see `is_full`)
         pub fn next_buf(&mut self) -> &mut BytesMut {
             &mut self.bufs[self.peers.len()]
         }
@@ -394,6 +431,11 @@ pub mod udp_batch {
 
         pub fn is_empty(&self) -> bool {
             self.peers.is_empty()
+        }
+
+        /// 一批已经放满 / The batch holds as many as it can
+        pub fn is_full(&self) -> bool {
+            self.peers.len() == BATCH
         }
 
         pub fn clear(&mut self) {

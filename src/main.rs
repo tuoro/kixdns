@@ -838,15 +838,10 @@ async fn send_udp_datagram(
     }
 }
 
-/// 发送 UDP 响应：超限响应截断（RFC 6891）+ try_send_to 优先，WouldBlock 回退异步
-/// Send UDP response: truncate oversized (RFC 6891), try non-blocking first, async fallback on WouldBlock
-async fn send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], peer: SocketAddr) {
-    // 截断超限响应，避免 UDP 报文超过客户端声明上限 / Truncate to the client's advertised UDP limit
-    let truncated = truncate_udp_response(request, response);
-    let response = truncated.as_deref().unwrap_or(response);
-    if let Err(error) = send_udp_datagram(socket, response, peer).await {
-        debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
-    }
+/// UDP 回答：超过客户端声明的上限就截断（RFC 6891）/ A UDP reply, cut to the client's advertised
+/// limit when over it (RFC 6891)
+fn udp_reply(request: &[u8], response: Bytes) -> Bytes {
+    truncate_udp_response(request, &response).unwrap_or(response)
 }
 
 /// 非阻塞发送 UDP 响应（过载保护路径）：截断 + 纯 try_send_to，WouldBlock 背压丢弃
@@ -862,12 +857,100 @@ fn try_send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], pe
     // WouldBlock: 发送缓冲满，丢弃（背压）/ send buffer full, drop (backpressure)
 }
 
-/// 异步发送 SERVFAIL（处理失败/超时路径）
-async fn send_udp_servfail(socket: &UdpSocket, request: &[u8], peer: SocketAddr) {
-    let Some(response) = engine_helpers::try_build_servfail_response_from_wire(request) else {
-        return;
-    };
-    send_udp_response(socket, request, &response, peer).await;
+/// 转发回来、等着和下一批一起发出去的回答。接收循环忙着的时候（它很快会回来收发下一批），转发完的任务把
+/// 回答放在这里，接收循环把它们和当场答出的回答拼进同一批，一次 sendmmsg 发出；接收循环在等新报文时，回答
+/// 直接发，不为一个回答把它叫醒。只有 Linux 的批量循环会说自己在忙，其他平台的回答都直接发。
+/// Replies back from a forward, waiting to go out with the next batch. While the receive loop is busy
+/// (it will soon be back to receive and send the next batch), a task done forwarding leaves its reply
+/// here, and the loop puts it in the same batch as the replies it gave on the spot, one sendmmsg for
+/// all; while the loop waits for datagrams the reply goes directly, without waking the loop for it.
+/// Only Linux's batched loop ever says it is busy; on other platforms every reply goes directly.
+struct PendingReplies {
+    queue: parking_lot::Mutex<Vec<(Bytes, SocketAddr)>>,
+    /// 接收循环在等新报文 / The receive loop is waiting for datagrams
+    idle: std::sync::atomic::AtomicBool,
+    /// 接收循环在等新报文时有回答放了进来 / A reply came in while the receive loop waited for datagrams
+    wake: tokio::sync::Notify,
+}
+
+impl Default for PendingReplies {
+    fn default() -> Self {
+        Self {
+            queue: parking_lot::Mutex::new(Vec::new()),
+            idle: std::sync::atomic::AtomicBool::new(true),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl PendingReplies {
+    /// 接收循环忙着时收下这个回答；它在等新报文时不收，返回 false，由调用方直接发
+    /// Takes the reply while the receive loop is busy; while it waits for datagrams the reply is
+    /// not taken and false comes back, for the caller to send it directly
+    fn try_queue(&self, reply: &Bytes, peer: SocketAddr) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.idle.load(SeqCst) {
+            return false;
+        }
+        self.queue_and_wake(reply, peer);
+        true
+    }
+
+    /// 放进队列。放进来的时候循环正好转去等待、可能没看到它，就叫醒它（见 `begin_wait`）
+    /// Queues the reply, and wakes the loop should it have turned to waiting just as the reply
+    /// came in, possibly without seeing it (see `begin_wait`)
+    fn queue_and_wake(&self, reply: &Bytes, peer: SocketAddr) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.queue.lock().push((reply.clone(), peer));
+        if self.idle.load(SeqCst) {
+            self.wake.notify_one();
+        }
+    }
+
+    /// 排着的回答按先后挪进 `replies`，直到这一批放满 / Moves queued replies into `replies` in order
+    /// until the batch is full
+    #[cfg(target_os = "linux")]
+    fn fill(&self, replies: &mut kixdns::socket_utils::udp_batch::Replies) {
+        use kixdns::socket_utils::udp_batch::Peer;
+        let mut queue = self.queue.lock();
+        let room = queue
+            .len()
+            .min(kixdns::socket_utils::udp_batch::BATCH - replies.len());
+        for (reply, peer) in queue.drain(..room) {
+            let buf = replies.next_buf();
+            buf.clear();
+            buf.extend_from_slice(&reply);
+            replies.push(Peer::of(peer));
+        }
+    }
+
+    /// 接收循环没有报文可收了：先把排着的回答发掉，再等新报文或者放进来的回答
+    /// The receive loop has nothing to receive: it sends the queued replies, then waits for a
+    /// datagram or a queued reply
+    #[cfg(target_os = "linux")]
+    async fn wait(
+        &self,
+        socket: &UdpSocket,
+        replies: &mut kixdns::socket_utils::udp_batch::Replies,
+    ) {
+        send_pending(socket, self, replies).await;
+        if self.begin_wait() {
+            tokio::select! {
+                _ = socket.readable() => {}
+                _ = self.wake.notified() => {}
+            }
+        }
+        self.idle.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 说自己在等，再看一眼队列：在这之前放进来的回答 `queue_and_wake` 不会叫醒循环。队列空着才可以睡
+    /// Says the loop waits, then looks at the queue once more: `queue_and_wake` wakes the loop for
+    /// nothing queued before this. The loop may sleep only when the queue is empty
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // 只有 Linux 的批量循环会等 / Only Linux's batched loop waits
+    fn begin_wait(&self) -> bool {
+        self.idle.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.queue.lock().is_empty()
+    }
 }
 
 /// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
@@ -891,6 +974,7 @@ async fn run_udp_worker(
 struct UdpAnswering<'a> {
     socket: &'a Arc<UdpSocket>,
     engine: &'a Arc<Engine>,
+    pending: &'a Arc<PendingReplies>,
     /// 自适应流控：每 100 个请求检查一次是否需要调整 permits / Adaptive flow control: check if adjustment needed every 100 requests
     request_count: u32,
 }
@@ -925,13 +1009,13 @@ impl UdpAnswering<'_> {
             Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                 // 缓存未命中，使用预解析的数据避免重复解析 / Cache miss, use pre-parsed data to avoid re-parsing
                 let packet = Bytes::copy_from_slice(packet);
-                spawn_udp_answer(self.engine, self.socket, packet, peer, Some(pre_parsed));
+                spawn_udp_answer(self, packet, peer, Some(pre_parsed));
                 return false;
             }
             Ok(None) => {
                 // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
                 let packet = Bytes::copy_from_slice(packet);
-                spawn_udp_answer(self.engine, self.socket, packet, peer, None);
+                spawn_udp_answer(self, packet, peer, None);
                 return false;
             }
             Err(error) => {
@@ -975,9 +1059,14 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
     let fd = socket.as_raw_fd();
     let mut received = Received::default();
     let mut replies = Replies::default();
+    let pending = Arc::new(PendingReplies::default());
+    pending
+        .idle
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     let mut answering = UdpAnswering {
         socket,
         engine,
+        pending: &pending,
         request_count: 0,
     };
     let mut received_in_row = 0;
@@ -985,9 +1074,10 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         match socket.try_io(Interest::READABLE, || received.recv(fd)) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                // 当前无包可读 — 让出 tokio / No packet available right now — yield to tokio
+                // 当前无包可读：先把排着的回答发掉，再等新报文或新回答 / Nothing to receive right now:
+                // send the queued replies, then wait for a datagram or a queued reply
                 received_in_row = 0;
-                let _ = socket.readable().await;
+                pending.wait(socket, &mut replies).await;
                 continue;
             }
             Err(_) => continue,
@@ -1000,13 +1090,34 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
                 replies.push(peer);
             }
         }
+        // 转发回来的回答搭上这一批，放不下的随后成批发 / Replies back from forwards ride along with this
+        // batch; what does not fit goes in batches right after
+        pending.fill(&mut replies);
         send_replies(socket, &replies).await;
         replies.clear();
+        send_pending(socket, &pending, &mut replies).await;
         received_in_row += received.len();
         if received_in_row >= RECEIVED_BEFORE_YIELD {
             received_in_row = 0;
             tokio::task::yield_now().await;
         }
+    }
+}
+
+/// 排着的回答成批发完 / Sends every queued reply, in batches
+#[cfg(target_os = "linux")]
+async fn send_pending(
+    socket: &UdpSocket,
+    pending: &PendingReplies,
+    replies: &mut kixdns::socket_utils::udp_batch::Replies,
+) {
+    loop {
+        pending.fill(replies);
+        if replies.is_empty() {
+            return;
+        }
+        send_replies(socket, replies).await;
+        replies.clear();
     }
 }
 
@@ -1051,9 +1162,13 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
     let mut buf = vec![0; 4096];
     // 复用发送缓冲区：缓存命中时在这里改 TTL 和 TXID，避免每包堆分配 / Reuse send buffer to patch TTLs and the TXID on cache hits, avoiding per-packet heap allocation
     let mut reply = BytesMut::with_capacity(512);
+    // 这个循环从不说自己在忙，转发回来的回答都直接发 / This loop never says it is busy, so replies
+    // back from forwards all go directly
+    let pending = Arc::new(PendingReplies::default());
     let mut answering = UdpAnswering {
         socket,
         engine,
+        pending: &pending,
         request_count: 0,
     };
     let mut received_in_row = 0;
@@ -1095,30 +1210,40 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
 /// be cheap, and a full parse of an already-failed packet wastes CPU, as hickory most
 /// likely fails too.
 fn spawn_udp_answer(
-    engine: &Arc<Engine>,
-    socket: &Arc<UdpSocket>,
+    answering: &UdpAnswering<'_>,
     packet: bytes::Bytes,
     peer: SocketAddr,
     pre_parsed: Option<PreParsedData>,
 ) {
-    let Some(permit) = engine.permit_manager.try_acquire() else {
+    let Some(permit) = answering.engine.permit_manager.try_acquire() else {
         if let Some(pre_parsed) = pre_parsed
             && let Ok(response) = pre_parsed.servfail(packet[2] & 0x01 != 0)
         {
-            try_send_udp_response(socket, &packet, &response, peer);
+            try_send_udp_response(answering.socket, &packet, &response, peer);
         }
         return;
     };
-    let engine = Arc::clone(engine);
-    let socket = Arc::clone(socket);
+    let engine = Arc::clone(answering.engine);
+    let socket = Arc::clone(answering.socket);
+    let pending = Arc::clone(answering.pending);
     tokio::spawn(async move {
         let _permit = permit; // 自动释放 / Auto-release on drop
-        match engine
+        // 答不上（处理失败、超时）回 SERVFAIL / SERVFAIL when no answer came (a failure, a timeout)
+        let response = match engine
             .answer_after_fast_path(&packet, peer, pre_parsed)
             .await
         {
-            Some(response) => send_udp_response(&socket, &packet, &response, peer).await,
-            None => send_udp_servfail(&socket, &packet, peer).await,
+            Some(response) => response,
+            None => match engine_helpers::try_build_servfail_response_from_wire(&packet) {
+                Some(servfail) => servfail,
+                None => return,
+            },
+        };
+        let response = udp_reply(&packet, response);
+        if !pending.try_queue(&response, peer)
+            && let Err(error) = send_udp_datagram(&socket, &response, peer).await
+        {
+            debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
         }
     });
 }
@@ -2490,7 +2615,8 @@ mod tests {
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             let (len, peer) = server.recv_from(&mut buf).await.unwrap();
-            send_udp_response(&server, &buf[..len], &big_response, peer).await;
+            let reply = udp_reply(&buf[..len], Bytes::from(big_response));
+            send_udp_datagram(&server, &reply, peer).await.unwrap();
         });
 
         client.send_to(&request, server_addr).await.unwrap();
@@ -2555,6 +2681,208 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// 要转发的查询在接收循环忙着时答完：回答排进队列、和下一批一起发出，每个客户端收到的正好是自己那些
+    /// 查询的回答。批量收发和一个一个收发的两种循环、单线程和多线程的运行时都这样
+    /// Forwarded queries answered while the receive loop is busy: the replies queue up and go out
+    /// with the next batch, and each client gets the answers to exactly its own queries. So with the
+    /// batched and the one-by-one loop, on a current-thread and a multi-thread runtime alike
+    #[tokio::test]
+    async fn forwarded_answers_reach_their_clients_while_the_loop_is_busy() {
+        forwarded_answers_reach_their_clients().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwarded_answers_reach_their_clients_on_several_threads() {
+        forwarded_answers_reach_their_clients().await;
+    }
+
+    async fn forwarded_answers_reach_their_clients() {
+        #[cfg(target_os = "linux")]
+        forwarded_answers_reach_their_clients_by(|server, engine| {
+            tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
+        })
+        .await;
+        forwarded_answers_reach_their_clients_by(|server, engine| {
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        })
+        .await;
+    }
+
+    async fn forwarded_answers_reach_their_clients_by(
+        receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
+    ) {
+        const CLIENTS: u16 = 4;
+        const PER_CLIENT: u16 = 100;
+        // 每个客户端最多同时等这么多个回答：几个客户端加起来装得进默认的接收缓冲，不会被内核丢掉，又足够让
+        // 接收循环一直有事做
+        // Each client waits for at most this many answers at once: all clients together fit in the
+        // default receive buffer, so the kernel drops none, and still keep the receive loop busy
+        const WINDOW: u16 = 16;
+        let upstream = spawn_answering_udp_upstream().await;
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = receive(
+            server,
+            engine_forwarding_to(upstream, serde_json::json!({})),
+        );
+        let clients: Vec<_> = (0..CLIENTS)
+            .map(|c| {
+                tokio::spawn(async move {
+                    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    // 名字各不相同：每个都要转发，不会命中缓存或者合并成一个 / Every name differs: each is
+                    // forwarded, none hits the cache or merges with another
+                    let ask = |id: u16| query(&format!("q{id}-c{c}.forwarded.test"), id);
+                    for id in 0..WINDOW {
+                        client.send_to(&ask(id), server_addr).await.unwrap();
+                    }
+                    let (mut sent, mut ids) = (WINDOW, Vec::new());
+                    let mut buf = [0u8; 512];
+                    while ids.len() < PER_CLIENT as usize {
+                        let (len, _) = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            client.recv_from(&mut buf),
+                        )
+                        .await
+                        .unwrap_or_else(|_| panic!("client {c} got only {} answers", ids.len()))
+                        .unwrap();
+                        let answer = Message::from_bytes(&buf[..len]).expect("an answer");
+                        assert_eq!(
+                            answer.queries[0].name().to_string(),
+                            format!("q{}-c{c}.forwarded.test.", answer.metadata.id),
+                            "client {c} got an answer to someone else's query"
+                        );
+                        assert_eq!(answer.answers.len(), 1, "the upstream's answer comes back");
+                        ids.push(answer.metadata.id);
+                        if sent < PER_CLIENT {
+                            client.send_to(&ask(sent), server_addr).await.unwrap();
+                            sent += 1;
+                        }
+                    }
+                    ids.sort_unstable();
+                    assert_eq!(ids, (0..PER_CLIENT).collect::<Vec<_>>(), "client {c}");
+                })
+            })
+            .collect();
+        for client in clients {
+            client.await.unwrap();
+        }
+        worker.abort();
+    }
+
+    /// 接收循环在等新报文时（其他平台一直如此）不收回答，由转发完的任务直接发
+    /// While the receive loop waits for datagrams (on other platforms, always) it takes no reply,
+    /// and the task done forwarding sends it directly
+    #[test]
+    fn a_waiting_loop_takes_no_replies() {
+        let pending = PendingReplies::default();
+        assert!(!pending.try_queue(
+            &Bytes::from_static(b"reply"),
+            "127.0.0.1:9".parse().unwrap()
+        ));
+        assert!(pending.queue.lock().is_empty());
+    }
+
+    /// 循环忙着时放进来的回答让它不睡：说完在等以后看一眼队列，还有回答就接着发
+    /// A reply queued while the loop is busy keeps it awake: once it has said it waits it looks at
+    /// the queue, and goes on sending while a reply is there
+    #[test]
+    fn a_reply_queued_while_the_loop_is_busy_keeps_it_awake() {
+        let pending = PendingReplies::default();
+        pending
+            .idle
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(pending.try_queue(
+            &Bytes::from_static(b"reply"),
+            "127.0.0.1:9".parse().unwrap()
+        ));
+        assert!(
+            !pending.begin_wait(),
+            "the loop must not sleep on a queued reply"
+        );
+    }
+
+    /// 循环刚说完在等，转发完的任务才放进回答（它看的时候循环还忙着）：这个回答叫醒循环
+    /// The loop has just said it waits when a task queues a reply (the loop was busy when the task
+    /// looked): that reply wakes the loop
+    #[tokio::test]
+    async fn a_reply_queued_as_the_loop_turns_to_waiting_wakes_it() {
+        let pending = PendingReplies::default();
+        pending
+            .idle
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            pending.begin_wait(),
+            "nothing queued yet: the loop may sleep"
+        );
+        pending.queue_and_wake(
+            &Bytes::from_static(b"reply"),
+            "127.0.0.1:9".parse().unwrap(),
+        );
+        tokio::time::timeout(Duration::from_millis(500), pending.wake.notified())
+            .await
+            .expect("the queued reply wakes the loop");
+    }
+
+    /// 接收循环转去等待之前，把排着的回答都发出去 / Before the receive loop turns to waiting, it
+    /// sends every queued reply
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_loop_sends_what_is_queued_before_it_waits() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pending = PendingReplies::default();
+        pending
+            .idle
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(pending.try_queue(
+            &Bytes::from_static(b"queued reply"),
+            client.local_addr().unwrap()
+        ));
+        let mut replies = kixdns::socket_utils::udp_batch::Replies::default();
+        // 没有新报文，这个等待不会自己结束 / With no datagram this wait never ends of itself
+        let _ = tokio::time::timeout(
+            Duration::from_millis(200),
+            pending.wait(&server, &mut replies),
+        )
+        .await;
+        let mut buf = [0u8; 64];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+            .await
+            .expect("the queued reply went out before the wait")
+            .unwrap();
+        assert_eq!(&buf[..len], b"queued reply");
+    }
+
+    /// 一次只问一个：接收循环在等新报文时回答直接发，正在转去等待时放进队列的回答也不会卡住
+    /// One query at a time: while the receive loop waits for datagrams the reply goes directly, and
+    /// a reply queued just as it turns to waiting does not get stuck
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lone_forwarded_answer_never_waits_in_the_queue() {
+        let upstream = spawn_answering_udp_upstream().await;
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let engine = Arc::new(engine_forwarding_to(upstream, serde_json::json!({})));
+        #[cfg(target_os = "linux")]
+        let worker = tokio::spawn(async move { receive_in_batches(&server, &engine).await });
+        #[cfg(not(target_os = "linux"))]
+        let worker = tokio::spawn(async move { receive_one_by_one(&server, &engine).await });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 512];
+        for id in 0..200u16 {
+            let name = format!("lone{id}.forwarded.test");
+            client
+                .send_to(&query(&name, id), server_addr)
+                .await
+                .unwrap();
+            let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("query {id} got no answer within a second"))
+                .unwrap();
+            assert_eq!(Message::from_bytes(&buf[..len]).unwrap().metadata.id, id);
+        }
+        worker.abort();
     }
 
     /// 本机上游，UDP 和 TCP 占同一个端口：收下查询、接下连接，从不回答
