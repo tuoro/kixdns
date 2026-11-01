@@ -115,6 +115,12 @@ pub async fn run_doh_with_listener(
                 continue;
             }
         };
+        // 和 DNS over TCP 一样关掉 Nagle：TLS 握手和应答都是几段小写入，开着 Nagle 时后一段要等对端的
+        // 延迟确认，新连接上第一个请求多等约 40 ms
+        // Nagle is turned off, as for DNS over TCP: the TLS handshake and the answers are a few
+        // small writes, and with Nagle on a later one waits for the peer's delayed ACK, adding
+        // about 40 ms to the first request on a new connection
+        stream.set_nodelay(true).ok();
         // Snapshot the current acceptor for this connection; in-flight
         // connections keep serving with the certificate they were established with.
         let acceptor = acceptor.load_full();
