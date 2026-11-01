@@ -147,6 +147,16 @@ impl<V: Cached> CacheStore<V> {
         }
     }
 
+    /// 写入 `key` 的值 / Store the value of `key`
+    pub fn insert(&self, key: u64, value: V) {
+        self.compute(key, |_| Op::Put(value));
+    }
+
+    /// 去掉 `key` / Remove `key`
+    pub fn remove(&self, key: u64) {
+        self.compute(key, |_| Op::Remove);
+    }
+
     /// 去掉所有条目 / Remove every entry
     pub fn invalidate_all(&self) {
         for shard in self.shards.iter() {
@@ -170,6 +180,22 @@ impl<V: Cached> CacheStore<V> {
                 shard.small_weight + shard.main_weight
             })
             .sum()
+    }
+
+    /// 测试用：存着的所有值 / For tests: every stored value
+    #[cfg(test)]
+    pub(crate) fn values(&self) -> Vec<V> {
+        self.shards
+            .iter()
+            .flat_map(|shard| {
+                let shard = shard.read();
+                shard
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.value.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// 测试用：每个分片的账都对得上 / For tests: every shard's books balance

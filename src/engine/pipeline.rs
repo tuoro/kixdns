@@ -25,7 +25,8 @@ use super::observation::{
 };
 use super::rules::Decision;
 use super::rules::{
-    RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, fast_hash_str, rule_cache_requester,
+    RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, fast_hash_str,
+    rule_cache_requester,
 };
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_answer};
@@ -208,7 +209,8 @@ impl Engine {
                 {
                     Some(Duration::from_secs(state.pipeline.settings.min_ttl as u64))
                 } else {
-                    None // Permanent
+                    // 只受 `RULE_CACHE_MAX_AGE` 限制 / Bounded by `RULE_CACHE_MAX_AGE` alone
+                    None
                 }
             }
             _ => {
@@ -224,7 +226,9 @@ impl Engine {
             return;
         }
 
-        let expires_at = ttl.map(|d| Instant::now() + d);
+        let now = Instant::now();
+        let longest = now + RULE_CACHE_MAX_AGE;
+        let expires_at = Some(ttl.map_or(longest, |ttl| (now + ttl).min(longest)));
 
         self.rule_cache.insert(
             hash,
@@ -291,12 +295,12 @@ impl Engine {
         let whole_pipeline = skip_rules.is_none_or(|set| set.is_empty());
         let allow_rule_cache_lookup = !skip_cache && whole_pipeline;
 
-        if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(&rule_hash) {
+        if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(rule_hash) {
             let entry = &record.entry;
             // Check validity and clean up if expired
             // 检查有效性，如果过期则清理
             if !entry.is_valid() {
-                self.rule_cache.remove(&rule_hash);
+                self.rule_cache.remove(rule_hash);
             } else if entry.matches(&pipeline.id, qname, qtype, qclass, &requester_key) {
                 if let Some((observer, ctx)) = request.observed {
                     report_rule_cache_hit(observer, ctx, &pipeline.id, &record, false);
@@ -616,11 +620,11 @@ mod observer_rule_cache_tests {
             .handle_packet(&query(), "127.0.0.1:53000".parse().unwrap())
             .await
             .expect("static answer");
-        engine.rule_cache.run_pending_tasks();
         engine
             .rule_cache
+            .values()
             .iter()
-            .map(|(_, record)| record.matched_rules.as_ref().map(|rules| rules.len()))
+            .map(|record| record.matched_rules.as_ref().map(|rules| rules.len()))
             .collect()
     }
 
@@ -730,11 +734,11 @@ mod continued_rule_cache_tests {
         );
 
         // 正常求值的决策照常缓存 / A decision from a normal evaluation is still cached
-        engine.rule_cache.run_pending_tasks();
         let cached: Vec<_> = engine
             .rule_cache
+            .values()
             .iter()
-            .map(|(_, record)| rule_of(&record.entry.decision).to_owned())
+            .map(|record| rule_of(&record.entry.decision).to_owned())
             .collect();
         assert_eq!(cached, ["first"]);
     }
@@ -747,11 +751,13 @@ mod continued_rule_cache_tests {
 /// computing it again is cheaper than storing an entry for every new name.
 #[cfg(test)]
 mod rule_cache_policy_tests {
+    use std::time::Instant;
+
     use hickory_proto::rr::{DNSClass, RecordType};
 
     use super::RuleEvaluationContext;
     use crate::engine::Engine;
-    use crate::engine::rules::Decision;
+    use crate::engine::rules::{Decision, RULE_CACHE_MAX_AGE};
     use crate::engine::test_support::engine_from;
 
     /// `plain` pipeline 只有后缀和 any 条件，`regex` pipeline 带正则条件
@@ -827,11 +833,11 @@ mod rule_cache_policy_tests {
             Decision::Forward { .. }
         ));
 
-        engine.rule_cache.run_pending_tasks();
         let mut kept: Vec<(String, &str)> = engine
             .rule_cache
+            .values()
             .iter()
-            .map(|(_, record)| {
+            .map(|record| {
                 let kind = match record.entry.decision.as_ref() {
                     Decision::Static { .. } => "static",
                     Decision::Forward { .. } => "forward",
@@ -849,6 +855,89 @@ mod rule_cache_policy_tests {
                 ("regex".to_owned(), "forward"),
             ]
         );
+    }
+
+    /// 本身不过期的决策（静态回答、没有应答阶段规则的转发）和 TTL 更长的跳转，在规则缓存里都只用
+    /// `RULE_CACHE_MAX_AGE`
+    /// Decisions that do not expire of themselves (static answers, forwards without
+    /// response-phase rules) and jumps with a longer TTL all serve from the rule cache for
+    /// `RULE_CACHE_MAX_AGE` at most
+    #[tokio::test]
+    async fn no_decision_outlives_the_rule_cache_max_age() {
+        let engine = engine_from(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [
+                {
+                    "id": "main",
+                    "rules": [
+                        {
+                            "name": "block",
+                            "matchers": [{ "type": "domain_suffix", "value": "ads.example" }],
+                            "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                        },
+                        {
+                            "name": "elsewhere",
+                            "matchers": [{ "type": "domain_suffix", "value": "jump.example" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
+                        },
+                        {
+                            // 有正则的 pipeline 才缓存转发和跳转 / Only a pipeline with regexes caches forwards and jumps
+                            "name": "www",
+                            "matchers": [{ "type": "domain_regex", "value": "^www\\." }],
+                            "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+                        },
+                        {
+                            "name": "rest",
+                            "matchers": [{ "type": "any" }],
+                            "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+                        }
+                    ]
+                },
+                {
+                    "id": "other",
+                    "rules": [{
+                        "name": "rest",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+                    }]
+                }
+            ]
+        }));
+        let state = engine.state.load_full();
+        let pipeline = &state.pipeline.pipelines[0];
+        assert!(pipeline.matches_regex);
+        let before = Instant::now();
+        for name in ["ads.example", "jump.example", "example.com"] {
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            engine.apply_rules(&state, pipeline, &request);
+        }
+        let after = Instant::now();
+
+        let mut kinds: Vec<&str> = Vec::new();
+        for record in engine.rule_cache.values() {
+            kinds.push(match record.entry.decision.as_ref() {
+                Decision::Static { .. } => "static",
+                Decision::Jump { .. } => "jump",
+                Decision::Forward { .. } => "forward",
+            });
+            let expires = record.entry.expires_at.expect("every decision expires");
+            assert!(
+                expires >= before + RULE_CACHE_MAX_AGE && expires <= after + RULE_CACHE_MAX_AGE,
+                "a {} decision serves {:?}",
+                kinds.last().unwrap(),
+                expires.saturating_duration_since(before)
+            );
+        }
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["forward", "jump", "static"]);
     }
 }
 

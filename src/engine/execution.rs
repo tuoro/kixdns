@@ -821,14 +821,14 @@ impl Engine {
                 qclass,
                 &rule_requester,
             );
-            if let Some(record) = self.rule_cache.get(&rule_hash) {
+            if let Some(record) = self.rule_cache.get(rule_hash) {
                 let entry = &record.entry;
                 // Check if entry is valid before using
                 // 在使用前检查条目是否有效
                 if !entry.is_valid() {
                     // Remove expired entry
                     // 删除过期条目
-                    self.rule_cache.remove(&rule_hash);
+                    self.rule_cache.remove(rule_hash);
                 } else if entry.matches(&pipeline_id, qname_str, qtype, qclass, &rule_requester)
                     && let Decision::Static { rcode, answers } = entry.decision.as_ref()
                 {
@@ -7288,7 +7288,7 @@ mod requester_scope_tests {
             DNSClass::IN,
             &RequesterKey::NONE,
         );
-        assert!(engine.rule_cache.get(&rule_key).is_some());
+        assert!(engine.rule_cache.get(rule_key).is_some());
     }
 
     /// 带着客户端 ECS 的转发之后，回答检查跳进另一个 pipeline：那里原样转发这个包，应答也

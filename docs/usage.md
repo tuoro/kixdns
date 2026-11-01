@@ -20,7 +20,7 @@ UDP 和 TCP 默认监听 0.0.0.0:5353，默认上游是 1.1.1.1:53。所有路�
 
 Release profile 设置 opt-level = 3、lto = fat、codegen-units = 1、panic = abort 和 strip = true。
 
-主要依赖包括 tokio、hickory-proto、serde、moka、dashmap、reqwest、tokio-rustls、quinn、maxminddb、notify、clap 和 tracing；具体版本以 Cargo.toml 和 Cargo.lock 为准。
+主要依赖包括 tokio、hickory-proto、serde、dashmap、reqwest、tokio-rustls、quinn、maxminddb、notify、clap 和 tracing；具体版本以 Cargo.toml 和 Cargo.lock 为准。
 
 ## 命令行
 

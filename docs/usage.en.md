@@ -20,7 +20,7 @@ The default listener addresses are UDP and TCP on 0.0.0.0:5353. The default upst
 
 The release profile sets opt-level = 3, lto = fat, codegen-units = 1, panic = abort, and strip = true.
 
-The main dependencies include tokio, hickory-proto, serde, moka, dashmap, reqwest, tokio-rustls, quinn, maxminddb, notify, clap, and tracing. The exact versions are defined by Cargo.toml and Cargo.lock.
+The main dependencies include tokio, hickory-proto, serde, dashmap, reqwest, tokio-rustls, quinn, maxminddb, notify, clap, and tracing. The exact versions are defined by Cargo.toml and Cargo.lock.
 
 ## Command line
 

@@ -1572,7 +1572,6 @@ async fn handle_request(
             let rule_entries_before = engine.rule_cache.entry_count();
             engine.cache.invalidate_all();
             engine.rule_cache.invalidate_all();
-            engine.rule_cache.run_pending_tasks();
             json_response(
                 StatusCode::OK,
                 json!({
