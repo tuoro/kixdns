@@ -996,7 +996,7 @@ impl Engine {
                     );
                     return Some(stale_bytes);
                 }
-                // Stale entry evicted by moka - fall through to normal processing
+                // No stale entry left in the cache - fall through to normal processing
             }
         }
 
@@ -2072,7 +2072,6 @@ mod tests {
             response.answers.first().map(|record| &record.data),
             Some(RData::A(address)) if address.0 == "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
         ));
-        engine.cache.run_pending_tasks();
         assert_eq!(
             engine.cache.entry_count(),
             0,

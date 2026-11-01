@@ -12,6 +12,7 @@ use rustc_hash::FxBuildHasher;
 
 use super::geo::GeoSources;
 use crate::cache::{CacheEntry, CacheSlot, CachedQuestion, DnsCache, new_cache};
+use crate::cache_store::Op;
 use crate::ecs_scope::EcsView;
 use crate::engine::refresh::RefreshTarget;
 use crate::lock::RwLock;
@@ -19,7 +20,6 @@ use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
-use moka::ops::compute::Op;
 
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::RuleCacheRecord;
@@ -175,8 +175,8 @@ impl Engine {
         listener_label: String,
         observer: Option<Arc<dyn EngineObserver>>,
     ) -> anyhow::Result<Self> {
-        // moka 缓存：容量由配置控制（默认 10000 条），最大生存时间由 cache_max_ttl 控制
-        // moka cache capacity and max TTL are configurable via settings
+        // 响应缓存：容量由配置控制（默认 10000 份应答），最大生存时间由 cache_max_ttl 控制
+        // Response cache: capacity and max age come from the settings
         let running_settings = Arc::new(cfg.settings.clone());
         let settings = Arc::clone(&running_settings);
         let cache = new_cache(settings.cache_capacity, settings.cache_max_ttl);
@@ -275,7 +275,7 @@ impl Engine {
 
         Ok(Self {
             state,
-            cache_max_age: cache.policy().time_to_live(),
+            cache_max_age: Some(Duration::from_secs(settings.cache_max_ttl)),
             cache,
             udp_client: Arc::new(
                 UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?,
@@ -332,7 +332,7 @@ impl Engine {
         question: &CachedQuestion<'_>,
         now: std::time::Instant,
     ) -> Option<Arc<CacheEntry>> {
-        self.cache.get(&slot)?.select(
+        self.cache.get(slot)?.select(
             view,
             |entry| question.matches(entry),
             self.cache_max_age,
@@ -342,16 +342,14 @@ impl Engine {
 
     /// 从槽位 `slot` 去掉 `remove` 选中的应答 / Remove from slot `slot` the answers `remove` picks
     pub(crate) fn cache_remove(&self, slot: u64, remove: impl Fn(&CacheEntry) -> bool) {
-        self.cache
-            .entry(slot)
-            .and_compute_with(|current| match current {
+        self.cache.compute(slot, |current| match current {
+            None => Op::Nop,
+            Some(current) => match current.without(&remove) {
                 None => Op::Nop,
-                Some(current) => match current.value().without(&remove) {
-                    None => Op::Nop,
-                    Some(rest) if rest.is_empty() => Op::Remove,
-                    Some(rest) => Op::Put(Arc::new(rest)),
-                },
-            });
+                Some(rest) if rest.is_empty() => Op::Remove,
+                Some(rest) => Op::Put(Arc::new(rest)),
+            },
+        });
     }
 
     /// 从槽位 `slot` 去掉这一份应答 / Remove this one answer from slot `slot`
@@ -366,15 +364,13 @@ impl Engine {
     /// slot's other answers alone.
     pub(crate) fn cache_replace(&self, slot: u64, old: &Arc<CacheEntry>, new: CacheEntry) {
         let new = Arc::new(new);
-        self.cache
-            .entry(slot)
-            .and_compute_with(|current| match current {
+        self.cache.compute(slot, |current| match current {
+            None => Op::Nop,
+            Some(current) => match current.replacing(old, new) {
                 None => Op::Nop,
-                Some(current) => match current.value().replacing(old, new) {
-                    None => Op::Nop,
-                    Some(slot) => Op::Put(Arc::new(slot)),
-                },
-            });
+                Some(slot) => Op::Put(Arc::new(slot)),
+            },
+        });
     }
 
     /// 去掉后台刷新发现已和规则对不上的条目：刷新的就是这个槽位时，去掉它要更新的那条；
@@ -420,24 +416,22 @@ impl Engine {
             qtype,
             flags,
         };
-        self.cache
-            .entry(target.slot)
-            .and_compute_with(|current| match current {
-                None => Op::Nop,
-                Some(current) => {
-                    match current.value().after_refresh(
-                        &question,
-                        &target.reach,
-                        target.fetched_at,
-                        written,
-                        target.started,
-                    ) {
-                        None => Op::Nop,
-                        Some(rest) if rest.is_empty() => Op::Remove,
-                        Some(rest) => Op::Put(Arc::new(rest)),
-                    }
+        self.cache.compute(target.slot, |current| match current {
+            None => Op::Nop,
+            Some(current) => {
+                match current.after_refresh(
+                    &question,
+                    &target.reach,
+                    target.fetched_at,
+                    written,
+                    target.started,
+                ) {
+                    None => Op::Nop,
+                    Some(rest) if rest.is_empty() => Op::Remove,
+                    Some(rest) => Op::Put(Arc::new(rest)),
                 }
-            });
+            }
+        });
     }
 
     /// 把一份应答存进槽位 `slot`（见 `CacheSlot::with`）。写入只经过这里和
@@ -446,9 +440,9 @@ impl Engine {
     /// here and `insert_dns_cache_entry` only.
     pub(crate) fn cache_insert(&self, slot: u64, entry: Arc<CacheEntry>) {
         let max_age = self.cache_max_age;
-        self.cache.entry(slot).and_compute_with(|current| {
+        self.cache.compute(slot, |current| {
             let slot = match current {
-                Some(current) => current.into_value().with(entry, max_age),
+                Some(current) => current.with(entry, max_age),
                 None => CacheSlot::default().with(entry, max_age),
             };
             Op::Put(Arc::new(slot))
@@ -459,7 +453,7 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn cached_entries(&self, slot: u64) -> Vec<Arc<CacheEntry>> {
         self.cache
-            .get(&slot)
+            .get(slot)
             .map(|slot| slot.entries().cloned().collect())
             .unwrap_or_default()
     }

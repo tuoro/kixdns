@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::cache_store::{CacheStore, Cached};
 use bytes::Bytes;
 use hickory_proto::op::ResponseCode;
-use moka::sync::Cache;
 use smallvec::SmallVec;
 
 use crate::ecs_scope::{EcsReach, EcsView};
@@ -286,18 +286,29 @@ impl CacheSlot {
 /// Use u64 hash as key to avoid allocation during lookup / 使用 u64 哈希作为键以避免查找时的内存分配
 ///  Slots and answers are behind `Arc`s, so a cache hit clones no entry fields
 ///  槽位和应答都在 `Arc` 后面，缓存命中不复制条目的字段
-pub type DnsCache = Cache<u64, Arc<CacheSlot>>;
+///  Engine 的副本共用同一个缓存 / Copies of the Engine share one cache
+pub type DnsCache = Arc<CacheStore<Arc<CacheSlot>>>;
 
-/// 创建带 TTL 的 DNS 缓存。容量按应答份数计：每个槽位按它存的应答份数计重。
-/// Create DNS cache with TTL. Capacity counts answers: each slot weighs as many
-/// as it holds.
+/// 每个槽位按它存的应答份数计重；里面的应答都存了 `max_age` 以上，整个槽位就不能再用了
+/// Each slot weighs as many answers as it holds; once every answer in it was stored
+/// `max_age` or longer ago, the whole slot is of no further use
+impl Cached for Arc<CacheSlot> {
+    fn weight(&self) -> u32 {
+        self.len().max(1) as u32
+    }
+
+    fn outlived(&self, max_age: Duration, now: Instant) -> bool {
+        self.entries()
+            .all(|entry| entry.outlived(Some(max_age), now))
+    }
+}
+
+/// 创建 DNS 缓存。容量按应答份数计；存了 `ttl_secs` 秒以上的应答不再用。
+/// Create the DNS cache. Capacity counts answers; answers stored `ttl_secs`
+/// seconds or longer ago are no longer used.
 #[inline]
 pub fn new_cache(max_capacity: u64, ttl_secs: u64) -> DnsCache {
-    Cache::builder()
-        .max_capacity(max_capacity)
-        .weigher(|_, slot: &Arc<CacheSlot>| slot.len().max(1) as u32)
-        .time_to_live(Duration::from_secs(ttl_secs))
-        .build()
+    Arc::new(CacheStore::new(max_capacity, Duration::from_secs(ttl_secs)))
 }
 
 #[cfg(test)]
