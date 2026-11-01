@@ -8,6 +8,10 @@ use quinn::{
     Connection as QuicConnection, Endpoint as QuicEndpoint, TransportConfig as QuicTransportConfig,
 };
 use reqwest::Client as DohHttpClient;
+
+use super::doh_h2::{self, H2Link};
+use http_body_util::Full;
+use hyper_util::client::legacy::connect::HttpConnector;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST, HeaderValue, RETRY_AFTER};
 use rustc_hash::FxBuildHasher;
 use rustls::pki_types::ServerName;
@@ -1738,21 +1742,39 @@ struct DohUpstream {
     /// 回了 429 以后暂停到什么时候，从 `DohClient::epoch` 起算的毫秒数；没暂停过是 0
     /// Until when a 429 paused it, in milliseconds from `DohClient::epoch`; 0 if it never was
     paused_until: AtomicU64,
-    /// 请求发往的 URL 和覆盖的 Host（见 [`build_doh_url`]）：第一次发请求时算好，之后每个请求直接用
-    /// The URL requests go to and the Host override (see [`build_doh_url`]): worked out at the
-    /// first send and taken as they are by every request after
-    target: std::sync::OnceLock<(Url, Option<String>)>,
+    /// 请求发往哪里（见 [`DohTarget`]）：第一次发请求时算好，之后每个请求直接用
+    /// Where requests go (see [`DohTarget`]): worked out at the first send and taken as it is by
+    /// every request after
+    target: std::sync::OnceLock<DohTarget>,
+    /// 握手时选了 h2 时直连用的 HTTP/2 连接（见 `doh_h2`）/ The HTTP/2 connection used directly when the upstream picked h2 in the handshake (see `doh_h2`)
+    h2: H2Link,
+}
+
+/// 一个 DoH 上游的请求发往哪里：URL、覆盖的 Host（见 [`build_doh_url`]），以及直连 HTTP/2 用的同一个
+/// 地址（hyper 的 Uri）
+/// Where a DoH upstream's requests go: the URL, the Host override (see [`build_doh_url`]), and
+/// the same address as a hyper Uri for the direct HTTP/2 connection
+struct DohTarget {
+    url: Url,
+    host_override: Option<String>,
+    /// 转不成 Uri 的 URL 只走 reqwest / A URL that does not convert to a Uri goes through reqwest only
+    uri: Option<hyper::Uri>,
 }
 
 impl DohUpstream {
-    /// `upstream` 的 URL 和覆盖的 Host；写错的 URL 每次都报同样的错，不记下来
-    /// `upstream`'s URL and Host override; a malformed URL gives the same error each time and is not kept
-    fn target(&self, upstream: &str) -> anyhow::Result<&(Url, Option<String>)> {
+    /// `upstream` 请求发往哪里；写错的 URL 每次都报同样的错，不记下来
+    /// Where `upstream`'s requests go; a malformed URL gives the same error each time and is not kept
+    fn target(&self, upstream: &str) -> anyhow::Result<&DohTarget> {
         if let Some(target) = self.target.get() {
             return Ok(target);
         }
-        let built = build_doh_url(upstream)?;
-        Ok(self.target.get_or_init(|| built))
+        let (url, host_override) = build_doh_url(upstream)?;
+        let uri = url.as_str().parse().ok();
+        Ok(self.target.get_or_init(|| DohTarget {
+            url,
+            host_override,
+            uri,
+        }))
     }
 }
 
@@ -1776,11 +1798,26 @@ pub struct DohClient {
     /// past. A merged forward looks at it first: with no upstream paused, the check costs
     /// this one load
     latest_pause_end: AtomicU64,
+    /// 直连 HTTP/2 用的 TLS 设置：握手时报 h2 和 http/1.1 / The TLS settings of the direct HTTP/2 connection: h2 and http/1.1 offered in the handshake
+    tls_h2: Arc<ClientConfig>,
+    /// 直连用的 TCP 连接器，设置和 reqwest 的一样 / The TCP connector of the direct connection, set up as reqwest's
+    connector: HttpConnector,
+    /// 握手时选了 h2 的上游是否直连：设了代理环境变量时不直连，全部照旧交给 reqwest（见 `doh_h2::proxy_configured`）
+    /// Whether an upstream that picked h2 is connected to directly: not with a proxy
+    /// environment variable set, when everything goes to reqwest as before (see `doh_h2::proxy_configured`)
+    direct_h2: bool,
+    /// 连接空闲多久就不再用（见 `doh_h2::DOH_IDLE_TIMEOUT`），测试里可以改短
+    /// How long a connection may sit idle before it is not used again (see
+    /// `doh_h2::DOH_IDLE_TIMEOUT`), shorter in some tests
+    idle_timeout: Duration,
     /// 测试里改走明文 http：引擎把 DoH 上游一律当 https，本机的假 DoH 上游只会说 http
     /// Plain http in tests: the engine takes every DoH upstream as https, and the local fake
     /// DoH upstream speaks http only
     #[cfg(test)]
     plain_http: AtomicBool,
+    /// 测试里另外信任的证书，直连和 reqwest 都认 / Certificates also trusted in tests, by the direct connection and reqwest alike
+    #[cfg(test)]
+    test_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl DohClient {
@@ -1795,9 +1832,51 @@ impl DohClient {
             last_prune_millis: AtomicU64::new(unix_time_millis()),
             epoch: std::time::Instant::now(),
             latest_pause_end: AtomicU64::new(0),
+            tls_h2: direct_tls_config(build_tls_client_config()?),
+            connector: doh_h2::tcp_connector(),
+            direct_h2: !doh_h2::proxy_configured(),
+            idle_timeout: doh_h2::DOH_IDLE_TIMEOUT,
             #[cfg(test)]
             plain_http: AtomicBool::new(false),
+            #[cfg(test)]
+            test_roots: Vec::new(),
         })
+    }
+
+    /// 测试里另外信任 `cert`：之后建的直连和 reqwest 客户端都认它 / In tests, also trust `cert`: the direct connections and reqwest clients built after accept it
+    #[cfg(test)]
+    pub(crate) fn trust_for_tests(&mut self, cert: rustls::pki_types::CertificateDer<'static>) {
+        let mut roots = RootCertStore::empty();
+        roots.extend(TLS_SERVER_ROOTS.iter().cloned());
+        self.test_roots.push(cert);
+        for root in &self.test_roots {
+            roots.add(root.clone()).expect("test root");
+        }
+        self.tls_h2 = direct_tls_config(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+    }
+
+    /// 测试里看 `upstream` 现在是不是经直连的 HTTP/2 连接问的 / In tests, whether `upstream` is asked over the direct HTTP/2 connection now
+    #[cfg(test)]
+    pub(crate) fn has_direct_connection(&self, upstream: &str) -> bool {
+        self.upstreams
+            .get(upstream)
+            .is_some_and(|state| state.h2.is_connected())
+    }
+
+    /// 测试里改短连接的空闲时限 / In tests, shorten how long a connection may sit idle
+    #[cfg(test)]
+    pub(crate) fn set_idle_timeout_for_tests(&mut self, idle: Duration) {
+        self.idle_timeout = idle;
+    }
+
+    /// 测试里关掉直连，全部走 reqwest，和设了代理时一样 / In tests, turn the direct connection off so everything goes through reqwest, as with a proxy set
+    #[cfg(test)]
+    pub(crate) fn reqwest_only_for_tests(&mut self) {
+        self.direct_h2 = false;
     }
 
     /// 之后的请求都走明文 http（见 `plain_http`）/ Later requests go over plain http (see `plain_http`)
@@ -1817,16 +1896,21 @@ impl DohClient {
     /// Build a fresh reqwest client. Used for both initial construction and pool
     /// rebuilds (the latter evicts dead/half-open connections).
     /// 构建新的 reqwest 客户端，用于初始构造和连接池重建（后者驱逐死/半开连接）
-    fn build_client(pool_max_idle_per_host: usize) -> anyhow::Result<DohHttpClient> {
-        DohHttpClient::builder()
+    fn build_client(&self) -> anyhow::Result<DohHttpClient> {
+        let builder = DohHttpClient::builder();
+        #[cfg(test)]
+        let builder = self.test_roots.iter().fold(builder, |builder, root| {
+            builder.add_root_certificate(reqwest::Certificate::from_der(root).expect("test root"))
+        });
+        builder
             // A DoH server has no reason to redirect, and following one could send
             // the query elsewhere, plain HTTP included; a 3xx fails like any other
             // non-success status
             // DoH 服务器没有理由跳转，跟着跳可能把查询发到别处，包括明文 HTTP；3xx 和别的非成功状态一样算失败
             .redirect(reqwest::redirect::Policy::none())
             .http2_adaptive_window(true)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(pool_max_idle_per_host.max(1))
+            .pool_idle_timeout(self.idle_timeout)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host.max(1))
             .build()
             .context("build doh http client")
     }
@@ -1859,11 +1943,12 @@ impl DohClient {
             }
             entry::Entry::Vacant(slot) => {
                 let state = Arc::new(DohUpstream {
-                    client: ArcSwap::from_pointee(Self::build_client(self.pool_max_idle_per_host)?),
+                    client: ArcSwap::from_pointee(self.build_client()?),
                     consecutive_errors: AtomicUsize::new(0),
                     last_used_millis: AtomicU64::new(now),
                     paused_until: AtomicU64::new(0),
                     target: std::sync::OnceLock::new(),
+                    h2: H2Link::new(self.idle_timeout),
                 });
                 slot.insert(Arc::clone(&state));
                 Ok(state)
@@ -1921,13 +2006,24 @@ impl DohClient {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         let state = self.upstream(upstream)?;
-        let (url, host_override) = state.target(upstream)?;
+        let target = state.target(upstream)?;
+        let url = &target.url;
         #[cfg(test)]
         let url = &self.scheme_for_tests(url.clone());
-        let host = host_override.as_deref();
+        let host = target.host_override.as_deref();
+        // 握手时选了 h2 的 https 上游直连（见 `doh_h2`）；明文 http、设了代理时照旧经 reqwest
+        // An https upstream that picks h2 in the handshake is connected to directly (see
+        // `doh_h2`); plain http, or a proxy set, goes through reqwest as before
+        let uri = target
+            .uri
+            .as_ref()
+            .filter(|_| self.direct_h2 && url.scheme() == "https");
 
         let start = tokio::time::Instant::now();
-        let result = match Self::send_once(&state, packet, url, host, timeout_dur).await {
+        let result = match self
+            .send_once(&state, packet, url, uri, host, timeout_dur)
+            .await
+        {
             Ok(bytes) => {
                 state.consecutive_errors.store(0, Ordering::Release);
                 return Ok(restore_query_id(packet, bytes));
@@ -1950,7 +2046,8 @@ impl DohClient {
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                Self::send_once(&state, packet, url, host, remaining).await
+                self.send_once(&state, packet, url, uri, host, remaining)
+                    .await
             }
             Err(e) => Err(e),
         };
@@ -2027,77 +2124,58 @@ impl DohClient {
     /// Single attempt: send the request and read the body within a timeout.
     /// 单次尝试：在超时内发送请求并读取响应体
     async fn send_once(
+        &self,
         state: &DohUpstream,
         packet: &[u8],
         url: &Url,
+        uri: Option<&hyper::Uri>,
         host_override: Option<&str>,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        // load_full() returns an owned Arc<Client>, keeping the Future Send across
-        // await points (an ArcSwap Guard would not). The Arc is cheap to hold.
-        // load_full() 返回 owned Arc<Client>，保持 Future 跨 await 点 Send
-        // （ArcSwap 的 Guard 不满足）。持有 Arc 很廉价。
-        let client = state.client.load_full();
-
-        let mut req = client
-            .post(url.clone())
-            .header(ACCEPT, DOH_MEDIA_TYPE)
-            .header(CONTENT_TYPE, DOH_MEDIA_TYPE)
-            .body(packet.to_vec());
-
-        if let Some(host) = host_override {
-            req = req.header(HOST, host);
-        }
-
         // Wrap entire operation (send + read body) in a single timeout to prevent
         // hanging if the server sends headers but delays the body.
         // 将整个操作（发送 + 读取响应体）包裹在单个超时中，
         // 防止服务器发送头信息但延迟响应体时挂起。
         let result = timeout(timeout_dur, async {
+            // 握手时选了 h2 的上游直接经 hyper 发，请求和 reqwest 发的一样：同样的方法、地址和头
+            // An upstream that picked h2 is asked straight through hyper, with the request
+            // reqwest would send: the same method, address and headers
+            if let Some(uri) = uri
+                && let Some(mut sender) =
+                    state.h2.sender(url, &self.tls_h2, &self.connector).await?
+            {
+                let mut request = hyper::Request::post(uri.clone())
+                    .header(ACCEPT, DOH_MEDIA_TYPE)
+                    .header(CONTENT_TYPE, DOH_MEDIA_TYPE);
+                if let Some(host) = host_override {
+                    request = request.header(HOST, host);
+                }
+                let request = request
+                    .body(Full::new(Bytes::copy_from_slice(packet)))
+                    .context("build doh request")?;
+                sender.ready().await.context("doh request send failed")?;
+                let resp = sender
+                    .send_request(request)
+                    .await
+                    .context("doh request send failed")?;
+                return doh_answer(packet, resp).await;
+            }
+
+            // load_full() returns an owned Arc<Client>, keeping the Future Send across
+            // await points (an ArcSwap Guard would not). The Arc is cheap to hold.
+            // load_full() 返回 owned Arc<Client>，保持 Future 跨 await 点 Send
+            // （ArcSwap 的 Guard 不满足）。持有 Arc 很廉价。
+            let client = state.client.load_full();
+            let mut req = client
+                .post(url.clone())
+                .header(ACCEPT, DOH_MEDIA_TYPE)
+                .header(CONTENT_TYPE, DOH_MEDIA_TYPE)
+                .body(packet.to_vec());
+            if let Some(host) = host_override {
+                req = req.header(HOST, host);
+            }
             let resp = req.send().await.context("doh request send failed")?;
-
-            let status = resp.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                // 服务器嫌问得太快。和别的错误状态一样不重试，另外记下它要等多久
-                // The server finds the queries too fast. No retry, as for any error status,
-                // and note how long it wants a wait
-                return Err(anyhow::Error::new(DohAnswerError {
-                    message: format!("doh http status {status}"),
-                    throttle: Some(throttle_after(resp.headers().get(RETRY_AFTER))),
-                }));
-            }
-            if !status.is_success() {
-                // Wrap as DohAnswerError so the caller knows the connection is
-                // fine and a retry won't help.
-                // 包装为 DohAnswerError，让调用方知道连接正常、重试无益
-                return Err(doh_answer_error(format!("doh http status {status}")));
-            }
-            // Anything but a DNS message (a captive portal's HTML page, say) is
-            // not an answer
-            // 不是 DNS 消息的（比如强制门户的 HTML 页面）不算回答
-            let media_type = resp
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(';').next())
-                .map(str::trim);
-            if !media_type.is_some_and(|media| media.eq_ignore_ascii_case(DOH_MEDIA_TYPE)) {
-                return Err(doh_answer_error(format!(
-                    "doh answer is not {DOH_MEDIA_TYPE} but {}",
-                    media_type.unwrap_or("untyped")
-                )));
-            }
-
-            let body = read_doh_body(resp).await?;
-            // RFC 5452 §9.1, as on the other transports: the answer has to be for
-            // this question
-            // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
-            if !crate::proto_utils::answers_query(packet, &body) {
-                return Err(doh_answer_error(
-                    "doh reply does not answer the query".to_string(),
-                ));
-            }
-            Ok(body)
+            doh_answer(packet, hyper::Response::from(resp)).await
         })
         .await;
 
@@ -2117,12 +2195,15 @@ impl DohClient {
     fn record_error(&self, upstream: &str, state: &DohUpstream) -> bool {
         let count = state.consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
         if self.health_error_threshold > 0 && count >= self.health_error_threshold {
-            match Self::build_client(self.pool_max_idle_per_host) {
+            match self.build_client() {
                 Ok(new_client) => {
                     // Swap in a fresh client; the old pool is released once in-flight
-                    // requests holding a cloned Arc finish.
-                    // 替换为新客户端；旧池在持有 Arc 副本的在途请求结束后释放
+                    // requests holding a cloned Arc finish. The direct HTTP/2 connection
+                    // goes too, and the next request connects again
+                    // 替换为新客户端；旧池在持有 Arc 副本的在途请求结束后释放。直连的 HTTP/2
+                    // 连接也一起丢掉，下一个请求重新连
                     state.client.store(Arc::new(new_client));
+                    state.h2.reset();
                     warn!(
                         upstream = upstream,
                         consecutive_errors = count,
@@ -2154,7 +2235,7 @@ impl DohClient {
 
     /// [`Self::record_error`] for `upstream` by its name / 按名字找到 `upstream` 再 [`Self::record_error`]
     #[cfg(test)]
-    fn record_error_of(&self, upstream: &str) -> bool {
+    pub(crate) fn record_error_of(&self, upstream: &str) -> bool {
         let state = self.upstream(upstream).expect("doh upstream state");
         self.record_error(upstream, &state)
     }
@@ -2191,28 +2272,92 @@ fn restore_query_id(packet: &[u8], response: Bytes) -> Bytes {
 /// single answer.
 /// 读 DoH 回答的正文，最多一条 DNS 消息那么长。以前一个不停往回发的服务器发多少就收多少，直到请求超时，
 /// 一个回答就能占掉几个 GB。
-async fn read_doh_body(mut resp: reqwest::Response) -> anyhow::Result<Bytes> {
-    let Some(first) = resp.chunk().await.context("read doh response body")? else {
-        return Ok(Bytes::new());
-    };
+/// 上游的 HTTP 应答里的 DNS 回答。直连 HTTP/2 和 reqwest 两种发法的应答都在这里检查：429 记下暂停多久，
+/// 别的错误状态、不是 DNS 消息的媒体类型、太长的正文、答的不是这个问题，都算用不了的回答
+/// The DNS answer in an upstream's HTTP response. Responses to both ways of sending, the direct
+/// HTTP/2 connection and reqwest, are checked here: a 429 notes how long to pause, and any other
+/// error status, a media type other than a DNS message, a body too long, or an answer to another
+/// question is an unusable answer
+async fn doh_answer<B>(packet: &[u8], resp: hyper::Response<B>) -> anyhow::Result<Bytes>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let status = resp.status();
+    if status == hyper::StatusCode::TOO_MANY_REQUESTS {
+        // 服务器嫌问得太快。和别的错误状态一样不重试，另外记下它要等多久
+        // The server finds the queries too fast. No retry, as for any error status,
+        // and note how long it wants a wait
+        return Err(anyhow::Error::new(DohAnswerError {
+            message: format!("doh http status {status}"),
+            throttle: Some(throttle_after(resp.headers().get(RETRY_AFTER))),
+        }));
+    }
+    if !status.is_success() {
+        // Wrap as DohAnswerError so the caller knows the connection is
+        // fine and a retry won't help.
+        // 包装为 DohAnswerError，让调用方知道连接正常、重试无益
+        return Err(doh_answer_error(format!("doh http status {status}")));
+    }
+    // Anything but a DNS message (a captive portal's HTML page, say) is
+    // not an answer
+    // 不是 DNS 消息的（比如强制门户的 HTML 页面）不算回答
+    let media_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !media_type.is_some_and(|media| media.eq_ignore_ascii_case(DOH_MEDIA_TYPE)) {
+        return Err(doh_answer_error(format!(
+            "doh answer is not {DOH_MEDIA_TYPE} but {}",
+            media_type.unwrap_or("untyped")
+        )));
+    }
+
+    let body = read_doh_body(resp.into_body()).await?;
+    // RFC 5452 §9.1, as on the other transports: the answer has to be for
+    // this question
+    // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
+    if !crate::proto_utils::answers_query(packet, &body) {
+        return Err(doh_answer_error(
+            "doh reply does not answer the query".to_string(),
+        ));
+    }
+    Ok(body)
+}
+
+async fn read_doh_body<B>(mut body: B) -> anyhow::Result<Bytes>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    use http_body_util::BodyExt;
+
     // An answer usually arrives in one piece, handed on as it is
     // 回答一般一块就到齐，那时原样交出
-    let mut length = first.len();
+    let mut first: Option<Bytes> = None;
     let mut joined: Option<BytesMut> = None;
-    loop {
+    let mut length = 0;
+    while let Some(frame) = body.frame().await {
+        // 尾部字段（trailers）不是正文 / Trailers are no part of the body
+        let Ok(chunk) = frame.context("read doh response body")?.into_data() else {
+            continue;
+        };
+        length += chunk.len();
         if length > MAX_DNS_MESSAGE_SIZE {
             return Err(doh_answer_error(format!(
                 "doh answer longer than {MAX_DNS_MESSAGE_SIZE} bytes"
             )));
         }
-        let Some(chunk) = resp.chunk().await.context("read doh response body")? else {
-            return Ok(joined.map_or(first, BytesMut::freeze));
-        };
-        length += chunk.len();
-        joined
-            .get_or_insert_with(|| BytesMut::from(first.as_ref()))
-            .extend_from_slice(&chunk);
+        match &first {
+            None => first = Some(chunk),
+            Some(first) => joined
+                .get_or_insert_with(|| BytesMut::from(first.as_ref()))
+                .extend_from_slice(&chunk),
+        }
     }
+    Ok(joined.map_or_else(|| first.unwrap_or_default(), BytesMut::freeze))
 }
 
 /// A transport-level error is anything that is NOT an unusable answer (see
@@ -2329,6 +2474,14 @@ fn build_tls_client_config() -> anyhow::Result<ClientConfig> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
     Ok(config)
+}
+
+/// 直连 DoH 上游用的 TLS 设置：`base` 再加上握手时报 h2 和 http/1.1，和 reqwest 一样
+/// The TLS settings for a direct DoH connection: `base` with h2 and http/1.1 offered in the
+/// handshake, as reqwest offers them
+fn direct_tls_config(mut base: ClientConfig) -> Arc<ClientConfig> {
+    base.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Arc::new(base)
 }
 
 fn build_server_name(name: &str) -> anyhow::Result<ServerName<'static>> {
