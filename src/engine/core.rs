@@ -6,13 +6,12 @@ use std::time::Duration;
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
-use moka::sync::Cache;
 use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 
 use super::geo::GeoSources;
 use crate::cache::{CacheEntry, CacheSlot, CachedQuestion, DnsCache, new_cache};
-use crate::cache_store::Op;
+use crate::cache_store::{CacheStore, Op};
 use crate::ecs_scope::EcsView;
 use crate::engine::refresh::RefreshTarget;
 use crate::lock::RwLock;
@@ -22,7 +21,7 @@ use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
 
 use super::concurrency::{FlowControlState, PermitManager};
-use super::rules::RuleCacheRecord;
+use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheRecord};
 use super::transport::{DohClient, DoqClient, DotMultiplexer, TcpMultiplexer, UdpClient};
 use super::types::{EngineInner, InflightMap};
 
@@ -59,7 +58,7 @@ pub struct Engine {
     pub(crate) reload_lock: Arc<Mutex<GeoSources>>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
-    pub(crate) rule_cache: Cache<u64, RuleCacheRecord>,
+    pub(crate) rule_cache: Arc<CacheStore<RuleCacheRecord>>,
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
     /// In-flight request deduplication map using tokio::watch for lock-free concurrent waiting
@@ -180,12 +179,9 @@ impl Engine {
         let running_settings = Arc::new(cfg.settings.clone());
         let settings = Arc::clone(&running_settings);
         let cache = new_cache(settings.cache_capacity, settings.cache_max_ttl);
-        // Rule cache: 10k entries, long default TTL (managed manually per-entry)
-        // 规则缓存：1万条，默认长 TTL（通过条目内部 expires_at 手动管理）
-        let rule_cache = Cache::builder()
-            .max_capacity(10_000)
-            .time_to_live(Duration::from_secs(60))
-            .build();
+        // 规则缓存：1 万条，每条按自己的 expires_at 过期（见 `RULE_CACHE_MAX_AGE`）
+        // Rule cache: 10k entries, each expiring at its own expires_at (see `RULE_CACHE_MAX_AGE`)
+        let rule_cache = Arc::new(CacheStore::new(10_000, RULE_CACHE_MAX_AGE));
 
         let geoip_manager = Arc::new(RwLock::new(
             GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed"),

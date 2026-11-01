@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 use super::observation::{Observed, report_response_decision, report_response_rule};
+use crate::cache_store::Cached;
 use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
 use crate::engine::matcher_adapter::log_match;
@@ -168,6 +169,26 @@ pub struct RuleCacheRecord {
     pub decided_by_rule: bool,
 }
 
+/// 规则缓存里的决策最多用这么久，不论决策本身的 TTL：键不随 GeoIP/GeoSite 数据更新而变，靠它限制
+/// 按旧数据做的决策还能用多久
+/// The longest a rule cache decision serves, whatever its own TTL: the key does not
+/// change when GeoIP/GeoSite data updates, so this bounds how long a decision made on
+/// the old data goes on serving
+pub(crate) const RULE_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// 每条记录计重 1；`expires_at` 已经含了 `RULE_CACHE_MAX_AGE`，按它判断过期
+/// Each record weighs 1; `expires_at` already includes `RULE_CACHE_MAX_AGE`, so it
+/// decides when a record is outlived
+impl Cached for RuleCacheRecord {
+    fn weight(&self) -> u32 {
+        1
+    }
+
+    fn outlived(&self, _max_age: Duration, now: Instant) -> bool {
+        !self.entry.is_valid_at(now)
+    }
+}
+
 impl RuleCacheEntry {
     pub fn new(
         pipeline_id: Arc<str>,
@@ -219,11 +240,13 @@ impl RuleCacheEntry {
     /// 检查条目是否仍然有效（未过期）
     #[inline]
     pub fn is_valid(&self) -> bool {
-        if let Some(expires) = self.expires_at {
-            Instant::now() <= expires
-        } else {
-            true // No expiration = permanent
-        }
+        self.is_valid_at(Instant::now())
+    }
+
+    /// 在 `now` 这一刻还有效 / Still valid at `now`
+    #[inline]
+    pub fn is_valid_at(&self, now: Instant) -> bool {
+        self.expires_at.is_none_or(|expires| now <= expires)
     }
 }
 
