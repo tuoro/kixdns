@@ -953,6 +953,14 @@ impl UdpAnswering<'_> {
     }
 }
 
+/// 接收循环连着收到这么多个报文、socket 一直没空过，就让出一次线程。socket 里有包时非阻塞接收一直成功，
+/// 循环从不 await；不让出的话，同一线程上要等上游的查询和上游回答的接收就轮不到，过载时转发全停
+/// After this many datagrams in a row without the socket running empty, a receive loop yields its
+/// thread once. While the socket holds datagrams the non-blocking receive keeps succeeding and the loop
+/// never awaits; without the yield the queries waiting on an upstream and the readers of upstream
+/// answers on the same thread never run, and under overload forwarding stops altogether
+const RECEIVED_BEFORE_YIELD: usize = 32;
+
 /// Linux：一次系统调用收一批、回一批（recvmmsg / sendmmsg）。满负荷时省下每个报文各自进出内核的那一趟；
 /// 空闲时一批只有一个，和单收单发一样。没有报文时让出 tokio，worker 不空转。
 /// Linux: one system call takes a batch and one sends the replies (recvmmsg / sendmmsg). Under full load
@@ -972,11 +980,13 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         engine,
         request_count: 0,
     };
+    let mut received_in_row = 0;
     loop {
         match socket.try_io(Interest::READABLE, || received.recv(fd)) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 // 当前无包可读 — 让出 tokio / No packet available right now — yield to tokio
+                received_in_row = 0;
                 let _ = socket.readable().await;
                 continue;
             }
@@ -992,6 +1002,11 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         }
         send_replies(socket, &replies).await;
         replies.clear();
+        received_in_row += received.len();
+        if received_in_row >= RECEIVED_BEFORE_YIELD {
+            received_in_row = 0;
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -1041,11 +1056,13 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         engine,
         request_count: 0,
     };
+    let mut received_in_row = 0;
     loop {
         let (len, peer) = match socket.try_recv_from(&mut buf) {
             Ok(result) => result,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 当前无包可读 — 让出 tokio / No packet available right now — yield to tokio
+                received_in_row = 0;
                 match socket.recv_from(&mut buf).await {
                     Ok(result) => result,
                     Err(_) => continue,
@@ -1057,6 +1074,11 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
             && let Err(error) = send_udp_datagram(socket, &reply, peer).await
         {
             debug!(%peer, %error, response_len = reply.len(), "failed to send UDP response");
+        }
+        received_in_row += 1;
+        if received_in_row >= RECEIVED_BEFORE_YIELD {
+            received_in_row = 0;
+            tokio::task::yield_now().await;
         }
     }
 }
@@ -1617,6 +1639,68 @@ mod tests {
             tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
         })
         .await;
+    }
+
+    /// 排着的报文比一批多时，接收循环收一批就让出一次线程：同一线程上别的任务（要等上游的查询、上游回答的
+    /// 接收）不必等排着的全收完才能跑。两种循环都这样
+    /// With more datagrams queued than one batch, the receive loop yields its thread after each batch:
+    /// other tasks on the same thread (queries waiting on an upstream, the readers of upstream answers)
+    /// need not wait until the whole queue is received. Both loops do so
+    #[tokio::test]
+    async fn receive_loop_yields_while_datagrams_are_queued() {
+        #[cfg(target_os = "linux")]
+        yields_while_datagrams_are_queued(|server, engine| {
+            tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
+        })
+        .await;
+        yields_while_datagrams_are_queued(|server, engine| {
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        })
+        .await;
+    }
+
+    async fn yields_while_datagrams_are_queued(
+        receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
+    ) {
+        const QUEUED: usize = 4 * RECEIVED_BEFORE_YIELD;
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 循环开始前查询全排进服务端 socket；静态规则当场回答，回答在下一次让出前就到了客户端
+        // Every query is queued in the server socket before the loop starts; the static rule answers on
+        // the spot, so the answers reach the client before the loop next yields
+        for id in 0..QUEUED as u16 {
+            client
+                .send_to(&query("data.xiaoheihe.cn", id), server_addr)
+                .await
+                .unwrap();
+        }
+        let worker = receive(server, static_engine());
+
+        // 这个测试本身就是同一线程上的别的任务：每轮取走已经到的回答，记下一轮最多取到几个
+        // This test is itself the other task on the thread: each turn it takes the answers that have
+        // arrived, noting the most taken in one turn
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 512];
+        let (mut answered, mut most_in_one_turn) = (0, 0);
+        while answered < QUEUED {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {answered} of {QUEUED} answered"
+            );
+            tokio::task::yield_now().await;
+            let mut this_turn = 0;
+            while client.try_recv_from(&mut buf).is_ok() {
+                this_turn += 1;
+            }
+            answered += this_turn;
+            most_in_one_turn = most_in_one_turn.max(this_turn);
+        }
+        worker.abort();
+        assert!(
+            most_in_one_turn <= 2 * RECEIVED_BEFORE_YIELD,
+            "{most_in_one_turn} of {QUEUED} queued answers came in one turn: the receive loop kept the thread"
+        );
     }
 
     /// 记录每个请求的客户端地址 / Records each request's client address
