@@ -1145,123 +1145,214 @@ const TCP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// unbounded number of tasks.
 const TCP_MAX_QUERIES_PER_CONN: usize = 64;
 
+/// 一次至少读这么多：流水线发来的几个查询一次读进来，不再每个查询读两次（长度前缀、正文）
+/// Each read asks for at least this much: queries pipelined together come in with one read,
+/// instead of two reads (length prefix, body) per query
+const TCP_READ_CHUNK: usize = 4096;
+
+/// 当场答好的回答攒到这么多就先写出去，不等这一批读完 / Answers made on the spot are written out
+/// once this much has gathered, without waiting for the rest of the batch
+const TCP_ANSWERS_FLUSH: usize = 16 * 1024;
+
+/// 从读进来的字节里取出下一个完整的消息（不带长度前缀）；还不完整时没有
+/// Takes the next complete message (without its length prefix) out of the bytes read; none
+/// while it is still incomplete
+fn take_tcp_message(received: &mut bytes::BytesMut) -> Option<bytes::Bytes> {
+    use bytes::Buf;
+
+    let len = u16::from_be_bytes(received.get(..2)?.try_into().ok()?) as usize;
+    if received.len() < 2 + len {
+        return None;
+    }
+    received.advance(2);
+    Some(received.split_to(len).freeze())
+}
+
+/// 当场答好的一个回答带上长度前缀排进 `answers`；放不进一个 TCP 消息的不发
+/// Queues one answer made on the spot into `answers` with its length prefix; one that does not
+/// fit a TCP message is not sent
+fn queue_tcp_answer(answers: &mut bytes::BytesMut, response: &[u8]) {
+    let Ok(len) = u16::try_from(response.len()) else {
+        return;
+    };
+    answers.extend_from_slice(&len.to_be_bytes());
+    answers.extend_from_slice(response);
+}
+
 async fn handle_tcp_conn(
     stream: TcpStream,
     peer: SocketAddr,
     engine: Engine,
 ) -> anyhow::Result<()> {
-    let engine = Arc::new(engine.with_client_transport(ClientTransport::Tcp));
-    const MAX_TCP_FRAME: usize = 64 * 1024;
-    let mut len_buf = [0u8; 2];
+    serve_tcp_conn(stream, peer, engine, TCP_READ_TIMEOUT).await
+}
 
-    // Reusable buffer to avoid per-frame heap allocation / 可复用缓冲区，避免每帧堆分配
-    // 使用 BytesMut 以支持零拷贝操作 / Use BytesMut for zero-copy operations
-    let mut buf = bytes::BytesMut::with_capacity(MAX_TCP_FRAME);
+/// 处理一条入站 TCP 连接；等下一个消息的长度前缀、等当前消息的正文，各最多 `read_timeout`（测试用短的）
+/// Handles one inbound TCP connection; waiting for the next message's length prefix, and for the
+/// current message's body, each take at most `read_timeout` (short in tests)
+async fn serve_tcp_conn(
+    stream: TcpStream,
+    peer: SocketAddr,
+    engine: Engine,
+    read_timeout: Duration,
+) -> anyhow::Result<()> {
+    let engine = Arc::new(engine.with_client_transport(ClientTransport::Tcp));
 
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let slots = Arc::new(tokio::sync::Semaphore::new(TCP_MAX_QUERIES_PER_CONN));
     let mut pending = tokio::task::JoinSet::<()>::new();
+    // 读进来还没处理的字节：一次读到的可能是好几个查询，也可能是半个
+    // Bytes read but not handled yet: one read may bring several queries, or half of one
+    let mut received = bytes::BytesMut::with_capacity(TCP_READ_CHUNK);
+    // 当场答好、还没写出去的回答，带着长度前缀；下一次读之前一次写出去
+    // Answers made on the spot, with their length prefixes, not yet written; written in one go
+    // before the next read
+    let mut answers = bytes::BytesMut::new();
+    // 复用的缓冲：缓存命中时在这里改 TTL 和 TXID / Reused buffer where a cache hit gets its TTLs and TXID patched
+    let mut hit = bytes::BytesMut::new();
+    // 正在等的是不是正文、等到什么时候：长度前缀和正文各有 read_timeout
+    // Whether a body is being waited for, and until when: the length prefix and the body
+    // each get read_timeout
+    let mut waiting: Option<(bool, tokio::time::Instant)> = None;
 
-    loop {
+    'connection: loop {
         // 收掉已经答完的 / Reap the ones already answered
         while pending.try_join_next().is_some() {}
-        // 空闲超时：不再读，还在处理的查询写完回答后关闭连接，释放任务与文件描述符；对方读到头或出错
-        // 同样结束
-        // Idle timeout: reading stops, and once the queries still being handled have written
-        // their answers the connection closes, releasing the task and the file descriptor;
-        // the peer's end of stream or an error ends it too.
-        if !matches!(
-            tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut len_buf)).await,
-            Ok(Ok(_))
-        ) {
-            break;
-        }
-        let frame_len = u16::from_be_bytes(len_buf) as usize;
-        if frame_len == 0 {
-            break;
-        }
 
-        // Reuse buffer: resize to exact frame length / 复用缓冲区：调整到精确帧长度
-        // resize() is safe and efficient - it only initializes new bytes if growing
-        buf.clear();
-        buf.resize(frame_len, 0);
-        // 半截消息同样受限，发送方停在长度前缀之后不会让连接一直挂着
-        // A half-sent message is bounded too: a sender that stops after the
-        // length prefix cannot keep the connection hanging.
-        if !matches!(
-            tokio::time::timeout(TCP_READ_TIMEOUT, reader.read_exact(&mut buf)).await,
-            Ok(Ok(_))
-        ) {
-            break;
-        }
-
-        let packet_bytes = buf.split().freeze();
-        if !is_standard_query_header(&packet_bytes) {
-            break;
-        }
-
-        // ✅ 优化：使用 handle_packet_fast 进行快速路径检查；当场能答的直接写回，要等上游的交给
-        // 单独的任务，答完就回
-        // ✅ Optimization: Use handle_packet_fast for fast path check; what it answers on the
-        // spot is written back at once, and what waits on an upstream goes to its own task,
-        // answered when done
-        let async_needed = match engine.handle_packet_fast(&packet_bytes, peer) {
-            Ok(Some(FastPathResponse::Direct(bytes))) => {
-                // 快速路径命中：直接返回 / Fast path hit: return directly
-                write_tcp_answer(&writer, &bytes).await;
-                continue;
+        // 读进来的完整消息一个个处理：当场能答的排进 answers，要等上游的交给单独的任务，答完就回
+        // Every complete message read is handled in turn: what is answered on the spot is
+        // queued in answers, and what waits on an upstream goes to its own task, answered when done
+        while let Some(packet_bytes) = take_tcp_message(&mut received) {
+            waiting = None;
+            if packet_bytes.is_empty() || !is_standard_query_header(&packet_bytes) {
+                break 'connection;
             }
-            Ok(Some(FastPathResponse::CacheHit {
-                cached,
-                tx_id,
-                inserted_at,
-            })) => {
-                let mut answer = bytes::BytesMut::new();
-                write_cache_hit(&mut answer, &cached, tx_id, inserted_at);
-                write_tcp_answer(&writer, &answer).await;
-                continue;
-            }
-            Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
-                // 缓存未命中：使用预解析数据避免重复解析
-                // Cache miss: use pre-parsed data to avoid re-parsing
-                Some(pre_parsed)
-            }
-            // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
-            Ok(None) => None,
-            Err(error) => {
-                engine.log_fast_path_error(&error);
-                if let Some(response) =
-                    engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
-                {
-                    write_tcp_answer(&writer, &response).await;
+            // ✅ 优化：使用 handle_packet_fast 进行快速路径检查 / ✅ Optimization: Use handle_packet_fast for fast path check
+            let async_needed = match engine.handle_packet_fast(&packet_bytes, peer) {
+                Ok(Some(FastPathResponse::Direct(bytes))) => {
+                    queue_tcp_answer(&mut answers, &bytes);
+                    None
                 }
+                Ok(Some(FastPathResponse::CacheHit {
+                    cached,
+                    tx_id,
+                    inserted_at,
+                })) => {
+                    write_cache_hit(&mut hit, &cached, tx_id, inserted_at);
+                    queue_tcp_answer(&mut answers, &hit);
+                    None
+                }
+                // 缓存未命中：使用预解析数据避免重复解析 / Cache miss: use pre-parsed data to avoid re-parsing
+                Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => Some(Some(pre_parsed)),
+                // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
+                Ok(None) => Some(None),
+                Err(error) => {
+                    engine.log_fast_path_error(&error);
+                    if let Some(response) =
+                        engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                    {
+                        queue_tcp_answer(&mut answers, &response);
+                    }
+                    None
+                }
+            };
+            if answers.len() >= TCP_ANSWERS_FLUSH {
+                write_tcp_answers(&writer, &mut answers).await;
+            }
+            let Some(pre_parsed) = async_needed else {
                 continue;
-            }
-        };
+            };
 
-        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
-            break;
-        };
-        let engine = Arc::clone(&engine);
-        let writer = Arc::clone(&writer);
-        pending.spawn(async move {
-            let _slot = slot;
-            let answer = engine
-                .answer_after_fast_path(&packet_bytes, peer, async_needed)
-                .await
-                .or_else(|| engine_helpers::try_build_servfail_response_from_wire(&packet_bytes));
-            if let Some(answer) = answer {
-                write_tcp_answer(&writer, &answer).await;
+            // 满了就先不读下一个；等之前把已经答好的写出去，它们不陪着等
+            // With all slots taken the next query is not read yet; what is already answered
+            // is written out first instead of waiting along
+            let slot = match Arc::clone(&slots).try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    write_tcp_answers(&writer, &mut answers).await;
+                    let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                        break 'connection;
+                    };
+                    slot
+                }
+            };
+            let engine = Arc::clone(&engine);
+            let writer = Arc::clone(&writer);
+            pending.spawn(async move {
+                let _slot = slot;
+                let answer = engine
+                    .answer_after_fast_path(&packet_bytes, peer, pre_parsed)
+                    .await
+                    .or_else(|| {
+                        engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                    });
+                if let Some(answer) = answer {
+                    write_tcp_answer(&writer, &answer).await;
+                }
+            });
+        }
+        write_tcp_answers(&writer, &mut answers).await;
+
+        // 读更多：至少要够把当前这个消息读完 / Read more: at least enough to finish the current message
+        let in_body = received.len() >= 2;
+        let deadline = match waiting {
+            Some((body, deadline)) if body == in_body => deadline,
+            _ => {
+                let deadline = tokio::time::Instant::now() + read_timeout;
+                waiting = Some((in_body, deadline));
+                deadline
             }
-        });
+        };
+        let missing = match received.get(..2) {
+            Some(prefix) => {
+                2 + u16::from_be_bytes([prefix[0], prefix[1]]) as usize - received.len()
+            }
+            None => 2 - received.len(),
+        };
+        received.reserve(missing.max(TCP_READ_CHUNK));
+        // 空闲超时、半截消息超时、对方读到头或出错：不再读，还在处理的查询写完回答后关闭连接，
+        // 释放任务与文件描述符
+        // Idle timeout, a half-sent message timing out, the peer's end of stream or an error:
+        // reading stops, and once the queries still being handled have written their answers
+        // the connection closes, releasing the task and the file descriptor
+        if !matches!(
+            tokio::time::timeout_at(deadline, reader.read_buf(&mut received)).await,
+            Ok(Ok(1..))
+        ) {
+            break;
+        }
     }
 
-    // 读完了：等还在处理的查询把回答写出去再关连接，半关闭的客户端照样拿到回答
-    // Reading is over: the queries still being handled write their answers before the
-    // connection closes, so a half-closed client still gets them
+    // 读完了：先把当场答好的写出去，再等还在处理的查询把回答写出去，然后关连接；半关闭的客户端照样拿到回答
+    // Reading is over: what was answered on the spot is written first, then the queries still
+    // being handled write their answers before the connection closes, so a half-closed client
+    // still gets them
+    write_tcp_answers(&writer, &mut answers).await;
     while pending.join_next().await.is_some() {}
     Ok(())
+}
+
+/// 把排好的回答一次写出去，和 [`write_tcp_answer`] 一样：写端加锁，不和别的回答穿插；写不出去或
+/// [`TCP_READ_TIMEOUT`] 内写不完时关掉写端
+/// Writes the queued answers in one go, like [`write_tcp_answer`]: under the writer's lock, so
+/// they cannot interleave with another answer; when they cannot be written, or not within
+/// [`TCP_READ_TIMEOUT`], the write side is shut
+async fn write_tcp_answers(
+    writer: &tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
+    answers: &mut bytes::BytesMut,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    if answers.is_empty() {
+        return;
+    }
+    let mut writer = writer.lock().await;
+    let written = tokio::time::timeout(TCP_READ_TIMEOUT, writer.write_all(answers)).await;
+    if !matches!(written, Ok(Ok(()))) {
+        let _ = writer.shutdown().await;
+    }
+    answers.clear();
 }
 
 /// 写回一个回答：长度前缀加正文一次写完，写端加锁，不会和别的回答穿插。写不出去或 [`TCP_READ_TIMEOUT`]
@@ -1966,6 +2057,194 @@ mod tests {
             .unwrap();
         let (stream, peer) = listener.accept().await.unwrap();
         (client, tokio::spawn(handle_tcp_conn(stream, peer, engine)))
+    }
+
+    /// 一次写进来的一串查询都答上，各带自己的 ID；当场答的攒在一起写回
+    /// A run of queries written in one go is answered in full, each with its own ID; the answers
+    /// made on the spot are written back together
+    #[tokio::test]
+    async fn queries_written_together_are_all_answered() {
+        let (mut client, _server) = tcp_connection(static_engine()).await;
+        let frames: Vec<u8> = (0..200u16)
+            .flat_map(|id| tcp_frame(&format!("q{id}.example."), id))
+            .collect();
+        client.write_all(&frames).await.unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..200 {
+            let answer = read_tcp_answer(&mut client).await;
+            let message = Message::from_bytes(&answer).unwrap();
+            assert_eq!(
+                message.queries[0].name().to_string(),
+                format!("q{}.example.", message.metadata.id)
+            );
+            ids.push(message.metadata.id);
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..200).collect::<Vec<_>>());
+    }
+
+    /// 消息拆成几段到，长度前缀也拆开，照样答；拆开的段之间不超时
+    /// A message arriving in pieces, its length prefix split too, is still answered; the pieces
+    /// do not time out between them
+    #[tokio::test]
+    async fn a_message_in_pieces_is_answered() {
+        let (mut client, _server) = tcp_connection(static_engine()).await;
+        let frame = tcp_frame("pieces.example.", 7);
+        for piece in [&frame[..1], &frame[1..2], &frame[2..9], &frame[9..]] {
+            client.write_all(piece).await.unwrap();
+            client.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(read_answer_id(&mut client).await, 7);
+        // 下一个消息只差最后一个字节，跟在这个后面一起到 / The next message, all but its last byte, comes along with this one
+        let next = [tcp_frame("a.example.", 8), tcp_frame("b.example.", 9)].concat();
+        client.write_all(&next[..next.len() - 1]).await.unwrap();
+        assert_eq!(read_answer_id(&mut client).await, 8);
+        client.write_all(&next[next.len() - 1..]).await.unwrap();
+        assert_eq!(read_answer_id(&mut client).await, 9);
+    }
+
+    /// 比一次读的大小还长的消息照样读完，后面的查询照样答
+    /// A message longer than one read is still read whole, and the query after it is answered
+    #[tokio::test]
+    async fn a_message_longer_than_one_read_is_read_whole() {
+        let (mut client, _server) = tcp_connection(static_engine()).await;
+        let mut long = query("long.example.", 1);
+        long.resize(TCP_READ_CHUNK * 3 + 17, 0);
+        let frames = [
+            &(long.len() as u16).to_be_bytes()[..],
+            &long,
+            &tcp_frame("after.example.", 2),
+        ]
+        .concat();
+        client.write_all(&frames).await.unwrap();
+        // 多出来的字节让完整解析出错：回 SERVFAIL 或不回都行，后面那个一定要答
+        // The extra bytes make the full parse fail: a SERVFAIL or no answer is fine, the one after must be answered
+        loop {
+            let answer = read_tcp_answer(&mut client).await;
+            if u16::from_be_bytes([answer[0], answer[1]]) == 2 {
+                break;
+            }
+        }
+    }
+
+    /// 连接上的处理名额用满时，同一批里已经当场答好的不陪着等名额，先写回去
+    /// With every slot on the connection taken, what the same batch already answered on the spot
+    /// does not wait for a slot along with the rest and is written back first
+    #[tokio::test]
+    async fn answers_made_on_the_spot_do_not_wait_for_a_slot() {
+        const DELAY: Duration = Duration::from_millis(400);
+        let upstream = spawn_slow_udp_upstream(DELAY).await;
+        let (mut client, _server) = tcp_connection(slow_and_fast_engine(upstream)).await;
+        let slow = |i: usize| tcp_frame(&format!("q{i}.slow.test."), i as u16);
+        let mut frames: Vec<u8> = (0..TCP_MAX_QUERIES_PER_CONN).flat_map(slow).collect();
+        frames.extend(tcp_frame("a.fast.test.", 9999));
+        frames.extend(slow(TCP_MAX_QUERIES_PER_CONN));
+        let started = std::time::Instant::now();
+        client.write_all(&frames).await.unwrap();
+        assert_eq!(read_answer_id(&mut client).await, 9999);
+        assert!(
+            started.elapsed() < DELAY / 2,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 测试里的读超时，比 TCP_READ_TIMEOUT 短，几次超时一会儿就跑完 / The read timeout in tests,
+    /// shorter than TCP_READ_TIMEOUT, so several timeouts take little time
+    const SHORT_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// 连在 `engine` 上、读超时是 SHORT_READ_TIMEOUT 的一条入站 TCP 连接 / An inbound TCP connection
+    /// to `engine` with SHORT_READ_TIMEOUT as its read timeout
+    async fn tcp_connection_timing_out(
+        engine: Engine,
+    ) -> (TcpStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let server = tokio::spawn(serve_tcp_conn(stream, peer, engine, SHORT_READ_TIMEOUT));
+        (client, server)
+    }
+
+    /// 半截消息一点点地发也不能一直挂着：正文从开始等起总共一个读超时，中途到的字节不重新计时
+    /// A half-sent message trickled in bit by bit cannot hang on either: the body gets one read
+    /// timeout from when it was first waited for, and bytes arriving meanwhile do not restart it
+    #[tokio::test]
+    async fn a_trickled_message_still_times_out() {
+        let (client, server) = tcp_connection_timing_out(static_engine()).await;
+        let (_read, mut write) = client.into_split();
+        let frame = tcp_frame("trickle.example.", 1);
+        let started = std::time::Instant::now();
+        write.write_all(&frame[..4]).await.unwrap();
+        let trickle = tokio::spawn(async move {
+            for byte in &frame[4..frame.len() - 1] {
+                tokio::time::sleep(SHORT_READ_TIMEOUT / 4).await;
+                if write.write_all(std::slice::from_ref(byte)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::timeout(SHORT_READ_TIMEOUT * 3, server)
+            .await
+            .expect("the connection is closed")
+            .unwrap()
+            .unwrap();
+        let took = started.elapsed();
+        trickle.abort();
+        assert!(
+            took >= SHORT_READ_TIMEOUT && took < SHORT_READ_TIMEOUT + SHORT_READ_TIMEOUT / 4,
+            "took {took:?}"
+        );
+    }
+
+    /// 读超时管的是每次等：一直有查询进来的连接不会因为连了很久就被关掉，空下来以后才在一个读超时后关
+    /// The read timeout bounds each wait: a connection that keeps sending queries is not closed for
+    /// having lasted long, and closes one read timeout after it goes quiet
+    #[tokio::test]
+    async fn a_busy_connection_outlives_the_read_timeout() {
+        let (mut client, server) = tcp_connection_timing_out(static_engine()).await;
+        let started = std::time::Instant::now();
+        for id in 0..4 {
+            client
+                .write_all(&tcp_frame("busy.example.", id))
+                .await
+                .unwrap();
+            assert_eq!(read_answer_id(&mut client).await, id);
+            tokio::time::sleep(SHORT_READ_TIMEOUT * 3 / 5).await;
+        }
+        let quiet = started.elapsed();
+        assert!(quiet > SHORT_READ_TIMEOUT * 2, "took {quiet:?}");
+        tokio::time::timeout(SHORT_READ_TIMEOUT * 2, server)
+            .await
+            .expect("the quiet connection is closed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// 长度为 0 的消息结束连接，但它前面一起到的查询照样拿到回答
+    /// A zero-length message ends the connection, yet the queries that came before it in the same
+    /// read still get their answers
+    #[tokio::test]
+    async fn a_zero_length_message_ends_the_connection_after_the_answers_before_it() {
+        let (mut client, server) = tcp_connection(static_engine()).await;
+        let frames = [
+            tcp_frame("a.example.", 1),
+            tcp_frame("b.example.", 2),
+            vec![0, 0],
+        ]
+        .concat();
+        client.write_all(&frames).await.unwrap();
+        assert_eq!(read_answer_id(&mut client).await, 1);
+        assert_eq!(read_answer_id(&mut client).await, 2);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+            .await
+            .expect("the connection closes")
+            .unwrap();
+        assert!(rest.is_empty());
+        server.await.unwrap().unwrap();
     }
 
     /// 同一条连接上，快查询不等它前面的慢查询，答完就回（RFC 7766 第 6.2.1.1 节）。此前一个接一个地
