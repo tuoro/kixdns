@@ -231,6 +231,8 @@ Inbound DoH is disabled unless settings.bind_doh is set. When it is set, setting
 
 The inbound DoH handler:
 
+- speaks HTTP/2 and HTTP/1.1: a client that picks h2 in the TLS handshake gets HTTP/2, with up to 100 requests handled at once on one connection; a client that only speaks HTTP/1.1, or sends no ALPN, keeps HTTP/1.1;
+- closes a connection idle for 10 seconds (nothing being handled and nothing new coming), under either HTTP version;
 - accepts POST requests at the configured path and reads a DNS wire message body;
 - accepts GET requests at the configured path with a dns base64url-without-padding query parameter;
 - rejects DNS bodies larger than 64 KiB;

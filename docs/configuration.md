@@ -231,6 +231,8 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 
 入站 DoH 处理器：
 
+- 支持 HTTP/2 和 HTTP/1.1：TLS 握手时客户端选了 h2 就用 HTTP/2，一条连接上最多同时处理 100 个请求；只会 HTTP/1.1 或不发 ALPN 的客户端照旧用 HTTP/1.1；
+- 连接空闲 10 秒（没有请求在处理，也没有新请求来）就关闭，两种 HTTP 版本一样；
 - 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
 - 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
 - 拒绝大于 64 KiB 的 DNS 请求体；
