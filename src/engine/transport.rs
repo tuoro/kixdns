@@ -498,6 +498,46 @@ fn tune_stream_socket(stream: &TcpStream, upstream: &str) {
     }
 }
 
+/// 一条连接上同时有这么多查询还没答完就算忙，再来的查询换下一条：TCP、DoT 的连接池和 DoH 的连接位都这样挑
+/// （见 [`least_busy`]）。一阵子几十个以内的查询（比如打开一个网页）都留在第一条连接上，用不着的连接不去连，
+/// 常用的那条也不会因为隔太久没轮到而被当作空闲关掉、下个查询再重新连；一直有这么多在途时才分到后面的连接，
+/// 各条连接的收发落到不同的核上
+/// A connection with this many queries unanswered at once counts as busy, and further queries go
+/// to the next one: the TCP and DoT pools and the DoH slots all pick this way (see
+/// [`least_busy`]). A burst of a few dozen queries at most (a web page opening, say) stays on the
+/// first connection, so connections nothing needs are not made, and the one in use is never left
+/// unvisited long enough to be closed as idle and made again for the next query; only steadily
+/// this many in flight spreads queries over the later connections, whose I/O then lands on
+/// different cores
+pub(crate) const BUSY_AT: usize = 32;
+
+/// `members` 里排在最前、还不忙的那个；都忙时在途最少的那个（见 [`BUSY_AT`]）
+/// The first of `members` not busy; with all busy, the one with the fewest in flight (see
+/// [`BUSY_AT`])
+pub(crate) fn least_busy<T>(members: &[T], in_flight: impl Fn(&T) -> usize) -> &T {
+    members
+        .iter()
+        .find(|member| in_flight(member) < BUSY_AT)
+        .or_else(|| members.iter().min_by_key(|member| in_flight(member)))
+        .expect("a pool has a member at least")
+}
+
+/// 一个查询记在一条连接的在途数上，丢掉时再减掉 / A query counted in a connection's in-flight number, taken off again when dropped
+pub(crate) struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    pub(crate) fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// 一个上游的连接池：几个客户端轮流用 / One upstream's pool: a few clients taken in turn
 pub struct ConnectionPool<C> {
     clients: Vec<Arc<C>>,
@@ -517,15 +557,11 @@ impl<C> ConnectionPool<C> {
         &self.clients[self.next_idx.fetch_add(1, Ordering::Relaxed) % self.clients.len()]
     }
 
-    /// 上一个轮到的客户端还合 `stay` 的意就接着用它，否则轮到下一个
-    /// The client last picked while `stay` still holds for it, otherwise the next in turn
-    fn pick_staying(&self, stay: impl Fn(&C) -> bool) -> &Arc<C> {
-        let last = &self.clients
-            [self.next_idx.load(Ordering::Relaxed).wrapping_sub(1) % self.clients.len()];
-        if stay(last) {
-            return last;
-        }
-        self.pick()
+    /// 排在最前、还不忙的客户端；都忙时在途最少的那个（见 [`least_busy`]）
+    /// The first client not busy; with all busy, the one with the fewest in flight (see
+    /// [`least_busy`])
+    fn least_busy(&self, in_flight: impl Fn(&C) -> usize) -> &Arc<C> {
+        least_busy(&self.clients, |client| in_flight(client))
     }
 }
 
@@ -659,12 +695,12 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         let pool = self.pool(upstream);
-        // 这一轮的查询都上同一条连接，一次写出去（见 `WriteQueue`）；这一批写走了才轮到下一条
-        // The queries of one round all go on the same connection and out in one write (see
-        // `WriteQueue`); only once that batch is written does the next connection take its turn
-        pool.pick_staying(StreamMuxClient::is_gathering)
-            .send(packet, timeout_dur)
-            .await
+        // 平常只用第一条连接，同一轮的查询在它上面一次写出去（见 `WriteQueue`）；忙了才用后面的
+        // Normally only the first connection is used, with one round's queries going out on it
+        // in one write (see `WriteQueue`); the later ones only once it is busy
+        let client = pool.least_busy(|client| client.in_flight.load(Ordering::Relaxed));
+        let _in_flight = InFlight::enter(&client.in_flight);
+        client.send(packet, timeout_dur).await
     }
 }
 
@@ -739,8 +775,8 @@ pub struct StreamMuxClient<T: StreamTransport> {
     /// The connection's write queue (see [`WriteQueue`]), None without a connection. The lock
     /// also orders a query's registration against the connection's teardown
     conn: Arc<Mutex<Option<Arc<WriteQueue>>>>,
-    /// 写入队列里有帧等着写入任务来取 / Frames on the write queue are waiting for the writer
-    gathering: Arc<AtomicBool>,
+    /// 这个客户端上还没答完的查询数（见 [`BUSY_AT`]）/ Queries on this client not yet answered (see [`BUSY_AT`])
+    in_flight: AtomicUsize,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
     /// Generation counter to detect stale readers
@@ -809,36 +845,22 @@ struct Pending {
 /// the connection lock, one system call per query and for DoT one TLS record, and a write
 /// cancelled part way (the outer timeout first, or the loser of a multi-upstream race aborted)
 /// left half a frame on the connection
+#[derive(Default)]
 struct WriteQueue {
     frames: parking_lot::Mutex<BytesMut>,
     wake: tokio::sync::Notify,
-    /// 客户端的 `gathering`：有帧排着时为真 / The client's `gathering`: true while frames are queued
-    gathering: Arc<AtomicBool>,
 }
 
 impl WriteQueue {
-    fn new(gathering: Arc<AtomicBool>) -> Self {
-        Self {
-            frames: parking_lot::Mutex::default(),
-            wake: tokio::sync::Notify::new(),
-            gathering,
-        }
-    }
-
     /// 排进一帧，叫醒写入任务 / Queues a frame and wakes the writer
     fn push(&self, frame: &[u8]) {
-        let mut frames = self.frames.lock();
-        frames.extend_from_slice(frame);
-        self.gathering.store(true, Ordering::Relaxed);
-        drop(frames);
+        self.frames.lock().extend_from_slice(frame);
         self.wake.notify_one();
     }
 
     /// 取走排着的全部帧，换进 `batch` 里那块空缓冲 / Takes every queued frame, leaving the empty buffer in `batch` in their place
     fn take(&self, batch: &mut BytesMut) {
-        let mut frames = self.frames.lock();
-        std::mem::swap(batch, &mut *frames);
-        self.gathering.store(false, Ordering::Relaxed);
+        std::mem::swap(batch, &mut *self.frames.lock());
     }
 }
 
@@ -927,7 +949,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             upstream,
             shared,
             conn: Arc::new(Mutex::new(None)),
-            gathering: Arc::new(AtomicBool::new(false)),
+            in_flight: AtomicUsize::new(0),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
             generation: Arc::new(AtomicU64::new(0)),
@@ -1166,11 +1188,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         } else {
             false // Connection was not reset / 连接未重置
         }
-    }
-
-    /// 写入队列里有帧等着写出去：这一轮的查询接着上这条连接 / Frames wait on the write queue: this round's queries keep coming to this connection
-    fn is_gathering(&self) -> bool {
-        self.gathering.load(Ordering::Relaxed)
     }
 
     /// Record success and clear error counter
@@ -1465,7 +1482,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
         if guard.is_none() {
             let (read_half, write_half) = T::connect(&self.shared, &self.upstream, budget).await?;
-            let queue = Arc::new(WriteQueue::new(Arc::clone(&self.gathering)));
+            let queue = Arc::new(WriteQueue::default());
             *guard = Some(Arc::clone(&queue));
 
             // Increment generation for new connection
@@ -1585,12 +1602,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         conn_guard: &mut Option<Arc<WriteQueue>>,
     ) {
         let err_msg = err.to_string();
-        // 连接没了，排着的帧不会再写出去，挑连接时也别再当它在攒一批
-        // The connection is gone and its queued frames will never be written, so picking
-        // must not take it for one gathering a batch any more
-        if let Some(queue) = conn_guard.take() {
-            queue.gathering.store(false, Ordering::Relaxed);
-        }
+        *conn_guard = None;
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
         for key in keys {
             if let Some((_, p)) = pending.remove(&key) {
@@ -3553,7 +3565,7 @@ mod tests {
     /// first, the first task to wake the writer would have it write that frame alone
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_round_of_frames_goes_out_in_one_write() {
-        let queue = Arc::new(WriteQueue::new(Arc::default()));
+        let queue = Arc::new(WriteQueue::default());
         let (client_io, mut server_io) = tokio::io::duplex(1 << 16);
         let writes = Arc::new(AtomicUsize::new(0));
         let writer = crate::engine::test_support::CountedWrites {
@@ -3630,7 +3642,7 @@ mod tests {
 
         let turns = Arc::new(AtomicUsize::new(0));
         let written_at = Arc::new(AtomicUsize::new(usize::MAX));
-        let queue = Arc::new(WriteQueue::new(Arc::default()));
+        let queue = Arc::new(WriteQueue::default());
         let writer = NotingWrites {
             turns: Arc::clone(&turns),
             written_at: Arc::clone(&written_at),
@@ -3696,7 +3708,7 @@ mod tests {
         }
 
         let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
-        let queue = Arc::new(WriteQueue::new(Arc::clone(&client.gathering)));
+        let queue = Arc::new(WriteQueue::default());
         *client.conn.lock().await = Some(Arc::clone(&queue));
         let token = CancellationToken::new();
         client.spawn_writer(
@@ -3722,26 +3734,6 @@ mod tests {
         );
         assert!(client.conn.lock().await.is_none(), "the slot is cleared");
         assert!(token.is_cancelled(), "the reader ends too");
-        assert!(!client.is_gathering(), "picking no longer stays on it");
-    }
-
-    /// 复位以后挑连接不再停在这个客户端上：排着的帧不会再写出去了
-    /// Once reset, picking no longer stays on this client: its queued frames will never be written
-    #[tokio::test]
-    async fn a_reset_connection_is_no_longer_gathering() {
-        let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
-        *client.conn.lock().await = Some(Arc::new(WriteQueue::new(Arc::clone(&client.gathering))));
-        let (tx, _rx) = oneshot::channel();
-        client
-            .register_pending(&udp_test_query("queued.example"), 7, tx)
-            .await
-            .expect("register while connected");
-        assert!(client.is_gathering(), "a queued frame waits for the writer");
-        client.reset().await;
-        assert!(
-            !client.is_gathering(),
-            "the reset connection's frames will never be written"
-        );
     }
 
     /// 帧排进去以后查询被取消（外层超时先到、多上游竞速输了被 abort），帧照样整条写出去，迟到的回答对不上号
@@ -4746,7 +4738,7 @@ mod tests {
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
         // Arrange: Prepare a TCP client with many pending IDs to force contention
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        *client.conn.lock().await = Some(Arc::new(WriteQueue::new(Arc::default())));
+        *client.conn.lock().await = Some(Arc::new(WriteQueue::default()));
         for id in 1u16..200u16 {
             client.pending.insert(
                 id,
@@ -4785,7 +4777,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_fail_all_cannot_miss_a_concurrent_registration() {
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        *client.conn.lock().await = Some(Arc::new(WriteQueue::new(Arc::default())));
+        *client.conn.lock().await = Some(Arc::new(WriteQueue::default()));
 
         // Hold the connection lock so registration queues before fail_all. The old implementation
         // took its pending snapshot before this lock, then allowed the queued registration to land

@@ -15,9 +15,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode, Version};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-use super::doh_h2::{self, BUSY_AT, proxy_configured_in};
+use super::doh_h2::{self, proxy_configured_in};
 use super::test_support::CountedWrites;
-use super::transport::{DOH_MEDIA_TYPE, DohClient, throttle_of};
+use super::transport::{BUSY_AT, DOH_MEDIA_TYPE, DohClient, throttle_of};
 
 #[ctor::ctor]
 fn init_crypto() {

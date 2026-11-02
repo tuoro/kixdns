@@ -1,8 +1,9 @@
 //! 配置里写明的 TCP 上游启动时就建好连接池（见 `TcpMultiplexer::warm_up_pools`），大小和发送时现建
-//! 的一样，是 `tcp_pool_size`；同一轮里的查询都上池里的同一条连接。
+//! 的一样，是 `tcp_pool_size`；平常只用池里的第一条连接，忙了才用后面的（见 `transport::BUSY_AT`）。
 //! The TCP upstreams a configuration names get their pools at start-up (see
 //! `TcpMultiplexer::warm_up_pools`), as large as one built on first send: `tcp_pool_size`;
-//! the queries of one round all go on the same connection of the pool.
+//! normally only the pool's first connection is used, the later ones once it is busy (see
+//! `transport::BUSY_AT`).
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,52 +16,41 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::engine::test_support::{self as support, counting_settings, engine_from, peer};
-use crate::engine::transport::TcpMultiplexer;
+use crate::engine::transport::{BUSY_AT, TcpMultiplexer};
 
-/// 本机 TCP 上游：把每个查询置上 QR 位原样答回 / A local TCP upstream answering each query with itself, QR set
-struct TcpUpstream {
-    address: String,
-    /// 收到的连接数 / The connections it accepted
-    connections: Arc<AtomicUsize>,
-    /// 每条连接收到的查询数，按接受的先后 / The queries each connection brought, in the order accepted
-    queries: Arc<std::sync::Mutex<Vec<usize>>>,
-}
-
-async fn tcp_upstream() -> TcpUpstream {
+/// 本机 TCP 上游：每个查询过 `after` 置上 QR 位原样答回；返回它的地址和收到的连接数
+/// A local TCP upstream answering each query with itself, QR set, after `after`; its address
+/// and the number of connections it accepted
+async fn tcp_upstream(after: Duration) -> (String, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let connections = Arc::new(AtomicUsize::new(0));
-    let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (counted, seen) = (Arc::clone(&connections), Arc::clone(&queries));
+    let counted = connections.clone();
     tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
+        while let Ok((stream, _)) = listener.accept().await {
             counted.fetch_add(1, Ordering::SeqCst);
-            let index = {
-                let mut seen = seen.lock().unwrap();
-                seen.push(0);
-                seen.len() - 1
-            };
-            let seen = Arc::clone(&seen);
             tokio::spawn(async move {
+                let (mut reader, writer) = stream.into_split();
+                let writer = Arc::new(tokio::sync::Mutex::new(writer));
                 let mut len = [0u8; 2];
-                while stream.read_exact(&mut len).await.is_ok() {
+                while reader.read_exact(&mut len).await.is_ok() {
                     let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
-                    if stream.read_exact(&mut frame).await.is_err() {
+                    if reader.read_exact(&mut frame).await.is_err() {
                         return;
                     }
-                    seen.lock().unwrap()[index] += 1;
                     frame[2] |= 0x80;
-                    let _ = stream.write_all(&len).await;
-                    let _ = stream.write_all(&frame).await;
+                    let writer = Arc::clone(&writer);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(after).await;
+                        let mut writer = writer.lock().await;
+                        let _ = writer.write_all(&len).await;
+                        let _ = writer.write_all(&frame).await;
+                    });
                 }
             });
         }
     });
-    TcpUpstream {
-        address,
-        connections,
-        queries,
-    }
+    (address, connections)
 }
 
 fn query(name: &str) -> Vec<u8> {
@@ -70,18 +60,14 @@ fn query(name: &str) -> Vec<u8> {
     request.to_vec().unwrap()
 }
 
-/// 两个连接的池：先后两个查询轮到两个客户端，各用一条连接。以前预热只建 1 个客户端，发送时又不再
-/// 扩大，配置里的 TCP 上游整个运行期只有 1 条连接
-/// A pool of two: two queries in turn go to its two clients, one connection each. The
-/// warm-up used to build a single client that sending never grew, so a TCP upstream in
-/// the configuration had one connection for as long as the kernel ran
+/// 两个连接的池：第一条连接忙起来以后，再来的查询上第二条。以前预热只建 1 个客户端，发送时又不再扩大，
+/// 配置里的 TCP 上游整个运行期只有 1 条连接
+/// A pool of two: once the first connection is busy, further queries go on the second. The
+/// warm-up used to build a single client that sending never grew, so a TCP upstream in the
+/// configuration had one connection for as long as the kernel ran
 #[tokio::test]
 async fn a_tcp_upstream_in_the_config_gets_the_whole_pool() {
-    let TcpUpstream {
-        address,
-        connections,
-        ..
-    } = tcp_upstream().await;
+    let (address, connections) = tcp_upstream(Duration::from_millis(200)).await;
     let engine = engine_from(json!({
         "settings": counting_settings(json!({ "tcp_pool_size": 2 })),
         "pipelines": [{ "id": "main", "rules": [{
@@ -89,9 +75,15 @@ async fn a_tcp_upstream_in_the_config_gets_the_whole_pool() {
             "actions": [{ "type": "forward", "upstream": address, "transport": "tcp" }]
         }] }]
     }));
-    for name in ["a.example.", "b.example."] {
-        support::ask(&engine, &query(name), peer()).await;
-    }
+    let packets: Vec<Vec<u8>> = (0..=BUSY_AT)
+        .map(|index| query(&format!("q{index}.example.")))
+        .collect();
+    futures::future::join_all(
+        packets
+            .iter()
+            .map(|packet| support::ask(&engine, packet, peer())),
+    )
+    .await;
     assert_eq!(
         connections.load(Ordering::SeqCst),
         2,
@@ -99,59 +91,50 @@ async fn a_tcp_upstream_in_the_config_gets_the_whole_pool() {
     );
 }
 
-/// 同一轮里的查询都上池里的同一条连接，一次写出去；这一批写走了，下一个查询才轮到下一条连接。以前一个接
-/// 一个轮流分，64 条连接的池里同一轮的查询各占一条，各写一次。一个工作线程，查询都从这个线程上起，和收到
-/// 一批查询时一样
-/// The queries of one round all go on the same connection of the pool and out in one write;
-/// only once that batch is written does the next query move on to the next connection. They
-/// used to be dealt out in turn, so in a pool of 64 each query of a round had a connection
-/// and a write of its own. One worker thread, with the queries started on it, as when a batch
-/// of queries arrives
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn a_round_of_queries_shares_one_connection() {
-    let upstream = tcp_upstream().await;
-    let mux = Arc::new(TcpMultiplexer::new(4, 3, 0, 0));
-    // 一个接一个问四次：每次都轮到下一个客户端，四条连接都连好 / Four queries one after
-    // another: each moves on to the next client, so all four connections are made
-    for index in 0..4 {
+/// 平常只用池里的第一条连接：一个接一个的查询，和一阵子同时到、但没多到让它忙起来的查询，都在它上面，后面
+/// 的不去连。以前一个查询轮一条，64 条的池里每条隔 64 个查询才轮到一次，查询稀疏时早过了空闲时限，几乎每个
+/// 查询都要新建连接（DoT 还要握手）
+/// Normally only the pool's first connection is used: queries one after another, and a burst of
+/// them at once that is not enough to make it busy, all go on it, and the later ones do not
+/// connect. Each query used to take the next connection, so in a pool of 64 each came round once
+/// every 64 queries; with sparse queries that was long past the idle limit, and nearly every
+/// query opened a new connection (DoT with a handshake too)
+#[tokio::test]
+async fn light_load_stays_on_one_connection() {
+    let (address, connections) = tcp_upstream(Duration::from_millis(20)).await;
+    let mux = TcpMultiplexer::new(4, 3, 0, 0);
+    for index in 0..10 {
         mux.send(
-            &query(&format!("warm{index}.example.")),
-            &upstream.address,
+            &query(&format!("one{index}.example.")),
+            &address,
             Duration::from_secs(5),
         )
         .await
         .unwrap();
     }
-    assert_eq!(upstream.connections.load(Ordering::SeqCst), 4);
-    let before = upstream.queries.lock().unwrap().clone();
+    let burst = (1..BUSY_AT).map(|index| {
+        let (mux, address, packet) = (&mux, &address, query(&format!("burst{index}.example.")));
+        async move { mux.send(&packet, address, Duration::from_secs(5)).await }
+    });
+    for answer in futures::future::join_all(burst).await {
+        answer.unwrap();
+    }
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+}
 
-    let (asking, address) = (Arc::clone(&mux), upstream.address.clone());
-    tokio::spawn(async move {
-        let asked: Vec<_> = (0..8)
-            .map(|index| {
-                let (mux, address) = (Arc::clone(&asking), address.clone());
-                tokio::spawn(async move {
-                    mux.send(
-                        &query(&format!("q{index}.example.")),
-                        &address,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                })
-            })
-            .collect();
-        for answer in futures::future::join_all(asked).await {
-            answer.unwrap().unwrap();
-        }
-    })
-    .await
-    .unwrap();
-    let after = upstream.queries.lock().unwrap().clone();
-    let grew: Vec<usize> = after
-        .iter()
-        .zip(&before)
-        .map(|(after, before)| after - before)
-        .collect();
-    assert_eq!(grew.iter().filter(|&&n| n > 0).count(), 1, "{grew:?}");
-    assert_eq!(upstream.connections.load(Ordering::SeqCst), 4);
+/// 第一条连接上同时在途的查询到了 `BUSY_AT` 个，再来的上第二条，那条也忙了再上第三条
+/// Once the first connection has `BUSY_AT` queries in flight, further ones go on the second,
+/// and once that is busy too, on the third
+#[tokio::test]
+async fn a_busy_connection_spills_to_the_next() {
+    let (address, connections) = tcp_upstream(Duration::from_millis(200)).await;
+    let mux = TcpMultiplexer::new(4, 3, 0, 0);
+    let many = (0..2 * BUSY_AT + BUSY_AT / 2).map(|index| {
+        let (mux, address, packet) = (&mux, &address, query(&format!("many{index}.example.")));
+        async move { mux.send(&packet, address, Duration::from_secs(5)).await }
+    });
+    for answer in futures::future::join_all(many).await {
+        answer.unwrap();
+    }
+    assert_eq!(connections.load(Ordering::SeqCst), 3);
 }

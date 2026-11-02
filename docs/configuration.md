@@ -35,9 +35,9 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | request_timeout_ms | null | 整体请求超时；为 null 时使用 upstream_timeout_ms * 2.5，且不能小于 upstream_timeout_ms。 |
 | response_jump_limit | 10 | 响应阶段 Pipeline 跳转上限。 |
 | udp_pool_size | 64 | 出站 UDP socket 池大小。 |
-| tcp_pool_size | 64 | 每个上游的 TCP 连接池大小。 |
-| doh_pool_size | 8 | 每个上游最多保留的 DoH 空闲连接数。 |
-| dot_pool_size | 64 | 每个上游的 DoT 连接池大小。 |
+| tcp_pool_size | 64 | 每个上游最多几条 TCP 连接。平常只用第一条；它上面同时有 32 个以上查询没答完时，再来的查询才用后面的。 |
+| doh_pool_size | 8 | 上游不支持 HTTP/2、或设了 `HTTPS_PROXY` / `ALL_PROXY` 时，每个上游最多保留的 DoH 空闲连接数。支持 HTTP/2 的上游直连，每个工作线程最多一条，平常只用一条，忙起来的规则和 `tcp_pool_size` 一样。 |
+| dot_pool_size | 64 | 每个上游最多几条 DoT 连接，平常只用一条，规则和 `tcp_pool_size` 一样。 |
 | doq_pool_size | 16 | 每个上游的 DoQ 连接池大小。 |
 | tcp_health_check_error_threshold | 3 | 目前不起作用，保留只为兼容旧配置。TCP/DoT 连接写失败、读失败，或者等到超时而连接上已经没有动静时，都会马上重建，不看这个次数。DoQ 不读这一项。 |
 | tcp_connection_max_age_seconds | 300 | TCP/DoT 连接最大存活时间；0 禁用。 |
