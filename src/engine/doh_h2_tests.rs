@@ -1,13 +1,15 @@
 //! 直连 HTTP/2 的 DoH 上游（见 `doh_h2`）：共用一条连接、没选 h2 时交给 reqwest、发出的请求和 reqwest 的一样、
-//! 回答检查照旧、断了和空闲太久时重连、连续出错重建时丢掉连接
+//! 同一轮的请求一次写完、回答检查照旧、接收窗口还给对方、断了、要走了和空闲太久时重连、连续出错重建时丢掉连接
 //! DoH upstreams over the direct HTTP/2 connection (see `doh_h2`): one shared connection, reqwest
-//! when h2 is not picked, the same request as reqwest sends, the answer checks as before, a new
-//! connection when the old one is gone or idle too long, and the connection dropped when repeated
-//! errors rebuild
+//! when h2 is not picked, the same request as reqwest sends, one write per round of requests, the
+//! answer checks as before, the receive window handed back, a new connection when the old one is
+//! gone, leaving or idle too long, and the connection dropped when repeated errors rebuild
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,7 +17,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode, Version};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-use super::doh_h2::proxy_configured_in;
+use super::doh_h2::{self, proxy_configured_in};
 use super::transport::{DOH_MEDIA_TYPE, DohClient, throttle_of};
 
 #[ctor::ctor]
@@ -30,9 +32,8 @@ struct Seen {
     method: String,
     path_and_query: String,
     authority: Option<String>,
-    host: Option<String>,
-    content_type: Option<String>,
-    accept: Option<String>,
+    /// 全部请求头，按收到的顺序 / Every request header, in the order received
+    headers: Vec<(String, String)>,
 }
 
 /// 本机 TLS 上的 DoH 上游 / A local DoH upstream over TLS
@@ -78,14 +79,9 @@ fn dns_ok(body: Vec<u8>) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-/// 起一个 TLS DoH 上游：握手时报 `alpn`，每个请求的正文交给 `reply` 作答；`close_after` 个请求以后断开连接
-/// Starts a DoH upstream over TLS: `alpn` offered in the handshake, each request's body answered
-/// by `reply`; the connection is closed after `close_after` requests
-async fn spawn_upstream(
-    alpn: &[&[u8]],
-    close_after: Option<usize>,
-    reply: impl Fn(&[u8]) -> Response<Full<Bytes>> + Send + Sync + 'static,
-) -> TlsUpstream {
+/// 本机地址的自签证书和用它的 TLS 接受端，握手时报 `alpn` / A self-signed certificate for the
+/// local address and a TLS acceptor using it, offering `alpn` in the handshake
+fn tls_acceptor(alpn: &[&[u8]]) -> (tokio_rustls::TlsAcceptor, CertificateDer<'static>) {
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     params.subject_alt_names.push(rcgen::SanType::IpAddress(
         std::net::Ipv4Addr::LOCALHOST.into(),
@@ -99,7 +95,18 @@ async fn spawn_upstream(
         .with_single_cert(vec![cert_der.clone()], key)
         .unwrap();
     tls.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    (tokio_rustls::TlsAcceptor::from(Arc::new(tls)), cert_der)
+}
+
+/// 起一个 TLS DoH 上游：握手时报 `alpn`，每个请求的正文交给 `reply` 作答；`close_after` 个请求以后断开连接
+/// Starts a DoH upstream over TLS: `alpn` offered in the handshake, each request's body answered
+/// by `reply`; the connection is closed after `close_after` requests
+async fn spawn_upstream(
+    alpn: &[&[u8]],
+    close_after: Option<usize>,
+    reply: impl Fn(&[u8]) -> Response<Full<Bytes>> + Send + Sync + 'static,
+) -> TlsUpstream {
+    let (acceptor, cert_der) = tls_acceptor(alpn);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
@@ -129,12 +136,6 @@ async fn spawn_upstream(
                                 conn_closed.clone(),
                             );
                             async move {
-                                let header = |name: &str| {
-                                    req.headers()
-                                        .get(name)
-                                        .and_then(|v| v.to_str().ok())
-                                        .map(str::to_string)
-                                };
                                 seen.lock().unwrap().push(Seen {
                                     version: req.version(),
                                     method: req.method().to_string(),
@@ -144,9 +145,13 @@ async fn spawn_upstream(
                                         .map(|p| p.to_string())
                                         .unwrap_or_default(),
                                     authority: req.uri().authority().map(|a| a.to_string()),
-                                    host: header("host"),
-                                    content_type: header("content-type"),
-                                    accept: header("accept"),
+                                    headers: req
+                                        .headers()
+                                        .iter()
+                                        .map(|(name, value)| {
+                                            (name.to_string(), value.to_str().unwrap().to_string())
+                                        })
+                                        .collect(),
                                 });
                                 let body = req.into_body().collect().await.unwrap().to_bytes();
                                 let response = reply(&body);
@@ -261,9 +266,11 @@ async fn an_upstream_without_h2_goes_through_reqwest() {
     assert_eq!(upstream.connections.load(Ordering::SeqCst), 2);
 }
 
-/// 直连发出的请求和 reqwest 发的一样：方法、路径和查询串、:authority、覆盖的 Host、两个媒体类型头
+/// 直连发出的请求和 reqwest 发的一样：方法、路径和查询串、:authority，全部请求头（覆盖的 Host、两个媒体类型头、
+/// content-length）连同顺序
 /// The direct connection sends the request reqwest sends: method, path and query, :authority,
-/// the Host override, and both media type headers
+/// and every request header (the Host override, both media type headers, content-length) in
+/// the same order
 #[tokio::test]
 async fn the_direct_request_is_the_one_reqwest_sends() {
     let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
@@ -283,14 +290,222 @@ async fn the_direct_request_is_the_one_reqwest_sends() {
     }
 }
 
-/// 回答检查在直连上照旧：429 记下暂停，错误状态、别的媒体类型、太长的正文、答非所问都算用不了的回答，不重试
+/// 读完一个请求的正文，读到的接收窗口随手还给对方 / Reads a request body to its end, handing the receive window back as it goes
+async fn read_body(mut body: h2::RecvStream) -> Vec<u8> {
+    let mut read = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        body.flow_control().release_capacity(chunk.len()).unwrap();
+        read.extend_from_slice(&chunk);
+    }
+    read
+}
+
+/// 读完请求，等 `after` 以后用它的回声作答 / Reads the request, then answers with its echo after `after`
+async fn answer_after(
+    request: Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<Bytes>,
+    after: Duration,
+) {
+    let query = read_body(request.into_body()).await;
+    tokio::time::sleep(after).await;
+    let head = Response::builder()
+        .header("content-type", DOH_MEDIA_TYPE)
+        .body(())
+        .unwrap();
+    let mut body = respond.send_response(head, false).unwrap();
+    body.send_data(Bytes::from(echo(&query)), true).unwrap();
+}
+
+/// 连接的一端，数着往外写了几次 / One end of a connection, counting the writes out of it
+struct CountedWrites {
+    io: tokio::io::DuplexStream,
+    writes: Arc<AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for CountedWrites {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for CountedWrites {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let written = Pin::new(&mut self.io).poll_write(cx, buf);
+        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+        }
+        written
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// 同一轮里发起的请求连同各自的正文，一次写出去：上游不用等第二次写才收齐一个请求（hyper 的客户端总是先单独
+/// 写请求头），连接也不会一个请求写一次（tokio 让刚被叫醒的连接任务插到最前面先跑）。一个工作线程，请求任务
+/// 都从这个线程上起，和收到一批 UDP 查询时一样
+/// The requests started in one round, each with its body, leave in one write: the upstream does
+/// not wait for a second write to have a request (hyper's client always writes the head alone
+/// first), and the connection does not write once per request (tokio runs the connection task it
+/// was just woken for first). One worker thread, with the request tasks started on it, as when a
+/// batch of UDP queries arrives
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn requests_of_one_round_go_out_in_one_write() {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let mut conn = h2::server::handshake(server_io).await.unwrap();
+        while let Some(accepted) = conn.accept().await {
+            let (request, respond) = accepted.unwrap();
+            tokio::spawn(answer_after(request, respond, Duration::ZERO));
+        }
+    });
+    let writes = Arc::new(AtomicUsize::new(0));
+    let sender = doh_h2::handshake(CountedWrites {
+        io: client_io,
+        writes: Arc::clone(&writes),
+    })
+    .await
+    .unwrap();
+    // 数完之前连接一直开着：发送端都没了，连接会发 GOAWAY 关掉，那也是一次写
+    // The connection stays open until the count is taken: with every sender gone it would send
+    // a GOAWAY and close, another write
+    let keep_open = sender.clone();
+    let ask = move |id: u16| {
+        let request = Request::post("https://upstream.example/dns-query")
+            .body(())
+            .unwrap();
+        let sent = doh_h2::send(sender.clone(), request, Bytes::from(query(id)));
+        async move {
+            let answer = sent.await.unwrap().into_body().collect().await.unwrap();
+            answer.to_bytes()
+        }
+    };
+    // 第一个请求让两边把设置和确认都交换完 / The first request lets both sides finish exchanging settings and acknowledgements
+    tokio::spawn(ask(0)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let before = writes.load(Ordering::SeqCst);
+    let answers = tokio::spawn(async move {
+        let asked: Vec<_> = (1..=8u16).map(|id| tokio::spawn(ask(id))).collect();
+        futures::future::join_all(asked).await
+    })
+    .await
+    .unwrap();
+    for (id, answer) in (1..=8u16).zip(answers) {
+        assert_eq!(answer.unwrap()[..2], id.to_be_bytes());
+    }
+    assert_eq!(writes.load(Ordering::SeqCst) - before, 1);
+    drop(keep_open);
+}
+
+/// 回答加起来超过连接的接收窗口以后照样答上：读到的窗口都还给了对方
+/// Answers keep coming once they add up past the connection's receive window: what was read
+/// went back to the peer
+#[tokio::test]
+async fn answers_keep_coming_past_the_receive_window() {
+    let upstream = spawn_upstream(&[b"h2"], None, |q| {
+        let mut answer = echo(q);
+        answer.resize(60_000, 0);
+        dns_ok(answer)
+    })
+    .await;
+    let client = upstream.client(3);
+    let url = upstream.url("");
+    // 40 个 60 KB 的回答，是连接窗口的两倍多 / Forty 60 KB answers, over twice the connection window
+    for id in 0..40u16 {
+        let answer = ask(&client, &url, id).await.unwrap();
+        assert_eq!(
+            (answer.len(), &answer[..2]),
+            (60_000, &id.to_be_bytes()[..])
+        );
+    }
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+}
+
+/// 上游发来 GOAWAY 以后，新请求另连一条，不上这条要走的连接；这条连接上还没答完的请求照样答完
+/// Once the upstream sends a GOAWAY, a new request opens another connection instead of the one
+/// that is leaving; the request still being answered there is answered all the same
+#[tokio::test]
+async fn a_leaving_connection_takes_no_new_requests() {
+    let (acceptor, cert) = tls_acceptor(&[b"h2"]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = TlsUpstream {
+        addr: listener.local_addr().unwrap(),
+        cert,
+        connections: Arc::new(AtomicUsize::new(0)),
+        seen: Arc::default(),
+    };
+    let connections = Arc::clone(&upstream.connections);
+    let leaving = Arc::new(tokio::sync::Notify::new());
+    let left = Arc::clone(&leaving);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let first = connections.fetch_add(1, Ordering::SeqCst) == 0;
+            let (acceptor, left) = (acceptor.clone(), Arc::clone(&left));
+            tokio::spawn(async move {
+                let tls = acceptor.accept(tcp).await.unwrap();
+                let mut conn = h2::server::handshake(tls).await.unwrap();
+                while let Some(accepted) = conn.accept().await {
+                    let (request, respond) = accepted.unwrap();
+                    // 第一条连接一收到请求就发 GOAWAY，回答晚点给，所以答完之前连接一直开着
+                    // The first connection sends a GOAWAY as soon as a request arrives and
+                    // answers late, so it stays open until then
+                    let after = if first {
+                        conn.graceful_shutdown();
+                        left.notify_one();
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::ZERO
+                    };
+                    tokio::spawn(answer_after(request, respond, after));
+                }
+            });
+        }
+    });
+    let client = upstream.client(3);
+    let url = upstream.url("");
+    let later = async {
+        // 等 GOAWAY 到了客户端再问 / Ask once the GOAWAY has reached the client
+        leaving.notified().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while client.has_direct_connection(&url) {
+            assert!(tokio::time::Instant::now() < deadline, "no GOAWAY seen");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        ask(&client, &url, 2).await
+    };
+    let (first, second) = tokio::join!(ask(&client, &url, 1), later);
+    assert_eq!(first.unwrap()[..2], 1u16.to_be_bytes());
+    assert_eq!(second.unwrap()[..2], 2u16.to_be_bytes());
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 2);
+}
+
+/// 回答检查在直连上照旧：429 记下暂停，错误状态、别的媒体类型、太长的正文、答非所问都算用不了的回答，当场报出
+/// 原因，不重试（太长的正文不该卡在接收窗口上等到超时）
 /// The answer checks hold over the direct connection: a 429 notes the pause, and an error status,
-/// another media type, a body too long and an answer to another question are unusable answers, not retried
+/// another media type, a body too long and an answer to another question are unusable answers,
+/// reported at once with the reason and not retried (a body too long must not stall on the
+/// receive window until the timeout)
 #[tokio::test]
 async fn answer_checks_hold_over_the_direct_connection() {
-    let cases: Vec<(&str, Reply)> = vec![
+    // 标签、错误里该有的原因、上游怎么回 / Label, the reason the error has to give, how the upstream answers
+    let cases: Vec<(&str, &str, Reply)> = vec![
         (
             "429",
+            "status 429",
             Box::new(|_| {
                 Response::builder()
                     .status(StatusCode::TOO_MANY_REQUESTS)
@@ -301,6 +516,7 @@ async fn answer_checks_hold_over_the_direct_connection() {
         ),
         (
             "500",
+            "status 500",
             Box::new(|_| {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -310,6 +526,7 @@ async fn answer_checks_hold_over_the_direct_connection() {
         ),
         (
             "html",
+            "not application/dns-message but text/html",
             Box::new(|q| {
                 Response::builder()
                     .header("content-type", "text/html")
@@ -317,9 +534,14 @@ async fn answer_checks_hold_over_the_direct_connection() {
                     .unwrap()
             }),
         ),
-        ("long", Box::new(|_| dns_ok(vec![0u8; 70_000]))),
+        (
+            "long",
+            "longer than 65535 bytes",
+            Box::new(|_| dns_ok(vec![0u8; 70_000])),
+        ),
         (
             "other question",
+            "does not answer the query",
             Box::new(|q| {
                 let mut answer = echo(q);
                 let at = answer.len() - 6;
@@ -328,10 +550,11 @@ async fn answer_checks_hold_over_the_direct_connection() {
             }),
         ),
     ];
-    for (label, reply) in cases {
+    for (label, reason, reply) in cases {
         let upstream = spawn_upstream(&[b"h2"], None, reply).await;
         let client = upstream.client(3);
         let err = ask(&client, &upstream.url(""), 1).await.expect_err(label);
+        assert!(format!("{err:#}").contains(reason), "{label}: {err:#}");
         assert_eq!(
             upstream.seen.lock().unwrap().len(),
             1,
