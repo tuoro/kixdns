@@ -6,10 +6,8 @@
 //! gone, leaving or idle too long, and the connection dropped when repeated errors rebuild
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -18,6 +16,7 @@ use hyper::{Request, Response, StatusCode, Version};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use super::doh_h2::{self, proxy_configured_in};
+use super::test_support::CountedWrites;
 use super::transport::{DOH_MEDIA_TYPE, DohClient, throttle_of};
 
 #[ctor::ctor]
@@ -315,44 +314,6 @@ async fn answer_after(
         .unwrap();
     let mut body = respond.send_response(head, false).unwrap();
     body.send_data(Bytes::from(echo(&query)), true).unwrap();
-}
-
-/// 连接的一端，数着往外写了几次 / One end of a connection, counting the writes out of it
-struct CountedWrites {
-    io: tokio::io::DuplexStream,
-    writes: Arc<AtomicUsize>,
-}
-
-impl tokio::io::AsyncRead for CountedWrites {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.io).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for CountedWrites {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let written = Pin::new(&mut self.io).poll_write(cx, buf);
-        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
-            self.writes.fetch_add(1, Ordering::SeqCst);
-        }
-        written
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.io).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.io).poll_shutdown(cx)
-    }
 }
 
 /// 同一轮里发起的请求连同各自的正文，一次写出去：上游不用等第二次写才收齐一个请求（hyper 的客户端总是先单独
