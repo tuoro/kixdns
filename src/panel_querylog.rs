@@ -16,6 +16,7 @@ use std::borrow::{Borrow, Cow};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,6 +54,13 @@ pub(crate) const MAX_PAGE: usize = 2_000;
 /// the panel can still say how many it missed. Tens of thousands of queries a second with an upstream
 /// slowing past a hundred milliseconds put over four thousand in flight at once
 const MAX_PENDING: usize = 16_384;
+/// 交接区最多占多少字节。一条命中的记录一百来字节，16384 条两三兆，平时先到的是条数上限；面板跟得上时交接区几乎是
+/// 空的，只占用过的那一点。一条记录长过它的四分之一（配置里的名字长得离谱时）就不记，算进没记下的
+/// The most bytes the ring takes. A hit's record is about a hundred bytes and 16384 of them two or three
+/// megabytes, so the count limit is usually reached first; with the panel keeping up the ring is nearly
+/// empty and takes only what it used. A record longer than a quarter of it (names in the config of an
+/// absurd length) is not kept and counts as unrecorded
+const RING_BYTES: usize = 8 << 20;
 /// 在跟的请求按编号直接定位的槽位数，2 的幂；同时在跟的多过它时，多出来的记在共享表里
 /// Slots the tracked requests are placed in by number, a power of two; requests beyond them at once go
 /// to a shared map
@@ -149,8 +157,9 @@ pub(crate) struct QueryLog {
     /// reaching it wakes the waiting takes; `u64::MAX` with no one waiting
     wake_at: AtomicU64,
     arrived: tokio::sync::Notify,
-    /// 超出在途上限、没能记下的请求数（自内核启动起累计） / Requests left unrecorded because too many
-    /// were in flight (cumulative since the kernel started)
+    /// 没能记下的请求数（自内核启动起累计）：同时在途的超过上限，或者一条记录长得放不进交接区 / Requests left
+    /// unrecorded (cumulative since the kernel started): more were in flight than the limit, or a record too
+    /// long for the ring
     untracked: AtomicU64,
     /// 在跟的请求，按编号直接定位槽位：不算哈希、不碰共享表的锁。槽位被另一个还没结束的请求占着时
     /// （同时在跟的多过槽位数），这个请求记在 `overflow` 里
@@ -168,20 +177,103 @@ pub(crate) struct QueryLog {
     ring: Mutex<Ring>,
 }
 
-/// 交接区：编好的记录，序号连续（只从头上丢），最后一条是 `newest`
-/// The hand-off ring: encoded records, numbered contiguously (it only drops from the front), the last
-/// being `newest`
+/// 交接区：编好的记录首尾相接放在一块内存里，序号连续（只从头上丢），最后一条是 `newest`。放一条只是复制这几十上百
+/// 字节；删掉、挤掉只是从目录头上去掉，不逐条分配和释放。面板来取时复制一段连续的内存，锁占得很短
+/// The hand-off ring: encoded records laid end to end in one block of memory, numbered contiguously (it
+/// only drops from the front), the last being `newest`. Putting one in copies its few dozen or hundred
+/// bytes; deleting or pushing out only drops them from the head of the directory, with nothing allocated
+/// or freed per record. A collection copies a stretch of contiguous memory, holding the lock briefly
 struct Ring {
-    entries: VecDeque<Arc<[u8]>>,
+    bytes: Vec<u8>,
+    /// 每条记录在 `bytes` 里的位置，按序号排 / Where each record sits in `bytes`, by number
+    index: VecDeque<Range<usize>>,
+    /// 下一条从哪里放 / Where the next record goes
+    tail: usize,
+    max_bytes: usize,
     /// 最近一条的序号；第一条是 1 / The newest record's sequence number; the first is 1
     newest: u64,
 }
 
 impl Ring {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            index: VecDeque::new(),
+            tail: 0,
+            max_bytes,
+            newest: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
     /// 最早那条的序号；空着时为 None / The oldest record's number; None while empty
     fn oldest(&self) -> Option<u64> {
-        let len = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        let len = u64::try_from(self.len()).unwrap_or(u64::MAX);
         (len > 0).then(|| self.newest + 1 - len)
+    }
+
+    /// 从头数第几条 / The record at this position from the oldest
+    fn record(&self, at: usize) -> &[u8] {
+        &self.bytes[self.index[at].clone()]
+    }
+
+    fn pop_front(&mut self) {
+        self.index.pop_front();
+    }
+
+    /// 放进一条，序号是 `newest` 的下一个；交回放没放下。条数到了 `capacity` 先挤掉最早一条。末尾放不下就从头放：
+    /// 末尾剩的那截不用，还在那截里的是最早的几条，先挤掉——从头那一带放的比它们新，不能先挪到头上再看。要占的地方
+    /// 上还有最早的几条，也挤掉
+    /// Puts a record in, numbered after `newest`; returns whether it was kept. At `capacity` records the
+    /// oldest is pushed out first. When the end has no room it goes to the start: the rest of the end goes
+    /// unused, and the records still there, the oldest ones, are pushed out first (those near the start are
+    /// newer, so moving to the start before looking would be wrong). The oldest records on the space it
+    /// takes are pushed out as well
+    fn push(&mut self, record: &[u8], capacity: usize) -> bool {
+        let len = record.len();
+        if len > self.max_bytes / 4 {
+            return false;
+        }
+        if self.index.len() >= capacity {
+            self.index.pop_front();
+        }
+        if self.index.is_empty() {
+            self.tail = 0;
+        }
+        let mut at = self.tail;
+        if at + len > self.max_bytes {
+            while self.index.front().is_some_and(|front| front.start >= at) {
+                self.index.pop_front();
+            }
+            at = 0;
+        }
+        let taken = at..at + len;
+        while self
+            .index
+            .front()
+            .is_some_and(|front| front.start < taken.end && taken.start < front.end)
+        {
+            self.index.pop_front();
+        }
+        if self.bytes.len() < taken.end {
+            self.bytes.resize(taken.end, 0);
+        }
+        self.bytes[taken.clone()].copy_from_slice(record);
+        self.tail = taken.end;
+        self.index.push_back(taken);
+        self.newest += 1;
+        true
+    }
+
+    /// 全清掉，内存还回去；序号照旧往下数 / Empties everything and gives the memory back; numbering carries
+    /// on
+    fn clear(&mut self) {
+        self.bytes = Vec::new();
+        self.index = VecDeque::new();
+        self.tail = 0;
     }
 }
 
@@ -1070,10 +1162,7 @@ impl QueryLog {
             overflow: DashMap::new(),
             overflow_len: AtomicUsize::new(0),
             pending_count: AtomicUsize::new(0),
-            ring: Mutex::new(Ring {
-                entries: VecDeque::new(),
-                newest: 0,
-            }),
+            ring: Mutex::new(Ring::new(RING_BYTES)),
         }
     }
 
@@ -1118,9 +1207,7 @@ impl QueryLog {
         {
             return (current != 0).then_some(now);
         }
-        let mut ring = self.ring.lock();
-        ring.entries.clear();
-        ring.entries.shrink_to_fit();
+        self.ring.lock().clear();
         None
     }
 
@@ -1379,32 +1466,25 @@ impl QueryLog {
             return;
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
-        let record = ENCODING.with_borrow_mut(|encoding| {
+        ENCODING.with_borrow_mut(|encoding| {
             encoding.clear();
             pending.encode(outcome, encoding);
-            Arc::<[u8]>::from(encoding.as_slice())
+            self.push(encoding);
         });
         pending.release();
-        self.push(record);
     }
 
     /// 编好的记录放进交接区，序号是它的位置 / Puts an encoded record into the ring; its number is its
     /// place
-    fn push(&self, record: Arc<[u8]>) {
-        // 释放在锁外：锁里只给序号、换进换出 / Freeing happens outside the lock: inside it the record
-        // only gets its number and is swapped in
-        let (evicted, newest) = {
+    fn push(&self, record: &[u8]) {
+        let pushed = {
             let mut ring = self.ring.lock();
-            ring.newest += 1;
-            let evicted = if ring.entries.len() >= self.capacity {
-                ring.entries.pop_front()
-            } else {
-                None
-            };
-            ring.entries.push_back(record);
-            (evicted, ring.newest)
+            ring.push(record, self.capacity).then_some(ring.newest)
         };
-        drop(evicted);
+        let Some(newest) = pushed else {
+            self.untracked.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         if newest >= self.wake_at.load(Ordering::Relaxed) {
             self.arrived.notify_waiters();
         }
@@ -1488,14 +1568,16 @@ impl QueryLog {
         self.renew();
         let stored_up_to = (instance == Some(self.instance))
             .then(|| stored.map_or(after, |stored| stored.min(after)));
-        let (entries, first, oldest, newest, stored) = {
+        // 锁里只复制这一页的字节，写 JSON 在锁外 / Only the page's bytes are copied under the lock; the JSON is
+        // written outside it
+        let mut records = Vec::with_capacity(limit.min(MAX_PAGE) * 128);
+        let mut ends = Vec::with_capacity(limit.min(MAX_PAGE));
+        let (first, oldest, newest) = {
             let mut ring = self.ring.lock();
-            // 存好的锁外再释放 / What is stored is freed outside the lock
-            let mut stored = Vec::new();
             while let Some(up_to) = stored_up_to
                 && ring.oldest().is_some_and(|oldest| oldest <= up_to)
             {
-                stored.extend(ring.entries.pop_front());
+                ring.pop_front();
             }
             let oldest = ring.oldest();
             // 交接区里的序号是连续的（只从头上丢），所以 `after` 之后的第一条就在 `after - oldest + 1`
@@ -1503,18 +1585,17 @@ impl QueryLog {
             // after `after` sits at `after - oldest + 1`
             let start = oldest.map_or(0, |oldest| after.saturating_add(1).saturating_sub(oldest));
             let first = oldest.map_or(0, |oldest| oldest + start);
-            let entries: Vec<Arc<[u8]>> = ring
-                .entries
-                .iter()
-                .skip(usize::try_from(start).unwrap_or(usize::MAX))
+            let positions = usize::try_from(start).unwrap_or(usize::MAX)..ring.len();
+            for (at, _) in positions
                 .zip(first..)
                 .take_while(|(_, seq)| until.is_none_or(|until| *seq <= until))
                 .take(limit)
-                .map(|(record, _)| Arc::clone(record))
-                .collect();
-            (entries, first, oldest, ring.newest, stored)
+            {
+                records.extend_from_slice(ring.record(at));
+                ends.push(records.len());
+            }
+            (first, oldest, ring.newest)
         };
-        drop(stored);
         // 交接区空了（清空过，或从没记过）时，游标之后、到最新序号为止的都已不在
         // With the ring empty (emptied, or never written), everything after the cursor up to the newest
         // number is gone
@@ -1527,9 +1608,9 @@ impl QueryLog {
         // lies past where this page reaches
         let reached = after
             .saturating_add(missed)
-            .saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX)); // 一条大约六七百字节，一次给够，免得边写边挪 / A record takes six or seven hundred bytes, so the
+            .saturating_add(u64::try_from(ends.len()).unwrap_or(u64::MAX)); // 一条大约六七百字节，一次给够，免得边写边挪 / A record takes six or seven hundred bytes, so the
         // room is given at once instead of moving as it grows
-        let mut json = Json(Vec::with_capacity(256 + entries.len() * 768));
+        let mut json = Json(Vec::with_capacity(256 + ends.len() * 768));
         json.raw("{\"protocol_version\":");
         json.number(u64::from(protocol_version));
         json.key("instance");
@@ -1550,7 +1631,10 @@ impl QueryLog {
         json.raw(if reached < newest { "true" } else { "false" });
         json.key("entries");
         json.raw("[");
-        for (seq, record) in (first..).zip(&entries) {
+        let mut begin = 0;
+        for (seq, &end) in (first..).zip(&ends) {
+            let record = &records[begin..end];
+            begin = end;
             if seq > first {
                 json.raw(",");
             }
@@ -2059,7 +2143,7 @@ mod tests {
         {
             let ring = log.ring.lock();
             assert!(
-                ring.entries.iter().all(|record| record.len() < 200),
+                (0..ring.len()).all(|at| ring.record(at).len() < 200),
                 "the ring holds the encoded records, not the {}-byte response",
                 long.len()
             );
@@ -2222,17 +2306,13 @@ mod tests {
         let log = QueryLog::default();
         cancelled(&log, 1..=5);
         assert_eq!(seqs(&page_of_this_run(&log, 0, 10)), [1, 2, 3, 4, 5]);
-        assert_eq!(
-            log.ring.lock().entries.len(),
-            5,
-            "taking deletes nothing yet"
-        );
+        assert_eq!(log.ring.lock().len(), 5, "taking deletes nothing yet");
         let next = page_of_this_run(&log, 3, 10);
         assert_eq!(seqs(&next), [4, 5]);
         assert_eq!(next["missed"], 0, "deleted after storing is no gap");
-        assert_eq!(log.ring.lock().entries.len(), 2);
+        assert_eq!(log.ring.lock().len(), 2);
         assert!(seqs(&page_of_this_run(&log, 5, 10)).is_empty());
-        assert!(log.ring.lock().entries.is_empty());
+        assert_eq!(log.ring.lock().len(), 0);
     }
 
     /// 没说游标是哪个进程的（面板在探，或者面板是旧的），或者游标是别的进程的（内核重启了，面板还拿着上一个进程的
@@ -3038,7 +3118,7 @@ mod tests {
         let _ = page(&log, 0, 1);
         log.collected.store(1, Relaxed);
         assert!(!log.recording());
-        assert!(log.ring.lock().entries.is_empty());
+        assert_eq!(log.ring.lock().len(), 0);
         // 回来时：2、3 已经清掉，算漏记 / On return: 2 and 3 were emptied and count as missed
         let back = page(&log, 1, 10);
         assert_eq!(back["missed"], 2);
@@ -3684,6 +3764,119 @@ mod tests {
         })
         .join()
         .expect("the names thread");
+    }
+
+    /// 交接区里还在的记录：(序号, 内容) / The records still in the ring: (number, contents)
+    fn ring_contents(ring: &super::Ring) -> Vec<(u64, Vec<u8>)> {
+        let oldest = ring.oldest().unwrap_or(0);
+        (0..ring.len())
+            .map(|at| (oldest + at as u64, ring.record(at).to_vec()))
+            .collect()
+    }
+
+    /// 一条记录：长度为 `len`，每个字节都是它的序号，读错了位置一眼看得出 / A record of `len` bytes, each its
+    /// number, so a read from the wrong place shows at once
+    fn numbered(seq: u64, len: usize) -> Vec<u8> {
+        vec![u8::try_from(seq).unwrap(); len]
+    }
+
+    /// 一条记录长得放不进交接区（配置里的名字长得离谱）就不记，算进没记下的；序号不空出来
+    /// A record too long for the ring (names in the config of an absurd length) is not kept and counts as
+    /// unrecorded; no number is skipped for it
+    #[test]
+    fn a_record_too_long_for_the_ring_counts_as_unrecorded() {
+        let log = QueryLog::default();
+        *log.ring.lock() = super::Ring::new(400);
+        let _ = page(&log, 0, 1);
+        let long = "x".repeat(150);
+        let request = RequestContext {
+            qname: &long,
+            ..ctx(1)
+        };
+        log.request_started(&request, false);
+        finish(&log, &request, RequestStatus::Cancelled, None);
+        cancelled(&log, 2..=2);
+        let got = page(&log, 0, 10);
+        assert_eq!(got["untracked"], 1, "{got}");
+        assert_eq!(got["newest_seq"], 1, "{got}");
+        assert_eq!(seqs(&got), [1]);
+        assert_eq!(got["entries"][0]["qname"], "www.example.com");
+    }
+
+    /// 字节环放到末尾放不下就从头放，挤掉要占的地方上最早的几条。交接区绕过一圈、最早一条在末尾、新的又放不下
+    /// 末尾时，末尾那条先挤掉，再挤掉从头那一带的最早几条，比它们新的不会被盖掉。长过四分之一的不收；条数到了
+    /// 上限挤掉最早一条；清空时内存还回去，序号照旧
+    /// A byte ring with no room at the end goes back to the start, pushing out the oldest records on the
+    /// space it takes. With the ring wrapped, the oldest record at the end and a new one too long for the
+    /// end, that record goes first, then the oldest near the start, and newer ones are never overwritten.
+    /// A record longer than a quarter is refused; at the count limit the oldest goes; emptying gives the
+    /// memory back and numbering carries on
+    #[test]
+    fn the_byte_ring_wraps_and_pushes_out_only_the_oldest() {
+        let push = |ring: &mut super::Ring, len: usize| {
+            let seq = ring.newest + 1;
+            assert!(ring.push(&numbered(seq, len), 100), "{seq}");
+        };
+        let lens = |ring: &super::Ring| -> Vec<(u64, usize)> {
+            ring_contents(ring)
+                .into_iter()
+                .map(|(seq, bytes)| {
+                    assert!(bytes.iter().all(|byte| u64::from(*byte) == seq), "{seq}");
+                    (seq, bytes.len())
+                })
+                .collect()
+        };
+        let mut ring = super::Ring::new(400);
+        // 1..=5 放在 0..100、100..200、200..300、300..350、350..390 / 1 to 5 at 0..100, 100..200, 200..300,
+        // 300..350 and 350..390
+        for len in [100, 100, 100, 50, 40] {
+            push(&mut ring, len);
+        }
+        // 6 放不下末尾，从头放，挤掉 1 / 6 does not fit the end, goes to the start and pushes out 1
+        push(&mut ring, 100);
+        assert_eq!(
+            lens(&ring),
+            [(2, 100), (3, 100), (4, 50), (5, 40), (6, 100)]
+        );
+        // 7、8 挤掉 2、3；9 放在 300..320，挤掉 4。现在最早的 5 在末尾 350..390
+        // 7 and 8 push out 2 and 3; 9 at 300..320 pushes out 4. Now the oldest, 5, sits at the end, 350..390
+        for len in [100, 100, 20] {
+            push(&mut ring, len);
+        }
+        assert_eq!(
+            lens(&ring),
+            [(5, 40), (6, 100), (7, 100), (8, 100), (9, 20)]
+        );
+        // 10 要 90 字节，320 之后放不下：先挤掉末尾的 5，再从头放、挤掉 6；7 以后的都还在
+        // 10 needs 90 bytes and does not fit past 320: 5 at the end goes first, then it goes to the start and
+        // pushes out 6; 7 onwards stay
+        push(&mut ring, 90);
+        assert_eq!(lens(&ring), [(7, 100), (8, 100), (9, 20), (10, 90)]);
+        assert!(
+            !ring.push(&[0; 101], 100),
+            "longer than a quarter is not kept"
+        );
+        assert_eq!(ring.newest, 10);
+        // 都删掉以后从头放：面板跟得上时一直用开头那一小段，内存不会越占越多
+        // Once all is deleted it starts at the beginning again: with the panel keeping up the same small
+        // stretch is used over and over, and memory does not keep growing
+        let mut reused = super::Ring::new(400);
+        for _ in 0..20 {
+            push(&mut reused, 30);
+            reused.pop_front();
+        }
+        assert_eq!(reused.bytes.len(), 30);
+        // 条数上限 / The count limit
+        let mut counted = super::Ring::new(1 << 20);
+        for _ in 0..5 {
+            assert!(counted.push(&[1, 2, 3], 3));
+        }
+        assert_eq!(counted.len(), 3);
+        assert_eq!(counted.oldest(), Some(3));
+        counted.clear();
+        assert_eq!(counted.len(), 0);
+        assert_eq!(counted.bytes.capacity(), 0, "the memory is given back");
+        assert_eq!(counted.newest, 5);
     }
 
     #[test]
