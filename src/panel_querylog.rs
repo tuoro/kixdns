@@ -26,8 +26,6 @@ use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
-use serde::ser::SerializeStruct;
-use serde::{Serialize, Serializer};
 use smallvec::SmallVec;
 
 use crate::observe::{
@@ -113,15 +111,11 @@ impl std::ops::Deref for ConfigName {
     }
 }
 
-impl Serialize for ConfigName {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-/// 一个槽位：空着，或放着一个在跟的请求（编号和它攒下的记录） / One slot: empty, or holding a tracked
-/// request (its number and the record so far)
-type Slot = Mutex<Option<(u64, Pending)>>;
+/// 一个槽位：空着，或放着一个在跟的请求（编号和它写到一半的记录）。记录在别处，槽位里只是一个指针，
+/// 一千多个槽位放得进缓存
+/// One slot: empty, or holding a tracked request (its number and its half-written record). The record
+/// lives elsewhere and the slot holds a pointer, so a thousand slots fit in the cache
+type Slot = Mutex<Option<(u64, Arc<Entry>)>>;
 
 pub(crate) struct QueryLog {
     epoch: Instant,
@@ -151,7 +145,7 @@ pub(crate) struct QueryLog {
     /// request still running holds the slot (more are tracked at once than there are slots), the request
     /// goes to `overflow`
     slots: Box<[Slot]>,
-    overflow: DashMap<u64, Pending>,
+    overflow: DashMap<u64, Arc<Entry>>,
     /// `overflow` 里有几条：为 0 时不碰共享表 / How many requests `overflow` holds: at 0 the map is not
     /// touched
     overflow_len: AtomicUsize,
@@ -167,41 +161,15 @@ struct Ring {
     newest: u64,
 }
 
-/// 还没结束的请求 / A request still running
-struct Pending {
-    started: Instant,
-    time_unix_ms: u64,
-    client: IpAddr,
-    transport: Option<ClientTransport>,
-    qname: Box<str>,
-    qtype: RecordType,
-    /// 多数请求不过四步，放得下就不另外分配 / Most requests take four steps or fewer, which need no
-    /// allocation of their own
-    steps: SmallVec<[Step; 4]>,
-    steps_truncated: bool,
-    cache: Option<CacheHitKind>,
-    cache_source: Option<ConfigName>,
-    joined: bool,
-    /// 最后进入的 Pipeline / The pipeline entered last
-    pipeline: Option<ConfigName>,
-    /// 最后一次决定：哪条规则（没有规则命中时是 None）、决定了什么；回答后检查的决定也算
-    /// The last decision: which rule (None when no rule matched) and what it decided; an answer check's
-    /// decision counts too
-    decision: Option<(Option<ConfigName>, DecisionKind)>,
-    /// 最后一个回了可用答案的上游 / The last upstream that returned a usable answer
-    answered_by: Option<ConfigName>,
-}
-
-#[derive(Serialize)]
 struct Step {
     /// 从请求进来算起的微秒数 / Microseconds since the request arrived
     at_us: u64,
-    #[serde(flatten)]
     what: StepKind,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+/// 处理过程的一步，写出来是 `{"at_us":…,"kind":"…",…}`：`kind` 是下面的名字（小写、下划线连接），空着的项不写
+/// A step of the handling, written as `{"at_us":…,"kind":"…",…}`: `kind` is the name below (lower case,
+/// joined by underscores), and empty items are left out
 enum StepKind {
     /// 进入一个 Pipeline：选中入口时一次，之后每跳一次一次 / Entered a pipeline: once at selection,
     /// once more after every jump
@@ -215,11 +183,8 @@ enum StepKind {
         pipeline: ConfigName,
         rule: ConfigName,
         phase: &'static str,
-        #[serde(skip_serializing_if = "Option::is_none")]
         matched: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         decision: Option<&'static str>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         target: Option<ConfigName>,
     },
     /// 前面没有对应规则那一步的决定：没有规则命中时 Pipeline 的默认决定，或没写回答检查条件的规则的回答阶段动作
@@ -227,11 +192,9 @@ enum StepKind {
     /// response actions of a rule that has no response matchers
     Decision {
         pipeline: ConfigName,
-        #[serde(skip_serializing_if = "Option::is_none")]
         rule: Option<ConfigName>,
         phase: &'static str,
         decision: &'static str,
-        #[serde(skip_serializing_if = "Option::is_none")]
         target: Option<ConfigName>,
     },
     /// 响应缓存：`fresh`、`stale`、`stale_timeout`、`stale_failure` 或 `miss`；命中时 `source` 是当初回答的上游
@@ -239,7 +202,6 @@ enum StepKind {
     /// is the upstream that answered originally
     Cache {
         result: &'static str,
-        #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<ConfigName>,
     },
     /// 同一时刻已有相同的查询在问上游，这次用了它的答案 / An identical query was already asking
@@ -256,12 +218,7 @@ enum StepKind {
         via: &'static str,
         result: &'static str,
         latency_us: u64,
-        #[serde(
-            skip_serializing_if = "Option::is_none",
-            serialize_with = "serialize_rcode"
-        )]
         rcode: Option<ResponseCode>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<Box<str>>,
     },
     /// 一组上游里这个这次没问，不算一次尝试；`reason` 只有 `throttled`（刚回过 429，正在暂停）。用单独的
@@ -277,43 +234,48 @@ enum StepKind {
     },
 }
 
-/// 一条查询记录。响应码、回答，以及由它们决定的结果和来源，都在面板来取时才读出（见下面的
-/// `Serialize`）：记录时只存客户端收到的应答原文。查询多到交接区装满时，还没被取走就挤掉的记录不必解析。
-/// One query record. The response code, the answers, and the outcome and source they decide are read
-/// out only when the panel collects the record (see `Serialize` below): recording keeps just the response
-/// the client got. When queries outrun the ring, a record pushed out before anyone collected it is never
-/// parsed.
+/// 一条查询记录。请求一开始就分配在它最终的位置上：在跟的时候只有槽位引用它，每一步原地写进来，请求结束补上
+/// 结果，再原样放进交接区，整条记录不再搬动。响应码、回答，以及由它们决定的结果和来源，都在面板来取时才读出
+/// （见 [`Entry::write`]）：记录时只存客户端收到的应答原文。查询多到交接区装满时，还没被取走就挤掉的记录不必解析。
+/// One query record. It is allocated in its final place when the request starts: while tracked only
+/// the slot refers to it, each step is written into it in place, the result is added when the request
+/// ends, and it goes into the ring as it is, never moved as a whole. The response code, the answers,
+/// and the outcome and source they decide are read out only when the panel collects the record (see
+/// [`Entry::write`]): recording keeps just the response the client got. When queries outrun the ring,
+/// a record pushed out before anyone collected it is never parsed.
 struct Entry {
     seq: u64,
+    started: Instant,
     time_unix_ms: u64,
     client: IpAddr,
-    transport: Option<&'static str>,
+    transport: Option<ClientTransport>,
     qname: Box<str>,
     qtype: RecordType,
-    latency_us: u64,
-    status: Status,
+    /// 多数请求不过四步，放得下就不另外分配 / Most requests take four steps or fewer, which need no
+    /// allocation of their own
+    steps: SmallVec<[Step; 4]>,
+    steps_truncated: bool,
     /// 命中的是哪种缓存 / Which kind of cache hit answered
     cache: Option<CacheHitKind>,
+    /// 缓存的答案当初是哪个上游回答的 / Which upstream originally answered a cached answer
+    cache_source: Option<ConfigName>,
     joined: bool,
-    /// 最后一次决定是规则直接回应 / The last decision was a rule's own answer
-    decided_static: bool,
-    response: Response,
-    error: Option<Box<str>>,
     /// 最后进入的 Pipeline：请求在哪里结束（缓存在规则之前就回了的，也有它）
     /// The pipeline entered last: where the request ended (a cache answer given before any rule ran has
     /// one too)
     pipeline: Option<ConfigName>,
-    /// 最后一次决定的规则；那个 Pipeline 只负责转发时，它可能在更早的 Pipeline 里
-    /// The rule of the last decision; when the final pipeline only forwards, it may sit in an earlier one
-    rule: Option<ConfigName>,
-    /// 缓存的答案当初是哪个上游回答的 / Which upstream originally answered a cached answer
-    cache_source: Option<ConfigName>,
+    /// 最后一次决定：哪条规则（没有规则命中时是 None）、决定了什么；回答后检查的决定也算。那个 Pipeline
+    /// 只负责转发时，规则可能在更早的 Pipeline 里
+    /// The last decision: which rule (None when no rule matched) and what it decided; an answer check's
+    /// decision counts too. When the final pipeline only forwards, the rule may sit in an earlier one
+    decision: Option<(Option<ConfigName>, DecisionKind)>,
     /// 最后一个回了可用答案的上游 / The last upstream that returned a usable answer
     answered_by: Option<ConfigName>,
-    /// 缓存命中只有两步，放得下就不另外分配 / A cache hit takes two steps, which need no allocation of
-    /// their own
-    steps: SmallVec<[Step; 2]>,
-    steps_truncated: bool,
+    /// 以下在请求结束时补上 / The rest is added when the request ends
+    latency_us: u64,
+    status: Status,
+    response: Response,
+    error: Option<Box<str>>,
 }
 
 /// 请求怎么结束的 / How the request ended
@@ -371,6 +333,11 @@ impl Response {
 }
 
 impl Entry {
+    /// 最后一次决定是规则直接回应 / Whether the last decision was a rule's own answer
+    fn decided_static(&self) -> bool {
+        matches!(self.decision, Some((_, DecisionKind::Static)))
+    }
+
     /// 答案从哪来：`forwarded`、`cached`、`stale`、`joined`、`static`（规则直接回应，包括回答后检查拦截或改写）、
     /// `failed`（引擎出错，或客户端收到的不是缓存里的 SERVFAIL）或 `cancelled`。缓存里拿到的 SERVFAIL 还算缓存
     /// （照实说答案从哪来）；别的 SERVFAIL 都是没解析出来
@@ -385,16 +352,17 @@ impl Entry {
             Status::Completed if self.cache.is_some() => "stale",
             Status::Completed if rcode == Some(ResponseCode::ServFail) => "failed",
             Status::Completed if self.joined => "joined",
-            Status::Completed if self.decided_static => "static",
+            Status::Completed if self.decided_static() => "static",
             Status::Completed => "forwarded",
             Status::Failed => "failed",
             Status::Cancelled => "cancelled",
         }
     }
-}
 
-impl Serialize for Entry {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    /// 写成一行 JSON。字段的顺序固定，空着的不写；`steps_truncated` 只在截断时写
+    /// Writes the record as one line of JSON. The fields come in a fixed order and empty ones are left
+    /// out; `steps_truncated` appears only when the steps were cut
+    fn write(&self, json: &mut Json) {
         let (rcode, answers) = self.response.read();
         let outcome = self.outcome(rcode);
         // 答案来自哪个上游：转发的是回答的那个，缓存的是当初回答的那个；规则直接回应、合并和失败的没有
@@ -405,41 +373,238 @@ impl Serialize for Entry {
             "forwarded" => self.answered_by.as_deref(),
             _ => None,
         };
-        let mut entry = serializer.serialize_struct("Entry", 17)?;
-        entry.serialize_field("seq", &self.seq)?;
-        entry.serialize_field("time_unix_ms", &self.time_unix_ms)?;
-        entry.serialize_field("client", &self.client)?;
+        json.raw("{\"seq\":");
+        json.number(self.seq);
+        json.key("time_unix_ms");
+        json.number(self.time_unix_ms);
+        json.key("client");
+        json.address(self.client);
         if let Some(transport) = self.transport {
-            entry.serialize_field("transport", transport)?;
+            json.key("transport");
+            json.label(client_transport_label(transport));
         }
-        entry.serialize_field("qname", &self.qname)?;
+        json.key("qname");
+        json.text(&self.qname);
         // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
         // hickory's `Display` writes it, without allocating a string first
-        entry.serialize_field("qtype", <&'static str>::from(self.qtype))?;
-        entry.serialize_field("latency_us", &self.latency_us)?;
-        entry.serialize_field("status", self.status.label())?;
-        entry.serialize_field("outcome", outcome)?;
+        json.key("qtype");
+        json.text(<&'static str>::from(self.qtype));
+        json.key("latency_us");
+        json.number(self.latency_us);
+        json.key("status");
+        json.label(self.status.label());
+        json.key("outcome");
+        json.label(outcome);
         if let Some(rcode) = rcode {
-            entry.serialize_field("rcode", &rcode_name(rcode))?;
+            json.key("rcode");
+            json.label(&rcode_name(rcode));
         }
-        entry.serialize_field("answers", &answers)?;
+        json.key("answers");
+        json.raw("[");
+        for (index, answer) in answers.iter().enumerate() {
+            if index > 0 {
+                json.raw(",");
+            }
+            json.text(answer);
+        }
+        json.raw("]");
         if let Some(error) = &self.error {
-            entry.serialize_field("error", error)?;
+            json.key("error");
+            json.text(error);
         }
         if let Some(pipeline) = &self.pipeline {
-            entry.serialize_field("pipeline", pipeline)?;
+            json.key("pipeline");
+            json.text(pipeline);
         }
-        if let Some(rule) = &self.rule {
-            entry.serialize_field("rule", rule)?;
+        if let Some((Some(rule), _)) = &self.decision {
+            json.key("rule");
+            json.text(rule);
         }
         if let Some(upstream) = upstream {
-            entry.serialize_field("upstream", upstream)?;
+            json.key("upstream");
+            json.text(upstream);
         }
-        entry.serialize_field("steps", &self.steps[..])?;
+        json.key("steps");
+        json.raw("[");
+        for (index, step) in self.steps.iter().enumerate() {
+            if index > 0 {
+                json.raw(",");
+            }
+            step.write(json);
+        }
+        json.raw("]");
         if self.steps_truncated {
-            entry.serialize_field("steps_truncated", &true)?;
+            json.key("steps_truncated");
+            json.raw("true");
         }
-        entry.end()
+        json.raw("}");
+    }
+}
+
+impl Step {
+    fn write(&self, json: &mut Json) {
+        json.raw("{\"at_us\":");
+        json.number(self.at_us);
+        json.key("kind");
+        match &self.what {
+            StepKind::Pipeline { pipeline } => {
+                json.label("pipeline");
+                json.key("pipeline");
+                json.text(pipeline);
+            }
+            StepKind::Rule {
+                pipeline,
+                rule,
+                phase,
+                matched,
+                decision,
+                target,
+            } => {
+                json.label("rule");
+                json.key("pipeline");
+                json.text(pipeline);
+                json.key("rule");
+                json.text(rule);
+                json.key("phase");
+                json.label(phase);
+                if let Some(matched) = matched {
+                    json.key("matched");
+                    json.raw(if *matched { "true" } else { "false" });
+                }
+                if let Some(decision) = decision {
+                    json.key("decision");
+                    json.label(decision);
+                }
+                if let Some(target) = target {
+                    json.key("target");
+                    json.text(target);
+                }
+            }
+            StepKind::Decision {
+                pipeline,
+                rule,
+                phase,
+                decision,
+                target,
+            } => {
+                json.label("decision");
+                json.key("pipeline");
+                json.text(pipeline);
+                if let Some(rule) = rule {
+                    json.key("rule");
+                    json.text(rule);
+                }
+                json.key("phase");
+                json.label(phase);
+                json.key("decision");
+                json.label(decision);
+                if let Some(target) = target {
+                    json.key("target");
+                    json.text(target);
+                }
+            }
+            StepKind::Cache { result, source } => {
+                json.label("cache");
+                json.key("result");
+                json.label(result);
+                if let Some(source) = source {
+                    json.key("source");
+                    json.text(source);
+                }
+            }
+            StepKind::Joined => json.label("joined"),
+            StepKind::Upstream {
+                upstream,
+                transport,
+                via,
+                result,
+                latency_us,
+                rcode,
+                error,
+            } => {
+                json.label("upstream");
+                json.key("upstream");
+                json.text(upstream);
+                json.key("transport");
+                json.label(transport);
+                json.key("via");
+                json.label(via);
+                json.key("result");
+                json.label(result);
+                json.key("latency_us");
+                json.number(*latency_us);
+                if let Some(rcode) = rcode {
+                    json.key("rcode");
+                    json.label(&rcode_name(*rcode));
+                }
+                if let Some(error) = error {
+                    json.key("error");
+                    json.text(error);
+                }
+            }
+            StepKind::UpstreamSkipped {
+                upstream,
+                transport,
+                reason,
+            } => {
+                json.label("upstream_skipped");
+                json.key("upstream");
+                json.text(upstream);
+                json.key("transport");
+                json.label(transport);
+                json.key("reason");
+                json.label(reason);
+            }
+        }
+        json.raw("}");
+    }
+}
+
+/// 拼一页 JSON。键名和内核自己的标签（`udp`、`forward`、`success`……）原样写；外来的文字（域名、配置里的名字、
+/// 错误、回答）照 serde_json 的规矩转义，数字也由它写。不先建 JSON 树，也不走通用的序列化
+/// Builds a page of JSON. Keys and the kernel's own labels (`udp`, `forward`, `success`, …) go in as
+/// they are; outside text (domain names, names from the config, errors, answers) is escaped by
+/// serde_json's rules, and numbers are written by it too. No JSON tree is built, and no generic
+/// serialization is gone through
+struct Json(Vec<u8>);
+
+impl Json {
+    fn raw(&mut self, text: &str) {
+        self.0.extend_from_slice(text.as_bytes());
+    }
+
+    /// 下一个字段的键：前面总有别的字段，所以先写逗号 / The next field's key: another field always comes
+    /// before, so a comma goes first
+    fn key(&mut self, key: &str) {
+        self.raw(",\"");
+        self.raw(key);
+        self.raw("\":");
+    }
+
+    /// 内核自己的标签：只有小写字母、数字和下划线，不用转义 / A label of the kernel's own: lower-case
+    /// letters, digits and underscores only, which need no escaping
+    fn label(&mut self, label: &str) {
+        self.raw("\"");
+        self.raw(label);
+        self.raw("\"");
+    }
+
+    fn text(&mut self, text: &str) {
+        // 写进 Vec 不会失败 / Writing into a Vec cannot fail
+        let _ =
+            serde::Serializer::serialize_str(&mut serde_json::Serializer::new(&mut self.0), text);
+    }
+
+    fn number(&mut self, number: u64) {
+        let _ =
+            serde::Serializer::serialize_u64(&mut serde_json::Serializer::new(&mut self.0), number);
+    }
+
+    /// 地址的写法和 `Display` 一样，只有数字、字母、点和冒号 / An address as `Display` writes it: digits,
+    /// letters, dots and colons only
+    fn address(&mut self, address: IpAddr) {
+        use std::io::Write as _;
+        let _ = write!(self.0, "\"{address}\"");
     }
 }
 
@@ -453,24 +618,7 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// 一次取走的结果 / One collection
-#[derive(Serialize)]
-struct Page<'a> {
-    protocol_version: u8,
-    instance: u64,
-    capacity: usize,
-    newest_seq: u64,
-    /// 序号在游标之后、已经被挤出交接区的条数 / Records numbered after the cursor that were already
-    /// pushed out of the ring
-    missed: u64,
-    /// 超出在途上限没能记下的请求，自内核启动起累计 / Requests left unrecorded because too many were in
-    /// flight, cumulative since the kernel started
-    untracked: u64,
-    more: bool,
-    entries: Vec<&'a Entry>,
-}
-
-impl Pending {
+impl Entry {
     fn push(&mut self, what: StepKind) {
         if self.steps.len() >= MAX_STEPS {
             self.steps_truncated = true;
@@ -561,20 +709,26 @@ impl QueryLog {
         &self.slots[request_id as usize & (self.slots.len() - 1)]
     }
 
-    fn with_pending(&self, ctx: &RequestContext<'_>, update: impl FnOnce(&mut Pending)) {
+    /// 往在跟的请求的记录里写。记录放进交接区之前只有槽位引用它，`get_mut` 总能拿到
+    /// Writes into a tracked request's record. Until the record goes into the ring only the slot refers
+    /// to it, so `get_mut` always succeeds
+    fn with_pending(&self, ctx: &RequestContext<'_>, update: impl FnOnce(&mut Entry)) {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return;
         }
         if let Some((id, pending)) = &mut *self.slot(ctx.request_id).lock()
             && *id == ctx.request_id
         {
-            update(pending);
+            if let Some(pending) = Arc::get_mut(pending) {
+                update(pending);
+            }
             return;
         }
         if self.overflow_len.load(Ordering::Relaxed) > 0
             && let Some(mut pending) = self.overflow.get_mut(&ctx.request_id)
+            && let Some(pending) = Arc::get_mut(&mut pending)
         {
-            update(&mut pending);
+            update(pending);
         }
     }
 
@@ -592,7 +746,8 @@ impl QueryLog {
             self.untracked.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let pending = Pending {
+        let pending = Arc::new(Entry {
+            seq: 0,
             started,
             time_unix_ms: unix_ms(),
             client: ctx.client.ip().to_canonical(),
@@ -607,7 +762,11 @@ impl QueryLog {
             pipeline: None,
             decision: None,
             answered_by: None,
-        };
+            latency_us: 0,
+            status: Status::Cancelled,
+            response: Response::None,
+            error: None,
+        });
         // 同一个请求号又开始一次时替换掉原来那条，不多算一条（和原先用共享表时一样）
         // The same request number starting again replaces its record without counting another (as
         // when a shared map held them all)
@@ -819,17 +978,19 @@ impl QueryLog {
             self.overflow_len.fetch_sub(1, Ordering::Relaxed);
             Some(pending)
         });
-        let Some(pending) = pending else {
+        let Some(mut pending) = pending else {
             return;
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
-        self.push(finish(pending, outcome));
+        if let Some(entry) = Arc::get_mut(&mut pending) {
+            finish(entry, outcome);
+        }
+        self.push(pending);
     }
 
-    fn push(&self, entry: Entry) {
-        // 分配和释放都在锁外：锁里只给序号、换进换出 / Allocating and freeing happen outside the lock:
-        // inside it the record only gets its number and is swapped in
-        let mut entry = Arc::new(entry);
+    fn push(&self, mut entry: Arc<Entry>) {
+        // 释放在锁外：锁里只给序号、换进换出 / Freeing happens outside the lock: inside it the record
+        // only gets its number and is swapped in
         let (evicted, newest) = {
             let mut ring = self.ring.lock();
             ring.newest += 1;
@@ -942,56 +1103,56 @@ impl QueryLog {
         // With the ring empty (emptied, or never written), everything after the cursor up to the newest
         // number is gone
         let first_kept = oldest.unwrap_or(newest.saturating_add(1));
-        let page = Page {
-            protocol_version,
-            instance: self.instance,
-            capacity: self.capacity,
-            newest_seq: newest,
-            missed: first_kept.saturating_sub(after.saturating_add(1)),
-            untracked: self.untracked.load(Ordering::Relaxed),
-            more: entries.last().is_some_and(|entry| entry.seq < newest),
-            entries: entries.iter().map(|entry| &**entry).collect(),
-        };
-        serde_json::to_string(&page).unwrap_or_else(|error| {
-            // 记录里只有字符串和数字，序列化不会失败；万一失败也不让面板读到半截 JSON
-            // Records hold only strings and numbers, so serializing cannot fail; should it, the panel
-            // still never reads half a JSON text
-            serde_json::json!({ "protocol_version": protocol_version, "error": error.to_string() })
-                .to_string()
-        })
+        // 一条大约六七百字节，一次给够，免得边写边挪 / A record takes six or seven hundred bytes, so the
+        // room is given at once instead of moving as it grows
+        let mut json = Json(Vec::with_capacity(256 + entries.len() * 768));
+        json.raw("{\"protocol_version\":");
+        json.number(u64::from(protocol_version));
+        json.key("instance");
+        json.number(self.instance);
+        json.key("capacity");
+        json.number(u64::try_from(self.capacity).unwrap_or(u64::MAX));
+        json.key("newest_seq");
+        json.number(newest);
+        // 序号在游标之后、已经被挤出交接区的条数 / Records numbered after the cursor that were already
+        // pushed out of the ring
+        json.key("missed");
+        json.number(first_kept.saturating_sub(after.saturating_add(1)));
+        // 超出在途上限没能记下的请求，自内核启动起累计 / Requests left unrecorded because too many were in
+        // flight, cumulative since the kernel started
+        json.key("untracked");
+        json.number(self.untracked.load(Ordering::Relaxed));
+        json.key("more");
+        json.raw(if entries.last().is_some_and(|entry| entry.seq < newest) {
+            "true"
+        } else {
+            "false"
+        });
+        json.key("entries");
+        json.raw("[");
+        for (index, entry) in entries.iter().enumerate() {
+            if index > 0 {
+                json.raw(",");
+            }
+            entry.write(&mut json);
+        }
+        json.raw("]}");
+        // 写进去的都是完整的 UTF-8 / Everything written is whole UTF-8
+        String::from_utf8(json.0).unwrap_or_default()
     }
 }
 
-/// 请求结束：把攒下的步骤和响应拼成一条记录 / The request ended: its steps and response become a record
-fn finish(pending: Pending, outcome: &RequestOutcome<'_>) -> Entry {
-    let status = match outcome.status {
+/// 请求结束：补上用了多久、怎么结束的和客户端收到的应答 / The request ended: how long it took, how it
+/// ended and the response the client got are added
+fn finish(entry: &mut Entry, outcome: &RequestOutcome<'_>) {
+    entry.latency_us = u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX);
+    entry.status = match outcome.status {
         RequestStatus::Completed => Status::Completed,
         RequestStatus::Failed => Status::Failed,
         RequestStatus::Cancelled => Status::Cancelled,
     };
-    let decided_static = matches!(pending.decision, Some((_, DecisionKind::Static)));
-    let rule = pending.decision.and_then(|(rule, _)| rule);
-    Entry {
-        seq: 0,
-        time_unix_ms: pending.time_unix_ms,
-        client: pending.client,
-        transport: pending.transport.map(client_transport_label),
-        qname: pending.qname,
-        qtype: pending.qtype,
-        latency_us: u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX),
-        status,
-        cache: pending.cache,
-        joined: pending.joined,
-        decided_static,
-        response: Response::keep(outcome.response),
-        error: outcome.error.map(|error| clip(error).into()),
-        pipeline: pending.pipeline,
-        rule,
-        cache_source: pending.cache_source,
-        answered_by: pending.answered_by,
-        steps: pending.steps.into_iter().collect(),
-        steps_truncated: pending.steps_truncated,
-    }
+    entry.response = Response::keep(outcome.response);
+    entry.error = outcome.error.map(|error| clip(error).into());
 }
 
 /// 响应码和回答记录（只取记录的数据部分，最多 8 条）；解析不了就只读包头的响应码。
@@ -1086,17 +1247,6 @@ fn name_end(packet: &[u8], mut pos: usize) -> Option<usize> {
             _ if len & 0xC0 == 0xC0 => return Some(pos + 2),
             _ => pos += 1 + usize::from(len),
         }
-    }
-}
-
-/// 上游那一步的响应码，取走时写成助记名 / An upstream step's response code, named when collected
-fn serialize_rcode<S: Serializer>(
-    code: &Option<ResponseCode>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match code {
-        Some(code) => serializer.serialize_str(&rcode_name(*code)),
-        None => serializer.serialize_none(),
     }
 }
 
@@ -1674,6 +1824,148 @@ mod tests {
         let _ = log.collect(3, 10, Some(log.instance + 1), 1);
         assert_eq!(seqs(&page(&log, 0, 10)), [1, 2, 3]);
     }
+
+    /// 一页 JSON 逐字节固定：每种步骤、空着不写的项、要转义的文字、IPv6 客户端、各种结果。面板照原文存下记录，
+    /// 字段的顺序和写法变了，存下来的就跟着变
+    /// A page of JSON fixed byte for byte: every kind of step, items left out when empty, text that needs
+    /// escaping, an IPv6 client and the various outcomes. The panel stores records as written, so a change
+    /// in field order or spelling changes what it stores
+    #[test]
+    fn a_page_is_written_byte_for_byte() {
+        let log = QueryLog::default();
+        let ok = response(ResponseCode::NoError, &[[192, 0, 2, 1], [192, 0, 2, 2]]);
+        let cached = ctx(1);
+        log.request_started(&cached, false);
+        log.pipeline_selected(&cached, "main");
+        log.cache_hit(
+            &cached,
+            &CacheHit {
+                kind: CacheHitKind::Fresh,
+                remaining_ttl: None,
+                original_ttl: None,
+                source: Some("udp://192.0.2.53"),
+            },
+        );
+        finish(&log, &cached, RequestStatus::Completed, Some(&ok));
+        let forwarded = RequestContext {
+            client: SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 53_000),
+            transport: Some(ClientTransport::Tcp),
+            ..ctx(2)
+        };
+        log.request_started(&forwarded, false);
+        log.pipeline_selected(&forwarded, "main");
+        log.cache_miss(&forwarded);
+        matched(&log, &forwarded, "all", DecisionKind::Forward);
+        log.decision_made(
+            &forwarded,
+            &DecisionMade {
+                pipeline: "main",
+                rule: Some("all"),
+                phase: RulePhase::Request,
+                detail: DecisionDetail::Forward {
+                    upstream: "udp://192.0.2.53",
+                    transport: None,
+                },
+            },
+        );
+        upstream(&log, &forwarded, "192.0.2.53:53", UpstreamOutcome::Success);
+        finish(&log, &forwarded, RequestStatus::Completed, Some(&ok));
+        let checked = RequestContext {
+            qname: "q\"uote\\back\u{1}.example",
+            transport: None,
+            ..ctx(3)
+        };
+        log.request_started(&checked, false);
+        log.pipeline_selected(&checked, "p\"1");
+        log.inflight_joined(&checked);
+        log.rule_evaluated(
+            &checked,
+            &RuleEvaluated {
+                pipeline: "p\"1",
+                rule: "check",
+                phase: RulePhase::Response,
+                matched: false,
+                matchers: 1,
+            },
+        );
+        log.decision_made(
+            &checked,
+            &DecisionMade {
+                pipeline: "p\"1",
+                rule: Some("check"),
+                phase: RulePhase::Request,
+                detail: DecisionDetail::Jump { pipeline: "other" },
+            },
+        );
+        log.upstream_skipped(
+            &checked,
+            &crate::observe::UpstreamSkipped {
+                upstream: "https://dns.example/dns-query",
+                transport: Transport::Doh,
+                reason: crate::observe::UpstreamSkipReason::Throttled,
+            },
+        );
+        let refused = anyhow::anyhow!("refused \"x\"\nagain");
+        log.upstream_result(
+            &checked,
+            &UpstreamResult {
+                upstream: "192.0.2.54:53",
+                transport: Transport::Udp,
+                via: Transport::Tcp,
+                outcome: UpstreamOutcome::Error,
+                latency: Duration::from_millis(3),
+                rcode: None,
+                truncated: None,
+                error: Some(&refused),
+            },
+        );
+        finish(&log, &checked, RequestStatus::Completed, Some(&ok));
+        let blocked = ctx(4);
+        log.request_started(&blocked, false);
+        matched(&log, &blocked, "ads", DecisionKind::Static);
+        log.decision_made(
+            &blocked,
+            &DecisionMade {
+                pipeline: "main",
+                rule: Some("ads"),
+                phase: RulePhase::Request,
+                detail: DecisionDetail::Static {
+                    rcode: ResponseCode::NXDomain,
+                    answers: 0,
+                },
+            },
+        );
+        finish(
+            &log,
+            &blocked,
+            RequestStatus::Completed,
+            Some(&response(ResponseCode::NXDomain, &[])),
+        );
+        let failed = ctx(5);
+        log.request_started(&failed, false);
+        log.request_finished(
+            &failed,
+            &RequestOutcome {
+                latency: Duration::from_millis(21),
+                status: RequestStatus::Failed,
+                response: None,
+                error: Some("engine \"failed\"\n"),
+            },
+        );
+        let page = log.collect(0, 10, None, 1);
+        let page = regex::Regex::new(r#""(time_unix_ms|at_us|instance)":\d+"#)
+            .unwrap()
+            .replace_all(&page, r#""$1":0"#);
+        assert_eq!(page, EXPECTED_PAGE);
+    }
+
+    const EXPECTED_PAGE: &str = concat!(
+        r#"{"protocol_version":1,"instance":0,"capacity":16384,"newest_seq":5,"missed":0,"untracked":0,"more":false,"entries":[{"seq":1,"time_unix_ms":0,"client":"192.0.2.7","transport":"udp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"completed","outcome":"cached","rcode":"NOERROR","answers":["192.0.2.1","192.0.2.2"],"pipeline":"main","upstream":"udp://192.0.2.53","steps":[{"at_us":0,"kind":"pipeline","pipeline":"main"},{"at_us":0,"kind":"cache","result":"fresh","source":"udp://192.0.2.53"}]}"#,
+        r#",{"seq":2,"time_unix_ms":0,"client":"::1","transport":"tcp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"completed","outcome":"forwarded","rcode":"NOERROR","answers":["192.0.2.1","192.0.2.2"],"pipeline":"main","rule":"all","upstream":"192.0.2.53:53","steps":[{"at_us":0,"kind":"pipeline","pipeline":"main"},{"at_us":0,"kind":"cache","result":"miss"},{"at_us":0,"kind":"rule","pipeline":"main","rule":"all","phase":"request","decision":"forward","target":"udp://192.0.2.53"},{"at_us":0,"kind":"upstream","upstream":"192.0.2.53:53","transport":"udp","via":"udp","result":"success","latency_us":20000,"rcode":"NOERROR"}]}"#,
+        r#",{"seq":3,"time_unix_ms":0,"client":"192.0.2.7","qname":"q\"uote\\back\u0001.example","qtype":"A","latency_us":21000,"status":"completed","outcome":"joined","rcode":"NOERROR","answers":["192.0.2.1","192.0.2.2"],"pipeline":"p\"1","rule":"check","steps":[{"at_us":0,"kind":"pipeline","pipeline":"p\"1"},{"at_us":0,"kind":"joined"},{"at_us":0,"kind":"rule","pipeline":"p\"1","rule":"check","phase":"response","matched":false},{"at_us":0,"kind":"decision","pipeline":"p\"1","rule":"check","phase":"request","decision":"jump","target":"other"},{"at_us":0,"kind":"upstream_skipped","upstream":"https://dns.example/dns-query","transport":"doh","reason":"throttled"},{"at_us":0,"kind":"upstream","upstream":"192.0.2.54:53","transport":"udp","via":"tcp","result":"error","latency_us":3000,"error":"refused \"x\"\nagain"}]}"#,
+        r#",{"seq":4,"time_unix_ms":0,"client":"192.0.2.7","transport":"udp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"completed","outcome":"static","rcode":"NXDOMAIN","answers":[],"rule":"ads","steps":[{"at_us":0,"kind":"rule","pipeline":"main","rule":"ads","phase":"request","decision":"static"}]}"#,
+        r#",{"seq":5,"time_unix_ms":0,"client":"192.0.2.7","transport":"udp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"failed","outcome":"failed","answers":[],"error":"engine \"failed\"\n","steps":[]}]}"#,
+    );
 
     #[test]
     fn recording_stops_two_minutes_after_the_last_collection() {
