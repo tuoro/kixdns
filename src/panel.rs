@@ -865,7 +865,8 @@ impl PanelMetrics {
                 "querylog_v1",
                 "querylog_wait_v1",
                 "querylog_stored_v1",
-                "querylog_until_v1"
+                "querylog_until_v1",
+                "querylog_records_v1"
             ],
         })
     }
@@ -2139,18 +2140,22 @@ async fn querylog_response(
     }
     let collecting = Arc::clone(metrics);
     match tokio::task::spawn_blocking(move || {
-        collecting.query_log.collect(
+        let page = collecting.query_log.take(
             take.after,
             take.limit,
             take.until,
             take.instance,
             take.stored,
             PROTOCOL_VERSION,
-        )
+        );
+        match take.format {
+            QueryLogFormat::Json => ("application/json; charset=utf-8", page.json().into_bytes()),
+            QueryLogFormat::Records => ("application/octet-stream", page.records()),
+        }
     })
     .await
     {
-        Ok(page) => text_response(StatusCode::OK, "application/json; charset=utf-8", page),
+        Ok((content_type, page)) => bytes_response(StatusCode::OK, content_type, page),
         Err(error) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json("querylog_failed", &error.to_string()),
@@ -2166,20 +2171,32 @@ struct QueryLogTake {
     after: u64,
     /// 最多取几条，默认取满一页 / At most how many records, a full page by default
     limit: usize,
-    /// 只取到这个序号为止（见 `QueryLog::collect`）/ No record past this number (see `QueryLog::collect`)
+    /// 只取到这个序号为止（见 `QueryLog::take`）/ No record past this number (see `QueryLog::take`)
     until: Option<u64>,
-    /// 游标是哪个内核进程的（见 `QueryLog::collect`）/ The kernel process the cursor belongs to (see `QueryLog::collect`)
+    /// 游标是哪个内核进程的（见 `QueryLog::take`）/ The kernel process the cursor belongs to (see `QueryLog::take`)
     instance: Option<u64>,
-    /// 面板存好到哪一条（见 `QueryLog::collect`）/ The record the panel has stored up to (see `QueryLog::collect`)
+    /// 面板存好到哪一条（见 `QueryLog::take`）/ The record the panel has stored up to (see `QueryLog::take`)
     stored: Option<u64>,
+    /// 交成什么样（见 `TakenPage`）/ How the page is handed over (see `TakenPage`)
+    format: QueryLogFormat,
     /// 攒不满一页时最多等多久（见 `QueryLog::wait_for_page`）/ How long to wait at most while a page has not filled
     /// (see `QueryLog::wait_for_page`)
     wait: std::time::Duration,
 }
 
+/// 一页查询日志交成什么样：JSON（`querylog_v1`），或者编好的记录原样交出（`querylog_records_v1`）
+/// How a page of the query log is handed over: as JSON (`querylog_v1`), or as the encoded records
+/// themselves (`querylog_records_v1`)
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryLogFormat {
+    Json,
+    Records,
+}
+
 /// 查询日志的游标：`after`、`limit`、`until`、`instance`、`stored`、`wait_ms`，含义见 [`QueryLogTake`]
 /// The query log cursor: `after`, `limit`, `until`, `instance`, `stored` and `wait_ms`, as described at
-/// [`QueryLogTake`]
+/// [`QueryLogTake`], and `format` (`json` or `records1`)
 #[cfg(unix)]
 fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static str> {
     let mut take = QueryLogTake {
@@ -2188,6 +2205,7 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
         until: None,
         instance: None,
         stored: None,
+        format: QueryLogFormat::Json,
         wait: std::time::Duration::ZERO,
     };
     for pair in query.into_iter().flat_map(|query| query.split('&')) {
@@ -2208,6 +2226,13 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
             "until" => take.until = Some(value.parse().map_err(|_| "截止序号无效")?),
             "instance" => take.instance = Some(value.parse().map_err(|_| "内核进程无效")?),
             "stored" => take.stored = Some(value.parse().map_err(|_| "存好的序号无效")?),
+            "format" => {
+                take.format = match value {
+                    "json" => QueryLogFormat::Json,
+                    "records1" => QueryLogFormat::Records,
+                    _ => return Err("格式只能是 json 或 records1"),
+                };
+            }
             "wait_ms" => {
                 take.wait =
                     std::time::Duration::from_millis(value.parse().map_err(|_| "等待时间无效")?);
@@ -2265,6 +2290,15 @@ fn text_response(
     status: StatusCode,
     content_type: &'static str,
     body: String,
+) -> Response<Full<Bytes>> {
+    bytes_response(status, content_type, body.into_bytes())
+}
+
+#[cfg(unix)]
+fn bytes_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
 ) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::from(body)));
     *response.status_mut() = status;
@@ -3749,6 +3783,7 @@ mod diagnostic_tests {
             "querylog_wait_v1",
             "querylog_stored_v1",
             "querylog_until_v1",
+            "querylog_records_v1",
         ] {
             assert!(
                 capabilities().iter().any(|name| name == capability),
@@ -3767,6 +3802,7 @@ mod diagnostic_tests {
             until: None,
             instance,
             stored: None,
+            format: super::QueryLogFormat::Json,
             wait,
         };
         assert_eq!(
@@ -3804,6 +3840,11 @@ mod diagnostic_tests {
         );
         assert!(parse_querylog_query(Some("stored=soon")).is_err());
         assert!(parse_querylog_query(Some("until=soon")).is_err());
+        assert_eq!(
+            parse_querylog_query(Some("format=records1")).map(|take| take.format),
+            Ok(super::QueryLogFormat::Records)
+        );
+        assert!(parse_querylog_query(Some("format=xml")).is_err());
         assert!(parse_querylog_query(Some("wait_ms=5001")).is_err());
         assert!(parse_querylog_query(Some("wait_ms=soon")).is_err());
         assert!(parse_querylog_query(Some("limit=0")).is_err());
@@ -4017,6 +4058,39 @@ mod diagnostic_tests {
             .collect();
         assert_eq!(seqs, [2, 3]);
         assert_eq!(left["missed"], 1);
+    }
+
+    /// 经过控制口：带 `format=records1` 时交的是编好的记录（二进制），和 JSON 那一页是同样的记录；不认得的格式拒绝
+    /// Through the control socket: with `format=records1` the encoded records come as binary, the same
+    /// records as the JSON page; a format it does not know is refused
+    #[tokio::test]
+    async fn the_control_socket_hands_over_encoded_records() {
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(client_split_config("192.168.1.0/24"), Arc::clone(&metrics));
+        let home = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
+        for name in ["a.example", "b.example"] {
+            let (packet, _) = diagnostic_packet(name, "A").expect("packet");
+            engine.handle_packet(&packet, home).await.expect("query");
+        }
+        let response = super::querylog_response(&metrics, Some("after=0&format=records1")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[hyper::header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(body.starts_with(b"KXQL\x01"), "{body:?}");
+        for name in [b"a.example".as_slice(), b"b.example"] {
+            assert!(
+                body.windows(name.len()).any(|window| window == name),
+                "{body:?}"
+            );
+        }
+        let refused = super::querylog_response(&metrics, Some("after=0&format=xml")).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     }
 
     /// 经过控制口：`until` 让一页只交到它为止；等着取时到它为止的都在了就回，不等攒满 `limit` 条
