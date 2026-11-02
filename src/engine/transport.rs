@@ -1818,6 +1818,10 @@ pub struct DohClient {
     /// How long a connection may sit idle before it is not used again (see
     /// `doh_h2::DOH_IDLE_TIMEOUT`), shorter in some tests
     idle_timeout: Duration,
+    /// 每个上游最多几条直连：每个工作线程一条，平常只用一条（见 `doh_h2::BUSY_AT`）
+    /// How many direct connections an upstream may have at most: one per worker thread, with
+    /// one normally in use (see `doh_h2::BUSY_AT`)
+    direct_connections: usize,
     /// 测试里改走明文 http：引擎把 DoH 上游一律当 https，本机的假 DoH 上游只会说 http
     /// Plain http in tests: the engine takes every DoH upstream as https, and the local fake
     /// DoH upstream speaks http only
@@ -1844,6 +1848,8 @@ impl DohClient {
             connector: doh_h2::tcp_connector(),
             direct_h2: !doh_h2::proxy_configured(),
             idle_timeout: doh_h2::DOH_IDLE_TIMEOUT,
+            direct_connections: tokio::runtime::Handle::try_current()
+                .map_or(1, |runtime| runtime.metrics().num_workers()),
             #[cfg(test)]
             plain_http: AtomicBool::new(false),
             #[cfg(test)]
@@ -1879,6 +1885,20 @@ impl DohClient {
     #[cfg(test)]
     pub(crate) fn set_idle_timeout_for_tests(&mut self, idle: Duration) {
         self.idle_timeout = idle;
+    }
+
+    /// 测试里定每个上游最多几条直连 / In tests, set how many direct connections an upstream may have
+    #[cfg(test)]
+    pub(crate) fn set_direct_connections_for_tests(&mut self, connections: usize) {
+        self.direct_connections = connections;
+    }
+
+    /// 测试里看 `upstream` 的直连上还有几个请求没答完 / In tests, how many requests are unanswered on `upstream`'s direct connections
+    #[cfg(test)]
+    pub(crate) fn direct_in_flight(&self, upstream: &str) -> usize {
+        self.upstreams
+            .get(upstream)
+            .map_or(0, |state| state.h2.in_flight())
     }
 
     /// 测试里关掉直连，全部走 reqwest，和设了代理时一样 / In tests, turn the direct connection off so everything goes through reqwest, as with a proxy set
@@ -1956,7 +1976,7 @@ impl DohClient {
                     last_used_millis: AtomicU64::new(now),
                     paused_until: AtomicU64::new(0),
                     target: std::sync::OnceLock::new(),
-                    h2: H2Link::new(self.idle_timeout),
+                    h2: H2Link::new(self.idle_timeout, self.direct_connections),
                 });
                 slot.insert(Arc::clone(&state));
                 Ok(state)
@@ -2151,7 +2171,8 @@ impl DohClient {
             // would send: the same method, address and headers. hyper and reqwest add
             // content-length themselves, h2 does not
             if let Some(uri) = uri
-                && let Some(sender) = state.h2.sender(url, &self.tls_h2, &self.connector).await?
+                && let Some((sender, _in_flight)) =
+                    state.h2.sender(url, &self.tls_h2, &self.connector).await?
             {
                 let mut request = hyper::Request::post(uri.clone())
                     .header(ACCEPT, DOH_MEDIA_TYPE)
