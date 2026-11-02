@@ -9,6 +9,8 @@
 //! [`BUSY_AT`]). When a connection is gone, idle too long or rebuilt after repeated errors, the
 //! next request connects again. An upstream that did not pick h2 is handed to reqwest by the
 //! caller as before.
+//!
+//! [`BUSY_AT`]: super::transport::BUSY_AT
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,6 +29,8 @@ use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tower_service::Service;
 use url::{Host, Url};
+
+use super::transport::{InFlight, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
 pub(crate) type H2Sender = SendRequest<Bytes>;
@@ -53,17 +57,6 @@ struct H2Conn {
     last_used_ms: AtomicU64,
 }
 
-/// 一条连接上同时有这么多请求还没答完就算忙，再来的请求换下一个位。一阵子几十个以内的查询（比如打开一个
-/// 网页）都留在一条连接上，用不着的连接不去连，也不会因为隔太久没用而每次重新握手；一直有这么多在途时才
-/// 分到更多连接，各条连接的加解密和收发落到不同的核上。本机压测里只有一条连接时，4 核压满也只到单核的吞吐
-/// A connection with this many requests unanswered at once counts as busy, and further requests
-/// go to the next slot. A burst of a few dozen queries at most (a web page opening, say) stays
-/// on one connection, so connections nothing needs are not made, nor redone with a fresh
-/// handshake each time for sitting idle too long; only steadily this many in flight spreads
-/// requests over more connections, whose encryption and I/O then land on different cores. In a
-/// local load test with one connection, four cores at full load reached only the throughput of one
-pub(crate) const BUSY_AT: usize = 32;
-
 /// 一个连接位：最多一条连接 / One connection slot: at most one connection
 struct Slot {
     conn: ArcSwapOption<H2Conn>,
@@ -73,18 +66,10 @@ struct Slot {
     in_flight: AtomicUsize,
 }
 
-/// 一个请求占着一个连接位，丢掉时这个位的在途数减一 / A request's hold on a slot: dropping it takes one off the slot's in-flight count
-pub(crate) struct InFlight<'a>(&'a Slot);
-
-impl Drop for InFlight<'_> {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
-/// 一个 DoH 上游的 HTTP/2 连接：每个工作线程一个位，平常只用第一个（见 [`BUSY_AT`]）
+/// 一个 DoH 上游的 HTTP/2 连接：每个工作线程一个位，平常只用第一个
+/// （见 [`BUSY_AT`](super::transport::BUSY_AT)）
 /// One DoH upstream's HTTP/2 connections: a slot per worker thread, normally only the first in
-/// use (see [`BUSY_AT`])
+/// use (see [`BUSY_AT`](super::transport::BUSY_AT))
 pub(crate) struct H2Link {
     slots: Box<[Slot]>,
     /// 这个上游握手时没选 h2：之后的请求都交给 reqwest / This upstream did not pick h2 in the handshake: later requests all go to reqwest
@@ -114,18 +99,6 @@ impl H2Link {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// 请求上哪个位：排在最前、还不忙的那个；都忙时在途最少的那个
-    /// The slot a request goes to: the first one not busy; with all busy, the one with the
-    /// fewest in flight
-    fn pick(&self) -> &Slot {
-        let in_flight = |slot: &Slot| slot.in_flight.load(Ordering::Relaxed);
-        self.slots
-            .iter()
-            .find(|slot| in_flight(slot) < BUSY_AT)
-            .or_else(|| self.slots.iter().min_by_key(|slot| in_flight(slot)))
-            .expect("an H2Link has a slot at least")
-    }
-
     /// `slot` 上还能用的现有连接：能接着开流、也没空闲太久 / The connection on `slot` if it is still usable: open to new streams and not idle too long
     fn usable(&self, slot: &Slot, now: u64) -> Option<H2Sender> {
         let conn = slot.conn.load_full()?;
@@ -153,9 +126,8 @@ impl H2Link {
         if self.no_h2.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let slot = self.pick();
-        slot.in_flight.fetch_add(1, Ordering::Relaxed);
-        let in_flight = InFlight(slot);
+        let slot = least_busy(&self.slots, |slot| slot.in_flight.load(Ordering::Relaxed));
+        let in_flight = InFlight::enter(&slot.in_flight);
         if let Some(sender) = self.usable(slot, self.now_ms()) {
             return Ok(Some((sender, in_flight)));
         }

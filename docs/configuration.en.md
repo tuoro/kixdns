@@ -35,9 +35,9 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | request_timeout_ms | null | Overall request timeout. When null, it is upstream_timeout_ms * 2.5. It must be at least upstream_timeout_ms. |
 | response_jump_limit | 10 | Maximum response-phase pipeline jumps. |
 | udp_pool_size | 64 | Outbound UDP socket-pool size. |
-| tcp_pool_size | 64 | TCP connections per upstream pool. |
-| doh_pool_size | 8 | Maximum idle DoH connections per upstream. |
-| dot_pool_size | 64 | DoT connections per upstream pool. |
+| tcp_pool_size | 64 | At most this many TCP connections per upstream. Normally only the first is used; further queries go to the later ones only while 32 or more are unanswered on it at once. |
+| doh_pool_size | 8 | Maximum idle DoH connections per upstream when the upstream does not support HTTP/2 or `HTTPS_PROXY` / `ALL_PROXY` is set. An upstream supporting HTTP/2 is connected to directly, with at most one connection per worker thread and normally one in use, busy by the same rule as `tcp_pool_size`. |
+| dot_pool_size | 64 | At most this many DoT connections per upstream, normally one in use, by the same rule as `tcp_pool_size`. |
 | doq_pool_size | 16 | DoQ connections per upstream pool. |
 | tcp_health_check_error_threshold | 3 | Currently has no effect; kept only so older configurations still load. A TCP/DoT connection is rebuilt at once after a failed write or read, or when a query times out and the connection has gone quiet, whatever this count says. DoQ does not read it. |
 | tcp_connection_max_age_seconds | 300 | Maximum TCP/DoT connection age; 0 disables aging. |
