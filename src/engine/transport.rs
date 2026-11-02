@@ -516,6 +516,17 @@ impl<C> ConnectionPool<C> {
     fn pick(&self) -> &Arc<C> {
         &self.clients[self.next_idx.fetch_add(1, Ordering::Relaxed) % self.clients.len()]
     }
+
+    /// 上一个轮到的客户端还合 `stay` 的意就接着用它，否则轮到下一个
+    /// The client last picked while `stay` still holds for it, otherwise the next in turn
+    fn pick_staying(&self, stay: impl Fn(&C) -> bool) -> &Arc<C> {
+        let last = &self.clients
+            [self.next_idx.load(Ordering::Relaxed).wrapping_sub(1) % self.clients.len()];
+        if stay(last) {
+            return last;
+        }
+        self.pick()
+    }
 }
 
 /// 每个上游一个连接池 / One connection pool per upstream
@@ -648,7 +659,12 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         let pool = self.pool(upstream);
-        pool.pick().send(packet, timeout_dur).await
+        // 这一轮的查询都上同一条连接，一次写出去（见 `WriteQueue`）；这一批写走了才轮到下一条
+        // The queries of one round all go on the same connection and out in one write (see
+        // `WriteQueue`); only once that batch is written does the next connection take its turn
+        pool.pick_staying(StreamMuxClient::is_gathering)
+            .send(packet, timeout_dur)
+            .await
     }
 }
 
@@ -718,11 +734,13 @@ pub struct StreamMuxClient<T: StreamTransport> {
     pub upstream: Arc<str>,
     /// 建连用的共享部分 / What connects share
     shared: T::Shared,
-    /// Write half protected by Mutex - serves as both connection storage and write serialization
-    conn: Arc<Mutex<Option<T::Write>>>,
-    /// 上一次写入被取消，下次使用前需要完整 reset
-    /// A write was cancelled; the connection needs a full reset before reuse
-    write_cancelled: AtomicBool,
+    /// 这条连接的写入队列（见 [`WriteQueue`]），没有连接时是 None。锁同时把查询的登记和连接的拆除
+    /// 排出先后
+    /// The connection's write queue (see [`WriteQueue`]), None without a connection. The lock
+    /// also orders a query's registration against the connection's teardown
+    conn: Arc<Mutex<Option<Arc<WriteQueue>>>>,
+    /// 写入队列里有帧等着写入任务来取 / Frames on the write queue are waiting for the writer
+    gathering: Arc<AtomicBool>,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
     /// Generation counter to detect stale readers
@@ -738,13 +756,13 @@ pub struct StreamMuxClient<T: StreamTransport> {
     last_request_time: AtomicU64,
     /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
     last_health_check_time: AtomicU64,
-    /// Reader 取消令牌 / Reader cancellation token
-    read_cancel: Mutex<CancellationToken>,
+    /// 这条连接的读取和写入任务的取消令牌 / Cancels the connection's reader and writer tasks
+    conn_cancel: Mutex<CancellationToken>,
     /// 这条客户端的 reader 读到的应答帧总数。查询超时时拿它判断连接是不是还活着：
-    /// 本查询写出之后数字涨过，说明连接照常在回答，慢的只是这一个
+    /// 本查询排进写入队列之后数字涨过，说明连接照常在回答，慢的只是这一个
     /// Answer frames this client's readers have read. A timed-out query uses it to
     /// tell whether the connection is still alive: if it grew after the query was
-    /// written, the connection kept answering and only this one answer is slow
+    /// queued, the connection kept answering and only this one answer is slow
     answers_read: Arc<AtomicU64>,
 }
 
@@ -782,69 +800,110 @@ struct Pending {
     tx: oneshot::Sender<anyhow::Result<Bytes>>,
 }
 
-/// RAII Guard for TCP and DoT pending requests to ensure cleanup on cancellation
-/// 写入期间被取消时丢弃这条连接
-/// Drops the connection if the write is cancelled part way through
-///
-/// 与 [`RemoveOnDrop`] 是同一个取消点：`send_attempt` 可以在任意 await 处
-/// 被丢弃——外层请求超时先到（`validate_timeouts` 只要求 request >= upstream，
-/// 取等时就会），或者双发路径上 UDP 先返回导致 `tcp_task.abort()`。待处理表
-/// 那一侧已经由 `RemoveOnDrop` 兜住，写入这一侧此前没有：`write_all` 只写
-/// 进去一部分就被丢弃时，连接仍然留在池里，下一个请求把自己的帧接在半条帧
-/// 后面，对端按长度前缀读就会错位，而且不计错误也不重置，只能等下一次失败
-/// 才自愈。
-///
-/// 这里把连接置空即可，下一次 `ensure_connection` 会重建。代价是热路径上多
-/// 一次栈上构造和一次布尔写。
-///
-/// The same cancellation point as [`RemoveOnDrop`]: `send_attempt` can be
-/// dropped at any await, either because the outer request timeout fires first
-/// (`validate_timeouts` only requires request >= upstream, so equality allows
-/// it) or because UDP answered first on the dual-send path and aborted the TCP
-/// task. The pending-map side was already covered by `RemoveOnDrop`; the
-/// write side was not. A `write_all` dropped after a partial write leaves the
-/// connection in the pool, the next request appends its frame to half a frame,
-/// and a peer reading by length prefix desynchronises, with nothing counting an
-/// error or resetting it until a later request fails. Clearing the slot is
-/// enough, since the next `ensure_connection` rebuilds it. The hot path pays
-/// one stack construction and one boolean store.
-///
-/// DoT 的写半边换成 TLS 流，用的是同一个 guard。
-/// DoT, whose write half is a TLS stream, uses the same guard.
-struct TcpWriteGuard<'a, W> {
-    slot: &'a mut Option<W>,
-    /// 取消时置位，交给下一次 `ensure_connection` 做完整 reset
-    /// Set on cancellation so the next `ensure_connection` does a full reset
-    needs_reset: &'a AtomicBool,
-    armed: bool,
+/// 一条连接上排着要写出去的帧。查询登记时把帧放进来，连接的写入任务被叫醒后先让一轮，再把这一轮里
+/// 排进来的帧一次写出去。查询自己不写：以前每个查询拿着连接锁各写一次，一个查询一次系统调用、DoT 还要
+/// 一个 TLS 记录；写到一半被取消（外层超时先到、多上游竞速输了被 abort）时，还会把半条帧留在连接上
+/// The frames queued for writing on one connection. A query puts its frame here when it
+/// registers; once woken, the connection's writer yields one round and then writes the frames
+/// queued during that round at once. Queries do not write themselves: each used to write under
+/// the connection lock, one system call per query and for DoT one TLS record, and a write
+/// cancelled part way (the outer timeout first, or the loser of a multi-upstream race aborted)
+/// left half a frame on the connection
+struct WriteQueue {
+    frames: parking_lot::Mutex<BytesMut>,
+    wake: tokio::sync::Notify,
+    /// 客户端的 `gathering`：有帧排着时为真 / The client's `gathering`: true while frames are queued
+    gathering: Arc<AtomicBool>,
 }
 
-impl<W> Drop for TcpWriteGuard<'_, W> {
-    fn drop(&mut self) {
-        if self.armed {
-            // 立刻丢掉写半边，半条帧不会再被别人续写；`reset()` 还要取消 reader
-            // 的 token、让还在等这条连接的查询失败，那两件事不能在 Drop 里 await，所以
-            // 置位让下一次 `ensure_connection` 顺着既有的 `errors > 0` 那条路
-            // 一起收口。
-            // Drop the write half at once so nothing can append to half a frame.
-            // A full `reset()` also cancels the reader's token and fails the queries
-            // still waiting on the connection, neither of which can await inside
-            // Drop, so this flags the next `ensure_connection` to take the existing
-            // `errors > 0` path and finish the job in one place.
-            *self.slot = None;
-            self.needs_reset.store(true, Ordering::Release);
+impl WriteQueue {
+    fn new(gathering: Arc<AtomicBool>) -> Self {
+        Self {
+            frames: parking_lot::Mutex::default(),
+            wake: tokio::sync::Notify::new(),
+            gathering,
         }
+    }
+
+    /// 排进一帧，叫醒写入任务 / Queues a frame and wakes the writer
+    fn push(&self, frame: &[u8]) {
+        let mut frames = self.frames.lock();
+        frames.extend_from_slice(frame);
+        self.gathering.store(true, Ordering::Relaxed);
+        drop(frames);
+        self.wake.notify_one();
+    }
+
+    /// 取走排着的全部帧，换进 `batch` 里那块空缓冲 / Takes every queued frame, leaving the empty buffer in `batch` in their place
+    fn take(&self, batch: &mut BytesMut) {
+        let mut frames = self.frames.lock();
+        std::mem::swap(batch, &mut *frames);
+        self.gathering.store(false, Ordering::Relaxed);
     }
 }
 
-/// 客户端被丢掉（它的上游在重载后不在配置里了）时，让读取任务结束：读取任务拿着写半边的共享引用，
-/// 不结束的话连接会一直开着。
-/// When the client is dropped (its upstream left the configuration on a reload), its
-/// reader task is ended: the reader holds a share of the write half, and the connection
-/// would stay open while it runs.
+/// 让一轮：叫醒自己再让出，tokio 把这样的任务排到队尾，眼下排着的任务都跑过一遍再轮到它。
+/// `tokio::task::yield_now` 不一样，要等工作线程手上的活全干完才回来，一直有活时会被拖很久
+/// Yields one round: the task wakes itself and steps aside, and tokio puts such a task at the
+/// back of its queue, after every task queued now. `tokio::task::yield_now` differs: it comes
+/// back only once the worker runs out of work, which under steady load can be long
+async fn yield_one_round() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            return std::task::Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+    .await;
+}
+
+/// 把 `queue` 里排着的帧写到 `writer`，直到写失败 / Writes the frames queued on `queue` to `writer` until a write fails
+///
+/// 叫醒以后先让一轮再取（见 [`yield_one_round`]）：tokio 让刚被叫醒的任务插到最前面先跑，不让的话，
+/// 第一个查询一叫醒写入任务，它就只写这一帧，一个查询写一次
+/// Once woken it yields one round before taking the frames (see [`yield_one_round`]): tokio runs
+/// a task it was just woken for first, so without the yield the first query to wake the writer
+/// would be written alone, one write per query
+async fn write_frames<W>(mut writer: W, queue: &WriteQueue) -> std::io::Error
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut batch = BytesMut::new();
+    loop {
+        queue.wake.notified().await;
+        yield_one_round().await;
+        queue.take(&mut batch);
+        if batch.is_empty() {
+            continue;
+        }
+        // TLS 流在 socket 写满时会先收下明文、返回"已写入"，加密后的记录留在缓冲里，要等下一次写或 flush
+        // 才发出去；不 flush 的话，流量少时这一批可能一直等到超时。TCP 的 flush 什么也不做
+        // When the socket is full a TLS stream accepts the plaintext and reports it written
+        // while the encrypted records stay buffered until the next write or flush; without the
+        // flush, on a quiet connection the batch could wait out the whole timeout. A TCP flush
+        // does nothing
+        let written = async {
+            writer.write_all(&batch).await?;
+            writer.flush().await
+        };
+        if let Err(err) = written.await {
+            return err;
+        }
+        batch.clear();
+    }
+}
+
+/// 客户端被丢掉（它的上游在重载后不在配置里了）时，让读取和写入任务结束：它们拿着连接的两半，不结束的话
+/// 连接会一直开着。
+/// When the client is dropped (its upstream left the configuration on a reload), its reader
+/// and writer tasks are ended: they hold the two halves of the connection, which would stay
+/// open while they run.
 impl<T: StreamTransport> Drop for StreamMuxClient<T> {
     fn drop(&mut self) {
-        self.read_cancel.get_mut().cancel();
+        self.conn_cancel.get_mut().cancel();
     }
 }
 
@@ -868,7 +927,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             upstream,
             shared,
             conn: Arc::new(Mutex::new(None)),
-            write_cancelled: AtomicBool::new(false),
+            gathering: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
             generation: Arc::new(AtomicU64::new(0)),
@@ -877,7 +936,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             conn_create_time: AtomicU64::new(0),
             last_request_time: AtomicU64::new(0),
             last_health_check_time: AtomicU64::new(0),
-            read_cancel: Mutex::new(CancellationToken::new()),
+            conn_cancel: Mutex::new(CancellationToken::new()),
             answers_read: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1025,6 +1084,43 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     }
                 }
             }
+            // 读不下去了，写入任务也跟着结束 / Reading has failed, so the writer ends too
+            cancel_token.cancel();
+        });
+    }
+
+    /// 起这条连接的写入任务（见 [`WriteQueue`]）。写失败时这条连接就废了：让还在等它的查询失败，读取任务也
+    /// 跟着结束；连接已经换了代就什么也不动
+    /// Starts the connection's writer (see [`WriteQueue`]). A failed write ends the connection:
+    /// the queries still waiting on it fail and the reader ends too; a connection already
+    /// replaced by a newer generation is left alone
+    fn spawn_writer(
+        &self,
+        writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+        queue: Arc<WriteQueue>,
+        cancel_token: CancellationToken,
+        my_generation: u64,
+    ) {
+        let global_generation = Arc::clone(&self.generation);
+        let pending = Arc::clone(&self.pending);
+        let upstream = self.upstream.clone();
+        let conn = Arc::clone(&self.conn);
+
+        tokio::spawn(async move {
+            let err = tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                err = write_frames(writer, &queue) => err,
+            };
+            cancel_token.cancel();
+            if global_generation.load(Ordering::Relaxed) == my_generation {
+                debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} write failed", T::LABEL);
+                Self::fail_all_async(
+                    &pending,
+                    anyhow::anyhow!("{} write failed", T::LABEL),
+                    &conn,
+                )
+                .await;
+            }
         });
     }
 
@@ -1070,6 +1166,11 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         } else {
             false // Connection was not reset / 连接未重置
         }
+    }
+
+    /// 写入队列里有帧等着写出去：这一轮的查询接着上这条连接 / Frames wait on the write queue: this round's queries keep coming to this connection
+    fn is_gathering(&self) -> bool {
+        self.gathering.load(Ordering::Relaxed)
     }
 
     /// Record success and clear error counter
@@ -1223,8 +1324,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 upstream = self.upstream
             );
         };
-        let (new_packet, new_id) = registered?;
-        let remaining = timeout_dur.saturating_sub(start.elapsed());
+        let new_id = registered?;
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
@@ -1233,117 +1333,26 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             id: new_id,
         };
 
-        // 2. Write request with remaining timeout (connection already ensured)
-        // 2. 写入请求（连接已确保）
-        let write_res = timeout(remaining, async {
-            // Frame already contains length prefix + payload — write directly, no second copy.
-            // 帧已包含长度前缀 + 负载——直接写入，无二次拷贝。
-            let mut guard = self.conn.lock().await;
+        let answers_at_queue = self.answers_read.load(Ordering::Acquire);
 
-            // Connection must exist (ensure_connection was called earlier)
-            // 连接必须存在（ensure_connection 已在之前调用）
-            // Pre-flight check: if writer is closed or broken, fail fast
-            if guard.is_none() {
-                anyhow::bail!("{} write half missing", T::LABEL);
-            }
-
-            // Note: OwnedWriteHalf doesn't support peek/checking error directly easily without shared socket access.
-            // But if the previous read failed, guard should be None (reset).
-            // The fact we are here means 'guard' is Some, so we think connection is alive.
-            // Writing to a closed socket usually triggers error immediately on Linux/BSD.
-
-            // 写入期间被取消时丢弃连接，避免半条帧留在池里 / Drop the connection
-            // if the write is cancelled, so half a frame cannot stay pooled
-            let mut write_guard = TcpWriteGuard {
-                slot: &mut guard,
-                needs_reset: &self.write_cancelled,
-                armed: true,
-            };
-            let writer = write_guard
-                .slot
-                .as_mut()
-                .expect("connection presence checked above");
-            // TLS 流在 socket 写满时会先收下明文、返回"已写入"，加密后的记录留在缓冲
-            // 里，要等下一次写或 flush 才发出去；不 flush 的话，流量少时这个查询可能
-            // 一直等到超时。TCP 的 flush 什么也不做。
-            // When the socket is full a TLS stream accepts the plaintext and
-            // reports it written while the encrypted records stay buffered until
-            // the next write or flush; without the flush, on a quiet connection
-            // the query could wait out its whole timeout. A TCP flush does nothing.
-            let mut result = writer.write_all(&new_packet).await;
-            if result.is_ok() {
-                result = writer.flush().await;
-            }
-            // 走到这里说明写入已经结束：成功则帧是完整的，失败则下面会 reset。
-            // Reaching here means the write finished: complete on success, and
-            // the caller resets on failure.
-            write_guard.armed = false;
-
-            if let Err(e) = result {
-                return Err(anyhow::anyhow!(e).context(format!("{} write failed", T::LABEL)));
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await;
-
-        match write_res {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                // Guard will remove pending entry automatically
-                // Guard 会自动移除 pending 条目
-
-                // The socket is likely dead: record the error and reset the connection, failing
-                // the queries still waiting on it (see `reset`)
-                // socket 多半已经死了：记一次错误并复位连接，还在等这条连接的查询一起失败（见 `reset`）
-                self.record_error().await;
-                self.reset().await;
-                self.consecutive_errors.store(0, Ordering::Release);
-
-                return Err(err).context(format!(
-                    "{name} write/connect failed for upstream {upstream}",
-                    name = T::NAME,
-                    upstream = self.upstream
-                ));
-            }
-            Err(_) => {
-                // Guard will remove pending entry automatically
-
-                // The write timed out: reset the connection, or have the next connect reset
-                // it when the lock is busy (see `reset_after_deadline`)
-                // 写入超时：复位连接，锁被占着时交给下一次建连去复位（见 `reset_after_deadline`）
-                self.reset_after_deadline().await;
-
-                return Err(anyhow::anyhow!(
-                    "{name} write/connect timeout for upstream {upstream} (timeout: {timeout_ms}ms)",
-                    name = T::NAME,
-                    upstream = self.upstream,
-                    timeout_ms = remaining.as_millis()
-                ));
-            }
-        }
-
-        let answers_at_write = self.answers_read.load(Ordering::Acquire);
-
-        // 3. Wait for response
-        // 3. 等待响应
-        let elapsed_after_write = start.elapsed();
-        if elapsed_after_write >= timeout_dur {
+        // 2. Wait for response; the connection's writer sends the frame (see `WriteQueue`)
+        // 2. 等待响应；帧由连接的写入任务发出（见 `WriteQueue`）
+        let elapsed_after_queue = start.elapsed();
+        if elapsed_after_queue >= timeout_dur {
             // Guard will remove pending entry automatically
 
-            // The deadline passed before waiting began: reset the connection, or have the
-            // next connect reset it when the lock is busy (see `reset_after_deadline`)
-            // 还没开始等就到了时限：复位连接，锁被占着时交给下一次建连去复位（见 `reset_after_deadline`）
-            self.reset_after_deadline().await;
-
+            // 登记完就到了时限：连接还没机会回答，不怪它，不复位
+            // The deadline passed as registration finished: the connection had no chance to
+            // answer, so it is not blamed and not reset
             return Err(anyhow::anyhow!(
                 "{name} timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
                 name = T::NAME,
                 upstream = self.upstream,
-                elapsed_ms = elapsed_after_write.as_millis(),
+                elapsed_ms = elapsed_after_queue.as_millis(),
                 timeout_ms = timeout_dur.as_millis()
             ));
         }
-        let final_remaining = timeout_dur - elapsed_after_write;
+        let final_remaining = timeout_dur - elapsed_after_queue;
 
         let resp = match timeout(final_remaining, rx).await {
             Ok(Ok(Ok(response))) => {
@@ -1375,12 +1384,12 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             Err(_elapsed) => {
                 // Guard will remove pending entry automatically
 
-                // 写出之后这条连接还在回答别的查询：连接是活的，只是这一个回答慢。重建
+                // 排进去之后这条连接还在回答别的查询：连接是活的，只是这一个回答慢。重建
                 // 连接只会让同一条连接上其他查询的回答跟着丢掉，也不算连接出错
                 // The connection kept answering other queries after this one was
-                // written: it is alive and only this answer is slow. Rebuilding it
+                // queued: it is alive and only this answer is slow. Rebuilding it
                 // would only lose the other answers on it, and it is no connection error
-                if self.answers_read.load(Ordering::Acquire) > answers_at_write {
+                if self.answers_read.load(Ordering::Acquire) > answers_at_queue {
                     return Err(anyhow::anyhow!(
                         "{name} response timeout from upstream {upstream} (remaining: {timeout_ms}ms); the connection is still answering",
                         name = T::NAME,
@@ -1419,30 +1428,19 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // First, check if we need to reconnect based on error state
         // 首先，根据错误状态检查是否需要重连
         let errors = self.consecutive_errors.load(Ordering::Acquire);
-        // 写入被取消过：写半边已经在 Drop 里丢掉了，这里补上取消 reader token、
-        // 让还在等的查询失败，让清理和普通错误路径完全对称。
-        // A cancelled write already dropped the write half in Drop; this cancels
-        // the reader token and fails the queries still waiting, so the cleanup
-        // matches the ordinary error path exactly.
-        let write_cancelled = self.write_cancelled.swap(false, Ordering::AcqRel);
-        let needs_reset = errors > 0 || write_cancelled;
 
-        if needs_reset {
+        if errors > 0 {
             debug!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
-                write_cancelled,
                 "{} connection needs a reset before ensure",
                 T::NAME
             );
-            // 欠着的复位也守预算：前面的写入占着锁时不能等过时限；没做完下次再做
-            // An owed reset keeps to the budget too: with writes holding the lock
+            // 欠着的复位也守预算：前面的登记占着锁时不能等过时限；没做完下次再做
+            // An owed reset keeps to the budget too: with registrations holding the lock
             // ahead of it, it must not wait past the deadline; if unfinished, the next
             // connect does it
             if timeout(budget, self.reset()).await.is_err() {
-                if write_cancelled {
-                    self.write_cancelled.store(true, Ordering::Release);
-                }
                 anyhow::bail!(
                     "{} timeout resetting the connection after {}ms",
                     T::LABEL,
@@ -1467,8 +1465,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
         if guard.is_none() {
             let (read_half, write_half) = T::connect(&self.shared, &self.upstream, budget).await?;
-
-            *guard = Some(write_half);
+            let queue = Arc::new(WriteQueue::new(Arc::clone(&self.gathering)));
+            *guard = Some(Arc::clone(&queue));
 
             // Increment generation for new connection
             // 为新连接增加代数
@@ -1478,14 +1476,15 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             // 为此连接生命周期创建新的取消令牌
             let new_token = CancellationToken::new();
 
-            // Spawn reader while holding the lock to prevent races
-            // 持有锁时启动 reader 以防止竞争
+            // Spawn reader and writer while holding the lock to prevent races
+            // 持有锁时启动读取和写入任务以防止竞争
             self.spawn_reader(read_half, new_token.clone(), new_gen);
+            self.spawn_writer(write_half, queue, new_token.clone(), new_gen);
 
-            // Store token AFTER spawn so reset() can only cancel a live reader
-            // 在 spawn 之后存储 token，确保 reset() 只能取消已启动的 reader
+            // Store token AFTER spawn so reset() can only cancel live tasks
+            // 在 spawn 之后存储 token，确保 reset() 只能取消已启动的任务
             {
-                let mut token_guard = self.read_cancel.lock().await;
+                let mut token_guard = self.conn_cancel.lock().await;
                 *token_guard = new_token;
             }
 
@@ -1505,19 +1504,19 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         Ok(())
     }
 
-    /// Rewrite DNS transaction ID and register in pending map atomically, returning the frame to write
-    /// 原子操作：重写 DNS 事务 ID 并注册到 pending map，返回要写出的帧
+    /// Rewrite DNS transaction ID, register in pending map and queue the frame for writing
+    /// atomically, returning the new ID
+    /// 原子操作：重写 DNS 事务 ID、注册到 pending map、把帧排进写入队列，返回新的 ID
     async fn register_pending(
         &self,
         packet: &[u8],
         original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<(Bytes, u16)> {
-        // Build complete TCP/DoT wire frame (2-byte length prefix + DNS message). Caller writes
-        // it directly without further copying, and the same buffer stays in the pending
-        // entry for the answer's question check, as on UDP.
-        // 构建完整 TCP/DoT wire frame（2 字节长度前缀 + DNS 消息）。调用方直接写入、无需二次拷贝；
-        // 同一份缓冲还留在 pending 条目里供应答比对问题，和 UDP 一样。
+    ) -> anyhow::Result<u16> {
+        // Build complete TCP/DoT wire frame (2-byte length prefix + DNS message). The same
+        // buffer stays in the pending entry for the answer's question check, as on UDP.
+        // 构建完整 TCP/DoT wire frame（2 字节长度前缀 + DNS 消息）。同一份缓冲还留在 pending 条目里
+        // 供应答比对问题，和 UDP 一样。
         let mut frame = BytesMut::with_capacity(2 + packet.len());
         frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
         frame.extend_from_slice(packet);
@@ -1525,12 +1524,12 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
         // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
         let conn_guard = self.conn.lock().await;
-        if conn_guard.is_none() {
+        let Some(queue) = conn_guard.as_ref() else {
             anyhow::bail!("connection closed before registration");
-        }
+        };
 
         let mut tries = 0;
-        let (frame, new_id) = loop {
+        let new_id = loop {
             let cand = self.next_id.fetch_add(1, Ordering::Relaxed);
             tries += 1;
 
@@ -1545,7 +1544,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     frame: frame.clone(),
                     tx,
                 });
-                break (frame, cand);
+                queue.push(&frame);
+                break cand;
             }
 
             // 头一个 ID 就被占着时看看是不是全被占了：65536 个 ID 都被等着的查询占着时立刻说没有，
@@ -1564,13 +1564,13 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             }
         };
         drop(conn_guard);
-        Ok((frame, new_id))
+        Ok(new_id)
     }
 
     async fn fail_all_async(
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
-        conn: &Arc<Mutex<Option<T::Write>>>,
+        conn: &Arc<Mutex<Option<Arc<WriteQueue>>>>,
     ) {
         // Hold the connection lock while resetting and draining. register_pending uses the same
         // lock, so it either registers before this drain or observes the closed connection.
@@ -1582,10 +1582,15 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     fn fail_all_locked(
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
         err: anyhow::Error,
-        conn_guard: &mut Option<T::Write>,
+        conn_guard: &mut Option<Arc<WriteQueue>>,
     ) {
         let err_msg = err.to_string();
-        *conn_guard = None;
+        // 连接没了，排着的帧不会再写出去，挑连接时也别再当它在攒一批
+        // The connection is gone and its queued frames will never be written, so picking
+        // must not take it for one gathering a batch any more
+        if let Some(queue) = conn_guard.take() {
+            queue.gathering.store(false, Ordering::Relaxed);
+        }
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
         for key in keys {
             if let Some((_, p)) = pending.remove(&key) {
@@ -1594,21 +1599,21 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         }
     }
 
-    /// Reset connection: cancel reader task, then drop write half and fail every
-    /// waiting query
-    /// 重置连接：取消 reader 任务，然后丢弃写半部、让所有等待中的查询失败
+    /// Reset connection: cancel the reader and writer tasks, then drop the write queue and
+    /// fail every waiting query
+    /// 重置连接：取消读取和写入任务，然后丢掉写入队列、让所有等待中的查询失败
     ///
-    /// The cancellation token interrupts the reader's blocked read so it
-    /// exits immediately instead of leaking the connection. With the reader
+    /// The cancellation token interrupts the reader's blocked read and the writer's
+    /// blocked write so they exit immediately instead of leaking the connection. With the reader
     /// gone nothing can answer the queries still waiting on this connection, so
     /// they are failed at once: each can then retry over a fresh connection
     /// instead of sitting out its whole deadline and resetting the next
     /// connection in turn.
-    /// 取消令牌中断 reader 阻塞的读取操作，使其立即退出而非泄漏连接。reader 没了，
+    /// 取消令牌中断读取任务阻塞的读和写入任务阻塞的写，使它们立即退出而非泄漏连接。reader 没了，
     /// 这条连接上还在等的查询再也等不到回答，所以立刻让它们失败：各自可以换新连接重发，
     /// 而不是干等到截止时间、再轮流把下一条连接也重置掉。
     async fn reset(&self) {
-        self.read_cancel.lock().await.cancel();
+        self.conn_cancel.lock().await.cancel();
         Self::fail_all_async(
             &self.pending,
             anyhow::anyhow!("{} connection reset", T::NAME),
@@ -1617,12 +1622,12 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         .await;
     }
 
-    /// 时限已经到了的查询复位连接。连接锁空着就马上复位；被别人拿着时（多半是排着队的写入）不等，
+    /// 时限已经到了的查询复位连接。连接锁空着就马上复位；被别人拿着时（多半是排着队的登记）不等，
     /// 记一次错误，下一次建连会先复位（见 `ensure_connection`）。以前这里一直等锁，排在长队后面的
     /// 查询要远远超出时限才返回。
     /// Reset the connection for a query whose deadline has passed. With the
     /// connection lock free it resets at once; held by someone else (most likely a
-    /// queue of writes) it does not wait but records an error, and the next connect
+    /// queue of registrations) it does not wait but records an error, and the next connect
     /// resets first (see `ensure_connection`). It used to wait for the lock, so a
     /// query at the back of a long queue returned far past its deadline.
     async fn reset_after_deadline(&self) {
@@ -1630,7 +1635,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             self.consecutive_errors.fetch_add(1, Ordering::Release);
             return;
         };
-        self.read_cancel.lock().await.cancel();
+        self.conn_cancel.lock().await.cancel();
         Self::fail_all_locked(
             &self.pending,
             anyhow::anyhow!("{} connection reset", T::NAME),
@@ -3425,86 +3430,331 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     }
 
-    /// 写入中途被取消时，这条池化连接必须被丢弃。取消点与 RemoveOnDrop
-    /// 兜的是同一个：外层请求超时先到，或者双发路径上 UDP 先返回导致
-    /// tcp_task.abort()。此前只有待处理表那一侧被清理，连接仍然留在池里，
-    /// 下一个请求会把自己的帧接在可能只写了一半的帧后面。
-    /// A pooled connection has to be dropped when the write is cancelled part
-    /// way through. The cancellation point is the one RemoveOnDrop already
-    /// covers: the outer request timeout firing first, or the dual-send path
-    /// aborting the TCP task once UDP answered. Only the pending-map side used
-    /// to be cleaned up, leaving the connection pooled for the next request to
-    /// append its frame to a possibly half-written one.
-    #[tokio::test]
-    async fn a_cancelled_write_drops_the_pooled_connection() {
-        // 对端只 accept 不读，发送缓冲区会被填满，写入因此停在 await 上
-        // The peer accepts and never reads, so the send buffer fills and the
-        // write parks on an await
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
-            let (held, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            drop(held);
-        });
-
-        let client = Arc::new(TcpMuxClient::new(Arc::from(addr.to_string().as_str())));
-
-        // 直接建连，不走查询——查询超时会自己 reset 掉连接
-        // Connect directly: a query would time out and reset the connection
-        let query = [0u8; 12];
+    /// 填满 `client` 的连接、让写入卡住，再看一个查询到时限以后怎么收尾：连接上没有动静，复位；写入任务
+    /// 结束、放掉写半边，对端（收到 `read_now` 后读到连接关闭为止）读得到头
+    /// Fills `client`'s connection so the writer is stuck, then follows a query past its
+    /// deadline: the connection has gone quiet, so it is reset; the writer ends and lets go of
+    /// the write half, and the peer (reading to the close once told by `read_now`) reaches
+    /// the end
+    async fn assert_a_stuck_write_ends_at_the_deadline<T: StreamTransport>(
+        client: &StreamMuxClient<T>,
+        read_now: oneshot::Sender<()>,
+        peer: tokio::task::JoinHandle<()>,
+    ) {
         client
             .ensure_connection(Duration::from_secs(2))
             .await
             .expect("connect to the test peer");
-        assert!(
-            client.conn.lock().await.is_some(),
-            "the connection must be pooled before the test can mean anything"
-        );
-
-        // 把发送缓冲区填满，让后续写入必然停在 await 上
-        // Fill the send buffer so any later write must park on an await
-        {
-            let mut guard = client.conn.lock().await;
-            let writer = guard.as_mut().unwrap();
-            let chunk = vec![0u8; 65536];
-            while tokio::time::timeout(Duration::from_millis(300), writer.write_all(&chunk))
-                .await
-                .is_ok()
-            {}
-        }
-
-        // 写入停在 await 上时取消这次发送
-        // Cancel the send while the write is parked
-        let sender = Arc::clone(&client);
-        let task = tokio::spawn(async move { sender.send(&query, Duration::from_secs(30)).await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        task.abort();
-        let _ = task.await;
-
+        // 排进比两头的缓冲加起来还多的字节，写入停在 await 上
+        // Queue more bytes than both ends' buffers hold, so the writer parks on an await
+        client
+            .conn
+            .lock()
+            .await
+            .as_ref()
+            .expect("connected")
+            .push(&vec![0u8; 32 << 20]);
+        let err = client
+            .send(&udp_test_query("stuck.example"), Duration::from_millis(500))
+            .await
+            .expect_err("nothing answers");
+        assert!(err.to_string().contains("response timeout"), "{err:#}");
         assert!(
             client.conn.lock().await.is_none(),
-            "a write cancelled part way through must drop the connection instead of \
-             leaving a possibly half-written frame in the pool"
+            "the quiet connection is reset"
         );
-        assert!(
-            client.write_cancelled.load(Ordering::Acquire),
-            "the next ensure_connection must be told to finish the cleanup that \
-             Drop cannot await: the reader token and the queries still waiting"
-        );
+        read_now.send(()).expect("the peer waits");
+        tokio::time::timeout(Duration::from_secs(10), peer)
+            .await
+            .expect("the writer lets go of the write half, so the peer reads to the close")
+            .expect("join the peer");
+    }
 
-        // 下一次建连要真的走完整 reset，并把标志清掉
-        // The next connect must take the full reset path and clear the flag
+    /// 读到连接关闭为止 / Reads until the connection closes
+    async fn read_to_close(mut stream: impl tokio::io::AsyncRead + Unpin) {
+        let mut sink = vec![0u8; 1 << 16];
+        while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+    }
+
+    /// 写不出去的连接（对端一个字节也不读）不会一直占着：查询等到时限、连接上又没有动静时复位，写入任务
+    /// 跟着结束。查询不再自己写（见 `WriteQueue`），以前写到一半被取消时会把半条帧留在连接上
+    /// A connection that cannot be written to (the peer reads not a byte) is not held on to:
+    /// a query waiting out its deadline on a quiet connection resets it and the writer ends.
+    /// Queries no longer write themselves (see `WriteQueue`); one cancelled part way through
+    /// its write used to leave half a frame on the connection
+    #[tokio::test]
+    async fn a_stuck_write_ends_at_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (read_now, told) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (held, _) = listener.accept().await.unwrap();
+            let _ = told.await;
+            read_to_close(held).await;
+        });
+        let client = TcpMuxClient::new(Arc::from(addr.to_string().as_str()));
+        assert_a_stuck_write_ends_at_the_deadline(&client, read_now, peer).await;
+    }
+
+    /// 对端关掉自己往这边写的那一头以后，读取任务读到头、腾出连接，写入任务也跟着结束、放掉写半边，对端
+    /// 读得到连接关闭；不然写入任务会一直拿着这条半开的连接
+    /// Once the peer closes its sending side, the reader reaches the end and clears the
+    /// connection, and the writer ends too and lets go of the write half, so the peer reads to
+    /// the close; otherwise the writer would hold on to the half-open connection for good
+    #[tokio::test]
+    async fn a_closed_peer_ends_the_writer_too() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.shutdown().await.unwrap();
+            read_to_close(stream).await;
+        });
+        let client = TcpMuxClient::new(Arc::from(addr.to_string().as_str()));
         client
             .ensure_connection(Duration::from_secs(2))
             .await
-            .expect("reconnect after a cancelled write");
+            .expect("connect to the test peer");
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .expect("the writer lets go of the write half, so the peer reads to the close")
+            .expect("join the peer");
         assert!(
-            !client.write_cancelled.load(Ordering::Acquire),
-            "the flag must be consumed, not left to reset a healthy connection later"
+            client.conn.lock().await.is_none(),
+            "the connection is cleared"
         );
+    }
 
-        peer.abort();
+    /// 同一轮里排进来的帧一次写出去。一个工作线程，排帧的任务都从这个线程上起，和收到一批查询时一样；不先让
+    /// 一轮的话，第一个任务一叫醒写入任务，它就只写这一帧
+    /// The frames queued in one round go out in one write. One worker thread, with the tasks
+    /// queuing them started on it, as when a batch of queries arrives; without yielding a round
+    /// first, the first task to wake the writer would have it write that frame alone
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_round_of_frames_goes_out_in_one_write() {
+        let queue = Arc::new(WriteQueue::new(Arc::default()));
+        let (client_io, mut server_io) = tokio::io::duplex(1 << 16);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let writer = crate::engine::test_support::CountedWrites {
+            io: client_io,
+            writes: Arc::clone(&writes),
+        };
+        let draining = Arc::clone(&queue);
+        tokio::spawn(async move { write_frames(writer, &draining).await });
+        // 先写一帧，写入任务写完转回去等着 / One frame first, after which the writer is back to waiting
+        queue.push(&[0, 1, 9]);
+        server_io.read_exact(&mut [0u8; 3]).await.unwrap();
+        let before = writes.load(Ordering::SeqCst);
+        // 排完帧的任务接着等，和查询排完帧等回答一样 / The tasks keep waiting once their frames are
+        // queued, as queries wait for their answers
+        let queuing = Arc::clone(&queue);
+        let waiting = tokio::spawn(async move {
+            (0..8u8)
+                .map(|index| {
+                    let queue = Arc::clone(&queuing);
+                    tokio::spawn(async move {
+                        queue.push(&[0, 1, index]);
+                        std::future::pending::<()>().await
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        let mut written = [0u8; 24];
+        server_io.read_exact(&mut written).await.unwrap();
+        waiting.iter().for_each(tokio::task::JoinHandle::abort);
+        assert_eq!(writes.load(Ordering::SeqCst) - before, 1);
+        assert!(
+            (0..8u8).all(|index| written.chunks(3).any(|frame| frame == [0, 1, index])),
+            "every frame is written whole: {written:?}"
+        );
+    }
+
+    /// 让一轮就是一轮：工作线程一直有活时，写入任务也只排在眼下这些任务后面。`tokio::task::yield_now`
+    /// 要等手上的活干完、或者隔上几十个任务才回来，持续有负载时每一批都会晚出去
+    /// One round is one round: on a worker that always has work, the writer still waits only
+    /// behind the tasks queued now. `tokio::task::yield_now` comes back only once the work runs
+    /// out, or after some dozens of tasks, so under steady load every batch would leave late
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn the_writer_waits_one_round_on_a_busy_worker() {
+        /// 不真写，只记下写的时候忙任务转到了第几圈 / Writes nothing, noting how many turns the busy task had made when written to
+        struct NotingWrites {
+            turns: Arc<AtomicUsize>,
+            written_at: Arc<AtomicUsize>,
+        }
+        impl tokio::io::AsyncWrite for NotingWrites {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.written_at
+                    .store(self.turns.load(Ordering::SeqCst), Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let turns = Arc::new(AtomicUsize::new(0));
+        let written_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let queue = Arc::new(WriteQueue::new(Arc::default()));
+        let writer = NotingWrites {
+            turns: Arc::clone(&turns),
+            written_at: Arc::clone(&written_at),
+        };
+        let draining = Arc::clone(&queue);
+        let writing = tokio::spawn(async move { write_frames(writer, &draining).await });
+        // 一直有活的任务：每圈记一次数，让一轮再来 / A task that always has work: it counts each turn and yields a round
+        let counting = Arc::clone(&turns);
+        let busy = tokio::spawn(async move {
+            loop {
+                counting.fetch_add(1, Ordering::SeqCst);
+                yield_one_round().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for _ in 0..5 {
+            let (queuing, counted) = (Arc::clone(&queue), Arc::clone(&turns));
+            let pushed_at = tokio::spawn(async move {
+                let at = counted.load(Ordering::SeqCst);
+                queuing.push(&[0, 1, 2]);
+                at
+            })
+            .await
+            .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while written_at.load(Ordering::SeqCst) == usize::MAX {
+                assert!(tokio::time::Instant::now() < deadline, "never written");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let waited = written_at.swap(usize::MAX, Ordering::SeqCst) - pushed_at;
+            assert!(waited < 8, "written {waited} turns of the busy task late");
+        }
+        busy.abort();
+        writing.abort();
+    }
+
+    /// 写失败时这条连接就废了：还在等它的查询马上失败，不用等到超时；连接腾出来，下一个查询重新连
+    /// A failed write ends the connection: the queries still waiting on it fail at once rather
+    /// than at their timeout, and the slot is cleared for the next query to connect again
+    #[tokio::test]
+    async fn a_failed_write_fails_the_waiting_queries() {
+        struct Broken;
+        impl tokio::io::AsyncWrite for Broken {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
+        let queue = Arc::new(WriteQueue::new(Arc::clone(&client.gathering)));
+        *client.conn.lock().await = Some(Arc::clone(&queue));
+        let token = CancellationToken::new();
+        client.spawn_writer(
+            Broken,
+            queue,
+            token.clone(),
+            client.generation.load(Ordering::Relaxed),
+        );
+        let (tx, rx) = oneshot::channel();
+        client
+            .register_pending(&udp_test_query("broken.example"), 7, tx)
+            .await
+            .expect("register while connected");
+        let answer = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("told at once, not at a timeout")
+            .expect("the sender is used, not dropped");
+        assert!(
+            answer
+                .expect_err("the write failed")
+                .to_string()
+                .contains("write failed")
+        );
+        assert!(client.conn.lock().await.is_none(), "the slot is cleared");
+        assert!(token.is_cancelled(), "the reader ends too");
+        assert!(!client.is_gathering(), "picking no longer stays on it");
+    }
+
+    /// 复位以后挑连接不再停在这个客户端上：排着的帧不会再写出去了
+    /// Once reset, picking no longer stays on this client: its queued frames will never be written
+    #[tokio::test]
+    async fn a_reset_connection_is_no_longer_gathering() {
+        let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
+        *client.conn.lock().await = Some(Arc::new(WriteQueue::new(Arc::clone(&client.gathering))));
+        let (tx, _rx) = oneshot::channel();
+        client
+            .register_pending(&udp_test_query("queued.example"), 7, tx)
+            .await
+            .expect("register while connected");
+        assert!(client.is_gathering(), "a queued frame waits for the writer");
+        client.reset().await;
+        assert!(
+            !client.is_gathering(),
+            "the reset connection's frames will never be written"
+        );
+    }
+
+    /// 帧排进去以后查询被取消（外层超时先到、多上游竞速输了被 abort），帧照样整条写出去，迟到的回答对不上号
+    /// 丢掉，连接还是对齐的：下一个查询在同一条连接上照样答对
+    /// A query cancelled once its frame is queued (the outer timeout first, or the loser of a
+    /// multi-upstream race aborted) still has its frame written whole; the late answer matches
+    /// nothing and is dropped, the connection stays in step, and the next query is answered
+    /// right on the same connection
+    #[tokio::test]
+    async fn a_query_cancelled_after_queuing_leaves_the_connection_in_step() {
+        let addr = spawn_stream_upstream(None).await;
+        let client = Arc::new(TcpMuxClient::new(Arc::from(addr.to_string())));
+        let asking = Arc::clone(&client);
+        let task = tokio::spawn(async move {
+            asking
+                .send(&udp_test_query("cancelled.example"), Duration::from_secs(5))
+                .await
+        });
+        while client.pending.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        let generation = client.generation.load(Ordering::Acquire);
+        let answer = client
+            .send(&udp_test_query("next.example"), Duration::from_secs(5))
+            .await
+            .expect("answered");
+        assert_eq!(first_label(&answer), "next");
+        assert_eq!(
+            client.generation.load(Ordering::Acquire),
+            generation,
+            "on the same connection"
+        );
     }
 
     /// 0-RTT 判定必须按类型走。此前它比对 `anyhow::Error::to_string()`，而内层
@@ -4051,18 +4301,6 @@ mod tests {
             .expect("IPv4 UDP upstream still reachable");
     }
 
-    async fn connected_tcp_write_half() -> (OwnedWriteHalf, TcpStream) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind TCP test listener");
-        let addr = listener.local_addr().expect("read TCP test address");
-        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
-        let client = client.expect("connect TCP test client");
-        let (server, _) = server.expect("accept TCP test client");
-        let (_, write_half) = client.into_split();
-        (write_half, server)
-    }
-
     /// 0-RTT 的安全提示曾在构造 DoQ 客户端时打印，而客户端在任何配置下都会构造，
     /// 于是没有任何 DoQ 上游的部署每次启动也会看到它。
     /// The 0-RTT security notice used to be printed when the DoQ client was
@@ -4487,8 +4725,7 @@ mod tests {
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
         // Arrange: Prepare a TCP client with many pending IDs to force contention
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        let (write_half, _server) = connected_tcp_write_half().await;
-        *client.conn.lock().await = Some(write_half);
+        *client.conn.lock().await = Some(Arc::new(WriteQueue::new(Arc::default())));
         for id in 1u16..200u16 {
             client.pending.insert(
                 id,
@@ -4507,10 +4744,7 @@ mod tests {
                 async move {
                     let dummy = vec![0u8; 4];
                     let (tx, _) = oneshot::channel();
-                    client
-                        .register_pending(&dummy, 0, tx)
-                        .await
-                        .map(|(_, id)| id)
+                    client.register_pending(&dummy, 0, tx).await
                 }
             })
             .collect::<Vec<_>>();
@@ -4530,8 +4764,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_fail_all_cannot_miss_a_concurrent_registration() {
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        let (write_half, _server) = connected_tcp_write_half().await;
-        *client.conn.lock().await = Some(write_half);
+        *client.conn.lock().await = Some(Arc::new(WriteQueue::new(Arc::default())));
 
         // Hold the connection lock so registration queues before fail_all. The old implementation
         // took its pending snapshot before this lock, then allowed the queued registration to land
@@ -6118,67 +6351,28 @@ mod tests {
             .expect("an IPv6 literal DoQ upstream answers");
     }
 
-    /// TCP 早有的保护 DoT 此前没有：写到一半被取消（多上游竞速时输掉的请求会被
-    /// abort），半条帧留在 TLS 流里，下一个请求接着往后写，对端按长度前缀读就会错位
-    /// The guard TCP already had, which DoT lacked: a write cancelled part way
-    /// (the losers of a multi-upstream race are aborted) left half a frame in the
-    /// TLS stream for the next request to append to, desynchronising a peer
-    /// that reads by length prefix
+    /// DoT 的写入卡住时也一样收尾（见 `a_stuck_write_ends_at_the_deadline`）：TLS 流写满时会先收下明文，
+    /// 写入任务停在 flush 上
+    /// A stuck DoT write ends the same way (see `a_stuck_write_ends_at_the_deadline`): a full
+    /// TLS stream accepts the plaintext first and the writer parks on the flush
     #[tokio::test]
-    async fn a_cancelled_dot_write_drops_the_pooled_connection() {
-        // 对端握手之后一个字节也不读，发送缓冲区会被填满
-        // The peer completes the handshake and never reads, so the send buffer fills
+    async fn a_stuck_dot_write_ends_at_the_deadline() {
         let (server, client_tls) = localhost_tls(&[]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let (read_now, told) = oneshot::channel();
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let held = acceptor.accept(stream).await.expect("TLS handshake");
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            drop(held);
+            let _ = told.await;
+            read_to_close(held).await;
         });
-
-        let client = Arc::new(DotMuxClient::new(
+        let client = DotMuxClient::new(
             Arc::from(format!("dot://{addr}?sni=localhost")),
             Arc::new(client_tls),
-        ));
-        client
-            .ensure_connection(Duration::from_secs(2))
-            .await
-            .expect("connect to the test peer");
-
-        // 把发送缓冲区填满，让后续写入必然停在 await 上
-        // Fill the send buffer so any later write must park on an await
-        {
-            let mut guard = client.conn.lock().await;
-            let writer = guard.as_mut().unwrap();
-            let chunk = vec![0u8; 65536];
-            while tokio::time::timeout(Duration::from_millis(300), writer.write_all(&chunk))
-                .await
-                .is_ok_and(|written| written.is_ok())
-            {}
-        }
-
-        // 写入停在 await 上时取消这次发送 / Cancel the send while the write is parked
-        let sender = Arc::clone(&client);
-        let query = udp_test_query("cancelled.example");
-        let task = tokio::spawn(async move { sender.send(&query, Duration::from_secs(30)).await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        task.abort();
-        let _ = task.await;
-
-        assert!(
-            client.conn.lock().await.is_none(),
-            "a write cancelled part way through must drop the connection instead of \
-             leaving a possibly half-written frame in the pool"
         );
-        assert!(
-            client.write_cancelled.load(Ordering::Acquire),
-            "the next ensure_connection must be told to finish the cleanup that \
-             Drop cannot await: the reader token and the queries still waiting"
-        );
-        peer.abort();
+        assert_a_stuck_write_ends_at_the_deadline(&client, read_now, peer).await;
     }
 
     /// 每个 DoQ 上游有一组连接轮流用（默认 16 条）。"0-RTT 不稳定"此前是每条连接各记

@@ -1,10 +1,12 @@
-//! 引擎测试共用的部分：本机假上游、按配置建引擎，以及像监听器那样问。
+//! 引擎测试共用的部分：本机假上游、按配置建引擎、像监听器那样问，以及数着写了几次的连接一端。
 //! What the engine tests share: a local fake upstream, an engine built from a config,
-//! and asking as a listener does.
+//! asking as a listener does, and one end of a connection that counts its writes.
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -630,5 +632,43 @@ impl std::io::Write for Warnings {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// 连接的一端，数着往外写了几次 / One end of a connection, counting the writes out of it
+pub(crate) struct CountedWrites {
+    pub(crate) io: tokio::io::DuplexStream,
+    pub(crate) writes: Arc<AtomicUsize>,
+}
+
+impl tokio::io::AsyncRead for CountedWrites {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for CountedWrites {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let written = Pin::new(&mut self.io).poll_write(cx, buf);
+        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+        }
+        written
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
