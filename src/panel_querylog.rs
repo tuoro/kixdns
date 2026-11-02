@@ -116,7 +116,17 @@ impl std::ops::Deref for ConfigName {
 /// 一千多个槽位放得进缓存
 /// One slot: empty, or holding a tracked request (its number and its half-written record). The record
 /// lives elsewhere and the slot holds a pointer, so a thousand slots fit in the cache
-type Slot = Mutex<Option<(u64, Arc<Entry>)>>;
+type Slot = Mutex<Option<(u64, Box<Pending>)>>;
+
+thread_local! {
+    /// 这个线程上一个请求用完的记录，下一个请求接着用：每个请求不再分配一份，域名和步骤也留着用过的容量
+    /// The record the last request on this thread finished with, taken up by the next one: no request
+    /// allocates its own, and the domain and steps keep the capacity they had
+    static SPARE: RefCell<Option<Box<Pending>>> = const { RefCell::new(None) };
+    /// 编一条记录用的缓冲，编好再复制成交接区里那一份 / The buffer a record is encoded into before it is
+    /// copied into the ring
+    static ENCODING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 pub(crate) struct QueryLog {
     epoch: Instant,
@@ -148,7 +158,7 @@ pub(crate) struct QueryLog {
     /// request still running holds the slot (more are tracked at once than there are slots), the request
     /// goes to `overflow`
     slots: Box<[Slot]>,
-    overflow: DashMap<u64, Arc<Entry>>,
+    overflow: DashMap<u64, Box<Pending>>,
     /// `overflow` 里有几条：为 0 时不碰共享表 / How many requests `overflow` holds: at 0 the map is not
     /// touched
     overflow_len: AtomicUsize,
@@ -158,10 +168,21 @@ pub(crate) struct QueryLog {
     ring: Mutex<Ring>,
 }
 
+/// 交接区：编好的记录，序号连续（只从头上丢），最后一条是 `newest`
+/// The hand-off ring: encoded records, numbered contiguously (it only drops from the front), the last
+/// being `newest`
 struct Ring {
-    entries: VecDeque<Arc<Entry>>,
+    entries: VecDeque<Arc<[u8]>>,
     /// 最近一条的序号；第一条是 1 / The newest record's sequence number; the first is 1
     newest: u64,
+}
+
+impl Ring {
+    /// 最早那条的序号；空着时为 None / The oldest record's number; None while empty
+    fn oldest(&self) -> Option<u64> {
+        let len = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        (len > 0).then(|| self.newest + 1 - len)
+    }
 }
 
 struct Step {
@@ -240,22 +261,20 @@ enum StepKind {
     },
 }
 
-/// 一条查询记录。请求一开始就分配在它最终的位置上：在跟的时候只有槽位引用它，每一步原地写进来，请求结束补上
-/// 结果，再原样放进交接区，整条记录不再搬动。响应码、回答，以及由它们决定的结果和来源，都在面板来取时才读出
-/// （见 [`Entry::write`]）：记录时只存客户端收到的应答原文。查询多到交接区装满时，还没被取走就挤掉的记录不必解析。
-/// One query record. It is allocated in its final place when the request starts: while tracked only
-/// the slot refers to it, each step is written into it in place, the result is added when the request
-/// ends, and it goes into the ring as it is, never moved as a whole. The response code, the answers,
-/// and the outcome and source they decide are read out only when the panel collects the record (see
-/// [`Entry::write`]): recording keeps just the response the client got. When queries outrun the ring,
-/// a record pushed out before anyone collected it is never parsed.
-struct Entry {
-    seq: u64,
+/// 一个在跟的请求写到一半的记录：每一步原地写进来。请求结束时连同结果编成一段字节（见 [`Pending::encode`]），
+/// 交接区里放的是那段字节，这份结构留给这个线程的下一个请求接着用。字节在答它的那颗核上就编好，面板来取的线程
+/// 读的是连在一起的一小段，不必把散在几处的结构从别的核上搬过来
+/// A tracked request's half-written record: each step is written into it in place. When the request
+/// ends it is encoded together with the result into bytes (see [`Pending::encode`]); the ring holds
+/// those bytes, and this structure is taken up by the next request on the thread. The bytes are made on
+/// the core that answered, so the thread the panel collects on reads one small contiguous piece instead
+/// of pulling a structure spread over several places from another core
+struct Pending {
     started: Instant,
     time_unix_ms: u64,
     client: IpAddr,
     transport: Option<ClientTransport>,
-    qname: Box<str>,
+    qname: String,
     qtype: RecordType,
     /// 多数请求不过四步，放得下就不另外分配 / Most requests take four steps or fewer, which need no
     /// allocation of their own
@@ -277,11 +296,6 @@ struct Entry {
     decision: Option<(Option<ConfigName>, DecisionKind)>,
     /// 最后一个回了可用答案的上游 / The last upstream that returned a usable answer
     answered_by: Option<ConfigName>,
-    /// 以下在请求结束时补上 / The rest is added when the request ends
-    latency_us: u64,
-    status: Status,
-    response: Response,
-    error: Option<Box<str>>,
 }
 
 /// 请求怎么结束的 / How the request ended
@@ -303,9 +317,31 @@ impl Status {
     }
 }
 
-/// 存到交接区里的应答。比这长的当场读出，交接区里不存大块原文
-/// A response held in the ring. Anything longer is read on the spot, so the ring holds no large blobs
-const MAX_KEPT_RESPONSE: usize = 2_048;
+/// 答案从哪来（见 [`Pending::outcome`]）/ Where the answer came from (see [`Pending::outcome`])
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Forwarded,
+    Cached,
+    Stale,
+    Joined,
+    Static,
+    Failed,
+    Cancelled,
+}
+
+impl Outcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Cached => "cached",
+            Self::Stale => "stale",
+            Self::Joined => "joined",
+            Self::Static => "static",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
 
 /// 一条回答。地址留着原样，写的时候直接写数字，不先格式化成一个字符串；别的类型是读出来的文字
 /// One answer. An address is kept as it is and written digit by digit, without being formatted into a
@@ -321,38 +357,247 @@ enum Answer {
 /// allocation of their own
 type Answers = SmallVec<[Answer; MAX_ANSWERS]>;
 
-/// 客户端收到的应答 / The response the client got
-enum Response {
-    /// 没有应答（失败或取消） / No response (failed or cancelled)
-    None,
-    /// 应答原文，面板来取时再读 / The response bytes, read when the panel collects the record
-    Kept(Box<[u8]>),
-    /// 太长的应答，当场读出的响应码和回答 / An over-long response, its code and answers read on the spot
-    Read(Option<ResponseCode>, Box<[Answer]>),
+/// 枚举在编好的记录里写成一个字节。同一张表生成两个方向；写的那边是完整的 match，加了新的值不给编号就编译不过
+/// An enum written as one byte in an encoded record. One table makes both directions; the writing side is
+/// a full match, so a new value without a number does not compile
+macro_rules! byte_codes {
+    ($code:ident, $of:ident, $ty:ident { $($variant:ident = $byte:literal),+ $(,)? }) => {
+        fn $code(value: $ty) -> u8 {
+            match value {
+                $($ty::$variant => $byte,)+
+            }
+        }
+
+        fn $of(byte: u8) -> Option<$ty> {
+            match byte {
+                $($byte => Some($ty::$variant),)+
+                _ => None,
+            }
+        }
+    };
 }
 
-impl Response {
-    fn keep(bytes: Option<&[u8]>) -> Self {
-        match bytes {
-            None => Self::None,
-            Some(bytes) if bytes.len() <= MAX_KEPT_RESPONSE => Self::Kept(bytes.into()),
-            Some(bytes) => {
-                let (rcode, answers) = read_response(bytes);
-                Self::Read(rcode, answers.into_vec().into_boxed_slice())
+byte_codes!(client_transport_code, client_transport_of, ClientTransport { Udp = 0, Tcp = 1, Doh = 2 });
+byte_codes!(status_code, status_of, Status { Completed = 0, Failed = 1, Cancelled = 2 });
+byte_codes!(outcome_code, outcome_of, Outcome {
+    Forwarded = 0,
+    Cached = 1,
+    Stale = 2,
+    Joined = 3,
+    Static = 4,
+    Failed = 5,
+    Cancelled = 6,
+});
+byte_codes!(phase_code, phase_of, RulePhase { Request = 0, Response = 1 });
+byte_codes!(decision_code, decision_of, DecisionKind { Static = 0, Forward = 1, Jump = 2, Continue = 3 });
+byte_codes!(cache_code, cache_of, CacheHitKind {
+    Fresh = 0,
+    Stale = 1,
+    StaleClientTimeout = 2,
+    StaleUpstreamFailure = 3,
+});
+byte_codes!(transport_code, transport_of, Transport { Udp = 0, Tcp = 1, TcpUdp = 2, Doh = 3, Dot = 4, Doq = 5 });
+byte_codes!(upstream_outcome_code, upstream_outcome_of, UpstreamOutcome {
+    Success = 0,
+    Rejected = 1,
+    Error = 2,
+    Aborted = 3,
+    Throttled = 4,
+});
+byte_codes!(skip_reason_code, skip_reason_of, UpstreamSkipReason { Throttled = 0 });
+
+/// 步骤的种类在编好的记录里的编号 / The numbers of the step kinds in an encoded record
+const STEP_PIPELINE: u8 = 0;
+const STEP_RULE: u8 = 1;
+const STEP_DECISION: u8 = 2;
+const STEP_CACHE: u8 = 3;
+const STEP_JOINED: u8 = 4;
+const STEP_UPSTREAM: u8 = 5;
+const STEP_UPSTREAM_SKIPPED: u8 = 6;
+/// 回答的种类：IPv4、IPv6 地址照原样，别的是文字 / The kinds of answer: IPv4 and IPv6 addresses as they
+/// are, anything else as text
+const ANSWER_TEXT: u8 = 0;
+const ANSWER_V4: u8 = 4;
+const ANSWER_V6: u8 = 6;
+
+/// 编一条记录：数字是变长整数（每个字节七位，高位说后面还有），文字是长度加原文；可有可无的项，文字和枚举前面
+/// 一个 0 表示没有，数字加一、0 表示没有
+/// Encodes a record: numbers are variable-length integers (seven bits a byte, the high bit saying more
+/// follow), text is its length and then itself; for optional items, text and enums are preceded by 0 when
+/// absent, and numbers are stored plus one with 0 for none
+struct Encoder<'a>(&'a mut Vec<u8>);
+
+impl Encoder<'_> {
+    fn byte(&mut self, byte: u8) {
+        self.0.push(byte);
+    }
+
+    fn number(&mut self, mut value: u64) {
+        while value >= 0x80 {
+            self.0.push(value.to_le_bytes()[0] | 0x80);
+            value >>= 7;
+        }
+        self.0.push(value.to_le_bytes()[0]);
+    }
+
+    fn text(&mut self, text: &str) {
+        self.number(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        self.0.extend_from_slice(text.as_bytes());
+    }
+
+    fn optional_text(&mut self, text: Option<&str>) {
+        match text {
+            None => self.byte(0),
+            Some(text) => {
+                self.byte(1);
+                self.text(text);
             }
         }
     }
 
-    fn read(&self) -> (Option<ResponseCode>, Answers) {
-        match self {
-            Self::None => (None, Answers::new()),
-            Self::Kept(bytes) => read_response(bytes),
-            Self::Read(rcode, answers) => (*rcode, answers.iter().cloned().collect()),
+    fn optional_number(&mut self, value: Option<u64>) {
+        self.number(value.map_or(0, |value| value + 1));
+    }
+
+    fn address(&mut self, address: IpAddr) {
+        match address {
+            IpAddr::V4(address) => {
+                self.byte(ANSWER_V4);
+                self.0.extend_from_slice(&address.octets());
+            }
+            IpAddr::V6(address) => {
+                self.byte(ANSWER_V6);
+                self.0.extend_from_slice(&address.octets());
+            }
         }
     }
 }
 
-impl Entry {
+/// 读编好的记录（见 [`Encoder`]）；读不通时交回 None / Reads an encoded record (see [`Encoder`]); None
+/// when it does not read
+struct Decoder<'a>(&'a [u8]);
+
+impl<'a> Decoder<'a> {
+    fn byte(&mut self) -> Option<u8> {
+        let (&byte, rest) = self.0.split_first()?;
+        self.0 = rest;
+        Some(byte)
+    }
+
+    fn number(&mut self) -> Option<u64> {
+        let mut value = 0;
+        for shift in (0..64).step_by(7) {
+            let byte = self.byte()?;
+            value |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let (taken, rest) = self.0.split_at_checked(len)?;
+        self.0 = rest;
+        Some(taken)
+    }
+
+    fn text(&mut self) -> Option<&'a str> {
+        let len = usize::try_from(self.number()?).ok()?;
+        std::str::from_utf8(self.take(len)?).ok()
+    }
+
+    fn optional_text(&mut self) -> Option<Option<&'a str>> {
+        match self.byte()? {
+            0 => Some(None),
+            1 => self.text().map(Some),
+            _ => None,
+        }
+    }
+
+    fn optional_number(&mut self) -> Option<Option<u64>> {
+        Some(self.number()?.checked_sub(1))
+    }
+
+    /// 前面一个 0 表示没有，否则是编号加一 / 0 for none, otherwise the code plus one
+    fn optional_code<T>(&mut self, of: fn(u8) -> Option<T>) -> Option<Option<T>> {
+        match self.byte()? {
+            0 => Some(None),
+            code => of(code - 1).map(Some),
+        }
+    }
+
+    fn octets<const N: usize>(&mut self) -> Option<[u8; N]> {
+        self.take(N)?.try_into().ok()
+    }
+
+    fn address(&mut self) -> Option<IpAddr> {
+        match self.byte()? {
+            ANSWER_V4 => Some(IpAddr::V4(Ipv4Addr::from(self.octets::<4>()?))),
+            ANSWER_V6 => Some(IpAddr::V6(Ipv6Addr::from(self.octets::<16>()?))),
+            _ => None,
+        }
+    }
+
+    fn rcode(&mut self) -> Option<Option<u16>> {
+        match self.optional_number()? {
+            None => Some(None),
+            Some(rcode) => u16::try_from(rcode).ok().map(Some),
+        }
+    }
+}
+
+impl Pending {
+    /// 这个请求的记录：接着用这个线程上一个请求用完的那份，没有才分配 / This request's record: the one the
+    /// last request on this thread finished with, or a new one when there is none
+    fn start(ctx: &RequestContext<'_>, started: Instant) -> Box<Self> {
+        let client = ctx.client.ip().to_canonical();
+        let time_unix_ms = unix_ms();
+        let Some(mut pending) = SPARE.with_borrow_mut(Option::take) else {
+            return Box::new(Self {
+                started,
+                time_unix_ms,
+                client,
+                transport: ctx.transport,
+                qname: ctx.qname.to_owned(),
+                qtype: ctx.qtype,
+                steps: SmallVec::new(),
+                steps_truncated: false,
+                cache: None,
+                cache_source: None,
+                joined: false,
+                pipeline: None,
+                decision: None,
+                answered_by: None,
+            });
+        };
+        pending.started = started;
+        pending.time_unix_ms = time_unix_ms;
+        pending.client = client;
+        pending.transport = ctx.transport;
+        pending.qname.clear();
+        pending.qname.push_str(ctx.qname);
+        pending.qtype = ctx.qtype;
+        pending.steps.clear();
+        pending.steps_truncated = false;
+        pending.cache = None;
+        pending.cache_source = None;
+        pending.joined = false;
+        pending.pipeline = None;
+        pending.decision = None;
+        pending.answered_by = None;
+        pending
+    }
+
+    /// 用完了，留给这个线程的下一个请求 / Done with, kept for the next request on this thread
+    fn release(self: Box<Self>) {
+        SPARE.with_borrow_mut(|spare| {
+            if spare.is_none() {
+                *spare = Some(self);
+            }
+        });
+    }
+
     /// 最后一次决定是规则直接回应 / Whether the last decision was a rule's own answer
     fn decided_static(&self) -> bool {
         matches!(self.decision, Some((_, DecisionKind::Static)))
@@ -366,115 +611,88 @@ impl Entry {
     /// SERVFAIL that did not come from the cache) or `cancelled`. A SERVFAIL taken from the cache still
     /// counts as cached (it says where the answer came from); any other SERVFAIL means the name was not
     /// resolved
-    fn outcome(&self, rcode: Option<ResponseCode>) -> &'static str {
-        match self.status {
-            Status::Completed if self.cache == Some(CacheHitKind::Fresh) => "cached",
-            Status::Completed if self.cache.is_some() => "stale",
-            Status::Completed if rcode == Some(ResponseCode::ServFail) => "failed",
-            Status::Completed if self.joined => "joined",
-            Status::Completed if self.decided_static() => "static",
-            Status::Completed => "forwarded",
-            Status::Failed => "failed",
-            Status::Cancelled => "cancelled",
+    fn outcome(&self, status: Status, rcode: Option<ResponseCode>) -> Outcome {
+        match status {
+            Status::Completed if self.cache == Some(CacheHitKind::Fresh) => Outcome::Cached,
+            Status::Completed if self.cache.is_some() => Outcome::Stale,
+            Status::Completed if rcode == Some(ResponseCode::ServFail) => Outcome::Failed,
+            Status::Completed if self.joined => Outcome::Joined,
+            Status::Completed if self.decided_static() => Outcome::Static,
+            Status::Completed => Outcome::Forwarded,
+            Status::Failed => Outcome::Failed,
+            Status::Cancelled => Outcome::Cancelled,
         }
     }
 
-    /// 写成一行 JSON。字段的顺序固定，空着的不写；`steps_truncated` 只在截断时写
-    /// Writes the record as one line of JSON. The fields come in a fixed order and empty ones are left
-    /// out; `steps_truncated` appears only when the steps were cut
-    fn write(&self, json: &mut Json) {
-        let (rcode, answers) = self.response.read();
-        let outcome = self.outcome(rcode);
+    /// 请求结束：连同用了多久、怎么结束的和客户端收到的应答编成一段字节，顺序就是写成 JSON 的顺序（见
+    /// [`write_record`]）。应答这时就读出来，不再留一份原文
+    /// The request ended: the record is encoded with how long it took, how it ended and the response the
+    /// client got, in the order its JSON is written (see [`write_record`]). The response is read now, and
+    /// no copy of it is kept
+    fn encode(&self, outcome: &RequestOutcome<'_>, out: &mut Vec<u8>) {
+        let status = match outcome.status {
+            RequestStatus::Completed => Status::Completed,
+            RequestStatus::Failed => Status::Failed,
+            RequestStatus::Cancelled => Status::Cancelled,
+        };
+        let (rcode, answers) = outcome
+            .response
+            .map_or_else(|| (None, Answers::new()), read_response);
+        let result = self.outcome(status, rcode);
         // 答案来自哪个上游：转发的是回答的那个，缓存的是当初回答的那个；规则直接回应、合并和失败的没有
         // Which upstream the answer came from: for a forward the one that answered, for a cache hit the one
         // that answered originally; none for a rule's own answer, a joined query or a failure
-        let upstream = match outcome {
-            "cached" | "stale" => self.cache_source.as_deref(),
-            "forwarded" => self.answered_by.as_deref(),
+        let upstream = match result {
+            Outcome::Cached | Outcome::Stale => self.cache_source.as_deref(),
+            Outcome::Forwarded => self.answered_by.as_deref(),
             _ => None,
         };
-        json.raw("{\"seq\":");
-        json.number(self.seq);
-        json.key("time_unix_ms");
-        json.number(self.time_unix_ms);
-        json.key("client");
-        json.address(self.client);
-        if let Some(transport) = self.transport {
-            json.key("transport");
-            json.label(client_transport_label(transport));
-        }
-        json.key("qname");
-        json.text(&self.qname);
-        // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
-        // hickory's `Display` writes it, without allocating a string first
-        json.key("qtype");
-        json.text(<&'static str>::from(self.qtype));
-        json.key("latency_us");
-        json.number(self.latency_us);
-        json.key("status");
-        json.label(self.status.label());
-        json.key("outcome");
-        json.label(outcome);
-        if let Some(rcode) = rcode {
-            json.key("rcode");
-            json.label(&rcode_name(rcode));
-        }
-        json.key("answers");
-        json.raw("[");
-        for (index, answer) in answers.iter().enumerate() {
-            if index > 0 {
-                json.raw(",");
-            }
+        let mut out = Encoder(out);
+        out.number(self.time_unix_ms);
+        out.address(self.client);
+        out.byte(
+            self.transport
+                .map_or(0, |transport| client_transport_code(transport) + 1),
+        );
+        out.text(&self.qname);
+        out.number(u64::from(u16::from(self.qtype)));
+        out.number(u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX));
+        out.byte(status_code(status));
+        out.byte(outcome_code(result));
+        out.optional_number(rcode.map(|rcode| u64::from(u16::from(rcode))));
+        out.number(u64::try_from(answers.len()).unwrap_or(u64::MAX));
+        for answer in &answers {
             match answer {
-                Answer::V4(address) => json.ipv4(*address),
-                Answer::V6(address) => json.address(IpAddr::V6(*address)),
-                Answer::Text(text) => json.text(text),
+                Answer::V4(address) => out.address(IpAddr::V4(*address)),
+                Answer::V6(address) => out.address(IpAddr::V6(*address)),
+                Answer::Text(text) => {
+                    out.byte(ANSWER_TEXT);
+                    out.text(text);
+                }
             }
         }
-        json.raw("]");
-        if let Some(error) = &self.error {
-            json.key("error");
-            json.text(error);
+        out.optional_text(outcome.error.map(clip).as_deref());
+        out.optional_text(self.pipeline.as_deref());
+        out.optional_text(match &self.decision {
+            Some((Some(rule), _)) => Some(rule),
+            _ => None,
+        });
+        out.optional_text(upstream);
+        out.number(u64::try_from(self.steps.len()).unwrap_or(u64::MAX));
+        for step in &self.steps {
+            step.encode(&mut out);
         }
-        if let Some(pipeline) = &self.pipeline {
-            json.key("pipeline");
-            json.text(pipeline);
-        }
-        if let Some((Some(rule), _)) = &self.decision {
-            json.key("rule");
-            json.text(rule);
-        }
-        if let Some(upstream) = upstream {
-            json.key("upstream");
-            json.text(upstream);
-        }
-        json.key("steps");
-        json.raw("[");
-        for (index, step) in self.steps.iter().enumerate() {
-            if index > 0 {
-                json.raw(",");
-            }
-            step.write(json);
-        }
-        json.raw("]");
-        if self.steps_truncated {
-            json.key("steps_truncated");
-            json.raw("true");
-        }
-        json.raw("}");
+        out.byte(u8::from(self.steps_truncated));
     }
 }
 
 impl Step {
-    fn write(&self, json: &mut Json) {
-        json.raw("{\"at_us\":");
-        json.number(self.at_us);
-        json.key("kind");
+    fn encode(&self, out: &mut Encoder<'_>) {
+        out.number(self.at_us);
         match &self.what {
             StepKind::Pipeline { pipeline } => {
-                json.label("pipeline");
-                json.key("pipeline");
-                json.text(pipeline);
+                out.byte(STEP_PIPELINE);
+                out.text(pipeline);
             }
             StepKind::Rule {
                 pipeline,
@@ -484,25 +702,13 @@ impl Step {
                 decision,
                 target,
             } => {
-                json.label("rule");
-                json.key("pipeline");
-                json.text(pipeline);
-                json.key("rule");
-                json.text(rule);
-                json.key("phase");
-                json.label(phase_label(*phase));
-                if let Some(matched) = matched {
-                    json.key("matched");
-                    json.raw(if *matched { "true" } else { "false" });
-                }
-                if let Some(decision) = decision {
-                    json.key("decision");
-                    json.label(decision_label(*decision));
-                }
-                if let Some(target) = target {
-                    json.key("target");
-                    json.text(target);
-                }
+                out.byte(STEP_RULE);
+                out.text(pipeline);
+                out.text(rule);
+                out.byte(phase_code(*phase));
+                out.byte(matched.map_or(0, |matched| u8::from(matched) + 1));
+                out.byte(decision.map_or(0, |decision| decision_code(decision) + 1));
+                out.optional_text(target.as_deref());
             }
             StepKind::Decision {
                 pipeline,
@@ -511,32 +717,19 @@ impl Step {
                 decision,
                 target,
             } => {
-                json.label("decision");
-                json.key("pipeline");
-                json.text(pipeline);
-                if let Some(rule) = rule {
-                    json.key("rule");
-                    json.text(rule);
-                }
-                json.key("phase");
-                json.label(phase_label(*phase));
-                json.key("decision");
-                json.label(decision_label(*decision));
-                if let Some(target) = target {
-                    json.key("target");
-                    json.text(target);
-                }
+                out.byte(STEP_DECISION);
+                out.text(pipeline);
+                out.optional_text(rule.as_deref());
+                out.byte(phase_code(*phase));
+                out.byte(decision_code(*decision));
+                out.optional_text(target.as_deref());
             }
             StepKind::Cache { result, source } => {
-                json.label("cache");
-                json.key("result");
-                json.label(result.map_or("miss", cache_label));
-                if let Some(source) = source {
-                    json.key("source");
-                    json.text(source);
-                }
+                out.byte(STEP_CACHE);
+                out.byte(result.map_or(0, |result| cache_code(result) + 1));
+                out.optional_text(source.as_deref());
             }
-            StepKind::Joined => json.label("joined"),
+            StepKind::Joined => out.byte(STEP_JOINED),
             StepKind::Upstream {
                 upstream,
                 transport,
@@ -546,42 +739,202 @@ impl Step {
                 rcode,
                 error,
             } => {
-                json.label("upstream");
-                json.key("upstream");
-                json.text(upstream);
-                json.key("transport");
-                json.label(transport_label(*transport));
-                json.key("via");
-                json.label(transport_label(*via));
-                json.key("result");
-                json.label(outcome_label(*result));
-                json.key("latency_us");
-                json.number(*latency_us);
-                if let Some(rcode) = rcode {
-                    json.key("rcode");
-                    json.label(&rcode_name(*rcode));
-                }
-                if let Some(error) = error {
-                    json.key("error");
-                    json.text(error);
-                }
+                out.byte(STEP_UPSTREAM);
+                out.text(upstream);
+                out.byte(transport_code(*transport));
+                out.byte(transport_code(*via));
+                out.byte(upstream_outcome_code(*result));
+                out.number(*latency_us);
+                out.optional_number(rcode.map(|rcode| u64::from(u16::from(rcode))));
+                out.optional_text(error.as_deref());
             }
             StepKind::UpstreamSkipped {
                 upstream,
                 transport,
                 reason,
             } => {
-                json.label("upstream_skipped");
-                json.key("upstream");
-                json.text(upstream);
-                json.key("transport");
-                json.label(transport_label(*transport));
-                json.key("reason");
-                json.label(skip_reason_label(*reason));
+                out.byte(STEP_UPSTREAM_SKIPPED);
+                out.text(upstream);
+                out.byte(transport_code(*transport));
+                out.byte(skip_reason_code(*reason));
             }
         }
-        json.raw("}");
     }
+}
+
+/// 编好的一条记录写成一行 JSON：字段的顺序固定，空着的不写；`steps_truncated` 只在截断时写。字节是这个进程自己
+/// 编的，读不通只会是程序写错了，交回 None
+/// Writes an encoded record as one line of JSON: the fields come in a fixed order and empty ones are left
+/// out; `steps_truncated` appears only when the steps were cut. The bytes were encoded by this process, so
+/// failing to read them can only be a bug, and gives None
+fn write_record(seq: u64, record: &[u8], json: &mut Json) -> Option<()> {
+    let mut input = Decoder(record);
+    json.raw("{\"seq\":");
+    json.number(seq);
+    json.key("time_unix_ms");
+    json.number(input.number()?);
+    json.key("client");
+    json.address(input.address()?);
+    if let Some(transport) = input.optional_code(client_transport_of)? {
+        json.key("transport");
+        json.label(client_transport_label(transport));
+    }
+    json.key("qname");
+    json.text(input.text()?);
+    // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
+    // hickory's `Display` writes it, without allocating a string first
+    json.key("qtype");
+    json.text(<&'static str>::from(RecordType::from(
+        u16::try_from(input.number()?).ok()?,
+    )));
+    json.key("latency_us");
+    json.number(input.number()?);
+    json.key("status");
+    json.label(status_of(input.byte()?)?.label());
+    json.key("outcome");
+    json.label(outcome_of(input.byte()?)?.label());
+    if let Some(rcode) = input.rcode()? {
+        json.key("rcode");
+        json.label(&rcode_name(rcode));
+    }
+    json.key("answers");
+    json.raw("[");
+    for index in 0..input.number()? {
+        if index > 0 {
+            json.raw(",");
+        }
+        match input.byte()? {
+            ANSWER_V4 => json.ipv4(Ipv4Addr::from(input.octets::<4>()?)),
+            ANSWER_V6 => json.address(IpAddr::V6(Ipv6Addr::from(input.octets::<16>()?))),
+            ANSWER_TEXT => json.text(input.text()?),
+            _ => return None,
+        }
+    }
+    json.raw("]");
+    for key in ["error", "pipeline", "rule", "upstream"] {
+        if let Some(text) = input.optional_text()? {
+            json.key(key);
+            json.text(text);
+        }
+    }
+    json.key("steps");
+    json.raw("[");
+    for index in 0..input.number()? {
+        if index > 0 {
+            json.raw(",");
+        }
+        write_step(&mut input, json)?;
+    }
+    json.raw("]");
+    if input.byte()? != 0 {
+        json.key("steps_truncated");
+        json.raw("true");
+    }
+    json.raw("}");
+    input.0.is_empty().then_some(())
+}
+
+/// 编好的一步写成 JSON / Writes one encoded step as JSON
+fn write_step(input: &mut Decoder<'_>, json: &mut Json) -> Option<()> {
+    json.raw("{\"at_us\":");
+    json.number(input.number()?);
+    json.key("kind");
+    match input.byte()? {
+        STEP_PIPELINE => {
+            json.label("pipeline");
+            json.key("pipeline");
+            json.text(input.text()?);
+        }
+        STEP_RULE => {
+            json.label("rule");
+            json.key("pipeline");
+            json.text(input.text()?);
+            json.key("rule");
+            json.text(input.text()?);
+            json.key("phase");
+            json.label(phase_label(phase_of(input.byte()?)?));
+            match input.byte()? {
+                0 => {}
+                1 => {
+                    json.key("matched");
+                    json.raw("false");
+                }
+                2 => {
+                    json.key("matched");
+                    json.raw("true");
+                }
+                _ => return None,
+            }
+            if let Some(decision) = input.optional_code(decision_of)? {
+                json.key("decision");
+                json.label(decision_label(decision));
+            }
+            if let Some(target) = input.optional_text()? {
+                json.key("target");
+                json.text(target);
+            }
+        }
+        STEP_DECISION => {
+            json.label("decision");
+            json.key("pipeline");
+            json.text(input.text()?);
+            if let Some(rule) = input.optional_text()? {
+                json.key("rule");
+                json.text(rule);
+            }
+            json.key("phase");
+            json.label(phase_label(phase_of(input.byte()?)?));
+            json.key("decision");
+            json.label(decision_label(decision_of(input.byte()?)?));
+            if let Some(target) = input.optional_text()? {
+                json.key("target");
+                json.text(target);
+            }
+        }
+        STEP_CACHE => {
+            json.label("cache");
+            json.key("result");
+            json.label(input.optional_code(cache_of)?.map_or("miss", cache_label));
+            if let Some(source) = input.optional_text()? {
+                json.key("source");
+                json.text(source);
+            }
+        }
+        STEP_JOINED => json.label("joined"),
+        STEP_UPSTREAM => {
+            json.label("upstream");
+            json.key("upstream");
+            json.text(input.text()?);
+            json.key("transport");
+            json.label(transport_label(transport_of(input.byte()?)?));
+            json.key("via");
+            json.label(transport_label(transport_of(input.byte()?)?));
+            json.key("result");
+            json.label(outcome_label(upstream_outcome_of(input.byte()?)?));
+            json.key("latency_us");
+            json.number(input.number()?);
+            if let Some(rcode) = input.rcode()? {
+                json.key("rcode");
+                json.label(&rcode_name(rcode));
+            }
+            if let Some(error) = input.optional_text()? {
+                json.key("error");
+                json.text(error);
+            }
+        }
+        STEP_UPSTREAM_SKIPPED => {
+            json.label("upstream_skipped");
+            json.key("upstream");
+            json.text(input.text()?);
+            json.key("transport");
+            json.label(transport_label(transport_of(input.byte()?)?));
+            json.key("reason");
+            json.label(skip_reason_label(skip_reason_of(input.byte()?)?));
+        }
+        _ => return None,
+    }
+    json.raw("}");
+    Some(())
 }
 
 /// 拼一页 JSON。键名和内核自己的标签（`udp`、`forward`、`success`……）原样写；外来的文字（域名、配置里的名字、
@@ -684,7 +1037,7 @@ impl Drop for Waiting<'_> {
     }
 }
 
-impl Entry {
+impl Pending {
     fn push(&mut self, what: StepKind) {
         if self.steps.len() >= MAX_STEPS {
             self.steps_truncated = true;
@@ -776,26 +1129,21 @@ impl QueryLog {
         &self.slots[request_id as usize & (self.slots.len() - 1)]
     }
 
-    /// 往在跟的请求的记录里写。记录放进交接区之前只有槽位引用它，`get_mut` 总能拿到
-    /// Writes into a tracked request's record. Until the record goes into the ring only the slot refers
-    /// to it, so `get_mut` always succeeds
-    fn with_pending(&self, ctx: &RequestContext<'_>, update: impl FnOnce(&mut Entry)) {
+    /// 往在跟的请求的记录里写 / Writes into a tracked request's record
+    fn with_pending(&self, ctx: &RequestContext<'_>, update: impl FnOnce(&mut Pending)) {
         if self.pending_count.load(Ordering::Relaxed) == 0 {
             return;
         }
         if let Some((id, pending)) = &mut *self.slot(ctx.request_id).lock()
             && *id == ctx.request_id
         {
-            if let Some(pending) = Arc::get_mut(pending) {
-                update(pending);
-            }
+            update(pending);
             return;
         }
         if self.overflow_len.load(Ordering::Relaxed) > 0
             && let Some(mut pending) = self.overflow.get_mut(&ctx.request_id)
-            && let Some(pending) = Arc::get_mut(&mut pending)
         {
-            update(pending);
+            update(&mut pending);
         }
     }
 
@@ -813,27 +1161,7 @@ impl QueryLog {
             self.untracked.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let pending = Arc::new(Entry {
-            seq: 0,
-            started,
-            time_unix_ms: unix_ms(),
-            client: ctx.client.ip().to_canonical(),
-            transport: ctx.transport,
-            qname: ctx.qname.into(),
-            qtype: ctx.qtype,
-            steps: SmallVec::new(),
-            steps_truncated: false,
-            cache: None,
-            cache_source: None,
-            joined: false,
-            pipeline: None,
-            decision: None,
-            answered_by: None,
-            latency_us: 0,
-            status: Status::Cancelled,
-            response: Response::None,
-            error: None,
-        });
+        let pending = Pending::start(ctx, started);
         // 同一个请求号又开始一次时替换掉原来那条，不多算一条（和原先用共享表时一样）
         // The same request number starting again replaces its record without counting another (as
         // when a shared map held them all)
@@ -843,7 +1171,11 @@ impl QueryLog {
                 *slot = Some((ctx.request_id, pending));
                 self.pending_count.fetch_add(1, Ordering::Relaxed);
             }
-            Some((held, _)) if *held == ctx.request_id => *slot = Some((ctx.request_id, pending)),
+            Some((held, _)) if *held == ctx.request_id => {
+                if let Some((_, replaced)) = slot.replace((ctx.request_id, pending)) {
+                    replaced.release();
+                }
+            }
             Some(_) => {
                 drop(slot);
                 if self.overflow.insert(ctx.request_id, pending).is_none() {
@@ -1043,31 +1375,33 @@ impl QueryLog {
             self.overflow_len.fetch_sub(1, Ordering::Relaxed);
             Some(pending)
         });
-        let Some(mut pending) = pending else {
+        let Some(pending) = pending else {
             return;
         };
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
-        if let Some(entry) = Arc::get_mut(&mut pending) {
-            finish(entry, outcome);
-        }
-        self.push(pending);
+        let record = ENCODING.with_borrow_mut(|encoding| {
+            encoding.clear();
+            pending.encode(outcome, encoding);
+            Arc::<[u8]>::from(encoding.as_slice())
+        });
+        pending.release();
+        self.push(record);
     }
 
-    fn push(&self, mut entry: Arc<Entry>) {
+    /// 编好的记录放进交接区，序号是它的位置 / Puts an encoded record into the ring; its number is its
+    /// place
+    fn push(&self, record: Arc<[u8]>) {
         // 释放在锁外：锁里只给序号、换进换出 / Freeing happens outside the lock: inside it the record
         // only gets its number and is swapped in
         let (evicted, newest) = {
             let mut ring = self.ring.lock();
             ring.newest += 1;
-            if let Some(unshared) = Arc::get_mut(&mut entry) {
-                unshared.seq = ring.newest;
-            }
             let evicted = if ring.entries.len() >= self.capacity {
                 ring.entries.pop_front()
             } else {
                 None
             };
-            ring.entries.push_back(entry);
+            ring.entries.push_back(record);
             (evicted, ring.newest)
         };
         drop(evicted);
@@ -1154,32 +1488,31 @@ impl QueryLog {
         self.renew();
         let stored_up_to = (instance == Some(self.instance))
             .then(|| stored.map_or(after, |stored| stored.min(after)));
-        let (entries, oldest, newest, stored) = {
+        let (entries, first, oldest, newest, stored) = {
             let mut ring = self.ring.lock();
             // 存好的锁外再释放 / What is stored is freed outside the lock
             let mut stored = Vec::new();
             while let Some(up_to) = stored_up_to
-                && ring.entries.front().is_some_and(|entry| entry.seq <= up_to)
+                && ring.oldest().is_some_and(|oldest| oldest <= up_to)
             {
                 stored.extend(ring.entries.pop_front());
             }
-            let oldest = ring.entries.front().map(|entry| entry.seq);
+            let oldest = ring.oldest();
             // 交接区里的序号是连续的（只从头上丢），所以 `after` 之后的第一条就在 `after - oldest + 1`
             // The ring's numbers are contiguous (it only drops from the front), so the first record
             // after `after` sits at `after - oldest + 1`
-            let start = oldest.map_or(0, |oldest| {
-                usize::try_from(after.saturating_add(1).saturating_sub(oldest))
-                    .unwrap_or(usize::MAX)
-            });
-            let entries: Vec<Arc<Entry>> = ring
+            let start = oldest.map_or(0, |oldest| after.saturating_add(1).saturating_sub(oldest));
+            let first = oldest.map_or(0, |oldest| oldest + start);
+            let entries: Vec<Arc<[u8]>> = ring
                 .entries
                 .iter()
-                .skip(start)
-                .take_while(|entry| until.is_none_or(|until| entry.seq <= until))
+                .skip(usize::try_from(start).unwrap_or(usize::MAX))
+                .zip(first..)
+                .take_while(|(_, seq)| until.is_none_or(|until| *seq <= until))
                 .take(limit)
-                .cloned()
+                .map(|(record, _)| Arc::clone(record))
                 .collect();
-            (entries, oldest, ring.newest, stored)
+            (entries, first, oldest, ring.newest, stored)
         };
         drop(stored);
         // 交接区空了（清空过，或从没记过）时，游标之后、到最新序号为止的都已不在
@@ -1217,29 +1550,26 @@ impl QueryLog {
         json.raw(if reached < newest { "true" } else { "false" });
         json.key("entries");
         json.raw("[");
-        for (index, entry) in entries.iter().enumerate() {
-            if index > 0 {
+        for (seq, record) in (first..).zip(&entries) {
+            if seq > first {
                 json.raw(",");
             }
-            entry.write(&mut json);
+            let at = json.0.len();
+            if write_record(seq, record, &mut json).is_none() {
+                // 编好的记录读不回来只会是程序写错了：这一条只留序号，整页照样能读
+                // An encoded record that does not read back can only be a bug: it keeps just its number,
+                // and the page still reads
+                tracing::error!(seq, "查询日志里有一条编好的记录读不回来");
+                json.0.truncate(at);
+                json.raw("{\"seq\":");
+                json.number(seq);
+                json.raw("}");
+            }
         }
         json.raw("]}");
         // 写进去的都是完整的 UTF-8 / Everything written is whole UTF-8
         String::from_utf8(json.0).unwrap_or_default()
     }
-}
-
-/// 请求结束：补上用了多久、怎么结束的和客户端收到的应答 / The request ended: how long it took, how it
-/// ended and the response the client got are added
-fn finish(entry: &mut Entry, outcome: &RequestOutcome<'_>) {
-    entry.latency_us = u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX);
-    entry.status = match outcome.status {
-        RequestStatus::Completed => Status::Completed,
-        RequestStatus::Failed => Status::Failed,
-        RequestStatus::Cancelled => Status::Cancelled,
-    };
-    entry.response = Response::keep(outcome.response);
-    entry.error = outcome.error.map(|error| clip(error).into());
 }
 
 /// 响应码和回答记录（只取记录的数据部分，最多 8 条）；解析不了就只读包头的响应码。
@@ -1343,8 +1673,8 @@ fn name_end(packet: &[u8], mut pos: usize) -> Option<usize> {
 
 /// 响应码的助记名（NOERROR、NXDOMAIN……），和配置里写的一样 / The response code mnemonic
 /// (NOERROR, NXDOMAIN, …), as written in the config
-fn rcode_name(code: ResponseCode) -> Cow<'static, str> {
-    match u16::from(code) {
+fn rcode_name(code: u16) -> Cow<'static, str> {
+    match code {
         0 => Cow::Borrowed("NOERROR"),
         1 => Cow::Borrowed("FORMERR"),
         2 => Cow::Borrowed("SERVFAIL"),
@@ -1424,8 +1754,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CAPACITY, ConfigName, KNOWN_NAMES, MAX_ANSWERS, MAX_KEPT_RESPONSE, MAX_PAGE, MAX_STEPS,
-        MAX_TEXT, PENDING_SLOTS, QueryLog, Response, clip, read_response, read_whole_response,
+        CAPACITY, ConfigName, KNOWN_NAMES, MAX_ANSWERS, MAX_PAGE, MAX_STEPS, MAX_TEXT,
+        PENDING_SLOTS, QueryLog, clip, read_response, read_whole_response,
     };
     use crate::config::Transport;
     use crate::observe::{
@@ -1711,17 +2041,16 @@ mod tests {
         );
     }
 
-    /// 应答原文存着、面板来取时才读；超过上限的当场读出，交接区里不存大块原文。两种取出来都一样
-    /// Responses are kept as bytes and read when the panel collects them; over-long ones are read on the
-    /// spot so the ring holds no large blobs. Both read out the same
+    /// 请求结束时就读出应答，交接区里不存应答原文：短的照样读出全部回答，长的只留前 8 条
+    /// The response is read when the request ends and the ring keeps no copy of it: a short one gives all its
+    /// answers, a long one only the first eight
     #[test]
-    fn responses_are_read_when_collected_and_long_ones_on_the_spot() {
+    fn responses_are_read_when_the_request_ends() {
         let log = QueryLog::default();
         let _ = page(&log, 0, 1);
         let short = response(ResponseCode::NoError, &[[192, 0, 2, 1], [192, 0, 2, 2]]);
         let many: Vec<[u8; 4]> = (0..200u8).map(|i| [198, 51, 100, i]).collect();
         let long = response(ResponseCode::NoError, &many);
-        assert!(short.len() <= MAX_KEPT_RESPONSE && long.len() > MAX_KEPT_RESPONSE);
         for (id, bytes) in [(1, &short), (2, &long)] {
             let request = ctx(id);
             log.request_started(&request, false);
@@ -1729,8 +2058,11 @@ mod tests {
         }
         {
             let ring = log.ring.lock();
-            assert!(matches!(ring.entries[0].response, Response::Kept(_)));
-            assert!(matches!(ring.entries[1].response, Response::Read(..)));
+            assert!(
+                ring.entries.iter().all(|record| record.len() < 200),
+                "the ring holds the encoded records, not the {}-byte response",
+                long.len()
+            );
         }
         let got = entries(&log);
         assert_eq!(
@@ -2047,6 +2379,500 @@ mod tests {
     /// A page of JSON fixed byte for byte: every kind of step, items left out when empty, text that needs
     /// escaping, an IPv6 client and the various outcomes. The panel stores records as written, so a change
     /// in field order or spelling changes what it stores
+    /// 编好的记录读回来写成的 JSON，和原来直接从记录写的一字不差。原来的写法照搬下来当标准答案（只把字段换成在跟的
+    /// 记录和请求结束时的结果），随机的记录比两万条：每种步骤、要转义的文字、截断的报错、IPv6 客户端、各种应答
+    /// The JSON written from an encoded record equals what was written straight from the record. The old
+    /// way of writing is kept as the reference (its fields taken from the tracked record and the request's
+    /// end), compared over twenty thousand random records: every kind of step, text that needs escaping,
+    /// clipped errors, IPv6 clients and all sorts of responses
+    mod encoded_records {
+        use super::super::*;
+        use hickory_proto::op::{MessageType, OpCode};
+        use hickory_proto::rr::Record;
+        use hickory_proto::rr::rdata::{A, AAAA, CNAME, TXT};
+        use std::str::FromStr;
+
+        fn reference_json(pending: &Pending, seq: u64, finished: &RequestOutcome<'_>) -> String {
+            let status = match finished.status {
+                RequestStatus::Completed => Status::Completed,
+                RequestStatus::Failed => Status::Failed,
+                RequestStatus::Cancelled => Status::Cancelled,
+            };
+            let latency_us = u64::try_from(finished.latency.as_micros()).unwrap_or(u64::MAX);
+            let error = finished.error.map(clip);
+            let reference_outcome = |rcode: Option<ResponseCode>| -> &'static str {
+                match status {
+                    Status::Completed if pending.cache == Some(CacheHitKind::Fresh) => "cached",
+                    Status::Completed if pending.cache.is_some() => "stale",
+                    Status::Completed if rcode == Some(ResponseCode::ServFail) => "failed",
+                    Status::Completed if pending.joined => "joined",
+                    Status::Completed
+                        if matches!(pending.decision, Some((_, DecisionKind::Static))) =>
+                    {
+                        "static"
+                    }
+                    Status::Completed => "forwarded",
+                    Status::Failed => "failed",
+                    Status::Cancelled => "cancelled",
+                }
+            };
+            let mut json = Json(Vec::new());
+            let (rcode, answers) = finished
+                .response
+                .map_or_else(|| (None, Answers::new()), read_response);
+            let outcome = reference_outcome(rcode);
+            // 答案来自哪个上游：转发的是回答的那个，缓存的是当初回答的那个；规则直接回应、合并和失败的没有
+            // Which upstream the answer came from: for a forward the one that answered, for a cache hit the one
+            // that answered originally; none for a rule's own answer, a joined query or a failure
+            let upstream = match outcome {
+                "cached" | "stale" => pending.cache_source.as_deref(),
+                "forwarded" => pending.answered_by.as_deref(),
+                _ => None,
+            };
+            json.raw("{\"seq\":");
+            json.number(seq);
+            json.key("time_unix_ms");
+            json.number(pending.time_unix_ms);
+            json.key("client");
+            json.address(pending.client);
+            if let Some(transport) = pending.transport {
+                json.key("transport");
+                json.label(client_transport_label(transport));
+            }
+            json.key("qname");
+            json.text(&pending.qname);
+            // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
+            // hickory's `Display` writes it, without allocating a string first
+            json.key("qtype");
+            json.text(<&'static str>::from(pending.qtype));
+            json.key("latency_us");
+            json.number(latency_us);
+            json.key("status");
+            json.label(status.label());
+            json.key("outcome");
+            json.label(outcome);
+            if let Some(rcode) = rcode {
+                json.key("rcode");
+                json.label(&rcode_name(u16::from(rcode)));
+            }
+            json.key("answers");
+            json.raw("[");
+            for (index, answer) in answers.iter().enumerate() {
+                if index > 0 {
+                    json.raw(",");
+                }
+                match answer {
+                    Answer::V4(address) => json.ipv4(*address),
+                    Answer::V6(address) => json.address(IpAddr::V6(*address)),
+                    Answer::Text(text) => json.text(text),
+                }
+            }
+            json.raw("]");
+            if let Some(error) = &error {
+                json.key("error");
+                json.text(error);
+            }
+            if let Some(pipeline) = &pending.pipeline {
+                json.key("pipeline");
+                json.text(pipeline);
+            }
+            if let Some((Some(rule), _)) = &pending.decision {
+                json.key("rule");
+                json.text(rule);
+            }
+            if let Some(upstream) = upstream {
+                json.key("upstream");
+                json.text(upstream);
+            }
+            json.key("steps");
+            json.raw("[");
+            for (index, step) in pending.steps.iter().enumerate() {
+                if index > 0 {
+                    json.raw(",");
+                }
+                reference_step(step, &mut json);
+            }
+            json.raw("]");
+            if pending.steps_truncated {
+                json.key("steps_truncated");
+                json.raw("true");
+            }
+            json.raw("}");
+            String::from_utf8(json.0).unwrap()
+        }
+
+        fn reference_step(step: &Step, json: &mut Json) {
+            json.raw("{\"at_us\":");
+            json.number(step.at_us);
+            json.key("kind");
+            match &step.what {
+                StepKind::Pipeline { pipeline } => {
+                    json.label("pipeline");
+                    json.key("pipeline");
+                    json.text(pipeline);
+                }
+                StepKind::Rule {
+                    pipeline,
+                    rule,
+                    phase,
+                    matched,
+                    decision,
+                    target,
+                } => {
+                    json.label("rule");
+                    json.key("pipeline");
+                    json.text(pipeline);
+                    json.key("rule");
+                    json.text(rule);
+                    json.key("phase");
+                    json.label(phase_label(*phase));
+                    if let Some(matched) = matched {
+                        json.key("matched");
+                        json.raw(if *matched { "true" } else { "false" });
+                    }
+                    if let Some(decision) = decision {
+                        json.key("decision");
+                        json.label(decision_label(*decision));
+                    }
+                    if let Some(target) = target {
+                        json.key("target");
+                        json.text(target);
+                    }
+                }
+                StepKind::Decision {
+                    pipeline,
+                    rule,
+                    phase,
+                    decision,
+                    target,
+                } => {
+                    json.label("decision");
+                    json.key("pipeline");
+                    json.text(pipeline);
+                    if let Some(rule) = rule {
+                        json.key("rule");
+                        json.text(rule);
+                    }
+                    json.key("phase");
+                    json.label(phase_label(*phase));
+                    json.key("decision");
+                    json.label(decision_label(*decision));
+                    if let Some(target) = target {
+                        json.key("target");
+                        json.text(target);
+                    }
+                }
+                StepKind::Cache { result, source } => {
+                    json.label("cache");
+                    json.key("result");
+                    json.label(result.map_or("miss", cache_label));
+                    if let Some(source) = source {
+                        json.key("source");
+                        json.text(source);
+                    }
+                }
+                StepKind::Joined => json.label("joined"),
+                StepKind::Upstream {
+                    upstream,
+                    transport,
+                    via,
+                    result,
+                    latency_us,
+                    rcode,
+                    error,
+                } => {
+                    json.label("upstream");
+                    json.key("upstream");
+                    json.text(upstream);
+                    json.key("transport");
+                    json.label(transport_label(*transport));
+                    json.key("via");
+                    json.label(transport_label(*via));
+                    json.key("result");
+                    json.label(outcome_label(*result));
+                    json.key("latency_us");
+                    json.number(*latency_us);
+                    if let Some(rcode) = rcode {
+                        json.key("rcode");
+                        json.label(&rcode_name(u16::from(*rcode)));
+                    }
+                    if let Some(error) = error {
+                        json.key("error");
+                        json.text(error);
+                    }
+                }
+                StepKind::UpstreamSkipped {
+                    upstream,
+                    transport,
+                    reason,
+                } => {
+                    json.label("upstream_skipped");
+                    json.key("upstream");
+                    json.text(upstream);
+                    json.key("transport");
+                    json.label(transport_label(*transport));
+                    json.key("reason");
+                    json.label(skip_reason_label(*reason));
+                }
+            }
+            json.raw("}");
+        }
+
+        /// 小的伪随机数，测试每次都一样 / A small pseudo-random generator, the same on every run
+        struct Rng(u64);
+
+        impl Rng {
+            fn below(&mut self, bound: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                usize::try_from(self.0 % u64::try_from(bound).unwrap()).unwrap()
+            }
+
+            fn pick<T: Clone>(&mut self, items: &[T]) -> T {
+                items[self.below(items.len())].clone()
+            }
+
+            fn maybe<T>(&mut self, value: impl FnOnce(&mut Self) -> T) -> Option<T> {
+                (self.below(2) == 0).then(|| value(self))
+            }
+
+            fn number(&mut self) -> u64 {
+                self.below(usize::MAX) as u64 >> self.below(60)
+            }
+        }
+
+        const NAMES: [&str; 8] = [
+            "main",
+            "abroad",
+            "q\"uote",
+            "back\\slash",
+            "tab\tname",
+            "名字",
+            "udp://192.0.2.53:53",
+            "https://doh.example/dns-query",
+        ];
+
+        fn name(rng: &mut Rng) -> ConfigName {
+            ConfigName::of(rng.pick(&NAMES))
+        }
+
+        fn step(rng: &mut Rng) -> Step {
+            let phases = [RulePhase::Request, RulePhase::Response];
+            let decisions = [
+                DecisionKind::Static,
+                DecisionKind::Forward,
+                DecisionKind::Jump,
+                DecisionKind::Continue,
+            ];
+            let caches = [
+                CacheHitKind::Fresh,
+                CacheHitKind::Stale,
+                CacheHitKind::StaleClientTimeout,
+                CacheHitKind::StaleUpstreamFailure,
+            ];
+            let transports = [
+                Transport::Udp,
+                Transport::Tcp,
+                Transport::TcpUdp,
+                Transport::Doh,
+                Transport::Dot,
+                Transport::Doq,
+            ];
+            let results = [
+                UpstreamOutcome::Success,
+                UpstreamOutcome::Rejected,
+                UpstreamOutcome::Error,
+                UpstreamOutcome::Aborted,
+                UpstreamOutcome::Throttled,
+            ];
+            let what = match rng.below(7) {
+                0 => StepKind::Pipeline {
+                    pipeline: name(rng),
+                },
+                1 => StepKind::Rule {
+                    pipeline: name(rng),
+                    rule: name(rng),
+                    phase: rng.pick(&phases),
+                    matched: rng.maybe(|rng| rng.below(2) == 0),
+                    decision: rng.maybe(|rng| rng.pick(&decisions)),
+                    target: rng.maybe(name),
+                },
+                2 => StepKind::Decision {
+                    pipeline: name(rng),
+                    rule: rng.maybe(name),
+                    phase: rng.pick(&phases),
+                    decision: rng.pick(&decisions),
+                    target: rng.maybe(name),
+                },
+                3 => StepKind::Cache {
+                    result: rng.maybe(|rng| rng.pick(&caches)),
+                    source: rng.maybe(name),
+                },
+                4 => StepKind::Joined,
+                5 => StepKind::Upstream {
+                    upstream: name(rng),
+                    transport: rng.pick(&transports),
+                    via: rng.pick(&transports),
+                    result: rng.pick(&results),
+                    latency_us: rng.number(),
+                    rcode: rng.maybe(rcode),
+                    error: rng.maybe(|rng| rng.pick(&NAMES).into()),
+                },
+                _ => StepKind::UpstreamSkipped {
+                    upstream: name(rng),
+                    transport: rng.pick(&transports),
+                    reason: UpstreamSkipReason::Throttled,
+                },
+            };
+            Step {
+                at_us: rng.number(),
+                what,
+            }
+        }
+
+        fn rcode(rng: &mut Rng) -> ResponseCode {
+            let code: u16 = rng.pick(&[0, 2, 3, 5, 16, 23, 3_841]);
+            ResponseCode::from((code >> 4).to_le_bytes()[0], (code & 0x0F).to_le_bytes()[0])
+        }
+
+        /// 一份应答：地址、名字和别的类型的回答，有时坏掉 / A response with address, name and other answers,
+        /// sometimes damaged
+        fn reply(rng: &mut Rng) -> Vec<u8> {
+            let mut message = Message::new(7, MessageType::Response, OpCode::Query);
+            message.metadata.response_code = rcode(rng);
+            let owner = Name::from_str("www.example.com.").unwrap();
+            for index in 0..rng.below(12) {
+                let data = match rng.below(4) {
+                    0 => RData::A(A::new(192, 0, 2, u8::try_from(index).unwrap())),
+                    1 => RData::AAAA(AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                    2 => RData::CNAME(CNAME(Name::from_str("alias.example.net.").unwrap())),
+                    _ => RData::TXT(TXT::new(vec!["v=1".to_owned()])),
+                };
+                message
+                    .answers
+                    .push(Record::from_rdata(owner.clone(), 300, data));
+            }
+            let mut bytes = message.to_vec().unwrap();
+            if rng.below(5) == 0 {
+                bytes.truncate(rng.below(bytes.len()));
+            }
+            bytes
+        }
+
+        /// 编好的记录多出字节、或者短了一截都读不通，不会写出半条或者错开的 JSON / An encoded record with bytes
+        /// left over, or cut short, does not read, so no half or shifted JSON is written
+        #[test]
+        fn an_encoded_record_reads_only_whole() {
+            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+            let pending = Pending::start(&super::ctx(1), Instant::now());
+            let response = reply(&mut rng);
+            let finished = RequestOutcome {
+                latency: Duration::from_micros(900),
+                status: RequestStatus::Completed,
+                response: Some(&response),
+                error: None,
+            };
+            let mut encoded = Vec::new();
+            pending.encode(&finished, &mut encoded);
+            let reads = |bytes: &[u8]| write_record(1, bytes, &mut Json(Vec::new())).is_some();
+            assert!(reads(&encoded));
+            let mut longer = encoded.clone();
+            longer.push(0);
+            assert!(!reads(&longer));
+            for cut in 0..encoded.len() {
+                assert!(!reads(&encoded[..cut]), "cut at {cut}");
+            }
+        }
+
+        #[test]
+        fn encoded_records_read_back_as_written_directly() {
+            let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+            let long = "很长的报错".repeat(80);
+            let errors = ["engine failed", "q\"\\\n", long.as_str()];
+            let qnames = [
+                "www.example.com",
+                "a\"b.example",
+                "中文.example",
+                "x.example",
+            ];
+            let qtypes = [
+                RecordType::A,
+                RecordType::AAAA,
+                RecordType::HTTPS,
+                RecordType::CNAME,
+                RecordType::Unknown(65_280),
+            ];
+            let statuses = [
+                RequestStatus::Completed,
+                RequestStatus::Failed,
+                RequestStatus::Cancelled,
+            ];
+            let caches = [
+                CacheHitKind::Fresh,
+                CacheHitKind::Stale,
+                CacheHitKind::StaleClientTimeout,
+                CacheHitKind::StaleUpstreamFailure,
+            ];
+            let decisions = [
+                DecisionKind::Static,
+                DecisionKind::Forward,
+                DecisionKind::Jump,
+                DecisionKind::Continue,
+            ];
+            let transports = [
+                ClientTransport::Udp,
+                ClientTransport::Tcp,
+                ClientTransport::Doh,
+            ];
+            for round in 0..20_000 {
+                let client = if rng.below(2) == 0 {
+                    IpAddr::V4(Ipv4Addr::from(u32::try_from(rng.number() >> 32).unwrap()))
+                } else {
+                    IpAddr::V6(Ipv6Addr::from(
+                        u128::from(rng.number()) << 64 | u128::from(rng.number()),
+                    ))
+                };
+                let mut pending = Pending {
+                    started: Instant::now(),
+                    time_unix_ms: rng.number(),
+                    client,
+                    transport: rng.maybe(|rng| rng.pick(&transports)),
+                    qname: rng.pick(&qnames).to_owned(),
+                    qtype: rng.pick(&qtypes),
+                    steps: SmallVec::new(),
+                    steps_truncated: rng.below(4) == 0,
+                    cache: rng.maybe(|rng| rng.pick(&caches)),
+                    cache_source: rng.maybe(name),
+                    joined: rng.below(4) == 0,
+                    pipeline: rng.maybe(name),
+                    decision: rng.maybe(|rng| (rng.maybe(name), rng.pick(&decisions))),
+                    answered_by: rng.maybe(name),
+                };
+                for _ in 0..rng.below(9) {
+                    pending.steps.push(step(&mut rng));
+                }
+                let response = rng.maybe(reply);
+                let finished = RequestOutcome {
+                    latency: Duration::from_micros(rng.number()),
+                    status: rng.pick(&statuses),
+                    response: response.as_deref(),
+                    error: rng.maybe(|rng| rng.pick(&errors)),
+                };
+                let seq = rng.number();
+                let mut encoded = Vec::new();
+                pending.encode(&finished, &mut encoded);
+                let mut json = Json(Vec::new());
+                write_record(seq, &encoded, &mut json).expect("an encoded record reads back");
+                assert_eq!(
+                    String::from_utf8(json.0).unwrap(),
+                    reference_json(&pending, seq, &finished),
+                    "round {round}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_page_is_written_byte_for_byte() {
         let log = QueryLog::default();
