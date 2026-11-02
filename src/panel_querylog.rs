@@ -1038,17 +1038,19 @@ impl QueryLog {
             .store(self.since_epoch_ms().saturating_add(1), Ordering::Release);
     }
 
-    /// 等到 `after` 之后攒满 `limit` 条，或者过了 `wait`：面板这样等着取，流量一来就取走，交接区不会满；空闲时
-    /// 也只隔 `wait` 来一次。游标是别的内核进程的就不等，马上回，面板好早点发现内核换了
-    /// Waits until `limit` records follow `after`, or `wait` has passed: a panel waiting like this takes
-    /// records as soon as traffic brings them, before the ring can fill, and comes only once per
-    /// `wait` while things are quiet. A cursor of another kernel process gets no wait but an answer at
-    /// once, so the panel soon finds out the kernel has changed
+    /// 等到 `after` 之后攒满 `limit` 条（给了 `until` 时，到它为止的都有了也算满），或者过了 `wait`：面板这样等着取，
+    /// 流量一来就取走，交接区不会满；空闲时也只隔 `wait` 来一次。游标是别的内核进程的就不等，马上回，面板好早点发现
+    /// 内核换了
+    /// Waits until `limit` records follow `after` (or, given `until`, every record up to it is there), or
+    /// `wait` has passed: a panel waiting like this takes records as soon as traffic brings them, before the
+    /// ring can fill, and comes only once per `wait` while things are quiet. A cursor of another kernel
+    /// process gets no wait but an answer at once, so the panel soon finds out the kernel has changed
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) async fn wait_for_page(
         &self,
         after: u64,
         limit: usize,
+        until: Option<u64>,
         instance: Option<u64>,
         wait: Duration,
     ) {
@@ -1056,7 +1058,9 @@ impl QueryLog {
             return;
         }
         self.renew();
-        let target = after.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX));
+        let target = after
+            .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX))
+            .min(until.unwrap_or(u64::MAX));
         let deadline = tokio::time::Instant::now() + wait;
         // 等完、或者面板中途断开（这个 future 被丢掉）都不再等这一段 / Done waiting, or the panel gone
         // midway (this future dropped), this range is no longer waited for
@@ -1075,13 +1079,18 @@ impl QueryLog {
         }
     }
 
-    /// 取走 `after` 之后的记录（最多 `limit` 条），同时续上「面板在取」，返回 JSON 文本（不先建中间的 JSON 树）。
+    /// 取走 `after` 之后的记录（最多 `limit` 条；给了 `until` 时只到它为止，`querylog_until_v1`），同时续上「面板在取」，
+    /// 返回 JSON 文本（不先建中间的 JSON 树）。面板同时取着相邻的几段时，每段各管各的：前面被挤掉了一截，这一段
+    /// 也不会越界交出下一段的记录，`missed` 只算这一段里不在了的。
     /// `instance` 是游标所属的内核进程：是这个进程的，面板存好了的就删掉。存好到哪由 `stored` 说
     /// （`querylog_stored_v1`：面板同时取着好几段，取到哪和存到哪不是一回事），没给 `stored` 时就是 `after`
     /// （游标在写好以后才往前挪）；`stored` 超过 `after` 时也只删到 `after`，还没取走的不删。没说是哪个进程的（面板
     /// 在探是哪个进程，或者面板不认 `querylog_wait_v1`）、或是别的进程的游标，一条不删
-    /// Takes the records after `after` (at most `limit`), renews 「the panel is collecting」, and returns
-    /// the JSON text (without building an intermediate JSON tree first). `instance` is the kernel process
+    /// Takes the records after `after` (at most `limit`, and with `until` none past it,
+    /// `querylog_until_v1`), renews 「the panel is collecting」, and returns the JSON text (without building
+    /// an intermediate JSON tree first). With a panel taking neighbouring ranges at once, each range keeps
+    /// to itself: with a stretch before it pushed out, it never hands over the next range's records, and
+    /// `missed` counts only what is gone from this one. `instance` is the kernel process
     /// the cursor belongs to: if it is this one, what the panel has stored is deleted. How far that goes is
     /// `stored` (`querylog_stored_v1`: a panel taking several ranges at once has taken further than it has
     /// stored), and `after` without it (the cursor moves only once a page is written); a `stored` past
@@ -1093,6 +1102,7 @@ impl QueryLog {
         &self,
         after: u64,
         limit: usize,
+        until: Option<u64>,
         instance: Option<u64>,
         stored: Option<u64>,
         protocol_version: u8,
@@ -1121,6 +1131,7 @@ impl QueryLog {
                 .entries
                 .iter()
                 .skip(start)
+                .take_while(|entry| until.is_none_or(|until| entry.seq <= until))
                 .take(limit)
                 .cloned()
                 .collect();
@@ -1131,7 +1142,15 @@ impl QueryLog {
         // With the ring empty (emptied, or never written), everything after the cursor up to the newest
         // number is gone
         let first_kept = oldest.unwrap_or(newest.saturating_add(1));
-        // 一条大约六七百字节，一次给够，免得边写边挪 / A record takes six or seven hundred bytes, so the
+        let missed = first_kept
+            .saturating_sub(after.saturating_add(1))
+            .min(until.map_or(u64::MAX, |until| until.saturating_sub(after)));
+        // 交出的记录是连着的，接在不在了的那些后面：这一页管到哪儿，最新的还在它后面就是还有
+        // The records handed over are contiguous and follow those that are gone: more remain when the newest
+        // lies past where this page reaches
+        let reached = after
+            .saturating_add(missed)
+            .saturating_add(u64::try_from(entries.len()).unwrap_or(u64::MAX)); // 一条大约六七百字节，一次给够，免得边写边挪 / A record takes six or seven hundred bytes, so the
         // room is given at once instead of moving as it grows
         let mut json = Json(Vec::with_capacity(256 + entries.len() * 768));
         json.raw("{\"protocol_version\":");
@@ -1142,20 +1161,16 @@ impl QueryLog {
         json.number(u64::try_from(self.capacity).unwrap_or(u64::MAX));
         json.key("newest_seq");
         json.number(newest);
-        // 序号在游标之后、已经被挤出交接区的条数 / Records numbered after the cursor that were already
-        // pushed out of the ring
+        // 序号在游标之后（给了 `until` 时到它为止）、已经被挤出交接区的条数 / Records numbered after the
+        // cursor (up to `until`, when given) that were already pushed out of the ring
         json.key("missed");
-        json.number(first_kept.saturating_sub(after.saturating_add(1)));
+        json.number(missed);
         // 超出在途上限没能记下的请求，自内核启动起累计 / Requests left unrecorded because too many were in
         // flight, cumulative since the kernel started
         json.key("untracked");
         json.number(self.untracked.load(Ordering::Relaxed));
         json.key("more");
-        json.raw(if entries.last().is_some_and(|entry| entry.seq < newest) {
-            "true"
-        } else {
-            "false"
-        });
+        json.raw(if reached < newest { "true" } else { "false" });
         json.key("entries");
         json.raw("[");
         for (index, entry) in entries.iter().enumerate() {
@@ -1358,7 +1373,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::{
         CAPACITY, ConfigName, KNOWN_NAMES, MAX_ANSWERS, MAX_KEPT_RESPONSE, MAX_PAGE, MAX_STEPS,
@@ -1522,12 +1537,13 @@ mod tests {
     }
 
     fn page(log: &QueryLog, after: u64, limit: usize) -> Value {
-        serde_json::from_str(&log.collect(after, limit, None, None, 1)).expect("a page is JSON")
+        serde_json::from_str(&log.collect(after, limit, None, None, None, 1))
+            .expect("a page is JSON")
     }
 
     /// 带着这个内核进程的游标来取的一页 / A page taken with a cursor of this kernel process
     fn page_of_this_run(log: &QueryLog, after: u64, limit: usize) -> Value {
-        serde_json::from_str(&log.collect(after, limit, Some(log.instance), None, 1))
+        serde_json::from_str(&log.collect(after, limit, None, Some(log.instance), None, 1))
             .expect("a page is JSON")
     }
 
@@ -1748,7 +1764,8 @@ mod tests {
         let log = QueryLog::default();
         quick_answers(&log, 1..=5);
         let started = tokio::time::Instant::now();
-        log.wait_for_page(0, 5, None, Duration::from_secs(5)).await;
+        log.wait_for_page(0, 5, None, None, Duration::from_secs(5))
+            .await;
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(log.wake_at.load(Relaxed), u64::MAX, "no one waits any more");
     }
@@ -1765,7 +1782,7 @@ mod tests {
             quick_answers(&filling, 3..=4);
         });
         let started = tokio::time::Instant::now();
-        log.wait_for_page(0, 4, Some(log.instance), Duration::from_secs(5))
+        log.wait_for_page(0, 4, None, Some(log.instance), Duration::from_secs(5))
             .await;
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(100), "{waited:?}");
@@ -1780,7 +1797,7 @@ mod tests {
         let log = QueryLog::default();
         let given_up = tokio::time::timeout(
             Duration::from_millis(50),
-            log.wait_for_page(0, 5, None, Duration::from_secs(5)),
+            log.wait_for_page(0, 5, None, None, Duration::from_secs(5)),
         )
         .await;
         assert!(given_up.is_err());
@@ -1792,7 +1809,7 @@ mod tests {
     async fn a_cursor_of_another_run_is_answered_at_once() {
         let log = QueryLog::default();
         let started = tokio::time::Instant::now();
-        log.wait_for_page(0, 5, Some(log.instance + 1), Duration::from_secs(5))
+        log.wait_for_page(0, 5, None, Some(log.instance + 1), Duration::from_secs(5))
             .await;
         assert!(started.elapsed() < Duration::from_secs(1));
     }
@@ -1809,7 +1826,7 @@ mod tests {
             quick_answers(&trickle, 1..=1);
         });
         let started = tokio::time::Instant::now();
-        log.wait_for_page(0, 100, None, Duration::from_millis(400))
+        log.wait_for_page(0, 100, None, None, Duration::from_millis(400))
             .await;
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(400), "{waited:?}");
@@ -1852,7 +1869,7 @@ mod tests {
         let log = QueryLog::default();
         cancelled(&log, 1..=8);
         let page_after = |after, stored, instance| -> Value {
-            serde_json::from_str(&log.collect(after, 10, instance, stored, 1)).unwrap()
+            serde_json::from_str(&log.collect(after, 10, None, instance, stored, 1)).unwrap()
         };
         assert_eq!(
             seqs(&page_after(4, Some(2), Some(log.instance))),
@@ -1873,6 +1890,66 @@ mod tests {
         assert_eq!(seqs(&page(&log, 0, 10)), [6, 7, 8]);
     }
 
+    /// 面板同时取相邻的几段时，每段只交到 `until`：前面被挤掉了一截，这一段也不越界交出下一段的记录，`missed` 只算
+    /// 这一段里不在了的；整段都不在了，后面还有的照样说还有。不给 `until` 的照旧
+    /// With the panel taking neighbouring ranges at once, each hands over records up to `until` only: with a stretch
+    /// before it pushed out, it never hands over the next range's records, and `missed` counts only what is gone from
+    /// this one; with the whole range gone, it still says more remain when they do. Without `until` nothing changes
+    #[test]
+    fn a_range_keeps_to_itself() {
+        let log = QueryLog::with_capacity(4);
+        let _ = page(&log, 0, 1);
+        cancelled(&log, 1..=10);
+        let range = |after, until| -> Value {
+            serde_json::from_str(&log.collect(after, 10, Some(until), None, None, 1)).unwrap()
+        };
+        let summary = |page: &Value| (seqs(page), page["missed"].clone(), page["more"].clone());
+        assert_eq!(summary(&range(6, 8)), (vec![7, 8], json!(0), json!(true)));
+        assert_eq!(
+            summary(&range(4, 8)),
+            (vec![7, 8], json!(2), json!(true)),
+            "5 and 6 were pushed out"
+        );
+        assert_eq!(
+            summary(&range(2, 4)),
+            (vec![], json!(2), json!(true)),
+            "the whole range is gone, and 7 to 10 remain"
+        );
+        assert_eq!(
+            summary(&range(8, 10)),
+            (vec![9, 10], json!(0), json!(false))
+        );
+        assert_eq!(summary(&range(8, 8)), (vec![], json!(0), json!(true)));
+        assert_eq!(
+            summary(&page(&log, 2, 10)),
+            (vec![7, 8, 9, 10], json!(4), json!(false))
+        );
+        assert_eq!(
+            summary(&page(&log, 2, 2)),
+            (vec![7, 8], json!(4), json!(true))
+        );
+    }
+
+    /// 等着取的一段到 `until` 为止的都到了就回，不等攒满 `limit` 条 / A range waiting to be taken returns once
+    /// everything up to `until` is there, without waiting for `limit` records
+    #[tokio::test]
+    async fn a_waiting_range_returns_once_it_is_complete() {
+        let log = std::sync::Arc::new(QueryLog::default());
+        let waiting = {
+            let log = std::sync::Arc::clone(&log);
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                log.wait_for_page(0, 500, Some(2), None, Duration::from_secs(5))
+                    .await;
+                started.elapsed()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        quick_answers(&log, 1..=2);
+        let waited = waiting.await.unwrap();
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+    }
+
     /// 好几段同时在等：先等到的那段走了，后面那段照样一到就叫醒，不白等到时限
     /// Several ranges waiting at once: once the first has what it waited for and leaves, the next is still woken the
     /// moment its records arrive, without sitting out its deadline
@@ -1881,13 +1958,17 @@ mod tests {
         let log = std::sync::Arc::new(QueryLog::default());
         let first = {
             let log = std::sync::Arc::clone(&log);
-            tokio::spawn(async move { log.wait_for_page(0, 2, None, Duration::from_secs(5)).await })
+            tokio::spawn(async move {
+                log.wait_for_page(0, 2, None, None, Duration::from_secs(5))
+                    .await
+            })
         };
         let second = {
             let log = std::sync::Arc::clone(&log);
             tokio::spawn(async move {
                 let started = tokio::time::Instant::now();
-                log.wait_for_page(2, 2, None, Duration::from_secs(5)).await;
+                log.wait_for_page(2, 2, None, None, Duration::from_secs(5))
+                    .await;
                 started.elapsed()
             })
         };
@@ -1909,7 +1990,7 @@ mod tests {
         cancelled(&log, 1..=3);
         let _ = page(&log, 3, 10);
         let _ = page(&log, u64::MAX / 2, 1);
-        let _ = log.collect(3, 10, Some(log.instance + 1), None, 1);
+        let _ = log.collect(3, 10, None, Some(log.instance + 1), None, 1);
         assert_eq!(seqs(&page(&log, 0, 10)), [1, 2, 3]);
     }
 
@@ -2040,7 +2121,7 @@ mod tests {
                 error: Some("engine \"failed\"\n"),
             },
         );
-        let page = log.collect(0, 10, None, None, 1);
+        let page = log.collect(0, 10, None, None, None, 1);
         let page = regex::Regex::new(r#""(time_unix_ms|at_us|instance)":\d+"#)
             .unwrap()
             .replace_all(&page, r#""$1":0"#);
