@@ -1,16 +1,18 @@
-//! DoH 上游的 HTTP/2 连接：握手时选了 h2 的上游，所有请求共用一条连接，直接经 h2 发出，不过 reqwest
-//! 的那几层（请求构造、URL 和 URI 的来回转换、中间件、连接池检出），也不过 hyper 的客户端（见 [`send`]）。
-//! 连接断了、空闲太久或连续出错重建时，下一个请求重新连。没选 h2 的上游由调用方照旧交给 reqwest。
-//! An HTTP/2 connection to a DoH upstream: an upstream that picked h2 in the handshake has all
-//! requests share one connection, sent straight through h2 without reqwest's layers (request
-//! building, URL and URI conversions, middleware, pool checkout) and without hyper's client (see
-//! [`send`]). When the connection is gone, idle too long or rebuilt after repeated errors, the next
-//! request connects again. An upstream that did not pick h2 is handed to reqwest by the caller as
-//! before.
+//! DoH 上游的 HTTP/2 连接：握手时选了 h2 的上游，请求直接经 h2 发出，不过 reqwest 的那几层（请求构造、
+//! URL 和 URI 的来回转换、中间件、连接池检出），也不过 hyper 的客户端（见 [`send`]）。平常所有请求共用
+//! 一条连接，一直很忙时才分到更多连接（见 [`BUSY_AT`]）。连接断了、空闲太久或连续出错重建时，下一个请求
+//! 重新连。没选 h2 的上游由调用方照旧交给 reqwest。
+//! HTTP/2 connections to a DoH upstream: for an upstream that picked h2 in the handshake,
+//! requests go straight through h2 without reqwest's layers (request building, URL and URI
+//! conversions, middleware, pool checkout) and without hyper's client (see [`send`]). Normally
+//! every request shares one connection; only steady heavy load spreads them over more (see
+//! [`BUSY_AT`]). When a connection is gone, idle too long or rebuilt after repeated errors, the
+//! next request connects again. An upstream that did not pick h2 is handed to reqwest by the
+//! caller as before.
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll, Waker, ready};
 use std::time::{Duration, Instant};
 
@@ -51,11 +53,40 @@ struct H2Conn {
     last_used_ms: AtomicU64,
 }
 
-/// 一个 DoH 上游的 HTTP/2 连接 / One DoH upstream's HTTP/2 connection
-pub(crate) struct H2Link {
+/// 一条连接上同时有这么多请求还没答完就算忙，再来的请求换下一个位。一阵子几十个以内的查询（比如打开一个
+/// 网页）都留在一条连接上，用不着的连接不去连，也不会因为隔太久没用而每次重新握手；一直有这么多在途时才
+/// 分到更多连接，各条连接的加解密和收发落到不同的核上。本机压测里只有一条连接时，4 核压满也只到单核的吞吐
+/// A connection with this many requests unanswered at once counts as busy, and further requests
+/// go to the next slot. A burst of a few dozen queries at most (a web page opening, say) stays
+/// on one connection, so connections nothing needs are not made, nor redone with a fresh
+/// handshake each time for sitting idle too long; only steadily this many in flight spreads
+/// requests over more connections, whose encryption and I/O then land on different cores. In a
+/// local load test with one connection, four cores at full load reached only the throughput of one
+pub(crate) const BUSY_AT: usize = 32;
+
+/// 一个连接位：最多一条连接 / One connection slot: at most one connection
+struct Slot {
     conn: ArcSwapOption<H2Conn>,
     /// 同一时刻只有一个请求去连，其余的等它连好 / One request connects at a time and the others wait for it
     connecting: tokio::sync::Mutex<()>,
+    /// 这个位上还没答完的请求数 / Requests on this slot not yet answered
+    in_flight: AtomicUsize,
+}
+
+/// 一个请求占着一个连接位，丢掉时这个位的在途数减一 / A request's hold on a slot: dropping it takes one off the slot's in-flight count
+pub(crate) struct InFlight<'a>(&'a Slot);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 一个 DoH 上游的 HTTP/2 连接：每个工作线程一个位，平常只用第一个（见 [`BUSY_AT`]）
+/// One DoH upstream's HTTP/2 connections: a slot per worker thread, normally only the first in
+/// use (see [`BUSY_AT`])
+pub(crate) struct H2Link {
+    slots: Box<[Slot]>,
     /// 这个上游握手时没选 h2：之后的请求都交给 reqwest / This upstream did not pick h2 in the handshake: later requests all go to reqwest
     no_h2: AtomicBool,
     epoch: Instant,
@@ -63,10 +94,16 @@ pub(crate) struct H2Link {
 }
 
 impl H2Link {
-    pub(crate) fn new(idle_timeout: Duration) -> Self {
+    /// 最多 `connections` 条连接的 H2Link，至少一条 / An H2Link of at most `connections` connections, one at least
+    pub(crate) fn new(idle_timeout: Duration, connections: usize) -> Self {
         Self {
-            conn: ArcSwapOption::empty(),
-            connecting: tokio::sync::Mutex::new(()),
+            slots: (0..connections.max(1))
+                .map(|_| Slot {
+                    conn: ArcSwapOption::empty(),
+                    connecting: tokio::sync::Mutex::new(()),
+                    in_flight: AtomicUsize::new(0),
+                })
+                .collect(),
             no_h2: AtomicBool::new(false),
             epoch: Instant::now(),
             idle_timeout,
@@ -77,9 +114,21 @@ impl H2Link {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// 还能用的现有连接：能接着开流、也没空闲太久 / The current connection if it is still usable: open to new streams and not idle too long
-    fn usable(&self, now: u64) -> Option<H2Sender> {
-        let conn = self.conn.load_full()?;
+    /// 请求上哪个位：排在最前、还不忙的那个；都忙时在途最少的那个
+    /// The slot a request goes to: the first one not busy; with all busy, the one with the
+    /// fewest in flight
+    fn pick(&self) -> &Slot {
+        let in_flight = |slot: &Slot| slot.in_flight.load(Ordering::Relaxed);
+        self.slots
+            .iter()
+            .find(|slot| in_flight(slot) < BUSY_AT)
+            .or_else(|| self.slots.iter().min_by_key(|slot| in_flight(slot)))
+            .expect("an H2Link has a slot at least")
+    }
+
+    /// `slot` 上还能用的现有连接：能接着开流、也没空闲太久 / The connection on `slot` if it is still usable: open to new streams and not idle too long
+    fn usable(&self, slot: &Slot, now: u64) -> Option<H2Sender> {
+        let conn = slot.conn.load_full()?;
         let idle =
             Duration::from_millis(now.saturating_sub(conn.last_used_ms.load(Ordering::Relaxed)));
         if idle >= self.idle_timeout {
@@ -90,33 +139,38 @@ impl H2Link {
         Some(sender)
     }
 
-    /// 发请求用的发送端：有能用的连接就用它，没有就连一条。上游没选 h2 时是 None，交给 reqwest
-    /// The sender for a request: the current connection when usable, a new one otherwise. None
+    /// 发请求用的发送端和它占着的连接位：位上有能用的连接就用它，没有就连一条。请求答完（或放弃）之前一直
+    /// 拿着 [`InFlight`]。上游没选 h2 时是 None，交给 reqwest
+    /// The sender for a request and the slot it holds: the slot's connection when usable, a new
+    /// one otherwise. The [`InFlight`] is kept until the request is answered (or given up). None
     /// when the upstream did not pick h2, for reqwest to handle
     pub(crate) async fn sender(
         &self,
         url: &Url,
         tls: &Arc<ClientConfig>,
         connector: &HttpConnector,
-    ) -> anyhow::Result<Option<H2Sender>> {
+    ) -> anyhow::Result<Option<(H2Sender, InFlight<'_>)>> {
         if self.no_h2.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        if let Some(sender) = self.usable(self.now_ms()) {
-            return Ok(Some(sender));
+        let slot = self.pick();
+        slot.in_flight.fetch_add(1, Ordering::Relaxed);
+        let in_flight = InFlight(slot);
+        if let Some(sender) = self.usable(slot, self.now_ms()) {
+            return Ok(Some((sender, in_flight)));
         }
-        let _connecting = self.connecting.lock().await;
+        let _connecting = slot.connecting.lock().await;
         // 等锁的时候别的请求可能已经连好了 / Another request may have connected while this one waited for the lock
-        if let Some(sender) = self.usable(self.now_ms()) {
-            return Ok(Some(sender));
+        if let Some(sender) = self.usable(slot, self.now_ms()) {
+            return Ok(Some((sender, in_flight)));
         }
         match connect(url, tls, connector).await? {
             Some(sender) => {
-                self.conn.store(Some(Arc::new(H2Conn {
+                slot.conn.store(Some(Arc::new(H2Conn {
                     sender: sender.clone(),
                     last_used_ms: AtomicU64::new(self.now_ms()),
                 })));
-                Ok(Some(sender))
+                Ok(Some((sender, in_flight)))
             }
             None => {
                 self.no_h2.store(true, Ordering::Relaxed);
@@ -128,17 +182,30 @@ impl H2Link {
     /// 现在有没有一条直连的连接 / Whether a direct connection is open now
     #[cfg(test)]
     pub(crate) fn is_connected(&self) -> bool {
-        self.conn
-            .load()
-            .as_ref()
-            .is_some_and(|conn| open_to_new_streams(&conn.sender).is_some())
+        self.slots.iter().any(|slot| {
+            slot.conn
+                .load()
+                .as_ref()
+                .is_some_and(|conn| open_to_new_streams(&conn.sender).is_some())
+        })
+    }
+
+    /// 各个位上还没答完的请求加起来有几个 / How many requests are unanswered across the slots
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.slots
+            .iter()
+            .map(|slot| slot.in_flight.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// 丢掉现有连接：下一个请求重新连，也重新看对方选不选 h2（连续出错重建连接池时用）
-    /// Drops the current connection: the next request connects again and looks again whether
+    /// Drops the current connections: the next request connects again and looks again whether
     /// the peer picks h2 (used when repeated errors rebuild the pool)
     pub(crate) fn reset(&self) {
-        self.conn.store(None);
+        for slot in &self.slots {
+            slot.conn.store(None);
+        }
         self.no_h2.store(false, Ordering::Relaxed);
     }
 }

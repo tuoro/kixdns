@@ -1,7 +1,7 @@
-//! 直连 HTTP/2 的 DoH 上游（见 `doh_h2`）：共用一条连接、没选 h2 时交给 reqwest、发出的请求和 reqwest 的一样、
+//! 直连 HTTP/2 的 DoH 上游（见 `doh_h2`）：共用一条连接、忙时才分到更多连接、没选 h2 时交给 reqwest、发出的请求和 reqwest 的一样、
 //! 同一轮的请求一次写完、回答检查照旧、接收窗口还给对方、断了、要走了和空闲太久时重连、连续出错重建时丢掉连接
-//! DoH upstreams over the direct HTTP/2 connection (see `doh_h2`): one shared connection, reqwest
-//! when h2 is not picked, the same request as reqwest sends, one write per round of requests, the
+//! DoH upstreams over the direct HTTP/2 connection (see `doh_h2`): one shared connection, more
+//! only when busy, reqwest when h2 is not picked, the same request as reqwest sends, one write per round of requests, the
 //! answer checks as before, the receive window handed back, a new connection when the old one is
 //! gone, leaving or idle too long, and the connection dropped when repeated errors rebuild
 
@@ -15,7 +15,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode, Version};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-use super::doh_h2::{self, proxy_configured_in};
+use super::doh_h2::{self, BUSY_AT, proxy_configured_in};
 use super::test_support::CountedWrites;
 use super::transport::{DOH_MEDIA_TYPE, DohClient, throttle_of};
 
@@ -372,6 +372,76 @@ async fn requests_of_one_round_go_out_in_one_write() {
     drop(keep_open);
 }
 
+/// 起一个 h2 的 TLS DoH 上游，每个请求过 `after` 再答 / Starts an h2 DoH upstream over TLS answering each request after `after`
+async fn spawn_h2_upstream_answering_after(after: Duration) -> TlsUpstream {
+    let (acceptor, cert) = tls_acceptor(&[b"h2"]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = TlsUpstream {
+        addr: listener.local_addr().unwrap(),
+        cert,
+        connections: Arc::new(AtomicUsize::new(0)),
+        seen: Arc::default(),
+    };
+    let connections = Arc::clone(&upstream.connections);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            connections.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let tls = acceptor.accept(tcp).await.unwrap();
+                let mut conn = h2::server::handshake(tls).await.unwrap();
+                while let Some(accepted) = conn.accept().await {
+                    let (request, respond) = accepted.unwrap();
+                    tokio::spawn(answer_after(request, respond, after));
+                }
+            });
+        }
+    });
+    upstream
+}
+
+/// 同时问 `ids` 里的每一个，各自的回答都带回自己查询的 ID / Asks for each of `ids` at once; each answer carries its own query's ID
+async fn ask_together(client: &DohClient, url: &str, ids: std::ops::Range<u16>) {
+    let together = ids.map(|id| async move { (id, ask(client, url, id).await.unwrap()) });
+    for (id, answer) in futures::future::join_all(together).await {
+        assert_eq!(answer[..2], id.to_be_bytes());
+    }
+}
+
+/// 平常只用一条连接：一个接一个的查询，和一阵子同时到、但没多到让连接忙起来的查询，都在第一条连接上。
+/// 别的位不去连，也就不会隔太久没用、每次都要重新握手
+/// Normally one connection is used: queries one after another, and a burst of them at once
+/// that is not enough to make the connection busy, all go on the first. The other slots do not
+/// connect, so none sits idle long enough to need a fresh handshake each time
+#[tokio::test]
+async fn light_load_stays_on_one_connection() {
+    let upstream = spawn_h2_upstream_answering_after(Duration::from_millis(20)).await;
+    let mut client = upstream.client(3);
+    client.set_direct_connections_for_tests(4);
+    let url = upstream.url("");
+    for id in 0..10u16 {
+        assert_eq!(ask(&client, &url, id).await.unwrap()[..2], id.to_be_bytes());
+    }
+    ask_together(&client, &url, 100..100 + BUSY_AT as u16 - 1).await;
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(client.direct_in_flight(&url), 0, "every request let go");
+}
+
+/// 第一条连接上同时在途的请求到了 `BUSY_AT` 个，再来的上下一条，那条也忙了再下一条
+/// Once the first connection has `BUSY_AT` requests in flight, further ones go to the next,
+/// and once that one is busy too, to the one after
+#[tokio::test]
+async fn a_busy_connection_spills_to_the_next() {
+    let upstream = spawn_h2_upstream_answering_after(Duration::from_millis(200)).await;
+    let mut client = upstream.client(3);
+    client.set_direct_connections_for_tests(4);
+    let url = upstream.url("");
+    let many = 2 * BUSY_AT + BUSY_AT / 2;
+    ask_together(&client, &url, 0..many as u16).await;
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 3);
+    assert_eq!(client.direct_in_flight(&url), 0, "every request let go");
+}
+
 /// 回答加起来超过连接的接收窗口以后照样答上：读到的窗口都还给了对方
 /// Answers keep coming once they add up past the connection's receive window: what was read
 /// went back to the peer
@@ -520,6 +590,11 @@ async fn answer_checks_hold_over_the_direct_connection() {
             upstream.seen.lock().unwrap().len(),
             1,
             "{label}: not retried"
+        );
+        assert_eq!(
+            client.direct_in_flight(&upstream.url("")),
+            0,
+            "{label}: the failed request let go"
         );
         let throttle = throttle_of(&err);
         if label == "429" {
