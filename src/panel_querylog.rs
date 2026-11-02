@@ -747,7 +747,9 @@ impl Pending {
                 .map_or(0, |transport| client_transport_code(transport) + 1),
         );
         out.text(&self.qname);
-        out.number(u64::from(u16::from(self.qtype)));
+        // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
+        // hickory's `Display` writes it, without allocating a string first
+        out.text(<&'static str>::from(self.qtype));
         out.number(u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX));
         out.byte(status_code(status));
         out.byte(outcome_code(result));
@@ -873,12 +875,8 @@ fn write_record(seq: u64, record: &[u8], json: &mut Json) -> Option<()> {
     }
     json.key("qname");
     json.text(input.text()?);
-    // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
-    // hickory's `Display` writes it, without allocating a string first
     json.key("qtype");
-    json.text(<&'static str>::from(RecordType::from(
-        u16::try_from(input.number()?).ok()?,
-    )));
+    json.text(input.text()?);
     json.key("latency_us");
     json.number(input.number()?);
     json.key("status");
@@ -1538,15 +1536,15 @@ impl QueryLog {
     }
 
     /// 取走 `after` 之后的记录（最多 `limit` 条；给了 `until` 时只到它为止，`querylog_until_v1`），同时续上「面板在取」，
-    /// 返回 JSON 文本（不先建中间的 JSON 树）。面板同时取着相邻的几段时，每段各管各的：前面被挤掉了一截，这一段
+    /// 交回这一页的页头和记录编好的字节，按面板要的写出来（见 [`TakenPage`]）。面板同时取着相邻的几段时，每段各管各的：前面被挤掉了一截，这一段
     /// 也不会越界交出下一段的记录，`missed` 只算这一段里不在了的。
     /// `instance` 是游标所属的内核进程：是这个进程的，面板存好了的就删掉。存好到哪由 `stored` 说
     /// （`querylog_stored_v1`：面板同时取着好几段，取到哪和存到哪不是一回事），没给 `stored` 时就是 `after`
     /// （游标在写好以后才往前挪）；`stored` 超过 `after` 时也只删到 `after`，还没取走的不删。没说是哪个进程的（面板
     /// 在探是哪个进程，或者面板不认 `querylog_wait_v1`）、或是别的进程的游标，一条不删
     /// Takes the records after `after` (at most `limit`, and with `until` none past it,
-    /// `querylog_until_v1`), renews 「the panel is collecting」, and returns the JSON text (without building
-    /// an intermediate JSON tree first). With a panel taking neighbouring ranges at once, each range keeps
+    /// `querylog_until_v1`), renews 「the panel is collecting」, and returns the page's head and its records'
+    /// encoded bytes, written the way the panel asks for (see [`TakenPage`]). With a panel taking neighbouring ranges at once, each range keeps
     /// to itself: with a stretch before it pushed out, it never hands over the next range's records, and
     /// `missed` counts only what is gone from this one. `instance` is the kernel process
     /// the cursor belongs to: if it is this one, what the panel has stored is deleted. How far that goes is
@@ -1556,7 +1554,7 @@ impl QueryLog {
     /// process (the panel probing which process this is, or one that does not know `querylog_wait_v1`) or
     /// of another one deletes nothing
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn collect(
+    pub(crate) fn take(
         &self,
         after: u64,
         limit: usize,
@@ -1564,12 +1562,12 @@ impl QueryLog {
         instance: Option<u64>,
         stored: Option<u64>,
         protocol_version: u8,
-    ) -> String {
+    ) -> TakenPage {
         self.renew();
         let stored_up_to = (instance == Some(self.instance))
             .then(|| stored.map_or(after, |stored| stored.min(after)));
-        // 锁里只复制这一页的字节，写 JSON 在锁外 / Only the page's bytes are copied under the lock; the JSON is
-        // written outside it
+        // 锁里只复制这一页的字节，写出来在锁外 / Only the page's bytes are copied under the lock; they are
+        // written out outside it
         let mut records = Vec::with_capacity(limit.min(MAX_PAGE) * 128);
         let mut ends = Vec::with_capacity(limit.min(MAX_PAGE));
         let (first, oldest, newest) = {
@@ -1608,34 +1606,95 @@ impl QueryLog {
         // lies past where this page reaches
         let reached = after
             .saturating_add(missed)
-            .saturating_add(u64::try_from(ends.len()).unwrap_or(u64::MAX)); // 一条大约六七百字节，一次给够，免得边写边挪 / A record takes six or seven hundred bytes, so the
-        // room is given at once instead of moving as it grows
-        let mut json = Json(Vec::with_capacity(256 + ends.len() * 768));
+            .saturating_add(u64::try_from(ends.len()).unwrap_or(u64::MAX));
+        TakenPage {
+            protocol_version,
+            instance: self.instance,
+            capacity: u64::try_from(self.capacity).unwrap_or(u64::MAX),
+            newest,
+            missed,
+            untracked: self.untracked.load(Ordering::Relaxed),
+            more: reached < newest,
+            first,
+            records,
+            ends,
+        }
+    }
+}
+
+#[cfg(test)]
+impl QueryLog {
+    /// 取走一页写成 JSON，测试里用 / Takes a page as JSON, for the tests
+    pub(crate) fn collect(
+        &self,
+        after: u64,
+        limit: usize,
+        until: Option<u64>,
+        instance: Option<u64>,
+        stored: Option<u64>,
+        protocol_version: u8,
+    ) -> String {
+        self.take(after, limit, until, instance, stored, protocol_version)
+            .json()
+    }
+}
+
+/// 编好的记录交给面板时，二进制那种写法开头的几个字节：名字和版本 / The leading bytes of the binary way of
+/// handing encoded records to the panel: a name and the version
+const RECORDS_MAGIC: &[u8; 5] = b"KXQL\x01";
+
+/// 取走的一页：页头那几项，和这一页记录编好的字节（`ends` 是每条的结尾）/ A page taken: its head items and its
+/// records' encoded bytes (`ends` holds where each ends)
+pub(crate) struct TakenPage {
+    protocol_version: u8,
+    instance: u64,
+    capacity: u64,
+    newest: u64,
+    /// 序号在游标之后（给了 `until` 时到它为止）、已经被挤出交接区的条数 / Records numbered after the cursor
+    /// (up to `until`, when given) that were already pushed out of the ring
+    missed: u64,
+    /// 没能记下的请求，自内核启动起累计 / Requests left unrecorded, cumulative since the kernel started
+    untracked: u64,
+    more: bool,
+    /// 这一页第一条的序号 / The number of the page's first record
+    first: u64,
+    records: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl TakenPage {
+    /// 这一页的记录：(序号, 编好的字节) / The page's records: (number, encoded bytes)
+    fn each(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        let starts = std::iter::once(0).chain(self.ends.iter().copied());
+        (self.first..)
+            .zip(starts.zip(&self.ends))
+            .map(|(seq, (start, &end))| (seq, &self.records[start..end]))
+    }
+
+    /// 写成 JSON（`querylog_v1`）：不先建中间的 JSON 树 / Written as JSON (`querylog_v1`), without building an
+    /// intermediate JSON tree first
+    pub(crate) fn json(&self) -> String {
+        // 一条大约六七百字节，一次给够，免得边写边挪 / A record takes six or seven hundred bytes, so the room is
+        // given at once instead of moving as it grows
+        let mut json = Json(Vec::with_capacity(256 + self.ends.len() * 768));
         json.raw("{\"protocol_version\":");
-        json.number(u64::from(protocol_version));
+        json.number(u64::from(self.protocol_version));
         json.key("instance");
         json.number(self.instance);
         json.key("capacity");
-        json.number(u64::try_from(self.capacity).unwrap_or(u64::MAX));
+        json.number(self.capacity);
         json.key("newest_seq");
-        json.number(newest);
-        // 序号在游标之后（给了 `until` 时到它为止）、已经被挤出交接区的条数 / Records numbered after the
-        // cursor (up to `until`, when given) that were already pushed out of the ring
+        json.number(self.newest);
         json.key("missed");
-        json.number(missed);
-        // 超出在途上限没能记下的请求，自内核启动起累计 / Requests left unrecorded because too many were in
-        // flight, cumulative since the kernel started
+        json.number(self.missed);
         json.key("untracked");
-        json.number(self.untracked.load(Ordering::Relaxed));
+        json.number(self.untracked);
         json.key("more");
-        json.raw(if reached < newest { "true" } else { "false" });
+        json.raw(if self.more { "true" } else { "false" });
         json.key("entries");
         json.raw("[");
-        let mut begin = 0;
-        for (seq, &end) in (first..).zip(&ends) {
-            let record = &records[begin..end];
-            begin = end;
-            if seq > first {
+        for (seq, record) in self.each() {
+            if seq > self.first {
                 json.raw(",");
             }
             let at = json.0.len();
@@ -1653,6 +1712,33 @@ impl QueryLog {
         json.raw("]}");
         // 写进去的都是完整的 UTF-8 / Everything written is whole UTF-8
         String::from_utf8(json.0).unwrap_or_default()
+    }
+
+    /// 写成二进制（`querylog_records_v1`）：[`RECORDS_MAGIC`]，页头那几项（变长整数，`more` 一个字节），第一条的
+    /// 序号和条数，再是每条的长度和编好的字节。记录怎么编见 [`Pending::encode`]；交接区里的字节原样交出去，内核
+    /// 不必再写成文字
+    /// Written as binary (`querylog_records_v1`): [`RECORDS_MAGIC`], the head items (variable-length
+    /// integers, `more` one byte), the first record's number and the count, then each record's length and
+    /// encoded bytes. How a record is encoded is told at [`Pending::encode`]; the ring's bytes go out as
+    /// they are, and the kernel no longer writes them as text
+    pub(crate) fn records(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64 + self.records.len() + self.ends.len() * 2);
+        out.extend_from_slice(RECORDS_MAGIC);
+        let mut encoder = Encoder(&mut out);
+        encoder.number(u64::from(self.protocol_version));
+        encoder.number(self.instance);
+        encoder.number(self.capacity);
+        encoder.number(self.newest);
+        encoder.number(self.missed);
+        encoder.number(self.untracked);
+        encoder.byte(u8::from(self.more));
+        encoder.number(self.first);
+        encoder.number(u64::try_from(self.ends.len()).unwrap_or(u64::MAX));
+        for (_, record) in self.each() {
+            encoder.number(u64::try_from(record.len()).unwrap_or(u64::MAX));
+            encoder.0.extend_from_slice(record);
+        }
+        out
     }
 }
 
@@ -2865,9 +2951,11 @@ mod tests {
             }
         }
 
-        #[test]
-        fn encoded_records_read_back_as_written_directly() {
-            let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        /// 一条随机的记录和它结束时的样子，交给 `check` / A random record and how it ended, handed to `check`
+        fn random_case<T>(
+            rng: &mut Rng,
+            check: impl FnOnce(&Pending, &RequestOutcome<'_>) -> T,
+        ) -> T {
             let long = "很长的报错".repeat(80);
             let errors = ["engine failed", "q\"\\\n", long.as_str()];
             let qnames = [
@@ -2905,51 +2993,244 @@ mod tests {
                 ClientTransport::Tcp,
                 ClientTransport::Doh,
             ];
-            for round in 0..20_000 {
-                let client = if rng.below(2) == 0 {
-                    IpAddr::V4(Ipv4Addr::from(u32::try_from(rng.number() >> 32).unwrap()))
-                } else {
-                    IpAddr::V6(Ipv6Addr::from(
-                        u128::from(rng.number()) << 64 | u128::from(rng.number()),
-                    ))
-                };
-                let mut pending = Pending {
-                    started: Instant::now(),
-                    time_unix_ms: rng.number(),
-                    client,
-                    transport: rng.maybe(|rng| rng.pick(&transports)),
-                    qname: rng.pick(&qnames).to_owned(),
-                    qtype: rng.pick(&qtypes),
-                    steps: SmallVec::new(),
-                    steps_truncated: rng.below(4) == 0,
-                    cache: rng.maybe(|rng| rng.pick(&caches)),
-                    cache_source: rng.maybe(name),
-                    joined: rng.below(4) == 0,
-                    pipeline: rng.maybe(name),
-                    decision: rng.maybe(|rng| (rng.maybe(name), rng.pick(&decisions))),
-                    answered_by: rng.maybe(name),
-                };
-                for _ in 0..rng.below(9) {
-                    pending.steps.push(step(&mut rng));
-                }
-                let response = rng.maybe(reply);
-                let finished = RequestOutcome {
-                    latency: Duration::from_micros(rng.number()),
-                    status: rng.pick(&statuses),
-                    response: response.as_deref(),
-                    error: rng.maybe(|rng| rng.pick(&errors)),
-                };
-                let seq = rng.number();
-                let mut encoded = Vec::new();
-                pending.encode(&finished, &mut encoded);
-                let mut json = Json(Vec::new());
-                write_record(seq, &encoded, &mut json).expect("an encoded record reads back");
-                assert_eq!(
-                    String::from_utf8(json.0).unwrap(),
-                    reference_json(&pending, seq, &finished),
-                    "round {round}"
-                );
+            let client = if rng.below(2) == 0 {
+                IpAddr::V4(Ipv4Addr::from(u32::try_from(rng.number() >> 32).unwrap()))
+            } else {
+                IpAddr::V6(Ipv6Addr::from(
+                    u128::from(rng.number()) << 64 | u128::from(rng.number()),
+                ))
+            };
+            let mut pending = Pending {
+                started: Instant::now(),
+                time_unix_ms: rng.number(),
+                client,
+                transport: rng.maybe(|rng| rng.pick(&transports)),
+                qname: rng.pick(&qnames).to_owned(),
+                qtype: rng.pick(&qtypes),
+                steps: SmallVec::new(),
+                steps_truncated: rng.below(4) == 0,
+                cache: rng.maybe(|rng| rng.pick(&caches)),
+                cache_source: rng.maybe(name),
+                joined: rng.below(4) == 0,
+                pipeline: rng.maybe(name),
+                decision: rng.maybe(|rng| (rng.maybe(name), rng.pick(&decisions))),
+                answered_by: rng.maybe(name),
+            };
+            for _ in 0..rng.below(9) {
+                pending.steps.push(step(rng));
             }
+            let response = rng.maybe(reply);
+            let finished = RequestOutcome {
+                latency: Duration::from_micros(rng.number()),
+                status: rng.pick(&statuses),
+                response: response.as_deref(),
+                error: rng.maybe(|rng| rng.pick(&errors)),
+            };
+            check(&pending, &finished)
+        }
+
+        #[test]
+        fn encoded_records_read_back_as_written_directly() {
+            let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+            for round in 0..20_000 {
+                let seq = rng.number();
+                random_case(&mut rng, |pending, finished| {
+                    let mut encoded = Vec::new();
+                    pending.encode(finished, &mut encoded);
+                    let mut json = Json(Vec::new());
+                    write_record(seq, &encoded, &mut json).expect("an encoded record reads back");
+                    assert_eq!(
+                        String::from_utf8(json.0).unwrap(),
+                        reference_json(pending, seq, finished),
+                        "round {round}"
+                    );
+                });
+            }
+        }
+
+        /// 一页随机的记录 / A page of random records
+        fn random_page(rng: &mut Rng, count: usize) -> TakenPage {
+            let mut records = Vec::new();
+            let mut ends = Vec::new();
+            for _ in 0..count {
+                random_case(rng, |pending, finished| {
+                    pending.encode(finished, &mut records)
+                });
+                ends.push(records.len());
+            }
+            TakenPage {
+                protocol_version: 1,
+                instance: rng.number(),
+                capacity: 16_384,
+                newest: rng.number() | 1 << 40,
+                missed: rng.number(),
+                untracked: rng.number(),
+                more: rng.below(2) == 0,
+                first: rng.number() >> 30,
+                records,
+                ends,
+            }
+        }
+
+        /// 二进制的一页拆回来；读不通时为 None / A binary page taken apart; None when it does not read
+        fn page_from_records(bytes: &[u8]) -> Option<TakenPage> {
+            let mut input = Decoder(bytes.strip_prefix(RECORDS_MAGIC)?);
+            let protocol_version = u8::try_from(input.number()?).ok()?;
+            let (instance, capacity, newest, missed, untracked) = (
+                input.number()?,
+                input.number()?,
+                input.number()?,
+                input.number()?,
+                input.number()?,
+            );
+            let more = match input.byte()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let first = input.number()?;
+            let mut records = Vec::new();
+            let mut ends = Vec::new();
+            for _ in 0..input.number()? {
+                let len = usize::try_from(input.number()?).ok()?;
+                records.extend_from_slice(input.take(len)?);
+                ends.push(records.len());
+            }
+            input.0.is_empty().then_some(TakenPage {
+                protocol_version,
+                instance,
+                capacity,
+                newest,
+                missed,
+                untracked,
+                more,
+                first,
+                records,
+                ends,
+            })
+        }
+
+        /// 二进制交出的一页拆回来，写成的 JSON 和直接写 JSON 的一字不差 / A page handed over as binary, taken
+        /// apart again, gives JSON exactly as writing JSON directly does
+        #[test]
+        fn the_two_ways_of_handing_a_page_over_carry_the_same() {
+            let mut rng = Rng(0x0DDB_1A5E_5BAD_5EED);
+            for count in [0, 1, 300] {
+                let page = random_page(&mut rng, count);
+                let back = page_from_records(&page.records()).expect("the binary page reads back");
+                assert_eq!(back.json(), page.json(), "{count} records");
+            }
+        }
+
+        /// 交给面板的二进制逐字节固定：改了记录或页的编法，这里就红，要换版本号（`querylog_records_v2`、
+        /// `KXQL\x02`）并告诉面板
+        /// The binary handed to the panel is fixed byte for byte: changing how records or pages are encoded
+        /// turns this red, and calls for a new version (`querylog_records_v2`, `KXQL\x02`) and the panel told
+        #[test]
+        fn the_binary_page_is_fixed_byte_for_byte() {
+            let hit = Pending {
+                started: Instant::now(),
+                time_unix_ms: 1_792_065_600_123,
+                client: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+                transport: Some(ClientTransport::Udp),
+                qname: "www.example.com".to_owned(),
+                qtype: RecordType::A,
+                steps: [
+                    Step {
+                        at_us: 3,
+                        what: StepKind::Pipeline {
+                            pipeline: ConfigName::of("main"),
+                        },
+                    },
+                    Step {
+                        at_us: 9,
+                        what: StepKind::Cache {
+                            result: Some(CacheHitKind::Fresh),
+                            source: Some(ConfigName::of("udp://192.0.2.53")),
+                        },
+                    },
+                ]
+                .into_iter()
+                .collect(),
+                steps_truncated: false,
+                cache: Some(CacheHitKind::Fresh),
+                cache_source: Some(ConfigName::of("udp://192.0.2.53")),
+                joined: false,
+                pipeline: Some(ConfigName::of("main")),
+                decision: None,
+                answered_by: None,
+            };
+            let answer = super::response(ResponseCode::NoError, &[[192, 0, 2, 1]]);
+            let mut records = Vec::new();
+            hit.encode(
+                &RequestOutcome {
+                    latency: Duration::from_micros(150),
+                    status: RequestStatus::Completed,
+                    response: Some(&answer),
+                    error: None,
+                },
+                &mut records,
+            );
+            let ends = vec![records.len()];
+            let page = TakenPage {
+                protocol_version: 1,
+                instance: 1_792_065_000_000,
+                capacity: 16_384,
+                newest: 42,
+                missed: 0,
+                untracked: 0,
+                more: false,
+                first: 42,
+                records,
+                ends,
+            };
+            let hex: String = page
+                .records()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(
+                hex,
+                concat!(
+                    // 名字和版本、页头：协议版本、内核进程、容量、最新、漏掉、没记下、还有没有、第一条、条数
+                    // Name and version, the head: protocol version, process, capacity, newest, missed,
+                    // unrecorded, more, first, count
+                    "4b58514c01",
+                    "01c0a497fb93348080012a0000002a01",
+                    // 一条 97 字节：时刻、客户端、UDP、域名、类型、耗时、完成、命中、NOERROR、一条回答
+                    // One record of 97 bytes: time, client, UDP, name, type, latency, completed, cached,
+                    // NOERROR, one answer
+                    "61fbf4bbfb933404c0000207010f7777772e6578616d706c652e636f6d014196010001010104c0000201",
+                    // 没有报错、Pipeline、没有规则、上游、两步、没截断
+                    // No error, the pipeline, no rule, the upstream, two steps, not cut
+                    "0001046d61696e0001107564703a2f2f3139322e302e322e3533",
+                    "020300046d61696e09030101107564703a2f2f3139322e302e322e353300",
+                )
+            );
+        }
+
+        /// 给面板用的样本：一页随机的记录，二进制和 JSON 各一份。`KX_RECORDS_SAMPLE=目录` 时写出来
+        /// A sample for the panel: a page of random records, as binary and as JSON. Written with
+        /// `KX_RECORDS_SAMPLE=directory`
+        #[test]
+        #[ignore = "writes the sample the panel's tests read"]
+        fn write_the_records_sample_for_the_panel() {
+            let directory = std::path::PathBuf::from(
+                std::env::var("KX_RECORDS_SAMPLE").expect("KX_RECORDS_SAMPLE names a directory"),
+            );
+            // 页头前后一致，面板的测试可以拿它当内核的回答 / A consistent head, so the panel's tests can use it as
+            // the kernel's answer
+            let page = TakenPage {
+                instance: 1_792_065_000_000,
+                newest: 150,
+                missed: 0,
+                untracked: 0,
+                more: false,
+                first: 1,
+                ..random_page(&mut Rng(0x5A3F_1E2D_9C8B_7A61), 150)
+            };
+            std::fs::write(directory.join("querylog-records1.bin"), page.records()).unwrap();
+            std::fs::write(directory.join("querylog-records1.json"), page.json()).unwrap();
         }
     }
 
