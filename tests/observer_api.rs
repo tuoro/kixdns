@@ -452,6 +452,29 @@ async fn spawn_echo_upstream(ttl: u32) -> (String, tokio::task::JoinHandle<()>) 
     (addr, task)
 }
 
+/// As [`spawn_echo_upstream`], receiving but no longer answering once `answering` is set to
+/// false. The port stays taken: ending the task would free it, and a test running alongside
+/// could bind the same port number and answer in its place.
+/// 同 [`spawn_echo_upstream`]，`answering` 置为 false 以后照收不答。端口一直占着：结束任务会放掉端口，
+/// 并行跑的别的测试可能正好绑到同一个端口号、替它作答。
+async fn spawn_silenceable_echo_upstream(ttl: u32) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap().to_string();
+    let answering = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let still_answering = Arc::clone(&answering);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+            if still_answering.load(std::sync::atomic::Ordering::SeqCst)
+                && let Some(response) = echo_answer(&buf[..n], ttl)
+            {
+                let _ = socket.send_to(&response, peer).await;
+            }
+        }
+    });
+    (addr, answering)
+}
+
 /// UDP upstream that holds every answer until `release` fires, then answers
 /// what it holds and everything after. It counts the queries it receives.
 /// 扣住所有应答直到 `release` 触发，之后应答已收到的和此后的查询；统计收到的查询数。
@@ -1135,10 +1158,10 @@ async fn upstream_success_then_fresh_and_stale_cache_hits() {
 
 #[tokio::test]
 async fn background_refresh_reports_no_cache_events() {
-    // A stale entry whose upstream has gone away: the foreground request is
+    // A stale entry whose upstream has stopped answering: the foreground request is
     // served stale and spawns a background refresh, whose forward fails.
-    // 上游已消失的过期条目：前台请求返回过期缓存并触发后台刷新，刷新转发失败。
-    let (upstream, echo) = spawn_echo_upstream(1).await;
+    // 上游已不再回答的过期条目：前台请求返回过期缓存并触发后台刷新，刷新转发失败。
+    let (upstream, answering) = spawn_silenceable_echo_upstream(1).await;
     let raw = serde_json::json!({
         "settings": {
             "default_upstream": "127.0.0.1:9",
@@ -1168,7 +1191,7 @@ async fn background_refresh_reports_no_cache_events() {
         .handle_packet(&query("stale.example"), peer())
         .await
         .unwrap();
-    echo.abort();
+    answering.store(false, std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(1200)).await;
     recorder.drain();
 
@@ -3183,7 +3206,7 @@ async fn requests_that_jump_into_each_others_pipeline_do_not_wait_forever() {
 /// Stale
 #[tokio::test]
 async fn a_stale_answer_after_the_client_wait_is_reported_as_a_client_timeout() {
-    let (upstream, echo) = spawn_echo_upstream(1).await;
+    let (upstream, answering) = spawn_silenceable_echo_upstream(1).await;
     let raw = serde_json::json!({
         "settings": {
             "default_upstream": "127.0.0.1:9",
@@ -3204,7 +3227,7 @@ async fn a_stale_answer_after_the_client_wait_is_reported_as_a_client_timeout() 
         .await
         .unwrap();
     // 上游不再应答，刷新回不来 / The upstream answers no more, so no refresh comes back
-    echo.abort();
+    answering.store(false, std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(1200)).await;
     recorder.drain();
 
