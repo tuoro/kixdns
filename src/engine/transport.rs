@@ -10,9 +10,8 @@ use quinn::{
 use reqwest::Client as DohHttpClient;
 
 use super::doh_h2::{self, H2Link};
-use http_body_util::Full;
 use hyper_util::client::legacy::connect::HttpConnector;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HOST, HeaderValue, RETRY_AFTER};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderValue, RETRY_AFTER};
 use rustc_hash::FxBuildHasher;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
@@ -2137,12 +2136,13 @@ impl DohClient {
         // 将整个操作（发送 + 读取响应体）包裹在单个超时中，
         // 防止服务器发送头信息但延迟响应体时挂起。
         let result = timeout(timeout_dur, async {
-            // 握手时选了 h2 的上游直接经 hyper 发，请求和 reqwest 发的一样：同样的方法、地址和头
-            // An upstream that picked h2 is asked straight through hyper, with the request
-            // reqwest would send: the same method, address and headers
+            // 握手时选了 h2 的上游直接经 h2 发，请求和 reqwest 发的一样：同样的方法、地址和头。
+            // content-length 是 hyper 和 reqwest 自己补的，h2 不补
+            // An upstream that picked h2 is asked straight through h2, with the request reqwest
+            // would send: the same method, address and headers. hyper and reqwest add
+            // content-length themselves, h2 does not
             if let Some(uri) = uri
-                && let Some(mut sender) =
-                    state.h2.sender(url, &self.tls_h2, &self.connector).await?
+                && let Some(sender) = state.h2.sender(url, &self.tls_h2, &self.connector).await?
             {
                 let mut request = hyper::Request::post(uri.clone())
                     .header(ACCEPT, DOH_MEDIA_TYPE)
@@ -2151,11 +2151,10 @@ impl DohClient {
                     request = request.header(HOST, host);
                 }
                 let request = request
-                    .body(Full::new(Bytes::copy_from_slice(packet)))
+                    .header(CONTENT_LENGTH, packet.len())
+                    .body(())
                     .context("build doh request")?;
-                sender.ready().await.context("doh request send failed")?;
-                let resp = sender
-                    .send_request(request)
+                let resp = doh_h2::send(sender, request, Bytes::copy_from_slice(packet))
                     .await
                     .context("doh request send failed")?;
                 return doh_answer(packet, resp).await;

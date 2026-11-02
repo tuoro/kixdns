@@ -1,30 +1,33 @@
-//! DoH 上游的 HTTP/2 连接：握手时选了 h2 的上游，所有请求共用一条连接，直接经 hyper 发出，不过 reqwest
-//! 的那几层（请求构造、URL 和 URI 的来回转换、中间件、连接池检出）。连接断了、空闲太久或连续出错重建时，
-//! 下一个请求重新连。没选 h2 的上游由调用方照旧交给 reqwest。
+//! DoH 上游的 HTTP/2 连接：握手时选了 h2 的上游，所有请求共用一条连接，直接经 h2 发出，不过 reqwest
+//! 的那几层（请求构造、URL 和 URI 的来回转换、中间件、连接池检出），也不过 hyper 的客户端（见 [`send`]）。
+//! 连接断了、空闲太久或连续出错重建时，下一个请求重新连。没选 h2 的上游由调用方照旧交给 reqwest。
 //! An HTTP/2 connection to a DoH upstream: an upstream that picked h2 in the handshake has all
-//! requests share one connection, sent straight through hyper without reqwest's layers (request
-//! building, URL and URI conversions, middleware, pool checkout). When the connection is gone, idle
-//! too long or rebuilt after repeated errors, the next request connects again. An upstream that did
-//! not pick h2 is handed to reqwest by the caller as before.
+//! requests share one connection, sent straight through h2 without reqwest's layers (request
+//! building, URL and URI conversions, middleware, pool checkout) and without hyper's client (see
+//! [`send`]). When the connection is gone, idle too long or rebuilt after repeated errors, the next
+//! request connects again. An upstream that did not pick h2 is handed to reqwest by the caller as
+//! before.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll, Waker, ready};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::client::conn::http2;
+use h2::RecvStream;
+use h2::client::SendRequest;
+use hyper::body::Frame;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tower_service::Service;
 use url::{Host, Url};
 
 /// 请求的发送端 / The sending half requests go through
-pub(crate) type H2Sender = http2::SendRequest<Full<Bytes>>;
+pub(crate) type H2Sender = SendRequest<Bytes>;
 
 /// 连接空闲这么久就不再用，和 reqwest 连接池的空闲时限（`pool_idle_timeout`）一样：家用路由器的 NAT 会
 /// 悄悄忘掉空闲久了的 TCP 连接，在那样的连接上发的请求只会等到超时
@@ -32,6 +35,14 @@ pub(crate) type H2Sender = http2::SendRequest<Full<Bytes>>;
 /// (`pool_idle_timeout`): a home router's NAT quietly forgets TCP connections idle that long,
 /// and a request sent on one would only wait for its timeout
 pub(crate) const DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// 连接的接收窗口。每个流的窗口用协议默认的 64 KiB，正好装下最长的 DNS 消息；连接的窗口大得多，同时在途的
+/// 回答不用等窗口更新。hyper 用 PING 估算带宽时延积再放大窗口，DNS 回答很小，用不着
+/// The connection's receive window. Each stream keeps the protocol's default 64 KiB, which holds
+/// the longest DNS message; the connection's is much larger, so answers in flight together never
+/// wait for a window update. hyper widens its windows from PING-based bandwidth-delay estimates,
+/// which DNS answers are far too small to need
+const CONNECTION_WINDOW: u32 = 1 << 20;
 
 /// 一条打开的连接 / One open connection
 struct H2Conn {
@@ -66,16 +77,17 @@ impl H2Link {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// 还能用的现有连接：没关、也没空闲太久 / The current connection if it is still usable: not closed and not idle too long
+    /// 还能用的现有连接：能接着开流、也没空闲太久 / The current connection if it is still usable: open to new streams and not idle too long
     fn usable(&self, now: u64) -> Option<H2Sender> {
         let conn = self.conn.load_full()?;
         let idle =
             Duration::from_millis(now.saturating_sub(conn.last_used_ms.load(Ordering::Relaxed)));
-        if conn.sender.is_closed() || idle >= self.idle_timeout {
+        if idle >= self.idle_timeout {
             return None;
         }
+        let sender = open_to_new_streams(&conn.sender)?;
         conn.last_used_ms.store(now, Ordering::Relaxed);
-        Some(conn.sender.clone())
+        Some(sender)
     }
 
     /// 发请求用的发送端：有能用的连接就用它，没有就连一条。上游没选 h2 时是 None，交给 reqwest
@@ -119,7 +131,7 @@ impl H2Link {
         self.conn
             .load()
             .as_ref()
-            .is_some_and(|conn| !conn.sender.is_closed())
+            .is_some_and(|conn| open_to_new_streams(&conn.sender).is_some())
     }
 
     /// 丢掉现有连接：下一个请求重新连，也重新看对方选不选 h2（连续出错重建连接池时用）
@@ -162,18 +174,109 @@ async fn connect(
     if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
         return Ok(None);
     }
-    let (sender, conn) = http2::Builder::new(TokioExecutor::new())
-        .timer(TokioTimer::new())
-        .adaptive_window(true)
-        .handshake(TokioIo::new(stream))
+    handshake(stream).await.map(Some)
+}
+
+/// 在 `io` 上做 HTTP/2 握手，把连接交给后台任务。这几项和 hyper 的客户端一样：不收服务器推送，对方的设置到
+/// 之前最多开 100 个流，响应头最多 16 KiB；接收窗口见 [`CONNECTION_WINDOW`]
+/// Does the HTTP/2 handshake on `io` and hands the connection to a background task. As in hyper's
+/// client: no server push, at most 100 streams before the peer's settings arrive, response
+/// headers up to 16 KiB; the receive window is [`CONNECTION_WINDOW`]
+pub(crate) async fn handshake<T>(io: T) -> anyhow::Result<H2Sender>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (sender, connection) = h2::client::Builder::new()
+        .enable_push(false)
+        .initial_max_send_streams(100)
+        .max_header_list_size(16 << 10)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .handshake(io)
         .await
         .context("doh http2 handshake failed")?;
     tokio::spawn(async move {
-        if let Err(err) = conn.await {
+        // 被叫醒以后先让一轮再干活，这一轮里排进来的请求就一次写出去。不让的话，tokio 让刚被叫醒的任务插到
+        // 最前面先跑，第一个请求一叫醒连接，连接就只写这一个，一个请求写一次
+        // Once woken, yield one round before working, so the requests queued during that round
+        // go out in one write. Without it tokio runs a task it was just woken for first, so the
+        // first request to wake the connection is written alone, one write per request
+        let mut connection = std::pin::pin!(connection);
+        let mut yielded = false;
+        let ended = std::future::poll_fn(|cx| {
+            yielded = !yielded;
+            if yielded {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            connection.as_mut().poll(cx)
+        })
+        .await;
+        if let Err(err) = ended {
             tracing::debug!(error = %err, "DoH HTTP/2 connection ended");
         }
     });
-    Ok(Some(sender))
+    Ok(sender)
+}
+
+/// 一个能开新流的发送端；连接断了、出错了、收到 GOAWAY 或流 ID 用完时是 None。新的发送端没有待开的流，
+/// `poll_ready` 只查这些，不会等
+/// A sender able to open a new stream; None once the connection is gone, has failed, got a GOAWAY
+/// or ran out of stream IDs. A fresh sender has no stream waiting to open, so `poll_ready` only
+/// checks these and never waits
+fn open_to_new_streams(sender: &H2Sender) -> Option<H2Sender> {
+    let mut sender = sender.clone();
+    match sender.poll_ready(&mut TaskContext::from_waker(Waker::noop())) {
+        Poll::Ready(Ok(())) => Some(sender),
+        Poll::Ready(Err(_)) | Poll::Pending => None,
+    }
+}
+
+/// 发一个请求，正文 `body` 一次发完，等回响应头。请求头和正文接连排进连接、中间不让出，连接下一次写出时
+/// 一起写出去。hyper 的客户端另起任务送正文，那个任务等到流开了才拿得到发送窗口，请求头总是先单独写出去，
+/// 上游要等第二次写才收齐整个请求
+/// Sends a request whose body `body` goes in one piece, and waits for the response head. The
+/// request head and body are queued on the connection back to back without yielding, so its next
+/// write carries both. hyper's client sends the body from a separate task that gets send capacity
+/// only once the stream is open, so the head always goes out alone first and the upstream has the
+/// whole request only after a second write
+pub(crate) async fn send(
+    mut sender: H2Sender,
+    request: hyper::Request<()>,
+    body: Bytes,
+) -> Result<hyper::Response<H2Body>, h2::Error> {
+    let (response, mut stream) = sender.send_request(request, false)?;
+    stream.send_data(body, true)?;
+    Ok(response.await?.map(H2Body))
+}
+
+/// 响应的正文。读到一块就把这块的接收窗口还给对方：流的窗口正好装下一条最长的 DNS 消息，不还的话，比它长的
+/// 正文会停在窗口上，等到超时才知道太长
+/// A response body. Each piece read hands its share of the receive window back to the peer: a
+/// stream's window holds exactly the longest DNS message, so without this a longer body would
+/// stall on the window and be found too long only at the timeout
+pub(crate) struct H2Body(RecvStream);
+
+impl hyper::body::Body for H2Body {
+    type Data = Bytes;
+    type Error = h2::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, h2::Error>>> {
+        let Some(chunk) = ready!(self.0.poll_data(cx)) else {
+            return Poll::Ready(None);
+        };
+        Poll::Ready(Some(chunk.map(|chunk| {
+            // 还的不会比收到的多，不会出错 / Never more than was received, so this cannot fail
+            let _ = self.0.flow_control().release_capacity(chunk.len());
+            Frame::data(chunk)
+        })))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
 }
 
 /// 和 reqwest 默认一样的 TCP 连接器：关 Nagle，不限 http（TLS 由这里接着做），TCP keepalive 15 秒起、
