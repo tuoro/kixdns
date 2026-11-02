@@ -131,9 +131,11 @@ pub(crate) struct QueryLog {
     /// collection: at boot the kernel comes up before the panel, and the queries of those seconds are
     /// recorded too
     collected: AtomicU64,
-    /// 等着取的面板盼到的序号：最新一条到了它就叫醒；没人等时是 `u64::MAX`
-    /// The number a waiting panel looks for: the newest record reaching it wakes the panel; `u64::MAX`
-    /// with no one waiting
+    /// 等着取的面板各自盼到的序号：面板可以同时取好几段，每段一个 / The numbers the waiting takes look for: the
+    /// panel may take several ranges at once, one number each
+    waiting: Mutex<Vec<u64>>,
+    /// 其中最小的：最新一条到了它就叫醒等着的；没人等时是 `u64::MAX` / The smallest of them: the newest record
+    /// reaching it wakes the waiting takes; `u64::MAX` with no one waiting
     wake_at: AtomicU64,
     arrived: tokio::sync::Notify,
     /// 超出在途上限、没能记下的请求数（自内核启动起累计） / Requests left unrecorded because too many
@@ -608,13 +610,31 @@ impl Json {
     }
 }
 
-/// 有面板在等着取；放下时把 `wake_at` 改回没人等 / A panel waiting to collect; dropping it sets `wake_at`
-/// back to no one waiting
-struct Waiting<'a>(&'a AtomicU64);
+/// 一段在等着取；放下时不再算它，`wake_at` 换成还在等的里最小的
+/// A take waiting for its range; dropping it stops counting it, and `wake_at` becomes the smallest number still waited
+/// for
+struct Waiting<'a> {
+    log: &'a QueryLog,
+    target: u64,
+}
+
+impl<'a> Waiting<'a> {
+    fn new(log: &'a QueryLog, target: u64) -> Self {
+        let mut waiting = log.waiting.lock();
+        waiting.push(target);
+        log.wake_at.fetch_min(target, Ordering::Relaxed);
+        Self { log, target }
+    }
+}
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        self.0.store(u64::MAX, Ordering::Relaxed);
+        let mut waiting = self.log.waiting.lock();
+        if let Some(at) = waiting.iter().position(|target| *target == self.target) {
+            waiting.swap_remove(at);
+        }
+        let smallest = waiting.iter().copied().min().unwrap_or(u64::MAX);
+        self.log.wake_at.store(smallest, Ordering::Relaxed);
     }
 }
 
@@ -643,6 +663,7 @@ impl QueryLog {
             capacity,
             max_pending: MAX_PENDING,
             collected: AtomicU64::new(1),
+            waiting: Mutex::new(Vec::new()),
             wake_at: AtomicU64::new(u64::MAX),
             arrived: tokio::sync::Notify::new(),
             untracked: AtomicU64::new(0),
@@ -1037,16 +1058,15 @@ impl QueryLog {
         self.renew();
         let target = after.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX));
         let deadline = tokio::time::Instant::now() + wait;
-        // 等完、或者面板中途断开（这个 future 被丢掉）都算没人等了 / Done waiting, or the panel gone
-        // midway (this future dropped), no one waits any more
-        let _waiting = Waiting(&self.wake_at);
+        // 等完、或者面板中途断开（这个 future 被丢掉）都不再等这一段 / Done waiting, or the panel gone
+        // midway (this future dropped), this range is no longer waited for
+        let _waiting = Waiting::new(self, target);
         loop {
             // 先登记要等，再看够不够：看完之后到的那一条也叫得醒它
             // Register to wait before checking: a record arriving right after the check still wakes it
             let arrived = self.arrived.notified();
             tokio::pin!(arrived);
             arrived.as_mut().enable();
-            self.wake_at.fetch_min(target, Ordering::Relaxed);
             if self.ring.lock().newest >= target
                 || tokio::time::timeout_at(deadline, arrived).await.is_err()
             {
@@ -1056,29 +1076,37 @@ impl QueryLog {
     }
 
     /// 取走 `after` 之后的记录（最多 `limit` 条），同时续上「面板在取」，返回 JSON 文本（不先建中间的 JSON 树）。
-    /// `instance` 是游标所属的内核进程：是这个进程的，`after` 及以前的面板就已经存好了（游标在写好以后才往前挪），
-    /// 删掉。没说是哪个进程的（面板在探是哪个进程，或者面板不认 `querylog_wait_v1`）、或是别的进程的游标，一条不删
+    /// `instance` 是游标所属的内核进程：是这个进程的，面板存好了的就删掉。存好到哪由 `stored` 说
+    /// （`querylog_stored_v1`：面板同时取着好几段，取到哪和存到哪不是一回事），没给 `stored` 时就是 `after`
+    /// （游标在写好以后才往前挪）；`stored` 超过 `after` 时也只删到 `after`，还没取走的不删。没说是哪个进程的（面板
+    /// 在探是哪个进程，或者面板不认 `querylog_wait_v1`）、或是别的进程的游标，一条不删
     /// Takes the records after `after` (at most `limit`), renews 「the panel is collecting」, and returns
     /// the JSON text (without building an intermediate JSON tree first). `instance` is the kernel process
-    /// the cursor belongs to: if it is this one, the panel has stored everything up to `after` (its cursor
-    /// moves only once that is done), which is deleted. A cursor of no stated process (the panel probing
-    /// which process this is, or one that does not know `querylog_wait_v1`) or of another one deletes
-    /// nothing
+    /// the cursor belongs to: if it is this one, what the panel has stored is deleted. How far that goes is
+    /// `stored` (`querylog_stored_v1`: a panel taking several ranges at once has taken further than it has
+    /// stored), and `after` without it (the cursor moves only once a page is written); a `stored` past
+    /// `after` still deletes only up to `after`, never what was not taken yet. A cursor of no stated
+    /// process (the panel probing which process this is, or one that does not know `querylog_wait_v1`) or
+    /// of another one deletes nothing
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn collect(
         &self,
         after: u64,
         limit: usize,
         instance: Option<u64>,
+        stored: Option<u64>,
         protocol_version: u8,
     ) -> String {
         self.renew();
-        let stored_here = instance == Some(self.instance);
+        let stored_up_to = (instance == Some(self.instance))
+            .then(|| stored.map_or(after, |stored| stored.min(after)));
         let (entries, oldest, newest, stored) = {
             let mut ring = self.ring.lock();
             // 存好的锁外再释放 / What is stored is freed outside the lock
             let mut stored = Vec::new();
-            while stored_here && ring.entries.front().is_some_and(|entry| entry.seq <= after) {
+            while let Some(up_to) = stored_up_to
+                && ring.entries.front().is_some_and(|entry| entry.seq <= up_to)
+            {
                 stored.extend(ring.entries.pop_front());
             }
             let oldest = ring.entries.front().map(|entry| entry.seq);
@@ -1494,12 +1522,12 @@ mod tests {
     }
 
     fn page(log: &QueryLog, after: u64, limit: usize) -> Value {
-        serde_json::from_str(&log.collect(after, limit, None, 1)).expect("a page is JSON")
+        serde_json::from_str(&log.collect(after, limit, None, None, 1)).expect("a page is JSON")
     }
 
     /// 带着这个内核进程的游标来取的一页 / A page taken with a cursor of this kernel process
     fn page_of_this_run(log: &QueryLog, after: u64, limit: usize) -> Value {
-        serde_json::from_str(&log.collect(after, limit, Some(log.instance), 1))
+        serde_json::from_str(&log.collect(after, limit, Some(log.instance), None, 1))
             .expect("a page is JSON")
     }
 
@@ -1814,6 +1842,66 @@ mod tests {
     /// 游标）：都不是存好了什么，一条不删
     /// A cursor of no stated process (the panel probing, or an older panel) or of another one (the kernel
     /// restarted and the panel still holds the last process's cursor) says nothing was stored: nothing
+    /// 面板同时取着好几段时，存好到哪由 `stored` 说：只删到它为止，取走了还没存好的照留；`stored` 超过 `after`
+    /// 也只删到 `after`；不是这个进程的游标照样一条不删
+    /// With the panel taking several ranges at once, `stored` says how far it has stored: deletion stops there, and
+    /// what was taken but not stored stays; a `stored` past `after` still deletes only up to `after`; a cursor of
+    /// another process still deletes nothing
+    #[test]
+    fn what_is_stored_is_said_apart_from_what_is_taken() {
+        let log = QueryLog::default();
+        cancelled(&log, 1..=8);
+        let page_after = |after, stored, instance| -> Value {
+            serde_json::from_str(&log.collect(after, 10, instance, stored, 1)).unwrap()
+        };
+        assert_eq!(
+            seqs(&page_after(4, Some(2), Some(log.instance))),
+            [5, 6, 7, 8]
+        );
+        assert_eq!(
+            seqs(&page(&log, 0, 10)),
+            [3, 4, 5, 6, 7, 8],
+            "3 and 4 were taken, not stored"
+        );
+        let _ = page_after(5, Some(7), Some(log.instance));
+        assert_eq!(
+            seqs(&page(&log, 0, 10)),
+            [6, 7, 8],
+            "never past what was taken"
+        );
+        let _ = page_after(8, Some(8), Some(log.instance + 1));
+        assert_eq!(seqs(&page(&log, 0, 10)), [6, 7, 8]);
+    }
+
+    /// 好几段同时在等：先等到的那段走了，后面那段照样一到就叫醒，不白等到时限
+    /// Several ranges waiting at once: once the first has what it waited for and leaves, the next is still woken the
+    /// moment its records arrive, without sitting out its deadline
+    #[tokio::test]
+    async fn several_waiting_takes_are_each_woken() {
+        let log = std::sync::Arc::new(QueryLog::default());
+        let first = {
+            let log = std::sync::Arc::clone(&log);
+            tokio::spawn(async move { log.wait_for_page(0, 2, None, Duration::from_secs(5)).await })
+        };
+        let second = {
+            let log = std::sync::Arc::clone(&log);
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                log.wait_for_page(2, 2, None, Duration::from_secs(5)).await;
+                started.elapsed()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        quick_answers(&log, 1..=2);
+        first.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        quick_answers(&log, 3..=4);
+        let waited = second.await.unwrap();
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert_eq!(log.wake_at.load(Relaxed), u64::MAX, "no one waits any more");
+        assert!(log.waiting.lock().is_empty());
+    }
+
     /// is deleted
     #[test]
     fn only_a_cursor_of_this_run_deletes() {
@@ -1821,7 +1909,7 @@ mod tests {
         cancelled(&log, 1..=3);
         let _ = page(&log, 3, 10);
         let _ = page(&log, u64::MAX / 2, 1);
-        let _ = log.collect(3, 10, Some(log.instance + 1), 1);
+        let _ = log.collect(3, 10, Some(log.instance + 1), None, 1);
         assert_eq!(seqs(&page(&log, 0, 10)), [1, 2, 3]);
     }
 
@@ -1952,7 +2040,7 @@ mod tests {
                 error: Some("engine \"failed\"\n"),
             },
         );
-        let page = log.collect(0, 10, None, 1);
+        let page = log.collect(0, 10, None, None, 1);
         let page = regex::Regex::new(r#""(time_unix_ms|at_us|instance)":\d+"#)
             .unwrap()
             .replace_all(&page, r#""$1":0"#);
