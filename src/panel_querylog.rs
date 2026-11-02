@@ -22,16 +22,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::rr::{Name, RData, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
+use crate::config::Transport;
 use crate::observe::{
     CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
     RequestContext, RequestOutcome, RequestStatus, RuleEvaluated, RuleMatched, RulePhase,
-    UpstreamOutcome, UpstreamResult, UpstreamSkipped,
+    UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
 use crate::panel::{outcome_label, phase_label, skip_reason_label, transport_label};
 
@@ -169,9 +170,11 @@ struct Step {
     what: StepKind,
 }
 
-/// 处理过程的一步，写出来是 `{"at_us":…,"kind":"…",…}`：`kind` 是下面的名字（小写、下划线连接），空着的项不写
+/// 处理过程的一步，写出来是 `{"at_us":…,"kind":"…",…}`：`kind` 是下面的名字（小写、下划线连接），空着的项不写。
+/// 阶段、决定、结果这些存成原来的枚举，一个字节，写的时候才变成文字
 /// A step of the handling, written as `{"at_us":…,"kind":"…",…}`: `kind` is the name below (lower case,
-/// joined by underscores), and empty items are left out
+/// joined by underscores), and empty items are left out. Phases, decisions and results are kept as their
+/// enums, a byte each, and turned into text only when written
 enum StepKind {
     /// 进入一个 Pipeline：选中入口时一次，之后每跳一次一次 / Entered a pipeline: once at selection,
     /// once more after every jump
@@ -184,9 +187,9 @@ enum StepKind {
     Rule {
         pipeline: ConfigName,
         rule: ConfigName,
-        phase: &'static str,
+        phase: RulePhase,
         matched: Option<bool>,
-        decision: Option<&'static str>,
+        decision: Option<DecisionKind>,
         target: Option<ConfigName>,
     },
     /// 前面没有对应规则那一步的决定：没有规则命中时 Pipeline 的默认决定，或没写回答检查条件的规则的回答阶段动作
@@ -195,15 +198,16 @@ enum StepKind {
     Decision {
         pipeline: ConfigName,
         rule: Option<ConfigName>,
-        phase: &'static str,
-        decision: &'static str,
+        phase: RulePhase,
+        decision: DecisionKind,
         target: Option<ConfigName>,
     },
     /// 响应缓存：`fresh`、`stale`、`stale_timeout`、`stale_failure` 或 `miss`；命中时 `source` 是当初回答的上游
     /// The response cache: `fresh`, `stale`, `stale_timeout`, `stale_failure` or `miss`; on a hit `source`
     /// is the upstream that answered originally
     Cache {
-        result: &'static str,
+        /// 没命中时为 None / None on a miss
+        result: Option<CacheHitKind>,
         source: Option<ConfigName>,
     },
     /// 同一时刻已有相同的查询在问上游，这次用了它的答案 / An identical query was already asking
@@ -216,9 +220,9 @@ enum StepKind {
     /// was cancelled) or `throttled` (the DoH upstream answered HTTP 429)
     Upstream {
         upstream: ConfigName,
-        transport: &'static str,
-        via: &'static str,
-        result: &'static str,
+        transport: Transport,
+        via: Transport,
+        result: UpstreamOutcome,
         latency_us: u64,
         rcode: Option<ResponseCode>,
         error: Option<Box<str>>,
@@ -231,8 +235,8 @@ enum StepKind {
     /// does not know as an error
     UpstreamSkipped {
         upstream: ConfigName,
-        transport: &'static str,
-        reason: &'static str,
+        transport: Transport,
+        reason: UpstreamSkipReason,
     },
 }
 
@@ -303,6 +307,20 @@ impl Status {
 /// A response held in the ring. Anything longer is read on the spot, so the ring holds no large blobs
 const MAX_KEPT_RESPONSE: usize = 2_048;
 
+/// 一条回答。地址留着原样，写的时候直接写数字，不先格式化成一个字符串；别的类型是读出来的文字
+/// One answer. An address is kept as it is and written digit by digit, without being formatted into a
+/// string first; any other type is the text read
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Answer {
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+    Text(String),
+}
+
+/// 一条记录的回答，最多 [`MAX_ANSWERS`] 条，不另外分配 / A record's answers, at most [`MAX_ANSWERS`], with no
+/// allocation of their own
+type Answers = SmallVec<[Answer; MAX_ANSWERS]>;
+
 /// 客户端收到的应答 / The response the client got
 enum Response {
     /// 没有应答（失败或取消） / No response (failed or cancelled)
@@ -310,7 +328,7 @@ enum Response {
     /// 应答原文，面板来取时再读 / The response bytes, read when the panel collects the record
     Kept(Box<[u8]>),
     /// 太长的应答，当场读出的响应码和回答 / An over-long response, its code and answers read on the spot
-    Read(Option<ResponseCode>, Vec<String>),
+    Read(Option<ResponseCode>, Box<[Answer]>),
 }
 
 impl Response {
@@ -320,16 +338,16 @@ impl Response {
             Some(bytes) if bytes.len() <= MAX_KEPT_RESPONSE => Self::Kept(bytes.into()),
             Some(bytes) => {
                 let (rcode, answers) = read_response(bytes);
-                Self::Read(rcode, answers)
+                Self::Read(rcode, answers.into_vec().into_boxed_slice())
             }
         }
     }
 
-    fn read(&self) -> (Option<ResponseCode>, Vec<String>) {
+    fn read(&self) -> (Option<ResponseCode>, Answers) {
         match self {
-            Self::None => (None, Vec::new()),
+            Self::None => (None, Answers::new()),
             Self::Kept(bytes) => read_response(bytes),
-            Self::Read(rcode, answers) => (*rcode, answers.clone()),
+            Self::Read(rcode, answers) => (*rcode, answers.iter().cloned().collect()),
         }
     }
 }
@@ -407,7 +425,11 @@ impl Entry {
             if index > 0 {
                 json.raw(",");
             }
-            json.text(answer);
+            match answer {
+                Answer::V4(address) => json.ipv4(*address),
+                Answer::V6(address) => json.address(IpAddr::V6(*address)),
+                Answer::Text(text) => json.text(text),
+            }
         }
         json.raw("]");
         if let Some(error) = &self.error {
@@ -468,14 +490,14 @@ impl Step {
                 json.key("rule");
                 json.text(rule);
                 json.key("phase");
-                json.label(phase);
+                json.label(phase_label(*phase));
                 if let Some(matched) = matched {
                     json.key("matched");
                     json.raw(if *matched { "true" } else { "false" });
                 }
                 if let Some(decision) = decision {
                     json.key("decision");
-                    json.label(decision);
+                    json.label(decision_label(*decision));
                 }
                 if let Some(target) = target {
                     json.key("target");
@@ -497,9 +519,9 @@ impl Step {
                     json.text(rule);
                 }
                 json.key("phase");
-                json.label(phase);
+                json.label(phase_label(*phase));
                 json.key("decision");
-                json.label(decision);
+                json.label(decision_label(*decision));
                 if let Some(target) = target {
                     json.key("target");
                     json.text(target);
@@ -508,7 +530,7 @@ impl Step {
             StepKind::Cache { result, source } => {
                 json.label("cache");
                 json.key("result");
-                json.label(result);
+                json.label(result.map_or("miss", cache_label));
                 if let Some(source) = source {
                     json.key("source");
                     json.text(source);
@@ -528,11 +550,11 @@ impl Step {
                 json.key("upstream");
                 json.text(upstream);
                 json.key("transport");
-                json.label(transport);
+                json.label(transport_label(*transport));
                 json.key("via");
-                json.label(via);
+                json.label(transport_label(*via));
                 json.key("result");
-                json.label(result);
+                json.label(outcome_label(*result));
                 json.key("latency_us");
                 json.number(*latency_us);
                 if let Some(rcode) = rcode {
@@ -553,9 +575,9 @@ impl Step {
                 json.key("upstream");
                 json.text(upstream);
                 json.key("transport");
-                json.label(transport);
+                json.label(transport_label(*transport));
                 json.key("reason");
-                json.label(reason);
+                json.label(skip_reason_label(*reason));
             }
         }
         json.raw("}");
@@ -606,7 +628,31 @@ impl Json {
     /// letters, dots and colons only
     fn address(&mut self, address: IpAddr) {
         use std::io::Write as _;
-        let _ = write!(self.0, "\"{address}\"");
+        match address {
+            IpAddr::V4(address) => self.ipv4(address),
+            IpAddr::V6(address) => {
+                let _ = write!(self.0, "\"{address}\"");
+            }
+        }
+    }
+
+    /// IPv4 地址一位位写出来，和 `Display` 一样，不经格式化那一套 / An IPv4 address written digit by digit, as
+    /// `Display` writes it, without the formatting machinery
+    fn ipv4(&mut self, address: Ipv4Addr) {
+        self.0.push(b'"');
+        for (index, octet) in address.octets().into_iter().enumerate() {
+            if index > 0 {
+                self.0.push(b'.');
+            }
+            if octet >= 100 {
+                self.0.push(b'0' + octet / 100);
+            }
+            if octet >= 10 {
+                self.0.push(b'0' + octet / 10 % 10);
+            }
+            self.0.push(b'0' + octet % 10);
+        }
+        self.0.push(b'"');
     }
 }
 
@@ -827,7 +873,7 @@ impl QueryLog {
             pending.push(StepKind::Rule {
                 pipeline: ConfigName::of(event.pipeline),
                 rule: ConfigName::of(event.rule),
-                phase: "response",
+                phase: RulePhase::Response,
                 matched: Some(event.matched),
                 decision: None,
                 target: None,
@@ -844,20 +890,20 @@ impl QueryLog {
             if event.phase != RulePhase::Request {
                 if let Some(StepKind::Rule { decision, .. }) =
                     pending.steps.iter_mut().rev().map(|step| &mut step.what).find(|what| {
-                        matches!(what, StepKind::Rule { pipeline, rule, phase: "response", decision: None, .. }
+                        matches!(what, StepKind::Rule { pipeline, rule, phase: RulePhase::Response, decision: None, .. }
                             if **pipeline == *event.pipeline && **rule == *event.rule)
                     })
                 {
-                    *decision = Some(decision_label(event.decision));
+                    *decision = Some(event.decision);
                 }
                 return;
             }
             pending.push(StepKind::Rule {
                 pipeline: ConfigName::of(event.pipeline),
                 rule: ConfigName::of(event.rule),
-                phase: "request",
+                phase: RulePhase::Request,
                 matched: None,
-                decision: Some(decision_label(event.decision)),
+                decision: Some(event.decision),
                 target: None,
             });
         });
@@ -880,8 +926,7 @@ impl QueryLog {
                 }
             };
             pending.decision = Some((event.rule.map(ConfigName::of), kind));
-            let phase = phase_label(event.phase);
-            let label = decision_label(kind);
+            let phase = event.phase;
             // 只看这条规则最近的那一步：它是同一阶段、还没有去处时才补上。再往前的是更早的一轮
             // （比如跳回同一个列表之前），不能把这次的决定挂到那里
             // Only the rule's latest step is considered: the decision is added when that step is of the
@@ -909,14 +954,14 @@ impl QueryLog {
             });
             match step {
                 Some((decision, slot)) => {
-                    *decision = Some(label);
+                    *decision = Some(kind);
                     *slot = target;
                 }
                 None => pending.push(StepKind::Decision {
                     pipeline: ConfigName::of(event.pipeline),
                     rule: event.rule.map(ConfigName::of),
                     phase,
-                    decision: label,
+                    decision: kind,
                     target,
                 }),
             }
@@ -929,7 +974,7 @@ impl QueryLog {
             pending.cache = Some(event.kind);
             pending.cache_source.clone_from(&source);
             pending.push(StepKind::Cache {
-                result: cache_label(event.kind),
+                result: Some(event.kind),
                 source,
             });
         });
@@ -938,7 +983,7 @@ impl QueryLog {
     pub(crate) fn cache_miss(&self, ctx: &RequestContext<'_>) {
         self.with_pending(ctx, |pending| {
             pending.push(StepKind::Cache {
-                result: "miss",
+                result: None,
                 source: None,
             });
         });
@@ -953,16 +998,15 @@ impl QueryLog {
 
     pub(crate) fn upstream_result(&self, ctx: &RequestContext<'_>, event: &UpstreamResult<'_>) {
         self.with_pending(ctx, |pending| {
-            let result = outcome_label(event.outcome);
             let upstream = ConfigName::of(event.upstream);
             if event.outcome == UpstreamOutcome::Success {
                 pending.answered_by = Some(upstream.clone());
             }
             pending.push(StepKind::Upstream {
                 upstream,
-                transport: transport_label(event.transport),
-                via: transport_label(event.via),
-                result,
+                transport: event.transport,
+                via: event.via,
+                result: event.outcome,
                 latency_us: u64::try_from(event.latency.as_micros()).unwrap_or(u64::MAX),
                 rcode: event.rcode,
                 error: event.error.map(|error| clip(&format!("{error:#}")).into()),
@@ -974,8 +1018,8 @@ impl QueryLog {
         self.with_pending(ctx, |pending| {
             pending.push(StepKind::UpstreamSkipped {
                 upstream: ConfigName::of(event.upstream),
-                transport: transport_label(event.transport),
-                reason: skip_reason_label(event.reason),
+                transport: event.transport,
+                reason: event.reason,
             });
         });
     }
@@ -1208,7 +1252,7 @@ fn finish(entry: &mut Entry, outcome: &RequestOutcome<'_>) {
 /// are addresses or names is read here: addresses are written directly and names read by hickory's
 /// `Name`, word for word what hickory's whole parse writes, without that parse; anything else is still
 /// parsed whole
-fn read_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
+fn read_response(bytes: &[u8]) -> (Option<ResponseCode>, Answers) {
     if crate::proto_utils::well_formed_reply(bytes)
         && let Some(read) = read_plain_response(bytes)
     {
@@ -1217,7 +1261,7 @@ fn read_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
     read_whole_response(bytes)
 }
 
-fn read_whole_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
+fn read_whole_response(bytes: &[u8]) -> (Option<ResponseCode>, Answers) {
     match Message::from_vec(bytes) {
         Ok(message) => (
             Some(message.metadata.response_code),
@@ -1225,10 +1269,14 @@ fn read_whole_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
                 .answers
                 .iter()
                 .take(MAX_ANSWERS)
-                .map(|record| clip_owned(record.data.to_string()))
+                .map(|record| match &record.data {
+                    RData::A(address) => Answer::V4(address.0),
+                    RData::AAAA(address) => Answer::V6(address.0),
+                    data => Answer::Text(clip_owned(data.to_string())),
+                })
                 .collect(),
         ),
-        Err(_) => (crate::observe::header_rcode(bytes), Vec::new()),
+        Err(_) => (crate::observe::header_rcode(bytes), Answers::new()),
     }
 }
 
@@ -1237,7 +1285,7 @@ fn read_whole_response(bytes: &[u8]) -> (Option<ResponseCode>, Vec<String>) {
 /// A reply whose structure is already checked: the response code (with the high bits from EDNS, as hickory
 /// merges them) and the first eight answers. None when an answer is of a type other than an address or a
 /// name, which is left to hickory
-fn read_plain_response(packet: &[u8]) -> Option<(Option<ResponseCode>, Vec<String>)> {
+fn read_plain_response(packet: &[u8]) -> Option<(Option<ResponseCode>, Answers)> {
     let count = |at: usize| {
         packet
             .get(at..at + 2)
@@ -1250,7 +1298,7 @@ fn read_plain_response(packet: &[u8]) -> Option<(Option<ResponseCode>, Vec<Strin
     for _ in 0..count(4)? {
         pos = name_end(packet, pos)?.checked_add(4)?;
     }
-    let mut texts = Vec::with_capacity(answers.min(MAX_ANSWERS));
+    let mut texts = Answers::new();
     let mut high = 0;
     for index in 0..records {
         pos = name_end(packet, pos)?;
@@ -1260,16 +1308,16 @@ fn read_plain_response(packet: &[u8]) -> Option<(Option<ResponseCode>, Vec<Strin
         let end = rdata.checked_add(usize::from(u16::from_be_bytes([header[8], header[9]])))?;
         let data = packet.get(rdata..end)?;
         if index < answers.min(MAX_ANSWERS) {
-            let text = match RecordType::from(rr_type) {
-                RecordType::A => Ipv4Addr::from(<[u8; 4]>::try_from(data).ok()?).to_string(),
-                RecordType::AAAA => Ipv6Addr::from(<[u8; 16]>::try_from(data).ok()?).to_string(),
+            let answer = match RecordType::from(rr_type) {
+                RecordType::A => Answer::V4(Ipv4Addr::from(<[u8; 4]>::try_from(data).ok()?)),
+                RecordType::AAAA => Answer::V6(Ipv6Addr::from(<[u8; 16]>::try_from(data).ok()?)),
                 RecordType::CNAME | RecordType::NS | RecordType::PTR => {
                     let mut decoder = BinDecoder::new(packet).clone(u16::try_from(rdata).ok()?);
-                    Name::read(&mut decoder).ok()?.to_string()
+                    Answer::Text(clip_owned(Name::read(&mut decoder).ok()?.to_string()))
                 }
                 _ => return None,
             };
-            texts.push(clip_owned(text));
+            texts.push(answer);
         } else if index >= additional_from && rr_type == u16::from(RecordType::OPT) {
             // OPT 的 TTL 第一个字节是扩展响应码的高位 / The first byte of OPT's TTL is the extended
             // response code's high bits
@@ -2245,6 +2293,24 @@ mod tests {
         assert!(steps[5].get("rcode").is_none());
     }
 
+    /// 回答后检查命中时先写上它要做什么：实际的决定还没补上请求就结束了，那一步上留着的就是它
+    /// A matched answer check first writes what it is set to do: with the request over before the actual
+    /// decision is added, that is what its step keeps
+    #[test]
+    fn a_matched_answer_check_keeps_what_it_was_set_to_do() {
+        let log = QueryLog::default();
+        let _ = entries(&log);
+        let request = ctx(1);
+        log.request_started(&request, false);
+        checked(&log, &request, "polluted", Some(DecisionKind::Static));
+        finish(&log, &request, RequestStatus::Cancelled, None);
+        let records = entries(&log);
+        let step = &records[0]["steps"][0];
+        assert_eq!(step["phase"], "response", "{step}");
+        assert_eq!(step["matched"], true, "{step}");
+        assert_eq!(step["decision"], "static", "{step}");
+    }
+
     /// 回答后检查：结论和它实际做了什么都写在检查那一步上；拦截或改写算规则直接回应，不再写上游
     /// Answer checks: the verdict and what it actually did sit on the check's step; a block or rewrite
     /// counts as a rule's own answer and names no upstream
@@ -2682,6 +2748,31 @@ mod tests {
             }
         }
         assert!(read_here > 5_000, "{read_here} intact replies read here");
+    }
+
+    /// IPv4 地址一位位写出来，和 `Display` 写的一字不差 / An IPv4 address written digit by digit reads exactly
+    /// as `Display` writes it
+    #[test]
+    fn an_ipv4_address_is_written_as_display_writes_it() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut addresses = vec![
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 100, 9),
+            Ipv4Addr::new(9, 99, 100, 255),
+        ];
+        addresses.extend((0..10_000).map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            Ipv4Addr::from(u32::try_from(state >> 32).unwrap())
+        }));
+        for address in addresses {
+            let mut json = super::Json(Vec::new());
+            json.ipv4(address);
+            assert_eq!(String::from_utf8(json.0).unwrap(), format!("\"{address}\""));
+        }
     }
 
     #[test]
