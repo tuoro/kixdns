@@ -37,17 +37,23 @@ use crate::observe::{
 };
 use crate::panel::{outcome_label, phase_label, skip_reason_label, transport_label};
 
-/// 交接区最多留多少条。面板每秒取一次，家用流量远到不了；满了丢最旧的，面板从序号的空缺看出漏了几条。
-/// How many records the hand-off ring keeps. The panel collects every second, far beyond home traffic;
-/// when full the oldest goes, and the panel sees from the gap in sequence numbers how many it missed.
-pub(crate) const CAPACITY: usize = 4_096;
+/// 交接区最多留多少条。面板说存好了（下次来取时的 `after`）的就删掉，平时交接区几乎是空的；面板重启、跟不上
+/// 时才攒起来，攒到这么多还没取就丢最旧的，面板从序号的空缺看出漏了几条。面板停十秒，每秒一千多个查询都留得住
+/// How many records the hand-off ring keeps. What the panel says it has stored (the `after` of its
+/// next take) is deleted, so the ring is nearly empty most of the time; it fills only while the panel
+/// restarts or falls behind, and past this many untaken the oldest goes, the panel seeing from the gap
+/// in sequence numbers how many it missed. With the panel away ten seconds, over a thousand queries a
+/// second are kept
+pub(crate) const CAPACITY: usize = 16_384;
 /// 一次最多取走多少条 / At most this many records per collection
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const MAX_PAGE: usize = 2_000;
-/// 同时在跟的请求上限：超过的不记，只计个数（`untracked`），面板据此说漏记了几条
+/// 同时在跟的请求上限：超过的不记，只计个数（`untracked`），面板据此说漏记了几条。每秒几万个查询、上游
+/// 慢到一百多毫秒时，同时在途的就上了四千
 /// At most this many requests tracked at once: beyond it requests are only counted (`untracked`), so
-/// the panel can still say how many it missed
-const MAX_PENDING: usize = 4_096;
+/// the panel can still say how many it missed. Tens of thousands of queries a second with an upstream
+/// slowing past a hundred milliseconds put over four thousand in flight at once
+const MAX_PENDING: usize = 16_384;
 /// 在跟的请求按编号直接定位的槽位数，2 的幂；同时在跟的多过它时，多出来的记在共享表里
 /// Slots the tracked requests are placed in by number, a power of two; requests beyond them at once go
 /// to a shared map
@@ -61,6 +67,9 @@ const MAX_ANSWERS: usize = 8;
 const MAX_TEXT: usize = 256;
 /// 面板多久没来取就停记 / How long without a collection before recording stops
 const IDLE_AFTER: Duration = Duration::from_secs(120);
+/// 面板等着取时最多等多久 / The longest a panel waiting to collect is kept waiting
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// 配置里的名字：Pipeline、规则、上游地址。来来回回就那几个，每个线程记住见过的，同一个名字一份内存，
 /// 记一步只加一次引用计数，不再每一步复制一份字符串
@@ -121,10 +130,18 @@ pub(crate) struct QueryLog {
     instance: u64,
     capacity: usize,
     max_pending: usize,
-    /// 上一次被取走的时刻（相对 `epoch` 的毫秒数加一），0 表示没在记：没在记时请求进来只读这一个数，不读时钟
+    /// 上一次被取走的时刻（相对 `epoch` 的毫秒数加一），0 表示没在记：没在记时请求进来只读这一个数，不读时钟。
+    /// 内核一启动就算取过一次：开机时内核比面板先起来，那几秒的查询也要记下
     /// The last collection (milliseconds since `epoch`, plus one), or 0 when not recording: while not
-    /// recording, an arriving request reads this one number and never the clock
+    /// recording, an arriving request reads this one number and never the clock. Start-up counts as a
+    /// collection: at boot the kernel comes up before the panel, and the queries of those seconds are
+    /// recorded too
     collected: AtomicU64,
+    /// 等着取的面板盼到的序号：最新一条到了它就叫醒；没人等时是 `u64::MAX`
+    /// The number a waiting panel looks for: the newest record reaching it wakes the panel; `u64::MAX`
+    /// with no one waiting
+    wake_at: AtomicU64,
+    arrived: tokio::sync::Notify,
     /// 超出在途上限、没能记下的请求数（自内核启动起累计） / Requests left unrecorded because too many
     /// were in flight (cumulative since the kernel started)
     untracked: AtomicU64,
@@ -426,6 +443,16 @@ impl Serialize for Entry {
     }
 }
 
+/// 有面板在等着取；放下时把 `wake_at` 改回没人等 / A panel waiting to collect; dropping it sets `wake_at`
+/// back to no one waiting
+struct Waiting<'a>(&'a AtomicU64);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
 /// 一次取走的结果 / One collection
 #[derive(Serialize)]
 struct Page<'a> {
@@ -467,7 +494,9 @@ impl QueryLog {
             instance: unix_ms(),
             capacity,
             max_pending: MAX_PENDING,
-            collected: AtomicU64::new(0),
+            collected: AtomicU64::new(1),
+            wake_at: AtomicU64::new(u64::MAX),
+            arrived: tokio::sync::Notify::new(),
             untracked: AtomicU64::new(0),
             slots: (0..PENDING_SLOTS).map(|_| Mutex::new(None)).collect(),
             overflow: DashMap::new(),
@@ -494,15 +523,15 @@ impl QueryLog {
             .is_some()
     }
 
-    /// 面板最近两分钟来取过。时钟只在记着的时候读；超过两分钟就停下并清空交接区（序号照旧往后数，
-    /// 面板回来时从空缺看出漏了几条），之后的请求又只读那一个数。停下用比较交换：同时来取的面板赢。
-    /// `collected` 是刚读到的那个数。在记时给出为此读到的时刻，请求的起点就用它，不再读一次时钟
-    /// The panel collected within the last two minutes. The clock is read only while recording; past
-    /// two minutes recording stops and the ring is emptied (numbering carries on, so a returning panel
-    /// sees from the gap how many it missed), and later requests read the one number again. Stopping
-    /// uses compare-and-exchange, so a collection arriving at the same moment wins. `collected` is the
-    /// value just read. While recording, gives the moment read for it, which serves as the request's
-    /// start instead of reading the clock again
+    /// 面板最近两分钟来取过（内核刚启动也算一次）。时钟只在记着的时候读；超过两分钟就停下并清空交接区
+    /// （序号照旧往后数，面板回来时从空缺看出漏了几条），之后的请求又只读那一个数。停下用比较交换：同时来取的
+    /// 面板赢。`collected` 是刚读到的那个数。在记时给出为此读到的时刻，请求的起点就用它，不再读一次时钟
+    /// The panel collected within the last two minutes (start-up counting as one). The clock is read
+    /// only while recording; past two minutes recording stops and the ring is emptied (numbering
+    /// carries on, so a returning panel sees from the gap how many it missed), and later requests read
+    /// the one number again. Stopping uses compare-and-exchange, so a collection arriving at the same
+    /// moment wins. `collected` is the value just read. While recording, gives the moment read for it,
+    /// which serves as the request's start instead of reading the clock again
     fn recording_after(&self, collected: u64) -> Option<Instant> {
         if collected == 0 {
             return None;
@@ -801,7 +830,7 @@ impl QueryLog {
         // 分配和释放都在锁外：锁里只给序号、换进换出 / Allocating and freeing happen outside the lock:
         // inside it the record only gets its number and is swapped in
         let mut entry = Arc::new(entry);
-        let evicted = {
+        let (evicted, newest) = {
             let mut ring = self.ring.lock();
             ring.newest += 1;
             if let Some(unshared) = Arc::get_mut(&mut entry) {
@@ -813,20 +842,84 @@ impl QueryLog {
                 None
             };
             ring.entries.push_back(entry);
-            evicted
+            (evicted, ring.newest)
         };
         drop(evicted);
+        if newest >= self.wake_at.load(Ordering::Relaxed) {
+            self.arrived.notify_waiters();
+        }
+    }
+
+    /// 续上「面板在取」：没在记的话从现在起接着记 / Renews 「the panel is collecting」: recording resumes now if it had stopped
+    fn renew(&self) {
+        self.collected
+            .store(self.since_epoch_ms().saturating_add(1), Ordering::Release);
+    }
+
+    /// 等到 `after` 之后攒满 `limit` 条，或者过了 `wait`：面板这样等着取，流量一来就取走，交接区不会满；空闲时
+    /// 也只隔 `wait` 来一次。游标是别的内核进程的就不等，马上回，面板好早点发现内核换了
+    /// Waits until `limit` records follow `after`, or `wait` has passed: a panel waiting like this takes
+    /// records as soon as traffic brings them, before the ring can fill, and comes only once per
+    /// `wait` while things are quiet. A cursor of another kernel process gets no wait but an answer at
+    /// once, so the panel soon finds out the kernel has changed
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) async fn wait_for_page(
+        &self,
+        after: u64,
+        limit: usize,
+        instance: Option<u64>,
+        wait: Duration,
+    ) {
+        if instance.is_some_and(|instance| instance != self.instance) {
+            return;
+        }
+        self.renew();
+        let target = after.saturating_add(u64::try_from(limit).unwrap_or(u64::MAX));
+        let deadline = tokio::time::Instant::now() + wait;
+        // 等完、或者面板中途断开（这个 future 被丢掉）都算没人等了 / Done waiting, or the panel gone
+        // midway (this future dropped), no one waits any more
+        let _waiting = Waiting(&self.wake_at);
+        loop {
+            // 先登记要等，再看够不够：看完之后到的那一条也叫得醒它
+            // Register to wait before checking: a record arriving right after the check still wakes it
+            let arrived = self.arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            self.wake_at.fetch_min(target, Ordering::Relaxed);
+            if self.ring.lock().newest >= target
+                || tokio::time::timeout_at(deadline, arrived).await.is_err()
+            {
+                break;
+            }
+        }
     }
 
     /// 取走 `after` 之后的记录（最多 `limit` 条），同时续上「面板在取」，返回 JSON 文本（不先建中间的 JSON 树）。
+    /// `instance` 是游标所属的内核进程：是这个进程的，`after` 及以前的面板就已经存好了（游标在写好以后才往前挪），
+    /// 删掉。没说是哪个进程的（面板在探是哪个进程，或者面板不认 `querylog_wait_v1`）、或是别的进程的游标，一条不删
     /// Takes the records after `after` (at most `limit`), renews 「the panel is collecting」, and returns
-    /// the JSON text (without building an intermediate JSON tree first).
+    /// the JSON text (without building an intermediate JSON tree first). `instance` is the kernel process
+    /// the cursor belongs to: if it is this one, the panel has stored everything up to `after` (its cursor
+    /// moves only once that is done), which is deleted. A cursor of no stated process (the panel probing
+    /// which process this is, or one that does not know `querylog_wait_v1`) or of another one deletes
+    /// nothing
     #[cfg_attr(not(unix), allow(dead_code))]
-    pub(crate) fn collect(&self, after: u64, limit: usize, protocol_version: u8) -> String {
-        self.collected
-            .store(self.since_epoch_ms().saturating_add(1), Ordering::Release);
-        let (entries, oldest, newest) = {
-            let ring = self.ring.lock();
+    pub(crate) fn collect(
+        &self,
+        after: u64,
+        limit: usize,
+        instance: Option<u64>,
+        protocol_version: u8,
+    ) -> String {
+        self.renew();
+        let stored_here = instance == Some(self.instance);
+        let (entries, oldest, newest, stored) = {
+            let mut ring = self.ring.lock();
+            // 存好的锁外再释放 / What is stored is freed outside the lock
+            let mut stored = Vec::new();
+            while stored_here && ring.entries.front().is_some_and(|entry| entry.seq <= after) {
+                stored.extend(ring.entries.pop_front());
+            }
             let oldest = ring.entries.front().map(|entry| entry.seq);
             // 交接区里的序号是连续的（只从头上丢），所以 `after` 之后的第一条就在 `after - oldest + 1`
             // The ring's numbers are contiguous (it only drops from the front), so the first record
@@ -842,8 +935,9 @@ impl QueryLog {
                 .take(limit)
                 .cloned()
                 .collect();
-            (entries, oldest, ring.newest)
+            (entries, oldest, ring.newest, stored)
         };
+        drop(stored);
         // 交接区空了（清空过，或从没记过）时，游标之后、到最新序号为止的都已不在
         // With the ring empty (emptied, or never written), everything after the cursor up to the newest
         // number is gone
@@ -1250,7 +1344,13 @@ mod tests {
     }
 
     fn page(log: &QueryLog, after: u64, limit: usize) -> Value {
-        serde_json::from_str(&log.collect(after, limit, 1)).expect("a page is JSON")
+        serde_json::from_str(&log.collect(after, limit, None, 1)).expect("a page is JSON")
+    }
+
+    /// 带着这个内核进程的游标来取的一页 / A page taken with a cursor of this kernel process
+    fn page_of_this_run(log: &QueryLog, after: u64, limit: usize) -> Value {
+        serde_json::from_str(&log.collect(after, limit, Some(log.instance), 1))
+            .expect("a page is JSON")
     }
 
     /// 面板来取一次（开始记），返回取到的记录 / The panel collects once (which starts recording) and
@@ -1430,20 +1530,149 @@ mod tests {
         }
     }
 
+    /// 内核一启动就记：开机时内核比面板先起来，面板头一次来取时那几秒的查询都在
+    /// Recording starts with the kernel: at boot the kernel comes up before the panel, and the
+    /// queries of those seconds are there when the panel first collects
     #[test]
-    fn nothing_is_recorded_until_the_panel_collects() {
+    fn recording_starts_with_the_kernel() {
         let log = QueryLog::default();
+        assert!(log.recording(), "before any collection");
         let ok = response(ResponseCode::NoError, &[]);
-        let request = ctx(1);
-        log.request_started(&request, false);
-        finish(&log, &request, RequestStatus::Completed, Some(&ok));
-        assert!(entries(&log).is_empty());
+        for id in 1..=2 {
+            let request = ctx(id);
+            log.request_started(&request, false);
+            finish(&log, &request, RequestStatus::Completed, Some(&ok));
+        }
+        assert_eq!(entries(&log).len(), 2);
+    }
 
-        // 取过一次以后才开始记 / Recording starts once the panel has collected
-        let request = ctx(2);
-        log.request_started(&request, false);
-        finish(&log, &request, RequestStatus::Completed, Some(&ok));
-        assert_eq!(entries(&log).len(), 1);
+    /// 内核启动两分钟里面板一直没来：照样停记，和面板走了以后一样
+    /// No panel within two minutes of start-up: recording stops, as after a panel has gone
+    #[test]
+    fn without_a_panel_recording_stops_two_minutes_after_start_up() {
+        let log = started_three_minutes_ago();
+        assert!(!log.recording());
+        assert_eq!(log.collected.load(Relaxed), 0);
+    }
+
+    fn quick_answers(log: &QueryLog, ids: std::ops::RangeInclusive<u64>) {
+        let ok = response(ResponseCode::NoError, &[]);
+        for id in ids {
+            let request = ctx(id);
+            log.request_started(&request, false);
+            finish(log, &request, RequestStatus::Completed, Some(&ok));
+        }
+    }
+
+    /// 等着取：交接区里已经够一页就不等 / Waiting to collect: with a page already in the ring there is no wait
+    #[tokio::test]
+    async fn a_full_page_is_taken_without_waiting() {
+        let log = QueryLog::default();
+        quick_answers(&log, 1..=5);
+        let started = tokio::time::Instant::now();
+        log.wait_for_page(0, 5, None, Duration::from_secs(5)).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(log.wake_at.load(Relaxed), u64::MAX, "no one waits any more");
+    }
+
+    /// 攒不满一页时等着，攒满的那一刻就回，不等到时限
+    /// Short of a page it waits, and returns the moment the page fills rather than at the deadline
+    #[tokio::test]
+    async fn a_waiting_panel_is_woken_when_the_page_fills() {
+        let log = std::sync::Arc::new(QueryLog::default());
+        quick_answers(&log, 1..=2);
+        let filling = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            quick_answers(&filling, 3..=4);
+        });
+        let started = tokio::time::Instant::now();
+        log.wait_for_page(0, 4, Some(log.instance), Duration::from_secs(5))
+            .await;
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        assert_eq!(seqs(&page(&log, 0, 4)), [1, 2, 3, 4]);
+    }
+
+    /// 面板等到一半断开了：也算没人等了，之后的记录不再去叫它 / The panel gone midway through a wait no
+    /// longer counts as waiting, and later records do not try to wake it
+    #[tokio::test]
+    async fn a_wait_given_up_midway_is_no_longer_waiting() {
+        let log = QueryLog::default();
+        let given_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            log.wait_for_page(0, 5, None, Duration::from_secs(5)),
+        )
+        .await;
+        assert!(given_up.is_err());
+        assert_eq!(log.wake_at.load(Relaxed), u64::MAX);
+    }
+
+    /// 游标是别的内核进程的：不等，马上回 / A cursor of another kernel process: no wait, an answer at once
+    #[tokio::test]
+    async fn a_cursor_of_another_run_is_answered_at_once() {
+        let log = QueryLog::default();
+        let started = tokio::time::Instant::now();
+        log.wait_for_page(0, 5, Some(log.instance + 1), Duration::from_secs(5))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// 一直攒不满就到时限回，交来手上有的；只差几条的到来不会把它提前叫醒
+    /// Never filling, it returns at the deadline with what there is; records short of the page do not
+    /// wake it early
+    #[tokio::test]
+    async fn a_waiting_panel_returns_at_the_deadline() {
+        let log = std::sync::Arc::new(QueryLog::default());
+        let trickle = std::sync::Arc::clone(&log);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            quick_answers(&trickle, 1..=1);
+        });
+        let started = tokio::time::Instant::now();
+        log.wait_for_page(0, 100, None, Duration::from_millis(400))
+            .await;
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(400), "{waited:?}");
+        assert_eq!(seqs(&page(&log, 0, 100)), [1]);
+    }
+
+    /// 面板带着这个内核进程的游标来取：`after` 说明之前的都存好了，删掉，交接区平时几乎是空的。还没取的照留
+    /// The panel takes with a cursor of this kernel process: its `after` says everything before is
+    /// stored, which is deleted, so the ring is nearly empty most of the time. What has not been taken
+    /// stays
+    #[test]
+    fn what_the_panel_has_stored_is_deleted() {
+        let log = QueryLog::default();
+        cancelled(&log, 1..=5);
+        assert_eq!(seqs(&page_of_this_run(&log, 0, 10)), [1, 2, 3, 4, 5]);
+        assert_eq!(
+            log.ring.lock().entries.len(),
+            5,
+            "taking deletes nothing yet"
+        );
+        let next = page_of_this_run(&log, 3, 10);
+        assert_eq!(seqs(&next), [4, 5]);
+        assert_eq!(next["missed"], 0, "deleted after storing is no gap");
+        assert_eq!(log.ring.lock().entries.len(), 2);
+        assert!(seqs(&page_of_this_run(&log, 5, 10)).is_empty());
+        assert!(log.ring.lock().entries.is_empty());
+    }
+
+    /// 没说游标是哪个进程的（面板在探，或者面板是旧的），或者游标是别的进程的（内核重启了，面板还拿着上一个进程的
+    /// 游标）：都不是存好了什么，一条不删
+    /// A cursor of no stated process (the panel probing, or an older panel) or of another one (the kernel
+    /// restarted and the panel still holds the last process's cursor) says nothing was stored: nothing
+    /// is deleted
+    #[test]
+    fn only_a_cursor_of_this_run_deletes() {
+        let log = QueryLog::default();
+        cancelled(&log, 1..=3);
+        let _ = page(&log, 3, 10);
+        let _ = page(&log, u64::MAX / 2, 1);
+        let _ = log.collect(3, 10, Some(log.instance + 1), 1);
+        assert_eq!(seqs(&page(&log, 0, 10)), [1, 2, 3]);
     }
 
     #[test]

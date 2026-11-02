@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use anyhow::Context;
@@ -862,7 +862,8 @@ impl PanelMetrics {
                 "config_static_cname_response_v1",
                 "metrics_upstream_precision_v1",
                 "metrics_upstream_response_latency_v1",
-                "querylog_v1"
+                "querylog_v1",
+                "querylog_wait_v1"
             ],
         })
     }
@@ -1544,17 +1545,7 @@ async fn handle_request(
                 error_json("stats_query_invalid", message),
             ),
         },
-        (&Method::GET, "/v1/querylog") => match parse_querylog_query(request.uri().query()) {
-            Ok((after, limit)) => text_response(
-                StatusCode::OK,
-                "application/json; charset=utf-8",
-                metrics.query_log.collect(after, limit, PROTOCOL_VERSION),
-            ),
-            Err(message) => json_response(
-                StatusCode::BAD_REQUEST,
-                error_json("querylog_query_invalid", message),
-            ),
-        },
+        (&Method::GET, "/v1/querylog") => querylog_response(&metrics, request.uri().query()).await,
         (&Method::POST, "/v1/stats/clear") => {
             metrics.clear_stats();
             json_response(
@@ -2119,13 +2110,72 @@ fn parse_stats_query(query: Option<&str>) -> Result<(u64, usize), &'static str> 
     Ok((window_seconds, limit))
 }
 
-/// 查询日志的游标：`after` 是面板已经取到的最后一个序号（从没取过是 0），`limit` 默认取满一页
-/// The query log cursor: `after` is the last sequence number the panel has taken (0 before the first),
-/// and `limit` defaults to a full page
+/// 交出一页查询日志：给了 `wait_ms` 先等着（见 `QueryLog::wait_for_page`），再在阻塞线程上拼 JSON——几千条
+/// 要几毫秒，不能占着答 DNS 的线程
+/// Hands over a page of the query log: with `wait_ms` it first waits (see
+/// `QueryLog::wait_for_page`), then builds the JSON on a blocking thread, as thousands of records
+/// take milliseconds that must not hold up a thread answering DNS
 #[cfg(unix)]
-fn parse_querylog_query(query: Option<&str>) -> Result<(u64, usize), &'static str> {
-    let mut after = 0u64;
-    let mut limit = panel_querylog::MAX_PAGE;
+async fn querylog_response(
+    metrics: &Arc<PanelMetrics>,
+    query: Option<&str>,
+) -> Response<Full<Bytes>> {
+    let take = match parse_querylog_query(query) {
+        Ok(take) => take,
+        Err(message) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                error_json("querylog_query_invalid", message),
+            );
+        }
+    };
+    if !take.wait.is_zero() {
+        metrics
+            .query_log
+            .wait_for_page(take.after, take.limit, take.instance, take.wait)
+            .await;
+    }
+    let collecting = Arc::clone(metrics);
+    match tokio::task::spawn_blocking(move || {
+        collecting
+            .query_log
+            .collect(take.after, take.limit, take.instance, PROTOCOL_VERSION)
+    })
+    .await
+    {
+        Ok(page) => text_response(StatusCode::OK, "application/json; charset=utf-8", page),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("querylog_failed", &error.to_string()),
+        ),
+    }
+}
+
+/// 面板来取一页查询日志 / One take of the query log by the panel
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QueryLogTake {
+    /// 面板已经取到的最后一个序号，从没取过是 0 / The last sequence number the panel has taken, 0 before the first
+    after: u64,
+    /// 最多取几条，默认取满一页 / At most how many records, a full page by default
+    limit: usize,
+    /// 游标是哪个内核进程的（见 `QueryLog::collect`）/ The kernel process the cursor belongs to (see `QueryLog::collect`)
+    instance: Option<u64>,
+    /// 攒不满一页时最多等多久（见 `QueryLog::wait_for_page`）/ How long to wait at most while a page has not filled
+    /// (see `QueryLog::wait_for_page`)
+    wait: Duration,
+}
+
+/// 查询日志的游标：`after`、`limit`、`instance`、`wait_ms`，含义见 [`QueryLogTake`]
+/// The query log cursor: `after`, `limit`, `instance` and `wait_ms`, as described at [`QueryLogTake`]
+#[cfg(unix)]
+fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static str> {
+    let mut take = QueryLogTake {
+        after: 0,
+        limit: panel_querylog::MAX_PAGE,
+        instance: None,
+        wait: Duration::ZERO,
+    };
     for pair in query.into_iter().flat_map(|query| query.split('&')) {
         if pair.is_empty() {
             continue;
@@ -2134,17 +2184,24 @@ fn parse_querylog_query(query: Option<&str>) -> Result<(u64, usize), &'static st
             return Err("查询参数格式无效");
         };
         match key {
-            "after" => after = value.parse().map_err(|_| "游标无效")?,
+            "after" => take.after = value.parse().map_err(|_| "游标无效")?,
             "limit" => {
-                limit = value.parse().map_err(|_| "条数无效")?;
-                if !(1..=panel_querylog::MAX_PAGE).contains(&limit) {
+                take.limit = value.parse().map_err(|_| "条数无效")?;
+                if !(1..=panel_querylog::MAX_PAGE).contains(&take.limit) {
                     return Err("条数必须在 1 到 2000 之间");
+                }
+            }
+            "instance" => take.instance = Some(value.parse().map_err(|_| "内核进程无效")?),
+            "wait_ms" => {
+                take.wait = Duration::from_millis(value.parse().map_err(|_| "等待时间无效")?);
+                if take.wait > panel_querylog::MAX_WAIT {
+                    return Err("等待时间不能超过 5000 毫秒");
                 }
             }
             _ => return Err("包含不受支持的查询参数"),
         }
     }
-    Ok((after, limit))
+    Ok(take)
 }
 
 #[cfg(unix)]
@@ -3670,20 +3727,44 @@ mod diagnostic_tests {
 
     #[test]
     fn health_declares_the_query_log() {
-        assert!(capabilities().iter().any(|name| name == "querylog_v1"));
+        for capability in ["querylog_v1", "querylog_wait_v1"] {
+            assert!(
+                capabilities().iter().any(|name| name == capability),
+                "{capability}"
+            );
+        }
     }
 
     #[test]
     fn the_query_log_cursor_is_checked() {
         use super::parse_querylog_query;
+        use std::time::Duration;
+        let take = |after, limit, instance, wait| super::QueryLogTake {
+            after,
+            limit,
+            instance,
+            wait,
+        };
         assert_eq!(
             parse_querylog_query(None),
-            Ok((0, crate::panel_querylog::MAX_PAGE))
+            Ok(take(
+                0,
+                crate::panel_querylog::MAX_PAGE,
+                None,
+                Duration::ZERO
+            ))
         );
         assert_eq!(
             parse_querylog_query(Some("after=42&limit=10")),
-            Ok((42, 10))
+            Ok(take(42, 10, None, Duration::ZERO))
         );
+        assert_eq!(
+            parse_querylog_query(Some("after=42&limit=10&instance=7&wait_ms=5000")),
+            Ok(take(42, 10, Some(7), Duration::from_secs(5)))
+        );
+        assert!(parse_querylog_query(Some("instance=")).is_err());
+        assert!(parse_querylog_query(Some("wait_ms=5001")).is_err());
+        assert!(parse_querylog_query(Some("wait_ms=soon")).is_err());
         assert!(parse_querylog_query(Some("limit=0")).is_err());
         assert!(parse_querylog_query(Some("limit=2001")).is_err());
         assert!(parse_querylog_query(Some("after=-1")).is_err());
@@ -3767,7 +3848,9 @@ mod diagnostic_tests {
             }),
             Arc::clone(&metrics),
         );
-        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+        let _ = metrics
+            .query_log
+            .collect(0, 10, None, super::PROTOCOL_VERSION);
         let client = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
         for name in ["denied.example", "rescued.example", "moved.example"] {
             let (packet, _) = diagnostic_packet(name, "A").expect("packet");
@@ -3775,9 +3858,13 @@ mod diagnostic_tests {
         }
         task.abort();
 
-        let page: serde_json::Value =
-            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
-                .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&metrics.query_log.collect(
+            0,
+            10,
+            None,
+            super::PROTOCOL_VERSION,
+        ))
+        .unwrap();
         let entries = page["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 3, "{page}");
         let (denied, rescued, moved) = (&entries[0], &entries[1], &entries[2]);
@@ -3806,6 +3893,58 @@ mod diagnostic_tests {
         assert_eq!(moved["pipeline"], "local");
     }
 
+    /// 控制口交出的一页：JSON 文本 / A page the control socket hands over, as JSON
+    async fn querylog_page(metrics: &Arc<PanelMetrics>, query: &str) -> serde_json::Value {
+        let response = super::querylog_response(metrics, Some(query)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// 面板等着取：一页攒不满时控制口先挂着，查询一到就交出去；不带 `wait_ms` 时照旧马上回，拿着别的内核进程的
+    /// 游标也马上回。下次带着这个进程的游标来取，之前的就删了
+    /// A waiting panel: short of a page the control socket holds the request and hands the query over
+    /// as soon as it arrives; without `wait_ms` it answers at once as before, and so it does for a
+    /// cursor of another kernel process. The next take with a cursor of this process deletes what came
+    /// before
+    #[tokio::test]
+    async fn the_control_socket_holds_a_query_log_take_until_records_arrive() {
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(client_split_config("192.168.1.0/24"), Arc::clone(&metrics));
+        let started = std::time::Instant::now();
+        let empty = querylog_page(&metrics, "after=0&limit=1").await;
+        assert_eq!(empty["entries"], json!([]));
+        let instance = empty["instance"].as_u64().expect("instance");
+        let other_run = format!("after=0&limit=1&instance={}&wait_ms=4000", instance + 1);
+        let _ = querylog_page(&metrics, &other_run).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let (packet, _) = diagnostic_packet("nas.example", "A").expect("packet");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let home = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
+            engine.handle_packet(&packet, home).await.expect("query");
+        });
+        let started = std::time::Instant::now();
+        let this_run = format!("after=0&limit=1&instance={instance}&wait_ms=4000");
+        let page = querylog_page(&metrics, &this_run).await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "{waited:?}"
+        );
+        assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
+        assert_eq!(page["entries"][0]["qname"], "nas.example");
+
+        let _ = querylog_page(&metrics, &format!("after=1&limit=1&instance={instance}")).await;
+        let from_the_start = querylog_page(&metrics, "after=0&limit=1").await;
+        assert_eq!(from_the_start["entries"], json!([]), "stored, so deleted");
+        assert_eq!(from_the_start["missed"], 1);
+    }
+
     /// 真引擎走一遍：面板取过一次以后，普通查询进日志（谁问的、哪条规则、回了什么），诊断查询不进
     /// Through a real engine: once the panel has collected, a normal query is recorded (who asked,
     /// which rule, what came back) and a diagnostic query is not
@@ -3814,7 +3953,9 @@ mod diagnostic_tests {
         let metrics = Arc::new(PanelMetrics::new(false));
         let engine = engine_for(client_split_config("192.168.1.0/24"), Arc::clone(&metrics));
         let (packet, record_type) = diagnostic_packet("nas.example", "A").expect("packet");
-        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+        let _ = metrics
+            .query_log
+            .collect(0, 10, None, super::PROTOCOL_VERSION);
 
         let home = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
         engine.handle_packet(&packet, home).await.expect("query");
@@ -3828,9 +3969,13 @@ mod diagnostic_tests {
         )
         .await;
 
-        let page: serde_json::Value =
-            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
-                .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&metrics.query_log.collect(
+            0,
+            10,
+            None,
+            super::PROTOCOL_VERSION,
+        ))
+        .unwrap();
         let entries = page["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 1, "{page}");
         let entry = &entries[0];
@@ -3888,16 +4033,22 @@ mod diagnostic_tests {
     async fn the_query_log_shows_throttled_and_skipped_upstreams() {
         let metrics = Arc::new(PanelMetrics::new(false));
         let (engine, doh) = throttling_engine(&metrics).await;
-        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+        let _ = metrics
+            .query_log
+            .collect(0, 10, None, super::PROTOCOL_VERSION);
         let client = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
         for name in ["first.example", "second.example"] {
             let (packet, _) = diagnostic_packet(name, "A").expect("packet");
             engine.handle_packet(&packet, client).await.expect("query");
         }
 
-        let page: serde_json::Value =
-            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
-                .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&metrics.query_log.collect(
+            0,
+            10,
+            None,
+            super::PROTOCOL_VERSION,
+        ))
+        .unwrap();
         let entries = page["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 2, "{page}");
         let steps_at = |entry: &serde_json::Value| -> Vec<serde_json::Value> {
@@ -4051,14 +4202,20 @@ mod diagnostic_tests {
             }),
             Arc::clone(&metrics),
         );
-        let _ = metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION);
+        let _ = metrics
+            .query_log
+            .collect(0, 10, None, super::PROTOCOL_VERSION);
         let client = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 5353);
         let (packet, _) = diagnostic_packet("broken.example", "A").expect("packet");
         engine.handle_packet(&packet, client).await.expect("query");
 
-        let page: serde_json::Value =
-            serde_json::from_str(&metrics.query_log.collect(0, 10, super::PROTOCOL_VERSION))
-                .unwrap();
+        let page: serde_json::Value = serde_json::from_str(&metrics.query_log.collect(
+            0,
+            10,
+            None,
+            super::PROTOCOL_VERSION,
+        ))
+        .unwrap();
         let entry = &page["entries"][0];
         assert_eq!(entry["answers"], json!(["192.0.2.53"]), "{entry}");
         assert_eq!(entry["pipeline"], "fallback", "{entry}");
