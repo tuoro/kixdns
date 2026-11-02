@@ -444,7 +444,10 @@ pub trait StreamTransport: Send + Sync + 'static {
 pub struct Tcp;
 
 impl StreamTransport for Tcp {
-    type Read = OwnedReadHalf;
+    /// 读回答经过缓冲：一次读进好几条回答，长度前缀和正文不用各读一次系统调用。DoT 的 TLS 流自己有缓冲
+    /// Answers are read through a buffer: one read takes in several answers, and a length
+    /// prefix and its body no longer cost a system call each. DoT's TLS stream buffers on its own
+    type Read = tokio::io::BufReader<OwnedReadHalf>;
     type Write = OwnedWriteHalf;
     type Shared = ();
     const LABEL: &'static str = "tcp";
@@ -455,7 +458,7 @@ impl StreamTransport for Tcp {
         _: &(),
         upstream: &str,
         budget: Duration,
-    ) -> anyhow::Result<(OwnedReadHalf, OwnedWriteHalf)> {
+    ) -> anyhow::Result<(Self::Read, OwnedWriteHalf)> {
         // Establish TCP connection within the budget. Unbounded, a blackholed
         // SYN blocks here until the kernel gives up (minutes) while every
         // other request on this client waits for the lock.
@@ -467,7 +470,8 @@ impl StreamTransport for Tcp {
             Err(_) => anyhow::bail!("tcp connect timeout after {}ms", budget.as_millis()),
         };
         tune_stream_socket(&stream, upstream);
-        Ok(stream.into_split())
+        let (read, write) = stream.into_split();
+        Ok((tokio::io::BufReader::new(read), write))
     }
 }
 
