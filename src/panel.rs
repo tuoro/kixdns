@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use anyhow::Context;
@@ -2163,7 +2163,7 @@ struct QueryLogTake {
     instance: Option<u64>,
     /// 攒不满一页时最多等多久（见 `QueryLog::wait_for_page`）/ How long to wait at most while a page has not filled
     /// (see `QueryLog::wait_for_page`)
-    wait: Duration,
+    wait: std::time::Duration,
 }
 
 /// 查询日志的游标：`after`、`limit`、`instance`、`wait_ms`，含义见 [`QueryLogTake`]
@@ -2174,7 +2174,7 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
         after: 0,
         limit: panel_querylog::MAX_PAGE,
         instance: None,
-        wait: Duration::ZERO,
+        wait: std::time::Duration::ZERO,
     };
     for pair in query.into_iter().flat_map(|query| query.split('&')) {
         if pair.is_empty() {
@@ -2193,7 +2193,8 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
             }
             "instance" => take.instance = Some(value.parse().map_err(|_| "内核进程无效")?),
             "wait_ms" => {
-                take.wait = Duration::from_millis(value.parse().map_err(|_| "等待时间无效")?);
+                take.wait =
+                    std::time::Duration::from_millis(value.parse().map_err(|_| "等待时间无效")?);
                 if take.wait > panel_querylog::MAX_WAIT {
                     return Err("等待时间不能超过 5000 毫秒");
                 }
