@@ -14,7 +14,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
 use tokio::sync::watch;
 
 pub type InflightMap = DashMap<u64, InflightEntry, FxBuildHasher>;
@@ -215,7 +214,7 @@ mod inflight_pending_tests {
 ///
 /// - `Direct`: already has correct TXID and can be sent as-is.
 /// - `CacheHit`: carries cached bytes (with an old TXID) and the request TXID to patch.
-///   Also includes the insertion time, to age its TTLs (RFC 1035 §5.2).
+///   Also includes how long it sat in the cache, to age its TTLs (RFC 1035 §5.2).
 /// - `AsyncNeeded`: cache miss, needs async processing. Contains pre-parsed data to avoid re-parsing.
 #[derive(Debug, Clone)]
 pub enum FastPathResponse {
@@ -223,8 +222,8 @@ pub enum FastPathResponse {
     CacheHit {
         cached: Bytes,
         tx_id: u16,
-        /// Insertion time for TTL calculation / 用于TTL计算的插入时间
-        inserted_at: Instant,
+        /// Whole seconds it sat in the cache, for TTL calculation / 在缓存里停留的整秒数，用于计算 TTL
+        elapsed_secs: u32,
     },
     /// Cache miss, needs async processing, with what the fast path already parsed and the
     /// pipeline it picked, to pass on to `handle_packet_internal_with_pre_parsed`.

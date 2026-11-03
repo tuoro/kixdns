@@ -5,7 +5,7 @@
 //! How each listener builds its SERVFAIL, and what it does under overload, stay with it.
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use tracing::{debug, warn};
@@ -18,13 +18,10 @@ use crate::proto_utils;
 /// 事务 ID 换成这条查询的
 /// Write a cache hit's answer into `buf` (cleared first): its TTLs lowered by the whole
 /// seconds the answer sat in the cache (RFC 1035 §5.2), and the query's transaction ID
-pub fn write_cache_hit(buf: &mut BytesMut, cached: &[u8], tx_id: u16, inserted_at: Instant) {
+pub fn write_cache_hit(buf: &mut BytesMut, cached: &[u8], tx_id: u16, elapsed_secs: u32) {
     buf.clear();
     buf.extend_from_slice(cached);
-    proto_utils::patch_all_ttls(
-        buf,
-        proto_utils::saturating_u64_to_u32(inserted_at.elapsed().as_secs()),
-    );
+    proto_utils::patch_all_ttls(buf, elapsed_secs);
     utils::set_id(buf, tx_id);
 }
 

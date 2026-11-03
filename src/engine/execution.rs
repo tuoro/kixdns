@@ -410,6 +410,7 @@ impl Engine {
     /// 快速路径应答请求的观察者上下文。
     fn fast_path_context<'a>(
         &'a self,
+        started: Instant,
         peer: SocketAddr,
         qname: &'a str,
         qtype: hickory_proto::rr::RecordType,
@@ -424,6 +425,8 @@ impl Engine {
             qtype,
             qclass,
             background_refresh: false,
+            started,
+            reported_at_once: true,
         }
     }
 
@@ -436,7 +439,6 @@ impl Engine {
     fn observe_fast_path(
         &self,
         observer: &dyn EngineObserver,
-        start: Instant,
         ctx: &RequestContext<'_>,
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
@@ -497,7 +499,7 @@ impl Engine {
         observer.request_finished(
             ctx,
             &RequestOutcome {
-                latency: start.elapsed(),
+                latency: ctx.started.elapsed(),
                 status: if error.is_some() {
                     RequestStatus::Failed
                 } else {
@@ -524,7 +526,10 @@ impl Engine {
         peer: SocketAddr,
     ) -> anyhow::Result<Option<FastPathResponse>> {
         let peer = client_address(peer);
-        let log_start = Instant::now();
+        // 这个请求的时刻只读这一次：查缓存、算 TTL、上报都用它，答完才再读一次算耗时
+        // The request's moment is read once, here: the cache lookup, the TTL and the report all use
+        // it, and only the latency reads the clock again once answered
+        let start = Instant::now();
         // Quick parsing, avoiding full Message parsing and massive allocations / 快速解析，避免完整 Message 解析和大量分配
         // Use stack buffer to avoid String allocation / 使用栈上缓冲区避免 String 分配
         let mut qname_buf = [0u8; 256];
@@ -538,10 +543,7 @@ impl Engine {
         // Observer: requests answered here are reported in one batch at the
         // answering site; requests that fall through are reported by the async path.
         // 观察者：在此应答的请求在应答处一次性上报；回落的请求由异步路径上报。
-        let observed = self
-            .observer
-            .as_deref()
-            .map(|observer| (observer, Instant::now()));
+        let observed = self.observer.as_deref();
 
         // Get pipeline ID / 获取 pipeline ID
         let state = self.state.load_full();
@@ -568,16 +570,8 @@ impl Engine {
         );
 
         // 在这里答上的请求各记一条响应日志 / Each request answered here gets a response record
-        let response_log = || {
-            ResponseLog::new(
-                qname_str,
-                qtype,
-                peer,
-                pipeline_id.clone(),
-                log_start,
-                false,
-            )
-        };
+        let response_log =
+            || ResponseLog::new(qname_str, qtype, peer, pipeline_id.clone(), start, false);
 
         // RFC 6891 第 6.1.3 节：不支持请求的 EDNS 版本时回 BADVERS，而不是照版本 0 去答
         // RFC 6891 section 6.1.3: an unsupported EDNS version is answered BADVERS rather
@@ -587,8 +581,8 @@ impl Engine {
                 crate::proto_utils::badvers_response(packet).context("build BADVERS response")?,
                 packet,
             );
-            if let Some((observer, start)) = observed {
-                let ctx = self.fast_path_context(peer, qname_str, qtype, qclass);
+            if let Some(observer) = observed {
+                let ctx = self.fast_path_context(start, peer, qname_str, qtype, qclass);
                 observer.request_started(&ctx);
                 observer.request_finished(
                     &ctx,
@@ -627,7 +621,6 @@ impl Engine {
             &requester_key,
         );
 
-        let now = Instant::now();
         if let Some(hit) = self.cache_get(
             slot,
             &view,
@@ -637,11 +630,11 @@ impl Engine {
                 qtype: u16::from(qtype),
                 flags: q.flags,
             },
-            now,
+            start,
         ) {
             // Check if expired / 检查是否已过期
             let elapsed_secs = crate::proto_utils::saturating_u64_to_u32(
-                now.saturating_duration_since(hit.inserted_at).as_secs(),
+                start.saturating_duration_since(hit.inserted_at).as_secs(),
             );
             if elapsed_secs >= hit.original_ttl {
                 // An expired answer is left to the async path, whose lookup picks this
@@ -721,11 +714,10 @@ impl Engine {
                     },
                     packet,
                 );
-                if let Some((observer, start)) = observed {
+                if let Some(observer) = observed {
                     self.observe_fast_path(
                         observer,
-                        start,
-                        &self.fast_path_context(peer, qname_str, qtype, qclass),
+                        &self.fast_path_context(start, peer, qname_str, qtype, qclass),
                         &pipeline_id,
                         FastPathAnswer::Cache {
                             original_ttl: hit.original_ttl,
@@ -744,7 +736,7 @@ impl Engine {
                     FastPathResponse::CacheHit {
                         cached: reply,
                         tx_id: q.tx_id,
-                        inserted_at: hit.inserted_at,
+                        elapsed_secs,
                     }
                 }));
             }
@@ -766,11 +758,10 @@ impl Engine {
                             packet,
                         )
                     });
-            if let Some((observer, start)) = observed {
+            if let Some(observer) = observed {
                 self.observe_fast_path(
                     observer,
-                    start,
-                    &self.fast_path_context(peer, qname_str, qtype, qclass),
+                    &self.fast_path_context(start, peer, qname_str, qtype, qclass),
                     &pipeline_id,
                     answer,
                     built.as_deref(),
@@ -1174,8 +1165,9 @@ impl Engine {
                     qtype,
                     qclass,
                     background_refresh,
+                    started: start,
+                    reported_at_once: false,
                 },
-                start,
             )
         });
         let observed_ctx = observed
@@ -4776,6 +4768,52 @@ mod tests {
             stored_at: Instant::now(),
             fetched_at: Instant::now(),
         })
+    }
+
+    /// 快速路径交出的是应答在缓存里实际停留的整秒数，写出去的 TTL 按它调低（RFC 1035 §5.2）
+    /// The fast path hands over the whole seconds the answer really sat in the cache, and the TTLs
+    /// written are lowered by them (RFC 1035 §5.2)
+    #[tokio::test]
+    async fn a_fast_path_hit_ages_its_ttls_by_its_time_in_the_cache() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, Record};
+
+        let engine = engine_from_json(serde_json::json!({
+            "settings": { "default_upstream": DEAD_UPSTREAM },
+            "pipelines": []
+        }));
+        let name = Name::from_ascii("stale.com.").unwrap();
+        let mut answer = Message::new(0, MessageType::Response, OpCode::Query);
+        answer.add_query(Query::query(name.clone(), RecordType::A));
+        let address = std::net::Ipv4Addr::new(192, 0, 2, 66);
+        answer.add_answer(Record::from_rdata(name, 300, RData::A(A(address))));
+        let entry = Arc::new(CacheEntry {
+            bytes: Bytes::from(answer.to_vec().unwrap()),
+            inserted_at: Instant::now() - Duration::from_secs(30),
+            original_ttl: 300,
+            refresh_ttl: 300,
+            ..(*stale_entry("default")).clone()
+        });
+        engine.cache_insert(stale_com_keys(&engine).slot, entry);
+        // RD 置位，和 `QueryFlags::RECURSIVE` 一样 / RD set, as in `QueryFlags::RECURSIVE`
+        let mut packet = stale_com_query();
+        packet[2] = 0x01;
+        let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
+        let Ok(Some(FastPathResponse::CacheHit {
+            cached,
+            tx_id,
+            elapsed_secs,
+        })) = engine.handle_packet_fast(&packet, peer)
+        else {
+            panic!("a fresh answer in the cache is a fast-path hit");
+        };
+        assert!((30..=31).contains(&elapsed_secs), "{elapsed_secs}");
+        let mut written = bytes::BytesMut::new();
+        crate::engine::write_cache_hit(&mut written, &cached, tx_id, elapsed_secs);
+        let written = Message::from_vec(&written).unwrap();
+        assert_eq!(written.metadata.id, 0xAABB);
+        assert_eq!(written.answers[0].ttl, 300 - elapsed_secs);
     }
 
     /// 两个请求同时问 `stale.com`，缓存里都没有；先到的那个转发，上游不应答。这期间缓存里有了一条

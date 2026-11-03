@@ -175,6 +175,7 @@ pub(crate) struct QueryLog {
     /// event returns after one atomic load
     pending_count: AtomicUsize,
     ring: Mutex<Ring>,
+    wall: WallClock,
 }
 
 /// 交接区：编好的记录首尾相接放在一块内存里，序号连续（只从头上丢），最后一条是 `newest`。放一条只是复制这几十上百
@@ -363,6 +364,10 @@ enum StepKind {
 /// of pulling a structure spread over several places from another core
 struct Pending {
     started: Instant,
+    /// 这个请求答完才一次性上报（见 [`RequestContext::reported_at_once`]）：几步的时刻说明不了什么，不为它们读钟
+    /// The request is reported at once after answering (see [`RequestContext::reported_at_once`]): the steps' times
+    /// say nothing, and the clock is not read for them
+    at_once: bool,
     time_unix_ms: u64,
     client: IpAddr,
     transport: Option<ClientTransport>,
@@ -642,12 +647,12 @@ impl<'a> Decoder<'a> {
 impl Pending {
     /// 这个请求的记录：接着用这个线程上一个请求用完的那份，没有才分配 / This request's record: the one the
     /// last request on this thread finished with, or a new one when there is none
-    fn start(ctx: &RequestContext<'_>, started: Instant) -> Box<Self> {
+    fn start(ctx: &RequestContext<'_>, time_unix_ms: u64) -> Box<Self> {
         let client = ctx.client.ip().to_canonical();
-        let time_unix_ms = unix_ms();
         let Some(mut pending) = SPARE.with_borrow_mut(Option::take) else {
             return Box::new(Self {
-                started,
+                started: ctx.started,
+                at_once: ctx.reported_at_once,
                 time_unix_ms,
                 client,
                 transport: ctx.transport,
@@ -663,7 +668,8 @@ impl Pending {
                 answered_by: None,
             });
         };
-        pending.started = started;
+        pending.started = ctx.started;
+        pending.at_once = ctx.reported_at_once;
         pending.time_unix_ms = time_unix_ms;
         pending.client = client;
         pending.transport = ctx.transport;
@@ -1133,7 +1139,11 @@ impl Pending {
             self.steps_truncated = true;
             return;
         }
-        let at_us = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let at_us = if self.at_once {
+            0
+        } else {
+            u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        };
         self.steps.push(Step { at_us, what });
     }
 }
@@ -1161,6 +1171,7 @@ impl QueryLog {
             overflow_len: AtomicUsize::new(0),
             pending_count: AtomicUsize::new(0),
             ring: Mutex::new(Ring::new(RING_BYTES)),
+            wall: WallClock::default(),
         }
     }
 
@@ -1174,27 +1185,22 @@ impl QueryLog {
 
     #[cfg(test)]
     fn recording(&self) -> bool {
-        self.recording_after(self.collected.load(Ordering::Acquire))
-            .is_some()
+        self.recording_after(self.collected.load(Ordering::Acquire), Instant::now())
     }
 
-    /// 面板最近两分钟来取过（内核刚启动也算一次）。时钟只在记着的时候读；超过两分钟就停下并清空交接区
-    /// （序号照旧往后数，面板回来时从空缺看出漏了几条），之后的请求又只读那一个数。停下用比较交换：同时来取的
-    /// 面板赢。`collected` 是刚读到的那个数。在记时给出为此读到的时刻，请求的起点就用它，不再读一次时钟
-    /// The panel collected within the last two minutes (start-up counting as one). The clock is read
-    /// only while recording; past two minutes recording stops and the ring is emptied (numbering
-    /// carries on, so a returning panel sees from the gap how many it missed), and later requests read
-    /// the one number again. Stopping uses compare-and-exchange, so a collection arriving at the same
-    /// moment wins. `collected` is the value just read. While recording, gives the moment read for it,
-    /// which serves as the request's start instead of reading the clock again
-    fn recording_after(&self, collected: u64) -> Option<Instant> {
+    /// 面板最近两分钟来取过（内核刚启动也算一次）。超过两分钟就停下并清空交接区（序号照旧往后数，面板回来时从空缺
+    /// 看出漏了几条）。停下用比较交换：同时来取的面板赢。`collected` 是刚读到的那个数，`now` 是这个请求的时刻
+    /// The panel collected within the last two minutes (start-up counting as one). Past two minutes
+    /// recording stops and the ring is emptied (numbering carries on, so a returning panel sees from the
+    /// gap how many it missed). Stopping uses compare-and-exchange, so a collection arriving at the same
+    /// moment wins. `collected` is the value just read and `now` the request's moment
+    fn recording_after(&self, collected: u64, now: Instant) -> bool {
         if collected == 0 {
-            return None;
+            return false;
         }
-        let now = Instant::now();
         let idle = self.ms_since_epoch(now).saturating_sub(collected - 1);
         if idle < u64::try_from(IDLE_AFTER.as_millis()).unwrap_or(u64::MAX) {
-            return Some(now);
+            return true;
         }
         // 交换失败：要么面板刚来取过（接着记），要么别的请求已经停下了（不记）
         // The exchange failed: either the panel just collected (keep recording) or another request
@@ -1203,10 +1209,10 @@ impl QueryLog {
             self.collected
                 .compare_exchange(collected, 0, Ordering::AcqRel, Ordering::Acquire)
         {
-            return (current != 0).then_some(now);
+            return current != 0;
         }
         self.ring.lock().clear();
-        None
+        false
     }
 
     #[inline]
@@ -1239,14 +1245,14 @@ impl QueryLog {
         if ctx.background_refresh || diagnostic {
             return;
         }
-        let Some(started) = self.recording_after(self.collected.load(Ordering::Acquire)) else {
+        if !self.recording_after(self.collected.load(Ordering::Acquire), ctx.started) {
             return;
-        };
+        }
         if self.pending_count.load(Ordering::Relaxed) >= self.max_pending {
             self.untracked.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let pending = Pending::start(ctx, started);
+        let pending = Pending::start(ctx, self.wall.unix_ms_at(ctx.started));
         // 同一个请求号又开始一次时替换掉原来那条，不多算一条（和原先用共享表时一样）
         // The same request number starting again replaces its record without counting another (as
         // when a shared map held them all)
@@ -1903,6 +1909,51 @@ fn clip_owned(text: String) -> String {
     }
 }
 
+/// 墙上时钟，由请求手里的单调时刻推算：每个请求都读一次墙上时钟太贵。每秒和系统对一次，系统时间被调过时最多错一秒
+/// The wall clock worked out from the monotonic moment a request already holds: reading it for every
+/// request costs too much. It is checked against the system once a second, so a change of the system time
+/// is wrong for at most a second
+pub(crate) struct WallClock {
+    epoch: Instant,
+    /// `epoch` 那一刻的墙上时间 / The wall time at `epoch`
+    at_epoch_ms: AtomicU64,
+    /// 下回对时的时刻，自 `epoch` 起的毫秒数 / When to check next, in milliseconds since `epoch`
+    check_at_ms: AtomicU64,
+}
+
+impl Default for WallClock {
+    fn default() -> Self {
+        Self {
+            epoch: Instant::now(),
+            at_epoch_ms: AtomicU64::new(0),
+            check_at_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl WallClock {
+    #[inline]
+    pub(crate) fn unix_ms_at(&self, now: Instant) -> u64 {
+        let since = u64::try_from(now.saturating_duration_since(self.epoch).as_millis())
+            .unwrap_or(u64::MAX);
+        if since >= self.check_at_ms.load(Ordering::Relaxed) {
+            self.check();
+        }
+        self.at_epoch_ms
+            .load(Ordering::Relaxed)
+            .saturating_add(since)
+    }
+
+    #[cold]
+    fn check(&self) {
+        let since = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.at_epoch_ms
+            .store(unix_ms().saturating_sub(since), Ordering::Relaxed);
+        self.check_at_ms
+            .store(since.saturating_add(1_000), Ordering::Relaxed);
+    }
+}
+
 fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1916,7 +1967,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::str::FromStr;
     use std::sync::atomic::Ordering::Relaxed;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
     use hickory_proto::rr::rdata::A;
@@ -1924,8 +1975,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CAPACITY, ConfigName, KNOWN_NAMES, MAX_ANSWERS, MAX_PAGE, MAX_STEPS, MAX_TEXT,
-        PENDING_SLOTS, QueryLog, clip, read_response, read_whole_response,
+        CAPACITY, ConfigName, IDLE_AFTER, KNOWN_NAMES, MAX_ANSWERS, MAX_PAGE, MAX_STEPS, MAX_TEXT,
+        PENDING_SLOTS, QueryLog, WallClock, clip, read_response, read_whole_response, unix_ms,
     };
     use crate::config::Transport;
     use crate::observe::{
@@ -1944,6 +1995,8 @@ mod tests {
             qtype: RecordType::A,
             qclass: DNSClass::IN,
             background_refresh: false,
+            started: Instant::now(),
+            reported_at_once: false,
         }
     }
 
@@ -2077,7 +2130,7 @@ mod tests {
     /// milliseconds after that start, so 1 means it was three minutes ago
     fn started_three_minutes_ago() -> QueryLog {
         QueryLog {
-            epoch: std::time::Instant::now()
+            epoch: Instant::now()
                 .checked_sub(Duration::from_secs(180))
                 .expect("the monotonic clock goes back three minutes"),
             ..QueryLog::default()
@@ -2087,6 +2140,104 @@ mod tests {
     fn page(log: &QueryLog, after: u64, limit: usize) -> Value {
         serde_json::from_str(&log.collect(after, limit, None, None, None, 1))
             .expect("a page is JSON")
+    }
+
+    /// 给的时刻往后几秒，算出来的墙上时间也往后几秒，不用读系统时间
+    /// A moment some seconds on gives a wall time the same seconds on, with no read of the system time
+    #[test]
+    fn the_wall_clock_is_worked_out_from_the_moment_given() {
+        let clock = WallClock::default();
+        let now = Instant::now();
+        let at = clock.unix_ms_at(now);
+        assert!(unix_ms().abs_diff(at) < 2_000, "{at}");
+        clock.check_at_ms.store(u64::MAX, Relaxed);
+        clock.at_epoch_ms.fetch_add(7, Relaxed);
+        assert_eq!(clock.unix_ms_at(now + Duration::from_secs(10)), at + 10_007);
+    }
+
+    /// 起点早就过了也一样，算出来的还是现在 / An epoch long past changes nothing: what comes out is still now
+    #[test]
+    fn the_wall_clock_holds_for_an_epoch_long_past() {
+        let clock = WallClock {
+            epoch: Instant::now() - Duration::from_secs(60),
+            ..WallClock::default()
+        };
+        let at = clock.unix_ms_at(Instant::now());
+        assert!(unix_ms().abs_diff(at) < 2_000, "{at}");
+    }
+
+    /// 系统时间被调过：一秒之内不再对时，过了一秒就对上了
+    /// The system time changed: it is not checked again within the second, and it matches after that
+    #[test]
+    fn the_wall_clock_catches_a_changed_system_time_after_a_second() {
+        const DAY_MS: u64 = 86_400_000;
+        let clock = WallClock::default();
+        let now = Instant::now();
+        clock.unix_ms_at(now);
+        clock.at_epoch_ms.fetch_sub(DAY_MS, Relaxed);
+        assert!(unix_ms().abs_diff(clock.unix_ms_at(now)) > DAY_MS / 2);
+        let later = clock.unix_ms_at(now + Duration::from_secs(2));
+        assert!(unix_ms().abs_diff(later) < 10_000, "{later}");
+    }
+
+    /// 记录的时刻来自引擎读到的那一刻，不再读一次钟
+    /// A record's time comes from the moment the engine read, with no other read of the clock
+    #[test]
+    fn a_record_is_timed_from_the_moment_the_engine_read() {
+        let log = QueryLog::default();
+        let request = RequestContext {
+            started: Instant::now() + Duration::from_secs(60),
+            ..ctx(1)
+        };
+        log.request_started(&request, false);
+        finish(&log, &request, RequestStatus::Completed, None);
+        let time = entries(&log)[0]["time_unix_ms"].as_u64().unwrap();
+        assert!((unix_ms() + 60_000).abs_diff(time) < 10_000, "{time}");
+    }
+
+    /// 是否还在记也按引擎读到的那一刻算 / Whether recording goes on is judged by that moment too
+    #[test]
+    fn whether_to_record_is_judged_by_the_moment_the_engine_read() {
+        let log = QueryLog::default();
+        let request = RequestContext {
+            started: Instant::now() + IDLE_AFTER + Duration::from_secs(60),
+            ..ctx(1)
+        };
+        log.request_started(&request, false);
+        finish(&log, &request, RequestStatus::Completed, None);
+        assert!(entries(&log).is_empty());
+    }
+
+    /// 答完才一次性上报的请求，几步的时刻都记 0，不为它们读钟；边走边报的照旧记真实的时刻。两种请求在同一个线程上
+    /// 接着用同一份记录，上一个的这两项不能留下
+    /// A request reported at once has 0 for each step's time, with no clock read for them; a request
+    /// reported as it goes keeps the real times. Both reuse one record on this thread, and the last request's
+    /// two items must not stay
+    #[test]
+    fn only_a_request_reported_at_once_goes_without_the_steps_times() {
+        let log = QueryLog::default();
+        let at_once = RequestContext {
+            started: Instant::now(),
+            reported_at_once: true,
+            ..ctx(1)
+        };
+        let as_it_goes = RequestContext {
+            started: Instant::now() - Duration::from_millis(50),
+            reported_at_once: false,
+            ..ctx(2)
+        };
+        for request in [&at_once, &as_it_goes, &at_once] {
+            log.request_started(request, false);
+            log.pipeline_selected(request, "main");
+            finish(&log, request, RequestStatus::Completed, None);
+        }
+        let at_us: Vec<u64> = entries(&log)
+            .iter()
+            .map(|entry| entry["steps"][0]["at_us"].as_u64().unwrap())
+            .collect();
+        assert_eq!(at_us[0], 0);
+        assert!(at_us[1] >= 50_000, "{at_us:?}");
+        assert_eq!(at_us[2], 0);
     }
 
     /// 带着这个内核进程的游标来取的一页 / A page taken with a cursor of this kernel process
@@ -2931,7 +3082,7 @@ mod tests {
         #[test]
         fn an_encoded_record_reads_only_whole() {
             let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-            let pending = Pending::start(&super::ctx(1), Instant::now());
+            let pending = Pending::start(&super::ctx(1), 1_792_065_600_123);
             let response = reply(&mut rng);
             let finished = RequestOutcome {
                 latency: Duration::from_micros(900),
@@ -3002,6 +3153,7 @@ mod tests {
             };
             let mut pending = Pending {
                 started: Instant::now(),
+                at_once: false,
                 time_unix_ms: rng.number(),
                 client,
                 transport: rng.maybe(|rng| rng.pick(&transports)),
@@ -3130,6 +3282,7 @@ mod tests {
         fn the_binary_page_is_fixed_byte_for_byte() {
             let hit = Pending {
                 started: Instant::now(),
+                at_once: false,
                 time_unix_ms: 1_792_065_600_123,
                 client: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
                 transport: Some(ClientTransport::Udp),
@@ -3646,7 +3799,7 @@ mod tests {
         let log = started_three_minutes_ago();
         // 读到的还是三分钟前那次，另一个请求已经把它停了 / What it read is the collection three
         // minutes ago, and another request has already stopped recording
-        assert!(log.recording_after(1).is_none());
+        assert!(!log.recording_after(1, Instant::now()));
     }
 
     #[test]

@@ -365,10 +365,10 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
         Ok(Some(FastPathResponse::CacheHit {
             cached,
             tx_id,
-            inserted_at,
+            elapsed_secs,
         })) => {
             let mut answer = bytes::BytesMut::new();
-            write_cache_hit(&mut answer, &cached, tx_id, inserted_at);
+            write_cache_hit(&mut answer, &cached, tx_id, elapsed_secs);
             return answer.freeze();
         }
         Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => Some(pre_parsed),

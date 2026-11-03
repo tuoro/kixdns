@@ -1004,8 +1004,8 @@ impl UdpAnswering<'_> {
             Ok(Some(FastPathResponse::CacheHit {
                 cached,
                 tx_id,
-                inserted_at,
-            })) => write_cache_hit(reply, &cached, tx_id, inserted_at),
+                elapsed_secs,
+            })) => write_cache_hit(reply, &cached, tx_id, elapsed_secs),
             Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                 // 缓存未命中，使用预解析的数据避免重复解析 / Cache miss, use pre-parsed data to avoid re-parsing
                 let packet = Bytes::copy_from_slice(packet);
@@ -1387,9 +1387,9 @@ async fn serve_tcp_conn(
                 Ok(Some(FastPathResponse::CacheHit {
                     cached,
                     tx_id,
-                    inserted_at,
+                    elapsed_secs,
                 })) => {
-                    write_cache_hit(&mut hit, &cached, tx_id, inserted_at);
+                    write_cache_hit(&mut hit, &cached, tx_id, elapsed_secs);
                     queue_tcp_answer(&mut answers, &hit);
                     None
                 }
