@@ -195,18 +195,10 @@ impl Engine {
                 let min_ttl = answers.iter().map(|r| r.ttl).min();
                 min_ttl.map(|t| Duration::from_secs(t as u64))
             }
-            Decision::Forward {
-                response_matchers,
-                response_actions_on_match,
-                response_actions_on_miss,
-                ..
-            } => {
+            Decision::Forward { response_phase, .. } => {
                 // If it has response-phase logic, it is not "static" in the user's terms.
                 // It should expire based on the configured min_ttl.
-                if !response_matchers.is_empty()
-                    || !response_actions_on_match.is_empty()
-                    || !response_actions_on_miss.is_empty()
-                {
+                if response_phase.is_some() {
                     Some(Duration::from_secs(state.pipeline.settings.min_ttl as u64))
                 } else {
                     // 只受 `RULE_CACHE_MAX_AGE` 限制 / Bounded by `RULE_CACHE_MAX_AGE` alone
@@ -457,9 +449,7 @@ impl Engine {
                     let d = Decision::Forward {
                         upstream: merged.upstream_str.clone(),
                         pre_split_upstreams: Some(merged.upstream_list.clone()),
-                        response_matchers: rule.response_matchers.clone(),
-                        response_actions_on_match: rule.response_actions_on_match.clone(),
-                        response_actions_on_miss: rule.response_actions_on_miss.clone(),
+                        response_phase: rule.response_phase.clone(),
                         rule_name: rule.name.clone(),
                         transport: None, // Each upstream decides its own transport / 每个 upstream 自行决定 transport
                         ecs: merged.ecs.clone(),
@@ -501,9 +491,7 @@ impl Engine {
                             let d = Decision::Forward {
                                 upstream: state.pipeline.settings.default_upstream_arc(),
                                 pre_split_upstreams: None,
-                                response_matchers: Vec::new(),
-                                response_actions_on_match: Vec::new(),
-                                response_actions_on_miss: Vec::new(),
+                                response_phase: None,
                                 rule_name: rule.name.clone(),
                                 transport: Some(Transport::Udp),
                                 ecs: None,
@@ -533,9 +521,7 @@ impl Engine {
                             let d = Decision::Forward {
                                 upstream: upstream_addr,
                                 pre_split_upstreams: pre_split_upstreams.clone(),
-                                response_matchers: rule.response_matchers.clone(),
-                                response_actions_on_match: rule.response_actions_on_match.clone(),
-                                response_actions_on_miss: rule.response_actions_on_miss.clone(),
+                                response_phase: rule.response_phase.clone(),
                                 rule_name: rule.name.clone(),
                                 transport: Some(transport.unwrap_or(Transport::Udp)),
                                 ecs: ecs.clone(),
@@ -984,6 +970,132 @@ mod rule_cache_policy_tests {
         let again = upstream_of("b.other.example");
         assert!(Arc::ptr_eq(&default.0, &again.0));
         assert!(Arc::ptr_eq(&default.1, &again.1));
+    }
+
+    /// 带响应阶段的转发在规则缓存里按 min_ttl 过期，min_ttl 为 0 时不缓存；没有响应阶段的只受
+    /// `RULE_CACHE_MAX_AGE` 限制
+    /// A forward with a response phase lasts min_ttl in the rule cache and is not cached at a
+    /// min_ttl of 0; one without is bounded by `RULE_CACHE_MAX_AGE` alone
+    #[tokio::test]
+    async fn a_forward_with_a_response_phase_lasts_min_ttl_in_the_rule_cache() {
+        let lasts = |min_ttl: u64, response_phase: bool| {
+            let mut rule = serde_json::json!({
+                "name": "www",
+                "matchers": [{ "type": "domain_regex", "value": "^www\\." }],
+                "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
+            });
+            if response_phase {
+                rule["response_actions_on_miss"] = serde_json::json!([{ "type": "allow" }]);
+            }
+            let engine = engine_from(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": min_ttl },
+                "pipelines": [{ "id": "main", "rules": [rule] }]
+            }));
+            let state = engine.state.load_full();
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "www.example.com",
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            let before = Instant::now();
+            engine.apply_rules(&state, &state.pipeline.pipelines[0], &request);
+            engine.rule_cache.values().first().map(|record| {
+                let expires = record.entry.expires_at.expect("every decision expires");
+                expires.saturating_duration_since(before).as_secs_f64()
+            })
+        };
+        assert_eq!(lasts(0, true), None, "not cached");
+        let thirty = lasts(30, true).expect("cached");
+        assert!((29.0..31.0).contains(&thirty), "{thirty}");
+        for min_ttl in [0, 30] {
+            let bounded = lasts(min_ttl, false).expect("cached");
+            let longest = RULE_CACHE_MAX_AGE.as_secs_f64();
+            assert!(
+                (longest - 1.0..longest + 1.0).contains(&bounded),
+                "{bounded}"
+            );
+        }
+    }
+
+    /// 规则的决策共用它的响应阶段，每次决策不再复制匹配器和动作；响应阶段里只要有一样，决策就带上；
+    /// 什么都没有的规则，决策什么都不带
+    /// A rule's decisions share its response phase instead of copying the matchers and actions;
+    /// a decision carries it when any part is written, and nothing for a rule with none
+    #[tokio::test]
+    async fn decisions_share_their_rules_response_phase() {
+        let forward = serde_json::json!([{ "type": "forward", "upstream": "127.0.0.1:10" }]);
+        let any = serde_json::json!([{ "type": "any" }]);
+        let allow = serde_json::json!([{ "type": "allow" }]);
+        let engine = engine_from(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "main",
+                "rules": [
+                    {
+                        "name": "plain",
+                        "matchers": [{ "type": "domain_suffix", "value": "plain.example" }],
+                        "actions": forward
+                    },
+                    {
+                        "name": "matchers",
+                        "matchers": [{ "type": "domain_suffix", "value": "matchers.example" }],
+                        "actions": forward,
+                        "response_matchers": [{ "type": "response_type", "value": "A" }]
+                    },
+                    {
+                        "name": "on_match",
+                        "matchers": [{ "type": "domain_suffix", "value": "on-match.example" }],
+                        "actions": forward,
+                        "response_actions_on_match": allow
+                    },
+                    {
+                        "name": "on_miss",
+                        "matchers": any,
+                        "actions": forward,
+                        "response_actions_on_miss": allow
+                    }
+                ]
+            }]
+        }));
+        let state = engine.state.load_full();
+        let pipeline = &state.pipeline.pipelines[0];
+        let phase_of = |name: &str| {
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            match engine.apply_rules(&state, pipeline, &request) {
+                Decision::Forward { response_phase, .. } => response_phase,
+                _ => panic!("every name here forwards"),
+            }
+        };
+        assert!(phase_of("a.plain.example").is_none(), "nothing written");
+        for (first, second, parts) in [
+            ("a.matchers.example", "b.matchers.example", (1, 0, 0)),
+            ("a.on-match.example", "b.on-match.example", (0, 1, 0)),
+            ("a.other.example", "b.other.example", (0, 0, 1)),
+        ] {
+            let phase = phase_of(first).expect("something written");
+            assert!(Arc::ptr_eq(&phase, &phase_of(second).unwrap()), "{first}");
+            assert_eq!(
+                (
+                    phase.matchers.len(),
+                    phase.on_match.len(),
+                    phase.on_miss.len()
+                ),
+                parts,
+                "{first}"
+            );
+        }
     }
 
     /// 过期的决策不拿来用；重新求值后原地写回，访问计数还在，也就还留在淘汰队列原来的位置

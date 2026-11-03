@@ -27,7 +27,7 @@ use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::{InflightCleanupGuard, parse_rcode, set_id};
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
-use crate::matcher::{Requester, RequesterKey, RuntimePipeline};
+use crate::matcher::{Requester, RequesterKey, ResponsePhase, RuntimePipeline};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -39,9 +39,7 @@ pub enum Decision {
         upstream: Arc<str>,
         /// Pre-split upstream list (performance optimization) / 预分割的 upstream 列表（性能优化）
         pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
-        response_matchers: Vec<RuntimeResponseMatcherWithOp>,
-        response_actions_on_match: Vec<Action>,
-        response_actions_on_miss: Vec<Action>,
+        response_phase: Option<Arc<ResponsePhase>>,
         rule_name: Arc<str>,
         transport: Option<Transport>, // None means each upstream decides itself (via protocol prefix) / None 表示每个 upstream 自己决定（通过协议前缀）
         /// EDNS Client Subnet (RFC 7871) request rewriting mode / EDNS 客户端子网 (RFC 7871) 请求改写模式
@@ -64,9 +62,7 @@ impl Decision {
         Decision::Forward {
             upstream: settings.default_upstream_arc(),
             pre_split_upstreams: settings.default_upstream_pre_split.clone(),
-            response_matchers: Vec::new(),
-            response_actions_on_match: Vec::new(),
-            response_actions_on_miss: Vec::new(),
+            response_phase: None,
             rule_name: Arc::clone(&DEFAULT_RULE_NAME),
             transport: Some(Transport::Udp),
             ecs: None,
@@ -880,14 +876,14 @@ pub(crate) async fn process_response_jump(
             Decision::Forward {
                 upstream,
                 pre_split_upstreams,
-                response_matchers,
-                response_actions_on_match,
-                response_actions_on_miss,
+                response_phase,
                 rule_name,
                 transport,
                 ecs: _,
                 allow_reuse,
             } => {
+                let (response_matchers, response_actions_on_match, response_actions_on_miss) =
+                    ResponsePhase::parts(response_phase.as_deref());
                 response.upstream = Some(upstream.clone());
                 // A reused answer is in the trail already / 复用的应答已经记在 trail 里
                 let mut reused = false;
@@ -979,10 +975,10 @@ pub(crate) async fn process_response_jump(
                     .await
                 };
                 // As in handle_forward_decision_logged / 同 handle_forward_decision_logged
-                let resp = check_failure_reply(resp, &response_actions_on_match, |msg| {
+                let resp = check_failure_reply(resp, response_actions_on_match, |msg| {
                     response_matches(
                         engine,
-                        &response_matchers,
+                        response_matchers,
                         &upstream,
                         qname,
                         qtype,
@@ -1007,7 +1003,7 @@ pub(crate) async fn process_response_jump(
 
                         let resp_match_ok = response_matches(
                             engine,
-                            &response_matchers,
+                            response_matchers,
                             &upstream,
                             qname,
                             qtype,
@@ -1020,7 +1016,7 @@ pub(crate) async fn process_response_jump(
                             &rule_name,
                             response_matchers.len(),
                             resp_match_ok,
-                            &response_actions_on_match,
+                            response_actions_on_match,
                         );
                         let actions_to_run = if resp_match_ok {
                             &response_actions_on_match
