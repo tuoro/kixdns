@@ -48,6 +48,143 @@ pub(crate) fn build_fast_static_response(
     Ok(Bytes::from(out))
 }
 
+/// `static_ip_response` 答的 TTL / The TTL a `static_ip_response` answers with
+const STATIC_IP_TTL: u32 = 300;
+
+/// 写进静态应答的地址 / The addresses to write into a static answer
+#[derive(Clone, Copy)]
+pub(crate) enum StaticAddresses<'a> {
+    /// 配置里的地址，按问的类型挑 / Addresses from the config, picked by the type asked
+    Configured(&'a [IpAddr], RecordType),
+    /// 规则求值时做好的记录 / Records the rule evaluation has made
+    Records(&'a [Record]),
+}
+
+/// 把静态应答直接写成字节：报文头，照抄查询的问题段，每条地址一条指回问题名的记录。写出来和
+/// [`build_fast_static_response`] 经 `reply_as_asked` 规整之后的一字不差，只是不必为每个查询解析名字、搭一份报文再编码。
+/// 写不了的交回 None，由 [`build_fast_static_response`] 去写：问题名压缩过、根名（根名的记录不用指针）、名字超长、
+/// 响应码要 OPT 才写得下，或者记录不是这个问题名的 A、AAAA
+/// Writes a static answer directly as bytes: the header, the query's question section as it is, and for
+/// each address a record pointing back at the question name. What comes out is, byte for byte, what
+/// [`build_fast_static_response`] makes once `reply_as_asked` has shaped it, without reading a name and
+/// putting a message together to encode for every query. What it cannot write gives None and goes to
+/// [`build_fast_static_response`]: a compressed question name, the root (whose records use no pointer), a
+/// name too long, a response code that needs an OPT, or records other than this question name's A and AAAA
+pub(crate) fn write_static_reply(
+    query: &[u8],
+    rcode: ResponseCode,
+    addresses: StaticAddresses<'_>,
+) -> Option<Bytes> {
+    const MAX_NAME: usize = 255;
+    /// 报文头 / The header
+    const QUESTION_AT: usize = 12;
+    /// 指针、类型、类别、TTL、RDATA 长度，加上 IPv6 地址 / The pointer, type, class, TTL and RDATA length, and an
+    /// IPv6 address
+    const LONGEST_RECORD: usize = 2 + 2 + 2 + 4 + 2 + 16;
+    let rcode = u8::try_from(u16::from(rcode))
+        .ok()
+        .filter(|rcode| *rcode < 16)?;
+    let name_end = crate::proto_utils::question_name_end(query)?;
+    let name_len = name_end - QUESTION_AT;
+    if name_len <= 1 || name_len > MAX_NAME {
+        return None;
+    }
+    let question = query.get(QUESTION_AT..name_end + 4)?;
+    let records = match addresses {
+        StaticAddresses::Configured(addresses, _) => addresses.len(),
+        StaticAddresses::Records(records) => records.len(),
+    };
+    let mut reply = Vec::with_capacity(QUESTION_AT + question.len() + records * LONGEST_RECORD);
+    reply.extend_from_slice(&query[..2]);
+    // 回答、RD 和 CD 照抄查询、可递归 / A response, RD and CD as the query has them, recursion available
+    reply.extend_from_slice(&[
+        0x80 | (query[2] & 0x01),
+        0x80 | (query[3] & 0x10) | rcode,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    reply.extend_from_slice(question);
+    let mut written = 0u16;
+    match addresses {
+        StaticAddresses::Configured(addresses, qtype) => {
+            for address in addresses {
+                match (qtype, address) {
+                    (RecordType::A | RecordType::ANY, IpAddr::V4(address)) => {
+                        push_address(&mut reply, RecordType::A, STATIC_IP_TTL, &address.octets());
+                    }
+                    (RecordType::AAAA | RecordType::ANY, IpAddr::V6(address)) => {
+                        push_address(
+                            &mut reply,
+                            RecordType::AAAA,
+                            STATIC_IP_TTL,
+                            &address.octets(),
+                        );
+                    }
+                    _ => continue,
+                }
+                written += 1;
+            }
+        }
+        StaticAddresses::Records(records) => {
+            for record in records {
+                if record.dns_class != DNSClass::IN
+                    || !is_question_name(&record.name, &query[QUESTION_AT..name_end])
+                {
+                    return None;
+                }
+                match &record.data {
+                    RData::A(A(address)) => {
+                        push_address(&mut reply, RecordType::A, record.ttl, &address.octets());
+                    }
+                    RData::AAAA(AAAA(address)) => {
+                        push_address(&mut reply, RecordType::AAAA, record.ttl, &address.octets());
+                    }
+                    _ => return None,
+                }
+                written += 1;
+            }
+        }
+    }
+    reply[6..8].copy_from_slice(&written.to_be_bytes());
+    Some(Bytes::from(reply))
+}
+
+/// 一条地址记录：主人是指回问题名的指针 / An address record, its owner a pointer back at the question name
+fn push_address(reply: &mut Vec<u8>, kind: RecordType, ttl: u32, address: &[u8]) {
+    reply.extend_from_slice(&[0xC0, 0x0C]);
+    reply.extend_from_slice(&u16::from(kind).to_be_bytes());
+    reply.extend_from_slice(&u16::from(DNSClass::IN).to_be_bytes());
+    reply.extend_from_slice(&ttl.to_be_bytes());
+    reply.extend_from_slice(
+        &u16::try_from(address.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes(),
+    );
+    reply.extend_from_slice(address);
+}
+
+/// `name` 就是线上这个（没压缩的）问题名，不分大小写 / `name` is this uncompressed question name on the wire,
+/// whatever the case
+fn is_question_name(name: &Name, mut wire: &[u8]) -> bool {
+    for label in name.iter() {
+        let Some((&len, rest)) = wire.split_first() else {
+            return false;
+        };
+        let len = usize::from(len);
+        if len != label.len() || rest.len() < len || !rest[..len].eq_ignore_ascii_case(label) {
+            return false;
+        }
+        wire = &rest[len..];
+    }
+    wire == [0]
+}
+
 pub(crate) fn make_static_ip_answer(
     qname: &str,
     qtype: RecordType,
@@ -70,7 +207,7 @@ pub(crate) fn make_static_ip_answer(
             (RecordType::AAAA | RecordType::ANY, IpAddr::V6(v6)) => Some(RData::AAAA(AAAA(v6))),
             _ => None,
         })
-        .map(|rdata| Record::from_rdata(name.clone(), 300, rdata))
+        .map(|rdata| Record::from_rdata(name.clone(), STATIC_IP_TTL, rdata))
         .collect();
 
     (ResponseCode::NoError, answers)

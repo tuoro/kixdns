@@ -69,7 +69,7 @@ pub use types::{EngineInner, FastPathResponse};
 
 pub use response::{extract_ttl, extract_ttl_for_refresh};
 pub(crate) use response::{
-    make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
+    make_static_cname_answer, make_static_ip_answer, make_static_txt_answer, static_ips,
 };
 pub use rules::Decision;
 pub use utils::engine_helpers;

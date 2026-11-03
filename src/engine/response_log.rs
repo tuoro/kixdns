@@ -66,6 +66,12 @@ impl<'a> ResponseLog<'a> {
         }
     }
 
+    /// 这条日志会写下来；不写的话不必为它准备什么 / This record will be written; otherwise nothing need be
+    /// prepared for it
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn answered(&mut self, bytes: &[u8]) {
         if !self.enabled {
             return;

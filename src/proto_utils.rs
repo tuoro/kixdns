@@ -626,7 +626,7 @@ fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
 /// 第一个问题名（不压缩，从偏移 12 开始）结束的位置；没有问题段时为 None
 /// Where the first question name ends, written uncompressed from offset 12; None
 /// without a question
-fn question_name_end(packet: &[u8]) -> Option<usize> {
+pub(crate) fn question_name_end(packet: &[u8]) -> Option<usize> {
     if packet.len() < 12 || packet[4..6] == [0, 0] {
         return None;
     }
