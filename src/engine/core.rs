@@ -174,7 +174,7 @@ impl Engine {
         listener_label: String,
         observer: Option<Arc<dyn EngineObserver>>,
     ) -> anyhow::Result<Self> {
-        // 响应缓存：容量由配置控制（默认 10000 份应答），最大生存时间由 cache_max_ttl 控制
+        // 响应缓存：容量由配置控制（默认 10000 份，见 `new_cache`），最大生存时间由 cache_max_ttl 控制
         // Response cache: capacity and max age come from the settings
         let running_settings = Arc::new(cfg.settings.clone());
         let settings = Arc::clone(&running_settings);

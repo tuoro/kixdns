@@ -8,9 +8,11 @@
 //! 只记下它的哈希（幽灵队列）；幽灵队列里有的条目再来时直接进主队列。主队列像 CLOCK：读到过的
 //! 计数减一放回队尾，计数为零的淘汰。只问一次的名字因此挤不掉常用的。
 //!
-//! 容量按条目的计重算（响应缓存里是槽位存的应答份数），平分给各分片。条目存了 `max_age` 以上就
-//! 不能再用（见 [`Cached::outlived`]）；写入时每个分片至多每分钟清扫一次，把这样的条目去掉，
-//! 缓存闲下来时内存也会退回去。
+//! 容量按条目的计重算（响应缓存里见 `Arc<CacheSlot>` 的 [`Cached::weight`]），平分给各分片；一个
+//! 分片整个都放不下的条目不存。条目存了 `max_age` 以上就不能再用（见 [`Cached::outlived`]）；写入时
+//! 每个分片每隔 `max_age` 的 1/16（至少一分钟）清扫一轮，把这样的条目去掉，它们占的内存就退回去了，
+//! 分片自己的表和队列则按用过的最大量留着。一轮清扫分到多次写入里做，每次至多走
+//! `SWEEP_PLACES` 个位置，不会长时间占着写锁。
 //!
 //! The store under the response cache: a sharded hash table with S3-FIFO eviction.
 //!
@@ -29,11 +31,14 @@
 //! last turn has its count lowered and goes to the back, one at zero is evicted.
 //! Names asked once therefore cannot push out the ones in regular use.
 //!
-//! Capacity counts entry weights (in the response cache, the answers a slot holds)
-//! and is split evenly across the shards. An entry stored `max_age` or longer ago
-//! can no longer serve (see [`Cached::outlived`]); on writes each shard sweeps such
-//! entries out at most once a minute, so memory also goes back down once the cache
-//! goes quiet.
+//! Capacity counts entry weights (in the response cache, see [`Cached::weight`] of
+//! `Arc<CacheSlot>`) and is split evenly across the shards; an entry too heavy for a
+//! whole shard is not stored. An entry stored `max_age` or longer ago can no longer
+//! serve (see [`Cached::outlived`]); on writes each shard sweeps such entries out
+//! once every sixteenth of `max_age` (at least a minute), which gives their memory
+//! back, while the shard's own table and queues stay at the most they ever used. A
+//! round of sweeping is spread over writes, at most `SWEEP_PLACES` places each, so
+//! it never holds the write lock for long.
 
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, RandomState};
@@ -68,8 +73,15 @@ const MIN_SHARD_CAPACITY: u64 = 64;
 const MAX_SHARDS: u64 = 64;
 /// 访问计数的上限 / Cap on the access count
 const MAX_FREQ: u8 = 3;
-/// 一个分片两次清扫之间至少隔多久 / The least time between two sweeps of one shard
+/// 一个分片两轮清扫之间至少隔多久 / The least time between two rounds of sweeping one shard
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// 条目能存 `max_age` 时，这段时间里清扫几轮：能存一天的条目不必每分钟查一遍
+/// Rounds of sweeping per `max_age`: entries that may stay a day need no look every minute
+const SWEEPS_PER_MAX_AGE: u32 = 16;
+/// 一次写入至多替清扫走这么多个位置，冷的时候不到 100 µs，分片再大也不会更久地占着写锁
+/// The most places one write walks for the sweep, under 100 µs when cold, so the write
+/// lock is held no longer however large the shard
+const SWEEP_PLACES: u32 = 256;
 /// 分片号取哈希的这几位：低位留给分片里的桶，最高 7 位是 hashbrown 的标签，两者都要分散
 /// The hash bits that pick the shard: the low bits pick the bucket inside the shard and
 /// the top 7 are hashbrown's tag, and both must stay spread
@@ -85,6 +97,7 @@ pub struct CacheStore<V> {
     shards: Box<[RwLock<Shard<V>>]>,
     hasher: RandomState,
     max_age: Duration,
+    sweep_every: Duration,
 }
 
 impl<V: Cached> CacheStore<V> {
@@ -105,6 +118,7 @@ impl<V: Cached> CacheStore<V> {
                 .collect(),
             hasher: RandomState::new(),
             max_age,
+            sweep_every: SWEEP_EVERY.max(max_age / SWEEPS_PER_MAX_AGE),
         }
     }
 
@@ -134,16 +148,35 @@ impl<V: Cached> CacheStore<V> {
         let (hash, shard) = self.locate(key);
         let mut shard = shard.write();
         let now = Instant::now();
-        if now.saturating_duration_since(shard.swept_at) >= SWEEP_EVERY {
-            shard.sweep(self.max_age, now);
+        if shard.sweeping.is_none()
+            && now.saturating_duration_since(shard.swept_at) >= self.sweep_every
+        {
+            shard.swept_at = now;
+            shard.sweeping = Some(0);
+        }
+        if shard.sweeping.is_some() {
+            shard.sweep_some(self.max_age, now);
         }
         let found = shard.find(hash, key);
         let current = found.and_then(|index| shard.nodes[index as usize].value.as_ref());
         match (f(current), found) {
             (Op::Nop, _) | (Op::Remove, None) => {}
             (Op::Remove, Some(index)) => shard.remove(index),
-            (Op::Put(value), Some(index)) => shard.replace(index, value),
-            (Op::Put(value), None) => shard.insert(hash, key, value),
+            (Op::Put(value), found) => {
+                let weight = value.weight().max(1);
+                // 整个分片都放不下：存了也会马上淘汰，还要先把别的条目都挤掉。这个键原来的值已经不对了，也去掉
+                // Too heavy for the whole shard: stored, it would soon go, after pushing out
+                // all the others first. The key's old value is out of date by now and goes too
+                if u64::from(weight) > shard.capacity {
+                    if let Some(index) = found {
+                        shard.remove(index);
+                    }
+                } else if let Some(index) = found {
+                    shard.replace(index, value, weight);
+                } else {
+                    shard.insert(hash, key, value, weight);
+                }
+            }
         }
     }
 
@@ -157,12 +190,15 @@ impl<V: Cached> CacheStore<V> {
         self.compute(key, |_| Op::Remove);
     }
 
-    /// 去掉所有条目 / Remove every entry
+    /// 去掉所有条目。旧条目在写锁外释放，读这个分片的请求不用等 / Remove every entry. The old entries
+    /// are freed outside the write lock, so requests reading the shard do not wait for it
     pub fn invalidate_all(&self) {
         for shard in self.shards.iter() {
             let mut shard = shard.write();
             let (capacity, swept_at) = (shard.capacity, shard.swept_at);
-            *shard = Shard::new(capacity, swept_at);
+            let old = std::mem::replace(&mut *shard, Shard::new(capacity, swept_at));
+            drop(shard);
+            drop(old);
         }
     }
 
@@ -180,6 +216,15 @@ impl<V: Cached> CacheStore<V> {
                 shard.small_weight + shard.main_weight
             })
             .sum()
+    }
+
+    /// 测试用：`key` 的访问计数，读它不算一次访问 / For tests: the access count of `key`, not counting as an access
+    #[cfg(test)]
+    pub(crate) fn access_count(&self, key: u64) -> Option<u8> {
+        let (hash, shard) = self.locate(key);
+        let shard = shard.read();
+        let index = shard.find(hash, key)?;
+        Some(shard.nodes[index as usize].freq.load(Ordering::Relaxed))
     }
 
     /// 测试用：存着的所有值 / For tests: every stored value
@@ -243,6 +288,8 @@ struct Shard<V> {
     dead: u64,
     capacity: u64,
     swept_at: Instant,
+    /// 这一轮清扫走到了哪个位置；None：这一轮走完了 / The place this round of sweeping has got to; None: the round is over
+    sweeping: Option<u32>,
 }
 
 impl<V: Cached> Shard<V> {
@@ -262,6 +309,7 @@ impl<V: Cached> Shard<V> {
             dead: 0,
             capacity,
             swept_at,
+            sweeping: None,
         }
     }
 
@@ -278,8 +326,7 @@ impl<V: Cached> Shard<V> {
         }
     }
 
-    fn insert(&mut self, hash: u64, key: u64, value: V) {
-        let weight = value.weight().max(1);
+    fn insert(&mut self, hash: u64, key: u64, value: V, weight: u32) {
         // 幽灵队列记得的直接进主队列 / One the ghost queue remembers goes straight to the main queue
         let queue = match self.ghost.find_entry(hash, |&(ghost, _)| ghost == hash) {
             Ok(entry) => {
@@ -318,8 +365,7 @@ impl<V: Cached> Shard<V> {
         self.evict();
     }
 
-    fn replace(&mut self, index: u32, value: V) {
-        let weight = value.weight().max(1);
+    fn replace(&mut self, index: u32, value: V, weight: u32) {
         let node = &mut self.nodes[index as usize];
         let (queue, old) = (node.queue, node.weight);
         node.value = Some(value);
@@ -449,10 +495,18 @@ impl<V: Cached> Shard<V> {
         }
     }
 
-    /// 去掉存了 `max_age` 以上的条目 / Remove the entries stored `max_age` or longer ago
-    fn sweep(&mut self, max_age: Duration, now: Instant) {
-        self.swept_at = now;
-        for index in 0..self.nodes.len() as u32 {
+    /// 这一轮清扫接着走至多 `SWEEP_PLACES` 个位置，去掉存了 `max_age` 以上的条目
+    /// Walk on at most `SWEEP_PLACES` places of this round of sweeping, removing the
+    /// entries stored `max_age` or longer ago
+    #[cold]
+    #[inline(never)]
+    fn sweep_some(&mut self, max_age: Duration, now: Instant) {
+        let Some(start) = self.sweeping else {
+            return;
+        };
+        let places = self.nodes.len() as u32;
+        let end = start.saturating_add(SWEEP_PLACES).min(places);
+        for index in start..end {
             if self.nodes[index as usize]
                 .value
                 .as_ref()
@@ -461,6 +515,7 @@ impl<V: Cached> Shard<V> {
                 self.remove(index);
             }
         }
+        self.sweeping = (end < places).then_some(end);
     }
 
     #[cfg(test)]
@@ -756,6 +811,218 @@ mod tests {
         put(&store, 3, value(3));
         assert!(store.get(1).is_none(), "swept out");
         assert!(store.get(2).is_some() && store.get(3).is_some());
+        store.check();
+    }
+
+    /// 存了 `age` 的值 / A value stored `age` ago
+    fn aged(id: u64, age: Duration) -> Value {
+        Value {
+            id,
+            weight: 1,
+            stored_at: Instant::now() - age,
+        }
+    }
+
+    /// 一轮清扫走完整个分片，但每次至多走 `SWEEP_PLACES` 个位置
+    /// A round of sweeping covers the whole shard, at most `SWEEP_PLACES` places at a time
+    #[test]
+    fn a_round_of_sweeping_walks_a_limited_stretch_at_a_time() {
+        let (max_age, now) = (Duration::from_secs(30), Instant::now());
+        let count = u64::from(SWEEP_PLACES) * 2 + 10;
+        let mut shard = Shard::new(count, now);
+        for key in 0..count {
+            shard.insert(key, key, aged(key, Duration::from_secs(40)), 1);
+        }
+        shard.sweeping = Some(0);
+        shard.sweep_some(max_age, now);
+        assert_eq!(shard.live, count - u64::from(SWEEP_PLACES));
+        assert_eq!(shard.sweeping, Some(SWEEP_PLACES));
+        shard.sweep_some(max_age, now);
+        assert_eq!(shard.live, 10);
+        assert_eq!(shard.sweeping, Some(SWEEP_PLACES * 2));
+        shard.sweep_some(max_age, now);
+        assert_eq!(shard.live, 0);
+        assert_eq!(shard.sweeping, None, "the round is over");
+        shard.check();
+        // 这一轮结束了就不再走 / A round that is over walks no further
+        shard.insert(1, 1, aged(1, Duration::from_secs(40)), 1);
+        shard.sweep_some(max_age, now);
+        assert_eq!(shard.live, 1);
+    }
+
+    /// 第一个分片里存着 `stored` 个已经存过头的条目，再给几个同一分片的键，接下来写入用
+    /// `stored` outlived entries in the first shard, and some more keys of that shard for
+    /// the writes to come
+    fn outlived_in_first_shard(stored: u64) -> (CacheStore<Value>, Vec<u64>) {
+        let store = CacheStore::new(64 * 4 * u64::from(SWEEP_PLACES), Duration::from_secs(30));
+        let mut keys: Vec<u64> = (0u64..)
+            .filter(|key| std::ptr::eq(store.locate(*key).1, &store.shards[0]))
+            .take(stored as usize + 8)
+            .collect();
+        let spare = keys.split_off(stored as usize);
+        for key in keys {
+            put(&store, key, aged(key, Duration::from_secs(40)));
+        }
+        assert_eq!(store.shards[0].read().live, stored, "not time to sweep yet");
+        (store, spare)
+    }
+
+    /// 轮到清扫的写入开始一轮，之后的写入不等下一次轮到就接着走完；走完之后要等下一次轮到才再开始
+    /// The write whose turn has come starts a round and later ones finish it without waiting
+    /// for another turn; once finished, the next round waits for its turn
+    #[test]
+    fn writes_carry_a_round_of_sweeping_through() {
+        let places = u64::from(SWEEP_PLACES);
+        let (store, mut spare) = outlived_in_first_shard(places * 2);
+        let live = || store.shards[0].read().live;
+        let sweeping = || store.shards[0].read().sweeping;
+        store.shards[0].write().swept_at -= SWEEP_EVERY;
+        put(&store, spare.pop().unwrap(), value(0));
+        assert_eq!(live(), places + 1, "started");
+        put(&store, spare.pop().unwrap(), value(0));
+        assert_eq!(live(), 2, "carried on without another turn");
+        // 新条目排在这一轮走到的位置后面，再写一次这一轮才结束 / A new entry sits past where the round has
+        // got to, and one more write ends it
+        assert!(sweeping().is_some());
+        put(&store, spare.pop().unwrap(), value(0));
+        assert_eq!(sweeping(), None, "the round is over");
+        put(&store, spare.pop().unwrap(), value(0));
+        assert_eq!(sweeping(), None, "the next round waits for its turn");
+        store.check();
+    }
+
+    /// 一轮还没走完又轮到了：接着走，不从头来，否则写得慢时这一轮永远走不完
+    /// Another turn coming before a round is over: it carries on rather than starting again,
+    /// or with slow writes the round would never end
+    #[test]
+    fn a_turn_coming_on_the_way_does_not_restart_the_round() {
+        let places = u64::from(SWEEP_PLACES);
+        let (store, mut spare) = outlived_in_first_shard(places * 2);
+        store.shards[0].write().swept_at -= SWEEP_EVERY;
+        put(&store, spare.pop().unwrap(), value(0));
+        assert_eq!(store.shards[0].read().live, places + 1);
+        store.shards[0].write().swept_at -= SWEEP_EVERY;
+        put(&store, spare.pop().unwrap(), value(0));
+        assert_eq!(
+            store.shards[0].read().live,
+            2,
+            "carried on, not from the start"
+        );
+        store.check();
+    }
+
+    /// 条目能存得久的，清扫也隔得久；能存得短的，也至少隔一分钟
+    /// Entries that may stay long are swept less often; those that may not, a minute apart at least
+    #[test]
+    fn the_longer_entries_may_stay_the_less_often_they_are_swept() {
+        let short = CacheStore::<Value>::new(100, Duration::from_secs(30));
+        assert_eq!(short.sweep_every, SWEEP_EVERY);
+        let store = CacheStore::new(100, DAY);
+        assert_eq!(store.sweep_every, DAY / 16);
+        put(&store, 1, aged(1, DAY * 2));
+        store.shards[0].write().swept_at -= SWEEP_EVERY;
+        put(&store, 2, value(2));
+        assert_eq!(store.entry_count(), 2, "a minute is not long enough");
+        store.shards[0].write().swept_at -= DAY / 16;
+        put(&store, 3, value(3));
+        assert!(store.get(1).is_none(), "swept out");
+    }
+
+    /// 清空时旧条目在写锁外释放
+    /// Emptying the cache frees the old entries outside the write lock
+    #[test]
+    fn invalidate_all_frees_the_entries_outside_the_lock() {
+        #[derive(Clone)]
+        struct Probe {
+            store: Arc<std::sync::OnceLock<std::sync::Weak<CacheStore<Probe>>>>,
+            freed: Arc<[std::sync::atomic::AtomicU32; 2]>,
+        }
+        impl Cached for Probe {
+            fn weight(&self) -> u32 {
+                1
+            }
+            fn outlived(&self, _max_age: Duration, _now: Instant) -> bool {
+                false
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                if let Some(store) = self.store.get().and_then(std::sync::Weak::upgrade) {
+                    let locked = store.shards[0].try_read().is_none();
+                    self.freed[usize::from(locked)].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let store = Arc::new(CacheStore::new(8, DAY));
+        let handle = Arc::new(std::sync::OnceLock::new());
+        let freed = Arc::new([const { std::sync::atomic::AtomicU32::new(0) }; 2]);
+        handle.set(Arc::downgrade(&store)).unwrap();
+        for key in 0..8 {
+            let probe = Probe {
+                store: Arc::clone(&handle),
+                freed: Arc::clone(&freed),
+            };
+            store.compute(key, |_| Op::Put(probe));
+        }
+        store.invalidate_all();
+        assert_eq!(store.entry_count(), 0);
+        assert_eq!(
+            freed[0].load(Ordering::Relaxed),
+            8,
+            "freed with the lock free"
+        );
+        assert_eq!(freed[1].load(Ordering::Relaxed), 0, "freed under the lock");
+    }
+
+    /// 整个分片都放不下的不存，也不挤掉别的；正好放得下的存
+    /// One too heavy for the whole shard is not stored and pushes nothing out; one that
+    /// just fits is stored
+    #[test]
+    fn an_entry_too_heavy_for_its_shard_is_not_stored_and_pushes_nothing_out() {
+        let store = CacheStore::new(64, DAY);
+        for key in 0..50 {
+            put(&store, key, value(key));
+        }
+        put(&store, 100, weighted(100, 65));
+        assert!(store.get(100).is_none());
+        assert_eq!(store.entry_count(), 50);
+        put(&store, 1, weighted(1, 65));
+        assert!(
+            store.get(1).is_none(),
+            "the old value is out of date by now"
+        );
+        assert_eq!(store.entry_count(), 49);
+        store.check();
+        put(&store, 100, weighted(100, 64));
+        assert_eq!(store.get(100).map(|value| value.weight), Some(64));
+        store.check();
+    }
+
+    /// 写回一个还在的键：留在原来的队列，访问计数也不变（规则缓存的决策过期后就这样写回）
+    /// Writing over a key still there keeps its queue and its access count (the way a rule
+    /// cache decision is written back once it has expired)
+    #[test]
+    fn writing_over_an_entry_keeps_its_queue_and_access_count() {
+        let store = CacheStore::new(64, DAY);
+        put(&store, 0, value(0));
+        store.get(0);
+        store.get(0);
+        // 小队列满了，读到过的这个进主队列 / The small queue fills up and this one, read since, goes to the main queue
+        for key in 1..=64 {
+            put(&store, key, value(key));
+        }
+        let state = || {
+            let mut shard = store.shards[0].write();
+            let index = shard.find(store.locate(0).0, 0).unwrap();
+            let node = &mut shard.nodes[index as usize];
+            (node.queue, *node.freq.get_mut())
+        };
+        assert_eq!(state().0, Queue::Main);
+        store.get(0);
+        let before = state();
+        put(&store, 0, value(100));
+        assert_eq!(state(), before);
+        assert_eq!(store.get(0).map(|value| value.id), Some(100));
         store.check();
     }
 

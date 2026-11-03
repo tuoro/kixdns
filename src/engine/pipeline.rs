@@ -297,11 +297,10 @@ impl Engine {
 
         if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(rule_hash) {
             let entry = &record.entry;
-            // Check validity and clean up if expired
-            // 检查有效性，如果过期则清理
-            if !entry.is_valid() {
-                self.rule_cache.remove(rule_hash);
-            } else if entry.matches(&pipeline.id, qname, qtype, qclass, &requester_key) {
+            // 过期的这里不去掉：求值之后原地写回，它在淘汰队列里的位置还在，写不回的由清扫去掉
+            // An expired entry is not removed here: written back after evaluating, it keeps its
+            // place in the eviction queues; one that is not goes with the sweep
+            if entry.matches(&pipeline.id, qname, qtype, qclass, &requester_key) {
                 if let Some((observer, ctx)) = request.observed {
                     report_rule_cache_hit(observer, ctx, &pipeline.id, &record, false);
                 }
@@ -757,8 +756,9 @@ mod rule_cache_policy_tests {
 
     use super::RuleEvaluationContext;
     use crate::engine::Engine;
-    use crate::engine::rules::{Decision, RULE_CACHE_MAX_AGE};
+    use crate::engine::rules::{Decision, RULE_CACHE_MAX_AGE, calculate_rule_hash};
     use crate::engine::test_support::engine_from;
+    use crate::matcher::RequesterKey;
 
     /// `plain` pipeline 只有后缀和 any 条件，`regex` pipeline 带正则条件
     /// The `plain` pipeline has suffix and any conditions only, the `regex` one a regex condition
@@ -938,6 +938,62 @@ mod rule_cache_policy_tests {
         }
         kinds.sort_unstable();
         assert_eq!(kinds, ["forward", "jump", "static"]);
+    }
+
+    /// 过期的决策不拿来用；重新求值后原地写回，访问计数还在，也就还留在淘汰队列原来的位置
+    /// An expired decision does not serve; evaluating again writes it back in place, with its
+    /// access count, so it keeps its place in the eviction queues
+    #[tokio::test]
+    async fn an_expired_decision_is_evaluated_again_and_written_back() {
+        let engine = engine_from(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "block",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                }]
+            }]
+        }));
+        let state = engine.state.load_full();
+        let pipeline = &state.pipeline.pipelines[0];
+        let evaluate = || {
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                "ads.example",
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            engine.apply_rules(&state, pipeline, &request);
+        };
+        evaluate();
+        let key = calculate_rule_hash(
+            state.cache_namespace("main"),
+            "main",
+            "ads.example",
+            RecordType::A,
+            DNSClass::IN,
+            &RequesterKey::NONE,
+        );
+        let mut record = engine.rule_cache.get(key).expect("cached");
+        let expired = Instant::now() - std::time::Duration::from_secs(1);
+        record.entry.expires_at = Some(expired);
+        engine.rule_cache.insert(key, record);
+        let count = engine.rule_cache.access_count(key).unwrap();
+        assert!(count > 0);
+
+        evaluate();
+        assert_eq!(engine.rule_cache.entry_count(), 1);
+        assert!(
+            engine.rule_cache.access_count(key).unwrap() >= count,
+            "written back in place"
+        );
+        let record = engine.rule_cache.get(key).expect("written back");
+        assert!(record.entry.is_valid_at(Instant::now()), "evaluated again");
     }
 }
 

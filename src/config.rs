@@ -57,7 +57,8 @@ pub struct GlobalSettings {
     /// / DoH query path, defaults to /dns-query. Can be customized to any path to avoid detection.
     #[serde(default = "default_doh_path")]
     pub doh_path: String,
-    /// 响应缓存最多存放的应答份数（默认 10000） / Most answers the response cache holds (default 10000)
+    /// 响应缓存最多存放的应答份数（默认 10000），超过 1 KB 的应答每 1 KB 算一份
+    /// / Most answers the response cache holds (default 10000), one over 1 KB counting once per KB
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
     /// 响应缓存里的应答最多存多久（秒，默认 86400） / Longest the response cache keeps an answer (seconds, default 86400)

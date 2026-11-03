@@ -248,13 +248,6 @@ impl RuleCacheEntry {
         self.pipeline_id.as_ref() == pipeline_id && self.qname_hash == fast_hash_str(qname)
     }
 
-    /// Check if entry is still valid (not expired)
-    /// 检查条目是否仍然有效（未过期）
-    #[inline]
-    pub fn is_valid(&self) -> bool {
-        self.is_valid_at(Instant::now())
-    }
-
     /// 在 `now` 这一刻还有效 / Still valid at `now`
     #[inline]
     pub fn is_valid_at(&self, now: Instant) -> bool {

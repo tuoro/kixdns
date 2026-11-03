@@ -52,7 +52,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | flow_control_max_permits | 800 | Maximum permits when flow control is enabled. |
 | flow_control_latency_threshold_ms | 100 | Latency threshold used by adaptive flow control. |
 | flow_control_adjustment_interval_secs | 5 | Permit adjustment interval. |
-| cache_capacity | 10000 | Maximum answers in the DNS response cache; must be greater than zero. |
+| cache_capacity | 10000 | Maximum answers in the DNS response cache, one over 1 KB counting once per KB; must be greater than zero. |
 | cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. No record of an upstream answer carries a longer TTL either, and it wins over min_ttl when the two cross. |
 | dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
 | cache_background_refresh | false | Refresh entries before their TTL expires. |
