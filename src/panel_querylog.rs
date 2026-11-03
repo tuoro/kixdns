@@ -37,14 +37,14 @@ use crate::observe::{
 };
 use crate::panel::{outcome_label, phase_label, skip_reason_label, transport_label};
 
-/// 交接区最多留多少条。面板说存好了（下次来取时的 `after`）的就删掉，平时交接区几乎是空的；面板重启、跟不上
-/// 时才攒起来，攒到这么多还没取就丢最旧的，面板从序号的空缺看出漏了几条。面板停十秒，每秒一千多个查询都留得住
-/// How many records the hand-off ring keeps. What the panel says it has stored (the `after` of its
-/// next take) is deleted, so the ring is nearly empty most of the time; it fills only while the panel
-/// restarts or falls behind, and past this many untaken the oldest goes, the panel seeing from the gap
-/// in sequence numbers how many it missed. With the panel away ten seconds, over a thousand queries a
-/// second are kept
-pub(crate) const CAPACITY: usize = 16_384;
+/// 交接区最多留多少条，只是给索引一个上限，先到的是字节上限（[`RING_BYTES`]）。面板说存好了（下次来取时的 `after`）的
+/// 就删掉，平时交接区几乎是空的；面板重启、跟不上时才攒起来，攒满了就丢最旧的，面板从序号的空缺看出漏了几条
+/// How many records the hand-off ring keeps, which only bounds its index: the byte limit
+/// ([`RING_BYTES`]) comes first. What the panel says it has stored (the `after` of its next take) is
+/// deleted, so the ring is nearly empty most of the time; it fills only while the panel restarts or
+/// falls behind, and when full the oldest goes, the panel seeing from the gap in sequence numbers how
+/// many it missed
+pub(crate) const CAPACITY: usize = 131_072;
 /// 一次最多取走多少条 / At most this many records per collection
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const MAX_PAGE: usize = 2_000;
@@ -54,12 +54,14 @@ pub(crate) const MAX_PAGE: usize = 2_000;
 /// the panel can still say how many it missed. Tens of thousands of queries a second with an upstream
 /// slowing past a hundred milliseconds put over four thousand in flight at once
 const MAX_PENDING: usize = 16_384;
-/// 交接区最多占多少字节。一条命中的记录一百来字节，16384 条两三兆，平时先到的是条数上限；面板跟得上时交接区几乎是
-/// 空的，只占用过的那一点。一条记录长过它的四分之一（配置里的名字长得离谱时）就不记，算进没记下的
-/// The most bytes the ring takes. A hit's record is about a hundred bytes and 16384 of them two or three
-/// megabytes, so the count limit is usually reached first; with the panel keeping up the ring is nearly
-/// empty and takes only what it used. A record longer than a quarter of it (names in the config of an
-/// absurd length) is not kept and counts as unrecorded
+/// 交接区最多占多少字节。一条命中的记录一百来字节，放得下七万多条：每秒七十万条时是一百来毫秒，每秒一千条时面板停半分钟
+/// 也留得住（要上游的记录长些）。面板跟得上时交接区几乎是空的，只占用过的那一点。一条记录长过它的四分之一（配置里的名字
+/// 长得离谱时）就不记，算进没记下的
+/// The most bytes the ring takes. A hit's record is about a hundred bytes, so it holds over seventy
+/// thousand: a hundred milliseconds or so at seven hundred thousand a second, and at a thousand a second
+/// the panel can be away half a minute (records with upstream steps are longer). With the panel keeping
+/// up the ring is nearly empty and takes only what it has used. A record longer than a quarter of it
+/// (with absurdly long names in the config) is not recorded, and counts as unrecorded
 const RING_BYTES: usize = 8 << 20;
 /// 在跟的请求按编号直接定位的槽位数，2 的幂；同时在跟的多过它时，多出来的记在共享表里
 /// Slots the tracked requests are placed in by number, a power of two; requests beyond them at once go
@@ -2084,7 +2086,8 @@ mod tests {
 
     use super::{
         CAPACITY, ConfigName, IDLE_AFTER, KNOWN_NAMES, MAX_ANSWERS, MAX_PAGE, MAX_STEPS, MAX_TEXT,
-        PENDING_SLOTS, QueryLog, WallClock, clip, read_response, read_whole_response, unix_ms,
+        PENDING_SLOTS, QueryLog, RING_BYTES, WallClock, clip, read_response, read_whole_response,
+        unix_ms,
     };
     use crate::config::Transport;
     use crate::observe::{
@@ -2437,6 +2440,25 @@ mod tests {
         };
         log.answered_from_cache(&ctx(1), "main", &hit, &finished);
         assert_eq!(log.ring.lock().newest, 0);
+    }
+
+    /// 一条命中的记录一百来字节时，先到的是字节上限，放得下的都留着：面板慢一下，每秒七十万条时也有一百来毫秒的余地
+    /// With records of a hit's hundred or so bytes the byte limit comes first and all that fit are kept:
+    /// should the panel slow down, there are a hundred milliseconds or so to spare even at seven hundred
+    /// thousand records a second
+    #[test]
+    fn the_ring_is_limited_by_its_bytes_before_its_count() {
+        let log = QueryLog::default();
+        let record = [0u8; 110];
+        let fit = RING_BYTES / record.len();
+        assert!(fit < CAPACITY);
+        for _ in 0..fit {
+            log.push(&record);
+        }
+        assert_eq!(log.ring.lock().len(), fit);
+        log.push(&record);
+        assert_eq!(log.ring.lock().newest, u64::try_from(fit).unwrap() + 1);
+        assert!(log.ring.lock().len() <= fit, "the oldest goes when full");
     }
 
     /// 带着这个内核进程的游标来取的一页 / A page taken with a cursor of this kernel process
@@ -3716,7 +3738,7 @@ mod tests {
     }
 
     const EXPECTED_PAGE: &str = concat!(
-        r#"{"protocol_version":1,"instance":0,"capacity":16384,"newest_seq":5,"missed":0,"untracked":0,"more":false,"entries":[{"seq":1,"time_unix_ms":0,"client":"192.0.2.7","transport":"udp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"completed","outcome":"cached","rcode":"NOERROR","answers":["192.0.2.1","192.0.2.2"],"pipeline":"main","upstream":"udp://192.0.2.53","steps":[{"at_us":0,"kind":"pipeline","pipeline":"main"},{"at_us":0,"kind":"cache","result":"fresh","source":"udp://192.0.2.53"}]}"#,
+        r#"{"protocol_version":1,"instance":0,"capacity":131072,"newest_seq":5,"missed":0,"untracked":0,"more":false,"entries":[{"seq":1,"time_unix_ms":0,"client":"192.0.2.7","transport":"udp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"completed","outcome":"cached","rcode":"NOERROR","answers":["192.0.2.1","192.0.2.2"],"pipeline":"main","upstream":"udp://192.0.2.53","steps":[{"at_us":0,"kind":"pipeline","pipeline":"main"},{"at_us":0,"kind":"cache","result":"fresh","source":"udp://192.0.2.53"}]}"#,
         r#",{"seq":2,"time_unix_ms":0,"client":"::1","transport":"tcp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"completed","outcome":"forwarded","rcode":"NOERROR","answers":["192.0.2.1","192.0.2.2"],"pipeline":"main","rule":"all","upstream":"192.0.2.53:53","steps":[{"at_us":0,"kind":"pipeline","pipeline":"main"},{"at_us":0,"kind":"cache","result":"miss"},{"at_us":0,"kind":"rule","pipeline":"main","rule":"all","phase":"request","decision":"forward","target":"udp://192.0.2.53"},{"at_us":0,"kind":"upstream","upstream":"192.0.2.53:53","transport":"udp","via":"udp","result":"success","latency_us":20000,"rcode":"NOERROR"}]}"#,
         r#",{"seq":3,"time_unix_ms":0,"client":"192.0.2.7","qname":"q\"uote\\back\u0001.example","qtype":"A","latency_us":21000,"status":"completed","outcome":"joined","rcode":"NOERROR","answers":["192.0.2.1","192.0.2.2"],"pipeline":"p\"1","rule":"check","steps":[{"at_us":0,"kind":"pipeline","pipeline":"p\"1"},{"at_us":0,"kind":"joined"},{"at_us":0,"kind":"rule","pipeline":"p\"1","rule":"check","phase":"response","matched":false},{"at_us":0,"kind":"decision","pipeline":"p\"1","rule":"check","phase":"request","decision":"jump","target":"other"},{"at_us":0,"kind":"upstream_skipped","upstream":"https://dns.example/dns-query","transport":"doh","reason":"throttled"},{"at_us":0,"kind":"upstream","upstream":"192.0.2.54:53","transport":"udp","via":"tcp","result":"error","latency_us":3000,"error":"refused \"x\"\nagain"}]}"#,
         r#",{"seq":4,"time_unix_ms":0,"client":"192.0.2.7","transport":"udp","qname":"www.example.com","qtype":"A","latency_us":21000,"status":"completed","outcome":"static","rcode":"NXDOMAIN","answers":[],"rule":"ads","steps":[{"at_us":0,"kind":"rule","pipeline":"main","rule":"ads","phase":"request","decision":"static"}]}"#,
