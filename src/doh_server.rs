@@ -252,12 +252,27 @@ where
         .serve_connection(io, svc);
     tokio::pin!(conn);
     let mut closing = false;
+    // 被叫醒后先让出一轮再干活，同一轮答好的请求就能一次写出去。不让的话，答完第一个请求时唤醒的连接任务排在
+    // 最前面，马上写出这一个回答，一轮的回答各写一次；连接关了 Nagle，每次写就是一个包
+    // Once woken, yield one round before working, so the requests answered during that round
+    // go out in one write. Without it the connection task woken by the first answer runs
+    // next and writes that answer alone, one write per answer; with Nagle off on the
+    // connection, each write is a packet
+    let mut yielded = false;
     loop {
         // 下一次看看空了没有：最早也要在最后一个请求结束 HEADER_READ_TIMEOUT 以后 / When to look
         // again whether it is idle: no earlier than HEADER_READ_TIMEOUT after the last request ended
         let wait = HEADER_READ_TIMEOUT.saturating_sub(activity.idle_for().unwrap_or_default());
+        let served = std::future::poll_fn(|cx| {
+            yielded = !yielded;
+            if yielded {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            conn.as_mut().poll(cx)
+        });
         tokio::select! {
-            _ = conn.as_mut() => return,
+            _ = served => return,
             () = tokio::time::sleep(wait), if !closing => {
                 if activity.idle_for().is_some_and(|idle| idle >= HEADER_READ_TIMEOUT) {
                     conn.as_mut().graceful_shutdown();
@@ -672,6 +687,121 @@ mod tests {
     }
 
     // ---- MAX_DNS_MESSAGE size guard ----
+
+    /// 数写了几次的连接：HTTP/2 把攒好的帧写完 flush 一次，一次连接 poll 就 flush 一次，不管有没有东西要写，
+    /// 所以只数写过东西的那些 flush
+    /// A connection counting its writes: HTTP/2 writes the frames it has gathered, then
+    /// flushes. It flushes on every poll of the connection, with or without anything
+    /// written, so only the flushes after a write count
+    struct CountsWrites<I> {
+        inner: hyper_util::rt::TokioIo<I>,
+        wrote: bool,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> hyper::rt::Read for CountsWrites<I> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> hyper::rt::Write for CountsWrites<I> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.wrote = true;
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if std::mem::take(&mut self.wrote) {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// 一条 HTTP/2 连接上同时答好的回答一次写出去，不是答一个写一个：连接关了 Nagle，每次写就是一个包。
+    /// 要用多线程运行时：多出来的这些写来自工作线程的 LIFO 优先位，单线程运行时没有它，看不出差别
+    /// Answers ready together on an HTTP/2 connection go out in one write, not one write each:
+    /// with Nagle off on the connection, each write is a packet. It takes the multi-thread
+    /// runtime: those extra writes come from a worker's LIFO slot, which the current-thread
+    /// runtime does not have
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_round_of_http2_answers_goes_out_in_one_write() {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const REQUESTS: u16 = 32;
+        type Sender = hyper::client::conn::http2::SendRequest<http_body_util::Empty<Bytes>>;
+        // 用 GET：请求没有正文，一个帧就是一个请求，客户端一次发得完 / GET has no body: one frame is
+        // one request, so the client sends them all at once
+        async fn ask(mut sender: Sender, txid: u16) {
+            let query = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(make_dns_query_a("round.example", txid));
+            let request = hyper::Request::get(format!("https://localhost/dns-query?dns={query}"))
+                .body(http_body_util::Empty::new())
+                .unwrap();
+            let response = sender.send_request(request).await.expect("answered");
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(u16::from_be_bytes([body[0], body[1]]), txid);
+        }
+
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let writes = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(serve_http2(
+            CountsWrites {
+                inner: hyper_util::rt::TokioIo::new(server),
+                wrote: false,
+                writes: Arc::clone(&writes),
+            },
+            "127.0.0.1:53000".parse().unwrap(),
+            Arc::new(make_static_engine("NXDOMAIN")),
+            Arc::from("/dns-query"),
+        ));
+        let (sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            hyper_util::rt::TokioIo::new(client),
+        )
+        .await
+        .expect("http2 handshake");
+        tokio::spawn(conn);
+        // 先问一次，握手和设置帧的写都算在这之前 / One question first, so that the writes of the
+        // handshake and the settings come before the count
+        ask(sender.clone(), 0).await;
+        let before = writes.load(Ordering::Relaxed);
+        // 放在工作线程上一起发：一次 poll 把请求都排好，客户端的连接任务一次发出去，服务端一次读到
+        // Sent together on the worker: one poll queues them all, the client's connection task
+        // sends them at once and the server reads them at once
+        tokio::spawn(futures::future::join_all(
+            (1..=REQUESTS).map(|txid| ask(sender.clone(), txid)),
+        ))
+        .await
+        .unwrap();
+        let written = writes.load(Ordering::Relaxed) - before;
+        assert!(
+            written <= usize::from(REQUESTS) / 4,
+            "{written} writes for {REQUESTS} answers"
+        );
+    }
 
     #[test]
     fn test_max_dns_message_constant() {
