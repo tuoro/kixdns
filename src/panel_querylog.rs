@@ -278,10 +278,10 @@ impl Ring {
     }
 }
 
-struct Step {
+struct Step<N = ConfigName> {
     /// 从请求进来算起的微秒数 / Microseconds since the request arrived
     at_us: u64,
-    what: StepKind,
+    what: StepKind<N>,
 }
 
 /// 处理过程的一步，写出来是 `{"at_us":…,"kind":"…",…}`：`kind` 是下面的名字（小写、下划线连接），空着的项不写。
@@ -289,32 +289,32 @@ struct Step {
 /// A step of the handling, written as `{"at_us":…,"kind":"…",…}`: `kind` is the name below (lower case,
 /// joined by underscores), and empty items are left out. Phases, decisions and results are kept as their
 /// enums, a byte each, and turned into text only when written
-enum StepKind {
+enum StepKind<N = ConfigName> {
     /// 进入一个 Pipeline：选中入口时一次，之后每跳一次一次 / Entered a pipeline: once at selection,
     /// once more after every jump
-    Pipeline { pipeline: ConfigName },
+    Pipeline { pipeline: N },
     /// 一条规则命中（请求阶段），或回答后检查的结果（`phase` 为 `response`，`matched` 是检查的结论）；
     /// `decision` 和 `target` 由随后的决定补上：跳去的 Pipeline，或转发用的上游（沿用上游回答时是回答的那个）
     /// A rule matched (request phase), or an answer check's result (`phase` is `response`, `matched` its
     /// verdict); `decision` and `target` come from the decision that follows: the pipeline it jumps to,
     /// or the upstreams it forwards to (the upstream that answered, when an answer is kept)
     Rule {
-        pipeline: ConfigName,
-        rule: ConfigName,
+        pipeline: N,
+        rule: N,
         phase: RulePhase,
         matched: Option<bool>,
         decision: Option<DecisionKind>,
-        target: Option<ConfigName>,
+        target: Option<N>,
     },
     /// 前面没有对应规则那一步的决定：没有规则命中时 Pipeline 的默认决定，或没写回答检查条件的规则的回答阶段动作
     /// A decision with no rule step before it: a pipeline's default decision when no rule matched, or the
     /// response actions of a rule that has no response matchers
     Decision {
-        pipeline: ConfigName,
-        rule: Option<ConfigName>,
+        pipeline: N,
+        rule: Option<N>,
         phase: RulePhase,
         decision: DecisionKind,
-        target: Option<ConfigName>,
+        target: Option<N>,
     },
     /// 响应缓存：`fresh`、`stale`、`stale_timeout`、`stale_failure` 或 `miss`；命中时 `source` 是当初回答的上游
     /// The response cache: `fresh`, `stale`, `stale_timeout`, `stale_failure` or `miss`; on a hit `source`
@@ -322,7 +322,7 @@ enum StepKind {
     Cache {
         /// 没命中时为 None / None on a miss
         result: Option<CacheHitKind>,
-        source: Option<ConfigName>,
+        source: Option<N>,
     },
     /// 同一时刻已有相同的查询在问上游，这次用了它的答案 / An identical query was already asking
     /// upstream, and this request took its answer
@@ -333,7 +333,7 @@ enum StepKind {
     /// `is_failure_reply`), `error`, `aborted` (another upstream answered first and this one
     /// was cancelled) or `throttled` (the DoH upstream answered HTTP 429)
     Upstream {
-        upstream: ConfigName,
+        upstream: N,
         transport: Transport,
         via: Transport,
         result: UpstreamOutcome,
@@ -348,7 +348,7 @@ enum StepKind {
     /// panel leaves out a kind it does not know, but shows an `upstream` step with a result it
     /// does not know as an error
     UpstreamSkipped {
-        upstream: ConfigName,
+        upstream: N,
         transport: Transport,
         reason: UpstreamSkipReason,
     },
@@ -711,8 +711,7 @@ impl Pending {
     /// resolved
     fn outcome(&self, status: Status, rcode: Option<ResponseCode>) -> Outcome {
         match status {
-            Status::Completed if self.cache == Some(CacheHitKind::Fresh) => Outcome::Cached,
-            Status::Completed if self.cache.is_some() => Outcome::Stale,
+            Status::Completed if self.cache.is_some() => cached_outcome(status, self.cache),
             Status::Completed if rcode == Some(ResponseCode::ServFail) => Outcome::Failed,
             Status::Completed if self.joined => Outcome::Joined,
             Status::Completed if self.decided_static() => Outcome::Static,
@@ -728,65 +727,119 @@ impl Pending {
     /// client got, in the order its JSON is written (see [`write_record`]). The response is read now, and
     /// no copy of it is kept
     fn encode(&self, outcome: &RequestOutcome<'_>, out: &mut Vec<u8>) {
-        let status = match outcome.status {
-            RequestStatus::Completed => Status::Completed,
-            RequestStatus::Failed => Status::Failed,
-            RequestStatus::Cancelled => Status::Cancelled,
-        };
-        let (rcode, answers) = outcome
-            .response
-            .map_or_else(|| (None, Answers::new()), read_response);
-        let result = self.outcome(status, rcode);
-        // 答案来自哪个上游：转发的是回答的那个，缓存的是当初回答的那个；规则直接回应、合并和失败的没有
-        // Which upstream the answer came from: for a forward the one that answered, for a cache hit the one
-        // that answered originally; none for a rule's own answer, a joined query or a failure
-        let upstream = match result {
-            Outcome::Cached | Outcome::Stale => self.cache_source.as_deref(),
-            Outcome::Forwarded => self.answered_by.as_deref(),
-            _ => None,
-        };
-        let mut out = Encoder(out);
-        out.number(self.time_unix_ms);
-        out.address(self.client);
-        out.byte(
-            self.transport
-                .map_or(0, |transport| client_transport_code(transport) + 1),
+        encode_record(
+            &RecordHead {
+                time_unix_ms: self.time_unix_ms,
+                client: self.client,
+                transport: self.transport,
+                qname: &self.qname,
+                qtype: self.qtype,
+                pipeline: self.pipeline.as_deref(),
+                rule: match &self.decision {
+                    Some((Some(rule), _)) => Some(rule),
+                    _ => None,
+                },
+            },
+            outcome,
+            |status, rcode| {
+                let result = self.outcome(status, rcode);
+                // 答案来自哪个上游：转发的是回答的那个，缓存的是当初回答的那个；规则直接回应、合并和失败的没有
+                // Which upstream the answer came from: for a forward the one that answered, for a
+                // cached answer the one that answered originally; none for a rule's own answer, a
+                // joined query or a failure
+                let upstream = match result {
+                    Outcome::Cached | Outcome::Stale => self.cache_source.as_deref(),
+                    Outcome::Forwarded => self.answered_by.as_deref(),
+                    _ => None,
+                };
+                (result, upstream)
+            },
+            &self.steps,
+            self.steps_truncated,
+            out,
         );
-        out.text(&self.qname);
-        // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
-        // hickory's `Display` writes it, without allocating a string first
-        out.text(<&'static str>::from(self.qtype));
-        out.number(u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX));
-        out.byte(status_code(status));
-        out.byte(outcome_code(result));
-        out.optional_number(rcode.map(|rcode| u64::from(u16::from(rcode))));
-        out.number(u64::try_from(answers.len()).unwrap_or(u64::MAX));
-        for answer in &answers {
-            match answer {
-                Answer::V4(address) => out.address(IpAddr::V4(*address)),
-                Answer::V6(address) => out.address(IpAddr::V6(*address)),
-                Answer::Text(text) => {
-                    out.byte(ANSWER_TEXT);
-                    out.text(text);
-                }
-            }
-        }
-        out.optional_text(outcome.error.map(clip).as_deref());
-        out.optional_text(self.pipeline.as_deref());
-        out.optional_text(match &self.decision {
-            Some((Some(rule), _)) => Some(rule),
-            _ => None,
-        });
-        out.optional_text(upstream);
-        out.number(u64::try_from(self.steps.len()).unwrap_or(u64::MAX));
-        for step in &self.steps {
-            step.encode(&mut out);
-        }
-        out.byte(u8::from(self.steps_truncated));
     }
 }
 
-impl Step {
+/// 一条记录里步骤和结果以外的部分 / The parts of a record other than its steps and how it ended
+struct RecordHead<'a> {
+    time_unix_ms: u64,
+    client: IpAddr,
+    transport: Option<ClientTransport>,
+    qname: &'a str,
+    qtype: RecordType,
+    pipeline: Option<&'a str>,
+    rule: Option<&'a str>,
+}
+
+/// 缓存答的请求算哪种结果 / What a request the cache answered counts as
+fn cached_outcome(status: Status, cache: Option<CacheHitKind>) -> Outcome {
+    match status {
+        Status::Completed if cache == Some(CacheHitKind::Fresh) => Outcome::Cached,
+        Status::Completed => Outcome::Stale,
+        Status::Failed => Outcome::Failed,
+        Status::Cancelled => Outcome::Cancelled,
+    }
+}
+
+/// 编一条记录，顺序就是写成 JSON 的顺序（见 [`write_record`]）。`decide` 由结束状态和响应码定出结果和答案来自哪个上游
+/// Encodes a record, in the order its JSON is written (see [`write_record`]). `decide` gives how it
+/// ended and which upstream the answer came from, from the status and the response code
+fn encode_record<'a, N: std::ops::Deref<Target = str>>(
+    head: &RecordHead<'_>,
+    outcome: &RequestOutcome<'_>,
+    decide: impl FnOnce(Status, Option<ResponseCode>) -> (Outcome, Option<&'a str>),
+    steps: &[Step<N>],
+    steps_truncated: bool,
+    out: &mut Vec<u8>,
+) {
+    let status = match outcome.status {
+        RequestStatus::Completed => Status::Completed,
+        RequestStatus::Failed => Status::Failed,
+        RequestStatus::Cancelled => Status::Cancelled,
+    };
+    let (rcode, answers) = outcome
+        .response
+        .map_or_else(|| (None, Answers::new()), read_response);
+    let (result, upstream) = decide(status, rcode);
+    let mut out = Encoder(out);
+    out.number(head.time_unix_ms);
+    out.address(head.client);
+    out.byte(
+        head.transport
+            .map_or(0, |transport| client_transport_code(transport) + 1),
+    );
+    out.text(head.qname);
+    // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
+    // hickory's `Display` writes it, without allocating a string first
+    out.text(<&'static str>::from(head.qtype));
+    out.number(u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX));
+    out.byte(status_code(status));
+    out.byte(outcome_code(result));
+    out.optional_number(rcode.map(|rcode| u64::from(u16::from(rcode))));
+    out.number(u64::try_from(answers.len()).unwrap_or(u64::MAX));
+    for answer in &answers {
+        match answer {
+            Answer::V4(address) => out.address(IpAddr::V4(*address)),
+            Answer::V6(address) => out.address(IpAddr::V6(*address)),
+            Answer::Text(text) => {
+                out.byte(ANSWER_TEXT);
+                out.text(text);
+            }
+        }
+    }
+    out.optional_text(outcome.error.map(clip).as_deref());
+    out.optional_text(head.pipeline);
+    out.optional_text(head.rule);
+    out.optional_text(upstream);
+    out.number(u64::try_from(steps.len()).unwrap_or(u64::MAX));
+    for step in steps {
+        step.encode(&mut out);
+    }
+    out.byte(u8::from(steps_truncated));
+}
+
+impl<N: std::ops::Deref<Target = str>> Step<N> {
     fn encode(&self, out: &mut Encoder<'_>) {
         out.number(self.at_us);
         match &self.what {
@@ -1476,6 +1529,61 @@ impl QueryLog {
             self.push(encoding);
         });
         pending.release();
+    }
+
+    /// 快速路径用缓存答的请求，一次记完（见 [`crate::observe::EngineObserver::answered_from_cache`]）。这之前没有
+    /// 在跟它，也就用不着槽位、记录结构和配置名那张表，名字直接从引擎借来编进去。两步都没等过什么，时刻记 0
+    /// A request the fast path answered from the cache, recorded in one go (see
+    /// [`crate::observe::EngineObserver::answered_from_cache`]). It was never tracked, so it needs no slot, record
+    /// structure or table of config names, and the names are borrowed from the engine and encoded directly.
+    /// Neither step waited for anything, and both have 0 for their time
+    pub(crate) fn answered_from_cache(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        hit: &CacheHit<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) {
+        if !self.recording_after(self.collected.load(Ordering::Acquire), ctx.started) {
+            return;
+        }
+        let steps = [
+            Step {
+                at_us: 0,
+                what: StepKind::Pipeline { pipeline },
+            },
+            Step {
+                at_us: 0,
+                what: StepKind::Cache {
+                    result: Some(hit.kind),
+                    source: hit.source,
+                },
+            },
+        ];
+        ENCODING.with_borrow_mut(|encoding| {
+            encoding.clear();
+            encode_record(
+                &RecordHead {
+                    time_unix_ms: self.wall.unix_ms_at(ctx.started),
+                    client: ctx.client.ip().to_canonical(),
+                    transport: ctx.transport,
+                    qname: ctx.qname,
+                    qtype: ctx.qtype,
+                    pipeline: Some(pipeline),
+                    rule: None,
+                },
+                outcome,
+                |status, _| {
+                    let result = cached_outcome(status, Some(hit.kind));
+                    let cached = matches!(result, Outcome::Cached | Outcome::Stale);
+                    (result, hit.source.filter(|_| cached))
+                },
+                &steps,
+                false,
+                encoding,
+            );
+            self.push(encoding);
+        });
     }
 
     /// 编好的记录放进交接区，序号是它的位置 / Puts an encoded record into the ring; its number is its
@@ -2238,6 +2346,97 @@ mod tests {
         assert_eq!(at_us[0], 0);
         assert!(at_us[1] >= 50_000, "{at_us:?}");
         assert_eq!(at_us[2], 0);
+    }
+
+    /// 一次记完的记录和分开的事件记下的逐字节一样：各种客户端、传输、来源、缓存种类和结束方式
+    /// A record made in one go is byte for byte what the separate events make, for every kind of
+    /// client, transport, source, cache hit and ending
+    #[test]
+    fn a_cache_hit_recorded_whole_is_what_the_separate_events_record() {
+        let log = QueryLog::default();
+        // 两种写法的墙上时间要一样：对过一次就不再对 / Both ways must see one wall time: checked once and no more
+        log.wall.unix_ms_at(Instant::now());
+        log.wall.check_at_ms.store(u64::MAX, Relaxed);
+        let ok = response(ResponseCode::NoError, &[[192, 0, 2, 1], [198, 51, 100, 23]]);
+        let servfail = response(ResponseCode::ServFail, &[]);
+        let completed = |bytes| (RequestStatus::Completed, Some(bytes), None);
+        let endings = [
+            completed(ok.as_slice()),
+            completed(servfail.as_slice()),
+            (RequestStatus::Failed, None, Some("engine failed")),
+        ];
+        let port = 53_000;
+        let clients = [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), port),
+            SocketAddr::new(
+                IpAddr::V6(Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped()),
+                port,
+            ),
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+        ];
+        let mut compared = 0;
+        for client in clients {
+            for transport in [Some(ClientTransport::Udp), Some(ClientTransport::Doh), None] {
+                for source in [Some("udp://192.0.2.53:53"), None] {
+                    for kind in [CacheHitKind::Fresh, CacheHitKind::Stale] {
+                        for (status, bytes, error) in endings {
+                            let request = RequestContext {
+                                client,
+                                transport,
+                                reported_at_once: true,
+                                ..ctx(compared + 1)
+                            };
+                            let hit = CacheHit {
+                                kind,
+                                remaining_ttl: None,
+                                original_ttl: None,
+                                source,
+                            };
+                            let finished = RequestOutcome {
+                                latency: Duration::from_micros(900),
+                                status,
+                                response: bytes,
+                                error,
+                            };
+                            log.request_started(&request, false);
+                            log.pipeline_selected(&request, "main");
+                            log.cache_hit(&request, &hit);
+                            log.request_finished(&request, &finished);
+                            log.answered_from_cache(&request, "main", &hit, &finished);
+                            let ring = log.ring.lock();
+                            let last = ring.len() - 1;
+                            assert_eq!(
+                                ring.record(last - 1),
+                                ring.record(last),
+                                "{client} {source:?}"
+                            );
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 108);
+    }
+
+    /// 没人来取以后，一次记完的这条路也不再记 / Once nobody collects, the way of recording in one go stops too
+    #[test]
+    fn a_cache_hit_is_not_recorded_once_recording_has_stopped() {
+        let log = started_three_minutes_ago();
+        let hit = CacheHit {
+            kind: CacheHitKind::Fresh,
+            remaining_ttl: None,
+            original_ttl: None,
+            source: None,
+        };
+        let finished = RequestOutcome {
+            latency: Duration::from_micros(900),
+            status: RequestStatus::Completed,
+            response: None,
+            error: None,
+        };
+        log.answered_from_cache(&ctx(1), "main", &hit, &finished);
+        assert_eq!(log.ring.lock().newest, 0);
     }
 
     /// 带着这个内核进程的游标来取的一页 / A page taken with a cursor of this kernel process

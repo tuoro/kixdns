@@ -708,6 +708,18 @@ impl PanelMetrics {
         self.update_series(series, key, |sum| sum.add(latency));
     }
 
+    /// 一个请求结束：按结果记一次，算进耗时 / A request ended: counted by how, and its latency added
+    #[inline]
+    fn count_finished(&self, outcome: &RequestOutcome<'_>) {
+        let counter = match outcome.status {
+            RequestStatus::Completed => &self.requests_completed,
+            RequestStatus::Failed => &self.requests_failed,
+            RequestStatus::Cancelled => &self.requests_cancelled,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.request_latency.observe(outcome.latency);
+    }
+
     #[inline]
     fn record_pipeline_hit(&self, pipeline: &str) {
         self.increment(&self.pipeline_hits, pipeline);
@@ -1129,6 +1141,30 @@ macro_rules! debug_forward {
 }
 
 impl EngineObserver for PanelMetrics {
+    /// 和分开的事件记下一样的东西，只是一次记完。诊断查询和调试跟踪要一步步看，照旧走分开的事件
+    /// Records what the separate events record, all at once. Diagnostic queries and the debug trace
+    /// want every step, and take the separate events as ever
+    fn answered_from_cache(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        hit: &CacheHit<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) -> bool {
+        if self.debug_trace.is_some() || panel_trace::active() {
+            return false;
+        }
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.record_query(ctx.qname, ctx.client.ip(), ctx.started);
+        self.record_pipeline_hit(pipeline);
+        self.record_cache_lookup();
+        self.record_cache_hit(hit.kind);
+        self.count_finished(outcome);
+        self.query_log
+            .answered_from_cache(ctx, pipeline, hit, outcome);
+        true
+    }
+
     fn request_started(&self, ctx: &RequestContext<'_>) {
         debug_forward!(self.request_started(ctx));
         if !ctx.background_refresh {
@@ -1162,13 +1198,7 @@ impl EngineObserver for PanelMetrics {
         }
         self.cache_lookup_counted.finished(ctx.request_id);
         self.requests_inflight.fetch_sub(1, Ordering::Relaxed);
-        let counter = match outcome.status {
-            RequestStatus::Completed => &self.requests_completed,
-            RequestStatus::Failed => &self.requests_failed,
-            RequestStatus::Cancelled => &self.requests_cancelled,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-        self.request_latency.observe(outcome.latency);
+        self.count_finished(outcome);
     }
 
     fn pipeline_selected(&self, ctx: &RequestContext<'_>, pipeline: &str) {
@@ -2497,6 +2527,107 @@ mod tests {
         }
     }
 
+    /// 命中一次交过来，和分开的事件记下的一样：计数、排行和查询日志
+    /// A cache hit handed over whole records what the separate events record: the counters, the
+    /// rankings and the query log
+    #[test]
+    fn a_cache_hit_taken_whole_records_what_the_separate_events_record() {
+        use crate::observe::{
+            CacheHit, CacheHitKind, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
+        };
+
+        let by_events = PanelMetrics::new(false);
+        let whole = PanelMetrics::new(false);
+        let bytes = [
+            0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
+        ];
+        let hit = CacheHit {
+            kind: CacheHitKind::Fresh,
+            remaining_ttl: Some(std::time::Duration::from_secs(30)),
+            original_ttl: Some(std::time::Duration::from_secs(60)),
+            source: Some("udp://192.0.2.53:53"),
+        };
+        let completed = RequestOutcome {
+            latency: std::time::Duration::from_millis(3),
+            status: RequestStatus::Completed,
+            response: Some(&bytes),
+            error: None,
+        };
+        let failed = RequestOutcome {
+            latency: std::time::Duration::from_millis(7),
+            status: RequestStatus::Failed,
+            response: None,
+            error: Some("engine failed"),
+        };
+        for (id, qname, outcome) in [
+            (1, "a.example", &completed),
+            (2, "b.example", &completed),
+            (3, "a.example", &failed),
+        ] {
+            let ctx = RequestContext {
+                reported_at_once: true,
+                ..request(id, "192.168.1.9:5353", qname)
+            };
+            by_events.request_started(&ctx);
+            by_events.pipeline_selected(&ctx, "main");
+            by_events.cache_lookup(&ctx);
+            by_events.cache_hit(&ctx, &hit);
+            by_events.request_finished(&ctx, outcome);
+            assert!(whole.answered_from_cache(&ctx, "main", &hit, outcome));
+        }
+        let counters = |metrics: &PanelMetrics| {
+            let mut output = String::new();
+            metrics.render_counters(&mut output);
+            output
+        };
+        assert_eq!(counters(&by_events), counters(&whole));
+        assert_eq!(by_events.stats_json(3_600, 20), whole.stats_json(3_600, 20));
+        let log = |metrics: &PanelMetrics| {
+            let page = metrics.query_log.collect(0, 10, None, None, None, 1);
+            let mut page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            page.as_object_mut().unwrap().remove("instance");
+            for entry in page["entries"].as_array_mut().unwrap() {
+                entry.as_object_mut().unwrap().remove("time_unix_ms");
+            }
+            page
+        };
+        assert_eq!(log(&by_events)["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(log(&by_events), log(&whole));
+    }
+
+    /// 诊断查询和调试跟踪要一步步看，不一次接过来 / Diagnostic queries and the debug trace want every
+    /// step, and a hit is not taken whole
+    #[tokio::test]
+    async fn a_hit_is_not_taken_whole_when_every_step_is_wanted() {
+        use crate::observe::{
+            CacheHit, CacheHitKind, EngineObserver, RequestOutcome, RequestStatus,
+        };
+        use std::sync::atomic::Ordering;
+
+        let hit = CacheHit {
+            kind: CacheHitKind::Fresh,
+            remaining_ttl: None,
+            original_ttl: None,
+            source: None,
+        };
+        let outcome = RequestOutcome {
+            latency: std::time::Duration::from_millis(3),
+            status: RequestStatus::Completed,
+            response: None,
+            error: None,
+        };
+        let ctx = request(1, "192.168.1.9:5353", "a.example");
+        let traced = PanelMetrics::new(true);
+        assert!(!traced.answered_from_cache(&ctx, "main", &hit, &outcome));
+        let plain = PanelMetrics::new(false);
+        let (taken, _, _) = crate::panel_trace::capture(async {
+            plain.answered_from_cache(&ctx, "main", &hit, &outcome)
+        })
+        .await;
+        assert!(!taken);
+        assert_eq!(plain.requests_total.load(Ordering::Relaxed), 0);
+    }
+
     /// 正常结束，回了一个空应答 / Completed with an empty response
     fn completed(millis: u64) -> crate::observe::RequestOutcome<'static> {
         crate::observe::RequestOutcome {
@@ -3408,6 +3539,59 @@ mod diagnostic_tests {
                 ]
             }]
         })
+    }
+
+    /// 真引擎的快速路径命中整个交给面板：记录、计数都对，也不留着「在处理」
+    /// A real engine's fast-path hit reaches the panel whole: the record and the counters are right,
+    /// and nothing stays in flight
+    #[tokio::test]
+    async fn a_fast_path_hit_reaches_the_panel_whole() {
+        use crate::engine::FastPathResponse;
+        use std::sync::atomic::Ordering;
+
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "block",
+                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
+                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+            }] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let peer: std::net::SocketAddr = "192.0.2.7:53000".parse().unwrap();
+        let mut query = hickory_proto::op::Message::new(
+            0x1234,
+            hickory_proto::op::MessageType::Query,
+            hickory_proto::op::OpCode::Query,
+        );
+        query.metadata.recursion_desired = true;
+        query.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii("a.blocked.test.").unwrap(),
+            hickory_proto::rr::RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        engine.handle_packet(&query, peer).await.unwrap();
+        assert!(matches!(
+            engine.handle_packet_fast(&query, peer).unwrap(),
+            Some(FastPathResponse::CacheHit { .. })
+        ));
+        assert_eq!(metrics.requests_total.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.requests_inflight.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.requests_completed.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.cache_hits_fresh.load(Ordering::Relaxed), 1);
+        let page: serde_json::Value =
+            serde_json::from_str(&metrics.query_log.collect(0, 10, None, None, None, 1)).unwrap();
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let cached = &entries[1];
+        assert_eq!(cached["outcome"], "cached");
+        assert_eq!(cached["qname"], "a.blocked.test");
+        assert_eq!(cached["pipeline"], "main");
+        assert_eq!(cached["rcode"], "NXDOMAIN");
+        assert_eq!(cached["steps"][0]["kind"], "pipeline");
+        assert_eq!(cached["steps"][1]["kind"], "cache");
+        assert_eq!(cached["steps"][1]["result"], "fresh");
     }
 
     /// 照启动和重载的路子读配置（`parse_config`）/ Reads a config the way startup and reload do
