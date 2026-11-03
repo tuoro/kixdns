@@ -943,8 +943,10 @@ impl PanelMetrics {
     #[cfg(unix)]
     fn render_prometheus(&self, engine: &Engine) -> String {
         let mut output = String::with_capacity(8_192);
-        // Answers, not slots: one question can hold answers for several ECS networks
-        // 按应答份数计，而不是槽位数：一个问题可以存多个 ECS 网段的应答
+        // In the unit of `cache_capacity`, not slots: one question can hold answers for several
+        // ECS networks, and an answer over 1 KB counts once per KB
+        // 和 `cache_capacity` 同一个单位，而不是槽位数：一个问题可以存多个 ECS 网段的应答，超过 1 KB
+        // 的应答每 1 KB 算一份
         metric(
             &mut output,
             "kixdns_cache_entries",

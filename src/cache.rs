@@ -292,9 +292,17 @@ pub type DnsCache = Arc<CacheStore<Arc<CacheSlot>>>;
 /// 每个槽位按它存的应答份数计重；里面的应答都存了 `max_age` 以上，整个槽位就不能再用了
 /// Each slot weighs as many answers as it holds; once every answer in it was stored
 /// `max_age` or longer ago, the whole slot is of no further use
+/// 多少字节的应答算一份：容量按份算，大应答按它占的地方多算几份，容量才管得住内存
+/// The bytes of an answer that count as one: capacity counts answers, and a large one
+/// counts for the room it takes, so that capacity bounds the memory
+const BYTES_PER_ANSWER: usize = 1024;
+
 impl Cached for Arc<CacheSlot> {
     fn weight(&self) -> u32 {
-        self.len().max(1) as u32
+        let answers = self
+            .entries()
+            .map(|entry| entry.bytes.len().div_ceil(BYTES_PER_ANSWER) as u32);
+        answers.sum::<u32>().max(1)
     }
 
     fn outlived(&self, max_age: Duration, now: Instant) -> bool {
@@ -303,9 +311,10 @@ impl Cached for Arc<CacheSlot> {
     }
 }
 
-/// 创建 DNS 缓存。容量按应答份数计；存了 `ttl_secs` 秒以上的应答不再用。
-/// Create the DNS cache. Capacity counts answers; answers stored `ttl_secs`
-/// seconds or longer ago are no longer used.
+/// 创建 DNS 缓存。容量按应答份数计，超过 1 KB 的应答每 1 KB 算一份；存了 `ttl_secs` 秒以上的
+/// 应答不再用。
+/// Create the DNS cache. Capacity counts answers, one over 1 KB counting once per KB;
+/// answers stored `ttl_secs` seconds or longer ago are no longer used.
 #[inline]
 pub fn new_cache(max_capacity: u64, ttl_secs: u64) -> DnsCache {
     Arc::new(CacheStore::new(max_capacity, Duration::from_secs(ttl_secs)))
@@ -323,6 +332,64 @@ mod tests {
         pipeline_id: "main",
         qtype: 1,
     };
+
+    /// 这么多字节的应答 / An answer of this many bytes
+    fn answer_of(qname: &str, bytes: usize) -> Arc<CacheEntry> {
+        Arc::new(CacheEntry::from_response(
+            Bytes::from(vec![0; bytes]),
+            ResponseCode::NoError,
+            None,
+            qname,
+            Arc::from("main"),
+            1,
+            crate::proto_utils::QueryFlags::RECURSIVE,
+            (60, 60),
+        ))
+    }
+
+    /// 1 KB 以内算一份，再大的每 1 KB 算一份，一个槽位里的合起来算
+    /// Up to 1 KB counts as one, more counts once per KB, and a slot adds up what it holds
+    #[test]
+    fn an_answer_weighs_one_per_kilobyte_and_a_slot_adds_them_up() {
+        for (bytes, weight) in [
+            (0, 1),
+            (100, 1),
+            (1024, 1),
+            (1025, 2),
+            (59_000, 58),
+            (65_535, 64),
+        ] {
+            let slot = Arc::new(CacheSlot::default().with(answer_of("a.example", bytes), None));
+            assert_eq!(slot.weight(), weight, "{bytes} bytes");
+        }
+        let slot = CacheSlot::default()
+            .with(answer_of("a.example", 100), None)
+            .with(answer_of("b.example", 3000), None);
+        assert_eq!(Arc::new(slot).weight(), 4);
+        assert_eq!(Arc::new(CacheSlot::default()).weight(), 1);
+    }
+
+    /// 容量管得住内存：大应答存得少，字节数合计不超过容量那么多 KB
+    /// Capacity bounds the memory: fewer large answers are held, their bytes adding up to no
+    /// more KB than the capacity
+    #[test]
+    fn capacity_bounds_the_bytes_large_answers_take() {
+        let cache = new_cache(10_000, 86_400);
+        for key in 0..2_000u64 {
+            let slot =
+                CacheSlot::default().with(answer_of(&format!("h{key}.example"), 59_000), None);
+            cache.insert(key, Arc::new(slot));
+        }
+        let held: usize = cache
+            .values()
+            .iter()
+            .flat_map(|slot| slot.entries())
+            .map(|entry| entry.bytes.len())
+            .sum();
+        assert!(held <= 10_000 * BYTES_PER_ANSWER, "{held} bytes held");
+        assert!(cache.entry_count() > 0);
+        assert_eq!(cache.weighted_size() % 58, 0);
+    }
 
     fn view(client: &str) -> EcsView {
         EcsView {

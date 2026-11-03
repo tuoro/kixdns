@@ -52,7 +52,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | flow_control_max_permits | 800 | 启用流控时的最大 permits。 |
 | flow_control_latency_threshold_ms | 100 | 自适应流控使用的延迟阈值。 |
 | flow_control_adjustment_interval_secs | 5 | permits 调整间隔。 |
-| cache_capacity | 10000 | DNS 响应缓存最多存放的应答数；必须大于 0。 |
+| cache_capacity | 10000 | DNS 响应缓存最多存放的应答数，超过 1 KB 的应答每 1 KB 算一份；必须大于 0。 |
 | cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。上游回答里每条记录的 TTL 也不超过它，和 min_ttl 冲突时以它为准。 |
 | dashmap_shards | 0 | 内部分片设置；0 使用 DashMap 默认值，否则必须是 2 的幂。 |
 | cache_background_refresh | false | 在 TTL 过期前刷新条目。 |

@@ -948,13 +948,8 @@ impl Engine {
             );
             if let Some(record) = self.rule_cache.get(rule_hash) {
                 let entry = &record.entry;
-                // Check if entry is valid before using
-                // 在使用前检查条目是否有效
-                if !entry.is_valid_at(start) {
-                    // Remove expired entry
-                    // 删除过期条目
-                    self.rule_cache.remove(rule_hash);
-                } else if entry.matches_at(
+                // 过期的这里不去掉，见 `apply_rules` / An expired entry is not removed here, see `apply_rules`
+                if entry.matches_at(
                     start,
                     pipeline_id,
                     qname_str,
@@ -5305,17 +5300,18 @@ mod tests {
         }
     }
 
-    /// 规则缓存里过期的条目不拿来答，也顺手删掉，有效的留着
-    /// An expired entry in the rule cache does not answer and is removed, and a valid one stays
+    /// 规则缓存里过期的条目不拿来答，但留在原处等求值后写回；有效的拿来答
+    /// An expired entry in the rule cache does not answer but stays where it is, to be written
+    /// back after evaluating; a valid one answers
     #[tokio::test]
-    async fn the_fast_path_drops_an_expired_rule_cache_entry() {
+    async fn the_fast_path_leaves_an_expired_rule_cache_entry_in_place() {
         let engine = rule_cache_engine(Arc::new(RuleAnswers::default()));
         let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
         let expired = Some(Instant::now() - Duration::from_secs(1));
         let key = put_rule_answer(&engine, expired, Some(&["block"]), true);
         let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
         assert!(matches!(answered, Some(FastPathResponse::AsyncNeeded(_))));
-        assert!(engine.rule_cache.get(key).is_none());
+        assert!(engine.rule_cache.get(key).is_some());
 
         let valid = Some(Instant::now() + Duration::from_secs(60));
         let key = put_rule_answer(&engine, valid, Some(&["block"]), true);
