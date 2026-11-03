@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
 use crate::engine::utils::parse_rcode;
-use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer};
+use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer, static_ips};
 use crate::lock::RwLock;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
@@ -76,9 +76,39 @@ pub enum CompiledMatcher {
 
 #[derive(Debug, Clone)]
 pub enum PrecomputedAction {
-    Static { rcode: ResponseCode },
-    StaticIp { ip: String },
-    StaticCname { target: String, ttl: u32 },
+    Static {
+        rcode: ResponseCode,
+    },
+    StaticIp {
+        ip: String,
+        /// `ip` 读出的地址，每个查询不用再读一遍；读不出来时为 None / The addresses `ip` holds, so no query reads it
+        /// again; None when it cannot be read
+        addresses: Option<Box<[IpAddr]>>,
+    },
+    StaticCname {
+        target: String,
+        ttl: u32,
+    },
+}
+
+impl PrecomputedAction {
+    /// 这个动作对这个查询的决定 / What this action decides for this query
+    pub(crate) fn decision(&self, qname: &str, qtype: RecordType) -> Decision {
+        match self {
+            Self::Static { rcode } => Decision::Static {
+                rcode: *rcode,
+                answers: Vec::new(),
+            },
+            Self::StaticIp { ip, .. } => {
+                let (rcode, answers) = make_static_ip_answer(qname, qtype, ip);
+                Decision::Static { rcode, answers }
+            }
+            Self::StaticCname { target, ttl } => {
+                let (rcode, answers) = make_static_cname_answer(qname, target, *ttl);
+                Decision::Static { rcode, answers }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -273,7 +303,10 @@ fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
         Action::StaticResponse { rcode } => {
             parse_rcode(rcode).map(|rc| PrecomputedAction::Static { rcode: rc })
         }
-        Action::StaticIpResponse { ip } => Some(PrecomputedAction::StaticIp { ip: ip.clone() }),
+        Action::StaticIpResponse { ip } => Some(PrecomputedAction::StaticIp {
+            ip: ip.clone(),
+            addresses: static_ips(ip).map(Vec::into_boxed_slice),
+        }),
         Action::StaticCnameResponse { target, ttl } => Some(PrecomputedAction::StaticCname {
             target: target.clone(),
             ttl: ttl.unwrap_or(300),
@@ -305,12 +338,12 @@ pub(crate) fn fast_static_match(
         edns_present,
         None,
     )
-    .map(|(decision, _)| decision)
+    .map(|(action, _)| action.decision(qname, qtype))
 }
 
-/// Like [`fast_static_match`], additionally returning the name of the rule
-/// that produced the decision.
-/// 同 [`fast_static_match`]，并返回产生该决策的规则名。
+/// Like [`fast_static_match`], giving the matched rule's action instead of a decision, so that a
+/// caller who can answer from it need not make the records, and the name of that rule.
+/// 同 [`fast_static_match`]，但给出命中规则的动作而不是决策（能直接按动作回答的就不必做记录），以及规则名。
 pub(crate) fn fast_static_match_with_rule<'a>(
     pipeline: &'a CompiledPipeline,
     qname: &str,
@@ -319,7 +352,7 @@ pub(crate) fn fast_static_match_with_rule<'a>(
     client_ip: IpAddr,
     edns_present: bool,
     geoip: Option<&Arc<RwLock<GeoIpManager>>>,
-) -> Option<(Decision, &'a str)> {
+) -> Option<(&'a PrecomputedAction, &'a str)> {
     let candidates = pipeline.index.get_candidates(qname, qtype);
     for idx in candidates {
         let rule = pipeline.rules.get(idx)?;
@@ -351,22 +384,8 @@ pub(crate) fn fast_static_match_with_rule<'a>(
         }
         // 找到第一个匹配的规则
         // 如果它可预计算，使用快速路径；否则放弃快速路径以保持规则顺序
-        if let Some(pre) = &rule.precomputed {
-            let decision = match pre {
-                PrecomputedAction::Static { rcode } => Decision::Static {
-                    rcode: *rcode,
-                    answers: Vec::new(),
-                },
-                PrecomputedAction::StaticIp { ip } => {
-                    let (rcode, answers) = make_static_ip_answer(qname, qtype, ip);
-                    Decision::Static { rcode, answers }
-                }
-                PrecomputedAction::StaticCname { target, ttl } => {
-                    let (rcode, answers) = make_static_cname_answer(qname, target, *ttl);
-                    Decision::Static { rcode, answers }
-                }
-            };
-            return Some((decision, &rule.rule_name));
+        if let Some(action) = &rule.precomputed {
+            return Some((action, &rule.rule_name));
         } else {
             // 第一个匹配的规则不可预计算（如 Forward、Jump 等）
             // 放弃快速路径，让规则走正常路径以保持配置顺序

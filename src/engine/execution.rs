@@ -18,7 +18,7 @@ use tracing::warn;
 
 use crate::cache::CacheEntry;
 use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::advanced_rule::fast_static_match_with_rule;
+use crate::matcher::advanced_rule::{PrecomputedAction, fast_static_match_with_rule};
 use crate::observe::{
     CacheHit, CacheHitKind, DecisionDetail, DecisionKind, DecisionMade, EngineObserver,
     RequestContext, RequestOutcome, RequestStatus, RuleMatched, RulePhase,
@@ -26,7 +26,7 @@ use crate::observe::{
 use crate::proto_utils::parse_quick;
 
 use super::observation::{ObservedRequest, cached_source, report_decision, report_rule_cache_hit};
-use super::response::build_fast_static_response;
+use super::response::{StaticAddresses, build_fast_static_response, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse};
@@ -128,6 +128,18 @@ fn fast_client_reply(reply: Bytes, client: Option<&crate::ecs::EcsKey>) -> Bytes
         // A static answer depends on no ECS / 静态应答不取决于任何 ECS
         Some(_) => phases::client_reply(reply, client, 0),
         None => reply,
+    }
+}
+
+/// 写成字节的静态应答（见 [`write_static_reply`]）交给客户端前的样子。查询没有附加段就不会有 OPT，写好的就是最后的
+/// 样子，不必再规整一遍
+/// A static answer written as bytes (see [`write_static_reply`]) as it goes to the client. A query with
+/// no additional section has no OPT, and the answer as written is final, with nothing left to shape
+fn shaped_static_reply(reply: Bytes, packet: &[u8], client: Option<&crate::ecs::EcsKey>) -> Bytes {
+    if packet[10..12] == [0, 0] {
+        reply
+    } else {
+        crate::proto_utils::reply_as_asked(fast_client_reply(reply, client), packet)
     }
 }
 
@@ -755,17 +767,7 @@ impl Engine {
         // A static answer from a compiled rule or the rule cache. Report before `?`: a
         // response that cannot be built still ends the request here, and the listener
         // answers SERVFAIL by itself.
-        let answer_static = |rcode,
-                             answers: &Vec<hickory_proto::rr::Record>,
-                             answer: FastPathAnswer<'_>| {
-            let built =
-                build_fast_static_response(q.tx_id, qname_str, q.qtype, q.qclass, rcode, answers)
-                    .map(|reply| {
-                        crate::proto_utils::reply_as_asked(
-                            fast_client_reply(reply, q.client_subnet.as_ref()),
-                            packet,
-                        )
-                    });
+        let finish_static = |built: anyhow::Result<Bytes>, answer: FastPathAnswer<'_>| {
             if let Some(observer) = observed {
                 self.observe_fast_path(
                     observer,
@@ -777,30 +779,75 @@ impl Engine {
             }
             let resp = built?;
             let mut log = response_log();
-            log.info.upstream = Some(Arc::from("static"));
-            log.answered(&resp);
+            if log.is_enabled() {
+                log.info.upstream = Some(Arc::from("static"));
+                log.answered(&resp);
+            }
             anyhow::Ok(Some(FastPathResponse::Direct(resp)))
+        };
+        let answer_static = |rcode, answers: &Vec<hickory_proto::rr::Record>, answer| {
+            let built = match write_static_reply(packet, rcode, StaticAddresses::Records(answers)) {
+                Some(reply) => Ok(shaped_static_reply(reply, packet, q.client_subnet.as_ref())),
+                None => build_fast_static_response(
+                    q.tx_id, qname_str, q.qtype, q.qclass, rcode, answers,
+                )
+                .map(|reply| {
+                    crate::proto_utils::reply_as_asked(
+                        fast_client_reply(reply, q.client_subnet.as_ref()),
+                        packet,
+                    )
+                }),
+            };
+            finish_static(built, answer)
         };
 
         // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
         if let Some(compiled) = self.compiled_for(&state, &pipeline_id)
-            && let Some((Decision::Static { rcode, answers }, rule_name)) =
-                fast_static_match_with_rule(
-                    compiled,
-                    qname_str,
-                    qtype,
-                    qclass,
-                    peer.ip(),
-                    q.edns_present,
-                    Some(&self.geoip_manager),
-                )
+            && let Some((action, rule_name)) = fast_static_match_with_rule(
+                compiled,
+                qname_str,
+                qtype,
+                qclass,
+                peer.ip(),
+                q.edns_present,
+                Some(&self.geoip_manager),
+            )
         {
-            let answer = FastPathAnswer::StaticRule {
-                rule: rule_name,
-                rcode,
-                answers: answers.len(),
+            // 规则按配置直接答的不做记录，写不了的才走下面 / What a rule answers straight from the config makes no
+            // records; only what cannot be written goes on below
+            let direct = match action {
+                PrecomputedAction::Static { rcode } => {
+                    Some((*rcode, StaticAddresses::Configured(&[], qtype)))
+                }
+                PrecomputedAction::StaticIp {
+                    addresses: Some(addresses),
+                    ..
+                } => Some((
+                    ResponseCode::NoError,
+                    StaticAddresses::Configured(addresses, qtype),
+                )),
+                _ => None,
             };
-            return answer_static(rcode, &answers, answer);
+            if let Some((rcode, addresses)) = direct
+                && let Some(reply) = write_static_reply(packet, rcode, addresses)
+            {
+                let answers = usize::from(u16::from_be_bytes([reply[6], reply[7]]));
+                let answer = FastPathAnswer::StaticRule {
+                    rule: rule_name,
+                    rcode,
+                    answers,
+                };
+                let reply = shaped_static_reply(reply, packet, q.client_subnet.as_ref());
+                return finish_static(Ok(reply), answer);
+            }
+            if let Decision::Static { rcode, answers } = action.decision(qname_str, qtype) {
+                let answer = FastPathAnswer::StaticRule {
+                    rule: rule_name,
+                    rcode,
+                    answers: answers.len(),
+                };
+                return answer_static(rcode, &answers, answer);
+            }
         }
 
         // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
@@ -4778,6 +4825,302 @@ mod tests {
         })
     }
 
+    /// 一条查询的原始字节：`labels` 是问题名的各个标签，`additional` 接在问题后面
+    /// A query's raw bytes: `labels` make up the question name, `additional` follows the question
+    fn static_query(
+        id: u16,
+        flags: [u8; 2],
+        labels: &[Vec<u8>],
+        qtype: u16,
+        qclass: u16,
+        additional: (u16, &[u8]),
+    ) -> Vec<u8> {
+        let mut packet = id.to_be_bytes().to_vec();
+        packet.extend_from_slice(&flags);
+        packet.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+        packet.extend_from_slice(&additional.0.to_be_bytes());
+        for label in labels {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label);
+        }
+        packet.push(0);
+        packet.extend_from_slice(&qtype.to_be_bytes());
+        packet.extend_from_slice(&qclass.to_be_bytes());
+        packet.extend_from_slice(additional.1);
+        packet
+    }
+
+    /// 这条查询下，写成字节的和 hickory 搭出来再规整的一字不差。写不了（None）的走老路，也算对。交回比了几回
+    /// For this query, what is written as bytes is byte for byte what hickory builds and shaping then does.
+    /// What cannot be written (None) goes the old way, which is right too. Gives how many were compared
+    fn static_reply_agrees(packet: &[u8]) -> usize {
+        use super::super::response::make_static_ip_answer;
+        const ANSWERS: [(ResponseCode, &str); 8] = [
+            (ResponseCode::NoError, ""),
+            (ResponseCode::NXDomain, ""),
+            (ResponseCode::Refused, ""),
+            (ResponseCode::ServFail, ""),
+            (ResponseCode::NoError, "192.0.2.1"),
+            (ResponseCode::NoError, "2001:db8::1"),
+            (ResponseCode::NoError, "192.0.2.1,2001:db8::1,198.51.100.7"),
+            (ResponseCode::NoError, "0.0.0.0,::"),
+        ];
+        let mut buffer = [0u8; 256];
+        let Some(q) = parse_quick(packet, &mut buffer) else {
+            return 0;
+        };
+        let text = q.qname_str_unchecked();
+        let qtype = RecordType::from(q.qtype);
+        let subnet = q.client_subnet.as_ref();
+        let mut compared = 0;
+        for (rcode, ips) in ANSWERS {
+            let (rcode, records) = if ips.is_empty() {
+                (rcode, Vec::new())
+            } else {
+                make_static_ip_answer(text, qtype, ips)
+            };
+            let addresses = if ips.is_empty() {
+                Vec::new()
+            } else {
+                crate::engine::static_ips(ips).unwrap()
+            };
+            let old = || {
+                build_fast_static_response(q.tx_id, text, q.qtype, q.qclass, rcode, &records)
+                    .map(|reply| {
+                        crate::proto_utils::reply_as_asked(fast_client_reply(reply, subnet), packet)
+                    })
+                    .expect("what can be written can be built")
+            };
+            for written in [
+                write_static_reply(
+                    packet,
+                    rcode,
+                    StaticAddresses::Configured(&addresses, qtype),
+                ),
+                write_static_reply(packet, rcode, StaticAddresses::Records(&records)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let expected = old();
+                assert_eq!(
+                    shaped_static_reply(written, packet, subnet),
+                    expected,
+                    "{text} {qtype:?} {rcode:?} {ips}: {packet:?}"
+                );
+                compared += 1;
+            }
+        }
+        compared
+    }
+
+    /// 随机的名字（大小写、要转义的字节、点和反斜杠、零字节）、类型、类别、查询位、EDNS、ECS 和地址：写成字节的和 hickory
+    /// 的一字不差
+    /// Random names (case, bytes to escape, dots and backslashes in a label, zero bytes), types, classes, query
+    /// bits, EDNS, ECS and addresses: what is written as bytes is byte for byte hickory's
+    #[test]
+    fn a_static_reply_written_as_bytes_is_what_hickory_builds() {
+        const NAME_BYTES: &[u8] = b"abcXYZ019-_.\\ *\x00\xFF\x7F";
+        const PLAIN_BYTES: &[u8] = b"abcdefXYZ0189-";
+        let opt = |do_bit: u8, options: &[u8]| {
+            let mut record = vec![0, 0, 41, 0x10, 0, 0, 0, do_bit, 0];
+            record.extend_from_slice(&(options.len() as u16).to_be_bytes());
+            record.extend_from_slice(options);
+            record
+        };
+        let ecs = [0, 8, 0, 7, 0, 1, 24, 0, 192, 0, 2];
+        let another = [0, 0, 16, 0, 1, 0, 0, 0, 0, 0, 1, 0];
+        let additionals: [(u16, Vec<u8>); 6] = [
+            (0, Vec::new()),
+            (1, opt(0, &[])),
+            (1, opt(0x80, &[])),
+            (1, opt(0, &ecs)),
+            (1, another.to_vec()),
+            (2, [another.to_vec(), opt(0x80, &[])].concat()),
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut compared = 0;
+        for _ in 0..3_000 {
+            // 多数名字只有字母数字，少数带上别的字节：快速解析放弃的走不到这里 / Most names are alphanumeric and a few
+            // carry other bytes: what the quick parse gives up on never gets here
+            let bytes = if next() % 8 == 0 {
+                NAME_BYTES
+            } else {
+                PLAIN_BYTES
+            };
+            let labels: Vec<Vec<u8>> = (0..1 + next() % 4)
+                .map(|_| {
+                    (0..1 + next() % 12)
+                        .map(|_| bytes[(next() % bytes.len() as u64) as usize])
+                        .collect()
+                })
+                .collect();
+            let qtype = [1, 28, 255, 15, 16, 65_280][(next() % 6) as usize];
+            let qclass = [1, 1, 1, 3, 255][(next() % 5) as usize];
+            let flags = [(next() % 2) as u8, if next() % 2 == 0 { 0 } else { 0x10 }];
+            let additional = &additionals[(next() % 6) as usize];
+            compared += static_reply_agrees(&static_query(
+                next() as u16,
+                flags,
+                &labels,
+                qtype,
+                qclass,
+                (additional.0, &additional.1),
+            ));
+        }
+        assert!(compared > 20_000, "{compared}");
+    }
+
+    /// 名字的边界：63 字节的标签，线上正好 255 字节的名字。写得了就和 hickory 一样
+    /// The limits of a name: a 63-byte label, a name of exactly 255 bytes on the wire. What can be written is
+    /// hickory's
+    #[test]
+    fn a_static_reply_is_written_up_to_the_longest_name() {
+        let label = |len| vec![b'a'; len];
+        // 63 + 1 三个，61 + 1 一个，加根，正好 255 / Three of 63 + 1, one of 61 + 1, and the root: exactly 255
+        let longest = vec![label(63), label(63), label(63), label(61)];
+        for labels in [vec![label(63)], longest] {
+            let packet = static_query(7, [1, 0], &labels, 1, 1, (0, &[]));
+            assert!(static_reply_agrees(&packet) > 0);
+        }
+    }
+
+    /// 写不了的交回 None：压缩过的问题名、根名、截断的问题、要 OPT 的响应码、别的类型的记录、别的主人、别的类别
+    /// What cannot be written gives None: a compressed question name, the root, a question cut short, a
+    /// response code needing an OPT, records of another type, owner or class
+    #[test]
+    fn a_static_reply_it_cannot_write_is_left_to_hickory() {
+        use hickory_proto::rr::rdata::{A, CNAME};
+        use hickory_proto::rr::{Name, RData, Record};
+        let none = StaticAddresses::Records(&[]);
+        let name = Name::from_ascii("www.example.com.").unwrap();
+        let labels = [b"www".to_vec(), b"example".to_vec(), b"com".to_vec()];
+        let packet = static_query(7, [1, 0], &labels, 1, 1, (0, &[]));
+        assert!(write_static_reply(&packet, ResponseCode::NoError, none).is_some());
+
+        let mut compressed = packet[..12].to_vec();
+        compressed.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1]);
+        let root = static_query(7, [1, 0], &[], 1, 1, (0, &[]));
+        for unwritable in [&compressed[..], &root[..], &packet[..packet.len() - 1]] {
+            assert!(write_static_reply(unwritable, ResponseCode::NoError, none).is_none());
+        }
+        assert!(write_static_reply(&packet, ResponseCode::BADVERS, none).is_none());
+        // 线上 257 字节的名字 / A name of 257 bytes on the wire
+        let too_long = vec![
+            vec![b'a'; 63],
+            vec![b'b'; 63],
+            vec![b'c'; 63],
+            vec![b'd'; 63],
+        ];
+        let too_long = static_query(7, [1, 0], &too_long, 1, 1, (0, &[]));
+        assert!(write_static_reply(&too_long, ResponseCode::NoError, none).is_none());
+
+        let address = RData::A(A::new(192, 0, 2, 1));
+        let written = |record: Record| {
+            write_static_reply(
+                &packet,
+                ResponseCode::NoError,
+                StaticAddresses::Records(&[record]),
+            )
+        };
+        assert!(written(Record::from_rdata(name.clone(), 300, address.clone())).is_some());
+        let mut upper = Record::from_rdata(name.clone(), 300, address.clone());
+        upper.name = Name::from_ascii("WWW.example.com.").unwrap();
+        assert!(
+            written(upper).is_some(),
+            "the case of the owner does not matter"
+        );
+        for other_owner in [
+            "example.com.",
+            "www.example.",
+            "www.example.com.cn.",
+            "ww.example.com.",
+        ] {
+            let owner = Name::from_ascii(other_owner).unwrap();
+            assert!(written(Record::from_rdata(owner, 300, address.clone())).is_none());
+        }
+        let cname = RData::CNAME(CNAME(name.clone()));
+        assert!(written(Record::from_rdata(name.clone(), 300, cname)).is_none());
+        let mut chaos = Record::from_rdata(name, 300, address);
+        chaos.dns_class = DNSClass::CH;
+        assert!(written(chaos).is_none());
+    }
+
+    /// 快速路径上规则按配置答的（地址、响应码）和规则缓存答的，给出去的就是 hickory 搭的样子；CNAME 还走老路
+    /// What a rule answers from the config on the fast path (addresses, a response code) and what the rule
+    /// cache answers go out as hickory builds them; a CNAME still goes the old way
+    #[tokio::test]
+    async fn the_fast_path_answers_rules_with_written_bytes() {
+        let engine = engine_from_json(serde_json::json!({
+            "settings": { "default_upstream": DEAD_UPSTREAM },
+            "pipelines": [{ "id": "main", "rules": [
+                { "name": "ip", "matchers": [{ "type": "domain_suffix", "value": "ip.test" }],
+                  "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1,2001:db8::1" }] },
+                { "name": "no", "matchers": [{ "type": "domain_suffix", "value": "no.test" }],
+                  "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }] },
+                { "name": "deny", "matchers": [{ "type": "domain_suffix", "value": "deny.test" }],
+                  "actions": [{ "type": "deny" }] },
+                { "name": "alias", "matchers": [{ "type": "domain_suffix", "value": "alias.test" }],
+                  "actions": [{ "type": "static_cname_response", "target": "www.example.com" }] },
+            ] }]
+        }));
+        let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
+        let ask = |name: &str, qtype: RecordType| {
+            let mut query = Message::new(0x4242, MessageType::Query, OpCode::Query);
+            query.metadata.recursion_desired = true;
+            query.add_query(hickory_proto::op::Query::query(
+                hickory_proto::rr::Name::from_ascii(name).unwrap(),
+                qtype,
+            ));
+            let packet = query.to_vec().unwrap();
+            let Ok(Some(FastPathResponse::Direct(reply))) =
+                engine.handle_packet_fast(&packet, peer)
+            else {
+                panic!("{name} is answered on the spot");
+            };
+            Message::from_vec(&reply).unwrap()
+        };
+        // 配置里的地址读一次就留着，不用每个查询读 / The config's addresses are read once and kept, not for every query
+        let state = engine.state.load_full();
+        let compiled = engine.compiled_for(&state, "main").unwrap();
+        assert!(matches!(
+            compiled.rules[0].precomputed,
+            Some(PrecomputedAction::StaticIp { addresses: Some(ref addresses), .. }) if addresses.len() == 2
+        ));
+        let a = ask("A.Ip.Test.", RecordType::A);
+        assert_eq!(a.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(a.queries[0].name().to_string(), "A.Ip.Test.");
+        assert_eq!(a.answers.len(), 1);
+        assert_eq!(a.answers[0].ttl, 300);
+        assert_eq!(a.answers[0].data.to_string(), "192.0.2.1");
+        let aaaa = ask("a.ip.test.", RecordType::AAAA);
+        assert_eq!(aaaa.answers.len(), 1);
+        assert_eq!(aaaa.answers[0].data.to_string(), "2001:db8::1");
+        let mx = ask("a.ip.test.", RecordType::MX);
+        assert_eq!(mx.metadata.response_code, ResponseCode::NoError);
+        assert!(mx.answers.is_empty());
+        assert_eq!(
+            ask("a.no.test.", RecordType::A).metadata.response_code,
+            ResponseCode::NXDomain
+        );
+        assert_eq!(
+            ask("a.deny.test.", RecordType::A).metadata.response_code,
+            ResponseCode::Refused
+        );
+        let alias = ask("a.alias.test.", RecordType::A);
+        assert_eq!(alias.answers.len(), 1);
+        assert!(matches!(
+            alias.answers[0].data,
+            hickory_proto::rr::RData::CNAME(_)
+        ));
+    }
+
     /// 快速路径交出的是应答在缓存里实际停留的整秒数，写出去的 TTL 按它调低（RFC 1035 §5.2）
     /// The fast path hands over the whole seconds the answer really sat in the cache, and the TTLs
     /// written are lowered by them (RFC 1035 §5.2)
@@ -5770,14 +6113,19 @@ mod tests {
                         (None, Decision::Static { .. }) => *left_to_full_path,
                         (None, _) => true,
                         (
-                            Some((Decision::Static { rcode, answers }, _)),
+                            Some((action, _)),
                             Decision::Static {
                                 rcode: full_rcode,
                                 answers: full_answers,
                             },
                         ) => {
+                            let Decision::Static { rcode, answers } =
+                                action.decision(domain, RecordType::A)
+                            else {
+                                unreachable!("a fast-path action answers statically");
+                            };
                             !left_to_full_path
-                                && rcode == full_rcode
+                                && rcode == *full_rcode
                                 && format!("{answers:?}") == format!("{full_answers:?}")
                         }
                         (Some(_), _) => false,

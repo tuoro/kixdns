@@ -846,6 +846,42 @@ async fn an_observer_can_take_a_cache_hit_whole() {
     assert_eq!(observer.finished.lock().unwrap().len(), 2);
 }
 
+/// 快速路径上规则按配置答地址，上报的回答条数就是这个查询实际得到的条数
+/// A rule answering addresses from the config on the fast path reports how many answers this
+/// query really got
+#[tokio::test]
+async fn a_rules_addresses_are_counted_for_the_type_asked() {
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9" },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "ip",
+                "matchers": [{ "type": "domain_suffix", "value": "ip.test" }],
+                "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1,192.0.2.2,2001:db8::1" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    let fast = engine
+        .handle_packet_fast(&query("a.ip.test"), peer())
+        .unwrap();
+    assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
+    let answers: Vec<usize> = recorder
+        .drain()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Decision {
+                detail: Detail::Static { answers, .. },
+                ..
+            } => Some(answers),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answers, [2]);
+}
+
 #[tokio::test]
 async fn static_rule_is_reported_on_slow_and_fast_paths() {
     let raw = serde_json::json!({
