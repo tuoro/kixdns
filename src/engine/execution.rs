@@ -80,7 +80,7 @@ pub struct CacheKeys {
 /// 来自 handle_packet_fast 的预解析数据，避免重新解析
 #[derive(Debug, Clone)]
 pub struct PreParsedData {
-    qname: String,
+    qname: Arc<str>,
     qtype: hickory_proto::rr::RecordType,
     qclass: DNSClass,
     tx_id: u16,
@@ -89,7 +89,7 @@ pub struct PreParsedData {
 }
 impl PreParsedData {
     pub fn new(
-        qname: String,
+        qname: impl Into<Arc<str>>,
         qtype: u16,
         qclass: u16,
         tx_id: u16,
@@ -97,7 +97,7 @@ impl PreParsedData {
         pipeline_id: Arc<str>,
     ) -> Self {
         Self {
-            qname,
+            qname: qname.into(),
             qtype: hickory_proto::rr::RecordType::from(qtype),
             qclass: DNSClass::from(qclass),
             tx_id,
@@ -971,7 +971,7 @@ impl Engine {
         // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
         // 返回 AsyncNeeded 包含预解析数据，避免在 handle_packet 中重新解析
         Ok(Some(FastPathResponse::AsyncNeeded(PreParsedData::new(
-            qname_str.to_string(),
+            qname_str,
             q.qtype,
             q.qclass,
             q.tx_id,
@@ -1204,7 +1204,7 @@ impl Engine {
                         // ASCII 始终是有效的 UTF-8，所以这是安全的
                         let qname_str = unsafe { std::str::from_utf8_unchecked(q.qname_bytes) };
                         (
-                            qname_str.to_string(),
+                            Arc::<str>::from(qname_str),
                             hickory_proto::rr::RecordType::from(q.qtype),
                             DNSClass::from(q.qclass),
                             q.tx_id,
@@ -1217,7 +1217,7 @@ impl Engine {
                         let question = req.queries.first().context("empty question")?;
                         (
                             // The text parse_quick would have built / parse_quick 会拼出的同一段文本
-                            crate::proto_utils::name_text(question.name()),
+                            Arc::from(crate::proto_utils::name_text(question.name())),
                             question.query_type(),
                             question.query_class(),
                             req.metadata.id,
@@ -1674,7 +1674,7 @@ impl Engine {
                             phases::ForwardDecisionContext {
                                 state: &state,
                                 packet,
-                                qname,
+                                qname: qname_ref,
                                 qtype,
                                 qclass,
                                 tx_id,
@@ -2337,6 +2337,57 @@ mod tests {
 
     /// 合并查询只合并问同一个问题的请求。另一个问题的条目落在同一个键上时，请求自己转发，拿到的是自己
     /// 问题的应答，而不是那个条目交出的别的问题的应答。
+    /// 转发回来写进缓存的应答，共用请求和配置手里已有的那几份：Pipeline 名、上游的名字，每条应答不再各存一份
+    /// Answers cached after a forward share what the request and configuration already hold: the
+    /// pipeline's name and the upstream's name, with no copies per answer
+    #[tokio::test]
+    async fn a_cached_answer_shares_what_the_request_already_holds() {
+        let upstream = answering_upstream("192.0.2.20".parse().unwrap(), 300).await;
+        let (engine, _steps) = engine_with_steps(config_with_default_upstream(
+            serde_json::json!([]),
+            serde_json::json!([{ "id": "main", "rules": [{
+                "name": "all",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream.address }]
+            }] }]),
+            &upstream.address,
+        ));
+        let peer: SocketAddr = "10.0.0.1:53000".parse().unwrap();
+        let mut answers = Vec::new();
+        for name in ["one.example", "two.example"] {
+            let labels: Vec<Vec<u8>> = name.split('.').map(|l| l.as_bytes().to_vec()).collect();
+            let query = static_query(7, [1, 0], &labels, 1, 1, (0, &[]));
+            engine.handle_packet(&query, peer).await.unwrap();
+            let keys = Engine::cache_keys(
+                engine.state.load().cache_namespace("main"),
+                "main",
+                name.as_bytes(),
+                RecordType::A,
+                DNSClass::IN,
+                crate::proto_utils::QueryFlags::RECURSIVE,
+                &RequesterKey::NONE,
+                None,
+            );
+            answers.push(engine.cached_entries(keys.slot).remove(0));
+        }
+        let state = engine.state.load();
+        let pipeline = state.pipeline.pipeline("main").expect("configured");
+        for answer in &answers {
+            assert!(Arc::ptr_eq(&answer.pipeline_id, &pipeline.id), "pipeline");
+        }
+        let names: Vec<_> = answers
+            .iter()
+            .map(|answer| {
+                answer
+                    .upstream
+                    .clone()
+                    .expect("a forward names its upstream")
+            })
+            .collect();
+        assert!(Arc::ptr_eq(&names[0], &names[1]), "upstream");
+        assert_eq!(&*names[0], format!("udp:{}", upstream.address));
+    }
+
     /// Merging only merges requests asking the same question. When another question's entry lands
     /// on the same key, the request forwards by itself and gets the answer to its own question,
     /// not the other question's answer that entry hands out.
@@ -3057,9 +3108,10 @@ mod tests {
         // 另一个请求在刷新所用的 inflight 键下登记的条目 / Another request's entry under the refresh's inflight key
         let (owner, waiter) =
             tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
-        engine
-            .inflight
-            .insert(keys.inflight, InflightEntry::new(&question, owner));
+        engine.inflight.insert(
+            keys.inflight,
+            InflightEntry::new(&question).with_channel(owner),
+        );
 
         let refreshed = tokio::time::timeout(
             Duration::from_secs(5),
@@ -5699,7 +5751,7 @@ mod tests {
         let (tx, rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
         engine.inflight.insert(
             inflight,
-            InflightEntry::new(&stale_com_question(&engine), tx),
+            InflightEntry::new(&stale_com_question(&engine)).with_channel(tx),
         );
 
         let result = refresh(&engine, dedupe_hash).await;

@@ -389,10 +389,6 @@ impl Engine {
             skip_rules,
             ..
         } = *request;
-        // Borrow instead of clone: state lives for the entire function, no heap alloc
-        // 借用而非克隆：state 在整个函数生命周期内存活，零堆分配
-        let upstream_default = &state.pipeline.settings.default_upstream;
-
         // 2. Candidate Selection: every pipeline is compiled, and its index gives every rule
         // that can match (see `RuleIndex::add_rule`)
         // 2. 候选规则：每个 pipeline 都编译过，它的索引给出所有可能命中的规则（见 `RuleIndex::add_rule`）
@@ -503,7 +499,7 @@ impl Engine {
                         }
                         Action::Allow => {
                             let d = Decision::Forward {
-                                upstream: Arc::from(upstream_default.as_str()),
+                                upstream: state.pipeline.settings.default_upstream_arc(),
                                 pre_split_upstreams: None,
                                 response_matchers: Vec::new(),
                                 response_actions_on_match: Vec::new(),
@@ -527,11 +523,13 @@ impl Engine {
                             transport,
                             ecs,
                             pre_split_upstreams,
+                            upstream_shared,
                         } => {
-                            let upstream_addr: Arc<str> = upstream
-                                .as_ref()
-                                .map(|s| Arc::from(s.as_str()))
-                                .unwrap_or_else(|| Arc::from(upstream_default.as_str()));
+                            let upstream_addr: Arc<str> = match (upstream_shared, upstream) {
+                                (Some(shared), _) => Arc::clone(shared),
+                                (None, Some(upstream)) => Arc::from(upstream.as_str()),
+                                (None, None) => state.pipeline.settings.default_upstream_arc(),
+                            };
                             let d = Decision::Forward {
                                 upstream: upstream_addr,
                                 pre_split_upstreams: pre_split_upstreams.clone(),
@@ -750,6 +748,7 @@ mod continued_rule_cache_tests {
 /// computing it again is cheaper than storing an entry for every new name.
 #[cfg(test)]
 mod rule_cache_policy_tests {
+    use std::sync::Arc;
     use std::time::Instant;
 
     use hickory_proto::rr::{DNSClass, RecordType};
@@ -938,6 +937,53 @@ mod rule_cache_policy_tests {
         }
         kinds.sort_unstable();
         assert_eq!(kinds, ["forward", "jump", "static"]);
+    }
+
+    /// 规则和默认上游的决策共用配置加载时算好的那份上游名字，每次决策不再各分配一份
+    /// Decisions by a rule and by the default upstream share the upstream name made at config
+    /// load, rather than allocating one each
+    #[tokio::test]
+    async fn decisions_share_one_copy_of_their_upstream() {
+        let engine = engine_from(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "named",
+                    "matchers": [{ "type": "domain_suffix", "value": "named.example" }],
+                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:10" }]
+                }]
+            }]
+        }));
+        let state = engine.state.load_full();
+        let pipeline = &state.pipeline.pipelines[0];
+        let upstream_of = |name: &str| {
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            match engine.apply_rules(&state, pipeline, &request) {
+                Decision::Forward {
+                    upstream,
+                    rule_name,
+                    ..
+                } => (upstream, rule_name),
+                _ => panic!("every name here forwards"),
+            }
+        };
+        let first = upstream_of("a.named.example");
+        assert_eq!(&*first.0, "127.0.0.1:10");
+        assert!(Arc::ptr_eq(&first.0, &upstream_of("b.named.example").0));
+        let default = upstream_of("a.other.example");
+        assert_eq!((&*default.0, &*default.1), ("127.0.0.1:9", "default"));
+        let again = upstream_of("b.other.example");
+        assert!(Arc::ptr_eq(&default.0, &again.0));
+        assert!(Arc::ptr_eq(&default.1, &again.1));
     }
 
     /// 过期的决策不拿来用；重新求值后原地写回，访问计数还在，也就还留在淘汰队列原来的位置

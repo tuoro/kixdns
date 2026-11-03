@@ -818,7 +818,7 @@ impl RuntimePipelineConfig {
         })
     }
 
-    pub fn from_config(cfg: PipelineConfig) -> anyhow::Result<Self> {
+    pub fn from_config(mut cfg: PipelineConfig) -> anyhow::Result<Self> {
         // Validate cache_capacity configuration
         if cfg.settings.cache_capacity == 0 {
             anyhow::bail!("cache_capacity must be greater than 0");
@@ -996,6 +996,8 @@ impl RuntimePipelineConfig {
                 .chain(&mut rule.response_actions_on_miss)
                 .for_each(Action::pre_split_upstreams);
         }
+        cfg.settings.default_upstream_shared =
+            Some(Arc::from(cfg.settings.default_upstream.as_str()));
 
         // Build O(1) pipeline id lookup index / 构建 O(1) pipeline id 查找索引
         let pipeline_id_index: FxHashMap<Arc<str>, usize> = pipelines

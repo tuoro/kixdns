@@ -40,11 +40,11 @@ impl InflightCleanupGuard {
     pub fn hand_over(&mut self, reply: impl FnOnce() -> Bytes) {
         self.defuse();
         if let Some((_, entry)) = self.inflight.remove(&self.hash)
-            && entry.tx.receiver_count() > 0
+            && let Some(tx) = entry.waiting()
         {
             let reply = reply();
             if !crate::proto_utils::last_record_is_tsig(&reply) {
-                let _ = entry.tx.send(Ok(reply));
+                let _ = tx.send(Ok(reply));
             }
         }
     }

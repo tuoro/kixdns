@@ -21,7 +21,7 @@ use crate::engine::response::{
     make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
 };
 use crate::engine::types::EngineInner;
-use crate::engine::types::{InflightEntry, InflightQuestion, inflight_pending};
+use crate::engine::types::{InflightEntry, InflightQuestion};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::{InflightCleanupGuard, parse_rcode, set_id};
@@ -53,17 +53,21 @@ pub enum Decision {
     },
 }
 
+/// 没有规则作出决策时，决策记在这个名字下 / The name a decision goes under when no rule makes it
+static DEFAULT_RULE_NAME: std::sync::LazyLock<Arc<str>> =
+    std::sync::LazyLock::new(|| Arc::from("default"));
+
 impl Decision {
     /// 没有规则作出决策时：用 UDP 转发给默认上游 / When no rule decides: forwarded over UDP to
     /// the default upstream
     pub(crate) fn default_forward(settings: &crate::config::GlobalSettings) -> Self {
         Decision::Forward {
-            upstream: Arc::from(settings.default_upstream.as_str()),
+            upstream: settings.default_upstream_arc(),
             pre_split_upstreams: settings.default_upstream_pre_split.clone(),
             response_matchers: Vec::new(),
             response_actions_on_match: Vec::new(),
             response_actions_on_miss: Vec::new(),
-            rule_name: Arc::from("default"),
+            rule_name: Arc::clone(&DEFAULT_RULE_NAME),
             transport: Some(Transport::Udp),
             ecs: None,
             allow_reuse: false,
@@ -318,10 +322,10 @@ pub(crate) fn acquire_geo_locks<'a>(
 /// `reject_failure_reply_on_refresh` right after, so the refresh still gets the failure
 /// and leaves the cached entry alone.
 pub(crate) fn check_failure_reply(
-    resp: anyhow::Result<(Bytes, String)>,
+    resp: anyhow::Result<(Bytes, Arc<str>)>,
     on_match: &[Action],
     check: impl FnOnce(&Message) -> bool,
-) -> anyhow::Result<(Bytes, String)> {
+) -> anyhow::Result<(Bytes, Arc<str>)> {
     let Err(err) = resp else {
         return resp;
     };
@@ -543,6 +547,7 @@ async fn run_response_actions(
                 transport,
                 ecs: _,
                 pre_split_upstreams,
+                upstream_shared: _,
             } => {
                 forward_attempts += 1;
                 if forward_attempts > MAX_RESPONSE_FORWARDS {
@@ -610,7 +615,7 @@ async fn run_response_actions(
                 ctx.ctx_opt = Some(ResponseContext {
                     raw,
                     msg,
-                    upstream: Arc::from(actual_upstream.as_str()), // Use actual responding upstream
+                    upstream: actual_upstream, // Use actual responding upstream
                 });
             }
         }
@@ -891,7 +896,7 @@ pub(crate) async fn process_response_jump(
                 // it (see `handle_forward_decision_logged`)
                 let resp = if let Some(ctx) = reused_response.take_if(|_| allow_reuse) {
                     reused = true;
-                    Ok((ctx.raw, ctx.upstream.to_string()))
+                    Ok((ctx.raw, ctx.upstream))
                 } else {
                     // FIX: Background refresh must skip inflight check
                     // 修复：后台刷新必须跳过 inflight 检查
@@ -899,10 +904,8 @@ pub(crate) async fn process_response_jump(
                         use dashmap::mapref::entry::Entry;
                         let rx = match engine.inflight.entry(dedupe_hash) {
                             Entry::Vacant(entry) => {
-                                // No other request in progress, create watch channel
-                                // 没有其他请求在进行,创建 watch channel
-                                let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                                entry.insert(InflightEntry::new(&inflight_question, tx));
+                                // No other request in progress / 没有其他请求在进行
+                                entry.insert(InflightEntry::new(&inflight_question));
                                 cleanup_guards.push(InflightCleanupGuard::new(
                                     engine.inflight.clone(),
                                     dedupe_hash,
@@ -916,11 +919,10 @@ pub(crate) async fn process_response_jump(
                             // `InflightQuestion`)
                             // 同一个键下别的问题的条目：改为自己转发（见 `InflightQuestion`）
                             Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
-                            Entry::Occupied(entry) => {
+                            Entry::Occupied(mut entry) => {
                                 // Another request in progress, subscribe to its result
                                 // 已有请求在进行,订阅其结果
-                                let rx = entry.get().tx.subscribe();
-                                Some(rx)
+                                Some(entry.get_mut().subscribe())
                             }
                         };
 
@@ -1000,7 +1002,7 @@ pub(crate) async fn process_response_jump(
 
                 match resp {
                     Ok((raw, actual_upstream)) => {
-                        response.upstream = Some(Arc::from(actual_upstream.as_str()));
+                        response.upstream = Some(Arc::clone(&actual_upstream));
                         let msg = Message::from_bytes(&raw).context("parse upstream response")?;
 
                         let resp_match_ok = response_matches(
@@ -1040,7 +1042,7 @@ pub(crate) async fn process_response_jump(
                         let ctx = ResponseContext {
                             raw,
                             msg,
-                            upstream: Arc::from(actual_upstream.as_str()), // Use actual responding upstream
+                            upstream: actual_upstream, // Use actual responding upstream
                         };
                         let apply_ctx = ApplyResponseActionsContext {
                             engine,

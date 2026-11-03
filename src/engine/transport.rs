@@ -61,7 +61,7 @@ type UdpInflightMap = DashMap<
     (
         u16,
         SocketAddr,
-        Bytes,
+        Arc<[u8]>,
         oneshot::Sender<anyhow::Result<Bytes>>,
     ),
     FxBuildHasher,
@@ -353,8 +353,7 @@ impl UdpClient {
         // Copy the packet once so the ID can be rewritten; the same buffer is
         // sent and kept in the inflight entry for the answer's question check.
         // 只拷贝一次报文用于改写 ID；同一份缓冲既用于发送，也留在在途条目里供应答比对。
-        let mut new_packet = BytesMut::with_capacity(packet.len());
-        new_packet.extend_from_slice(packet);
+        let mut new_packet: Arc<[u8]> = Arc::from(packet);
 
         // Claim a free ID using the atomic entry API; on a collision with an
         // in-flight query draw a fresh random ID rather than the next one.
@@ -366,9 +365,10 @@ impl UdpClient {
         let new_packet = loop {
             match state.inflight.entry(new_id) {
                 entry::Entry::Vacant(e) => {
-                    new_packet[0..2].copy_from_slice(&new_id.to_be_bytes());
-                    let new_packet = new_packet.freeze();
-                    e.insert((original_id, addr, new_packet.clone(), tx));
+                    // 放进条目之前只有这一份 / There is only this one until it goes in the entry
+                    Arc::get_mut(&mut new_packet).expect("not shared yet")[0..2]
+                        .copy_from_slice(&new_id.to_be_bytes());
+                    e.insert((original_id, addr, Arc::clone(&new_packet), tx));
                     break new_packet;
                 }
                 entry::Entry::Occupied(_) => {

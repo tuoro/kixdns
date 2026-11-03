@@ -8,7 +8,7 @@ use crate::engine::refresh::{RefreshCheck, RefreshTarget};
 use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
-use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion, inflight_pending};
+use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
 use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::engine::utils::{InflightCleanupGuard, set_id};
@@ -503,11 +503,11 @@ pub fn handle_static_decision(
 pub struct ForwardDecisionContext<'a> {
     pub state: &'a Arc<EngineInner>,
     pub packet: &'a [u8],
-    pub qname: &'a str,
+    pub qname: &'a Arc<str>,
     pub qtype: RecordType,
     pub qclass: DNSClass,
     pub tx_id: u16,
-    pub pipeline_id: &'a str,
+    pub pipeline_id: &'a Arc<str>,
     pub rule_name: &'a str,
     pub keys: CacheKeys,
     pub min_ttl: Duration,
@@ -531,7 +531,7 @@ pub struct ForwardDecisionContext<'a> {
     /// `client_reply`), for the echo
     /// 请求跳离的 pipeline 让应答依赖的部分（见 `client_reply`），回显时用
     pub echo_floor: u8,
-    pub upstream: &'a str,
+    pub upstream: &'a Arc<str>,
     pub pre_split_upstreams: Option<&'a Arc<Vec<Arc<str>>>>,
     pub response_matchers: &'a [RuntimeResponseMatcherWithOp],
     pub response_actions_on_match: &'a [Action],
@@ -595,7 +595,7 @@ pub(crate) async fn handle_forward_decision_logged(
         observed,
     } = context;
 
-    response.upstream = Some(Arc::from(upstream));
+    response.upstream = Some(Arc::clone(upstream));
     let view = requester.ecs_view();
     let question = CachedQuestion {
         qname,
@@ -674,14 +674,17 @@ pub(crate) async fn handle_forward_decision_logged(
     // 等已经在问的那个
     let resp = if let Some(ctx) = reused_response.take_if(|_| allow_reuse) {
         reused = true;
-        Ok((ctx.raw, ctx.upstream.to_string()))
+        Ok((ctx.raw, ctx.upstream))
     } else {
         if !skip_cache {
             use dashmap::mapref::entry::Entry;
             let rx = match engine.inflight.entry(keys.inflight) {
                 Entry::Vacant(entry) => {
-                    let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-                    entry.insert(InflightEntry::new(&inflight_question, tx));
+                    entry.insert(InflightEntry::sharing(
+                        &inflight_question,
+                        pipeline_id,
+                        Arc::<[u8]>::from(Arc::clone(qname)),
+                    ));
                     cleanup_guard = Some(InflightCleanupGuard::new(
                         engine.inflight.clone(),
                         keys.inflight,
@@ -704,10 +707,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
                 // 别的问题的应答交给这个请求。它自己转发。
                 Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
-                Entry::Occupied(entry) => {
-                    let rx = entry.get().tx.subscribe();
-                    Some(rx)
-                }
+                Entry::Occupied(mut entry) => Some(entry.get_mut().subscribe()),
             };
 
             if let Some(mut rx) = rx
@@ -820,8 +820,8 @@ pub(crate) async fn handle_forward_decision_logged(
                 bytes.clone(),
                 rcode,
                 upstream,
-                qname,
-                Arc::from(pipeline_id),
+                Arc::clone(qname),
+                Arc::clone(pipeline_id),
                 u16::from(qtype),
                 keys.flags,
                 ttls,
@@ -844,7 +844,7 @@ pub(crate) async fn handle_forward_decision_logged(
         // the two in only a few places (see `failure`)
         let (actions, ctx_opt, req, failure) = match resp {
             Ok((raw, actual_upstream)) => {
-                response.upstream = Some(Arc::from(actual_upstream.as_str()));
+                response.upstream = Some(Arc::clone(&actual_upstream));
                 // Response rules read the parsed message, so they always take hickory's.
                 // Otherwise the quick parse is cached as read for a reply whose structure
                 // holds up (see `well_formed_reply`); any other is cached as hickory reads
@@ -927,7 +927,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         cache(
                             &raw,
                             rcode,
-                            Some(Arc::from(actual_upstream.as_str())),
+                            Some(actual_upstream),
                             (cache_ttl, refresh_ttl),
                             trail,
                         );
@@ -952,7 +952,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 let ctx = ResponseContext {
                     raw,
                     msg,
-                    upstream: Arc::from(actual_upstream.as_str()),
+                    upstream: actual_upstream,
                 };
                 (actions_to_run, Some(ctx), req_full, None)
             }

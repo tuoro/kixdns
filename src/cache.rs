@@ -53,26 +53,27 @@ impl CacheEntry {
         bytes: Bytes,
         rcode: ResponseCode,
         upstream: Option<Arc<str>>,
-        qname: &str,
+        qname: impl Into<Arc<str>>,
         pipeline_id: Arc<str>,
         qtype: u16,
         flags: QueryFlags,
         ttls: (u32, u32),
     ) -> Self {
+        let now = Instant::now();
         Self {
             bytes,
             rcode,
             upstream,
-            qname: Arc::from(qname),
+            qname: qname.into(),
             pipeline_id,
             qtype,
             flags,
-            inserted_at: Instant::now(),
+            inserted_at: now,
             original_ttl: ttls.0,
             refresh_ttl: ttls.1,
             reach: EcsReach::default(),
-            stored_at: Instant::now(),
-            fetched_at: Instant::now(),
+            stored_at: now,
+            fetched_at: now,
         }
     }
 

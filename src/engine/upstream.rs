@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ pub struct UpstreamFailure {
     /// were asked together, with the upstream that sent it (`transport:address`); none when
     /// every attempt was a transport error. The rule's answer check still reads it (see
     /// `rules::check_failure_reply`)
-    reply: Option<(Bytes, String)>,
+    reply: Option<(Bytes, Arc<str>)>,
 }
 
 impl UpstreamFailure {
@@ -47,14 +48,14 @@ impl UpstreamFailure {
 
     /// 同 [`Self::error`]，带着最先收到的失败应答 / As [`Self::error`], carrying the first
     /// failure reply received
-    fn with_reply(source: anyhow::Error, reply: Option<(Bytes, String)>) -> anyhow::Error {
+    fn with_reply(source: anyhow::Error, reply: Option<(Bytes, Arc<str>)>) -> anyhow::Error {
         anyhow::Error::new(Self { source, reply })
     }
 
     /// `err` 是上游都失败了、而且带着失败应答时，那个应答和回它的上游
     /// The failure reply `err` carries, and the upstream that sent it, when `err` is an
     /// every-upstream-failed error with one
-    pub(crate) fn reply_of(err: &anyhow::Error) -> Option<&(Bytes, String)> {
+    pub(crate) fn reply_of(err: &anyhow::Error) -> Option<&(Bytes, Arc<str>)> {
         err.downcast_ref::<Self>()
             .and_then(|failure| failure.reply.as_ref())
     }
@@ -143,14 +144,22 @@ fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Trans
 /// The transport an upstream prefix names; None for a prefix it does not know
 /// ([`parse_upstream_addr`] then takes the default transport)
 pub(crate) fn transport_for_scheme(scheme: &str) -> Option<Transport> {
-    Some(match scheme.to_lowercase().as_str() {
-        "tcp" => Transport::Tcp,
-        "udp" => Transport::Udp,
-        "tcp+udp" | "udp+tcp" => Transport::TcpUdp,
-        "doh" | "https" => Transport::Doh,
-        "dot" | "tls" => Transport::Dot,
-        "doq" | "quic" => Transport::Doq,
-        _ => return None,
+    // 每个转发都要看一次，不为大小写分配内存 / Every forward looks once, so case costs no allocation
+    let is = |name: &str| scheme.eq_ignore_ascii_case(name);
+    Some(if is("tcp") {
+        Transport::Tcp
+    } else if is("udp") {
+        Transport::Udp
+    } else if is("tcp+udp") || is("udp+tcp") {
+        Transport::TcpUdp
+    } else if is("doh") || is("https") {
+        Transport::Doh
+    } else if is("dot") || is("tls") {
+        Transport::Dot
+    } else if is("doq") || is("quic") {
+        Transport::Doq
+    } else {
+        return None;
     })
 }
 
@@ -443,6 +452,10 @@ async fn forward_tcp_udp_dual(
 /// 几个上游一起问时，刚回过 429、正在暂停的 DoH 上游这次不问（见 [`without_paused`]）。
 /// When several upstreams are asked together, a DoH upstream that answered 429 a moment
 /// ago and is paused is not asked this time (see [`without_paused`]).
+/// 一个规则的上游，通常一两个，放得下时不分配内存 / A rule's upstreams, usually one or two, which
+/// take no allocation while they fit
+type Upstreams = smallvec::SmallVec<[Arc<str>; 4]>;
+
 pub async fn forward_upstream(
     engine: &Engine,
     packet: &[u8],
@@ -451,7 +464,7 @@ pub async fn forward_upstream(
     transport: Option<Transport>,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
-) -> anyhow::Result<(Bytes, String)> {
+) -> anyhow::Result<(Bytes, Arc<str>)> {
     let packet = crate::proto_utils::query_without_cookie(packet);
     let guarded = |reply| {
         let reply = crate::proto_utils::reply_without_cookie(reply);
@@ -498,17 +511,17 @@ async fn forward_upstream_as_is(
     transport: Option<Transport>,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
-) -> anyhow::Result<(Bytes, String)> {
+) -> anyhow::Result<(Bytes, Arc<str>)> {
     // 如果 transport 为 None，使用默认 UDP
     let default_transport = transport.unwrap_or(Transport::Udp);
 
     // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
     // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
-    let upstreams: Vec<std::sync::Arc<str>> = if let Some(pre_split) = pre_split_upstreams {
+    let upstreams: Upstreams = if let Some(pre_split) = pre_split_upstreams {
         pre_split.iter().cloned().collect()
     } else if !upstream.contains(',') {
         // 单个上游：直接转发 / Single upstream: direct forward
-        vec![std::sync::Arc::from(upstream)]
+        smallvec::smallvec![std::sync::Arc::from(upstream)]
     } else {
         upstream
             .split(',')
@@ -550,12 +563,10 @@ async fn forward_upstream_as_is(
             send_to_upstream(engine, packet, addr, timeout_dur, transport_for_addr, tcp).await;
         let dur = start.elapsed();
 
-        let upstream_with_proto = format!("{}:{}", transport_label(via), addr);
-
         match res {
-            Ok(ref bytes) => {
+            Ok(bytes) => {
                 // Quick check rcode / 快速解析响应码
-                let quick = crate::proto_utils::parse_response_quick(bytes);
+                let quick = crate::proto_utils::parse_response_quick(&bytes);
                 if let Some((observer, ctx)) = observed {
                     observer.upstream_result(
                         ctx,
@@ -579,7 +590,7 @@ async fn forward_upstream_as_is(
                 if let Some(qr) = quick {
                     tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
                 }
-                return Ok((bytes.clone(), upstream_with_proto));
+                return Ok((bytes, upstream_label(via, addr)));
             }
             Err(err) => {
                 let outcome = failed_outcome(&err);
@@ -621,7 +632,7 @@ async fn forward_upstream_as_is(
     // 最先收到的失败应答，全都失败时带出去（见 `UpstreamFailure::reply`）
     // The first failure reply received, carried out when every attempt fails (see
     // `UpstreamFailure::reply`)
-    let mut first_failure_reply: Option<(Bytes, String)> = None;
+    let mut first_failure_reply: Option<(Bytes, Arc<str>)> = None;
     // Attempts that have not reported a result yet, so losers of the race can
     // be reported as aborted; only tracked for an observer.
     // 尚未上报结果的尝试，用于把竞争失败者上报为已取消；仅在有观察者时跟踪。
@@ -683,7 +694,7 @@ async fn forward_upstream_as_is(
 
             // Note: for TcpUdp, timing includes both tasks' spawn/abort overhead
             // 注意：对于 TcpUdp，计时包含两个任务的 spawn/abort 开销
-            let upstream_with_proto = format!("{}:{}", transport_label(via), addr_owned);
+            let upstream_with_proto = upstream_label(via, &addr_owned);
             let dur = start.elapsed();
             (
                 upstream_with_proto,
@@ -792,10 +803,10 @@ async fn forward_upstream_as_is(
 /// all: a pause only lets the others answer, it never leaves a forward with nobody to ask.
 fn without_paused(
     engine: &Engine,
-    upstreams: Vec<std::sync::Arc<str>>,
+    upstreams: Upstreams,
     default_transport: Transport,
     observed: Observed<'_>,
-) -> Vec<std::sync::Arc<str>> {
+) -> Upstreams {
     // 通常没有上游在暂停：只花一次原子读取，地址都不解析
     // Usually no upstream is paused: one atomic load, and no address is parsed
     if upstreams.len() < 2 || !engine.doh_client.any_paused() {
@@ -931,6 +942,36 @@ fn transport_label(via: Transport) -> &'static str {
     }
 }
 
+/// 记住的上游名字最多这么多个，配置里写不了这么多；再多的现算，不记 / The most upstream names kept,
+/// more than a configuration writes; any further are built each time and not kept
+const UPSTREAM_LABELS: usize = 4096;
+
+/// 上游在应答记录里的名字（`udp:1.1.1.1:53`）。每个转发回来的应答都带一个，而上游只有配置里那几个，
+/// 算过就留着：之后不分配内存，所有应答共用一份。
+/// An upstream's name in the records of its answers (`udp:1.1.1.1:53`). Every answer back
+/// from a forward carries one and the configuration only has so many upstreams, so each is
+/// kept once built: no allocation after that, and all answers share one copy.
+fn upstream_label(via: Transport, addr: &str) -> Arc<str> {
+    type Labels = dashmap::DashMap<Box<str>, Arc<str>, rustc_hash::FxBuildHasher>;
+    static LABELS: std::sync::LazyLock<[Labels; 5]> =
+        std::sync::LazyLock::new(|| std::array::from_fn(|_| Labels::default()));
+    let labels = &LABELS[match via {
+        Transport::Udp | Transport::TcpUdp => 0,
+        Transport::Tcp => 1,
+        Transport::Doh => 2,
+        Transport::Dot => 3,
+        Transport::Doq => 4,
+    }];
+    if let Some(label) = labels.get(addr) {
+        return Arc::clone(&label);
+    }
+    let label: Arc<str> = Arc::from(format!("{}:{addr}", transport_label(via)));
+    if labels.len() < UPSTREAM_LABELS {
+        labels.insert(addr.into(), Arc::clone(&label));
+    }
+    label
+}
+
 /// The point by which an upstream should have answered: the budget of a UDP
 /// query's first attempt, after which it is retried.
 /// 上游应当已经应答的时间点：UDP 查询第一次尝试的时间预算，过了就重试。
@@ -1030,6 +1071,72 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    /// 上游地址的前缀不分大小写，别的都不认 / An upstream's prefix takes any case, and nothing else
+    #[test]
+    fn a_scheme_is_read_in_any_case() {
+        for (scheme, transport) in [
+            ("tcp", Transport::Tcp),
+            ("TCP", Transport::Tcp),
+            ("udp", Transport::Udp),
+            ("Udp", Transport::Udp),
+            ("tcp+udp", Transport::TcpUdp),
+            ("UDP+tcp", Transport::TcpUdp),
+            ("doh", Transport::Doh),
+            ("HTTPS", Transport::Doh),
+            ("dot", Transport::Dot),
+            ("TLS", Transport::Dot),
+            ("doq", Transport::Doq),
+            ("QuIc", Transport::Doq),
+        ] {
+            assert_eq!(transport_for_scheme(scheme), Some(transport), "{scheme}");
+        }
+        for scheme in ["", "tc", "tcpp", "http", "udp+udp", "tc\u{0440}"] {
+            assert_eq!(transport_for_scheme(scheme), None, "{scheme}");
+        }
+    }
+
+    /// 上游的名字算一次，之后所有应答共用；双发算 UDP
+    /// An upstream's name is built once and all answers share it; a dual send counts as UDP
+    #[test]
+    fn an_upstream_name_is_built_once_and_shared() {
+        let first = upstream_label(Transport::Udp, "192.0.2.1:53");
+        assert_eq!(&*first, "udp:192.0.2.1:53");
+        assert!(Arc::ptr_eq(
+            &first,
+            &upstream_label(Transport::Udp, "192.0.2.1:53")
+        ));
+        assert!(Arc::ptr_eq(
+            &first,
+            &upstream_label(Transport::TcpUdp, "192.0.2.1:53")
+        ));
+        assert_eq!(
+            &*upstream_label(Transport::Udp, "192.0.2.2:53"),
+            "udp:192.0.2.2:53"
+        );
+        for (via, label) in [
+            (Transport::Tcp, "tcp:192.0.2.1:53"),
+            (Transport::Doh, "doh:192.0.2.1:53"),
+            (Transport::Dot, "dot:192.0.2.1:53"),
+            (Transport::Doq, "doq:192.0.2.1:53"),
+        ] {
+            assert_eq!(&*upstream_label(via, "192.0.2.1:53"), label);
+        }
+    }
+
+    /// 记住的名字有上限，再多的现算，名字照样对
+    /// The names kept are limited; further ones are built each time, and still right
+    #[test]
+    fn upstream_names_past_the_limit_are_not_kept() {
+        for i in 0..UPSTREAM_LABELS {
+            upstream_label(Transport::Doq, &format!("limit-{i}.example"));
+        }
+        let first = upstream_label(Transport::Doq, "past-the-limit.example");
+        let second = upstream_label(Transport::Doq, "past-the-limit.example");
+        assert_eq!(&*first, "doq:past-the-limit.example");
+        assert_eq!(first, second);
+        assert!(!Arc::ptr_eq(&first, &second), "not kept");
+    }
 
     #[test]
     fn test_parse_upstream_addr_with_protocol_prefix() {

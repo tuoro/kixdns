@@ -64,10 +64,15 @@ impl InflightQuestion<'_> {
 /// asked
 #[derive(Debug)]
 pub struct InflightEntry {
-    pub(crate) tx: watch::Sender<InflightResult>,
+    /// 结果从这里发给等着的请求。第一个来等的请求才建：绝大多数查询没人等，这样它们既不用建通道，放下
+    /// 条目时也不用通知谁
+    /// The result goes out here to the requests waiting. The first to wait builds it: nearly
+    /// every query has none waiting, and so neither builds a channel nor notifies anyone
+    /// when its entry goes
+    tx: Option<watch::Sender<InflightResult>>,
     namespace: u64,
-    pipeline_id: Box<str>,
-    qname: Box<[u8]>,
+    pipeline_id: Arc<str>,
+    qname: Arc<[u8]>,
     qtype: RecordType,
     qclass: DNSClass,
     flags: QueryFlags,
@@ -76,19 +81,53 @@ pub struct InflightEntry {
 }
 
 impl InflightEntry {
-    /// `question` 的条目，结果从 `tx` 发出 / The entry of `question`, whose result goes out on `tx`
-    pub(crate) fn new(question: &InflightQuestion<'_>, tx: watch::Sender<InflightResult>) -> Self {
+    /// `question` 的条目 / The entry of `question`
+    pub(crate) fn new(question: &InflightQuestion<'_>) -> Self {
+        Self::sharing(
+            question,
+            &Arc::from(question.pipeline_id),
+            Arc::from(question.qname),
+        )
+    }
+
+    /// `question` 的条目，`pipeline_id` 和 `qname` 就是它问的，请求手里已经有一份，不再另存
+    /// The entry of `question`, whose `pipeline_id` and `qname` the request already holds a
+    /// copy of, so that no other is made
+    pub(crate) fn sharing(
+        question: &InflightQuestion<'_>,
+        pipeline_id: &Arc<str>,
+        qname: Arc<[u8]>,
+    ) -> Self {
         Self {
-            tx,
+            tx: None,
             namespace: question.namespace,
-            pipeline_id: question.pipeline_id.into(),
-            qname: question.qname.into(),
+            pipeline_id: Arc::clone(pipeline_id),
+            qname,
             qtype: question.qtype,
             qclass: question.qclass,
             flags: question.flags,
             requester: question.requester,
             client_ecs: question.client_ecs,
         }
+    }
+
+    /// 等这个条目的结果 / Wait for this entry's result
+    pub(crate) fn subscribe(&mut self) -> watch::Receiver<InflightResult> {
+        self.tx
+            .get_or_insert_with(|| watch::channel(inflight_pending()).0)
+            .subscribe()
+    }
+
+    /// 有请求在等时，结果从这里发给它们 / Where the result goes out, when any request waits
+    pub(crate) fn waiting(&self) -> Option<&watch::Sender<InflightResult>> {
+        self.tx.as_ref().filter(|tx| tx.receiver_count() > 0)
+    }
+
+    /// 测试用：结果从 `tx` 发出的条目 / For tests: the entry whose result goes out on `tx`
+    #[cfg(test)]
+    pub(crate) fn with_channel(mut self, tx: watch::Sender<InflightResult>) -> Self {
+        self.tx = Some(tx);
+        self
     }
 
     /// 条目是不是 `question` 的：只有问的完全一样，才能等它的结果
@@ -121,13 +160,77 @@ pub(crate) fn inflight_pending() -> InflightResult {
 
 #[cfg(test)]
 mod inflight_entry_tests {
-    use super::{InflightEntry, InflightQuestion, inflight_pending};
+    use super::{InflightEntry, InflightQuestion};
     use crate::ecs::EcsKey;
     use crate::matcher::RequesterKey;
     use hickory_proto::rr::{DNSClass, RecordType};
 
     /// 条目只认问得完全一样的请求：问题的任何一部分不同都不算 / An entry is only for a request asking
     /// exactly the same: any part of the question differing rules it out
+    /// 这些测试问的问题 / The question these tests ask
+    fn asked<'a>(pipeline_id: &'a str, qname: &'a [u8]) -> InflightQuestion<'a> {
+        InflightQuestion {
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            namespace: 1,
+            pipeline_id,
+            qname,
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+    }
+
+    /// 没人等时没有通道；第一个来等的请求建通道，之后来的等同一个
+    /// No channel while nobody waits; the first to wait builds it and later ones wait on the same
+    #[tokio::test]
+    async fn the_channel_is_built_by_the_first_to_wait() {
+        let mut entry = InflightEntry::new(&asked("main", b"example.com"));
+        assert!(entry.waiting().is_none(), "nobody waits");
+        let mut first = entry.subscribe();
+        let mut second = entry.subscribe();
+        let tx = entry.waiting().expect("two wait");
+        assert_eq!(tx.receiver_count(), 2);
+        tx.send(Ok(bytes::Bytes::from_static(b"answer"))).unwrap();
+        for rx in [&mut first, &mut second] {
+            rx.changed().await.unwrap();
+            let got = rx.borrow().as_ref().map(bytes::Bytes::clone).unwrap();
+            assert_eq!(&got[..], b"answer");
+        }
+        drop((first, second));
+        assert!(entry.waiting().is_none(), "nobody waits any more");
+    }
+
+    /// 放下条目时没发结果，等着的请求会知道，好自己去转发
+    /// An entry going without a result tells those waiting, who then forward themselves
+    #[tokio::test]
+    async fn an_entry_going_without_a_result_ends_the_wait() {
+        let mut entry = InflightEntry::new(&asked("main", b"example.com"));
+        let mut rx = entry.subscribe();
+        drop(entry);
+        assert!(rx.changed().await.is_err());
+    }
+
+    /// 共用请求手里那份时，比的还是问题本身，不多存一份
+    /// Sharing what the request holds, the entry still compares the question itself and keeps
+    /// no copy of its own
+    #[test]
+    fn an_entry_can_share_what_the_request_holds() {
+        let pipeline: std::sync::Arc<str> = "main".into();
+        let qname: std::sync::Arc<str> = "example.com".into();
+        let question = asked(&pipeline, qname.as_bytes());
+        let entry = InflightEntry::sharing(
+            &question,
+            &pipeline,
+            std::sync::Arc::<[u8]>::from(std::sync::Arc::clone(&qname)),
+        );
+        assert!(entry.asks(&question));
+        assert!(!entry.asks(&asked("main", b"example.org")));
+        assert!(!entry.asks(&asked("other", b"example.com")));
+        assert_eq!(std::sync::Arc::strong_count(&pipeline), 2);
+        assert_eq!(std::sync::Arc::strong_count(&qname), 2);
+    }
+
     #[test]
     fn an_entry_is_only_for_its_own_question() {
         let question = InflightQuestion {
@@ -140,8 +243,7 @@ mod inflight_entry_tests {
             requester: RequesterKey::NONE,
             client_ecs: None,
         };
-        let (tx, _rx) = tokio::sync::watch::channel(inflight_pending());
-        let entry = InflightEntry::new(&question, tx);
+        let entry = InflightEntry::new(&question);
         assert!(entry.asks(&question));
         let others = [
             InflightQuestion {
@@ -300,6 +402,7 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         dashmap_shards,
         default_upstream,
         default_upstream_pre_split: _,
+        default_upstream_shared: _,
         upstream_timeout_ms,
         request_timeout_ms,
         response_jump_limit,
