@@ -43,7 +43,7 @@ use crate::observe::{
     RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
     UpstreamSkipReason, UpstreamSkipped,
 };
-use crate::panel_querylog::{self, QueryLog};
+use crate::panel_querylog::{self, QueryLog, WallClock};
 use crate::panel_trace;
 use sha2::{Digest, Sha256};
 
@@ -255,6 +255,7 @@ where
 /// `statistics_anonymize_client_ip` still load but no longer do anything.
 struct QueryStats {
     buckets: Box<[QueryStatsBucket]>,
+    wall: WallClock,
 }
 
 impl Default for QueryStats {
@@ -263,6 +264,7 @@ impl Default for QueryStats {
             buckets: (0..QUERY_STATS_BUCKETS)
                 .map(|_| QueryStatsBucket::new())
                 .collect(),
+            wall: WallClock::default(),
         }
     }
 }
@@ -316,8 +318,8 @@ impl QueryStats {
     }
 
     #[inline]
-    fn record(&self, domain: &str, client: IpAddr) {
-        self.record_at(domain, client, unix_timestamp());
+    fn record(&self, domain: &str, client: IpAddr, at: Instant) {
+        self.record_at(domain, client, self.wall.unix_ms_at(at) / 1_000);
     }
 
     fn record_at(&self, domain: &str, client: IpAddr, now: u64) {
@@ -667,8 +669,8 @@ impl PanelMetrics {
     }
 
     #[inline]
-    fn record_query(&self, domain: &str, client: IpAddr) {
-        self.query_stats.record(domain, client);
+    fn record_query(&self, domain: &str, client: IpAddr, at: Instant) {
+        self.query_stats.record(domain, client, at);
     }
 
     #[inline]
@@ -1136,7 +1138,7 @@ impl EngineObserver for PanelMetrics {
             // Diagnostic queries count toward request metrics but stay out of the query ranking:
             // test domains and an assigned client IP are not real traffic
             if !panel_trace::active() {
-                self.record_query(ctx.qname, ctx.client.ip());
+                self.record_query(ctx.qname, ctx.client.ip(), ctx.started);
             }
         }
         self.query_log.request_started(ctx, panel_trace::active());
@@ -2490,6 +2492,8 @@ mod tests {
             qtype: hickory_proto::rr::RecordType::A,
             qclass: hickory_proto::rr::DNSClass::IN,
             background_refresh: false,
+            started: std::time::Instant::now(),
+            reported_at_once: false,
         }
     }
 
@@ -3214,7 +3218,11 @@ mod tests {
             r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
             Vec::new(),
         );
-        metrics.record_query("example.com", "192.168.1.42".parse().unwrap());
+        metrics.record_query(
+            "example.com",
+            "192.168.1.42".parse().unwrap(),
+            std::time::Instant::now(),
+        );
         let snapshot = metrics
             .query_stats
             .snapshot(super::unix_timestamp(), 3_600, 20);
@@ -3345,7 +3353,11 @@ mod tests {
     #[test]
     fn stats_json_says_always_on_with_whole_addresses_and_clears() {
         let metrics = PanelMetrics::default();
-        metrics.record_query("example.com", "192.168.1.42".parse().unwrap());
+        metrics.record_query(
+            "example.com",
+            "192.168.1.42".parse().unwrap(),
+            std::time::Instant::now(),
+        );
         let stats = metrics.stats_json(3_600, 20);
         assert_eq!(stats["enabled"], true);
         assert_eq!(stats["anonymized_clients"], false);

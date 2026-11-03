@@ -4,7 +4,6 @@
 //! 引擎内部上报观察者事件的辅助函数。仅在确认安装了观察者后才会执行。
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -30,7 +29,6 @@ pub(crate) type Observed<'a> = Option<(&'a dyn EngineObserver, &'a RequestContex
 pub(crate) struct ObservedRequest<'a> {
     pub observer: &'a dyn EngineObserver,
     pub ctx: RequestContext<'a>,
-    start: Instant,
     status: RequestStatus,
     /// The response lent to `request_finished`; a cheap reference-counted
     /// clone of the bytes the engine returns.
@@ -42,11 +40,10 @@ pub(crate) struct ObservedRequest<'a> {
 }
 
 impl<'a> ObservedRequest<'a> {
-    pub fn new(observer: &'a dyn EngineObserver, ctx: RequestContext<'a>, start: Instant) -> Self {
+    pub fn new(observer: &'a dyn EngineObserver, ctx: RequestContext<'a>) -> Self {
         Self {
             observer,
             ctx,
-            start,
             status: RequestStatus::Cancelled,
             response: None,
             error: None,
@@ -74,7 +71,7 @@ impl Drop for ObservedRequest<'_> {
         self.observer.request_finished(
             &self.ctx,
             &RequestOutcome {
-                latency: self.start.elapsed(),
+                latency: self.ctx.started.elapsed(),
                 status: self.status,
                 response: self.response.as_deref(),
                 error: self.error.as_deref(),

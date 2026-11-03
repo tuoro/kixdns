@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
@@ -681,6 +681,72 @@ async fn reload_events_carry_the_generation_they_allocated() {
             },
         ]
     );
+}
+
+/// 每个请求说的开始时刻和上报方式，以及报的耗时 / When each request says it started and how it is
+/// reported, and the latency reported
+#[derive(Default)]
+struct Moments {
+    started: Mutex<Vec<(Instant, bool)>>,
+    latencies: Mutex<Vec<Duration>>,
+}
+
+impl EngineObserver for Moments {
+    fn request_started(&self, ctx: &RequestContext<'_>) {
+        self.started
+            .lock()
+            .unwrap()
+            .push((ctx.started, ctx.reported_at_once));
+    }
+
+    fn request_finished(&self, _ctx: &RequestContext<'_>, outcome: &RequestOutcome<'_>) {
+        self.latencies.lock().unwrap().push(outcome.latency);
+    }
+}
+
+#[tokio::test]
+async fn a_request_says_when_it_started_and_how_it_is_reported() {
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "block",
+                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
+                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+            }]
+        }]
+    })
+    .to_string();
+    let moments = Arc::new(Moments::default());
+    let engine = Engine::builder(runtime_config(&raw))
+        .observer(moments.clone())
+        .build()
+        .expect("build engine");
+
+    let before = Instant::now();
+    engine
+        .handle_packet(&query("a.blocked.test"), peer())
+        .await
+        .unwrap();
+    let slow = Instant::now();
+    let fast = engine
+        .handle_packet_fast(&query("a.blocked.test"), peer())
+        .unwrap();
+    assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
+    let after = Instant::now();
+
+    let seen = moments.started.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert!(before <= seen[0].0 && seen[0].0 <= slow);
+    assert!(!seen[0].1, "the full path reports as it goes");
+    assert!(slow <= seen[1].0 && seen[1].0 <= after);
+    assert!(seen[1].1, "the fast path reports at once after answering");
+    // 耗时从开始那一刻算到答完 / The latency runs from that moment to the answer
+    let latencies = moments.latencies.lock().unwrap().clone();
+    assert_eq!(latencies.len(), 2);
+    assert!(Duration::ZERO < latencies[0] && latencies[0] <= slow - before);
+    assert!(Duration::ZERO < latencies[1] && latencies[1] <= after - slow);
 }
 
 #[tokio::test]

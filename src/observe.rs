@@ -41,7 +41,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, RecordType};
@@ -226,6 +226,13 @@ pub struct RequestContext<'a> {
     /// of both phases included, so an observer counting client traffic
     /// filters on this flag.
     pub background_refresh: bool,
+    /// When the engine began on the request. An observer that wants the time of
+    /// the request takes it from here, which spares a read of the clock.
+    pub started: Instant,
+    /// `true` when the request was answered on the spot and its whole lifecycle
+    /// is reported at once afterwards: the events all come at the end, so the
+    /// time between them says nothing about the request.
+    pub reported_at_once: bool,
 }
 
 /// Transport a client query arrived over. Distinct from the upstream
@@ -819,6 +826,8 @@ mod tests {
             qtype: RecordType::A,
             qclass: DNSClass::IN,
             background_refresh: false,
+            started: std::time::Instant::now(),
+            reported_at_once: false,
         };
         let error = anyhow::anyhow!("boom");
         let observers: [&dyn EngineObserver; 2] = [&NoopObserver, &TracingObserver];
