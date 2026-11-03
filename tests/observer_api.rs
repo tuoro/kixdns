@@ -24,8 +24,8 @@ use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
     CacheHit, CacheHitKind, ClientTransport, ConfigLoaded, ConfigReloadFailed, DecisionDetail,
     DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome, RequestStatus,
-    RuleCacheLookup, RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt, UpstreamOutcome,
-    UpstreamResult,
+    RuleAnswer, RuleCacheLookup, RuleEvaluated, RuleMatched, RulePhase, UpstreamAttempt,
+    UpstreamOutcome, UpstreamResult,
 };
 
 #[ctor::ctor]
@@ -844,6 +844,138 @@ async fn an_observer_can_take_a_cache_hit_whole() {
     assert_eq!(observer.whole.lock().unwrap().len(), 1);
     assert_eq!(observer.started.lock().unwrap().len(), 2);
     assert_eq!(observer.finished.lock().unwrap().len(), 2);
+}
+
+/// 把规则回答整个接过去的观察者 / An observer taking rules' answers whole
+/// 接过去的一条：域名、命中的规则、是不是规则定的、响应码、回答条数、应答的响应码
+/// One taken: the name, the matched rules, whether a rule decided, the response code, how many answers,
+/// and the response code of the reply
+type RuleAnswerTaken = (
+    String,
+    Vec<String>,
+    bool,
+    ResponseCode,
+    usize,
+    Option<ResponseCode>,
+);
+
+#[derive(Default)]
+struct TakesRuleAnswersWhole {
+    whole: Mutex<Vec<RuleAnswerTaken>>,
+    started: Mutex<Vec<String>>,
+}
+
+impl EngineObserver for TakesRuleAnswersWhole {
+    fn answered_by_rule(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        answer: &RuleAnswer<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) -> bool {
+        assert_eq!(pipeline, "main");
+        assert!(outcome.latency > Duration::ZERO);
+        self.whole.lock().unwrap().push((
+            ctx.qname.to_string(),
+            answer.rules.iter().map(ToString::to_string).collect(),
+            answer.decided_by_rule,
+            answer.rcode,
+            answer.answers,
+            outcome.response.map(rcode_of),
+        ));
+        true
+    }
+
+    fn request_started(&self, ctx: &RequestContext<'_>) {
+        self.started.lock().unwrap().push(ctx.qname.to_string());
+    }
+}
+
+/// 规则直接答的两条路都能整个接过去，接过去就没有分开的事件：编译好的规则和规则缓存
+/// Both ways of a rule's answer can be taken whole, with no separate events then: compiled rules and the
+/// rule cache
+#[tokio::test]
+async fn an_observer_can_take_a_rule_answer_whole() {
+    let engine_with = |pipelines: serde_json::Value| {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": pipelines,
+        })
+        .to_string();
+        let observer = Arc::new(TakesRuleAnswersWhole::default());
+        let engine = Engine::builder(runtime_config(&raw))
+            .observer(observer.clone())
+            .build()
+            .expect("build engine");
+        (engine, observer)
+    };
+    let answer = serde_json::json!([{ "type": "static_ip_response", "ip": "192.0.2.1,192.0.2.2" }]);
+
+    // 编译好的规则当场答 / A compiled rule answers on the spot
+    let (engine, observer) = engine_with(serde_json::json!([{
+        "id": "main",
+        "rules": [{ "name": "ip", "matchers": [{ "type": "any" }], "actions": answer }]
+    }]));
+    let fast = engine
+        .handle_packet_fast(&query("a.ip.test"), peer())
+        .unwrap();
+    assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
+    assert_eq!(
+        *observer.whole.lock().unwrap(),
+        vec![(
+            "a.ip.test".to_string(),
+            vec!["ip".to_string()],
+            true,
+            ResponseCode::NoError,
+            2,
+            Some(ResponseCode::NoError)
+        )]
+    );
+    assert!(observer.started.lock().unwrap().is_empty());
+
+    // 用到 GeoSite 的规则第一次走完整路径，之后由规则缓存答 / A rule using GeoSite takes the full path the first
+    // time, and the rule cache answers after that
+    let (engine, observer) = engine_with(serde_json::json!([{
+        "id": "main",
+        "rules": [
+            { "name": "geo", "matchers": [{ "type": "geo_site", "value": "nosuchtag" }],
+              "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }] },
+            { "name": "ip", "matchers": [{ "type": "any" }], "actions": answer },
+        ]
+    }]));
+    engine
+        .handle_packet(&query("a.ip.test"), peer())
+        .await
+        .unwrap();
+    assert!(observer.whole.lock().unwrap().is_empty());
+    assert_eq!(observer.started.lock().unwrap().len(), 1);
+    let fast = engine
+        .handle_packet_fast(&query("b.ip.test"), peer())
+        .unwrap();
+    assert!(
+        matches!(fast, Some(FastPathResponse::AsyncNeeded(_))),
+        "another name is not cached"
+    );
+    let fast = engine
+        .handle_packet_fast(&query("a.ip.test"), peer())
+        .unwrap();
+    assert!(!matches!(fast, Some(FastPathResponse::AsyncNeeded(_))));
+    assert_eq!(
+        observer.started.lock().unwrap().len(),
+        1,
+        "no separate events"
+    );
+    assert_eq!(
+        *observer.whole.lock().unwrap(),
+        vec![(
+            "a.ip.test".to_string(),
+            vec!["ip".to_string()],
+            true,
+            ResponseCode::NoError,
+            2,
+            Some(ResponseCode::NoError)
+        )]
+    );
 }
 
 /// 快速路径上规则按配置答地址，上报的回答条数就是这个查询实际得到的条数

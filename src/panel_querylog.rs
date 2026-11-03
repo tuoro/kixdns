@@ -32,8 +32,8 @@ use smallvec::SmallVec;
 use crate::config::Transport;
 use crate::observe::{
     CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
-    RequestContext, RequestOutcome, RequestStatus, RuleEvaluated, RuleMatched, RulePhase,
-    UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
+    RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleEvaluated, RuleMatched,
+    RulePhase, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
 use crate::panel::{outcome_label, phase_label, skip_reason_label, transport_label};
 
@@ -79,6 +79,13 @@ const IDLE_AFTER: Duration = Duration::from_secs(120);
 /// 面板等着取时最多等多久 / The longest a panel waiting to collect is kept waiting
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// 这么多条命中的规则放得进一条记录：一步 Pipeline、一步缓存、每条规则一步、可能还有一步决定，都不超过步数上限
+/// So many matched rules fit one record: a step for the pipeline, one for the cache, one per rule and
+/// perhaps one for the decision, all within the limit on steps
+pub(crate) fn fits_a_record(rules: usize) -> bool {
+    rules + 3 <= MAX_STEPS
+}
 
 /// 配置里的名字：Pipeline、规则、上游地址。来来回回就那几个，每个线程记住见过的，同一个名字一份内存，
 /// 记一步只加一次引用计数，不再每一步复制一份字符串
@@ -779,6 +786,18 @@ fn cached_outcome(status: Status, cache: Option<CacheHitKind>) -> Outcome {
     match status {
         Status::Completed if cache == Some(CacheHitKind::Fresh) => Outcome::Cached,
         Status::Completed => Outcome::Stale,
+        Status::Failed => Outcome::Failed,
+        Status::Cancelled => Outcome::Cancelled,
+    }
+}
+
+/// 规则直接答的请求算哪种结果：SERVFAIL 算没解析出来（见 [`Pending::outcome`]）
+/// What a request a rule answered counts as: a SERVFAIL means it was not resolved (see
+/// [`Pending::outcome`])
+fn rule_outcome(status: Status, rcode: Option<ResponseCode>) -> Outcome {
+    match status {
+        Status::Completed if rcode == Some(ResponseCode::ServFail) => Outcome::Failed,
+        Status::Completed => Outcome::Static,
         Status::Failed => Outcome::Failed,
         Status::Cancelled => Outcome::Cancelled,
     }
@@ -1588,6 +1607,76 @@ impl QueryLog {
         });
     }
 
+    /// 快速路径上规则直接答的请求，一次记完，道理同 [`Self::answered_from_cache`]。命中的规则各记一步，定下回答的
+    /// 那条是静态决定，别的是接着往下；没有规则定下时是 Pipeline 默认的决定，单记一步
+    /// A request a rule answered on the fast path, recorded in one go for the reasons of
+    /// [`Self::answered_from_cache`]. Each matched rule has a step: the one that decided has the static
+    /// decision and the others carry on; with no rule deciding, the pipeline's default is a step of its own
+    pub(crate) fn answered_by_rule(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        answer: &RuleAnswer<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) {
+        if !self.recording_after(self.collected.load(Ordering::Acquire), ctx.started) {
+            return;
+        }
+        let step = |what| Step { at_us: 0, what };
+        let mut steps: SmallVec<[Step<&str>; 6]> = SmallVec::new();
+        steps.push(step(StepKind::Pipeline { pipeline }));
+        steps.push(step(StepKind::Cache {
+            result: None,
+            source: None,
+        }));
+        for (at, rule) in answer.rules.iter().enumerate() {
+            steps.push(step(StepKind::Rule {
+                pipeline,
+                rule,
+                phase: RulePhase::Request,
+                matched: None,
+                decision: Some(if answer.decided_by_rule && at + 1 == answer.rules.len() {
+                    DecisionKind::Static
+                } else {
+                    DecisionKind::Continue
+                }),
+                target: None,
+            }));
+        }
+        if !answer.decided_by_rule {
+            steps.push(step(StepKind::Decision {
+                pipeline,
+                rule: None,
+                phase: RulePhase::Request,
+                decision: DecisionKind::Static,
+                target: None,
+            }));
+        }
+        ENCODING.with_borrow_mut(|encoding| {
+            encoding.clear();
+            encode_record(
+                &RecordHead {
+                    time_unix_ms: self.wall.unix_ms_at(ctx.started),
+                    client: ctx.client.ip().to_canonical(),
+                    transport: ctx.transport,
+                    qname: ctx.qname,
+                    qtype: ctx.qtype,
+                    pipeline: Some(pipeline),
+                    rule: answer
+                        .decided_by_rule
+                        .then(|| answer.rules.last().copied())
+                        .flatten(),
+                },
+                outcome,
+                |status, rcode| (rule_outcome(status, rcode), None),
+                &steps,
+                false,
+                encoding,
+            );
+            self.push(encoding);
+        });
+    }
+
     /// 编好的记录放进交接区，序号是它的位置 / Puts an encoded record into the ring; its number is its
     /// place
     fn push(&self, record: &[u8]) {
@@ -2092,8 +2181,8 @@ mod tests {
     use crate::config::Transport;
     use crate::observe::{
         CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
-        RequestContext, RequestOutcome, RequestStatus, RuleEvaluated, RuleMatched, RulePhase,
-        UpstreamOutcome, UpstreamResult,
+        RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleEvaluated, RuleMatched,
+        RulePhase, UpstreamOutcome, UpstreamResult,
     };
 
     fn ctx(request_id: u64) -> RequestContext<'static> {
@@ -2420,6 +2509,121 @@ mod tests {
             }
         }
         assert_eq!(compared, 108);
+    }
+
+    /// 规则直接答的请求一次记完，和引擎一个个发事件记下的逐字节一样：一条规则定的、规则缓存里几条规则命中、都没定而是
+    /// Pipeline 默认的，各种响应码和结束方式
+    /// A request a rule answered recorded in one go is byte for byte what the engine's separate events make:
+    /// one rule deciding, several matched from the rule cache, none deciding and the pipeline's default, with
+    /// every response code and ending
+    #[test]
+    fn a_rule_answer_recorded_whole_is_what_the_separate_events_record() {
+        let log = QueryLog::default();
+        log.wall.unix_ms_at(Instant::now());
+        log.wall.check_at_ms.store(u64::MAX, Relaxed);
+        let ok = response(ResponseCode::NoError, &[[192, 0, 2, 1]]);
+        let nxdomain = response(ResponseCode::NXDomain, &[]);
+        let servfail = response(ResponseCode::ServFail, &[]);
+        let completed = |bytes| (RequestStatus::Completed, Some(bytes), None);
+        let endings = [
+            completed(ok.as_slice()),
+            completed(nxdomain.as_slice()),
+            completed(servfail.as_slice()),
+            (RequestStatus::Failed, None, Some("engine failed")),
+        ];
+        let shapes: [(&[&str], bool); 6] = [
+            (&["block"], true),
+            (&["first", "second", "block"], true),
+            (&["block", "block"], true),
+            (&["first", "second"], false),
+            (&["first"], false),
+            (&[], false),
+        ];
+        let mut compared = 0;
+        for (rules, decided_by_rule) in shapes {
+            for (status, bytes, error) in endings {
+                let request = RequestContext {
+                    reported_at_once: true,
+                    ..ctx(compared + 1)
+                };
+                let finished = RequestOutcome {
+                    latency: Duration::from_micros(900),
+                    status,
+                    response: bytes,
+                    error,
+                };
+                let rcode = ResponseCode::NXDomain;
+                log.request_started(&request, false);
+                log.pipeline_selected(&request, "main");
+                log.cache_miss(&request);
+                for (at, rule) in rules.iter().enumerate() {
+                    log.rule_matched(
+                        &request,
+                        &RuleMatched {
+                            pipeline: "main",
+                            rule,
+                            phase: RulePhase::Request,
+                            decision: if decided_by_rule && at + 1 == rules.len() {
+                                DecisionKind::Static
+                            } else {
+                                DecisionKind::Continue
+                            },
+                            fast_path: true,
+                        },
+                    );
+                }
+                log.decision_made(
+                    &request,
+                    &DecisionMade {
+                        pipeline: "main",
+                        rule: decided_by_rule.then(|| rules[rules.len() - 1]),
+                        phase: RulePhase::Request,
+                        detail: DecisionDetail::Static { rcode, answers: 0 },
+                    },
+                );
+                log.request_finished(&request, &finished);
+                log.answered_by_rule(
+                    &request,
+                    "main",
+                    &RuleAnswer {
+                        rules,
+                        decided_by_rule,
+                        rcode,
+                        answers: 0,
+                    },
+                    &finished,
+                );
+                let ring = log.ring.lock();
+                let last = ring.len() - 1;
+                assert_eq!(
+                    ring.record(last - 1),
+                    ring.record(last),
+                    "{rules:?} {status:?}"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 24);
+    }
+
+    /// 没人来取以后，规则回答这条路也不再记 / Once nobody collects, the way of recording a rule's answer stops too
+    #[test]
+    fn a_rule_answer_is_not_recorded_once_recording_has_stopped() {
+        let log = started_three_minutes_ago();
+        let finished = RequestOutcome {
+            latency: Duration::from_micros(900),
+            status: RequestStatus::Completed,
+            response: None,
+            error: None,
+        };
+        let answer = RuleAnswer {
+            rules: &["block"],
+            decided_by_rule: true,
+            rcode: ResponseCode::NXDomain,
+            answers: 0,
+        };
+        log.answered_by_rule(&ctx(1), "main", &answer, &finished);
+        assert_eq!(log.ring.lock().newest, 0);
     }
 
     /// 没人来取以后，一次记完的这条路也不再记 / Once nobody collects, the way of recording in one go stops too

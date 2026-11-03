@@ -147,6 +147,21 @@ pub trait EngineObserver: Send + Sync + 'static {
         false
     }
 
+    /// The fast path answered the request with a rule's fixed answer, offered
+    /// whole. As with [`answered_from_cache`], return `true` to take it so and
+    /// the engine reports none of the separate events for this request.
+    ///
+    /// [`answered_from_cache`]: EngineObserver::answered_from_cache
+    fn answered_by_rule(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        answer: &RuleAnswer<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) -> bool {
+        false
+    }
+
     /// The response cache answered the request. Reported at most once per
     /// request, and paired with one of its [`cache_lookup`]s, except a
     /// [`CacheHitKind::StaleUpstreamFailure`] hit, which follows the request's
@@ -264,6 +279,24 @@ pub enum ClientTransport {
     Tcp,
     /// DNS over HTTPS.
     Doh,
+}
+
+/// A rule's fixed answer on the fast path, as [`EngineObserver::answered_by_rule`]
+/// offers it.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RuleAnswer<'a> {
+    /// The rules that matched on the way to the answer, in order.
+    pub rules: &'a [&'a str],
+    /// `true` when the last of [`rules`] decided; otherwise the pipeline's
+    /// default did.
+    ///
+    /// [`rules`]: RuleAnswer::rules
+    pub decided_by_rule: bool,
+    /// Response code of the answer.
+    pub rcode: ResponseCode,
+    /// Number of answer records.
+    pub answers: usize,
 }
 
 /// How a request ended.

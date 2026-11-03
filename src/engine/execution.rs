@@ -14,6 +14,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::DNSClass;
 
 use hickory_proto::serialize::binary::BinDecodable;
+use smallvec::SmallVec;
 use tracing::warn;
 
 use crate::cache::CacheEntry;
@@ -21,7 +22,7 @@ use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::advanced_rule::{PrecomputedAction, fast_static_match_with_rule};
 use crate::observe::{
     CacheHit, CacheHitKind, DecisionDetail, DecisionKind, DecisionMade, EngineObserver,
-    RequestContext, RequestOutcome, RequestStatus, RuleMatched, RulePhase,
+    RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleMatched, RulePhase,
 };
 use crate::proto_utils::parse_quick;
 
@@ -482,9 +483,49 @@ impl Engine {
             }),
             _ => None,
         };
-        if let Some(hit) = &hit
-            && observer.answered_from_cache(ctx, pipeline_id, hit, &outcome)
-        {
+        let taken_whole = match &answer {
+            FastPathAnswer::Cache { .. } => hit
+                .as_ref()
+                .is_some_and(|hit| observer.answered_from_cache(ctx, pipeline_id, hit, &outcome)),
+            FastPathAnswer::StaticRule {
+                rule,
+                rcode,
+                answers,
+            } => observer.answered_by_rule(
+                ctx,
+                pipeline_id,
+                &RuleAnswer {
+                    rules: &[rule],
+                    decided_by_rule: true,
+                    rcode: *rcode,
+                    answers: *answers,
+                },
+                &outcome,
+            ),
+            FastPathAnswer::CachedRules { record } => {
+                let rules: SmallVec<[&str; 4]> = record
+                    .matched_rules
+                    .iter()
+                    .flat_map(|rules| rules.iter())
+                    .map(AsRef::as_ref)
+                    .collect();
+                let Decision::Static { rcode, answers } = record.entry.decision.as_ref() else {
+                    unreachable!("the fast path answers only static decisions from the rule cache");
+                };
+                observer.answered_by_rule(
+                    ctx,
+                    pipeline_id,
+                    &RuleAnswer {
+                        rules: &rules,
+                        decided_by_rule: record.decided_by_rule && !rules.is_empty(),
+                        rcode: *rcode,
+                        answers: answers.len(),
+                    },
+                    &outcome,
+                )
+            }
+        };
+        if taken_whole {
             return;
         }
         observer.request_started(ctx);
@@ -871,12 +912,18 @@ impl Engine {
                 let entry = &record.entry;
                 // Check if entry is valid before using
                 // 在使用前检查条目是否有效
-                if !entry.is_valid() {
+                if !entry.is_valid_at(start) {
                     // Remove expired entry
                     // 删除过期条目
                     self.rule_cache.remove(rule_hash);
-                } else if entry.matches(&pipeline_id, qname_str, qtype, qclass, &rule_requester)
-                    && let Decision::Static { rcode, answers } = entry.decision.as_ref()
+                } else if entry.matches_at(
+                    start,
+                    &pipeline_id,
+                    qname_str,
+                    qtype,
+                    qclass,
+                    &rule_requester,
+                ) && let Decision::Static { rcode, answers } = entry.decision.as_ref()
                 {
                     return answer_static(
                         *rcode,
@@ -5119,6 +5166,129 @@ mod tests {
             alias.answers[0].data,
             hickory_proto::rr::RData::CNAME(_)
         ));
+    }
+
+    /// 一个查规则缓存才答得了的引擎（用到 GeoSite 的规则留给完整路径），观察者记下规则回答；连同往规则缓存里放一条
+    /// `ip.test` 静态决定的办法，交回它的键
+    /// An engine that answers only from the rule cache (a rule using GeoSite is left to the full path), with
+    /// an observer noting rules' answers; and a way of putting a static decision for `ip.test` in the rule
+    /// cache, giving its key
+    fn rule_cache_engine(observer: Arc<dyn EngineObserver>) -> Engine {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": DEAD_UPSTREAM },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "geo",
+                "matchers": [{ "type": "geo_site", "value": "nosuchtag" }],
+                "actions": [{ "type": "forward", "upstream": DEAD_UPSTREAM }],
+            }] }]
+        });
+        let config: crate::config::PipelineConfig =
+            serde_json::from_value(raw).expect("parse config");
+        Engine::builder(RuntimePipelineConfig::from_config(config).expect("build runtime config"))
+            .observer(observer)
+            .build()
+            .expect("build engine")
+    }
+
+    fn put_rule_answer(
+        engine: &Engine,
+        expires_at: Option<Instant>,
+        matched_rules: Option<&[&str]>,
+        decided_by_rule: bool,
+    ) -> u64 {
+        let key = crate::engine::rules::calculate_rule_hash(
+            engine.state.load().cache_namespace("main"),
+            "main",
+            "ip.test",
+            RecordType::A,
+            DNSClass::IN,
+            &RequesterKey::NONE,
+        );
+        engine.rule_cache.insert(
+            key,
+            RuleCacheRecord {
+                entry: RuleCacheEntry {
+                    pipeline_id: Arc::from("main"),
+                    qname_hash: fast_hash_str("ip.test"),
+                    qtype: u16::from(RecordType::A),
+                    qclass: u16::from(DNSClass::IN),
+                    requester: RequesterKey::NONE,
+                    decision: Arc::new(Decision::Static {
+                        rcode: ResponseCode::NXDomain,
+                        answers: Vec::new(),
+                    }),
+                    expires_at,
+                },
+                matched_rules: matched_rules
+                    .map(|rules| rules.iter().map(|rule| Arc::from(*rule)).collect()),
+                decided_by_rule,
+            },
+        );
+        key
+    }
+
+    fn ip_test_query() -> Vec<u8> {
+        let labels = [b"ip".to_vec(), b"test".to_vec()];
+        static_query(7, [1, 0], &labels, 1, 1, (0, &[]))
+    }
+
+    /// 记下每条规则回答的命中规则和是不是规则定的 / Notes each rule answer's matched rules and whether a rule decided
+    #[derive(Default)]
+    struct RuleAnswers(std::sync::Mutex<Vec<(Vec<String>, bool)>>);
+
+    impl EngineObserver for RuleAnswers {
+        fn answered_by_rule(
+            &self,
+            _ctx: &RequestContext<'_>,
+            _pipeline: &str,
+            answer: &RuleAnswer<'_>,
+            _outcome: &RequestOutcome<'_>,
+        ) -> bool {
+            let rules = answer.rules.iter().map(ToString::to_string).collect();
+            self.0.lock().unwrap().push((rules, answer.decided_by_rule));
+            true
+        }
+    }
+
+    /// 规则缓存里的条目，有规则定的才说是规则定的：记下的规则只是一路命中的、一条规则也没记下时都不算
+    /// An entry in the rule cache says a rule decided only when one did: not when the rules recorded merely
+    /// matched on the way, nor with no rule recorded
+    #[tokio::test]
+    async fn a_rule_cache_answer_says_whether_a_rule_decided() {
+        let observer = Arc::new(RuleAnswers::default());
+        let engine = rule_cache_engine(observer.clone());
+        let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
+        for (rules, decided_by_rule, expected) in [
+            (Some(&["first", "block"][..]), true, true),
+            (Some(&["first"][..]), false, false),
+            (None, true, false),
+        ] {
+            put_rule_answer(&engine, None, rules, decided_by_rule);
+            let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+            assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
+            let (seen, decided) = observer.0.lock().unwrap().pop().unwrap();
+            assert_eq!(decided, expected, "{rules:?}");
+            assert_eq!(seen.len(), rules.map_or(0, <[&str]>::len));
+        }
+    }
+
+    /// 规则缓存里过期的条目不拿来答，也顺手删掉，有效的留着
+    /// An expired entry in the rule cache does not answer and is removed, and a valid one stays
+    #[tokio::test]
+    async fn the_fast_path_drops_an_expired_rule_cache_entry() {
+        let engine = rule_cache_engine(Arc::new(RuleAnswers::default()));
+        let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
+        let expired = Some(Instant::now() - Duration::from_secs(1));
+        let key = put_rule_answer(&engine, expired, Some(&["block"]), true);
+        let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+        assert!(matches!(answered, Some(FastPathResponse::AsyncNeeded(_))));
+        assert!(engine.rule_cache.get(key).is_none());
+
+        let valid = Some(Instant::now() + Duration::from_secs(60));
+        let key = put_rule_answer(&engine, valid, Some(&["block"]), true);
+        let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+        assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
+        assert!(engine.rule_cache.get(key).is_some());
     }
 
     /// 快速路径交出的是应答在缓存里实际停留的整秒数，写出去的 TTL 按它调低（RFC 1035 §5.2）
