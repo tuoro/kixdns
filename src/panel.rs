@@ -39,8 +39,8 @@ use serde_json::json;
 use crate::engine::Engine;
 use crate::observe::{
     CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionMade, EngineObserver,
-    RequestContext, RequestOutcome, RequestStatus, RuleCacheLookup, RuleEvaluated, RuleMatched,
-    RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
+    RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleCacheLookup, RuleEvaluated,
+    RuleMatched, RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
     UpstreamSkipReason, UpstreamSkipped,
 };
 use crate::panel_querylog::{self, QueryLog, WallClock};
@@ -1162,6 +1162,35 @@ impl EngineObserver for PanelMetrics {
         self.count_finished(outcome);
         self.query_log
             .answered_from_cache(ctx, pipeline, hit, outcome);
+        true
+    }
+
+    /// 同 [`Self::answered_from_cache`]。命中的规则多到一条记录放不下的，照旧走分开的事件
+    /// As [`Self::answered_from_cache`]. With more matched rules than a record has room for, the separate
+    /// events go on as ever
+    fn answered_by_rule(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        answer: &RuleAnswer<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) -> bool {
+        if self.debug_trace.is_some()
+            || panel_trace::active()
+            || !panel_querylog::fits_a_record(answer.rules.len())
+        {
+            return false;
+        }
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.record_query(ctx.qname, ctx.client.ip(), ctx.started);
+        self.record_pipeline_hit(pipeline);
+        self.record_cache_lookup();
+        for rule in answer.rules {
+            self.record_rule_match(pipeline, rule, phase_label(RulePhase::Request));
+        }
+        self.count_finished(outcome);
+        self.query_log
+            .answered_by_rule(ctx, pipeline, answer, outcome);
         true
     }
 
@@ -2595,6 +2624,167 @@ mod tests {
         assert_eq!(log(&by_events), log(&whole));
     }
 
+    /// 规则回答一次交过来，和分开的事件记下的一样：计数、排行和查询日志，一条规则定的和规则缓存里几条规则都算
+    /// A rule's answer handed over whole records what the separate events record: the counters, the rankings
+    /// and the query log, for one rule deciding and for several from the rule cache
+    #[test]
+    fn a_rule_answer_taken_whole_records_what_the_separate_events_record() {
+        use crate::observe::{
+            DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext,
+            RequestOutcome, RequestStatus, RuleAnswer, RuleCacheLookup, RuleMatched, RulePhase,
+        };
+        use hickory_proto::op::ResponseCode;
+
+        let by_events = PanelMetrics::new(false);
+        let whole = PanelMetrics::new(false);
+        let bytes = [
+            0x12, 0x34, 0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
+        ];
+        let completed = RequestOutcome {
+            latency: std::time::Duration::from_millis(3),
+            status: RequestStatus::Completed,
+            response: Some(&bytes),
+            error: None,
+        };
+        let failed = RequestOutcome {
+            latency: std::time::Duration::from_millis(7),
+            status: RequestStatus::Failed,
+            response: None,
+            error: Some("engine failed"),
+        };
+        // 编号、域名、命中的规则、是不是规则定的、怎么结束的、是不是规则缓存答的 / The number, name, matched rules, whether
+        // a rule decided, how it ended and whether the rule cache answered
+        type Shape<'a> = (
+            u64,
+            &'static str,
+            &'a [&'a str],
+            bool,
+            &'a RequestOutcome<'a>,
+            bool,
+        );
+        let shapes: [Shape<'_>; 4] = [
+            (1, "a.example", &["block"], true, &completed, false),
+            (2, "b.example", &["first", "block"], true, &completed, true),
+            (3, "a.example", &["first"], false, &completed, true),
+            (4, "c.example", &["block"], true, &failed, false),
+        ];
+        for (id, qname, rules, decided_by_rule, outcome, from_rule_cache) in shapes {
+            let ctx = RequestContext {
+                reported_at_once: true,
+                ..request(id, "192.168.1.9:5353", qname)
+            };
+            let rcode = ResponseCode::NXDomain;
+            by_events.request_started(&ctx);
+            by_events.pipeline_selected(&ctx, "main");
+            by_events.cache_lookup(&ctx);
+            by_events.cache_miss(&ctx);
+            if from_rule_cache {
+                by_events.rule_cache_lookup(
+                    &ctx,
+                    &RuleCacheLookup {
+                        pipeline: "main",
+                        hit: true,
+                        matched_rules: rules.len(),
+                    },
+                );
+            }
+            for (at, rule) in rules.iter().enumerate() {
+                by_events.rule_matched(
+                    &ctx,
+                    &RuleMatched {
+                        pipeline: "main",
+                        rule,
+                        phase: RulePhase::Request,
+                        decision: if decided_by_rule && at + 1 == rules.len() {
+                            DecisionKind::Static
+                        } else {
+                            DecisionKind::Continue
+                        },
+                        fast_path: true,
+                    },
+                );
+            }
+            by_events.decision_made(
+                &ctx,
+                &DecisionMade {
+                    pipeline: "main",
+                    rule: decided_by_rule.then(|| rules[rules.len() - 1]),
+                    phase: RulePhase::Request,
+                    detail: DecisionDetail::Static { rcode, answers: 0 },
+                },
+            );
+            by_events.request_finished(&ctx, outcome);
+            assert!(whole.answered_by_rule(
+                &ctx,
+                "main",
+                &RuleAnswer {
+                    rules,
+                    decided_by_rule,
+                    rcode,
+                    answers: 0,
+                },
+                outcome,
+            ));
+        }
+        let counters = |metrics: &PanelMetrics| {
+            let mut output = String::new();
+            metrics.render_counters(&mut output);
+            output
+        };
+        assert_eq!(counters(&by_events), counters(&whole));
+        assert_eq!(by_events.stats_json(3_600, 20), whole.stats_json(3_600, 20));
+        let log = |metrics: &PanelMetrics| {
+            let page = metrics.query_log.collect(0, 10, None, None, None, 1);
+            let mut page: serde_json::Value = serde_json::from_str(&page).unwrap();
+            page.as_object_mut().unwrap().remove("instance");
+            for entry in page["entries"].as_array_mut().unwrap() {
+                entry.as_object_mut().unwrap().remove("time_unix_ms");
+            }
+            page
+        };
+        assert_eq!(log(&by_events)["entries"].as_array().unwrap().len(), 4);
+        assert_eq!(log(&by_events), log(&whole));
+    }
+
+    /// 诊断、调试跟踪和命中的规则多到一条记录放不下时，不一次接过来，也什么都不记
+    /// Diagnostics, the debug trace and more matched rules than a record has room for are not taken whole, and
+    /// nothing is recorded
+    #[tokio::test]
+    async fn a_rule_answer_is_not_taken_whole_when_it_should_not_be() {
+        use crate::observe::{EngineObserver, RequestOutcome, RequestStatus, RuleAnswer};
+        use hickory_proto::op::ResponseCode;
+        use std::sync::atomic::Ordering;
+
+        let outcome = RequestOutcome {
+            latency: std::time::Duration::from_millis(3),
+            status: RequestStatus::Completed,
+            response: None,
+            error: None,
+        };
+        let answer = |rules| RuleAnswer {
+            rules,
+            decided_by_rule: true,
+            rcode: ResponseCode::NXDomain,
+            answers: 0,
+        };
+        let ctx = request(1, "192.168.1.9:5353", "a.example");
+        let one: &[&str] = &["block"];
+        let traced = PanelMetrics::new(true);
+        assert!(!traced.answered_by_rule(&ctx, "main", &answer(one), &outcome));
+        let plain = PanelMetrics::new(false);
+        let (taken, _, _) = crate::panel_trace::capture(async {
+            plain.answered_by_rule(&ctx, "main", &answer(one), &outcome)
+        })
+        .await;
+        assert!(!taken);
+        let many = vec!["rule"; 62];
+        assert!(!plain.answered_by_rule(&ctx, "main", &answer(&many), &outcome));
+        assert_eq!(plain.requests_total.load(Ordering::Relaxed), 0);
+        let most = vec!["rule"; 61];
+        assert!(plain.answered_by_rule(&ctx, "main", &answer(&most), &outcome));
+        assert_eq!(plain.requests_total.load(Ordering::Relaxed), 1);
+    }
+
     /// 诊断查询和调试跟踪要一步步看，不一次接过来 / Diagnostic queries and the debug trace want every
     /// step, and a hit is not taken whole
     #[tokio::test]
@@ -3539,6 +3729,63 @@ mod diagnostic_tests {
                 ]
             }]
         })
+    }
+
+    /// 真引擎上规则直接答的请求整个交给面板：记录、计数都对，也不留着「在处理」
+    /// A rule's answer on a real engine reaches the panel whole: the record and the counters are right, and
+    /// nothing stays in flight
+    #[tokio::test]
+    async fn a_rule_answer_reaches_the_panel_whole() {
+        use crate::engine::FastPathResponse;
+        use std::sync::atomic::Ordering;
+
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "block",
+                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
+                "actions": [{ "type": "static_ip_response", "ip": "0.0.0.0" }]
+            }] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let peer: std::net::SocketAddr = "192.0.2.7:53000".parse().unwrap();
+        let mut query = hickory_proto::op::Message::new(
+            0x1234,
+            hickory_proto::op::MessageType::Query,
+            hickory_proto::op::OpCode::Query,
+        );
+        query.metadata.recursion_desired = true;
+        query.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii("a.blocked.test.").unwrap(),
+            hickory_proto::rr::RecordType::A,
+        ));
+        assert!(matches!(
+            engine
+                .handle_packet_fast(&query.to_vec().unwrap(), peer)
+                .unwrap(),
+            Some(FastPathResponse::Direct(_))
+        ));
+        assert_eq!(metrics.requests_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.requests_inflight.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.requests_completed.load(Ordering::Relaxed), 1);
+        let page: serde_json::Value =
+            serde_json::from_str(&metrics.query_log.collect(0, 10, None, None, None, 1)).unwrap();
+        let entries = page["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["outcome"], "static");
+        assert_eq!(entry["pipeline"], "main");
+        assert_eq!(entry["rule"], "block");
+        assert_eq!(entry["answers"][0], "0.0.0.0");
+        let kinds: Vec<&str> = entry["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["pipeline", "cache", "rule"]);
+        assert_eq!(entry["steps"][2]["decision"], "static");
     }
 
     /// 真引擎的快速路径命中整个交给面板：记录、计数都对，也不留着「在处理」

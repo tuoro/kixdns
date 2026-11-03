@@ -218,10 +218,22 @@ impl RuleCacheEntry {
         qclass: DNSClass,
         requester: &RequesterKey,
     ) -> bool {
+        self.matches_at(Instant::now(), pipeline_id, qname, qtype, qclass, requester)
+    }
+
+    /// 同 [`Self::matches`]，时刻是已经读好的 / As [`Self::matches`], with the moment already read
+    #[inline]
+    pub fn matches_at(
+        &self,
+        now: Instant,
+        pipeline_id: &str,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        requester: &RequesterKey,
+    ) -> bool {
         // Check expiration first / 首先检查过期
-        if let Some(expires) = self.expires_at
-            && Instant::now() > expires
-        {
+        if !self.is_valid_at(now) {
             return false;
         }
 
