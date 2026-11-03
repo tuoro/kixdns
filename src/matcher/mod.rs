@@ -680,9 +680,33 @@ pub struct RuntimeRule {
     pub response_matcher_operator: MatchOperator,
     pub response_actions_on_match: Vec<Action>,
     pub response_actions_on_miss: Vec<Action>,
+    /// 决策要带上的响应阶段；没有响应阶段的规则为 None，决策也就什么都不用带
+    /// The response phase decisions carry; None for a rule without one, whose decisions then
+    /// carry nothing
+    pub response_phase: Option<Arc<ResponsePhase>>,
     /// Pre-computed merge result for multiple Forward actions (None if <=1 Forward action).
     /// 多个 Forward action 的预计算合并结果（<=1 个 Forward 时为 None）。
     pub merged_forward: Option<config::MergedForward>,
+}
+
+/// 一条规则的响应阶段，它的决策共用一份：每次决策都复制这些匹配器和动作，每个未命中要多分配好几次
+/// A rule's response phase, shared by its decisions: copying the matchers and actions into
+/// each decision took several more allocations per cache miss
+#[derive(Debug)]
+pub struct ResponsePhase {
+    pub matchers: Vec<RuntimeResponseMatcherWithOp>,
+    pub on_match: Vec<Action>,
+    pub on_miss: Vec<Action>,
+}
+
+impl ResponsePhase {
+    /// 匹配器和两种结果下的动作；没有响应阶段时都是空的
+    /// The matchers and the actions for either result, all empty without a response phase
+    pub fn parts(phase: Option<&Self>) -> (&[RuntimeResponseMatcherWithOp], &[Action], &[Action]) {
+        phase.map_or((&[], &[], &[]), |phase| {
+            (&phase.matchers, &phase.on_match, &phase.on_miss)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -929,6 +953,7 @@ impl RuntimePipelineConfig {
                     response_matcher_operator: r.response_matcher_operator,
                     response_actions_on_match: r.response_actions_on_match,
                     response_actions_on_miss: r.response_actions_on_miss,
+                    response_phase: None,
                     merged_forward: r.merged_forward,
                 });
             }
@@ -995,6 +1020,16 @@ impl RuntimePipelineConfig {
                 .chain(&mut rule.response_actions_on_match)
                 .chain(&mut rule.response_actions_on_miss)
                 .for_each(Action::pre_split_upstreams);
+            rule.response_phase = (!(rule.response_matchers.is_empty()
+                && rule.response_actions_on_match.is_empty()
+                && rule.response_actions_on_miss.is_empty()))
+            .then(|| {
+                Arc::new(ResponsePhase {
+                    matchers: rule.response_matchers.clone(),
+                    on_match: rule.response_actions_on_match.clone(),
+                    on_miss: rule.response_actions_on_miss.clone(),
+                })
+            });
         }
         cfg.settings.default_upstream_shared =
             Some(Arc::from(cfg.settings.default_upstream.as_str()));

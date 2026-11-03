@@ -1661,14 +1661,17 @@ impl Engine {
                     Decision::Forward {
                         upstream,
                         pre_split_upstreams,
-                        response_matchers,
-                        response_actions_on_match,
-                        response_actions_on_miss,
+                        response_phase,
                         rule_name,
                         transport,
                         ecs,
                         allow_reuse,
                     } => {
+                        let (
+                            response_matchers,
+                            response_actions_on_match,
+                            response_actions_on_miss,
+                        ) = crate::matcher::ResponsePhase::parts(response_phase.as_deref());
                         let res = phases::handle_forward_decision_logged(
                             self,
                             phases::ForwardDecisionContext {
@@ -1692,9 +1695,9 @@ impl Engine {
                                 echo_floor,
                                 upstream: &upstream,
                                 pre_split_upstreams: pre_split_upstreams.as_ref(),
-                                response_matchers: &response_matchers,
-                                response_actions_on_match: &response_actions_on_match,
-                                response_actions_on_miss: &response_actions_on_miss,
+                                response_matchers,
+                                response_actions_on_match,
+                                response_actions_on_miss,
                                 transport,
                                 ecs: ecs.as_ref(),
                                 allow_reuse,
@@ -2386,6 +2389,82 @@ mod tests {
             .collect();
         assert!(Arc::ptr_eq(&names[0], &names[1]), "upstream");
         assert_eq!(&*names[0], format!("udp:{}", upstream.address));
+    }
+
+    /// 要用到请求本身的响应动作（静态回答、拒绝、转发失败后的 SERVFAIL、跳转到静态回答），答的还是客户端问的
+    /// 那个问题：只有用不到请求的动作才不解析它
+    /// The response actions that use the request itself (a static answer, a refusal, the
+    /// SERVFAIL after a failed forward, a jump to a static answer) still answer the question
+    /// the client asked: only actions with no use for the request leave it unparsed
+    #[tokio::test]
+    async fn response_actions_answer_the_question_that_was_asked() {
+        let upstream = answering_upstream("192.0.2.20".parse().unwrap(), 300).await;
+        let static_rule = serde_json::json!([{
+            "name": "fixed",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+        }]);
+        for (actions, rcode) in [
+            (
+                serde_json::json!([{ "type": "static_response", "rcode": "NXDOMAIN" }]),
+                ResponseCode::NXDomain,
+            ),
+            (
+                serde_json::json!([{ "type": "static_ip_response", "ip": "192.0.2.99" }]),
+                ResponseCode::NoError,
+            ),
+            (
+                serde_json::json!([{ "type": "static_cname_response", "target": "t.example" }]),
+                ResponseCode::NoError,
+            ),
+            (
+                serde_json::json!([{ "type": "deny" }]),
+                ResponseCode::Refused,
+            ),
+            (
+                serde_json::json!([{
+                    "type": "forward",
+                    "upstream": "127.0.0.1:9",
+                    "transport": "tcp"
+                }]),
+                ResponseCode::ServFail,
+            ),
+            (
+                serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": "other" }]),
+                ResponseCode::NXDomain,
+            ),
+        ] {
+            let (engine, _steps) = engine_with_steps(config_with_default_upstream(
+                serde_json::json!([]),
+                serde_json::json!([
+                    { "id": "main", "rules": [{
+                        "name": "all",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": upstream.address }],
+                        "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
+                        "response_actions_on_match": actions
+                    }] },
+                    { "id": "other", "rules": static_rule }
+                ]),
+                &upstream.address,
+            ));
+            let labels = [b"asked".to_vec(), b"example".to_vec()];
+            let query = static_query(0x1234, [1, 0], &labels, 1, 1, (0, &[]));
+            let reply = engine
+                .handle_packet(&query, "10.0.0.1:53000".parse().unwrap())
+                .await
+                .unwrap();
+            let reply = Message::from_bytes(&reply).unwrap();
+            assert_eq!(reply.metadata.response_code, rcode, "{actions}");
+            assert_eq!(reply.metadata.id, 0x1234, "{actions}");
+            assert_eq!(reply.queries.len(), 1, "{actions}");
+            assert_eq!(
+                reply.queries[0].name().to_ascii(),
+                "asked.example.",
+                "{actions}"
+            );
+            assert_eq!(reply.queries[0].query_type(), RecordType::A, "{actions}");
+        }
     }
 
     /// Merging only merges requests asking the same question. When another question's entry lands
@@ -4116,9 +4195,11 @@ mod tests {
         match decision2 {
             Decision::Forward {
                 upstream,
-                response_matchers,
+                response_phase,
                 ..
             } => {
+                let (response_matchers, _, _) =
+                    crate::matcher::ResponsePhase::parts(response_phase.as_deref());
                 assert_eq!(
                     upstream.as_ref(),
                     "8.8.8.8:53",

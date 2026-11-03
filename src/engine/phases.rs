@@ -890,13 +890,6 @@ pub(crate) async fn handle_forward_decision_logged(
                     qclass,
                     msg_opt.as_ref(),
                 );
-                let msg = msg_opt.unwrap_or_else(|| {
-                    Message::new(
-                        0,
-                        hickory_proto::op::MessageType::Query,
-                        hickory_proto::op::OpCode::Query,
-                    )
-                });
 
                 // A refresh reports these too: it acts on the response rules like a client
                 // request, and the observer tells the two apart by background_refresh.
@@ -939,16 +932,28 @@ pub(crate) async fn handle_forward_decision_logged(
                     return Ok(ForwardResult::Success(raw));
                 }
 
-                // 要执行的动作带着这份应答 / The actions to run carry this answer
-                let req_full = if let Ok(r) = Message::from_bytes(packet) {
-                    r
-                } else {
+                let empty_message = || {
                     Message::new(
                         0,
                         hickory_proto::op::MessageType::Query,
                         hickory_proto::op::OpCode::Query,
                     )
                 };
+                let msg = msg_opt.unwrap_or_else(empty_message);
+                // 手里有应答时，这几个动作用不着请求本身，不必为它们解析一遍；分流规则常写的就是这几个
+                // With an answer in hand these actions have no use for the request itself, and
+                // it is not parsed for them; these are what splitting rules usually write
+                let needs_request = !actions_to_run.iter().all(|action| {
+                    matches!(
+                        action,
+                        Action::Log { .. } | Action::Allow | Action::Continue
+                    )
+                });
+                // 要执行的动作带着这份应答 / The actions to run carry this answer
+                let req_full = needs_request
+                    .then(|| Message::from_bytes(packet).ok())
+                    .flatten()
+                    .unwrap_or_else(empty_message);
                 let ctx = ResponseContext {
                     raw,
                     msg,
