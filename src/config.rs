@@ -73,6 +73,9 @@ pub struct GlobalSettings {
     /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
     #[serde(skip)]
     pub default_upstream_pre_split: Option<Arc<Vec<Arc<str>>>>,
+    /// `default_upstream` 的一份共用的副本（性能优化） / A shared copy of `default_upstream` (performance optimization)
+    #[serde(skip)]
+    pub default_upstream_shared: Option<Arc<str>>,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
     /// 单次上游请求的超时时间
     #[serde(default = "default_upstream_timeout_ms")]
@@ -226,6 +229,7 @@ impl Default for GlobalSettings {
             doh_path: default_doh_path(),
             default_upstream: default_upstream(),
             default_upstream_pre_split: None,
+            default_upstream_shared: None,
             upstream_timeout_ms: default_upstream_timeout_ms(),
             request_timeout_ms: None, // 默认自动计算 / Auto-calculated by default
             response_jump_limit: default_response_jump_limit(),
@@ -557,6 +561,9 @@ pub enum Action {
         /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
         #[serde(skip)]
         pre_split_upstreams: Option<Arc<Vec<Arc<str>>>>,
+        /// `upstream` 的一份共用的副本（性能优化）/ A shared copy of `upstream` (performance optimization)
+        #[serde(skip)]
+        upstream_shared: Option<Arc<str>>,
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
@@ -576,12 +583,14 @@ impl Action {
         if let Action::Forward {
             upstream: Some(upstream_str),
             pre_split_upstreams,
+            upstream_shared,
             ..
         } = self
         {
             *pre_split_upstreams = Some(Arc::new(
                 split_upstreams(upstream_str).map(Arc::from).collect(),
             ));
+            *upstream_shared = Some(Arc::from(upstream_str.as_str()));
         }
     }
 }
@@ -780,6 +789,7 @@ impl GlobalSettings {
                 min_ttl,
                 default_upstream,
                 default_upstream_pre_split,
+                default_upstream_shared,
                 upstream_timeout_ms,
                 request_timeout_ms,
                 response_jump_limit,
@@ -873,6 +883,14 @@ impl GlobalSettings {
         if split.len() > 1 {
             self.default_upstream_pre_split = Some(Arc::new(split));
         }
+    }
+
+    /// `default_upstream`，配置加载时算好的那份，转发不用为它分配内存 / `default_upstream`, the copy
+    /// made at config load, so that a forward allocates nothing for it
+    pub(crate) fn default_upstream_arc(&self) -> Arc<str> {
+        self.default_upstream_shared
+            .clone()
+            .unwrap_or_else(|| Arc::from(self.default_upstream.as_str()))
     }
 
     /// Validate timeout configuration sanity
