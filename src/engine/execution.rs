@@ -444,25 +444,46 @@ impl Engine {
         answer: FastPathAnswer<'_>,
         response: Result<&[u8], &anyhow::Error>,
     ) {
-        observer.request_started(ctx);
-        observer.pipeline_selected(ctx, pipeline_id);
-        observer.cache_lookup(ctx);
-        match answer {
+        let error = response.as_ref().err().map(|error| format!("{error:#}"));
+        let outcome = RequestOutcome {
+            latency: ctx.started.elapsed(),
+            status: if error.is_some() {
+                RequestStatus::Failed
+            } else {
+                RequestStatus::Completed
+            },
+            response: response.ok(),
+            error: error.as_deref(),
+        };
+        let hit = match answer {
             FastPathAnswer::Cache {
                 original_ttl,
                 elapsed_secs,
                 source,
-            } => observer.cache_hit(
-                ctx,
-                &CacheHit {
-                    kind: CacheHitKind::Fresh,
-                    remaining_ttl: Some(Duration::from_secs(
-                        original_ttl.saturating_sub(elapsed_secs) as u64,
-                    )),
-                    original_ttl: Some(Duration::from_secs(original_ttl as u64)),
-                    source,
-                },
-            ),
+            } => Some(CacheHit {
+                kind: CacheHitKind::Fresh,
+                remaining_ttl: Some(Duration::from_secs(
+                    original_ttl.saturating_sub(elapsed_secs) as u64,
+                )),
+                original_ttl: Some(Duration::from_secs(original_ttl as u64)),
+                source,
+            }),
+            _ => None,
+        };
+        if let Some(hit) = &hit
+            && observer.answered_from_cache(ctx, pipeline_id, hit, &outcome)
+        {
+            return;
+        }
+        observer.request_started(ctx);
+        observer.pipeline_selected(ctx, pipeline_id);
+        observer.cache_lookup(ctx);
+        match answer {
+            FastPathAnswer::Cache { .. } => {
+                if let Some(hit) = &hit {
+                    observer.cache_hit(ctx, hit);
+                }
+            }
             FastPathAnswer::StaticRule {
                 rule,
                 rcode,
@@ -495,20 +516,7 @@ impl Engine {
                 report_rule_cache_hit(observer, ctx, pipeline_id, record, true);
             }
         }
-        let error = response.as_ref().err().map(|error| format!("{error:#}"));
-        observer.request_finished(
-            ctx,
-            &RequestOutcome {
-                latency: ctx.started.elapsed(),
-                status: if error.is_some() {
-                    RequestStatus::Failed
-                } else {
-                    RequestStatus::Completed
-                },
-                response: response.ok(),
-                error: error.as_deref(),
-            },
-        );
+        observer.request_finished(ctx, &outcome);
     }
 
     /// Fast path: synchronous cache hit attempt / 快速路径：同步尝试缓存命中

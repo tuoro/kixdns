@@ -749,6 +749,103 @@ async fn a_request_says_when_it_started_and_how_it_is_reported() {
     assert!(Duration::ZERO < latencies[1] && latencies[1] <= after - slow);
 }
 
+/// 把缓存命中整个接过去的观察者 / An observer taking cache hits whole
+#[derive(Default)]
+struct TakesHitsWhole {
+    whole: Mutex<Vec<(String, String, Option<ResponseCode>)>>,
+    started: Mutex<Vec<String>>,
+    finished: Mutex<Vec<String>>,
+}
+
+impl EngineObserver for TakesHitsWhole {
+    fn answered_from_cache(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        hit: &CacheHit<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) -> bool {
+        assert_eq!(hit.kind, CacheHitKind::Fresh);
+        assert!(outcome.latency > Duration::ZERO);
+        self.whole.lock().unwrap().push((
+            ctx.qname.to_string(),
+            pipeline.to_string(),
+            outcome.response.map(rcode_of),
+        ));
+        true
+    }
+
+    fn request_started(&self, ctx: &RequestContext<'_>) {
+        self.started.lock().unwrap().push(ctx.qname.to_string());
+    }
+
+    fn request_finished(&self, ctx: &RequestContext<'_>, _outcome: &RequestOutcome<'_>) {
+        self.finished.lock().unwrap().push(ctx.qname.to_string());
+    }
+}
+
+/// 接过去了就不再发分开的事件；只有缓存命中才这样，规则直接答的照旧
+/// Once taken whole there are no separate events; only a cache hit goes this way, and a rule's own
+/// answer on the fast path is reported as ever
+#[tokio::test]
+async fn an_observer_can_take_a_cache_hit_whole() {
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "block",
+                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
+                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+            }]
+        }]
+    })
+    .to_string();
+    let observer = Arc::new(TakesHitsWhole::default());
+    let engine = Engine::builder(runtime_config(&raw))
+        .observer(observer.clone())
+        .build()
+        .expect("build engine");
+
+    engine
+        .handle_packet(&query("a.blocked.test"), peer())
+        .await
+        .unwrap();
+    assert!(observer.whole.lock().unwrap().is_empty());
+    assert_eq!(observer.started.lock().unwrap().len(), 1);
+
+    let fast = engine
+        .handle_packet_fast(&query("a.blocked.test"), peer())
+        .unwrap();
+    assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
+    assert_eq!(
+        *observer.whole.lock().unwrap(),
+        vec![(
+            "a.blocked.test".to_string(),
+            "main".to_string(),
+            Some(ResponseCode::NXDomain)
+        )]
+    );
+    assert_eq!(
+        observer.started.lock().unwrap().len(),
+        1,
+        "no separate events"
+    );
+    assert_eq!(
+        observer.finished.lock().unwrap().len(),
+        1,
+        "no separate events"
+    );
+
+    let fast = engine
+        .handle_packet_fast(&query("b.blocked.test"), peer())
+        .unwrap();
+    assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
+    assert_eq!(observer.whole.lock().unwrap().len(), 1);
+    assert_eq!(observer.started.lock().unwrap().len(), 2);
+    assert_eq!(observer.finished.lock().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn static_rule_is_reported_on_slow_and_fast_paths() {
     let raw = serde_json::json!({

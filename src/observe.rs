@@ -130,6 +130,23 @@ pub trait EngineObserver: Send + Sync + 'static {
     /// [`cache_miss`]: EngineObserver::cache_miss
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {}
 
+    /// The fast path answered the request from the response cache, offered whole.
+    /// Return `true` to take it so: the engine then reports none of the separate
+    /// events for this request. By default an observer gets the separate events.
+    ///
+    /// The separate events are a dynamic call each, and an observer keeping
+    /// anything per request has to find it again in each of them. A request
+    /// answered on the spot needs none of that.
+    fn answered_from_cache(
+        &self,
+        ctx: &RequestContext<'_>,
+        pipeline: &str,
+        hit: &CacheHit<'_>,
+        outcome: &RequestOutcome<'_>,
+    ) -> bool {
+        false
+    }
+
     /// The response cache answered the request. Reported at most once per
     /// request, and paired with one of its [`cache_lookup`]s, except a
     /// [`CacheHitKind::StaleUpstreamFailure`] hit, which follows the request's
