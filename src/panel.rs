@@ -15,8 +15,6 @@ use arc_swap::ArcSwap;
 #[cfg(unix)]
 use bytes::Bytes;
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
-use dashmap::try_result::TryResult;
 #[cfg(unix)]
 use http_body_util::{BodyExt, Full, Limited};
 #[cfg(unix)]
@@ -43,7 +41,7 @@ use crate::observe::{
     RuleMatched, RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
     UpstreamSkipReason, UpstreamSkipped,
 };
-use crate::panel_querylog::{self, QueryLog, WallClock};
+use crate::panel_querylog::{self, OwnLines, QueryLog, WallClock};
 use crate::panel_trace;
 use sha2::{Digest, Sha256};
 
@@ -67,9 +65,11 @@ const MAX_DIAGNOSTIC_BODY: usize = 2 * 1024;
 const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const QUERY_STATS_BUCKET_SECONDS: u64 = 3_600;
 const QUERY_STATS_BUCKETS: usize = 24;
-const QUERY_STATS_SHARDS: usize = 16;
-const QUERY_STATS_DOMAIN_CAP: usize = 4_096;
-const QUERY_STATS_CLIENT_CAP: usize = 1_024;
+/// 一个钟头最多记多少项。各线程分开记，同一个域名可能在几个线程里各占一项，所以留出两倍的地方
+/// How many entries an hour holds at most. Threads count apart and one name may take an entry in several of
+/// them, so there is twice the room
+const QUERY_STATS_DOMAIN_CAP: usize = 8_192;
+const QUERY_STATS_CLIENT_CAP: usize = 2_048;
 
 thread_local! {
     /// 拼统计键的缓冲，每个线程一份、反复使用：已有的统计项按它直接查到，计数时不再为键分配内存
@@ -121,28 +121,36 @@ struct ActiveConfig {
     restart_pending: Vec<String>,
 }
 
+/// 一个线程记下的一格 / What one thread has counted in a bucket
+#[derive(Default)]
+struct StatsShard {
+    requests: u64,
+    dropped_updates: u64,
+    domains: HashMap<Arc<str>, u64>,
+    clients: HashMap<IpAddr, u64>,
+}
+
+/// 一个钟头的排行。每个线程记自己那一份，读的时候合起来：每个查询都要记，放在一张表上就是所有核轮流抢它的锁和计数。
+/// 只有新来一项才碰共用的条数
+/// One hour of rankings. Each thread counts in its own share and reading merges them: every query is
+/// counted, and on one table all cores would take turns fighting over its locks and counts. Only a new entry
+/// touches the shared numbers of entries
 struct QueryStatsBucket {
     epoch: AtomicU64,
-    requests: AtomicU64,
-    dropped_updates: AtomicU64,
     domain_entries: AtomicUsize,
     client_entries: AtomicUsize,
     rotate_lock: Mutex<()>,
-    domains: DashMap<Arc<str>, AtomicU64>,
-    clients: DashMap<IpAddr, AtomicU64>,
+    shards: Box<[OwnLines<Mutex<StatsShard>>]>,
 }
 
 impl QueryStatsBucket {
     fn new() -> Self {
         Self {
             epoch: AtomicU64::new(0),
-            requests: AtomicU64::new(0),
-            dropped_updates: AtomicU64::new(0),
             domain_entries: AtomicUsize::new(0),
             client_entries: AtomicUsize::new(0),
             rotate_lock: Mutex::new(()),
-            domains: DashMap::with_shard_amount(QUERY_STATS_SHARDS),
-            clients: DashMap::with_shard_amount(QUERY_STATS_SHARDS),
+            shards: (0..COUNT_CELLS).map(|_| OwnLines::default()).collect(),
         }
     }
 
@@ -168,43 +176,44 @@ impl QueryStatsBucket {
     /// 清空这一格、换成 `epoch` 那个钟头；调用方拿着 `rotate_lock`
     /// Empties this bucket for the hour `epoch`; the caller holds `rotate_lock`
     fn reset(&self, epoch: u64) {
-        self.domains.clear();
-        self.clients.clear();
-        self.requests.store(0, Ordering::Relaxed);
-        self.dropped_updates.store(0, Ordering::Relaxed);
+        for shard in &self.shards {
+            *shard.lock() = StatsShard::default();
+        }
         self.domain_entries.store(0, Ordering::Relaxed);
         self.client_entries.store(0, Ordering::Relaxed);
         self.epoch.store(epoch, Ordering::Release);
     }
 
-    fn record_domain(&self, domain: &str) -> bool {
-        record_capped(
-            &self.domains,
+    /// 这个线程记一次 / This thread counts one query
+    fn record(&self, domain: &str, client: IpAddr) {
+        let mut shard = self.shards[thread_cell()].lock();
+        let shard = &mut *shard;
+        shard.requests += 1;
+        let domain_recorded = record_capped(
+            &mut shard.domains,
             &self.domain_entries,
             QUERY_STATS_DOMAIN_CAP,
             domain,
             || Arc::from(domain),
-        )
-    }
-
-    fn record_client(&self, client: IpAddr) -> bool {
-        record_capped(
-            &self.clients,
+        );
+        let client_recorded = record_capped(
+            &mut shard.clients,
             &self.client_entries,
             QUERY_STATS_CLIENT_CAP,
             &client,
             || client,
-        )
+        );
+        if !domain_recorded || !client_recorded {
+            shard.dropped_updates += 1;
+        }
     }
 }
 
-/// 给 `map` 里的 `key` 记一次；没有这一项时新建，`entries` 记着已有几项，到了 `cap` 就不再新建。
-/// 锁被别人占着、或者满了，都不记，返回 false
-/// Counts `key` once in `map`, adding it when absent; `entries` holds how many there
-/// are, and none is added once it reaches `cap`. Nothing is counted when the lock is
-/// taken or the map is full, and then it returns false
+/// 给 `map` 里的 `key` 记一次；没有这一项时新建，`entries` 记着各线程一共有几项，到了 `cap` 就不再新建，返回 false
+/// Counts `key` once in `map`, adding it when absent; `entries` holds how many all threads have together,
+/// and none is added once it reaches `cap`, which gives false
 fn record_capped<K, Q>(
-    map: &DashMap<K, AtomicU64>,
+    map: &mut HashMap<K, u64>,
     entries: &AtomicUsize,
     cap: usize,
     key: &Q,
@@ -214,38 +223,21 @@ where
     K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
     Q: Eq + std::hash::Hash + ?Sized,
 {
-    match map.try_get(key) {
-        TryResult::Present(counter) => {
-            counter.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-        TryResult::Locked => return false,
-        TryResult::Absent => {}
+    if let Some(count) = map.get_mut(key) {
+        *count += 1;
+        return true;
     }
-    // 满了就不再为新的一项分配、抢写锁：随机子域名一多，这条路每个查询都会走
-    // Full: no allocation or write lock for a new entry, a path every query takes once
-    // random subdomains pour in
+    // 满了就不再为新的一项分配：随机子域名一多，这条路每个查询都会走
+    // Full: no allocation for a new entry, a path every query takes once random subdomains pour in
     if entries.load(Ordering::Relaxed) >= cap {
         return false;
     }
-    let Some(entry) = map.try_entry(owned()) else {
+    if entries.fetch_add(1, Ordering::Relaxed) >= cap {
+        entries.fetch_sub(1, Ordering::Relaxed);
         return false;
-    };
-    match entry {
-        Entry::Occupied(entry) => {
-            entry.get().fetch_add(1, Ordering::Relaxed);
-            true
-        }
-        Entry::Vacant(entry) => {
-            let index = entries.fetch_add(1, Ordering::Relaxed);
-            if index >= cap {
-                entries.fetch_sub(1, Ordering::Relaxed);
-                return false;
-            }
-            entry.insert(AtomicU64::new(1));
-            true
-        }
     }
+    map.insert(owned(), 1);
+    true
 }
 
 /// 查询排行：开了控制通道就一直统计，客户端地址照原样记。配置里的 `statistics_enabled` 和
@@ -279,11 +271,11 @@ struct TopStat {
 #[cfg_attr(not(unix), allow(dead_code))]
 fn add_counts<K: Clone + Eq + std::hash::Hash>(
     totals: &mut HashMap<K, u64>,
-    counts: &DashMap<K, AtomicU64>,
+    counts: &HashMap<K, u64>,
 ) {
-    for entry in counts {
-        let total = totals.entry(entry.key().clone()).or_default();
-        *total = total.saturating_add(entry.value().load(Ordering::Relaxed));
+    for (key, count) in counts {
+        let total = totals.entry(key.clone()).or_default();
+        *total = total.saturating_add(*count);
     }
 }
 
@@ -329,12 +321,7 @@ impl QueryStats {
         if !bucket.prepare(epoch) {
             return;
         }
-        bucket.requests.fetch_add(1, Ordering::Relaxed);
-        let domain_recorded = bucket.record_domain(domain);
-        let client_recorded = bucket.record_client(client);
-        if !domain_recorded || !client_recorded {
-            bucket.dropped_updates.fetch_add(1, Ordering::Relaxed);
-        }
+        bucket.record(domain, client);
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -352,12 +339,13 @@ impl QueryStats {
             {
                 continue;
             }
-            requests_observed =
-                requests_observed.saturating_add(bucket.requests.load(Ordering::Relaxed));
-            dropped_updates =
-                dropped_updates.saturating_add(bucket.dropped_updates.load(Ordering::Relaxed));
-            add_counts(&mut domains, &bucket.domains);
-            add_counts(&mut clients, &bucket.clients);
+            for shard in &bucket.shards {
+                let shard = shard.lock();
+                requests_observed = requests_observed.saturating_add(shard.requests);
+                dropped_updates = dropped_updates.saturating_add(shard.dropped_updates);
+                add_counts(&mut domains, &shard.domains);
+                add_counts(&mut clients, &shard.clients);
+            }
         }
 
         QueryStatsSnapshot {
@@ -399,17 +387,54 @@ impl LatencySum {
     }
 }
 
+/// [`ThreadCount`] 分成几格，线程比这多时共用，照样数得对 / How many cells a [`ThreadCount`] has; threads
+/// beyond that share one and the count stays right
+const COUNT_CELLS: usize = 16;
+
+static NEXT_COUNT_CELL: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// 这个线程写哪一格 / The cell this thread writes
+    static COUNT_CELL: usize = NEXT_COUNT_CELL.fetch_add(1, Ordering::Relaxed) % COUNT_CELLS;
+}
+
+fn thread_cell() -> usize {
+    COUNT_CELL.with(|cell| *cell)
+}
+
+/// 每个查询都要记的数：线程写自己那一格，读的时候加起来。放在一个数上，就是所有核轮流抢同一块内存
+/// A number counted for every query: a thread writes its own cell, and reading adds them up. As one number
+/// it would be a piece of memory all cores take turns fighting over
+#[derive(Default)]
+struct ThreadCount([OwnLines<AtomicU64>; COUNT_CELLS]);
+
+impl ThreadCount {
+    #[inline]
+    fn fetch_add(&self, value: u64, order: Ordering) {
+        self.0[thread_cell()].fetch_add(value, order);
+    }
+
+    fn load(&self, order: Ordering) -> u64 {
+        self.0
+            .iter()
+            .fold(0, |total, cell| total.wrapping_add(cell.load(order)))
+    }
+}
+
 /// 请求耗时直方图：固定分桶，零分配。/ Request latency histogram with fixed buckets.
 #[derive(Default)]
 struct RequestLatency {
-    total: LatencySum,
-    buckets: [AtomicU64; REQUEST_LATENCY_BUCKETS_MS.len() + 1],
+    micros: ThreadCount,
+    count: ThreadCount,
+    buckets: [ThreadCount; REQUEST_LATENCY_BUCKETS_MS.len() + 1],
 }
 
 impl RequestLatency {
     #[inline]
     fn observe(&self, latency: std::time::Duration) {
-        self.total.add(latency);
+        let micros = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+        self.micros.fetch_add(micros, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
         let millis = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
         let index = REQUEST_LATENCY_BUCKETS_MS
             .iter()
@@ -570,31 +595,31 @@ pub struct PanelMetrics {
     started_at_unix: u64,
     #[cfg_attr(not(unix), allow(dead_code))]
     started_at: Instant,
-    requests_total: AtomicU64,
+    requests_total: ThreadCount,
     requests_inflight: AtomicUsize,
-    cache_lookups_total: AtomicU64,
+    cache_lookups_total: ThreadCount,
     /// 每个请求只计一次缓存查找（见 `LookupsCounted`） / Each request counts one cache lookup (see
     /// `LookupsCounted`)
     cache_lookup_counted: LookupsCounted,
-    cache_hits_fresh: AtomicU64,
+    cache_hits_fresh: ThreadCount,
     cache_hits_stale: AtomicU64,
     cache_stale_client_timeout: AtomicU64,
     cache_stale_upstream_failure: AtomicU64,
-    requests_completed: AtomicU64,
-    requests_failed: AtomicU64,
-    requests_cancelled: AtomicU64,
+    requests_completed: ThreadCount,
+    requests_failed: ThreadCount,
+    requests_cancelled: ThreadCount,
     request_latency: RequestLatency,
     upstream_latency: Series<LatencySum>,
     /// 只算拿到响应的尝试（成功或被拒绝），超时与连接错误不计入。
     /// Only attempts that received a response (success or rejected); timeouts and
     /// connection errors are left out.
     upstream_response_latency: Series<LatencySum>,
-    upstream_rcodes: Series<AtomicU64>,
-    upstream_via: Series<AtomicU64>,
-    pipeline_hits: Series<AtomicU64>,
-    rule_matches: Series<AtomicU64>,
-    upstream_attempts: Series<AtomicU64>,
-    upstream_results: Series<AtomicU64>,
+    upstream_rcodes: Series<ThreadCount>,
+    upstream_via: Series<ThreadCount>,
+    pipeline_hits: Series<ThreadCount>,
+    rule_matches: Series<ThreadCount>,
+    upstream_attempts: Series<ThreadCount>,
+    upstream_results: Series<ThreadCount>,
     metric_series_insert_lock: Mutex<()>,
     metric_series_dropped: AtomicU64,
     reload_success: AtomicU64,
@@ -618,17 +643,17 @@ impl Default for PanelMetrics {
         Self {
             started_at_unix: unix_timestamp(),
             started_at: Instant::now(),
-            requests_total: AtomicU64::new(0),
+            requests_total: ThreadCount::default(),
             requests_inflight: AtomicUsize::new(0),
-            cache_lookups_total: AtomicU64::new(0),
+            cache_lookups_total: ThreadCount::default(),
             cache_lookup_counted: LookupsCounted::default(),
-            cache_hits_fresh: AtomicU64::new(0),
+            cache_hits_fresh: ThreadCount::default(),
             cache_hits_stale: AtomicU64::new(0),
             cache_stale_client_timeout: AtomicU64::new(0),
             cache_stale_upstream_failure: AtomicU64::new(0),
-            requests_completed: AtomicU64::new(0),
-            requests_failed: AtomicU64::new(0),
-            requests_cancelled: AtomicU64::new(0),
+            requests_completed: ThreadCount::default(),
+            requests_failed: ThreadCount::default(),
+            requests_cancelled: ThreadCount::default(),
             request_latency: RequestLatency::default(),
             upstream_latency: Series::default(),
             upstream_response_latency: Series::default(),
@@ -775,7 +800,7 @@ impl PanelMetrics {
     /// 按借来的键计数，只有第一次出现的统计项才分配它的键
     /// Counts by a borrowed key; only a series seen for the first time allocates its key
     #[inline]
-    fn increment(&self, series: &Series<AtomicU64>, key: &str) {
+    fn increment(&self, series: &Series<ThreadCount>, key: &str) {
         self.update_series(series, key, |counter| {
             counter.fetch_add(1, Ordering::Relaxed);
         });
@@ -1053,12 +1078,12 @@ impl PanelMetrics {
         metric(
             output,
             "kixdns_request_latency_ms_sum",
-            format_millis(self.request_latency.total.micros.load(Ordering::Relaxed)),
+            format_millis(self.request_latency.micros.load(Ordering::Relaxed)),
         );
         metric(
             output,
             "kixdns_request_latency_ms_count",
-            self.request_latency.total.count.load(Ordering::Relaxed),
+            self.request_latency.count.load(Ordering::Relaxed),
         );
         append_latency_map(
             output,
@@ -2381,7 +2406,7 @@ fn error_json(code: &str, message: &str) -> serde_json::Value {
     json!({ "protocol_version": PROTOCOL_VERSION, "error": { "code": code, "message": message } })
 }
 
-fn append_map(output: &mut String, name: &str, series: &Series<AtomicU64>, labels: &[&str]) {
+fn append_map(output: &mut String, name: &str, series: &Series<ThreadCount>, labels: &[&str]) {
     let mut rows = series
         .snapshot()
         .iter()
@@ -3100,7 +3125,7 @@ mod tests {
             metrics.record_upstream_attempt("udp://192.0.2.1:53", "udp");
         }
         metrics.record_rule_match("main", "cn", "request");
-        let count = |series: &super::Series<super::AtomicU64>, key: &str| {
+        let count = |series: &super::Series<super::ThreadCount>, key: &str| {
             series.with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(metrics.rule_matches.len(), 2);
@@ -3250,7 +3275,7 @@ mod tests {
             metrics.cache_lookups_total.load(super::Ordering::Relaxed),
             1
         );
-        let count = |series: &super::Series<super::AtomicU64>, key: &str| {
+        let count = |series: &super::Series<super::ThreadCount>, key: &str| {
             series.with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(count(&metrics.pipeline_hits, "main"), Some(1));
@@ -3585,6 +3610,121 @@ mod tests {
         assert_eq!(snapshot.dropped_updates, 8);
         assert_eq!(snapshot.clients[0].name, "10.0.0.0");
         assert_eq!(snapshot.clients[0].count, 2);
+    }
+
+    /// 线程各写各的格子，读到的是总数；线程比格子多时共用一格，也一样
+    /// Threads write cells of their own and reading gives the total; with more threads than cells some
+    /// share one, and it is the same
+    #[test]
+    fn a_thread_count_adds_up_across_threads() {
+        use super::{COUNT_CELLS, ThreadCount, thread_cell};
+        let count = std::sync::Arc::new(ThreadCount::default());
+        let threads = (0..COUNT_CELLS + 8)
+            .map(|index| {
+                let count = std::sync::Arc::clone(&count);
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        count.fetch_add(1, super::Ordering::Relaxed);
+                    }
+                    count.fetch_add(index as u64, super::Ordering::Relaxed);
+                    thread_cell()
+                })
+            })
+            .collect::<Vec<_>>();
+        let cells = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        let threads = COUNT_CELLS + 8;
+        let extra = threads * (threads - 1) / 2;
+        assert_eq!(
+            count.load(super::Ordering::Relaxed),
+            (threads * 1_000 + extra) as u64
+        );
+        assert!(cells.len() > 1, "threads write apart: {cells:?}");
+    }
+
+    /// 几个线程记同一个域名和客户端，合起来就是一项，数是总数；各记各的也都在
+    /// Several threads counting one name and client make one entry with the total; what each counted alone
+    /// is there too
+    #[test]
+    fn rankings_counted_on_several_threads_merge() {
+        const THREADS: usize = super::COUNT_CELLS + 4;
+        let stats = std::sync::Arc::new(QueryStats::default());
+        let client: IpAddr = "192.0.2.1".parse().unwrap();
+        let threads = (0..THREADS)
+            .map(|index| {
+                let stats = std::sync::Arc::clone(&stats);
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        stats.record_at("shared.example", client, 3_600);
+                    }
+                    stats.record_at(&format!("own-{index}.example"), client, 3_600);
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let snapshot = stats.snapshot(3_600, 3_600, THREADS + 8);
+        assert_eq!(snapshot.requests_observed, (THREADS * 101) as u64);
+        assert_eq!(snapshot.dropped_updates, 0);
+        assert_eq!(snapshot.domains.len(), THREADS + 1);
+        assert_eq!(snapshot.domains[0].name, "shared.example");
+        assert_eq!(snapshot.domains[0].count, (THREADS * 100) as u64);
+        assert_eq!(snapshot.clients.len(), 1);
+        assert_eq!(snapshot.clients[0].count, (THREADS * 101) as u64);
+    }
+
+    /// 条数上限算的是所有线程加起来：一起来很多新名字也不会超，多出来的记成丢弃
+    /// The cap on entries is across all threads: however many new names come at once it is not passed, and
+    /// those beyond it count as dropped
+    #[test]
+    fn the_cap_on_entries_holds_across_threads() {
+        const THREADS: usize = 8;
+        let stats = std::sync::Arc::new(QueryStats::default());
+        let client: IpAddr = "192.0.2.1".parse().unwrap();
+        let each = QUERY_STATS_DOMAIN_CAP / THREADS + 100;
+        let threads = (0..THREADS)
+            .map(|thread| {
+                let stats = std::sync::Arc::clone(&stats);
+                std::thread::spawn(move || {
+                    for index in 0..each {
+                        stats.record_at(&format!("{thread}-{index}.example"), client, 3_600);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_DOMAIN_CAP * 2);
+        assert_eq!(snapshot.domains.len(), QUERY_STATS_DOMAIN_CAP);
+        assert_eq!(
+            snapshot.dropped_updates,
+            (THREADS * each - QUERY_STATS_DOMAIN_CAP) as u64
+        );
+        assert_eq!(snapshot.requests_observed, (THREADS * each) as u64);
+    }
+
+    /// 同一格过了一天再用到时，客户端的条数上限也重新算 / When a bucket comes round a day later the cap on
+    /// clients starts over too
+    #[test]
+    fn a_bucket_used_again_a_day_later_has_room_for_clients() {
+        let stats = QueryStats::default();
+        let hour = QUERY_STATS_BUCKET_SECONDS;
+        let day = hour * QUERY_STATS_BUCKETS as u64;
+        for index in 0..=QUERY_STATS_CLIENT_CAP {
+            let client = IpAddr::from(Ipv4Addr::from(0x0a00_0000 + index as u32));
+            stats.record_at("a.example", client, hour);
+        }
+        assert_eq!(stats.snapshot(hour, hour, 1).dropped_updates, 1);
+        let new_client = IpAddr::from(Ipv4Addr::new(192, 0, 2, 1));
+        stats.record_at("a.example", new_client, hour + day);
+        let after = stats.snapshot(hour + day, day, 10);
+        assert_eq!(after.dropped_updates, 0);
+        assert_eq!(after.clients.len(), 1);
+        assert_eq!(after.clients[0].name, "192.0.2.1");
     }
 
     /// 一个钟头一格，24 格轮着用：同一格过了一天再用到时，先清空再记，旧的计数、名字、客户端和丢弃数

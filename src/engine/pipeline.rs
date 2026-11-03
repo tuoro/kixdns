@@ -47,7 +47,7 @@ pub struct PipelineSelectionContext<'a> {
 pub fn select_pipeline<'a>(
     cfg: &'a RuntimePipelineConfig,
     request: &PipelineSelectionContext<'_>,
-) -> (Option<&'a RuntimePipeline>, Arc<str>) {
+) -> Option<&'a RuntimePipeline> {
     let qname = request.qname;
     let client_ip = request.client_ip;
     let qclass = request.qclass;
@@ -104,15 +104,15 @@ pub fn select_pipeline<'a>(
             },
         );
         if matched && let Some(p) = cfg.pipeline(&rule.pipeline) {
-            return (Some(p), p.id.clone());
+            return Some(p);
         }
     }
 
-    match cfg.pipelines.first() {
-        Some(p) => (Some(p), p.id.clone()),
-        None => (None, Arc::from("default")),
-    }
+    cfg.pipelines.first()
 }
+
+/// 没有 Pipeline 时用的名字 / The name used with no pipeline
+pub(crate) const NO_PIPELINE: &str = "default";
 
 /// Immutable request state shared across rule evaluation and rule-cache insertion.
 pub struct RuleEvaluationContext<'a> {

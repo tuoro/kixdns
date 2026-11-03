@@ -48,17 +48,32 @@ impl<'a> ResponseLog<'a> {
         start: Instant,
         background: bool,
     ) -> Self {
+        Self::with_pipeline(qname, qtype, peer, || pipeline, start, background)
+    }
+
+    /// 同 [`Self::new`]，这条日志不写时不去要 Pipeline 的名字：要一次就是所有核都写的引用计数加减各一次
+    /// As [`Self::new`], not asking for the pipeline's name when this record will not be written: asking
+    /// takes the reference count every core writes up and down once
+    pub fn with_pipeline(
+        qname: &'a str,
+        qtype: RecordType,
+        peer: SocketAddr,
+        pipeline: impl FnOnce() -> Arc<str>,
+        start: Instant,
+        background: bool,
+    ) -> Self {
+        let enabled = !background
+            && tracing::enabled!(target: "kixdns::engine::phases", tracing::Level::INFO);
         Self {
             info: ResponseInfo {
-                pipeline: Some(pipeline),
+                pipeline: enabled.then(pipeline),
                 ..Default::default()
             },
             qname,
             qtype,
             peer,
             start,
-            enabled: !background
-                && tracing::enabled!(target: "kixdns::engine::phases", tracing::Level::INFO),
+            enabled,
             // No response exists yet; never infer an RCODE from a dropped future.
             rcode: None,
             answered: false,
