@@ -145,6 +145,21 @@ thread_local! {
     static ENCODING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// 独占自己缓存行的一项（硬件预取成对抓两行，所以按两行对齐）：被写得很勤的东西和只读的放在一行上，读也要抢
+/// An item on cache lines of its own (hardware prefetching fetches lines in pairs, so it aligns to two):
+/// something written often and something only read on one line would have the reads fighting too
+#[derive(Default)]
+#[repr(align(128))]
+pub(crate) struct OwnLines<T>(T);
+
+impl<T> std::ops::Deref for OwnLines<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 pub(crate) struct QueryLog {
     epoch: Instant,
     /// 这次内核进程的身份：面板发现它变了就知道序号从头算了 / This kernel run's identity: when it
@@ -183,7 +198,7 @@ pub(crate) struct QueryLog {
     /// 在跟的请求数：为 0 时别的事件一次原子读就返回 / How many requests are tracked: at 0 every other
     /// event returns after one atomic load
     pending_count: AtomicUsize,
-    ring: Mutex<Ring>,
+    ring: OwnLines<Mutex<Ring>>,
     wall: WallClock,
 }
 
@@ -1244,7 +1259,7 @@ impl QueryLog {
             overflow: DashMap::new(),
             overflow_len: AtomicUsize::new(0),
             pending_count: AtomicUsize::new(0),
-            ring: Mutex::new(Ring::new(RING_BYTES)),
+            ring: OwnLines(Mutex::new(Ring::new(RING_BYTES))),
             wall: WallClock::default(),
         }
     }

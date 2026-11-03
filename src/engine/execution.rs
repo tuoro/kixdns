@@ -1,9 +1,10 @@
 use rustc_hash::{FxHashSet, FxHasher};
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -144,6 +145,35 @@ fn shaped_static_reply(reply: Bytes, packet: &[u8], client: Option<&crate::ecs::
     }
 }
 
+/// 请求编号一个线程一次领这么多，用完再领：这个数所有核都要写，每个查询领一次就是每个查询抢一次
+/// A thread takes this many request numbers at a time and comes back when they run out: all cores write
+/// the shared number, so taking one per query would mean fighting over it for every query
+const REQUEST_ID_BLOCK: u64 = 1_024;
+
+/// 整个进程共用：同一个线程可能轮流处理几个引擎的请求，共用才保证同一个引擎里的编号不重复
+/// Shared by the whole process: one thread may handle several engines' requests in turn, and only sharing
+/// keeps the numbers within an engine from repeating
+static NEXT_REQUEST_ID_BLOCK: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// 这个线程手里还没用的编号：下一个，和用到哪儿为止 / The numbers this thread still holds: the next one,
+    /// and where they end
+    static REQUEST_IDS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
+fn next_request_id() -> u64 {
+    REQUEST_IDS.with(|ids| {
+        let (next, end) = ids.get();
+        if next < end {
+            ids.set((next + 1, end));
+            return next;
+        }
+        let start = NEXT_REQUEST_ID_BLOCK.fetch_add(REQUEST_ID_BLOCK, Ordering::Relaxed);
+        ids.set((start + 1, start + REQUEST_ID_BLOCK));
+        start
+    })
+}
+
 /// What answered a request on the synchronous fast path, for observer reporting.
 /// 快速路径上应答请求的来源，用于观察者上报。
 enum FastPathAnswer<'a> {
@@ -168,7 +198,9 @@ enum FastPathAnswer<'a> {
 // ============================================================================
 
 use super::core::Engine;
-use super::pipeline::{PipelineSelectionContext, RuleEvaluationContext, select_pipeline};
+use super::pipeline::{
+    NO_PIPELINE, PipelineSelectionContext, RuleEvaluationContext, select_pipeline,
+};
 
 // ============================================================================
 // Refreshing Bitmap Helpers / 刷新位图辅助函数
@@ -430,7 +462,7 @@ impl Engine {
         qclass: DNSClass,
     ) -> RequestContext<'a> {
         RequestContext {
-            request_id: self.request_id_counter.fetch_add(1, Ordering::Relaxed),
+            request_id: next_request_id(),
             listener_label: &self.listener_label,
             client: peer,
             transport: self.client_transport,
@@ -607,7 +639,9 @@ impl Engine {
         let observed = self.observer.as_deref();
 
         // Get pipeline ID / 获取 pipeline ID
-        let state = self.state.load_full();
+        // 只借不留：`load_full` 每个查询要改一次所有核共用的引用计数 / Borrowed, not kept: `load_full` writes the
+        // reference count all cores share for every query
+        let state = self.state.load();
         let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
@@ -616,7 +650,7 @@ impl Engine {
         // Use unchecked conversion for performance (qname_bytes is validated UTF-8)
         // 使用未检查转换以提高性能（qname_bytes 是已验证的 UTF-8）
         let qname_str = q.qname_str_unchecked();
-        let (pipeline_opt, pipeline_id) = select_pipeline(
+        let pipeline_opt = select_pipeline(
             cfg,
             &PipelineSelectionContext {
                 qname: qname_str,
@@ -630,9 +664,13 @@ impl Engine {
             },
         );
 
+        let pipeline_id = pipeline_opt.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
+        let owned_pipeline_id =
+            || pipeline_opt.map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone());
+
         // 在这里答上的请求各记一条响应日志 / Each request answered here gets a response record
         let response_log =
-            || ResponseLog::new(qname_str, qtype, peer, pipeline_id.clone(), start, false);
+            || ResponseLog::with_pipeline(qname_str, qtype, peer, owned_pipeline_id, start, false);
 
         // RFC 6891 第 6.1.3 节：不支持请求的 EDNS 版本时回 BADVERS，而不是照版本 0 去答
         // RFC 6891 section 6.1.3: an unsupported EDNS version is answered BADVERS rather
@@ -662,7 +700,7 @@ impl Engine {
         }
 
         // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        let cache_namespace = state.cache_namespace(&pipeline_id);
+        let cache_namespace = state.cache_namespace(pipeline_id);
         let requester = Requester {
             address: peer.ip(),
             edns: q.edns_present,
@@ -674,7 +712,7 @@ impl Engine {
         });
         let slot = Self::cache_slot(
             cache_namespace,
-            &pipeline_id,
+            pipeline_id,
             q.qname_bytes,
             qtype,
             qclass,
@@ -687,7 +725,7 @@ impl Engine {
             &view,
             &CachedQuestion {
                 qname: qname_str,
-                pipeline_id: &pipeline_id,
+                pipeline_id,
                 qtype: u16::from(qtype),
                 flags: q.flags,
             },
@@ -779,7 +817,7 @@ impl Engine {
                     self.observe_fast_path(
                         observer,
                         &self.fast_path_context(start, peer, qname_str, qtype, qclass),
-                        &pipeline_id,
+                        pipeline_id,
                         FastPathAnswer::Cache {
                             original_ttl: hit.original_ttl,
                             elapsed_secs,
@@ -813,7 +851,7 @@ impl Engine {
                 self.observe_fast_path(
                     observer,
                     &self.fast_path_context(start, peer, qname_str, qtype, qclass),
-                    &pipeline_id,
+                    pipeline_id,
                     answer,
                     built.as_deref(),
                 );
@@ -843,7 +881,7 @@ impl Engine {
         };
 
         // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
-        if let Some(compiled) = self.compiled_for(&state, &pipeline_id)
+        if let Some(compiled) = self.compiled_for(&state, pipeline_id)
             && let Some((action, rule_name)) = fast_static_match_with_rule(
                 compiled,
                 qname_str,
@@ -902,7 +940,7 @@ impl Engine {
             );
             let rule_hash = crate::engine::rules::calculate_rule_hash(
                 cache_namespace,
-                &pipeline_id,
+                pipeline_id,
                 qname_str,
                 qtype,
                 qclass,
@@ -918,7 +956,7 @@ impl Engine {
                     self.rule_cache.remove(rule_hash);
                 } else if entry.matches_at(
                     start,
-                    &pipeline_id,
+                    pipeline_id,
                     qname_str,
                     qtype,
                     qclass,
@@ -943,7 +981,7 @@ impl Engine {
             q.qclass,
             q.tx_id,
             q.edns_present,
-            pipeline_id,
+            owned_pipeline_id(),
         ))))
     }
 
@@ -1132,7 +1170,7 @@ impl Engine {
         // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
         let flags = crate::proto_utils::QueryFlags::of(packet);
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
-        let request_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
+        let request_id = next_request_id();
         // A request uses one immutable configuration snapshot from selection
         // through response actions and cache writes. Background refresh passes
         // the snapshot that produced its cache key via `state_override`.
@@ -1193,7 +1231,7 @@ impl Engine {
                         )
                     };
 
-                let (_, pipeline_id) = select_pipeline(
+                let pipeline_id = select_pipeline(
                     cfg,
                     &PipelineSelectionContext {
                         qname: &qname_text,
@@ -1205,7 +1243,8 @@ impl Engine {
                         geosite_manager: Some(&self.geosite_manager),
                         geoip_manager: Some(&self.geoip_manager),
                     },
-                );
+                )
+                .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone());
 
                 (
                     qname_text,
@@ -3872,7 +3911,7 @@ mod tests {
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime");
 
         // Act: Select pipeline for edge listener
-        let (opt, id) = select_pipeline(
+        let opt = select_pipeline(
             &runtime,
             &PipelineSelectionContext {
                 qname: "any.example.com",
@@ -3885,14 +3924,11 @@ mod tests {
                 geoip_manager: None,
             },
         );
+        let id = opt.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
 
         // Assert: Verify correct pipeline was selected
         assert!(opt.is_some(), "Should find matching pipeline");
-        assert_eq!(
-            id.as_ref(),
-            "p2",
-            "Should select p2 pipeline for edge listener"
-        );
+        assert_eq!(id, "p2", "Should select p2 pipeline for edge listener");
     }
 
     #[test]
@@ -3920,7 +3956,7 @@ mod tests {
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime");
 
         // Act: Select pipeline for edge listener
-        let (opt, id) = select_pipeline(
+        let opt = select_pipeline(
             &runtime,
             &PipelineSelectionContext {
                 qname: "example.com",
@@ -3933,14 +3969,11 @@ mod tests {
                 geoip_manager: None,
             },
         );
+        let id = opt.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
 
         // Assert: Verify correct pipeline was selected
         assert!(opt.is_some(), "Should find matching pipeline");
-        assert_eq!(
-            id.as_ref(),
-            "p2",
-            "Should select p2 pipeline for edge listener"
-        );
+        assert_eq!(id, "p2", "Should select p2 pipeline for edge listener");
     }
 
     #[allow(dead_code)]
@@ -5289,6 +5322,30 @@ mod tests {
         let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
         assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
         assert!(engine.rule_cache.get(key).is_some());
+    }
+
+    /// 请求编号一个线程领一批：跨过好几批、好几个线程，也没有两个一样的
+    /// A thread takes request numbers in blocks: across many blocks and threads, no two are the same
+    #[test]
+    fn request_numbers_never_repeat_across_threads() {
+        let per_thread = REQUEST_ID_BLOCK as usize * 3 + 5;
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    (0..per_thread)
+                        .map(|_| next_request_id())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let numbers: Vec<u64> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(numbers.len(), 8 * per_thread);
+        let distinct: std::collections::HashSet<u64> = numbers.iter().copied().collect();
+        assert_eq!(distinct.len(), numbers.len());
+        assert!(numbers.iter().all(|number| *number > 0));
     }
 
     /// 快速路径交出的是应答在缓存里实际停留的整秒数，写出去的 TTL 按它调低（RFC 1035 §5.2）
