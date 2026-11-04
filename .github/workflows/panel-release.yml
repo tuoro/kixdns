@@ -92,6 +92,7 @@ jobs:
           cargo test --locked --test doh_integration
           cargo test --locked --test response_log
           cargo test --locked --test observer_api
+          cargo test --locked --test listener_port
 
       # 漏洞、不健全、已撤回挡住发布；无人维护和通知只报告。
       # Vulnerabilities, unsound and yanked crates block a release; unmaintained and notices are only reported.

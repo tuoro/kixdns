@@ -69,19 +69,6 @@ const MAX_CONCURRENT_STREAMS: u32 = 100;
 /// hot-reload pattern as Engine's `Arc<ArcSwap<...>>` state.
 type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 
-/// 启动 DoH 服务器 / Start DoH server
-pub async fn run_doh(
-    addr: SocketAddr,
-    cert_path: &str,
-    key_path: &str,
-    engine: Engine,
-    doh_path: String,
-) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await.context("bind doh tcp")?;
-    info!(%addr, %doh_path, "DoH server listening");
-    run_doh_with_listener(listener, cert_path, key_path, engine, doh_path).await
-}
-
 /// 从已绑定的 TcpListener 启动 DoH 服务器（便于测试获取实际端口）
 /// Start DoH server from a pre-bound TcpListener (allows tests to discover the actual port)
 pub async fn run_doh_with_listener(
