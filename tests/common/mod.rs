@@ -7,23 +7,32 @@
 
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::process::Child;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A local port free for both TCP and UDP / 本机上 TCP 和 UDP 都空着的端口
 ///
-/// 先拿 UDP 端口再看同号的 TCP：TCP 挑临时端口时不看 UDP 的占用，反过来更容易撞上别的测试占着的
-/// UDP 端口。最多试 20 次。
-/// The UDP port first, then TCP on the same number: the TCP ephemeral allocator does
-/// not look at UDP, so the other order runs into UDP ports other tests hold more often.
-/// At most 20 tries.
+/// 挑在系统分配临时端口的范围之下（Linux 从 32768 起）。范围内的端口查完以后到内核绑定之前是空着的，
+/// 这期间任何新开的 socket 都可能拿走它，包括内核自己的上游 socket，内核就起不来了。起点从进程号算，
+/// 同时跑的测试程序不容易挑到同一个；一个测试程序里不会挑到两次。最多试 200 次。
+/// Picked below the range the system hands out ephemeral ports from (32768 up on Linux). A port in that
+/// range sits free between this check and the kernel binding it, and any new socket may take it
+/// meanwhile, the kernel's own upstream sockets included, and the kernel does not start. The starting
+/// point comes from the process id, so test binaries running together rarely pick the same; one binary
+/// never picks a port twice. At most 200 tries.
 pub fn free_port() -> u16 {
-    for _ in 0..20 {
-        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = udp.local_addr().unwrap().port();
-        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+    const FIRST: u32 = 20_000;
+    const PORTS: u32 = 12_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let start = std::process::id().wrapping_mul(61);
+    for _ in 0..200 {
+        let next = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = (FIRST + start.wrapping_add(next) % PORTS) as u16;
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
+        if udp.is_ok() && TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
             return port;
         }
     }
-    panic!("port conflict: no port free for both UDP and TCP in 20 tries");
+    panic!("port conflict: no port free for both UDP and TCP in 200 tries");
 }
 
 /// The running binary, ended when the test ends, a failing one too
