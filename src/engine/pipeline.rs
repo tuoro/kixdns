@@ -25,8 +25,7 @@ use super::observation::{
 };
 use super::rules::Decision;
 use super::rules::{
-    RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, fast_hash_str,
-    rule_cache_requester,
+    RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, rule_cache_requester,
 };
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_answer};
@@ -224,19 +223,19 @@ impl Engine {
 
         self.rule_cache.insert(
             hash,
-            RuleCacheRecord {
+            Arc::new(RuleCacheRecord {
                 entry: RuleCacheEntry {
                     pipeline_id,
-                    qname_hash: fast_hash_str(qname),
+                    qname: SmallVec::from_slice(qname.as_bytes()),
                     qtype: u16::from(qtype),
                     qclass: u16::from(qclass),
                     requester,
-                    decision: Arc::new(decision),
+                    decision,
                     expires_at,
                 },
                 matched_rules: request.observed.map(|_| Arc::from(matched_rules)),
                 decided_by_rule,
-            },
+            }),
         );
     }
 
@@ -296,7 +295,7 @@ impl Engine {
                 if let Some((observer, ctx)) = request.observed {
                     report_rule_cache_hit(observer, ctx, &pipeline.id, &record, false);
                 }
-                return (*entry.decision).clone();
+                return entry.decision.clone();
             }
         }
         if allow_rule_cache_lookup && let Some((observer, ctx)) = request.observed {
@@ -823,7 +822,7 @@ mod rule_cache_policy_tests {
             .values()
             .iter()
             .map(|record| {
-                let kind = match record.entry.decision.as_ref() {
+                let kind = match &record.entry.decision {
                     Decision::Static { .. } => "static",
                     Decision::Forward { .. } => "forward",
                     _ => "other",
@@ -840,6 +839,45 @@ mod rule_cache_policy_tests {
                 ("regex".to_owned(), "forward"),
             ]
         );
+    }
+
+    /// 落到同一个键上的决定是给别的名字的，就不拿来用：该转发的名字不会照着别人的决定被拦下
+    /// A decision on the same key but for another name is not used: a name to be forwarded is not blocked
+    /// on another's decision
+    #[tokio::test]
+    async fn a_decision_for_another_name_on_the_same_key_is_not_used() {
+        let engine = engine();
+        let state = engine.state.load_full();
+        let plain = &state.pipeline.pipelines[0];
+        let ask = |name| {
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            engine.apply_rules(&state, plain, &request)
+        };
+        let key_of = |name| {
+            calculate_rule_hash(
+                state.cache_namespace("plain"),
+                "plain",
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                &RequesterKey::NONE,
+            )
+        };
+        assert!(matches!(ask("ads.example"), Decision::Static { .. }));
+        let block = engine
+            .rule_cache
+            .get(key_of("ads.example"))
+            .expect("cached");
+        engine.rule_cache.insert(key_of("example.com"), block);
+        assert!(matches!(ask("example.com"), Decision::Forward { .. }));
     }
 
     /// 本身不过期的决策（静态回答、没有应答阶段规则的转发）和 TTL 更长的跳转，在规则缓存里都只用
@@ -908,7 +946,7 @@ mod rule_cache_policy_tests {
 
         let mut kinds: Vec<&str> = Vec::new();
         for record in engine.rule_cache.values() {
-            kinds.push(match record.entry.decision.as_ref() {
+            kinds.push(match &record.entry.decision {
                 Decision::Static { .. } => "static",
                 Decision::Jump { .. } => "jump",
                 Decision::Forward { .. } => "forward",
@@ -1139,7 +1177,7 @@ mod rule_cache_policy_tests {
         );
         let mut record = engine.rule_cache.get(key).expect("cached");
         let expired = Instant::now() - std::time::Duration::from_secs(1);
-        record.entry.expires_at = Some(expired);
+        Arc::make_mut(&mut record).entry.expires_at = Some(expired);
         engine.rule_cache.insert(key, record);
         let count = engine.rule_cache.access_count(key).unwrap();
         assert!(count > 0);
