@@ -46,7 +46,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive interval; 0 disables keepalive. |
 | doq_enable_0rtt | true | Global DoQ 0-RTT setting. |
 | enable_tcp_fallback | true | Retry UDP failure or truncation with TCP. |
-| flow_control_enabled | false | Enable adaptive flow control: while the kernel cannot keep up, queries past the limit on those handled at once get SERVFAIL at once. A slow upstream does not count as busy and refuses nothing. |
+| flow_control_enabled | false | Enable adaptive flow control: while the kernel cannot keep up, queries past the limit on those handled at once get SERVFAIL at once. A slow upstream alone does not count as busy; while the kernel is busy, queries waiting on an upstream count among those handled at once. |
 | flow_control_initial_permits | 500 | Initial limit on queries handled at once, which applies only while the kernel is busy. |
 | flow_control_min_permits | 100 | The lowest the limit tightens to. |
 | flow_control_max_permits | 800 | The highest the limit loosens to. |

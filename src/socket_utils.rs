@@ -177,6 +177,32 @@ pub fn set_reuseport_lb(_socket: &socket2::Socket) -> io::Result<()> {
 
 /// Non-Unix stub implementations (Windows and other platforms)
 /// 非 Unix 系统的存根实现（Windows 和其他平台）
+/// 这个 socket 因为接收缓冲满丢过多少报文；读不到时是 None
+/// How many datagrams this socket has dropped for a full receive buffer; None when that cannot be read
+#[cfg(target_os = "linux")]
+pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
+    // 只要到丢包这一项，内核按给的长度填 / Only as far as the drops; the kernel fills what the length allows
+    let mut info = [0u32; libc::SK_MEMINFO_DROPS as usize + 1];
+    let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+    // SAFETY: the buffer and its length are valid for the call, which only writes within them
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            info.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    (ret == 0).then(|| info[libc::SK_MEMINFO_DROPS as usize])
+}
+
+/// 别的系统读不到，接收缓冲就一直不收小 / Other systems cannot read it, so the receive buffer never shrinks there
+#[cfg(not(target_os = "linux"))]
+pub fn udp_receive_drops(_socket: &tokio::net::UdpSocket) -> Option<u32> {
+    None
+}
+
 #[cfg(not(unix))]
 #[allow(dead_code)] // Stub implementations for cross-platform compatibility
 #[inline]
