@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -582,11 +581,6 @@ async fn forward_upstream_as_is(
                         },
                     );
                 }
-                // 记录成功指标 / Record success metrics
-                engine
-                    .metrics_last_upstream_latency_ns
-                    .store(dur.as_nanos() as u64, Ordering::Relaxed);
-
                 if let Some(qr) = quick {
                     tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
                 }
@@ -749,9 +743,6 @@ async fn forward_upstream_as_is(
 
                         if should_accept {
                             report(UpstreamOutcome::Success, rcode, truncated, None);
-                            engine
-                                .metrics_last_upstream_latency_ns
-                                .store(dur.as_nanos() as u64, Ordering::Relaxed);
 
                             // The remaining attempts lose the race / 其余尝试竞争失败
                             if let Some(pending) = pending.as_ref() {

@@ -76,8 +76,6 @@ pub struct Engine {
     pub refreshing_set: Arc<DashSet<u64>>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
-    // Latest upstream latency for adaptive flow control / 用于自适应流控的最新上游延迟
-    pub metrics_last_upstream_latency_ns: Arc<AtomicU64>,
     // Adaptive flow control state (None when flow control is disabled) / 自适应流控状态（禁用流控时为None）
     pub flow_control_state: Option<Arc<FlowControlState>>,
     // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
@@ -216,8 +214,7 @@ impl Engine {
                     max_permits: AtomicUsize::new(settings.flow_control_max_permits),
                     min_permits: settings.flow_control_min_permits,
                     last_adjustment_ms: AtomicU64::new(0),
-                    critical_latency_threshold_ns: settings.flow_control_latency_threshold_ms
-                        * 1_000_000,
+                    busy_after: Duration::from_millis(settings.flow_control_latency_threshold_ms),
                     adjustment_interval_ms: settings.flow_control_adjustment_interval_secs * 1000,
                 })),
             )
@@ -290,7 +287,6 @@ impl Engine {
             running_settings,
             reload_lock: Arc::new(Mutex::new(geo_sources)),
             rule_cache,
-            metrics_last_upstream_latency_ns: Arc::new(AtomicU64::new(0)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
             // DashMap configuration: shard count and initial capacity
             // If dashmap_shards is 0, use DashMap default (num_cpus * 4)

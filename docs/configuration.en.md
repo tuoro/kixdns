@@ -46,12 +46,12 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive interval; 0 disables keepalive. |
 | doq_enable_0rtt | true | Global DoQ 0-RTT setting. |
 | enable_tcp_fallback | true | Retry UDP failure or truncation with TCP. |
-| flow_control_enabled | false | Enable adaptive permit-based flow control. |
-| flow_control_initial_permits | 500 | Initial permits when flow control is enabled. |
-| flow_control_min_permits | 100 | Minimum permits when flow control is enabled. |
-| flow_control_max_permits | 800 | Maximum permits when flow control is enabled. |
-| flow_control_latency_threshold_ms | 100 | Latency threshold used by adaptive flow control. |
-| flow_control_adjustment_interval_secs | 5 | Permit adjustment interval. |
+| flow_control_enabled | false | Enable adaptive flow control: while the kernel cannot keep up, queries past the limit on those handled at once get SERVFAIL at once. A slow upstream does not count as busy and refuses nothing. |
+| flow_control_initial_permits | 500 | Initial limit on queries handled at once, which applies only while the kernel is busy. |
+| flow_control_min_permits | 100 | The lowest the limit tightens to. |
+| flow_control_max_permits | 800 | The highest the limit loosens to. |
+| flow_control_latency_threshold_ms | 100 | A receiving socket going this long without running empty counts as the kernel being busy. With 0 it always counts as busy and the limit always applies. |
+| flow_control_adjustment_interval_secs | 5 | How often the limit is adjusted: tightened by a tenth while busy, loosened by a tenth otherwise. |
 | cache_capacity | 10000 | Maximum answers in the DNS response cache, one over 1 KB counting once per KB; must be greater than zero. |
 | cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. No record of an upstream answer carries a longer TTL either, and it wins over min_ttl when the two cross. |
 | dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
