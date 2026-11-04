@@ -856,11 +856,14 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
     Ok(socket.into())
 }
 
+/// UDP 收发缓冲平时的大小 / The usual size of the UDP send and receive buffers
+const UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
 /// 设置 UDP 收发缓冲区，免得负载高时丢包：先试 4 MiB，设不上再退到 1 MiB
 /// Set the UDP buffer sizes to prevent packet loss under load: 4 MiB first, falling back
 /// to 1 MiB if that fails
 fn set_udp_buffers(socket: &socket2::Socket) {
-    let desired_size = 4 * 1024 * 1024;
+    let desired_size = UDP_BUFFER_SIZE;
     let fallback_size = 1024 * 1024;
 
     if let Err(e) = socket.set_recv_buffer_size(desired_size) {
@@ -1036,16 +1039,70 @@ struct UdpAnswering<'a> {
     request_count: u32,
     /// socket 上次收空的时刻，流控靠它判断内核忙不忙 / When the socket last ran empty, by which flow control tells whether the kernel is busy
     emptied_at: Instant,
+    /// 上次收空以后看过几次接收缓冲 / How many times the receive buffer was looked at since the socket last ran empty
+    checks_since_empty: u32,
+    /// 接收缓冲现在是不是收小的 / Whether the receive buffer is shrunk right now
+    buffer_shrunk: bool,
+    /// 这一段积压里上次读到的丢包数 / The drop count last read during this backlog
+    drops_seen: Option<u32>,
 }
 
+/// 每 100 个查询看一次接收缓冲，连续这么多次 socket 都没收空才去读丢包数，平时不多这一次系统调用
+/// The receive buffer is looked at every 100 queries, and the drops are only read after this many looks in a row
+/// without the socket running empty, sparing the usual path that system call
+const BEHIND_AFTER_CHECKS: u32 = 10;
+
+/// 缓冲满到丢包时收到这么小。处理不完的查询反正要丢，缓冲越大，答得上的那些排得越久
+/// The size the receive buffer shrinks to once full enough to drop. What cannot be handled gets dropped anyway,
+/// and the larger the buffer the longer the queries that do get answered wait in line
+const BEHIND_RECV_BUFFER: usize = 512 * 1024;
+
 impl UdpAnswering<'_> {
-    /// socket 收空了，刚等到新东西：等的这段时间不算没收空，否则空闲之后的第一个查询就算内核忙
+    /// 积压着、而且这段时间在丢包，就把接收缓冲收小，排队的时间短下来。只看积压不够：贴着处理能力时队列积压了也消化得完，
+    /// 大缓冲一个包都不丢，这时收小才是白丢
+    /// While backed up and dropping, shrinks the receive buffer so the wait in line gets short. A backlog alone is
+    /// not enough: right at capacity the queue still drains and the large buffer drops nothing, so shrinking there
+    /// would throw queries away for nothing
+    fn shrink_buffer_if_overflowing(&mut self) {
+        self.checks_since_empty += 1;
+        if self.buffer_shrunk || self.checks_since_empty < BEHIND_AFTER_CHECKS {
+            return;
+        }
+        let Some(drops) = kixdns::socket_utils::udp_receive_drops(self.socket) else {
+            return;
+        };
+        if self
+            .drops_seen
+            .replace(drops)
+            .is_some_and(|seen| seen != drops)
+        {
+            self.set_recv_buffer(BEHIND_RECV_BUFFER);
+            self.buffer_shrunk = true;
+        }
+    }
+
+    fn set_recv_buffer(&self, size: usize) {
+        if let Err(error) = socket2::SockRef::from(self.socket.as_ref()).set_recv_buffer_size(size)
+        {
+            debug!(%error, size, "failed to resize udp recv buffer");
+        }
+    }
+
+    /// socket 收空了，刚等到新东西：等的这段时间不算没收空，否则空闲之后的第一个查询就算内核忙。跟得上了，接收缓冲
+    /// 也放回去接突发
     /// The socket ran empty and the wait just ended: the wait does not count as not running empty, or the first
-    /// query after a quiet spell would find the kernel busy
+    /// query after a quiet spell would find the kernel busy. Keeping up again, the receive buffer goes back to
+    /// catching bursts
     #[inline]
     fn socket_ran_empty(&mut self) {
         if self.engine.flow_control_state.is_some() {
             self.emptied_at = Instant::now();
+        }
+        self.checks_since_empty = 0;
+        self.drops_seen = None;
+        if self.buffer_shrunk {
+            self.set_recv_buffer(UDP_BUFFER_SIZE);
+            self.buffer_shrunk = false;
         }
     }
 
@@ -1062,6 +1119,7 @@ impl UdpAnswering<'_> {
         if self.request_count >= 100 {
             self.request_count = 0;
             self.engine.adjust_flow_control(self.emptied_at); // Now synchronous with atomic CAS
+            self.shrink_buffer_if_overflowing();
         }
         // ✅ 优化：使用 handle_packet_fast 避免重复解析 / ✅ Optimization: Use handle_packet_fast to avoid re-parsing
         match self.engine.handle_packet_fast(packet, peer) {
@@ -1138,6 +1196,9 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         pending: &pending,
         request_count: 0,
         emptied_at: Instant::now(),
+        checks_since_empty: 0,
+        buffer_shrunk: false,
+        drops_seen: None,
     };
     let mut received_in_row = 0;
     loop {
@@ -1242,6 +1303,9 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         pending: &pending,
         request_count: 0,
         emptied_at: Instant::now(),
+        checks_since_empty: 0,
+        buffer_shrunk: false,
+        drops_seen: None,
     };
     let mut received_in_row = 0;
     loop {
@@ -2174,6 +2238,94 @@ mod tests {
         }
         assert_eq!(refused_and_answered(&client, QUERIES).await, (0, QUERIES));
         worker.abort();
+    }
+
+    /// 积压着而且在丢包时接收缓冲收小，收空了放回去。没丢包、没积压、上一段积压留下的丢包数都不算。没开流控也一样
+    /// While backed up and dropping the receive buffer shrinks, and running empty puts it back. No drops, no
+    /// backlog and the drops left from an earlier backlog do not count. The same without flow control
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_receive_buffer_shrinks_only_while_overflowing_and_comes_back() {
+        let engine = Arc::new(Engine::new(static_runtime(), "test".to_string()).unwrap());
+        assert!(engine.flow_control_state.is_none());
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let target = socket.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let size = || {
+            socket2::SockRef::from(socket.as_ref())
+                .recv_buffer_size()
+                .unwrap()
+        };
+        socket2::SockRef::from(socket.as_ref())
+            .set_recv_buffer_size(UDP_BUFFER_SIZE)
+            .unwrap();
+        let full = size();
+        // 一直发到丢包为止 / Sends until it drops
+        let overflow = || async {
+            let before = kixdns::socket_utils::udp_receive_drops(&socket).unwrap();
+            for _ in 0..500_000 {
+                client.send_to(&[0u8; 64], target).await.unwrap();
+                if kixdns::socket_utils::udp_receive_drops(&socket).unwrap() != before {
+                    return;
+                }
+            }
+            panic!("the socket never dropped");
+        };
+        let pending = Arc::new(PendingReplies::default());
+        let mut answering = UdpAnswering {
+            socket: &socket,
+            engine: &engine,
+            pending: &pending,
+            request_count: 0,
+            emptied_at: Instant::now(),
+            checks_since_empty: BEHIND_AFTER_CHECKS - 1,
+            buffer_shrunk: false,
+            drops_seen: None,
+        };
+
+        // 积压着、队列还在涨，但没丢包 / Backed up with the queue still growing, but no drops
+        answering.shrink_buffer_if_overflowing();
+        client.send_to(&[0u8; 64], target).await.unwrap();
+        answering.shrink_buffer_if_overflowing();
+        assert!(!answering.buffer_shrunk, "no drops");
+        assert_eq!(size(), full);
+
+        overflow().await;
+        answering.shrink_buffer_if_overflowing();
+        assert!(answering.buffer_shrunk);
+        // 系统不让开大缓冲时（`rmem_max`）收小没有分别 / With the system not allowing a large buffer
+        // (`rmem_max`), shrinking makes no difference
+        assert!(size() <= full);
+        if full > 2 * BEHIND_RECV_BUFFER {
+            assert!(size() < full, "{} of {full}", size());
+        }
+
+        answering.socket_ran_empty();
+        assert!(!answering.buffer_shrunk);
+        assert_eq!(size(), full);
+
+        // 没积压时丢包也不算 / Drops do not count without a backlog
+        answering.shrink_buffer_if_overflowing();
+        overflow().await;
+        answering.shrink_buffer_if_overflowing();
+        assert!(!answering.buffer_shrunk, "no backlog");
+
+        // 上一段积压留下的丢包数不算：新的一段先记下来 / The drops left from an earlier backlog do not count:
+        // a new backlog first notes the count
+        answering.checks_since_empty = BEHIND_AFTER_CHECKS - 1;
+        answering.shrink_buffer_if_overflowing();
+        assert!(!answering.buffer_shrunk, "old drops");
+
+        // 每 100 个查询看一次 / Looked at once every 100 queries
+        overflow().await;
+        let peer = SocketAddr::from(([127, 0, 0, 1], 53000));
+        let mut reply = BytesMut::new();
+        for id in 0..99 {
+            answering.answer(&query("a.test", id), peer, &mut reply);
+        }
+        assert!(!answering.buffer_shrunk);
+        answering.answer(&query("a.test", 99), peer, &mut reply);
+        assert!(answering.buffer_shrunk);
     }
 
     /// 上限跟着 socket 收不收得空走：一直收不空就收紧，收得空就放宽
