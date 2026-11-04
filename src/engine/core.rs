@@ -58,7 +58,10 @@ pub struct Engine {
     pub(crate) reload_lock: Arc<Mutex<GeoSources>>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
-    pub(crate) rule_cache: Arc<CacheStore<RuleCacheRecord>>,
+    /// 一条记录一个 `Arc`：取一次只动一个引用计数，几个核反复读同一条时不用轮流抢好几个
+    /// One `Arc` per record: taking one touches a single reference count, so cores reading the same record
+    /// over and over do not take turns on several
+    pub(crate) rule_cache: Arc<CacheStore<Arc<RuleCacheRecord>>>,
     // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
     pub request_id_counter: Arc<AtomicU64>,
     /// In-flight request deduplication map using tokio::watch for lock-free concurrent waiting

@@ -541,7 +541,7 @@ impl Engine {
                     .flat_map(|rules| rules.iter())
                     .map(AsRef::as_ref)
                     .collect();
-                let Decision::Static { rcode, answers } = record.entry.decision.as_ref() else {
+                let Decision::Static { rcode, answers } = &record.entry.decision else {
                     unreachable!("the fast path answers only static decisions from the rule cache");
                 };
                 observer.answered_by_rule(
@@ -956,7 +956,7 @@ impl Engine {
                     qtype,
                     qclass,
                     &rule_requester,
-                ) && let Decision::Static { rcode, answers } = entry.decision.as_ref()
+                ) && let Decision::Static { rcode, answers } = &entry.decision
                 {
                     return answer_static(
                         *rcode,
@@ -5367,23 +5367,23 @@ mod tests {
         );
         engine.rule_cache.insert(
             key,
-            RuleCacheRecord {
+            Arc::new(RuleCacheRecord {
                 entry: RuleCacheEntry {
                     pipeline_id: Arc::from("main"),
-                    qname_hash: fast_hash_str("ip.test"),
+                    qname: "ip.test".as_bytes().into(),
                     qtype: u16::from(RecordType::A),
                     qclass: u16::from(DNSClass::IN),
                     requester: RequesterKey::NONE,
-                    decision: Arc::new(Decision::Static {
+                    decision: Decision::Static {
                         rcode: ResponseCode::NXDomain,
                         answers: Vec::new(),
-                    }),
+                    },
                     expires_at,
                 },
                 matched_rules: matched_rules
                     .map(|rules| rules.iter().map(|rule| Arc::from(*rule)).collect()),
                 decided_by_rule,
-            },
+            }),
         );
         key
     }
@@ -5451,6 +5451,21 @@ mod tests {
         let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
         assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
         assert!(engine.rule_cache.get(key).is_some());
+    }
+
+    /// 落到同一个键上的条目是给别的名字的，就不拿来答，走完整路径自己求值
+    /// An entry on the same key but for another name does not answer: the request takes the full path and
+    /// evaluates for itself
+    #[tokio::test]
+    async fn the_fast_path_does_not_answer_from_an_entry_for_another_name() {
+        let engine = rule_cache_engine(Arc::new(RuleAnswers::default()));
+        let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
+        let key = put_rule_answer(&engine, None, Some(&["block"]), true);
+        let mut record = engine.rule_cache.get(key).unwrap();
+        Arc::make_mut(&mut record).entry.qname = "other.test".as_bytes().into();
+        engine.rule_cache.insert(key, record);
+        let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+        assert!(matches!(answered, Some(FastPathResponse::AsyncNeeded(_))));
     }
 
     /// 请求编号一个线程领一批：跨过好几批、好几个线程，也没有两个一样的
@@ -6049,14 +6064,14 @@ mod tests {
         let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
         let entry = |requester| RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
-            qname_hash: fast_hash_str(qname),
+            qname: qname.as_bytes().into(),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
             requester,
-            decision: Arc::new(Decision::Static {
+            decision: Decision::Static {
                 rcode: ResponseCode::NoError,
                 answers: vec![],
-            }),
+            },
             expires_at: None,
         };
         let with_ip = |ip| RequesterKey {
@@ -6090,6 +6105,39 @@ mod tests {
         assert!(!matches(&by_class, RequesterKey::NONE));
     }
 
+    /// 名字整个比，放不进记录、存到堆上的长名字也一样，差最后一个字也不算
+    /// Names compare whole, also long ones stored on the heap for not fitting the record: one differing in
+    /// its last character is no match
+    #[test]
+    fn test_rule_cache_entry_matches_only_its_whole_name() {
+        let long = format!("{}.example", "a".repeat(60));
+        for name in ["short.example", long.as_str()] {
+            let entry = RuleCacheEntry::new(
+                Arc::from("test_p"),
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                RequesterKey::NONE,
+                Decision::Static {
+                    rcode: ResponseCode::NoError,
+                    answers: vec![],
+                },
+            );
+            let matches = |asked: &str| {
+                entry.matches(
+                    "test_p",
+                    asked,
+                    RecordType::A,
+                    DNSClass::IN,
+                    &RequesterKey::NONE,
+                )
+            };
+            assert!(matches(name));
+            assert!(!matches(&format!("{}x", &name[..name.len() - 1])));
+            assert!(!matches(&name[..name.len() - 1]));
+        }
+    }
+
     #[test]
     fn test_rule_cache_expiration() {
         // Arrange: Define test data
@@ -6097,15 +6145,15 @@ mod tests {
         let qname = "expire.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let decision = Arc::new(Decision::Static {
+        let decision = Decision::Static {
             rcode: ResponseCode::NoError,
             answers: vec![],
-        });
+        };
 
         // Arrange: Expired entry
         let entry_expired = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
-            qname_hash: fast_hash_str(qname),
+            qname: qname.as_bytes().into(),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
             requester: RequesterKey::NONE,
@@ -6122,7 +6170,7 @@ mod tests {
         // Arrange: Fresh entry
         let entry_fresh = RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
-            qname_hash: fast_hash_str(qname),
+            qname: qname.as_bytes().into(),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
             requester: RequesterKey::NONE,

@@ -5,6 +5,7 @@ use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use rustc_hash::{FxHashSet, FxHasher};
+use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -142,13 +143,18 @@ pub fn rule_cache_requester(
 #[derive(Clone)]
 pub struct RuleCacheEntry {
     pub pipeline_id: Arc<str>,
-    pub qname_hash: u64,
+    /// 这个决定是给哪个名字的。键只是哈希，不同的名字可能落到同一个键上，决定不能给错名字。放在记录里，多数名字放得下，
+    /// 写入时不用再分配一次
+    /// The name this decision is for. The key is only a hash, on which different names may land, and a
+    /// decision must not go to the wrong name. Kept in the record, where most names fit, sparing writing
+    /// another allocation
+    pub qname: SmallVec<[u8; 32]>,
     pub qtype: u16,
     pub qclass: u16,
     /// The requester the decision was made for, as far as the key separates it
     /// 决策是为哪个请求方做的（以键区分到的程度为限）
     pub requester: RequesterKey,
-    pub decision: Arc<Decision>,
+    pub decision: Decision,
     /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
     pub expires_at: Option<Instant>,
 }
@@ -179,7 +185,7 @@ pub(crate) const RULE_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 /// 每条记录计重 1；`expires_at` 已经含了 `RULE_CACHE_MAX_AGE`，按它判断过期
 /// Each record weighs 1; `expires_at` already includes `RULE_CACHE_MAX_AGE`, so it
 /// decides when a record is outlived
-impl Cached for RuleCacheRecord {
+impl Cached for Arc<RuleCacheRecord> {
     fn weight(&self) -> u32 {
         1
     }
@@ -200,11 +206,11 @@ impl RuleCacheEntry {
     ) -> Self {
         Self {
             pipeline_id,
-            qname_hash: fast_hash_str(qname),
+            qname: SmallVec::from_slice(qname.as_bytes()),
             qtype: u16::from(qtype),
             qclass: u16::from(qclass),
             requester,
-            decision: Arc::new(decision),
+            decision,
             expires_at: None,
         }
     }
@@ -245,7 +251,7 @@ impl RuleCacheEntry {
             return false;
         }
 
-        self.pipeline_id.as_ref() == pipeline_id && self.qname_hash == fast_hash_str(qname)
+        self.pipeline_id.as_ref() == pipeline_id && self.qname.as_slice() == qname.as_bytes()
     }
 
     /// 在 `now` 这一刻还有效 / Still valid at `now`
@@ -253,13 +259,6 @@ impl RuleCacheEntry {
     pub fn is_valid_at(&self, now: Instant) -> bool {
         self.expires_at.is_none_or(|expires| now <= expires)
     }
-}
-
-#[inline]
-pub fn fast_hash_str(s: &str) -> u64 {
-    let mut h = FxHasher::default();
-    s.hash(&mut h);
-    h.finish()
 }
 
 /// 辅助函数：获取 GeoIP 和 GeoSite 锁（带非阻塞快速路径）
