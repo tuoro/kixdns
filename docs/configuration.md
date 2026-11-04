@@ -46,12 +46,12 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive 间隔；0 禁用。 |
 | doq_enable_0rtt | true | 全局 DoQ 0-RTT 设置。 |
 | enable_tcp_fallback | true | UDP 失败或截断时用 TCP 重试。 |
-| flow_control_enabled | false | 启用基于 permits 的自适应流控。 |
-| flow_control_initial_permits | 500 | 启用流控时的初始 permits。 |
-| flow_control_min_permits | 100 | 启用流控时的最小 permits。 |
-| flow_control_max_permits | 800 | 启用流控时的最大 permits。 |
-| flow_control_latency_threshold_ms | 100 | 自适应流控使用的延迟阈值。 |
-| flow_control_adjustment_interval_secs | 5 | permits 调整间隔。 |
+| flow_control_enabled | false | 启用自适应流控：内核忙不过来时，同时处理的查询超过上限就直接回 SERVFAIL。上游慢不算忙，不会因此拒绝查询。 |
+| flow_control_initial_permits | 500 | 同时处理的查询数上限的初始值，只在内核忙时起作用。 |
+| flow_control_min_permits | 100 | 上限最低收紧到多少。 |
+| flow_control_max_permits | 800 | 上限最高放宽到多少。 |
+| flow_control_latency_threshold_ms | 100 | 接收 socket 连续这么久没收空，就算内核忙。设为 0 时一直算忙，上限始终起作用。 |
+| flow_control_adjustment_interval_secs | 5 | 多久调整一次上限：忙时收紧一成，不忙时放宽一成。 |
 | cache_capacity | 10000 | DNS 响应缓存最多存放的应答数，超过 1 KB 的应答每 1 KB 算一份；必须大于 0。 |
 | cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。上游回答里每条记录的 TTL 也不超过它，和 min_ttl 冲突时以它为准。 |
 | dashmap_shards | 0 | 内部分片设置；0 使用 DashMap 默认值，否则必须是 2 的幂。 |

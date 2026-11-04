@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
@@ -1034,9 +1034,21 @@ struct UdpAnswering<'a> {
     pending: &'a Arc<PendingReplies>,
     /// 自适应流控：每 100 个请求检查一次是否需要调整 permits / Adaptive flow control: check if adjustment needed every 100 requests
     request_count: u32,
+    /// socket 上次收空的时刻，流控靠它判断内核忙不忙 / When the socket last ran empty, by which flow control tells whether the kernel is busy
+    emptied_at: Instant,
 }
 
 impl UdpAnswering<'_> {
+    /// socket 收空了，刚等到新东西：等的这段时间不算没收空，否则空闲之后的第一个查询就算内核忙
+    /// The socket ran empty and the wait just ended: the wait does not count as not running empty, or the first
+    /// query after a quiet spell would find the kernel busy
+    #[inline]
+    fn socket_ran_empty(&mut self) {
+        if self.engine.flow_control_state.is_some() {
+            self.emptied_at = Instant::now();
+        }
+    }
+
     /// 处理收到的一个报文。快速路径当场答得上的（缓存命中、静态规则、解析出错的 SERVFAIL），把回答写进 `reply`
     /// 并返回 true，超过客户端上限的已经截断；要等上游的交给单独的任务，不是查询的丢掉，都返回 false。
     /// Handles one received datagram. What the fast path answers on the spot (a cache hit, a static rule, the
@@ -1049,7 +1061,7 @@ impl UdpAnswering<'_> {
         self.request_count += 1;
         if self.request_count >= 100 {
             self.request_count = 0;
-            self.engine.adjust_flow_control(); // Now synchronous with atomic CAS
+            self.engine.adjust_flow_control(self.emptied_at); // Now synchronous with atomic CAS
         }
         // ✅ 优化：使用 handle_packet_fast 避免重复解析 / ✅ Optimization: Use handle_packet_fast to avoid re-parsing
         match self.engine.handle_packet_fast(packet, peer) {
@@ -1125,6 +1137,7 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         engine,
         pending: &pending,
         request_count: 0,
+        emptied_at: Instant::now(),
     };
     let mut received_in_row = 0;
     loop {
@@ -1135,6 +1148,7 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
                 // send the queued replies, then wait for a datagram or a queued reply
                 received_in_row = 0;
                 pending.wait(socket, &mut replies).await;
+                answering.socket_ran_empty();
                 continue;
             }
             Err(_) => continue,
@@ -1227,6 +1241,7 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         engine,
         pending: &pending,
         request_count: 0,
+        emptied_at: Instant::now(),
     };
     let mut received_in_row = 0;
     loop {
@@ -1235,7 +1250,9 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 当前无包可读 — 让出 tokio / No packet available right now — yield to tokio
                 received_in_row = 0;
-                match socket.recv_from(&mut buf).await {
+                let received = socket.recv_from(&mut buf).await;
+                answering.socket_ran_empty();
+                match received {
                     Ok(result) => result,
                     Err(_) => continue,
                 }
@@ -1272,7 +1289,7 @@ fn spawn_udp_answer(
     peer: SocketAddr,
     pre_parsed: Option<PreParsedData>,
 ) {
-    let Some(permit) = answering.engine.permit_manager.try_acquire() else {
+    let Some(permit) = answering.engine.query_permit(answering.emptied_at) else {
         if let Some(pre_parsed) = pre_parsed
             && let Ok(response) = pre_parsed.servfail(packet[2] & 0x01 != 0)
         {
@@ -2026,7 +2043,8 @@ mod tests {
                 "flow_control_enabled": true,
                 "flow_control_initial_permits": 1,
                 "flow_control_min_permits": 1,
-                "flow_control_max_permits": 1
+                "flow_control_max_permits": 1,
+                "flow_control_latency_threshold_ms": 0
             },
             "pipelines": [{
                 "id": "p",
@@ -2082,6 +2100,172 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ipv6_peer: SocketAddr = "[::1]:53".parse().unwrap();
         assert!(send_udp_datagram(&socket, b"dns", ipv6_peer).await.is_err());
+    }
+
+    /// 上限只有 1、上游慢的引擎，`busy_after_ms` 是 socket 多久没收空算忙
+    /// An engine with a limit of 1 and a slow upstream, `busy_after_ms` being how long a socket goes without
+    /// running empty before that counts as busy
+    async fn limited_engine_with_slow_upstream(busy_after_ms: u64) -> Engine {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
+        engine_forwarding_to(
+            upstream,
+            serde_json::json!({
+                "flow_control_enabled": true,
+                "flow_control_initial_permits": 1,
+                "flow_control_min_permits": 1,
+                "flow_control_max_permits": 1,
+                "flow_control_latency_threshold_ms": busy_after_ms,
+            }),
+        )
+    }
+
+    /// 发出 `count` 个不同的查询，数被拒绝（SERVFAIL）的和答上来的
+    /// Sends `count` different queries and counts those refused (SERVFAIL) and those answered
+    async fn refused_and_answered(client: &UdpSocket, count: u16) -> (u16, u16) {
+        let (mut refused, mut answered) = (0, 0);
+        let mut buf = [0u8; 512];
+        for _ in 0..count {
+            let (len, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+                .await
+                .expect("every query gets a reply")
+                .unwrap();
+            match Message::from_bytes(&buf[..len])
+                .unwrap()
+                .metadata
+                .response_code
+            {
+                ResponseCode::ServFail => refused += 1,
+                _ => answered += 1,
+            }
+        }
+        (refused, answered)
+    }
+
+    /// 上游慢时，等着的查询比上限多也不拒绝：内核并不忙，它们都等得到回答。两种循环都这样
+    /// With a slow upstream, more queries waiting than the limit are not refused: the kernel is not busy and
+    /// they all get their answers. Both loops do so
+    #[tokio::test]
+    async fn queries_waiting_on_a_slow_upstream_are_not_refused() {
+        #[cfg(target_os = "linux")]
+        not_refused_while_waiting_on_an_upstream(|server, engine| {
+            tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
+        })
+        .await;
+        not_refused_while_waiting_on_an_upstream(|server, engine| {
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        })
+        .await;
+    }
+
+    async fn not_refused_while_waiting_on_an_upstream(
+        receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
+    ) {
+        let engine = limited_engine_with_slow_upstream(2_000).await;
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = receive(server, engine);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        const QUERIES: u16 = 8;
+        for id in 0..QUERIES {
+            let query = query(&format!("q{id}.slow.test"), id);
+            client.send_to(&query, server_addr).await.unwrap();
+            // 一个一个来，socket 每次都收得空 / One at a time, so the socket runs empty each time
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(refused_and_answered(&client, QUERIES).await, (0, QUERIES));
+        worker.abort();
+    }
+
+    /// 上限跟着 socket 收不收得空走：一直收不空就收紧，收得空就放宽
+    /// The limit follows whether the socket runs empty: tightened when it does not, loosened when it does
+    #[tokio::test]
+    async fn the_limit_follows_whether_the_socket_runs_empty() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(1)).await;
+        let engine = engine_forwarding_to(
+            upstream,
+            serde_json::json!({
+                "flow_control_enabled": true,
+                "flow_control_adjustment_interval_secs": 0,
+            }),
+        );
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        engine.adjust_flow_control(long_ago);
+        assert_eq!(engine.permit_manager.max_permits(), 450);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        engine.adjust_flow_control(Instant::now());
+        assert_eq!(engine.permit_manager.max_permits(), 495);
+    }
+
+    /// 空闲了很久以后来的查询不算内核忙：等新报文的时间不算没收空。两种循环都这样
+    /// Queries after a long quiet spell do not find the kernel busy: waiting for datagrams does not count as
+    /// not running empty. Both loops do so
+    #[tokio::test]
+    async fn a_quiet_spell_does_not_count_as_busy() {
+        #[cfg(target_os = "linux")]
+        not_refused_after_a_quiet_spell(|server, engine| {
+            tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
+        })
+        .await;
+        not_refused_after_a_quiet_spell(|server, engine| {
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        })
+        .await;
+    }
+
+    async fn not_refused_after_a_quiet_spell(
+        receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
+    ) {
+        let engine = limited_engine_with_slow_upstream(500).await;
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = receive(server, engine);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        const QUERIES: u16 = 2;
+        for id in 0..QUERIES {
+            let query = query(&format!("q{id}.quiet.test"), id);
+            client.send_to(&query, server_addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(refused_and_answered(&client, QUERIES).await, (0, QUERIES));
+        worker.abort();
+    }
+
+    /// socket 一直收不空才算内核忙，这时超过上限的查询回 SERVFAIL。两种循环都这样
+    /// A socket that never runs empty means the kernel is busy, and queries past the limit then get SERVFAIL.
+    /// Both loops do so
+    #[tokio::test]
+    async fn a_socket_that_stays_behind_refuses_past_the_limit() {
+        #[cfg(target_os = "linux")]
+        refused_when_behind(|server, engine| {
+            tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
+        })
+        .await;
+        refused_when_behind(|server, engine| {
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        })
+        .await;
+    }
+
+    async fn refused_when_behind(
+        receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
+    ) {
+        let engine = limited_engine_with_slow_upstream(1).await;
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // worker 起来之前全排进接收队列，收完它们要比 1 毫秒久 / All queued before the worker starts, and
+        // taking them in lasts longer than a millisecond
+        const QUERIES: u16 = 200;
+        for id in 0..QUERIES {
+            let query = query(&format!("q{id}.behind.test"), id);
+            client.send_to(&query, server_addr).await.unwrap();
+        }
+        let worker = receive(server, engine);
+        let (refused, answered) = refused_and_answered(&client, QUERIES).await;
+        assert!(refused > 0, "refused {refused}, answered {answered}");
+        assert!(answered > 0, "refused {refused}, answered {answered}");
+        worker.abort();
     }
 
     #[tokio::test]

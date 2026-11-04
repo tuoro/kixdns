@@ -27,6 +27,7 @@ use crate::observe::{
 };
 use crate::proto_utils::parse_quick;
 
+use super::concurrency::PermitGuard;
 use super::observation::{ObservedRequest, cached_source, report_decision, report_rule_cache_hit};
 use super::response::{StaticAddresses, build_fast_static_response, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog};
@@ -295,13 +296,25 @@ impl Engine {
         // keep their warm response and rule caches.
     }
 
-    /// 动态调整 flow control permits 基于系统负载和延迟 / Adaptively adjust flow control permits based on system load and latency
-    pub fn adjust_flow_control(&self) {
+    /// 按内核忙不忙调整流控的上限，`emptied_at` 是 socket 上次收空的时刻
+    /// Adjusts the flow control limit by whether the kernel is busy, `emptied_at` being when the socket last
+    /// ran empty
+    pub fn adjust_flow_control(&self, emptied_at: Instant) {
         if let Some(state) = &self.flow_control_state {
-            let latest_latency = self
-                .metrics_last_upstream_latency_ns
-                .load(Ordering::Relaxed);
-            state.adjust(&self.permit_manager, latest_latency);
+            state.adjust(&self.permit_manager, state.busy(emptied_at));
+        }
+    }
+
+    /// 一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。上限只在内核忙的时候起作用：
+    /// 上游慢时查询多半在等，内核并不忙，拒绝它们只会让本来能答的答不了
+    /// Whether a query that waits on an upstream can go ahead, `emptied_at` being when the socket last ran
+    /// empty. The limit applies only while the kernel is busy: with a slow upstream the queries mostly wait
+    /// and the kernel is not busy, and refusing them only leaves unanswered what could be answered
+    #[inline]
+    pub fn query_permit(&self, emptied_at: Instant) -> Option<PermitGuard> {
+        match &self.flow_control_state {
+            Some(state) if state.busy(emptied_at) => self.permit_manager.try_acquire(),
+            _ => Some(self.permit_manager.acquire()),
         }
     }
 
