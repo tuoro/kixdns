@@ -657,9 +657,12 @@ impl tokio::io::AsyncWrite for CountedWrites {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        // 先记再写：另一端一收到这次写的内容，就该数得到它 / Counted before writing: the other end must
+        // see this write counted as soon as it receives what it wrote
+        self.writes.fetch_add(1, Ordering::SeqCst);
         let written = Pin::new(&mut self.io).poll_write(cx, buf);
-        if matches!(written, Poll::Ready(Ok(n)) if n > 0) {
-            self.writes.fetch_add(1, Ordering::SeqCst);
+        if !matches!(written, Poll::Ready(Ok(n)) if n > 0) {
+            self.writes.fetch_sub(1, Ordering::SeqCst);
         }
         written
     }

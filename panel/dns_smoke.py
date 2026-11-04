@@ -31,17 +31,22 @@ class SmokeFailure(RuntimeError):
 
 
 def reserve_dns_port() -> int:
-    """选择一个可同时绑定 TCP 和 UDP 的本机端口。"""
-    for _ in range(20):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
-            tcp.bind(("127.0.0.1", 0))
-            port = tcp.getsockname()[1]
-            try:
+    """选择一个可同时绑定 TCP 和 UDP 的本机端口，在系统分配临时端口的范围之下。
+
+    范围内的端口查完以后到内核绑定之前是空着的，这期间任何新开的 socket 都可能拿走它，
+    包括内核自己的上游 socket，内核就起不来了。
+    """
+    for offset in range(200):
+        port = 20000 + (os.getpid() * 61 + offset) % 12000
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+                tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                tcp.bind(("127.0.0.1", port))
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
                     udp.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
+            return port
+        except OSError:
+            continue
     raise SmokeFailure("无法分配 DNS 冒烟测试端口")
 
 
