@@ -242,6 +242,9 @@ jobs:
       - name: Run observer API tests
         run: cargo test --test observer_api
 
+      - name: Run listener port test
+        run: cargo test --test listener_port
+
   lint-linux:
     name: Lint (clippy + fmt)
     runs-on: ubuntu-24.04

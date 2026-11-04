@@ -159,7 +159,7 @@ mod allocator_tuning {
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-use kixdns::config::load_config_with_source;
+use kixdns::config::{DohListenerConfig, ListenerConfig, load_config_with_source};
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, write_cache_hit};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{ClientTransport, EngineObserver, TracingObserver};
@@ -349,6 +349,22 @@ async fn run_dns_server(
     let bind_addr = listeners.udp;
     let bind_tcp = listeners.tcp;
 
+    // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
+    let udp_workers_final = if udp_workers_count > 0 {
+        udp_workers_count
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    };
+
+    // 先占住监听端口，再建引擎：引擎要打开一批上游 socket，系统给它们挑的端口可能正好是要监听的那个，内核就起不来了。
+    // 建引擎这一小段时间里来的查询排在 socket 里，建好就答
+    // The listening ports are taken before the engine is built: it opens a batch of upstream sockets, and
+    // the ports the system picks for them may be the very one to listen on, and the kernel would not start.
+    // Queries arriving while the engine is built wait in the sockets and are answered once it is ready
+    let bound = BoundListeners::bind(listeners, udp_workers_final).await?;
+
     // 面板的统计只能经控制通道读，所以只在开了控制通道时装面板观察者 / The panel's statistics can
     // only be read over the control socket, so the panel observer is installed only with one
     let panel_metrics = admin_socket
@@ -364,15 +380,6 @@ async fn run_dns_server(
     let engine = engine.build().context("initialize DNS engine")?;
 
     watcher::spawn(config.clone(), engine.clone());
-
-    // UDP worker 数量：默认为 CPU 核心数，最少 1 个 / UDP worker count: defaults to CPU core count, minimum 1
-    let udp_workers_final = if udp_workers_count > 0 {
-        udp_workers_count
-    } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    };
 
     info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
 
@@ -396,132 +403,7 @@ async fn run_dns_server(
         );
     }
 
-    #[cfg(unix)]
-    {
-        // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
-        // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
-        // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
-        // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
-
-        // 根据配置地址决定创建哪种 socket / Determine which socket type to create based on config
-        // IPv6 unspecified address (::) 需要同时创建 IPv4 和 IPv6 socket
-        // IPv6 other addresses 只创建 IPv6 socket
-        // IPv4 addresses 只创建 IPv4 socket
-        let ipv4_addr = ipv4_listen_addr(bind_addr);
-        let needs_ipv6 = bind_addr.is_ipv6();
-        let workers_per_family = if ipv4_addr.is_some() && needs_ipv6 {
-            udp_workers_final.div_ceil(2)
-        } else {
-            udp_workers_final
-        };
-
-        if let Some(ipv4_addr) = ipv4_addr {
-            spawn_udp_workers(
-                ipv4_addr,
-                workers_per_family,
-                engine.clone(),
-                &mut all_handles,
-            )?;
-        }
-
-        if needs_ipv6 {
-            spawn_udp_workers(
-                bind_addr,
-                workers_per_family,
-                engine.clone(),
-                &mut all_handles,
-            )?;
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        // Non-Unix: create a single shared socket and spawn workers that share it / 非 Unix：创建单个共享套接字并生成共享它的工作线程
-        // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
-        use socket2::{Domain, Protocol, Socket, Type};
-        let domain = if bind_addr.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-        let socket =
-            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
-
-        // ✅ Windows 上设置 IPV6_V6ONLY=0 以支持双栈，与 Linux 行为一致
-        // ✅ On Windows, set IPV6_V6ONLY=0 for dual-stack support, consistent with Linux behavior
-        if domain == Domain::IPV6 {
-            if let Err(e) = socket.set_only_v6(false) {
-                debug!(
-                    "failed to set IPV6_V6ONLY=0: {}, IPv4 may not work on [::] bind",
-                    e
-                );
-            } else {
-                info!("UDP IPv6 socket set to dual-stack mode (IPV6_V6ONLY=0)");
-            }
-        }
-
-        set_udp_buffers(&socket);
-
-        socket.set_nonblocking(true).context("set nonblocking")?;
-        socket.bind(&bind_addr.into()).context("bind socket")?;
-
-        let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
-        for worker_id in 0..udp_workers_final {
-            let engine = engine.clone();
-            let socket = Arc::clone(&udp_socket);
-            let handle = tokio::spawn(async move {
-                if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                    error!(worker_id, error = %err, "udp worker exited");
-                }
-            });
-            all_handles.push(handle);
-        }
-    }
-
-    // TCP listener / TCP 监听器
-    // ✅ 双 socket 方案，与 UDP 行为一致 / Dual-socket approach, consistent with UDP
-    // --- 启动 IPv4 TCP 监听 / Start IPv4 TCP listener ---
-    if let Some(addr) = ipv4_listen_addr(bind_tcp) {
-        // 纯 IPv4 绑定，不受 bindv6only 影响 / Pure IPv4 bind, unaffected by bindv6only
-        let listener = TcpListener::bind(addr).await.context("bind ipv4 tcp")?;
-        all_handles.push(spawn_tcp(listener, engine.clone(), "ipv4"));
-    }
-
-    // --- 启动 IPv6 TCP 监听 / Start IPv6 TCP listener ---
-    if bind_tcp.is_ipv6() {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-
-        // ⭐️ 核心：强制 IPV6_V6ONLY=1，避免和 IPv4 监听器冲突
-        // ⭐️ Key: force IPV6_V6ONLY=1 to avoid conflict with IPv4 listener
-        socket
-            .set_only_v6(true)
-            .context("set ipv6 only for kixdns")?;
-        socket.set_reuse_address(true)?;
-
-        socket
-            .bind(&bind_tcp.into())
-            .context("bind ipv6 tcp socket")?;
-        socket.listen(128)?;
-        socket.set_nonblocking(true)?;
-
-        let listener = TcpListener::from_std(socket.into())?;
-        all_handles.push(spawn_tcp(listener, engine.clone(), "ipv6"));
-    }
-
-    // DoH listener — 仅在配置了 bind_doh 时启动 / DoH listener — only if bind_doh is configured
-    if let Some(doh) = listeners.doh {
-        let engine = engine.clone();
-        let h = tokio::spawn(async move {
-            if let Err(err) =
-                kixdns::doh_server::run_doh(doh.bind, &doh.tls_cert, &doh.tls_key, engine, doh.path)
-                    .await
-            {
-                error!(error = %err, "DoH server exited");
-            }
-        });
-        all_handles.push(h);
-    }
+    bound.serve(&engine, &mut all_handles);
 
     // 等待所有任务 / Wait for all tasks
     for h in all_handles {
@@ -529,6 +411,150 @@ async fn run_dns_server(
     }
 
     Ok(())
+}
+
+/// 绑定好、还没开始答的 UDP socket，每个 worker 一个 / UDP sockets bound and not answering yet, one per worker
+struct BoundUdp {
+    addr: SocketAddr,
+    family: &'static str,
+    sockets: Vec<Arc<UdpSocket>>,
+}
+
+/// 绑定好、还没开始答的监听口 / Listeners bound and not answering yet
+struct BoundListeners {
+    udp: Vec<BoundUdp>,
+    tcp: Vec<(TcpListener, &'static str)>,
+    doh: Option<(TcpListener, DohListenerConfig)>,
+}
+
+impl BoundListeners {
+    async fn bind(listeners: ListenerConfig, udp_workers: usize) -> anyhow::Result<Self> {
+        let ListenerConfig {
+            udp: bind_addr,
+            tcp: bind_tcp,
+            doh,
+        } = listeners;
+        let mut udp = Vec::new();
+
+        #[cfg(unix)]
+        {
+            // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
+            // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
+            // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
+            // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
+
+            // 根据配置地址决定创建哪种 socket / Determine which socket type to create based on config
+            // IPv6 unspecified address (::) 需要同时创建 IPv4 和 IPv6 socket
+            // IPv6 other addresses 只创建 IPv6 socket
+            // IPv4 addresses 只创建 IPv4 socket
+            let ipv4_addr = ipv4_listen_addr(bind_addr);
+            let needs_ipv6 = bind_addr.is_ipv6();
+            let workers_per_family = if ipv4_addr.is_some() && needs_ipv6 {
+                udp_workers.div_ceil(2)
+            } else {
+                udp_workers
+            };
+
+            if let Some(ipv4_addr) = ipv4_addr {
+                udp.push(bind_udp_workers(ipv4_addr, workers_per_family)?);
+            }
+
+            if needs_ipv6 {
+                udp.push(bind_udp_workers(bind_addr, workers_per_family)?);
+            }
+        }
+
+        #[cfg(not(unix))]
+        udp.push(bind_udp_workers(bind_addr, udp_workers)?);
+
+        // TCP listener / TCP 监听器
+        // ✅ 双 socket 方案，与 UDP 行为一致 / Dual-socket approach, consistent with UDP
+        let mut tcp = Vec::new();
+        // --- 启动 IPv4 TCP 监听 / Start IPv4 TCP listener ---
+        if let Some(addr) = ipv4_listen_addr(bind_tcp) {
+            // 纯 IPv4 绑定，不受 bindv6only 影响 / Pure IPv4 bind, unaffected by bindv6only
+            let listener = TcpListener::bind(addr).await.context("bind ipv4 tcp")?;
+            tcp.push((listener, "ipv4"));
+        }
+
+        // --- 启动 IPv6 TCP 监听 / Start IPv6 TCP listener ---
+        if bind_tcp.is_ipv6() {
+            use socket2::{Domain, Protocol, Socket, Type};
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+
+            // ⭐️ 核心：强制 IPV6_V6ONLY=1，避免和 IPv4 监听器冲突
+            // ⭐️ Key: force IPV6_V6ONLY=1 to avoid conflict with IPv4 listener
+            socket
+                .set_only_v6(true)
+                .context("set ipv6 only for kixdns")?;
+            socket.set_reuse_address(true)?;
+
+            socket
+                .bind(&bind_tcp.into())
+                .context("bind ipv6 tcp socket")?;
+            socket.listen(128)?;
+            socket.set_nonblocking(true)?;
+
+            tcp.push((TcpListener::from_std(socket.into())?, "ipv6"));
+        }
+
+        // DoH listener — 仅在配置了 bind_doh 时启动：绑不上只记错误，DNS 照常答
+        // DoH listener — only if bind_doh is configured: failing to bind is only logged, DNS answers as usual
+        let doh = match doh {
+            Some(doh) => match TcpListener::bind(doh.bind).await {
+                Ok(listener) => Some((listener, doh)),
+                Err(err) => {
+                    error!(error = %err, "DoH server exited");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        Ok(Self { udp, tcp, doh })
+    }
+
+    /// 开始答 / Starts answering
+    fn serve(self, engine: &Engine, all_handles: &mut Vec<tokio::task::JoinHandle<()>>) {
+        for BoundUdp {
+            addr,
+            family,
+            sockets,
+        } in self.udp
+        {
+            info!(bind_addr = %addr, workers = sockets.len(), "Starting {family} UDP workers");
+            for (worker_id, socket) in sockets.into_iter().enumerate() {
+                let engine = engine.clone();
+                all_handles.push(tokio::spawn(async move {
+                    if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
+                        error!(worker_id, error = %err, "{family} udp worker exited");
+                    }
+                }));
+            }
+        }
+
+        for (listener, family) in self.tcp {
+            all_handles.push(spawn_tcp(listener, engine.clone(), family));
+        }
+
+        if let Some((listener, doh)) = self.doh {
+            info!(addr = %doh.bind, doh_path = %doh.path, "DoH server listening");
+            let engine = engine.clone();
+            all_handles.push(tokio::spawn(async move {
+                if let Err(err) = kixdns::doh_server::run_doh_with_listener(
+                    listener,
+                    &doh.tls_cert,
+                    &doh.tls_key,
+                    engine,
+                    doh.path,
+                )
+                .await
+                {
+                    error!(error = %err, "DoH server exited");
+                }
+            }));
+        }
+    }
 }
 
 /// 引擎的观察者：有面板时是面板观察者，`--debug` 的事件由它转发；没有面板时和上游一样，
@@ -710,20 +736,14 @@ fn spawn_tcp(
     })
 }
 
-// 为一个地址创建并启动 UDP workers / Create and spawn UDP workers for one address
+// 为一个地址绑定 UDP workers 的 socket / Bind the UDP workers' sockets for one address
 #[cfg(unix)]
-fn spawn_udp_workers(
-    addr: SocketAddr,
-    worker_count: usize,
-    engine: Engine,
-    all_handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<()> {
+fn bind_udp_workers(addr: SocketAddr, worker_count: usize) -> anyhow::Result<BoundUdp> {
     let (family, lowercase) = if addr.is_ipv4() {
         ("IPv4", "ipv4")
     } else {
         ("IPv6", "ipv6")
     };
-    info!(bind_addr = %addr, workers = worker_count, "Starting {family} UDP workers");
 
     // ✅ Per-worker SO_REUSEPORT_LB sockets: each worker gets its own fd.
     // On FreeBSD, SO_REUSEPORT_LB enables kernel hash-based packet distribution
@@ -736,20 +756,57 @@ fn spawn_udp_workers(
     // Linux 上 SO_REUSEPORT 已自带此行为。
     // 实现无竞争的多核扩展——每个 worker 独占 socket，
     // 无 Arc<UdpSocket> 共享，无 reactor 惊群效应。
-    for worker_id in 0..worker_count {
-        let engine = engine.clone();
-        let std_socket = create_reuseport_udp_socket(addr)
-            .with_context(|| format!("create {lowercase} udp socket for worker {worker_id}"))?;
-        let socket = Arc::new(UdpSocket::from_std(std_socket)?);
-        let handle = tokio::spawn(async move {
-            if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                error!(worker_id, error = %err, "{family} udp worker exited");
-            }
-        });
-        all_handles.push(handle);
+    let sockets = (0..worker_count)
+        .map(|worker_id| {
+            let std_socket = create_reuseport_udp_socket(addr)
+                .with_context(|| format!("create {lowercase} udp socket for worker {worker_id}"))?;
+            Ok(Arc::new(UdpSocket::from_std(std_socket)?))
+        })
+        .collect::<anyhow::Result<_>>()?;
+
+    Ok(BoundUdp {
+        addr,
+        family,
+        sockets,
+    })
+}
+
+// Non-Unix: create a single shared socket that the workers share / 非 Unix：创建单个共享套接字，工作线程共用它
+#[cfg(not(unix))]
+fn bind_udp_workers(addr: SocketAddr, worker_count: usize) -> anyhow::Result<BoundUdp> {
+    // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
+    use socket2::{Domain, Protocol, Socket, Type};
+    let (domain, family) = if addr.is_ipv4() {
+        (Domain::IPV4, "IPv4")
+    } else {
+        (Domain::IPV6, "IPv6")
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
+
+    // ✅ Windows 上设置 IPV6_V6ONLY=0 以支持双栈，与 Linux 行为一致
+    // ✅ On Windows, set IPV6_V6ONLY=0 for dual-stack support, consistent with Linux behavior
+    if domain == Domain::IPV6 {
+        if let Err(e) = socket.set_only_v6(false) {
+            debug!(
+                "failed to set IPV6_V6ONLY=0: {}, IPv4 may not work on [::] bind",
+                e
+            );
+        } else {
+            info!("UDP IPv6 socket set to dual-stack mode (IPV6_V6ONLY=0)");
+        }
     }
 
-    Ok(())
+    set_udp_buffers(&socket);
+
+    socket.set_nonblocking(true).context("set nonblocking")?;
+    socket.bind(&addr.into()).context("bind socket")?;
+
+    let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
+    Ok(BoundUdp {
+        addr,
+        family,
+        sockets: vec![udp_socket; worker_count],
+    })
 }
 
 // 在 Unix 上创建带 SO_REUSEPORT 的 UDP socket；非 Unix 使用标准绑定 / Create UDP socket with SO_REUSEPORT on Unix; use standard binding on non-Unix
