@@ -154,34 +154,39 @@ impl QueryStatsBucket {
         }
     }
 
-    fn prepare(&self, epoch: u64) -> bool {
+    /// 让这一格准备好记 `epoch` 那个钟头。别的线程正在换的话就等它换完：这个查询要记进新的钟头，不能丢
+    /// Readies this bucket for the hour `epoch`. If another thread is changing it over this waits for that:
+    /// the query belongs in the new hour and must not be lost
+    fn prepare(&self, epoch: u64) {
         if self.epoch.load(Ordering::Acquire) == epoch {
-            return true;
+            return;
         }
-        let Some(_guard) = self.rotate_lock.try_lock() else {
-            return false;
-        };
+        let guard = self.rotate_lock.lock();
         if self.epoch.load(Ordering::Relaxed) != epoch {
-            self.reset(epoch);
+            self.reset(guard, epoch);
         }
-        true
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
     fn clear(&self) {
-        let _guard = self.rotate_lock.lock();
-        self.reset(0);
+        self.reset(self.rotate_lock.lock(), 0);
     }
 
-    /// 清空这一格、换成 `epoch` 那个钟头；调用方拿着 `rotate_lock`
-    /// Empties this bucket for the hour `epoch`; the caller holds `rotate_lock`
-    fn reset(&self, epoch: u64) {
-        for shard in &self.shards {
-            *shard.lock() = StatsShard::default();
-        }
+    /// 清空这一格、换成 `epoch` 那个钟头。锁里只把旧内容取走，放开锁再释放：一张满的表要释放几百微秒，等着的线程不用陪它
+    /// Empties this bucket for the hour `epoch`. Under the lock the old contents are only taken out, and they
+    /// are freed once it is released: a full table takes some hundreds of microseconds to free, which the
+    /// threads waiting need not sit through
+    fn reset(&self, guard: MutexGuard<'_, ()>, epoch: u64) {
+        let old = self
+            .shards
+            .iter()
+            .map(|shard| std::mem::take(&mut *shard.lock()))
+            .collect::<Vec<_>>();
         self.domain_entries.store(0, Ordering::Relaxed);
         self.client_entries.store(0, Ordering::Relaxed);
         self.epoch.store(epoch, Ordering::Release);
+        drop(guard);
+        drop(old);
     }
 
     /// 这个线程记一次 / This thread counts one query
@@ -318,9 +323,7 @@ impl QueryStats {
         let epoch = now - now % QUERY_STATS_BUCKET_SECONDS;
         let index = (epoch / QUERY_STATS_BUCKET_SECONDS) as usize % QUERY_STATS_BUCKETS;
         let bucket = &self.buckets[index];
-        if !bucket.prepare(epoch) {
-            return;
-        }
+        bucket.prepare(epoch);
         bucket.record(domain, client);
     }
 
@@ -2512,10 +2515,11 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::Ordering;
 
     use super::{
         MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_BUCKET_SECONDS, QUERY_STATS_BUCKETS,
-        QUERY_STATS_CLIENT_CAP, QUERY_STATS_DOMAIN_CAP, QueryStats, TopStat,
+        QUERY_STATS_CLIENT_CAP, QUERY_STATS_DOMAIN_CAP, QueryStats, QueryStatsBucket, TopStat,
     };
 
     #[derive(Clone, Default)]
@@ -3676,6 +3680,52 @@ mod tests {
         assert_eq!(snapshot.domains[0].count, (THREADS * 100) as u64);
         assert_eq!(snapshot.clients.len(), 1);
         assert_eq!(snapshot.clients[0].count, (THREADS * 101) as u64);
+    }
+
+    /// 这一格正在换钟头时来的查询都等它换完再记，一条不丢，也不会有人把别人刚记下的又清掉
+    /// Queries arriving while a bucket changes hour all wait and then count: none is lost, and none clears
+    /// what another has just counted
+    #[test]
+    fn queries_during_the_change_of_hour_all_count() {
+        const QUERIES: usize = 8;
+        let stats = QueryStats::default();
+        let client: IpAddr = "192.0.2.1".parse().unwrap();
+        let changing = stats.buckets[1].rotate_lock.lock();
+        std::thread::scope(|scope| {
+            let queries = (0..QUERIES)
+                .map(|_| scope.spawn(|| stats.record_at("a.example", client, 3_600)))
+                .collect::<Vec<_>>();
+            // 给它们时间走到锁那里；没走到也不会误报，只是这一次没测到
+            // Time for them to reach the lock; one that has not cannot fail this, it just goes untested
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(queries.iter().all(|query| !query.is_finished()));
+            drop(changing);
+        });
+        let snapshot = stats.snapshot(3_600, 3_600, 10);
+        assert_eq!(snapshot.requests_observed, QUERIES as u64);
+        assert_eq!(snapshot.domains[0].count, QUERIES as u64);
+    }
+
+    /// 换钟头的线程一直拿着锁，换完才露出新的钟头：只有它一个在清空这一格，别人也不会记进还没清空的表
+    /// The thread changing the hour holds the lock throughout and shows the new hour only once done: it alone
+    /// empties the bucket, and nobody counts into a table not yet emptied
+    #[test]
+    fn a_change_of_hour_holds_the_lock_until_it_is_done() {
+        let bucket = QueryStatsBucket::new();
+        let last_shard = bucket.shards.last().unwrap().lock();
+        std::thread::scope(|scope| {
+            scope.spawn(|| bucket.prepare(3_600));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !bucket.rotate_lock.is_locked() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            // 它现在卡在最后一个分片上，过一会儿还是这样 / It is stuck on the last shard, and still is a moment later
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(bucket.rotate_lock.is_locked());
+            assert_eq!(bucket.epoch.load(Ordering::Acquire), 0);
+            drop(last_shard);
+        });
+        assert_eq!(bucket.epoch.load(Ordering::Acquire), 3_600);
     }
 
     /// 条数上限算的是所有线程加起来：一起来很多新名字也不会超，多出来的记成丢弃
