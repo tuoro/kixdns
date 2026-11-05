@@ -46,12 +46,12 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive interval; 0 disables keepalive. |
 | doq_enable_0rtt | true | Global DoQ 0-RTT setting. |
 | enable_tcp_fallback | true | Retry UDP failure or truncation with TCP. |
-| flow_control_enabled | false | Enable adaptive flow control: while the kernel cannot keep up, queries past the limit on those handled at once get SERVFAIL at once. A slow upstream alone does not count as busy; while the kernel is busy, queries waiting on an upstream count among those handled at once. Past 1000 queries handled at once memory counts too: when the system or its cgroup has less available than a quarter of what the kernel itself holds plus a sixteenth of the total (the latter at most 256 MiB), new cache misses get SERVFAIL too, until memory comes back, inbound over UDP, TCP and DoH alike, and new TCP and DoH connections are closed. Only Linux reads memory so far. |
-| flow_control_initial_permits | 500 | Initial limit on queries handled at once, which applies only while the kernel is busy. |
-| flow_control_min_permits | 100 | The lowest the limit tightens to. |
-| flow_control_max_permits | 800 | The highest the limit loosens to. |
-| flow_control_latency_threshold_ms | 100 | A receiving socket going this long without running empty counts as the kernel being busy. With 0 it always counts as busy and the limit always applies. |
-| flow_control_adjustment_interval_secs | 5 | How often the limit is adjusted: tightened by a tenth while busy, loosened by a tenth otherwise. |
+| flow_control_enabled | false | Enable flow control, with no numbers to fill in as the kernel judges at run time: when a receiving socket never runs empty and queries queue over 20 ms inside the kernel, new cache misses get SERVFAIL at once. Waiting on an upstream is not queueing, so however slow the upstream, queries are not refused for it. Past 1000 queries handled at once memory counts too: when the system or its cgroup has less available than a quarter of what the kernel itself holds plus a sixteenth of the total (the latter at most 256 MiB), new cache misses get SERVFAIL too, until memory comes back, inbound over UDP, TCP and DoH alike, and new TCP and DoH connections are closed. Only Linux reads memory so far. |
+| flow_control_initial_permits | 500 | No longer used, kept only so old configurations load. |
+| flow_control_min_permits | 100 | No longer used, kept only so old configurations load. |
+| flow_control_max_permits | 800 | No longer used, kept only so old configurations load. |
+| flow_control_latency_threshold_ms | 100 | A receiving socket going this long without running empty counts as the kernel being busy. With 0 it always counts as busy. |
+| flow_control_adjustment_interval_secs | 5 | No longer used, kept only so old configurations load. |
 | cache_capacity | 10000 | Maximum answers in the DNS response cache, one over 1 KB counting once per KB; must be greater than zero. |
 | cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. With serve_stale on, an expired entry stays for serve_stale_expire_ttl longer. No record of an upstream answer carries a longer TTL either, and it wins over min_ttl when the two cross. |
 | dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
@@ -223,7 +223,7 @@ Inbound listener behavior:
 
 - Only standard single-question QUERY messages are processed. Non-QUERY opcodes, messages without exactly one question, DNS response packets and packets under 12 bytes are silently dropped. A message with a standard query header that cannot be read (two OPT records, say, or a UDP query over 4096 bytes) gets FORMERR, with the header and question alone and no longer than the query; while flow control is refusing queries such a message is dropped.
 - A query whose EDNS version is not 0 is answered BADVERS (RFC 6891 section 6.1.3), with an OPT of version 0 in the reply.
-- A listener processing error, an overall request timeout, or an exhausted flow-control permit returns SERVFAIL to the client for a valid query.
+- A listener processing error, an overall request timeout, or flow control refusing a query returns SERVFAIL to the client for a valid query.
 - UDP responses larger than the client's advertised size (the EDNS payload size, or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP.
 - A dual-stack socket (inbound DoH listening on `[::]`, say) reports an IPv4 client as `::ffff:a.b.c.d`. Rules, GeoIP, ECS and the cache all judge it by the IPv4 address it carries, so client_ip takes IPv4 networks as usual; a network written as `::ffff:a.b.c.d/n` counts as the IPv4 network it names.
 

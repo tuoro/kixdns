@@ -304,15 +304,6 @@ impl Engine {
         // keep their warm response and rule caches.
     }
 
-    /// 按内核忙不忙调整流控的上限，`emptied_at` 是 socket 上次收空的时刻
-    /// Adjusts the flow control limit by whether the kernel is busy, `emptied_at` being when the socket last
-    /// ran empty
-    pub fn adjust_flow_control(&self, emptied_at: Instant) {
-        if let Some(state) = &self.flow_control_state {
-            state.adjust(&self.permit_manager, state.busy(emptied_at));
-        }
-    }
-
     /// 一个要等上游的查询能不能处理（见 `FlowControlState::permit`）；没开流控时都能处理
     /// Whether a query that waits on an upstream can go ahead (see `FlowControlState::permit`);
     /// without flow control it always can
@@ -4946,34 +4937,6 @@ mod tests {
         assert!(
             engine.cached(dedupe_hash).is_none(),
             "Cache entry should be removed after expiration check"
-        );
-    }
-
-    /// flow_control_initial_permits 曾在构造 Engine 时被下一行的天花板当场覆盖，
-    /// 配置项完全不生效：开了流控的部署从天花板起步，而不是文档写的初始值。
-    /// flow_control_initial_permits used to be overwritten by the ceiling on the
-    /// very next line when the Engine was built, so the setting never applied and
-    /// a flow-controlled deployment started at the ceiling instead of the
-    /// documented initial value.
-    #[tokio::test]
-    async fn flow_control_starts_at_the_configured_initial_permits() {
-        let engine = Engine::new(
-            runtime_with_settings(GlobalSettings {
-                default_upstream: TEST_UPSTREAM.to_string(),
-                flow_control_enabled: true,
-                flow_control_min_permits: 100,
-                flow_control_initial_permits: 500,
-                flow_control_max_permits: 800,
-                ..Default::default()
-            }),
-            "lbl".to_string(),
-        )
-        .expect("initialize engine");
-
-        assert_eq!(
-            engine.permit_manager.max_permits(),
-            500,
-            "the current limit must start at flow_control_initial_permits, not the ceiling"
         );
     }
 

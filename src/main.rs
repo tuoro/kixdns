@@ -1118,7 +1118,6 @@ impl UdpAnswering<'_> {
         self.request_count += 1;
         if self.request_count >= 100 {
             self.request_count = 0;
-            self.engine.adjust_flow_control(self.emptied_at); // Now synchronous with atomic CAS
             self.shrink_buffer_if_overflowing();
         }
         // ✅ 优化：使用 handle_packet_fast 避免重复解析 / ✅ Optimization: Use handle_packet_fast to avoid re-parsing
@@ -1336,13 +1335,13 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
     }
 }
 
-/// 要等上游的查询交给单独的任务，在请求时限内回答，答不上回 SERVFAIL。接收循环里不等 permit：没有空闲的
-/// permit 时（过载），快速解析成了的立刻回一个现成的 SERVFAIL，非阻塞发送（发送缓冲满就丢掉，背压）；没成
+/// 要等上游的查询交给单独的任务，在请求时限内回答，答不上回 SERVFAIL。流控拒绝时（过载），
+/// 快速解析成了的立刻回一个现成的 SERVFAIL，非阻塞发送（发送缓冲满就丢掉，背压）；没成
 /// 的多半是畸形包，静默丢弃——过载时要做最便宜的拒绝，对已经解析失败的包再完整解析一遍只会加重过载，
 /// hickory 大概率同样失败。
 /// A query that waits on an upstream goes to its own task, answered within the request
-/// timeout and SERVFAIL when it cannot be. The receive loop does not wait for a permit:
-/// without a free one (overload), a query the quick parse read gets a ready-made SERVFAIL at
+/// timeout and SERVFAIL when it cannot be. When flow control refuses it (overload), a query
+/// the quick parse read gets a ready-made SERVFAIL at
 /// once, sent without blocking (dropped when the send buffer is full, as backpressure); one
 /// it could not read is most likely malformed and dropped silently. Overload rejection must
 /// be cheap, and a full parse of an already-failed packet wastes CPU, as hickory most
@@ -1364,8 +1363,15 @@ fn spawn_udp_answer(
     let engine = Arc::clone(answering.engine);
     let socket = Arc::clone(answering.socket);
     let pending = Arc::clone(answering.pending);
+    // 从排进去到开始跑等了多久：等上游不算在内，算的是内核自己跟不跟得上
+    // How long it waits from being queued until it runs: waiting on an upstream is not in
+    // this, so it tells whether the kernel itself keeps up
+    let queued_at = engine.flow_control_state.is_some().then(Instant::now);
     tokio::spawn(async move {
         let _permit = permit; // 自动释放 / Auto-release on drop
+        if let (Some(queued_at), Some(flow)) = (queued_at, &engine.flow_control_state) {
+            flow.note_queue_delay(queued_at.elapsed());
+        }
         // 答不上（处理失败、超时）回 SERVFAIL，读不了回 FORMERR / SERVFAIL when no answer came (a failure, a timeout), FORMERR when the query cannot be read
         let response = match engine
             .answer_after_fast_path(&packet, peer, pre_parsed)
@@ -2238,9 +2244,6 @@ mod tests {
             "settings": {
                 "default_upstream": "127.0.0.1:9",
                 "flow_control_enabled": true,
-                "flow_control_initial_permits": 1,
-                "flow_control_min_permits": 1,
-                "flow_control_max_permits": 1,
                 "flow_control_latency_threshold_ms": 0
             },
             "pipelines": [{
@@ -2299,21 +2302,25 @@ mod tests {
         assert!(send_udp_datagram(&socket, b"dns", ipv6_peer).await.is_err());
     }
 
-    /// 上限只有 1、上游慢的引擎，`busy_after_ms` 是 socket 多久没收空算忙
-    /// An engine with a limit of 1 and a slow upstream, `busy_after_ms` being how long a socket goes without
-    /// running empty before that counts as busy
-    async fn limited_engine_with_slow_upstream(busy_after_ms: u64) -> Engine {
+    /// 查询一直算排长队、上游慢的引擎，只差内核忙不忙就会拒绝。`busy_after_ms` 是 socket 多久没收空算忙
+    /// An engine with queries always counting as queueing long and a slow upstream, refusing as
+    /// soon as the kernel is busy, `busy_after_ms` being how long a socket goes without running
+    /// empty before that counts as busy
+    async fn behind_engine_with_slow_upstream(busy_after_ms: u64) -> Engine {
         let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
-        engine_forwarding_to(
+        let engine = engine_forwarding_to(
             upstream,
             serde_json::json!({
                 "flow_control_enabled": true,
-                "flow_control_initial_permits": 1,
-                "flow_control_min_permits": 1,
-                "flow_control_max_permits": 1,
                 "flow_control_latency_threshold_ms": busy_after_ms,
             }),
-        )
+        );
+        engine
+            .flow_control_state
+            .as_ref()
+            .unwrap()
+            .note_queue_delay(Duration::from_secs(3600));
+        engine
     }
 
     /// 发出 `count` 个不同的查询，数被拒绝（SERVFAIL）的和答上来的
@@ -2338,8 +2345,8 @@ mod tests {
         (refused, answered)
     }
 
-    /// 上游慢时，等着的查询比上限多也不拒绝：内核并不忙，它们都等得到回答。两种循环都这样
-    /// With a slow upstream, more queries waiting than the limit are not refused: the kernel is not busy and
+    /// 上游慢时，等着的查询再多也不拒绝：内核并不忙，它们都等得到回答。两种循环都这样
+    /// With a slow upstream, however many queries wait they are not refused: the kernel is not busy and
     /// they all get their answers. Both loops do so
     #[tokio::test]
     async fn queries_waiting_on_a_slow_upstream_are_not_refused() {
@@ -2357,7 +2364,7 @@ mod tests {
     async fn not_refused_while_waiting_on_an_upstream(
         receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
     ) {
-        let engine = limited_engine_with_slow_upstream(2_000).await;
+        let engine = behind_engine_with_slow_upstream(2_000).await;
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let worker = receive(server, engine);
@@ -2461,26 +2468,6 @@ mod tests {
         assert!(answering.buffer_shrunk);
     }
 
-    /// 上限跟着 socket 收不收得空走：一直收不空就收紧，收得空就放宽
-    /// The limit follows whether the socket runs empty: tightened when it does not, loosened when it does
-    #[tokio::test]
-    async fn the_limit_follows_whether_the_socket_runs_empty() {
-        let upstream = spawn_slow_udp_upstream(Duration::from_millis(1)).await;
-        let engine = engine_forwarding_to(
-            upstream,
-            serde_json::json!({
-                "flow_control_enabled": true,
-                "flow_control_adjustment_interval_secs": 0,
-            }),
-        );
-        let long_ago = Instant::now() - Duration::from_secs(60);
-        engine.adjust_flow_control(long_ago);
-        assert_eq!(engine.permit_manager.max_permits(), 450);
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        engine.adjust_flow_control(Instant::now());
-        assert_eq!(engine.permit_manager.max_permits(), 495);
-    }
-
     /// 空闲了很久以后来的查询不算内核忙：等新报文的时间不算没收空。两种循环都这样
     /// Queries after a long quiet spell do not find the kernel busy: waiting for datagrams does not count as
     /// not running empty. Both loops do so
@@ -2500,7 +2487,7 @@ mod tests {
     async fn not_refused_after_a_quiet_spell(
         receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
     ) {
-        let engine = limited_engine_with_slow_upstream(500).await;
+        let engine = behind_engine_with_slow_upstream(500).await;
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let worker = receive(server, engine);
@@ -2516,8 +2503,8 @@ mod tests {
         worker.abort();
     }
 
-    /// socket 一直收不空才算内核忙，这时超过上限的查询回 SERVFAIL。两种循环都这样
-    /// A socket that never runs empty means the kernel is busy, and queries past the limit then get SERVFAIL.
+    /// socket 一直收不空才算内核忙，这时查询又在排长队就回 SERVFAIL。两种循环都这样
+    /// A socket that never runs empty means the kernel is busy, and with queries queueing long they then get SERVFAIL.
     /// Both loops do so
     #[tokio::test]
     async fn a_socket_that_stays_behind_refuses_past_the_limit() {
@@ -2535,7 +2522,7 @@ mod tests {
     async fn refused_when_behind(
         receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
     ) {
-        let engine = limited_engine_with_slow_upstream(1).await;
+        let engine = behind_engine_with_slow_upstream(1).await;
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -2551,6 +2538,58 @@ mod tests {
         assert!(refused > 0, "refused {refused}, answered {answered}");
         assert!(answered > 0, "refused {refused}, answered {answered}");
         worker.abort();
+    }
+
+    /// 查询从排进去到开始跑等得超过目标，内核就算跟不上，下一个查询被拒绝；等得不久就不会
+    /// A query waiting past the target from being queued until it runs means the kernel is
+    /// behind, and the next query is refused; a short wait does not
+    #[tokio::test]
+    async fn queueing_past_the_target_refuses_queries() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let engine = Arc::new(engine_forwarding_to(
+            upstream.local_addr().unwrap(),
+            serde_json::json!({
+                "flow_control_enabled": true,
+                "flow_control_latency_threshold_ms": 0,
+                "upstream_timeout_ms": 5000,
+                "enable_tcp_fallback": false,
+            }),
+        ));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pending = Arc::new(PendingReplies::default());
+        let mut answering = UdpAnswering {
+            socket: &socket,
+            engine: &engine,
+            pending: &pending,
+            request_count: 0,
+            emptied_at: Instant::now(),
+            checks_since_empty: 0,
+            buffer_shrunk: false,
+            drops_seen: None,
+        };
+        let peer = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut reply = BytesMut::new();
+        let mut ask = |id: u16| {
+            let query = query(&format!("q{id}.queue.test"), id);
+            answering.answer(&query, peer, &mut reply);
+        };
+
+        // 这个测试和查询的任务在同一线程上，它不让出，任务就跑不了
+        // This test and the query's task share a thread, so the task cannot run until it yields
+        ask(1);
+        tokio::task::yield_now().await;
+        ask(2);
+        assert_eq!(engine.permit_manager.dropped_requests(), 0, "a short wait");
+
+        ask(3);
+        std::thread::sleep(Duration::from_millis(300));
+        tokio::task::yield_now().await;
+        ask(4);
+        assert_eq!(engine.permit_manager.dropped_requests(), 1, "a long wait");
     }
 
     /// 开着流控的引擎，转发给一个不应答的上游，在途已有 1000 个查询，内存剩多少看 `available`
@@ -2718,7 +2757,11 @@ mod tests {
     #[tokio::test]
     async fn udp_permit_exhaustion_returns_servfail_but_malformed_packet_is_silent() {
         let engine = forwarding_engine();
-        engine.permit_manager.set_max_permits(0);
+        engine
+            .flow_control_state
+            .as_ref()
+            .unwrap()
+            .note_queue_delay(Duration::from_secs(3600));
 
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();

@@ -2,37 +2,67 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// 动态信号量调整的自适应流控状态 / Adaptive flow control state for dynamic semaphore adjustment
+/// 查询在内核里排队超过这么久，就算内核跟不上。这是延迟目标，和机器无关：快机器和慢机器都一样
+/// Queries waiting longer than this inside the kernel means it cannot keep up. This is a
+/// latency goal rather than a property of the machine, the same on a fast one and a slow one
+const QUEUE_TARGET: Duration = Duration::from_millis(20);
+
+/// 流控的状态。不用填数字，判断都来自运行时测到的：socket 收不收得空、查询排队多久、还剩多少内存
+/// The state of flow control. There are no numbers to fill in: it goes by what is measured at
+/// run time, namely whether a socket runs empty, how long queries queue and how much memory is left
 pub struct FlowControlState {
-    pub max_permits: AtomicUsize,
-    pub min_permits: usize,
-    /// 自UNIX_EPOCH以来的最后调整时间戳（毫秒） / Last adjustment timestamp in milliseconds since UNIX_EPOCH
-    /// 时钟回滚通过 adjust_flow_control 中的 saturating_sub 处理 / Clock rollback is handled by saturating_sub in adjust_flow_control
-    pub last_adjustment_ms: AtomicU64,
     /// socket 连续这么久没收空就算忙 / How long a socket goes without running empty before that counts as busy
     pub busy_after: Duration,
-    pub adjustment_interval_ms: u64,
     pub memory: super::memory_watermark::MemoryWatermark,
+    started: Instant,
+    /// 跟不上的状态到什么时候（从 `started` 算起的纳秒）/ Until when the kernel counts as behind, in nanoseconds since `started`
+    behind_until_ns: AtomicU64,
 }
 
 impl FlowControlState {
-    /// 一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝；上限只在内核
-    /// 忙的时候起作用：上游慢时查询多半在等，内核并不忙，拒绝它们只会让本来能答的答不了
+    pub fn new(busy_after: Duration, memory: super::memory_watermark::MemoryWatermark) -> Self {
+        Self {
+            busy_after,
+            memory,
+            started: Instant::now(),
+            behind_until_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// 一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝；内核忙而且
+    /// 查询在内核里排着长队时也拒绝。等上游不算排队，所以上游再慢，这样的查询也不会被拒绝
     /// Whether a query that waits on an upstream can go ahead, `emptied_at` being when the socket
-    /// last ran empty. Too little memory refuses it. The limit applies only while the kernel is
-    /// busy: with a slow upstream the queries mostly wait and the kernel is not busy, and refusing
-    /// them only leaves unanswered what could be answered
+    /// last ran empty. Too little memory refuses it, and so does the kernel being busy with
+    /// queries queueing long inside it. Waiting on an upstream is not queueing, so however slow
+    /// the upstream, such queries are not refused
     #[inline]
     pub fn permit(&self, manager: &Arc<PermitManager>, emptied_at: Instant) -> Option<PermitGuard> {
         if !self.memory.has_room(manager.inflight()) {
             manager.count_refused();
             return None;
         }
-        if self.busy(emptied_at) {
-            manager.try_acquire()
-        } else {
-            Some(manager.acquire())
+        if self.busy(emptied_at) && self.behind() {
+            manager.count_refused();
+            return None;
         }
+        Some(manager.acquire())
+    }
+
+    /// 一个查询从排进去到开始跑等了 `delay`。超过目标就说明队里积着这么久的活，这段时间不接新查询，让它消化
+    /// A query waited `delay` from being queued until it ran. Past the target, that means this
+    /// much work is queued, and for that long no new query is taken so it can be worked off
+    #[inline]
+    pub fn note_queue_delay(&self, delay: Duration) {
+        if delay > QUEUE_TARGET {
+            let until = self.started.elapsed() + delay;
+            self.behind_until_ns
+                .store(until.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn behind(&self) -> bool {
+        (self.started.elapsed().as_nanos() as u64) < self.behind_until_ns.load(Ordering::Relaxed)
     }
 
     /// 内核忙不忙，`emptied_at` 是 socket 上次收空的时刻。内核跟不上，socket 才会一直收不空；上游慢不算，
@@ -57,190 +87,45 @@ impl FlowControlState {
             None
         }
     }
-
-    /// 忙的时候收紧上限，不忙的时候放宽 / Tightens the limit while busy and loosens it otherwise
-    pub fn adjust(&self, permit_manager: &PermitManager, busy: bool) {
-        // Get current time in milliseconds
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        // Use compare_exchange_weak in a loop for lock-free synchronization
-        // saturating_sub handles clock rollback: if now < last, result is 0, we skip
-        let mut last_ms = self.last_adjustment_ms.load(Ordering::Acquire);
-        loop {
-            // Check if adjustment interval has passed
-            if now_ms.saturating_sub(last_ms) < self.adjustment_interval_ms {
-                return;
-            }
-
-            // Try to update timestamp - only one thread will succeed
-            match self.last_adjustment_ms.compare_exchange_weak(
-                last_ms,
-                now_ms,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break, // Successfully acquired adjustment right
-                Err(current) => {
-                    // Another thread updated timestamp, reload and recheck
-                    last_ms = current;
-                    continue;
-                }
-            }
-        }
-
-        let inflight = permit_manager.inflight();
-        let current_permits = permit_manager.max_permits();
-        let dropped = permit_manager.dropped_requests();
-
-        // Log permit pool health periodically / 定期记录permit pool健康状况
-        if dropped > 0 {
-            tracing::warn!(
-                inflight = inflight,
-                max = current_permits,
-                dropped_total = dropped,
-                "Permit pool health status"
-            );
-        }
-
-        // Log when the permit pool is full, at most once a minute / permit 池满了就记一条，每分钟最多一次
-        permit_manager.check_and_recover();
-
-        if busy && current_permits > self.min_permits {
-            let new_permits = (current_permits * 9 / 10).max(self.min_permits);
-            permit_manager.set_max_permits(new_permits);
-            tracing::info!(
-                event = "flow_control_reduce",
-                current_permits = current_permits,
-                new_permits = new_permits,
-                inflight = inflight,
-                dropped = dropped,
-                "reducing permits while busy"
-            );
-        } else if !busy && current_permits < self.max_permits.load(Ordering::Relaxed) {
-            let new_permits =
-                (current_permits * 11 / 10).min(self.max_permits.load(Ordering::Relaxed));
-            permit_manager.set_max_permits(new_permits);
-            tracing::info!(
-                event = "flow_control_increase",
-                current_permits = current_permits,
-                new_permits = new_permits,
-                inflight = inflight,
-                dropped = dropped,
-                "increasing permits while not busy"
-            );
-        }
-    }
 }
 
-/// 动态流控的 Permit 管理器 / Permit manager for dynamic flow control feedback
+/// 记着有多少查询和连接在处理、拒绝了多少 / Counts the queries and connections being handled, and those refused
 pub struct PermitManager {
     // Current active permits (acquired) / 当前活跃 permits（已获得）
     pub(crate) active_permits: AtomicUsize,
-    // Maximum permits that can be granted / 可授予的最大 permits
-    max_permits: AtomicUsize,
-    // Last recovery timestamp (ms) / 上次恢复时间戳（毫秒）
-    last_recovery_ms: AtomicU64,
-    // Count of dropped requests due to pool exhaustion / 因pool耗尽而丢弃的请求计数
+    // Count of requests refused / 被拒绝的请求计数
     dropped_requests: AtomicU64,
 }
 
+impl Default for PermitManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PermitManager {
-    pub fn new(initial_permits: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             active_permits: AtomicUsize::new(0),
-            max_permits: AtomicUsize::new(initial_permits),
-            last_recovery_ms: AtomicU64::new(0),
             dropped_requests: AtomicU64::new(0),
         }
     }
 
-    /// 创建一个无限制的PermitManager（用于rustdns风格的无流控模式）
-    /// Create an unlimited PermitManager (for rustdns-style no-flow-control mode)
-    pub fn new_unlimited() -> Self {
-        Self {
-            active_permits: AtomicUsize::new(0),
-            max_permits: AtomicUsize::new(usize::MAX),
-            last_recovery_ms: AtomicU64::new(0),
-            dropped_requests: AtomicU64::new(0),
-        }
-    }
-
-    /// 不看上限拿一个 permit：不忙的时候不拒绝查询，只记着有多少在处理
-    /// Takes a permit whatever the limit: while not busy no query is refused, and this only counts how many are
-    /// being handled
+    /// 拿一个 permit：这里不拒绝，只记着有多少在处理 / Takes a permit: nothing is refused here, this only counts what is being handled
     pub fn acquire(self: &Arc<Self>) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
         PermitGuard::new(Arc::clone(self))
     }
 
-    /// 记下一个没走到这里就被拒绝的查询 / Counts a query refused before it got here
+    /// 记下一个被拒绝的查询或连接，隔一阵记一条日志 / Counts a refused query or connection, with a log line now and then
     pub fn count_refused(&self) {
-        self.dropped_requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
-    /// Returns a guard that holds Arc<PermitManager> to ensure permit is released
-    ///
-    /// Uses a post-CAS validation to handle the TOCTOU window where max_permits
-    /// may shrink between the initial load and the successful CAS.
-    /// 使用 CAS 后验证来处理 max_permits 在初始读取和 CAS 成功之间缩小的 TOCTOU 窗口。
-    pub fn try_acquire(self: &Arc<Self>) -> Option<PermitGuard> {
-        loop {
-            let active = self.active_permits.load(Ordering::Acquire);
-            let max = self.max_permits.load(Ordering::Acquire);
-
-            if active >= max {
-                // Pool exhausted: increment counter and log / Pool耗尽：增加计数器并记录
-                let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
-
-                // Log every 1000 dropped requests to avoid spam / 每1000个丢弃请求记录一次，避免刷屏
-                if dropped.is_multiple_of(1000) {
-                    tracing::warn!(
-                        active = active,
-                        max = max,
-                        dropped_total = dropped + 1,
-                        "UDP permit pool exhausted, requests are being dropped"
-                    );
-
-                    // Trigger recovery check if pool is exhausted / 如果pool耗尽，触发恢复检查
-                    self.check_and_recover();
-                }
-                return None;
-            }
-
-            match self.active_permits.compare_exchange(
-                active,
-                active + 1,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // Post-CAS validation: max_permits may have shrunk concurrently
-                    // via set_max_permits(). If we now exceed the new limit, roll back.
-                    // CAS后验证：max_permits 可能已通过 set_max_permits() 缩小，
-                    // 如果超出新限制则回滚。
-                    let current_max = self.max_permits.load(Ordering::Acquire);
-                    if active + 1 > current_max {
-                        // Exceeded new limit — return the permit and report exhaustion
-                        self.active_permits.fetch_sub(1, Ordering::Release);
-                        let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
-                        if dropped.is_multiple_of(1000) {
-                            tracing::warn!(
-                                active = active,
-                                new_max = current_max,
-                                dropped_total = dropped + 1,
-                                "Permit acquired but max shrunk concurrently, rolling back"
-                            );
-                        }
-                        return None;
-                    }
-                    return Some(PermitGuard::new(Arc::clone(self)));
-                }
-                Err(_) => continue, // Retry on CAS failure / CAS 失败时重试
-            }
+        let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
+        if dropped.is_multiple_of(100_000) {
+            tracing::warn!(
+                inflight = self.inflight(),
+                dropped_total = dropped + 1,
+                "flow control is refusing queries"
+            );
         }
     }
 
@@ -269,75 +154,10 @@ impl PermitManager {
         self.active_permits.load(Ordering::Acquire)
     }
 
-    /// Update max permits for dynamic adjustment / 更新最大 permits 用于动态调整
-    #[inline]
-    pub fn set_max_permits(&self, new_max: usize) {
-        self.max_permits.store(new_max, Ordering::Release);
-    }
-
-    /// Get current max permits / 获取当前最大 permits
-    #[inline]
-    pub fn max_permits(&self) -> usize {
-        self.max_permits.load(Ordering::Acquire)
-    }
-
     /// Get total dropped requests count / 获取总丢弃请求数
     #[inline]
     pub fn dropped_requests(&self) -> u64 {
         self.dropped_requests.load(Ordering::Relaxed)
-    }
-
-    /// Log pool saturation, at most once per minute. Called from the periodic
-    /// flow-control adjustment and when an acquire is refused.
-    ///
-    /// This used to also "recover from leakage" by forcing `active_permits`
-    /// down to `max_permits` whenever it exceeded it. That state is not a leak:
-    /// the counter only moves through `try_acquire` and `PermitGuard`, which
-    /// release exactly once, so a guard that is never dropped keeps `active`
-    /// at or below `max`, never above it. `active > max` only arises when
-    /// `set_max_permits` lowers the limit under live guards, and clamping the
-    /// counter there made their later releases underflow it, after which every
-    /// acquire was refused for good.
-    /// 记录池饱和，每分钟最多一次。由周期性流控调整和 acquire 被拒时调用。
-    ///
-    /// 这里原本还会在 active 超过 max 时把 active 强行压到 max 来"恢复泄漏"。那不是
-    /// 泄漏：计数只经由 try_acquire 和恰好释放一次的 PermitGuard 变化，永不释放的
-    /// guard 只会让 active 停在 ≤ max，不会超过 max。active > max 只在
-    /// set_max_permits 于在途 guard 之下调低上限时出现，此时压低计数会让这些 guard
-    /// 之后的释放把计数减到下溢，从此所有 acquire 都被拒绝。
-    pub fn check_and_recover(&self) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
-        let last_ms = self.last_recovery_ms.load(Ordering::Relaxed);
-
-        // At most once per minute / 每分钟最多一次
-        if now_ms.saturating_sub(last_ms) < 60_000 {
-            return;
-        }
-
-        // Try to update the timestamp; whoever wins reports / 尝试更新时间戳，赢者上报
-        if self
-            .last_recovery_ms
-            .compare_exchange_weak(last_ms, now_ms, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
-        }
-
-        let active = self.active_permits.load(Ordering::Acquire);
-        let max = self.max_permits.load(Ordering::Acquire);
-        if active >= max {
-            let dropped = self.dropped_requests.load(Ordering::Relaxed);
-            tracing::warn!(
-                active = active,
-                max = max,
-                dropped_total = dropped,
-                "Permit pool is at capacity, consider increasing max_permits or checking upstream health"
-            );
-        }
     }
 }
 
@@ -396,24 +216,63 @@ mod tests {
     use super::*;
     use crate::engine::memory_watermark::{MemoryLeft, MemoryReading, MemoryWatermark};
 
-    fn state(min: usize, max: usize, busy_after: Duration) -> FlowControlState {
-        FlowControlState {
-            max_permits: AtomicUsize::new(max),
-            min_permits: min,
-            last_adjustment_ms: AtomicU64::new(0),
-            busy_after,
-            adjustment_interval_ms: 0,
-            memory: MemoryWatermark::reading(MemoryReading::default),
-        }
+    fn state(busy_after: Duration) -> FlowControlState {
+        FlowControlState::new(busy_after, MemoryWatermark::reading(MemoryReading::default))
     }
 
-    /// TCP 和 DoH 只看内存：内核一直算忙、上限是 0 也放行，内存不够时拒绝并记下
-    /// TCP and DoH go by memory alone: with the kernel always busy and a limit of 0 they go
-    /// ahead, and too little memory refuses and counts them
+    const LONG_AGO: Duration = Duration::from_secs(61);
+
+    /// 忙而且排长队才拒绝：只忙（上游慢、socket 收不空）或只排队（短暂卡顿）都不拒绝
+    /// Refused only when busy and queueing long: busy alone (a slow upstream, a socket not
+    /// running empty) or queueing alone (a brief stall) refuses nothing
+    #[test]
+    fn a_query_is_refused_only_when_busy_and_behind() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = state(Duration::from_secs(60));
+        let busy = Instant::now() - LONG_AGO;
+
+        let busy_alone = flow.permit(&manager, busy);
+        assert!(busy_alone.is_some(), "busy alone");
+
+        flow.note_queue_delay(Duration::from_secs(3600));
+        let behind_alone = flow.permit(&manager, Instant::now());
+        assert!(behind_alone.is_some(), "behind alone");
+        assert_eq!(manager.dropped_requests(), 0);
+
+        assert!(flow.permit(&manager, busy).is_none(), "both");
+        assert_eq!(manager.dropped_requests(), 1);
+        assert_eq!(manager.inflight(), 2, "a refused query holds no permit");
+    }
+
+    /// 排队没超过目标不算跟不上；超过了就按等了多久算，到点自己恢复
+    /// Queueing within the target does not count as behind; past it, it counts for as long as
+    /// the query waited, and ends by itself
+    #[test]
+    fn behind_lasts_as_long_as_the_queue_was() {
+        let flow = state(Duration::ZERO);
+        flow.note_queue_delay(QUEUE_TARGET);
+        assert!(!flow.behind(), "the target itself is fine");
+
+        flow.note_queue_delay(QUEUE_TARGET + Duration::from_millis(30));
+        assert!(flow.behind());
+        std::thread::sleep(QUEUE_TARGET + Duration::from_millis(60));
+        assert!(!flow.behind(), "it ends by itself");
+
+        flow.note_queue_delay(Duration::from_secs(3600));
+        flow.note_queue_delay(QUEUE_TARGET);
+        assert!(flow.behind(), "a short wait does not end it early");
+        std::thread::sleep(QUEUE_TARGET + Duration::from_millis(5));
+        assert!(flow.behind(), "a long queue lasts longer than the target");
+    }
+
+    /// TCP 和 DoH 只看内存：内核忙而且排长队也放行，内存不够时拒绝并记下
+    /// TCP and DoH go by memory alone: with the kernel busy and queueing long they go ahead,
+    /// and too little memory refuses and counts them
     #[test]
     fn a_stream_query_goes_by_memory_alone() {
-        let manager = Arc::new(PermitManager::new(0));
-        let mut flow = state(0, 0, Duration::ZERO);
+        let manager = Arc::new(PermitManager::new());
+        let mut flow = state(Duration::ZERO);
+        flow.note_queue_delay(Duration::from_secs(3600));
         let plenty = flow.permit_by_memory(&manager);
         assert!(plenty.is_some());
         assert_eq!(manager.inflight(), 1, "it counts among those in flight");
@@ -436,8 +295,8 @@ mod tests {
     /// queries in flight memory is not looked at and they go ahead
     #[test]
     fn too_little_memory_refuses_a_query_even_when_not_busy() {
-        let manager = Arc::new(PermitManager::new(500));
-        let mut flow = state(100, 800, Duration::from_secs(3600));
+        let manager = Arc::new(PermitManager::new());
+        let mut flow = state(Duration::from_secs(3600));
         flow.memory = MemoryWatermark::reading(|| MemoryReading {
             own: 0,
             limits: vec![MemoryLeft {
@@ -473,82 +332,24 @@ mod tests {
     /// Busy only once long enough has passed since the socket last ran empty; with a threshold of 0, always
     #[test]
     fn busy_is_judged_from_when_the_socket_last_ran_empty() {
-        let state = state(1, 1, Duration::from_secs(60));
+        let state = state(Duration::from_secs(60));
         assert!(!state.busy(Instant::now()));
-        assert!(state.busy(Instant::now() - Duration::from_secs(61)));
+        assert!(state.busy(Instant::now() - LONG_AGO));
 
-        let always = super::tests::state(1, 1, Duration::ZERO);
+        let always = super::tests::state(Duration::ZERO);
         assert!(always.busy(Instant::now()));
     }
 
-    /// 忙的时候每次收紧一成，到最少为止；不忙的时候每次放宽一成，到最多为止，有多少在处理都一样
-    /// While busy each step tightens by a tenth down to the minimum; while not busy each loosens by a tenth up
-    /// to the maximum, however many are being handled
+    /// 还回来以后计数归零 / The count returns to zero once permits are given back
     #[test]
-    fn the_limit_tightens_only_while_busy() {
-        let state = state(100, 800, Duration::from_millis(100));
-        let manager = Arc::new(PermitManager::new(500));
-        let step = |busy, expected| {
-            state.last_adjustment_ms.store(0, Ordering::Relaxed);
-            state.adjust(&manager, busy);
-            assert_eq!(manager.max_permits(), expected);
-        };
-        step(true, 450);
-        step(false, 495);
-
-        // 在处理的比上限还多也一样放宽：等上游的查询不算内核忙
-        // Loosens even with more being handled than the limit: queries waiting on an upstream are no business
-        let waiting: Vec<_> = (0..600).map(|_| manager.acquire()).collect();
-        step(false, 544);
-        drop(waiting);
-
-        manager.set_max_permits(105);
-        step(true, 100);
-        step(true, 100);
-        manager.set_max_permits(790);
-        step(false, 800);
-        step(false, 800);
-    }
-
-    /// 超过上限拿的 permit 也记着，还回来以后计数归零 / A permit taken past the limit is counted too, and the count returns to zero
-    #[test]
-    fn a_permit_past_the_limit_is_counted_and_released() {
-        let manager = Arc::new(PermitManager::new(1));
-        let within = manager.try_acquire().expect("within the limit");
-        let past = manager.acquire();
+    fn permits_are_counted_and_released() {
+        let manager = Arc::new(PermitManager::new());
+        let first = manager.acquire();
+        let second = manager.acquire();
         assert_eq!(manager.inflight(), 2);
-        assert!(manager.try_acquire().is_none(), "the limit still stands");
-        drop(within);
+        drop(first);
         assert_eq!(manager.inflight(), 1);
-        drop(past);
+        drop(second);
         assert_eq!(manager.inflight(), 0);
-    }
-
-    #[test]
-    fn shrinking_max_below_inflight_does_not_corrupt_the_counter() {
-        // Flow control lowering max_permits while guards are live is the normal
-        // way active can exceed max; it is not a leak. Once those guards drop
-        // the pool must be empty and usable again.
-        // 流控在有在途 guard 时调低 max_permits 是 active 超过 max 的正常途径，不是
-        // 泄漏。这些 guard 释放后，池必须回到空闲且可用。
-        let manager = Arc::new(PermitManager::new(100));
-        let guards: Vec<_> = (0..60)
-            .map(|_| manager.try_acquire().expect("permit within limit"))
-            .collect();
-        manager.set_max_permits(59);
-        // The periodic health hook runs unconditionally from adjust().
-        manager.check_and_recover();
-        drop(guards);
-
-        assert_eq!(
-            manager.inflight(),
-            0,
-            "every released permit must be counted back"
-        );
-        manager.set_max_permits(100);
-        assert!(
-            manager.try_acquire().is_some(),
-            "pool must accept requests again after the guards are gone"
-        );
     }
 }

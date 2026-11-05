@@ -135,21 +135,21 @@ pub struct GlobalSettings {
     /// When disabled, use rustdns style: no concurrency limit, rely on tokio runtime scheduling and timeout protection
     #[serde(default = "default_flow_control_enabled")]
     pub flow_control_enabled: bool,
-    /// 自适应流控初始 permits 数量（仅在flow_control_enabled=true时有效） / Initial permits for adaptive flow control (only effective when flow_control_enabled=true)
+    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
     #[serde(default = "default_flow_control_initial_permits")]
     pub flow_control_initial_permits: usize,
-    /// 自适应流控最小 permits 数量（仅在flow_control_enabled=true时有效） / Minimum permits for adaptive flow control (only effective when flow_control_enabled=true)
+    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
     #[serde(default = "default_flow_control_min_permits")]
     pub flow_control_min_permits: usize,
-    /// 自适应流控最大 permits 数量（仅在flow_control_enabled=true时有效） / Maximum permits for adaptive flow control (only effective when flow_control_enabled=true)
+    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
     #[serde(default = "default_flow_control_max_permits")]
     pub flow_control_max_permits: usize,
-    /// 接收 socket 连续多久没收空就算内核忙（毫秒，仅在flow_control_enabled=true时有效），上限只在忙的时候起作用；0 表示一直算忙
+    /// 接收 socket 连续多久没收空就算内核忙（毫秒，仅在flow_control_enabled=true时有效），只有忙的时候才可能拒绝查询；0 表示一直算忙
     /// How long a receiving socket goes without running empty before the kernel counts as busy (milliseconds, only
-    /// effective when flow_control_enabled=true); the limit applies only while busy, and 0 means always busy
+    /// effective when flow_control_enabled=true); queries may be refused only while busy, and 0 means always busy
     #[serde(default = "default_flow_control_latency_threshold_ms")]
     pub flow_control_latency_threshold_ms: u64,
-    /// 流控调整间隔（秒，仅在flow_control_enabled=true时有效） / Flow control adjustment interval (seconds, only effective when flow_control_enabled=true)
+    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
     #[serde(default = "default_flow_control_adjustment_interval_secs")]
     pub flow_control_adjustment_interval_secs: u64,
     /// RFC 8767: 上游不可用时返回过期缓存（默认 false）/ RFC 8767: Serve stale cached data when upstream is unavailable (default false)
