@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -209,39 +209,13 @@ impl Engine {
 
         let state = Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg)));
 
-        // 根据配置决定是否启用流控 / Decide whether to enable flow control based on configuration
-        // 如果禁用流控，使用usize::MAX作为max_permits，实现"无限制"模式
-        // When flow control is disabled, use usize::MAX as max_permits for "unlimited" mode
-        let (permit_manager, flow_control_state) = if settings.flow_control_enabled {
-            // PermitManager.max_permits 是"当前上限"，FlowControlState.max_permits
-            // 是天花板。此前紧接着的一行把当前上限直接写成天花板，
-            // flow_control_initial_permits 当场失效，开了流控的部署实际从 800
-            // 起步而不是文档写的 500。现在按初始值起步，由 adjust 往天花板爬。
-            // PermitManager.max_permits is the *current* limit while
-            // FlowControlState.max_permits is the ceiling. The next line used to
-            // overwrite the current limit with the ceiling, which made
-            // flow_control_initial_permits dead on arrival and started a
-            // flow-controlled deployment at 800 rather than the documented 500.
-            // It now starts at the initial value and adjust climbs toward the
-            // ceiling.
-            let pm = Arc::new(PermitManager::new(settings.flow_control_initial_permits));
-            (
-                pm,
-                Some(Arc::new(FlowControlState {
-                    max_permits: AtomicUsize::new(settings.flow_control_max_permits),
-                    min_permits: settings.flow_control_min_permits,
-                    last_adjustment_ms: AtomicU64::new(0),
-                    busy_after: Duration::from_millis(settings.flow_control_latency_threshold_ms),
-                    adjustment_interval_ms: settings.flow_control_adjustment_interval_secs * 1000,
-                    memory: super::memory_watermark::MemoryWatermark::of_this_machine(),
-                })),
-            )
-        } else {
-            // 无限制模式：创建一个max_permits=usize::MAX的PermitManager
-            // Unlimited mode: create a PermitManager with max_permits=usize::MAX
-            let pm = Arc::new(PermitManager::new_unlimited());
-            (pm, None)
-        };
+        let permit_manager = Arc::new(PermitManager::new());
+        let flow_control_state = settings.flow_control_enabled.then(|| {
+            Arc::new(FlowControlState::new(
+                Duration::from_millis(settings.flow_control_latency_threshold_ms),
+                super::memory_watermark::MemoryWatermark::of_this_machine(),
+            ))
+        });
 
         // TCP pool size is per upstream: each upstream keeps up to that many connections
         // TCP 连接池大小按每个 upstream 算：每个 upstream 最多保留这么多条连接
