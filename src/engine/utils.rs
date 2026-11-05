@@ -130,6 +130,20 @@ pub mod engine_helpers {
             .map(|reply| crate::proto_utils::reply_as_asked(reply, request))
     }
 
+    /// 监听器答不上一个报文时回什么：读得了的查询回 SERVFAIL；请求头是标准查询、报文却读不了的回 FORMERR
+    /// （RFC 6891 第 6.1.1 节，见 `proto_utils::formerr_reply`）；其余的（响应包、非标准查询、不到 12 字节）
+    /// 不回，也就没有反射。
+    /// What a listener sends for a message it cannot answer: SERVFAIL for a query it can
+    /// read, FORMERR for one with a standard query header that it cannot (RFC 6891 section
+    /// 6.1.1, see `proto_utils::formerr_reply`), and nothing for the rest (responses,
+    /// non-standard queries, under 12 bytes), which leaves nothing to reflect.
+    pub fn try_build_listener_failure_from_wire(request: &[u8]) -> Option<Bytes> {
+        try_build_servfail_response_from_wire(request).or_else(|| {
+            crate::proto_utils::is_standard_query_header(request)
+                .then(|| crate::proto_utils::formerr_reply(request))
+        })
+    }
+
     /// Build a SERVFAIL response directly from a DNS wire request.
     ///
     /// Valid requests preserve TXID, opcode, RD, and the Question section. The
