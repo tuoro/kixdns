@@ -221,7 +221,7 @@ UDP and TCP listeners are always created from settings.bind_udp and settings.bin
 
 Inbound listener behavior:
 
-- Only standard single-question QUERY messages are processed. Malformed packets, non-QUERY opcodes, and DNS response packets are silently dropped.
+- Only standard single-question QUERY messages are processed. Non-QUERY opcodes, messages without exactly one question, DNS response packets and packets under 12 bytes are silently dropped. A message with a standard query header that cannot be read (two OPT records, say, or a UDP query over 4096 bytes) gets FORMERR, with the header and question alone and no longer than the query; while flow control is refusing queries such a message is dropped.
 - A query whose EDNS version is not 0 is answered BADVERS (RFC 6891 section 6.1.3), with an OPT of version 0 in the reply.
 - A listener processing error, an overall request timeout, or an exhausted flow-control permit returns SERVFAIL to the client for a valid query.
 - UDP responses larger than the client's advertised size (the EDNS payload size, or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP.

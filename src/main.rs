@@ -1147,12 +1147,12 @@ impl UdpAnswering<'_> {
             }
             Err(error) => {
                 self.engine.log_fast_path_error(&error);
-                let Some(servfail) = engine_helpers::try_build_servfail_response_from_wire(packet)
+                let Some(failure) = engine_helpers::try_build_listener_failure_from_wire(packet)
                 else {
                     return false;
                 };
                 reply.clear();
-                reply.extend_from_slice(&servfail);
+                reply.extend_from_slice(&failure);
             }
         }
         // 截断超限响应，避免 UDP 报文超过客户端声明上限 / Truncate to the client's advertised UDP limit
@@ -1366,14 +1366,14 @@ fn spawn_udp_answer(
     let pending = Arc::clone(answering.pending);
     tokio::spawn(async move {
         let _permit = permit; // 自动释放 / Auto-release on drop
-        // 答不上（处理失败、超时）回 SERVFAIL / SERVFAIL when no answer came (a failure, a timeout)
+        // 答不上（处理失败、超时）回 SERVFAIL，读不了回 FORMERR / SERVFAIL when no answer came (a failure, a timeout), FORMERR when the query cannot be read
         let response = match engine
             .answer_after_fast_path(&packet, peer, pre_parsed)
             .await
         {
             Some(response) => response,
-            None => match engine_helpers::try_build_servfail_response_from_wire(&packet) {
-                Some(servfail) => servfail,
+            None => match engine_helpers::try_build_listener_failure_from_wire(&packet) {
+                Some(failure) => failure,
                 None => return,
             },
         };
@@ -1538,7 +1538,7 @@ async fn serve_tcp_conn(
                 Err(error) => {
                     engine.log_fast_path_error(&error);
                     if let Some(response) =
-                        engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
                     {
                         queue_tcp_answer(&mut answers, &response);
                     }
@@ -1573,7 +1573,7 @@ async fn serve_tcp_conn(
                     .answer_after_fast_path(&packet_bytes, peer, pre_parsed)
                     .await
                     .or_else(|| {
-                        engine_helpers::try_build_servfail_response_from_wire(&packet_bytes)
+                        engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
                     });
                 if let Some(answer) = answer {
                     write_tcp_answer(&writer, &answer).await;
@@ -2077,25 +2077,144 @@ mod tests {
         invalid_pointer.extend_from_slice(&[0xC0, 0xFF, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0]);
 
         let mut response_buf = [0u8; 512];
+        client.send_to(&qr_response, server_addr).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                client.recv_from(&mut response_buf),
+            )
+            .await
+            .is_err(),
+            "QR=1 gets no answer, so there is nothing to reflect"
+        );
         for (case, packet) in [
-            ("QR=1", qr_response),
             ("missing Additional RR", missing_additional),
             ("truncated EDNS RDATA", truncated_edns),
             ("invalid Additional compression pointer", invalid_pointer),
         ] {
             client.send_to(&packet, server_addr).await.unwrap();
+            let (len, _) =
+                tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response_buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("{case} should get FORMERR"))
+                    .unwrap();
+            let response = Message::from_bytes(&response_buf[..len]).unwrap();
+            assert_eq!(
+                response.metadata.response_code,
+                ResponseCode::FormErr,
+                "{case}"
+            );
             assert!(
-                tokio::time::timeout(
-                    Duration::from_millis(100),
-                    client.recv_from(&mut response_buf),
-                )
-                .await
-                .is_err(),
+                response.answers.is_empty(),
                 "{case} must be rejected before static/cache fast paths"
             );
         }
 
         worker.abort();
+    }
+
+    /// 请求头是标准查询、报文读不了的回 FORMERR（RFC 6891 第 6.1.1 节），带上它的 ID、RD 和问题，不比查询长。
+    /// 批量收发、一个一个收发和 TCP 都这样；超过接收缓冲的 UDP 查询被截断后也算这一类
+    /// A query with a standard header that cannot be read gets FORMERR (RFC 6891 section
+    /// 6.1.1) with its ID, RD and question, no longer than the query. So in the batched
+    /// and one-by-one receive loops and over TCP; a UDP query cut off at the receive buffer
+    /// counts too
+    #[tokio::test]
+    async fn a_query_that_cannot_be_read_gets_formerr() {
+        #[cfg(target_os = "linux")]
+        formerr_on_udp(|server, engine| {
+            tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
+        })
+        .await;
+        formerr_on_udp(|server, engine| {
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        })
+        .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(run_tcp(listener, static_engine()));
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        for (case, packet) in unreadable_queries() {
+            stream
+                .write_all(&(packet.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&packet).await.unwrap();
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut reply = vec![0u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut reply).await.unwrap();
+            assert_is_formerr_for(&reply, &packet, case);
+        }
+        server.abort();
+    }
+
+    async fn formerr_on_udp(
+        receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
+    ) {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = receive(server, static_engine());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut too_long = dns_query();
+        too_long[11] = 1;
+        let padding = 4400u16;
+        too_long.extend_from_slice(&[0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0]);
+        too_long.extend_from_slice(&(padding + 4).to_be_bytes());
+        too_long.extend_from_slice(&[0, 12]);
+        too_long.extend_from_slice(&padding.to_be_bytes());
+        too_long.resize(too_long.len() + padding as usize, 0);
+        let mut buf = [0u8; 512];
+        for (case, packet) in unreadable_queries()
+            .into_iter()
+            .chain([("over 4096 bytes", too_long)])
+        {
+            client.send_to(&packet, server_addr).await.unwrap();
+            let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{case} should get FORMERR"))
+                .unwrap();
+            assert_is_formerr_for(&buf[..len], &packet, case);
+        }
+        worker.abort();
+    }
+
+    fn unreadable_queries() -> Vec<(&'static str, Vec<u8>)> {
+        let opt = [0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0];
+        let mut two_opts = dns_query();
+        two_opts[11] = 2;
+        two_opts.extend_from_slice(&opt);
+        two_opts.extend_from_slice(&opt);
+        let mut opt_after_the_end = dns_query();
+        opt_after_the_end[11] = 2;
+        opt_after_the_end.extend_from_slice(&opt);
+        vec![
+            ("two OPT records", two_opts),
+            ("a record missing", opt_after_the_end),
+        ]
+    }
+
+    fn assert_is_formerr_for(reply: &[u8], query: &[u8], case: &str) {
+        let reply_message = Message::from_bytes(reply).unwrap();
+        assert_eq!(
+            reply_message.metadata.response_code,
+            ResponseCode::FormErr,
+            "{case}"
+        );
+        assert_eq!(
+            reply_message.metadata.message_type,
+            MessageType::Response,
+            "{case}"
+        );
+        assert_eq!(reply_message.metadata.id, 0xCAFE, "{case}");
+        assert!(reply_message.metadata.recursion_desired, "{case}");
+        assert_eq!(
+            reply_message.queries,
+            Message::from_bytes(&dns_query()).unwrap().queries,
+            "{case}"
+        );
+        assert!(reply.len() <= query.len(), "{case}: no amplification");
     }
 
     fn forwarding_engine() -> Engine {

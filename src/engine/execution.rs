@@ -3609,6 +3609,97 @@ mod tests {
         assert_ne!(response[3] & 0x10, 0, "CD must be preserved");
     }
 
+    /// 读不了的查询回什么：问题抄得过来就带上，抄不过来就只有请求头；不是标准查询的不回
+    /// What a query that cannot be read gets: its question when that can be copied, the
+    /// header alone otherwise; what is no standard query gets nothing
+    #[test]
+    fn the_listener_failure_for_what_cannot_be_read() {
+        let header = |qd: u8| {
+            let mut packet = vec![0u8; 12];
+            packet[..2].copy_from_slice(&0x1234u16.to_be_bytes());
+            packet[2] = 0x01;
+            packet[3] = 0x10;
+            packet[5] = qd;
+            packet
+        };
+        let question = [1, b'a', 0, 0, 1, 0, 1];
+        let reply = |packet: &[u8]| engine_helpers::try_build_listener_failure_from_wire(packet);
+
+        // 能读的查询照旧 SERVFAIL / A query that can be read still gets SERVFAIL
+        let mut readable = header(1);
+        readable.extend_from_slice(&question);
+        assert_eq!(reply(&readable).unwrap()[3] & 0x0F, 2);
+
+        // 问题完整：ID、RD、CD 和问题都带回，RCODE 是 FORMERR
+        // A whole question: ID, RD, CD and question come back, with RCODE FORMERR
+        let mut two_questions_worth = readable.clone();
+        two_questions_worth[11] = 1;
+        let formerr = reply(&two_questions_worth).unwrap();
+        assert_eq!(formerr[..2], [0x12, 0x34]);
+        assert_eq!(formerr[2], 0x81, "QR and RD");
+        assert_eq!(formerr[3], 0x91, "RA, CD and FORMERR");
+        assert_eq!(formerr[4..12], [0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(formerr[12..], question);
+
+        // 问题抄不过来：只有请求头 / A question that cannot be copied: the header alone
+        let mut name_too_long = header(1);
+        for _ in 0..5 {
+            name_too_long.push(63);
+            name_too_long.extend_from_slice(&[b'a'; 63]);
+        }
+        name_too_long.extend_from_slice(&[0, 0, 1, 0, 1]);
+        // 指针后面的字节够多，当成长度为 192 的标签也读得下去，只有查标签长度才拦得住
+        // Enough bytes follow the pointer to read on as a label of length 192, so only
+        // checking the label's length stops it
+        let mut pointer_with_room = header(1);
+        pointer_with_room.push(0xC0);
+        pointer_with_room.extend_from_slice(&[b'a'; 192]);
+        pointer_with_room.extend_from_slice(&[0, 0, 1, 0, 1]);
+        for (case, packet) in [
+            (
+                "label past the end",
+                [header(1), vec![63, b'a', 0, 0, 1, 0, 1]].concat(),
+            ),
+            (
+                "compression pointer",
+                [header(1), vec![0xC0, 0x0C, 0, 1, 0, 1]].concat(),
+            ),
+            (
+                "no room for type and class",
+                [header(1), vec![0, 0, 1]].concat(),
+            ),
+            ("no question bytes", header(1)),
+            (
+                "compression pointer with bytes behind it",
+                pointer_with_room,
+            ),
+            ("name over 255 bytes", name_too_long),
+        ] {
+            let formerr = reply(&packet).unwrap_or_else(|| panic!("{case}"));
+            assert_eq!(formerr.len(), 12, "{case}");
+            assert_eq!(formerr[3], 0x91, "{case}");
+            assert_eq!(formerr[4..6], [0, 0], "{case}");
+        }
+
+        // 不是标准查询的不回 / What is no standard query gets nothing
+        let mut response = readable.clone();
+        response[2] |= 0x80;
+        let mut other_opcode = readable.clone();
+        other_opcode[2] |= 0x28;
+        let mut with_answers = readable.clone();
+        with_answers[7] = 1;
+        for (case, packet) in [
+            ("too short", vec![0x12, 0x34]),
+            ("no question", header(0)),
+            ("two questions", [header(2), question.to_vec()].concat()),
+            ("a response", response),
+            ("another opcode", other_opcode),
+            ("with answers", with_answers),
+        ] {
+            assert!(reply(&packet).is_none(), "{case}");
+        }
+    }
+
     #[test]
     fn test_listener_servfail_rejects_non_queries_and_malformed_packets() {
         assert!(engine_helpers::try_build_servfail_response_from_wire(&[0x12, 0x34]).is_none());
