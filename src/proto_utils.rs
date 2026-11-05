@@ -1291,6 +1291,13 @@ fn extract_soa_negative_ttl_wire(packet: &[u8], qd_count: u16, ns_count: u16) ->
         }
     }
 
+    soa_negative_ttl_at(packet, pos, ns_count)
+}
+
+/// `pos` 是 Authority 段的开头 / `pos` is where the Authority section starts
+fn soa_negative_ttl_at(packet: &[u8], mut pos: usize, ns_count: u16) -> Option<u32> {
+    let packet_len = packet.len();
+
     // Walk Authority section looking for SOA (type 6) / 遍历 Authority 部分查找 SOA (type 6)
     for _ in 0..ns_count {
         pos = skip_dns_name_wire(packet, pos)?;
@@ -1584,6 +1591,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
 
     let mut pos = 12;
     let packet_len = packet.len();
+    let mut asked = None;
 
     // Skip Questions / 跳过问题部分
     for _ in 0..qd_count {
@@ -1593,6 +1601,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         if pos + 4 > packet_len {
             return None;
         }
+        asked.get_or_insert(u16::from_be_bytes([packet[pos], packet[pos + 1]]));
         pos += 4;
     }
 
@@ -1600,6 +1609,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // There is at least one answer record (an_count 0 returned above), so both get set below
     let mut min_ttl = u32::MAX;
     let mut max_ttl = u32::MIN;
+    let mut only_aliases = true;
 
     // Scan Answers / 扫描应答部分
     for _ in 0..an_count {
@@ -1616,6 +1626,8 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         // Offset 4: TTL / 偏移量 4：TTL
         // Offset 8: RDLen / 偏移量 8：数据长度
 
+        only_aliases &=
+            only_points_elsewhere(u16::from_be_bytes([packet[pos], packet[pos + 1]]), asked);
         let ttl = received_ttl(u32::from_be_bytes([
             packet[pos + 4],
             packet[pos + 5],
@@ -1633,12 +1645,47 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         pos += 10 + rd_len;
     }
 
+    if says_no_despite_answers(rcode, only_aliases) {
+        let negative = soa_negative_ttl_at(packet, pos, ns_count).unwrap_or(0);
+        min_ttl = min_ttl.min(negative);
+        max_ttl = max_ttl.min(negative);
+    }
+
     Some(QuickResponse {
         rcode,
         min_ttl,
         max_ttl,
         truncated,
     })
+}
+
+/// 这条答案记录只把问题指向别处（CNAME、DNAME 和它们的签名），不是在回答问的类型
+/// This answer record only points the question elsewhere (a CNAME, a DNAME, or their
+/// signature) rather than answering the type asked
+#[inline]
+pub(crate) fn only_points_elsewhere(record_type: u16, asked: Option<u16>) -> bool {
+    const CNAME: u16 = 5;
+    const DNAME: u16 = 39;
+    const RRSIG: u16 = 46;
+    const ANY: u16 = 255;
+    matches!(record_type, CNAME | DNAME | RRSIG)
+        && asked.is_some_and(|asked| asked != record_type && asked != ANY)
+}
+
+/// 带答案的应答说的还是「没有」：NXDOMAIN，或者 NOERROR 但答案全是别名，没有问的类型
+/// （RFC 2308 第 2 节）。答案段里的别名可以留到自己的 TTL，这个否定事实只能留到 SOA 的负缓存
+/// TTL（第 5 节），没有 SOA 就不能缓存（第 4 节），整份应答照短的算。
+/// A reply with answers that still says no: NXDOMAIN, or NOERROR whose answers are all
+/// aliases with none of the type asked (RFC 2308 section 2). The aliases may stay for
+/// their own TTLs, but the negative fact only for the SOA's negative TTL (section 5) and
+/// not at all without an SOA (section 4), so the reply as a whole goes by the shorter.
+#[inline]
+pub(crate) fn says_no_despite_answers(
+    rcode: hickory_proto::op::ResponseCode,
+    only_aliases: bool,
+) -> bool {
+    use hickory_proto::op::ResponseCode;
+    rcode == ResponseCode::NXDomain || (rcode == ResponseCode::NoError && only_aliases)
 }
 
 /// Whether a DNS message is a response with the TC (truncated) bit set. TC only means
