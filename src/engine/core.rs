@@ -233,6 +233,7 @@ impl Engine {
                     last_adjustment_ms: AtomicU64::new(0),
                     busy_after: Duration::from_millis(settings.flow_control_latency_threshold_ms),
                     adjustment_interval_ms: settings.flow_control_adjustment_interval_secs * 1000,
+                    memory: super::memory_watermark::MemoryWatermark::of_this_machine(),
                 })),
             )
         } else {

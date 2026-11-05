@@ -23,6 +23,7 @@ mod geo_reload_tests;
 mod inflight_wait_tests;
 pub mod listener;
 pub mod matcher_adapter;
+pub mod memory_watermark;
 #[cfg(test)]
 mod merged_failure_check_tests;
 #[cfg(test)]

@@ -313,16 +313,14 @@ impl Engine {
         }
     }
 
-    /// 一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。上限只在内核忙的时候起作用：
-    /// 上游慢时查询多半在等，内核并不忙，拒绝它们只会让本来能答的答不了
-    /// Whether a query that waits on an upstream can go ahead, `emptied_at` being when the socket last ran
-    /// empty. The limit applies only while the kernel is busy: with a slow upstream the queries mostly wait
-    /// and the kernel is not busy, and refusing them only leaves unanswered what could be answered
+    /// 一个要等上游的查询能不能处理（见 `FlowControlState::permit`）；没开流控时都能处理
+    /// Whether a query that waits on an upstream can go ahead (see `FlowControlState::permit`);
+    /// without flow control it always can
     #[inline]
     pub fn query_permit(&self, emptied_at: Instant) -> Option<PermitGuard> {
         match &self.flow_control_state {
-            Some(state) if state.busy(emptied_at) => self.permit_manager.try_acquire(),
-            _ => Some(self.permit_manager.acquire()),
+            Some(state) => state.permit(&self.permit_manager, emptied_at),
+            None => Some(self.permit_manager.acquire()),
         }
     }
 
