@@ -1,7 +1,7 @@
 //! 流控的内存水位：在途查询多到可能撑爆内存时，看这台机器还剩多少内存，不够了就拒绝新的未命中查询，
 //! 够了自动恢复。不填数字：每台机器读自己的内存（系统的，以及所在 cgroup 的限制）。
 //! 在途查询没到 [`LOOK_FROM_INFLIGHT`] 时不读内存，也不拒绝：日常路径没有开销，其他程序吃内存也不会
-//! 牵连日常查询。之后每来 [`READ_EVERY`] 个未命中读一次，两次之间多出的在途查询有上限，和 CPU 快慢无关。
+//! 牵连日常查询。之后按 [`reads_apart`] 隔一段读一次，两次之间多占的内存和总量成比例，和 CPU 快慢无关。
 //!
 //! Flow control's memory watermark: once enough queries are in flight to threaten the
 //! memory, it looks at how much memory this machine has left, refuses new cache misses
@@ -9,15 +9,15 @@
 //! machine reads its own memory (the system's and any limit of its cgroups).
 //! Under [`LOOK_FROM_INFLIGHT`] queries in flight it neither reads nor refuses: the daily
 //! path pays nothing, and other programs using memory do not hold up daily queries. After
-//! that it reads once per [`READ_EVERY`] misses, which bounds the queries added between two
-//! reads whatever the CPU's speed.
+//! that it reads every [`reads_apart`], which keeps what is added between two reads in
+//! proportion to the total, whatever the CPU's speed.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 /// 在途查询到这么多才开始看内存 / The queries in flight from which memory is looked at
 const LOOK_FROM_INFLIGHT: usize = 1000;
-/// 每这么多个未命中读一次内存 / Memory is read once per this many misses
-const READ_EVERY: usize = 1000;
+/// 还不知道总量时隔多少个读一次 / How many apart reads are while the total is unknown
+const READS_APART_UNKNOWN: usize = 10_000;
 /// 余量：总量的十六分之一，最多这么多字节。机器再大也不必留更多，否则别的程序占着内存时会误伤
 /// The margin: a sixteenth of the total, at most this many bytes. A larger machine needs no
 /// more, and leaving more would refuse queries just because other programs hold memory
@@ -25,9 +25,18 @@ const MAX_MARGIN: u64 = 256 << 20;
 
 /// 一处内存限制：一共多少、还剩多少字节 / One memory limit: its total and what is left, in bytes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MemoryLeft {
-    pub(crate) total: u64,
-    pub(crate) available: u64,
+pub struct MemoryLeft {
+    pub total: u64,
+    pub available: u64,
+}
+
+/// 隔多少个未命中或新连接读一次内存：两次之间多占的不超过总量的 1/32。一个按 12 KB 算，这是这个程序
+/// 自己的开销，和机器无关；只用来定读的频率，不用来判断够不够。
+/// How many misses or new connections apart memory is read: at most a thirty-second of the
+/// total is added between two reads. Each counts as 12 KB, a cost of this program and not of
+/// the machine, used only to pace the reads and not to judge what is enough.
+fn reads_apart(total: u64) -> usize {
+    (total / 32 / (12 << 10)).clamp(100, READS_APART_UNKNOWN as u64) as usize
 }
 
 impl MemoryLeft {
@@ -43,17 +52,17 @@ impl MemoryLeft {
 
 /// 读一次内存的结果 / What one reading of the memory gives
 #[derive(Debug, Default)]
-pub(crate) struct MemoryReading {
+pub struct MemoryReading {
     /// 这个进程占着多少字节 / The bytes this process holds
-    pub(crate) own: u64,
+    pub own: u64,
     /// 所有内存限制，空的表示读不到 / Every memory limit, empty when they cannot be read
-    pub(crate) limits: Vec<MemoryLeft>,
+    pub limits: Vec<MemoryLeft>,
 }
 
 /// 见模块说明 / See the module's description
 pub struct MemoryWatermark {
     read: Box<dyn Fn() -> MemoryReading + Send + Sync>,
-    misses: AtomicUsize,
+    until_read: AtomicIsize,
     low: AtomicBool,
 }
 
@@ -71,10 +80,10 @@ impl MemoryWatermark {
         Self::reading(read)
     }
 
-    pub(crate) fn reading(read: impl Fn() -> MemoryReading + Send + Sync + 'static) -> Self {
+    pub fn reading(read: impl Fn() -> MemoryReading + Send + Sync + 'static) -> Self {
         Self {
             read: Box::new(read),
-            misses: AtomicUsize::new(0),
+            until_read: AtomicIsize::new(1),
             low: AtomicBool::new(false),
         }
     }
@@ -86,12 +95,17 @@ impl MemoryWatermark {
     }
 
     fn looked_at(&self) -> bool {
-        if self
-            .misses
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(READ_EVERY)
-        {
+        if self.until_read.fetch_sub(1, Ordering::Relaxed) <= 1 {
             let reading = (self.read)();
+            let apart = reading
+                .limits
+                .iter()
+                .map(|limit| reads_apart(limit.total))
+                .min();
+            self.until_read.store(
+                apart.unwrap_or(READS_APART_UNKNOWN) as isize,
+                Ordering::Relaxed,
+            );
             let low = reading.limits.iter().any(|limit| limit.is_low(reading.own));
             if self.low.swap(low, Ordering::Relaxed) != low {
                 tracing::warn!(
@@ -374,10 +388,12 @@ mod system {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
 
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
+    /// 下面这些测试的总量 1 GiB 对应的间隔 / How far apart reads are with the 1 GiB of the tests below
+    const READ_EVERY: usize = 2730;
 
     /// 剩余内存可以随时改、还记着读了几次的水位，总量 1 GiB
     /// A watermark over 1 GiB whose free memory can change, counting its reads
@@ -414,6 +430,57 @@ mod tests {
             !low(64 * GIB, 3 * GIB, 200 * MIB),
             "other programs holding the memory do not make it low"
         );
+    }
+
+    #[test]
+    fn reads_are_nearer_together_the_less_memory_there_is() {
+        assert_eq!(reads_apart(GIB), READ_EVERY);
+        assert_eq!(reads_apart(128 * MIB), 341);
+        assert_eq!(reads_apart(16 * MIB), 100, "at least this far apart");
+        assert_eq!(
+            reads_apart(64 * GIB),
+            READS_APART_UNKNOWN,
+            "at most this far apart"
+        );
+    }
+
+    /// 取最小的总量算间隔；读不到时按最大的间隔
+    /// The least total sets how far apart reads are; without one it is the widest
+    #[test]
+    fn the_smallest_limit_paces_the_reads() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&reads);
+        let watermark = MemoryWatermark::reading(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            MemoryReading {
+                own: 0,
+                limits: vec![
+                    MemoryLeft {
+                        total: 16 * GIB,
+                        available: 16 * GIB,
+                    },
+                    MemoryLeft {
+                        total: 128 * MIB,
+                        available: 128 * MIB,
+                    },
+                ],
+            }
+        });
+        for _ in 0..341 * 2 {
+            watermark.has_room(LOOK_FROM_INFLIGHT);
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&reads);
+        let unknown = MemoryWatermark::reading(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            MemoryReading::default()
+        });
+        for _ in 0..READS_APART_UNKNOWN {
+            unknown.has_room(LOOK_FROM_INFLIGHT);
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
 
     #[test]

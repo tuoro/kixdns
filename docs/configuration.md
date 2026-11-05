@@ -46,7 +46,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive 间隔；0 禁用。 |
 | doq_enable_0rtt | true | 全局 DoQ 0-RTT 设置。 |
 | enable_tcp_fallback | true | UDP 失败或截断时用 TCP 重试。 |
-| flow_control_enabled | false | 启用自适应流控：内核忙不过来时，同时处理的查询超过上限就直接回 SERVFAIL。上游慢本身不算忙；内核忙的时候，等上游的查询也计入同时处理的查询数。同时处理的查询超过 1000 个以后还会看内存：系统或所在 cgroup 的可用内存低于内核自身占用的四分之一加总量的十六分之一（后者最多 256 MiB）时，新的未命中查询也回 SERVFAIL，内存回来后恢复。目前只有 Linux 读内存。 |
+| flow_control_enabled | false | 启用自适应流控：内核忙不过来时，同时处理的查询超过上限就直接回 SERVFAIL。上游慢本身不算忙；内核忙的时候，等上游的查询也计入同时处理的查询数。同时处理的查询超过 1000 个以后还会看内存：系统或所在 cgroup 的可用内存低于内核自身占用的四分之一加总量的十六分之一（后者最多 256 MiB）时，新的未命中查询也回 SERVFAIL，内存回来后恢复，UDP、TCP 和 DoH 入站都一样；TCP 和 DoH 的新连接也会直接关闭。目前只有 Linux 读内存。 |
 | flow_control_initial_permits | 500 | 同时处理的查询数上限的初始值，只在内核忙时起作用。 |
 | flow_control_min_permits | 100 | 上限最低收紧到多少。 |
 | flow_control_max_permits | 800 | 上限最高放宽到多少。 |

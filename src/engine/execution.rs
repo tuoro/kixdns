@@ -324,6 +324,19 @@ impl Engine {
         }
     }
 
+    /// TCP 或 DoH 的一条新连接、或它上面一个要等上游的查询能不能处理（见
+    /// `FlowControlState::permit_by_memory`）。连接本身也占内存，所以也算；没开流控时都能处理
+    /// Whether a new TCP or DoH connection, or a query on one that waits on an upstream, can
+    /// go ahead (see `FlowControlState::permit_by_memory`). A connection holds memory too, so
+    /// it counts as well; without flow control it always can
+    #[inline]
+    pub fn stream_query_permit(&self) -> Option<PermitGuard> {
+        match &self.flow_control_state {
+            Some(state) => state.permit_by_memory(&self.permit_manager),
+            None => Some(self.permit_manager.acquire()),
+        }
+    }
+
     /// Get the configured upstream timeout in milliseconds
     /// 获取配置的上游超时时间（毫秒）
     #[inline]

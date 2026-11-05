@@ -45,6 +45,19 @@ impl FlowControlState {
         emptied_at.elapsed() >= self.busy_after
     }
 
+    /// 只看内存：TCP 和 DoH 没有 socket 收空这个信号，也就不看内核忙不忙
+    /// By memory alone: TCP and DoH have no socket running empty to tell by, so whether the
+    /// kernel is busy does not come into it
+    #[inline]
+    pub fn permit_by_memory(&self, manager: &Arc<PermitManager>) -> Option<PermitGuard> {
+        if self.memory.has_room(manager.inflight()) {
+            Some(manager.acquire())
+        } else {
+            manager.count_refused();
+            None
+        }
+    }
+
     /// 忙的时候收紧上限，不忙的时候放宽 / Tightens the limit while busy and loosens it otherwise
     pub fn adjust(&self, permit_manager: &PermitManager, busy: bool) {
         // Get current time in milliseconds
@@ -392,6 +405,30 @@ mod tests {
             adjustment_interval_ms: 0,
             memory: MemoryWatermark::reading(MemoryReading::default),
         }
+    }
+
+    /// TCP 和 DoH 只看内存：内核一直算忙、上限是 0 也放行，内存不够时拒绝并记下
+    /// TCP and DoH go by memory alone: with the kernel always busy and a limit of 0 they go
+    /// ahead, and too little memory refuses and counts them
+    #[test]
+    fn a_stream_query_goes_by_memory_alone() {
+        let manager = Arc::new(PermitManager::new(0));
+        let mut flow = state(0, 0, Duration::ZERO);
+        let plenty = flow.permit_by_memory(&manager);
+        assert!(plenty.is_some());
+        assert_eq!(manager.inflight(), 1, "it counts among those in flight");
+
+        flow.memory = MemoryWatermark::reading(|| MemoryReading {
+            own: 0,
+            limits: vec![MemoryLeft {
+                total: 1 << 30,
+                available: 0,
+            }],
+        });
+        let in_flight: Vec<_> = (0..1000).map(|_| manager.acquire()).collect();
+        assert!(flow.permit_by_memory(&manager).is_none());
+        assert_eq!(manager.dropped_requests(), 1);
+        drop(in_flight);
     }
 
     /// 内存不够时，内核不忙也拒绝并记下；在途查询少时不看内存，照常放行
