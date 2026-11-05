@@ -232,6 +232,47 @@ async fn a_reply_only_hickory_reads_is_still_cached() {
     assert_eq!(up.queries(), 1, "answered from the cache");
 }
 
+/// 带 CNAME 的否定应答只留到 SOA 的负缓存 TTL：之前从缓存答，到点后再问上游（RFC 2308 第 5 节）
+/// A negative reply with a CNAME stays only for the SOA's negative TTL: answered from the
+/// cache until then, and the upstream is asked again after (RFC 2308 section 5)
+#[tokio::test]
+async fn a_negative_reply_with_a_cname_stays_only_for_the_negative_ttl() {
+    let up = upstream(|query| {
+        let target = Name::from_str("target.example.").unwrap();
+        let alias = Record::from_rdata(
+            query.queries[0].name().clone(),
+            3600,
+            RData::CNAME(CNAME(target)),
+        );
+        let mut reply = reply_to(query, ResponseCode::NXDomain, vec![alias]);
+        let zone = Name::from_str("example.").unwrap();
+        reply.add_authority(Record::from_rdata(
+            zone.clone(),
+            1,
+            RData::SOA(SOA::new(zone.clone(), zone, 1, 60, 60, 60, 1)),
+        ));
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    })
+    .await;
+    let engine = engine_from(serde_json::json!({
+        "settings": counting_settings(serde_json::json!({ "min_ttl": 0 })),
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "all",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": up.address }]
+        }]}]
+    }));
+
+    for _ in 0..2 {
+        ask(&engine, "alias.example.", RecordType::A).await;
+    }
+    assert_eq!(up.queries(), 1, "answered from the cache");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    ask(&engine, "alias.example.", RecordType::A).await;
+    assert_eq!(up.queries(), 2, "the negative TTL ran out");
+}
+
 /// 最高位为 1 的 TTL 按 0 算（RFC 2181 第 8 节）：客户端看到 0，应答不缓存；否定应答的 SOA 也一样
 /// A TTL with the top bit set counts as 0 (RFC 2181 section 8): the client sees 0 and
 /// the answer is not cached; so with a negative answer's SOA

@@ -324,6 +324,7 @@ pub(crate) fn make_static_txt_answer(
 pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
     let answer_max = msg.answers.iter().map(|r| received_ttl(r.ttl) as u64).max();
     match answer_max {
+        Some(t) if says_no(msg) => t.min(extract_soa_negative_ttl(msg)),
         Some(t) => t,
         // No answers: negative response (NXDOMAIN/NODATA) — use SOA from authority
         // per RFC 2308 §5 / 无答案：否定响应 (NXDOMAIN/NODATA) — 按 RFC 2308 §5 从 authority 的 SOA 提取
@@ -343,11 +344,27 @@ pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
 pub fn extract_ttl(msg: &Message) -> u64 {
     let answer_min = msg.answers.iter().map(|r| received_ttl(r.ttl) as u64).min();
     match answer_min {
+        Some(t) if says_no(msg) => t.min(extract_soa_negative_ttl(msg)),
         Some(t) => t,
         // No answers: negative response (NXDOMAIN/NODATA) — use SOA from authority
         // per RFC 2308 §5 / 无答案：否定响应 (NXDOMAIN/NODATA) — 按 RFC 2308 §5 从 authority 的 SOA 提取
         None => extract_soa_negative_ttl(msg),
     }
+}
+
+/// 带答案却说「没有」的应答（见 `proto_utils::says_no_despite_answers`）
+/// A reply with answers that still says no (see `proto_utils::says_no_despite_answers`)
+fn says_no(msg: &Message) -> bool {
+    let asked = msg
+        .queries
+        .first()
+        .map(|query| u16::from(query.query_type()));
+    crate::proto_utils::says_no_despite_answers(
+        msg.metadata.response_code,
+        msg.answers.iter().all(|record| {
+            crate::proto_utils::only_points_elsewhere(u16::from(record.record_type()), asked)
+        }),
+    )
 }
 
 /// Extract negative caching TTL from SOA in the authority section (RFC 2308 §5).
@@ -400,6 +417,183 @@ mod tests {
             let (rcode, answers) = make_static_cname_answer(qname, target, 300);
             assert_eq!(rcode, ResponseCode::ServFail);
             assert!(answers.is_empty());
+        }
+    }
+
+    /// 带答案的否定应答：完整解析和快速解析都照 SOA 的负缓存 TTL 算，真正回答了问题的应答不受影响
+    /// A negative reply with answers goes by the SOA's negative TTL in both the full and
+    /// the quick parse, and a reply that does answer the question is unaffected
+    #[test]
+    fn a_reply_with_answers_that_says_no_goes_by_the_soa() {
+        use crate::proto_utils::parse_response_quick;
+        use hickory_proto::op::Query;
+        use hickory_proto::rr::rdata::NULL;
+        let name = Name::from_str("alias.example.com.").unwrap();
+        let target = Name::from_str("target.example.com.").unwrap();
+        let cname =
+            |ttl| Record::from_rdata(name.clone(), ttl, RData::CNAME(CNAME(target.clone())));
+        let by_code = |code, ttl| {
+            let unknown = RData::Unknown {
+                code: RecordType::Unknown(code),
+                rdata: NULL::with(vec![0]),
+            };
+            Record::from_rdata(name.clone(), ttl, unknown)
+        };
+        let a = |ttl| {
+            Record::from_rdata(
+                target.clone(),
+                ttl,
+                RData::A(A(std::net::Ipv4Addr::LOCALHOST)),
+            )
+        };
+        let aaaa = |ttl| {
+            Record::from_rdata(
+                name.clone(),
+                ttl,
+                RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
+            )
+        };
+        let cases = vec![
+            (
+                "NXDOMAIN 带 CNAME",
+                RecordType::A,
+                ResponseCode::NXDomain,
+                vec![cname(3600)],
+                Some((10, 10)),
+                (10, 10),
+            ),
+            (
+                "NODATA 带 CNAME",
+                RecordType::A,
+                ResponseCode::NoError,
+                vec![cname(3600)],
+                Some((10, 10)),
+                (10, 10),
+            ),
+            (
+                "SOA 的 TTL 比 MINIMUM 短",
+                RecordType::A,
+                ResponseCode::NoError,
+                vec![cname(3600)],
+                Some((5, 60)),
+                (5, 5),
+            ),
+            (
+                "SOA 的 MINIMUM 比 TTL 短",
+                RecordType::A,
+                ResponseCode::NXDomain,
+                vec![cname(3600)],
+                Some((60, 5)),
+                (5, 5),
+            ),
+            (
+                "CNAME 比负缓存短",
+                RecordType::A,
+                ResponseCode::NoError,
+                vec![cname(5)],
+                Some((60, 60)),
+                (5, 5),
+            ),
+            (
+                "多级 CNAME",
+                RecordType::A,
+                ResponseCode::NXDomain,
+                vec![cname(3600), cname(600)],
+                Some((60, 60)),
+                (60, 60),
+            ),
+            (
+                "CNAME 加它的签名",
+                RecordType::A,
+                ResponseCode::NoError,
+                vec![cname(3600), by_code(46, 3600)],
+                Some((60, 60)),
+                (60, 60),
+            ),
+            (
+                "DNAME 加 CNAME",
+                RecordType::AAAA,
+                ResponseCode::NoError,
+                vec![by_code(39, 3600), cname(600)],
+                Some((60, 60)),
+                (60, 60),
+            ),
+            (
+                "NXDOMAIN 带 CNAME 没有 SOA",
+                RecordType::A,
+                ResponseCode::NXDomain,
+                vec![cname(3600)],
+                None,
+                (0, 0),
+            ),
+            (
+                "NODATA 带 CNAME 没有 SOA",
+                RecordType::A,
+                ResponseCode::NoError,
+                vec![cname(3600)],
+                None,
+                (0, 0),
+            ),
+            (
+                "CNAME 链有结果",
+                RecordType::A,
+                ResponseCode::NoError,
+                vec![cname(3600), a(300)],
+                Some((10, 10)),
+                (300, 3600),
+            ),
+            (
+                "问的就是 CNAME",
+                RecordType::CNAME,
+                ResponseCode::NoError,
+                vec![cname(3600)],
+                Some((10, 10)),
+                (3600, 3600),
+            ),
+            (
+                "问的是 ANY",
+                RecordType::ANY,
+                ResponseCode::NoError,
+                vec![cname(3600)],
+                Some((10, 10)),
+                (3600, 3600),
+            ),
+            (
+                "答案是别的类型",
+                RecordType::A,
+                ResponseCode::NoError,
+                vec![aaaa(300)],
+                Some((10, 10)),
+                (300, 300),
+            ),
+        ];
+        for (case, qtype, rcode, answers, soa, expected) in cases {
+            let mut msg = Message::new(7, MessageType::Response, OpCode::Query);
+            msg.metadata.response_code = rcode;
+            msg.add_query(Query::query(name.clone(), qtype));
+            for answer in answers {
+                msg.add_answer(answer);
+            }
+            if let Some((ttl, minimum)) = soa {
+                let mname = Name::from_str("ns.example.com.").unwrap();
+                let soa = SOA::new(mname.clone(), mname, 1, 3600, 900, 1209600, minimum);
+                msg.add_authority(Record::from_rdata(
+                    Name::from_str("example.com.").unwrap(),
+                    ttl,
+                    RData::SOA(soa),
+                ));
+            }
+            assert_eq!(
+                (extract_ttl(&msg), extract_ttl_for_refresh(&msg)),
+                expected,
+                "完整解析：{case}"
+            );
+            let quick = parse_response_quick(&msg.to_vec().unwrap()).unwrap();
+            assert_eq!(
+                (quick.min_ttl as u64, quick.max_ttl as u64),
+                expected,
+                "快速解析：{case}"
+            );
         }
     }
 
