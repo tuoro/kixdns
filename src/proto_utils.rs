@@ -1,5 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::Message;
+use hickory_proto::rr::Record;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 
 /// 快速解析结果，零拷贝实现 / Quick parse result with zero-copy implementation
@@ -1689,25 +1690,42 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
     }
 
     if let Ok(mut response) = Message::from_bytes(response_packet) {
-        // Do not advertise a larger UDP payload in the response than the client
-        // offered in its request.
-        if let Some(edns) = response.edns.as_mut() {
+        // 客户端带了 OPT 的查询，应答也要带（RFC 6891 第 6.1.1 节）。hickory 把 OPT 放在最后，放不下
+        // 就整条丢掉，所以先单独编好，给它留出位置，其余的记录能放多少放多少。
+        // A query with an OPT needs one in its reply (RFC 6891 section 6.1.1). hickory
+        // emits the OPT last and drops it whole when it does not fit, so it is encoded
+        // apart first and its room kept, the other records taking what is left.
+        let opt = response.edns.take().and_then(|mut edns| {
+            // Do not advertise a larger UDP payload in the response than the client
+            // offered in its request.
             edns.set_max_payload(max_payload as u16);
-        }
+            let mut wire = Vec::new();
+            Record::from(&edns)
+                .emit(&mut BinEncoder::new(&mut wire))
+                .ok()
+                .map(|()| wire)
+        });
+        let opt = opt.unwrap_or_default();
+        let room = max_payload.saturating_sub(opt.len());
 
         let mut out = Vec::with_capacity(max_payload);
         let encoded = {
             let mut encoder = BinEncoder::new(&mut out);
-            encoder.set_max_size(max_payload as u16);
+            encoder.set_max_size(room as u16);
             response.emit(&mut encoder)
         };
-        if encoded.is_ok() && out.len() <= max_payload {
+        if encoded.is_ok() && out.len() <= room {
             // hickory's rollback does not shrink the backing buffer, so the
             // output can carry partial bytes from the record that did not fit.
             // Trim to the last complete record boundary from the corrected
             // header counts; fall back to the raw output if the walk fails.
             if let Some(valid_len) = valid_message_len(&out) {
                 out.truncate(valid_len);
+            }
+            if !opt.is_empty() {
+                out.extend_from_slice(&opt);
+                let additional = section_count(&out, 3) as u16 + 1;
+                out[10..12].copy_from_slice(&additional.to_be_bytes());
             }
             return Some(Bytes::from(out));
         }
@@ -2226,6 +2244,95 @@ mod tests {
             Some(truncated.len()),
             "truncated response must end exactly at a record boundary"
         );
+    }
+
+    /// 客户端带 OPT 时，截断的应答不管放得下几条记录都带 OPT，载荷写客户端声明的，也不超过它
+    /// A reply truncated for a client that sent an OPT carries one however many records
+    /// fit, giving the payload the client declared and staying within it
+    #[test]
+    fn a_truncated_reply_keeps_its_opt() {
+        for payload in [512u16, 513, 523, 600, 1232] {
+            let request = txt_query(Some(payload));
+            for answers in 3..30 {
+                let response = large_txt_response(answers);
+                if response.len() <= payload as usize {
+                    continue;
+                }
+                let truncated = truncate_udp_response(&request, &response).expect("must truncate");
+                let case = format!("payload {payload}, {answers} answers");
+                assert!(truncated.len() <= payload as usize, "{case}");
+                assert_eq!(
+                    valid_message_len(&truncated),
+                    Some(truncated.len()),
+                    "{case}"
+                );
+                let decoded = Message::from_bytes(&truncated).expect("valid truncated response");
+                assert!(decoded.metadata.truncation, "{case}");
+                assert_eq!(section_count(&truncated, 3), 1, "{case}");
+                let edns = decoded
+                    .edns
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{case}: no OPT"));
+                assert_eq!(edns.max_payload(), payload, "{case}");
+            }
+        }
+    }
+
+    /// 记录小到能把载荷填到只差几个字节时，也给 OPT 留出了位置
+    /// With records small enough to fill the payload to within a few bytes, the OPT's room is
+    /// still kept
+    #[test]
+    fn a_truncated_reply_keeps_room_for_its_opt_when_small_records_fill_it() {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{Name, RData, RecordType};
+        use std::str::FromStr;
+
+        let name = Name::from_str("cloudflare.com.").unwrap();
+        let mut message = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        message.add_query(Query::query(name.clone(), RecordType::TXT));
+        for last in 0..=99 {
+            message.add_answer(Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(A::new(192, 0, 2, last)),
+            ));
+        }
+        let mut edns = Edns::new();
+        edns.set_max_payload(4096);
+        message.set_edns(edns);
+        let response = encode_message(&message);
+
+        // 一条 A 记录 16 字节，这个范围把离上限还差几个字节的情况都走到了
+        // An A record takes 16 bytes, so this range meets every distance from the limit
+        for payload in 512u16..=540 {
+            let truncated =
+                truncate_udp_response(&txt_query(Some(payload)), &response).expect("must truncate");
+            assert!(truncated.len() <= payload as usize, "payload {payload}");
+            let decoded = Message::from_bytes(&truncated).expect("valid truncated response");
+            assert!(decoded.metadata.truncation, "payload {payload}");
+            assert_eq!(
+                decoded.edns.as_ref().map(|edns| edns.max_payload()),
+                Some(payload)
+            );
+            assert!(
+                truncated.len() + 16 > payload as usize,
+                "payload {payload}: room for another record went unused ({} bytes)",
+                truncated.len()
+            );
+        }
+    }
+
+    /// 扩展 RCODE 在 OPT 里，截断时不能丢 / The extended RCODE lives in the OPT, and truncating keeps it
+    #[test]
+    fn a_truncated_reply_keeps_its_extended_rcode() {
+        use hickory_proto::op::ResponseCode;
+        let mut response = Message::from_bytes(&large_txt_response(20)).unwrap();
+        response.metadata.response_code = ResponseCode::BADVERS;
+        let truncated = truncate_udp_response(&txt_query(Some(512)), &encode_message(&response))
+            .expect("must truncate");
+        let decoded = Message::from_bytes(&truncated).expect("valid truncated response");
+        assert_eq!(u16::from(decoded.metadata.response_code), 16);
     }
 
     #[test]
