@@ -268,3 +268,30 @@ async fn a_ttl_with_the_top_bit_set_counts_as_zero() {
         assert_eq!(up.queries(), 2 * round, "round {round}: nothing cached");
     }
 }
+
+/// 响应动作的 forward 没写 upstream 时用 default_upstream，手上已有应答时也一样
+/// A response action's forward without an upstream uses default_upstream, also with an
+/// answer in hand
+#[tokio::test]
+async fn a_response_forward_without_an_upstream_goes_to_the_default_upstream() {
+    let (first_address, default_address) =
+        (Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2));
+    let first = support::answering_upstream(first_address, 60).await;
+    let default = support::answering_upstream(default_address, 60).await;
+    let engine = engine_from(serde_json::json!({
+        "settings": counting_settings(serde_json::json!({ "default_upstream": default.address })),
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "ask again",
+            "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": first.address }],
+            "response_matchers": [{ "type": "response_answer_ip", "cidr": "192.0.2.1/32" }],
+            "response_actions_on_match": [{ "type": "forward" }],
+            "response_actions_on_miss": [{ "type": "allow" }]
+        }] }]
+    }));
+
+    let reply = support::ask(&engine, &query("again.test", RecordType::A), peer()).await;
+
+    assert_eq!(support::first_a(&reply), Some(default_address));
+    assert_eq!((first.queries(), default.queries()), (1, 1));
+}
