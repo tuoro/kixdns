@@ -558,15 +558,12 @@ async fn run_response_actions(
                     return response_action_servfail(ctx.req);
                 }
 
-                let upstream_addr: Arc<str> = upstream
-                    .as_ref()
-                    .map(|s| Arc::from(s.as_str()))
-                    .unwrap_or_else(|| {
-                        ctx.ctx_opt
-                            .as_ref()
-                            .map(|c| c.upstream.clone())
-                            .unwrap_or_else(|| Arc::from(ctx.upstream_default))
-                    });
+                // 手上应答记的来源（`udp:1.1.1.1:53`）不是能发查询的地址，所以没写 upstream 时和请求
+                // 阶段一样用 default_upstream
+                // Where the answer in hand came from (`udp:1.1.1.1:53`) is no address to query,
+                // so without an upstream this uses default_upstream as the request phase does
+                let upstream_addr: Arc<str> =
+                    Arc::from(upstream.as_deref().unwrap_or(ctx.upstream_default));
                 let use_transport = transport.unwrap_or(Transport::Udp);
                 let (raw, actual_upstream) = match crate::engine::upstream::forward_upstream(
                     ctx.engine,
