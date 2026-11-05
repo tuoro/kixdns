@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 /// 查询在内核里排队超过这么久，就算内核跟不上。这是延迟目标，和机器无关：快机器和慢机器都一样
 /// Queries waiting longer than this inside the kernel means it cannot keep up. This is a
 /// latency goal rather than a property of the machine, the same on a fast one and a slow one
-const QUEUE_TARGET: Duration = Duration::from_millis(20);
+pub const QUEUE_TARGET: Duration = Duration::from_millis(20);
 
 /// 流控的状态。不用填数字，判断都来自运行时测到的：socket 收不收得空、查询排队多久、还剩多少内存
 /// The state of flow control. There are no numbers to fill in: it goes by what is measured at

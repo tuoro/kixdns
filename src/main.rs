@@ -160,6 +160,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kixdns::config::{DohListenerConfig, ListenerConfig, load_config_with_source};
+use kixdns::engine::concurrency::QUEUE_TARGET;
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, write_cache_hit};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{ClientTransport, EngineObserver, TracingObserver};
@@ -1045,17 +1046,50 @@ struct UdpAnswering<'a> {
     buffer_shrunk: bool,
     /// 这一段积压里上次读到的丢包数 / The drop count last read during this backlog
     drops_seen: Option<u32>,
+    /// 上次读丢包数的时刻，到下一次之间处理了多少查询是定数，这就量出了处理速度
+    /// When the drops were last read; a set number of queries is handled until the next read, which gives the speed
+    looked_at: Instant,
+    /// 接收缓冲收小以后上次见到丢包的时刻 / When drops were last seen since the receive buffer shrank
+    dropped_at: Instant,
 }
 
-/// 每 100 个查询看一次接收缓冲，连续这么多次 socket 都没收空才去读丢包数，平时不多这一次系统调用
-/// The receive buffer is looked at every 100 queries, and the drops are only read after this many looks in a row
-/// without the socket running empty, sparing the usual path that system call
+/// 每 100 个查询看一次接收缓冲，看到这么多次的整数倍、socket 还没收空就读一次丢包数，平时不多这一次系统调用
+/// The receive buffer is looked at every 100 queries, and at every multiple of this many looks without the socket
+/// running empty the drops are read, sparing the usual path that system call
 const BEHIND_AFTER_CHECKS: u32 = 10;
 
-/// 缓冲满到丢包时收到这么小。处理不完的查询反正要丢，缓冲越大，答得上的那些排得越久
-/// The size the receive buffer shrinks to once full enough to drop. What cannot be handled gets dropped anyway,
-/// and the larger the buffer the longer the queries that do get answered wait in line
-const BEHIND_RECV_BUFFER: usize = 512 * 1024;
+/// 一个小查询在接收缓冲里算多少字节：内核给每个小报文记 960 字节，再把 `SO_RCVBUF` 的值翻倍当上限。网卡收进来的报文记得
+/// 更多，放得下的少，排队只会更短
+/// What a small query counts for in the receive buffer: the kernel charges a small datagram 960 bytes and doubles
+/// the `SO_RCVBUF` value for its limit. A datagram from a network card is charged more, so fewer fit and the wait
+/// only gets shorter
+const RECV_BUFFER_PER_QUERY: usize = 480;
+
+/// 接收缓冲至少放得下这么多查询（两批）/ The receive buffer holds at least this many queries (two batches)
+const MIN_QUERIES_IN_RECV_BUFFER: usize = 64;
+
+/// 丢包停了这么久才算跟上。缓冲收小以后只排 `QUEUE_TARGET` 那么多，到达有一小段空档就会收空；这时放回大缓冲，下一波要排
+/// 满它才会再收小，这段时间答的都要排很久
+/// Drops have to stop for this long to count as having caught up. Once shrunk the buffer holds
+/// only `QUEUE_TARGET`, so a short gap in arrivals runs it empty; putting the large buffer back
+/// then means the next wave has to fill it before it shrinks again, and what gets answered
+/// meanwhile waits long
+const CAUGHT_UP_AFTER: Duration = Duration::from_secs(1);
+
+/// 缓冲满到丢包时收到多小，`took` 是处理 `BEHIND_AFTER_CHECKS` 次看缓冲之间那些查询用的时间：正好放得下这台机器
+/// `QUEUE_TARGET` 内处理得完的查询。处理不完的查询反正要丢，缓冲越大，答得上的那些排得越久
+/// How small the receive buffer gets once full enough to drop, `took` being how long the queries between
+/// `BEHIND_AFTER_CHECKS` looks took: just what this machine handles within `QUEUE_TARGET`. What cannot be handled
+/// gets dropped anyway, and the larger the buffer the longer the queries that do get answered wait in line
+fn recv_buffer_when_behind(took: Duration) -> usize {
+    let handled = u128::from(BEHIND_AFTER_CHECKS) * 100;
+    let queries = handled * QUEUE_TARGET.as_nanos() / took.as_nanos().max(1);
+    usize::try_from(queries)
+        .unwrap_or(usize::MAX)
+        .max(MIN_QUERIES_IN_RECV_BUFFER)
+        .saturating_mul(RECV_BUFFER_PER_QUERY)
+        .min(UDP_BUFFER_SIZE)
+}
 
 impl UdpAnswering<'_> {
     /// 积压着、而且这段时间在丢包，就把接收缓冲收小，排队的时间短下来。只看积压不够：贴着处理能力时队列积压了也消化得完，
@@ -1065,19 +1099,24 @@ impl UdpAnswering<'_> {
     /// would throw queries away for nothing
     fn shrink_buffer_if_overflowing(&mut self) {
         self.checks_since_empty += 1;
-        if self.buffer_shrunk || self.checks_since_empty < BEHIND_AFTER_CHECKS {
+        if !self.checks_since_empty.is_multiple_of(BEHIND_AFTER_CHECKS) {
             return;
         }
+        let now = Instant::now();
+        let took = now.duration_since(std::mem::replace(&mut self.looked_at, now));
         let Some(drops) = kixdns::socket_utils::udp_receive_drops(self.socket) else {
             return;
         };
-        if self
+        let dropping = self
             .drops_seen
             .replace(drops)
-            .is_some_and(|seen| seen != drops)
-        {
-            self.set_recv_buffer(BEHIND_RECV_BUFFER);
+            .is_some_and(|seen| seen != drops);
+        // 这一段积压第一次看：到上一次之间可能空闲过，量不出速度 / The first look of this backlog: it may
+        // have been idle since the last, so this measures no speed
+        if dropping && self.checks_since_empty > BEHIND_AFTER_CHECKS {
+            self.set_recv_buffer(recv_buffer_when_behind(took));
             self.buffer_shrunk = true;
+            self.dropped_at = now;
         }
     }
 
@@ -1088,21 +1127,29 @@ impl UdpAnswering<'_> {
         }
     }
 
-    /// socket 收空了，刚等到新东西：等的这段时间不算没收空，否则空闲之后的第一个查询就算内核忙。跟得上了，接收缓冲
+    /// socket 收空了，刚等到新东西：等的这段时间不算没收空，否则空闲之后的第一个查询就算内核忙。丢包停得够久，接收缓冲
     /// 也放回去接突发
     /// The socket ran empty and the wait just ended: the wait does not count as not running empty, or the first
-    /// query after a quiet spell would find the kernel busy. Keeping up again, the receive buffer goes back to
-    /// catching bursts
+    /// query after a quiet spell would find the kernel busy. With the drops stopped long enough, the receive buffer
+    /// goes back to catching bursts
     #[inline]
     fn socket_ran_empty(&mut self) {
         if self.engine.flow_control_state.is_some() {
             self.emptied_at = Instant::now();
         }
         self.checks_since_empty = 0;
-        self.drops_seen = None;
-        if self.buffer_shrunk {
+        if !self.buffer_shrunk {
+            self.drops_seen = None;
+            return;
+        }
+        let drops = kixdns::socket_utils::udp_receive_drops(self.socket);
+        if drops != self.drops_seen {
+            self.drops_seen = drops;
+            self.dropped_at = Instant::now();
+        } else if self.dropped_at.elapsed() >= CAUGHT_UP_AFTER {
             self.set_recv_buffer(UDP_BUFFER_SIZE);
             self.buffer_shrunk = false;
+            self.drops_seen = None;
         }
     }
 
@@ -1198,6 +1245,8 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         checks_since_empty: 0,
         buffer_shrunk: false,
         drops_seen: None,
+        looked_at: Instant::now(),
+        dropped_at: Instant::now(),
     };
     let mut received_in_row = 0;
     loop {
@@ -1305,6 +1354,8 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
         checks_since_empty: 0,
         buffer_shrunk: false,
         drops_seen: None,
+        looked_at: Instant::now(),
+        dropped_at: Instant::now(),
     };
     let mut received_in_row = 0;
     loop {
@@ -2418,28 +2469,58 @@ mod tests {
             pending: &pending,
             request_count: 0,
             emptied_at: Instant::now(),
-            checks_since_empty: BEHIND_AFTER_CHECKS - 1,
+            checks_since_empty: 0,
             buffer_shrunk: false,
             drops_seen: None,
+            looked_at: Instant::now(),
+            dropped_at: Instant::now(),
+        };
+        // 看一次丢包数：处理那些查询用了一秒 / One reading of the drops: the queries took a second
+        let look = |answering: &mut UdpAnswering<'_>| {
+            answering.checks_since_empty = 2 * BEHIND_AFTER_CHECKS - 1;
+            answering.looked_at = Instant::now() - Duration::from_secs(1);
+            answering.shrink_buffer_if_overflowing();
         };
 
         // 积压着、队列还在涨，但没丢包 / Backed up with the queue still growing, but no drops
-        answering.shrink_buffer_if_overflowing();
+        look(&mut answering);
         client.send_to(&[0u8; 64], target).await.unwrap();
-        answering.shrink_buffer_if_overflowing();
+        look(&mut answering);
         assert!(!answering.buffer_shrunk, "no drops");
         assert_eq!(size(), full);
 
         overflow().await;
-        answering.shrink_buffer_if_overflowing();
+        answering.dropped_at = Instant::now() - Duration::from_secs(3600);
+        look(&mut answering);
         assert!(answering.buffer_shrunk);
-        // 系统不让开大缓冲时（`rmem_max`）收小没有分别 / With the system not allowing a large buffer
-        // (`rmem_max`), shrinking makes no difference
-        assert!(size() <= full);
-        if full > 2 * BEHIND_RECV_BUFFER {
-            assert!(size() < full, "{} of {full}", size());
-        }
+        assert!(
+            answering.dropped_at.elapsed() < Duration::from_secs(60),
+            "noted"
+        );
+        let shrunk = size();
+        assert!(shrunk < full, "{shrunk} of {full}");
 
+        // 这一段积压第一次看量不出速度，不动缓冲 / The first look of a backlog measures no speed and leaves the buffer
+        overflow().await;
+        answering.checks_since_empty = BEHIND_AFTER_CHECKS - 1;
+        answering.looked_at = Instant::now() - Duration::from_millis(1);
+        answering.shrink_buffer_if_overflowing();
+        assert_eq!(size(), shrunk);
+
+        // 刚才还在丢包，收空了也不放回去；又丢了就重新算 / Dropping a moment ago, running empty does not put
+        // it back; new drops start the wait over
+        let long_ago = || Instant::now() - CAUGHT_UP_AFTER - Duration::from_millis(1);
+        answering.dropped_at = Instant::now();
+        answering.socket_ran_empty();
+        assert!(answering.buffer_shrunk, "dropping a moment ago");
+        overflow().await;
+        answering.dropped_at = long_ago();
+        answering.socket_ran_empty();
+        assert!(answering.buffer_shrunk, "new drops");
+        assert_eq!(size(), shrunk);
+
+        // 丢包停得够久才放回去 / Only with the drops stopped long enough does it go back
+        answering.dropped_at = long_ago();
         answering.socket_ran_empty();
         assert!(!answering.buffer_shrunk);
         assert_eq!(size(), full);
@@ -2452,20 +2533,44 @@ mod tests {
 
         // 上一段积压留下的丢包数不算：新的一段先记下来 / The drops left from an earlier backlog do not count:
         // a new backlog first notes the count
-        answering.checks_since_empty = BEHIND_AFTER_CHECKS - 1;
-        answering.shrink_buffer_if_overflowing();
+        look(&mut answering);
         assert!(!answering.buffer_shrunk, "old drops");
 
-        // 每 100 个查询看一次 / Looked at once every 100 queries
+        // 每 1000 个查询读一次丢包数 / The drops are read once every 1000 queries
         overflow().await;
         let peer = SocketAddr::from(([127, 0, 0, 1], 53000));
         let mut reply = BytesMut::new();
-        for id in 0..99 {
+        answering.checks_since_empty = BEHIND_AFTER_CHECKS;
+        answering.looked_at = Instant::now() - Duration::from_secs(1);
+        for id in 0..999 {
             answering.answer(&query("a.test", id), peer, &mut reply);
         }
         assert!(!answering.buffer_shrunk);
-        answering.answer(&query("a.test", 99), peer, &mut reply);
+        answering.answer(&query("a.test", 999), peer, &mut reply);
         assert!(answering.buffer_shrunk);
+    }
+
+    /// 收小以后放得下的正好是这台机器 20 ms 处理得完的查询，机器越慢缓冲越小
+    /// Once shrunk it holds just what this machine handles in 20 ms, so the slower the machine the smaller the buffer
+    #[test]
+    fn the_shrunk_receive_buffer_follows_the_speed() {
+        // 每秒 5 万个，20 ms 是 1000 个 / At 50k a second, 20 ms is 1000
+        assert_eq!(
+            recv_buffer_when_behind(Duration::from_millis(20)),
+            1000 * RECV_BUFFER_PER_QUERY
+        );
+        // 每秒 1 万个，20 ms 是 200 个 / At 10k a second, 20 ms is 200
+        assert_eq!(
+            recv_buffer_when_behind(Duration::from_millis(100)),
+            200 * RECV_BUFFER_PER_QUERY
+        );
+        // 再慢也放得下两批 / However slow it holds two batches
+        assert_eq!(
+            recv_buffer_when_behind(Duration::from_secs(60)),
+            MIN_QUERIES_IN_RECV_BUFFER * RECV_BUFFER_PER_QUERY
+        );
+        // 再快也不比平时大 / However fast it is no larger than usual
+        assert_eq!(recv_buffer_when_behind(Duration::ZERO), UDP_BUFFER_SIZE);
     }
 
     /// 空闲了很久以后来的查询不算内核忙：等新报文的时间不算没收空。两种循环都这样
@@ -2566,6 +2671,8 @@ mod tests {
             checks_since_empty: 0,
             buffer_shrunk: false,
             drops_seen: None,
+            looked_at: Instant::now(),
+            dropped_at: Instant::now(),
         };
         let peer = UdpSocket::bind("127.0.0.1:0")
             .await
