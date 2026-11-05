@@ -12,9 +12,29 @@ pub struct FlowControlState {
     /// socket 连续这么久没收空就算忙 / How long a socket goes without running empty before that counts as busy
     pub busy_after: Duration,
     pub adjustment_interval_ms: u64,
+    pub memory: super::memory_watermark::MemoryWatermark,
 }
 
 impl FlowControlState {
+    /// 一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝；上限只在内核
+    /// 忙的时候起作用：上游慢时查询多半在等，内核并不忙，拒绝它们只会让本来能答的答不了
+    /// Whether a query that waits on an upstream can go ahead, `emptied_at` being when the socket
+    /// last ran empty. Too little memory refuses it. The limit applies only while the kernel is
+    /// busy: with a slow upstream the queries mostly wait and the kernel is not busy, and refusing
+    /// them only leaves unanswered what could be answered
+    #[inline]
+    pub fn permit(&self, manager: &Arc<PermitManager>, emptied_at: Instant) -> Option<PermitGuard> {
+        if !self.memory.has_room(manager.inflight()) {
+            manager.count_refused();
+            return None;
+        }
+        if self.busy(emptied_at) {
+            manager.try_acquire()
+        } else {
+            Some(manager.acquire())
+        }
+    }
+
     /// 内核忙不忙，`emptied_at` 是 socket 上次收空的时刻。内核跟不上，socket 才会一直收不空；上游慢不算，
     /// 那时查询都在等上游，socket 照样收得空
     /// Whether the kernel is busy, `emptied_at` being when the socket last ran empty. Only a kernel falling
@@ -141,6 +161,11 @@ impl PermitManager {
     pub fn acquire(self: &Arc<Self>) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
         PermitGuard::new(Arc::clone(self))
+    }
+
+    /// 记下一个没走到这里就被拒绝的查询 / Counts a query refused before it got here
+    pub fn count_refused(&self) {
+        self.dropped_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Try to acquire a permit without blocking / 非阻塞地尝试获取 permit
@@ -356,6 +381,7 @@ impl Drop for PermitGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::memory_watermark::{MemoryLeft, MemoryReading, MemoryWatermark};
 
     fn state(min: usize, max: usize, busy_after: Duration) -> FlowControlState {
         FlowControlState {
@@ -364,7 +390,46 @@ mod tests {
             last_adjustment_ms: AtomicU64::new(0),
             busy_after,
             adjustment_interval_ms: 0,
+            memory: MemoryWatermark::reading(MemoryReading::default),
         }
+    }
+
+    /// 内存不够时，内核不忙也拒绝并记下；在途查询少时不看内存，照常放行
+    /// Too little memory refuses and counts a query even with the kernel not busy; with few
+    /// queries in flight memory is not looked at and they go ahead
+    #[test]
+    fn too_little_memory_refuses_a_query_even_when_not_busy() {
+        let manager = Arc::new(PermitManager::new(500));
+        let mut flow = state(100, 800, Duration::from_secs(3600));
+        flow.memory = MemoryWatermark::reading(|| MemoryReading {
+            own: 0,
+            limits: vec![MemoryLeft {
+                total: 1 << 30,
+                available: 0,
+            }],
+        });
+
+        let mut in_flight: Vec<_> = (0..999)
+            .map(|_| {
+                flow.permit(&manager, Instant::now())
+                    .expect("few in flight")
+            })
+            .collect();
+        in_flight.push(
+            flow.permit(&manager, Instant::now())
+                .expect("the last under the floor"),
+        );
+        assert_eq!(manager.dropped_requests(), 0);
+
+        assert!(flow.permit(&manager, Instant::now()).is_none());
+        assert_eq!(manager.dropped_requests(), 1);
+        assert_eq!(manager.inflight(), 1000, "a refused query holds no permit");
+
+        in_flight.truncate(999);
+        assert!(
+            flow.permit(&manager, Instant::now()).is_some(),
+            "under the floor again"
+        );
     }
 
     /// 从上次收空算起够久了才算忙；阈值是 0 时一直算忙
