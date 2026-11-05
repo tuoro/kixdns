@@ -108,12 +108,17 @@ pub async fn run_doh_with_listener(
         // small writes, and with Nagle on a later one waits for the peer's delayed ACK, adding
         // about 40 ms to the first request on a new connection
         stream.set_nodelay(true).ok();
+        // 内存不够时不接新连接，已有的连接照常 / With too little memory no new connection is taken, and those there go on
+        let Some(permit) = engine.stream_query_permit() else {
+            continue;
+        };
         // Snapshot the current acceptor for this connection; in-flight
         // connections keep serving with the certificate they were established with.
         let acceptor = acceptor.load_full();
         let engine = Arc::clone(&engine);
         let doh_path = Arc::clone(&doh_path);
         tokio::spawn(async move {
+            let _permit = permit;
             match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls_stream)) => {
                     // 客户端在握手时选了 h2 就走 HTTP/2，否则 HTTP/1.1 / HTTP/2 when the client
@@ -381,6 +386,9 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             return empty_dns_response(packet);
         }
     };
+    let Some(_permit) = engine.stream_query_permit() else {
+        return empty_dns_response(packet);
+    };
     // 要等上游的这一路放到堆上：它的状态有 4 KB 多，留在每个请求的 future 里，当场答完的请求也要跟着
     // 搬一遍，HTTP/2 下每个请求还要按这个大小分配
     // The path that waits on an upstream goes on the heap: its state is over 4 KB, and left inside
@@ -585,6 +593,155 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let resp = error_response(StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// 开着流控、转发给 `upstream` 的引擎，在途已有 1000 个查询，内存剩 `available` 字节
+    /// An engine with flow control forwarding to `upstream`, with 1000 queries in flight and
+    /// `available` bytes of memory left
+    fn engine_with_memory(
+        upstream: SocketAddr,
+        available: u64,
+    ) -> (Engine, Vec<crate::engine::concurrency::PermitGuard>) {
+        use crate::engine::memory_watermark::{MemoryLeft, MemoryReading, MemoryWatermark};
+        let config: crate::config::PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": {
+                "default_upstream": upstream.to_string(),
+                "upstream_timeout_ms": 3000,
+                "enable_tcp_fallback": false,
+                "flow_control_enabled": true
+            },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "all",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream.to_string() }]
+            }]}]
+        }))
+        .unwrap();
+        let mut engine = Engine::new(
+            crate::matcher::RuntimePipelineConfig::from_config(config).unwrap(),
+            "test".to_string(),
+        )
+        .unwrap();
+        Arc::get_mut(engine.flow_control_state.as_mut().unwrap())
+            .unwrap()
+            .memory = MemoryWatermark::reading(move || MemoryReading {
+            own: 0,
+            limits: vec![MemoryLeft {
+                total: 1 << 30,
+                available,
+            }],
+        });
+        let in_flight = (0..1000).map(|_| engine.permit_manager.acquire()).collect();
+        (engine, in_flight)
+    }
+
+    /// DoH 进来的查询也看内存：不够时当场回 SERVFAIL，不问上游；够的话算在途，在问上游
+    /// A query from DoH goes by memory too: with too little it gets SERVFAIL at once and the
+    /// upstream is not asked; with enough it counts as in flight and asks the upstream
+    #[tokio::test]
+    async fn a_doh_query_is_refused_when_memory_is_short() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RecordType};
+        use hickory_proto::serialize::binary::BinDecodable;
+        use std::str::FromStr;
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let mut request = Message::new(7, MessageType::Query, OpCode::Query);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(
+            Name::from_str("short.test.").unwrap(),
+            RecordType::A,
+        ));
+        let query = request.to_vec().unwrap();
+        let peer: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+
+        let (engine, _in_flight) = engine_with_memory(address, 0);
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            process_dns_wire(&query, peer, &engine),
+        )
+        .await
+        .expect("refused at once");
+        let reply = Message::from_bytes(&reply).unwrap();
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(engine.permit_manager.dropped_requests(), 1);
+        let mut buf = [0u8; 512];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                upstream.recv_from(&mut buf)
+            )
+            .await
+            .is_err(),
+            "the upstream is not asked"
+        );
+
+        let (engine, _in_flight) = engine_with_memory(address, 1 << 30);
+        let waiting = {
+            let (engine, query) = (engine.clone(), query.clone());
+            tokio::spawn(async move { process_dns_wire(&query, peer, &engine).await })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.recv_from(&mut buf),
+        )
+        .await
+        .expect("the upstream is asked")
+        .unwrap();
+        assert_eq!(
+            engine.permit_manager.inflight(),
+            1001,
+            "it counts as in flight"
+        );
+        waiting.abort();
+    }
+
+    /// 内存不够时不接新连接，TLS 握手之前就关掉：连接和握手本身也占内存
+    /// With too little memory no new connection is taken, closed before the TLS handshake: a
+    /// connection and its handshake hold memory too
+    #[tokio::test]
+    async fn a_new_doh_connection_is_closed_when_memory_is_short() {
+        use rcgen::{CertificateParams, KeyPair};
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        let key = KeyPair::generate().unwrap();
+        let cert = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (engine, _in_flight) = engine_with_memory(upstream.local_addr().unwrap(), 0);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (cert_path, key_path) = (
+            cert_path.to_str().unwrap().to_string(),
+            key_path.to_str().unwrap().to_string(),
+        );
+        let served = engine.clone();
+        let server = tokio::spawn(async move {
+            run_doh_with_listener(
+                listener,
+                &cert_path,
+                &key_path,
+                served,
+                "/dns-query".to_string(),
+            )
+            .await
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("closed at once");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        assert_eq!(engine.permit_manager.dropped_requests(), 1);
+        assert_eq!(engine.permit_manager.inflight(), 1000, "it holds nothing");
+        server.abort();
     }
 
     // ---- process_dns_wire (with static-response Engine) ----

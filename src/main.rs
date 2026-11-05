@@ -1406,8 +1406,13 @@ async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
         // 禁用 Nagle 算法 (TCP_NODELAY)，避免长度前缀和包体两次写入被合并，
         // 否则与对端的 delayed-ACK 定时器交互导致每查询约 40ms 延迟。
         stream.set_nodelay(true).ok();
+        // 内存不够时不接新连接，已有的连接照常 / With too little memory no new connection is taken, and those there go on
+        let Some(permit) = engine.stream_query_permit() else {
+            continue;
+        };
         let engine = engine.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = handle_tcp_conn(stream, peer, engine).await;
         });
     }
@@ -1551,6 +1556,14 @@ async fn serve_tcp_conn(
             let Some(pre_parsed) = async_needed else {
                 continue;
             };
+            let Some(permit) = engine.stream_query_permit() else {
+                if let Some(response) =
+                    engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
+                {
+                    queue_tcp_answer(&mut answers, &response);
+                }
+                continue;
+            };
 
             // 满了就先不读下一个；等之前把已经答好的写出去，它们不陪着等
             // With all slots taken the next query is not read yet; what is already answered
@@ -1569,6 +1582,7 @@ async fn serve_tcp_conn(
             let writer = Arc::clone(&writer);
             pending.spawn(async move {
                 let _slot = slot;
+                let _permit = permit;
                 let answer = engine
                     .answer_after_fast_path(&packet_bytes, peer, pre_parsed)
                     .await
@@ -2537,6 +2551,168 @@ mod tests {
         assert!(refused > 0, "refused {refused}, answered {answered}");
         assert!(answered > 0, "refused {refused}, answered {answered}");
         worker.abort();
+    }
+
+    /// 开着流控的引擎，转发给一个不应答的上游，在途已有 1000 个查询，内存剩多少看 `available`
+    /// An engine with flow control forwarding to a silent upstream, with 1000 queries in
+    /// flight and `available` bytes of memory left
+    fn engine_short_of_memory(
+        silent_upstream: SocketAddr,
+        available: Arc<std::sync::atomic::AtomicU64>,
+    ) -> (Engine, Vec<kixdns::engine::concurrency::PermitGuard>) {
+        use kixdns::config::PipelineConfig;
+        use kixdns::engine::memory_watermark::{MemoryLeft, MemoryReading, MemoryWatermark};
+
+        let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+            "settings": {
+                "default_upstream": silent_upstream.to_string(),
+                "upstream_timeout_ms": 3000,
+                "enable_tcp_fallback": false,
+                "flow_control_enabled": true
+            },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "all",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": silent_upstream.to_string() }]
+            }]}]
+        }))
+        .unwrap();
+        let mut engine = Engine::new(
+            kixdns::matcher::RuntimePipelineConfig::from_config(config).unwrap(),
+            "test".to_string(),
+        )
+        .unwrap();
+        Arc::get_mut(engine.flow_control_state.as_mut().unwrap())
+            .unwrap()
+            .memory = MemoryWatermark::reading(move || MemoryReading {
+            own: 0,
+            limits: vec![MemoryLeft {
+                total: 1 << 30,
+                available: available.load(std::sync::atomic::Ordering::Relaxed),
+            }],
+        });
+        let in_flight = (0..1000).map(|_| engine.permit_manager.acquire()).collect();
+        (engine, in_flight)
+    }
+
+    /// 内存剩这么多字节 / This many bytes of memory left
+    fn memory_left(bytes: u64) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::new(std::sync::atomic::AtomicU64::new(bytes))
+    }
+
+    /// 一个 TCP 服务端，返回它的地址 / A TCP server, giving its address
+    async fn tcp_server(
+        engine: &Engine,
+    ) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        (address, tokio::spawn(run_tcp(listener, engine.clone())))
+    }
+
+    async fn send_tcp_query(stream: &mut TcpStream) {
+        let query = dns_query();
+        stream
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&query).await.unwrap();
+    }
+
+    /// 等到在途数量到 `count` / Until `count` are in flight
+    async fn in_flight_reaches(engine: &Engine, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.permit_manager.inflight() != count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} in flight", engine.permit_manager.inflight()));
+    }
+
+    /// TCP 进来的查询也看内存：不够时当场回 SERVFAIL，不问上游，连接还在
+    /// A query from TCP goes by memory too: with too little it gets SERVFAIL at once, the
+    /// upstream is not asked and the connection stays
+    #[tokio::test]
+    async fn a_tcp_query_is_refused_when_memory_runs_short() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let available = memory_left(1 << 30);
+        let (engine, _in_flight) =
+            engine_short_of_memory(upstream.local_addr().unwrap(), Arc::clone(&available));
+        let (address, server) = tcp_server(&engine).await;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        in_flight_reaches(&engine, 1001).await;
+
+        // 看够了次数，下一次读到内存不够 / Enough looks for the next read to find memory short
+        available.store(0, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3000 {
+            drop(engine.stream_query_permit());
+        }
+        send_tcp_query(&mut stream).await;
+        let mut length = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut length))
+            .await
+            .expect("refused at once")
+            .unwrap();
+        let mut reply = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut reply).await.unwrap();
+        let reply = Message::from_bytes(&reply).unwrap();
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        let mut buf = [0u8; 512];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), upstream.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the upstream is not asked"
+        );
+        assert_eq!(
+            engine.permit_manager.inflight(),
+            1001,
+            "only the connection counts"
+        );
+        server.abort();
+    }
+
+    /// 内存够时 TCP 的连接和查询都算在途，查询照常问上游
+    /// With enough memory a TCP connection and query both count as in flight, and the query
+    /// asks the upstream as usual
+    #[tokio::test]
+    async fn a_tcp_connection_and_query_count_as_in_flight() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (engine, _in_flight) =
+            engine_short_of_memory(upstream.local_addr().unwrap(), memory_left(1 << 30));
+        let (address, server) = tcp_server(&engine).await;
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        in_flight_reaches(&engine, 1001).await;
+        send_tcp_query(&mut stream).await;
+        let mut buf = [0u8; 512];
+        tokio::time::timeout(Duration::from_secs(1), upstream.recv_from(&mut buf))
+            .await
+            .expect("the upstream is asked")
+            .unwrap();
+        in_flight_reaches(&engine, 1002).await;
+        drop(stream);
+        server.abort();
+    }
+
+    /// 内存不够时不接新连接：连接本身也占内存，只拒绝查询挡不住光连不发的客户端
+    /// With too little memory no new connection is taken: a connection holds memory too, and
+    /// refusing queries alone would not stop clients that connect and send nothing
+    #[tokio::test]
+    async fn a_new_tcp_connection_is_closed_when_memory_is_short() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (engine, _in_flight) =
+            engine_short_of_memory(upstream.local_addr().unwrap(), memory_left(0));
+        let (address, server) = tcp_server(&engine).await;
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("closed at once");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        assert_eq!(engine.permit_manager.dropped_requests(), 1);
+        assert_eq!(engine.permit_manager.inflight(), 1000, "it holds nothing");
+        server.abort();
     }
 
     #[tokio::test]
