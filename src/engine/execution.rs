@@ -277,6 +277,14 @@ impl Engine {
         // The Geo data follows the new configuration first, so the new rules
         // find the new tags and files from their first query
         geo_sources.follow(&inner.pipeline, &self.geosite_manager, &self.geoip_manager);
+        // serve_stale 重载即生效，能续用多久决定了应答要留多久
+        // serve_stale takes effect on reload, and how long an answer may be served stale
+        // decides how long it stays
+        self.cache
+            .set_max_age(Duration::from_secs(super::core::cache_retention_secs(
+                self.cache_max_ttl,
+                &inner.pipeline.settings,
+            )));
         self.state.store(Arc::new(inner));
         let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.report_config_loaded(generation, path, source);
@@ -4950,6 +4958,101 @@ mod tests {
             engine.cached(dedupe_hash).is_some(),
             "serve_stale enabled by the reload must keep the expired entry"
         );
+    }
+
+    /// 存了 `age` 秒、TTL 等于 `cache_max_ttl` 的应答，上游又答不了：客户端是不是还拿到它
+    /// An answer stored `age` seconds ago with a TTL equal to `cache_max_ttl`, with an upstream
+    /// that cannot answer: whether the client still gets it
+    async fn answers_after(engine: &Engine, cache_max_ttl: u32, age: u64) -> bool {
+        let name = Name::from_str("stale.com.").unwrap();
+        let mut answer = Message::new(0, MessageType::Response, OpCode::Query);
+        answer.add_query(Query::query(name.clone(), RecordType::A));
+        answer.add_answer(Record::from_rdata(
+            name,
+            cache_max_ttl,
+            RData::A(std::net::Ipv4Addr::new(192, 0, 2, 7).into()),
+        ));
+        let then = Instant::now() - Duration::from_secs(age);
+        engine.cache_insert(
+            stale_com_keys(engine).slot,
+            Arc::new(CacheEntry {
+                bytes: Bytes::from(answer.to_vec().unwrap()),
+                inserted_at: then,
+                stored_at: then,
+                original_ttl: cache_max_ttl,
+                refresh_ttl: cache_max_ttl,
+                ..(*stale_entry("default")).clone()
+            }),
+        );
+        // 缓存里存的是 RD 位置上的查询的应答 / The cache holds the answer to a query with RD set
+        let mut query = stale_com_query();
+        query[2] = 0x01;
+        let reply = engine
+            .handle_packet(&query, "127.0.0.1:12345".parse().unwrap())
+            .await
+            .unwrap();
+        !Message::from_bytes(&reply).unwrap().answers.is_empty()
+    }
+
+    /// 只有全局设置的引擎：TTL 上限 2 秒，`serve_stale`、`stale` 如给定
+    /// An engine of global settings alone: a TTL cap of 2 seconds, `serve_stale` and `stale` as given
+    fn stale_settings(serve_stale: bool, stale: u64) -> RuntimePipelineConfig {
+        runtime_with_settings(GlobalSettings {
+            default_upstream: DEAD_UPSTREAM.to_string(),
+            upstream_timeout_ms: 100,
+            cache_max_ttl: 2,
+            serve_stale,
+            serve_stale_expire_ttl: stale,
+            ..Default::default()
+        })
+    }
+
+    /// TTL 被 cache_max_ttl 封顶的应答，到期后照样能续用 serve_stale_expire_ttl 这么久；0 是不限
+    /// An answer whose TTL cache_max_ttl capped can still be served stale for
+    /// serve_stale_expire_ttl after it expires, 0 meaning no limit
+    #[tokio::test]
+    async fn serve_stale_keeps_an_answer_as_long_as_the_cap_for_its_own_window() {
+        for (serve_stale, stale, age, served) in [
+            (false, 10, 3, false),
+            (true, 10, 3, true),
+            (true, 10, 11, true),
+            (true, 1, 5, false),
+            (true, 0, 30, true),
+        ] {
+            let engine =
+                Engine::new(stale_settings(serve_stale, stale), "lbl".to_string()).unwrap();
+            assert_eq!(
+                answers_after(&engine, 2, age).await,
+                served,
+                "serve_stale {serve_stale}, window {stale}, stored {age} s ago"
+            );
+            assert_eq!(
+                engine.ttl_cap(),
+                2,
+                "the window does not raise the TTL an answer may carry"
+            );
+        }
+    }
+
+    /// 能留多久跟着重载走：打开 serve_stale 后马上留得更久，关掉后退回 cache_max_ttl
+    /// How long answers stay follows a reload: longer as soon as serve_stale goes on, back to
+    /// cache_max_ttl when it goes off
+    #[tokio::test]
+    async fn a_reload_changes_how_long_answers_stay() {
+        let engine = Engine::new(stale_settings(false, 10), "lbl".to_string()).unwrap();
+        assert_eq!(engine.cache.max_age(), Duration::from_secs(2));
+        assert!(!answers_after(&engine, 2, 3).await);
+
+        engine.reload(stale_settings(true, 10));
+        assert_eq!(engine.cache.max_age(), Duration::from_secs(12));
+        assert!(answers_after(&engine, 2, 3).await);
+
+        engine.reload(stale_settings(true, 0));
+        assert_eq!(engine.cache.max_age(), Duration::from_secs(u64::MAX));
+
+        engine.reload(stale_settings(false, 10));
+        assert_eq!(engine.cache.max_age(), Duration::from_secs(2));
+        assert_eq!(engine.ttl_cap(), 2);
     }
 
     /// 一条 `stale.com` 的 A 查询。 / A query for `stale.com` A.

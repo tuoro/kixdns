@@ -29,10 +29,8 @@ use super::types::{EngineInner, InflightMap};
 pub struct Engine {
     pub(crate) state: Arc<ArcSwap<EngineInner>>,
     pub(crate) cache: DnsCache,
-    /// The cache's `time_to_live` (`cache_max_ttl`), which each answer in a slot keeps
-    /// to on its own (see `CacheEntry::stored_at`)
-    /// 缓存的 `time_to_live`（`cache_max_ttl`），槽位里的每份应答各自遵守（见 `CacheEntry::stored_at`）
-    pub(crate) cache_max_age: Option<Duration>,
+    /// 应答带的 TTL 的上限，只在启动时读 / The cap on the TTLs answers carry, read at startup only
+    pub(crate) cache_max_ttl: u64,
     pub(crate) udp_client: Arc<UdpClient>,
     pub(crate) tcp_mux: Arc<TcpMultiplexer>,
     pub(crate) doh_client: Arc<DohClient>,
@@ -130,13 +128,29 @@ impl EngineBuilder {
     }
 }
 
+/// 应答在缓存里留多少秒，每份应答各自遵守（见 `CacheEntry::stored_at`）：自己的 TTL 最长是
+/// `cache_max_ttl`；开着 serve_stale 时，TTL 到了之后还要留够续用的时间，也就是
+/// `serve_stale_expire_ttl` 秒，0 是不限，只受缓存容量约束。
+/// How many seconds an answer stays in the cache, which each answer keeps to on its own
+/// (see `CacheEntry::stored_at`): its own TTL is at most `cache_max_ttl`, and with
+/// serve_stale on it stays past that for as long as it may be served stale, which is
+/// `serve_stale_expire_ttl` seconds, 0 meaning no limit but the cache's capacity.
+pub(super) fn cache_retention_secs(
+    cache_max_ttl: u64,
+    settings: &crate::config::GlobalSettings,
+) -> u64 {
+    match (settings.serve_stale, settings.serve_stale_expire_ttl) {
+        (false, _) => cache_max_ttl,
+        (true, 0) => u64::MAX,
+        (true, stale) => cache_max_ttl.saturating_add(stale),
+    }
+}
+
 impl Engine {
     /// 应答带的、缓存用的 TTL 最长多少：`cache_max_ttl`
     /// The longest TTL an answer may carry or be cached with: `cache_max_ttl`
     pub(crate) fn ttl_cap(&self) -> u32 {
-        self.cache_max_age.map_or(u32::MAX, |age| {
-            crate::proto_utils::saturating_u64_to_u32(age.as_secs())
-        })
+        crate::proto_utils::saturating_u64_to_u32(self.cache_max_ttl)
     }
 
     /// Start configuring an engine for `cfg`.
@@ -179,7 +193,10 @@ impl Engine {
         // Response cache: capacity and max age come from the settings
         let running_settings = Arc::new(cfg.settings.clone());
         let settings = Arc::clone(&running_settings);
-        let cache = new_cache(settings.cache_capacity, settings.cache_max_ttl);
+        let cache = new_cache(
+            settings.cache_capacity,
+            cache_retention_secs(settings.cache_max_ttl, &settings),
+        );
         // 规则缓存：1 万条，每条按自己的 expires_at 过期（见 `RULE_CACHE_MAX_AGE`）
         // Rule cache: 10k entries, each expiring at its own expires_at (see `RULE_CACHE_MAX_AGE`)
         let rule_cache = Arc::new(CacheStore::new(10_000, RULE_CACHE_MAX_AGE));
@@ -271,7 +288,7 @@ impl Engine {
 
         Ok(Self {
             state,
-            cache_max_age: Some(Duration::from_secs(settings.cache_max_ttl)),
+            cache_max_ttl: settings.cache_max_ttl,
             cache,
             udp_client: Arc::new(
                 UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?,
@@ -330,7 +347,7 @@ impl Engine {
         self.cache.get(slot)?.select(
             view,
             |entry| question.matches(entry),
-            self.cache_max_age,
+            Some(self.cache.max_age()),
             now,
         )
     }
@@ -434,7 +451,7 @@ impl Engine {
     /// Store an answer in slot `slot` (see `CacheSlot::with`). Writes go through
     /// here and `insert_dns_cache_entry` only.
     pub(crate) fn cache_insert(&self, slot: u64, entry: Arc<CacheEntry>) {
-        let max_age = self.cache_max_age;
+        let max_age = Some(self.cache.max_age());
         self.cache.compute(slot, |current| {
             let slot = match current {
                 Some(current) => current.with(entry, max_age),
