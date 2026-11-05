@@ -53,7 +53,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | flow_control_latency_threshold_ms | 100 | A receiving socket going this long without running empty counts as the kernel being busy. With 0 it always counts as busy and the limit always applies. |
 | flow_control_adjustment_interval_secs | 5 | How often the limit is adjusted: tightened by a tenth while busy, loosened by a tenth otherwise. |
 | cache_capacity | 10000 | Maximum answers in the DNS response cache, one over 1 KB counting once per KB; must be greater than zero. |
-| cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. No record of an upstream answer carries a longer TTL either, and it wins over min_ttl when the two cross. |
+| cache_max_ttl | 86400 | Maximum lifetime of a DNS cache entry in seconds; must be greater than zero. With serve_stale on, an expired entry stays for serve_stale_expire_ttl longer. No record of an upstream answer carries a longer TTL either, and it wins over min_ttl when the two cross. |
 | dashmap_shards | 0 | Internal shard setting; 0 uses the DashMap default, otherwise the value must be a power of two. |
 | cache_background_refresh | false | Refresh entries before their TTL expires. |
 | cache_refresh_threshold_percent | 10 | Refresh threshold as a percentage of the entry TTL; must be below 100, since at 100 every cache hit refreshes upstream. |

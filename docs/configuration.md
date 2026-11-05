@@ -53,7 +53,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | flow_control_latency_threshold_ms | 100 | 接收 socket 连续这么久没收空，就算内核忙。设为 0 时一直算忙，上限始终起作用。 |
 | flow_control_adjustment_interval_secs | 5 | 多久调整一次上限：忙时收紧一成，不忙时放宽一成。 |
 | cache_capacity | 10000 | DNS 响应缓存最多存放的应答数，超过 1 KB 的应答每 1 KB 算一份；必须大于 0。 |
-| cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。上游回答里每条记录的 TTL 也不超过它，和 min_ttl 冲突时以它为准。 |
+| cache_max_ttl | 86400 | DNS 缓存条目的最大生存时间，单位秒；必须大于 0。开着 serve_stale 时，到期的条目还会再留 serve_stale_expire_ttl 这么久。上游回答里每条记录的 TTL 也不超过它，和 min_ttl 冲突时以它为准。 |
 | dashmap_shards | 0 | 内部分片设置；0 使用 DashMap 默认值，否则必须是 2 的幂。 |
 | cache_background_refresh | false | 在 TTL 过期前刷新条目。 |
 | cache_refresh_threshold_percent | 10 | 按剩余 TTL 百分比触发刷新；必须小于 100，取 100 时每次缓存命中都会刷新上游。 |

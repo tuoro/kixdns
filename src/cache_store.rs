@@ -42,7 +42,7 @@
 
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, RandomState};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hashbrown::HashTable;
@@ -96,8 +96,8 @@ const DEAD_SLACK: u64 = 64;
 pub struct CacheStore<V> {
     shards: Box<[RwLock<Shard<V>>]>,
     hasher: RandomState,
-    max_age: Duration,
-    sweep_every: Duration,
+    /// 条目能存多少秒，重载可以改 / How many seconds entries may stay, which a reload can change
+    max_age_secs: AtomicU64,
 }
 
 impl<V: Cached> CacheStore<V> {
@@ -117,9 +117,25 @@ impl<V: Cached> CacheStore<V> {
                 })
                 .collect(),
             hasher: RandomState::new(),
-            max_age,
-            sweep_every: SWEEP_EVERY.max(max_age / SWEEPS_PER_MAX_AGE),
+            max_age_secs: AtomicU64::new(max_age.as_secs()),
         }
+    }
+
+    /// 条目能存多久，到了就不能再用（见 [`Cached::outlived`]）
+    /// How long entries may stay, after which they can no longer serve (see [`Cached::outlived`])
+    pub fn max_age(&self) -> Duration {
+        Duration::from_secs(self.max_age_secs.load(Ordering::Relaxed))
+    }
+
+    /// 改条目能存多久，已经存着的条目也按新的算 / Change how long entries may stay, for those already stored too
+    pub fn set_max_age(&self, max_age: Duration) {
+        self.max_age_secs
+            .store(max_age.as_secs(), Ordering::Relaxed);
+    }
+
+    /// 能存多久的十六分之一，至少一分钟 / A sixteenth of how long entries may stay, a minute at least
+    fn sweep_every(&self) -> Duration {
+        SWEEP_EVERY.max(self.max_age() / SWEEPS_PER_MAX_AGE)
     }
 
     fn locate(&self, key: u64) -> (u64, &RwLock<Shard<V>>) {
@@ -149,13 +165,13 @@ impl<V: Cached> CacheStore<V> {
         let mut shard = shard.write();
         let now = Instant::now();
         if shard.sweeping.is_none()
-            && now.saturating_duration_since(shard.swept_at) >= self.sweep_every
+            && now.saturating_duration_since(shard.swept_at) >= self.sweep_every()
         {
             shard.swept_at = now;
             shard.sweeping = Some(0);
         }
         if shard.sweeping.is_some() {
-            shard.sweep_some(self.max_age, now);
+            shard.sweep_some(self.max_age(), now);
         }
         let found = shard.find(hash, key);
         let current = found.and_then(|index| shard.nodes[index as usize].value.as_ref());
@@ -911,14 +927,33 @@ mod tests {
         store.check();
     }
 
+    /// 改了能存多久，清扫跟着新的算：放宽后没到新期限的条目留下，收紧后过了新期限的条目去掉
+    /// Sweeping follows a change of how long entries may stay: entries within a longer limit
+    /// stay, and those past a shorter one go
+    #[test]
+    fn sweeping_follows_a_new_limit() {
+        let store = CacheStore::new(100, Duration::from_secs(60));
+        put(&store, 1, aged(1, DAY));
+        store.set_max_age(DAY * 2);
+        assert_eq!(store.sweep_every(), DAY / 8);
+        store.shards[0].write().swept_at -= DAY / 8;
+        put(&store, 2, value(2));
+        assert_eq!(store.entry_count(), 2, "a day is within the longer limit");
+
+        store.set_max_age(Duration::from_secs(60));
+        store.shards[0].write().swept_at -= SWEEP_EVERY;
+        put(&store, 3, value(3));
+        assert_eq!(store.entry_count(), 2, "a day is past the shorter limit");
+    }
+
     /// 条目能存得久的，清扫也隔得久；能存得短的，也至少隔一分钟
     /// Entries that may stay long are swept less often; those that may not, a minute apart at least
     #[test]
     fn the_longer_entries_may_stay_the_less_often_they_are_swept() {
         let short = CacheStore::<Value>::new(100, Duration::from_secs(30));
-        assert_eq!(short.sweep_every, SWEEP_EVERY);
+        assert_eq!(short.sweep_every(), SWEEP_EVERY);
         let store = CacheStore::new(100, DAY);
-        assert_eq!(store.sweep_every, DAY / 16);
+        assert_eq!(store.sweep_every(), DAY / 16);
         put(&store, 1, aged(1, DAY * 2));
         store.shards[0].write().swept_at -= SWEEP_EVERY;
         put(&store, 2, value(2));
