@@ -91,47 +91,6 @@ pub fn is_standard_query_header(packet: &[u8]) -> bool {
     flags & 0x8000 == 0 && flags & 0x7800 == 0 && qd_count == 1 && an_count == 0 && ns_count == 0
 }
 
-/// 读不了的查询的 FORMERR：只有请求头，问题读得出来就带上问题。不比查询长，伪造来源也放大不了流量。
-/// `query` 由调用方用 [`is_standard_query_header`] 查过，至少 12 字节。
-/// The FORMERR for a query that cannot be read: the header alone, with the question when
-/// that can be read. It is no longer than the query, so a forged source gains no
-/// amplification. The caller has checked `query` with [`is_standard_query_header`], so it
-/// has at least 12 bytes.
-pub fn formerr_reply(query: &[u8]) -> Bytes {
-    let question_end = plain_question_end(query);
-    let mut reply = Vec::with_capacity(question_end.unwrap_or(12));
-    reply.extend_from_slice(&query[..2]);
-    // QR=1，保留 opcode 和 RD；RA=1，保留 CD，RCODE=FORMERR
-    // QR=1, keeping the opcode and RD; RA=1, keeping CD, RCODE=FORMERR
-    reply.push(0x80 | (query[2] & 0x79));
-    reply.push(0x81 | (query[3] & 0x10));
-    reply.extend_from_slice(&[0, u8::from(question_end.is_some()), 0, 0, 0, 0, 0, 0]);
-    if let Some(end) = question_end {
-        reply.extend_from_slice(&query[12..end]);
-    }
-    Bytes::from(reply)
-}
-
-/// 查询里唯一一个问题的结尾，名字用了压缩指针、超长或问题没写完时为 None：这样的问题抄不到应答里
-/// Where the query's one question ends; None when its name has a compression pointer or
-/// is too long, or the question is cut short, as such a question cannot be copied to a reply
-fn plain_question_end(query: &[u8]) -> Option<usize> {
-    const MAX_NAME: usize = 255;
-    let mut pos = 12usize;
-    loop {
-        let label = *query.get(pos)? as usize;
-        if label > 63 || pos - 12 + label + 1 > MAX_NAME {
-            return None;
-        }
-        pos += 1 + label;
-        if label == 0 {
-            break;
-        }
-    }
-    let end = pos + 4;
-    (end <= query.len()).then_some(end)
-}
-
 /// 仅解析 DNS 头部和第一个 Query，用于快速缓存查找 / Parse only DNS header and first query for quick cache lookup
 /// 避免 hickory-proto Message::from_bytes 的全量解析和分配开销 / Avoid full parsing and allocation overhead of hickory-proto Message::from_bytes
 /// buf: 用于存储归一化（小写）域名的缓冲区，建议至少 256 字节 / buf: buffer for storing normalized (lowercase) domain name, recommend at least 256 bytes

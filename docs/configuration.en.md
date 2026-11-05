@@ -46,7 +46,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive interval; 0 disables keepalive. |
 | doq_enable_0rtt | true | Global DoQ 0-RTT setting. |
 | enable_tcp_fallback | true | Retry UDP failure or truncation with TCP. |
-| flow_control_enabled | false | Enable adaptive flow control: while the kernel cannot keep up, queries past the limit on those handled at once get SERVFAIL at once. A slow upstream alone does not count as busy; while the kernel is busy, queries waiting on an upstream count among those handled at once. |
+| flow_control_enabled | false | Enable adaptive flow control: while the kernel cannot keep up, queries past the limit on those handled at once get SERVFAIL at once. A slow upstream alone does not count as busy; while the kernel is busy, queries waiting on an upstream count among those handled at once. Past 1000 queries handled at once memory counts too: when the system or its cgroup has less available than a quarter of what the kernel itself holds plus a sixteenth of the total (the latter at most 256 MiB), new cache misses get SERVFAIL too, until memory comes back. Only Linux reads memory so far. |
 | flow_control_initial_permits | 500 | Initial limit on queries handled at once, which applies only while the kernel is busy. |
 | flow_control_min_permits | 100 | The lowest the limit tightens to. |
 | flow_control_max_permits | 800 | The highest the limit loosens to. |
@@ -221,7 +221,7 @@ UDP and TCP listeners are always created from settings.bind_udp and settings.bin
 
 Inbound listener behavior:
 
-- Only standard single-question QUERY messages are processed. Non-QUERY opcodes, messages without exactly one question, DNS response packets and packets under 12 bytes are silently dropped. A message with a standard query header that cannot be read (two OPT records, say, or a UDP query over 4096 bytes) gets FORMERR, with the header and question alone and no longer than the query; while flow control is refusing queries such a message is dropped.
+- Only standard single-question QUERY messages are processed. Malformed packets, non-QUERY opcodes, and DNS response packets are silently dropped.
 - A query whose EDNS version is not 0 is answered BADVERS (RFC 6891 section 6.1.3), with an OPT of version 0 in the reply.
 - A listener processing error, an overall request timeout, or an exhausted flow-control permit returns SERVFAIL to the client for a valid query.
 - UDP responses larger than the client's advertised size (the EDNS payload size, or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP.

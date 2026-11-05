@@ -46,7 +46,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive 间隔；0 禁用。 |
 | doq_enable_0rtt | true | 全局 DoQ 0-RTT 设置。 |
 | enable_tcp_fallback | true | UDP 失败或截断时用 TCP 重试。 |
-| flow_control_enabled | false | 启用自适应流控：内核忙不过来时，同时处理的查询超过上限就直接回 SERVFAIL。上游慢本身不算忙；内核忙的时候，等上游的查询也计入同时处理的查询数。 |
+| flow_control_enabled | false | 启用自适应流控：内核忙不过来时，同时处理的查询超过上限就直接回 SERVFAIL。上游慢本身不算忙；内核忙的时候，等上游的查询也计入同时处理的查询数。同时处理的查询超过 1000 个以后还会看内存：系统或所在 cgroup 的可用内存低于内核自身占用的四分之一加总量的十六分之一（后者最多 256 MiB）时，新的未命中查询也回 SERVFAIL，内存回来后恢复。目前只有 Linux 读内存。 |
 | flow_control_initial_permits | 500 | 同时处理的查询数上限的初始值，只在内核忙时起作用。 |
 | flow_control_min_permits | 100 | 上限最低收紧到多少。 |
 | flow_control_max_permits | 800 | 上限最高放宽到多少。 |
@@ -221,7 +221,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 
 入站监听器行为：
 
-- 只处理标准单 question 的 QUERY 消息。非 QUERY opcode、问题数不是 1 的报文、DNS 响应包和不足 12 字节的包会被静默丢弃。请求头是标准查询、报文却读不了的（比如带两条 OPT，或 UDP 查询超过 4096 字节）回 FORMERR，只带请求头和问题，不比查询长；流控拒绝查询时这类报文直接丢弃。
+- 只处理标准单 question 的 QUERY 消息。畸形包、非 QUERY opcode 和 DNS 响应包会被静默丢弃。
 - EDNS 版本不是 0 的查询回 BADVERS（RFC 6891 第 6.1.3 节），回答里的 OPT 写版本 0。
 - 监听器处理错误、整体请求超时或流控 permit 耗尽时，对合法查询返回 SERVFAIL。
 - 大于客户端声明大小（EDNS 载荷大小；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试。
