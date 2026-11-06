@@ -169,15 +169,21 @@ mod tests {
         );
     }
 
-    /// 地址全不相同时队列数也有上限，再多也占不了更多内存 / With every address different the queues
-    /// still set a limit, so however many there are they hold no more memory
+    /// 地址全不相同时队列数也有上限，再多也占不了更多内存：空队列总收一个，不空的只收到自己那一份，各份加起来
+    /// 是 room。撞进同一份的地址算一台设备，在份额内本来就能多排，所以上限是份数加 room，不是份数
+    /// With every address different the queues still set a limit, so however many there are they
+    /// hold no more memory: an empty queue always takes one and one in use takes only up to its
+    /// share, the shares adding up to the room. Addresses landing in one queue count as one device
+    /// and may queue more within its share, so the limit is the queues plus the room, not the queues
     #[test]
     fn different_addresses_cannot_grow_it_past_the_queues() {
-        let mut queue = FairQueue::new(10);
+        let room = 10;
+        let mut queue = FairQueue::new(room);
         let accepted = (0..100_000)
             .filter(|&id| queue.offer(b"q", device(id), id))
             .count();
-        assert!(accepted <= QUEUES, "{accepted}");
+        assert_eq!(queue.devices(), QUEUES, "every queue is in use");
+        assert!(accepted <= QUEUES + room, "{accepted}");
     }
 
     /// 已经排着的设备比份额还多时，空队列里新来的一台照样排得进——发得少的不会因为设备多就被挡在外面
