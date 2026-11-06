@@ -16,6 +16,7 @@ mod ecs_scope_tests;
 #[cfg(test)]
 mod edns_reply_tests;
 pub mod execution;
+pub mod fair_queue;
 mod geo;
 #[cfg(test)]
 mod geo_reload_tests;

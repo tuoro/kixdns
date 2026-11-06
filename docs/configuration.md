@@ -46,7 +46,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive 间隔；0 禁用。 |
 | doq_enable_0rtt | true | 全局 DoQ 0-RTT 设置。 |
 | enable_tcp_fallback | true | UDP 失败或截断时用 TCP 重试。 |
-| flow_control_enabled | false | 启用流控，不用填数字，内核运行时自己判断：接收 socket 一直收不空，而且查询在内核里排队超过 20 毫秒时，新的未命中查询直接回 SERVFAIL。等上游的时间不算排队，所以上游再慢也不会因此被拒。同时处理的查询超过 1000 个以后还会看内存：系统或所在 cgroup 的可用内存低于内核自身占用的四分之一加总量的十六分之一（后者最多 256 MiB）时，新的未命中查询也回 SERVFAIL，内存回来后恢复，UDP、TCP 和 DoH 入站都一样；TCP 和 DoH 的新连接也会直接关闭。目前只有 Linux 读内存。 |
+| flow_control_enabled | false | 启用流控，不用填数字，内核运行时自己判断：接收 socket 一直收不空，而且查询在内核里排队超过 20 毫秒时，新的未命中查询直接回 SERVFAIL。等上游的时间不算排队，所以上游再慢也不会因此被拒。同时处理的查询超过 1000 个以后还会看内存：系统或所在 cgroup 的可用内存低于内核自身占用的四分之一加总量的十六分之一（后者最多 256 MiB）时，新的未命中查询也回 SERVFAIL，内存回来后恢复，UDP、TCP 和 DoH 入站都一样；TCP 和 DoH 的新连接也会直接关闭。丢包或拒绝持续一秒以上、而且不止一台设备在查询时，UDP 按设备轮流处理（IPv4 一个地址、IPv6 一个 /64 算一台）：每台设备各排各的队，排不下的不回应直接丢弃，发得少的设备不受影响；跟上之后恢复，只有一台设备时不这样做。目前读内存和按设备轮流都只有 Linux。 |
 | flow_control_initial_permits | 500 | 不再使用，保留只为旧配置还能加载。 |
 | flow_control_min_permits | 100 | 不再使用，保留只为旧配置还能加载。 |
 | flow_control_max_permits | 800 | 不再使用，保留只为旧配置还能加载。 |
