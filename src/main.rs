@@ -1092,11 +1092,13 @@ const RECV_BUFFER_PER_QUERY: usize = 480;
 #[cfg(target_os = "linux")]
 const QUERIES_IN_RECV_BUFFER: usize = UDP_BUFFER_SIZE / RECV_BUFFER_PER_QUERY;
 
-/// 这个 socket 的接收缓冲实际放得下多少个小查询。`net.core.rmem_max` 比 4 MiB 小时，设下去的大小会被内核截短；
-/// 内核报的是翻过倍的大小，一个小查询记 `2 * RECV_BUFFER_PER_QUERY`
-/// How many small queries this socket's receive buffer actually holds. With `net.core.rmem_max`
-/// below 4 MiB the kernel cuts the size that was set; it reports the doubled size, a small query
-/// being charged `2 * RECV_BUFFER_PER_QUERY`
+/// 这个 socket 的接收缓冲放得下多少个小查询，开始轮流时先这么算。`net.core.rmem_max` 比 4 MiB 小时，设下去的
+/// 大小会被内核截短；内核报的是翻过倍的大小，一个小查询按 `2 * RECV_BUFFER_PER_QUERY` 算。网卡收的包内核记得更多，
+/// 读的时候再量（见 `TakingTurns::read`）
+/// How many small queries this socket's receive buffer holds, as reckoned when turns begin. With
+/// `net.core.rmem_max` below 4 MiB the kernel cuts the size that was set; it reports the doubled
+/// size, a small query reckoned at `2 * RECV_BUFFER_PER_QUERY`. The kernel charges datagrams from
+/// a network card more, so reading measures it again (see `TakingTurns::read`)
 #[cfg(target_os = "linux")]
 fn queries_in_recv_buffer(socket: &UdpSocket) -> usize {
     socket2::SockRef::from(socket)
@@ -1367,7 +1369,11 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
     let mut received_in_row = 0;
     let mut turns: Option<Box<TakingTurns>> = None;
     loop {
-        let got = match socket.try_io(Interest::READABLE, || received.recv(fd)) {
+        let read = match &mut turns {
+            Some(taking) => taking.read(socket, &mut received),
+            None => socket.try_io(Interest::READABLE, || received.recv(fd)),
+        };
+        let got = match read {
             Ok(got) => got,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if turns.as_ref().is_none_or(|turns| turns.queue.is_empty()) {
@@ -1445,7 +1451,14 @@ struct TakingTurns {
     counted_at: Instant,
     /// 接收缓冲放得下多少个查询 / How many queries the receive buffer holds
     holds: usize,
+    /// 还要量几批每个查询实际记多少 / How many more batches measure what a query is charged
+    samples_left: usize,
 }
+
+/// 开始轮流后头这么多批读的时候量一下每个查询在接收缓冲里实际记多少字节 / For this many batches after
+/// turns begin, reading measures how many bytes a query is charged in the receive buffer
+#[cfg(target_os = "linux")]
+const CHARGE_SAMPLES: usize = 8;
 
 /// 答一批之前最多读这么多批，再多的洪泛也要留时间处理 / At most this many batches are read before one is
 /// answered, leaving time for handling under any flood
@@ -1461,6 +1474,48 @@ impl TakingTurns {
             backlog: 0,
             counted_at: Instant::now(),
             holds,
+            samples_left: CHARGE_SAMPLES,
+        }
+    }
+
+    /// 读一批。开始轮流后的头 `CHARGE_SAMPLES` 批，读前读后各看一次接收缓冲记着多少字节，差除以读到的个数就是每个
+    /// 查询实际记多少（见 `note_charge`）。读的同时又来了包，量出来只会偏小
+    /// Reads a batch. For the first `CHARGE_SAMPLES` batches after turns begin the bytes the
+    /// receive buffer is charged with are read before and after, and the difference over how many
+    /// were read is what a query is actually charged (see `note_charge`). Datagrams arriving
+    /// meanwhile only make it come out smaller
+    fn read(
+        &mut self,
+        socket: &UdpSocket,
+        received: &mut udp_batch::Received,
+    ) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        use tokio::io::Interest;
+
+        let before = (self.samples_left > 0)
+            .then(|| kixdns::socket_utils::udp_receive_queue(socket))
+            .flatten();
+        let fd = socket.as_raw_fd();
+        let got = socket.try_io(Interest::READABLE, || received.recv(fd))?;
+        if let Some((queued, _)) = before
+            && got > 0
+            && let Some((left, buffer)) = kixdns::socket_utils::udp_receive_queue(socket)
+        {
+            self.samples_left -= 1;
+            self.note_charge(queued.saturating_sub(left) as usize / got, buffer as usize);
+        }
+        Ok(got)
+    }
+
+    /// 量到一个查询实际记 `charge` 字节，缓冲最多记 `buffer` 字节。放得下的比原先算的少才改：原先按每个查询
+    /// `2 * RECV_BUFFER_PER_QUERY` 算，回环上已经偏少，网卡收的包记得更多、放得下的更少；量偏小时算出来的偏多，不改
+    /// A query measured at `charge` bytes, the buffer charged with at most `buffer`. It changes only
+    /// when fewer fit than reckoned: the reckoning at `2 * RECV_BUFFER_PER_QUERY` a query already
+    /// comes out low on loopback, while datagrams from a network card are charged more and fewer
+    /// fit; a measurement that came out small gives more, and changes nothing
+    fn note_charge(&mut self, charge: usize, buffer: usize) {
+        if let Some(fits) = buffer.checked_div(charge) {
+            self.holds = self.holds.min(fits.max(MIN_QUERIES_IN_RECV_BUFFER));
         }
     }
 
@@ -3211,6 +3266,10 @@ mod tests {
             .local_addr()
             .unwrap();
         let mut reply = BytesMut::new();
+        // 这台设备已经有一个在途，过载时它在平均上，不轮流就拒 / This device already has one in flight,
+        // so under overload it holds its share and is refused without turns
+        let manager = &engine.permit_manager;
+        let _held = manager.acquire_for(manager.slot_of(peer.ip()));
 
         answering.emptied_at = Instant::now() - Duration::from_secs(1);
         answering.answer(&query("a.queue.test", 1), peer, &mut reply);
@@ -3221,7 +3280,7 @@ mod tests {
         answering.taking_turns = true;
         answering.answer(&query("b.queue.test", 2), peer, &mut reply);
         assert_eq!(engine.permit_manager.dropped_requests(), 1);
-        assert_eq!(engine.permit_manager.inflight(), 1);
+        assert_eq!(engine.permit_manager.inflight(), 2, "the one held and this");
         assert!(!answering.refused);
 
         // 快速解析读不了、从头解析的也记下 / One the quick parse cannot read, parsed from scratch, is noted too
@@ -3313,6 +3372,58 @@ mod tests {
             assert!(turns.queue.offer(b"q", device, peer));
         }
         assert!(!turns.queue.offer(b"q", device, peer));
+    }
+
+    /// 读的时候量一个查询在接收缓冲里实际记多少，放得下的按量到的算；只往少里改
+    /// Reading measures what a query is actually charged in the receive buffer and what fits
+    /// follows it, only ever downwards
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn reading_measures_what_a_query_takes_in_the_receive_buffer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let send_batch = || {
+            for _ in 0..udp_batch::BATCH {
+                client
+                    .send_to(&query("a.test", 1), socket.local_addr().unwrap())
+                    .unwrap();
+            }
+        };
+        let mut received = udp_batch::Received::default();
+
+        send_batch();
+        let (queued, buffer) = kixdns::socket_utils::udp_receive_queue(&socket).unwrap();
+        let charge = queued as usize / udp_batch::BATCH;
+        assert!(charge > query("a.test", 1).len(), "{charge}");
+        let mut turns = TakingTurns::new(10, usize::MAX);
+        socket.readable().await.unwrap();
+        assert_eq!(
+            turns.read(&socket, &mut received).unwrap(),
+            udp_batch::BATCH
+        );
+        assert_eq!(
+            turns.holds,
+            buffer as usize / charge,
+            "as many as actually fit"
+        );
+        assert_eq!(turns.samples_left, CHARGE_SAMPLES - 1, "one batch measured");
+
+        send_batch();
+        let mut turns = TakingTurns::new(10, MIN_QUERIES_IN_RECV_BUFFER);
+        socket.readable().await.unwrap();
+        turns.read(&socket, &mut received).unwrap();
+        assert_eq!(
+            turns.holds, MIN_QUERIES_IN_RECV_BUFFER,
+            "never more than reckoned"
+        );
+
+        // 量够了就不再量 / Once measured enough it measures no more
+        turns.samples_left = 0;
+        turns.holds = usize::MAX;
+        send_batch();
+        socket.readable().await.unwrap();
+        turns.read(&socket, &mut received).unwrap();
+        assert_eq!(turns.holds, usize::MAX);
     }
 
     /// 答一批之前最多读这么多批 / At most this many batches are read before one is answered
@@ -3567,7 +3678,13 @@ mod tests {
             let query = query(&format!("q{id}.busy.test"), id);
             client.send_to(&query, server_addr).await.unwrap();
         }
-        assert_eq!(refused_and_answered(&client, QUERIES).await, (QUERIES, 0));
+        // 头一个进去，那时什么都没在途；它在慢上游上等着的时候，同一台设备的其余都在平均上，都拒
+        // The first goes in, nothing being in flight then; while it waits on the slow upstream the
+        // rest from the same device hold its share and are all refused
+        assert_eq!(
+            refused_and_answered(&client, QUERIES).await,
+            (QUERIES - 1, 1)
+        );
         worker.abort();
     }
 
@@ -3894,8 +4011,12 @@ mod tests {
 
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
-        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine));
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 客户端这台设备已经有一个在途，过载时它在平均上 / The client's device already has one in
+        // flight, so under overload it holds its share
+        let manager = Arc::clone(&engine.permit_manager);
+        let _held = manager.acquire_for(manager.slot_of(client.local_addr().unwrap().ip()));
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine));
 
         client.send_to(&dns_query(), server_addr).await.unwrap();
         let mut response_buf = [0u8; 512];

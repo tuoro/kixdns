@@ -197,6 +197,31 @@ pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
     (ret == 0).then(|| info[libc::SK_MEMINFO_DROPS as usize])
 }
 
+/// 这个 socket 的接收缓冲现在记着多少字节、最多记多少（内核翻过倍的大小）；读不到时是 None
+/// How many bytes this socket's receive buffer is charged with now and at most (the size the
+/// kernel doubled); None when that cannot be read
+#[cfg(target_os = "linux")]
+pub fn udp_receive_queue(socket: &tokio::net::UdpSocket) -> Option<(u32, u32)> {
+    let mut info = [0u32; libc::SK_MEMINFO_RCVBUF as usize + 1];
+    let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+    // SAFETY: the buffer and its length are valid for the call, which only writes within them
+    let ret = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            info.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    (ret == 0).then(|| {
+        (
+            info[libc::SK_MEMINFO_RMEM_ALLOC as usize],
+            info[libc::SK_MEMINFO_RCVBUF as usize],
+        )
+    })
+}
+
 /// 别的系统读不到，接收缓冲就一直不收小 / Other systems cannot read it, so the receive buffer never shrinks there
 #[cfg(not(target_os = "linux"))]
 pub fn udp_receive_drops(_socket: &tokio::net::UdpSocket) -> Option<u32> {

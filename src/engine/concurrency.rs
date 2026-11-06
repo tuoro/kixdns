@@ -43,12 +43,17 @@ impl FlowControlState {
     }
 
     /// `device` 的一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝
-    /// （见 [`Self::memory_refuses`]）；内核忙而且查询在内核里排着长队时也拒绝。等上游不算排队，所以
-    /// 上游再慢，这样的查询也不会被拒绝
+    /// （见 [`Self::memory_refuses`]）；内核忙而且查询在内核里排着长队时，拒绝在途不比各设备平均少的设备，
+    /// 发得少的照常。那时每个查询都要先排同样长的队，在途多少就是发得多快；不分设备地拒，发得少的设备也
+    /// 跟着丢，直到开始按设备轮流。等上游不算排队，所以上游再慢，这样的查询也不会被拒绝
     /// Whether a query from `device` that waits on an upstream can go ahead, `emptied_at` being
     /// when the socket last ran empty. Too little memory refuses it (see [`Self::memory_refuses`]),
-    /// and so does the kernel being busy with queries queueing long inside it. Waiting on an
-    /// upstream is not queueing, so however slow the upstream, such queries are not refused
+    /// and with the kernel busy and queries queueing long inside it a device holding no less in
+    /// flight than the average is refused while those sending little go on. Every query then
+    /// waits in the same long line first, so what a device holds in flight is how fast it sends;
+    /// refusing whatever comes would lose the devices sending little too, until devices take
+    /// turns. Waiting on an upstream is not queueing, so however slow the upstream, such queries
+    /// are not refused
     #[inline]
     pub fn permit(
         &self,
@@ -56,7 +61,9 @@ impl FlowControlState {
         emptied_at: Instant,
         device: DeviceSlot,
     ) -> Option<PermitGuard> {
-        if self.memory_refuses(manager, device) || (self.busy(emptied_at) && self.behind()) {
+        if self.memory_refuses(manager, device)
+            || (self.busy(emptied_at) && self.behind() && manager.holds_its_share(device))
+        {
             manager.count_refused();
             return None;
         }
@@ -184,15 +191,17 @@ impl PermitManager {
         DeviceSlot((hash % DEVICE_SLOTS as u64) as u16)
     }
 
-    /// `device` 在途的是不是不比各设备的平均少：只有一台时就是它；没有在途的不算，因为只在内存紧张时问，
-    /// 那时在途至少有 1000 个
-    /// Whether `device` holds no less in flight than the average across devices: a lone one
-    /// does; one with nothing in flight does not, as this is asked only with memory tight, when
-    /// at least 1000 are in flight
+    /// `device` 在途的是不是不比各设备的平均少：只有一台在途时就是它；自己没有在途的不算，哪台都没有在途时也一样。
+    /// 一台在刷的设备被拒以后在途的很快就走光，这时都算的话发得少的也跟着被拒，拒得越管用越分不出是谁在刷
+    /// Whether `device` holds no less in flight than the average across devices: a lone one in
+    /// flight does; one with nothing in flight does not, also with nothing in flight anywhere. A
+    /// device flooding has its queries in flight run out soon once refused, and counting everyone
+    /// then would refuse those sending little along with it: the better the refusing works, the
+    /// less it could tell who floods
     fn holds_its_share(&self, device: DeviceSlot) -> bool {
         let own = self.device_inflight[usize::from(device.0)].load(Ordering::Relaxed) as usize;
         let devices = self.devices_in_flight.load(Ordering::Relaxed).max(1);
-        own.saturating_mul(devices) >= self.inflight()
+        own > 0 && own.saturating_mul(devices) >= self.inflight()
     }
 
     /// 记下一个被拒绝的查询或连接，隔一阵记一条日志 / Counts a refused query or connection, with a log line now and then
@@ -348,6 +357,38 @@ mod tests {
         assert!(flow.permit(&manager, busy, ONE).is_none(), "both");
         assert_eq!(manager.dropped_requests(), 1);
         assert_eq!(manager.inflight(), 2, "a refused query holds no permit");
+    }
+
+    /// 忙而且排长队时只拒在途不比平均少的设备：一台在刷时拒它，发得少的照常；没有在途的不拒，哪台都没有在途时也
+    /// 一样，只有一台时它放进一个以后再拒
+    /// Busy and queueing long, only devices holding no less than the average in flight are
+    /// refused: the one sending most is, those sending little go on; one with nothing in flight
+    /// is not, also with nothing in flight anywhere, so a lone one gets one in and is refused after
+    #[test]
+    fn busy_and_behind_refuses_only_the_devices_holding_their_share() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = state(Duration::from_secs(60));
+        let busy = Instant::now() - LONG_AGO;
+        flow.note_queue_delay(Duration::from_secs(3600));
+        let heavy: Vec<_> = (0..100).map(|_| manager.acquire_for(ONE)).collect();
+        assert!(
+            flow.permit(&manager, busy, ONE).is_none(),
+            "the device sending most"
+        );
+        let light = flow
+            .permit(&manager, busy, OTHER)
+            .expect("one sending little goes on");
+        assert!(
+            flow.permit(&manager, busy, OTHER).is_some(),
+            "still far below the average"
+        );
+        assert_eq!(manager.dropped_requests(), 1);
+        drop((heavy, light));
+        let first = flow
+            .permit(&manager, busy, OTHER)
+            .expect("nothing in flight anywhere");
+        assert!(flow.permit(&manager, busy, OTHER).is_none(), "alone now");
+        drop(first);
     }
 
     /// 排队没超过目标不算跟不上；超过了就按等了多久算，到点自己恢复
