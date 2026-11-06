@@ -107,17 +107,23 @@ impl PreParsedData {
         }
     }
 
-    /// 直接用预解析的内容构造 SERVFAIL，不必再解析请求；RD 位照查询的 `recursion_desired`
-    /// A SERVFAIL built straight from the pre-parsed query, with no parse of the request;
-    /// RD as the query's `recursion_desired`
-    pub fn servfail(&self, recursion_desired: bool) -> anyhow::Result<Bytes> {
+    /// 直接用预解析的内容构造 `request` 的 SERVFAIL，不必再解析请求。照抄查询的部分照 `request` 的写法（见
+    /// `proto_utils::reply_as_asked`）：问题名的大小写、RD 和 CD 位、带不带 OPT。预解析的名字是小写的，开着 0x20 的
+    /// 解析器拿到小写的问题名会当作不匹配丢掉
+    /// The SERVFAIL for `request`, built straight from the pre-parsed query with no parse of
+    /// the request. What it copies from the query is written as `request` has it (see
+    /// `proto_utils::reply_as_asked`): the question name's case, the RD and CD bits, and
+    /// whether an OPT comes back. The pre-parsed name is lowercase, and a resolver using 0x20
+    /// drops a reply with a lowercased question name as a mismatch
+    pub fn servfail(&self, request: &[u8]) -> anyhow::Result<Bytes> {
         engine_helpers::build_servfail_response_fast(
             self.tx_id,
             &self.qname,
             u16::from(self.qtype),
             u16::from(self.qclass),
-            recursion_desired,
+            request.get(2).is_some_and(|flags| flags & 0x01 != 0),
         )
+        .map(|reply| crate::proto_utils::reply_as_asked(reply, request))
     }
 }
 
