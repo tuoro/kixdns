@@ -1057,8 +1057,12 @@ struct UdpAnswering<'a> {
     behind_at: Instant,
     /// 这一段跟不上从什么时候开始 / When this spell of falling behind began
     behind_since: Instant,
-    /// 上次读到的拒绝数 / The refusal count last read
-    refused_seen: u64,
+    /// 上次看过以后，这个 worker 读到的查询有没有被流控拒绝。只算自己的：别的 worker、TCP 和 DoH 被拒，
+    /// 轮流时排不下丢的，都不是这个 socket 跟不上
+    /// Whether flow control refused a query this worker read since the last look. Only its own
+    /// count: refusals in another worker or over TCP and DoH, and what taking turns drops for not
+    /// fitting, are not this socket falling behind
+    refused: bool,
     /// 正在按设备轮流：只看内存，内核跟不上时丢的是还排着队的设备 / Devices are taking turns: only memory is
     /// looked at, as falling behind drops from devices with more queued
     taking_turns: bool,
@@ -1082,6 +1086,26 @@ const BEHIND_AFTER_CHECKS: u32 = 10;
 /// the `SO_RCVBUF` value for its limit. A datagram from a network card is charged more, so fewer fit and the wait
 /// only gets shorter
 const RECV_BUFFER_PER_QUERY: usize = 480;
+
+/// 大接收缓冲放得下多少个小查询，读不到实际大小时按这个算 / How many small queries the large receive
+/// buffer holds, taken when the actual size cannot be read
+#[cfg(target_os = "linux")]
+const QUERIES_IN_RECV_BUFFER: usize = UDP_BUFFER_SIZE / RECV_BUFFER_PER_QUERY;
+
+/// 这个 socket 的接收缓冲实际放得下多少个小查询。`net.core.rmem_max` 比 4 MiB 小时，设下去的大小会被内核截短；
+/// 内核报的是翻过倍的大小，一个小查询记 `2 * RECV_BUFFER_PER_QUERY`
+/// How many small queries this socket's receive buffer actually holds. With `net.core.rmem_max`
+/// below 4 MiB the kernel cuts the size that was set; it reports the doubled size, a small query
+/// being charged `2 * RECV_BUFFER_PER_QUERY`
+#[cfg(target_os = "linux")]
+fn queries_in_recv_buffer(socket: &UdpSocket) -> usize {
+    socket2::SockRef::from(socket)
+        .recv_buffer_size()
+        .map_or(QUERIES_IN_RECV_BUFFER, |size| {
+            size / (2 * RECV_BUFFER_PER_QUERY)
+        })
+        .max(MIN_QUERIES_IN_RECV_BUFFER)
+}
 
 /// 接收缓冲至少放得下这么多查询（两批）/ The receive buffer holds at least this many queries (two batches)
 const MIN_QUERIES_IN_RECV_BUFFER: usize = 64;
@@ -1139,7 +1163,7 @@ impl<'a> UdpAnswering<'a> {
             looked_at: Instant::now(),
             behind_at: Instant::now() - CAUGHT_UP_AFTER,
             behind_since: Instant::now(),
-            refused_seen: 0,
+            refused: false,
             taking_turns: false,
             queries_within_target: MIN_QUERIES_IN_RECV_BUFFER,
             behind: false,
@@ -1167,8 +1191,7 @@ impl<'a> UdpAnswering<'a> {
             .drops_seen
             .replace(drops)
             .is_some_and(|seen| seen != drops);
-        let refused = self.engine.permit_manager.dropped_requests();
-        let refusing = std::mem::replace(&mut self.refused_seen, refused) != refused;
+        let refusing = std::mem::take(&mut self.refused);
         // 这一段积压第一次看：到上一次之间可能空闲过，量不出速度 / The first look of this backlog: it may
         // have been idle since the last, so this measures no speed
         if self.checks_since_empty == BEHIND_AFTER_CHECKS {
@@ -1203,7 +1226,10 @@ impl<'a> UdpAnswering<'a> {
     #[cfg(target_os = "linux")]
     fn begin_turns(&mut self) -> Box<TakingTurns> {
         self.taking_turns = true;
-        Box::new(TakingTurns::new(self.queries_within_target))
+        Box::new(TakingTurns::new(
+            self.queries_within_target,
+            queries_in_recv_buffer(self.socket),
+        ))
     }
 
     fn set_recv_buffer(&self, size: usize) {
@@ -1283,13 +1309,13 @@ impl<'a> UdpAnswering<'a> {
             Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                 // 缓存未命中，使用预解析的数据避免重复解析 / Cache miss, use pre-parsed data to avoid re-parsing
                 let packet = Bytes::copy_from_slice(packet);
-                spawn_udp_answer(self, packet, peer, Some(pre_parsed));
+                self.refused |= !spawn_udp_answer(self, packet, peer, Some(pre_parsed));
                 return false;
             }
             Ok(None) => {
                 // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
                 let packet = Bytes::copy_from_slice(packet);
-                spawn_udp_answer(self, packet, peer, None);
+                self.refused |= !spawn_udp_answer(self, packet, peer, None);
                 return false;
             }
             Err(error) => {
@@ -1395,18 +1421,30 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
 }
 
 /// 过载时按设备轮流：能读多少先读多少，排不下的不解析就丢，所以读得比处理得快得多，socket 不再因为满了而不分来源地丢包；
-/// 然后轮流答一批。只有一台设备在刷也这样：别的设备隔多久才问一次都读得到、轮得上。什么时候结束不用另外判断：队列也
-/// 排不满、丢包停够久，就是跟上了
+/// 然后轮流答一批。只有一台设备在刷也这样：别的设备隔多久才问一次都读得到、轮得上。不轮流也不会丢包了就是跟上了：
+/// 读到的按量到的速度消得掉，大接收缓冲放得下
 /// Devices taking turns under overload: as much as there is gets read first and what does not fit
 /// is dropped unparsed, so reading is far faster than handling and the socket no longer drops
 /// whatever comes for being full; then a batch is answered in turn. A single device flooding gets
-/// the same, so another asking however rarely is read and gets its turn. The end needs no judging
-/// of its own: with the queues not filling up and the drops stopped long enough, it has caught up
+/// the same, so another asking however rarely is read and gets its turn. It has caught up once
+/// there would be no drops without turns either: what is read is worked off at the measured speed
+/// and the large receive buffer holds it
 #[cfg(target_os = "linux")]
 struct TakingTurns {
     queue: FairQueue<udp_batch::Peer>,
     /// 答一批之前已经读了几批 / How many batches were read before answering one
     reads: usize,
+    /// 不轮流的话接收缓冲里会积着多少查询：读到的加上，按量到的速度消掉。轮流时读得比处理快，缓冲满不了，排不下
+    /// 的也只是这台设备超出了自己那一份，所以看这个数：超过缓冲放得下的，不轮流也会丢包，才算还跟不上
+    /// How many queries the receive buffer would hold without turns: what is read adds to it and the
+    /// measured speed works it off. Taking turns reads faster than it handles, so the buffer does not
+    /// fill, and what does not fit only means a device went past its share; this tells instead: past
+    /// what the buffer holds there would be drops without turns, and only that is still falling behind
+    backlog: usize,
+    /// `backlog` 上次算到的时刻 / When `backlog` was last worked out
+    counted_at: Instant,
+    /// 接收缓冲放得下多少个查询 / How many queries the receive buffer holds
+    holds: usize,
 }
 
 /// 答一批之前最多读这么多批，再多的洪泛也要留时间处理 / At most this many batches are read before one is
@@ -1416,34 +1454,55 @@ const READS_PER_TURN: usize = 64;
 
 #[cfg(target_os = "linux")]
 impl TakingTurns {
-    fn new(room: usize) -> Self {
+    fn new(room: usize, holds: usize) -> Self {
         Self {
             queue: FairQueue::new(room),
             reads: 0,
+            backlog: 0,
+            counted_at: Instant::now(),
+            holds,
         }
     }
 
-    /// 收到的排进队列，排不下的丢掉并记下：这也算还在丢包 / Queues what was received and drops what does
-    /// not fit, noting it: that counts as still dropping too
+    /// 收到的排进队列，排不下的丢掉。丢掉的不算跟不上：一台设备一次发得比自己那一份多、平均却没到处理能力，不轮流的话
+    /// 大缓冲照样接得住；不轮流也会丢包时才算
+    /// Queues what was received and drops what does not fit. What is dropped is not falling behind: a
+    /// device sending more than its share at once but below capacity on average would be caught by
+    /// the large buffer without turns; only drops that would happen without turns count
     fn queue_received(
         &mut self,
         received: &udp_batch::Received,
         got: usize,
         answering: &mut UdpAnswering<'_>,
     ) {
-        let mut dropped = false;
         for k in 0..got {
             let Some((packet, peer)) = received.get(k) else {
                 continue;
             };
             if !self.queue.offer(packet, Device::of(peer.addr().ip()), peer) {
                 answering.engine.permit_manager.count_refused();
-                dropped = true;
             }
         }
-        if dropped {
-            answering.behind_at = Instant::now();
+        let now = Instant::now();
+        if self.would_overflow(got, answering.queries_within_target, now) {
+            answering.behind_at = now;
         }
+    }
+
+    /// 记下又读到 `got` 个，`within_target` 是 `QUEUE_TARGET` 内处理得完多少；不轮流的话接收缓冲这会儿放不下了，
+    /// 返回 true。放不下的那些内核会丢掉，所以积压到缓冲放得下的为止
+    /// Notes `got` more read, `within_target` being how many are handled within `QUEUE_TARGET`, and
+    /// gives true when the receive buffer would by now overflow without turns. The kernel would drop
+    /// what does not fit, so the backlog stops at what the buffer holds
+    fn would_overflow(&mut self, got: usize, within_target: usize, now: Instant) -> bool {
+        let took = now.saturating_duration_since(std::mem::replace(&mut self.counted_at, now));
+        let handled = within_target as u128 * took.as_nanos() / QUEUE_TARGET.as_nanos();
+        let backlog = self
+            .backlog
+            .saturating_sub(usize::try_from(handled).unwrap_or(usize::MAX))
+            .saturating_add(got);
+        self.backlog = backlog.min(self.holds);
+        backlog > self.holds
     }
 
     fn may_read_more(&mut self) -> bool {
@@ -1463,12 +1522,12 @@ impl TakingTurns {
             let Some((packet, peer, more_queued)) = self.queue.next_in_turn() else {
                 return;
             };
-            // 内核跟不上：还排着队的设备这一个不解析就丢，发得少的设备照常答
+            // 内核跟不上：还排着队的设备这一个不解析就丢，发得少的设备照常答。丢的和排不下的一样，不算跟不上
             // Falling behind: a device with more queued loses this one unparsed, and a device
-            // sending little is answered as usual
+            // sending little is answered as usual. As with what does not fit, this drop is not
+            // falling behind
             if more_queued && answering.engine.falling_behind() {
                 manager.count_refused();
-                answering.behind_at = Instant::now();
                 continue;
             }
             if answering.answer(&packet, peer.addr(), replies.next_buf()) {
@@ -1573,20 +1632,20 @@ async fn receive_one_by_one(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
 /// 要等上游的查询交给单独的任务，在请求时限内回答，答不上回 SERVFAIL。流控拒绝时（过载），
 /// 快速解析成了的立刻回一个现成的 SERVFAIL，非阻塞发送（发送缓冲满就丢掉，背压）；没成
 /// 的多半是畸形包，静默丢弃——过载时要做最便宜的拒绝，对已经解析失败的包再完整解析一遍只会加重过载，
-/// hickory 大概率同样失败。
+/// hickory 大概率同样失败。流控拒绝时返回 false。
 /// A query that waits on an upstream goes to its own task, answered within the request
 /// timeout and SERVFAIL when it cannot be. When flow control refuses it (overload), a query
 /// the quick parse read gets a ready-made SERVFAIL at
 /// once, sent without blocking (dropped when the send buffer is full, as backpressure); one
 /// it could not read is most likely malformed and dropped silently. Overload rejection must
 /// be cheap, and a full parse of an already-failed packet wastes CPU, as hickory most
-/// likely fails too.
+/// likely fails too. Gives false when flow control refused it.
 fn spawn_udp_answer(
     answering: &UdpAnswering<'_>,
     packet: bytes::Bytes,
     peer: SocketAddr,
     pre_parsed: Option<PreParsedData>,
-) {
+) -> bool {
     // 轮流时内核跟不上已经丢过了，轮到这里的都该答，只看内存 / Taking turns, falling behind has already
     // dropped what it should, and what gets here is to be answered by memory alone
     let client = peer.ip();
@@ -1601,7 +1660,7 @@ fn spawn_udp_answer(
         {
             try_send_udp_response(answering.socket, &packet, &response, peer);
         }
-        return;
+        return false;
     };
     let engine = Arc::clone(answering.engine);
     let socket = Arc::clone(answering.socket);
@@ -1633,6 +1692,7 @@ fn spawn_udp_answer(
             debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
         }
     });
+    true
 }
 
 async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
@@ -2867,9 +2927,11 @@ mod tests {
         )
     }
 
-    /// 跟不上持续够久、刚才还在跟不上、开着流控，三样都有才算过载；丢包和拒绝都算跟不上
+    /// 跟不上持续够久、刚才还在跟不上、开着流控，三样都有才算过载；丢包和这个 worker 自己的查询被拒都算跟不上，
+    /// 别处的拒绝不算
     /// Overload takes all three: falling behind for long enough, still so a moment ago, and flow
-    /// control on; drops and refusals both count as falling behind
+    /// control on; drops and refusals of this worker's own queries both count as falling behind,
+    /// refusals elsewhere do not
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn overload_takes_lasting_trouble_and_flow_control() {
@@ -2904,10 +2966,20 @@ mod tests {
         look(&mut answering, long_ago(), long_ago(), drops);
         assert!(!answering.overloaded, "it is over");
 
-        // 拒绝也算 / Refusals count too
+        // 自己的查询被拒也算；别的 worker、TCP 和 DoH 的拒绝不算 / Its own queries refused count too;
+        // refusals in another worker or over TCP and DoH do not
         with_flow.permit_manager.count_refused();
         look(&mut answering, long_ago(), long_ago(), drops);
-        assert!(answering.behind_at.elapsed() < CAUGHT_UP_AFTER, "a refusal");
+        assert!(
+            answering.behind_at.elapsed() > CAUGHT_UP_AFTER,
+            "a refusal elsewhere"
+        );
+        answering.refused = true;
+        look(&mut answering, long_ago(), long_ago(), drops);
+        assert!(
+            answering.behind_at.elapsed() < CAUGHT_UP_AFTER,
+            "its own refusal"
+        );
         let at = long_ago();
         look(&mut answering, long_ago(), at, drops);
         assert_eq!(answering.behind_at, at, "no new refusal");
@@ -2918,9 +2990,9 @@ mod tests {
         assert!(!answering.overloaded, "flow control off");
     }
 
-    /// 轮流时跟不上：还排着队的设备丢一个，只排了一个的照常答；丢的算还在跟不上
+    /// 轮流时跟不上：还排着队的设备丢一个，只排了一个的照常答；丢的本身不算还在跟不上，那要看积压
     /// Falling behind while taking turns: a device with more queued loses one and one with a
-    /// single query is answered; what is dropped counts as still falling behind
+    /// single query is answered; the drop itself is not still falling behind, the backlog tells that
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn falling_behind_drops_only_from_a_device_with_more_queued() {
@@ -2951,7 +3023,7 @@ mod tests {
             *heavy -= 1;
             light
         };
-        let mut turns = TakingTurns::new(1000);
+        let mut turns = TakingTurns::new(1000, QUERIES_IN_RECV_BUFFER);
         let light = fill(&mut turns, &mut heavy);
 
         // 没跟不上时都答 / All are answered when not falling behind
@@ -2977,13 +3049,18 @@ mod tests {
             "the light device, and the last of the other"
         );
         assert_eq!(replies.get(0).unwrap().1, peer(light).addr());
-        assert!(answering.behind_at.elapsed() < CAUGHT_UP_AFTER);
+        assert!(
+            answering.behind_at.elapsed() > CAUGHT_UP_AFTER,
+            "a drop is no sign of falling behind"
+        );
     }
 
-    /// 排不下的丢掉并记下，算还在跟不上 / What does not fit is dropped and noted, counting as still falling behind
+    /// 排不下的丢掉并计数；不轮流的话缓冲放得下就不算跟不上，放不下才算
+    /// What does not fit is dropped and counted; it is falling behind only when the buffer would
+    /// not hold it without turns either
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn what_does_not_fit_counts_as_still_falling_behind() {
+    async fn what_does_not_fit_counts_only_when_the_buffer_would_overflow() {
         use std::os::fd::AsRawFd;
 
         let engine = static_engine_with_flow_control();
@@ -3001,16 +3078,122 @@ mod tests {
         let got = received.recv(socket.as_raw_fd()).unwrap();
         assert_eq!(got, 5);
 
-        let mut turns = TakingTurns::new(2);
+        let mut turns = TakingTurns::new(2, QUERIES_IN_RECV_BUFFER);
         answering.behind_at = Instant::now() - Duration::from_secs(5);
         turns.queue_received(&received, got, &mut answering);
         assert_eq!(engine.permit_manager.dropped_requests(), 3);
-        assert!(answering.behind_at.elapsed() < CAUGHT_UP_AFTER);
+        assert!(
+            answering.behind_at.elapsed() > CAUGHT_UP_AFTER,
+            "the buffer would hold them"
+        );
 
-        let mut turns = TakingTurns::new(100);
-        answering.behind_at = Instant::now() - Duration::from_secs(5);
+        // 积压已经满了，不轮流的话这几个内核会丢 / With the backlog full, the kernel would drop these
+        // without turns
+        let mut turns = TakingTurns::new(100, QUERIES_IN_RECV_BUFFER);
+        turns.backlog = turns.holds;
+        turns.counted_at = Instant::now() + Duration::from_secs(3600);
         turns.queue_received(&received, got, &mut answering);
-        assert!(answering.behind_at.elapsed() > CAUGHT_UP_AFTER, "all fit");
+        assert!(
+            answering.behind_at.elapsed() < CAUGHT_UP_AFTER,
+            "past the buffer"
+        );
+        assert_eq!(engine.permit_manager.dropped_requests(), 3, "all fit");
+    }
+
+    /// 不轮流时的积压：读到的加上，按量到的速度消掉，到缓冲放得下的为止
+    /// The backlog without turns: what is read adds to it, the measured speed works it off, and it
+    /// stops at what the buffer holds
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_backlog_without_turns_is_worked_off_at_the_measured_speed() {
+        let start = Instant::now();
+        let mut turns = TakingTurns::new(10, QUERIES_IN_RECV_BUFFER);
+        turns.counted_at = start;
+        assert!(
+            !turns.would_overflow(QUERIES_IN_RECV_BUFFER, 64, start),
+            "just full"
+        );
+        assert!(turns.would_overflow(1, 64, start), "one more");
+        assert_eq!(turns.backlog, QUERIES_IN_RECV_BUFFER);
+        let later = start + QUEUE_TARGET;
+        assert!(!turns.would_overflow(64, 64, later), "64 handled meanwhile");
+        assert!(turns.would_overflow(1, 64, later));
+        let much_later = later + Duration::from_secs(3600);
+        assert!(!turns.would_overflow(0, 64, much_later));
+        assert_eq!(turns.backlog, 0, "worked off");
+
+        // 每半秒发一批、比份额多得多，平均却没到处理能力：缓冲接得住 / A batch far past the share
+        // every half second, below capacity on average: the buffer catches it
+        let mut at = much_later;
+        for _ in 0..20 {
+            at += Duration::from_millis(500);
+            assert!(
+                !turns.would_overflow(1000, 64, at),
+                "{} held",
+                turns.backlog
+            );
+        }
+        // 平均超出处理能力：迟早放不下 / Past capacity on average: sooner or later it does not fit
+        let overflowed = (0..100).any(|_| {
+            at += Duration::from_millis(500);
+            turns.would_overflow(2000, 64, at)
+        });
+        assert!(overflowed);
+    }
+
+    /// 洪泛停了，一台设备每次发得比自己那一份多、平均却没到处理能力：排不下的照丢，跟上了轮流就结束，不会自己一直撑着
+    /// The flood over, a device sending more than its share each time but below capacity on
+    /// average: what does not fit still goes, and turns end on catching up instead of keeping
+    /// themselves going
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_burst_past_the_share_does_not_keep_turns_going() {
+        use std::os::fd::AsRawFd;
+
+        let engine = static_engine_with_flow_control();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        socket2::SockRef::from(socket.as_ref())
+            .set_recv_buffer_size(UDP_BUFFER_SIZE)
+            .unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let pending = Arc::new(PendingReplies::default());
+        let mut answering = UdpAnswering::new(&socket, &engine, &pending);
+        let mut turns = answering.begin_turns();
+        answering.overloaded = true;
+        answering.behind_at = Instant::now() - CAUGHT_UP_AFTER - Duration::from_millis(1);
+        // 跟不上的时候还排着队的也要丢 / Falling behind drops from devices with more queued too
+        engine
+            .flow_control_state
+            .as_ref()
+            .unwrap()
+            .note_queue_delay(Duration::from_secs(3600));
+
+        let burst = 3 * answering.queries_within_target;
+        let packet = query("burst.test", 1);
+        for _ in 0..burst {
+            client
+                .send_to(&packet, socket.local_addr().unwrap())
+                .unwrap();
+        }
+        let mut received = udp_batch::Received::default();
+        let mut read = 0;
+        while read < burst {
+            let got = received.recv(socket.as_raw_fd()).unwrap();
+            turns.queue_received(&received, got, &mut answering);
+            read += got;
+        }
+        let mut replies = udp_batch::Replies::default();
+        while !turns.queue.is_empty() {
+            turns.answer_in_turn(&mut answering, &mut replies);
+            replies.clear();
+        }
+        assert!(
+            engine.permit_manager.dropped_requests() as usize > burst / 2,
+            "past its share"
+        );
+        answering.socket_ran_empty();
+        assert!(!answering.taking_turns, "caught up");
+        assert!(!answering.overloaded);
     }
 
     /// 轮流时只看内存：内核跟不上也不回 SERVFAIL，该丢的已经丢了；不轮流时照常拒绝
@@ -3032,11 +3215,20 @@ mod tests {
         answering.emptied_at = Instant::now() - Duration::from_secs(1);
         answering.answer(&query("a.queue.test", 1), peer, &mut reply);
         assert_eq!(engine.permit_manager.dropped_requests(), 1);
+        assert!(answering.refused, "noted as its own refusal");
 
+        answering.refused = false;
         answering.taking_turns = true;
         answering.answer(&query("b.queue.test", 2), peer, &mut reply);
         assert_eq!(engine.permit_manager.dropped_requests(), 1);
         assert_eq!(engine.permit_manager.inflight(), 1);
+        assert!(!answering.refused);
+
+        // 快速解析读不了、从头解析的也记下 / One the quick parse cannot read, parsed from scratch, is noted too
+        answering.taking_turns = false;
+        answering.answer(&query_parsed_from_scratch(3), peer, &mut reply);
+        assert_eq!(engine.permit_manager.dropped_requests(), 2);
+        assert!(answering.refused, "noted from the full path too");
     }
 
     /// 轮流要等跟上才结束：还在跟不上时 socket 收空也继续 / Turns end only on catching up: still falling
@@ -3076,7 +3268,7 @@ mod tests {
             turns.queue.offer(&packet, Device::of(ip.into()), peer);
         };
 
-        let mut turns = TakingTurns::new(1000);
+        let mut turns = TakingTurns::new(1000, QUERIES_IN_RECV_BUFFER);
         offer(&mut turns, 1);
         turns.answer_in_turn(&mut answering, &mut replies);
         assert_eq!(replies.len(), 1);
@@ -3090,7 +3282,8 @@ mod tests {
         assert_eq!(replies.len(), udp_batch::BATCH, "one batch per turn");
     }
 
-    /// 开始轮流时记下状态，队列按量到的速度算 / Beginning turns is noted, with a queue sized by the measured speed
+    /// 开始轮流时记下状态，队列按量到的速度算，积压按接收缓冲实际放得下的算 / Beginning turns is noted, with a
+    /// queue sized by the measured speed and the backlog by what the receive buffer actually holds
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn turns_begin_with_room_from_the_measured_speed() {
@@ -3099,8 +3292,13 @@ mod tests {
         let pending = Arc::new(PendingReplies::default());
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
         answering.queries_within_target = 2;
+        let sock = socket2::SockRef::from(socket.as_ref());
+        sock.set_recv_buffer_size(100_000).unwrap();
         let mut turns = answering.begin_turns();
         assert!(answering.taking_turns);
+        let holds = sock.recv_buffer_size().unwrap() / (2 * RECV_BUFFER_PER_QUERY);
+        assert_eq!(turns.holds, holds, "as much as the buffer actually holds");
+        assert!(holds < QUERIES_IN_RECV_BUFFER);
         let device = Device::of([192, 0, 2, 1].into());
         let peer = udp_batch::Peer::of(SocketAddr::from(([192, 0, 2, 1], 53000)));
         assert!(turns.queue.offer(b"q", device, peer));
@@ -3121,7 +3319,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn reads_before_a_turn_have_a_limit() {
-        let mut turns = TakingTurns::new(100);
+        let mut turns = TakingTurns::new(100, QUERIES_IN_RECV_BUFFER);
         let allowed = (0..100).take_while(|_| turns.may_read_more()).count();
         assert_eq!(allowed, READS_PER_TURN - 1);
     }
