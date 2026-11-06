@@ -61,7 +61,7 @@ impl FlowControlState {
     }
 
     #[inline]
-    fn behind(&self) -> bool {
+    pub fn behind(&self) -> bool {
         (self.started.elapsed().as_nanos() as u64) < self.behind_until_ns.load(Ordering::Relaxed)
     }
 

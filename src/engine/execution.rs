@@ -328,6 +328,14 @@ impl Engine {
         }
     }
 
+    /// 内核现在跟不上吗（没开流控时不算）/ Whether the kernel is falling behind now (not without flow control)
+    #[inline]
+    pub fn falling_behind(&self) -> bool {
+        self.flow_control_state
+            .as_ref()
+            .is_some_and(|state| state.behind())
+    }
+
     /// Get the configured upstream timeout in milliseconds
     /// 获取配置的上游超时时间（毫秒）
     #[inline]
