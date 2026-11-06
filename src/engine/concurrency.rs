@@ -7,11 +7,20 @@ use std::time::{Duration, Instant};
 /// latency goal rather than a property of the machine, the same on a fast one and a slow one
 pub const QUEUE_TARGET: Duration = Duration::from_millis(20);
 
+/// socket 连续这么久没收空，才算内核忙。这也是延迟目标、和机器无关：积压持续这么久才是过载，一阵突发很快
+/// 就收空了，不算。配置决定不了它，旧配置里写的 `flow_control_latency_threshold_ms` 不起作用
+/// A socket going this long without running empty is what counts as the kernel being busy. This too
+/// is a latency goal and not a property of the machine: a backlog lasting this long is overload, while
+/// a burst soon runs empty and does not count. No configuration sets it, and an old configuration's
+/// `flow_control_latency_threshold_ms` has no effect
+pub const BUSY_AFTER: Duration = Duration::from_millis(100);
+
 /// 流控的状态。不用填数字，判断都来自运行时测到的：socket 收不收得空、查询排队多久、还剩多少内存
 /// The state of flow control. There are no numbers to fill in: it goes by what is measured at
 /// run time, namely whether a socket runs empty, how long queries queue and how much memory is left
 pub struct FlowControlState {
-    /// socket 连续这么久没收空就算忙 / How long a socket goes without running empty before that counts as busy
+    /// socket 连续这么久没收空就算忙，就是 `BUSY_AFTER`（测试可以换）/ How long a socket goes without
+    /// running empty before that counts as busy: `BUSY_AFTER` (a test may change it)
     pub busy_after: Duration,
     pub memory: super::memory_watermark::MemoryWatermark,
     started: Instant,
@@ -20,9 +29,9 @@ pub struct FlowControlState {
 }
 
 impl FlowControlState {
-    pub fn new(busy_after: Duration, memory: super::memory_watermark::MemoryWatermark) -> Self {
+    pub fn new(memory: super::memory_watermark::MemoryWatermark) -> Self {
         Self {
-            busy_after,
+            busy_after: BUSY_AFTER,
             memory,
             started: Instant::now(),
             behind_until_ns: AtomicU64::new(0),
@@ -217,7 +226,9 @@ mod tests {
     use crate::engine::memory_watermark::{MemoryLeft, MemoryReading, MemoryWatermark};
 
     fn state(busy_after: Duration) -> FlowControlState {
-        FlowControlState::new(busy_after, MemoryWatermark::reading(MemoryReading::default))
+        let mut state = FlowControlState::new(MemoryWatermark::reading(MemoryReading::default));
+        state.busy_after = busy_after;
+        state
     }
 
     const LONG_AGO: Duration = Duration::from_secs(61);

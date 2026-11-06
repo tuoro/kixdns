@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
@@ -212,7 +211,6 @@ impl Engine {
         let permit_manager = Arc::new(PermitManager::new());
         let flow_control_state = settings.flow_control_enabled.then(|| {
             Arc::new(FlowControlState::new(
-                Duration::from_millis(settings.flow_control_latency_threshold_ms),
                 super::memory_watermark::MemoryWatermark::of_this_machine(),
             ))
         });

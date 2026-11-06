@@ -144,9 +144,9 @@ pub struct GlobalSettings {
     /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
     #[serde(default = "default_flow_control_max_permits")]
     pub flow_control_max_permits: usize,
-    /// 接收 socket 连续多久没收空就算内核忙（毫秒，仅在flow_control_enabled=true时有效），只有忙的时候才可能拒绝查询；0 表示一直算忙
-    /// How long a receiving socket goes without running empty before the kernel counts as busy (milliseconds, only
-    /// effective when flow_control_enabled=true); queries may be refused only while busy, and 0 means always busy
+    /// 不再使用，保留只为旧配置还能加载：内核忙不忙由智能流控自己判断（见 `BUSY_AFTER`）
+    /// No longer used, kept only so old configurations load: smart flow control judges for itself
+    /// whether the kernel is busy (see `BUSY_AFTER`)
     #[serde(default = "default_flow_control_latency_threshold_ms")]
     pub flow_control_latency_threshold_ms: u64,
     /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
@@ -784,10 +784,15 @@ impl GlobalSettings {
             }};
         }
         restart_pending!(
-            // 重载即生效（统计开关和 GeoIP 自动转换、国家过滤已经不起作用）
+            // 重载即生效（统计开关、GeoIP 自动转换和国家过滤、流控的几个旧数字已经不起作用）
             // Applied on a reload (the statistics switches, GeoIP auto-conversion and
-            // country filter no longer do anything)
+            // country filter, and flow control's old numbers no longer do anything)
             reload: [
+                flow_control_initial_permits,
+                flow_control_min_permits,
+                flow_control_max_permits,
+                flow_control_latency_threshold_ms,
+                flow_control_adjustment_interval_secs,
                 min_ttl,
                 default_upstream,
                 default_upstream_pre_split,
@@ -836,11 +841,6 @@ impl GlobalSettings {
                 doq_keepalive_interval_ms,
                 doq_enable_0rtt,
                 flow_control_enabled,
-                flow_control_initial_permits,
-                flow_control_min_permits,
-                flow_control_max_permits,
-                flow_control_latency_threshold_ms,
-                flow_control_adjustment_interval_secs,
             ],
         )
     }
@@ -2470,6 +2470,13 @@ mod validation_tests {
         configured.upstream_timeout_ms += 1;
         configured.serve_stale = !configured.serve_stale;
         configured.default_upstream = "9.9.9.9:53".to_string();
+        // 流控的几个旧数字不起作用，改了也不用重启 / Flow control's old numbers do nothing, so
+        // changing them needs no restart
+        configured.flow_control_initial_permits += 1;
+        configured.flow_control_min_permits += 1;
+        configured.flow_control_max_permits += 1;
+        configured.flow_control_latency_threshold_ms += 1;
+        configured.flow_control_adjustment_interval_secs += 1;
         assert_eq!(
             configured.restart_pending(&running),
             ["bind_udp", "cache_capacity", "flow_control_enabled"]

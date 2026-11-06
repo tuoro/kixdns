@@ -419,11 +419,6 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         doq_keepalive_interval_ms,
         doq_enable_0rtt,
         flow_control_enabled,
-        flow_control_initial_permits,
-        flow_control_min_permits,
-        flow_control_max_permits,
-        flow_control_latency_threshold_ms,
-        flow_control_adjustment_interval_secs,
         serve_stale,
         serve_stale_ttl,
         serve_stale_expire_ttl,
@@ -442,6 +437,11 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         // 已不起作用（见 `GlobalSettings`），不让缓存换代
         statistics_enabled: _,
         statistics_anonymize_client_ip: _,
+        flow_control_initial_permits: _,
+        flow_control_min_permits: _,
+        flow_control_max_permits: _,
+        flow_control_latency_threshold_ms: _,
+        flow_control_adjustment_interval_secs: _,
     } = settings;
 
     (
@@ -478,14 +478,9 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         doq_keepalive_interval_ms,
         doq_enable_0rtt,
         flow_control_enabled,
-        flow_control_initial_permits,
-        flow_control_min_permits,
-        flow_control_max_permits,
-        flow_control_latency_threshold_ms,
     )
         .hash(hasher);
     (
-        flow_control_adjustment_interval_secs,
         serve_stale,
         serve_stale_ttl,
         serve_stale_expire_ttl,
@@ -733,6 +728,26 @@ mod tests {
         let mut after_config = before_config.clone();
         after_config.settings.statistics_enabled = true;
         after_config.settings.statistics_anonymize_client_ip = true;
+        let before = build_cache_namespaces(&before_config);
+        let after = build_cache_namespaces(&after_config);
+
+        assert_eq!(before.get("first"), after.get("first"));
+        assert_eq!(before.get("second"), after.get("second"));
+    }
+
+    /// 流控的几个旧数字已被智能流控替代、不起作用，改它们不让缓存换代
+    /// Flow control's old numbers were replaced by smart flow control and do nothing, so
+    /// changing them leaves the caches alone
+    #[test]
+    fn flow_control_old_numbers_leave_namespaces_alone() {
+        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let mut after_config = before_config.clone();
+        let settings = &mut after_config.settings;
+        settings.flow_control_initial_permits += 1;
+        settings.flow_control_min_permits += 1;
+        settings.flow_control_max_permits += 1;
+        settings.flow_control_latency_threshold_ms += 1;
+        settings.flow_control_adjustment_interval_secs += 1;
         let before = build_cache_namespaces(&before_config);
         let after = build_cache_namespaces(&after_config);
 
