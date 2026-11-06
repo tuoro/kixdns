@@ -1647,10 +1647,11 @@ fn spawn_udp_answer(
 ) {
     // 轮流时内核跟不上已经丢过了，轮到这里的都该答，只看内存 / Taking turns, falling behind has already
     // dropped what it should, and what gets here is to be answered by memory alone
+    let client = peer.ip();
     let permit = if answering.taking_turns {
-        answering.engine.stream_query_permit()
+        answering.engine.stream_query_permit(client)
     } else {
-        answering.engine.query_permit(answering.emptied_at)
+        answering.engine.query_permit(answering.emptied_at, client)
     };
     let Some(permit) = permit else {
         if let Some(pre_parsed) = pre_parsed
@@ -1713,7 +1714,7 @@ async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
         // 否则与对端的 delayed-ACK 定时器交互导致每查询约 40ms 延迟。
         stream.set_nodelay(true).ok();
         // 内存不够时不接新连接，已有的连接照常 / With too little memory no new connection is taken, and those there go on
-        let Some(permit) = engine.stream_query_permit() else {
+        let Some(permit) = engine.stream_query_permit(peer.ip()) else {
             continue;
         };
         let engine = engine.clone();
@@ -1862,7 +1863,7 @@ async fn serve_tcp_conn(
             let Some(pre_parsed) = async_needed else {
                 continue;
             };
-            let Some(permit) = engine.stream_query_permit() else {
+            let Some(permit) = engine.stream_query_permit(peer.ip()) else {
                 if let Some(response) =
                     engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
                 {
@@ -3576,7 +3577,7 @@ mod tests {
         // 看够了次数，下一次读到内存不够 / Enough looks for the next read to find memory short
         available.store(0, std::sync::atomic::Ordering::Relaxed);
         for _ in 0..3000 {
-            drop(engine.stream_query_permit());
+            drop(engine.stream_query_permit(std::net::Ipv4Addr::LOCALHOST.into()));
         }
         send_tcp_query(&mut stream).await;
         let mut length = [0u8; 2];
@@ -3644,6 +3645,111 @@ mod tests {
         assert_eq!(engine.permit_manager.dropped_requests(), 1);
         assert_eq!(engine.permit_manager.inflight(), 1000, "it holds nothing");
         server.abort();
+    }
+
+    /// 从 `local` 连 `to` / Connects to `to` from `local`
+    async fn connect_from(local: std::net::IpAddr, to: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::new(local, 0)).unwrap();
+        socket.connect(to).await.unwrap()
+    }
+
+    /// 内存紧张时，在途占满的那台设备的查询和新连接被拒，别的设备照常；UDP 和 TCP 都按真实的对端地址算
+    /// With memory tight, the device holding everything in flight has its queries and new
+    /// connections refused while another goes on; UDP and TCP both go by the real peer address
+    #[tokio::test]
+    async fn tight_memory_refuses_only_the_device_holding_the_queries() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let available = memory_left(1 << 30);
+        let (engine, plain) =
+            engine_short_of_memory(upstream.local_addr().unwrap(), Arc::clone(&available));
+        drop(plain);
+        let manager = &engine.permit_manager;
+        let heavy = IpAddr::from(Ipv4Addr::new(127, 0, 0, 4));
+        // 和它不在同一份的另一台：份是按每次启动都不同的哈希分的 / Another device, not in the same
+        // slot: slots go by a hash that differs at each start
+        let light = (2..=250)
+            .map(|n| IpAddr::from(Ipv4Addr::new(127, 0, 0, n)))
+            .find(|ip| manager.slot_of(*ip) != manager.slot_of(heavy))
+            .unwrap();
+        let held: Vec<_> = (0..1000)
+            .map(|_| engine.stream_query_permit(heavy).expect("plenty of memory"))
+            .collect();
+        // 内存还够时它先连上一条 TCP / While memory is plenty it opens a TCP connection first
+        let (address, tcp) = tcp_server(&engine).await;
+        let mut heavy_connected = connect_from(heavy, address).await;
+        in_flight_reaches(&engine, 1001).await;
+        // 余量 64 MiB、两倍 128 MiB，剩 100 MiB 算紧张；看够了次数，下一次读到它
+        // A 64 MiB margin, twice that 128 MiB: 100 MiB left is tight; enough looks for the next read to find it
+        available.store(100 << 20, Relaxed);
+        for _ in 0..3000 {
+            drop(engine.stream_query_permit(heavy));
+        }
+        assert!(engine.stream_query_permit(heavy).is_none(), "tight now");
+
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let worker = tokio::spawn(run_udp_worker(0, Arc::clone(&server), engine.clone()));
+        let mut buf = [0u8; 512];
+        let light_client = UdpSocket::bind(SocketAddr::new(light, 0)).await.unwrap();
+        light_client
+            .send_to(&dns_query(), server_addr)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), upstream.recv_from(&mut buf))
+            .await
+            .expect("the light device's query is asked of the upstream")
+            .unwrap();
+        in_flight_reaches(&engine, 1002).await;
+
+        let heavy_client = UdpSocket::bind(SocketAddr::new(heavy, 0)).await.unwrap();
+        heavy_client
+            .send_to(&dns_query(), server_addr)
+            .await
+            .unwrap();
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), heavy_client.recv_from(&mut buf))
+                .await
+                .expect("the heavy device is refused at once")
+                .unwrap();
+        // 1 秒内就回 SERVFAIL 就是被拒了：放行的要等这个不回答的上游超时，至少 3 秒。上游收没收到不在这里看，
+        // 发得少的那个查询还挂在它上面，可能重发 / SERVFAIL within a second means refused: one let through waits
+        // for this silent upstream to time out, 3 s at least. What the upstream receives is not looked at here, as
+        // the light device's query still hangs on it and may be sent again
+        let reply = Message::from_bytes(&buf[..len]).unwrap();
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+
+        // 它在已有的连接上发的查询也被拒，当场回 SERVFAIL / Its query on the connection it has is refused
+        // too, with SERVFAIL at once
+        send_tcp_query(&mut heavy_connected).await;
+        let mut length = [0u8; 2];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            heavy_connected.read_exact(&mut length),
+        )
+        .await
+        .expect("refused at once")
+        .unwrap();
+        let mut reply = vec![0u8; u16::from_be_bytes(length) as usize];
+        heavy_connected.read_exact(&mut reply).await.unwrap();
+        let reply = Message::from_bytes(&reply).unwrap();
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+
+        let mut heavy_stream = connect_from(heavy, address).await;
+        let read = tokio::time::timeout(Duration::from_secs(1), heavy_stream.read(&mut buf))
+            .await
+            .expect("its new connection is closed at once");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        let before = engine.permit_manager.inflight();
+        let light_stream = connect_from(light, address).await;
+        in_flight_reaches(&engine, before + 1).await;
+
+        drop((held, light_stream, heavy_connected));
+        worker.abort();
+        tcp.abort();
     }
 
     #[tokio::test]

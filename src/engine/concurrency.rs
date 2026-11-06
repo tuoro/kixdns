@@ -1,6 +1,10 @@
+use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use super::fair_queue::Device;
+use super::memory_watermark::Room;
 
 /// 查询在内核里排队超过这么久，就算内核跟不上。这是延迟目标，和机器无关：快机器和慢机器都一样
 /// Queries waiting longer than this inside the kernel means it cannot keep up. This is a
@@ -38,23 +42,40 @@ impl FlowControlState {
         }
     }
 
-    /// 一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝；内核忙而且
-    /// 查询在内核里排着长队时也拒绝。等上游不算排队，所以上游再慢，这样的查询也不会被拒绝
-    /// Whether a query that waits on an upstream can go ahead, `emptied_at` being when the socket
-    /// last ran empty. Too little memory refuses it, and so does the kernel being busy with
-    /// queries queueing long inside it. Waiting on an upstream is not queueing, so however slow
-    /// the upstream, such queries are not refused
+    /// `device` 的一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝
+    /// （见 [`Self::memory_refuses`]）；内核忙而且查询在内核里排着长队时也拒绝。等上游不算排队，所以
+    /// 上游再慢，这样的查询也不会被拒绝
+    /// Whether a query from `device` that waits on an upstream can go ahead, `emptied_at` being
+    /// when the socket last ran empty. Too little memory refuses it (see [`Self::memory_refuses`]),
+    /// and so does the kernel being busy with queries queueing long inside it. Waiting on an
+    /// upstream is not queueing, so however slow the upstream, such queries are not refused
     #[inline]
-    pub fn permit(&self, manager: &Arc<PermitManager>, emptied_at: Instant) -> Option<PermitGuard> {
-        if !self.memory.has_room(manager.inflight()) {
+    pub fn permit(
+        &self,
+        manager: &Arc<PermitManager>,
+        emptied_at: Instant,
+        device: DeviceSlot,
+    ) -> Option<PermitGuard> {
+        if self.memory_refuses(manager, device) || (self.busy(emptied_at) && self.behind()) {
             manager.count_refused();
             return None;
         }
-        if self.busy(emptied_at) && self.behind() {
-            manager.count_refused();
-            return None;
+        Some(manager.acquire_for(device))
+    }
+
+    /// 内存够不够 `device` 再接一个：没了谁都不接；紧张时，在途的不比各设备平均少的设备不接，发得少的
+    /// 照常——一台设备把内存占满时先拦住它，别的设备不受连累
+    /// Whether memory refuses one more for `device`: with none left everyone is refused; when it
+    /// is tight, a device holding no less in flight than the average across devices is refused and
+    /// those sending little go on, so a device filling the memory is stopped first and the others
+    /// are not held up with it
+    #[inline]
+    fn memory_refuses(&self, manager: &PermitManager, device: DeviceSlot) -> bool {
+        match self.memory.room(manager.inflight()) {
+            Room::Plenty => false,
+            Room::Tight => manager.holds_its_share(device),
+            Room::Full => true,
         }
-        Some(manager.acquire())
     }
 
     /// 一个查询从排进去到开始跑等了 `delay`。超过目标就说明队里积着这么久的活，这段时间不接新查询，让它消化
@@ -88,15 +109,28 @@ impl FlowControlState {
     /// By memory alone: TCP and DoH have no socket running empty to tell by, so whether the
     /// kernel is busy does not come into it
     #[inline]
-    pub fn permit_by_memory(&self, manager: &Arc<PermitManager>) -> Option<PermitGuard> {
-        if self.memory.has_room(manager.inflight()) {
-            Some(manager.acquire())
-        } else {
+    pub fn permit_by_memory(
+        &self,
+        manager: &Arc<PermitManager>,
+        device: DeviceSlot,
+    ) -> Option<PermitGuard> {
+        if self.memory_refuses(manager, device) {
             manager.count_refused();
             None
+        } else {
+            Some(manager.acquire_for(device))
         }
     }
 }
+
+/// 按设备记在途数的份数：设备按哈希落到其中一份，哈希每次启动都不同，同一份的设备一起算一台
+/// How many slots the in-flight counts per device are kept in: a device lands in one by a hash
+/// that differs at each start, and devices in the same slot count as one
+const DEVICE_SLOTS: usize = 1024;
+
+/// 一台设备落在的那一份 / The slot a device lands in
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DeviceSlot(u16);
 
 /// 记着有多少查询和连接在处理、拒绝了多少 / Counts the queries and connections being handled, and those refused
 pub struct PermitManager {
@@ -104,6 +138,11 @@ pub struct PermitManager {
     pub(crate) active_permits: AtomicUsize,
     // Count of requests refused / 被拒绝的请求计数
     dropped_requests: AtomicU64,
+    /// 开了流控时，每一份设备在途的查询和连接 / With flow control on, the queries and connections in flight per slot of devices
+    device_inflight: Box<[AtomicU32]>,
+    /// 有在途的份数 / How many slots have something in flight
+    devices_in_flight: AtomicUsize,
+    hasher: RandomState,
 }
 
 impl Default for PermitManager {
@@ -117,13 +156,43 @@ impl PermitManager {
         Self {
             active_permits: AtomicUsize::new(0),
             dropped_requests: AtomicU64::new(0),
+            device_inflight: (0..DEVICE_SLOTS).map(|_| AtomicU32::new(0)).collect(),
+            devices_in_flight: AtomicUsize::new(0),
+            hasher: RandomState::new(),
         }
     }
 
     /// 拿一个 permit：这里不拒绝，只记着有多少在处理 / Takes a permit: nothing is refused here, this only counts what is being handled
     pub fn acquire(self: &Arc<Self>) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
-        PermitGuard::new(Arc::clone(self))
+        PermitGuard::new(Arc::clone(self), None)
+    }
+
+    /// 给 `device` 拿一个 permit，也记在它那一份上 / Takes a permit for `device`, counted in its slot as well
+    pub fn acquire_for(self: &Arc<Self>, device: DeviceSlot) -> PermitGuard {
+        self.active_permits.fetch_add(1, Ordering::Release);
+        if self.device_inflight[usize::from(device.0)].fetch_add(1, Ordering::Relaxed) == 0 {
+            self.devices_in_flight.fetch_add(1, Ordering::Relaxed);
+        }
+        PermitGuard::new(Arc::clone(self), Some(device))
+    }
+
+    /// 客户端地址所属的设备落在哪一份 / The slot the device of a client address lands in
+    #[inline]
+    pub fn slot_of(&self, client: std::net::IpAddr) -> DeviceSlot {
+        let hash = self.hasher.hash_one(Device::of(client));
+        DeviceSlot((hash % DEVICE_SLOTS as u64) as u16)
+    }
+
+    /// `device` 在途的是不是不比各设备的平均少：只有一台时就是它；没有在途的不算，因为只在内存紧张时问，
+    /// 那时在途至少有 1000 个
+    /// Whether `device` holds no less in flight than the average across devices: a lone one
+    /// does; one with nothing in flight does not, as this is asked only with memory tight, when
+    /// at least 1000 are in flight
+    fn holds_its_share(&self, device: DeviceSlot) -> bool {
+        let own = self.device_inflight[usize::from(device.0)].load(Ordering::Relaxed) as usize;
+        let devices = self.devices_in_flight.load(Ordering::Relaxed).max(1);
+        own.saturating_mul(devices) >= self.inflight()
     }
 
     /// 记下一个被拒绝的查询或连接，隔一阵记一条日志 / Counts a refused query or connection, with a log line now and then
@@ -142,8 +211,11 @@ impl PermitManager {
     /// wrapped counter reads as "full" and refuses every acquire until restart.
     /// 归还一个 permit。在 0 处饱和，计数永不回绕：回绕后的计数看起来是"满的"，
     /// 会拒绝所有 acquire 直到重启。
+    /// 记在某台设备上的，那一份也减一，减到 0 时有在途的份数也减一，同样在 0 处饱和
+    /// One counted for a device takes one off its slot too, and a slot reaching 0 takes one off
+    /// the slots in flight, saturating at zero in the same way
     #[inline]
-    fn release_one(&self) {
+    fn release_one(&self, device: Option<DeviceSlot>) {
         // Rust 1.99 renamed fetch_update to try_update. The crate declares no
         // minimum toolchain, so keep the old name, which every toolchain has,
         // until one is set at 1.99 or later.
@@ -155,6 +227,23 @@ impl PermitManager {
             .fetch_update(Ordering::Release, Ordering::Relaxed, |active| {
                 active.checked_sub(1)
             });
+        let Some(device) = device else {
+            return;
+        };
+        #[allow(deprecated)]
+        let was = self.device_inflight[usize::from(device.0)].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |held| held.checked_sub(1),
+        );
+        if was == Ok(1) {
+            #[allow(deprecated)]
+            let _ = self.devices_in_flight.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |devices| devices.checked_sub(1),
+            );
+        }
     }
 
     /// Get current inflight permits count / 获取当前进行中的 permits 数
@@ -177,13 +266,16 @@ impl PermitManager {
 /// 该守卫通过使用防御性编程技术，确保即使在panic场景下也能正确释放permits。
 pub struct PermitGuard {
     manager: Arc<PermitManager>,
+    /// 记在哪台设备的那一份上（开了流控时）/ The device slot it is counted in (with flow control on)
+    device: Option<DeviceSlot>,
     released: AtomicBool, // Track if already released to handle double-drop / 跟踪是否已释放以处理双重释放
 }
 
 impl PermitGuard {
-    fn new(manager: Arc<PermitManager>) -> Self {
+    fn new(manager: Arc<PermitManager>, device: Option<DeviceSlot>) -> Self {
         Self {
             manager,
+            device,
             released: AtomicBool::new(false),
         }
     }
@@ -200,7 +292,7 @@ impl PermitGuard {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            self.manager.release_one();
+            self.manager.release_one(self.device);
         }
         // self is dropped here; Drop::drop sees released=true → no double free
     }
@@ -215,7 +307,7 @@ impl Drop for PermitGuard {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            self.manager.release_one();
+            self.manager.release_one(self.device);
         }
     }
 }
@@ -232,6 +324,9 @@ mod tests {
     }
 
     const LONG_AGO: Duration = Duration::from_secs(61);
+    /// 两台设备，固定落在不同的两份 / Two devices, fixed in two different slots
+    const ONE: DeviceSlot = DeviceSlot(0);
+    const OTHER: DeviceSlot = DeviceSlot(1);
 
     /// 忙而且排长队才拒绝：只忙（上游慢、socket 收不空）或只排队（短暂卡顿）都不拒绝
     /// Refused only when busy and queueing long: busy alone (a slow upstream, a socket not
@@ -242,15 +337,15 @@ mod tests {
         let flow = state(Duration::from_secs(60));
         let busy = Instant::now() - LONG_AGO;
 
-        let busy_alone = flow.permit(&manager, busy);
+        let busy_alone = flow.permit(&manager, busy, ONE);
         assert!(busy_alone.is_some(), "busy alone");
 
         flow.note_queue_delay(Duration::from_secs(3600));
-        let behind_alone = flow.permit(&manager, Instant::now());
+        let behind_alone = flow.permit(&manager, Instant::now(), ONE);
         assert!(behind_alone.is_some(), "behind alone");
         assert_eq!(manager.dropped_requests(), 0);
 
-        assert!(flow.permit(&manager, busy).is_none(), "both");
+        assert!(flow.permit(&manager, busy, ONE).is_none(), "both");
         assert_eq!(manager.dropped_requests(), 1);
         assert_eq!(manager.inflight(), 2, "a refused query holds no permit");
     }
@@ -284,7 +379,7 @@ mod tests {
         let manager = Arc::new(PermitManager::new());
         let mut flow = state(Duration::ZERO);
         flow.note_queue_delay(Duration::from_secs(3600));
-        let plenty = flow.permit_by_memory(&manager);
+        let plenty = flow.permit_by_memory(&manager, ONE);
         assert!(plenty.is_some());
         assert_eq!(manager.inflight(), 1, "it counts among those in flight");
 
@@ -296,7 +391,7 @@ mod tests {
             }],
         });
         let in_flight: Vec<_> = (0..1000).map(|_| manager.acquire()).collect();
-        assert!(flow.permit_by_memory(&manager).is_none());
+        assert!(flow.permit_by_memory(&manager, ONE).is_none());
         assert_eq!(manager.dropped_requests(), 1);
         drop(in_flight);
     }
@@ -318,23 +413,23 @@ mod tests {
 
         let mut in_flight: Vec<_> = (0..999)
             .map(|_| {
-                flow.permit(&manager, Instant::now())
+                flow.permit(&manager, Instant::now(), ONE)
                     .expect("few in flight")
             })
             .collect();
         in_flight.push(
-            flow.permit(&manager, Instant::now())
+            flow.permit(&manager, Instant::now(), ONE)
                 .expect("the last under the floor"),
         );
         assert_eq!(manager.dropped_requests(), 0);
 
-        assert!(flow.permit(&manager, Instant::now()).is_none());
+        assert!(flow.permit(&manager, Instant::now(), ONE).is_none());
         assert_eq!(manager.dropped_requests(), 1);
         assert_eq!(manager.inflight(), 1000, "a refused query holds no permit");
 
         in_flight.truncate(999);
         assert!(
-            flow.permit(&manager, Instant::now()).is_some(),
+            flow.permit(&manager, Instant::now(), ONE).is_some(),
             "under the floor again"
         );
     }
@@ -362,5 +457,103 @@ mod tests {
         assert_eq!(manager.inflight(), 1);
         drop(second);
         assert_eq!(manager.inflight(), 0);
+    }
+
+    /// 总量 1 GiB、剩下 `available` 字节的流控 / Flow control over 1 GiB with `available` bytes left
+    fn with_memory_left(available: u64) -> FlowControlState {
+        let mut flow = state(Duration::from_secs(3600));
+        flow.memory = MemoryWatermark::reading(move || MemoryReading {
+            own: 0,
+            limits: vec![MemoryLeft {
+                total: 1 << 30,
+                available,
+            }],
+        });
+        flow
+    }
+
+    /// 内存紧张时只拒在途的不比平均少的设备：一台把内存占着时拒它，没有在途的照常，UDP、TCP 和 DoH 都一样
+    /// With memory tight only devices holding no less than the average in flight are refused:
+    /// the one holding the memory is, one with nothing in flight goes on, over UDP, TCP and DoH alike
+    #[test]
+    fn tight_memory_refuses_only_the_devices_holding_their_share() {
+        let manager = Arc::new(PermitManager::new());
+        // 余量 64 MiB，两倍 128 MiB：剩 100 MiB 算紧张 / A 64 MiB margin, twice that 128 MiB: 100 MiB left is tight
+        let flow = with_memory_left(100 << 20);
+        let heavy: Vec<_> = (0..1000).map(|_| manager.acquire_for(ONE)).collect();
+        assert!(
+            flow.permit(&manager, Instant::now(), ONE).is_none(),
+            "the device holding the memory"
+        );
+        assert!(flow.permit_by_memory(&manager, ONE).is_none());
+        let light: Vec<_> = (0..10)
+            .map(|_| {
+                flow.permit(&manager, Instant::now(), OTHER)
+                    .expect("one sending little goes on")
+            })
+            .collect();
+        assert!(flow.permit_by_memory(&manager, OTHER).is_some());
+        assert_eq!(manager.dropped_requests(), 2);
+        drop((heavy, light));
+    }
+
+    /// 都一样多时都在平均上，都拒；内存没了谁都拒 / Holding as much as each other, all are at the
+    /// average and all are refused; with no memory left everyone is
+    #[test]
+    fn devices_alike_and_no_memory_left_refuse_everyone() {
+        let manager = Arc::new(PermitManager::new());
+        let tight = with_memory_left(100 << 20);
+        let alike: Vec<_> = (0..1000)
+            .map(|n| manager.acquire_for(if n % 2 == 0 { ONE } else { OTHER }))
+            .collect();
+        assert!(tight.permit(&manager, Instant::now(), ONE).is_none());
+        assert!(tight.permit(&manager, Instant::now(), OTHER).is_none());
+
+        let full = with_memory_left(1 << 20);
+        assert!(
+            full.permit(&manager, Instant::now(), DeviceSlot(2))
+                .is_none(),
+            "nothing in flight, still refused"
+        );
+        drop(alike);
+    }
+
+    /// 记在设备上的数还回来以后都归零，有在途的设备数也归零 / What is counted per device returns to
+    /// zero once given back, and so does the count of devices in flight
+    #[test]
+    fn device_counts_return_to_zero() {
+        let manager = Arc::new(PermitManager::new());
+        let first = manager.acquire_for(ONE);
+        let second = manager.acquire_for(ONE);
+        let other = manager.acquire_for(OTHER);
+        let plain = manager.acquire();
+        assert_eq!(manager.devices_in_flight.load(Ordering::Relaxed), 2);
+        assert_eq!(manager.device_inflight[0].load(Ordering::Relaxed), 2);
+        drop(first);
+        second.release();
+        assert_eq!(manager.devices_in_flight.load(Ordering::Relaxed), 1);
+        drop((other, plain));
+        assert_eq!(manager.devices_in_flight.load(Ordering::Relaxed), 0);
+        assert!(
+            manager
+                .device_inflight
+                .iter()
+                .all(|held| held.load(Ordering::Relaxed) == 0)
+        );
+        assert_eq!(manager.inflight(), 0);
+    }
+
+    /// 同一台设备落在同一份，IPv6 同一个 /64 也是 / The same device lands in the same slot, and so does
+    /// the same IPv6 /64
+    #[test]
+    fn a_device_lands_in_one_slot() {
+        let manager = PermitManager::new();
+        let of = |text: &str| manager.slot_of(text.parse().unwrap());
+        assert_eq!(of("192.0.2.1"), of("192.0.2.1"));
+        assert_eq!(of("192.0.2.1"), of("::ffff:192.0.2.1"));
+        assert_eq!(of("2001:db8:0:1::1"), of("2001:db8:0:1:ffff::2"));
+        let slots: std::collections::HashSet<_> =
+            (1..=100).map(|n| of(&format!("192.0.2.{n}"))).collect();
+        assert!(slots.len() > 1, "devices spread over the slots");
     }
 }

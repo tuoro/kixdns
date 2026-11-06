@@ -109,7 +109,7 @@ pub async fn run_doh_with_listener(
         // about 40 ms to the first request on a new connection
         stream.set_nodelay(true).ok();
         // 内存不够时不接新连接，已有的连接照常 / With too little memory no new connection is taken, and those there go on
-        let Some(permit) = engine.stream_query_permit() else {
+        let Some(permit) = engine.stream_query_permit(peer.ip()) else {
             continue;
         };
         // Snapshot the current acceptor for this connection; in-flight
@@ -386,7 +386,7 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             return empty_dns_response(packet);
         }
     };
-    let Some(_permit) = engine.stream_query_permit() else {
+    let Some(_permit) = engine.stream_query_permit(peer.ip()) else {
         return empty_dns_response(packet);
     };
     // 要等上游的这一路放到堆上：它的状态有 4 KB 多，留在每个请求的 future 里，当场答完的请求也要跟着
@@ -699,10 +699,17 @@ mod tests {
     /// 内存不够时不接新连接，TLS 握手之前就关掉：连接和握手本身也占内存
     /// With too little memory no new connection is taken, closed before the TLS handshake: a
     /// connection and its handshake hold memory too
-    #[tokio::test]
-    async fn a_new_doh_connection_is_closed_when_memory_is_short() {
+    /// 起一个用自签证书的 DoH 服务端，返回地址、任务和放证书的目录（目录得留着）
+    /// Starts a DoH server with a self-signed certificate, giving its address, its task and the
+    /// directory holding the certificate (which must be kept)
+    async fn doh_server(
+        engine: &Engine,
+    ) -> (
+        SocketAddr,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        tempfile::TempDir,
+    ) {
         use rcgen::{CertificateParams, KeyPair};
-        use tokio::io::AsyncReadExt;
         let dir = tempfile::tempdir().unwrap();
         let (cert_path, key_path) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
         let key = KeyPair::generate().unwrap();
@@ -712,9 +719,6 @@ mod tests {
             .unwrap();
         std::fs::write(&cert_path, cert.pem()).unwrap();
         std::fs::write(&key_path, key.serialize_pem()).unwrap();
-
-        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let (engine, _in_flight) = engine_with_memory(upstream.local_addr().unwrap(), 0);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (cert_path, key_path) = (
@@ -732,6 +736,15 @@ mod tests {
             )
             .await
         });
+        (address, server, dir)
+    }
+
+    #[tokio::test]
+    async fn a_new_doh_connection_is_closed_when_memory_is_short() {
+        use tokio::io::AsyncReadExt;
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (engine, _in_flight) = engine_with_memory(upstream.local_addr().unwrap(), 0);
+        let (address, server, _dir) = doh_server(&engine).await;
 
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut buf = [0u8; 1];
@@ -741,6 +754,93 @@ mod tests {
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
         assert_eq!(engine.permit_manager.dropped_requests(), 1);
         assert_eq!(engine.permit_manager.inflight(), 1000, "it holds nothing");
+        server.abort();
+    }
+
+    /// 内存紧张时 DoH 也按对端地址算：在途占满的那台设备的请求和新连接被拒，别的设备照常
+    /// With memory tight DoH goes by the peer address too: the device holding everything in
+    /// flight has its requests and new connections refused while another goes on
+    #[tokio::test]
+    async fn tight_memory_refuses_only_the_doh_device_holding_the_queries() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RecordType};
+        use hickory_proto::serialize::binary::BinDecodable;
+        use std::str::FromStr;
+        use tokio::io::AsyncReadExt;
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut request = Message::new(7, MessageType::Query, OpCode::Query);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(
+            Name::from_str("tight.test.").unwrap(),
+            RecordType::A,
+        ));
+        let query = request.to_vec().unwrap();
+
+        // 余量 64 MiB、两倍 128 MiB：剩 100 MiB 算紧张 / A 64 MiB margin, twice that 128 MiB: 100 MiB left is tight
+        let (engine, plain) = engine_with_memory(upstream.local_addr().unwrap(), 100 << 20);
+        drop(plain);
+        let manager = &engine.permit_manager;
+        let heavy: SocketAddr = "127.0.0.4:53000".parse().unwrap();
+        // 和它不在同一份的另一台 / Another device, not in the same slot
+        let light = (2..=250)
+            .map(|n| SocketAddr::from(([127, 0, 0, n], 53000)))
+            .find(|peer| manager.slot_of(peer.ip()) != manager.slot_of(heavy.ip()))
+            .unwrap();
+        let held: Vec<_> = (0..1000)
+            .map(|_| {
+                engine
+                    .stream_query_permit(heavy.ip())
+                    .expect("under the floor")
+            })
+            .collect();
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            process_dns_wire(&query, heavy, &engine),
+        )
+        .await
+        .expect("the heavy device is refused at once");
+        let reply = Message::from_bytes(&reply).unwrap();
+        assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+        let waiting = {
+            let (engine, query) = (engine.clone(), query.clone());
+            tokio::spawn(async move { process_dns_wire(&query, light, &engine).await })
+        };
+        let mut buf = [0u8; 512];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.recv_from(&mut buf),
+        )
+        .await
+        .expect("the light device's request is asked of the upstream")
+        .unwrap();
+
+        let (address, server, _dir) = doh_server(&engine).await;
+        let connect_from = |local: SocketAddr| async move {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind(SocketAddr::new(local.ip(), 0)).unwrap();
+            socket.connect(address).await.unwrap()
+        };
+        let mut heavy_stream = connect_from(heavy).await;
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            heavy_stream.read(&mut buf),
+        )
+        .await
+        .expect("its new connection is closed at once");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        let before = engine.permit_manager.inflight();
+        let light_stream = connect_from(light).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while engine.permit_manager.inflight() != before + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the light device's connection is taken");
+
+        drop((held, light_stream));
+        waiting.abort();
         server.abort();
     }
 

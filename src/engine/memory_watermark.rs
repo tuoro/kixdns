@@ -1,12 +1,15 @@
-//! 流控的内存水位：在途查询多到可能撑爆内存时，看这台机器还剩多少内存，不够了就拒绝新的未命中查询，
-//! 够了自动恢复。不填数字：每台机器读自己的内存——Linux 读系统的和所在各级 cgroup 的限制，FreeBSD 读系统的，
+//! 流控的内存水位：在途查询多到可能撑爆内存时，看这台机器还剩多少内存。紧张了先只拒在途查询比平均多的
+//! 设备的新未命中，发得少的照常；再少就谁的都拒；够了自动恢复（见 [`Room`]）。不填数字：每台机器读自己的
+//! 内存——Linux 读系统的和所在各级 cgroup 的限制，FreeBSD 读系统的，
 //! Windows 读系统的和所在作业对象的限制。
 //! 在途查询没到 [`LOOK_FROM_INFLIGHT`] 时不读内存，也不拒绝：日常路径没有开销，其他程序吃内存也不会
 //! 牵连日常查询。之后按 [`reads_apart`] 隔一段读一次，两次之间多占的内存和总量成比例，和 CPU 快慢无关。
 //!
 //! Flow control's memory watermark: once enough queries are in flight to threaten the
-//! memory, it looks at how much memory this machine has left, refuses new cache misses
-//! when too little remains, and resumes by itself. There is no number to fill in: each
+//! memory, it looks at how much memory this machine has left. When it is tight, new cache
+//! misses are refused only from devices holding more queries in flight than the average,
+//! and those sending little go on; with less left, everyone's are refused; with enough it
+//! resumes by itself (see [`Room`]). There is no number to fill in: each
 //! machine reads its own memory: on Linux the system's and the limits of its cgroups at
 //! every level, on FreeBSD the system's, and on Windows the system's and the limits of its job object.
 //! Under [`LOOK_FROM_INFLIGHT`] queries in flight it neither reads nor refuses: the daily
@@ -14,7 +17,7 @@
 //! that it reads every [`reads_apart`], which keeps what is added between two reads in
 //! proportion to the total, whatever the CPU's speed.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
 
 /// 在途查询到这么多才开始看内存 / The queries in flight from which memory is looked at
 const LOOK_FROM_INFLIGHT: usize = 1000;
@@ -41,14 +44,49 @@ fn reads_apart(total: u64) -> usize {
     (total / 32 / (12 << 10)).clamp(100, READS_APART_UNKNOWN as u64) as usize
 }
 
+/// 内存还有多少余地 / How much room memory has left
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Room {
+    /// 够 / Enough
+    Plenty,
+    /// 紧张：只拒在途查询比各设备平均多的设备，发得少的照常 / Tight: only devices holding more queries in
+    /// flight than the average are refused, and those sending little go on
+    Tight,
+    /// 没了：谁都拒 / None left: everyone is refused
+    Full,
+}
+
+impl Room {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Plenty,
+            1 => Self::Tight,
+            _ => Self::Full,
+        }
+    }
+}
+
 impl MemoryLeft {
-    /// 这个进程占着 `own` 字节时，这里剩的够不够。不再接新查询之后，在途查询进入超时阶段还会多占
-    /// 一成多，所以要留出自身占用的四分之一，再加一点余量
-    /// Whether what is left here is too little with this process holding `own` bytes. After new
-    /// queries stop, those in flight still grow by over a tenth as they reach their timeouts,
-    /// so a quarter of its own use is kept back, plus a margin
-    fn is_low(self, own: u64) -> bool {
-        self.available < own / 4 + (self.total / 16).min(MAX_MARGIN)
+    /// 这个进程占着 `own` 字节时这里还有多少余地。不再接新查询之后，在途查询进入超时阶段还会多占
+    /// 一成多，所以要留出自身占用的四分之一，再加一点余量，剩的少于这些就谁都拒。少于它的两倍时先只拒
+    /// 占得多的设备：两次读之间多占的，一般远少于两条线之间的距离（总量的十六分之一、最多 256 MiB，
+    /// 再加自身的四分之一），所以内存只是被这个程序占掉时，总是先读到紧张，一台设备发得多就先拦住它
+    /// How much room is left here with this process holding `own` bytes. After new queries stop,
+    /// those in flight still grow by over a tenth as they reach their timeouts, so a quarter of its
+    /// own use is kept back, plus a margin, and with less left than that everyone is refused. With
+    /// less than twice that only the devices holding more are refused first: what is added between
+    /// two reads is usually far less than the distance between the two lines (a sixteenth of the
+    /// total, at most 256 MiB, plus a quarter of its own use), so while it is this program taking
+    /// the memory, tight is read first and a device sending much is stopped there
+    fn room_for(self, own: u64) -> Room {
+        let margin = own / 4 + (self.total / 16).min(MAX_MARGIN);
+        if self.available < margin {
+            Room::Full
+        } else if self.available < margin.saturating_mul(2) {
+            Room::Tight
+        } else {
+            Room::Plenty
+        }
     }
 }
 
@@ -65,7 +103,8 @@ pub struct MemoryReading {
 pub struct MemoryWatermark {
     read: Box<dyn Fn() -> MemoryReading + Send + Sync>,
     until_read: AtomicIsize,
-    low: AtomicBool,
+    /// 上次读到的 [`Room`] / The [`Room`] last read
+    room: AtomicU8,
 }
 
 impl MemoryWatermark {
@@ -86,17 +125,21 @@ impl MemoryWatermark {
         Self {
             read: Box::new(read),
             until_read: AtomicIsize::new(1),
-            low: AtomicBool::new(false),
+            room: AtomicU8::new(Room::Plenty as u8),
         }
     }
 
-    /// 在途 `inflight` 个查询时，能不能再接一个未命中 / Whether one more miss can go ahead with `inflight` in flight
+    /// 在途 `inflight` 个查询时，内存还有多少余地 / How much room memory has with `inflight` in flight
     #[inline]
-    pub fn has_room(&self, inflight: usize) -> bool {
-        inflight < LOOK_FROM_INFLIGHT || self.looked_at()
+    pub fn room(&self, inflight: usize) -> Room {
+        if inflight < LOOK_FROM_INFLIGHT {
+            Room::Plenty
+        } else {
+            self.looked_at()
+        }
     }
 
-    fn looked_at(&self) -> bool {
+    fn looked_at(&self) -> Room {
         if self.until_read.fetch_sub(1, Ordering::Relaxed) <= 1 {
             let reading = (self.read)();
             let apart = reading
@@ -108,17 +151,23 @@ impl MemoryWatermark {
                 apart.unwrap_or(READS_APART_UNKNOWN) as isize,
                 Ordering::Relaxed,
             );
-            let low = reading.limits.iter().any(|limit| limit.is_low(reading.own));
-            if self.low.swap(low, Ordering::Relaxed) != low {
+            let room = reading
+                .limits
+                .iter()
+                .map(|limit| limit.room_for(reading.own))
+                .max()
+                .unwrap_or(Room::Plenty);
+            if self.room.swap(room as u8, Ordering::Relaxed) != room as u8 {
                 tracing::warn!(
                     event = "flow_control_memory",
-                    low,
+                    low = room != Room::Plenty,
+                    ?room,
                     ?reading,
                     "memory watermark crossed"
                 );
             }
         }
-        !self.low.load(Ordering::Relaxed)
+        Room::from_u8(self.room.load(Ordering::Relaxed))
     }
 }
 
@@ -665,21 +714,40 @@ mod tests {
         (watermark, available, reads)
     }
 
+    /// 少于余量谁都拒，少于两倍余量算紧张 / Under the margin everyone is refused, under twice it is tight
     #[test]
     fn what_is_kept_back_grows_with_its_own_use() {
-        let low = |total, available, own| MemoryLeft { total, available }.is_low(own);
-        assert!(low(256 * MIB, 15 * MIB, 0), "a sixteenth of the total");
-        assert!(!low(256 * MIB, 17 * MIB, 0));
-        assert!(
-            low(256 * MIB, 63 * MIB, 192 * MIB),
+        let room = |total, available, own| MemoryLeft { total, available }.room_for(own);
+        assert_eq!(
+            room(256 * MIB, 15 * MIB, 0),
+            Room::Full,
+            "a sixteenth of the total"
+        );
+        assert_eq!(
+            room(256 * MIB, 17 * MIB, 0),
+            Room::Tight,
+            "under twice that"
+        );
+        assert_eq!(room(256 * MIB, 31 * MIB, 0), Room::Tight);
+        assert_eq!(room(256 * MIB, 33 * MIB, 0), Room::Plenty);
+        assert_eq!(
+            room(256 * MIB, 63 * MIB, 192 * MIB),
+            Room::Full,
             "plus a quarter of its own use"
         );
-        assert!(!low(256 * MIB, 65 * MIB, 192 * MIB));
-        assert!(low(16 * GIB, 256 * MIB - 1, 0), "the margin stops growing");
-        assert!(!low(16 * GIB, 256 * MIB + 1, 0));
-        assert!(
-            !low(64 * GIB, 3 * GIB, 200 * MIB),
-            "other programs holding the memory do not make it low"
+        assert_eq!(room(256 * MIB, 65 * MIB, 192 * MIB), Room::Tight);
+        assert_eq!(room(256 * MIB, 129 * MIB, 192 * MIB), Room::Plenty);
+        assert_eq!(
+            room(16 * GIB, 256 * MIB - 1, 0),
+            Room::Full,
+            "the margin stops growing"
+        );
+        assert_eq!(room(16 * GIB, 256 * MIB + 1, 0), Room::Tight);
+        assert_eq!(room(16 * GIB, 512 * MIB + 1, 0), Room::Plenty);
+        assert_eq!(
+            room(64 * GIB, 3 * GIB, 200 * MIB),
+            Room::Plenty,
+            "other programs holding the memory do not make it tight"
         );
     }
 
@@ -718,7 +786,7 @@ mod tests {
             }
         });
         for _ in 0..341 * 2 {
-            watermark.has_room(LOOK_FROM_INFLIGHT);
+            watermark.room(LOOK_FROM_INFLIGHT);
         }
         assert_eq!(reads.load(Ordering::Relaxed), 2);
 
@@ -729,7 +797,7 @@ mod tests {
             MemoryReading::default()
         });
         for _ in 0..READS_APART_UNKNOWN {
-            unknown.has_room(LOOK_FROM_INFLIGHT);
+            unknown.room(LOOK_FROM_INFLIGHT);
         }
         assert_eq!(reads.load(Ordering::Relaxed), 1);
     }
@@ -739,7 +807,7 @@ mod tests {
         let (watermark, available, reads) = watermark();
         available.store(0, Ordering::Relaxed);
         for _ in 0..5000 {
-            assert!(watermark.has_room(LOOK_FROM_INFLIGHT - 1));
+            assert_eq!(watermark.room(LOOK_FROM_INFLIGHT - 1), Room::Plenty);
         }
         assert_eq!(reads.load(Ordering::Relaxed), 0);
     }
@@ -748,57 +816,87 @@ mod tests {
     fn from_the_floor_memory_is_read_every_so_many_misses() {
         let (watermark, _, reads) = watermark();
         for _ in 0..READ_EVERY * 3 {
-            assert!(watermark.has_room(LOOK_FROM_INFLIGHT));
+            assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Plenty);
         }
         assert_eq!(reads.load(Ordering::Relaxed), 3);
     }
 
+    /// 没了就一直谁都拒，回到线上先是紧张，再多才够 / With none left everyone is refused until it
+    /// comes back: just above the line it is tight, and only with more is it plenty
     #[test]
     fn low_memory_refuses_until_it_comes_back() {
         let (watermark, available, _) = watermark();
-        assert!(watermark.has_room(LOOK_FROM_INFLIGHT));
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Plenty);
 
         available.store(GIB / 16 - 1, Ordering::Relaxed);
         for _ in 1..READ_EVERY {
-            assert!(watermark.has_room(LOOK_FROM_INFLIGHT), "not read yet");
+            assert_eq!(
+                watermark.room(LOOK_FROM_INFLIGHT),
+                Room::Plenty,
+                "not read yet"
+            );
         }
-        assert!(!watermark.has_room(LOOK_FROM_INFLIGHT), "read now");
-        assert!(
-            watermark.has_room(LOOK_FROM_INFLIGHT - 1),
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Full, "read now");
+        assert_eq!(
+            watermark.room(LOOK_FROM_INFLIGHT - 1),
+            Room::Plenty,
             "under the floor it is not refused"
         );
-        assert!(!watermark.has_room(LOOK_FROM_INFLIGHT), "still low");
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Full, "still full");
 
         available.store(GIB / 16 + 1, Ordering::Relaxed);
         for _ in 0..READ_EVERY {
-            watermark.has_room(LOOK_FROM_INFLIGHT);
+            watermark.room(LOOK_FROM_INFLIGHT);
         }
-        assert!(watermark.has_room(LOOK_FROM_INFLIGHT), "came back");
+        assert_eq!(
+            watermark.room(LOOK_FROM_INFLIGHT),
+            Room::Tight,
+            "back above the line"
+        );
+
+        available.store(GIB / 8 + 1, Ordering::Relaxed);
+        for _ in 0..READ_EVERY {
+            watermark.room(LOOK_FROM_INFLIGHT);
+        }
+        assert_eq!(
+            watermark.room(LOOK_FROM_INFLIGHT),
+            Room::Plenty,
+            "came back"
+        );
     }
 
+    /// 哪一处限制最紧就按哪一处 / The tightest limit is the one that counts
     #[test]
-    fn any_low_limit_counts() {
-        let watermark = MemoryWatermark::reading(|| MemoryReading {
-            own: 0,
-            limits: vec![
-                MemoryLeft {
-                    total: 16 * GIB,
-                    available: 8 * GIB,
-                },
-                MemoryLeft {
-                    total: 256 * MIB,
-                    available: MIB,
-                },
-            ],
+    fn the_tightest_limit_counts() {
+        let reading = |second: MemoryLeft| {
+            MemoryWatermark::reading(move || MemoryReading {
+                own: 0,
+                limits: vec![
+                    MemoryLeft {
+                        total: 16 * GIB,
+                        available: 8 * GIB,
+                    },
+                    second,
+                ],
+            })
+        };
+        let full = reading(MemoryLeft {
+            total: 256 * MIB,
+            available: MIB,
         });
-        assert!(!watermark.has_room(LOOK_FROM_INFLIGHT));
+        assert_eq!(full.room(LOOK_FROM_INFLIGHT), Room::Full);
+        let tight = reading(MemoryLeft {
+            total: 256 * MIB,
+            available: 20 * MIB,
+        });
+        assert_eq!(tight.room(LOOK_FROM_INFLIGHT), Room::Tight);
     }
 
     #[test]
     fn memory_that_cannot_be_read_refuses_nothing() {
         let watermark = MemoryWatermark::reading(MemoryReading::default);
         for _ in 0..READ_EVERY * 2 {
-            assert!(watermark.has_room(LOOK_FROM_INFLIGHT));
+            assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Plenty);
         }
     }
 

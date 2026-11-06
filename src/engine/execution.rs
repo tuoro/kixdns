@@ -304,26 +304,32 @@ impl Engine {
         // keep their warm response and rule caches.
     }
 
-    /// 一个要等上游的查询能不能处理（见 `FlowControlState::permit`）；没开流控时都能处理
-    /// Whether a query that waits on an upstream can go ahead (see `FlowControlState::permit`);
-    /// without flow control it always can
+    /// `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::permit`）；没开流控时都能处理
+    /// Whether a query from `client` that waits on an upstream can go ahead (see
+    /// `FlowControlState::permit`); without flow control it always can
     #[inline]
-    pub fn query_permit(&self, emptied_at: Instant) -> Option<PermitGuard> {
+    pub fn query_permit(&self, emptied_at: Instant, client: IpAddr) -> Option<PermitGuard> {
         match &self.flow_control_state {
-            Some(state) => state.permit(&self.permit_manager, emptied_at),
+            Some(state) => state.permit(
+                &self.permit_manager,
+                emptied_at,
+                self.permit_manager.slot_of(client),
+            ),
             None => Some(self.permit_manager.acquire()),
         }
     }
 
-    /// TCP 或 DoH 的一条新连接、或它上面一个要等上游的查询能不能处理（见
+    /// `client` 的 TCP 或 DoH 新连接、或连接上一个要等上游的查询能不能处理（见
     /// `FlowControlState::permit_by_memory`）。连接本身也占内存，所以也算；没开流控时都能处理
-    /// Whether a new TCP or DoH connection, or a query on one that waits on an upstream, can
-    /// go ahead (see `FlowControlState::permit_by_memory`). A connection holds memory too, so
-    /// it counts as well; without flow control it always can
+    /// Whether a new TCP or DoH connection from `client`, or a query on one that waits on an
+    /// upstream, can go ahead (see `FlowControlState::permit_by_memory`). A connection holds
+    /// memory too, so it counts as well; without flow control it always can
     #[inline]
-    pub fn stream_query_permit(&self) -> Option<PermitGuard> {
+    pub fn stream_query_permit(&self, client: IpAddr) -> Option<PermitGuard> {
         match &self.flow_control_state {
-            Some(state) => state.permit_by_memory(&self.permit_manager),
+            Some(state) => {
+                state.permit_by_memory(&self.permit_manager, self.permit_manager.slot_of(client))
+            }
             None => Some(self.permit_manager.acquire()),
         }
     }
