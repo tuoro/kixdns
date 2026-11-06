@@ -3401,47 +3401,41 @@ mod tests {
         worker.abort();
     }
 
-    /// socket 一直收不空才算内核忙，这时查询又在排长队就回 SERVFAIL。两种循环都这样
-    /// A socket that never runs empty means the kernel is busy, and with queries queueing long they then get SERVFAIL.
-    /// Both loops do so
+    /// 内核忙、查询又在排长队时，两种接收循环都回 SERVFAIL。这里一开始就算忙、排队一直算过长，每个查询都该被拒。
+    /// 只拒一部分的那种情况看时机，CI 上一次线程抢占就能翻，不在这里测；不忙就不拒由
+    /// `queries_waiting_on_a_slow_upstream_are_not_refused` 和 `a_quiet_spell_does_not_count_as_busy` 测着
+    /// With the kernel busy and queries queueing long, both receive loops answer SERVFAIL. Here it is
+    /// busy from the start and queueing always runs long, so every query is refused. Refusing only some
+    /// turns on timing that one preempted thread on CI can flip, so it is not tested here; that nothing
+    /// is refused while not busy is what `queries_waiting_on_a_slow_upstream_are_not_refused` and
+    /// `a_quiet_spell_does_not_count_as_busy` test
     #[tokio::test]
-    async fn a_socket_that_stays_behind_refuses_past_the_limit() {
+    async fn a_busy_kernel_queueing_long_refuses_in_both_loops() {
         #[cfg(target_os = "linux")]
-        refused_when_behind(|server, engine| {
+        refused_when_busy(|server, engine| {
             tokio::spawn(async move { receive_in_batches(&server, &Arc::new(engine)).await })
         })
         .await;
-        refused_when_behind(|server, engine| {
+        refused_when_busy(|server, engine| {
             tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
         })
         .await;
     }
 
-    async fn refused_when_behind(
+    async fn refused_when_busy(
         receive: impl FnOnce(Arc<UdpSocket>, Engine) -> tokio::task::JoinHandle<()>,
     ) {
-        let engine = behind_engine_with_slow_upstream(1).await;
+        let engine = behind_engine_with_slow_upstream(0).await;
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
         let worker = receive(server, engine);
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        // 先探一个：worker 在空 socket 上收到它，socket 刚收空不算忙，答得上——跟不上也不会把谁都拒了
-        // A primer first: the worker takes it on an empty socket, which just ran empty and is not busy,
-        // so it is answered — falling behind does not refuse everyone
-        client
-            .send_to(&query("primer.behind.test", u16::MAX), server_addr)
-            .await
-            .unwrap();
-        assert_eq!(refused_and_answered(&client, 1).await, (0, 1));
-        // 再一股脑灌进去：socket 一直收不空就算忙，排在后面的被拒 / Then a burst all at once: the socket
-        // never runs empty, counts as busy and the ones queued behind it are refused
-        const QUERIES: u16 = 200;
+        const QUERIES: u16 = 50;
         for id in 0..QUERIES {
-            let query = query(&format!("q{id}.behind.test"), id);
+            let query = query(&format!("q{id}.busy.test"), id);
             client.send_to(&query, server_addr).await.unwrap();
         }
-        let (refused, answered) = refused_and_answered(&client, QUERIES).await;
-        assert!(refused > 0, "refused {refused}, answered {answered}");
+        assert_eq!(refused_and_answered(&client, QUERIES).await, (QUERIES, 0));
         worker.abort();
     }
 
