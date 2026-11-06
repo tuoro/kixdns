@@ -36,7 +36,11 @@ pub struct FairQueue<P> {
     queues: Vec<VecDeque<(Box<[u8]>, P)>>,
     /// 还有查询排着的队列，下一个轮到的在最前面 / The queues holding queries, the next in turn first
     turns: VecDeque<usize>,
-    /// 一共排多少个查询，有几台设备就各占一份 / How many queries are held in all, each device taking its share
+    /// 一台设备排进去时能排到多少：它除以那一刻在排队的设备数。排着的不收回，一共能排多少见
+    /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
+    /// How far a device may queue as it offers a query: this divided by how many devices are queued
+    /// at that moment. What is queued is not taken back; for how much may be held in all see
+    /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     room: usize,
     hasher: RandomState,
 }
@@ -169,21 +173,54 @@ mod tests {
         );
     }
 
-    /// 地址全不相同时队列数也有上限，再多也占不了更多内存：空队列总收一个，不空的只收到自己那一份，各份加起来
-    /// 是 room。撞进同一份的地址算一台设备，在份额内本来就能多排，所以上限是份数加 room，不是份数
-    /// With every address different the queues still set a limit, so however many there are they
-    /// hold no more memory: an empty queue always takes one and one in use takes only up to its
-    /// share, the shares adding up to the room. Addresses landing in one queue count as one device
-    /// and may queue more within its share, so the limit is the queues plus the room, not the queues
+    /// 一共能排多少：份额只在排进去那一刻按当时排着的设备数算，排着的不收回。按最后一次排进去的先后数，第 k 台排进去时，
+    /// 前面那些从各自最后一次排进去以后没再收过、也还没排空，都还排着，所以它最多排到 max(1, ⌊room/k⌋)，一共最多
+    /// Σ max(1, ⌊room/k⌋)（k 从 1 到份数），大约 room × ln(room) 加份数。一台接一台各排满自己那一份正好到这个数；
+    /// 地址再多也只是撞进这些份里，占不了更多内存
+    /// How much may be held in all: a share is set only as a query is queued, by how many devices are
+    /// queued then, and what is queued is not taken back. Counting devices by when they last queued,
+    /// the k-th one finds the earlier ones still queued, as none has taken anything since and none
+    /// has run empty, so it holds at most max(1, ⌊room/k⌋), and all at most Σ max(1, ⌊room/k⌋) for k
+    /// from 1 to the queues, about room × ln(room) plus the queues. Device after device filling its
+    /// share reaches exactly that; however many addresses there are, they only land in these queues
+    /// and hold no more memory
     #[test]
-    fn different_addresses_cannot_grow_it_past_the_queues() {
-        let room = 10;
-        let mut queue = FairQueue::new(room);
-        let accepted = (0..100_000)
-            .filter(|&id| queue.offer(b"q", device(id), id))
-            .count();
-        assert_eq!(queue.devices(), QUEUES, "every queue is in use");
-        assert!(accepted <= QUEUES + room, "{accepted}");
+    fn the_queues_hold_at_most_each_device_filling_its_share_in_turn() {
+        for room in [10, 64, 205, 4000] {
+            let limit: usize = (1..=QUEUES).map(|k| (room / k).max(1)).sum();
+
+            let mut queue = FairQueue::new(room);
+            let mut seen = std::collections::HashSet::new();
+            let one_per_queue: Vec<Device> = (0..)
+                .map(device)
+                .filter(|&one| seen.insert(queue.index_of(one)))
+                .take(QUEUES)
+                .collect();
+            let mut held = 0;
+            for one in one_per_queue {
+                while queue.offer(b"q", one, 0) {
+                    held += 1;
+                }
+            }
+            assert_eq!(held, limit, "room {room}");
+            assert!(
+                !(0..10_000).any(|id| queue.offer(b"q", device(id), id)),
+                "nobody gets in past it"
+            );
+
+            // 地址各不相同、边排边答也到不了 / Nor with every address different and turns taken meanwhile
+            let mut queue = FairQueue::new(room);
+            let mut held = 0;
+            for id in 0..200_000 {
+                if id % 7 == 0 && queue.next_in_turn().is_some() {
+                    held -= 1;
+                }
+                if queue.offer(b"q", device(id), id) {
+                    held += 1;
+                }
+                assert!(held <= limit, "{held} with room {room}");
+            }
+        }
     }
 
     /// 已经排着的设备比份额还多时，空队列里新来的一台照样排得进——发得少的不会因为设备多就被挡在外面
