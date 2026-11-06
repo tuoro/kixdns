@@ -3324,17 +3324,75 @@ mod tests {
         assert_eq!(allowed, READS_PER_TURN - 1);
     }
 
-    /// 一直发直到 `stop`，发的是当场能答的查询 / Keeps sending queries answered on the spot until `stop`
+    /// `fd` 这个 socket 的接收缓冲是不是已经排到四分之三；读不到（socket 已经关了）是 `None`
+    /// Whether the receive buffer of socket `fd` is three quarters full already; `None` when it
+    /// cannot be read, the socket being closed
+    #[cfg(target_os = "linux")]
+    fn receive_buffer_mostly_full(fd: std::os::fd::RawFd) -> Option<bool> {
+        let mut info = [0u32; libc::SK_MEMINFO_RCVBUF as usize + 1];
+        let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+        // SAFETY: the buffer and its length are valid for the call, which only writes within them
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_MEMINFO,
+                info.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        let queued = info[libc::SK_MEMINFO_RMEM_ALLOC as usize] as usize;
+        (ret == 0).then(|| 4 * queued >= 3 * info[libc::SK_MEMINFO_RCVBUF as usize] as usize)
+    }
+
+    /// 洪泛怎么发：只管发 / How the flood sends: as fast as it can
+    const FLOOD_FREELY: u8 = 0;
+    /// 请它别挤满接收缓冲 / Asked to leave the receive buffer short of full
+    const FLOOD_ASKED_GENTLE: u8 = 1;
+    /// 它看到了，从此每发一个先看缓冲 / It has seen that, and from then on looks at the buffer before each send
+    const FLOOD_GENTLE: u8 = 2;
+
+    /// 一直发直到 `stop`，发的是当场能答的查询。`mode` 改成 `FLOOD_ASKED_GENTLE` 以后它回一个 `FLOOD_GENTLE`，从此
+    /// `server` 的接收缓冲排到四分之三就先等一等：洪泛照样远超处理能力，只是缓冲满不了。轮流读得比洪泛快时本来就是这样，
+    /// 可测试里读和发是两个线程，谁快一时半会说不准，读慢了一下缓冲就满，内核会把别的设备的包和洪泛一起丢掉
+    /// Keeps sending queries answered on the spot until `stop`. Once `mode` is set to
+    /// `FLOOD_ASKED_GENTLE` it answers with `FLOOD_GENTLE`, and from then on waits whenever
+    /// `server`'s receive buffer is three quarters full: the flood still goes far past what can be
+    /// handled, only the buffer never fills. That is how taking turns goes while it reads faster
+    /// than the flood, but in a test reading and sending are two threads and either may be ahead
+    /// for a moment; with reading behind for a moment the buffer fills and the kernel drops
+    /// another device's datagram along with the flood
     #[cfg(target_os = "linux")]
     fn flood_from(
         source: [u8; 4],
-        target: SocketAddr,
+        server: &UdpSocket,
         stop: Arc<std::sync::atomic::AtomicBool>,
+        mode: Arc<std::sync::atomic::AtomicU8>,
     ) -> std::thread::JoinHandle<()> {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::Ordering;
+
         let socket = std::net::UdpSocket::bind(SocketAddr::from((source, 0))).unwrap();
+        let (target, fd) = (server.local_addr().unwrap(), server.as_raw_fd());
         let packet = query("flood.test", 1);
         std::thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = mode.compare_exchange(
+                    FLOOD_ASKED_GENTLE,
+                    FLOOD_GENTLE,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                if mode.load(Ordering::SeqCst) == FLOOD_GENTLE {
+                    // 测试先失败了，socket 已经关掉 / The test failed first and closed the socket
+                    let Some(mostly_full) = receive_buffer_mostly_full(fd) else {
+                        return;
+                    };
+                    if mostly_full {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                }
                 let _ = socket.send_to(&packet, target);
             }
         })
@@ -3348,6 +3406,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_device_asking_rarely_is_answered_while_another_floods() {
+        use std::os::fd::AsRawFd;
+
         let engine = static_engine_with_flow_control();
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let target = server.local_addr().unwrap();
@@ -3356,7 +3416,13 @@ mod tests {
             tokio::spawn(async move { receive_in_batches(&server, &engine).await })
         };
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flood = flood_from([127, 0, 0, 2], target, Arc::clone(&stop));
+        let mode = Arc::new(std::sync::atomic::AtomicU8::new(FLOOD_FREELY));
+        let flood = flood_from(
+            [127, 0, 0, 2],
+            &server,
+            Arc::clone(&stop),
+            Arc::clone(&mode),
+        );
         let client = UdpSocket::bind("127.0.0.3:0").await.unwrap();
         let mut buf = [0u8; 512];
 
@@ -3372,22 +3438,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // 另一台头一次问就答得上，之后一个一个地问也都答得上 / The other is answered on its very first
-        // query, and asking one at a time after that too
-        let mut answered = 0;
+        // 另一台头一次问就答得上，之后一个一个地问也都答得上。洪泛从这里起不挤满缓冲，内核一个包都不丢，没答上的只能是
+        // 轮流没轮到它；还在削洪泛，就是还在轮流
+        // The other is answered on its very first query, and asking one at a time after that too.
+        // From here the flood leaves the buffer short of full and the kernel drops nothing, so one
+        // left unanswered could only be one taking turns passed over; the flood still being cut
+        // means turns go on
+        mode.store(FLOOD_ASKED_GENTLE, std::sync::atomic::Ordering::SeqCst);
+        let started = Instant::now();
+        while mode.load(std::sync::atomic::Ordering::SeqCst) != FLOOD_GENTLE
+            || receive_buffer_mostly_full(server.as_raw_fd()).unwrap()
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the flood never eased"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let drops = kixdns::socket_utils::udp_receive_drops(&server).unwrap();
+        let cut = engine.permit_manager.dropped_requests();
         for id in 0..20 {
             client
                 .send_to(&query("light.test", id), target)
                 .await
                 .unwrap();
-            if tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+            tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
                 .await
-                .is_ok()
-            {
-                answered += 1;
-            }
+                .unwrap_or_else(|_| panic!("query {id} unanswered"))
+                .unwrap();
         }
-        assert!(answered >= 19, "{answered} of 20 answered");
+        assert_eq!(
+            kixdns::socket_utils::udp_receive_drops(&server).unwrap(),
+            drops,
+            "nothing dropped in the kernel"
+        );
+        assert!(
+            engine.permit_manager.dropped_requests() > cut,
+            "the flood is still being cut"
+        );
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         flood.join().unwrap();
