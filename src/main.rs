@@ -1656,7 +1656,7 @@ fn spawn_udp_answer(
     };
     let Some(permit) = permit else {
         if let Some(pre_parsed) = pre_parsed
-            && let Ok(response) = pre_parsed.servfail(packet[2] & 0x01 != 0)
+            && let Ok(response) = pre_parsed.servfail(&packet)
         {
             try_send_udp_response(answering.socket, &packet, &response, peer);
         }
@@ -3914,6 +3914,43 @@ mod tests {
             response.queries,
             Message::from_bytes(&dns_query()).unwrap().queries
         );
+
+        // 问题名照客户端的写法，查询带 OPT 应答也带：开着 0x20 的解析器认大小写，问题名被改成小写的应答它当作不匹配丢掉
+        // The question name as the client wrote it, and an OPT back for a query with one: a
+        // resolver using 0x20 checks the case and drops a reply whose name was lowercased
+        let mut asked = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
+        asked.metadata.recursion_desired = true;
+        asked.add_query(Query::query(
+            Name::from_str("data.xiaoheihe.cn.").unwrap(),
+            RecordType::A,
+        ));
+        asked.edns = Some(hickory_proto::op::Edns::new());
+        let mut asked = asked.to_vec().unwrap();
+        // 编码时名字会变成小写，所以直接改字节：DaTa.XiaoHeiHe / Encoding lowercases the name, so the
+        // bytes are changed directly: DaTa.XiaoHeiHe
+        for at in [13, 15, 18, 22, 25] {
+            asked[at] = asked[at].to_ascii_uppercase();
+        }
+        assert_eq!(&asked[13..17], b"DaTa");
+        client.send_to(&asked, server_addr).await.unwrap();
+        let (response_len, _) =
+            tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response_buf))
+                .await
+                .expect("valid query should receive a response")
+                .unwrap();
+        let mut name_end = 12;
+        while asked[name_end] != 0 {
+            name_end += 1 + usize::from(asked[name_end]);
+        }
+        let question_end = name_end + 1 + 4;
+        assert_eq!(
+            &response_buf[12..question_end],
+            &asked[12..question_end],
+            "the question as asked"
+        );
+        let response = Message::from_bytes(&response_buf[..response_len]).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+        assert!(response.edns.is_some(), "an OPT for a query with one");
 
         client.send_to(&[0x12, 0x34], server_addr).await.unwrap();
         assert!(
