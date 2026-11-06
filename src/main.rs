@@ -2543,8 +2543,7 @@ mod tests {
         let config: PipelineConfig = serde_json::from_value(serde_json::json!({
             "settings": {
                 "default_upstream": "127.0.0.1:9",
-                "flow_control_enabled": true,
-                "flow_control_latency_threshold_ms": 0
+                "flow_control_enabled": true
             },
             "pipelines": [{
                 "id": "p",
@@ -2561,7 +2560,8 @@ mod tests {
         }))
         .expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
-        Engine::new(runtime, "test".to_string()).expect("initialize engine")
+        let engine = Engine::new(runtime, "test".to_string()).expect("initialize engine");
+        with_busy_after(engine, Duration::ZERO)
     }
 
     fn doh_timeout_engine(upstream: &str) -> Engine {
@@ -2608,12 +2608,12 @@ mod tests {
     /// empty before that counts as busy
     async fn behind_engine_with_slow_upstream(busy_after_ms: u64) -> Engine {
         let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
-        let engine = engine_forwarding_to(
-            upstream,
-            serde_json::json!({
-                "flow_control_enabled": true,
-                "flow_control_latency_threshold_ms": busy_after_ms,
-            }),
+        let engine = with_busy_after(
+            engine_forwarding_to(
+                upstream,
+                serde_json::json!({ "flow_control_enabled": true }),
+            ),
+            Duration::from_millis(busy_after_ms),
         );
         engine
             .flow_control_state
@@ -3451,14 +3451,16 @@ mod tests {
     #[tokio::test]
     async fn queueing_past_the_target_refuses_queries() {
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let engine = Arc::new(engine_forwarding_to(
-            upstream.local_addr().unwrap(),
-            serde_json::json!({
-                "flow_control_enabled": true,
-                "flow_control_latency_threshold_ms": 0,
-                "upstream_timeout_ms": 5000,
-                "enable_tcp_fallback": false,
-            }),
+        let engine = Arc::new(with_busy_after(
+            engine_forwarding_to(
+                upstream.local_addr().unwrap(),
+                serde_json::json!({
+                    "flow_control_enabled": true,
+                    "upstream_timeout_ms": 5000,
+                    "enable_tcp_fallback": false,
+                }),
+            ),
+            Duration::ZERO,
         ));
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let pending = Arc::new(PendingReplies::default());
@@ -4576,6 +4578,45 @@ mod tests {
         .expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
         Engine::new(runtime, "test".to_string()).expect("initialize engine")
+    }
+
+    /// 换掉引擎判断「socket 多久没收空算忙」的时长。生产里它就是 `BUSY_AFTER`，配置改不了，测试要别的值只能这样换
+    /// Changes how long a socket goes without running empty before the engine counts as busy. In
+    /// production that is `BUSY_AFTER`, which no configuration changes, so a test wanting another value swaps it here
+    fn with_busy_after(mut engine: Engine, busy_after: Duration) -> Engine {
+        let flow = engine
+            .flow_control_state
+            .take()
+            .expect("flow control is on");
+        let mut flow = Arc::into_inner(flow).expect("nothing else holds it yet");
+        flow.busy_after = busy_after;
+        engine.flow_control_state = Some(Arc::new(flow));
+        engine
+    }
+
+    /// 智能流控替代了旧参数：配置里写的 `flow_control_latency_threshold_ms` 不起作用，忙不忙始终按 `BUSY_AFTER` 判断
+    /// Smart flow control replaced the old numbers: a `flow_control_latency_threshold_ms` in the
+    /// configuration has no effect, and busy is always judged by `BUSY_AFTER`
+    #[tokio::test]
+    async fn an_old_busy_threshold_in_the_configuration_has_no_effect() {
+        for threshold in [0, 1, 100, 60_000] {
+            let engine = engine_forwarding_to(
+                "127.0.0.1:9".parse().unwrap(),
+                serde_json::json!({
+                    "flow_control_enabled": true,
+                    "flow_control_latency_threshold_ms": threshold,
+                }),
+            );
+            let flow = engine
+                .flow_control_state
+                .as_ref()
+                .expect("flow control is on");
+            assert_eq!(
+                flow.busy_after,
+                kixdns::engine::concurrency::BUSY_AFTER,
+                "{threshold}"
+            );
+        }
     }
 
     /// 发一个 UDP 查询、读回回答，连同用时一起返回
