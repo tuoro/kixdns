@@ -161,9 +161,8 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use kixdns::config::{DohListenerConfig, ListenerConfig, load_config_with_source};
 use kixdns::engine::concurrency::QUEUE_TARGET;
-use kixdns::engine::fair_queue::Device;
 #[cfg(target_os = "linux")]
-use kixdns::engine::fair_queue::FairQueue;
+use kixdns::engine::fair_queue::{Device, FairQueue};
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, write_cache_hit};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{ClientTransport, EngineObserver, TracingObserver};
@@ -1066,16 +1065,10 @@ struct UdpAnswering<'a> {
     /// 这台机器 `QUEUE_TARGET` 内处理得完多少查询，上次读丢包数时量的 / How many queries this machine handles
     /// within `QUEUE_TARGET`, measured when the drops were last read
     queries_within_target: usize,
-    /// 这会儿在丢包或者拒绝。还没过载就先看设备：不等缓冲收小，发得少的那台还在大缓冲里时就数进来
-    /// Dropping or refusing just now. Devices are looked at before overload, so one sending little
-    /// is counted while it is still in the large buffer, before any shrink
+    /// 这会儿在丢包或者拒绝 / Dropping or refusing just now
     behind: bool,
     /// 丢包持续了够久，就按设备轮流 / Drops have lasted long enough, so devices take turns
     overloaded: bool,
-    /// 跟不上以后见到的第一台设备 / The first device seen since falling behind
-    first_device: Option<Device>,
-    /// 跟不上以后见到了别的设备 / Another device was seen since falling behind
-    other_device_seen: bool,
 }
 
 /// 每 100 个查询看一次接收缓冲，看到这么多次的整数倍、socket 还没收空就读一次丢包数，平时不多这一次系统调用
@@ -1105,11 +1098,6 @@ const CAUGHT_UP_AFTER: Duration = Duration::from_secs(1);
 /// Falling behind (drops or refusals) has to last this long before devices take turns. A burst
 /// is soon handled, and nobody should lose queries over it
 const BEHIND_BEFORE_TURNS: Duration = Duration::from_secs(1);
-
-/// 只剩一台设备这么久，就不再按设备轮流：只有一台时它不算发得多，它分不到的回 SERVFAIL 比一声不响好
-/// With a single device left for this long devices stop taking turns: alone it does not count as
-/// sending too much, and SERVFAIL serves it better than silence for what it cannot get
-const TURNS_END_WHEN_ALONE: Duration = Duration::from_secs(5);
 
 /// 这台机器 `QUEUE_TARGET` 内处理得完多少查询，`took` 是处理 `BEHIND_AFTER_CHECKS` 次看缓冲之间那些查询用的时间
 /// How many queries this machine handles within `QUEUE_TARGET`, `took` being how long the queries
@@ -1156,17 +1144,15 @@ impl<'a> UdpAnswering<'a> {
             queries_within_target: MIN_QUERIES_IN_RECV_BUFFER,
             behind: false,
             overloaded: false,
-            first_device: None,
-            other_device_seen: false,
         }
     }
 
-    /// 量处理速度，记下在不在丢包、过没过载。过载了还始终只有一台设备，才把接收缓冲收小（见下），
-    /// 压住它自己造成的排队延迟；只看积压不够，贴着处理能力时大缓冲一个包都不丢，收小才是白丢
-    /// Measures the handling speed and notes whether it is dropping and overloaded. The receive
-    /// buffer is shrunk only once overloaded with a single device throughout (see below), to hold
-    /// down the wait that one device inflicts on itself; a backlog alone is not enough, as right at
-    /// capacity the large buffer drops nothing and shrinking would throw queries away for nothing
+    /// 量处理速度，记下在不在丢包、过没过载。没开流控时一丢包就把接收缓冲收小，压住排队延迟；只看积压
+    /// 不够，贴着处理能力时大缓冲一个包都不丢，收小才是白丢
+    /// Measures the handling speed and notes whether it is dropping and overloaded. Without flow
+    /// control a drop shrinks the receive buffer, holding down the wait in line; a backlog alone is
+    /// not enough, as right at capacity the large buffer drops nothing and shrinking would throw
+    /// queries away for nothing
     fn shrink_buffer_if_overflowing(&mut self) {
         self.checks_since_empty += 1;
         if !self.checks_since_empty.is_multiple_of(BEHIND_AFTER_CHECKS) {
@@ -1199,53 +1185,24 @@ impl<'a> UdpAnswering<'a> {
         self.overloaded = self.engine.flow_control_state.is_some()
             && now.duration_since(self.behind_since) >= BEHIND_BEFORE_TURNS
             && self.behind;
-        // 没开流控：一丢包就收小，排队的时间短下来，照旧。开了流控：看清设备数之前先留着大缓冲，发得少的那台
-        // 才不会在排进自己队列之前就被挤掉——过载了还始终只有一台设备，才是它自己在刷自己，这时收小压住它造成
-        // 的排队延迟；有第二台一露面就转成按设备轮流，不收小
-        // Without flow control the buffer shrinks on any drop, as before. With it, the large buffer
-        // is kept until the device count is clear, so a device sending little is not crowded out
-        // before it reaches its own queue: only once overloaded with a single device throughout is
-        // it one device flooding itself, and shrinking then holds down the wait it inflicts; a second
-        // one appearing turns this into taking turns instead, with no shrink
-        let shrink = if self.engine.flow_control_state.is_some() {
-            self.overloaded && !self.other_device_seen
-        } else {
-            dropping
-        };
-        if shrink && !self.taking_turns {
+        // 开了流控不收小：过载了就按设备轮流，排队压在各设备自己的队列里。缓冲收小了，发得少的那台的包在被读到
+        // 之前就在内核里和洪泛一起丢了，接收循环见不到它，它也就轮不上
+        // With flow control it is never shrunk: overload means taking turns, with the wait held down in
+        // each device's own queue. A shrunk buffer would lose a device sending little in the kernel
+        // along with the flood, before it is ever read, so it would never get a turn
+        if dropping && self.engine.flow_control_state.is_none() {
             self.set_recv_buffer(recv_buffer_when_behind(self.queries_within_target));
             self.buffer_shrunk = true;
         }
     }
 
-    /// 跟不上以后记下见到的设备：只有一台时不算谁发得多 / Since falling behind notes the devices seen: with
-    /// only one nobody is sending too much
-    #[inline]
-    fn note_device(&mut self, peer: SocketAddr) {
-        let device = Device::of(peer.ip());
-        if *self.first_device.get_or_insert(device) != device {
-            self.other_device_seen = true;
-        }
-    }
-
-    /// 不再按设备轮流，从头再看有几台设备 / Devices no longer take turns, and the count of them starts over
-    fn turns_over(&mut self) {
-        self.taking_turns = false;
-        self.first_device = None;
-        self.other_device_seen = false;
-    }
-
-    /// 开始按设备轮流。接收缓冲放回大的：排队已经在各设备自己的队列里，缓冲小了只会在读不及时满出来，不分来源地丢
-    /// Devices begin to take turns. The large receive buffer goes back: the wait in line is now in
-    /// each device's own queue, and a small buffer would only overflow when a read comes late,
-    /// dropping whatever comes from anyone
+    /// 开始按设备轮流。接收缓冲一直是大的：排队在各设备自己的队列里，缓冲小了只会在读不及时满出来，不分来源地丢
+    /// Devices begin to take turns. The receive buffer stays large: the wait in line is in each
+    /// device's own queue, and a small buffer would only overflow when a read comes late, dropping
+    /// whatever comes from anyone
     #[cfg(target_os = "linux")]
     fn begin_turns(&mut self) -> Box<TakingTurns> {
         self.taking_turns = true;
-        if self.buffer_shrunk {
-            self.set_recv_buffer(UDP_BUFFER_SIZE);
-            self.buffer_shrunk = false;
-        }
         Box::new(TakingTurns::new(self.queries_within_target))
     }
 
@@ -1293,7 +1250,7 @@ impl<'a> UdpAnswering<'a> {
             self.drops_seen = None;
             self.behind = false;
             self.overloaded = false;
-            self.turns_over();
+            self.taking_turns = false;
         }
     }
 
@@ -1310,9 +1267,6 @@ impl<'a> UdpAnswering<'a> {
         if self.request_count >= 100 {
             self.request_count = 0;
             self.shrink_buffer_if_overflowing();
-        }
-        if self.behind && !self.taking_turns {
-            self.note_device(peer);
         }
         // ✅ 优化：使用 handle_packet_fast 避免重复解析 / ✅ Optimization: Use handle_packet_fast to avoid re-parsing
         match self.engine.handle_packet_fast(packet, peer) {
@@ -1412,10 +1366,6 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
                 continue;
             }
             taking.answer_in_turn(&mut answering, &mut replies);
-            if taking.alone_for_long() {
-                turns = None;
-                answering.turns_over();
-            }
             received_in_row = RECEIVED_BEFORE_YIELD;
         } else {
             for k in 0..got {
@@ -1427,7 +1377,7 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
                 }
             }
             received_in_row += got;
-            if answering.overloaded && answering.other_device_seen {
+            if answering.overloaded {
                 turns = Some(answering.begin_turns());
             }
         }
@@ -1445,16 +1395,16 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
 }
 
 /// 过载时按设备轮流：能读多少先读多少，排不下的不解析就丢，所以读得比处理得快得多，socket 不再因为满了而不分来源地丢包；
-/// 然后轮流答一批。什么时候结束不用另外判断：队列也排不满、丢包停够久，就是跟上了
+/// 然后轮流答一批。只有一台设备在刷也这样：别的设备隔多久才问一次都读得到、轮得上。什么时候结束不用另外判断：队列也
+/// 排不满、丢包停够久，就是跟上了
 /// Devices taking turns under overload: as much as there is gets read first and what does not fit
 /// is dropped unparsed, so reading is far faster than handling and the socket no longer drops
-/// whatever comes for being full; then a batch is answered in turn. The end needs no judging of its
-/// own: with the queues not filling up and the drops stopped long enough, it has caught up
+/// whatever comes for being full; then a batch is answered in turn. A single device flooding gets
+/// the same, so another asking however rarely is read and gets its turn. The end needs no judging
+/// of its own: with the queues not filling up and the drops stopped long enough, it has caught up
 #[cfg(target_os = "linux")]
 struct TakingTurns {
     queue: FairQueue<udp_batch::Peer>,
-    /// 上次见到不止一台设备在排队的时刻 / When more than one device was last seen queued
-    others_seen_at: Instant,
     /// 答一批之前已经读了几批 / How many batches were read before answering one
     reads: usize,
 }
@@ -1469,7 +1419,6 @@ impl TakingTurns {
     fn new(room: usize) -> Self {
         Self {
             queue: FairQueue::new(room),
-            others_seen_at: Instant::now(),
             reads: 0,
         }
     }
@@ -1508,9 +1457,6 @@ impl TakingTurns {
         replies: &mut udp_batch::Replies,
     ) {
         self.reads = 0;
-        if self.queue.devices() > 1 {
-            self.others_seen_at = Instant::now();
-        }
         self.queue.set_room(answering.queries_within_target);
         let manager = &answering.engine.permit_manager;
         for _ in 0..udp_batch::BATCH {
@@ -1529,10 +1475,6 @@ impl TakingTurns {
                 replies.push(peer);
             }
         }
-    }
-
-    fn alone_for_long(&self) -> bool {
-        self.others_seen_at.elapsed() >= TURNS_END_WHEN_ALONE
     }
 }
 
@@ -2791,9 +2733,9 @@ mod tests {
         assert!(answering.buffer_shrunk);
     }
 
-    /// 轮流时接收缓冲是大的，丢包也不再收小，但丢包还算没跟上；等之前的丢包不算等完才丢的
-    /// While taking turns the receive buffer is large and drops no longer shrink it, yet drops
-    /// still count as falling behind; drops from before a wait do not count as just after it
+    /// 开了流控接收缓冲一直是大的，过载了、轮流时都不收小，但丢包还算没跟上；等之前的丢包不算等完才丢的
+    /// With flow control the receive buffer stays large, overloaded or taking turns, yet drops still
+    /// count as falling behind; drops from before a wait do not count as just after it
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn taking_turns_keeps_the_large_receive_buffer() {
@@ -2831,22 +2773,20 @@ mod tests {
 
         look(&mut answering);
         overflow().await;
-        // 开了流控，过载了（跟不上够久）而且始终只有一台设备，才收小 / With flow control it shrinks only
-        // once overloaded (behind long enough) with a single device throughout
+        // 开了流控，过载了（跟不上够久）也不收小：过载就按设备轮流 / With flow control even overload
+        // (behind long enough) does not shrink it: overload means taking turns
         answering.behind_since = Instant::now() - BEHIND_BEFORE_TURNS - Duration::from_millis(1);
         answering.behind_at = Instant::now();
         look(&mut answering);
         assert!(answering.overloaded);
-        assert!(answering.buffer_shrunk);
-        assert!(size() < full, "it was shrunk");
-
-        let _turns = answering.begin_turns();
         assert!(!answering.buffer_shrunk);
         assert_eq!(size(), full);
 
-        // 还在丢包、还过载着（孤狼的那种）：轮流时就是不收小，但丢包还算没跟上
-        // Still dropping and still overloaded (the lone-flooder kind): while taking turns it is
-        // simply not shrunk, yet the drops still count as falling behind
+        let _turns = answering.begin_turns();
+
+        // 还在丢包、还过载着：轮流时也不收小，但丢包还算没跟上
+        // Still dropping and still overloaded: while taking turns it is not shrunk either, yet the
+        // drops still count as falling behind
         overflow().await;
         answering.behind_since = Instant::now() - BEHIND_BEFORE_TURNS - Duration::from_millis(1);
         answering.behind_at = Instant::now();
@@ -3119,62 +3059,17 @@ mod tests {
         assert!(!answering.overloaded);
     }
 
-    /// 跟不上以后才看设备（不等过载，这样缓冲还大着就数得到发得少的那台），同一台设备发再多也不算，
-    /// 同一个 IPv6 网段算一台；跟上了从头再看
-    /// Devices are only looked at while falling behind (before overload, so one sending little is
-    /// counted while the buffer is still large); one device sending any amount does not count, one
-    /// IPv6 network is one device, and having caught up starts over
-    #[tokio::test]
-    async fn another_device_is_noted_only_while_behind() {
-        let engine = static_engine_with_flow_control();
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let pending = Arc::new(PendingReplies::default());
-        let mut answering = UdpAnswering::new(&socket, &engine, &pending);
-        let mut reply = BytesMut::new();
-        let query = query("a.test", 1);
-        let mut ask = |answering: &mut UdpAnswering<'_>, from: &str| {
-            answering.answer(
-                &query,
-                SocketAddr::new(from.parse().unwrap(), 53000),
-                &mut reply,
-            );
-        };
-
-        ask(&mut answering, "2001:db8:0:1::1");
-        ask(&mut answering, "2001:db8:0:2::1");
-        assert!(!answering.other_device_seen, "not while behind");
-
-        answering.behind = true;
-        ask(&mut answering, "2001:db8:0:1::1");
-        ask(&mut answering, "2001:db8:0:1::2");
-        assert!(!answering.other_device_seen, "the same network");
-        ask(&mut answering, "2001:db8:0:2::1");
-        assert!(answering.other_device_seen);
-
-        answering.buffer_shrunk = true;
-        answering.drops_seen = kixdns::socket_utils::udp_receive_drops(&socket);
-        answering.behind_at = Instant::now() - CAUGHT_UP_AFTER - Duration::from_millis(1);
-        answering.socket_ran_empty();
-        assert!(!answering.behind);
-        assert!(!answering.other_device_seen);
-        answering.behind = true;
-        ask(&mut answering, "2001:db8:0:2::1");
-        assert!(!answering.other_device_seen, "it starts over");
-    }
-
-    /// 只剩一台设备够久就不再轮流；还有别的设备在排队就继续；一轮答一批
-    /// With a single device left long enough the turns end; with others queued they go on; a
-    /// turn answers one batch
+    /// 一轮答一批：只有一台在排队时答它排着的，很多台时答满一批
+    /// A turn answers one batch: what a single device has queued, or a full batch from many
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn turns_end_after_a_device_is_alone_for_long() {
+    async fn a_turn_answers_one_batch() {
         let engine = static_engine_with_flow_control();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let pending = Arc::new(PendingReplies::default());
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
         let mut replies = udp_batch::Replies::default();
         let packet = query("a.test", 1);
-        let long_ago = Instant::now() - TURNS_END_WHEN_ALONE - Duration::from_millis(1);
         let offer = |turns: &mut TakingTurns, last: u8| {
             let ip = [192, 0, 2, last];
             let peer = udp_batch::Peer::of(SocketAddr::from((ip, 53000)));
@@ -3182,11 +3077,8 @@ mod tests {
         };
 
         let mut turns = TakingTurns::new(1000);
-        turns.others_seen_at = long_ago;
-        assert!(turns.alone_for_long());
         offer(&mut turns, 1);
         turns.answer_in_turn(&mut answering, &mut replies);
-        assert!(turns.alone_for_long(), "still alone");
         assert_eq!(replies.len(), 1);
         replies.clear();
 
@@ -3195,7 +3087,6 @@ mod tests {
         }
         assert!(turns.queue.devices() > 1);
         turns.answer_in_turn(&mut answering, &mut replies);
-        assert!(!turns.alone_for_long());
         assert_eq!(replies.len(), udp_batch::BATCH, "one batch per turn");
     }
 
@@ -3251,12 +3142,14 @@ mod tests {
         })
     }
 
-    /// 一台设备把 CPU 占满时，另一台发得少的设备照样答得上；跟上以后不再按设备轮流，一阵突发不因排不下被丢
-    /// With one device taking all the CPU another that sends little is still answered; once
-    /// caught up devices no longer take turns and a burst is not dropped for not fitting
+    /// 一台设备把 CPU 占满时，另一台偶尔才问一次的设备照样答得上：过载就轮流，不等第二台设备露面；跟上以后不再按设备
+    /// 轮流，一阵突发不因排不下被丢
+    /// With one device taking all the CPU another asking only now and then is still answered:
+    /// overload means taking turns, with no waiting for a second device to show; once caught up
+    /// devices no longer take turns and a burst is not dropped for not fitting
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn a_device_sending_little_is_answered_while_another_floods() {
+    async fn a_device_asking_rarely_is_answered_while_another_floods() {
         let engine = static_engine_with_flow_control();
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let target = server.local_addr().unwrap();
@@ -3269,26 +3162,20 @@ mod tests {
         let client = UdpSocket::bind("127.0.0.3:0").await.unwrap();
         let mut buf = [0u8; 512];
 
-        // 等到开始按设备轮流：轮流时排不下的才计入被拒绝，这里没有别的拒绝
-        // Until devices take turns: only then is what does not fit counted as refused, and
-        // nothing else gets refused here
+        // 只有洪泛的那台也开始轮流：轮流时排不下的才计入被拒绝，这里没有别的拒绝
+        // Turns begin with the flooding device alone: only then is what does not fit counted as
+        // refused, and nothing else gets refused here
         let started = Instant::now();
         while engine.permit_manager.dropped_requests() == 0 {
             assert!(
                 started.elapsed() < Duration::from_secs(30),
                 "turns never began"
             );
-            client
-                .send_to(&query("light.test", 2), target)
-                .await
-                .unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        while tokio::time::timeout(Duration::from_millis(50), client.recv_from(&mut buf))
-            .await
-            .is_ok()
-        {}
 
+        // 另一台头一次问就答得上，之后一个一个地问也都答得上 / The other is answered on its very first
+        // query, and asking one at a time after that too
         let mut answered = 0;
         for id in 0..20 {
             client
@@ -3303,27 +3190,6 @@ mod tests {
             }
         }
         assert!(answered >= 19, "{answered} of 20 answered");
-
-        // 只剩一台够久就不再轮流，排不下的不再被丢 / With one device left long enough the turns end and
-        // nothing is dropped for not fitting any more
-        tokio::time::sleep(TURNS_END_WHEN_ALONE + Duration::from_millis(500)).await;
-        let refused = engine.permit_manager.dropped_requests();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(engine.permit_manager.dropped_requests(), refused, "alone");
-
-        // 再来一台又开始 / Another device begins them again
-        let started = Instant::now();
-        while engine.permit_manager.dropped_requests() == refused {
-            assert!(
-                started.elapsed() < Duration::from_secs(30),
-                "turns never began again"
-            );
-            client
-                .send_to(&query("light.test", 2), target)
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
 
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         flood.join().unwrap();
@@ -3343,27 +3209,6 @@ mod tests {
             refused,
             "caught up, nothing is dropped for not fitting"
         );
-        worker.abort();
-    }
-
-    /// 只有一台设备时不轮流，也就没有查询因为排不下被丢
-    /// With a single device there are no turns, so no query is dropped for not fitting
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_lone_device_does_not_take_turns() {
-        let engine = static_engine_with_flow_control();
-        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let target = server.local_addr().unwrap();
-        let worker = {
-            let (server, engine) = (Arc::clone(&server), Arc::clone(&engine));
-            tokio::spawn(async move { receive_in_batches(&server, &engine).await })
-        };
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flood = flood_from([127, 0, 0, 2], target, Arc::clone(&stop));
-        tokio::time::sleep(BEHIND_BEFORE_TURNS * 3).await;
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        flood.join().unwrap();
-        assert_eq!(engine.permit_manager.dropped_requests(), 0);
         worker.abort();
     }
 
