@@ -62,6 +62,21 @@ prost = { version = "0.14.4", features = ["derive"] }
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["process", "io-util"] }
 
+# 智能流控在 Windows 上读内存：系统的、本进程的、所在作业对象的限制
+# Smart flow control reads memory on Windows: the system's, this process's and its job object's limits
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+# 测试里建一个带内存上限的作业对象 / The tests create a job object with a memory limit
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security"] }
+
 [dev-dependencies]
 ctor = "0.2"
 rcgen = "0.13"

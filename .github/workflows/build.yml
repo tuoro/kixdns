@@ -245,6 +245,9 @@ jobs:
       - name: Run listener port test
         run: cargo test --test listener_port
 
+      - name: Run memory reading test
+        run: cargo test --test memory_reading
+
   lint-linux:
     name: Lint (clippy + fmt)
     runs-on: ubuntu-24.04

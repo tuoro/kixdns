@@ -1,12 +1,14 @@
 //! 流控的内存水位：在途查询多到可能撑爆内存时，看这台机器还剩多少内存，不够了就拒绝新的未命中查询，
-//! 够了自动恢复。不填数字：每台机器读自己的内存（系统的，以及所在 cgroup 的限制）。
+//! 够了自动恢复。不填数字：每台机器读自己的内存——Linux 读系统的和所在各级 cgroup 的限制，FreeBSD 读系统的，
+//! Windows 读系统的和所在作业对象的限制。
 //! 在途查询没到 [`LOOK_FROM_INFLIGHT`] 时不读内存，也不拒绝：日常路径没有开销，其他程序吃内存也不会
 //! 牵连日常查询。之后按 [`reads_apart`] 隔一段读一次，两次之间多占的内存和总量成比例，和 CPU 快慢无关。
 //!
 //! Flow control's memory watermark: once enough queries are in flight to threaten the
 //! memory, it looks at how much memory this machine has left, refuses new cache misses
 //! when too little remains, and resumes by itself. There is no number to fill in: each
-//! machine reads its own memory (the system's and any limit of its cgroups).
+//! machine reads its own memory: on Linux the system's and the limits of its cgroups at
+//! every level, on FreeBSD the system's, and on Windows the system's and the limits of its job object.
 //! Under [`LOOK_FROM_INFLIGHT`] queries in flight it neither reads nor refuses: the daily
 //! path pays nothing, and other programs using memory do not hold up daily queries. After
 //! that it reads every [`reads_apart`], which keeps what is added between two reads in
@@ -364,24 +366,273 @@ mod system {
             assert!(limited_cgroups("0::/\n", root.path(), root.path()).is_empty());
             assert!(limited_cgroups("not a cgroup line\n", root.path(), root.path()).is_empty());
         }
+    }
+}
 
-        #[test]
-        fn this_machine_can_be_read() {
-            let reading = reader()();
-            assert!(!reading.limits.is_empty());
-            assert!(reading.own > 0);
+/// FreeBSD 的系统内存。空闲页加不活跃页随时能用；ZFS 的 ARC 缺内存时会缩到下限，高出下限的那部分也算能用，
+/// 不然用 ZFS 的机器 ARC 占着大半内存，总像是不够
+/// FreeBSD's system memory. Free and inactive pages can be used at any time; ZFS's ARC shrinks
+/// to its minimum when memory runs short, so what it holds above that counts as usable too, or a
+/// machine on ZFS, its ARC holding most of the memory, would always seem short
+#[cfg(any(target_os = "freebsd", test))]
+fn freebsd_left(
+    physmem: u64,
+    page_size: u64,
+    free_pages: u64,
+    inactive_pages: u64,
+    arc: Option<(u64, u64)>,
+) -> MemoryLeft {
+    let arc_above_min = arc.map_or(0, |(size, min)| size.saturating_sub(min));
+    MemoryLeft {
+        total: physmem,
+        available: free_pages
+            .saturating_add(inactive_pages)
+            .saturating_mul(page_size)
+            .saturating_add(arc_above_min)
+            .min(physmem),
+    }
+}
+
+/// Windows 作业对象的内存限制，按已提交的内存算。单个进程的上限，用量就是这个进程已提交的；整个作业的上限，
+/// 作业里只有这个进程时用量也是它，有别的进程时读不到作业的用量，这一处就不算
+/// The memory limits of a Windows job object, counted in committed memory. For the per-process
+/// limit the use is what this process has committed; for the whole job's limit it is the same
+/// when this process is alone in the job, and with others there the job's use cannot be read,
+/// so that limit is left out
+#[cfg(any(windows, test))]
+fn job_left(
+    process_limit: Option<u64>,
+    job_limit: Option<u64>,
+    alone_in_job: bool,
+    committed: u64,
+) -> Vec<MemoryLeft> {
+    let left = |total: u64| MemoryLeft {
+        total,
+        available: total.saturating_sub(committed),
+    };
+    process_limit
+        .map(left)
+        .into_iter()
+        .chain(job_limit.filter(|_| alone_in_job).map(left))
+        .collect()
+}
+
+#[cfg(target_os = "freebsd")]
+mod system {
+    use super::{MemoryReading, freebsd_left};
+    use std::ffi::CStr;
+    use std::mem::{MaybeUninit, size_of};
+
+    pub(super) fn reader() -> Box<dyn Fn() -> MemoryReading + Send + Sync> {
+        Box::new(|| MemoryReading {
+            own: own_resident().unwrap_or(0),
+            limits: system_left().into_iter().collect(),
+        })
+    }
+
+    fn system_left() -> Option<super::MemoryLeft> {
+        let arc =
+            sysctl(c"kstat.zfs.misc.arcstats.size").zip(sysctl(c"kstat.zfs.misc.arcstats.c_min"));
+        Some(freebsd_left(
+            sysctl(c"hw.physmem")?,
+            sysctl(c"vm.stats.vm.v_page_size")?,
+            sysctl(c"vm.stats.vm.v_free_count")?,
+            sysctl(c"vm.stats.vm.v_inactive_count")?,
+            arc,
+        ))
+    }
+
+    /// 读一个整数 sysctl，32 位、64 位的都行；没有这一项（比如没用 ZFS）就是 None
+    /// Reads an integer sysctl, 32 or 64 bits wide; None when there is no such entry (no ZFS, say)
+    fn sysctl(name: &CStr) -> Option<u64> {
+        let mut value = [0u8; 8];
+        let mut len = value.len();
+        // SAFETY: the buffer holds `len` bytes and the kernel writes no more than that
+        // 缓冲区有 `len` 字节，内核写不超过这么多
+        let read = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if read != 0 {
+            return None;
+        }
+        match len {
+            4 => Some(u64::from(u32::from_ne_bytes(value[..4].try_into().ok()?))),
+            8 => Some(u64::from_ne_bytes(value)),
+            _ => None,
+        }
+    }
+
+    /// 这个进程驻留的字节：kinfo_proc 里的驻留页数乘页大小。结构体大小和内核报的对不上就不读
+    /// The bytes this process holds resident: the resident pages in its kinfo_proc times the page
+    /// size. Nothing is read when the structure's size differs from what the kernel reports
+    fn own_resident() -> Option<u64> {
+        // SAFETY: getpid has no preconditions / getpid 没有前提条件
+        let pid = unsafe { libc::getpid() };
+        let mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut info = MaybeUninit::<libc::kinfo_proc>::zeroed();
+        let mut len = size_of::<libc::kinfo_proc>();
+        // SAFETY: `info` holds `len` bytes and the kernel writes no more than that
+        // `info` 有 `len` 字节，内核写不超过这么多
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_ptr(),
+                mib.len() as libc::c_uint,
+                info.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if read != 0 || len != size_of::<libc::kinfo_proc>() {
+            return None;
+        }
+        // SAFETY: zeroed and then filled by the kernel, every field is initialised
+        // 先清零再由内核填好，每个字段都有值
+        let info = unsafe { info.assume_init() };
+        if usize::try_from(info.ki_structsize).ok()? != size_of::<libc::kinfo_proc>() {
+            return None;
+        }
+        let pages = u64::try_from(info.ki_rssize).ok()?;
+        Some(pages.saturating_mul(sysctl(c"vm.stats.vm.v_page_size")?))
+    }
+}
+
+#[cfg(windows)]
+mod system {
+    use super::{MemoryLeft, MemoryReading, job_left};
+    use std::mem::{MaybeUninit, size_of};
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOBOBJECTINFOCLASS, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    pub(super) fn reader() -> Box<dyn Fn() -> MemoryReading + Send + Sync> {
+        Box::new(|| {
+            let process = process_memory();
+            MemoryReading {
+                own: process.map_or(0, |counters| counters.WorkingSetSize as u64),
+                limits: system_left()
+                    .into_iter()
+                    .chain(job_limits(
+                        process.map_or(0, |counters| counters.PrivateUsage as u64),
+                    ))
+                    .collect(),
+            }
+        })
+    }
+
+    /// 物理内存总量和可用量，可用的含随时能回收的缓存 / Physical memory in all and available, the
+    /// available including cache that can be reclaimed at any time
+    fn system_left() -> Option<MemoryLeft> {
+        let mut status = MaybeUninit::<MEMORYSTATUSEX>::zeroed();
+        // SAFETY: a zeroed MEMORYSTATUSEX is valid, and its length is set before the call
+        // 清零的 MEMORYSTATUSEX 合法，调用前先填好长度
+        let status = unsafe {
+            (*status.as_mut_ptr()).dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(status.as_mut_ptr()) == 0 {
+                return None;
+            }
+            status.assume_init()
+        };
+        Some(MemoryLeft {
+            total: status.ullTotalPhys,
+            available: status.ullAvailPhys,
+        })
+    }
+
+    fn process_memory() -> Option<PROCESS_MEMORY_COUNTERS_EX> {
+        let size = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        let mut counters = MaybeUninit::<PROCESS_MEMORY_COUNTERS_EX>::zeroed();
+        // SAFETY: the counters hold `size` bytes, which the call is told, and zeroed they are valid
+        // 计数结构有 `size` 字节并告诉了调用，清零也合法
+        unsafe {
+            (*counters.as_mut_ptr()).cb = size;
+            let read = K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                counters.as_mut_ptr().cast::<PROCESS_MEMORY_COUNTERS>(),
+                size,
+            );
+            (read != 0).then(|| counters.assume_init())
+        }
+    }
+
+    fn job_limits(committed: u64) -> Vec<MemoryLeft> {
+        // SAFETY: each class is queried into the structure it fills
+        // 每一类信息都查进它对应的结构
+        let (limits, accounting) = unsafe {
+            (
+                query_job::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(
+                    JobObjectExtendedLimitInformation,
+                ),
+                query_job::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(
+                    JobObjectBasicAccountingInformation,
+                ),
+            )
+        };
+        let Some(limits) = limits else {
+            return Vec::new();
+        };
+        let flags = limits.BasicLimitInformation.LimitFlags;
+        job_left(
+            (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0)
+                .then_some(limits.ProcessMemoryLimit as u64),
+            (flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0).then_some(limits.JobMemoryLimit as u64),
+            accounting.is_some_and(|accounting| accounting.ActiveProcesses == 1),
+            committed,
+        )
+    }
+
+    /// 这个进程所在作业的一类信息（作业套作业时是最里面那一层）；不在作业里就没有
+    /// One class of information on the job this process is in (the innermost of nested jobs);
+    /// None when it is in no job
+    ///
+    /// # Safety
+    /// `T` 必须是 `class` 要填的那个 C 结构，全零是合法值 / `T` must be the C structure `class`
+    /// fills, for which all zeros is a valid value
+    unsafe fn query_job<T>(class: JOBOBJECTINFOCLASS) -> Option<T> {
+        let mut info = MaybeUninit::<T>::zeroed();
+        // SAFETY: by this function's contract `info` is what `class` fills, `size_of::<T>()` bytes
+        // 按约定 `info` 就是 `class` 要填的，`size_of::<T>()` 字节
+        unsafe {
+            let read = QueryInformationJobObject(
+                std::ptr::null_mut(),
+                class,
+                info.as_mut_ptr().cast(),
+                size_of::<T>() as u32,
+                std::ptr::null_mut(),
+            );
+            (read != 0).then(|| info.assume_init())
         }
     }
 }
 
-// FreeBSD 和 Windows 另行实现，这里先读不到 / FreeBSD and Windows come later; until then memory reads as unknown
-#[cfg(not(target_os = "linux"))]
+// 其他系统还读不到内存，不按内存拒绝 / Other systems cannot read memory yet, and nothing is refused by memory
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", windows)))]
 mod system {
     use super::MemoryReading;
 
     pub(super) fn reader() -> Box<dyn Fn() -> MemoryReading + Send + Sync> {
         Box::new(MemoryReading::default)
     }
+}
+
+/// 读一次这台机器的内存：本进程占的和每一处限制，系统的那处在最前面
+/// Reads this machine's memory once: what this process holds and every limit, the system's first
+pub fn this_machine() -> MemoryReading {
+    system::reader()()
 }
 
 #[cfg(test)]
@@ -549,5 +800,57 @@ mod tests {
         for _ in 0..READ_EVERY * 2 {
             assert!(watermark.has_room(LOOK_FROM_INFLIGHT));
         }
+    }
+
+    /// FreeBSD：空闲页加不活跃页能用，ZFS 的 ARC 只算高出下限的那部分；没有 ZFS 就不算它
+    /// FreeBSD: free and inactive pages are usable, and of ZFS's ARC only what is above its
+    /// minimum; without ZFS it does not count
+    #[test]
+    fn on_freebsd_free_inactive_and_the_arc_above_its_minimum_are_left() {
+        const PAGE: u64 = 4096;
+        let with_arc = freebsd_left(16 * GIB, PAGE, 1000, 3000, Some((6 * GIB, GIB)));
+        assert_eq!(
+            with_arc,
+            MemoryLeft {
+                total: 16 * GIB,
+                available: 4000 * PAGE + 5 * GIB,
+            }
+        );
+        let without_zfs = freebsd_left(16 * GIB, PAGE, 1000, 3000, None);
+        assert_eq!(without_zfs.available, 4000 * PAGE);
+        let arc_at_its_minimum = freebsd_left(16 * GIB, PAGE, 1000, 3000, Some((GIB, 2 * GIB)));
+        assert_eq!(arc_at_its_minimum.available, 4000 * PAGE);
+        let counters_past_the_total = freebsd_left(GIB, PAGE, u64::MAX, 1, Some((GIB, 0)));
+        assert_eq!(
+            counters_past_the_total.available, GIB,
+            "never more than the total"
+        );
+    }
+
+    /// Windows 作业对象：单进程上限按本进程已提交的算；整个作业的上限只在作业里只有本进程时算
+    /// A Windows job object: the per-process limit goes by what this process has committed; the
+    /// whole job's limit counts only with this process alone in the job
+    #[test]
+    fn a_windows_job_limit_counts_only_when_its_use_is_known() {
+        let process = MemoryLeft {
+            total: 2 * GIB,
+            available: 2 * GIB - 300 * MIB,
+        };
+        let job = MemoryLeft {
+            total: 4 * GIB,
+            available: 4 * GIB - 300 * MIB,
+        };
+        assert!(job_left(None, None, true, 300 * MIB).is_empty());
+        assert_eq!(job_left(Some(2 * GIB), None, false, 300 * MIB), [process]);
+        assert_eq!(job_left(None, Some(4 * GIB), true, 300 * MIB), [job]);
+        assert!(
+            job_left(None, Some(4 * GIB), false, 300 * MIB).is_empty(),
+            "others in the job: its use is unknown"
+        );
+        assert_eq!(
+            job_left(Some(2 * GIB), Some(4 * GIB), true, 300 * MIB),
+            [process, job]
+        );
+        assert_eq!(job_left(Some(MIB), None, true, GIB)[0].available, 0);
     }
 }

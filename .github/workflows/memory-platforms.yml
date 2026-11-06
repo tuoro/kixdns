@@ -1,0 +1,72 @@
+# 智能流控读内存的代码每个平台各写一份。只在这些文件改动时，到 FreeBSD 和 Windows 上真读一遍（Linux 的在 Build 里跑）
+# Smart flow control reads memory with code of its own on each platform. Only when these files change does
+# this read it for real on FreeBSD and Windows (Linux's runs in Build)
+name: Memory reading
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/engine/memory_watermark.rs
+      - tests/memory_reading.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/memory-platforms.yml
+  pull_request:
+    paths:
+      - src/engine/memory_watermark.rs
+      - tests/memory_reading.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/memory-platforms.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Memory reading on Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # 和 Build 里的 Windows 构建同一套工具链 / The same toolchain as Build's Windows build
+      - name: Install MSYS2 x86_64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-rust
+
+      - name: Read this machine's memory
+        shell: msys2 {0}
+        run: cargo test --locked --target x86_64-pc-windows-gnullvm --test memory_reading
+
+  freebsd:
+    name: Memory reading on FreeBSD ${{ matrix.release }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14", "15"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Read this machine's memory in a FreeBSD VM
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          prepare: |
+            pkg install -y curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            . "$HOME/.cargo/env"
+            cargo test --locked --test memory_reading
