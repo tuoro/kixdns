@@ -1771,7 +1771,7 @@ async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
         // 否则与对端的 delayed-ACK 定时器交互导致每查询约 40ms 延迟。
         stream.set_nodelay(true).ok();
         // 内存不够时不接新连接，已有的连接照常 / With too little memory no new connection is taken, and those there go on
-        let Some(permit) = engine.stream_query_permit(peer.ip()) else {
+        let Some(permit) = engine.connection_permit(peer.ip()) else {
             continue;
         };
         let engine = engine.clone();
@@ -3997,6 +3997,62 @@ mod tests {
 
         drop((held, light_stream, heavy_connected));
         worker.abort();
+        tcp.abort();
+    }
+
+    /// 内存紧张时，一台只开着一条 TCP 连接的设备，在这条连接上问的未命中查询照常转发：连接不算查询的份。以前连接和
+    /// 查询记在一起，别的设备各占一个查询时它这条连接也算占了一份，查询当场被拒
+    /// With memory tight, a device holding just one TCP connection has a miss it asks on that
+    /// connection forwarded as usual: a connection is no share of queries. Connections and
+    /// queries used to be counted together, so with every other device holding one query its
+    /// connection counted as a share and the query was refused at once
+    #[tokio::test]
+    async fn tight_memory_does_not_count_a_connection_as_a_share_of_queries() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let available = memory_left(1 << 30);
+        let (engine, plain) =
+            engine_short_of_memory(upstream.local_addr().unwrap(), Arc::clone(&available));
+        drop(plain);
+        let manager = &engine.permit_manager;
+        // 1000 台设备各占一个查询，各在一份 / 1000 devices holding one query each, each in a slot of its own
+        let mut slots = std::collections::HashSet::new();
+        let holders: Vec<IpAddr> = (0..=255u8)
+            .flat_map(|b| (1..=254u8).map(move |c| IpAddr::from(Ipv4Addr::new(127, 1, b, c))))
+            .filter(|ip| slots.insert(manager.slot_of(*ip)))
+            .take(1000)
+            .collect();
+        let client = (2..=254)
+            .map(|n| IpAddr::from(Ipv4Addr::new(127, 0, 0, n)))
+            .find(|ip| !slots.contains(&manager.slot_of(*ip)))
+            .unwrap();
+        let held: Vec<_> = holders
+            .iter()
+            .map(|ip| engine.stream_query_permit(*ip).expect("plenty of memory"))
+            .collect();
+        let (address, tcp) = tcp_server(&engine).await;
+        let mut connected = connect_from(client, address).await;
+        in_flight_reaches(&engine, 1001).await;
+        // 剩 100 MiB 算紧张；看够了次数，下一次读到它 / 100 MiB left is tight; enough looks for the next read to find it
+        available.store(100 << 20, Relaxed);
+        for _ in 0..3000 {
+            drop(engine.stream_query_permit(holders[0]));
+        }
+        assert!(
+            engine.stream_query_permit(holders[0]).is_none(),
+            "tight now, and a device holding a query is at the average"
+        );
+
+        send_tcp_query(&mut connected).await;
+        let mut buf = [0u8; 512];
+        tokio::time::timeout(Duration::from_secs(1), upstream.recv_from(&mut buf))
+            .await
+            .expect("the query on the only connection is asked of the upstream")
+            .unwrap();
+
+        drop((held, connected));
         tcp.abort();
     }
 

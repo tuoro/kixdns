@@ -330,16 +330,30 @@ impl Engine {
         }
     }
 
-    /// `client` 的 TCP 或 DoH 新连接、或连接上一个要等上游的查询能不能处理（见
-    /// `FlowControlState::permit_by_memory`）。连接本身也占内存，所以也算；没开流控时都能处理
-    /// Whether a new TCP or DoH connection from `client`, or a query on one that waits on an
-    /// upstream, can go ahead (see `FlowControlState::permit_by_memory`). A connection holds
-    /// memory too, so it counts as well; without flow control it always can
+    /// `client` 的 TCP 或 DoH 连接上一个要等上游的查询能不能处理（见
+    /// `FlowControlState::permit_by_memory`）；没开流控时都能处理
+    /// Whether a query from `client` on a TCP or DoH connection that waits on an upstream can
+    /// go ahead (see `FlowControlState::permit_by_memory`); without flow control it always can
     #[inline]
     pub fn stream_query_permit(&self, client: IpAddr) -> Option<PermitGuard> {
         match &self.flow_control_state {
             Some(state) => {
                 state.permit_by_memory(&self.permit_manager, self.permit_manager.slot_of(client))
+            }
+            None => Some(self.permit_manager.acquire()),
+        }
+    }
+
+    /// `client` 的一条 TCP 或 DoH 新连接接不接（见 `FlowControlState::connection_permit`）。连接本身也占内存，
+    /// 所以也算在途；没开流控时都接
+    /// Whether a new TCP or DoH connection from `client` is taken (see
+    /// `FlowControlState::connection_permit`). A connection holds memory too, so it counts as in
+    /// flight; without flow control it always is
+    #[inline]
+    pub fn connection_permit(&self, client: IpAddr) -> Option<PermitGuard> {
+        match &self.flow_control_state {
+            Some(state) => {
+                state.connection_permit(&self.permit_manager, self.permit_manager.slot_of(client))
             }
             None => Some(self.permit_manager.acquire()),
         }

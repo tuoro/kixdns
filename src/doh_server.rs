@@ -109,7 +109,7 @@ pub async fn run_doh_with_listener(
         // about 40 ms to the first request on a new connection
         stream.set_nodelay(true).ok();
         // 内存不够时不接新连接，已有的连接照常 / With too little memory no new connection is taken, and those there go on
-        let Some(permit) = engine.stream_query_permit(peer.ip()) else {
+        let Some(permit) = engine.connection_permit(peer.ip()) else {
             continue;
         };
         // Snapshot the current acceptor for this connection; in-flight
