@@ -169,13 +169,15 @@ The aliases and-not, andnot, or-not, and ornot are also accepted.
 | static_response | rcode | Returns NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, or REFUSED. |
 | static_ip_response | ip | Returns A or AAAA records matching the query type (both for ANY queries). Other query types, including HTTPS and SVCB, receive NODATA; this action does not synthesize IP hints. `ip` accepts one address or a comma-separated list of IPv4/IPv6 addresses (for example, `192.0.2.1,2001:db8::1`). Addresses are returned as-is; a very large list may exceed the UDP response size limit. |
 | static_cname_response | target, ttl (optional) | Returns a CNAME record for every query type that maps the queried name to `target`; ttl defaults to 300. The target is not resolved server-side and its address records are not included, so the client or resolver must follow the alias. Clients that do not follow a bare CNAME may report no data. Invalid owner or target names return SERVFAIL. |
-| static_txt_response | text, ttl (optional) | Returns a TXT response. text accepts a string or string array; ttl defaults to 300. Each string is at most 255 bytes; the whole answer has to fit one DNS message (65535 bytes, keeping room for EDNS and an ECS echo, each string taking one length byte more), otherwise it is SERVFAIL, and text that fits no question at all is a configuration problem. |
+| static_txt_response | text, ttl (optional) | Returns a TXT record for TXT and ANY queries; other query types receive NODATA. text accepts a string or string array; ttl defaults to 300. Each string is at most 255 bytes; the whole answer has to fit one DNS message (65535 bytes, keeping room for EDNS and an ECS echo, each string taking one length byte more), otherwise it is SERVFAIL, and text that fits no question at all is a configuration problem. |
 | jump_to_pipeline | pipeline | Starts processing the referenced pipeline. |
 | allow | none | Request phase: forward with the global default UDP upstream. Response phase: keep the current upstream response. |
 | deny | none | Returns REFUSED. |
 | forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream (or null, or []) uses default_upstream; an empty string is not missing. |
 | continue | none | Continues with the next request rule, or the next pipeline decision in the response flow. |
 | replace_txt_response | text | Response-phase action that replaces TXT records in the current response. In the request phase it does not produce a response. text has the same size limits as static_txt_response. |
+
+The records static_ip_response, static_cname_response and static_txt_response give are all of class IN, so they answer only questions of class IN or ANY; a question of another class (CH, for example) receives NODATA.
 
 ### ECS
 
@@ -196,7 +198,7 @@ ECS is configured on a Forward action:
 The supported modes are:
 
 - clear: remove the request ECS option;
-- from_client_ip: when the client sent ECS itself, forward its own subnet, cut to the prefix set here when it is longer, and a prefix of 0 as it is, adding no address (RFC 7871 section 7.1); a private or IPv4-mapped (`::ffff:a.b.c.d`) network the client sent counts as none and does not go upstream (section 11.3); an option nobody can read is removed, and no subnet of the client address is added either. Otherwise derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6, injecting nothing for private, loopback, and ULA addresses;
+- from_client_ip: when the client sent ECS itself, forward its own subnet, cut to the prefix set here when it is longer, and a prefix of 0 as it is, adding no address (RFC 7871 section 7.1); a private or IPv4-mapped (`::ffff:a.b.c.d`) network the client sent counts as none and does not go upstream (section 11.3); an option nobody can read is removed, and no subnet of the client address is added either. Otherwise derive the subnet from the client address, defaulting to /24 for IPv4 and /56 for IPv6, injecting nothing for private, loopback, and ULA addresses or other addresses that are not globally routable (RFC 6890: 100.64.0.0/10 of carrier-grade NAT, 198.18.0.0/15 for benchmarking, 192.0.0.0/24, 0.0.0.0/8, and in IPv6 100::/64 and 64:ff9b:1::/48), and counting such a network the client sent as a private one;
 - static: inject a configured IP and prefix.
 
 A forward without ecs passes the client's own ECS option upstream as it is.

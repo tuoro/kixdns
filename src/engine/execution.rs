@@ -962,7 +962,7 @@ impl Engine {
                 let reply = shaped_static_reply(reply, packet, q.client_subnet.as_ref());
                 return finish_static(Ok(reply), answer);
             }
-            if let Decision::Static { rcode, answers } = action.decision(qname_str, qtype) {
+            if let Decision::Static { rcode, answers } = action.decision(qname_str, qtype, qclass) {
                 let answer = FastPathAnswer::StaticRule {
                     rule: rule_name,
                     rcode,
@@ -1281,6 +1281,10 @@ impl Engine {
                         )
                     } else {
                         // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
+                        anyhow::ensure!(
+                            crate::proto_utils::question_name_readable(packet),
+                            "unreadable question name"
+                        );
                         let req = Message::from_bytes(packet).context("parse request")?;
                         let question = req.queries.first().context("empty question")?;
                         (
@@ -3839,7 +3843,7 @@ mod tests {
         let ipv4 = "1.2.3.4";
 
         // Act: Generate static IP answer
-        let (rcode, answers) = make_static_ip_answer(domain, RecordType::A, ipv4);
+        let (rcode, answers) = make_static_ip_answer(domain, RecordType::A, DNSClass::IN, ipv4);
 
         // Assert: Verify response code and record type
         assert_eq!(
@@ -3862,7 +3866,7 @@ mod tests {
         let ipv6 = "2001:db8::1";
 
         // Act: Generate static IP answer
-        let (rcode, answers) = make_static_ip_answer(domain, RecordType::AAAA, ipv6);
+        let (rcode, answers) = make_static_ip_answer(domain, RecordType::AAAA, DNSClass::IN, ipv6);
 
         // Assert: Verify response code and record type
         assert_eq!(
@@ -3882,7 +3886,8 @@ mod tests {
     fn make_static_ip_answer_filters_comma_separated_addresses_by_query_type() {
         let ips = " 192.0.2.1, 2001:db8::1,192.0.2.2 ";
 
-        let (a_rcode, a_answers) = make_static_ip_answer("example.com", RecordType::A, ips);
+        let (a_rcode, a_answers) =
+            make_static_ip_answer("example.com", RecordType::A, DNSClass::IN, ips);
         assert_eq!(a_rcode, ResponseCode::NoError);
         assert_eq!(a_answers.len(), 2);
         assert!(
@@ -3892,7 +3897,7 @@ mod tests {
         );
 
         let (aaaa_rcode, aaaa_answers) =
-            make_static_ip_answer("example.com", RecordType::AAAA, ips);
+            make_static_ip_answer("example.com", RecordType::AAAA, DNSClass::IN, ips);
         assert_eq!(aaaa_rcode, ResponseCode::NoError);
         assert_eq!(aaaa_answers.len(), 1);
         assert_eq!(aaaa_answers[0].record_type(), RecordType::AAAA);
@@ -3900,7 +3905,8 @@ mod tests {
 
     #[test]
     fn make_static_ip_answer_returns_nodata_for_unconfigured_query_family() {
-        let (rcode, answers) = make_static_ip_answer("example.com", RecordType::AAAA, "192.0.2.1");
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", RecordType::AAAA, DNSClass::IN, "192.0.2.1");
 
         assert_eq!(rcode, ResponseCode::NoError);
         assert!(answers.is_empty());
@@ -3908,8 +3914,12 @@ mod tests {
 
     #[test]
     fn make_static_ip_answer_returns_nodata_for_https_query() {
-        let (rcode, answers) =
-            make_static_ip_answer("example.com", RecordType::HTTPS, "192.0.2.1,2001:db8::1");
+        let (rcode, answers) = make_static_ip_answer(
+            "example.com",
+            RecordType::HTTPS,
+            DNSClass::IN,
+            "192.0.2.1,2001:db8::1",
+        );
 
         assert_eq!(rcode, ResponseCode::NoError);
         assert!(answers.is_empty());
@@ -3917,8 +3927,12 @@ mod tests {
 
     #[test]
     fn make_static_ip_answer_returns_both_families_for_any_query() {
-        let (rcode, answers) =
-            make_static_ip_answer("example.com", RecordType::ANY, "192.0.2.1,2001:db8::1");
+        let (rcode, answers) = make_static_ip_answer(
+            "example.com",
+            RecordType::ANY,
+            DNSClass::IN,
+            "192.0.2.1,2001:db8::1",
+        );
 
         assert_eq!(rcode, ResponseCode::NoError);
         assert_eq!(answers.len(), 2);
@@ -3931,6 +3945,7 @@ mod tests {
         let (rcode, answers) = make_static_ip_answer(
             "example.com",
             RecordType::A,
+            DNSClass::IN,
             "192.0.2.1,not-an-ip,2001:db8::1",
         );
 
@@ -3945,7 +3960,8 @@ mod tests {
     #[test]
     fn make_static_ip_answer_rejects_empty_entries() {
         for ips in ["", "192.0.2.1,", ",192.0.2.1", "192.0.2.1,,2001:db8::1"] {
-            let (rcode, answers) = make_static_ip_answer("example.com", RecordType::A, ips);
+            let (rcode, answers) =
+                make_static_ip_answer("example.com", RecordType::A, DNSClass::IN, ips);
             assert_eq!(rcode, ResponseCode::ServFail, "input: {ips:?}");
             assert!(answers.is_empty(), "input: {ips:?}");
         }
@@ -4803,7 +4819,8 @@ mod tests {
             RecordType::A,
         ));
         let packet = request.to_vec().unwrap();
-        let (rcode, answers) = make_static_ip_answer("example.com", RecordType::A, "192.0.2.1");
+        let (rcode, answers) =
+            make_static_ip_answer("example.com", RecordType::A, DNSClass::IN, "192.0.2.1");
 
         // Act: uses_client_ip=true must NOT write into dns_cache (client isolation)
         let ctx = phases::StaticDecisionContext {
@@ -5311,7 +5328,7 @@ mod tests {
             let (rcode, records) = if ips.is_empty() {
                 (rcode, Vec::new())
             } else {
-                make_static_ip_answer(text, qtype, ips)
+                make_static_ip_answer(text, qtype, DNSClass::from(q.qclass), ips)
             };
             let addresses = if ips.is_empty() {
                 Vec::new()
@@ -6750,7 +6767,7 @@ mod tests {
                             },
                         ) => {
                             let Decision::Static { rcode, answers } =
-                                action.decision(domain, RecordType::A)
+                                action.decision(domain, RecordType::A, DNSClass::IN)
                             else {
                                 unreachable!("a fast-path action answers statically");
                             };
