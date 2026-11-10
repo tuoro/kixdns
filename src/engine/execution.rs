@@ -315,16 +315,24 @@ impl Engine {
         // keep their warm response and rule caches.
     }
 
-    /// `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::permit`）；没开流控时都能处理
-    /// Whether a query from `client` that waits on an upstream can go ahead (see
+    /// `client` 的一个要等上游的查询能不能处理，`budget` 是内核忙时在途的查询一共最多多少（见
+    /// `FlowControlState::permit`）；没开流控时都能处理
+    /// Whether a query from `client` that waits on an upstream can go ahead, `budget` being how
+    /// many queries may be in flight in all while the kernel is busy (see
     /// `FlowControlState::permit`); without flow control it always can
     #[inline]
-    pub fn query_permit(&self, emptied_at: Instant, client: IpAddr) -> Option<PermitGuard> {
+    pub fn query_permit(
+        &self,
+        emptied_at: Instant,
+        client: IpAddr,
+        budget: usize,
+    ) -> Option<PermitGuard> {
         match &self.flow_control_state {
             Some(state) => state.permit(
                 &self.permit_manager,
                 emptied_at,
                 self.permit_manager.slot_of(client),
+                budget,
             ),
             None => Some(self.permit_manager.acquire()),
         }
@@ -359,16 +367,18 @@ impl Engine {
         }
     }
 
-    /// 按设备轮流时 `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::turn_permit`）；没开流控时都能
+    /// 按设备轮流时 `client` 的一个要等上游的查询能不能处理，`budget` 同 [`Self::query_permit`]（见
+    /// `FlowControlState::turn_permit`）；没开流控时都能
     /// Whether a query from `client` that waits on an upstream can go ahead while devices take
-    /// turns (see `FlowControlState::turn_permit`); without flow control it always can
+    /// turns, `budget` as for [`Self::query_permit`] (see `FlowControlState::turn_permit`);
+    /// without flow control it always can
     #[inline]
-    pub fn turn_query_permit(&self, client: IpAddr, more_queued: bool) -> Option<PermitGuard> {
+    pub fn turn_query_permit(&self, client: IpAddr, budget: usize) -> Option<PermitGuard> {
         match &self.flow_control_state {
             Some(state) => state.turn_permit(
                 &self.permit_manager,
                 self.permit_manager.slot_of(client),
-                more_queued,
+                budget,
             ),
             None => Some(self.permit_manager.acquire()),
         }

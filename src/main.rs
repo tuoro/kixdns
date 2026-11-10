@@ -1075,14 +1075,17 @@ struct UdpAnswering<'a> {
     /// 这台机器 `QUEUE_TARGET` 内处理得完多少查询，上次读丢包数时量的 / How many queries this machine handles
     /// within `QUEUE_TARGET`, measured when the drops were last read
     queries_within_target: usize,
+    /// 上次读丢包数时一共走完了多少查询（见 `PermitManager::queries_done`）/ How many queries were done in all
+    /// when the drops were last read (see `PermitManager::queries_done`)
+    done_seen: u64,
+    /// 内核忙时在途的查询一共最多多少，上次读丢包数时按走完的速度算的（见 `concurrency::budget_from`）/ How many
+    /// queries may be in flight in all while the kernel is busy, worked out from how fast they were
+    /// done when the drops were last read (see `concurrency::budget_from`)
+    budget: usize,
     /// 这会儿在丢包或者拒绝 / Dropping or refusing just now
     behind: bool,
     /// 丢包持续了够久，就按设备轮流 / Drops have lasted long enough, so devices take turns
     overloaded: bool,
-    /// 轮流时正在答的这个查询，它的设备后面还排没排着别的（见 `Engine::turn_query_permit`）
-    /// While taking turns, whether the device of the query being answered has more queued behind
-    /// it (see `Engine::turn_query_permit`)
-    more_queued: bool,
 }
 
 /// 每 100 个查询看一次接收缓冲，看到这么多次的整数倍、socket 还没收空就读一次丢包数，平时不多这一次系统调用
@@ -1188,9 +1191,10 @@ impl<'a> UdpAnswering<'a> {
             refused: false,
             taking_turns: false,
             queries_within_target: MIN_QUERIES_IN_RECV_BUFFER,
+            done_seen: engine.permit_manager.queries_done(),
+            budget: kixdns::engine::concurrency::BUDGET_AT_LEAST,
             behind: false,
             overloaded: false,
-            more_queued: false,
         }
     }
 
@@ -1229,12 +1233,15 @@ impl<'a> UdpAnswering<'a> {
             }
         };
         let refusing = std::mem::take(&mut self.refused);
+        let done = self.engine.permit_manager.queries_done();
+        let done_since = done.saturating_sub(std::mem::replace(&mut self.done_seen, done));
         // 这一段积压第一次看：到上一次之间可能空闲过，量不出速度 / The first look of this backlog: it may
         // have been idle since the last, so this measures no speed
         if self.checks_since_empty == BEHIND_AFTER_CHECKS {
             return;
         }
         self.queries_within_target = queries_within_target(took);
+        self.budget = kixdns::engine::concurrency::budget_from(done_since, took);
         if dropping || refusing {
             // 还从没跟不上过，或者已经安静了够久：新的一段 / Never behind yet, or quiet long enough: a new spell
             if self.behind_since > self.behind_at
@@ -1624,21 +1631,19 @@ impl TakingTurns {
         self.queue.set_room(answering.queries_within_target);
         let manager = &answering.engine.permit_manager;
         for _ in 0..udp_batch::BATCH {
-            let Some((packet, peer, more_queued)) = self.queue.next_in_turn() else {
+            let Some((packet, peer, queues_its_share)) = self.queue.next_in_turn() else {
                 return;
             };
-            // 内核跟不上：还排着队的设备这一个不解析就丢，发得少的设备照常答。丢的和排不下的一样，不算跟不上
-            // Falling behind: a device with more queued loses this one unparsed, and a device
-            // sending little is answered as usual. As with what does not fit, this drop is not
-            // falling behind
-            if more_queued && answering.engine.falling_behind() {
+            // 内核跟不上：后面排着的不比各设备平均少的设备，这一个不解析就丢；发得少的设备照常答，一次问好几个的也是。
+            // 丢的和排不下的一样，不算跟不上
+            // Falling behind: a device with no fewer queued behind it than the average loses this
+            // one unparsed; a device sending little is answered as usual, one asking several at
+            // once too. As with what does not fit, this drop is not falling behind
+            if queues_its_share && answering.engine.falling_behind() {
                 manager.count_refused();
                 continue;
             }
-            answering.more_queued = more_queued;
-            let answered = answering.answer(&packet, peer.addr(), replies.next_buf());
-            answering.more_queued = false;
-            if answered {
+            if answering.answer(&packet, peer.addr(), replies.next_buf()) {
                 replies.push(peer);
             }
         }
@@ -1766,23 +1771,24 @@ impl TurnsOneByOne {
         drained
     }
 
-    /// 轮流答一批：内核跟不上时，还排着队的设备这一个不解析就丢，发得少的照常答（见 `TakingTurns::answer_in_turn`）
-    /// Answers a batch in turn: falling behind, a device with more queued loses this one unparsed,
-    /// and a device sending little is answered as usual (see `TakingTurns::answer_in_turn`)
+    /// 轮流答一批：内核跟不上时，后面排着的不比各设备平均少的设备这一个不解析就丢，发得少的照常答（见
+    /// `TakingTurns::answer_in_turn`）
+    /// Answers a batch in turn: falling behind, a device with no fewer queued behind it than the
+    /// average loses this one unparsed, and a device sending little is answered as usual (see
+    /// `TakingTurns::answer_in_turn`)
     async fn answer_in_turn(&mut self, answering: &mut UdpAnswering<'_>, reply: &mut BytesMut) {
         self.queue.set_room(answering.queries_within_target);
         for _ in 0..ONE_BY_ONE_TURN {
-            let Some((packet, peer, more_queued)) = self.queue.next_in_turn() else {
+            let Some((packet, peer, queues_its_share)) = self.queue.next_in_turn() else {
                 return;
             };
-            if more_queued && answering.engine.falling_behind() {
+            if queues_its_share && answering.engine.falling_behind() {
                 answering.engine.permit_manager.count_refused();
                 continue;
             }
-            answering.more_queued = more_queued;
-            let answered = answering.answer(&packet, peer, reply);
-            answering.more_queued = false;
-            if answered && let Err(error) = send_udp_datagram(answering.socket, reply, peer).await {
+            if answering.answer(&packet, peer, reply)
+                && let Err(error) = send_udp_datagram(answering.socket, reply, peer).await
+            {
                 debug!(%peer, %error, response_len = reply.len(), "failed to send UDP response");
             }
         }
@@ -1934,17 +1940,16 @@ fn spawn_udp_answer(
     peer: SocketAddr,
     pre_parsed: Option<PreParsedData>,
 ) -> bool {
-    // 轮流时内核跟不上已经丢过了；轮到这里的看内存，后面还排着别的设备再比一次份额（见 `Engine::turn_query_permit`）
+    // 轮流时内核跟不上已经丢过了；轮到这里的看内存和在途的预算（见 `Engine::turn_query_permit`）
     // Taking turns, falling behind has already dropped what it should; what gets here goes by
-    // memory, and a device with more queued is compared with the average once more (see
-    // `Engine::turn_query_permit`)
+    // memory and the budget of what is in flight (see `Engine::turn_query_permit`)
     let client = peer.ip();
     let permit = if answering.taking_turns {
+        answering.engine.turn_query_permit(client, answering.budget)
+    } else {
         answering
             .engine
-            .turn_query_permit(client, answering.more_queued)
-    } else {
-        answering.engine.query_permit(answering.emptied_at, client)
+            .query_permit(answering.emptied_at, client, answering.budget)
     };
     let Some(permit) = permit else {
         if let Some(pre_parsed) = pre_parsed
@@ -3219,54 +3224,103 @@ mod tests {
         assert!(answering.behind_since.elapsed() < BEHIND_BEFORE_TURNS);
     }
 
-    /// 轮流时，后面还排着别的、在途又不比平均少的设备，这个要等上游的查询也拒；排到最后一个的照常，发得少的设备照常。
-    /// 以前轮流时只看内存，对着不回答的域名洪泛的设备在途一直涨到内存水位
-    /// While taking turns, a device with more queued behind it and no less in flight than the
-    /// average has this query that waits on an upstream refused too; its last one queued goes on,
-    /// and so does a device sending little. Taking turns used to go by memory alone, so a device
-    /// flooding names that get no answer piled up in flight until the memory watermark
+    /// 轮流时在途没到预算谁都不拒：洪泛的设备只剩一个在途，发得少的设备一次问 4 个、洪泛的设备自己再来 3 个，都去问上游。
+    /// 以前后面还排着别的、在途又不比平均少的就拒，平均被压到 1，发得少的设备并发的中间几个被回 SERVFAIL
+    /// While taking turns, under the budget nobody is refused: with the flooding device down to one
+    /// in flight, a device sending little asking 4 at once and the flooding device 3 more all go
+    /// upstream. Holding no less than the average with more queued used to be refused, the average
+    /// pressed down to one, so the middle ones of a device sending little asking a few at once got
+    /// SERVFAIL
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn while_taking_turns_a_device_with_more_queued_is_held_to_its_share() {
+    async fn while_taking_turns_nobody_is_refused_under_the_budget() {
         let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
-        let engine = Arc::new(engine_forwarding_to(
-            upstream,
-            serde_json::json!({ "flow_control_enabled": true }),
-        ));
+        let (engine, heavy, light) = engine_with_two_devices(upstream);
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let pending = Arc::new(PendingReplies::default());
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
         let manager = &engine.permit_manager;
-        let heavy = SocketAddr::from(([127, 0, 0, 4], 53000));
-        let light = (2..=250)
-            .map(|n| SocketAddr::from(([127, 0, 0, n], 53000)))
-            .find(|peer| manager.slot_of(peer.ip()) != manager.slot_of(heavy.ip()))
-            .unwrap();
         let _held = manager.acquire_for(manager.slot_of(heavy.ip()));
 
         let mut turns = answering.begin_turns();
-        let offer = |turns: &mut TakingTurns, peer: SocketAddr, id: u16| {
-            let packet = query(&format!("q{id}.turn.test"), id);
-            turns
-                .queue
-                .offer(&packet, Device::of(peer.ip()), udp_batch::Peer::of(peer));
-        };
-        offer(&mut turns, heavy, 1);
-        offer(&mut turns, heavy, 2);
-        offer(&mut turns, heavy, 3);
-        offer(&mut turns, light, 4);
+        for (peer, ids) in [(heavy, 1..=3), (light, 4..=7)] {
+            for id in ids {
+                offer_in_turn(&mut turns, peer, id);
+            }
+        }
+        let mut replies = udp_batch::Replies::default();
+        turns.answer_in_turn(&mut answering, &mut replies);
+        assert_eq!(manager.dropped_requests(), 0);
+        assert_eq!(manager.inflight(), 8, "the one held and all seven");
+    }
+
+    /// 轮流时在途到了预算（还没量出走完的速度时是底数），占着自己那一份的设备这个要等上游的查询也拒，发得少的设备照常。
+    /// 轮流挡不住在途：对着不回答的域名洪泛的设备，只看内存的话在途一直涨到内存水位
+    /// While taking turns with the budget in flight (its floor, before how fast queries are done
+    /// has been measured), a device holding its share has this query that waits on an upstream
+    /// refused too, and a device sending little goes on. Taking turns does not hold what is in
+    /// flight: a device flooding names that get no answer would, by memory alone, pile up in
+    /// flight until the memory watermark
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn while_taking_turns_in_flight_is_held_to_the_budget() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
+        let (engine, heavy, light) = engine_with_two_devices(upstream);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pending = Arc::new(PendingReplies::default());
+        let mut answering = UdpAnswering::new(&socket, &engine, &pending);
+        let manager = &engine.permit_manager;
+        let budget = answering.budget;
+        assert_eq!(budget, kixdns::engine::concurrency::BUDGET_AT_LEAST);
+        let _held: Vec<_> = (1..budget)
+            .map(|_| manager.acquire_for(manager.slot_of(heavy.ip())))
+            .collect();
+
+        let mut turns = answering.begin_turns();
+        for (peer, ids) in [(heavy, 1..=3), (light, 4..=7)] {
+            for id in ids {
+                offer_in_turn(&mut turns, peer, id);
+            }
+        }
         let mut replies = udp_batch::Replies::default();
         turns.answer_in_turn(&mut answering, &mut replies);
         assert_eq!(
             manager.dropped_requests(),
             2,
-            "the heavy device's two with more queued"
+            "the heavy device's two past the budget"
         );
         assert_eq!(
             manager.inflight(),
-            3,
-            "the one held, its last and the light one"
+            budget + 4,
+            "the budget and the light one's four"
         );
+    }
+
+    /// 开着流控、转发给 `upstream` 的引擎，以及落在不同份里的两台设备 / An engine with flow control forwarding
+    /// to `upstream`, and two devices landing in different slots
+    #[cfg(target_os = "linux")]
+    fn engine_with_two_devices(upstream: SocketAddr) -> (Arc<Engine>, SocketAddr, SocketAddr) {
+        let engine = Arc::new(engine_forwarding_to(
+            upstream,
+            serde_json::json!({ "flow_control_enabled": true }),
+        ));
+        let heavy = SocketAddr::from(([127, 0, 0, 4], 53000));
+        let light = (2..=250)
+            .map(|n| SocketAddr::from(([127, 0, 0, n], 53000)))
+            .find(|peer| {
+                engine.permit_manager.slot_of(peer.ip())
+                    != engine.permit_manager.slot_of(heavy.ip())
+            })
+            .unwrap();
+        (engine, heavy, light)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn offer_in_turn(turns: &mut TakingTurns, peer: SocketAddr, id: u16) {
+        let packet = query(&format!("q{id}.turn.test"), id);
+        turns
+            .queue
+            .offer(&packet, Device::of(peer.ip()), udp_batch::Peer::of(peer));
     }
 
     /// 收小以后放得下的正好是这台机器 20 ms 处理得完的查询，机器越慢缓冲越小
@@ -3390,12 +3444,54 @@ mod tests {
         assert!(!answering.overloaded, "flow control off");
     }
 
-    /// 轮流时跟不上：还排着队的设备丢一个，只排了一个的照常答；丢的本身不算还在跟不上，那要看积压
-    /// Falling behind while taking turns: a device with more queued loses one and one with a
-    /// single query is answered; the drop itself is not still falling behind, the backlog tells that
+    /// 轮流时跟不上，一次问 4 个的设备一个都不丢：它后面排着的比一直在发的那台少得多。以前后面还排着别的就丢，单核上它每次
+    /// 并发的中间几个都没有回应
+    /// Falling behind while taking turns, a device asking 4 at once loses none: it has far fewer
+    /// queued behind it than the one sending on and on. Having more queued at all used to lose one,
+    /// so on a single core the middle ones of each few at once got no reply
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn falling_behind_drops_only_from_a_device_with_more_queued() {
+    async fn falling_behind_spares_a_device_asking_a_few_at_once() {
+        let engine = static_engine_with_flow_control();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pending = Arc::new(PendingReplies::default());
+        let mut answering = UdpAnswering::new(&socket, &engine, &pending);
+        let packet = query("a.test", 1);
+        let heavy = SocketAddr::from(([192, 0, 2, 1], 53000));
+        let light = SocketAddr::from(([192, 0, 2, 2], 53000));
+        let mut turns = TakingTurns::new(1000, QUERIES_IN_RECV_BUFFER);
+        for _ in 0..50 {
+            turns
+                .queue
+                .offer(&packet, Device::of(heavy.ip()), udp_batch::Peer::of(heavy));
+        }
+        for _ in 0..4 {
+            turns
+                .queue
+                .offer(&packet, Device::of(light.ip()), udp_batch::Peer::of(light));
+        }
+        engine
+            .flow_control_state
+            .as_ref()
+            .unwrap()
+            .note_queue_delay(Duration::from_secs(3600));
+        let mut replies = udp_batch::Replies::default();
+        turns.answer_in_turn(&mut answering, &mut replies);
+        assert_eq!(replies.len(), 4, "all four of the light device");
+        assert_eq!(
+            engine.permit_manager.dropped_requests(),
+            udp_batch::BATCH as u64 - 4,
+            "the rest of the batch, from the heavy device"
+        );
+    }
+
+    /// 轮流时跟不上：排着的不比平均少的设备丢一个，只排了一个的照常答；丢的本身不算还在跟不上，那要看积压
+    /// Falling behind while taking turns: a device with no fewer queued than the average loses
+    /// one and one with a single query is answered; the drop itself is not still falling behind,
+    /// the backlog tells that
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn falling_behind_drops_only_from_a_device_queueing_its_share() {
         let engine = static_engine_with_flow_control();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let pending = Arc::new(PendingReplies::default());
@@ -3717,6 +3813,45 @@ mod tests {
             assert!(turns.queue.offer(b"q", device, peer));
         }
         assert!(!turns.queue.offer(b"q", device, peer));
+    }
+
+    /// 内核忙时的预算跟着走完的速度：一秒走完 5000 个，预算就是 5000；一段积压头一次看量不出速度，不动它；这段时间什么都
+    /// 没走完，回到底数
+    /// The budget while busy follows how fast queries are done: 5000 done in a second makes it
+    /// 5000; the first look of a backlog measures nothing and leaves it; with none done meanwhile
+    /// it is back at its floor
+    #[tokio::test]
+    async fn the_budget_follows_how_fast_queries_are_done() {
+        use kixdns::engine::concurrency::BUDGET_AT_LEAST;
+        let engine = static_engine_with_flow_control();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pending = Arc::new(PendingReplies::default());
+        let mut answering = UdpAnswering::new(&socket, &engine, &pending);
+        assert_eq!(answering.budget, BUDGET_AT_LEAST);
+        let manager = &engine.permit_manager;
+        let slot = manager.slot_of([192, 0, 2, 1].into());
+        let finish = |count: usize| {
+            for _ in 0..count {
+                drop(manager.acquire_for(slot));
+            }
+        };
+        let look = |answering: &mut UdpAnswering<'_>, checks: u32| {
+            answering.checks_since_empty = checks - 1;
+            answering.looked_at = Instant::now() - Duration::from_secs(1);
+            answering.shrink_buffer_if_overflowing();
+        };
+        finish(5000);
+        look(&mut answering, BEHIND_AFTER_CHECKS);
+        assert_eq!(answering.budget, BUDGET_AT_LEAST, "the first look");
+        finish(5000);
+        look(&mut answering, 2 * BEHIND_AFTER_CHECKS);
+        assert!(
+            (4900..=5000).contains(&answering.budget),
+            "{}",
+            answering.budget
+        );
+        look(&mut answering, 3 * BEHIND_AFTER_CHECKS);
+        assert_eq!(answering.budget, BUDGET_AT_LEAST, "none done since");
     }
 
     /// 读的时候量一个查询在接收缓冲里实际记多少，放得下的按量到的算；只往少里改

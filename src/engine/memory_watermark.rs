@@ -1,14 +1,15 @@
-//! 流控的内存水位：在途查询多到可能撑爆内存时，看这台机器还剩多少内存。紧张了先只拒在途查询比平均多的
-//! 设备的新未命中，发得少的照常；再少就谁的都拒；够了自动恢复（见 [`Room`]）。不填数字：每台机器读自己的
+//! 流控的内存水位：在途查询多到可能撑爆内存时，看这台机器还剩多少内存。紧张了在途就停在那一刻的数，各设备平分，
+//! 只拒占着自己那一份的设备的新未命中，发得少的照常；再少就谁的都拒；够了自动恢复（见 [`Room`]）。不填数字：每台机器读自己的
 //! 内存——Linux 读系统的和所在各级 cgroup 的限制，FreeBSD 读系统的，
 //! Windows 读系统的和所在作业对象的限制。
 //! 在途查询没到 [`LOOK_FROM_INFLIGHT`] 时不读内存，也不拒绝：日常路径没有开销，其他程序吃内存也不会
 //! 牵连日常查询。之后按 [`reads_apart`] 隔一段读一次，两次之间多占的内存和总量成比例，和 CPU 快慢无关。
 //!
 //! Flow control's memory watermark: once enough queries are in flight to threaten the
-//! memory, it looks at how much memory this machine has left. When it is tight, new cache
-//! misses are refused only from devices holding more queries in flight than the average,
-//! and those sending little go on; with less left, everyone's are refused; with enough it
+//! memory, it looks at how much memory this machine has left. When it is tight, what is in
+//! flight stays where it was at that moment, shared out among the devices, new cache misses
+//! are refused only from devices holding their share, and those sending little go on; with
+//! less left, everyone's are refused; with enough it
 //! resumes by itself (see [`Room`]). There is no number to fill in: each
 //! machine reads its own memory: on Linux the system's and the limits of its cgroups at
 //! every level, on FreeBSD the system's, and on Windows the system's and the limits of its job object.
@@ -17,7 +18,7 @@
 //! that it reads every [`reads_apart`], which keeps what is added between two reads in
 //! proportion to the total, whatever the CPU's speed.
 
-use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// 在途查询到这么多才开始看内存 / The queries in flight from which memory is looked at
@@ -50,8 +51,10 @@ fn reads_apart(total: u64) -> usize {
 pub enum Room {
     /// 够 / Enough
     Plenty,
-    /// 紧张：只拒在途查询比各设备平均多的设备，发得少的照常 / Tight: only devices holding more queries in
-    /// flight than the average are refused, and those sending little go on
+    /// 紧张：在途停在变紧张那一刻的数（见 [`MemoryWatermark::tight_budget`]），只拒占着自己那一份的设备，发得少的照常
+    /// Tight: what is in flight stays where it was as memory got tight (see
+    /// [`MemoryWatermark::tight_budget`]), only devices holding their share are refused, and
+    /// those sending little go on
     Tight,
     /// 没了：谁都拒 / None left: everyone is refused
     Full,
@@ -109,6 +112,9 @@ pub struct MemoryWatermark {
     started: Instant,
     /// 上次读的时刻，从 `started` 算起的毫秒 / When it was last read, in milliseconds since `started`
     read_at_ms: AtomicU64,
+    /// 紧张时在途的查询最多多少，没记下时是 `usize::MAX`，见 [`Self::tight_budget`] / How many queries may be in
+    /// flight while tight, `usize::MAX` when none is noted, see [`Self::tight_budget`]
+    tight_budget: AtomicUsize,
 }
 
 /// 读数放了这么久就重读，不管隔了几次：在途降到底线以下时不读也不计数，再过底线时手上可能是很久以前的读数
@@ -137,6 +143,7 @@ impl MemoryWatermark {
             room: AtomicU8::new(Room::Plenty as u8),
             started: Instant::now(),
             read_at_ms: AtomicU64::new(0),
+            tight_budget: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -147,6 +154,31 @@ impl MemoryWatermark {
             Room::Plenty
         } else {
             self.looked_at()
+        }
+    }
+
+    /// 紧张时在途的查询一共最多多少，`queries` 是现在在途的查询数（不算连接）：变紧张以后头一次问的时候在途多少，就是多少，
+    /// 内存不紧张了（够了，或者没了）就清掉。不随着读数往上调：紧张时放进去的都让内存更紧，到了这个数只再放没占满自己那一份的
+    /// 设备，一共最多多出设备数那么多。没了的时候谁都不放，在途只会少，再回到紧张时记下的就更小。内存还给系统以前，在途回到
+    /// 这个数用的还是原来那些内存
+    /// How many queries may be in flight in all while tight, `queries` being how many are in
+    /// flight now (connections not counted): as many as were in flight when first asked after
+    /// memory got tight, cleared once it is not tight (enough again, or none left). It does not
+    /// follow later readings up: whatever is let in while tight makes memory tighter, so at this
+    /// many only devices short of their share get more, the total going past it by at most the
+    /// number of devices. With none left nothing is let in and what is in flight only falls, so
+    /// coming back to tight notes fewer. Until memory goes back to the system, coming back to this
+    /// many uses the memory already held
+    #[inline]
+    pub fn tight_budget(&self, queries: usize) -> usize {
+        match self.tight_budget.compare_exchange(
+            usize::MAX,
+            queries,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => queries,
+            Err(budget) => budget,
         }
     }
 
@@ -172,6 +204,9 @@ impl MemoryWatermark {
                 .map(|limit| limit.room_for(reading.own))
                 .max()
                 .unwrap_or(Room::Plenty);
+            if room != Room::Tight {
+                self.tight_budget.store(usize::MAX, Ordering::Relaxed);
+            }
             if self.room.swap(room as u8, Ordering::Relaxed) != room as u8 {
                 tracing::warn!(
                     event = "flow_control_memory",
@@ -909,6 +944,47 @@ mod tests {
         available.store(0, Ordering::Relaxed);
         assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Plenty, "not yet");
         assert_eq!(reads.load(Ordering::Relaxed), read_so_far + 1);
+    }
+
+    /// 紧张时的在途上限：变紧张以后头一次问时记下，之后不随着问的数往上调；内存没了或者够了就清掉，再变紧张时重新记
+    /// The budget while tight is noted as first asked after memory got tight and does not follow
+    /// later asks up; it is cleared once memory has none left or enough, and noted afresh as it
+    /// gets tight again
+    #[test]
+    fn the_tight_budget_is_noted_once_and_cleared_when_not_tight() {
+        let (watermark, available, _) = watermark();
+        let read_as = |left: u64| {
+            available.store(left, Ordering::Relaxed);
+            for _ in 0..READ_EVERY {
+                watermark.room(LOOK_FROM_INFLIGHT);
+            }
+            watermark.room(LOOK_FROM_INFLIGHT)
+        };
+        assert_eq!(read_as(GIB / 8 - 1), Room::Tight);
+        assert_eq!(watermark.tight_budget(5000), 5000, "noted as first asked");
+        assert_eq!(
+            watermark.tight_budget(9000),
+            5000,
+            "not raised by more in flight"
+        );
+        assert_eq!(read_as(GIB / 8 - 2), Room::Tight);
+        assert_eq!(watermark.tight_budget(9000), 5000, "nor by another reading");
+
+        assert_eq!(read_as(0), Room::Full);
+        assert_eq!(read_as(GIB / 8 - 1), Room::Tight);
+        assert_eq!(
+            watermark.tight_budget(3000),
+            3000,
+            "noted afresh after none left"
+        );
+
+        assert_eq!(read_as(GIB), Room::Plenty);
+        assert_eq!(read_as(GIB / 8 - 1), Room::Tight);
+        assert_eq!(
+            watermark.tight_budget(7000),
+            7000,
+            "noted afresh after enough"
+        );
     }
 
     /// 哪一处限制最紧就按哪一处 / The tightest limit is the one that counts

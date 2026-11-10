@@ -19,9 +19,45 @@ pub const QUEUE_TARGET: Duration = Duration::from_millis(20);
 /// `flow_control_latency_threshold_ms` has no effect
 pub const BUSY_AFTER: Duration = Duration::from_millis(100);
 
-/// 流控的状态。不用填数字，判断都来自运行时测到的：socket 收不收得空、查询排队多久、还剩多少内存
+/// 内核忙时，在途的查询平均要等这么久以上才走完，就拒占着自己那一份的设备。平常的上游一秒内都回答了，客户端一秒等不到多半
+/// 也已经重发；等得比这还久，等的是不回答或者慢得没用的上游，这些查询占着内存，也都转发给了上游。这也是延迟目标、和机器无关。
+/// 比它紧，一台转发器或者 NAT 后面的全部用户在上游稍慢一点时就会被拒
+/// While the kernel is busy, queries in flight taking longer than this on average to be done
+/// means a device holding its share is refused. Usual upstreams answer within a second, and a
+/// client that waited a second has most likely asked again; waiting longer means waiting on
+/// upstreams that do not answer or are too slow to be of use, queries that hold memory and were
+/// all forwarded upstream too. This too is a latency goal and not a property of the machine. Any
+/// tighter, and everyone behind one forwarder or NAT would be refused as soon as an upstream got
+/// a little slow
+pub const HELD_AT_MOST: Duration = Duration::from_secs(1);
+
+/// 在途的查询不到这么多，不按预算拒：和内存水位开始看内存的在途数一样，这么少占不了多少内存，也压不着上游
+/// Under this many queries in flight nothing is refused by the budget: the same number of
+/// queries in flight as the memory watermark starts looking at memory from, too few to hold much
+/// memory or weigh on an upstream
+pub const BUDGET_AT_LEAST: usize = 1000;
+
+/// 内核忙时在途的查询一共最多多少：`took` 这段时间走完了 `done` 个（回答了、失败了、超时了都算），按 `HELD_AT_MOST` 折算，
+/// 至少 `BUDGET_AT_LEAST`。在途的数除以每秒走完的数就是平均要等多久（利特尔定律），所以超过它就是平均要等 `HELD_AT_MOST`
+/// 以上。上游回答得快，走完得也快，在途能有多少就跟着多；对着不回答的域名洪泛，查询要到超时才走完，预算就停在底数附近
+/// How many queries may be in flight in all while the kernel is busy: `done` were done over
+/// `took` (answered, failed or timed out alike), over `HELD_AT_MOST`, at least
+/// `BUDGET_AT_LEAST`. What is in flight over how many are done per second is how long they take
+/// on average (Little's law), so past this they take over `HELD_AT_MOST` on average. With
+/// upstreams answering fast, queries are done fast and as many may be in flight; flooding names
+/// that get no answer, queries are done only at their timeouts and the budget stays near its floor
+#[inline]
+pub fn budget_from(done: u64, took: Duration) -> usize {
+    let budget = u128::from(done) * HELD_AT_MOST.as_nanos() / took.as_nanos().max(1);
+    usize::try_from(budget)
+        .unwrap_or(usize::MAX)
+        .max(BUDGET_AT_LEAST)
+}
+
+/// 流控的状态。不用填数字，判断都来自运行时测到的：socket 收不收得空、查询排队多久、处理得多快、还剩多少内存
 /// The state of flow control. There are no numbers to fill in: it goes by what is measured at
-/// run time, namely whether a socket runs empty, how long queries queue and how much memory is left
+/// run time, namely whether a socket runs empty, how long queries queue, how fast they are
+/// handled and how much memory is left
 pub struct FlowControlState {
     /// socket 连续这么久没收空就算忙，就是 `BUSY_AFTER`（测试可以换）/ How long a socket goes without
     /// running empty before that counts as busy: `BUSY_AFTER` (a test may change it)
@@ -42,27 +78,33 @@ impl FlowControlState {
         }
     }
 
-    /// `device` 的一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝
-    /// （见 [`Self::memory_refuses`]）；内核忙而且查询在内核里排着长队时，拒绝在途不比各设备平均少的设备，
-    /// 发得少的照常。那时每个查询都要先排同样长的队，在途多少就是发得多快；不分设备地拒，发得少的设备也
-    /// 跟着丢，直到开始按设备轮流。等上游不算排队，所以上游再慢，这样的查询也不会被拒绝
+    /// `device` 的一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻，`budget` 是内核忙时在途的查询一共
+    /// 最多多少（见 [`budget_from`]）。内存不够时拒绝（见 [`Self::memory_refuses`]）。内核忙时，在途到了预算就拒占着自己
+    /// 那一份的设备；忙而且查询在内核里排着长队时，拒在途不比各设备平均少的设备，发得少的照常——那时每个查询都要先排同样长
+    /// 的队，在途多少就是发得多快，不分设备地拒，发得少的也跟着丢，直到开始按设备轮流。等上游不算排队：上游慢，在途没到预算
+    /// 就不拒
     /// Whether a query from `device` that waits on an upstream can go ahead, `emptied_at` being
-    /// when the socket last ran empty. Too little memory refuses it (see [`Self::memory_refuses`]),
-    /// and with the kernel busy and queries queueing long inside it a device holding no less in
-    /// flight than the average is refused while those sending little go on. Every query then
-    /// waits in the same long line first, so what a device holds in flight is how fast it sends;
-    /// refusing whatever comes would lose the devices sending little too, until devices take
-    /// turns. Waiting on an upstream is not queueing, so however slow the upstream, such queries
-    /// are not refused
+    /// when the socket last ran empty and `budget` how many queries may be in flight in all while
+    /// the kernel is busy (see [`budget_from`]). Too little memory refuses it (see
+    /// [`Self::memory_refuses`]). With the kernel busy, a device holding its share is refused
+    /// once the budget is in flight; busy and queueing long inside the kernel, a device holding no
+    /// less in flight than the average is refused while those sending little go on. Every query
+    /// then waits in the same long line first, so what a device holds in flight is how fast it
+    /// sends, and refusing whatever comes would lose the devices sending little too, until devices
+    /// take turns. Waiting on an upstream is not queueing: with a slow upstream nothing is refused
+    /// until the budget is in flight
     #[inline]
     pub fn permit(
         &self,
         manager: &Arc<PermitManager>,
         emptied_at: Instant,
         device: DeviceSlot,
+        budget: usize,
     ) -> Option<PermitGuard> {
         if self.memory_refuses(manager, device)
-            || (self.busy(emptied_at) && self.behind() && manager.queries.holds_its_share(device))
+            || (self.busy(emptied_at)
+                && (manager.queries.holds_share_of(device, budget)
+                    || (self.behind() && manager.queries.holds_its_share(device))))
         {
             manager.count_refused();
             return None;
@@ -70,17 +112,21 @@ impl FlowControlState {
         Some(manager.acquire_for(device))
     }
 
-    /// 内存够不够 `device` 再接一个：没了谁都不接；紧张时，在途的不比各设备平均少的设备不接，发得少的
-    /// 照常——一台设备把内存占满时先拦住它，别的设备不受连累
+    /// 内存够不够 `device` 再接一个：没了谁都不接；紧张时，在途停在变紧张那一刻的数（见
+    /// `MemoryWatermark::tight_budget`），各设备平分，占着自己那一份的不接，发得少的照常——一台或者很多台设备把内存
+    /// 占满时先拦住它们，别的设备不受连累
     /// Whether memory refuses one more for `device`: with none left everyone is refused; when it
-    /// is tight, a device holding no less in flight than the average across devices is refused and
-    /// those sending little go on, so a device filling the memory is stopped first and the others
-    /// are not held up with it
+    /// is tight, what is in flight stays where it was as memory got tight (see
+    /// `MemoryWatermark::tight_budget`), shared out among the devices, and one holding its share
+    /// is refused while those sending little go on, so one or many devices filling the memory are
+    /// stopped first and the others are not held up with them
     #[inline]
     fn memory_refuses(&self, manager: &PermitManager, device: DeviceSlot) -> bool {
         match self.memory.room(manager.inflight()) {
             Room::Plenty => false,
-            Room::Tight => manager.queries.holds_its_share(device),
+            Room::Tight => manager
+                .queries
+                .holds_share_of(device, self.memory.tight_budget(manager.queries.total())),
             Room::Full => true,
         }
     }
@@ -112,25 +158,24 @@ impl FlowControlState {
         emptied_at.elapsed() >= self.busy_after
     }
 
-    /// 按设备轮流时 `device` 的一个要等上游的查询能不能处理：看内存；这台设备后面还排着别的（`more_queued`）、在途又不比
-    /// 各设备平均少时也拒绝——和忙而且排长队时同一条规则。轮流挡住的是排队，挡不住在途：对着不回答的域名洪泛的设备，
-    /// 只看内存的话在途一直涨到内存水位，这些查询还都转发给了上游
+    /// 按设备轮流时 `device` 的一个要等上游的查询能不能处理，`budget` 同 [`Self::permit`]：看内存；在途到了预算，占着
+    /// 自己那一份的设备也拒绝。轮流挡住的是排队，挡不住在途：对着不
+    /// 回答的域名洪泛的设备，只看内存的话在途一直涨到内存水位，这些查询还都转发给了上游。没到预算谁都不拒：只有一台设备、
+    /// 发得少的设备一次问好几个，都照常
     /// Whether a query from `device` that waits on an upstream can go ahead while devices take
-    /// turns: by memory, and a device with more queued behind it (`more_queued`) holding no less
-    /// in flight than the average is refused as well, the same rule as when busy and queueing
-    /// long. Taking turns holds the queueing, not what is in flight: a device flooding names that
-    /// get no answer would, by memory alone, pile up in flight until the memory watermark, every
-    /// one of those queries forwarded upstream too
+    /// turns, `budget` as for [`Self::permit`]: by memory, and once the budget is in flight a
+    /// device holding its share is refused as well. Taking turns holds the queueing, not what is in flight: a device flooding
+    /// names that get no answer would, by memory alone, pile up in flight until the memory
+    /// watermark, every one of those queries forwarded upstream too. Under the budget nobody is
+    /// refused, a lone device and one sending little asking several at once alike
     #[inline]
     pub fn turn_permit(
         &self,
         manager: &Arc<PermitManager>,
         device: DeviceSlot,
-        more_queued: bool,
+        budget: usize,
     ) -> Option<PermitGuard> {
-        if self.memory_refuses(manager, device)
-            || (more_queued && manager.queries.holds_its_share(device))
-        {
+        if self.memory_refuses(manager, device) || manager.queries.holds_share_of(device, budget) {
             manager.count_refused();
             return None;
         }
@@ -154,15 +199,16 @@ impl FlowControlState {
         }
     }
 
-    /// `device` 的一条 TCP 或 DoH 新连接接不接：和查询一样只看内存，紧张时开着的连接或在途的查询有一样不比各设备平均少，
-    /// 就不接——占着内存的设备开新连接，连接上的查询反正也要被拒。连接和查询各比各的：只开着一条空闲连接不算占了查询的
-    /// 份，开着很多连接的设备（比如 DoH 前面的反向代理）也不把查询的平均拉高
+    /// `device` 的一条 TCP 或 DoH 新连接接不接：和查询一样只看内存，紧张时开着的连接不比各设备平均少，或者占着查询的那一份
+    /// （见 [`Self::memory_refuses`]），就不接——占着内存的设备开新连接，连接上的查询反正也要被拒。连接和查询各比各的：
+    /// 只开着一条空闲连接不算占了查询的份，开着很多连接的设备（比如 DoH 前面的反向代理）也不把查询的份额压小
     /// Whether a new TCP or DoH connection from `device` is taken: by memory alone, as for a
-    /// query, and when tight a device holding no fewer open connections, or no fewer queries in
-    /// flight, than the average gets none: a device holding the memory would have the queries on
-    /// a new connection refused anyway. Connections and queries are each compared with their own
-    /// kind: one idle connection is no share of queries, and a device holding many connections (a
-    /// reverse proxy in front of DoH, say) does not raise the average of queries
+    /// query, and when tight a device holding no fewer open connections than the average, or
+    /// holding its share of queries (see [`Self::memory_refuses`]), gets none: a device holding
+    /// the memory would have the queries on a new connection refused anyway. Connections and
+    /// queries are each compared with their own kind: one idle connection is no share of queries,
+    /// and a device holding many connections (a reverse proxy in front of DoH, say) does not make
+    /// the shares of queries smaller
     #[inline]
     pub fn connection_permit(
         &self,
@@ -173,7 +219,9 @@ impl FlowControlState {
             Room::Plenty => false,
             Room::Tight => {
                 manager.connections.holds_its_share(device)
-                    || manager.queries.holds_its_share(device)
+                    || manager
+                        .queries
+                        .holds_share_of(device, self.memory.tight_budget(manager.queries.total()))
             }
             Room::Full => true,
         };
@@ -231,6 +279,11 @@ impl DeviceCounts {
         }
     }
 
+    /// 一共多少 / How many in all
+    fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
     /// 减一，在 0 处饱和 / Takes one off, saturating at zero
     fn remove(&self, device: DeviceSlot) {
         #[allow(deprecated)]
@@ -256,16 +309,31 @@ impl DeviceCounts {
     }
 
     /// `device` 在途的是不是不比各设备的平均少：只有一台在途时就是它；自己没有在途的不算，哪台都没有在途时也一样。
-    /// 一台在刷的设备被拒以后在途的很快就走光，这时都算的话发得少的也跟着被拒，拒得越管用越分不出是谁在刷
+    /// 一台在刷的设备被拒以后在途的很快就走光，这时都算的话发得少的也跟着被拒，拒得越管用越分不出是谁在刷。
+    /// 就是 [`Self::holds_share_of`] 的预算取现在一共在途的数
     /// Whether `device` holds no less in flight than the average across devices: a lone one in
     /// flight does; one with nothing in flight does not, also with nothing in flight anywhere. A
     /// device flooding has its queries in flight run out soon once refused, and counting everyone
     /// then would refuse those sending little along with it: the better the refusing works, the
-    /// less it could tell who floods
+    /// less it could tell who floods. It is [`Self::holds_share_of`] with what is in flight now
+    /// as the budget
     fn holds_its_share(&self, device: DeviceSlot) -> bool {
+        self.holds_share_of(device, self.total())
+    }
+
+    /// 在途一共到了 `budget`，`device` 又占着 `budget` 平分给各台有在途的设备的那一份：两样都是才算。没到预算谁都不算，
+    /// 自己没有在途的也不算。预算是定数，所以设备再多，一共也只多出每台一个：和平均比的话，有一台偏多，别的就都在平均下面，
+    /// 一个个放进去又把平均抬高，一共能涨到设备数乘最多的那台
+    /// Whether `budget` is in flight in all and `device` holds its share of `budget` split among
+    /// the devices holding any: both, or it does not count. Under the budget nobody does, nor does
+    /// a device with nothing in flight. The budget is fixed, so however many devices there are
+    /// they hold at most one more each in all; compared with the average instead, one device
+    /// holding more leaves all the others under it, each let in raises the average again, and
+    /// the total could climb to the devices times the one holding most
+    fn holds_share_of(&self, device: DeviceSlot, budget: usize) -> bool {
         let own = self.per_slot[usize::from(device.0)].load(Ordering::Relaxed) as usize;
         let slots = self.slots_held.load(Ordering::Relaxed).max(1);
-        own > 0 && own.saturating_mul(slots) >= self.total.load(Ordering::Relaxed)
+        own > 0 && self.total() >= budget && own.saturating_mul(slots) >= budget
     }
 }
 
@@ -287,6 +355,9 @@ pub struct PermitManager {
     /// 开了流控时，每一份设备开着的 TCP 和 DoH 连接 / With flow control on, the TCP and DoH
     /// connections open per slot of devices
     connections: DeviceCounts,
+    /// 开了流控时，一共走完了多少查询（回答了、失败了、超时了都算），见 [`budget_from`] / With flow control on, how
+    /// many queries were done in all (answered, failed or timed out alike), see [`budget_from`]
+    done: AtomicU64,
     hasher: RandomState,
 }
 
@@ -303,6 +374,7 @@ impl PermitManager {
             dropped_requests: AtomicU64::new(0),
             queries: DeviceCounts::new(),
             connections: DeviceCounts::new(),
+            done: AtomicU64::new(0),
             hasher: RandomState::new(),
         }
     }
@@ -368,7 +440,10 @@ impl PermitManager {
                 active.checked_sub(1)
             });
         match device {
-            Some((device, Held::Query)) => self.queries.remove(device),
+            Some((device, Held::Query)) => {
+                self.queries.remove(device);
+                self.done.fetch_add(1, Ordering::Relaxed);
+            }
             Some((device, Held::Connection)) => self.connections.remove(device),
             None => {}
         }
@@ -378,6 +453,13 @@ impl PermitManager {
     #[inline]
     pub fn inflight(&self) -> usize {
         self.active_permits.load(Ordering::Acquire)
+    }
+
+    /// 开了流控时一共走完了多少查询，见 [`budget_from`] / With flow control on, how many queries were done in
+    /// all, see [`budget_from`]
+    #[inline]
+    pub fn queries_done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
     }
 
     /// Get total dropped requests count / 获取总丢弃请求数
@@ -452,6 +534,9 @@ mod tests {
     }
 
     const LONG_AGO: Duration = Duration::from_secs(61);
+    /// 处理得极快的 worker：预算怎么都用不完，只看别的规则 / A worker handling queries extremely fast: the
+    /// budget never runs out, leaving the other rules alone
+    const FAST: usize = usize::MAX;
     /// 两台设备，固定落在不同的两份 / Two devices, fixed in two different slots
     const ONE: DeviceSlot = DeviceSlot(0);
     const OTHER: DeviceSlot = DeviceSlot(1);
@@ -465,15 +550,15 @@ mod tests {
         let flow = state(Duration::from_secs(60));
         let busy = Instant::now() - LONG_AGO;
 
-        let busy_alone = flow.permit(&manager, busy, ONE);
+        let busy_alone = flow.permit(&manager, busy, ONE, FAST);
         assert!(busy_alone.is_some(), "busy alone");
 
         flow.note_queue_delay(Duration::from_secs(3600));
-        let behind_alone = flow.permit(&manager, Instant::now(), ONE);
+        let behind_alone = flow.permit(&manager, Instant::now(), ONE, FAST);
         assert!(behind_alone.is_some(), "behind alone");
         assert_eq!(manager.dropped_requests(), 0);
 
-        assert!(flow.permit(&manager, busy, ONE).is_none(), "both");
+        assert!(flow.permit(&manager, busy, ONE, FAST).is_none(), "both");
         assert_eq!(manager.dropped_requests(), 1);
         assert_eq!(manager.inflight(), 2, "a refused query holds no permit");
     }
@@ -491,23 +576,140 @@ mod tests {
         flow.note_queue_delay(Duration::from_secs(3600));
         let heavy: Vec<_> = (0..100).map(|_| manager.acquire_for(ONE)).collect();
         assert!(
-            flow.permit(&manager, busy, ONE).is_none(),
+            flow.permit(&manager, busy, ONE, FAST).is_none(),
             "the device sending most"
         );
         let light = flow
-            .permit(&manager, busy, OTHER)
+            .permit(&manager, busy, OTHER, FAST)
             .expect("one sending little goes on");
         assert!(
-            flow.permit(&manager, busy, OTHER).is_some(),
+            flow.permit(&manager, busy, OTHER, FAST).is_some(),
             "still far below the average"
         );
         assert_eq!(manager.dropped_requests(), 1);
         drop((heavy, light));
         let first = flow
-            .permit(&manager, busy, OTHER)
+            .permit(&manager, busy, OTHER, FAST)
             .expect("nothing in flight anywhere");
-        assert!(flow.permit(&manager, busy, OTHER).is_none(), "alone now");
+        assert!(
+            flow.permit(&manager, busy, OTHER, FAST).is_none(),
+            "alone now"
+        );
         drop(first);
+    }
+
+    /// 预算是一秒走完的查询数，至少是底数：每秒走完 2000 个，在途就能有 2000 个；0.1 秒走完 500 个是每秒 5000 个；
+    /// 什么都没走完（上游不回答）时是底数
+    /// The budget is the queries done in a second, at least its floor: with 2000 done a second,
+    /// 2000 may be in flight; 500 done in 0.1 s is 5000 a second; with none done (an upstream not
+    /// answering) it is the floor
+    #[test]
+    fn the_budget_is_what_is_done_in_a_second() {
+        assert_eq!(budget_from(2000, Duration::from_secs(1)), 2000);
+        assert_eq!(budget_from(500, Duration::from_millis(100)), 5000);
+        assert_eq!(budget_from(0, Duration::from_secs(1)), BUDGET_AT_LEAST);
+    }
+
+    /// 内核忙时在途一共压到预算：一台设备一直问，放到预算那么多就拒，别的设备照常；不忙时不看预算
+    /// Busy, what is in flight is held to the budget: a device asking on and on gets the budget
+    /// and is refused after, others going on; not busy, the budget does not come in
+    #[test]
+    fn busy_holds_what_is_in_flight_to_the_budget() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = state(Duration::from_secs(60));
+        let busy = Instant::now() - LONG_AGO;
+        let mut held = Vec::new();
+        while let Some(permit) = flow.permit(&manager, busy, ONE, 1000) {
+            held.push(permit);
+            assert!(held.len() <= 1000, "unbounded");
+        }
+        assert_eq!(held.len(), 1000);
+        let other: Vec<_> = (0..10)
+            .map(|_| {
+                flow.permit(&manager, busy, OTHER, 1000)
+                    .expect("another device goes on")
+            })
+            .collect();
+        assert!(
+            flow.permit(&manager, Instant::now(), ONE, 1000).is_some(),
+            "not busy, the budget does not come in"
+        );
+        assert_eq!(manager.dropped_requests(), 1);
+        drop((held, other));
+    }
+
+    /// 轮流时没到预算谁都不拒：洪泛的设备只剩一个在途，发得少的设备一次问好几个照常；只有一台设备时放到预算那么多才拒。以前
+    /// 后面还排着别的、在途又不比平均少就拒，平均被压到 1，发得少的设备并发的中间几个、只有一台时的那台都被拒
+    /// While taking turns, under the budget nobody is refused: with a flooding device down to one
+    /// in flight, a device sending little asking several at once goes on, and a lone device is
+    /// refused only with the budget in flight. Holding no less than the average with more queued
+    /// used to be refused, the average pressed down to one, so the middle ones of a few at once and
+    /// a lone device were refused
+    #[test]
+    fn under_the_budget_taking_turns_refuses_nobody() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = state(Duration::from_secs(60));
+        let budget = BUDGET_AT_LEAST;
+        let flooder = manager.acquire_for(ONE);
+        let light: Vec<_> = (0..8)
+            .map(|_| {
+                flow.turn_permit(&manager, OTHER, budget)
+                    .expect("several at once")
+            })
+            .collect();
+        drop((flooder, light));
+        let alone: Vec<_> = (0..budget)
+            .map(|_| {
+                flow.turn_permit(&manager, ONE, budget)
+                    .expect("a lone device under the budget")
+            })
+            .collect();
+        assert!(
+            flow.turn_permit(&manager, ONE, budget).is_none(),
+            "at the budget"
+        );
+        assert_eq!(manager.dropped_requests(), 1);
+        drop(alone);
+        let half: Vec<_> = (0..budget / 2).map(|_| manager.acquire_for(ONE)).collect();
+        let other = manager.acquire_for(OTHER);
+        assert!(
+            flow.turn_permit(&manager, ONE, budget).is_some(),
+            "holding most, but the budget is not in flight"
+        );
+        drop((half, other));
+    }
+
+    /// 到了预算，设备再多一共也只多出每台一个：一千台设备轮着问到谁都放不进，在途不超过预算加设备数；什么都没在途的设备照样
+    /// 放进去。以前和平均比，设备多到每台只排得进一个时规则不起作用，在途一直涨到内存水位
+    /// At the budget, however many devices there are they hold at most one more each: a thousand
+    /// devices asking in turn until none gets in hold no more than the budget plus the devices,
+    /// and a device with nothing in flight still gets in. Compared with the average, the rule did
+    /// nothing once there were enough devices for each to queue only one, and what was in flight
+    /// climbed to the memory watermark
+    #[test]
+    fn at_the_budget_many_devices_hold_at_most_one_more_each() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = state(Duration::from_secs(60));
+        let budget = 3200;
+        let mut held = Vec::new();
+        loop {
+            let before = held.len();
+            held.extend(
+                (0..1000u16).filter_map(|n| flow.turn_permit(&manager, DeviceSlot(n), budget)),
+            );
+            assert!(held.len() <= 10 * budget, "unbounded");
+            if held.len() == before {
+                break;
+            }
+        }
+        assert!(held.len() >= budget, "{} held", held.len());
+        assert!(held.len() <= budget + 1000, "{} held", held.len());
+        assert!(
+            flow.turn_permit(&manager, DeviceSlot(5000), budget)
+                .is_some(),
+            "one with nothing in flight"
+        );
+        drop(held);
     }
 
     /// 排队没超过目标不算跟不上；超过了就按等了多久算，到点自己恢复
@@ -573,23 +775,23 @@ mod tests {
 
         let mut in_flight: Vec<_> = (0..999)
             .map(|_| {
-                flow.permit(&manager, Instant::now(), ONE)
+                flow.permit(&manager, Instant::now(), ONE, FAST)
                     .expect("few in flight")
             })
             .collect();
         in_flight.push(
-            flow.permit(&manager, Instant::now(), ONE)
+            flow.permit(&manager, Instant::now(), ONE, FAST)
                 .expect("the last under the floor"),
         );
         assert_eq!(manager.dropped_requests(), 0);
 
-        assert!(flow.permit(&manager, Instant::now(), ONE).is_none());
+        assert!(flow.permit(&manager, Instant::now(), ONE, FAST).is_none());
         assert_eq!(manager.dropped_requests(), 1);
         assert_eq!(manager.inflight(), 1000, "a refused query holds no permit");
 
         in_flight.truncate(999);
         assert!(
-            flow.permit(&manager, Instant::now(), ONE).is_some(),
+            flow.permit(&manager, Instant::now(), ONE, FAST).is_some(),
             "under the floor again"
         );
     }
@@ -642,19 +844,58 @@ mod tests {
         let flow = with_memory_left(100 << 20);
         let heavy: Vec<_> = (0..1000).map(|_| manager.acquire_for(ONE)).collect();
         assert!(
-            flow.permit(&manager, Instant::now(), ONE).is_none(),
+            flow.permit(&manager, Instant::now(), ONE, FAST).is_none(),
             "the device holding the memory"
         );
         assert!(flow.permit_by_memory(&manager, ONE).is_none());
         let light: Vec<_> = (0..10)
             .map(|_| {
-                flow.permit(&manager, Instant::now(), OTHER)
+                flow.permit(&manager, Instant::now(), OTHER, FAST)
                     .expect("one sending little goes on")
             })
             .collect();
         assert!(flow.permit_by_memory(&manager, OTHER).is_some());
         assert_eq!(manager.dropped_requests(), 2);
         drop((heavy, light));
+    }
+
+    /// 内存紧张时在途停在变紧张那一刻：一台偏多、其余一样多的一百台设备轮着问到谁都放不进，在途不超过那时的数加设备数，
+    /// 什么都没在途的照样放进去。以前和平均比，偏多的那台把平均抬高，其余的都在平均下面，一个个放进去又抬高平均，一共涨到
+    /// 设备数乘最多的那台
+    /// With memory tight what is in flight stays where it was as memory got tight: a hundred
+    /// devices, one holding more and the rest alike, asking in turn until none gets in hold no more
+    /// than that plus the devices, and one with nothing in flight still gets in. Compared with the
+    /// average, the one holding more raised the average, leaving the rest under it, each let in
+    /// raised it again, and the total climbed to the devices times the one holding most
+    #[test]
+    fn tight_memory_holds_what_was_in_flight_as_it_got_tight() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = with_memory_left(100 << 20);
+        let mut held: Vec<_> = (0..20)
+            .map(|_| manager.acquire_for(DeviceSlot(0)))
+            .collect();
+        for n in 1..100u16 {
+            held.extend((0..10).map(|_| manager.acquire_for(DeviceSlot(n))));
+        }
+        let noted = held.len();
+        loop {
+            let before = held.len();
+            held.extend((0..100u16).filter_map(|n| flow.permit_by_memory(&manager, DeviceSlot(n))));
+            assert!(held.len() <= 3 * noted, "unbounded");
+            if held.len() == before {
+                break;
+            }
+        }
+        assert!(held.len() <= noted + 100, "{} held", held.len());
+        assert!(
+            flow.connection_permit(&manager, DeviceSlot(1)).is_none(),
+            "nor a new connection for one at its share"
+        );
+        assert!(
+            flow.permit_by_memory(&manager, DeviceSlot(500)).is_some(),
+            "one with nothing in flight"
+        );
+        drop(held);
     }
 
     /// 内存紧张时，只开着一条空闲连接的设备照样能问：连接和查询各比各的份额，空闲连接不算查询的在途。以前人人一条连接
@@ -680,7 +921,7 @@ mod tests {
                 "a query on the connection of {n}"
             );
             assert!(
-                flow.permit(&manager, Instant::now(), DeviceSlot(n))
+                flow.permit(&manager, Instant::now(), DeviceSlot(n), FAST)
                     .is_some(),
                 "a query over UDP from {n}"
             );
@@ -707,7 +948,7 @@ mod tests {
             .collect();
         flow.note_queue_delay(Duration::from_secs(3600));
         let mut flooder = Vec::new();
-        while let Some(permit) = flow.permit(&manager, busy, ONE) {
+        while let Some(permit) = flow.permit(&manager, busy, ONE, FAST) {
             flooder.push(permit);
             assert!(flooder.len() <= 600, "unbounded");
         }
@@ -756,12 +997,16 @@ mod tests {
         let alike: Vec<_> = (0..1000)
             .map(|n| manager.acquire_for(if n % 2 == 0 { ONE } else { OTHER }))
             .collect();
-        assert!(tight.permit(&manager, Instant::now(), ONE).is_none());
-        assert!(tight.permit(&manager, Instant::now(), OTHER).is_none());
+        assert!(tight.permit(&manager, Instant::now(), ONE, FAST).is_none());
+        assert!(
+            tight
+                .permit(&manager, Instant::now(), OTHER, FAST)
+                .is_none()
+        );
 
         let full = with_memory_left(1 << 20);
         assert!(
-            full.permit(&manager, Instant::now(), DeviceSlot(2))
+            full.permit(&manager, Instant::now(), DeviceSlot(2), FAST)
                 .is_none(),
             "nothing in flight, still refused"
         );
@@ -797,6 +1042,7 @@ mod tests {
             );
         }
         assert_eq!(manager.inflight(), 0);
+        assert_eq!(manager.queries_done(), 3, "only queries count as done");
     }
 
     /// 两千台设备几乎都落在各自的份里：份数多到落在一起的很少（约 3%）。以前只有 1024 份，两千台里大半和别的设备落在一起
