@@ -7,7 +7,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::RandomState;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// 最多这么多台设备同时排队，再来的新设备丢掉。每台设备有自己的队列，不和别的设备共用；这个上限管住一共能压多少（见
 /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`），伪造来源地址的洪泛每个地址只排得进一个，也压不出更多
@@ -21,12 +22,16 @@ const MAX_QUEUED_DEVICES: usize = 4096;
 /// sparing an allocation for every new device
 const SPARE_QUEUES: usize = 256;
 
-/// 一台设备：IPv4 按地址，公网 IPv6 按 /64，一个这样的网段通常就是一户。局域网里的 IPv6 地址（链路本地、ULA）
-/// 按完整地址：同一网段的主机都在一个 /64 里，用链路本地地址的更是全在 fe80::/64，按 /64 算就成了一台
+/// 一台设备：IPv4 按地址，公网 IPv6 按 /64，一个这样的网段通常就是一户。局域网里的 IPv6 地址按完整地址：链路本地、ULA、
+/// 站点本地，以及和内核在同一个 /64 里的公网地址（见 [`note_local_networks`]）——同一网段的主机都在一个 /64 里，家里的
+/// 局域网主机用的是运营商下发的同一个 /64，按 /64 算就成了一台。64:ff9b::/96 的地址是翻译过来的 IPv4 客户端，按里面的
+/// IPv4 地址算
 /// A device: by address for IPv4 and by /64 for global IPv6, one such network usually being
-/// one home. IPv6 addresses of a LAN (link-local, ULA) go by the whole address: the hosts of a
-/// segment share one /64, and all hosts using link-local addresses share fe80::/64, so by /64
-/// they would be one device
+/// one home. IPv6 addresses of a LAN go by the whole address: link-local, ULA, site-local, and
+/// global ones in a /64 the kernel itself is on (see [`note_local_networks`]); the hosts of a
+/// segment share one /64, the hosts of a home LAN the /64 its provider handed out, so by /64
+/// they would be one device. An address in 64:ff9b::/96 is an IPv4 client translated, and goes
+/// by that IPv4 address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
     V4(u32),
@@ -34,16 +39,69 @@ pub enum Device {
     V6Host(u128),
 }
 
+/// NAT64 的知名前缀 64:ff9b::/96 / The well-known NAT64 prefix 64:ff9b::/96
+const NAT64: u128 = 0x0064_ff9b << 96;
+
 impl Device {
     pub fn of(ip: IpAddr) -> Self {
         match ip.to_canonical() {
             IpAddr::V4(v4) => Self::V4(u32::from(v4)),
-            IpAddr::V6(v6) if v6.is_unicast_link_local() || v6.is_unique_local() => {
-                Self::V6Host(u128::from(v6))
+            IpAddr::V6(v6) => {
+                let bits = u128::from(v6);
+                let network = (bits >> 64) as u64;
+                if bits & !u128::from(u32::MAX) == NAT64 {
+                    Self::V4(bits as u32)
+                } else if v6.is_unicast_link_local()
+                    || v6.is_unique_local()
+                    || is_site_local(v6)
+                    || is_local_network(network)
+                {
+                    Self::V6Host(bits)
+                } else {
+                    Self::V6(network)
+                }
             }
-            IpAddr::V6(v6) => Self::V6((u128::from(v6) >> 64) as u64),
         }
     }
+}
+
+/// fec0::/10，已经废弃、局域网里偶尔还有 / fec0::/10, deprecated and now and then still on a LAN
+fn is_site_local(ip: Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xffc0 == 0xfec0
+}
+
+/// 最多记这么多个本机所在的 IPv6 网段 / At most this many networks the machine is on are noted
+const LOCAL_NETWORKS: usize = 16;
+
+/// 本机网卡上公网 IPv6 地址所在的 /64（地址的高 64 位），见 [`note_local_networks`] / The /64s (the high 64 bits)
+/// of the global IPv6 addresses on this machine's interfaces, see [`note_local_networks`]
+static LOCAL_NETWORK: [AtomicU64; LOCAL_NETWORKS] = [const { AtomicU64::new(0) }; LOCAL_NETWORKS];
+
+/// 记了几个 / How many are noted
+static LOCAL_NETWORKS_NOTED: AtomicUsize = AtomicUsize::new(0);
+
+/// 记下本机网卡上公网 IPv6 地址所在的 /64（见 `socket_utils::local_ipv6_networks`），多出的不记。来源在这些网段里的，是和
+/// 内核在同一个网段上的主机：对公网上的服务，一户的地址都在一个 /64 里；部署在局域网时，客户端和内核在同一个 /64，要按完整
+/// 地址分开。换了网段（比如重新拨号后运营商下发了新的）再记一次就换掉
+/// Notes the /64s of the global IPv6 addresses on this machine's interfaces (see
+/// `socket_utils::local_ipv6_networks`), any past the limit left out. A source in one of them is
+/// a host on the kernel's own network: for a service on the internet one home's addresses are in
+/// one /64, while deployed on a LAN the clients share the kernel's /64 and are told apart by
+/// the whole address. A new network (a provider handing out another after redialling, say) is
+/// noted again and replaces it
+pub fn note_local_networks(networks: &[u64]) {
+    let noted = networks.len().min(LOCAL_NETWORKS);
+    for (slot, &network) in LOCAL_NETWORK.iter().zip(&networks[..noted]) {
+        slot.store(network, Ordering::Relaxed);
+    }
+    LOCAL_NETWORKS_NOTED.store(noted, Ordering::Relaxed);
+}
+
+fn is_local_network(network: u64) -> bool {
+    let noted = LOCAL_NETWORKS_NOTED.load(Ordering::Relaxed);
+    LOCAL_NETWORK[..noted.min(LOCAL_NETWORKS)]
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) == network)
 }
 
 /// 一台设备排着的查询和回答时要用的对端 / A device's queued queries and the peers to answer
@@ -363,11 +421,51 @@ mod tests {
         assert_ne!(of("fe80::1"), of("fe80::abcd:1234"), "link-local");
         assert_ne!(of("fd00:1:2:3::10"), of("fd00:1:2:3::99"), "unique local");
         assert_ne!(of("fc00::1"), of("fc00::2"), "unique local, fc00::/8");
+        assert_ne!(of("fec0::1:10"), of("fec0::1:99"), "site-local");
         assert_eq!(of("fe80::1"), of("fe80::1"));
         assert_eq!(
             of("2001:db8:0:1::1"),
             of("2001:db8:0:1::2"),
             "global, by /64"
+        );
+    }
+
+    /// 和内核在同一个 /64 里的公网地址按完整地址算：家里的局域网主机用的是运营商下发的同一个 /64。别的公网地址照旧按
+    /// /64；内核换了网段，原来那个网段又按 /64 算。以前这样的局域网主机都算一台
+    /// Global addresses in a /64 the kernel is on go by the whole address: the hosts of a home LAN
+    /// share the /64 their provider handed out. Other global addresses still go by /64, and once
+    /// the kernel moves to another network the old one goes by /64 again. Such LAN hosts used to
+    /// count as one device
+    #[test]
+    fn hosts_on_the_kernels_own_network_are_devices_of_their_own() {
+        let of = |text: &str| Device::of(text.parse().unwrap());
+        let ours = (u128::from("2001:db8:4c4c:4c4c::".parse::<Ipv6Addr>().unwrap()) >> 64) as u64;
+        note_local_networks(&[ours]);
+        assert_ne!(
+            of("2001:db8:4c4c:4c4c::10"),
+            of("2001:db8:4c4c:4c4c:1234:5678:9abc:def0")
+        );
+        assert_eq!(of("2001:db8:4c4c:4c4d::10"), of("2001:db8:4c4c:4c4d::99"));
+        note_local_networks(&[]);
+        assert_eq!(
+            of("2001:db8:4c4c:4c4c::10"),
+            of("2001:db8:4c4c:4c4c:1234:5678:9abc:def0"),
+            "no longer ours"
+        );
+    }
+
+    /// 64:ff9b::/96 的地址按里面的 IPv4 地址算：翻译过来的 IPv4 客户端各是各的，和直接来的同一个地址是同一台
+    /// An address in 64:ff9b::/96 goes by its IPv4 address: translated IPv4 clients are each their
+    /// own, and the same as that address arriving directly
+    #[test]
+    fn a_translated_ipv4_client_is_its_ipv4_address() {
+        let of = |text: &str| Device::of(text.parse().unwrap());
+        assert_ne!(of("64:ff9b::c000:201"), of("64:ff9b::c633:6401"));
+        assert_eq!(of("64:ff9b::c000:201"), of("192.0.2.1"));
+        assert_eq!(
+            of("64:ff9b:0:0:1::1"),
+            of("64:ff9b:0:0:1::2"),
+            "outside the /96, by /64"
         );
     }
 }
