@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use super::fair_queue::Device;
+use super::fair_queue::{Device, MAX_QUEUED_DEVICES};
 use super::memory_watermark::Room;
 
 /// 查询在内核里排队超过这么久，就算内核跟不上。这是延迟目标，和机器无关：快机器和慢机器都一样
@@ -37,22 +37,194 @@ pub const HELD_AT_MOST: Duration = Duration::from_secs(1);
 /// memory or weigh on an upstream
 pub const BUDGET_AT_LEAST: usize = 1000;
 
-/// 内核忙时在途的查询一共最多多少：`took` 这段时间走完了 `done` 个（回答了、失败了、超时了都算），按 `HELD_AT_MOST` 折算，
-/// 至少 `BUDGET_AT_LEAST`。在途的数除以每秒走完的数就是平均要等多久（利特尔定律），所以超过它就是平均要等 `HELD_AT_MOST`
-/// 以上。上游回答得快，走完得也快，在途能有多少就跟着多；对着不回答的域名洪泛，查询要到超时才走完，预算就停在底数附近
-/// How many queries may be in flight in all while the kernel is busy: `done` were done over
-/// `took` (answered, failed or timed out alike), over `HELD_AT_MOST`, at least
-/// `BUDGET_AT_LEAST`. What is in flight over how many are done per second is how long they take
-/// on average (Little's law), so past this they take over `HELD_AT_MOST` on average. With
-/// upstreams answering fast, queries are done fast and as many may be in flight; flooding names
-/// that get no answer, queries are done only at their timeouts and the budget stays near its floor
-#[inline]
-pub fn budget_from(done: u64, took: Duration) -> usize {
-    let budget = u128::from(done) * HELD_AT_MOST.as_nanos() / took.as_nanos().max(1);
-    usize::try_from(budget)
-        .unwrap_or(usize::MAX)
-        .max(BUDGET_AT_LEAST)
+/// 内核忙时每台设备在途至少能有这么多个，排队也是（见 `FairQueue::offer`），够 A、AAAA、HTTPS 一起问：来源多到预算平分下来
+/// 每台不到一个时，发得少的设备一次问几个，只答得上一个。最多照顾 [`MAX_QUEUED_DEVICES`] 台，在途和排队一共最多各多出它们乘
+/// 这么多个；来源再多，每台分到的又和以前一样
+/// While the kernel is busy each device may hold at least this many in flight, and queue as many
+/// (see `FairQueue::offer`), enough to ask A, AAAA and HTTPS together: with sources so many that
+/// the budget shared out gives each less than one, a device sending little asking a few at once
+/// would get only one answered. At most [`MAX_QUEUED_DEVICES`] devices are looked after this way,
+/// so in flight and queued each hold at most that many times this more in all; with yet more
+/// sources each gets what it used to
+pub const SHARE_AT_LEAST: usize = 4;
+
+/// 预算看的那一秒分成这么长的一格：每有一个查询在上游超时以前走完，就记进它走完时所在的那一格，看的是现在这一格之前的
+/// `HELD_AT_MOST` 那么多格
+/// The second the budget looks at is kept in buckets this long: each query done before the
+/// upstream timeout is noted in the bucket it was done in, and what is looked at is the
+/// `HELD_AT_MOST` worth of buckets before the current one
+const BUCKET: Duration = Duration::from_millis(100);
+
+/// 预算看的是现在这一格之前的这么多格 / The budget looks at this many buckets before the current one
+const BUCKETS_LOOKED_AT: u64 = (HELD_AT_MOST.as_nanos() / BUCKET.as_nanos()) as u64;
+
+/// 记着的格数：看的那些、正在记的这一格，以及几个核在格子交界处还往上一格记的余地，取 2 的幂
+/// How many buckets are kept: those looked at, the one being noted in, and room for cores still
+/// noting in the last one around a boundary, as a power of two
+const BUCKETS_KEPT: usize = 16;
+
+/// 一格的原子数里，个数占的低位，高位是格号 / In a bucket's atomic, the low bits holding the count,
+/// the high bits being the bucket's number
+const COUNT_BITS: u32 = 24;
+const COUNT_MASK: u64 = (1 << COUNT_BITS) - 1;
+
+/// 一格：这一段时间里有多少查询没等到上游超时就走完、有多少等到了超时，各是一个带格号的原子数。一格单占一条缓存行：
+/// 几个核一起往现在这一格记，看预算时读的是别的格，不跟着失效
+/// A bucket: how many queries were done short of the upstream timeout over its stretch and how
+/// many only at the timeout, each an atomic carrying the bucket's number. A bucket is on a cache
+/// line of its own: the cores noting in the current one together leave the others, which the
+/// budget reads, valid
+#[repr(align(64))]
+struct Bucket {
+    answered: AtomicU64,
+    timed_out: AtomicU64,
 }
+
+/// 第 `number` 格的计数加一。这一格上次记的是更早的格号，就从这一个重新数；已经记着更晚的（这个核在交界处慢了一整圈），
+/// 这一个不记
+/// Adds one to the count of bucket `number`. A count last noted for an earlier number starts
+/// again from this one; one already noted for a later number (this core slow by a whole round at
+/// a boundary) leaves this one out
+fn count_one(counter: &AtomicU64, number: u64) {
+    let mut seen = counter.load(Ordering::Relaxed);
+    loop {
+        let next = match (seen >> COUNT_BITS).cmp(&number) {
+            std::cmp::Ordering::Greater => return,
+            std::cmp::Ordering::Equal if seen & COUNT_MASK == COUNT_MASK => return,
+            std::cmp::Ordering::Equal => seen + 1,
+            std::cmp::Ordering::Less => number << COUNT_BITS | 1,
+        };
+        match counter.compare_exchange_weak(seen, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(now_seen) => seen = now_seen,
+        }
+    }
+}
+
+/// 第 `number` 格记了多少；记着的是别的格号时是 0 / How many bucket `number` holds; 0 when it holds
+/// another number
+fn count_of(counter: &AtomicU64, number: u64) -> u64 {
+    let seen = counter.load(Ordering::Relaxed);
+    if seen >> COUNT_BITS == number {
+        seen & COUNT_MASK
+    } else {
+        0
+    }
+}
+
+/// 一段时间里有多少查询没等到上游超时就走完、有多少等到了超时，按 `bucket` 那么长分格，几个核一起记，见
+/// [`PermitManager::budget`] / How many queries were done short of the upstream timeout and how many only
+/// at it over a stretch of time, kept in buckets `bucket` long and noted by several cores at once,
+/// see [`PermitManager::budget`]
+struct Done {
+    started: Instant,
+    bucket: Duration,
+    buckets: [Bucket; BUCKETS_KEPT],
+}
+
+impl Done {
+    fn new(bucket: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            bucket,
+            buckets: std::array::from_fn(|_| Bucket {
+                answered: AtomicU64::new(0),
+                timed_out: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// `at` 在第几格 / Which bucket `at` falls in
+    fn bucket_of(&self, at: Instant) -> u64 {
+        (at.saturating_duration_since(self.started).as_nanos() / self.bucket.as_nanos()) as u64
+    }
+
+    /// 记下 `at` 这一刻走完了一个，`answered` 是没等到上游超时 / Notes one done at `at`, `answered`
+    /// meaning short of the upstream timeout
+    fn note(&self, at: Instant, answered: bool) {
+        let number = self.bucket_of(at);
+        let bucket = &self.buckets[number as usize % BUCKETS_KEPT];
+        count_one(
+            if answered {
+                &bucket.answered
+            } else {
+                &bucket.timed_out
+            },
+            number,
+        );
+    }
+
+    /// `now` 这一格之前的 `N` 格各记了多少，近的在前，`kind` 选是哪一种 / How many were noted in each of the
+    /// `N` buckets before the one `now` falls in, the latest first, `kind` choosing which
+    fn counts<const N: usize>(&self, now: Instant, kind: fn(&Bucket) -> &AtomicU64) -> [u64; N] {
+        let current = self.bucket_of(now);
+        std::array::from_fn(|back| match current.checked_sub(back as u64 + 1) {
+            Some(number) => count_of(kind(&self.buckets[number as usize % BUCKETS_KEPT]), number),
+            None => 0,
+        })
+    }
+
+    /// 最近一秒有多少没等到上游超时就走完 / How many were done short of the upstream timeout over the
+    /// last second
+    #[cfg(test)]
+    fn last_second(&self, now: Instant) -> u64 {
+        self.counts::<{ BUCKETS_LOOKED_AT as usize }>(now, |bucket| &bucket.answered)
+            .iter()
+            .sum()
+    }
+
+    /// 没等到上游超时就走完的，整整一秒有多少，以及最近零点几秒走得更快时跟着那一段折成一秒有多少（最多是整秒的
+    /// [`FOLLOWS_FASTER_AT_MOST`] 倍），见 [`PermitManager::budget`] / How many were done short of the upstream
+    /// timeout over the whole second, and how many over a second when following the last tenths of
+    /// a second that went faster (at most [`FOLLOWS_FASTER_AT_MOST`] times the whole second's), see
+    /// [`PermitManager::budget`]
+    fn second_and_faster(&self, now: Instant) -> (u64, u64) {
+        let answered =
+            self.counts::<{ BUCKETS_LOOKED_AT as usize }>(now, |bucket| &bucket.answered);
+        let mut second = 0;
+        let mut fastest = 0;
+        for (k, count) in (1..).zip(answered) {
+            second += count;
+            fastest = fastest.max(second * BUCKETS_LOOKED_AT / k);
+        }
+        let faster = second.max(fastest.min(second.saturating_mul(FOLLOWS_FASTER_AT_MOST)));
+        (second, faster)
+    }
+
+    /// 现在这一格和之前的 `back` 格里，等到上游超时的是不是不到走完的 `1 / TIMED_OUT_ONE_IN`（什么都没走完时算是）。
+    /// 现在这一格也算：洪泛一开始超时，下一次问就看得到
+    /// Whether those that waited for the upstream timeout were under `1 / TIMED_OUT_ONE_IN` of all
+    /// done in the current bucket and the `back` before it (as they are with nothing done). The
+    /// current bucket counts too: a flood starting to time out is seen at the next ask
+    fn rarely_timed_out(&self, now: Instant, back: u64) -> bool {
+        let current = self.bucket_of(now);
+        let (mut answered, mut timed_out) = (0u64, 0u64);
+        for number in current.saturating_sub(back)..=current {
+            let bucket = &self.buckets[number as usize % BUCKETS_KEPT];
+            answered += count_of(&bucket.answered, number);
+            timed_out += count_of(&bucket.timed_out, number);
+        }
+        timed_out.saturating_mul(TIMED_OUT_ONE_IN) < answered.saturating_add(timed_out).max(1)
+    }
+}
+
+/// 最近零点几秒走得比整秒快时，预算最多跟到整秒的这么多倍，见 [`PermitManager::budget`] / How many times the
+/// whole second's count the budget follows the last tenths of a second up to, when they went
+/// faster, see [`PermitManager::budget`]
+const FOLLOWS_FASTER_AT_MOST: u64 = 2;
+
+/// 记等到超时有多少的那些格一格多长，看之前的几格：比默认的上游超时（9 秒）长，洪泛一阵阵地来、每阵之间超时的已经走光了，
+/// 也还记着 / How long a bucket noting how many waited for the timeout is, and how many before now are
+/// looked at: longer than the default upstream timeout (9 s), so a flood coming in waves is still
+/// remembered after one wave's timeouts are all gone
+const RECENT_BUCKET: Duration = Duration::from_secs(1);
+const RECENT_LOOKED_AT: u64 = 15;
+
+/// 最近 `RECENT_LOOKED_AT` 秒走完的查询里，等到超时的不到这么多分之一，预算才跟着最近零点几秒走，见
+/// [`PermitManager::budget`] / The budget follows the last tenths of a second only while fewer than one in
+/// this many queries done over the last `RECENT_LOOKED_AT` seconds waited for the timeout, see
+/// [`PermitManager::budget`]
+const TIMED_OUT_ONE_IN: u64 = 20;
 
 /// 流控的状态。不用填数字，判断都来自运行时测到的：socket 收不收得空、查询排队多久、处理得多快、还剩多少内存
 /// The state of flow control. There are no numbers to fill in: it goes by what is measured at
@@ -79,13 +251,13 @@ impl FlowControlState {
     }
 
     /// `device` 的一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻，`budget` 是内核忙时在途的查询一共
-    /// 最多多少（见 [`budget_from`]）。内存不够时拒绝（见 [`Self::memory_refuses`]）。内核忙时，在途到了预算就拒占着自己
+    /// 最多多少（见 [`PermitManager::budget`]）。内存不够时拒绝（见 [`Self::memory_refuses`]）。内核忙时，在途到了预算就拒占着自己
     /// 那一份的设备；忙而且查询在内核里排着长队时，拒在途不比各设备平均少的设备，发得少的照常——那时每个查询都要先排同样长
     /// 的队，在途多少就是发得多快，不分设备地拒，发得少的也跟着丢，直到开始按设备轮流。等上游不算排队：上游慢，在途没到预算
     /// 就不拒
     /// Whether a query from `device` that waits on an upstream can go ahead, `emptied_at` being
     /// when the socket last ran empty and `budget` how many queries may be in flight in all while
-    /// the kernel is busy (see [`budget_from`]). Too little memory refuses it (see
+    /// the kernel is busy (see [`PermitManager::budget`]). Too little memory refuses it (see
     /// [`Self::memory_refuses`]). With the kernel busy, a device holding its share is refused
     /// once the budget is in flight; busy and queueing long inside the kernel, a device holding no
     /// less in flight than the average is refused while those sending little go on. Every query
@@ -103,7 +275,7 @@ impl FlowControlState {
     ) -> Option<PermitGuard> {
         if self.memory_refuses(manager, device)
             || (self.busy(emptied_at)
-                && (manager.queries.holds_share_of(device, budget)
+                && (manager.queries.holds_busy_share_of(device, budget)
                     || (self.behind() && manager.queries.holds_its_share(device))))
         {
             manager.count_refused();
@@ -175,7 +347,9 @@ impl FlowControlState {
         device: DeviceSlot,
         budget: usize,
     ) -> Option<PermitGuard> {
-        if self.memory_refuses(manager, device) || manager.queries.holds_share_of(device, budget) {
+        if self.memory_refuses(manager, device)
+            || manager.queries.holds_busy_share_of(device, budget)
+        {
             manager.count_refused();
             return None;
         }
@@ -335,6 +509,17 @@ impl DeviceCounts {
         let slots = self.slots_held.load(Ordering::Relaxed).max(1);
         own > 0 && self.total() >= budget && own.saturating_mul(slots) >= budget
     }
+
+    /// 内核忙时 `device` 是不是占着 `budget` 的那一份：同 [`Self::holds_share_of`]，只是有在途的设备不超过
+    /// [`MAX_QUEUED_DEVICES`] 台时每台至少 [`SHARE_AT_LEAST`] 个。内存紧张时不这样：那时管的是内存
+    /// Whether `device` holds its share of `budget` while the kernel is busy: as
+    /// [`Self::holds_share_of`], only with at most [`MAX_QUEUED_DEVICES`] devices holding any each
+    /// gets at least [`SHARE_AT_LEAST`]. Not so with memory tight: memory is what counts then
+    fn holds_busy_share_of(&self, device: DeviceSlot, budget: usize) -> bool {
+        let slots = self.slots_held.load(Ordering::Relaxed);
+        let at_least = SHARE_AT_LEAST.saturating_mul(slots.min(MAX_QUEUED_DEVICES));
+        self.holds_share_of(device, budget.max(at_least))
+    }
 }
 
 /// 一个 permit 记在哪一种上 / Which kind a permit is counted as
@@ -355,9 +540,20 @@ pub struct PermitManager {
     /// 开了流控时，每一份设备开着的 TCP 和 DoH 连接 / With flow control on, the TCP and DoH
     /// connections open per slot of devices
     connections: DeviceCounts,
-    /// 开了流控时，一共走完了多少查询（回答了、失败了、超时了都算），见 [`budget_from`] / With flow control on, how
-    /// many queries were done in all (answered, failed or timed out alike), see [`budget_from`]
-    done: AtomicU64,
+    /// 开了流控时，最近一秒有多少查询在上游超时以前走完，见 [`Self::budget`] / With flow control on, how many
+    /// queries were done before the upstream timeout over the last second, see [`Self::budget`]
+    done: Done,
+    /// 开了流控时，最近十几秒有多少查询回答了、有多少等到了超时，见 [`Self::budget`] / With flow control on,
+    /// how many queries were answered and how many waited for the timeout over the last dozen
+    /// seconds or so, see [`Self::budget`]
+    recent: Done,
+    /// 记下的预算：高 32 位是算的时候在第几格，低 32 位是预算，见 [`Self::budget`] / The budget kept: the bucket it
+    /// was worked out in, in the high 32 bits, and the budget in the low 32, see [`Self::budget`]
+    budget_kept: AtomicU64,
+    /// 上游超时，毫秒：在途这么久才走完的是等到了超时，见 [`Self::set_upstream_timeout`] / The upstream
+    /// timeout in milliseconds: a query done after this long in flight waited for the timeout, see
+    /// [`Self::set_upstream_timeout`]
+    upstream_timeout_ms: AtomicU64,
     hasher: RandomState,
 }
 
@@ -374,7 +570,10 @@ impl PermitManager {
             dropped_requests: AtomicU64::new(0),
             queries: DeviceCounts::new(),
             connections: DeviceCounts::new(),
-            done: AtomicU64::new(0),
+            done: Done::new(BUCKET),
+            recent: Done::new(RECENT_BUCKET),
+            budget_kept: AtomicU64::new(u64::MAX),
+            upstream_timeout_ms: AtomicU64::new(u64::MAX),
             hasher: RandomState::new(),
         }
     }
@@ -382,14 +581,20 @@ impl PermitManager {
     /// 拿一个 permit：这里不拒绝，只记着有多少在处理 / Takes a permit: nothing is refused here, this only counts what is being handled
     pub fn acquire(self: &Arc<Self>) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
-        PermitGuard::new(Arc::clone(self), None)
+        PermitGuard::new(Arc::clone(self), None, None)
     }
 
-    /// 给 `device` 的一个查询拿 permit，也记在它那一份上 / Takes a permit for a query of `device`, counted in its slot as well
+    /// 给 `device` 的一个查询拿 permit，也记在它那一份上，记下拿到的时刻（见 [`PermitGuard::held_since`]）/ Takes
+    /// a permit for a query of `device`, counted in its slot as well, noting when it was taken (see
+    /// [`PermitGuard::held_since`])
     pub fn acquire_for(self: &Arc<Self>, device: DeviceSlot) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
         self.queries.add(device);
-        PermitGuard::new(Arc::clone(self), Some((device, Held::Query)))
+        PermitGuard::new(
+            Arc::clone(self),
+            Some((device, Held::Query)),
+            Some(Instant::now()),
+        )
     }
 
     /// 给 `device` 的一条连接拿 permit，也记在它那一份的连接上 / Takes a permit for a connection of
@@ -397,7 +602,7 @@ impl PermitManager {
     pub fn acquire_connection_for(self: &Arc<Self>, device: DeviceSlot) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
         self.connections.add(device);
-        PermitGuard::new(Arc::clone(self), Some((device, Held::Connection)))
+        PermitGuard::new(Arc::clone(self), Some((device, Held::Connection)), None)
     }
 
     /// 客户端地址所属的设备落在哪一份 / The slot the device of a client address lands in
@@ -427,7 +632,7 @@ impl PermitManager {
     /// One counted for a device takes one off its slot too, and a slot reaching 0 takes one off
     /// the slots in flight, saturating at zero in the same way
     #[inline]
-    fn release_one(&self, device: Option<(DeviceSlot, Held)>) {
+    fn release_one(&self, device: Option<(DeviceSlot, Held)>, held_since: Option<Instant>) {
         // Rust 1.99 renamed fetch_update to try_update. The crate declares no
         // minimum toolchain, so keep the old name, which every toolchain has,
         // until one is set at 1.99 or later.
@@ -442,11 +647,45 @@ impl PermitManager {
         match device {
             Some((device, Held::Query)) => {
                 self.queries.remove(device);
-                self.done.fetch_add(1, Ordering::Relaxed);
+                if let Some(held_since) = held_since {
+                    self.note_done(held_since, Instant::now());
+                }
             }
             Some((device, Held::Connection)) => self.connections.remove(device),
             None => {}
         }
+    }
+
+    /// 一个从 `held_since` 起在途的查询在 `now` 走完：记下它有没有等到上游超时，见 [`Self::budget`]
+    /// A query in flight since `held_since` is done at `now`: noted with whether it waited for the
+    /// upstream timeout, see [`Self::budget`]
+    #[inline]
+    fn note_done(&self, held_since: Instant, now: Instant) {
+        let held = now.saturating_duration_since(held_since).as_millis();
+        let answered = held < u128::from(self.upstream_timeout_ms.load(Ordering::Relaxed));
+        // 一秒的那些格只看回答了的；等到超时的只记在十几秒的那些格里
+        // The buckets of the second look only at those answered; those that waited for the
+        // timeout are noted only in the buckets of the dozen seconds
+        if answered {
+            self.done.note(now, true);
+        }
+        self.recent.note(now, answered);
+    }
+
+    /// 配置里的上游超时（`upstream_timeout_ms`），启动和每次重载时记下：在途这么久才走完的是等到了超时，不算回答了，见
+    /// [`Self::budget`]。没记下时都算
+    /// The upstream timeout of the configuration (`upstream_timeout_ms`), noted at start and at
+    /// each reload: a query done only after this long in flight waited for the timeout and does not
+    /// count as answered, see [`Self::budget`]. With none noted every one counts
+    pub fn set_upstream_timeout(&self, timeout: Duration) {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.upstream_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// 记下的上游超时，见 [`Self::set_upstream_timeout`] / The upstream timeout noted, see
+    /// [`Self::set_upstream_timeout`]
+    pub fn upstream_timeout(&self) -> Duration {
+        Duration::from_millis(self.upstream_timeout_ms.load(Ordering::Relaxed))
     }
 
     /// Get current inflight permits count / 获取当前进行中的 permits 数
@@ -455,11 +694,74 @@ impl PermitManager {
         self.active_permits.load(Ordering::Acquire)
     }
 
-    /// 开了流控时一共走完了多少查询，见 [`budget_from`] / With flow control on, how many queries were done in
-    /// all, see [`budget_from`]
+    /// 内核忙时在途的查询一共最多多少（见 [`FlowControlState::permit`]）：到 `now` 为止的最近一秒里，有多少查询没等到上游超时
+    /// 就走完了（回答了、失败了都算，见 [`Self::set_upstream_timeout`]），至少 `BUDGET_AT_LEAST`。在途的数除以每秒走完的数就是
+    /// 平均要等多久（利特尔定律），所以在途比它多，就是在途的平均要等 `HELD_AT_MOST` 以上。等到超时才走完的不算：对着不回答的域名
+    /// 洪泛，一批一起超时时那一下走完的很多，算进去的话预算跟着跳上去，又放进一批，在途一圈圈往上涨；不算它们，预算就停在别的设备
+    /// 答上的那些和底数上。按超时分而不按 `HELD_AT_MOST` 分：上游一次要将近一秒、内核忙时自己又排着几十毫秒，回答了的也过了一秒，
+    /// 按一秒分就都不算，预算掉回底数再也起不来；慢的回答照样算进去，在途的平均超过 `HELD_AT_MOST` 时一样会拒。看的是整整一秒：
+    /// 只看几毫秒，上游回答得整齐时一批放进去的要过一个延迟才一起走完，没放的那一小段过一个延迟就空着，预算掉回底数，又放不进，
+    /// 这个缺口一直留着。最近零点几秒走得更快时跟着那一段，最多到整秒的 [`FOLLOWS_FASTER_AT_MOST`] 倍：放进去的要过一个延迟才
+    /// 走完，整秒的数比放进去的落后一个延迟，上游一次要将近一秒时，只看整秒的话负载一下子上来，预算每秒只涨一成多；最多两倍，是不让
+    /// 零点一秒里偶尔一下走完很多就把预算抬得太高。只在最近 `RECENT_LOOKED_AT` 秒走完的查询里等到超时的不到
+    /// `1 / TIMED_OUT_ONE_IN` 时才这样跟：跟是在赌刚放进去的也会回答，平常超时的极少，这一赌稳赢；一半等到超时的洪泛里，被拒、
+    /// 放开、再被拒，每次放开时最近零点几秒都比整秒快，跟的话预算一次次被抬到两倍，在途在一千到两万之间来回晃。要等到超时才知道
+    /// 输了，所以记的比上游超时还久，一阵阵的洪泛每阵之间也还记着
+    /// How many queries may be in flight in all while the kernel is busy (see
+    /// [`FlowControlState::permit`]): how many queries were done short of the upstream timeout over
+    /// the last second up to `now` (answered or failed alike, see [`Self::set_upstream_timeout`]),
+    /// at least `BUDGET_AT_LEAST`. What is in flight over how many are done per second is how long
+    /// they take on average (Little's law), so more in flight than this means they take over
+    /// `HELD_AT_MOST` on average. Those done only at the timeout do not count: flooding names that
+    /// get no answer, with a batch timing out together many are done at that moment, so counting
+    /// them would make the budget jump, let another batch in, and climb round after round; without
+    /// them, the budget stays at what other devices get answered and the floor. They are told apart
+    /// by the timeout rather than by `HELD_AT_MOST`: with an upstream taking close to a second and
+    /// the busy kernel queueing tens of milliseconds of its own, answered queries go past a second
+    /// too, so splitting at a second would count none, and the budget would fall to its floor and
+    /// never rise again; slow answers count all the same, and in flight averaging over
+    /// `HELD_AT_MOST` is refused just as well. A whole second is looked at: looking at a few
+    /// milliseconds, with an upstream answering evenly a batch let in is done together one delay
+    /// later, a stretch with none let in is empty one delay later, the budget falls back to the
+    /// floor and lets none in again, so the gap never closes. When the last tenths of a second went
+    /// faster it follows them, up to [`FOLLOWS_FASTER_AT_MOST`] times the whole second's count:
+    /// what is let in is done one delay later, so the whole second lags what is let in by a delay,
+    /// and with an upstream taking close to a second, load coming on at once would raise a budget
+    /// looking at the whole second only a tenth or so a second; at most twice, so that a tenth of a
+    /// second now and then with many done does not lift the budget too far. It follows so only while
+    /// fewer than `1 / TIMED_OUT_ONE_IN` of the queries done over the last `RECENT_LOOKED_AT`
+    /// seconds waited for the timeout: following is a bet that what was just let in will be
+    /// answered too, a safe bet with timeouts as rare as they usually are; in a flood half of which
+    /// waits for the timeout, refused, let in and refused again, each letting in finds the last
+    /// tenths faster than the second, so following would lift the budget to twice over and over,
+    /// what is in flight swinging between a thousand and twenty thousand. A lost bet shows only at
+    /// the timeout, so this is remembered for longer than the upstream timeout, between the waves
+    /// of a flood too
+    ///
+    /// 一格之内看的格不变，所以每格只算一次，记下来给这一格里的查询用；十几秒那些格里现在这一格的超时，最多晚一格才算进来
+    /// The buckets looked at stay the same within a bucket, so it is worked out once a bucket and
+    /// kept for the queries in it; timeouts in the current bucket of the dozen seconds come in at
+    /// most a bucket late
     #[inline]
-    pub fn queries_done(&self) -> u64 {
-        self.done.load(Ordering::Relaxed)
+    pub fn budget(&self, now: Instant) -> usize {
+        let number = self.done.bucket_of(now) & u64::from(u32::MAX);
+        let kept = self.budget_kept.load(Ordering::Relaxed);
+        if kept >> 32 == number {
+            return (kept & u64::from(u32::MAX)) as usize;
+        }
+        let budget = self.budget_at(now).min(u32::MAX as usize);
+        self.budget_kept
+            .store(number << 32 | budget as u64, Ordering::Relaxed);
+        budget
+    }
+
+    /// 按 `now` 现算的预算，见 [`Self::budget`] / The budget worked out afresh at `now`, see [`Self::budget`]
+    fn budget_at(&self, now: Instant) -> usize {
+        let (second, faster) = self.done.second_and_faster(now);
+        let follows = self.recent.rarely_timed_out(now, RECENT_LOOKED_AT);
+        usize::try_from(if follows { faster } else { second })
+            .unwrap_or(usize::MAX)
+            .max(BUDGET_AT_LEAST)
     }
 
     /// Get total dropped requests count / 获取总丢弃请求数
@@ -478,16 +780,30 @@ pub struct PermitGuard {
     manager: Arc<PermitManager>,
     /// 记在哪台设备的那一份、哪一种上（开了流控时）/ The device slot and kind it is counted in (with flow control on)
     device: Option<(DeviceSlot, Held)>,
+    /// 开了流控时，查询的 permit 是什么时候拿到的 / With flow control on, when a query's permit was taken
+    held_since: Option<Instant>,
     released: AtomicBool, // Track if already released to handle double-drop / 跟踪是否已释放以处理双重释放
 }
 
 impl PermitGuard {
-    fn new(manager: Arc<PermitManager>, device: Option<(DeviceSlot, Held)>) -> Self {
+    fn new(
+        manager: Arc<PermitManager>,
+        device: Option<(DeviceSlot, Held)>,
+        held_since: Option<Instant>,
+    ) -> Self {
         Self {
             manager,
             device,
+            held_since,
             released: AtomicBool::new(false),
         }
+    }
+
+    /// 开了流控时这个查询的 permit 是什么时候拿到的，没开时是 None / When this query's permit was taken
+    /// with flow control on, None without
+    #[inline]
+    pub fn held_since(&self) -> Option<Instant> {
+        self.held_since
     }
 
     /// Manually release the permit early / 提前手动释放permit
@@ -502,7 +818,7 @@ impl PermitGuard {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            self.manager.release_one(self.device);
+            self.manager.release_one(self.device, self.held_since);
         }
         // self is dropped here; Drop::drop sees released=true → no double free
     }
@@ -517,7 +833,7 @@ impl Drop for PermitGuard {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            self.manager.release_one(self.device);
+            self.manager.release_one(self.device, self.held_since);
         }
     }
 }
@@ -598,16 +914,171 @@ mod tests {
         drop(first);
     }
 
-    /// 预算是一秒走完的查询数，至少是底数：每秒走完 2000 个，在途就能有 2000 个；0.1 秒走完 500 个是每秒 5000 个；
-    /// 什么都没走完（上游不回答）时是底数
-    /// The budget is the queries done in a second, at least its floor: with 2000 done a second,
-    /// 2000 may be in flight; 500 done in 0.1 s is 5000 a second; with none done (an upstream not
-    /// answering) it is the floor
+    /// 预算看的是最近一秒里没等到上游超时就走完的查询，至少是底数：0.5 秒时走完 2000 个，1.2 秒和 1.55 秒时看得到这 2000 个；
+    /// 正在记的那一格不算，过了一秒也不算；从拿到 permit 起到了上游超时才走完的不算，慢一点的回答照样算
+    /// The budget looks at the queries done short of the upstream timeout over the last second, at
+    /// least its floor: 2000 done at 0.5 s are seen at 1.2 s and 1.55 s; the bucket being noted in
+    /// does not count, nor does one over a second old; those done only at the upstream timeout
+    /// after taking their permit do not count, while slower answers count all the same
     #[test]
-    fn the_budget_is_what_is_done_in_a_second() {
-        assert_eq!(budget_from(2000, Duration::from_secs(1)), 2000);
-        assert_eq!(budget_from(500, Duration::from_millis(100)), 5000);
-        assert_eq!(budget_from(0, Duration::from_secs(1)), BUDGET_AT_LEAST);
+    fn the_budget_is_what_was_done_short_of_the_timeout_over_the_last_second() {
+        let manager = PermitManager::new();
+        manager.set_upstream_timeout(Duration::from_secs(2));
+        let at = |ms: u64| manager.done.started + Duration::from_millis(ms);
+        for _ in 0..2000 {
+            manager.note_done(at(450), at(500));
+        }
+        assert_eq!(
+            manager.budget_at(at(550)),
+            BUDGET_AT_LEAST,
+            "still being noted in"
+        );
+        assert_eq!(manager.done.last_second(at(1200)), 2000);
+        assert_eq!(
+            manager.done.last_second(at(1550)),
+            2000,
+            "the last of the second"
+        );
+        assert_eq!(manager.done.last_second(at(1650)), 0);
+        assert_eq!(
+            manager.budget_at(at(1650)),
+            BUDGET_AT_LEAST,
+            "over a second old"
+        );
+        for _ in 0..5000 {
+            manager.note_done(at(2000), at(4050));
+        }
+        manager.note_done(at(2900), at(4050));
+        assert_eq!(
+            manager.done.last_second(at(4150)),
+            1,
+            "only the one answered after 1.15 s"
+        );
+    }
+
+    /// 看的是整整一秒：上游回答得整齐、一段时间没放进去，过一个延迟那一小段没有走完的，预算只少那一小段，不掉回底数；那一小段
+    /// 之后又一直走完得一样快，预算跟着最近这一段。以前按几毫秒里走完的速度算，这时掉回底数，又放不进，缺口一直留着
+    /// A whole second is looked at: with an upstream answering evenly and a stretch with none let
+    /// in, one delay later the stretch has none done and the budget is short of just that stretch,
+    /// not back at its floor; with as many done as before ever since, the budget follows that
+    /// latest stretch. Worked out from what was done in a few milliseconds it used to fall back
+    /// there, let none in, and keep the gap open
+    #[test]
+    fn a_stretch_with_none_done_leaves_the_rest_of_the_second() {
+        let manager = PermitManager::new();
+        let at = |ms: u64| manager.done.started + Duration::from_millis(ms);
+        for bucket in (0..20).filter(|&bucket| bucket != 15) {
+            for _ in 0..5000 {
+                manager.note_done(at(bucket * 100), at(bucket * 100 + 30));
+            }
+        }
+        assert_eq!(manager.budget_at(at(1550)), 50_000);
+        assert_eq!(manager.budget_at(at(1650)), 45_000, "one stretch short");
+        assert_eq!(
+            manager.budget_at(at(2050)),
+            50_000,
+            "as fast for the last 0.4 s"
+        );
+    }
+
+    /// 最近零点几秒走得比整秒快时预算跟着那一段，最多到整秒的两倍：前九格各 1000、最近一格 1500，预算是 1.5 万；最近两格
+    /// 各 5000，整秒 1.85 万，按最近的是 5 万，取两倍 3.7 万
+    /// When the last tenths of a second went faster than the whole second the budget follows them,
+    /// up to twice the whole second's: nine buckets of 1000 and the latest of 1500 make it 15,000;
+    /// the latest two of 5000 each make the second 18,500 and the latest 50,000, so twice, 37,000
+    #[test]
+    fn the_budget_follows_faster_tenths_up_to_twice_the_second() {
+        let manager = PermitManager::new();
+        let at = |ms: u64| manager.done.started + Duration::from_millis(ms);
+        let fill = |bucket: u64, count: usize| {
+            for _ in 0..count {
+                manager.note_done(at(bucket * 100), at(bucket * 100 + 10));
+            }
+        };
+        for bucket in 2..11 {
+            fill(bucket, 1000);
+        }
+        fill(11, 1500);
+        assert_eq!(manager.budget_at(at(1250)), 15_000);
+        fill(12, 5000);
+        fill(13, 5000);
+        assert_eq!(manager.done.last_second(at(1450)), 18_500);
+        assert_eq!(manager.budget_at(at(1450)), 37_000);
+    }
+
+    /// 最近十几秒等到超时的有二十分之一，预算就只看整秒、不跟着最近更快的那一段：同样的回答，预算从 15070 变成 10507；超时的
+    /// 不到二十分之一时照样跟；那些超时过了十几秒，又跟
+    /// With one in twenty of those done over the last dozen seconds or so waiting for the timeout,
+    /// the budget goes by the whole second without following the faster latest stretch: the same
+    /// answers take it from 15,070 to 10,507; with fewer timeouts than that it follows as before,
+    /// and it follows again once those timeouts are over a dozen seconds old
+    #[test]
+    fn timeouts_stop_the_budget_following_the_faster_tenths() {
+        let manager = PermitManager::new();
+        manager.set_upstream_timeout(Duration::from_secs(2));
+        let at = |ms: u64| manager.done.started + Duration::from_millis(ms);
+        let fill = |bucket: u64, count: usize, held_ms: u64| {
+            for _ in 0..count {
+                manager.note_done(at(bucket * 100 - held_ms), at(bucket * 100));
+            }
+        };
+        for bucket in 32..41 {
+            fill(bucket, 1000, 10);
+        }
+        fill(41, 1507, 10);
+        assert_eq!(manager.budget_at(at(4250)), 15_070);
+        fill(20, 552, 2000);
+        assert_eq!(manager.budget_at(at(4250)), 15_070, "under one in twenty");
+        fill(20, 1, 2000);
+        assert_eq!(manager.budget_at(at(4250)), 10_507, "one in twenty");
+        for bucket in 192..201 {
+            fill(bucket, 1000, 10);
+        }
+        fill(201, 1500, 10);
+        assert_eq!(
+            manager.budget_at(at(20_250)),
+            15_000,
+            "over a dozen seconds on"
+        );
+    }
+
+    /// 每格只算一次：同一格里又记了超时，预算还是这一格开头算的；到了下一格重算
+    /// Worked out once a bucket: with timeouts noted again within the same bucket, the budget is
+    /// still the one worked out at its start; the next bucket works it out again
+    #[test]
+    fn the_budget_is_worked_out_once_a_bucket() {
+        let manager = PermitManager::new();
+        manager.set_upstream_timeout(Duration::from_secs(2));
+        let at = |ms: u64| manager.done.started + Duration::from_millis(ms);
+        for _ in 0..9000 {
+            manager.note_done(at(3500), at(3510));
+        }
+        for _ in 0..1500 {
+            manager.note_done(at(4090), at(4100));
+        }
+        assert_eq!(manager.budget(at(4210)), 15_000);
+        for _ in 0..5000 {
+            manager.note_done(at(2210), at(4210));
+        }
+        assert_eq!(manager.budget(at(4290)), 15_000, "the same bucket");
+        assert_eq!(manager.budget(at(4310)), 10_500, "the next");
+    }
+
+    /// 一格过了一圈再记，从这一个重新数，不接着上一圈的；这个核在交界处慢了一圈、记的格号比那一格已经记着的早，不记
+    /// A bucket noted again a round later counts from this one, not on from the last round; a
+    /// core slow by a round at a boundary, noting an earlier number than the bucket already holds,
+    /// is left out
+    #[test]
+    fn a_bucket_starts_again_each_round() {
+        let manager = PermitManager::new();
+        let at = |ms: u64| manager.done.started + Duration::from_millis(ms);
+        let round = BUCKET.as_millis() as u64 * BUCKETS_KEPT as u64;
+        for _ in 0..100 {
+            manager.done.note(at(50), true);
+        }
+        manager.done.note(at(round + 50), true);
+        manager.done.note(at(50), true);
+        assert_eq!(manager.done.last_second(at(round + 150)), 1);
     }
 
     /// 内核忙时在途一共压到预算：一台设备一直问，放到预算那么多就拒，别的设备照常；不忙时不看预算
@@ -710,6 +1181,64 @@ mod tests {
             "one with nothing in flight"
         );
         drop(held);
+    }
+
+    /// 内核忙时每台设备在途至少 4 个：一千台各占 4 个、预算在底数，发得少的设备一次问 4 个都放进去，第 5 个才拒，洪泛的那些再来
+    /// 也拒；轮流时一样。设备超过 4096 台时不再照顾，每台又和以前一样，占着一个就拒。以前一千台时每台只有一个，并发的第二个起
+    /// 回 SERVFAIL
+    /// While the kernel is busy each device holds at least 4 in flight: with a thousand holding 4
+    /// each and the budget at its floor, a device sending little asking 4 at once gets them all and
+    /// only a fifth is refused, as are more from the flooding ones; taking turns alike. Past 4096
+    /// devices none is looked after so, each again refused holding one as before. With a thousand,
+    /// each used to get one, the second of a few at once getting SERVFAIL
+    #[test]
+    fn busy_each_device_holds_at_least_a_few() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = state(Duration::from_secs(60));
+        let busy = Instant::now() - LONG_AGO;
+        let flooders: Vec<_> = (0..1000u16)
+            .flat_map(|n| std::iter::repeat_n(DeviceSlot(n), SHARE_AT_LEAST))
+            .map(|slot| manager.acquire_for(slot))
+            .collect();
+        let light = DeviceSlot(5000);
+        let asked: Vec<_> = (0..SHARE_AT_LEAST)
+            .map(|_| {
+                flow.permit(&manager, busy, light, BUDGET_AT_LEAST)
+                    .expect("a few at once")
+            })
+            .collect();
+        assert!(
+            flow.permit(&manager, busy, light, BUDGET_AT_LEAST)
+                .is_none(),
+            "past its share"
+        );
+        let in_turn: Vec<_> = (0..SHARE_AT_LEAST)
+            .map(|_| {
+                flow.turn_permit(&manager, DeviceSlot(6000), BUDGET_AT_LEAST)
+                    .expect("a few at once, taking turns")
+            })
+            .collect();
+        assert!(
+            flow.turn_permit(&manager, DeviceSlot(0), BUDGET_AT_LEAST)
+                .is_none(),
+            "a flooding one, taking turns"
+        );
+        assert!(
+            flow.permit(&manager, Instant::now(), DeviceSlot(0), BUDGET_AT_LEAST)
+                .is_some(),
+            "not busy"
+        );
+        drop((flooders, asked, in_turn));
+
+        let many: Vec<_> = (0..20_000u16)
+            .map(|n| manager.acquire_for(DeviceSlot(n)))
+            .collect();
+        assert!(
+            flow.permit(&manager, busy, DeviceSlot(0), BUDGET_AT_LEAST)
+                .is_none(),
+            "past the devices looked after"
+        );
+        drop(many);
     }
 
     /// 排队没超过目标不算跟不上；超过了就按等了多久算，到点自己恢复
@@ -1042,7 +1571,11 @@ mod tests {
             );
         }
         assert_eq!(manager.inflight(), 0);
-        assert_eq!(manager.queries_done(), 3, "only queries count as done");
+        assert_eq!(
+            manager.done.last_second(Instant::now() + BUCKET),
+            3,
+            "only queries count as done"
+        );
     }
 
     /// 两千台设备几乎都落在各自的份里：份数多到落在一起的很少（约 3%）。以前只有 1024 份，两千台里大半和别的设备落在一起

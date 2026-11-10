@@ -10,13 +10,15 @@ use std::hash::RandomState;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use super::concurrency::SHARE_AT_LEAST;
+
 /// 最多这么多台设备同时排队，再来的新设备丢掉。每台设备有自己的队列，不和别的设备共用；这个上限管住一共能压多少（见
 /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`），伪造来源地址的洪泛每个地址只排得进一个，也压不出更多
 /// At most this many devices are queued at once, and a new one past it is dropped. Each device
 /// has a queue of its own, shared with no other; this limit bounds how much may be held in all
 /// (see `the_queues_hold_at_most_each_device_filling_its_share_in_turn`), so a flood with forged
 /// source addresses, each getting one in, holds no more
-const MAX_QUEUED_DEVICES: usize = 4096;
+pub(crate) const MAX_QUEUED_DEVICES: usize = 4096;
 
 /// 空出来的队列留这么多个下次再用，省得每台新设备都分配一次 / This many emptied queues are kept for reuse,
 /// sparing an allocation for every new device
@@ -115,11 +117,11 @@ pub struct FairQueue<P> {
     queues: HashMap<Device, Queued<P>, RandomState>,
     /// 还有查询排着的设备，下一个轮到的在最前面 / The devices holding queries, the next in turn first
     turns: VecDeque<Device>,
-    /// 一台设备排进去时能排到多少：它除以那一刻在排队的设备数。排着的不收回，一共能排多少见
+    /// 一台设备排进去时能排到多少：它除以那一刻在排队的设备数，至少 [`SHARE_AT_LEAST`]。排着的不收回，一共能排多少见
     /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     /// How far a device may queue as it offers a query: this divided by how many devices are queued
-    /// at that moment. What is queued is not taken back; for how much may be held in all see
-    /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
+    /// at that moment, at least [`SHARE_AT_LEAST`]. What is queued is not taken back; for how much
+    /// may be held in all see `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     room: usize,
     /// 一共排着多少个 / How many are queued in all
     queued: usize,
@@ -142,14 +144,17 @@ impl<P> FairQueue<P> {
         self.room = room;
     }
 
-    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。还没排着的设备总能排进去，发得少的设备不会被挡；只有已经有
-    /// [`MAX_QUEUED_DEVICES`] 台在排队时，新来的才丢
-    /// Queues a query; with the device's share full it is dropped and this gives false. A device not
-    /// queued yet always gets in, so a device sending little is not kept out; only with
-    /// [`MAX_QUEUED_DEVICES`] already queued is a new one dropped
+    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。份额至少 [`SHARE_AT_LEAST`]：设备多到平分下来每台不到一个时，发得少的
+    /// 设备一次问几个也排得进。还没排着的设备总能排进去，发得少的设备不会被挡；只有已经有 [`MAX_QUEUED_DEVICES`] 台在排队时，
+    /// 新来的才丢
+    /// Queues a query; with the device's share full it is dropped and this gives false. A share is
+    /// at least [`SHARE_AT_LEAST`]: with devices so many that each would get less than one, a device
+    /// sending little asking a few at once still gets them in. A device not queued yet always gets
+    /// in, so a device sending little is not kept out; only with [`MAX_QUEUED_DEVICES`] already
+    /// queued is a new one dropped
     pub fn offer(&mut self, packet: &[u8], device: Device, peer: P) -> bool {
         if let Some(queue) = self.queues.get_mut(&device) {
-            if queue.len() >= self.room / self.turns.len() {
+            if queue.len() >= (self.room / self.turns.len()).max(SHARE_AT_LEAST) {
                 return false;
             }
             queue.push_back((packet.into(), peer));
@@ -167,11 +172,14 @@ impl<P> FairQueue<P> {
         true
     }
 
-    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少（后面没排着的不算）。一次问好几个的设备后面也排着
-    /// 几个，但比一直在发的少得多，不算
+    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少，而且至少 [`SHARE_AT_LEAST`] 个（排得更少的不算）。一次问
+    /// 好几个的设备后面也排着几个，但比一直在发的少得多，不算；设备多到每台只排几个时，后面排着不到 [`SHARE_AT_LEAST`] 个的也
+    /// 不算，那是每台都排得进的份
     /// The next query in turn, and whether this device has no fewer queued behind it than the
-    /// average across devices (one with none behind does not). A device asking several at once
-    /// has a few behind it too, but far fewer than one sending on and on, and does not count
+    /// average across devices, and at least [`SHARE_AT_LEAST`] (one with fewer does not). A device
+    /// asking several at once has a few behind it too, but far fewer than one sending on and on,
+    /// and does not count; with devices so many that each queues only a few, one with fewer than
+    /// [`SHARE_AT_LEAST`] behind does not count either, that being the share every device gets in
     pub fn next_in_turn(&mut self) -> Option<(Box<[u8]>, P, bool)> {
         let device = self.turns.pop_front()?;
         let queue = self.queues.get_mut(&device)?;
@@ -185,7 +193,7 @@ impl<P> FairQueue<P> {
         {
             self.spare.push(emptied);
         }
-        let queues_its_share = left > 0 && left * self.turns.len() >= self.queued;
+        let queues_its_share = left >= SHARE_AT_LEAST && left * self.turns.len() >= self.queued;
         Some((packet, peer, queues_its_share))
     }
 
@@ -260,11 +268,12 @@ mod tests {
         assert_eq!(queue.devices(), 0);
     }
 
-    /// 轮到的设备后面排着的不比各设备平均少，才算占着自己那一份：一台排了 100 个、一台一次来了 4 个，轮到前者算，轮到后者
-    /// 不算；只剩一台在排时它就是平均，排到它最后一个时不算
-    /// A device in turn holds its share only with no fewer queued behind it than the average: with
-    /// one having queued 100 and another 4 at once, the first does and the second does not; once
-    /// it is the only one queued it is the average, and its last does not
+    /// 轮到的设备后面排着的不比各设备平均少、至少 4 个，才算占着自己那一份：一台排了 100 个、一台一次来了 4 个，轮到前者算，
+    /// 轮到后者不算；只剩一台在排时它就是平均，排到后面不到 4 个时不算
+    /// A device in turn holds its share only with no fewer queued behind it than the average, and
+    /// at least 4: with one having queued 100 and another 4 at once, the first does and the second
+    /// does not; once it is the only one queued it is the average, and with fewer than 4 behind it
+    /// does not
     #[test]
     fn a_device_queueing_no_less_than_the_average_holds_its_share() {
         let mut queue = FairQueue::new(1000);
@@ -289,27 +298,59 @@ mod tests {
         assert!(
             shares
                 .iter()
-                .filter(|(peer, _)| *peer < 99)
+                .filter(|(peer, _)| *peer < 96)
                 .all(|(_, share)| *share),
             "the one sending on and on"
         );
-        assert_eq!(shares.last(), Some(&(99, false)), "its last");
+        assert!(
+            shares
+                .iter()
+                .filter(|(peer, _)| (96..100).contains(peer))
+                .all(|(_, share)| !share),
+            "fewer than 4 behind"
+        );
     }
 
     #[test]
     fn the_query_comes_back_as_it_was_sent() {
         let mut queue = FairQueue::new(100);
         queue.offer(b"query", device(0), 7);
-        queue.offer(b"more", device(0), 8);
+        for peer in 8..12 {
+            queue.offer(b"more", device(0), peer);
+        }
         let (packet, peer, holds_its_share) = queue.next_in_turn().unwrap();
         assert_eq!(&*packet, b"query");
         assert_eq!(peer, 7);
-        assert!(holds_its_share, "alone, with one behind");
+        assert!(holds_its_share, "alone, with four behind");
         let (packet, peer, holds_its_share) = queue.next_in_turn().unwrap();
         assert_eq!(&*packet, b"more");
         assert_eq!(peer, 8);
-        assert!(!holds_its_share, "its last");
-        assert!(queue.next_in_turn().is_none());
+        assert!(!holds_its_share, "three behind");
+        assert_eq!(taken(&mut queue), [9, 10, 11]);
+    }
+
+    /// 设备多到平分下来每台不到一个时，每台照样排得进 4 个：一千台各排满，发得少的设备一次问 3 个都排得进，轮到时也都不算占着
+    /// 份额，跟不上时不丢。以前每台只排得进一个，同一批来的第二个起就丢
+    /// With devices so many that each would get less than one, each still gets 4 in: with a
+    /// thousand at their share, a device sending little asking 3 at once gets all in, and none of
+    /// them counts as holding its share in turn, so falling behind drops none. Each used to get one
+    /// in, the second of a batch onwards dropped
+    #[test]
+    fn many_devices_each_queue_a_few() {
+        let mut queue = FairQueue::new(100);
+        for n in 0..1000 {
+            while queue.offer(b"q", device(n), n) {}
+        }
+        assert_eq!(queue.queues[&device(999)].len(), SHARE_AT_LEAST);
+        let light = device(5000);
+        for id in 0..3 {
+            assert!(queue.offer(b"q", light, 5000 + id), "{id}");
+        }
+        let light_turns: Vec<_> = std::iter::from_fn(|| queue.next_in_turn())
+            .filter(|(_, peer, _)| *peer >= 5000)
+            .map(|(_, _, share)| share)
+            .collect();
+        assert_eq!(light_turns, [false, false, false]);
     }
 
     #[test]
@@ -334,20 +375,22 @@ mod tests {
     }
 
     /// 一共能排多少：份额只在排进去那一刻按当时排着的设备数算，排着的不收回。按最后一次排进去的先后数，第 k 台排进去时，
-    /// 前面那些从各自最后一次排进去以后没再收过、也还没排空，都还排着，所以它最多排到 max(1, ⌊room/k⌋)，一共最多
-    /// Σ max(1, ⌊room/k⌋)（k 从 1 到 `MAX_QUEUED_DEVICES`），大约 room × ln(room) 加设备上限。一台接一台各排满自己那一份
-    /// 正好到这个数；地址再多，过了设备上限的新设备也排不进，占不了更多内存
+    /// 前面那些从各自最后一次排进去以后没再收过、也还没排空，都还排着，所以它最多排到 max(4, ⌊room/k⌋)，一共最多
+    /// Σ max(4, ⌊room/k⌋)（k 从 1 到 `MAX_QUEUED_DEVICES`，4 是 `SHARE_AT_LEAST`），大约 room × ln(room) 加设备上限的 4 倍。
+    /// 一台接一台各排满自己那一份正好到这个数；地址再多，过了设备上限的新设备也排不进，占不了更多内存
     /// How much may be held in all: a share is set only as a query is queued, by how many devices are
     /// queued then, and what is queued is not taken back. Counting devices by when they last queued,
     /// the k-th one finds the earlier ones still queued, as none has taken anything since and none
-    /// has run empty, so it holds at most max(1, ⌊room/k⌋), and all at most Σ max(1, ⌊room/k⌋) for k
-    /// from 1 to `MAX_QUEUED_DEVICES`, about room × ln(room) plus the device limit. Device after
-    /// device filling its share reaches exactly that; however many addresses there are, new devices
-    /// past the limit do not get in, and hold no more memory
+    /// has run empty, so it holds at most max(4, ⌊room/k⌋), and all at most Σ max(4, ⌊room/k⌋) for k
+    /// from 1 to `MAX_QUEUED_DEVICES` (4 being `SHARE_AT_LEAST`), about room × ln(room) plus four
+    /// times the device limit. Device after device filling its share reaches exactly that; however
+    /// many addresses there are, new devices past the limit do not get in, and hold no more memory
     #[test]
     fn the_queues_hold_at_most_each_device_filling_its_share_in_turn() {
         for room in [10, 64, 205, 4000] {
-            let limit: usize = (1..=MAX_QUEUED_DEVICES).map(|k| (room / k).max(1)).sum();
+            let limit: usize = (1..=MAX_QUEUED_DEVICES)
+                .map(|k| (room / k).max(SHARE_AT_LEAST))
+                .sum();
 
             let mut queue = FairQueue::new(room);
             let mut held = 0;

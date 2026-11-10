@@ -147,10 +147,18 @@ impl MemoryWatermark {
         }
     }
 
-    /// 在途 `inflight` 个查询时，内存还有多少余地 / How much room memory has with `inflight` in flight
+    /// 在途 `inflight` 个查询时，内存还有多少余地。在途不到底线时不看内存，算够，紧张时记下的在途也清掉（见
+    /// [`Self::tight_budget`]）：不清的话，过一阵在途再过底线、内存仍然紧张时，用的还是上一阵记下的数
+    /// How much room memory has with `inflight` in flight. Under the floor memory is not looked
+    /// at and counts as enough, and what was noted in flight while tight is cleared too (see
+    /// [`Self::tight_budget`]): otherwise, with what is in flight crossing the floor again a while
+    /// later and memory still tight, the number noted the last time would be used
     #[inline]
     pub fn room(&self, inflight: usize) -> Room {
         if inflight < LOOK_FROM_INFLIGHT {
+            if self.tight_budget.load(Ordering::Relaxed) != usize::MAX {
+                self.tight_budget.store(usize::MAX, Ordering::Relaxed);
+            }
             Room::Plenty
         } else {
             self.looked_at()
@@ -158,12 +166,13 @@ impl MemoryWatermark {
     }
 
     /// 紧张时在途的查询一共最多多少，`queries` 是现在在途的查询数（不算连接）：变紧张以后头一次问的时候在途多少，就是多少，
-    /// 内存不紧张了（够了，或者没了）就清掉。不随着读数往上调：紧张时放进去的都让内存更紧，到了这个数只再放没占满自己那一份的
+    /// 内存不紧张了（够了，或者没了）、在途掉到底线以下，就清掉。不随着读数往上调：紧张时放进去的都让内存更紧，到了这个数只再放没占满自己那一份的
     /// 设备，一共最多多出设备数那么多。没了的时候谁都不放，在途只会少，再回到紧张时记下的就更小。内存还给系统以前，在途回到
     /// 这个数用的还是原来那些内存
     /// How many queries may be in flight in all while tight, `queries` being how many are in
     /// flight now (connections not counted): as many as were in flight when first asked after
-    /// memory got tight, cleared once it is not tight (enough again, or none left). It does not
+    /// memory got tight, cleared once it is not tight (enough again, or none left) or what is in
+    /// flight falls under the floor. It does not
     /// follow later readings up: whatever is let in while tight makes memory tighter, so at this
     /// many only devices short of their share get more, the total going past it by at most the
     /// number of devices. With none left nothing is let in and what is in flight only falls, so
@@ -984,6 +993,31 @@ mod tests {
             watermark.tight_budget(7000),
             7000,
             "noted afresh after enough"
+        );
+    }
+
+    /// 紧张时记下的在途，在途掉到底线以下就清掉：过一阵在途再过底线、内存仍然紧张时，按那时在途的数重新记。以前一直留着，下一阵
+    /// 用的是上一阵的数，偏大时紧张这一档拦不住，要等到没了谁都拒
+    /// What was noted in flight while tight is cleared once what is in flight falls under the
+    /// floor: crossing the floor again a while later with memory still tight notes what is in
+    /// flight then. It used to stay, the next spell using the last one's number, and a number too
+    /// large left tight holding nothing back until none left refused everyone
+    #[test]
+    fn the_tight_budget_is_cleared_under_the_floor() {
+        let (watermark, available, _) = watermark();
+        available.store(GIB / 8 - 1, Ordering::Relaxed);
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Tight);
+        assert_eq!(watermark.tight_budget(30_000), 30_000);
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT - 1), Room::Plenty);
+        assert_eq!(
+            watermark.room(LOOK_FROM_INFLIGHT),
+            Room::Tight,
+            "still tight"
+        );
+        assert_eq!(
+            watermark.tight_budget(LOOK_FROM_INFLIGHT),
+            LOOK_FROM_INFLIGHT,
+            "noted afresh"
         );
     }
 
