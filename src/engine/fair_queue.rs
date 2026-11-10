@@ -63,6 +63,8 @@ pub struct FairQueue<P> {
     /// at that moment. What is queued is not taken back; for how much may be held in all see
     /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     room: usize,
+    /// 一共排着多少个 / How many are queued in all
+    queued: usize,
     /// 空出来留着再用的队列 / Emptied queues kept for reuse
     spare: Vec<Queued<P>>,
 }
@@ -73,6 +75,7 @@ impl<P> FairQueue<P> {
             queues: HashMap::default(),
             turns: VecDeque::new(),
             room,
+            queued: 0,
             spare: Vec::new(),
         }
     }
@@ -92,6 +95,7 @@ impl<P> FairQueue<P> {
                 return false;
             }
             queue.push_back((packet.into(), peer));
+            self.queued += 1;
             return true;
         }
         if self.turns.len() >= MAX_QUEUED_DEVICES {
@@ -99,26 +103,32 @@ impl<P> FairQueue<P> {
         }
         let mut queue = self.spare.pop().unwrap_or_default();
         queue.push_back((packet.into(), peer));
+        self.queued += 1;
         self.queues.insert(device, queue);
         self.turns.push_back(device);
         true
     }
 
-    /// 下一个轮到的查询，以及这台设备后面还排没排着别的 / The next query in turn, and whether this device
-    /// has more queued behind it
+    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少（后面没排着的不算）。一次问好几个的设备后面也排着
+    /// 几个，但比一直在发的少得多，不算
+    /// The next query in turn, and whether this device has no fewer queued behind it than the
+    /// average across devices (one with none behind does not). A device asking several at once
+    /// has a few behind it too, but far fewer than one sending on and on, and does not count
     pub fn next_in_turn(&mut self) -> Option<(Box<[u8]>, P, bool)> {
         let device = self.turns.pop_front()?;
         let queue = self.queues.get_mut(&device)?;
         let (packet, peer) = queue.pop_front()?;
-        let more_queued = !queue.is_empty();
-        if more_queued {
+        self.queued -= 1;
+        let left = queue.len();
+        if left > 0 {
             self.turns.push_back(device);
         } else if let Some(emptied) = self.queues.remove(&device)
             && self.spare.len() < SPARE_QUEUES
         {
             self.spare.push(emptied);
         }
-        Some((packet, peer, more_queued))
+        let queues_its_share = left > 0 && left * self.turns.len() >= self.queued;
+        Some((packet, peer, queues_its_share))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -192,19 +202,55 @@ mod tests {
         assert_eq!(queue.devices(), 0);
     }
 
+    /// 轮到的设备后面排着的不比各设备平均少，才算占着自己那一份：一台排了 100 个、一台一次来了 4 个，轮到前者算，轮到后者
+    /// 不算；只剩一台在排时它就是平均，排到它最后一个时不算
+    /// A device in turn holds its share only with no fewer queued behind it than the average: with
+    /// one having queued 100 and another 4 at once, the first does and the second does not; once
+    /// it is the only one queued it is the average, and its last does not
+    #[test]
+    fn a_device_queueing_no_less_than_the_average_holds_its_share() {
+        let mut queue = FairQueue::new(1000);
+        let (heavy, light) = (device(1), device(2));
+        for id in 0..100 {
+            assert!(queue.offer(b"q", heavy, id));
+        }
+        for id in 100..104 {
+            assert!(queue.offer(b"q", light, id));
+        }
+        let shares: Vec<_> = std::iter::from_fn(|| queue.next_in_turn())
+            .map(|(_, peer, share)| (peer, share))
+            .collect();
+        assert_eq!(shares.len(), 104);
+        assert!(
+            shares
+                .iter()
+                .filter(|(peer, _)| *peer >= 100)
+                .all(|(_, share)| !share),
+            "the one asking a few at once"
+        );
+        assert!(
+            shares
+                .iter()
+                .filter(|(peer, _)| *peer < 99)
+                .all(|(_, share)| *share),
+            "the one sending on and on"
+        );
+        assert_eq!(shares.last(), Some(&(99, false)), "its last");
+    }
+
     #[test]
     fn the_query_comes_back_as_it_was_sent() {
         let mut queue = FairQueue::new(100);
         queue.offer(b"query", device(0), 7);
         queue.offer(b"more", device(0), 8);
-        let (packet, peer, more_queued) = queue.next_in_turn().unwrap();
+        let (packet, peer, holds_its_share) = queue.next_in_turn().unwrap();
         assert_eq!(&*packet, b"query");
         assert_eq!(peer, 7);
-        assert!(more_queued);
-        let (packet, peer, more_queued) = queue.next_in_turn().unwrap();
+        assert!(holds_its_share, "alone, with one behind");
+        let (packet, peer, holds_its_share) = queue.next_in_turn().unwrap();
         assert_eq!(&*packet, b"more");
         assert_eq!(peer, 8);
-        assert!(!more_queued);
+        assert!(!holds_its_share, "its last");
         assert!(queue.next_in_turn().is_none());
     }
 
