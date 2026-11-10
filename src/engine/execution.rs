@@ -460,6 +460,26 @@ impl Engine {
     /// 照那个请求写法的应答。应答去掉 ECS 选项后存放：它可能交给别的子网的请求方，它们各自得到自己的
     /// 回显（见 `phases::served_from_cache`）。
     pub(crate) fn insert_dns_cache_entry(&self, slot: u64, mut entry: CacheEntry) {
+        // 失败不进缓存：SERVFAIL 不管从哪里来都不缓存（RFC 2308 第 7.1 节最多允许 5 分钟，缓存了，一次瞬时的
+        // 故障就会在缓存里留到条目到期）；上游回的 REFUSED 和扩展 RCODE 也不缓存，带着记录也一样。规则自己给出的
+        // REFUSED（deny）照常缓存，拦截靠它走缓存
+        // Failures stay out of the cache: a SERVFAIL is never cached, wherever it comes from
+        // (RFC 2308 section 7.1 allows five minutes at most, and once cached one passing
+        // failure stays until the entry expires); neither is a REFUSED or an extended RCODE
+        // from an upstream, records or not. A REFUSED the rules give themselves (deny) is
+        // cached as before, and blocking relies on it
+        if entry.rcode == ResponseCode::ServFail
+            || (entry.upstream.is_some() && crate::engine::upstream::is_failure_reply(entry.rcode))
+        {
+            tracing::debug!(
+                event = "failure_not_cached",
+                qname = %entry.qname,
+                pipeline = %entry.pipeline_id,
+                rcode = %entry.rcode,
+                "failure reply is not cached"
+            );
+            return;
+        }
         if crate::proto_utils::truncated_response(&entry.bytes) {
             tracing::debug!(
                 event = "truncated_answer_not_cached",
