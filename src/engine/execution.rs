@@ -359,6 +359,21 @@ impl Engine {
         }
     }
 
+    /// 按设备轮流时 `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::turn_permit`）；没开流控时都能
+    /// Whether a query from `client` that waits on an upstream can go ahead while devices take
+    /// turns (see `FlowControlState::turn_permit`); without flow control it always can
+    #[inline]
+    pub fn turn_query_permit(&self, client: IpAddr, more_queued: bool) -> Option<PermitGuard> {
+        match &self.flow_control_state {
+            Some(state) => state.turn_permit(
+                &self.permit_manager,
+                self.permit_manager.slot_of(client),
+                more_queued,
+            ),
+            None => Some(self.permit_manager.acquire()),
+        }
+    }
+
     /// 内核现在跟不上吗（没开流控时不算）/ Whether the kernel is falling behind now (not without flow control)
     #[inline]
     pub fn falling_behind(&self) -> bool {

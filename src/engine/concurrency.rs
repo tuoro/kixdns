@@ -112,6 +112,31 @@ impl FlowControlState {
         emptied_at.elapsed() >= self.busy_after
     }
 
+    /// 按设备轮流时 `device` 的一个要等上游的查询能不能处理：看内存；这台设备后面还排着别的（`more_queued`）、在途又不比
+    /// 各设备平均少时也拒绝——和忙而且排长队时同一条规则。轮流挡住的是排队，挡不住在途：对着不回答的域名洪泛的设备，
+    /// 只看内存的话在途一直涨到内存水位，这些查询还都转发给了上游
+    /// Whether a query from `device` that waits on an upstream can go ahead while devices take
+    /// turns: by memory, and a device with more queued behind it (`more_queued`) holding no less
+    /// in flight than the average is refused as well, the same rule as when busy and queueing
+    /// long. Taking turns holds the queueing, not what is in flight: a device flooding names that
+    /// get no answer would, by memory alone, pile up in flight until the memory watermark, every
+    /// one of those queries forwarded upstream too
+    #[inline]
+    pub fn turn_permit(
+        &self,
+        manager: &Arc<PermitManager>,
+        device: DeviceSlot,
+        more_queued: bool,
+    ) -> Option<PermitGuard> {
+        if self.memory_refuses(manager, device)
+            || (more_queued && manager.queries.holds_its_share(device))
+        {
+            manager.count_refused();
+            return None;
+        }
+        Some(manager.acquire_for(device))
+    }
+
     /// 只看内存：TCP 和 DoH 没有 socket 收空这个信号，也就不看内核忙不忙
     /// By memory alone: TCP and DoH have no socket running empty to tell by, so whether the
     /// kernel is busy does not come into it
