@@ -17,7 +17,8 @@
 //! that it reads every [`reads_apart`], which keeps what is added between two reads in
 //! proportion to the total, whatever the CPU's speed.
 
-use std::sync::atomic::{AtomicIsize, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// 在途查询到这么多才开始看内存 / The queries in flight from which memory is looked at
 const LOOK_FROM_INFLIGHT: usize = 1000;
@@ -105,7 +106,15 @@ pub struct MemoryWatermark {
     until_read: AtomicIsize,
     /// 上次读到的 [`Room`] / The [`Room`] last read
     room: AtomicU8,
+    started: Instant,
+    /// 上次读的时刻，从 `started` 算起的毫秒 / When it was last read, in milliseconds since `started`
+    read_at_ms: AtomicU64,
 }
+
+/// 读数放了这么久就重读，不管隔了几次：在途降到底线以下时不读也不计数，再过底线时手上可能是很久以前的读数
+/// A reading this old is taken again, however few reads apart: under the floor nothing is read
+/// or counted, so crossing the floor again could find a reading from long ago
+const READING_KEPT: Duration = Duration::from_secs(1);
 
 impl MemoryWatermark {
     /// 读这台机器的内存；读不到就不起作用，只记一条警告
@@ -126,6 +135,8 @@ impl MemoryWatermark {
             read: Box::new(read),
             until_read: AtomicIsize::new(1),
             room: AtomicU8::new(Room::Plenty as u8),
+            started: Instant::now(),
+            read_at_ms: AtomicU64::new(0),
         }
     }
 
@@ -140,7 +151,11 @@ impl MemoryWatermark {
     }
 
     fn looked_at(&self) -> Room {
-        if self.until_read.fetch_sub(1, Ordering::Relaxed) <= 1 {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        let stale = now_ms.saturating_sub(self.read_at_ms.load(Ordering::Relaxed))
+            > READING_KEPT.as_millis() as u64;
+        if self.until_read.fetch_sub(1, Ordering::Relaxed) <= 1 || stale {
+            self.read_at_ms.store(now_ms, Ordering::Relaxed);
             let reading = (self.read)();
             let apart = reading
                 .limits
@@ -863,6 +878,37 @@ mod tests {
             Room::Plenty,
             "came back"
         );
+    }
+
+    /// 读数放了一秒以上就重读：内存不够时读过一次、在途随后降到底线以下，过了一阵再过底线时，按当时的内存判断。以前
+    /// 一直沿用旧读数，要等够次数才重读，头一批查询和连接按早已过时的读数被拒
+    /// A reading over a second old is taken again: once memory was read as short and in-flight
+    /// then fell under the floor, crossing the floor again a while later is judged by the memory
+    /// then. The old reading used to stay until enough reads had passed, refusing the first
+    /// queries and connections by a reading long out of date
+    #[test]
+    fn a_reading_over_a_second_old_is_taken_again() {
+        let (watermark, available, reads) = watermark();
+        available.store(0, Ordering::Relaxed);
+        for _ in 0..READ_EVERY {
+            watermark.room(LOOK_FROM_INFLIGHT);
+        }
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Full);
+        let read_so_far = reads.load(Ordering::Relaxed);
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT - 1), Room::Plenty);
+
+        available.store(GIB, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        assert_eq!(
+            watermark.room(LOOK_FROM_INFLIGHT),
+            Room::Plenty,
+            "read again at once"
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), read_so_far + 1);
+        // 一秒之内照旧按次数 / Within the second it still goes by count
+        available.store(0, Ordering::Relaxed);
+        assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Plenty, "not yet");
+        assert_eq!(reads.load(Ordering::Relaxed), read_so_far + 1);
     }
 
     /// 哪一处限制最紧就按哪一处 / The tightest limit is the one that counts
