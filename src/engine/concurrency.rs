@@ -62,7 +62,7 @@ impl FlowControlState {
         device: DeviceSlot,
     ) -> Option<PermitGuard> {
         if self.memory_refuses(manager, device)
-            || (self.busy(emptied_at) && self.behind() && manager.holds_its_share(device))
+            || (self.busy(emptied_at) && self.behind() && manager.queries.holds_its_share(device))
         {
             manager.count_refused();
             return None;
@@ -80,7 +80,7 @@ impl FlowControlState {
     fn memory_refuses(&self, manager: &PermitManager, device: DeviceSlot) -> bool {
         match self.memory.room(manager.inflight()) {
             Room::Plenty => false,
-            Room::Tight => manager.holds_its_share(device),
+            Room::Tight => manager.queries.holds_its_share(device),
             Room::Full => true,
         }
     }
@@ -128,6 +128,37 @@ impl FlowControlState {
             Some(manager.acquire_for(device))
         }
     }
+
+    /// `device` 的一条 TCP 或 DoH 新连接接不接：和查询一样只看内存，紧张时开着的连接或在途的查询有一样不比各设备平均少，
+    /// 就不接——占着内存的设备开新连接，连接上的查询反正也要被拒。连接和查询各比各的：只开着一条空闲连接不算占了查询的
+    /// 份，开着很多连接的设备（比如 DoH 前面的反向代理）也不把查询的平均拉高
+    /// Whether a new TCP or DoH connection from `device` is taken: by memory alone, as for a
+    /// query, and when tight a device holding no fewer open connections, or no fewer queries in
+    /// flight, than the average gets none: a device holding the memory would have the queries on
+    /// a new connection refused anyway. Connections and queries are each compared with their own
+    /// kind: one idle connection is no share of queries, and a device holding many connections (a
+    /// reverse proxy in front of DoH, say) does not raise the average of queries
+    #[inline]
+    pub fn connection_permit(
+        &self,
+        manager: &Arc<PermitManager>,
+        device: DeviceSlot,
+    ) -> Option<PermitGuard> {
+        let refused = match self.memory.room(manager.inflight()) {
+            Room::Plenty => false,
+            Room::Tight => {
+                manager.connections.holds_its_share(device)
+                    || manager.queries.holds_its_share(device)
+            }
+            Room::Full => true,
+        };
+        if refused {
+            manager.count_refused();
+            None
+        } else {
+            Some(manager.acquire_connection_for(device))
+        }
+    }
 }
 
 /// 按设备记在途数的份数：设备按哈希落到其中一份，哈希每次启动都不同，同一份的设备一起算一台
@@ -139,16 +170,87 @@ const DEVICE_SLOTS: usize = 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceSlot(u16);
 
+/// 一种东西按设备记的在途：每一份的个数、有在途的份数、一共多少。份额按同一种东西比
+/// What is in flight of one kind, per device: the count in each slot, how many slots hold
+/// any, and how many in all. Shares are compared within one kind
+struct DeviceCounts {
+    per_slot: Box<[AtomicU32]>,
+    slots_held: AtomicUsize,
+    total: AtomicUsize,
+}
+
+impl DeviceCounts {
+    fn new() -> Self {
+        Self {
+            per_slot: (0..DEVICE_SLOTS).map(|_| AtomicU32::new(0)).collect(),
+            slots_held: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+        }
+    }
+
+    fn add(&self, device: DeviceSlot) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        if self.per_slot[usize::from(device.0)].fetch_add(1, Ordering::Relaxed) == 0 {
+            self.slots_held.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 减一，在 0 处饱和 / Takes one off, saturating at zero
+    fn remove(&self, device: DeviceSlot) {
+        #[allow(deprecated)]
+        let _ = self
+            .total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                total.checked_sub(1)
+            });
+        #[allow(deprecated)]
+        let was = self.per_slot[usize::from(device.0)].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |held| held.checked_sub(1),
+        );
+        if was == Ok(1) {
+            #[allow(deprecated)]
+            let _ = self
+                .slots_held
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |slots| {
+                    slots.checked_sub(1)
+                });
+        }
+    }
+
+    /// `device` 在途的是不是不比各设备的平均少：只有一台在途时就是它；自己没有在途的不算，哪台都没有在途时也一样。
+    /// 一台在刷的设备被拒以后在途的很快就走光，这时都算的话发得少的也跟着被拒，拒得越管用越分不出是谁在刷
+    /// Whether `device` holds no less in flight than the average across devices: a lone one in
+    /// flight does; one with nothing in flight does not, also with nothing in flight anywhere. A
+    /// device flooding has its queries in flight run out soon once refused, and counting everyone
+    /// then would refuse those sending little along with it: the better the refusing works, the
+    /// less it could tell who floods
+    fn holds_its_share(&self, device: DeviceSlot) -> bool {
+        let own = self.per_slot[usize::from(device.0)].load(Ordering::Relaxed) as usize;
+        let slots = self.slots_held.load(Ordering::Relaxed).max(1);
+        own > 0 && own.saturating_mul(slots) >= self.total.load(Ordering::Relaxed)
+    }
+}
+
+/// 一个 permit 记在哪一种上 / Which kind a permit is counted as
+#[derive(Clone, Copy, Debug)]
+enum Held {
+    Query,
+    Connection,
+}
+
 /// 记着有多少查询和连接在处理、拒绝了多少 / Counts the queries and connections being handled, and those refused
 pub struct PermitManager {
     // Current active permits (acquired) / 当前活跃 permits（已获得）
     pub(crate) active_permits: AtomicUsize,
     // Count of requests refused / 被拒绝的请求计数
     dropped_requests: AtomicU64,
-    /// 开了流控时，每一份设备在途的查询和连接 / With flow control on, the queries and connections in flight per slot of devices
-    device_inflight: Box<[AtomicU32]>,
-    /// 有在途的份数 / How many slots have something in flight
-    devices_in_flight: AtomicUsize,
+    /// 开了流控时，每一份设备在途的查询 / With flow control on, the queries in flight per slot of devices
+    queries: DeviceCounts,
+    /// 开了流控时，每一份设备开着的 TCP 和 DoH 连接 / With flow control on, the TCP and DoH
+    /// connections open per slot of devices
+    connections: DeviceCounts,
     hasher: RandomState,
 }
 
@@ -163,8 +265,8 @@ impl PermitManager {
         Self {
             active_permits: AtomicUsize::new(0),
             dropped_requests: AtomicU64::new(0),
-            device_inflight: (0..DEVICE_SLOTS).map(|_| AtomicU32::new(0)).collect(),
-            devices_in_flight: AtomicUsize::new(0),
+            queries: DeviceCounts::new(),
+            connections: DeviceCounts::new(),
             hasher: RandomState::new(),
         }
     }
@@ -175,13 +277,19 @@ impl PermitManager {
         PermitGuard::new(Arc::clone(self), None)
     }
 
-    /// 给 `device` 拿一个 permit，也记在它那一份上 / Takes a permit for `device`, counted in its slot as well
+    /// 给 `device` 的一个查询拿 permit，也记在它那一份上 / Takes a permit for a query of `device`, counted in its slot as well
     pub fn acquire_for(self: &Arc<Self>, device: DeviceSlot) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
-        if self.device_inflight[usize::from(device.0)].fetch_add(1, Ordering::Relaxed) == 0 {
-            self.devices_in_flight.fetch_add(1, Ordering::Relaxed);
-        }
-        PermitGuard::new(Arc::clone(self), Some(device))
+        self.queries.add(device);
+        PermitGuard::new(Arc::clone(self), Some((device, Held::Query)))
+    }
+
+    /// 给 `device` 的一条连接拿 permit，也记在它那一份的连接上 / Takes a permit for a connection of
+    /// `device`, counted among its slot's connections as well
+    pub fn acquire_connection_for(self: &Arc<Self>, device: DeviceSlot) -> PermitGuard {
+        self.active_permits.fetch_add(1, Ordering::Release);
+        self.connections.add(device);
+        PermitGuard::new(Arc::clone(self), Some((device, Held::Connection)))
     }
 
     /// 客户端地址所属的设备落在哪一份 / The slot the device of a client address lands in
@@ -189,19 +297,6 @@ impl PermitManager {
     pub fn slot_of(&self, client: std::net::IpAddr) -> DeviceSlot {
         let hash = self.hasher.hash_one(Device::of(client));
         DeviceSlot((hash % DEVICE_SLOTS as u64) as u16)
-    }
-
-    /// `device` 在途的是不是不比各设备的平均少：只有一台在途时就是它；自己没有在途的不算，哪台都没有在途时也一样。
-    /// 一台在刷的设备被拒以后在途的很快就走光，这时都算的话发得少的也跟着被拒，拒得越管用越分不出是谁在刷
-    /// Whether `device` holds no less in flight than the average across devices: a lone one in
-    /// flight does; one with nothing in flight does not, also with nothing in flight anywhere. A
-    /// device flooding has its queries in flight run out soon once refused, and counting everyone
-    /// then would refuse those sending little along with it: the better the refusing works, the
-    /// less it could tell who floods
-    fn holds_its_share(&self, device: DeviceSlot) -> bool {
-        let own = self.device_inflight[usize::from(device.0)].load(Ordering::Relaxed) as usize;
-        let devices = self.devices_in_flight.load(Ordering::Relaxed).max(1);
-        own > 0 && own.saturating_mul(devices) >= self.inflight()
     }
 
     /// 记下一个被拒绝的查询或连接，隔一阵记一条日志 / Counts a refused query or connection, with a log line now and then
@@ -224,7 +319,7 @@ impl PermitManager {
     /// One counted for a device takes one off its slot too, and a slot reaching 0 takes one off
     /// the slots in flight, saturating at zero in the same way
     #[inline]
-    fn release_one(&self, device: Option<DeviceSlot>) {
+    fn release_one(&self, device: Option<(DeviceSlot, Held)>) {
         // Rust 1.99 renamed fetch_update to try_update. The crate declares no
         // minimum toolchain, so keep the old name, which every toolchain has,
         // until one is set at 1.99 or later.
@@ -236,22 +331,10 @@ impl PermitManager {
             .fetch_update(Ordering::Release, Ordering::Relaxed, |active| {
                 active.checked_sub(1)
             });
-        let Some(device) = device else {
-            return;
-        };
-        #[allow(deprecated)]
-        let was = self.device_inflight[usize::from(device.0)].fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |held| held.checked_sub(1),
-        );
-        if was == Ok(1) {
-            #[allow(deprecated)]
-            let _ = self.devices_in_flight.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |devices| devices.checked_sub(1),
-            );
+        match device {
+            Some((device, Held::Query)) => self.queries.remove(device),
+            Some((device, Held::Connection)) => self.connections.remove(device),
+            None => {}
         }
     }
 
@@ -275,13 +358,13 @@ impl PermitManager {
 /// 该守卫通过使用防御性编程技术，确保即使在panic场景下也能正确释放permits。
 pub struct PermitGuard {
     manager: Arc<PermitManager>,
-    /// 记在哪台设备的那一份上（开了流控时）/ The device slot it is counted in (with flow control on)
-    device: Option<DeviceSlot>,
+    /// 记在哪台设备的那一份、哪一种上（开了流控时）/ The device slot and kind it is counted in (with flow control on)
+    device: Option<(DeviceSlot, Held)>,
     released: AtomicBool, // Track if already released to handle double-drop / 跟踪是否已释放以处理双重释放
 }
 
 impl PermitGuard {
-    fn new(manager: Arc<PermitManager>, device: Option<DeviceSlot>) -> Self {
+    fn new(manager: Arc<PermitManager>, device: Option<(DeviceSlot, Held)>) -> Self {
         Self {
             manager,
             device,
@@ -538,6 +621,96 @@ mod tests {
         drop((heavy, light));
     }
 
+    /// 内存紧张时，只开着一条空闲连接的设备照样能问：连接和查询各比各的份额，空闲连接不算查询的在途。以前人人一条连接
+    /// 时平均就是一条，这些设备连接上和 UDP 上的未命中查询都被拒
+    /// With memory tight a device holding just one idle connection can still ask: connections
+    /// and queries are each compared with their own kind, and an idle connection is no query in
+    /// flight. With one connection each the average used to be one, refusing those devices'
+    /// misses on the connection and over UDP alike
+    #[test]
+    fn an_idle_connection_is_no_share_of_queries() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = with_memory_left(100 << 20);
+        let connections: Vec<_> = (0..DEVICE_SLOTS as u16)
+            .map(|n| {
+                flow.connection_permit(&manager, DeviceSlot(n))
+                    .expect("a device with no connection connects")
+            })
+            .collect();
+        assert!(manager.inflight() >= 1000, "memory is read");
+        for n in [0, 1, 500, DEVICE_SLOTS as u16 - 1] {
+            assert!(
+                flow.permit_by_memory(&manager, DeviceSlot(n)).is_some(),
+                "a query on the connection of {n}"
+            );
+            assert!(
+                flow.permit(&manager, Instant::now(), DeviceSlot(n))
+                    .is_some(),
+                "a query over UDP from {n}"
+            );
+        }
+        assert_eq!(manager.dropped_requests(), 0);
+        drop(connections);
+    }
+
+    /// 一台设备开着很多连接，不把查询的平均拉高：内核忙而且排长队时，只有一台在问的设备照样放进一个就拒。以前另一台
+    /// 开着 600 条空闲连接时，它能同时在途 600 个
+    /// A device holding many connections does not raise the average of queries: busy and
+    /// queueing long, a device alone in asking still gets one in and is refused after. With
+    /// another holding 600 idle connections it used to hold 600 in flight
+    #[test]
+    fn many_connections_do_not_raise_the_average_of_queries() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = state(Duration::from_secs(60));
+        let busy = Instant::now() - LONG_AGO;
+        let proxy: Vec<_> = (0..600)
+            .map(|_| {
+                flow.connection_permit(&manager, OTHER)
+                    .expect("plenty of memory")
+            })
+            .collect();
+        flow.note_queue_delay(Duration::from_secs(3600));
+        let mut flooder = Vec::new();
+        while let Some(permit) = flow.permit(&manager, busy, ONE) {
+            flooder.push(permit);
+            assert!(flooder.len() <= 600, "unbounded");
+        }
+        assert_eq!(flooder.len(), 1, "a lone device asking gets one in");
+        drop((proxy, flooder));
+    }
+
+    /// 连接和连接比：内存紧张时，开着的连接不比平均少的设备不接新连接，没开连接的照常接；它连接上的查询按查询比
+    /// Connections are compared with connections: with memory tight a device holding no fewer
+    /// connections than the average gets no new one, one holding none still connects, and the
+    /// queries on its connections are compared with queries
+    #[test]
+    fn connections_are_compared_with_connections() {
+        let manager = Arc::new(PermitManager::new());
+        let flow = with_memory_left(100 << 20);
+        let held: Vec<_> = (0..1000)
+            .map(|_| manager.acquire_connection_for(ONE))
+            .collect();
+        assert!(
+            flow.connection_permit(&manager, ONE).is_none(),
+            "holding them all"
+        );
+        assert!(
+            flow.connection_permit(&manager, OTHER).is_some(),
+            "holding none"
+        );
+        assert!(
+            flow.permit_by_memory(&manager, ONE).is_some(),
+            "its queries hold no share"
+        );
+        assert_eq!(manager.dropped_requests(), 1);
+        let full = with_memory_left(1 << 20);
+        assert!(
+            full.connection_permit(&manager, DeviceSlot(2)).is_none(),
+            "with no memory left nobody connects"
+        );
+        drop(held);
+    }
+
     /// 都一样多时都在平均上，都拒；内存没了谁都拒 / Holding as much as each other, all are at the
     /// average and all are refused; with no memory left everyone is
     #[test]
@@ -568,19 +741,25 @@ mod tests {
         let second = manager.acquire_for(ONE);
         let other = manager.acquire_for(OTHER);
         let plain = manager.acquire();
-        assert_eq!(manager.devices_in_flight.load(Ordering::Relaxed), 2);
-        assert_eq!(manager.device_inflight[0].load(Ordering::Relaxed), 2);
+        let connection = manager.acquire_connection_for(ONE);
+        assert_eq!(manager.queries.slots_held.load(Ordering::Relaxed), 2);
+        assert_eq!(manager.queries.per_slot[0].load(Ordering::Relaxed), 2);
+        assert_eq!(manager.queries.total.load(Ordering::Relaxed), 3);
+        assert_eq!(manager.connections.slots_held.load(Ordering::Relaxed), 1);
         drop(first);
         second.release();
-        assert_eq!(manager.devices_in_flight.load(Ordering::Relaxed), 1);
-        drop((other, plain));
-        assert_eq!(manager.devices_in_flight.load(Ordering::Relaxed), 0);
-        assert!(
-            manager
-                .device_inflight
-                .iter()
-                .all(|held| held.load(Ordering::Relaxed) == 0)
-        );
+        assert_eq!(manager.queries.slots_held.load(Ordering::Relaxed), 1);
+        drop((other, plain, connection));
+        for counts in [&manager.queries, &manager.connections] {
+            assert_eq!(counts.slots_held.load(Ordering::Relaxed), 0);
+            assert_eq!(counts.total.load(Ordering::Relaxed), 0);
+            assert!(
+                counts
+                    .per_slot
+                    .iter()
+                    .all(|held| held.load(Ordering::Relaxed) == 0)
+            );
+        }
         assert_eq!(manager.inflight(), 0);
     }
 

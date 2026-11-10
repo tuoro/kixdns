@@ -14,18 +14,26 @@ use std::net::IpAddr;
 /// nobody outside can work out who lands together; devices in the same queue count as one
 const QUEUES: usize = 1024;
 
-/// 一台设备：IPv4 按地址，IPv6 按 /64，一个 IPv6 网段通常就是一户
-/// A device: by address for IPv4 and by /64 for IPv6, one such network usually being one home
+/// 一台设备：IPv4 按地址，公网 IPv6 按 /64，一个这样的网段通常就是一户。局域网里的 IPv6 地址（链路本地、ULA）
+/// 按完整地址：同一网段的主机都在一个 /64 里，用链路本地地址的更是全在 fe80::/64，按 /64 算就成了一台
+/// A device: by address for IPv4 and by /64 for global IPv6, one such network usually being
+/// one home. IPv6 addresses of a LAN (link-local, ULA) go by the whole address: the hosts of a
+/// segment share one /64, and all hosts using link-local addresses share fe80::/64, so by /64
+/// they would be one device
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
     V4(u32),
     V6(u64),
+    V6Host(u128),
 }
 
 impl Device {
     pub fn of(ip: IpAddr) -> Self {
         match ip.to_canonical() {
             IpAddr::V4(v4) => Self::V4(u32::from(v4)),
+            IpAddr::V6(v6) if v6.is_unicast_link_local() || v6.is_unique_local() => {
+                Self::V6Host(u128::from(v6))
+            }
             IpAddr::V6(v6) => Self::V6((u128::from(v6) >> 64) as u64),
         }
     }
@@ -259,5 +267,24 @@ mod tests {
         assert_eq!(of("2001:db8:0:1::1"), of("2001:db8:0:1:ffff::2"));
         assert_ne!(of("2001:db8:0:1::1"), of("2001:db8:0:2::1"));
         assert_ne!(of("0.0.0.1"), of("0:0:0:1::"), "families do not mix");
+    }
+
+    /// 链路本地地址和 ULA 按完整地址算：局域网里一个网段的 IPv6 主机不算一台设备；公网地址照旧按 /64。以前同一个
+    /// 局域网的 IPv6 主机都算一台，其中一台洪泛，别的跟着被削
+    /// Link-local addresses and ULAs count by the whole address: the IPv6 hosts on one LAN
+    /// segment are not one device; global addresses still go by /64. Every IPv6 host of one LAN
+    /// used to count as one device, so when one flooded the others were cut along with it
+    #[test]
+    fn hosts_on_a_lan_are_devices_of_their_own() {
+        let of = |text: &str| Device::of(text.parse().unwrap());
+        assert_ne!(of("fe80::1"), of("fe80::abcd:1234"), "link-local");
+        assert_ne!(of("fd00:1:2:3::10"), of("fd00:1:2:3::99"), "unique local");
+        assert_ne!(of("fc00::1"), of("fc00::2"), "unique local, fc00::/8");
+        assert_eq!(of("fe80::1"), of("fe80::1"));
+        assert_eq!(
+            of("2001:db8:0:1::1"),
+            of("2001:db8:0:1::2"),
+            "global, by /64"
+        );
     }
 }
