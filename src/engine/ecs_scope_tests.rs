@@ -516,12 +516,14 @@ async fn a_mismatched_echo_serves_only_the_subnet_sent() {
     assert_eq!(up.queries(), 2);
 }
 
-/// 不带 ECS 的报错（这里是 REFUSED，带 SOA 所以能缓存）说的是发出的这个子网，不给别的子网。
-/// An error without ECS (REFUSED here, with a SOA so it can be cached) speaks of
-/// the subnet sent and does not go to another.
+/// 不带 ECS 的报错说的是发出的这个子网，不给别的子网。这里是 NOTIMP：它是报错，又不算失败应答
+/// （失败应答不缓存，见 `upstream::is_failure_reply`），带 SOA 所以能缓存。
+/// An error without ECS speaks of the subnet sent and does not go to another. NOTIMP
+/// here: an error that is no failure reply (failure replies are not cached, see
+/// `upstream::is_failure_reply`), with a SOA so it can be cached.
 #[tokio::test]
 async fn an_error_reply_without_ecs_is_not_shared() {
-    let up = upstream_with(Echo::Nothing, ResponseCode::Refused, 300, Duration::ZERO).await;
+    let up = upstream_with(Echo::Nothing, ResponseCode::NotImp, 300, Duration::ZERO).await;
     let engine = engine(forward_all(&up.address, None));
     reply(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
     reply(&engine, "10.0.0.2", Some(("198.51.100.0", 24))).await;
@@ -860,12 +862,13 @@ async fn a_client_with_a_malformed_ecs_gets_a_well_formed_cached_reply() {
     assert_eq!(reply_ecs(&cached), None);
 }
 
-/// 刚转发回来的、不带 ECS 的报错，回显客户端子网时以它自己的前缀作为作用范围，与缓存里一样。
+/// 刚转发回来的、不带 ECS 的报错，回显客户端子网时以它自己的前缀作为作用范围，与缓存里一样。报错用
+/// NOTIMP，理由同上。
 /// A fresh error without ECS echoes the client's subnet with the client's own
-/// prefix as the scope, as the cache does.
+/// prefix as the scope, as the cache does. The error is NOTIMP, for the reason above.
 #[tokio::test]
 async fn a_fresh_error_echoes_the_clients_own_prefix() {
-    let up = upstream_with(Echo::Nothing, ResponseCode::Refused, 300, Duration::ZERO).await;
+    let up = upstream_with(Echo::Nothing, ResponseCode::NotImp, 300, Duration::ZERO).await;
     let engine = engine(forward_all(&up.address, None));
     let fresh = reply(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
     assert_eq!(reply_ecs(&fresh), Some((ip("198.51.100.0"), 24, 24)));
