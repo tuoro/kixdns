@@ -161,7 +161,6 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 
 use kixdns::config::{DohListenerConfig, ListenerConfig, load_config_with_source};
 use kixdns::engine::concurrency::QUEUE_TARGET;
-#[cfg(target_os = "linux")]
 use kixdns::engine::fair_queue::{Device, FairQueue};
 use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, write_cache_hit};
 use kixdns::matcher::RuntimePipelineConfig;
