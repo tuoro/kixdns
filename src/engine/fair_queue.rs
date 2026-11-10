@@ -46,12 +46,15 @@ impl Device {
     }
 }
 
+/// 一台设备排着的查询和回答时要用的对端 / A device's queued queries and the peers to answer
+type Queued<P> = VecDeque<(Box<[u8]>, P)>;
+
 /// 按设备轮流的队列，`P` 是回答时要用的对端 / A queue taking devices in turn, `P` being the peer to answer
 pub struct FairQueue<P> {
     /// 每台排着队的设备自己的队列；哈希每次启动都不同，外面算不出表里的布局
     /// Each queued device's own queue; the hash differs at each start, so nobody outside can work
     /// out the table's layout
-    queues: HashMap<Device, VecDeque<(Box<[u8]>, P)>, RandomState>,
+    queues: HashMap<Device, Queued<P>, RandomState>,
     /// 还有查询排着的设备，下一个轮到的在最前面 / The devices holding queries, the next in turn first
     turns: VecDeque<Device>,
     /// 一台设备排进去时能排到多少：它除以那一刻在排队的设备数。排着的不收回，一共能排多少见
@@ -61,7 +64,7 @@ pub struct FairQueue<P> {
     /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     room: usize,
     /// 空出来留着再用的队列 / Emptied queues kept for reuse
-    spare: Vec<VecDeque<(Box<[u8]>, P)>>,
+    spare: Vec<Queued<P>>,
 }
 
 impl<P> FairQueue<P> {
