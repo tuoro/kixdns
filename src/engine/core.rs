@@ -204,9 +204,13 @@ impl Engine {
             GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed"),
         ));
         let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::new()));
-        let geo_sources = GeoSources::load(&cfg, &geosite_manager, &geoip_manager);
-
         let state = Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg)));
+        let geo_sources = GeoSources::load(
+            &state.load_full().pipeline,
+            &geosite_manager,
+            &geoip_manager,
+            &state,
+        );
 
         let permit_manager = Arc::new(PermitManager::new());
         let flow_control_state = settings.flow_control_enabled.then(|| {
