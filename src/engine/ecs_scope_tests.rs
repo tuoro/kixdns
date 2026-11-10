@@ -278,6 +278,49 @@ async fn from_client_ip_counts_0_0_0_0_as_private_but_not_255_255_255_255() {
     );
 }
 
+/// `from_client_ip` 不把不可全球路由的地址算成公网子网发给上游（RFC 6890）：运营商级 NAT 和 Tailscale 用的
+/// 100.64.0.0/10、基准测试用的 198.18.0.0/15、IETF 协议分配用的 192.0.0.0/24、「本网络」0.0.0.0/8，IPv6 的
+/// 100::/64 和 64:ff9b:1::/48。拿它们算出的子网说明不了客户端在哪里，还把内部编址漏给上游。以前这些都当公网
+/// 子网发出去；公网地址照常发
+/// `from_client_ip` does not send an address that is not globally routable upstream as a
+/// public subnet (RFC 6890): 100.64.0.0/10 of carrier-grade NAT and Tailscale, 198.18.0.0/15
+/// for benchmarking, 192.0.0.0/24 for IETF protocol assignments, "this network" 0.0.0.0/8,
+/// and IPv6's 100::/64 and 64:ff9b:1::/48. A subnet taken from them says nothing about where
+/// the client is and leaks internal addressing upstream. They all used to go out as public
+/// subnets; a public address still does
+#[tokio::test]
+async fn from_client_ip_keeps_addresses_that_are_not_globally_routable() {
+    let up = upstream(Echo::Nothing).await;
+    // 每个请求一个新引擎，理由同上 / A fresh engine per request, for the reason above
+    for client in [
+        "100.64.12.34",
+        "100.127.255.1",
+        "198.18.5.5",
+        "198.19.0.1",
+        "192.0.0.8",
+        "0.1.2.3",
+        "100::1",
+        "64:ff9b:1::1",
+        "203.0.113.9",
+    ] {
+        let engine = engine(forward_all(&up.address, from_client_ip()));
+        reply_from(&engine, SocketAddr::new(ip(client), 53000), None).await;
+    }
+    let mut expected = vec![None; 8];
+    expected.push(Some((ip("203.0.113.0"), 24)));
+    // 客户端自己带的这些网段也当作私有网段（RFC 7871 第 11.3 节）：公网客户端照样发来源地址的子网。以前原样或截短
+    // 发给上游
+    // Such a network in the client's own ECS counts as a private one too (RFC 7871 section
+    // 11.3): a public client sends its source address's subnet as usual. It used to go
+    // upstream as it was or cut short
+    for own in [("100.64.1.0", 24), ("198.18.0.1", 32), ("64:ff9b:1::", 48)] {
+        let engine = engine(forward_all(&up.address, from_client_ip()));
+        reply(&engine, "198.51.100.7", Some(own)).await;
+        expected.push(Some((ip("198.51.100.0"), 24)));
+    }
+    assert_eq!(seen(&up), expected);
+}
+
 /// 不写 `ecs` 的转发把客户端自己带的 ECS 原样转给上游。上游按子网作答（作用范围 /24），
 /// 另一个子网的客户端不能从缓存拿到这份应答。
 /// A forward without `ecs` passes the client's own ECS upstream. The upstream
@@ -1514,8 +1557,8 @@ async fn from_client_ip_sends_no_more_of_a_client_subnet_than_the_client_did() {
     assert_eq!(first_a(&long), v4("203.0.113.0"));
     assert_eq!(reply_ecs(&long), Some((ip("203.0.113.9"), 32, 32)));
     assert_eq!(
-        ask(&engine, "192.168.1.10", Some(("198.18.0.1", 32))).await,
-        v4("198.18.0.0")
+        ask(&engine, "192.168.1.10", Some(("198.51.100.200", 32))).await,
+        v4("198.51.100.0")
     );
     assert_eq!(
         seen(&up),
@@ -1523,7 +1566,7 @@ async fn from_client_ip_sends_no_more_of_a_client_subnet_than_the_client_did() {
             Some((ip("0.0.0.0"), 0)),
             Some((ip("203.0.0.0"), 16)),
             Some((ip("203.0.113.0"), 24)),
-            Some((ip("198.18.0.0"), 24)),
+            Some((ip("198.51.100.0"), 24)),
         ]
     );
     // 别的客户端发出同样的子网时，拿缓存里的这几份 / Another client sending the same subnet takes these from the cache

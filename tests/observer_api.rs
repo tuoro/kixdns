@@ -3823,8 +3823,15 @@ async fn a_static_txt_without_a_ttl_answers_for_300_seconds() {
     })
     .to_string();
     let (engine, _recorder) = observed_engine(&raw);
+    // 静态 TXT 只答 TXT 和 ANY 查询 / A static TXT answers only TXT and ANY queries
+    let mut txt = Message::new(0x1234, MessageType::Query, OpCode::Query);
+    txt.metadata.recursion_desired = true;
+    txt.add_query(Query::query(
+        Name::from_str("txt.test").unwrap(),
+        RecordType::TXT,
+    ));
     let answer = engine
-        .handle_packet(&query("txt.test"), peer())
+        .handle_packet(&txt.to_vec().unwrap(), peer())
         .await
         .unwrap();
     let message = Message::from_bytes(&answer).unwrap();

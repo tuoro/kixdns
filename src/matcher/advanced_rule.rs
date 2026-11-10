@@ -93,18 +93,18 @@ pub enum PrecomputedAction {
 
 impl PrecomputedAction {
     /// 这个动作对这个查询的决定 / What this action decides for this query
-    pub(crate) fn decision(&self, qname: &str, qtype: RecordType) -> Decision {
+    pub(crate) fn decision(&self, qname: &str, qtype: RecordType, qclass: DNSClass) -> Decision {
         match self {
             Self::Static { rcode } => Decision::Static {
                 rcode: *rcode,
                 answers: Vec::new(),
             },
             Self::StaticIp { ip, .. } => {
-                let (rcode, answers) = make_static_ip_answer(qname, qtype, ip);
+                let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
                 Decision::Static { rcode, answers }
             }
             Self::StaticCname { target, ttl } => {
-                let (rcode, answers) = make_static_cname_answer(qname, target, *ttl);
+                let (rcode, answers) = make_static_cname_answer(qname, qclass, target, *ttl);
                 Decision::Static { rcode, answers }
             }
         }
@@ -338,7 +338,7 @@ pub(crate) fn fast_static_match(
         edns_present,
         None,
     )
-    .map(|(action, _)| action.decision(qname, qtype))
+    .map(|(action, _)| action.decision(qname, qtype, qclass))
 }
 
 /// Like [`fast_static_match`], giving the matched rule's action instead of a decision, so that a
