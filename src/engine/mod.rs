@@ -53,6 +53,8 @@ pub mod rules;
 #[cfg(test)]
 mod signed_answer_tests;
 #[cfg(test)]
+mod stale_wait_tests;
+#[cfg(test)]
 mod static_answer_scope_tests;
 #[cfg(test)]
 mod tcp_pool_tests;
