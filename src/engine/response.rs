@@ -327,10 +327,10 @@ pub(crate) fn make_static_cname_answer(
 /// 创建静态TXT记录响应 / Create static TXT record response
 ///
 /// 只答 TXT 和 ANY 查询，别的类型回 NODATA，和 [`make_static_ip_answer`] 只给问的地址族一样；装不进这个名字的
-/// 应答时（见 [`txt_size_problem`]）回 SERVFAIL
+/// 应答时（见 [`txt_size_problem`]）不管问什么类型都回 SERVFAIL
 /// Answers only TXT and ANY queries, other types getting NODATA, as
-/// [`make_static_ip_answer`] gives only the family asked for; SERVFAIL when it does not fit
-/// the answer for this name (see [`txt_size_problem`])
+/// [`make_static_ip_answer`] gives only the family asked for; SERVFAIL whatever the type
+/// asked for when it does not fit the answer for this name (see [`txt_size_problem`])
 pub(crate) fn make_static_txt_answer(
     qname: &str,
     qtype: RecordType,
@@ -341,12 +341,14 @@ pub(crate) fn make_static_txt_answer(
     let Some(name) = crate::proto_utils::name_from_text(qname) else {
         return (ResponseCode::ServFail, Vec::new());
     };
-    if !matches!(qtype, RecordType::TXT | RecordType::ANY) || !has_static_records(qclass) {
-        return (ResponseCode::NoError, Vec::new());
-    }
+    // 装不下的先报：和读不出来的地址一样，不看问的是什么类型 / What does not fit is reported first: like
+    // an address that cannot be read, whatever type is asked for
     if let Some(problem) = txt_size_problem(text, name_wire_len(&name)) {
         warn!(qname = %qname, %problem, "static TXT answer does not fit a message");
         return (ResponseCode::ServFail, Vec::new());
+    }
+    if !matches!(qtype, RecordType::TXT | RecordType::ANY) || !has_static_records(qclass) {
+        return (ResponseCode::NoError, Vec::new());
     }
     let txt = TXT::new(text.to_vec());
     let record = Record::from_rdata(name, ttl, RData::TXT(txt));
