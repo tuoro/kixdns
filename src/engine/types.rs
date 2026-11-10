@@ -1,6 +1,7 @@
 use crate::config::{Action, EcsMode, GlobalSettings, MatchOperator};
 use crate::ecs::EcsKey;
 use crate::engine::Engine;
+use crate::engine::geo::GeoGeneration;
 use crate::matcher::advanced_rule::{CompiledPipeline, compile_pipelines};
 use crate::matcher::{
     RequesterKey, RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher,
@@ -342,7 +343,14 @@ pub struct EngineInner {
     /// Response-affecting configuration fingerprint for each pipeline.
     /// It namespaces response/rule/inflight caches across hot reloads while
     /// allowing unchanged pipelines to keep their warm cache entries.
+    /// 每个 pipeline 影响应答的配置指纹，加上它用到的 Geo 数据的代数（见 [`Self::at_geo`]）
+    /// Each pipeline's response-affecting configuration fingerprint, combined with the
+    /// generations of the Geo data it uses (see [`Self::at_geo`])
     pub cache_namespaces: FxHashMap<Arc<str>, u64>,
+    /// 只按配置算出的指纹 / The fingerprints from the configuration alone
+    config_namespaces: FxHashMap<Arc<str>, u64>,
+    /// `cache_namespaces` 算进去的 Geo 数据代数 / The Geo data generations `cache_namespaces` takes in
+    geo: GeoGeneration,
 }
 
 impl EngineInner {
@@ -357,12 +365,49 @@ impl EngineInner {
             .enumerate()
             .map(|(i, p)| (p.id.clone(), i))
             .collect();
+        let config_namespaces = build_cache_namespaces(&cfg);
+        let geo = GeoGeneration::default();
         Self {
-            cache_namespaces: build_cache_namespaces(&cfg),
+            cache_namespaces: with_geo(&cfg, &config_namespaces, geo),
+            config_namespaces,
+            geo,
             pipeline: cfg,
             compiled_pipelines,
             pipeline_index,
         }
+    }
+
+    /// 命名空间就地换成 Geo 数据第 `geo` 代的（见 [`Self::at_geo`]），给还没存进去的新状态用
+    /// Moves the namespaces to Geo data generation `geo` in place (see [`Self::at_geo`]),
+    /// for a new state not stored yet
+    pub(crate) fn set_geo(&mut self, geo: GeoGeneration) {
+        self.cache_namespaces = with_geo(&self.pipeline, &self.config_namespaces, geo);
+        self.geo = geo;
+    }
+
+    /// 同样的配置，命名空间换成 Geo 数据第 `geo` 代的：用到某份 Geo 数据的 pipeline，那份数据每换一代就换一个命名空间，
+    /// 按旧数据得出的应答和规则决定不再查到；没用到的 pipeline 不变。已经是这一代的就原样交回
+    /// The same configuration with the namespaces of Geo data generation `geo`: a pipeline
+    /// using some Geo data moves to a new namespace with every generation of that data, so
+    /// answers and rule decisions reached with the old data are no longer found; pipelines
+    /// not using it stay as they are. A state already at this generation is handed back as
+    /// it is.
+    ///
+    /// 换代时整份复制：Geo 数据一天换几次，请求路径上的状态因此保持原来的布局，不多一层间接
+    /// A new generation copies the whole state: Geo data changes a few times a day, and the
+    /// state on the request path keeps its layout this way, without another indirection
+    pub(crate) fn at_geo(self: &Arc<Self>, geo: GeoGeneration) -> Arc<Self> {
+        if self.geo == geo {
+            return Arc::clone(self);
+        }
+        Arc::new(Self {
+            cache_namespaces: with_geo(&self.pipeline, &self.config_namespaces, geo),
+            config_namespaces: self.config_namespaces.clone(),
+            geo,
+            pipeline: self.pipeline.clone(),
+            compiled_pipelines: self.compiled_pipelines.clone(),
+            pipeline_index: self.pipeline_index.clone(),
+        })
     }
 
     #[inline]
@@ -372,6 +417,35 @@ impl EngineInner {
             .copied()
             .unwrap_or_default()
     }
+}
+
+/// 配置指纹加上各 pipeline 用到的 Geo 数据的代数 / The configuration fingerprints combined with the
+/// generations of the Geo data each pipeline uses
+fn with_geo(
+    cfg: &RuntimePipelineConfig,
+    config_namespaces: &FxHashMap<Arc<str>, u64>,
+    geo: GeoGeneration,
+) -> FxHashMap<Arc<str>, u64> {
+    cfg.pipelines
+        .iter()
+        .map(|pipeline| {
+            let base = config_namespaces
+                .get(&pipeline.id)
+                .copied()
+                .unwrap_or_default();
+            let uses = pipeline.geo_data;
+            let namespace = if uses.site || uses.ip {
+                let mut hasher = DefaultHasher::new();
+                base.hash(&mut hasher);
+                uses.site.then_some(geo.site).hash(&mut hasher);
+                uses.ip.then_some(geo.ip).hash(&mut hasher);
+                hasher.finish()
+            } else {
+                base
+            };
+            (pipeline.id.clone(), namespace)
+        })
+        .collect()
 }
 
 pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<Arc<str>, u64> {

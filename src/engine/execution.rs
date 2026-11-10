@@ -274,7 +274,7 @@ impl Engine {
         source: Option<&str>,
     ) {
         let pool_keys = super::upstream::pool_keys(&new_cfg);
-        let inner = EngineInner::new(new_cfg);
+        let mut inner = EngineInner::new(new_cfg);
         // Store, generation and event stay together under the reload lock, so
         // the reported generation is the one this reload allocated.
         // 存储、代数与事件在重载锁内一起完成，事件中的代数就是本次分配的值。
@@ -291,7 +291,12 @@ impl Engine {
                 self.cache_max_ttl,
                 &inner.pipeline.settings,
             )));
-        self.state.store(Arc::new(inner));
+        // 按 Geo 数据现在的代数存。监视线程这时换了数据、改了状态，rcu 就重来一遍，用上新的代数
+        // Stored at the Geo data's generation now. When a watcher swaps data and changes
+        // the state meanwhile, rcu starts over and takes the new generation
+        inner.set_geo(geo_sources.generation());
+        let inner = Arc::new(inner);
+        self.state.rcu(|_| inner.at_geo(geo_sources.generation()));
         let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.report_config_loaded(generation, path, source);
         // 新配置不再用到的上游，连接池就此丢掉。此前它们一直留到重启：TCP 和 DoT 连接开着，
