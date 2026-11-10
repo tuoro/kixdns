@@ -228,6 +228,153 @@ pub fn udp_receive_drops(_socket: &tokio::net::UdpSocket) -> Option<u32> {
     None
 }
 
+/// 本机网卡上公网 IPv6 地址所在的 /64（地址的高 64 位），去重排好；读不到时是空的。流控用它认出和内核在同一个网段上的主机
+/// The /64s (the high 64 bits) of the global IPv6 addresses on this machine's interfaces,
+/// sorted without repeats; empty when they cannot be read. Flow control tells the hosts on the
+/// kernel's own network by them
+pub fn local_ipv6_networks() -> Vec<u64> {
+    global_networks(local_ipv6_addresses())
+}
+
+/// 这些地址里公网的（2000::/3）所在的 /64，去重排好 / The /64s of those addresses that are global
+/// (2000::/3), sorted without repeats
+fn global_networks(addresses: impl IntoIterator<Item = std::net::Ipv6Addr>) -> Vec<u64> {
+    let mut networks: Vec<u64> = addresses
+        .into_iter()
+        .filter(|ip| ip.segments()[0] & 0xe000 == 0x2000)
+        .map(|ip| (u128::from(ip) >> 64) as u64)
+        .collect();
+    networks.sort_unstable();
+    networks.dedup();
+    networks
+}
+
+#[cfg(test)]
+mod local_network_tests {
+    use super::*;
+
+    /// 只留公网地址的 /64：回环、链路本地、ULA 都不算，同一个 /64 的几个地址只记一次
+    /// Only the /64s of global addresses: loopback, link-local and ULA do not count, and several
+    /// addresses of one /64 are noted once
+    #[test]
+    fn only_global_addresses_give_networks() {
+        let parse = |text: &str| text.parse::<std::net::Ipv6Addr>().unwrap();
+        let networks = global_networks(
+            [
+                "::1",
+                "fe80::1",
+                "fd00:1:2:3::10",
+                "2001:db8:0:1::10",
+                "2001:db8:0:1:ffff::2",
+                "2408:8207:1e:5a00::10",
+            ]
+            .map(parse),
+        );
+        let network = |text: &str| (u128::from(parse(text)) >> 64) as u64;
+        assert_eq!(
+            networks,
+            [network("2001:db8:0:1::"), network("2408:8207:1e:5a00::")]
+        );
+    }
+
+    /// 这台机器上读得出来，读到的都是公网的 / It reads on this machine, and what it reads is global
+    #[test]
+    fn this_machines_networks_are_global() {
+        for network in local_ipv6_networks() {
+            assert_eq!(network >> 61, 1, "{network:x}");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn local_ipv6_addresses() -> Vec<std::net::Ipv6Addr> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs 填好一张链表，用完由 freeifaddrs 释放 / getifaddrs fills a list freed by freeifaddrs
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut entry = list;
+    while !entry.is_null() {
+        // SAFETY: 链表里的每一项在 freeifaddrs 之前都有效；地址的族是 AF_INET6 时它就是 sockaddr_in6
+        // SAFETY: every entry of the list is valid until freeifaddrs; an address of family
+        // AF_INET6 is a sockaddr_in6
+        unsafe {
+            let ifa = &*entry;
+            if !ifa.ifa_addr.is_null() && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET6 {
+                let addr = &*ifa.ifa_addr.cast::<libc::sockaddr_in6>();
+                found.push(std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr));
+            }
+            entry = ifa.ifa_next;
+        }
+    }
+    // SAFETY: list 来自上面成功的 getifaddrs / list comes from the successful getifaddrs above
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
+#[cfg(windows)]
+fn local_ipv6_addresses() -> Vec<std::net::Ipv6Addr> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET6, SOCKADDR_IN6};
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size: u32 = 16 * 1024;
+    // 按 8 字节对齐的缓冲 / A buffer aligned to 8 bytes
+    let mut buffer: Vec<u64> = Vec::new();
+    for _ in 0..3 {
+        buffer.resize((size as usize).div_ceil(8), 0);
+        let first = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        // SAFETY: 缓冲有 size 字节，放不下时返回 ERROR_BUFFER_OVERFLOW 并给出要多大
+        // SAFETY: the buffer holds size bytes; when too small it gives ERROR_BUFFER_OVERFLOW and the size needed
+        let result = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_INET6),
+                flags,
+                std::ptr::null(),
+                first,
+                &mut size,
+            )
+        };
+        if result == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if result != NO_ERROR {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        let mut adapter = first.cast_const();
+        // SAFETY: 链表在缓冲里，缓冲一直活着；地址的族是 AF_INET6 时它就是 SOCKADDR_IN6
+        // SAFETY: the lists live in the buffer, which stays alive; an address of family
+        // AF_INET6 is a SOCKADDR_IN6
+        unsafe {
+            while !adapter.is_null() {
+                let mut unicast = (*adapter).FirstUnicastAddress.cast_const();
+                while !unicast.is_null() {
+                    let sockaddr = (*unicast).Address.lpSockaddr;
+                    if !sockaddr.is_null() && (*sockaddr).sa_family == AF_INET6 {
+                        let v6 = &*sockaddr.cast::<SOCKADDR_IN6>();
+                        found.push(std::net::Ipv6Addr::from(v6.sin6_addr.u.Byte));
+                    }
+                    unicast = (*unicast).Next.cast_const();
+                }
+                adapter = (*adapter).Next.cast_const();
+            }
+        }
+        return found;
+    }
+    Vec::new()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_ipv6_addresses() -> Vec<std::net::Ipv6Addr> {
+    Vec::new()
+}
+
 #[cfg(not(unix))]
 #[allow(dead_code)] // Stub implementations for cross-platform compatibility
 #[inline]

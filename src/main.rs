@@ -407,6 +407,21 @@ async fn run_dns_server(
         );
     }
 
+    // 流控按设备分时要认出和内核在同一个网段上的 IPv6 主机（见 `fair_queue::note_local_networks`）：隔一阵看一次本机网卡的
+    // 地址，换了网段跟着换 / Flow control, going by device, tells the IPv6 hosts on the kernel's own
+    // network (see `fair_queue::note_local_networks`): the interfaces' addresses are looked at
+    // now and then, following any new network
+    if engine.flow_control_state.is_some() {
+        tokio::spawn(async {
+            loop {
+                kixdns::engine::fair_queue::note_local_networks(
+                    &kixdns::socket_utils::local_ipv6_networks(),
+                );
+                tokio::time::sleep(LOCAL_NETWORKS_LOOKED_AT).await;
+            }
+        });
+    }
+
     bound.serve(&engine, &mut all_handles);
 
     // 等待所有任务 / Wait for all tasks
@@ -416,6 +431,10 @@ async fn run_dns_server(
 
     Ok(())
 }
+
+/// 隔这么久看一次本机网卡上的 IPv6 地址：重新拨号换了网段，最多这么久以后跟上 / How often this machine's IPv6
+/// addresses are looked at: after a redial brings another network, it follows within this long
+const LOCAL_NETWORKS_LOOKED_AT: Duration = Duration::from_secs(30);
 
 /// 绑定好、还没开始答的 UDP socket，每个 worker 一个 / UDP sockets bound and not answering yet, one per worker
 struct BoundUdp {
