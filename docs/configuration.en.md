@@ -58,7 +58,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | cache_background_refresh | false | Refresh entries before their TTL expires. |
 | cache_refresh_threshold_percent | 10 | Refresh threshold as a percentage of the entry TTL; must be below 100, since at 100 every cache hit refreshes upstream. |
 | cache_refresh_min_ttl | 5 | Minimum refresh TTL considered for background refresh. |
-| serve_stale | false | Keep and serve expired entries according to RFC 8767 behavior. |
+| serve_stale | false | Keep and serve expired entries according to RFC 8767 behavior. Once the refresh of an expired answer fails, it is not refreshed again for 30 seconds, and requests hitting it get the stale data at once without waiting (the failure recheck of RFC 8767 section 5); the first hit after the 30 seconds tries again. |
 | serve_stale_ttl | 30 | TTL written into a stale response. |
 | serve_stale_expire_ttl | 86400 | Maximum stale age in seconds; 0 means no stale-age limit. |
 | serve_stale_ttl_reset | true | Reset the stale-age window when stale data is served. |

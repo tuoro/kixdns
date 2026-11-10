@@ -153,6 +153,24 @@ pub(crate) fn check_cache_logged(
         // serve_stale_client_timeout_ms > 0: 不在此处返回 stale，
         // 让调用者先尝试上游查询（在 handle_packet_internal 中处理）。
         if state.pipeline.settings.serve_stale_client_timeout_ms > 0 {
+            // 这份应答刚刷新失败过：不等，马上交出过期应答，也不再刷新（RFC 8767 第 5 节，见
+            // `REFRESH_FAILURE_RECHECK`）
+            // This answer's refresh failed lately: no waiting, the stale answer goes out at
+            // once and no refresh starts (RFC 8767 section 5, see `REFRESH_FAILURE_RECHECK`)
+            if hit.upstream.is_some()
+                && engine
+                    .refresh_failures
+                    .failed_recently(RefreshTarget::mark_of(slot, &hit.reach), hit.fetched_at)
+            {
+                return Some(serve_stale(
+                    engine,
+                    context,
+                    &hit,
+                    &view,
+                    CacheHitKind::StaleUpstreamFailure,
+                    response,
+                ));
+            }
             // Don't invalidate - we still need the stale entry for the client_timeout path.
             // Spawn background refresh proactively.
             if hit.upstream.is_some() {

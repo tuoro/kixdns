@@ -58,7 +58,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | cache_background_refresh | false | 在 TTL 过期前刷新条目。 |
 | cache_refresh_threshold_percent | 10 | 按剩余 TTL 百分比触发刷新；必须小于 100，取 100 时每次缓存命中都会刷新上游。 |
 | cache_refresh_min_ttl | 5 | 参与后台刷新的最小 TTL。 |
-| serve_stale | false | 按 RFC 8767 行为保留并返回过期条目。 |
+| serve_stale | false | 按 RFC 8767 行为保留并返回过期条目。一条过期应答刷新失败以后，30 秒内不再为它刷新，命中它的请求直接拿过期数据，不再等（RFC 8767 第 5 节的失败复查）；30 秒后的头一次命中再试一次。 |
 | serve_stale_ttl | 30 | 过期响应中写入的 TTL。 |
 | serve_stale_expire_ttl | 86400 | 允许返回过期条目的最大时间，单位秒；0 表示不限制过期时间。 |
 | serve_stale_ttl_reset | true | 返回过期数据时重置过期时间窗口。 |
