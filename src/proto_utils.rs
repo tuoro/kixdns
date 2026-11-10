@@ -132,6 +132,19 @@ fn plain_question_end(query: &[u8]) -> Option<usize> {
     (end <= query.len()).then_some(end)
 }
 
+/// DNS 报文头的长度 / The length of a DNS header
+const HEADER_LEN: usize = 12;
+
+/// 查询的第一个问题名读得了：标签、长度合规，压缩指针只往前指、不指进报文头（见 [`strict_name_end`]）。
+/// hickory 不管指针指不指进报文头，所以快速解析读不了、要交给 hickory 的查询先过这一关。
+/// Whether the query's first question name can be read: proper labels and length, and
+/// compression pointers that only point back and not into the header (see
+/// [`strict_name_end`]). hickory does not mind a pointer into the header, so a query the
+/// quick parse cannot read passes this before it goes to hickory.
+pub(crate) fn question_name_readable(packet: &[u8]) -> bool {
+    strict_name_end(packet, HEADER_LEN).is_some()
+}
+
 /// 仅解析 DNS 头部和第一个 Query，用于快速缓存查找 / Parse only DNS header and first query for quick cache lookup
 /// 避免 hickory-proto Message::from_bytes 的全量解析和分配开销 / Avoid full parsing and allocation overhead of hickory-proto Message::from_bytes
 /// buf: 用于存储归一化（小写）域名的缓冲区，建议至少 256 字节 / buf: buffer for storing normalized (lowercase) domain name, recommend at least 256 bytes
@@ -186,7 +199,10 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             // RFC 1035 第 4.1.4 节：指针指向前面出现过的名字，必须指在自己前面（hickory 也拒绝
             // 别的）。指向后面的指针可能落在改写报文时会挪动的字节上，发给上游的名字就不再是
             // 路由时看到的那个。
-            if offset as usize >= current_pos {
+            // 指进报文头（偏移 12 以前）的也不行：那里不会有名字，转发时事务 ID 一换，名字就变了
+            // Nor one pointing into the header (before offset 12): no name starts there, and
+            // once the transaction ID is replaced on the way out the name changes
+            if (offset as usize) < HEADER_LEN || offset as usize >= current_pos {
                 return None;
             }
             current_pos = offset as usize;
@@ -1512,12 +1528,14 @@ fn well_formed_rdata(packet: &[u8], rr_type: u16, rdata: std::ops::Range<usize>)
 
 /// 严格读一个名字，返回它在 `start` 处的编码结束的位置：标签不超过 63 字节，整个名字不超过 255
 /// 字节；压缩指针跳过去以后读到的每个字节都在指针所在那段的开头之前，所以指针只能往前指，不会
-/// 绕圈，也不会读进跳出来的那段（和 hickory 的规则一样）。
+/// 绕圈，也不会读进跳出来的那段（和 hickory 的规则一样）；指针也不能指进报文头（偏移 12 以前），
+/// 那里不会有名字，报文头一改（换事务 ID）名字就跟着变。
 /// Read a name strictly and return where its encoding at `start` ends: labels of at
 /// most 63 bytes and at most 255 bytes in all; everything read after a compression
 /// pointer lies before the start of the part the pointer is in, so a pointer can only
 /// point back, cannot loop, and cannot read into the part it jumped from (hickory's
-/// rule too).
+/// rule too); nor can a pointer point into the header (before offset 12), where no name
+/// starts and where the name would change with the header (a new transaction ID).
 fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
     let (mut pos, mut part_start, mut limit) = (start, start, usize::MAX);
     let (mut end, mut length) = (None, 1usize);
@@ -1537,6 +1555,9 @@ fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
             }
             0xC0..=0xFF => {
                 let target = (len & 0x3F) << 8 | *packet.get(pos + 1)? as usize;
+                if target < HEADER_LEN {
+                    return None;
+                }
                 end.get_or_insert(pos + 2);
                 (pos, limit, part_start) = (target, part_start, target);
             }

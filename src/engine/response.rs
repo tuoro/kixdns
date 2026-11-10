@@ -60,6 +60,15 @@ pub(crate) enum StaticAddresses<'a> {
     Records(&'a [Record]),
 }
 
+/// 问题的类别有没有静态记录可给：静态应答的记录都是 IN 类，所以只给 IN 和 ANY 类的问题，别的类别（CH、HS 等）
+/// 回 NODATA
+/// Whether a question of this class gets static records: a static answer's records are
+/// all of class IN, so only questions of class IN and ANY get them, and other classes (CH,
+/// HS and so on) get NODATA
+pub(crate) fn has_static_records(qclass: DNSClass) -> bool {
+    matches!(qclass, DNSClass::IN | DNSClass::ANY)
+}
+
 /// 把静态应答直接写成字节：报文头，照抄查询的问题段，每条地址一条指回问题名的记录。写出来和
 /// [`build_fast_static_response`] 经 `reply_as_asked` 规整之后的一字不差，只是不必为每个查询解析名字、搭一份报文再编码。
 /// 写不了的交回 None，由 [`build_fast_static_response`] 去写：问题名压缩过、根名（根名的记录不用指针）、名字超长、
@@ -90,6 +99,10 @@ pub(crate) fn write_static_reply(
         return None;
     }
     let question = query.get(QUESTION_AT..name_end + 4)?;
+    let qclass = DNSClass::from(u16::from_be_bytes([
+        question[question.len() - 2],
+        question[question.len() - 1],
+    ]));
     let records = match addresses {
         StaticAddresses::Configured(addresses, _) => addresses.len(),
         StaticAddresses::Records(records) => records.len(),
@@ -113,6 +126,11 @@ pub(crate) fn write_static_reply(
     let mut written = 0u16;
     match addresses {
         StaticAddresses::Configured(addresses, qtype) => {
+            let addresses = if has_static_records(qclass) {
+                addresses
+            } else {
+                &[]
+            };
             for address in addresses {
                 match (qtype, address) {
                     (RecordType::A | RecordType::ANY, IpAddr::V4(address)) => {
@@ -188,6 +206,7 @@ fn is_question_name(name: &Name, mut wire: &[u8]) -> bool {
 pub(crate) fn make_static_ip_answer(
     qname: &str,
     qtype: RecordType,
+    qclass: DNSClass,
     ips: &str,
 ) -> (ResponseCode, Vec<Record>) {
     let Some(name) = crate::proto_utils::name_from_text(qname) else {
@@ -199,6 +218,9 @@ pub(crate) fn make_static_ip_answer(
     let Some(parsed_ips) = static_ips(ips) else {
         return (ResponseCode::ServFail, Vec::new());
     };
+    if !has_static_records(qclass) {
+        return (ResponseCode::NoError, Vec::new());
+    }
 
     let answers = parsed_ips
         .into_iter()
@@ -284,6 +306,7 @@ pub(crate) fn txt_size_problem(text: &[String], name_len: usize) -> Option<Strin
 /// 创建静态 CNAME 记录响应 / Create a static CNAME record response
 pub(crate) fn make_static_cname_answer(
     qname: &str,
+    qclass: DNSClass,
     target: &str,
     ttl: u32,
 ) -> (ResponseCode, Vec<Record>) {
@@ -293,6 +316,9 @@ pub(crate) fn make_static_cname_answer(
     ) else {
         return (ResponseCode::ServFail, Vec::new());
     };
+    if !has_static_records(qclass) {
+        return (ResponseCode::NoError, Vec::new());
+    }
 
     let record = Record::from_rdata(name, ttl, RData::CNAME(CNAME(target)));
     (ResponseCode::NoError, vec![record])
@@ -300,16 +326,24 @@ pub(crate) fn make_static_cname_answer(
 
 /// 创建静态TXT记录响应 / Create static TXT record response
 ///
-/// 装不进这个名字的应答时（见 [`txt_size_problem`]）回 SERVFAIL
-/// SERVFAIL when it does not fit the answer for this name (see [`txt_size_problem`])
+/// 只答 TXT 和 ANY 查询，别的类型回 NODATA，和 [`make_static_ip_answer`] 只给问的地址族一样；装不进这个名字的
+/// 应答时（见 [`txt_size_problem`]）回 SERVFAIL
+/// Answers only TXT and ANY queries, other types getting NODATA, as
+/// [`make_static_ip_answer`] gives only the family asked for; SERVFAIL when it does not fit
+/// the answer for this name (see [`txt_size_problem`])
 pub(crate) fn make_static_txt_answer(
     qname: &str,
+    qtype: RecordType,
+    qclass: DNSClass,
     text: &[String],
     ttl: u32,
 ) -> (ResponseCode, Vec<Record>) {
     let Some(name) = crate::proto_utils::name_from_text(qname) else {
         return (ResponseCode::ServFail, Vec::new());
     };
+    if !matches!(qtype, RecordType::TXT | RecordType::ANY) || !has_static_records(qclass) {
+        return (ResponseCode::NoError, Vec::new());
+    }
     if let Some(problem) = txt_size_problem(text, name_wire_len(&name)) {
         warn!(qname = %qname, %problem, "static TXT answer does not fit a message");
         return (ResponseCode::ServFail, Vec::new());
@@ -393,7 +427,8 @@ mod tests {
 
     #[test]
     fn static_cname_answer_uses_configured_target_and_ttl() {
-        let (rcode, answers) = make_static_cname_answer("alias.example.", "origin.example.", 120);
+        let (rcode, answers) =
+            make_static_cname_answer("alias.example.", DNSClass::IN, "origin.example.", 120);
 
         assert_eq!(rcode, ResponseCode::NoError);
         assert_eq!(answers.len(), 1);
@@ -414,7 +449,7 @@ mod tests {
             ("alias.example.", "invalid name"),
             ("alias.example.", ""),
         ] {
-            let (rcode, answers) = make_static_cname_answer(qname, target, 300);
+            let (rcode, answers) = make_static_cname_answer(qname, DNSClass::IN, target, 300);
             assert_eq!(rcode, ResponseCode::ServFail);
             assert!(answers.is_empty());
         }
