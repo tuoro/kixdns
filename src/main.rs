@@ -1094,13 +1094,6 @@ struct UdpAnswering<'a> {
     /// 这台机器 `QUEUE_TARGET` 内处理得完多少查询，上次读丢包数时量的 / How many queries this machine handles
     /// within `QUEUE_TARGET`, measured when the drops were last read
     queries_within_target: usize,
-    /// 上次读丢包数时一共走完了多少查询（见 `PermitManager::queries_done`）/ How many queries were done in all
-    /// when the drops were last read (see `PermitManager::queries_done`)
-    done_seen: u64,
-    /// 内核忙时在途的查询一共最多多少，上次读丢包数时按走完的速度算的（见 `concurrency::budget_from`）/ How many
-    /// queries may be in flight in all while the kernel is busy, worked out from how fast they were
-    /// done when the drops were last read (see `concurrency::budget_from`)
-    budget: usize,
     /// 这会儿在丢包或者拒绝 / Dropping or refusing just now
     behind: bool,
     /// 丢包持续了够久，就按设备轮流 / Drops have lasted long enough, so devices take turns
@@ -1210,8 +1203,6 @@ impl<'a> UdpAnswering<'a> {
             refused: false,
             taking_turns: false,
             queries_within_target: MIN_QUERIES_IN_RECV_BUFFER,
-            done_seen: engine.permit_manager.queries_done(),
-            budget: kixdns::engine::concurrency::BUDGET_AT_LEAST,
             behind: false,
             overloaded: false,
         }
@@ -1252,15 +1243,12 @@ impl<'a> UdpAnswering<'a> {
             }
         };
         let refusing = std::mem::take(&mut self.refused);
-        let done = self.engine.permit_manager.queries_done();
-        let done_since = done.saturating_sub(std::mem::replace(&mut self.done_seen, done));
         // 这一段积压第一次看：到上一次之间可能空闲过，量不出速度 / The first look of this backlog: it may
         // have been idle since the last, so this measures no speed
         if self.checks_since_empty == BEHIND_AFTER_CHECKS {
             return;
         }
         self.queries_within_target = queries_within_target(took);
-        self.budget = kixdns::engine::concurrency::budget_from(done_since, took);
         if dropping || refusing {
             // 还从没跟不上过，或者已经安静了够久：新的一段 / Never behind yet, or quiet long enough: a new spell
             if self.behind_since > self.behind_at
@@ -1964,11 +1952,9 @@ fn spawn_udp_answer(
     // memory and the budget of what is in flight (see `Engine::turn_query_permit`)
     let client = peer.ip();
     let permit = if answering.taking_turns {
-        answering.engine.turn_query_permit(client, answering.budget)
+        answering.engine.turn_query_permit(client)
     } else {
-        answering
-            .engine
-            .query_permit(answering.emptied_at, client, answering.budget)
+        answering.engine.query_permit(answering.emptied_at, client)
     };
     let Some(permit) = permit else {
         if let Some(pre_parsed) = pre_parsed
@@ -1981,10 +1967,11 @@ fn spawn_udp_answer(
     let engine = Arc::clone(answering.engine);
     let socket = Arc::clone(answering.socket);
     let pending = Arc::clone(answering.pending);
-    // 从排进去到开始跑等了多久：等上游不算在内，算的是内核自己跟不跟得上
+    // 从排进去到开始跑等了多久：等上游不算在内，算的是内核自己跟不跟得上。开了流控时拿 permit 的那一刻就是排进去的时候
     // How long it waits from being queued until it runs: waiting on an upstream is not in
-    // this, so it tells whether the kernel itself keeps up
-    let queued_at = engine.flow_control_state.is_some().then(Instant::now);
+    // this, so it tells whether the kernel itself keeps up. With flow control on, taking the
+    // permit is when it was queued
+    let queued_at = permit.held_since();
     tokio::spawn(async move {
         let _permit = permit; // 自动释放 / Auto-release on drop
         if let (Some(queued_at), Some(flow)) = (queued_at, &engine.flow_control_state) {
@@ -3273,10 +3260,10 @@ mod tests {
         assert_eq!(manager.inflight(), 8, "the one held and all seven");
     }
 
-    /// 轮流时在途到了预算（还没量出走完的速度时是底数），占着自己那一份的设备这个要等上游的查询也拒，发得少的设备照常。
+    /// 轮流时在途到了预算（还没有按时走完的查询时是底数），占着自己那一份的设备这个要等上游的查询也拒，发得少的设备照常。
     /// 轮流挡不住在途：对着不回答的域名洪泛的设备，只看内存的话在途一直涨到内存水位
-    /// While taking turns with the budget in flight (its floor, before how fast queries are done
-    /// has been measured), a device holding its share has this query that waits on an upstream
+    /// While taking turns with the budget in flight (its floor, with no query done in time yet),
+    /// a device holding its share has this query that waits on an upstream
     /// refused too, and a device sending little goes on. Taking turns does not hold what is in
     /// flight: a device flooding names that get no answer would, by memory alone, pile up in
     /// flight until the memory watermark
@@ -3289,7 +3276,7 @@ mod tests {
         let pending = Arc::new(PendingReplies::default());
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
         let manager = &engine.permit_manager;
-        let budget = answering.budget;
+        let budget = manager.budget(Instant::now());
         assert_eq!(budget, kixdns::engine::concurrency::BUDGET_AT_LEAST);
         let _held: Vec<_> = (1..budget)
             .map(|_| manager.acquire_for(manager.slot_of(heavy.ip())))
@@ -3504,10 +3491,11 @@ mod tests {
         );
     }
 
-    /// 轮流时跟不上：排着的不比平均少的设备丢一个，只排了一个的照常答；丢的本身不算还在跟不上，那要看积压
+    /// 轮流时跟不上：排着的不比平均少的设备丢一个，后面排着不到 4 个时照常答，只排了一个的也照常答；丢的本身不算还在跟不上，
+    /// 那要看积压
     /// Falling behind while taking turns: a device with no fewer queued than the average loses
-    /// one and one with a single query is answered; the drop itself is not still falling behind,
-    /// the backlog tells that
+    /// one, answered as usual with fewer than 4 behind, and one with a single query is answered;
+    /// the drop itself is not still falling behind, the backlog tells that
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn falling_behind_drops_only_from_a_device_queueing_its_share() {
@@ -3520,12 +3508,12 @@ mod tests {
         let peer = |last: u8| udp_batch::Peer::of(SocketAddr::from(([192, 0, 2, last], 53000)));
         let device = |last: u8| Device::of([192, 0, 2, last].into());
 
-        // 三个查询排在第一台，再找一台和它不落在一起的；落在一起的算第一台的
-        // Three queries for the first device, then one that does not land with it; any that
+        // 八个查询排在第一台，再找一台和它不落在一起的；落在一起的算第一台的
+        // Eight queries for the first device, then one that does not land with it; any that
         // does counts as the first's
-        let mut heavy = 3;
+        let mut heavy = 8;
         let fill = |turns: &mut TakingTurns, heavy: &mut u64| {
-            for _ in 0..3 {
+            for _ in 0..8 {
                 turns.queue.offer(&packet, device(1), peer(1));
             }
             let light = (2..=255)
@@ -3547,7 +3535,7 @@ mod tests {
         assert_eq!(replies.len() as u64, heavy + 1);
         replies.clear();
 
-        let mut heavy = 3;
+        let mut heavy = 8;
         let light_again = fill(&mut turns, &mut heavy);
         assert_eq!(light_again, light, "the same hash");
         engine
@@ -3557,11 +3545,12 @@ mod tests {
             .note_queue_delay(Duration::from_secs(3600));
         answering.behind_at = Instant::now() - Duration::from_secs(5);
         turns.answer_in_turn(&mut answering, &mut replies);
-        assert_eq!(engine.permit_manager.dropped_requests(), heavy - 1);
+        let share = kixdns::engine::concurrency::SHARE_AT_LEAST as u64;
+        assert_eq!(engine.permit_manager.dropped_requests(), heavy - share);
         assert_eq!(
-            replies.len(),
-            2,
-            "the light device, and the last of the other"
+            replies.len() as u64,
+            share + 1,
+            "the light device, and the last four of the other"
         );
         assert_eq!(replies.get(0).unwrap().1, peer(light).addr());
         assert!(
@@ -3581,7 +3570,7 @@ mod tests {
         let engine = static_engine_with_flow_control();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        for _ in 0..5 {
+        for _ in 0..7 {
             client
                 .send_to(b"query", socket.local_addr().unwrap())
                 .await
@@ -3591,8 +3580,9 @@ mod tests {
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
         let mut received = udp_batch::Received::default();
         let got = received.recv(socket.as_raw_fd()).unwrap();
-        assert_eq!(got, 5);
+        assert_eq!(got, 7);
 
+        // 份额至少 4 个，排进 4 个丢 3 个 / A share of at least 4, so 4 get in and 3 are dropped
         let mut turns = TakingTurns::new(2, QUERIES_IN_RECV_BUFFER);
         answering.behind_at = Instant::now() - Duration::from_secs(5);
         turns.queue_received(&received, got, &mut answering);
@@ -3810,7 +3800,7 @@ mod tests {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let pending = Arc::new(PendingReplies::default());
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
-        answering.queries_within_target = 2;
+        answering.queries_within_target = 6;
         let sock = socket2::SockRef::from(socket.as_ref());
         sock.set_recv_buffer_size(100_000).unwrap();
         let mut turns = answering.begin_turns();
@@ -3820,57 +3810,50 @@ mod tests {
         assert!(holds < QUERIES_IN_RECV_BUFFER);
         let device = Device::of([192, 0, 2, 1].into());
         let peer = udp_batch::Peer::of(SocketAddr::from(([192, 0, 2, 1], 53000)));
-        assert!(turns.queue.offer(b"q", device, peer));
-        assert!(turns.queue.offer(b"q", device, peer));
+        for _ in 0..6 {
+            assert!(turns.queue.offer(b"q", device, peer));
+        }
         assert!(!turns.queue.offer(b"q", device, peer));
 
         // 量到的速度变了，下一轮跟着变 / The measured speed changing, the next turn follows
-        answering.queries_within_target = 3;
+        answering.queries_within_target = 9;
         let mut replies = udp_batch::Replies::default();
         turns.answer_in_turn(&mut answering, &mut replies);
-        for _ in 0..3 {
+        for _ in 0..9 {
             assert!(turns.queue.offer(b"q", device, peer));
         }
         assert!(!turns.queue.offer(b"q", device, peer));
     }
 
-    /// 内核忙时的预算跟着走完的速度：一秒走完 5000 个，预算就是 5000；一段积压头一次看量不出速度，不动它；这段时间什么都
-    /// 没走完，回到底数
-    /// The budget while busy follows how fast queries are done: 5000 done in a second makes it
-    /// 5000; the first look of a backlog measures nothing and leaves it; with none done meanwhile
-    /// it is back at its floor
+    /// 内核忙时在途到了预算（还没有按时走完的查询时是底数），占着自己那一份的设备的查询被拒，发得少的设备照常去问上游
+    /// Busy with the budget in flight (its floor, with no query done in time yet), the device
+    /// holding its share has its query refused, and a device sending little goes upstream as usual
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn the_budget_follows_how_fast_queries_are_done() {
-        use kixdns::engine::concurrency::BUDGET_AT_LEAST;
-        let engine = static_engine_with_flow_control();
+    async fn busy_in_flight_is_held_to_the_budget() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
+        let (engine, heavy, light) = engine_with_two_devices(upstream);
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let pending = Arc::new(PendingReplies::default());
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
-        assert_eq!(answering.budget, BUDGET_AT_LEAST);
+        answering.emptied_at = Instant::now() - Duration::from_secs(1);
         let manager = &engine.permit_manager;
-        let slot = manager.slot_of([192, 0, 2, 1].into());
-        let finish = |count: usize| {
-            for _ in 0..count {
-                drop(manager.acquire_for(slot));
-            }
-        };
-        let look = |answering: &mut UdpAnswering<'_>, checks: u32| {
-            answering.checks_since_empty = checks - 1;
-            answering.looked_at = Instant::now() - Duration::from_secs(1);
-            answering.shrink_buffer_if_overflowing();
-        };
-        finish(5000);
-        look(&mut answering, BEHIND_AFTER_CHECKS);
-        assert_eq!(answering.budget, BUDGET_AT_LEAST, "the first look");
-        finish(5000);
-        look(&mut answering, 2 * BEHIND_AFTER_CHECKS);
+        let budget = manager.budget(Instant::now());
+        assert_eq!(budget, kixdns::engine::concurrency::BUDGET_AT_LEAST);
+        let _held: Vec<_> = (0..budget)
+            .map(|_| manager.acquire_for(manager.slot_of(heavy.ip())))
+            .collect();
+        let packet = |id: u16| Bytes::from(query(&format!("q{id}.busy.test"), id));
         assert!(
-            (4900..=5000).contains(&answering.budget),
-            "{}",
-            answering.budget
+            !spawn_udp_answer(&answering, packet(1), heavy, None),
+            "the device holding the budget"
         );
-        look(&mut answering, 3 * BEHIND_AFTER_CHECKS);
-        assert_eq!(answering.budget, BUDGET_AT_LEAST, "none done since");
+        assert!(
+            spawn_udp_answer(&answering, packet(2), light, None),
+            "a device sending little"
+        );
+        assert_eq!(manager.dropped_requests(), 1);
+        assert_eq!(manager.inflight(), budget + 1);
     }
 
     /// 读的时候量一个查询在接收缓冲里实际记多少，放得下的按量到的算；只往少里改

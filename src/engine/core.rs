@@ -215,6 +215,9 @@ impl Engine {
         );
 
         let permit_manager = Arc::new(PermitManager::new());
+        permit_manager.set_upstream_timeout(std::time::Duration::from_millis(
+            settings.upstream_timeout_ms,
+        ));
         let flow_control_state = settings.flow_control_enabled.then(|| {
             Arc::new(FlowControlState::new(
                 super::memory_watermark::MemoryWatermark::of_this_machine(),
