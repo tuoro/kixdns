@@ -1055,7 +1055,9 @@ struct UdpAnswering<'a> {
     looked_at: Instant,
     /// 上次见到跟不上的时刻：丢包或者拒绝 / When falling behind was last seen: drops or refusals
     behind_at: Instant,
-    /// 这一段跟不上从什么时候开始 / When this spell of falling behind began
+    /// 这一段跟不上从什么时候开始。只有还从没跟不上过时它晚于 `behind_at`（见 `UdpAnswering::new`）
+    /// When this spell of falling behind began. It is later than `behind_at` only while nothing
+    /// has fallen behind yet (see `UdpAnswering::new`)
     behind_since: Instant,
     /// 上次看过以后，这个 worker 读到的查询有没有被流控拒绝。只算自己的：别的 worker、TCP 和 DoH 被拒，
     /// 轮流时排不下丢的，都不是这个 socket 跟不上
@@ -1073,6 +1075,10 @@ struct UdpAnswering<'a> {
     behind: bool,
     /// 丢包持续了够久，就按设备轮流 / Drops have lasted long enough, so devices take turns
     overloaded: bool,
+    /// 轮流时正在答的这个查询，它的设备后面还排没排着别的（见 `Engine::turn_query_permit`）
+    /// While taking turns, whether the device of the query being answered has more queued behind
+    /// it (see `Engine::turn_query_permit`)
+    more_queued: bool,
 }
 
 /// 每 100 个查询看一次接收缓冲，看到这么多次的整数倍、socket 还没收空就读一次丢包数，平时不多这一次系统调用
@@ -1125,6 +1131,15 @@ const CAUGHT_UP_AFTER: Duration = Duration::from_secs(1);
 /// is soon handled, and nobody should lose queries over it
 const BEHIND_BEFORE_TURNS: Duration = Duration::from_secs(1);
 
+/// 跟上以后这么久之内又跟不上，算同一阵过载的继续：一阵开头已经过了 `BEHIND_BEFORE_TURNS`，马上轮流。一阵阵、每阵不到一秒的
+/// 洪泛中间停一两秒，每次都从头计时的话，一阵还没够一秒就停了，轮流一次都不会开始，每阵里别的设备都答不上
+/// Falling behind again within this long of catching up continues the same spell of overload: the
+/// spell began `BEHIND_BEFORE_TURNS` ago or more, so turns begin at once. A flood coming in waves
+/// of under a second with a second or two between them would otherwise start over each time, each
+/// wave ending before it lasted a second, so turns would never begin and other devices would go
+/// unanswered through every wave
+const QUIET_BEFORE_A_NEW_SPELL: Duration = Duration::from_secs(60);
+
 /// 这台机器 `QUEUE_TARGET` 内处理得完多少查询，`took` 是处理 `BEHIND_AFTER_CHECKS` 次看缓冲之间那些查询用的时间
 /// How many queries this machine handles within `QUEUE_TARGET`, `took` being how long the queries
 /// between `BEHIND_AFTER_CHECKS` looks took
@@ -1170,6 +1185,7 @@ impl<'a> UdpAnswering<'a> {
             queries_within_target: MIN_QUERIES_IN_RECV_BUFFER,
             behind: false,
             overloaded: false,
+            more_queued: false,
         }
     }
 
@@ -1201,7 +1217,10 @@ impl<'a> UdpAnswering<'a> {
         }
         self.queries_within_target = queries_within_target(took);
         if dropping || refusing {
-            if now.duration_since(self.behind_at) >= CAUGHT_UP_AFTER {
+            // 还从没跟不上过，或者已经安静了够久：新的一段 / Never behind yet, or quiet long enough: a new spell
+            if self.behind_since > self.behind_at
+                || now.duration_since(self.behind_at) >= QUIET_BEFORE_A_NEW_SPELL
+            {
                 self.behind_since = now;
             }
             self.behind_at = now;
@@ -1585,7 +1604,10 @@ impl TakingTurns {
                 manager.count_refused();
                 continue;
             }
-            if answering.answer(&packet, peer.addr(), replies.next_buf()) {
+            answering.more_queued = more_queued;
+            let answered = answering.answer(&packet, peer.addr(), replies.next_buf());
+            answering.more_queued = false;
+            if answered {
                 replies.push(peer);
             }
         }
@@ -1701,11 +1723,15 @@ fn spawn_udp_answer(
     peer: SocketAddr,
     pre_parsed: Option<PreParsedData>,
 ) -> bool {
-    // 轮流时内核跟不上已经丢过了，轮到这里的都该答，只看内存 / Taking turns, falling behind has already
-    // dropped what it should, and what gets here is to be answered by memory alone
+    // 轮流时内核跟不上已经丢过了；轮到这里的看内存，后面还排着别的设备再比一次份额（见 `Engine::turn_query_permit`）
+    // Taking turns, falling behind has already dropped what it should; what gets here goes by
+    // memory, and a device with more queued is compared with the average once more (see
+    // `Engine::turn_query_permit`)
     let client = peer.ip();
     let permit = if answering.taking_turns {
-        answering.engine.stream_query_permit(client)
+        answering
+            .engine
+            .turn_query_permit(client, answering.more_queued)
     } else {
         answering.engine.query_permit(answering.emptied_at, client)
     };
@@ -2931,6 +2957,107 @@ mod tests {
         assert_eq!(size(), full);
     }
 
+    /// 一阵阵的洪泛：跟上以后一分钟之内又跟不上，算同一阵的继续，第二阵一来就轮流。以前停一秒就从头计时，每阵不到一秒、
+    /// 中间停一秒多的洪泛永远开始不了轮流，每阵里别的设备都答不上
+    /// A flood in waves: falling behind again within a minute of catching up continues the
+    /// same spell, so turns begin as the second wave comes. A pause of a second used to start
+    /// the count over, so waves of under a second with pauses of a little over one never began
+    /// turns, and other devices went unanswered through every wave
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn waves_of_falling_behind_close_together_are_one_spell() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pending = Arc::new(PendingReplies::default());
+        let engine = static_engine_with_flow_control();
+        let mut answering = UdpAnswering::new(&socket, &engine, &pending);
+        let drops = kixdns::socket_utils::udp_receive_drops(&socket).unwrap();
+        let dropping = |answering: &mut UdpAnswering<'_>| {
+            answering.drops_seen = Some(drops.wrapping_add(1));
+            answering.checks_since_empty = 2 * BEHIND_AFTER_CHECKS - 1;
+            answering.shrink_buffer_if_overflowing();
+        };
+        let back = |at: Instant, by: Duration| at.checked_sub(by).expect("the clock is far enough");
+
+        // 运行了一阵才头一回跟不上，照样是新的一段 / Falling behind for the first time after running a
+        // while is a new spell all the same
+        answering.behind_since = back(answering.behind_since, Duration::from_secs(5));
+        answering.behind_at = back(answering.behind_at, Duration::from_secs(5));
+        // 第一阵：0.9 秒，然后停 1.1 秒 / The first wave: 0.9 s, then 1.1 s of quiet
+        dropping(&mut answering);
+        assert!(!answering.overloaded, "the first wave just began");
+        answering.behind_since = back(answering.behind_since, Duration::from_millis(2_000));
+        answering.behind_at = back(answering.behind_at, Duration::from_millis(1_100));
+        answering.socket_ran_empty();
+
+        dropping(&mut answering);
+        assert!(answering.overloaded, "the second wave takes turns at once");
+
+        // 停够一分钟以后的一阵是新的一阵 / A wave after a minute's quiet is a new spell
+        answering.overloaded = false;
+        answering.behind_since = back(
+            Instant::now(),
+            QUIET_BEFORE_A_NEW_SPELL + Duration::from_secs(10),
+        );
+        answering.behind_at = back(
+            Instant::now(),
+            QUIET_BEFORE_A_NEW_SPELL + Duration::from_secs(1),
+        );
+        answering.socket_ran_empty();
+        dropping(&mut answering);
+        assert!(!answering.overloaded, "a new spell");
+        assert!(answering.behind_since.elapsed() < BEHIND_BEFORE_TURNS);
+    }
+
+    /// 轮流时，后面还排着别的、在途又不比平均少的设备，这个要等上游的查询也拒；排到最后一个的照常，发得少的设备照常。
+    /// 以前轮流时只看内存，对着不回答的域名洪泛的设备在途一直涨到内存水位
+    /// While taking turns, a device with more queued behind it and no less in flight than the
+    /// average has this query that waits on an upstream refused too; its last one queued goes on,
+    /// and so does a device sending little. Taking turns used to go by memory alone, so a device
+    /// flooding names that get no answer piled up in flight until the memory watermark
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn while_taking_turns_a_device_with_more_queued_is_held_to_its_share() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(300)).await;
+        let engine = Arc::new(engine_forwarding_to(
+            upstream,
+            serde_json::json!({ "flow_control_enabled": true }),
+        ));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let pending = Arc::new(PendingReplies::default());
+        let mut answering = UdpAnswering::new(&socket, &engine, &pending);
+        let manager = &engine.permit_manager;
+        let heavy = SocketAddr::from(([127, 0, 0, 4], 53000));
+        let light = (2..=250)
+            .map(|n| SocketAddr::from(([127, 0, 0, n], 53000)))
+            .find(|peer| manager.slot_of(peer.ip()) != manager.slot_of(heavy.ip()))
+            .unwrap();
+        let _held = manager.acquire_for(manager.slot_of(heavy.ip()));
+
+        let mut turns = answering.begin_turns();
+        let offer = |turns: &mut TakingTurns, peer: SocketAddr, id: u16| {
+            let packet = query(&format!("q{id}.turn.test"), id);
+            turns
+                .queue
+                .offer(&packet, Device::of(peer.ip()), udp_batch::Peer::of(peer));
+        };
+        offer(&mut turns, heavy, 1);
+        offer(&mut turns, heavy, 2);
+        offer(&mut turns, heavy, 3);
+        offer(&mut turns, light, 4);
+        let mut replies = udp_batch::Replies::default();
+        turns.answer_in_turn(&mut answering, &mut replies);
+        assert_eq!(
+            manager.dropped_requests(),
+            2,
+            "the heavy device's two with more queued"
+        );
+        assert_eq!(
+            manager.inflight(),
+            3,
+            "the one held, its last and the light one"
+        );
+    }
+
     /// 收小以后放得下的正好是这台机器 20 ms 处理得完的查询，机器越慢缓冲越小
     /// Once shrunk it holds just what this machine handles in 20 ms, so the slower the machine the smaller the buffer
     #[test]
@@ -3009,7 +3136,14 @@ mod tests {
         assert!(answering.overloaded);
         look(&mut answering, Instant::now(), Instant::now(), dropping);
         assert!(!answering.overloaded, "not for long enough");
+        // 停了几秒又跟不上，还是同一阵；停够一分钟才算新的一阵 / Behind again after a few seconds'
+        // pause is the same spell; only a minute's quiet makes a new one
         look(&mut answering, long_ago(), long_ago(), dropping);
+        assert!(answering.overloaded, "the same spell, a few seconds on");
+        let quiet = Instant::now()
+            .checked_sub(QUIET_BEFORE_A_NEW_SPELL + Duration::from_secs(1))
+            .expect("the clock is far enough from its start");
+        look(&mut answering, long_ago(), quiet, dropping);
         assert!(!answering.overloaded, "a new spell begins");
         assert!(answering.behind_since.elapsed() < BEHIND_BEFORE_TURNS);
         assert!(answering.behind_at.elapsed() < CAUGHT_UP_AFTER);
