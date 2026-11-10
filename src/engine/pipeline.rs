@@ -470,13 +470,18 @@ impl Engine {
                             return Some(d);
                         }
                         Action::StaticIpResponse { ip } => {
-                            let (rcode, answers) = make_static_ip_answer(qname, request.qtype, ip);
+                            let (rcode, answers) =
+                                make_static_ip_answer(qname, request.qtype, request.qclass, ip);
                             let d = Decision::Static { rcode, answers };
                             return Some(d);
                         }
                         Action::StaticCnameResponse { target, ttl } => {
-                            let (rcode, answers) =
-                                make_static_cname_answer(qname, target, ttl.unwrap_or(300));
+                            let (rcode, answers) = make_static_cname_answer(
+                                qname,
+                                request.qclass,
+                                target,
+                                ttl.unwrap_or(300),
+                            );
                             let d = Decision::Static { rcode, answers };
                             return Some(d);
                         }
@@ -540,8 +545,13 @@ impl Engine {
                             // 和响应阶段一样：装不进一条记录的文本回 SERVFAIL
                             // As in the response phase: text that does not fit a record is
                             // answered SERVFAIL
-                            let (rcode, answers) =
-                                make_static_txt_answer(qname, text, ttl.unwrap_or(300));
+                            let (rcode, answers) = make_static_txt_answer(
+                                qname,
+                                request.qtype,
+                                request.qclass,
+                                text,
+                                ttl.unwrap_or(300),
+                            );
                             return Some(Decision::Static { rcode, answers });
                         }
                         Action::ReplaceTxtResponse { .. } => {
