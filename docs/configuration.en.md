@@ -62,7 +62,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | serve_stale_ttl | 30 | TTL written into a stale response. |
 | serve_stale_expire_ttl | 86400 | Maximum stale age in seconds; 0 means no stale-age limit. |
 | serve_stale_ttl_reset | true | Reset the stale-age window when stale data is served. |
-| serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for up to this many milliseconds first, bounded by what is left of request_timeout_ms so the stale answer still goes out in time. |
+| serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for up to this many milliseconds first, bounded by what is left of request_timeout_ms so the stale answer still goes out in time. When that refresh fails, the stale answer goes out at once instead of after the full wait. |
 | geoip_db_path | null | MaxMind MMDB path. |
 | geoip_dat_path | null | V2Ray GeoIP data path: either a protobuf `.dat` file or the compatible JSON format described below. |
 | geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. |
