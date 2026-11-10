@@ -43,6 +43,8 @@ mod question_pointer_tests;
 pub mod refresh;
 #[cfg(test)]
 mod refresh_class_tests;
+#[cfg(test)]
+mod reply_flags_tests;
 pub mod response;
 pub(crate) mod response_log;
 #[cfg(test)]

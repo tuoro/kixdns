@@ -279,6 +279,8 @@ DoQ uses port 853 when no port is supplied. Its optional query parameters are sn
 
 An upstream answer is taken only when it answers this query's question (the name ignoring case, the same type and class). Over UDP, TCP and DoT an answer that does not match is dropped and the query keeps waiting for the real one; over DoH and DoQ a query gets a single answer, so a mismatch fails that upstream. An error answer with no question section and no records at all, which is how some upstreams send FORMERR or NOTIMP, is still taken.
 
+Queries sent upstream always carry the AD bit (RFC 6840 section 5.7), so a validating upstream's answer always carries its verdict; for a client whose query had neither AD nor DO the answer loses AD (section 5.8), so the AD a client sees does not depend on who filled the cache. A TSIG-signed query is sent as it is. An answer handed on always loses its AA bit: KixDNS is not the authority for that data, less so for what comes from its cache.
+
 When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fallback is enabled by default and can be disabled with settings.enable_tcp_fallback. The fallback is applied by the forwarding path; it is not an additional listener.
 
 ## Configuration examples

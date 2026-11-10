@@ -539,27 +539,74 @@ pub(crate) fn reply_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     if walk.last_is_tsig {
         return reply;
     }
+    // 查询的 OPT 只找一次：它的 DO 位既决定应答留不留 AD，也决定应答的 OPT
+    // The query's OPT is looked for once: its DO bit decides both whether the reply keeps
+    // AD and the reply's OPT
+    let asked_dnssec_ok = asked_dnssec_ok(query);
     edns_as_asked_with(
-        header_as_asked(question_as_asked(reply, query), query),
-        query,
+        header_as_asked(question_as_asked(reply, query), query, asked_dnssec_ok),
+        asked_dnssec_ok,
         walk.opt,
     )
 }
 
-/// 应答的 RD 位（RFC 1035 第 4.1.1 节）和 CD 位（RFC 4035 第 3.2.2 节）照抄查询的
+/// 查询的 DO 位：有 OPT 时是 Some，没有 OPT 时是 None，读不出来时是 Err
+/// The query's DO bit: Some with an OPT, None without one, Err when it cannot be read
+fn asked_dnssec_ok(query: &[u8]) -> Result<Option<bool>, ()> {
+    find_opt(query).map(|opt| opt.map(|opt| opt.dnssec_ok(query)))
+}
+
+/// 应答的 RD 位（RFC 1035 第 4.1.1 节）和 CD 位（RFC 4035 第 3.2.2 节）照抄查询的。查询既没带 AD
+/// 也没带 DO 时应答不带 AD（RFC 6840 第 5.8 节）：转发时 AD 一律是带着的（见 [`query_asking_ad`]），
+/// 所以缓存里的应答带着上游验证的结论，交给每个客户端时再按它自己问的样子去掉
 /// The reply with the query's RD bit (RFC 1035 section 4.1.1) and CD bit (RFC 4035
-/// section 3.2.2)
-fn header_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+/// section 3.2.2). When the query has neither AD nor DO the reply carries no AD (RFC 6840
+/// section 5.8): forwards always ask with AD (see [`query_asking_ad`]), so a cached reply
+/// carries what the upstream validated, and each client has it taken off as it asked
+fn header_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bool>, ()>) -> Bytes {
     if reply.len() < 12 || query.len() < 12 {
         return reply;
     }
     let (rd, cd) = (query[2] & 0x01, query[3] & 0x10);
-    if reply[2] & 0x01 == rd && reply[3] & 0x10 == cd {
+    let keeps_ad = query[3] & 0x20 != 0 || asked_dnssec_ok == Ok(Some(true));
+    let ad = if keeps_ad { reply[3] & 0x20 } else { 0 };
+    if reply[2] & 0x01 == rd && reply[3] & 0x10 == cd && reply[3] & 0x20 == ad {
         return reply;
     }
     let mut copy = BytesMut::from(&reply[..]);
     copy[2] = (copy[2] & !0x01) | rd;
-    copy[3] = (copy[3] & !0x10) | cd;
+    copy[3] = (copy[3] & !0x30) | cd | ad;
+    copy.freeze()
+}
+
+/// 发给上游的查询带上 AD 位（RFC 6840 第 5.7 节：带 AD 表示听得懂应答里的 AD），验证型上游给的应答就带着
+/// 它验证的结论，不论客户端问时带没带 AD。缓存和合并因此不必按 AD 分开，客户端拿到的 AD 也不再取决于谁先把
+/// 缓存填上（见 [`header_as_asked`]）。签过名的查询不改，改了签名就失效
+/// A query sent upstream with the AD bit set (RFC 6840 section 5.7: AD says the asker
+/// understands AD in the reply), so a validating upstream's reply carries its verdict
+/// whether or not the client asked with AD. The cache and merged requests then need not be
+/// kept apart by AD, and the AD a client gets no longer depends on who filled the cache
+/// (see [`header_as_asked`]). A signed query is left alone: a change would break its signature
+pub(crate) fn query_asking_ad(query: std::borrow::Cow<'_, [u8]>) -> std::borrow::Cow<'_, [u8]> {
+    if query.len() < 12 || query[3] & 0x20 != 0 || last_record_is_tsig(&query) {
+        return query;
+    }
+    let mut asking = query.into_owned();
+    asking[3] |= 0x20;
+    std::borrow::Cow::Owned(asking)
+}
+
+/// 上游应答去掉 AA 位：AA 说的是作答的服务器是权威（RFC 1035 第 4.1.1 节），KixDNS 转交别人的数据，
+/// 从缓存里取出的更不是。签过名的应答不改
+/// An upstream reply without its AA bit: AA says the responding server is an authority
+/// (RFC 1035 section 4.1.1), and KixDNS hands on others' data, less so from its cache. A
+/// signed reply is left alone
+pub(crate) fn reply_without_aa(reply: Bytes) -> Bytes {
+    if reply.len() < 12 || reply[2] & 0x04 == 0 || last_record_is_tsig(&reply) {
+        return reply;
+    }
+    let mut copy = BytesMut::from(&reply[..]);
+    copy[2] &= !0x04;
     copy.freeze()
 }
 
@@ -574,16 +621,19 @@ fn header_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
 #[cfg(test)]
 fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     let opt = find_opt(&reply);
-    edns_as_asked_with(reply, query, opt)
+    edns_as_asked_with(reply, asked_dnssec_ok(query), opt)
 }
 
-/// [`edns_as_asked`]，应答的 OPT（[`find_opt`] 的结论）已经找过 / [`edns_as_asked`] with the
-/// reply's OPT (what [`find_opt`] concludes) already looked for
-fn edns_as_asked_with(reply: Bytes, query: &[u8], opt: Result<Option<OptRecord>, ()>) -> Bytes {
-    let asked_dnssec_ok = match find_opt(query) {
-        Ok(Some(opt)) => Some(opt.dnssec_ok(query)),
-        Ok(None) => None,
-        Err(()) => return reply,
+/// [`edns_as_asked`]，应答的 OPT（[`find_opt`] 的结论）和查询的 DO 位（[`asked_dnssec_ok`]）都已经
+/// 找过 / [`edns_as_asked`] with the reply's OPT (what [`find_opt`] concludes) and the query's
+/// DO bit (see [`asked_dnssec_ok`]) already looked for
+fn edns_as_asked_with(
+    reply: Bytes,
+    asked_dnssec_ok: Result<Option<bool>, ()>,
+    opt: Result<Option<OptRecord>, ()>,
+) -> Bytes {
+    let Ok(asked_dnssec_ok) = asked_dnssec_ok else {
+        return reply;
     };
     let Ok(opt) = opt else {
         return reply;
@@ -2760,7 +2810,7 @@ mod tests {
             // AA and AD in the query are not copied / 查询里的 AA 和 AD 不照抄
             query[2] = byte2 | 0x04;
             query[3] = byte3 | 0x20;
-            let out = header_as_asked(reply.clone(), &query);
+            let out = header_as_asked(reply.clone(), &query, asked_dnssec_ok(&query));
             assert_eq!(out[2] & 0x01, byte2);
             assert_eq!(out[3] & 0x10, byte3);
             assert_eq!(out[2] & !0x01, reply[2] & !0x01);
@@ -2771,6 +2821,83 @@ mod tests {
                 (byte2, byte3) == (reply[2] & 0x01, reply[3] & 0x10)
             );
         }
+    }
+
+    /// 应答的 AD 只在查询带 AD 或 DO 时留着（照上游给的），两样都没带时去掉（RFC 6840 第 5.8 节）
+    /// A reply keeps its AD (as the upstream gave it) only for a query with AD or DO, and
+    /// loses it for a query with neither (RFC 6840 section 5.8)
+    #[test]
+    fn header_as_asked_keeps_ad_only_for_a_query_with_ad_or_do() {
+        use hickory_proto::op::MessageType::{Query, Response};
+        for reply_ad in [false, true] {
+            let mut reply = edns_message(Response, None);
+            if reply_ad {
+                reply[3] |= 0x20;
+            }
+            let reply = Bytes::from(reply);
+            for (query_ad, query_do, keeps) in [
+                (false, None, false),
+                (false, Some(false), false),
+                (true, None, true),
+                (false, Some(true), true),
+                (true, Some(true), true),
+            ] {
+                let mut query = edns_message(Query, query_do);
+                query[3] = if query_ad {
+                    query[3] | 0x20
+                } else {
+                    query[3] & !0x20
+                };
+                let out = header_as_asked(reply.clone(), &query, asked_dnssec_ok(&query));
+                assert_eq!(
+                    out[3] & 0x20 != 0,
+                    keeps && reply_ad,
+                    "reply AD {reply_ad}, query AD {query_ad} DO {query_do:?}"
+                );
+            }
+        }
+    }
+
+    /// 发给上游的查询带上 AD；已经带着的原样不复制；签过名的不改
+    /// A query sent upstream gets AD; one that has it is handed back uncopied; a signed one is
+    /// left alone
+    #[test]
+    fn query_asking_ad_sets_ad_except_on_a_signed_query() {
+        use hickory_proto::op::MessageType::Query;
+        let plain = edns_message(Query, None);
+        assert_eq!(plain[3] & 0x20, 0);
+        let asking = query_asking_ad(std::borrow::Cow::Borrowed(&plain));
+        assert_eq!(asking[3] & 0x20, 0x20);
+        assert_eq!(asking[..3], plain[..3]);
+        assert_eq!(asking[3] & !0x20, plain[3]);
+        assert_eq!(asking[4..], plain[4..]);
+        assert!(matches!(
+            query_asking_ad(std::borrow::Cow::Borrowed(&asking)),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let signed_query = signed(edns_message(Query, None));
+        assert_eq!(
+            query_asking_ad(std::borrow::Cow::Borrowed(&signed_query)).as_ref(),
+            &signed_query[..]
+        );
+    }
+
+    /// 上游应答的 AA 去掉，其余不动；没有 AA 时原样不复制；签过名的不改
+    /// An upstream reply loses its AA and nothing else; without AA it is handed back
+    /// uncopied; a signed one is left alone
+    #[test]
+    fn reply_without_aa_clears_only_aa() {
+        use hickory_proto::op::MessageType::Response;
+        let mut authoritative = edns_message(Response, None);
+        authoritative[2] |= 0x04;
+        let out = reply_without_aa(Bytes::from(authoritative.clone()));
+        assert_eq!(out[2], authoritative[2] & !0x04);
+        assert_eq!(out[..2], authoritative[..2]);
+        assert_eq!(out[3..], authoritative[3..]);
+        let plain = Bytes::from(edns_message(Response, None));
+        assert_eq!(reply_without_aa(plain.clone()).as_ptr(), plain.as_ptr());
+        let signed_reply = signed(authoritative);
+        assert_eq!(reply_without_aa(signed_reply.clone()), signed_reply);
     }
 
     /// 最高位为 1 的 TTL 按 0 算：快速解析的最小、最大 TTL，否定应答的 SOA（TTL 和 MINIMUM），以及
@@ -3836,7 +3963,11 @@ mod one_walk_tests {
                     reply.clone()
                 } else {
                     edns_as_asked(
-                        header_as_asked(question_as_asked(reply.clone(), query), query),
+                        header_as_asked(
+                            question_as_asked(reply.clone(), query),
+                            query,
+                            asked_dnssec_ok(query),
+                        ),
                         query,
                     )
                 };
