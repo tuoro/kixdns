@@ -465,34 +465,12 @@ pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<A
 fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl Hasher) {
     let GlobalSettings {
         min_ttl,
-        bind_udp,
-        bind_tcp,
-        bind_doh,
-        doh_tls_cert,
-        doh_tls_key,
-        doh_path,
-        cache_capacity,
-        cache_max_ttl,
-        dashmap_shards,
         default_upstream,
         default_upstream_pre_split: _,
         default_upstream_shared: _,
         upstream_timeout_ms,
         request_timeout_ms,
         response_jump_limit,
-        udp_pool_size,
-        tcp_pool_size,
-        doh_pool_size,
-        doh_health_check_error_threshold,
-        dot_pool_size,
-        doq_pool_size,
-        tcp_health_check_error_threshold,
-        tcp_connection_max_age_seconds,
-        tcp_connection_idle_timeout_seconds,
-        doq_connection_idle_timeout_seconds,
-        doq_keepalive_interval_ms,
-        doq_enable_0rtt,
-        flow_control_enabled,
         serve_stale,
         serve_stale_ttl,
         serve_stale_expire_ttl,
@@ -507,6 +485,31 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         geoip_filter_countries,
         geosite_data_paths,
         enable_tcp_fallback,
+        // 只在启动时读（见 `GlobalSettings::restart_pending`）：重载改了也不生效，应答不变，不让缓存换代
+        // Read at startup only (see `GlobalSettings::restart_pending`): a reload changing them
+        // applies nothing and the answers stay the same, so they leave the caches alone
+        bind_udp: _,
+        bind_tcp: _,
+        bind_doh: _,
+        doh_tls_cert: _,
+        doh_tls_key: _,
+        doh_path: _,
+        cache_capacity: _,
+        cache_max_ttl: _,
+        dashmap_shards: _,
+        udp_pool_size: _,
+        tcp_pool_size: _,
+        doh_pool_size: _,
+        doh_health_check_error_threshold: _,
+        dot_pool_size: _,
+        doq_pool_size: _,
+        tcp_health_check_error_threshold: _,
+        tcp_connection_max_age_seconds: _,
+        tcp_connection_idle_timeout_seconds: _,
+        doq_connection_idle_timeout_seconds: _,
+        doq_keepalive_interval_ms: _,
+        doq_enable_0rtt: _,
+        flow_control_enabled: _,
         // No longer have any effect (see `GlobalSettings`), so they leave the caches alone
         // 已不起作用（见 `GlobalSettings`），不让缓存换代
         statistics_enabled: _,
@@ -520,38 +523,10 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
 
     (
         min_ttl,
-        bind_udp,
-        bind_tcp,
-        bind_doh,
-        doh_tls_cert,
-        doh_tls_key,
-        doh_path,
-        cache_capacity,
-        cache_max_ttl,
-        dashmap_shards,
         default_upstream,
-    )
-        .hash(hasher);
-    (
         upstream_timeout_ms,
         request_timeout_ms,
         response_jump_limit,
-        udp_pool_size,
-        tcp_pool_size,
-        doh_pool_size,
-        doh_health_check_error_threshold,
-        dot_pool_size,
-        doq_pool_size,
-    )
-        .hash(hasher);
-    (
-        tcp_health_check_error_threshold,
-        tcp_connection_max_age_seconds,
-        tcp_connection_idle_timeout_seconds,
-        doq_connection_idle_timeout_seconds,
-        doq_keepalive_interval_ms,
-        doq_enable_0rtt,
-        flow_control_enabled,
     )
         .hash(hasher);
     (
@@ -793,6 +768,68 @@ mod tests {
         assert_ne!(before.get("second"), after.get("second"));
     }
 
+    /// 重载即生效、又影响应答的设置，改哪一个都让所有 pipeline 换命名空间
+    /// Each setting that applies on a reload and affects the answers moves every pipeline to
+    /// a new namespace when changed
+    #[test]
+    fn every_setting_applied_on_reload_changes_all_namespaces() {
+        type Change = fn(&mut crate::config::GlobalSettings);
+        let changes: [(&str, Change); 19] = [
+            ("min_ttl", |s| s.min_ttl += 1),
+            ("default_upstream", |s| {
+                s.default_upstream = "1.0.0.1:53".into()
+            }),
+            ("upstream_timeout_ms", |s| s.upstream_timeout_ms += 1),
+            ("request_timeout_ms", |s| {
+                s.request_timeout_ms = Some(s.request_timeout_ms.unwrap_or(1000) + 1)
+            }),
+            ("response_jump_limit", |s| s.response_jump_limit += 1),
+            ("serve_stale", |s| s.serve_stale = !s.serve_stale),
+            ("serve_stale_ttl", |s| s.serve_stale_ttl += 1),
+            ("serve_stale_expire_ttl", |s| s.serve_stale_expire_ttl += 1),
+            ("serve_stale_ttl_reset", |s| {
+                s.serve_stale_ttl_reset = !s.serve_stale_ttl_reset
+            }),
+            ("serve_stale_client_timeout_ms", |s| {
+                s.serve_stale_client_timeout_ms += 1
+            }),
+            ("cache_background_refresh", |s| {
+                s.cache_background_refresh = !s.cache_background_refresh
+            }),
+            ("cache_refresh_threshold_percent", |s| {
+                s.cache_refresh_threshold_percent = s.cache_refresh_threshold_percent % 99 + 1
+            }),
+            ("cache_refresh_min_ttl", |s| s.cache_refresh_min_ttl += 1),
+            ("geoip_db_path", |s| {
+                s.geoip_db_path = Some("/geo/a.mmdb".into())
+            }),
+            ("geoip_dat_path", |s| {
+                s.geoip_dat_path = Some("/geo/a.dat".into())
+            }),
+            ("geoip_auto_convert", |s| {
+                s.geoip_auto_convert = !s.geoip_auto_convert
+            }),
+            ("geoip_filter_countries", |s| {
+                s.geoip_filter_countries.push("ZZ".into())
+            }),
+            ("geosite_data_paths", |s| {
+                s.geosite_data_paths.push("/geo/site.dat".into())
+            }),
+            ("enable_tcp_fallback", |s| {
+                s.enable_tcp_fallback = !s.enable_tcp_fallback
+            }),
+        ];
+        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let before = build_cache_namespaces(&before_config);
+        for (name, change) in changes {
+            let mut after_config = before_config.clone();
+            change(&mut after_config.settings);
+            let after = build_cache_namespaces(&after_config);
+            assert_ne!(before.get("first"), after.get("first"), "{name}");
+            assert_ne!(before.get("second"), after.get("second"), "{name}");
+        }
+    }
+
     /// 统计的两个设置已不起作用，改它们不让缓存换代
     /// The two statistics settings no longer do anything, so changing them leaves
     /// the caches alone
@@ -822,6 +859,56 @@ mod tests {
         settings.flow_control_max_permits += 1;
         settings.flow_control_latency_threshold_ms += 1;
         settings.flow_control_adjustment_interval_secs += 1;
+        let before = build_cache_namespaces(&before_config);
+        let after = build_cache_namespaces(&after_config);
+
+        assert_eq!(before.get("first"), after.get("first"));
+        assert_eq!(before.get("second"), after.get("second"));
+    }
+
+    /// 只在启动时读的设置（见 `GlobalSettings::restart_pending`）重载时改了也不让缓存换代：重载不让它们生效，应答也就
+    /// 不会变。以前它们都进了命名空间的哈希，热重载改一个（比如 flow_control_enabled）就作废所有缓存，设置本身却要重启
+    /// 才生效
+    /// The settings read at startup only (see `GlobalSettings::restart_pending`) leave the
+    /// caches alone when a reload changes them: a reload does not apply them, so the answers do
+    /// not change. They all used to go into the namespace hash, so a hot reload changing one
+    /// (flow_control_enabled, say) dropped every cache while the setting itself waited for a
+    /// restart
+    #[test]
+    fn settings_read_at_startup_leave_namespaces_alone() {
+        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let mut after_config = before_config.clone();
+        let settings = &mut after_config.settings;
+        settings.bind_udp = "127.0.0.1:5353".into();
+        settings.bind_tcp = "127.0.0.1:5354".into();
+        settings.bind_doh = Some("127.0.0.1:8443".into());
+        settings.doh_tls_cert = Some("/etc/kixdns/cert.pem".into());
+        settings.doh_tls_key = Some("/etc/kixdns/key.pem".into());
+        settings.doh_path = "/resolve".into();
+        settings.cache_capacity += 1;
+        settings.cache_max_ttl += 1;
+        settings.dashmap_shards += 1;
+        settings.udp_pool_size += 1;
+        settings.tcp_pool_size += 1;
+        settings.doh_pool_size += 1;
+        settings.doh_health_check_error_threshold += 1;
+        settings.dot_pool_size += 1;
+        settings.doq_pool_size += 1;
+        settings.tcp_health_check_error_threshold += 1;
+        settings.tcp_connection_max_age_seconds += 1;
+        settings.tcp_connection_idle_timeout_seconds += 1;
+        settings.doq_connection_idle_timeout_seconds += 1;
+        settings.doq_keepalive_interval_ms += 1;
+        settings.doq_enable_0rtt = !settings.doq_enable_0rtt;
+        settings.flow_control_enabled = !settings.flow_control_enabled;
+        assert_eq!(
+            after_config
+                .settings
+                .restart_pending(&before_config.settings)
+                .len(),
+            22,
+            "every setting read at startup changed"
+        );
         let before = build_cache_namespaces(&before_config);
         let after = build_cache_namespaces(&after_config);
 
