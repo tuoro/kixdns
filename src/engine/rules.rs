@@ -373,6 +373,15 @@ pub(crate) fn response_matches(
     )
 }
 
+/// 请求问题的类别：静态应答照它给不给记录（见 `has_static_records`）。回答阶段的应答照抄这个请求的问题
+/// The class of the request's question, by which a static answer gives records or not
+/// (see `has_static_records`). A response-phase answer copies this request's question
+fn question_class(req: &Message) -> DNSClass {
+    req.queries
+        .first()
+        .map_or(DNSClass::IN, |question| question.query_class())
+}
+
 pub struct ApplyResponseActionsContext<'a> {
     pub engine: &'a Engine,
     pub actions: &'a [Action],
@@ -445,7 +454,8 @@ async fn run_response_actions(
                 });
             }
             Action::StaticIpResponse { ip } => {
-                let (rcode, answers) = make_static_ip_answer(ctx.qname, ctx.qtype, ip);
+                let (rcode, answers) =
+                    make_static_ip_answer(ctx.qname, ctx.qtype, question_class(ctx.req), ip);
                 let bytes = build_response(ctx.req, rcode, answers)?;
                 return Ok(ResponseActionResult::Static {
                     bytes,
@@ -454,8 +464,12 @@ async fn run_response_actions(
                 });
             }
             Action::StaticCnameResponse { target, ttl } => {
-                let (rcode, answers) =
-                    make_static_cname_answer(ctx.qname, target, ttl.unwrap_or(300));
+                let (rcode, answers) = make_static_cname_answer(
+                    ctx.qname,
+                    question_class(ctx.req),
+                    target,
+                    ttl.unwrap_or(300),
+                );
                 let bytes = build_response(ctx.req, rcode, answers)?;
                 return Ok(ResponseActionResult::Static {
                     bytes,
@@ -465,7 +479,13 @@ async fn run_response_actions(
             }
             Action::StaticTxtResponse { text, ttl } => {
                 let ttl = ttl.unwrap_or(300);
-                let (rcode, answers) = make_static_txt_answer(ctx.qname, text, ttl);
+                let (rcode, answers) = make_static_txt_answer(
+                    ctx.qname,
+                    ctx.qtype,
+                    question_class(ctx.req),
+                    text,
+                    ttl,
+                );
                 let bytes = build_response(ctx.req, rcode, answers)?;
                 return Ok(ResponseActionResult::Static {
                     bytes,

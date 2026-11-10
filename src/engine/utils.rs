@@ -113,7 +113,9 @@ pub mod engine_helpers {
         // Reuse the shared standard-query header guard so listener and fast-path
         // validation cannot drift apart.
         // 复用共享的标准查询头守卫，避免监听器与快速路径的校验漂移。
-        if !crate::proto_utils::is_standard_query_header(request) {
+        if !crate::proto_utils::is_standard_query_header(request)
+            || !crate::proto_utils::question_name_readable(request)
+        {
             return None;
         }
 

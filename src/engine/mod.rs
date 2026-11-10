@@ -40,6 +40,8 @@ mod private_address_tests;
 mod query_flags_tests;
 #[cfg(test)]
 mod question_case_tests;
+#[cfg(test)]
+mod question_pointer_tests;
 pub mod refresh;
 #[cfg(test)]
 mod refresh_class_tests;
@@ -54,6 +56,8 @@ pub mod rules;
 mod signed_answer_tests;
 #[cfg(test)]
 mod stale_wait_tests;
+#[cfg(test)]
+mod static_answer_scope_tests;
 #[cfg(test)]
 mod tcp_pool_tests;
 #[cfg(test)]

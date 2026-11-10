@@ -292,13 +292,39 @@ fn strip_ecs(packet: &[u8]) -> Vec<u8> {
 /// Private addresses must never be leaked via ECS.
 /// 私有地址绝不能通过 ECS 泄露。
 pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
-    // 0.0.0.0 不是哪台主机的地址，拿它算出子网发给上游说明不了客户端在哪里，所以 ECS 一直把它
-    // 当作内网地址；geoip_private 那边不算（见 `matcher::geoip::is_private_ip`）
-    // 0.0.0.0 is no host's address, and a subnet worked out from it says nothing about
-    // where the client is, so ECS has always counted it as a local network one;
-    // geoip_private does not (see `matcher::geoip::is_private_ip`)
-    crate::matcher::geoip::is_local_network(*ip)
-        || matches!(ip, IpAddr::V4(v4) if v4.is_unspecified())
+    crate::matcher::geoip::is_local_network(*ip) || not_globally_routable(ip)
+}
+
+/// 不可全球路由、又不在 `is_local_network` 里的网段（RFC 6890）：拿它们算出的子网说明不了客户端在哪里，还把
+/// 内部编址漏给上游
+/// Ranges that are not globally routable yet not in `is_local_network` (RFC 6890): a
+/// subnet worked out from them says nothing about where the client is, and leaks internal
+/// addressing upstream
+fn not_globally_routable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            // 「本网络」0.0.0.0/8（RFC 791），0.0.0.0 也在里面：它不是哪台主机的地址；geoip_private 那边不算
+            // （见 `matcher::geoip::is_private_ip`）
+            // "This network" 0.0.0.0/8 (RFC 791), 0.0.0.0 included: it is no host's
+            // address; geoip_private does not count it (see `matcher::geoip::is_private_ip`)
+            a == 0
+                // 运营商级 NAT 共享地址 100.64.0.0/10 / Shared address space 100.64.0.0/10 (RFC 6598)
+                || (a == 100 && (b & 0xC0) == 64)
+                // IETF 协议分配 192.0.0.0/24 / IETF protocol assignments 192.0.0.0/24 (RFC 6890)
+                || (a == 192 && b == 0 && c == 0)
+                // 基准测试 198.18.0.0/15 / Benchmarking 198.18.0.0/15 (RFC 2544)
+                || (a == 198 && (b & 0xFE) == 18)
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            // 丢弃前缀 100::/64 / Discard-only prefix 100::/64 (RFC 6666)
+            (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
+                // 本地用的 IPv4/IPv6 转换前缀 64:ff9b:1::/48 / Local-use IPv4/IPv6 translation
+                // prefix 64:ff9b:1::/48 (RFC 8215)
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
+        }
+    }
 }
 
 // ============================================================================
