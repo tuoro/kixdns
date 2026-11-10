@@ -127,6 +127,12 @@ pub struct FairQueue<P> {
     queued: usize,
     /// 空出来留着再用的队列 / Emptied queues kept for reuse
     spare: Vec<Queued<P>>,
+    /// 一共轮过多少次 / How many turns have been taken in all
+    turns_taken: u64,
+    /// 上一次有新设备因为排队的设备到了 [`MAX_QUEUED_DEVICES`] 被挡在外面时，已经轮过多少次，见 [`Self::share_at_least`]
+    /// How many turns had been taken when a new device was last turned away for
+    /// [`MAX_QUEUED_DEVICES`] being queued, see [`Self::share_at_least`]
+    turned_away_at: Option<u64>,
 }
 
 impl<P> FairQueue<P> {
@@ -137,6 +143,8 @@ impl<P> FairQueue<P> {
             room,
             queued: 0,
             spare: Vec::new(),
+            turns_taken: 0,
+            turned_away_at: None,
         }
     }
 
@@ -144,17 +152,18 @@ impl<P> FairQueue<P> {
         self.room = room;
     }
 
-    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。份额至少 [`SHARE_AT_LEAST`]：设备多到平分下来每台不到一个时，发得少的
-    /// 设备一次问几个也排得进。还没排着的设备总能排进去，发得少的设备不会被挡；只有已经有 [`MAX_QUEUED_DEVICES`] 台在排队时，
-    /// 新来的才丢
+    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。份额至少 [`Self::share_at_least`]：设备多到平分下来每台不到一个时，
+    /// 发得少的设备一次问几个也排得进。还没排着的设备总能排进去，发得少的设备不会被挡；只有已经有 [`MAX_QUEUED_DEVICES`] 台在
+    /// 排队时，新来的才丢
     /// Queues a query; with the device's share full it is dropped and this gives false. A share is
-    /// at least [`SHARE_AT_LEAST`]: with devices so many that each would get less than one, a device
-    /// sending little asking a few at once still gets them in. A device not queued yet always gets
-    /// in, so a device sending little is not kept out; only with [`MAX_QUEUED_DEVICES`] already
-    /// queued is a new one dropped
+    /// at least [`Self::share_at_least`]: with devices so many that each would get less than one, a
+    /// device sending little asking a few at once still gets them in. A device not queued yet
+    /// always gets in, so a device sending little is not kept out; only with
+    /// [`MAX_QUEUED_DEVICES`] already queued is a new one dropped
     pub fn offer(&mut self, packet: &[u8], device: Device, peer: P) -> bool {
+        let at_least = self.share_at_least();
         if let Some(queue) = self.queues.get_mut(&device) {
-            if queue.len() >= (self.room / self.turns.len()).max(SHARE_AT_LEAST) {
+            if queue.len() >= (self.room / self.turns.len()).max(at_least) {
                 return false;
             }
             queue.push_back((packet.into(), peer));
@@ -162,6 +171,7 @@ impl<P> FairQueue<P> {
             return true;
         }
         if self.turns.len() >= MAX_QUEUED_DEVICES {
+            self.turned_away_at = Some(self.turns_taken);
             return false;
         }
         let mut queue = self.spare.pop().unwrap_or_default();
@@ -172,19 +182,39 @@ impl<P> FairQueue<P> {
         true
     }
 
-    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少，而且至少 [`SHARE_AT_LEAST`] 个（排得更少的不算）。一次问
-    /// 好几个的设备后面也排着几个，但比一直在发的少得多，不算；设备多到每台只排几个时，后面排着不到 [`SHARE_AT_LEAST`] 个的也
-    /// 不算，那是每台都排得进的份
+    /// 每台设备至少排得进几个：平常是 [`SHARE_AT_LEAST`]；最近一圈里有新设备因为排队的设备到了 [`MAX_QUEUED_DEVICES`] 被挡在
+    /// 外面时是 1。来源比设备上限还多时，洪泛的设备每轮到一次只取走一个，这一圈里又到了几个，每台排得进几个的话队列一直不空，
+    /// 先排进去的那些一直占着位置，后来的设备一个都排不进；每台只排得进一个时，轮到一次就排空、让出位置，后来的才赶得上空位。
+    /// 一圈按设备上限那么多次算：上限那么多台在排时，每台都轮到一次
+    /// How many each device may at least queue: [`SHARE_AT_LEAST`] as a rule, and 1 when within the
+    /// last round a new device was turned away for [`MAX_QUEUED_DEVICES`] being queued. With more
+    /// sources than the device limit, a flooding device has one taken each turn and several more
+    /// arriving within the round, so with a few each its queue never runs empty, those queued
+    /// first keep their places for good and a device coming later never gets in; with one each, a
+    /// turn empties it and gives up the place, and a later device has a chance at it. A round is
+    /// counted as that many turns as the limit: with that many devices queued, each gets a turn
+    fn share_at_least(&self) -> usize {
+        match self.turned_away_at {
+            Some(at) if self.turns_taken.wrapping_sub(at) < MAX_QUEUED_DEVICES as u64 => 1,
+            _ => SHARE_AT_LEAST,
+        }
+    }
+
+    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少，而且至少 [`Self::share_at_least`] 个（排得更少的不算）。
+    /// 一次问好几个的设备后面也排着几个，但比一直在发的少得多，不算；设备多到每台只排几个时，后面排着不到这么多个的也不算，那是
+    /// 每台都排得进的份
     /// The next query in turn, and whether this device has no fewer queued behind it than the
-    /// average across devices, and at least [`SHARE_AT_LEAST`] (one with fewer does not). A device
-    /// asking several at once has a few behind it too, but far fewer than one sending on and on,
-    /// and does not count; with devices so many that each queues only a few, one with fewer than
-    /// [`SHARE_AT_LEAST`] behind does not count either, that being the share every device gets in
+    /// average across devices, and at least [`Self::share_at_least`] (one with fewer does not). A
+    /// device asking several at once has a few behind it too, but far fewer than one sending on
+    /// and on, and does not count; with devices so many that each queues only a few, one with
+    /// fewer than that behind does not count either, that being the share every device gets in
     pub fn next_in_turn(&mut self) -> Option<(Box<[u8]>, P, bool)> {
+        let at_least = self.share_at_least();
         let device = self.turns.pop_front()?;
         let queue = self.queues.get_mut(&device)?;
         let (packet, peer) = queue.pop_front()?;
         self.queued -= 1;
+        self.turns_taken = self.turns_taken.wrapping_add(1);
         let left = queue.len();
         if left > 0 {
             self.turns.push_back(device);
@@ -193,7 +223,7 @@ impl<P> FairQueue<P> {
         {
             self.spare.push(emptied);
         }
-        let queues_its_share = left >= SHARE_AT_LEAST && left * self.turns.len() >= self.queued;
+        let queues_its_share = left >= at_least && left * self.turns.len() >= self.queued;
         Some((packet, peer, queues_its_share))
     }
 
@@ -351,6 +381,75 @@ mod tests {
             .map(|(_, _, share)| share)
             .collect();
         assert_eq!(light_turns, [false, false, false]);
+    }
+
+    /// 排队的设备到了上限、又有新设备被挡在外面以后，每台只排得进一个，后面排着一个、不比平均少的就算占着份额，和以前一样；轮一圈
+    /// 没再挡谁就又是至少 4 个
+    /// Once the queued devices are at the limit and a new device has been turned away, each gets
+    /// only one in, and one with one behind and no fewer than the average holds its share, as it
+    /// used to; after a round with nobody turned away it is at least 4 again
+    #[test]
+    fn past_the_device_limit_each_queues_one_again() {
+        let mut queue = FairQueue::new(100);
+        let limit = MAX_QUEUED_DEVICES as u32;
+        for n in 0..limit {
+            assert!(queue.offer(b"q", device(n), n));
+        }
+        assert!(
+            queue.offer(b"q", device(0), 0),
+            "at the limit with nobody turned away, at least 4 each"
+        );
+        assert!(!queue.offer(b"q", device(limit), limit), "past the limit");
+        assert!(!queue.offer(b"q", device(1), 1), "then one each");
+        let (_, peer, holds_its_share) = queue.next_in_turn().unwrap();
+        assert_eq!(peer, 0);
+        assert!(holds_its_share, "one behind and no fewer than the average");
+        for _ in 1..limit {
+            queue.next_in_turn();
+        }
+        assert_eq!(queue.devices(), 1, "all but the one holding two ran empty");
+        // 一圈里没再挡谁：设备多到平分下来每台一个都没有，每台又排得进 4 个 / A round with nobody turned
+        // away: with devices so many that each would get none, each gets 4 in again
+        for n in 1..1000 {
+            assert!(queue.offer(b"q", device(n), n));
+        }
+        for id in 1..SHARE_AT_LEAST as u32 {
+            assert!(queue.offer(b"q", device(5), id), "a round later, {id}");
+        }
+        assert!(!queue.offer(b"q", device(5), 9), "and no more");
+    }
+
+    /// 来源比设备上限还多、一直在发时，问一个等一个的设备也排得进：每台只排得进一个，轮到一次就排空、让出位置。以前每台排得进
+    /// 4 个，先排进去的那些一直占着位置，它答上一次以后再也排不进
+    /// With more sources than the device limit sending on and on, a device asking one at a time
+    /// still gets in: each gets one in, so a turn empties it and gives up the place. With 4 each,
+    /// those queued first kept their places for good, and once answered it never got in again
+    #[test]
+    fn a_device_sending_little_gets_in_past_the_device_limit() {
+        let mut queue = FairQueue::new(100);
+        let sources = MAX_QUEUED_DEVICES as u32 + 900;
+        let light = device(sources);
+        let (mut waiting, mut answered) = (false, 0);
+        for round in 0..40u32 {
+            // 每轮各发一个，先后打乱；它夹在中间 / Each sends one a round in a shuffled order, it somewhere among them
+            let light_at = round * 997 % sources;
+            for k in 0..sources {
+                if k == light_at && !waiting {
+                    waiting = queue.offer(b"q", light, sources);
+                }
+                let n = (k * 7919 + round * 31) % sources;
+                queue.offer(b"q", device(n), n);
+            }
+            for _ in 0..1000 {
+                if let Some((_, peer, _)) = queue.next_in_turn()
+                    && peer == sources
+                {
+                    waiting = false;
+                    answered += u32::from(round >= 10);
+                }
+            }
+        }
+        assert!(answered >= 5, "{answered}");
     }
 
     #[test]
