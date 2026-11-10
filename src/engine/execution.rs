@@ -1083,16 +1083,19 @@ impl Engine {
                 qtype: u16::from(lookup.qtype),
                 flags: lookup.flags,
             };
-            let has_stale = self
+            let stale = self
                 .cache_get(lookup.slot, &view, &question, Instant::now())
                 .filter(|h| {
                     h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
                         && h.rcode != ResponseCode::ServFail
                         && h.rcode != ResponseCode::Refused
-                })
-                .is_some();
+                });
 
-            if has_stale {
+            if let Some(stale) = stale {
+                // 这个条目的刷新标记：查缓存时已经为它发起刷新（见 `check_cache_logged`），刷新一结束标记就放开
+                // The refresh mark of this entry: the lookup already started its refresh (see
+                // `check_cache_logged`), and the mark goes as soon as the refresh ends
+                let mark = super::refresh::RefreshTarget::mark_of(lookup.slot, &stale.reach);
                 // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
                 // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
                 // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
@@ -1123,8 +1126,14 @@ impl Engine {
 
                 // Poll cache for fresh data from background refresh
                 // 轮询缓存等待后台刷新带来的新鲜数据
+                let mut refresh_ended = false;
                 while wait_start.elapsed() < client_timeout {
                     tokio::time::sleep(poll_interval).await;
+                    // 先看刷新还在不在跑、再看缓存：刷新先把新应答写进缓存、再放开标记，这样不会错过刚写进来的
+                    // Whether the refresh still runs first, then the cache: a refresh writes its
+                    // fresh answer into the cache before it lets go of the mark, so one that just
+                    // landed is never missed
+                    let refreshing = self.refreshing_set.contains(&mark);
                     // Check if background refresh put fresh data in cache
                     let Some(fresh_hit) =
                         self.cache_get(lookup.slot, &view, &question, Instant::now())
@@ -1143,25 +1152,41 @@ impl Engine {
                             return Some(fresh_bytes);
                         }
                     }
+                    // 刷新已经结束却没带回新应答（上游失败了）：再等也等不来，马上交出过期应答。以前照样等满
+                    // 客户端等待的时间，上游很快报错时，每个查询都白等一整段
+                    // The refresh ended without a fresh answer (the upstream failed): no more
+                    // waiting brings one, so the stale answer goes out at once. It used to wait out
+                    // the client wait all the same, so with an upstream failing fast every query
+                    // waited the whole time for nothing
+                    if !refreshing {
+                        refresh_ended = true;
+                        break;
+                    }
                 }
 
-                // Client timeout expired - serve stale response
-                // 客户端超时 - 返回过期缓存响应
-                if let Some(stale_bytes) = phases::check_stale_cache_logged(
-                    self,
-                    lookup,
-                    CacheHitKind::StaleClientTimeout,
-                    info,
-                ) {
+                // 刷新失败了，或者客户端等待的时间到了：交出过期缓存
+                // The refresh failed, or the client wait ran out: serve the stale entry
+                let kind = if refresh_ended {
+                    CacheHitKind::StaleUpstreamFailure
+                } else {
+                    CacheHitKind::StaleClientTimeout
+                };
+                if let Some(stale_bytes) =
+                    phases::check_stale_cache_logged(self, lookup, kind, info)
+                {
                     tracing::debug!(
-                        event = "serve_stale_on_client_timeout",
+                        event = if refresh_ended {
+                            "serve_stale_after_refresh_failed"
+                        } else {
+                            "serve_stale_on_client_timeout"
+                        },
                         qname = %lookup.qname,
                         qtype = ?lookup.qtype,
-                        waited_ms = client_timeout.as_millis() as u64,
+                        waited_ms = wait_start.elapsed().as_millis() as u64,
                         configured_timeout_ms = settings.serve_stale_client_timeout_ms,
                         client_ip = %lookup.peer.ip(),
                         pipeline = %lookup.pipeline_id,
-                        "RFC 8767: client timeout expired, serving stale"
+                        "RFC 8767: serving stale"
                     );
                     return Some(stale_bytes);
                 }
