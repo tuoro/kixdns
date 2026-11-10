@@ -253,6 +253,37 @@ pub struct RuntimePipeline {
     /// an entry for every new name costs more than computing them again. A rule's own answer is kept
     /// whatever the pipeline: the fast path answers repeated blocked queries from it.
     pub matches_regex: bool,
+    /// 这个 pipeline 的应答取决于哪些 Geo 数据：它自己的规则、它跳到的 pipeline 的规则读的。数据换了，按旧数据缓存的
+    /// 应答和规则决定就不能再用，这个 pipeline 换缓存命名空间（见 `EngineInner::at_geo`）
+    /// Which Geo data this pipeline's answers depend on: what its own rules and those of the
+    /// pipelines it jumps to read. Once that data changes, answers and rule decisions cached
+    /// with the old data are no longer valid, and the pipeline moves to a new cache namespace
+    /// (see `EngineInner::at_geo`)
+    pub geo_data: GeoData,
+}
+
+/// 规则读的 Geo 数据 / The Geo data rules read
+///
+/// 按客户端地址的 GeoIP 国家判断的规则不算：缓存的键带着客户端那次判断的结果（见 [`RequesterScope`]），数据换了，
+/// 判断结果跟着变，查到的就是另一个条目。
+/// Rules judging the client address's GeoIP country do not count: cache keys carry the
+/// result of that judgement for the client (see [`RequesterScope`]), so when the data
+/// changes the result changes with it and the lookup finds another entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GeoData {
+    /// GeoSite 名单：请求域名在不在里面 / GeoSite lists: whether the request's name is in them
+    pub site: bool,
+    /// GeoIP 网段：回答里的地址在不在里面 / GeoIP networks: whether the addresses in the answer are in them
+    pub ip: bool,
+}
+
+impl GeoData {
+    fn with(self, other: Self) -> Self {
+        Self {
+            site: self.site || other.site,
+            ip: self.ip || other.ip,
+        }
+    }
 }
 
 /// Who is asking, as far as rules can tell.
@@ -514,6 +545,8 @@ struct RuleReads {
     jumps: Vec<Arc<str>>,
     /// Whether an answer check continues / 是否有回答检查会 continue
     continues: bool,
+    /// The Geo data its rules read / 规则读的 Geo 数据
+    geo: GeoData,
 }
 
 impl RuleReads {
@@ -526,9 +559,30 @@ impl RuleReads {
             request_jumps: Vec::new(),
             jumps: Vec::new(),
             continues: false,
+            geo: GeoData::default(),
         };
         let mut answer_edns = false;
         for rule in rules {
+            for m in &rule.matchers {
+                if matches!(
+                    m.matcher,
+                    RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
+                ) {
+                    reads.geo.site = true;
+                }
+            }
+            for m in &rule.response_matchers {
+                match m.matcher {
+                    RuntimeResponseMatcher::ResponseRequestDomainGeoSite { .. }
+                    | RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { .. } => {
+                        reads.geo.site = true;
+                    }
+                    RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { .. } => {
+                        reads.geo.ip = true;
+                    }
+                    _ => {}
+                }
+            }
             for m in &rule.matchers {
                 let test = match &m.matcher {
                     RuntimeMatcher::ClientIp { net } => RequesterTest::InNet(*net),
@@ -972,6 +1026,8 @@ impl RuntimePipelineConfig {
                 depends_on_requester,
                 matches_edns,
                 matches_regex,
+                // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
+                geo_data: GeoData::default(),
             });
         }
 
@@ -1022,13 +1078,21 @@ impl RuntimePipelineConfig {
             .map(|(i, p)| (p.id.clone(), i))
             .collect();
 
-        for ((pipeline, scope), rule_reads) in pipelines
+        for (idx, ((pipeline, scope), rule_reads)) in pipelines
             .iter_mut()
             .zip(requester_scopes(&reads, &pipeline_id_index))
             .zip(&reads)
+            .enumerate()
         {
             pipeline.requester = scope;
             pipeline.rule_requester = rule_reads.request_matchers.clone();
+            // 跳转过去的 pipeline 的应答也缓存在这个 pipeline 的键下 / Answers of the pipelines it jumps to are
+            // cached under this pipeline's keys as well
+            pipeline.geo_data = reachable_pipelines(&reads, &pipeline_id_index, [idx])
+                .into_iter()
+                .fold(GeoData::default(), |geo, reached| {
+                    geo.with(reads[reached].geo)
+                });
         }
 
         Ok(Self {

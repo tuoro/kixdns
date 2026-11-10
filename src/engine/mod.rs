@@ -21,6 +21,8 @@ mod geo;
 #[cfg(test)]
 mod geo_reload_tests;
 #[cfg(test)]
+mod geo_update_cache_tests;
+#[cfg(test)]
 mod inflight_wait_tests;
 pub mod listener;
 pub mod matcher_adapter;
