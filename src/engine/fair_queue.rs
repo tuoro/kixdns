@@ -5,14 +5,21 @@
 //! not fit is dropped, leaving the devices that send little alone. There is no judging who
 //! counts as heavy and no need to know how much this machine can handle.
 
-use std::collections::VecDeque;
-use std::hash::{BuildHasher, RandomState};
+use std::collections::{HashMap, VecDeque};
+use std::hash::RandomState;
 use std::net::IpAddr;
 
-/// 队列的份数。设备按哈希落到其中一份，哈希每次启动都不同，外面算不出谁和谁落在一起；同一份的设备一起算一台
-/// How many queues there are. A device lands in one by a hash that differs at each start, so
-/// nobody outside can work out who lands together; devices in the same queue count as one
-const QUEUES: usize = 1024;
+/// 最多这么多台设备同时排队，再来的新设备丢掉。每台设备有自己的队列，不和别的设备共用；这个上限管住一共能压多少（见
+/// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`），伪造来源地址的洪泛每个地址只排得进一个，也压不出更多
+/// At most this many devices are queued at once, and a new one past it is dropped. Each device
+/// has a queue of its own, shared with no other; this limit bounds how much may be held in all
+/// (see `the_queues_hold_at_most_each_device_filling_its_share_in_turn`), so a flood with forged
+/// source addresses, each getting one in, holds no more
+const MAX_QUEUED_DEVICES: usize = 4096;
+
+/// 空出来的队列留这么多个下次再用，省得每台新设备都分配一次 / This many emptied queues are kept for reuse,
+/// sparing an allocation for every new device
+const SPARE_QUEUES: usize = 256;
 
 /// 一台设备：IPv4 按地址，公网 IPv6 按 /64，一个这样的网段通常就是一户。局域网里的 IPv6 地址（链路本地、ULA）
 /// 按完整地址：同一网段的主机都在一个 /64 里，用链路本地地址的更是全在 fe80::/64，按 /64 算就成了一台
@@ -39,27 +46,34 @@ impl Device {
     }
 }
 
+/// 一台设备排着的查询和回答时要用的对端 / A device's queued queries and the peers to answer
+type Queued<P> = VecDeque<(Box<[u8]>, P)>;
+
 /// 按设备轮流的队列，`P` 是回答时要用的对端 / A queue taking devices in turn, `P` being the peer to answer
 pub struct FairQueue<P> {
-    queues: Vec<VecDeque<(Box<[u8]>, P)>>,
-    /// 还有查询排着的队列，下一个轮到的在最前面 / The queues holding queries, the next in turn first
-    turns: VecDeque<usize>,
+    /// 每台排着队的设备自己的队列；哈希每次启动都不同，外面算不出表里的布局
+    /// Each queued device's own queue; the hash differs at each start, so nobody outside can work
+    /// out the table's layout
+    queues: HashMap<Device, Queued<P>, RandomState>,
+    /// 还有查询排着的设备，下一个轮到的在最前面 / The devices holding queries, the next in turn first
+    turns: VecDeque<Device>,
     /// 一台设备排进去时能排到多少：它除以那一刻在排队的设备数。排着的不收回，一共能排多少见
     /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     /// How far a device may queue as it offers a query: this divided by how many devices are queued
     /// at that moment. What is queued is not taken back; for how much may be held in all see
     /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     room: usize,
-    hasher: RandomState,
+    /// 空出来留着再用的队列 / Emptied queues kept for reuse
+    spare: Vec<Queued<P>>,
 }
 
 impl<P> FairQueue<P> {
     pub fn new(room: usize) -> Self {
         Self {
-            queues: (0..QUEUES).map(|_| VecDeque::new()).collect(),
+            queues: HashMap::default(),
             turns: VecDeque::new(),
             room,
-            hasher: RandomState::new(),
+            spare: Vec::new(),
         }
     }
 
@@ -67,34 +81,42 @@ impl<P> FairQueue<P> {
         self.room = room;
     }
 
-    fn index_of(&self, device: Device) -> usize {
-        (self.hasher.hash_one(device) % QUEUES as u64) as usize
-    }
-
-    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。队列是空的总能排进去，发得少的设备不会被挡
-    /// Queues a query; with the device's share full it is dropped and this gives false. An empty
-    /// queue always takes it, so a device sending little is not kept out
+    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。还没排着的设备总能排进去，发得少的设备不会被挡；只有已经有
+    /// [`MAX_QUEUED_DEVICES`] 台在排队时，新来的才丢
+    /// Queues a query; with the device's share full it is dropped and this gives false. A device not
+    /// queued yet always gets in, so a device sending little is not kept out; only with
+    /// [`MAX_QUEUED_DEVICES`] already queued is a new one dropped
     pub fn offer(&mut self, packet: &[u8], device: Device, peer: P) -> bool {
-        let index = self.index_of(device);
-        let queue = &mut self.queues[index];
-        if queue.is_empty() {
-            self.turns.push_back(index);
-        } else if queue.len() >= self.room / self.turns.len() {
+        if let Some(queue) = self.queues.get_mut(&device) {
+            if queue.len() >= self.room / self.turns.len() {
+                return false;
+            }
+            queue.push_back((packet.into(), peer));
+            return true;
+        }
+        if self.turns.len() >= MAX_QUEUED_DEVICES {
             return false;
         }
+        let mut queue = self.spare.pop().unwrap_or_default();
         queue.push_back((packet.into(), peer));
+        self.queues.insert(device, queue);
+        self.turns.push_back(device);
         true
     }
 
     /// 下一个轮到的查询，以及这台设备后面还排没排着别的 / The next query in turn, and whether this device
     /// has more queued behind it
     pub fn next_in_turn(&mut self) -> Option<(Box<[u8]>, P, bool)> {
-        let index = self.turns.pop_front()?;
-        let queue = &mut self.queues[index];
+        let device = self.turns.pop_front()?;
+        let queue = self.queues.get_mut(&device)?;
         let (packet, peer) = queue.pop_front()?;
         let more_queued = !queue.is_empty();
         if more_queued {
-            self.turns.push_back(index);
+            self.turns.push_back(device);
+        } else if let Some(emptied) = self.queues.remove(&device)
+            && self.spare.len() < SPARE_QUEUES
+        {
+            self.spare.push(emptied);
         }
         Some((packet, peer, more_queued))
     }
@@ -117,12 +139,38 @@ mod tests {
         Device::V4(n)
     }
 
-    /// 和 `first` 不在同一份队列的另一台设备 / Another device, not in the same queue as `first`
-    fn other_device(queue: &FairQueue<u32>, first: Device) -> Device {
-        (1..)
-            .map(device)
-            .find(|other| queue.index_of(*other) != queue.index_of(first))
-            .unwrap()
+    /// 和 `first` 不同的另一台设备 / Another device than `first`
+    fn other_device(_queue: &FairQueue<u32>, first: Device) -> Device {
+        (1..).map(device).find(|other| *other != first).unwrap()
+    }
+
+    /// 设备不和别的设备共用队列：一台洪泛的排满了自己那一份，再来几千台各发一个，都排得进。以前设备按哈希落进 1024 份，
+    /// 来源一多，正常设备和洪泛的落在同一份就被丢
+    /// A device shares its queue with no other: with one flooding device at its share, thousands
+    /// more sending one each all get in. Devices used to land in 1024 queues by hash, so with many
+    /// sources a normal device landing with a flooding one was dropped
+    #[test]
+    fn devices_never_share_a_queue() {
+        let mut queue = FairQueue::new(10);
+        while queue.offer(b"q", device(0), 0) {}
+        let taken_in = (1..=3000)
+            .filter(|&n| queue.offer(b"q", device(n), n))
+            .count();
+        assert_eq!(taken_in, 3000);
+    }
+
+    /// 一台设备排空以后再来，照样排得进、轮得到 / A device that ran empty and comes back gets in and
+    /// gets its turn all the same
+    #[test]
+    fn a_device_that_ran_empty_queues_again() {
+        let mut queue = FairQueue::new(10);
+        assert!(queue.offer(b"q", device(1), 1));
+        assert_eq!(taken(&mut queue), [1]);
+        assert!(queue.is_empty());
+        assert!(queue.offer(b"q", device(1), 2));
+        assert!(queue.offer(b"q", device(2), 3));
+        assert_eq!(taken(&mut queue), [2, 3]);
+        assert_eq!(queue.devices(), 0);
     }
 
     fn taken(queue: &mut FairQueue<u32>) -> Vec<u32> {
@@ -183,29 +231,23 @@ mod tests {
 
     /// 一共能排多少：份额只在排进去那一刻按当时排着的设备数算，排着的不收回。按最后一次排进去的先后数，第 k 台排进去时，
     /// 前面那些从各自最后一次排进去以后没再收过、也还没排空，都还排着，所以它最多排到 max(1, ⌊room/k⌋)，一共最多
-    /// Σ max(1, ⌊room/k⌋)（k 从 1 到份数），大约 room × ln(room) 加份数。一台接一台各排满自己那一份正好到这个数；
-    /// 地址再多也只是撞进这些份里，占不了更多内存
+    /// Σ max(1, ⌊room/k⌋)（k 从 1 到 `MAX_QUEUED_DEVICES`），大约 room × ln(room) 加设备上限。一台接一台各排满自己那一份
+    /// 正好到这个数；地址再多，过了设备上限的新设备也排不进，占不了更多内存
     /// How much may be held in all: a share is set only as a query is queued, by how many devices are
     /// queued then, and what is queued is not taken back. Counting devices by when they last queued,
     /// the k-th one finds the earlier ones still queued, as none has taken anything since and none
     /// has run empty, so it holds at most max(1, ⌊room/k⌋), and all at most Σ max(1, ⌊room/k⌋) for k
-    /// from 1 to the queues, about room × ln(room) plus the queues. Device after device filling its
-    /// share reaches exactly that; however many addresses there are, they only land in these queues
-    /// and hold no more memory
+    /// from 1 to `MAX_QUEUED_DEVICES`, about room × ln(room) plus the device limit. Device after
+    /// device filling its share reaches exactly that; however many addresses there are, new devices
+    /// past the limit do not get in, and hold no more memory
     #[test]
     fn the_queues_hold_at_most_each_device_filling_its_share_in_turn() {
         for room in [10, 64, 205, 4000] {
-            let limit: usize = (1..=QUEUES).map(|k| (room / k).max(1)).sum();
+            let limit: usize = (1..=MAX_QUEUED_DEVICES).map(|k| (room / k).max(1)).sum();
 
             let mut queue = FairQueue::new(room);
-            let mut seen = std::collections::HashSet::new();
-            let one_per_queue: Vec<Device> = (0..)
-                .map(device)
-                .filter(|&one| seen.insert(queue.index_of(one)))
-                .take(QUEUES)
-                .collect();
             let mut held = 0;
-            for one in one_per_queue {
+            for one in (0..MAX_QUEUED_DEVICES as u32).map(device) {
                 while queue.offer(b"q", one, 0) {
                     held += 1;
                 }
@@ -213,7 +255,7 @@ mod tests {
             assert_eq!(held, limit, "room {room}");
             assert!(
                 !(0..10_000).any(|id| queue.offer(b"q", device(id), id)),
-                "nobody gets in past it"
+                "nobody gets in past it, new devices included"
             );
 
             // 地址各不相同、边排边答也到不了 / Nor with every address different and turns taken meanwhile
@@ -237,13 +279,8 @@ mod tests {
     #[test]
     fn a_new_device_always_gets_its_first_turn() {
         let mut queue = FairQueue::new(2);
-        // 挑落在不同份的几台设备，数目超过 room / Pick devices in distinct queues, more than the room
-        let mut seen = std::collections::HashSet::new();
-        let devices: Vec<Device> = (0..)
-            .map(device)
-            .filter(|&one| seen.insert(queue.index_of(one)))
-            .take(8)
-            .collect();
+        // 几台设备，数目超过 room / Several devices, more than the room
+        let devices: Vec<Device> = (0..8).map(device).collect();
         for (peer, &one) in devices.iter().enumerate() {
             assert!(
                 queue.offer(b"q", one, peer as u32),

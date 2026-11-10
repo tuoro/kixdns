@@ -186,10 +186,13 @@ impl FlowControlState {
     }
 }
 
-/// 按设备记在途数的份数：设备按哈希落到其中一份，哈希每次启动都不同，同一份的设备一起算一台
+/// 按设备记在途数的份数：设备按哈希落到其中一份，哈希每次启动都不同，同一份的设备一起算一台。份数多到两千台设备里落在一起
+/// 的约 3%；在途的计数是几个核一起改的原子数，按份的数组比按设备的表省得多，两种东西各 256 KiB
 /// How many slots the in-flight counts per device are kept in: a device lands in one by a hash
-/// that differs at each start, and devices in the same slot count as one
-const DEVICE_SLOTS: usize = 1024;
+/// that differs at each start, and devices in the same slot count as one. There are enough that
+/// about 3% of two thousand devices land together; the counts are atomics several cores change at
+/// once, and an array of slots costs far less than a table by device, 256 KiB for each kind
+const DEVICE_SLOTS: usize = 65536;
 
 /// 一台设备落在的那一份 / The slot a device lands in
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -206,8 +209,16 @@ struct DeviceCounts {
 
 impl DeviceCounts {
     fn new() -> Self {
+        // 清零的分配：这么大的一块通常由系统按页给零页，碰到的份才真正占内存；没开流控时一份都不碰
+        // A zeroed allocation: a block this large usually comes from the system as zero pages, so
+        // only the slots touched take memory; without flow control not a slot is touched
+        let zeroed: Box<[u32]> = vec![0u32; DEVICE_SLOTS].into_boxed_slice();
+        // SAFETY: AtomicU32 和 u32 的大小、对齐、有效位都相同，这块内存按同样的布局分配，也按同样的布局释放
+        // SAFETY: AtomicU32 has the same size, alignment and bit validity as u32, so this block is
+        // allocated and freed with the same layout
+        let per_slot = unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [AtomicU32]) };
         Self {
-            per_slot: (0..DEVICE_SLOTS).map(|_| AtomicU32::new(0)).collect(),
+            per_slot,
             slots_held: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
         }
@@ -656,14 +667,14 @@ mod tests {
     fn an_idle_connection_is_no_share_of_queries() {
         let manager = Arc::new(PermitManager::new());
         let flow = with_memory_left(100 << 20);
-        let connections: Vec<_> = (0..DEVICE_SLOTS as u16)
+        let connections: Vec<_> = (0..1024u16)
             .map(|n| {
                 flow.connection_permit(&manager, DeviceSlot(n))
                     .expect("a device with no connection connects")
             })
             .collect();
         assert!(manager.inflight() >= 1000, "memory is read");
-        for n in [0, 1, 500, DEVICE_SLOTS as u16 - 1] {
+        for n in [0, 1, 500, 1023] {
             assert!(
                 flow.permit_by_memory(&manager, DeviceSlot(n)).is_some(),
                 "a query on the connection of {n}"
@@ -786,6 +797,19 @@ mod tests {
             );
         }
         assert_eq!(manager.inflight(), 0);
+    }
+
+    /// 两千台设备几乎都落在各自的份里：份数多到落在一起的很少（约 3%）。以前只有 1024 份，两千台里大半和别的设备落在一起
+    /// Two thousand devices land almost all in slots of their own: there are slots enough that
+    /// few land together (about 3%). There used to be only 1024, and most of two thousand landed
+    /// with another
+    #[test]
+    fn devices_rarely_share_a_slot() {
+        let manager = PermitManager::new();
+        let slots: std::collections::HashSet<_> = (0..2000u32)
+            .map(|n| manager.slot_of(std::net::Ipv4Addr::from(0x0a00_0000 + n).into()))
+            .collect();
+        assert!(slots.len() >= 1900, "{} distinct slots", slots.len());
     }
 
     /// 同一台设备落在同一份，IPv6 同一个 /64 也是 / The same device lands in the same slot, and so does
