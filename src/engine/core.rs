@@ -71,6 +71,8 @@ pub struct Engine {
     /// The refresh marks of the entries being refreshed (see `RefreshingGuard`): one
     /// refresh of an entry at a time
     pub refreshing_set: Arc<DashSet<u64>>,
+    /// 最近刷新失败的应答（见 `RefreshFailures`）/ The answers whose refresh failed lately (see `RefreshFailures`)
+    pub(crate) refresh_failures: Arc<super::refresh::RefreshFailures>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
     pub permit_manager: Arc<PermitManager>,
     // Adaptive flow control state (None when flow control is disabled) / 自适应流控状态（禁用流控时为None）
@@ -295,6 +297,7 @@ impl Engine {
                 ))
             },
             refreshing_set: Arc::new(DashSet::new()),
+            refresh_failures: Arc::default(),
             permit_manager,
             flow_control_state,
             // Cache background refresh settings / 缓存后台刷新设置

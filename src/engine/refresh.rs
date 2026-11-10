@@ -1,5 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 
 use hickory_proto::rr::{DNSClass, RecordType};
 use tracing::{debug, error, warn};
@@ -103,6 +106,92 @@ impl RefreshTarget {
     }
 }
 
+/// RFC 8767 第 5 节的失败复查时间：一份应答刷新失败以后，这么久之内不再为它发起刷新，命中它的请求直接拿过期应答，
+/// 开着 `serve_stale_client_timeout_ms` 也不等。过了这段时间，头一次命中再试一次
+/// The failure recheck time of RFC 8767 section 5: once an answer's refresh fails, no refresh
+/// is started for it for this long, and requests hitting it get the stale answer at once,
+/// without waiting even with `serve_stale_client_timeout_ms`. After that, the first hit tries
+/// again
+pub(crate) const REFRESH_FAILURE_RECHECK: Duration = Duration::from_secs(30);
+
+/// 表里的失败多到这么多条，就清掉过了复查时间的 / Once the table holds this many failures, those past the
+/// recheck time are cleared out
+const REFRESH_FAILURES_PRUNED_AT: usize = 4096;
+
+/// 一次刷新失败 / One failed refresh
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RefreshFailure {
+    /// 失败的是哪一份应答：它取得的时刻（见 `CacheEntry::fetched_at`）。之后重新取得的应答不受影响
+    /// Which answer failed: the moment it was fetched (see `CacheEntry::fetched_at`). An
+    /// answer fetched again later is not affected
+    pub(crate) fetched_at: Instant,
+    /// 什么时候失败的 / When it failed
+    pub(crate) failed_at: Instant,
+}
+
+/// 最近刷新失败的应答，按刷新标记（见 [`RefreshTarget::mark_of`]）记。只记在这张表里、不记在缓存条目上：条目上
+/// 没有多余的空位，每条应答都多占一份内存不值得。表里只有复查时间之内的失败有用，过多时清掉其余的
+/// The answers whose refresh failed lately, by refresh mark (see [`RefreshTarget::mark_of`]).
+/// They live in this table, not on the cache entries: an entry has no room to spare, and
+/// more memory for every answer is not worth it. Only failures within the recheck time
+/// matter, and the rest are cleared out when the table grows
+#[derive(Debug)]
+pub(crate) struct RefreshFailures {
+    pub(crate) map: DashMap<u64, RefreshFailure>,
+    /// 下次清理时的条数：清完以后的两倍，至少 [`REFRESH_FAILURES_PRUNED_AT`]，清理的代价按次数摊开
+    /// The size at which the next clearing happens: twice what is left after one, at
+    /// least [`REFRESH_FAILURES_PRUNED_AT`], so clearing costs little per insert
+    prune_at: AtomicUsize,
+}
+
+impl Default for RefreshFailures {
+    fn default() -> Self {
+        Self {
+            map: DashMap::new(),
+            prune_at: AtomicUsize::new(REFRESH_FAILURES_PRUNED_AT),
+        }
+    }
+}
+
+impl RefreshFailures {
+    /// 标记为 `mark`、在 `fetched_at` 取得的那份应答，是否在复查时间之内刷新失败过
+    /// Whether the answer with refresh mark `mark`, fetched at `fetched_at`, failed a
+    /// refresh within the recheck time
+    pub(crate) fn failed_recently(&self, mark: u64, fetched_at: Instant) -> bool {
+        let Some(failure) = self.map.get(&mark).map(|failure| *failure) else {
+            return false;
+        };
+        if failure.fetched_at != fetched_at {
+            return false;
+        }
+        if failure.failed_at.elapsed() < REFRESH_FAILURE_RECHECK {
+            return true;
+        }
+        self.map
+            .remove_if(&mark, |_, current| current.failed_at == failure.failed_at);
+        false
+    }
+
+    /// 记下这份应答的刷新刚刚失败 / Notes that this answer's refresh just failed
+    fn record(&self, mark: u64, fetched_at: Instant) {
+        if self.map.len() >= self.prune_at.load(Ordering::Relaxed) {
+            self.map
+                .retain(|_, failure| failure.failed_at.elapsed() < REFRESH_FAILURE_RECHECK);
+            self.prune_at.store(
+                (self.map.len() * 2).max(REFRESH_FAILURES_PRUNED_AT),
+                Ordering::Relaxed,
+            );
+        }
+        self.map.insert(
+            mark,
+            RefreshFailure {
+                fetched_at,
+                failed_at: Instant::now(),
+            },
+        );
+    }
+}
+
 /// spawn_background_refresh spawns a task to refresh a DNS record in the background.
 ///
 /// 防止无限循环的保护措施：
@@ -138,6 +227,15 @@ pub fn spawn_background_refresh(
     // `RefreshingGuard::try_new`). The guard clears the mark when the task ends, and on
     // the early return below too
     let mark = RefreshTarget::mark_of(slot, &renewed.reach);
+    // 这份应答刚刷新失败过：复查时间之内不再刷新（RFC 8767 第 5 节），故障期间不必每次命中都去问坏掉的上游
+    // This answer's refresh failed lately: no refresh within the recheck time (RFC 8767
+    // section 5), so a broken upstream is not asked on every hit during an outage
+    if engine
+        .refresh_failures
+        .failed_recently(mark, renewed.fetched_at)
+    {
+        return;
+    }
     let Some(guard) = RefreshingGuard::try_new(&engine.refreshing_set, mark) else {
         return;
     };
@@ -185,6 +283,7 @@ pub fn spawn_background_refresh(
     // Step 2: Spawn the background task, which holds the refresh mark's guard
     // 步骤 2：生成后台任务，刷新标记的 guard 交给它
     let engine = engine.clone();
+    let fetched_at = renewed.fetched_at;
     let qname_owned = qname.to_string();
     let pipeline_id_owned = pipeline_id.to_string();
 
@@ -224,11 +323,17 @@ pub fn spawn_background_refresh(
             // stale hit starts a refresh only while the mark is clear, and with
             // serve_stale_client_timeout_ms the request then waits for that refresh, so
             // holding the mark for a backoff would leave it waiting for a refresh that
-            // never starts.
+            // never starts. The backoff lives in `RefreshFailures` instead, which a stale
+            // hit checks before it waits.
             // 无论成败，任务一结束就释放刷新标记。过期命中只在标记空闲时才发起刷新，
             // 开着 serve_stale_client_timeout_ms 时请求随后就等这次刷新；退避期间占着
-            // 标记，请求等的就是一个根本没有发起的刷新。
+            // 标记，请求等的就是一个根本没有发起的刷新。退避因此另记在 `RefreshFailures`
+            // 里，过期命中在等之前先查它。
             Err(e) => {
+                // 标记放开之前记下：看到标记放开的请求也就看得到这次失败
+                // Noted before the mark is let go: a request that sees the mark gone sees
+                // this failure too
+                engine.refresh_failures.record(mark, fetched_at);
                 warn!(
                     event = "background_refresh_failed",
                     qname = %qname_owned,
@@ -242,4 +347,40 @@ pub fn spawn_background_refresh(
         // _guard dropped here, automatically clearing the refresh mark
         // _guard 在此处 drop，自动清除刷新标记
     });
+}
+
+#[cfg(test)]
+mod refresh_failures_tests {
+    use super::*;
+
+    /// 表里多到 [`REFRESH_FAILURES_PRUNED_AT`] 条时，清掉过了复查时间的、留下还在时间之内的，下次清理的门槛是清完以后的两倍
+    /// Once the table reaches [`REFRESH_FAILURES_PRUNED_AT`] entries, those past the recheck
+    /// time go and those within it stay, and the next clearing waits for twice what is left
+    #[test]
+    fn a_full_table_keeps_only_failures_within_the_recheck_time() {
+        let failures = RefreshFailures::default();
+        let now = Instant::now();
+        let long_ago = now
+            .checked_sub(REFRESH_FAILURE_RECHECK + Duration::from_secs(1))
+            .expect("the clock is far enough from its start");
+        let recent = REFRESH_FAILURES_PRUNED_AT as u64 * 3 / 4;
+        for mark in 0..REFRESH_FAILURES_PRUNED_AT as u64 {
+            let failed_at = if mark < recent { now } else { long_ago };
+            failures.map.insert(
+                mark,
+                RefreshFailure {
+                    fetched_at: now,
+                    failed_at,
+                },
+            );
+        }
+        failures.record(u64::MAX, now);
+        assert_eq!(failures.map.len() as u64, recent + 1);
+        assert!((0..recent).all(|mark| failures.failed_recently(mark, now)));
+        assert!(failures.failed_recently(u64::MAX, now));
+        assert_eq!(
+            failures.prune_at.load(Ordering::Relaxed),
+            (recent as usize * 2).max(REFRESH_FAILURES_PRUNED_AT)
+        );
+    }
 }
