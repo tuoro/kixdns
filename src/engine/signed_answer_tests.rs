@@ -20,7 +20,7 @@ use crate::proto_utils::last_record_is_tsig;
 
 /// 末尾补一条 hickory 读得懂的 TSIG（密钥 `key.`、hmac-sha256、32 字节的 MAC）
 /// Appends a TSIG record hickory can read (key `key.`, hmac-sha256, a 32-byte MAC)
-fn signed(mut message: Vec<u8>) -> Vec<u8> {
+pub(super) fn signed(mut message: Vec<u8>) -> Vec<u8> {
     let mut rdata = vec![11];
     rdata.extend_from_slice(b"hmac-sha256");
     rdata.push(0);
