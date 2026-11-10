@@ -24,7 +24,7 @@ const MATCHED: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 50);
 const OTHER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 60);
 
 /// 一个长度前缀字段 / One length-delimited field
-fn field(number: u8, bytes: &[u8]) -> Vec<u8> {
+pub(super) fn field(number: u8, bytes: &[u8]) -> Vec<u8> {
     assert!(bytes.len() < 128, "test fields stay below one length byte");
     let mut out = vec![(number << 3) | 2, bytes.len() as u8];
     out.extend_from_slice(bytes);
@@ -32,7 +32,7 @@ fn field(number: u8, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// GeoSite .dat 内容：每个 (标签, 后缀) 一个条目 / GeoSite .dat content: one entry per (tag, suffix)
-fn geosite_dat(entries: &[(&str, &str)]) -> Vec<u8> {
+pub(super) fn geosite_dat(entries: &[(&str, &str)]) -> Vec<u8> {
     entries
         .iter()
         .flat_map(|(tag, suffix)| {
@@ -108,7 +108,7 @@ async fn ask(engine: &Engine, name: &str) -> Option<Ipv4Addr> {
 /// 等文件监视把改动读进来：`landed` 一成立就返回，只有监视坏了才会等满
 /// Waits for a file watch to read a change in: returns as soon as `landed` holds, and only a
 /// broken watch waits out the deadline
-async fn wait_for(what: &str, landed: impl Fn() -> bool) {
+pub(super) async fn wait_for(what: &str, landed: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !landed() {
         assert!(Instant::now() < deadline, "{what}");
@@ -119,7 +119,7 @@ async fn wait_for(what: &str, landed: impl Fn() -> bool) {
 /// 写到旁边的临时文件再改名盖过去，像面板和下载工具那样
 /// Writes a sibling temporary file and renames it over `path`, as the panel and download
 /// tools do
-fn replace(path: &Path, content: &[u8]) {
+pub(super) fn replace(path: &Path, content: &[u8]) {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, content).unwrap();
     std::fs::rename(&tmp, path).unwrap();

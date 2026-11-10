@@ -425,3 +425,5 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 重载后，配置里不再出现的上游会关闭它们的 TCP、DoT、DoQ 连接；正在使用这些连接的请求处理完之后才会关闭。
 
 geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只读入规则（geoip_country、response_answer_ip_geoip_country）用到的国家代码和标签（见上文 GeoIP 数据源与标签），不读的文件也不监控。热加载改变了规则用到的 GeoSite 或 GeoIP 标签，或这几个文件路径时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。被监控的文件重新读出来以后，规则用到的标签一个都没有了、而它此前提供过（比如下载失败留下的空文件），这次不替换，正在用的数据保留到文件下次改动。规则用到、却没有一个 GeoSite 数据文件提供的标签会记一条告警，和 GeoIP 一样。
+
+Geo 数据换进来以后（文件变了重新读入，或热加载读入），应答取决于这份数据的 Pipeline 换一个缓存命名空间：规则按 GeoSite 名单判断请求域名（geo_site、response_request_domain_geo_site 等），或按 GeoIP 判断回答里的地址（response_answer_ip_geoip_country），跳转过去的 Pipeline 用到的也算。按旧数据缓存的应答和规则决定从此不再拿出来用，和热加载改了规则一样；没用到这份数据的 Pipeline 留着各自的缓存。只按客户端地址判断 GeoIP 国家（geoip_country）的规则不必换：缓存本来就按这次判断的结果区分客户端，数据一换，判断结果跟着变。

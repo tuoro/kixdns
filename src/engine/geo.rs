@@ -7,9 +7,12 @@
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::ArcSwap;
 use tracing::{info, warn};
 
+use super::types::EngineInner;
 use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
 use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
@@ -87,26 +90,90 @@ impl<S: PartialEq> Loaded<S> {
     }
 }
 
+/// 两种 Geo 数据各自换过几次：缓存命名空间算上它，数据一换，用到它的 pipeline 就换命名空间（见
+/// `EngineInner::at_geo`）
+/// How many times each kind of Geo data has been swapped: cache namespaces take it in, so
+/// once the data is swapped the pipelines that use it move to a new namespace (see
+/// `EngineInner::at_geo`)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GeoGeneration {
+    pub(crate) site: u64,
+    pub(crate) ip: u64,
+}
+
+/// 数据换进管理器以后，代数加一，引擎状态换成这一代的命名空间
+/// After data is swapped into a manager, its generation goes up by one and the engine
+/// state moves to that generation's namespaces
+#[derive(Clone)]
+struct Rotation {
+    site: Arc<AtomicU64>,
+    ip: Arc<AtomicU64>,
+    state: Arc<ArcSwap<EngineInner>>,
+}
+
+impl Rotation {
+    fn generation(&self) -> GeoGeneration {
+        GeoGeneration {
+            site: self.site.load(Ordering::SeqCst),
+            ip: self.ip.load(Ordering::SeqCst),
+        }
+    }
+
+    /// `counter` 那种数据刚换进管理器 / The data `counter` counts was just swapped into its manager
+    fn swapped(&self, counter: &AtomicU64) {
+        // 数据先换、代数后加：拿到新命名空间的请求读到的一定是新数据。换状态用 rcu，同时有配置重载存进新状态时重来一遍，
+        // 不会把它盖回去；重载那边存的时候也读一遍代数（见 `Engine::apply_config`）
+        // The data first, the generation after: a request that gets the new namespace
+        // reads the new data. The state is swapped with rcu, which starts over when a
+        // configuration reload stores a new state meanwhile instead of overwriting it; the
+        // reload reads the generation as it stores too (see `Engine::apply_config`)
+        counter.fetch_add(1, Ordering::SeqCst);
+        self.state.rcu(|state| state.at_geo(self.generation()));
+    }
+
+    fn site_swapped(&self) {
+        self.swapped(&self.site);
+    }
+
+    fn ip_swapped(&self) {
+        self.swapped(&self.ip);
+    }
+}
+
 /// 两个管理器里现在的 Geo 数据从哪来；只在重载锁下使用（见 `Engine::reload_lock`）
 /// Where the Geo data now in the two managers came from; used only under the reload lock
 /// (see `Engine::reload_lock`)
 pub(crate) struct GeoSources {
     geosite: Loaded<GeoSiteSpec>,
     geoip: Loaded<GeoIpSpec>,
+    rotation: Rotation,
 }
 
 impl GeoSources {
-    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件
-    /// Loads the Geo data `cfg` uses into the two managers and watches its files
+    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件；数据每换一次，`state` 换成新一代的命名空间
+    /// Loads the Geo data `cfg` uses into the two managers and watches its files; every
+    /// time the data is swapped, `state` moves to the new generation's namespaces
     pub(crate) fn load(
         cfg: &RuntimePipelineConfig,
         geosite: &Arc<RwLock<GeoSiteManager>>,
         geoip: &Arc<RwLock<GeoIpManager>>,
+        state: &Arc<ArcSwap<EngineInner>>,
     ) -> Self {
+        let rotation = Rotation {
+            site: Arc::default(),
+            ip: Arc::default(),
+            state: Arc::clone(state),
+        };
         Self {
-            geosite: load_geosite(GeoSiteSpec::of(cfg), geosite),
-            geoip: load_geoip(GeoIpSpec::of(cfg), geoip),
+            geosite: load_geosite(GeoSiteSpec::of(cfg), geosite, &rotation),
+            geoip: load_geoip(GeoIpSpec::of(cfg), geoip, &rotation),
+            rotation,
         }
+    }
+
+    /// 两种 Geo 数据现在的代数 / The two kinds of Geo data's generations now
+    pub(crate) fn generation(&self) -> GeoGeneration {
+        self.rotation.generation()
     }
 
     /// 热重载到 `cfg`：它要的 Geo 数据和现在的不同时，换成新数据并改为监视新的文件。在换入新规则
@@ -127,13 +194,13 @@ impl GeoSources {
             // Stop the old watch and wait for it first, so it cannot write into the new
             // data after the swap
             self.geosite.watch = None;
-            self.geosite = load_geosite(spec, geosite);
+            self.geosite = load_geosite(spec, geosite, &self.rotation);
         }
         let spec = GeoIpSpec::of(cfg);
         if !self.geoip.is_current(&spec) {
             info!(target = "geoip", tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
             self.geoip.watch = None;
-            self.geoip = load_geoip(spec, geoip);
+            self.geoip = load_geoip(spec, geoip, &self.rotation);
         }
     }
 }
@@ -173,7 +240,11 @@ fn start_watch(
 /// 在锁外建好 `spec` 的 GeoSite 数据，整体换进 `shared`，再按新的文件和标签监视
 /// Builds `spec`'s GeoSite data outside the lock, swaps it into `shared` whole, then watches
 /// the new files for the new tags
-fn load_geosite(spec: GeoSiteSpec, shared: &Arc<RwLock<GeoSiteManager>>) -> Loaded<GeoSiteSpec> {
+fn load_geosite(
+    spec: GeoSiteSpec,
+    shared: &Arc<RwLock<GeoSiteManager>>,
+    rotation: &Rotation,
+) -> Loaded<GeoSiteSpec> {
     let mut missing = Vec::new();
     let mut files = Vec::new();
     for path_str in &spec.paths {
@@ -215,11 +286,15 @@ fn load_geosite(spec: GeoSiteSpec, shared: &Arc<RwLock<GeoSiteManager>>) -> Load
     // 旧数据在锁外释放 / The old data is freed outside the lock
     let old = mem::replace(&mut *shared.write(), fresh);
     drop(old);
+    rotation.site_swapped();
 
     let manager = Arc::clone(shared);
     let tags = spec.tags.clone();
+    let rotation = rotation.clone();
     let watch = start_watch(pending, "geosite-watch", move |path| {
-        reload_geosite_file(&manager, path, &tags);
+        if reload_geosite_file(&manager, path, &tags) {
+            rotation.site_swapped();
+        }
     });
     Loaded {
         spec,
@@ -232,10 +307,14 @@ fn load_geosite(spec: GeoSiteSpec, shared: &Arc<RwLock<GeoSiteManager>>) -> Load
 /// 其它文件贡献的标签不动（见 [`GeoSiteManager::apply_source`]）
 /// A watched GeoSite data file `path` changed: it is read again outside the lock, then the
 /// write lock is held briefly to replace only the tags it contributes, leaving other files'
-/// tags alone (see [`GeoSiteManager::apply_source`])
-fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[String]) {
+/// tags alone (see [`GeoSiteManager::apply_source`]). Gives whether new data went in
+/// 换进了新数据时为 true
+fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[String]) -> bool {
     let what = format!("GeoSite data {}", path.display());
-    if let Some(parsed) = load_with_retry(&what, || GeoSiteManager::parse_file(path, tags)) {
+    let Some(parsed) = load_with_retry(&what, || GeoSiteManager::parse_file(path, tags)) else {
+        return false;
+    };
+    {
         // 这份文件此前提供着规则用到的标签，新读出来却一个都没有了：多半是空文件或写坏了的文件（下载
         // 失败、磁盘写满）。换进去会让这些规则一下子全不命中，所以留着正在用的数据，等文件下次改动
         // The file provided tags rules use until now, yet the new read has none of them: most
@@ -246,7 +325,7 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
             && manager.read().source_provides_any(path, tags)
         {
             warn!(target = "geosite_watcher", path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
-            return;
+            return false;
         }
         let mut manager = manager.write();
         let count = manager.apply_source(path, parsed);
@@ -255,6 +334,7 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
         info!(target = "geosite_watcher", path = %path.display(), loaded_count = count, "GeoSite data reloaded");
         warn_missing_geosite_tags(&missing);
     }
+    true
 }
 
 /// 规则用到、却没有一个 GeoSite 数据文件提供的标签记一条告警，和 GeoIP 一样
@@ -268,7 +348,11 @@ fn warn_missing_geosite_tags(missing: &[String]) {
 /// 在锁外建好 `spec` 的 GeoIP 数据，整体换进 `shared`，再监视新的数据文件
 /// Builds `spec`'s GeoIP data outside the lock, swaps it into `shared` whole, then watches the
 /// new data file
-fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<GeoIpSpec> {
+fn load_geoip(
+    spec: GeoIpSpec,
+    shared: &Arc<RwLock<GeoIpManager>>,
+    rotation: &Rotation,
+) -> Loaded<GeoIpSpec> {
     let mut missing = Vec::new();
     if let Some(db_path) = &spec.db_path
         && !Path::new(db_path).exists()
@@ -319,10 +403,14 @@ fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<Geo
     // 旧数据在锁外释放 / The old data is freed outside the lock
     let old = mem::replace(&mut *shared.write(), fresh);
     drop(old);
+    rotation.ip_swapped();
 
     let manager = Arc::clone(shared);
+    let rotation = rotation.clone();
     let watch = start_watch(pending, "geoip-watch", move |path| {
-        reload_geoip_file(&manager, path, &dat_tags);
+        if reload_geoip_file(&manager, path, &dat_tags) {
+            rotation.ip_swapped();
+        }
     });
     Loaded {
         spec,
@@ -336,18 +424,22 @@ fn load_geoip(spec: GeoIpSpec, shared: &Arc<RwLock<GeoIpManager>>) -> Loaded<Geo
 /// A watched GeoIP data file `path` changed: reading, decoding and indexing happen outside
 /// the lock, which is held only for the swap. Matching takes the read lock, and with the
 /// whole reload under the write lock a .dat of 300k networks stalled every GeoIP match for
-/// 961 ms
-fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String]) {
+/// 961 ms. Gives whether new data went in / 换进了新数据时为 true
+fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String]) -> bool {
     let what = format!("GeoIP data {}", path.display());
-    if let Some(parsed) = load_with_retry(&what, || GeoIpManager::parse_file(path, tags)) {
+    let Some(parsed) = load_with_retry(&what, || GeoIpManager::parse_file(path, tags)) else {
+        return false;
+    };
+    {
         // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
         // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
         // none of them any more, most likely a broken file, so the data in use stays
         if parsed.tag_count() == 0 && manager.read().tag_count() > 0 {
             warn!(target = "geoip_watcher", path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
-            return;
+            return false;
         }
         let count = manager.write().apply_parsed(parsed);
         info!(target = "geoip_watcher", path = %path.display(), loaded_count = count, "GeoIP data reloaded");
     }
+    true
 }
