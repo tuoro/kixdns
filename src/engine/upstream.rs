@@ -464,9 +464,11 @@ pub async fn forward_upstream(
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
-    let packet = crate::proto_utils::query_without_cookie(packet);
+    let packet =
+        crate::proto_utils::query_asking_ad(crate::proto_utils::query_without_cookie(packet));
     let guarded = |reply| {
-        let reply = crate::proto_utils::reply_without_cookie(reply);
+        let reply =
+            crate::proto_utils::reply_without_aa(crate::proto_utils::reply_without_cookie(reply));
         // 用当前配置的 min_ttl，而不是请求开始时那份：改 min_ttl 会轮换所有缓存命名空间，一个跨过重载
         // 的应答只会交给它自己的客户端
         // min_ttl comes from the current configuration rather than the request's own:
