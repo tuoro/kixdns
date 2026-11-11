@@ -295,13 +295,6 @@ impl Engine {
         // Stored at the Geo data's generation now. When a watcher swaps data and changes
         // the state meanwhile, rcu starts over and takes the new generation
         inner.set_geo(geo_sources.generation());
-        // 上游超时重载即生效，流控按它分开回答了的和等到超时的（见 `PermitManager::budget`）
-        // The upstream timeout takes effect on reload, and flow control tells answered queries
-        // from those that waited for it by it (see `PermitManager::budget`)
-        self.permit_manager
-            .set_upstream_timeout(Duration::from_millis(
-                inner.pipeline.settings.upstream_timeout_ms,
-            ));
         let inner = Arc::new(inner);
         self.state.rcu(|_| inner.at_geo(geo_sources.generation()));
         let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -322,10 +315,8 @@ impl Engine {
         // keep their warm response and rule caches.
     }
 
-    /// `client` 的一个要等上游的查询能不能处理，内核忙时在途的查询一共最多多少见 `PermitManager::budget`（见
-    /// `FlowControlState::permit`）；没开流控时都能处理
-    /// Whether a query from `client` that waits on an upstream can go ahead, how many queries
-    /// may be in flight in all while the kernel is busy being `PermitManager::budget` (see
+    /// `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::permit`）；没开流控时都能处理
+    /// Whether a query from `client` that waits on an upstream can go ahead (see
     /// `FlowControlState::permit`); without flow control it always can
     #[inline]
     pub fn query_permit(&self, emptied_at: Instant, client: IpAddr) -> Option<PermitGuard> {
@@ -334,7 +325,6 @@ impl Engine {
                 &self.permit_manager,
                 emptied_at,
                 self.permit_manager.slot_of(client),
-                self.permit_manager.budget(Instant::now()),
             ),
             None => Some(self.permit_manager.acquire()),
         }
@@ -369,19 +359,15 @@ impl Engine {
         }
     }
 
-    /// 按设备轮流时 `client` 的一个要等上游的查询能不能处理，预算同 [`Self::query_permit`]（见
-    /// `FlowControlState::turn_permit`）；没开流控时都能
+    /// 按设备轮流时 `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::turn_permit`）；没开流控时都能
     /// Whether a query from `client` that waits on an upstream can go ahead while devices take
-    /// turns, the budget as for [`Self::query_permit`] (see `FlowControlState::turn_permit`);
-    /// without flow control it always can
+    /// turns (see `FlowControlState::turn_permit`); without flow control it always can
     #[inline]
     pub fn turn_query_permit(&self, client: IpAddr) -> Option<PermitGuard> {
         match &self.flow_control_state {
-            Some(state) => state.turn_permit(
-                &self.permit_manager,
-                self.permit_manager.slot_of(client),
-                self.permit_manager.budget(Instant::now()),
-            ),
+            Some(state) => {
+                state.turn_permit(&self.permit_manager, self.permit_manager.slot_of(client))
+            }
             None => Some(self.permit_manager.acquire()),
         }
     }
@@ -1907,12 +1893,30 @@ impl Engine {
                                 // 规则 continue 后，下一条 Forward 查询失败。必须给客户端
                                 // 一个确定性的响应而非静默：DNS 客户端会把无响应视为
                                 // TIMEOUT。返回 SERVFAIL 以便 stub resolver 重试。
-                                warn!(
-                                    event = "continue_reforward_failed",
-                                    error = %e,
-                                    rule = %rule_name,
-                                    "continue re-forward failed, returning SERVFAIL"
-                                );
+                                // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：规则
+                                // continue 以后还留着的条目现在放下，这个 SERVFAIL 不交给等在上面的别的请求；
+                                // 也不逐个记警告，拦着的时候每秒可以有几万个
+                                // A failure with flow control keeping the query from waiting is the
+                                // device's own affair (see `UpstreamFailure::withheld`): the entry
+                                // still held after a rule continued goes now, and this SERVFAIL is
+                                // not handed to the other requests waiting on it; nor is a warning
+                                // logged for each, held back there being tens of thousands a second
+                                if crate::engine::upstream::UpstreamFailure::was_withheld(&e) {
+                                    drop(held_inflight.take());
+                                    tracing::debug!(
+                                        event = "forward_withheld",
+                                        error = %e,
+                                        rule = %rule_name,
+                                        "flow control kept the forward from the upstream, returning SERVFAIL"
+                                    );
+                                } else {
+                                    warn!(
+                                        event = "continue_reforward_failed",
+                                        error = %e,
+                                        rule = %rule_name,
+                                        "continue re-forward failed, returning SERVFAIL"
+                                    );
+                                }
                                 return servfail("parse request for SERVFAIL");
                             }
                         }
@@ -4618,6 +4622,7 @@ mod tests {
             qname: "example.com",
             qtype: RecordType::A,
             client_ip: "10.0.0.1".parse().unwrap(),
+            asker: Some("10.0.0.1".parse().unwrap()),
             upstream_default: TEST_UPSTREAM,
             pipeline_id: "pipeline",
             rule_name: "rule",
@@ -5246,34 +5251,6 @@ mod tests {
         engine.reload(stale_settings(false, 10));
         assert_eq!(engine.cache.max_age(), Duration::from_secs(2));
         assert_eq!(engine.ttl_cap(), 2);
-    }
-
-    /// 流控分开回答了的和等到超时的，用的是配置里的上游超时：启动时记下，重载即换（见 `PermitManager::budget`）
-    /// Flow control tells answered queries from those that waited for the timeout by the upstream
-    /// timeout of the configuration: noted at start, changed on reload (see `PermitManager::budget`)
-    #[tokio::test]
-    async fn flow_control_follows_the_upstream_timeout_on_reload() {
-        let config = |timeout: u64| {
-            serde_json::json!({
-                "settings": {
-                    "default_upstream": DEAD_UPSTREAM,
-                    "flow_control_enabled": true,
-                    "upstream_timeout_ms": timeout,
-                },
-                "pipelines": []
-            })
-        };
-        let engine = engine_from_json(config(2000));
-        assert_eq!(
-            engine.permit_manager.upstream_timeout(),
-            Duration::from_millis(2000)
-        );
-        let reloaded: crate::config::PipelineConfig = serde_json::from_value(config(5000)).unwrap();
-        engine.reload(RuntimePipelineConfig::from_config(reloaded).unwrap());
-        assert_eq!(
-            engine.permit_manager.upstream_timeout(),
-            Duration::from_millis(5000)
-        );
     }
 
     /// 一条 `stale.com` 的 A 查询。 / A query for `stale.com` A.
