@@ -784,7 +784,9 @@ mod tests {
         // 和它不在同一份的另一台 / Another device, not in the same slot
         let light = (2..=250)
             .map(|n| SocketAddr::from(([127, 0, 0, n], 53000)))
-            .find(|peer| manager.slot_of(peer.ip()) != manager.slot_of(heavy.ip()))
+            .find(|peer| {
+                manager.slot_of(peer.ip()).counted_in() != manager.slot_of(heavy.ip()).counted_in()
+            })
             .unwrap();
         let held: Vec<_> = (0..1000)
             .map(|_| {
