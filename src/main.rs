@@ -1635,7 +1635,8 @@ impl TakingTurns {
         replies: &mut udp_batch::Replies,
     ) {
         self.reads = 0;
-        self.queue.set_room(answering.queries_within_target);
+        self.queue
+            .begin_batch(answering.queries_within_target, Instant::now());
         let manager = &answering.engine.permit_manager;
         for _ in 0..udp_batch::BATCH {
             let Some((packet, peer, queues_its_share)) = self.queue.next_in_turn() else {
@@ -1784,7 +1785,8 @@ impl TurnsOneByOne {
     /// average loses this one unparsed, and a device sending little is answered as usual (see
     /// `TakingTurns::answer_in_turn`)
     async fn answer_in_turn(&mut self, answering: &mut UdpAnswering<'_>, reply: &mut BytesMut) {
-        self.queue.set_room(answering.queries_within_target);
+        self.queue
+            .begin_batch(answering.queries_within_target, Instant::now());
         for _ in 0..ONE_BY_ONE_TURN {
             let Some((packet, peer, queues_its_share)) = self.queue.next_in_turn() else {
                 return;
@@ -3314,8 +3316,8 @@ mod tests {
         let light = (2..=250)
             .map(|n| SocketAddr::from(([127, 0, 0, n], 53000)))
             .find(|peer| {
-                engine.permit_manager.slot_of(peer.ip())
-                    != engine.permit_manager.slot_of(heavy.ip())
+                engine.permit_manager.slot_of(peer.ip()).counted_in()
+                    != engine.permit_manager.slot_of(heavy.ip()).counted_in()
             })
             .unwrap();
         (engine, heavy, light)
@@ -4544,7 +4546,7 @@ mod tests {
         // slot: slots go by a hash that differs at each start
         let light = (2..=250)
             .map(|n| IpAddr::from(Ipv4Addr::new(127, 0, 0, n)))
-            .find(|ip| manager.slot_of(*ip) != manager.slot_of(heavy))
+            .find(|ip| manager.slot_of(*ip).counted_in() != manager.slot_of(heavy).counted_in())
             .unwrap();
         let held: Vec<_> = (0..1000)
             .map(|_| engine.stream_query_permit(heavy).expect("plenty of memory"))
@@ -4640,16 +4642,17 @@ mod tests {
             engine_short_of_memory(upstream.local_addr().unwrap(), Arc::clone(&available));
         drop(plain);
         let manager = &engine.permit_manager;
-        // 1000 台设备各占一个查询，各在一份 / 1000 devices holding one query each, each in a slot of its own
+        // 1000 台设备各占一个查询，数设备时各算一台 / 1000 devices holding one query each, each
+        // counting as one when devices are counted
         let mut slots = std::collections::HashSet::new();
         let holders: Vec<IpAddr> = (0..=255u8)
             .flat_map(|b| (1..=254u8).map(move |c| IpAddr::from(Ipv4Addr::new(127, 1, b, c))))
-            .filter(|ip| slots.insert(manager.slot_of(*ip)))
+            .filter(|ip| slots.insert(manager.slot_of(*ip).counted_in()))
             .take(1000)
             .collect();
         let client = (2..=254)
             .map(|n| IpAddr::from(Ipv4Addr::new(127, 0, 0, n)))
-            .find(|ip| !slots.contains(&manager.slot_of(*ip)))
+            .find(|ip| !slots.contains(&manager.slot_of(*ip).counted_in()))
             .unwrap();
         let held: Vec<_> = holders
             .iter()

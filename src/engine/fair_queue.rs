@@ -9,6 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::RandomState;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use super::concurrency::SHARE_AT_LEAST;
 
@@ -19,6 +20,13 @@ use super::concurrency::SHARE_AT_LEAST;
 /// (see `the_queues_hold_at_most_each_device_filling_its_share_in_turn`), so a flood with forged
 /// source addresses, each getting one in, holds no more
 pub(crate) const MAX_QUEUED_DEVICES: usize = 4096;
+
+/// 有新设备因为排队的设备到了 [`MAX_QUEUED_DEVICES`] 被挡在外面以后，这么久里每台只排得进一个，见
+/// [`FairQueue::begin_batch`]。被挡的设备要过一阵才再问：客户端等不到回答，一般过一到五秒重发
+/// For this long after a new device was turned away for [`MAX_QUEUED_DEVICES`] being queued,
+/// each device gets only one in, see [`FairQueue::begin_batch`]. A device turned away asks again
+/// only some time later: a client getting no answer usually asks again one to five seconds on
+pub(crate) const TURNED_AWAY_KEPT: Duration = Duration::from_secs(10);
 
 /// 空出来的队列留这么多个下次再用，省得每台新设备都分配一次 / This many emptied queues are kept for reuse,
 /// sparing an allocation for every new device
@@ -117,22 +125,26 @@ pub struct FairQueue<P> {
     queues: HashMap<Device, Queued<P>, RandomState>,
     /// 还有查询排着的设备，下一个轮到的在最前面 / The devices holding queries, the next in turn first
     turns: VecDeque<Device>,
-    /// 一台设备排进去时能排到多少：它除以那一刻在排队的设备数，至少 [`SHARE_AT_LEAST`]。排着的不收回，一共能排多少见
-    /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
+    /// 一台设备排进去时能排到多少：它除以那一刻在排队的设备数，至少 [`Self::begin_batch`] 定下的数，平常是
+    /// [`SHARE_AT_LEAST`]。排着的不收回，一共能排多少见 `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     /// How far a device may queue as it offers a query: this divided by how many devices are queued
-    /// at that moment, at least [`SHARE_AT_LEAST`]. What is queued is not taken back; for how much
-    /// may be held in all see `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
+    /// at that moment, at least what [`Self::begin_batch`] set, [`SHARE_AT_LEAST`] as a rule. What
+    /// is queued is not taken back; for how much may be held in all see
+    /// `the_queues_hold_at_most_each_device_filling_its_share_in_turn`
     room: usize,
     /// 一共排着多少个 / How many are queued in all
     queued: usize,
     /// 空出来留着再用的队列 / Emptied queues kept for reuse
     spare: Vec<Queued<P>>,
-    /// 一共轮过多少次 / How many turns have been taken in all
-    turns_taken: u64,
-    /// 上一次有新设备因为排队的设备到了 [`MAX_QUEUED_DEVICES`] 被挡在外面时，已经轮过多少次，见 [`Self::share_at_least`]
-    /// How many turns had been taken when a new device was last turned away for
-    /// [`MAX_QUEUED_DEVICES`] being queued, see [`Self::share_at_least`]
-    turned_away_at: Option<u64>,
+    /// 每台设备至少排得进几个，见 [`Self::begin_batch`] / How many each device may at least queue,
+    /// see [`Self::begin_batch`]
+    at_least: usize,
+    /// 这一批开始以后有没有新设备因为排队的设备到了 [`MAX_QUEUED_DEVICES`] 被挡在外面 / Whether a new device
+    /// was turned away for [`MAX_QUEUED_DEVICES`] being queued since this batch began
+    turned_away: bool,
+    /// 上一次有新设备被挡在外面以后，下一批是什么时候开始的 / When the batch after a new device was last
+    /// turned away began
+    turned_away_at: Option<Instant>,
 }
 
 impl<P> FairQueue<P> {
@@ -143,27 +155,52 @@ impl<P> FairQueue<P> {
             room,
             queued: 0,
             spare: Vec::new(),
-            turns_taken: 0,
+            at_least: SHARE_AT_LEAST,
+            turned_away: false,
             turned_away_at: None,
         }
     }
 
-    pub fn set_room(&mut self, room: usize) {
+    /// 答一批之前：`room` 同 [`Self::new`]，`now` 是这一批开始的时刻。也定下每台设备至少排得进几个：平常是
+    /// [`SHARE_AT_LEAST`]；[`TURNED_AWAY_KEPT`] 里有新设备因为排队的设备到了 [`MAX_QUEUED_DEVICES`] 被挡在外面时是 1，挡的那一刻起
+    /// 就是。来源比设备上限还多时，洪泛的设备每轮到一次只取走一个，这一圈里又到了几个，每台排得进几个的话队列一直不空，先排进去的
+    /// 那些一直占着位置，后来的设备一个都排不进；每台只排得进一个时，轮到一次就排空、让出位置，后来的才赶得上空位。记的是时间不是
+    /// 轮数：被挡的设备过一阵才再问，一圈有多长却跟着处理速度变；来源正好是上限那么多时，被挡的只有这台设备，只记一圈的话等它再问时
+    /// 早过了，各台又排满了，它一次都排不进
+    /// Before a batch is answered: `room` as for [`Self::new`] and `now` when the batch begins.
+    /// This also sets how many each device may at least queue: [`SHARE_AT_LEAST`] as a rule, and 1
+    /// when within [`TURNED_AWAY_KEPT`] a new device was turned away for [`MAX_QUEUED_DEVICES`]
+    /// being queued, from the moment it was. With more sources than the device limit, a flooding
+    /// device has one taken each turn and several more arriving within the round, so with a few
+    /// each its queue never runs empty, those queued first keep their places for good and a device
+    /// coming later never gets in; with one each, a turn empties it and gives up the place, and a
+    /// later device has a chance at it. Time is kept rather than turns: a device turned away asks
+    /// again some time later, while how long a round takes goes with the handling speed; with
+    /// exactly as many sources as the limit only this device is turned away, and remembering a
+    /// round would have it long over by the time it asked again, every device full once more, so
+    /// it would never get in
+    pub fn begin_batch(&mut self, room: usize, now: Instant) {
         self.room = room;
+        if std::mem::take(&mut self.turned_away) {
+            self.turned_away_at = Some(now);
+        }
+        self.at_least = match self.turned_away_at {
+            Some(at) if now.saturating_duration_since(at) < TURNED_AWAY_KEPT => 1,
+            _ => SHARE_AT_LEAST,
+        };
     }
 
-    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。份额至少 [`Self::share_at_least`]：设备多到平分下来每台不到一个时，
+    /// 排进去；这台设备排满了自己那一份就丢掉，返回 false。份额至少是 [`Self::begin_batch`] 定下的数：设备多到平分下来每台不到一个时，
     /// 发得少的设备一次问几个也排得进。还没排着的设备总能排进去，发得少的设备不会被挡；只有已经有 [`MAX_QUEUED_DEVICES`] 台在
     /// 排队时，新来的才丢
     /// Queues a query; with the device's share full it is dropped and this gives false. A share is
-    /// at least [`Self::share_at_least`]: with devices so many that each would get less than one, a
+    /// at least what [`Self::begin_batch`] set: with devices so many that each would get less than one, a
     /// device sending little asking a few at once still gets them in. A device not queued yet
     /// always gets in, so a device sending little is not kept out; only with
     /// [`MAX_QUEUED_DEVICES`] already queued is a new one dropped
     pub fn offer(&mut self, packet: &[u8], device: Device, peer: P) -> bool {
-        let at_least = self.share_at_least();
         if let Some(queue) = self.queues.get_mut(&device) {
-            if queue.len() >= (self.room / self.turns.len()).max(at_least) {
+            if queue.len() >= (self.room / self.turns.len()).max(self.at_least) {
                 return false;
             }
             queue.push_back((packet.into(), peer));
@@ -171,7 +208,8 @@ impl<P> FairQueue<P> {
             return true;
         }
         if self.turns.len() >= MAX_QUEUED_DEVICES {
-            self.turned_away_at = Some(self.turns_taken);
+            self.turned_away = true;
+            self.at_least = 1;
             return false;
         }
         let mut queue = self.spare.pop().unwrap_or_default();
@@ -182,39 +220,19 @@ impl<P> FairQueue<P> {
         true
     }
 
-    /// 每台设备至少排得进几个：平常是 [`SHARE_AT_LEAST`]；最近一圈里有新设备因为排队的设备到了 [`MAX_QUEUED_DEVICES`] 被挡在
-    /// 外面时是 1。来源比设备上限还多时，洪泛的设备每轮到一次只取走一个，这一圈里又到了几个，每台排得进几个的话队列一直不空，
-    /// 先排进去的那些一直占着位置，后来的设备一个都排不进；每台只排得进一个时，轮到一次就排空、让出位置，后来的才赶得上空位。
-    /// 一圈按设备上限那么多次算：上限那么多台在排时，每台都轮到一次
-    /// How many each device may at least queue: [`SHARE_AT_LEAST`] as a rule, and 1 when within the
-    /// last round a new device was turned away for [`MAX_QUEUED_DEVICES`] being queued. With more
-    /// sources than the device limit, a flooding device has one taken each turn and several more
-    /// arriving within the round, so with a few each its queue never runs empty, those queued
-    /// first keep their places for good and a device coming later never gets in; with one each, a
-    /// turn empties it and gives up the place, and a later device has a chance at it. A round is
-    /// counted as that many turns as the limit: with that many devices queued, each gets a turn
-    fn share_at_least(&self) -> usize {
-        match self.turned_away_at {
-            Some(at) if self.turns_taken.wrapping_sub(at) < MAX_QUEUED_DEVICES as u64 => 1,
-            _ => SHARE_AT_LEAST,
-        }
-    }
-
-    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少，而且至少 [`Self::share_at_least`] 个（排得更少的不算）。
+    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少，而且至少是 [`Self::begin_batch`] 定下的那么多个（排得更少的不算）。
     /// 一次问好几个的设备后面也排着几个，但比一直在发的少得多，不算；设备多到每台只排几个时，后面排着不到这么多个的也不算，那是
     /// 每台都排得进的份
     /// The next query in turn, and whether this device has no fewer queued behind it than the
-    /// average across devices, and at least [`Self::share_at_least`] (one with fewer does not). A
+    /// average across devices, and at least what [`Self::begin_batch`] set (one with fewer does not). A
     /// device asking several at once has a few behind it too, but far fewer than one sending on
     /// and on, and does not count; with devices so many that each queues only a few, one with
     /// fewer than that behind does not count either, that being the share every device gets in
     pub fn next_in_turn(&mut self) -> Option<(Box<[u8]>, P, bool)> {
-        let at_least = self.share_at_least();
         let device = self.turns.pop_front()?;
         let queue = self.queues.get_mut(&device)?;
         let (packet, peer) = queue.pop_front()?;
         self.queued -= 1;
-        self.turns_taken = self.turns_taken.wrapping_add(1);
         let left = queue.len();
         if left > 0 {
             self.turns.push_back(device);
@@ -223,7 +241,7 @@ impl<P> FairQueue<P> {
         {
             self.spare.push(emptied);
         }
-        let queues_its_share = left >= at_least && left * self.turns.len() >= self.queued;
+        let queues_its_share = left >= self.at_least && left * self.turns.len() >= self.queued;
         Some((packet, peer, queues_its_share))
     }
 
@@ -383,14 +401,17 @@ mod tests {
         assert_eq!(light_turns, [false, false, false]);
     }
 
-    /// 排队的设备到了上限、又有新设备被挡在外面以后，每台只排得进一个，后面排着一个、不比平均少的就算占着份额，和以前一样；轮一圈
-    /// 没再挡谁就又是至少 4 个
+    /// 排队的设备到了上限、又有新设备被挡在外面以后，挡的那一刻起每台只排得进一个，后面排着一个、不比平均少的就算占着份额，
+    /// 和以前一样；`TURNED_AWAY_KEPT` 里一直这样，过了又是至少 4 个
     /// Once the queued devices are at the limit and a new device has been turned away, each gets
-    /// only one in, and one with one behind and no fewer than the average holds its share, as it
-    /// used to; after a round with nobody turned away it is at least 4 again
+    /// only one in from that moment, and one with one behind and no fewer than the average holds
+    /// its share, as it used to; so it stays for `TURNED_AWAY_KEPT`, and past that it is at least
+    /// 4 again
     #[test]
     fn past_the_device_limit_each_queues_one_again() {
         let mut queue = FairQueue::new(100);
+        let start = Instant::now();
+        queue.begin_batch(100, start);
         let limit = MAX_QUEUED_DEVICES as u32;
         for n in 0..limit {
             assert!(queue.offer(b"q", device(n), n));
@@ -408,13 +429,18 @@ mod tests {
             queue.next_in_turn();
         }
         assert_eq!(queue.devices(), 1, "all but the one holding two ran empty");
-        // 一圈里没再挡谁：设备多到平分下来每台一个都没有，每台又排得进 4 个 / A round with nobody turned
-        // away: with devices so many that each would get none, each gets 4 in again
+        // 设备多到平分下来每台一个都没有：记着的时候每台只排得进一个，过了又是 4 个 / With devices so
+        // many that each would get none: one each while it is kept, and 4 again past that
+        let noted = start + Duration::from_millis(1);
+        queue.begin_batch(100, noted);
+        queue.begin_batch(100, noted + TURNED_AWAY_KEPT - Duration::from_millis(1));
         for n in 1..1000 {
             assert!(queue.offer(b"q", device(n), n));
         }
+        assert!(!queue.offer(b"q", device(5), 1), "still kept, one each");
+        queue.begin_batch(100, noted + TURNED_AWAY_KEPT);
         for id in 1..SHARE_AT_LEAST as u32 {
-            assert!(queue.offer(b"q", device(5), id), "a round later, {id}");
+            assert!(queue.offer(b"q", device(5), id), "no longer kept, {id}");
         }
         assert!(!queue.offer(b"q", device(5), 9), "and no more");
     }
@@ -429,6 +455,7 @@ mod tests {
         let mut queue = FairQueue::new(100);
         let sources = MAX_QUEUED_DEVICES as u32 + 900;
         let light = device(sources);
+        let start = Instant::now();
         let (mut waiting, mut answered) = (false, 0);
         for round in 0..40u32 {
             // 每轮各发一个，先后打乱；它夹在中间 / Each sends one a round in a shuffled order, it somewhere among them
@@ -440,6 +467,7 @@ mod tests {
                 let n = (k * 7919 + round * 31) % sources;
                 queue.offer(b"q", device(n), n);
             }
+            queue.begin_batch(100, start + Duration::from_millis(50 * u64::from(round)));
             for _ in 0..1000 {
                 if let Some((_, peer, _)) = queue.next_in_turn()
                     && peer == sources
@@ -450,6 +478,51 @@ mod tests {
             }
         }
         assert!(answered >= 5, "{answered}");
+    }
+
+    /// 来源正好是设备上限那么多、一直在发时，隔一秒才问一个的设备也排得进：被挡以后每台只排得进一个，记十秒，这些来源排空了让出
+    /// 位置，它下次问时赶得上。以前只记一圈，被挡的只有它，等它再问时早过了，各台又排满了，一次都排不进；少一个来源时本来就排得进
+    /// With exactly as many sources as the device limit sending on and on, a device asking once a
+    /// second still gets in: once it is turned away each gets one in, kept for ten seconds, so the
+    /// sources run empty and give up places in time for its next ask. Only a round used to be
+    /// kept, and with it alone turned away that was long over when it asked again, every device
+    /// full once more, so it never got in; with a source fewer it always did
+    #[test]
+    fn a_device_asking_now_and_then_gets_in_with_sources_at_the_device_limit() {
+        let limit = MAX_QUEUED_DEVICES as u32;
+        for sources in [limit - 1, limit] {
+            let mut queue = FairQueue::new(100);
+            let light = device(sources);
+            let start = Instant::now();
+            let (mut waiting, mut asked, mut answered) = (false, 0, 0);
+            // 一轮 50 毫秒：来源一共发 3000 个，轮到 1000 个；它每 20 轮（一秒）问一个，上一个还排着就不问，数第 200 轮以后的
+            // A round is 50 ms: the sources send 3000 in all and 1000 get their turn; it asks one
+            // every 20 rounds (a second) unless one is still queued, counted from round 200 on
+            for round in 0..1400u32 {
+                let light_at = round * 997 % 3000;
+                for k in 0..3000u32 {
+                    if k == light_at && !waiting && round % 20 == 0 {
+                        asked += u32::from(round >= 200);
+                        waiting = queue.offer(b"q", light, sources);
+                    }
+                    let n = (u64::from(round * 3000 + k) * 7919 % u64::from(sources)) as u32;
+                    queue.offer(b"q", device(n), n);
+                }
+                queue.begin_batch(100, start + Duration::from_millis(50 * u64::from(round)));
+                for _ in 0..1000 {
+                    if let Some((_, peer, _)) = queue.next_in_turn()
+                        && peer == sources
+                    {
+                        waiting = false;
+                        answered += u32::from(round >= 200);
+                    }
+                }
+            }
+            assert!(
+                answered * 10 >= asked * 8,
+                "{answered} of {asked}, {sources} sources"
+            );
+        }
     }
 
     #[test]
