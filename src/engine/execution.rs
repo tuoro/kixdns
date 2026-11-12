@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::FxHasher;
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -1532,7 +1532,7 @@ impl Engine {
             }
 
             let qname: &str = qname_ref;
-            let mut skip_rules: FxHashSet<Arc<str>> = FxHashSet::default();
+            let mut skip_rules = crate::engine::pipeline::Continued::new();
             let mut current_pipeline_id = pipeline_id.clone();
             let mut current_uses_client_ip =
                 pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
@@ -1542,7 +1542,7 @@ impl Engine {
             // 求值 `pipeline` 的规则，跳过 `skip` 里的（continue 越过的那些）
             // Evaluate the rules of `pipeline`, skipping those in `skip` (the ones a continue passed)
             let evaluate = |pipeline: &crate::matcher::RuntimePipeline,
-                            skip: Option<&FxHashSet<Arc<str>>>| {
+                            skip: Option<&[usize]>| {
                 self.apply_rules(
                     &state,
                     pipeline,
@@ -1787,6 +1787,7 @@ impl Engine {
                         pre_split_upstreams,
                         response_phase,
                         rule_name,
+                        rule_index,
                         transport,
                         ecs,
                         allow_reuse,
@@ -1865,7 +1866,7 @@ impl Engine {
                                 refresh_passed_an_answer |= skip_cache && ctx.is_some();
                                 refresh_fell_back = skip_cache && after_failure;
                                 reused_response = *ctx;
-                                skip_rules.insert(rule_name.clone());
+                                skip_rules.extend(rule_index);
 
                                 let Some(pipeline) = cfg.pipeline(&current_pipeline_id) else {
                                     warn!(
@@ -3506,12 +3507,12 @@ mod tests {
     }
 
     /// 在响应跳转路径上，跳转次数同样取决于请求一路怎么来的。经过更多跳转才到 `s` 的
-    /// 请求先用完了次数（在下一个 pipeline 的入口，或在 `s` 的回答检查要跳转时），它的
+    /// 请求先用完了次数（在 `s` 的回答检查要跳转时，或在之后一次规则级跳转时），它的
     /// SERVFAIL 不能交给直接从 `p2` 跳来、还有余量的请求。
     /// On the response-jump path too, the jumps left depend on the way a request
-    /// came. One that reached `s` through more jumps runs out first (entering the
-    /// next pipeline, or when the answer check in `s` jumps), and its SERVFAIL
-    /// must not reach a request that jumped there from `p2` with jumps to spare.
+    /// came. One that reached `s` through more jumps runs out first (when the answer
+    /// check in `s` jumps, or at a rule-level hop after it), and its SERVFAIL must
+    /// not reach a request that jumped there from `p2` with jumps to spare.
     #[tokio::test]
     async fn a_jump_path_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
         let entry = answering_upstream("192.0.2.50".parse().unwrap(), 300)
@@ -3559,20 +3560,13 @@ mod tests {
             )
         };
         // 第一个请求在 s 之前多走一次或两次规则级跳转，于是比从 p2 来的请求先用完次数：
-        // 在下一个 pipeline 的入口、在 s 的回答检查要跳转时，或在之后一次规则级跳转时。
+        // 在 s 的回答检查要跳转时，或在之后一次规则级跳转时。（上限 N 就是能跳 N 次：带着
+        // 0 次进入下一个 pipeline 不算超限，所以没有「在入口用完」这种情况。）
         // The first request takes one or two more rule-level hops before s, so it
-        // runs out before the one from p2: entering the next pipeline, when the
-        // answer check in s jumps, or at a rule-level hop after it.
+        // runs out before the one from p2: when the answer check in s jumps, or at a
+        // rule-level hop after it. (A limit of N is N jumps: entering the next
+        // pipeline with none left is within it, so nothing runs out on entering.)
         let paths = [
-            (
-                "entering the next pipeline",
-                3,
-                vec![
-                    hop("y", "s"),
-                    checked_jump("s", &slow, "t"),
-                    answers_at("t"),
-                ],
-            ),
             (
                 "at the answer check's jump",
                 3,

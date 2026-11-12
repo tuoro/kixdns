@@ -166,7 +166,7 @@ impl GeoSources {
         };
         Self {
             geosite: load_geosite(GeoSiteSpec::of(cfg), geosite, &rotation),
-            geoip: load_geoip(GeoIpSpec::of(cfg), geoip, &rotation),
+            geoip: load_geoip(GeoIpSpec::of(cfg), None, geoip, &rotation),
             rotation,
         }
     }
@@ -200,7 +200,8 @@ impl GeoSources {
         if !self.geoip.is_current(&spec) {
             info!(target = "geoip", tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
             self.geoip.watch = None;
-            self.geoip = load_geoip(spec, geoip, &self.rotation);
+            let in_use = self.geoip.spec.dat_path.clone();
+            self.geoip = load_geoip(spec, in_use.as_deref(), geoip, &self.rotation);
         }
     }
 }
@@ -264,27 +265,53 @@ fn load_geosite(
 
     let pending = pending_watch("GeoSite data", &files);
     let mut fresh = GeoSiteManager::new();
+    // 读出来没有一个规则用到的标签的文件（读不了的也算）/ The files whose read gave none of the
+    // tags rules use (unreadable ones included)
+    let mut gave_nothing = Vec::new();
     for path in &files {
-        match GeoSiteManager::parse_file(path, &spec.tags) {
-            Ok(parsed) => {
-                let count = fresh.apply_source(path, parsed);
-                info!(path = %path.display(), loaded_count = count,
-                     used_tags = spec.tags.len(),
-                     "loaded GeoSite data from file");
-            }
-            // 解析失败的文件照样监视：写了一半或被截断的文件在下次写完时能自己恢复，不必重启进程
-            // A file that failed to parse is watched all the same: a half-written or truncated
-            // file heals itself on the next write instead of needing a restart
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "failed to load GeoSite data, waiting for the file to change");
-            }
+        // 解析失败的文件照样监视：写了一半或被截断的文件在下次写完时能自己恢复，不必重启进程。它在文件里的
+        // 先后也照样记下（几个文件声明同一个标签时排在后面的说了算）
+        // A file that failed to parse is watched all the same: a half-written or truncated
+        // file heals itself on the next write instead of needing a restart. Its place among
+        // the files is recorded all the same (of files declaring one tag the later decides)
+        let parsed = GeoSiteManager::parse_file(path, &spec.tags)
+            .inspect_err(|e| warn!(path = %path.display(), error = %e, "failed to load GeoSite data, waiting for the file to change"))
+            .ok();
+        let readable = parsed.is_some();
+        let parsed = parsed.unwrap_or_default();
+        if !parsed_provides_any(&parsed, &spec.tags) {
+            gave_nothing.push(path);
+        }
+        let count = fresh.apply_source(path, parsed);
+        if readable {
+            info!(path = %path.display(), loaded_count = count,
+                 used_tags = spec.tags.len(),
+                 "loaded GeoSite data from file");
         }
     }
-    if !files.is_empty() {
-        warn_missing_geosite_tags(&fresh.missing_tags(&spec.tags));
-    }
+    let old = {
+        let mut in_use = shared.write();
+        // 和监视到文件变了时一样（见 `reload_geosite_file`）：这份文件此前提供着规则现在还用的标签，重新读出来
+        // 却一个都没有，多半是空文件或写坏了的文件。这些标签留着正在用的数据，等文件下次改动
+        // As when a watched file changes (see `reload_geosite_file`): the file provided tags
+        // the rules still use, yet reading it again gives none of them, most likely an empty or
+        // broken file. Those tags keep the data in use until the file changes again
+        for path in gave_nothing {
+            let kept = in_use.take_source(path, &spec.tags);
+            if !kept.is_empty() {
+                warn!(target = "geosite", path = %path.display(), tags = kept.len(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
+                fresh.apply_source(path, kept);
+            }
+        }
+        let missing = fresh.missing_tags(&spec.tags);
+        let old = mem::replace(&mut *in_use, fresh);
+        drop(in_use);
+        if !files.is_empty() {
+            warn_missing_geosite_tags(&missing);
+        }
+        old
+    };
     // 旧数据在锁外释放 / The old data is freed outside the lock
-    let old = mem::replace(&mut *shared.write(), fresh);
     drop(old);
     rotation.site_swapped();
 
@@ -345,11 +372,14 @@ fn warn_missing_geosite_tags(missing: &[String]) {
     }
 }
 
-/// 在锁外建好 `spec` 的 GeoIP 数据，整体换进 `shared`，再监视新的数据文件
+/// 在锁外建好 `spec` 的 GeoIP 数据，整体换进 `shared`，再监视新的数据文件。`in_use` 是 `shared` 里正在用的
+/// 数据读自哪个数据文件（启动时还没有）
 /// Builds `spec`'s GeoIP data outside the lock, swaps it into `shared` whole, then watches the
-/// new data file
+/// new data file. `in_use` is the data file the data in `shared` was read from (none yet at
+/// startup)
 fn load_geoip(
     spec: GeoIpSpec,
+    in_use: Option<&str>,
     shared: &Arc<RwLock<GeoIpManager>>,
     rotation: &Rotation,
 ) -> Loaded<GeoIpSpec> {
@@ -400,8 +430,24 @@ fn load_geoip(
             }
         }
     }
+    let old = {
+        let mut current = shared.write();
+        // 和监视到文件变了时一样（见 `reload_geoip_file`）：还是正在用的那份数据文件，重新读出来却没有一个规则
+        // 用到的标签，多半是空文件或写坏了的文件。规则现在还用的标签留着正在用的数据，等文件下次改动
+        // As when a watched file changes (see `reload_geoip_file`): the data file is the one
+        // the data in use came from, yet reading it again gives none of the tags rules use,
+        // most likely an empty or broken file. The tags the rules still use keep the data in
+        // use until the file changes again
+        if fresh.tag_count() == 0
+            && let Some(path) = files.first()
+            && in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path())
+            && fresh.keep_tags_of(&mut current, &dat_tags) > 0
+        {
+            warn!(target = "geoip", path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
+        }
+        mem::replace(&mut *current, fresh)
+    };
     // 旧数据在锁外释放 / The old data is freed outside the lock
-    let old = mem::replace(&mut *shared.write(), fresh);
     drop(old);
     rotation.ip_swapped();
 

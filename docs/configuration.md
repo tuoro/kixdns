@@ -33,7 +33,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | default_upstream | 1.1.1.1:53 | 默认上游；支持逗号分隔列表。 |
 | upstream_timeout_ms | 9000 | 单次上游操作超时；必须大于 0。 |
 | request_timeout_ms | null | 整体请求超时；为 null 时使用 upstream_timeout_ms * 2.5，且不能小于 upstream_timeout_ms。 |
-| response_jump_limit | 10 | 响应阶段 Pipeline 跳转上限。 |
+| response_jump_limit | 10 | 响应阶段最多跳转几次 Pipeline（回答动作里的跳转和跳转之后规则级的跳转都算）；再跳就回 SERVFAIL。 |
 | udp_pool_size | 64 | 出站 UDP socket 池大小。 |
 | tcp_pool_size | 64 | 每个上游最多几条 TCP 连接。平常只用第一条；它上面同时有 32 个以上查询没答完时，再来的查询才用后面的。 |
 | doh_pool_size | 8 | 上游不支持 HTTP/2、或设了 `HTTPS_PROXY` / `ALL_PROXY` 时，每个上游最多保留的 DoH 空闲连接数。支持 HTTP/2 的上游直连，每个工作线程最多一条，平常只用一条，忙起来的规则和 `tcp_pool_size` 一样。 |
@@ -65,7 +65,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游最多指定毫秒数，并受 request_timeout_ms 剩余预算截断，保证过期应答来得及返回。这次刷新失败时不再等满，马上返回过期数据。 |
 | geoip_db_path | null | MaxMind MMDB 路径。 |
 | geoip_dat_path | null | V2Ray GeoIP 数据文件路径：可以是 protobuf `.dat`，也可以是下文说明的兼容 JSON。 |
-| geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。 |
+| geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。几个文件声明同一个标签时，用排在后面的文件里的。 |
 
 当前配置类型会反序列化 geoip_auto_convert 和 geoip_filter_countries，但运行引擎没有读取它们，因此它们不会改变运行行为。转换时的国家过滤请使用 convert-geo-ip 的 --filter。顶层 background_refresh_rule 也照样能读，但不会生效：后台刷新按原请求走过的规则重放。配置里写了它，启动和每次重载时各记一条告警，配置照常加载，删掉这一项即可。
 
@@ -75,7 +75,7 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 
 ### Pipeline 和规则
 
-每个 Pipeline 包含 id、可选的 rules 数组和可选的 Pipeline 级 ecs。Pipeline 级 ecs 是旧配置用来区分缓存的，现在不再影响缓存（改动它时，热加载后该 Pipeline 的缓存仍会重新开始）。规则按配置顺序处理。空匹配器列表视为匹配。规则内的匹配器按从左到右形成链；每个匹配器可以携带自己的 operator，或者在所有匹配器都省略 operator 时由规则级 matcher_operator 设置。
+每个 Pipeline 包含 id、可选的 rules 数组和可选的 Pipeline 级 ecs。Pipeline 级 ecs 是旧配置用来区分缓存的，现在不再影响缓存（改动它时，热加载后该 Pipeline 的缓存仍会重新开始）。规则按配置顺序处理；规则的 name 只用在日志和统计里，可以重复。空匹配器列表视为匹配。规则内的匹配器按从左到右形成链；每个匹配器可以携带自己的 operator，或者在所有匹配器都省略 operator 时由规则级 matcher_operator 设置。
 
 响应阶段使用同样的 response_matchers、response_matcher_operator、response_actions_on_match 和 response_actions_on_miss。Forward 得到响应后执行响应动作；配置了 miss 动作时，上游尝试全部失败后也会进入 miss 路径。几个上游一起问、全都失败、其中有上游回了失败应答（SERVFAIL、REFUSED 或扩展 RCODE）时，最先收到的那个应答照样交给回答检查：检查通过、而且 response_actions_on_match 有动作时，按这个应答执行 match 动作，和只问一个上游时一样。检查不通过，或者通过了但没有 match 动作时，照旧按上游失败处理：有 miss 动作时在没有应答的情况下执行，否则给过期缓存或 SERVFAIL。因此，SERVFAIL 也能满足的回答检查（例如「上游回 SERVFAIL 或 REFUSED 时改问」，或取反的 IP 条件）不管写了几个上游都会生效。后台刷新不这样做：上游都回失败应答时，刷新照旧算失败，条目保留。
 
@@ -121,7 +121,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 
 | 类型 | 字段 |
 |---|---|
-| upstream_equals | value；按运行时上游标签做字符串精确比较 |
+| upstream_equals | value；回答来自这个上游时成立，写法见下文 |
 | request_domain_suffix | value |
 | request_domain_exact | value |
 | request_domain_regex | value |
@@ -145,7 +145,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 
 这些匹配器只读取已有记录，不会创建或改写 HTTPS/SVCB 记录。
 
-当前成功上游标签包含传输前缀，例如 udp:1.1.1.1:53 或 tcp:1.1.1.1:53。因此 upstream_equals 的 value 必须包含该前缀。response_upstream_ip 当前解析原始 IP 或 host:port，不会剥离传输前缀。
+upstream_equals 和 response_upstream_ip 看的是这次实际作答的上游：一条规则同时问几个上游时，是给出这个应答的那一个。upstream_equals 的 value 有两种写法。写上游的地址，和 forward 的 upstream 写法一样（`1.1.1.1:53`、`tcp://1.1.1.1:53`；逗号隔开几个时，其中任一个作答即成立），这时只比地址，不管应答最后是哪种传输带回来的。或者写运行时的上游标签 `传输:地址`（`udp:1.1.1.1:53`、`tcp:1.1.1.1:53`，传输是 udp、tcp、doh、dot、doq 之一），这时传输也要相同；UDP 查询因截断或失败改走 TCP 时，标签是 `tcp:`。response_upstream_ip 取作答上游地址里的 IP；上游的主机写的是域名时不成立。
 
 ### 逻辑运算符
 
@@ -203,7 +203,7 @@ ECS 配置在 Forward 动作中：
 
 不写 ecs 的转发把客户端自己带的 ECS 选项原样发往上游。
 
-一条规则里写了几个 forward 时，它们合成一次转发，同时问所有上游，发出的 ECS 也只有一个：几个 forward 的 ecs 写得一样时照它发；写得不一样时（包括有的写、有的不写），这条规则和不写 ecs 一样，这是一条配置问题（见「缓存和重载行为」）。upstream 写成空的（或只有逗号）的 forward 不在合并里：合并时跳过它，它的 ecs 不算，只要别的 forward 写了地址也不算配置问题。
+一条规则里写了几个 forward 时，它们合成一次转发，同时问所有上游（forward 前面已经写了别的作决定的动作，如静态应答或跳转时，规则给的是那个动作的结果，后面的 forward 不执行），发出的 ECS 也只有一个：几个 forward 的 ecs 写得一样时照它发；写得不一样时（包括有的写、有的不写），这条规则和不写 ecs 一样，这是一条配置问题（见「缓存和重载行为」）。upstream 写成空的（或只有逗号）的 forward 不在合并里：合并时跳过它，它的 ecs 不算，只要别的 forward 写了地址也不算配置问题。
 
 缓存的应答遵循 RFC 7871 第 7.3 节。每份应答只给它适用的请求方，依据是转发实际发出的 ECS，以及上游应答里的 SCOPE PREFIX-LENGTH（作用范围）：
 
@@ -418,12 +418,12 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 主配置 watcher 使用按 Pipeline 划分的缓存命名空间重载有效 JSON。发生变化的 Pipeline 会立即停止访问旧配置产生的响应缓存、规则缓存和进行中请求；未变化的 Pipeline 会保留热缓存。任意全局设置变化都会轮换所有 Pipeline 的缓存命名空间。旧命名空间中的条目不会被同步删除，而是继续受现有缓存容量和 TTL 策略限制。包括后台刷新和响应阶段跳转在内，每个请求都会保持选择其缓存命名空间时的配置快照，因此重载前启动的任务无法写入当前生效的缓存代际。无效的重载会保留旧配置。
 
-下面这些写法以前能加载，却会悄悄做成别的事：读不懂的上游地址（端口不对、UDP 上游不是 IP 地址、不认识的前缀如 `http://`、IP 字面量的 DoQ 没写 SNI）、拼错的 rcode（以前回 NXDOMAIN）、无效的静态 IP 或 CNAME 目标、装不进一条记录的 TXT（以前回 SERVFAIL）、跳到不存在的 Pipeline（跳转动作或 pipeline_select），空的 domain_suffix 或 domain_regex（以前匹配所有域名），以及同一条规则里几个 forward 的 ecs 写得不一样（以前一个也不发）。启动时遇到它们只在日志里记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和控制通道的配置校验会拒绝，并一次列出全部问题，所以下一次改配置时要把它们改掉。
+下面这些写法以前能加载，却会悄悄做成别的事：读不懂的上游地址（端口不对、UDP 上游不是 IP 地址、不认识的前缀如 `http://`、IP 字面量的 DoQ 没写 SNI）、拼错的 rcode（以前回 NXDOMAIN）、无效的静态 IP 或 CNAME 目标、装不进一条记录的 TXT（以前回 SERVFAIL）、跳到不存在的 Pipeline（跳转动作或 pipeline_select），空的 domain_suffix 或 domain_regex（以前匹配所有域名），同一条规则里几个 forward 的 ecs 写得不一样（以前一个也不发），几个 Pipeline 写了同一个 id（按 id 只找得到其中一个，其余的规则不会照写的执行），以及 ecs 的 static 模式里不是 IP 的地址（以前每个查询记一条警告、不发 ECS）。启动时遇到它们只在日志里记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和控制通道的配置校验会拒绝，并一次列出全部问题，所以下一次改配置时要把它们改掉。
 
 下面这些全局设置只在启动时读取，重载不会让它们生效，修改后要重启服务：`bind_udp`、`bind_tcp`、`bind_doh`、`doh_path`、`doh_tls_cert`、`doh_tls_key`、`cache_capacity`、`cache_max_ttl`、`dashmap_shards`、`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`doh_health_check_error_threshold`、`dot_pool_size`、`doq_pool_size`、`tcp_health_check_error_threshold`、`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`、`doq_connection_idle_timeout_seconds`、`doq_keepalive_interval_ms`、`doq_enable_0rtt` 和全部 `flow_control_*`。其余全局设置重载即生效。重载后，配置里改过、还在等重启的设置会出现在控制通道 `config` 结果的 `restart_pending` 里；改回启动时的值，或者重启以后，它就不再出现。重载时改这些设置不会让缓存作废。UDP worker 数量由命令行指定，同样只在启动时生效。DoH TLS 证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。配置文件、证书和私钥、Geo 数据文件是符号链接时（比如 Kubernetes 的 ConfigMap、Secret 卷），链接指向的文件变了、路上哪个链接换了指向，都算文件变了，监控跟着新的指向走。
 
 重载后，配置里不再出现的上游会关闭它们的 TCP、DoT、DoQ 连接；正在使用这些连接的请求处理完之后才会关闭。
 
-geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只读入规则（geoip_country、response_answer_ip_geoip_country）用到的国家代码和标签（见上文 GeoIP 数据源与标签），不读的文件也不监控。热加载改变了规则用到的 GeoSite 或 GeoIP 标签，或这几个文件路径时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。被监控的文件重新读出来以后，规则用到的标签一个都没有了、而它此前提供过（比如下载失败留下的空文件），这次不替换，正在用的数据保留到文件下次改动。规则用到、却没有一个 GeoSite 数据文件提供的标签会记一条告警，和 GeoIP 一样。
+geosite_data_paths 中的 GeoSite 文件和 geoip_dat_path 指定的 GeoIP 文件会被监控，文件变了就重新读入；geoip_db_path 指定的 MMDB 不监控。GeoSite 的 `.dat` 只读入规则用到的标签，一个都没用到时既不读也不监控；GeoIP 数据只读入规则（geoip_country、response_answer_ip_geoip_country）用到的国家代码和标签（见上文 GeoIP 数据源与标签），不读的文件也不监控。热加载改变了规则用到的 GeoSite 或 GeoIP 标签，或这几个文件路径时，会按新配置重新读入 Geo 数据，并改为监控新的文件；新数据读完才替换旧数据，新规则从第一个请求起就用新数据。配置里写了、当时还不存在的文件，出现以后的下一次热加载会读入。被监控的文件重新读出来以后，规则用到的标签一个都没有了、而它此前提供过（比如下载失败留下的空文件），这次不替换，正在用的数据保留到文件下次改动；热加载重新读入时遇到这样的文件也一样，它此前提供、规则现在还用的标签留着正在用的数据。数据文件里写错的正则跳过，不匹配任何名字。规则用到、却没有一个 GeoSite 数据文件提供的标签会记一条告警，和 GeoIP 一样。
 
 Geo 数据换进来以后（文件变了重新读入，或热加载读入），应答取决于这份数据的 Pipeline 换一个缓存命名空间：规则按 GeoSite 名单判断请求域名（geo_site、response_request_domain_geo_site 等），或按 GeoIP 判断回答里的地址（response_answer_ip_geoip_country），跳转过去的 Pipeline 用到的也算。按旧数据缓存的应答和规则决定从此不再拿出来用，和热加载改了规则一样；没用到这份数据的 Pipeline 留着各自的缓存。只按客户端地址判断 GeoIP 国家（geoip_country）的规则不必换：缓存本来就按这次判断的结果区分客户端，数据一换，判断结果跟着变。

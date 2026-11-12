@@ -1,4 +1,8 @@
 #[cfg(test)]
+mod action_order_tests;
+#[cfg(test)]
+mod answered_by_tests;
+#[cfg(test)]
 mod client_address_tests;
 pub mod concurrency;
 #[cfg(test)]
@@ -55,6 +59,8 @@ mod refresh_class_tests;
 mod reply_flags_tests;
 pub mod response;
 pub(crate) mod response_log;
+#[cfg(test)]
+mod rule_identity_tests;
 #[cfg(test)]
 mod rule_index_tests;
 pub mod rules;

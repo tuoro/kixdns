@@ -58,10 +58,6 @@ fn geosite_regex_pattern(pattern: &str) -> Result<String, Box<regex_syntax::Erro
     check(pattern).map(|()| pattern.to_owned())
 }
 
-/// 只匹配空名字的正则，写错的正则用它顶替 / A regex matching only the empty name, standing in for
-/// one written wrong
-const EMPTY_NAME: &str = "^$";
-
 /// `pattern` 里的 `\w`、`\d`、`\s`、`\b` 及其大写的取反形式改成 Go 正则的 ASCII 含义：字符类外写成一个字符类
 /// （`\b` 写成 `(?-u:\b)`），字符类里展开成范围（取反的写成嵌套的字符类）。转义的反斜杠和别的转义原样保留。
 /// `\w`, `\d`, `\s` and `\b` in `pattern`, and their negated capitals, rewritten to their ASCII
@@ -433,17 +429,18 @@ impl Regexes {
         }
     }
 
-    /// 逐条编译；编译不了的（超出上限）照旧只匹配空名字 / Compiles one by one; one that does not
-    /// compile (over the limit) matches only the empty name, as before
+    /// 逐条编译；编译不了的（超出上限）跳过，什么名字都不匹配 / Compiles one by one; one that does
+    /// not compile (over the limit) is skipped and matches no name
     fn compile_each(patterns: &[String]) -> Vec<Regex> {
         patterns
             .iter()
-            .map(|pattern| {
-                Self::compile(pattern).unwrap_or_else(|err| {
-                    warn!(target = "geosite", pattern = %pattern, error = %err,
-                         "invalid regex pattern, using empty regex");
-                    Regex::new(EMPTY_NAME).expect("a valid regex")
-                })
+            .filter_map(|pattern| {
+                Self::compile(pattern)
+                    .inspect_err(|err| {
+                        warn!(target = "geosite", pattern = %pattern, error = %err,
+                             "regex pattern does not compile, skipping it");
+                    })
+                    .ok()
             })
             .collect()
     }
@@ -549,14 +546,16 @@ impl TagBuilder {
     fn add_entry(&mut self, entry: DatEntry) {
         match entry {
             DatEntry::Matcher(matcher) => self.add(matcher),
-            DatEntry::Regex(pattern) => {
-                let pattern = geosite_regex_pattern(&pattern).unwrap_or_else(|err| {
+            // 写错的正则跳过，什么名字都不匹配，和 JSON 数据里一样。以前换成 `^$` 顶替，而根域名的名字正是空的
+            // A regex written wrong is skipped and matches no name, as in JSON data. It used to be
+            // replaced with `^$`, and the root name is the empty one
+            DatEntry::Regex(pattern) => match geosite_regex_pattern(&pattern) {
+                Ok(pattern) => self.regexes.push(pattern),
+                Err(err) => {
                     warn!(target = "geosite", pattern = %pattern, error = %err,
-                         "invalid regex pattern, using empty regex");
-                    EMPTY_NAME.to_owned()
-                });
-                self.regexes.push(pattern);
-            }
+                         "invalid regex pattern, skipping it");
+                }
+            },
         }
     }
 
@@ -666,9 +665,13 @@ pub struct GeoSiteManager {
     // 匹配不再经过缓存：几次哈希查找加一遍正则集合扫描，比查一次缓存、写一条缓存还快；按问过的每个
     // 名字存结果的缓存，在全是新名字时会涨到几百兆
     database: FxHashMap<String, TagMatchers>,
-    // 每个数据文件贡献的 tag，重载时据此只替换该文件的条目
-    // Tags contributed by each data file, so a reload replaces only that file's entries
-    sources: FxHashMap<PathBuf, Vec<String>>,
+    // 每个数据文件贡献的 tag，重载时据此只替换该文件的条目。按文件头一次读进来的先后排，也就是配置里写的
+    // 先后；重载不改变位置。几个文件声明同一个 tag 时，排在后面的文件说了算，`database` 里放的是它的数据
+    // Tags contributed by each data file, so a reload replaces only that file's entries. In the
+    // order the files were first read, which is the order the configuration writes them in; a
+    // reload keeps a file's place. Of several files declaring one tag the later file decides,
+    // and `database` holds its data
+    sources: Vec<(PathBuf, Vec<String>)>,
 }
 
 /// 一个数据文件解析出的 tag 与域名匹配器，尚未进入管理器
@@ -689,7 +692,7 @@ impl GeoSiteManager {
     pub fn new() -> Self {
         Self {
             database: FxHashMap::default(),
-            sources: FxHashMap::default(),
+            sources: Vec::new(),
         }
     }
 
@@ -760,9 +763,35 @@ impl GeoSiteManager {
     /// 数据文件 `path` 眼下有没有提供 `tags`（不分大小写）里的标签
     /// Whether data file `path` provides any of `tags` (ignoring case) right now
     pub fn source_provides_any(&self, path: &Path, tags: &[String]) -> bool {
+        let key = Self::source_key(path);
         self.sources
-            .get(&Self::source_key(path))
-            .is_some_and(|provided| provided.iter().any(|tag| is_one_of(tag, tags)))
+            .iter()
+            .find(|(source, _)| *source == key)
+            .is_some_and(|(_, provided)| provided.iter().any(|tag| is_one_of(tag, tags)))
+    }
+
+    /// 把数据文件 `path` 眼下说了算的标签里、属于 `tags`（不分大小写）的拿出来，连同它们的数据。重新读这个文件
+    /// 什么都没读出来时，用它把在用的数据带进新建的管理器（见 `engine::geo` 的 `load_geosite`）。拿走以后
+    /// 这个管理器不再完整，只该被换掉
+    /// Takes out, data and all, the tags among `tags` (ignoring case) that data file `path`
+    /// decides right now. When reading the file again gives nothing, this carries the data in
+    /// use into the manager being built (see `load_geosite` in `engine::geo`). The manager is
+    /// left incomplete and is only to be replaced
+    pub fn take_source(&mut self, path: &Path, tags: &[String]) -> ParsedGeoSite {
+        let key = Self::source_key(path);
+        let Some(place) = self.sources.iter().position(|(source, _)| *source == key) else {
+            return Vec::new();
+        };
+        let mut taken = Vec::new();
+        for tag in std::mem::take(&mut self.sources[place].1) {
+            if is_one_of(&tag, tags)
+                && !self.later_source_provides(place, &tag)
+                && let Some(matchers) = self.database.remove(&tag)
+            {
+                taken.push((tag, matchers));
+            }
+        }
+        taken
     }
 
     /// 获取标签的所有域名匹配器（仅用于调试）/ Get all domain matchers for a tag (debug only)
@@ -1240,24 +1269,41 @@ impl GeoSiteManager {
     /// stay (`geosite_data_paths` accepts several files).
     pub fn apply_source<P: AsRef<Path>>(&mut self, path: P, parsed: ParsedGeoSite) -> usize {
         let key = Self::source_key(path.as_ref());
-        let previous = self.sources.remove(&key).unwrap_or_default();
+        // 这个文件排第几：读过的留在原位，头一次读的排到最后 / The file's place: one read before
+        // keeps it, one read for the first time goes last
+        let place = self
+            .sources
+            .iter()
+            .position(|(source, _)| *source == key)
+            .unwrap_or_else(|| {
+                self.sources.push((key.clone(), Vec::new()));
+                self.sources.len() - 1
+            });
+        let previous = std::mem::take(&mut self.sources[place].1);
 
         let mut tags = Vec::with_capacity(parsed.len());
         let mut retired = Vec::new();
         for (tag, matchers) in parsed {
-            retired.extend(self.database.insert(tag.clone(), matchers));
+            // 排在后面的文件也声明了这个 tag：那个文件说了算，索引里留着它的数据，这一份不进去
+            // A later file declares the tag too: that file decides and its data stays in the
+            // index, so this copy does not go in
+            if self.later_source_provides(place, &tag) {
+                retired.push(matchers);
+            } else {
+                retired.extend(self.database.insert(tag.clone(), matchers));
+            }
             tags.push(tag);
         }
 
-        // 这个文件不再提供的 tag：没有别的文件提供就删掉；还有别的文件提供，
-        // 就从那个文件里重新读出来顶上——否则索引里留着的仍是本文件的旧条目，
-        // 名义上 tag 还在，命中的却是已经被删掉的数据。多个文件声明同一个 tag
-        // 时最后加载的一份生效（与全量加载一致）。
-        // For tags this file no longer provides: drop them when no other file
-        // provides them, and re-read them from a file that still does otherwise.
-        // Without that the index keeps this file's own stale entries, so the tag
-        // survives but matches data that was deleted. When several files declare
-        // the same tag the last load wins, as with a full load.
+        // 这个文件不再提供的 tag：排在后面的文件还提供着，索引里本来就是那个文件的数据，不用动。否则
+        // 索引里是本文件的旧条目：没有别的文件提供就删掉；前面还有文件提供，就从其中排得最后的那个里
+        // 重新读出来顶上，和全部重新读一遍的结果一样——不然名义上 tag 还在，命中的却是已经被删掉的数据。
+        // For tags this file no longer provides: with a later file still providing one the
+        // index holds that file's data already and nothing changes. Otherwise the index
+        // holds this file's stale entries: they are dropped when no other file provides the
+        // tag, and with earlier files providing it the tag is re-read from the latest of
+        // them, as a full load would have it. Without that the tag survives but matches
+        // data that was deleted.
         // 先按提供者分组再读：同一个文件顶上多少个 tag 都只解析一次，代价与被删
         // 的 tag 数无关。写锁是整个匹配器共享的，这里多读一遍就是多停顿一次查询。
         // Group by provider before reading: one parse per file however many tags
@@ -1266,10 +1312,10 @@ impl GeoSiteManager {
         // is another stall for queries.
         let mut takeovers: FxHashMap<PathBuf, Vec<String>> = FxHashMap::default();
         for tag in previous {
-            if tags.contains(&tag) {
+            if tags.contains(&tag) || self.later_source_provides(place, &tag) {
                 continue;
             }
-            match self.other_source_providing(&key, &tag) {
+            match self.earlier_source_providing(place, &tag) {
                 Some(other) => takeovers.entry(other).or_default().push(tag),
                 None => {
                     retired.extend(self.database.remove(&tag));
@@ -1281,25 +1327,29 @@ impl GeoSiteManager {
         }
 
         let loaded_count = tags.len();
-        self.sources.insert(key, tags);
+        self.sources[place].1 = tags;
 
         self.log_totals();
         retire(retired);
         loaded_count
     }
 
-    /// 找一个仍在提供这个 tag 的其它数据文件；多个候选时取路径最小的一个，
-    /// 让结果与哈希表的遍历顺序无关。
-    /// Find another data file still providing this tag; with several candidates
-    /// the smallest path wins, so the result does not depend on hash order.
-    fn other_source_providing(&self, skip: &Path, tag: &str) -> Option<PathBuf> {
-        self.sources
+    /// 排在第 `place` 个文件后面的文件里，有没有提供这个 tag 的
+    /// Whether a file after the one at `place` provides this tag
+    fn later_source_provides(&self, place: usize, tag: &str) -> bool {
+        self.sources[place + 1..]
             .iter()
-            .filter(|(path, provided)| {
-                path.as_path() != skip && provided.iter().any(|name| name == tag)
-            })
+            .any(|(_, provided)| provided.iter().any(|name| name == tag))
+    }
+
+    /// 排在第 `place` 个文件前面、仍在提供这个 tag 的文件里排得最后的那个
+    /// The latest of the files before the one at `place` that still provide this tag
+    fn earlier_source_providing(&self, place: usize, tag: &str) -> Option<PathBuf> {
+        self.sources[..place]
+            .iter()
+            .rev()
+            .find(|(_, provided)| provided.iter().any(|name| name == tag))
             .map(|(path, _)| path.clone())
-            .min()
     }
 
     /// 从另一个数据文件里重新读出单个 tag；读不出来就保持原样，等那个文件自己
@@ -1988,11 +2038,13 @@ mod tests {
         assert!(manager.matches("g", "only.test"));
     }
 
-    /// 数据文件里的正则读完一个 tag 才合成编译；写错的一条照旧换成只匹配空名字的正则，不连累同一个 tag
-    /// 的其他正则。按需加载和全部加载都是这样。
-    /// A data file's regexes compile once the tag is read; one written wrong still stands as a
-    /// regex matching only the empty name and spoils none of the tag's others. Both selective and
-    /// full loading do so.
+    /// 数据文件里的正则读完一个 tag 才合成编译；写错的一条跳过，什么名字都不匹配，也不连累同一个 tag 的其他
+    /// 正则。按需加载和全部加载都是这样。以前写错的一条换成只匹配空名字的正则，而根域名的名字正是空的：带着
+    /// 一条坏正则的 tag 就把对根域名的查询也算了进去。
+    /// A data file's regexes compile once the tag is read; one written wrong is skipped, matching
+    /// no name at all, and spoils none of the tag's others. Both selective and full loading do
+    /// so. One written wrong used to become a regex matching only the empty name, and the root
+    /// name is the empty one: a tag with one broken regex took in queries for the root.
     #[test]
     fn a_broken_regex_in_a_data_file_spoils_none_of_the_others() {
         let dir = tempfile::tempdir().unwrap();
@@ -2013,13 +2065,14 @@ mod tests {
         assert!(matches!(tag.regexes, Regexes::Sets(_)));
         assert!(tag.matches("cdn7.example.com"));
         assert!(tag.matches("a.test"));
-        assert!(tag.matches(""));
+        assert!(!tag.matches(""));
         assert!(!tag.matches("cdnx.example.com"));
 
         let mut manager = GeoSiteManager::new();
         manager.load_from_dat_file(&path).unwrap();
         assert!(manager.matches("r", "cdn7.example.com"));
         assert!(!manager.matches("r", "b.test"));
+        assert!(!manager.matches("r", ""));
     }
 
     #[test]
@@ -2222,6 +2275,72 @@ mod tests {
             "a tag another file still provides must survive"
         );
         assert!(manager.matches("only-a", "www.only-a.example"));
+    }
+
+    /// 写一个只有 tag `ADS`、里面只有域名 `domain` 的数据文件
+    /// Writes a data file with the one tag `ADS` holding the one name `domain`
+    fn write_ads(path: &Path, domain: &str) {
+        std::fs::write(
+            path,
+            build_dat(&[build_geosite("ADS", &[build_domain(2, domain, &[])])]),
+        )
+        .unwrap();
+    }
+
+    /// 两个文件声明同一个 tag 时，排在后面的文件说了算，和各自什么时候读进来无关：前面的文件变了、重新读进来
+    /// 以后，这个 tag 用的还是后面那个文件的数据。以前是谁后读进来谁说了算，前面的文件一变，这个 tag 就换成
+    /// 了它的数据，直到后面的文件也变一次
+    /// Of two files declaring one tag the later file decides, whenever each was read: once the
+    /// earlier file changes and is read again, the tag still has the later file's data. Whichever
+    /// was read last used to decide, so a change to the earlier file gave the tag its data until
+    /// the later file changed too
+    #[test]
+    fn the_later_file_keeps_a_shared_tag_when_an_earlier_one_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.dat"), dir.path().join("b.dat"));
+        write_ads(&a, "from-a.example");
+        write_ads(&b, "from-b.example");
+        let mut manager = GeoSiteManager::new();
+        manager.load_from_dat_file(&a).unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+        assert!(manager.matches("ads", "www.from-b.example"));
+        assert!(!manager.matches("ads", "www.from-a.example"));
+
+        write_ads(&a, "again-from-a.example");
+        manager.load_from_dat_file(&a).unwrap();
+        assert!(manager.matches("ads", "www.from-b.example"));
+        assert!(!manager.matches("ads", "www.again-from-a.example"));
+
+        // 后面的文件不再声明它，才轮到前面那个现在的数据 / Only once the later file drops it does
+        // the earlier one's present data have its turn
+        std::fs::write(&b, build_dat(&[])).unwrap();
+        manager.load_from_dat_file(&b).unwrap();
+        assert!(manager.matches("ads", "www.again-from-a.example"));
+        assert!(!manager.matches("ads", "www.from-b.example"));
+    }
+
+    /// 排在最后的文件不再声明这个 tag 时，换成剩下的文件里排得最后的那一个，和全部重新读一遍的结果一样。以前
+    /// 换成路径最小的那一个
+    /// When the last file stops declaring a tag, the latest of the files left provides it, as a
+    /// full load would have it. The one with the smallest path used to
+    #[test]
+    fn a_dropped_shared_tag_falls_back_to_the_latest_file_still_providing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let [first, second, last] = ["a.dat", "z.dat", "c.dat"].map(|name| dir.path().join(name));
+        write_ads(&first, "from-first.example");
+        write_ads(&second, "from-second.example");
+        write_ads(&last, "from-last.example");
+        let mut manager = GeoSiteManager::new();
+        for path in [&first, &second, &last] {
+            manager.load_from_dat_file(path).unwrap();
+        }
+        assert!(manager.matches("ads", "www.from-last.example"));
+
+        std::fs::write(&last, build_dat(&[])).unwrap();
+        manager.load_from_dat_file(&last).unwrap();
+        assert!(manager.matches("ads", "www.from-second.example"));
+        assert!(!manager.matches("ads", "www.from-first.example"));
+        assert!(!manager.matches("ads", "www.from-last.example"));
     }
 
     /// 后加载的文件删掉共享 tag 之后，索引里必须换成仍在声明它的那个文件的数据，

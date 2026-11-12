@@ -675,7 +675,7 @@ fn hash_runtime_matcher(matcher: &RuntimeMatcher, hasher: &mut impl Hasher) {
 fn hash_runtime_response_matcher(matcher: &RuntimeResponseMatcher, hasher: &mut impl Hasher) {
     discriminant(matcher).hash(hasher);
     match matcher {
-        RuntimeResponseMatcher::UpstreamEquals { value }
+        RuntimeResponseMatcher::UpstreamEquals { value, .. }
         | RuntimeResponseMatcher::RequestDomainSuffix { value }
         | RuntimeResponseMatcher::RequestDomainExact { value }
         | RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value }

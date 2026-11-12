@@ -4,7 +4,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use rustc_hash::{FxHashSet, FxHasher};
+use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -42,6 +42,12 @@ pub enum Decision {
         pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
         response_phase: Option<Arc<ResponsePhase>>,
         rule_name: Arc<str>,
+        /// 作出决策的规则在它的规则组里排第几（从 0 起）；没有规则作出决策时为 None。它 continue 以后按这个
+        /// 位置跳过它，不按名字：名字只是标签，两条规则可以同名
+        /// The place in its pipeline (from 0) of the rule that decided; None when no rule did.
+        /// Once it continues it is skipped by this place, not by name: a name is a label, and
+        /// two rules may share one
+        rule_index: Option<usize>,
         transport: Option<Transport>, // None means each upstream decides itself (via protocol prefix) / None 表示每个 upstream 自己决定（通过协议前缀）
         /// EDNS Client Subnet (RFC 7871) request rewriting mode / EDNS 客户端子网 (RFC 7871) 请求改写模式
         ecs: Option<crate::config::EcsMode>,
@@ -65,6 +71,7 @@ impl Decision {
             pre_split_upstreams: settings.default_upstream_pre_split.clone(),
             response_phase: None,
             rule_name: Arc::clone(&DEFAULT_RULE_NAME),
+            rule_index: None,
             transport: Some(Transport::Udp),
             ecs: None,
             allow_reuse: false,
@@ -304,12 +311,13 @@ pub(crate) fn acquire_geo_locks<'a>(
 }
 
 /// 几个上游一起问、全都失败、其中有上游回了失败应答时（见 `UpstreamFailure`），把最先收到的那个
-/// 应答交给规则的回答检查 `check`：检查通过、而且通过后有动作（`on_match`）要执行时，它就是这次转发
+/// 应答连同回它的上游交给规则的回答检查 `check`：检查通过、而且通过后有动作（`on_match`）要执行时，它就是这次转发
 /// 的应答，和只问一个上游时一样。其余情况照旧是失败：检查不通过时 on_miss 照旧在没有应答的情况下
 /// 执行，没有 on_miss 时照旧是过期缓存或 SERVFAIL。后台刷新不受影响：两处调用之后紧跟着
 /// `reject_failure_reply_on_refresh`，刷新照旧拿到失败，缓存的条目不动。
 /// When several upstreams asked together all failed and one of them replied with a failure
-/// (see `UpstreamFailure`), the first such reply goes to the rule's answer check `check`:
+/// (see `UpstreamFailure`), the first such reply goes to the rule's answer check `check`
+/// with the upstream that sent it:
 /// when it passes and has actions to run (`on_match`), that reply is this forward's answer,
 /// as with a single upstream. Otherwise it stays a failure: when the check fails on_miss
 /// still runs without an answer, and without on_miss the stale entry or SERVFAIL still
@@ -319,7 +327,7 @@ pub(crate) fn acquire_geo_locks<'a>(
 pub(crate) fn check_failure_reply(
     resp: anyhow::Result<(Bytes, Arc<str>)>,
     on_match: &[Action],
-    check: impl FnOnce(&Message) -> bool,
+    check: impl FnOnce(&Message, &str) -> bool,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
     let Err(err) = resp else {
         return resp;
@@ -328,17 +336,19 @@ pub(crate) fn check_failure_reply(
         return Err(err);
     }
     match UpstreamFailure::reply_of(&err) {
-        Some((raw, upstream)) if Message::from_bytes(raw).is_ok_and(|msg| check(&msg)) => {
+        Some((raw, upstream))
+            if Message::from_bytes(raw).is_ok_and(|msg| check(&msg, upstream)) =>
+        {
             Ok((raw.clone(), upstream.clone()))
         }
         _ => Err(err),
     }
 }
 
-/// 响应匹配器对应答 `msg` 是否成立；没有应答（`None`）时不成立。没有匹配器时成立，也不用去拿
+/// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给的应答 `msg` 是否成立；没有应答（`None`）时不成立。没有匹配器时成立，也不用去拿
 /// GeoIP、GeoSite 的读锁；有匹配器时读锁只在求值时拿着
-/// Whether the response matchers hold for the answer `msg`; without an answer (`None`)
-/// they do not. With no matchers they hold, and the GeoIP and GeoSite read locks are not
+/// Whether the response matchers hold for the answer `msg` that `upstream` gave (the
+/// answering upstream, `udp:1.1.1.1:53`); without an answer (`None`) they do not. With no matchers they hold, and the GeoIP and GeoSite read locks are not
 /// taken; with some, the locks are held only while they are evaluated
 pub(crate) fn response_matches(
     engine: &Engine,
@@ -744,7 +754,7 @@ pub(crate) async fn process_response_jump(
         ecs: client_ecs,
     };
     let cfg = &state.pipeline;
-    let mut skip_rules: FxHashSet<Arc<str>> = FxHashSet::default();
+    let mut skip_rules = crate::engine::pipeline::Continued::new();
     let mut reused_response: Option<ResponseContext> = None;
     let mut cleanup_guards: Vec<InflightCleanupGuard> = Vec::new();
     // The request's own entries: the ones it held before the jump and the ones
@@ -760,32 +770,21 @@ pub(crate) async fn process_response_jump(
     };
     // Whether this pass enters a pipeline (by the jump that led here, or a
     // later one) rather than resuming the same pipeline after a `continue`:
-    // only entering reports `pipeline_selected` and counts against the jump
-    // limit.
+    // only entering reports `pipeline_selected`.
     // 这一轮是不是进入一个 pipeline（经由引来的跳转或之后的跳转），而不是
-    // `continue` 后在同一 pipeline 继续：只有进入才上报 `pipeline_selected`，
-    // 也只有进入才受跳转上限约束。
+    // `continue` 后在同一 pipeline 继续：只有进入才上报 `pipeline_selected`。
     let mut entering = true;
     let join_wait = crate::engine::upstream::hedge_timeout(upstream_timeout);
 
     loop {
         response.pipeline = Some(pipeline_id.clone());
         response.upstream = None;
-        // The limit counts jumps: a `continue` resuming the same pipeline is not one.
-        // How many jumps a request has left here depends on the way it came along
-        // the jump path, which no key carries: the waiters on its entries may have
-        // jumps to spare. Returning drops the guards, which removes the entries,
-        // and the waiters forward themselves.
-        // 上限数的是跳转：`continue` 在同一 pipeline 继续不算一次。请求在这里还能跳几次
-        // 取决于它沿跳转路径怎么来的，键里没有这一项：等在它条目上的请求可能还有余量。
-        // 返回时守卫被丢弃，条目随之移除，等待者自己转发。
-        if entering && remaining_jumps == 0 {
-            // 本地给的 SERVFAIL，日志记成 static，和请求阶段的跳转上限一样
-            // A local SERVFAIL, logged as static as at the request-phase jump limit
-            response.upstream = Some(Arc::from("static"));
-            return engine_helpers::build_servfail_response(req);
-        }
-
+        // 跳转上限在要跳的地方数（下面规则级的跳转，和响应动作里的跳转）：还剩 0 次时不让再跳。带着 0 次进到这里
+        // 不算超限，引来的那次跳转本身在上限之内；以前在这里也拦一次，上限 N 就只让跳 N−1 次
+        // The jump limit is counted where a jump is about to be made (the rule-level jumps
+        // below and the jumps of response actions): with none left, no further jump. Arriving
+        // here with none left is within the limit, as the jump that led here was; this used
+        // to be refused here too, so a limit of N allowed N−1 jumps
         let Some(pipeline) = cfg.pipeline(&pipeline_id) else {
             let resp_bytes = engine_helpers::build_servfail_response(req)?;
             for g in &mut cleanup_guards {
@@ -919,6 +918,7 @@ pub(crate) async fn process_response_jump(
                 pre_split_upstreams,
                 response_phase,
                 rule_name,
+                rule_index,
                 transport,
                 ecs: _,
                 allow_reuse,
@@ -1036,11 +1036,11 @@ pub(crate) async fn process_response_jump(
                     .await
                 };
                 // As in handle_forward_decision_logged / 同 handle_forward_decision_logged
-                let resp = check_failure_reply(resp, response_actions_on_match, |msg| {
+                let resp = check_failure_reply(resp, response_actions_on_match, |msg, answered| {
                     response_matches(
                         engine,
                         response_matchers,
-                        &upstream,
+                        answered,
                         qname,
                         qtype,
                         qclass,
@@ -1065,7 +1065,7 @@ pub(crate) async fn process_response_jump(
                         let resp_match_ok = response_matches(
                             engine,
                             response_matchers,
-                            &upstream,
+                            &actual_upstream,
                             qname,
                             qtype,
                             qclass,
@@ -1183,7 +1183,7 @@ pub(crate) async fn process_response_jump(
                                 // （相同 dedupe_hash）也就不会等在本请求自己的条目上。
                                 cleanup_guards.clear();
                                 reused_response = ctx;
-                                skip_rules.insert(rule_name.clone());
+                                skip_rules.extend(rule_index);
                                 entering = false;
                                 continue;
                             }

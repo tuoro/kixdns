@@ -1093,6 +1093,19 @@ fn transport_label(via: Transport) -> &'static str {
     }
 }
 
+/// 上游名字（`udp:1.1.1.1:53`，见 [`upstream_label`]）里的地址：去掉前面的传输名。回答检查拿它和配置里写的
+/// 上游地址比（见 `RuntimeResponseMatcher::UpstreamEquals`）。不带传输名的原样返回
+/// The address in an upstream's name (`udp:1.1.1.1:53`, see [`upstream_label`]): the name less
+/// its transport. The answer check compares it with the upstream addresses a configuration
+/// writes (see `RuntimeResponseMatcher::UpstreamEquals`). One without a transport comes back
+/// as it is
+pub(crate) fn answered_address(label: &str) -> &str {
+    ["udp:", "tcp:", "doh:", "dot:", "doq:"]
+        .iter()
+        .find_map(|transport| label.strip_prefix(transport))
+        .unwrap_or(label)
+}
+
 /// 记住的上游名字最多这么多个，配置里写不了这么多；再多的现算，不记 / The most upstream names kept,
 /// more than a configuration writes; any further are built each time and not kept
 const UPSTREAM_LABELS: usize = 4096;

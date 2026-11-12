@@ -515,6 +515,27 @@ impl GeoIpManager {
         self.tag_indexes.len()
     }
 
+    /// 把 `in_use` 里属于 `tags`（不分大小写）的标签连同数据搬过来，给出搬了几个。重新读数据文件什么都没读出来
+    /// 时，用它把在用的数据带进新建的管理器（见 `engine::geo` 的 `load_geoip`）；`in_use` 之后只该被换掉
+    /// Moves the tags among `tags` (ignoring case) over from `in_use`, data and all, giving how
+    /// many moved. When reading the data file again gives nothing, this carries the data in use
+    /// into the manager being built (see `load_geoip` in `engine::geo`); `in_use` is only to be
+    /// replaced afterwards
+    pub fn keep_tags_of(&mut self, in_use: &mut GeoIpManager, tags: &[String]) -> usize {
+        let kept: Vec<Arc<str>> = in_use
+            .tag_indexes
+            .keys()
+            .filter(|tag| tags.iter().any(|wanted| wanted.eq_ignore_ascii_case(tag)))
+            .cloned()
+            .collect();
+        for tag in &kept {
+            if let Some(index) = in_use.tag_indexes.remove(tag) {
+                self.tag_indexes.insert(Arc::clone(tag), index);
+            }
+        }
+        kept.len()
+    }
+
     /// 用解析结果整体替换索引
     /// Replace the indexes wholesale with a parsed result
     ///

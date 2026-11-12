@@ -816,8 +816,16 @@ pub struct RuntimePipelineSelectorMatcherWithOp {
 
 #[derive(Debug, Clone)]
 pub enum RuntimeResponseMatcher {
+    /// 回答来自 `value` 写的上游：`value` 和作答上游的名字（`udp:1.1.1.1:53`）逐字相同，或作答上游的地址是
+    /// `addresses` 之一
+    /// The answer came from the upstream `value` writes: `value` is the answering upstream's
+    /// name (`udp:1.1.1.1:53`) to the letter, or that upstream's address is one of `addresses`
     UpstreamEquals {
         value: Arc<str>,
+        /// 把 `value` 当转发里的上游来读得到的地址：逗号隔开的每一个，去掉前缀
+        /// The addresses `value` gives read as a forward's upstream: each of those the commas
+        /// separate, less its prefix
+        addresses: Box<[Box<str>]>,
     },
     RequestDomainSuffix {
         value: Arc<str>,
@@ -1224,9 +1232,9 @@ fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> V
         .collect()
 }
 
-/// 域名匹配器的正则：状态空间和 DFA 各限 1 MB，防止复杂度攻击
-/// A domain matcher's regex: the state space and the DFA each capped at 1 MB against
-/// complexity attacks
+/// 匹配器的正则（域名的，和 TXT 内容的）：状态空间和 DFA 各限 1 MB，防止复杂度攻击
+/// A matcher's regex (for names, and for TXT content): the state space and the DFA each
+/// capped at 1 MB against complexity attacks
 fn domain_regex(pattern: &str) -> Result<Regex, regex::Error> {
     RegexBuilder::new(pattern)
         .size_limit(1_000_000)
@@ -1530,13 +1538,19 @@ pub fn eval_match_chain<T>(
     acc
 }
 
+/// 作答上游 `upstream`（`udp:1.1.1.1:53`，不带传输名也行）的 IP：地址里的主机是 IP 字面量时有，是域名时没有。
+/// 路径（DoH）和参数（`?sni=`）不看
+/// The IP of the answering upstream `upstream` (`udp:1.1.1.1:53`, or without the transport):
+/// there is one when the host in its address is an IP literal, none when it is a name. A path
+/// (DoH) and parameters (`?sni=`) are not read
 #[inline]
 fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
-    upstream
-        .parse::<SocketAddr>()
+    let address = crate::engine::upstream::answered_address(upstream);
+    let host = address.split(['/', '?']).next().unwrap_or(address);
+    host.parse::<SocketAddr>()
         .ok()
         .map(|sa| sa.ip())
-        .or_else(|| upstream.parse::<IpAddr>().ok())
+        .or_else(|| host.parse::<IpAddr>().ok())
 }
 
 impl RuntimeResponseMatcher {
@@ -1544,6 +1558,9 @@ impl RuntimeResponseMatcher {
         Ok(match m {
             config::ResponseMatcher::UpstreamEquals { value } => {
                 RuntimeResponseMatcher::UpstreamEquals {
+                    addresses: crate::engine::upstream::addresses(&value)
+                        .map(Box::from)
+                        .collect(),
                     value: Arc::from(value),
                 }
             }
@@ -1632,13 +1649,11 @@ impl RuntimeResponseMatcher {
                                 MAX_REGEX_LEN
                             );
                         }
-                        // 使用regex crate的大小限制来防止复杂度攻击
-                        // Use regex crate size limit to prevent complexity attacks
+                        // 编译后的大小和域名正则一个上限。以前限在 1000 字节，`.`、`\d+` 都编译不过
+                        // The compiled size gets the limit domain regexes have. It was held to
+                        // 1000 bytes, which `.` or `\d+` already exceed
                         Some(
-                            RegexBuilder::new(&value)
-                                .size_limit(1000) // 限制正则引擎状态空间 / limit regex engine state space
-                                .dfa_size_limit(1000) // 限制DFA状态数 / limit DFA states
-                                .build()
+                            domain_regex(&value)
                                 .map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?,
                         )
                     }
@@ -1664,7 +1679,12 @@ impl RuntimeResponseMatcher {
         geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
         match self {
-            RuntimeResponseMatcher::UpstreamEquals { value } => upstream == value.as_ref(),
+            RuntimeResponseMatcher::UpstreamEquals { value, addresses } => {
+                upstream == value.as_ref() || {
+                    let answered = crate::engine::upstream::answered_address(upstream);
+                    addresses.iter().any(|address| **address == *answered)
+                }
+            }
             RuntimeResponseMatcher::RequestDomainSuffix { value } => {
                 domain_suffix_matches(qname, value)
             }
@@ -2655,5 +2675,73 @@ mod tests {
         assert!(!check("svc.test", "notsvc.test"));
         assert!(!check(".svc.test", "svc.test"));
         assert!(check(".svc.test", "a.svc.test"));
+    }
+}
+
+#[cfg(test)]
+mod upstream_ip_tests {
+    use std::net::IpAddr;
+
+    use super::try_parse_upstream_ip;
+
+    /// 作答上游的 IP 从它的名字里读：去掉传输名、端口、路径和参数；主机是域名时没有
+    /// The answering upstream's IP is read from its name, less the transport, the port, a path
+    /// and parameters; there is none when the host is a name
+    #[test]
+    fn the_ip_of_an_answering_upstream_is_read_from_its_name() {
+        let ip = |text: &str| Some(text.parse::<IpAddr>().unwrap());
+        for (upstream, expected) in [
+            ("udp:192.0.2.1:53", ip("192.0.2.1")),
+            ("tcp:[2001:db8::1]:53", ip("2001:db8::1")),
+            ("doh:192.0.2.1/dns-query", ip("192.0.2.1")),
+            ("doh:192.0.2.1:8443/dns-query", ip("192.0.2.1")),
+            ("dot:192.0.2.1:853?sni=dns.example", ip("192.0.2.1")),
+            ("doq:[2001:db8::1]:853?sni=dns.example", ip("2001:db8::1")),
+            ("192.0.2.1:53", ip("192.0.2.1")),
+            ("192.0.2.1", ip("192.0.2.1")),
+            ("doh:dns.example/dns-query", None),
+            ("dot:dns.example:853", None),
+        ] {
+            assert_eq!(try_parse_upstream_ip(upstream), expected, "{upstream}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod txt_regex_tests {
+    use super::RuntimeResponseMatcher;
+
+    fn built(pattern: &str) -> anyhow::Result<RuntimeResponseMatcher> {
+        RuntimeResponseMatcher::from_config(crate::config::ResponseMatcher::ResponseTxtContent {
+            mode: "regex".to_string(),
+            value: pattern.to_string(),
+        })
+    }
+
+    /// `response_txt_content` 的正则和域名正则一个上限（编译后 1 MB）。以前限在 1000 字节，`.`、`\d+`、
+    /// `^v=spf1 .*` 这样的平常写法都编译不过，整份配置跟着加载失败。大得离谱的照旧拒绝
+    /// A `response_txt_content` regex gets the limit domain regexes have (1 MB compiled). It
+    /// was held to 1000 bytes, which `.`, `\d+` or `^v=spf1 .*` already exceed, and the whole
+    /// configuration then failed to load. One out of all proportion is refused as before
+    #[test]
+    fn a_txt_regex_takes_ordinary_patterns() {
+        for pattern in [
+            ".",
+            r"\d+",
+            "^v=spf1 .*",
+            "google-site-verification=.*",
+            r"^\s*v=DKIM1",
+            r"^127\.0\.0\.\d+$",
+            "(?i)^(forbidden|blocked)",
+            r"^[\w.-]+@[\w.-]+$",
+        ] {
+            assert!(
+                built(pattern).is_ok(),
+                "{pattern}: {:?}",
+                built(pattern).err()
+            );
+        }
+        assert!(built(r"(\w{100}){100}").is_err(), "too large to compile");
+        assert!(built(&"a".repeat(1001)).is_err(), "too long a pattern");
     }
 }
