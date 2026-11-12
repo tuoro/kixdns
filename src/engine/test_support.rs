@@ -59,6 +59,44 @@ impl Upstream {
 
 /// 按 `replies` 对每个查询作答的本机 UDP 上游 / A local UDP upstream answering each query as `replies` says
 pub(crate) async fn upstream(replies: impl Fn(&Message) -> Replies + Send + 'static) -> Upstream {
+    upstream_letting_out(replies, None).await
+}
+
+/// 假上游的应答放不放行，由测试说了算：上游要多久才回答不靠猜一段时间，测试等到它要的事发生了再放行
+/// Whether a fake upstream's answers are let out, as the test says: how long the upstream
+/// takes is not a guessed stretch of time, the test letting them out once what it waits for
+/// has happened
+pub(crate) struct Held(tokio::sync::watch::Sender<bool>);
+
+impl Held {
+    /// 放行：扣着的应答都发出去，之后的应答当场发 / Lets them out: every answer held goes, and
+    /// those after go at once
+    pub(super) fn release(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// 之后的应答先扣着 / Holds the answers from now on
+    pub(super) fn hold(&self) {
+        self.0.send_replace(false);
+    }
+}
+
+/// 同 [`answering_upstream`]，但应答先扣着，测试放行了才发出（见 [`Held`]）
+/// The same as [`answering_upstream`], with every answer held until the test lets it out (see
+/// [`Held`])
+pub(crate) async fn answering_upstream_held(address: Ipv4Addr, ttl: u32) -> (Upstream, Held) {
+    let (held, let_out) = tokio::sync::watch::channel(false);
+    let upstream = upstream_letting_out(move |query| answer_of(query, address, ttl), Some(let_out));
+    (upstream.await, Held(held))
+}
+
+/// 同 [`upstream`]；给了 `let_out` 时，每个应答到了该发的时候还要等它放行
+/// The same as [`upstream`]; with `let_out` given, each reply also waits for it once its time
+/// to go has come
+async fn upstream_letting_out(
+    replies: impl Fn(&Message) -> Replies + Send + 'static,
+    let_out: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Upstream {
     let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let address = sock.local_addr().unwrap().to_string();
     let received = Arc::new(Mutex::new(Vec::new()));
@@ -76,8 +114,14 @@ pub(crate) async fn upstream(replies: impl Fn(&Message) -> Replies + Send + 'sta
             }
             for (delay, reply) in replies(&query) {
                 let sock = sock.clone();
+                let let_out = let_out.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
+                    if let Some(mut let_out) = let_out
+                        && let_out.wait_for(|open| *open).await.is_err()
+                    {
+                        return;
+                    }
                     let _ = sock.send_to(&reply, peer).await;
                 });
             }
@@ -104,20 +148,29 @@ pub(crate) async fn answering_upstream_after(
     delay: Duration,
 ) -> Upstream {
     upstream(move |query| {
-        let Some(question) = query.queries.first() else {
-            return Vec::new();
-        };
-        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-        reply.metadata.recursion_desired = query.metadata.recursion_desired;
-        reply.add_query(question.clone());
-        reply.add_answer(Record::from_rdata(
-            question.name().clone(),
-            ttl,
-            RData::A(A(address)),
-        ));
-        vec![(delay, reply.to_vec().unwrap())]
+        answer_of(query, address, ttl)
+            .into_iter()
+            .map(|(_, reply)| (delay, reply))
+            .collect()
     })
     .await
+}
+
+/// 对 `query` 的应答：一条 TTL 为 `ttl` 的 A 记录 `address`，当场发 / The answer to `query`: one A
+/// record `address` of TTL `ttl`, sent at once
+fn answer_of(query: &Message, address: Ipv4Addr, ttl: u32) -> Replies {
+    let Some(question) = query.queries.first() else {
+        return Vec::new();
+    };
+    let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+    reply.metadata.recursion_desired = query.metadata.recursion_desired;
+    reply.add_query(question.clone());
+    reply.add_answer(Record::from_rdata(
+        question.name().clone(),
+        ttl,
+        RData::A(A(address)),
+    ));
+    vec![(Duration::ZERO, reply.to_vec().unwrap())]
 }
 
 /// UDP 和 TCP 占同一个端口的本机上游：收下查询、接下连接，从不回答

@@ -75,14 +75,16 @@ impl UpstreamFailure {
     }
 
     /// 流控没让等的失败（见 [`Withheld`]）。调用方照上游失败处理，只有三处不同：不逐个记警告日志——拦的时候每秒可以有
-    /// 几万个；不把结果交给等在同一个转发上的别的请求——这是这台设备自己的事，别的设备各自去问；规则在上游失败时给的
-    /// 静态应答不写进缓存——缓存是所有设备共用的，别的设备问这个上游是有回答的
+    /// 几万个；不把结果交给等在同一个转发上的别的请求——这是这台设备自己的事，别的设备各自去问；这个请求此后得到的应答
+    /// 都不写进缓存，规则在上游失败时给的静态应答、改问备用上游得到的回答都一样——缓存是所有设备共用的，别的设备问这个
+    /// 上游是有回答的
     /// A failure with flow control keeping the query from waiting (see [`Withheld`]). Callers
     /// treat it as the upstream failing, but for three things: no warning is logged for each, as
     /// held back there can be tens of thousands a second; the outcome is not handed to other
     /// requests waiting on the same forward, this being the device's own affair, so other
-    /// devices ask for themselves; and a static answer the rules give on an upstream failure is
-    /// not written to the cache, which all devices share while the upstream does answer the
+    /// devices ask for themselves; and nothing the request gets from then on is written to the
+    /// cache, a static answer the rules give on an upstream failure and a fallback upstream's
+    /// answer alike, the cache being shared by all devices while the upstream does answer the
     /// others
     fn withheld(why: Withheld) -> anyhow::Error {
         anyhow::Error::new(Self::new(anyhow::Error::new(why)))

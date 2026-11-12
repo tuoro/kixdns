@@ -228,10 +228,14 @@ pub struct Step {
 pub struct EcsReach {
     steps: SmallVec<[Step; 1]>,
     /// 实际发出的 ECS 与 `crate::ecs::plan` 推算的不一样（客户端的 ECS 选项读不懂、改写失败
-    /// 而原样发出等）：拿不准应答适用于谁，不缓存
+    /// 而原样发出等）：拿不准应答适用于谁，不缓存。流控没让这个请求等上游以后也一样：它此后得到的
+    /// 应答只是它自己的（见 `engine::upstream::UpstreamFailure::withheld`）
     /// The ECS actually sent differs from what `crate::ecs::plan` works out (a client
     /// ECS option that cannot be read, a rewrite that failed and sent the packet as
-    /// it was, and so on): whom the answer applies to is unknown, so it is not cached
+    /// it was, and so on): whom the answer applies to is unknown, so it is not cached.
+    /// The same once flow control kept this request from waiting on an upstream: what it
+    /// gets from then on is its own alone (see
+    /// `engine::upstream::UpstreamFailure::withheld`)
     uncacheable: bool,
 }
 
@@ -272,7 +276,8 @@ impl EcsReach {
         self.record(ecs, ReplyEcs::Unreadable, false);
     }
 
-    /// 实际发出的 ECS 与推算的不一样，见 `uncacheable` / The ECS actually sent differs, see `uncacheable`
+    /// 此后得到的应答不缓存，见 `uncacheable` / What is got from here on is not cached, see
+    /// `uncacheable`
     pub fn mark_uncacheable(&mut self) {
         self.uncacheable = true;
     }

@@ -220,29 +220,24 @@ impl<P> FairQueue<P> {
         true
     }
 
-    /// 下一个轮到的查询，以及这台设备后面排着的是不是不比各设备平均少，而且至少是 [`Self::begin_batch`] 定下的那么多个（排得更少的不算）。
-    /// 一次问好几个的设备后面也排着几个，但比一直在发的少得多，不算；设备多到每台只排几个时，后面排着不到这么多个的也不算，那是
-    /// 每台都排得进的份
-    /// The next query in turn, and whether this device has no fewer queued behind it than the
-    /// average across devices, and at least what [`Self::begin_batch`] set (one with fewer does not). A
-    /// device asking several at once has a few behind it too, but far fewer than one sending on
-    /// and on, and does not count; with devices so many that each queues only a few, one with
-    /// fewer than that behind does not count either, that being the share every device gets in
-    pub fn next_in_turn(&mut self) -> Option<(Box<[u8]>, P, bool)> {
+    /// 下一个轮到的查询。轮到谁、谁排着就取谁的一个，不看它排了多少：发得多的设备多出来的那些，排进去时就排不下了（见
+    /// [`Self::offer`]）
+    /// The next query in turn. Whoever's turn it is has one taken, however many it has queued:
+    /// what a device sending more has over its share did not fit as it was offered (see
+    /// [`Self::offer`])
+    pub fn next_in_turn(&mut self) -> Option<(Box<[u8]>, P)> {
         let device = self.turns.pop_front()?;
         let queue = self.queues.get_mut(&device)?;
-        let (packet, peer) = queue.pop_front()?;
+        let next = queue.pop_front()?;
         self.queued -= 1;
-        let left = queue.len();
-        if left > 0 {
+        if !queue.is_empty() {
             self.turns.push_back(device);
         } else if let Some(emptied) = self.queues.remove(&device)
             && self.spare.len() < SPARE_QUEUES
         {
             self.spare.push(emptied);
         }
-        let queues_its_share = left >= self.at_least && left * self.turns.len() >= self.queued;
-        Some((packet, peer, queues_its_share))
+        Some(next)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -298,7 +293,7 @@ mod tests {
     }
 
     fn taken(queue: &mut FairQueue<u32>) -> Vec<u32> {
-        std::iter::from_fn(|| queue.next_in_turn().map(|(_, peer, _)| peer)).collect()
+        std::iter::from_fn(|| queue.next_in_turn().map(|(_, peer)| peer)).collect()
     }
 
     #[test]
@@ -316,49 +311,6 @@ mod tests {
         assert_eq!(queue.devices(), 0);
     }
 
-    /// 轮到的设备后面排着的不比各设备平均少、至少 4 个，才算占着自己那一份：一台排了 100 个、一台一次来了 4 个，轮到前者算，
-    /// 轮到后者不算；只剩一台在排时它就是平均，排到后面不到 4 个时不算
-    /// A device in turn holds its share only with no fewer queued behind it than the average, and
-    /// at least 4: with one having queued 100 and another 4 at once, the first does and the second
-    /// does not; once it is the only one queued it is the average, and with fewer than 4 behind it
-    /// does not
-    #[test]
-    fn a_device_queueing_no_less_than_the_average_holds_its_share() {
-        let mut queue = FairQueue::new(1000);
-        let (heavy, light) = (device(1), device(2));
-        for id in 0..100 {
-            assert!(queue.offer(b"q", heavy, id));
-        }
-        for id in 100..104 {
-            assert!(queue.offer(b"q", light, id));
-        }
-        let shares: Vec<_> = std::iter::from_fn(|| queue.next_in_turn())
-            .map(|(_, peer, share)| (peer, share))
-            .collect();
-        assert_eq!(shares.len(), 104);
-        assert!(
-            shares
-                .iter()
-                .filter(|(peer, _)| *peer >= 100)
-                .all(|(_, share)| !share),
-            "the one asking a few at once"
-        );
-        assert!(
-            shares
-                .iter()
-                .filter(|(peer, _)| *peer < 96)
-                .all(|(_, share)| *share),
-            "the one sending on and on"
-        );
-        assert!(
-            shares
-                .iter()
-                .filter(|(peer, _)| (96..100).contains(peer))
-                .all(|(_, share)| !share),
-            "fewer than 4 behind"
-        );
-    }
-
     #[test]
     fn the_query_comes_back_as_it_was_sent() {
         let mut queue = FairQueue::new(100);
@@ -366,23 +318,21 @@ mod tests {
         for peer in 8..12 {
             queue.offer(b"more", device(0), peer);
         }
-        let (packet, peer, holds_its_share) = queue.next_in_turn().unwrap();
+        let (packet, peer) = queue.next_in_turn().unwrap();
         assert_eq!(&*packet, b"query");
         assert_eq!(peer, 7);
-        assert!(holds_its_share, "alone, with four behind");
-        let (packet, peer, holds_its_share) = queue.next_in_turn().unwrap();
+        let (packet, peer) = queue.next_in_turn().unwrap();
         assert_eq!(&*packet, b"more");
         assert_eq!(peer, 8);
-        assert!(!holds_its_share, "three behind");
         assert_eq!(taken(&mut queue), [9, 10, 11]);
     }
 
-    /// 设备多到平分下来每台不到一个时，每台照样排得进 4 个：一千台各排满，发得少的设备一次问 3 个都排得进，轮到时也都不算占着
-    /// 份额，跟不上时不丢。以前每台只排得进一个，同一批来的第二个起就丢
+    /// 设备多到平分下来每台不到一个时，每台照样排得进 4 个：一千台各排满，发得少的设备一次问 3 个都排得进，和别的设备轮着取，
+    /// 三圈里取完。以前每台只排得进一个，同一批来的第二个起就丢
     /// With devices so many that each would get less than one, each still gets 4 in: with a
-    /// thousand at their share, a device sending little asking 3 at once gets all in, and none of
-    /// them counts as holding its share in turn, so falling behind drops none. Each used to get one
-    /// in, the second of a batch onwards dropped
+    /// thousand at their share, a device sending little asking 3 at once gets all in and has
+    /// them taken in turn with the others, done within three rounds. Each used to get one in,
+    /// the second of a batch onwards dropped
     #[test]
     fn many_devices_each_queue_a_few() {
         let mut queue = FairQueue::new(100);
@@ -394,19 +344,21 @@ mod tests {
         for id in 0..3 {
             assert!(queue.offer(b"q", light, 5000 + id), "{id}");
         }
-        let light_turns: Vec<_> = std::iter::from_fn(|| queue.next_in_turn())
-            .filter(|(_, peer, _)| *peer >= 5000)
-            .map(|(_, _, share)| share)
+        let taken = taken(&mut queue);
+        let light_turns: Vec<_> = taken
+            .iter()
+            .enumerate()
+            .filter(|(_, peer)| **peer >= 5000)
+            .map(|(at, _)| at)
             .collect();
-        assert_eq!(light_turns, [false, false, false]);
+        assert_eq!(light_turns, [1000, 2001, 3002], "one each round");
     }
 
-    /// 排队的设备到了上限、又有新设备被挡在外面以后，挡的那一刻起每台只排得进一个，后面排着一个、不比平均少的就算占着份额，
-    /// 和以前一样；`TURNED_AWAY_KEPT` 里一直这样，过了又是至少 4 个
+    /// 排队的设备到了上限、又有新设备被挡在外面以后，挡的那一刻起每台只排得进一个；`TURNED_AWAY_KEPT` 里一直这样，过了又是
+    /// 至少 4 个
     /// Once the queued devices are at the limit and a new device has been turned away, each gets
-    /// only one in from that moment, and one with one behind and no fewer than the average holds
-    /// its share, as it used to; so it stays for `TURNED_AWAY_KEPT`, and past that it is at least
-    /// 4 again
+    /// only one in from that moment; so it stays for `TURNED_AWAY_KEPT`, and past that it is at
+    /// least 4 again
     #[test]
     fn past_the_device_limit_each_queues_one_again() {
         let mut queue = FairQueue::new(100);
@@ -422,9 +374,8 @@ mod tests {
         );
         assert!(!queue.offer(b"q", device(limit), limit), "past the limit");
         assert!(!queue.offer(b"q", device(1), 1), "then one each");
-        let (_, peer, holds_its_share) = queue.next_in_turn().unwrap();
+        let (_, peer) = queue.next_in_turn().unwrap();
         assert_eq!(peer, 0);
-        assert!(holds_its_share, "one behind and no fewer than the average");
         for _ in 1..limit {
             queue.next_in_turn();
         }
@@ -469,7 +420,7 @@ mod tests {
             }
             queue.begin_batch(100, start + Duration::from_millis(50 * u64::from(round)));
             for _ in 0..1000 {
-                if let Some((_, peer, _)) = queue.next_in_turn()
+                if let Some((_, peer)) = queue.next_in_turn()
                     && peer == sources
                 {
                     waiting = false;
@@ -510,7 +461,7 @@ mod tests {
                 }
                 queue.begin_batch(100, start + Duration::from_millis(50 * u64::from(round)));
                 for _ in 0..1000 {
-                    if let Some((_, peer, _)) = queue.next_in_turn()
+                    if let Some((_, peer)) = queue.next_in_turn()
                         && peer == sources
                     {
                         waiting = false;

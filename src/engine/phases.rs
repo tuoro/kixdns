@@ -843,15 +843,25 @@ pub(crate) async fn handle_forward_decision_logged(
     };
 
     // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：这个请求登记的条目、规则 continue 以后还
-    // 留着的条目，现在都放下，等在上面的别的请求各自去问，不拿这一个的结果
+    // 留着的条目，现在都放下，等在上面的别的请求各自去问，不拿这一个的结果；这个请求此后得到的应答也一律不写缓存——规则在
+    // 上游失败时给的静态应答、改问备用上游得到的回答、continue 到后面的规则或者跳到别的规则组得到的回答都一样。缓存是所有
+    // 设备共用的：别的设备问这个名字时上游并没有失败，该拿到上游的回答；写进去的话，一台被拦着的设备问过哪个名字，哪个名字
+    // 在缓存有效期里对所有设备就都换成了备用的答案
     // A failure with flow control keeping the query from waiting is the device's own affair
     // (see `UpstreamFailure::withheld`): the entry this request registered and the one it
     // still holds after a rule continued both go now, so the other requests waiting on them
-    // ask for themselves and get nothing of this one's outcome
+    // ask for themselves and get nothing of this one's outcome; and nothing the request gets
+    // from here on is cached, be it a static answer the rule gives when the upstream fails, the
+    // answer of a fallback upstream, or what a later rule after a continue or another pipeline
+    // after a jump answers. The cache is shared by all devices: for another device asking the
+    // name the upstream has not failed, and the upstream's answer is what it should get; cached,
+    // every name a device held back asked would be the fallback's answer for all devices for
+    // as long as the entry lives
     let withheld = resp.as_ref().is_err_and(UpstreamFailure::was_withheld);
     if withheld {
         cleanup_guard = None;
         *held_inflight = None;
+        trail.mark_uncacheable();
     }
 
     // 几个上游都回了失败应答时，规则的回答检查照样看得到最先收到的那个（见
@@ -1268,10 +1278,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         refresh_found_no_answer("the response actions found no answer")
                     }));
                 }
-                // 流控没让等时规则给的静态应答不写缓存（见 `UpstreamFailure::withheld`）/ A static answer the
-                // rules give with flow control keeping the query from waiting is not cached (see
-                // `UpstreamFailure::withheld`)
-                if min_ttl > Duration::from_secs(0) && !withheld {
+                if min_ttl > Duration::from_secs(0) {
                     let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                     cache(&bytes, rcode, None, (ttl, ttl), trail);
                 } else if skip_cache && !fallback {
