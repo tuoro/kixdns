@@ -685,3 +685,114 @@ fn a_proxy_keeps_everything_on_reqwest() {
     )])));
     assert!(!proxy_configured_in(env(&[("HTTPS_PROXY", "")])));
 }
+
+/// 一条不走 TLS 的 HTTP/2 连接，中间隔着一段线路：客户端取消请求的帧（RST_STREAM）在路上丢掉，上游不知道请求被
+/// 取消，`after` 之后照样作答。真实网络上，取消和已经在路上的回答交错时客户端看到的就是这样：回答落在一个自己已经
+/// 取消的流上
+/// An HTTP/2 connection without TLS, with a stretch of wire in between that drops the client's
+/// cancellations (RST_STREAM): the upstream never learns a request was given up and answers it
+/// after `after` all the same. On a real network this is what the client sees when a cancellation
+/// crosses an answer already on its way: the answer lands on a stream it has cancelled
+async fn connection_whose_answers_cross_cancellations(after: Duration) -> doh_h2::H2Sender {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const RST_STREAM: u8 = 3;
+    let (client_io, client_wire) = tokio::io::duplex(1 << 20);
+    let (server_wire, server_io) = tokio::io::duplex(1 << 20);
+    let (mut from_client, mut to_client) = tokio::io::split(client_wire);
+    let (mut from_server, mut to_server) = tokio::io::split(server_wire);
+    tokio::spawn(async move {
+        // 连接前言 24 字节，之后是一帧一帧：9 字节的头（长度 3 字节、类型 1 字节……）加载荷
+        // The 24-byte preface, then frame after frame: a 9-byte header (3 bytes of length, 1 of
+        // type, ...) and the payload
+        let mut preface = [0u8; 24];
+        if from_client.read_exact(&mut preface).await.is_err()
+            || to_server.write_all(&preface).await.is_err()
+        {
+            return;
+        }
+        loop {
+            let mut header = [0u8; 9];
+            if from_client.read_exact(&mut header).await.is_err() {
+                return;
+            }
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let mut payload = vec![0u8; len];
+            if from_client.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            if header[3] == RST_STREAM {
+                continue;
+            }
+            if to_server.write_all(&header).await.is_err()
+                || to_server.write_all(&payload).await.is_err()
+            {
+                return;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut from_server, &mut to_client).await;
+    });
+    tokio::spawn(async move {
+        let mut conn = h2::server::handshake(server_io).await.unwrap();
+        while let Some(Ok((request, respond))) = conn.accept().await {
+            tokio::spawn(answer_after(request, respond, after));
+        }
+    });
+    doh_h2::handshake(client_io).await.expect("handshake")
+}
+
+/// 在 `sender` 的连接上问一个查询，等回答 / Asks one query on `sender`'s connection and waits for its answer
+async fn ask_on(sender: &doh_h2::H2Sender, id: u16) -> Result<Vec<u8>, h2::Error> {
+    let request = Request::post("https://upstream.test/dns-query")
+        .version(Version::HTTP_2)
+        .header("content-type", DOH_MEDIA_TYPE)
+        .body(())
+        .unwrap();
+    let response = doh_h2::send(sender.clone(), request, Bytes::from(query(id))).await?;
+    Ok(response.into_body().collect().await?.to_bytes().to_vec())
+}
+
+/// 请求被放弃以后回答才到（时限先到、几个上游竞速它输了都是这样），再多也不让连接断开：连接照常用。h2 默认只记得住
+/// 10 个取消了的流，再多的当场忘掉；回答落在忘掉的流上，每一帧都记一次「对方出错」，这个数只增不减，到 1024 就把
+/// 连接断开。和 UDP 上游一起问、每次都慢一步的 DoH 上游，每个查询的回答都落在取消了的流上，一千来个查询就断一次
+/// With requests given up before their answers arrive (a deadline that came first, a race
+/// between upstreams lost), however many, the connection does not end and goes on being used.
+/// By default h2 remembers 10 cancelled streams and forgets any further ones at once; an answer
+/// landing on a forgotten stream counts each frame as an error by the peer, in a count that only
+/// grows, and at 1024 the connection is ended. A DoH upstream asked along with a UDP one and
+/// always a step slower has every answer land on a cancelled stream, so the connection ended
+/// every thousand queries or so
+#[tokio::test]
+async fn answers_to_requests_given_up_do_not_end_the_connection() {
+    let sender = connection_whose_answers_cross_cancellations(Duration::from_millis(30)).await;
+    assert_eq!(ask_on(&sender, 1).await.unwrap()[..2], 1u16.to_be_bytes());
+
+    // 1500 个请求，每个 5 毫秒就放弃；上游不知道，30 毫秒后照样回答
+    // 1500 requests, each given up after 5 ms; the upstream does not know and answers after
+    // 30 ms all the same
+    for batch in 0..75u16 {
+        let given_up = (0..20u16).map(|n| {
+            let sender = &sender;
+            let id = 1000 + batch * 20 + n;
+            async move { tokio::time::timeout(Duration::from_millis(5), ask_on(sender, id)).await }
+        });
+        for result in futures::future::join_all(given_up).await {
+            match result {
+                Err(_given_up) => {}
+                Ok(Err(err)) => panic!(
+                    "the connection ended after about {} requests: {err}",
+                    batch * 20
+                ),
+                Ok(Ok(_)) => panic!("answered within 5 ms"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    let answer = tokio::time::timeout(Duration::from_secs(2), ask_on(&sender, 2))
+        .await
+        .expect("an answer in time")
+        .expect("the connection is still in use");
+    assert_eq!(answer[..2], 2u16.to_be_bytes());
+}

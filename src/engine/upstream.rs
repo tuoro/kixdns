@@ -6,6 +6,7 @@ use futures::future::select;
 use hickory_proto::op::ResponseCode;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::debug;
 
 use super::Engine;
@@ -309,7 +310,7 @@ const HEDGE_TIMEOUT_DIVISOR: u32 = 3;
 /// After one leg of a dual send failed, wait up to `remaining` for the other; returns
 /// the other leg's answer and its transport
 async fn fallback_after_primary_failure(
-    other_task: tokio::task::JoinHandle<anyhow::Result<Bytes>>,
+    other_task: AbortOnDropHandle<anyhow::Result<Bytes>>,
     remaining: Duration,
     primary_label: &'static str,
     primary_err: anyhow::Error,
@@ -386,7 +387,12 @@ async fn forward_tcp_udp_dual(
     let addr_udp = addr.to_string();
     let addr_tcp = addr.to_string();
 
-    let udp_task = tokio::spawn(async move {
+    // 两路各是一个任务，句柄一丢任务就取消：这次转发被放弃时（外层的时限先到、几个上游竞速它输了），两路不该
+    // 接着跑到各自的超时，UDP 那一路还会再发一次
+    // Each leg is a task that is cancelled when its handle is dropped: when this forward is given
+    // up (an outer deadline comes first, or it loses a race between upstreams) the legs must not
+    // run on to their own timeouts, the UDP one sending once more on the way
+    let udp_task = AbortOnDropHandle::new(tokio::spawn(async move {
         // Disable TCP fallback here to avoid duplicate TCP sends when dual-send is enabled.
         // A truncated answer waits for the TCP leg below instead.
         // 双发时这里不改用 TCP，免得重复发送；截断的应答改为在下面等 TCP 那一路。
@@ -397,9 +403,9 @@ async fn forward_tcp_udp_dual(
         forward_udp_smart(&engine_udp, &packet_udp, &addr_udp, timeout_dur, tcp)
             .await
             .map(|(bytes, _)| bytes)
-    });
+    }));
 
-    let tcp_task = tokio::spawn(async move {
+    let tcp_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let sent = sent_if_timed(&engine_tcp);
         let reply = engine_tcp
             .tcp_mux
@@ -407,7 +413,7 @@ async fn forward_tcp_udp_dual(
             .await;
         note_round_trip(&engine_tcp, &addr_tcp, timeout_dur, sent, &reply);
         reply
-    });
+    }));
 
     let start = std::time::Instant::now();
 
@@ -1872,6 +1878,51 @@ mod tests {
             );
             assert_eq!(reply[2] & 0x02, 0, "case {index}: a full answer");
         }
+    }
+
+    /// 双发的这次转发被放弃时（外层的时限先到、几个上游竞速它输了），它的两路也跟着停：不再重发，不再占着在途的
+    /// 条目等到超时。以前两路是各自起的任务，转发被放弃以后没人管它们，UDP 那一路过了三分之一时限照样再发一次
+    /// When a dual send's forward is given up (an outer deadline comes first, or it loses a race
+    /// between upstreams), its two legs stop with it: no resend, no in-flight entry held until the
+    /// timeout. The legs were tasks of their own that nobody looked after once the forward was
+    /// given up, and the UDP leg still sent again past a third of the timeout
+    #[tokio::test]
+    async fn giving_up_a_dual_send_stops_its_legs() {
+        let _ = ring::default_provider().install_default();
+        let (udp_socket, tcp_listener, addr) = bind_udp_and_tcp_on_one_port().await;
+        // TCP 连不上，UDP 收下不回，只数收到几个 / TCP refuses, UDP takes queries without
+        // answering and only counts them
+        drop(tcp_listener);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&received);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while udp_socket.recv_from(&mut buf).await.is_ok() {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let engine = build_test_engine(true);
+        let packet = build_dns_query_packet("example.com");
+        let addr = addr.to_string();
+        {
+            let forward = forward_tcp_udp_dual(&engine, &packet, &addr, Duration::from_millis(600));
+            tokio::pin!(forward);
+            // 两路都发出去了，转发还在等 / Both legs have sent and the forward still waits
+            assert!(
+                timeout(Duration::from_millis(60), &mut forward)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(received.load(Ordering::SeqCst), 1);
+        }
+        // 过了三分之一时限（200 毫秒）：放弃了的转发不再重发 / Past a third of the timeout
+        // (200 ms): a forward given up does not send again
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            1,
+            "no resend after giving up"
+        );
     }
 
     /// UDP 第一次尝试用掉预算的三分之一，过了就再发一次（测试里的「三分之一」都指这个）
