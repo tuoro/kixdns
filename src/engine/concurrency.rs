@@ -30,6 +30,28 @@ pub const BUSY_AFTER: Duration = Duration::from_millis(100);
 /// queue only one. At most `fair_queue::MAX_QUEUED_DEVICES` devices are looked after this way
 pub const SHARE_AT_LEAST: usize = 4;
 
+/// 按设备轮流时，有活等着内核干的查询最多这么多个（两批），到了接收循环就先不从队列里取（见 [`WaitingToRun`]）。接收循环取一个
+/// 查询、起一个任务只要一两微秒，内核把它处理完要十几微秒，转发的还要再处理一次回答：照自己的速度交，交出去的比处理完的多，
+/// 调度器里排的任务越来越多，上游的回答到了也轮不到处理，在途只涨不降，最后所有设备一起超时。等着的少了才接着交，多出来的就
+/// 不在内核里排队，留在各设备自己的队列里轮着取，排不下的在排进去时丢（见 `FairQueue::offer`）——谁发得多丢谁的，不用判断
+/// 谁算「重」。两批够内核在接收循环下次回来之前一直有活干，又远小于调度器一个线程排得下的任务数（tokio 是 256 个，满了就
+/// 把一半挪到另一个队列里，那里的任务隔几十个才取一个：回答到了的任务被挪过去，就是等不到处理的那些）
+/// While devices take turns, at most this many queries (two batches) have work waiting for the
+/// kernel; at that the receive loops take no more from the queues (see [`WaitingToRun`]).
+/// Taking a query and starting its task costs a receive loop a microsecond or two, while the
+/// kernel needs over ten to handle it and a forward's answer has to be handled as well:
+/// handing over at its own speed, more go in than get done, ever more tasks queue in the
+/// scheduler, the upstreams' answers arrive and are not got to, what is in flight only grows,
+/// and in the end every device times out. Handing over more only once fewer are waiting, the
+/// excess does not queue inside the kernel but stays in each device's own queue, taken in
+/// turn, and what does not fit is dropped as it is offered (see `FairQueue::offer`): whoever
+/// sends most loses most, with no judging who counts as heavy. Two batches keep the kernel in
+/// work until a receive loop is back, and are far fewer than the tasks one thread of the
+/// scheduler holds (256 in tokio, which at that moves half to another queue where a task is
+/// taken only once in dozens: tasks whose answers have arrived, moved there, are the ones
+/// that are not got to)
+pub const WAITING_TO_RUN_AT_MOST: usize = 64;
+
 /// 卡住的查询（见 [`PermitManager::stuck_after`]）留着等这么多个，各设备平分，再卡住的不等了。和内存水位开始看内存的在途数
 /// 一样：这么少占不了多少内存。留着的是每台设备最早卡住的那些：它们等到底，回答真来了，就知道回答比原先以为的慢。每台设备
 /// 至少留得下 [`SHARE_AT_LEAST`] 个，留着的设备到 `fair_queue::MAX_QUEUED_DEVICES` 台为止：来源多到平分下来每台不到一个时，
@@ -212,6 +234,139 @@ impl AnswerTime {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GaveUp;
 
+/// 有活等着内核干的查询有多少：交给任务还没开始跑的，和被叫醒（上游的回答到了、定时器到点了）还没轮到跑的。正在等上游的不算——
+/// 那不是内核在排队。几个接收循环、几个核共用这一个数：任务在哪个线程上排着、调度器怎么排，都不用管
+/// How many queries have work waiting for the kernel: those handed to a task that has not
+/// started running, and those woken (an upstream's answer arrived, a timer fired) whose turn to
+/// run has not come. One waiting on an upstream does not count, that not being the kernel
+/// queueing. Every receive loop and every core share this one count: on which thread a task
+/// queues and how the scheduler orders them does not come into it
+#[derive(Default)]
+pub struct WaitingToRun(AtomicUsize);
+
+impl WaitingToRun {
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// 等着的已经够多，先不再交（见 [`WAITING_TO_RUN_AT_MOST`]）/ Enough are waiting, so no more are
+    /// handed over for now (see [`WAITING_TO_RUN_AT_MOST`])
+    pub fn is_enough(&self) -> bool {
+        self.count() >= WAITING_TO_RUN_AT_MOST
+    }
+
+    /// 把 `work` 交给任务去跑，它有活等着内核干的时候都算在里面：从现在到它开始跑，之后每次被叫醒到轮到它跑。算的是交出去的
+    /// 这一刻，不是它第一次跑的时候。`work` 没跑完（甚至没跑过）就被丢掉时不再算
+    /// Hands `work` to a task, counted in for as long as it has work waiting for the kernel:
+    /// from now until it starts running, and from each time it is woken until its turn to run
+    /// comes. It counts from this moment of handing over, not from its first run. Dropped
+    /// before it is done, or before it ever ran, it counts no more
+    pub fn counting<F: Future>(waiting: Arc<Self>, work: F) -> impl Future<Output = F::Output> {
+        let handed_over = HandedOver::new(waiting);
+        async move {
+            let waker = std::task::Waker::from(Arc::clone(&handed_over.0));
+            let mut work = std::pin::pin!(work);
+            std::future::poll_fn(|cx| {
+                handed_over.0.runs(cx.waker());
+                work.as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker))
+            })
+            .await
+        }
+    }
+}
+
+/// 一个交出去的查询这会儿在等什么 / What a query handed over is waiting for right now
+const RUNNING_OR_WAITING_ON_OTHERS: u8 = 0;
+const WAITING_TO_RUN: u8 = 1;
+const DONE: u8 = 2;
+
+/// 一个交出去的查询的任务：记着它是不是有活等着内核干。任务拿到的是包了一层的 waker：谁叫醒它，先记下它在等着跑，再叫醒
+/// 任务本身
+/// The task of one query handed over, keeping whether it has work waiting for the kernel. What
+/// the task is given is a waker wrapped once: whoever wakes it first notes that it waits to
+/// run, then wakes the task itself
+struct Woken {
+    waiting: Arc<WaitingToRun>,
+    state: std::sync::atomic::AtomicU8,
+    /// 任务本身的 waker / The waker of the task itself
+    task: parking_lot::Mutex<Option<std::task::Waker>>,
+}
+
+impl Woken {
+    /// 轮到它跑了：不再算等着跑；记下任务本身的 waker / Its turn to run has come: it no longer
+    /// counts as waiting to run, and the task's own waker is kept
+    fn runs(&self, task: &std::task::Waker) {
+        if self
+            .state
+            .compare_exchange(
+                WAITING_TO_RUN,
+                RUNNING_OR_WAITING_ON_OTHERS,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.waiting.0.fetch_sub(1, Ordering::Relaxed);
+        }
+        let mut kept = self.task.lock();
+        if !kept.as_ref().is_some_and(|kept| kept.will_wake(task)) {
+            *kept = Some(task.clone());
+        }
+    }
+}
+
+impl std::task::Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        // 已经在等着跑的不重复算；结束以后才到的叫醒（定时器、别处留着的 waker）不算，没有下一次跑来把它减掉
+        // One already waiting to run is not counted again; a wake coming after the end (a timer,
+        // a waker kept somewhere) does not count, there being no next run to take it off
+        if self
+            .state
+            .compare_exchange(
+                RUNNING_OR_WAITING_ON_OTHERS,
+                WAITING_TO_RUN,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.waiting.0.fetch_add(1, Ordering::Relaxed);
+        }
+        let task = self.task.lock().clone();
+        if let Some(task) = task {
+            task.wake();
+        }
+    }
+}
+
+/// 交出去的一个查询，到它结束或者被丢掉为止 / One query handed over, until it ends or is dropped
+struct HandedOver(Arc<Woken>);
+
+impl HandedOver {
+    fn new(waiting: Arc<WaitingToRun>) -> Self {
+        waiting.0.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::new(Woken {
+            waiting,
+            state: std::sync::atomic::AtomicU8::new(WAITING_TO_RUN),
+            task: parking_lot::Mutex::new(None),
+        }))
+    }
+}
+
+impl Drop for HandedOver {
+    fn drop(&mut self) {
+        if self.0.state.swap(DONE, Ordering::AcqRel) == WAITING_TO_RUN {
+            self.0.waiting.0.fetch_sub(1, Ordering::Relaxed);
+        }
+        *self.0.task.lock() = None;
+    }
+}
+
 /// 流控的状态。不用填数字，判断都来自运行时测到的：socket 收不收得空、查询排队多久、处理得多快、还剩多少内存
 /// The state of flow control. There are no numbers to fill in: it goes by what is measured at
 /// run time, namely whether a socket runs empty, how long queries queue, how fast they are
@@ -224,6 +379,9 @@ pub struct FlowControlState {
     started: Instant,
     /// 跟不上的状态到什么时候（从 `started` 算起的纳秒）/ Until when the kernel counts as behind, in nanoseconds since `started`
     behind_until_ns: AtomicU64,
+    /// 按设备轮流时有活等着内核干的查询（见 [`WaitingToRun`]）/ The queries with work waiting for the
+    /// kernel while devices take turns (see [`WaitingToRun`])
+    pub waiting_to_run: Arc<WaitingToRun>,
 }
 
 impl FlowControlState {
@@ -233,6 +391,7 @@ impl FlowControlState {
             memory,
             started: Instant::now(),
             behind_until_ns: AtomicU64::new(0),
+            waiting_to_run: Arc::new(WaitingToRun::default()),
         }
     }
 
@@ -2677,5 +2836,128 @@ mod tests {
         let slots: std::collections::HashSet<_> =
             (1..=100).map(|n| of(&format!("192.0.2.{n}"))).collect();
         assert!(slots.len() > 1, "devices spread over the slots");
+    }
+
+    /// 数自己被叫醒过几次的任务 / A task counting how often it was woken
+    struct TaskWoken(AtomicUsize);
+
+    impl std::task::Wake for TaskWoken {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 一件活：每次跑都把拿到的 waker 留在 `given` 里，`done` 置位以后才结束
+    /// A piece of work: each run leaves the waker it was given in `given`, and it ends only once
+    /// `done` is set
+    fn work_keeping_its_waker(
+        given: &Arc<parking_lot::Mutex<Option<std::task::Waker>>>,
+        done: &Arc<AtomicBool>,
+    ) -> impl Future<Output = u8> + use<> {
+        let (given, done) = (Arc::clone(given), Arc::clone(done));
+        std::future::poll_fn(move |cx| {
+            *given.lock() = Some(cx.waker().clone());
+            if done.load(Ordering::Relaxed) {
+                std::task::Poll::Ready(7)
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+    }
+
+    /// 一个查询有活等着内核干的时候才算：交出去到开始跑算，跑过以后在等别的（上游）不算，被叫醒到再轮到它跑又算，叫醒两次只算
+    /// 一次；叫醒它的人叫醒的是任务本身。以前只数交出去还没开始跑的：上游的回答到了、任务被叫醒却轮不到跑的那些不算，几个核
+    /// 一起处理时在途照样涨到十几万
+    /// A query counts only while it has work waiting for the kernel: from being handed over
+    /// until it starts running; not once it has run and waits on something else (an upstream);
+    /// again from being woken until its turn to run comes, two wakes counting once; and whoever
+    /// wakes it wakes the task itself. Only those handed over and not started used to be
+    /// counted: those whose answer had arrived, woken with their turn to run not coming, were
+    /// not, and with several cores at work what was in flight still grew past a hundred thousand
+    #[test]
+    fn a_query_counts_while_it_has_work_waiting_for_the_kernel() {
+        use std::task::{Context, Poll, Waker};
+
+        let task = Arc::new(TaskWoken(AtomicUsize::new(0)));
+        let task_waker = Waker::from(Arc::clone(&task));
+        let mut cx = Context::from_waker(&task_waker);
+        let woken = || task.0.load(Ordering::Relaxed);
+        let waiting = Arc::new(WaitingToRun::default());
+        let given = Arc::new(parking_lot::Mutex::new(None));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let mut query = Box::pin(WaitingToRun::counting(
+            Arc::clone(&waiting),
+            work_keeping_its_waker(&given, &done),
+        ));
+        assert_eq!(waiting.count(), 1, "handed over and not run yet");
+        assert!(query.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(waiting.count(), 0, "it has run and waits on something else");
+
+        let waker = given.lock().clone().expect("the work was given a waker");
+        waker.wake_by_ref();
+        assert_eq!(waiting.count(), 1, "woken, its turn to run not come");
+        assert_eq!(woken(), 1, "the task itself is woken");
+        waker.wake_by_ref();
+        assert_eq!(waiting.count(), 1, "woken twice, counted once");
+        assert_eq!(woken(), 2);
+        assert!(query.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(waiting.count(), 0, "it has run again");
+
+        // 跑完了：不再算，之后才到的叫醒也不算，也不再叫醒任务 / Done: it counts no more, nor does a
+        // wake coming after, which wakes no task either
+        waker.wake_by_ref();
+        assert_eq!(waiting.count(), 1);
+        done.store(true, Ordering::Relaxed);
+        assert_eq!(query.as_mut().poll(&mut cx), Poll::Ready(7));
+        assert_eq!(waiting.count(), 0);
+        let before = woken();
+        waker.wake();
+        assert_eq!(waiting.count(), 0, "a wake after the end");
+        assert_eq!(woken(), before);
+    }
+
+    /// 没跑完就被丢掉的查询不再算：一次都没跑过的，和被叫醒以后还没轮到跑的，都一样
+    /// A query dropped before it is done counts no more: one that never ran, and one woken with
+    /// its turn to run not come, alike
+    #[test]
+    fn a_query_dropped_while_waiting_to_run_counts_no_more() {
+        use std::task::{Context, Waker};
+
+        let waiting = Arc::new(WaitingToRun::default());
+        let never_run = WaitingToRun::counting(Arc::clone(&waiting), std::future::pending::<()>());
+        assert_eq!(waiting.count(), 1);
+        drop(never_run);
+        assert_eq!(waiting.count(), 0, "never run");
+
+        let task_waker = Waker::from(Arc::new(TaskWoken(AtomicUsize::new(0))));
+        let mut cx = Context::from_waker(&task_waker);
+        let given = Arc::new(parking_lot::Mutex::new(None));
+        let done = Arc::new(AtomicBool::new(false));
+        let mut query = Box::pin(WaitingToRun::counting(
+            Arc::clone(&waiting),
+            work_keeping_its_waker(&given, &done),
+        ));
+        assert!(query.as_mut().poll(&mut cx).is_pending());
+        let waker = given.lock().clone().unwrap();
+        waker.wake_by_ref();
+        assert_eq!(waiting.count(), 1);
+        drop(query);
+        assert_eq!(waiting.count(), 0, "woken, then dropped");
+        waker.wake();
+        assert_eq!(waiting.count(), 0, "and a wake after that");
+    }
+
+    /// 等着的到了 [`WAITING_TO_RUN_AT_MOST`] 个才算够多 / Enough are waiting only at
+    /// [`WAITING_TO_RUN_AT_MOST`]
+    #[test]
+    fn enough_are_waiting_to_run_at_the_limit() {
+        let waiting = Arc::new(WaitingToRun::default());
+        let hand_over =
+            || WaitingToRun::counting(Arc::clone(&waiting), std::future::pending::<()>());
+        let mut handed_over: Vec<_> = (1..WAITING_TO_RUN_AT_MOST).map(|_| hand_over()).collect();
+        assert!(!waiting.is_enough(), "one short");
+        handed_over.push(hand_over());
+        assert!(waiting.is_enough());
     }
 }

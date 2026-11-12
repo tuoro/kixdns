@@ -261,7 +261,8 @@ async fn a_flood_of_names_failing_late_is_held_by_the_share_of_stuck_queries() {
     let engine = engine(&failing, &good, true, 3000);
     know_answers_are_quick(&engine).await;
     let flood = flood(&engine, client(1), "f", 1100);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 超出那一份的一百个不等了 / The hundred past the share have given up
+    done_of(&flood, 100).await;
     let sent = failing.queries();
     let started = Instant::now();
     let (_, answered) = ask_as_a_listener(&engine, "more.dead.test.".to_string(), client(1)).await;
@@ -322,6 +323,34 @@ fn flood(
             })
         })
         .collect()
+}
+
+/// 同 [`flood`]，但一次只问一小批，等 `upstream` 都收到了再问下一批：假上游的接收缓冲只放得下一百多个查询，一千个任务挨着
+/// 发出去时它还没轮到读，多出来的系统就丢了，上游根本没见过它们
+/// The same as [`flood`], asking a small lot at a time and the next once `upstream` has
+/// received them all: a fake upstream's receive buffer holds a hundred-odd queries, and with a
+/// thousand tasks sending one after another before it gets to read, the system drops the rest,
+/// which the upstream never sees
+async fn flood_reaching(
+    engine: &Arc<Engine>,
+    from: SocketAddr,
+    tag: &'static str,
+    count: usize,
+    upstream: &Upstream,
+) -> Vec<tokio::task::JoinHandle<(Duration, Option<ResponseCode>)>> {
+    const LOT: usize = 50;
+    let before = upstream.queries();
+    let mut asked = Vec::with_capacity(count);
+    while asked.len() < count {
+        for n in asked.len()..count.min(asked.len() + LOT) {
+            let engine = Arc::clone(engine);
+            asked.push(tokio::spawn(async move {
+                ask_as_a_listener(&engine, format!("{tag}{n}.dead.test."), from).await
+            }));
+        }
+        sent_to(upstream, before + asked.len()).await;
+    }
+    asked
 }
 
 /// 卡住的查询：知道回答一般很快以后，一台设备对着不回答的上游一下子问了 1100 个，先卡住的一千个留着等，后面的一百个不等
@@ -408,39 +437,86 @@ async fn an_answer_won_by_resending_is_noted_by_its_own_exchange() {
         assert_eq!(answered, Some(ResponseCode::NoError));
         assert!(took >= Duration::from_millis(300), "took {took:?}");
     }
-    assert_eq!(
-        engine
-            .permit_manager
-            .stuck_after(&answers_second_try.address, Duration::from_millis(900)),
-        Duration::from_millis(100)
-    );
+    // 记的要是查询一共等的 300 多毫秒，这里至少是 600 毫秒 / Had the 300-odd ms each query waited
+    // been noted, this would be 600 ms at least
+    let stuck_after = engine
+        .permit_manager
+        .stuck_after(&answers_second_try.address, Duration::from_millis(900));
+    assert!(stuck_after < Duration::from_millis(600), "{stuck_after:?}");
 }
 
-/// 上游只是慢时，留着等的那些等到回答以后，同样慢的查询不再算卡住：知道回答一般很快以后，一台设备一下子问一个 300 毫秒才
-/// 回答的上游 1100 个，先卡住的一千个留着、等到了回答，后面的一百个不等了；这以后再问 1100 个，都等到回答
+/// 等到 `asked` 里有 `count` 个有了结果 / Waits until `count` of `asked` have their outcome
+async fn done_of<T>(asked: &[tokio::task::JoinHandle<T>], count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let done = || asked.iter().filter(|one| one.is_finished()).count();
+    while done() < count {
+        assert!(Instant::now() < deadline, "{} of {count} done", done());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// 上游只是慢时，留着等的那些等到回答以后，同样慢的查询不再算卡住。知道回答一般很快以后，一台设备问一个慢上游 1100 个：
+/// 先卡住的一千个留着、后面的一百个不等了；留着的等到了回答，内核就知道这个上游要这么久，这以后再问 1100 个，等过了原先算卡住的
+/// 时间也都接着等，都等到回答。上游什么时候回答由测试放行，查询也等上游收到了再接着问。以前 1100 个一下子问出去、上游固定
+/// 300 毫秒回答：假上游的接收缓冲放不下，多出来的查询系统直接丢了，要等内核重发才有回答；又要 1100 个在 300 毫秒里全都卡住
+/// 才数得对。机器一忙两样都不成立，这个测试时过时不过
 /// With an upstream that is only slow, once those kept waiting get their answers, queries as
-/// slow no longer count as stuck: answers known to be quick, a device asks an upstream that
-/// takes 300 ms 1100 at once, the thousand stuck first are kept and answered and the hundred
-/// after wait no more; 1100 more after that are all answered
+/// slow no longer count as stuck. Answers known to be quick, a device asks a slow upstream
+/// 1100: the thousand stuck first are kept and the hundred after wait no more; with those kept
+/// answered the kernel knows this upstream takes that long, and 1100 more after that go on
+/// waiting past what counted as stuck before and are all answered. When the upstream answers is
+/// for the test to say, and each lot of queries is asked once the upstream has received the
+/// last. All 1100 used to be asked at once of an upstream answering after a fixed 300 ms: they
+/// did not fit the fake upstream's receive buffer, the system dropping the rest, which were
+/// answered only once the kernel sent them again; and the count came out right only with all
+/// 1100 stuck within those 300 ms. A busy machine manages neither, so the test passed at times
+/// and failed at others
 #[tokio::test]
 async fn a_slow_upstream_is_not_stuck_once_its_answers_arrive() {
-    let slow = support::answering_upstream_after(ANSWER, 300, Duration::from_millis(300)).await;
+    /// 上游超时，长到这个测试里不会重发 / The upstream's timeout, long enough for nothing to be
+    /// sent again within this test
+    const LIMIT: Duration = Duration::from_secs(30);
+    /// 留着等的那些卡住以后，上游还要这么久才回答 / How much longer the upstream takes once
+    /// those kept waiting are stuck
+    const SLOW: Duration = Duration::from_millis(400);
+    let (slow, answers) = support::answering_upstream_held(ANSWER, 300).await;
     let good = answering_upstream(ANSWER, 300).await;
-    let engine = engine(&slow, &good, true, 3000);
+    let engine = engine(&slow, &good, true, LIMIT.as_millis() as u64);
     know_answers_are_quick(&engine).await;
-    let answered = |asked: Vec<tokio::task::JoinHandle<(Duration, Option<ResponseCode>)>>| async {
-        let mut answered = 0;
+    let stuck_after = || engine.permit_manager.stuck_after(&slow.address, LIMIT);
+    let quick = stuck_after();
+    let outcomes = |asked: Vec<tokio::task::JoinHandle<(Duration, Option<ResponseCode>)>>| async {
+        let (mut answered, mut gave_up) = (0, 0);
         for one in asked {
-            if one.await.unwrap().1 == Some(ResponseCode::NoError) {
-                answered += 1;
+            match one.await.unwrap().1 {
+                Some(ResponseCode::NoError) => answered += 1,
+                Some(ResponseCode::ServFail) => gave_up += 1,
+                other => panic!("{other:?}"),
             }
         }
-        answered
+        (answered, gave_up)
     };
-    let first = answered(flood(&engine, client(1), "a", 1100)).await;
-    assert!((980..=1020).contains(&first), "{first} of the first 1100");
-    let second = answered(flood(&engine, client(1), "b", 1100)).await;
-    assert_eq!(second, 1100, "none stuck any more");
+
+    let first = flood_reaching(&engine, client(1), "a", 1100, &slow).await;
+    done_of(&first, 100).await;
+    assert_eq!(engine.permit_manager.stuck(), 1000, "the thousand kept");
+    tokio::time::sleep(SLOW).await;
+    answers.release();
+    assert_eq!(outcomes(first).await, (1000, 100));
+    assert!(
+        stuck_after() >= 2 * SLOW,
+        "this upstream takes that long: {:?}",
+        stuck_after()
+    );
+
+    answers.hold();
+    let second = flood_reaching(&engine, client(1), "b", 1100, &slow).await;
+    // 过了原先算卡住的时间 / Past what counted as stuck before
+    tokio::time::sleep(quick + Duration::from_millis(50)).await;
+    assert_eq!(engine.permit_manager.stuck(), 0, "none stuck any more");
+    assert!(second.iter().all(|one| !one.is_finished()));
+    answers.release();
+    assert_eq!(outcomes(second).await, (1100, 0));
 }
 
 /// 回答要多久是每个上游自己的：快的上游答了八百多个、慢的上游（250 毫秒）只答了十几个，合在一起看慢的排不进最慢的百分之一。
@@ -494,13 +570,20 @@ async fn a_slow_upstreams_failure_replies_are_judged_by_its_own_answers() {
     }
     let limit = Duration::from_millis(2000);
     let manager = &engine.permit_manager;
-    assert_eq!(
+    let (of_good, of_slow) = (
         manager.stuck_after(&good.address, limit),
-        Duration::from_millis(100)
+        manager.stuck_after(&slow.address, limit),
     );
     assert!(
-        manager.stuck_after(&slow.address, limit) >= Duration::from_millis(500),
+        of_slow >= Duration::from_millis(500),
         "the slow upstream by its own answers"
+    );
+    // 比的是两个上游谁长谁短，不是量到的毫秒数：机器忙的时候快上游量出来也有几十毫秒
+    // What is compared is which of the two is longer, not the milliseconds measured: on a busy
+    // machine the quick upstream measures at tens of milliseconds too
+    assert!(
+        of_good < of_slow,
+        "the quick upstream by its own answers: {of_good:?} against {of_slow:?}"
     );
 
     for one in flood(&engine, client(1), "broken", 100) {
@@ -1003,50 +1086,100 @@ async fn a_held_back_device_waits_on_another_devices_forward_and_stays_held_back
     assert_eq!(slow.queries(), sent, "and not sent upstream");
 }
 
-/// 流控没让等时规则给的静态应答不进缓存：缓存是所有设备共用的。上游失败时规则回一个固定地址；一台设备被拦住以后问一个
-/// 新名字，拿到那个固定地址；另一台设备接着问同一个名字，照常去问上游、拿到上游的回答，不是缓存里的固定地址
-/// A static answer the rules give with flow control keeping the query from waiting does not
-/// go into the cache, which all devices share. With a rule answering a fixed address when the
-/// upstream fails: a device held back asks a new name and gets that fixed address; another
-/// device asking the same name next goes to the upstream as usual and gets its answer, not the
-/// fixed address out of the cache
+/// 流控没让等的请求此后得到的应答都不进缓存：缓存是所有设备共用的。规则在上游失败时回一个固定地址、改问备用上游、continue 到
+/// 后面问备用上游的规则、跳到问备用上游的规则组，四种写法都一样：一台设备被拦住以后问一个新名字，拿到备用的答案；另一台设备
+/// 接着问同一个名字，照常去问上游、拿到上游的回答，不是缓存里备用的答案。以前只有固定地址不进缓存，备用上游的回答照常写进去：
+/// 一台被拦着的设备问过哪个名字，哪个名字在缓存有效期里对所有设备都换成了备用上游的答案
+/// Nothing a request gets once flow control kept it from waiting goes into the cache, which
+/// all devices share. With a rule that on an upstream failure answers a fixed address, asks a
+/// fallback upstream, continues to a later rule asking the fallback, or jumps to a pipeline
+/// asking it, all four alike: a device held back asks a new name and gets the fallback's
+/// answer; another device asking the same name next goes to the upstream as usual and gets its
+/// answer, not the fallback's out of the cache. Only the fixed address used to stay out of the
+/// cache while a fallback upstream's answer went in as usual: every name a device held back
+/// asked became the fallback upstream's answer for all devices for as long as the entry lived
 #[tokio::test]
-async fn a_static_answer_given_to_a_held_back_device_is_not_cached_for_others() {
+async fn what_a_held_back_device_gets_is_not_cached_for_others() {
     let fixed = Ipv4Addr::new(192, 0, 2, 99);
-    let upstream = answering_upstream(ANSWER, 300).await;
-    upstream.silence(true);
-    let engine = Arc::new(engine_from(json!({
-        "settings": counting_settings(json!({
-            "flow_control_enabled": true,
-            "upstream_timeout_ms": 150,
-            "min_ttl": 60,
-        })),
-        "pipelines": [{ "id": "main", "rules": [
-            { "name": "all", "matchers": [{ "type": "any" }],
-              "actions": [{ "type": "forward", "upstream": upstream.address }],
-              "response_actions_on_miss": [{ "type": "static_ip_response", "ip": fixed.to_string() }] },
-        ]}]
-    })));
-    let held: Vec<_> = (0..64)
-        .map(|n| {
-            let engine = Arc::clone(&engine);
-            let packet = query(&format!("held{n}.test."));
-            tokio::spawn(async move { ask(&engine, &packet, client(1)).await })
-        })
-        .collect();
-    for one in held {
-        assert_eq!(first_a(&one.await.unwrap()), Some(fixed));
-    }
-    upstream.silence(false);
+    let fallback = answering_upstream(fixed, 300).await;
+    let asking_the_fallback = json!([{ "type": "forward", "upstream": fallback.address }]);
+    // 最后一项：上游真的没回答时，备用的答案进不进这条规则的缓存。跳到别的规则组得到的回答记在那个规则组名下，不在这里
+    // The last of each: whether, with the upstream truly not answering, the fallback's answer
+    // goes into this rule's cache. What a jump to another pipeline gets is kept under that
+    // pipeline, not here
+    let on_failure = [
+        (
+            "a fixed address",
+            json!([{ "type": "static_ip_response", "ip": fixed.to_string() }]),
+            true,
+        ),
+        ("a fallback upstream", asking_the_fallback.clone(), true),
+        ("a later rule", json!([{ "type": "continue" }]), true),
+        (
+            "another pipeline",
+            json!([{ "type": "jump_to_pipeline", "pipeline": "fallback" }]),
+            false,
+        ),
+    ];
+    for (which, actions, cached_here) in on_failure {
+        let upstream = answering_upstream(ANSWER, 300).await;
+        upstream.silence(true);
+        let engine = Arc::new(engine_from(json!({
+            "settings": counting_settings(json!({
+                "flow_control_enabled": true,
+                "upstream_timeout_ms": 150,
+                "min_ttl": 60,
+            })),
+            "pipelines": [
+                { "id": "main", "rules": [
+                    { "name": "all", "matchers": [{ "type": "any" }],
+                      "actions": [{ "type": "forward", "upstream": upstream.address }],
+                      "response_actions_on_miss": actions },
+                    { "name": "later", "matchers": [{ "type": "any" }], "actions": asking_the_fallback },
+                ]},
+                { "id": "fallback", "rules": [
+                    { "name": "all", "matchers": [{ "type": "any" }], "actions": asking_the_fallback },
+                ]},
+            ]
+        })));
+        let held: Vec<_> = (0..64)
+            .map(|n| {
+                let engine = Arc::clone(&engine);
+                let packet = query(&format!("held{n}.test."));
+                tokio::spawn(async move { ask(&engine, &packet, client(1)).await })
+            })
+            .collect();
+        for one in held {
+            assert_eq!(first_a(&one.await.unwrap()), Some(fixed), "{which}");
+        }
+        upstream.silence(false);
 
-    let sent = upstream.queries();
-    let withheld = ask(&engine, &query("fresh.test."), client(1)).await;
-    assert_eq!(
-        first_a(&withheld),
-        Some(fixed),
-        "the rule's answer on a failure"
-    );
-    assert_eq!(upstream.queries(), sent, "held back: not sent upstream");
-    let other = ask(&engine, &query("fresh.test."), client(2)).await;
-    assert_eq!(first_a(&other), Some(ANSWER), "the upstream's own answer");
+        let sent = upstream.queries();
+        let withheld = ask(&engine, &query("fresh.test."), client(1)).await;
+        assert_eq!(
+            first_a(&withheld),
+            Some(fixed),
+            "{which}: what the rules give on a failure"
+        );
+        assert_eq!(
+            upstream.queries(),
+            sent,
+            "{which}: held back, not sent upstream"
+        );
+        let other = ask(&engine, &query("fresh.test."), client(2)).await;
+        assert_eq!(
+            first_a(&other),
+            Some(ANSWER),
+            "{which}: the upstream's own answer"
+        );
+        // 上游真的没回答时备用的答案照常进缓存：那 64 个名字别的设备问到的也是它，不再去问上游
+        // With the upstream truly not answering the fallback's answer is cached as usual:
+        // another device asking one of those 64 names gets it too, the upstream not asked again
+        if cached_here {
+            let sent = upstream.queries();
+            let cached = ask(&engine, &query("held7.test."), client(2)).await;
+            assert_eq!(first_a(&cached), Some(fixed), "{which}: cached");
+            assert_eq!(upstream.queries(), sent, "{which}: out of the cache");
+        }
+    }
 }
