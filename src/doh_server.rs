@@ -399,9 +399,16 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
         .unwrap_or_else(|| empty_dns_response(packet))
 }
 
-/// 构造空 DNS 响应（SERVFAIL） / Build empty SERVFAIL response
+/// 答不上一个报文时回什么。和 UDP、TCP 一样（见 `try_build_listener_failure_from_wire`）：读得了的查询回
+/// SERVFAIL，请求头是标准查询、报文却读不了的回 FORMERR。HTTP 请求总得有个回应，所以其余的回只有报文头的
+/// SERVFAIL，UDP、TCP 对它们不回
+/// What to answer a message that gets no answer. As over UDP and TCP (see
+/// `try_build_listener_failure_from_wire`): SERVFAIL for a query that can be read, FORMERR for
+/// one with a standard query's header that cannot. An HTTP request has to be answered, so the
+/// rest get a header-only SERVFAIL, where UDP and TCP send nothing
 fn empty_dns_response(request: &[u8]) -> Bytes {
-    engine_helpers::build_servfail_response_from_wire(request)
+    engine_helpers::try_build_listener_failure_from_wire(request)
+        .unwrap_or_else(|| engine_helpers::build_servfail_response_from_wire(request))
 }
 
 fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
@@ -901,6 +908,47 @@ mod tests {
         assert_eq!(resp[3] & 0x0F, 0x03, "RCODE should be NXDOMAIN (3)");
     }
 
+    /// 请求头是标准查询、报文却读不了时回 FORMERR，和 UDP、TCP 一样（RFC 6891 第 6.1.1 节）。以前 DoH 回的是
+    /// 只有报文头的 SERVFAIL，客户端分不清是自己发错了还是服务器出了故障，会去重试
+    /// A message with a standard query's header that cannot be read is answered FORMERR, as over
+    /// UDP and TCP (RFC 6891 section 6.1.1). DoH used to answer a header-only SERVFAIL, from
+    /// which a client cannot tell its own mistake from a server failure, and retries
+    #[tokio::test]
+    async fn an_unreadable_query_is_answered_formerr() {
+        let engine = make_static_engine("NOERROR");
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let readable = make_dns_query_a("test.example.com", 0x4242);
+        // 两条 OPT 记录（RFC 6891：FORMERR）；问题没写完；问题名里的标签超出报文
+        // Two OPT records (RFC 6891: FORMERR); a question cut short; a label in the question
+        // name running past the message
+        let opt = [0u8, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0];
+        let mut two_opts = readable.clone();
+        two_opts.extend_from_slice(&opt);
+        two_opts.extend_from_slice(&opt);
+        two_opts[11] = 2;
+        let cut_short = readable[..readable.len() - 3].to_vec();
+        let mut long_label = readable[..12].to_vec();
+        long_label.extend_from_slice(&[40, b'a', b'b']);
+        for (what, query) in [
+            ("two OPT records", two_opts),
+            ("a question cut short", cut_short),
+            ("a label past the message", long_label),
+        ] {
+            let resp = process_dns_wire(&query, peer, &engine).await;
+            assert!(resp.len() >= 12, "{what}");
+            assert_eq!(&resp[..2], &[0x42, 0x42], "{what}: the transaction ID");
+            assert_eq!(resp[2] & 0x80, 0x80, "{what}: a response");
+            assert_eq!(resp[3] & 0x0F, 1, "{what}: FORMERR");
+            assert!(
+                resp.len() <= query.len(),
+                "{what}: no longer than the query"
+            );
+        }
+        // 读得了的照常回答 / A readable one is answered as usual
+        let resp = process_dns_wire(&readable, peer, &engine).await;
+        assert_eq!(resp[3] & 0x0F, 0);
+    }
+
     #[tokio::test]
     async fn test_process_dns_wire_static_noerror() {
         let engine = make_static_engine("NOERROR");
@@ -1202,11 +1250,13 @@ mod tests {
         }
     }
 
-    /// 快速路径构造不出应答（名字超长，hickory 不接受）时，回一个只有报头的 SERVFAIL
+    /// 快速路径构造不出应答（名字超长，hickory 不接受）时，和 UDP、TCP 一样回只有报文头的 FORMERR：这个查询的
+    /// 名字超长，本来就读不了。以前 DoH 回的是 SERVFAIL
     /// When the fast path cannot build its answer (an overlong name hickory rejects), the
-    /// answer is a header-only SERVFAIL
+    /// answer is a header-only FORMERR as over UDP and TCP: the query's name is too long to be
+    /// read in the first place. DoH used to answer SERVFAIL
     #[tokio::test]
-    async fn a_fast_path_answer_that_cannot_be_built_is_answered_servfail() {
+    async fn a_fast_path_answer_that_cannot_be_built_is_answered_formerr() {
         let engine = make_static_engine("NXDOMAIN");
         // 点分形式 256 字节：快速路径自己的解析器接受，hickory 不接受（在线格式最多 255 字节）
         // 256 bytes dotted: the fast path's own parser accepts it, hickory does not (at most
@@ -1228,8 +1278,8 @@ mod tests {
         let answer = process_dns_wire(&query, peer, &engine).await;
         assert_eq!(
             &answer[..],
-            [0x12, 0x34, 0x81, 0x82, 0, 0, 0, 0, 0, 0, 0, 0],
-            "TXID, QR + RD, RA + SERVFAIL, no records"
+            [0x12, 0x34, 0x81, 0x81, 0, 0, 0, 0, 0, 0, 0, 0],
+            "TXID, QR + RD, RA + FORMERR, no records"
         );
     }
 }
