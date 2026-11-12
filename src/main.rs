@@ -874,6 +874,19 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
 
     set_udp_buffers(&socket);
 
+    // 监听在通配地址上时，回答要从查询发到的那个地址发出（见 `receive_in_batches`）。在绑定之前就开：绑定以后、
+    // 开之前排进来的报文，内核没给它们记下本机地址
+    // Listening on the wildcard address, a reply has to leave from the address the query was
+    // sent to (see `receive_in_batches`). Turned on before binding: for datagrams queued after
+    // the bind and before this, the kernel has noted no local address
+    #[cfg(target_os = "linux")]
+    if addr.ip().is_unspecified() {
+        use std::os::fd::AsRawFd;
+        if let Err(error) = udp_batch::receive_local_addresses(socket.as_raw_fd(), addr.is_ipv6()) {
+            tracing::warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
+        }
+    }
+
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())
@@ -905,19 +918,66 @@ fn set_udp_buffers(socket: &socket2::Socket) {
     }
 }
 
+/// 一个 UDP 回答发给谁，从哪个本机地址发出。监听在通配地址上时，`local` 是查询发到的那个地址（见
+/// `socket_utils::LocalAddr`）；监听在具体地址上、或别的系统上没有，由内核挑
+/// Whom a UDP reply goes to and which local address it leaves from. Listening on the wildcard
+/// address, `local` is the address the query was sent to (see `socket_utils::LocalAddr`);
+/// listening on one address, or on other systems, there is none and the kernel picks
+#[derive(Clone, Copy)]
+struct ReplyTo {
+    peer: SocketAddr,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // 只有 Linux 读得到、用得上 / Only Linux reads and uses it
+    local: Option<kixdns::socket_utils::LocalAddr>,
+}
+
+impl From<SocketAddr> for ReplyTo {
+    fn from(peer: SocketAddr) -> Self {
+        Self { peer, local: None }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<udp_batch::Peer> for ReplyTo {
+    fn from(peer: udp_batch::Peer) -> Self {
+        Self {
+            peer: peer.addr(),
+            local: peer.local(),
+        }
+    }
+}
+
+impl ReplyTo {
+    /// 不等待地发一次；发送缓冲满时是 `WouldBlock` / Sends once without waiting; `WouldBlock`
+    /// when the send buffer is full
+    fn try_send(self, socket: &UdpSocket, data: &[u8]) -> std::io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        if self.local.is_some() {
+            use std::os::fd::AsRawFd;
+            let to = udp_batch::Peer::of(self.peer).from_local(self.local);
+            return socket.try_io(tokio::io::Interest::WRITABLE, || {
+                udp_batch::send_one(socket.as_raw_fd(), data, &to)
+            });
+        }
+        socket.try_send_to(data, self.peer)
+    }
+}
+
 /// 发送 UDP 数据报：try_send_to 优先（避免 reactor 开销），WouldBlock 回退异步
 /// Send UDP datagram: try non-blocking first, async fallback on WouldBlock
 async fn send_udp_datagram(
     socket: &UdpSocket,
     data: &[u8],
-    peer: SocketAddr,
+    to: impl Into<ReplyTo>,
 ) -> std::io::Result<usize> {
-    match socket.try_send_to(data, peer) {
-        Ok(sent) => Ok(sent),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            socket.send_to(data, peer).await
+    let to = to.into();
+    loop {
+        match to.try_send(socket, data) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                socket.writable().await?;
+            }
+            sent => return sent,
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -929,13 +989,13 @@ fn udp_reply(request: &[u8], response: Bytes) -> Bytes {
 
 /// 非阻塞发送 UDP 响应（过载保护路径）：截断 + 纯 try_send_to，WouldBlock 背压丢弃
 /// Non-blocking UDP send for overload paths: truncate + try_send_to only; drop on WouldBlock
-fn try_send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], peer: SocketAddr) {
+fn try_send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], to: ReplyTo) {
     let truncated = truncate_udp_response(request, response);
     let response = truncated.as_deref().unwrap_or(response);
-    if let Err(error) = socket.try_send_to(response, peer)
+    if let Err(error) = to.try_send(socket, response)
         && error.kind() != std::io::ErrorKind::WouldBlock
     {
-        debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
+        debug!(peer = %to.peer, %error, response_len = response.len(), "failed to send UDP response");
     }
     // WouldBlock: 发送缓冲满，丢弃（背压）/ send buffer full, drop (backpressure)
 }
@@ -949,7 +1009,7 @@ fn try_send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], pe
 /// all; while the loop waits for datagrams the reply goes directly, without waking the loop for it.
 /// Only Linux's batched loop ever says it is busy; on other platforms every reply goes directly.
 struct PendingReplies {
-    queue: parking_lot::Mutex<Vec<(Bytes, SocketAddr)>>,
+    queue: parking_lot::Mutex<Vec<(Bytes, ReplyTo)>>,
     /// 接收循环在等新报文 / The receive loop is waiting for datagrams
     idle: std::sync::atomic::AtomicBool,
     /// 接收循环在等新报文时有回答放了进来 / A reply came in while the receive loop waited for datagrams
@@ -970,21 +1030,21 @@ impl PendingReplies {
     /// 接收循环忙着时收下这个回答；它在等新报文时不收，返回 false，由调用方直接发
     /// Takes the reply while the receive loop is busy; while it waits for datagrams the reply is
     /// not taken and false comes back, for the caller to send it directly
-    fn try_queue(&self, reply: &Bytes, peer: SocketAddr) -> bool {
+    fn try_queue(&self, reply: &Bytes, to: impl Into<ReplyTo>) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         if self.idle.load(SeqCst) {
             return false;
         }
-        self.queue_and_wake(reply, peer);
+        self.queue_and_wake(reply, to);
         true
     }
 
     /// 放进队列。放进来的时候循环正好转去等待、可能没看到它，就叫醒它（见 `begin_wait`）
     /// Queues the reply, and wakes the loop should it have turned to waiting just as the reply
     /// came in, possibly without seeing it (see `begin_wait`)
-    fn queue_and_wake(&self, reply: &Bytes, peer: SocketAddr) {
+    fn queue_and_wake(&self, reply: &Bytes, to: impl Into<ReplyTo>) {
         use std::sync::atomic::Ordering::SeqCst;
-        self.queue.lock().push((reply.clone(), peer));
+        self.queue.lock().push((reply.clone(), to.into()));
         if self.idle.load(SeqCst) {
             self.wake.notify_one();
         }
@@ -999,11 +1059,11 @@ impl PendingReplies {
         let room = queue
             .len()
             .min(kixdns::socket_utils::udp_batch::BATCH - replies.len());
-        for (reply, peer) in queue.drain(..room) {
+        for (reply, to) in queue.drain(..room) {
             let buf = replies.next_buf();
             buf.clear();
             buf.extend_from_slice(&reply);
-            replies.push(Peer::of(peer));
+            replies.push(Peer::of(to.peer).from_local(to.local));
         }
     }
 
@@ -1355,10 +1415,12 @@ impl<'a> UdpAnswering<'a> {
     /// Handles one received datagram. What the fast path answers on the spot (a cache hit, a static rule, the
     /// SERVFAIL for an error) is written to `reply`, already cut to the client's limit, and gives true; a query
     /// that waits on an upstream goes to its own task and anything that is not a query is dropped, both giving false.
-    fn answer(&mut self, packet: &[u8], peer: SocketAddr, reply: &mut BytesMut) -> bool {
+    fn answer(&mut self, packet: &[u8], to: impl Into<ReplyTo>, reply: &mut BytesMut) -> bool {
         if !is_standard_query_header(packet) {
             return false;
         }
+        let to = to.into();
+        let peer = to.peer;
         self.request_count += 1;
         if self.request_count >= 100 {
             self.request_count = 0;
@@ -1379,13 +1441,13 @@ impl<'a> UdpAnswering<'a> {
             Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                 // 缓存未命中，使用预解析的数据避免重复解析 / Cache miss, use pre-parsed data to avoid re-parsing
                 let packet = Bytes::copy_from_slice(packet);
-                self.refused |= !spawn_udp_answer(self, packet, peer, Some(pre_parsed));
+                self.refused |= !spawn_udp_answer(self, packet, to, Some(pre_parsed));
                 return false;
             }
             Ok(None) => {
                 // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
                 let packet = Bytes::copy_from_slice(packet);
-                self.refused |= !spawn_udp_answer(self, packet, peer, None);
+                self.refused |= !spawn_udp_answer(self, packet, to, None);
                 return false;
             }
             Err(error) => {
@@ -1428,6 +1490,21 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
 
     let fd = socket.as_raw_fd();
     let mut received = Received::default();
+    // 监听在通配地址上：回答要从查询发到的那个地址发出，所以让内核把它连同每个报文一起交上来。监听在具体地址上
+    // 时回答只会从那个地址发出，用不着
+    // Listening on the wildcard address: a reply has to leave from the address the query was
+    // sent to, so the kernel hands it over with each datagram. Listening on one address, replies
+    // can only leave from it, and none of this is needed
+    if let Ok(bound) = socket.local_addr()
+        && bound.ip().is_unspecified()
+    {
+        match udp_batch::receive_local_addresses(fd, bound.is_ipv6()) {
+            Ok(()) => received = received.with_local_addresses(),
+            Err(error) => {
+                warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks")
+            }
+        }
+    }
     let mut replies = Replies::default();
     let pending = Arc::new(PendingReplies::default());
     pending
@@ -1472,7 +1549,7 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
                 let Some((packet, peer)) = received.get(k) else {
                     continue;
                 };
-                if answering.answer(packet, peer.addr(), replies.next_buf()) {
+                if answering.answer(packet, peer, replies.next_buf()) {
                     replies.push(peer);
                 }
             }
@@ -1651,7 +1728,7 @@ impl TakingTurns {
                 manager.count_refused();
                 continue;
             }
-            if answering.answer(&packet, peer.addr(), replies.next_buf()) {
+            if answering.answer(&packet, peer, replies.next_buf()) {
                 replies.push(peer);
             }
         }
@@ -1946,9 +2023,11 @@ async fn receive_one_by_one_reading_drops(
 fn spawn_udp_answer(
     answering: &UdpAnswering<'_>,
     packet: bytes::Bytes,
-    peer: SocketAddr,
+    to: impl Into<ReplyTo>,
     pre_parsed: Option<PreParsedData>,
 ) -> bool {
+    let to = to.into();
+    let peer = to.peer;
     // 轮流时内核跟不上已经丢过了；轮到这里的只看内存（见 `Engine::turn_query_permit`）
     // Taking turns, falling behind has already dropped what it should; what gets here goes by
     // memory alone (see `Engine::turn_query_permit`)
@@ -1962,7 +2041,7 @@ fn spawn_udp_answer(
         if let Some(pre_parsed) = pre_parsed
             && let Ok(response) = pre_parsed.servfail(&packet)
         {
-            try_send_udp_response(answering.socket, &packet, &response, peer);
+            try_send_udp_response(answering.socket, &packet, &response, to);
         }
         return false;
     };
@@ -1991,8 +2070,8 @@ fn spawn_udp_answer(
             },
         };
         let response = udp_reply(&packet, response);
-        if !pending.try_queue(&response, peer)
-            && let Err(error) = send_udp_datagram(&socket, &response, peer).await
+        if !pending.try_queue(&response, to)
+            && let Err(error) = send_udp_datagram(&socket, &response, to).await
         {
             debug!(%peer, %error, response_len = response.len(), "failed to send UDP response");
         }
@@ -2967,6 +3046,97 @@ mod tests {
             tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
         })
         .await;
+    }
+
+    /// 监听在通配地址上时，回答从查询发到的那个地址发出。一台机器有几个地址时（同一个网卡上的第二个地址、VIP、
+    /// 回环上的服务地址），内核自己挑的源地址可能是另一个：客户端收到一个从别的地址来的回答，不认，查询超时。
+    /// 当场答出的和转发回来的都从查询发到的地址发出
+    /// Listening on the wildcard address, a reply leaves from the address the query came to. On
+    /// a machine with several addresses (a second one on an interface, a VIP, a service address
+    /// on loopback) the source the kernel picks by itself may be another: the client gets a
+    /// reply from an address it did not ask, refuses it, and the query times out. Replies given
+    /// on the spot and those back from a forward both leave from the address the query came to
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reply_leaves_from_the_address_the_query_came_to() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(20)).await;
+        let engines = [
+            ("answered on the spot", static_engine_with_flow_control()),
+            (
+                "back from a forward",
+                Arc::new(engine_forwarding_to(upstream, serde_json::json!({}))),
+            ),
+        ];
+        for (how, engine) in engines {
+            let server = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+            let port = server.local_addr().unwrap().port();
+            let worker = tokio::spawn(async move { receive_in_batches(&server, &engine).await });
+            // 回环上 127.0.0.0/8 都是本机地址。connect 过的客户端只收从它问的那个地址来的回答
+            // On loopback all of 127.0.0.0/8 is local. A connected client takes replies from
+            // the address it asked alone
+            for (id, to) in ["127.0.0.2", "127.0.0.1", "127.9.9.9"]
+                .into_iter()
+                .enumerate()
+            {
+                let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                client.connect((to, port)).await.unwrap();
+                client
+                    .send(&query(&format!("n{id}.name.test"), id as u16))
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 512];
+                tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("{how}: no reply from {to}"))
+                    .unwrap();
+                assert_eq!(buf[..2], (id as u16).to_be_bytes(), "{how}");
+            }
+            worker.abort();
+        }
+    }
+
+    /// 转发回来、排着等下一批一起发的回答，和流控拒绝时当场发的 SERVFAIL，也从查询发到的地址发出
+    /// A reply back from a forward that waits for the next batch, and the SERVFAIL sent at once
+    /// when flow control refuses, leave from the address the query came to as well
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn queued_and_refused_replies_leave_from_the_address_the_query_came_to() {
+        use kixdns::socket_utils::LocalAddr;
+        use std::os::fd::AsRawFd;
+
+        let server = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        let asked = std::net::Ipv4Addr::new(127, 0, 0, 2);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect((asked, port)).await.unwrap();
+        let to = ReplyTo {
+            peer: client.local_addr().unwrap(),
+            local: Some(LocalAddr::V4(asked)),
+        };
+        let mut buf = [0u8; 64];
+        let mut expect = async |sent: &[u8]| {
+            let len = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("no reply from {asked} for {sent:?}"))
+                .unwrap();
+            assert_eq!(&buf[..len], sent);
+        };
+
+        // 排着的回答挪进一批里发 / A queued reply moved into a batch and sent
+        let pending = PendingReplies::default();
+        pending.queue_and_wake(&Bytes::from_static(b"queued"), to);
+        let mut replies = udp_batch::Replies::default();
+        pending.fill(&mut replies);
+        assert_eq!(replies.send(server.as_raw_fd(), 0).unwrap(), 1);
+        expect(b"queued").await;
+
+        // 流控拒绝时当场发的 / What is sent at once when flow control refuses
+        try_send_udp_response(&server, &query("a.test", 1), b"refused", to);
+        expect(b"refused").await;
+
+        // 接收循环在等新报文时直接发的 / What goes directly while the receive loop waits
+        send_udp_datagram(&server, b"direct", to).await.unwrap();
+        expect(b"direct").await;
     }
 
     async fn not_refused_while_waiting_on_an_upstream(
@@ -5440,7 +5610,7 @@ mod tests {
         let pending = PendingReplies::default();
         assert!(!pending.try_queue(
             &Bytes::from_static(b"reply"),
-            "127.0.0.1:9".parse().unwrap()
+            "127.0.0.1:9".parse::<SocketAddr>().unwrap()
         ));
         assert!(pending.queue.lock().is_empty());
     }
@@ -5456,7 +5626,7 @@ mod tests {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(pending.try_queue(
             &Bytes::from_static(b"reply"),
-            "127.0.0.1:9".parse().unwrap()
+            "127.0.0.1:9".parse::<SocketAddr>().unwrap()
         ));
         assert!(
             !pending.begin_wait(),
@@ -5479,7 +5649,7 @@ mod tests {
         );
         pending.queue_and_wake(
             &Bytes::from_static(b"reply"),
-            "127.0.0.1:9".parse().unwrap(),
+            "127.0.0.1:9".parse::<SocketAddr>().unwrap(),
         );
         tokio::time::timeout(Duration::from_millis(500), pending.wake.notified())
             .await
