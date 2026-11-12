@@ -1220,10 +1220,18 @@ struct UdpTcpFallback {
     on_failure: bool,
 }
 
-/// UDP forwarder with hedged retry and TCP fallback for better tail latency. Returns the
-/// answer with the transport that carried it: UDP, or TCP after a TC-bit retry or a
-/// UDP-failure fallback.
-/// 带对冲重试和 TCP 回退的 UDP 转发。返回应答和实际带回它的传输：UDP，或 TC/失败回退后的 TCP。
+/// UDP forwarder with a resend and TCP fallback for better tail latency. Returns the answer
+/// with the transport that carried it: UDP, or TCP after a TC-bit retry or a UDP-failure
+/// fallback. With no reply after a third of the timeout (see [`hedge_timeout`]) the query is
+/// sent again, and from then on whichever of the two is answered first is used, for the whole
+/// of the timeout: the first query stays registered, so its reply is taken should it arrive
+/// only after the resend. It used to be given up as the resend went out: an upstream slower
+/// than a third of the timeout had every query wait a resend's interval more for the reply to
+/// the resend, and answered once more for nothing.
+/// 带重发和 TCP 回退的 UDP 转发。返回应答和实际带回它的传输：UDP，或 TC/失败回退后的 TCP。过了时限的三分之一
+/// （见 [`hedge_timeout`]）还没有回答就把查询再发一次，此后一整个时限里，两次谁的回答先到用谁的：第一次的查询一直
+/// 登记着，它的回答在重发以后才到也照样收下。以前重发的那一刻就不等它了：回答比时限的三分之一慢的上游，每个查询都要
+/// 多等一个重发的间隔才拿到重发那一次的回答，上游还白白多答一次。
 async fn forward_udp_smart(
     engine: &Engine,
     packet: &[u8],
@@ -1236,59 +1244,129 @@ async fn forward_udp_smart(
     let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
     let retry_truncated = tcp.retry_truncated && enable_tcp_fallback;
     let fallback_on_failure = tcp.on_failure && enable_tcp_fallback;
+    let failed = |attempt: u8, waited: Duration, error: &anyhow::Error| {
+        debug!(
+            event = "udp_forward_retry",
+            upstream = %upstream,
+            attempt,
+            timeout_ms = waited.as_millis() as u64,
+            error = %error,
+            "udp forward attempt failed",
+        );
+    };
+    // UDP 带回来的应答：截断的改用 TCP 重取，别的原样交回 / A reply UDP brought back: a truncated one
+    // is fetched again over TCP, any other goes back as it is
+    let answered = async |bytes: Bytes| {
+        // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
+        if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
+            debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
+            return over_tcp(engine, packet, upstream, timeout_dur).await;
+        }
+        Ok((bytes, Transport::Udp))
+    };
 
-    // Split timeout: first attempt uses 1/N budget (leaving room for TCP fallback)
-    // 分割超时：第一次尝试使用 1/N 时间（为 TCP fallback 留出空间）
-    let attempts = [hedge_timeout(timeout_dur), timeout_dur];
-
-    for (idx, dur) in attempts.iter().enumerate() {
-        let sent = sent_if_timed(engine);
-        let attempt = engine.udp_client.send(packet, upstream, *dur).await;
-        note_round_trip(engine, upstream, timeout_dur, sent, &attempt);
-        match attempt {
-            Ok(bytes) => {
-                // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
-                if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
-                    debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
-                    // TCP 的收发单独在堆上分配：只有截断或 UDP 失败时才走 TCP，等 UDP 应答的查询不必为它
-                    // 预留地方
-                    // The TCP exchange is allocated on its own: TCP is only taken for a truncated
-                    // answer or a UDP failure, so a query waiting on UDP reserves no room for it
-                    let sent = sent_if_timed(engine);
-                    let over_tcp =
-                        Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur)).await;
-                    note_round_trip(engine, upstream, timeout_dur, sent, &over_tcp);
-                    return over_tcp.map(|bytes| (bytes, Transport::Tcp));
-                }
-                return Ok((bytes, Transport::Udp));
-            }
-            Err(err) => {
-                debug!(
-                    event = "udp_forward_retry",
-                    upstream = %upstream,
-                    attempt = idx + 1,
-                    timeout_ms = dur.as_millis() as u64,
-                    error = %err,
-                    "udp forward attempt failed",
-                );
-                if idx + 1 == attempts.len() && fallback_on_failure {
-                    // Last UDP attempt, try TCP fallback before failing.
-                    debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
-                    // 单独在堆上分配，见上 / Allocated on its own, see above
-                    let sent = sent_if_timed(engine);
-                    let over_tcp =
-                        Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur)).await;
-                    note_round_trip(engine, upstream, timeout_dur, sent, &over_tcp);
-                    return over_tcp.map(|bytes| (bytes, Transport::Tcp));
+    // 第一次：只等到时限的三分之一，后面留给重发和 TCP / The first query: waited for only a third
+    // of the timeout, the rest being left for the resend and TCP
+    let first_wait = hedge_timeout(timeout_dur);
+    let first_sent = sent_if_timed(engine);
+    let mut first = match engine.udp_client.begin(packet, upstream).await {
+        Ok(sent) => Some(sent),
+        Err(error) => {
+            failed(1, first_wait, &error);
+            None
+        }
+    };
+    if let Some(sent) = first.as_mut() {
+        match tokio::time::timeout(first_wait, sent.reply()).await {
+            Ok(reply) => {
+                note_round_trip(engine, upstream, timeout_dur, first_sent, &reply);
+                match reply {
+                    Ok(bytes) => return answered(bytes).await,
+                    Err(error) => {
+                        failed(1, first_wait, &error);
+                        first = None;
+                    }
                 }
             }
+            // 还没有回答：接着等它，同时重发 / No reply yet: it is waited for still, and the query
+            // is sent again
+            Err(_) => failed(1, first_wait, &anyhow::anyhow!("upstream timeout")),
         }
     }
 
+    // 重发，然后两次谁的回答先到用谁的。重发的这一段单独在堆上分配：回答按时来的查询走不到这里，不必为它预留地方
+    // The resend, and then whichever of the two is answered first. This stretch is allocated
+    // on its own: a query answered in time never gets here, and reserves no room for it
+    let resent = Box::pin(async {
+        let second_sent = sent_if_timed(engine);
+        let mut second = match engine.udp_client.begin(packet, upstream).await {
+            Ok(sent) => Some(sent),
+            Err(error) => {
+                failed(2, timeout_dur, &error);
+                None
+            }
+        };
+        let deadline = tokio::time::sleep(timeout_dur);
+        tokio::pin!(deadline);
+        while first.is_some() || second.is_some() {
+            let (reply, sent) = tokio::select! {
+                reply = async { first.as_mut().expect("still waited for").reply().await },
+                    if first.is_some() =>
+                {
+                    first = None;
+                    (reply, first_sent)
+                }
+                reply = async { second.as_mut().expect("still waited for").reply().await },
+                    if second.is_some() =>
+                {
+                    second = None;
+                    (reply, second_sent)
+                }
+                _ = &mut deadline => {
+                    failed(2, timeout_dur, &anyhow::anyhow!("upstream timeout"));
+                    return None;
+                }
+            };
+            // 上游回答要多久，记的是等到回答的那一次从发出到收到 / How long the upstream takes is
+            // noted from the sending of the query that was answered to its reply
+            note_round_trip(engine, upstream, timeout_dur, sent, &reply);
+            match reply {
+                Ok(bytes) => return Some(bytes),
+                Err(error) => failed(2, timeout_dur, &error),
+            }
+        }
+        None
+    });
+    if let Some(bytes) = resent.await {
+        return answered(bytes).await;
+    }
+
+    if fallback_on_failure {
+        // Both UDP queries failed, try TCP fallback before failing.
+        debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
+        return over_tcp(engine, packet, upstream, timeout_dur).await;
+    }
     // Every UDP attempt failed and none fell back to TCP: the fallback is off, or the
     // caller tries TCP itself (a dual send, a batch with TCP upstreams)
     // UDP 全部失败，也没有改用 TCP：要么回退关着，要么调用方自己会走 TCP（双发、带 TCP 上游的批次）
     anyhow::bail!("all udp attempts failed")
+}
+
+/// UDP 转发改用 TCP 问一次（应答截断了，或者 UDP 没等到回答）。TCP 的收发单独在堆上分配：只有这两种情况才走 TCP，
+/// 等 UDP 应答的查询不必为它预留地方
+/// One exchange over TCP for a UDP forward (a truncated reply, or no reply over UDP). The TCP
+/// exchange is allocated on its own: TCP is only taken in those two cases, so a query waiting
+/// on UDP reserves no room for it
+async fn over_tcp(
+    engine: &Engine,
+    packet: &[u8],
+    upstream: &str,
+    timeout_dur: Duration,
+) -> anyhow::Result<(Bytes, Transport)> {
+    let sent = sent_if_timed(engine);
+    let reply = Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur)).await;
+    note_round_trip(engine, upstream, timeout_dur, sent, &reply);
+    reply.map(|bytes| (bytes, Transport::Tcp))
 }
 
 #[cfg(test)]
@@ -1879,6 +1957,63 @@ mod tests {
                 }
             );
             assert_eq!(reply[2] & 0x02, 0, "case {index}: a full answer");
+        }
+    }
+
+    /// UDP 发了两次都没等到回答，改用 TCP 问到了，带回应答的是 TCP；关着 TCP 重试、或者调用方自己会走 TCP 时不另试，
+    /// 算上游失败。开着流控时，TCP 这一次收发的用时也记进「上游回答要多久」
+    /// With neither UDP query answered the upstream is asked over TCP, which carries the answer
+    /// back; with the TCP retry off, or a caller that takes TCP itself, there is no such try and
+    /// the upstream has failed. With flow control on, the exchange over TCP is noted in how long
+    /// the upstream takes as well
+    #[tokio::test]
+    async fn a_udp_upstream_that_does_not_answer_is_asked_over_tcp() {
+        let _ = ring::default_provider().install_default();
+        // （开没开 TCP 重试，调用方让不让 UDP 失败时试 TCP）/ (whether the TCP retry is on,
+        // whether the caller lets a UDP failure try TCP)
+        for (enabled, on_failure) in [(true, true), (true, false), (false, true)] {
+            let settings = GlobalSettings {
+                default_upstream: "127.0.0.1:0".to_string(),
+                enable_tcp_fallback: enabled,
+                flow_control_enabled: true,
+                udp_pool_size: 1,
+                tcp_pool_size: 1,
+                ..GlobalSettings::default()
+            };
+            let engine = Engine::new(
+                RuntimePipelineConfig {
+                    settings,
+                    pipeline_select: Vec::new(),
+                    pipelines: Vec::new(),
+                    pipeline_id_index: FxHashMap::default(),
+                },
+                "test".to_string(),
+            )
+            .expect("initialize test engine");
+            let addr = dual_upstream(DualLeg::Absent, DualLeg::Answer(Duration::ZERO)).await;
+            let packet = build_dns_query_packet("example.com");
+            let (result, via) = send_to_upstream(
+                &engine,
+                &packet,
+                &addr,
+                Duration::from_millis(450),
+                Transport::Udp,
+                UdpTcpFallback {
+                    retry_truncated: true,
+                    on_failure,
+                },
+            )
+            .await;
+            let over_tcp = enabled && on_failure;
+            assert_eq!(result.is_ok(), over_tcp, "{enabled} {on_failure}");
+            if over_tcp {
+                assert_eq!(via, Transport::Tcp);
+            }
+            assert_eq!(
+                engine.permit_manager.has_seen_an_answer(),
+                over_tcp,
+                "{enabled} {on_failure}: the exchange over TCP is timed"
+            );
         }
     }
 

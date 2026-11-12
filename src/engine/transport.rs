@@ -51,21 +51,21 @@ fn unix_time_millis() -> u64 {
 /// 剩余不足这个值时现实路径上跑不完，只会在调用方截止后再失败一次。绝不延长调用方的截止。
 const MIN_RETRY_BUDGET: Duration = Duration::from_millis(50);
 
+/// 一个在途的 UDP 查询：客户端的 ID、发给谁、发出去的查询、回答交给谁 / One UDP query in flight: the
+/// client's ID, whom it was sent to, the query as sent, and whom the reply goes to
+type UdpInflight = (
+    u16,
+    SocketAddr,
+    Arc<[u8]>,
+    oneshot::Sender<anyhow::Result<Bytes>>,
+);
+
 /// Type alias for UDP inflight request tracking
 /// ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
 /// The sent query (ID already rewritten) stays in the entry so the reader can
 /// match the answer's question section against it (RFC 5452 §9.1).
 /// 条目保留已改写 ID 的查询报文，供 reader 比对应答的 question 段（RFC 5452 §9.1）。
-type UdpInflightMap = DashMap<
-    u16,
-    (
-        u16,
-        SocketAddr,
-        Arc<[u8]>,
-        oneshot::Sender<anyhow::Result<Bytes>>,
-    ),
-    FxBuildHasher,
->;
+type UdpInflightMap = DashMap<u16, UdpInflight, FxBuildHasher>;
 
 /// 等着一个在途条目的回答的那一头：回答从 `rx` 来。放手时（拿到了回答、超时、取消、提前返回、panic）把 `map` 里
 /// `id` 下已经没人等的条目删掉：先关掉自己这一头再删，所以自己的条目一定删得掉。回答到了、读取任务把条目拿走以后，
@@ -323,13 +323,27 @@ impl UdpClient {
         state
     }
 
-    #[inline]
+    /// 发出查询并在 `timeout_dur` 内等它的回答（测试用）/ Sends the query and waits for its reply
+    /// within `timeout_dur` (for tests)
+    #[cfg(test)]
     pub async fn send(
         &self,
         packet: &[u8],
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
+        let mut sent = self.begin(packet, upstream).await?;
+        match timeout(timeout_dur, sent.reply()).await {
+            Ok(reply) => reply,
+            Err(_) => Err(anyhow::anyhow!("upstream timeout")),
+        }
+    }
+
+    /// 把查询发给 `upstream`，返回等它回答的那一头（见 [`UdpSent`]）：等多久、同时还等着什么，由调用方定
+    /// Sends the query to `upstream` and gives the end that waits for its reply (see
+    /// [`UdpSent`]): how long to wait, and what else is waited for meanwhile, is the caller's
+    #[inline]
+    pub async fn begin(&self, packet: &[u8], upstream: &str) -> anyhow::Result<UdpSent> {
         let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
         // 按目标地址族选池：IPv4 路径只多一次判别
         // Pick the pool by address family; the IPv4 path only gains one check.
@@ -405,7 +419,7 @@ impl UdpClient {
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // (e.g. timeout, cancel, early return)
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
-        let mut waiting = Waiting {
+        let waiting = Waiting {
             rx,
             map: state.inflight.clone(),
             id: new_id,
@@ -416,14 +430,28 @@ impl UdpClient {
             // Guard will remove inflight entry automatically
             return Err(e.into());
         }
+        Ok(UdpSent(waiting))
+    }
+}
 
-        match timeout(timeout_dur, &mut waiting.rx).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(_)) => {
-                // Channel closed by receiver (should not happen normally unless logic error or panic)
-                Err(anyhow::anyhow!("channel closed"))
-            }
-            Err(_) => Err(anyhow::anyhow!("upstream timeout")),
+/// 发出去、在等回答的一个 UDP 查询（见 [`UdpClient::begin`]）。只要它还在，回答什么时候到都收得到；放手时不再等，
+/// 它登记的条目跟着删掉（见 [`Waiting`]）
+/// One UDP query sent and waiting for its reply (see [`UdpClient::begin`]). For as long as it
+/// is kept the reply is taken whenever it arrives; let go of, it waits no more and the entry it
+/// registered goes with it (see [`Waiting`])
+pub struct UdpSent(Waiting<UdpInflight>);
+
+impl UdpSent {
+    /// 等它的回答。没等到就被放下的这次等待不影响下一次：回答到了，下一次照样拿得到。拿到过结果以后不要再等
+    /// Waits for its reply. A wait dropped before the reply came leaves the next one unaffected:
+    /// the reply is still there for it once it arrives. Not to be waited on again once it has
+    /// given its outcome
+    pub async fn reply(&mut self) -> anyhow::Result<Bytes> {
+        match (&mut self.0.rx).await {
+            Ok(reply) => reply,
+            // 发送的那一头没给结果就没了（正常不会，除非逻辑出错或者 panic）/ The sending end went
+            // without an outcome (not normally, short of a logic error or a panic)
+            Err(_) => Err(anyhow::anyhow!("channel closed")),
         }
     }
 }
