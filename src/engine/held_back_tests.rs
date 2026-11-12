@@ -72,6 +72,25 @@ async fn know_answers_are_quick(engine: &Arc<Engine>) {
     }
 }
 
+/// 等到 `upstream` 收到的查询达到 `count` 个：领头的查询已经发给上游，它登记的条目也就在了，这时再让别的查询来等
+/// 它。等的是这件事本身，不是猜一段够长的时间（忙的机器上 20 毫秒不够 70 个查询都发出去）；一直等不到才在 5 秒后失败
+/// Waits until `upstream` has received `count` queries: the leading queries have gone to the
+/// upstream, so the entries they registered are there, and only then do other queries come to
+/// wait on them. What is waited for is that itself, not a guessed stretch of time (on a busy
+/// machine 20 ms is not enough for 70 queries to go out); only if it never comes does this
+/// fail, after 5 seconds
+async fn sent_to(upstream: &Upstream, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while upstream.queries() < count {
+        assert!(
+            Instant::now() < deadline,
+            "the upstream got {} of {count} queries",
+            upstream.queries()
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 /// `from` 一起问 `dead.test` 下的 `count` 个不同名字，都答完才返回 / `from` asks `count` different
 /// names under `dead.test` at once, returning once all are answered
 async fn ask_dead_names(engine: &Arc<Engine>, from: SocketAddr, tag: &str, count: usize) {
@@ -511,13 +530,14 @@ async fn another_device_waiting_on_the_same_forward_asks_for_itself() {
     let slot = engine.permit_manager.slot_of(client(1).ip());
     let kept = engine.permit_manager.keep_all_stuck_for_tests(slot);
 
+    let had = slow.queries();
     let leader = {
         let engine = Arc::clone(&engine);
         tokio::spawn(async move {
             ask_as_a_listener(&engine, "same.dead.test.".to_string(), client(1)).await
         })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    sent_to(&slow, had + 1).await;
     let (waited, answered) =
         ask_as_a_listener(&engine, "same.dead.test.".to_string(), client(2)).await;
     assert_eq!(
@@ -548,13 +568,14 @@ async fn a_wait_on_another_devices_forward_gives_up_as_its_own_would() {
     let slot = engine.permit_manager.slot_of(client(1).ip());
     let kept = engine.permit_manager.keep_all_stuck_for_tests(slot);
 
+    let had = dead.queries();
     let leader = {
         let engine = Arc::clone(&engine);
         tokio::spawn(async move {
             ask_as_a_listener(&engine, "same.dead.test.".to_string(), client(2)).await
         })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    sent_to(&dead, had + 1).await;
     let sent = dead.queries();
     let (took, answered) =
         ask_as_a_listener(&engine, "same.dead.test.".to_string(), client(1)).await;
@@ -665,13 +686,14 @@ async fn the_other_device_is_answered_when_a_held_back_one_led(
     }
     second.silence(false);
 
+    let had = first.queries();
     let leader = {
         let engine = Arc::clone(&engine);
         tokio::spawn(async move {
             ask_as_a_listener(&engine, "same.test.".to_string(), client(1)).await
         })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    sent_to(&first, had + 1).await;
     let (_, answered) = ask_as_a_listener(&engine, "same.test.".to_string(), client(2)).await;
     assert_eq!(
         answered,
@@ -918,13 +940,17 @@ async fn failure_replies_from_every_upstream_of_a_rule_do_not_hold_a_device_back
 async fn waits_on_another_devices_forwards_are_not_noted_against_the_upstream() {
     let dead = support::upstream(|_| Vec::new()).await;
     let good = answering_upstream(ANSWER, 300).await;
-    let engine = engine(&dead, &good, true, 150);
+    // 上游时限 600 毫秒：领头的 70 个查询在途这么久，另一台设备的查询有足够的时间等上去
+    // An upstream timeout of 600 ms: the 70 leading queries stay in flight that long, time
+    // enough for the other device's queries to come and wait on them
+    let engine = engine(&dead, &good, true, 600);
     know_answers_are_quick(&engine).await;
+    let had = dead.queries();
     let leaders = {
         let engine = Arc::clone(&engine);
         tokio::spawn(async move { ask_dead_names(&engine, client(2), "same", 70).await })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    sent_to(&dead, had + 70).await;
     let before = dead.queries();
     ask_dead_names(&engine, client(1), "same", 70).await;
     leaders.await.unwrap();
@@ -944,19 +970,25 @@ async fn waits_on_another_devices_forwards_are_not_noted_against_the_upstream() 
 /// of that upstream is still held back
 #[tokio::test]
 async fn a_held_back_device_waits_on_another_devices_forward_and_stays_held_back() {
-    let slow = support::answering_upstream_after(ANSWER, 300, Duration::from_millis(100)).await;
+    // 上游 300 毫秒后才答：领头的查询在途这么久，被拦着的设备有足够的时间等上去；上游时限 1200 毫秒，领头的
+    // 400 毫秒才重发，在那之前已经答了
+    // The upstream answers after 300 ms: the leading query stays in flight that long, time
+    // enough for the held-back device to come and wait on it; with an upstream timeout of
+    // 1200 ms the leader resends only at 400 ms, by when it has been answered
+    let slow = support::answering_upstream_after(ANSWER, 300, Duration::from_millis(300)).await;
     slow.silence(true);
     let good = answering_upstream(ANSWER, 300).await;
-    let engine = engine(&slow, &good, true, 450);
+    let engine = engine(&slow, &good, true, 1200);
     know_answers_are_quick(&engine).await;
     ask_dead_names(&engine, client(1), "a", 64).await;
     slow.silence(false);
 
+    let had = slow.queries();
     let leader = {
         let engine = Arc::clone(&engine);
         tokio::spawn(async move { ask(&engine, &query("same.dead.test."), client(2)).await })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    sent_to(&slow, had + 1).await;
     let sent = slow.queries();
     let joined = ask(&engine, &query("same.dead.test."), client(1)).await;
     assert_eq!(
