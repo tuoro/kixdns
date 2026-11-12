@@ -95,6 +95,10 @@ const DEAD_SLACK: u64 = 64;
 
 pub struct CacheStore<V> {
     shards: Box<[RwLock<Shard<V>>]>,
+    /// 最小的分片能放多重：比它重的值哪一片都可能放不下（见 [`Self::heaviest_value`]）/ What the
+    /// smallest shard holds: a value heavier than this may fit no shard (see
+    /// [`Self::heaviest_value`])
+    heaviest_value: u64,
     hasher: RandomState,
     /// 条目能存多少秒，重载可以改 / How many seconds entries may stay, which a reload can change
     max_age_secs: AtomicU64,
@@ -118,7 +122,18 @@ impl<V: Cached> CacheStore<V> {
                 .collect(),
             hasher: RandomState::new(),
             max_age_secs: AtomicU64::new(max_age.as_secs()),
+            heaviest_value: capacity / shards,
         }
+    }
+
+    /// 一个值最重能有多重：再重的，它落在的那一片整片都放不下，存不进去（原来那个键的值也跟着去掉）。值是由几份东西
+    /// 攒成的时候，调用方按这个数自己先去掉一些，别让整个值被扔掉
+    /// The most one value may weigh: a heavier one does not fit the whole shard it lands in
+    /// and is not stored (what the key held before goes with it). A caller whose value is made
+    /// up of several parts drops some of them to stay within this, so the whole value is not
+    /// thrown away
+    pub fn heaviest_value(&self) -> u64 {
+        self.heaviest_value
     }
 
     /// 条目能存多久，到了就不能再用（见 [`Cached::outlived`]）
@@ -644,6 +659,25 @@ mod tests {
             store.weighted_size() > 900,
             "a full cache stays nearly full"
         );
+    }
+
+    /// 一个值最重能有多重，是最小的那个分片的容量：再重的落进那一片就放不下。容量分给几个分片时按一片算，不按总容量算
+    /// The most one value may weigh is what the smallest shard holds: a heavier one landing
+    /// there does not fit. With the capacity split among shards it goes by one shard, not by
+    /// the whole capacity
+    #[test]
+    fn the_heaviest_value_is_what_the_smallest_shard_holds() {
+        for (capacity, heaviest) in [(64, 64), (100, 100), (300, 75), (10_000, 156)] {
+            let store = CacheStore::<Value>::new(capacity, DAY);
+            assert_eq!(store.heaviest_value(), heaviest, "capacity {capacity}");
+            let smallest = store
+                .shards
+                .iter()
+                .map(|shard| shard.read().capacity)
+                .min()
+                .expect("a shard");
+            assert_eq!(store.heaviest_value(), smallest, "capacity {capacity}");
+        }
     }
 
     #[test]

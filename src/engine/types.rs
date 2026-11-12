@@ -351,6 +351,12 @@ pub struct EngineInner {
     config_namespaces: FxHashMap<Arc<str>, u64>,
     /// `cache_namespaces` 算进去的 Geo 数据代数 / The Geo data generations `cache_namespaces` takes in
     geo: GeoGeneration,
+    /// 不在任何一个配置了的 pipeline 下的请求用的命名空间（没写 pipeline 的配置里所有请求都是）：只有全局设置的指纹。
+    /// 以前这样的请求恒用 0，重载改了全局设置也分不开新旧
+    /// The namespace of requests under no configured pipeline (every request of a configuration
+    /// with none written): the fingerprint of the global settings alone. Such requests used to
+    /// take 0 always, and a reload changing a global setting told old from new by nothing
+    no_pipeline_namespace: u64,
 }
 
 impl EngineInner {
@@ -367,10 +373,16 @@ impl EngineInner {
             .collect();
         let config_namespaces = build_cache_namespaces(&cfg);
         let geo = GeoGeneration::default();
+        let no_pipeline_namespace = {
+            let mut hasher = DefaultHasher::new();
+            hash_global_settings_semantics(&cfg.settings, &mut hasher);
+            hasher.finish()
+        };
         Self {
             cache_namespaces: with_geo(&cfg, &config_namespaces, geo),
             config_namespaces,
             geo,
+            no_pipeline_namespace,
             pipeline: cfg,
             compiled_pipelines,
             pipeline_index,
@@ -404,6 +416,7 @@ impl EngineInner {
             cache_namespaces: with_geo(&self.pipeline, &self.config_namespaces, geo),
             config_namespaces: self.config_namespaces.clone(),
             geo,
+            no_pipeline_namespace: self.no_pipeline_namespace,
             pipeline: self.pipeline.clone(),
             compiled_pipelines: self.compiled_pipelines.clone(),
             pipeline_index: self.pipeline_index.clone(),
@@ -415,7 +428,7 @@ impl EngineInner {
         self.cache_namespaces
             .get(pipeline_id)
             .copied()
-            .unwrap_or_default()
+            .unwrap_or(self.no_pipeline_namespace)
     }
 }
 

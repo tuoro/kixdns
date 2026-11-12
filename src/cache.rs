@@ -197,16 +197,45 @@ impl CacheSlot {
             .cloned()
             .collect();
         while entries.len() >= MAX_NETWORKS_PER_SLOT {
-            let evicted = entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, old)| (old.reach.is_broad(), old.is_fresh(), old.inserted_at))
-                .map(|(index, _)| index)
-                .unwrap_or(0);
-            entries.remove(evicted);
+            entries.remove(Self::least_worth_keeping(&entries));
         }
         entries.push(entry);
         Self { entries }
+    }
+
+    /// 满了时先淘汰哪一份（见 [`Self::with`]）/ Which answer goes first when full (see [`Self::with`])
+    fn least_worth_keeping(entries: &[Arc<CacheEntry>]) -> usize {
+        entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, old)| (old.reach.is_broad(), old.is_fresh(), old.inserted_at))
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    }
+
+    /// 计重不超过 `heaviest` 的槽位：超了就照 [`Self::with`] 的次序淘汰，最后存进来的那一份留着。缓存的一个分片放不下
+    /// 比它还重的槽位，整个槽位会被扔掉：一个名字有几十个网段的大应答时，每添一份就全部丢一次，这个名字永远缓存不住
+    /// The slot weighing no more than `heaviest`: over it, answers go in the order of
+    /// [`Self::with`], the one stored last staying. A shard of the cache cannot hold a slot
+    /// heavier than itself and throws the whole slot away: with large answers for dozens of
+    /// networks under one name, each one added lost them all, and the name never stayed cached
+    pub fn fitting(mut self, heaviest: u64) -> Self {
+        while self.entries.len() > 1 && u64::from(Self::weight_of(&self.entries)) > heaviest {
+            let last = self.entries.len() - 1;
+            let evicted = Self::least_worth_keeping(&self.entries[..last]);
+            self.entries.remove(evicted);
+        }
+        self
+    }
+
+    /// 这些应答一共计多重（见 [`BYTES_PER_ANSWER`]）/ What these answers weigh together (see
+    /// [`BYTES_PER_ANSWER`])
+    fn weight_of(entries: &[Arc<CacheEntry>]) -> u32 {
+        entries
+            .iter()
+            .map(|entry| entry.bytes.len().div_ceil(BYTES_PER_ANSWER) as u32)
+            .sum::<u32>()
+            .max(1)
     }
 
     /// 把 `old` 这一份换成 `new` 后的槽位；`old` 已经不在时为 None
@@ -300,10 +329,7 @@ const BYTES_PER_ANSWER: usize = 1024;
 
 impl Cached for Arc<CacheSlot> {
     fn weight(&self) -> u32 {
-        let answers = self
-            .entries()
-            .map(|entry| entry.bytes.len().div_ceil(BYTES_PER_ANSWER) as u32);
-        answers.sum::<u32>().max(1)
+        CacheSlot::weight_of(&self.entries)
     }
 
     fn outlived(&self, max_age: Duration, now: Instant) -> bool {
@@ -594,6 +620,39 @@ mod tests {
             &select(&slot, "203.0.0.0/24").unwrap(),
             &shared
         ));
+    }
+
+    /// 槽位比缓存的一个分片还重时，先淘汰只适用于一部分子网的旧应答，够轻为止：新存进来的和大家共用的那份留着
+    /// A slot heavier than a shard of the cache has its older answers for some subnets go
+    /// first until it is light enough: the one just stored and the one everyone shares stay
+    #[test]
+    fn a_slot_too_heavy_for_a_shard_sheds_answers_instead_of_going_whole() {
+        let large = |reach: EcsReach, age: Duration| {
+            let mut large = (*entry(reach, 300, age)).clone();
+            large.bytes = Bytes::from(vec![0u8; 3 * BYTES_PER_ANSWER]);
+            Arc::new(large)
+        };
+        let shared = large(EcsReach::default(), Duration::from_secs(50));
+        let mut slot = CacheSlot::default().with(shared.clone(), None);
+        for network in 0..20u8 {
+            let reach = reach(&format!("198.51.{network}.0/24"), Some(24));
+            slot = slot.with(
+                large(reach, Duration::from_secs(u64::from(20 - network))),
+                None,
+            );
+        }
+        assert_eq!(Arc::new(slot.clone()).weight(), 63);
+        let newest = slot.entries().last().expect("stored").clone();
+
+        let fitted = slot.fitting(30);
+        assert_eq!(fitted.len(), 10, "ten answers of weight 3");
+        assert!(fitted.entries().any(|entry| Arc::ptr_eq(entry, &shared)));
+        assert!(fitted.entries().any(|entry| Arc::ptr_eq(entry, &newest)));
+        // 一份就超重的留着那一份，由缓存决定存不存 / One answer over the weight by itself stays,
+        // and the cache decides whether to store it
+        let alone = fitted.fitting(1);
+        assert_eq!(alone.len(), 1);
+        assert!(alone.entries().all(|entry| Arc::ptr_eq(entry, &newest)));
     }
 
     /// 刷新写进了适用范围不同的新应答，被刷新的那份就让位；什么都没写时它留着

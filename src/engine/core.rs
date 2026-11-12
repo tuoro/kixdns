@@ -432,12 +432,13 @@ impl Engine {
     /// here and `insert_dns_cache_entry` only.
     pub(crate) fn cache_insert(&self, slot: u64, entry: Arc<CacheEntry>) {
         let max_age = Some(self.cache.max_age());
+        let heaviest = self.cache.heaviest_value();
         self.cache.compute(slot, |current| {
             let slot = match current {
                 Some(current) => current.with(entry, max_age),
                 None => CacheSlot::default().with(entry, max_age),
             };
-            Op::Put(Arc::new(slot))
+            Op::Put(Arc::new(slot.fitting(heaviest)))
         });
     }
 
