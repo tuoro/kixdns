@@ -25,6 +25,8 @@ mod geo_reload_tests;
 #[cfg(test)]
 mod geo_update_cache_tests;
 #[cfg(test)]
+mod heavy_slot_tests;
+#[cfg(test)]
 mod held_back_tests;
 #[cfg(test)]
 mod inflight_wait_tests;
@@ -57,9 +59,13 @@ pub(crate) mod response_log;
 mod rule_index_tests;
 pub mod rules;
 #[cfg(test)]
+mod settings_only_reload_tests;
+#[cfg(test)]
 mod signed_answer_tests;
 #[cfg(test)]
 mod stale_recheck_tests;
+#[cfg(test)]
+mod stale_redecide_tests;
 #[cfg(test)]
 mod stale_wait_tests;
 #[cfg(test)]

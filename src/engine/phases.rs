@@ -397,12 +397,12 @@ pub(crate) fn check_stale_cache_logged(
 }
 
 /// 把过期的 `hit` 当作 stale 提供（RFC 8767）：TTL 都设成 serve_stale_ttl；开着
-/// serve_stale_ttl_reset 时让它重新从刚过期算起；来自上游的应答顺带发起后台刷新；按 `kind`
+/// serve_stale_ttl_reset 时让它重新从刚过期算起；顺带发起后台刷新；按 `kind`
 /// 上报观察者，记下应答取自缓存
 /// Serve the expired `hit` stale (RFC 8767): every TTL set to serve_stale_ttl; with
-/// serve_stale_ttl_reset on it counts as just expired again; an answer from an upstream
-/// starts a background refresh too; the observer hears of it as `kind`, and the answer
-/// is noted as taken from the cache
+/// serve_stale_ttl_reset on it counts as just expired again; a background refresh is
+/// started too; the observer hears of it as `kind`, and the answer is noted as taken
+/// from the cache
 fn serve_stale(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
@@ -423,16 +423,19 @@ fn serve_stale(
     if settings.serve_stale_ttl_reset {
         engine.cache_replace(context.slot, hit, hit.clone_with_refreshed_ttl());
     }
-    // Trigger background refresh to get fresh data / 触发后台刷新以获取新数据
-    if hit.upstream.is_some() {
-        engine.spawn_background_refresh(
-            (*context.state).clone(),
-            hit,
-            context.slot,
-            context.qclass,
-            context.requester,
-        );
-    }
+    // 发起后台刷新，重新决定一次。规则给的应答（没有上游的那种）也一样：它可能是上游失败时的兜底、对上游那次应答的
+    // 检查结果，不重新决定的话每次命中都把它续上，一直用下去
+    // Start a background refresh to decide again. An answer the rules gave (one with no
+    // upstream) is no different: it may be the fallback for an upstream failure or what the
+    // check of that one reply came to, and not decided again it would be renewed on every hit
+    // and served for ever
+    engine.spawn_background_refresh(
+        (*context.state).clone(),
+        hit,
+        context.slot,
+        context.qclass,
+        context.requester,
+    );
     if let Some((observer, ctx)) = context.observed {
         observer.cache_hit(
             ctx,
@@ -907,6 +910,22 @@ pub(crate) async fn handle_forward_decision_logged(
             .with_reach(reach.clone()),
         );
     };
+    // 刷新问到了上游，拿到一份完整的应答，只是它的 TTL 让它不进缓存（TTL 为 0、没有 SOA 的否定应答）：被刷新的那条
+    // 不再留着，下一个客户端请求自己去问。留着的话它每次命中都被当过期应答交出去、再续上，上游明明答了别的也一直
+    // 用它（RFC 8767 只在取不到新应答时才用过期的）。被截断的应答算刷新失败、签过名的应答只对那一次请求有效，这两种
+    // 条目照旧留着，不走这里
+    // A refresh reached the upstream and got a whole answer whose TTL keeps it out of the
+    // cache (a TTL of 0, a negative answer with no SOA): the entry it renews is kept no
+    // longer, and the next client request asks for itself. Kept, it would go out stale and be
+    // renewed on every hit, served on while the upstream says otherwise (RFC 8767 serves
+    // stale only when no new answer can be had). A truncated answer is a failed refresh and a
+    // signed one holds for that one request only: for those two the entry stays as before,
+    // and they do not come here
+    let drop_renewed = || {
+        if let Some(target) = refresh {
+            engine.drop_refreshed(keys.slot, &question, &view, target);
+        }
+    };
 
     // 应答回来以后的处理单独在堆上分配：它的状态（解析出来的报文、响应动作的结果等）只在应答回来
     // 以后才用得着，放在这个函数里，等上游的每个查询都得替它多留一千多字节
@@ -1002,6 +1021,8 @@ pub(crate) async fn handle_forward_decision_logged(
                             (cache_ttl, refresh_ttl),
                             trail,
                         );
+                    } else {
+                        drop_renewed();
                     }
                     if let Some(g) = cleanup_guard.as_mut() {
                         g.hand_over(|| for_waiters(&raw, &requester, trail, echo_floor));
@@ -1220,6 +1241,10 @@ pub(crate) async fn handle_forward_decision_logged(
                         (cache_ttl, refresh_ttl),
                         trail,
                     );
+                } else if !fallback {
+                    // 上游失败以后由别的上游兜底的不算：那是失败，条目保留 / Not after an upstream
+                    // failure covered by another upstream: that is a failure, and the entry stays
+                    drop_renewed();
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.hand_over(|| for_waiters(&ctx.raw, &requester, trail, echo_floor));
