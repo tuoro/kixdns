@@ -694,6 +694,9 @@ pub(crate) async fn handle_forward_decision_logged(
         reused = true;
         Ok((ctx.raw, ctx.upstream))
     } else {
+        // 等别人的转发时卡住、不等了的失败 / The failure of waiting no more, stuck on another's
+        // forward
+        let mut gave_up = None;
         if !skip_cache {
             use dashmap::mapref::entry::Entry;
             let rx = match engine.inflight.entry(keys.inflight) {
@@ -728,13 +731,51 @@ pub(crate) async fn handle_forward_decision_logged(
                 Entry::Occupied(mut entry) => Some(entry.get_mut().subscribe()),
             };
 
-            if let Some(mut rx) = rx
-                && rx.changed().await.is_ok()
-            {
+            // 等别人正在做的同一个转发。开了流控时这次等待也看卡没卡住（见 `PermitManager::join`）：卡住了、这台设备
+            // 留着等的又已经够多，就不等了，照上游失败往下走
+            // Waiting on the same forward another is making. With flow control on this wait too
+            // is seen to for being stuck (see `PermitManager::join`): stuck with enough of the
+            // device's kept waiting already it waits no more, and goes on below as the upstream
+            // failing
+            let joined = match rx {
+                Some(mut rx) => {
+                    let waiting = async {
+                        rx.changed().await.ok()?;
+                        Some(rx.borrow().clone())
+                    };
+                    match &engine.flow_control_state {
+                        // 流控的等待单独在堆上分配：只有等别人的查询才用得着，放在这个函数里的话每个等上游的查询
+                        // 都得替它留着地方
+                        // Flow control's wait is allocated on its own: only a query waiting on
+                        // another's has use for it, and held in this function every query
+                        // waiting on an upstream would reserve room for it
+                        Some(flow) => {
+                            match Box::pin(crate::engine::upstream::wait_for_another(
+                                engine,
+                                flow,
+                                peer.ip(),
+                                upstream,
+                                upstream_timeout,
+                                waiting,
+                            ))
+                            .await
+                            {
+                                Ok(joined) => joined,
+                                Err(failure) => {
+                                    gave_up = Some(failure);
+                                    None
+                                }
+                            }
+                        }
+                        None => waiting.await,
+                    }
+                }
+                None => None,
+            };
+            if let Some(result) = joined {
                 if let Some((observer, ctx)) = observed {
                     observer.inflight_joined(ctx);
                 }
-                let result = rx.borrow().clone();
                 match &result {
                     Ok(bytes) => {
                         let mut resp_mut = BytesMut::from(bytes.as_ref());
@@ -746,16 +787,22 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
             }
         }
-        crate::engine::upstream::forward_upstream(
-            engine,
-            packet,
-            upstream,
-            upstream_timeout,
-            transport,
-            pre_split_upstreams,
-            observed,
-        )
-        .await
+        match gave_up {
+            Some(failure) => Err(failure),
+            None => {
+                crate::engine::upstream::forward_upstream(
+                    engine,
+                    packet,
+                    upstream,
+                    upstream_timeout,
+                    transport,
+                    pre_split_upstreams,
+                    observed,
+                    (!skip_cache).then(|| peer.ip()),
+                )
+                .await
+            }
+        }
     };
 
     // 被截断的应答改用 TCP 重取一次，取到的结果照常往下走：应答经过响应规则和动作、写进缓存，失败时
@@ -785,11 +832,24 @@ pub(crate) async fn handle_forward_decision_logged(
                 Some(Transport::Tcp),
                 pre_split_upstreams,
                 observed,
+                (!skip_cache).then(|| peer.ip()),
             )
             .await
         }
         resp => resp,
     };
+
+    // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：这个请求登记的条目、规则 continue 以后还
+    // 留着的条目，现在都放下，等在上面的别的请求各自去问，不拿这一个的结果
+    // A failure with flow control keeping the query from waiting is the device's own affair
+    // (see `UpstreamFailure::withheld`): the entry this request registered and the one it
+    // still holds after a rule continued both go now, so the other requests waiting on them
+    // ask for themselves and get nothing of this one's outcome
+    let withheld = resp.as_ref().is_err_and(UpstreamFailure::was_withheld);
+    if withheld {
+        cleanup_guard = None;
+        *held_inflight = None;
+    }
 
     // 几个上游都回了失败应答时，规则的回答检查照样看得到最先收到的那个（见
     // `rules::check_failure_reply`）；刷新随后照旧拒收它
@@ -1014,16 +1074,27 @@ pub(crate) async fn handle_forward_decision_logged(
                         CacheHitKind::StaleUpstreamFailure,
                         response,
                     ) {
-                        warn!(
-                            event = "serve_stale_on_upstream_failure",
-                            upstream = %upstream,
-                            qname = %qname,
-                            qtype = ?qtype,
-                            client_ip = %peer.ip(),
-                            pipeline = %pipeline_id,
-                            error = %e,
-                            "RFC 8767: upstream failed, serving stale cache"
-                        );
+                        if UpstreamFailure::was_withheld(&e) {
+                            debug!(
+                                event = "serve_stale_on_upstream_withheld",
+                                upstream = %upstream,
+                                qname = %qname,
+                                client_ip = %peer.ip(),
+                                error = %e,
+                                "RFC 8767: flow control kept the query from the upstream, serving stale cache"
+                            );
+                        } else {
+                            warn!(
+                                event = "serve_stale_on_upstream_failure",
+                                upstream = %upstream,
+                                qname = %qname,
+                                qtype = ?qtype,
+                                client_ip = %peer.ip(),
+                                pipeline = %pipeline_id,
+                                error = %e,
+                                "RFC 8767: upstream failed, serving stale cache"
+                            );
+                        }
                         if let Some(g) = cleanup_guard.as_mut() {
                             g.hand_over(|| {
                                 for_waiters(&stale_bytes, &requester, trail, echo_floor)
@@ -1033,18 +1104,29 @@ pub(crate) async fn handle_forward_decision_logged(
                     }
 
                     let rcode = ResponseCode::ServFail;
-                    warn!(
-                       event = "upstream_failure",
-                       upstream = %upstream,
-                       qname = %qname,
-                       qtype = ?qtype,
-                       rcode = ?rcode,
-                       client_ip = %peer.ip(),
-                       error = %e,
-                       pipeline = %pipeline_id,
-                       transport = ?transport,
-                       "upstream failed"
-                    );
+                    if UpstreamFailure::was_withheld(&e) {
+                        debug!(
+                            event = "upstream_withheld",
+                            upstream = %upstream,
+                            qname = %qname,
+                            client_ip = %peer.ip(),
+                            error = %e,
+                            "flow control kept the query from the upstream"
+                        );
+                    } else {
+                        warn!(
+                           event = "upstream_failure",
+                           upstream = %upstream,
+                           qname = %qname,
+                           qtype = ?qtype,
+                           rcode = ?rcode,
+                           client_ip = %peer.ip(),
+                           error = %e,
+                           pipeline = %pipeline_id,
+                           transport = ?transport,
+                           "upstream failed"
+                        );
+                    }
                     // Fast build SERVFAIL without full request parse
                     let rd = packet.get(2).map(|b| b & 0x01 != 0).unwrap_or(false);
                     let resp_bytes = match build_servfail_response_fast(
@@ -1103,6 +1185,7 @@ pub(crate) async fn handle_forward_decision_logged(
             qname,
             qtype,
             client_ip: peer.ip(),
+            asker: (!skip_cache).then(|| peer.ip()),
             upstream_default: default_upstream,
             pipeline_id,
             rule_name,
@@ -1160,7 +1243,10 @@ pub(crate) async fn handle_forward_decision_logged(
                         refresh_found_no_answer("the response actions found no answer")
                     }));
                 }
-                if min_ttl > Duration::from_secs(0) {
+                // 流控没让等时规则给的静态应答不写缓存（见 `UpstreamFailure::withheld`）/ A static answer the
+                // rules give with flow control keeping the query from waiting is not cached (see
+                // `UpstreamFailure::withheld`)
+                if min_ttl > Duration::from_secs(0) && !withheld {
                     let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                     cache(&bytes, rcode, None, (ttl, ttl), trail);
                 } else if skip_cache && !fallback {

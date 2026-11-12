@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::select;
@@ -9,12 +9,40 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use super::Engine;
+use super::concurrency::GaveUp;
 use crate::config::Transport;
 use crate::observe::{
     UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
 
 use super::observation::Observed;
+
+/// 流控没让一个查询等到上游的回答（见 `PermitManager::ask`、`Asking::wait`）/ Flow control kept a query from
+/// waiting for an upstream's answer (see `PermitManager::ask`, `Asking::wait`)
+#[derive(Debug)]
+enum Withheld {
+    /// 没去问：这台设备在这个上游上的等待多半没等到回答 / Not asked: most of this device's waits on
+    /// this upstream got no answer
+    NotAsked,
+    /// 卡住了，这台设备留着等的又已经够多，不等了 / Stuck with enough of this device's kept waiting
+    /// already, it waited no more
+    GaveUp,
+}
+
+impl std::fmt::Display for Withheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotAsked => {
+                "upstream not asked: most of this client's latest queries to it got no answer"
+            }
+            Self::GaveUp => {
+                "gave up waiting: stuck, with enough of this client's queries kept waiting"
+            }
+        })
+    }
+}
+
+impl std::error::Error for Withheld {}
 
 /// Error indicating that all upstream attempts have been exhausted.
 /// 表示所有 upstream 尝试均已耗尽的错误。
@@ -43,6 +71,27 @@ impl UpstreamFailure {
     /// `downcast_ref`
     pub fn error(source: anyhow::Error) -> anyhow::Error {
         anyhow::Error::new(Self::new(source))
+    }
+
+    /// 流控没让等的失败（见 [`Withheld`]）。调用方照上游失败处理，只有三处不同：不逐个记警告日志——拦的时候每秒可以有
+    /// 几万个；不把结果交给等在同一个转发上的别的请求——这是这台设备自己的事，别的设备各自去问；规则在上游失败时给的
+    /// 静态应答不写进缓存——缓存是所有设备共用的，别的设备问这个上游是有回答的
+    /// A failure with flow control keeping the query from waiting (see [`Withheld`]). Callers
+    /// treat it as the upstream failing, but for three things: no warning is logged for each, as
+    /// held back there can be tens of thousands a second; the outcome is not handed to other
+    /// requests waiting on the same forward, this being the device's own affair, so other
+    /// devices ask for themselves; and a static answer the rules give on an upstream failure is
+    /// not written to the cache, which all devices share while the upstream does answer the
+    /// others
+    fn withheld(why: Withheld) -> anyhow::Error {
+        anyhow::Error::new(Self::new(anyhow::Error::new(why)))
+    }
+
+    /// `err` 是不是流控没让等的失败（见 [`Self::withheld`]）/ Whether `err` is a failure with flow
+    /// control keeping the query from waiting (see [`Self::withheld`])
+    pub(crate) fn was_withheld(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<Self>()
+            .is_some_and(|failure| failure.source.is::<Withheld>())
     }
 
     /// 同 [`Self::error`]，带着最先收到的失败应答 / As [`Self::error`], carrying the first
@@ -137,6 +186,17 @@ fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Trans
     } else {
         (addr, default_transport)
     }
+}
+
+/// 规则里写的一串上游各自的地址（去掉前缀），`PermitManager::note_answer_took` 就是按它记的 / The address
+/// (short of its prefix) of each of the upstreams a rule writes, which is what
+/// `PermitManager::note_answer_took` notes by
+pub(crate) fn addresses(upstream: &str) -> impl Iterator<Item = &str> {
+    upstream
+        .split(',')
+        .map(str::trim)
+        .filter(|member| !member.is_empty())
+        .map(|member| parse_upstream_addr(member, Transport::Udp).0)
 }
 
 /// 上游地址前缀对应的传输；不认识的前缀为 None（[`parse_upstream_addr`] 这时用默认传输）
@@ -340,10 +400,13 @@ async fn forward_tcp_udp_dual(
     });
 
     let tcp_task = tokio::spawn(async move {
-        engine_tcp
+        let sent = sent_if_timed(&engine_tcp);
+        let reply = engine_tcp
             .tcp_mux
             .send(&packet_tcp, &addr_tcp, timeout_dur)
-            .await
+            .await;
+        note_round_trip(&engine_tcp, &addr_tcp, timeout_dur, sent, &reply);
+        reply
     });
 
     let start = std::time::Instant::now();
@@ -455,6 +518,15 @@ async fn forward_tcp_udp_dual(
 /// take no allocation while they fit
 type Upstreams = smallvec::SmallVec<[Arc<str>; 4]>;
 
+///
+/// `asker` 是替谁问的（后台刷新不替谁问，是 None）。开了流控时：这台设备最近在这个上游上的等待多半没等到回答，这一次
+/// 不问（见 `PermitManager::ask`）；问了的卡住了、这台设备留着等的又已经够多，不等了（见 `Asking::wait`）。两样都算上游
+/// 失败（见 [`UpstreamFailure::withheld`]）。
+/// `asker` is whom this is asked for (None for a background refresh, asked for nobody). With
+/// flow control on: with most of this device's latest waits on this upstream unanswered, this
+/// one is not asked (see `PermitManager::ask`); one that is asked and gets stuck with enough of
+/// the device's kept waiting already waits no more (see `Asking::wait`). Both count as the
+/// upstream failing (see [`UpstreamFailure::withheld`]).
 pub async fn forward_upstream(
     engine: &Engine,
     packet: &[u8],
@@ -463,7 +535,20 @@ pub async fn forward_upstream(
     transport: Option<Transport>,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
+    asker: Option<std::net::IpAddr>,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
+    let asking = match (asker, &engine.flow_control_state) {
+        (Some(client), Some(flow)) => {
+            match engine
+                .permit_manager
+                .ask(flow, client, upstream, timeout_dur)
+            {
+                Some(asking) => Some(asking),
+                None => return Err(UpstreamFailure::withheld(Withheld::NotAsked)),
+            }
+        }
+        _ => None,
+    };
     let packet =
         crate::proto_utils::query_asking_ad(crate::proto_utils::query_without_cookie(packet));
     let guarded = |reply| {
@@ -477,7 +562,8 @@ pub async fn forward_upstream(
         let floor = engine.state.load().pipeline.settings.min_ttl;
         crate::proto_utils::reply_within_ttls(reply, floor, engine.ttl_cap())
     };
-    match forward_upstream_as_is(
+    // 固定在这里，两条路等的是同一份 / Pinned here, both paths waiting on the one copy
+    let mut forward = std::pin::pin!(forward_upstream_as_is(
         engine,
         &packet,
         upstream,
@@ -485,9 +571,16 @@ pub async fn forward_upstream(
         transport,
         pre_split_upstreams,
         observed,
-    )
-    .await
-    {
+    ));
+    let forwarded = match asking {
+        // 流控的等待（定时器、这次等待的记录）单独在堆上分配：放在这里的话，没开流控时每个等上游的查询也得替它留着地方
+        // Flow control's wait (its timer and what is kept of this wait) is allocated on its own:
+        // held here, every query waiting on an upstream would reserve room for it without flow
+        // control too
+        Some(asking) => Box::pin(waited_for(asking, forward.as_mut())).await?,
+        None => forward.await,
+    };
+    match forwarded {
         Ok((reply, winner)) => Ok((guarded(reply), winner)),
         // 失败带着的失败应答也可能交到客户端手里（见 `rules::check_failure_reply`），一样把关
         // The failure reply a failure carries may reach a client too (see
@@ -501,6 +594,63 @@ pub async fn forward_upstream(
             Err(err)
         }
     }
+}
+
+/// 开了流控时等一次转发 `forward` 走完（见 `Asking::wait`），并记下上游回了什么：卡住了、留着等的又已经够多时不等了，是外层
+/// 的 Err；转发自己的结果原样在里层
+/// Waits for one `forward` to be done with flow control on (see `Asking::wait`), noting what
+/// the upstream replied: stuck with enough kept waiting already it waits no more, which is the
+/// outer Err; the forward's own outcome is the inner one as it is
+async fn waited_for<F>(
+    mut asking: crate::engine::concurrency::Asking<'_>,
+    forward: std::pin::Pin<&mut F>,
+) -> anyhow::Result<anyhow::Result<(Bytes, Arc<str>)>>
+where
+    F: Future<Output = anyhow::Result<(Bytes, Arc<str>)>>,
+{
+    let Ok(forwarded) = asking.wait(forward).await else {
+        return Err(UpstreamFailure::withheld(Withheld::GaveUp));
+    };
+    match &forwarded {
+        // 只有一个上游的规则，失败应答也当作应答交回来：那不是用得上的回答 / A rule with a single
+        // upstream gets a failure reply back as its answer, which is no answer of use
+        Ok((reply, _)) => asking.replied(!is_failure_reply_packet(reply)),
+        // 几个上游都失败了，其中有回了失败应答的：上游是回了的 / Every upstream failed, one of them
+        // with a failure reply: the upstreams did reply
+        Err(err) if UpstreamFailure::reply_of(err).is_some() => asking.replied(false),
+        Err(_) => {}
+    }
+    Ok(forwarded)
+}
+
+/// 开了流控时等别的请求正在做的、给 `upstream` 的同一个转发（`wait`），`client` 是替谁等的，`limit` 是上游的时限：卡住了、
+/// 这台设备留着等的又已经够多时不等了，算上游失败；别的都不管（见 `PermitManager::join`）
+/// Waits, with flow control on, on the same forward to `upstream` another request is making
+/// (`wait`), `client` being whom it waits for and `limit` the upstream's timeout: stuck with
+/// enough of this device's kept waiting already it waits no more, which counts as the upstream
+/// failing; nothing else is looked at (see `PermitManager::join`)
+pub(crate) async fn wait_for_another<T>(
+    engine: &Engine,
+    flow: &crate::engine::concurrency::FlowControlState,
+    client: std::net::IpAddr,
+    upstream: &str,
+    limit: Duration,
+    wait: impl Future<Output = T>,
+) -> anyhow::Result<T> {
+    let mut joining = engine.permit_manager.join(flow, client, upstream, limit);
+    let wait = std::pin::pin!(wait);
+    joining
+        .wait(wait)
+        .await
+        .map_err(|GaveUp| UpstreamFailure::withheld(Withheld::GaveUp))
+}
+
+/// 应答报文是不是失败应答（SERVFAIL、REFUSED），只看报头里的 RCODE / Whether a reply packet is a failure
+/// reply (SERVFAIL, REFUSED), by the RCODE in its header alone
+pub(crate) fn is_failure_reply_packet(reply: &[u8]) -> bool {
+    reply
+        .get(3)
+        .is_some_and(|flags| matches!(flags & 0x0f, 2 | 5))
 }
 
 /// [`forward_upstream`] 去掉 cookie 之前的部分 / [`forward_upstream`] short of its cookie guard
@@ -896,7 +1046,9 @@ async fn send_to_upstream(
             }
         }
         Transport::Tcp => {
+            let sent = sent_if_timed(engine);
             let r = Box::pin(engine.tcp_mux.send(packet, addr, timeout_dur)).await;
+            note_round_trip(engine, addr, timeout_dur, sent, &r);
             (r, Transport::Tcp)
         }
         Transport::TcpUdp => {
@@ -908,15 +1060,21 @@ async fn send_to_upstream(
             }
         }
         Transport::Doh => {
+            let sent = sent_if_timed(engine);
             let r = Box::pin(engine.doh_client.send(packet, addr, timeout_dur)).await;
+            note_round_trip(engine, addr, timeout_dur, sent, &r);
             (r, Transport::Doh)
         }
         Transport::Dot => {
+            let sent = sent_if_timed(engine);
             let r = Box::pin(engine.dot_mux.send(packet, addr, timeout_dur)).await;
+            note_round_trip(engine, addr, timeout_dur, sent, &r);
             (r, Transport::Dot)
         }
         Transport::Doq => {
+            let sent = sent_if_timed(engine);
             let r = Box::pin(engine.doq_client.send(packet, addr, timeout_dur)).await;
+            note_round_trip(engine, addr, timeout_dur, sent, &r);
             (r, Transport::Doq)
         }
     }
@@ -965,6 +1123,61 @@ fn upstream_label(via: Transport, addr: &str) -> Arc<str> {
     label
 }
 
+/// 现在发出的一次和上游的收发要量用了多久时，现在这一刻：开了流控才量，而且抽着量（见
+/// `PermitManager::times_this_round_trip`）；启动以后还没等到过回答时每一次都量，头一个回答一来就知道回答要多久，
+/// 不用等抽到的那一个——这之前开始等的查询是按上游应当已经回答的时间点算卡住的，洪泛时这一段越短，占着内存等到那个
+/// 点的查询越少。和 [`note_round_trip`] 一前一后夹着那次收发，不另包一层：包一层的话收发的
+/// 状态要整块搬进去，没开流控时每个查询也跟着多花时间
+/// The present, when the exchange with an upstream being sent now is to be timed: only with
+/// flow control on, and only one in so many (see `PermitManager::times_this_round_trip`);
+/// while no answer has been seen since the start every one is timed, so the first answer tells
+/// at once how long answers take without waiting for a sampled one: a query that began waiting
+/// before then counts as stuck by the point an upstream should have answered by, and in a
+/// flood the shorter that stretch, the fewer queries hold memory until that point. It
+/// and [`note_round_trip`] go either side of the exchange with no wrapper round it: a wrapper
+/// would have the exchange's whole state moved into it, costing every query without flow
+/// control too
+#[inline]
+fn sent_if_timed(engine: &Engine) -> Option<Instant> {
+    (engine.flow_control_state.is_some()
+        && (crate::engine::PermitManager::times_this_round_trip()
+            || !engine.permit_manager.has_seen_an_answer()))
+    .then(Instant::now)
+}
+
+/// 一次和 `upstream`（一个地址）的收发在 `sent` 发出（量了的才有值），现在有了结果 `reply`：收到的是用得上的回答（不是
+/// SERVFAIL、REFUSED）就记进这个上游的回答要多久（见 `PermitManager::stuck_after`）。记的是这一次收发自己用了多久，不是
+/// 查询一共等了多久：第一次没发到、重发才等到回答的查询，一共等了一个重发的间隔，那不是上游回答要多久。`limit` 是上游
+/// 的时限：比它还晚才看到的应答，是按时到了、内核晚了这么久才读到，说明不了上游，不记。内核忙时读得晚一些的照常记：
+/// 内核看得到的回答就是这么慢，算卡住的时间得跟着它
+/// One exchange with `upstream` (one address), sent at `sent` (which has a value only when it
+/// was timed), now has its outcome `reply`: an answer of use (no SERVFAIL or REFUSED) is noted
+/// in how long this upstream's answers take (see `PermitManager::stuck_after`). What is noted
+/// is how long this one exchange took, not how long the query waited in all: a query whose
+/// first try was lost and that got its answer by being sent again waited a resend's interval
+/// in all, which is not how long the upstream takes to answer. `limit` is the upstream's
+/// timeout: a reply seen later than that came in time and was read late, the kernel being that
+/// far behind, which says nothing of the upstream and is not noted. One read somewhat late by
+/// a busy kernel is noted as usual: answers are that slow as far as the kernel can see, and
+/// the time a query counts as stuck after has to follow
+#[inline]
+fn note_round_trip(
+    engine: &Engine,
+    upstream: &str,
+    limit: Duration,
+    sent: Option<Instant>,
+    reply: &anyhow::Result<Bytes>,
+) {
+    if let (Some(sent), Ok(reply)) = (sent, reply)
+        && !is_failure_reply_packet(reply)
+    {
+        let took = sent.elapsed();
+        if took <= limit {
+            engine.permit_manager.note_answer_took(upstream, took);
+        }
+    }
+}
+
 /// The point by which an upstream should have answered: the budget of a UDP
 /// query's first attempt, after which it is retried.
 /// 上游应当已经应答的时间点：UDP 查询第一次尝试的时间预算，过了就重试。
@@ -1008,7 +1221,10 @@ async fn forward_udp_smart(
     let attempts = [hedge_timeout(timeout_dur), timeout_dur];
 
     for (idx, dur) in attempts.iter().enumerate() {
-        match engine.udp_client.send(packet, upstream, *dur).await {
+        let sent = sent_if_timed(engine);
+        let attempt = engine.udp_client.send(packet, upstream, *dur).await;
+        note_round_trip(engine, upstream, timeout_dur, sent, &attempt);
+        match attempt {
             Ok(bytes) => {
                 // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
                 if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
@@ -1017,9 +1233,11 @@ async fn forward_udp_smart(
                     // 预留地方
                     // The TCP exchange is allocated on its own: TCP is only taken for a truncated
                     // answer or a UDP failure, so a query waiting on UDP reserves no room for it
-                    return Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur))
-                        .await
-                        .map(|bytes| (bytes, Transport::Tcp));
+                    let sent = sent_if_timed(engine);
+                    let over_tcp =
+                        Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur)).await;
+                    note_round_trip(engine, upstream, timeout_dur, sent, &over_tcp);
+                    return over_tcp.map(|bytes| (bytes, Transport::Tcp));
                 }
                 return Ok((bytes, Transport::Udp));
             }
@@ -1036,9 +1254,11 @@ async fn forward_udp_smart(
                     // Last UDP attempt, try TCP fallback before failing.
                     debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
                     // 单独在堆上分配，见上 / Allocated on its own, see above
-                    return Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur))
-                        .await
-                        .map(|bytes| (bytes, Transport::Tcp));
+                    let sent = sent_if_timed(engine);
+                    let over_tcp =
+                        Box::pin(engine.tcp_mux.send(packet, upstream, timeout_dur)).await;
+                    note_round_trip(engine, upstream, timeout_dur, sent, &over_tcp);
+                    return over_tcp.map(|bytes| (bytes, Transport::Tcp));
                 }
             }
         }
@@ -1278,6 +1498,118 @@ mod tests {
             pipeline_id_index: FxHashMap::default(),
         };
         Engine::new(runtime, "test".to_string()).expect("initialize test engine")
+    }
+
+    /// 记进回答要多久的只有上游时限以内的应答：比时限还晚才看到的，是内核晚读到的，说明不了上游，不记。CPU 很慢
+    /// 又被洪泛占满时，一个晚了八秒才读到的应答要是算数，这以后要等十六秒才算卡住，等于没有这一道
+    /// Only a reply within the upstream's timeout is noted in how long answers take: one
+    /// seen later than that was read late by the kernel, says nothing of the upstream and
+    /// is not noted. On a slow CPU filled by a flood, were a reply read eight seconds late to
+    /// count, nothing would count as stuck for sixteen seconds after it, as good as no such
+    /// check at all
+    #[tokio::test]
+    async fn a_reply_seen_later_than_the_upstreams_timeout_is_not_noted() {
+        let settings = GlobalSettings {
+            default_upstream: "127.0.0.1:0".to_string(),
+            flow_control_enabled: true,
+            ..GlobalSettings::default()
+        };
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings,
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "test".to_string(),
+        )
+        .expect("initialize test engine");
+        let reply = || {
+            let mut reply = Message::new(1, MessageType::Response, OpCode::Query);
+            reply.metadata.response_code = ResponseCode::NoError;
+            Bytes::from(reply.to_vec().expect("encode reply"))
+        };
+        let (upstream, limit) = ("198.51.100.1:53", Duration::from_millis(900));
+        let stuck_after = || engine.permit_manager.stuck_after(upstream, limit);
+        // 每 8 次收发量一次：16 次里一定有量到的 / One exchange in 8 is timed: of 16, some are
+        for _ in 0..16 {
+            let seen_late = async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                anyhow::Ok(reply())
+            };
+            let sent = sent_if_timed(&engine);
+            let reply = seen_late.await;
+            note_round_trip(&engine, upstream, Duration::from_millis(20), sent, &reply);
+        }
+        assert_eq!(
+            stuck_after(),
+            hedge_timeout(limit),
+            "no answer noted: still by the point an upstream should have answered by"
+        );
+        // 失败应答也不记：上游自己等不到才放弃的那几秒不是回答要多久 / Nor is a failure reply noted:
+        // the seconds an upstream took to give up are not how long answers take
+        for _ in 0..16 {
+            let failed = async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                let mut reply = Message::new(1, MessageType::Response, OpCode::Query);
+                reply.metadata.response_code = ResponseCode::ServFail;
+                anyhow::Ok(Bytes::from(reply.to_vec().expect("encode reply")))
+            };
+            let sent = sent_if_timed(&engine);
+            let reply = failed.await;
+            note_round_trip(&engine, upstream, limit, sent, &reply);
+        }
+        assert_eq!(stuck_after(), hedge_timeout(limit), "a failure reply");
+        for _ in 0..16 {
+            let in_time = async {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                anyhow::Ok(reply())
+            };
+            let sent = sent_if_timed(&engine);
+            let reply = in_time.await;
+            note_round_trip(&engine, upstream, limit, sent, &reply);
+        }
+        let after = stuck_after();
+        assert!(
+            after >= Duration::from_millis(120) && after < Duration::from_millis(300),
+            "{after:?}, twice the sixty milliseconds or so the replies took"
+        );
+    }
+
+    /// 启动以后还没等到过回答时每次收发都量，等到了就抽着量：头一个回答一来就知道回答要多久
+    /// While no answer has been seen since the start every exchange is timed, and one in so
+    /// many once one has: the first answer tells at once how long answers take
+    #[tokio::test]
+    async fn every_exchange_is_timed_until_an_answer_is_seen() {
+        let settings = GlobalSettings {
+            default_upstream: "127.0.0.1:0".to_string(),
+            flow_control_enabled: true,
+            ..GlobalSettings::default()
+        };
+        let engine = Engine::new(
+            RuntimePipelineConfig {
+                settings,
+                pipeline_select: Vec::new(),
+                pipelines: Vec::new(),
+                pipeline_id_index: FxHashMap::default(),
+            },
+            "test".to_string(),
+        )
+        .expect("initialize test engine");
+        assert!((0..64).all(|_| sent_if_timed(&engine).is_some()));
+        engine
+            .permit_manager
+            .note_answer_took("198.51.100.1:53", Duration::from_millis(5));
+        let timed = (0..64).filter(|_| sent_if_timed(&engine).is_some()).count();
+        assert_eq!(timed, 8, "one in eight once an answer is seen");
+    }
+
+    /// 没开流控时不量：每个查询不必为它读时钟 / Without flow control nothing is timed, and no query
+    /// reads the clock for it
+    #[tokio::test]
+    async fn without_flow_control_no_exchange_is_timed() {
+        let engine = build_test_engine(false);
+        assert!((0..64).all(|_| sent_if_timed(&engine).is_none()));
     }
 
     fn build_dns_query_packet(qname: &str) -> Vec<u8> {

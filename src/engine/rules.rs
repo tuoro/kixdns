@@ -392,6 +392,10 @@ pub struct ApplyResponseActionsContext<'a> {
     pub qname: &'a str,
     pub qtype: RecordType,
     pub client_ip: IpAddr,
+    /// 响应动作里的转发是替谁问的；后台刷新不替谁问，是 None（见 `upstream::forward_upstream`）/ Whom a forward
+    /// among the response actions is asked for; None on a background refresh, asked for nobody
+    /// (see `upstream::forward_upstream`)
+    pub asker: Option<IpAddr>,
     pub upstream_default: &'a str,
     pub pipeline_id: &'a str,
     pub rule_name: &'a str,
@@ -593,6 +597,7 @@ async fn run_response_actions(
                     Some(use_transport),
                     pre_split_upstreams.as_ref(),
                     observed,
+                    ctx.asker,
                 )
                 .await
                 {
@@ -606,18 +611,38 @@ async fn run_response_actions(
                         if let Some((trail, ecs)) = ctx.trail.as_mut() {
                             trail.record_failure(*ecs);
                         }
-                        warn!(
-                            event = "response_action_failure",
-                            upstream = %upstream_addr,
-                            qname = %ctx.qname,
-                            qtype = ?ctx.qtype,
-                            client_ip = %ctx.client_ip,
-                            pipeline = %ctx.pipeline_id,
-                            rule = %ctx.rule_name,
-                            error = %err,
-                            "response action forward failed"
-                        );
-                        if err.downcast_ref::<UpstreamFailure>().is_none() {
+                        if UpstreamFailure::was_withheld(&err) {
+                            tracing::debug!(
+                                event = "response_action_withheld",
+                                upstream = %upstream_addr,
+                                qname = %ctx.qname,
+                                client_ip = %ctx.client_ip,
+                                error = %err,
+                                "flow control kept the response action forward from the upstream"
+                            );
+                        } else {
+                            warn!(
+                                event = "response_action_failure",
+                                upstream = %upstream_addr,
+                                qname = %ctx.qname,
+                                qtype = ?ctx.qtype,
+                                client_ip = %ctx.client_ip,
+                                pipeline = %ctx.pipeline_id,
+                                rule = %ctx.rule_name,
+                                error = %err,
+                                "response action forward failed"
+                            );
+                        }
+                        // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：原样交回，这个
+                        // 请求出错、由监听器回 SERVFAIL，它登记的条目随之放下，不把 SERVFAIL 交给等着的别的请求
+                        // A failure with flow control keeping the query from waiting is the
+                        // device's own affair (see `UpstreamFailure::withheld`): it goes back
+                        // as it is, the request fails with the listener answering SERVFAIL,
+                        // and the entries it registered go with it, no SERVFAIL being handed
+                        // to the other requests waiting
+                        if err.downcast_ref::<UpstreamFailure>().is_none()
+                            || UpstreamFailure::was_withheld(&err)
+                        {
                             return Err(err);
                         }
                         return response_action_servfail(ctx.req);
@@ -946,8 +971,27 @@ pub(crate) async fn process_response_jump(
                             // 跳转路上的请求自己握着条目，它等的那一个可能反过来也在等它（两个请求互相
                             // 跳进了对方的 pipeline）。只等到上游应当已经应答的时间点（见
                             // `hedge_timeout`），之后自己转发。
-                            if let Ok(Ok(())) = tokio::time::timeout(join_wait, rx.changed()).await
-                            {
+                            // 开了流控时这次等待也看卡没卡住，卡住不等了的失败原样交回（见
+                            // `PermitManager::join`、`UpstreamFailure::withheld`）
+                            // With flow control on this wait too is seen to for being stuck, and
+                            // the failure of waiting no more goes back as it is (see
+                            // `PermitManager::join`, `UpstreamFailure::withheld`)
+                            let waiting = tokio::time::timeout(join_wait, rx.changed());
+                            let joined = match &engine.flow_control_state {
+                                Some(flow) => {
+                                    Box::pin(crate::engine::upstream::wait_for_another(
+                                        engine,
+                                        flow,
+                                        peer.ip(),
+                                        &upstream,
+                                        upstream_timeout,
+                                        waiting,
+                                    ))
+                                    .await?
+                                }
+                                None => waiting.await,
+                            };
+                            if let Ok(Ok(())) = joined {
                                 if let Some((observer, ctx)) = observed {
                                     observer.inflight_joined(ctx);
                                 }
@@ -987,6 +1031,7 @@ pub(crate) async fn process_response_jump(
                         transport,
                         pre_split_upstreams.as_ref(),
                         observed,
+                        (!skip_cache).then(|| peer.ip()),
                     )
                     .await
                 };
@@ -1066,6 +1111,7 @@ pub(crate) async fn process_response_jump(
                             qname,
                             qtype,
                             client_ip: peer.ip(),
+                            asker: (!skip_cache).then(|| peer.ip()),
                             upstream_default: cfg.settings.default_upstream.as_str(),
                             pipeline_id: &pipeline_id,
                             rule_name: &rule_name,
@@ -1147,7 +1193,15 @@ pub(crate) async fn process_response_jump(
                         // A background refresh answers no client, so it gets the failure
                         // itself (see handle_forward_decision_logged).
                         // 后台刷新没有要应答的客户端，失败原样交回（同 handle_forward_decision_logged）。
-                        if skip_cache || err.downcast_ref::<UpstreamFailure>().is_none() {
+                        // 流控没让等的失败也原样交回：那是这台设备自己的事，不交给等着的别的请求（见
+                        // `UpstreamFailure::withheld`）
+                        // A failure with flow control keeping the query from waiting goes back as
+                        // it is too: the device's own affair, not handed to the other requests
+                        // waiting (see `UpstreamFailure::withheld`)
+                        if skip_cache
+                            || err.downcast_ref::<UpstreamFailure>().is_none()
+                            || UpstreamFailure::was_withheld(&err)
+                        {
                             return Err(err);
                         }
                         let resp_bytes = engine_helpers::build_servfail_response(req)?;
