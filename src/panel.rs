@@ -818,7 +818,13 @@ impl PanelMetrics {
         if series.with(key, &update).is_some() {
             return;
         }
-        if key.len() > MAX_METRIC_KEY_BYTES {
+        // 键太长，或者这一组已经满了：都加不进去，不必拿锁。满了的表不会再变小，而锁是全进程共用的：规则多过上限的
+        // 配置下，命中表外规则的每个查询都拿一次的话，几个核就互相等
+        // A key too long, or a set already full: neither can be added, so no lock is taken. A
+        // full table never shrinks, and the lock is shared by the whole process: with more rules
+        // than the limit, every query matching a rule outside the table taking it would have the
+        // cores wait on one another
+        if key.len() > MAX_METRIC_KEY_BYTES || series.len() >= MAX_METRIC_SERIES_PER_MAP {
             self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1631,9 +1637,7 @@ async fn handle_request(
             metrics.render_prometheus(&engine),
         ),
         (&Method::GET, "/v1/stats/top") => match parse_stats_query(request.uri().query()) {
-            Ok((window_seconds, limit)) => {
-                json_response(StatusCode::OK, metrics.stats_json(window_seconds, limit))
-            }
+            Ok((window_seconds, limit)) => stats_response(&metrics, window_seconds, limit).await,
             Err(message) => json_response(
                 StatusCode::BAD_REQUEST,
                 error_json("stats_query_invalid", message),
@@ -2355,10 +2359,46 @@ async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
         }
     };
 
+    validate_body(body).await
+}
+
+/// 排行的回答。算排行要把窗口里每个钟头的每一项合起来再排序（24 小时的窗口最多二十万项），放到阻塞线程池里做，
+/// 不占着处理 DNS 的线程
+/// The answer with the rankings. Working them out merges every entry of every hour in the
+/// window and sorts them (up to two hundred thousand entries for a 24-hour window), so it runs on
+/// the blocking thread pool and holds no thread that serves DNS
+#[cfg(unix)]
+async fn stats_response(
+    metrics: &Arc<PanelMetrics>,
+    window_seconds: u64,
+    limit: usize,
+) -> Response<Full<Bytes>> {
+    let counting = Arc::clone(metrics);
+    match tokio::task::spawn_blocking(move || counting.stats_json(window_seconds, limit)).await {
+        Ok(stats) => json_response(StatusCode::OK, stats),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("stats_failed", &error.to_string()),
+        ),
+    }
+}
+
+/// 校验一份配置，给出回答。校验放到阻塞线程池里做，和取查询日志一样：它要解析整份配置、编译每条正则、读 DoH 的
+/// 证书文件，规则多的配置要几十到几百毫秒，在处理请求的线程上做的话，排在这个线程上的 DNS 查询这期间都等着
+/// Validates a configuration and gives the answer. The validation runs on the blocking thread
+/// pool, as taking the query log does: it parses the whole configuration, compiles every regex
+/// and reads the DoH certificate files, tens to hundreds of milliseconds for a configuration
+/// with many rules, during which the DNS queries queued on a thread serving requests would wait
+#[cfg(unix)]
+async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
     // 与引擎启动完全相同的校验路径，含监听地址与 DoH 证书检查。
     // The exact validation the engine runs at startup, listener and DoH checks included.
-    match crate::config::validate(std::str::from_utf8(&body).unwrap_or_default()) {
-        Ok(report) => json_response(
+    let validated = tokio::task::spawn_blocking(move || {
+        crate::config::validate(std::str::from_utf8(&body).unwrap_or_default())
+    })
+    .await;
+    match validated {
+        Ok(Ok(report)) => json_response(
             StatusCode::OK,
             json!({
                 "protocol_version": PROTOCOL_VERSION,
@@ -2367,7 +2407,11 @@ async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
                 "rule_count": report.rule_count,
             }),
         ),
-        Err(error) => respond(config_invalid(&error)),
+        Ok(Err(error)) => respond(config_invalid(&error)),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("config_validate_failed", &error.to_string()),
+        ),
     }
 }
 
@@ -3098,6 +3142,120 @@ mod tests {
     #[test]
     fn escapes_prometheus_labels() {
         assert_eq!(super::escape_label("a\\b\n\"c"), "a\\\\b\\n\\\"c");
+    }
+
+    /// 一组统计项满了以后，再来的新名字只记一次丢弃，不去拿加统计项的那把锁。这把锁全进程共用；规则多过上限的配置下，
+    /// 以前命中表外规则的每个查询都要拿它一次，几个核互相等
+    /// Once a set of series is full, a further new name counts one dropped series and does not
+    /// take the lock that adds a series. That lock is shared by the whole process; with more rules
+    /// than the limit, every query matching a rule outside the table used to take it, the cores
+    /// waiting on one another
+    #[test]
+    fn a_full_set_of_series_takes_no_lock_for_a_new_name() {
+        let metrics = std::sync::Arc::new(PanelMetrics::default());
+        for index in 0..MAX_METRIC_SERIES_PER_MAP {
+            metrics.record_pipeline_hit(&format!("pipeline-{index}"));
+        }
+        let held = metrics.metric_series_insert_lock.lock();
+        let (done, counted) = std::sync::mpsc::channel();
+        let counting = std::sync::Arc::clone(&metrics);
+        let worker = std::thread::spawn(move || {
+            counting.record_pipeline_hit("one-more");
+            let _ = done.send(());
+        });
+        let counted = counted.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        worker.join().unwrap();
+        assert!(counted.is_ok(), "counting a new name waited for the lock");
+        assert_eq!(
+            metrics.metric_series_dropped.load(super::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.pipeline_hits.len(), MAX_METRIC_SERIES_PER_MAP);
+    }
+
+    /// 校验配置的活不占着处理 DNS 的线程：校验一份大配置的时候，运行时照常干别的。以前校验就在收到请求的那个线程上
+    /// 做，规则多的配置要几十到几百毫秒，这期间排在这个线程上的查询都等着；只有一个核的设备上所有查询都等着
+    /// Validating a configuration does not hold a thread that serves DNS: while a large
+    /// configuration is validated the runtime goes on with other work. Validation used to run on
+    /// the thread that took the request, tens to hundreds of milliseconds for a configuration
+    /// with many rules, with the queries queued on that thread waiting; on a single-core device,
+    /// every query
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validating_a_configuration_leaves_the_runtime_free() {
+        let rules: Vec<serde_json::Value> = (0..1000)
+            .map(|n| {
+                serde_json::json!({
+                    "name": format!("rule-{n}"),
+                    "matchers": [{ "type": "domain_regex", "value": format!(r"^(ads?|track\d*)\.site{n}\.example$") }],
+                    "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }]
+                })
+            })
+            .collect();
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": rules }]
+        })
+        .to_string();
+        // 运行时上的另一件活：每轮到一次就数一下 / Other work on the runtime, counting each turn it gets
+        let turns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counting = std::sync::Arc::clone(&turns);
+        let other = tokio::spawn(async move {
+            loop {
+                counting.fetch_add(1, super::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let before = turns.load(super::Ordering::Relaxed);
+        let response = super::validate_body(bytes::Bytes::from(config)).await;
+        let during = turns.load(super::Ordering::Relaxed) - before;
+        other.abort();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert!(
+            during > 1000,
+            "the runtime had {during} turns for other work while validating"
+        );
+    }
+
+    /// 算排行也不占着处理 DNS 的线程：几个钟头、几万个名字的排行在算的时候，运行时照常干别的
+    /// Working out the rankings holds no thread that serves DNS either: with several hours and
+    /// tens of thousands of names to rank, the runtime goes on with other work meanwhile
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn working_out_the_rankings_leaves_the_runtime_free() {
+        let metrics = std::sync::Arc::new(PanelMetrics::default());
+        let now = super::unix_timestamp();
+        for hour in 0..6u64 {
+            for n in 0..8_000u32 {
+                metrics.query_stats.record_at(
+                    &format!("name{n}.hour{hour}.example"),
+                    std::net::IpAddr::from([10, 0, (n >> 8) as u8, n as u8]),
+                    now - hour * 3_600,
+                );
+            }
+        }
+        let turns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counting = std::sync::Arc::clone(&turns);
+        let other = tokio::spawn(async move {
+            loop {
+                counting.fetch_add(1, super::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let before = turns.load(super::Ordering::Relaxed);
+        let response = super::stats_response(&metrics, 86_400, 20).await;
+        let during = turns.load(super::Ordering::Relaxed) - before;
+        other.abort();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert!(
+            during > 1000,
+            "the runtime had {during} turns for other work while ranking"
+        );
     }
 
     #[test]

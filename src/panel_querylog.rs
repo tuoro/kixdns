@@ -846,9 +846,7 @@ fn encode_record<'a, N: std::ops::Deref<Target = str>>(
             .map_or(0, |transport| client_transport_code(transport) + 1),
     );
     out.text(head.qname);
-    // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
-    // hickory's `Display` writes it, without allocating a string first
-    out.text(<&'static str>::from(head.qtype));
+    out.text(type_name(head.qtype, &mut [0; 9]));
     out.number(u64::try_from(outcome.latency.as_micros()).unwrap_or(u64::MAX));
     out.byte(status_code(status));
     out.byte(outcome_code(result));
@@ -1243,11 +1241,42 @@ impl Default for QueryLog {
     }
 }
 
+/// 一份日志的标识：随机取的 1 到 2^53−1（写进 JSON 是个整数，谁读都装得下）。面板拿它认出内核重启过、手里的位置
+/// 作废。以前用的是启动时刻的毫秒数：没有时钟电池的设备每次开机时钟从同一个时刻走起，两次启动撞上同一毫秒时面板
+/// 认不出重启，它手里那个超前的位置会让内核把交接区里的记录当成已经存好的删掉
+/// A log's identity: a random number from 1 to 2^53−1 (a whole number in JSON that any reader
+/// holds). The panel knows by it that the kernel restarted and the position it holds is void. It
+/// used to be the start time in milliseconds: on a device without a clock battery the clock
+/// starts from the same moment at every boot, and with two starts on the same millisecond the
+/// panel saw no restart, and the position it held, ahead of the new log, had the kernel delete
+/// the records in the ring as already stored
+fn new_instance() -> u64 {
+    (rand::random::<u64>() >> 11).max(1)
+}
+
+/// 记录类型写成什么：有名字的照 hickory `Display` 的写法，不分配字符串；没有名字的写成 `TYPE` 加类型号（RFC 3597
+/// 第 5 节），写进 `buf`。以前没有名字的一律写成 `Unknown`，看不出问的是哪一种
+/// How a record type is written: one with a name as hickory's `Display` writes it, with no
+/// string allocated; one without as `TYPE` and its number (RFC 3597 section 5), written into
+/// `buf`. One without a name used to be written `Unknown`, whichever type was asked
+fn type_name(qtype: RecordType, buf: &mut [u8; 9]) -> &str {
+    use std::io::Write;
+    let RecordType::Unknown(number) = qtype else {
+        return <&'static str>::from(qtype);
+    };
+    let mut rest = &mut buf[..];
+    // `TYPE65535` 正好 9 个字节，写得下 / `TYPE65535` is exactly 9 bytes and fits
+    let _ = write!(rest, "TYPE{number}");
+    let left = rest.len();
+    let written = buf.len() - left;
+    std::str::from_utf8(&buf[..written]).unwrap_or("TYPE")
+}
+
 impl QueryLog {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             epoch: Instant::now(),
-            instance: unix_ms(),
+            instance: new_instance(),
             capacity,
             max_pending: MAX_PENDING,
             collected: AtomicU64::new(1),
@@ -3198,10 +3227,8 @@ mod tests {
             }
             json.key("qname");
             json.text(&pending.qname);
-            // 记录类型的写法就是 hickory `Display` 用的那个，不必先分配一个字符串 / The type is written as
-            // hickory's `Display` writes it, without allocating a string first
             json.key("qtype");
-            json.text(<&'static str>::from(pending.qtype));
+            json.text(type_name(pending.qtype, &mut [0; 9]));
             json.key("latency_us");
             json.number(latency_us);
             json.key("status");
@@ -4001,6 +4028,47 @@ mod tests {
         // 接着记的从 4 开始 / What is recorded next starts at 4
         cancelled(&log, 4..=4);
         assert_eq!(seqs(&page(&log, 3, 10)), [4]);
+    }
+
+    /// 没有名字的记录类型写成 `TYPE` 加类型号（RFC 3597 的写法），看得出问的是哪一种。以前一律写成 `Unknown`
+    /// A record type without a name is written `TYPE` and its number (as RFC 3597 writes it), so
+    /// it shows which type was asked. It used to be written `Unknown` whatever the number
+    #[test]
+    fn a_type_without_a_name_is_written_with_its_number() {
+        let log = QueryLog::default();
+        let _ = entries(&log);
+        for (id, qtype, written) in [
+            (7, RecordType::Unknown(65280), "TYPE65280"),
+            (8, RecordType::Unknown(999), "TYPE999"),
+            (9, RecordType::HTTPS, "HTTPS"),
+        ] {
+            let mut request = ctx(id);
+            request.qtype = qtype;
+            log.request_started(&request, false);
+            finish(&log, &request, RequestStatus::Completed, None);
+            let entry = entries(&log).pop().expect("one record");
+            assert_eq!(entry["qtype"], written);
+        }
+    }
+
+    /// 每次启动的日志有自己的标识：面板靠它认出内核重启过、手里的位置作废。以前标识就是启动时刻的毫秒数，同一
+    /// 毫秒里建的两份日志标识相同；没有时钟电池的设备每次开机时钟从同一个时刻走起，两次启动可能撞上
+    /// Each start's log has an identity of its own, by which the panel knows the kernel restarted
+    /// and the position it holds is void. The identity used to be the start time in milliseconds,
+    /// the same for two logs made within one millisecond; on a device without a clock battery
+    /// the clock starts from the same moment at every boot, so two starts could coincide
+    #[test]
+    fn every_log_has_an_identity_of_its_own() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let instance = QueryLog::default().instance;
+            assert!(instance > 0, "0 is no identity");
+            assert!(instance < 1 << 53, "a whole number any JSON reader takes");
+            assert!(
+                seen.insert(instance),
+                "two logs share the identity {instance}"
+            );
+        }
     }
 
     #[test]
