@@ -84,6 +84,8 @@ pub mod transport;
 #[cfg(test)]
 mod txt_answer_tests;
 pub mod types;
+#[cfg(test)]
+mod udp_resend_tests;
 pub mod upstream;
 #[cfg(test)]
 mod upstream_reply_tests;
