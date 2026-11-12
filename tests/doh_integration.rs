@@ -542,15 +542,11 @@ async fn test_doh_post_body_at_limit_still_processed() {
         .await
         .expect("POST request");
 
-    // The question is not readable, so the engine answers SERVFAIL; what
-    // matters here is that the size guard let it through.
+    // The question is not readable, so the answer is FORMERR, as over UDP and
+    // TCP; what matters here is that the size guard let it through.
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body = resp.bytes().await.expect("read body");
-    assert_eq!(
-        body[3] & 0x0F,
-        0x02,
-        "RCODE = SERVFAIL for unparseable wire"
-    );
+    assert_eq!(body[3] & 0x0F, 0x01, "RCODE = FORMERR for unparseable wire");
 }
 
 // ============================================================================

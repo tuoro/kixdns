@@ -116,11 +116,10 @@ pub fn formerr_reply(query: &[u8]) -> Bytes {
 /// Where the query's one question ends; None when its name has a compression pointer or
 /// is too long, or the question is cut short, as such a question cannot be copied to a reply
 fn plain_question_end(query: &[u8]) -> Option<usize> {
-    const MAX_NAME: usize = 255;
     let mut pos = 12usize;
     loop {
         let label = *query.get(pos)? as usize;
-        if label > 63 || pos - 12 + label + 1 > MAX_NAME {
+        if label > 63 || pos - 12 + label + 1 > MAX_NAME_LEN {
             return None;
         }
         pos += 1 + label;
@@ -134,6 +133,12 @@ fn plain_question_end(query: &[u8]) -> Option<usize> {
 
 /// DNS 报文头的长度 / The length of a DNS header
 const HEADER_LEN: usize = 12;
+
+/// 一个名字编码出来最多这么多字节，连同压缩指针跳过去读到的部分（RFC 1035 第 2.3.4 节）。读名字的每个函数都守
+/// 这一条
+/// The most bytes a name takes encoded, what a compression pointer leads to included (RFC
+/// 1035 section 2.3.4). Every function that reads a name keeps to it
+const MAX_NAME_LEN: usize = 255;
 
 /// 查询的第一个问题名读得了：标签、长度合规，压缩指针只往前指、不指进报文头（见 [`strict_name_end`]）。
 /// hickory 不管指针指不指进报文头，所以快速解析读不了、要交给 hickory 的查询先过这一关。
@@ -751,12 +756,19 @@ pub(crate) fn question_name_end(packet: &[u8]) -> Option<usize> {
     }
 }
 
-/// 跳过 DNS 名称并返回下一个位置 / Skip DNS name and return next position
+/// 跳过 DNS 名称并返回下一个位置。名字连同压缩指针跳过去读到的部分超过 [`MAX_NAME_LEN`] 时读不了：不数的话，
+/// 一长串标签被许多条记录的属主名指着时，每个名字都要把它走一遍，走一遍报文的步数是报文长度的平方
+/// Skip DNS name and return next position. A name longer than [`MAX_NAME_LEN`], what a
+/// compression pointer leads to included, cannot be read: uncounted, a long run of labels
+/// that the owners of many records point into is walked for each of them, and one walk of the
+/// message takes the square of its length in steps
 #[inline]
 fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
     let packet_len = packet.len();
     let mut encoded_end = None;
     let mut jumps = 0usize;
+    // 结尾的根标签占 1 字节 / The root label at the end takes 1 byte
+    let mut length = 1usize;
 
     loop {
         let len = *packet.get(pos)?;
@@ -786,6 +798,10 @@ fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
             return None;
         }
 
+        length += 1 + len as usize;
+        if length > MAX_NAME_LEN {
+            return None;
+        }
         let next = pos.checked_add(1 + len as usize)?;
         if next > packet_len {
             return None;
@@ -1598,7 +1614,7 @@ fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
             0 => return Some(end.unwrap_or(pos + 1)),
             1..=63 => {
                 length += 1 + len;
-                if length > 255 {
+                if length > MAX_NAME_LEN {
                     return None;
                 }
                 pos += 1 + len;
@@ -2203,6 +2219,80 @@ mod tests {
         packet.extend_from_slice(label);
         packet.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
         packet
+    }
+
+    /// 头部（附加段 `additional` 条记录）加问题 `a.`（A/IN）
+    /// A header (with `additional` records in the additional section) and the question `a.` (A/IN)
+    fn query_with_additional_count(additional: u16) -> Vec<u8> {
+        let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0];
+        packet.extend_from_slice(&additional.to_be_bytes());
+        packet.extend_from_slice(&[1, b'a', 0, 0, 1, 0, 1]);
+        packet
+    }
+
+    /// `labels` 个单字节标签加根：编码长 `2 * labels + 1` 字节 / `labels` one-byte labels and the
+    /// root: `2 * labels + 1` bytes encoded
+    fn label_run(labels: usize) -> Vec<u8> {
+        let mut run: Vec<u8> = std::iter::repeat_n([1u8, b'x'], labels).flatten().collect();
+        run.push(0);
+        run
+    }
+
+    /// 一个名字连同压缩指针跳过去读到的部分，总共不超过 255 字节（RFC 1035 第 2.3.4 节）。`skip_name` 以前不数：
+    /// 一条记录的 RDATA 里放一长串标签，后面每条记录的属主名都指进去，每个名字都要把这一长串走一遍。64 KiB 的
+    /// TCP 或 DoH 报文里放两千多条这样的记录，走一遍报文就是几千万步，一个查询要走好几遍
+    /// A name is at most 255 bytes in all, what a compression pointer leads to included (RFC 1035
+    /// section 2.3.4). `skip_name` did not count: with a long run of labels in one record's RDATA
+    /// and the owner of every later record pointing into it, each name walked the whole run. Over
+    /// two thousand such records in a 64 KiB TCP or DoH message made one walk of the message tens
+    /// of millions of steps, and a query is walked several times
+    #[test]
+    fn a_name_is_at_most_255_bytes_through_pointers_too() {
+        // 第一条附加记录的 RDATA 是一串标签，第二条的属主名指进去 / The first additional record's RDATA
+        // is a run of labels, and the second one's owner points into it
+        let pointing_into_a_run_of = |labels: usize| {
+            let mut packet = query_with_additional_count(2);
+            let run = label_run(labels);
+            packet.push(0);
+            packet.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 0]);
+            packet.extend_from_slice(&(run.len() as u16).to_be_bytes());
+            let run_at = packet.len();
+            packet.extend_from_slice(&run);
+            let second = packet.len();
+            packet.extend_from_slice(&[0xC0 | (run_at >> 8) as u8, run_at as u8]);
+            packet.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 192, 0, 2, 1]);
+            (packet, second)
+        };
+        // 127 个标签加根正好 255 字节 / 127 labels and the root come to exactly 255 bytes
+        let (packet, second) = pointing_into_a_run_of(127);
+        assert_eq!(skip_name(&packet, second), Some(second + 2));
+        assert_eq!(find_opt(&packet), Ok(None));
+
+        let (packet, second) = pointing_into_a_run_of(128);
+        assert_eq!(skip_name(&packet, second), None);
+        assert!(find_opt(&packet).is_err());
+
+        // 不经指针、直接写在原地的也一样 / The same for one written in place, with no pointer
+        let in_place = |labels: usize| {
+            let mut packet = query_with_additional_count(1);
+            let owner = packet.len();
+            packet.extend_from_slice(&label_run(labels));
+            packet.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 192, 0, 2, 1]);
+            (packet, owner)
+        };
+        let (packet, owner) = in_place(127);
+        assert_eq!(skip_name(&packet, owner), Some(owner + 255));
+        let (packet, owner) = in_place(128);
+        assert_eq!(skip_name(&packet, owner), None);
+
+        // 正好 256 字节：126 个单字节标签、一个两字节的标签，加根
+        // Exactly 256 bytes: 126 one-byte labels, one of two bytes, and the root
+        let mut packet = query_with_additional_count(1);
+        let owner = packet.len();
+        packet.extend_from_slice(&label_run(126)[..252]);
+        packet.extend_from_slice(&[2, b'y', b'y', 0]);
+        packet.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 192, 0, 2, 1]);
+        assert_eq!(skip_name(&packet, owner), None);
     }
 
     #[test]
