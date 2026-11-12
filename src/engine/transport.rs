@@ -67,16 +67,30 @@ type UdpInflightMap = DashMap<
     FxBuildHasher,
 >;
 
-/// drop 时从 `map` 里删掉 `id` 那一条，取消、提前返回或 panic 时也一样
-/// Removes `id` from `map` on drop, on cancellation, an early return or a panic too
-struct RemoveOnDrop<V> {
+/// 等着一个在途条目的回答的那一头：回答从 `rx` 来。放手时（拿到了回答、超时、取消、提前返回、panic）把 `map` 里
+/// `id` 下已经没人等的条目删掉：先关掉自己这一头再删，所以自己的条目一定删得掉。回答到了、读取任务把条目拿走以后，
+/// 这个 ID 可能已经分给了后来的查询，那一条有人等着，不动；以前按 ID 无条件删，会把后来的条目带走，它的回答到了
+/// 找不到条目，只能等到超时
+/// The end that waits for an in-flight entry's answer, which comes on `rx`. On letting go (with
+/// the answer, at a timeout, on cancellation, an early return or a panic) it removes the entry
+/// under `id` in `map` if nobody waits on it any more: its own end is closed first, so its own
+/// entry always goes. Once an answer has come and the reader has taken the entry, the ID may
+/// have gone to a later query, whose entry is waited on and stays; removing by ID whatever was
+/// there used to take that later entry along, so its answer found no entry and the query
+/// waited out its timeout
+struct Waiting<V> {
+    rx: oneshot::Receiver<anyhow::Result<Bytes>>,
     map: Arc<DashMap<u16, V, FxBuildHasher>>,
     id: u16,
+    /// 这个条目的回答是不是没人等了 / Whether nobody waits for this entry's answer any more
+    abandoned: fn(&V) -> bool,
 }
 
-impl<V> Drop for RemoveOnDrop<V> {
+impl<V> Drop for Waiting<V> {
     fn drop(&mut self) {
-        self.map.remove(&self.id);
+        self.rx.close();
+        self.map
+            .remove_if(&self.id, |_, entry| (self.abandoned)(entry));
     }
 }
 
@@ -391,9 +405,11 @@ impl UdpClient {
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // (e.g. timeout, cancel, early return)
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
-        let _guard = RemoveOnDrop {
+        let mut waiting = Waiting {
+            rx,
             map: state.inflight.clone(),
             id: new_id,
+            abandoned: |entry| entry.3.is_closed(),
         };
 
         if let Err(e) = state.socket.send_to(&new_packet, addr).await {
@@ -401,7 +417,7 @@ impl UdpClient {
             return Err(e.into());
         }
 
-        match timeout(timeout_dur, rx).await {
+        match timeout(timeout_dur, &mut waiting.rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => {
                 // Channel closed by receiver (should not happen normally unless logic error or panic)
@@ -765,23 +781,37 @@ impl DotMultiplexer {
     }
 }
 
+/// 一条连接：它的写入队列（见 [`WriteQueue`]）、它是第几代、停掉它的读取和写入任务的令牌。三样放在一起、在同一把
+/// 锁下，拆连接时才说得清拆的是哪一条
+/// One connection: its write queue (see [`WriteQueue`]), which generation it is, and the token
+/// that stops its reader and writer. The three sit together under one lock, so a teardown can
+/// say which connection it means
+struct Live {
+    queue: Arc<WriteQueue>,
+    generation: u64,
+    cancel: CancellationToken,
+}
+
 /// 一个上游的一条多路复用连接（TCP 或 DoT）/ One multiplexed connection to an upstream (TCP or DoT)
 pub struct StreamMuxClient<T: StreamTransport> {
     pub upstream: Arc<str>,
     /// 建连用的共享部分 / What connects share
     shared: T::Shared,
-    /// 这条连接的写入队列（见 [`WriteQueue`]），没有连接时是 None。锁同时把查询的登记和连接的拆除
-    /// 排出先后
-    /// The connection's write queue (see [`WriteQueue`]), None without a connection. The lock
-    /// also orders a query's registration against the connection's teardown
-    conn: Arc<Mutex<Option<Arc<WriteQueue>>>>,
+    /// 现在的连接，没有时是 None。锁同时把查询的登记和连接的拆除排出先后
+    /// The connection now, None without one. The lock also orders a query's registration
+    /// against the connection's teardown
+    conn: Arc<Mutex<Option<Live>>>,
     /// 这个客户端上还没答完的查询数（见 [`BUSY_AT`]）/ Queries on this client not yet answered (see [`BUSY_AT`])
     in_flight: AtomicUsize,
     pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
-    /// Generation counter to detect stale readers
-    /// 代数计数器，用于检测过期的 reader (Wrapped in Arc for sharing with spawned tasks)
+    /// 最近建的那条连接是第几代，从 1 起，建连时在连接锁下加一。拆连接的决定都点名一代（见 `close_locked`）
+    /// The generation of the connection made last, from 1, raised under the connection lock as a
+    /// connection is made. Every decision to tear one down names a generation (see `close_locked`)
     generation: Arc<AtomicU64>,
+    /// 欠着要拆的那一代，0 是不欠（见 `reset_after_deadline`）/ The generation whose teardown is
+    /// owed, 0 for none (see `reset_after_deadline`)
+    reset_owed: AtomicU64,
     /// 健康检查：连续错误计数 / Health check: consecutive error count
     consecutive_errors: AtomicUsize,
     /// 健康检查的设置 / Health check settings
@@ -792,8 +822,9 @@ pub struct StreamMuxClient<T: StreamTransport> {
     last_request_time: AtomicU64,
     /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
     last_health_check_time: AtomicU64,
-    /// 这条连接的读取和写入任务的取消令牌 / Cancels the connection's reader and writer tasks
-    conn_cancel: Mutex<CancellationToken>,
+    /// 客户端被丢掉时取消：每条连接的令牌都是它的子令牌 / Cancelled when the client is dropped:
+    /// every connection's token is a child of it
+    stop: CancellationToken,
     /// 这条客户端的 reader 读到的应答帧总数。查询超时时拿它判断连接是不是还活着：
     /// 本查询排进写入队列之后数字涨过，说明连接照常在回答，慢的只是这一个
     /// Answer frames this client's readers have read. A timed-out query uses it to
@@ -925,7 +956,7 @@ where
 /// open while they run.
 impl<T: StreamTransport> Drop for StreamMuxClient<T> {
     fn drop(&mut self) {
-        self.conn_cancel.get_mut().cancel();
+        self.stop.cancel();
     }
 }
 
@@ -953,12 +984,13 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
             generation: Arc::new(AtomicU64::new(0)),
+            reset_owed: AtomicU64::new(0),
             consecutive_errors: AtomicUsize::new(0),
             health,
             conn_create_time: AtomicU64::new(0),
             last_request_time: AtomicU64::new(0),
             last_health_check_time: AtomicU64::new(0),
-            conn_cancel: Mutex::new(CancellationToken::new()),
+            stop: CancellationToken::new(),
             answers_read: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -997,15 +1029,12 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     }
                     result = reader.read_exact(&mut len_buf) => {
                         if let Err(err) = result {
-                            // Check generation again before resetting anything
-                            if global_generation.load(Ordering::Relaxed) == my_generation {
+                            // 拆的是这个读取任务自己的那一代；已经换了代就什么都不动
+                            // The generation this reader belongs to is what goes; one already
+                            // replaced is left alone
+                            let why = format!("{} read len failed", T::LABEL);
+                            if Self::close(&pending, &conn, my_generation, &why).await {
                                 debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read len failed", T::LABEL);
-                                Self::fail_all_async(
-                                    &pending,
-                                    anyhow::anyhow!("{} read len failed", T::LABEL),
-                                    &conn,
-                                )
-                                .await;
                             } else {
                                 debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader failed but generation changed, ignoring", T::NAME);
                             }
@@ -1029,15 +1058,9 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     }
                     result = reader.read_exact(&mut reusable_buf[..resp_len]) => {
                         if let Err(err) = result {
-                            // Check generation again
-                            if global_generation.load(Ordering::Relaxed) == my_generation {
+                            let why = format!("{} read body failed", T::LABEL);
+                            if Self::close(&pending, &conn, my_generation, &why).await {
                                 debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read body failed", T::LABEL);
-                                Self::fail_all_async(
-                                    &pending,
-                                    anyhow::anyhow!("{} read body failed", T::LABEL),
-                                    &conn,
-                                )
-                                .await;
                             }
                             break;
                         }
@@ -1123,7 +1146,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         cancel_token: CancellationToken,
         my_generation: u64,
     ) {
-        let global_generation = Arc::clone(&self.generation);
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
@@ -1134,14 +1156,9 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 err = write_frames(writer, &queue) => err,
             };
             cancel_token.cancel();
-            if global_generation.load(Ordering::Relaxed) == my_generation {
+            let why = format!("{} write failed", T::LABEL);
+            if Self::close(&pending, &conn, my_generation, &why).await {
                 debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} write failed", T::LABEL);
-                Self::fail_all_async(
-                    &pending,
-                    anyhow::anyhow!("{} write failed", T::LABEL),
-                    &conn,
-                )
-                .await;
             }
         });
     }
@@ -1155,7 +1172,13 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     /// counter is cleared to avoid immediate re-triggering on the next error.
     ///
     /// 当错误阈值超过时，连接会被重置，错误计数器会被清零以避免下次错误时立即重新触发。
-    async fn record_error(&self) -> bool {
+    async fn record_error(&self, generation: u64) -> bool {
+        // 出错的那条连接已经换掉了：这个错误不算在替它的连接头上
+        // The connection that erred has been replaced: the error does not count against the
+        // one in its place
+        if self.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
         let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
         // 阈值 0 表示禁用健康检查（README 与 config.rs 如此描述），
         // 而不是"每次错误都重置连接"。
@@ -1180,10 +1203,11 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 "{} connection error threshold exceeded, resetting connection",
                 T::NAME
             );
-            self.reset().await;
             // Clear error counter to avoid immediate re-triggering on next error
             // 清零错误计数器，避免下次错误时立即重新触发
-            self.consecutive_errors.store(0, Ordering::Release);
+            if self.reset(generation).await {
+                self.consecutive_errors.store(0, Ordering::Release);
+            }
             true // Connection was reset / 连接已重置
         } else {
             false // Connection was not reset / 连接未重置
@@ -1205,6 +1229,12 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     /// 如果连接被重置返回 true，否则返回 false。
     async fn check_connection_health(&self) -> bool {
         let now = unix_time_millis();
+        // 先记下看的是哪一代，再读它的时刻：几个查询可能同时判断「该拆了」，后到的那个动手时连接也许已经
+        // 换成新的，它拆的还得是当初看的那一代
+        // Which generation is looked at is noted first, its times read after: several queries may
+        // decide together that it has to go, and by the time the later one acts the connection
+        // may have been replaced; what it tears down must still be the generation it looked at
+        let generation = self.generation.load(Ordering::Acquire);
 
         // Check connection aging / 检查连接老化
         let create_time = self.conn_create_time.load(Ordering::Acquire);
@@ -1219,10 +1249,11 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     "{} connection too old, resetting",
                     T::NAME
                 );
-                self.reset().await;
                 // Clear error counter since we're starting fresh
                 // 清零错误计数器，因为我们重新开始
-                self.consecutive_errors.store(0, Ordering::Release);
+                if self.reset(generation).await {
+                    self.consecutive_errors.store(0, Ordering::Release);
+                }
                 return true;
             }
         }
@@ -1240,10 +1271,11 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     "{} connection idle timeout, resetting",
                     T::NAME
                 );
-                self.reset().await;
                 // Clear error counter since we're starting fresh
                 // 清零错误计数器，因为我们重新开始
-                self.consecutive_errors.store(0, Ordering::Release);
+                if self.reset(generation).await {
+                    self.consecutive_errors.store(0, Ordering::Release);
+                }
                 return true;
             }
         }
@@ -1341,13 +1373,18 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 upstream = self.upstream
             );
         };
-        let new_id = registered?;
+        // 登记在哪一代连接上：之后要拆连接、要记错误，说的都是这一代
+        // The generation of the connection it registered on: a later teardown or a recorded
+        // error means this one
+        let (new_id, generation) = registered?;
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
-        let _guard = RemoveOnDrop {
+        let mut waiting = Waiting {
+            rx,
             map: self.pending.clone(),
             id: new_id,
+            abandoned: |pending| pending.tx.is_closed(),
         };
 
         let answers_at_queue = self.answers_read.load(Ordering::Acquire);
@@ -1371,7 +1408,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         }
         let final_remaining = timeout_dur - elapsed_after_queue;
 
-        let resp = match timeout(final_remaining, rx).await {
+        let resp = match timeout(final_remaining, &mut waiting.rx).await {
             Ok(Ok(Ok(response))) => {
                 // Record success and clear error count
                 // 记录成功并清零错误计数
@@ -1391,7 +1428,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
                 // Record error but DO NOT reset - Mux handles ignored responses
                 // 记录错误但不重置 - Mux 会处理被忽略的响应
-                self.record_error().await;
+                self.record_error(generation).await;
                 return Err(anyhow::anyhow!(
                     "{name} response canceled for upstream {upstream}",
                     name = T::NAME,
@@ -1420,7 +1457,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 // (see `reset_after_deadline`)
                 // 时限内没有回答，连接也没了动静（多半已死或卡住）：复位它，锁被占着时交给下一次建连去
                 // 复位（见 `reset_after_deadline`）
-                self.reset_after_deadline().await;
+                self.reset_after_deadline(generation).await;
 
                 return Err(anyhow::anyhow!(
                     "{name} response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
@@ -1443,10 +1480,21 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         let started = tokio::time::Instant::now();
         // First, check if we need to reconnect based on error state
-        // 首先，根据错误状态检查是否需要重连
+        // 首先，根据错误状态检查是否需要重连。要拆的是欠着的那一代（见 `reset_after_deadline`），或者记着错误的
+        // 这一代：先记下是哪一代再看错误数，拆的时候连接已经换过就什么都不动
+        // What has to go is the generation whose teardown is owed (see `reset_after_deadline`), or
+        // this one if it has errors recorded: the generation is noted before the errors are read,
+        // and a connection replaced by the time of the teardown is left alone
+        let owed = self.reset_owed.load(Ordering::Acquire);
+        let current = self.generation.load(Ordering::Acquire);
         let errors = self.consecutive_errors.load(Ordering::Acquire);
+        let to_reset = if owed != 0 {
+            Some(owed)
+        } else {
+            (errors > 0).then_some(current)
+        };
 
-        if errors > 0 {
+        if let Some(generation) = to_reset {
             debug!(
                 upstream = %self.upstream,
                 consecutive_errors = errors,
@@ -1457,13 +1505,21 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             // An owed reset keeps to the budget too: with registrations holding the lock
             // ahead of it, it must not wait past the deadline; if unfinished, the next
             // connect does it
-            if timeout(budget, self.reset()).await.is_err() {
+            if timeout(budget, self.reset(generation)).await.is_err() {
                 anyhow::bail!(
                     "{} timeout resetting the connection after {}ms",
                     T::LABEL,
                     budget.as_millis()
                 );
             }
+            // 做完了才销账；这期间又欠了别的一代就留着 / The debt is cleared only once done; another
+            // generation owed meanwhile stays
+            let _ = self.reset_owed.compare_exchange(
+                generation,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
 
         // 等连接锁也算在预算里：前面有查询占着锁时，不能等过自己的时限
@@ -1483,27 +1539,24 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         if guard.is_none() {
             let (read_half, write_half) = T::connect(&self.shared, &self.upstream, budget).await?;
             let queue = Arc::new(WriteQueue::default());
-            *guard = Some(Arc::clone(&queue));
 
             // Increment generation for new connection
             // 为新连接增加代数
-            let new_gen = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            let new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
 
-            // Create fresh cancellation token for this connection lifecycle
-            // 为此连接生命周期创建新的取消令牌
-            let new_token = CancellationToken::new();
+            // 这条连接自己的取消令牌；客户端被丢掉时也跟着取消
+            // The connection's own cancellation token, cancelled with the client too
+            let new_token = self.stop.child_token();
 
             // Spawn reader and writer while holding the lock to prevent races
             // 持有锁时启动读取和写入任务以防止竞争
             self.spawn_reader(read_half, new_token.clone(), new_gen);
-            self.spawn_writer(write_half, queue, new_token.clone(), new_gen);
-
-            // Store token AFTER spawn so reset() can only cancel live tasks
-            // 在 spawn 之后存储 token，确保 reset() 只能取消已启动的任务
-            {
-                let mut token_guard = self.conn_cancel.lock().await;
-                *token_guard = new_token;
-            }
+            self.spawn_writer(write_half, Arc::clone(&queue), new_token.clone(), new_gen);
+            *guard = Some(Live {
+                queue,
+                generation: new_gen,
+                cancel: new_token,
+            });
 
             // 设置连接创建时间
             // Set connection creation time
@@ -1529,7 +1582,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         packet: &[u8],
         original_id: u16,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<u16> {
+    ) -> anyhow::Result<(u16, u64)> {
         // Build complete TCP/DoT wire frame (2-byte length prefix + DNS message). The same
         // buffer stays in the pending entry for the answer's question check, as on UDP.
         // 构建完整 TCP/DoT wire frame（2 字节长度前缀 + DNS 消息）。同一份缓冲还留在 pending 条目里
@@ -1541,9 +1594,10 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
         // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
         let conn_guard = self.conn.lock().await;
-        let Some(queue) = conn_guard.as_ref() else {
+        let Some(live) = conn_guard.as_ref() else {
             anyhow::bail!("connection closed before registration");
         };
+        let (queue, generation) = (&live.queue, live.generation);
 
         let mut tries = 0;
         let new_id = loop {
@@ -1581,34 +1635,59 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             }
         };
         drop(conn_guard);
-        Ok(new_id)
+        Ok((new_id, generation))
     }
 
-    async fn fail_all_async(
+    /// 拆掉第 `generation` 代连接，等连接锁（见 [`close_locked`](Self::close_locked)）。登记也拿这把锁，所以一个查询
+    /// 要么在拆之前登记上、被告知失败，要么看到连接已经没了
+    /// Tears down the connection of `generation`, waiting for the connection lock (see
+    /// [`close_locked`](Self::close_locked)). Registration takes the same lock, so a query either
+    /// registers before the teardown and is told of the failure, or finds the connection gone
+    async fn close(
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
-        err: anyhow::Error,
-        conn: &Arc<Mutex<Option<Arc<WriteQueue>>>>,
-    ) {
-        // Hold the connection lock while resetting and draining. register_pending uses the same
-        // lock, so it either registers before this drain or observes the closed connection.
-        let mut conn_guard = conn.lock().await;
-        Self::fail_all_locked(pending, err, &mut conn_guard);
+        conn: &Arc<Mutex<Option<Live>>>,
+        generation: u64,
+        why: &str,
+    ) -> bool {
+        let mut slot = conn.lock().await;
+        Self::close_locked(pending, &mut slot, generation, why)
     }
 
-    /// [`fail_all_async`](Self::fail_all_async)，连接锁已经拿在手里 / [`fail_all_async`](Self::fail_all_async) with the connection lock already held
-    fn fail_all_locked(
+    /// 连接锁已经拿在手里，拆掉第 `generation` 代连接：停掉它的读取和写入任务，丢掉写入队列，让等在它上面的
+    /// 查询都以 `why` 失败。现在的连接不是这一代（已经换成新的，或者已经拆了）就什么都不做，返回 false。
+    ///
+    /// 拆连接的决定都是对着某一条连接作的：它空闲太久了、它读写失败了、它上面的查询超时了。作出决定到拿到锁
+    /// 之间连接可能已经换过，这个决定不能落到替它的那条上：那会让刚建好的连接白建，登记在它上面的查询失败
+    ///
+    /// With the connection lock held, tears down the connection of `generation`: its reader and
+    /// writer are stopped, its write queue dropped, and the queries waiting on it fail with
+    /// `why`. When the connection now is not of that generation (replaced by a new one, or torn
+    /// down already) nothing is done and false comes back.
+    ///
+    /// Every decision to tear a connection down is made about one connection: it sat idle too
+    /// long, its read or write failed, a query on it timed out. Between the decision and the
+    /// lock the connection may have been replaced, and the decision must not land on the one in
+    /// its place, which would waste a connection just made and fail the queries registered on it
+    fn close_locked(
         pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
-        err: anyhow::Error,
-        conn_guard: &mut Option<Arc<WriteQueue>>,
-    ) {
-        let err_msg = err.to_string();
-        *conn_guard = None;
+        slot: &mut Option<Live>,
+        generation: u64,
+        why: &str,
+    ) -> bool {
+        let Some(live) = slot.take_if(|live| live.generation == generation) else {
+            return false;
+        };
+        live.cancel.cancel();
+        // 等着的查询都在这一代上：登记要拿这把锁、要有连接在，而这一代之前的在各自拆的时候清过了
+        // Every waiting query is on this generation: registering takes this lock and needs a
+        // connection, and those before this generation were cleared as theirs was torn down
         let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
         for key in keys {
             if let Some((_, p)) = pending.remove(&key) {
-                let _ = p.tx.send(Err(anyhow::anyhow!(err_msg.clone())));
+                let _ = p.tx.send(Err(anyhow::anyhow!(why.to_owned())));
             }
         }
+        true
     }
 
     /// Reset connection: cancel the reader and writer tasks, then drop the write queue and
@@ -1624,36 +1703,35 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     /// 取消令牌中断读取任务阻塞的读和写入任务阻塞的写，使它们立即退出而非泄漏连接。reader 没了，
     /// 这条连接上还在等的查询再也等不到回答，所以立刻让它们失败：各自可以换新连接重发，
     /// 而不是干等到截止时间、再轮流把下一条连接也重置掉。
-    async fn reset(&self) {
-        self.conn_cancel.lock().await.cancel();
-        Self::fail_all_async(
-            &self.pending,
-            anyhow::anyhow!("{} connection reset", T::NAME),
-            &self.conn,
-        )
-        .await;
+    ///
+    /// 拆的是第 `generation` 代；现在的连接已经不是它就什么都不做，返回 false（见 `close_locked`）
+    /// What goes is the connection of `generation`; when the connection now is another, nothing
+    /// is done and false comes back (see `close_locked`)
+    async fn reset(&self, generation: u64) -> bool {
+        let why = format!("{} connection reset", T::NAME);
+        Self::close(&self.pending, &self.conn, generation, &why).await
     }
 
     /// 时限已经到了的查询复位连接。连接锁空着就马上复位；被别人拿着时（多半是排着队的登记）不等，
-    /// 记一次错误，下一次建连会先复位（见 `ensure_connection`）。以前这里一直等锁，排在长队后面的
+    /// 记下欠着拆哪一代，下一次建连会先拆它（见 `ensure_connection`）。以前这里一直等锁，排在长队后面的
     /// 查询要远远超出时限才返回。
     /// Reset the connection for a query whose deadline has passed. With the
     /// connection lock free it resets at once; held by someone else (most likely a
-    /// queue of registrations) it does not wait but records an error, and the next connect
-    /// resets first (see `ensure_connection`). It used to wait for the lock, so a
-    /// query at the back of a long queue returned far past its deadline.
-    async fn reset_after_deadline(&self) {
-        let Ok(mut conn) = self.conn.try_lock() else {
-            self.consecutive_errors.fetch_add(1, Ordering::Release);
+    /// queue of registrations) it does not wait but notes which generation is owed a teardown,
+    /// and the next connect does that first (see `ensure_connection`). It used to wait for the
+    /// lock, so a query at the back of a long queue returned far past its deadline.
+    ///
+    /// 要拆的是查询登记的那一代 `generation`，欠着的也记的是这一代
+    /// What goes is `generation`, the one the query registered on, and that is what is noted as owed
+    async fn reset_after_deadline(&self, generation: u64) {
+        let Ok(mut slot) = self.conn.try_lock() else {
+            self.reset_owed.store(generation, Ordering::Release);
             return;
         };
-        self.conn_cancel.lock().await.cancel();
-        Self::fail_all_locked(
-            &self.pending,
-            anyhow::anyhow!("{} connection reset", T::NAME),
-            &mut conn,
-        );
-        self.consecutive_errors.store(0, Ordering::Release);
+        let why = format!("{} connection reset", T::NAME);
+        if Self::close_locked(&self.pending, &mut slot, generation, &why) {
+            self.consecutive_errors.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -2680,6 +2758,10 @@ struct DoqConnectionInfo {
     /// 连接取自连接池，而不是为这次查询新建的
     /// The connection came from the pool rather than being made for this query
     reused: bool,
+    /// 这条连接是第几代：这个查询之后要把连接从池里拿掉，拿掉的就是这一代（见 `reset_connection`）
+    /// Which generation the connection is: when this query later has the connection taken
+    /// out of the pool, this generation is what goes (see `reset_connection`)
+    generation: u64,
 }
 
 /// DoQ (DNS over QUIC) 连接池
@@ -2758,7 +2840,14 @@ pub struct DoqClient {
 pub struct DoqMuxClient {
     upstream: Arc<str>,
     target: Mutex<Option<DoqTarget>>,
-    connection: Mutex<Option<QuicConnection>>,
+    /// 池里的连接和它是第几代 / The pooled connection and which generation it is
+    connection: Mutex<Option<(QuicConnection, u64)>>,
+    /// 最近建的那条连接是第几代，从 1 起，建连时在连接锁下加一。把连接从池里拿掉的决定都点名一代
+    /// （见 `reset_connection`）
+    /// The generation of the connection made last, from 1, raised under the connection lock as a
+    /// connection is made. Every decision to take a connection out of the pool names a
+    /// generation (see `reset_connection`)
+    generation: AtomicU64,
     runtime: Arc<DoqRuntime>,
     /// Track whether 0-RTT has been rejected by the server for auto-fallback
     /// 跟踪服务器是否拒绝了 0-RTT，用于自动回退
@@ -2892,6 +2981,7 @@ impl DoqMuxClient {
             upstream,
             target: Mutex::new(None),
             connection: Mutex::new(None),
+            generation: AtomicU64::new(0),
             runtime,
             zero_rtt_rejected,
             conn_create_time: AtomicU64::new(0),
@@ -2917,6 +3007,10 @@ impl DoqMuxClient {
             return false;
         }
         self.last_health_check_time.store(now, Ordering::Release);
+        // 先记下看的是哪一代，再读它的时刻（道理同 TCP、DoT 的健康检查）
+        // Which generation is looked at is noted first and its times read after (as in the
+        // TCP and DoT health check)
+        let generation = self.generation.load(Ordering::Acquire);
 
         // Check connection aging
         let create_time = self.conn_create_time.load(Ordering::Acquire);
@@ -2930,7 +3024,7 @@ impl DoqMuxClient {
                     max_age_ms = max_age,
                     "DoQ connection too old, resetting"
                 );
-                self.reset_connection().await;
+                self.reset_connection(generation).await;
                 return true;
             }
         }
@@ -2947,7 +3041,7 @@ impl DoqMuxClient {
                     idle_timeout_ms = idle_timeout,
                     "DoQ connection idle too long, resetting"
                 );
-                self.reset_connection().await;
+                self.reset_connection(generation).await;
                 return true;
             }
         }
@@ -3009,6 +3103,7 @@ impl DoqMuxClient {
                 conn,
                 used_0rtt,
                 reused,
+                generation,
             } = match timeout(timeout_dur, self.get_or_connect(target, timeout_dur)).await {
                 Ok(info) => info?,
                 Err(_) => anyhow::bail!("doq connect timeout after {}ms", timeout_dur.as_millis()),
@@ -3129,13 +3224,15 @@ impl DoqMuxClient {
                     return Ok(bytes);
                 }
                 Ok(Err(failure)) => {
-                    // 每次失败都复位连接 / Every failure resets the connection
-                    self.reset_connection().await;
+                    // 每次失败都把这次查询用的那条连接从池里拿掉 / Every failure takes the
+                    // connection this query used out of the pool
+                    self.reset_connection(generation).await;
                     let retry = if !allow_retry {
                         false
-                    } else if used_0rtt
-                        && self.zero_rtt_retry_allowed(target)
-                        && Self::zero_rtt_likely_rejected(&failure)
+                    } else if Self::early_data_refused(&failure)
+                        || (used_0rtt
+                            && self.zero_rtt_retry_allowed(target)
+                            && Self::zero_rtt_likely_rejected(&failure))
                     {
                         self.disable_zero_rtt();
                         warn!(
@@ -3177,7 +3274,7 @@ impl DoqMuxClient {
                         self.disable_zero_rtt();
                         if allow_retry {
                             let remaining = timeout_dur.saturating_sub(start.elapsed());
-                            self.reset_connection().await;
+                            self.reset_connection(generation).await;
                             if remaining.is_zero() {
                                 return Err(anyhow::anyhow!("doq timeout"));
                             }
@@ -3190,7 +3287,7 @@ impl DoqMuxClient {
                             continue;
                         }
                     }
-                    self.reset_connection().await;
+                    self.reset_connection(generation).await;
                     return Err(anyhow::anyhow!("doq timeout"));
                 }
             }
@@ -3233,6 +3330,22 @@ impl DoqMuxClient {
             },
             _ => false,
         }
+    }
+
+    /// quinn 明说这个查询发出去的是早期数据、被上游拒收了。只有 0-RTT 期间开的流才会报这个，所以不管这条连接是不是
+    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次：搭在别的查询建的连接上的查询以前不重发，直接失败
+    /// quinn says outright that what this query sent was early data the upstream refused. Only
+    /// a stream opened during 0-RTT is told so, and whether or not this query made the
+    /// connection it is to be sent again on one without 0-RTT: a query riding a connection
+    /// another query made used not to be sent again, and failed
+    fn early_data_refused(failure: &DoqFailure) -> bool {
+        matches!(
+            failure,
+            DoqFailure::Write(quinn::WriteError::ZeroRttRejected)
+                | DoqFailure::Read(quinn::ReadToEndError::Read(
+                    quinn::ReadError::ZeroRttRejected
+                ))
+        )
     }
 
     /// 这次失败是否说明连接本身已经没了（而不是这一次查询出了问题）
@@ -3285,7 +3398,7 @@ impl DoqMuxClient {
         // 单锁模式：一次获取锁，检查+创建在一个临界区内完成。
         // 防止两个协程同时通过第一次检查后都创建连接、浪费一个的竞态。
         let mut guard = self.connection.lock().await;
-        if let Some(conn) = guard.as_ref() {
+        if let Some((conn, generation)) = guard.as_ref() {
             // 对端关掉的、或者空闲超时的连接还留在这里的话，拿去用只会让这次查询失败
             // A connection the peer closed, or one that idled out, would only
             // fail this query if handed out again
@@ -3295,6 +3408,7 @@ impl DoqMuxClient {
                         conn: conn.clone(),
                         used_0rtt: false,
                         reused: true,
+                        generation: *generation,
                     });
                 }
                 Some(reason) => {
@@ -3309,7 +3423,8 @@ impl DoqMuxClient {
         }
 
         let (conn, used_0rtt) = self.connect_new(target, timeout_dur).await?;
-        *guard = Some(conn.clone());
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *guard = Some((conn.clone(), generation));
 
         // Record connection creation time for aging checks
         // 记录连接创建时间用于老化检查
@@ -3321,6 +3436,7 @@ impl DoqMuxClient {
             conn,
             used_0rtt,
             reused: false,
+            generation,
         })
     }
 
@@ -3407,11 +3523,23 @@ impl DoqMuxClient {
         Ok((connection, false))
     }
 
-    async fn reset_connection(&self) {
+    /// 把第 `generation` 代连接从池里拿掉，下一个查询新建一条。池里现在的已经不是这一代（换成了新的，或者已经
+    /// 拿掉了）就什么都不做：几个查询在同一条连接上一起失败时，先失败的那个已经换了新连接，后面的不能把新连接
+    /// 也拿掉、让每个查询各建一条
+    /// Takes the connection of `generation` out of the pool, so the next query makes a new one.
+    /// When what is pooled now is not that generation (replaced by a new one, or taken out
+    /// already) nothing is done: with several queries failing together on one connection, the
+    /// first has had a new one made, and the rest must not take that out too, each making its own
+    async fn reset_connection(&self, generation: u64) {
         let mut guard = self.connection.lock().await;
-        *guard = None;
-        // Reset connection creation time so aging checks start fresh on reconnect
-        self.conn_create_time.store(0, Ordering::Release);
+        if guard
+            .as_ref()
+            .is_some_and(|(_, pooled)| *pooled == generation)
+        {
+            *guard = None;
+            // Reset connection creation time so aging checks start fresh on reconnect
+            self.conn_create_time.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -3486,6 +3614,7 @@ mod tests {
             .await
             .as_ref()
             .expect("connected")
+            .queue
             .push(&vec![0u8; 32 << 20]);
         let err = client
             .send(&udp_test_query("stuck.example"), Duration::from_millis(500))
@@ -3709,14 +3838,11 @@ mod tests {
 
         let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
         let queue = Arc::new(WriteQueue::default());
-        *client.conn.lock().await = Some(Arc::clone(&queue));
+        *client.conn.lock().await = Some(planted(Arc::clone(&queue)));
         let token = CancellationToken::new();
-        client.spawn_writer(
-            Broken,
-            queue,
-            token.clone(),
-            client.generation.load(Ordering::Relaxed),
-        );
+        // 写入任务属于摆进去的那条连接（第 1 代）/ The writer belongs to the planted connection
+        // (generation 1)
+        client.spawn_writer(Broken, queue, token.clone(), 1);
         let (tx, rx) = oneshot::channel();
         client
             .register_pending(&udp_test_query("broken.example"), 7, tx)
@@ -4738,7 +4864,7 @@ mod tests {
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
         // Arrange: Prepare a TCP client with many pending IDs to force contention
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        *client.conn.lock().await = Some(Arc::new(WriteQueue::default()));
+        *client.conn.lock().await = Some(planted(Arc::new(WriteQueue::default())));
         for id in 1u16..200u16 {
             client.pending.insert(
                 id,
@@ -4774,10 +4900,51 @@ mod tests {
         }
     }
 
+    /// 回答到了，读取任务把条目拿走，这个 ID 随后分给了后来的查询；先前那个查询这时才放手，不能把后来的条目带走。
+    /// 以前放手时按 ID 无条件删：后来的查询的回答到了却找不到条目，只能等到超时
+    /// An answer arrives and the reader takes the entry, the ID then goes to a later query, and
+    /// only now does the earlier query let go: it must not take the later one's entry with it.
+    /// Letting go used to remove by ID whatever was there, so the later query's answer found no
+    /// entry and the query waited out its timeout
+    #[test]
+    fn letting_go_of_an_id_leaves_a_later_query_on_it_alone() {
+        let map: Arc<DashMap<u16, Pending, FxBuildHasher>> =
+            Arc::new(DashMap::with_hasher(FxBuildHasher));
+        let entry = |tx| Pending {
+            original_id: 1,
+            frame: Bytes::new(),
+            tx,
+        };
+        let waiting = |rx| Waiting {
+            rx,
+            map: Arc::clone(&map),
+            id: 7,
+            abandoned: |pending: &Pending| pending.tx.is_closed(),
+        };
+        let (earlier_tx, earlier_rx) = oneshot::channel();
+        map.insert(7, entry(earlier_tx));
+        let earlier = waiting(earlier_rx);
+        // 回答到了：读取任务拿走条目，交出回答 / The answer arrives: the reader takes the entry
+        // and hands the answer over
+        let (_, taken) = map.remove(&7).expect("the earlier query's entry");
+        taken.tx.send(Ok(Bytes::new())).expect("still waited for");
+        // 同一个 ID 分给了后来的查询 / The same ID goes to a later query
+        let (later_tx, later_rx) = oneshot::channel();
+        map.insert(7, entry(later_tx));
+        let later = waiting(later_rx);
+
+        drop(earlier);
+        assert!(map.contains_key(&7), "the later query's entry stays");
+        // 后来的查询自己放手（超时、取消）时，它的条目跟着走 / When the later query lets go itself
+        // (a timeout, a cancellation) its entry goes with it
+        drop(later);
+        assert!(map.is_empty(), "its own entry goes");
+    }
+
     #[tokio::test]
     async fn tcp_fail_all_cannot_miss_a_concurrent_registration() {
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        *client.conn.lock().await = Some(Arc::new(WriteQueue::default()));
+        *client.conn.lock().await = Some(planted(Arc::new(WriteQueue::default())));
 
         // Hold the connection lock so registration queues before fail_all. The old implementation
         // took its pending snapshot before this lock, then allowed the queued registration to land
@@ -4795,7 +4962,7 @@ mod tests {
         let pending = Arc::clone(&client.pending);
         let conn = Arc::clone(&client.conn);
         let fail_all = tokio::spawn(async move {
-            TcpMuxClient::fail_all_async(&pending, anyhow::anyhow!("reader failed"), &conn).await;
+            assert!(TcpMuxClient::close(&pending, &conn, 1, "reader failed").await);
         });
         tokio::task::yield_now().await;
         drop(conn_guard);
@@ -5037,20 +5204,76 @@ mod tests {
             .expect("the upstream answers");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        client.reset_connection().await;
+        client
+            .reset_connection(client.generation.load(Ordering::Acquire))
+            .await;
         let resumed = client
             .get_or_connect(&target, Duration::from_secs(2))
             .await
             .expect("connect");
         assert!(resumed.used_0rtt, "a resumed connection offers early data");
 
-        client.reset_connection().await;
+        client
+            .reset_connection(client.generation.load(Ordering::Acquire))
+            .await;
         client.disable_zero_rtt();
         let after = client
             .get_or_connect(&target, Duration::from_secs(2))
             .await
             .expect("connect");
         assert!(!after.used_0rtt, "no early data once 0-RTT was rejected");
+    }
+
+    /// 上游拒绝了 0-RTT 时，不光建这条连接的查询换一条不带 0-RTT 的连接再发一次，同时搭在这条连接上的查询也
+    /// 一样。以前只有建连接的那个查询重发，搭车的查询直接失败
+    /// When an upstream rejects 0-RTT, the query that made the connection is sent again on one
+    /// without 0-RTT, and so are the queries riding that connection at the time. Only the query
+    /// that made the connection used to be sent again, and those riding it failed
+    #[tokio::test]
+    async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
+        let (mut accepting, mut client_tls) = localhost_tls(&[b"doq"]);
+        accepting.max_early_data_size = u32::MAX;
+        client_tls.enable_early_data = true;
+        // 同一张证书的另一台上游：不认别人发的票据，早期数据也不收
+        // Another upstream with the same certificate: it knows no ticket another gave, and
+        // takes no early data
+        let mut rejecting = accepting.clone();
+        rejecting.max_early_data_size = 0;
+        rejecting.session_storage = rustls::server::ServerSessionMemoryCache::new(32);
+        let answer: fn(usize, &str) -> DoqReply = |_, _| DoqReply::Answer(Duration::ZERO);
+        let first = spawn_doq_upstream(accepting, Duration::ZERO, answer).await;
+        let second = spawn_doq_upstream(rejecting, Duration::ZERO, answer).await;
+
+        // 先从第一台拿到允许早期数据的票据（票据按服务器名存，两台同名）
+        // A ticket allowing early data comes from the first (tickets are kept by server name,
+        // which the two share)
+        let ticket = doq_test_client(
+            format!("doq://{first}?sni=localhost"),
+            client_tls.clone(),
+            true,
+        );
+        ticket
+            .send(&udp_test_query("first.example"), Duration::from_secs(2))
+            .await
+            .expect("the first upstream answers");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = doq_test_client(format!("doq://{second}?sni=localhost"), client_tls, true);
+        let (a, b) = (udp_test_query("a.example"), udp_test_query("b.example"));
+        let (made_it, rode_it) = tokio::join!(
+            client.send(&a, Duration::from_secs(2)),
+            client.send(&b, Duration::from_secs(2)),
+        );
+        made_it.expect("the query that made the connection is sent again");
+        rode_it.expect("so is the one riding it");
+        assert!(
+            client.zero_rtt_rejected.load(Ordering::Relaxed),
+            "0-RTT is off for this upstream from then on"
+        );
+        // 两个查询在同一条连接上一起失败，只换一条新连接：后失败的那个不把先失败的建好的连接也拿掉
+        // The two queries failed together on one connection and one new connection replaces
+        // it: the later one does not take out what the earlier one had made
+        assert_eq!(client.generation.load(Ordering::Acquire), 2);
     }
 
     /// DoQ 连接用了超过 30 分钟，或者空闲超过 5 分钟，健康检查就把它换掉；没到时不动
@@ -5920,6 +6143,16 @@ mod tests {
     /// TCP 和 DoT 的多路复用客户端是同一套写法，下面几条测试对两者一视同仁
     /// The TCP and DoT multiplexing clients share one design, so the tests
     /// below hold both to the same behaviour
+    /// 测试直接摆进客户端的一条连接：第 1 代，写入队列是 `queue`
+    /// A connection a test plants in a client: generation 1, with `queue` as its write queue
+    fn planted(queue: Arc<WriteQueue>) -> Live {
+        Live {
+            queue,
+            generation: 1,
+            cancel: CancellationToken::new(),
+        }
+    }
+
     trait StreamMux {
         async fn query(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes>;
         fn connection_generation(&self) -> u64;
@@ -5937,7 +6170,7 @@ mod tests {
             self.generation.load(Ordering::Acquire)
         }
         async fn drop_connection(&self) {
-            self.reset().await;
+            self.reset(self.generation.load(Ordering::Acquire)).await;
         }
         fn pending(&self) -> &DashMap<u16, Pending, FxBuildHasher> {
             &self.pending
@@ -6274,6 +6507,129 @@ mod tests {
     /// 握手被压住 250 ms、回答再等 250 ms：300 ms 预算的请求曾跑满 560 ms 才成功
     /// A handshake held back 250 ms and an answer after another 250 ms: a request
     /// with a 300 ms budget used to run the full 560 ms and succeed
+    /// 连接空闲过期以后同时来几个查询（一次解析的 A 和 AAAA 就是这样）：旧连接拆一次，新连接建一条，查询都
+    /// 答上。以前几个查询各自判断「该拆了」，后到的那个拆的时候旧连接已经换成了新的，拆掉的是新连接：先到的
+    /// 查询登记不上或被告知连接已复位，新连接白建一条，它的读写任务也没人去停
+    /// With a connection expired by idleness and several queries arriving together (the A and
+    /// AAAA of one lookup do), the old connection is torn down once, one new one is made, and
+    /// every query is answered. Each query used to decide for itself that it had to go, and by
+    /// the time the later one tore down, the old connection had been replaced: the new one went
+    /// instead, the earlier query could not register or was told of a reset, a connection was
+    /// made for nothing, and nobody stopped its reader and writer
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_expired_connection_is_replaced_once_for_queries_arriving_together() {
+        let addr = spawn_stream_upstream(None).await;
+        let client = Arc::new(TcpMuxClient::with_shared(
+            (),
+            Arc::from(addr.to_string()),
+            StreamHealth {
+                idle_timeout_ms: 1,
+                ..StreamHealth::default()
+            },
+        ));
+        client
+            .send(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        for round in 0..300 {
+            // 空闲过期，并让健康检查这一轮再看一次 / Expired by idleness, with the health check
+            // due again this round
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            client.last_health_check_time.store(0, Ordering::Release);
+            let before = client.generation.load(Ordering::Acquire);
+            let queries = (0..4).map(|n| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    let query = udp_test_query(&format!("r{round}q{n}.example"));
+                    client.send(&query, Duration::from_secs(2)).await
+                })
+            });
+            for answered in futures::future::join_all(queries).await {
+                answered
+                    .expect("the query task ran")
+                    .unwrap_or_else(|err| panic!("round {round}: {err:#}"));
+            }
+            assert_eq!(
+                client.generation.load(Ordering::Acquire),
+                before + 1,
+                "round {round}: the expired connection is replaced once"
+            );
+        }
+    }
+
+    /// 拆连接的决定点名一代：点的那一代已经换成新连接时，什么都不动。新连接照常用，等在它上面的查询不受影响，
+    /// 也没有多建一条。拆除的每条路都这样：直接复位、时限到了的查询复位、欠着的复位、记错误
+    /// A decision to tear a connection down names a generation, and does nothing once that
+    /// generation has been replaced: the new connection goes on being used, a query waiting on
+    /// it is untouched, and no further connection is made. So for every way of tearing down: a
+    /// plain reset, the reset of a query past its deadline, an owed reset, a recorded error
+    #[tokio::test]
+    async fn a_teardown_naming_a_replaced_connection_leaves_the_new_one_alone() {
+        let client = tcp_test_client().await;
+        let ask =
+            |name: &'static str| client.send(udp_test_query(name).leak(), Duration::from_secs(2));
+        ask("warm.example")
+            .await
+            .expect("a fresh connection answers");
+        let old = client.generation.load(Ordering::Acquire);
+        assert!(
+            client.reset(old).await,
+            "the connection it names is torn down"
+        );
+        assert!(!client.reset(old).await, "torn down already");
+        ask("again.example")
+            .await
+            .expect("a new connection answers");
+        let new = client.generation.load(Ordering::Acquire);
+        assert_eq!(new, old + 1);
+
+        // 新连接上有一个查询在等（上游 100 毫秒后才答）/ A query waits on the new connection (the
+        // upstream answers after 100 ms)
+        let (waiting, ()) = tokio::join!(ask("mid.example"), async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(!client.reset(old).await);
+            client.reset_after_deadline(old).await;
+            let why = "stale";
+            assert!(!TcpMuxClient::close(&client.pending, &client.conn, old, why).await);
+            assert!(!client.record_error(old).await);
+            assert_eq!(client.consecutive_errors.load(Ordering::Acquire), 0);
+            // 欠着拆旧的那一代：下一次建连去拆，拆不到新连接，账销掉
+            // The old generation owed a teardown: the next connect goes to do it, cannot reach
+            // the new connection, and the debt is cleared
+            client.reset_owed.store(old, Ordering::Release);
+            ask("next.example")
+                .await
+                .expect("the same connection answers");
+            assert_eq!(client.reset_owed.load(Ordering::Acquire), 0);
+        });
+        waiting.expect("the query on the new connection is answered");
+        assert_eq!(client.generation.load(Ordering::Acquire), new);
+    }
+
+    /// 时限到了的查询要拆连接、锁却被别人拿着时，记下欠着拆的是它登记的那一代；下一次建连拆的就是这一代
+    /// A query past its deadline that cannot take the lock notes the generation it registered on
+    /// as owed, and that generation is what the next connect tears down
+    #[tokio::test]
+    async fn an_owed_reset_names_the_generation_the_query_was_on() {
+        let client = tcp_test_client().await;
+        client
+            .send(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        let generation = client.generation.load(Ordering::Acquire);
+        {
+            let _held = client.conn.lock().await;
+            client.reset_after_deadline(generation).await;
+        }
+        assert_eq!(client.reset_owed.load(Ordering::Acquire), generation);
+        client
+            .send(&udp_test_query("after.example"), Duration::from_secs(2))
+            .await
+            .expect("a new connection answers");
+        assert_eq!(client.generation.load(Ordering::Acquire), generation + 1);
+        assert_eq!(client.reset_owed.load(Ordering::Acquire), 0);
+    }
+
     #[tokio::test]
     async fn doq_handshake_and_answer_share_one_budget() {
         let (server, client_tls) = localhost_tls(&[b"doq"]);
@@ -6490,11 +6846,15 @@ mod tests {
     async fn pool_clients_take_the_configured_health_settings() {
         let mux = TcpMultiplexer::new(1, 2, 0, 0);
         let client = Arc::clone(&mux.get_or_init_pool_for_test("127.0.0.1:9").clients[0]);
+        let generation = client.generation.load(Ordering::Acquire);
         assert!(
-            !client.record_error().await,
+            !client.record_error(generation).await,
             "one error is below a threshold of 2"
         );
-        assert!(client.record_error().await, "the second error reaches it");
+        assert!(
+            client.record_error(generation).await,
+            "the second error reaches it"
+        );
 
         // 把连接的出生时间或上次请求时间往前拨 2 秒，再让下一次发送做健康检查：设成 1 秒的
         // 那一项会让旧连接被关掉

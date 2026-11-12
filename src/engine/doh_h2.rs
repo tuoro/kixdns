@@ -216,6 +216,26 @@ async fn connect(
     handshake(stream).await.map(Some)
 }
 
+/// 一条连接上记着多少个取消了的请求、各记多久。请求被放弃时（时限先到、几个上游竞速它输了）流被取消，上游的回答
+/// 可能已经在路上：回答落在还记着的流上就悄悄丢掉；落在忘掉的流上，h2 每一帧都记一次「对方出错」，这个数只增不减，
+/// 到 1024 就把连接断开。h2 默认只记 10 个（记 30 秒），和 UDP 上游一起问、每次都慢一步的 DoH 上游，每个回答都落在
+/// 忘掉的流上，一千来个查询连接就断一次。迟到的回答一般几百毫秒内就到，所以记 2 秒、最多记 16384 个：一条连接每秒
+/// 取消八千个请求以内都记得住；记满时每个占几百字节，一条连接几兆。超出的照旧算数，那道 1024 的上限留着兜底
+/// How many cancelled requests a connection remembers, and for how long each. A request given
+/// up (a deadline that came first, a race between upstreams lost) has its stream cancelled while
+/// the upstream's answer may be on its way: an answer landing on a stream still remembered is
+/// dropped quietly; one landing on a forgotten stream has h2 count each frame as an error by the
+/// peer, in a count that only grows, and at 1024 the connection is ended. h2 remembers 10 by
+/// default (for 30 seconds), so a DoH upstream asked along with a UDP one and always a step
+/// slower had every answer land on a forgotten stream, and its connection ended every thousand
+/// queries or so. Late answers mostly arrive within a few hundred milliseconds, so each is
+/// remembered for 2 seconds and at most 16384 are: up to eight thousand requests cancelled a
+/// second on one connection are all remembered, at a few hundred bytes each when full, a few
+/// megabytes a connection. Any beyond that count as before, and the limit of 1024 stays as the
+/// backstop
+const CANCELLED_REMEMBERED: usize = 16384;
+const CANCELLED_REMEMBERED_FOR: Duration = Duration::from_secs(2);
+
 /// 在 `io` 上做 HTTP/2 握手，把连接交给后台任务。这几项和 hyper 的客户端一样：不收服务器推送，对方的设置到
 /// 之前最多开 100 个流，响应头最多 16 KiB；接收窗口见 [`CONNECTION_WINDOW`]
 /// Does the HTTP/2 handshake on `io` and hands the connection to a background task. As in hyper's
@@ -230,6 +250,8 @@ where
         .initial_max_send_streams(100)
         .max_header_list_size(16 << 10)
         .initial_connection_window_size(CONNECTION_WINDOW)
+        .max_concurrent_reset_streams(CANCELLED_REMEMBERED)
+        .reset_stream_duration(CANCELLED_REMEMBERED_FOR)
         .handshake(io)
         .await
         .context("doh http2 handshake failed")?;
