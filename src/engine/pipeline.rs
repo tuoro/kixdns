@@ -1,4 +1,3 @@
-use rustc_hash::FxHashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -113,6 +112,11 @@ pub fn select_pipeline<'a>(
 /// 没有 Pipeline 时用的名字 / The name used with no pipeline
 pub(crate) const NO_PIPELINE: &str = "default";
 
+/// 一个请求在当前规则组里已经 continue 过的规则，按它们在规则组里的位置记；一般只有一两条，不上堆
+/// The rules of the current pipeline a request has continued past, by their place in it;
+/// one or two as a rule, kept off the heap
+pub(crate) type Continued = SmallVec<[usize; 4]>;
+
 /// Immutable request state shared across rule evaluation and rule-cache insertion.
 pub struct RuleEvaluationContext<'a> {
     pub client_ip: IpAddr,
@@ -120,7 +124,9 @@ pub struct RuleEvaluationContext<'a> {
     pub qtype: RecordType,
     pub qclass: DNSClass,
     pub edns_present: bool,
-    pub skip_rules: Option<&'a FxHashSet<Arc<str>>>,
+    /// 这次求值不看的规则，按它们在规则组里的位置（见 [`Continued`]）
+    /// The rules this evaluation leaves out, by their place in the pipeline (see [`Continued`])
+    pub skip_rules: Option<&'a [usize]>,
     pub skip_cache: bool,
     /// Observer context of the request being evaluated; `None` disables
     /// rule-match events. / 所属请求的观察者上下文；None 时不上报规则命中。
@@ -134,7 +140,7 @@ impl<'a> RuleEvaluationContext<'a> {
         qtype: RecordType,
         qclass: DNSClass,
         edns_present: bool,
-        skip_rules: Option<&'a FxHashSet<Arc<str>>>,
+        skip_rules: Option<&'a [usize]>,
         skip_cache: bool,
     ) -> Self {
         Self {
@@ -407,7 +413,7 @@ impl Engine {
                 Some(r) => r,
                 None => continue, // Skip if index is out of bounds due to reload race / 如果由于重载竞争导致索引越界，则跳过
             };
-            if skip_rules.is_some_and(|set| set.contains(&rule.name)) {
+            if skip_rules.is_some_and(|set| set.contains(&idx)) {
                 continue;
             }
             let req_match = eval_match_chain(
@@ -450,6 +456,7 @@ impl Engine {
                         pre_split_upstreams: Some(merged.upstream_list.clone()),
                         response_phase: rule.response_phase.clone(),
                         rule_name: rule.name.clone(),
+                        rule_index: Some(idx),
                         transport: None, // Each upstream decides its own transport / 每个 upstream 自行决定 transport
                         ecs: merged.ecs.clone(),
                         allow_reuse: false,
@@ -497,6 +504,7 @@ impl Engine {
                                 pre_split_upstreams: None,
                                 response_phase: None,
                                 rule_name: rule.name.clone(),
+                                rule_index: Some(idx),
                                 transport: Some(Transport::Udp),
                                 ecs: None,
                                 allow_reuse: true,
@@ -527,6 +535,7 @@ impl Engine {
                                 pre_split_upstreams: pre_split_upstreams.clone(),
                                 response_phase: rule.response_phase.clone(),
                                 rule_name: rule.name.clone(),
+                                rule_index: Some(idx),
                                 transport: Some(transport.unwrap_or(Transport::Udp)),
                                 ecs: ecs.clone(),
                                 allow_reuse: false,
@@ -647,10 +656,7 @@ mod observer_rule_cache_tests {
 
 #[cfg(test)]
 mod continued_rule_cache_tests {
-    use std::sync::Arc;
-
     use hickory_proto::rr::{DNSClass, RecordType};
-    use rustc_hash::FxHashSet;
 
     use super::RuleEvaluationContext;
     use crate::engine::Engine;
@@ -702,7 +708,7 @@ mod continued_rule_cache_tests {
         let engine = engine();
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
-        let continued: FxHashSet<Arc<str>> = [Arc::from("first")].into_iter().collect();
+        let continued = [0usize];
         let request = |skip_rules| {
             RuleEvaluationContext::new(
                 "127.0.0.1".parse().unwrap(),
@@ -715,7 +721,7 @@ mod continued_rule_cache_tests {
             )
         };
 
-        let after_continue = engine.apply_rules(&state, pipeline, &request(Some(&continued)));
+        let after_continue = engine.apply_rules(&state, pipeline, &request(Some(&continued[..])));
         assert_eq!(rule_of(&after_continue), "next");
 
         let fresh = engine.apply_rules(&state, pipeline, &request(None));

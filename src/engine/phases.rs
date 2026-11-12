@@ -859,11 +859,11 @@ pub(crate) async fn handle_forward_decision_logged(
     // When several upstreams all replied with a failure, the rule's answer check still sees
     // the first of those replies (see `rules::check_failure_reply`); a refresh still rejects
     // it right after
-    let resp = rules::check_failure_reply(resp, response_actions_on_match, |msg| {
+    let resp = rules::check_failure_reply(resp, response_actions_on_match, |msg, answered| {
         rules::response_matches(
             engine,
             response_matchers,
-            upstream,
+            answered,
             qname,
             qtype,
             qclass,
@@ -981,7 +981,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 let resp_match_ok = rules::response_matches(
                     engine,
                     response_matchers,
-                    upstream,
+                    &actual_upstream,
                     qname,
                     qtype,
                     qclass,

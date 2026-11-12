@@ -406,14 +406,14 @@ async fn unparsable_answer_after_a_tcp_retry_is_one_servfail_response() {
 
 /// 响应跳转路径上到了跳转上限，回的是本地给的 SERVFAIL，日志的 upstream 记成 "static"，和请求
 /// 阶段的跳转上限一样；以前要么空着，要么留着之前那次转发的上游。到上限的地方有三处：
-/// - 进入下一个 pipeline 时；
+/// - 回答检查头一次要跳转、上限是 0 时；
 /// - 规则级跳转一路跳下去时；
 /// - 跳转路径上转发以后，响应动作还要跳转时。
 ///
 /// A jump limit reached on the response jump path answers a local SERVFAIL, which the log
 /// labels "static" as for the request-phase jump limit; it used to be left empty, or to
 /// keep the upstream of an earlier forward. The limit is reached in three places:
-/// - when entering the next pipeline;
+/// - when an answer check first wants to jump under a limit of 0;
 /// - when rule-level jumps run on;
 /// - when a response action wants to jump after a forward on the jump path.
 #[tokio::test]
@@ -434,9 +434,9 @@ async fn a_jump_limit_on_the_response_jump_path_is_logged_as_static() {
         "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }]
     });
     let cases = [
-        // 进入 second 时已经没有跳转次数 / No jumps left when entering second
+        // 回答检查头一次要跳转，上限是 0 / An answer check first wants to jump under a limit of 0
         (
-            1,
+            0,
             json!([
                 { "id": "main", "rules": [forward_then("ask", jump("second"))] },
                 { "id": "second", "rules": [answer_rule] }

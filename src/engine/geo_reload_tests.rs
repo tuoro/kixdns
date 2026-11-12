@@ -81,6 +81,27 @@ fn geosite_config(paths: &[&Path], tag: &str) -> RuntimePipelineConfig {
     )
 }
 
+/// 同 [`geosite_config`]，规则命中 `tags` 里任何一个标签
+/// As [`geosite_config`], with the rule matching any of the tags in `tags`
+fn geosite_config_any_of(paths: &[&Path], tags: &[&str]) -> RuntimePipelineConfig {
+    let paths: Vec<&str> = paths.iter().map(|path| path.to_str().unwrap()).collect();
+    let matchers: Vec<Value> = tags
+        .iter()
+        .map(|tag| json!({ "type": "geo_site", "value": tag, "operator": "or" }))
+        .collect();
+    let config: crate::config::PipelineConfig = serde_json::from_value(json!({
+        "settings": { "default_upstream": "127.0.0.1:9", "geosite_data_paths": paths },
+        "pipelines": [{ "id": "main", "rules": [
+            { "name": "matched", "matchers": matchers,
+              "actions": [{ "type": "static_ip_response", "ip": MATCHED.to_string() }] },
+            { "name": "other", "matchers": [{ "type": "any" }],
+              "actions": [{ "type": "static_ip_response", "ip": OTHER.to_string() }] }
+        ]}]
+    }))
+    .expect("parse config");
+    RuntimePipelineConfig::from_config(config).expect("build runtime config")
+}
+
 fn engine(cfg: RuntimePipelineConfig) -> Engine {
     Engine::new(cfg, "test".to_string()).expect("engine")
 }
@@ -504,6 +525,122 @@ async fn an_empty_geoip_file_keeps_the_tags_in_use() {
             .matches_any_tag("198.51.100.1".parse().unwrap(), &tags)
     })
     .await;
+}
+
+/// 数据文件已经成了空文件，在用的数据靠监视那一层留着。这时热重载改了要读的 Geo 数据（多了一个文件），所有文件
+/// 重新读一遍：空文件读出来什么都没有，它此前提供、新配置也还用的标签照旧留着。以前这次重读把数据整个换掉，
+/// 规则一下子全不命中，直到文件下次改动
+/// A data file has become an empty one, and the data in use stays thanks to the watch. A hot
+/// reload then changes the Geo data to read (one more file), so every file is read again: the
+/// empty one gives nothing, and the tags it provided that the new configuration still uses
+/// stay. This read used to replace the data whole, so the rules stopped matching at once
+/// until the file changed again
+#[tokio::test]
+async fn a_reload_reading_an_empty_geosite_file_keeps_the_tags_still_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("geosite.dat");
+    let other = dir.path().join("other.dat");
+    std::fs::write(
+        &path,
+        geosite_dat(&[("testa", "geo.test"), ("testb", "b.test")]),
+    )
+    .unwrap();
+    std::fs::write(&other, geosite_dat(&[("else", "else.test")])).unwrap();
+    let engine = engine(geosite_config_any_of(&[&path], &["testa", "testb"]));
+    assert_eq!(ask(&engine, "first.geo.test").await, Some(MATCHED));
+    assert_eq!(ask(&engine, "first.b.test").await, Some(MATCHED));
+
+    // 新配置只用 testa：留下的只有它，不再用的 testb 不留
+    // The new configuration uses testa alone: it is what stays, and testb, no longer used,
+    // does not
+    replace(&path, b"");
+    engine.reload(geosite_config(&[&path, &other], "testa"));
+    assert_eq!(ask(&engine, "second.geo.test").await, Some(MATCHED));
+    assert!(
+        !engine.geosite_manager.read().has_tag("testb"),
+        "only tags the rules use are kept"
+    );
+
+    // 写坏了一半的文件（读不出来）也一样 / The same for a file written halfway (unreadable)
+    replace(&path, &geosite_dat(&[("testa", "geo.test")])[..5]);
+    engine.reload(geosite_config(&[&other, &path], "testa"));
+    assert_eq!(ask(&engine, "third.geo.test").await, Some(MATCHED));
+
+    // 文件再写好时照常读进来 / A good file written again is read in as usual
+    replace(&path, &geosite_dat(&[("testa", "geo2.test")]));
+    let manager = &engine.geosite_manager;
+    wait_for("the good file must be read", || {
+        manager.read().matches("testa", "x.geo2.test")
+    })
+    .await;
+    assert!(!manager.read().matches("testa", "x.geo.test"));
+}
+
+/// GeoIP 的 .dat 数据文件也一样：成了空文件以后热重载改了规则用到的标签，原来在用、现在还用的标签照旧留着
+/// The same for a GeoIP .dat data file: with it empty, a hot reload changing the tags rules use
+/// keeps the tags that were in use and still are
+#[tokio::test]
+async fn a_reload_reading_an_empty_geoip_file_keeps_the_tags_still_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("geoip.dat");
+    std::fs::write(&path, geoip_dat("TESTNET", [203, 0, 113, 0], 24)).unwrap();
+    let using = |tags: &[&str]| {
+        config(
+            json!({ "geoip_dat_path": path.to_str().unwrap() }),
+            json!({ "type": "geoip_country", "country_codes": tags }),
+        )
+    };
+    let engine = engine(using(&["TESTNET"]));
+    let peer = "203.0.113.9:53000".parse().unwrap();
+    assert_eq!(ask_from(&engine, "first.test", peer).await, Some(MATCHED));
+
+    replace(&path, b"");
+    engine.reload(using(&["TESTNET", "ELSEWHERE"]));
+    assert_eq!(ask_from(&engine, "second.test", peer).await, Some(MATCHED));
+
+    replace(&path, &geoip_dat("TESTNET", [198, 51, 100, 0], 24));
+    let manager = &engine.geoip_manager;
+    let tags: [Arc<str>; 1] = [Arc::from("TESTNET")];
+    wait_for("the good file must be read", || {
+        manager
+            .read()
+            .matches_any_tag("198.51.100.1".parse().unwrap(), &tags)
+    })
+    .await;
+}
+
+/// 留着的只是同一个数据文件此前给的数据：配置换了一个数据文件、新文件是空的，旧文件的数据不沿用
+/// Only the data the same file gave before is kept: with the configuration pointing at another
+/// data file that is empty, the old file's data is not carried on
+#[tokio::test]
+async fn an_empty_geo_file_at_a_new_path_keeps_nothing_of_the_old_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = "203.0.113.9:53000".parse().unwrap();
+
+    let (old, new) = (dir.path().join("old.dat"), dir.path().join("new.dat"));
+    std::fs::write(&old, geoip_dat("TESTNET", [203, 0, 113, 0], 24)).unwrap();
+    std::fs::write(&new, b"").unwrap();
+    let using = |path: &Path| {
+        config(
+            json!({ "geoip_dat_path": path.to_str().unwrap() }),
+            json!({ "type": "geoip_country", "country_codes": ["TESTNET"] }),
+        )
+    };
+    let geoip = engine(using(&old));
+    assert_eq!(ask_from(&geoip, "first.test", peer).await, Some(MATCHED));
+    geoip.reload(using(&new));
+    assert_eq!(ask_from(&geoip, "second.test", peer).await, Some(OTHER));
+
+    let (old, new) = (
+        dir.path().join("old-site.dat"),
+        dir.path().join("new-site.dat"),
+    );
+    std::fs::write(&old, geosite_dat(&[("testa", "geo.test")])).unwrap();
+    std::fs::write(&new, b"").unwrap();
+    let geosite = engine(geosite_config(&[&old], "testa"));
+    assert_eq!(ask(&geosite, "first.geo.test").await, Some(MATCHED));
+    geosite.reload(geosite_config(&[&new], "testa"));
+    assert_eq!(ask(&geosite, "second.geo.test").await, Some(OTHER));
 }
 
 /// 规则用到、却没有数据文件提供的 GeoSite 标签能被认出来（用来记告警），不分大小写

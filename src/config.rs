@@ -640,6 +640,21 @@ impl Rule {
         if forward_count <= 1 {
             return;
         }
+        // 动作按写的顺序执行，合并只在轮到 forward 时才算：forward 前面已经写了别的作决定的动作（日志不作决定）
+        // 时，规则给的是那个动作的结果，后面的 forward 轮不到。不这样的话，这条规则走完整路径时去转发，走
+        // 快速路径时照第一个动作回静态应答
+        // Actions run in the order written, and the merge counts only when a forward's turn
+        // comes: with another deciding action written before the forwards (a log decides
+        // nothing), what the rule gives is that action's outcome and the forwards never have
+        // their turn. Otherwise the rule forwards on the full path while the fast path answers
+        // its static first action
+        let first_to_decide = self
+            .actions
+            .iter()
+            .find(|action| !matches!(action, Action::Log { .. }));
+        if !matches!(first_to_decide, Some(Action::Forward { .. })) {
+            return;
+        }
 
         // 每种传输一组，各组按这里的顺序排进合并后的列表 / One set per transport, each going
         // into the merged list in this order
@@ -1340,7 +1355,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 }
 
 /// 配置里会悄悄做成别的事的写法：读不懂的上游地址、拼错的 rcode、无效的静态 IP 或 CNAME 目标、
-/// 装不进一条记录的 TXT、跳到不存在的 pipeline、会匹配所有域名的空域名匹配器。以前这些都照常加载：
+/// 装不进一条记录的 TXT、跳到不存在的 pipeline、会匹配所有域名的空域名匹配器、几个 pipeline 写了同一个 id、
+/// 不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
 /// 启动时只记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
@@ -1349,7 +1365,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// Ways of writing a configuration that silently do something else: an upstream
 /// address nothing can read, a misspelt rcode, an invalid static IP or CNAME target,
 /// TXT content that does not fit a record, a jump to a pipeline that does not exist,
-/// an empty domain matcher that matches every name. These all used to load as
+/// an empty domain matcher that matches every name, several pipelines written with
+/// one id, a static ECS address that is no IP. These all used to load as
 /// usual: the upstream kept failing, the rcode became NXDOMAIN, the static answer
 /// became SERVFAIL, the empty suffix matched everything.
 ///
@@ -1388,6 +1405,22 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             {
                 found.push(format!("{place}: {EMPTY_EXACT_MATCHER}"));
             }
+        }
+    }
+    // 一个 id 写了几次，在它第一次出现的地方报一次 / An id written several times is raised once,
+    // where it first appears
+    let mut written: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
+    for pipeline in &cfg.pipelines {
+        *written.entry(pipeline.id.as_str()).or_default() += 1;
+    }
+    for pipeline in &cfg.pipelines {
+        if let Some(times) = written.remove(pipeline.id.as_str())
+            && times > 1
+        {
+            found.push(format!(
+                "pipeline \"{}\": {times} pipelines are written with this id; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
+                pipeline.id
+            ));
         }
     }
     for pipeline in &cfg.pipelines {
@@ -1502,6 +1535,16 @@ fn rule_problems(
                 .map(|action| (action, false)),
         );
     for (action, skipped_when_empty) in actions {
+        if let Action::Forward {
+            ecs: Some(EcsMode::Static { ip, .. }),
+            ..
+        } = action
+            && ip.parse::<std::net::IpAddr>().is_err()
+        {
+            report(format!(
+                "ecs ip \"{ip}\" is not an IP address, so no ECS is sent"
+            ));
+        }
         match action {
             Action::Forward {
                 upstream: Some(upstreams),
@@ -2436,6 +2479,62 @@ mod validation_tests {
             ]
         });
         assert_eq!(problems_of(config), Vec::<String>::new());
+    }
+
+    /// 两个规则组写了同一个 id：跳转和 pipeline_select 按 id 只找得到其中一个，另一个里的规则不会照写的执行。
+    /// 这是一条配置问题，每个重复的 id 报一次
+    /// Two pipelines written with one id: a jump or pipeline_select finds only one of them by
+    /// the id, and the rules of the other do not run as written. A configuration problem,
+    /// raised once for each id written more than once
+    #[test]
+    fn pipelines_sharing_an_id_are_a_problem() {
+        let pipeline = |id: &str| serde_json::json!({ "id": id, "rules": [] });
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [pipeline("main"), pipeline("other"), pipeline("main"), pipeline("main"), pipeline("third"), pipeline("other")]
+        });
+        let found = problems_of(config);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert!(
+            found[0].starts_with("pipeline \"main\": ") && found[0].contains("3 pipelines"),
+            "{found:#?}"
+        );
+        assert!(
+            found[1].starts_with("pipeline \"other\": ") && found[1].contains("2 pipelines"),
+            "{found:#?}"
+        );
+    }
+
+    /// 静态 ECS 的地址不是 IP：每个查询都记一条警告、什么也不发。这是一条配置问题；写对的不报
+    /// A static ECS whose address is no IP: every query logged a warning and sent nothing. A
+    /// configuration problem; one written right raises nothing
+    #[test]
+    fn a_static_ecs_address_that_is_no_ip_is_a_problem() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let forward = |ip: &str| serde_json::json!([{ "type": "forward", "upstream": "1.1.1.1:53", "ecs": { "mode": "static", "ip": ip } }]);
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": [
+                rule("wrong", any.clone(), forward("203.0.113.300")),
+                rule("v4", any.clone(), forward("203.0.113.7")),
+                rule("v6", any.clone(), forward("2001:db8::7")),
+                {
+                    "name": "late", "matchers": any, "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
+                    "response_actions_on_miss": forward("somewhere")
+                }
+            ]}]
+        });
+        let found = problems_of(config);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        for (place, ip) in [("wrong", "203.0.113.300"), ("late", "somewhere")] {
+            assert!(
+                found.iter().any(|problem| {
+                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                        && problem.contains(&format!("ecs ip \"{ip}\""))
+                }),
+                "missing {place} in {found:#?}"
+            );
+        }
     }
 
     /// 面板的校验拒绝这些写法，一次列出全部 / The panel's validation refuses these, listing them all at once
