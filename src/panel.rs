@@ -36,10 +36,10 @@ use serde_json::json;
 
 use crate::engine::Engine;
 use crate::observe::{
-    CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionMade, EngineObserver,
-    RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleCacheLookup, RuleEvaluated,
-    RuleMatched, RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome, UpstreamResult,
-    UpstreamSkipReason, UpstreamSkipped,
+    CacheHit, CacheHitKind, ConfigLoaded, ConfigReloadFailed, DecisionDetail, DecisionMade,
+    EngineObserver, RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleCacheLookup,
+    RuleEvaluated, RuleMatched, RulePhase, TracingObserver, UpstreamAttempt, UpstreamOutcome,
+    UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
 use crate::panel_querylog::{self, OwnLines, QueryLog, WallClock};
 use crate::panel_trace;
@@ -500,13 +500,16 @@ impl<V> Series<V> {
 /// power of two
 const LOOKUP_SLOTS: usize = 4_096;
 
-/// 已经计过一次缓存查找、还没结束的请求。请求跳转后会在目标 pipeline 下再查一次，而命中率按请求算
-/// （一个请求最多命中一次），所以每个请求只计一次查找。请求编号直接定位一个槽位，里面存「编号 + 1」
+/// 已经计过一次缓存查找、还没结束的请求。查找在命中上游的回答、或者决定去问上游时才计（见
+/// `PanelMetrics::cache_lookups_total`）；跳转以后会在目标 pipeline 下再查一次、continue 以后会再决定转发一次，
+/// 而命中率按请求算（一个请求最多命中一次），所以每个请求只计一次查找。请求编号直接定位一个槽位，里面存「编号 + 1」
 /// （0 表示空），请求结束时清掉；槽位正被另一个还没结束的请求占着时（同时在处理的请求要多过槽位数），
 /// 这个请求改记在共享表里。一个请求的几次查找前后相继、不会同时发生，查它在不在共享表里的也只有它自己。
-/// Requests still running whose cache lookup is already counted. A request looks again under the
-/// target pipeline after a jump, while the hit rate is per request (a request hits at most once), so
-/// each request counts one lookup. The request number picks a slot directly, which holds the number
+/// Requests still running whose cache lookup is already counted. A lookup is counted on a hit of an
+/// upstream's answer or on deciding to ask an upstream (see `PanelMetrics::cache_lookups_total`); a
+/// request looks again under the target pipeline after a jump and decides to forward again after
+/// a continue, while the hit rate is per request (a request hits at most once), so each request
+/// counts one lookup. The request number picks a slot directly, which holds the number
 /// plus one (0 is empty) and is cleared when the request finishes; when another running request holds
 /// that slot (more requests are in progress than there are slots), the request is noted in a shared
 /// map instead. One request's lookups follow one another and never overlap, and only the request
@@ -600,10 +603,19 @@ pub struct PanelMetrics {
     started_at: Instant,
     requests_total: ThreadCount,
     requests_inflight: AtomicUsize,
+    /// 要靠上游回答的请求：缓存里存着的上游回答答上了它，或者它去问了上游。规则自己回答的（拦截列表、域名映射、规则里写的
+    /// 静态回答，不管是当场给的还是存在缓存里的）不算，它们本来就用不着缓存，算进来的话拦得越多命中率越低
+    /// The requests an upstream's answer was needed for: an upstream's answer kept in the cache
+    /// answered it, or it went to ask an upstream. What the rules answer themselves (a blocklist, a
+    /// domain mapping, a static answer written in a rule, given on the spot or from the cache) is
+    /// not counted: it never needed the cache, and counted the hit rate would fall the more was
+    /// blocked
     cache_lookups_total: ThreadCount,
-    /// 每个请求只计一次缓存查找（见 `LookupsCounted`） / Each request counts one cache lookup (see
-    /// `LookupsCounted`)
+    /// 每个请求只计一次（见 `LookupsCounted`） / Each request counts once (see `LookupsCounted`)
     cache_lookup_counted: LookupsCounted,
+    /// 命中的都是缓存里存着的上游回答，规则存进缓存的回答不算（见 `cache_lookups_total`）/ Hits are of
+    /// upstreams' answers kept in the cache; a rule's answer kept there is none (see
+    /// `cache_lookups_total`)
     cache_hits_fresh: ThreadCount,
     cache_hits_stale: AtomicU64,
     cache_stale_client_timeout: AtomicU64,
@@ -704,6 +716,29 @@ impl PanelMetrics {
     #[inline]
     fn record_cache_lookup(&self) {
         self.cache_lookups_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 这个请求还没计过查找就计一次；后台刷新不算 / Counts a lookup unless this request has already
+    /// counted one; a background refresh counts none
+    #[inline]
+    fn count_lookup_once(&self, ctx: &RequestContext<'_>) {
+        if !ctx.background_refresh && self.cache_lookup_counted.first(ctx.request_id) {
+            self.record_cache_lookup();
+        }
+    }
+
+    /// 一个请求从缓存拿到了回答：存的是上游的回答才算一次查找、一次命中；规则存进去的回答都不算（见
+    /// `cache_lookups_total`）。快速路径一次交过来的请求只有这一次，不用查重
+    /// A request got its answer from the cache: only an upstream's answer kept there counts a
+    /// lookup and a hit, and a rule's answer kept there counts neither (see
+    /// `cache_lookups_total`). A request the fast path hands over whole has only this one, so
+    /// nothing is checked for repeats
+    #[inline]
+    fn record_upstream_answer_hit(&self, hit: &CacheHit<'_>) {
+        if hit.source.is_some() {
+            self.record_cache_lookup();
+            self.record_cache_hit(hit.kind);
+        }
     }
 
     #[inline]
@@ -1193,8 +1228,7 @@ impl EngineObserver for PanelMetrics {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.record_query(ctx.qname, ctx.client.ip(), ctx.started);
         self.record_pipeline_hit(pipeline);
-        self.record_cache_lookup();
-        self.record_cache_hit(hit.kind);
+        self.record_upstream_answer_hit(hit);
         self.count_finished(outcome);
         self.query_log
             .answered_from_cache(ctx, pipeline, hit, outcome);
@@ -1220,7 +1254,8 @@ impl EngineObserver for PanelMetrics {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.record_query(ctx.qname, ctx.client.ip(), ctx.started);
         self.record_pipeline_hit(pipeline);
-        self.record_cache_lookup();
+        // 规则自己回答的不算缓存查找（见 `cache_lookups_total`） / A rule's own answer is no cache lookup
+        // (see `cache_lookups_total`)
         for rule in answer.rules {
             self.record_rule_match(pipeline, rule, phase_label(RulePhase::Request));
         }
@@ -1351,15 +1386,23 @@ impl EngineObserver for PanelMetrics {
         // outcome is already told by its response-rule step
         if event.phase == RulePhase::Request {
             panel_trace::record_decision(event);
+            // 决定去问上游：缓存没有能答它的上游回答，算一次没命中的查找。规则自己回答的决定不算（见
+            // `cache_lookups_total`）
+            // Deciding to ask an upstream: the cache held no upstream's answer for it, which is a
+            // lookup that missed. A decision the rules answer themselves is none (see
+            // `cache_lookups_total`)
+            if matches!(event.detail, DecisionDetail::Forward { .. }) {
+                self.count_lookup_once(ctx);
+            }
         }
         self.query_log.decision_made(ctx, event);
     }
 
+    /// 查缓存这一步本身不计：这时还不知道这个请求要不要上游的回答（见 `cache_lookups_total`）
+    /// The look in the cache is not counted as such: whether this request needs an upstream's
+    /// answer is not known yet (see `cache_lookups_total`)
     fn cache_lookup(&self, ctx: &RequestContext<'_>) {
         debug_forward!(self.cache_lookup(ctx));
-        if !ctx.background_refresh && self.cache_lookup_counted.first(ctx.request_id) {
-            self.record_cache_lookup();
-        }
     }
 
     fn cache_miss(&self, ctx: &RequestContext<'_>) {
@@ -1376,7 +1419,15 @@ impl EngineObserver for PanelMetrics {
 
     fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit) {
         debug_forward!(self.cache_hit(ctx, event));
-        self.record_cache_hit(event.kind);
+        // 规则存进缓存的回答不算命中（见 `cache_lookups_total`）；上游的回答在等过上游以后才续用的，查找在决定去问
+        // 上游时已经计过
+        // A rule's answer kept in the cache is no hit (see `cache_lookups_total`); for an
+        // upstream's answer reused only after waiting on the upstream, the lookup was counted
+        // on deciding to ask it
+        if event.source.is_some() {
+            self.count_lookup_once(ctx);
+            self.record_cache_hit(event.kind);
+        }
         self.query_log.cache_hit(ctx, event);
         let ttl = |value: Option<std::time::Duration>| value.map(|value| value.as_secs());
         match event.kind {
@@ -3077,9 +3128,8 @@ mod tests {
     /// show as half a hit on the dashboard. Nothing is kept once the request ends.
     #[test]
     fn a_request_that_looks_again_after_a_jump_counts_one_lookup() {
-        use crate::observe::{CacheHit, CacheHitKind, EngineObserver};
+        use crate::observe::{CacheHitKind, DecisionDetail, EngineObserver};
         use std::sync::atomic::Ordering;
-        use std::time::Duration;
 
         let metrics = PanelMetrics::default();
         let ctx = request(41, "192.0.2.10:53000", "jumped.example");
@@ -3087,21 +3137,134 @@ mod tests {
         metrics.pipeline_selected(&ctx, "main");
         metrics.cache_lookup(&ctx);
         metrics.cache_miss(&ctx);
+        metrics.decision_made(
+            &ctx,
+            &request_decision(DecisionDetail::Jump {
+                pipeline: "upstream-default",
+            }),
+        );
         metrics.pipeline_selected(&ctx, "upstream-default");
         metrics.cache_lookup(&ctx);
-        metrics.cache_hit(
-            &ctx,
-            &CacheHit {
-                kind: CacheHitKind::Fresh,
-                remaining_ttl: Some(Duration::from_secs(30)),
-                original_ttl: Some(Duration::from_secs(60)),
-                source: None,
-            },
-        );
+        metrics.cache_hit(&ctx, &upstream_answer(CacheHitKind::Fresh));
         metrics.request_finished(&ctx, &completed(1));
 
         assert_eq!(metrics.cache_lookups_total.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.cache_hits_fresh.load(Ordering::Relaxed), 1);
+        assert!(metrics.cache_lookup_counted.is_empty());
+    }
+
+    /// 请求阶段的一个决定 / A decision of the request phase
+    fn request_decision(
+        detail: crate::observe::DecisionDetail<'static>,
+    ) -> crate::observe::DecisionMade<'static> {
+        crate::observe::DecisionMade {
+            pipeline: "main",
+            rule: Some("all"),
+            phase: crate::observe::RulePhase::Request,
+            detail,
+        }
+    }
+
+    /// 决定去问上游 / Deciding to ask an upstream
+    fn forward_decision() -> crate::observe::DecisionMade<'static> {
+        request_decision(crate::observe::DecisionDetail::Forward {
+            upstream: "192.0.2.53:53",
+            transport: None,
+        })
+    }
+
+    /// 缓存里存着的一个上游回答答上了 / An upstream's answer kept in the cache answered
+    fn upstream_answer(kind: crate::observe::CacheHitKind) -> crate::observe::CacheHit<'static> {
+        crate::observe::CacheHit {
+            kind,
+            remaining_ttl: None,
+            original_ttl: None,
+            source: Some("192.0.2.53:53"),
+        }
+    }
+
+    /// 决定去问上游、等不到回答以后续用旧的上游回答：一次查找、一次命中，查找不重复计。continue 以后又决定转发一次也只算一次
+    /// 查找
+    /// Deciding to ask an upstream and, with no answer coming, reusing an old upstream answer: one
+    /// lookup and one hit, the lookup not counted twice. Deciding to forward again after a continue
+    /// still counts one lookup
+    #[test]
+    fn a_request_that_asks_an_upstream_counts_one_lookup_whatever_follows() {
+        use crate::observe::{CacheHitKind, EngineObserver};
+        use std::sync::atomic::Ordering;
+
+        let metrics = PanelMetrics::default();
+        let waited = request(42, "192.0.2.10:53000", "stale.example");
+        metrics.request_started(&waited);
+        metrics.cache_lookup(&waited);
+        metrics.cache_miss(&waited);
+        metrics.decision_made(&waited, &forward_decision());
+        metrics.cache_hit(
+            &waited,
+            &upstream_answer(CacheHitKind::StaleUpstreamFailure),
+        );
+        metrics.request_finished(&waited, &completed(1));
+
+        let continued = request(43, "192.0.2.10:53000", "continued.example");
+        metrics.request_started(&continued);
+        metrics.cache_lookup(&continued);
+        metrics.cache_miss(&continued);
+        metrics.decision_made(&continued, &forward_decision());
+        metrics.decision_made(&continued, &forward_decision());
+        metrics.request_finished(&continued, &completed(1));
+
+        assert_eq!(metrics.cache_lookups_total.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.cache_hits_stale.load(Ordering::Relaxed), 1);
+        assert!(metrics.cache_lookup_counted.is_empty());
+    }
+
+    /// 规则自己回答的请求不算查找也不算命中：当场给的静态回答，存在缓存里的规则回答都一样；后台刷新去问上游也不算
+    /// A request the rules answer themselves counts neither a lookup nor a hit, a static answer
+    /// given on the spot and a rule's answer kept in the cache alike; nor does a background
+    /// refresh asking an upstream
+    #[test]
+    fn rule_answers_and_refreshes_count_no_lookup() {
+        use crate::observe::{CacheHit, CacheHitKind, DecisionDetail, EngineObserver};
+        use hickory_proto::op::ResponseCode;
+        use std::sync::atomic::Ordering;
+
+        let metrics = PanelMetrics::default();
+        let blocked = request(44, "192.0.2.10:53000", "ads.example");
+        metrics.request_started(&blocked);
+        metrics.cache_lookup(&blocked);
+        metrics.cache_miss(&blocked);
+        metrics.decision_made(
+            &blocked,
+            &request_decision(DecisionDetail::Static {
+                rcode: ResponseCode::NXDomain,
+                answers: 0,
+            }),
+        );
+        metrics.request_finished(&blocked, &completed(1));
+
+        let kept = request(45, "192.0.2.10:53000", "mapped.example");
+        metrics.request_started(&kept);
+        metrics.cache_lookup(&kept);
+        metrics.cache_hit(
+            &kept,
+            &CacheHit {
+                source: None,
+                ..upstream_answer(CacheHitKind::Fresh)
+            },
+        );
+        metrics.request_finished(&kept, &completed(1));
+
+        let refresh = crate::observe::RequestContext {
+            background_refresh: true,
+            ..request(46, "192.0.2.10:53000", "refreshed.example")
+        };
+        metrics.request_started(&refresh);
+        metrics.decision_made(&refresh, &forward_decision());
+        metrics.request_finished(&refresh, &completed(1));
+
+        assert_eq!(metrics.requests_total.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.cache_lookups_total.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.cache_hits_fresh.load(Ordering::Relaxed), 0);
         assert!(metrics.cache_lookup_counted.is_empty());
     }
 
@@ -3410,6 +3573,7 @@ mod tests {
                 fast_path: false,
             },
         );
+        metrics.decision_made(&ctx, &forward_decision());
         assert_eq!(metrics.requests_inflight.load(super::Ordering::Relaxed), 1);
         metrics.request_finished(&ctx, &completed(1));
 
@@ -3420,6 +3584,7 @@ mod tests {
         metrics.request_started(&background);
         metrics.pipeline_selected(&background, "main");
         metrics.cache_lookup(&background);
+        metrics.decision_made(&background, &forward_decision());
         for phase in [RulePhase::Request, RulePhase::Response] {
             metrics.rule_matched(
                 &background,
@@ -3630,7 +3795,7 @@ mod tests {
                     kind,
                     remaining_ttl: remaining,
                     original_ttl: None,
-                    source: None,
+                    source: Some("1.1.1.1:53"),
                 },
             );
         }
@@ -4146,12 +4311,13 @@ mod diagnostic_tests {
         use crate::engine::FastPathResponse;
         use std::sync::atomic::Ordering;
 
+        let (upstream, task) = fake_upstream().await;
         let raw = serde_json::json!({
-            "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+            "settings": { "default_upstream": upstream },
             "pipelines": [{ "id": "main", "rules": [{
-                "name": "block",
-                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
-                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                "name": "all",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream }]
             }] }]
         });
         let metrics = Arc::new(PanelMetrics::new(false));
@@ -4164,7 +4330,7 @@ mod diagnostic_tests {
         );
         query.metadata.recursion_desired = true;
         query.add_query(hickory_proto::op::Query::query(
-            hickory_proto::rr::Name::from_ascii("a.blocked.test.").unwrap(),
+            hickory_proto::rr::Name::from_ascii("www.example.test.").unwrap(),
             hickory_proto::rr::RecordType::A,
         ));
         let query = query.to_vec().unwrap();
@@ -4176,6 +4342,7 @@ mod diagnostic_tests {
         assert_eq!(metrics.requests_total.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.requests_inflight.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.requests_completed.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.cache_lookups_total.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.cache_hits_fresh.load(Ordering::Relaxed), 1);
         let page: serde_json::Value =
             serde_json::from_str(&metrics.query_log.collect(0, 10, None, None, None, 1)).unwrap();
@@ -4183,12 +4350,111 @@ mod diagnostic_tests {
         assert_eq!(entries.len(), 2);
         let cached = &entries[1];
         assert_eq!(cached["outcome"], "cached");
-        assert_eq!(cached["qname"], "a.blocked.test");
+        assert_eq!(cached["qname"], "www.example.test");
         assert_eq!(cached["pipeline"], "main");
-        assert_eq!(cached["rcode"], "NXDOMAIN");
+        assert_eq!(cached["rcode"], "NOERROR");
         assert_eq!(cached["steps"][0]["kind"], "pipeline");
         assert_eq!(cached["steps"][1]["kind"], "cache");
         assert_eq!(cached["steps"][1]["result"], "fresh");
+        task.abort();
+    }
+
+    /// 问一个查询，`qtype` 是问的类型 / One query, `qtype` being the type asked
+    fn query_of(name: &str, qtype: hickory_proto::rr::RecordType) -> Vec<u8> {
+        let mut query = hickory_proto::op::Message::new(
+            0x1234,
+            hickory_proto::op::MessageType::Query,
+            hickory_proto::op::OpCode::Query,
+        );
+        query.metadata.recursion_desired = true;
+        query.add_query(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_ascii(name).unwrap(),
+            qtype,
+        ));
+        query.to_vec().unwrap()
+    }
+
+    /// 像 UDP 监听器那样问：先走快速路径，答不了的带着预解析的数据走完整路径
+    /// Asks as the UDP listener does: the fast path first, and what it cannot answer goes the full
+    /// way with the pre-parsed data
+    async fn ask_as_a_listener(engine: &Engine, packet: &[u8]) {
+        use crate::engine::FastPathResponse;
+
+        let peer: std::net::SocketAddr = "192.0.2.7:53000".parse().unwrap();
+        let pre_parsed = match engine.handle_packet_fast(packet, peer).unwrap() {
+            Some(FastPathResponse::AsyncNeeded(pre_parsed)) => Some(pre_parsed),
+            Some(_) => return,
+            None => None,
+        };
+        engine
+            .answer_after_fast_path(packet, peer, pre_parsed)
+            .await
+            .expect("an answer");
+    }
+
+    /// 缓存命中率只算要靠上游回答的查询：缓存里存着的上游回答直接答上的算命中，去问了上游的算没命中。规则自己给的回答——拦截
+    /// 列表、域名映射、规则里写的静态回答——不算在里面，不管是当场给的，还是开着 `min_ttl` 时存进缓存以后再给的。这里每个名字
+    /// 都问两遍：被拦的、映射的、静态 TXT 的都不算，只有转给上游的那个名字算两次查找、一次命中。以前每次查缓存都算一次查找：
+    /// 规则的回答从不进缓存的那些永远是「没命中」，拦得越多命中率越低；进了缓存的那些又算成「命中」
+    /// The cache hit rate counts only the queries an upstream answers: an upstream's answer kept in
+    /// the cache and given straight away is a hit, a query that went to ask an upstream is a miss.
+    /// What the rules answer themselves (a blocklist, a domain mapping, a static answer written in a
+    /// rule) is left out, whether given on the spot or given from the cache once `min_ttl` kept it
+    /// there. Each name here is asked twice: the blocked one, the mapped one and the static TXT do
+    /// not count, and only the name forwarded to the upstream counts two lookups and one hit. Every
+    /// look in the cache used to count a lookup: the rules' answers that never go into the cache
+    /// were "misses" for ever, so the more was blocked the lower the hit rate went, and those that
+    /// do go in counted as hits
+    #[tokio::test]
+    async fn the_hit_rate_counts_only_what_an_upstream_answers() {
+        use hickory_proto::rr::RecordType;
+        use std::sync::atomic::Ordering;
+
+        let (upstream, task) = fake_upstream().await;
+        for min_ttl in [0, 60] {
+            let raw = json!({
+                "settings": { "default_upstream": upstream, "min_ttl": min_ttl },
+                "pipeline_select": [
+                    { "pipeline": "blocklist", "matcher_operator": "and",
+                      "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }] },
+                    { "pipeline": "main", "matcher_operator": "and", "matchers": [] }
+                ],
+                "pipelines": [
+                    { "id": "blocklist", "rules": [{
+                        "name": "拦截列表", "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                    }] },
+                    { "id": "main", "rules": [
+                        { "name": "mapped", "matchers": [{ "type": "domain_suffix", "value": "mapped.test" }],
+                          "actions": [{ "type": "static_ip_response", "ip": "192.0.2.1" }] },
+                        { "name": "text", "matchers": [{ "type": "domain_suffix", "value": "text.test" }],
+                          "actions": [{ "type": "static_txt_response", "text": ["hello"] }] },
+                        { "name": "all", "matchers": [{ "type": "any" }],
+                          "actions": [{ "type": "forward", "upstream": upstream }] }
+                    ] }
+                ]
+            });
+            let metrics = Arc::new(PanelMetrics::new(false));
+            let engine = engine_for(raw, Arc::clone(&metrics));
+            for (name, qtype) in [
+                ("ads.blocked.test.", RecordType::A),
+                ("www.mapped.test.", RecordType::A),
+                ("www.text.test.", RecordType::TXT),
+                ("www.example.", RecordType::A),
+            ] {
+                let packet = query_of(name, qtype);
+                ask_as_a_listener(&engine, &packet).await;
+                ask_as_a_listener(&engine, &packet).await;
+            }
+            assert_eq!(metrics.requests_total.load(Ordering::Relaxed), 8);
+            let counted = (
+                metrics.cache_lookups_total.load(Ordering::Relaxed),
+                metrics.cache_hits_fresh.load(Ordering::Relaxed),
+                metrics.cache_hits_stale.load(Ordering::Relaxed),
+            );
+            assert_eq!(counted, (2, 1, 0), "min_ttl {min_ttl}");
+        }
+        task.abort();
     }
 
     /// 照启动和重载的路子读配置（`parse_config`）/ Reads a config the way startup and reload do
