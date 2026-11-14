@@ -492,11 +492,21 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         cache_background_refresh,
         cache_refresh_threshold_percent,
         cache_refresh_min_ttl,
-        geoip_db_path,
-        geoip_dat_path,
-        geoip_auto_convert,
-        geoip_filter_countries,
-        geosite_data_paths,
+        // Geo 数据的设置决定读进哪些名单和网段。应答取决于它们的只有读 Geo 数据的 pipeline，那些 pipeline 按数据的代数换命名
+        // 空间（见 `with_geo`；配置重载换了文件也是新的一代），其余的不必跟着换。以前它们算进了每个 pipeline 的命名空间：面板
+        // 按内容给 Geo 数据和拦截列表的文件起名，每次更新都换一个文件，名单一更新整份缓存就作废。后两个现在什么也不做
+        // The Geo settings decide which lists and networks are read in. Only the pipelines
+        // reading Geo data have answers that depend on them, and those move namespace with
+        // the data's generation (see `with_geo`; a reload changing the files is a new
+        // generation too), so the rest need not follow. They used to go into every
+        // pipeline's namespace: the panel names the files of Geo data and blocklists by their
+        // content, every update brings another file, and every list update dropped the whole
+        // cache. The last two do nothing at present
+        geoip_db_path: _,
+        geoip_dat_path: _,
+        geoip_auto_convert: _,
+        geoip_filter_countries: _,
+        geosite_data_paths: _,
         enable_tcp_fallback,
         // 只在启动时读（见 `GlobalSettings::restart_pending`）：重载改了也不生效，应答不变，不让缓存换代
         // Read at startup only (see `GlobalSettings::restart_pending`): a reload changing them
@@ -553,15 +563,7 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         cache_refresh_min_ttl,
     )
         .hash(hasher);
-    (
-        geoip_db_path,
-        geoip_dat_path,
-        geoip_auto_convert,
-        geoip_filter_countries,
-        geosite_data_paths,
-        enable_tcp_fallback,
-    )
-        .hash(hasher);
+    enable_tcp_fallback.hash(hasher);
 }
 
 fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher) {
@@ -787,7 +789,7 @@ mod tests {
     #[test]
     fn every_setting_applied_on_reload_changes_all_namespaces() {
         type Change = fn(&mut crate::config::GlobalSettings);
-        let changes: [(&str, Change); 19] = [
+        let changes: [(&str, Change); 14] = [
             ("min_ttl", |s| s.min_ttl += 1),
             ("default_upstream", |s| {
                 s.default_upstream = "1.0.0.1:53".into()
@@ -813,6 +815,30 @@ mod tests {
                 s.cache_refresh_threshold_percent = s.cache_refresh_threshold_percent % 99 + 1
             }),
             ("cache_refresh_min_ttl", |s| s.cache_refresh_min_ttl += 1),
+            ("enable_tcp_fallback", |s| {
+                s.enable_tcp_fallback = !s.enable_tcp_fallback
+            }),
+        ];
+        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let before = build_cache_namespaces(&before_config);
+        for (name, change) in changes {
+            let mut after_config = before_config.clone();
+            change(&mut after_config.settings);
+            let after = build_cache_namespaces(&after_config);
+            assert_ne!(before.get("first"), after.get("first"), "{name}");
+            assert_ne!(before.get("second"), after.get("second"), "{name}");
+        }
+    }
+
+    /// Geo 数据的设置不进命名空间的哈希：读 Geo 数据的 pipeline 按数据的代数换命名空间（见 `with_geo`），其余的不跟着换。
+    /// 以前改哪一个都让所有 pipeline 换命名空间
+    /// The Geo settings stay out of the namespace hash: the pipelines reading Geo data move
+    /// namespace with the data's generation (see `with_geo`), and the rest do not follow.
+    /// Changing any of them used to move every pipeline
+    #[test]
+    fn geo_settings_leave_namespaces_to_the_geo_generation() {
+        type Change = fn(&mut crate::config::GlobalSettings);
+        let changes: [(&str, Change); 5] = [
             ("geoip_db_path", |s| {
                 s.geoip_db_path = Some("/geo/a.mmdb".into())
             }),
@@ -828,18 +854,13 @@ mod tests {
             ("geosite_data_paths", |s| {
                 s.geosite_data_paths.push("/geo/site.dat".into())
             }),
-            ("enable_tcp_fallback", |s| {
-                s.enable_tcp_fallback = !s.enable_tcp_fallback
-            }),
         ];
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         let before = build_cache_namespaces(&before_config);
         for (name, change) in changes {
             let mut after_config = before_config.clone();
             change(&mut after_config.settings);
-            let after = build_cache_namespaces(&after_config);
-            assert_ne!(before.get("first"), after.get("first"), "{name}");
-            assert_ne!(before.get("second"), after.get("second"), "{name}");
+            assert_eq!(before, build_cache_namespaces(&after_config), "{name}");
         }
     }
 

@@ -328,6 +328,135 @@ async fn only_pipelines_that_use_the_data_change_namespace() {
     assert_eq!(moved(&after_site, &all()), ["ip"], "a GeoIP update");
 }
 
+/// 面板按内容给 Geo 数据和拦截列表的文件起名，每次更新都换一个文件、重载一次配置。用到 GeoSite 的 pipeline 照样换命名空间、
+/// 按新名单作答；不读 Geo 数据的 pipeline 留着上游给的应答，不必再问一遍。以前 `geosite_data_paths` 算进了每个 pipeline 的
+/// 命名空间，名单一更新整份缓存就作废，留着过期续用的应答也一起没了
+/// The panel names the files of Geo data and blocklists by their content, so every update
+/// brings another file and a configuration reload. The pipelines that use GeoSite move to a
+/// new namespace as before and answer by the new list; the pipelines reading no Geo data keep
+/// the upstream's answers and need not ask again. `geosite_data_paths` used to go into every
+/// pipeline's namespace, so every list update dropped the whole cache, the answers kept for
+/// serving stale with it
+#[tokio::test]
+async fn a_geosite_file_renamed_by_a_reload_leaves_pipelines_reading_no_geo_data_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("blocklist-1.dat");
+    let second = dir.path().join("blocklist-2.dat");
+    std::fs::write(&first, ads(&["ads.example"])).unwrap();
+    std::fs::write(&second, ads(&["ads.example", "tracker.example"])).unwrap();
+    let up = answering_upstream(UPSTREAM, 3600).await;
+    let config = |site: &Path| {
+        runtime(json!({
+            "settings": settings(json!({ "geosite_data_paths": [site.to_str().unwrap()] })),
+            "pipeline_select": [
+                { "pipeline": "blocked", "matchers": [{ "type": "geo_site", "value": "ads" }] },
+                { "pipeline": "main", "matchers": [] }
+            ],
+            "pipelines": [
+                { "id": "blocked", "rules": [{ "name": "block", "matchers": [],
+                    "actions": [{ "type": "static_ip_response", "ip": MATCHED.to_string() }] }] },
+                { "id": "main", "rules": [
+                    { "name": "split", "matchers": [{ "type": "geo_site", "value": "ads" }],
+                      "actions": [{ "type": "static_ip_response", "ip": OTHER.to_string() }] },
+                    { "name": "rest", "matchers": [],
+                      "actions": [{ "type": "jump_to_pipeline", "pipeline": "upstream" }] }
+                ] },
+                { "id": "upstream", "rules": [{ "name": "forward", "matchers": [],
+                    "actions": [{ "type": "forward", "upstream": up.address }] }] }
+            ]
+        }))
+    };
+    let engine = Engine::new(config(&first), "test".to_string()).expect("engine");
+    for name in ["www.example", "tracker.example"] {
+        assert_eq!(
+            both_paths(&engine, name).await,
+            [Some(UPSTREAM); 2],
+            "{name}"
+        );
+    }
+    assert_eq!(up.queries(), 2);
+
+    let (main, upstream) = (namespace(&engine, "main"), namespace(&engine, "upstream"));
+    engine.reload(config(&second));
+    assert_ne!(namespace(&engine, "main"), main, "main reads GeoSite");
+    assert_eq!(
+        both_paths(&engine, "tracker.example").await,
+        [Some(MATCHED); 2],
+        "the new list applies"
+    );
+    assert_eq!(
+        namespace(&engine, "upstream"),
+        upstream,
+        "upstream reads no Geo data"
+    );
+    assert_eq!(
+        both_paths(&engine, "www.example").await,
+        [Some(UPSTREAM); 2]
+    );
+    assert_eq!(up.queries(), 2, "the upstream's answer stayed in the cache");
+}
+
+/// GeoIP 也一样：换了文件，按回答地址判断 GeoIP 的 pipeline 换命名空间，不读 Geo 数据的留着缓存
+/// GeoIP likewise: with another file, the pipeline judging answer addresses by GeoIP moves to
+/// a new namespace, and one reading no Geo data keeps its cache
+#[tokio::test]
+async fn a_geoip_file_renamed_by_a_reload_leaves_pipelines_reading_no_geo_data_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("geoip-1.json");
+    let second = dir.path().join("geoip-2.json");
+    let networks =
+        |net: &str| format!(r#"{{"entries":[{{"country_code":"TESTNET","ips":["{net}"]}}]}}"#);
+    std::fs::write(&first, networks("198.51.100.0/24")).unwrap();
+    std::fs::write(&second, networks("192.0.2.0/24")).unwrap();
+    let up = answering_upstream(UPSTREAM, 3600).await;
+    let config = |ip: &Path| {
+        runtime(json!({
+            "settings": settings(json!({ "geoip_dat_path": ip.to_str().unwrap() })),
+            "pipelines": [
+                { "id": "main", "rules": [
+                    { "name": "checked", "matchers": [{ "type": "domain_suffix", "value": "checked.example" }],
+                      "actions": [{ "type": "jump_to_pipeline", "pipeline": "ip" }] },
+                    { "name": "rest", "matchers": [{ "type": "any" }],
+                      "actions": [{ "type": "jump_to_pipeline", "pipeline": "plain" }] }
+                ] },
+                { "id": "ip", "rules": [{ "name": "c", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": up.address }],
+                    "response_matchers": [
+                        { "type": "response_answer_ip_geoip_country", "country_codes": ["TESTNET"] }
+                    ],
+                    "response_actions_on_match": [{ "type": "static_ip_response", "ip": MATCHED.to_string() }] }] },
+                { "id": "plain", "rules": [{ "name": "d", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": up.address }] }] }
+            ]
+        }))
+    };
+    let engine = Engine::new(config(&first), "test".to_string()).expect("engine");
+    assert_eq!(
+        both_paths(&engine, "www.example").await,
+        [Some(UPSTREAM); 2]
+    );
+    assert_eq!(
+        both_paths(&engine, "www.checked.example").await,
+        [Some(UPSTREAM); 2]
+    );
+    assert_eq!(up.queries(), 2);
+
+    let (ip, plain) = (namespace(&engine, "ip"), namespace(&engine, "plain"));
+    engine.reload(config(&second));
+    assert!(in_testnet("192.0.2.1")(&engine), "the new networks are in");
+    assert_ne!(namespace(&engine, "ip"), ip, "ip judges answers by GeoIP");
+    assert_eq!(
+        namespace(&engine, "plain"),
+        plain,
+        "plain reads no Geo data"
+    );
+    assert_eq!(
+        both_paths(&engine, "www.example").await,
+        [Some(UPSTREAM); 2]
+    );
+    assert_eq!(up.queries(), 2, "the upstream's answer stayed in the cache");
+}
+
 /// 按客户端地址判断 GeoIP 国家的规则不靠换命名空间：缓存的键带着客户端那次判断的结果，网段一换，判断结果跟着变，
 /// 查到的就是另一个条目，所以照样按新网段作答
 /// Rules judging the client address's GeoIP country need no namespace change: cache keys
