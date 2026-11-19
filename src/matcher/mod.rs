@@ -1232,15 +1232,16 @@ fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> V
         .collect()
 }
 
-/// 配置和 GeoSite 数据里的一条正则最长多少字节，在解析之前查。正则先整条解析成语法树才看编译后的大小，`\w`、`\pL`
-/// 这样的字符类在树里每个都是几 KB 的 Unicode 区间：1 MiB 的 `\w` 还没轮到编译的上限，就要 3 GB 以上的内存。域名
-/// 最长 253 字节，真用到的正则短得多；`\w` 连写到一百来字节，编译后就超过 1 MB 了
+/// 配置和 GeoSite 数据里的一条正则最长多少字节，在解析之前查。正则先整条解析成语法树才看编译后的大小，`\pL` 这样的
+/// Unicode 字符类在树里每个都是几 KB 的区间：以前按 Unicode 理解的 `\w` 也是，1 MiB 的 `\w` 还没轮到编译的上限，就要
+/// 3 GB 以上的内存（`\w` 现在按 ASCII 理解，见 [`go_classes`]）。域名最长 253 字节，真用到的正则短得多；`\pL{50}`
+/// 编译后就超过 1 MB 了
 /// The most bytes one regex of a configuration or of GeoSite data may be written in, checked
 /// before it is parsed. A regex is parsed whole into its syntax tree before its compiled size is
-/// looked at, and each class such as `\w` or `\pL` is several KB of Unicode ranges there: 1 MiB
-/// of `\w` takes over 3 GB before the compiled limit is reached. A name is at most 253 bytes
-/// and the regexes really used are far shorter; `\w` written out to a hundred-odd bytes is
-/// already over 1 MB compiled
+/// looked at, and each Unicode class such as `\pL` is several KB of ranges there: so was `\w`
+/// read as Unicode, and 1 MiB of it took over 3 GB before the compiled limit was reached (`\w`
+/// now reads as ASCII, see [`go_classes`]). A name is at most 253 bytes and the regexes really
+/// used are far shorter; `\pL{50}` is already over 1 MB compiled
 pub(crate) const MAX_REGEX_LEN: usize = 16 * 1024;
 
 /// 正则写得比 `max` 字节长时的报错 / The error for a regex written longer than `max` bytes
@@ -1254,15 +1255,158 @@ pub(crate) fn regex_within(pattern: &str, max: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 匹配器的正则（域名的，和 TXT 内容的）：最长 [`MAX_REGEX_LEN`] 字节，状态空间和 DFA 各限 1 MB，防止复杂度攻击
-/// A matcher's regex (for names, and for TXT content): at most [`MAX_REGEX_LEN`] bytes, with
-/// the state space and the DFA each capped at 1 MB against complexity attacks
-fn domain_regex(pattern: &str) -> anyhow::Result<Regex> {
+/// 一条域名正则（GeoSite 数据的和配置的）实际要编译的写法：按 Go 的 ASCII 含义改写过字符类的（见 [`go_classes`]），
+/// 改写后语法不对（不该发生）就用原样，原样也不对时返回语法错误，引的是原样；比 [`MAX_REGEX_LEN`] 长的不解析，直接
+/// 返回错误。只检查语法、不编译：GeoSite 数据文件里一个 tag 的正则读完以后合成一个集合，只编译这一次（见
+/// `geosite::Regexes::new`）；以前每条先单独编译一次，`geolocation-!cn` 的 151 条因此多占好几 MiB。
+/// The pattern a domain regex (of GeoSite data, or of a configuration) actually compiles as:
+/// with its classes rewritten to their ASCII meaning in Go (see [`go_classes`]), as written
+/// when the rewrite does not parse (it should not happen), and a syntax error quoting it as
+/// written when that does not parse either; one longer than [`MAX_REGEX_LEN`] is an error
+/// without being parsed. Only the syntax is checked, nothing compiles: a GeoSite data file's
+/// regexes for one tag are combined into one set once read, which is the only compile (see
+/// `geosite::Regexes::new`); compiling each one first as well cost several MiB for the 151
+/// regexes of `geolocation-!cn`.
+fn ascii_regex_pattern(pattern: &str) -> anyhow::Result<String> {
     regex_within(pattern, MAX_REGEX_LEN)?;
-    Ok(RegexBuilder::new(pattern)
+    let check = |pattern: &str| {
+        regex_syntax::Parser::new()
+            .parse(pattern)
+            .map(drop)
+            .map_err(Box::new)
+    };
+    if let std::borrow::Cow::Owned(rewritten) = go_classes(pattern)
+        && check(&rewritten).is_ok()
+    {
+        return Ok(rewritten);
+    }
+    check(pattern)?;
+    Ok(pattern.to_owned())
+}
+
+/// `pattern` 里的 `\w`、`\d`、`\s`、`\b` 及其大写的取反形式改成 Go 正则的 ASCII 含义：字符类外写成一个字符类
+/// （`\b` 写成 `(?-u:\b)`；`\b{start}` 这样带名字的词边界整个写进去，`\<`、`\>` 也一样），字符类里展开成范围（取反的
+/// 写成嵌套的字符类）。转义的反斜杠和别的转义原样保留。
+/// `\w`, `\d`, `\s` and `\b` in `pattern`, and their negated capitals, rewritten to their ASCII
+/// meaning in Go regexes: outside a class each becomes a class (`\b` becomes `(?-u:\b)`; a named
+/// boundary such as `\b{start}` goes in whole, and so do `\<` and `\>`), inside a class it
+/// becomes ranges (a negated one a nested class). Escaped backslashes and other escapes stay as
+/// they are.
+fn go_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
+    const WORD: &str = "0-9A-Za-z_";
+    const DIGIT: &str = "0-9";
+    const SPACE: &str = r"\t\n\f\r ";
+    if !pattern.contains('\\') {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut changed = false;
+    // 字符类嵌套的层数，和刚开始一个字符类（这时的 `]` 是字面字符）
+    // How deep in character classes, and whether one just began (where `]` is a literal)
+    let (mut depth, mut class_start) = (0usize, false);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        let starting = std::mem::take(&mut class_start);
+        match c {
+            '\\' => {
+                let Some(next) = chars.next() else {
+                    out.push(c);
+                    break;
+                };
+                let class = match next.to_ascii_lowercase() {
+                    'w' => Some(WORD),
+                    'd' => Some(DIGIT),
+                    's' => Some(SPACE),
+                    _ => None,
+                };
+                match (class, next.is_ascii_uppercase(), depth > 0) {
+                    (Some(class), false, true) => out.push_str(class),
+                    (Some(class), negated, _) => {
+                        out.push_str(if negated { "[^" } else { "[" });
+                        out.push_str(class);
+                        out.push(']');
+                    }
+                    (None, _, false) if matches!(next, 'b' | 'B' | '<' | '>') => {
+                        out.push_str("(?-u:\\");
+                        out.push(next);
+                        // 词边界的名字（`start`、`end`、`start-half`、`end-half`）以字母开头；`\b{2}` 是
+                        // 重复次数，留在外面
+                        // A boundary's name (`start`, `end`, `start-half`, `end-half`) starts with a
+                        // letter; `\b{2}` is a repetition and stays outside
+                        let rest = chars.as_str();
+                        if next == 'b'
+                            && let Some(name) = rest.strip_prefix('{')
+                            && name.starts_with(|c: char| c.is_ascii_alphabetic())
+                            && let Some(end) = rest.find('}')
+                        {
+                            out.push_str(&rest[..=end]);
+                            chars = rest[end + 1..].chars();
+                        }
+                        out.push(')');
+                    }
+                    _ => {
+                        out.push(c);
+                        out.push(next);
+                        continue;
+                    }
+                }
+                changed = true;
+            }
+            '[' => {
+                depth += 1;
+                class_start = true;
+                out.push(c);
+            }
+            '^' if starting => {
+                class_start = true;
+                out.push(c);
+            }
+            ']' if depth > 0 && !starting => {
+                depth -= 1;
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    }
+}
+
+/// 域名的正则（规则和入口的 `domain_regex`、回答条件的 `request_domain_regex`）：最长 [`MAX_REGEX_LEN`] 字节，按写的
+/// 长度在解析之前查；照写的得是对的正则，`\w`、`\d`、`\s`、`\b` 按 ASCII 理解，和 GeoSite 的正则一样（见
+/// [`ascii_regex_pattern`]）；编译后限 1 MB（见 [`limited_regex`]）。规则看到的名字只有 ASCII（见
+/// `proto_utils::name_text`），两种理解匹配结果相同；按 Unicode 理解时一个 `\w` 就是几百个区间，`\w{50}` 编译后就超过
+/// 1 MB，一千条 `\w{20}` 这样的短正则校验时要 1.2 GiB，三千条 3 GiB 也不够
+/// A name regex (`domain_regex` in rules and entries, `request_domain_regex` in answer
+/// conditions): at most [`MAX_REGEX_LEN`] bytes as written, checked before it is parsed; valid
+/// as written, with `\w`, `\d`, `\s` and `\b` read as ASCII, as in GeoSite regexes (see
+/// [`ascii_regex_pattern`]); and within 1 MB compiled (see [`limited_regex`]). The names rules
+/// see are ASCII alone (see `proto_utils::name_text`), so they match the same either way; read
+/// as Unicode one `\w` is hundreds of ranges, `\w{50}` is over 1 MB compiled, and a thousand
+/// short regexes such as `\w{20}` took 1.2 GiB to validate, three thousand more than 3 GiB
+fn domain_regex(pattern: &str) -> anyhow::Result<Regex> {
+    // 长度在这里面先查 / The length is checked in here first
+    let ascii = ascii_regex_pattern(pattern)?;
+    // 照写的写错了，照旧按写错拒绝：`[\w-a]` 照写是错的（`\w` 不能当区间的一端），改写后却成了合法的区间。
+    // 只解析成语法树，不展开字符类，花不了多少
+    // One written wrong is refused as before: `[\w-a]` is wrong as written (`\w` cannot end a
+    // range), yet a valid range once rewritten. Parsed into the syntax tree alone, classes not
+    // spelt out, which costs little
+    regex_syntax::ast::parse::Parser::new().parse(pattern)?;
+    Ok(limited_regex(&ascii)?)
+}
+
+/// 匹配器的正则（域名的，和 TXT 内容的）编译时状态空间和 DFA 各限 1 MB，防止复杂度攻击
+/// A matcher's regex (for names, and for TXT content) compiled with the state space and the
+/// DFA each capped at 1 MB against complexity attacks
+fn limited_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern)
         .size_limit(1_000_000)
         .dfa_size_limit(1_000_000)
-        .build()?)
+        .build()
 }
 
 /// 逗号分隔的 CIDR 列表，空项跳过 / A comma-separated CIDR list, empty items skipped
@@ -1666,11 +1810,14 @@ impl RuntimeResponseMatcher {
                         // ReDoS保护: 限制正则表达式大小 / ReDoS protection: limit regex size
                         const MAX_TXT_REGEX_LEN: usize = 1000;
                         regex_within(&value, MAX_TXT_REGEX_LEN)?;
-                        // 编译后的大小和域名正则一个上限。以前限在 1000 字节，`.`、`\d+` 都编译不过
+                        // 编译后的大小和域名正则一个上限。以前限在 1000 字节，`.`、`\d+` 都编译不过。
+                        // 字符类不像域名正则那样改成 ASCII：TXT 里本来就可以写任意文字，照写的编译
                         // The compiled size gets the limit domain regexes have. It was held to
-                        // 1000 bytes, which `.` or `\d+` already exceed
+                        // 1000 bytes, which `.` or `\d+` already exceed. Its classes are not made
+                        // ASCII as a domain regex's are: TXT may hold any text, so it compiles as
+                        // written
                         Some(
-                            domain_regex(&value)
+                            limited_regex(&value)
                                 .map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?,
                         )
                     }
@@ -2110,7 +2257,8 @@ mod tests {
     /// 配置里的正则最长 16384 字节，在解析之前查。正则先整条解析成语法树才看编译后的大小，`\w` 在树里每个都是几 KB
     /// 的 Unicode 区间：以前 1 MiB 的 `\w` 送去校验，要 3 GB 以上的内存。三种域名正则都是：刚好 16384 字节、
     /// 内容寻常的照常读入；长一个字节的读不进来，说明写了多长；`\w` 连写 64 KiB 报的也是太长（以前解析完才报编译超限，
-    /// 要两百来 MB）。短于上限的照旧：编译超过 1 MB 的仍按编译的上限拒绝
+    /// 要两百来 MB）。短于上限的照旧：编译超过 1 MB 的（`\pL` 连写 200 个；`\w` 现在按 ASCII 理解，连写 200 个也编得出，
+    /// 见 `word_classes_in_a_domain_regex_are_ascii`）仍按编译的上限拒绝
     /// A configuration's regex is at most 16384 bytes, checked before it is parsed. A regex is
     /// parsed whole into its syntax tree before its compiled size is looked at, and each `\w` is
     /// several KB of Unicode ranges there: 1 MiB of `\w` sent for validation used to take over
@@ -2118,7 +2266,8 @@ mod tests {
     /// loads; one byte longer is refused, saying how long it is; 64 KiB of `\w` written out is
     /// refused as too long as well (it used to be parsed first, taking some two hundred MB, and
     /// then refused for its compiled size). Below the limit nothing changes: one over 1 MB
-    /// compiled is still refused by the compiled limit
+    /// compiled (200 `\pL` written out; `\w` now reads as ASCII, and 200 of them compile, see
+    /// `word_classes_in_a_domain_regex_are_ascii`) is still refused by the compiled limit
     #[test]
     fn a_regex_in_a_configuration_is_at_most_16_kib() {
         let validate = |config: serde_json::Value| crate::config::validate(&config.to_string());
@@ -2147,7 +2296,7 @@ mod tests {
                 "matcher {which}: {err}"
             );
         }
-        for (which, below) in domain_regex_configs(&r"\w".repeat(200))
+        for (which, below) in domain_regex_configs(&r"\pL".repeat(200))
             .into_iter()
             .enumerate()
         {
@@ -2159,22 +2308,306 @@ mod tests {
         }
     }
 
-    /// 三种域名正则（请求规则、pipeline 选择、响应规则）编译时都限 1 MB：`\w{20}` 编得出，
-    /// `\w{50}` 超出上限、配置读不进来（默认上限下它编得出）
+    /// 三种域名正则（请求规则、pipeline 选择、响应规则）编译时都限 1 MB：`\pL{20}` 编得出，
+    /// `\pL{50}` 超出上限、配置读不进来（默认上限下它编得出）。用 `\pL` 是因为它照旧是几百个区间的 Unicode 字母类；
+    /// `\w` 现在按 ASCII 理解，`\w{50}` 编得出（见 `word_classes_in_a_domain_regex_are_ascii`）
     /// The three domain regexes (request rules, pipeline selection, response rules) all
-    /// compile within 1 MB: `\w{20}` compiles, while `\w{50}` exceeds the limit and the
-    /// configuration is refused (it compiles under the default limits)
+    /// compile within 1 MB: `\pL{20}` compiles, while `\pL{50}` exceeds the limit and the
+    /// configuration is refused (it compiles under the default limits). `\pL` because it is
+    /// still the Unicode letter class of hundreds of ranges; `\w` now reads as ASCII, and
+    /// `\w{50}` compiles (see `word_classes_in_a_domain_regex_are_ascii`)
     #[test]
     fn a_domain_regex_is_limited_to_a_megabyte() {
-        assert!(regex::Regex::new(r"\w{50}").is_ok());
+        assert!(regex::Regex::new(r"\pL{50}").is_ok());
         let configs = domain_regex_configs;
-        for (which, (small, large)) in configs(r"\w{20}")
+        for (which, (small, large)) in configs(r"\pL{20}")
             .into_iter()
-            .zip(configs(r"\w{50}"))
+            .zip(configs(r"\pL{50}"))
             .enumerate()
         {
             assert!(runtime_of(small).is_ok(), "matcher {which}");
             assert!(runtime_of(large).is_err(), "matcher {which}");
+        }
+    }
+
+    /// 三种域名正则各照 `pattern` 建好，拿去匹配一个名字：请求规则、pipeline 选择、响应规则各自的结果
+    /// The three domain regexes built from `pattern`, matching a name: what the request rule,
+    /// the pipeline selection and the response rule each say
+    fn domain_regex_matchers(pattern: &str) -> impl Fn(&str) -> [bool; 3] {
+        let [rule, select, response] = domain_regex_configs(pattern)
+            .map(|config| runtime_of(config).unwrap_or_else(|err| panic!("{pattern}: {err:#}")));
+        let message = Message::new(0, MessageType::Response, OpCode::Query);
+        move |name: &str| {
+            let client_ip = IpAddr::from([192, 0, 2, 1]);
+            let query = PipelineSelectorQuery {
+                listener_label: "test",
+                client_ip,
+                qname: name,
+                qclass: DNSClass::IN,
+                edns_present: false,
+                qtype: RecordType::A,
+            };
+            [
+                rule.pipelines[0].rules[0].matchers[0]
+                    .matcher
+                    .matches_with_qtype(
+                        name,
+                        DNSClass::IN,
+                        client_ip,
+                        false,
+                        RecordType::A,
+                        None,
+                        None,
+                    ),
+                select.pipeline_select[0].matchers[0]
+                    .matcher
+                    .matches_with_ready_managers(&query, None, None),
+                response.pipelines[0].rules[0].response_matchers[0]
+                    .matcher
+                    .matches(
+                        "udp:test",
+                        name,
+                        RecordType::A,
+                        DNSClass::IN,
+                        &message,
+                        None,
+                        None,
+                    ),
+            ]
+        }
+    }
+
+    /// 域名正则里的 `\w`、`\d`、`\s`、`\b` 和它们大写的取反形式按 ASCII 理解，和 GeoSite 的 `regexp:` 一样：规则看到的
+    /// 名字只有 ASCII（见 `proto_utils::name_text`）。按 Unicode 理解时一个 `\w` 就是几百个区间，`\w{50}` 编译后超过
+    /// 1 MB，一份配置里这样的短正则一多，校验和运行时都要好几 GB。下面每一条照写的按 Unicode、1 MB 的上限都编不出，
+    /// 现在三种域名正则里都读得进来：连写的 `\w`、取反的、字符类里的、`(?i)` 下的，带 `\b{start}`、`\<` 这类词边界的也是
+    /// `\w`, `\d`, `\s` and `\b` in a domain regex, and their negated capitals, read as ASCII,
+    /// as in a GeoSite `regexp:`: the names rules see are ASCII alone (see
+    /// `proto_utils::name_text`). Read as Unicode one `\w` is hundreds of ranges, `\w{50}` is
+    /// over 1 MB compiled, and a configuration with many such short regexes takes gigabytes to
+    /// validate and to run. Every pattern below fails to compile as written, as Unicode within
+    /// 1 MB, and now loads in all three domain regexes: `\w` written out, negated, inside a
+    /// class, under `(?i)`, and next to word boundaries such as `\b{start}` or `\<`
+    #[test]
+    fn word_classes_in_a_domain_regex_are_ascii() {
+        let as_written = |pattern: &str| {
+            RegexBuilder::new(pattern)
+                .size_limit(1_000_000)
+                .dfa_size_limit(1_000_000)
+                .build()
+        };
+        for pattern in [
+            r"\w{50}".to_owned(),
+            r"\w{60}".to_owned(),
+            r"\w".repeat(200),
+            r"\W{60}".to_owned(),
+            r"[\w.-]{60}".to_owned(),
+            r"[^\W\d]{60}".to_owned(),
+            r"(?i)\w{60}".to_owned(),
+            r"\b{start}\w{60}\b{end}".to_owned(),
+            r"\<\w{60}\>".to_owned(),
+        ] {
+            assert!(as_written(&pattern).is_err(), "{pattern} as Unicode");
+            for (which, config) in domain_regex_configs(&pattern).into_iter().enumerate() {
+                if let Err(err) = crate::config::validate(&config.to_string()) {
+                    panic!("{pattern}, matcher {which}: {err:#}");
+                }
+            }
+        }
+    }
+
+    /// 一份配置里一千条 `^\w{18}\.example-N\.com$`：照写的按 Unicode 编译，每条都超过 64 KiB，一千条校验时要 1.5 GB
+    /// 以上、好几秒。现在这份配置校验通过，读进来的每一条正则在 64 KiB 的上限下也编得出
+    /// A thousand `^\w{18}\.example-N\.com$` in one configuration: compiled as written, as
+    /// Unicode, each is over 64 KiB, and validating the thousand took over 1.5 GB and seconds.
+    /// Now the configuration validates, and every regex it loads compiles within 64 KiB
+    #[test]
+    fn a_thousand_word_class_regexes_stay_small() {
+        let within_64_kib = |pattern: &str| {
+            RegexBuilder::new(pattern)
+                .size_limit(64 * 1024)
+                .dfa_size_limit(64 * 1024)
+                .build()
+                .is_ok()
+        };
+        let pattern = |i: usize| format!(r"^\w{{18}}\.example-{i}\.com$");
+        assert!(!within_64_kib(&pattern(0)), "as written, as Unicode");
+        let compiled = |config: serde_json::Value| -> Vec<String> {
+            let config = runtime_of(config).expect("build runtime config");
+            config.pipelines[0]
+                .rules
+                .iter()
+                .map(|rule| match &rule.matchers[0].matcher {
+                    RuntimeMatcher::DomainRegex { regex } => regex.as_str().to_owned(),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        // 先看一条，以前的写法在这里就停下，不用把一千条都按 Unicode 编一遍
+        // One first, so the old way stops here without compiling a thousand as Unicode
+        let one = compiled(one_rule(serde_json::json!([
+            { "type": "domain_regex", "value": pattern(0) }
+        ])));
+        assert!(within_64_kib(&one[0]), "{}", one[0]);
+
+        let rules: Vec<serde_json::Value> = (0..1000)
+            .map(|i| {
+                serde_json::json!({
+                    "name": format!("r{i}"),
+                    "matchers": [{ "type": "domain_regex", "value": pattern(i) }],
+                    "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                })
+            })
+            .collect();
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": rules }]
+        });
+        let report = crate::config::validate(&config.to_string()).expect("validate");
+        assert_eq!(report.rule_count, 1000);
+        let regexes = compiled(config);
+        assert_eq!(regexes.len(), 1000);
+        for regex in &regexes {
+            assert!(within_64_kib(regex), "{regex}");
+        }
+    }
+
+    /// 只含 ASCII 的名字，匹配结果和按 Unicode 照写编译时一样：`\w`、`\d`、`\s`、`\b` 和取反形式，字符类里的、
+    /// 嵌套和求交的，锚点、`(?i)`、`(?x)`、分支，`\b{start}`、`\<` 这类词边界，和 `\p{..}` 混写的。名字按规则看到的
+    /// 写法给（见 `proto_utils::name_text`）：小写，标签里的点、空格和非 ASCII 字节写成 `\DDD`；另加几个带大写的。
+    /// 三种域名正则都比；每条正则至少命中一个名字、至少漏掉一个，表才不是空比
+    /// Names of ASCII alone match as they do with the pattern compiled as written, as Unicode:
+    /// `\w`, `\d`, `\s`, `\b` and their negations, inside classes, nested and intersected,
+    /// with anchors, `(?i)`, `(?x)`, alternations, word boundaries such as `\b{start}` or `\<`,
+    /// and mixed with `\p{..}`. Names come as rules see them (see `proto_utils::name_text`):
+    /// lower case, with a dot, a space or a non-ASCII byte inside a label written as `\DDD`;
+    /// a few with capitals besides. All three domain regexes are compared; each pattern
+    /// matches at least one name and misses at least one, so the table compares something
+    #[test]
+    fn ascii_names_match_a_domain_regex_as_before() {
+        let names = [
+            "www.example.com",
+            "a-b_c.example.com",
+            "_dmarc.example.com",
+            "cdn12.example.net",
+            "ads.site3.example",
+            "track.site10.example",
+            "trackads.example",
+            "1.2.0.192.in-addr.arpa",
+            "x.test",
+            "x1.test",
+            "-.test",
+            "*.wild.test",
+            r"a\046b.example",
+            r"a\032b.example",
+            r"\195\169.example",
+            "WWW.Example.COM",
+            "Cdn7.EXAMPLE.net",
+        ];
+        for pattern in [
+            r"^\w+\.example\.com$",
+            r"^[\w-]+\.example\.com$",
+            r"^cdn\d+\.example\.net$",
+            r"(?i)^cdn\d+\.example\.net$",
+            r"^[^\d]+\.test$",
+            r"\bads\b",
+            r"\Bads",
+            r"\w\W\w",
+            r"^\W",
+            r"\D\d\.",
+            r"^\S+\.test$",
+            r"\s|-",
+            r"^\S*\\\d{3}",
+            r"(?i)^WWW\.\w+\.COM$",
+            r"^(ads?|track\d*)\.site\d+\.example$",
+            r"^\d{1,3}(\.\d{1,3}){3}\.in-addr\.arpa$",
+            r"^[a\W]",
+            r"^[[:alpha:]\d]+\.test$",
+            r"^[\w&&[^\d]]+\.test$",
+            r"^[\w--_]+\.",
+            r"^[a-z]\w*\.test$",
+            r"\b{start}www\b{end}",
+            r"\<site\d+\>",
+            r"(?x) ^ \w+ \. example \. com $",
+            r"^\p{L}\w*\.test$",
+        ] {
+            let unicode = regex::Regex::new(pattern).expect(pattern);
+            let matched = domain_regex_matchers(pattern);
+            let mut seen = [false; 2];
+            for name in names {
+                let before = unicode.is_match(name);
+                assert_eq!(matched(name), [before; 3], "{pattern} against {name}");
+                seen[usize::from(before)] = true;
+            }
+            assert_eq!(seen, [true, true], "{pattern} matches some names, not all");
+        }
+    }
+
+    /// 和以前不同的只有含非 ASCII 字符的文本：`\w` 不认 `é`，`\d` 不认 `٣`，`\s` 不认不换行空格，`\b`、`\<` 把 `é`
+    /// 当作词外的字符。规则看不到这样的文本：标签里不是可打印 ASCII 的字节写成 `\DDD`，同一个名字以前和现在结果一样
+    /// Only text beyond ASCII reads differently: `\w` takes no `é`, `\d` no `٣`, `\s` no
+    /// no-break space, and `\b` and `\<` take `é` as outside a word. Rules never see such text: a
+    /// label byte that is not printable ASCII is written as `\DDD`, and the same name matches as
+    /// it did before
+    #[test]
+    fn only_text_beyond_ascii_reads_a_domain_regex_differently() {
+        for (pattern, text) in [
+            (r"^\w+\.example$", "é.example"),
+            (r"^x\d\.example$", "x٣.example"),
+            (r"^a\sb\.example$", "a\u{a0}b.example"),
+            (r"^.\bexample$", "éexample"),
+            (r"^.\<example$", "éexample"),
+        ] {
+            let unicode = regex::Regex::new(pattern).unwrap();
+            let matched = domain_regex_matchers(pattern);
+            assert!(
+                unicode.is_match(text) != matched(text)[0],
+                "{pattern} against {text}"
+            );
+            assert_eq!(
+                matched(text),
+                [matched(text)[0]; 3],
+                "{pattern} against {text}"
+            );
+
+            // 规则看到的是 `\DDD` 写出的名字 / What rules see is the name written with `\DDD`
+            let labels: Vec<&[u8]> = text.split('.').map(str::as_bytes).collect();
+            let name = Name::from_labels(labels).unwrap();
+            let seen = crate::proto_utils::name_text(&name);
+            assert!(seen.is_ascii(), "{seen}");
+            assert_eq!(
+                matched(&seen),
+                [unicode.is_match(&seen); 3],
+                "{pattern} against {seen}"
+            );
+        }
+    }
+
+    /// 改写只换字符类，不改哪些写法算错：照写的写错了，照旧拒绝，报错里是照写的那条。`[\w-a]` 照写是错的（`\w` 不能当
+    /// 区间的一端），改写成 `[0-9A-Za-z_-a]` 却成了一个合法的区间，所以先查照写的；`\p{Foo}` 改写后仍然错，报错引的是
+    /// 照写的，不是改写后的。三种域名正则都是
+    /// The rewrite changes classes, not which patterns are wrong: one written wrong is
+    /// refused as before, with the error quoting it as written. `[\w-a]` is wrong as written
+    /// (`\w` cannot end a range), yet rewritten as `[0-9A-Za-z_-a]` it is a valid range, so
+    /// the pattern as written is checked first; `\p{Foo}` stays wrong once rewritten, and the
+    /// error quotes the pattern as written, not the rewrite. All three domain regexes alike
+    #[test]
+    fn a_domain_regex_written_wrong_is_refused_in_its_own_words() {
+        for (pattern, cause) in [
+            (r"^[\w-a]+$", "invalid range boundary, must be a literal"),
+            (r"^\w+\p{Foo}$", "Unicode property not found"),
+            (r"^(\w+\.example$", "unclosed group"),
+        ] {
+            for (which, config) in domain_regex_configs(pattern).into_iter().enumerate() {
+                let err = format!(
+                    "{:#}",
+                    crate::config::validate(&config.to_string()).unwrap_err()
+                );
+                assert!(
+                    err.contains(cause) && err.contains(pattern) && !err.contains("0-9A-Za-z_"),
+                    "{pattern}, matcher {which}: {err}"
+                );
+            }
         }
     }
 
@@ -2837,6 +3270,48 @@ mod txt_regex_tests {
         }
         assert!(built(r"(\w{100}){100}").is_err(), "too large to compile");
         assert!(built(&"a".repeat(1001)).is_err(), "too long a pattern");
+    }
+
+    /// TXT 内容的正则不跟着域名正则改成 ASCII：TXT 里本来就可以写任意文字，`\w`、`\d`、`\s`、`\b` 照旧按 Unicode
+    /// 理解，`\w` 认 `é` 和 `中`，`\d` 认 `٣`，`\s` 认不换行空格，`\b` 把 `é` 当作词里的字符
+    /// TXT content regexes do not turn ASCII with the domain regexes: TXT may hold any text, so
+    /// `\w`, `\d`, `\s` and `\b` keep their Unicode meaning: `\w` takes `é` and `中`, `\d`
+    /// takes `٣`, `\s` takes a no-break space, and `\b` takes `é` as inside a word
+    #[test]
+    fn a_txt_regex_keeps_unicode_classes() {
+        use hickory_proto::op::{Message, MessageType, OpCode};
+        use hickory_proto::rr::rdata::TXT;
+        use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+        let answer = |text: &str| {
+            let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+            message.add_answer(Record::from_rdata(
+                Name::from_ascii("example.com.").unwrap(),
+                300,
+                RData::TXT(TXT::new(vec![text.to_owned()])),
+            ));
+            message
+        };
+        for (pattern, text) in [
+            (r"^\w+$", "café"),
+            (r"^\w+$", "中文"),
+            (r"^v\d$", "v٣"),
+            (r"^a\sb$", "a\u{a0}b"),
+            (r"\bcafé\b", "un café noir"),
+        ] {
+            let matcher = built(pattern).unwrap();
+            assert!(
+                matcher.matches(
+                    "udp:test",
+                    "example.com",
+                    RecordType::TXT,
+                    DNSClass::IN,
+                    &answer(text),
+                    None,
+                    None,
+                ),
+                "{pattern} against {text}"
+            );
+        }
     }
 
     /// 写 TXT 正则的人碰到的是配置校验（面板的校验、热重载都走 `config::validate`）：`.*`、`\d+`、`\w+`、
