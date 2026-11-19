@@ -108,7 +108,7 @@ Pipeline selectors support all of the rows above. Request rules support all rows
 - Only the country codes and tags rules use are read. The MMDB is read only when rules use a two-letter country code; `geoip_dat_path` is read only for the tags rules use that the MMDB does not decide, so with an MMDB configured and rules using two-letter country codes alone that file is not read. A tag rules use that the file lacks is logged as a warning, and rules using it never match.
 - Tag matching is case-insensitive. `country_codes` should normally be a JSON string array, for example `["CN", "cloudflare"]`; a single or comma-separated string is also accepted for compatibility.
 
-Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` and `request_domain_suffix` compare whole labels: `example.com` matches `example.com` itself and every subdomain such as `www.example.com`, while `.example.com` matches subdomains only; neither matches `notexample.com`. `domain_exact` and `request_domain_exact` match the name itself only: `api.example.com` does not match `www.api.example.com`. A trailing dot on any of these values changes nothing: `example.com.` is `example.com`. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax. Rules see the query name in lower case, without the trailing dot. A label byte that is not printable ASCII, and a dot or backslash inside a label, is written as `\DDD` (three decimal digits): the label `a.b` is `a\046b`, so it is never taken as two labels and does not match a suffix such as `b.example`. Write `domain_regex` patterns for such names in this form.
+Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` and `request_domain_suffix` compare whole labels: `example.com` matches `example.com` itself and every subdomain such as `www.example.com`, while `.example.com` matches subdomains only; neither matches `notexample.com`. `domain_exact` and `request_domain_exact` match the name itself only: `api.example.com` does not match `www.api.example.com`. A trailing dot on any of these values changes nothing: `example.com.` is `example.com`. `domain_regex` and `request_domain_regex` use Rust regular-expression syntax, at most 16384 bytes and 1 MB compiled each; a configuration with a longer or larger one is refused. Rules see the query name in lower case, without the trailing dot. A label byte that is not printable ASCII, and a dot or backslash inside a label, is written as `\DDD` (three decimal digits): the label `a.b` is `a\046b`, so it is never taken as two labels and does not match a suffix such as `b.example`. Write `domain_regex` patterns for such names in this form.
 
 #### GeoSite entries
 
@@ -116,6 +116,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 - `full:example.com` matches the domain only, `keyword:` and `regexp:` match a keyword or a regular expression, and a bare value with `*` is a wildcard.
 - In `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. The domains without an attribute are `geo_site: google` together with `geo_site_not: google@cn`.
 - JSON entries with an unknown prefix, no value or an invalid regex are skipped with a warning.
+- A `regexp:` regex is at most 16384 bytes, as a `domain_regex` is; a longer one is skipped with a warning, in `.dat` and JSON alike.
 
 ### Response matchers
 
@@ -135,7 +136,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 | response_answer_ip_geoip_private | expect: boolean |
 | response_request_domain_geo_site | value: GeoSite tag |
 | response_request_domain_geo_site_not | value: GeoSite tag |
-| response_txt_content | mode: exact, prefix, or regex; value is the text/pattern |
+| response_txt_content | mode: exact, prefix, or regex; value is the text/pattern, a regex at most 1000 bytes |
 
 Response address matching uses these scopes:
 

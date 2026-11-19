@@ -15,7 +15,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use super::domain_suffix_matches;
+use super::{MAX_REGEX_LEN, domain_suffix_matches, regex_within};
 
 /// 编译 GeoSite 数据里的一条正则。数据是给 v2ray 写的，v2ray 用 Go 的正则，那里 `\w`、`\d`、`\s`、`\b` 只认
 /// ASCII；Rust 的正则默认按 Unicode 理解，`\w{5}` 要展开整张 Unicode 字母表，`cn` 里这样的正则让进程多占好几 MiB。
@@ -28,22 +28,23 @@ use super::domain_suffix_matches;
 /// rewrite that does not compile (it should not happen) compiles as written instead. Names of
 /// ASCII alone match the same either way; names with other characters match as v2ray reads the
 /// pattern.
-fn compile_geosite_regex(pattern: &str) -> Result<Regex, regex::Error> {
-    // 原样的写法也不对时，按原样编译拿到正则自己的报错 / When the pattern as written is wrong too,
-    // compiling it as written gives the regex's own error
-    Regexes::compile(&geosite_regex_pattern(pattern).unwrap_or_else(|_| pattern.to_owned()))
+fn compile_geosite_regex(pattern: &str) -> anyhow::Result<Regex> {
+    Ok(Regexes::compile(&geosite_regex_pattern(pattern)?)?)
 }
 
 /// 一条 GeoSite 正则实际要编译的写法：按 Go 的含义改写过字符类的（见 [`go_classes`]），改写后语法不对（不该发生）
-/// 就用原样，原样也不对时返回语法错误。只检查语法、不编译：数据文件里一个 tag 的正则读完以后合成一个集合，只编译
-/// 这一次（见 [`Regexes::new`]）；以前每条先单独编译一次，`geolocation-!cn` 的 151 条因此多占好几 MiB。
+/// 就用原样，原样也不对时返回语法错误；比 [`MAX_REGEX_LEN`] 长的不解析，直接返回错误。只检查语法、不编译：数据文件里
+/// 一个 tag 的正则读完以后合成一个集合，只编译这一次（见 [`Regexes::new`]）；以前每条先单独编译一次，
+/// `geolocation-!cn` 的 151 条因此多占好几 MiB。
 /// The pattern a GeoSite regex actually compiles as: with its classes rewritten the Go way (see
 /// [`go_classes`]), as written when the rewrite does not parse (it should not happen), and a
-/// syntax error when that does not parse either. Only the syntax is checked, nothing compiles:
-/// a data file's regexes for one tag are combined into one set once read, which is the only
-/// compile (see [`Regexes::new`]); compiling each one first as well cost several MiB for the
-/// 151 regexes of `geolocation-!cn`.
-fn geosite_regex_pattern(pattern: &str) -> Result<String, Box<regex_syntax::Error>> {
+/// syntax error when that does not parse either; one longer than [`MAX_REGEX_LEN`] is an error
+/// without being parsed. Only the syntax is checked, nothing compiles: a data file's regexes for
+/// one tag are combined into one set once read, which is the only compile (see
+/// [`Regexes::new`]); compiling each one first as well cost several MiB for the 151 regexes of
+/// `geolocation-!cn`.
+fn geosite_regex_pattern(pattern: &str) -> anyhow::Result<String> {
+    regex_within(pattern, MAX_REGEX_LEN)?;
     let check = |pattern: &str| {
         regex_syntax::Parser::new()
             .parse(pattern)
@@ -55,7 +56,8 @@ fn geosite_regex_pattern(pattern: &str) -> Result<String, Box<regex_syntax::Erro
     {
         return Ok(rewritten);
     }
-    check(pattern).map(|()| pattern.to_owned())
+    check(pattern)?;
+    Ok(pattern.to_owned())
 }
 
 /// `pattern` 里的 `\w`、`\d`、`\s`、`\b` 及其大写的取反形式改成 Go 正则的 ASCII 含义：字符类外写成一个字符类
@@ -356,13 +358,14 @@ pub struct TagMatchers {
     others: Vec<DomainMatcher>,
 }
 
-/// 一个 tag 的正则条目。每 [`Regexes::SET_SIZE`] 条合成一个 [`RegexSet`]，一遍扫描就知道一组里
-/// 有没有哪条命中：`geolocation-!cn` 这样带上百条正则的 tag，逐条比较要几微秒，合起来不到一微秒。
-/// 合不成（超出大小上限）时退回逐条比较。
-/// One tag's regex entries. Every [`Regexes::SET_SIZE`] of them combine into one [`RegexSet`], so
-/// a single scan tells whether any in that group matches: a tag like `geolocation-!cn` with over a
-/// hundred regexes takes microseconds one by one and well under one combined. When they cannot be
-/// combined (over the size limit) they are tried one by one instead.
+/// 一个 tag 的正则条目。每 [`Regexes::SET_SIZE`] 条（写法合起来不超过一条正则的上限，见 [`Regexes::groups`]）
+/// 合成一个 [`RegexSet`]，一遍扫描就知道一组里有没有哪条命中：`geolocation-!cn` 这样带上百条正则的 tag，
+/// 逐条比较要几微秒，合起来不到一微秒。合不成（超出大小上限）时退回逐条比较。
+/// One tag's regex entries. Every [`Regexes::SET_SIZE`] of them (no longer together than one regex
+/// may be, see [`Regexes::groups`]) combine into one [`RegexSet`], so a single scan tells whether
+/// any in that group matches: a tag like `geolocation-!cn` with over a hundred regexes takes
+/// microseconds one by one and well under one combined. When they cannot be combined (over the
+/// size limit) they are tried one by one instead.
 #[derive(Debug, Default)]
 enum Regexes {
     #[default]
@@ -410,8 +413,7 @@ impl Regexes {
         match patterns.len() {
             0 => Self::None,
             1 => Self::Each(Self::compile_each(&patterns)),
-            count => match patterns
-                .chunks(Self::SET_SIZE)
+            count => match Self::groups(&patterns)
                 .map(|group| {
                     RegexSetBuilder::new(group)
                         .size_limit(limit_each.saturating_mul(group.len()))
@@ -427,6 +429,38 @@ impl Regexes {
                 }
             },
         }
+    }
+
+    /// 按顺序分组：每组最多 [`Self::SET_SIZE`] 条，写法合起来最多 [`MAX_REGEX_LEN`] 字节，一条就比这长的（改写成 Go
+    /// 的字符类会变长）自成一组。合成集合时一组的正则同时解析成语法树、都留到编译完，合起来不该比一条最长的正则更占
+    /// 内存：数据里 64 条 16 KiB 的 `\pL` 以前合成一组，要 2 GB。真实数据里的正则短，照样每 256 条一组
+    /// In order, in groups of at most [`Self::SET_SIZE`] whose patterns come to at most
+    /// [`MAX_REGEX_LEN`] bytes together, one longer than that by itself (rewriting the Go way
+    /// lengthens it) making a group alone. Combining a group into a set parses all its regexes
+    /// into syntax trees at once and keeps them until compiled, so together they should take no
+    /// more than the longest regex may: 64 regexes of 16 KiB of `\pL` in the data used to
+    /// combine into one group, taking 2 GB. The regexes of real data are short and still go 256
+    /// to a group
+    fn groups(patterns: &[String]) -> impl Iterator<Item = &[String]> {
+        let mut rest = patterns;
+        std::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            let mut bytes = 0;
+            let end = rest
+                .iter()
+                .take(Self::SET_SIZE)
+                .position(|pattern| {
+                    bytes += pattern.len();
+                    bytes > MAX_REGEX_LEN
+                })
+                .unwrap_or(rest.len().min(Self::SET_SIZE))
+                .max(1);
+            let (group, after) = rest.split_at(end);
+            rest = after;
+            Some(group)
+        })
     }
 
     /// 逐条编译；编译不了的（超出上限）跳过，什么名字都不匹配 / Compiles one by one; one that does
@@ -3233,6 +3267,92 @@ mod tests {
         ] {
             assert_eq!(indexed.matches(domain), expected, "{domain}");
         }
+    }
+
+    /// 数据文件里的正则和配置里的一样最长 16384 字节，在解析之前查：长一个字节的跳过，什么名字都不匹配，同一个
+    /// tag 的其他条目照常；刚好 16384 字节、内容寻常的照常编译。.dat 和 JSON 都是。正则先整条解析成语法树才看
+    /// 编译后的大小，`\pL` 在树里是几 KB 的 Unicode 区间：以前数据里一条 1 MiB 的 `\pL` 要 2 GB 内存。
+    /// A data file's regex is at most 16384 bytes, as a configuration's is, checked before it is
+    /// parsed: one a byte longer is skipped, matching no name, and the tag's other entries load
+    /// as usual; one of exactly 16384 bytes with ordinary content compiles. So for .dat and JSON
+    /// alike. A regex is parsed whole into its syntax tree before its compiled size is looked at,
+    /// and `\pL` is several KB of Unicode ranges there: one regex of 1 MiB of `\pL` in the data
+    /// used to take 2 GB.
+    #[test]
+    fn a_data_regex_longer_than_16_kib_is_skipped() {
+        use crate::matcher::{MAX_REGEX_LEN, tests::names_regex};
+        let at_limit = names_regex(r"at-limit\.example", MAX_REGEX_LEN);
+        let over = names_regex(r"over\.example", MAX_REGEX_LEN + 1);
+        let check = |tag: &TagMatchers| {
+            assert_eq!(tag.regexes.len(), 2);
+            assert!(tag.matches("at-limit.example"));
+            assert!(tag.matches("cdn7.example.com"));
+            assert!(tag.matches("ok.com"));
+            assert!(!tag.matches("over.example"));
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[build_geosite(
+                "t",
+                &[
+                    build_domain(1, &over, &[]),
+                    build_domain(1, &at_limit, &[]),
+                    build_domain(1, r"^cdn\d\.example\.com$", &[]),
+                    build_domain(3, "ok.com", &[]),
+                ],
+            )],
+        );
+        let parsed = GeoSiteManager::parse_dat_file_selective(&path, &["t".to_string()]).unwrap();
+        check(&parsed[0].1);
+
+        let json = serde_json::json!({ "entries": [{ "tag": "t", "domains": [
+            format!("regexp:{over}"),
+            format!("regexp:{at_limit}"),
+            r"regexp:^cdn\d\.example\.com$",
+            "full:ok.com",
+        ] }] });
+        let path = dir.path().join("geosite.json");
+        std::fs::write(&path, json.to_string()).unwrap();
+        let parsed = GeoSiteManager::parse_json_file(&path).unwrap();
+        check(&parsed[0].1);
+    }
+
+    /// 合成一个集合的正则同时解析成语法树、都留到编译完，所以一组的写法合起来也不超过一条正则的上限：数据里 64 条
+    /// 16 KiB 的 `\pL` 以前合成一组，要 2 GB 内存。刚好到上限的合在一组；一条就比上限长的（改写成 Go 的字符类会
+    /// 变长）自成一组。真实数据里的正则短（最多的 tag 合起来 4 KB 左右），照旧每 256 条一组
+    /// The regexes combined into one set are parsed into syntax trees together and all kept until
+    /// compiled, so a group's patterns together are no longer than one regex may be either: 64
+    /// regexes of 16 KiB of `\pL` in the data used to combine into one group, taking 2 GB. Those
+    /// exactly reaching the limit share a group; one longer than the limit by itself (rewriting the
+    /// Go way lengthens it) makes a group alone. The regexes of real data are short (some 4 KB
+    /// together for the tag with most), and still go 256 to a group
+    #[test]
+    fn a_group_of_regexes_is_no_longer_than_one_regex_may_be() {
+        use crate::matcher::{MAX_REGEX_LEN, tests::names_regex};
+        let half = |i: usize| names_regex(&format!(r"half{i}\.example"), MAX_REGEX_LEN / 2);
+        let longer = names_regex(r"longer\.example", MAX_REGEX_LEN + 100);
+        let patterns = vec![half(0), half(1), half(2), longer, half(3), half(4)];
+        let regexes = Regexes::new(patterns);
+        let Regexes::Sets(sets) = &regexes else {
+            panic!("{regexes:?}");
+        };
+        assert_eq!(
+            sets.iter().map(RegexSet::len).collect::<Vec<_>>(),
+            [2, 1, 1, 2]
+        );
+        for name in [
+            "half0.example",
+            "half1.example",
+            "half2.example",
+            "longer.example",
+            "half3.example",
+            "half4.example",
+        ] {
+            assert!(regexes.is_match(name), "{name}");
+        }
+        assert!(!regexes.is_match("half5.example"));
     }
 
     /// 多条正则合成一组以后，命中与否和逐条比较完全一样；合不成时退回逐条比较，结果也一样
