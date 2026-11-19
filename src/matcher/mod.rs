@@ -1232,14 +1232,37 @@ fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> V
         .collect()
 }
 
-/// 匹配器的正则（域名的，和 TXT 内容的）：状态空间和 DFA 各限 1 MB，防止复杂度攻击
-/// A matcher's regex (for names, and for TXT content): the state space and the DFA each
-/// capped at 1 MB against complexity attacks
-fn domain_regex(pattern: &str) -> Result<Regex, regex::Error> {
-    RegexBuilder::new(pattern)
+/// 配置和 GeoSite 数据里的一条正则最长多少字节，在解析之前查。正则先整条解析成语法树才看编译后的大小，`\w`、`\pL`
+/// 这样的字符类在树里每个都是几 KB 的 Unicode 区间：1 MiB 的 `\w` 还没轮到编译的上限，就要 3 GB 以上的内存。域名
+/// 最长 253 字节，真用到的正则短得多；`\w` 连写到一百来字节，编译后就超过 1 MB 了
+/// The most bytes one regex of a configuration or of GeoSite data may be written in, checked
+/// before it is parsed. A regex is parsed whole into its syntax tree before its compiled size is
+/// looked at, and each class such as `\w` or `\pL` is several KB of Unicode ranges there: 1 MiB
+/// of `\w` takes over 3 GB before the compiled limit is reached. A name is at most 253 bytes
+/// and the regexes really used are far shorter; `\w` written out to a hundred-odd bytes is
+/// already over 1 MB compiled
+pub(crate) const MAX_REGEX_LEN: usize = 16 * 1024;
+
+/// 正则写得比 `max` 字节长时的报错 / The error for a regex written longer than `max` bytes
+pub(crate) fn regex_within(pattern: &str, max: usize) -> anyhow::Result<()> {
+    if pattern.len() > max {
+        anyhow::bail!(
+            "regex pattern too long: {} bytes (max {max})",
+            pattern.len()
+        );
+    }
+    Ok(())
+}
+
+/// 匹配器的正则（域名的，和 TXT 内容的）：最长 [`MAX_REGEX_LEN`] 字节，状态空间和 DFA 各限 1 MB，防止复杂度攻击
+/// A matcher's regex (for names, and for TXT content): at most [`MAX_REGEX_LEN`] bytes, with
+/// the state space and the DFA each capped at 1 MB against complexity attacks
+fn domain_regex(pattern: &str) -> anyhow::Result<Regex> {
+    regex_within(pattern, MAX_REGEX_LEN)?;
+    Ok(RegexBuilder::new(pattern)
         .size_limit(1_000_000)
         .dfa_size_limit(1_000_000)
-        .build()
+        .build()?)
 }
 
 /// 逗号分隔的 CIDR 列表，空项跳过 / A comma-separated CIDR list, empty items skipped
@@ -1641,14 +1664,8 @@ impl RuntimeResponseMatcher {
                 let regex = match mode {
                     TxtMatchMode::Regex => {
                         // ReDoS保护: 限制正则表达式大小 / ReDoS protection: limit regex size
-                        const MAX_REGEX_LEN: usize = 1000;
-                        if value.len() > MAX_REGEX_LEN {
-                            anyhow::bail!(
-                                "regex pattern too long: {} bytes (max {})",
-                                value.len(),
-                                MAX_REGEX_LEN
-                            );
-                        }
+                        const MAX_TXT_REGEX_LEN: usize = 1000;
+                        regex_within(&value, MAX_TXT_REGEX_LEN)?;
                         // 编译后的大小和域名正则一个上限。以前限在 1000 字节，`.`、`\d+` 都编译不过
                         // The compiled size gets the limit domain regexes have. It was held to
                         // 1000 bytes, which `.` or `\d+` already exceed
@@ -2043,6 +2060,105 @@ mod tests {
         }
     }
 
+    /// 三种域名正则（请求规则、pipeline 选择、响应规则）各写一条 `pattern` 的配置
+    /// A configuration for each of the three domain regexes (request rules, pipeline selection,
+    /// response rules), written as `pattern`
+    fn domain_regex_configs(pattern: &str) -> [serde_json::Value; 3] {
+        [
+            one_rule(serde_json::json!([{ "type": "domain_regex", "value": pattern }])),
+            serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipeline_select": [{
+                    "pipeline": "main",
+                    "matchers": [{ "type": "domain_regex", "value": pattern }]
+                }],
+                "pipelines": [{ "id": "main", "rules": [] }]
+            }),
+            serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                    "response_matchers": [{ "type": "request_domain_regex", "value": pattern }],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }] }]
+            }),
+        ]
+    }
+
+    /// 恰好 `len` 字节、内容寻常的域名正则：`first` 和一串名字任选其一（GeoSite 的测试也用）
+    /// A domain regex of exactly `len` bytes with ordinary content: any one of `first` and a run
+    /// of names (the GeoSite tests use it too)
+    pub(super) fn names_regex(first: &str, len: usize) -> String {
+        let mut pattern = format!("^(?:{first}");
+        for i in 0..len {
+            if pattern.len() + 64 > len {
+                break;
+            }
+            pattern.push_str(&format!(r"|host{i}\.example\.com"));
+        }
+        // 剩下的用一个名字补足 / One more name makes up the rest
+        let rest = len - pattern.len() - "|)$".len();
+        pattern.push('|');
+        pattern.push_str(&"x".repeat(rest));
+        pattern.push_str(")$");
+        assert_eq!(pattern.len(), len);
+        pattern
+    }
+
+    /// 配置里的正则最长 16384 字节，在解析之前查。正则先整条解析成语法树才看编译后的大小，`\w` 在树里每个都是几 KB
+    /// 的 Unicode 区间：以前 1 MiB 的 `\w` 送去校验，要 3 GB 以上的内存。三种域名正则都是：刚好 16384 字节、
+    /// 内容寻常的照常读入；长一个字节的读不进来，说明写了多长；`\w` 连写 64 KiB 报的也是太长（以前解析完才报编译超限，
+    /// 要两百来 MB）。短于上限的照旧：编译超过 1 MB 的仍按编译的上限拒绝
+    /// A configuration's regex is at most 16384 bytes, checked before it is parsed. A regex is
+    /// parsed whole into its syntax tree before its compiled size is looked at, and each `\w` is
+    /// several KB of Unicode ranges there: 1 MiB of `\w` sent for validation used to take over
+    /// 3 GB. So for all three domain regexes: one of exactly 16384 bytes with ordinary content
+    /// loads; one byte longer is refused, saying how long it is; 64 KiB of `\w` written out is
+    /// refused as too long as well (it used to be parsed first, taking some two hundred MB, and
+    /// then refused for its compiled size). Below the limit nothing changes: one over 1 MB
+    /// compiled is still refused by the compiled limit
+    #[test]
+    fn a_regex_in_a_configuration_is_at_most_16_kib() {
+        let validate = |config: serde_json::Value| crate::config::validate(&config.to_string());
+        let refused = |config: serde_json::Value| format!("{:#}", validate(config).unwrap_err());
+        let at_limit = names_regex(r"at-limit\.example", MAX_REGEX_LEN);
+        for (which, config) in domain_regex_configs(&at_limit).into_iter().enumerate() {
+            if let Err(err) = validate(config) {
+                panic!("matcher {which}: {err:#}");
+            }
+        }
+        let over = names_regex(r"over\.example", MAX_REGEX_LEN + 1);
+        let written_out = r"\w".repeat(32 * 1024);
+        for (which, (over, written_out)) in domain_regex_configs(&over)
+            .into_iter()
+            .zip(domain_regex_configs(&written_out))
+            .enumerate()
+        {
+            let err = refused(over);
+            assert!(
+                err.contains("regex pattern too long: 16385 bytes (max 16384)"),
+                "matcher {which}: {err}"
+            );
+            let err = refused(written_out);
+            assert!(
+                err.contains("regex pattern too long: 65536 bytes (max 16384)"),
+                "matcher {which}: {err}"
+            );
+        }
+        for (which, below) in domain_regex_configs(&r"\w".repeat(200))
+            .into_iter()
+            .enumerate()
+        {
+            let err = refused(below);
+            assert!(
+                err.contains("exceeds size limit") && !err.contains("too long"),
+                "matcher {which}: {err}"
+            );
+        }
+    }
+
     /// 三种域名正则（请求规则、pipeline 选择、响应规则）编译时都限 1 MB：`\w{20}` 编得出，
     /// `\w{50}` 超出上限、配置读不进来（默认上限下它编得出）
     /// The three domain regexes (request rules, pipeline selection, response rules) all
@@ -2051,29 +2167,7 @@ mod tests {
     #[test]
     fn a_domain_regex_is_limited_to_a_megabyte() {
         assert!(regex::Regex::new(r"\w{50}").is_ok());
-        let configs = |pattern: &str| {
-            [
-                one_rule(serde_json::json!([{ "type": "domain_regex", "value": pattern }])),
-                serde_json::json!({
-                    "settings": { "default_upstream": "127.0.0.1:9" },
-                    "pipeline_select": [{
-                        "pipeline": "main",
-                        "matchers": [{ "type": "domain_regex", "value": pattern }]
-                    }],
-                    "pipelines": [{ "id": "main", "rules": [] }]
-                }),
-                serde_json::json!({
-                    "settings": { "default_upstream": "127.0.0.1:9" },
-                    "pipelines": [{ "id": "main", "rules": [{
-                        "name": "r",
-                        "matchers": [{ "type": "any" }],
-                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
-                        "response_matchers": [{ "type": "request_domain_regex", "value": pattern }],
-                        "response_actions_on_match": [{ "type": "allow" }]
-                    }] }]
-                }),
-            ]
-        };
+        let configs = domain_regex_configs;
         for (which, (small, large)) in configs(r"\w{20}")
             .into_iter()
             .zip(configs(r"\w{50}"))
