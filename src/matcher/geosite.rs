@@ -15,125 +15,21 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use super::{MAX_REGEX_LEN, domain_suffix_matches, regex_within};
+use super::{MAX_REGEX_LEN, ascii_regex_pattern, domain_suffix_matches};
 
 /// 编译 GeoSite 数据里的一条正则。数据是给 v2ray 写的，v2ray 用 Go 的正则，那里 `\w`、`\d`、`\s`、`\b` 只认
 /// ASCII；Rust 的正则默认按 Unicode 理解，`\w{5}` 要展开整张 Unicode 字母表，`cn` 里这样的正则让进程多占好几 MiB。
-/// 所以先把这几类写法改成 Go 的 ASCII 写法（见 [`go_classes`]），其余照旧；改写后编译不了（不该发生）就按原样编译。
-/// 只含 ASCII 的名字两种写法结果相同，含其他字符的名字按 v2ray 的理解。
+/// 所以先把这几类写法改成 Go 的 ASCII 写法（见 [`super::go_classes`]），其余照旧；改写后编译不了（不该发生）就按
+/// 原样编译。只含 ASCII 的名字两种写法结果相同，含其他字符的名字按 v2ray 的理解。配置里的域名正则也这样改写
 /// Compiles one regex of GeoSite data. The data is written for v2ray, whose Go regexes treat
 /// `\w`, `\d`, `\s` and `\b` as ASCII only; Rust regexes default to Unicode, where `\w{5}` spells
 /// out the whole Unicode alphabet, and such regexes in `cn` cost the process several MiB. So these
-/// classes are first rewritten the Go way (see [`go_classes`]) and the rest is left as it is; a
-/// rewrite that does not compile (it should not happen) compiles as written instead. Names of
-/// ASCII alone match the same either way; names with other characters match as v2ray reads the
-/// pattern.
+/// classes are first rewritten the Go way (see [`super::go_classes`]) and the rest is left as it
+/// is; a rewrite that does not compile (it should not happen) compiles as written instead. Names
+/// of ASCII alone match the same either way; names with other characters match as v2ray reads
+/// the pattern. A configuration's domain regexes are rewritten the same way
 fn compile_geosite_regex(pattern: &str) -> anyhow::Result<Regex> {
-    Ok(Regexes::compile(&geosite_regex_pattern(pattern)?)?)
-}
-
-/// 一条 GeoSite 正则实际要编译的写法：按 Go 的含义改写过字符类的（见 [`go_classes`]），改写后语法不对（不该发生）
-/// 就用原样，原样也不对时返回语法错误；比 [`MAX_REGEX_LEN`] 长的不解析，直接返回错误。只检查语法、不编译：数据文件里
-/// 一个 tag 的正则读完以后合成一个集合，只编译这一次（见 [`Regexes::new`]）；以前每条先单独编译一次，
-/// `geolocation-!cn` 的 151 条因此多占好几 MiB。
-/// The pattern a GeoSite regex actually compiles as: with its classes rewritten the Go way (see
-/// [`go_classes`]), as written when the rewrite does not parse (it should not happen), and a
-/// syntax error when that does not parse either; one longer than [`MAX_REGEX_LEN`] is an error
-/// without being parsed. Only the syntax is checked, nothing compiles: a data file's regexes for
-/// one tag are combined into one set once read, which is the only compile (see
-/// [`Regexes::new`]); compiling each one first as well cost several MiB for the 151 regexes of
-/// `geolocation-!cn`.
-fn geosite_regex_pattern(pattern: &str) -> anyhow::Result<String> {
-    regex_within(pattern, MAX_REGEX_LEN)?;
-    let check = |pattern: &str| {
-        regex_syntax::Parser::new()
-            .parse(pattern)
-            .map(drop)
-            .map_err(Box::new)
-    };
-    if let std::borrow::Cow::Owned(rewritten) = go_classes(pattern)
-        && check(&rewritten).is_ok()
-    {
-        return Ok(rewritten);
-    }
-    check(pattern)?;
-    Ok(pattern.to_owned())
-}
-
-/// `pattern` 里的 `\w`、`\d`、`\s`、`\b` 及其大写的取反形式改成 Go 正则的 ASCII 含义：字符类外写成一个字符类
-/// （`\b` 写成 `(?-u:\b)`），字符类里展开成范围（取反的写成嵌套的字符类）。转义的反斜杠和别的转义原样保留。
-/// `\w`, `\d`, `\s` and `\b` in `pattern`, and their negated capitals, rewritten to their ASCII
-/// meaning in Go regexes: outside a class each becomes a class (`\b` becomes `(?-u:\b)`), inside a
-/// class it becomes ranges (a negated one a nested class). Escaped backslashes and other escapes
-/// stay as they are.
-fn go_classes(pattern: &str) -> std::borrow::Cow<'_, str> {
-    const WORD: &str = "0-9A-Za-z_";
-    const DIGIT: &str = "0-9";
-    const SPACE: &str = r"\t\n\f\r ";
-    if !pattern.contains('\\') {
-        return std::borrow::Cow::Borrowed(pattern);
-    }
-    let mut out = String::with_capacity(pattern.len() + 16);
-    let mut changed = false;
-    // 字符类嵌套的层数，和刚开始一个字符类（这时的 `]` 是字面字符）
-    // How deep in character classes, and whether one just began (where `]` is a literal)
-    let (mut depth, mut class_start) = (0usize, false);
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        let starting = std::mem::take(&mut class_start);
-        match c {
-            '\\' => {
-                let Some(next) = chars.next() else {
-                    out.push(c);
-                    break;
-                };
-                let class = match next.to_ascii_lowercase() {
-                    'w' => Some(WORD),
-                    'd' => Some(DIGIT),
-                    's' => Some(SPACE),
-                    _ => None,
-                };
-                match (class, next.is_ascii_uppercase(), depth > 0) {
-                    (Some(class), false, true) => out.push_str(class),
-                    (Some(class), negated, _) => {
-                        out.push_str(if negated { "[^" } else { "[" });
-                        out.push_str(class);
-                        out.push(']');
-                    }
-                    (None, _, false) if matches!(next, 'b' | 'B') => {
-                        out.push_str("(?-u:\\");
-                        out.push(next);
-                        out.push(')');
-                    }
-                    _ => {
-                        out.push(c);
-                        out.push(next);
-                        continue;
-                    }
-                }
-                changed = true;
-            }
-            '[' => {
-                depth += 1;
-                class_start = true;
-                out.push(c);
-            }
-            '^' if starting => {
-                class_start = true;
-                out.push(c);
-            }
-            ']' if depth > 0 && !starting => {
-                depth -= 1;
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    if changed {
-        std::borrow::Cow::Owned(out)
-    } else {
-        std::borrow::Cow::Borrowed(pattern)
-    }
+    Ok(Regexes::compile(&ascii_regex_pattern(pattern)?)?)
 }
 
 /// 域名匹配器类型 / Domain matcher type
@@ -583,7 +479,7 @@ impl TagBuilder {
             // 写错的正则跳过，什么名字都不匹配，和 JSON 数据里一样。以前换成 `^$` 顶替，而根域名的名字正是空的
             // A regex written wrong is skipped and matches no name, as in JSON data. It used to be
             // replaced with `^$`, and the root name is the empty one
-            DatEntry::Regex(pattern) => match geosite_regex_pattern(&pattern) {
+            DatEntry::Regex(pattern) => match ascii_regex_pattern(&pattern) {
                 Ok(pattern) => self.regexes.push(pattern),
                 Err(err) => {
                     warn!(target = "geosite", pattern = %pattern, error = %err,
@@ -1934,6 +1830,7 @@ impl GeoSiteManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matcher::go_classes;
 
     fn encode_varint(mut value: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -3203,6 +3100,33 @@ mod tests {
         assert!(!go.is_match("r1---sn-2x3abcdé.googlevideo.com"));
         assert!(unicode.is_match("r1---sn-2x3abcdé.googlevideo.com"));
         assert!(compile_geosite_regex("(unclosed").is_err());
+    }
+
+    /// `\b{start}`、`\b{end}` 这类带名字的词边界整个放进 `(?-u:…)`，`\<`、`\>` 也按 ASCII 改写：以前只包住 `\b`，
+    /// 剩下的 `{start}` 成了写错的重复次数，整条正则只好照写的按 Unicode 编译。`\b{2}` 是 `\b` 重复两次，照旧只包
+    /// `\b`。改写后的都能解析
+    /// A named word boundary such as `\b{start}` or `\b{end}` goes into `(?-u:…)` whole, and
+    /// `\<` and `\>` are rewritten as ASCII too: only `\b` used to be wrapped, leaving `{start}`
+    /// as a broken repetition, so the whole regex compiled as written, as Unicode. `\b{2}` is
+    /// `\b` twice and still wraps just `\b`. Every rewrite parses
+    #[test]
+    fn named_word_boundaries_are_rewritten_whole() {
+        for (pattern, rewritten) in [
+            (r"\b{start}x\b{end}", r"(?-u:\b{start})x(?-u:\b{end})"),
+            (
+                r"\b{start-half}\w\b{end-half}",
+                r"(?-u:\b{start-half})[0-9A-Za-z_](?-u:\b{end-half})",
+            ),
+            (r"\<x\>", r"(?-u:\<)x(?-u:\>)"),
+            (r"\b{2}x\B", r"(?-u:\b){2}x(?-u:\B)"),
+            (r"[<>]\<", r"[<>](?-u:\<)"),
+        ] {
+            assert_eq!(go_classes(pattern), rewritten, "{pattern}");
+            assert!(
+                regex_syntax::Parser::new().parse(rewritten).is_ok(),
+                "{rewritten}"
+            );
+        }
     }
 
     /// 名字集合按小写存一份：大小写不同的同一个名字只存一次，重复加入什么都不变；查找时调用方
