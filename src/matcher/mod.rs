@@ -2744,4 +2744,62 @@ mod txt_regex_tests {
         assert!(built(r"(\w{100}){100}").is_err(), "too large to compile");
         assert!(built(&"a".repeat(1001)).is_err(), "too long a pattern");
     }
+
+    /// 写 TXT 正则的人碰到的是配置校验（面板的校验、热重载都走 `config::validate`）：`.*`、`\d+`、`\w+`、
+    /// `[a-z]{1,10}` 这样的平常写法都收，正则本身 1000 字节整的也收。编译后的上限是 1 MB：`\w{50}` 在 regex 库
+    /// 默认的上限下编得出，这里拒绝（上面的 `(\w{100}){100}` 默认上限下也编不出，看不出用的是哪个上限）；超过
+    /// 1000 字节的照旧拒绝。两种拒绝的原因原样说给用户
+    /// Someone writing a TXT regex meets config validation (the panel's check and a reload both go
+    /// through `config::validate`): ordinary patterns such as `.*`, `\d+`, `\w+` or `[a-z]{1,10}` are
+    /// taken, and so is a pattern of exactly 1000 bytes. The compiled limit is 1 MB: `\w{50}`, which
+    /// compiles under the regex library's default limits, is refused here (`(\w{100}){100}` above is
+    /// refused under the defaults too, so it cannot tell which limit is in use); a pattern over 1000
+    /// bytes is refused as before. Both refusals give the user their cause as written
+    #[test]
+    fn config_validation_takes_ordinary_txt_regexes_within_the_limits() {
+        let validated = |pattern: &str| {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": "192.0.2.1:53" },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": "192.0.2.1:53" }],
+                    "response_matchers": [
+                        { "type": "response_txt_content", "mode": "regex", "value": pattern }
+                    ],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }] }]
+            });
+            crate::config::validate(&config.to_string()).map_err(|e| format!("{e:#}"))
+        };
+        for pattern in [
+            ".*",
+            r"\d+",
+            r"\w+",
+            "[a-z]{1,10}",
+            "[ -~]*",
+            "google-site-verification=.*",
+            r"\w{20}",
+            &"a".repeat(1000),
+        ] {
+            assert!(
+                validated(pattern).is_ok(),
+                "{pattern}: {:?}",
+                validated(pattern).err()
+            );
+        }
+
+        assert!(regex::Regex::new(r"\w{50}").is_ok());
+        let too_large = validated(r"\w{50}").expect_err("over 1 MB compiled");
+        assert!(
+            too_large.contains("invalid regex: Compiled regex exceeds size limit of 1000000 bytes"),
+            "{too_large}"
+        );
+
+        let too_long = validated(&"a".repeat(1001)).expect_err("over 1000 bytes");
+        assert!(
+            too_long.contains("regex pattern too long: 1001 bytes (max 1000)"),
+            "{too_long}"
+        );
+    }
 }
