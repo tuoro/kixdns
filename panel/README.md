@@ -40,6 +40,10 @@
 
 `2026.10.13` 是在合进 `main` 之前从 `panel` 分支发的，它的来源文件记的是 `base_commit`（当时 fork 的 main），之后的版本记 `upstream_commit`。
 
+## 日志格式
+
+标准输出接 journald 时（systemd 下），每行开头是 journald 认的 `<N>` 优先级前缀，时间由 journald 自己记。不接 journald 时（终端，或者 OpenWrt 上 procd 把输出写进文件），每行是「UTC 时间 级别 消息」，比如 `2026-11-22T07:00:00.123456Z  INFO dns server started`；面板的 procd 后端就按这个格式读日志文件，级别取时间后面的第一个词。
+
 ## English summary
 
 `main` is upstream plus fixes (held to upstream-PR standards and sent upstream from branches cut from upstream's main) plus panel-only code: the query rankings, the control socket and metrics, this directory and the release workflow. Every push to `main` is checked, built for x86_64 and arm64 (Ubuntu 22.04, GLIBC ≤ 2.35) and released under a date version in Beijing time (`2026.10.13`, then `2026.10.13.2` the same day), with one zip per architecture and a `manifest.json`. Only the tip of `main` is released, each commit once; a released binary reports `release_version` and `release_commit` in health. A daily run audits the dependencies.
