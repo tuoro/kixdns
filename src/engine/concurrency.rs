@@ -241,12 +241,16 @@ pub struct GaveUp;
 /// run has not come. One waiting on an upstream does not count, that not being the kernel
 /// queueing. Every receive loop and every core share this one count: on which thread a task
 /// queues and how the scheduler orders them does not come into it
+///
+/// 带符号：一次叫醒先改状态再加一，同时跑起来的那一次可能先减一，这一瞬间数是 -1，不能回绕成极大的数
+/// Signed: a wake changes the state before adding one, and a run at the same moment may take one
+/// off first, so for an instant the count is -1, which must not wrap round to a huge number
 #[derive(Default)]
-pub struct WaitingToRun(AtomicUsize);
+pub struct WaitingToRun(AtomicIsize);
 
 impl WaitingToRun {
     pub fn count(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+        usize::try_from(self.0.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     /// 等着的已经够多，先不再交（见 [`WAITING_TO_RUN_AT_MOST`]）/ Enough are waiting, so no more are
@@ -452,27 +456,32 @@ impl FlowControlState {
         }
     }
 
-    /// `device` 的一个要等上游的查询能不能处理，`emptied_at` 是 socket 上次收空的时刻。内存不够时拒绝（见
-    /// [`Self::memory_refuses`]）。内核忙而且查询在内核里排着长队时，拒在途不比各设备平均少的设备，发得少的照常——那时每个查询
-    /// 都要先排同样长的队，在途多少就是发得多快，不分设备地拒，发得少的也跟着丢，直到开始按设备轮流。等上游不算排队：上游慢、
-    /// 在途多，都不拒；卡住的查询另有处置（见 [`Asking::wait`]）
-    /// Whether a query from `device` that waits on an upstream can go ahead, `emptied_at` being
-    /// when the socket last ran empty. Too little memory refuses it (see
-    /// [`Self::memory_refuses`]). Busy and queueing long inside the kernel, a device holding no
-    /// less in flight than the average is refused while those sending little go on. Every query
-    /// then waits in the same long line first, so what a device holds in flight is how fast it
-    /// sends, and refusing whatever comes would lose the devices sending little too, until devices
-    /// take turns. Waiting on an upstream is not queueing: a slow upstream or many in flight
-    /// refuses nothing, and stuck queries are dealt with elsewhere (see [`Asking::wait`])
+    /// `device` 的一个要等上游的查询能不能处理。内存不够时拒绝（见 [`Self::memory_refuses`]）。`emptied_at` 是 socket 上次收空的
+    /// 时刻：内核忙而且查询在内核里排着长队时，拒在途不比各设备平均少的设备，发得少的照常——那时每个查询都要先排同样长的队，在途
+    /// 多少就是发得多快，不分设备地拒，发得少的也跟着丢，直到开始按设备轮流。没有这个时刻就只看内存：TCP 和 DoH 没有 socket
+    /// 收空这个信号，按设备轮流时排队已经由轮流挡住。等上游不算排队：上游慢、在途多，都不拒；卡住的查询另有处置（见
+    /// [`Asking::wait`]）
+    /// Whether a query from `device` that waits on an upstream can go ahead. Too little memory
+    /// refuses it (see [`Self::memory_refuses`]). `emptied_at` is when the socket last ran empty:
+    /// busy and queueing long inside the kernel, a device holding no less in flight than the average
+    /// is refused while those sending little go on. Every query then waits in the same long line
+    /// first, so what a device holds in flight is how fast it sends, and refusing whatever comes
+    /// would lose the devices sending little too, until devices take turns. Without that moment it
+    /// goes by memory alone: TCP and DoH have no socket running empty to tell by, and while devices
+    /// take turns the turns hold the queueing. Waiting on an upstream is not queueing: a slow
+    /// upstream or many in flight refuses nothing, and stuck queries are dealt with elsewhere (see
+    /// [`Asking::wait`])
     #[inline]
     pub fn permit(
         &self,
         manager: &Arc<PermitManager>,
-        emptied_at: Instant,
+        emptied_at: Option<Instant>,
         device: DeviceSlot,
     ) -> Option<PermitGuard> {
         if self.memory_refuses(manager, device)
-            || (self.busy(emptied_at) && self.behind() && manager.queries.holds_its_share(device))
+            || emptied_at.is_some_and(|emptied_at| {
+                self.busy(emptied_at) && self.behind() && manager.queries.holds_its_share(device)
+            })
         {
             manager.count_refused();
             return None;
@@ -538,9 +547,11 @@ impl FlowControlState {
     #[inline]
     pub fn note_queue_delay(&self, delay: Duration) {
         if delay > QUEUE_TARGET {
+            // 取最晚的：后到的短延迟不把前面长延迟定下的截短 / The latest wins: a shorter delay coming
+            // later does not cut short what a longer one set
             let until = self.started.elapsed() + delay;
             self.behind_until_ns
-                .store(until.as_nanos() as u64, Ordering::Relaxed);
+                .fetch_max(until.as_nanos() as u64, Ordering::Relaxed);
         }
     }
 
@@ -557,38 +568,6 @@ impl FlowControlState {
     #[inline]
     pub fn busy(&self, emptied_at: Instant) -> bool {
         emptied_at.elapsed() >= self.busy_after
-    }
-
-    /// 按设备轮流时 `device` 的一个要等上游的查询能不能处理：只看内存。轮流挡住的是排队，谁排得多先丢谁的；在途的不在这里拒，
-    /// 卡住的另有处置（见 [`Asking::wait`]）
-    /// Whether a query from `device` that waits on an upstream can go ahead while devices take
-    /// turns: by memory alone. Taking turns holds the queueing, dropping from whoever queues
-    /// most; what is in flight is not refused here, and stuck queries are dealt with elsewhere
-    /// (see [`Asking::wait`])
-    #[inline]
-    pub fn turn_permit(
-        &self,
-        manager: &Arc<PermitManager>,
-        device: DeviceSlot,
-    ) -> Option<PermitGuard> {
-        self.permit_by_memory(manager, device)
-    }
-
-    /// 只看内存：TCP 和 DoH 没有 socket 收空这个信号，也就不看内核忙不忙
-    /// By memory alone: TCP and DoH have no socket running empty to tell by, so whether the
-    /// kernel is busy does not come into it
-    #[inline]
-    pub fn permit_by_memory(
-        &self,
-        manager: &Arc<PermitManager>,
-        device: DeviceSlot,
-    ) -> Option<PermitGuard> {
-        if self.memory_refuses(manager, device) {
-            manager.count_refused();
-            None
-        } else {
-            Some(manager.acquire_for(device))
-        }
     }
 
     /// `device` 的一条 TCP 或 DoH 新连接接不接：和查询一样只看内存，紧张时开着的连接不比各设备平均少，或者占着查询的那一份
@@ -1551,18 +1530,13 @@ impl Drop for Stuck<'_> {
     }
 }
 
-/// RAII guard for automatic permit release / RAII 守卫用于自动 permit 释放
-///
-/// This guard ensures that permits are properly released even in panic scenarios
-/// by using defensive programming techniques.
-/// 该守卫通过使用防御性编程技术，确保即使在panic场景下也能正确释放permits。
+/// 一个在途的查询或连接，丢掉时还回去 / One query or connection in flight, given back when dropped
 pub struct PermitGuard {
     manager: Arc<PermitManager>,
     /// 记在哪台设备的那一份、哪一种上（开了流控时）/ The device slot and kind it is counted in (with flow control on)
     device: Option<(DeviceSlot, Held)>,
     /// 开了流控时，查询的 permit 是什么时候拿到的 / With flow control on, when a query's permit was taken
     held_since: Option<Instant>,
-    released: AtomicBool, // Track if already released to handle double-drop / 跟踪是否已释放以处理双重释放
 }
 
 impl PermitGuard {
@@ -1575,7 +1549,6 @@ impl PermitGuard {
             manager,
             device,
             held_since,
-            released: AtomicBool::new(false),
         }
     }
 
@@ -1585,36 +1558,11 @@ impl PermitGuard {
     pub fn held_since(&self) -> Option<Instant> {
         self.held_since
     }
-
-    /// Manually release the permit early / 提前手动释放permit
-    /// This is useful if you want to release the permit before the guard is dropped.
-    /// Consumes self to prevent double-release; Drop impl will see released=true and skip.
-    /// 如果你想在guard被drop之前释放permit，这很有用。
-    /// 消耗 self 防止双重释放；Drop 实现会看到 released=true 并跳过。
-    pub fn release(self) {
-        // Mark as released and decrement / 标记为已释放并递减
-        if self
-            .released
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.manager.release_one(self.device);
-        }
-        // self is dropped here; Drop::drop sees released=true → no double free
-    }
 }
 
 impl Drop for PermitGuard {
     fn drop(&mut self) {
-        // Use compare_exchange to handle potential double-drop scenarios
-        // 使用compare_exchange处理潜在的双重释放场景
-        if self
-            .released
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.manager.release_one(self.device);
-        }
+        self.manager.release_one(self.device);
     }
 }
 
@@ -1641,13 +1589,13 @@ mod tests {
     fn a_query_is_refused_only_when_busy_and_behind() {
         let manager = Arc::new(PermitManager::new());
         let flow = state(Duration::from_secs(60));
-        let busy = Instant::now() - LONG_AGO;
+        let busy = Some(Instant::now() - LONG_AGO);
 
         let busy_alone = flow.permit(&manager, busy, ONE);
         assert!(busy_alone.is_some(), "busy alone");
 
         flow.note_queue_delay(Duration::from_secs(3600));
-        let behind_alone = flow.permit(&manager, Instant::now(), ONE);
+        let behind_alone = flow.permit(&manager, Some(Instant::now()), ONE);
         assert!(behind_alone.is_some(), "behind alone");
         assert_eq!(manager.dropped_requests(), 0);
 
@@ -1665,7 +1613,7 @@ mod tests {
     fn busy_and_behind_refuses_only_the_devices_holding_their_share() {
         let manager = Arc::new(PermitManager::new());
         let flow = state(Duration::from_secs(60));
-        let busy = Instant::now() - LONG_AGO;
+        let busy = Some(Instant::now() - LONG_AGO);
         flow.note_queue_delay(Duration::from_secs(3600));
         let heavy: Vec<_> = (0..100).map(|_| manager.acquire_for(ONE)).collect();
         assert!(
@@ -1697,7 +1645,7 @@ mod tests {
         let mut flow = state(Duration::ZERO);
         flow.note_queue_delay(Duration::from_secs(3600));
         let held: Vec<_> = (0..5000)
-            .map(|_| flow.turn_permit(&manager, ONE).expect("plenty of memory"))
+            .map(|_| flow.permit(&manager, None, ONE).expect("plenty of memory"))
             .collect();
         assert_eq!(manager.dropped_requests(), 0);
         flow.memory = MemoryWatermark::reading(|| MemoryReading {
@@ -1707,7 +1655,7 @@ mod tests {
                 available: 0,
             }],
         });
-        assert!(flow.turn_permit(&manager, ONE).is_none(), "none left");
+        assert!(flow.permit(&manager, None, ONE).is_none(), "none left");
         drop(held);
     }
 
@@ -2586,7 +2534,7 @@ mod tests {
         let manager = Arc::new(PermitManager::new());
         let mut flow = state(Duration::ZERO);
         flow.note_queue_delay(Duration::from_secs(3600));
-        let plenty = flow.permit_by_memory(&manager, ONE);
+        let plenty = flow.permit(&manager, None, ONE);
         assert!(plenty.is_some());
         assert_eq!(manager.inflight(), 1, "it counts among those in flight");
 
@@ -2598,7 +2546,7 @@ mod tests {
             }],
         });
         let in_flight: Vec<_> = (0..1000).map(|_| manager.acquire()).collect();
-        assert!(flow.permit_by_memory(&manager, ONE).is_none());
+        assert!(flow.permit(&manager, None, ONE).is_none());
         assert_eq!(manager.dropped_requests(), 1);
         drop(in_flight);
     }
@@ -2620,23 +2568,23 @@ mod tests {
 
         let mut in_flight: Vec<_> = (0..999)
             .map(|_| {
-                flow.permit(&manager, Instant::now(), ONE)
+                flow.permit(&manager, Some(Instant::now()), ONE)
                     .expect("few in flight")
             })
             .collect();
         in_flight.push(
-            flow.permit(&manager, Instant::now(), ONE)
+            flow.permit(&manager, Some(Instant::now()), ONE)
                 .expect("the last under the floor"),
         );
         assert_eq!(manager.dropped_requests(), 0);
 
-        assert!(flow.permit(&manager, Instant::now(), ONE).is_none());
+        assert!(flow.permit(&manager, Some(Instant::now()), ONE).is_none());
         assert_eq!(manager.dropped_requests(), 1);
         assert_eq!(manager.inflight(), 1000, "a refused query holds no permit");
 
         in_flight.truncate(999);
         assert!(
-            flow.permit(&manager, Instant::now(), ONE).is_some(),
+            flow.permit(&manager, Some(Instant::now()), ONE).is_some(),
             "under the floor again"
         );
     }
@@ -2677,7 +2625,7 @@ mod tests {
         flow.known_before = Duration::ZERO;
         for &device in devices {
             assert!(
-                flow.permit_by_memory(manager, device).is_some(),
+                flow.permit(manager, None, device).is_some(),
                 "before memory ran short"
             );
         }
@@ -2707,17 +2655,17 @@ mod tests {
         in_use_before(&mut flow, &manager, &[OTHER]);
         let heavy: Vec<_> = (0..1000).map(|_| manager.acquire_for(ONE)).collect();
         assert!(
-            flow.permit(&manager, Instant::now(), ONE).is_none(),
+            flow.permit(&manager, Some(Instant::now()), ONE).is_none(),
             "the device holding the memory"
         );
-        assert!(flow.permit_by_memory(&manager, ONE).is_none());
+        assert!(flow.permit(&manager, None, ONE).is_none());
         let light: Vec<_> = (0..10)
             .map(|_| {
-                flow.permit(&manager, Instant::now(), OTHER)
+                flow.permit(&manager, Some(Instant::now()), OTHER)
                     .expect("one sending little goes on")
             })
             .collect();
-        assert!(flow.permit_by_memory(&manager, OTHER).is_some());
+        assert!(flow.permit(&manager, None, OTHER).is_some());
         assert_eq!(manager.dropped_requests(), 2);
         drop((heavy, light));
     }
@@ -2744,9 +2692,7 @@ mod tests {
         let noted = held.len();
         loop {
             let before = held.len();
-            held.extend(
-                (0..100u16).filter_map(|n| flow.permit_by_memory(&manager, DeviceSlot(n, n))),
-            );
+            held.extend((0..100u16).filter_map(|n| flow.permit(&manager, None, DeviceSlot(n, n))));
             assert!(held.len() <= 3 * noted, "unbounded");
             if held.len() == before {
                 break;
@@ -2758,8 +2704,7 @@ mod tests {
             "nor a new connection for one at its share"
         );
         assert!(
-            flow.permit_by_memory(&manager, DeviceSlot(500, 500))
-                .is_some(),
+            flow.permit(&manager, None, DeviceSlot(500, 500)).is_some(),
             "one with nothing in flight"
         );
         drop(held);
@@ -2786,11 +2731,11 @@ mod tests {
         assert!(manager.inflight() >= 1000, "memory is read");
         for n in [0, 1, 500, 1023] {
             assert!(
-                flow.permit_by_memory(&manager, DeviceSlot(n, n)).is_some(),
+                flow.permit(&manager, None, DeviceSlot(n, n)).is_some(),
                 "a query on the connection of {n}"
             );
             assert!(
-                flow.permit(&manager, Instant::now(), DeviceSlot(n, n))
+                flow.permit(&manager, Some(Instant::now()), DeviceSlot(n, n))
                     .is_some(),
                 "a query over UDP from {n}"
             );
@@ -2808,7 +2753,7 @@ mod tests {
     fn many_connections_do_not_raise_the_average_of_queries() {
         let manager = Arc::new(PermitManager::new());
         let flow = state(Duration::from_secs(60));
-        let busy = Instant::now() - LONG_AGO;
+        let busy = Some(Instant::now() - LONG_AGO);
         let proxy: Vec<_> = (0..600)
             .map(|_| {
                 flow.connection_permit(&manager, OTHER)
@@ -2846,7 +2791,7 @@ mod tests {
             "holding none"
         );
         assert!(
-            flow.permit_by_memory(&manager, ONE).is_some(),
+            flow.permit(&manager, None, ONE).is_some(),
             "its queries hold no share"
         );
         assert_eq!(manager.dropped_requests(), 1);
@@ -2867,12 +2812,16 @@ mod tests {
         let alike: Vec<_> = (0..1000)
             .map(|n| manager.acquire_for(if n % 2 == 0 { ONE } else { OTHER }))
             .collect();
-        assert!(tight.permit(&manager, Instant::now(), ONE).is_none());
-        assert!(tight.permit(&manager, Instant::now(), OTHER).is_none());
+        assert!(tight.permit(&manager, Some(Instant::now()), ONE).is_none());
+        assert!(
+            tight
+                .permit(&manager, Some(Instant::now()), OTHER)
+                .is_none()
+        );
 
         let full = with_memory_left(1 << 20);
         assert!(
-            full.permit(&manager, Instant::now(), DeviceSlot(2, 2))
+            full.permit(&manager, Some(Instant::now()), DeviceSlot(2, 2))
                 .is_none(),
             "nothing in flight, still refused"
         );
@@ -2892,25 +2841,25 @@ mod tests {
         flow.known_before = Duration::from_secs(1);
         let known = DeviceSlot(7, 7);
         drop(
-            flow.permit_by_memory(&manager, known)
+            flow.permit(&manager, None, known)
                 .expect("memory not looked at yet"),
         );
         std::thread::sleep(Duration::from_millis(1_100));
         let flood: Vec<_> = (0..1000).map(|_| manager.acquire_for(ONE)).collect();
-        let first = flow.permit_by_memory(&manager, known);
+        let first = flow.permit(&manager, None, known);
         assert!(first.is_some(), "in use before memory ran short");
         assert!(
-            flow.permit_by_memory(&manager, known).is_none(),
+            flow.permit(&manager, None, known).is_none(),
             "nor a second while the first is in flight"
         );
         for n in 100..200 {
             assert!(
-                flow.permit_by_memory(&manager, DeviceSlot(n, n)).is_none(),
+                flow.permit(&manager, None, DeviceSlot(n, n)).is_none(),
                 "a source turning up now"
             );
         }
         assert!(
-            flow.permit_by_memory(&manager, ONE).is_none(),
+            flow.permit(&manager, None, ONE).is_none(),
             "the device flooding"
         );
         drop((first, flood));
@@ -2933,7 +2882,7 @@ mod tests {
         assert_eq!(manager.queries.total.load(Ordering::Relaxed), 3);
         assert_eq!(manager.connections.slots_held.load(Ordering::Relaxed), 1);
         drop(first);
-        second.release();
+        drop(second);
         assert_eq!(manager.queries.slots_held.load(Ordering::Relaxed), 1);
         drop((other, plain, connection, stuck));
         for counts in [&manager.queries, &manager.connections, &manager.stuck] {
@@ -2986,7 +2935,7 @@ mod tests {
     fn a_device_sharing_one_slot_with_a_flooding_one_goes_on() {
         let manager = Arc::new(PermitManager::new());
         let flow = state(Duration::from_secs(60));
-        let busy = Instant::now() - LONG_AGO;
+        let busy = Some(Instant::now() - LONG_AGO);
         flow.note_queue_delay(Duration::from_secs(3600));
         let flooder = DeviceSlot(7, 7);
         let held: Vec<_> = (0..1000).map(|_| manager.acquire_for(flooder)).collect();

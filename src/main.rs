@@ -2149,15 +2149,10 @@ fn spawn_udp_answer(
 ) -> bool {
     let to = to.into();
     let peer = to.peer;
-    // 轮流时排不下的已经丢过了；轮到这里的只看内存（见 `Engine::turn_query_permit`）
-    // Taking turns, what did not fit has been dropped already; what gets here goes by memory
-    // alone (see `Engine::turn_query_permit`)
-    let client = peer.ip();
-    let permit = if answering.taking_turns {
-        answering.engine.turn_query_permit(client)
-    } else {
-        answering.engine.query_permit(answering.emptied_at, client)
-    };
+    // 轮流时排不下的已经丢过了，轮到这里的只看内存 / Taking turns, what did not fit has been dropped
+    // already, and what gets here goes by memory alone
+    let emptied_at = (!answering.taking_turns).then_some(answering.emptied_at);
+    let permit = answering.engine.query_permit(emptied_at, peer.ip());
     let Some(permit) = permit else {
         if let Some(pre_parsed) = pre_parsed
             && let Ok(response) = pre_parsed.servfail(&packet)
@@ -2386,7 +2381,7 @@ async fn serve_tcp_conn(
             let Some(pre_parsed) = async_needed else {
                 continue;
             };
-            let Some(permit) = engine.stream_query_permit(peer.ip()) else {
+            let Some(permit) = engine.query_permit(None, peer.ip()) else {
                 if let Some(response) =
                     engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
                 {
@@ -4918,7 +4913,7 @@ mod tests {
         // 看够了次数，下一次读到内存不够 / Enough looks for the next read to find memory short
         available.store(0, std::sync::atomic::Ordering::Relaxed);
         for _ in 0..3000 {
-            drop(engine.stream_query_permit(std::net::Ipv4Addr::LOCALHOST.into()));
+            drop(engine.query_permit(None, std::net::Ipv4Addr::LOCALHOST.into()));
         }
         send_tcp_query(&mut stream).await;
         let mut length = [0u8; 2];
@@ -5018,9 +5013,9 @@ mod tests {
             .find(|ip| manager.slot_of(*ip).counted_in() != manager.slot_of(heavy).counted_in())
             .unwrap();
         // 它在内存不够以前就在用 / It was in use before memory ran short
-        drop(engine.stream_query_permit(light));
+        drop(engine.query_permit(None, light));
         let held: Vec<_> = (0..1000)
-            .map(|_| engine.stream_query_permit(heavy).expect("plenty of memory"))
+            .map(|_| engine.query_permit(None, heavy).expect("plenty of memory"))
             .collect();
         // 内存还够时它先连上一条 TCP / While memory is plenty it opens a TCP connection first
         let (address, tcp) = tcp_server(&engine).await;
@@ -5030,9 +5025,9 @@ mod tests {
         // A 64 MiB margin, twice that 128 MiB: 100 MiB left is tight; enough looks for the next read to find it
         available.store(100 << 20, Relaxed);
         for _ in 0..3000 {
-            drop(engine.stream_query_permit(heavy));
+            drop(engine.query_permit(None, heavy));
         }
-        assert!(engine.stream_query_permit(heavy).is_none(), "tight now");
+        assert!(engine.query_permit(None, heavy).is_none(), "tight now");
 
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
@@ -5127,10 +5122,10 @@ mod tests {
             .find(|ip| !slots.contains(&manager.slot_of(*ip).counted_in()))
             .unwrap();
         // 它在内存不够以前就在用 / It was in use before memory ran short
-        drop(engine.stream_query_permit(client));
+        drop(engine.query_permit(None, client));
         let held: Vec<_> = holders
             .iter()
-            .map(|ip| engine.stream_query_permit(*ip).expect("plenty of memory"))
+            .map(|ip| engine.query_permit(None, *ip).expect("plenty of memory"))
             .collect();
         let (address, tcp) = tcp_server(&engine).await;
         let mut connected = connect_from(client, address).await;
@@ -5138,10 +5133,10 @@ mod tests {
         // 剩 100 MiB 算紧张；看够了次数，下一次读到它 / 100 MiB left is tight; enough looks for the next read to find it
         available.store(100 << 20, Relaxed);
         for _ in 0..3000 {
-            drop(engine.stream_query_permit(holders[0]));
+            drop(engine.query_permit(None, holders[0]));
         }
         assert!(
-            engine.stream_query_permit(holders[0]).is_none(),
+            engine.query_permit(None, holders[0]).is_none(),
             "tight now, and a device holding a query is at the average"
         );
 

@@ -631,26 +631,34 @@ where
     Ok(forwarded)
 }
 
-/// 开了流控时等别的请求正在做的、给 `upstream` 的同一个转发（`wait`），`client` 是替谁等的，`limit` 是上游的时限：卡住了、
-/// 这台设备留着等的又已经够多时不等了，算上游失败；别的都不管（见 `PermitManager::join`）
-/// Waits, with flow control on, on the same forward to `upstream` another request is making
-/// (`wait`), `client` being whom it waits for and `limit` the upstream's timeout: stuck with
-/// enough of this device's kept waiting already it waits no more, which counts as the upstream
-/// failing; nothing else is looked at (see `PermitManager::join`)
+/// 等别的请求正在做的、给 `upstream` 的同一个转发（`wait`），`client` 是替谁等的，`limit` 是上游的时限。开了流控时还看卡没卡住：
+/// 卡住了、这台设备留着等的又已经够多时不等了，算上游失败；别的都不管（见 `PermitManager::join`）
+/// Waits on the same forward to `upstream` another request is making (`wait`), `client` being
+/// whom it waits for and `limit` the upstream's timeout. With flow control on it is also seen to
+/// for being stuck: stuck with enough of this device's kept waiting already it waits no more,
+/// which counts as the upstream failing; nothing else is looked at (see `PermitManager::join`)
 pub(crate) async fn wait_for_another<T>(
     engine: &Engine,
-    flow: &crate::engine::concurrency::FlowControlState,
     client: std::net::IpAddr,
     upstream: &str,
     limit: Duration,
     wait: impl Future<Output = T>,
 ) -> anyhow::Result<T> {
-    let mut joining = engine.permit_manager.join(flow, client, upstream, limit);
-    let wait = std::pin::pin!(wait);
-    joining
-        .wait(wait)
-        .await
-        .map_err(|GaveUp| UpstreamFailure::withheld(Withheld::GaveUp))
+    let Some(flow) = &engine.flow_control_state else {
+        return Ok(wait.await);
+    };
+    // 流控的等待单独在堆上分配：只有等别人的查询才用得着，放在调用方里的话每个等上游的查询都得替它留着地方
+    // Flow control's wait is allocated on its own: only a query waiting on another's has use for
+    // it, and held in the callers every query waiting on an upstream would reserve room for it
+    Box::pin(async move {
+        let mut joining = engine.permit_manager.join(flow, client, upstream, limit);
+        let wait = std::pin::pin!(wait);
+        joining
+            .wait(wait)
+            .await
+            .map_err(|GaveUp| UpstreamFailure::withheld(Withheld::GaveUp))
+    })
+    .await
 }
 
 /// 应答报文是不是失败应答（SERVFAIL、REFUSED），只看报头里的 RCODE / Whether a reply packet is a failure

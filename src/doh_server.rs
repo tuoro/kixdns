@@ -386,7 +386,7 @@ async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> B
             return empty_dns_response(packet);
         }
     };
-    let Some(_permit) = engine.stream_query_permit(peer.ip()) else {
+    let Some(_permit) = engine.query_permit(None, peer.ip()) else {
         return empty_dns_response(packet);
     };
     // 要等上游的这一路放到堆上：它的状态有 4 KB 多，留在每个请求的 future 里，当场答完的请求也要跟着
@@ -801,11 +801,11 @@ mod tests {
             })
             .unwrap();
         // 它在内存不够以前就在用 / It was in use before memory ran short
-        drop(engine.stream_query_permit(light.ip()));
+        drop(engine.query_permit(None, light.ip()));
         let held: Vec<_> = (0..1000)
             .map(|_| {
                 engine
-                    .stream_query_permit(heavy.ip())
+                    .query_permit(None, heavy.ip())
                     .expect("under the floor")
             })
             .collect();

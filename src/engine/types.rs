@@ -537,11 +537,6 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         // 已不起作用（见 `GlobalSettings`），不让缓存换代
         statistics_enabled: _,
         statistics_anonymize_client_ip: _,
-        flow_control_initial_permits: _,
-        flow_control_min_permits: _,
-        flow_control_max_permits: _,
-        flow_control_latency_threshold_ms: _,
-        flow_control_adjustment_interval_secs: _,
     } = settings;
 
     (
@@ -880,34 +875,6 @@ mod tests {
         assert_eq!(before.get("second"), after.get("second"));
     }
 
-    /// 流控的几个旧数字已被智能流控替代、不起作用，改它们不让缓存换代
-    /// Flow control's old numbers were replaced by smart flow control and do nothing, so
-    /// changing them leaves the caches alone
-    #[test]
-    fn flow_control_old_numbers_leave_namespaces_alone() {
-        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        let mut after_config = before_config.clone();
-        let settings = &mut after_config.settings;
-        settings.flow_control_initial_permits += 1;
-        settings.flow_control_min_permits += 1;
-        settings.flow_control_max_permits += 1;
-        settings.flow_control_latency_threshold_ms += 1;
-        settings.flow_control_adjustment_interval_secs += 1;
-        let before = build_cache_namespaces(&before_config);
-        let after = build_cache_namespaces(&after_config);
-
-        assert_eq!(before.get("first"), after.get("first"));
-        assert_eq!(before.get("second"), after.get("second"));
-    }
-
-    /// 只在启动时读的设置（见 `GlobalSettings::restart_pending`）重载时改了也不让缓存换代：重载不让它们生效，应答也就
-    /// 不会变。以前它们都进了命名空间的哈希，热重载改一个（比如 flow_control_enabled）就作废所有缓存，设置本身却要重启
-    /// 才生效
-    /// The settings read at startup only (see `GlobalSettings::restart_pending`) leave the
-    /// caches alone when a reload changes them: a reload does not apply them, so the answers do
-    /// not change. They all used to go into the namespace hash, so a hot reload changing one
-    /// (flow_control_enabled, say) dropped every cache while the setting itself waited for a
-    /// restart
     #[test]
     fn settings_read_at_startup_leave_namespaces_alone() {
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");

@@ -746,31 +746,20 @@ pub(crate) async fn handle_forward_decision_logged(
                         rx.changed().await.ok()?;
                         Some(rx.borrow().clone())
                     };
-                    match &engine.flow_control_state {
-                        // 流控的等待单独在堆上分配：只有等别人的查询才用得着，放在这个函数里的话每个等上游的查询
-                        // 都得替它留着地方
-                        // Flow control's wait is allocated on its own: only a query waiting on
-                        // another's has use for it, and held in this function every query
-                        // waiting on an upstream would reserve room for it
-                        Some(flow) => {
-                            match Box::pin(crate::engine::upstream::wait_for_another(
-                                engine,
-                                flow,
-                                peer.ip(),
-                                upstream,
-                                upstream_timeout,
-                                waiting,
-                            ))
-                            .await
-                            {
-                                Ok(joined) => joined,
-                                Err(failure) => {
-                                    gave_up = Some(failure);
-                                    None
-                                }
-                            }
+                    match crate::engine::upstream::wait_for_another(
+                        engine,
+                        peer.ip(),
+                        upstream,
+                        upstream_timeout,
+                        waiting,
+                    )
+                    .await
+                    {
+                        Ok(joined) => joined,
+                        Err(failure) => {
+                            gave_up = Some(failure);
+                            None
                         }
-                        None => waiting.await,
                     }
                 }
                 None => None,

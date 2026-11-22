@@ -252,34 +252,9 @@
                                 <label class="form-label">启用流控</label>
                                 <div class="form-check form-switch">
                                     <input class="form-check-input" type="checkbox" v-model="config.settings.flow_control_enabled">
-                                    <label class="form-check-label">启用自适应流控</label>
+                                    <label class="form-check-label">启用智能流控</label>
                                 </div>
-                                <div class="form-text small">推荐禁用以获得更好的性能和更简单的行为（rustdns风格）。禁用后不限制并发，依赖 tokio runtime 调度和超时保护。</div>
-                            </div>
-                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
-                                <label class="form-label">初始许可数 (Initial Permits)</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_initial_permits" placeholder="500">
-                                <div class="form-text small">初始并发任务数</div>
-                            </div>
-                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
-                                <label class="form-label">最小许可数 (Min Permits)</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_min_permits" placeholder="100">
-                                <div class="form-text small">并发下限</div>
-                            </div>
-                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
-                                <label class="form-label">最大许可数 (Max Permits)</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_max_permits" placeholder="800">
-                                <div class="form-text small">并发上限</div>
-                            </div>
-                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
-                                <label class="form-label">延迟阈值 (ms)</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_latency_threshold_ms" placeholder="100">
-                                <div class="form-text small">压力判断的延迟阈值</div>
-                            </div>
-                            <div class="col-md-6" v-show="config.settings.flow_control_enabled">
-                                <label class="form-label">调整间隔 (seconds)</label>
-                                <input type="number" class="form-control" v-model.number="config.settings.flow_control_adjustment_interval_secs" placeholder="5">
-                                <div class="form-text small">流控参数检查频率</div>
+                                <div class="form-text small">某台设备请求激增时，其他设备照常解析。不用填数字，内核运行时自己判断。</div>
                             </div>
                         </div>
 
@@ -905,11 +880,6 @@
                         doq_connection_idle_timeout_seconds: 60,
                         doq_keepalive_interval_ms: 15000,
                         doq_enable_0rtt: true,
-                        flow_control_initial_permits: 500,
-                        flow_control_min_permits: 100,
-                        flow_control_max_permits: 800,
-                        flow_control_latency_threshold_ms: 100,
-                        flow_control_adjustment_interval_secs: 5,
                         cache_capacity: 10000,
                         cache_max_ttl: 86400,
                         dashmap_shards: 0,
@@ -922,11 +892,6 @@
                         serve_stale_ttl_reset: true,
                         serve_stale_client_timeout_ms: 0,
                         flow_control_enabled: false,
-                        flow_control_initial_permits: 500,
-                        flow_control_min_permits: 100,
-                        flow_control_max_permits: 800,
-                        flow_control_latency_threshold_ms: 100,
-                        flow_control_adjustment_interval_secs: 5,
                         geoip_db_path: "",
                         geoip_dat_path: "",
                         geoip_auto_convert: false,
