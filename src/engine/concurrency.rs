@@ -478,12 +478,17 @@ impl FlowControlState {
         emptied_at: Option<Instant>,
         device: DeviceSlot,
     ) -> Option<PermitGuard> {
-        if self.memory_refuses(manager, device)
-            || emptied_at.is_some_and(|emptied_at| {
-                self.busy(emptied_at) && self.behind() && manager.queries.holds_its_share(device)
-            })
-        {
-            manager.count_refused();
+        let refused = if self.memory_refuses(manager, device) {
+            Some(Defence::Memory)
+        } else if emptied_at.is_some_and(|emptied_at| {
+            self.busy(emptied_at) && self.behind() && manager.queries.holds_its_share(device)
+        }) {
+            Some(Defence::Capacity)
+        } else {
+            None
+        };
+        if let Some(defence) = refused {
+            manager.count_refused(defence);
             return None;
         }
         Some(manager.acquire_for(device))
@@ -597,7 +602,7 @@ impl FlowControlState {
             Room::Full => true,
         };
         if refused {
-            manager.count_refused();
+            manager.count_refused(Defence::Connection);
             None
         } else {
             Some(manager.acquire_connection_for(device))
@@ -1093,6 +1098,7 @@ impl Asking<'_> {
         self.stuck = true;
         let device = self.manager.slot_of(self.client);
         let Some(kept) = self.manager.keep_stuck(device) else {
+            self.manager.note_refused(self.client);
             return Err(GaveUp);
         };
         let done = work.await;
@@ -1143,11 +1149,126 @@ enum Held {
 }
 
 /// 记着有多少查询和连接在处理、拒绝了多少 / Counts the queries and connections being handled, and those refused
+/// 流控拒掉一个查询或连接的是哪一道防线 / Which defence of flow control refused a query or connection
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Defence {
+    /// 内核忙、查询排着长队，这台设备在途占着自己那一份 / The kernel busy and queueing long, the device
+    /// holding its share in flight
+    Capacity,
+    /// 内存不够 / Too little memory
+    Memory,
+    /// 内存不够时的 TCP、DoH 新连接 / A new TCP or DoH connection with too little memory
+    Connection,
+    /// 按设备轮流时这台设备的队排满了 / Its queue full while devices take turns
+    Queue,
+    /// 这台设备卡住的查询留够了 / Enough of the device's stuck queries kept waiting
+    Stuck,
+    /// 上游最近不回答这台设备 / The upstream not answering this device of late
+    Unanswered,
+}
+
+impl Defence {
+    pub const ALL: [Self; 6] = [
+        Self::Capacity,
+        Self::Memory,
+        Self::Connection,
+        Self::Queue,
+        Self::Stuck,
+        Self::Unanswered,
+    ];
+
+    /// 指标里的名字 / The name in the metrics
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::Memory => "memory",
+            Self::Connection => "connection",
+            Self::Queue => "queue",
+            Self::Stuck => "stuck",
+            Self::Unanswered => "unanswered",
+        }
+    }
+}
+
+/// 记几台被拦得最多的设备 / How many of the devices refused most are kept
+const REFUSED_CLIENTS: usize = 8;
+
+/// 被拦得最多的设备：地址、被拦了几次、最近一次被拦是哪一秒（从 `started` 算起）
+/// A device refused often: its address, how often it was refused, and the second (since
+/// `started`) it last was
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RefusedClient {
+    pub client: std::net::IpAddr,
+    pub refused: u64,
+    pub last_refused_secs: u64,
+}
+
+/// 被拦得最多的几台设备（Space-Saving）：表里有就加一，没有就顶掉最久没被拦过或次数最少的那台，接着它的次数往上数，
+/// 所以次数是上限。拦得正凶时锁抢不到就不记，只少记几次
+/// The devices refused most (Space-Saving): one already in the table counts one more, another
+/// takes the place of the one refused longest ago or least and counts on from its number, so a
+/// count is an upper bound. While refusals come thick and the lock is taken it is skipped, only
+/// missing a few
+struct RefusedClients {
+    started: Instant,
+    table: parking_lot::Mutex<Vec<RefusedClient>>,
+}
+
+/// 这么久没被拦过的设备先让位 / A device not refused for this long gives way first
+const REFUSED_STALE_SECS: u64 = 3600;
+
+impl RefusedClients {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            table: parking_lot::Mutex::new(Vec::with_capacity(REFUSED_CLIENTS)),
+        }
+    }
+
+    fn note(&self, client: std::net::IpAddr) {
+        let Some(mut table) = self.table.try_lock() else {
+            return;
+        };
+        let now = self.started.elapsed().as_secs();
+        if let Some(known) = table.iter_mut().find(|known| known.client == client) {
+            known.refused += 1;
+            known.last_refused_secs = now;
+            return;
+        }
+        if table.len() < REFUSED_CLIENTS {
+            table.push(RefusedClient {
+                client,
+                refused: 1,
+                last_refused_secs: now,
+            });
+            return;
+        }
+        let stale = |entry: &RefusedClient| now - entry.last_refused_secs > REFUSED_STALE_SECS;
+        let Some(place) = table
+            .iter_mut()
+            .min_by_key(|entry| (!stale(entry), entry.refused))
+        else {
+            return;
+        };
+        let refused = if stale(place) { 1 } else { place.refused + 1 };
+        *place = RefusedClient {
+            client,
+            refused,
+            last_refused_secs: now,
+        };
+    }
+}
+
 pub struct PermitManager {
     // Current active permits (acquired) / 当前活跃 permits（已获得）
     pub(crate) active_permits: AtomicUsize,
     // Count of requests refused / 被拒绝的请求计数
     dropped_requests: AtomicU64,
+    /// 按防线分的拒绝次数，下标是 [`Defence`] / Refusals by defence, indexed by [`Defence`]
+    refused_by: [AtomicU64; Defence::ALL.len()],
+    refused_clients: RefusedClients,
+    /// 开始按设备轮流了几次 / How many times devices began taking turns
+    turns: AtomicU64,
     /// 开了流控时，每一份设备在途的查询 / With flow control on, the queries in flight per slot of devices
     queries: DeviceCounts,
     /// 开了流控时，每一份设备开着的 TCP 和 DoH 连接 / With flow control on, the TCP and DoH
@@ -1180,6 +1301,9 @@ impl PermitManager {
         Self {
             active_permits: AtomicUsize::new(0),
             dropped_requests: AtomicU64::new(0),
+            refused_by: Default::default(),
+            refused_clients: RefusedClients::new(),
+            turns: AtomicU64::new(0),
             queries: DeviceCounts::new(),
             connections: DeviceCounts::new(),
             answer_time: AnswerTime::new(),
@@ -1227,8 +1351,10 @@ impl PermitManager {
         DeviceSlot(slot(hash), slot(hash >> 32))
     }
 
-    /// 记下一个被拒绝的查询或连接，隔一阵记一条日志 / Counts a refused query or connection, with a log line now and then
-    pub fn count_refused(&self) {
+    /// 记下 `defence` 拒掉的一个查询或连接，隔一阵记一条日志 / Counts a query or connection `defence`
+    /// refused, with a log line now and then
+    pub fn count_refused(&self, defence: Defence) {
+        self.refused_by[defence as usize].fetch_add(1, Ordering::Relaxed);
         let dropped = self.dropped_requests.fetch_add(1, Ordering::Relaxed);
         if dropped.is_multiple_of(100_000) {
             tracing::warn!(
@@ -1384,7 +1510,7 @@ impl PermitManager {
     /// counted once the guard returned is dropped; at its share it is not, counted as refused
     fn keep_stuck(&self, device: DeviceSlot) -> Option<Stuck<'_>> {
         if self.stuck.full_for(device, STUCK_KEPT) {
-            self.count_refused();
+            self.count_refused(Defence::Stuck);
             return None;
         }
         self.stuck.add(device);
@@ -1428,7 +1554,8 @@ impl PermitManager {
             let slots = self.asked_slots(client, upstream);
             let held_back = self.asked.held_back(slots);
             if held_back && !self.asked.tries_now(slots[0]) {
-                self.count_refused();
+                self.count_refused(Defence::Unanswered);
+                self.note_refused(client);
                 return None;
             }
             held_back
@@ -1515,6 +1642,39 @@ impl PermitManager {
     #[inline]
     pub fn dropped_requests(&self) -> u64 {
         self.dropped_requests.load(Ordering::Relaxed)
+    }
+
+    /// 被拦的是哪台设备 / The device that was refused
+    pub fn note_refused(&self, client: std::net::IpAddr) {
+        self.refused_clients.note(client);
+    }
+
+    /// 各道防线拒了几次 / How often each defence refused
+    pub fn refusals(&self) -> [(Defence, u64); Defence::ALL.len()] {
+        Defence::ALL.map(|defence| {
+            (
+                defence,
+                self.refused_by[defence as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// 被拦得最多的几台设备，次数多的在前，`now_secs` 是从启动算起的现在 / The devices refused most, most
+    /// first, with `now_secs` now in seconds since the start
+    pub fn refused_clients(&self) -> (Vec<RefusedClient>, u64) {
+        let mut clients = self.refused_clients.table.lock().clone();
+        clients.sort_by(|a, b| b.refused.cmp(&a.refused));
+        (clients, self.refused_clients.started.elapsed().as_secs())
+    }
+
+    /// 记下又开始按设备轮流了一次 / Counts devices beginning to take turns once more
+    pub fn note_turns_begun(&self) {
+        self.turns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 开始按设备轮流过几次 / How many times devices began taking turns
+    pub fn turns_begun(&self) -> u64 {
+        self.turns.load(Ordering::Relaxed)
     }
 }
 
@@ -2863,6 +3023,90 @@ mod tests {
             "the device flooding"
         );
         drop((first, flood));
+    }
+
+    /// 被拦得最多的设备：表里有的加一，满了顶掉次数最少的、接着它的数往上数；很久没被拦过的先让位，从 1 数起
+    /// The devices refused most: one in the table counts one more, a full table has the least
+    /// refused give way with the newcomer counting on from it; one not refused for long gives way
+    /// first, counting from 1
+    #[test]
+    fn the_devices_refused_most_are_kept() {
+        let clients = RefusedClients::new();
+        let ip = |n: u8| std::net::IpAddr::from([10, 0, 0, n]);
+        for n in 0..REFUSED_CLIENTS as u8 {
+            for _ in 0..=n {
+                clients.note(ip(n));
+            }
+        }
+        clients.note(ip(200));
+        let table = clients.table.lock().clone();
+        assert_eq!(table.len(), REFUSED_CLIENTS);
+        let of = |client| {
+            table
+                .iter()
+                .find(|entry| entry.client == client)
+                .map(|entry| entry.refused)
+        };
+        assert_eq!(of(ip(0)), None, "the least refused gave way");
+        assert_eq!(of(ip(200)), Some(2), "counting on from it");
+        assert_eq!(of(ip(7)), Some(8));
+
+        clients.table.lock()[0].last_refused_secs = 0;
+        let stale = clients.table.lock()[0].client;
+        let clients = RefusedClients {
+            started: Instant::now() - Duration::from_secs(REFUSED_STALE_SECS + 10),
+            table: parking_lot::Mutex::new(clients.table.lock().clone()),
+        };
+        for entry in clients.table.lock().iter_mut().skip(1) {
+            entry.last_refused_secs = REFUSED_STALE_SECS + 5;
+        }
+        clients.note(ip(201));
+        let table = clients.table.lock().clone();
+        assert!(
+            table.iter().all(|entry| entry.client != stale),
+            "the stale one gave way"
+        );
+        assert_eq!(
+            table
+                .iter()
+                .find(|entry| entry.client == ip(201))
+                .map(|entry| entry.refused),
+            Some(1),
+            "counting from 1 in a stale place"
+        );
+    }
+
+    /// 每道防线各记各的：内存不够、内核忙、新连接、卡住的查询；合起来就是总数
+    /// Each defence counts its own: too little memory, the kernel busy, a new connection, a stuck
+    /// query; together they are the total
+    #[test]
+    fn refusals_are_counted_by_defence() {
+        let manager = Arc::new(PermitManager::new());
+        let full = with_memory_left(1 << 20);
+        let held: Vec<_> = (0..1000).map(|_| manager.acquire_for(ONE)).collect();
+        assert!(full.permit(&manager, None, ONE).is_none());
+        assert!(full.connection_permit(&manager, OTHER).is_none());
+        drop(held);
+        let busy = state(Duration::ZERO);
+        busy.note_queue_delay(Duration::from_secs(3600));
+        let one = busy
+            .permit(&manager, Some(Instant::now()), ONE)
+            .expect("its first");
+        assert!(busy.permit(&manager, Some(Instant::now()), ONE).is_none());
+        let kept: Vec<_> = std::iter::from_fn(|| manager.keep_stuck(ONE)).collect();
+        let by = |defence| {
+            manager
+                .refusals()
+                .into_iter()
+                .find(|(each, _)| *each == defence)
+                .map(|(_, refused)| refused)
+        };
+        assert_eq!(by(Defence::Memory), Some(1));
+        assert_eq!(by(Defence::Connection), Some(1));
+        assert_eq!(by(Defence::Capacity), Some(1));
+        assert_eq!(by(Defence::Stuck), Some(1));
+        assert_eq!(manager.dropped_requests(), 4);
+        drop((one, kept));
     }
 
     /// 记在设备上的数还回来以后都归零，有在途的设备数也归零 / What is counted per device returns to
