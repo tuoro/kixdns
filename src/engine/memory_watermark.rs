@@ -176,6 +176,18 @@ impl MemoryWatermark {
         }
     }
 
+    /// 一分钟内读到的还剩几倍余量（见 [`MemoryLeft::headroom`]），到 2 为止：2 算够，1 以下算没了。在途不到底线时不读内存，
+    /// 读数会一直停在上一阵，所以超过一分钟就不给
+    /// How many margins were left as read within the last minute (see [`MemoryLeft::headroom`]), up
+    /// to 2: 2 is enough, under 1 none left. Memory is not read with what is in flight under the
+    /// floor, so a reading stays where the last spell left it, and one over a minute old is not given
+    pub fn margins_left(&self) -> Option<f64> {
+        let read_at = self.read_at_ms.load(Ordering::Relaxed);
+        let age = (self.started.elapsed().as_millis() as u64).saturating_sub(read_at);
+        (read_at != 0 && age <= 60_000)
+            .then(|| f64::from(self.headroom.load(Ordering::Relaxed)) / 1000.0)
+    }
+
     /// 紧张时在途的查询一共最多多少，`queries` 是现在在途的查询数（不算连接）：变紧张以后头一次问的时候在途多少，就是多少，
     /// 内存不紧张了（够了，或者没了）、在途掉到底线以下，就清掉。不随着读数往上调：紧张时放进去的都让内存更紧，到了这个数只再放没占满自己那一份的
     /// 设备，一共最多多出设备数那么多。没了的时候谁都不放，在途只会少，再回到紧张时记下的就更小。内存还给系统以前，在途回到

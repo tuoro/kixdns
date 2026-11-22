@@ -996,6 +996,7 @@ impl PanelMetrics {
             "kixdns_cache_entries",
             engine.cache.weighted_size(),
         );
+        render_flow_control(&mut output, engine);
         self.render_counters(&mut output);
         output
     }
@@ -1159,6 +1160,57 @@ impl PanelMetrics {
             output,
             "kixdns_panel_metric_series_dropped_total",
             self.metric_series_dropped.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// 流控的指标：开没开、各道防线拒了几次、开始按设备轮流过几次、卡住留着等的查询、内存还剩几倍余量（一分钟内读到的，2 以上算够，
+/// 1 以下算没了；没有这样的读数就没有这一行），以及被拦得最多的几台设备，各自被拦了几次、最近一次是几秒前
+/// Flow control's metrics: whether it is on, how often each defence refused, how many times
+/// devices began taking turns, the stuck queries kept waiting, how many margins of memory are left
+/// (as read within the last minute: 2 or more is enough, under 1 none left; no line without such a
+/// reading), and the devices refused most, each
+/// with how often and how many seconds ago it last was
+#[cfg(unix)]
+fn render_flow_control(output: &mut String, engine: &Engine) {
+    let manager = &engine.permit_manager;
+    metric(
+        output,
+        "kixdns_flow_control_enabled",
+        u8::from(engine.flow_control_state.is_some()),
+    );
+    for (defence, refused) in manager.refusals() {
+        labeled_metric(
+            output,
+            "kixdns_flow_refused_total",
+            &[("defence", defence.label())],
+            refused,
+        );
+    }
+    metric(output, "kixdns_flow_turns_total", manager.turns_begun());
+    metric(output, "kixdns_flow_stuck", manager.stuck());
+    if let Some(margins) = engine
+        .flow_control_state
+        .as_ref()
+        .and_then(|flow| flow.memory.margins_left())
+    {
+        metric(output, "kixdns_flow_memory_room", margins);
+    }
+    let (clients, now) = manager.refused_clients();
+    for client in clients {
+        let address = client.client.to_string();
+        let labels = [("client", address.as_str())];
+        labeled_metric(
+            output,
+            "kixdns_flow_refused_client_total",
+            &labels,
+            client.refused,
+        );
+        labeled_metric(
+            output,
+            "kixdns_flow_refused_client_age_seconds",
+            &labels,
+            now.saturating_sub(client.last_refused_secs),
         );
     }
 }
@@ -4470,6 +4522,42 @@ mod diagnostic_tests {
             .observer(metrics)
             .build()
             .expect("build engine")
+    }
+
+    /// 指标里有流控：开没开、各道防线拒了几次、轮流过几次、内存还剩几倍余量、被拦的设备和多久以前
+    /// The metrics carry flow control: whether it is on, how often each defence refused, how many
+    /// times turns began, how many margins of memory are left, and the devices refused and how long ago
+    #[tokio::test]
+    async fn the_metrics_show_flow_control() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "flow_control_enabled": true },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "rest", "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+            }] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let manager = &engine.permit_manager;
+        manager.count_refused(crate::engine::concurrency::Defence::Queue);
+        manager.note_refused("192.168.1.20".parse().unwrap());
+        manager.note_turns_begun();
+        let text = metrics.render_prometheus(&engine);
+        assert!(
+            !text.contains("kixdns_flow_memory_room"),
+            "memory not read yet"
+        );
+        for line in [
+            "kixdns_flow_control_enabled 1",
+            "kixdns_flow_refused_total{defence=\"queue\"} 1",
+            "kixdns_flow_refused_total{defence=\"memory\"} 0",
+            "kixdns_flow_turns_total 1",
+            "kixdns_flow_stuck 0",
+            "kixdns_flow_refused_client_total{client=\"192.168.1.20\"} 1",
+            "kixdns_flow_refused_client_age_seconds{client=\"192.168.1.20\"} 0",
+        ] {
+            assert!(text.lines().any(|got| got == line), "{line} in\n{text}");
+        }
     }
 
     /// 控制通道的 config 列出改了但要重启才生效的设置；改回去以后不再列

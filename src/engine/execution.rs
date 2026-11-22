@@ -322,14 +322,18 @@ impl Engine {
     /// `FlowControlState::permit`); without flow control it always can
     #[inline]
     pub fn query_permit(&self, emptied_at: Option<Instant>, client: IpAddr) -> Option<PermitGuard> {
-        match &self.flow_control_state {
-            Some(state) => state.permit(
-                &self.permit_manager,
-                emptied_at,
-                self.permit_manager.slot_of(client),
-            ),
-            None => Some(self.permit_manager.acquire()),
+        let Some(state) = &self.flow_control_state else {
+            return Some(self.permit_manager.acquire());
+        };
+        let permit = state.permit(
+            &self.permit_manager,
+            emptied_at,
+            self.permit_manager.slot_of(client),
+        );
+        if permit.is_none() {
+            self.permit_manager.note_refused(client);
         }
+        permit
     }
 
     /// `client` 的一条 TCP 或 DoH 新连接接不接（见 `FlowControlState::connection_permit`）。连接本身也占内存，
@@ -339,12 +343,15 @@ impl Engine {
     /// flight; without flow control it always is
     #[inline]
     pub fn connection_permit(&self, client: IpAddr) -> Option<PermitGuard> {
-        match &self.flow_control_state {
-            Some(state) => {
-                state.connection_permit(&self.permit_manager, self.permit_manager.slot_of(client))
-            }
-            None => Some(self.permit_manager.acquire()),
+        let Some(state) = &self.flow_control_state else {
+            return Some(self.permit_manager.acquire());
+        };
+        let permit =
+            state.connection_permit(&self.permit_manager, self.permit_manager.slot_of(client));
+        if permit.is_none() {
+            self.permit_manager.note_refused(client);
         }
+        permit
     }
 
     /// Get the configured upstream timeout in milliseconds

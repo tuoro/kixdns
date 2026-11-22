@@ -1452,6 +1452,7 @@ impl<'a> UdpAnswering<'a> {
     #[cfg(target_os = "linux")]
     fn begin_turns(&mut self) -> Box<TakingTurns> {
         self.taking_turns = true;
+        self.engine.permit_manager.note_turns_begun();
         Box::new(TakingTurns::new(
             self.queries_within_target,
             queries_in_recv_buffer(self.socket),
@@ -1481,6 +1482,7 @@ impl<'a> UdpAnswering<'a> {
     #[cfg_attr(target_os = "linux", allow(dead_code))] // Linux 上只有测试用 / On Linux only the tests use it
     fn begin_turns_one_by_one(&mut self) -> TurnsOneByOne {
         self.taking_turns = true;
+        self.engine.permit_manager.note_turns_begun();
         TurnsOneByOne::new(self.queries_within_target, recv_buffer_holds(self.socket))
     }
 
@@ -1803,7 +1805,9 @@ impl TakingTurns {
                 continue;
             };
             if !self.queue.offer(packet, Device::of(peer.addr().ip()), peer) {
-                answering.engine.permit_manager.count_refused();
+                let manager = &answering.engine.permit_manager;
+                manager.count_refused(kixdns::engine::concurrency::Defence::Queue);
+                manager.note_refused(peer.addr().ip());
             }
         }
         let now = Instant::now();
@@ -1954,7 +1958,9 @@ impl TurnsOneByOne {
                 Ok((len, peer)) => {
                     got += 1;
                     if !self.queue.offer(&buf[..len], Device::of(peer.ip()), peer) {
-                        answering.engine.permit_manager.count_refused();
+                        let manager = &answering.engine.permit_manager;
+                        manager.count_refused(kixdns::engine::concurrency::Defence::Queue);
+                        manager.note_refused(peer.ip());
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3733,7 +3739,9 @@ mod tests {
 
         // 自己的查询被拒也算；别的 worker、TCP 和 DoH 的拒绝不算 / Its own queries refused count too;
         // refusals in another worker or over TCP and DoH do not
-        with_flow.permit_manager.count_refused();
+        with_flow
+            .permit_manager
+            .count_refused(kixdns::engine::concurrency::Defence::Capacity);
         look(&mut answering, long_ago(), long_ago(), drops);
         assert!(
             answering.behind_at.elapsed() > CAUGHT_UP_AFTER,
