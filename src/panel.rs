@@ -1164,11 +1164,12 @@ impl PanelMetrics {
     }
 }
 
-/// 流控的指标：开没开、各道防线拒了几次、开始按设备轮流过几次、卡住留着等的查询、内存还剩几倍余量（上次读到的，2 以上算够，
-/// 1 以下算没了），以及被拦得最多的几台设备，各自被拦了几次、最近一次是几秒前
+/// 流控的指标：开没开、各道防线拒了几次、开始按设备轮流过几次、卡住留着等的查询、内存还剩几倍余量（一分钟内读到的，2 以上算够，
+/// 1 以下算没了；没有这样的读数就没有这一行），以及被拦得最多的几台设备，各自被拦了几次、最近一次是几秒前
 /// Flow control's metrics: whether it is on, how often each defence refused, how many times
 /// devices began taking turns, the stuck queries kept waiting, how many margins of memory are left
-/// (as last read: 2 or more is enough, under 1 none left), and the devices refused most, each
+/// (as read within the last minute: 2 or more is enough, under 1 none left; no line without such a
+/// reading), and the devices refused most, each
 /// with how often and how many seconds ago it last was
 #[cfg(unix)]
 fn render_flow_control(output: &mut String, engine: &Engine) {
@@ -1188,12 +1189,12 @@ fn render_flow_control(output: &mut String, engine: &Engine) {
     }
     metric(output, "kixdns_flow_turns_total", manager.turns_begun());
     metric(output, "kixdns_flow_stuck", manager.stuck());
-    if let Some(flow) = &engine.flow_control_state {
-        metric(
-            output,
-            "kixdns_flow_memory_room",
-            flow.memory.margins_left(),
-        );
+    if let Some(margins) = engine
+        .flow_control_state
+        .as_ref()
+        .and_then(|flow| flow.memory.margins_left())
+    {
+        metric(output, "kixdns_flow_memory_room", margins);
     }
     let (clients, now) = manager.refused_clients();
     for client in clients {
@@ -4542,13 +4543,16 @@ mod diagnostic_tests {
         manager.note_refused("192.168.1.20".parse().unwrap());
         manager.note_turns_begun();
         let text = metrics.render_prometheus(&engine);
+        assert!(
+            !text.contains("kixdns_flow_memory_room"),
+            "memory not read yet"
+        );
         for line in [
             "kixdns_flow_control_enabled 1",
             "kixdns_flow_refused_total{defence=\"queue\"} 1",
             "kixdns_flow_refused_total{defence=\"memory\"} 0",
             "kixdns_flow_turns_total 1",
             "kixdns_flow_stuck 0",
-            "kixdns_flow_memory_room 2",
             "kixdns_flow_refused_client_total{client=\"192.168.1.20\"} 1",
             "kixdns_flow_refused_client_age_seconds{client=\"192.168.1.20\"} 0",
         ] {
