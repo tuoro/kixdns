@@ -63,6 +63,10 @@ const MAX_PENDING: usize = 16_384;
 /// up the ring is nearly empty and takes only what it has used. A record longer than a quarter of it
 /// (with absurdly long names in the config) is not recorded, and counts as unrecorded
 const RING_BYTES: usize = 8 << 20;
+/// 交接区头上空出这么多才把还在的记录挪到最前面，也是用过的地方缩回去时至少留的一半
+/// How much has to be free at the head of the ring before the records still there move to the front,
+/// and half of what is kept at least when the used space shrinks back
+const COMPACT_FROM: usize = 64 << 10;
 /// 在跟的请求按编号直接定位的槽位数，2 的幂；同时在跟的多过它时，多出来的记在共享表里
 /// Slots the tracked requests are placed in by number, a power of two; requests beyond them at once go
 /// to a shared map
@@ -284,6 +288,14 @@ impl Ring {
             self.index.pop_front();
         }
         if self.bytes.len() < taken.end {
+            // 加倍着长，但不超过上限：交给 Vec 自己加倍，会占到上限的近两倍
+            // It grows by doubling, but not past the limit: left to Vec's own doubling it would take
+            // nearly twice the limit
+            let room = self.bytes.capacity();
+            if room < taken.end {
+                let want = room.saturating_mul(2).min(self.max_bytes).max(taken.end);
+                self.bytes.reserve_exact(want - self.bytes.len());
+            }
             self.bytes.resize(taken.end, 0);
         }
         self.bytes[taken.clone()].copy_from_slice(record);
@@ -291,6 +303,41 @@ impl Ring {
         self.index.push_back(taken);
         self.newest += 1;
         true
+    }
+
+    /// 面板存好的删掉以后调用。面板取走的那批要等它下次来取才删，交接区在有查询时就从来不空，下一条总接在最后一条
+    /// 后面放，用过的地方会一直长到上限（8 MiB）。所以没绕回、还在的记录不到头上空出来的四分之一（空出来的至少
+    /// [`COMPACT_FROM`]）时，把还在的挪到最前面，挪的不超过空出来的四分之一；用过的地方比要用的多出好几倍时，多出来的
+    /// 还回去。面板跟得上时交接区只占一批记录的几倍，面板停过一阵、攒满又取完以后也缩回来
+    /// Called once what the panel has stored is deleted. The batch the panel took is deleted only on its
+    /// next take, so while queries come the ring is never empty, the next record always goes after the
+    /// last, and the used space would grow all the way to the limit (8 MiB). So when the ring has not
+    /// wrapped and what is still there is under a quarter of what is free at its head (which is
+    /// [`COMPACT_FROM`] at least), the records still there move to the front, moving no more than a
+    /// quarter of what was freed; and when the used space is several times what is needed, the rest is
+    /// given back. With the panel keeping up the ring takes a few times one batch, and after the panel
+    /// stopped a while, the ring filled up and was taken it shrinks back too
+    fn compact(&mut self) {
+        if let Some(start) = self.index.front().map(|front| front.start) {
+            // 最早的在 `tail` 后面就是绕回了 / The oldest lying past `tail` means it has wrapped
+            if start >= self.tail || start < COMPACT_FROM || self.tail - start > start / 4 {
+                return;
+            }
+            self.bytes.copy_within(start..self.tail, 0);
+            for range in &mut self.index {
+                range.start -= start;
+                range.end -= start;
+            }
+            self.tail -= start;
+        } else {
+            self.tail = 0;
+        }
+        // 到这里还在的都在 `..tail` 里 / Here everything still there lies in `..tail`
+        let keep = self.tail.max(COMPACT_FROM) * 2;
+        if self.bytes.len() > keep * 2 {
+            self.bytes.truncate(keep);
+            self.bytes.shrink_to_fit();
+        }
     }
 
     /// 全清掉，内存还回去；序号照旧往下数 / Empties everything and gives the memory back; numbering carries
@@ -1826,6 +1873,7 @@ impl QueryLog {
             {
                 ring.pop_front();
             }
+            ring.compact();
             let oldest = ring.oldest();
             // 交接区里的序号是连续的（只从头上丢），所以 `after` 之后的第一条就在 `after - oldest + 1`
             // The ring's numbers are contiguous (it only drops from the front), so the first record
@@ -2218,9 +2266,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CAPACITY, ConfigName, IDLE_AFTER, KNOWN_NAMES, MAX_ANSWERS, MAX_PAGE, MAX_STEPS, MAX_TEXT,
-        PENDING_SLOTS, QueryLog, RING_BYTES, WallClock, clip, read_response, read_whole_response,
-        unix_ms,
+        CAPACITY, COMPACT_FROM, ConfigName, IDLE_AFTER, KNOWN_NAMES, MAX_ANSWERS, MAX_PAGE,
+        MAX_STEPS, MAX_TEXT, PENDING_SLOTS, QueryLog, RING_BYTES, WallClock, clip, read_response,
+        read_whole_response, unix_ms,
     };
     use crate::config::Transport;
     use crate::observe::{
@@ -4819,6 +4867,79 @@ mod tests {
         assert_eq!(counted.len(), 0);
         assert_eq!(counted.bytes.capacity(), 0, "the memory is given back");
         assert_eq!(counted.newest, 5);
+    }
+
+    /// 面板跟得上时（每次来取都删掉上次取走的），交接区只占一批记录的几倍，不会一直长到上限，长的时候也不超过上限；
+    /// 挪过的记录内容和序号都对；面板停过一阵、交接区攒满又取完以后，用过的地方缩回来
+    /// With the panel keeping up (each take deleting what the last one took) the ring takes a few times one
+    /// batch and does not grow to its limit, nor past it while it grows; records that moved keep their
+    /// contents and numbers; after the panel stopped a while, the ring filled up and was taken, the used
+    /// space shrinks back
+    #[test]
+    fn the_ring_stays_small_while_the_panel_keeps_up() {
+        let record = |seq: u64| vec![u8::try_from(seq % 251).unwrap(); 110];
+        let intact = |ring: &super::Ring| {
+            for (seq, bytes) in ring_contents(ring) {
+                assert_eq!(bytes, record(seq), "{seq}");
+            }
+        };
+        let push = |ring: &mut super::Ring, count: usize| {
+            for _ in 0..count {
+                let seq = ring.newest + 1;
+                assert!(ring.push(&record(seq), CAPACITY), "{seq}");
+            }
+        };
+        // 面板存好了 `up_to` 以前的 / The panel has stored everything up to `up_to`
+        let stored = |ring: &mut super::Ring, up_to: u64| {
+            while ring.oldest().is_some_and(|oldest| oldest <= up_to) {
+                ring.pop_front();
+            }
+            ring.compact();
+        };
+        let mut ring = super::Ring::new(RING_BYTES);
+        let mut taken = 0;
+        // 两千批、每批一百条，一共 22 MB / Two thousand batches of a hundred, 22 MB in all
+        for _ in 0..2_000 {
+            push(&mut ring, 100);
+            stored(&mut ring, taken);
+            taken = ring.newest;
+        }
+        intact(&ring);
+        assert!(
+            ring.bytes.capacity() <= 4 * COMPACT_FROM,
+            "{}",
+            ring.bytes.capacity()
+        );
+        // 面板停了一阵：攒满，长的时候不超过上限 / The panel stopped a while: the ring fills up, and does not
+        // grow past its limit
+        push(&mut ring, RING_BYTES / 110 + 1_000);
+        assert!(
+            ring.bytes.capacity() <= RING_BYTES,
+            "{}",
+            ring.bytes.capacity()
+        );
+        intact(&ring);
+        // 面板回来取完，只剩最后一百条 / The panel is back and has taken all but the last hundred
+        let up_to = ring.newest - 100;
+        stored(&mut ring, up_to);
+        assert_eq!(ring.len(), 100);
+        intact(&ring);
+        assert!(
+            ring.bytes.capacity() <= 4 * COMPACT_FROM,
+            "{}",
+            ring.bytes.capacity()
+        );
+        // 挪过以后照常往后放 / After moving it carries on as before
+        push(&mut ring, 1_000);
+        intact(&ring);
+        let up_to = ring.newest;
+        stored(&mut ring, up_to);
+        assert_eq!(ring.len(), 0);
+        assert!(
+            ring.bytes.capacity() <= 4 * COMPACT_FROM,
+            "{}",
+            ring.bytes.capacity()
+        );
     }
 
     #[test]
