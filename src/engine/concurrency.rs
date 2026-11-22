@@ -1663,7 +1663,7 @@ impl PermitManager {
     /// first, with `now_secs` now in seconds since the start
     pub fn refused_clients(&self) -> (Vec<RefusedClient>, u64) {
         let mut clients = self.refused_clients.table.lock().clone();
-        clients.sort_by(|a, b| b.refused.cmp(&a.refused));
+        clients.sort_by_key(|client| std::cmp::Reverse(client.refused));
         (clients, self.refused_clients.started.elapsed().as_secs())
     }
 
