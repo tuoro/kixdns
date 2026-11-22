@@ -263,16 +263,50 @@ impl WaitingToRun {
     /// before it is done, or before it ever ran, it counts no more
     pub fn counting<F: Future>(waiting: Arc<Self>, work: F) -> impl Future<Output = F::Output> {
         let handed_over = HandedOver::new(waiting);
-        async move {
-            let waker = std::task::Waker::from(Arc::clone(&handed_over.0));
-            let mut work = std::pin::pin!(work);
-            std::future::poll_fn(|cx| {
-                handed_over.0.runs(cx.waker());
-                work.as_mut()
-                    .poll(&mut std::task::Context::from_waker(&waker))
-            })
-            .await
+        let waker = std::task::Waker::from(Arc::clone(&handed_over.0));
+        Counting {
+            work,
+            waker,
+            handed_over,
         }
+    }
+}
+
+/// [`WaitingToRun::counting`] 交出去的查询。手写成 future，不写成 async 块：async 块把 `work` 存在捕获里，等它时又挪进等着的
+/// 那一格，同一个查询占两份地方。一个查询的 future 有四五 KB，轮流时正是在途多的时候
+/// A query handed over by [`WaitingToRun::counting`], written by hand rather than as an async block:
+/// an async block keeps `work` among its captures and moves it into the slot it is awaited from, so
+/// one query takes room twice. A query's future is four or five KB, and turns are taken just when many
+/// are in flight
+struct Counting<F> {
+    work: F,
+    waker: std::task::Waker,
+    handed_over: HandedOver,
+}
+
+impl<F: Future> Future for Counting<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        // SAFETY: `work` 钉在原地：从不挪出来，`Counting` 也没有会挪它的 Drop / `work` stays pinned in
+        // place: it is never moved out, and `Counting` has no Drop that would move it
+        let (work, waker, handed_over) = unsafe {
+            let this = self.get_unchecked_mut();
+            (
+                std::pin::Pin::new_unchecked(&mut this.work),
+                &this.waker,
+                &this.handed_over,
+            )
+        };
+        handed_over.0.runs(cx.waker());
+        let done = work.poll(&mut std::task::Context::from_waker(waker));
+        if done.is_ready() {
+            handed_over.end();
+        }
+        done
     }
 }
 
@@ -358,12 +392,20 @@ impl HandedOver {
     }
 }
 
-impl Drop for HandedOver {
-    fn drop(&mut self) {
+impl HandedOver {
+    /// 跑完了或者被丢掉了：不再算，之后的叫醒也不算；再调一次什么都不做 / Done or dropped: it counts no
+    /// more, nor do later wakes; calling it again does nothing
+    fn end(&self) {
         if self.0.state.swap(DONE, Ordering::AcqRel) == WAITING_TO_RUN {
             self.0.waiting.0.fetch_sub(1, Ordering::Relaxed);
         }
         *self.0.task.lock() = None;
+    }
+}
+
+impl Drop for HandedOver {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -2874,6 +2916,25 @@ mod tests {
     /// wakes it wakes the task itself. Only those handed over and not started used to be
     /// counted: those whose answer had arrived, woken with their turn to run not coming, were
     /// not, and with several cores at work what was in flight still grew past a hundred thousand
+    /// 包一层只多几十字节，不把查询的 future 再存一份：轮流时在途正多，一个查询要是占两份，四五 KB 就成了八九 KB
+    /// Wrapping adds a few dozen bytes and does not keep the query's future twice: in flight is high
+    /// while turns are taken, and two copies would turn four or five KB into eight or nine
+    #[test]
+    fn counting_keeps_the_query_once() {
+        let query = async {
+            let held = [7u8; 4096];
+            tokio::task::yield_now().await;
+            held.len()
+        };
+        let alone = std::mem::size_of_val(&query);
+        let counted = WaitingToRun::counting(Arc::new(WaitingToRun::default()), query);
+        assert!(
+            std::mem::size_of_val(&counted) <= alone + 64,
+            "{} for a {alone}-byte query",
+            std::mem::size_of_val(&counted)
+        );
+    }
+
     #[test]
     fn a_query_counts_while_it_has_work_waiting_for_the_kernel() {
         use std::task::{Context, Poll, Waker};
