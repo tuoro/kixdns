@@ -128,30 +128,13 @@ pub struct GlobalSettings {
     /// 是否启用 DoQ 0-RTT（默认 true）。 / Enable DoQ 0-RTT (default true)
     #[serde(default = "default_doq_enable_0rtt")]
     pub doq_enable_0rtt: bool,
-    /// 是否启用自适应流控（默认false，推荐禁用以获得更好的性能和更简单的行为）
-    /// Enable adaptive flow control (default false, recommended disabled for better performance and simpler behavior)
-    ///
-    /// 禁用后采用rustdns风格：不限制并发，依赖tokio runtime调度和超时保护
-    /// When disabled, use rustdns style: no concurrency limit, rely on tokio runtime scheduling and timeout protection
+    /// 智能流控（默认关）：不用填数字，内核运行时自己判断，见 `engine::concurrency`。以前的
+    /// `flow_control_initial_permits` 等五个数字已经删掉，旧配置里留着也照常加载，不起作用
+    /// Smart flow control (off by default): no numbers to fill in, the kernel judges at run time,
+    /// see `engine::concurrency`. The five numbers such as `flow_control_initial_permits` it used
+    /// to have are gone; an old configuration still holding them loads as before, to no effect
     #[serde(default = "default_flow_control_enabled")]
     pub flow_control_enabled: bool,
-    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
-    #[serde(default = "default_flow_control_initial_permits")]
-    pub flow_control_initial_permits: usize,
-    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
-    #[serde(default = "default_flow_control_min_permits")]
-    pub flow_control_min_permits: usize,
-    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
-    #[serde(default = "default_flow_control_max_permits")]
-    pub flow_control_max_permits: usize,
-    /// 不再使用，保留只为旧配置还能加载：内核忙不忙由智能流控自己判断（见 `BUSY_AFTER`）
-    /// No longer used, kept only so old configurations load: smart flow control judges for itself
-    /// whether the kernel is busy (see `BUSY_AFTER`)
-    #[serde(default = "default_flow_control_latency_threshold_ms")]
-    pub flow_control_latency_threshold_ms: u64,
-    /// 不再使用，保留只为旧配置还能加载 / No longer used, kept only so old configurations load
-    #[serde(default = "default_flow_control_adjustment_interval_secs")]
-    pub flow_control_adjustment_interval_secs: u64,
     /// RFC 8767: 上游不可用时返回过期缓存（默认 false）/ RFC 8767: Serve stale cached data when upstream is unavailable (default false)
     #[serde(default = "default_serve_stale")]
     pub serve_stale: bool,
@@ -248,11 +231,6 @@ impl Default for GlobalSettings {
             doq_keepalive_interval_ms: default_doq_keepalive_interval_ms(),
             doq_enable_0rtt: default_doq_enable_0rtt(),
             flow_control_enabled: default_flow_control_enabled(),
-            flow_control_initial_permits: default_flow_control_initial_permits(),
-            flow_control_min_permits: default_flow_control_min_permits(),
-            flow_control_max_permits: default_flow_control_max_permits(),
-            flow_control_latency_threshold_ms: default_flow_control_latency_threshold_ms(),
-            flow_control_adjustment_interval_secs: default_flow_control_adjustment_interval_secs(),
             cache_capacity: default_cache_capacity(),
             cache_max_ttl: default_cache_max_ttl(),
             dashmap_shards: default_dashmap_shards(),
@@ -799,15 +777,10 @@ impl GlobalSettings {
             }};
         }
         restart_pending!(
-            // 重载即生效（统计开关、GeoIP 自动转换和国家过滤、流控的几个旧数字已经不起作用）
+            // 重载即生效（统计开关、GeoIP 自动转换和国家过滤已经不起作用）
             // Applied on a reload (the statistics switches, GeoIP auto-conversion and
-            // country filter, and flow control's old numbers no longer do anything)
+            // country filter no longer do anything)
             reload: [
-                flow_control_initial_permits,
-                flow_control_min_permits,
-                flow_control_max_permits,
-                flow_control_latency_threshold_ms,
-                flow_control_adjustment_interval_secs,
                 min_ttl,
                 default_upstream,
                 default_upstream_pre_split,
@@ -1134,27 +1107,7 @@ fn default_doq_enable_0rtt() -> bool {
 }
 
 fn default_flow_control_enabled() -> bool {
-    false // 默认禁用，采用rustdns风格 / Default disabled, use rustdns style
-}
-
-fn default_flow_control_initial_permits() -> usize {
-    500
-}
-
-fn default_flow_control_min_permits() -> usize {
-    100
-}
-
-fn default_flow_control_max_permits() -> usize {
-    800
-}
-
-fn default_flow_control_latency_threshold_ms() -> u64 {
-    100
-}
-
-fn default_flow_control_adjustment_interval_secs() -> u64 {
-    5
+    false
 }
 
 fn default_serve_stale() -> bool {
@@ -2286,26 +2239,6 @@ mod validation_tests {
             );
             assert!(settings.doq_enable_0rtt, "doq_enable_0rtt");
             assert!(!settings.flow_control_enabled, "flow_control_enabled");
-            assert_eq!(
-                settings.flow_control_initial_permits, 500,
-                "flow_control_initial_permits"
-            );
-            assert_eq!(
-                settings.flow_control_min_permits, 100,
-                "flow_control_min_permits"
-            );
-            assert_eq!(
-                settings.flow_control_max_permits, 800,
-                "flow_control_max_permits"
-            );
-            assert_eq!(
-                settings.flow_control_latency_threshold_ms, 100,
-                "flow_control_latency_threshold_ms"
-            );
-            assert_eq!(
-                settings.flow_control_adjustment_interval_secs, 5,
-                "flow_control_adjustment_interval_secs"
-            );
             assert!(!settings.serve_stale, "serve_stale");
             assert_eq!(settings.serve_stale_ttl, 30, "serve_stale_ttl");
             assert_eq!(
@@ -2569,13 +2502,6 @@ mod validation_tests {
         configured.upstream_timeout_ms += 1;
         configured.serve_stale = !configured.serve_stale;
         configured.default_upstream = "9.9.9.9:53".to_string();
-        // 流控的几个旧数字不起作用，改了也不用重启 / Flow control's old numbers do nothing, so
-        // changing them needs no restart
-        configured.flow_control_initial_permits += 1;
-        configured.flow_control_min_permits += 1;
-        configured.flow_control_max_permits += 1;
-        configured.flow_control_latency_threshold_ms += 1;
-        configured.flow_control_adjustment_interval_secs += 1;
         assert_eq!(
             configured.restart_pending(&running),
             ["bind_udp", "cache_capacity", "flow_control_enabled"]

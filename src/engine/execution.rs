@@ -315,31 +315,19 @@ impl Engine {
         // keep their warm response and rule caches.
     }
 
-    /// `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::permit`）；没开流控时都能处理
-    /// Whether a query from `client` that waits on an upstream can go ahead (see
+    /// `client` 的一个要等上游的查询能不能处理，`emptied_at` 是 UDP socket 上次收空的时刻，TCP、DoH 和轮流时没有（见
+    /// `FlowControlState::permit`）；没开流控时都能处理
+    /// Whether a query from `client` that waits on an upstream can go ahead, `emptied_at` being
+    /// when the UDP socket last ran empty, with none over TCP, DoH and while taking turns (see
     /// `FlowControlState::permit`); without flow control it always can
     #[inline]
-    pub fn query_permit(&self, emptied_at: Instant, client: IpAddr) -> Option<PermitGuard> {
+    pub fn query_permit(&self, emptied_at: Option<Instant>, client: IpAddr) -> Option<PermitGuard> {
         match &self.flow_control_state {
             Some(state) => state.permit(
                 &self.permit_manager,
                 emptied_at,
                 self.permit_manager.slot_of(client),
             ),
-            None => Some(self.permit_manager.acquire()),
-        }
-    }
-
-    /// `client` 的 TCP 或 DoH 连接上一个要等上游的查询能不能处理（见
-    /// `FlowControlState::permit_by_memory`）；没开流控时都能处理
-    /// Whether a query from `client` on a TCP or DoH connection that waits on an upstream can
-    /// go ahead (see `FlowControlState::permit_by_memory`); without flow control it always can
-    #[inline]
-    pub fn stream_query_permit(&self, client: IpAddr) -> Option<PermitGuard> {
-        match &self.flow_control_state {
-            Some(state) => {
-                state.permit_by_memory(&self.permit_manager, self.permit_manager.slot_of(client))
-            }
             None => Some(self.permit_manager.acquire()),
         }
     }
@@ -354,19 +342,6 @@ impl Engine {
         match &self.flow_control_state {
             Some(state) => {
                 state.connection_permit(&self.permit_manager, self.permit_manager.slot_of(client))
-            }
-            None => Some(self.permit_manager.acquire()),
-        }
-    }
-
-    /// 按设备轮流时 `client` 的一个要等上游的查询能不能处理（见 `FlowControlState::turn_permit`）；没开流控时都能
-    /// Whether a query from `client` that waits on an upstream can go ahead while devices take
-    /// turns (see `FlowControlState::turn_permit`); without flow control it always can
-    #[inline]
-    pub fn turn_query_permit(&self, client: IpAddr) -> Option<PermitGuard> {
-        match &self.flow_control_state {
-            Some(state) => {
-                state.turn_permit(&self.permit_manager, self.permit_manager.slot_of(client))
             }
             None => Some(self.permit_manager.acquire()),
         }

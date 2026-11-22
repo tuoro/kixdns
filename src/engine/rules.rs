@@ -977,20 +977,14 @@ pub(crate) async fn process_response_jump(
                             // the failure of waiting no more goes back as it is (see
                             // `PermitManager::join`, `UpstreamFailure::withheld`)
                             let waiting = tokio::time::timeout(join_wait, rx.changed());
-                            let joined = match &engine.flow_control_state {
-                                Some(flow) => {
-                                    Box::pin(crate::engine::upstream::wait_for_another(
-                                        engine,
-                                        flow,
-                                        peer.ip(),
-                                        &upstream,
-                                        upstream_timeout,
-                                        waiting,
-                                    ))
-                                    .await?
-                                }
-                                None => waiting.await,
-                            };
+                            let joined = crate::engine::upstream::wait_for_another(
+                                engine,
+                                peer.ip(),
+                                &upstream,
+                                upstream_timeout,
+                                waiting,
+                            )
+                            .await?;
                             if let Ok(Ok(())) = joined {
                                 if let Some((observer, ctx)) = observed {
                                     observer.inflight_joined(ctx);
