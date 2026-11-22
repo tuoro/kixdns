@@ -31,7 +31,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 ///
 /// 释放的内存按 mimalloc 默认的延迟（1 秒）归还系统，不改成释放即还。释放即还时，新名字用到的内存页多半
 /// 是刚还回去又要回来的，几乎每个查询都多一次缺页，新名字的吞吐少约一成；省下的内存实测只有约 1 MiB
-/// （空闲时、GeoSite 规则压测后、20 万条缓存压满后都是）。到期的归还在之后的分配里顺带完成。
+/// （空闲时、GeoSite 规则压测后、20 万条缓存压满后都是）。到期的归还在之后的分配里顺带完成，工作线程闲下来时也整理一次
+/// （见 [`allocator_tuning::collect_when_idle`]）。
 ///
 /// 另外在 Linux 上只对本进程关掉透明大页，不改系统设置。用了透明大页，零碎归还过的内存再用到时，系统要把
 /// 整块 2 MiB 清零，单核上事件循环会停住（外部压测在 mimalloc 默认设置下测到 p99 上百毫秒）。不预先提交时
@@ -46,7 +47,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// once. Purging at once makes most pages a new name touches ones that were just handed back and are
 /// taken again, so nearly every query costs one more page fault and new names lose about a tenth of
 /// their throughput; the memory it saves measured about 1 MiB (idle, after a GeoSite rule load test,
-/// and with 200,000 cached answers alike). Purges that fall due are carried out by later allocations.
+/// and with 200,000 cached answers alike). Purges that fall due are carried out by later allocations,
+/// and a worker thread tidies up once more as it goes idle (see [`allocator_tuning::collect_when_idle`]).
 ///
 /// On Linux transparent huge pages are also turned off for this process alone, leaving the system
 /// setting as it is. With them, memory that was returned piecemeal and is touched again makes the
@@ -55,14 +57,70 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// mimalloc no longer asks for huge pages, but a system set to `always` hands them out unasked, so they
 /// are turned off outright.
 mod allocator_tuning {
+    use std::cell::Cell;
     #[cfg(target_os = "linux")]
     use std::ffi::c_ulong;
     use std::ffi::{c_int, c_long};
+    use std::time::{Duration, Instant};
 
     unsafe extern "C" {
         #[cfg(test)]
         fn mi_option_get(option: c_int) -> c_long;
         fn mi_option_set(option: c_int, value: c_long);
+        fn mi_collect(force: bool);
+    }
+
+    /// 同一个工作线程两次整理之间至少隔多久 / The least time between two tidy-ups on one worker thread
+    const COLLECT_EVERY: Duration = Duration::from_secs(1);
+
+    thread_local! {
+        /// 这个线程上次整理的时刻 / When this thread last tidied up
+        static LAST_COLLECT: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// tokio 工作线程没活、要停下来等的时候调用（`on_thread_park`）：离这个线程上次整理过了一秒，就让 mimalloc
+    /// 整理一次这个线程的内存，把整页空出来的还给系统。
+    ///
+    /// mimalloc 的内存页归各线程所有，页空出来、到期归还，都是在这个线程之后的分配里顺带做的。一阵查询过去，
+    /// 工作线程闲下来不再分配，这些就一直不做：在 256 MB 内存的 OpenWrt（musl、两个核）上，每秒 8000 个新名字、
+    /// 上游 1.5 秒才回，压 15 秒，在用的内存约 40 MiB，进程却占着约 120 MiB，几分钟都不降；把归还延迟设成 0
+    /// 也一样（约 110 MiB）。闲下来时整理一次，一秒内就降到在用的那么多。同一台机器上压未命中和命中，每个查询的
+    /// CPU（约 51 和 14 微秒）、p99 和 p999 延迟，整理与否测不出差别：忙的时候线程停得少，停的时候正好没活，一秒
+    /// 最多一次。不强制整理（`force` 为 false）就够了，强制的结果一样
+    ///
+    /// Called as a tokio worker thread runs out of work and parks (`on_thread_park`): once a second has
+    /// passed since this thread last tidied up, mimalloc tidies up this thread's memory, giving whole
+    /// freed pages back to the system.
+    ///
+    /// mimalloc's pages belong to threads, and freeing an emptied page and carrying out a purge that has
+    /// fallen due both happen during that thread's later allocations. After a burst of queries the worker
+    /// threads go quiet and stop allocating, so none of it happens: on OpenWrt with 256 MB of memory (musl,
+    /// two cores), 15 seconds of 8,000 new names a second against an upstream answering after 1.5 seconds
+    /// left about 40 MiB in use while the process held about 120 MiB, for minutes; a purge delay of 0 did
+    /// the same (about 110 MiB). Tidying up as the thread goes idle brings it down to what is in use within
+    /// a second. On the same machine the CPU per query (about 51 and 14 microseconds for misses and hits)
+    /// and the p99 and p999 latencies measured the same with and without it: a busy thread parks seldom, a
+    /// parking one has nothing else to do, and it happens at most once a second. A collection that is not
+    /// forced (`force` false) is enough; a forced one measured the same
+    pub(crate) fn collect_when_idle() {
+        let now = Instant::now();
+        let due = LAST_COLLECT.with(|last| {
+            let due = collect_due(last.get(), now);
+            if due {
+                last.set(Some(now));
+            }
+            due
+        });
+        if due {
+            // SAFETY: 只整理调用它的这个线程自己的内存，随时可以调 / Tidies up only the calling thread's own
+            // memory, and may be called at any time
+            unsafe { mi_collect(false) }
+        }
+    }
+
+    /// 上次在 `last`，现在是 `now`，该不该整理 / Whether to tidy up at `now`, having last done so at `last`
+    fn collect_due(last: Option<Instant>, now: Instant) -> bool {
+        last.is_none_or(|last| now.saturating_duration_since(last) >= COLLECT_EVERY)
     }
 
     // mimalloc v3 `mi_option_e` 里的编号（libmimalloc-sys 自带的常量还是旧版本的）；依赖升级、编号变了时，
@@ -115,7 +173,31 @@ mod allocator_tuning {
     mod tests {
         #[cfg(target_os = "linux")]
         use super::c_ulong;
-        use super::{ARENA_EAGER_COMMIT, PURGE_DELAY, apply, mi_option_get};
+        use super::{
+            ARENA_EAGER_COMMIT, COLLECT_EVERY, PURGE_DELAY, apply, collect_due, collect_when_idle,
+            mi_option_get,
+        };
+        use std::time::Instant;
+
+        /// 一个线程头一次停下就整理，之后一秒最多一次；整理本身随时可以调
+        /// A thread tidies up the first time it parks and then at most once a second; the tidy-up itself
+        /// may be called at any time
+        #[test]
+        fn an_idle_thread_tidies_up_at_most_once_a_second() {
+            let now = Instant::now();
+            assert!(collect_due(None, now));
+            assert!(!collect_due(Some(now), now));
+            assert!(!collect_due(Some(now), now + COLLECT_EVERY / 2));
+            assert!(collect_due(Some(now), now + COLLECT_EVERY));
+            assert!(
+                !collect_due(Some(now + COLLECT_EVERY), now),
+                "a clock read out of order waits"
+            );
+            let freed: Vec<Vec<u8>> = (0..1000).map(|_| vec![1; 4096]).collect();
+            drop(freed);
+            collect_when_idle();
+            collect_when_idle();
+        }
 
         /// 两个编号还对应这两个选项（默认值分别是 1000 毫秒和 2）；`apply` 把预先提交设成 0，归还延迟
         /// 留着默认值，在 Linux 上还关掉本进程的透明大页
@@ -252,6 +334,7 @@ fn real_main() -> anyhow::Result<()> {
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .on_thread_park(allocator_tuning::collect_when_idle)
         .build()
         .context("build tokio runtime")?
         .block_on(async_main())
