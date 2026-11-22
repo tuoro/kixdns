@@ -629,15 +629,15 @@ mod tests {
             "test".to_string(),
         )
         .unwrap();
-        Arc::get_mut(engine.flow_control_state.as_mut().unwrap())
-            .unwrap()
-            .memory = MemoryWatermark::reading(move || MemoryReading {
+        let flow = Arc::get_mut(engine.flow_control_state.as_mut().unwrap()).unwrap();
+        flow.memory = MemoryWatermark::reading(move || MemoryReading {
             own: 0,
             limits: vec![MemoryLeft {
                 total: 1 << 30,
                 available,
             }],
         });
+
         let in_flight = (0..1000).map(|_| engine.permit_manager.acquire()).collect();
         (engine, in_flight)
     }
@@ -784,7 +784,12 @@ mod tests {
         let query = request.to_vec().unwrap();
 
         // 余量 64 MiB、两倍 128 MiB：剩 100 MiB 算紧张 / A 64 MiB margin, twice that 128 MiB: 100 MiB left is tight
-        let (engine, plain) = engine_with_memory(upstream.local_addr().unwrap(), 100 << 20);
+        let (mut engine, plain) = engine_with_memory(upstream.local_addr().unwrap(), 100 << 20);
+        // 测试不必等：内存不够以前问过的设备都算老设备 / A test need not wait: a device that asked before
+        // memory ran short counts as known
+        Arc::get_mut(engine.flow_control_state.as_mut().unwrap())
+            .unwrap()
+            .known_before = std::time::Duration::ZERO;
         drop(plain);
         let manager = &engine.permit_manager;
         let heavy: SocketAddr = "127.0.0.4:53000".parse().unwrap();
@@ -795,6 +800,8 @@ mod tests {
                 manager.slot_of(peer.ip()).counted_in() != manager.slot_of(heavy.ip()).counted_in()
             })
             .unwrap();
+        // 它在内存不够以前就在用 / It was in use before memory ran short
+        drop(engine.stream_query_permit(light.ip()));
         let held: Vec<_> = (0..1000)
             .map(|_| {
                 engine

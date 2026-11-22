@@ -4848,9 +4848,8 @@ mod tests {
             "test".to_string(),
         )
         .unwrap();
-        Arc::get_mut(engine.flow_control_state.as_mut().unwrap())
-            .unwrap()
-            .memory = MemoryWatermark::reading(move || MemoryReading {
+        let flow = Arc::get_mut(engine.flow_control_state.as_mut().unwrap()).unwrap();
+        flow.memory = MemoryWatermark::reading(move || MemoryReading {
             own: 0,
             limits: vec![MemoryLeft {
                 total: 1 << 30,
@@ -4859,6 +4858,14 @@ mod tests {
         });
         let in_flight = (0..1000).map(|_| engine.permit_manager.acquire()).collect();
         (engine, in_flight)
+    }
+
+    /// 测试不必等：内存不够以前问过的设备都算老设备 / A test need not wait: a device that asked before memory
+    /// ran short counts as known
+    fn known_at_once(engine: &mut Engine) {
+        Arc::get_mut(engine.flow_control_state.as_mut().unwrap())
+            .unwrap()
+            .known_before = Duration::ZERO;
     }
 
     /// 内存剩这么多字节 / This many bytes of memory left
@@ -4998,8 +5005,9 @@ mod tests {
 
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let available = memory_left(1 << 30);
-        let (engine, plain) =
+        let (mut engine, plain) =
             engine_short_of_memory(upstream.local_addr().unwrap(), Arc::clone(&available));
+        known_at_once(&mut engine);
         drop(plain);
         let manager = &engine.permit_manager;
         let heavy = IpAddr::from(Ipv4Addr::new(127, 0, 0, 4));
@@ -5009,6 +5017,8 @@ mod tests {
             .map(|n| IpAddr::from(Ipv4Addr::new(127, 0, 0, n)))
             .find(|ip| manager.slot_of(*ip).counted_in() != manager.slot_of(heavy).counted_in())
             .unwrap();
+        // 它在内存不够以前就在用 / It was in use before memory ran short
+        drop(engine.stream_query_permit(light));
         let held: Vec<_> = (0..1000)
             .map(|_| engine.stream_query_permit(heavy).expect("plenty of memory"))
             .collect();
@@ -5099,8 +5109,9 @@ mod tests {
 
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let available = memory_left(1 << 30);
-        let (engine, plain) =
+        let (mut engine, plain) =
             engine_short_of_memory(upstream.local_addr().unwrap(), Arc::clone(&available));
+        known_at_once(&mut engine);
         drop(plain);
         let manager = &engine.permit_manager;
         // 1000 台设备各占一个查询，数设备时各算一台 / 1000 devices holding one query each, each
@@ -5115,6 +5126,8 @@ mod tests {
             .map(|n| IpAddr::from(Ipv4Addr::new(127, 0, 0, n)))
             .find(|ip| !slots.contains(&manager.slot_of(*ip).counted_in()))
             .unwrap();
+        // 它在内存不够以前就在用 / It was in use before memory ran short
+        drop(engine.stream_query_permit(client));
         let held: Vec<_> = holders
             .iter()
             .map(|ip| engine.stream_query_permit(*ip).expect("plenty of memory"))
