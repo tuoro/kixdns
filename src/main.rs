@@ -599,22 +599,48 @@ fn engine_observer(
 fn init_tracing(debug: bool) {
     // 默认仅保留错误日志以平衡性能与可观测性，除非显式指定
     // Default to error-level logging to balance performance with observability unless explicitly enabled
-    let format = fmt::format()
-        .with_timer(fmt::time::LocalTime::rfc_3339())
-        .with_target(false)
-        .with_ansi(false)
-        .with_level(debug);
-
     let level = if debug { "debug" } else { "error" };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     let registry = tracing_subscriber::registry().with(filter);
     if stdout_is_journald() {
+        // journald 自己记时间，优先级靠行首的 `<N>` 前缀，行里的时间和级别只是给人看的，照旧
+        // journald keeps its own timestamps and takes the priority from the `<N>` prefix, so the
+        // time and level inside the line are for people only and stay as they were
+        let format = fmt::format()
+            .with_timer(fmt::time::LocalTime::rfc_3339())
+            .with_target(false)
+            .with_ansi(false)
+            .with_level(debug);
         registry
             .with(fmt::layer().event_format(JournalPriority(format)))
             .init();
     } else {
-        registry.with(fmt::layer().event_format(format)).init();
+        registry
+            .with(fmt::layer().event_format(plain_log_format()))
+            .init();
     }
+}
+
+/// 不接 journald 时每行日志的格式（终端，或者 OpenWrt 上 procd 把输出写进文件）：UTC 的
+/// RFC 3339 时间、级别、消息，比如 `2026-11-22T07:00:00.123456Z ERROR upstream exploded`。
+/// 没有 journald 记优先级和时间，级别和时间就只能写在行里：面板的 procd 后端读日志文件时，
+/// 级别取时间后面的第一个词。时间用 UTC，读的一方不用管时区。
+/// The line format when stdout is not journald (a terminal, or a file procd writes on
+/// `OpenWrt`): an RFC 3339 time in UTC, the level, the message, such as
+/// `2026-11-22T07:00:00.123456Z ERROR upstream exploded`. With no journald to record the
+/// priority and time, both have to be in the line: the panel's procd backend reads the log
+/// file taking the first word after the time as the level. The time is in UTC, so a reader
+/// need not know the time zone.
+fn plain_log_format<S, N>() -> impl fmt::FormatEvent<S, N>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fmt::format()
+        .with_timer(fmt::time::UtcTime::rfc_3339())
+        .with_target(false)
+        .with_ansi(false)
+        .with_level(true)
 }
 
 /// journald 只解析每行开头的优先级前缀，所以致命错误必须压成一行；换行会让后半段掉回 info。
@@ -2472,6 +2498,44 @@ mod tests {
         assert!(lines[2].starts_with("<6>") && lines[2].contains("config reloaded"));
         assert!(lines[3].starts_with("<7>"));
         assert_eq!(super::journal_priority(tracing::Level::TRACE), 7);
+    }
+
+    /// 不接 journald 时每行是「UTC 时间 级别 消息」：面板的 procd 后端按时间后面的第一个词认级别，
+    /// 时间以 Z 结尾。
+    /// Without journald each line is "UTC time, level, message": the panel's procd backend
+    /// takes the first word after the time as the level, and the time ends in Z.
+    #[test]
+    fn plain_lines_carry_utc_time_and_level() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .event_format(super::plain_log_format())
+                .with_writer(buffer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("upstream exploded");
+            tracing::warn!(upstream = "1.1.1.1:53", "single upstream call failed");
+            tracing::info!("config reloaded");
+        });
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{output}");
+        for (line, level, message) in [
+            (lines[0], "ERROR", "upstream exploded"),
+            (lines[1], "WARN", "single upstream call failed"),
+            (lines[2], "INFO", "config reloaded"),
+        ] {
+            let mut words = line.split_whitespace();
+            let time = words.next().unwrap_or_default();
+            assert!(
+                time.len() >= 20 && time.as_bytes()[4] == b'-' && time.ends_with('Z'),
+                "{line}"
+            );
+            assert_eq!(words.next(), Some(level), "{line}");
+            assert!(line.contains(message), "{line}");
+        }
     }
 
     /// 致命错误一行 `<3>fatal:`，cause 链完整，消息里的换行被压平。
