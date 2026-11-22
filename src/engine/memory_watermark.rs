@@ -18,7 +18,7 @@
 //! that it reads every [`reads_apart`], which keeps what is added between two reads in
 //! proportion to the total, whatever the CPU's speed.
 
-use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// 在途查询到这么多才开始看内存 / The queries in flight from which memory is looked at
@@ -51,21 +51,32 @@ fn reads_apart(total: u64) -> usize {
 pub enum Room {
     /// 够 / Enough
     Plenty,
-    /// 紧张：在途停在变紧张那一刻的数（见 [`MemoryWatermark::tight_budget`]），只拒占着自己那一份的设备，发得少的照常
-    /// Tight: what is in flight stays where it was as memory got tight (see
-    /// [`MemoryWatermark::tight_budget`]), only devices holding their share are refused, and
-    /// those sending little go on
+    /// 紧张：在途最多是变紧张那一刻的数，离底线越近越少（见 [`MemoryWatermark::tight_budget`]），只拒占着自己那一份的设备，
+    /// 发得少的照常
+    /// Tight: what is in flight is held to where it was as memory got tight, the less the nearer
+    /// the floor (see [`MemoryWatermark::tight_budget`]); only devices holding their share are
+    /// refused, and those sending little go on
     Tight,
-    /// 没了：谁都拒 / None left: everyone is refused
+    /// 没了：手上有在途的设备都拒，手上一个没有的只接原来就在用的（见 `FlowControlState::memory_refuses`）/ None left:
+    /// every device holding queries is refused, and of those holding none only the ones in use all
+    /// along go on (see `FlowControlState::memory_refuses`)
     Full,
 }
 
+/// 余地按余量的千分之几算（见 [`MemoryLeft::headroom`]）：到这么多算够 / Room is counted in thousandths of
+/// the margin (see [`MemoryLeft::headroom`]): from this much it is enough
+const PLENTY_FROM: u32 = 2000;
+/// 少于这么多就没了 / Under this much there is none left
+const FULL_UNDER: u32 = 1000;
+
 impl Room {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Plenty,
-            1 => Self::Tight,
-            _ => Self::Full,
+    fn of(headroom: u32) -> Self {
+        if headroom < FULL_UNDER {
+            Self::Full
+        } else if headroom < PLENTY_FROM {
+            Self::Tight
+        } else {
+            Self::Plenty
         }
     }
 }
@@ -82,15 +93,14 @@ impl MemoryLeft {
     /// two reads is usually far less than the distance between the two lines (a sixteenth of the
     /// total, at most 256 MiB, plus a quarter of its own use), so while it is this program taking
     /// the memory, tight is read first and a device sending much is stopped there
-    fn room_for(self, own: u64) -> Room {
-        let margin = own / 4 + (self.total / 16).min(MAX_MARGIN);
-        if self.available < margin {
-            Room::Full
-        } else if self.available < margin.saturating_mul(2) {
-            Room::Tight
-        } else {
-            Room::Plenty
-        }
+    ///
+    /// 算出来的是剩的是余量的千分之几，到 [`PLENTY_FROM`] 为止：少于 [`FULL_UNDER`] 是没了，少于 [`PLENTY_FROM`] 是紧张
+    /// What it gives is what is left in thousandths of the margin, up to [`PLENTY_FROM`]: under
+    /// [`FULL_UNDER`] there is none left, under [`PLENTY_FROM`] it is tight
+    fn headroom(self, own: u64) -> u32 {
+        let margin = (own / 4 + (self.total / 16).min(MAX_MARGIN)).max(1);
+        let thousandths = u128::from(self.available) * 1000 / u128::from(margin);
+        u32::try_from(thousandths).map_or(PLENTY_FROM, |thousandths| thousandths.min(PLENTY_FROM))
     }
 }
 
@@ -107,8 +117,9 @@ pub struct MemoryReading {
 pub struct MemoryWatermark {
     read: Box<dyn Fn() -> MemoryReading + Send + Sync>,
     until_read: AtomicIsize,
-    /// 上次读到的 [`Room`] / The [`Room`] last read
-    room: AtomicU8,
+    /// 上次读到的余地，余量的千分之几（见 [`MemoryLeft::headroom`]）/ The room last read, in thousandths of
+    /// the margin (see [`MemoryLeft::headroom`])
+    headroom: AtomicU32,
     started: Instant,
     /// 上次读的时刻，从 `started` 算起的毫秒 / When it was last read, in milliseconds since `started`
     read_at_ms: AtomicU64,
@@ -140,7 +151,7 @@ impl MemoryWatermark {
         Self {
             read: Box::new(read),
             until_read: AtomicIsize::new(1),
-            room: AtomicU8::new(Room::Plenty as u8),
+            headroom: AtomicU32::new(PLENTY_FROM),
             started: Instant::now(),
             read_at_ms: AtomicU64::new(0),
             tight_budget: AtomicUsize::new(usize::MAX),
@@ -178,8 +189,30 @@ impl MemoryWatermark {
     /// number of devices. With none left nothing is let in and what is in flight only falls, so
     /// coming back to tight notes fewer. Until memory goes back to the system, coming back to this
     /// many uses the memory already held
+    ///
+    /// 离底线越近，这个数按比例越小：剩的是余量的两倍时是记下的数，到了余量就是 0。只按记下的数拦，内存周转时还会再往下掉，
+    /// 一掉到底线谁都拒，发得少的设备也跟着被拒（256 MB 的 OpenWrt 上实测，一台设备猛发时，发得少的那台约一成被拒）；按比例收，
+    /// 占着内存的设备一点点让出来，内存停在两条线之间
+    /// The nearer the floor, the smaller it gets in proportion: with twice the margin left it is
+    /// the number noted, at the margin it is 0. Holding to the number noted alone, memory still
+    /// sinks as it turns over, and at the floor everyone is refused, devices sending little with
+    /// them (measured on a 256 MB OpenWrt: with one device flooding, about a tenth of another
+    /// sending little was refused); shrinking it in proportion, the device holding the memory gives
+    /// it back bit by bit and memory settles between the two lines
     #[inline]
     pub fn tight_budget(&self, queries: usize) -> usize {
+        let headroom = self.headroom.load(Ordering::Relaxed);
+        if headroom < FULL_UNDER {
+            return 0;
+        }
+        let above_floor = headroom.min(PLENTY_FROM) - FULL_UNDER;
+        let noted = self.noted_budget(queries) as u64;
+        (noted * u64::from(above_floor) / u64::from(PLENTY_FROM - FULL_UNDER)) as usize
+    }
+
+    /// 紧张时记下的在途：变紧张以后头一次问的时候在途多少就是多少 / What is noted in flight while tight:
+    /// as many as were in flight when first asked after memory got tight
+    fn noted_budget(&self, queries: usize) -> usize {
         match self.tight_budget.compare_exchange(
             usize::MAX,
             queries,
@@ -207,16 +240,17 @@ impl MemoryWatermark {
                 apart.unwrap_or(READS_APART_UNKNOWN) as isize,
                 Ordering::Relaxed,
             );
-            let room = reading
+            let headroom = reading
                 .limits
                 .iter()
-                .map(|limit| limit.room_for(reading.own))
-                .max()
-                .unwrap_or(Room::Plenty);
+                .map(|limit| limit.headroom(reading.own))
+                .min()
+                .unwrap_or(PLENTY_FROM);
+            let room = Room::of(headroom);
             if room != Room::Tight {
                 self.tight_budget.store(usize::MAX, Ordering::Relaxed);
             }
-            if self.room.swap(room as u8, Ordering::Relaxed) != room as u8 {
+            if Room::of(self.headroom.swap(headroom, Ordering::Relaxed)) != room {
                 tracing::warn!(
                     event = "flow_control_memory",
                     low = room != Room::Plenty,
@@ -226,7 +260,7 @@ impl MemoryWatermark {
                 );
             }
         }
-        Room::from_u8(self.room.load(Ordering::Relaxed))
+        Room::of(self.headroom.load(Ordering::Relaxed))
     }
 }
 
@@ -776,7 +810,7 @@ mod tests {
     /// 少于余量谁都拒，少于两倍余量算紧张 / Under the margin everyone is refused, under twice it is tight
     #[test]
     fn what_is_kept_back_grows_with_its_own_use() {
-        let room = |total, available, own| MemoryLeft { total, available }.room_for(own);
+        let room = |total, available, own| Room::of(MemoryLeft { total, available }.headroom(own));
         assert_eq!(
             room(256 * MIB, 15 * MIB, 0),
             Room::Full,
@@ -970,19 +1004,19 @@ mod tests {
             watermark.room(LOOK_FROM_INFLIGHT)
         };
         assert_eq!(read_as(GIB / 8 - 1), Room::Tight);
-        assert_eq!(watermark.tight_budget(5000), 5000, "noted as first asked");
+        assert_eq!(watermark.noted_budget(5000), 5000, "noted as first asked");
         assert_eq!(
-            watermark.tight_budget(9000),
+            watermark.noted_budget(9000),
             5000,
             "not raised by more in flight"
         );
         assert_eq!(read_as(GIB / 8 - 2), Room::Tight);
-        assert_eq!(watermark.tight_budget(9000), 5000, "nor by another reading");
+        assert_eq!(watermark.noted_budget(9000), 5000, "nor by another reading");
 
         assert_eq!(read_as(0), Room::Full);
         assert_eq!(read_as(GIB / 8 - 1), Room::Tight);
         assert_eq!(
-            watermark.tight_budget(3000),
+            watermark.noted_budget(3000),
             3000,
             "noted afresh after none left"
         );
@@ -990,7 +1024,7 @@ mod tests {
         assert_eq!(read_as(GIB), Room::Plenty);
         assert_eq!(read_as(GIB / 8 - 1), Room::Tight);
         assert_eq!(
-            watermark.tight_budget(7000),
+            watermark.noted_budget(7000),
             7000,
             "noted afresh after enough"
         );
@@ -1007,7 +1041,7 @@ mod tests {
         let (watermark, available, _) = watermark();
         available.store(GIB / 8 - 1, Ordering::Relaxed);
         assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Tight);
-        assert_eq!(watermark.tight_budget(30_000), 30_000);
+        assert_eq!(watermark.noted_budget(30_000), 30_000);
         assert_eq!(watermark.room(LOOK_FROM_INFLIGHT - 1), Room::Plenty);
         assert_eq!(
             watermark.room(LOOK_FROM_INFLIGHT),
@@ -1015,10 +1049,30 @@ mod tests {
             "still tight"
         );
         assert_eq!(
-            watermark.tight_budget(LOOK_FROM_INFLIGHT),
+            watermark.noted_budget(LOOK_FROM_INFLIGHT),
             LOOK_FROM_INFLIGHT,
             "noted afresh"
         );
+    }
+
+    /// 紧张时的在途上限离底线越近越小：剩两倍余量时是记下的数，一倍半时一半，到了余量是 0
+    /// The budget while tight shrinks toward the floor: the number noted with twice the margin
+    /// left, half of it with one and a half times, and 0 at the margin
+    #[test]
+    fn the_tight_budget_shrinks_toward_the_floor() {
+        let (watermark, available, _) = watermark();
+        let budget_at = |left: u64| {
+            available.store(left, Ordering::Relaxed);
+            for _ in 0..READ_EVERY {
+                watermark.room(LOOK_FROM_INFLIGHT);
+            }
+            assert_eq!(watermark.room(LOOK_FROM_INFLIGHT), Room::Tight);
+            watermark.tight_budget(8000)
+        };
+        assert_eq!(budget_at(GIB / 8 - 1), 7992, "just under twice the margin");
+        assert_eq!(budget_at(GIB / 16 * 3 / 2), 4000, "one and a half times");
+        assert_eq!(budget_at(GIB / 16), 0, "at the margin");
+        assert_eq!(watermark.noted_budget(9000), 8000, "the number noted stays");
     }
 
     /// 哪一处限制最紧就按哪一处 / The tightest limit is the one that counts

@@ -417,8 +417,20 @@ pub struct FlowControlState {
     /// socket 连续这么久没收空就算忙，就是 `BUSY_AFTER`（测试可以换）/ How long a socket goes without
     /// running empty before that counts as busy: `BUSY_AFTER` (a test may change it)
     pub busy_after: Duration,
+    /// 压力出现以前在用了这么久才算老设备，就是 `KNOWN_BEFORE`（测试可以换）/ How long before memory ran short a
+    /// device has to have been in use to count as known: `KNOWN_BEFORE` (a test may change it)
+    pub known_before: Duration,
     pub memory: super::memory_watermark::MemoryWatermark,
     started: Instant,
+    /// 每一份设备从哪一秒起一直在用（见 [`extend_spell`]，秒从 `started` 算起）：前 `DEVICE_SLOTS` 份按第一个哈希，后面的按第二个，
+    /// 两份都早才算老设备（见 [`Self::known`]）
+    /// Since which second each slot of devices has been in use (see [`extend_spell`], seconds since
+    /// `started`): the first `DEVICE_SLOTS` by the first hash, the rest by the second, and it takes
+    /// both being early to count as known (see [`Self::known`])
+    seen: Box<[AtomicU64]>,
+    /// 这一阵内存不够从哪一秒开始（见 [`extend_spell`]）/ Since which second memory has been short this spell
+    /// (see [`extend_spell`])
+    pressed: AtomicU64,
     /// 跟不上的状态到什么时候（从 `started` 算起的纳秒）/ Until when the kernel counts as behind, in nanoseconds since `started`
     behind_until_ns: AtomicU64,
     /// 按设备轮流时有活等着内核干的查询（见 [`WaitingToRun`]）/ The queries with work waiting for the
@@ -430,8 +442,11 @@ impl FlowControlState {
     pub fn new(memory: super::memory_watermark::MemoryWatermark) -> Self {
         Self {
             busy_after: BUSY_AFTER,
+            known_before: KNOWN_BEFORE,
             memory,
             started: Instant::now(),
+            seen: zeroed_u64_slots(),
+            pressed: AtomicU64::new(0),
             behind_until_ns: AtomicU64::new(0),
             waiting_to_run: Arc::new(WaitingToRun::default()),
         }
@@ -465,23 +480,56 @@ impl FlowControlState {
         Some(manager.acquire_for(device))
     }
 
-    /// 内存够不够 `device` 再接一个：没了谁都不接；紧张时，在途停在变紧张那一刻的数（见
-    /// `MemoryWatermark::tight_budget`），各设备平分，占着自己那一份的不接，发得少的照常——一台或者很多台设备把内存
-    /// 占满时先拦住它们，别的设备不受连累
-    /// Whether memory refuses one more for `device`: with none left everyone is refused; when it
-    /// is tight, what is in flight stays where it was as memory got tight (see
-    /// `MemoryWatermark::tight_budget`), shared out among the devices, and one holding its share
-    /// is refused while those sending little go on, so one or many devices filling the memory are
-    /// stopped first and the others are not held up with them
+    /// 内存够不够 `device` 再接一个。紧张时，在途最多是变紧张那一刻的数、离底线越近越少（见
+    /// `MemoryWatermark::tight_budget`，没了就是 0），到了这个数：
+    /// - 手上有在途的设备，占着自己那一份就不接，发得少的照常——一台或者很多台设备把内存占满时先拦住它们；
+    /// - 手上一个没有的设备，内存不够以前 [`Self::known_before`] 就在用的照常，之后才冒出来的不接。伪造来源的洪泛每个来源都是
+    ///   新的，每个只占一个也能把内存占满；以前没了时谁都拒，原来就在用的设备也跟着被拒
+    ///
+    /// Whether memory refuses one more for `device`. When tight, what is in flight is held to as
+    /// many as when memory got tight, the fewer the nearer the floor (see
+    /// `MemoryWatermark::tight_budget`, which is 0 with none left), and at that many:
+    /// - a device holding queries is refused once it holds its share, while those sending little
+    ///   go on, so one or many devices filling the memory are stopped first;
+    /// - a device holding none goes on if it was in use [`Self::known_before`] before memory ran
+    ///   short, and one turning up later is refused. In a flood from spoofed sources each source is
+    ///   new and holding just one each still fills the memory; with none left everyone used to be
+    ///   refused, the devices in use all along with them
     #[inline]
     fn memory_refuses(&self, manager: &PermitManager, device: DeviceSlot) -> bool {
-        match self.memory.room(manager.inflight()) {
-            Room::Plenty => false,
-            Room::Tight => manager
-                .queries
-                .holds_share_of(device, self.memory.tight_budget(manager.queries.total())),
-            Room::Full => true,
+        let now = self.now_secs();
+        for slot in DeviceCounts::slots(device) {
+            extend_spell(&self.seen[slot], now, FORGET_AFTER_SECS);
         }
+        if self.memory.room(manager.inflight()) == Room::Plenty {
+            return false;
+        }
+        extend_spell(&self.pressed, now, CALM_AFTER_SECS);
+        let queries = &manager.queries;
+        let budget = self.memory.tight_budget(queries.total());
+        queries.total() >= budget
+            && match queries.own(device) {
+                0 => !self.known(device),
+                own => own.saturating_mul(queries.slots_held()) >= budget,
+            }
+    }
+
+    /// 从 `started` 算起的秒加 1 / Seconds since `started`, plus 1
+    fn now_secs(&self) -> u32 {
+        u32::try_from(self.started.elapsed().as_secs())
+            .unwrap_or(u32::MAX - 1)
+            .saturating_add(1)
+    }
+
+    /// 这一阵内存不够以前 [`Self::known_before`] 就一直在用的设备：两份都是 / A device in use all along since
+    /// [`Self::known_before`] before memory ran short this spell: both of its slots
+    fn known(&self, device: DeviceSlot) -> bool {
+        let pressed_since = spell_start(&self.pressed);
+        let before = u32::try_from(self.known_before.as_secs()).unwrap_or(u32::MAX);
+        DeviceCounts::slots(device).into_iter().all(|slot| {
+            let since = spell_start(&self.seen[slot]);
+            since != 0 && since.saturating_add(before) <= pressed_since
+        })
     }
 
     /// 一个查询从排进去到开始跑等了 `delay`。超过目标就说明队里积着这么久的活，这段时间不接新查询，让它消化
@@ -665,6 +713,12 @@ impl DeviceCounts {
         self.total.load(Ordering::Relaxed)
     }
 
+    /// 按第一个哈希有几份有，差不多就是有的设备数 / How many slots by the first hash hold any, about the
+    /// devices holding any
+    fn slots_held(&self) -> usize {
+        self.slots_held.load(Ordering::Relaxed).max(1)
+    }
+
     /// 减一，在 0 处饱和 / Takes one off, saturating at zero
     fn remove(&self, device: DeviceSlot) {
         #[allow(deprecated)]
@@ -800,16 +854,55 @@ struct Asked {
     mostly_unanswered: AtomicIsize,
 }
 
+/// 两个哈希各 `DEVICE_SLOTS` 份、清零的 u64，同 `DeviceCounts::new` 的分配 / Zeroed u64s, `DEVICE_SLOTS` for
+/// each of the two hashes, allocated as in `DeviceCounts::new`
+fn zeroed_u64_slots() -> Box<[AtomicU64]> {
+    let zeroed: Box<[u64]> = vec![0u64; 2 * DEVICE_SLOTS].into_boxed_slice();
+    // SAFETY: AtomicU64 和 u64 的大小、对齐、有效位都相同，这块内存按同样的布局分配，也按同样的布局释放
+    // SAFETY: AtomicU64 has the same size, alignment and bit validity as u64, so this block is
+    // allocated and freed with the same layout
+    unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [AtomicU64]) }
+}
+
+/// 一台设备在压力出现以前就在用了多久才算老设备，就是 `KNOWN_BEFORE`（测试可以换）/ How long before memory ran
+/// short a device has to have been in use to count as known: `KNOWN_BEFORE` (a test may change it)
+const KNOWN_BEFORE: Duration = Duration::from_secs(10);
+/// 一份这么久没见到，就当它的设备走了，下次见到重新算起 / A slot unseen this long counts as its device
+/// gone, and counts afresh when next seen
+const FORGET_AFTER_SECS: u32 = 3600;
+/// 内存这么久一直够，下次不够就算新的一阵 / Memory enough for this long, the next shortage counts as a
+/// new spell
+const CALM_AFTER_SECS: u32 = 60;
+
+/// 一个时间段：高 32 位是开始、低 32 位是最近一次，都是从某个时刻算起的秒加 1，0 是没有过。最近一次隔了 `gap` 秒以上，
+/// 就从 `now` 重新开始
+/// A spell: its start in the high 32 bits and its latest moment in the low 32, both seconds
+/// since some moment plus 1, with 0 for never. With over `gap` seconds since the latest, it starts
+/// again at `now`
+fn extend_spell(cell: &AtomicU64, now: u32, gap: u32) {
+    let was = cell.load(Ordering::Relaxed);
+    let (start, last) = ((was >> 32) as u32, was as u32);
+    // 别的线程刚记过同一秒或更晚的就不动 / Left alone when another thread has just noted this second or a
+    // later one
+    if now > last {
+        let start = if last == 0 || now - last > gap {
+            now
+        } else {
+            start
+        };
+        cell.store(u64::from(start) << 32 | u64::from(now), Ordering::Relaxed);
+    }
+}
+
+/// 一段时间从哪一秒开始，0 是没有过 / The second a spell started, 0 for never
+fn spell_start(cell: &AtomicU64) -> u32 {
+    (cell.load(Ordering::Relaxed) >> 32) as u32
+}
+
 impl Asked {
     fn new() -> Self {
-        // 清零的分配，同 `DeviceCounts::new` / A zeroed allocation, as in `DeviceCounts::new`
-        let zeroed: Box<[u64]> = vec![0u64; 2 * DEVICE_SLOTS].into_boxed_slice();
-        // SAFETY: AtomicU64 和 u64 的大小、对齐、有效位都相同，这块内存按同样的布局分配，也按同样的布局释放
-        // SAFETY: AtomicU64 has the same size, alignment and bit validity as u64, so this block is
-        // allocated and freed with the same layout
-        let per_slot = unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [AtomicU64]) };
         Self {
-            per_slot,
+            per_slot: zeroed_u64_slots(),
             started: Instant::now(),
             mostly_unanswered: AtomicIsize::new(0),
         }
@@ -2573,6 +2666,23 @@ mod tests {
         assert_eq!(manager.inflight(), 0);
     }
 
+    /// 这些设备在内存不够以前就在用：门槛设成 0 秒，测试不必等；要在在途到底线以前调
+    /// These devices were in use before memory ran short: the threshold is set to 0 seconds so a test
+    /// need not wait; to be called before what is in flight reaches the floor
+    fn in_use_before(
+        flow: &mut FlowControlState,
+        manager: &Arc<PermitManager>,
+        devices: &[DeviceSlot],
+    ) {
+        flow.known_before = Duration::ZERO;
+        for &device in devices {
+            assert!(
+                flow.permit_by_memory(manager, device).is_some(),
+                "before memory ran short"
+            );
+        }
+    }
+
     /// 总量 1 GiB、剩下 `available` 字节的流控 / Flow control over 1 GiB with `available` bytes left
     fn with_memory_left(available: u64) -> FlowControlState {
         let mut flow = state(Duration::from_secs(3600));
@@ -2593,7 +2703,8 @@ mod tests {
     fn tight_memory_refuses_only_the_devices_holding_their_share() {
         let manager = Arc::new(PermitManager::new());
         // 余量 64 MiB，两倍 128 MiB：剩 100 MiB 算紧张 / A 64 MiB margin, twice that 128 MiB: 100 MiB left is tight
-        let flow = with_memory_left(100 << 20);
+        let mut flow = with_memory_left(100 << 20);
+        in_use_before(&mut flow, &manager, &[OTHER]);
         let heavy: Vec<_> = (0..1000).map(|_| manager.acquire_for(ONE)).collect();
         assert!(
             flow.permit(&manager, Instant::now(), ONE).is_none(),
@@ -2611,7 +2722,7 @@ mod tests {
         drop((heavy, light));
     }
 
-    /// 内存紧张时在途停在变紧张那一刻：一台偏多、其余一样多的一百台设备轮着问到谁都放不进，在途不超过那时的数加设备数，
+    /// 内存紧张时在途最多是变紧张那一刻的数：一台偏多、其余一样多的一百台设备轮着问到谁都放不进，在途不超过那时的数加设备数，
     /// 什么都没在途的照样放进去。以前和平均比，偏多的那台把平均抬高，其余的都在平均下面，一个个放进去又抬高平均，一共涨到
     /// 设备数乘最多的那台
     /// With memory tight what is in flight stays where it was as memory got tight: a hundred
@@ -2622,7 +2733,8 @@ mod tests {
     #[test]
     fn tight_memory_holds_what_was_in_flight_as_it_got_tight() {
         let manager = Arc::new(PermitManager::new());
-        let flow = with_memory_left(100 << 20);
+        let mut flow = with_memory_left(100 << 20);
+        in_use_before(&mut flow, &manager, &[DeviceSlot(500, 500)]);
         let mut held: Vec<_> = (0..20)
             .map(|_| manager.acquire_for(DeviceSlot(0, 0)))
             .collect();
@@ -2662,7 +2774,9 @@ mod tests {
     #[test]
     fn an_idle_connection_is_no_share_of_queries() {
         let manager = Arc::new(PermitManager::new());
-        let flow = with_memory_left(100 << 20);
+        let mut flow = with_memory_left(100 << 20);
+        let asking = [0, 1, 500, 1023].map(|n| DeviceSlot(n, n));
+        in_use_before(&mut flow, &manager, &asking);
         let connections: Vec<_> = (0..1024u16)
             .map(|n| {
                 flow.connection_permit(&manager, DeviceSlot(n, n))
@@ -2718,7 +2832,8 @@ mod tests {
     #[test]
     fn connections_are_compared_with_connections() {
         let manager = Arc::new(PermitManager::new());
-        let flow = with_memory_left(100 << 20);
+        let mut flow = with_memory_left(100 << 20);
+        in_use_before(&mut flow, &manager, &[ONE]);
         let held: Vec<_> = (0..1000)
             .map(|_| manager.acquire_connection_for(ONE))
             .collect();
@@ -2762,6 +2877,43 @@ mod tests {
             "nothing in flight, still refused"
         );
         drop(alike);
+    }
+
+    /// 内存没了：压力出现以前就在用的设备，手上一个没有时照常问；压力出现以后才冒出来的来源（伪造来源的洪泛每个都是新的）、
+    /// 手上已经有在途的设备都不接。以前没了时谁都拒，原来就在用的设备也跟着被拒
+    /// With no memory left: a device in use before memory ran short still asks while holding none;
+    /// a source turning up after (each in a flood from spoofed sources is new), and a device
+    /// already holding one, are refused. With none left everyone used to be refused, the devices in
+    /// use all along with them
+    #[test]
+    fn with_no_memory_left_only_devices_in_use_before_go_on() {
+        let manager = Arc::new(PermitManager::new());
+        let mut flow = with_memory_left(1 << 20);
+        flow.known_before = Duration::from_secs(1);
+        let known = DeviceSlot(7, 7);
+        drop(
+            flow.permit_by_memory(&manager, known)
+                .expect("memory not looked at yet"),
+        );
+        std::thread::sleep(Duration::from_millis(1_100));
+        let flood: Vec<_> = (0..1000).map(|_| manager.acquire_for(ONE)).collect();
+        let first = flow.permit_by_memory(&manager, known);
+        assert!(first.is_some(), "in use before memory ran short");
+        assert!(
+            flow.permit_by_memory(&manager, known).is_none(),
+            "nor a second while the first is in flight"
+        );
+        for n in 100..200 {
+            assert!(
+                flow.permit_by_memory(&manager, DeviceSlot(n, n)).is_none(),
+                "a source turning up now"
+            );
+        }
+        assert!(
+            flow.permit_by_memory(&manager, ONE).is_none(),
+            "the device flooding"
+        );
+        drop((first, flood));
     }
 
     /// 记在设备上的数还回来以后都归零，有在途的设备数也归零 / What is counted per device returns to
