@@ -163,12 +163,16 @@ jobs:
           echo "Version: ${version}; upstream: ${upstream}; publish: ${publish}"
 
   build:
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.arch }}${{ matrix.suffix }}
     needs: [verify, version]
     runs-on: ${{ matrix.runner }}
     # 在 Ubuntu 22.04 里构建，GLIBC 不超过 2.35，和面板以前发的内核一样能在老系统上跑。
+    # musl 版是静态链接的，给 OpenWrt 这类没有 glibc 的系统；包名和清单里的键都多一个
+    # `-musl`，只认 x86_64、arm64 的面板照旧取 glibc 版。
     # Built on Ubuntu 22.04 so GLIBC stays at or below 2.35, running on the same older
-    # systems as the kernels the panel used to ship.
+    # systems as the kernels the panel used to ship. The musl builds are static, for systems
+    # without glibc such as OpenWrt; their package names and manifest keys carry an extra
+    # `-musl`, so panels that only know x86_64 and arm64 keep taking the glibc builds.
     container:
       image: ubuntu:22.04
     defaults:
@@ -185,15 +189,32 @@ jobs:
           - arch: x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            libc: gnu
+            suffix: ""
           - arch: arm64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            libc: gnu
+            suffix: ""
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            libc: musl
+            suffix: -musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            libc: musl
+            suffix: -musl
     steps:
       - name: Install build dependencies
         run: |
+          packages=(binutils build-essential ca-certificates cmake curl git jq perl pkg-config python3 zip)
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            packages+=(musl-tools)
+          fi
           apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates cmake curl git jq perl pkg-config python3 zip
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
@@ -225,7 +246,23 @@ jobs:
           cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Verify GLIBC baseline
+        if: matrix.libc == 'gnu'
         run: bash panel/verify-glibc-baseline.sh "target/${{ matrix.target }}/release/kixdns" "${GLIBC_BASELINE}"
+
+      # 没有 glibc 的系统上没有动态加载器：musl 版不能带 PT_INTERP。glibc 版的运行契约在 verify 里
+      # 已经冒烟过，musl 版这里拿发布用的二进制再跑一遍。
+      # Systems without glibc have no dynamic loader, so the musl build must carry no PT_INTERP.
+      # The glibc runtime contract is smoke-tested in verify; the musl release binary is run
+      # through the same smoke test here.
+      - name: Verify static musl binary
+        if: matrix.libc == 'musl'
+        run: |
+          binary="target/${{ matrix.target }}/release/kixdns"
+          if readelf --program-headers --wide "${binary}" | grep -q 'INTERP'; then
+            echo "${binary} 不是静态链接 / is not statically linked" >&2
+            exit 1
+          fi
+          python3 panel/dns_smoke.py "${binary}"
 
       - name: Package
         run: |
@@ -240,18 +277,22 @@ jobs:
             ([.config_capabilities[] | type == "string" and test("^[a-z][a-z0-9_]{0,63}$")] | all) and
             ((.config_capabilities | unique | length) == (.config_capabilities | length))
           ' panel/capabilities.json >/dev/null
-          name="kixdns-${VERSION}-linux-${{ matrix.arch }}"
+          name="kixdns-${VERSION}-linux-${{ matrix.arch }}${{ matrix.suffix }}"
           dir="dist/${name}"
           install -Dm755 "target/${{ matrix.target }}/release/kixdns" "${dir}/kixdns"
           cp panel/capabilities.json "${dir}/KIXDNS_CAPABILITIES.json"
+          # arch 照旧只写架构（面板按它核对本机架构），C 库另记在 libc 里
+          # arch keeps naming the architecture only (the panel checks it against its own);
+          # the C library is recorded separately in libc
           jq -n \
             --arg repository "${GITHUB_REPOSITORY}" \
             --arg version "${VERSION}" \
             --arg commit "${GITHUB_SHA}" \
             --arg upstream "${UPSTREAM_COMMIT}" \
             --arg arch "${{ matrix.arch }}" \
+            --arg libc "${{ matrix.libc }}" \
             --argjson protocol "${protocol}" \
-            '{schema_version: 1, repository: $repository, version: $version, commit: $commit, upstream_commit: $upstream, arch: $arch, control_protocol: $protocol}' \
+            '{schema_version: 1, repository: $repository, version: $version, commit: $commit, upstream_commit: $upstream, arch: $arch, libc: $libc, control_protocol: $protocol}' \
             > "${dir}/KIXDNS_SOURCE.json"
           (cd "${dir}" && sha256sum kixdns KIXDNS_CAPABILITIES.json KIXDNS_SOURCE.json > SHA256SUMS)
           (cd "${dir}" && zip -X -q "../${name}.zip" kixdns KIXDNS_CAPABILITIES.json KIXDNS_SOURCE.json SHA256SUMS)
@@ -259,7 +300,7 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: kernel-${{ matrix.arch }}
+          name: kernel-${{ matrix.arch }}${{ matrix.suffix }}
           path: dist/*.zip
           if-no-files-found: error
           retention-days: 1
@@ -291,19 +332,22 @@ jobs:
       - name: Write manifest and notes
         run: |
           protocol="$(sed -nE 's/^const PROTOCOL_VERSION: u8 = ([0-9]+);$/\1/p' src/panel.rs)"
+          # 清单的键：glibc 版就是架构名（旧面板只认这两个），musl 版多一个 -musl
+          # Manifest keys: the architecture for glibc builds (all older panels know), plus
+          # -musl for musl builds
           assets='{}'
-          for arch in x86_64 arm64; do
-            file="dist/kixdns-${VERSION}-linux-${arch}.zip"
+          for key in x86_64 arm64 x86_64-musl arm64-musl; do
+            file="dist/kixdns-${VERSION}-linux-${key}.zip"
             [[ -f "${file}" ]] || {
               echo "缺少 ${file}" >&2
               exit 1
             }
             assets="$(jq \
-              --arg arch "${arch}" \
+              --arg key "${key}" \
               --arg name "$(basename "${file}")" \
               --argjson size "$(stat -c %s "${file}")" \
               --arg sha256 "$(sha256sum "${file}" | cut -d ' ' -f1)" \
-              '. + {($arch): {name: $name, size: $size, sha256: $sha256}}' <<<"${assets}")"
+              '. + {($key): {name: $name, size: $size, sha256: $sha256}}' <<<"${assets}")"
           done
           jq -n \
             --arg repository "${GITHUB_REPOSITORY}" \
@@ -361,4 +405,6 @@ jobs:
             --notes-file dist/notes.md \
             dist/kixdns-"${VERSION}"-linux-x86_64.zip \
             dist/kixdns-"${VERSION}"-linux-arm64.zip \
+            dist/kixdns-"${VERSION}"-linux-x86_64-musl.zip \
+            dist/kixdns-"${VERSION}"-linux-arm64-musl.zip \
             dist/manifest.json
