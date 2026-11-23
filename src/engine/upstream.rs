@@ -701,6 +701,7 @@ async fn forward_upstream_as_is(
     // With one upstream left it takes the single-upstream path below, as if it were the
     // only one written
     let upstreams = without_paused(engine, upstreams, default_transport, observed);
+    let mut attempts = Attempts::new(observed);
 
     // 快速路径：只有一个上游时，直接调用避免 spawn 开销
     // Fast path: direct call when only one upstream, avoiding spawn overhead
@@ -709,15 +710,7 @@ async fn forward_upstream_as_is(
 
         // 解析地址中的协议前缀 / Parse protocol prefix from address
         let (addr, transport_for_addr) = parse_upstream_addr(up, default_transport);
-        if let Some((observer, ctx)) = observed {
-            observer.upstream_attempt(
-                ctx,
-                &UpstreamAttempt {
-                    upstream: addr,
-                    transport: transport_for_addr,
-                },
-            );
-        }
+        let attempt = attempts.start(addr, transport_for_addr);
 
         let start = std::time::Instant::now();
         // `via` is the transport that actually carried the answer (UDP may fall
@@ -734,21 +727,14 @@ async fn forward_upstream_as_is(
             Ok(bytes) => {
                 // Quick check rcode / 快速解析响应码
                 let quick = crate::proto_utils::parse_response_quick(&bytes);
-                if let Some((observer, ctx)) = observed {
-                    observer.upstream_result(
-                        ctx,
-                        &UpstreamResult {
-                            upstream: addr,
-                            transport: transport_for_addr,
-                            via,
-                            outcome: UpstreamOutcome::Success,
-                            latency: dur,
-                            rcode: quick.as_ref().map(|qr| qr.rcode),
-                            truncated: quick.as_ref().map(|qr| qr.truncated),
-                            error: None,
-                        },
-                    );
-                }
+                attempts.finish(
+                    attempt,
+                    via,
+                    UpstreamOutcome::Success,
+                    dur,
+                    quick.as_ref(),
+                    None,
+                );
                 if let Some(qr) = quick {
                     tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
                 }
@@ -756,21 +742,7 @@ async fn forward_upstream_as_is(
             }
             Err(err) => {
                 let outcome = failed_outcome(&err);
-                if let Some((observer, ctx)) = observed {
-                    observer.upstream_result(
-                        ctx,
-                        &UpstreamResult {
-                            upstream: addr,
-                            transport: transport_for_addr,
-                            via: transport_for_addr,
-                            outcome,
-                            latency: dur,
-                            rcode: None,
-                            truncated: None,
-                            error: Some(&err),
-                        },
-                    );
-                }
+                attempts.finish(attempt, transport_for_addr, outcome, dur, None, Some(&err));
                 // 失败时不构造 prefix，只 warn；回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
                 // No prefix is built on failure, only a warn; a 429 logs at debug, the DoH
                 // client having logged one warn as the pause began
@@ -795,11 +767,6 @@ async fn forward_upstream_as_is(
     // The first failure reply received, carried out when every attempt fails (see
     // `UpstreamFailure::reply`)
     let mut first_failure_reply: Option<(Bytes, Arc<str>)> = None;
-    // Attempts that have not reported a result yet, so losers of the race can
-    // be reported as aborted; only tracked for an observer.
-    // 尚未上报结果的尝试，用于把竞争失败者上报为已取消；仅在有观察者时跟踪。
-    let mut pending: Option<Vec<(String, Transport, std::time::Instant)>> =
-        observed.map(|_| Vec::new());
 
     // If any TCP/TCP+UDP upstream is present, a failed UDP attempt does not fall back to TCP, to
     // prevent duplicate TCP sends (truncated answers are still fetched again over TCP)
@@ -810,26 +777,10 @@ async fn forward_upstream_as_is(
         matches!(t, Transport::Tcp | Transport::TcpUdp)
     });
 
-    for up in upstreams {
+    for up in &upstreams {
         // 解析地址中的协议前缀 / Parse protocol prefix from address
-        let (addr, transport_for_task) = parse_upstream_addr(&up, default_transport);
-        if let Some((observer, ctx)) = observed {
-            observer.upstream_attempt(
-                ctx,
-                &UpstreamAttempt {
-                    upstream: addr,
-                    transport: transport_for_task,
-                },
-            );
-        }
-
-        if let Some(pending) = pending.as_mut() {
-            pending.push((
-                addr.to_string(),
-                transport_for_task,
-                std::time::Instant::now(),
-            ));
-        }
+        let (addr, transport_for_task) = parse_upstream_addr(up, default_transport);
+        let attempt = attempts.start(addr, transport_for_task);
 
         let engine = engine.clone();
         let packet = packet_owned.clone();
@@ -858,75 +809,42 @@ async fn forward_upstream_as_is(
             // 注意：对于 TcpUdp，计时包含两个任务的 spawn/abort 开销
             let upstream_with_proto = upstream_label(via, &addr_owned);
             let dur = start.elapsed();
-            (
-                upstream_with_proto,
-                addr_owned,
-                transport_for_task,
-                via,
-                res,
-                dur,
-            )
+            (attempt, upstream_with_proto, via, res, dur)
         });
     }
 
     // 等待第一个成功响应 / Wait for first successful response
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((up_proto, addr, transport_for_task, via, res, dur)) => {
-                if let Some(pending) = pending.as_mut()
-                    && let Some(idx) = pending
-                        .iter()
-                        .position(|(a, t, _)| *a == addr && *t == transport_for_task)
-                {
-                    pending.swap_remove(idx);
-                }
+            Ok((attempt, up_proto, via, res, dur)) => {
                 // Report the outcome of this attempt / 上报本次尝试的结果
-                let report = |outcome: UpstreamOutcome,
-                              rcode: Option<ResponseCode>,
-                              truncated: Option<bool>,
-                              error: Option<&anyhow::Error>| {
-                    if let Some((observer, ctx)) = observed {
-                        observer.upstream_result(
-                            ctx,
-                            &UpstreamResult {
-                                upstream: &addr,
-                                transport: transport_for_task,
-                                via,
-                                outcome,
-                                latency: dur,
-                                rcode,
-                                truncated,
-                                error,
-                            },
-                        );
-                    }
+                let mut report = |outcome,
+                                  reply: Option<&crate::proto_utils::QuickResponse>,
+                                  error: Option<&anyhow::Error>| {
+                    attempts.finish(attempt, via, outcome, dur, reply, error);
                 };
                 match res {
                     Ok(bytes) => {
                         // 快速解析响应码 / Quick parse response code
                         let quick = crate::proto_utils::parse_response_quick(&bytes);
-                        let rcode = quick.as_ref().map(|qr| qr.rcode);
-                        let truncated = quick.as_ref().map(|qr| qr.truncated);
-                        let should_accept = quick.is_none_or(|qr| !is_failure_reply(qr.rcode));
+                        let should_accept =
+                            quick.as_ref().is_none_or(|qr| !is_failure_reply(qr.rcode));
 
                         if should_accept {
-                            report(UpstreamOutcome::Success, rcode, truncated, None);
-
-                            // The remaining attempts lose the race / 其余尝试竞争失败
-                            if let Some(pending) = pending.as_ref() {
-                                report_aborted(observed, pending);
-                            }
-                            // 显式取消其他正在进行的任务 / Cancel the attempts still running
+                            report(UpstreamOutcome::Success, quick.as_ref(), None);
+                            // 显式取消其他正在进行的任务，它们的尝试竞争失败（见 `Attempts`）
+                            // Cancel the attempts still running, which lose the race (see
+                            // `Attempts`)
                             tasks.abort_all();
 
                             return Ok((bytes, up_proto));
                         }
-                        report(UpstreamOutcome::Rejected, rcode, truncated, None);
+                        report(UpstreamOutcome::Rejected, quick.as_ref(), None);
                         first_failure_reply.get_or_insert((bytes, up_proto));
                     }
                     Err(err) => {
                         let outcome = failed_outcome(&err);
-                        report(outcome, None, None, Some(&err));
+                        report(outcome, None, Some(&err));
                         // 回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
                         // A 429 logs at debug: the DoH client logged one warn as the pause began
                         if outcome == UpstreamOutcome::Throttled {
@@ -943,11 +861,6 @@ async fn forward_upstream_as_is(
                 last_err = Some(anyhow::anyhow!(e));
             }
         }
-    }
-
-    // Attempts whose task never reported (join error) / 任务未能上报结果的尝试（join 错误）
-    if let Some(pending) = pending.as_ref() {
-        report_aborted(observed, pending);
     }
 
     // 所有上游都失败 / All upstreams failed
@@ -1016,23 +929,99 @@ fn failed_outcome(err: &anyhow::Error) -> UpstreamOutcome {
     }
 }
 
-/// Report every attempt still in flight as aborted / 把仍在飞的尝试上报为已取消
-fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::time::Instant)]) {
-    if let Some((observer, ctx)) = observed {
-        for (upstream, transport, started) in pending {
+/// 一次转发报给观察者的尝试：每次 `upstream_attempt` 都配一次 `upstream_result`。丢掉时还没报结果的报成
+/// [`UpstreamOutcome::Aborted`]：一组上游里别的先答了、任务没交回结果，或者整个转发半路被放下（请求被取消、流控不等了）。
+/// 以前只有前两种报了，请求被取消时这些尝试有开头没结果。没有观察者时什么也不记
+/// The attempts of one forward reported to the observer: every `upstream_attempt` gets one
+/// `upstream_result`. Dropped, it reports those still without a result as
+/// [`UpstreamOutcome::Aborted`]: another upstream of the set answered first, a task never
+/// handed its result back, or the whole forward was dropped halfway (the request cancelled,
+/// flow control waiting no more). Only the first two used to be reported, and a cancelled
+/// request left its attempts begun with no result. Without an observer nothing is kept
+struct Attempts<'a> {
+    observed: Observed<'a>,
+    /// 每次尝试的上游、传输和开始的时候，报了结果的是 None / Each attempt's upstream, transport
+    /// and start, None once its result is reported
+    pending: Vec<Option<(&'a str, Transport, Instant)>>,
+}
+
+impl<'a> Attempts<'a> {
+    fn new(observed: Observed<'a>) -> Self {
+        Self {
+            observed,
+            pending: Vec::new(),
+        }
+    }
+
+    /// 报一次尝试，返回它的编号，报结果时用 / Reports an attempt, returning its number for
+    /// reporting its result
+    fn start(&mut self, upstream: &'a str, transport: Transport) -> usize {
+        let attempt = self.pending.len();
+        if let Some((observer, ctx)) = self.observed {
+            observer.upstream_attempt(
+                ctx,
+                &UpstreamAttempt {
+                    upstream,
+                    transport,
+                },
+            );
+            self.pending
+                .push(Some((upstream, transport, Instant::now())));
+        }
+        attempt
+    }
+
+    /// 报 `attempt` 的结果：`via` 是带回应答的传输，`reply` 是快速解析出的应答 / Reports the
+    /// result of `attempt`: `via` is the transport that carried the answer, `reply` the answer
+    /// as quickly parsed
+    fn finish(
+        &mut self,
+        attempt: usize,
+        via: Transport,
+        outcome: UpstreamOutcome,
+        latency: Duration,
+        reply: Option<&crate::proto_utils::QuickResponse>,
+        error: Option<&anyhow::Error>,
+    ) {
+        if let Some((observer, ctx)) = self.observed {
+            let (upstream, transport, _) = self.pending[attempt]
+                .take()
+                .expect("one result per attempt");
             observer.upstream_result(
                 ctx,
                 &UpstreamResult {
                     upstream,
-                    transport: *transport,
-                    via: *transport,
-                    outcome: UpstreamOutcome::Aborted,
-                    latency: started.elapsed(),
-                    rcode: None,
-                    truncated: None,
-                    error: None,
+                    transport,
+                    via,
+                    outcome,
+                    latency,
+                    rcode: reply.map(|reply| reply.rcode),
+                    truncated: reply.map(|reply| reply.truncated),
+                    error,
                 },
             );
+        }
+    }
+}
+
+impl Drop for Attempts<'_> {
+    fn drop(&mut self) {
+        if let Some((observer, ctx)) = self.observed {
+            for (upstream, transport, started) in self.pending.drain(..).flatten() {
+                observer.upstream_result(
+                    ctx,
+                    &UpstreamResult {
+                        upstream,
+                        transport,
+                        via: transport,
+                        outcome: UpstreamOutcome::Aborted,
+                        latency: started.elapsed(),
+                        rcode: None,
+                        truncated: None,
+                        error: None,
+                    },
+                );
+            }
         }
     }
 }

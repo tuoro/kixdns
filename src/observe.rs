@@ -193,7 +193,8 @@ pub trait EngineObserver: Send + Sync + 'static {
 
     /// A query is about to be sent to an upstream server. Every attempt is
     /// followed by exactly one [`upstream_result`], including attempts that
-    /// lose a concurrent race ([`UpstreamOutcome::Aborted`]).
+    /// lose a concurrent race or whose request is given up before they finish
+    /// ([`UpstreamOutcome::Aborted`]).
     ///
     /// [`upstream_result`]: EngineObserver::upstream_result
     fn upstream_attempt(&self, ctx: &RequestContext<'_>, event: &UpstreamAttempt<'_>) {}
@@ -555,8 +556,9 @@ pub enum UpstreamOutcome {
     Rejected,
     /// The attempt failed (timeout, transport error, task failure).
     Error,
-    /// The attempt was still in flight when another upstream of the same
-    /// concurrent set answered, and was cancelled.
+    /// The attempt was still in flight when it was cancelled: another upstream
+    /// of the same concurrent set answered, or the request was given up (the
+    /// client went away, the request timed out, flow control stopped waiting).
     Aborted,
     /// The query was sent and the DoH upstream answered HTTP 429 Too Many Requests.
     /// It is not retried; the upstream is left out of concurrent sets for a while
