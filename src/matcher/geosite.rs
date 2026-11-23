@@ -211,7 +211,8 @@ impl NameSet {
         self.starts.is_empty()
     }
 
-    /// 所有名字（调试用，顺序不保留） / Every name (for debugging; order is not kept)
+    /// 所有名字（测试用，顺序不保留） / Every name (for tests; order is not kept)
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = &str> {
         self.starts.iter().map(|&start| {
             std::str::from_utf8(Self::name_at(&self.bytes, start))
@@ -387,7 +388,8 @@ impl Regexes {
         }
     }
 
-    /// 正则重新展开成一条条（调试用） / The regexes one by one again (for debugging)
+    /// 正则重新展开成一条条（测试用） / The regexes one by one again (for tests)
+    #[cfg(test)]
     fn to_regexes(&self) -> Vec<Regex> {
         match self {
             Self::None => Vec::new(),
@@ -544,8 +546,9 @@ impl TagMatchers {
         self.full.len() + self.suffixes.len() + self.regexes.len() + self.others.len()
     }
 
-    /// 条目重新展开成匹配器列表（调试用，顺序不保留）
-    /// The entries as a list of matchers again (for debugging; order is not kept)
+    /// 条目重新展开成匹配器列表（测试用，顺序不保留）
+    /// The entries as a list of matchers again (for tests; order is not kept)
+    #[cfg(test)]
     fn to_matchers(&self) -> Vec<DomainMatcher> {
         self.full
             .iter()
@@ -638,6 +641,7 @@ impl GeoSiteManager {
     }
 
     /// 添加 GeoSite 条目 / Add GeoSite entry
+    #[cfg(test)]
     pub fn add_entry(&mut self, entry: GeoSiteEntry) {
         // 在添加时自动标准化 / Auto-normalize on add
         let normalized = entry.normalized();
@@ -671,8 +675,8 @@ impl GeoSiteManager {
             .is_some_and(|matchers| matchers.matches(domain))
     }
 
-    /// 检查标签是否已加载 / Check if tag is loaded
-    #[inline]
+    /// 标签是否已加载，测试用 / Whether a tag is loaded, for tests
+    #[cfg(test)]
     pub fn has_tag(&self, tag: &str) -> bool {
         self.database.contains_key(tag)
     }
@@ -715,8 +719,8 @@ impl GeoSiteManager {
         taken
     }
 
-    /// 获取标签的所有域名匹配器（仅用于调试）/ Get all domain matchers for a tag (debug only)
-    #[inline]
+    /// 标签的所有域名匹配器，测试用 / Every domain matcher of a tag, for tests
+    #[cfg(test)]
     pub fn get_tag_matchers(&self, tag: &str) -> Option<Vec<DomainMatcher>> {
         self.database.get(tag).map(TagMatchers::to_matchers)
     }
@@ -971,24 +975,10 @@ fn runs_past(pos: usize, len: usize, end: usize) -> bool {
 }
 
 impl GeoSiteManager {
-    /// 从 V2Ray 格式文件加载 GeoSite 数据 / Load GeoSite data from V2Ray format file
-    ///
-    /// # 参数 / Parameters
-    /// - `path`: 文件路径 / File path
-    ///
-    /// # 返回 / Returns
-    /// 返回加载的条目数量 / Returns the number of loaded entries
-    ///
-    /// # 错误 / Errors
-    /// 如果文件不存在或格式错误，返回错误 / Returns error if file doesn't exist or format is invalid
-    ///
-    /// # 示例 / Example
-    /// ```no_run
-    /// use kixdns::matcher::geosite::GeoSiteManager;
-    /// let mut manager = GeoSiteManager::new();
-    /// let count = manager.load_from_v2ray_file("geosite.json").unwrap();
-    /// println!("Loaded {} GeoSite entries", count);
-    /// ```
+    /// 加载数据文件里的每个标签，给出加载了几个，测试用；运行时只加载规则用到的（见 [`Self::parse_file`]）
+    /// Loads every tag of a data file, giving how many, for tests; at run time only the tags
+    /// rules use are loaded (see [`Self::parse_file`])
+    #[cfg(test)]
     pub fn load_from_v2ray_file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<usize> {
         let path = path.as_ref();
         let parsed = Self::parse_file(path, &[])?;
@@ -1264,17 +1254,9 @@ impl GeoSiteManager {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
-    /// 从 .dat 文件按需加载指定的 GeoSite tags / Load specified GeoSite tags from .dat file on-demand
-    ///
-    /// # 参数 / Parameters
-    /// - `path`: .dat 文件路径 / .dat file path
-    /// - `tags`: 需要加载的 tag 列表 / List of tags to load
-    ///
-    /// # 返回 / Returns
-    /// 返回实际加载的条目数量 / Returns the number of entries actually loaded
-    ///
-    /// # 错误 / Errors
-    /// 如果文件不存在或格式错误，返回错误 / Returns error if file doesn't exist or format is invalid
+    /// 从 .dat 文件加载 `tags` 这几个标签，给出加载了几个，测试用 / Loads the tags `tags` from a .dat
+    /// file, giving how many, for tests
+    #[cfg(test)]
     pub fn load_from_dat_file_selective<P: AsRef<Path>>(
         &mut self,
         path: P,
@@ -1480,16 +1462,9 @@ impl GeoSiteManager {
         Ok((full, suffixes))
     }
 
-    /// 从 V2Ray 格式字符串加载 GeoSite 数据 / Load GeoSite data from V2Ray format string
-    ///
-    /// # 参数 / Parameters
-    /// - `json_str`: JSON 字符串 / JSON string
-    ///
-    /// # 返回 / Returns
-    /// 返回加载的条目数量 / Returns the number of loaded entries
-    ///
-    /// # 错误 / Errors
-    /// 如果 JSON 格式错误，返回错误 / Returns error if JSON format is invalid
+    /// 加载 V2Ray JSON 格式的字符串，保留已有的数据，给出条目数，测试用 / Loads a string in V2Ray's
+    /// JSON format, keeping the data already there, giving the number of entries, for tests
+    #[cfg(test)]
     pub fn load_from_v2ray_string(&mut self, json_str: &str) -> anyhow::Result<usize> {
         let v2ray_data: V2RayGeoSiteList =
             serde_json::from_str(json_str).with_context(|| "parse V2Ray GeoSite JSON format")?;

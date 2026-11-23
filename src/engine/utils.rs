@@ -283,7 +283,7 @@ pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<Stri
     for pipeline in &cfg.pipelines {
         for rule in &pipeline.rules {
             // Scan request matchers / 扫描请求匹配器
-            for matcher in &rule.matchers {
+            for matcher in rule.matchers.iter() {
                 if let crate::matcher::RuntimeMatcher::GeoSite { tag } = &matcher.matcher {
                     tags_set.insert(tag.clone());
                 }
@@ -293,7 +293,7 @@ pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<Stri
             }
 
             // Scan response matchers / 扫描响应匹配器
-            for matcher in &rule.response_matchers {
+            for matcher in rule.response_matchers() {
                 if let crate::matcher::RuntimeResponseMatcher::ResponseRequestDomainGeoSite {
                     value,
                 } = &matcher.matcher
@@ -331,13 +331,13 @@ pub fn extract_geoip_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String
     let rules = cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules);
     let request_codes = rules
         .clone()
-        .flat_map(|rule| &rule.matchers)
+        .flat_map(|rule| rule.matchers.iter())
         .filter_map(|matcher| match &matcher.matcher {
             crate::matcher::RuntimeMatcher::GeoipCountry { country_codes } => Some(country_codes),
             _ => None,
         });
     let response_codes = rules
-        .flat_map(|rule| &rule.response_matchers)
+        .flat_map(crate::matcher::RuntimeRule::response_matchers)
         .filter_map(|matcher| match &matcher.matcher {
             crate::matcher::RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
                 country_codes,

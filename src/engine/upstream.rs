@@ -205,12 +205,7 @@ pub(crate) fn tcp_upstreams(
     cfg.pipelines
         .iter()
         .flat_map(|p| &p.rules)
-        .flat_map(|rule| {
-            rule.actions
-                .iter()
-                .chain(&rule.response_actions_on_match)
-                .chain(&rule.response_actions_on_miss)
-        })
+        .flat_map(crate::matcher::RuntimeRule::all_actions)
         .filter_map(|action| match action {
             crate::config::Action::Forward {
                 upstream: Some(upstream),
@@ -307,12 +302,7 @@ pub(crate) fn upstreams(
         .pipelines
         .iter()
         .flat_map(|pipeline| &pipeline.rules)
-        .flat_map(|rule| {
-            rule.actions
-                .iter()
-                .chain(&rule.response_actions_on_match)
-                .chain(&rule.response_actions_on_miss)
-        })
+        .flat_map(crate::matcher::RuntimeRule::all_actions)
         .filter_map(|action| match action {
             crate::config::Action::Forward {
                 upstream,
