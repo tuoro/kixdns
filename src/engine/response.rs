@@ -84,7 +84,6 @@ pub(crate) fn write_static_reply(
     rcode: ResponseCode,
     addresses: StaticAddresses<'_>,
 ) -> Option<Bytes> {
-    const MAX_NAME: usize = 255;
     /// 报文头 / The header
     const QUESTION_AT: usize = 12;
     /// 指针、类型、类别、TTL、RDATA 长度，加上 IPv6 地址 / The pointer, type, class, TTL and RDATA length, and an
@@ -93,9 +92,10 @@ pub(crate) fn write_static_reply(
     let rcode = u8::try_from(u16::from(rcode))
         .ok()
         .filter(|rcode| *rcode < 16)?;
+    // 名字不超过 255 字节，`question_name_end` 查过 / The name is at most 255 bytes, as
+    // `question_name_end` has checked
     let name_end = crate::proto_utils::question_name_end(query)?;
-    let name_len = name_end - QUESTION_AT;
-    if name_len <= 1 || name_len > MAX_NAME {
+    if name_end - QUESTION_AT <= 1 {
         return None;
     }
     let question = query.get(QUESTION_AT..name_end + 4)?;
