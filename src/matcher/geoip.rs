@@ -10,9 +10,6 @@ use prost::Message;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 
-// Re-export from the sibling geoip_converter module
-pub use crate::matcher::geoip_converter::{ConversionStats, convert_dat_to_mmdb};
-
 /// MaxMind GeoLite2-Country 数据库结构，字符串直接借用数据库里的字节
 /// MaxMind GeoLite2-Country database structure, its strings borrowed from the database's bytes
 #[derive(Deserialize)]
@@ -345,45 +342,26 @@ impl GeoIpManager {
         self.mmdb.is_some()
     }
 
-    /// 检查 IP 是否属于指定标签 / Check whether an IP belongs to a tag.
-    #[inline]
+    /// IP 是否属于一个标签（不分大小写）：测试用的 [`Self::matches_any_tag`] 简写
+    /// Whether an IP belongs to one tag (in any case): the tests' shorthand for
+    /// [`Self::matches_any_tag`]
+    #[cfg(test)]
     pub fn matches_tag(&self, ip: IpAddr, tag: &str) -> bool {
-        let normalized;
-        let tag = if tag.bytes().all(|b| !b.is_ascii_lowercase()) {
-            tag
-        } else {
-            normalized = tag.to_ascii_uppercase();
-            &normalized
-        };
-
-        if let Some(mmdb) = &self.mmdb
-            && is_country_tag(tag)
-        {
-            return mmdb
-                .country(ip)
-                .is_some_and(|code| code.eq_ignore_ascii_case(tag));
-        }
-
-        self.tag_indexes
-            .get(tag)
-            .is_some_and(|index| index.contains(ip))
+        self.matches_any_tag(ip, &[Arc::from(tag.to_ascii_uppercase())])
     }
 
-    /// 检查 IP 是否属于任一指定标签 / Check whether an IP belongs to any requested tag.
+    /// IP 是否属于 `tags` 里的哪个标签。`tags` 已是大写：规则写的国家代码和标签编译时就转了大写（见
+    /// `matcher::normalize_geoip_country_codes`），数据文件里的读进来时转
+    /// Whether an IP belongs to any of `tags`. `tags` are uppercase already: the country codes and
+    /// tags rules write are uppercased as they compile (see
+    /// `matcher::normalize_geoip_country_codes`), and those of data files as they are read
     #[inline]
     pub fn matches_any_tag(&self, ip: IpAddr, tags: &[Arc<str>]) -> bool {
         // 用到国家代码时才查 MMDB，只查一次 / The MMDB is asked once, and only when a country code needs it
         let mut mmdb_country: Option<Option<&str>> = None;
 
         for tag in tags {
-            let normalized;
-            let tag = if tag.bytes().all(|b| !b.is_ascii_lowercase()) {
-                tag.as_ref()
-            } else {
-                normalized = tag.to_ascii_uppercase();
-                &normalized
-            };
-
+            let tag = tag.as_ref();
             if let Some(mmdb) = &self.mmdb
                 && is_country_tag(tag)
             {
@@ -417,26 +395,18 @@ impl GeoIpManager {
             .sum()
     }
 
-    /// 从 V2Ray .dat 文件加载 GeoIP 数据 / Load GeoIP data from V2Ray .dat file
-    ///
-    /// 文件格式 / File format:
-    /// - Header: 4 bytes magic (0x0D 0x0A 0x0D 0x0A)
-    /// - Index section: country_code_count (2 bytes) + entries
-    /// - Data section: IP ranges for each country
-    ///
-    /// 从 V2Ray .dat 文件加载 GeoIP 数据
-    ///
-    /// V2Ray .dat 文件使用 protobuf 编码，包含国家代码和 IP 范围
-    /// V2Ray .dat files use protobuf encoding, containing country codes and IP ranges
-    /// V2Ray .dat 文件使用 protobuf 编码，包含国家代码和 IP 范围
-    /// V2Ray .dat files use protobuf encoding, containing country codes and IP ranges
+    /// 从 V2Ray .dat 文件加载每个标签（protobuf 编码的 GeoIPList，见 [`Self::parse_dat_file`]），测试用
+    /// Loads every tag of a V2Ray .dat file (a protobuf-encoded GeoIPList, see
+    /// [`Self::parse_dat_file`]), for tests
+    #[cfg(test)]
     pub fn load_from_dat_file(&mut self, path: &Path) -> anyhow::Result<usize> {
         let parsed = Self::parse_dat_file(path)?;
         Ok(self.apply_parsed(parsed))
     }
 
-    /// 解析 .dat 文件，不触碰管理器状态
-    /// Parse a .dat file without touching manager state
+    /// 解析 .dat 文件里的每个标签，不触碰管理器状态；测试用，运行时只解析规则用到的（见 [`Self::parse_file`]）
+    /// Parse every tag of a .dat file without touching manager state; for tests, as at run time
+    /// only the tags rules use are parsed (see [`Self::parse_file`])
     ///
     /// 读取、解码、建索引、finalize 全在这里完成，与 [`Self::apply_parsed`]
     /// 配合：调用方在锁外解析，只在替换数据时短暂持写锁。finalize 必须留在
@@ -448,6 +418,7 @@ impl GeoIpManager {
     /// on this side, since sorting and merging every tag's ranges is the
     /// heaviest part of a reload and moving only the read and the decode would
     /// leave most of it behind.
+    #[cfg(test)]
     pub fn parse_dat_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
         Self::parse_dat_entries(path, &|_| true)
     }
@@ -631,18 +602,20 @@ impl GeoIpManager {
         parsed.count
     }
 
+    /// 从 JSON 数据文件加载每个标签，测试用 / Loads every tag of a JSON data file, for tests
+    #[cfg(test)]
     pub fn load_from_v2ray_file(&mut self, path: &Path) -> anyhow::Result<usize> {
         let parsed = Self::parse_v2ray_file(path)?;
         Ok(self.apply_parsed(parsed))
     }
 
     /// 按扩展名解析数据文件里 `tags` 这几个标签（不分大小写），其余条目不解，不触碰管理器状态：
-    /// `.dat` 按条目读（见 [`Self::parse_dat_file`]），其余按 JSON 读（[`Self::parse_v2ray_file`]）。
+    /// `.dat` 按条目读（见 `parse_dat_entries`），其余按 JSON 读（`parse_v2ray_entries`）。
     /// 文件里没有的标签记一条告警，用它的规则不会命中。
     /// Parses the `tags` of a data file (ignoring case) by its extension, leaving the other
     /// entries undecoded and the manager untouched: `.dat` is read entry by entry (see
-    /// [`Self::parse_dat_file`]) and anything else as JSON ([`Self::parse_v2ray_file`]). Tags
-    /// the file lacks are logged as a warning, since rules using them never match.
+    /// `parse_dat_entries`) and anything else as JSON (`parse_v2ray_entries`). Tags the file
+    /// lacks are logged as a warning, since rules using them never match.
     pub fn parse_file(path: &Path, tags: &[String]) -> anyhow::Result<ParsedGeoIp> {
         let wanted: FxHashSet<String> = tags.iter().map(|tag| tag.to_ascii_uppercase()).collect();
         let parsed = Self::parse_matching(path, &|code| wanted.contains(code))?;
@@ -677,8 +650,10 @@ impl GeoIpManager {
         }
     }
 
-    /// 解析 JSON 格式的数据文件，不触碰管理器状态
-    /// Parse a JSON data file without touching manager state
+    /// 解析 JSON 数据文件里的每个标签，不触碰管理器状态；测试用，运行时只解析规则用到的（见 [`Self::parse_file`]）
+    /// Parse every tag of a JSON data file without touching manager state; for tests, as at run
+    /// time only the tags rules use are parsed (see [`Self::parse_file`])
+    #[cfg(test)]
     pub fn parse_v2ray_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
         Self::parse_v2ray_entries(path, &|_| true)
     }
@@ -738,21 +713,6 @@ impl GeoIpManager {
             ipv6_count,
             source: "JSON file",
         })
-    }
-
-    /// 转换 .dat 为 MMDB 格式
-    /// Convert .dat to MMDB format
-    ///
-    /// # 参数 / Parameters
-    /// - `dat_path`: V2Ray .dat 文件路径 / V2Ray .dat file path
-    /// - `mmdb_path`: 输出 MMDB 文件路径 / Output MMDB file path
-    /// - `filter_countries`: 可选的国家代码过滤列表 / Optional country code filter list
-    pub fn convert_dat_to_mmdb(
-        dat_path: &Path,
-        mmdb_path: &Path,
-        filter_countries: Option<&[String]>,
-    ) -> anyhow::Result<ConversionStats> {
-        convert_dat_to_mmdb(dat_path, mmdb_path, filter_countries)
     }
 }
 
@@ -939,8 +899,12 @@ mod tests {
         let source = dir.path().join("geoip.json");
         let mmdb = dir.path().join("geoip.mmdb");
         std::fs::write(&source, json).unwrap();
-        let stats =
-            GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, Some(&["CN".to_string()])).unwrap();
+        let stats = crate::matcher::geoip_converter::convert_dat_to_mmdb(
+            &source,
+            &mmdb,
+            Some(&["CN".to_string()]),
+        )
+        .unwrap();
         assert_eq!(stats.countries_count, 1);
 
         let mut mgr = GeoIpManager::default();
@@ -963,7 +927,7 @@ mod tests {
         let convert = |json: &str| {
             let source = dir.path().join("geoip.json");
             std::fs::write(&source, json).unwrap();
-            GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+            crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
         };
         convert(r#"{ "entries": [{ "country_code": "CN", "ips": ["198.51.100.0/24"] }] }"#);
         let mut first = GeoIpManager::default();
@@ -1304,7 +1268,8 @@ mod tests {
         let mmdb_path = temp_dir.path().join("geoip_test_mmdb_precedence.mmdb");
         std::fs::write(&mmdb_source_path, mmdb_source).unwrap();
         std::fs::write(&dat_path, dat).unwrap();
-        GeoIpManager::convert_dat_to_mmdb(&mmdb_source_path, &mmdb_path, None).unwrap();
+        crate::matcher::geoip_converter::convert_dat_to_mmdb(&mmdb_source_path, &mmdb_path, None)
+            .unwrap();
 
         let mut mgr = GeoIpManager::default();
         assert!(mgr.use_mmdb(&mmdb_path.to_string_lossy(), &GeoIpManager::default()));
@@ -1455,7 +1420,8 @@ mod tests {
         let source_path = dir.path().join("source.dat");
         let mmdb_path = dir.path().join("test.mmdb");
         std::fs::write(&source_path, source).unwrap();
-        GeoIpManager::convert_dat_to_mmdb(&source_path, &mmdb_path, None).unwrap();
+        crate::matcher::geoip_converter::convert_dat_to_mmdb(&source_path, &mmdb_path, None)
+            .unwrap();
 
         let mmdb = Mmdb::open(
             mmdb_path.to_str().unwrap(),
