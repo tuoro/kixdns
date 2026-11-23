@@ -283,6 +283,14 @@ pub(crate) fn upstream_problem(upstream: &str, default_transport: Transport) -> 
         .map(|error| format!("upstream \"{upstream}\" is not usable: {error:#}"))
 }
 
+/// 连上 `upstream` 之前要解析的主机名，没写前缀的按 `default_transport` 连（见 `transport::host_name`）
+/// The host name to resolve before connecting to `upstream`, one without a prefix connected to
+/// by `default_transport` (see `transport::host_name`)
+pub(crate) fn host_name(upstream: &str, default_transport: Transport) -> Option<String> {
+    let (address, transport) = parse_upstream_addr(upstream, default_transport);
+    crate::engine::transport::host_name(address, transport)
+}
+
 /// 一份配置里的上游在各连接池里的键，按传输分开；DoH 自己清理不用的上游，不在这里
 /// The pool keys of a configuration's upstreams, by transport; DoH prunes the upstreams it
 /// stops using on its own, so it is not here

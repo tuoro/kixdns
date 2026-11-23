@@ -177,21 +177,23 @@ fn answer_of(query: &Message, address: Ipv4Addr, ttl: u32) -> Replies {
 /// A local bootstrap server: whatever the name asked, A gets 127.0.0.1 and AAAA ::1, both of
 /// TTL `ttl`
 pub(crate) async fn loopback_bootstrap(ttl: u32) -> Upstream {
-    upstream(move |query| {
-        let Some(question) = query.queries.first() else {
-            return Vec::new();
-        };
-        let address = match question.query_type() {
-            RecordType::A => RData::A(A(Ipv4Addr::LOCALHOST)),
-            RecordType::AAAA => RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
-            _ => return Vec::new(),
-        };
-        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-        reply.add_query(question.clone());
-        reply.add_answer(Record::from_rdata(question.name().clone(), ttl, address));
-        vec![(Duration::ZERO, reply.to_vec().unwrap())]
-    })
-    .await
+    upstream(move |query| loopback_addresses(query, ttl)).await
+}
+
+/// [`loopback_bootstrap`] 对 `query` 的应答 / What [`loopback_bootstrap`] answers `query` with
+pub(super) fn loopback_addresses(query: &Message, ttl: u32) -> Replies {
+    let Some(question) = query.queries.first() else {
+        return Vec::new();
+    };
+    let address = match question.query_type() {
+        RecordType::A => RData::A(A(Ipv4Addr::LOCALHOST)),
+        RecordType::AAAA => RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
+        _ => return Vec::new(),
+    };
+    let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+    reply.add_query(question.clone());
+    reply.add_answer(Record::from_rdata(question.name().clone(), ttl, address));
+    vec![(Duration::ZERO, reply.to_vec().unwrap())]
 }
 
 /// UDP 和 TCP 占同一个端口的本机上游：收下查询、接下连接，从不回答
