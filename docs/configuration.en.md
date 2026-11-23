@@ -130,7 +130,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 | response_answer_ip_geoip_private | expect: boolean |
 | response_request_domain_geo_site | value: GeoSite tag |
 | response_request_domain_geo_site_not | value: GeoSite tag |
-| response_txt_content | mode: exact, prefix, or regex; value is the text/pattern, a regex at most 1000 bytes |
+| response_txt_content | mode: exact, prefix, or regex; value is the text/pattern, a regex at most 1000 bytes. Each TXT record in the answer is compared on its own, and one matching is enough; a record's strings are joined without spaces before comparing (as RFC 7208 reads an SPF record), and an answer without a TXT record does not match |
 
 Response address matching uses these scopes:
 
