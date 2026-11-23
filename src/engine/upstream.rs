@@ -1610,6 +1610,8 @@ mod tests {
         let runtime = RuntimePipelineConfig {
             settings,
             pipeline_select: Vec::new(),
+            select_needs_geosite: false,
+            select_needs_geoip: false,
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
             warnings: Vec::new(),
@@ -1635,6 +1637,8 @@ mod tests {
             RuntimePipelineConfig {
                 settings,
                 pipeline_select: Vec::new(),
+                select_needs_geosite: false,
+                select_needs_geoip: false,
                 pipelines: Vec::new(),
                 pipeline_id_index: FxHashMap::default(),
                 warnings: Vec::new(),
@@ -2076,6 +2080,8 @@ mod tests {
                 RuntimePipelineConfig {
                     settings,
                     pipeline_select: Vec::new(),
+                    select_needs_geosite: false,
+                    select_needs_geoip: false,
                     pipelines: Vec::new(),
                     pipeline_id_index: FxHashMap::default(),
                     warnings: Vec::new(),

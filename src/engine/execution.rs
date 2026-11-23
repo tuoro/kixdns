@@ -30,7 +30,7 @@ use crate::proto_utils::parse_quick;
 use super::concurrency::PermitGuard;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
 use super::response::{StaticAddresses, build_fast_static_response, write_static_reply};
-use super::response_log::{ResponseInfo, ResponseLog};
+use super::response_log::{ResponseInfo, ResponseLog, Source};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse};
 use super::utils::{InflightCleanupGuard, engine_helpers};
@@ -957,10 +957,8 @@ impl Engine {
             }
             let resp = built?;
             let mut log = response_log();
-            if log.is_enabled() {
-                log.info.upstream = Some(Arc::from("static"));
-                log.answered(&resp);
-            }
+            log.info.upstream = Some(Source::Static);
+            log.answered(&resp);
             anyhow::Ok(Some(FastPathResponse::Direct(resp)))
         };
         let answer_static = |rcode, answers: &Vec<hickory_proto::rr::Record>, answer| {
@@ -1591,7 +1589,7 @@ impl Engine {
                     // SERVFAIL 只属于它：等在持有条目上的请求可能还有余量，所以放掉
                     // 条目，不把它交出去；也不缓存给直接进入这个 pipeline 的请求。
                     drop(route.held_inflight.take());
-                    info.upstream = Some(Arc::from("static"));
+                    info.upstream = Some(Source::Static);
                     return request.servfail("parse request");
                 }
                 route.jumps_left -= 1;
@@ -1639,7 +1637,7 @@ impl Engine {
             match decision {
                 Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
                 Decision::Static { rcode, answers } => {
-                    info.upstream = Some(Arc::from("static"));
+                    info.upstream = Some(Source::Static);
                     // On a refresh, a SERVFAIL here (a jump target that does not
                     // exist, or a static SERVFAIL the rules configure) is no answer:
                     // the refresh ends as a failure before anything is cached over
@@ -4708,6 +4706,8 @@ mod tests {
         RuntimePipelineConfig {
             settings,
             pipeline_select: Vec::new(),
+            select_needs_geosite: false,
+            select_needs_geoip: false,
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
             warnings: Vec::new(),
