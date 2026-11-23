@@ -1845,7 +1845,7 @@ pub async fn serve_admin(
     let listener = UnixListener::bind(&path).context("绑定管理 Socket 失败")?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
         .context("设置管理 Socket 权限失败")?;
-    tracing::info!(target = "panel", path = %path.display(), "panel control socket started");
+    tracing::info!(path = %path.display(), "panel control socket started");
 
     loop {
         let stream = match listener.accept().await {
@@ -1853,7 +1853,7 @@ pub async fn serve_admin(
             Err(err) => {
                 // Never end the loop on an accept error (see accept_retry_delay)
                 // 接受出错不退出循环（见 accept_retry_delay）
-                tracing::warn!(target = "panel", error = %err, "control socket accept failed, retrying");
+                tracing::warn!(error = %err, "control socket accept failed, retrying");
                 tokio::time::sleep(crate::socket_utils::accept_retry_delay(&err)).await;
                 continue;
             }
@@ -1875,7 +1875,7 @@ pub async fn serve_admin(
                 )
                 .await
             {
-                tracing::debug!(target = "panel", error = %error, "panel connection closed");
+                tracing::debug!(error = %error, "panel connection closed");
             }
         });
     }
