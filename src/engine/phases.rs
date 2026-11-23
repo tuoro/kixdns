@@ -27,17 +27,13 @@ use tracing::debug;
 
 /// Result of the Forward phase
 pub enum ForwardResult {
-    /// Request completed with a response (bytes)
+    /// 请求的应答，上游失败以后改用的（过期条目、SERVFAIL、miss 动作给出的）也是。后台刷新的上游一失败刷新就结束了（见
+    /// `Forwarding::settle`），拿到的总是上游的应答或者规则据它给出的
+    /// The request's answer, what it answers instead after an upstream failure (a stale entry,
+    /// SERVFAIL, what the miss actions produced) included. A background refresh ends as soon
+    /// as its upstream fails (see `Forwarding::settle`), and always gets an upstream's answer
+    /// or what the rules give by it
     Success(Bytes),
-    /// The upstream failed, and this is what the request answers instead: a stale
-    /// entry, SERVFAIL, or what the miss actions produced. For a client it is an
-    /// answer like any other. For a background refresh it is no new answer from
-    /// the route the entry came by, so the refresh does not drop that entry for it
-    /// (see the Success arm in `Engine::decide`).
-    /// 上游失败，这是请求改用的应答：过期条目、SERVFAIL，或 on_miss 动作给出的结果。对客户端
-    /// 来说它和别的应答一样。对后台刷新来说，它不是条目来路上的新应答，刷新不会因为它删掉
-    /// 那个条目（见 `Engine::decide` 里的 Success 分支）。
-    Fallback(Bytes),
     /// Request needs to continue (e.g. Action::Continue)
     /// Boxed to reduce enum size (ResponseContext is ~256 bytes)
     /// `fallback`：这是 miss 动作在上游失败以后做的 continue，手里没有上游的应答（见 `Route::on_an_answer`）
@@ -1099,10 +1095,8 @@ impl<'a> Forwarding<'a> {
             cx.response_actions_on_miss
         };
         if actions.is_empty() {
-            match ttl_to_cache(self.engine, ttl, cx.min_ttl) {
-                0 => self.drop_renewed(),
-                ttl => self.cache(&raw, rcode, Some(upstream), ttl),
-            }
+            let ttl = ttl_to_cache(self.engine, ttl, cx.min_ttl);
+            self.cache(&raw, rcode, Some(upstream), ttl);
             self.hand_over(&raw);
             return Ok(ForwardResult::Success(raw));
         }
@@ -1238,13 +1232,13 @@ impl<'a> Forwarding<'a> {
             }
         };
         self.hand_over(&answer);
-        Ok(ForwardResult::Fallback(answer))
+        Ok(ForwardResult::Success(answer))
     }
 
-    /// 执行 `actions`：带着上游的应答 `ctx`，或者上游失败以后（`fallback`）不带，那时给出的结果算回落（刷新到不了那里，
+    /// 执行 `actions`：带着上游的应答 `ctx`，或者上游失败以后（`fallback`）不带，那时给出的结果是兜底（刷新到不了那里，
     /// 见 [`Self::settle`]）
     /// Run `actions`: with the upstream's answer `ctx`, or without one after an upstream failure
-    /// (`fallback`), when what they give counts as a fallback (a refresh never gets there, see
+    /// (`fallback`), when what they give is a fallback (a refresh never gets there, see
     /// [`Self::settle`])
     async fn act(
         mut self,
@@ -1254,13 +1248,6 @@ impl<'a> Forwarding<'a> {
         fallback: bool,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
-        let finished = |bytes| {
-            if fallback {
-                ForwardResult::Fallback(bytes)
-            } else {
-                ForwardResult::Success(bytes)
-            }
-        };
         let background_refresh = self.cx.refresh.is_some();
         let cx = &mut self.cx;
         let ctx = rules::ApplyResponseActionsContext {
@@ -1297,37 +1284,19 @@ impl<'a> Forwarding<'a> {
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(background_refresh, &ctx.raw)?;
-                match ttl_to_cache(self.engine, extract_ttl(&ctx.msg), self.cx.min_ttl) {
-                    0 => self.drop_renewed(),
-                    ttl => self.cache(
-                        &ctx.raw,
-                        ctx.msg.metadata.response_code,
-                        Some(ctx.upstream.clone()),
-                        ttl,
-                    ),
-                }
+                self.cache(
+                    &ctx.raw,
+                    ctx.msg.metadata.response_code,
+                    Some(ctx.upstream.clone()),
+                    ttl_to_cache(self.engine, extract_ttl(&ctx.msg), self.cx.min_ttl),
+                );
                 self.hand_over(&ctx.raw);
                 response.upstream = Some(Source::Upstream(ctx.upstream));
-                Ok(finished(ctx.raw))
+                Ok(ForwardResult::Success(ctx.raw))
             }
             ResponseActionResult::Static {
                 bytes, rcode, ttl, ..
             } => {
-                // A SERVFAIL here mostly means the response actions found no answer
-                // either (a response-phase forward failed or ran past its limit, or the
-                // jump limit was reached); a static SERVFAIL the rules configure is taken
-                // the same way. A refresh ends as a failure rather than cache SERVFAIL
-                // over the entry it was refreshing: after an upstream failure, that
-                // failure.
-                // 这里的 SERVFAIL 多半说明响应动作也没拿到应答（响应阶段的转发失败或超过次数
-                // 上限，或到了跳转上限）；规则里配置的静态 SERVFAIL 也按这个处理。刷新以失败
-                // 结束，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条；上游失败以后，交回的
-                // 就是上游的失败。
-                if background_refresh && rcode == ResponseCode::ServFail {
-                    return Err(refresh_found_no_answer(
-                        "the response actions found no answer",
-                    ));
-                }
                 // 上游失败以后 miss 动作给的静态应答只是这一次请求的兜底，不是这个问题的应答，不缓存：缓存是所有
                 // 请求方共用的，写进去的话，上游恢复了它还要一直用到条目到期
                 // After an upstream failure a static answer of the miss actions is a fallback
@@ -1335,18 +1304,16 @@ impl<'a> Forwarding<'a> {
                 // cache is shared by every requester, and cached it would go on serving after
                 // the upstream recovered, until the entry expired
                 if !fallback {
-                    match static_ttl(self.engine, ttl, self.cx.min_ttl) {
-                        // An answer that is not cached cannot renew the entry, so the refresh
-                        // drops it and the next client request runs the rules.
-                        // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端请求自己
-                        // 执行规则。
-                        0 => self.drop_renewed(),
-                        ttl => self.cache(&bytes, rcode, None, ttl),
-                    }
+                    self.cache(
+                        &bytes,
+                        rcode,
+                        None,
+                        static_ttl(self.engine, ttl, self.cx.min_ttl),
+                    );
                 }
                 self.hand_over(&bytes);
                 response.upstream = Some(Source::Static);
-                Ok(finished(bytes))
+                Ok(ForwardResult::Success(bytes))
             }
             ResponseActionResult::Jump { pipeline } => {
                 // 跳过去以后的才是最终应答：条目留给请求，和 Continue 一样（见 `held_inflight`）
@@ -1381,9 +1348,14 @@ impl<'a> Forwarding<'a> {
         }
     }
 
-    /// 在这次转发的问题下写一条缓存，适用于 trail 接受的请求方
-    /// Cache an answer under this forward's question, for the requesters the trail admits
+    /// 在这次转发的问题下写一条缓存，留 `ttl` 秒，适用于 trail 接受的请求方；`ttl` 为 0 时不写（见 `ttl_to_cache`、
+    /// `static_ttl`）
+    /// Cache an answer under this forward's question for `ttl` seconds, for the requesters
+    /// the trail admits; with `ttl` 0 nothing is cached (see `ttl_to_cache`, `static_ttl`)
     fn cache(&self, bytes: &Bytes, rcode: ResponseCode, upstream: Option<Arc<str>>, ttl: u32) {
+        if ttl == 0 {
+            return;
+        }
         let cx = &self.cx;
         self.engine.insert_dns_cache_entry(
             cx.keys.slot,
@@ -1400,32 +1372,6 @@ impl<'a> Forwarding<'a> {
             )
             .with_reach(cx.trail.clone()),
         );
-    }
-
-    /// 刷新问到了上游，拿到一份完整的应答，只是它不进缓存（TTL 为 0、没有 SOA 的否定应答，或者不缓存的静态应答）：被刷新
-    /// 的那条不再留着，下一个客户端请求自己去问。留着的话它每次命中都被当过期应答交出去、再续上，上游明明答了别的也一直
-    /// 用它（RFC 8767 只在取不到新应答时才用过期的）。被截断的应答算刷新失败、签过名的应答只对那一次请求有效，这两种
-    /// 条目照旧留着，不走这里。不是刷新时什么都不做
-    /// A refresh reached the upstream and got a whole answer that stays out of the cache (a
-    /// TTL of 0, a negative answer with no SOA, or a static answer not cached): the entry it
-    /// renews is kept no longer, and the next client request asks for itself. Kept, it would go
-    /// out stale and be renewed on every hit, served on while the upstream says otherwise (RFC
-    /// 8767 serves stale only when no new answer can be had). A truncated answer is a failed
-    /// refresh and a signed one holds for that one request only: for those two the entry stays
-    /// as before, and they do not come here. Outside a refresh this does nothing
-    fn drop_renewed(&self) {
-        let cx = &self.cx;
-        if let Some(target) = cx.refresh {
-            let question = CachedQuestion {
-                qname: cx.qname,
-                pipeline_id: cx.key_pipeline_id,
-                qtype: u16::from(cx.qtype),
-                qclass: u16::from(cx.qclass),
-                flags: cx.keys.flags,
-            };
-            self.engine
-                .drop_refreshed(cx.keys.slot, &question, &cx.requester.ecs_view(), target);
-        }
     }
 
     /// 把最终应答交给等在这次转发登记的条目上的请求 / Hand the final answer to the requests
@@ -1445,13 +1391,6 @@ impl<'a> Forwarding<'a> {
             *self.cx.held_inflight = Some(guard);
         }
     }
-}
-
-/// The error a background refresh ends with when its rules found no answer: the
-/// refresh counts as failed and the cached entry stays.
-/// 后台刷新的规则没找到应答时以这个错误结束：算作刷新失败，缓存条目保留。
-pub(crate) fn refresh_found_no_answer(reason: &'static str) -> anyhow::Error {
-    UpstreamFailure::error(anyhow::anyhow!(reason))
 }
 
 /// The reply as it goes to the client, with the ECS option RFC 7871 section 7.2.2
@@ -1535,11 +1474,6 @@ pub(crate) fn for_waiters(
     }
 }
 
-/// Whether a response carries SERVFAIL / 响应是否为 SERVFAIL
-pub(crate) fn is_servfail(bytes: &[u8]) -> bool {
-    proto_utils::parse_response_quick(bytes).is_some_and(|qr| qr.rcode == ResponseCode::ServFail)
-}
-
 #[cfg(test)]
 mod refresh_response_rule_tests {
     use crate::cache::CacheEntry;
@@ -1567,14 +1501,17 @@ mod refresh_response_rule_tests {
     const FINAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
     const STATIC: &str = "192.0.2.5";
 
-    /// 本机 UDP 上游：每个查询都回一条 A 记录，应答带 TC 位
-    /// Local UDP upstream that answers every query with one A record, truncated (TC set)
-    async fn spawn_upstream_truncating(ip: Ipv4Addr) -> String {
+    /// 本机 UDP 上游：每个查询都回带 TC 位的应答，给了 `ip` 时带一条 A 记录，不给时回答段是空的（真实的递归服务器
+    /// 常这样回）。TCP 上没有它
+    /// Local UDP upstream that answers every query truncated (TC set), with one A record for
+    /// `ip` given, or with an empty answer section (as real resolvers often send) without it.
+    /// It has no TCP
+    async fn spawn_upstream_truncating(ip: Option<Ipv4Addr>) -> String {
         spawn_upstream_replying(move |query, question| {
             let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
             resp.metadata.truncation = true;
             resp.add_query(question.clone());
-            resp.add_answer(a_record(question, ip));
+            resp.answers.extend(ip.map(|ip| a_record(question, ip)));
             resp
         })
         .await
@@ -2097,6 +2034,24 @@ mod refresh_response_rule_tests {
         };
         engine.cache_insert(key, Arc::new(newer));
         assert_eq!(refresh_as(&engine, key, target).await, Some(vec![OLD]));
+    }
+
+    /// 规则现在直接给出静态应答（比如数据重载以后匹配上了另一条规则）：它不缓存，条目已经和规则对不上，刷新照样算成功、
+    /// 把条目删掉，下一个客户端请求直接拿到规则的应答。以前只有越过一个应答以后才删，直接给出的静态应答让条目一直留着，
+    /// 过期以后每次命中都交出旧应答再续上
+    /// The rules now give a static answer outright (another rule matching after a data
+    /// reload, say): it is not cached and the entry no longer matches the rules, so the
+    /// refresh succeeds all the same and drops the entry, the next client request getting the
+    /// rules' answer at once. Only a refresh past an answer used to drop it, and a static answer
+    /// given outright left the entry in place, the old answer going out and renewed on every
+    /// hit once expired
+    #[tokio::test]
+    async fn a_refresh_drops_the_entry_when_the_rules_now_answer_statically() {
+        let (engine, key) = engine_with_a_cached_answer(
+            json!({}),
+            json!([{ "id": "main", "rules": [rule("static", answer_static(), json!({}))] }]),
+        );
+        assert_eq!(refresh_succeeds(&engine, key).await, (true, None));
     }
 
     #[tokio::test]
@@ -2644,10 +2599,10 @@ mod refresh_response_rule_tests {
     }
 
     /// 上游失败以后，on_miss 动作给出 SERVFAIL（直接给，或者跳到给 SERVFAIL 的 pipeline）：刷新
-    /// 报的是上游的失败，而不是「没找到应答」
+    /// 报的是上游的失败，而不是规则给了 SERVFAIL
     /// After the upstream failed, the miss actions answer SERVFAIL (themselves, or by a
     /// jump to a pipeline that does): the refresh reports the upstream's failure rather
-    /// than "found no answer"
+    /// than the rules answering SERVFAIL
     #[tokio::test]
     async fn a_refresh_whose_miss_actions_answer_servfail_reports_the_upstream_failure() {
         let servfail = json!([{ "type": "static_response", "rcode": "SERVFAIL" }]);
@@ -2669,7 +2624,10 @@ mod refresh_response_rule_tests {
                     .await
                     .unwrap_err()
             );
-            assert!(!error.contains("found no answer"), "{on_miss}: {error}");
+            assert!(
+                !error.contains("the rules answered SERVFAIL"),
+                "{on_miss}: {error}"
+            );
             assert_eq!(
                 engine.cached(key).map(|entry| a_records(&entry.bytes)),
                 Some(vec![OLD])
@@ -2725,20 +2683,40 @@ mod refresh_response_rule_tests {
         }
     }
 
-    /// Only a truncated answer comes back (TCP fallback is off): it is not cached, so
-    /// there is nothing to renew the entry with, and the refresh fails
-    /// 只拿到被截断的应答（关了 TCP 回退）：它不写缓存，没有拿来更新条目的应答，刷新算失败
+    /// 只拿到被截断的应答（TCP 也取不到完整的）：它不写缓存，没有拿来更新条目的应答，刷新算失败，条目原样留着。转发本身
+    /// 拿到的、回答检查以后响应动作的转发拿到的都一样；回答段是空的也一样，以前它没有 SOA，按 TTL 算不进缓存，条目先被
+    /// 当作不进缓存的完整应答删掉，刷新到出口才算失败
+    /// Only a truncated answer comes back (with TCP unable to fetch the whole one): it is not
+    /// cached, so there is nothing to renew the entry with, the refresh fails and the entry
+    /// stays as it is. So it is for what a forward itself gets and for what a response action's
+    /// forward gets after an answer check, and with an empty answer section too, which, with
+    /// no SOA and so no TTL to cache by, used to have the entry dropped first as for a whole
+    /// answer that is not cached, the refresh failing only at the exit
     #[tokio::test]
     async fn a_refresh_that_gets_only_a_truncated_answer_fails() {
-        let truncating = spawn_upstream_truncating(FINAL).await;
-        let (engine, key) = engine_with_a_cached_answer(
-            json!({ "enable_tcp_fallback": false }),
-            json!([{ "id": "main", "rules": [rule("all", forward(&truncating), json!({}))] }]),
-        );
-        assert_eq!(
-            refresh_succeeds(&engine, key).await,
-            (false, Some(vec![OLD]))
-        );
+        let answering = answering_upstream(PASSED_OVER, 300).await.address;
+        for records in [Some(FINAL), None] {
+            let truncating = spawn_upstream_truncating(records).await;
+            let rules = [
+                rule("all", forward(&truncating), json!({})),
+                rule(
+                    "all",
+                    forward(&answering),
+                    json!({ "response_actions_on_match": forward(&truncating) }),
+                ),
+            ];
+            for rule in rules {
+                let (engine, key) = engine_with_a_cached_answer(
+                    json!({}),
+                    json!([{ "id": "main", "rules": [rule.clone()] }]),
+                );
+                assert_eq!(
+                    refresh_succeeds(&engine, key).await,
+                    (false, Some(vec![OLD])),
+                    "{records:?} {rule}"
+                );
+            }
+        }
     }
 
     /// The same past a continue and a rule-level jump, or through a response jump:
@@ -2747,7 +2725,7 @@ mod refresh_response_rule_tests {
     /// 时一样保留
     #[tokio::test]
     async fn a_refresh_whose_jump_target_gets_only_a_truncated_answer_keeps_the_entry() {
-        let truncating = spawn_upstream_truncating(FINAL).await;
+        let truncating = spawn_upstream_truncating(Some(FINAL)).await;
         let target = rule("target", forward(&truncating), json!({}));
         let settings = json!({ "enable_tcp_fallback": false });
         let after_a_continue = refresh_with_actions_on_the_answer(
