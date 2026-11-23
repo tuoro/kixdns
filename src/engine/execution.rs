@@ -6995,6 +6995,38 @@ mod tests {
     ///
     /// 修复前：fast_static_match 会跳过不可预计算的规则，直接返回可预计算的规则结果
     /// 修复后：fast_static_match 在遇到第一个匹配但不可预计算的规则时放弃快速路径
+    /// 快速路径只求值到最后一条能当场作答的规则：再往后不论哪条命中都交给完整路径，在这里求值它们（正则、GeoIP）是白算；
+    /// 一条这样的规则都没有的 pipeline，快速路径什么都不求值
+    /// The fast path evaluates rules up to the last one it can answer on the spot: whichever
+    /// matches beyond it goes to the full path anyway, so evaluating them here (a regex, GeoIP)
+    /// is wasted; for a pipeline with no such rule the fast path evaluates nothing
+    #[test]
+    fn the_fast_path_stops_at_the_last_rule_it_can_answer() {
+        use crate::matcher::advanced_rule::compile_pipelines;
+        let rule = |name: &str, matcher: serde_json::Value, action: serde_json::Value| serde_json::json!({ "name": name, "matchers": [matcher], "actions": [action] });
+        let forward = serde_json::json!({ "type": "forward", "upstream": "223.5.5.5:53" });
+        let refuse = serde_json::json!({ "type": "deny" });
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [
+                { "id": "mixed", "rules": [
+                    rule("acme", serde_json::json!({ "type": "domain_regex", "value": "^_acme" }), forward.clone()),
+                    rule("block", serde_json::json!({ "type": "domain_suffix", "value": "ads.test" }), refuse),
+                    rule("regex", serde_json::json!({ "type": "domain_regex", "value": "^x" }), forward.clone()),
+                    rule("rest", serde_json::json!({ "type": "any" }), forward.clone()),
+                ] },
+                { "id": "forwards", "rules": [
+                    rule("rest", serde_json::json!({ "type": "any" }), forward),
+                ] },
+            ]
+        });
+        let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
+        let compiled =
+            compile_pipelines(&RuntimePipelineConfig::from_config(cfg).expect("runtime config"));
+        assert_eq!(compiled[0].last_precomputed, Some(1));
+        assert_eq!(compiled[1].last_precomputed, None);
+    }
+
     #[test]
     fn test_fast_static_match_preserves_rule_order() {
         use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match};

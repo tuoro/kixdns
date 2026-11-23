@@ -21,6 +21,13 @@ pub struct CompiledPipeline {
     pub id: Arc<str>,
     pub rules: Vec<CompiledRule>,
     pub index: RuleIndex,
+    /// 能当场作答的（见 `CompiledRule::precomputed`）最后一条规则的位置，一条都没有时为 None。快速路径求值候选规则到
+    /// 这里为止：再往后不论哪条命中都只能交给完整路径，在快速路径上求值它们（正则、GeoIP）是白算一遍
+    /// Where the last rule that can be answered on the spot (see `CompiledRule::precomputed`)
+    /// is, None when there is none. The fast path evaluates candidate rules up to here: whichever
+    /// matches beyond it goes to the full path anyway, and evaluating them on the fast path (a
+    /// regex, GeoIP) was work done twice
+    pub last_precomputed: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +204,7 @@ fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
 
     CompiledPipeline {
         id: p.id.clone(),
+        last_precomputed: rules.iter().rposition(|rule| rule.precomputed.is_some()),
         rules,
         index,
     }
@@ -272,8 +280,11 @@ pub(crate) fn fast_static_match_with_rule<'a>(
     edns_present: bool,
     geoip: Option<&Arc<RwLock<GeoIpManager>>>,
 ) -> Option<(&'a PrecomputedAction, &'a str)> {
+    let last = pipeline.last_precomputed?;
     let candidates = pipeline.index.get_candidates(qname, qtype);
-    for idx in candidates {
+    // 候选按规则顺序排好（见 `RuleIndex::get_candidates_into`）/ Candidates come in rule order (see
+    // `RuleIndex::get_candidates_into`)
+    for idx in candidates.into_iter().take_while(|&idx| idx <= last) {
         let rule = pipeline.rules.get(idx)?;
         // GeoSite matching can scan a whole tag for a name it has not seen, and
         // the fast path runs before a request is admitted, so a rule that needs
