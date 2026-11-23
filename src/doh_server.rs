@@ -475,16 +475,19 @@ async fn handle_doh_request(
         let Some(refused) = crate::proto_utils::header_reply(&dns_wire) else {
             return Ok(error_response(StatusCode::BAD_REQUEST));
         };
-        return Ok(dns_message_response(refused));
+        return Ok(dns_message_response(&dns_wire, refused));
     }
 
     // ✅ 复用 Engine 公共入口 — 与 TCP/UDP 入站完全一致
     let resp = process_dns_wire(&dns_wire, peer, engine).await;
-    Ok(dns_message_response(resp))
+    Ok(dns_message_response(&dns_wire, resp))
 }
 
-/// 装着 DNS 应答的 200 响应 / A 200 response carrying a DNS answer
-fn dns_message_response(answer: Bytes) -> Response<Full<Bytes>> {
+/// 装着 `query` 的 DNS 应答的 200 响应；查询带了填充时应答也填充（见 `reply_padded_as_asked`）
+/// A 200 response carrying the DNS answer to `query`, padded when the query was (see
+/// `reply_padded_as_asked`)
+fn dns_message_response(query: &[u8], answer: Bytes) -> Response<Full<Bytes>> {
+    let answer = crate::proto_utils::reply_padded_as_asked(answer, query);
     let mut response = Response::new(Full::new(answer));
     let headers = response.headers_mut();
     headers.insert(
