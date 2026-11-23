@@ -408,6 +408,29 @@ async fn ask_together(client: &DohClient, url: &str, ids: std::ops::Range<u16>) 
     }
 }
 
+/// 发起建连的请求在握手做完前被取消了（竞速时别的上游先答完），连接照样建完，下一个请求直接用上，不另建
+/// The request that started the connect is cancelled before the handshake is through (another
+/// upstream answering first in a race); the connection is made all the same and the next
+/// request uses it, making no other
+#[tokio::test]
+async fn a_handshake_outlives_the_request_that_started_it() {
+    let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
+    let client = upstream.client(3);
+    let (front, accepted) =
+        super::test_support::slow_front(upstream.addr, Duration::from_millis(300)).await;
+    let url = format!("https://{front}/dns-query");
+    let raced = tokio::time::timeout(Duration::from_millis(100), ask(&client, &url, 1)).await;
+    assert!(raced.is_err(), "cancelled while the handshake goes on");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let answer = client
+        .send(&query(2), &url, Duration::from_millis(150))
+        .await
+        .expect("the connection made meanwhile answers at once");
+    assert_eq!(answer[..2], 2u16.to_be_bytes());
+    assert!(client.has_direct_connection(&url), "asked over HTTP/2");
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "one connection made");
+}
+
 /// 平常只用一条连接：一个接一个的查询，和一阵子同时到、但没多到让连接忙起来的查询，都在第一条连接上。
 /// 别的位不去连，也就不会隔太久没用、每次都要重新握手
 /// Normally one connection is used: queries one after another, and a burst of them at once
