@@ -737,9 +737,7 @@ impl Engine {
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         // GeoSiteManager uses FxHashMap protected by RwLock, no additional locks needed
         // GeoSiteManager 使用 FxHashMap + RwLock 保护，无需额外锁
-        // Use unchecked conversion for performance (qname_bytes is validated UTF-8)
-        // 使用未检查转换以提高性能（qname_bytes 是已验证的 UTF-8）
-        let qname_str = q.qname_str_unchecked();
+        let qname_str = q.qname;
         let pipeline_opt = select_pipeline(
             cfg,
             &PipelineSelectionContext {
@@ -803,7 +801,7 @@ impl Engine {
         let slot = Self::cache_slot(
             cache_namespace,
             pipeline_id,
-            q.qname_bytes,
+            q.qname.as_bytes(),
             qtype,
             qclass,
             q.flags,
@@ -856,7 +854,7 @@ impl Engine {
                         min_ttl = cfg.settings.cache_refresh_min_ttl,
                         should_trigger = due,
                         upstream = ?hit.upstream,
-                        qname = %q.qname_str_unchecked(),  // Use unchecked for performance / 使用未检查版本以提高性能
+                        qname = %q.qname,  // Use unchecked for performance / 使用未检查版本以提高性能
                         "cache background refresh check"
                     );
 
@@ -1327,14 +1325,8 @@ impl Engine {
 
                 let (qname_text, qtype, qclass, tx_id, edns_present, client_ecs) =
                     if let Some(q) = q {
-                        // Use unchecked conversion to avoid double allocation / 使用未检查转换避免双重分配
-                        // SAFETY: qname_bytes is validated ASCII from parse_quick()
-                        // ASCII is always valid UTF-8, so this is safe
-                        // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
-                        // ASCII 始终是有效的 UTF-8，所以这是安全的
-                        let qname_str = unsafe { std::str::from_utf8_unchecked(q.qname_bytes) };
                         (
-                            Arc::<str>::from(qname_str),
+                            Arc::<str>::from(q.qname),
                             hickory_proto::rr::RecordType::from(q.qtype),
                             DNSClass::from(q.qclass),
                             q.tx_id,
@@ -5472,7 +5464,7 @@ mod tests {
         let Some(q) = parse_quick(packet, &mut buffer) else {
             return 0;
         };
-        let text = q.qname_str_unchecked();
+        let text = q.qname;
         let qtype = RecordType::from(q.qtype);
         let subnet = q.client_subnet.as_ref();
         let mut compared = 0;
