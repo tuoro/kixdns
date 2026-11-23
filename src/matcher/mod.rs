@@ -573,9 +573,19 @@ impl RuleReads {
                     RuntimeResponseMatcher::ResponseEdnsPresent { .. }
                 )
             });
-            // Response actions forward without ECS of their own, so only the rule's
-            // own forward sends any / 响应动作转发时不加自己的 ECS，只有规则自己的转发会发送
-            for action in &rule.actions {
+            // 规则自己的转发和回答动作里的转发都可能按客户端地址发 ECS：回答动作里的照它自己写的 `ecs` 发。以前只看规则
+            // 自己的，两台不同网段的客户端同时问，后来的那台合并进先来的那台的条目，拿到按先来的那台网段取回的应答
+            // The rule's own forward and the forwards among its answer actions may each send ECS by
+            // the client's address, those among the answer actions by the `ecs` they write. Only
+            // the rule's own used to count, so of two clients in different networks asking at once
+            // the later merged into the earlier's entry and got the answer fetched for the
+            // earlier's network
+            for action in rule
+                .actions
+                .iter()
+                .chain(&rule.response_actions_on_match)
+                .chain(&rule.response_actions_on_miss)
+            {
                 if let Action::Forward {
                     ecs:
                         Some(config::EcsMode::FromClientIp {
