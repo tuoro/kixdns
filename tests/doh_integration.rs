@@ -437,12 +437,14 @@ async fn test_doh_wrong_path_returns_404() {
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
+/// 路径对、方法不对回 405，Allow 写着 GET 和 POST（RFC 9110 第 15.5.6 节）；以前回 404，和路径不对一样
+/// The right path with the wrong method gets 405, Allow naming GET and POST (RFC 9110 section
+/// 15.5.6); it used to get 404, as a wrong path does
 #[tokio::test]
-async fn test_doh_wrong_method_returns_404() {
+async fn test_doh_wrong_method_returns_405_with_allow() {
     let server = start_doh(make_nxdomain_engine()).await;
     let client = make_https_client();
 
-    // PUT should not be supported
     let resp = client
         .put(doh_url(server.port))
         .body(vec![0u8; 12])
@@ -450,7 +452,44 @@ async fn test_doh_wrong_method_returns_404() {
         .await
         .expect("PUT request");
 
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        resp.headers().get("allow").expect("Allow header"),
+        "GET, POST"
+    );
+}
+
+/// POST 的正文不是 application/dns-message（RFC 8484 第 4.1 节）回 415，不当 DNS 报文读；媒体类型不分大小写，参数不看。
+/// 以前不看 Content-Type，什么正文都当查询
+/// A POST whose body is not application/dns-message (RFC 8484 section 4.1) gets 415 and is
+/// not read as a DNS message; the media type goes by no case and no parameters. Content-Type
+/// used to go unlooked at, any body taken as a query
+#[tokio::test]
+async fn test_doh_post_of_another_media_type_returns_415() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let client = make_https_client();
+    let query = make_dns_query("test.example.com", 0x0001);
+
+    for content_type in [None, Some("application/octet-stream"), Some("text/plain")] {
+        let mut request = client.post(doh_url(server.port)).body(query.clone());
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let resp = request.send().await.expect("POST request");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{content_type:?}"
+        );
+    }
+    let resp = client
+        .post(doh_url(server.port))
+        .header("content-type", "Application/DNS-Message; charset=binary")
+        .body(query)
+        .send()
+        .await
+        .expect("POST request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]
