@@ -447,28 +447,6 @@ impl Engine {
                 if request.observed.is_some() {
                     matched_rules.push(rule.name.clone());
                 }
-                // Check for multiple Forward actions using pre-computed merge result.
-                // The merge was computed at config load time (Rule::compute_merged_forward),
-                // eliminating per-request FxHashSet + format! + join overhead.
-                // 使用配置加载时预计算的合并结果检查多 Forward action。
-                // 合并在配置加载时计算（Rule::compute_merged_forward），
-                // 消除每请求的 FxHashSet + format! + join 开销。
-                if let Some(merged) = &rule.merged_forward {
-                    let d = Decision::Forward {
-                        upstream: merged.upstream_str.clone(),
-                        pre_split_upstreams: Some(merged.upstream_list.clone()),
-                        response_phase: rule.response_phase.clone(),
-                        rule_name: rule.name.clone(),
-                        rule_index: Some(idx),
-                        transport: None, // Each upstream decides its own transport / 每个 upstream 自行决定 transport
-                        ecs: merged.ecs.clone(),
-                        allow_reuse: false,
-                    };
-                    return Some(d);
-                }
-
-                // Single Forward or other actions: use original logic
-                // 单个 Forward 或其他 action：按原逻辑处理
                 for action in &rule.actions {
                     match action {
                         Action::StaticResponse { rcode } => {
@@ -528,22 +506,45 @@ impl Engine {
                             pre_split_upstreams,
                             upstream_shared,
                         } => {
-                            let upstream_addr: Arc<str> = match (upstream_shared, upstream) {
-                                (Some(shared), _) => Arc::clone(shared),
-                                (None, Some(upstream)) => Arc::from(upstream.as_str()),
-                                (None, None) => state.pipeline.settings.default_upstream_arc(),
-                            };
-                            let d = Decision::Forward {
-                                upstream: upstream_addr,
-                                pre_split_upstreams: pre_split_upstreams.clone(),
+                            // 规则写了几个 forward 时，轮到头一个就照配置加载时合并好的一起问（见
+                            // `Rule::compute_merged_forward`），每个上游自己定传输；写在前面的 log 和只有一个 forward
+                            // 时一样已经执行过。以前合并的转发在执行动作之前就给出，这样的规则 log 从不执行
+                            // With several forwards written, the first one's turn asks them all as merged
+                            // at config load (see `Rule::compute_merged_forward`), each upstream deciding
+                            // its own transport; a log written before has run, as with a single forward.
+                            // The merged forward used to be given before any action ran, and the log of
+                            // such a rule never did
+                            let (upstream, pre_split_upstreams, transport, ecs) =
+                                match &rule.merged_forward {
+                                    Some(merged) => (
+                                        merged.upstream_str.clone(),
+                                        Some(merged.upstream_list.clone()),
+                                        None,
+                                        merged.ecs.clone(),
+                                    ),
+                                    None => (
+                                        match (upstream_shared, upstream) {
+                                            (Some(shared), _) => Arc::clone(shared),
+                                            (None, Some(upstream)) => Arc::from(upstream.as_str()),
+                                            (None, None) => {
+                                                state.pipeline.settings.default_upstream_arc()
+                                            }
+                                        },
+                                        pre_split_upstreams.clone(),
+                                        Some(transport.unwrap_or(Transport::Udp)),
+                                        ecs.clone(),
+                                    ),
+                                };
+                            return Some(Decision::Forward {
+                                upstream,
+                                pre_split_upstreams,
                                 response_phase: rule.response_phase.clone(),
                                 rule_name: rule.name.clone(),
                                 rule_index: Some(idx),
-                                transport: Some(transport.unwrap_or(Transport::Udp)),
-                                ecs: ecs.clone(),
+                                transport,
+                                ecs,
                                 allow_reuse: false,
-                            };
-                            return Some(d);
+                            });
                         }
                         Action::Log { level } => {
                             super::matcher_adapter::log_match(
