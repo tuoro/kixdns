@@ -121,10 +121,6 @@ pub struct GlobalSettings {
     /// DoQ 上游连接池大小。 / DoQ upstream connection pool size
     #[serde(default = "default_doq_pool_size")]
     pub doq_pool_size: usize,
-    /// TCP 健康检查错误阈值（连续失败多少次后重置连接） / TCP health check error threshold (reset connection after N consecutive failures)
-    /// 默认 3 次，0 表示禁用健康检查 / Default 3, 0 means disable health check
-    #[serde(default = "default_tcp_health_check_error_threshold")]
-    pub tcp_health_check_error_threshold: usize,
     /// TCP 连接最大存活时间（秒，超过强制重置） / TCP connection max age (seconds, force reset after this time)
     /// 0 表示禁用连接老化检查 / 0 means disable connection aging check
     #[serde(default = "default_tcp_connection_max_age_seconds")]
@@ -238,7 +234,6 @@ impl Default for GlobalSettings {
             doh_health_check_error_threshold: default_doh_health_check_error_threshold(),
             dot_pool_size: default_dot_pool_size(),
             doq_pool_size: default_doq_pool_size(),
-            tcp_health_check_error_threshold: default_tcp_health_check_error_threshold(),
             tcp_connection_max_age_seconds: default_tcp_connection_max_age_seconds(),
             tcp_connection_idle_timeout_seconds: default_tcp_connection_idle_timeout_seconds(),
             doq_connection_idle_timeout_seconds: default_doq_idle_timeout_seconds(),
@@ -836,7 +831,6 @@ impl GlobalSettings {
                 doh_health_check_error_threshold,
                 dot_pool_size,
                 doq_pool_size,
-                tcp_health_check_error_threshold,
                 tcp_connection_max_age_seconds,
                 tcp_connection_idle_timeout_seconds,
                 doq_connection_idle_timeout_seconds,
@@ -1099,10 +1093,6 @@ fn default_dot_pool_size() -> usize {
 
 fn default_doq_pool_size() -> usize {
     16
-}
-
-fn default_tcp_health_check_error_threshold() -> usize {
-    3 // 连续 3 次失败后重置连接 / Reset connection after 3 consecutive failures
 }
 
 fn default_tcp_connection_max_age_seconds() -> u64 {
@@ -1427,19 +1417,22 @@ pub fn warn_ignored_settings(cfg: &PipelineConfig) {
 }
 
 /// 以前有、后来删掉的设置：老配置里留着的照样能读，启动和重载时各记一条 warn（见 [`warn_ignored_settings`]），不算
-/// [`problems`]，升级以后不必先改配置。智能流控的五个数字在流控改为自己判断以后不再用；`prefetch` 随它的实现撤掉了
+/// [`problems`]，升级以后不必先改配置。智能流控的五个数字在流控改为自己判断以后不再用；`prefetch` 随它的实现撤掉了；
+/// `tcp_health_check_error_threshold` 从来数不到：TCP/DoT 连接一出错就重建，不按次数
 /// Settings there used to be and were taken out: an older configuration still writing them
 /// reads as before, each getting a warn at startup and on reload (see
 /// [`warn_ignored_settings`]) and none counting among [`problems`], so an upgrade needs no
 /// change first. The five numbers of flow control went out of use once it judged by itself;
-/// `prefetch` went with its implementation
-const RETIRED_SETTINGS: [&str; 6] = [
+/// `prefetch` went with its implementation; `tcp_health_check_error_threshold` was never
+/// counted up to, a TCP/DoT connection being rebuilt on its first failure, not by count
+const RETIRED_SETTINGS: [&str; 7] = [
     "flow_control_initial_permits",
     "flow_control_min_permits",
     "flow_control_max_permits",
     "flow_control_latency_threshold_ms",
     "flow_control_adjustment_interval_secs",
     "prefetch",
+    "tcp_health_check_error_threshold",
 ];
 
 /// `key` 是不是一个退役的设置（见 [`RETIRED_SETTINGS`]）/ Whether `key` is a retired setting (see [`RETIRED_SETTINGS`])
@@ -1948,7 +1941,8 @@ mod validation_tests {
                 "default_upstream": "1.1.1.1:53",
                 "min_tll": 30,
                 "flow_control_max_permits": 500,
-                "prefetch": { "prefetch_enabled": true }
+                "prefetch": { "prefetch_enabled": true },
+                "tcp_health_check_error_threshold": 3
             },
             "pipeline_select": [{ "pipeline": "main", "matcher": [] }],
             "pipelines": [{ "id": "main", "rules": [
@@ -2335,10 +2329,6 @@ mod validation_tests {
             );
             assert_eq!(settings.dot_pool_size, 64, "dot_pool_size");
             assert_eq!(settings.doq_pool_size, 16, "doq_pool_size");
-            assert_eq!(
-                settings.tcp_health_check_error_threshold, 3,
-                "tcp_health_check_error_threshold"
-            );
             assert_eq!(
                 settings.tcp_connection_max_age_seconds, 300,
                 "tcp_connection_max_age_seconds"
