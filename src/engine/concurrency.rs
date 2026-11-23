@@ -426,12 +426,8 @@ pub struct FlowControlState {
     pub known_before: Duration,
     pub memory: super::memory_watermark::MemoryWatermark,
     started: Instant,
-    /// 每一份设备从哪一秒起一直在用（见 [`extend_spell`]，秒从 `started` 算起）：前 `DEVICE_SLOTS` 份按第一个哈希，后面的按第二个，
-    /// 两份都早才算老设备（见 [`Self::known`]）
-    /// Since which second each slot of devices has been in use (see [`extend_spell`], seconds since
-    /// `started`): the first `DEVICE_SLOTS` by the first hash, the rest by the second, and it takes
-    /// both being early to count as known (see [`Self::known`])
-    seen: Box<[AtomicU64]>,
+    /// 在用的设备，秒从 `started` 算起 / The devices in use, in seconds since `started`
+    in_use: InUse,
     /// 这一阵内存不够从哪一秒开始（见 [`extend_spell`]）/ Since which second memory has been short this spell
     /// (see [`extend_spell`])
     pressed: AtomicU64,
@@ -449,7 +445,7 @@ impl FlowControlState {
             known_before: KNOWN_BEFORE,
             memory,
             started: Instant::now(),
-            seen: zeroed_u64_slots(),
+            in_use: InUse::new(),
             pressed: AtomicU64::new(0),
             behind_until_ns: AtomicU64::new(0),
             waiting_to_run: Arc::new(WaitingToRun::default()),
@@ -498,7 +494,8 @@ impl FlowControlState {
     /// `MemoryWatermark::tight_budget`，没了就是 0），到了这个数：
     /// - 手上有在途的设备，占着自己那一份就不接，发得少的照常——一台或者很多台设备把内存占满时先拦住它们；
     /// - 手上一个没有的设备，内存不够以前 [`Self::known_before`] 就在用的照常，之后才冒出来的不接。伪造来源的洪泛每个来源都是
-    ///   新的，每个只占一个也能把内存占满；以前没了时谁都拒，原来就在用的设备也跟着被拒
+    ///   新的，每个只占一个也能把内存占满；以前没了时谁都拒，原来就在用的设备也跟着被拒。这样照常的设备有数（见 [`InUse`]），
+    ///   内存没了时各再放一个，多出来的在途也有数
     ///
     /// Whether memory refuses one more for `device`. When tight, what is in flight is held to as
     /// many as when memory got tight, the fewer the nearer the floor (see
@@ -508,22 +505,22 @@ impl FlowControlState {
     /// - a device holding none goes on if it was in use [`Self::known_before`] before memory ran
     ///   short, and one turning up later is refused. In a flood from spoofed sources each source is
     ///   new and holding just one each still fills the memory; with none left everyone used to be
-    ///   refused, the devices in use all along with them
+    ///   refused, the devices in use all along with them. Such devices are few (see [`InUse`]), and
+    ///   with one more each with no memory left, what more is in flight is bounded too
     #[inline]
     fn memory_refuses(&self, manager: &PermitManager, device: DeviceSlot) -> bool {
         let now = self.now_secs();
-        for slot in DeviceCounts::slots(device) {
-            extend_spell(&self.seen[slot], now, FORGET_AFTER_SECS);
-        }
+        let in_use_since = self.in_use.note(device, now);
         if self.memory.room(manager.inflight()) == Room::Plenty {
             return false;
         }
-        extend_spell(&self.pressed, now, CALM_AFTER_SECS);
+        let pressed_since = extend_spell(&self.pressed, now, CALM_AFTER_SECS);
+        let before = u32::try_from(self.known_before.as_secs()).unwrap_or(u32::MAX);
         let queries = &manager.queries;
         let budget = self.memory.tight_budget(queries.total());
         queries.total() >= budget
             && match queries.own(device) {
-                0 => !self.known(device),
+                0 => in_use_since.saturating_add(before) > pressed_since,
                 own => own.saturating_mul(queries.slots_held()) >= budget,
             }
     }
@@ -533,17 +530,6 @@ impl FlowControlState {
         u32::try_from(self.started.elapsed().as_secs())
             .unwrap_or(u32::MAX - 1)
             .saturating_add(1)
-    }
-
-    /// 这一阵内存不够以前 [`Self::known_before`] 就一直在用的设备：两份都是 / A device in use all along since
-    /// [`Self::known_before`] before memory ran short this spell: both of its slots
-    fn known(&self, device: DeviceSlot) -> bool {
-        let pressed_since = spell_start(&self.pressed);
-        let before = u32::try_from(self.known_before.as_secs()).unwrap_or(u32::MAX);
-        DeviceCounts::slots(device).into_iter().all(|slot| {
-            let since = spell_start(&self.seen[slot]);
-            since != 0 && since.saturating_add(before) <= pressed_since
-        })
     }
 
     /// 一个查询从排进去到开始跑等了 `delay`。超过目标就说明队里积着这么久的活，这段时间不接新查询，让它消化
@@ -638,6 +624,12 @@ impl DeviceSlot {
     /// counting as one (see `DeviceCounts`)
     pub fn counted_in(self) -> u16 {
         self.0
+    }
+
+    /// 两个哈希拼成的一个数，[`InUse`] 按它认设备 / The two hashes as one number, by which [`InUse`] tells
+    /// devices apart
+    fn key(self) -> u32 {
+        u32::from(self.0) << 16 | u32::from(self.1)
     }
 }
 
@@ -851,36 +843,102 @@ fn zeroed_u64_slots() -> Box<[AtomicU64]> {
 /// 一台设备在压力出现以前就在用了多久才算老设备，就是 `KNOWN_BEFORE`（测试可以换）/ How long before memory ran
 /// short a device has to have been in use to count as known: `KNOWN_BEFORE` (a test may change it)
 const KNOWN_BEFORE: Duration = Duration::from_secs(10);
-/// 一份这么久没见到，就当它的设备走了，下次见到重新算起 / A slot unseen this long counts as its device
-/// gone, and counts afresh when next seen
+/// 一台设备这么久没见到就当它走了，下次见到重新算起 / A device unseen this long counts as gone, and counts
+/// afresh when next seen
 const FORGET_AFTER_SECS: u32 = 3600;
+/// 记着的在用设备分这么多组，按第一个哈希落进其中一组 / The devices in use fall into this many buckets, by
+/// the first hash
+const IN_USE_BUCKETS: usize = 32;
+/// 每组记几台，一组的键正好一条缓存行：两百台设备时哪一组记不下的机会不到 1%，记不下的是这一组里用得最短的那台
+/// How many devices a bucket keeps, its keys filling one cache line: with two hundred devices the
+/// odds of a bucket overflowing are under 1%, and the one not kept is the bucket's device in use for
+/// the shortest while
+const IN_USE_WAYS: usize = 16;
+
+/// 在用的设备，最多 `IN_USE_BUCKETS` × `IN_USE_WAYS` 台，各自从哪一秒起一直在用（见 [`extend_spell`]）。内存没了时手上一个没有的
+/// 老设备各再放一个（见 [`FlowControlState::memory_refuses`]），所以这里记得下多少台，多出来的在途最多就多少个，512 个约 5 MB。按哈希
+/// 分份记的话，伪造的来源一多几乎每份都早，几乎每个来源都算老设备，内存照样被占满。一组满了先顶掉空着的、走了的，再顶掉一直在用
+/// 得最短的：伪造的来源各只出现一次，只能互相顶掉，用了一阵的设备留着。两个核同时改同一路时，新设备可能接着旧设备的起点，多算一台
+/// 老设备，上限不变
+/// The devices in use, at most `IN_USE_BUCKETS` × `IN_USE_WAYS`, each with the second since which
+/// it has been in use all along (see [`extend_spell`]). With no memory left a device in use before
+/// that holding none still gets one more (see [`FlowControlState::memory_refuses`]), so as many as
+/// are kept here is as many more as can be in flight: 512 in flight take about 5 MB. Kept by hash
+/// slots, spoofed sources enough read nearly every slot early, nearly every source counted as known
+/// and the memory filled up all the same. A full bucket gives up a free or gone way first, then the
+/// way of the device in use for the shortest while: spoofed sources each turn up once and only push
+/// each other out, while devices in use for a while stay. Two cores changing one way at once may
+/// leave a new device with the old one's start, one more counted as known, and the bound holds
+struct InUse(Box<[InUseBucket]>);
+
+#[derive(Default)]
+struct InUseBucket {
+    /// 每一路记的是哪台设备（见 [`DeviceSlot::key`]）/ The device each way keeps (see [`DeviceSlot::key`])
+    keys: [AtomicU32; IN_USE_WAYS],
+    /// 每一路的设备从哪一秒起一直在用，0 是空着 / Since when each way's device has been in use, 0 for free
+    spells: [AtomicU64; IN_USE_WAYS],
+}
+
+impl InUse {
+    fn new() -> Self {
+        Self(
+            (0..IN_USE_BUCKETS)
+                .map(|_| InUseBucket::default())
+                .collect(),
+        )
+    }
+
+    /// 记下 `device` 在 `now` 这一秒在用，回它从哪一秒起一直在用 / Notes `device` in use at second `now`,
+    /// returning the second since which it has been in use all along
+    fn note(&self, device: DeviceSlot, now: u32) -> u32 {
+        let bucket = &self.0[usize::from(device.0) % IN_USE_BUCKETS];
+        let key = device.key();
+        let ways = 0..IN_USE_WAYS;
+        if let Some(way) = ways
+            .clone()
+            .find(|&way| bucket.keys[way].load(Ordering::Relaxed) == key)
+        {
+            return extend_spell(&bucket.spells[way], now, FORGET_AFTER_SECS);
+        }
+        // 空着的、走了的是 None，排在最前；其余按用了多久、再按最近一次 / Free or gone is None and comes first;
+        // the rest by how long in use, then by when last seen
+        let way = ways
+            .min_by_key(|&way| {
+                let spell = bucket.spells[way].load(Ordering::Relaxed);
+                let (start, last) = ((spell >> 32) as u32, spell as u32);
+                (spell != 0 && now.saturating_sub(last) <= FORGET_AFTER_SECS)
+                    .then_some((last - start, last))
+            })
+            .expect("a bucket has ways");
+        bucket.keys[way].store(key, Ordering::Relaxed);
+        bucket.spells[way].store(u64::from(now) << 32 | u64::from(now), Ordering::Relaxed);
+        now
+    }
+}
 /// 内存这么久一直够，下次不够就算新的一阵 / Memory enough for this long, the next shortage counts as a
 /// new spell
 const CALM_AFTER_SECS: u32 = 60;
 
-/// 一个时间段：高 32 位是开始、低 32 位是最近一次，都是从某个时刻算起的秒加 1，0 是没有过。最近一次隔了 `gap` 秒以上，
-/// 就从 `now` 重新开始
-/// A spell: its start in the high 32 bits and its latest moment in the low 32, both seconds
-/// since some moment plus 1, with 0 for never. With over `gap` seconds since the latest, it starts
-/// again at `now`
-fn extend_spell(cell: &AtomicU64, now: u32, gap: u32) {
+/// 把一个时间段延到 `now`，回它从哪一秒开始。高 32 位是开始、低 32 位是最近一次，都是从某个时刻算起的秒加 1，0 是没有过；
+/// 最近一次隔了 `gap` 秒以上，就从 `now` 重新开始
+/// Extends a spell to `now`, returning the second it started. Its start is in the high 32 bits
+/// and its latest moment in the low 32, both seconds since some moment plus 1, with 0 for never;
+/// with over `gap` seconds since the latest, it starts again at `now`
+fn extend_spell(cell: &AtomicU64, now: u32, gap: u32) -> u32 {
     let was = cell.load(Ordering::Relaxed);
     let (start, last) = ((was >> 32) as u32, was as u32);
     // 别的线程刚记过同一秒或更晚的就不动 / Left alone when another thread has just noted this second or a
     // later one
-    if now > last {
-        let start = if last == 0 || now - last > gap {
-            now
-        } else {
-            start
-        };
-        cell.store(u64::from(start) << 32 | u64::from(now), Ordering::Relaxed);
+    if now <= last {
+        return start;
     }
-}
-
-/// 一段时间从哪一秒开始，0 是没有过 / The second a spell started, 0 for never
-fn spell_start(cell: &AtomicU64) -> u32 {
-    (cell.load(Ordering::Relaxed) >> 32) as u32
+    let start = if last == 0 || now - last > gap {
+        now
+    } else {
+        start
+    };
+    cell.store(u64::from(start) << 32 | u64::from(now), Ordering::Relaxed);
+    start
 }
 
 impl Asked {
@@ -2986,6 +3044,33 @@ mod tests {
             "nothing in flight, still refused"
         );
         drop(alike);
+    }
+
+    /// 记着的在用设备有数：伪造的来源再多，记得下的也只有那么多台，挤掉的是用得最短的，一直在用的设备留着；走了很久的重新算起
+    /// The devices in use kept are few: however many spoofed sources, only so many are kept, those in
+    /// use the shortest are pushed out, and a device in use all along stays; one gone for long counts
+    /// afresh
+    #[test]
+    fn the_devices_in_use_are_few_and_stay() {
+        let in_use = InUse::new();
+        let home = DeviceSlot(7, 7);
+        assert_eq!(in_use.note(home, 1), 1);
+        assert_eq!(in_use.note(home, 30), 1, "in use all along");
+        let spoofed = |n: u32| DeviceSlot(n as u16, (n >> 16) as u16 | 0x100);
+        for n in 0..100_000 {
+            assert_eq!(in_use.note(spoofed(n), 31), 31, "each source is new");
+        }
+        assert_eq!(
+            in_use.note(home, 32),
+            1,
+            "spoofed sources push out only each other"
+        );
+        let kept = (0..100_000)
+            .filter(|&n| in_use.note(spoofed(n), 40) == 31)
+            .count();
+        assert!(kept < IN_USE_BUCKETS * IN_USE_WAYS, "{kept} kept");
+        let back = 32 + FORGET_AFTER_SECS + 1;
+        assert_eq!(in_use.note(home, back), back, "gone for long");
     }
 
     /// 内存没了：压力出现以前就在用的设备，手上一个没有时照常问；压力出现以后才冒出来的来源（伪造来源的洪泛每个都是新的）、
