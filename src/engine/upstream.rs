@@ -1152,25 +1152,24 @@ fn upstream_label(via: Transport, addr: &str) -> Arc<str> {
     label
 }
 
-/// 现在发出的一次和上游的收发要量用了多久时，现在这一刻：开了流控才量，而且抽着量（见
-/// `PermitManager::times_this_round_trip`）；启动以后还没等到过回答时每一次都量，头一个回答一来就知道回答要多久，
-/// 不用等抽到的那一个——这之前开始等的查询是按上游应当已经回答的时间点算卡住的，洪泛时这一段越短，占着内存等到那个
-/// 点的查询越少。和 [`note_round_trip`] 一前一后夹着那次收发，不另包一层：包一层的话收发的
-/// 状态要整块搬进去，没开流控时每个查询也跟着多花时间
-/// The present, when the exchange with an upstream being sent now is to be timed: only with
-/// flow control on, and only one in so many (see `PermitManager::times_this_round_trip`);
-/// while no answer has been seen since the start every one is timed, so the first answer tells
-/// at once how long answers take without waiting for a sampled one: a query that began waiting
-/// before then counts as stuck by the point an upstream should have answered by, and in a
-/// flood the shorter that stretch, the fewer queries hold memory until that point. It
-/// and [`note_round_trip`] go either side of the exchange with no wrapper round it: a wrapper
-/// would have the exchange's whole state moved into it, costing every query without flow
-/// control too
+/// 现在发出的一次和上游的收发要量用了多久时，现在这一刻：抽着量（见 `PermitManager::times_this_round_trip`），量到的
+/// 定 UDP 什么时候重发，开了流控时也定查询等多久算卡住；启动以后还没等到过回答时每一次都量，头一个回答一来就知道回答要多久，
+/// 不用等抽到的那一个——这之前开始等的查询是按上游应当已经回答的时间点算卡住、重发的，洪泛时这一段越短，占着内存等到那个
+/// 点的查询越少。和 [`note_round_trip`] 一前一后夹着那次收发，不另包一层：包一层的话收发的状态要整块搬进去，每个查询都跟着
+/// 多花时间
+/// The present, when the exchange with an upstream being sent now is to be timed: one in so
+/// many is (see `PermitManager::times_this_round_trip`), what is timed setting when UDP sends
+/// again and, with flow control on, how long a query waits before it counts as stuck; while no
+/// answer has been seen since the start every one is timed, so the first answer tells at once
+/// how long answers take without waiting for a sampled one: a query that began waiting before
+/// then counts as stuck and is sent again by the point an upstream should have answered by, and
+/// in a flood the shorter that stretch, the fewer queries hold memory until that point. It and
+/// [`note_round_trip`] go either side of the exchange with no wrapper round it: a wrapper would
+/// have the exchange's whole state moved into it, costing every query
 #[inline]
 fn sent_if_timed(engine: &Engine) -> Option<Instant> {
-    (engine.flow_control_state.is_some()
-        && (crate::engine::PermitManager::times_this_round_trip()
-            || !engine.permit_manager.has_seen_an_answer()))
+    (crate::engine::PermitManager::times_this_round_trip()
+        || !engine.permit_manager.has_seen_an_answer())
     .then(Instant::now)
 }
 
@@ -1230,15 +1229,15 @@ struct UdpTcpFallback {
 
 /// UDP forwarder with a resend and TCP fallback for better tail latency. Returns the answer
 /// with the transport that carried it: UDP, or TCP after a TC-bit retry or a UDP-failure
-/// fallback. With no reply after a third of the timeout (see [`hedge_timeout`]) the query is
-/// sent again, and from then on whichever of the two is answered first is used, for the whole
-/// of the timeout: the first query stays registered, so its reply is taken should it arrive
-/// only after the resend. It used to be given up as the resend went out: an upstream slower
-/// than a third of the timeout had every query wait a resend's interval more for the reply to
-/// the resend, and answered once more for nothing.
-/// 带重发和 TCP 回退的 UDP 转发。返回应答和实际带回它的传输：UDP，或 TC/失败回退后的 TCP。过了时限的三分之一
-/// （见 [`hedge_timeout`]）还没有回答就把查询再发一次，此后一整个时限里，两次谁的回答先到用谁的：第一次的查询一直
-/// 登记着，它的回答在重发以后才到也照样收下。以前重发的那一刻就不等它了：回答比时限的三分之一慢的上游，每个查询都要
+/// fallback. With no reply by the time this upstream's answers are due (see
+/// `PermitManager::resend_after`) the query is sent again, and from then on whichever of the two
+/// is answered first is used, for the whole of the timeout: the first query stays registered, so
+/// its reply is taken should it arrive only after the resend. It used to be given up as the
+/// resend went out: an upstream slower than the resend had every query wait a resend's interval
+/// more for the reply to the resend, and answered once more for nothing.
+/// 带重发和 TCP 回退的 UDP 转发。返回应答和实际带回它的传输：UDP，或 TC/失败回退后的 TCP。过了这个上游该有回答的
+/// 时候（见 `PermitManager::resend_after`）还没有回答就把查询再发一次，此后一整个时限里，两次谁的回答先到用谁的：第一次的
+/// 查询一直登记着，它的回答在重发以后才到也照样收下。以前重发的那一刻就不等它了：回答比重发慢的上游，每个查询都要
 /// 多等一个重发的间隔才拿到重发那一次的回答，上游还白白多答一次。
 async fn forward_udp_smart(
     engine: &Engine,
@@ -1273,9 +1272,10 @@ async fn forward_udp_smart(
         Ok((bytes, Transport::Udp))
     };
 
-    // 第一次：只等到时限的三分之一，后面留给重发和 TCP / The first query: waited for only a third
-    // of the timeout, the rest being left for the resend and TCP
-    let first_wait = hedge_timeout(timeout_dur);
+    // 第一次：等到该有回答的时候（见 `PermitManager::resend_after`），后面留给重发和 TCP / The first
+    // query: waited for until an answer was due (see `PermitManager::resend_after`), the rest being
+    // left for the resend and TCP
+    let first_wait = engine.permit_manager.resend_after(upstream, timeout_dur);
     let first_sent = sent_if_timed(engine);
     let mut first = match engine.udp_client.begin(packet, upstream).await {
         Ok(sent) => Some(sent),
@@ -1388,8 +1388,8 @@ mod tests {
     use rustls::crypto::ring;
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     use tokio::io::AsyncReadExt;
 
     /// 上游地址的前缀不分大小写，别的都不认 / An upstream's prefix takes any case, and nothing else
@@ -1683,26 +1683,14 @@ mod tests {
         );
     }
 
-    /// 启动以后还没等到过回答时每次收发都量，等到了就抽着量：头一个回答一来就知道回答要多久
+    /// 启动以后还没等到过回答时每次收发都量，等到了就抽着量：头一个回答一来就知道回答要多久。开不开流控都量，UDP 什么时候
+    /// 重发跟着它
     /// While no answer has been seen since the start every exchange is timed, and one in so
-    /// many once one has: the first answer tells at once how long answers take
+    /// many once one has: the first answer tells at once how long answers take. Timing goes on
+    /// with flow control off too, when UDP sends again following it
     #[tokio::test]
     async fn every_exchange_is_timed_until_an_answer_is_seen() {
-        let settings = GlobalSettings {
-            default_upstream: "127.0.0.1:0".to_string(),
-            flow_control_enabled: true,
-            ..GlobalSettings::default()
-        };
-        let engine = Engine::new(
-            RuntimePipelineConfig {
-                settings,
-                pipeline_select: Vec::new(),
-                pipelines: Vec::new(),
-                pipeline_id_index: FxHashMap::default(),
-            },
-            "test".to_string(),
-        )
-        .expect("initialize test engine");
+        let engine = build_test_engine(false);
         assert!((0..64).all(|_| sent_if_timed(&engine).is_some()));
         engine
             .permit_manager
@@ -1711,12 +1699,61 @@ mod tests {
         assert_eq!(timed, 8, "one in eight once an answer is seen");
     }
 
-    /// 没开流控时不量：每个查询不必为它读时钟 / Without flow control nothing is timed, and no query
-    /// reads the clock for it
+    /// 丢了的查询在这个上游该有回答的时候就再发：它还没回答过时按时限的三分之一，回答过了就按它最慢的那些回答，至少 50 毫秒。
+    /// 以前一律等三分之一（默认 3 秒）
+    /// A lost query is sent again once this upstream's answers are due: by a third of the
+    /// timeout while it has not answered yet, by its slowest answers once it has, 50 ms at
+    /// least. It used to wait a third every time (3 seconds by default)
     #[tokio::test]
-    async fn without_flow_control_no_exchange_is_timed() {
+    async fn a_lost_query_is_sent_again_once_the_upstreams_answers_are_due() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind the upstream");
+        let upstream = socket
+            .local_addr()
+            .expect("read the upstream address")
+            .to_string();
+        let lose_next = Arc::new(AtomicBool::new(false));
+        let losing = Arc::clone(&lose_next);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+                if losing.swap(false, Ordering::SeqCst) {
+                    continue;
+                }
+                buf[2] |= 0x80;
+                let _ = socket.send_to(&buf[..len], peer).await;
+            }
+        });
         let engine = build_test_engine(false);
-        assert!((0..64).all(|_| sent_if_timed(&engine).is_none()));
+        let packet = build_dns_query_packet("example.com");
+        let limit = Duration::from_millis(3000);
+        let ask = || {
+            let tcp = UdpTcpFallback {
+                retry_truncated: false,
+                on_failure: false,
+            };
+            forward_udp_smart(&engine, &packet, &upstream, limit, tcp)
+        };
+        let resend_after = || engine.permit_manager.resend_after(&upstream, limit);
+        assert_eq!(
+            resend_after(),
+            hedge_timeout(limit),
+            "no answer from it yet"
+        );
+        // 收发每 8 次量一次 / One exchange in 8 is timed
+        for _ in 0..16 {
+            ask().await.expect("answered");
+        }
+        assert_eq!(resend_after(), Duration::from_millis(50), "quick answers");
+        lose_next.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        ask().await.expect("answered by the resend");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(50) && took < hedge_timeout(limit),
+            "took {took:?}"
+        );
     }
 
     fn build_dns_query_packet(qname: &str) -> Vec<u8> {

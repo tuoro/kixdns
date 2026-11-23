@@ -394,12 +394,13 @@ async fn stuck_queries_past_a_devices_share_give_up_early() {
 }
 
 /// 记进回答要多久的，是和上游的一次收发用了多久，不是查询一共等了多久：上游头一次不回、重发才回时（上游超时 900 毫秒，
-/// 过 300 毫秒重发），查询一共等了 300 多毫秒，记下的还是重发那一次的几毫秒，算卡住的时间还是 100 毫秒。以前按查询一共等了
-/// 多久记，上游限速时靠重发才等到的回答把这个时间拉到几秒，谁都不再算卡住
+/// 头一个查询过 300 毫秒重发，这个上游回答过以后过 50 毫秒），查询一共等了几十到三百多毫秒，记下的还是重发那一次的几毫秒，
+/// 算卡住的时间还是 100 毫秒。以前按查询一共等了多久记，上游限速时靠重发才等到的回答把这个时间拉到几秒，谁都不再算卡住
 /// What is noted in how long answers take is how long one exchange with an upstream took, not
 /// how long the query waited in all: with an upstream ignoring the first try and answering the
-/// resend (an upstream timeout of 900 ms, resent after 300 ms), the query waits over 300 ms in
-/// all while the few milliseconds of the resend are what is noted, and a query still counts as
+/// resend (an upstream timeout of 900 ms, the first query resent after 300 ms, after 50 ms once
+/// this upstream has answered), a query waits tens to over 300 ms in all while the few
+/// milliseconds of the resend are what is noted, and a query still counts as
 /// stuck after 100 ms. Noted by the whole wait, the answers won by resending under an upstream's
 /// rate limit stretched that time to seconds, with nothing stuck any more
 #[tokio::test]
@@ -435,10 +436,10 @@ async fn an_answer_won_by_resending_is_noted_by_its_own_exchange() {
         let (took, answered) =
             ask_as_a_listener(&engine, format!("again{n}.dead.test."), client(1)).await;
         assert_eq!(answered, Some(ResponseCode::NoError));
-        assert!(took >= Duration::from_millis(300), "took {took:?}");
+        assert!(took >= Duration::from_millis(50), "took {took:?}");
     }
-    // 记的要是查询一共等的 300 多毫秒，这里至少是 600 毫秒 / Had the 300-odd ms each query waited
-    // been noted, this would be 600 ms at least
+    // 记的要是查询一共等了多久，头一个的 300 多毫秒让这里至少是 600 毫秒 / Had how long each query
+    // waited been noted, the first one's 300-odd ms would make this 600 ms at least
     let stuck_after = engine
         .permit_manager
         .stuck_after(&answers_second_try.address, Duration::from_millis(900));

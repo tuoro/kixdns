@@ -102,6 +102,10 @@ pub const QUERY_BUDGET: usize = 4096;
 const SLOWEST_ONE_IN: u32 = 100;
 const WAITS_TIMES_SLOWEST: u32 = 2;
 
+/// UDP 查询最早等多久没有回答就再发一次（见 [`PermitManager::resend_after`]）/ The soonest a UDP
+/// query with no answer is sent again (see [`PermitManager::resend_after`])
+const RESEND_AFTER_AT_LEAST: Duration = Duration::from_millis(50);
+
 /// 记着的回答到这么多个就都减半：看的是最近四千到八千个回答。按个数不按时间：一阵没有查询，记着的不变——回答要多久是上游的
 /// 性质，和有没有负载无关
 /// With this many answers noted they are all halved: what is looked at is the latest four to
@@ -1616,6 +1620,30 @@ impl PermitManager {
             None => super::upstream::hedge_timeout(limit),
         };
         after.max(BUSY_AFTER)
+    }
+
+    /// `upstream`（一个地址）的 UDP 查询等多久还没有回答就再发一次，`limit` 是上游的时限：这个上游最近的回答里最慢的
+    /// `1 / SLOWEST_ONE_IN` 用了多久——比这还慢的回答本来就少，多半是查询或回答在路上丢了——收进
+    /// [`RESEND_AFTER_AT_LEAST`] 到时限的三分之一（`hedge_timeout`）；这个上游还没等到过回答时是时限的三分之一：回答要多久
+    /// 是每个上游自己的，别的上游的说明不了它。以前一律等三分之一，默认 3 秒：丢一个包，查询就多等 3 秒。发早了只是上游多答
+    /// 一次：两次谁的回答先到用谁的
+    /// How long a UDP query to `upstream` (one address) waits with no answer before it is sent
+    /// again, `limit` being the upstream's timeout: what the slowest `1 / SLOWEST_ONE_IN` of this
+    /// upstream's latest answers took, since answers slower still are few and the query or its
+    /// answer was most likely lost on the way, brought into [`RESEND_AFTER_AT_LEAST`] to a third
+    /// of the timeout (`hedge_timeout`); with no answer from this upstream yet, a third of the
+    /// timeout, how long answers take being each upstream's own, which no other upstream's tells.
+    /// It used to be a third every time, 3 seconds by default: one packet lost, and the query
+    /// waited 3 seconds more. Sent too early, the upstream only answers once more: whichever of
+    /// the two answers comes first is used
+    pub fn resend_after(&self, upstream: &str, limit: Duration) -> Duration {
+        let at_most = super::upstream::hedge_timeout(limit);
+        self.answer_time_of
+            .get(upstream)
+            .and_then(|own| own.slowest())
+            .map_or(at_most, |slowest| {
+                slowest.max(RESEND_AFTER_AT_LEAST).min(at_most)
+            })
     }
 
     /// `device` 的一个卡住的查询留不留着等：它留着的没到它那一份就留，返回的守卫放下时不再算；到了就不留，记一次拒绝
