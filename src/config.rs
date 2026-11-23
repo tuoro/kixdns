@@ -6,12 +6,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Result;
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Serialize};
 
 use crate::matcher::RuntimePipelineConfig;
 use tracing::info;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineConfig {
     #[serde(default)]
     pub version: Option<String>,
@@ -31,22 +32,18 @@ pub struct PipelineConfig {
     #[serde(default)]
     pub background_refresh_rule: Option<Rule>,
 
-    /// 配置里写了、内核却不读的键，解析时找出来（见 [`parse_config`]），写成 `pipelines[0].rules[2].matcher` 这样的路径。
-    /// 退役的旧设置（见 [`RETIRED_SETTINGS`]）只记 warn，其余的算 [`problems`]。找得到的是各层对象里的键：设置、pipeline、
-    /// 规则和选择规则；动作、匹配器和 ECS 按 `type` 或 `mode` 分种类，serde 先把整个对象缓冲下来再读，多出来的键在那里就丢了，
-    /// 找不到（那里拼错的必填字段照旧是解析错误）
+    /// 配置里写了、内核却不读的键，解析时找出来（见 [`unread_keys`]），写成 `pipelines[0].rules[2].matcher`、
+    /// `pipelines[0].rules[2].actions[0].upstrem` 这样的路径，按写的顺序排。退役的旧设置（见 [`RETIRED_SETTINGS`]）只记
+    /// warn，其余的算 [`problems`]
     /// The keys a configuration writes that the kernel does not read, found while parsing (see
-    /// [`parse_config`]), as paths like `pipelines[0].rules[2].matcher`. Retired settings (see
-    /// [`RETIRED_SETTINGS`]) only get a warn, and the rest count among [`problems`]. What is found
-    /// are the keys of the objects at each level: settings, pipelines, rules and selector rules;
-    /// actions, matchers and ECS are told apart by `type` or `mode`, which serde reads by buffering
-    /// the whole object first, dropping extra keys there out of sight (a misspelt required field
-    /// there is still a parse error)
+    /// [`unread_keys`]), as paths like `pipelines[0].rules[2].matcher` and
+    /// `pipelines[0].rules[2].actions[0].upstrem`, in the order written. Retired settings (see
+    /// [`RETIRED_SETTINGS`]) only get a warn, and the rest count among [`problems`]
     #[serde(skip)]
     pub unread_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
     #[serde(default = "default_min_ttl")]
@@ -265,7 +262,7 @@ fn default_dashmap_shards() -> usize {
     0 // 0 means use DashMap default (num_cpus * 4)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Pipeline {
     pub id: String,
     #[serde(default)]
@@ -299,7 +296,7 @@ pub struct MergedForward {
     pub ecs: Option<EcsMode>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Rule {
     pub name: String,
     #[serde(default)]
@@ -327,7 +324,7 @@ pub struct Rule {
     pub merged_forward: Option<MergedForward>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Matcher {
     Any,
@@ -379,7 +376,7 @@ pub enum Matcher {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PipelineSelectorMatcher {
     /// 入口标签匹配（来自启动参数 listener_label）。 / Entry label matching (from listener_label startup parameter)
@@ -413,7 +410,7 @@ pub enum PipelineSelectorMatcher {
     Qtype { value: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineSelectRule {
     pub pipeline: String,
     #[serde(default)]
@@ -422,7 +419,7 @@ pub struct PipelineSelectRule {
     pub matcher_operator: MatchOperator,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MatcherWithOp {
     #[serde(default = "default_match_operator")]
     pub operator: MatchOperator,
@@ -430,7 +427,7 @@ pub struct MatcherWithOp {
     pub matcher: Matcher,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineSelectorMatcherWithOp {
     #[serde(default = "default_match_operator")]
     pub operator: MatchOperator,
@@ -438,7 +435,7 @@ pub struct PipelineSelectorMatcherWithOp {
     pub matcher: PipelineSelectorMatcher,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseMatcherWithOp {
     #[serde(default = "default_match_operator")]
     pub operator: MatchOperator,
@@ -446,7 +443,7 @@ pub struct ResponseMatcherWithOp {
     pub matcher: ResponseMatcher,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseMatcher {
     /// 匹配使用的上游（字符串相等）。 / Match the upstream used (string equality)
@@ -489,7 +486,7 @@ pub enum ResponseMatcher {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
     /// 记录日志，level可选：trace/debug/info/warn/error / Log action, level options: trace/debug/info/warn/error
@@ -896,7 +893,7 @@ impl GlobalSettings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Deserialize, Serialize, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Udp,
@@ -915,7 +912,7 @@ pub enum Transport {
     Doq,
 }
 
-#[derive(Debug, Clone, Deserialize, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchOperator {
     And,
@@ -950,13 +947,8 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
 /// the filesystem. Errors from the JSON layer carry line/column positions.
 /// 从 JSON 文本解析并规范化配置，不访问文件系统。JSON 层错误带行列位置。
 pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
-    let mut unread_keys = Vec::new();
-    let mut json = serde_json::Deserializer::from_str(raw);
-    let mut cfg: PipelineConfig =
-        serde_ignored::deserialize(&mut json, |key| unread_keys.push(key_path(&key)))
-            .context("parse config JSON")?;
-    json.end().context("parse config JSON")?;
-    cfg.unread_keys = unread_keys;
+    let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
+    cfg.unread_keys = unread_keys(raw, &serde_json::to_value(&cfg)?)?;
 
     // 预分割上游字符串，转发时不必每次再拆；默认上游有几个时同时问 / Pre-split the upstream
     // strings so a forward does not split them each time; several default upstreams are
@@ -1210,7 +1202,7 @@ fn default_enable_tcp_fallback() -> bool {
 /// - `Clear`: 剥离客户端自带的 ECS（隐私保护）/ Strip client-provided ECS (privacy)
 /// - `FromClientIp`: 从客户端来源 IP 推导 ECS 子网 / Derive ECS subnet from client source IP
 /// - `Static`: 使用固定 IP/前缀（伪装特定地理位置）/ Use fixed IP/prefix (spoof geo-location)
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum EcsMode {
     /// 剥离查询中的 ECS OPT 选项。
@@ -1515,22 +1507,115 @@ fn retired(key: &str) -> bool {
         .is_some_and(|setting| RETIRED_SETTINGS.contains(&setting))
 }
 
-/// 内核不读的一个键在配置里的路径：对象的键用点隔开，数组的下标写在方括号里（从 0 数）
-/// Where a key the kernel does not read sits in the configuration: an object's keys joined by
-/// dots, an array's index in brackets (counting from 0)
-fn key_path(key: &serde_ignored::Path<'_>) -> String {
-    use serde_ignored::Path;
+/// 配置原文 `raw` 里内核不读的键：读出来的配置写回成 JSON（`read`）里没有的键，按写的顺序列出路径（见
+/// [`PipelineConfig::unread_keys`]）。不问 serde 解析时跳过了哪些键：动作、匹配器和 ECS 按 `type` 或 `mode` 分种类，
+/// serde 先把整个对象缓冲下来再读，那里跳过的键谁也看不到，拼错的可选字段（`upstrem`、`operater`）就悄悄丢了
+/// The keys of the configuration text `raw` the kernel does not read: those the configuration
+/// read, written back as JSON (`read`), lacks, listed by path in the order written (see
+/// [`PipelineConfig::unread_keys`]). It does not ask which keys serde skipped while parsing:
+/// actions, matchers and ECS are told apart by `type` or `mode`, which serde reads by buffering
+/// the whole object first, and the keys skipped there are seen by nobody, so a misspelt optional
+/// field (`upstrem`, `operater`) used to be dropped without a word
+fn unread_keys(raw: &str, read: &serde_json::Value) -> serde_json::Result<Vec<String>> {
+    let mut found = Vec::new();
+    Unread {
+        read,
+        path: String::new(),
+        found: &mut found,
+    }
+    .deserialize(&mut serde_json::Deserializer::from_str(raw))?;
+    Ok(found)
+}
 
-    match key {
-        Path::Root => String::new(),
-        Path::Seq { parent, index } => format!("{}[{index}]", key_path(parent)),
-        Path::Map { parent, key } => match key_path(parent) {
-            parent if parent.is_empty() => key.clone(),
-            parent => format!("{parent}.{key}"),
-        },
-        Path::Some { parent }
-        | Path::NewtypeStruct { parent }
-        | Path::NewtypeVariant { parent } => key_path(parent),
+/// 照着读出来的配置里对应的那一块（`read`）走一遍写下的一个值，`path` 是它的路径：对象的键用点隔开，数组的下标写在
+/// 方括号里（从 0 数）
+/// Walks one value as written against its counterpart in the configuration read (`read`),
+/// `path` being where it sits: an object's keys joined by dots, an array's index in brackets
+/// (counting from 0)
+struct Unread<'a> {
+    read: &'a serde_json::Value,
+    path: String,
+    found: &'a mut Vec<String>,
+}
+
+impl<'de> DeserializeSeed<'de> for Unread<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, written: D) -> Result<(), D::Error> {
+        written.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Unread<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            let read = self.read.get(&key);
+            let path = if self.path.is_empty() {
+                key
+            } else {
+                format!("{}.{key}", self.path)
+            };
+            match read {
+                Some(read) => map.next_value_seed(Unread {
+                    read,
+                    path,
+                    found: &mut *self.found,
+                })?,
+                None => {
+                    map.next_value::<IgnoredAny>()?;
+                    self.found.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        // 写下的数组读出来可能不是数组（写成数组的 upstream 读成一个字符串），那里的元素没有对应的一块
+        // An array written may not be read as one (an upstream written as an array is read as one
+        // string), its elements then having no counterpart
+        const NOTHING: &serde_json::Value = &serde_json::Value::Null;
+        for index in 0.. {
+            let element = Unread {
+                read: self.read.get(index).unwrap_or(NOTHING),
+                path: format!("{}[{index}]", self.path),
+                found: &mut *self.found,
+            };
+            if seq.next_element_seed(element)?.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
     }
 }
 
@@ -2225,11 +2310,57 @@ mod validation_tests {
             unread,
             [
                 "pipeline_select[0].matcher",
+                "pipelines[0].rules[0].actions[0].ttl",
                 "pipelines[0].rules[0].matcher",
                 "pipelines[0].rules[1].response_matcher",
                 "settings.min_tll",
             ],
             "{found:#?}"
+        );
+    }
+
+    /// 动作、匹配器和 ECS 里内核不读的键一样按路径、按写的顺序报出来：入口、请求和回答的匹配器，请求和回答的动作，转发和
+    /// pipeline 的 ECS 都算，写在 `type`、`mode` 前面的也算；写成数组的上游照常。以前这些对象按 `type` 或 `mode` 分种类，
+    /// 整个先缓冲下来再读，多出来的键悄悄丢掉：拼错 `upstream` 的转发问的是默认上游，拼错 `operator` 的取反成了正向匹配
+    /// The keys the kernel does not read inside actions, matchers and ECS are raised by path, in
+    /// the order written, just the same: entry, request and answer matchers, request and answer
+    /// actions, and the ECS of forwards and pipelines all count, as do keys written before `type`
+    /// or `mode`; an upstream written as an array passes. These objects are told apart by `type`
+    /// or `mode` and used to be buffered whole before being read, extra keys dropped without a
+    /// word: a forward with `upstream` misspelt asked the default upstream, and a negation with
+    /// `operator` misspelt became a plain match
+    #[test]
+    fn keys_the_kernel_does_not_read_inside_actions_matchers_and_ecs_are_found() {
+        let config = r#"{
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipeline_select": [{ "pipeline": "main", "matchers": [{ "type": "any", "operater": "or" }] }],
+            "pipelines": [{ "id": "main", "ecs": { "mode": "clear", "prefix": 24 }, "rules": [{
+                "name": "r",
+                "matchers": [
+                    { "type": "any" },
+                    { "operater": "and_not", "type": "domain_suffix", "value": "ads.example" }
+                ],
+                "actions": [{
+                    "type": "forward",
+                    "upstream": ["9.9.9.9:53"],
+                    "upstrem": "8.8.8.8:53",
+                    "ecs": { "prefix4": 16, "mode": "from_client_ip" }
+                }],
+                "response_matchers": [{ "type": "response_rcode", "value": "NXDOMAIN", "values": "SERVFAIL" }],
+                "response_actions_on_match": [{ "type": "allow", "upstream": "8.8.8.8:53" }]
+            }] }]
+        }"#;
+        assert_eq!(
+            super::parse_config(config).expect("parses").unread_keys,
+            [
+                "pipeline_select[0].matchers[0].operater",
+                "pipelines[0].ecs.prefix",
+                "pipelines[0].rules[0].matchers[1].operater",
+                "pipelines[0].rules[0].actions[0].upstrem",
+                "pipelines[0].rules[0].actions[0].ecs.prefix4",
+                "pipelines[0].rules[0].response_matchers[0].values",
+                "pipelines[0].rules[0].response_actions_on_match[0].upstream",
+            ]
         );
     }
 
