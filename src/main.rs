@@ -248,7 +248,7 @@ use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, wr
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{ClientTransport, EngineObserver, TracingObserver};
 use kixdns::panel::PanelMetrics;
-use kixdns::proto_utils::{is_standard_query_header, notimp_reply, truncate_udp_response};
+use kixdns::proto_utils::{header_reply, is_standard_query_header, truncate_udp_response};
 #[cfg(target_os = "linux")]
 use kixdns::socket_utils::udp_batch;
 use kixdns::watcher;
@@ -1547,13 +1547,13 @@ impl<'a> UdpAnswering<'a> {
     /// that waits on an upstream goes to its own task and anything that is not a query is dropped, both giving false.
     fn answer(&mut self, packet: &[u8], to: impl Into<ReplyTo>, reply: &mut BytesMut) -> bool {
         if !is_standard_query_header(packet) {
-            // 别的操作码回 NOTIMP，其余的（应答、问题数不对）丢掉 / Another opcode gets NOTIMP, and the
-            // rest (a response, a wrong question count) is dropped
-            let Some(notimp) = notimp_reply(packet) else {
+            // 别的操作码回 NOTIMP，问题数不对回 FORMERR，应答丢掉（见 `header_reply`）/ Another opcode gets
+            // NOTIMP, a wrong question count FORMERR, and a response is dropped (see `header_reply`)
+            let Some(refused) = header_reply(packet) else {
                 return false;
             };
             reply.clear();
-            reply.extend_from_slice(&notimp);
+            reply.extend_from_slice(&refused);
             return true;
         }
         let to = to.into();
@@ -2349,11 +2349,12 @@ async fn serve_tcp_conn(
         while let Some(packet_bytes) = take_tcp_message(&mut received) {
             waiting = None;
             if !is_standard_query_header(&packet_bytes) {
-                // 别的操作码回 NOTIMP，其余的不是查询，断开 / Another opcode gets NOTIMP; the rest is no
-                // query, and the connection closes
-                match notimp_reply(&packet_bytes) {
-                    Some(notimp) => {
-                        queue_tcp_answer(&mut answers, &notimp);
+                // 别的操作码回 NOTIMP，问题数不对回 FORMERR（见 `header_reply`）；应答不是查询，断开 / Another
+                // opcode gets NOTIMP and a wrong question count FORMERR (see `header_reply`); a response
+                // is no query, and the connection closes
+                match header_reply(&packet_bytes) {
+                    Some(refused) => {
+                        queue_tcp_answer(&mut answers, &refused);
                         continue;
                     }
                     None => break 'connection,
@@ -2436,14 +2437,23 @@ async fn serve_tcp_conn(
 
         // 读更多：至少要够把当前这个消息读完 / Read more: at least enough to finish the current message
         let in_body = received.len() >= 2;
-        let deadline = match waiting {
+        // 等下一个查询、手上还有查询在等上游回答时不算空闲：读不设时限，等哪个答完再重新算，空闲从再没有查询要等的那一刻
+        // 起算。以前照样计时，上游慢时等回答的那段时间里再来的查询躺在接收缓冲里没人读，答完一关连接就丢了。半截消息的
+        // 时限照旧
+        // Waiting for the next query with queries still waiting on an upstream is no idleness: the
+        // read has no deadline, worked out again once one is answered, and idleness counts from when
+        // none is left waiting. It used to be timed all the same, and with a slow upstream a query
+        // sent meanwhile lay unread in the receive buffer, lost as the connection closed after the
+        // answer. A half-sent message keeps its deadline
+        let answering = !in_body && !pending.is_empty();
+        let deadline = (!answering).then(|| match waiting {
             Some((body, deadline)) if body == in_body => deadline,
             _ => {
                 let deadline = tokio::time::Instant::now() + read_timeout;
                 waiting = Some((in_body, deadline));
                 deadline
             }
-        };
+        });
         let missing = match received.get(..2) {
             Some(prefix) => match u16::from_be_bytes([prefix[0], prefix[1]]) as usize {
                 // 没有这么长的查询（见 MAX_QUERY_LEN）：不为它留 64 KiB，关掉连接 / No query is this
@@ -2461,7 +2471,18 @@ async fn serve_tcp_conn(
         // the connection closes, releasing the task and the file descriptor
         let read = tokio::select! {
             _ = writer.broken.cancelled() => break,
-            read = tokio::time::timeout_at(deadline, reader.read_buf(&mut received)) => read,
+            _ = pending.join_next(), if answering => {
+                waiting = None;
+                continue;
+            }
+            read = async {
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::timeout_at(deadline, reader.read_buf(&mut received)).await
+                    }
+                    None => Ok(reader.read_buf(&mut received).await),
+                }
+            } => read,
         };
         if !matches!(read, Ok(Ok(1..))) {
             break;
@@ -3128,6 +3149,80 @@ mod tests {
         assert_eq!(
             answered.metadata.op_code,
             OpCode::Query,
+            "the connection goes on"
+        );
+        server.abort();
+    }
+
+    /// 操作码是 QUERY、但问题数不是 1 或者带着回答记录的请求回 FORMERR（RFC 9619），只有请求头；UDP 和 TCP 都这样，
+    /// TCP 连接也照常接着用。以前 UDP 丢掉它、TCP 断开连接
+    /// A QUERY with a question count other than 1, or carrying answer records, gets FORMERR
+    /// (RFC 9619), the header alone; so over UDP and TCP, the TCP connection going on as usual.
+    /// UDP used to drop it and TCP to close the connection
+    #[tokio::test]
+    async fn a_query_with_a_wrong_question_count_gets_formerr() {
+        let with = |change: fn(&mut Vec<u8>)| {
+            let mut packet = dns_query();
+            change(&mut packet);
+            packet
+        };
+        let cases = [
+            with(|packet| packet[5] = 0),
+            with(|packet| packet[5] = 2),
+            with(|packet| packet[7] = 1),
+        ];
+        let is_formerr_for = |reply: &[u8], query: &[u8]| {
+            assert_eq!(reply.len(), 12, "the header alone");
+            assert_eq!(reply[..2], query[..2]);
+            let reply = Message::from_bytes(reply).unwrap();
+            assert_eq!(reply.metadata.response_code, ResponseCode::FormErr);
+            assert_eq!(reply.metadata.message_type, MessageType::Response);
+        };
+
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let engine = static_engine();
+        let worker = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        };
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 512];
+        for packet in &cases {
+            client.send_to(packet, server_addr).await.unwrap();
+            let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+                .await
+                .expect("FORMERR over UDP")
+                .unwrap();
+            is_formerr_for(&buf[..len], packet);
+        }
+        worker.abort();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(run_tcp(listener, static_engine()));
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        for packet in cases.iter().chain([&dns_query()]) {
+            stream
+                .write_all(&(packet.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(packet).await.unwrap();
+        }
+        for packet in &cases {
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut reply = vec![0u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut reply).await.unwrap();
+            is_formerr_for(&reply, packet);
+        }
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut reply = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(
+            Message::from_bytes(&reply).unwrap().metadata.response_code,
+            ResponseCode::NoError,
             "the connection goes on"
         );
         server.abort();
@@ -5663,6 +5758,37 @@ mod tests {
         let (stream, peer) = listener.accept().await.unwrap();
         let server = tokio::spawn(serve_tcp_conn(stream, peer, engine, SHORT_READ_TIMEOUT));
         (client, server)
+    }
+
+    /// 还有查询在等上游回答时，连接不算空闲：读超时过了以后再发来的查询照样读、照样答；都答完以后，空闲一个读超时才关。
+    /// 以前空闲计时不看有没有在途的查询，上游慢时，等回答的那段时间里再来的查询躺在接收缓冲里没人读，答完一关连接就丢了
+    /// A connection with queries still waiting on an upstream is not idle: a query sent after the
+    /// read timeout is read and answered all the same, and with both answered it closes after one
+    /// read timeout idle. The idle clock used to ignore queries in flight, and with a slow upstream
+    /// a query sent meanwhile lay unread in the receive buffer, lost as the connection closed
+    #[tokio::test]
+    async fn a_connection_waiting_on_an_answer_keeps_reading() {
+        let upstream =
+            spawn_slow_udp_upstream(SHORT_READ_TIMEOUT + Duration::from_millis(500)).await;
+        let (mut client, server) = tcp_connection_timing_out(slow_and_fast_engine(upstream)).await;
+        client
+            .write_all(&tcp_frame("a.slow.test.", 1))
+            .await
+            .unwrap();
+        tokio::time::sleep(SHORT_READ_TIMEOUT + Duration::from_millis(200)).await;
+        client
+            .write_all(&tcp_frame("b.fast.test.", 2))
+            .await
+            .unwrap();
+        let mut ids = [
+            read_answer_id(&mut client).await,
+            read_answer_id(&mut client).await,
+        ];
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2], "both answered");
+        let mut rest = [0u8; 1];
+        assert_eq!(client.read(&mut rest).await.unwrap(), 0, "closed once idle");
+        server.await.unwrap().expect("connection handler");
     }
 
     /// 声明的长度超过 MAX_QUERY_LEN 的消息不等它发完，连接当场关掉，之前的查询照样答。以前按长度前缀先留出 64 KiB，

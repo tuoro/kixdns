@@ -1,5 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::Record;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 
@@ -114,26 +114,44 @@ pub fn formerr_reply(query: &[u8]) -> Bytes {
     Bytes::from(reply)
 }
 
-/// 操作码不是 QUERY 的请求（NOTIFY、UPDATE 这些 KixDNS 不做的）的应答：RFC 1035 第 4.1.1 节的 NOTIMP。只有请求头，
-/// 各段计数为 0：别的操作码各段的意思不同，不往应答里抄；不比请求长，伪造来源也放大不了流量。应答（QR=1）、
-/// 操作码是 QUERY 的报文和不足 12 字节的报文没有这样的应答，为 None。以前它们和应答一样被丢掉（UDP）或断开连接（TCP）
-/// The reply to a request whose opcode is not QUERY (NOTIFY, UPDATE and the like, which KixDNS
-/// does not do): NOTIMP, as RFC 1035 section 4.1.1 has it. The header alone with every count
-/// at 0: the sections mean other things under other opcodes and are not copied; no longer than
-/// the request, a forged source gains no amplification. A response (QR=1), a message whose
-/// opcode is QUERY and one shorter than 12 bytes have no such reply, None. They used to be
-/// dropped (UDP) or have the connection closed (TCP), as a response is
-pub fn notimp_reply(packet: &[u8]) -> Option<Bytes> {
+/// 请求头不是 KixDNS 回答的标准查询（见 [`is_standard_query_header`]）时的应答。只有请求头，带着它的 ID、
+/// 操作码、RD 和 CD，各段计数为 0：不比请求长，伪造来源也放大不了流量；别的操作码下各段的意思不同，
+/// 也不往应答里抄。
+/// - 操作码不是 QUERY（NOTIFY、UPDATE 这些 KixDNS 不做的）：NOTIMP（RFC 1035 第 4.1.1 节）。
+/// - 操作码是 QUERY，但问题数不是 1，或者带着回答、授权记录：FORMERR（RFC 9619）。RFC 7873 第 5.4 节那种
+///   只带 cookie、没有问题的探测，也由此得到回答。
+///
+/// 应答（QR=1）和不足 12 字节的报文没有这样的应答，为 None：回应答会让两个服务器一直互相回下去。
+/// 以前除了 NOTIMP，这些都被丢掉（UDP）或者断开连接（TCP）。
+///
+/// The reply to a request whose header is not the standard query KixDNS answers (see
+/// [`is_standard_query_header`]). The header alone, with its ID, opcode, RD and CD and every
+/// count at 0: no longer than the request, a forged source gains no amplification, and the
+/// sections, meaning other things under other opcodes, are not copied.
+/// - An opcode other than QUERY (NOTIFY, UPDATE and the like, which KixDNS does not do) gets
+///   NOTIMP (RFC 1035 section 4.1.1).
+/// - A QUERY with a question count other than 1, or carrying answer or authority records,
+///   gets FORMERR (RFC 9619). The cookie-only probe of RFC 7873 section 5.4, with no
+///   question, is answered so too.
+///
+/// A response (QR=1) and a message shorter than 12 bytes have no such reply, None: answering a
+/// response would have two servers answer each other on and on. All but NOTIMP used to be
+/// dropped (UDP) or have the connection closed (TCP).
+pub fn header_reply(packet: &[u8]) -> Option<Bytes> {
     let header = packet.get(..12)?;
-    if header[2] & 0x80 != 0 || header[2] & 0x78 == 0 {
+    if header[2] & 0x80 != 0 {
         return None;
     }
+    let rcode = if header[2] & 0x78 != 0 {
+        ResponseCode::NotImp.low()
+    } else {
+        ResponseCode::FormErr.low()
+    };
     let mut reply = Vec::with_capacity(12);
     reply.extend_from_slice(&header[..2]);
-    // QR=1，保留 opcode 和 RD；RA=1，保留 CD，RCODE=NOTIMP
-    // QR=1, keeping the opcode and RD; RA=1, keeping CD, RCODE=NOTIMP
+    // QR=1，保留 opcode 和 RD；RA=1，保留 CD / QR=1, keeping the opcode and RD; RA=1, keeping CD
     reply.push(0x80 | (header[2] & 0x79));
-    reply.push(0x84 | (header[3] & 0x10));
+    reply.push(0x80 | (header[3] & 0x10) | rcode);
     reply.extend_from_slice(&[0; 8]);
     Some(Bytes::from(reply))
 }
