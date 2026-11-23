@@ -213,6 +213,16 @@ jobs:
           if [[ "${{ matrix.libc }}" == "musl" ]]; then
             packages+=(musl-tools)
           fi
+          # x86_64 的构建机在 Azure 里，从那里的 Ubuntu 镜像装包（GitHub 自己的 Ubuntu 构建机也用它）：
+          # archive.ubuntu.com 和 security.ubuntu.com 有时只有 100 多 kB/s，这一步就要十几到三十多分钟。
+          # arm64 走的是 ports.ubuntu.com，不动
+          # The x86_64 runners live in Azure, so packages come from the Ubuntu mirror there (the one
+          # GitHub's own Ubuntu runners use): archive.ubuntu.com and security.ubuntu.com sometimes
+          # give a little over 100 kB/s, and this step then takes 15 to over 30 minutes. arm64 goes
+          # through ports.ubuntu.com and is left alone
+          if [[ "$(dpkg --print-architecture)" == amd64 ]]; then
+            sed -i -E 's#http://(archive|security)\.ubuntu\.com/ubuntu/?#http://azure.archive.ubuntu.com/ubuntu/#' /etc/apt/sources.list
+          fi
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
           rm -rf /var/lib/apt/lists/*
