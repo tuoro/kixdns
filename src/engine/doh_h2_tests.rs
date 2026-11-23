@@ -258,7 +258,6 @@ async fn a_named_doh_upstream_is_resolved_through_bootstrap() {
         let bootstrap = Bootstrap::new(
             &server.address,
             Arc::new(UdpClient::new(1).expect("UDP client")),
-            Duration::from_secs(2),
         );
         let mut client = DohClient::new(8, 3, bootstrap).expect("doh client");
         client.trust_for_tests(upstream.cert.clone());

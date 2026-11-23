@@ -979,28 +979,27 @@ async fn a_response_actions_forward_kept_back_fails_the_request() {
     )
     .unwrap()];
     let packet = query("more.dead.test.");
-    let request = Message::from_vec(&packet).unwrap();
-    let outcome = crate::engine::rules::apply_response_actions_observed(
+    let req = Message::from_vec(&packet).unwrap();
+    let asked = support::Asked::new(
+        &engine,
+        "more.dead.test",
+        RecordType::A,
+        packet.clone(),
+        client(1),
+    );
+    let outcome = crate::engine::rules::apply_response_actions(
         crate::engine::rules::ApplyResponseActionsContext {
             engine: &engine,
+            request: &asked.request(),
             actions: &actions,
             ctx_opt: None,
-            req: &request,
+            req: &req,
             packet: &packet,
-            query: &packet,
-            client_ecs: None,
-            upstream_timeout: Duration::from_millis(150),
-            qname: "more.dead.test",
-            qtype: RecordType::A,
-            client_ip: client(1).ip(),
-            asker: Some(client(1).ip()),
-            upstream_default: &dead.address,
             pipeline_id: "main",
             rule_name: "dead",
             remaining_jumps: 4,
             trail: None,
         },
-        None,
     )
     .await;
     let failure = outcome.expect_err("the request fails");
