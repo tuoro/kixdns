@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use super::{Engine, PreParsedData, utils};
 use crate::observe::ClientTransport;
@@ -61,7 +61,7 @@ impl Engine {
                 debug!(%error, "{listener} request processing error, returning SERVFAIL");
             }
             Err(_) => {
-                warn!(
+                crate::warn_sparse!(
                     timeout_ms,
                     upstream_timeout_ms = self.get_upstream_timeout_ms(),
                     "{listener} request timeout"

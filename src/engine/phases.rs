@@ -22,7 +22,7 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Result of the Forward phase
 pub enum ForwardResult {
@@ -1113,7 +1113,7 @@ pub(crate) async fn handle_forward_decision_logged(
                                 "RFC 8767: flow control kept the query from the upstream, serving stale cache"
                             );
                         } else {
-                            warn!(
+                            crate::warn_sparse!(
                                 event = "serve_stale_on_upstream_failure",
                                 upstream = %upstream,
                                 qname = %qname,
@@ -1143,7 +1143,7 @@ pub(crate) async fn handle_forward_decision_logged(
                             "flow control kept the query from the upstream"
                         );
                     } else {
-                        warn!(
+                        crate::warn_sparse!(
                            event = "upstream_failure",
                            upstream = %upstream,
                            qname = %qname,
