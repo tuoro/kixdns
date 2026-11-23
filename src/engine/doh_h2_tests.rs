@@ -265,15 +265,15 @@ async fn an_upstream_without_h2_goes_through_reqwest() {
     assert_eq!(upstream.connections.load(Ordering::SeqCst), 2);
 }
 
-/// 直连发出的请求和 reqwest 发的一样：方法、路径和查询串、:authority，全部请求头（覆盖的 Host、两个媒体类型头、
+/// 直连发出的请求和 reqwest 经 HTTP/2 发的一样：方法、路径和查询串、:authority，全部请求头（两个媒体类型头、
 /// content-length）连同顺序
-/// The direct connection sends the request reqwest sends: method, path and query, :authority,
-/// and every request header (the Host override, both media type headers, content-length) in
-/// the same order
+/// The direct connection sends the request reqwest sends over HTTP/2: method, path and query,
+/// :authority, and every request header (both media type headers, content-length) in the same
+/// order
 #[tokio::test]
 async fn the_direct_request_is_the_one_reqwest_sends() {
     let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
-    for query_string in ["", "?host=front.example", "?ct&host=front.example&x=1"] {
+    for query_string in ["", "?ct&x=1"] {
         let url = upstream.url(query_string);
         let direct = upstream.client(3);
         let mut via_reqwest = upstream.client(3);
@@ -286,6 +286,41 @@ async fn the_direct_request_is_the_one_reqwest_sends() {
         assert_eq!(seen.len(), 2, "{query_string}");
         assert_eq!(seen[0], seen[1], "{query_string}");
         assert_eq!(seen[0].version, Version::HTTP_2);
+    }
+}
+
+/// 覆盖的 Host（`?host=`）是请求的 authority：HTTP/2 上是 :authority，不另带 Host 头（RFC 9113 §8.3.1：两者不许不同）；
+/// HTTP/1.1 上是 Host 头。reqwest 说 HTTP/2 时 :authority 只取自 URL，所以有覆盖的上游经 reqwest 时说 HTTP/1.1。参数本身
+/// 不发给上游，别的查询参数照发
+/// A Host override (`?host=`) is the request's authority: the :authority under HTTP/2, with no
+/// Host header (RFC 9113 §8.3.1: the two may not differ), and the Host header under HTTP/1.1.
+/// reqwest takes :authority from the URL alone under HTTP/2, so an upstream with an override
+/// speaks HTTP/1.1 through reqwest. The parameter itself is not sent on, the other query
+/// parameters are
+#[tokio::test]
+async fn a_host_override_is_the_authority_of_the_request() {
+    let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
+    let url = upstream.url("?ct&host=front.example&x=1");
+    let direct = upstream.client(3);
+    let mut via_reqwest = upstream.client(3);
+    via_reqwest.reqwest_only_for_tests();
+    ask(&direct, &url, 1).await.unwrap();
+    ask(&via_reqwest, &url, 2).await.unwrap();
+    let seen = upstream.seen.lock().unwrap().split_off(0);
+    let hosts = |seen: &Seen| {
+        seen.headers
+            .iter()
+            .filter(|(name, _)| name == "host")
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(seen[0].version, Version::HTTP_2);
+    assert_eq!(seen[0].authority.as_deref(), Some("front.example"));
+    assert_eq!(hosts(&seen[0]), Vec::<String>::new());
+    assert_eq!(seen[1].version, Version::HTTP_11);
+    assert_eq!(hosts(&seen[1]), ["front.example"]);
+    for seen in &seen {
+        assert_eq!(seen.path_and_query, "/dns-query?ct=&x=1");
     }
 }
 

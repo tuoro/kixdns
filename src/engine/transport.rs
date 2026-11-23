@@ -2036,40 +2036,51 @@ struct DohUpstream {
     /// 回了 429 以后暂停到什么时候，从 `DohClient::epoch` 起算的毫秒数；没暂停过是 0
     /// Until when a 429 paused it, in milliseconds from `DohClient::epoch`; 0 if it never was
     paused_until: AtomicU64,
-    /// 请求发往哪里（见 [`DohTarget`]）：第一次发请求时算好，之后每个请求直接用
-    /// Where requests go (see [`DohTarget`]): worked out at the first send and taken as it is by
-    /// every request after
-    target: std::sync::OnceLock<DohTarget>,
+    /// 请求发往哪里（见 [`DohTarget`]）：建这个上游的状态时算好，reqwest 客户端也按它建
+    /// Where requests go (see [`DohTarget`]): worked out when this upstream's state is made, and
+    /// the reqwest client is built for it
+    target: DohTarget,
     /// 握手时选了 h2 时直连用的 HTTP/2 连接（见 `doh_h2`）/ The HTTP/2 connection used directly when the upstream picked h2 in the handshake (see `doh_h2`)
     h2: H2Link,
 }
 
-/// 一个 DoH 上游的请求发往哪里：URL、覆盖的 Host（见 [`build_doh_url`]），以及直连 HTTP/2 用的同一个
-/// 地址（hyper 的 Uri）
+/// 一个 DoH 上游的请求发往哪里：URL、覆盖的 Host（见 [`build_doh_url`]），以及直连 HTTP/2 的请求 URI
 /// Where a DoH upstream's requests go: the URL, the Host override (see [`build_doh_url`]), and
-/// the same address as a hyper Uri for the direct HTTP/2 connection
+/// the request URI of the direct HTTP/2 connection
 struct DohTarget {
     url: Url,
     host_override: Option<String>,
-    /// 转不成 Uri 的 URL 只走 reqwest / A URL that does not convert to a Uri goes through reqwest only
+    /// URL 本身，有覆盖的 Host 时 authority 换成它：HTTP/2 的请求只在 :authority 里说 authority，不许再带一个和它不同的
+    /// Host 头（RFC 9113 §8.3.1）。连接和 TLS 照旧按 URL 来。转不成 Uri 的只走 reqwest
+    /// The URL, its authority replaced by the Host override when there is one: an HTTP/2 request
+    /// gives its authority in :authority alone and may not carry a Host header differing from it
+    /// (RFC 9113 §8.3.1). The connection and TLS still follow the URL. One that does not convert
+    /// to a Uri goes through reqwest only
     uri: Option<hyper::Uri>,
 }
 
-impl DohUpstream {
-    /// `upstream` 请求发往哪里；写错的 URL 每次都报同样的错，不记下来
-    /// Where `upstream`'s requests go; a malformed URL gives the same error each time and is not kept
-    fn target(&self, upstream: &str) -> anyhow::Result<&DohTarget> {
-        if let Some(target) = self.target.get() {
-            return Ok(target);
-        }
+impl DohTarget {
+    /// `upstream` 的请求发往哪里；写错的 URL 每次都报同样的错 / Where `upstream`'s requests go; a
+    /// malformed URL gives the same error each time
+    fn new(upstream: &str) -> anyhow::Result<Self> {
         let (url, host_override) = build_doh_url(upstream)?;
-        let uri = url.as_str().parse().ok();
-        Ok(self.target.get_or_init(|| DohTarget {
+        let uri = request_uri(&url, host_override.as_deref());
+        Ok(Self {
             url,
             host_override,
             uri,
-        }))
+        })
     }
+}
+
+/// 直连 HTTP/2 的请求 URI（见 [`DohTarget::uri`]）/ The request URI of the direct HTTP/2
+/// connection (see [`DohTarget::uri`])
+fn request_uri(url: &Url, host_override: Option<&str>) -> Option<hyper::Uri> {
+    let mut parts = hyper::Uri::try_from(url.as_str()).ok()?.into_parts();
+    if let Some(host) = host_override {
+        parts.authority = Some(host.parse().ok()?);
+    }
+    hyper::Uri::from_parts(parts).ok()
 }
 
 pub struct DohClient {
@@ -2207,11 +2218,23 @@ impl DohClient {
         url
     }
 
-    /// Build a fresh reqwest client. Used for both initial construction and pool
+    /// Build a fresh reqwest client for `target`. Used for both initial construction and pool
     /// rebuilds (the latter evicts dead/half-open connections).
-    /// 构建新的 reqwest 客户端，用于初始构造和连接池重建（后者驱逐死/半开连接）
-    fn build_client(&self) -> anyhow::Result<DohHttpClient> {
+    /// 为 `target` 构建新的 reqwest 客户端，用于初始构造和连接池重建（后者驱逐死/半开连接）
+    ///
+    /// reqwest 说 HTTP/2 时 :authority 只取自 URL，覆盖的 Host 只能另作一个和它不同的 Host 头，RFC 9113 §8.3.1 不许；
+    /// 所以有覆盖的上游经 reqwest 时只说 HTTP/1.1，HTTP/2 交给直连（见 [`DohTarget::uri`]）
+    /// Under HTTP/2 reqwest takes :authority from the URL alone, so a Host override could only go
+    /// as a Host header differing from it, which RFC 9113 §8.3.1 forbids; an upstream with an
+    /// override therefore speaks only HTTP/1.1 through reqwest, HTTP/2 being left to the direct
+    /// connection (see [`DohTarget::uri`])
+    fn build_client(&self, target: &DohTarget) -> anyhow::Result<DohHttpClient> {
         let builder = DohHttpClient::builder();
+        let builder = if target.host_override.is_some() {
+            builder.http1_only()
+        } else {
+            builder
+        };
         #[cfg(test)]
         let builder = self.test_roots.iter().fold(builder, |builder, root| {
             builder.add_root_certificate(reqwest::Certificate::from_der(root).expect("test root"))
@@ -2256,13 +2279,14 @@ impl DohClient {
                 Ok(Arc::clone(existing.get()))
             }
             entry::Entry::Vacant(slot) => {
+                let target = DohTarget::new(upstream)?;
                 let state = Arc::new(DohUpstream {
-                    client: ArcSwap::from_pointee(self.build_client()?),
+                    client: ArcSwap::from_pointee(self.build_client(&target)?),
                     consecutive_errors: AtomicUsize::new(0),
                     generation: AtomicU64::new(0),
                     last_used_millis: AtomicU64::new(now),
                     paused_until: AtomicU64::new(0),
-                    target: std::sync::OnceLock::new(),
+                    target,
                     h2: H2Link::new(self.idle_timeout, self.direct_connections),
                 });
                 slot.insert(Arc::clone(&state));
@@ -2321,7 +2345,7 @@ impl DohClient {
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
         let state = self.upstream(upstream)?;
-        let target = state.target(upstream)?;
+        let target = &state.target;
         let url = &target.url;
         #[cfg(test)]
         let url = &self.scheme_for_tests(url.clone());
@@ -2453,22 +2477,19 @@ impl DohClient {
         // 将整个操作（发送 + 读取响应体）包裹在单个超时中，
         // 防止服务器发送头信息但延迟响应体时挂起。
         let result = timeout(timeout_dur, async {
-            // 握手时选了 h2 的上游直接经 h2 发，请求和 reqwest 发的一样：同样的方法、地址和头。
-            // content-length 是 hyper 和 reqwest 自己补的，h2 不补
+            // 握手时选了 h2 的上游直接经 h2 发，请求和 reqwest 经 HTTP/2 发的一样：同样的方法、地址和头。覆盖的 Host
+            // 就是 :authority，不另带 Host 头（见 [`DohTarget::uri`]）。content-length 是 hyper 和 reqwest 自己补的，h2 不补
             // An upstream that picked h2 is asked straight through h2, with the request reqwest
-            // would send: the same method, address and headers. hyper and reqwest add
+            // would send over HTTP/2: the same method, address and headers. A Host override is the
+            // :authority, with no Host header (see [`DohTarget::uri`]). hyper and reqwest add
             // content-length themselves, h2 does not
             if let Some(uri) = uri
                 && let Some((sender, _in_flight)) =
                     state.h2.sender(url, &self.tls_h2, &self.connector).await?
             {
-                let mut request = hyper::Request::post(uri.clone())
+                let request = hyper::Request::post(uri.clone())
                     .header(ACCEPT, DOH_MEDIA_TYPE)
-                    .header(CONTENT_TYPE, DOH_MEDIA_TYPE);
-                if let Some(host) = host_override {
-                    request = request.header(HOST, host);
-                }
-                let request = request
+                    .header(CONTENT_TYPE, DOH_MEDIA_TYPE)
                     .header(CONTENT_LENGTH, packet.len())
                     .body(())
                     .context("build doh request")?;
@@ -2544,7 +2565,7 @@ impl DohClient {
         state.consecutive_errors.store(0, Ordering::Release);
         // 直连的连接一起丢掉，下一个请求重新连 / The direct connections go too, and the next request connects again
         state.h2.reset();
-        match self.build_client() {
+        match self.build_client(&state.target) {
             // 旧池在持有 Arc 副本的在途请求结束后释放 / The old pool is released once the requests in
             // flight holding a clone of its Arc finish
             Ok(new_client) => state.client.store(Arc::new(new_client)),
@@ -5088,7 +5109,7 @@ mod tests {
     #[test]
     fn doh_record_error_treats_a_zero_threshold_as_disabled() {
         let client = DohClient::new(8, 0).expect("build doh client");
-        let upstream = "doh:8.8.8.8";
+        let upstream = "doh://8.8.8.8";
         let ptr_before =
             Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
 
@@ -5225,7 +5246,7 @@ mod tests {
     #[test]
     fn requests_broken_together_rebuild_once() {
         let client = DohClient::new(8, 3).expect("build doh client");
-        let upstream = "doh:8.8.8.8";
+        let upstream = "doh://8.8.8.8";
         let state = client.upstream(upstream).unwrap();
         let started = state.generation.load(Ordering::Acquire);
         let before = state.client.load_full();
@@ -5252,7 +5273,7 @@ mod tests {
         // 达阈值时重建连接池（新 reqwest::Client 是清除 reqwest 自身无法检测的
         // 死/半开连接的唯一手段）。
         let client = DohClient::new(8, 3).expect("build doh client");
-        let upstream = "doh:8.8.8.8";
+        let upstream = "doh://8.8.8.8";
 
         let ptr_before =
             Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
@@ -5292,8 +5313,8 @@ mod tests {
         // 上游的连接池一起换掉，健康上游丢失 keep-alive 连接、被迫重新握手。
         // 现在每个上游各持一个客户端。
         let client = DohClient::new(8, 3).expect("build doh client");
-        let healthy = "doh:1.1.1.1";
-        let failing = "doh:bad.example";
+        let healthy = "doh://1.1.1.1";
+        let failing = "doh://bad.example";
         let healthy_before =
             Arc::as_ptr(&client.upstream(healthy).unwrap().client.load_full()) as usize;
         let failing_before =
@@ -5322,7 +5343,7 @@ mod tests {
         // not accumulate toward a rebuild across an intervening healthy request.
         // record_success 清零 per-upstream 计数，避免偶发错误跨健康请求累积到重建。
         let client = DohClient::new(8, 3).expect("build doh client");
-        let upstream = "doh:1.1.1.1";
+        let upstream = "doh://1.1.1.1";
 
         client.record_error_of(upstream);
         client.record_error_of(upstream);
@@ -5350,13 +5371,13 @@ mod tests {
         // 一个 upstream 的错误不得累加到另一个 upstream。
         let client = DohClient::new(8, 3).expect("build doh client");
 
-        client.record_error_of("doh:8.8.8.8");
-        client.record_error_of("doh:8.8.8.8");
+        client.record_error_of("doh://8.8.8.8");
+        client.record_error_of("doh://8.8.8.8");
         // A success on a *different* upstream must not touch 8.8.8.8's count.
-        client.record_success("doh:1.1.1.1");
+        client.record_success("doh://1.1.1.1");
         // 8.8.8.8 still at 2 — the 3rd error rebuilds.
         assert!(
-            client.record_error_of("doh:8.8.8.8"),
+            client.record_error_of("doh://8.8.8.8"),
             "isolated counter reaches threshold independently"
         );
     }

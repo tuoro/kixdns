@@ -267,7 +267,7 @@ The following prefixes override the transport field:
 | dot:// | DoT | tls:// |
 | doq:// | DoQ | quic:// |
 
-Without a prefix, an omitted transport means UDP. DoH URLs without a path use /dns-query. DoH supports a host query parameter as an HTTP Host override; that parameter is removed before the request is sent. A DoH answer is taken only with a success status, the application/dns-message media type and at most 65535 bytes; a redirect (3xx) is not followed and fails the upstream like any other error status.
+Without a prefix, an omitted transport means UDP. DoH URLs without a path use /dns-query. DoH supports a host query parameter overriding the request's authority: the Host header under HTTP/1.1, the :authority under HTTP/2 (with no Host header), the connection and TLS still following the host in the URL; with `HTTPS_PROXY` / `ALL_PROXY` set, an upstream with it speaks HTTP/1.1 only. That parameter is removed before the request is sent. A DoH answer is taken only with a success status, the application/dns-message media type and at most 65535 bytes; a redirect (3xx) is not followed and fails the upstream like any other error status.
 
 A DoH upstream that answers 429 Too Many Requests is not retried and does not count towards doh_health_check_error_threshold; it pauses from that moment for the seconds its Retry-After gives, brought into 1 to 60, or for 1 second when Retry-After is missing, a date or unreadable. While it is paused, a forward asking several upstreams together (several in one upstream, or several forward actions in one rule) leaves it out and the others answer; when every upstream of the set is paused all are asked as usual, and a forward to this upstream alone still asks it. The start of a pause logs one warning.
 
