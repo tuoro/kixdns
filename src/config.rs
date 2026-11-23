@@ -1466,18 +1466,21 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 }
 
 /// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，一个国家
-/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时。启动、重载
+/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时，没设
+/// bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`）。启动、重载
 /// 和面板的校验都不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制
 /// 通道 `config` 结果的 `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
 /// [`RETIRED_SETTINGS`]) and the background refresh rule, a geoip matcher written with no
-/// country code, which never matches, a cache so large it may take a lot of memory, and an
-/// overall timeout too short for the resend and the TCP fallback. Startup, reloads and the
-/// panel's validation refuse none of them, nor do they count among [`problems`]; they are
-/// found as the configuration compiles (see `RuntimePipelineConfig::warnings`), listed in the
-/// validation answer and as `warnings` in the control channel's `config` result, and each is
-/// logged as a warn every time the configuration takes effect. They used to be logged only, out
-/// of sight at the default log level, and validation said nothing of them
+/// country code, which never matches, a cache so large it may take a lot of memory, an overall
+/// timeout too short for the resend and the TCP fallback, and upstreams written with a host name
+/// while bootstrap is unset (resolving comes back round should the system resolver be KixDNS
+/// itself, see `engine::bootstrap`). Startup, reloads and the panel's validation refuse none of
+/// them, nor do they count among [`problems`]; they are found as the configuration compiles (see
+/// `RuntimePipelineConfig::warnings`), listed in the validation answer and as `warnings` in the
+/// control channel's `config` result, and each is logged as a warn every time the configuration
+/// takes effect. They used to be logged only, out of sight at the default log level, and
+/// validation said nothing of them
 pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     let mut found = Vec::new();
     if cfg.background_refresh_rule.is_some() {
@@ -1504,6 +1507,45 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
         found.push(format!(
             "settings.request_timeout_ms: {request_timeout} is under 2.5 times upstream_timeout_ms ({}), which may cut the resend and the TCP fallback short",
             settings.upstream_timeout_ms
+        ));
+    }
+    // 没设 bootstrap 时，写成主机名的上游交给系统的解析器解析（见 `engine::bootstrap`）。不写 upstream 的 forward 问的是
+    // 默认上游，按它自己的 transport 连 / Without bootstrap, upstreams written with a host name are
+    // resolved by the system resolver (see `engine::bootstrap`). A forward naming no upstream asks
+    // the default one, connected to by its own transport
+    let forwards = cfg
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| &pipeline.rules)
+        .flat_map(|rule| {
+            rule.actions
+                .iter()
+                .chain(&rule.response_actions_on_match)
+                .chain(&rule.response_actions_on_miss)
+        })
+        .filter_map(|action| match action {
+            Action::Forward {
+                upstream,
+                transport,
+                ..
+            } => Some((
+                upstream.as_deref().unwrap_or(&settings.default_upstream),
+                transport.unwrap_or(Transport::Udp),
+            )),
+            _ => None,
+        });
+    if !names_an_address(&settings.bootstrap)
+        && let Some(host) = std::iter::once((settings.default_upstream.as_str(), Transport::Udp))
+            .chain(forwards)
+            .flat_map(|(upstreams, transport)| {
+                split_upstreams(upstreams).map(move |upstream| (upstream, transport))
+            })
+            .find_map(|(upstream, transport)| {
+                crate::engine::upstream::host_name(upstream, transport)
+            })
+    {
+        found.push(format!(
+            "settings.bootstrap is unset, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
         ));
     }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
@@ -2216,6 +2258,64 @@ mod validation_tests {
 
     fn problems_of(config: serde_json::Value) -> Vec<String> {
         super::problems(&super::parse_config(&config.to_string()).expect("parses"))
+    }
+
+    /// 没设 bootstrap 时，写成主机名的 TCP、DoT、DoH、DoQ 上游算一条 warning：默认上游、请求和回答阶段的 forward 都算，
+    /// 不写 upstream 的 forward 按它的 transport 连默认上游。都写成 IP、只有 UDP 上游或者设了 bootstrap 时没有。以前只在
+    /// 第一次经系统解析时记一条 warn，默认日志级别看不到
+    /// Without bootstrap, a TCP, DoT, DoH or DoQ upstream written with a host name counts as a
+    /// warning: the default upstream and request- and answer-phase forwards alike, a forward naming
+    /// no upstream connecting to the default one by its transport. None with every upstream an IP,
+    /// with UDP upstreams only, or with bootstrap set. It used to be a warn logged the first time
+    /// the system resolved a name, out of sight at the default log level
+    #[test]
+    fn a_named_upstream_without_bootstrap_is_a_warning() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let warned = |settings: serde_json::Value, actions: serde_json::Value| {
+            let config = serde_json::json!({
+                "settings": settings,
+                "pipelines": [{ "id": "main", "rules": [rule("r", any.clone(), actions)] }]
+            });
+            super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
+                .iter()
+                .any(|warning| warning.starts_with("settings.bootstrap is unset"))
+        };
+        let udp = serde_json::json!({ "default_upstream": "1.1.1.1:53" });
+        let forward =
+            |upstream: &str| serde_json::json!([{ "type": "forward", "upstream": upstream }]);
+        for named in [
+            "tcp://dns.example:53",
+            "tls://dns.example",
+            "https://dns.example/dns-query",
+            "quic://dns.example?sni=dns.example",
+        ] {
+            assert!(warned(udp.clone(), forward(named)), "{named}");
+            assert!(
+                !warned(
+                    serde_json::json!({ "default_upstream": "1.1.1.1:53", "bootstrap": "223.5.5.5:53" }),
+                    forward(named)
+                ),
+                "{named} with bootstrap"
+            );
+        }
+        assert!(warned(
+            serde_json::json!({ "default_upstream": "tls://dns.example" }),
+            serde_json::json!([{ "type": "allow" }])
+        ));
+        assert!(warned(
+            serde_json::json!({ "default_upstream": "dns.example:53" }),
+            serde_json::json!([{ "type": "forward", "transport": "tcp" }])
+        ));
+        for ip in [
+            "1.1.1.1:53",
+            "tcp://1.1.1.1:53",
+            "tcp://[2606:4700::1111]:53",
+            "tls://1.1.1.1?sni=one.one.one.one",
+            "https://1.1.1.1/dns-query",
+            "https://[2606:4700::1111]/dns-query",
+        ] {
+            assert!(!warned(udp.clone(), forward(ip)), "{ip}");
+        }
     }
 
     /// 白写的取反报出来：第一个匹配器上的 `not`，只有一个匹配器时规则级的 `not`，入口、请求和回答的匹配器都一样。第一个上

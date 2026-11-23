@@ -31,7 +31,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doh_tls_key | null | PEM 私钥路径；设置 bind_doh 时必需。 |
 | doh_path | /dns-query | 入站 DoH 请求路径。 |
 | default_upstream | 1.1.1.1:53 | 默认上游；支持逗号分隔列表。 |
-| bootstrap | 空 | 解析写成主机名的上游（TCP、DoT、DoH、DoQ）用的明文 DNS 服务器，逗号分隔的 `IP:端口`，经 UDP 问；几个一起问，取先答出地址的那个。问到的地址按 TTL 留着，TTL 过了又一个也问不到时接着用上次的。不设时交给系统的解析器：系统的解析器要是 KixDNS 自己，解析上游的名字会绕回来问 KixDNS，上游就连不上，所以这时第一次经系统解析名字会记一条 warn。写成 IP 的上游不用解析。 |
+| bootstrap | 空 | 解析写成主机名的上游（TCP、DoT、DoH、DoQ）用的明文 DNS 服务器，逗号分隔的 `IP:端口`，经 UDP 问；几个一起问，取先答出地址的那个，A 和 AAAA 有一种先答出了地址时另一种最多再等 50 毫秒。问到的地址马上就用：TTL 过了也照用，同时在后台再问一次，问不到就一直用上次的；只有从没问到过的名字要等，最多 2 秒。不设时交给系统的解析器：系统的解析器要是 KixDNS 自己，解析上游的名字会绕回来问 KixDNS，上游就连不上，所以这时有写成主机名的 TCP、DoT、DoH、DoQ 上游会算一条警告（见下面值得知道的写法）。写成 IP 的上游不用解析。 |
 | upstream_timeout_ms | 9000 | 单次上游操作超时；必须大于 0。UDP 转发等过这个上游最近最慢百分之一回答的用时还没有回答，会把查询再发一次（至少等 50 毫秒，最多等超时的三分之一；这个上游还没回答过时等三分之一），此后一整个超时里两次谁的回答先到用谁的。 |
 | request_timeout_ms | null | 整体请求超时；为 null 时使用 upstream_timeout_ms * 2.5，且不能小于 upstream_timeout_ms。 |
 | response_jump_limit | 10 | 响应阶段最多跳转几次 Pipeline（回答动作里的跳转和跳转之后规则级的跳转都算）；再跳就回 SERVFAIL。 |
@@ -41,7 +41,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | dot_pool_size | 64 | 每个上游最多几条 DoT 连接，平常只用一条，规则和 `tcp_pool_size` 一样。 |
 | doq_pool_size | 16 | 每个上游最多几条 DoQ 连接，平常只用一条，规则和 `tcp_pool_size` 一样。连接没了、或者查询超时而这期间连接上没有别的回答时才换新的；回答不合协议、流被重置只算这一个查询失败。 |
 | tcp_connection_max_age_seconds | 300 | TCP/DoT 连接最大存活时间；0 禁用。 |
-| tcp_connection_idle_timeout_seconds | 60 | TCP/DoT 空闲超时；0 禁用。 |
+| tcp_connection_idle_timeout_seconds | 60 | TCP/DoT 连接空闲多久就关掉：连接上的查询都过了期限以后，这么久没有新查询；排在池后面、平常轮不到的连接也一样（RFC 7766 第 6.2.3 节）。DoT 关的时候先发 close_notify。0 禁用。 |
 | doq_connection_idle_timeout_seconds | 60 | DoQ 空闲超时；0 禁用。 |
 | doq_keepalive_interval_ms | 15000 | DoQ keepalive 间隔；0 禁用。 |
 | doq_enable_0rtt | true | 全局 DoQ 0-RTT 设置。 |
@@ -273,11 +273,13 @@ upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多�
 
 DoH 上游回 429 Too Many Requests 时不重试，也不计入 doh_health_check_error_threshold，这个上游从这时起暂停一会儿：秒数按 Retry-After，收进 1 到 60 秒；没写、写的是日期或读不懂时暂停 1 秒。暂停期间，几个上游一起问（一个 upstream 里写了几个，或一条规则写了几个 forward）时不问它，由别的上游作答；一组里全都在暂停时照常全问，只写了这一个上游的转发也照问。暂停开始时记一条 warn。
 
+DoH 上游连不上（建连或 TLS、HTTP/2 握手失败，或者还在建连失败以后的退避里）时同样不重试，也不计入 doh_health_check_error_threshold：重建连接池是为了丢掉坏了的连接，这时没有连接可丢。在建好的连接上收发出错或者超时，才重试一次、计入它。
+
 DoT 未提供端口时使用 853。可通过 sni 或 servername 查询参数设置 TLS 名称，且 DoT 上游不能包含 DNS path。
 
 DoQ 未提供端口时使用 853。可通过 sni/servername 和 0rtt/enable_0rtt 查询参数配置。使用 IP 字面量的 DoQ 上游必须显式设置 SNI。0-RTT 默认全局启用，也可以按上游覆盖；用了 0-RTT 的连接超时或被拒绝后，会在进程重启前对该上游的所有连接禁用 0-RTT。被拒绝既包括明确报告拒绝，也包括对端直接关闭或重置连接——拒收早期数据的服务器常常是这么回应的；没用 0-RTT 的连接超时只算回答慢，不影响 0-RTT。
 
-TCP、DoT、DoQ 上游和走 HTTP/2 的 DoH 上游，连接都在后台建，最多用 5 秒（解析名字和握手都算在内）：发起建连的查询先超时或被取消了（比如一起问的别的上游先答了），连接照样建完，留给下一个查询用；那个查询用之前先看它还通不通，上游这期间已经关掉的就重建一条。建连失败以后这个上游歇 250 毫秒再连，接连失败每次翻倍，最多 5 秒，从失败的那一刻算起；这期间转给它的查询当场失败，不再去连。上游解析出几个地址时错开着连（RFC 8305）：两族交替，第一个地址那一族在前（DoQ 总是 IPv4 在前），一个地址 250 毫秒还没连上、或者连不上，就接着连下一个，先连上的那个用。
+TCP、DoT、DoQ 上游和走 HTTP/2 的 DoH 上游，连接都在后台建，最多用 5 秒（解析名字和握手都算在内）：发起建连的查询先超时或被取消了（比如一起问的别的上游先答了），连接照样建完，留给下一个查询用；那个查询用之前先看它还通不通，上游这期间已经关掉的就重建一条。建连失败以后这个上游歇 250 毫秒再连，接连失败每次翻倍，最多 5 秒，从失败的那一刻算起；这期间转给它的查询当场失败，不再去连。上游解析出几个地址时错开着连（RFC 8305）：两族交替，第一个地址那一族在前（DoQ 总是 IPv4 在前），一个地址 250 毫秒还没连上、或者连不上，就接着连下一个，先连上的那个用。TCP、DoT 的连接在查询等回答时断了，而它是这次查询之前就有的、或者答过别的查询（上游答了一些就关掉），没答的查询换一条新连接重发一次（RFC 7766 第 6.2.1.1 节）；这次查询自己新建、一个也没答就断了的不重发。
 
 上游的回答必须是这次查询的问题（名称不分大小写，类型和类别相同）才收：UDP、TCP、DoT 上对不上的回答丢掉，继续等真正的回答；DoH、DoQ 上一个查询只有一个回答，对不上就算这个上游失败。没有问题段、也不带任何记录的错误回答（有些上游这样回 FORMERR、NOTIMP）照收。
 
@@ -424,9 +426,9 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 下面这些写法以前能加载，却会悄悄做成别的事：读不懂的上游地址（端口不对、UDP 上游不是 IP 地址、不认识的前缀如 `http://`、IP 字面量的 DoQ 没写 SNI）、拼错的 rcode（以前回 NXDOMAIN）、无效的静态 IP 或 CNAME 目标、装不进一条记录的 TXT（以前回 SERVFAIL）、跳到不存在的 Pipeline（跳转动作或 pipeline_select），空的 domain_suffix 或 domain_regex（以前匹配所有域名），同一条规则里几个 forward 的 ecs 写得不一样（以前一个也不发），几个 Pipeline 写了同一个 id（按 id 只找得到其中一个，其余的规则不会照写的执行），ecs 的 static 模式里不是 IP 的地址（以前每个查询记一条警告、不发 ECS），以及内核不读的键：拼错的设置名，写错名字或层级的规则、Pipeline、pipeline_select 的键（比如把 `matchers` 写成 `matcher`，以前这条规则没有匹配器，匹配所有查询），动作、匹配器和 ecs 里拼错的或这一种不读的键（比如把 forward 的 `upstream` 写成 `upstrem`，以前问的是默认上游），按 `settings.min_tll`、`pipelines[0].rules[2].matcher`、`pipelines[0].rules[2].actions[0].upstrem` 这样的路径、按写的顺序报出来（那里拼错的必填字段照旧报解析错误）；已经删掉的旧设置（智能流控以前的五个数字、`prefetch`、从来数不到的 `tcp_health_check_error_threshold`、不再起作用的 `statistics_enabled` 和 `statistics_anonymize_client_ip`（排行照原样记客户端地址）、从来没被读过的 `geoip_auto_convert` 和 `geoip_filter_countries`）照常忽略，只记一条警告（见下一段）。启动时遇到它们只在日志里记警告、照旧加载，已经在用的配置升级以后行为不变（默认日志级别看不到这些警告，控制通道 `config` 结果的 `problems` 也把它们列出来，重载成功以后清空）；热重载和控制通道的配置校验会拒绝，并一次列出全部问题，所以下一次改配置时要把它们改掉。
 
-还有一些写法照样加载、照写的做，却值得知道：上面这些退役的设置和 background_refresh_rule，一个国家代码也没写的 geoip_country 和 response_answer_ip_geoip_country（永远不命中），大于 1000000 的 cache_capacity（可能占掉很多内存），不到 upstream_timeout_ms 两倍半的 request_timeout_ms（可能来不及重发和改用 TCP）。它们不算上面的问题，启动、重载和校验都不拒绝：配置每生效一次各记一条警告，控制通道 `config` 结果的 `warnings` 列出当前配置里的这些写法，配置校验的回答也带着 `warnings`。
+还有一些写法照样加载、照写的做，却值得知道：上面这些退役的设置和 background_refresh_rule，一个国家代码也没写的 geoip_country 和 response_answer_ip_geoip_country（永远不命中），大于 1000000 的 cache_capacity（可能占掉很多内存），不到 upstream_timeout_ms 两倍半的 request_timeout_ms（可能来不及重发和改用 TCP），没设 bootstrap 却有写成主机名的 TCP、DoT、DoH、DoQ 上游（系统的解析器要是 KixDNS 自己，解析会绕回来）。它们不算上面的问题，启动、重载和校验都不拒绝：配置每生效一次各记一条警告，控制通道 `config` 结果的 `warnings` 列出当前配置里的这些写法，配置校验的回答也带着 `warnings`。
 
-下面这些全局设置只在启动时读取，重载不会让它们生效，修改后要重启服务：`bind_udp`、`bind_tcp`、`bind_doh`、`doh_path`、`doh_tls_cert`、`doh_tls_key`、`cache_capacity`、`cache_max_ttl`、`dashmap_shards`、`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`doh_health_check_error_threshold`、`dot_pool_size`、`doq_pool_size`、`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`、`doq_connection_idle_timeout_seconds`、`doq_keepalive_interval_ms`、`doq_enable_0rtt`、`bootstrap` 和全部 `flow_control_*`。其余全局设置重载即生效。重载后，配置里改过、还在等重启的设置会出现在控制通道 `config` 结果的 `restart_pending` 里；改回启动时的值，或者重启以后，它就不再出现。重载时改这些设置不会让缓存作废。UDP worker 数量由命令行指定，同样只在启动时生效。DoH TLS 证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。配置文件、证书和私钥、Geo 数据文件是符号链接时（比如 Kubernetes 的 ConfigMap、Secret 卷），链接指向的文件变了、路上哪个链接换了指向，都算文件变了，监控跟着新的指向走。这些文件写完才读：Linux 上等写的一方关上文件或者改名到位；别的平台等写入停下 0.3 秒；一直有人在写时最多等 2 秒也读一次。只改属性（chmod、chown）不算改动。读出来不对（写坏了、半截文件）时留着正在用的，等文件下次改动。
+下面这些全局设置只在启动时读取，重载不会让它们生效，修改后要重启服务：`bind_udp`、`bind_tcp`、`bind_doh`、`doh_path`、`doh_tls_cert`、`doh_tls_key`、`cache_capacity`、`cache_max_ttl`、`dashmap_shards`、`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`doh_health_check_error_threshold`、`dot_pool_size`、`doq_pool_size`、`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`、`doq_connection_idle_timeout_seconds`、`doq_keepalive_interval_ms`、`doq_enable_0rtt`、`bootstrap` 和 `flow_control_enabled`。其余全局设置重载即生效。重载后，配置里改过、还在等重启的设置会出现在控制通道 `config` 结果的 `restart_pending` 里；改回启动时的值，或者重启以后，它就不再出现。重载时改这些设置不会让缓存作废。UDP worker 数量由命令行指定，同样只在启动时生效。DoH TLS 证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。配置文件、证书和私钥、Geo 数据文件是符号链接时（比如 Kubernetes 的 ConfigMap、Secret 卷），链接指向的文件变了、路上哪个链接换了指向，都算文件变了，监控跟着新的指向走。这些文件写完才读：Linux 上等写的一方关上文件或者改名到位；别的平台等写入停下 0.3 秒；一直有人在写时最多等 2 秒也读一次。只改属性（chmod、chown）不算改动。读出来不对（写坏了、半截文件）时留着正在用的，等文件下次改动。
 
 重载后，配置里不再出现的上游会关闭它们的 TCP、DoT、DoQ 连接；正在使用这些连接的请求处理完之后才会关闭。
 
