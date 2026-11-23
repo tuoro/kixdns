@@ -205,12 +205,7 @@ pub(crate) fn tcp_upstreams(
     cfg.pipelines
         .iter()
         .flat_map(|p| &p.rules)
-        .flat_map(|rule| {
-            rule.actions
-                .iter()
-                .chain(&rule.response_actions_on_match)
-                .chain(&rule.response_actions_on_miss)
-        })
+        .flat_map(crate::matcher::RuntimeRule::all_actions)
         .filter_map(|action| match action {
             crate::config::Action::Forward {
                 upstream: Some(upstream),
@@ -321,12 +316,7 @@ pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys
     };
     add(&cfg.settings.default_upstream, None);
     for rule in cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules) {
-        for action in rule
-            .actions
-            .iter()
-            .chain(&rule.response_actions_on_match)
-            .chain(&rule.response_actions_on_miss)
-        {
+        for action in rule.all_actions() {
             if let crate::config::Action::Forward {
                 upstream,
                 transport,

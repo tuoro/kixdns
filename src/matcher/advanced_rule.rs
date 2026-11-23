@@ -35,13 +35,13 @@ pub struct CompiledRule {
     /// Rule name from the configuration, reported to observers on fast-path matches.
     /// 配置中的规则名，快速路径命中时上报给观察者。
     pub rule_name: Arc<str>,
-    /// 规则的匹配器，和完整规则路径用的是同一份、同一个判断（`RuntimeMatcher::matches_with_qtype`），两条路径对规则
-    /// 是否命中从不分歧。以前快速路径另有一份 `CompiledMatcher`，把每种匹配器重写了一遍
-    /// The rule's matchers, the same ones the full rule path uses, judged the same way
+    /// 规则的匹配器，和完整规则路径共用同一份、同一个判断（`RuntimeMatcher::matches_with_qtype`），两条路径对规则
+    /// 是否命中从不分歧。以前快速路径另有一份 `CompiledMatcher`，把每种匹配器重写了一遍，后来又复制一份完整规则的
+    /// The rule's matchers, shared with the full rule path and judged the same way
     /// (`RuntimeMatcher::matches_with_qtype`), so the two paths never disagree on whether a rule
     /// matches. The fast path used to keep a `CompiledMatcher` of its own, every kind of
-    /// matcher written out again
-    pub matchers: Vec<RuntimeMatcherWithOp>,
+    /// matcher written out again, and then a copy of the full rule's
+    pub matchers: Arc<[RuntimeMatcherWithOp]>,
     pub precomputed: Option<PrecomputedAction>,
     /// Whether a matcher needs GeoSite data, which the fast path leaves to the
     /// full rule path (see `fast_static_match_with_rule`).
@@ -121,7 +121,7 @@ impl RuleIndex {
         }
 
         let mut indexed = false;
-        for m in &rule.matchers {
+        for m in rule.matchers.iter() {
             match &m.matcher {
                 RuntimeMatcher::DomainExact { value } if !value.is_empty() => {
                     self.domain_exact
@@ -221,7 +221,7 @@ fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
 fn compile_rule(rule: &RuntimeRule) -> CompiledRule {
     CompiledRule {
         rule_name: rule.name.clone(),
-        matchers: rule.matchers.clone(),
+        matchers: Arc::clone(&rule.matchers),
         precomputed: precompute_action(rule),
         needs_geosite: rule.matchers.iter().any(|m| {
             matches!(
