@@ -315,7 +315,7 @@ impl Regexes {
             {
                 Ok(sets) => Self::Sets(sets),
                 Err(err) => {
-                    warn!(target = "geosite", regexes = count, error = %err,
+                    warn!(regexes = count, error = %err,
                         "GeoSite regexes too large to combine, matching them one by one");
                     Self::Each(Self::compile_each(&patterns))
                 }
@@ -363,8 +363,8 @@ impl Regexes {
             .filter_map(|pattern| {
                 Self::compile(pattern)
                     .inspect_err(|err| {
-                        warn!(target = "geosite", pattern = %pattern, error = %err,
-                             "regex pattern does not compile, skipping it");
+                        warn!(pattern = %pattern, error = %err,
+                             "GeoSite regex pattern does not compile, skipping it");
                     })
                     .ok()
             })
@@ -478,8 +478,8 @@ impl TagBuilder {
             DatEntry::Regex(pattern) => match ascii_regex_pattern(&pattern) {
                 Ok(pattern) => self.regexes.push(pattern),
                 Err(err) => {
-                    warn!(target = "geosite", pattern = %pattern, error = %err,
-                         "invalid regex pattern, skipping it");
+                    warn!(pattern = %pattern, error = %err,
+                         "invalid GeoSite regex pattern, skipping it");
                 }
             },
         }
@@ -830,7 +830,7 @@ impl Domain {
             }
             3 => DatEntry::Matcher(DomainMatcher::Full(value)), // Full
             kind => {
-                warn!(target = "geosite", type = kind,
+                warn!(type = kind,
                      "unknown V2Ray domain type, using full matcher");
                 DatEntry::Matcher(DomainMatcher::Full(value))
             }
@@ -1143,7 +1143,6 @@ impl GeoSiteManager {
                 Ok(parsed) => {
                     if parsed.len() < wanted.len() {
                         warn!(
-                            target = "geosite",
                             path = %path.display(), wanted = wanted.len(), taken = parsed.len(),
                             "data file no longer contains every tag it was recorded as providing"
                         );
@@ -1152,7 +1151,6 @@ impl GeoSiteManager {
                 }
                 Err(e) => {
                     warn!(
-                        target = "geosite",
                         path = %path.display(), tags = wanted.len(), error = %e,
                         "failed to re-read shared tags, keeping the current entries"
                     );
@@ -1328,7 +1326,7 @@ impl GeoSiteManager {
         }
 
         if let Some(tags) = tags {
-            info!(target = "geosite", requested_tags = ?tags,
+            info!(requested_tags = ?tags,
                  "loading GeoSite data selectively from .dat file");
         }
 
@@ -1367,7 +1365,7 @@ impl GeoSiteManager {
                     let tag = std::str::from_utf8(&field)
                         .context("GeoSite tag in .dat file is not UTF-8")?
                         .to_lowercase();
-                    debug!(target = "geosite", tag = %tag, "read GeoSite tag");
+                    debug!(tag = %tag, "read GeoSite tag");
                     // Match against base tags (supports `@attr` split); with no tag named,
                     // every non-empty tag is wanted
                     match tags {
@@ -1417,31 +1415,29 @@ impl GeoSiteManager {
             for ((builder, count), (store_tag, attr_filter)) in builders.into_iter().zip(&requests)
             {
                 if count > 0 {
-                    info!(target = "geosite", tag = %store_tag,
+                    info!(tag = %store_tag,
                           domain_count = count,
                           attr_filter = ?attr_filter,
                           "loaded GeoSite tag with domains");
                     parsed.push((store_tag.clone(), builder.finish()));
                 } else if tags.is_none() {
-                    warn!(target = "geosite", tag = %store_tag,
-                          "tag has no valid domains, skipping");
+                    warn!(tag = %store_tag,
+                          "GeoSite tag has no valid domains, skipping");
                 } else {
-                    warn!(target = "geosite", tag = %store_tag,
+                    warn!(tag = %store_tag,
                           attr_filter = ?attr_filter,
-                          "no domains matched attribute filter");
+                          "no GeoSite domains matched the attribute filter");
                 }
             }
         }
 
         match tags {
             Some(tags) => info!(
-                target = "geosite",
                 loaded_count = parsed.len(),
                 requested_count = tags.len(),
                 "selectively loaded GeoSite data from .dat file"
             ),
             None => info!(
-                target = "geosite",
                 loaded_count = parsed.len(),
                 "loaded GeoSite data from V2Ray .dat file"
             ),
@@ -1542,7 +1538,6 @@ impl GeoSiteManager {
                     .collect();
                 if let Some(example) = first_skipped {
                     warn!(
-                        target = "geosite",
                         tag = %tag,
                         skipped,
                         example = %example,
