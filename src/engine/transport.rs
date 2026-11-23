@@ -659,7 +659,6 @@ pub struct StreamMultiplexer<T: StreamTransport> {
     /// 建连用的共享部分 / What connects share
     shared: T::Shared,
     /// 健康检查配置 / Health check configuration
-    health_error_threshold: usize,
     max_age_secs: u64,
     idle_timeout_secs: u64,
 }
@@ -679,7 +678,6 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
     fn with_shared(
         shared: T::Shared,
         pool_size: usize,
-        health_error_threshold: usize,
         max_age_secs: u64,
         idle_timeout_secs: u64,
     ) -> Self {
@@ -687,7 +685,6 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
             pools: UpstreamPools::new(),
             pool_size: pool_size.max(1),
             shared,
-            health_error_threshold,
             max_age_secs,
             idle_timeout_secs,
         }
@@ -714,7 +711,6 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
                         self.shared.clone(),
                         upstream.clone(),
                         StreamHealth {
-                            error_threshold: self.health_error_threshold,
                             max_age_ms: self.max_age_secs * 1000,
                             idle_timeout_ms: self.idle_timeout_secs * 1000,
                         },
@@ -749,19 +745,8 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
 }
 
 impl TcpMultiplexer {
-    pub fn new(
-        pool_size: usize,
-        health_error_threshold: usize,
-        max_age_secs: u64,
-        idle_timeout_secs: u64,
-    ) -> Self {
-        Self::with_shared(
-            (),
-            pool_size,
-            health_error_threshold,
-            max_age_secs,
-            idle_timeout_secs,
-        )
+    pub fn new(pool_size: usize, max_age_secs: u64, idle_timeout_secs: u64) -> Self {
+        Self::with_shared((), pool_size, max_age_secs, idle_timeout_secs)
     }
 
     /// 为配置里的 TCP 上游建好连接池，和发送时现建的一样大（`pool_size`），首个查询就不用再建。
@@ -794,7 +779,6 @@ impl TcpMultiplexer {
 impl DotMultiplexer {
     pub fn new(
         pool_size: usize,
-        health_error_threshold: usize,
         max_age_secs: u64,
         idle_timeout_secs: u64,
     ) -> anyhow::Result<Self> {
@@ -802,7 +786,6 @@ impl DotMultiplexer {
         Ok(Self::with_shared(
             Arc::new(tls_config),
             pool_size,
-            health_error_threshold,
             max_age_secs,
             idle_timeout_secs,
         ))
@@ -840,8 +823,6 @@ pub struct StreamMuxClient<T: StreamTransport> {
     /// 欠着要拆的那一代，0 是不欠（见 `reset_after_deadline`）/ The generation whose teardown is
     /// owed, 0 for none (see `reset_after_deadline`)
     reset_owed: AtomicU64,
-    /// 健康检查：连续错误计数 / Health check: consecutive error count
-    consecutive_errors: AtomicUsize,
     /// 健康检查的设置 / Health check settings
     health: StreamHealth,
     /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
@@ -865,8 +846,6 @@ pub struct StreamMuxClient<T: StreamTransport> {
 /// A TCP/DoT connection's health check settings, given when the client is built and fixed after
 #[derive(Debug, Clone, Copy)]
 struct StreamHealth {
-    /// 连续错误达到这个数就复位；0 不按次数复位 / Reset after this many errors in a row; 0 never by count
-    error_threshold: usize,
     /// 连接最长存活多久（毫秒），0 不限 / How long a connection may live (ms), 0 for no limit
     max_age_ms: u64,
     /// 空闲多久（毫秒）就复位，0 不限 / How long it may sit idle (ms) before a reset, 0 for no limit
@@ -874,10 +853,9 @@ struct StreamHealth {
 }
 
 impl Default for StreamHealth {
-    /// 3 次错误、5 分钟、1 分钟 / 3 errors, 5 minutes, 1 minute
+    /// 5 分钟、1 分钟 / 5 minutes, 1 minute
     fn default() -> Self {
         Self {
-            error_threshold: 3,
             max_age_ms: 300_000,
             idle_timeout_ms: 60_000,
         }
@@ -1013,7 +991,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             next_id: AtomicU16::new(1),
             generation: Arc::new(AtomicU64::new(0)),
             reset_owed: AtomicU64::new(0),
-            consecutive_errors: AtomicUsize::new(0),
             health,
             conn_create_time: AtomicU64::new(0),
             last_request_time: AtomicU64::new(0),
@@ -1193,59 +1170,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
     // ========== Health check methods / 健康检查方法 ==========
 
-    /// Record error and check if connection reset is needed
-    /// 记录错误并检查是否需要重置连接
-    ///
-    /// When the error threshold is exceeded, the connection is reset and the error
-    /// counter is cleared to avoid immediate re-triggering on the next error.
-    ///
-    /// 当错误阈值超过时，连接会被重置，错误计数器会被清零以避免下次错误时立即重新触发。
-    async fn record_error(&self, generation: u64) -> bool {
-        // 出错的那条连接已经换掉了：这个错误不算在替它的连接头上
-        // The connection that erred has been replaced: the error does not count against the
-        // one in its place
-        if self.generation.load(Ordering::Acquire) != generation {
-            return false;
-        }
-        let errors = self.consecutive_errors.fetch_add(1, Ordering::Release) + 1;
-        // 阈值 0 表示禁用健康检查（README 与 config.rs 如此描述），
-        // 而不是"每次错误都重置连接"。
-        // A threshold of 0 disables the health check, as README and config.rs
-        // describe, rather than resetting the connection on every error.
-        let threshold = self.health.error_threshold;
-
-        debug!(
-            upstream = %self.upstream,
-            consecutive_errors = errors,
-            threshold = threshold,
-            "{} connection error recorded",
-            T::NAME
-        );
-
-        // Check if threshold exceeded / 检查是否超过阈值
-        if threshold > 0 && errors >= threshold {
-            warn!(
-                upstream = %self.upstream,
-                consecutive_errors = errors,
-                threshold = threshold,
-                "{} connection error threshold exceeded, resetting connection",
-                T::NAME
-            );
-            // Clear error counter to avoid immediate re-triggering on next error
-            // 清零错误计数器，避免下次错误时立即重新触发
-            if self.reset(generation).await {
-                self.consecutive_errors.store(0, Ordering::Release);
-            }
-            true // Connection was reset / 连接已重置
-        } else {
-            false // Connection was not reset / 连接未重置
-        }
-    }
-
-    /// Record success and clear error counter
-    /// 记录成功并清零错误计数
+    /// 记下这一刻得到了回答，空闲从这时算起 / Notes an answer got now, idling counted from here
     fn record_success(&self) {
-        self.consecutive_errors.store(0, Ordering::Release);
         let now = unix_time_millis();
         self.last_request_time.store(now, Ordering::Release);
     }
@@ -1277,11 +1203,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     "{} connection too old, resetting",
                     T::NAME
                 );
-                // Clear error counter since we're starting fresh
-                // 清零错误计数器，因为我们重新开始
-                if self.reset(generation).await {
-                    self.consecutive_errors.store(0, Ordering::Release);
-                }
+                self.reset(generation).await;
                 return true;
             }
         }
@@ -1299,11 +1221,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     "{} connection idle timeout, resetting",
                     T::NAME
                 );
-                // Clear error counter since we're starting fresh
-                // 清零错误计数器，因为我们重新开始
-                if self.reset(generation).await {
-                    self.consecutive_errors.store(0, Ordering::Release);
-                }
+                self.reset(generation).await;
                 return true;
             }
         }
@@ -1452,11 +1370,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 return Err(err);
             }
             Ok(Err(_canceled)) => {
-                // Guard will remove pending entry automatically
-
-                // Record error but DO NOT reset - Mux handles ignored responses
-                // 记录错误但不重置 - Mux 会处理被忽略的响应
-                self.record_error(generation).await;
+                // 发送的那一头没给结果就没了（正常不会：拿走条目的都先给结果）/ The sending end went
+                // without an outcome (not normally: whatever takes an entry gives its outcome first)
                 return Err(anyhow::anyhow!(
                     "{name} response canceled for upstream {upstream}",
                     name = T::NAME,
@@ -1507,26 +1422,15 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     /// `budget` 约束建连（包括 DoT 的 TLS 握手）；失败时立即释放锁。
     async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
         let started = tokio::time::Instant::now();
-        // First, check if we need to reconnect based on error state
-        // 首先，根据错误状态检查是否需要重连。要拆的是欠着的那一代（见 `reset_after_deadline`），或者记着错误的
-        // 这一代：先记下是哪一代再看错误数，拆的时候连接已经换过就什么都不动
-        // What has to go is the generation whose teardown is owed (see `reset_after_deadline`), or
-        // this one if it has errors recorded: the generation is noted before the errors are read,
-        // and a connection replaced by the time of the teardown is left alone
+        // 欠着要拆的那一代（见 `reset_after_deadline`）先拆掉；拆的时候连接已经换过就什么都不动
+        // The generation whose teardown is owed (see `reset_after_deadline`) goes first; a
+        // connection replaced by the time of the teardown is left alone
         let owed = self.reset_owed.load(Ordering::Acquire);
-        let current = self.generation.load(Ordering::Acquire);
-        let errors = self.consecutive_errors.load(Ordering::Acquire);
-        let to_reset = if owed != 0 {
-            Some(owed)
-        } else {
-            (errors > 0).then_some(current)
-        };
-
-        if let Some(generation) = to_reset {
+        if owed != 0 {
+            let generation = owed;
             debug!(
                 upstream = %self.upstream,
-                consecutive_errors = errors,
-                "{} connection needs a reset before ensure",
+                "{} connection owes a reset before ensure",
                 T::NAME
             );
             // 欠着的复位也守预算：前面的登记占着锁时不能等过时限；没做完下次再做
@@ -1591,10 +1495,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             let now = unix_time_millis();
             self.conn_create_time.store(now, Ordering::Release);
             self.last_request_time.store(now, Ordering::Release);
-
-            // Clear error count for new connection
-            // 清除新连接的错误计数
-            self.consecutive_errors.store(0, Ordering::Release);
 
             info!(upstream = %self.upstream, "{} connection established", T::NAME);
         }
@@ -1757,9 +1657,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             return;
         };
         let why = format!("{} connection reset", T::NAME);
-        if Self::close_locked(&self.pending, &mut slot, generation, &why) {
-            self.consecutive_errors.store(0, Ordering::Release);
-        }
+        Self::close_locked(&self.pending, &mut slot, generation, &why);
     }
 }
 
@@ -5098,7 +4996,7 @@ mod tests {
     /// connection slot of its own
     #[test]
     fn a_warmed_up_pool_has_every_client() {
-        let mux = TcpMultiplexer::new(3, 3, 0, 0);
+        let mux = TcpMultiplexer::new(3, 0, 0);
         mux.warm_up_pools(&["127.0.0.1:53".to_string()].into_iter().collect());
         let pool = mux
             .pools
@@ -5144,7 +5042,7 @@ mod tests {
                 });
             }
         });
-        let mux = TcpMultiplexer::new(2, 3, 0, 0);
+        let mux = TcpMultiplexer::new(2, 0, 0);
         let pool = mux.get_or_init_pool_for_test(&addr);
         assert_eq!(pool.clients.len(), 2);
         for client in &pool.clients {
@@ -5210,7 +5108,7 @@ mod tests {
     /// get one client
     #[tokio::test]
     async fn a_pool_size_of_zero_gives_one_client() {
-        let tcp = TcpMultiplexer::new(0, 3, 0, 0);
+        let tcp = TcpMultiplexer::new(0, 0, 0);
         assert_eq!(
             tcp.get_or_init_pool_for_test("192.0.2.1:53").clients.len(),
             1
@@ -6653,11 +6551,11 @@ mod tests {
     }
 
     /// 拆连接的决定点名一代：点的那一代已经换成新连接时，什么都不动。新连接照常用，等在它上面的查询不受影响，
-    /// 也没有多建一条。拆除的每条路都这样：直接复位、时限到了的查询复位、欠着的复位、记错误
+    /// 也没有多建一条。拆除的每条路都这样：直接复位、时限到了的查询复位、欠着的复位
     /// A decision to tear a connection down names a generation, and does nothing once that
     /// generation has been replaced: the new connection goes on being used, a query waiting on
     /// it is untouched, and no further connection is made. So for every way of tearing down: a
-    /// plain reset, the reset of a query past its deadline, an owed reset, a recorded error
+    /// plain reset, the reset of a query past its deadline, an owed reset
     #[tokio::test]
     async fn a_teardown_naming_a_replaced_connection_leaves_the_new_one_alone() {
         let client = tcp_test_client().await;
@@ -6686,8 +6584,6 @@ mod tests {
             client.reset_after_deadline(old).await;
             let why = "stale";
             assert!(!TcpMuxClient::close(&client.pending, &client.conn, old, why).await);
-            assert!(!client.record_error(old).await);
-            assert_eq!(client.consecutive_errors.load(Ordering::Acquire), 0);
             // 欠着拆旧的那一代：下一次建连去拆，拆不到新连接，账销掉
             // The old generation owed a teardown: the next connect goes to do it, cannot reach
             // the new connection, and the debt is cleared
@@ -6908,7 +6804,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_tcp_pool_closes_its_connection() {
         let (addr, mut closed) = upstream_noting_closes(None).await;
-        let mux = TcpMultiplexer::new(2, 3, 300, 60);
+        let mux = TcpMultiplexer::new(2, 300, 60);
         mux.send(
             &udp_test_query("a.example"),
             &addr.to_string(),
@@ -6923,7 +6819,7 @@ mod tests {
     async fn dropping_a_dot_pool_closes_its_connection() {
         let (server, client_tls) = localhost_tls(&[]);
         let (addr, mut closed) = upstream_noting_closes(Some(server)).await;
-        let mux = DotMultiplexer::with_shared(Arc::new(client_tls), 2, 3, 300, 60);
+        let mux = DotMultiplexer::with_shared(Arc::new(client_tls), 2, 300, 60);
         mux.send(
             &udp_test_query("a.example"),
             &format!("{addr}?sni=localhost"),
@@ -6934,23 +6830,11 @@ mod tests {
         kept_then_dropped(&mut closed, |keep| mux.retain_upstreams(|_| keep)).await;
     }
 
-    /// 连接池里的客户端用的是建多路复用器时给的健康设置：错误阈值、连接最长存活、空闲时长
-    /// A pool's clients take the health settings the multiplexer was built with: the error
-    /// threshold, the longest a connection may live and how long it may sit idle
+    /// 连接池里的客户端用的是建多路复用器时给的健康设置：连接最长存活、空闲时长
+    /// A pool's clients take the health settings the multiplexer was built with: the longest a
+    /// connection may live and how long it may sit idle
     #[tokio::test]
     async fn pool_clients_take_the_configured_health_settings() {
-        let mux = TcpMultiplexer::new(1, 2, 0, 0);
-        let client = Arc::clone(&mux.get_or_init_pool_for_test("127.0.0.1:9").clients[0]);
-        let generation = client.generation.load(Ordering::Acquire);
-        assert!(
-            !client.record_error(generation).await,
-            "one error is below a threshold of 2"
-        );
-        assert!(
-            client.record_error(generation).await,
-            "the second error reaches it"
-        );
-
         // 把连接的出生时间或上次请求时间往前拨 2 秒，再让下一次发送做健康检查：设成 1 秒的
         // 那一项会让旧连接被关掉
         // Wind the connection's birth or its last request back 2 seconds and have the next
@@ -6963,11 +6847,11 @@ mod tests {
         };
         for (mux, age) in [
             (
-                TcpMultiplexer::new(1, 3, 1, 0),
+                TcpMultiplexer::new(1, 1, 0),
                 wind_back(|client| &client.conn_create_time),
             ),
             (
-                TcpMultiplexer::new(1, 3, 0, 1),
+                TcpMultiplexer::new(1, 0, 1),
                 wind_back(|client| &client.last_request_time),
             ),
         ] {

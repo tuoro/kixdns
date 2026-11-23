@@ -227,7 +227,6 @@ impl Engine {
 
         let tcp_mux = Arc::new(TcpMultiplexer::new(
             settings.tcp_pool_size,
-            settings.tcp_health_check_error_threshold,
             settings.tcp_connection_max_age_seconds,
             settings.tcp_connection_idle_timeout_seconds,
         ));
@@ -235,7 +234,6 @@ impl Engine {
         let dot_mux = Arc::new(
             DotMultiplexer::new(
                 settings.dot_pool_size,
-                settings.tcp_health_check_error_threshold,
                 settings.tcp_connection_max_age_seconds,
                 settings.tcp_connection_idle_timeout_seconds,
             )

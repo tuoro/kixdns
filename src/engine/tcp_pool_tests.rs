@@ -102,7 +102,7 @@ async fn a_tcp_upstream_in_the_config_gets_the_whole_pool() {
 #[tokio::test]
 async fn light_load_stays_on_one_connection() {
     let (address, connections) = tcp_upstream(Duration::from_millis(20)).await;
-    let mux = TcpMultiplexer::new(4, 3, 0, 0);
+    let mux = TcpMultiplexer::new(4, 0, 0);
     for index in 0..10 {
         mux.send(
             &query(&format!("one{index}.example.")),
@@ -128,7 +128,7 @@ async fn light_load_stays_on_one_connection() {
 #[tokio::test]
 async fn a_busy_connection_spills_to_the_next() {
     let (address, connections) = tcp_upstream(Duration::from_millis(200)).await;
-    let mux = TcpMultiplexer::new(4, 3, 0, 0);
+    let mux = TcpMultiplexer::new(4, 0, 0);
     let many = (0..2 * BUSY_AT + BUSY_AT / 2).map(|index| {
         let (mux, address, packet) = (&mux, &address, query(&format!("many{index}.example.")));
         async move { mux.send(&packet, address, Duration::from_secs(5)).await }

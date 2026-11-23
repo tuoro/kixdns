@@ -532,7 +532,6 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         doh_health_check_error_threshold: _,
         dot_pool_size: _,
         doq_pool_size: _,
-        tcp_health_check_error_threshold: _,
         tcp_connection_max_age_seconds: _,
         tcp_connection_idle_timeout_seconds: _,
         doq_connection_idle_timeout_seconds: _,
@@ -901,7 +900,6 @@ mod tests {
         settings.doh_health_check_error_threshold += 1;
         settings.dot_pool_size += 1;
         settings.doq_pool_size += 1;
-        settings.tcp_health_check_error_threshold += 1;
         settings.tcp_connection_max_age_seconds += 1;
         settings.tcp_connection_idle_timeout_seconds += 1;
         settings.doq_connection_idle_timeout_seconds += 1;
@@ -913,7 +911,7 @@ mod tests {
                 .settings
                 .restart_pending(&before_config.settings)
                 .len(),
-            22,
+            21,
             "every setting read at startup changed"
         );
         let before = build_cache_namespaces(&before_config);
