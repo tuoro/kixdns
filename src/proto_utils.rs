@@ -6,7 +6,9 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 /// 快速解析结果，零拷贝实现 / Quick parse result with zero-copy implementation
 pub struct QuickQuery<'a> {
     pub tx_id: u16,
-    pub qname_bytes: &'a [u8], // 零拷贝：直接引用已小写化的缓冲区
+    /// 问题名，已经小写，只有 ASCII：引用调用方给的缓冲区，不分配 / The question name, lowercased
+    /// and ASCII only: it refers to the buffer the caller gave, allocating nothing
+    pub qname: &'a str,
     pub qtype: u16,
     pub qclass: u16,
     pub edns_present: bool,
@@ -366,11 +368,15 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         return None;
     }
 
-    // Return slice of buf as zero-copy reference
-    // The buf already contains the lowercased domain name from the parsing loop above.
+    // 上面的循环已经把名字小写写进 buf，只放过了 ASCII，所以转成 &str 一定成功；这里照常检查，不用 unsafe：
+    // 以前另由 `qname_str_unchecked` 不检查地转，而字段是公开的，安全代码就能凑出不是 UTF-8 的名字让它转
+    // The loop above has written the name lowercased into buf, letting only ASCII through, so it
+    // always converts to &str; it is checked as usual here rather than with unsafe: it used to be
+    // converted unchecked by `qname_str_unchecked`, while the field is public, so safe code could
+    // make up a name that is no UTF-8 and have it converted
     Some(QuickQuery {
         tx_id,
-        qname_bytes: &buf[..buf_pos], // 零拷贝：直接引用已小写化的缓冲区
+        qname: std::str::from_utf8(&buf[..buf_pos]).ok()?,
         qtype,
         qclass,
         edns_present,
@@ -1375,50 +1381,6 @@ fn valid_message_len(packet: &[u8]) -> Option<usize> {
     (pos <= packet.len()).then_some(pos)
 }
 
-impl QuickQuery<'_> {
-    /// 获取 qname 的 &str 表示（零分配，但受生命周期限制）
-    /// Get &str representation of qname (zero-allocation, but lifetime-bound)
-    ///
-    /// # Performance
-    /// This is the preferred method for string operations in hot paths.
-    /// 这是热路径中字符串操作的首选方法。
-    ///
-    /// # Safety
-    /// qname_bytes is guaranteed to be valid ASCII (and thus UTF-8) by parse_quick().
-    /// parse_quick() validates ASCII before returning QuickQuery.
-    /// If parse_quick() succeeds, qname_bytes is always valid ASCII/UTF-8.
-    /// In debug builds, we validate to catch any issues early.
-    /// qname_bytes 由 parse_quick() 保证为有效的 ASCII（因此也是 UTF-8）。
-    /// parse_quick() 在返回 QuickQuery 之前验证 ASCII。
-    /// 如果 parse_quick() 成功，qname_bytes 始终是有效的 ASCII/UTF-8。
-    /// 在 debug 构建中，我们验证以尽早发现问题。
-    ///
-    /// # Examples
-    /// ```
-    /// # use kixdns::proto_utils::QuickQuery;
-    /// let query = QuickQuery { qname_bytes: b"google.com", tx_id: 0, qtype: 1, qclass: 1, edns_present: false, edns_version: 0, client_subnet: None, flags: Default::default() };
-    /// let qname_str = query.qname_str_unchecked();  // &str
-    /// ```
-    #[inline]
-    pub fn qname_str_unchecked(&self) -> &str {
-        // SAFETY: qname_bytes is validated ASCII from parse_quick()
-        // ASCII is always valid UTF-8
-        // 安全性：qname_bytes 在 parse_quick() 中已验证为 ASCII
-        // ASCII 始终是有效的 UTF-8
-        //
-        // In debug builds, we validate to catch any issues early
-        // 在 debug 构建中，我们验证以尽早发现问题
-        #[cfg(debug_assertions)]
-        {
-            std::str::from_utf8(self.qname_bytes).expect("qname_bytes should be valid UTF-8")
-        }
-        #[cfg(not(debug_assertions))]
-        unsafe {
-            std::str::from_utf8_unchecked(self.qname_bytes)
-        }
-    }
-}
-
 /// 快速解析响应包，仅提取 RCODE、TC 标志和 TTL 范围 / Quick parse response packet, extracting only RCODE, TC flag and TTL range
 /// 避免全量解析 Message / Avoid full Message parsing
 #[derive(Debug, Clone)]
@@ -2360,9 +2322,9 @@ mod tests {
             let packet = query_with_label(label);
             let quick = parse_quick(&packet, &mut qname)
                 .expect("a plain name")
-                .qname_bytes
-                .to_vec();
-            assert_eq!(name_text(&name_of(&packet)).as_bytes(), quick, "{label:?}");
+                .qname
+                .to_owned();
+            assert_eq!(name_text(&name_of(&packet)), quick, "{label:?}");
         }
         for (label, text) in [
             (&b"a.b"[..], r"a\046b"),
