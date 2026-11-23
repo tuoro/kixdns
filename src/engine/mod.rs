@@ -42,6 +42,8 @@ mod merged_failure_check_tests;
 #[cfg(test)]
 mod name_text_tests;
 pub(crate) mod observation;
+#[cfg(test)]
+mod padding_tests;
 pub mod phases;
 pub mod pipeline;
 #[cfg(test)]
