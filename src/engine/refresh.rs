@@ -232,7 +232,7 @@ const REFRESHES_AT_ONCE: usize = 128;
 pub fn spawn_background_refresh(
     engine: &Engine,
     state: &Arc<EngineInner>,
-    renewed: &crate::cache::CacheEntry,
+    renewed: &Arc<crate::cache::CacheEntry>,
     slot: u64,
     qclass: DNSClass,
     requester: Requester,
@@ -310,6 +310,9 @@ pub fn spawn_background_refresh(
     // 步骤 2：生成后台任务，刷新标记的 guard 交给它
     let engine = engine.clone();
     let fetched_at = renewed.fetched_at;
+    let settings = &state.pipeline.settings;
+    let renew_on_failure = settings.serve_stale && settings.serve_stale_ttl_reset;
+    let renewed = Arc::clone(renewed);
     let qname_owned = qname.to_string();
     let pipeline_id_owned = pipeline_id.to_string();
 
@@ -360,6 +363,17 @@ pub fn spawn_background_refresh(
                 // Noted before the mark is let go: a request that sees the mark gone sees
                 // this failure too
                 engine.refresh_failures.record(mark, fetched_at);
+                // 开着 serve_stale_ttl_reset 时，过期的这份应答从这次失败起重新算还能续用多久（见
+                // `CacheEntry::clone_with_refreshed_ttl`）：上游一直取不到新的，就一直有旧的可给。以前每交出一次过期
+                // 应答都重新算，故障期间每次命中都要拿一次写锁、换一个槽位
+                // With serve_stale_ttl_reset on, the stale answer counts how long it may still be
+                // served afresh from this failure (see `CacheEntry::clone_with_refreshed_ttl`):
+                // while the upstream gives nothing new, the old one stays to give. It used to count
+                // afresh on every stale answer served, every hit in an outage taking a write lock
+                // and a new slot
+                if renew_on_failure && !renewed.is_fresh() {
+                    engine.cache_replace(slot, &renewed, renewed.clone_with_refreshed_ttl());
+                }
                 warn!(
                     event = "background_refresh_failed",
                     qname = %qname_owned,

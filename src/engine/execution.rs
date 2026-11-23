@@ -2009,7 +2009,7 @@ impl Engine {
     pub(crate) fn spawn_background_refresh(
         &self,
         state: &Arc<EngineInner>,
-        renewed: &CacheEntry,
+        renewed: &Arc<CacheEntry>,
         slot: u64,
         qclass: DNSClass,
         requester: Requester,
@@ -6058,13 +6058,15 @@ mod tests {
         }
     }
 
-    /// 开着 serve_stale_ttl_reset，每次当作 stale 提供都让这条应答重新从刚过期算起，查缓存和上游
-    /// 失败时的兜底都一样；关着就不动
-    /// With serve_stale_ttl_reset on, every time an answer is served stale it counts as
-    /// just expired again, on a lookup and on the fallback after an upstream failure
-    /// alike; with it off nothing changes
+    /// 当作 stale 提供不动这条应答的过期计时，查缓存和上游失败时的兜底都一样，开不开 serve_stale_ttl_reset 都是：
+    /// 续期只在后台刷新失败以后（见 `a_failed_refresh_renews_a_stale_answer_with_ttl_reset_on`）。以前开着时每交出
+    /// 一次就重新算一次
+    /// Serving an answer stale leaves its expiry alone, on a lookup and on the fallback after an
+    /// upstream failure alike, with serve_stale_ttl_reset on or off: renewal comes only after a
+    /// failed background refresh (see `a_failed_refresh_renews_a_stale_answer_with_ttl_reset_on`).
+    /// With it on, every answer served stale used to count afresh
     #[tokio::test]
-    async fn serving_stale_restarts_the_expiry_with_ttl_reset_on() {
+    async fn serving_stale_leaves_the_expiry_alone() {
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         for reset in [true, false] {
             for fallback in [false, true] {
@@ -6088,11 +6090,7 @@ mod tests {
                 let entry = engine.cached(slot).expect("still cached");
                 // `stale_entry` 10 秒前写入、TTL 5 秒 / `stale_entry` went in 10 s ago with a TTL of 5 s
                 let stale_for = entry.inserted_at.elapsed().as_secs() - entry.original_ttl as u64;
-                assert_eq!(
-                    stale_for,
-                    if reset { 0 } else { 5 },
-                    "reset {reset}, fallback {fallback}"
-                );
+                assert_eq!(stale_for, 5, "reset {reset}, fallback {fallback}");
             }
         }
     }

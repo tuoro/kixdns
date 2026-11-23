@@ -159,11 +159,13 @@ pub struct GlobalSettings {
     /// 对应 Unbound serve-expired-ttl / Corresponds to Unbound serve-expired-ttl
     #[serde(default = "default_serve_stale_expire_ttl")]
     pub serve_stale_expire_ttl: u64,
-    /// RFC 8767: 提供过期缓存后重置过期计时器（默认 true）
-    /// 启用后，每次返回 stale 数据时重置过期时间窗口，确保频繁访问的域名不会因 serve_stale_expire_ttl 超时。
-    /// RFC 8767: Reset the stale expiry timer after serving stale (default true)
-    /// When enabled, resets the stale age counter each time stale data is served.
-    /// 对应 Unbound serve-expired-ttl-reset / Corresponds to Unbound serve-expired-ttl-reset
+    /// RFC 8767：过期应答的后台刷新失败以后，从这次失败起重新算它还能续用多久（默认 false）。上游一直取不到新的、又一直
+    /// 有人问的名字，就一直交出过期应答，不受 serve_stale_expire_ttl 限制。对应 Unbound 的 serve-expired-ttl-reset，
+    /// 那边默认也关
+    /// RFC 8767: once the background refresh of a stale answer fails, how long it may still be
+    /// served counts afresh from that failure (default false). A name the upstream keeps giving
+    /// nothing new for, and that keeps being asked, then goes out stale beyond
+    /// serve_stale_expire_ttl. Corresponds to Unbound's serve-expired-ttl-reset, off there too
     #[serde(default = "default_serve_stale_ttl_reset")]
     pub serve_stale_ttl_reset: bool,
     /// RFC 8767: 返回过期缓存前尝试上游查询的超时（毫秒，默认 0）
@@ -1109,7 +1111,7 @@ fn default_serve_stale_expire_ttl() -> u64 {
 }
 
 fn default_serve_stale_ttl_reset() -> bool {
-    true
+    false
 }
 
 fn default_serve_stale_client_timeout_ms() -> u64 {
@@ -2545,7 +2547,7 @@ mod validation_tests {
                 settings.serve_stale_expire_ttl, 86400,
                 "serve_stale_expire_ttl"
             );
-            assert!(settings.serve_stale_ttl_reset, "serve_stale_ttl_reset");
+            assert!(!settings.serve_stale_ttl_reset, "serve_stale_ttl_reset");
             assert_eq!(
                 settings.serve_stale_client_timeout_ms, 0,
                 "serve_stale_client_timeout_ms"

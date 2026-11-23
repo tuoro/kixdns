@@ -408,11 +408,6 @@ fn serve_stale(
         view,
         ServedTtl::Stale(settings.serve_stale_ttl),
     );
-    // serve_stale_ttl_reset: reset stale expiry timer by re-inserting with shifted inserted_at
-    // 重置过期计时器：通过重新插入条目并将 inserted_at 设置为"刚过期"的时间点
-    if settings.serve_stale_ttl_reset {
-        engine.cache_replace(context.slot, hit, hit.clone_with_refreshed_ttl());
-    }
     // 发起后台刷新，重新决定一次。规则给的应答（没有上游的那种）也一样：它可能是上游失败时的兜底、对上游那次应答的
     // 检查结果，不重新决定的话每次命中都把它续上，一直用下去
     // Start a background refresh to decide again. An answer the rules gave (one with no
