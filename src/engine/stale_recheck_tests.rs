@@ -106,7 +106,7 @@ fn query() -> Vec<u8> {
 /// the request returns, and once it is clear the refresh has ended
 async fn refreshes_done(engine: &Engine) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !engine.refreshing_set.is_empty() {
+    while !engine.refreshing.is_empty() {
         assert!(Instant::now() < deadline, "the refresh must end");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

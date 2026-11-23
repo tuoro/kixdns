@@ -853,7 +853,7 @@ impl Engine {
                             remaining_ttl = remaining_ttl,
                             "triggering background cache refresh"
                         );
-                        self.spawn_background_refresh(state.clone(), &hit, slot, qclass, requester);
+                        self.spawn_background_refresh(&state, &hit, slot, qclass, requester);
                     }
                 }
 
@@ -1097,10 +1097,10 @@ impl Engine {
         // Corresponds to Unbound serve-expired-client-timeout
         //
         // Design: check_cache() already triggers spawn_background_refresh() for expired entries
-        // when client_timeout > 0. Here we poll the cache with 5ms intervals to detect
-        // when the background refresh completes. If client_timeout expires, serve stale.
+        // when client_timeout > 0. Here the request waits for that refresh to end (see
+        // `RefreshingGuard`), then serves the fresh answer it brought, or the stale one.
         // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
-        // 这里以 5ms 间隔轮询缓存，检测后台刷新是否完成。超时则返回过期数据。
+        // 这里等那次刷新结束（见 `RefreshingGuard`），交出它带回的新应答，或者过期应答。
         if settings.serve_stale && settings.serve_stale_client_timeout_ms > 0 {
             let view = lookup.requester.ecs_view();
             let question = CachedQuestion {
@@ -1111,10 +1111,9 @@ impl Engine {
             };
             let stale = self
                 .cache_get(lookup.slot, &view, &question, Instant::now())
-                .filter(|h| {
-                    h.inserted_at.elapsed().as_secs() >= h.original_ttl as u64
-                        && h.rcode != ResponseCode::ServFail
-                        && h.rcode != ResponseCode::Refused
+                .filter(|hit| {
+                    phases::age_of(hit, hit.inserted_at.elapsed().as_secs(), settings)
+                        == phases::Age::Stale
                 });
 
             if let Some(stale) = stale {
@@ -1147,47 +1146,39 @@ impl Engine {
                             .saturating_sub(lookup.start.elapsed())
                             .saturating_sub(STALE_SERVE_RESERVE),
                     );
-                let poll_interval = std::time::Duration::from_millis(5);
                 let wait_start = Instant::now();
-
-                // Poll cache for fresh data from background refresh
-                // 轮询缓存等待后台刷新带来的新鲜数据
-                let mut refresh_ended = false;
-                while wait_start.elapsed() < client_timeout {
-                    tokio::time::sleep(poll_interval).await;
-                    // 先看刷新还在不在跑、再看缓存：刷新先把新应答写进缓存、再放开标记，这样不会错过刚写进来的
-                    // Whether the refresh still runs first, then the cache: a refresh writes its
-                    // fresh answer into the cache before it lets go of the mark, so one that just
-                    // landed is never missed
-                    let refreshing = self.refreshing_set.contains(&mark);
-                    // Check if background refresh put fresh data in cache
-                    let Some(fresh_hit) =
-                        self.cache_get(lookup.slot, &view, &question, Instant::now())
-                    else {
-                        break;
-                    };
-                    if fresh_hit.inserted_at.elapsed().as_secs() < fresh_hit.original_ttl as u64 {
-                        // Fresh data available! Serve it.
-                        if let Some(fresh_bytes) = phases::check_cache_logged(self, lookup, info) {
-                            tracing::debug!(
-                                event = "serve_fresh_after_client_wait",
-                                qname = %lookup.qname,
-                                wait_ms = wait_start.elapsed().as_millis() as u64,
-                                "background refresh completed within client_timeout"
-                            );
-                            return Some(fresh_bytes);
-                        }
+                // 等刷新结束：先登记要被叫醒，再看刷新还在不在，这样不会错过在两步之间结束的刷新。刷新结束以后没带回
+                // 新应答（上游失败了）就马上交出过期应答。以前每 5 毫秒查一次缓存，等 1.8 秒要醒 360 次
+                // Wait for the refresh to end: being woken is registered first and whether the
+                // refresh still runs is looked at after, so one ending in between is not missed.
+                // Ended without a fresh answer (the upstream failed), the stale answer goes out at
+                // once. It used to look at the cache every 5 ms, 360 times in a wait of 1.8 seconds
+                let refresh_ended = match self.refreshing.get(&mark).map(|ended| Arc::clone(&ended))
+                {
+                    None => true,
+                    Some(ended) => {
+                        let ending = ended.notified();
+                        tokio::pin!(ending);
+                        ending.as_mut().enable();
+                        !self.refreshing.contains_key(&mark)
+                            || tokio::time::timeout(client_timeout, ending).await.is_ok()
                     }
-                    // 刷新已经结束却没带回新应答（上游失败了）：再等也等不来，马上交出过期应答。以前照样等满
-                    // 客户端等待的时间，上游很快报错时，每个查询都白等一整段
-                    // The refresh ended without a fresh answer (the upstream failed): no more
-                    // waiting brings one, so the stale answer goes out at once. It used to wait out
-                    // the client wait all the same, so with an upstream failing fast every query
-                    // waited the whole time for nothing
-                    if !refreshing {
-                        refresh_ended = true;
-                        break;
-                    }
+                };
+                let fresh = refresh_ended
+                    && self
+                        .cache_get(lookup.slot, &view, &question, Instant::now())
+                        .is_some_and(|hit| {
+                            phases::age_of(&hit, hit.inserted_at.elapsed().as_secs(), settings)
+                                == phases::Age::Fresh
+                        });
+                if fresh && let Some(fresh_bytes) = phases::check_cache_logged(self, lookup, info) {
+                    tracing::debug!(
+                        event = "serve_fresh_after_client_wait",
+                        qname = %lookup.qname,
+                        wait_ms = wait_start.elapsed().as_millis() as u64,
+                        "background refresh completed within client_timeout"
+                    );
+                    return Some(fresh_bytes);
                 }
 
                 // 刷新失败了，或者客户端等待的时间到了：交出过期缓存
@@ -2013,7 +2004,7 @@ impl Engine {
     /// 3. 刷新失败不会删除现有缓存条目
     pub(crate) fn spawn_background_refresh(
         &self,
-        state: Arc<EngineInner>,
+        state: &Arc<EngineInner>,
         renewed: &CacheEntry,
         slot: u64,
         qclass: DNSClass,
@@ -6242,7 +6233,7 @@ mod tests {
                         let _runtime = runtime.enter();
                         barrier.wait();
                         engine.spawn_background_refresh(
-                            engine.state.load_full(),
+                            &engine.state.load_full(),
                             &renewed,
                             slot,
                             DNSClass::IN,
@@ -6253,7 +6244,7 @@ mod tests {
             });
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while engine.refreshing_set.contains(&mark) {
+                    while engine.refreshing.contains_key(&mark) {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
@@ -6274,9 +6265,9 @@ mod tests {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(false);
         let renewed = stale_entry("default");
         let mark = RefreshTarget::mark_of(dedupe_hash, &renewed.reach);
-        let marked = || engine.refreshing_set.contains(&mark);
+        let marked = || engine.refreshing.contains_key(&mark);
         engine.spawn_background_refresh(
-            engine.state.load_full(),
+            &engine.state.load_full(),
             &renewed,
             dedupe_hash,
             DNSClass::IN,
@@ -8787,7 +8778,7 @@ mod requester_scope_tests {
                 assert_eq!(ask(&engine, "10.0.0.1", true).await, Some(OTHER));
             }
             tokio::time::timeout(Duration::from_secs(3), async {
-                while !engine.refreshing_set.is_empty() {
+                while !engine.refreshing.is_empty() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })

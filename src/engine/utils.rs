@@ -1,7 +1,6 @@
 use super::types::InflightMap;
 use crate::matcher::RuntimePipelineConfig;
 use bytes::Bytes;
-use dashmap::DashSet;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
@@ -218,29 +217,46 @@ pub mod engine_helpers {
     }
 }
 
-/// 刷新标记：打上的 guard 在 drop 时清掉它 / A refresh mark, cleared when its guard drops
+/// 正在刷新的条目：刷新标记 → 刷新结束时叫醒等着它的请求（见 `RefreshingGuard`）
+/// The entries being refreshed: refresh mark → what wakes the requests waiting on the refresh
+/// once it ends (see `RefreshingGuard`)
+pub type Refreshing = dashmap::DashMap<u64, Arc<tokio::sync::Notify>>;
+
+/// 刷新标记：打上的 guard 在 drop 时清掉它，叫醒等着这次刷新的请求。刷新先把新应答写进缓存、再放下 guard，所以被
+/// 叫醒的请求一定看得到它
+/// A refresh mark, cleared when its guard drops, which wakes the requests waiting on the
+/// refresh. A refresh writes its fresh answer into the cache before it drops the guard, so a
+/// request woken by it always sees that answer
 pub struct RefreshingGuard {
-    set: Arc<DashSet<u64>>,
-    cache_hash: u64,
+    refreshing: Arc<Refreshing>,
+    mark: u64,
 }
 
 impl RefreshingGuard {
-    /// 打上刷新标记，返回一个 drop 时清掉它的 guard；标记已经有人打了就是 None。查和打是同一步
-    /// （`DashSet::insert`），同时来的几个里只有一个拿得到
+    /// 打上刷新标记，返回一个 drop 时清掉它的 guard；标记已经有人打了就是 None。查和打是同一步，同时来的几个里只有
+    /// 一个拿得到
     /// Set the refresh mark and return a guard that clears it on drop; None when it is
-    /// set already. Checking and setting is one step (`DashSet::insert`), so of several
-    /// arriving at once only one gets it
-    pub fn try_new(set: &Arc<DashSet<u64>>, cache_hash: u64) -> Option<Self> {
-        set.insert(cache_hash).then(|| Self {
-            set: Arc::clone(set),
-            cache_hash,
-        })
+    /// set already. Checking and setting is one step, so of several arriving at once only one
+    /// gets it
+    pub fn try_new(refreshing: &Arc<Refreshing>, mark: u64) -> Option<Self> {
+        match refreshing.entry(mark) {
+            dashmap::Entry::Occupied(_) => None,
+            dashmap::Entry::Vacant(entry) => {
+                entry.insert(Arc::default());
+                Some(Self {
+                    refreshing: Arc::clone(refreshing),
+                    mark,
+                })
+            }
+        }
     }
 }
 
 impl Drop for RefreshingGuard {
     fn drop(&mut self) {
-        self.set.remove(&self.cache_hash);
+        if let Some((_, ended)) = self.refreshing.remove(&self.mark) {
+            ended.notify_waiters();
+        }
     }
 }
 
