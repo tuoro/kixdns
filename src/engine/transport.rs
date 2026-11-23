@@ -1786,6 +1786,11 @@ struct DohUpstream {
     /// Consecutive transport errors; cleared by a success or a rebuild.
     /// 连续传输错误数；成功或重建后清零。
     consecutive_errors: AtomicUsize,
+    /// 客户端和直连的连接是第几代，重建一次加一。请求记下自己开始时是哪一代，出错时已经换代了就不算（见
+    /// [`DohClient::record_error`]）/ Which generation the client and the direct connections are,
+    /// raised by each rebuild. A request notes the generation it started under, and an error
+    /// found once it has changed does not count (see [`DohClient::record_error`])
+    generation: AtomicU64,
     /// 最近一次使用的时刻，用于清理热重载换掉的旧上游
     /// When the entry was last used, so upstreams dropped by a reload can be pruned
     last_used_millis: AtomicU64,
@@ -2015,6 +2020,7 @@ impl DohClient {
                 let state = Arc::new(DohUpstream {
                     client: ArcSwap::from_pointee(self.build_client()?),
                     consecutive_errors: AtomicUsize::new(0),
+                    generation: AtomicU64::new(0),
                     last_used_millis: AtomicU64::new(now),
                     paused_until: AtomicU64::new(0),
                     target: std::sync::OnceLock::new(),
@@ -2090,6 +2096,7 @@ impl DohClient {
             .filter(|_| self.direct_h2 && url.scheme() == "https");
 
         let start = tokio::time::Instant::now();
+        let generation = state.generation.load(Ordering::Acquire);
         let result = match self
             .send_once(&state, packet, url, uri, host, timeout_dur)
             .await
@@ -2104,7 +2111,7 @@ impl DohClient {
                 // the retry then loads the fresh client (new connections).
                 // 透明重试：DNS 查询语义幂等，单次重试安全。
                 // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
-                let rebuilt = self.record_error(upstream, &state);
+                let rebuilt = self.record_error(upstream, &state, generation);
                 let remaining = timeout_dur.saturating_sub(start.elapsed());
                 if remaining < MIN_RETRY_BUDGET {
                     return Err(err);
@@ -2258,57 +2265,69 @@ impl DohClient {
         result.map_err(|_elapsed| anyhow::anyhow!("doh request timeout"))?
     }
 
-    /// Record a consecutive transport error for the upstream. When the count
-    /// reaches the threshold, rebuild that upstream's reqwest client (evicting
-    /// its dead connection pool) and reset the counter. Returns true if rebuilt.
-    /// 记录 upstream 的连续传输错误。计数达阈值时重建该上游的 reqwest 客户端
-    /// （驱逐其死连接池）并清零计数。重建返回 true。
-    fn record_error(&self, upstream: &str, state: &DohUpstream) -> bool {
+    /// 记下 `upstream` 一个传输错误，出错的请求是在第 `generation` 代开始的。连续错误数到了阈值就换一代：清掉直连的
+    /// 连接，重建 reqwest 客户端（丢掉它的连接池），计数清零。换了代返回 true。同一批断掉的请求一起报错时只换一次：换代
+    /// 用比较交换，只有一个请求换得成；已经换过代以后，旧连接上迟到的错误不算。以前每数到阈值就重建一次，一百个在途
+    /// 请求一起超时就要重建三十来次，还把重试刚连上的新连接一次次拆掉
+    /// Records a transport error of `upstream`, from a request started under generation
+    /// `generation`. Once errors in a row reach the threshold the generation moves on: the direct
+    /// connections are dropped, the reqwest client rebuilt (dropping its pool), and the count
+    /// cleared; true when it moved on. Requests broken together, erring together, move it once:
+    /// the move is a compare-and-swap only one of them wins, and once it has moved, errors
+    /// arriving late from the old connections do not count. Every count up to the threshold used
+    /// to rebuild, some thirty rebuilds for a hundred requests in flight timing out together,
+    /// each one tearing down the connection the retries had just made
+    fn record_error(&self, upstream: &str, state: &DohUpstream, generation: u64) -> bool {
+        if state.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
         let count = state.consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
-        if self.health_error_threshold > 0 && count >= self.health_error_threshold {
-            match self.build_client() {
-                Ok(new_client) => {
-                    // Swap in a fresh client; the old pool is released once in-flight
-                    // requests holding a cloned Arc finish. The direct HTTP/2 connection
-                    // goes too, and the next request connects again
-                    // 替换为新客户端；旧池在持有 Arc 副本的在途请求结束后释放。直连的 HTTP/2
-                    // 连接也一起丢掉，下一个请求重新连
-                    state.client.store(Arc::new(new_client));
-                    state.h2.reset();
-                    warn!(
-                        upstream = upstream,
-                        consecutive_errors = count,
-                        threshold = self.health_error_threshold,
-                        "DoH error threshold exceeded, rebuilding connection pool"
-                    );
-                    state.consecutive_errors.store(0, Ordering::Release);
-                    true
-                }
-                Err(e) => {
-                    warn!(
-                        upstream = upstream,
-                        error = %e,
-                        "failed to rebuild DoH client, keeping old pool"
-                    );
-                    false
-                }
-            }
-        } else {
+        if self.health_error_threshold == 0
+            || count < self.health_error_threshold
+            || state
+                .generation
+                .compare_exchange(
+                    generation,
+                    generation + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
             debug!(
                 upstream = upstream,
                 consecutive_errors = count,
                 threshold = self.health_error_threshold,
                 "DoH transport error recorded"
             );
-            false
+            return false;
         }
+        state.consecutive_errors.store(0, Ordering::Release);
+        // 直连的连接一起丢掉，下一个请求重新连 / The direct connections go too, and the next request connects again
+        state.h2.reset();
+        match self.build_client() {
+            // 旧池在持有 Arc 副本的在途请求结束后释放 / The old pool is released once the requests in
+            // flight holding a clone of its Arc finish
+            Ok(new_client) => state.client.store(Arc::new(new_client)),
+            Err(e) => {
+                warn!(upstream = upstream, error = %e, "failed to rebuild DoH client, keeping old pool")
+            }
+        }
+        warn!(
+            upstream = upstream,
+            consecutive_errors = count,
+            threshold = self.health_error_threshold,
+            "DoH error threshold exceeded, rebuilding connection pool"
+        );
+        true
     }
 
     /// [`Self::record_error`] for `upstream` by its name / 按名字找到 `upstream` 再 [`Self::record_error`]
     #[cfg(test)]
     pub(crate) fn record_error_of(&self, upstream: &str) -> bool {
         let state = self.upstream(upstream).expect("doh upstream state");
-        self.record_error(upstream, &state)
+        let generation = state.generation.load(Ordering::Acquire);
+        self.record_error(upstream, &state, generation)
     }
 
     /// Clear the consecutive error counter of `upstream` (what a successful
@@ -4706,6 +4725,32 @@ mod tests {
         client.last_prune_millis.store(
             now.saturating_sub(DOH_UPSTREAM_PRUNE_EVERY.as_millis() as u64 * 2),
             Ordering::Relaxed,
+        );
+    }
+
+    /// 同一代开始的请求一起断掉、一起报错，只重建一次；旧连接上迟到的错误不算，新的一代从头数。以前每数到阈值就重建
+    /// 一次，一百个一起报错要重建三十三次
+    /// Requests started under one generation, broken together and erring together, rebuild
+    /// once; errors arriving late from the old connections do not count, and the new generation
+    /// counts from scratch. Every count up to the threshold used to rebuild, thirty-three
+    /// rebuilds for a hundred erring together
+    #[test]
+    fn requests_broken_together_rebuild_once() {
+        let client = DohClient::new(8, 3).expect("build doh client");
+        let upstream = "doh:8.8.8.8";
+        let state = client.upstream(upstream).unwrap();
+        let started = state.generation.load(Ordering::Acquire);
+        let before = state.client.load_full();
+        let rebuilds = (0..100)
+            .filter(|_| client.record_error(upstream, &state, started))
+            .count();
+        assert_eq!(rebuilds, 1);
+        assert!(!Arc::ptr_eq(&before, &state.client.load_full()));
+        assert!(!client.record_error_of(upstream));
+        assert!(!client.record_error_of(upstream));
+        assert!(
+            client.record_error_of(upstream),
+            "the third error of the new generation"
         );
     }
 
