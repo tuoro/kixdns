@@ -18,7 +18,7 @@ use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
 use crate::engine::matcher_adapter::log_match;
 use crate::engine::response::{
-    make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
+    least_ttl, make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
 };
 use crate::engine::upstream::UpstreamFailure;
 use crate::engine::utils::engine_helpers::{self, build_response};
@@ -95,6 +95,9 @@ pub enum ResponseActionResult {
     Static {
         bytes: Bytes,
         rcode: ResponseCode,
+        /// 它带的 TTL：记录里最小的，没有记录时为 None（见 `phases::static_ttl`）/ The TTL it
+        /// carries: the least of its records', None without records (see `phases::static_ttl`)
+        ttl: Option<u32>,
         source: &'static str,
     },
     /// 跳到 `pipeline` 接着走规则；次数由跳过去的一方数（见 `handle_packet_internal`），这里只看还剩没剩
@@ -440,22 +443,12 @@ async fn run_response_actions(
             }
             Action::StaticResponse { rcode } => {
                 let code = parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain);
-                let bytes = build_response(ctx.req, code, Vec::new())?;
-                return Ok(ResponseActionResult::Static {
-                    bytes,
-                    rcode: code,
-                    source: "response_action",
-                });
+                return static_answer(ctx.req, code, Vec::new(), "response_action");
             }
             Action::StaticIpResponse { ip } => {
                 let (rcode, answers) =
                     make_static_ip_answer(ctx.qname, ctx.qtype, question_class(ctx.req), ip);
-                let bytes = build_response(ctx.req, rcode, answers)?;
-                return Ok(ResponseActionResult::Static {
-                    bytes,
-                    rcode,
-                    source: "response_action",
-                });
+                return static_answer(ctx.req, rcode, answers, "response_action");
             }
             Action::StaticCnameResponse { target, ttl } => {
                 let (rcode, answers) = make_static_cname_answer(
@@ -464,28 +457,17 @@ async fn run_response_actions(
                     target,
                     ttl.unwrap_or(300),
                 );
-                let bytes = build_response(ctx.req, rcode, answers)?;
-                return Ok(ResponseActionResult::Static {
-                    bytes,
-                    rcode,
-                    source: "response_action",
-                });
+                return static_answer(ctx.req, rcode, answers, "response_action");
             }
             Action::StaticTxtResponse { text, ttl } => {
-                let ttl = ttl.unwrap_or(300);
                 let (rcode, answers) = make_static_txt_answer(
                     ctx.qname,
                     ctx.qtype,
                     question_class(ctx.req),
                     text,
-                    ttl,
+                    ttl.unwrap_or(300),
                 );
-                let bytes = build_response(ctx.req, rcode, answers)?;
-                return Ok(ResponseActionResult::Static {
-                    bytes,
-                    rcode,
-                    source: "response_action",
-                });
+                return static_answer(ctx.req, rcode, answers, "response_action");
             }
             Action::JumpToPipeline { pipeline } => {
                 if ctx.remaining_jumps == 0 {
@@ -493,6 +475,7 @@ async fn run_response_actions(
                     return Ok(ResponseActionResult::Static {
                         bytes,
                         rcode: ResponseCode::ServFail,
+                        ttl: None,
                         source: JUMP_LIMIT,
                     });
                 }
@@ -508,6 +491,7 @@ async fn run_response_actions(
                 return Ok(ResponseActionResult::Static {
                     bytes,
                     rcode: ResponseCode::Refused,
+                    ttl: None,
                     source: "response_action",
                 });
             }
@@ -533,20 +517,14 @@ async fn run_response_actions(
                         warn!(qname = %ctx.qname, %problem, "replaced TXT answer does not fit a message");
                         return response_action_servfail(ctx.req);
                     }
-                    // Create new TXT record / 创建新的 TXT 记录
-                    let txt = TXT::new(text.to_vec());
-                    let record = Record::from_rdata(name, 300, RData::TXT(txt));
-
                     // Replace TXT records in answers / 替换答案中的 TXT 记录
-                    let new_answers = vec![record];
-                    let rcode = resp_ctx.msg.metadata.response_code;
-
-                    let bytes = build_response(ctx.req, rcode, new_answers)?;
-                    return Ok(ResponseActionResult::Static {
-                        bytes,
-                        rcode,
-                        source: "replace_txt",
-                    });
+                    let record = Record::from_rdata(name, 300, RData::TXT(TXT::new(text.to_vec())));
+                    return static_answer(
+                        ctx.req,
+                        resp_ctx.msg.metadata.response_code,
+                        vec![record],
+                        "replace_txt",
+                    );
                 }
                 return response_action_servfail(ctx.req);
             }
@@ -680,11 +658,28 @@ async fn run_response_actions(
     }
 }
 
+/// 响应动作照请求给出的静态应答，带着它记录里最小的 TTL / A static answer the response actions give
+/// for the request, with the least TTL of its records
+fn static_answer(
+    req: &Message,
+    rcode: ResponseCode,
+    answers: Vec<Record>,
+    source: &'static str,
+) -> anyhow::Result<ResponseActionResult> {
+    Ok(ResponseActionResult::Static {
+        ttl: least_ttl(&answers),
+        bytes: build_response(req, rcode, answers)?,
+        rcode,
+        source,
+    })
+}
+
 /// 响应动作给不出应答时的 SERVFAIL / The SERVFAIL of response actions that find no answer
 fn response_action_servfail(req: &Message) -> anyhow::Result<ResponseActionResult> {
     Ok(ResponseActionResult::Static {
         bytes: engine_helpers::build_servfail_response(req)?,
         rcode: ResponseCode::ServFail,
+        ttl: None,
         source: "response_action",
     })
 }

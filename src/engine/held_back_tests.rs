@@ -1157,15 +1157,16 @@ async fn what_a_held_back_device_gets_is_not_cached_for_others() {
     let fixed = Ipv4Addr::new(192, 0, 2, 99);
     let fallback = answering_upstream(fixed, 300).await;
     let asking_the_fallback = json!([{ "type": "forward", "upstream": fallback.address }]);
-    // 最后一项：上游真的没回答时，备用的答案进不进这条规则的缓存。跳到别的规则组得到的回答记在那个规则组名下，不在这里
+    // 最后一项：上游真的没回答时，备用的答案进不进这条规则的缓存。固定地址只是那一次请求的兜底，不进缓存；跳到别的规则组
+    // 得到的回答记在那个规则组名下，不在这里
     // The last of each: whether, with the upstream truly not answering, the fallback's answer
-    // goes into this rule's cache. What a jump to another pipeline gets is kept under that
-    // pipeline, not here
+    // goes into this rule's cache. A fixed address is a fallback for that one request and is
+    // not cached; what a jump to another pipeline gets is kept under that pipeline, not here
     let on_failure = [
         (
             "a fixed address",
             json!([{ "type": "static_ip_response", "ip": fixed.to_string() }]),
-            true,
+            false,
         ),
         ("a fallback upstream", asking_the_fallback.clone(), true),
         ("a later rule", json!([{ "type": "continue" }]), true),
@@ -1226,9 +1227,10 @@ async fn what_a_held_back_device_gets_is_not_cached_for_others() {
             Some(ANSWER),
             "{which}: the upstream's own answer"
         );
-        // 上游真的没回答时备用的答案照常进缓存：那 64 个名字别的设备问到的也是它，不再去问上游
-        // With the upstream truly not answering the fallback's answer is cached as usual:
-        // another device asking one of those 64 names gets it too, the upstream not asked again
+        // 上游真的没回答时备用上游的答案照常进缓存：那 64 个名字别的设备问到的也是它，不再去问上游
+        // With the upstream truly not answering the fallback upstream's answer is cached as
+        // usual: another device asking one of those 64 names gets it too, the upstream not asked
+        // again
         if cached_here {
             let sent = upstream.queries();
             let cached = ask(&engine, &query("held7.test."), client(2)).await;

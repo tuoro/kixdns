@@ -355,6 +355,13 @@ pub(crate) fn make_static_txt_answer(
     (ResponseCode::NoError, vec![record])
 }
 
+/// 静态应答带的 TTL：它的记录里最小的那个，没有记录时为 None（见 `phases::static_ttl`）
+/// The TTL a static answer carries: the least of its records', None without records (see
+/// `phases::static_ttl`)
+pub(crate) fn least_ttl(records: &[Record]) -> Option<u32> {
+    records.iter().map(|record| record.ttl).min()
+}
+
 /// 从 DNS 响应中提取最小 TTL 用于缓存条目 / Extract minimum TTL from DNS response for cache entry
 /// RFC 1035 §5.2 calls for using minimum TTL of the RRset.
 /// RFC 2308 §5: For negative responses (NXDOMAIN/NODATA), the negative cache
