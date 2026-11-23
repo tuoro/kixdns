@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode};
-use hickory_proto::rr::rdata::A;
-use hickory_proto::rr::{RData, Record};
+use hickory_proto::rr::rdata::{A, AAAA};
+use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -171,6 +171,27 @@ fn answer_of(query: &Message, address: Ipv4Addr, ttl: u32) -> Replies {
         RData::A(A(address)),
     ));
     vec![(Duration::ZERO, reply.to_vec().unwrap())]
+}
+
+/// 本机的 bootstrap 服务器：不管问的是什么名字，A 回 127.0.0.1，AAAA 回 ::1，TTL 都是 `ttl`
+/// A local bootstrap server: whatever the name asked, A gets 127.0.0.1 and AAAA ::1, both of
+/// TTL `ttl`
+pub(crate) async fn loopback_bootstrap(ttl: u32) -> Upstream {
+    upstream(move |query| {
+        let Some(question) = query.queries.first() else {
+            return Vec::new();
+        };
+        let address = match question.query_type() {
+            RecordType::A => RData::A(A(Ipv4Addr::LOCALHOST)),
+            RecordType::AAAA => RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
+            _ => return Vec::new(),
+        };
+        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        reply.add_query(question.clone());
+        reply.add_answer(Record::from_rdata(question.name().clone(), ttl, address));
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    })
+    .await
 }
 
 /// UDP 和 TCP 占同一个端口的本机上游：收下查询、接下连接，从不回答

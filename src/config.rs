@@ -89,6 +89,14 @@ pub struct GlobalSettings {
     /// `default_upstream` 的一份共用的副本（性能优化） / A shared copy of `default_upstream` (performance optimization)
     #[serde(skip)]
     pub default_upstream_shared: Option<Arc<str>>,
+    /// 解析写成主机名的上游（TCP、DoT、DoH、DoQ）用的明文 DNS 服务器，逗号分隔的 `IP:端口`，同时问、取先答的；
+    /// 空的（默认）就交给系统的解析器，系统的解析器要是 KixDNS 自己，解析就会绕回来（见 `engine::bootstrap`）
+    /// The plain DNS servers that resolve the upstreams written with a host name (TCP, DoT, DoH,
+    /// DoQ), comma-separated `IP:port`, asked at once with the first answer taken; empty (the
+    /// default) leaves it to the system resolver, which loops back should it be KixDNS itself
+    /// (see `engine::bootstrap`)
+    #[serde(default)]
+    pub bootstrap: String,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
     /// 单次上游请求的超时时间
     #[serde(default = "default_upstream_timeout_ms")]
@@ -210,6 +218,7 @@ impl Default for GlobalSettings {
             default_upstream: default_upstream(),
             default_upstream_pre_split: None,
             default_upstream_shared: None,
+            bootstrap: String::new(),
             upstream_timeout_ms: default_upstream_timeout_ms(),
             request_timeout_ms: None, // 默认自动计算 / Auto-calculated by default
             response_jump_limit: default_response_jump_limit(),
@@ -813,6 +822,7 @@ impl GlobalSettings {
                 doq_connection_idle_timeout_seconds,
                 doq_keepalive_interval_ms,
                 doq_enable_0rtt,
+                bootstrap,
                 flow_control_enabled,
             ],
         )
@@ -1330,6 +1340,16 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     for upstream in split_upstreams(&cfg.settings.default_upstream) {
         if let Some(problem) = crate::engine::upstream::upstream_problem(upstream, Transport::Udp) {
             found.push(format!("default_upstream: {problem}"));
+        }
+    }
+    // bootstrap 自己就是解析上游名字的，只能写成 IP 和端口，经 UDP 问 / bootstrap is what resolves
+    // upstream names, so it is written as an IP and a port only, asked over UDP
+    for server in split_upstreams(&cfg.settings.bootstrap) {
+        if let Err(error) = crate::engine::transport::check_upstream_address(server, Transport::Udp)
+        {
+            found.push(format!(
+                "bootstrap: server \"{server}\" is not usable: {error:#}"
+            ));
         }
     }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
@@ -2583,6 +2603,7 @@ mod validation_tests {
                 "doq_keepalive_interval_ms"
             );
             assert!(settings.doq_enable_0rtt, "doq_enable_0rtt");
+            assert!(settings.bootstrap.is_empty(), "bootstrap");
             assert!(!settings.flow_control_enabled, "flow_control_enabled");
             assert!(!settings.serve_stale, "serve_stale");
             assert_eq!(settings.serve_stale_ttl, 30, "serve_stale_ttl");
@@ -2658,7 +2679,7 @@ mod validation_tests {
     fn problems_name_what_would_silently_do_something_else() {
         let any = serde_json::json!([{ "type": "any" }]);
         let config = serde_json::json!({
-            "settings": { "default_upstream": "dns.example:53" },
+            "settings": { "default_upstream": "dns.example:53", "bootstrap": "223.5.5.5:53, dns.google:53" },
             "pipeline_select": [{ "pipeline": "gone", "matchers": [{ "type": "domain_suffix", "value": "" }] }],
             "pipelines": [{ "id": "main", "rules": [
                 rule("port", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "1.1.1.1:99999" }])),
@@ -2685,6 +2706,7 @@ mod validation_tests {
         let found = problems_of(config);
         for (place, fragment) in [
             ("default_upstream", "dns.example:53"),
+            ("bootstrap", "dns.google:53"),
             ("pipeline_select 1", "no pipeline \"gone\""),
             ("pipeline_select 1", "empty domain matcher"),
             ("rule \"port\"", "1.1.1.1:99999"),
@@ -2709,7 +2731,7 @@ mod validation_tests {
                 "missing {place} / {fragment} in {found:#?}"
             );
         }
-        assert_eq!(found.len(), 17, "{found:#?}");
+        assert_eq!(found.len(), 18, "{found:#?}");
     }
 
     /// 平常的正确写法一条都不报 / The ordinary right ways of writing raise nothing

@@ -9,8 +9,8 @@ use quinn::{
 };
 use reqwest::Client as DohHttpClient;
 
+use super::bootstrap::{Bootstrap, Resolver};
 use super::doh_h2::{self, H2Link};
-use hyper_util::client::legacy::connect::HttpConnector;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderValue, RETRY_AFTER};
 use rustc_hash::FxBuildHasher;
 use rustls::pki_types::ServerName;
@@ -519,15 +519,19 @@ impl StreamTransport for Tcp {
     /// prefix and its body no longer cost a system call each. DoT's TLS stream buffers on its own
     type Read = tokio::io::BufReader<OwnedReadHalf>;
     type Write = OwnedWriteHalf;
-    type Shared = ();
+    type Shared = Arc<Bootstrap>;
     const LABEL: &'static str = "tcp";
     const NAME: &'static str = "TCP";
     const LOG_TARGET: &'static str = "tcp_mux";
 
-    async fn connect(_: &(), upstream: &str) -> anyhow::Result<(Self::Read, OwnedWriteHalf)> {
-        let stream = TcpStream::connect(upstream)
+    async fn connect(
+        bootstrap: &Arc<Bootstrap>,
+        upstream: &str,
+    ) -> anyhow::Result<(Self::Read, OwnedWriteHalf)> {
+        let stream = bootstrap
+            .connect(upstream)
             .await
-            .map_err(|e| anyhow::anyhow!("tcp connect failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("tcp connect failed: {e:#}"))?;
         tune_stream_socket(&stream, upstream);
         let (read, write) = stream.into_split();
         Ok((tokio::io::BufReader::new(read), write))
@@ -915,8 +919,13 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
 }
 
 impl TcpMultiplexer {
-    pub fn new(pool_size: usize, max_age_secs: u64, idle_timeout_secs: u64) -> Self {
-        Self::with_shared((), pool_size, max_age_secs, idle_timeout_secs)
+    pub fn new(
+        pool_size: usize,
+        max_age_secs: u64,
+        idle_timeout_secs: u64,
+        bootstrap: Arc<Bootstrap>,
+    ) -> Self {
+        Self::with_shared(bootstrap, pool_size, max_age_secs, idle_timeout_secs)
     }
 
     /// 为配置里的 TCP 上游建好连接池，和发送时现建的一样大（`pool_size`），首个查询就不用再建。
@@ -951,10 +960,11 @@ impl DotMultiplexer {
         pool_size: usize,
         max_age_secs: u64,
         idle_timeout_secs: u64,
+        bootstrap: Arc<Bootstrap>,
     ) -> anyhow::Result<Self> {
         let tls_config = build_tls_client_config()?;
         Ok(Self::with_shared(
-            Arc::new(tls_config),
+            (Arc::new(tls_config), bootstrap),
             pool_size,
             max_age_secs,
             idle_timeout_secs,
@@ -1172,14 +1182,18 @@ impl<T: StreamTransport> Drop for StreamMuxClient<T> {
 #[cfg(test)]
 impl TcpMuxClient {
     fn new(upstream: Arc<str>) -> Self {
-        Self::with_shared((), upstream, StreamHealth::default())
+        Self::with_shared(Bootstrap::system(), upstream, StreamHealth::default())
     }
 }
 
 #[cfg(test)]
 impl DotMuxClient {
     fn new(upstream: Arc<str>, tls_config: Arc<ClientConfig>) -> Self {
-        Self::with_shared(tls_config, upstream, StreamHealth::default())
+        Self::with_shared(
+            (tls_config, Bootstrap::system()),
+            upstream,
+            StreamHealth::default(),
+        )
     }
 }
 
@@ -2106,7 +2120,10 @@ pub struct DohClient {
     /// 直连 HTTP/2 用的 TLS 设置：握手时报 h2 和 http/1.1 / The TLS settings of the direct HTTP/2 connection: h2 and http/1.1 offered in the handshake
     tls_h2: Arc<ClientConfig>,
     /// 直连用的 TCP 连接器，设置和 reqwest 的一样 / The TCP connector of the direct connection, set up as reqwest's
-    connector: HttpConnector,
+    connector: doh_h2::Connector,
+    /// 上游的主机名怎样解析（见 [`Bootstrap`]），直连和 reqwest 都用它 / How upstream host names are
+    /// resolved (see [`Bootstrap`]), by the direct connection and reqwest alike
+    resolver: Resolver,
     /// 握手时选了 h2 的上游是否直连：设了代理环境变量时不直连，全部照旧交给 reqwest（见 `doh_h2::proxy_configured`）
     /// Whether an upstream that picked h2 is connected to directly: not with a proxy
     /// environment variable set, when everything goes to reqwest as before (see `doh_h2::proxy_configured`)
@@ -2133,7 +2150,9 @@ impl DohClient {
     pub fn new(
         pool_max_idle_per_host: usize,
         health_error_threshold: usize,
+        bootstrap: Arc<Bootstrap>,
     ) -> anyhow::Result<Self> {
+        let resolver = Resolver(bootstrap);
         Ok(Self {
             upstreams: DashMap::with_hasher(FxBuildHasher),
             pool_max_idle_per_host,
@@ -2142,7 +2161,8 @@ impl DohClient {
             epoch: std::time::Instant::now(),
             latest_pause_end: AtomicU64::new(0),
             tls_h2: direct_tls_config(build_tls_client_config()?),
-            connector: doh_h2::tcp_connector(),
+            connector: doh_h2::tcp_connector(resolver.clone()),
+            resolver,
             direct_h2: !doh_h2::proxy_configured(),
             idle_timeout: doh_h2::DOH_IDLE_TIMEOUT,
             direct_connections: tokio::runtime::Handle::try_current()
@@ -2245,6 +2265,7 @@ impl DohClient {
             // non-success status
             // DoH 服务器没有理由跳转，跟着跳可能把查询发到别处，包括明文 HTTP；3xx 和别的非成功状态一样算失败
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(self.resolver.clone()))
             .http2_adaptive_window(true)
             .pool_idle_timeout(self.idle_timeout)
             .pool_max_idle_per_host(self.pool_max_idle_per_host.max(1))
@@ -2786,20 +2807,21 @@ pub struct Dot;
 impl StreamTransport for Dot {
     type Read = tokio::io::ReadHalf<DotTlsStream>;
     type Write = tokio::io::WriteHalf<DotTlsStream>;
-    type Shared = Arc<ClientConfig>;
+    type Shared = (Arc<ClientConfig>, Arc<Bootstrap>);
     const LABEL: &'static str = "dot";
     const NAME: &'static str = "DoT";
     const LOG_TARGET: &'static str = "dot_mux";
 
     async fn connect(
-        tls_config: &Arc<ClientConfig>,
+        (tls_config, bootstrap): &(Arc<ClientConfig>, Arc<Bootstrap>),
         upstream: &str,
     ) -> anyhow::Result<(Self::Read, Self::Write)> {
         let target = parse_dot_target(upstream)?;
         let server_name = build_server_name(&target.sni)?;
-        let stream = TcpStream::connect(&*target.connect_addr)
+        let stream = bootstrap
+            .connect(&target.connect_addr)
             .await
-            .map_err(|e| anyhow::anyhow!("dot connect failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("dot connect failed: {e:#}"))?;
         tune_stream_socket(&stream, upstream);
         let tls_stream = TlsConnector::from(tls_config.clone())
             .connect(server_name, stream)
@@ -2866,9 +2888,9 @@ pub(crate) fn check_upstream_address(
 ) -> anyhow::Result<()> {
     use crate::config::Transport;
 
-    // UDP 只认 IP 和端口（见 UdpClient::send）；TCP 交给 TcpStream::connect，也认域名
-    // UDP takes an IP and a port only (see UdpClient::send); TCP goes to
-    // TcpStream::connect, which takes a name too
+    // UDP 只认 IP 和端口（见 UdpClient::send）；TCP 也认主机名，由 Bootstrap 解析
+    // UDP takes an IP and a port only (see UdpClient::send); TCP takes a host name too,
+    // which Bootstrap resolves
     let socket_address = |address: &str| -> anyhow::Result<()> {
         let parsed: SocketAddr = address
             .parse()
@@ -2969,6 +2991,8 @@ struct DoqTarget {
 struct DoqRuntime {
     endpoint_v4: QuicEndpoint,
     endpoint_v6: QuicEndpoint,
+    /// 上游的主机名怎样解析（见 [`Bootstrap`]）/ How upstream host names are resolved (see [`Bootstrap`])
+    bootstrap: Arc<Bootstrap>,
     enable_0rtt: bool,
     /// 0-RTT 的安全提示只在真正用上 0-RTT 时打印一次
     /// Prints the 0-RTT security notice once, and only if 0-RTT is really used
@@ -3172,6 +3196,7 @@ impl DoqClient {
         idle_timeout_secs: u64,
         keepalive_interval_ms: u64,
         enable_0rtt: bool,
+        bootstrap: Arc<Bootstrap>,
     ) -> anyhow::Result<Self> {
         let mut tls = build_tls_client_config()?;
         tls.alpn_protocols = vec![b"doq".to_vec()];
@@ -3201,6 +3226,7 @@ impl DoqClient {
         let runtime = Arc::new(DoqRuntime {
             endpoint_v4,
             endpoint_v6,
+            bootstrap,
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
         });
@@ -3681,8 +3707,9 @@ impl DoqMuxClient {
         target: DoqTarget,
         zero_rtt: bool,
     ) -> anyhow::Result<NewDoqConn> {
-        let addr_str = host_port(&target.host, target.port);
-        let addrs = tokio::net::lookup_host(&addr_str)
+        let addrs_vec = runtime
+            .bootstrap
+            .addresses(&target.host, target.port)
             .await
             .context("doq resolve failed")?;
 
@@ -3690,7 +3717,6 @@ impl DoqMuxClient {
         // Prefer IPv4 addresses to avoid IPv6 connection issues
         // 某些网络的 IPv6 连接不稳定或 MTU 限制导致 QUIC Initial 数据包发送失败
         // Some networks have unstable IPv6 or MTU limits causing QUIC Initial packet send failures
-        let addrs_vec: Vec<_> = addrs.collect();
         let addr = addrs_vec
             .iter()
             .find(|a| a.is_ipv4())
@@ -5035,7 +5061,8 @@ mod tests {
     /// without a single DoQ upstream saw it at every start.
     #[tokio::test]
     async fn doq_client_holds_the_0rtt_notice_until_early_data_is_offered() {
-        let client = DoqClient::new(1, 60, 15_000, true).expect("build DoQ client");
+        let client =
+            DoqClient::new(1, 60, 15_000, true, Bootstrap::system()).expect("build DoQ client");
         assert!(
             !client.runtime.zero_rtt_notice.is_completed(),
             "building the client must not emit the 0-RTT notice"
@@ -5108,7 +5135,7 @@ mod tests {
     /// error, the exact opposite.
     #[test]
     fn doh_record_error_treats_a_zero_threshold_as_disabled() {
-        let client = DohClient::new(8, 0).expect("build doh client");
+        let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
         let upstream = "doh://8.8.8.8";
         let ptr_before =
             Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
@@ -5131,7 +5158,7 @@ mod tests {
     /// entries nothing has used are now dropped.
     #[test]
     fn doh_prunes_upstreams_nothing_has_used() {
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
         for idx in 0..4 {
             client
                 .upstream(&format!("https://{idx}.example/dns-query"))
@@ -5163,7 +5190,7 @@ mod tests {
     /// until the process exited. A lookup of an existing upstream now prunes too.
     #[test]
     fn doh_prunes_idle_upstreams_without_new_keys() {
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
         for idx in 0..4 {
             client
                 .upstream(&format!("https://{idx}.example/dns-query"))
@@ -5197,7 +5224,7 @@ mod tests {
     /// upstreams that used to happen on every single DoH query.
     #[test]
     fn doh_prune_round_is_claimed_even_when_nothing_expires() {
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
         let live = "https://live.example/dns-query";
         client.upstream(live).expect("create upstream");
 
@@ -5245,7 +5272,7 @@ mod tests {
     /// rebuilds for a hundred erring together
     #[test]
     fn requests_broken_together_rebuild_once() {
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
         let upstream = "doh://8.8.8.8";
         let state = client.upstream(upstream).unwrap();
         let started = state.generation.load(Ordering::Acquire);
@@ -5272,7 +5299,7 @@ mod tests {
         // 验证核心自愈契约：连续传输错误在阈值前累积不重建；
         // 达阈值时重建连接池（新 reqwest::Client 是清除 reqwest 自身无法检测的
         // 死/半开连接的唯一手段）。
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
         let upstream = "doh://8.8.8.8";
 
         let ptr_before =
@@ -5312,7 +5339,7 @@ mod tests {
         // 以前所有 DoH 上游共用一个 reqwest 客户端，一个上游达到错误阈值会把所有
         // 上游的连接池一起换掉，健康上游丢失 keep-alive 连接、被迫重新握手。
         // 现在每个上游各持一个客户端。
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
         let healthy = "doh://1.1.1.1";
         let failing = "doh://bad.example";
         let healthy_before =
@@ -5342,7 +5369,7 @@ mod tests {
         // record_success clears the per-upstream counter so a transient blip does
         // not accumulate toward a rebuild across an intervening healthy request.
         // record_success 清零 per-upstream 计数，避免偶发错误跨健康请求累积到重建。
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
         let upstream = "doh://1.1.1.1";
 
         client.record_error_of(upstream);
@@ -5369,7 +5396,7 @@ mod tests {
         // one upstream must not inflate another upstream's count.
         // 对齐 mux 的 per-upstream consecutive_errors 隔离：
         // 一个 upstream 的错误不得累加到另一个 upstream。
-        let client = DohClient::new(8, 3).expect("build doh client");
+        let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
 
         client.record_error_of("doh://8.8.8.8");
         client.record_error_of("doh://8.8.8.8");
@@ -5664,7 +5691,7 @@ mod tests {
     /// connection slot of its own
     #[test]
     fn a_warmed_up_pool_has_every_client() {
-        let mux = TcpMultiplexer::new(3, 0, 0);
+        let mux = TcpMultiplexer::new(3, 0, 0, Bootstrap::system());
         mux.warm_up_pools(&["127.0.0.1:53".to_string()].into_iter().collect());
         let pool = mux
             .pools
@@ -5710,7 +5737,7 @@ mod tests {
                 });
             }
         });
-        let mux = TcpMultiplexer::new(2, 0, 0);
+        let mux = TcpMultiplexer::new(2, 0, 0, Bootstrap::system());
         let pool = mux.get_or_init_pool_for_test(&addr);
         assert_eq!(pool.clients.len(), 2);
         for client in &pool.clients {
@@ -5781,13 +5808,14 @@ mod tests {
     /// get one client
     #[tokio::test]
     async fn a_pool_size_of_zero_gives_one_client() {
-        let tcp = TcpMultiplexer::new(0, 0, 0);
+        let tcp = TcpMultiplexer::new(0, 0, 0, Bootstrap::system());
         assert_eq!(
             tcp.get_or_init_pool_for_test("192.0.2.1:53").clients.len(),
             1
         );
 
-        let doq = DoqClient::new(0, 60, 15_000, false).expect("build DoQ client");
+        let doq =
+            DoqClient::new(0, 60, 15_000, false, Bootstrap::system()).expect("build DoQ client");
         // 发一个连不上的查询，只为建出这个上游的连接池
         // A query nothing answers, only to build this upstream's pool
         let upstream = "127.0.0.1:9?sni=localhost";
@@ -5968,7 +5996,7 @@ mod tests {
             })
             .await;
             let upstream = format!("http://{addr}/dns-query");
-            let client = DohClient::new(8, 0).expect("build doh client");
+            let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
             for id in [0xBEEF_u16, 0xCAFE] {
                 let mut query = vec![0u8; 12];
                 query[..2].copy_from_slice(&id.to_be_bytes());
@@ -6028,7 +6056,7 @@ mod tests {
         })
         .await;
         let upstream = format!("http://{addr}/dns-query");
-        let client = DohClient::new(8, 0).expect("build doh client");
+        let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
 
         // 正好一条最长的 DNS 消息：照收，分几块到也拼得回来
         // Exactly one longest DNS message: taken, put back together from its pieces
@@ -6073,7 +6101,7 @@ mod tests {
         })
         .await;
         let upstream = format!("http://{addr}/dns-query");
-        let client = DohClient::new(8, 0).expect("build doh client");
+        let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
         for label in ["html", "none"] {
             let err = client
                 .send(&doh_test_query(label), &upstream, Duration::from_secs(5))
@@ -6106,7 +6134,7 @@ mod tests {
             }
         })
         .await;
-        let client = DohClient::new(8, 0).expect("build doh client");
+        let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
         let err = client
             .send(
                 &doh_test_query("move"),
@@ -6131,7 +6159,7 @@ mod tests {
             ))
         })
         .await;
-        let client = DohClient::new(8, 0).expect("build doh client");
+        let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
         let err = client
             .send(
                 &udp_test_query("swap.example"),
@@ -6196,7 +6224,7 @@ mod tests {
         .await;
         let upstream = format!("http://{addr}/dns-query");
         // 阈值 1：记一次传输错误就会重建 / Threshold 1: a single transport error would rebuild
-        let client = DohClient::new(8, 1).expect("build doh client");
+        let client = DohClient::new(8, 1, Bootstrap::system()).expect("build doh client");
         assert!(!client.any_paused());
         let state = client.upstream(&upstream).expect("doh upstream state");
         let pool = Arc::as_ptr(&state.client.load_full());
@@ -6236,7 +6264,7 @@ mod tests {
     /// warn, with the upstream, the seconds and whether Retry-After set them
     #[test]
     fn concurrent_429s_only_move_a_pause_later_and_warn_once() {
-        let client = DohClient::new(8, 0).expect("build doh client");
+        let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
         let upstream = "doh.example/dns-query";
         let state = client.upstream(upstream).expect("doh upstream state");
         let throttle = |seconds, from_retry_after| Throttle {
@@ -6272,7 +6300,7 @@ mod tests {
     /// so later checks read no clock
     #[test]
     fn a_pause_ends_on_time_and_the_shared_gate_clears() {
-        let client = DohClient::new(8, 0).expect("build doh client");
+        let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
         let upstream = "doh.example/dns-query";
         let state = client.upstream(upstream).expect("doh upstream state");
         client.pause(
@@ -6505,6 +6533,7 @@ mod tests {
         Arc::new(DoqRuntime {
             endpoint_v4,
             endpoint_v6,
+            bootstrap: Bootstrap::system(),
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
         })
@@ -7234,7 +7263,7 @@ mod tests {
     async fn the_health_check_keeps_to_the_query_budget() {
         let addr = spawn_stream_upstream(None).await;
         let client = TcpMuxClient::with_shared(
-            (),
+            Bootstrap::system(),
             Arc::from(addr.to_string()),
             StreamHealth {
                 idle_timeout_ms: 1,
@@ -7276,7 +7305,7 @@ mod tests {
     async fn an_expired_connection_is_replaced_once_for_queries_arriving_together() {
         let addr = spawn_stream_upstream(None).await;
         let client = Arc::new(TcpMuxClient::with_shared(
-            (),
+            Bootstrap::system(),
             Arc::from(addr.to_string()),
             StreamHealth {
                 idle_timeout_ms: 1,
@@ -7515,6 +7544,58 @@ mod tests {
             .expect("an IPv6 literal DoQ upstream answers");
     }
 
+    /// 写成主机名的 TCP、DoT、DoQ 上游经 Bootstrap 解析：`upstream.test` 只有本机的 bootstrap 服务器认得，
+    /// 三种上游都由它解析出 127.0.0.1 连上
+    /// TCP, DoT and DoQ upstreams written with a host name are resolved through Bootstrap:
+    /// `upstream.test` is known to the local bootstrap server only, and all three connect to the
+    /// 127.0.0.1 it resolves
+    #[tokio::test]
+    async fn named_tcp_dot_and_doq_upstreams_are_resolved_through_bootstrap() {
+        let server = crate::engine::test_support::loopback_bootstrap(300).await;
+        let bootstrap = Bootstrap::new(
+            &server.address,
+            Arc::new(UdpClient::new(1).expect("UDP client")),
+            Duration::from_secs(2),
+        );
+        let query = udp_test_query("named.example");
+        let budget = Duration::from_secs(2);
+
+        let tcp = spawn_stream_upstream(None).await;
+        TcpMultiplexer::new(1, 0, 0, Arc::clone(&bootstrap))
+            .send(&query, &format!("upstream.test:{}", tcp.port()), budget)
+            .await
+            .expect("the named TCP upstream answers");
+
+        let (dot_server, dot_client) = self_signed_tls(&["upstream.test"], &[]);
+        let dot = spawn_stream_upstream(Some(dot_server)).await;
+        DotMultiplexer::with_shared((Arc::new(dot_client), Arc::clone(&bootstrap)), 1, 0, 0)
+            .send(&query, &format!("upstream.test:{}", dot.port()), budget)
+            .await
+            .expect("the named DoT upstream answers");
+
+        let (doq_server, doq_client) = self_signed_tls(&["upstream.test"], &[b"doq"]);
+        let answer = |_: usize, _: &str| DoqReply::Answer(Duration::ZERO);
+        let doq = spawn_doq_upstream(doq_server, Duration::ZERO, answer).await;
+        let runtime = Arc::into_inner(doq_test_runtime(doq_client, false)).expect("one owner");
+        DoqMuxClient::new(
+            Arc::from(format!("doq://upstream.test:{}", doq.port())),
+            Arc::new(DoqRuntime {
+                bootstrap,
+                ..runtime
+            }),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .send(&query, budget)
+        .await
+        .expect("the named DoQ upstream answers");
+
+        assert_eq!(
+            server.queries(),
+            2,
+            "A and AAAA asked once, then kept for their TTL"
+        );
+    }
+
     /// DoT 的写入卡住时也一样收尾（见 `a_stuck_write_ends_at_the_deadline`）：TLS 流写满时会先收下明文，
     /// 写入任务停在 flush 上
     /// A stuck DoT write ends the same way (see `a_stuck_write_ends_at_the_deadline`): a full
@@ -7548,7 +7629,8 @@ mod tests {
     /// timeout (9 s by default) before it stopped using it.
     #[tokio::test]
     async fn doq_pool_shares_what_one_connection_learned_about_0rtt() {
-        let client = DoqClient::new(2, 60, 15_000, true).expect("build DoQ client");
+        let client =
+            DoqClient::new(2, 60, 15_000, true, Bootstrap::system()).expect("build DoQ client");
         // 发一个连不上的查询，只为建出这个上游的连接池
         // A query nothing answers, only to build this upstream's pool
         let upstream = "127.0.0.1:9?sni=localhost";
@@ -7608,7 +7690,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_tcp_pool_closes_its_connection() {
         let (addr, mut closed) = upstream_noting_closes(None).await;
-        let mux = TcpMultiplexer::new(2, 300, 60);
+        let mux = TcpMultiplexer::new(2, 300, 60, Bootstrap::system());
         mux.send(
             &udp_test_query("a.example"),
             &addr.to_string(),
@@ -7623,7 +7705,8 @@ mod tests {
     async fn dropping_a_dot_pool_closes_its_connection() {
         let (server, client_tls) = localhost_tls(&[]);
         let (addr, mut closed) = upstream_noting_closes(Some(server)).await;
-        let mux = DotMultiplexer::with_shared(Arc::new(client_tls), 2, 300, 60);
+        let mux =
+            DotMultiplexer::with_shared((Arc::new(client_tls), Bootstrap::system()), 2, 300, 60);
         mux.send(
             &udp_test_query("a.example"),
             &format!("{addr}?sni=localhost"),
@@ -7651,11 +7734,11 @@ mod tests {
         };
         for (mux, age) in [
             (
-                TcpMultiplexer::new(1, 1, 0),
+                TcpMultiplexer::new(1, 1, 0, Bootstrap::system()),
                 wind_back(|client| &client.conn_create_time),
             ),
             (
-                TcpMultiplexer::new(1, 0, 1),
+                TcpMultiplexer::new(1, 0, 1, Bootstrap::system()),
                 wind_back(|client| &client.last_request_time),
             ),
         ] {

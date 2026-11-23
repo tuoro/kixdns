@@ -30,6 +30,7 @@ use rustls::pki_types::ServerName;
 use tower_service::Service;
 use url::{Host, Url};
 
+use super::bootstrap::Resolver;
 use super::transport::{Connect, InFlight, StillOpen, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
@@ -125,7 +126,7 @@ impl H2Link {
         &self,
         url: &Url,
         tls: &Arc<ClientConfig>,
-        connector: &HttpConnector,
+        connector: &Connector,
     ) -> anyhow::Result<Option<(H2Sender, InFlight<'_>)>> {
         if self.no_h2.load(Ordering::Relaxed) {
             return Ok(None);
@@ -208,7 +209,7 @@ impl StillOpen for Option<H2Sender> {
 async fn connect(
     url: &Url,
     tls: &Arc<ClientConfig>,
-    connector: &HttpConnector,
+    connector: &Connector,
 ) -> anyhow::Result<Option<H2Sender>> {
     let server_name = match url.host().context("doh url has no host")? {
         Host::Domain(name) => ServerName::try_from(name.to_string()).context("doh server name")?,
@@ -357,12 +358,17 @@ impl hyper::body::Body for H2Body {
     }
 }
 
+/// 直连用的 TCP 连接器，主机名交给 [`Resolver`] 解析 / The direct connection's TCP connector, host
+/// names resolved by [`Resolver`]
+pub(crate) type Connector = HttpConnector<Resolver>;
+
 /// 和 reqwest 默认一样的 TCP 连接器：关 Nagle，不限 http（TLS 由这里接着做），TCP keepalive 15 秒起、
-/// 每 15 秒一次、3 次没回就断
+/// 每 15 秒一次、3 次没回就断；主机名和 reqwest 一样交给 `resolver`
 /// A TCP connector set up as reqwest's default: Nagle off, any scheme allowed (TLS follows
-/// here), TCP keepalive from 15 seconds, every 15 seconds, given up after 3 unanswered
-pub(crate) fn tcp_connector() -> HttpConnector {
-    let mut connector = HttpConnector::new();
+/// here), TCP keepalive from 15 seconds, every 15 seconds, given up after 3 unanswered; host
+/// names go to `resolver`, as reqwest's do
+pub(crate) fn tcp_connector(resolver: Resolver) -> Connector {
+    let mut connector = HttpConnector::new_with_resolver(resolver);
     connector.enforce_http(false);
     connector.set_nodelay(true);
     connector.set_keepalive(Some(Duration::from_secs(15)));

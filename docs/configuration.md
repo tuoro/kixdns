@@ -31,6 +31,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doh_tls_key | null | PEM 私钥路径；设置 bind_doh 时必需。 |
 | doh_path | /dns-query | 入站 DoH 请求路径。 |
 | default_upstream | 1.1.1.1:53 | 默认上游；支持逗号分隔列表。 |
+| bootstrap | 空 | 解析写成主机名的上游（TCP、DoT、DoH、DoQ）用的明文 DNS 服务器，逗号分隔的 `IP:端口`，经 UDP 问；几个一起问，取先答出地址的那个。问到的地址按 TTL 留着，TTL 过了又一个也问不到时接着用上次的。不设时交给系统的解析器：系统的解析器要是 KixDNS 自己，解析上游的名字会绕回来问 KixDNS，上游就连不上，所以这时第一次经系统解析名字会记一条 warn。写成 IP 的上游不用解析。 |
 | upstream_timeout_ms | 9000 | 单次上游操作超时；必须大于 0。UDP 转发等过这个上游最近最慢百分之一回答的用时还没有回答，会把查询再发一次（至少等 50 毫秒，最多等超时的三分之一；这个上游还没回答过时等三分之一），此后一整个超时里两次谁的回答先到用谁的。 |
 | request_timeout_ms | null | 整体请求超时；为 null 时使用 upstream_timeout_ms * 2.5，且不能小于 upstream_timeout_ms。 |
 | response_jump_limit | 10 | 响应阶段最多跳转几次 Pipeline（回答动作里的跳转和跳转之后规则级的跳转都算）；再跳就回 SERVFAIL。 |
@@ -424,7 +425,7 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 还有一些写法照样加载、照写的做，却值得知道：上面这些退役的设置和 background_refresh_rule，一个国家代码也没写的 geoip_country 和 response_answer_ip_geoip_country（永远不命中），大于 1000000 的 cache_capacity（可能占掉很多内存），不到 upstream_timeout_ms 两倍半的 request_timeout_ms（可能来不及重发和改用 TCP）。它们不算上面的问题，启动、重载和校验都不拒绝：配置每生效一次各记一条警告，控制通道 `config` 结果的 `warnings` 列出当前配置里的这些写法，配置校验的回答也带着 `warnings`。
 
-下面这些全局设置只在启动时读取，重载不会让它们生效，修改后要重启服务：`bind_udp`、`bind_tcp`、`bind_doh`、`doh_path`、`doh_tls_cert`、`doh_tls_key`、`cache_capacity`、`cache_max_ttl`、`dashmap_shards`、`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`doh_health_check_error_threshold`、`dot_pool_size`、`doq_pool_size`、`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`、`doq_connection_idle_timeout_seconds`、`doq_keepalive_interval_ms`、`doq_enable_0rtt` 和全部 `flow_control_*`。其余全局设置重载即生效。重载后，配置里改过、还在等重启的设置会出现在控制通道 `config` 结果的 `restart_pending` 里；改回启动时的值，或者重启以后，它就不再出现。重载时改这些设置不会让缓存作废。UDP worker 数量由命令行指定，同样只在启动时生效。DoH TLS 证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。配置文件、证书和私钥、Geo 数据文件是符号链接时（比如 Kubernetes 的 ConfigMap、Secret 卷），链接指向的文件变了、路上哪个链接换了指向，都算文件变了，监控跟着新的指向走。这些文件写完才读：Linux 上等写的一方关上文件或者改名到位；别的平台等写入停下 0.3 秒；一直有人在写时最多等 2 秒也读一次。只改属性（chmod、chown）不算改动。读出来不对（写坏了、半截文件）时留着正在用的，等文件下次改动。
+下面这些全局设置只在启动时读取，重载不会让它们生效，修改后要重启服务：`bind_udp`、`bind_tcp`、`bind_doh`、`doh_path`、`doh_tls_cert`、`doh_tls_key`、`cache_capacity`、`cache_max_ttl`、`dashmap_shards`、`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`doh_health_check_error_threshold`、`dot_pool_size`、`doq_pool_size`、`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`、`doq_connection_idle_timeout_seconds`、`doq_keepalive_interval_ms`、`doq_enable_0rtt`、`bootstrap` 和全部 `flow_control_*`。其余全局设置重载即生效。重载后，配置里改过、还在等重启的设置会出现在控制通道 `config` 结果的 `restart_pending` 里；改回启动时的值，或者重启以后，它就不再出现。重载时改这些设置不会让缓存作废。UDP worker 数量由命令行指定，同样只在启动时生效。DoH TLS 证书/私钥 PEM 文件续期后会热更新生效，但修改配置中的证书路径仍需重启。配置文件、证书和私钥、Geo 数据文件是符号链接时（比如 Kubernetes 的 ConfigMap、Secret 卷），链接指向的文件变了、路上哪个链接换了指向，都算文件变了，监控跟着新的指向走。这些文件写完才读：Linux 上等写的一方关上文件或者改名到位；别的平台等写入停下 0.3 秒；一直有人在写时最多等 2 秒也读一次。只改属性（chmod、chown）不算改动。读出来不对（写坏了、半截文件）时留着正在用的，等文件下次改动。
 
 重载后，配置里不再出现的上游会关闭它们的 TCP、DoT、DoQ 连接；正在使用这些连接的请求处理完之后才会关闭。
 

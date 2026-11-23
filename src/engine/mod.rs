@@ -2,6 +2,9 @@
 mod action_order_tests;
 #[cfg(test)]
 mod answered_by_tests;
+pub(crate) mod bootstrap;
+#[cfg(test)]
+mod bootstrap_tests;
 #[cfg(test)]
 mod client_address_tests;
 pub mod concurrency;

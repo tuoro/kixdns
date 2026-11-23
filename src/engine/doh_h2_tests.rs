@@ -15,9 +15,10 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode, Version};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
+use super::bootstrap::Bootstrap;
 use super::doh_h2::{self, proxy_configured_in};
 use super::test_support::CountedWrites;
-use super::transport::{BUSY_AT, DOH_MEDIA_TYPE, DohClient, throttle_of};
+use super::transport::{BUSY_AT, DOH_MEDIA_TYPE, DohClient, UdpClient, throttle_of};
 
 #[ctor::ctor]
 fn init_crypto() {
@@ -49,7 +50,7 @@ impl TlsUpstream {
     }
 
     fn client(&self, threshold: usize) -> DohClient {
-        let mut client = DohClient::new(8, threshold).expect("doh client");
+        let mut client = DohClient::new(8, threshold, Bootstrap::system()).expect("doh client");
         client.trust_for_tests(self.cert.clone());
         client
     }
@@ -78,10 +79,13 @@ fn dns_ok(body: Vec<u8>) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-/// 本机地址的自签证书和用它的 TLS 接受端，握手时报 `alpn` / A self-signed certificate for the
-/// local address and a TLS acceptor using it, offering `alpn` in the handshake
+/// 本机地址（还有只有本机 bootstrap 服务器认得的 `upstream.test`）的自签证书和用它的 TLS 接受端，握手时报
+/// `alpn` / A self-signed certificate for the local address (and for `upstream.test`, known to
+/// the local bootstrap server only) and a TLS acceptor using it, offering `alpn` in the handshake
 fn tls_acceptor(alpn: &[&[u8]]) -> (tokio_rustls::TlsAcceptor, CertificateDer<'static>) {
-    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let mut params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "upstream.test".to_string()])
+            .unwrap();
     params.subject_alt_names.push(rcgen::SanType::IpAddress(
         std::net::Ipv4Addr::LOCALHOST.into(),
     ));
@@ -239,6 +243,33 @@ async fn an_h2_upstream_shares_one_connection() {
             .iter()
             .all(|seen| seen.version == Version::HTTP_2)
     );
+}
+
+/// 写成主机名的 DoH 上游经 Bootstrap 解析，直连和 reqwest 都是：`upstream.test` 只有本机的 bootstrap 服务器认得
+/// A DoH upstream written with a host name is resolved through Bootstrap, over the direct
+/// connection and through reqwest alike: `upstream.test` is known to the local bootstrap server
+/// only
+#[tokio::test]
+async fn a_named_doh_upstream_is_resolved_through_bootstrap() {
+    let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
+    let server = super::test_support::loopback_bootstrap(300).await;
+    let url = format!("https://upstream.test:{}/dns-query", upstream.addr.port());
+    for direct in [true, false] {
+        let bootstrap = Bootstrap::new(
+            &server.address,
+            Arc::new(UdpClient::new(1).expect("UDP client")),
+            Duration::from_secs(2),
+        );
+        let mut client = DohClient::new(8, 3, bootstrap).expect("doh client");
+        client.trust_for_tests(upstream.cert.clone());
+        if !direct {
+            client.reqwest_only_for_tests();
+        }
+        ask(&client, &url, 1)
+            .await
+            .expect("the named upstream answers");
+        assert_eq!(client.has_direct_connection(&url), direct);
+    }
 }
 
 /// 握手时没选 h2 的上游照旧经 reqwest（HTTP/1.1）问；只试探一次，之后不再为直连多开连接
