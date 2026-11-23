@@ -875,9 +875,13 @@ mod tests {
         server.abort();
     }
 
-    /// 内存紧张时 DoH 也按对端地址算：在途占满的那台设备的请求和新连接被拒，别的设备照常
+    /// 内存紧张时 DoH 也按对端地址算：在途占满的那台设备的请求和新连接被拒，别的设备照常。要从 127.0.0.1 以外的回环地址连，
+    /// 只在 Linux 上跑（见 `listeners::tests::connect_from`）
     /// With memory tight DoH goes by the peer address too: the device holding everything in
-    /// flight has its requests and new connections refused while another goes on
+    /// flight has its requests and new connections refused while another goes on. It connects
+    /// from loopback addresses besides 127.0.0.1, so it runs on Linux only (see
+    /// `listeners::tests::connect_from`)
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn tight_memory_refuses_only_the_doh_device_holding_the_queries() {
         use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};

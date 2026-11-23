@@ -2403,6 +2403,7 @@ fn engine_short_of_memory(
 
 /// 测试不必等：内存不够以前问过的设备都算老设备 / A test need not wait: a device that asked before memory
 /// ran short counts as known
+#[cfg(target_os = "linux")]
 fn known_at_once(engine: &mut Engine) {
     Arc::get_mut(engine.flow_control_state.as_mut().unwrap())
         .unwrap()
@@ -2531,7 +2532,11 @@ async fn a_new_tcp_connection_is_closed_when_memory_is_short() {
     server.abort();
 }
 
-/// 从 `local` 连 `to` / Connects to `to` from `local`
+/// 从 `local` 连 `to`。只有 Linux 的回环上整个 127.0.0.0/8 都绑得上，macOS 和 BSD 默认只有 127.0.0.1，用它的测试只在
+/// Linux 上跑
+/// Connects to `to` from `local`. Only Linux's loopback takes all of 127.0.0.0/8; macOS and the
+/// BSDs hold 127.0.0.1 alone by default, so the tests using it run on Linux only
+#[cfg(target_os = "linux")]
 async fn connect_from(local: std::net::IpAddr, to: SocketAddr) -> TcpStream {
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
     socket.bind(SocketAddr::new(local, 0)).unwrap();
@@ -2541,6 +2546,7 @@ async fn connect_from(local: std::net::IpAddr, to: SocketAddr) -> TcpStream {
 /// 内存紧张时，在途占满的那台设备的查询和新连接被拒，别的设备照常；UDP 和 TCP 都按真实的对端地址算
 /// With memory tight, the device holding everything in flight has its queries and new
 /// connections refused while another goes on; UDP and TCP both go by the real peer address
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tight_memory_refuses_only_the_device_holding_the_queries() {
     use std::net::{IpAddr, Ipv4Addr};
@@ -2644,6 +2650,7 @@ async fn tight_memory_refuses_only_the_device_holding_the_queries() {
 /// connection forwarded as usual: a connection is no share of queries. Connections and
 /// queries used to be counted together, so with every other device holding one query its
 /// connection counted as a share and the query was refused at once
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tight_memory_does_not_count_a_connection_as_a_share_of_queries() {
     use std::net::{IpAddr, Ipv4Addr};

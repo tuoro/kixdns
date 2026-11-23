@@ -93,11 +93,13 @@ pub fn is_standard_query_header(packet: &[u8]) -> bool {
     flags & 0x8000 == 0 && flags & 0x7800 == 0 && qd_count == 1 && an_count == 0 && ns_count == 0
 }
 
-/// 读不了的查询的 FORMERR：只有请求头，问题读得出来就带上问题（见 [`short_reply`]）
+/// 读不了的查询的 FORMERR：只有请求头，问题读得出来就带上问题（见 [`short_reply`]），查询带着读得出的 OPT 时也带 OPT（见
+/// [`reply_as_asked`]，RFC 6891 第 7 节）
 /// The FORMERR for a query that cannot be read: the header alone, with the question when that
-/// can be read (see [`short_reply`])
+/// can be read (see [`short_reply`]), and an OPT when the query carries one that can be read
+/// (see [`reply_as_asked`], RFC 6891 section 7)
 pub fn formerr_reply(query: &[u8]) -> Bytes {
-    short_reply(query, ResponseCode::FormErr, true)
+    reply_as_asked(short_reply(query, ResponseCode::FormErr, true), query)
 }
 
 /// 一个查询的 SERVFAIL，三个监听器过载拒绝和超时时都回它：照线上格式拼（见 [`short_reply`]），不必解析查询，再照查询规整
@@ -138,8 +140,8 @@ fn short_reply(request: &[u8], rcode: ResponseCode, question: bool) -> Bytes {
 }
 
 /// 请求头不是 KixDNS 回答的标准查询（见 [`is_standard_query_header`]）时的应答。只有请求头，带着它的 ID、
-/// 操作码、RD 和 CD，各段计数为 0：不比请求长，伪造来源也放大不了流量；别的操作码下各段的意思不同，
-/// 也不往应答里抄。
+/// 操作码、RD 和 CD，请求带着读得出的 OPT 时再加一条 OPT（RFC 6891 第 7 节：带 OPT 的请求，应答也要带）：不比请求长，
+/// 伪造来源也放大不了流量；别的操作码下各段的意思不同，也不往应答里抄。以前从不带 OPT，经 DoH 问时请求带了填充才碰巧带上
 /// - 操作码不是 QUERY（NOTIFY、UPDATE 这些 KixDNS 不做的）：NOTIMP（RFC 1035 第 4.1.1 节）。
 /// - 操作码是 QUERY，但问题数不是 1，或者带着回答、授权记录：FORMERR（RFC 9619）。RFC 7873 第 5.4 节那种
 ///   只带 cookie、没有问题的探测，也由此得到回答。
@@ -148,9 +150,11 @@ fn short_reply(request: &[u8], rcode: ResponseCode, question: bool) -> Bytes {
 /// 以前除了 NOTIMP，这些都被丢掉（UDP）或者断开连接（TCP）。
 ///
 /// The reply to a request whose header is not the standard query KixDNS answers (see
-/// [`is_standard_query_header`]). The header alone, with its ID, opcode, RD and CD and every
-/// count at 0: no longer than the request, a forged source gains no amplification, and the
-/// sections, meaning other things under other opcodes, are not copied.
+/// [`is_standard_query_header`]). The header alone, with its ID, opcode, RD and CD, and an OPT
+/// added when the request carries one that can be read (RFC 6891 section 7: a request with an
+/// OPT gets one back): no longer than the request, a forged source gains no amplification, and
+/// the sections, meaning other things under other opcodes, are not copied. It never carried an
+/// OPT before, except by chance over DoH when the request was padded.
 /// - An opcode other than QUERY (NOTIFY, UPDATE and the like, which KixDNS does not do) gets
 ///   NOTIMP (RFC 1035 section 4.1.1).
 /// - A QUERY with a question count other than 1, or carrying answer or authority records,
@@ -169,7 +173,7 @@ pub fn header_reply(packet: &[u8]) -> Option<Bytes> {
     } else {
         ResponseCode::FormErr
     };
-    Some(short_reply(packet, rcode, false))
+    Some(reply_as_asked(short_reply(packet, rcode, false), packet))
 }
 
 /// DNS 报文头的长度 / The length of a DNS header
@@ -399,7 +403,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             // TTL 字段依次是扩展 RCODE、版本和标志 / The TTL field holds the extended RCODE, the version and the flags
             edns_version = packet[next_pos + 5];
             dnssec_ok = packet[next_pos + 6] & 0x80 != 0;
-            client_subnet = query_subnet(packet, fixed_end..rdata_end);
+            // ECS 不合规的查询留给 `Engine::on_the_spot` 回 FORMERR / A query with an improper ECS is left
+            // for `Engine::on_the_spot` to answer FORMERR
+            client_subnet = query_subnet(packet, fixed_end..rdata_end).ok()?;
         }
         ar_pos = rdata_end;
     }
@@ -991,27 +997,34 @@ struct EcsOption {
 }
 
 impl EcsOption {
-    /// 是否完全符合 RFC 7871 第 6 节：已知的地址族、前缀不超过地址长度、ADDRESS 恰好
-    /// ceil(前缀/8) 个字节、前缀之后的位为零，SCOPE 也不超过地址长度。
-    /// Whether it follows RFC 7871 section 6 to the letter: a known family, a
-    /// prefix within the address length, an ADDRESS of exactly ceil(prefix/8)
-    /// octets with zero bits beyond the prefix, and a SCOPE within the address
-    /// length too.
+    /// 是否完全符合 RFC 7871 第 6 节：地址合规（见 [`Self::address_bits`]），SCOPE 也不超过地址长度。
+    /// Whether it follows RFC 7871 section 6 to the letter: a proper address (see
+    /// [`Self::address_bits`]), and a SCOPE within the address length too.
     fn is_well_formed(&self, packet: &[u8]) -> bool {
+        self.address_bits(packet)
+            .is_some_and(|bits| self.scope <= bits)
+    }
+
+    /// 地址合规时是地址族的位数：已知的地址族、前缀不超过地址长度、ADDRESS 恰好 ceil(前缀/8) 个字节、前缀之后的位为零。
+    /// 不合规的查询要回 FORMERR（RFC 7871 第 6 节、第 7.2.1 节）
+    /// The family's bit count when the address is proper: a known family, a prefix within the
+    /// address length, an ADDRESS of exactly ceil(prefix/8) octets with zero bits beyond the
+    /// prefix. A query with an improper one is answered FORMERR (RFC 7871 sections 6 and 7.2.1)
+    fn address_bits(&self, packet: &[u8]) -> Option<u8> {
         let bits = match self.family {
             1 => 32,
             2 => 128,
-            _ => return false,
+            _ => return None,
         };
         let address = &packet[self.address.clone()];
         let spare = self.source_prefix % 8;
-        self.source_prefix <= bits
-            && self.scope <= bits
+        (self.source_prefix <= bits
             && address.len() == (self.source_prefix as usize).div_ceil(8)
             && (spare == 0
                 || address
                     .last()
-                    .is_some_and(|last| last & (0xFF >> spare) == 0))
+                    .is_some_and(|last| last & (0xFF >> spare) == 0)))
+        .then_some(bits)
     }
 
     fn subnet(&self, packet: &[u8]) -> crate::ecs::EcsKey {
@@ -1075,28 +1088,46 @@ fn ecs_option(packet: &[u8], rdata: std::ops::Range<usize>) -> Result<Option<Ecs
     Ok(found)
 }
 
-/// 查询（OPT 的 RDATA 在 `rdata`）里客户端自己带的 ECS。不完全合规的选项得到
-/// `EcsKey::opaque`：它照样会被原样转给上游，应答却说不准适用于谁。
-/// The ECS a query carries itself, its OPT RDATA at `rdata`. An option that does
-/// not follow the rules to the letter gets an `EcsKey::opaque`: it still goes
-/// upstream as it is, but whom the answer applies to is unclear.
-fn query_subnet(packet: &[u8], rdata: std::ops::Range<usize>) -> Option<crate::ecs::EcsKey> {
-    match ecs_option(packet, rdata.clone()) {
-        Ok(None) => None,
-        Ok(Some(option)) if option.scope == 0 && option.is_well_formed(packet) => {
-            Some(option.subnet(packet))
-        }
-        _ => Some(crate::ecs::EcsKey::opaque(&packet[rdata])),
-    }
+/// 查询（OPT 的 RDATA 在 `rdata`）里客户端自己带的 ECS。地址不合规（见 `EcsOption::address_bits`）或者不止一个 ECS
+/// 选项时为 Err，这样的查询回 FORMERR（见 [`malformed_ecs`]）；SCOPE 不为 0 的得到 `EcsKey::opaque`（查询里它必须为 0，
+/// RFC 7871 第 6 节却没要求为此回 FORMERR）：它照样会被原样转给上游，应答却说不准适用于谁。
+/// The ECS a query carries itself, its OPT RDATA at `rdata`. Err for an improper address (see
+/// `EcsOption::address_bits`) or more than one ECS option, and such a query is answered FORMERR
+/// (see [`malformed_ecs`]); a nonzero SCOPE gets an `EcsKey::opaque` (it must be 0 in a query,
+/// but RFC 7871 section 6 asks no FORMERR for it): it still goes upstream as it is, but whom
+/// the answer applies to is unclear.
+fn query_subnet(
+    packet: &[u8],
+    rdata: std::ops::Range<usize>,
+) -> Result<Option<crate::ecs::EcsKey>, ()> {
+    let Some(option) = ecs_option(packet, rdata.clone())? else {
+        return Ok(None);
+    };
+    option.address_bits(packet).ok_or(())?;
+    Ok(Some(if option.scope == 0 {
+        option.subnet(packet)
+    } else {
+        crate::ecs::EcsKey::opaque(&packet[rdata])
+    }))
 }
 
-/// 查询报文里客户端自己带的 ECS（见 `query_subnet`）。报文读不出来时也按读不懂的选项算。
-/// The ECS a query message carries itself (see `query_subnet`). A message that
-/// cannot be read counts as an option that cannot be read too.
+/// 查询里的 ECS 选项不合规，要回 FORMERR（RFC 7871 第 6 节、第 7.2.1 节，见 `query_subnet`）。快速解析不收这样的查询，
+/// 所以只为快速解析读不了的查询看一遍
+/// Whether the query's ECS option is improper and to be answered FORMERR (RFC 7871 sections 6
+/// and 7.2.1, see `query_subnet`). The quick parse takes no such query, so only a query it
+/// cannot read is looked at for this
+pub(crate) fn malformed_ecs(query: &[u8]) -> bool {
+    matches!(find_opt(query), Ok(Some(opt)) if query_subnet(query, opt.rdata.clone()).is_err())
+}
+
+/// 查询报文里客户端自己带的 ECS（见 `query_subnet`）。报文或选项读不出来时按读不懂的选项算。
+/// The ECS a query message carries itself (see `query_subnet`). A message or an option that
+/// cannot be read counts as an option that cannot be read.
 pub(crate) fn client_subnet(packet: &[u8]) -> Option<crate::ecs::EcsKey> {
     match find_opt(packet) {
         Ok(None) => None,
-        Ok(Some(opt)) => query_subnet(packet, opt.rdata),
+        Ok(Some(opt)) => query_subnet(packet, opt.rdata.clone())
+            .unwrap_or_else(|()| Some(crate::ecs::EcsKey::opaque(&packet[opt.rdata]))),
         Err(()) => Some(crate::ecs::EcsKey::opaque(packet)),
     }
 }
@@ -1957,6 +1988,14 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
             if let Some(valid_len) = valid_message_len(&out) {
                 out.truncate(valid_len);
             }
+            // 回答段、授权段都还在，只是 Additional 放不下时不置 TC（RFC 2181 第 9 节）：客户端改用 TCP 拿到的也只多
+            // 几条附加记录，用不着为它重问一遍。上游自己置了 TC 的照旧
+            // With the answer and authority sections whole and only Additional cut, TC is
+            // not set (RFC 2181 section 9): retrying over TCP would bring only a few more
+            // additional records, not worth asking again for. A TC the upstream set stays
+            if out[6..10] == response_packet[6..10] && response_packet[2] & 0x02 == 0 {
+                out[2] &= !0x02;
+            }
             if !opt.is_empty() {
                 out.extend_from_slice(&opt);
                 let additional = section_count(&out, 3) as u16 + 1;
@@ -2207,6 +2246,75 @@ mod tests {
             Some(jumps_from(16) + 2)
         );
         assert_eq!(strict_name_end(&packet, jumps_from(17)), None);
+    }
+
+    /// UDP 回答只是 Additional 放不下时不置 TC（RFC 2181 第 9 节），回答段照样整个带上；回答段放不下时照旧置 TC
+    /// A UDP reply with only Additional cut sets no TC (RFC 2181 section 9), the answer section
+    /// whole; with the answer section cut it sets TC as before
+    #[test]
+    fn cutting_only_additional_records_sets_no_tc() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, RecordType, rdata::A};
+        let name = Name::from_ascii("glue.example.").unwrap();
+        let a = |n: u32| {
+            Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(A::from(std::net::Ipv4Addr::from(n))),
+            )
+        };
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(name.clone(), RecordType::A));
+        let mut reply = query.clone();
+        reply.metadata.message_type = MessageType::Response;
+        reply.add_answer(a(1));
+        reply.add_additionals((0..60).map(a));
+        let reply = reply.to_vec().unwrap();
+        let cut = Message::from_bytes(
+            &truncate_udp_response(&query.to_vec().unwrap(), &reply).expect("cut to 512"),
+        )
+        .unwrap();
+        assert_eq!(cut.answers.len(), 1);
+        assert!(cut.additionals.len() < 60);
+        assert!(!cut.metadata.truncation, "only Additional was cut");
+
+        let mut long = query.clone();
+        long.metadata.message_type = MessageType::Response;
+        long.add_answers((0..60).map(a));
+        let cut = Message::from_bytes(
+            &truncate_udp_response(&query.to_vec().unwrap(), &long.to_vec().unwrap())
+                .expect("cut to 512"),
+        )
+        .unwrap();
+        assert!(cut.answers.len() < 60);
+        assert!(cut.metadata.truncation, "answers were cut");
+    }
+
+    /// 带着读得出的 OPT 的请求，NOTIMP 和 FORMERR 也带 OPT，DO 位照抄（RFC 6891 第 7 节）；不带 OPT 的照旧不带
+    /// A request carrying an OPT that can be read gets one back with NOTIMP and FORMERR too, its DO
+    /// bit copied (RFC 6891 section 7); one without stays without
+    #[test]
+    fn notimp_and_formerr_carry_an_opt_for_a_request_with_one() {
+        // OPT 里的选项说有 10 字节、实际一个字节都没有：完整解析读不了，OPT 照样找得到
+        // An option in the OPT declaring 10 bytes and holding none: the full parse cannot read
+        // it, yet the OPT is found
+        let mut unreadable = vec![
+            0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1, 1, b'a', 0, 0, 1, 0, 1,
+        ];
+        push_opt(&mut unreadable, 0, true, &[0, 15, 0, 10]);
+        assert!(Message::from_bytes(&unreadable).is_err());
+        let mut notify = vec![0x56, 0x78, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 1];
+        push_opt(&mut notify, 0, true, &[]);
+        for (case, reply) in [
+            ("FORMERR", formerr_reply(&unreadable)),
+            ("NOTIMP", header_reply(&notify).unwrap()),
+        ] {
+            assert_eq!(reply[10..12], [0, 1], "{case}: one additional record");
+            let opt = find_opt(&reply).unwrap().expect("an OPT");
+            assert!(opt.dnssec_ok(&reply), "{case}: DO copied");
+        }
+        let without = [0x56, 0x78, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(header_reply(&without).unwrap().len(), 12);
     }
 
     /// 各段计数为 `counts`（问题、Answer、Authority、Additional）的应答报文头
