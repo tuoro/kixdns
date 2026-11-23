@@ -78,11 +78,12 @@ pub struct RuntimeResponseMatcherWithOp {
     pub matcher: RuntimeResponseMatcher,
 }
 
-/// 作答上游 `upstream`（`udp:1.1.1.1:53`，不带传输名也行）的 IP：地址里的主机是 IP 字面量时有，是域名时没有。
-/// 路径（DoH）和参数（`?sni=`）不看
+/// 作答上游 `upstream`（`udp:1.1.1.1:53`，不带传输名也行）的 IP：地址里的主机是 IP 字面量时有，是域名时没有；
+/// IPv4 映射形式的按它所指的 IPv4 地址算，和网段的写法一致（见 `canonical_net`）。路径（DoH）和参数（`?sni=`）不看
 /// The IP of the answering upstream `upstream` (`udp:1.1.1.1:53`, or without the transport):
-/// there is one when the host in its address is an IP literal, none when it is a name. A path
-/// (DoH) and parameters (`?sni=`) are not read
+/// there is one when the host in its address is an IP literal, none when it is a name; an
+/// IPv4-mapped one counts as the IPv4 address it names, as networks are read (see
+/// `canonical_net`). A path (DoH) and parameters (`?sni=`) are not read
 #[inline]
 fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
     let address = crate::engine::upstream::answered_address(upstream);
@@ -91,6 +92,7 @@ fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
         .ok()
         .map(|sa| sa.ip())
         .or_else(|| host.parse::<IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
 }
 
 impl RuntimeResponseMatcher {
@@ -332,6 +334,7 @@ mod upstream_ip_tests {
             ("doh:192.0.2.1:8443/dns-query", ip("192.0.2.1")),
             ("dot:192.0.2.1:853?sni=dns.example", ip("192.0.2.1")),
             ("doq:[2001:db8::1]:853?sni=dns.example", ip("2001:db8::1")),
+            ("udp:[::ffff:192.0.2.1]:53", ip("192.0.2.1")),
             ("192.0.2.1:53", ip("192.0.2.1")),
             ("192.0.2.1", ip("192.0.2.1")),
             ("doh:dns.example/dns-query", None),

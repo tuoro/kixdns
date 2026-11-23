@@ -138,6 +138,8 @@ Response address matching uses these scopes:
 - `response_answer_ip_geoip_country` checks Answers only. Every Answer that contains an address must match one of the requested GeoIP tags, and at least one Answer must contain an address.
 - `response_answer_ip` and `response_answer_ip_geoip_private` check both Answers and Additionals and succeed when any address matches.
 - A/AAAA addresses and HTTPS/SVCB `ipv4hint`/`ipv6hint` values are inspected. Hints in one HTTPS/SVCB record are alternative endpoints, so any matching hint satisfies that record.
+- An IPv4-mapped address (`::ffff:a.b.c.d` in an AAAA or an `ipv6hint`) is judged as the IPv4 address it names, and a network written as `::ffff:a.b.c.d/n` counts as the IPv4 network it names; response_upstream_ip reads them the same way.
+- geoip_private and `response_answer_ip_geoip_private` count private networks (RFC 1918, ULA fc00::/7), loopback, link-local, 0.0.0.0/8, `::` and 255.255.255.255 as local network addresses.
 
 These matchers only inspect existing records; they do not create or rewrite HTTPS/SVCB records.
 
