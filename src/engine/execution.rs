@@ -1546,8 +1546,6 @@ impl Engine {
             let mut current_pipeline_id = pipeline_id.clone();
             let mut current_uses_client_ip =
                 pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
-            // 这条路线上有没有按 EDNS 判断的 pipeline（见跳转后的缓存查找）/ Whether a pipeline on the route so far matches on EDNS (see the lookup after a jump)
-            let mut route_matches_edns = pipeline_opt.is_some_and(|p| p.matches_edns);
             let mut reused_response: Option<ResponseContext> = None;
             // 应答缓存在哪个 pipeline 的键下：请求阶段的跳转换成目标的；响应阶段跳转以后不再换，跳过去拿到的应答照旧缓存在
             // 跳转前那个 pipeline 的键下（见 `phases::ForwardResult::Jump`）
@@ -1662,7 +1660,6 @@ impl Engine {
                         // its forward and with its ECS. Handed to an allow here, it would be cached
                         // under this pipeline's key and served to requests that come here directly.
                         reused_response = None;
-                        route_matches_edns |= p.matches_edns;
                         if let Some(observed) = &observed {
                             observed
                                 .observer
@@ -1693,30 +1690,29 @@ impl Engine {
                             );
                             // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
                             // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
-                            // 上游。以下情况不查，保持原样：
+                            // 上游。后台刷新照请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），
+                            // 走的是同一条路线、写回同一个键。以下情况不查，保持原样：
                             // - 不在第一轮：continue 之后，请求已经越过了一个应答，后面的规则可能复用它；
-                            // - 目标的应答因「谁在问」而不同：它给别的请求方的应答不一定是给这一个的；
-                            // - 后台刷新走不回这条路线：刷新重放的请求不带 EDNS、类别固定是 IN，路线上（含
-                            //   pipeline 的选择）按 EDNS 判断，或者查询类别不是 IN 时，刷新可能走另一条路线，
-                            //   把别处的应答写进这个键，或者写进另一个键。
+                            // - 目标的应答因「谁在问」而不同：它给别的请求方的应答不一定是给这一个的。
+                            // 以前路线上按 EDNS 判断、或者类别不是 IN 时也不查：那时刷新重放的请求不带 EDNS、
+                            // 类别固定是 IN，可能走另一条路线
                             // After a jump, look in the response cache again under the target pipeline's
                             // key. A forwarded answer is stored under that key, while the entry lookup used
                             // the entry pipeline's, so a request that jumped never found it and went upstream
-                            // every time. These cases do not look and keep the current behaviour:
+                            // every time. A background refresh replays the request as it came (from the same
+                            // address, with or without EDNS, in the same class, see refresh.rs), taking the same
+                            // route and writing back under the same key. These cases do not look and keep the
+                            // current behaviour:
                             // - after the first pass: past a continue the request has passed over an answer
                             //   that later rules may reuse;
                             // - a target whose answer differs by who is asking: its answer to another
-                            //   requester is not necessarily its answer to this one;
-                            // - a route a background refresh cannot repeat: the refresh replays the query
-                            //   without EDNS and in class IN, so when the route (pipeline selection included)
-                            //   matches on EDNS, or the query class is not IN, it may take another route and
-                            //   write another answer under this key, or write under another key.
+                            //   requester is not necessarily its answer to this one.
+                            // A route matching on EDNS, or a class other than IN, used not to look either: the
+                            // refresh then replayed the query without EDNS and in class IN, and might take
+                            // another route
                             if !skip_cache
                                 && pass == 1
                                 && !p.depends_on_requester
-                                && !route_matches_edns
-                                && qclass == DNSClass::IN
-                                && !cfg.selection_matches_edns()
                                 && let Some(resp_bytes) = self
                                     .answer_from_cache(
                                         &phases::CacheLookupContext {
@@ -7486,13 +7482,14 @@ mod jump_response_cache_tests {
         );
     }
 
-    /// 路线上有按 EDNS 判断的 pipeline 时，跳转后不查缓存：后台刷新重放的请求不带 EDNS，
-    /// 可能走另一条路线，把别处的应答写进目标的键。
-    /// A route through a pipeline that matches on EDNS does not look in the cache after
-    /// the jump: a background refresh replays the query without EDNS, may take another
-    /// route and write another answer under the target's key.
+    /// 路线上有按 EDNS 判断的 pipeline 时，跳转后照常查缓存：后台刷新照原样重放，走同一条路线（见
+    /// `a_refresh_after_a_jump_through_an_edns_rule_renews_the_target_entry`）。以前不查，每次都问上游
+    /// A route through a pipeline that matches on EDNS looks in the cache after the jump as
+    /// usual: a background refresh replays the request as it came and takes the same route (see
+    /// `a_refresh_after_a_jump_through_an_edns_rule_renews_the_target_entry`). It used not to
+    /// look, asking upstream every time
     #[tokio::test]
-    async fn a_route_through_an_edns_rule_is_not_looked_up_after_the_jump() {
+    async fn a_route_through_an_edns_rule_is_looked_up_after_the_jump() {
         let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
         let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
@@ -7522,7 +7519,7 @@ mod jump_response_cache_tests {
                 Ipv4Addr::new(192, 0, 2, 1)
             );
         }
-        assert_eq!(upstream.queries(), 3);
+        assert_eq!(upstream.queries(), 1);
     }
 
     /// 跳转后找到的过期应答由后台刷新，刷新写回同一个目标键：之后的请求拿到新鲜应答，
@@ -7533,6 +7530,38 @@ mod jump_response_cache_tests {
     #[tokio::test]
     async fn a_refresh_started_after_a_jump_renews_the_target_entry() {
         let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
+        let pipelines = jump_to_group(serde_json::json!([forward_rule("fwd", &upstream.address)]));
+        a_refresh_after_a_jump_renews_the_target_entry(&upstream, pipelines).await;
+    }
+
+    /// 路线上有按 EDNS 判断的规则时也一样：刷新照原样（不带 EDNS）重放，走同一条路线，写回同一个目标键。以前
+    /// 跳转后不查缓存，每次都问上游
+    /// Likewise with a rule on the route matching on EDNS: the refresh replays the request as
+    /// it came (without EDNS), takes the same route and writes back under the same target key.
+    /// The lookup after a jump used to be off, asking upstream every time
+    #[tokio::test]
+    async fn a_refresh_after_a_jump_through_an_edns_rule_renews_the_target_entry() {
+        let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
+        let mut pipelines =
+            jump_to_group(serde_json::json!([forward_rule("fwd", &upstream.address)]));
+        pipelines[0]["rules"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({
+                "name": "edns-clients",
+                "matchers": [{ "type": "edns_present", "expect": true }],
+                "actions": [{ "type": "static_ip_response", "ip": "192.0.2.9" }]
+            }),
+        );
+        a_refresh_after_a_jump_renews_the_target_entry(&upstream, pipelines).await;
+    }
+
+    /// `pipelines`（先跳到 `group`，再由它转发给 `upstream`）下，跳转后找到的过期应答由后台刷新写回同一个目标键
+    /// Under `pipelines` (a jump to `group`, which forwards to `upstream`), an expired answer
+    /// found after the jump is renewed by a background refresh under the same target key
+    async fn a_refresh_after_a_jump_renews_the_target_entry(
+        upstream: &Upstream,
+        pipelines: serde_json::Value,
+    ) {
         let engine = engine_from(serde_json::json!({
             "settings": {
                 "default_upstream": "127.0.0.1:9",
@@ -7541,17 +7570,7 @@ mod jump_response_cache_tests {
                 "serve_stale_ttl": 30,
                 "serve_stale_client_timeout_ms": 0
             },
-            "pipelines": [
-                {
-                    "id": "main",
-                    "rules": [{
-                        "name": "to-group",
-                        "matchers": [{ "type": "any" }],
-                        "actions": [{ "type": "jump_to_pipeline", "pipeline": "group" }]
-                    }]
-                },
-                { "id": "group", "rules": [forward_rule("fwd", &upstream.address)] }
-            ]
+            "pipelines": pipelines
         }));
 
         answer(&engine, "renew.example", "192.0.2.10").await;
@@ -7606,11 +7625,11 @@ mod jump_response_cache_tests {
         ])
     }
 
-    /// pipeline 的选择按 EDNS 判断时，跳转后也不查缓存：刷新重放的请求不带 EDNS，可能选到别的 pipeline。
-    /// Selection that matches on EDNS also turns off the lookup after a jump: the refresh
-    /// replays the query without EDNS and may select another pipeline.
+    /// pipeline 的选择按 EDNS 判断时，跳转后也照常查缓存：刷新照原样重放，选到的是同一个 pipeline
+    /// Selection that matches on EDNS keeps the lookup after a jump too: the refresh replays the
+    /// request as it came and selects the same pipeline
     #[tokio::test]
-    async fn edns_in_pipeline_selection_turns_off_the_lookup_after_a_jump() {
+    async fn edns_in_pipeline_selection_keeps_the_lookup_after_a_jump() {
         let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
         let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
@@ -7624,14 +7643,14 @@ mod jump_response_cache_tests {
         for _ in 0..2 {
             answer(&engine, "selected.example", "192.0.2.10").await;
         }
-        assert_eq!(upstream.queries(), 2);
+        assert_eq!(upstream.queries(), 1);
     }
 
-    /// 类别不是 IN 的查询跳转后不查缓存：刷新重放的请求固定是 IN，算出的是另一个键。
-    /// A query in a class other than IN does not look after a jump: the refresh replays
-    /// in class IN and computes another key.
+    /// 类别不是 IN 的查询跳转后也照常查缓存：刷新按同一个类别重放，算出的是同一个键
+    /// A query in a class other than IN looks after a jump as well: the refresh replays in the
+    /// same class and computes the same key
     #[tokio::test]
-    async fn a_query_outside_class_in_is_not_looked_up_after_a_jump() {
+    async fn a_query_outside_class_in_is_looked_up_after_a_jump_too() {
         let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
         let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
@@ -7641,7 +7660,7 @@ mod jump_response_cache_tests {
         for _ in 0..2 {
             ask(&engine, "chaos.example", "192.0.2.10", DNSClass::CH).await;
         }
-        assert_eq!(upstream.queries(), 2);
+        assert_eq!(upstream.queries(), 1);
     }
 
     /// 目标的转发按客户端地址带 ECS 子网时，跳转后照常查缓存，但按一个子网定制的应答（作用
@@ -7700,10 +7719,9 @@ mod jump_response_cache_tests {
         assert_eq!(upstream.queries(), 1);
     }
 
-    /// 按「谁在问」判断的四种请求匹配会让 pipeline 带上标记，按问题本身判断的不会；
-    /// 只有按 EDNS 判断的带上 `matches_edns`。
+    /// 按「谁在问」判断的四种请求匹配会让 pipeline 带上标记，按问题本身判断的不会
     /// The four request matchers that look at who is asking flag the pipeline, and
-    /// those that look at the question do not; only the EDNS one sets `matches_edns`.
+    /// those that look at the question do not
     #[test]
     fn pipelines_that_match_on_the_requester_are_flagged() {
         let forward = |ecs: serde_json::Value| {
@@ -7755,36 +7773,27 @@ mod jump_response_cache_tests {
             (
                 serde_json::json!({ "type": "client_ip", "cidr": "10.0.0.0/8" }),
                 true,
-                false,
             ),
             (
                 serde_json::json!({ "type": "geoip_country", "country_codes": ["cn"] }),
                 true,
-                false,
             ),
             (
                 serde_json::json!({ "type": "geoip_private", "expect": true }),
                 true,
-                false,
             ),
             (
                 serde_json::json!({ "type": "edns_present", "expect": true }),
-                true,
                 true,
             ),
             (
                 serde_json::json!({ "type": "domain_suffix", "value": "example.com" }),
                 false,
-                false,
             ),
-            (
-                serde_json::json!({ "type": "qtype", "value": "A" }),
-                false,
-                false,
-            ),
-            (serde_json::json!({ "type": "any" }), false, false),
+            (serde_json::json!({ "type": "qtype", "value": "A" }), false),
+            (serde_json::json!({ "type": "any" }), false),
         ];
-        for (matcher, requester, edns) in cases {
+        for (matcher, requester) in cases {
             let config: PipelineConfig = serde_json::from_value(serde_json::json!({
                 "settings": { "default_upstream": "127.0.0.1:9" },
                 "pipelines": [{
@@ -7800,7 +7809,6 @@ mod jump_response_cache_tests {
             let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
             let pipeline = &runtime.pipelines[0];
             assert_eq!(pipeline.depends_on_requester, requester, "{matcher}");
-            assert_eq!(pipeline.matches_edns, edns, "{matcher}");
         }
     }
 }
