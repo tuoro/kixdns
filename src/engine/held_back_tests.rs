@@ -935,6 +935,8 @@ async fn a_response_actions_forward_kept_back_fails_the_request() {
             ctx_opt: None,
             req: &request,
             packet: &packet,
+            query: &packet,
+            client_ecs: None,
             upstream_timeout: Duration::from_millis(150),
             qname: "more.dead.test",
             qtype: RecordType::A,

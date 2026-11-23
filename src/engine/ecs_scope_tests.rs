@@ -694,6 +694,34 @@ async fn a_response_action_forward_keeps_its_answer_within_its_scope() {
     assert_eq!(second.queries(), 2);
 }
 
+/// 响应动作的转发写了自己的 `ecs`：发出去的是它定的子网，不是规则自己的转发发的那个，应答适用于谁也按它算（固定的子网
+/// 谁来问都一样，第二个客户端直接用缓存）。以前这个 `ecs` 读进来就丢掉了，发出去的还是规则自己那份
+/// A response action's forward writing an `ecs` of its own: what goes out is the subnet it sets,
+/// not the one the rule's own forward sent, and whom the answer applies to goes by it too (a
+/// fixed subnet is the same whoever asks, a second client answered from the cache). That
+/// `ecs` used to be read and dropped, the rule's own going out instead
+#[tokio::test]
+async fn a_response_action_forward_sends_its_own_ecs() {
+    let checked = upstream(Echo::Nothing).await;
+    let second = upstream(Echo::Scope(24)).await;
+    let fixed = |ip: &str| Some(serde_json::json!({ "mode": "static", "ip": ip, "prefix": 24 }));
+    let engine = engine(serde_json::json!([{ "id": "main", "rules": [{
+        "name": "check", "matchers": [{ "type": "any" }],
+        "actions": [forward_to(&checked.address, fixed("192.0.2.1"))],
+        "response_matchers": [{ "type": "upstream_equals", "value": checked.address }],
+        "response_actions_on_match": [forward_to(&second.address, fixed("198.51.100.7"))]
+    }] }]));
+    assert_eq!(ask(&engine, "10.0.0.1", None).await, v4("198.51.100.0"));
+    assert_eq!(seen(&checked), [Some((ip("192.0.2.0"), 24))]);
+    assert_eq!(seen(&second), [Some((ip("198.51.100.0"), 24))]);
+    assert_eq!(ask(&engine, "10.0.0.2", None).await, v4("198.51.100.0"));
+    assert_eq!(
+        second.queries(),
+        1,
+        "the second client is answered from the cache"
+    );
+}
+
 /// 后台刷新带着触发它的客户端的 ECS 重放请求，不同子网的条目各自刷新。
 /// A background refresh replays the request with the ECS of the client that
 /// triggered it, and entries for different subnets refresh on their own.
