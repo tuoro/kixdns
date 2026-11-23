@@ -209,7 +209,7 @@ impl Engine {
         // TCP 连接池大小按每个 upstream 算：每个 upstream 最多保留这么多条连接
 
         // Collect TCP upstreams for warmup / 收集 TCP upstream 用于预热
-        let tcp_upstreams = state.load().pipeline.collect_tcp_upstreams();
+        let tcp_upstreams = super::upstream::tcp_upstreams(&state.load().pipeline);
 
         let udp_client =
             Arc::new(UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?);

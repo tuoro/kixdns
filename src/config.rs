@@ -742,6 +742,10 @@ pub struct DohListenerConfig {
     pub path: String,
 }
 
+/// `dashmap_shards` 的上限：分片太多一次就分配掉大量内存 / The most `dashmap_shards` may be: too
+/// many shards allocate a great deal of memory at once
+pub const MAX_DASHMAP_SHARDS: usize = 1024;
+
 impl GlobalSettings {
     /// 和 `running`（进程启动时的设置）相比，改了以后要重启 KixDNS 才生效的设置名。这些设置只在启动时
     /// 读一次：监听地址、连接池、各传输的连接参数、缓存容量、自动限流；其余设置重载即生效。这里逐项列出
@@ -875,9 +879,68 @@ impl GlobalSettings {
             .unwrap_or_else(|| Arc::from(self.default_upstream.as_str()))
     }
 
-    /// Validate timeout configuration sanity
-    /// 验证超时配置的合理性
-    pub fn validate_timeouts(&self) -> anyhow::Result<()> {
+    /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
+    /// 启动、热重载和面板校验都经过这里
+    /// Whether the settings make sense on their own: their ranges, how they relate, and the few read
+    /// only at startup that must agree with what building the engine needs. The first step of
+    /// compiling a configuration, which startup, hot reloads and panel validation all go through
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // Validate cache_capacity configuration
+        if self.cache_capacity == 0 {
+            anyhow::bail!("cache_capacity must be greater than 0");
+        }
+        // cache_max_ttl = 0 会让每条应答的缓存 TTL 归零，等于静默关掉缓存，
+        // 与 cache_capacity = 0 同样不是有效配置。
+        // cache_max_ttl = 0 clamps every entry's TTL to zero, silently disabling
+        // the cache, which is no more a valid configuration than cache_capacity = 0.
+        if self.cache_max_ttl == 0 {
+            anyhow::bail!("cache_max_ttl must be greater than 0");
+        }
+        // 阈值是条目 TTL 的百分比，刷新条件是剩余 TTL 低于它。取 100 时阈值等于
+        // 条目自身的 TTL，任何时间一过就满足，和超过 100 一样每次缓存命中都触发
+        // 后台刷新，上游负载等于客户端负载；要关闭刷新请用 cache_background_refresh。
+        // The threshold is a percentage of the entry's TTL and a refresh happens
+        // once the remaining TTL falls below it. At 100 the threshold equals the
+        // entry's own TTL, so any elapsed time satisfies it and, like a value
+        // above 100, every cache hit triggers a refresh and the upstream carries
+        // the client's full load. Use cache_background_refresh to turn it off.
+        if self.cache_refresh_threshold_percent >= 100 {
+            anyhow::bail!(
+                "cache_refresh_threshold_percent must be below 100 (at 100 every cache hit refreshes upstream), got {}",
+                self.cache_refresh_threshold_percent
+            );
+        }
+        // upstream_timeout_ms = 0 让每次上游请求在发出的同一刻就超时，任何查询
+        // 都不可能拿到应答。它没有"不限时"的含义，那是 request_timeout_ms 留空
+        // 时的自动推导在管的事。
+        // upstream_timeout_ms = 0 expires every upstream request the instant it
+        // is issued, so no query can ever be answered. It does not mean "no
+        // limit"; leaving request_timeout_ms unset is what derives a budget.
+        if self.upstream_timeout_ms == 0 {
+            anyhow::bail!("upstream_timeout_ms must be greater than 0");
+        }
+        // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
+        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多一次就分配掉大量内存
+        // Settings read only at startup are checked against what building the engine needs: a value
+        // the check lets through and the build then fails on is accepted by a hot reload and a panel
+        // save, and the kernel does not start at the next restart. DashMap needs more than one
+        // shard, and too many shards allocate a great deal of memory at once
+        let shards = self.dashmap_shards;
+        if shards != 0 && !(shards.is_power_of_two() && (2..=MAX_DASHMAP_SHARDS).contains(&shards))
+        {
+            anyhow::bail!(
+                "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
+            );
+        }
+        let doq_idle = self.doq_connection_idle_timeout_seconds;
+        if doq_idle > 0
+            && quinn::IdleTimeout::try_from(std::time::Duration::from_secs(doq_idle)).is_err()
+        {
+            anyhow::bail!(
+                "doq_connection_idle_timeout_seconds is more than QUIC can carry, got {doq_idle}"
+            );
+        }
+
         // Validate request_timeout >= upstream_timeout
         // 验证 request_timeout >= upstream_timeout
         if let Some(request_timeout) = self.request_timeout_ms
