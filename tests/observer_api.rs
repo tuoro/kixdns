@@ -1757,6 +1757,89 @@ async fn concurrent_upstreams_report_the_loser_as_aborted() {
     drop(blackhole_socket);
 }
 
+/// 请求在上游回答之前被放下（客户端走了、超时了），转发半路停下：每次尝试照样有一个结果，报成 Aborted，只问一个上游的和
+/// 几个上游一起问的都一样。以前这些尝试只报了 upstream_attempt，没有配对的 upstream_result
+/// A request given up before its upstream answers (its client gone, a timeout) stops the forward
+/// halfway: each attempt still gets one result, reported as Aborted, for a single upstream and a
+/// set asked together alike. These attempts used to report an upstream_attempt with no
+/// upstream_result to pair it
+#[tokio::test]
+async fn attempts_of_a_request_given_up_halfway_are_reported_as_aborted() {
+    // 收下查询、从不回答的上游 / Upstreams that take queries and never answer
+    let blackhole = || async { tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap() };
+    let blackholes = [blackhole().await, blackhole().await, blackhole().await];
+    let [single, first, second] = blackholes
+        .each_ref()
+        .map(|socket| socket.local_addr().unwrap().to_string());
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "upstream_timeout_ms": 5000,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [
+                {
+                    "name": "single",
+                    "matchers": [{ "type": "domain_exact", "value": "single.example" }],
+                    "actions": [{ "type": "forward", "upstream": single, "transport": "udp" }]
+                },
+                {
+                    "name": "set",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{
+                        "type": "forward",
+                        "upstream": format!("{first},{second}"),
+                        "transport": "udp"
+                    }]
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+
+    for (qname, asked) in [
+        ("single.example", vec![single.clone()]),
+        ("set.example", vec![first.clone(), second.clone()]),
+    ] {
+        let given_up = tokio::time::timeout(
+            Duration::from_millis(200),
+            engine.handle_packet(&query(qname), peer()),
+        )
+        .await;
+        assert!(given_up.is_err(), "the upstreams never answer");
+        let events = recorder.drain();
+        let mine = events_of(&events, request_id_for(&events, qname));
+        let attempts: Vec<String> = mine
+            .iter()
+            .filter_map(|event| match event {
+                Event::UpstreamAttempt { upstream, .. } => Some(upstream.clone()),
+                _ => None,
+            })
+            .collect();
+        let results: Vec<(String, UpstreamOutcome)> = mine
+            .iter()
+            .filter_map(|event| match event {
+                Event::UpstreamResult {
+                    upstream, outcome, ..
+                } => Some((upstream.clone(), *outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, asked, "{mine:#?}");
+        assert_eq!(
+            results,
+            asked
+                .iter()
+                .map(|upstream| (upstream.clone(), UpstreamOutcome::Aborted))
+                .collect::<Vec<_>>(),
+            "one result per attempt: {mine:#?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn decision_made_reports_no_transport_for_prefixed_upstreams() {
     let forward_of = |events: &[Event], id: u64| -> (Option<Transport>, Transport) {
