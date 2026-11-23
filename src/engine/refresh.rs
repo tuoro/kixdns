@@ -215,7 +215,7 @@ const REFRESHES_AT_ONCE: usize = 128;
 /// 防止无限循环的保护措施：
 /// Protection against infinite loops:
 /// 1. 打得上刷新标记才刷新（`RefreshingGuard::try_new`）
-/// 2. 后台请求设置 skip_cache=true
+/// 2. 后台请求带着它要更新的条目（`RefreshTarget`），不查缓存
 /// 3. RefreshingGuard 确保刷新标记在任务完成后被清除
 ///
 /// `requester` is who sent the request that triggered this refresh: its real address
@@ -328,14 +328,14 @@ pub fn spawn_background_refresh(
         // 端口无关 — 下游仅消费 .ip()。
         let peer_addr = std::net::SocketAddr::new(requester.address, 53);
 
-        // Call handle_packet_internal with skip_cache=true and the entry it renews.
+        // Call handle_packet_internal with the entry it renews, which makes it a refresh.
         // Together with the original peer_ip, this ensures the background refresh
         // both writes to the correct cache slot AND injects the correct ECS (RFC 7871).
         //
-        // 调用 handle_packet_internal 并设置 skip_cache=true，传入要更新的条目。
+        // 调用 handle_packet_internal，传入要更新的条目，这就是一次刷新。
         // 配合原始 peer_ip，确保后台刷新既写入正确的缓存槽，又注入正确的 ECS (RFC 7871)。
         let result = engine
-            .handle_packet_internal(&packet, peer_addr, true, None, Some(target), Some(state))
+            .handle_packet_internal(&packet, peer_addr, None, Some(target), Some(state))
             .await;
 
         match result {

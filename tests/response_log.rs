@@ -160,29 +160,65 @@ async fn info_logs_include_fast_and_slow_cache_hits() {
     assert!(responses.iter().all(|r| r["status"] == "completed"));
 }
 
+/// 记下后台刷新结束 / Notes a background refresh ending
+#[derive(Default)]
+struct RefreshEnded(tokio::sync::Notify);
+
+impl kixdns::observe::EngineObserver for RefreshEnded {
+    fn request_finished(
+        &self,
+        ctx: &kixdns::observe::RequestContext<'_>,
+        _outcome: &kixdns::observe::RequestOutcome<'_>,
+    ) {
+        if ctx.background_refresh {
+            self.0.notify_one();
+        }
+    }
+}
+
+/// 后台刷新不是客户端的查询，不记应答日志：TTL 1 秒的应答一命中就该刷新，刷新以后只有两次客户端应答的记录；刷新照样
+/// 写进缓存，下一次客户端查询命中它
+/// A background refresh is no client query and writes no response record: an answer with a
+/// TTL of 1 second is due for a refresh at its first hit, and after the refresh there are
+/// records of the two client answers only; the refresh still writes the cache, which the
+/// next client query hits
 #[tokio::test]
 async fn background_refresh_is_not_a_client_response() {
     let log = Log::default();
     let _capture = log.capture();
-    let (addr, task) = upstream().await;
-    let engine = engine(&addr);
-    let Ok(Some(FastPathResponse::AsyncNeeded(pre))) = engine.handle_packet_fast(&query(), peer())
-    else {
-        panic!("a miss goes on to the async path");
-    };
-    engine
-        .handle_packet_internal_with_pre_parsed(&query(), peer(), true, pre)
+    let (addr, task) = upstream_with_ttl(1).await;
+    let ended = Arc::new(RefreshEnded::default());
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let config = json!({
+        "settings": {
+            "default_upstream": addr,
+            "cache_background_refresh": true,
+            "cache_refresh_min_ttl": 1,
+            "min_ttl": 0
+        },
+        "pipelines": []
+    });
+    let engine = Engine::builder(
+        RuntimePipelineConfig::from_config(parse_config(&config.to_string()).unwrap()).unwrap(),
+    )
+    .observer(ended.clone())
+    .build()
+    .unwrap();
+    engine.handle_packet(&query(), peer()).await.unwrap();
+    engine.handle_packet(&query(), peer()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), ended.0.notified())
         .await
-        .unwrap();
-    task.abort();
-    assert!(
-        log.responses().is_empty(),
+        .expect("the hit starts a refresh, which ends");
+    assert_eq!(
+        log.responses().len(),
+        2,
         "refresh work must not inflate client queries"
     );
     engine.handle_packet(&query(), peer()).await.unwrap();
+    task.abort();
     let responses = log.responses();
-    assert_eq!(responses.len(), 1);
-    assert_eq!(responses[0]["cache_hit"], true);
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[2]["cache_hit"], true);
 }
 
 #[tokio::test]

@@ -515,8 +515,8 @@ pub struct ForwardDecisionContext<'a> {
     pub peer: &'a std::net::SocketAddr,
     /// Who is asking (address, EDNS, the client's own ECS) / 谁在问（地址、EDNS、客户端自己的 ECS）
     pub requester: Requester,
-    pub skip_cache: bool,
-    /// For a background refresh, the entry it renews / 后台刷新时，它要更新的条目
+    /// For a background refresh, the entry it renews; the request is one exactly when it is
+    /// given / 后台刷新时它要更新的条目，有它就是后台刷新
     pub refresh: Option<&'a RefreshTarget>,
     /// The forwards the request passed in this pipeline so far, each with the ECS
     /// it sent and whom its reply applies to; every answer the request caches
@@ -585,7 +585,6 @@ pub(crate) async fn handle_forward_decision_logged(
         start,
         peer,
         requester,
-        skip_cache,
         refresh,
         trail,
         echo_floor,
@@ -603,6 +602,7 @@ pub(crate) async fn handle_forward_decision_logged(
         held_inflight,
         observed,
     } = context;
+    let background_refresh = refresh.is_some();
 
     response.upstream = Some(Arc::clone(upstream));
     let view = requester.ecs_view();
@@ -684,7 +684,7 @@ pub(crate) async fn handle_forward_decision_logged(
         // first. Each used to ask by itself, and a leader leaving with several waiting had the
         // upstream asked that many times over. A leader leaves on every round, so there are no
         // more rounds than requests waiting at once
-        if !skip_cache {
+        if !background_refresh {
             loop {
                 use dashmap::mapref::entry::Entry;
                 let mut rx = match engine.inflight.entry(keys.inflight) {
@@ -773,7 +773,7 @@ pub(crate) async fn handle_forward_decision_logged(
                     transport,
                     pre_split_upstreams,
                     observed,
-                    (!skip_cache).then(|| peer.ip()),
+                    (!background_refresh).then(|| peer.ip()),
                 )
                 .await
             }
@@ -807,7 +807,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 Some(Transport::Tcp),
                 pre_split_upstreams,
                 observed,
-                (!skip_cache).then(|| peer.ip()),
+                (!background_refresh).then(|| peer.ip()),
             )
             .await
         }
@@ -860,8 +860,9 @@ pub(crate) async fn handle_forward_decision_logged(
     // 刷新执行响应规则之后，失败应答在响应规则看到之前就被当作一次失败的尝试，和规则有
     // 多个上游时 forward_upstream 的做法一样：刷新走这样的规则会走的失败路径（包括
     // on_miss 动作），也不缓存这个应答（见 reject_failure_reply_on_refresh）。
-    let resp = resp
-        .and_then(|reply| reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply));
+    let resp = resp.and_then(|reply| {
+        reject_failure_reply_on_refresh(background_refresh, &reply.0).map(|()| reply)
+    });
 
     // The reply, or the failure, decides whom every answer reached from here applies to
     // 应答（或失败）决定此后得到的每份应答适用于谁
@@ -1045,7 +1046,7 @@ pub(crate) async fn handle_forward_decision_logged(
             // fallback a refresh has no use for: they used to run, a static fallback or a backup
             // upstream's answer going into the cache over the entry still fresh at a prefetch,
             // and the refresh counting as a success with no backing off
-            Err(e) if skip_cache => return Err(e),
+            Err(e) if background_refresh => return Err(e),
             Err(e) => {
                 if response_actions_on_miss.is_empty() {
                     // 下面的过期应答和 SERVFAIL 只在所有上游尝试都耗尽时用来应答客户端
@@ -1188,7 +1189,7 @@ pub(crate) async fn handle_forward_decision_logged(
             qname,
             qtype,
             client_ip: peer.ip(),
-            asker: (!skip_cache).then(|| peer.ip()),
+            asker: (!background_refresh).then(|| peer.ip()),
             upstream_default: default_upstream,
             pipeline_id,
             rule_name,
@@ -1210,7 +1211,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 // The reply to a response action's forward (see
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
-                reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
+                reject_failure_reply_on_refresh(background_refresh, &ctx.raw)?;
                 let cache_ttl = ttl_to_cache(engine, extract_ttl(&ctx.msg), min_ttl);
                 if cache_ttl > 0 {
                     cache(
@@ -1242,7 +1243,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 // 上限，或到了跳转上限）；规则里配置的静态 SERVFAIL 也按这个处理。刷新以失败
                 // 结束，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条；上游失败以后，交回的
                 // 就是上游的失败。
-                if skip_cache && rcode == ResponseCode::ServFail {
+                if background_refresh && rcode == ResponseCode::ServFail {
                     return Err(refresh_found_no_answer(
                         "the response actions found no answer",
                     ));
@@ -1250,14 +1251,12 @@ pub(crate) async fn handle_forward_decision_logged(
                 if min_ttl > Duration::from_secs(0) {
                     let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                     cache(&bytes, rcode, None, ttl, trail);
-                } else if skip_cache {
+                } else {
                     // An answer that is not cached cannot renew the entry, so the refresh
                     // drops it and the next client request runs the rules.
                     // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端请求自己
                     // 执行规则。
-                    if let Some(target) = refresh {
-                        engine.drop_refreshed(keys.slot, &question, &view, target);
-                    }
+                    drop_renewed();
                 }
                 if let Some(g) = cleanup_guard.as_mut() {
                     g.hand_over(|| for_waiters(&bytes, &requester, trail, echo_floor));
@@ -1789,7 +1788,6 @@ mod refresh_response_rule_tests {
             engine.handle_packet_internal(
                 &query().to_vec().unwrap(),
                 client,
-                true,
                 None,
                 Some(target),
                 Some(engine.state.load_full()),

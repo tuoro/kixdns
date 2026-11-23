@@ -127,7 +127,10 @@ pub struct RuleEvaluationContext<'a> {
     /// 这次求值不看的规则，按它们在规则组里的位置（见 [`Continued`]）
     /// The rules this evaluation leaves out, by their place in the pipeline (see [`Continued`])
     pub skip_rules: Option<&'a [usize]>,
-    pub skip_cache: bool,
+    /// 后台刷新：求值整条 pipeline，不读规则缓存，照常写入决策
+    /// A background refresh: the whole pipeline is evaluated, the rule cache is not read,
+    /// and the decision is written as usual
+    pub background_refresh: bool,
     /// Observer context of the request being evaluated; `None` disables
     /// rule-match events. / 所属请求的观察者上下文；None 时不上报规则命中。
     pub observed: Observed<'a>,
@@ -141,7 +144,7 @@ impl<'a> RuleEvaluationContext<'a> {
         qclass: DNSClass,
         edns_present: bool,
         skip_rules: Option<&'a [usize]>,
-        skip_cache: bool,
+        background_refresh: bool,
     ) -> Self {
         Self {
             client_ip,
@@ -150,7 +153,7 @@ impl<'a> RuleEvaluationContext<'a> {
             qclass,
             edns_present,
             skip_rules,
-            skip_cache,
+            background_refresh,
             observed: None,
         }
     }
@@ -258,7 +261,7 @@ impl Engine {
             qclass,
             edns_present,
             skip_rules,
-            skip_cache,
+            background_refresh,
             ..
         } = *request;
         // 1. Check Rule Cache
@@ -290,7 +293,7 @@ impl Engine {
         // 名字的决策，所以既不读也不写规则缓存。后台刷新求值的是整条 pipeline：不读
         // 缓存，但照常写入决策。
         let whole_pipeline = skip_rules.is_none_or(|set| set.is_empty());
-        let allow_rule_cache_lookup = !skip_cache && whole_pipeline;
+        let allow_rule_cache_lookup = !background_refresh && whole_pipeline;
 
         if allow_rule_cache_lookup && let Some(record) = self.rule_cache.get(rule_hash) {
             let entry = &record.entry;
