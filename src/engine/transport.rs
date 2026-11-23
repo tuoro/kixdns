@@ -979,6 +979,7 @@ struct StreamHealth {
     idle_timeout_ms: u64,
 }
 
+#[cfg(test)]
 impl Default for StreamHealth {
     /// 5 分钟、1 分钟 / 5 minutes, 1 minute
     fn default() -> Self {
@@ -1323,10 +1324,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
     /// Check if connection needs reset due to aging or idle timeout
     /// 检查连接是否需要重置（老化或空闲超时）
-    ///
-    /// Returns true if connection was reset, false otherwise.
-    /// 如果连接被重置返回 true，否则返回 false。
-    async fn check_connection_health(&self) -> bool {
+    async fn check_connection_health(&self) {
         let now = unix_time_millis();
         // 先记下看的是哪一代，再读它的时刻：几个查询可能同时判断「该拆了」，后到的那个动手时连接也许已经
         // 换成新的，它拆的还得是当初看的那一代
@@ -1349,7 +1347,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     T::NAME
                 );
                 self.retire(generation).await;
-                return true;
+                return;
             }
         }
 
@@ -1367,11 +1365,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     T::NAME
                 );
                 self.reset(generation).await;
-                return true;
             }
         }
-
-        false
     }
 
     async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
@@ -1424,8 +1419,15 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000; // 30 秒
         let now = unix_time_millis();
         let last_check = self.last_health_check_time.load(Ordering::Relaxed);
-        if last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS {
-            self.check_connection_health().await;
+        // 检查也守这次查询的预算：拆连接要等连接锁，前面有登记占着锁时不能等过自己的时限；没做完的下一个查询再查
+        // The check keeps to this query's budget too: tearing a connection down waits for the
+        // connection lock, which must not hold a query past its deadline while registrations hold it
+        // ahead; a check left unfinished is made by the next query
+        if (last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS)
+            && timeout(timeout_dur, self.check_connection_health())
+                .await
+                .is_ok()
+        {
             self.last_health_check_time.store(now, Ordering::Relaxed);
         }
 
@@ -2589,8 +2591,11 @@ where
 {
     use http_body_util::BodyExt;
 
-    // An answer usually arrives in one piece, handed on as it is
-    // 回答一般一块就到齐，那时原样交出
+    // 回答一般一块就到齐。那一块是从连接的读缓冲上切下来的，交出去之前复制成自己的一份：要存进缓存的话，整块读缓冲
+    // 都会跟着它留着
+    // An answer usually arrives in one piece. That piece is cut from the connection's read buffer
+    // and is copied into an allocation of its own before it is handed on: kept in the cache, it
+    // would keep the whole read buffer alive with it
     let mut first: Option<Bytes> = None;
     let mut joined: Option<BytesMut> = None;
     let mut length = 0;
@@ -2612,7 +2617,14 @@ where
                 .extend_from_slice(&chunk),
         }
     }
-    Ok(joined.map_or_else(|| first.unwrap_or_default(), BytesMut::freeze))
+    Ok(joined.map_or_else(
+        || {
+            first
+                .map(|piece| Bytes::copy_from_slice(&piece))
+                .unwrap_or_default()
+        },
+        BytesMut::freeze,
+    ))
 }
 
 /// A transport-level error is anything that is NOT an unusable answer (see
@@ -6916,6 +6928,42 @@ mod tests {
     #[tokio::test]
     async fn a_dot_reset_fails_waiting_queries_at_once() {
         a_reset_fails_waiting_queries_at_once(&dot_test_client().await).await;
+    }
+
+    /// 连接空闲过期、健康检查要拆它时，连接锁正被别的登记占着：查询照样守自己的时限，不等锁放开。以前健康检查在
+    /// 预算之外，锁占多久查询就等多久
+    /// With a connection expired by idleness and the health check about to tear it down while
+    /// other registrations hold the connection lock, the query keeps to its own deadline and does
+    /// not wait for the lock. The health check used to lie outside the budget, the query waiting
+    /// as long as the lock was held
+    #[tokio::test]
+    async fn the_health_check_keeps_to_the_query_budget() {
+        let addr = spawn_stream_upstream(None).await;
+        let client = TcpMuxClient::with_shared(
+            (),
+            Arc::from(addr.to_string()),
+            StreamHealth {
+                idle_timeout_ms: 1,
+                ..StreamHealth::default()
+            },
+        );
+        client
+            .send(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        client.last_health_check_time.store(0, Ordering::Release);
+        let (_, (sent, took)) =
+            tokio::join!(client.hold_connection(Duration::from_secs(2)), async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let started = tokio::time::Instant::now();
+                let sent = client
+                    .send(&udp_test_query("late.example"), Duration::from_millis(300))
+                    .await;
+                (sent, started.elapsed())
+            });
+        assert!(sent.is_err(), "the lock is held past the budget");
+        assert!(took < Duration::from_millis(1000), "took {took:?}");
     }
 
     /// 握手被压住 250 ms、回答再等 250 ms：300 ms 预算的请求曾跑满 560 ms 才成功

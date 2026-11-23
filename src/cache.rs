@@ -297,6 +297,7 @@ impl CacheSlot {
         })
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
