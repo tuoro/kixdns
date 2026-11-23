@@ -109,18 +109,25 @@ pub(crate) enum Age {
 /// it can still go out stale, and otherwise it is of no use. The cache lookup, looking for a
 /// stale answer after an upstream failure and waiting for a refresh all go by this alone
 pub(crate) fn age_of(hit: &CacheEntry, elapsed_secs: u64, settings: &GlobalSettings) -> Age {
-    let ttl = u64::from(hit.original_ttl);
-    if elapsed_secs < ttl {
-        return Age::Fresh;
-    }
-    let expire = settings.serve_stale_expire_ttl;
-    if settings.serve_stale
-        && !crate::engine::upstream::is_failure_reply(hit.rcode)
-        && (expire == 0 || elapsed_secs - ttl <= expire)
-    {
-        Age::Stale
-    } else {
+    if elapsed_secs < u64::from(hit.original_ttl) {
+        Age::Fresh
+    } else if hit.spent(elapsed_secs, kept_past_ttl(settings)) {
         Age::Spent
+    } else {
+        Age::Stale
+    }
+}
+
+/// 应答过了 TTL 还能当过期应答用多久，缓存也就留它这么久（见 `CacheEntry::spent`）：开着 serve_stale 时是
+/// serve_stale_expire_ttl（0 是不限，只受缓存容量约束），关着时是 0
+/// How long an answer past its TTL can still go out stale, and so how long the cache keeps it
+/// (see `CacheEntry::spent`): serve_stale_expire_ttl with serve_stale on (0 for no limit but
+/// the cache's capacity), 0 with it off
+pub(crate) fn kept_past_ttl(settings: &GlobalSettings) -> Duration {
+    match (settings.serve_stale, settings.serve_stale_expire_ttl) {
+        (false, _) => Duration::ZERO,
+        (true, 0) => Duration::from_secs(u64::MAX),
+        (true, stale) => Duration::from_secs(stale),
     }
 }
 
@@ -154,7 +161,7 @@ pub(crate) fn check_cache_logged(
     // 缓存只去掉存了 cache_max_ttl 以上的应答，应答自己的 TTL 到没到在下面判断
     // The cache only drops answers stored cache_max_ttl or longer ago; whether the answer's own TTL ran out is decided below
     let now = Instant::now();
-    let hit = engine.cache_get(slot, &view, &question, now)?;
+    let hit = engine.cache_get(slot, &view, &question)?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
 
     let age = age_of(&hit, elapsed_secs, &state.pipeline.settings);
@@ -370,7 +377,7 @@ pub(crate) fn check_stale_cache_logged(
     };
 
     let now = Instant::now();
-    let hit = engine.cache_get(slot, &view, &question, now)?;
+    let hit = engine.cache_get(slot, &view, &question)?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
     if age_of(&hit, elapsed_secs, &state.pipeline.settings) != Age::Stale {
         return None;

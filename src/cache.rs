@@ -31,19 +31,11 @@ pub struct CacheEntry {
     /// 这份应答适用于槽位里的哪些请求方（RFC 7871 第 7.3 节）
     /// Which requesters of its slot this answer applies to (RFC 7871 section 7.3)
     pub reach: EcsReach,
-    /// 写进缓存的时刻。缓存的 `time_to_live`（`cache_max_ttl`）按它计：这个上限原本由缓存按键
-    /// 执行，而槽位每写入一次都会让键重新计时。`inserted_at` 在过期应答续期时会往前调，不能用。
-    /// When it was written into the cache. The cache's `time_to_live`
-    /// (`cache_max_ttl`) counts from here: the cache used to enforce that limit per
-    /// key, and every write to a slot restarts the key's clock. `inserted_at` is
-    /// moved back when a stale answer is renewed, so it cannot serve.
-    pub stored_at: Instant,
     /// 这份应答从上游（或规则）得到的时刻，过期续用时照抄：后台刷新据此认出它要更新的那份。
-    /// `inserted_at` 续用时往前调，`stored_at` 续用时重新计，都不能用。
+    /// `inserted_at` 续用时往前调，不能用。
     /// When this answer came from the upstream (or the rules), copied when a stale
     /// answer is renewed: a background refresh recognises the answer it renews by
-    /// it. `inserted_at` is moved back and `stored_at` restarts on renewal, so
-    /// neither can serve.
+    /// it. `inserted_at` is moved back on renewal, so it cannot serve.
     pub fetched_at: Instant,
 }
 
@@ -71,7 +63,6 @@ impl CacheEntry {
             inserted_at: now,
             original_ttl: ttl,
             reach: EcsReach::default(),
-            stored_at: now,
             fetched_at: now,
         }
     }
@@ -97,10 +88,25 @@ impl CacheEntry {
         }
     }
 
-    /// 存了 `max_age` 以上：单独存放时缓存本来就会淘汰它
-    /// Stored `max_age` or longer ago: the cache would have evicted it stored alone
-    fn outlived(&self, max_age: Option<Duration>, now: Instant) -> bool {
-        max_age.is_some_and(|max| now.saturating_duration_since(self.stored_at) >= max)
+    /// 存了 `elapsed_secs` 秒，已经没用了：过了 TTL 又过了 `kept_past_ttl`（见
+    /// `phases::kept_past_ttl`）。失败应答（见 `is_failure_reply`）过了 TTL 就没用了，不当过期应答交出去。
+    /// 缓存留着一份应答，正好留到它没用为止；能不能用（`phases::age_of`）也照这一处
+    /// Stored `elapsed_secs` seconds ago and of no further use: past its TTL by `kept_past_ttl`
+    /// (see `phases::kept_past_ttl`). A failure reply (see `is_failure_reply`) is of no use once
+    /// past its TTL, never going out stale. The cache keeps an answer exactly until it is of
+    /// no use, and whether it can be used (`phases::age_of`) goes by this too
+    pub fn spent(&self, elapsed_secs: u64, kept_past_ttl: Duration) -> bool {
+        let kept = if crate::engine::upstream::is_failure_reply(self.rcode) {
+            0
+        } else {
+            kept_past_ttl.as_secs()
+        };
+        elapsed_secs >= u64::from(self.original_ttl).saturating_add(kept)
+    }
+
+    /// 到 `now` 为止存了多少秒 / How many seconds it has been stored by `now`
+    fn elapsed_secs(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.inserted_at).as_secs()
     }
 
     /// Clone entry with a refreshed `inserted_at` for serve-stale TTL reset / 克隆条目并刷新 inserted_at 用于过期缓存 TTL 重置
@@ -108,9 +114,6 @@ impl CacheEntry {
     pub fn clone_with_refreshed_ttl(&self) -> Self {
         Self {
             inserted_at: Instant::now() - Duration::from_secs(self.original_ttl as u64),
-            // A renewed entry is written again, which restarted the key's clock before
-            // slots existed / 续期的条目重新写入，在有槽位之前这会让键重新计时
-            stored_at: Instant::now(),
             ..self.clone()
         }
     }
@@ -151,47 +154,42 @@ pub struct CacheSlot {
 impl CacheSlot {
     /// 适用于 `view`、且是 `question` 的那份应答：前缀最长的优先，其次最新的（RFC 7871 第
     /// 7.3.2 节的最长前缀匹配）。新鲜与否不参与挑选：更具体的应答过期了，就由它的过期处理
-    /// 决定（续用或重新转发），而不是退回更宽的旧应答。存了 `max_age` 以上的不算。
+    /// 决定（续用或重新转发），而不是退回更宽的旧应答。
     /// The answer to `question` that applies to `view`: the longest prefix first,
     /// then the newest (the longest-prefix match of RFC 7871 section 7.3.2).
     /// Freshness does not take part: when the more specific answer has expired, its
     /// expiry handling decides (serve stale or forward again) rather than falling
-    /// back to a wider, older answer. Answers stored `max_age` or longer ago do not
-    /// count.
+    /// back to a wider, older answer.
     pub fn select(
         &self,
         view: &EcsView,
         question: impl Fn(&CacheEntry) -> bool,
-        max_age: Option<Duration>,
-        now: Instant,
     ) -> Option<Arc<CacheEntry>> {
         self.entries
             .iter()
-            .filter(|entry| {
-                question(entry) && !entry.outlived(max_age, now) && entry.reach.admits(view)
-            })
+            .filter(|entry| question(entry) && entry.reach.admits(view))
             .max_by_key(|entry| (entry.reach.specificity(), entry.inserted_at))
             .cloned()
     }
 
-    /// 存入 `entry` 后的槽位。它取代同一问题下适用于同样请求方的旧应答，去掉存了 `max_age`
-    /// 以上的应答；满了先淘汰只适用于一部分子网的应答（过期的先、早的先），只按带不带 ECS
+    /// 存入 `entry` 后的槽位。它取代同一问题下适用于同样请求方的旧应答，去掉过了 TTL 又过了
+    /// `kept_past_ttl`、已经没用的应答（见 [`CacheEntry::spent`]）；满了先淘汰只适用于一部分子网的应答（过期的先、早的先），只按带不带 ECS
     /// 区分的应答（见 `EcsReach::is_broad`）最后才淘汰，免得一个客户端用一串 ECS 子网挤掉
     /// 其他所有人共用的那份。
     /// The slot after storing `entry`. It replaces an older answer to the same
-    /// question for the same requesters, and drops answers stored `max_age` or
-    /// longer ago. When full it evicts answers for some subnets first (expired,
+    /// question for the same requesters, and drops answers past their TTL by
+    /// `kept_past_ttl`, of no further use (see [`CacheEntry::spent`]). When full it evicts answers for some subnets first (expired,
     /// then oldest first), and answers told apart only by whether ECS is sent (see
     /// `EcsReach::is_broad`) last, so one client cannot push out the answer
     /// everyone else shares with a run of ECS subnets.
-    pub fn with(&self, entry: Arc<CacheEntry>, max_age: Option<Duration>) -> Self {
+    pub fn with(&self, entry: Arc<CacheEntry>, kept_past_ttl: Duration) -> Self {
         let now = Instant::now();
         let mut entries: SmallVec<[Arc<CacheEntry>; 1]> = self
             .entries
             .iter()
             .filter(|old| {
                 !(entry.question().matches(old) && old.reach == entry.reach)
-                    && !old.outlived(max_age, now)
+                    && !old.spent(old.elapsed_secs(now), kept_past_ttl)
             })
             .cloned()
             .collect();
@@ -318,9 +316,10 @@ impl CacheSlot {
 ///  Engine 的副本共用同一个缓存 / Copies of the Engine share one cache
 pub type DnsCache = Arc<CacheStore<Arc<CacheSlot>>>;
 
-/// 每个槽位按它存的应答份数计重；里面的应答都存了 `max_age` 以上，整个槽位就不能再用了
-/// Each slot weighs as many answers as it holds; once every answer in it was stored
-/// `max_age` or longer ago, the whole slot is of no further use
+/// 每个槽位按它存的应答份数计重；里面的应答都过了 TTL 又过了缓存留着的那么久（见
+/// [`CacheEntry::spent`]），整个槽位就没用了
+/// Each slot weighs as many answers as it holds; once every answer in it is past its TTL by
+/// as long as the cache keeps it (see [`CacheEntry::spent`]), the whole slot is of no use
 /// 多少字节的应答算一份：容量按份算，大应答按它占的地方多算几份，容量才管得住内存
 /// The bytes of an answer that count as one: capacity counts answers, and a large one
 /// counts for the room it takes, so that capacity bounds the memory
@@ -331,19 +330,19 @@ impl Cached for Arc<CacheSlot> {
         CacheSlot::weight_of(&self.entries)
     }
 
-    fn outlived(&self, max_age: Duration, now: Instant) -> bool {
+    fn outlived(&self, kept_past_ttl: Duration, now: Instant) -> bool {
         self.entries()
-            .all(|entry| entry.outlived(Some(max_age), now))
+            .all(|entry| entry.spent(entry.elapsed_secs(now), kept_past_ttl))
     }
 }
 
-/// 创建 DNS 缓存。容量按应答份数计，超过 1 KB 的应答每 1 KB 算一份；存了 `ttl_secs` 秒以上的
-/// 应答不再用。
-/// Create the DNS cache. Capacity counts answers, one over 1 KB counting once per KB;
-/// answers stored `ttl_secs` seconds or longer ago are no longer used.
+/// 创建 DNS 缓存。容量按应答份数计，超过 1 KB 的应答每 1 KB 算一份；应答过了 TTL 又过了
+/// `kept_past_ttl` 就去掉（见 [`CacheEntry::spent`]）。
+/// Create the DNS cache. Capacity counts answers, one over 1 KB counting once per KB; an
+/// answer past its TTL by `kept_past_ttl` goes (see [`CacheEntry::spent`]).
 #[inline]
-pub fn new_cache(max_capacity: u64, ttl_secs: u64) -> DnsCache {
-    Arc::new(CacheStore::new(max_capacity, Duration::from_secs(ttl_secs)))
+pub fn new_cache(max_capacity: u64, kept_past_ttl: Duration) -> DnsCache {
+    Arc::new(CacheStore::new(max_capacity, kept_past_ttl))
 }
 
 #[cfg(test)]
@@ -385,12 +384,13 @@ mod tests {
             (59_000, 58),
             (65_535, 64),
         ] {
-            let slot = Arc::new(CacheSlot::default().with(answer_of("a.example", bytes), None));
+            let slot =
+                Arc::new(CacheSlot::default().with(answer_of("a.example", bytes), Duration::MAX));
             assert_eq!(slot.weight(), weight, "{bytes} bytes");
         }
         let slot = CacheSlot::default()
-            .with(answer_of("a.example", 100), None)
-            .with(answer_of("b.example", 3000), None);
+            .with(answer_of("a.example", 100), Duration::MAX)
+            .with(answer_of("b.example", 3000), Duration::MAX);
         assert_eq!(Arc::new(slot).weight(), 4);
         assert_eq!(Arc::new(CacheSlot::default()).weight(), 1);
     }
@@ -400,10 +400,10 @@ mod tests {
     /// more KB than the capacity
     #[test]
     fn capacity_bounds_the_bytes_large_answers_take() {
-        let cache = new_cache(10_000, 86_400);
+        let cache = new_cache(10_000, Duration::from_secs(86_400));
         for key in 0..2_000u64 {
-            let slot =
-                CacheSlot::default().with(answer_of(&format!("h{key}.example"), 59_000), None);
+            let slot = CacheSlot::default()
+                .with(answer_of(&format!("h{key}.example"), 59_000), Duration::MAX);
             cache.insert(key, Arc::new(slot));
         }
         let held: usize = cache
@@ -459,18 +459,12 @@ mod tests {
         )
         .with_reach(reach);
         entry.inserted_at -= age;
-        entry.stored_at -= age;
         entry.fetched_at -= age;
         Arc::new(entry)
     }
 
     fn select(slot: &CacheSlot, client: &str) -> Option<Arc<CacheEntry>> {
-        slot.select(
-            &view(client),
-            |entry| QUESTION.matches(entry),
-            None,
-            Instant::now(),
-        )
+        slot.select(&view(client), |entry| QUESTION.matches(entry))
     }
 
     /// 查询位不同的应答各存各的：新应答不取代另一种查询位的，查找也只认自己那几位
@@ -496,8 +490,8 @@ mod tests {
         let dnssec = QueryFlags::new(true, false, true);
         let (plain_answer, dnssec_answer) = (for_bits(QueryFlags::RECURSIVE), for_bits(dnssec));
         let slot = CacheSlot::default()
-            .with(plain_answer.clone(), None)
-            .with(dnssec_answer.clone(), None);
+            .with(plain_answer.clone(), Duration::MAX)
+            .with(dnssec_answer.clone(), Duration::MAX);
         assert_eq!(slot.len(), 2);
         for (flags, answer) in [
             (QueryFlags::RECURSIVE, &plain_answer),
@@ -505,12 +499,7 @@ mod tests {
         ] {
             let question = CachedQuestion { flags, ..QUESTION };
             let selected = slot
-                .select(
-                    &view("198.51.100.0/24"),
-                    |entry| question.matches(entry),
-                    None,
-                    Instant::now(),
-                )
+                .select(&view("198.51.100.0/24"), |entry| question.matches(entry))
                 .expect("its own answer");
             assert!(Arc::ptr_eq(&selected, answer), "{flags:?}");
         }
@@ -530,8 +519,8 @@ mod tests {
             Duration::from_secs(5),
         );
         let slot = CacheSlot::default()
-            .with(wide.clone(), None)
-            .with(narrow.clone(), None);
+            .with(wide.clone(), Duration::MAX)
+            .with(narrow.clone(), Duration::MAX);
         assert!(Arc::ptr_eq(
             &select(&slot, "198.51.100.0/24").unwrap(),
             &narrow
@@ -546,9 +535,9 @@ mod tests {
         let narrow = entry(reach("198.51.100.0/24", Some(24)), 300, Duration::ZERO);
         let newer_wide = entry(reach("198.51.100.0/24", Some(16)), 300, Duration::ZERO);
         let slot = CacheSlot::default()
-            .with(wide.clone(), None)
-            .with(narrow.clone(), None)
-            .with(newer_wide.clone(), None);
+            .with(wide.clone(), Duration::MAX)
+            .with(narrow.clone(), Duration::MAX)
+            .with(newer_wide.clone(), Duration::MAX);
         assert_eq!(slot.len(), 2);
         assert!(slot.entries().any(|entry| Arc::ptr_eq(entry, &newer_wide)));
         assert!(slot.entries().any(|entry| Arc::ptr_eq(entry, &narrow)));
@@ -564,8 +553,8 @@ mod tests {
         );
         let narrow = entry(reach("198.51.100.0/24", Some(24)), 300, Duration::ZERO);
         let slot = CacheSlot::default()
-            .with(wide.clone(), None)
-            .with(narrow.clone(), None);
+            .with(wide.clone(), Duration::MAX)
+            .with(narrow.clone(), Duration::MAX);
         let renewed = Arc::new(wide.clone_with_refreshed_ttl());
         let slot = slot.replacing(&wide, renewed.clone()).expect("still there");
         assert_eq!(slot.len(), 2);
@@ -574,26 +563,43 @@ mod tests {
         assert!(slot.replacing(&wide, renewed).is_none());
     }
 
+    /// 应答在缓存里留到它没用为止：过了 TTL 又过了 `kept_past_ttl` 就去掉，失败应答过了 TTL 就去掉。以前按
+    /// 写进缓存的时刻加 cache_max_ttl（默认一天）算，TTL 300 秒的应答没用了还占着容量一天
+    /// An answer stays in the cache until it is of no use: once past its TTL by
+    /// `kept_past_ttl` it goes, and a failure reply once past its TTL. It used to go by when it
+    /// was written plus cache_max_ttl (a day by default), an answer with a TTL of 300 seconds
+    /// taking up room for a day after it was of no use
     #[test]
-    fn answers_past_the_cache_time_to_live_do_not_count() {
-        let old = entry(
-            reach("198.51.100.0/24", Some(16)),
-            9000,
-            Duration::from_secs(120),
-        );
-        let slot = CacheSlot::default().with(old, None);
-        let max_age = Some(Duration::from_secs(60));
-        assert!(
-            slot.select(
-                &view("198.51.100.0/24"),
-                |entry| QUESTION.matches(entry),
-                max_age,
-                Instant::now()
+    fn an_answer_stays_until_it_is_of_no_use() {
+        let expired = || {
+            entry(
+                reach("198.51.100.0/24", Some(16)),
+                300,
+                Duration::from_secs(400),
             )
-            .is_none()
+        };
+        let stale_for = Duration::from_secs(200);
+        let slot = Arc::new(CacheSlot::default().with(expired(), Duration::ZERO));
+        let now = Instant::now();
+        assert!(
+            slot.outlived(Duration::ZERO, now),
+            "nothing kept past the TTL"
+        );
+        assert!(!slot.outlived(stale_for, now), "within the stale window");
+        assert!(
+            slot.outlived(Duration::from_secs(50), now),
+            "past the stale window"
         );
         let fresh = entry(reach("203.0.113.0/24", Some(24)), 300, Duration::ZERO);
-        assert_eq!(slot.with(fresh, max_age).len(), 1);
+        assert_eq!(slot.with(Arc::clone(&fresh), Duration::ZERO).len(), 1);
+        assert_eq!(slot.with(fresh, stale_for).len(), 2);
+
+        let mut failed = (*expired()).clone();
+        failed.rcode = ResponseCode::ServFail;
+        assert!(
+            failed.spent(400, stale_for),
+            "a failure reply never goes out stale"
+        );
     }
 
     /// 槽位满了，最后才淘汰按「带不带 ECS」区分、大家共用的那份
@@ -601,10 +607,13 @@ mod tests {
     #[test]
     fn a_full_slot_evicts_the_shared_answer_last() {
         let shared = entry(reach("198.51.100.0/24", None), 300, Duration::from_secs(10));
-        let mut slot = CacheSlot::default().with(shared.clone(), None);
+        let mut slot = CacheSlot::default().with(shared.clone(), Duration::MAX);
         for third in 0..MAX_NETWORKS_PER_SLOT {
             let client = format!("203.0.{third}.0/24");
-            slot = slot.with(entry(reach(&client, Some(24)), 300, Duration::ZERO), None);
+            slot = slot.with(
+                entry(reach(&client, Some(24)), 300, Duration::ZERO),
+                Duration::MAX,
+            );
         }
         assert_eq!(slot.len(), MAX_NETWORKS_PER_SLOT);
         assert!(slot.entries().any(|entry| Arc::ptr_eq(entry, &shared)));
@@ -632,12 +641,12 @@ mod tests {
             Arc::new(large)
         };
         let shared = large(EcsReach::default(), Duration::from_secs(50));
-        let mut slot = CacheSlot::default().with(shared.clone(), None);
+        let mut slot = CacheSlot::default().with(shared.clone(), Duration::MAX);
         for network in 0..20u8 {
             let reach = reach(&format!("198.51.{network}.0/24"), Some(24));
             slot = slot.with(
                 large(reach, Duration::from_secs(u64::from(20 - network))),
-                None,
+                Duration::MAX,
             );
         }
         assert_eq!(Arc::new(slot.clone()).weight(), 63);
@@ -665,7 +674,7 @@ mod tests {
             Duration::from_secs(1),
         );
         let started = Instant::now();
-        let slot = CacheSlot::default().with(renewed.clone(), None);
+        let slot = CacheSlot::default().with(renewed.clone(), Duration::MAX);
         let narrower = entry(reach("198.51.100.0/24", Some(24)), 300, Duration::ZERO);
         assert!(
             slot.after_refresh(
@@ -681,7 +690,7 @@ mod tests {
         // Another client's answer written meanwhile is not the refresh's
         // 这期间别的客户端写入的应答不是刷新写的
         let other = entry(reach("203.0.113.0/24", Some(24)), 300, Duration::ZERO);
-        let with_other = slot.with(other, None);
+        let with_other = slot.with(other, Duration::MAX);
         assert!(
             with_other
                 .after_refresh(
@@ -693,7 +702,7 @@ mod tests {
                 )
                 .is_none()
         );
-        let slot = with_other.with(narrower.clone(), None);
+        let slot = with_other.with(narrower.clone(), Duration::MAX);
         let settled = slot
             .after_refresh(
                 &QUESTION,
