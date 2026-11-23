@@ -1957,6 +1957,14 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
             if let Some(valid_len) = valid_message_len(&out) {
                 out.truncate(valid_len);
             }
+            // 回答段、授权段都还在，只是 Additional 放不下时不置 TC（RFC 2181 第 9 节）：客户端改用 TCP 拿到的也只多
+            // 几条附加记录，用不着为它重问一遍。上游自己置了 TC 的照旧
+            // With the answer and authority sections whole and only Additional cut, TC is
+            // not set (RFC 2181 section 9): retrying over TCP would bring only a few more
+            // additional records, not worth asking again for. A TC the upstream set stays
+            if out[6..10] == response_packet[6..10] && response_packet[2] & 0x02 == 0 {
+                out[2] &= !0x02;
+            }
             if !opt.is_empty() {
                 out.extend_from_slice(&opt);
                 let additional = section_count(&out, 3) as u16 + 1;
@@ -2207,6 +2215,48 @@ mod tests {
             Some(jumps_from(16) + 2)
         );
         assert_eq!(strict_name_end(&packet, jumps_from(17)), None);
+    }
+
+    /// UDP 回答只是 Additional 放不下时不置 TC（RFC 2181 第 9 节），回答段照样整个带上；回答段放不下时照旧置 TC
+    /// A UDP reply with only Additional cut sets no TC (RFC 2181 section 9), the answer section
+    /// whole; with the answer section cut it sets TC as before
+    #[test]
+    fn cutting_only_additional_records_sets_no_tc() {
+        use hickory_proto::op::{MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, RecordType, rdata::A};
+        let name = Name::from_ascii("glue.example.").unwrap();
+        let a = |n: u32| {
+            Record::from_rdata(
+                name.clone(),
+                300,
+                RData::A(A::from(std::net::Ipv4Addr::from(n))),
+            )
+        };
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(name.clone(), RecordType::A));
+        let mut reply = query.clone();
+        reply.metadata.message_type = MessageType::Response;
+        reply.add_answer(a(1));
+        reply.add_additionals((0..60).map(a));
+        let reply = reply.to_vec().unwrap();
+        let cut = Message::from_bytes(
+            &truncate_udp_response(&query.to_vec().unwrap(), &reply).expect("cut to 512"),
+        )
+        .unwrap();
+        assert_eq!(cut.answers.len(), 1);
+        assert!(cut.additionals.len() < 60);
+        assert!(!cut.metadata.truncation, "only Additional was cut");
+
+        let mut long = query.clone();
+        long.metadata.message_type = MessageType::Response;
+        long.add_answers((0..60).map(a));
+        let cut = Message::from_bytes(
+            &truncate_udp_response(&query.to_vec().unwrap(), &long.to_vec().unwrap())
+                .expect("cut to 512"),
+        )
+        .unwrap();
+        assert!(cut.answers.len() < 60);
+        assert!(cut.metadata.truncation, "answers were cut");
     }
 
     /// 带着读得出的 OPT 的请求，NOTIMP 和 FORMERR 也带 OPT，DO 位照抄（RFC 6891 第 7 节）；不带 OPT 的照旧不带
