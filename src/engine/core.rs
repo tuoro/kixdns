@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 
@@ -70,7 +70,7 @@ pub struct Engine {
     /// 正在刷新的条目的刷新标记（见 `RefreshingGuard`）：同一条同时只刷新一次
     /// The refresh marks of the entries being refreshed (see `RefreshingGuard`): one
     /// refresh of an entry at a time
-    pub refreshing_set: Arc<DashSet<u64>>,
+    pub refreshing: Arc<super::utils::Refreshing>,
     /// 最近刷新失败的应答（见 `RefreshFailures`）/ The answers whose refresh failed lately (see `RefreshFailures`)
     pub(crate) refresh_failures: Arc<super::refresh::RefreshFailures>,
     // Semaphore to limit concurrent handle_packet async tasks / 用于限制并发 handle_packet 异步任务数量
@@ -296,7 +296,7 @@ impl Engine {
                     settings.dashmap_shards,
                 ))
             },
-            refreshing_set: Arc::new(DashSet::new()),
+            refreshing: Arc::default(),
             refresh_failures: Arc::default(),
             permit_manager,
             flow_control_state,

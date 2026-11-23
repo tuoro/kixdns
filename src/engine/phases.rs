@@ -1,5 +1,6 @@
 use super::Engine;
 use crate::cache::{CacheEntry, CachedQuestion};
+use crate::config::GlobalSettings;
 use crate::config::{Action, Transport};
 use crate::ecs_scope::{EcsReach, EcsView, ForwardEcs};
 use crate::engine::execution::CacheKeys;
@@ -97,6 +98,41 @@ pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<
 /// background refresh; an expired one is served stale or dropped as serve_stale says.
 /// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期的按 serve_stale
 /// 的设置当作 stale 提供，或者删掉。
+/// 缓存里的一份应答现在算什么 / What a cached answer counts as now
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Age {
+    /// 还在 TTL 之内 / Still within its TTL
+    Fresh,
+    /// TTL 到了，还能当过期应答交出去（RFC 8767）/ Past its TTL, and still fit to go out as a stale answer (RFC 8767)
+    Stale,
+    /// TTL 到了，不能再用 / Past its TTL and of no further use
+    Spent,
+}
+
+/// 存了 `elapsed_secs` 秒的 `hit` 现在算什么：TTL 之内是新鲜的；TTL 到了以后，开着 serve_stale、不是失败应答
+/// （SERVFAIL、REFUSED、扩展 RCODE，见 `is_failure_reply`）、过期没超过 serve_stale_expire_ttl（0 不限）的还能当过期应答
+/// 交出去，其余的不能再用。查缓存、上游失败时找过期应答、等刷新时都按这一处判断
+/// What `hit`, stored `elapsed_secs` seconds ago, counts as now: within its TTL it is fresh;
+/// past it, with serve_stale on, no failure reply (SERVFAIL, REFUSED, an extended RCODE, see
+/// `is_failure_reply`) and no longer past its TTL than serve_stale_expire_ttl (0 for no limit)
+/// it can still go out stale, and otherwise it is of no use. The cache lookup, looking for a
+/// stale answer after an upstream failure and waiting for a refresh all go by this alone
+pub(crate) fn age_of(hit: &CacheEntry, elapsed_secs: u64, settings: &GlobalSettings) -> Age {
+    let ttl = u64::from(hit.original_ttl);
+    if elapsed_secs < ttl {
+        return Age::Fresh;
+    }
+    let expire = settings.serve_stale_expire_ttl;
+    if settings.serve_stale
+        && !crate::engine::upstream::is_failure_reply(hit.rcode)
+        && (expire == 0 || elapsed_secs - ttl <= expire)
+    {
+        Age::Stale
+    } else {
+        Age::Spent
+    }
+}
+
 pub(crate) fn check_cache_logged(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
@@ -130,40 +166,12 @@ pub(crate) fn check_cache_logged(
     let hit = engine.cache_get(slot, &view, &question, now)?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
 
-    // The answer's own TTL ran out / 应答自己的 TTL 到了
-    if elapsed_secs >= hit.original_ttl as u64 {
-        // serve_stale disabled → invalidate and miss
-        if !state.pipeline.settings.serve_stale {
-            engine.cache_invalidate(slot, &hit);
-            return None;
-        }
-        // Don't serve a failure reply (SERVFAIL, REFUSED, an extended RCODE, see
-        // `is_failure_reply`) as stale
-        if crate::engine::upstream::is_failure_reply(hit.rcode) {
-            engine.cache_invalidate(slot, &hit);
-            return None;
-        }
-
-        // Check serve_stale_expire_ttl: how long past original TTL has this been stale?
-        // 检查 serve_stale_expire_ttl：此条目已过期多长时间？
-        let stale_age = elapsed_secs - hit.original_ttl as u64;
-        if state.pipeline.settings.serve_stale_expire_ttl > 0
-            && stale_age > state.pipeline.settings.serve_stale_expire_ttl
-        {
-            // Stale entry has exceeded the maximum stale window
-            // 过期条目已超过最大过期窗口
-            engine.cache_invalidate(slot, &hit);
-            debug!(
-                event = "serve_stale_expired",
-                qname = %qname_ref,
-                qtype = ?qtype,
-                stale_age = stale_age,
-                serve_stale_expire_ttl = state.pipeline.settings.serve_stale_expire_ttl,
-                "stale entry exceeded serve_stale_expire_ttl, invalidating"
-            );
-            return None;
-        }
-
+    let age = age_of(&hit, elapsed_secs, &state.pipeline.settings);
+    if age == Age::Spent {
+        engine.cache_invalidate(slot, &hit);
+        return None;
+    }
+    if age == Age::Stale {
         // serve_stale_client_timeout_ms > 0: don't serve stale here, let the caller
         // try upstream first with a short timeout (handled in handle_packet_internal).
         // serve_stale_client_timeout_ms > 0: 不在此处返回 stale，
@@ -190,7 +198,7 @@ pub(crate) fn check_cache_logged(
             // Don't invalidate - we still need the stale entry for the client_timeout path.
             // Spawn background refresh proactively.
             if hit.upstream.is_some() {
-                engine.spawn_background_refresh((*state).clone(), &hit, slot, qclass, requester);
+                engine.spawn_background_refresh(state, &hit, slot, qclass, requester);
             }
             return None;
         }
@@ -205,7 +213,7 @@ pub(crate) fn check_cache_logged(
             original_ttl = hit.original_ttl,
             elapsed_secs = elapsed_secs,
             stale_ttl = state.pipeline.settings.serve_stale_ttl,
-            stale_age = stale_age,
+            stale_age = elapsed_secs - u64::from(hit.original_ttl),
             ttl_reset = state.pipeline.settings.serve_stale_ttl_reset,
             client_ip = %peer.ip(),
             pipeline = %pipeline_id,
@@ -241,7 +249,7 @@ pub(crate) fn check_cache_logged(
                 "Triggering background refresh for cached entry"
             );
 
-            engine.spawn_background_refresh((*state).clone(), &hit, slot, qclass, requester);
+            engine.spawn_background_refresh(state, &hit, slot, qclass, requester);
         }
 
         response.served_from_cache(&hit);
@@ -373,27 +381,10 @@ pub(crate) fn check_stale_cache_logged(
     let now = Instant::now();
     let hit = engine.cache_get(slot, &view, &question, now)?;
     let elapsed_secs = now.saturating_duration_since(hit.inserted_at).as_secs();
-
-    // Only serve stale when TTL has actually expired
-    // 仅当 TTL 已过期时才提供 stale 数据
-    if elapsed_secs < hit.original_ttl as u64 {
+    if age_of(&hit, elapsed_secs, &state.pipeline.settings) != Age::Stale {
         return None;
     }
-    // Don't serve a failure reply (SERVFAIL, REFUSED, an extended RCODE, see
-    // `is_failure_reply`) as stale
-    // 不把失败应答（SERVFAIL、REFUSED、扩展 RCODE，见 `is_failure_reply`）当作 stale 提供
-    if crate::engine::upstream::is_failure_reply(hit.rcode) {
-        return None;
-    }
-
-    // Check serve_stale_expire_ttl: max stale age window
-    // 检查 serve_stale_expire_ttl：过期数据的最大可用窗口
-    let stale_age = elapsed_secs - hit.original_ttl as u64;
-    if state.pipeline.settings.serve_stale_expire_ttl > 0
-        && stale_age > state.pipeline.settings.serve_stale_expire_ttl
-    {
-        return None;
-    }
+    let stale_age = elapsed_secs - u64::from(hit.original_ttl);
 
     debug!(
         event = "serve_stale",
@@ -445,7 +436,7 @@ fn serve_stale(
     // check of that one reply came to, and not decided again it would be renewed on every hit
     // and served for ever
     engine.spawn_background_refresh(
-        (*context.state).clone(),
+        context.state,
         hit,
         context.slot,
         context.qclass,

@@ -199,6 +199,17 @@ impl RefreshFailures {
     }
 }
 
+/// 同时最多刷新这么多条。刷新可有可无：到了上限就先不刷新，下一次命中再说。平常一次刷新几十毫秒，同时在刷的只有几条；
+/// 上游不应答又开着 serve_stale 时，每个过期的名字一命中就发起一次，每次都要等满上游的超时，以前没有上限，任务能涨到
+/// 和缓存条数一样多，流控和内存水位都看不见它们
+/// At most this many entries are refreshed at once. A refresh is optional: at the limit it
+/// waits for a later hit. A refresh usually takes some tens of milliseconds and only a few
+/// run at once; with an upstream that does not answer and serve_stale on, every stale name
+/// starts one on a hit, each waiting out the upstream timeout, and with no limit they used
+/// to grow as many as there are cache entries, unseen by flow control and the memory
+/// watermark
+const REFRESHES_AT_ONCE: usize = 128;
+
 /// spawn_background_refresh spawns a task to refresh a DNS record in the background.
 ///
 /// 防止无限循环的保护措施：
@@ -220,7 +231,7 @@ impl RefreshFailures {
 /// 类别为 `qclass`。
 pub fn spawn_background_refresh(
     engine: &Engine,
-    state: Arc<EngineInner>,
+    state: &Arc<EngineInner>,
     renewed: &crate::cache::CacheEntry,
     slot: u64,
     qclass: DNSClass,
@@ -243,9 +254,17 @@ pub fn spawn_background_refresh(
     {
         return;
     }
-    let Some(guard) = RefreshingGuard::try_new(&engine.refreshing_set, mark) else {
+    // 已经在刷新的只读一下就认出来，不去抢写锁；同时在刷新的够多了，这次先不刷新（见 `REFRESHES_AT_ONCE`）
+    // One already being refreshed is told by a read, without contending for the write lock;
+    // with enough being refreshed at once, this one waits for a later hit (see
+    // `REFRESHES_AT_ONCE`)
+    if engine.refreshing.contains_key(&mark) || engine.refreshing.len() >= REFRESHES_AT_ONCE {
+        return;
+    }
+    let Some(guard) = RefreshingGuard::try_new(&engine.refreshing, mark) else {
         return;
     };
+    let state = Arc::clone(state);
     let target = RefreshTarget::new(
         slot,
         renewed.pipeline_id.clone(),
@@ -454,12 +473,64 @@ mod refresh_timing_tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         engine.handle_packet(&query, peer).await.expect("answered");
         tokio::time::timeout(Duration::from_secs(3), async {
-            while upstream.queries() < 2 || !engine.refreshing_set.is_empty() {
+            while upstream.queries() < 2 || !engine.refreshing.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("the hit refreshes the answer from the upstream");
         assert_eq!(upstream.queries(), 2);
+    }
+
+    /// 同时在刷新的到了 `REFRESHES_AT_ONCE` 条，该刷新的命中先不刷新，有了空位以后的命中照常刷新
+    /// With `REFRESHES_AT_ONCE` entries being refreshed, a hit due for a refresh starts none, and
+    /// one once there is room starts it as usual
+    #[tokio::test]
+    async fn no_refresh_starts_while_enough_are_running() {
+        let upstream = crate::engine::test_support::answering_upstream(
+            std::net::Ipv4Addr::new(192, 0, 2, 1),
+            2,
+        )
+        .await;
+        let engine = engine_from(json!({
+            "settings": {
+                "cache_background_refresh": true,
+                "cache_refresh_threshold_percent": 99,
+                "cache_refresh_min_ttl": 1
+            },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "all",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream.address }]
+            }] }]
+        }));
+        let mut query = Message::new(0x2a2a, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_str("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        let peer = "10.0.0.1:53000".parse().unwrap();
+        engine.handle_packet(&query, peer).await.expect("answered");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        for mark in 0..super::REFRESHES_AT_ONCE as u64 {
+            engine
+                .refreshing
+                .insert(u64::MAX - mark, Default::default());
+        }
+        engine.handle_packet(&query, peer).await.expect("answered");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(upstream.queries(), 1, "no room for a refresh");
+
+        engine.refreshing.clear();
+        engine.handle_packet(&query, peer).await.expect("answered");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while upstream.queries() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("with room the hit refreshes");
     }
 }
