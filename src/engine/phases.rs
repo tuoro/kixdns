@@ -530,6 +530,12 @@ pub fn handle_static_decision(
 pub struct ForwardDecisionContext<'a> {
     pub state: &'a Arc<EngineInner>,
     pub packet: &'a [u8],
+    /// 客户端发来的查询，没经过哪次转发改写；响应动作里自己写了 `ecs` 的转发从它改写（`packet` 在响应阶段跳转以后
+    /// 是跳转前那次转发发出的包）
+    /// The query as the client sent it, rewritten by no forward; a forward among the response
+    /// actions that writes an `ecs` of its own rewrites from it (after a response-phase jump
+    /// `packet` is what the forward before the jump sent)
+    pub query: &'a [u8],
     pub qname: &'a Arc<str>,
     pub qtype: RecordType,
     pub qclass: DNSClass,
@@ -605,6 +611,7 @@ pub(crate) async fn handle_forward_decision_logged(
     let ForwardDecisionContext {
         state,
         packet,
+        query,
         qname,
         qtype,
         qclass,
@@ -667,19 +674,7 @@ pub(crate) async fn handle_forward_decision_logged(
         None => std::borrow::Cow::Borrowed(packet),
     };
     let packet = ecs_packet.as_ref();
-    // The cache relies on `forward_ecs` being what goes out. When it is not (an ECS
-    // option the rewrite could not parse goes out as it is, say), or what goes out is
-    // an option nobody can read, whom the reply applies to is unknown: nothing the
-    // request gets from here on is cached.
-    // 缓存依赖 `forward_ecs` 就是实际发出的 ECS。不一致（例如改写解析不了客户端的 ECS 选项，
-    // 包原样发出），或者发出的是谁也读不懂的选项时，应答适用于谁说不准：此后请求得到的应答
-    // 一律不缓存。
-    let actually_sent = proto_utils::sent_subnet(packet);
-    if actually_sent != forward_ecs.sent
-        || matches!(actually_sent, crate::ecs_scope::Sent::Subnet(subnet) if subnet.is_opaque())
-    {
-        trail.mark_uncacheable();
-    }
+    trail.check_sent(packet, &forward_ecs);
 
     // Only the request that registered an entry hands it an answer. One that
     // forwards under another's entry (a request holding an entry of its own, a
@@ -1213,6 +1208,8 @@ pub(crate) async fn handle_forward_decision_logged(
             ctx_opt,
             req: &req,
             packet,
+            query,
+            client_ecs: requester.ecs,
             upstream_timeout,
             qname,
             qtype,

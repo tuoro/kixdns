@@ -276,6 +276,18 @@ impl EcsReach {
         self.record(ecs, ReplyEcs::Unreadable, false);
     }
 
+    /// 缓存靠的是 `ecs` 就是 `packet` 实际发出的 ECS。对不上（比如改写解析不了客户端的 ECS 选项，包原样发出），或者
+    /// 发出的是谁也读不懂的选项时，应答适用于谁说不准：此后得到的一律不缓存
+    /// The cache relies on `ecs` being what `packet` sends. When it is not (an ECS option the
+    /// rewrite could not parse goes out as it is, say), or what goes out is an option nobody can
+    /// read, whom the reply applies to is unknown: nothing got from here on is cached
+    pub fn check_sent(&mut self, packet: &[u8], ecs: &ForwardEcs) {
+        let sent = crate::proto_utils::sent_subnet(packet);
+        if sent != ecs.sent || matches!(sent, Sent::Subnet(subnet) if subnet.is_opaque()) {
+            self.mark_uncacheable();
+        }
+    }
+
     /// 此后得到的应答不缓存，见 `uncacheable` / What is got from here on is not cached, see
     /// `uncacheable`
     pub fn mark_uncacheable(&mut self) {

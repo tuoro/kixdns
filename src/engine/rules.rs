@@ -396,7 +396,12 @@ pub struct ApplyResponseActionsContext<'a> {
     pub actions: &'a [Action],
     pub ctx_opt: Option<ResponseContext>,
     pub req: &'a Message,
+    /// 规则自己的转发发出的包 / The packet the rule's own forward sent
     pub packet: &'a [u8],
+    /// 客户端发来的查询，和它自己带的 ECS（见 `ForwardDecisionContext::query`）/ The query as the client sent
+    /// it, and the ECS it carried itself (see `ForwardDecisionContext::query`)
+    pub query: &'a [u8],
+    pub client_ecs: Option<crate::ecs::EcsKey>,
     pub upstream_timeout: Duration,
     pub qname: &'a str,
     pub qtype: RecordType,
@@ -410,10 +415,11 @@ pub struct ApplyResponseActionsContext<'a> {
     pub rule_name: &'a str,
     pub remaining_jumps: usize,
     /// Where a forward among the actions records its reply, or its failure, and the
-    /// ECS it sends: the rule's own, as it forwards the same packet (see
-    /// `ForwardDecisionContext::trail`). None where nothing is cached.
-    /// 动作里的转发在哪里记下它的应答或失败，以及它发出的 ECS：与规则自己的转发相同，因为
-    /// 它转发的是同一个包（见 `ForwardDecisionContext::trail`）。不缓存的地方为 None。
+    /// ECS the rule's own forward sent, which a forward among the actions without an `ecs` of
+    /// its own sends too, forwarding the same packet (see `ForwardDecisionContext::trail`).
+    /// None where nothing is cached.
+    /// 动作里的转发在哪里记下它的应答或失败，以及规则自己的转发发出的 ECS：动作里没写 `ecs` 的转发发的是同一个包，
+    /// 也就是这一份（见 `ForwardDecisionContext::trail`）。不缓存的地方为 None。
     pub trail: Option<(
         &'a mut crate::ecs_scope::EcsReach,
         crate::ecs_scope::ForwardEcs,
@@ -572,7 +578,7 @@ async fn run_response_actions(
             Action::Forward {
                 upstream,
                 transport,
-                ecs: _,
+                ecs,
                 pre_split_upstreams,
                 upstream_shared: _,
             } => {
@@ -597,9 +603,34 @@ async fn run_response_actions(
                 let upstream_addr: Arc<str> =
                     Arc::from(upstream.as_deref().unwrap_or(ctx.upstream_default));
                 let use_transport = transport.unwrap_or(Transport::Udp);
+                // 自己写了 `ecs` 的照它从客户端的查询改写，应答适用于谁也按它算；没写的和规则自己的转发发同一个包。以前
+                // 这里的 `ecs` 读进来就丢掉了
+                // One writing an `ecs` of its own rewrites the client's query by it, and whom the
+                // reply applies to goes by it too; one without sends the packet of the rule's own
+                // forward. The `ecs` here used to be read and dropped
+                let own_ecs = ecs.as_ref().map(|mode| {
+                    let view = crate::ecs_scope::EcsView {
+                        peer: ctx.client_ip,
+                        client: ctx.client_ecs,
+                    };
+                    let packet = crate::ecs::apply_ecs_for(
+                        ctx.query,
+                        mode,
+                        ctx.client_ip,
+                        ctx.client_ecs.as_ref(),
+                    );
+                    (packet, crate::ecs_scope::ForwardEcs::of(Some(mode), &view))
+                });
+                let packet = own_ecs.as_ref().map_or(ctx.packet, |(packet, _)| packet);
+                if let (Some((trail, _)), Some((packet, sent))) = (ctx.trail.as_mut(), &own_ecs) {
+                    trail.check_sent(packet, sent);
+                }
+                let sent_ecs = |rule_ecs: crate::ecs_scope::ForwardEcs| {
+                    own_ecs.as_ref().map_or(rule_ecs, |(_, sent)| *sent)
+                };
                 let (raw, actual_upstream) = match crate::engine::upstream::forward_upstream(
                     ctx.engine,
-                    ctx.packet,
+                    packet,
                     &upstream_addr,
                     ctx.upstream_timeout,
                     Some(use_transport),
@@ -610,14 +641,14 @@ async fn run_response_actions(
                 .await
                 {
                     Ok(result) => {
-                        if let Some((trail, ecs)) = ctx.trail.as_mut() {
-                            trail.record_reply(*ecs, &result.0);
+                        if let Some((trail, rule_ecs)) = ctx.trail.as_mut() {
+                            trail.record_reply(sent_ecs(*rule_ecs), &result.0);
                         }
                         result
                     }
                     Err(err) => {
-                        if let Some((trail, ecs)) = ctx.trail.as_mut() {
-                            trail.record_failure(*ecs);
+                        if let Some((trail, rule_ecs)) = ctx.trail.as_mut() {
+                            trail.record_failure(sent_ecs(*rule_ecs));
                         }
                         if UpstreamFailure::was_withheld(&err) {
                             tracing::debug!(

@@ -1840,6 +1840,7 @@ impl Engine {
                             phases::ForwardDecisionContext {
                                 state: &state,
                                 packet: jumped.as_ref().map_or(packet, |(packet, _)| packet),
+                                query: packet,
                                 qname: qname_ref,
                                 qtype,
                                 qclass,
@@ -4730,6 +4731,8 @@ mod tests {
             ctx_opt,
             req,
             packet,
+            query: packet,
+            client_ecs: None,
             upstream_timeout: Duration::from_secs(1),
             qname: "example.com",
             qtype: RecordType::A,
