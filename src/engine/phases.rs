@@ -121,6 +121,50 @@ pub(crate) fn kept_past_ttl(settings: &GlobalSettings) -> Duration {
     }
 }
 
+/// 过期还能用的 `hit`（见 [`Age::Stale`]）是不是现在就交出去、按哪种上报：没开 serve_stale_client_timeout_ms
+/// 时马上交出；开着时先等上游（见 `Engine::answer_from_cache`），只有这份应答刚刷新失败过的不等（RFC 8767 第 5
+/// 节，见 `REFRESH_FAILURE_RECHECK`）。查缓存和快速路径都按这一处判断
+/// Whether `hit`, past its TTL and still of use (see [`Age::Stale`]), goes out right now, and
+/// reported as what: at once with serve_stale_client_timeout_ms off; with it on the upstream
+/// comes first (see `Engine::answer_from_cache`), and only an answer whose refresh failed lately
+/// does not wait (RFC 8767 section 5, see `REFRESH_FAILURE_RECHECK`). The cache lookup and the
+/// fast path both go by this alone
+pub(crate) fn stale_at_once(
+    engine: &Engine,
+    settings: &GlobalSettings,
+    slot: u64,
+    hit: &CacheEntry,
+) -> Option<CacheHitKind> {
+    if settings.serve_stale_client_timeout_ms == 0 {
+        Some(CacheHitKind::Stale)
+    } else if hit.upstream.is_some()
+        && engine
+            .refresh_failures
+            .failed_recently(RefreshTarget::mark_of(slot, &hit.reach), hit.fetched_at)
+    {
+        Some(CacheHitKind::StaleUpstreamFailure)
+    } else {
+        None
+    }
+}
+
+/// 观察者看到的这次缓存命中：存了 `elapsed_secs` 秒的新鲜应答带上剩下的 TTL，过期应答不带
+/// The cache hit as the observer sees it: a fresh answer stored `elapsed_secs` seconds ago
+/// carries the TTL it has left, a stale one none
+pub(crate) fn cache_hit_of(
+    hit: &CacheEntry,
+    kind: CacheHitKind,
+    elapsed_secs: u32,
+) -> CacheHit<'_> {
+    CacheHit {
+        kind,
+        remaining_ttl: (kind == CacheHitKind::Fresh)
+            .then(|| Duration::from_secs(u64::from(hit.original_ttl.saturating_sub(elapsed_secs)))),
+        original_ttl: Some(Duration::from_secs(u64::from(hit.original_ttl))),
+        source: cached_source(hit.upstream.as_deref()),
+    }
+}
+
 /// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
 /// background refresh; an expired one is served stale or dropped as serve_stale says.
 /// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期的按 serve_stale
@@ -139,10 +183,9 @@ pub(crate) fn check_cache_logged(
         pipeline_id,
         slot,
         tx_id,
-        start: _,
-        peer,
         requester,
         observed,
+        ..
     } = *context;
     let view = requester.ecs_view();
     let question = CachedQuestion {
@@ -164,61 +207,18 @@ pub(crate) fn check_cache_logged(
         return None;
     }
     if age == Age::Stale {
-        // serve_stale_client_timeout_ms > 0: don't serve stale here, let the caller
-        // try upstream first with a short timeout (handled in handle_packet_internal).
-        // serve_stale_client_timeout_ms > 0: 不在此处返回 stale，
-        // 让调用者先尝试上游查询（在 handle_packet_internal 中处理）。
-        if state.pipeline.settings.serve_stale_client_timeout_ms > 0 {
-            // 这份应答刚刷新失败过：不等，马上交出过期应答，也不再刷新（RFC 8767 第 5 节，见
-            // `REFRESH_FAILURE_RECHECK`）
-            // This answer's refresh failed lately: no waiting, the stale answer goes out at
-            // once and no refresh starts (RFC 8767 section 5, see `REFRESH_FAILURE_RECHECK`)
-            if hit.upstream.is_some()
-                && engine
-                    .refresh_failures
-                    .failed_recently(RefreshTarget::mark_of(slot, &hit.reach), hit.fetched_at)
-            {
-                return Some(serve_stale(
-                    engine,
-                    context,
-                    &hit,
-                    &view,
-                    CacheHitKind::StaleUpstreamFailure,
-                    response,
-                ));
+        match stale_at_once(engine, &state.pipeline.settings, slot, &hit) {
+            Some(kind) => Some(serve_stale(engine, context, &hit, &view, kind, response)),
+            // 先等上游：条目留着，等待到头时交出；刷新现在就发起，等的就是它
+            // The upstream comes first: the entry stays to go out when the wait runs out,
+            // and its refresh, which is what is waited for, starts now
+            None => {
+                if hit.upstream.is_some() {
+                    engine.spawn_background_refresh(state, &hit, slot, qclass, requester);
+                }
+                None
             }
-            // Don't invalidate - we still need the stale entry for the client_timeout path.
-            // Spawn background refresh proactively.
-            if hit.upstream.is_some() {
-                engine.spawn_background_refresh(state, &hit, slot, qclass, requester);
-            }
-            return None;
         }
-
-        // serve_stale_client_timeout_ms == 0: Serve stale immediately (optimistic mode)
-        // RFC 8767: 立即返回 stale 数据 + 后台刷新
-        debug!(
-            event = "serve_stale_on_ttl_expiry",
-            qname = %qname_ref,
-            qtype = ?qtype,
-            rcode = ?hit.rcode,
-            original_ttl = hit.original_ttl,
-            elapsed_secs = elapsed_secs,
-            stale_ttl = state.pipeline.settings.serve_stale_ttl,
-            stale_age = elapsed_secs - u64::from(hit.original_ttl),
-            ttl_reset = state.pipeline.settings.serve_stale_ttl_reset,
-            client_ip = %peer.ip(),
-            pipeline = %pipeline_id,
-            "RFC 8767: serving stale cache entry on TTL expiry"
-        );
-        Some(serve_stale(
-            engine,
-            context,
-            &hit,
-            &view,
-            CacheHitKind::Stale,
-            response,
-        ))
     } else {
         // Cache hit is valid
 
@@ -247,17 +247,7 @@ pub(crate) fn check_cache_logged(
         response.served_from_cache(&hit);
 
         if let Some((observer, ctx)) = observed {
-            observer.cache_hit(
-                ctx,
-                &CacheHit {
-                    kind: CacheHitKind::Fresh,
-                    remaining_ttl: Some(Duration::from_secs(
-                        hit.original_ttl.saturating_sub(elapsed) as u64,
-                    )),
-                    original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
-                    source: cached_source(hit.upstream.as_deref()),
-                },
-            );
+            observer.cache_hit(ctx, &cache_hit_of(&hit, CacheHitKind::Fresh, elapsed));
         }
         Some(resp_bytes)
     }
@@ -341,15 +331,11 @@ pub(crate) fn check_stale_cache_logged(
         state,
         qname: qname_ref,
         qtype,
-        qclass: _,
         flags,
         pipeline_id,
         slot,
-        tx_id: _,
-        start: _,
-        peer,
         requester,
-        observed: _,
+        ..
     } = *context;
     if !state.pipeline.settings.serve_stale {
         return None;
@@ -368,31 +354,18 @@ pub(crate) fn check_stale_cache_logged(
     if age_of(&hit, elapsed_secs, &state.pipeline.settings) != Age::Stale {
         return None;
     }
-    let stale_age = elapsed_secs - u64::from(hit.original_ttl);
-
-    debug!(
-        event = "serve_stale",
-        qname = %qname_ref,
-        qtype = ?qtype,
-        rcode = ?hit.rcode,
-        original_ttl = hit.original_ttl,
-        elapsed_secs = elapsed_secs,
-        stale_age = stale_age,
-        stale_ttl = state.pipeline.settings.serve_stale_ttl,
-        client_ip = %peer.ip(),
-        pipeline = %pipeline_id,
-        "RFC 8767: serving stale cache entry on upstream failure"
-    );
     Some(serve_stale(engine, context, &hit, &view, kind, response))
 }
 
 /// 把过期的 `hit` 当作 stale 提供（RFC 8767）：TTL 都设成 serve_stale_ttl；顺带发起后台刷新（刷新失败时
-/// serve_stale_ttl_reset 才续期，见 `spawn_background_refresh`）；按 `kind` 上报观察者，记下应答取自缓存
+/// serve_stale_ttl_reset 才续期，见 `spawn_background_refresh`）；按 `kind` 上报观察者，记下应答取自缓存。
+/// 交出过期应答的都走这里：查缓存、等上游到头、上游失败以后，还有快速路径
 /// Serve the expired `hit` stale (RFC 8767): every TTL set to serve_stale_ttl; a background
 /// refresh is started too (only its failure renews the answer, with serve_stale_ttl_reset on,
 /// see `spawn_background_refresh`); the observer hears of it as `kind`, and the answer is noted
-/// as taken from the cache
-fn serve_stale(
+/// as taken from the cache. Every stale answer goes out through here: from the cache lookup,
+/// when the wait for the upstream runs out, after an upstream failure, and on the fast path
+pub(crate) fn serve_stale(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
     hit: &Arc<CacheEntry>,
@@ -401,6 +374,23 @@ fn serve_stale(
     response: &mut ResponseInfo,
 ) -> Bytes {
     let settings = &context.state.pipeline.settings;
+    debug!(
+        event = "serve_stale",
+        kind = ?kind,
+        qname = %context.qname,
+        qtype = ?context.qtype,
+        rcode = ?hit.rcode,
+        original_ttl = hit.original_ttl,
+        stale_for_secs = hit
+            .inserted_at
+            .elapsed()
+            .as_secs()
+            .saturating_sub(u64::from(hit.original_ttl)),
+        request_ms = context.start.elapsed().as_millis() as u64,
+        client_ip = %context.peer.ip(),
+        pipeline = %context.pipeline_id,
+        "RFC 8767: serving a stale answer"
+    );
     let resp_bytes = served_from_cache(
         hit,
         context.tx_id,
@@ -421,15 +411,7 @@ fn serve_stale(
         context.requester,
     );
     if let Some((observer, ctx)) = context.observed {
-        observer.cache_hit(
-            ctx,
-            &CacheHit {
-                kind,
-                remaining_ttl: None,
-                original_ttl: Some(Duration::from_secs(hit.original_ttl as u64)),
-                source: cached_source(hit.upstream.as_deref()),
-            },
-        );
+        observer.cache_hit(ctx, &cache_hit_of(hit, kind, 0));
     }
     response.served_from_cache(hit);
     resp_bytes

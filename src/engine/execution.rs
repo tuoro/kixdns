@@ -28,7 +28,7 @@ use crate::observe::{
 use crate::proto_utils::parse_quick;
 
 use super::concurrency::PermitGuard;
-use super::observation::{ObservedRequest, cached_source, report_decision, report_rule_cache_hit};
+use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
 use super::response::{StaticAddresses, build_fast_static_response, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog};
 use super::rules::RuleCacheRecord;
@@ -208,12 +208,8 @@ fn next_request_id() -> u64 {
 /// What answered a request on the synchronous fast path, for observer reporting.
 /// 快速路径上应答请求的来源，用于观察者上报。
 enum FastPathAnswer<'a> {
-    /// Fresh response cache entry / 新鲜的响应缓存条目
-    Cache {
-        original_ttl: u32,
-        elapsed_secs: u32,
-        source: Option<&'a str>,
-    },
+    /// Response cache entry, fresh or served stale / 响应缓存条目，新鲜的或当作过期应答交出的
+    Cache(CacheHit<'a>),
     /// Compiled static rule matched directly / 编译后的静态规则直接命中
     StaticRule {
         rule: &'a str,
@@ -590,25 +586,10 @@ impl Engine {
             response: response.ok(),
             error: error.as_deref(),
         };
-        let hit = match answer {
-            FastPathAnswer::Cache {
-                original_ttl,
-                elapsed_secs,
-                source,
-            } => Some(CacheHit {
-                kind: CacheHitKind::Fresh,
-                remaining_ttl: Some(Duration::from_secs(
-                    original_ttl.saturating_sub(elapsed_secs) as u64,
-                )),
-                original_ttl: Some(Duration::from_secs(original_ttl as u64)),
-                source,
-            }),
-            _ => None,
-        };
         let taken_whole = match &answer {
-            FastPathAnswer::Cache { .. } => hit
-                .as_ref()
-                .is_some_and(|hit| observer.answered_from_cache(ctx, pipeline_id, hit, &outcome)),
+            FastPathAnswer::Cache(hit) => {
+                observer.answered_from_cache(ctx, pipeline_id, hit, &outcome)
+            }
             FastPathAnswer::StaticRule {
                 rule,
                 rcode,
@@ -654,11 +635,7 @@ impl Engine {
         observer.pipeline_selected(ctx, pipeline_id);
         observer.cache_lookup(ctx);
         match answer {
-            FastPathAnswer::Cache { .. } => {
-                if let Some(hit) = &hit {
-                    observer.cache_hit(ctx, hit);
-                }
-            }
+            FastPathAnswer::Cache(hit) => observer.cache_hit(ctx, &hit),
             FastPathAnswer::StaticRule {
                 rule,
                 rcode,
@@ -818,19 +795,56 @@ impl Engine {
                 flags: q.flags,
             },
         ) {
-            // Check if expired / 检查是否已过期
             let elapsed_secs = crate::proto_utils::saturating_u64_to_u32(
                 start.saturating_duration_since(hit.inserted_at).as_secs(),
             );
-            if elapsed_secs >= hit.original_ttl {
-                // An expired answer is left to the async path, whose lookup picks this
-                // same answer and decides: serve it stale, or drop it and forward.
-                // Dropping it here would let that lookup fall back to a wider, older
-                // answer the upstream no longer meant for this requester.
-                // 过期的应答留给异步路径：那里的查找选中的是同一份，由它决定是过期续用，还是
-                // 删掉后重新转发。在这里删掉，那次查找就会退到一份更宽、更旧的应答上，而上游
-                // 已不再把它给这个请求方。
-            } else {
+            let age = phases::age_of(&hit, u64::from(elapsed_secs), &cfg.settings);
+            // 现在就能交出的过期应答在这里交出，和查缓存一样（见 `phases::stale_at_once`）：留给异步路径的话，过载时
+            // 异步路径收不下，手上这份能用的应答就变成了 SERVFAIL
+            // A stale answer that may go out right now goes out here, as on the cache lookup
+            // (see `phases::stale_at_once`): left to the async path, under overload the async
+            // path takes no more, and the usable answer in hand turned into SERVFAIL
+            if age == phases::Age::Stale
+                && let Some(kind) = phases::stale_at_once(self, &cfg.settings, slot, &hit)
+            {
+                let context = phases::CacheLookupContext {
+                    state: &state,
+                    qname: qname_str,
+                    qtype,
+                    qclass,
+                    flags: q.flags,
+                    pipeline_id,
+                    slot,
+                    tx_id: q.tx_id,
+                    start,
+                    peer: &peer,
+                    requester,
+                    observed: None,
+                };
+                let mut log = response_log();
+                let reply = crate::proto_utils::reply_as_asked(
+                    phases::serve_stale(self, &context, &hit, &view, kind, &mut log.info),
+                    packet,
+                );
+                if let Some(observer) = observed {
+                    self.observe_fast_path(
+                        observer,
+                        &self.fast_path_context(start, peer, qname_str, qtype, qclass),
+                        pipeline_id,
+                        FastPathAnswer::Cache(phases::cache_hit_of(&hit, kind, elapsed_secs)),
+                        Ok(&reply),
+                    );
+                }
+                log.answered(&reply);
+                return Ok(Some(FastPathResponse::Direct(reply)));
+            }
+            // 其余过期的（不能再用的、要先等上游的）留给异步路径：那里的查找选中的是同一份，由它决定。在这里删掉，那次
+            // 查找就会退到一份更宽、更旧的应答上，而上游已不再把它给这个请求方
+            // Any other expired answer (of no further use, or waiting on the upstream first) is
+            // left to the async path, whose lookup picks this same answer and decides. Dropping
+            // it here would let that lookup fall back to a wider, older answer the upstream no
+            // longer meant for this requester
+            if age == phases::Age::Fresh {
                 // Cache background refresh: trigger async refresh when TTL < threshold percentage
                 // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新
                 // Only refresh cache entries that came from an upstream server
@@ -903,11 +917,11 @@ impl Engine {
                         observer,
                         &self.fast_path_context(start, peer, qname_str, qtype, qclass),
                         pipeline_id,
-                        FastPathAnswer::Cache {
-                            original_ttl: hit.original_ttl,
+                        FastPathAnswer::Cache(phases::cache_hit_of(
+                            &hit,
+                            CacheHitKind::Fresh,
                             elapsed_secs,
-                            source: cached_source(hit.upstream.as_deref()),
-                        },
+                        )),
                         Ok(&reply),
                     );
                 }
@@ -1229,20 +1243,6 @@ impl Engine {
                 if let Some(stale_bytes) =
                     phases::check_stale_cache_logged(self, lookup, kind, info)
                 {
-                    tracing::debug!(
-                        event = if refresh_ended {
-                            "serve_stale_after_refresh_failed"
-                        } else {
-                            "serve_stale_on_client_timeout"
-                        },
-                        qname = %lookup.qname,
-                        qtype = ?lookup.qtype,
-                        waited_ms = wait_start.elapsed().as_millis() as u64,
-                        configured_timeout_ms = settings.serve_stale_client_timeout_ms,
-                        client_ip = %lookup.peer.ip(),
-                        pipeline = %lookup.pipeline_id,
-                        "RFC 8767: serving stale"
-                    );
                     return Some(stale_bytes);
                 }
                 // No stale entry left in the cache - fall through to normal processing
