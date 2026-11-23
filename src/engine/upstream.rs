@@ -191,36 +191,14 @@ fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Trans
     }
 }
 
-/// 配置里经 TCP 问的上游地址（去掉前缀），启动时据此预热连接：请求阶段、命中后和未命中时三类动作里的转发都算，逗号分开的
-/// 各算一个；走哪种传输和真正转发时一样，地址前缀优先于规则写的 `transport`（见 [`parse_upstream_addr`]），`tcp` 和
-/// `tcp_udp` 算 TCP
-/// The addresses (short of their prefix) of the upstreams asked over TCP in the configuration,
-/// whose connections are warmed up at startup: forwards among the request-phase, on-match and
-/// on-miss actions all count, each of a comma-separated list on its own; the transport is the one
-/// a forward really takes, an address prefix coming before the rule's `transport` (see
-/// [`parse_upstream_addr`]), and `tcp` and `tcp_udp` count as TCP
+/// `cfg` 里经 TCP 问的上游地址（去掉前缀，见 [`upstreams`]），启动时据此预热连接；`tcp` 和 `tcp_udp` 算 TCP
+/// The addresses (short of their prefix, see [`upstreams`]) of the upstreams `cfg` asks over
+/// TCP, whose connections are warmed up at startup; `tcp` and `tcp_udp` count as TCP
 pub(crate) fn tcp_upstreams(
     cfg: &crate::matcher::RuntimePipelineConfig,
 ) -> rustc_hash::FxHashSet<String> {
-    cfg.pipelines
-        .iter()
-        .flat_map(|p| &p.rules)
-        .flat_map(crate::matcher::RuntimeRule::all_actions)
-        .filter_map(|action| match action {
-            crate::config::Action::Forward {
-                upstream: Some(upstream),
-                transport,
-                ..
-            } => Some((upstream, transport.unwrap_or(Transport::Udp))),
-            _ => None,
-        })
-        .flat_map(|(upstream, transport)| {
-            upstream
-                .split(',')
-                .map(str::trim)
-                .filter(|member| !member.is_empty())
-                .map(move |member| parse_upstream_addr(member, transport))
-        })
+    upstreams(cfg)
+        .into_iter()
         .filter(|(_, transport)| matches!(transport, Transport::Tcp | Transport::TcpUdp))
         .map(|(address, _)| address.to_owned())
         .collect()
@@ -1430,12 +1408,13 @@ mod tests {
 
     /// 预热收集请求阶段、命中后和未命中时三类动作里用 TCP（含 tcp_udp）转发的上游，逗号分开的各算
     /// 一个，去掉协议前缀；UDP 的不算。只写了 `tcp://` 前缀、没写 `transport` 的也走 TCP，也算：以前只看
-    /// `transport`，它们不预热
+    /// `transport`，它们不预热。没写上游、经 TCP 转发的是经 TCP 问默认上游，也算：以前只看写了的上游
     /// Warm-up collects the upstreams forwarded to over TCP (tcp_udp included) by the
     /// request-phase, on-match and on-miss actions, each of a comma-separated list on its
     /// own, protocol prefix removed; UDP ones do not count. One written with a `tcp://`
     /// prefix and no `transport` goes over TCP and counts too: only `transport` used to be
-    /// looked at, and such upstreams were not warmed up
+    /// looked at, and such upstreams were not warmed up. A forward over TCP naming no upstream
+    /// asks the default one over TCP and counts too: only upstreams written out used to
     #[test]
     fn warm_up_collects_the_tcp_upstreams_of_every_action_phase() {
         let config = crate::matcher::RuntimePipelineConfig::from_config(
@@ -1446,7 +1425,8 @@ mod tests {
                 "matchers": [{ "type": "any" }],
                 "actions": [
                     { "type": "forward", "upstream": "192.0.2.1:53, 192.0.2.2:53", "transport": "tcp" },
-                    { "type": "forward", "upstream": "192.0.2.9:53", "transport": "udp" }
+                    { "type": "forward", "upstream": "192.0.2.9:53", "transport": "udp" },
+                    { "type": "forward", "transport": "tcp" }
                 ],
                 "response_matchers": [{ "type": "upstream_equals", "value": "192.0.2.1:53" }],
                 "response_actions_on_match": [
@@ -1467,6 +1447,7 @@ mod tests {
         assert_eq!(
             upstreams,
             [
+                "127.0.0.1:9",
                 "192.0.2.1:53",
                 "192.0.2.2:53",
                 "192.0.2.3:53",
