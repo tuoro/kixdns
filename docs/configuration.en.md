@@ -256,7 +256,7 @@ The Forward action has an optional transport field:
 | dot | DNS over TLS |
 | doq | DNS over QUIC |
 
-The upstream field accepts a string, a comma-separated string, or a JSON string array. Multiple upstreams are queried concurrently and the first accepted response is returned. A response with SERVFAIL or REFUSED is not accepted when choosing among multiple upstreams; when none is accepted, the first of them still goes to the answer check (see Pipelines and rules).
+The upstream field accepts a string, a comma-separated string, or a JSON string array. Multiple upstreams are queried concurrently and the first accepted response is returned. A response with SERVFAIL or REFUSED is not accepted when choosing among multiple upstreams; a truncated response (TC set, with TCP not fetching the whole one either) is held back and returned only when no other upstream gives a whole response, the client then turning to TCP itself on seeing TC; with neither, the first failure response received still goes to the answer check (see Pipelines and rules).
 
 The following prefixes override the transport field:
 

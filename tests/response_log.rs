@@ -335,18 +335,17 @@ async fn cancelled_request_does_not_invent_a_response_or_rcode() {
     assert!(finished[0].get("rcode").is_none());
 }
 
-fn truncated(request: &Message) -> Vec<u8> {
+/// The answer to `request`, with TC set when `truncated`
+fn answer(request: &[u8], truncated: bool) -> Vec<u8> {
+    let request = Message::from_bytes(request).unwrap();
     let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
     response.add_query(request.queries[0].clone());
-    response.metadata.truncation = true;
+    response.metadata.truncation = truncated;
     response.to_vec().unwrap()
 }
 
-/// UDP always answers TC=1; the Nth TCP request (0-based) gets `tcp(n, request)`.
-async fn truncating_upstream(
-    tcp: fn(usize, &[u8]) -> Vec<u8>,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+/// UDP always answers TC=1, TCP in full.
+async fn truncating_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // UDP first, and another pair when the TCP port of the same number is taken
     // already (by another test's connection, say), so the shared-port bind does not flake.
@@ -369,19 +368,16 @@ async fn truncating_upstream(
         tokio::spawn(async move {
             let mut buf = [0; 1500];
             while let Ok((n, peer)) = udp.recv_from(&mut buf).await {
-                let request = Message::from_bytes(&buf[..n]).unwrap();
-                let _ = udp.send_to(&truncated(&request), peer).await;
+                let _ = udp.send_to(&answer(&buf[..n], true), peer).await;
             }
         });
-        let seen = Arc::new(AtomicUsize::new(0));
         while let Ok((mut stream, _)) = listener.accept().await {
-            let seen = seen.clone();
             tokio::spawn(async move {
                 let mut len = [0; 2];
                 while stream.read_exact(&mut len).await.is_ok() {
                     let mut request = vec![0; u16::from_be_bytes(len) as usize];
                     stream.read_exact(&mut request).await.unwrap();
-                    let body = tcp(seen.fetch_add(1, Ordering::SeqCst), &request);
+                    let body = answer(&request, false);
                     let mut out = (body.len() as u16).to_be_bytes().to_vec();
                     out.extend_from_slice(&body);
                     let _ = stream.write_all(&out).await;
@@ -406,13 +402,7 @@ fn udp_forwarder(addr: SocketAddr) -> Engine {
 async fn tcp_fallback_answer_is_labelled_with_the_transport_that_carried_it() {
     let log = Log::default();
     let _capture = log.capture();
-    let (addr, task) = truncating_upstream(|_, request| {
-        let request = Message::from_bytes(request).unwrap();
-        let mut response = Message::new(request.metadata.id, MessageType::Response, OpCode::Query);
-        response.add_query(request.queries[0].clone());
-        response.to_vec().unwrap()
-    })
-    .await;
+    let (addr, task) = truncating_upstream().await;
     udp_forwarder(addr)
         .handle_packet(&query(), peer())
         .await
@@ -421,38 +411,6 @@ async fn tcp_fallback_answer_is_labelled_with_the_transport_that_carried_it() {
     let responses = log.responses();
     assert_eq!(responses.len(), 1, "{responses:?}");
     assert_eq!(responses[0]["upstream"], format!("tcp:{addr}"));
-}
-
-#[tokio::test]
-async fn unparsable_answer_after_a_tcp_retry_is_one_servfail_response() {
-    let log = Log::default();
-    let _capture = log.capture();
-    // The first TCP answer is truncated again, so the engine retries over TCP.
-    // The second, non-DNS body fails to parse like an unparsable answer on any
-    // other path: the client gets SERVFAIL, counted as one response. The retry
-    // used to relay the body as-is, without parsing it.
-    let (addr, task) = truncating_upstream(|n, request| {
-        if n == 0 {
-            truncated(&Message::from_bytes(request).unwrap())
-        } else {
-            let mut body = request[..2].to_vec();
-            body.extend_from_slice(&[0xff; 11]);
-            body
-        }
-    })
-    .await;
-    let answer = udp_forwarder(addr)
-        .handle_packet(&query(), peer())
-        .await
-        .unwrap();
-    task.abort();
-    let answer = Message::from_bytes(&answer).expect("the client receives a DNS answer");
-    assert_eq!(answer.metadata.response_code, ResponseCode::ServFail);
-    assert!(log.events("dns_request_finished").is_empty());
-    let responses = log.responses();
-    assert_eq!(responses.len(), 1, "{responses:?}");
-    assert_eq!(responses[0]["status"], "completed");
-    assert_eq!(responses[0]["rcode"], "ServFail");
 }
 
 /// 响应跳转路径上到了跳转上限，回的是本地给的 SERVFAIL，日志的 upstream 记成 "static"，和请求

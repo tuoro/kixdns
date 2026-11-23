@@ -551,9 +551,11 @@ pub struct UpstreamResult<'a> {
 pub enum UpstreamOutcome {
     /// A usable response was received.
     Success,
-    /// A response was received but discarded: a failure reply (see
-    /// `engine::upstream::is_failure_reply`) while other upstreams of a concurrent set were
-    /// still pending.
+    /// A response of a concurrent set was received and set aside for the other upstreams'
+    /// answers: a failure reply (see `engine::upstream::is_failure_reply`), or a truncated
+    /// answer. The first of either still counts when no upstream of the set gives a usable
+    /// response: a truncated answer then goes back as the answer, a failure reply to the
+    /// answer check.
     Rejected,
     /// The attempt failed (timeout, transport error, task failure).
     Error,
