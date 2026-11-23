@@ -573,7 +573,7 @@ impl RuntimePipelineConfig {
                 .flat_map(|rule| &rule.matchers)
                 .any(|m| needs(&m.matcher))
         };
-        Ok(Self {
+        let mut runtime = Self {
             settings: cfg.settings,
             select_needs_geosite: select_needs(RuntimePipelineSelectorMatcher::needs_geosite),
             select_needs_geoip: select_needs(RuntimePipelineSelectorMatcher::needs_geoip),
@@ -581,7 +581,14 @@ impl RuntimePipelineConfig {
             pipelines,
             pipeline_id_index,
             warnings,
-        })
+        };
+        let geo = config::geo_tags_without_data(
+            &runtime.settings,
+            crate::engine::utils::extract_geosite_tags_from_config(&runtime),
+            &crate::engine::utils::extract_geoip_tags_from_config(&runtime),
+        );
+        runtime.warnings.extend(geo);
+        Ok(runtime)
     }
 
     pub fn min_ttl(&self) -> std::time::Duration {
@@ -1097,6 +1104,60 @@ mod tests {
         };
         assert_eq!(matched("not"), [true, false, false]);
         assert_eq!(matched("and_not"), matched("not"));
+    }
+
+    /// 规则用到、却没配可读的数据的 Geo 标签各算一条 warnings：没写 geosite_data_paths 时的 GeoSite 标签，没写 geoip_dat_path
+    /// 时 MMDB 也答不了的 GeoIP 标签；配了数据的不算。以前一个数据文件都没配时什么都不说，用它们的规则悄悄地从不按数据判断
+    /// The Geo tags rules use with no data configured to read them from make one warning for
+    /// each kind: GeoSite tags without geosite_data_paths, and without geoip_dat_path the GeoIP
+    /// tags the MMDB cannot answer either; tags with data do not count. With no data file
+    /// configured nothing used to be said, and rules using them quietly never judged by any data
+    #[test]
+    fn geo_tags_without_data_are_warned_about() {
+        let warnings = |settings: serde_json::Value| {
+            let mut all = serde_json::json!({ "default_upstream": "127.0.0.1:9" });
+            all.as_object_mut()
+                .unwrap()
+                .extend(settings.as_object().unwrap().clone());
+            runtime_of(serde_json::json!({
+                "settings": all,
+                "pipeline_select": [{
+                    "pipeline": "main",
+                    "matchers": [{ "type": "geo_site", "value": "ads" }]
+                }],
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "geoip_country", "country_codes": ["CN", "cloudflare"] }],
+                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                    "response_matchers": [{ "type": "response_request_domain_geo_site_not", "value": "cn" }],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }] }]
+            }))
+            .expect("build runtime config")
+            .warnings
+        };
+        let geosite = "GeoSite tags ads, cn have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does";
+        assert_eq!(
+            warnings(serde_json::json!({})),
+            [
+                geosite,
+                "GeoIP tags CLOUDFLARE, CN have no data to match against: settings.geoip_dat_path is not set and neither is settings.geoip_db_path, so geoip_country never matches them"
+            ]
+        );
+        assert_eq!(
+            warnings(serde_json::json!({ "geoip_db_path": "/data/country.mmdb" })),
+            [
+                geosite,
+                "GeoIP tags CLOUDFLARE have no data to match against: settings.geoip_dat_path is not set, and settings.geoip_db_path answers two-letter country codes alone, so geoip_country never matches them"
+            ]
+        );
+        assert!(
+            warnings(serde_json::json!({
+                "geoip_dat_path": "/data/geoip.dat",
+                "geosite_data_paths": ["/data/geosite.dat"]
+            }))
+            .is_empty()
+        );
     }
 
     /// 按 JSON 建运行时配置 / A runtime configuration built from JSON
