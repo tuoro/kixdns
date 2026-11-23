@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::engine::{Engine, FastPathResponse, engine_helpers, write_cache_hit};
+use crate::engine::{Engine, OnTheSpot, engine_helpers};
 use crate::observe::ClientTransport;
 use crate::proto_utils::MAX_QUERY_LEN;
 use crate::watcher;
@@ -519,24 +519,13 @@ fn extract_get_dns_param(query: &str) -> Option<Bytes> {
 /// 处理 DNS wire 报文，返回响应 bytes
 /// 完全复用 Engine 的 handle_packet_fast 快速路径 + handle_packet 完整路径
 async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> Bytes {
-    let pre_parsed = match engine.handle_packet_fast(packet, peer) {
-        Ok(Some(FastPathResponse::Direct(bytes))) => return bytes,
-        Ok(Some(FastPathResponse::CacheHit {
-            cached,
-            tx_id,
-            elapsed_secs,
-        })) => {
-            let mut answer = bytes::BytesMut::new();
-            write_cache_hit(&mut answer, &cached, tx_id, elapsed_secs);
-            return answer.freeze();
-        }
-        Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => Some(pre_parsed),
-        // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
-        Ok(None) => None,
-        Err(error) => {
-            engine.log_fast_path_error(&error);
-            return empty_dns_response(packet);
-        }
+    let mut answer = bytes::BytesMut::new();
+    let pre_parsed = match engine.on_the_spot(packet, peer, &mut answer) {
+        OnTheSpot::Answered => return answer.freeze(),
+        OnTheSpot::Forward(pre_parsed) => pre_parsed,
+        // 失败应答也构造不出：HTTP 请求总得有个回应（见 `empty_dns_response`）/ Not even a failure answer
+        // can be built: an HTTP request has to be answered (see `empty_dns_response`)
+        OnTheSpot::Unanswered => return engine_helpers::build_servfail_response_from_wire(packet),
     };
     let Some(_permit) = engine.query_permit(None, peer.ip()) else {
         return empty_dns_response(packet);

@@ -244,7 +244,7 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 use kixdns::config::{DohListenerConfig, ListenerConfig, load_config_with_source};
 use kixdns::engine::concurrency::QUEUE_TARGET;
 use kixdns::engine::fair_queue::{Device, FairQueue};
-use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, write_cache_hit};
+use kixdns::engine::{Engine, OnTheSpot, PreParsedData, engine_helpers};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{ClientTransport, EngineObserver, TracingObserver};
 use kixdns::panel::PanelMetrics;
@@ -1563,39 +1563,16 @@ impl<'a> UdpAnswering<'a> {
             self.request_count = 0;
             self.shrink_buffer_if_overflowing();
         }
-        // ✅ 优化：使用 handle_packet_fast 避免重复解析 / ✅ Optimization: Use handle_packet_fast to avoid re-parsing
-        match self.engine.handle_packet_fast(packet, peer) {
-            Ok(Some(FastPathResponse::Direct(bytes))) => {
-                // 已包含正确 TXID / Already contains correct TXID
-                reply.clear();
-                reply.extend_from_slice(&bytes);
-            }
-            Ok(Some(FastPathResponse::CacheHit {
-                cached,
-                tx_id,
-                elapsed_secs,
-            })) => write_cache_hit(reply, &cached, tx_id, elapsed_secs),
-            Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
-                // 缓存未命中，使用预解析的数据避免重复解析 / Cache miss, use pre-parsed data to avoid re-parsing
+        match self.engine.on_the_spot(packet, peer, reply) {
+            OnTheSpot::Answered => {}
+            // 要等上游的放进它自己的任务，带着快速路径解析出的内容 / One that waits on an upstream goes to
+            // its own task, with what the fast path parsed
+            OnTheSpot::Forward(pre_parsed) => {
                 let packet = Bytes::copy_from_slice(packet);
-                self.refused |= !spawn_udp_answer(self, packet, to, Some(pre_parsed));
+                self.refused |= !spawn_udp_answer(self, packet, to, pre_parsed);
                 return false;
             }
-            Ok(None) => {
-                // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
-                let packet = Bytes::copy_from_slice(packet);
-                self.refused |= !spawn_udp_answer(self, packet, to, None);
-                return false;
-            }
-            Err(error) => {
-                self.engine.log_fast_path_error(&error);
-                let Some(failure) = engine_helpers::try_build_listener_failure_from_wire(packet)
-                else {
-                    return false;
-                };
-                reply.clear();
-                reply.extend_from_slice(&failure);
-            }
+            OnTheSpot::Unanswered => return false,
         }
         // 截断超限响应，避免 UDP 报文超过客户端声明上限 / Truncate to the client's advertised UDP limit
         if let Some(truncated) = truncate_udp_response(packet, reply) {
@@ -2329,8 +2306,9 @@ async fn serve_tcp_conn(
     // Answers made on the spot, with their length prefixes, not yet written; written in one go
     // before the next read
     let mut answers = bytes::BytesMut::new();
-    // 复用的缓冲：缓存命中时在这里改 TTL 和 TXID / Reused buffer where a cache hit gets its TTLs and TXID patched
-    let mut hit = bytes::BytesMut::new();
+    // 复用的缓冲：快速路径当场答的写在这里（见 `Engine::on_the_spot`）/ Reused buffer the fast path writes
+    // what it answers on the spot to (see `Engine::on_the_spot`)
+    let mut spot = bytes::BytesMut::new();
     // 正在等的是不是正文、等到什么时候：长度前缀和正文各有 read_timeout
     // Whether a body is being waited for, and until when: the length prefix and the body
     // each get read_timeout
@@ -2360,34 +2338,13 @@ async fn serve_tcp_conn(
                     None => break 'connection,
                 }
             }
-            // ✅ 优化：使用 handle_packet_fast 进行快速路径检查 / ✅ Optimization: Use handle_packet_fast for fast path check
-            let async_needed = match engine.handle_packet_fast(&packet_bytes, peer) {
-                Ok(Some(FastPathResponse::Direct(bytes))) => {
-                    queue_tcp_answer(&mut answers, &bytes);
+            let async_needed = match engine.on_the_spot(&packet_bytes, peer, &mut spot) {
+                OnTheSpot::Answered => {
+                    queue_tcp_answer(&mut answers, &spot);
                     None
                 }
-                Ok(Some(FastPathResponse::CacheHit {
-                    cached,
-                    tx_id,
-                    elapsed_secs,
-                })) => {
-                    write_cache_hit(&mut hit, &cached, tx_id, elapsed_secs);
-                    queue_tcp_answer(&mut answers, &hit);
-                    None
-                }
-                // 缓存未命中：使用预解析数据避免重复解析 / Cache miss: use pre-parsed data to avoid re-parsing
-                Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => Some(Some(pre_parsed)),
-                // 快速解析失败，回退到完整处理 / Fast parse failed, fallback to full processing
-                Ok(None) => Some(None),
-                Err(error) => {
-                    engine.log_fast_path_error(&error);
-                    if let Some(response) =
-                        engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
-                    {
-                        queue_tcp_answer(&mut answers, &response);
-                    }
-                    None
-                }
+                OnTheSpot::Forward(pre_parsed) => Some(pre_parsed),
+                OnTheSpot::Unanswered => None,
             };
             if answers.len() >= TCP_ANSWERS_FLUSH {
                 write_tcp_answers(&writer, &mut answers).await;
