@@ -60,8 +60,6 @@ pub struct Engine {
     /// One `Arc` per record: taking one touches a single reference count, so cores reading the same record
     /// over and over do not take turns on several
     pub(crate) rule_cache: Arc<CacheStore<Arc<RuleCacheRecord>>>,
-    // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
-    pub request_id_counter: Arc<AtomicU64>,
     /// In-flight request deduplication map using tokio::watch for lock-free concurrent waiting
     /// 使用 tokio::watch 实现无锁并发等待的进行中请求去重 map
     /// Key: the hash of the question asked (see `InflightQuestion::key`)
@@ -277,7 +275,6 @@ impl Engine {
             running_settings,
             reload_lock: Arc::new(Mutex::new(geo_sources)),
             rule_cache,
-            request_id_counter: Arc::new(AtomicU64::new(1)),
             // DashMap configuration: shard count and initial capacity
             // If dashmap_shards is 0, use DashMap default (num_cpus * 4)
             // More shards = less lock contention but more memory overhead
@@ -327,11 +324,6 @@ impl Engine {
                 Some(rest) => Op::Put(Arc::new(rest)),
             },
         });
-    }
-
-    /// 从槽位 `slot` 去掉这一份应答 / Remove this one answer from slot `slot`
-    pub(crate) fn cache_invalidate(&self, slot: u64, entry: &Arc<CacheEntry>) {
-        self.cache_remove(slot, |cached| std::ptr::eq(cached, entry.as_ref()));
     }
 
     /// 把槽位 `slot` 里的 `old` 这一份换成 `new`；`old` 已经不在（被取代或去掉）时什么都不做。

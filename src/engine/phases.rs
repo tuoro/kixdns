@@ -5,7 +5,7 @@ use crate::config::{Action, Transport};
 use crate::ecs_scope::{EcsReach, EcsView, ForwardEcs};
 use crate::engine::execution::{Request, Route};
 use crate::engine::observation::{Observed, cached_source, report_response_rule};
-use crate::engine::refresh::{RefreshCheck, RefreshTarget};
+use crate::engine::refresh::RefreshTarget;
 use crate::engine::response::extract_ttl;
 use crate::engine::response_log::{ResponseInfo, Source};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
@@ -46,12 +46,12 @@ pub enum ForwardResult {
         answer_ttl: u32,
     },
     /// 响应动作跳到 `pipeline`：请求在那里接着走规则，转发照原样发出这次转发发出的 `packet`，它带的 ECS 是 `carried`；应答
-    /// 照旧缓存在跳转前这个 pipeline 的键下（见 `handle_packet_internal`）。这次转发登记的条目留给请求（见 `Route::held_inflight`），
-    /// 等它拿到最终的应答再交出去
+    /// 照旧缓存在跳转前这个 pipeline 的键下（见 `Route::jumped`、`Route::key_pipeline`）。这次转发登记的条目留给请求（见
+    /// `Route::held_inflight`），等它拿到最终的应答再交出去
     /// A response action jumps to `pipeline`: the request goes on with the rules there, its
     /// forwards sending `packet`, what this forward sent, as it is, with `carried` as its ECS;
     /// answers are still cached under the key of this pipeline, the one jumped from (see
-    /// `handle_packet_internal`). The entry this forward registered stays with the request (see
+    /// `Route::jumped`, `Route::key_pipeline`). The entry this forward registered stays with the request (see
     /// `Route::held_inflight`) and is handed the final answer. `answer_ttl` as on Continue
     Jump {
         pipeline: Arc<str>,
@@ -209,9 +209,11 @@ fn cached_hit(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
 ) -> Option<(Arc<CacheEntry>, u64, Age)> {
-    // 缓存只去掉存了 cache_max_ttl 以上的应答，应答自己的 TTL 到没到在这里判断
-    // The cache only drops answers stored cache_max_ttl or longer ago; whether the answer's own
-    // TTL ran out is decided here
+    // 槽位里的应答全都不能再用了，缓存才把整个槽位清掉；往槽位里写的时候顺带去掉不能再用的（见 `CacheSlot::with`）。
+    // 所以拿到的这份可能已经不能再用，现在算什么在这里判断
+    // The cache clears a slot only once none of its answers is of use any more, and drops
+    // those of no further use from a slot as it writes to it (see `CacheSlot::with`). So the
+    // one got here may be of no use already, and what it counts as now is decided here
     let now = Instant::now();
     let hit = engine.cache_get(
         context.slot,
@@ -223,19 +225,19 @@ fn cached_hit(
     Some((hit, elapsed_secs, age))
 }
 
-/// 同 [`cached_hit`]，只给新鲜的、过期还能用的；不能再用的顺手去掉
-/// As [`cached_hit`], giving only one fresh, or stale and still of use; one of no further
-/// use goes
+/// 同 [`cached_hit`]，只给新鲜的、过期还能用的。不能再用的留在原处，等重新取回的应答写进来时取代它，或者随槽位清扫：
+/// 查缓存不为它拿写锁；它在的时候，这个请求方的查找也不退到一份更宽、更旧的应答上，和快速路径一样（见
+/// `CacheSlot::select`）。以前查到就删掉，紧跟着来的请求就拿到了别的子网取来的那份
+/// As [`cached_hit`], giving only one fresh, or stale and still of use. One of no further use
+/// stays where it is, until the answer fetched again replaces it or the slot is swept: a lookup
+/// takes no write lock for it, and while it is there this requester's lookups do not fall back
+/// to a wider, older answer, as on the fast path (see `CacheSlot::select`). It used to be
+/// dropped on being found, and the request right after got the answer another subnet fetched
 fn usable_hit(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
 ) -> Option<(Arc<CacheEntry>, u64, Age)> {
-    let (hit, elapsed_secs, age) = cached_hit(engine, context)?;
-    if age == Age::Spent {
-        engine.cache_invalidate(context.slot, &hit);
-        return None;
-    }
-    Some((hit, elapsed_secs, age))
+    cached_hit(engine, context).filter(|&(_, _, age)| age != Age::Spent)
 }
 
 /// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
@@ -310,19 +312,7 @@ fn serve_fresh(
     let elapsed = crate::proto_utils::saturating_u64_to_u32(elapsed_secs);
     let resp_bytes = served_from_cache(hit, context.tx_id, &view, ServedTtl::Elapsed(elapsed));
 
-    // Trigger a background refresh before returning the cached answer / 返回缓存的应答之前，看要不要发起后台刷新
-    let refresh = RefreshCheck::of(&context.state.pipeline.settings, hit, elapsed);
-    if let Some(RefreshCheck { remaining_ttl, .. }) = refresh.filter(RefreshCheck::due) {
-        debug!(
-            event = "cache_background_refresh_trigger",
-            qname = %context.qname,
-            qtype = ?context.qtype,
-            remaining_ttl = remaining_ttl,
-            original_ttl = hit.original_ttl,
-            "Triggering background refresh for cached entry"
-        );
-        engine.spawn_background_refresh(context.state, hit, context.slot, context.requester);
-    }
+    engine.refresh_if_due(context.state, hit, elapsed, context.slot, context.requester);
 
     response.served_from_cache(hit);
     if let Some((observer, ctx)) = context.observed {

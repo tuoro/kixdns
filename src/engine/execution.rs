@@ -844,47 +844,7 @@ impl Engine {
             // it here would let that lookup fall back to a wider, older answer the upstream no
             // longer meant for this requester
             if age == phases::Age::Fresh {
-                // Cache background refresh: trigger async refresh when TTL < threshold percentage
-                // 缓存后台刷新：当TTL < 阈值百分比时，触发异步刷新
-                // Only refresh cache entries that came from an upstream server
-                // 只有来自 upstream 的缓存条目才进行预取刷新
-                if let Some(check) = RefreshCheck::of(&cfg.settings, &hit, elapsed_secs) {
-                    let RefreshCheck {
-                        remaining_ttl,
-                        threshold,
-                    } = check;
-                    // 已经在刷新的由 spawn_background_refresh 认出来（见 `RefreshingGuard`）
-                    // One already being refreshed is told by spawn_background_refresh (see
-                    // `RefreshingGuard`)
-                    let due = check.due();
-
-                    tracing::debug!(
-                        original_ttl = hit.original_ttl,
-                        elapsed_secs = elapsed_secs,
-                        remaining_ttl = remaining_ttl,
-                        threshold_percent = cfg.settings.cache_refresh_threshold_percent,
-                        threshold_value = threshold,
-                        min_ttl = cfg.settings.cache_refresh_min_ttl,
-                        should_trigger = due,
-                        upstream = ?hit.upstream,
-                        qname = %q.qname,
-                        "cache background refresh check"
-                    );
-
-                    if due {
-                        // Trigger background refresh (async, don't block current request)
-                        // 触发后台刷新（异步，不阻塞当前请求）
-                        // Note: RefreshingGuard inside spawn_background_refresh will handle cleanup
-                        // 注意：spawn_background_refresh 内部的 RefreshingGuard 将处理清理
-                        tracing::debug!(
-                            qname = %qname_str,
-                            original_ttl = hit.original_ttl,
-                            remaining_ttl = remaining_ttl,
-                            "triggering background cache refresh"
-                        );
-                        self.spawn_background_refresh(&state, &hit, slot, requester);
-                    }
-                }
+                self.refresh_if_due(&state, &hit, elapsed_secs, slot, requester);
 
                 // Return current cache immediately, don't wait for refresh to complete
                 // 直接返回当前缓存，不等待刷新完成
@@ -1652,14 +1612,18 @@ impl Engine {
                             if background_refresh {
                                 return Err(e);
                             }
-                            // A rule continued (response_actions_on_match: [continue])
-                            // and the next Forward attempt failed. The client must
-                            // receive a definitive answer, never silence: DNS clients
-                            // treat a missing reply as TIMEOUT. Return SERVFAIL so the
-                            // stub resolver can retry (RFC 1035).
-                            // 规则 continue 后，下一条 Forward 查询失败。必须给客户端
-                            // 一个确定性的响应而非静默：DNS 客户端会把无响应视为
-                            // TIMEOUT。返回 SERVFAIL 以便 stub resolver 重试。
+                            // 这次转发没有以应答结束，以错误结束：上游的应答两种解析都读不了、响应动作要用的请求
+                            // 解析不了、响应动作里的转发被流控拦下，等等；有没有 continue 过都一样（上游失败本身
+                            // 已经在转发里化成了过期应答、SERVFAIL 或 miss 动作的结果）。客户端也得拿到确定的应答，
+                            // 不能没有回音：DNS 客户端把没有回音当超时。回 SERVFAIL，stub 解析器会重试（RFC 1035）
+                            // The forward ended in an error rather than an answer: an upstream reply
+                            // neither parser reads, a request the response actions need that cannot
+                            // be parsed, a response action's forward flow control kept back, and so
+                            // on, whether or not a rule continued before (an upstream failure itself
+                            // has become a stale answer, SERVFAIL or the miss actions' outcome within
+                            // the forward). The client must still get a definitive answer, never
+                            // silence: DNS clients treat a missing reply as a timeout. SERVFAIL lets
+                            // the stub resolver retry (RFC 1035)
                             // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：规则
                             // continue 以后还留着的条目现在放下，这个 SERVFAIL 不交给等在上面的别的请求；
                             // 也不逐个记警告，拦着的时候每秒可以有几万个
@@ -1678,10 +1642,10 @@ impl Engine {
                                 );
                             } else {
                                 crate::warn_sparse!(
-                                    event = "continue_reforward_failed",
+                                    event = "forward_failed",
                                     error = %e,
                                     rule = %rule_name,
-                                    "continue re-forward failed, returning SERVFAIL"
+                                    "forward failed, returning SERVFAIL"
                                 );
                             }
                             return request.servfail("parse request for SERVFAIL");
@@ -1690,6 +1654,36 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// 槽位 `slot` 里新鲜的 `renewed` 存了 `elapsed_secs` 秒，快到期了（见 `RefreshCheck`）就为它发起后台刷新；已经在刷新的
+    /// 由 `spawn_background_refresh` 认出来。查缓存和快速路径交出新鲜应答时都经这里
+    /// The fresh `renewed` in slot `slot` has been stored `elapsed_secs` seconds: once it is due
+    /// (see `RefreshCheck`) a background refresh is started for it, one already being refreshed
+    /// being told by `spawn_background_refresh`. The cache lookup and the fast path both go
+    /// through here when they serve a fresh answer
+    pub(crate) fn refresh_if_due(
+        &self,
+        state: &Arc<EngineInner>,
+        renewed: &Arc<CacheEntry>,
+        elapsed_secs: u32,
+        slot: u64,
+        requester: Requester,
+    ) {
+        let Some(check) = RefreshCheck::of(&state.pipeline.settings, renewed, elapsed_secs)
+            .filter(RefreshCheck::due)
+        else {
+            return;
+        };
+        tracing::debug!(
+            event = "cache_background_refresh_trigger",
+            qname = %renewed.qname,
+            qtype = ?hickory_proto::rr::RecordType::from(renewed.qtype),
+            remaining_ttl = check.remaining_ttl,
+            original_ttl = renewed.original_ttl,
+            "Triggering background refresh for cached entry"
+        );
+        self.spawn_background_refresh(state, renewed, slot, requester);
     }
 
     /// 为槽位 `slot` 里的 `renewed` 发起后台刷新，照 `requester` 的样子重放请求（见
@@ -1715,11 +1709,17 @@ impl Engine {
     ///
     /// Design: Use hickory-proto to ensure RFC compliance
     /// 设计：使用 hickory-proto 确保 RFC 合规性
-    /// - Generates valid TXID (not 0)
+    /// - Has TXID 0, which is what RFC 8484 section 4.1 asks of DoH. Its ID means nothing on
+    ///   the way: UDP and TCP give each query a random one of their own (RFC 5452 section
+    ///   9.2), DoQ 0 (RFC 9250 section 4.2.1), and over DoH HTTP pairs the answer with the
+    ///   query; each hands the answer back with the query's ID, and the answer goes to no
+    ///   client but into the cache, where its ID counts for nothing
     /// - Sets the query bits `flags` the replayed request had (RD, CD, DO), so its
     ///   answer is fetched and stored the same way
     /// - Encodes QNAME correctly
-    /// - 生成有效的 TXID（不是 0）
+    /// - TXID 为 0，RFC 8484 第 4.1 节要 DoH 这样发。它的 ID 一路上都没有意义：UDP、TCP 给每个查询换上自己随机取的
+    ///   （RFC 5452 第 9.2 节），DoQ 换成 0（RFC 9250 第 4.2.1 节），DoH 上 HTTP 把应答和查询配好对；交回应答时都换回
+    ///   查询的 ID，而应答不交给哪个客户端，只进缓存，ID 在那里没有意义
     /// - 带上被重放的请求的查询位 `flags`（RD、CD、DO），应答按同样的方式取回、存放
     /// - 正确编码 QNAME
     /// - Carries EDNS when `edns` is set, and the client's own ECS `ecs`, as the
@@ -1736,17 +1736,13 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         use hickory_proto::op::{Message, MessageType, Query};
 
-        // A TXID from the request counter, which wraps through 0 like any other value
-        // 从请求计数器取 TXID，回绕时和别的值一样会经过 0
-        let tx_id = self.request_id_counter.fetch_add(1, Ordering::Relaxed) as u16;
-
         // Build DNS query message
         // 构建 DNS 查询消息
         // hickory-proto 0.26: Message::new() defaults RD=false (was true in 0.24), so RD
         // is set from the replayed request.
         // hickory-proto 0.26: Message::new() 默认 RD=false（0.24 中为 true），所以 RD 按被重放的
         // 请求设置。
-        let mut msg = Message::new(tx_id, MessageType::Query, hickory_proto::op::OpCode::Query);
+        let mut msg = Message::new(0, MessageType::Query, hickory_proto::op::OpCode::Query);
         msg.metadata.recursion_desired = flags.recursion_desired();
         msg.metadata.checking_disabled = flags.checking_disabled();
 
@@ -5068,9 +5064,11 @@ mod tests {
 
         // The fast path leaves the expired entry to the async path's lookup, which a
         // listener runs next: that lookup picks the same entry and, with serve_stale
-        // off (build_test_engine), removes it before the request forwards
+        // off (build_test_engine), misses on it, leaving it for the answer the request
+        // forwards for to replace (see `phases::usable_hit`)
         // 快速路径把过期条目留给异步路径的查找（监听器接着就会走它）：那次查找选中同一条，
-        // serve_stale 关着（build_test_engine），在请求转发之前把它删掉
+        // serve_stale 关着（build_test_engine），不用它，把它留给请求转发取回的应答去取代（见
+        // `phases::usable_hit`）
         assert!(engine.cached(dedupe_hash).is_some());
         let state = engine.state.load_full();
         let requester = Requester {
@@ -5101,10 +5099,9 @@ mod tests {
             "an expired entry is not served"
         );
 
-        // Assert: Verify cache entry was invalidated (serve_stale disabled in build_test_engine)
         assert!(
-            engine.cached(dedupe_hash).is_none(),
-            "Cache entry should be removed after expiration check"
+            engine.cached(dedupe_hash).is_some(),
+            "the lookup leaves the expired entry in place"
         );
     }
 
@@ -5984,12 +5981,12 @@ mod tests {
         }
     }
 
-    /// 过期超过 serve_stale_expire_ttl 的应答不再当作 stale 提供：查缓存时删掉，上游失败时的兜底
-    /// 也不用它（但不删）；还在窗口里的两处都照常提供。`stale_entry` 过期了 5 秒
+    /// 过期超过 serve_stale_expire_ttl 的应答不再当作 stale 提供：查缓存、上游失败时的兜底都不用它，也都不删它，留给
+    /// 重新取回的应答去取代；还在窗口里的两处都照常提供。`stale_entry` 过期了 5 秒
     /// An answer expired for longer than serve_stale_expire_ttl is no longer served
-    /// stale: a lookup drops it, and the fallback after an upstream failure passes it by
-    /// (leaving it in place); one still within the window serves on both. `stale_entry`
-    /// expired 5 seconds ago
+    /// stale: a lookup and the fallback after an upstream failure both pass it by, leaving it
+    /// in place for the answer fetched again to replace; one still within the window serves on
+    /// both. `stale_entry` expired 5 seconds ago
     #[tokio::test]
     async fn a_stale_answer_past_the_expire_window_is_not_served() {
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
@@ -6019,10 +6016,9 @@ mod tests {
                 served,
                 "expire_ttl {expire_ttl}: the lookup"
             );
-            assert_eq!(
+            assert!(
                 engine.cached(slot).is_some(),
-                served,
-                "expire_ttl {expire_ttl}: the lookup drops an answer past the window"
+                "expire_ttl {expire_ttl}: the lookup leaves the entry"
             );
         }
     }
@@ -6064,11 +6060,11 @@ mod tests {
     }
 
     /// 失败应答（SERVFAIL、REFUSED、扩展 RCODE，见 `upstream::is_failure_reply`）过期以后不当作
-    /// stale 提供：查缓存时删掉，上游失败时的兜底也不用它；NOERROR 的照常留着、照常兜底
+    /// stale 提供：查缓存、上游失败时的兜底都不用它；NOERROR 的照常当作 stale 提供、照常兜底
     /// An expired failure reply (SERVFAIL, REFUSED, an extended RCODE, see
-    /// `upstream::is_failure_reply`) is never served stale: a lookup drops it and the
-    /// fallback after an upstream failure passes it by, while a NOERROR one stays and
-    /// serves as usual
+    /// `upstream::is_failure_reply`) is never served stale: a lookup and the fallback after an
+    /// upstream failure both pass it by, while a NOERROR one is served stale and serves the
+    /// fallback as usual
     #[tokio::test]
     async fn an_expired_failure_reply_is_never_served_stale() {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
@@ -6110,9 +6106,11 @@ mod tests {
                 served,
                 "{rcode}: the fallback"
             );
-            phases::check_cache_logged(&engine, &context, &mut Default::default());
             assert_eq!(
-                engine.cached(dedupe_hash).is_some(),
+                matches!(
+                    phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                    phases::Looked::Answered(_)
+                ),
                 served,
                 "{rcode}: the lookup"
             );

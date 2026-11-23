@@ -71,7 +71,11 @@ pub struct GlobalSettings {
     /// / Most answers the response cache holds (default 10000), one over 1 KB counting once per KB
     #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
-    /// 响应缓存里的应答最多存多久（秒，默认 86400） / Longest the response cache keeps an answer (seconds, default 86400)
+    /// 应答 TTL 的上限（秒，默认 86400）：上游回答里每条记录的 TTL、缓存把一份应答当作新鲜的时间都不超过它；过了 TTL
+    /// 还能当过期应答用的另外再留（见 `serve_stale_expire_ttl`）
+    /// The cap on an answer's TTL (seconds, default 86400): neither the TTL of any record in an
+    /// upstream answer nor how long the cache holds an answer fresh goes past it; one still of
+    /// use past its TTL is kept on beyond that (see `serve_stale_expire_ttl`)
     #[serde(default = "default_cache_max_ttl")]
     pub cache_max_ttl: u64,
     /// DashMap shard 数量（0=自动，默认 0）。更多 shards=更少锁竞争但更多内存开销 / DashMap shard count (0=auto, default 0). More shards=less lock contention but more memory overhead
