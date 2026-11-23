@@ -472,18 +472,23 @@ impl Engine {
         path: Option<&Path>,
         source: Option<&str>,
     ) {
+        let state = self.state.load();
+        // 照样生效、值得知道的写法（见 `config::warnings`），配置每生效一次各记一条
+        // What takes effect all the same yet is worth knowing (see `config::warnings`), each
+        // logged every time a configuration takes effect
+        for warning in &state.pipeline.warnings {
+            tracing::warn!(target = "config", %warning, "configuration warning");
+        }
         if let Some(observer) = &self.observer {
-            let restart_pending = self
-                .state
-                .load()
-                .pipeline
-                .settings
-                .restart_pending(&self.running_settings);
             observer.config_loaded(&ConfigLoaded {
                 path,
                 generation,
                 source,
-                restart_pending: &restart_pending,
+                restart_pending: &state
+                    .pipeline
+                    .settings
+                    .restart_pending(&self.running_settings),
+                warnings: &state.pipeline.warnings,
             });
         }
     }

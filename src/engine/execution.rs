@@ -4710,6 +4710,7 @@ mod tests {
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
+            warnings: Vec::new(),
         }
     }
 

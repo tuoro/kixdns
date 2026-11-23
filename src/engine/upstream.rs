@@ -1612,6 +1612,7 @@ mod tests {
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
+            warnings: Vec::new(),
         };
         Engine::new(runtime, "test".to_string()).expect("initialize test engine")
     }
@@ -1636,6 +1637,7 @@ mod tests {
                 pipeline_select: Vec::new(),
                 pipelines: Vec::new(),
                 pipeline_id_index: FxHashMap::default(),
+                warnings: Vec::new(),
             },
             "test".to_string(),
         )
@@ -2076,6 +2078,7 @@ mod tests {
                     pipeline_select: Vec::new(),
                     pipelines: Vec::new(),
                     pipeline_id_index: FxHashMap::default(),
+                    warnings: Vec::new(),
                 },
                 "test".to_string(),
             )

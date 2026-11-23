@@ -180,6 +180,12 @@ fn the_control_socket_answers_bodies_it_cannot_use_in_its_own_words() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        serde_json::json!({ "protocol_version": 1, "valid": true, "pipeline_count": 1, "rule_count": 1 })
+        serde_json::json!({
+            "protocol_version": 1,
+            "valid": true,
+            "pipeline_count": 1,
+            "rule_count": 1,
+            "warnings": []
+        })
     );
 }
