@@ -59,7 +59,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for up to this many milliseconds first, bounded by what is left of request_timeout_ms so the stale answer still goes out in time. When that refresh fails, the stale answer goes out at once instead of after the full wait. |
 | geoip_db_path | null | MaxMind MMDB path. |
 | geoip_dat_path | null | V2Ray GeoIP data path: either a protobuf `.dat` file or the compatible JSON format described below. |
-| geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. When several files declare one tag, the later file's is used. |
+| geosite_data_paths | [] | V2Ray GeoSite .dat or JSON paths; multiple files are accepted. When several files declare one tag, the later file's is used. Either format is read only for the tags rules use, and with none used the files are neither read nor watched. |
 
 geoip_auto_convert and geoip_filter_countries are retired: the engine never read them, and a configuration writing them loads as usual, with a warning at startup and on every reload; use convert-geo-ip with --filter for conversion-time filtering. The top-level background_refresh_rule is still read but has no effect: a background refresh replays the original request through its own rules. A configuration that has it loads as usual, with a warning at startup and on every reload; the entry can be removed.
 
