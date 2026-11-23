@@ -16,6 +16,9 @@ tokio-util = { version = "0.7", features = ["rt", "io"] }
 hickory-proto = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 配置里内核不读的键（拼错的、写在不对的层级上的）一个个找出来，见 config::problems
+# Finds each key a configuration writes that the kernel does not read (misspelt, or at the wrong level); see config::problems
+serde_ignored = "0.1"
 sha2 = "0.10"
 arc-swap = "1.8"
 tracing = "0.1"
