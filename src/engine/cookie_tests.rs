@@ -1,5 +1,6 @@
-//! DNS cookie（RFC 7873）只在相邻两跳之间有效：引擎层面的测试。
-//! DNS cookies (RFC 7873) hold between two neighbouring hops only: engine-level tests.
+//! DNS cookie（RFC 7873）和 edns-tcp-keepalive（RFC 7828）只在相邻两跳之间有效：引擎层面的测试。
+//! DNS cookies (RFC 7873) and edns-tcp-keepalive (RFC 7828) hold between two neighbouring hops
+//! only: engine-level tests.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -173,6 +174,75 @@ async fn a_cookie_the_upstream_adds_reaches_no_client() {
     assert_eq!(cookie_of(&second), None, "the cached answer carries none");
     assert!(
         second
+            .answers
+            .iter()
+            .any(|record| matches!(record.data, RData::A(_))),
+        "the answer itself is intact"
+    );
+}
+
+/// edns-tcp-keepalive 的选项代码（RFC 7828）/ The edns-tcp-keepalive option code (RFC 7828)
+const TCP_KEEPALIVE: u16 = 11;
+
+/// 消息带不带 edns-tcp-keepalive / Whether a message carries edns-tcp-keepalive
+fn has_keepalive(message: &Message) -> bool {
+    message
+        .edns
+        .as_ref()
+        .is_some_and(|edns| edns.options().get(EdnsCode::from(TCP_KEEPALIVE)).is_some())
+}
+
+/// edns-tcp-keepalive 说的是客户端和 KixDNS 之间那条 TCP 连接：查询带来的不转给上游（UDP 上不许带），上游在应答里说
+/// 的那条连接的空闲时限也不交给客户端。以前都原样转过去
+/// edns-tcp-keepalive speaks of the TCP connection between a client and KixDNS: the one a
+/// query brings goes to no upstream (it may not be sent over UDP), and the idle timeout an
+/// upstream gives in its answer, for its own connection, reaches no client. Both used to be
+/// passed on as they were
+#[tokio::test]
+async fn edns_tcp_keepalive_stays_on_its_own_hop() {
+    let upstream = support::upstream(|query| {
+        let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        resp.add_query(query.queries[0].clone());
+        resp.add_answer(Record::from_rdata(
+            query.queries[0].name().clone(),
+            300,
+            RData::A(A::new(192, 0, 2, 1)),
+        ));
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(TCP_KEEPALIVE, vec![0, 100]));
+        resp.edns = Some(edns);
+        vec![(Duration::ZERO, resp.to_vec().unwrap())]
+    })
+    .await;
+    let engine = engine(&upstream.address);
+    let mut request = Message::from_vec(&query(None)).unwrap();
+    let mut edns = Edns::new();
+    edns.set_max_payload(1232);
+    edns.options_mut()
+        .insert(EdnsOption::Unknown(TCP_KEEPALIVE, Vec::new()));
+    request.edns = Some(edns);
+    let bytes = support::ask(
+        &engine,
+        &request.to_vec().unwrap(),
+        "192.168.1.10:53000".parse().unwrap(),
+    )
+    .await;
+
+    let received = upstream.received();
+    assert_eq!(received.len(), 1);
+    assert!(
+        !has_keepalive(&received[0]),
+        "the query's keepalive stays here"
+    );
+    let reply = Message::from_bytes(&bytes).expect("parse the reply");
+    assert!(
+        !has_keepalive(&reply),
+        "the upstream's keepalive stays there"
+    );
+    assert!(
+        reply
             .answers
             .iter()
             .any(|record| matches!(record.data, RData::A(_))),

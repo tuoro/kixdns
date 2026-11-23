@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::engine::Engine;
 use crate::engine::test_support::{
-    answering_upstream, ask, ask_fast_path_first, counting_settings, first_a, peer,
+    Warnings, answering_upstream, ask, ask_fast_path_first, counting_settings, first_a, peer,
 };
 use crate::matcher::RuntimePipelineConfig;
 
@@ -114,4 +114,39 @@ async fn an_answer_written_before_the_forwards_is_what_the_rule_gives() {
         .await,
         [Some(UPSTREAM); 2]
     );
+}
+
+/// 合成一次的转发和一个 forward 一样，轮到它时才给出：写在前面的 log 先执行，每个查询都记下。以前合并的转发在执行动作之前就
+/// 给出，这样的规则 log 从不出声
+/// A merged forward is given when its turn comes, as a single forward is: a log written before
+/// it runs first and records every query. The merged forward used to be given before any action
+/// ran, and such a rule's log stayed silent
+#[tokio::test]
+async fn a_log_written_before_the_forwards_logs_every_query() {
+    let (warnings, _guard) = Warnings::capture();
+    let first = answering_upstream(UPSTREAM, 60).await;
+    let second = answering_upstream(UPSTREAM, 60).await;
+    let engine = engine_from(json!({
+        "settings": counting_settings(json!({})),
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "all", "matchers": [{ "type": "any" }],
+            "actions": [
+                { "type": "log", "level": "warn" },
+                { "type": "forward", "upstream": first.address },
+                { "type": "forward", "upstream": second.address }
+            ]
+        }]}]
+    }));
+    for name in ["one.test.", "two.test."] {
+        let mut query = Message::new(0x5b5b, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_str(name).unwrap(), RecordType::A));
+        let reply = ask(&engine, &query.to_vec().unwrap(), peer()).await;
+        assert_eq!(first_a(&reply), Some(UPSTREAM), "{name}");
+    }
+    let logged = warnings
+        .lines()
+        .iter()
+        .filter(|line| line.contains("matcher_log"))
+        .count();
+    assert_eq!(logged, 2);
 }

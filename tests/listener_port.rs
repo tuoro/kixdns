@@ -10,7 +10,6 @@
 #![cfg(target_os = "linux")]
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -21,9 +20,7 @@ use hickory_proto::rr::{Name, RecordType};
 mod common;
 use common::{Kernel, free_port};
 
-/// 跑真的程序，日志写进 `dir` 里的 kixdns.log；句柄上限提到顶，上游 socket 多的时候够用
-/// Runs the real binary, logging into kixdns.log in `dir`; the descriptor limit is raised to its top, enough
-/// for many upstream sockets
+/// 跑真的程序，日志写进 `dir` 里的 kixdns.log / Runs the real binary, logging into kixdns.log in `dir`
 fn start(dir: &Path, settings: serde_json::Value) -> Kernel {
     let config = dir.join("config.json");
     let mut full = serde_json::json!({
@@ -52,20 +49,6 @@ fn start(dir: &Path, settings: serde_json::Value) -> Kernel {
         .stdout(output.try_clone().unwrap())
         .stderr(output)
         .stdin(Stdio::null());
-    // SAFETY: getrlimit and setrlimit are async-signal-safe and touch only this process's limit
-    unsafe {
-        command.pre_exec(|| {
-            let mut limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-                limit.rlim_cur = limit.rlim_max;
-                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-            }
-            Ok(())
-        });
-    }
     Kernel(command.spawn().unwrap())
 }
 
@@ -122,43 +105,60 @@ fn until(kernel: &mut Kernel, check: impl Fn() -> bool) -> bool {
     }
 }
 
-/// 上游 socket 占掉系统分配范围的七成（句柄不够时少开一些），这时多数启动都会挑走范围里的监听口，如果它们先打开的话
-/// With upstream sockets filling seven tenths of the system's range (fewer if descriptors run short), most starts
-/// would hand them a listening port in that range, were they opened first
+/// 系统分配范围里只空出比最大的上游池多四分之一的端口，监听口是其中一个：上游 socket 要是先开，多半会挑走它
+/// With only a quarter more ports of the system's range free than the largest upstream pool, the listening
+/// port among them, upstream sockets would mostly take it, were they opened first
 #[test]
 fn a_listening_port_in_the_system_range_is_not_taken_by_upstream_sockets() {
     let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
-    let mut ports = range.split_whitespace().map(|port| port.parse::<u64>());
-    let (first, last) = (
-        ports.next().unwrap().unwrap(),
-        ports.next().unwrap().unwrap(),
-    );
+    let mut ports = range
+        .split_whitespace()
+        .map(|port| port.parse::<u16>().unwrap());
+    let range = ports.next().unwrap()..=ports.next().unwrap();
+    // 句柄上限提到顶，占端口要用；内核继承这个上限，上游 socket 也够用
+    // The descriptor limit raised to its top for holding ports; the kernel inherits it, enough for its
+    // upstream sockets
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: getrlimit only writes the struct it is handed
-    assert_eq!(
-        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
-        0
-    );
-    let upstream_sockets = ((last - first) * 7 / 10).min(limit.rlim_max.saturating_sub(1024));
+    // SAFETY: getrlimit and setrlimit touch only this process's limit
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+        limit.rlim_cur = limit.rlim_max;
+        assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+    }
+    let upstream_sockets = kixdns::config::MAX_POOL_SIZE;
+    // 空端口均匀散开：上游 socket 先开时挑走监听口的机会和挑走哪个空端口都一样，八成；本机别的程序（包括同时跑的
+    // 测试）这时要一个端口，碰上监听口的机会只有一千多分之一。句柄不够时少占一些
+    // The free ports spread evenly: upstream sockets opened first would take the listening port as
+    // likely as any free one, four times in five, while a port another program (a test running
+    // alongside, say) asks for meanwhile is the listening port about once in a thousand. Fewer are held
+    // when descriptors run short
+    let step = (range.len() / (upstream_sockets * 5 / 4)).max(1);
+    let (free, held): (Vec<u16>, Vec<u16>) = range
+        .clone()
+        .partition(|port| usize::from(port - range.start()) % step == 0);
+    let most =
+        usize::try_from(limit.rlim_cur).map_or(usize::MAX, |limit| limit.saturating_sub(256));
 
     for _ in 0..3 {
+        let _held: Vec<UdpSocket> = held
+            .iter()
+            .take(most)
+            .filter_map(|&port| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).ok())
+            .collect();
+        // 空端口里 UDP 和 TCP 都空着的一个 / A free port free for UDP and TCP alike
+        let port = free
+            .iter()
+            .copied()
+            .find(|&port| {
+                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok()
+                    && TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
+            })
+            .unwrap();
+
         let dir = tempfile::TempDir::new().unwrap();
-        // 系统现在空着的一个端口，UDP 和 TCP 都空着：系统给出的 UDP 端口，同号的 TCP 可能正被别的连接占着
-        // A port the system has free now, for UDP and TCP alike: the UDP port the system gives may
-        // be held for TCP by another connection
-        let port = std::iter::repeat_with(|| {
-            let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let port = udp.local_addr().unwrap().port();
-            TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-                .is_ok()
-                .then_some(port)
-        })
-        .flatten()
-        .next()
-        .unwrap();
         let mut kernel = start(
             dir.path(),
             serde_json::json!({
@@ -186,7 +186,7 @@ fn a_taken_dns_port_ends_the_kernel_with_the_reason() {
         "bind_udp": format!("127.0.0.1:{port}"),
         "bind_tcp": format!("127.0.0.1:{port}"),
     });
-    for (held_udp, reason) in [(true, "udp socket"), (false, "bind ipv4 tcp")] {
+    for (held_udp, reason) in [(true, "udp socket"), (false, "bind IPv4 TCP listener")] {
         let _udp = held_udp.then(|| UdpSocket::bind(bind).unwrap());
         let _tcp = (!held_udp).then(|| TcpListener::bind(bind).unwrap());
         let dir = tempfile::TempDir::new().unwrap();
