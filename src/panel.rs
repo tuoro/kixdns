@@ -1163,6 +1163,7 @@ impl PanelMetrics {
         metric(
             &mut output,
             "kixdns_cache_entries",
+            GAUGE,
             engine.cache.weighted_size(),
         );
         render_flow_control(&mut output, engine);
@@ -1175,28 +1176,32 @@ impl PanelMetrics {
         metric(
             output,
             "kixdns_requests_total",
+            COUNTER,
             self.requests_total.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_requests_inflight",
+            GAUGE,
             self.requests_inflight.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_cache_lookups_total",
+            COUNTER,
             self.cache_lookups_total.load(Ordering::Relaxed),
         );
+        family(output, "kixdns_cache_hits_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_cache_hits_total",
-            &[("kind", "fresh")],
+            [("kind", "fresh")],
             self.cache_hits_fresh.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_cache_hits_total",
-            &[("kind", "stale")],
+            [("kind", "stale")],
             self.cache_hits_stale.load(Ordering::Relaxed),
         );
         append_map(
@@ -1223,27 +1228,30 @@ impl PanelMetrics {
             &self.upstream_results,
             &["upstream", "transport", "result"],
         );
+        family(output, "kixdns_config_reload_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_config_reload_total",
-            &[("result", "success")],
+            [("result", "success")],
             self.reload_success.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_config_reload_total",
-            &[("result", "failure")],
+            [("result", "failure")],
             self.reload_failure.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_config_generation",
+            GAUGE,
             self.active_config.read().generation,
         );
+        family(output, "kixdns_cache_stale_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "expired")],
+            [("reason", "expired")],
             self.cache_hits_stale
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.cache_stale_client_timeout.load(Ordering::Relaxed))
@@ -1252,15 +1260,16 @@ impl PanelMetrics {
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "client_timeout")],
+            [("reason", "client_timeout")],
             self.cache_stale_client_timeout.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "upstream_failure")],
+            [("reason", "upstream_failure")],
             self.cache_stale_upstream_failure.load(Ordering::Relaxed),
         );
+        family(output, "kixdns_requests_finished_total", COUNTER);
         for (status, counter) in [
             ("completed", &self.requests_completed),
             ("failed", &self.requests_failed),
@@ -1269,17 +1278,18 @@ impl PanelMetrics {
             labeled_metric(
                 output,
                 "kixdns_requests_finished_total",
-                &[("status", status)],
+                [("status", status)],
                 counter.load(Ordering::Relaxed),
             );
         }
+        family(output, "kixdns_request_latency_ms", "histogram");
         let mut cumulative = 0u64;
         for (index, bound) in REQUEST_LATENCY_BUCKETS_MS.iter().enumerate() {
             cumulative += self.request_latency.buckets[index].load(Ordering::Relaxed);
             labeled_metric(
                 output,
                 "kixdns_request_latency_ms_bucket",
-                &[("le", &bound.to_string())],
+                [("le", bound.to_string().as_str())],
                 cumulative,
             );
         }
@@ -1288,17 +1298,19 @@ impl PanelMetrics {
         labeled_metric(
             output,
             "kixdns_request_latency_ms_bucket",
-            &[("le", "+Inf")],
+            [("le", "+Inf")],
             cumulative,
         );
-        metric(
+        labeled_metric(
             output,
             "kixdns_request_latency_ms_sum",
+            [],
             format_millis(self.request_latency.micros.load(Ordering::Relaxed)),
         );
-        metric(
+        labeled_metric(
             output,
             "kixdns_request_latency_ms_count",
+            [],
             self.request_latency.count.load(Ordering::Relaxed),
         );
         append_latency_map(
@@ -1328,6 +1340,7 @@ impl PanelMetrics {
         metric(
             output,
             "kixdns_panel_metric_series_dropped_total",
+            COUNTER,
             self.metric_series_dropped.load(Ordering::Relaxed),
         );
     }
@@ -1346,39 +1359,49 @@ fn render_flow_control(output: &mut String, engine: &Engine) {
     metric(
         output,
         "kixdns_flow_control_enabled",
+        GAUGE,
         u8::from(engine.flow_control_state.is_some()),
     );
+    family(output, "kixdns_flow_refused_total", COUNTER);
     for (defence, refused) in manager.refusals() {
         labeled_metric(
             output,
             "kixdns_flow_refused_total",
-            &[("defence", defence.label())],
+            [("defence", defence.label())],
             refused,
         );
     }
-    metric(output, "kixdns_flow_turns_total", manager.turns_begun());
-    metric(output, "kixdns_flow_stuck", manager.stuck());
+    metric(
+        output,
+        "kixdns_flow_turns_total",
+        COUNTER,
+        manager.turns_begun(),
+    );
+    metric(output, "kixdns_flow_stuck", GAUGE, manager.stuck());
     if let Some(margins) = engine
         .flow_control_state
         .as_ref()
         .and_then(|flow| flow.memory.margins_left())
     {
-        metric(output, "kixdns_flow_memory_room", margins);
+        metric(output, "kixdns_flow_memory_room", GAUGE, margins);
     }
+    // 每组的行挨在一起，两组各走一遍 / A family's lines stand together, so each family takes a pass
     let (clients, now) = manager.refused_clients();
-    for client in clients {
-        let address = client.client.to_string();
-        let labels = [("client", address.as_str())];
+    family(output, "kixdns_flow_refused_client_total", COUNTER);
+    for client in &clients {
         labeled_metric(
             output,
             "kixdns_flow_refused_client_total",
-            &labels,
+            [("client", client.client.to_string().as_str())],
             client.refused,
         );
+    }
+    family(output, "kixdns_flow_refused_client_age_seconds", GAUGE);
+    for client in &clients {
         labeled_metric(
             output,
             "kixdns_flow_refused_client_age_seconds",
-            &labels,
+            [("client", client.client.to_string().as_str())],
             now.saturating_sub(client.last_refused_secs),
         );
     }
@@ -1904,11 +1927,7 @@ async fn handle_request(
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/v1/health") => json_response(StatusCode::OK, metrics.health_json()),
         (&Method::GET, "/v1/config/active") => json_response(StatusCode::OK, metrics.config_json()),
-        (&Method::GET, "/v1/metrics") => text_response(
-            StatusCode::OK,
-            "text/plain; version=0.0.4; charset=utf-8",
-            metrics.render_prometheus(&engine),
-        ),
+        (&Method::GET, "/v1/metrics") => metrics_response(&metrics, engine).await,
         (&Method::GET, "/v1/stats/top") => match parse_stats_query(request.uri().query()) {
             Ok((window_seconds, limit)) => stats_response(&metrics, window_seconds, limit).await,
             Err(message) => json_response(
@@ -2645,6 +2664,28 @@ async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
     }
 }
 
+/// Prometheus 文本格式的指标。拼它要把每组统计项排好序、一行行写出来，统计项多时上万行，放到阻塞线程池里做，和排行
+/// 一样不占着处理 DNS 的线程；以前就在收到请求的线程上拼
+/// The metrics in the Prometheus text format. Writing them sorts every set of series and writes
+/// them out line by line, tens of thousands of lines with many series, so it runs on the
+/// blocking thread pool and, as the rankings do, holds no thread that serves DNS; it used to be
+/// written on the thread that took the request
+#[cfg(unix)]
+async fn metrics_response(metrics: &Arc<PanelMetrics>, engine: Engine) -> Response<Full<Bytes>> {
+    let rendering = Arc::clone(metrics);
+    match tokio::task::spawn_blocking(move || rendering.render_prometheus(&engine)).await {
+        Ok(text) => text_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4; charset=utf-8",
+            text,
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("metrics_failed", &error.to_string()),
+        ),
+    }
+}
+
 /// 排行的回答。算排行要把窗口里每个钟头的每一项合起来再排序（24 小时的窗口最多二十万项），放到阻塞线程池里做，
 /// 不占着处理 DNS 的线程
 /// The answer with the rankings. Working them out merges every entry of every hour in the
@@ -2744,63 +2785,54 @@ fn error_json(code: &str, message: &str) -> serde_json::Value {
     json!({ "protocol_version": PROTOCOL_VERSION, "error": { "code": code, "message": message } })
 }
 
+/// 一组计数统计项，按键排好，每项一行 / A set of counting series, sorted by key, a line each
 fn append_map(output: &mut String, name: &str, series: &Series<ThreadCount>, labels: &[&str]) {
-    let mut rows = series
-        .snapshot()
-        .iter()
-        .map(|(key, counter)| (key.to_string(), counter.load(Ordering::Relaxed)))
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    for (key, value) in rows {
-        let values = key.split('\0').collect::<Vec<_>>();
-        if values.len() != labels.len() {
-            continue;
+    family(output, name, COUNTER);
+    let snapshot = series.snapshot();
+    let mut rows: Vec<_> = snapshot.iter().collect();
+    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, counter) in rows {
+        if let Some(pairs) = label_pairs(labels, key) {
+            labeled_metric(output, name, pairs, counter.load(Ordering::Relaxed));
         }
-        let pairs = labels
-            .iter()
-            .zip(values)
-            .map(|(label, value)| (*label, value))
-            .collect::<Vec<_>>();
-        labeled_metric(output, name, &pairs, value);
     }
 }
 
+/// 一组耗时统计项，按键排好，每项一行总和、一行次数 / A set of latency series, sorted by key, each
+/// with a line for the sum and one for the count
 fn append_latency_map(
     output: &mut String,
     name: &str,
     series: &Series<LatencySum>,
     labels: &[&str],
 ) {
-    let mut rows = series
-        .snapshot()
-        .iter()
-        .map(|(key, sum)| {
-            (
-                key.to_string(),
-                sum.micros.load(Ordering::Relaxed),
+    family(output, name, "summary");
+    let (sum_name, count_name) = (format!("{name}_sum"), format!("{name}_count"));
+    let snapshot = series.snapshot();
+    let mut rows: Vec<_> = snapshot.iter().collect();
+    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, sum) in rows {
+        if let Some(pairs) = label_pairs(labels, key) {
+            let micros = sum.micros.load(Ordering::Relaxed);
+            labeled_metric(output, &sum_name, pairs.clone(), format_millis(micros));
+            labeled_metric(
+                output,
+                &count_name,
+                pairs,
                 sum.count.load(Ordering::Relaxed),
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    for (key, micros, count) in rows {
-        let values = key.split('\0').collect::<Vec<_>>();
-        if values.len() != labels.len() {
-            continue;
+            );
         }
-        let pairs = labels
-            .iter()
-            .zip(values)
-            .map(|(label, value)| (*label, value))
-            .collect::<Vec<_>>();
-        labeled_metric(
-            output,
-            &format!("{name}_sum"),
-            &pairs,
-            format_millis(micros),
-        );
-        labeled_metric(output, &format!("{name}_count"), &pairs, count);
     }
+}
+
+/// 统计键的各段配上标签名。名字里写了 `\0` 时段数和标签数对不上，这一项不导出
+/// A metric key's parts paired with the label names. With a `\0` written in a name the parts
+/// and labels do not match up, and the series is not exported
+fn label_pairs<'a>(
+    labels: &'a [&'a str],
+    key: &'a str,
+) -> Option<impl Iterator<Item = (&'a str, &'a str)> + Clone> {
+    (key.split('\0').count() == labels.len()).then(|| labels.iter().copied().zip(key.split('\0')))
 }
 
 /// 微秒累计值以毫秒输出，保留三位小数。/ Render accumulated microseconds as milliseconds.
@@ -2808,31 +2840,57 @@ fn format_millis(micros: u64) -> String {
     format!("{}.{:03}", micros / 1_000, micros % 1_000)
 }
 
-fn metric(output: &mut String, name: &str, value: impl std::fmt::Display) {
-    let _ = writeln!(output, "{name} {value}");
+/// 计数和仪表，`# TYPE` 行里的两种 / Counters and gauges, two of the kinds of a `# TYPE` line
+const COUNTER: &str = "counter";
+const GAUGE: &str = "gauge";
+
+/// 一组指标的 `# TYPE` 行，写在这一组的头一行之前；同一组的行挨在一起
+/// A metric family's `# TYPE` line, written before the family's first line; a family's lines
+/// stand together
+fn family(output: &mut String, name: &str, kind: &str) {
+    let _ = writeln!(output, "# TYPE {name} {kind}");
 }
 
-fn labeled_metric(
+/// 只有一行、不带标签的一组指标 / A metric family of a single line without labels
+fn metric(output: &mut String, name: &str, kind: &str, value: impl std::fmt::Display) {
+    family(output, name, kind);
+    labeled_metric(output, name, [], value);
+}
+
+/// 一行指标，没有标签时不写花括号。标签值照 Prometheus 文本格式转义，直接写进输出：以前每个标签值替换三遍、每行还要
+/// 另拼几个字符串
+/// One metric line, without braces when it has no labels. Label values are escaped as the
+/// Prometheus text format says, straight into the output: each used to be replaced three times
+/// over, and every line built several more strings besides
+fn labeled_metric<'a>(
     output: &mut String,
     name: &str,
-    labels: &[(&str, &str)],
+    labels: impl IntoIterator<Item = (&'a str, &'a str)>,
     value: impl std::fmt::Display,
 ) {
-    let _ = write!(output, "{name}{{");
-    for (index, (label, label_value)) in labels.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
+    output.push_str(name);
+    let mut labels = labels.into_iter().peekable();
+    if labels.peek().is_some() {
+        output.push('{');
+        for (index, (label, label_value)) in labels.enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str(label);
+            output.push_str("=\"");
+            for c in label_value.chars() {
+                match c {
+                    '\\' => output.push_str("\\\\"),
+                    '\n' => output.push_str("\\n"),
+                    '"' => output.push_str("\\\""),
+                    c => output.push(c),
+                }
+            }
+            output.push('"');
         }
-        let _ = write!(output, "{label}=\"{}\"", escape_label(label_value));
+        output.push('}');
     }
-    let _ = writeln!(output, "}} {value}");
-}
-
-fn escape_label(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"")
+    let _ = writeln!(output, " {value}");
 }
 
 fn truncate(value: &str, max_length: usize) -> String {
@@ -3593,10 +3651,15 @@ mod tests {
         assert!(metrics.uptime_seconds() >= 61);
     }
 
-    #[cfg(unix)]
+    /// 标签值照 Prometheus 文本格式转义：反斜杠、换行和引号，别的原样写；不带标签的一行没有花括号
+    /// Label values are escaped as the Prometheus text format says: backslashes, newlines and
+    /// quotes, the rest written as is; a line without labels has no braces
     #[test]
     fn escapes_prometheus_labels() {
-        assert_eq!(super::escape_label("a\\b\n\"c"), "a\\\\b\\n\\\"c");
+        let mut output = String::new();
+        super::labeled_metric(&mut output, "m", [("a", "x\\y\n\"z\""), ("b", "名字")], 1);
+        super::labeled_metric(&mut output, "n", [], 2);
+        assert_eq!(output, "m{a=\"x\\\\y\\n\\\"z\\\"\",b=\"名字\"} 1\nn 2\n");
     }
 
     /// 一组统计项满了以后，再来的新名字只记一次丢弃，不去拿加统计项的那把锁。这把锁全进程共用；规则多过上限的配置下，
@@ -4833,6 +4896,101 @@ mod diagnostic_tests {
         ] {
             assert!(text.lines().any(|got| got == line), "{line} in\n{text}");
         }
+    }
+
+    /// 导出照 Prometheus 文本格式写：每组指标前有一行 `# TYPE`，说它是计数、仪表、直方图还是摘要，同一组的行挨在一起
+    /// （直方图和摘要的 `_bucket`、`_sum`、`_count` 算在组里）。以前一行 `# TYPE` 也没有，被拦设备的两组还一行隔一行
+    /// The export follows the Prometheus text format: every metric family starts with a
+    /// `# TYPE` line saying whether it is a counter, a gauge, a histogram or a summary, and a
+    /// family's lines stand together (a histogram's or summary's `_bucket`, `_sum` and `_count`
+    /// belonging to it). There used to be no `# TYPE` line at all, and the two families of the
+    /// devices refused took turns line by line
+    #[tokio::test]
+    async fn every_metric_family_is_typed_once_before_its_lines() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "flow_control_enabled": true },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let manager = &engine.permit_manager;
+        for client in ["192.168.1.20", "192.168.1.21"] {
+            manager.note_refused(client.parse().unwrap());
+        }
+        metrics.record_pipeline_hit("main");
+        metrics.record_rule_match("main", "r", "request");
+        metrics.record_upstream_attempt("1.1.1.1:53", "udp");
+        metrics.record_upstream_latency(
+            &metrics.upstream_latency,
+            "1.1.1.1:53\0udp",
+            std::time::Duration::from_millis(5),
+        );
+        let text = metrics.render_prometheus(&engine);
+        let mut typed = Vec::new();
+        for line in text.lines() {
+            if let Some(family) = line.strip_prefix("# TYPE ") {
+                let (name, kind) = family.split_once(' ').expect("a name and a kind");
+                assert!(
+                    ["counter", "gauge", "histogram", "summary"].contains(&kind),
+                    "{line}"
+                );
+                assert!(!typed.contains(&name), "{name} typed twice in\n{text}");
+                typed.push(name);
+                continue;
+            }
+            let name = line.split(['{', ' ']).next().expect("a metric name");
+            let family = typed.last().expect("a line before any # TYPE");
+            assert!(
+                name == *family
+                    || ["_bucket", "_sum", "_count"]
+                        .iter()
+                        .any(|part| name.strip_suffix(part) == Some(family)),
+                "{name} under {family} in\n{text}"
+            );
+        }
+        for family in [
+            "kixdns_panel_metric_series_dropped_total",
+            "kixdns_request_latency_ms",
+            "kixdns_upstream_latency_ms",
+            "kixdns_flow_refused_client_total",
+            "kixdns_flow_refused_client_age_seconds",
+        ] {
+            assert!(typed.contains(&family), "{family} in\n{text}");
+        }
+    }
+
+    /// 拼指标也不占着处理 DNS 的线程：交给阻塞线程去拼，等的时候运行时照常干别的。测试用的是单线程运行时，在这里同步
+    /// 拼的话另一个任务一次也轮不到
+    /// Writing the metrics holds no thread that serves DNS either: a blocking thread writes them,
+    /// and while waiting the runtime goes on with other work. The test runs on a single-thread
+    /// runtime, where writing them inline would leave the other task not a single turn
+    #[tokio::test]
+    async fn writing_the_metrics_leaves_the_runtime_free() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let turns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counting = Arc::clone(&turns);
+        let other = tokio::spawn(async move {
+            loop {
+                counting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let before = turns.load(std::sync::atomic::Ordering::Relaxed);
+        let response = super::metrics_response(&metrics, engine).await;
+        let during = turns.load(std::sync::atomic::Ordering::Relaxed) - before;
+        other.abort();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert!(
+            during > 0,
+            "the runtime had no turn for other work while writing"
+        );
     }
 
     /// 控制通道的 config 列出改了但要重启才生效的设置；改回去以后不再列
