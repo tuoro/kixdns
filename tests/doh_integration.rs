@@ -17,7 +17,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use kixdns::config::PipelineConfig;
-use kixdns::doh_server::run_doh_with_listener;
+use kixdns::doh_server::{DohCertificate, run_doh};
 use kixdns::engine::Engine;
 use kixdns::matcher::RuntimePipelineConfig;
 
@@ -164,13 +164,8 @@ async fn start_doh(engine: Engine) -> DohTestServer {
         .expect("bind listener");
     let port = listener.local_addr().expect("local addr").port();
 
-    let (cert, key) = (cert_path.clone(), key_path.clone());
-    tokio::spawn(async move {
-        let _ =
-            run_doh_with_listener(listener, &cert, &key, engine, "/dns-query".to_string()).await;
-    });
-    // Brief delay to let the spawned task load certs and enter accept loop
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let certificate = DohCertificate::load(&cert_path, &key_path).expect("load certificate");
+    tokio::spawn(run_doh(listener, certificate, engine, "/dns-query".into()));
 
     DohTestServer {
         port,

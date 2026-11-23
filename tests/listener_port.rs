@@ -186,7 +186,7 @@ fn a_taken_dns_port_ends_the_kernel_with_the_reason() {
         "bind_udp": format!("127.0.0.1:{port}"),
         "bind_tcp": format!("127.0.0.1:{port}"),
     });
-    for (held_udp, reason) in [(true, "udp socket"), (false, "bind ipv4 tcp")] {
+    for (held_udp, reason) in [(true, "udp socket"), (false, "bind IPv4 TCP listener")] {
         let _udp = held_udp.then(|| UdpSocket::bind(bind).unwrap());
         let _tcp = (!held_udp).then(|| TcpListener::bind(bind).unwrap());
         let dir = tempfile::TempDir::new().unwrap();
@@ -223,7 +223,7 @@ fn a_taken_doh_port_leaves_dns_answering() {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     assert!(until(&mut kernel, || udp_answers(address) && tcp_answers(address)));
     let log = log_of(dir.path());
-    assert!(log.contains("DoH server exited"), "{log}");
+    assert!(log.contains("DoH server cannot start"), "{log}");
     assert!(log.contains("Address already in use"), "{log}");
 }
 

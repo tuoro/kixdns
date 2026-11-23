@@ -19,7 +19,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 
 use kixdns::config::{Transport, parse_config};
-use kixdns::doh_server::run_doh_with_listener;
+use kixdns::doh_server::{DohCertificate, run_doh};
 use kixdns::engine::{Engine, FastPathResponse};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
@@ -2213,19 +2213,8 @@ async fn start_doh(engine: Engine) -> (u16, tempfile::TempDir) {
         .await
         .expect("bind doh listener");
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        let _ = run_doh_with_listener(
-            listener,
-            &cert_path,
-            &key_path,
-            engine,
-            "/dns-query".to_string(),
-        )
-        .await;
-    });
-    // Let the server load its certificate and enter the accept loop
-    // 等服务器加载证书并进入 accept 循环
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let certificate = DohCertificate::load(&cert_path, &key_path).expect("load certificate");
+    tokio::spawn(run_doh(listener, certificate, engine, "/dns-query".into()));
     (port, dir)
 }
 

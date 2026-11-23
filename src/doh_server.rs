@@ -8,7 +8,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -93,33 +92,83 @@ mod buffered {
     pub(super) const SEND: usize = 16 * 1024;
 }
 
-/// TLS acceptor shared between the accept loop and the certificate watcher:
-/// wait-free snapshot per connection, swapped wholesale on reload — the same
-/// hot-reload pattern as Engine's `Arc<ArcSwap<...>>` state.
-type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
+/// 入站 DoH 的证书，各个监听口共用：证书或私钥文件换了就换上新的，新的读不了就留着在用的。每个连接握手时取一份当时的，
+/// 不用等锁；正在用的连接不受换证书影响。最后一个监听口停下、丢掉它的时候，监视证书文件的线程也停下
+/// The inbound DoH certificate, shared by every listener: a change to the certificate or key
+/// file brings in the new one, the one in use staying when the new one cannot be read. Each
+/// connection takes the one current at its handshake without waiting on a lock, and connections
+/// already up are not touched by a change. Dropped with the last listener, it stops the thread
+/// watching the files too
+pub struct DohCertificate {
+    current: Arc<ArcSwap<TlsAcceptor>>,
+    /// 证书文件的监视，监视不了时没有 / The watch on the certificate files, none when they cannot be watched
+    _watch: Option<watcher::FileWatch>,
+}
 
-/// 从已绑定的 TcpListener 启动 DoH 服务器（便于测试获取实际端口）
-/// Start DoH server from a pre-bound TcpListener (allows tests to discover the actual port)
-pub async fn run_doh_with_listener(
+impl DohCertificate {
+    /// 读 `cert_path` 和 `key_path`，读之前先装好监视（见 `watcher::PendingWatch`）：读的时候证书续期了，这次改动排着队，
+    /// 照样换上。以前先读后监视，中间续期的证书要等下一次改动才用上。监视不了只记错误，证书照用
+    /// Reads `cert_path` and `key_path`, watching them before they are read (see
+    /// `watcher::PendingWatch`): a renewal made while they are read waits in line and is brought
+    /// in all the same. They used to be read before being watched, and a renewal in between was
+    /// used only after the next change. When they cannot be watched an error is logged and the
+    /// certificate used as read
+    pub fn load(cert_path: &str, key_path: &str) -> anyhow::Result<Arc<Self>> {
+        let pending =
+            watcher::PendingWatch::new(&[PathBuf::from(cert_path), PathBuf::from(key_path)]);
+        let current = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
+            cert_path, key_path,
+        )?));
+        let watch = pending
+            .and_then(|pending| {
+                let reloaded = Arc::clone(&current);
+                let (cert, key) = (cert_path.to_owned(), key_path.to_owned());
+                pending
+                    .start("doh-cert-watcher", move |_| reload(&reloaded, &cert, &key))
+                    .map_err(notify::Error::io)
+            })
+            .inspect_err(|err| error!(target = "doh", cert = cert_path, key = key_path, error = %err, "cannot watch the DoH certificate, a renewed one is not used until restart"))
+            .ok();
+        Ok(Arc::new(Self {
+            current,
+            _watch: watch,
+        }))
+    }
+}
+
+/// 证书文件改了：换上重新读出来的证书，读不了就留着在用的
+/// The certificate files changed: the certificate read again goes in, or the one in use stays
+/// when it cannot be read
+fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str) {
+    match build_tls_acceptor(cert, key) {
+        Ok(acceptor) => {
+            current.store(Arc::new(acceptor));
+            info!(target = "doh", cert, key, "DoH TLS certificate reloaded");
+        }
+        // 默认日志级别是 error：记成 warn 的话，续期失败谁也看不到，直到旧证书过期
+        // The default log level is error: logged as a warn, a failed renewal would go unseen
+        // until the old certificate expired
+        Err(err) => {
+            error!(target = "doh", cert, key, error = %format!("{err:#}"), "DoH TLS certificate reload failed, keeping the one in use");
+        }
+    }
+}
+
+/// 在 `listener` 上接入站 DoH 连接，证书是 `certificate`，请求路径是 `doh_path`；一直接下去，不返回。`[::]` 时
+/// IPv4、IPv6 各有一个监听口（见 `listeners::bind_tcp_listeners`），各跑一个，共用一份证书
+/// Accepts inbound DoH connections on `listener` with `certificate`, requests served on
+/// `doh_path`; it goes on for good and never returns. For `[::]` IPv4 and IPv6 each have a
+/// listener (see `listeners::bind_tcp_listeners`), each running one, sharing the certificate
+pub async fn run_doh(
     listener: TcpListener,
-    cert_path: &str,
-    key_path: &str,
+    certificate: Arc<DohCertificate>,
     engine: Engine,
-    doh_path: String,
-) -> anyhow::Result<()> {
-    // 引擎和路径都只共享不复制：每个请求只加一次引用计数，不再复制整个 Engine（二十多个 Arc）和路径字符串
-    // The engine and the path are shared, not copied: each request takes one reference count
-    // instead of copying the whole Engine (twenty-odd Arcs) and the path string
+    doh_path: Arc<str>,
+) -> ! {
+    // 引擎只共享不复制：每个请求只加一次引用计数，不再复制整个 Engine（二十多个 Arc）
+    // The engine is shared, not copied: each request takes one reference count instead of
+    // copying the whole Engine (twenty-odd Arcs)
     let engine = Arc::new(engine.with_client_transport(ClientTransport::Doh));
-    let doh_path: Arc<str> = Arc::from(doh_path);
-    let acceptor: SharedTlsAcceptor = Arc::new(ArcSwap::from_pointee(build_tls_acceptor(
-        cert_path, key_path,
-    )?));
-
-    // 证书文件变更时热更新 TLS acceptor；重载失败保持旧证书继续服务
-    // Hot-reload the TLS acceptor on cert/key file changes; keep the previous certificate on failure
-    spawn_cert_watcher(cert_path, key_path, Arc::clone(&acceptor));
-
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -141,9 +190,7 @@ pub async fn run_doh_with_listener(
         let Some(permit) = engine.connection_permit(peer.ip()) else {
             continue;
         };
-        // Snapshot the current acceptor for this connection; in-flight
-        // connections keep serving with the certificate they were established with.
-        let acceptor = acceptor.load_full();
+        let acceptor = certificate.current.load_full();
         let engine = Arc::clone(&engine);
         let doh_path = Arc::clone(&doh_path);
         tokio::spawn(async move {
@@ -608,29 +655,6 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcce
     Ok(TlsAcceptor::from(Arc::new(tls_config)))
 }
 
-/// 监听证书/私钥文件变更并热更新 TLS acceptor（阻塞线程，与 config watcher 生命周期一致）
-/// Watch cert/key files and rebuild the TLS acceptor on change (blocking thread,
-/// mirroring the config watcher lifecycle).
-fn spawn_cert_watcher(cert_path: &str, key_path: &str, acceptor: SharedTlsAcceptor) {
-    let paths = vec![PathBuf::from(cert_path), PathBuf::from(key_path)];
-    let cert = cert_path.to_string();
-    let key = key_path.to_string();
-    thread::spawn(move || {
-        let result = watcher::run_files_watcher(&paths, || match build_tls_acceptor(&cert, &key) {
-            Ok(new_acceptor) => {
-                acceptor.store(Arc::new(new_acceptor));
-                info!(target = "doh", cert = %cert, key = %key, "DoH TLS certificate reloaded");
-            }
-            Err(err) => {
-                warn!(target = "doh", cert = %cert, key = %key, error = %format!("{err:#}"), "DoH TLS certificate reload failed, keeping the one in use");
-            }
-        });
-        if let Err(err) = result {
-            error!(target = "doh", error = %err, "DoH certificate watcher exited with error");
-        }
-    });
-}
-
 /// 从 PEM 文件加载证书 / Load certificates from PEM file
 fn load_certs(path: &str) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     CertificateDer::pem_file_iter(path)
@@ -877,49 +901,27 @@ mod tests {
         waiting.abort();
     }
 
-    /// 内存不够时不接新连接，TLS 握手之前就关掉：连接和握手本身也占内存
-    /// With too little memory no new connection is taken, closed before the TLS handshake: a
-    /// connection and its handshake hold memory too
     /// 起一个用自签证书的 DoH 服务端，返回地址、任务和放证书的目录（目录得留着）
     /// Starts a DoH server with a self-signed certificate, giving its address, its task and the
     /// directory holding the certificate (which must be kept)
     async fn doh_server(
         engine: &Engine,
-    ) -> (
-        SocketAddr,
-        tokio::task::JoinHandle<anyhow::Result<()>>,
-        tempfile::TempDir,
-    ) {
-        use rcgen::{CertificateParams, KeyPair};
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let (cert_path, key_path) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
-        let key = KeyPair::generate().unwrap();
-        let cert = CertificateParams::new(vec!["localhost".to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        std::fs::write(&cert_path, cert.pem()).unwrap();
-        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (cert_path, key_path) = (
-            cert_path.to_str().unwrap().to_string(),
-            key_path.to_str().unwrap().to_string(),
-        );
+        let certificate = DohCertificate::load(&cert, &key).unwrap();
         let served = engine.clone();
         let server = tokio::spawn(async move {
-            run_doh_with_listener(
-                listener,
-                &cert_path,
-                &key_path,
-                served,
-                "/dns-query".to_string(),
-            )
-            .await
+            run_doh(listener, certificate, served, Arc::from("/dns-query")).await
         });
         (address, server, dir)
     }
 
+    /// 内存不够时不接新连接，TLS 握手之前就关掉：连接和握手本身也占内存
+    /// With too little memory no new connection is taken, closed before the TLS handshake: a
+    /// connection and its handshake hold memory too
     #[tokio::test]
     async fn a_new_doh_connection_is_closed_when_memory_is_short() {
         use tokio::io::AsyncReadExt;
@@ -1396,6 +1398,48 @@ mod tests {
             build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).is_ok(),
             "valid cert/key pair must build an acceptor"
         );
+    }
+
+    /// 读完证书马上续期，续上的照样换上：监视在读证书之前就装好了。以前先读后监视，这中间的续期要等下一次改动才用上
+    /// A renewal right after the certificate is read is brought in all the same: the watch is
+    /// in place before the certificate is read. It used to be read before being watched, and a
+    /// renewal in between was used only after the next change
+    #[tokio::test]
+    async fn a_renewal_right_after_the_certificate_is_read_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
+        let certificate = DohCertificate::load(&cert, &key).unwrap();
+        let read = certificate.current.load_full();
+        crate::engine::test_support::write_certificate(dir.path());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::ptr_eq(&certificate.current.load_full(), &read) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the renewed certificate is used");
+    }
+
+    /// 最后一个监听口停下时证书的监视也停下：监视线程结束，放下它手里的证书。以前这个线程谁也停不了，进程活着它就一直在
+    /// The certificate's watch stops with the last listener: the watching thread ends and lets
+    /// go of the certificate it holds. Nothing could stop that thread before, and it stayed for
+    /// as long as the process did
+    #[tokio::test]
+    async fn the_certificate_watch_stops_with_the_last_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = crate::engine::test_support::write_certificate(dir.path());
+        let certificate = DohCertificate::load(&cert, &key).unwrap();
+        let held = Arc::downgrade(&certificate.current);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = tokio::spawn(run_doh(
+            listener,
+            certificate,
+            make_static_engine("NXDOMAIN"),
+            Arc::from("/dns-query"),
+        ));
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        assert!(held.upgrade().is_none(), "the watching thread has let go");
     }
 
     // ---- 快速路径之后 / After the fast path ----
