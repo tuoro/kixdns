@@ -863,6 +863,52 @@ pub struct StreamMuxClient<T: StreamTransport> {
     /// tell whether the connection is still alive: if it grew after the query was
     /// queued, the connection kept answering and only this one answer is slow
     answers_read: Arc<AtomicU64>,
+    /// 在建的连接、建连失败以后的退避（见 [`Connect`]）。只在拿着连接锁时锁它，所以同一时刻只建一条
+    /// The connection being made and the backing off after a failed connect (see [`Connect`]).
+    /// Locked only with the connection lock held, so one is made at a time
+    connect: Mutex<Connect<T>>,
+}
+
+/// 建连在自己的任务里做，有自己的时限 [`CONNECT_BUDGET`]：发起它的查询被取消了（几个上游竞速时 UDP 先答完、外层超时），
+/// 连接照样建完，下一个拿到连接锁的查询装上它。以前建连就在查询里，查询一取消握手就丢了：竞速时 DoT 几乎永远建不起来，每个
+/// 查询都从 SYN 重来。失败以后退避：从 [`CONNECT_BACKOFF`] 起每失败一次翻倍，最多 [`CONNECT_BACKOFF_AT_MOST`]，这期间的
+/// 查询马上失败、不再发 SYN；以前上游不通时排在锁后面的查询每个都发一个
+/// Connecting happens in a task of its own with a budget of its own, [`CONNECT_BUDGET`]: with the
+/// query that started it cancelled (UDP answering first in a race, an outer timeout), the
+/// connection is made all the same, and the next query to take the connection lock puts it in
+/// place. Connecting used to happen within the query, and a cancelled query lost the handshake:
+/// in a race DoT was hardly ever made, every query starting over from the SYN. After a failure
+/// it backs off, from [`CONNECT_BACKOFF`] doubling on each failure up to
+/// [`CONNECT_BACKOFF_AT_MOST`], the queries meanwhile failing at once with no SYN sent; with the
+/// upstream unreachable every query queued behind the lock used to send one
+struct Connect<T: StreamTransport> {
+    /// 建连的任务，建完了也留着，直到有查询取走结果 / The connecting task, kept after it is through
+    /// until a query takes what it made
+    task: Option<tokio::task::JoinHandle<ConnectResult<T>>>,
+    /// 退避到什么时候，下一次失败退避多久 / Backing off until when, and for how long after the next failure
+    retry_at: Option<std::time::Instant>,
+    backoff: Duration,
+}
+
+type ConnectResult<T> =
+    anyhow::Result<(<T as StreamTransport>::Read, <T as StreamTransport>::Write)>;
+
+/// 建一条连接最多花多久（TCP 握手，DoT 还有 TLS 握手）/ The most a connect may take (the TCP
+/// handshake, and the TLS one for DoT)
+const CONNECT_BUDGET: Duration = Duration::from_secs(5);
+/// 建连第一次失败以后退避多久 / How long to back off after a first failed connect
+const CONNECT_BACKOFF: Duration = Duration::from_millis(250);
+/// 建连接连失败时退避最多多久 / The longest backing off after failed connects in a row
+const CONNECT_BACKOFF_AT_MOST: Duration = Duration::from_secs(5);
+
+impl<T: StreamTransport> Default for Connect<T> {
+    fn default() -> Self {
+        Self {
+            task: None,
+            retry_at: None,
+            backoff: CONNECT_BACKOFF,
+        }
+    }
 }
 
 /// 一条 TCP/DoT 连接的健康检查设置，建客户端时给定，之后不变
@@ -1023,7 +1069,59 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             last_health_check_time: AtomicU64::new(0),
             stop: CancellationToken::new(),
             answers_read: Arc::new(AtomicU64::new(0)),
+            connect: Mutex::new(Connect::default()),
         }
+    }
+
+    /// 等一条新连接，最多等 `budget`：没有在建的就起一个建连的任务，退避期间不起、报错；等不到时任务留着给下一个查询
+    /// （见 [`Connect`]）。只在拿着连接锁时调用
+    /// Waits up to `budget` for a new connection: with none being made, a task is started to make
+    /// one, except while backing off, which is an error; past the budget the task stays for the
+    /// next query (see [`Connect`]). Called only with the connection lock held
+    async fn connect(&self, budget: Duration) -> ConnectResult<T> {
+        let mut connect = self.connect.lock().await;
+        let Connect {
+            task,
+            retry_at,
+            backoff,
+        } = &mut *connect;
+        let made = match task {
+            Some(made) => made,
+            None => {
+                if let Some(left) =
+                    retry_at.and_then(|at| at.checked_duration_since(std::time::Instant::now()))
+                {
+                    anyhow::bail!(
+                        "{} connect to {} failed lately, trying again in {}ms",
+                        T::LABEL,
+                        self.upstream,
+                        left.as_millis()
+                    );
+                }
+                let (shared, upstream) = (self.shared.clone(), Arc::clone(&self.upstream));
+                task.insert(tokio::spawn(async move {
+                    T::connect(&shared, &upstream, CONNECT_BUDGET).await
+                }))
+            }
+        };
+        let Ok(made) = timeout(budget, made).await else {
+            anyhow::bail!(
+                "{} timeout waiting for the connection after {}ms",
+                T::LABEL,
+                budget.as_millis()
+            );
+        };
+        *task = None;
+        // 建连的任务只会在 panic 时没有结果 / The connecting task has no result only on a panic
+        let made = made.unwrap_or_else(|panicked| Err(panicked.into()));
+        if made.is_ok() {
+            *retry_at = None;
+            *backoff = CONNECT_BACKOFF;
+        } else {
+            *retry_at = Some(std::time::Instant::now() + *backoff);
+            *backoff = (*backoff * 2).min(CONNECT_BACKOFF_AT_MOST);
+        }
+        made
     }
 
     fn spawn_reader(
@@ -1495,10 +1593,10 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 budget.as_millis()
             );
         };
-        let budget = budget.saturating_sub(started.elapsed());
-
         if guard.is_none() {
-            let (read_half, write_half) = T::connect(&self.shared, &self.upstream, budget).await?;
+            let (read_half, write_half) = self
+                .connect(budget.saturating_sub(started.elapsed()))
+                .await?;
             let queue = Arc::new(WriteQueue::default());
 
             // Increment generation for new connection
@@ -4359,6 +4457,103 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "gave up after {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dot_handshake_outlives_the_query_that_started_it() {
+        // 发起建连的查询在 TLS 握手做完前被取消了（竞速时别的上游先答完），握手照样做完，下一个查询直接用上，
+        // 不另建。以前握手跟着查询一起丢，竞速时每个查询都从 SYN 重来
+        // The query that started the connect is cancelled before the TLS handshake is through
+        // (another upstream answering first in a race); the handshake goes on all the same and
+        // the next query uses it, making no other. The handshake used to be lost with the
+        // query, every query in a race starting over from the SYN
+        let (server, client_tls) = localhost_tls(&[]);
+        let upstream = spawn_stream_upstream(Some(server)).await;
+        let front = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the slow front");
+        let addr = front.local_addr().expect("read the slow front address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = front.accept().await {
+                counted.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let mut upstream = tokio::net::TcpStream::connect(upstream)
+                        .await
+                        .expect("reach the upstream");
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                });
+            }
+        });
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(client_tls),
+        );
+        let raced = timeout(
+            Duration::from_millis(100),
+            client.send(&udp_test_query("first.example"), Duration::from_secs(2)),
+        )
+        .await;
+        assert!(raced.is_err(), "cancelled while the handshake goes on");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client
+            .send(
+                &udp_test_query("second.example"),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("the connection made meanwhile answers at once");
+        assert_eq!(accepted.load(Ordering::Relaxed), 1, "one connection made");
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_backs_off_before_the_next() {
+        // 建连失败以后退避：这期间的查询马上失败、不再去连；过了退避再连。以前上游不通时每个查询都去连一次
+        // After a failed connect it backs off: the queries meanwhile fail at once without
+        // connecting; past the backing off it connects again. Every query used to connect
+        // with the upstream unreachable
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the refusing listener");
+        let addr = listener
+            .local_addr()
+            .expect("read the refusing listener address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            // 接下就关，TLS 握手失败 / Accepted and closed at once, failing the TLS handshake
+            while listener.accept().await.is_ok() {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(build_tls_client_config().expect("tls config")),
+        );
+        let query = udp_test_query("refused.example");
+        assert!(client.send(&query, Duration::from_secs(1)).await.is_err());
+        let backing_off = client
+            .send(&query, Duration::from_secs(1))
+            .await
+            .expect_err("still backing off");
+        assert!(
+            backing_off.to_string().contains("failed lately"),
+            "{backing_off:#}"
+        );
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "no connect while backing off"
+        );
+        tokio::time::sleep(CONNECT_BACKOFF + Duration::from_millis(50)).await;
+        assert!(client.send(&query, Duration::from_secs(1)).await.is_err());
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            2,
+            "connects again past it"
         );
     }
 
