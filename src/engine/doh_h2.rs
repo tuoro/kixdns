@@ -30,7 +30,7 @@ use rustls::pki_types::ServerName;
 use tower_service::Service;
 use url::{Host, Url};
 
-use super::transport::{InFlight, least_busy};
+use super::transport::{Connect, InFlight, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
 pub(crate) type H2Sender = SendRequest<Bytes>;
@@ -62,8 +62,10 @@ struct H2Conn {
 /// 一个连接位：最多一条连接 / One connection slot: at most one connection
 struct Slot {
     conn: ArcSwapOption<H2Conn>,
-    /// 同一时刻只有一个请求去连，其余的等它连好 / One request connects at a time and the others wait for it
-    connecting: tokio::sync::Mutex<()>,
+    /// 在建的连接、建连失败以后的退避（见 [`Connect`]）；连上了对方没选 h2 时是 None / The connection
+    /// being made and the backing off after a failed connect (see [`Connect`]); None when the
+    /// peer connected did not pick h2
+    connecting: tokio::sync::Mutex<Connect<Option<H2Sender>>>,
     /// 这个位上还没答完的请求数 / Requests on this slot not yet answered
     in_flight: AtomicUsize,
 }
@@ -87,7 +89,7 @@ impl H2Link {
             slots: (0..connections.max(1))
                 .map(|_| Slot {
                     conn: ArcSwapOption::empty(),
-                    connecting: tokio::sync::Mutex::new(()),
+                    connecting: tokio::sync::Mutex::new(Connect::default()),
                     in_flight: AtomicUsize::new(0),
                 })
                 .collect(),
@@ -133,12 +135,16 @@ impl H2Link {
         if let Some(sender) = self.usable(slot, self.now_ms()) {
             return Ok(Some((sender, in_flight)));
         }
-        let _connecting = slot.connecting.lock().await;
+        let mut connecting = slot.connecting.lock().await;
         // 等锁的时候别的请求可能已经连好了 / Another request may have connected while this one waited for the lock
         if let Some(sender) = self.usable(slot, self.now_ms()) {
             return Ok(Some((sender, in_flight)));
         }
-        match connect(url, tls, connector).await? {
+        let made = connecting.finish(|| {
+            let (url, tls, connector) = (url.clone(), Arc::clone(tls), connector.clone());
+            async move { connect(&url, &tls, &connector).await }
+        });
+        match made.await? {
             Some(sender) => {
                 slot.conn.store(Some(Arc::new(H2Conn {
                     sender: sender.clone(),

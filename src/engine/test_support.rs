@@ -211,6 +211,33 @@ pub(crate) async fn silent_upstream() -> SocketAddr {
     address
 }
 
+/// 转到 `upstream` 的 TCP 前置：每条连接先压 `delay` 再接过去，握手因此慢这么久；返回它的地址和接下了几条连接
+/// A TCP front onto `upstream`: each connection is held for `delay` before being put through, so
+/// its handshake takes that much longer; its address, and how many connections it has accepted
+pub(crate) async fn slow_front(
+    upstream: SocketAddr,
+    delay: Duration,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let front = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the slow front");
+    let addr = front.local_addr().expect("read the slow front address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = front.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                }
+            });
+        }
+    });
+    (addr, accepted)
+}
+
 /// 照 `config` 建的引擎 / An engine built from `config`
 pub(crate) fn engine_from(config: Value) -> Engine {
     let config: crate::config::PipelineConfig =
