@@ -79,7 +79,7 @@ pub struct CacheKeys {
 
 /// Pre-parsed data from handle_packet_fast to avoid re-parsing
 /// 来自 handle_packet_fast 的预解析数据，避免重新解析
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PreParsedData {
     qname: Arc<str>,
     qtype: hickory_proto::rr::RecordType,
@@ -87,15 +87,38 @@ pub struct PreParsedData {
     tx_id: u16,
     edns_present: bool,
     pipeline_id: Arc<str>,
+    /// 选出 `pipeline_id` 的那份配置：请求接着在异步路径上也用它。以前异步路径再取一次当前的配置，中间赶上热重载时，
+    /// 旧配置选的 pipeline 在新配置里没有，就落到默认转发上，既不是旧配置也不是新配置会给的回答（新配置里的拦截规则也
+    /// 就被绕过）
+    /// The configuration that selected `pipeline_id`, which the request keeps using on the async path.
+    /// The async path used to take the current configuration again, and with a hot reload in between
+    /// a pipeline the old one selected that the new one lacks fell through to the default forward, an
+    /// answer neither configuration would give (going past the new one's blocking rules as well)
+    state: Arc<EngineInner>,
 }
+/// 配置快照太大，不打出来 / The configuration snapshot is too large to print
+impl std::fmt::Debug for PreParsedData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreParsedData")
+            .field("qname", &self.qname)
+            .field("qtype", &self.qtype)
+            .field("qclass", &self.qclass)
+            .field("tx_id", &self.tx_id)
+            .field("edns_present", &self.edns_present)
+            .field("pipeline_id", &self.pipeline_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PreParsedData {
-    pub fn new(
+    pub(crate) fn new(
         qname: impl Into<Arc<str>>,
         qtype: u16,
         qclass: u16,
         tx_id: u16,
         edns_present: bool,
         pipeline_id: Arc<str>,
+        state: Arc<EngineInner>,
     ) -> Self {
         Self {
             qname: qname.into(),
@@ -104,6 +127,7 @@ impl PreParsedData {
             tx_id,
             edns_present,
             pipeline_id,
+            state,
         }
     }
 
@@ -1046,7 +1070,31 @@ impl Engine {
             q.tx_id,
             q.edns_present,
             owned_pipeline_id(),
+            arc_swap::Guard::into_inner(state),
         ))))
+    }
+
+    /// 引擎现在这份配置下的一个查询的预解析数据，和快速路径交给异步路径的一样（见 [`PreParsedData`]）
+    /// The pre-parsed data of a query under the engine's configuration now, as the fast path hands
+    /// to the async path (see [`PreParsedData`])
+    pub fn pre_parsed(
+        &self,
+        qname: impl Into<Arc<str>>,
+        qtype: u16,
+        qclass: u16,
+        tx_id: u16,
+        edns_present: bool,
+        pipeline_id: Arc<str>,
+    ) -> PreParsedData {
+        PreParsedData::new(
+            qname,
+            qtype,
+            qclass,
+            tx_id,
+            edns_present,
+            pipeline_id,
+            self.state.load_full(),
+        )
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
@@ -1253,8 +1301,13 @@ impl Engine {
         let request_id = next_request_id();
         // A request uses one immutable configuration snapshot from selection
         // through response actions and cache writes. Background refresh passes
-        // the snapshot that produced its cache key via `state_override`.
-        let state = state_override.unwrap_or_else(|| self.state.load_full());
+        // the snapshot that produced its cache key via `state_override`, and the
+        // fast path the one that selected its pipeline via `pre_parsed`.
+        let state = match (state_override, &pre_parsed) {
+            (Some(state), _) => state,
+            (None, Some(pre)) => Arc::clone(&pre.state),
+            (None, None) => self.state.load_full(),
+        };
         let cfg = &state.pipeline;
         let min_ttl = cfg.min_ttl();
         let upstream_timeout = cfg.upstream_timeout();
@@ -2312,6 +2365,57 @@ mod tests {
         let config: crate::config::PipelineConfig =
             serde_json::from_value(raw).expect("parse config");
         RuntimePipelineConfig::from_config(config).expect("build runtime config")
+    }
+
+    /// 快速路径选好 pipeline、转去异步处理的查询，中间赶上热重载也照旧用选出它的那份配置。以前异步路径再取一次当前
+    /// 配置：新配置里没有旧配置选的 pipeline，就落到默认转发上，回答来自两份配置都不会去问的上游
+    /// A query the fast path selected a pipeline for and passed on to the async path keeps using
+    /// the configuration that selected it, a hot reload in between notwithstanding. The async path
+    /// used to take the current configuration again: lacking the pipeline the old one selected, it
+    /// fell through to the default forward, the answer coming from an upstream neither
+    /// configuration would ask
+    #[tokio::test]
+    async fn a_query_deferred_by_the_fast_path_keeps_its_configuration_through_a_reload() {
+        let chosen = answering_upstream("192.0.2.1".parse().unwrap(), 300).await;
+        let default = answering_upstream("192.0.2.2".parse().unwrap(), 300).await;
+        let config = |pipeline: &str| {
+            let raw = serde_json::json!({
+                "settings": { "default_upstream": default.address },
+                "pipelines": [{ "id": pipeline, "rules": [{
+                    "name": "chosen",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": chosen.address }]
+                }] }]
+            });
+            let config: crate::config::PipelineConfig =
+                serde_json::from_value(raw).expect("parse config");
+            RuntimePipelineConfig::from_config(config).expect("build runtime config")
+        };
+        let engine = Engine::new(config("old"), "test".to_string()).expect("engine");
+        let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let packet = request.to_vec().unwrap();
+        let peer: SocketAddr = "10.0.0.1:53000".parse().unwrap();
+        let Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) =
+            engine.handle_packet_fast(&packet, peer)
+        else {
+            panic!("a miss goes on to the async path");
+        };
+
+        engine.reload(config("new"));
+        let answer = engine
+            .handle_packet_internal_with_pre_parsed(&packet, peer, false, pre_parsed)
+            .await
+            .expect("answered");
+        let answer = Message::from_bytes(&answer).expect("parse answer");
+        assert!(matches!(
+            answer.answers.first().map(|record| &record.data),
+            Some(RData::A(address)) if address.0 == "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
+        ));
+        assert_eq!((chosen.queries(), default.queries()), (1, 0));
     }
 
     /// 响应跳转执行请求所用配置快照里的目标 pipeline，跳过去拿到的应答缓存在跳转前那个 pipeline 的键下，同样的问题
@@ -4564,7 +4668,7 @@ mod tests {
             &packet,
             peer,
             false,
-            PreParsedData::new("a.test".to_string(), 1, 1, 0, false, Arc::from("main")),
+            engine.pre_parsed("a.test".to_string(), 1, 1, 0, false, Arc::from("main")),
         );
         for (entry, size) in [
             ("handle_packet", std::mem::size_of_val(&full)),

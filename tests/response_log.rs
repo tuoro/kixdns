@@ -9,7 +9,7 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use kixdns::config::parse_config;
-use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
+use kixdns::engine::{Engine, FastPathResponse};
 use kixdns::matcher::RuntimePipelineConfig;
 use serde_json::{Value, json};
 
@@ -166,7 +166,10 @@ async fn background_refresh_is_not_a_client_response() {
     let _capture = log.capture();
     let (addr, task) = upstream().await;
     let engine = engine(&addr);
-    let pre = PreParsedData::new("cache.test", 1, 1, 42, false, "default".into());
+    let Ok(Some(FastPathResponse::AsyncNeeded(pre))) = engine.handle_packet_fast(&query(), peer())
+    else {
+        panic!("a miss goes on to the async path");
+    };
     engine
         .handle_packet_internal_with_pre_parsed(&query(), peer(), true, pre)
         .await
