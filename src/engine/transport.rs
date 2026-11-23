@@ -2927,6 +2927,24 @@ pub(crate) fn check_upstream_address(
     }
 }
 
+/// 用 `transport` 连一个上游地址（不带前缀）之前要解析的主机名，读法和各个客户端连接时一样；写成 IP 的没有，UDP 只认 IP
+/// The host name to resolve before `transport` connects to one upstream address (prefix
+/// removed), read the way each client reads it when it connects; none for one written as an IP,
+/// and UDP takes IPs only
+pub(crate) fn host_name(address: &str, transport: crate::config::Transport) -> Option<String> {
+    use crate::config::Transport;
+
+    let host = match transport {
+        Transport::Udp | Transport::TcpUdp => return None,
+        Transport::Tcp if address.parse::<SocketAddr>().is_ok() => return None,
+        Transport::Tcp => address.rsplit_once(':')?.0.to_owned(),
+        Transport::Dot => parse_tls_upstream(address, "dot").ok()?.1,
+        Transport::Doq => parse_tls_upstream(address, "doq").ok()?.1,
+        Transport::Doh => url_host(&build_doh_url(address).ok()?.0)?,
+    };
+    host.parse::<std::net::IpAddr>().is_err().then_some(host)
+}
+
 /// DoT、DoQ 上游地址共有的部分：没写协议时补上 `scheme`，主机，端口（默认 853），不许带路径，
 /// `sni`/`servername` 参数（空的不算，多个时取最后一个）。错误文字里的协议名就是 `scheme`
 /// What DoT and DoQ upstream addresses share: `scheme` added when none is written, the
@@ -7555,7 +7573,6 @@ mod tests {
         let bootstrap = Bootstrap::new(
             &server.address,
             Arc::new(UdpClient::new(1).expect("UDP client")),
-            Duration::from_secs(2),
         );
         let query = udp_test_query("named.example");
         let budget = Duration::from_secs(2);
