@@ -1466,18 +1466,21 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 }
 
 /// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，一个国家
-/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时。启动、重载
-/// 和面板的校验都不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制
-/// 通道 `config` 结果的 `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
+/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时，还有规则用到、
+/// 却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
+/// 不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制通道 `config` 结果的
+/// `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
 /// [`RETIRED_SETTINGS`]) and the background refresh rule, a geoip matcher written with no
-/// country code, which never matches, a cache so large it may take a lot of memory, and an
-/// overall timeout too short for the resend and the TCP fallback. Startup, reloads and the
-/// panel's validation refuse none of them, nor do they count among [`problems`]; they are
-/// found as the configuration compiles (see `RuntimePipelineConfig::warnings`), listed in the
-/// validation answer and as `warnings` in the control channel's `config` result, and each is
-/// logged as a warn every time the configuration takes effect. They used to be logged only, out
-/// of sight at the default log level, and validation said nothing of them
+/// country code, which never matches, a cache so large it may take a lot of memory, an overall
+/// timeout too short for the resend and the TCP fallback, and Geo tags rules use with no data
+/// configured to read them from (which tags rules use is known once they compile, see
+/// [`geo_tags_without_data`]). Startup, reloads and the panel's validation refuse none of them,
+/// nor do they count among [`problems`]; they are found as the configuration compiles (see
+/// `RuntimePipelineConfig::warnings`), listed in the validation answer and as `warnings` in the
+/// control channel's `config` result, and each is logged as a warn every time the configuration
+/// takes effect. They used to be logged only, out of sight at the default log level, and
+/// validation said nothing of them
 pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     let mut found = Vec::new();
     if cfg.background_refresh_rule.is_some() {
@@ -1534,6 +1537,51 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
 
 /// 一个国家代码也没写的 geoip 匹配器 / A geoip matcher written with no country code
 const NO_COUNTRY_CODE: &str = "a geoip matcher written with no country code never matches";
+
+/// 规则用到（`geosite`、`geoip` 是它们用到的标签）、却没配可读的数据的 Geo 标签，每种一条 [`warnings`]：没写
+/// `geosite_data_paths` 时的 GeoSite 标签，没写 `geoip_dat_path` 时 MMDB 也答不了的 GeoIP 标签（MMDB 只有两个字母的
+/// 国家代码）。配置照样加载，用它们的规则却从不按数据判断：geo_site 和 geoip_country 永远不命中，geo_site_not 永远命中。
+/// 以前只在读了数据文件、文件里没有某个标签时才记一条告警，一个数据文件都没配时什么都不说
+/// The Geo tags rules use (`geosite` and `geoip` being those they use) with no data
+/// configured to read them from, one of the [`warnings`] for each kind: GeoSite tags without
+/// `geosite_data_paths`, and without `geoip_dat_path` the GeoIP tags the MMDB cannot answer
+/// either (it holds two-letter country codes alone). The configuration loads all the same,
+/// yet rules using them never judge by any data: geo_site and geoip_country never match, and
+/// geo_site_not always does. A warning used to be logged only once a data file was read and
+/// lacked a tag, and with no data file configured nothing was said at all
+pub(crate) fn geo_tags_without_data(
+    settings: &GlobalSettings,
+    mut geosite: Vec<String>,
+    geoip: &[String],
+) -> Vec<String> {
+    let mut found = Vec::new();
+    geosite.sort_unstable();
+    geosite.dedup();
+    if settings.geosite_data_paths.is_empty() && !geosite.is_empty() {
+        found.push(format!(
+            "GeoSite tags {} have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does",
+            geosite.join(", ")
+        ));
+    }
+    let unanswered: Vec<&str> = geoip
+        .iter()
+        .map(String::as_str)
+        .filter(|tag| {
+            settings.geoip_db_path.is_none() || !crate::matcher::geoip::is_country_tag(tag)
+        })
+        .collect();
+    if settings.geoip_dat_path.is_none() && !unanswered.is_empty() {
+        let mmdb = match settings.geoip_db_path {
+            Some(_) => ", and settings.geoip_db_path answers two-letter country codes alone",
+            None => " and neither is settings.geoip_db_path",
+        };
+        found.push(format!(
+            "GeoIP tags {} have no data to match against: settings.geoip_dat_path is not set{mmdb}, so geoip_country never matches them",
+            unanswered.join(", ")
+        ));
+    }
+    found
+}
 
 /// 以前有、后来删掉的设置：老配置里留着的照样能读，各算一条 [`warnings`]（配置每生效一次列出来、记一条 warn），不算
 /// [`problems`]，升级以后不必先改配置。智能流控的五个数字在流控改为自己判断以后不再用；`prefetch` 随它的实现撤掉了；
