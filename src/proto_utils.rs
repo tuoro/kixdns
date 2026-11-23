@@ -113,15 +113,19 @@ pub fn servfail_reply(query: &[u8]) -> Bytes {
 }
 
 /// 不读完请求就给得出的应答：请求头带着它的 ID、操作码、RD 和 CD，QR、RA 置位，RCODE 为 `rcode`；`question` 为 true 时
-/// 问题读得出不压缩的写法就带上（见 [`plain_question_end`]），各段计数都是 0。不比请求长，伪造来源也放大不了流量。请求至少
-/// 12 字节，由调用方查过
+/// 问题读得出不压缩的写法（见 [`question_name_end`]）、类型和类别也在报文里就带上，各段计数都是 0。不比请求长，伪造来源也
+/// 放大不了流量。请求至少 12 字节，由调用方查过
 /// A reply given without reading the request through: the request's header with its ID,
-/// opcode, RD and CD, QR and RA set, RCODE `rcode`; with `question` true, the question when it
-/// can be read uncompressed (see [`plain_question_end`]), every other count 0. It is no longer
-/// than the request, so a forged source gains no amplification. The request has at least 12
-/// bytes, as the caller has checked
+/// opcode, RD and CD, QR and RA set, RCODE `rcode`; with `question` true, the question when its
+/// name can be read uncompressed (see [`question_name_end`]) and its type and class are in the
+/// message, every other count 0. It is no longer than the request, so a forged source gains no
+/// amplification. The request has at least 12 bytes, as the caller has checked
 fn short_reply(request: &[u8], rcode: ResponseCode, question: bool) -> Bytes {
-    let question_end = question.then(|| plain_question_end(request)).flatten();
+    let question_end = question
+        .then(|| question_name_end(request))
+        .flatten()
+        .map(|end| end + 4)
+        .filter(|&end| end <= request.len());
     let mut reply = Vec::with_capacity(question_end.unwrap_or(12));
     reply.extend_from_slice(&request[..2]);
     reply.push(0x80 | (request[2] & 0x79));
@@ -166,25 +170,6 @@ pub fn header_reply(packet: &[u8]) -> Option<Bytes> {
         ResponseCode::FormErr
     };
     Some(short_reply(packet, rcode, false))
-}
-
-/// 查询里唯一一个问题的结尾，名字用了压缩指针、超长或问题没写完时为 None：这样的问题抄不到应答里
-/// Where the query's one question ends; None when its name has a compression pointer or
-/// is too long, or the question is cut short, as such a question cannot be copied to a reply
-fn plain_question_end(query: &[u8]) -> Option<usize> {
-    let mut pos = 12usize;
-    loop {
-        let label = *query.get(pos)? as usize;
-        if label > 63 || pos - 12 + label + 1 > MAX_NAME_LEN {
-            return None;
-        }
-        pos += 1 + label;
-        if label == 0 {
-            break;
-        }
-    }
-    let end = pos + 4;
-    (end <= query.len()).then_some(end)
 }
 
 /// DNS 报文头的长度 / The length of a DNS header
@@ -247,12 +232,12 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let mut max_jumps = 5;
     let mut current_pos = pos;
     let packet_len = packet.len();
-    // 名字在线上的长度，结尾的根标签占 1 字节，最多 MAX_NAME_LEN，和 `skip_name`、完整解析一样。以前只受 256 字节的
-    // 文本缓冲限制，线上 256 到 258 字节的名字在这里过得去，完整解析却回 FORMERR
+    // 名字在线上的长度，结尾的根标签占 1 字节，最多 MAX_NAME_LEN，和 `strict_name_end`、完整解析一样。以前只受 256
+    // 字节的文本缓冲限制，线上 256 到 258 字节的名字在这里过得去，完整解析却回 FORMERR
     // The name's length on the wire, the root label at the end taking 1 byte, at most
-    // MAX_NAME_LEN, as in `skip_name` and the full parse. Only the 256-byte text buffer used to
-    // bound it, so names of 256 to 258 bytes on the wire passed here and got FORMERR from the full
-    // parse
+    // MAX_NAME_LEN, as in `strict_name_end` and the full parse. Only the 256-byte text buffer
+    // used to bound it, so names of 256 to 258 bytes on the wire passed here and got FORMERR from
+    // the full parse
     let mut wire_len = 1usize;
 
     loop {
@@ -389,7 +374,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let mut ar_pos = pos;
     for _ in 0..ar_count {
         let owner_start = ar_pos;
-        let next_pos = skip_name(packet, ar_pos)?;
+        let next_pos = strict_name_end(packet, ar_pos)?;
         let fixed_end = next_pos.checked_add(10)?;
         if fixed_end > packet.len() {
             return None;
@@ -538,7 +523,7 @@ pub(crate) fn edns_version(packet: &[u8]) -> Option<u8> {
 /// carrying version 0, the one KixDNS supports, and the question copied. None when the
 /// question cannot be read.
 pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
-    let question_end = skip_name(query, 12)?.checked_add(4)?;
+    let question_end = strict_name_end(query, 12)?.checked_add(4)?;
     if question_end > query.len() {
         return None;
     }
@@ -595,7 +580,7 @@ pub(crate) fn answers_query(query: &[u8], response: &[u8]) -> bool {
         _ => return false,
     }
     let (Some(query_name_end), Some(response_name_end)) =
-        (skip_name(query, 12), skip_name(response, 12))
+        (strict_name_end(query, 12), strict_name_end(response, 12))
     else {
         return false;
     };
@@ -826,77 +811,26 @@ fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     copy.freeze()
 }
 
-/// 第一个问题名（不压缩，从偏移 12 开始）结束的位置；没有问题段时为 None
-/// Where the first question name ends, written uncompressed from offset 12; None
-/// without a question
+/// 第一个问题名结束的位置，名字不压缩、从偏移 12 开始写，不超过 [`MAX_NAME_LEN`]：这样的名字才能照字节抄进应答、和应答
+/// 里的比较。没有问题段、名字用了压缩指针或者超长时为 None；名字之后的类型和类别在不在报文里，由调用方查
+/// Where the first question name ends, written uncompressed from offset 12 and no longer than
+/// [`MAX_NAME_LEN`]: only such a name can be copied byte for byte into a reply, or compared with
+/// the reply's. None without a question, or with a compression pointer or too long a name;
+/// whether the type and class after the name are in the message is the caller's to check
 pub(crate) fn question_name_end(packet: &[u8]) -> Option<usize> {
-    if packet.len() < 12 || packet[4..6] == [0, 0] {
+    if packet.len() < HEADER_LEN || packet[4..6] == [0, 0] {
         return None;
     }
-    let mut pos = 12;
+    let mut pos = HEADER_LEN;
     loop {
         let len = *packet.get(pos)? as usize;
+        if len > 63 || pos - HEADER_LEN + 1 + len > MAX_NAME_LEN {
+            return None;
+        }
         if len == 0 {
             return Some(pos + 1);
         }
-        if len > 63 {
-            return None;
-        }
         pos += 1 + len;
-    }
-}
-
-/// 跳过 DNS 名称并返回下一个位置。名字连同压缩指针跳过去读到的部分超过 [`MAX_NAME_LEN`] 时读不了：不数的话，
-/// 一长串标签被许多条记录的属主名指着时，每个名字都要把它走一遍，走一遍报文的步数是报文长度的平方
-/// Skip DNS name and return next position. A name longer than [`MAX_NAME_LEN`], what a
-/// compression pointer leads to included, cannot be read: uncounted, a long run of labels
-/// that the owners of many records point into is walked for each of them, and one walk of the
-/// message takes the square of its length in steps
-#[inline]
-fn skip_name(packet: &[u8], mut pos: usize) -> Option<usize> {
-    let packet_len = packet.len();
-    let mut encoded_end = None;
-    let mut jumps = 0usize;
-    // 结尾的根标签占 1 字节 / The root label at the end takes 1 byte
-    let mut length = 1usize;
-
-    loop {
-        let len = *packet.get(pos)?;
-        if len == 0 {
-            return Some(encoded_end.unwrap_or(pos + 1));
-        }
-        if (len & 0xC0) == 0xC0 {
-            let pointer_end = pos.checked_add(2)?;
-            if pointer_end > packet_len {
-                return None;
-            }
-            encoded_end.get_or_insert(pointer_end);
-            let offset = (((len & 0x3F) as usize) << 8) | packet[pos + 1] as usize;
-            // Only to a prior occurrence (RFC 1035 section 4.1.4), as in `parse_quick`
-            // 只能指向前面出现过的名字（RFC 1035 第 4.1.4 节），同 `parse_quick`
-            if offset >= pos {
-                return None;
-            }
-            jumps += 1;
-            if jumps > 16 {
-                return None;
-            }
-            pos = offset;
-            continue;
-        }
-        if len & 0xC0 != 0 || len > 63 {
-            return None;
-        }
-
-        length += 1 + len as usize;
-        if length > MAX_NAME_LEN {
-            return None;
-        }
-        let next = pos.checked_add(1 + len as usize)?;
-        if next > packet_len {
-            return None;
-        }
-        pos = next;
     }
 }
 
@@ -950,7 +884,9 @@ fn section_count(packet: &[u8], index: usize) -> usize {
 /// ending past the message is not checked here: the next name then cannot be read, or
 /// the caller checks.
 fn skip_questions(packet: &[u8], count: usize) -> Option<usize> {
-    (0..count).try_fold(12usize, |pos, _| skip_name(packet, pos)?.checked_add(4))
+    (0..count).try_fold(12usize, |pos, _| {
+        strict_name_end(packet, pos)?.checked_add(4)
+    })
 }
 
 /// 报文里 `start` 处的一条记录：属主名之后的 10 个固定字节必须在报文之内，RDATA 只算出范围、
@@ -966,7 +902,7 @@ struct RecordAt {
 }
 
 fn record_at(packet: &[u8], start: usize) -> Option<RecordAt> {
-    let fixed = skip_name(packet, start)?;
+    let fixed = strict_name_end(packet, start)?;
     let header = packet.get(fixed..fixed.checked_add(10)?)?;
     let rdata_start = fixed + 10;
     let rd_len = u16::from_be_bytes([header[8], header[9]]) as usize;
@@ -1557,7 +1493,7 @@ fn extract_soa_negative_ttl_wire(packet: &[u8], qd_count: u16, ns_count: u16) ->
 
     // Skip Question section / 跳过 Question 部分
     for _ in 0..qd_count {
-        pos = skip_dns_name_wire(packet, pos)?;
+        pos = strict_name_end(packet, pos)?;
         pos += 4; // QTYPE(2) + QCLASS(2)
         if pos > packet_len {
             return None;
@@ -1573,7 +1509,7 @@ fn soa_negative_ttl_at(packet: &[u8], mut pos: usize, ns_count: u16) -> Option<u
 
     // Walk Authority section looking for SOA (type 6) / 遍历 Authority 部分查找 SOA (type 6)
     for _ in 0..ns_count {
-        pos = skip_dns_name_wire(packet, pos)?;
+        pos = strict_name_end(packet, pos)?;
         if pos + 10 > packet_len {
             return None;
         }
@@ -1597,10 +1533,10 @@ fn soa_negative_ttl_at(packet: &[u8], mut pos: usize, ns_count: u16) -> Option<u
             }
             // Skip MNAME (domain name in rdata, may use compression pointers)
             // 跳过 MNAME（rdata 中的域名，可能使用压缩指针）
-            let after_mname = skip_dns_name_wire(packet, pos)?;
+            let after_mname = strict_name_end(packet, pos)?;
             // Skip RNAME (domain name in rdata)
             // 跳过 RNAME（rdata 中的域名）
-            let after_rname = skip_dns_name_wire(packet, after_mname)?;
+            let after_rname = strict_name_end(packet, after_mname)?;
             // 5 × u32 = 20 bytes: SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM
             let fixed_fields_start = after_rname;
             if fixed_fields_start + 20 > rdata_end {
@@ -1741,19 +1677,27 @@ fn well_formed_rdata(packet: &[u8], rr_type: u16, rdata: std::ops::Range<usize>)
     }
 }
 
-/// 严格读一个名字，返回它在 `start` 处的编码结束的位置：标签不超过 63 字节，整个名字不超过 255
-/// 字节；压缩指针跳过去以后读到的每个字节都在指针所在那段的开头之前，所以指针只能往前指，不会
-/// 绕圈，也不会读进跳出来的那段（和 hickory 的规则一样）；指针也不能指进报文头（偏移 12 以前），
-/// 那里不会有名字，报文头一改（换事务 ID）名字就跟着变。
-/// Read a name strictly and return where its encoding at `start` ends: labels of at
-/// most 63 bytes and at most 255 bytes in all; everything read after a compression
-/// pointer lies before the start of the part the pointer is in, so a pointer can only
-/// point back, cannot loop, and cannot read into the part it jumped from (hickory's
-/// rule too); nor can a pointer point into the header (before offset 12), where no name
-/// starts and where the name would change with the header (a new transaction ID).
+/// 读一个名字，返回它在 `start` 处的编码结束的位置；读名字、跳过名字的地方都用它（快速解析的问题名另有一份，要连着写出文本，
+/// 规则相同）。标签不超过 63 字节，整个名字连同压缩指针跳过去读到的部分不超过 [`MAX_NAME_LEN`]；压缩指针跳过去以后读到的
+/// 每个字节都在指针所在那段的开头之前，所以指针只能往前指，不会绕圈，也不会读进跳出来的那段（和 hickory 的规则一样）；指针
+/// 也不能指进报文头（偏移 12 以前），那里不会有名字，报文头一改（换事务 ID）名字就跟着变；最多跳 16 次。长度和跳数不数的话，
+/// 许多条记录的属主名指着一长串标签或者一长串指针时，每个名字都要把它走一遍，走一遍报文的步数是报文长度的平方。以前另有两份：
+/// 一份不跳指针、什么都不查，一份许指针指进报文头
+/// Reads a name and returns where its encoding at `start` ends; wherever names are read or
+/// skipped this is used (the quick parse has its own for the question name, writing out the
+/// text as it goes, by the same rules). Labels of at most 63 bytes, and at most
+/// [`MAX_NAME_LEN`] in all, what compression pointers lead to included; everything read after a
+/// pointer lies before the start of the part the pointer is in, so a pointer can only point
+/// back, cannot loop, and cannot read into the part it jumped from (hickory's rule too); nor can
+/// a pointer point into the header (before offset 12), where no name starts and where the name
+/// would change with the header (a new transaction ID); at most 16 jumps. Without counting the
+/// length and the jumps, a long run of labels or of pointers that the owners of many records
+/// point into is walked for each of them, and one walk of the message takes the square of its
+/// length in steps. There used to be two more: one that followed no pointer and checked nothing,
+/// one that let a pointer point into the header
 fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
     let (mut pos, mut part_start, mut limit) = (start, start, usize::MAX);
-    let (mut end, mut length) = (None, 1usize);
+    let (mut end, mut length, mut jumps) = (None, 1usize, 0);
     loop {
         if pos >= limit {
             return None;
@@ -1770,7 +1714,8 @@ fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
             }
             0xC0..=0xFF => {
                 let target = (len & 0x3F) << 8 | *packet.get(pos + 1)? as usize;
-                if target < HEADER_LEN {
+                jumps += 1;
+                if target < HEADER_LEN || jumps > 16 {
                     return None;
                 }
                 end.get_or_insert(pos + 2);
@@ -1789,38 +1734,6 @@ fn strict_name_end(packet: &[u8], start: usize) -> Option<usize> {
 #[inline]
 pub(crate) fn received_ttl(raw: u32) -> u32 {
     if raw & 0x8000_0000 != 0 { 0 } else { raw }
-}
-
-/// Skip a DNS name at the given position, following compression pointers.
-/// Returns the position after the name, or None on parse error.
-///
-/// 跳过指定位置的 DNS 名称，处理压缩指针。
-/// 返回名称之后的位置，解析错误时返回 None。
-#[inline]
-fn skip_dns_name_wire(packet: &[u8], mut pos: usize) -> Option<usize> {
-    let packet_len = packet.len();
-    loop {
-        if pos >= packet_len {
-            return None;
-        }
-        let len = packet[pos];
-        if len == 0 {
-            return Some(pos + 1);
-        }
-        if (len & 0xC0) == 0xC0 {
-            // Compression pointer: 2 bytes total / 压缩指针：共 2 字节
-            if pos + 2 > packet_len {
-                return None;
-            }
-            return Some(pos + 2);
-        }
-        // Regular label / 常规标签
-        let jump = 1 + len as usize;
-        if pos + jump > packet_len {
-            return None;
-        }
-        pos += jump;
-    }
 }
 
 pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
@@ -1873,7 +1786,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // Skip Questions / 跳过问题部分
     for _ in 0..qd_count {
         // Skip Name / 跳过名称
-        pos = skip_dns_name_wire(packet, pos)?;
+        pos = strict_name_end(packet, pos)?;
         // Skip Type(2) + Class(2) / 跳过类型(2) + 类别(2)
         if pos + 4 > packet_len {
             return None;
@@ -1890,7 +1803,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     // Scan Answers / 扫描应答部分
     for _ in 0..an_count {
         // Skip Name / 跳过名称
-        pos = skip_dns_name_wire(packet, pos)?;
+        pos = strict_name_end(packet, pos)?;
 
         if pos + 10 > packet_len {
             return None;
@@ -2268,6 +2181,30 @@ mod tests {
         }
     }
 
+    /// 一个名字最多跳 16 次指针：一串指针一个指着前一个，许多名字指着它的末尾时，每个都要把整串走一遍。以前跳过名字的那份数着，
+    /// 校验应答的那份不数，一份上游的应答能让它走上报文长度的平方那么多步
+    /// A name takes at most 16 pointer jumps: with a run of pointers each pointing at the one
+    /// before and many names pointing at its end, each walks the whole run. The walker that
+    /// skipped names counted them and the one checking replies did not, so an upstream's reply
+    /// could have it take the square of the message's length in steps
+    #[test]
+    fn a_name_takes_at_most_sixteen_jumps() {
+        // 偏移 12 是名字 a，之后每个指针指着前一个 / The name a at offset 12, then each pointer
+        // pointing at the one before
+        let mut packet = vec![0u8; 12];
+        packet.extend_from_slice(&[1, b'a', 0]);
+        packet.extend_from_slice(&[0xC0, 12]);
+        for at in (15..).step_by(2).take(16) {
+            packet.extend_from_slice(&[0xC0, at as u8]);
+        }
+        let jumps_from = |jumps: usize| 15 + 2 * (jumps - 1);
+        assert_eq!(
+            strict_name_end(&packet, jumps_from(16)),
+            Some(jumps_from(16) + 2)
+        );
+        assert_eq!(strict_name_end(&packet, jumps_from(17)), None);
+    }
+
     /// 各段计数为 `counts`（问题、Answer、Authority、Additional）的应答报文头
     /// A reply header with section counts `counts` (questions, Answer, Authority, Additional)
     fn header_with(counts: [u16; 4]) -> Vec<u8> {
@@ -2469,14 +2406,14 @@ mod tests {
         run
     }
 
-    /// 一个名字连同压缩指针跳过去读到的部分，总共不超过 255 字节（RFC 1035 第 2.3.4 节）。`skip_name` 以前不数：
+    /// 一个名字连同压缩指针跳过去读到的部分，总共不超过 255 字节（RFC 1035 第 2.3.4 节）。跳过名字的那份以前不数：
     /// 一条记录的 RDATA 里放一长串标签，后面每条记录的属主名都指进去，每个名字都要把这一长串走一遍。64 KiB 的
     /// TCP 或 DoH 报文里放两千多条这样的记录，走一遍报文就是几千万步，一个查询要走好几遍
     /// A name is at most 255 bytes in all, what a compression pointer leads to included (RFC 1035
-    /// section 2.3.4). `skip_name` did not count: with a long run of labels in one record's RDATA
-    /// and the owner of every later record pointing into it, each name walked the whole run. Over
-    /// two thousand such records in a 64 KiB TCP or DoH message made one walk of the message tens
-    /// of millions of steps, and a query is walked several times
+    /// section 2.3.4). The walker skipping names did not count it: with a long run of labels in
+    /// one record's RDATA and the owner of every later record pointing into it, each name walked
+    /// the whole run. Over two thousand such records in a 64 KiB TCP or DoH message made one walk
+    /// of the message tens of millions of steps, and a query is walked several times
     #[test]
     fn a_name_is_at_most_255_bytes_through_pointers_too() {
         // 第一条附加记录的 RDATA 是一串标签，第二条的属主名指进去 / The first additional record's RDATA
@@ -2496,11 +2433,11 @@ mod tests {
         };
         // 127 个标签加根正好 255 字节 / 127 labels and the root come to exactly 255 bytes
         let (packet, second) = pointing_into_a_run_of(127);
-        assert_eq!(skip_name(&packet, second), Some(second + 2));
+        assert_eq!(strict_name_end(&packet, second), Some(second + 2));
         assert_eq!(find_opt(&packet), Ok(None));
 
         let (packet, second) = pointing_into_a_run_of(128);
-        assert_eq!(skip_name(&packet, second), None);
+        assert_eq!(strict_name_end(&packet, second), None);
         assert!(find_opt(&packet).is_err());
 
         // 不经指针、直接写在原地的也一样 / The same for one written in place, with no pointer
@@ -2512,9 +2449,9 @@ mod tests {
             (packet, owner)
         };
         let (packet, owner) = in_place(127);
-        assert_eq!(skip_name(&packet, owner), Some(owner + 255));
+        assert_eq!(strict_name_end(&packet, owner), Some(owner + 255));
         let (packet, owner) = in_place(128);
-        assert_eq!(skip_name(&packet, owner), None);
+        assert_eq!(strict_name_end(&packet, owner), None);
 
         // 正好 256 字节：126 个单字节标签、一个两字节的标签，加根
         // Exactly 256 bytes: 126 one-byte labels, one of two bytes, and the root
@@ -2523,7 +2460,7 @@ mod tests {
         packet.extend_from_slice(&label_run(126)[..252]);
         packet.extend_from_slice(&[2, b'y', b'y', 0]);
         packet.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 192, 0, 2, 1]);
-        assert_eq!(skip_name(&packet, owner), None);
+        assert_eq!(strict_name_end(&packet, owner), None);
     }
 
     #[test]
@@ -3850,8 +3787,8 @@ mod tests {
             let packet = reply(true, Some(("198.51.100.0", 24, 24)), false);
             // The reply is the question, one answer, then the OPT record
             // 应答依次是问题、一条回答、OPT 记录
-            let question_end = skip_name(&packet, 12).unwrap() + 4;
-            let answer_fixed = skip_name(&packet, question_end).unwrap();
+            let question_end = strict_name_end(&packet, 12).unwrap() + 4;
+            let answer_fixed = strict_name_end(&packet, question_end).unwrap();
             let answer_end = answer_fixed
                 + 10
                 + u16::from_be_bytes([packet[answer_fixed + 8], packet[answer_fixed + 9]]) as usize;
