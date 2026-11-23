@@ -65,11 +65,15 @@ const MAX_DIAGNOSTIC_BODY: usize = 2 * 1024;
 const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const QUERY_STATS_BUCKET_SECONDS: u64 = 3_600;
 const QUERY_STATS_BUCKETS: usize = 24;
-/// 一个钟头最多记多少项。各线程分开记，同一个域名可能在几个线程里各占一项，所以留出两倍的地方
-/// How many entries an hour holds at most. Threads count apart and one name may take an entry in several of
-/// them, so there is twice the room
-const QUERY_STATS_DOMAIN_CAP: usize = 8_192;
-const QUERY_STATS_CLIENT_CAP: usize = 2_048;
+/// 一个线程在一个钟头里的排行清理以后留几项（见 [`TopCounts`]），最多存两倍。一格 16 个线程的份，24 格一天：域名和客户端
+/// 各最多约五万项，几 MB。以前一个钟头最多八千项、满了就不再记新的，一天要二十来 MB，而满了以后才热起来的名字一次都
+/// 排不上
+/// How many entries one thread's ranking of an hour keeps when it is cleared (see [`TopCounts`]), with
+/// room for twice that. Sixteen threads' shares a bucket and 24 buckets a day make at most some fifty
+/// thousand entries each for names and clients, a few MB. An hour used to hold up to eight thousand and
+/// take no new ones once full, some twenty MB a day, and a name only becoming popular after that never
+/// ranked at all
+const QUERY_STATS_KEPT: usize = 64;
 
 thread_local! {
     /// 拼统计键的缓冲，每个线程一份、反复使用：已有的统计项按它直接查到，计数时不再为键分配内存
@@ -125,20 +129,78 @@ struct ActiveConfig {
 #[derive(Default)]
 struct StatsShard {
     requests: u64,
-    dropped_updates: u64,
-    domains: HashMap<Arc<str>, u64>,
-    clients: HashMap<IpAddr, u64>,
+    domains: TopCounts<Arc<str>>,
+    clients: TopCounts<IpAddr>,
 }
 
-/// 一个钟头的排行。每个线程记自己那一份，读的时候合起来：每个查询都要记，放在一张表上就是所有核轮流抢它的锁和计数。
-/// 只有新来一项才碰共用的条数
+/// 一份有界的排行：最多存 `2 × QUERY_STATS_KEPT` 项，存满了要添新的一项时，只留计数排在前 `QUERY_STATS_KEPT` 的，
+/// 清掉的计数记进 `dropped`。只来一次的名字（随机子域名）一批批清掉，常来的一直留着；晚来的热门名字照样进得来，计数涨
+/// 上去以后下次清理也留得住。每项摊下来是常数时间：清一次 O(K)，清完至少空出 K 个位置
+/// A bounded ranking: it stores up to `2 × QUERY_STATS_KEPT` entries, and when full with a new one to add
+/// it keeps only those whose counts rank in the top `QUERY_STATS_KEPT`, the counts cleared going into
+/// `dropped`. Names that come once (random subdomains) are cleared batch by batch while frequent ones
+/// stay; a popular name coming late still gets in, and once its count has grown it stays through the next
+/// clearing. Each entry costs constant time on average: a clearing takes O(K) and frees K places at least
+struct TopCounts<K> {
+    counts: HashMap<K, u64>,
+    dropped: u64,
+}
+
+impl<K> Default for TopCounts<K> {
+    fn default() -> Self {
+        Self {
+            counts: HashMap::new(),
+            dropped: 0,
+        }
+    }
+}
+
+impl<K: Eq + std::hash::Hash> TopCounts<K> {
+    /// 给 `key` 记一次 / Counts `key` once
+    fn count<Q>(&mut self, key: &Q, owned: impl FnOnce() -> K)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        if let Some(count) = self.counts.get_mut(key) {
+            *count += 1;
+            return;
+        }
+        if self.counts.len() >= 2 * QUERY_STATS_KEPT {
+            self.keep_the_top();
+        }
+        self.counts.insert(owned(), 1);
+    }
+
+    /// 只留计数排在前 `QUERY_STATS_KEPT` 的项，和第 `QUERY_STATS_KEPT` 名一样多的随便留几个凑够 / Keeps only the
+    /// entries whose counts rank in the top `QUERY_STATS_KEPT`, any of those tied with the last one making up
+    /// the number
+    fn keep_the_top(&mut self) {
+        let mut counts: Vec<u64> = self.counts.values().copied().collect();
+        let (above, floor, _) =
+            counts.select_nth_unstable_by(QUERY_STATS_KEPT - 1, |a, b| b.cmp(a));
+        let floor = *floor;
+        let mut ties = QUERY_STATS_KEPT - above.iter().filter(|&&count| count > floor).count();
+        let mut dropped = 0;
+        self.counts.retain(|_, &mut count| {
+            let keep = count > floor || (count == floor && ties > 0);
+            if count == floor && keep {
+                ties -= 1;
+            }
+            if !keep {
+                dropped += count;
+            }
+            keep
+        });
+        self.dropped += dropped;
+    }
+}
+
+/// 一个钟头的排行。每个线程记自己那一份，读的时候合起来：每个查询都要记，放在一张表上就是所有核轮流抢它的锁和计数
 /// One hour of rankings. Each thread counts in its own share and reading merges them: every query is
-/// counted, and on one table all cores would take turns fighting over its locks and counts. Only a new entry
-/// touches the shared numbers of entries
+/// counted, and on one table all cores would take turns fighting over its locks and counts
 struct QueryStatsBucket {
     epoch: AtomicU64,
-    domain_entries: AtomicUsize,
-    client_entries: AtomicUsize,
     rotate_lock: Mutex<()>,
     shards: Box<[OwnLines<Mutex<StatsShard>>]>,
 }
@@ -147,8 +209,6 @@ impl QueryStatsBucket {
     fn new() -> Self {
         Self {
             epoch: AtomicU64::new(0),
-            domain_entries: AtomicUsize::new(0),
-            client_entries: AtomicUsize::new(0),
             rotate_lock: Mutex::new(()),
             shards: (0..COUNT_CELLS).map(|_| OwnLines::default()).collect(),
         }
@@ -182,8 +242,6 @@ impl QueryStatsBucket {
             .iter()
             .map(|shard| std::mem::take(&mut *shard.lock()))
             .collect::<Vec<_>>();
-        self.domain_entries.store(0, Ordering::Relaxed);
-        self.client_entries.store(0, Ordering::Relaxed);
         self.epoch.store(epoch, Ordering::Release);
         drop(guard);
         drop(old);
@@ -192,57 +250,10 @@ impl QueryStatsBucket {
     /// 这个线程记一次 / This thread counts one query
     fn record(&self, domain: &str, client: IpAddr) {
         let mut shard = self.shards[thread_cell()].lock();
-        let shard = &mut *shard;
         shard.requests += 1;
-        let domain_recorded = record_capped(
-            &mut shard.domains,
-            &self.domain_entries,
-            QUERY_STATS_DOMAIN_CAP,
-            domain,
-            || Arc::from(domain),
-        );
-        let client_recorded = record_capped(
-            &mut shard.clients,
-            &self.client_entries,
-            QUERY_STATS_CLIENT_CAP,
-            &client,
-            || client,
-        );
-        if !domain_recorded || !client_recorded {
-            shard.dropped_updates += 1;
-        }
+        shard.domains.count(domain, || Arc::from(domain));
+        shard.clients.count(&client, || client);
     }
-}
-
-/// 给 `map` 里的 `key` 记一次；没有这一项时新建，`entries` 记着各线程一共有几项，到了 `cap` 就不再新建，返回 false
-/// Counts `key` once in `map`, adding it when absent; `entries` holds how many all threads have together,
-/// and none is added once it reaches `cap`, which gives false
-fn record_capped<K, Q>(
-    map: &mut HashMap<K, u64>,
-    entries: &AtomicUsize,
-    cap: usize,
-    key: &Q,
-    owned: impl FnOnce() -> K,
-) -> bool
-where
-    K: std::borrow::Borrow<Q> + Eq + std::hash::Hash,
-    Q: Eq + std::hash::Hash + ?Sized,
-{
-    if let Some(count) = map.get_mut(key) {
-        *count += 1;
-        return true;
-    }
-    // 满了就不再为新的一项分配：随机子域名一多，这条路每个查询都会走
-    // Full: no allocation for a new entry, a path every query takes once random subdomains pour in
-    if entries.load(Ordering::Relaxed) >= cap {
-        return false;
-    }
-    if entries.fetch_add(1, Ordering::Relaxed) >= cap {
-        entries.fetch_sub(1, Ordering::Relaxed);
-        return false;
-    }
-    map.insert(owned(), 1);
-    true
 }
 
 /// 查询排行：开了控制通道就一直统计，客户端地址照原样记。配置里的 `statistics_enabled` 和
@@ -284,10 +295,23 @@ fn add_counts<K: Clone + Eq + std::hash::Hash>(
     }
 }
 
-/// `totals` 里排在前 `limit` 的几项 / The top `limit` entries of `totals`
+/// `totals` 里排在前 `limit` 的几项：先按计数选出这几项，只给它们拼名字。以前一天的窗口要把几十万项都转成字符串、整个
+/// 排一遍，最后只留几十条
+/// The top `limit` entries of `totals`: those are picked by count first and only they get their names
+/// spelled out. A day's window used to turn some hundreds of thousands of entries into strings and sort
+/// them all, keeping a few tens in the end
 #[cfg_attr(not(unix), allow(dead_code))]
-fn top<K: std::fmt::Display>(totals: HashMap<K, u64>, limit: usize) -> Vec<TopStat> {
-    let mut rows = totals
+fn top<K: std::fmt::Display + Ord>(totals: HashMap<K, u64>, limit: usize) -> Vec<TopStat> {
+    let mut picked = totals.into_iter().collect::<Vec<_>>();
+    if picked.len() > limit {
+        // 计数一样多的按键排先后，正好选出 `limit` 项：随机子域名一多，计数为 1 的成千上万，不能都留着去拼名字
+        // Tied counts go by the key, so exactly `limit` are picked: with random subdomains pouring in
+        // there are thousands counted once, too many to spell out
+        let by_rank = |a: &(K, u64), b: &(K, u64)| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0));
+        picked.select_nth_unstable_by(limit, by_rank);
+        picked.truncate(limit);
+    }
+    let mut rows = picked
         .into_iter()
         .map(|(key, count)| TopStat {
             name: key.to_string(),
@@ -345,9 +369,11 @@ impl QueryStats {
             for shard in &bucket.shards {
                 let shard = shard.lock();
                 requests_observed = requests_observed.saturating_add(shard.requests);
-                dropped_updates = dropped_updates.saturating_add(shard.dropped_updates);
-                add_counts(&mut domains, &shard.domains);
-                add_counts(&mut clients, &shard.clients);
+                dropped_updates = dropped_updates
+                    .saturating_add(shard.domains.dropped)
+                    .saturating_add(shard.clients.dropped);
+                add_counts(&mut domains, &shard.domains.counts);
+                add_counts(&mut clients, &shard.clients.counts);
             }
         }
 
@@ -2666,7 +2692,7 @@ mod tests {
 
     use super::{
         MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_BUCKET_SECONDS, QUERY_STATS_BUCKETS,
-        QUERY_STATS_CLIENT_CAP, QUERY_STATS_DOMAIN_CAP, QueryStats, QueryStatsBucket, TopStat,
+        QUERY_STATS_KEPT, QueryStats, QueryStatsBucket, TopStat,
     };
 
     #[derive(Clone, Default)]
@@ -3435,9 +3461,11 @@ mod tests {
         );
     }
 
-    /// 算排行也不占着处理 DNS 的线程：几个钟头、几万个名字的排行在算的时候，运行时照常干别的
-    /// Working out the rankings holds no thread that serves DNS either: with several hours and
-    /// tens of thousands of names to rank, the runtime goes on with other work meanwhile
+    /// 算排行也不占着处理 DNS 的线程：交给阻塞线程去算，等结果的时候运行时照常干别的。测试用的是单线程运行时，在这里
+    /// 同步算的话另一个任务一次也轮不到
+    /// Working out the rankings holds no thread that serves DNS either: it goes to a blocking thread, and
+    /// while waiting for the result the runtime goes on with other work. The test runs on a single-thread
+    /// runtime, where ranking inline would leave the other task not a single turn
     #[cfg(unix)]
     #[tokio::test]
     async fn working_out_the_rankings_leaves_the_runtime_free() {
@@ -3468,8 +3496,8 @@ mod tests {
         other.abort();
         assert_eq!(response.status(), hyper::StatusCode::OK);
         assert!(
-            during > 1000,
-            "the runtime had {during} turns for other work while ranking"
+            during > 0,
+            "the runtime had no turn for other work while ranking"
         );
     }
 
@@ -3957,40 +3985,44 @@ mod tests {
         assert_eq!(snapshot.clients[0].name, "192.168.1.42");
     }
 
+    /// 一大批只来一次的名字之后，晚来的热门名字照样排第一，清掉的计数记成丢弃。以前满了就不再记新名字，它一次都排不上
+    /// After a flood of names that come once, a popular name coming late still ranks first, and the
+    /// counts cleared are reported as dropped. New names used to be taken no more once full, and it never
+    /// ranked
     #[test]
-    fn caps_unique_domains_and_reports_dropped_updates() {
+    fn a_late_popular_name_ranks_after_a_flood_of_unique_names() {
         let stats = QueryStats::default();
         let client: IpAddr = "127.0.0.1".parse().unwrap();
-        for index in 0..QUERY_STATS_DOMAIN_CAP + 8 {
+        let flood = 100 * QUERY_STATS_KEPT;
+        for index in 0..flood {
             stats.record_at(&format!("{index}.example"), client, 3_600);
         }
-
-        let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_DOMAIN_CAP + 8);
-        assert_eq!(snapshot.domains.len(), QUERY_STATS_DOMAIN_CAP);
-        assert_eq!(snapshot.dropped_updates, 8);
-
-        // 满了以后已经在榜上的名字照样计数 / Once full, names already ranked still count
-        stats.record_at("0.example", client, 3_600);
-        let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_DOMAIN_CAP + 8);
-        assert_eq!(snapshot.domains[0].name, "0.example");
-        assert_eq!(snapshot.domains[0].count, 2);
-        assert_eq!(snapshot.dropped_updates, 8);
+        for _ in 0..50 {
+            stats.record_at("late.example", client, 3_600);
+        }
+        let snapshot = stats.snapshot(3_600, 3_600, 10);
+        assert_eq!(snapshot.domains[0].name, "late.example");
+        assert_eq!(snapshot.domains[0].count, 50);
+        assert_eq!(snapshot.requests_observed, flood as u64 + 50);
+        assert!(snapshot.dropped_updates > 0);
     }
 
+    /// 客户端也一样：很多只来一次的客户端之后，晚来的常客照样排第一
+    /// The same for clients: after many that come once, a frequent one coming late still ranks first
     #[test]
-    fn caps_unique_clients_and_keeps_counting_ranked_ones() {
+    fn a_late_busy_client_ranks_after_many_others() {
         let stats = QueryStats::default();
         let client = |index: usize| IpAddr::from(Ipv4Addr::from(0x0a00_0000 + index as u32));
-        for index in 0..QUERY_STATS_CLIENT_CAP + 8 {
+        for index in 0..10 * QUERY_STATS_KEPT {
             stats.record_at("example.com", client(index), 3_600);
         }
-        stats.record_at("example.com", client(0), 3_600);
-
-        let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_CLIENT_CAP + 8);
-        assert_eq!(snapshot.clients.len(), QUERY_STATS_CLIENT_CAP);
-        assert_eq!(snapshot.dropped_updates, 8);
-        assert_eq!(snapshot.clients[0].name, "10.0.0.0");
-        assert_eq!(snapshot.clients[0].count, 2);
+        let busy = IpAddr::from(Ipv4Addr::new(192, 0, 2, 1));
+        for _ in 0..20 {
+            stats.record_at("example.com", busy, 3_600);
+        }
+        let snapshot = stats.snapshot(3_600, 3_600, 10);
+        assert_eq!(snapshot.clients[0].name, "192.0.2.1");
+        assert_eq!(snapshot.clients[0].count, 20);
     }
 
     /// 线程各写各的格子，读到的是总数；线程比格子多时共用一格，也一样
@@ -4103,15 +4135,15 @@ mod tests {
         assert_eq!(bucket.epoch.load(Ordering::Acquire), 3_600);
     }
 
-    /// 条数上限算的是所有线程加起来：一起来很多新名字也不会超，多出来的记成丢弃
-    /// The cap on entries is across all threads: however many new names come at once it is not passed, and
-    /// those beyond it count as dropped
+    /// 各线程一起来很多新名字，一格里存的项数也有上限；留下的计数加上丢弃的计数正好是请求数，一个不少
+    /// With many new names from several threads at once, what a bucket stores stays bounded; the counts kept
+    /// and those dropped add up to the requests exactly, none lost
     #[test]
-    fn the_cap_on_entries_holds_across_threads() {
+    fn the_entries_stay_bounded_across_threads() {
         const THREADS: usize = 8;
         let stats = std::sync::Arc::new(QueryStats::default());
         let client: IpAddr = "192.0.2.1".parse().unwrap();
-        let each = QUERY_STATS_DOMAIN_CAP / THREADS + 100;
+        let each = 20 * QUERY_STATS_KEPT;
         let threads = (0..THREADS)
             .map(|thread| {
                 let stats = std::sync::Arc::clone(&stats);
@@ -4125,27 +4157,46 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        let snapshot = stats.snapshot(3_600, 3_600, QUERY_STATS_DOMAIN_CAP * 2);
-        assert_eq!(snapshot.domains.len(), QUERY_STATS_DOMAIN_CAP);
-        assert_eq!(
-            snapshot.dropped_updates,
-            (THREADS * each - QUERY_STATS_DOMAIN_CAP) as u64
+        let bucket = &stats.buckets[1];
+        let (stored, kept): (usize, u64) = bucket
+            .shards
+            .iter()
+            .map(|shard| {
+                let shard = shard.lock();
+                (
+                    shard.domains.counts.len(),
+                    shard.domains.counts.values().sum::<u64>(),
+                )
+            })
+            .fold((0, 0), |(stored, kept), (n, sum)| (stored + n, kept + sum));
+        let dropped: u64 = bucket
+            .shards
+            .iter()
+            .map(|shard| shard.lock().domains.dropped)
+            .sum();
+        assert!(
+            stored <= super::COUNT_CELLS * 2 * QUERY_STATS_KEPT,
+            "{stored}"
         );
-        assert_eq!(snapshot.requests_observed, (THREADS * each) as u64);
+        assert_eq!(kept + dropped, (THREADS * each) as u64);
+        assert_eq!(
+            stats.snapshot(3_600, 3_600, 1).requests_observed,
+            (THREADS * each) as u64
+        );
     }
 
-    /// 同一格过了一天再用到时，客户端的条数上限也重新算 / When a bucket comes round a day later the cap on
-    /// clients starts over too
+    /// 同一格过了一天再用到时，客户端从头记，旧的丢弃数也不留 / When a bucket comes round a day later
+    /// clients are counted afresh, the old dropped count gone too
     #[test]
     fn a_bucket_used_again_a_day_later_has_room_for_clients() {
         let stats = QueryStats::default();
         let hour = QUERY_STATS_BUCKET_SECONDS;
         let day = hour * QUERY_STATS_BUCKETS as u64;
-        for index in 0..=QUERY_STATS_CLIENT_CAP {
+        for index in 0..=2 * QUERY_STATS_KEPT {
             let client = IpAddr::from(Ipv4Addr::from(0x0a00_0000 + index as u32));
             stats.record_at("a.example", client, hour);
         }
-        assert_eq!(stats.snapshot(hour, hour, 1).dropped_updates, 1);
+        assert!(stats.snapshot(hour, hour, 1).dropped_updates > 0);
         let new_client = IpAddr::from(Ipv4Addr::new(192, 0, 2, 1));
         stats.record_at("a.example", new_client, hour + day);
         let after = stats.snapshot(hour + day, day, 10);
@@ -4155,22 +4206,22 @@ mod tests {
     }
 
     /// 一个钟头一格，24 格轮着用：同一格过了一天再用到时，先清空再记，旧的计数、名字、客户端和丢弃数
-    /// 都不留，满了的名字上限也重新算
+    /// 都不留
     /// One bucket per hour, 24 used in turn: when a bucket comes round again a day later it
     /// is emptied before recording, keeping none of the old counts, names, clients or
-    /// dropped updates, and the full name cap starts over
+    /// dropped updates
     #[test]
     fn a_bucket_used_again_a_day_later_starts_from_nothing() {
         let stats = QueryStats::default();
         let hour = QUERY_STATS_BUCKET_SECONDS;
         let day = hour * QUERY_STATS_BUCKETS as u64;
         let old_client = IpAddr::from(Ipv4Addr::new(10, 0, 0, 1));
-        for index in 0..=QUERY_STATS_DOMAIN_CAP {
+        for index in 0..=2 * QUERY_STATS_KEPT {
             stats.record_at(&format!("d{index}.example"), old_client, hour);
         }
         let before = stats.snapshot(hour, hour, 1);
-        assert_eq!(before.requests_observed, QUERY_STATS_DOMAIN_CAP as u64 + 1);
-        assert_eq!(before.dropped_updates, 1);
+        assert_eq!(before.requests_observed, 2 * QUERY_STATS_KEPT as u64 + 1);
+        assert!(before.dropped_updates > 0);
 
         let new_client = IpAddr::from(Ipv4Addr::new(10, 0, 0, 2));
         stats.record_at("new.example", new_client, hour + day);
