@@ -460,17 +460,24 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         default_upstream,
         default_upstream_pre_split: _,
         default_upstream_shared: _,
-        upstream_timeout_ms,
-        request_timeout_ms,
         response_jump_limit,
-        serve_stale,
-        serve_stale_ttl,
-        serve_stale_expire_ttl,
-        serve_stale_ttl_reset,
-        serve_stale_client_timeout_ms,
-        cache_background_refresh,
-        cache_refresh_threshold_percent,
-        cache_refresh_min_ttl,
+        // 怎样用缓存（等上游多久、过期了还续用多久、提前多久刷新），不改变缓存里的应答：改了不让缓存换代。以前算了进去，
+        // 在面板上调一下超时或预取的百分比，响应缓存和规则缓存就全都冷掉，上游被一下子问一遍
+        // How the cache is used (how long upstreams are waited for, how long an expired answer
+        // stands in, how early a refresh comes) changes no answer in it: a change leaves the
+        // caches alone. They used to count, and nudging a timeout or the prefetch percentage in
+        // the panel turned the response and rule caches cold at once, the upstreams asked
+        // everything over again
+        upstream_timeout_ms: _,
+        request_timeout_ms: _,
+        serve_stale: _,
+        serve_stale_ttl: _,
+        serve_stale_expire_ttl: _,
+        serve_stale_ttl_reset: _,
+        serve_stale_client_timeout_ms: _,
+        cache_background_refresh: _,
+        cache_refresh_threshold_percent: _,
+        cache_refresh_min_ttl: _,
         // Geo 数据的设置决定读进哪些名单和网段。应答取决于它们的只有读 Geo 数据的 pipeline，那些 pipeline 按数据的代数换命名
         // 空间（见 `with_geo`；配置重载换了文件也是新的一代），其余的不必跟着换。以前它们算进了每个 pipeline 的命名空间：面板
         // 按内容给 Geo 数据和拦截列表的文件起名，每次更新都换一个文件，名单一更新整份缓存就作废。后两个现在什么也不做
@@ -516,23 +523,10 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
     (
         min_ttl,
         default_upstream,
-        upstream_timeout_ms,
-        request_timeout_ms,
         response_jump_limit,
+        enable_tcp_fallback,
     )
         .hash(hasher);
-    (
-        serve_stale,
-        serve_stale_ttl,
-        serve_stale_expire_ttl,
-        serve_stale_ttl_reset,
-        serve_stale_client_timeout_ms,
-        cache_background_refresh,
-        cache_refresh_threshold_percent,
-        cache_refresh_min_ttl,
-    )
-        .hash(hasher);
-    enable_tcp_fallback.hash(hasher);
 }
 
 fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher) {
@@ -758,16 +752,41 @@ mod tests {
     #[test]
     fn every_setting_applied_on_reload_changes_all_namespaces() {
         type Change = fn(&mut crate::config::GlobalSettings);
-        let changes: [(&str, Change); 14] = [
+        let changes: [(&str, Change); 4] = [
             ("min_ttl", |s| s.min_ttl += 1),
             ("default_upstream", |s| {
                 s.default_upstream = "1.0.0.1:53".into()
             }),
+            ("response_jump_limit", |s| s.response_jump_limit += 1),
+            ("enable_tcp_fallback", |s| {
+                s.enable_tcp_fallback = !s.enable_tcp_fallback
+            }),
+        ];
+        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
+        let before = build_cache_namespaces(&before_config);
+        for (name, change) in changes {
+            let mut after_config = before_config.clone();
+            change(&mut after_config.settings);
+            let after = build_cache_namespaces(&after_config);
+            assert_ne!(before.get("first"), after.get("first"), "{name}");
+            assert_ne!(before.get("second"), after.get("second"), "{name}");
+        }
+    }
+
+    /// 怎样用缓存的设置（等上游多久、过期了续用多久、提前多久刷新）不改变缓存里的应答，改了不让缓存换代。以前改哪一个都让
+    /// 所有 pipeline 换命名空间，在面板上调一下超时，整个缓存就冷了
+    /// The settings for how the cache is used (how long upstreams are waited for, how long an
+    /// expired answer stands in, how early a refresh comes) change no answer in it and leave the
+    /// caches alone. Changing any of them used to move every pipeline, nudging a timeout in the
+    /// panel turning the whole cache cold
+    #[test]
+    fn settings_for_using_the_cache_leave_namespaces_alone() {
+        type Change = fn(&mut crate::config::GlobalSettings);
+        let changes: [(&str, Change); 10] = [
             ("upstream_timeout_ms", |s| s.upstream_timeout_ms += 1),
             ("request_timeout_ms", |s| {
                 s.request_timeout_ms = Some(s.request_timeout_ms.unwrap_or(1000) + 1)
             }),
-            ("response_jump_limit", |s| s.response_jump_limit += 1),
             ("serve_stale", |s| s.serve_stale = !s.serve_stale),
             ("serve_stale_ttl", |s| s.serve_stale_ttl += 1),
             ("serve_stale_expire_ttl", |s| s.serve_stale_expire_ttl += 1),
@@ -784,18 +803,13 @@ mod tests {
                 s.cache_refresh_threshold_percent = s.cache_refresh_threshold_percent % 99 + 1
             }),
             ("cache_refresh_min_ttl", |s| s.cache_refresh_min_ttl += 1),
-            ("enable_tcp_fallback", |s| {
-                s.enable_tcp_fallback = !s.enable_tcp_fallback
-            }),
         ];
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         let before = build_cache_namespaces(&before_config);
         for (name, change) in changes {
             let mut after_config = before_config.clone();
             change(&mut after_config.settings);
-            let after = build_cache_namespaces(&after_config);
-            assert_ne!(before.get("first"), after.get("first"), "{name}");
-            assert_ne!(before.get("second"), after.get("second"), "{name}");
+            assert_eq!(before, build_cache_namespaces(&after_config), "{name}");
         }
     }
 
