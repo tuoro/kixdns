@@ -1162,7 +1162,7 @@ async fn rule_cache_hits_replay_matched_rules() {
                 {
                     "name": "audit",
                     "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "log", "level": "debug" }]
+                    "actions": [{ "type": "continue" }]
                 },
                 {
                     "name": "block",

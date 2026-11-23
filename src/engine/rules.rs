@@ -25,7 +25,7 @@ use crate::engine::utils::engine_helpers::{self, build_response};
 use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
-use crate::matcher::{Requester, RequesterKey, ResponsePhase, RuntimePipeline};
+use crate::matcher::{RequesterKey, ResponsePhase};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -125,25 +125,6 @@ pub fn calculate_rule_hash(
     u16::from(qclass).hash(&mut hasher);
     requester.hash_into(&mut hasher);
     hasher.finish()
-}
-
-/// The requester's part of a rule cache key for `pipeline`: how its own request
-/// matchers judge the requester (see `RuntimePipeline::rule_requester`). With
-/// background refresh on, it also carries the client address, as the rule
-/// cache did before scopes existed.
-/// `pipeline` 的规则缓存键里属于请求方的部分：它自己的请求匹配器对请求方的判定（见
-/// `RuntimePipeline::rule_requester`）。开着后台刷新时还带上客户端地址，和引入范围
-/// 之前的规则缓存一样。
-pub fn rule_cache_requester(
-    pipeline: &RuntimePipeline,
-    background_refresh: bool,
-    requester: Requester,
-    geoip_manager: Option<&Arc<parking_lot::RwLock<crate::matcher::geoip::GeoIpManager>>>,
-) -> RequesterKey {
-    RequesterKey {
-        address: background_refresh.then_some(requester.address),
-        ..pipeline.rule_requester.key(requester, geoip_manager)
-    }
 }
 
 #[derive(Clone)]

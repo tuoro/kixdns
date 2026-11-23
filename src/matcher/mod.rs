@@ -434,7 +434,6 @@ impl RequesterScope {
         RequesterKey {
             class: judge(false),
             subnets: judge(true),
-            address: None,
         }
     }
 }
@@ -456,10 +455,6 @@ pub struct RequesterKey {
     /// 转发会为这个请求方发送的 ECS 子网。只有 inflight 键带着它们：缓存的应答标着它适用的
     /// 子网（见 `CacheEntry::reach`），而请求只有发送相同的子网才能互相等待。
     pub subnets: Option<u64>,
-    /// The client address itself, which only the rule cache adds, and only with
-    /// background refresh on, as it did before scopes existed
-    /// 客户端地址本身：只有规则缓存在开着后台刷新时加入，与引入范围之前一样
-    pub address: Option<IpAddr>,
 }
 
 impl RequesterKey {
@@ -467,7 +462,6 @@ impl RequesterKey {
     pub const NONE: Self = Self {
         class: None,
         subnets: None,
-        address: None,
     };
 
     /// The part of the response cache and rule cache keys / 响应缓存键和规则缓存键里的部分
@@ -475,10 +469,6 @@ impl RequesterKey {
         if let Some(class) = self.class {
             hasher.write_u8(1);
             class.hash(hasher);
-        }
-        if let Some(address) = self.address {
-            hasher.write_u8(2);
-            address.hash(hasher);
         }
     }
 

@@ -37,7 +37,6 @@ use super::utils::{InflightCleanupGuard, engine_helpers};
 use crate::cache::CachedQuestion;
 use crate::ecs_scope::EcsReach;
 use crate::engine::refresh::{RefreshCheck, RefreshTarget};
-use crate::engine::rules::rule_cache_requester;
 use crate::engine::rules::{Decision, ResponseContext};
 use crate::matcher::{Requester, RequesterKey};
 
@@ -1029,12 +1028,7 @@ impl Engine {
         // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
         // Zero-allocation lookup using hash / 使用哈希的零分配查找
         if let Some(p) = pipeline_opt {
-            let rule_requester = rule_cache_requester(
-                p,
-                cfg.settings.cache_background_refresh,
-                requester,
-                Some(&self.geoip_manager),
-            );
+            let rule_requester = p.rule_requester.key(requester, Some(&self.geoip_manager));
             let rule_hash = crate::engine::rules::calculate_rule_hash(
                 cache_namespace,
                 pipeline_id,
@@ -5065,19 +5059,13 @@ mod tests {
 
     #[test]
     fn test_calculate_rule_hash_respects_the_requester_key() {
-        // Arrange: Define test data with different IPs
+        // Arrange: Define test data
         let pipeline_id = "test_p";
         let qname = "example.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
-        let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
         let hash =
             |key: RequesterKey| calculate_rule_hash(0, pipeline_id, qname, qtype, qclass, &key);
-        let address = |ip| RequesterKey {
-            address: Some(ip),
-            ..RequesterKey::NONE
-        };
         let class = |class| RequesterKey {
             class: Some(class),
             ..RequesterKey::NONE
@@ -5092,21 +5080,9 @@ mod tests {
         u16::from(qclass).hash(&mut base);
         assert_eq!(hash(RequesterKey::NONE), base.finish());
 
-        // Act & Assert: Different IPs should result in different hashes when the IP is included
-        assert_ne!(hash(address(ip1)), hash(address(ip2)));
-        assert_ne!(hash(RequesterKey::NONE), hash(address(ip1)));
-
-        // Act & Assert: So should different requester classes, and a class with or without the IP
+        // Act & Assert: Different requester classes should result in different hashes
         assert_ne!(hash(class(1)), hash(class(2)));
         assert_ne!(hash(RequesterKey::NONE), hash(class(1)));
-        assert_ne!(
-            hash(class(1)),
-            hash(RequesterKey {
-                class: Some(1),
-                subnets: None,
-                address: Some(ip1)
-            })
-        );
     }
 
     #[tokio::test]
@@ -6502,8 +6478,6 @@ mod tests {
         let qname = "example.com";
         let qtype = RecordType::A;
         let qclass = DNSClass::IN;
-        let ip1 = "1.2.3.4".parse::<IpAddr>().unwrap();
-        let ip2 = "5.6.7.8".parse::<IpAddr>().unwrap();
         let entry = |requester| RuleCacheEntry {
             pipeline_id: pipeline_id.clone(),
             qname: qname.as_bytes().into(),
@@ -6516,10 +6490,6 @@ mod tests {
             },
             expires_at: None,
         };
-        let with_ip = |ip| RequesterKey {
-            address: Some(ip),
-            ..RequesterKey::NONE
-        };
         let class = |class| RequesterKey {
             class: Some(class),
             ..RequesterKey::NONE
@@ -6531,14 +6501,7 @@ mod tests {
         // An entry without requester facts matches only a key without them
         let shared = entry(RequesterKey::NONE);
         assert!(matches(&shared, RequesterKey::NONE));
-        assert!(!matches(&shared, with_ip(ip1)));
         assert!(!matches(&shared, class(1)));
-
-        // An entry with an IP matches that IP only
-        let by_ip = entry(with_ip(ip1));
-        assert!(matches(&by_ip, with_ip(ip1)));
-        assert!(!matches(&by_ip, with_ip(ip2)));
-        assert!(!matches(&by_ip, RequesterKey::NONE));
 
         // An entry for a requester class matches that class only
         let by_class = entry(class(1));
