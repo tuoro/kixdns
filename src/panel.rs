@@ -1997,8 +1997,9 @@ struct TrialOutput {
     body: serde_json::Value,
 }
 
-/// 草稿试跑的总时限：子进程启动、加载 Geo 数据、建引擎，再加查询自己的 6 秒
-/// The draft trial's overall limit: child start-up, Geo data loading and engine construction, plus the query's own 6 seconds
+/// 草稿试跑的总时限：排队等前面的试跑、子进程启动、加载 Geo 数据、建引擎，再加查询自己的 6 秒
+/// The draft trial's overall limit: the wait behind earlier trials, child start-up, Geo data loading and engine
+/// construction, plus the query's own 6 seconds
 #[cfg(unix)]
 const TRIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 /// 试跑的请求体：一份配置（与校验同上限）加上查询字段 / A trial body: one config (the validation limit) plus the query fields
@@ -2139,36 +2140,64 @@ async fn run_diagnostic(
     )
 }
 
-/// 读请求正文为什么失败 / Why reading a request body failed
+/// 一个端点怎么读请求正文：最多多少字节，读不成时回答里的错误码，太大和读不出来时各怎么说
+/// How an endpoint reads its request body: at most how many bytes, the error code of the
+/// answer when it cannot, and what that answer says for a body too large and for one that
+/// cannot be read
 #[cfg(unix)]
-enum BodyFailure {
-    TooLarge,
-    Unreadable,
-    /// [`REQUEST_READ_TIMEOUT`] 之内没发完 / Not finished within [`REQUEST_READ_TIMEOUT`]
-    Late,
+struct BodyRules {
+    limit: usize,
+    code: &'static str,
+    too_large: &'static str,
+    unreadable: &'static str,
 }
 
-/// 读请求正文，最多 `limit` 字节，最多等 [`REQUEST_READ_TIMEOUT`]
-/// Read a request body of at most `limit` bytes, waiting at most [`REQUEST_READ_TIMEOUT`]
 #[cfg(unix)]
-async fn collect_body(request: Request<Incoming>, limit: usize) -> Result<Bytes, BodyFailure> {
-    let body = Limited::new(request.into_body(), limit).collect();
-    match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
-        Ok(Ok(body)) => Ok(body.to_bytes()),
+const CONFIG_BODY: BodyRules = BodyRules {
+    limit: MAX_CONFIG_BODY,
+    code: "config_body_invalid",
+    too_large: "配置不能超过 4 MiB",
+    unreadable: "读取配置请求失败",
+};
+
+#[cfg(unix)]
+const DIAGNOSTIC_BODY: BodyRules = BodyRules {
+    limit: MAX_DIAGNOSTIC_BODY,
+    code: "diagnostic_body_invalid",
+    too_large: "诊断请求不能超过 2 KiB",
+    unreadable: "读取诊断请求失败",
+};
+
+#[cfg(unix)]
+const TRIAL_BODY: BodyRules = BodyRules {
+    limit: MAX_TRIAL_BODY,
+    code: "diagnostic_body_invalid",
+    too_large: "试跑请求不能超过 4 MiB",
+    unreadable: "读取试跑请求失败",
+};
+
+/// 照 `rules` 读请求正文，最多等 [`REQUEST_READ_TIMEOUT`]；读不成时拒掉：太大 413，正文本身坏了、读不出来 400，
+/// 没按时发完 408。以前读不出来也回 413，诊断和试跑还说成「不能超过」
+/// Reads a request body by `rules`, waiting at most [`REQUEST_READ_TIMEOUT`]; when it cannot,
+/// it is refused: 413 for a body too large, 400 for one broken and unreadable, 408 for one not
+/// sent in time. An unreadable body used to get a 413 too, the diagnostic and the trial calling
+/// it too large
+#[cfg(unix)]
+async fn collect_body(request: Request<Incoming>, rules: &BodyRules) -> Result<Bytes, Rejection> {
+    let body = Limited::new(request.into_body(), rules.limit).collect();
+    let (status, code, message) = match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
+        Ok(Ok(body)) => return Ok(body.to_bytes()),
         Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
-            Err(BodyFailure::TooLarge)
+            (StatusCode::PAYLOAD_TOO_LARGE, rules.code, rules.too_large)
         }
-        Ok(Err(_)) => Err(BodyFailure::Unreadable),
-        Err(_) => Err(BodyFailure::Late),
-    }
-}
-
-#[cfg(unix)]
-fn late_body_response() -> Response<Full<Bytes>> {
-    json_response(
-        StatusCode::REQUEST_TIMEOUT,
-        error_json("request_body_late", "请求正文没有在 10 秒内发完"),
-    )
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, rules.code, rules.unreadable),
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "request_body_late",
+            "请求正文没有在 10 秒内发完",
+        ),
+    };
+    Err((status, error_json(code, message)))
 }
 
 /// 把一个拒绝写成回答 / A rejection written out as the answer
@@ -2206,15 +2235,9 @@ fn config_invalid(error: &anyhow::Error) -> Rejection {
 
 #[cfg(unix)]
 async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_DIAGNOSTIC_BODY).await {
+    let body = match collect_body(request, &DIAGNOSTIC_BODY).await {
         Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("diagnostic_body_invalid", "诊断请求不能超过 2 KiB"),
-            );
-        }
+        Err(rejection) => return respond(rejection),
     };
     let request = match serde_json::from_slice::<DiagnosticRequest>(&body) {
         Ok(request) => request,
@@ -2237,7 +2260,7 @@ async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Respons
 
 /// 同一时间只跑一个草稿试跑：每次都要起一个子进程、加载 Geo 数据 / One draft trial at a time: each starts a child process and loads Geo data
 #[cfg(unix)]
-static TRIAL_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static TRIAL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 拿一份候选配置试跑一次查询，不碰正在用的配置、缓存和统计。
 ///
@@ -2256,15 +2279,9 @@ async fn diagnostic_trace_candidate(
     request: Request<Incoming>,
     engine: Engine,
 ) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_TRIAL_BODY).await {
+    let body = match collect_body(request, &TRIAL_BODY).await {
         Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("diagnostic_body_invalid", "试跑请求不能超过 4 MiB"),
-            );
-        }
+        Err(rejection) => return respond(rejection),
     };
     let request = match serde_json::from_slice::<CandidateTraceRequest>(&body) {
         Ok(request) => request,
@@ -2289,13 +2306,22 @@ async fn diagnostic_trace_candidate(
             );
         }
     };
-    let Ok(_permit) = TRIAL_GATE.acquire().await else {
-        return json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_json("diagnostic_trial_unavailable", "试跑暂时不可用"),
-        );
+    let (status, body) = trial_in_turn(input).await;
+    json_response(status, body)
+}
+
+/// 轮到自己时起子进程试跑，排队也算在 [`TRIAL_TIMEOUT`] 里：以前时限从轮到自己才开始算，前面排着几个试跑时，面板要
+/// 等上好几个 12 秒才有回答
+/// Runs the trial in a child once its turn comes, the wait for the turn counting towards
+/// [`TRIAL_TIMEOUT`]: the limit used to start only with the turn, so with several trials queued
+/// ahead the panel waited several times 12 seconds for an answer
+#[cfg(unix)]
+async fn trial_in_turn(input: Vec<u8>) -> (StatusCode, serde_json::Value) {
+    let trial = async {
+        let _turn = TRIAL_GATE.lock().await;
+        run_trial_child(input).await
     };
-    let (status, body) = match tokio::time::timeout(TRIAL_TIMEOUT, run_trial_child(input)).await {
+    match tokio::time::timeout(TRIAL_TIMEOUT, trial).await {
         Ok(Ok(output)) => (
             StatusCode::from_u16(output.status).unwrap_or(StatusCode::BAD_GATEWAY),
             output.body,
@@ -2312,8 +2338,7 @@ async fn diagnostic_trace_candidate(
             StatusCode::GATEWAY_TIMEOUT,
             error_json("diagnostic_timeout", "试跑超过 12 秒"),
         ),
-    };
-    json_response(status, body)
+    }
 }
 
 /// 起子进程、喂请求、读结果 / Start the child, feed it the request, read its result
@@ -2614,23 +2639,10 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
 
 #[cfg(unix)]
 async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_CONFIG_BODY).await {
-        Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(failure) => {
-            let message = if matches!(failure, BodyFailure::TooLarge) {
-                "配置不能超过 4 MiB"
-            } else {
-                "读取配置请求失败"
-            };
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("config_body_invalid", message),
-            );
-        }
-    };
-
-    validate_body(body).await
+    match collect_body(request, &CONFIG_BODY).await {
+        Ok(body) => validate_body(body).await,
+        Err(rejection) => respond(rejection),
+    }
 }
 
 /// 排行的回答。算排行要把窗口里每个钟头的每一项合起来再排序（24 小时的窗口最多二十万项），放到阻塞线程池里做，
@@ -2654,18 +2666,23 @@ async fn stats_response(
     }
 }
 
-/// 校验一份配置，给出回答。校验放到阻塞线程池里做，和取查询日志一样：它要解析整份配置、编译每条正则、读 DoH 的
-/// 证书文件，规则多的配置要几十到几百毫秒，在处理请求的线程上做的话，排在这个线程上的 DNS 查询这期间都等着
-/// Validates a configuration and gives the answer. The validation runs on the blocking thread
-/// pool, as taking the query log does: it parses the whole configuration, compiles every regex
-/// and reads the DoH certificate files, tens to hundreds of milliseconds for a configuration
-/// with many rules, during which the DNS queries queued on a thread serving requests would wait
+/// 校验一份配置，给出回答，和热重载拒绝的一样（见 `config::validate`）。校验放到阻塞线程池里做，和取查询日志一样：
+/// 它要解析整份配置、编译每条正则，规则多的配置要几十到几百毫秒，在处理请求的线程上做的话，排在这个线程上的 DNS
+/// 查询这期间都等着。正文不是 UTF-8 时回 400：以前当成空串去校验，回的是一份空配置的解析错误
+/// Validates a configuration and gives the answer, refusing what a hot reload refuses (see
+/// `config::validate`). The validation runs on the blocking thread pool, as taking the query
+/// log does: it parses the whole configuration and compiles every regex, tens to hundreds of
+/// milliseconds for a configuration with many rules, during which the DNS queries queued on a
+/// thread serving requests would wait. A body that is not UTF-8 gets a 400: it used to be
+/// validated as an empty string, answered with the parse error of an empty configuration
 #[cfg(unix)]
 async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
-    // 与引擎启动完全相同的校验路径，含监听地址与 DoH 证书检查。
-    // The exact validation the engine runs at startup, listener and DoH checks included.
-    let validated = tokio::task::spawn_blocking(move || {
-        crate::config::validate(std::str::from_utf8(&body).unwrap_or_default())
+    let validated = tokio::task::spawn_blocking(move || match std::str::from_utf8(&body) {
+        Ok(text) => crate::config::validate(text).map_err(|error| config_invalid(&error)),
+        Err(_) => Err((
+            StatusCode::BAD_REQUEST,
+            error_json("config_body_invalid", "配置不是 UTF-8 文本"),
+        )),
     })
     .await;
     match validated {
@@ -2679,7 +2696,7 @@ async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
                 "warnings": report.warnings,
             }),
         ),
-        Ok(Err(error)) => respond(config_invalid(&error)),
+        Ok(Err(rejection)) => respond(rejection),
         Err(error) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json("config_validate_failed", &error.to_string()),
@@ -5235,6 +5252,23 @@ mod diagnostic_tests {
         let (status, body) = run_trial(input).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"]["code"], "config_invalid", "{body}");
+    }
+
+    /// 排队等前面的试跑也算在时限里：前面那个一直占着，这个到 12 秒就回超时，不会一直等下去。以前时限从轮到自己才开始算
+    /// The wait behind an earlier trial counts towards the limit: with that one holding on, this
+    /// one answers a timeout at 12 seconds rather than waiting on. The limit used to start only
+    /// with the turn
+    #[tokio::test(start_paused = true)]
+    async fn a_trial_waiting_its_turn_times_out_within_the_limit() {
+        let _earlier = super::TRIAL_GATE.lock().await;
+        let started = tokio::time::Instant::now();
+        let answered =
+            tokio::time::timeout(super::TRIAL_TIMEOUT * 2, super::trial_in_turn(Vec::new()))
+                .await
+                .expect("answered within the limit, not after the earlier trial");
+        assert_eq!(answered.0, hyper::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(answered.1["error"]["code"], "diagnostic_timeout");
+        assert_eq!(started.elapsed(), super::TRIAL_TIMEOUT);
     }
 
     #[test]
