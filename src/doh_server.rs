@@ -1406,17 +1406,16 @@ mod tests {
         }
     }
 
-    /// 快速路径构造不出应答（名字超长，hickory 不接受）时，和 UDP、TCP 一样回只有报文头的 FORMERR：这个查询的
-    /// 名字超长，本来就读不了。以前 DoH 回的是 SERVFAIL
-    /// When the fast path cannot build its answer (an overlong name hickory rejects), the
-    /// answer is a header-only FORMERR as over UDP and TCP: the query's name is too long to be
-    /// read in the first place. DoH used to answer SERVFAIL
+    /// 名字超长的查询和 UDP、TCP 一样回只有报文头的 FORMERR：快速解析不收它（线上最多 255 字节，和完整解析一样），
+    /// 完整解析也读不了。以前快速解析收下了、构造应答时才出错，DoH 回的是 SERVFAIL
+    /// A query with an overlong name is answered a header-only FORMERR as over UDP and TCP: the
+    /// quick parse does not take it (at most 255 bytes on the wire, as for the full parse), and
+    /// neither can the full parse read it. The quick parse used to take it and fail only when
+    /// building the answer, and DoH answered SERVFAIL
     #[tokio::test]
-    async fn a_fast_path_answer_that_cannot_be_built_is_answered_formerr() {
+    async fn an_overlong_name_is_answered_formerr() {
         let engine = make_static_engine("NXDOMAIN");
-        // 点分形式 256 字节：快速路径自己的解析器接受，hickory 不接受（在线格式最多 255 字节）
-        // 256 bytes dotted: the fast path's own parser accepts it, hickory does not (at most
-        // 255 bytes on the wire)
+        // 线上 256 字节（点分形式 254 字节）/ 256 bytes on the wire (254 dotted)
         let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
         for label in [
             "a".repeat(63),
@@ -1429,7 +1428,7 @@ mod tests {
         }
         query.extend_from_slice(&[0, 0, 1, 0, 1]); // root, QTYPE A, QCLASS IN
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        assert!(engine.handle_packet_fast(&query, peer).is_err());
+        assert!(matches!(engine.handle_packet_fast(&query, peer), Ok(None)));
 
         let answer = process_dns_wire(&query, peer, &engine).await;
         assert_eq!(

@@ -11,10 +11,10 @@ use smallvec::SmallVec;
 use crate::config::{Action, MatchOperator};
 use crate::engine::utils::parse_rcode;
 use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer, static_ips};
-use crate::lock::RwLock;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
 use crate::matcher::{domain_suffix_index_key, domain_suffix_matches, eval_match_chain};
+use parking_lot::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct CompiledPipeline {

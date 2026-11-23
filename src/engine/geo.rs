@@ -14,11 +14,11 @@ use tracing::{info, warn};
 
 use super::types::EngineInner;
 use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
-use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::{GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, parsed_provides_any};
 use crate::watcher::{FileWatch, PendingWatch, load_with_retry};
+use parking_lot::RwLock;
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
 #[derive(Debug, PartialEq, Eq)]

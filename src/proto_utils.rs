@@ -140,6 +140,15 @@ const HEADER_LEN: usize = 12;
 /// 1035 section 2.3.4). Every function that reads a name keeps to it
 const MAX_NAME_LEN: usize = 255;
 
+/// 我们自己收发 UDP 的载荷上限，回答里的 OPT 都通告它；给客户端的 UDP 回答也不超过它，超过的截断、让客户端改用 TCP。
+/// 1232 是 DNS Flag Day 2020 定的值：再大的报文在常见的路径上就要在 IP 层分片，分片容易丢，也给伪造回包留了口子
+/// The UDP payload this server sends and receives at most, which every OPT in its replies
+/// advertises; no UDP reply to a client goes beyond it either, a longer one being truncated for the
+/// client to retry over TCP. 1232 is the value DNS Flag Day 2020 settled on: anything larger is
+/// fragmented at the IP layer on common paths, and fragments get lost and open a way for forged
+/// replies
+pub const UDP_PAYLOAD: u16 = 1232;
+
 /// 客户端发来的一个查询最长多少字节：UDP 一次收这么多，再长的被截断、答 FORMERR；TCP 上声明更长的关掉连接，DoH 的请求
 /// 正文也到此为止。真实的查询远没有这么长（按 RFC 8467 填充也只填到 128 字节的整数倍），定这个数是不让一个客户端凭一个
 /// 长度前缀或请求头就让内核为每条连接、每个请求留下 64 KiB
@@ -182,6 +191,13 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let mut max_jumps = 5;
     let mut current_pos = pos;
     let packet_len = packet.len();
+    // 名字在线上的长度，结尾的根标签占 1 字节，最多 MAX_NAME_LEN，和 `skip_name`、完整解析一样。以前只受 256 字节的
+    // 文本缓冲限制，线上 256 到 258 字节的名字在这里过得去，完整解析却回 FORMERR
+    // The name's length on the wire, the root label at the end taking 1 byte, at most
+    // MAX_NAME_LEN, as in `skip_name` and the full parse. Only the 256-byte text buffer used to
+    // bound it, so names of 256 to 258 bytes on the wire passed here and got FORMERR from the full
+    // parse
+    let mut wire_len = 1usize;
 
     loop {
         if current_pos >= packet_len {
@@ -233,6 +249,10 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
 
         // Label / 标签
         let label_len = len as usize;
+        wire_len += 1 + label_len;
+        if wire_len > MAX_NAME_LEN {
+            return None;
+        }
         current_pos += 1;
         if packet_len < current_pos + label_len {
             return None;
@@ -684,15 +704,15 @@ fn with_opt(message: &[u8], dnssec_ok: bool, options: &[u8]) -> Option<Vec<u8>> 
     Some(out)
 }
 
-/// 在 `out` 末尾写一条 OPT 记录：根名、TYPE OPT、CLASS 即 UDP 载荷大小 1232、扩展 RCODE
+/// 在 `out` 末尾写一条 OPT 记录：根名、TYPE OPT、CLASS 即 UDP 载荷大小 [`UDP_PAYLOAD`]、扩展 RCODE
 /// `extended_rcode`、版本 0、DO 位为 `dnssec_ok` 的标志、选项 `options`。选项不超过 65535 字节。
 /// Write an OPT record at the end of `out`: root owner, TYPE OPT, CLASS as the UDP
-/// payload size 1232, extended RCODE `extended_rcode`, version 0, flags with the DO bit
+/// payload size [`UDP_PAYLOAD`], extended RCODE `extended_rcode`, version 0, flags with the DO bit
 /// `dnssec_ok`, and `options`, at most 65535 bytes of them.
 fn push_opt(out: &mut Vec<u8>, extended_rcode: u8, dnssec_ok: bool, options: &[u8]) {
     out.push(0);
     out.extend_from_slice(&41u16.to_be_bytes());
-    out.extend_from_slice(&1232u16.to_be_bytes());
+    out.extend_from_slice(&UDP_PAYLOAD.to_be_bytes());
     out.extend_from_slice(&[extended_rcode, 0, if dnssec_ok { 0x80 } else { 0 }, 0]);
     out.extend_from_slice(&(options.len() as u16).to_be_bytes());
     out.extend_from_slice(options);
@@ -844,6 +864,15 @@ impl OptRecord {
     /// top bit of the TTL field's third byte, RFC 3225 section 3)
     fn dnssec_ok(&self, message: &[u8]) -> bool {
         message[self.extended_rcode_at + 2] & 0x80 != 0
+    }
+
+    /// 这条 OPT 声明的 UDP 载荷大小（CLASS 字段，就在 TTL 前面，RFC 6891 第 6.1.2 节）/ The UDP payload
+    /// size this OPT declares (its CLASS field, right before the TTL, RFC 6891 section 6.1.2)
+    fn udp_payload(&self, message: &[u8]) -> u16 {
+        u16::from_be_bytes([
+            message[self.extended_rcode_at - 2],
+            message[self.extended_rcode_at - 1],
+        ])
     }
 }
 
@@ -1852,12 +1881,16 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
         return None;
     }
 
-    // hickory's Message::max_payload() already clamps to >= 512, so the extra
-    // max() below is defensive only.
-    let max_payload = Message::from_bytes(request_packet)
-        .map(|request| request.max_payload() as usize)
-        .unwrap_or(CLASSIC_DNS_UDP_PAYLOAD)
-        .max(CLASSIC_DNS_UDP_PAYLOAD);
+    // 客户端声明的载荷大小，不超过我们自己的（见 UDP_PAYLOAD），不小于 512（RFC 6891 第 6.2.5 节）；不带 OPT 或读不了
+    // 的是 512。OPT 直接从报文里读，不必为一个数把请求整个解析一遍
+    // The payload size the client declares, no more than our own (see UDP_PAYLOAD) and no less
+    // than 512 (RFC 6891 section 6.2.5); 512 without an OPT or with one that cannot be read. The
+    // OPT is read off the packet, with no need to parse the whole request for one number
+    let max_payload = match find_opt(request_packet) {
+        Ok(Some(opt)) => usize::from(opt.udp_payload(request_packet))
+            .clamp(CLASSIC_DNS_UDP_PAYLOAD, usize::from(UDP_PAYLOAD)),
+        _ => CLASSIC_DNS_UDP_PAYLOAD,
+    };
 
     if response_packet.len() <= max_payload {
         return None;
@@ -1870,9 +1903,8 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
         // emits the OPT last and drops it whole when it does not fit, so it is encoded
         // apart first and its room kept, the other records taking what is left.
         let opt = response.edns.take().and_then(|mut edns| {
-            // Do not advertise a larger UDP payload in the response than the client
-            // offered in its request.
-            edns.set_max_payload(max_payload as u16);
+            // 和别的回答一样通告我们自己的载荷大小 / Our own payload size is advertised, as in every other reply
+            edns.set_max_payload(UDP_PAYLOAD);
             let mut wire = Vec::new();
             Record::from(&edns)
                 .emit(&mut BinEncoder::new(&mut wire))
@@ -2496,7 +2528,8 @@ mod tests {
 
     /// 客户端带 OPT 时，截断的应答不管放得下几条记录都带 OPT，载荷写客户端声明的，也不超过它
     /// A reply truncated for a client that sent an OPT carries one however many records
-    /// fit, giving the payload the client declared and staying within it
+    /// fit, staying within the payload the client declared and giving our own, as every
+    /// other reply does (see UDP_PAYLOAD)
     #[test]
     fn a_truncated_reply_keeps_its_opt() {
         for payload in [512u16, 513, 523, 600, 1232] {
@@ -2521,7 +2554,7 @@ mod tests {
                     .edns
                     .as_ref()
                     .unwrap_or_else(|| panic!("{case}: no OPT"));
-                assert_eq!(edns.max_payload(), payload, "{case}");
+                assert_eq!(edns.max_payload(), UDP_PAYLOAD, "{case}");
             }
         }
     }
@@ -2561,7 +2594,7 @@ mod tests {
             assert!(decoded.metadata.truncation, "payload {payload}");
             assert_eq!(
                 decoded.edns.as_ref().map(|edns| edns.max_payload()),
-                Some(payload)
+                Some(UDP_PAYLOAD)
             );
             assert!(
                 truncated.len() + 16 > payload as usize,
@@ -2603,11 +2636,60 @@ mod tests {
     #[test]
     fn truncate_udp_response_keeps_response_that_fits_client_limit() {
         let request = txt_query(Some(4096));
-        let response = large_txt_response(8);
+        let response = large_txt_response(4);
         assert!(response.len() > 512);
-        assert!(response.len() <= 4096);
+        assert!(response.len() <= usize::from(UDP_PAYLOAD));
 
         assert!(truncate_udp_response(&request, &response).is_none());
+    }
+
+    /// 客户端声明的载荷比我们的大，UDP 回答也不超过我们的：更长的截断，让客户端改用 TCP，不在 IP 层分片
+    /// With the client declaring a larger payload than ours, a UDP reply still stays within ours: a
+    /// longer one is truncated for the client to retry over TCP, rather than fragmented at the IP layer
+    #[test]
+    fn a_reply_over_our_payload_is_truncated_whatever_the_client_allows() {
+        let request = txt_query(Some(4096));
+        let response = large_txt_response(8);
+        assert!(response.len() > usize::from(UDP_PAYLOAD));
+        assert!(response.len() <= 4096);
+
+        let truncated = truncate_udp_response(&request, &response).expect("must truncate");
+        assert!(truncated.len() <= usize::from(UDP_PAYLOAD));
+        assert!(Message::from_bytes(&truncated).unwrap().metadata.truncation);
+    }
+
+    /// 线上 255 字节的名字快速解析照收，256 字节的不收，和完整解析一样
+    /// A name of 255 bytes on the wire passes the quick parse and one of 256 does not, as for the
+    /// full parse
+    #[test]
+    fn the_quick_parse_takes_names_up_to_255_bytes_on_the_wire() {
+        // 四个 62 字节的标签加一个 n 字节的：线上 4 × 63 + (n + 1) + 1 字节 / Four labels of 62 bytes
+        // and one of n: 4 × 63 + (n + 1) + 1 bytes on the wire
+        let name = |last: usize| {
+            let mut wire = Vec::new();
+            for _ in 0..4 {
+                wire.push(62u8);
+                wire.extend(std::iter::repeat_n(b'a', 62));
+            }
+            wire.push(last as u8);
+            wire.extend(std::iter::repeat_n(b'b', last));
+            wire.push(0);
+            wire
+        };
+        let query = |wire: &[u8]| {
+            let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+            packet.extend_from_slice(wire);
+            packet.extend_from_slice(&[0, 1, 0, 1]);
+            packet
+        };
+        let mut text = [0u8; 256];
+        let fits = query(&name(1));
+        assert_eq!(name(1).len(), MAX_NAME_LEN);
+        assert!(parse_quick(&fits, &mut text).is_some());
+        assert!(Message::from_bytes(&fits).is_ok());
+        let over = query(&name(2));
+        assert!(parse_quick(&over, &mut text).is_none());
+        assert!(Message::from_bytes(&over).is_err());
     }
 
     #[test]
