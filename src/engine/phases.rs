@@ -5,7 +5,7 @@ use crate::ecs_scope::{EcsReach, EcsView, ForwardEcs};
 use crate::engine::execution::CacheKeys;
 use crate::engine::observation::{Observed, cached_source, report_response_rule};
 use crate::engine::refresh::{RefreshCheck, RefreshTarget};
-use crate::engine::response::{extract_ttl, extract_ttl_for_refresh};
+use crate::engine::response::extract_ttl;
 use crate::engine::response_log::ResponseInfo;
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion};
@@ -222,7 +222,6 @@ pub(crate) fn check_cache_logged(
                 qtype = ?qtype,
                 remaining_ttl = remaining_ttl,
                 original_ttl = hit.original_ttl,
-                refresh_ttl = hit.refresh_ttl,
                 "Triggering background refresh for cached entry"
             );
 
@@ -511,7 +510,7 @@ pub fn handle_static_decision(
                 current_pipeline_id.clone(),
                 u16::from(qtype),
                 flags,
-                (ttl, ttl),
+                ttl,
             )
             .with_reach(reach.clone()),
         );
@@ -892,7 +891,7 @@ pub(crate) async fn handle_forward_decision_logged(
     let cache = |bytes: &Bytes,
                  rcode: ResponseCode,
                  upstream: Option<Arc<str>>,
-                 ttls: (u32, u32),
+                 ttl: u32,
                  reach: &EcsReach| {
         engine.insert_dns_cache_entry(
             keys.slot,
@@ -904,7 +903,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 Arc::clone(pipeline_id),
                 u16::from(qtype),
                 keys.flags,
-                ttls,
+                ttl,
             )
             .with_reach(reach.clone()),
         );
@@ -955,18 +954,13 @@ pub(crate) async fn handle_forward_decision_logged(
                 let quick = (!rules_read_the_reply)
                     .then(|| proto_utils::parse_response_quick(&raw))
                     .flatten();
-                let (rcode, ttl_secs_cache, ttl_secs_refresh, msg_opt) = match quick {
+                let (rcode, ttl_secs_cache, msg_opt) = match quick {
                     Some(qr) if proto_utils::well_formed_reply(&raw) => {
-                        (qr.rcode, qr.min_ttl as u64, qr.max_ttl as u64, None)
+                        (qr.rcode, u64::from(qr.min_ttl), None)
                     }
                     quick => match (Message::from_bytes(&raw), quick) {
-                        (Ok(msg), _) => (
-                            msg.metadata.response_code,
-                            extract_ttl(&msg),
-                            extract_ttl_for_refresh(&msg),
-                            Some(msg),
-                        ),
-                        (Err(_), Some(qr)) => (qr.rcode, 0, 0, None),
+                        (Ok(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
+                        (Err(_), Some(qr)) => (qr.rcode, 0, None),
                         (Err(error), None) => {
                             return Err(
                                 anyhow::Error::new(error).context("parse upstream response")
@@ -1012,14 +1006,7 @@ pub(crate) async fn handle_forward_decision_logged(
 
                 if actions_to_run.is_empty() {
                     if cache_ttl > 0 {
-                        let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
-                        cache(
-                            &raw,
-                            rcode,
-                            Some(actual_upstream),
-                            (cache_ttl, refresh_ttl),
-                            trail,
-                        );
+                        cache(&raw, rcode, Some(actual_upstream), cache_ttl, trail);
                     } else {
                         drop_renewed();
                     }
@@ -1228,16 +1215,13 @@ pub(crate) async fn handle_forward_decision_logged(
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
-                let ttl_secs_cache = extract_ttl(&ctx.msg);
-                let ttl_secs_refresh = extract_ttl_for_refresh(&ctx.msg);
-                let cache_ttl = ttl_to_cache(engine, ttl_secs_cache, min_ttl);
+                let cache_ttl = ttl_to_cache(engine, extract_ttl(&ctx.msg), min_ttl);
                 if cache_ttl > 0 {
-                    let refresh_ttl = proto_utils::saturating_u64_to_u32(ttl_secs_refresh);
                     cache(
                         &ctx.raw,
                         ctx.msg.metadata.response_code,
                         Some(ctx.upstream.clone()),
-                        (cache_ttl, refresh_ttl),
+                        cache_ttl,
                         trail,
                     );
                 } else if !fallback {
@@ -1269,7 +1253,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
                 if min_ttl > Duration::from_secs(0) {
                     let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
-                    cache(&bytes, rcode, None, (ttl, ttl), trail);
+                    cache(&bytes, rcode, None, ttl, trail);
                 } else if skip_cache && !fallback {
                     // An answer that is not cached cannot renew the entry, so the refresh
                     // drops it and the next client request runs the rules.
@@ -1664,7 +1648,7 @@ mod refresh_response_rule_tests {
                 Arc::from(pipeline),
                 u16::from(RecordType::A),
                 crate::proto_utils::QueryFlags::RECURSIVE,
-                (ttl, ttl),
+                ttl,
             )
             .with_reach(reach),
         );
@@ -1756,14 +1740,14 @@ mod refresh_response_rule_tests {
             (
                 json!({ "min_ttl": 60, "cache_max_ttl": 3600 }),
                 [60, 3600],
-                (60, 3600),
+                60,
             ),
             (
                 json!({ "min_ttl": 600, "cache_max_ttl": 300 }),
                 [300, 300],
-                (300, 300),
+                300,
             ),
-            (json!({}), [5, 86_400], (5, 86_400)),
+            (json!({}), [5, 86_400], 5),
         ];
         for (path, rule) in &rules {
             for (settings, carried, cached) in &cases {
@@ -1782,11 +1766,7 @@ mod refresh_response_rule_tests {
                     );
                 }
                 let entry = engine.cached(slot_of(&engine, "main")).expect("cached");
-                assert_eq!(
-                    (entry.original_ttl, entry.refresh_ttl),
-                    *cached,
-                    "{path} {settings}"
-                );
+                assert_eq!(entry.original_ttl, *cached, "{path} {settings}");
             }
         }
     }

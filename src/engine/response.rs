@@ -355,19 +355,6 @@ pub(crate) fn make_static_txt_answer(
     (ResponseCode::NoError, vec![record])
 }
 
-/// 从 DNS 响应中提取最大 TTL 用于后台刷新时机 / Extract maximum TTL from DNS response for background refresh timing
-#[inline]
-pub fn extract_ttl_for_refresh(msg: &Message) -> u64 {
-    let answer_max = msg.answers.iter().map(|r| received_ttl(r.ttl) as u64).max();
-    match answer_max {
-        Some(t) if says_no(msg) => t.min(extract_soa_negative_ttl(msg)),
-        Some(t) => t,
-        // No answers: negative response (NXDOMAIN/NODATA) — use SOA from authority
-        // per RFC 2308 §5 / 无答案：否定响应 (NXDOMAIN/NODATA) — 按 RFC 2308 §5 从 authority 的 SOA 提取
-        None => extract_soa_negative_ttl(msg),
-    }
-}
-
 /// 从 DNS 响应中提取最小 TTL 用于缓存条目 / Extract minimum TTL from DNS response for cache entry
 /// RFC 1035 §5.2 calls for using minimum TTL of the RRset.
 /// RFC 2308 §5: For negative responses (NXDOMAIN/NODATA), the negative cache
@@ -497,7 +484,7 @@ mod tests {
                 ResponseCode::NXDomain,
                 vec![cname(3600)],
                 Some((10, 10)),
-                (10, 10),
+                10,
             ),
             (
                 "NODATA 带 CNAME",
@@ -505,7 +492,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(3600)],
                 Some((10, 10)),
-                (10, 10),
+                10,
             ),
             (
                 "SOA 的 TTL 比 MINIMUM 短",
@@ -513,7 +500,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(3600)],
                 Some((5, 60)),
-                (5, 5),
+                5,
             ),
             (
                 "SOA 的 MINIMUM 比 TTL 短",
@@ -521,7 +508,7 @@ mod tests {
                 ResponseCode::NXDomain,
                 vec![cname(3600)],
                 Some((60, 5)),
-                (5, 5),
+                5,
             ),
             (
                 "CNAME 比负缓存短",
@@ -529,7 +516,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(5)],
                 Some((60, 60)),
-                (5, 5),
+                5,
             ),
             (
                 "多级 CNAME",
@@ -537,7 +524,7 @@ mod tests {
                 ResponseCode::NXDomain,
                 vec![cname(3600), cname(600)],
                 Some((60, 60)),
-                (60, 60),
+                60,
             ),
             (
                 "CNAME 加它的签名",
@@ -545,7 +532,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(3600), by_code(46, 3600)],
                 Some((60, 60)),
-                (60, 60),
+                60,
             ),
             (
                 "DNAME 加 CNAME",
@@ -553,7 +540,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![by_code(39, 3600), cname(600)],
                 Some((60, 60)),
-                (60, 60),
+                60,
             ),
             (
                 "NXDOMAIN 带 CNAME 没有 SOA",
@@ -561,7 +548,7 @@ mod tests {
                 ResponseCode::NXDomain,
                 vec![cname(3600)],
                 None,
-                (0, 0),
+                0,
             ),
             (
                 "NODATA 带 CNAME 没有 SOA",
@@ -569,7 +556,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(3600)],
                 None,
-                (0, 0),
+                0,
             ),
             (
                 "CNAME 链有结果",
@@ -577,7 +564,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(3600), a(300)],
                 Some((10, 10)),
-                (300, 3600),
+                300,
             ),
             (
                 "问的就是 CNAME",
@@ -585,7 +572,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(3600)],
                 Some((10, 10)),
-                (3600, 3600),
+                3600,
             ),
             (
                 "问的是 ANY",
@@ -593,7 +580,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![cname(3600)],
                 Some((10, 10)),
-                (3600, 3600),
+                3600,
             ),
             (
                 "答案是别的类型",
@@ -601,7 +588,7 @@ mod tests {
                 ResponseCode::NoError,
                 vec![aaaa(300)],
                 Some((10, 10)),
-                (300, 300),
+                300,
             ),
         ];
         for (case, qtype, rcode, answers, soa, expected) in cases {
@@ -620,17 +607,9 @@ mod tests {
                     RData::SOA(soa),
                 ));
             }
-            assert_eq!(
-                (extract_ttl(&msg), extract_ttl_for_refresh(&msg)),
-                expected,
-                "完整解析：{case}"
-            );
+            assert_eq!(extract_ttl(&msg), expected, "完整解析：{case}");
             let quick = parse_response_quick(&msg.to_vec().unwrap()).unwrap();
-            assert_eq!(
-                (quick.min_ttl as u64, quick.max_ttl as u64),
-                expected,
-                "快速解析：{case}"
-            );
+            assert_eq!(u64::from(quick.min_ttl), expected, "快速解析：{case}");
         }
     }
 
@@ -642,7 +621,6 @@ mod tests {
         let rec = Record::from_rdata(name, 300, RData::A(A(std::net::Ipv4Addr::LOCALHOST)));
         msg.add_answer(rec);
         assert_eq!(extract_ttl(&msg), 300);
-        assert_eq!(extract_ttl_for_refresh(&msg), 300);
     }
 
     #[test]
@@ -692,7 +670,6 @@ mod tests {
             ));
         }
         assert_eq!(extract_ttl(&msg), 0);
-        assert_eq!(extract_ttl_for_refresh(&msg), 300);
 
         for (soa_ttl, minimum) in [(0x8000_0000, 60), (300, 0xFFFF_FFFF)] {
             let mut negative = Message::new(0, MessageType::Response, OpCode::Query);
@@ -700,11 +677,6 @@ mod tests {
             let soa = SOA::new(name.clone(), name.clone(), 1, 3600, 900, 1209600, minimum);
             negative.add_authority(Record::from_rdata(name.clone(), soa_ttl, RData::SOA(soa)));
             assert_eq!(extract_ttl(&negative), 0, "{soa_ttl:#x} {minimum:#x}");
-            assert_eq!(
-                extract_ttl_for_refresh(&negative),
-                0,
-                "{soa_ttl:#x} {minimum:#x}"
-            );
         }
     }
 
@@ -716,6 +688,5 @@ mod tests {
         // No authority section records
 
         assert_eq!(extract_ttl(&msg), 0);
-        assert_eq!(extract_ttl_for_refresh(&msg), 0);
     }
 }

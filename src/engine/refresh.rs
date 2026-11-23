@@ -15,14 +15,17 @@ use crate::engine::types::EngineInner;
 use crate::engine::utils::RefreshingGuard;
 use crate::matcher::Requester;
 
-/// 一条缓存命中的刷新时机。后台刷新开着、应答来自上游、可刷新的 TTL 不低于下限时才有；剩余的
-/// TTL 不超过阈值时，就到了刷新的时候
+/// 一条缓存命中的刷新时机。后台刷新开着、应答来自上游、条目的 TTL 不低于下限时才有；剩余的
+/// TTL 不超过阈值时，就到了刷新的时候。照条目自己的 TTL 算，也就是它真正过期的时候：CNAME 3600
+/// 加 A 60 的应答 60 秒就过期，照最长的 TTL 算的话永远轮不到刷新
 /// When a cache hit is due for a background refresh. There is one only with background
-/// refresh on, for an answer from an upstream whose refreshable TTL is not below the
-/// minimum; it is due once the remaining TTL is at most the threshold
+/// refresh on, for an answer from an upstream whose TTL is not below the minimum; it is due
+/// once the remaining TTL is at most the threshold. It goes by the entry's own TTL, when it
+/// really expires: an answer of CNAME 3600 and A 60 expires after 60 seconds, and going by
+/// the longest TTL it would never come due
 #[derive(Clone, Copy)]
 pub(crate) struct RefreshCheck {
-    /// 可刷新的 TTL 还剩几秒 / Seconds left of the refreshable TTL
+    /// 条目的 TTL 还剩几秒 / Seconds left of the entry's TTL
     pub(crate) remaining_ttl: u32,
     /// 剩到几秒以内就刷新 / Refresh once this many seconds or fewer are left
     pub(crate) threshold: u64,
@@ -36,12 +39,16 @@ impl RefreshCheck {
     ) -> Option<Self> {
         (settings.cache_background_refresh
             && hit.upstream.is_some()
-            && hit.refresh_ttl >= settings.cache_refresh_min_ttl)
+            && hit.original_ttl >= settings.cache_refresh_min_ttl)
             .then(|| Self {
-                remaining_ttl: hit.refresh_ttl.saturating_sub(elapsed_secs),
-                threshold: (hit.refresh_ttl as u64
-                    * settings.cache_refresh_threshold_percent as u64)
-                    / 100,
+                remaining_ttl: hit.original_ttl.saturating_sub(elapsed_secs),
+                // 至少提前一秒：TTL 短到按比例算出 0 时，剩 0 秒的条目已经过期，等不到刷新
+                // At least a second ahead: when a short TTL works out to 0, an entry with 0
+                // seconds left has already expired and never gets refreshed
+                threshold: (u64::from(hit.original_ttl)
+                    * u64::from(settings.cache_refresh_threshold_percent)
+                    / 100)
+                    .max(1),
             })
     }
 
@@ -382,5 +389,77 @@ mod refresh_failures_tests {
             failures.prune_at.load(Ordering::Relaxed),
             (recent as usize * 2).max(REFRESH_FAILURES_PRUNED_AT)
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_timing_tests {
+    use std::str::FromStr;
+    use std::time::Duration;
+
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::rdata::{A, CNAME};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use serde_json::json;
+
+    use crate::engine::test_support::{engine_from, upstream};
+
+    /// CNAME 3600 加 A 2 的应答 2 秒就过期，刷新照这 2 秒算：阈值 50% 时，一秒之后的命中就去上游刷新。
+    /// 照最长的 TTL 算的话，剩下的 3599 秒远在阈值之外，条目过期之前永远轮不到刷新
+    /// An answer of CNAME 3600 and A 2 expires after 2 seconds and its refresh goes by those 2
+    /// seconds: at a 50% threshold, a hit after a second refreshes from the upstream. Going by
+    /// the longest TTL, the 3599 seconds left are far outside the threshold and it would never
+    /// come due before it expires
+    #[tokio::test]
+    async fn an_answer_is_refreshed_before_its_shortest_ttl_runs_out() {
+        let upstream = upstream(|query| {
+            let alias = query.queries[0].name().clone();
+            let target = Name::from_str("edge.example.net.").unwrap();
+            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            reply.add_queries(query.queries.iter().cloned());
+            reply.add_answer(Record::from_rdata(
+                alias,
+                3600,
+                RData::CNAME(CNAME(target.clone())),
+            ));
+            reply.add_answer(Record::from_rdata(
+                target,
+                2,
+                RData::A(A::new(192, 0, 2, 1)),
+            ));
+            vec![(Duration::ZERO, reply.to_vec().unwrap())]
+        })
+        .await;
+        let engine = engine_from(json!({
+            "settings": {
+                "cache_background_refresh": true,
+                "cache_refresh_threshold_percent": 50,
+                "cache_refresh_min_ttl": 1
+            },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "all",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream.address }]
+            }] }]
+        }));
+        let mut query = Message::new(0x2a2a, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_str("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        let peer = "10.0.0.1:53000".parse().unwrap();
+
+        engine.handle_packet(&query, peer).await.expect("answered");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine.handle_packet(&query, peer).await.expect("answered");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while upstream.queries() < 2 || !engine.refreshing_set.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hit refreshes the answer from the upstream");
+        assert_eq!(upstream.queries(), 2);
     }
 }

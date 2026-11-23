@@ -22,12 +22,12 @@ pub struct CacheEntry {
     pub flags: QueryFlags,
     /// RFC 1035 §5.2: Record insertion time for TTL decrement / RFC 1035 §5.2：记录插入时间用于TTL递减
     pub inserted_at: Instant,
-    /// Original minimum TTL from upstream response / 上游响应的原始最小TTL
-    /// Used for cache expiration and TTL patching / 用于缓存过期与 TTL 修正
+    /// 缓存用的 TTL：上游应答里最小的 TTL，收进 min_ttl 到 cache_max_ttl 之间。过期、回答里 TTL 的改写、
+    /// 后台刷新什么时候到期，都照它算
+    /// The TTL it is cached with: the smallest TTL of the upstream answer, brought within
+    /// min_ttl and cache_max_ttl. Expiry, the TTLs rewritten into answers and when a background
+    /// refresh is due all go by it
     pub original_ttl: u32,
-    /// Original maximum TTL from upstream response / 上游响应的原始最大TTL
-    /// Used for background refresh decisions / 用于后台刷新决策
-    pub refresh_ttl: u32,
     /// 这份应答适用于槽位里的哪些请求方（RFC 7871 第 7.3 节）
     /// Which requesters of its slot this answer applies to (RFC 7871 section 7.3)
     pub reach: EcsReach,
@@ -48,7 +48,7 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
-    /// Build a cache entry from a DNS response and its cache/refresh TTLs.
+    /// Build a cache entry from a DNS response and the TTL it is cached with.
     pub fn from_response(
         bytes: Bytes,
         rcode: ResponseCode,
@@ -57,7 +57,7 @@ impl CacheEntry {
         pipeline_id: Arc<str>,
         qtype: u16,
         flags: QueryFlags,
-        ttls: (u32, u32),
+        ttl: u32,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -69,8 +69,7 @@ impl CacheEntry {
             qtype,
             flags,
             inserted_at: now,
-            original_ttl: ttls.0,
-            refresh_ttl: ttls.1,
+            original_ttl: ttl,
             reach: EcsReach::default(),
             stored_at: now,
             fetched_at: now,
@@ -370,7 +369,7 @@ mod tests {
             Arc::from("main"),
             1,
             crate::proto_utils::QueryFlags::RECURSIVE,
-            (60, 60),
+            60,
         ))
     }
 
@@ -456,7 +455,7 @@ mod tests {
             Arc::from("main"),
             1,
             crate::proto_utils::QueryFlags::RECURSIVE,
-            (ttl, ttl),
+            ttl,
         )
         .with_reach(reach);
         entry.inserted_at -= age;
@@ -489,7 +488,7 @@ mod tests {
                     Arc::from("main"),
                     1,
                     flags,
-                    (300, 300),
+                    300,
                 )
                 .with_reach(reach("198.51.100.0/24", None)),
             )

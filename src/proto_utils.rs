@@ -1386,8 +1386,6 @@ impl QuickQuery<'_> {
 pub struct QuickResponse {
     pub rcode: hickory_proto::op::ResponseCode,
     pub min_ttl: u32,
-    /// 最大 TTL，用于后台刷新触发决策 / Maximum TTL, used for background refresh trigger decision
-    pub max_ttl: u32,
     /// TC (Truncated) flag - 响应被截断，应使用 TCP 重试 / Response was truncated, retry with TCP
     pub truncated: bool,
 }
@@ -1713,7 +1711,6 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         return Some(QuickResponse {
             rcode,
             min_ttl: ttl,
-            max_ttl: ttl,
             truncated,
         });
     }
@@ -1734,10 +1731,9 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
         pos += 4;
     }
 
-    // 至少有一条应答记录（上面已返回 an_count 为 0 的情况），所以两者都会被下面设过
-    // There is at least one answer record (an_count 0 returned above), so both get set below
+    // 至少有一条应答记录（上面已返回 an_count 为 0 的情况），所以它会被下面设过
+    // There is at least one answer record (an_count 0 returned above), so it gets set below
     let mut min_ttl = u32::MAX;
-    let mut max_ttl = u32::MIN;
     let mut only_aliases = true;
 
     // Scan Answers / 扫描应答部分
@@ -1763,12 +1759,7 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
             packet[pos + 6],
             packet[pos + 7],
         ]));
-        if ttl < min_ttl {
-            min_ttl = ttl;
-        }
-        if ttl > max_ttl {
-            max_ttl = ttl;
-        }
+        min_ttl = min_ttl.min(ttl);
 
         let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
         pos += 10 + rd_len;
@@ -1777,13 +1768,11 @@ pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
     if says_no_despite_answers(rcode, only_aliases) {
         let negative = soa_negative_ttl_at(packet, pos, ns_count).unwrap_or(0);
         min_ttl = min_ttl.min(negative);
-        max_ttl = max_ttl.min(negative);
     }
 
     Some(QuickResponse {
         rcode,
         min_ttl,
-        max_ttl,
         truncated,
     })
 }
@@ -3020,10 +3009,10 @@ mod tests {
             msg.to_vec().unwrap()
         };
         let quick = parse_response_quick(&reply(&[300, 0x8000_0001], None)).unwrap();
-        assert_eq!((quick.min_ttl, quick.max_ttl), (0, 300));
+        assert_eq!(quick.min_ttl, 0);
         for soa in [(0x8000_0000, 60), (300, 0x8000_0000)] {
             let quick = parse_response_quick(&reply(&[], Some(soa))).unwrap();
-            assert_eq!((quick.min_ttl, quick.max_ttl), (0, 0), "{soa:x?}");
+            assert_eq!(quick.min_ttl, 0, "{soa:x?}");
         }
         let rewritten = |floor, cap| {
             let out = reply_within_ttls(Bytes::from(reply(&[300, 0x8000_0001], None)), floor, cap);

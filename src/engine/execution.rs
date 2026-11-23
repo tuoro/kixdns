@@ -829,7 +829,6 @@ impl Engine {
 
                     tracing::debug!(
                         original_ttl = hit.original_ttl,
-                        refresh_ttl = hit.refresh_ttl,
                         elapsed_secs = elapsed_secs,
                         remaining_ttl = remaining_ttl,
                         threshold_percent = cfg.settings.cache_refresh_threshold_percent,
@@ -849,7 +848,6 @@ impl Engine {
                         tracing::debug!(
                             qname = %qname_str,
                             original_ttl = hit.original_ttl,
-                            refresh_ttl = hit.refresh_ttl,
                             remaining_ttl = remaining_ttl,
                             "triggering background cache refresh"
                         );
@@ -1963,7 +1961,7 @@ impl Engine {
     ///
     /// 防止无限循环的保护措施：
     /// Protection against infinite loops:
-    /// 1. 检查 refresh_ttl >= cache_refresh_min_ttl（默认5秒）
+    /// 1. 检查条目的 TTL >= cache_refresh_min_ttl（默认5秒）
     /// 2. 使用与正常请求相同的 Singleflight 机制（inflight map）
     /// 3. 刷新失败不会删除现有缓存条目
     pub(crate) fn spawn_background_refresh(
@@ -2149,7 +2147,7 @@ mod tests {
                 Arc::from("main"),
                 u16::from(RecordType::A),
                 crate::proto_utils::QueryFlags::RECURSIVE,
-                (60, 60),
+                60,
             ),
         );
 
@@ -5146,7 +5144,6 @@ mod tests {
                 inserted_at: then,
                 stored_at: then,
                 original_ttl: cache_max_ttl,
-                refresh_ttl: cache_max_ttl,
                 ..(*stale_entry("default")).clone()
             }),
         );
@@ -5308,7 +5305,6 @@ mod tests {
             qtype: u16::from(RecordType::A),
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5,
-            refresh_ttl: 5,
             reach: Default::default(),
             stored_at: Instant::now(),
             fetched_at: Instant::now(),
@@ -5796,7 +5792,6 @@ mod tests {
             bytes: Bytes::from(answer.to_vec().unwrap()),
             inserted_at: Instant::now() - Duration::from_secs(30),
             original_ttl: 300,
-            refresh_ttl: 300,
             ..(*stale_entry("default")).clone()
         });
         engine.cache_insert(stale_com_keys(&engine).slot, entry);
