@@ -1,5 +1,5 @@
 use anyhow::Context;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use dashmap::mapref::entry;
@@ -608,23 +608,15 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// 一个上游的连接池：几个客户端轮流用 / One upstream's pool: a few clients taken in turn
+/// 一个上游的连接池：几个客户端，先用排在前面、还不忙的（见 [`least_busy`]）/ One upstream's pool: a
+/// few clients, the first not busy taken first (see [`least_busy`])
 pub struct ConnectionPool<C> {
     clients: Vec<Arc<C>>,
-    next_idx: AtomicUsize,
 }
 
 impl<C> ConnectionPool<C> {
     fn new(clients: Vec<Arc<C>>) -> Self {
-        Self {
-            clients,
-            next_idx: AtomicUsize::new(0),
-        }
-    }
-
-    /// 轮到的那个客户端 / The client whose turn it is
-    fn pick(&self) -> &Arc<C> {
-        &self.clients[self.next_idx.fetch_add(1, Ordering::Relaxed) % self.clients.len()]
+        Self { clients }
     }
 
     /// 排在最前、还不忙的客户端；都忙时在途最少的那个（见 [`least_busy`]）
@@ -2723,18 +2715,6 @@ struct DoqRuntime {
     zero_rtt_notice: std::sync::Once,
 }
 
-struct DoqConnectionInfo {
-    conn: QuicConnection,
-    used_0rtt: bool,
-    /// 连接取自连接池，而不是为这次查询新建的
-    /// The connection came from the pool rather than being made for this query
-    reused: bool,
-    /// 这条连接是第几代：这个查询之后要把连接从池里拿掉，拿掉的就是这一代（见 `reset_connection`）
-    /// Which generation the connection is: when this query later has the connection taken
-    /// out of the pool, this generation is what goes (see `reset_connection`)
-    generation: u64,
-}
-
 /// DoQ (DNS over QUIC) 连接池
 /// DoQ (DNS over QUIC) connection pool
 ///
@@ -2810,15 +2790,16 @@ pub struct DoqClient {
 /// Implements RFC 9250 (DNS over Dedicated QUIC Connections)
 pub struct DoqMuxClient {
     upstream: Arc<str>,
-    target: Mutex<Option<DoqTarget>>,
-    /// 池里的连接和它是第几代 / The pooled connection and which generation it is
-    connection: Mutex<Option<(QuicConnection, u64)>>,
-    /// 最近建的那条连接是第几代，从 1 起，建连时在连接锁下加一。把连接从池里拿掉的决定都点名一代
-    /// （见 `reset_connection`）
-    /// The generation of the connection made last, from 1, raised under the connection lock as a
-    /// connection is made. Every decision to take a connection out of the pool names a
-    /// generation (see `reset_connection`)
-    generation: AtomicU64,
+    /// 解析好的上游地址，第一个查询时算 / The upstream address parsed, worked out at the first query
+    target: std::sync::OnceLock<DoqTarget>,
+    /// 池里的连接。读它不加锁，只有建连时拿 `connecting` / The pooled connection, read without a
+    /// lock; only making one takes `connecting`
+    pooled: ArcSwapOption<DoqConn>,
+    /// 同一时刻只有一个查询去连，其余的等它连好（等待算在各自的预算里）/ One query connects at a
+    /// time and the others wait for it (the wait counting against each one's budget)
+    connecting: Mutex<()>,
+    /// 这个客户端上还没答完的查询数（见 [`least_busy`]）/ Queries on this client not yet answered (see [`least_busy`])
+    in_flight: AtomicUsize,
     runtime: Arc<DoqRuntime>,
     /// Track whether 0-RTT has been rejected by the server for auto-fallback
     /// 跟踪服务器是否拒绝了 0-RTT，用于自动回退
@@ -2830,12 +2811,39 @@ pub struct DoqMuxClient {
     /// Shared by every connection in the upstream's pool: what one connection
     /// learned, the others need not each fail and sit out a timeout to learn again
     zero_rtt_rejected: Arc<AtomicBool>,
-    /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
-    conn_create_time: AtomicU64,
-    /// 空闲超时：最后请求时间（毫秒）/ Idle timeout: last request time (ms)
-    last_request_time: AtomicU64,
-    /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
-    last_health_check_time: AtomicU64,
+}
+
+/// 发查询用的连接，和它是怎么来的 / The connection to send on, and how it came
+struct DoqConnected {
+    pooled: Arc<DoqConn>,
+    used_0rtt: bool,
+    /// 取自池里，而不是为这次查询新建的 / Taken from the pool rather than made for this query
+    reused: bool,
+}
+
+/// 池里的一条 QUIC 连接 / One pooled QUIC connection
+struct DoqConn {
+    conn: QuicConnection,
+    /// 什么时候建的，什么时候最后答过（毫秒）/ When it was made, and when it last answered (ms)
+    created_ms: u64,
+    last_answer_ms: AtomicU64,
+    /// 在它上面读到过几个回答。查询超时时看这期间涨没涨：涨了说明连接照常在回答，慢的只是这一个，不换连接
+    /// Answers read on it. A query timing out looks whether this grew meanwhile: if so the
+    /// connection kept answering and only this one is slow, so it is not replaced
+    answers: AtomicU64,
+}
+
+/// 连接用旧了就换：活得比 [`DOQ_MAX_AGE_MS`] 久，或者比 [`DOQ_IDLE_TIMEOUT_MS`] 还久没答过。给出原因
+/// A connection worn out is replaced: alive longer than [`DOQ_MAX_AGE_MS`], or unanswered for
+/// longer than [`DOQ_IDLE_TIMEOUT_MS`]. Gives the reason
+fn doq_worn_out(created_ms: u64, last_answer_ms: u64, now: u64) -> Option<&'static str> {
+    if now.saturating_sub(created_ms) > DOQ_MAX_AGE_MS {
+        Some("too old")
+    } else if now.saturating_sub(last_answer_ms) > DOQ_IDLE_TIMEOUT_MS {
+        Some("idle too long")
+    } else {
+        None
+    }
 }
 
 /// DoQ 连接的传输参数。查询都是我们开的流，一个流问一个（RFC 9250 第 4.2 节），所以：
@@ -2962,7 +2970,9 @@ impl DoqClient {
                 })
                 .collect()
         });
-        pool.pick().send(packet, timeout_dur).await
+        pool.least_busy(|client| client.in_flight.load(Ordering::Relaxed))
+            .send(packet, timeout_dur)
+            .await
     }
 }
 
@@ -2974,93 +2984,33 @@ impl DoqMuxClient {
     ) -> Self {
         Self {
             upstream,
-            target: Mutex::new(None),
-            connection: Mutex::new(None),
-            generation: AtomicU64::new(0),
+            target: std::sync::OnceLock::new(),
+            pooled: ArcSwapOption::empty(),
+            connecting: Mutex::new(()),
+            in_flight: AtomicUsize::new(0),
             runtime,
             zero_rtt_rejected,
-            conn_create_time: AtomicU64::new(0),
-            last_request_time: AtomicU64::new(0),
-            last_health_check_time: AtomicU64::new(0),
         }
     }
 
-    /// Record a success / 记一次成功
-    fn record_success(&self) {
-        let now = unix_time_millis();
-        self.last_request_time.store(now, Ordering::Release);
-    }
-
-    /// Check if connection needs reset due to aging or idle timeout
-    /// 检查连接是否需要重置（老化或空闲超时）
-    async fn check_connection_health(&self) -> bool {
-        let now = unix_time_millis();
-
-        // Throttle health checks: only check once per second
-        let last_check = self.last_health_check_time.load(Ordering::Acquire);
-        if now.saturating_sub(last_check) < 1000 {
-            return false;
+    /// 解析好的上游地址 / The upstream address, parsed
+    fn target(&self) -> anyhow::Result<&DoqTarget> {
+        if let Some(target) = self.target.get() {
+            return Ok(target);
         }
-        self.last_health_check_time.store(now, Ordering::Release);
-        // 先记下看的是哪一代，再读它的时刻（道理同 TCP、DoT 的健康检查）
-        // Which generation is looked at is noted first and its times read after (as in the
-        // TCP and DoT health check)
-        let generation = self.generation.load(Ordering::Acquire);
-
-        // Check connection aging
-        let create_time = self.conn_create_time.load(Ordering::Acquire);
-        let max_age = DOQ_MAX_AGE_MS;
-        if create_time > 0 {
-            let age_ms = now.saturating_sub(create_time);
-            if age_ms > max_age {
-                info!(
-                    upstream = %self.upstream,
-                    age_ms = age_ms,
-                    max_age_ms = max_age,
-                    "DoQ connection too old, resetting"
-                );
-                self.reset_connection(generation).await;
-                return true;
-            }
-        }
-
-        // Check idle timeout
-        let last_req = self.last_request_time.load(Ordering::Acquire);
-        let idle_timeout = DOQ_IDLE_TIMEOUT_MS;
-        if last_req > 0 {
-            let idle_ms = now.saturating_sub(last_req);
-            if idle_ms > idle_timeout {
-                info!(
-                    upstream = %self.upstream,
-                    idle_ms = idle_ms,
-                    idle_timeout_ms = idle_timeout,
-                    "DoQ connection idle too long, resetting"
-                );
-                self.reset_connection(generation).await;
-                return true;
-            }
-        }
-
-        false
+        let target = parse_doq_target(&self.upstream)?;
+        anyhow::ensure!(
+            !target.host.is_empty(),
+            "invalid doq upstream: {}",
+            self.upstream
+        );
+        Ok(self.target.get_or_init(|| target))
     }
 
     pub async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
-        let target = {
-            let mut guard = self.target.lock().await;
-            if guard.is_none() {
-                *guard = Some(parse_doq_target(&self.upstream)?);
-            }
-            guard
-                .as_ref()
-                .context("doq target missing after initialization")?
-                .clone()
-        };
-
-        if target.host.is_empty() {
-            anyhow::bail!("invalid doq upstream: {}", self.upstream);
-        }
-
-        self.send_with_retry(&target, packet, timeout_dur).await
+        let target = self.target()?;
+        let _in_flight = InFlight::enter(&self.in_flight);
+        self.send_with_retry(target, packet, timeout_dur).await
     }
 
     async fn send_with_retry(
@@ -3083,145 +3033,42 @@ impl DoqMuxClient {
         let mut timeout_dur = timeout_dur;
 
         loop {
-            // Check connection health (aging, idle timeout) before each attempt
-            // 每次尝试前检查连接健康状态（老化、空闲超时）
-            self.check_connection_health().await;
-
             let start = tokio::time::Instant::now();
-            // 解析上游名字、等连接锁、握手和等回答共用这一份预算。此前握手和回答各拿
-            // 一整份超时，一个请求最多能跑到配置值的两倍，系统解析上游名字则完全不受限
-            // Resolving the upstream name, waiting for the connection lock, the
-            // handshake and the answer share this one budget. The handshake and
-            // the answer used to get a full timeout each, so a request could run
-            // to twice the configured value, and resolving the name had no bound
-            let DoqConnectionInfo {
-                conn,
+            // 等别的查询连好、解析上游名字、握手和等回答共用这一份预算
+            // Waiting for another query's connect, resolving the upstream name, the handshake and
+            // the answer share this one budget
+            let DoqConnected {
+                pooled,
                 used_0rtt,
                 reused,
-                generation,
             } = match timeout(timeout_dur, self.get_or_connect(target, timeout_dur)).await {
-                Ok(info) => info?,
-                Err(_) => anyhow::bail!("doq connect timeout after {}ms", timeout_dur.as_millis()),
+                Ok(connected) => connected?,
+                Err(_) => {
+                    anyhow::bail!("doq connect timeout after {}ms", timeout_dur.as_millis())
+                }
             };
             let query_budget = timeout_dur.saturating_sub(start.elapsed());
             if query_budget.is_zero() {
                 anyhow::bail!("doq timeout before sending the query");
             }
+            let answers_before = pooled.answers.load(Ordering::Acquire);
 
-            let resp = timeout(query_budget, async {
-                // 内层返回带类型的失败，而不是 anyhow：每一步都被 context 包过
-                // 之后，anyhow 的 to_string 只剩最外层那一句，quinn 的原始错误
-                // 到不了判定处。
-                // The inner block yields a typed failure rather than anyhow:
-                // once every step is wrapped in context, anyhow's to_string
-                // leaves only the outermost sentence and quinn's own error never
-                // reaches the decision.
-                let (mut send, mut recv) = conn.open_bi().await.map_err(DoqFailure::OpenStream)?;
-
-                // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
-                // with a 2-octet length field, followed by the DNS message content.
-                // Each query uses a separate bidirectional stream; the message boundary
-                // is signalled by FIN.
-                // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
-                // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
-                //
-                // RFC 9250 §4.2.1: DNS Message ID MUST be 0 over DoQ.
-                // Build complete wire frame in one allocation, no intermediate copy.
-                // RFC 9250 §4.2.1: DoQ 上 DNS Message ID 必须为 0。
-                // 单次分配构建完整 wire frame，无中间拷贝。
-                let mut frame = Vec::with_capacity(2 + packet.len());
-                frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-                frame.extend_from_slice(packet);
-                frame[2] = 0; // Message ID = 0 (RFC 9250 §4.2.1) / 消息 ID = 0
-                frame[3] = 0;
-
-                send.write_all(&frame).await.map_err(DoqFailure::Write)?;
-                let _ = send.finish();
-
-                // Read response: 2-byte length prefix followed by DNS message
-                // 读取响应：2 字节长度前缀，后跟 DNS 消息
-                // Note: The server sends the response and closes the stream with FIN
-                // We need to read all data until FIN, then parse the length prefix
-                // 注意：服务器发送响应后用 FIN 关闭流
-                // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-                // 连接被对端关掉的判断此前靠字符串，而且那个判断把所有原因都
-                // 折叠成同一句话；现在原样把 quinn 的错误带出去，由
-                // zero_rtt_likely_rejected 按类型判定。
-                // Detecting a peer-closed connection used to go through strings,
-                // and that check folded every cause into one sentence. The quinn
-                // error is now carried out as it is and
-                // zero_rtt_likely_rejected decides by type.
-                let mut all_data = recv
-                    .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
-                    .await
-                    .map_err(DoqFailure::Read)?;
-
-                if all_data.is_empty() {
-                    return Err(DoqFailure::Protocol(
-                        "doq received empty response (server closed stream without sending data)"
-                            .to_string(),
-                    ));
-                }
-
-                if all_data.len() < 2 {
-                    return Err(DoqFailure::Protocol(format!(
-                        "doq response too short: {} bytes",
-                        all_data.len()
-                    )));
-                }
-
-                let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
-
-                // idoq-style length validation: response length must match length prefix
-                // idoq 风格的长度验证：响应长度必须匹配长度前缀
-                if all_data.len() != 2 + msg_len {
-                    return Err(DoqFailure::Protocol(format!(
-                        "doq length mismatch: expected {} bytes (2 + {}), got {} bytes. \
-                        This may indicate data corruption or server protocol violation.",
-                        2 + msg_len,
-                        msg_len,
-                        all_data.len()
-                    )));
-                }
-
-                let buf = &all_data[2..2 + msg_len];
-                if buf.len() < 2 {
-                    // DNS message must be at least 2 bytes for TXID restoration.
-                    // Also prevents all_data[2..4] index out of bounds when msg_len < 2.
-                    // DNS 消息必须至少 2 字节才能恢复 TXID。
-                    // 同时防止 msg_len < 2 时 all_data[2..4] 越界。
-                    return Err(DoqFailure::Protocol(format!(
-                        "doq DNS message too short: {msg_len} bytes"
-                    )));
-                }
-                // RFC 5452 §9.1, as on the other transports: the answer has to be
-                // for this question
-                // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
-                if !crate::proto_utils::answers_query(packet, buf) {
-                    return Err(DoqFailure::Protocol(
-                        "doq reply does not answer the query".to_string(),
-                    ));
-                }
-                // Restore original DNS Message ID in-place (Vec<u8> is mutable).
-                // Bytes::from(Vec) takes ownership of the heap allocation (zero-copy).
-                // slice(2..) returns a view past the length prefix (zero-copy, shares allocation).
-                // 原地恢复原始 DNS Message ID（Vec<u8> 可变）。
-                // Bytes::from(Vec) 接管堆分配（零拷贝）。
-                // slice(2..) 返回跳过长度前缀的视图（零拷贝，共享分配）。
-                all_data[2..4].copy_from_slice(&original_id.to_be_bytes());
-                Ok::<Bytes, DoqFailure>(Bytes::from(all_data).slice(2..))
-            })
-            .await;
-
-            match resp {
+            match timeout(query_budget, Self::ask(&pooled.conn, packet, original_id)).await {
                 Ok(Ok(bytes)) => {
-                    self.record_success();
+                    pooled.answers.fetch_add(1, Ordering::AcqRel);
+                    pooled
+                        .last_answer_ms
+                        .store(unix_time_millis(), Ordering::Release);
                     return Ok(bytes);
                 }
                 Ok(Err(failure)) => {
-                    // 每次失败都把这次查询用的那条连接从池里拿掉 / Every failure takes the
-                    // connection this query used out of the pool
-                    self.reset_connection(generation).await;
+                    // 连接没了才换；流被重置、回答不合协议是这一个查询的事，连接照用
+                    // Only a connection that is gone is replaced; a stream reset or a malformed
+                    // answer is this one query's matter, and the connection stays in use
+                    let gone = Self::connection_gone(&failure);
+                    if gone {
+                        self.forget(&pooled);
+                    }
                     let retry = if !allow_retry {
                         false
                     } else if Self::early_data_refused(&failure)
@@ -3236,7 +3083,7 @@ impl DoqMuxClient {
                             "DoQ 0-RTT likely rejected, retrying without 0-RTT"
                         );
                         true
-                    } else if reused && Self::connection_gone(&failure) {
+                    } else if reused && gone {
                         // 池里的连接在两次查询之间断了（服务器的空闲超时可能比保活间隔还短），
                         // 这次查询本身没问题：换一条新连接再发一次
                         // The pooled connection died between two queries (a server's
@@ -3260,33 +3107,198 @@ impl DoqMuxClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(_) => {
-                    // 只有用了 0-RTT 的连接超时才算 0-RTT 的嫌疑；普通连接上的超时
-                    // 只是这次回答慢，不能因此把 0-RTT 永久关掉
-                    // Only a timeout on a connection that used 0-RTT puts 0-RTT
-                    // under suspicion; on a normal connection it just means a slow
-                    // answer and must not switch 0-RTT off for good
+                    // 用了 0-RTT 的连接上超时，算 0-RTT 的嫌疑，往后不再用；普通连接上的超时只是这次回答慢。预算已经
+                    // 用完，不再重试
+                    // A timeout on a connection that used 0-RTT puts 0-RTT under suspicion, and it
+                    // is not used from then on; on a normal connection it is just a slow answer.
+                    // The budget is spent, so there is no retry
                     if used_0rtt {
                         self.disable_zero_rtt();
-                        if allow_retry {
-                            let remaining = timeout_dur.saturating_sub(start.elapsed());
-                            self.reset_connection(generation).await;
-                            if remaining.is_zero() {
-                                return Err(anyhow::anyhow!("doq timeout"));
-                            }
-                            crate::warn_sparse!(
-                                upstream = %self.upstream,
-                                "DoQ 0-RTT timeout detected, retrying without 0-RTT"
-                            );
-                            allow_retry = false;
-                            timeout_dur = remaining;
-                            continue;
-                        }
                     }
-                    self.reset_connection(generation).await;
+                    // 这期间连接上没读到过别的回答（多半死了或者卡住了）才换 / Replaced only when no
+                    // other answer was read on it meanwhile (it is most likely dead or stalled)
+                    if pooled.answers.load(Ordering::Acquire) == answers_before {
+                        self.forget(&pooled);
+                    }
                     return Err(anyhow::anyhow!("doq timeout"));
                 }
             }
         }
+    }
+
+    /// 在 `conn` 上开一个流问一次（RFC 9250 §4.2）。返回带类型的失败而不是 anyhow：每一步都被 context 包过之后，
+    /// anyhow 的 to_string 只剩最外层那一句，quinn 的原始错误到不了判定处
+    /// Asks once on a stream of its own on `conn` (RFC 9250 §4.2). It gives a typed failure
+    /// rather than anyhow: once every step is wrapped in context, anyhow's to_string leaves only
+    /// the outermost sentence and quinn's own error never reaches the decision
+    async fn ask(
+        conn: &QuicConnection,
+        packet: &[u8],
+        original_id: u16,
+    ) -> Result<Bytes, DoqFailure> {
+        let (mut send, mut recv) = conn.open_bi().await.map_err(DoqFailure::OpenStream)?;
+
+        // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
+        // with a 2-octet length field, followed by the DNS message content.
+        // Each query uses a separate bidirectional stream; the message boundary
+        // is signalled by FIN.
+        // RFC 9250 §4.2: QUIC 流上的 DNS 消息必须使用 2 字节长度前缀，
+        // 后跟 DNS 消息内容。每个查询使用单独的双向流；消息边界由 FIN 信号标识。
+        //
+        // RFC 9250 §4.2.1: DNS Message ID MUST be 0 over DoQ.
+        // Build complete wire frame in one allocation, no intermediate copy.
+        // RFC 9250 §4.2.1: DoQ 上 DNS Message ID 必须为 0。
+        // 单次分配构建完整 wire frame，无中间拷贝。
+        let mut frame = Vec::with_capacity(2 + packet.len());
+        frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
+        frame.extend_from_slice(packet);
+        frame[2] = 0; // Message ID = 0 (RFC 9250 §4.2.1) / 消息 ID = 0
+        frame[3] = 0;
+
+        send.write_all(&frame).await.map_err(DoqFailure::Write)?;
+        let _ = send.finish();
+
+        // Read response: 2-byte length prefix followed by DNS message
+        // 读取响应：2 字节长度前缀，后跟 DNS 消息
+        // Note: The server sends the response and closes the stream with FIN
+        // We need to read all data until FIN, then parse the length prefix
+        // 注意：服务器发送响应后用 FIN 关闭流
+        // 我们需要读取所有数据直到 FIN，然后解析长度前缀
+        // 连接被对端关掉的判断此前靠字符串，而且那个判断把所有原因都
+        // 折叠成同一句话；现在原样把 quinn 的错误带出去，由
+        // zero_rtt_likely_rejected 按类型判定。
+        // Detecting a peer-closed connection used to go through strings,
+        // and that check folded every cause into one sentence. The quinn
+        // error is now carried out as it is and
+        // zero_rtt_likely_rejected decides by type.
+        let mut all_data = recv
+            .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
+            .await
+            .map_err(DoqFailure::Read)?;
+
+        if all_data.is_empty() {
+            return Err(DoqFailure::Protocol(
+                "doq received empty response (server closed stream without sending data)"
+                    .to_string(),
+            ));
+        }
+
+        if all_data.len() < 2 {
+            return Err(DoqFailure::Protocol(format!(
+                "doq response too short: {} bytes",
+                all_data.len()
+            )));
+        }
+
+        let msg_len = u16::from_be_bytes([all_data[0], all_data[1]]) as usize;
+
+        // idoq-style length validation: response length must match length prefix
+        // idoq 风格的长度验证：响应长度必须匹配长度前缀
+        if all_data.len() != 2 + msg_len {
+            return Err(DoqFailure::Protocol(format!(
+                "doq length mismatch: expected {} bytes (2 + {}), got {} bytes. \
+                This may indicate data corruption or server protocol violation.",
+                2 + msg_len,
+                msg_len,
+                all_data.len()
+            )));
+        }
+
+        let buf = &all_data[2..2 + msg_len];
+        if buf.len() < 2 {
+            // DNS message must be at least 2 bytes for TXID restoration.
+            // Also prevents all_data[2..4] index out of bounds when msg_len < 2.
+            // DNS 消息必须至少 2 字节才能恢复 TXID。
+            // 同时防止 msg_len < 2 时 all_data[2..4] 越界。
+            return Err(DoqFailure::Protocol(format!(
+                "doq DNS message too short: {msg_len} bytes"
+            )));
+        }
+        // RFC 5452 §9.1, as on the other transports: the answer has to be
+        // for this question
+        // RFC 5452 §9.1，和别的传输一样：回答必须是这个问题的
+        if !crate::proto_utils::answers_query(packet, buf) {
+            return Err(DoqFailure::Protocol(
+                "doq reply does not answer the query".to_string(),
+            ));
+        }
+        // Restore original DNS Message ID in-place (Vec<u8> is mutable).
+        // Bytes::from(Vec) takes ownership of the heap allocation (zero-copy).
+        // slice(2..) returns a view past the length prefix (zero-copy, shares allocation).
+        // 原地恢复原始 DNS Message ID（Vec<u8> 可变）。
+        // Bytes::from(Vec) 接管堆分配（零拷贝）。
+        // slice(2..) 返回跳过长度前缀的视图（零拷贝，共享分配）。
+        all_data[2..4].copy_from_slice(&original_id.to_be_bytes());
+        Ok::<Bytes, DoqFailure>(Bytes::from(all_data).slice(2..))
+    }
+
+    /// 池里的连接还能用就给出来：没被关掉，也没用旧（见 [`doq_worn_out`]）
+    /// The pooled connection when still usable: not closed, and not worn out (see [`doq_worn_out`])
+    fn usable(&self) -> Option<Arc<DoqConn>> {
+        let pooled = self.pooled.load_full()?;
+        if let Some(reason) = pooled.conn.close_reason() {
+            debug!(upstream = %self.upstream, reason = %reason, "DoQ pooled connection already closed, reconnecting");
+            return None;
+        }
+        let now = unix_time_millis();
+        let last_answer = pooled.last_answer_ms.load(Ordering::Acquire);
+        if let Some(why) = doq_worn_out(pooled.created_ms, last_answer, now) {
+            info!(upstream = %self.upstream, why, "DoQ connection replaced");
+            return None;
+        }
+        Some(pooled)
+    }
+
+    /// 发查询用的连接：池里的能用就用，不能用就建一条放进池里
+    /// The connection to send on: the pooled one when usable, otherwise one made and pooled
+    async fn get_or_connect(
+        &self,
+        target: &DoqTarget,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<DoqConnected> {
+        let reused = |pooled| DoqConnected {
+            pooled,
+            used_0rtt: false,
+            reused: true,
+        };
+        if let Some(pooled) = self.usable() {
+            return Ok(reused(pooled));
+        }
+        let _connecting = self.connecting.lock().await;
+        // 等锁的时候别的查询可能已经连好了 / Another query may have connected while this one waited for the lock
+        if let Some(pooled) = self.usable() {
+            return Ok(reused(pooled));
+        }
+        let (conn, used_0rtt) = self.connect_new(target, timeout_dur).await?;
+        let now = unix_time_millis();
+        let pooled = Arc::new(DoqConn {
+            conn,
+            created_ms: now,
+            last_answer_ms: AtomicU64::new(now),
+            answers: AtomicU64::new(0),
+        });
+        self.pooled.store(Some(Arc::clone(&pooled)));
+        Ok(DoqConnected {
+            pooled,
+            used_0rtt,
+            reused: false,
+        })
+    }
+
+    /// 把 `pooled` 从池里拿掉，下一个查询新建一条。池里现在的已经不是它（换成了新的，或者已经拿掉了）就什么都不做：
+    /// 几个查询在同一条连接上一起失败时，先失败的那个已经换了新连接，后面的不能把新连接也拿掉、让每个查询各建一条。
+    /// 不用锁：别的查询正在建连时也不用等
+    /// Takes `pooled` out of the pool, so the next query makes a new one. When what is pooled now
+    /// is not it (replaced by a new one, or taken out already) nothing is done: with several
+    /// queries failing together on one connection, the first has had a new one made, and the
+    /// rest must not take that out too, each making its own. Lock-free: it never waits for
+    /// another query's connect
+    fn forget(&self, pooled: &Arc<DoqConn>) {
+        self.pooled.rcu(|current| {
+            current
+                .clone()
+                .filter(|current| !Arc::ptr_eq(current, pooled))
+        });
     }
 
     /// 这次失败是否像 0-RTT 被拒绝，值得关掉 0-RTT 再试一次
@@ -3382,59 +3394,6 @@ impl DoqMuxClient {
             );
         }
     }
-    async fn get_or_connect(
-        &self,
-        target: &DoqTarget,
-        timeout_dur: Duration,
-    ) -> anyhow::Result<DoqConnectionInfo> {
-        // Single-lock pattern: acquire lock once, check + create in one critical section.
-        // This prevents the TOCTOU race where two coroutines both pass the first check,
-        // then both create connections, wasting one.
-        // 单锁模式：一次获取锁，检查+创建在一个临界区内完成。
-        // 防止两个协程同时通过第一次检查后都创建连接、浪费一个的竞态。
-        let mut guard = self.connection.lock().await;
-        if let Some((conn, generation)) = guard.as_ref() {
-            // 对端关掉的、或者空闲超时的连接还留在这里的话，拿去用只会让这次查询失败
-            // A connection the peer closed, or one that idled out, would only
-            // fail this query if handed out again
-            match conn.close_reason() {
-                None => {
-                    return Ok(DoqConnectionInfo {
-                        conn: conn.clone(),
-                        used_0rtt: false,
-                        reused: true,
-                        generation: *generation,
-                    });
-                }
-                Some(reason) => {
-                    debug!(
-                        upstream = %self.upstream,
-                        reason = %reason,
-                        "DoQ pooled connection already closed, reconnecting"
-                    );
-                    *guard = None;
-                }
-            }
-        }
-
-        let (conn, used_0rtt) = self.connect_new(target, timeout_dur).await?;
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        *guard = Some((conn.clone(), generation));
-
-        // Record connection creation time for aging checks
-        // 记录连接创建时间用于老化检查
-        let now = unix_time_millis();
-        self.conn_create_time.store(now, Ordering::Release);
-        self.last_request_time.store(now, Ordering::Release);
-
-        Ok(DoqConnectionInfo {
-            conn,
-            used_0rtt,
-            reused: false,
-            generation,
-        })
-    }
-
     async fn connect_new(
         &self,
         target: &DoqTarget,
@@ -3516,25 +3475,6 @@ impl DoqMuxClient {
             .context("doq connect timeout")??;
 
         Ok((connection, false))
-    }
-
-    /// 把第 `generation` 代连接从池里拿掉，下一个查询新建一条。池里现在的已经不是这一代（换成了新的，或者已经
-    /// 拿掉了）就什么都不做：几个查询在同一条连接上一起失败时，先失败的那个已经换了新连接，后面的不能把新连接
-    /// 也拿掉、让每个查询各建一条
-    /// Takes the connection of `generation` out of the pool, so the next query makes a new one.
-    /// When what is pooled now is not that generation (replaced by a new one, or taken out
-    /// already) nothing is done: with several queries failing together on one connection, the
-    /// first has had a new one made, and the rest must not take that out too, each making its own
-    async fn reset_connection(&self, generation: u64) {
-        let mut guard = self.connection.lock().await;
-        if guard
-            .as_ref()
-            .is_some_and(|(_, pooled)| *pooled == generation)
-        {
-            *guard = None;
-            // Reset connection creation time so aging checks start fresh on reconnect
-            self.conn_create_time.store(0, Ordering::Release);
-        }
     }
 }
 
@@ -5314,18 +5254,14 @@ mod tests {
             .expect("the upstream answers");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        client
-            .reset_connection(client.generation.load(Ordering::Acquire))
-            .await;
+        client.pooled.store(None);
         let resumed = client
             .get_or_connect(&target, Duration::from_secs(2))
             .await
             .expect("connect");
         assert!(resumed.used_0rtt, "a resumed connection offers early data");
 
-        client
-            .reset_connection(client.generation.load(Ordering::Acquire))
-            .await;
+        client.pooled.store(None);
         client.disable_zero_rtt();
         let after = client
             .get_or_connect(&target, Duration::from_secs(2))
@@ -5380,42 +5316,29 @@ mod tests {
             client.zero_rtt_rejected.load(Ordering::Relaxed),
             "0-RTT is off for this upstream from then on"
         );
-        // 两个查询在同一条连接上一起失败，只换一条新连接：后失败的那个不把先失败的建好的连接也拿掉
-        // The two queries failed together on one connection and one new connection replaces
-        // it: the later one does not take out what the earlier one had made
-        assert_eq!(client.generation.load(Ordering::Acquire), 2);
+        // 两个查询的重发都在池里这一条连接上答完：没有各建一条 / Both resends were answered on
+        // the one pooled connection: they did not make one each
+        let pooled = client.pooled.load_full().expect("a pooled connection");
+        assert_eq!(pooled.answers.load(Ordering::Acquire), 2);
     }
 
-    /// DoQ 连接用了超过 30 分钟，或者空闲超过 5 分钟，健康检查就把它换掉；没到时不动
-    /// A DoQ connection over 30 minutes old, or idle for over 5 minutes, is replaced by the
-    /// health check; short of that it stays
-    #[tokio::test]
-    async fn a_doq_connection_is_replaced_when_too_old_or_idle_too_long() {
-        let (_, client_tls) = localhost_tls(&[b"doq"]);
-        let client = doq_test_client(
-            "doq://127.0.0.1:853?sni=localhost".into(),
-            client_tls,
-            false,
-        );
+    /// DoQ 连接用了超过 30 分钟，或者超过 5 分钟没答过，就算用旧了、换新的；没到时照用
+    /// A DoQ connection over 30 minutes old, or unanswered for over 5 minutes, counts as worn out
+    /// and is replaced; short of that it stays in use
+    #[test]
+    fn a_doq_connection_is_worn_out_when_too_old_or_idle_too_long() {
         let minute = 60 * 1000;
-        let check = |born: u64, last_request: u64| {
-            let client = &client;
-            async move {
-                let now = unix_time_millis();
-                client.last_health_check_time.store(0, Ordering::Release);
-                client.conn_create_time.store(now - born, Ordering::Release);
-                client
-                    .last_request_time
-                    .store(now - last_request, Ordering::Release);
-                client.check_connection_health().await
-            }
-        };
-        assert!(
-            !check(29 * minute, 4 * minute).await,
+        let now = 100 * minute;
+        assert_eq!(
+            doq_worn_out(now - 29 * minute, now - 4 * minute, now),
+            None,
             "young and busy enough"
         );
-        assert!(check(31 * minute, 0).await, "too old");
-        assert!(check(minute, 6 * minute).await, "idle too long");
+        assert_eq!(doq_worn_out(now - 31 * minute, now, now), Some("too old"));
+        assert_eq!(
+            doq_worn_out(now - minute, now - 6 * minute, now),
+            Some("idle too long")
+        );
     }
 
     /// DoT 和 DoQ 的上游地址：`sni`/`servername` 取最后一个非空的；出错时错误文字带着协议名
@@ -6170,31 +6093,53 @@ mod tests {
         );
     }
 
-    /// 一次查询失败（回答的不是这个问题，或者超时）以后连接被复位，下一个查询走新连接
-    /// After a failed query (an answer to another question, or a timeout) the
-    /// connection is reset and the next query goes over a fresh one
+    /// 连接没了、或者超时而这期间连接上没读到别的回答，才换连接；回答的不是这个问题是这一个查询的事，超时而连接照常
+    /// 在回答别的查询是这一个回答慢，连接都照用。以前每次失败都换，接着的查询又要重新握手
+    /// The connection is replaced only once it is gone, or a query timed out with no other answer
+    /// read on it meanwhile; an answer to another question is this one query's matter, and a
+    /// timeout while the connection kept answering others is this one answer being slow, the
+    /// connection staying in use either way. Every failure used to replace it, the next query
+    /// shaking hands again
     #[tokio::test]
-    async fn a_failed_doq_query_resets_the_connection() {
-        for (failing, budget) in [
-            ("wrong", Duration::from_secs(2)),
-            ("slow", Duration::from_millis(300)),
+    async fn a_doq_connection_is_replaced_only_when_it_failed() {
+        for (failing, budget, alongside, replaced) in [
+            ("wrong", Duration::from_secs(2), false, false),
+            ("slow", Duration::from_millis(300), false, true),
+            ("slow", Duration::from_millis(300), true, false),
         ] {
             let (server, client_tls) = localhost_tls(&[b"doq"]);
-            // 只有一条连接上的第一个查询照常回答：还在旧连接上问，就等不到回答
-            // Only the first query on a connection is answered as asked: asking again
-            // on the old connection gets no answer
-            let addr = spawn_doq_upstream(server, Duration::ZERO, |n, label| match label {
+            let addr = spawn_doq_upstream(server, Duration::ZERO, |_, label| match label {
                 "wrong" => DoqReply::AnotherQuestion,
                 "slow" => DoqReply::Silence,
-                _ if n == 0 => DoqReply::Answer(Duration::ZERO),
-                _ => DoqReply::Silence,
+                "late" => DoqReply::Answer(Duration::from_millis(100)),
+                _ => DoqReply::Answer(Duration::ZERO),
             })
             .await;
             let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
-            let result = client
-                .send(&udp_test_query(&format!("{failing}.example")), budget)
-                .await;
-            assert!(result.is_err(), "`{failing}` gets no usable answer");
+            client
+                .send(&udp_test_query("warm.example"), Duration::from_secs(2))
+                .await
+                .expect("a fresh connection answers");
+            let before = client.pooled.load_full().expect("a pooled connection");
+            let query = udp_test_query(&format!("{failing}.example"));
+            let (failed, ()) = tokio::join!(client.send(&query, budget), async {
+                if alongside {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    client
+                        .send(&udp_test_query("late.example"), Duration::from_secs(2))
+                        .await
+                        .expect("answered alongside");
+                }
+            });
+            assert!(failed.is_err(), "`{failing}` gets no usable answer");
+            let kept = client
+                .pooled
+                .load_full()
+                .is_some_and(|after| Arc::ptr_eq(&after, &before));
+            assert_eq!(
+                !kept, replaced,
+                "`{failing}`, answered alongside: {alongside}"
+            );
             client
                 .send(&udp_test_query("after.example"), Duration::from_secs(2))
                 .await
@@ -7033,6 +6978,45 @@ mod tests {
 
     /// DoQ 连接带着保活，不关掉的话会一直给旧上游发包
     /// A DoQ connection carries a keep-alive and would go on pinging the old upstream
+    /// DoQ 连接池先用排在前面、还不忙的那个客户端：一个个来的查询都走第一条连接，别的客户端不建连接。以前轮流用，
+    /// 每个上游最后都开着 16 条连接、各自保活
+    /// A DoQ pool takes the first client not busy: queries coming one by one all go over the
+    /// first connection, and the other clients make none. They used to be taken in turn, every
+    /// upstream ending up with 16 connections open, each kept alive
+    #[tokio::test]
+    async fn a_doq_pool_uses_one_connection_until_it_is_busy() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let addr = spawn_doq_upstream(server, Duration::ZERO, |_, _| {
+            DoqReply::Answer(Duration::ZERO)
+        })
+        .await;
+        let client = DoqClient {
+            pools: UpstreamPools::new(),
+            pool_size: 4,
+            runtime: doq_test_runtime(client_tls, false),
+        };
+        let upstream = format!("{addr}?sni=localhost");
+        for n in 0..8 {
+            client
+                .send(
+                    &udp_test_query(&format!("q{n}.example")),
+                    &upstream,
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("the upstream answers");
+        }
+        let pool = client
+            .pools
+            .get_or_create(&upstream, |_| unreachable!("built already"));
+        let connected: Vec<bool> = pool
+            .clients
+            .iter()
+            .map(|client| client.pooled.load().is_some())
+            .collect();
+        assert_eq!(connected, [true, false, false, false]);
+    }
+
     #[tokio::test]
     async fn dropping_a_doq_pool_closes_its_connection() {
         let (server, client_tls) = localhost_tls(&[b"doq"]);
