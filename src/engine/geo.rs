@@ -17,7 +17,7 @@ use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_con
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::{GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, parsed_provides_any};
-use crate::watcher::{FileWatch, PendingWatch, load_with_retry};
+use crate::watcher::{FileWatch, PendingWatch};
 use parking_lot::RwLock;
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
@@ -337,9 +337,12 @@ fn load_geosite(
 /// tags alone (see [`GeoSiteManager::apply_source`]). Gives whether new data went in
 /// 换进了新数据时为 true
 fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[String]) -> bool {
-    let what = format!("GeoSite data {}", path.display());
-    let Some(parsed) = load_with_retry(&what, || GeoSiteManager::parse_file(path, tags)) else {
-        return false;
+    let parsed = match GeoSiteManager::parse_file(path, tags) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warn!(target = "geosite_watcher", path = %path.display(), error = %format!("{err:#}"), "GeoSite data reload failed, keeping the data in use");
+            return false;
+        }
     };
     {
         // 这份文件此前提供着规则用到的标签，新读出来却一个都没有了：多半是空文件或写坏了的文件（下载
@@ -470,9 +473,12 @@ fn load_geoip(
 /// whole reload under the write lock a .dat of 300k networks stalled every GeoIP match for
 /// 961 ms. Gives whether new data went in / 换进了新数据时为 true
 fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String]) -> bool {
-    let what = format!("GeoIP data {}", path.display());
-    let Some(parsed) = load_with_retry(&what, || GeoIpManager::parse_file(path, tags)) else {
-        return false;
+    let parsed = match GeoIpManager::parse_file(path, tags) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warn!(target = "geoip_watcher", path = %path.display(), error = %format!("{err:#}"), "GeoIP data reload failed, keeping the data in use");
+            return false;
+        }
     };
     {
         // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
