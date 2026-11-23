@@ -816,6 +816,13 @@ async fn forward_upstream_as_is(
     // The first failure reply received, carried out when every attempt fails (see
     // `UpstreamFailure::reply`)
     let mut first_failure_reply: Option<(Bytes, Arc<str>)> = None;
+    // 最先收到的截断应答：它是传输层用 TCP 也取不到完整应答时留下的（见 `forward_udp_smart`），只在别的上游都给不出
+    // 完整应答时交回，客户端看到 TC 自己改用 TCP。以前它和完整应答一样先到先赢，把还在路上的完整应答取消掉
+    // The first truncated answer received: what the transport was left with when TCP could
+    // not fetch the whole answer either (see `forward_udp_smart`). It goes back only when no
+    // other upstream gives a whole answer, the client turning to TCP itself on seeing TC. It
+    // used to win like a whole answer by coming first, cancelling a whole one still on its way
+    let mut first_truncated: Option<(Bytes, Arc<str>)> = None;
 
     // If any TCP/TCP+UDP upstream is present, a failed UDP attempt does not fall back to TCP, to
     // prevent duplicate TCP sends (truncated answers are still fetched again over TCP)
@@ -876,10 +883,11 @@ async fn forward_upstream_as_is(
                     Ok(bytes) => {
                         // 快速解析响应码 / Quick parse response code
                         let quick = crate::proto_utils::parse_response_quick(&bytes);
-                        let should_accept =
-                            quick.as_ref().is_none_or(|qr| !is_failure_reply(qr.rcode));
-
-                        if should_accept {
+                        let kept = if quick.as_ref().is_some_and(|qr| is_failure_reply(qr.rcode)) {
+                            &mut first_failure_reply
+                        } else if crate::proto_utils::truncated_response(&bytes) {
+                            &mut first_truncated
+                        } else {
                             report(UpstreamOutcome::Success, quick.as_ref(), None);
                             // 显式取消其他正在进行的任务，它们的尝试竞争失败（见 `Attempts`）
                             // Cancel the attempts still running, which lose the race (see
@@ -887,9 +895,9 @@ async fn forward_upstream_as_is(
                             tasks.abort_all();
 
                             return Ok((bytes, up_proto));
-                        }
+                        };
                         report(UpstreamOutcome::Rejected, quick.as_ref(), None);
-                        first_failure_reply.get_or_insert((bytes, up_proto));
+                        kept.get_or_insert((bytes, up_proto));
                     }
                     Err(err) => {
                         let outcome = failed_outcome(&err);
@@ -912,6 +920,9 @@ async fn forward_upstream_as_is(
         }
     }
 
+    if let Some(truncated) = first_truncated {
+        return Ok(truncated);
+    }
     // 所有上游都失败 / All upstreams failed
     let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
     Err(UpstreamFailure::with_reply(err, first_failure_reply))

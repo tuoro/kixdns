@@ -258,7 +258,7 @@ Forward 动作的 transport 字段可选以下值：
 | dot | DNS over TLS |
 | doq | DNS over QUIC |
 
-upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多个上游会并发查询并返回第一个可接受的响应；在多个上游选择时，SERVFAIL 和 REFUSED 响应不会被接受；全都没有可接受的响应时，最先收到的那个仍会交给回答检查（见「Pipeline 和规则」）。
+upstream 支持字符串、逗号分隔字符串或 JSON 字符串数组。多个上游会并发查询并返回第一个可接受的响应；在多个上游选择时，SERVFAIL 和 REFUSED 响应不会被接受；被截断的响应（带 TC 位，TCP 也没取到完整的）先放着，别的上游都给不出完整响应时才返回它，客户端看到 TC 位会自己改用 TCP；两样都没有时，最先收到的失败响应仍会交给回答检查（见「Pipeline 和规则」）。
 
 以下协议前缀会覆盖 transport 字段：
 
