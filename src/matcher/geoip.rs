@@ -1,8 +1,9 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use prost::Message;
@@ -141,9 +142,13 @@ impl ParsedGeoIp {
     }
 }
 
+/// 默认的管理器没有 MMDB、也没有标签 / The default manager has no MMDB and no tags
+#[derive(Default)]
 pub struct GeoIpManager {
-    /// MaxMind DB 和它每条数据记录的国家代码 / The MaxMind DB and the country code of each of its data records
-    mmdb: Option<Mmdb>,
+    /// MaxMind DB 和它每条数据记录的国家代码；重载时文件没变就和在用的那份共用（见 [`Self::use_mmdb`]）
+    /// The MaxMind DB and the country code of each of its data records, shared with the one in
+    /// use on a reload while the file stays as it was (see [`Self::use_mmdb`])
+    mmdb: Option<Arc<Mmdb>>,
     /// 按标签分组的 IP 范围索引（从 .dat/JSON 文件加载）
     /// IP range indexes grouped by tag (loaded from .dat/JSON files)
     tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex>,
@@ -163,17 +168,43 @@ struct Mmdb {
     reader: maxminddb::Reader<Vec<u8>>,
     /// 数据记录在文件里的位置 → 国家代码 / A data record's offset in the file → its country code
     countries: FxHashMap<usize, Option<Arc<str>>>,
+    /// 读的是哪个文件、读的时候那个文件什么样 / Which file was read, and what it was like then
+    file: FileStamp,
+}
+
+/// 一个文件的路径、长度和修改时间：三样都没变，就当内容没变 / A file's path, length and modification
+/// time: with all three unchanged, its content counts as unchanged
+#[derive(Debug, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
 }
 
 impl Mmdb {
-    fn open(path: &str) -> Result<Self, maxminddb::MaxMindDbError> {
+    fn open(path: &str, file: FileStamp) -> Result<Self, maxminddb::MaxMindDbError> {
         let reader = maxminddb::Reader::open_readfile(path)?;
         let mut countries = FxHashMap::default();
         if let Err(e) = Self::index(&reader, &mut countries) {
             // 没解到的记录查询时当场解，结果不变 / Records left out are decoded when asked about, with the same result
             tracing::warn!(geoip_db = %path, error = %e, "could not index every GeoIP database record, the rest are decoded per query");
         }
-        Ok(Self { reader, countries })
+        Ok(Self {
+            reader,
+            countries,
+            file,
+        })
     }
 
     /// 把每条数据记录的国家代码（大写）记进 `countries`，同一个代码共用一份
@@ -234,39 +265,44 @@ fn record_country<'a>(found: &maxminddb::LookupResult<'a, Vec<u8>>) -> Option<&'
 }
 
 impl GeoIpManager {
-    /// 创建新的 GeoIP 管理器 / Create new GeoIP manager
-    ///
-    /// # 参数 / Parameters
-    /// - `db_path`: MMDB 文件路径（可选）/ MMDB file path (optional)
-    ///
-    /// 此方法会立即加载 MMDB 文件（如果配置了路径），不再使用懒加载。
-    /// This method loads the MMDB file immediately (if path is configured), no longer using lazy loading.
-    pub fn new(db_path: Option<String>) -> anyhow::Result<Self> {
-        // 立即加载 MMDB 文件（如果配置了）/ Load MMDB file immediately (if configured)
-        let mmdb = if let Some(ref path) = db_path {
-            if std::path::Path::new(path).exists() {
-                match Mmdb::open(path) {
-                    Ok(mmdb) => {
-                        tracing::info!(geoip_db = %path, records = mmdb.countries.len(), "GeoIP database loaded successfully");
-                        Some(mmdb)
-                    }
-                    Err(e) => {
-                        tracing::warn!(geoip_db = %path, error = %e, "Failed to open GeoIP database");
-                        None
-                    }
-                }
-            } else {
-                tracing::warn!(geoip_db = %path, "GeoIP database file not found");
-                None
+    /// 用 `path` 的 MMDB。`current` 在用的正是这个文件、文件也没变（路径、长度、修改时间都一样）时共用它那份，不再
+    /// 读一遍：以前只改了规则用的标签也要把整个库（约 10 MB）再读一遍、每个网段再走一遍，旧库还占着内存。读不了
+    /// （不存在、正被替换、写坏了）时，`current` 用的是同一个路径就留着它那份，返回 false，由调用方等下次重载再读：
+    /// 以前换进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直不按 MMDB 判断，直到重启
+    /// Uses the MMDB at `path`. When `current` uses that very file and the file is unchanged
+    /// (same path, length and modification time) its data is shared rather than read again: a
+    /// change to nothing but the tags rules use used to read the whole database (some 10 MB) and
+    /// walk every network again while the old one still held memory. When it cannot be read
+    /// (missing, being replaced, broken) the data `current` has from the same path stays, and
+    /// false tells the caller to read it on a later reload: a manager with no MMDB used to be
+    /// swapped in, and with the file still there country codes were no longer judged by the MMDB
+    /// until a restart
+    pub fn use_mmdb(&mut self, path: &str, current: &Self) -> bool {
+        let file = FileStamp::of(Path::new(path));
+        let in_use = current.mmdb.as_ref();
+        if let (Ok(file), Some(in_use)) = (&file, in_use)
+            && *file == in_use.file
+        {
+            self.mmdb = Some(Arc::clone(in_use));
+            return true;
+        }
+        let opened = file
+            .map_err(anyhow::Error::new)
+            .and_then(|file| Mmdb::open(path, file).map_err(anyhow::Error::new));
+        match opened {
+            Ok(mmdb) => {
+                tracing::info!(geoip_db = %path, records = mmdb.countries.len(), "GeoIP database loaded successfully");
+                self.mmdb = Some(Arc::new(mmdb));
+                true
             }
-        } else {
-            None
-        };
-
-        Ok(Self {
-            mmdb,
-            tag_indexes: FxHashMap::default(),
-        })
+            Err(e) => {
+                self.mmdb = in_use
+                    .filter(|in_use| in_use.file.path == Path::new(path))
+                    .cloned();
+                tracing::warn!(geoip_db = %path, error = %e, keeping_the_one_in_use = self.mmdb.is_some(), "Failed to open GeoIP database");
+                false
+            }
+        }
     }
 
     /// MMDB 是否已加载；加载了，两个字母的国家代码就只按它判断
@@ -797,7 +833,7 @@ mod tests {
         let path = dir.path().join("geoip_test_v6.dat");
         std::fs::write(&path, &dat).unwrap();
 
-        let mut mgr = GeoIpManager::new(None).unwrap();
+        let mut mgr = GeoIpManager::default();
         let count = mgr.load_from_dat_file(&path).unwrap();
         assert_eq!(count, 2, "应加载 2 条（v4 + v6）");
         assert_eq!(mgr.ip_range_count(), 2, "IPv4 和 IPv6 段都应保留");
@@ -828,7 +864,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("geoip.dat");
         std::fs::write(&path, &dat).unwrap();
-        let mut mgr = GeoIpManager::new(None).unwrap();
+        let mut mgr = GeoIpManager::default();
         mgr.load_from_dat_file(&path).unwrap();
 
         for inside in [
@@ -865,9 +901,48 @@ mod tests {
             GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, Some(&["CN".to_string()])).unwrap();
         assert_eq!(stats.countries_count, 1);
 
-        let mgr = GeoIpManager::new(Some(mmdb.to_string_lossy().into_owned())).unwrap();
+        let mut mgr = GeoIpManager::default();
+        assert!(mgr.use_mmdb(&mmdb.to_string_lossy(), &GeoIpManager::default()));
         assert!(mgr.matches_tag("198.51.100.7".parse().unwrap(), "CN"));
         assert!(!mgr.matches_tag("203.0.113.7".parse().unwrap(), "JP"));
+    }
+
+    /// 重载时文件没变就共用在用的那份 MMDB，不再读第二遍；文件读不了（写坏了）时留着在用的那份、报读不上，修好以后
+    /// 读进新的。以前每次都重读整个库，读不了就换成没有 MMDB 的管理器，国家代码一直不按 MMDB 判断，直到重启
+    /// On a reload an unchanged file shares the MMDB in use instead of reading it twice; a file
+    /// that cannot be read (broken) keeps the one in use and reports it was not read, and once
+    /// fixed it is read anew. The whole database used to be read every time, a failed read
+    /// swapping in a manager with no MMDB, country codes no longer judged by it until a restart
+    #[test]
+    fn a_reload_shares_an_unchanged_mmdb_and_keeps_it_when_the_file_breaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mmdb = dir.path().join("geoip.mmdb");
+        let path = mmdb.to_string_lossy().into_owned();
+        let convert = |json: &str| {
+            let source = dir.path().join("geoip.json");
+            std::fs::write(&source, json).unwrap();
+            GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+        };
+        convert(r#"{ "entries": [{ "country_code": "CN", "ips": ["198.51.100.0/24"] }] }"#);
+        let mut first = GeoIpManager::default();
+        assert!(first.use_mmdb(&path, &GeoIpManager::default()));
+
+        let mut unchanged = GeoIpManager::default();
+        assert!(unchanged.use_mmdb(&path, &first));
+        assert!(Arc::ptr_eq(
+            unchanged.mmdb.as_ref().unwrap(),
+            first.mmdb.as_ref().unwrap()
+        ));
+
+        std::fs::write(&mmdb, b"not a database").unwrap();
+        let mut broken = GeoIpManager::default();
+        assert!(!broken.use_mmdb(&path, &first), "it was not read");
+        assert!(broken.matches_tag("198.51.100.7".parse().unwrap(), "CN"));
+
+        convert(r#"{ "entries": [{ "country_code": "JP", "ips": ["198.51.100.0/24"] }] }"#);
+        let mut fixed = GeoIpManager::default();
+        assert!(fixed.use_mmdb(&path, &broken));
+        assert!(fixed.matches_tag("198.51.100.7".parse().unwrap(), "JP"));
     }
 
     #[test]
@@ -884,7 +959,7 @@ mod tests {
         let path = dir.path().join("geoip_test_v6.json");
         std::fs::write(&path, json).unwrap();
 
-        let mut mgr = GeoIpManager::new(None).unwrap();
+        let mut mgr = GeoIpManager::default();
         let count = mgr.load_from_v2ray_file(&path).unwrap();
         assert_eq!(count, 2, "JSON 应加载 v4 + v6");
         assert_eq!(mgr.ip_range_count(), 2, "JSON IPv4 和 IPv6 段都应保留");
@@ -908,7 +983,7 @@ mod tests {
         std::fs::write(&good, build_dat("CN", Some(([10, 0, 0, 0], 8)), None)).unwrap();
         std::fs::write(&bad, b"not a protobuf at all").unwrap();
 
-        let mut manager = GeoIpManager::new(None).unwrap();
+        let mut manager = GeoIpManager::default();
         manager.load_from_dat_file(&good).unwrap();
         assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "cn"));
 
@@ -1056,7 +1131,7 @@ mod tests {
         let path = dir.path().join("geoip_test_nested.dat");
         std::fs::write(&path, &dat).unwrap();
 
-        let mut mgr = GeoIpManager::new(None).unwrap();
+        let mut mgr = GeoIpManager::default();
         mgr.load_from_dat_file(&path).unwrap();
 
         for (ip, us) in [
@@ -1094,7 +1169,7 @@ mod tests {
         let path = dir.path().join("geoip_test_same_tag_nested.json");
         std::fs::write(&path, json).unwrap();
 
-        let mut mgr = GeoIpManager::new(None).unwrap();
+        let mut mgr = GeoIpManager::default();
         assert_eq!(mgr.load_from_v2ray_file(&path).unwrap(), 6);
 
         let cn4: IpAddr = "10.1.1.1".parse().unwrap();
@@ -1128,7 +1203,7 @@ mod tests {
         let path = dir.path().join("geoip_test_overlapping_tags.dat");
         std::fs::write(&path, &dat).unwrap();
 
-        let mut mgr = GeoIpManager::new(None).unwrap();
+        let mut mgr = GeoIpManager::default();
         assert_eq!(mgr.load_from_dat_file(&path).unwrap(), 2);
 
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
@@ -1151,7 +1226,7 @@ mod tests {
         let path = dir.path().join("geoip_test_named_tag_only.dat");
         std::fs::write(&path, &dat).unwrap();
 
-        let mut mgr = GeoIpManager::new(None).unwrap();
+        let mut mgr = GeoIpManager::default();
         mgr.load_from_dat_file(&path).unwrap();
 
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
@@ -1176,7 +1251,8 @@ mod tests {
         std::fs::write(&dat_path, dat).unwrap();
         GeoIpManager::convert_dat_to_mmdb(&mmdb_source_path, &mmdb_path, None).unwrap();
 
-        let mut mgr = GeoIpManager::new(Some(mmdb_path.to_string_lossy().into_owned())).unwrap();
+        let mut mgr = GeoIpManager::default();
+        assert!(mgr.use_mmdb(&mmdb_path.to_string_lossy(), &GeoIpManager::default()));
         mgr.load_from_dat_file(&dat_path).unwrap();
 
         let ip: IpAddr = "2001:db8::1".parse().unwrap();
@@ -1212,7 +1288,7 @@ mod tests {
         dat.extend(build_dat("private", Some(([192, 168, 0, 0], 16)), None));
         std::fs::write(&path, &dat).unwrap();
 
-        let mut manager = GeoIpManager::new(None).unwrap();
+        let mut manager = GeoIpManager::default();
         let parsed = GeoIpManager::parse_file(&path, &tags(&["cn", "PRIVATE", "XX"])).unwrap();
         assert_eq!(manager.apply_parsed(parsed), 2);
         assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "CN"));
@@ -1238,7 +1314,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager = GeoIpManager::new(None).unwrap();
+        let mut manager = GeoIpManager::default();
         manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["jp"])).unwrap());
         assert!(manager.matches_tag("198.51.100.7".parse().unwrap(), "JP"));
         assert!(!manager.matches_tag("203.0.113.7".parse().unwrap(), "US"));
@@ -1267,7 +1343,7 @@ mod tests {
         let path = dir.path().join("geoip.dat");
         std::fs::write(&path, &dat).unwrap();
 
-        let mut manager = GeoIpManager::new(None).unwrap();
+        let mut manager = GeoIpManager::default();
         manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["CN"])).unwrap());
         assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "CN"));
     }
@@ -1288,7 +1364,7 @@ mod tests {
 
         let only_us = GeoIpManager::parse_file(&path, &tags(&["US"])).unwrap();
         assert_eq!(only_us.count, 0, "the entry is CN, not US");
-        let mut manager = GeoIpManager::new(None).unwrap();
+        let mut manager = GeoIpManager::default();
         manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["CN"])).unwrap());
         assert!(manager.matches_tag("10.1.2.3".parse().unwrap(), "CN"));
     }
@@ -1326,7 +1402,11 @@ mod tests {
         std::fs::write(&source_path, source).unwrap();
         GeoIpManager::convert_dat_to_mmdb(&source_path, &mmdb_path, None).unwrap();
 
-        let mmdb = Mmdb::open(mmdb_path.to_str().unwrap()).unwrap();
+        let mmdb = Mmdb::open(
+            mmdb_path.to_str().unwrap(),
+            FileStamp::of(&mmdb_path).unwrap(),
+        )
+        .unwrap();
         for (ip, want) in [
             ("10.1.2.3", Some("CN")),
             ("20.1.2.3", Some("US")),

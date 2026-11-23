@@ -202,9 +202,7 @@ impl Engine {
         // Rule cache: 10k entries, each expiring at its own expires_at (see `RULE_CACHE_MAX_AGE`)
         let rule_cache = Arc::new(CacheStore::new(10_000, RULE_CACHE_MAX_AGE));
 
-        let geoip_manager = Arc::new(RwLock::new(
-            GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed"),
-        ));
+        let geoip_manager = Arc::new(RwLock::new(GeoIpManager::default()));
         let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::new()));
         let state = Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg)));
         let geo_sources = GeoSources::load(

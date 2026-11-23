@@ -2869,7 +2869,7 @@ mod tests {
         let path = dir.path().join("geoip_runtime_matchers.json");
         std::fs::write(&path, json).unwrap();
 
-        let mut manager = geoip::GeoIpManager::new(None).unwrap();
+        let mut manager = geoip::GeoIpManager::default();
         manager.load_from_v2ray_file(&path).unwrap();
         let manager = Arc::new(crate::lock::RwLock::new(manager));
         let ip: IpAddr = "104.16.0.1".parse().unwrap();
