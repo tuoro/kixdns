@@ -1483,8 +1483,6 @@ impl Engine {
         }
 
         let cfg = &request.state.pipeline;
-        let min_ttl = cfg.min_ttl();
-        let upstream_timeout = cfg.upstream_timeout();
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
         // 求值 `pipeline` 的规则，跳过 `skip` 里的（continue 越过的那些）
         // Evaluate the rules of `pipeline`, skipping those in `skip` (the ones a continue passed)
@@ -1607,43 +1605,18 @@ impl Engine {
                         crate::matcher::ResponsePhase::parts(response_phase.as_deref());
                     let forwarded = phases::handle_forward_decision_logged(
                         self,
-                        phases::ForwardDecisionContext {
-                            state: request.state,
-                            packet: route.jumped.as_ref().map_or(packet, |(packet, _)| packet),
-                            query: packet,
-                            qname: request.qname,
-                            qtype: request.qtype,
-                            qclass: request.qclass,
-                            tx_id: request.tx_id,
-                            pipeline_id: &route.pipeline,
-                            key_pipeline_id: &route.key_pipeline,
-                            rule_name: &rule_name,
-                            keys: route.keys,
-                            min_ttl,
-                            upstream_timeout,
-                            start: request.start,
-                            peer: &request.peer,
-                            requester: request.requester,
-                            refresh: request.refresh,
-                            trail: &mut route.trail,
-                            echo_floor: route.echo_floor,
+                        request,
+                        route,
+                        phases::ForwardDecision {
                             upstream: &upstream,
                             pre_split_upstreams: pre_split_upstreams.as_ref(),
+                            rule_name: &rule_name,
                             response_matchers,
                             response_actions_on_match,
                             response_actions_on_miss,
                             transport,
                             ecs: ecs.as_ref(),
-                            carried: route.jumped.as_ref().map(|(_, carried)| *carried),
-                            jumps_left: if route.jumped.is_some() {
-                                route.jumps_left
-                            } else {
-                                response_jump_limit
-                            },
                             allow_reuse,
-                            reused_response: &mut route.reused_response,
-                            held_inflight: &mut route.held_inflight,
-                            observed: request.observed,
                         },
                         info,
                     )
@@ -1830,19 +1803,25 @@ struct RequestHead {
 /// 一个请求在整个处理过程中不变的部分：它的包、问题、谁在问、用的配置快照，和后台刷新时要更新的条目
 /// What stays the same for a request all the way through: its packet, its question, who is
 /// asking, the configuration snapshot it uses, and for a background refresh the entry it renews
-struct Request<'a> {
-    state: &'a Arc<EngineInner>,
-    packet: &'a [u8],
-    qname: &'a Arc<str>,
-    qtype: hickory_proto::rr::RecordType,
-    qclass: DNSClass,
-    tx_id: u16,
-    flags: crate::proto_utils::QueryFlags,
-    peer: SocketAddr,
-    requester: Requester,
-    start: Instant,
-    refresh: Option<&'a RefreshTarget>,
-    observed: super::observation::Observed<'a>,
+pub(crate) struct Request<'a> {
+    pub(crate) state: &'a Arc<EngineInner>,
+    /// 客户端发来的查询，没经过哪次转发改写 / The query as the client sent it, rewritten by no
+    /// forward
+    pub(crate) packet: &'a [u8],
+    pub(crate) qname: &'a Arc<str>,
+    pub(crate) qtype: hickory_proto::rr::RecordType,
+    pub(crate) qclass: DNSClass,
+    pub(crate) tx_id: u16,
+    pub(crate) flags: crate::proto_utils::QueryFlags,
+    pub(crate) peer: SocketAddr,
+    /// Who is asking (address, EDNS, the client's own ECS) / 谁在问（地址、EDNS、客户端自己的 ECS）
+    pub(crate) requester: Requester,
+    pub(crate) start: Instant,
+    /// For a background refresh, the entry it renews; the request is one exactly when it is
+    /// given / 后台刷新时它要更新的条目，有它就是后台刷新
+    pub(crate) refresh: Option<&'a RefreshTarget>,
+    /// Observer context of the request / 所属请求的观察者上下文
+    pub(crate) observed: super::observation::Observed<'a>,
 }
 
 impl Request<'_> {
@@ -1863,7 +1842,11 @@ impl Request<'_> {
 
     /// 在 `pipeline` 的槽位 `slot` 里查这个请求的应答 / Looking up this request's answer in slot
     /// `slot` of `pipeline`
-    fn lookup<'s>(&'s self, pipeline: &'s str, slot: u64) -> phases::CacheLookupContext<'s> {
+    pub(crate) fn lookup<'s>(
+        &'s self,
+        pipeline: &'s str,
+        slot: u64,
+    ) -> phases::CacheLookupContext<'s> {
         phases::CacheLookupContext {
             state: self.state,
             qname: self.qname,
@@ -1878,6 +1861,13 @@ impl Request<'_> {
             requester: self.requester,
             observed: self.observed,
         }
+    }
+
+    /// 这个请求发给上游的查询替谁问（见 `upstream::forward_upstream`）：替客户端；后台刷新不替谁问，是 None
+    /// Whom this request's upstream queries are asked for (see `upstream::forward_upstream`):
+    /// the client; nobody, None, for a background refresh
+    pub(crate) fn asker(&self) -> Option<std::net::IpAddr> {
+        self.refresh.is_none().then(|| self.peer.ip())
     }
 
     /// 回这个请求的 SERVFAIL；`context` 是请求读不出来时的错误说明
@@ -1941,23 +1931,24 @@ fn renewing(answer: Bytes) -> anyhow::Result<Bytes> {
 /// 请求沿着规则走的路线：现在在哪个 pipeline、应答缓存在哪个键下、还能跳几次、规则越过了什么，以及它在路上记下的
 /// What a request's way along the rules has come to: which pipeline it is in, which key its answers
 /// are cached under, how many jumps are left, what rules continued past, and what it noted on the way
-struct Route {
+pub(crate) struct Route {
     /// 现在所在的 pipeline / The pipeline it is in now
-    pipeline: Arc<str>,
+    pub(crate) pipeline: Arc<str>,
     /// 应答缓存在哪个 pipeline 的键下：请求阶段的跳转换成目标的；响应阶段跳转以后不再换，跳过去拿到的应答照旧缓存在
     /// 跳转前那个 pipeline 的键下（见 `phases::ForwardResult::Jump`）
     /// The pipeline whose key answers are cached under: a request-phase jump changes it to the
     /// target's; after a response-phase jump it changes no more, the answers got over there
     /// cached under the key of the pipeline jumped from (see `phases::ForwardResult::Jump`)
-    key_pipeline: Arc<str>,
-    keys: CacheKeys,
+    pub(crate) key_pipeline: Arc<str>,
+    pub(crate) keys: CacheKeys,
     /// continue 越过的规则，下一轮求值跳过它们 / The rules a continue passed, which the next evaluation skips
     skip_rules: crate::engine::pipeline::Continued,
     /// 规则越过、留着给后面的 `allow` 复用的应答 / The answer a rule continued past, kept for a later `allow`
-    reused_response: Option<ResponseContext>,
-    /// 响应阶段跳转以后：转发照原样发出的包，和它带的 ECS / After a response-phase jump: the
-    /// packet the forwards send as it is, and the ECS it carries
-    jumped: Option<(Bytes, crate::ecs_scope::ForwardEcs)>,
+    pub(crate) reused_response: Option<ResponseContext>,
+    /// 响应阶段跳转以后：转发照原样发出的包，不再按 `ecs` 改写，和它带的 ECS / After a response-phase
+    /// jump: the packet the forwards send as it is rather than rewritten by `ecs`, and the ECS it
+    /// carries
+    pub(crate) jumped: Option<(Bytes, crate::ecs_scope::ForwardEcs)>,
     /// 还能跳几次，在要跳的地方数：请求阶段的跳转一份，响应动作的跳转连同它之后的规则级跳转另一份（见
     /// `Route::response_jumped`）
     /// How many more jumps may be made, counted where a jump is made: the request phase's jumps
@@ -1977,18 +1968,28 @@ struct Route {
     /// another pipeline, changing the keys, goes by it no more: what is given outright there is
     /// given outright to the requests entering there directly too. Both are 0
     answer_ttl: u32,
-    /// 在当前 pipeline 里经过的转发（见 `ForwardDecisionContext::trail`）；请求结束后就是它最后一份应答缓存时带的那份
-    /// The forwards passed in the current pipeline (see `ForwardDecisionContext::trail`); after
-    /// the request, what its last answer was cached with
-    trail: EcsReach,
+    /// The forwards the request passed in the current pipeline, each with the ECS it sent
+    /// and whom its reply applies to; every answer the request caches applies to the
+    /// requesters all of them admit (see `CacheEntry::reach`). A forward adds its own here.
+    /// After the request, what its last answer was cached with
+    /// 请求在当前 pipeline 里经过的转发，每次都记着它发出的 ECS 和应答适用于谁；请求缓存的每份应答适用于它们全都接受的
+    /// 请求方（见 `CacheEntry::reach`）。转发把自己的这一次记在这里。请求结束后就是它最后一份应答缓存时带的那份
+    pub(crate) trail: EcsReach,
     /// 经由请求跳离的 pipeline（它们的 trail 已经清掉）应答依赖客户端 ECS 的多少位（见 `phases::client_reply`）
     /// How many bits of the client's ECS the answer depends on through the pipelines the request
     /// left by a jump, whose trails are gone (see `phases::client_reply`)
-    echo_floor: u8,
-    /// 规则 continue 后本请求仍持有的 inflight 条目（见 `ForwardDecisionContext::held_inflight`）
-    /// The inflight entry the request still holds after a rule continued (see
-    /// `ForwardDecisionContext::held_inflight`)
-    held_inflight: Option<InflightCleanupGuard>,
+    pub(crate) echo_floor: u8,
+    /// The inflight entry this request registered and still holds after a rule
+    /// continued. The request keeps it for the rest of the decision loop, so its
+    /// waiters get the final answer rather than one a rule continued past; a
+    /// request holding an entry never waits on one. The entry's key keeps its
+    /// waiters to requesters that the rules run after the continue treat alike
+    /// (see `RuntimePipeline::requester`).
+    /// 规则 continue 后本请求仍持有的 inflight 条目。它在决策循环余下的部分一直由
+    /// 本请求持有，等待者拿到的是最终应答，而不是规则越过的那一个；持有条目的请求
+    /// 从不等条目。条目的键只让 continue 之后运行的规则一样对待的请求方等在上面（见
+    /// `RuntimePipeline::requester`）。
+    pub(crate) held_inflight: Option<InflightCleanupGuard>,
 }
 
 impl Route {
@@ -2077,6 +2078,17 @@ impl Route {
         self.answer_ttl = answer_ttl;
         self.reused_response = reused;
         self.skip_rules.extend(rule);
+    }
+
+    /// 响应动作还能跳几次：头一次响应阶段的跳转之前是整份 `limit`，之后是那一份剩下的（见 [`Self::response_jumped`]）
+    /// How many more jumps the response actions may make: the whole `limit` before the first
+    /// response-phase jump, what is left of that budget after it (see [`Self::response_jumped`])
+    pub(crate) fn response_jumps_left(&self, limit: usize) -> usize {
+        if self.jumped.is_some() {
+            self.jumps_left
+        } else {
+            limit
+        }
     }
 
     /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（`answer_ttl` 也一样；刷新时上游失败的到不了
@@ -4673,31 +4685,40 @@ mod tests {
         }
     }
 
-    /// 在 `engine` 上为 `req`（来自 10.0.0.1 的 example.com A 查询）执行 `actions` 的上下文，
-    /// 手上的应答是 `ctx_opt`
-    /// The context for running `actions` on `engine` for `req` (an example.com A query from
-    /// 10.0.0.1), with `ctx_opt` the answer in hand
+    /// 来自 10.0.0.1、问 `qname` 的 `qtype` 的请求，包是 `packet` / A request from 10.0.0.1 asking
+    /// `qname` for `qtype`, its packet being `packet`
+    fn asked(
+        engine: &Engine,
+        qname: &str,
+        qtype: RecordType,
+        packet: &[u8],
+    ) -> crate::engine::test_support::Asked {
+        crate::engine::test_support::Asked::new(
+            engine,
+            qname,
+            qtype,
+            packet.to_vec(),
+            "10.0.0.1:53000".parse().unwrap(),
+        )
+    }
+
+    /// 在 `engine` 上为 `request`（解析出来是 `req`）执行 `actions` 的上下文，手上的应答是 `ctx_opt`
+    /// The context for running `actions` on `engine` for `request` (`req` once parsed), with
+    /// `ctx_opt` the answer in hand
     fn response_actions_context<'a>(
         engine: &'a Engine,
+        request: &'a Request<'a>,
         actions: &'a [Action],
         ctx_opt: Option<ResponseContext>,
         req: &'a Message,
-        packet: &'a [u8],
     ) -> ApplyResponseActionsContext<'a> {
         ApplyResponseActionsContext {
             engine,
+            request,
             actions,
             ctx_opt,
             req,
-            packet,
-            query: packet,
-            client_ecs: None,
-            upstream_timeout: Duration::from_secs(1),
-            qname: "example.com",
-            qtype: RecordType::A,
-            client_ip: "10.0.0.1".parse().unwrap(),
-            asker: Some("10.0.0.1".parse().unwrap()),
-            upstream_default: TEST_UPSTREAM,
+            packet: request.packet,
             pipeline_id: "pipeline",
             rule_name: "rule",
             remaining_jumps: 10,
@@ -4715,7 +4736,9 @@ mod tests {
         let packet = [0u8];
 
         // Act: Apply response actions with Allow action
-        let ctx = response_actions_context(&engine, &actions, Some(ctx), &req, &packet);
+        let asked = asked(&engine, "example.com", RecordType::A, &packet);
+        let request = asked.request();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed");
@@ -4751,12 +4774,14 @@ mod tests {
             },
         ];
         let packet = [0u8];
+        let asked = asked(&engine, "example.com", RecordType::A, &packet);
+        let request = asked.request();
         let ctx = response_actions_context(
             &engine,
+            &request,
             &actions,
             Some(build_response_context()),
             &req,
-            &packet,
         );
         match apply_response_actions(ctx).await.expect("response actions") {
             ResponseActionResult::Upstream { ctx, .. } => {
@@ -4776,7 +4801,9 @@ mod tests {
         let packet = [0u8];
 
         // Act: Apply response actions with Continue action
-        let ctx = response_actions_context(&engine, &actions, Some(ctx), &req, &packet);
+        let asked = asked(&engine, "example.com", RecordType::A, &packet);
+        let request = asked.request();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions continue should succeed");
@@ -4803,7 +4830,9 @@ mod tests {
         let packet = [0u8];
 
         // Act: Apply response actions with Allow action and non-matching matcher
-        let ctx = response_actions_context(&engine, &actions, Some(ctx), &req, &packet);
+        let asked = asked(&engine, "example.com", RecordType::A, &packet);
+        let request = asked.request();
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed even on miss");
@@ -4831,7 +4860,9 @@ mod tests {
         let packet = [0u8];
 
         // Act: Apply response actions with Deny action
-        let ctx = response_actions_context(&engine, &actions, None, &req, &packet);
+        let asked = asked(&engine, "example.com", RecordType::A, &packet);
+        let request = asked.request();
+        let ctx = response_actions_context(&engine, &request, &actions, None, &req);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions deny should return static");
@@ -4859,12 +4890,13 @@ mod tests {
         }];
         let packet = [0u8];
 
-        let run = |qtype: RecordType| {
-            let ctx = ApplyResponseActionsContext {
-                qtype,
-                ..response_actions_context(&engine, &actions, None, &req, &packet)
-            };
-            apply_response_actions(ctx)
+        let run = async |qtype: RecordType| {
+            let asked = asked(&engine, "example.com", qtype, &packet);
+            let request = asked.request();
+            apply_response_actions(response_actions_context(
+                &engine, &request, &actions, None, &req,
+            ))
+            .await
         };
         let answer_ips = |resp: &Message| -> Vec<IpAddr> {
             resp.answers
@@ -4930,10 +4962,9 @@ mod tests {
             ttl: Some(60),
         }];
         let packet = req.to_vec().unwrap();
-        let ctx = ApplyResponseActionsContext {
-            qname: "alias.example",
-            ..response_actions_context(&engine, &actions, None, &req, &packet)
-        };
+        let asked = asked(&engine, "alias.example", RecordType::A, &packet);
+        let request = asked.request();
+        let ctx = response_actions_context(&engine, &request, &actions, None, &req);
 
         match apply_response_actions(ctx).await.expect("static cname") {
             ResponseActionResult::Static { bytes, rcode, .. } => {
