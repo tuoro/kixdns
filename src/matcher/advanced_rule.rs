@@ -34,13 +34,14 @@ pub struct CompiledRule {
     /// Rule name from the configuration, reported to observers on fast-path matches.
     /// 配置中的规则名，快速路径命中时上报给观察者。
     pub rule_name: Arc<str>,
-    /// 规则的匹配器，和完整规则路径用的是同一份、同一个判断（`matcher_matches`，GeoIP、GeoSite 数据也一样读），两条
-    /// 路径对规则是否命中从不分歧。以前快速路径另有一份 `CompiledMatcher`，把每种匹配器重写了一遍
-    /// The rule's matchers, the same ones the full rule path uses, judged the same way
+    /// 规则的匹配器，和完整规则路径共用同一份、同一个判断（`matcher_matches`，GeoIP、GeoSite 数据也一样读），两条
+    /// 路径对规则是否命中从不分歧。以前快速路径另有一份 `CompiledMatcher`，把每种匹配器重写了一遍，后来又复制一份
+    /// 完整规则的
+    /// The rule's matchers, shared with the full rule path and judged the same way
     /// (`matcher_matches`, reading the GeoIP and GeoSite data alike), so the two paths never
     /// disagree on whether a rule matches. The fast path used to keep a `CompiledMatcher` of its
-    /// own, every kind of matcher written out again
-    pub matchers: Vec<RuntimeMatcherWithOp>,
+    /// own, every kind of matcher written out again, and then a copy of the full rule's
+    pub matchers: Arc<[RuntimeMatcherWithOp]>,
     pub precomputed: Option<PrecomputedAction>,
 }
 
@@ -233,7 +234,7 @@ fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
 fn compile_rule(rule: &RuntimeRule) -> CompiledRule {
     CompiledRule {
         rule_name: rule.name.clone(),
-        matchers: rule.matchers.clone(),
+        matchers: Arc::clone(&rule.matchers),
         precomputed: precompute_action(rule),
     }
 }

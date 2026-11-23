@@ -44,41 +44,35 @@ pub struct PipelineConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
-    #[serde(default = "default_min_ttl")]
     pub min_ttl: u32,
     /// UDP监听地址，缺省0.0.0.0:5353，避免1024以下端口权限问题。 / UDP listen address, defaults to 0.0.0.0:5353, avoiding port permission issues below 1024
-    #[serde(default = "default_bind_udp")]
     pub bind_udp: String,
     /// TCP监听地址，缺省0.0.0.0:5353。 / TCP listen address, defaults to 0.0.0.0:5353
-    #[serde(default = "default_bind_tcp")]
     pub bind_tcp: String,
     /// DoH 监听地址（留空则不启用）。 / DoH listen address (empty/null = disabled)
-    #[serde(default)]
     pub bind_doh: Option<String>,
     /// DoH TLS 证书路径（PEM）。 / TLS certificate path for DoH (PEM)
-    #[serde(default)]
     pub doh_tls_cert: Option<String>,
     /// DoH TLS 私钥路径（PEM）。 / TLS private key path for DoH (PEM)
-    #[serde(default)]
     pub doh_tls_key: Option<String>,
     /// DoH 查询路径，默认 /dns-query。可自定义为任意路径以避免探测。
     /// / DoH query path, defaults to /dns-query. Can be customized to any path to avoid detection.
-    #[serde(default = "default_doh_path")]
     pub doh_path: String,
     /// 响应缓存最多存放的应答份数（默认 10000），超过 1 KB 的应答每 1 KB 算一份
     /// / Most answers the response cache holds (default 10000), one over 1 KB counting once per KB
-    #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
-    /// 响应缓存里的应答最多存多久（秒，默认 86400） / Longest the response cache keeps an answer (seconds, default 86400)
-    #[serde(default = "default_cache_max_ttl")]
+    /// 应答 TTL 的上限（秒，默认 86400）：上游回答里每条记录的 TTL、缓存把一份应答当作新鲜的时间都不超过它；过了 TTL
+    /// 还能当过期应答用的另外再留（见 `serve_stale_expire_ttl`）
+    /// The cap on an answer's TTL (seconds, default 86400): neither the TTL of any record in an
+    /// upstream answer nor how long the cache holds an answer fresh goes past it; one still of
+    /// use past its TTL is kept on beyond that (see `serve_stale_expire_ttl`)
     pub cache_max_ttl: u64,
     /// DashMap shard 数量（0=自动，默认 0）。更多 shards=更少锁竞争但更多内存开销 / DashMap shard count (0=auto, default 0). More shards=less lock contention but more memory overhead
-    #[serde(default = "default_dashmap_shards")]
     pub dashmap_shards: usize,
     /// 默认上游DNS。 / Default upstream DNS
-    #[serde(default = "default_upstream")]
     pub default_upstream: String,
     /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
     #[serde(skip)]
@@ -92,76 +86,57 @@ pub struct GlobalSettings {
     /// DoQ), comma-separated `IP:port`, asked at once with the first answer taken; empty (the
     /// default) leaves it to the system resolver, which loops back should it be KixDNS itself
     /// (see `engine::bootstrap`)
-    #[serde(default)]
     pub bootstrap: String,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
     /// 单次上游请求的超时时间
-    #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
     /// 整体请求超时（毫秒）。 / Overall request timeout (milliseconds)
     /// 包含 hedge + TCP fallback 的总超时时间。如果未设置，自动计算为 upstream_timeout_ms * 2.5
     /// Total timeout including hedge + TCP fallback. If not set, auto-calculated as upstream_timeout_ms * 2.5
-    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
     /// 响应阶段 Pipeline 跳转上限。 / Response phase pipeline jump limit
-    #[serde(default = "default_response_jump_limit")]
     pub response_jump_limit: u32,
     /// UDP 上游连接池大小。 / UDP upstream connection pool size
-    #[serde(default = "default_udp_pool_size")]
     pub udp_pool_size: usize,
     /// TCP 上游连接池大小。 / TCP upstream connection pool size
-    #[serde(default = "default_tcp_pool_size")]
     pub tcp_pool_size: usize,
     /// DoH 上游连接池大小（每个 upstream 的最大空闲连接数）。 / DoH upstream pool size (max idle per host)
-    #[serde(default = "default_doh_pool_size")]
     pub doh_pool_size: usize,
     /// DoH 健康检查错误阈值（连续传输错误多少次后重建连接池以驱逐死连接）。 / DoH health check error threshold (rebuild pool after N consecutive transport errors to evict dead connections)
     /// 默认 3 次，0 表示禁用健康检查 / Default 3, 0 means disable health check
-    #[serde(default = "default_doh_health_check_error_threshold")]
     pub doh_health_check_error_threshold: usize,
     /// DoT 上游连接池大小。 / DoT upstream connection pool size
-    #[serde(default = "default_dot_pool_size")]
     pub dot_pool_size: usize,
     /// DoQ 上游连接池大小。 / DoQ upstream connection pool size
-    #[serde(default = "default_doq_pool_size")]
     pub doq_pool_size: usize,
     /// TCP 连接最大存活时间（秒，超过强制重置） / TCP connection max age (seconds, force reset after this time)
     /// 0 表示禁用连接老化检查 / 0 means disable connection aging check
-    #[serde(default = "default_tcp_connection_max_age_seconds")]
     pub tcp_connection_max_age_seconds: u64,
     /// TCP 连接空闲超时（秒，无请求超过此时间重置） / TCP connection idle timeout (seconds, reset if no requests for this time)
     /// 0 表示禁用空闲超时检查 / 0 means disable idle timeout check
-    #[serde(default = "default_tcp_connection_idle_timeout_seconds")]
     pub tcp_connection_idle_timeout_seconds: u64,
     /// DoQ 连接空闲超时（秒）。 / DoQ connection idle timeout (seconds)
-    #[serde(default = "default_doq_idle_timeout_seconds")]
     pub doq_connection_idle_timeout_seconds: u64,
     /// DoQ keepalive 间隔（毫秒）。0 表示禁用。 / DoQ keepalive interval (ms). 0 disables.
-    #[serde(default = "default_doq_keepalive_interval_ms")]
     pub doq_keepalive_interval_ms: u64,
     /// 是否启用 DoQ 0-RTT（默认 true）。 / Enable DoQ 0-RTT (default true)
-    #[serde(default = "default_doq_enable_0rtt")]
     pub doq_enable_0rtt: bool,
     /// 智能流控（默认关）：不用填数字，内核运行时自己判断，见 `engine::concurrency`。以前的
     /// `flow_control_initial_permits` 等五个数字已经删掉，旧配置里留着也照常加载，不起作用
     /// Smart flow control (off by default): no numbers to fill in, the kernel judges at run time,
     /// see `engine::concurrency`. The five numbers such as `flow_control_initial_permits` it used
     /// to have are gone; an old configuration still holding them loads as before, to no effect
-    #[serde(default = "default_flow_control_enabled")]
     pub flow_control_enabled: bool,
     /// RFC 8767: 上游不可用时返回过期缓存（默认 false）/ RFC 8767: Serve stale cached data when upstream is unavailable (default false)
-    #[serde(default = "default_serve_stale")]
     pub serve_stale: bool,
     /// RFC 8767: 过期缓存响应的 TTL（秒，默认 30）/ RFC 8767: TTL for stale responses (seconds, default 30)
     /// 对应 Unbound serve-expired-reply-ttl / Corresponds to Unbound serve-expired-reply-ttl
-    #[serde(default = "default_serve_stale_ttl")]
     pub serve_stale_ttl: u32,
     /// RFC 8767: 过期缓存可被服务的最大时间窗口（秒，默认 86400）
     /// 当缓存过期超过此时间后不再返回 stale 数据。0 表示无限制。
     /// RFC 8767: Maximum time window for serving stale cache (seconds, default 86400)
     /// Don't serve stale data after the entry has been expired for longer than this. 0 means no limit.
     /// 对应 Unbound serve-expired-ttl / Corresponds to Unbound serve-expired-ttl
-    #[serde(default = "default_serve_stale_expire_ttl")]
     pub serve_stale_expire_ttl: u64,
     /// RFC 8767：过期应答的后台刷新失败以后，从这次失败起重新算它还能续用多久（默认 false）。上游一直取不到新的、又一直
     /// 有人问的名字，就一直交出过期应答，不受 serve_stale_expire_ttl 限制。对应 Unbound 的 serve-expired-ttl-reset，
@@ -170,96 +145,89 @@ pub struct GlobalSettings {
     /// served counts afresh from that failure (default false). A name the upstream keeps giving
     /// nothing new for, and that keeps being asked, then goes out stale beyond
     /// serve_stale_expire_ttl. Corresponds to Unbound's serve-expired-ttl-reset, off there too
-    #[serde(default = "default_serve_stale_ttl_reset")]
     pub serve_stale_ttl_reset: bool,
     /// RFC 8767: 返回过期缓存前尝试上游查询的超时（毫秒，默认 0）
     /// 0 = 立即返回过期缓存（乐观模式）。 > 0 = 先尝试上游查询，超时后返回过期缓存。
     /// RFC 8767: Client timeout before serving stale (ms, default 0)
     /// 0 = serve stale immediately (optimistic mode). > 0 = try upstream first, serve stale on timeout.
     /// 对应 Unbound serve-expired-client-timeout / Corresponds to Unbound serve-expired-client-timeout
-    #[serde(default = "default_serve_stale_client_timeout_ms")]
     pub serve_stale_client_timeout_ms: u64,
     /// 缓存后台刷新是否启用（默认false） / Enable cache background refresh (default false)
-    #[serde(default = "default_cache_background_refresh")]
     pub cache_background_refresh: bool,
     /// 缓存后台刷新阈值（百分比，默认10）。当剩余TTL低于此百分比时触发后台刷新 / Cache background refresh threshold (percentage, default 10). Trigger background refresh when remaining TTL below this percentage
-    #[serde(default = "default_cache_refresh_threshold_percent")]
     pub cache_refresh_threshold_percent: u8,
     /// 缓存后台刷新最小TTL（秒，默认5）。防止TTL过短导致无限循环刷新 / Cache background refresh minimum TTL (seconds, default 5). Prevent infinite refresh loop for very short TTLs
-    #[serde(default = "default_cache_refresh_min_ttl")]
     pub cache_refresh_min_ttl: u32,
     /// GeoIP 数据库文件路径（MMDB 格式） / GeoIP database file path (MMDB format)
-    #[serde(default)]
     pub geoip_db_path: Option<String>,
     /// GeoIP 数据文件路径（V2Ray .dat 格式） / GeoIP data file path (V2Ray .dat format)
-    #[serde(default)]
     pub geoip_dat_path: Option<String>,
     /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
-    #[serde(default)]
     pub geosite_data_paths: Vec<String>,
     /// UDP 失败时是否自动 fallback 到 TCP（默认 true）。 / UDP failure automatically fallbacks to TCP (default true)
-    #[serde(default = "default_enable_tcp_fallback")]
     pub enable_tcp_fallback: bool,
 }
 
+/// 全局设置的默认值只写在这里：配置里没写的设置照这里取（见 `GlobalSettings` 上的 `#[serde(default)]`）。以前每个字段
+/// 另有一个默认值函数，同一个数写两遍，还得靠测试守着两边一致
+/// The global settings' defaults are written here alone: a setting a configuration leaves out
+/// takes its value from here (see `#[serde(default)]` on `GlobalSettings`). Every field used to
+/// have a default function of its own besides, the same number written twice, with a test to
+/// keep the two in step
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
-            min_ttl: default_min_ttl(),
-            bind_udp: default_bind_udp(),
-            bind_tcp: default_bind_tcp(),
+            min_ttl: 0,
+            bind_udp: "0.0.0.0:5353".to_string(),
+            bind_tcp: "0.0.0.0:5353".to_string(),
             bind_doh: None,
             doh_tls_cert: None,
             doh_tls_key: None,
-            doh_path: default_doh_path(),
-            default_upstream: default_upstream(),
+            // RFC 8484 用的路径 / The path RFC 8484 uses
+            doh_path: "/dns-query".to_string(),
+            default_upstream: "1.1.1.1:53".to_string(),
             default_upstream_pre_split: None,
             default_upstream_shared: None,
             bootstrap: String::new(),
-            upstream_timeout_ms: default_upstream_timeout_ms(),
+            // Increased from 2000ms to 9000ms to align with idoq library best practices
+            // DoQ servers (especially Alibaba DNS) may require longer response times
+            // 从 2000ms 增加到 9000ms，以对齐 idoq 库的最佳实践
+            // DoQ 服务器（特别是阿里 DNS）可能需要更长的响应时间
+            upstream_timeout_ms: 9000,
             request_timeout_ms: None, // 默认自动计算 / Auto-calculated by default
-            response_jump_limit: default_response_jump_limit(),
-            udp_pool_size: default_udp_pool_size(),
-            tcp_pool_size: default_tcp_pool_size(),
-            doh_pool_size: default_doh_pool_size(),
-            doh_health_check_error_threshold: default_doh_health_check_error_threshold(),
-            dot_pool_size: default_dot_pool_size(),
-            doq_pool_size: default_doq_pool_size(),
-            tcp_connection_max_age_seconds: default_tcp_connection_max_age_seconds(),
-            tcp_connection_idle_timeout_seconds: default_tcp_connection_idle_timeout_seconds(),
-            doq_connection_idle_timeout_seconds: default_doq_idle_timeout_seconds(),
-            doq_keepalive_interval_ms: default_doq_keepalive_interval_ms(),
-            doq_enable_0rtt: default_doq_enable_0rtt(),
-            flow_control_enabled: default_flow_control_enabled(),
-            cache_capacity: default_cache_capacity(),
-            cache_max_ttl: default_cache_max_ttl(),
-            dashmap_shards: default_dashmap_shards(),
-            serve_stale: default_serve_stale(),
-            serve_stale_ttl: default_serve_stale_ttl(),
-            serve_stale_expire_ttl: default_serve_stale_expire_ttl(),
-            serve_stale_ttl_reset: default_serve_stale_ttl_reset(),
-            serve_stale_client_timeout_ms: default_serve_stale_client_timeout_ms(),
-            cache_background_refresh: default_cache_background_refresh(),
-            cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
-            cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
+            response_jump_limit: 10,
+            udp_pool_size: 64,
+            tcp_pool_size: 64,
+            doh_pool_size: 8,
+            // 连续 3 次传输错误后重建连接池 / Rebuild pool after 3 consecutive transport errors
+            doh_health_check_error_threshold: 3,
+            dot_pool_size: 64,
+            doq_pool_size: 16,
+            tcp_connection_max_age_seconds: 300, // 5 分钟 / 5 minutes
+            tcp_connection_idle_timeout_seconds: 60, // 1 分钟 / 1 minute
+            doq_connection_idle_timeout_seconds: 60, // 1 分钟 / 1 minute
+            doq_keepalive_interval_ms: 15_000,
+            // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
+            // Enabled by default - system automatically detects and falls back for unsupported servers
+            doq_enable_0rtt: true,
+            flow_control_enabled: false,
+            cache_capacity: 10_000,
+            cache_max_ttl: 86400,
+            dashmap_shards: 0, // 0 means use DashMap default (num_cpus * 4)
+            serve_stale: false,
+            serve_stale_ttl: 30,
+            serve_stale_expire_ttl: 86400,
+            serve_stale_ttl_reset: false,
+            serve_stale_client_timeout_ms: 0,
+            cache_background_refresh: false,
+            cache_refresh_threshold_percent: 10,
+            cache_refresh_min_ttl: 5,
             geoip_db_path: None,
             geoip_dat_path: None,
             geosite_data_paths: Vec::new(),
-            enable_tcp_fallback: default_enable_tcp_fallback(),
+            enable_tcp_fallback: true,
         }
     }
-}
-
-fn default_cache_capacity() -> u64 {
-    10_000
-}
-
-fn default_cache_max_ttl() -> u64 {
-    86400
-}
-
-fn default_dashmap_shards() -> usize {
-    0 // 0 means use DashMap default (num_cpus * 4)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1066,120 +1034,6 @@ pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
     Ok(cfg)
 }
 
-fn default_min_ttl() -> u32 {
-    0
-}
-
-fn default_bind_udp() -> String {
-    "0.0.0.0:5353".to_string()
-}
-
-fn default_bind_tcp() -> String {
-    "0.0.0.0:5353".to_string()
-}
-
-fn default_upstream() -> String {
-    "1.1.1.1:53".to_string()
-}
-
-fn default_upstream_timeout_ms() -> u64 {
-    // Increased from 2000ms to 9000ms to align with idoq library best practices
-    // DoQ servers (especially Alibaba DNS) may require longer response times
-    // 从 2000ms 增加到 9000ms，以对齐 idoq 库的最佳实践
-    // DoQ 服务器（特别是阿里 DNS）可能需要更长的响应时间
-    9000
-}
-
-fn default_response_jump_limit() -> u32 {
-    10
-}
-
-fn default_udp_pool_size() -> usize {
-    64
-}
-
-fn default_tcp_pool_size() -> usize {
-    64
-}
-
-fn default_doh_pool_size() -> usize {
-    8
-}
-
-fn default_doh_health_check_error_threshold() -> usize {
-    3 // 连续 3 次传输错误后重建连接池 / Rebuild pool after 3 consecutive transport errors
-}
-
-/// Default DoH query path (RFC 8484 standard) / 默认 DoH 查询路径（RFC 8484 标准）
-fn default_doh_path() -> String {
-    "/dns-query".to_string()
-}
-
-fn default_dot_pool_size() -> usize {
-    64
-}
-
-fn default_doq_pool_size() -> usize {
-    16
-}
-
-fn default_tcp_connection_max_age_seconds() -> u64 {
-    300 // 5 分钟 / 5 minutes
-}
-
-fn default_tcp_connection_idle_timeout_seconds() -> u64 {
-    60 // 1 分钟 / 1 minute
-}
-
-fn default_doq_idle_timeout_seconds() -> u64 {
-    60 // 1 分钟 / 1 minute
-}
-
-fn default_doq_keepalive_interval_ms() -> u64 {
-    15_000
-}
-
-fn default_doq_enable_0rtt() -> bool {
-    true // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
-    // Enabled by default - system automatically detects and falls back for unsupported servers
-}
-
-fn default_flow_control_enabled() -> bool {
-    false
-}
-
-fn default_serve_stale() -> bool {
-    false
-}
-
-fn default_serve_stale_ttl() -> u32 {
-    30
-}
-
-fn default_serve_stale_expire_ttl() -> u64 {
-    86400
-}
-
-fn default_serve_stale_ttl_reset() -> bool {
-    false
-}
-
-fn default_serve_stale_client_timeout_ms() -> u64 {
-    0
-}
-
-fn default_cache_background_refresh() -> bool {
-    false
-}
-
-fn default_cache_refresh_threshold_percent() -> u8 {
-    10
-}
-
-fn default_cache_refresh_min_ttl() -> u32 {
-    5
-}
-
 /// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式
 /// Deserialize upstream field, supports string, comma-separated string, or array format
 fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -1253,10 +1107,6 @@ where
         TxtTextInput::String(value) => Ok(vec![value]),
         TxtTextInput::Array(values) => Ok(values),
     }
-}
-
-fn default_enable_tcp_fallback() -> bool {
-    true
 }
 
 /// EDNS Client Subnet (RFC 7871) 操作模式，用于 Forward 动作的请求改写。
@@ -2739,12 +2589,11 @@ mod validation_tests {
         assert_eq!(split("1.1.1.1:53"), None);
     }
 
-    /// 基础设置的默认值逐个写在这里：配置里不写时读进来的、`GlobalSettings::default()` 给的，都要是
-    /// 这些值，两者的 Debug 输出也一样。面板的基础设置也照这些值显示「默认 …」
-    /// Every basic setting's default is written out here: what a configuration that leaves
-    /// it out reads as, and what `GlobalSettings::default()` gives, must be these values,
-    /// and the two print the same. The panel's basic settings show these values as their
-    /// defaults too
+    /// 配置里不写的设置读进来就是 `GlobalSettings::default()` 给的；每个默认值逐个钉在这里，文档和面板的基础设置都照
+    /// 这些值写「默认 …」
+    /// A setting a configuration leaves out reads as what `GlobalSettings::default()` gives;
+    /// every default is pinned here one by one, as the docs and the panel's basic settings give
+    /// these values as the defaults
     #[test]
     fn every_setting_has_the_default_written_here() {
         use super::GlobalSettings;
@@ -2754,78 +2603,77 @@ mod validation_tests {
             format!("{read:?}"),
             format!("{:?}", GlobalSettings::default())
         );
-        for settings in [read, GlobalSettings::default()] {
-            assert_eq!(settings.min_ttl, 0, "min_ttl");
-            assert_eq!(settings.bind_udp, "0.0.0.0:5353", "bind_udp");
-            assert_eq!(settings.bind_tcp, "0.0.0.0:5353", "bind_tcp");
-            assert_eq!(settings.bind_doh, None, "bind_doh");
-            assert_eq!(settings.doh_tls_cert, None, "doh_tls_cert");
-            assert_eq!(settings.doh_tls_key, None, "doh_tls_key");
-            assert_eq!(settings.doh_path, "/dns-query", "doh_path");
-            assert_eq!(settings.cache_capacity, 10_000, "cache_capacity");
-            assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
-            assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
-            assert_eq!(settings.default_upstream, "1.1.1.1:53", "default_upstream");
-            assert!(
-                settings.default_upstream_pre_split.is_none(),
-                "default_upstream_pre_split"
-            );
-            assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");
-            assert_eq!(settings.request_timeout_ms, None, "request_timeout_ms");
-            assert_eq!(settings.response_jump_limit, 10, "response_jump_limit");
-            assert_eq!(settings.udp_pool_size, 64, "udp_pool_size");
-            assert_eq!(settings.tcp_pool_size, 64, "tcp_pool_size");
-            assert_eq!(settings.doh_pool_size, 8, "doh_pool_size");
-            assert_eq!(
-                settings.doh_health_check_error_threshold, 3,
-                "doh_health_check_error_threshold"
-            );
-            assert_eq!(settings.dot_pool_size, 64, "dot_pool_size");
-            assert_eq!(settings.doq_pool_size, 16, "doq_pool_size");
-            assert_eq!(
-                settings.tcp_connection_max_age_seconds, 300,
-                "tcp_connection_max_age_seconds"
-            );
-            assert_eq!(
-                settings.tcp_connection_idle_timeout_seconds, 60,
-                "tcp_connection_idle_timeout_seconds"
-            );
-            assert_eq!(
-                settings.doq_connection_idle_timeout_seconds, 60,
-                "doq_connection_idle_timeout_seconds"
-            );
-            assert_eq!(
-                settings.doq_keepalive_interval_ms, 15_000,
-                "doq_keepalive_interval_ms"
-            );
-            assert!(settings.doq_enable_0rtt, "doq_enable_0rtt");
-            assert!(settings.bootstrap.is_empty(), "bootstrap");
-            assert!(!settings.flow_control_enabled, "flow_control_enabled");
-            assert!(!settings.serve_stale, "serve_stale");
-            assert_eq!(settings.serve_stale_ttl, 30, "serve_stale_ttl");
-            assert_eq!(
-                settings.serve_stale_expire_ttl, 86400,
-                "serve_stale_expire_ttl"
-            );
-            assert!(!settings.serve_stale_ttl_reset, "serve_stale_ttl_reset");
-            assert_eq!(
-                settings.serve_stale_client_timeout_ms, 0,
-                "serve_stale_client_timeout_ms"
-            );
-            assert!(
-                !settings.cache_background_refresh,
-                "cache_background_refresh"
-            );
-            assert_eq!(
-                settings.cache_refresh_threshold_percent, 10,
-                "cache_refresh_threshold_percent"
-            );
-            assert_eq!(settings.cache_refresh_min_ttl, 5, "cache_refresh_min_ttl");
-            assert_eq!(settings.geoip_db_path, None, "geoip_db_path");
-            assert_eq!(settings.geoip_dat_path, None, "geoip_dat_path");
-            assert!(settings.geosite_data_paths.is_empty(), "geosite_data_paths");
-            assert!(settings.enable_tcp_fallback, "enable_tcp_fallback");
-        }
+        let settings = read;
+        assert_eq!(settings.min_ttl, 0, "min_ttl");
+        assert_eq!(settings.bind_udp, "0.0.0.0:5353", "bind_udp");
+        assert_eq!(settings.bind_tcp, "0.0.0.0:5353", "bind_tcp");
+        assert_eq!(settings.bind_doh, None, "bind_doh");
+        assert_eq!(settings.doh_tls_cert, None, "doh_tls_cert");
+        assert_eq!(settings.doh_tls_key, None, "doh_tls_key");
+        assert_eq!(settings.doh_path, "/dns-query", "doh_path");
+        assert_eq!(settings.cache_capacity, 10_000, "cache_capacity");
+        assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
+        assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
+        assert_eq!(settings.default_upstream, "1.1.1.1:53", "default_upstream");
+        assert!(
+            settings.default_upstream_pre_split.is_none(),
+            "default_upstream_pre_split"
+        );
+        assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");
+        assert_eq!(settings.request_timeout_ms, None, "request_timeout_ms");
+        assert_eq!(settings.response_jump_limit, 10, "response_jump_limit");
+        assert_eq!(settings.udp_pool_size, 64, "udp_pool_size");
+        assert_eq!(settings.tcp_pool_size, 64, "tcp_pool_size");
+        assert_eq!(settings.doh_pool_size, 8, "doh_pool_size");
+        assert_eq!(
+            settings.doh_health_check_error_threshold, 3,
+            "doh_health_check_error_threshold"
+        );
+        assert_eq!(settings.dot_pool_size, 64, "dot_pool_size");
+        assert_eq!(settings.doq_pool_size, 16, "doq_pool_size");
+        assert_eq!(
+            settings.tcp_connection_max_age_seconds, 300,
+            "tcp_connection_max_age_seconds"
+        );
+        assert_eq!(
+            settings.tcp_connection_idle_timeout_seconds, 60,
+            "tcp_connection_idle_timeout_seconds"
+        );
+        assert_eq!(
+            settings.doq_connection_idle_timeout_seconds, 60,
+            "doq_connection_idle_timeout_seconds"
+        );
+        assert_eq!(
+            settings.doq_keepalive_interval_ms, 15_000,
+            "doq_keepalive_interval_ms"
+        );
+        assert!(settings.doq_enable_0rtt, "doq_enable_0rtt");
+        assert!(settings.bootstrap.is_empty(), "bootstrap");
+        assert!(!settings.flow_control_enabled, "flow_control_enabled");
+        assert!(!settings.serve_stale, "serve_stale");
+        assert_eq!(settings.serve_stale_ttl, 30, "serve_stale_ttl");
+        assert_eq!(
+            settings.serve_stale_expire_ttl, 86400,
+            "serve_stale_expire_ttl"
+        );
+        assert!(!settings.serve_stale_ttl_reset, "serve_stale_ttl_reset");
+        assert_eq!(
+            settings.serve_stale_client_timeout_ms, 0,
+            "serve_stale_client_timeout_ms"
+        );
+        assert!(
+            !settings.cache_background_refresh,
+            "cache_background_refresh"
+        );
+        assert_eq!(
+            settings.cache_refresh_threshold_percent, 10,
+            "cache_refresh_threshold_percent"
+        );
+        assert_eq!(settings.cache_refresh_min_ttl, 5, "cache_refresh_min_ttl");
+        assert_eq!(settings.geoip_db_path, None, "geoip_db_path");
+        assert_eq!(settings.geoip_dat_path, None, "geoip_dat_path");
+        assert!(settings.geosite_data_paths.is_empty(), "geosite_data_paths");
+        assert!(settings.enable_tcp_fallback, "enable_tcp_fallback");
     }
 
     /// 只写了一部分设置时，写了的照写的读，没写的取默认值。挑的十来个字段类型各不相同：字符串、

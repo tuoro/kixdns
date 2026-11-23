@@ -1,21 +1,19 @@
 use anyhow::Context;
 use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::rdata::TXT;
-use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::warn;
 
-use super::observation::{Observed, report_response_decision};
+use super::observation::report_response_decision;
 use crate::cache_store::Cached;
 use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
+use crate::engine::execution::Request;
 use crate::engine::matcher_adapter::log_match;
 use crate::engine::response::{
     least_ttl, make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
@@ -324,113 +322,77 @@ pub(crate) fn response_matches(
     })
 }
 
-/// 请求问题的类别：静态应答照它给不给记录（见 `has_static_records`）。回答阶段的应答照抄这个请求的问题
-/// The class of the request's question, by which a static answer gives records or not
-/// (see `has_static_records`). A response-phase answer copies this request's question
-fn question_class(req: &Message) -> DNSClass {
-    req.queries
-        .first()
-        .map_or(DNSClass::IN, |question| question.query_class())
-}
-
-pub struct ApplyResponseActionsContext<'a> {
-    pub engine: &'a Engine,
-    pub actions: &'a [Action],
-    pub ctx_opt: Option<ResponseContext>,
-    pub req: &'a Message,
-    /// 规则自己的转发发出的包 / The packet the rule's own forward sent
-    pub packet: &'a [u8],
-    /// 客户端发来的查询，和它自己带的 ECS（见 `ForwardDecisionContext::query`）/ The query as the client sent
-    /// it, and the ECS it carried itself (see `ForwardDecisionContext::query`)
-    pub query: &'a [u8],
-    pub client_ecs: Option<crate::ecs::EcsKey>,
-    pub upstream_timeout: Duration,
-    pub qname: &'a str,
-    pub qtype: RecordType,
-    pub client_ip: IpAddr,
-    /// 响应动作里的转发是替谁问的；后台刷新不替谁问，是 None（见 `upstream::forward_upstream`）/ Whom a forward
-    /// among the response actions is asked for; None on a background refresh, asked for nobody
-    /// (see `upstream::forward_upstream`)
-    pub asker: Option<IpAddr>,
-    pub upstream_default: &'a str,
-    pub pipeline_id: &'a str,
-    pub rule_name: &'a str,
-    pub remaining_jumps: usize,
+/// 执行响应动作要的：请求本身（问题、谁在问、用的配置、观察者），和它这次转发的几样
+/// What running the response actions takes: the request itself (its question, who is asking,
+/// the configuration it uses, its observer), and a few things of this forward of it
+pub(crate) struct ApplyResponseActionsContext<'a> {
+    pub(crate) engine: &'a Engine,
+    pub(crate) request: &'a Request<'a>,
+    pub(crate) actions: &'a [Action],
+    pub(crate) ctx_opt: Option<ResponseContext>,
+    pub(crate) req: &'a Message,
+    /// 规则自己的转发发出的包；动作里自己写了 `ecs` 的转发从客户端发来的查询改写（见 `Request::packet`）
+    /// The packet the rule's own forward sent; a forward among the actions writing an `ecs` of
+    /// its own rewrites the query as the client sent it instead (see `Request::packet`)
+    pub(crate) packet: &'a [u8],
+    pub(crate) pipeline_id: &'a str,
+    pub(crate) rule_name: &'a str,
+    pub(crate) remaining_jumps: usize,
     /// Where a forward among the actions records its reply, or its failure, and the
     /// ECS the rule's own forward sent, which a forward among the actions without an `ecs` of
-    /// its own sends too, forwarding the same packet (see `ForwardDecisionContext::trail`).
+    /// its own sends too, forwarding the same packet (see `Route::trail`).
     /// None where nothing is cached.
     /// 动作里的转发在哪里记下它的应答或失败，以及规则自己的转发发出的 ECS：动作里没写 `ecs` 的转发发的是同一个包，
-    /// 也就是这一份（见 `ForwardDecisionContext::trail`）。不缓存的地方为 None。
-    pub trail: Option<(
+    /// 也就是这一份（见 `Route::trail`）。不缓存的地方为 None。
+    pub(crate) trail: Option<(
         &'a mut crate::ecs_scope::EcsReach,
         crate::ecs_scope::ForwardEcs,
     )>,
 }
 
-/// Test-only shorthand for [`apply_response_actions_observed`] without an observer context.
-#[cfg(test)]
+/// 执行响应动作：响应阶段 forward 动作的上游尝试和动作最后作出的决定，都经请求的观察者上报
+/// Run the response actions: the upstream attempts of response-phase `forward` actions and the
+/// decision the actions arrive at are reported through the request's observer
 pub(crate) async fn apply_response_actions(
     ctx: ApplyResponseActionsContext<'_>,
 ) -> anyhow::Result<ResponseActionResult> {
-    apply_response_actions_observed(ctx, None).await
-}
-
-/// [`apply_response_actions`] with the observer context of the request, so
-/// upstream attempts made by response-phase `forward` actions are reported, and
-/// so is the decision the actions arrive at.
-/// 带观察者上下文的 [`apply_response_actions`]，使响应阶段 forward 动作的上游尝试得以上报，
-/// 动作最后作出的决定也一并上报。
-pub(crate) async fn apply_response_actions_observed(
-    ctx: ApplyResponseActionsContext<'_>,
-    observed: Observed<'_>,
-) -> anyhow::Result<ResponseActionResult> {
-    let (pipeline, rule) = (ctx.pipeline_id, ctx.rule_name);
-    let result = run_response_actions(ctx, observed).await?;
-    if let Some((observer, request)) = observed {
-        report_response_decision(observer, request, pipeline, rule, &result);
+    let (observed, pipeline, rule) = (ctx.request.observed, ctx.pipeline_id, ctx.rule_name);
+    let result = run_response_actions(ctx).await?;
+    if let Some((observer, context)) = observed {
+        report_response_decision(observer, context, pipeline, rule, &result);
     }
     Ok(result)
 }
 
 async fn run_response_actions(
     mut ctx: ApplyResponseActionsContext<'_>,
-    observed: Observed<'_>,
 ) -> anyhow::Result<ResponseActionResult> {
+    let request = ctx.request;
+    let (qname, qtype, qclass) = (request.qname.as_ref(), request.qtype, request.qclass);
     const MAX_RESPONSE_FORWARDS: usize = 4;
     let mut forward_attempts = 0usize;
 
     for action in ctx.actions {
         match action {
             Action::Log { level } => {
-                log_match(level.as_deref(), ctx.rule_name, ctx.qname, ctx.client_ip);
+                log_match(level.as_deref(), ctx.rule_name, qname, request.peer.ip());
             }
             Action::StaticResponse { rcode } => {
                 let code = parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain);
                 return static_answer(ctx.req, code, Vec::new(), "response_action");
             }
             Action::StaticIpResponse { ip } => {
-                let (rcode, answers) =
-                    make_static_ip_answer(ctx.qname, ctx.qtype, question_class(ctx.req), ip);
+                let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
                 return static_answer(ctx.req, rcode, answers, "response_action");
             }
             Action::StaticCnameResponse { target, ttl } => {
-                let (rcode, answers) = make_static_cname_answer(
-                    ctx.qname,
-                    question_class(ctx.req),
-                    target,
-                    ttl.unwrap_or(300),
-                );
+                let (rcode, answers) =
+                    make_static_cname_answer(qname, qclass, target, ttl.unwrap_or(300));
                 return static_answer(ctx.req, rcode, answers, "response_action");
             }
             Action::StaticTxtResponse { text, ttl } => {
-                let (rcode, answers) = make_static_txt_answer(
-                    ctx.qname,
-                    ctx.qtype,
-                    question_class(ctx.req),
-                    text,
-                    ttl.unwrap_or(300),
-                );
+                let (rcode, answers) =
+                    make_static_txt_answer(qname, qtype, qclass, text, ttl.unwrap_or(300));
                 return static_answer(ctx.req, rcode, answers, "response_action");
             }
             Action::JumpToPipeline { pipeline } => {
@@ -462,35 +424,20 @@ async fn run_response_actions(
             Action::Continue => {
                 return Ok(ResponseActionResult::Continue { ctx: ctx.ctx_opt });
             }
+            // 换掉手上的应答，换成的和 static_txt_response 给出的一样（TTL 是它的默认值）：只有 TXT、ANY 查询拿到
+            // TXT 记录，别的类型、别的类别回 NODATA，响应码是 NOERROR，装不下时回 SERVFAIL。以前不看这些，A 查询也
+            // 拿到 TXT 记录，上游回 NXDOMAIN 时还带着它。手上没有应答（上游失败以后）就没有可换的，回 SERVFAIL
+            // The answer in hand is replaced with what static_txt_response gives (its default
+            // TTL): only TXT and ANY queries get the TXT record, other types and classes NODATA,
+            // with NOERROR, and SERVFAIL when it does not fit. None of this used to be looked at,
+            // an A query getting the TXT record too, and an upstream's NXDOMAIN keeping it. With
+            // no answer in hand (after an upstream failure) there is nothing to replace: SERVFAIL
             Action::ReplaceTxtResponse { text } => {
-                if let Some(ref resp_ctx) = ctx.ctx_opt {
-                    let name = resp_ctx
-                        .msg
-                        .queries
-                        .first()
-                        .map(|q| q.name().clone())
-                        .ok_or_else(|| anyhow::anyhow!("No query name"))?;
-
-                    // 和静态 TXT 一样，装不进应答时回 SERVFAIL（见 `txt_size_problem`）
-                    // As for a static TXT, SERVFAIL when it does not fit the answer (see
-                    // `txt_size_problem`)
-                    if let Some(problem) = crate::engine::response::txt_size_problem(
-                        text,
-                        crate::engine::response::name_wire_len(&name),
-                    ) {
-                        warn!(qname = %ctx.qname, %problem, "replaced TXT answer does not fit a message");
-                        return response_action_servfail(ctx.req);
-                    }
-                    // Replace TXT records in answers / 替换答案中的 TXT 记录
-                    let record = Record::from_rdata(name, 300, RData::TXT(TXT::new(text.to_vec())));
-                    return static_answer(
-                        ctx.req,
-                        resp_ctx.msg.metadata.response_code,
-                        vec![record],
-                        "replace_txt",
-                    );
+                if ctx.ctx_opt.is_none() {
+                    return response_action_servfail(ctx.req);
                 }
-                return response_action_servfail(ctx.req);
+                let (rcode, answers) = make_static_txt_answer(qname, qtype, qclass, text, 300);
+                return static_answer(ctx.req, rcode, answers, "replace_txt");
             }
             Action::Forward {
                 upstream,
@@ -503,9 +450,9 @@ async fn run_response_actions(
                 if forward_attempts > MAX_RESPONSE_FORWARDS {
                     crate::warn_sparse!(
                         event = "response_action_limit",
-                        qname = %ctx.qname,
-                        qtype = ?ctx.qtype,
-                        client_ip = %ctx.client_ip,
+                        qname = %qname,
+                        qtype = ?qtype,
+                        client_ip = %request.peer.ip(),
                         pipeline = %ctx.pipeline_id,
                         rule = %ctx.rule_name,
                         "response actions exceeded forward limit"
@@ -517,8 +464,11 @@ async fn run_response_actions(
                 // 阶段一样用 default_upstream
                 // Where the answer in hand came from (`udp:1.1.1.1:53`) is no address to query,
                 // so without an upstream this uses default_upstream as the request phase does
-                let upstream_addr: Arc<str> =
-                    Arc::from(upstream.as_deref().unwrap_or(ctx.upstream_default));
+                let upstream_addr: Arc<str> = Arc::from(
+                    upstream
+                        .as_deref()
+                        .unwrap_or(&request.state.pipeline.settings.default_upstream),
+                );
                 let use_transport = transport.unwrap_or(Transport::Udp);
                 // 自己写了 `ecs` 的照它从客户端的查询改写，应答适用于谁也按它算；没写的和规则自己的转发发同一个包。以前
                 // 这里的 `ecs` 读进来就丢掉了
@@ -526,16 +476,13 @@ async fn run_response_actions(
                 // reply applies to goes by it too; one without sends the packet of the rule's own
                 // forward. The `ecs` here used to be read and dropped
                 let own_ecs = ecs.as_ref().map(|mode| {
-                    let view = crate::ecs_scope::EcsView {
-                        peer: ctx.client_ip,
-                        client: ctx.client_ecs,
-                    };
                     let packet = crate::ecs::apply_ecs_for(
-                        ctx.query,
+                        request.packet,
                         mode,
-                        ctx.client_ip,
-                        ctx.client_ecs.as_ref(),
+                        request.peer.ip(),
+                        request.requester.ecs.as_ref(),
                     );
+                    let view = request.requester.ecs_view();
                     (packet, crate::ecs_scope::ForwardEcs::of(Some(mode), &view))
                 });
                 let packet = own_ecs.as_ref().map_or(ctx.packet, |(packet, _)| packet);
@@ -549,11 +496,11 @@ async fn run_response_actions(
                     ctx.engine,
                     packet,
                     &upstream_addr,
-                    ctx.upstream_timeout,
+                    request.state.pipeline.upstream_timeout(),
                     Some(use_transport),
                     pre_split_upstreams.as_ref(),
-                    observed,
-                    ctx.asker,
+                    request.observed,
+                    request.asker(),
                 )
                 .await
                 {
@@ -571,8 +518,8 @@ async fn run_response_actions(
                             tracing::debug!(
                                 event = "response_action_withheld",
                                 upstream = %upstream_addr,
-                                qname = %ctx.qname,
-                                client_ip = %ctx.client_ip,
+                                qname = %qname,
+                                client_ip = %request.peer.ip(),
                                 error = %err,
                                 "flow control kept the response action forward from the upstream"
                             );
@@ -580,9 +527,9 @@ async fn run_response_actions(
                             crate::warn_sparse!(
                                 event = "response_action_failure",
                                 upstream = %upstream_addr,
-                                qname = %ctx.qname,
-                                qtype = ?ctx.qtype,
-                                client_ip = %ctx.client_ip,
+                                qname = %qname,
+                                qtype = ?qtype,
+                                client_ip = %request.peer.ip(),
                                 pipeline = %ctx.pipeline_id,
                                 rule = %ctx.rule_name,
                                 error = %err,
