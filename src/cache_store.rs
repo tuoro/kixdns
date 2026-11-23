@@ -209,11 +209,6 @@ impl<V: Cached> CacheStore<V> {
         self.compute(key, |_| Op::Put(value));
     }
 
-    /// 去掉 `key` / Remove `key`
-    pub fn remove(&self, key: u64) {
-        self.compute(key, |_| Op::Remove);
-    }
-
     /// 去掉所有条目。旧条目在写锁外释放，读这个分片的请求不用等 / Remove every entry. The old entries
     /// are freed outside the write lock, so requests reading the shard do not wait for it
     pub fn invalidate_all(&self) {

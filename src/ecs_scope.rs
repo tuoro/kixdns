@@ -340,6 +340,7 @@ impl EcsReach {
     }
 
     /// 适用于槽位里的所有请求方 / Applies to every requester of its slot
+    #[cfg(test)]
     pub fn is_universal(&self) -> bool {
         self.steps.is_empty()
     }
