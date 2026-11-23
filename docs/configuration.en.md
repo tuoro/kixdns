@@ -89,7 +89,7 @@ The same structure is used for response_matchers, response_matcher_operator, res
 | geo_site_not | value: GeoSite tag |
 | geoip_country | country_codes: string array |
 | geoip_private | expect: boolean |
-| qtype | value: A, AAAA, CNAME, MX, TXT, NS, PTR, SOA, SRV, or OPT |
+| qtype | value: a record type name (A, AAAA, CNAME, HTTPS, SVCB, CAA, ANY and so on, in any case), or the RFC 3597 form such as `TYPE65` |
 
 Pipeline selectors support all of the rows above. Request rules support all rows except listener_label.
 
@@ -144,7 +144,7 @@ upstream_equals and response_upstream_ip are about the upstream that answered th
 
 ### Logical operators
 
-Operators are evaluated left to right. The first matcher seeds the result.
+Operators are evaluated left to right. The first matcher seeds the result: an and_not or or_not (not) written on it has nothing before it to join and does not negate it, and with a single matcher a rule-level negation is written for nothing just the same. Both are raised as configuration problems (a warning at startup, loaded as before; refused on reload and on a save from the panel). To match queries for which a condition does not hold, put an `{"type": "any"}` first and write and_not on the condition.
 
 | Operator | Meaning |
 |---|---|

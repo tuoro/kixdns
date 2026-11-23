@@ -1348,6 +1348,13 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         if !pipelines.contains(select.pipeline.as_str()) {
             found.push(format!("{place}: no pipeline \"{}\"", select.pipeline));
         }
+        if let Some(problem) = ignored_negation(
+            "matchers",
+            select.matchers.iter().map(|m| m.operator),
+            select.matcher_operator,
+        ) {
+            found.push(format!("{place}: {problem}"));
+        }
         for matcher in &select.matchers {
             if let PipelineSelectorMatcher::DomainSuffix { value }
             | PipelineSelectorMatcher::DomainRegex { value } = &matcher.matcher
@@ -1496,11 +1503,59 @@ fn names_an_address(upstreams: &str) -> bool {
 /// `log` 动作认的级别 / The levels a `log` action takes
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
+/// 一串匹配器里白写的取反。第一个匹配器是起点，它身上的 `and_not`、`or_not`（`not`）前面没有东西可合，也不把它取反；只有
+/// 一个匹配器时，规则级的取反也只落在它身上，一样白写。以前悄悄当成正向匹配：写着 `not` 的规则整个反过来。要匹配它不成立
+/// 的，前面放一个 `{"type": "any"}`。`matchers` 是这串匹配器在配置里的键
+/// A negation written for nothing in a chain of matchers. The first matcher is where the result
+/// starts: an `and_not` or `or_not` (`not`) on it has nothing before it to join and does not
+/// negate it; with a single matcher a chain-level negation lands on it alone, written for
+/// nothing just the same. It used to pass for a plain match, a rule written with `not` turning
+/// right round. To match what it does not, put an `{"type": "any"}` first. `matchers` is the
+/// chain's key in the configuration
+fn ignored_negation(
+    matchers: &str,
+    mut operators: impl ExactSizeIterator<Item = MatchOperator>,
+    chain: MatchOperator,
+) -> Option<String> {
+    let negation = |operator| match operator {
+        MatchOperator::AndNot => Some("and_not"),
+        MatchOperator::OrNot => Some("or_not"),
+        MatchOperator::And | MatchOperator::Or => None,
+    };
+    let single = operators.len() == 1;
+    let first = operators.next()?;
+    let operator = negation(first).or_else(|| {
+        (single && first == MatchOperator::And)
+            .then(|| negation(chain))
+            .flatten()
+    })?;
+    Some(format!(
+        "{operator} on the first of {matchers} has nothing before it and does not negate it; to match what it does not, put {{\"type\": \"any\"}} first"
+    ))
+}
+
 fn rule_problems(
     rule: &Rule,
     pipelines: &rustc_hash::FxHashSet<&str>,
     mut report: impl FnMut(String),
 ) {
+    for problem in [
+        ignored_negation(
+            "matchers",
+            rule.matchers.iter().map(|m| m.operator),
+            rule.matcher_operator,
+        ),
+        ignored_negation(
+            "response_matchers",
+            rule.response_matchers.iter().map(|m| m.operator),
+            rule.response_matcher_operator,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        report(problem);
+    }
     use crate::engine::response::{static_cname_target, static_ips, txt_size_problem};
 
     let forwards = rule
@@ -1948,6 +2003,61 @@ mod validation_tests {
 
     fn problems_of(config: serde_json::Value) -> Vec<String> {
         super::problems(&super::parse_config(&config.to_string()).expect("parses"))
+    }
+
+    /// 白写的取反报出来：第一个匹配器上的 `not`，只有一个匹配器时规则级的 `not`，入口、请求和回答的匹配器都一样。第一个上
+    /// 的 `or`、规则级的取反配几个匹配器（第一个起头，后面的取反）照常
+    /// A negation written for nothing is raised: `not` on the first matcher, or a chain-level
+    /// `not` with a single matcher, for entry, request and answer matchers alike. `or` on the
+    /// first, and a chain-level negation over several matchers (the first starting, the rest
+    /// negated), pass
+    #[test]
+    fn a_negation_on_the_first_matcher_is_a_problem() {
+        let config = |matchers: serde_json::Value, operator: &str| {
+            serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipeline_select": [{ "pipeline": "main", "matchers": matchers, "matcher_operator": operator }],
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": matchers,
+                    "matcher_operator": operator,
+                    "actions": [{ "type": "forward" }],
+                    "response_matchers": [{ "type": "response_rcode", "value": "NOERROR", "operator": "or_not" }],
+                }] }]
+            })
+        };
+        let one = serde_json::json!([{ "type": "domain_suffix", "value": "cn" }]);
+        let first_not =
+            serde_json::json!([{ "type": "domain_suffix", "value": "cn", "operator": "not" }]);
+        let two = serde_json::json!([
+            { "type": "domain_suffix", "value": "cn" },
+            { "type": "domain_suffix", "value": "com" },
+        ]);
+        let rule = "pipeline \"main\" rule \"r\": ";
+        let raised = |what: &str, matchers: &str| {
+            format!(
+                "{what} on the first of {matchers} has nothing before it and does not negate it; to match what it does not, put {{\"type\": \"any\"}} first"
+            )
+        };
+        let answer = format!("{rule}{}", raised("or_not", "response_matchers"));
+        for (matchers, operator) in [(&one, "not"), (&first_not, "and")] {
+            assert_eq!(
+                problems_of(config(matchers.clone(), operator)),
+                [
+                    format!("pipeline_select 1: {}", raised("and_not", "matchers")),
+                    format!("{rule}{}", raised("and_not", "matchers")),
+                    answer.clone(),
+                ],
+                "{matchers} {operator}"
+            );
+        }
+        for (matchers, operator) in [(&two, "not"), (&one, "or")] {
+            assert_eq!(
+                problems_of(config(matchers.clone(), operator)),
+                std::slice::from_ref(&answer),
+                "{matchers} {operator}"
+            );
+        }
     }
 
     /// 回答检查里写错的 rcode、`log` 动作写错的级别都报出来；`OTHER`、小写的 rcode 和认得的级别照常。以前前者悄悄当成
