@@ -1259,12 +1259,16 @@ const COOKIE: u16 = 10;
 /// RFC 7830 的 PADDING 选项代码 / The PADDING option code of RFC 7830
 const PADDING: u16 = 12;
 
+/// RFC 7828 的 edns-tcp-keepalive 选项代码 / The edns-tcp-keepalive option code of RFC 7828
+const TCP_KEEPALIVE: u16 = 11;
+
 /// 只在相邻两跳之间有意义的选项：cookie 是两跳之间的（RFC 7873），填充的长短按那一跳的传输来，明文传输上
-/// 不许用（RFC 7830 第 6 节）
+/// 不许用（RFC 7830 第 6 节），edns-tcp-keepalive 说的是那一跳的 TCP 连接，UDP 上不许带（RFC 7828 第 3.2 节）
 /// The options that mean something between two neighbouring hops only: a cookie belongs
-/// between two hops (RFC 7873), and padding is sized for one hop's transport and must not
-/// be used over a cleartext one (RFC 7830 section 6)
-const HOP_BY_HOP: [u16; 2] = [COOKIE, PADDING];
+/// between two hops (RFC 7873), padding is sized for one hop's transport and must not be used
+/// over a cleartext one (RFC 7830 section 6), and edns-tcp-keepalive speaks of that hop's TCP
+/// connection and must not be sent over UDP (RFC 7828 section 3.2)
+const HOP_BY_HOP: [u16; 3] = [COOKIE, PADDING, TCP_KEEPALIVE];
 
 /// OPT 的 RDATA（在 `rdata`）里有没有代码在 `codes` 之中的选项；选项结构不对时为 false
 /// Whether the OPT RDATA at `rdata` has an option coded one of `codes`; false when the

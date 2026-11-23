@@ -1,14 +1,15 @@
 //! 取决于上游应答的静态应答（回答检查的动作给出的，或者在上游的应答上 continue、回答检查跳转以后的规则给出的）按它带的 TTL
-//! 缓存：记录里最小的，不超过 cache_max_ttl；不带记录的没有自己的 TTL，按 min_ttl。规则直接给出的不进响应缓存，规则下次照样
-//! 直接给出；上游失败以后兜底给出的也不进，那只是那一次请求的。按「谁在问」给的静态应答照样缓存，槽位按规则对请求方的判定分开。
+//! 缓存，即记录里最小的，但不比它所依据的那份上游应答在缓存里留得久；不带记录的没有自己的 TTL，就按那份应答的。规则直接给出的
+//! 不进响应缓存，规则下次照样直接给出；上游失败以后兜底给出的也不进，那只是那一次请求的。按「谁在问」给的静态应答照样缓存，槽位
+//! 按规则对请求方的判定分开。
 //! A static answer that depends on an upstream's answer (given by an answer check's actions,
 //! or by the rules after a continue or an answer check's jump on an upstream's answer) is
-//! cached for the TTL it carries: the least of its records', at most cache_max_ttl; one
-//! without records has no TTL of its own and goes by min_ttl. One the rules give outright
-//! stays out of the response cache, the rules giving it again outright; so does one given as
-//! a fallback after an upstream failure, which is for that one request. A static answer given
-//! by who is asking is cached all the same, its slot kept apart by how the rules judge the
-//! requester.
+//! cached for the TTL it carries, the least of its records', yet no longer than the upstream
+//! answer it goes by may stay in the cache; one without records has no TTL of its own and
+//! goes by that answer's. One the rules give outright stays out of the response cache, the
+//! rules giving it again outright; so does one given as a fallback after an upstream
+//! failure, which is for that one request. A static answer given by who is asking is cached
+//! all the same, its slot kept apart by how the rules judge the requester.
 
 use std::net::Ipv4Addr;
 
@@ -75,29 +76,40 @@ fn cached_ttls(engine: &Engine) -> Vec<u32> {
         .collect()
 }
 
-/// 带 TTL 120 的静态 CNAME、带 TTL 300 的静态地址、不带记录的 deny，在不同的设置下缓存多久：回答检查的动作给出的、回答检查
-/// continue 或跳转以后的规则给出的都一样。以前一律按 min_ttl：带了 TTL 的也按它缓存，min_ttl 为 0（默认）时谁都不缓存，每次
-/// 都要再问一遍上游
+/// 带 TTL 120 的静态 CNAME、带 TTL 300 的静态地址、不带记录的 deny，依据不同 TTL 的上游回答、在不同的设置下缓存多久：
+/// 回答检查的动作给出的、回答检查 continue 或跳转以后的规则给出的都一样。带记录的取自己的 TTL 和那份回答在缓存里能留的
+/// 时间中短的那个，不带记录的就按那份回答的；那份回答不进缓存（TTL 为 0）时据它给的也不缓存。以前不看那份回答：静态地址
+/// 写死的 300 秒比回答的 60 秒长，规则早该给别的了还在用；deny 按 min_ttl，默认为 0 时不缓存，防重绑定的 deny 每次都要
+/// 再问一遍上游
 /// How long a static CNAME with TTL 120, a static address with TTL 300 and a deny with no
-/// records are cached under various settings: given by an answer check's actions, or by the
-/// rules after an answer check continued or jumped, alike. It used to go by min_ttl alone: an
-/// answer carrying a TTL was cached for min_ttl too, and with min_ttl 0 (the default) none was
-/// cached, the upstream asked again every time
+/// records are cached, going by upstream answers of various TTLs under various settings:
+/// given by an answer check's actions, or by the rules after an answer check continued or
+/// jumped, alike. One with records takes the shorter of its own TTL and how long that answer
+/// may stay in the cache, one without takes that answer's; with that answer kept out of the
+/// cache (TTL 0) nothing given by it is cached either. It used to ignore that answer: the
+/// static address's hard-coded 300 seconds outlasted an answer's 60, in use long after the
+/// rules would have given something else; a deny went by min_ttl, and with the default 0 was
+/// not cached, a deny against rebinding asking the upstream again every time
 #[tokio::test]
-async fn a_static_answer_on_an_upstream_answer_is_cached_for_the_ttl_it_carries() {
-    let upstream = answering_upstream(UPSTREAM_ANSWER, 600).await.address;
+async fn a_static_answer_on_an_upstream_answer_is_cached_no_longer_than_that_answer() {
     let cname = json!({ "type": "static_cname_response", "target": "target.test.", "ttl": 120 });
     let address = json!({ "type": "static_ip_response", "ip": STATIC.to_string() });
     let deny = json!({ "type": "deny" });
     let cases = [
-        (&cname, json!({}), Some(120)),
-        (&cname, json!({ "min_ttl": 600 }), Some(120)),
-        (&address, json!({}), Some(300)),
-        (&address, json!({ "cache_max_ttl": 100 }), Some(100)),
-        (&deny, json!({ "min_ttl": 60 }), Some(60)),
-        (&deny, json!({}), None),
+        (600, &cname, json!({}), Some(120)),
+        (600, &cname, json!({ "min_ttl": 600 }), Some(120)),
+        (600, &address, json!({}), Some(300)),
+        (600, &address, json!({ "cache_max_ttl": 100 }), Some(100)),
+        (60, &address, json!({}), Some(60)),
+        (0, &address, json!({}), None),
+        (600, &deny, json!({}), Some(600)),
+        (60, &deny, json!({ "min_ttl": 120 }), Some(120)),
+        (0, &deny, json!({}), None),
     ];
-    for (action, settings, cached) in cases {
+    for (answer_ttl, action, settings, cached) in cases {
+        let upstream = answering_upstream(UPSTREAM_ANSWER, answer_ttl)
+            .await
+            .address;
         let paths = [
             (
                 "answer check",
@@ -127,7 +139,7 @@ async fn a_static_answer_on_an_upstream_answer_is_cached_for_the_ttl_it_carries(
             assert_eq!(
                 cached_ttls(&engine),
                 Vec::from_iter(cached),
-                "{path}: {action} with {settings}"
+                "{path}: {action} on an answer of TTL {answer_ttl} with {settings}"
             );
         }
     }
