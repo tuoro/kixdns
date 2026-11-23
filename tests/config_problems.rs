@@ -2,17 +2,18 @@
 //! did before, but a reload carrying one is refused.
 //!
 //! Runs the real binary on a configuration with a misspelt rcode, which used to
-//! answer NXDOMAIN without a word. Startup logs the problem and answers as
-//! before. A reload that keeps the problem is refused, so the running
-//! configuration stays; once the problem is fixed the reload goes through.
+//! answer NXDOMAIN without a word. Startup logs the problem at error, seen at the
+//! default log level, and answers as before. A reload that keeps the problem is
+//! refused, so the running configuration stays; once the problem is fixed the
+//! reload goes through.
 //!
 //! A background_refresh_rule, which never takes effect, is no problem: it only logs a
 //! warn at startup and on each reload.
 //!
 //! 有问题的配置（见 `config::problems`）照旧能启动，但带着问题的重载会被拒绝。在一份 rcode 拼错的
-//! 配置上跑真的程序（以前它不声不响地回 NXDOMAIN）：启动时记下问题、照旧应答；保留着问题的重载
-//! 被拒绝，正在用的配置不变；问题改掉以后重载才生效。不会生效的 background_refresh_rule 不算问题，
-//! 只在启动和每次重载时记一条 warn。
+//! 配置上跑真的程序（以前它不声不响地回 NXDOMAIN）：启动时把问题记成错误，默认日志级别看得到，照旧
+//! 应答；保留着问题的重载被拒绝，正在用的配置不变；问题改掉以后重载才生效。不会生效的
+//! background_refresh_rule 不算问题，只在启动和每次重载时记一条 warn。
 
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::Path;
@@ -103,15 +104,21 @@ fn eventually(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// 起一个读 `config` 的内核，日志写进 `log`，等它开始应答
-/// Start a kernel reading `config`, logging into `log`, and wait until it answers
-fn start(config: &Path, log: &Path, port: u16) -> Kernel {
+/// 起一个读 `config` 的内核，日志按 `level` 写进 `log`（None 是默认级别），等它开始应答
+/// Start a kernel reading `config`, logging into `log` at `level` (None for the default
+/// level), and wait until it answers
+fn start(config: &Path, log: &Path, port: u16, level: Option<&str>) -> Kernel {
     let output = std::fs::File::create(log).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kixdns"));
+    command
+        .args(["run", "--config"])
+        .arg(config)
+        .env_remove("RUST_LOG");
+    if let Some(level) = level {
+        command.env("RUST_LOG", level);
+    }
     let kernel = Kernel(
-        Command::new(env!("CARGO_BIN_EXE_kixdns"))
-            .args(["run", "--config"])
-            .arg(config)
-            .env("RUST_LOG", "info")
+        command
             .stdout(output.try_clone().unwrap())
             .stderr(output)
             .stdin(Stdio::null())
@@ -145,7 +152,7 @@ fn a_background_refresh_rule_only_warns_at_startup_and_on_reload() {
         }
     });
     write_config_with(&config, port, "192.0.2.1", "REFUSED", refresh_rule.clone());
-    let _kernel = start(&config, &log, port);
+    let _kernel = start(&config, &log, port, Some("info"));
     let warnings = || {
         std::fs::read_to_string(&log)
             .unwrap()
@@ -167,6 +174,11 @@ fn a_background_refresh_rule_only_warns_at_startup_and_on_reload() {
     );
 }
 
+/// 默认日志级别下跑：启动时的问题和拒绝重载一样记成错误，不调日志级别也看得到。以前启动时只记 warn，
+/// 默认级别下一个字也没有
+/// Run at the default log level: a problem at startup is logged at error, as the reload
+/// refusing it is, and shows without raising the level. Startup used to log a warn, and at
+/// the default level not a word of it showed
 #[test]
 fn a_problem_starts_as_before_and_refuses_a_reload() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -174,11 +186,12 @@ fn a_problem_starts_as_before_and_refuses_a_reload() {
     let log = dir.path().join("kixdns.log");
     let port = free_port();
     write_config(&config, port, "192.0.2.1", "WHATEVER");
-    let _kernel = start(&config, &log, port);
+    let _kernel = start(&config, &log, port, None);
     let logged = |needle: &str| std::fs::read_to_string(&log).unwrap().contains(needle);
 
-    // 启动照旧：记下问题，拼错的 rcode 还是回 NXDOMAIN
-    // Startup as before: the problem is logged and the misspelt rcode still answers NXDOMAIN
+    // 启动照旧：问题记成错误，拼错的 rcode 还是回 NXDOMAIN
+    // Startup as before: the problem is logged as an error and the misspelt rcode still
+    // answers NXDOMAIN
     assert!(logged("WHATEVER"), "startup names the problem");
     assert_eq!(
         ask(port, "old.test").map(|reply| reply.metadata.response_code),

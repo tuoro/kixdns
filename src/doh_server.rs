@@ -471,8 +471,16 @@ async fn handle_doh_request(
     // Only a POST's body is read; a GET's goes at once, lest the data a client sends on its stream
     // pile up in the window until the answer is out
     let (parts, body) = req.into_parts();
-    let dns_wire = match (&parts.method, parts.uri.path()) {
-        (&Method::POST, path) if path == doh_path => {
+    if parts.uri.path() != doh_path {
+        return Ok(error_response(StatusCode::NOT_FOUND));
+    }
+    let dns_wire = match parts.method {
+        // RFC 8484 第 4.1 节：POST 的正文是 application/dns-message，别的媒体类型回 415 / RFC 8484
+        // section 4.1: a POST's body is application/dns-message, and another media type gets 415
+        Method::POST if !is_dns_message(&parts.headers) => {
+            return Ok(error_response(StatusCode::UNSUPPORTED_MEDIA_TYPE));
+        }
+        Method::POST => {
             // 先看 Content-Length：声明超限的请求一个字节都不读；再用 Limited 给
             // body 本身封顶，分块传输或与声明不符的发送方也只能让服务端缓冲
             // MAX_QUERY_LEN 字节。此前 body 先被整个收进内存再比较长度。
@@ -503,14 +511,24 @@ async fn handle_doh_request(
                 Err(_) => return Ok(error_response(StatusCode::REQUEST_TIMEOUT)),
             }
         }
-        (&Method::GET, path) if path == doh_path => {
+        Method::GET => {
             drop(body);
             match extract_get_dns_param(parts.uri.query().unwrap_or("")) {
                 Some(data) => data,
                 None => return Ok(error_response(StatusCode::BAD_REQUEST)),
             }
         }
-        _ => return Ok(error_response(StatusCode::NOT_FOUND)),
+        // 路径对、方法不对是 405，带上答得了的方法（RFC 9110 第 15.5.6 节）；以前和路径不对一样回 404
+        // The right path with the wrong method is 405, naming the methods answered (RFC 9110
+        // section 15.5.6); it used to get 404, as a wrong path does
+        _ => {
+            let mut response = error_response(StatusCode::METHOD_NOT_ALLOWED);
+            response.headers_mut().insert(
+                hyper::header::ALLOW,
+                hyper::header::HeaderValue::from_static("GET, POST"),
+            );
+            return Ok(response);
+        }
     };
 
     // QR=1 的应答不是查询，和报文太短时一样回 400（见 `OnTheSpot::Drop`）
@@ -538,6 +556,17 @@ fn dns_message_response(query: &[u8], answer: Bytes) -> Response<Full<Bytes>> {
         hyper::header::HeaderValue::from_static("max-age=0"),
     );
     response
+}
+
+/// 请求的 Content-Type 是不是 application/dns-message（媒体类型不分大小写，参数不看）
+/// Whether the request's Content-Type is application/dns-message (the media type ignoring
+/// case, any parameters aside)
+fn is_dns_message(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/dns-message"))
 }
 
 /// 从 GET ?dns=base64url 提取 DNS 报文 / Extract DNS wire from GET ?dns=base64url

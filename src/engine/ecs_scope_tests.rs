@@ -242,13 +242,13 @@ fn ip(text: &str) -> IpAddr {
     text.parse().unwrap()
 }
 
-/// `from_client_ip` 把 0.0.0.0 当作内网地址，255.255.255.255 不当作（`geoip_private` 正相反，见
+/// `from_client_ip` 把 0.0.0.0 当作内网地址，255.255.255.255 不当作（`geoip_private` 两个都当作，见
 /// `private_address_tests`）：
 /// - 来源地址是 0.0.0.0 时不加 ECS，是 255.255.255.255 时加它的 /24；
 /// - 公网客户端自己带的 0.0.0.0/8 不发给上游，换成来源地址的子网；255.255.255.0/24 原样转发。
 ///
 /// `from_client_ip` counts 0.0.0.0 as a local network address and 255.255.255.255 not
-/// (`geoip_private` the other way round, see `private_address_tests`):
+/// (`geoip_private` counts both, see `private_address_tests`):
 /// - a source address of 0.0.0.0 gets no ECS, one of 255.255.255.255 its /24;
 /// - a public client's own 0.0.0.0/8 does not go upstream and the source address's
 ///   subnet goes instead, while its own 255.255.255.0/24 goes on as it is.

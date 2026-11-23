@@ -4,7 +4,8 @@ use crate::engine::Engine;
 use crate::engine::geo::GeoGeneration;
 use crate::matcher::advanced_rule::{CompiledPipeline, compile_pipelines};
 use crate::matcher::{
-    RequesterKey, RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeResponseMatcher,
+    RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig,
+    RuntimeResponseMatcher,
 };
 use crate::proto_utils::QueryFlags;
 use bytes::Bytes;
@@ -521,15 +522,22 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         .hash(hasher);
 }
 
+/// pipeline 里决定应答的部分。规则级的运算符编译时已经定进每个匹配器的运算符里，起作用的部分随匹配器算进来；pipeline 级
+/// 的 `ecs` 不起作用（缓存按上游返回的作用范围区分应答，见 `CacheEntry::reach`），不在运行时配置里，改了它缓存不换代。
+/// 以前两样都另算一遍，改一个不起作用的 `ecs` 也丢掉整个缓存
+/// The part of a pipeline that decides its answers. The rule-level operators are settled into
+/// each matcher's operator as it compiles, and what they do counts with the matchers; the
+/// pipeline-level `ecs` does nothing (the cache tells answers apart by the scope the upstream
+/// returns, see `CacheEntry::reach`), is not in the runtime configuration, and changing it
+/// leaves the caches alone. Both used to count on their own, so changing an `ecs` that did
+/// nothing dropped the whole cache
 fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher) {
     pipeline.id.hash(hasher);
-    hash_ecs_mode(pipeline.ecs.as_ref(), hasher);
     pipeline.rules.len().hash(hasher);
     for rule in &pipeline.rules {
         rule.name.hash(hasher);
-        hash_match_operator(rule.matcher_operator, hasher);
         rule.matchers.len().hash(hasher);
-        for matcher in &rule.matchers {
+        for matcher in rule.matchers.iter() {
             hash_match_operator(matcher.operator, hasher);
             hash_runtime_matcher(&matcher.matcher, hasher);
         }
@@ -537,18 +545,19 @@ fn hash_pipeline_semantics(pipeline: &RuntimePipeline, hasher: &mut impl Hasher)
         for action in &rule.actions {
             hash_action(action, hasher);
         }
-        rule.response_matchers.len().hash(hasher);
-        for matcher in &rule.response_matchers {
+        let (response_matchers, on_match, on_miss) =
+            ResponsePhase::parts(rule.response_phase.as_deref());
+        response_matchers.len().hash(hasher);
+        for matcher in response_matchers {
             hash_match_operator(matcher.operator, hasher);
             hash_runtime_response_matcher(&matcher.matcher, hasher);
         }
-        hash_match_operator(rule.response_matcher_operator, hasher);
-        rule.response_actions_on_match.len().hash(hasher);
-        for action in &rule.response_actions_on_match {
+        on_match.len().hash(hasher);
+        for action in on_match {
             hash_action(action, hasher);
         }
-        rule.response_actions_on_miss.len().hash(hasher);
-        for action in &rule.response_actions_on_miss {
+        on_miss.len().hash(hasher);
+        for action in on_miss {
             hash_action(action, hasher);
         }
     }
@@ -714,6 +723,36 @@ mod tests {
         assert_eq!(
             build_cache_namespaces(&first),
             build_cache_namespaces(&second)
+        );
+    }
+
+    /// pipeline 级的 `ecs` 不起作用，改了它命名空间不变：缓存按上游返回的作用范围区分应答（见 `CacheEntry::reach`）。
+    /// 以前它也算进命名空间，改一个不起作用的设置就丢掉这个 pipeline 的整个缓存
+    /// The pipeline-level `ecs` does nothing, and changing it leaves the namespace as it was:
+    /// the cache tells answers apart by the scope the upstream returns (see
+    /// `CacheEntry::reach`). It used to count, so changing a setting that did nothing dropped
+    /// the pipeline's whole cache
+    #[test]
+    fn the_pipeline_level_ecs_leaves_the_namespace_alone() {
+        let namespaces = |ecs: serde_json::Value| {
+            let config: PipelineConfig = serde_json::from_value(serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{
+                    "id": "main",
+                    "ecs": ecs,
+                    "rules": [{
+                        "name": "forward",
+                        "matchers": [{ "type": "any" }],
+                        "actions": [{ "type": "forward", "upstream": "8.8.8.8:53" }]
+                    }]
+                }]
+            }))
+            .expect("parse config");
+            build_cache_namespaces(&RuntimePipelineConfig::from_config(config).expect("build"))
+        };
+        assert_eq!(
+            namespaces(serde_json::Value::Null),
+            namespaces(serde_json::json!({ "mode": "from_client_ip", "prefix_v4": 16 }))
         );
     }
 

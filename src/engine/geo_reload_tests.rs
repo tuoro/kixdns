@@ -380,7 +380,7 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
     )
     .unwrap();
     let mmdb = dir.path().join("country.mmdb");
-    crate::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&mmdb_source, &mmdb, None).unwrap();
+    crate::matcher::geoip_converter::convert_dat_to_mmdb(&mmdb_source, &mmdb, None).unwrap();
     let data = dir.path().join("geoip.json");
     std::fs::write(
         &data,
@@ -446,7 +446,7 @@ async fn a_hot_reload_reads_an_mmdb_replaced_in_place() {
         let entries =
             format!(r#"{{"entries":[{{"country_code":"{country}","ips":["198.51.100.0/24"]}}]}}"#);
         std::fs::write(&source, entries).unwrap();
-        crate::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+        crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
     };
     convert("US");
     let cfg = || {
@@ -762,15 +762,22 @@ async fn an_empty_geo_file_at_a_new_path_keeps_nothing_of_the_old_file() {
     assert_eq!(ask(&geosite, "second.geo.test").await, Some(OTHER));
 }
 
-/// 规则用到、却没有数据文件提供的 GeoSite 标签能被认出来（用来记告警），不分大小写
-/// The GeoSite tags rules use that no data file provides are found (for the warning), ignoring case
+/// 规则写的 GeoSite 标签编译时转成小写：写法不同的同一个标签只算一个，照样命中；没有数据文件提供的能被认出来（用来记
+/// 告警）。以前按写法各算一个，`TestA` 和 `testa` 各从数据里读一遍、各建一份匹配器，大小写一改缓存也跟着换代
+/// The GeoSite tags rules write are lowercased as they compile: one tag written in different
+/// cases counts once and matches all the same, and those no data file provides are found (for
+/// the warning). Each spelling used to count apart, `TestA` and `testa` each read from the data
+/// and given matchers of their own, and a change of case moved the caches to a new namespace
 #[tokio::test]
-async fn geosite_tags_no_file_provides_are_found() {
+async fn geosite_tags_count_once_whatever_their_case() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("geosite.dat");
     std::fs::write(&path, geosite_dat(&[("testa", "geo.test")])).unwrap();
-    let engine = engine(geosite_config(&[&path], "testa"));
-    let manager = engine.geosite_manager.read();
-    let used = ["TestA".to_string(), "gone".to_string(), "Gone".to_string()];
-    assert_eq!(manager.missing_tags(&used), ["gone"]);
+    let cfg = geosite_config_any_of(&[&path], &["TestA", "testa", "gone", "Gone"]);
+    let mut used = crate::engine::utils::extract_geosite_tags_from_config(&cfg);
+    used.sort_unstable();
+    assert_eq!(used, ["gone", "testa"]);
+    let engine = engine(cfg);
+    assert_eq!(ask(&engine, "www.geo.test").await, Some(MATCHED));
+    assert_eq!(engine.geosite_manager.read().missing_tags(&used), ["gone"]);
 }
