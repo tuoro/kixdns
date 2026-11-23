@@ -73,6 +73,16 @@ pub(crate) fn domain_value(value: &str) -> Arc<str> {
     }
 }
 
+/// 规则写的 GeoSite 标签，转成小写存：数据文件里的标签读进来就转小写（见 `geosite`），在这里转一次，每个查询就不用
+/// 再转，写法不同的同一个标签也只算一个（见 `extract_geosite_tags_from_config`），不会各读一遍数据、各建一份匹配器
+/// A GeoSite tag a rule writes, kept lowercased: the tags of data files are lowercased as they
+/// are read (see `geosite`), so lowering it once here spares every query doing it, and one tag
+/// written in different cases counts once (see `extract_geosite_tags_from_config`) instead of
+/// being read from the data and given matchers once for each spelling
+pub(crate) fn geosite_tag(value: &str) -> Arc<str> {
+    Arc::from(value.to_ascii_lowercase())
+}
+
 /// 域名后缀按点分段比较：`example.com` 命中它本身和每个子域名，`.example.com` 只命中子域名，
 /// `notexample.com` 两种都不命中。请求名在解析时已转小写、不带结尾的点，配置值在加载时已转小写。
 /// 规则、Pipeline 入口和响应阶段的 `request_domain_suffix` 都用这一个比较，按索引查到的候选和逐条检查的规则结果一致。
@@ -660,10 +670,10 @@ impl RuntimeMatcher {
             },
             config::Matcher::EdnsPresent { expect } => RuntimeMatcher::EdnsPresent { expect },
             config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite {
-                tag: Arc::from(value),
+                tag: geosite_tag(&value),
             },
             config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot {
-                tag: Arc::from(value),
+                tag: geosite_tag(&value),
             },
             config::Matcher::Qtype { value } => RuntimeMatcher::Qtype {
                 value: parse_dns_type(&value)?,
