@@ -819,6 +819,11 @@ struct Live {
     queue: Arc<WriteQueue>,
     generation: u64,
     cancel: CancellationToken,
+    /// 登记在它上面的查询里最晚的期限（毫秒，同 `unix_time_millis`）：用到最长时间摘下以后，过了这一刻才关（见
+    /// [`StreamMuxClient::retire`]）/ The latest deadline of the queries registered on it (ms, as
+    /// `unix_time_millis`): once taken out at its max age, it closes only past this (see
+    /// [`StreamMuxClient::retire`])
+    last_deadline_ms: AtomicU64,
 }
 
 /// 一个上游的一条多路复用连接（TCP 或 DoT）/ One multiplexed connection to an upstream (TCP or DoT)
@@ -885,6 +890,9 @@ pub type DotMuxClient = StreamMuxClient<Dot>;
 
 struct Pending {
     original_id: u16,
+    /// 登记在第几代连接上：拆一代时只让它自己的查询失败 / Which generation of connection it registered on:
+    /// tearing a generation down fails its own queries alone
+    generation: u64,
     /// 写出去的帧（长度前缀加查询），回答到了用来比对问题
     /// The frame that was written (length prefix plus query), for checking the answer's question
     frame: Bytes,
@@ -1024,7 +1032,6 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         cancel_token: CancellationToken,
         my_generation: u64,
     ) {
-        let global_generation = Arc::clone(&self.generation);
         let pending = Arc::clone(&self.pending);
         let upstream = self.upstream.clone();
         let conn = Arc::clone(&self.conn);
@@ -1034,14 +1041,10 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             // Pre-allocate a reusable buffer for reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
             let mut reusable_buf = BytesMut::with_capacity(4096);
+            // 一直读到这一代被取消：复位时马上取消，用到最长时间摘下的等它的查询都到了期限再取消（见 `retire`）
+            // Reading goes on until this generation is cancelled: at once on a reset, and once its
+            // queries have all reached their deadlines when taken out at its max age (see `retire`)
             loop {
-                // Check if this reader is still valid (Zombie Check)
-                // 检查此 reader 是否仍然有效（僵尸检测）
-                if global_generation.load(Ordering::Relaxed) != my_generation {
-                    debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader detected older generation, exiting silently", T::NAME);
-                    return;
-                }
-
                 let mut len_buf = [0u8; 2];
                 // Cancellation: select! interrupts blocked read_exact on reset
                 // 取消机制：select! 在 reset 时中断阻塞的 read_exact
@@ -1218,10 +1221,10 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     upstream = %self.upstream,
                     age_ms = age_ms,
                     max_age_ms = max_age,
-                    "{} connection too old, resetting",
+                    "{} connection too old, replacing it once its queries are done",
                     T::NAME
                 );
-                self.reset(generation).await;
+                self.retire(generation).await;
                 return true;
             }
         }
@@ -1328,8 +1331,16 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // Registration waits for the connection lock, so it is bounded by what is left
         // of the budget too: a query queued behind a long run of registrations used to
         // run far past its own deadline
-        let Ok(registered) =
-            timeout(remaining, self.register_pending(packet, original_id, tx)).await
+        let Ok(registered) = timeout(
+            remaining,
+            self.register_pending(
+                packet,
+                original_id,
+                unix_time_millis() + remaining.as_millis() as u64,
+                tx,
+            ),
+        )
+        .await
         else {
             anyhow::bail!(
                 "{name} timeout waiting to register for upstream {upstream}",
@@ -1506,6 +1517,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 queue,
                 generation: new_gen,
                 cancel: new_token,
+                last_deadline_ms: AtomicU64::new(0),
             });
 
             // 设置连接创建时间
@@ -1527,6 +1539,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         &self,
         packet: &[u8],
         original_id: u16,
+        deadline_ms: u64,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
     ) -> anyhow::Result<(u16, u64)> {
         // Build complete TCP/DoT wire frame (2-byte length prefix + DNS message). The same
@@ -1544,6 +1557,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             anyhow::bail!("connection closed before registration");
         };
         let (queue, generation) = (&live.queue, live.generation);
+        live.last_deadline_ms
+            .fetch_max(deadline_ms, Ordering::AcqRel);
 
         let mut tries = 0;
         let new_id = loop {
@@ -1558,6 +1573,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 let frame = frame.freeze();
                 e.insert(Pending {
                     original_id,
+                    generation,
                     frame: frame.clone(),
                     tx,
                 });
@@ -1620,20 +1636,24 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         generation: u64,
         why: &str,
     ) -> bool {
-        let Some(live) = slot.take_if(|live| live.generation == generation) else {
-            return false;
-        };
-        live.cancel.cancel();
-        // 等着的查询都在这一代上：登记要拿这把锁、要有连接在，而这一代之前的在各自拆的时候清过了
-        // Every waiting query is on this generation: registering takes this lock and needs a
-        // connection, and those before this generation were cleared as theirs was torn down
-        let keys: Vec<u16> = pending.iter().map(|item| *item.key()).collect();
+        let closed = slot.take_if(|live| live.generation == generation);
+        if let Some(live) = &closed {
+            live.cancel.cancel();
+        }
+        // 这一代上的查询都告诉一声：它在不在槽里都一样，用到最长时间摘下的那一代自己断了时也是
+        // Every query on this generation is told, whether or not it is in the slot: a generation
+        // taken out at its max age breaking by itself too
+        let keys: Vec<u16> = pending
+            .iter()
+            .filter(|item| item.generation == generation)
+            .map(|item| *item.key())
+            .collect();
         for key in keys {
-            if let Some((_, p)) = pending.remove(&key) {
+            if let Some((_, p)) = pending.remove_if(&key, |_, p| p.generation == generation) {
                 let _ = p.tx.send(Err(anyhow::anyhow!(why.to_owned())));
             }
         }
-        true
+        closed.is_some()
     }
 
     /// Reset connection: cancel the reader and writer tasks, then drop the write queue and
@@ -1656,6 +1676,31 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     async fn reset(&self, generation: u64) -> bool {
         let why = format!("{} connection reset", T::NAME);
         Self::close(&self.pending, &self.conn, generation, &why).await
+    }
+
+    /// 第 `generation` 代连接用到了最长时间：从槽里摘下，接着来的查询去建新连接；它上面还在等的查询照样收它的回答，
+    /// 最晚的那个期限过了再关。以前到期就复位，在途的查询一起失败，靠透明重试再发一遍
+    /// The connection of `generation` has reached its max age: it is taken out of the slot, and
+    /// queries coming next make a new one; those still waiting on it go on taking its answers,
+    /// and it closes once the latest of their deadlines has passed. It used to be reset on the
+    /// spot, failing the queries in flight together, sent again by the transparent retry
+    async fn retire(&self, generation: u64) {
+        let Some(live) = self
+            .conn
+            .lock()
+            .await
+            .take_if(|live| live.generation == generation)
+        else {
+            return;
+        };
+        let left = live
+            .last_deadline_ms
+            .load(Ordering::Acquire)
+            .saturating_sub(unix_time_millis());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(left)).await;
+            live.cancel.cancel();
+        });
     }
 
     /// 时限已经到了的查询复位连接。连接锁空着就马上复位；被别人拿着时（多半是排着队的登记）不等，
@@ -3780,7 +3825,7 @@ mod tests {
         client.spawn_writer(Broken, queue, token.clone(), 1);
         let (tx, rx) = oneshot::channel();
         client
-            .register_pending(&udp_test_query("broken.example"), 7, tx)
+            .register_pending(&udp_test_query("broken.example"), 7, u64::MAX, tx)
             .await
             .expect("register while connected");
         let answer = tokio::time::timeout(Duration::from_secs(2), rx)
@@ -4915,6 +4960,7 @@ mod tests {
                 id,
                 Pending {
                     original_id: id,
+                    generation: 1,
                     frame: Bytes::new(),
                     tx: oneshot::channel().0,
                 },
@@ -4928,7 +4974,7 @@ mod tests {
                 async move {
                     let dummy = vec![0u8; 4];
                     let (tx, _) = oneshot::channel();
-                    client.register_pending(&dummy, 0, tx).await
+                    client.register_pending(&dummy, 0, u64::MAX, tx).await
                 }
             })
             .collect::<Vec<_>>();
@@ -4957,6 +5003,7 @@ mod tests {
             Arc::new(DashMap::with_hasher(FxBuildHasher));
         let entry = |tx| Pending {
             original_id: 1,
+            generation: 1,
             frame: Bytes::new(),
             tx,
         };
@@ -4999,7 +5046,9 @@ mod tests {
         let register = tokio::spawn(async move {
             let packet = [0u8; 4];
             let (tx, rx) = oneshot::channel();
-            let result = register_client.register_pending(&packet, 0, tx).await;
+            let result = register_client
+                .register_pending(&packet, 0, u64::MAX, tx)
+                .await;
             (result, rx)
         });
         tokio::task::yield_now().await;
@@ -6248,6 +6297,7 @@ mod tests {
             queue,
             generation: 1,
             cancel: CancellationToken::new(),
+            last_deadline_ms: AtomicU64::new(0),
         }
     }
 
@@ -6310,6 +6360,7 @@ mod tests {
                 id,
                 Pending {
                     original_id: id,
+                    generation: 1,
                     frame: Bytes::new(),
                     tx: oneshot::channel().0,
                 },
@@ -6653,6 +6704,47 @@ mod tests {
                 "round {round}: the expired connection is replaced once"
             );
         }
+    }
+
+    /// 连接用到了最长时间：它上面还在等的查询照样在它上面拿到回答，接着的查询走新连接；最晚的期限过了以后旧连接关掉。
+    /// 以前到期就复位，在途的查询一起失败（`send` 的透明重试会再发一遍，`send_attempt` 看得出来）
+    /// A connection reaching its max age: a query still waiting on it gets its answer there, and
+    /// the next query goes over a new one; past the latest deadline the old connection closes. It
+    /// used to be reset on the spot, failing the queries in flight together (sent again by the
+    /// transparent retry of `send`, which `send_attempt` shows)
+    #[tokio::test]
+    async fn a_query_in_flight_outlives_its_connection_reaching_max_age() {
+        let (addr, mut closed) = upstream_noting_closes(None).await;
+        let client = TcpMuxClient::new(Arc::from(addr.to_string()));
+        // 期限短一些：旧连接要等登记在它上面最晚的那个期限 / A short deadline: the old connection waits
+        // for the latest deadline registered on it
+        client
+            .send(&udp_test_query("warm.example"), Duration::from_millis(300))
+            .await
+            .expect("a fresh connection answers");
+        let old = client.generation.load(Ordering::Acquire);
+        let mid = udp_test_query("mid.example");
+        let (waited, ()) = tokio::join!(
+            client.send_attempt(&mid, Duration::from_millis(500)),
+            async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                client.conn_create_time.store(
+                    unix_time_millis() - 2 * StreamHealth::default().max_age_ms,
+                    Ordering::Release,
+                );
+                client.last_health_check_time.store(0, Ordering::Relaxed);
+                client
+                    .send_attempt(&udp_test_query("next.example"), Duration::from_secs(2))
+                    .await
+                    .expect("a new connection answers");
+                assert_eq!(client.generation.load(Ordering::Acquire), old + 1);
+            }
+        );
+        waited.expect("the query on the aged connection is answered on it");
+        tokio::time::timeout(Duration::from_secs(2), closed.recv())
+            .await
+            .expect("the aged connection closes once its last deadline has passed")
+            .expect("a close noted");
     }
 
     /// 拆连接的决定点名一代：点的那一代已经换成新连接时，什么都不动。新连接照常用，等在它上面的查询不受影响，
