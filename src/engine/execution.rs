@@ -1731,7 +1731,7 @@ impl Engine {
                         skip_rules.clear();
                         decision = evaluate(p, None);
                     } else {
-                        warn!("jump target pipeline not found: {}", pipeline);
+                        crate::warn_sparse!(pipeline = %pipeline, "jump target pipeline not found");
                         decision = Decision::Static {
                             rcode: ResponseCode::ServFail,
                             answers: Vec::new(),
@@ -5120,7 +5120,7 @@ mod tests {
             edns: false,
             ecs: None,
         };
-        let looked_up = phases::check_cache(
+        let looked_up = phases::check_cache_logged(
             &engine,
             &phases::CacheLookupContext {
                 flags: crate::proto_utils::QueryFlags::RECURSIVE,
@@ -5136,6 +5136,7 @@ mod tests {
                 requester,
                 observed: None,
             },
+            &mut Default::default(),
         );
         assert!(looked_up.is_none(), "an expired entry is not served");
 
@@ -6038,10 +6039,11 @@ mod tests {
             let state = engine.state.load_full();
             let context = stale_com_lookup(&state, &peer, slot);
             assert_eq!(
-                phases::check_stale_cache(
+                phases::check_stale_cache_logged(
                     &engine,
                     &context,
-                    crate::observe::CacheHitKind::StaleUpstreamFailure
+                    crate::observe::CacheHitKind::StaleUpstreamFailure,
+                    &mut Default::default()
                 )
                 .is_some(),
                 served,
@@ -6053,7 +6055,7 @@ mod tests {
             );
             engine.cache_insert(slot, stale_entry("default"));
             assert_eq!(
-                phases::check_cache(&engine, &context).is_some(),
+                phases::check_cache_logged(&engine, &context, &mut Default::default()).is_some(),
                 served,
                 "expire_ttl {expire_ttl}: the lookup"
             );
@@ -6082,13 +6084,14 @@ mod tests {
                 let state = engine.state.load_full();
                 let context = stale_com_lookup(&state, &peer, slot);
                 let served = if fallback {
-                    phases::check_stale_cache(
+                    phases::check_stale_cache_logged(
                         &engine,
                         &context,
                         crate::observe::CacheHitKind::StaleUpstreamFailure,
+                        &mut Default::default(),
                     )
                 } else {
-                    phases::check_cache(&engine, &context)
+                    phases::check_cache_logged(&engine, &context, &mut Default::default())
                 };
                 assert!(served.is_some(), "reset {reset}, fallback {fallback}");
                 let entry = engine.cached(slot).expect("still cached");
@@ -6145,16 +6148,17 @@ mod tests {
             };
             engine.cache_insert(dedupe_hash, entry.clone());
             assert_eq!(
-                phases::check_stale_cache(
+                phases::check_stale_cache_logged(
                     &engine,
                     &context,
-                    crate::observe::CacheHitKind::StaleUpstreamFailure
+                    crate::observe::CacheHitKind::StaleUpstreamFailure,
+                    &mut Default::default()
                 )
                 .is_some(),
                 served,
                 "{rcode}: the fallback"
             );
-            phases::check_cache(&engine, &context);
+            phases::check_cache_logged(&engine, &context, &mut Default::default());
             assert_eq!(
                 engine.cached(dedupe_hash).is_some(),
                 served,
