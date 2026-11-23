@@ -555,12 +555,13 @@ fn spawn_cert_watcher(cert_path: &str, key_path: &str, acceptor: SharedTlsAccept
     let cert = cert_path.to_string();
     let key = key_path.to_string();
     thread::spawn(move || {
-        let result = watcher::run_files_watcher(&paths, || {
-            if let Some(new_acceptor) =
-                watcher::load_with_retry("DoH TLS certificate", || build_tls_acceptor(&cert, &key))
-            {
+        let result = watcher::run_files_watcher(&paths, || match build_tls_acceptor(&cert, &key) {
+            Ok(new_acceptor) => {
                 acceptor.store(Arc::new(new_acceptor));
                 info!(target = "doh", cert = %cert, key = %key, "DoH TLS certificate reloaded");
+            }
+            Err(err) => {
+                warn!(target = "doh", cert = %cert, key = %key, error = %format!("{err:#}"), "DoH TLS certificate reload failed, keeping the one in use");
             }
         });
         if let Err(err) = result {

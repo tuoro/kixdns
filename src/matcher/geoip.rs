@@ -940,6 +940,19 @@ mod tests {
         assert!(broken.matches_tag("198.51.100.7".parse().unwrap(), "CN"));
 
         convert(r#"{ "entries": [{ "country_code": "JP", "ips": ["198.51.100.0/24"] }] }"#);
+        // 和第一份一样长；修改时间按内核时钟的节拍走，紧接着写的可能和第一份一样（OpenWrt 虚拟机上就是），
+        // 所以写明它晚一秒，像隔了一阵才换上的那样
+        // As long as the first; modification times go by the kernel clock's tick, so one
+        // written right after may match the first's (as on an OpenWrt VM), and it is set a
+        // second later, as for a file replaced a while on
+        let later = std::fs::metadata(&mmdb).unwrap().modified().unwrap()
+            + std::time::Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&mmdb)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
         let mut fixed = GeoIpManager::default();
         assert!(fixed.use_mmdb(&path, &broken));
         assert!(fixed.matches_tag("198.51.100.7".parse().unwrap(), "JP"));
