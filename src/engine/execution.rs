@@ -1104,7 +1104,7 @@ impl Engine {
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, false, None, None, None)
+        self.handle_packet_internal(packet, peer, None, None, None)
             .await
     }
 
@@ -1117,10 +1117,9 @@ impl Engine {
         &self,
         packet: &[u8],
         peer: SocketAddr,
-        skip_cache: bool,
         pre_parsed: PreParsedData,
     ) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, skip_cache, Some(pre_parsed), None, None)
+        self.handle_packet_internal(packet, peer, Some(pre_parsed), None, None)
             .await
     }
 
@@ -1257,34 +1256,27 @@ impl Engine {
         None
     }
 
-    /// Internal handle_packet implementation with skip_cache option
-    /// 内部 handle_packet 实现，支持跳过缓存选项
-    ///
-    /// Design: Background refresh calls this with skip_cache=true to:
-    /// 设计：后台刷新使用 skip_cache=true 调用以：
-    /// 1. Skip cache lookup (avoid returning stale cache)
-    /// 2. Skip cache hit metrics (avoid inflating hit rate)
-    /// 3. Always query upstream (get fresh data)
-    /// 1. 跳过缓存查找（避免返回陈旧缓存）
-    /// 2. 跳过缓存命中指标（避免虚高命中率）
-    /// 3. 始终查询上游（获取最新数据）
+    /// Internal handle_packet implementation / 内部 handle_packet 实现
     ///
     /// pre_parsed: Optional pre-parsed data from handle_packet_fast to avoid re-parsing
     /// pre_parsed: 来自 handle_packet_fast 的可选预解析数据，避免重新解析
     ///
-    /// refresh: for a background refresh, the entry it renews. The refresh writes into
-    /// that entry's slot, the one the original request looked up.
-    /// refresh：后台刷新时，它要更新的条目。刷新写进这个条目的槽位，即原请求查过的那个。
+    /// refresh：后台刷新时它要更新的条目，有它就是后台刷新。刷新不查缓存，总是去问上游；写进这个条目的槽位，即原请求查过
+    /// 的那个；不上报缓存命中、不记应答日志；失败原样交回，由 refresh.rs 记录
+    /// refresh: for a background refresh, the entry it renews, and the request is one exactly
+    /// when it is given. A refresh looks up no cache and always asks upstream; it writes into
+    /// that entry's slot, the one the original request looked up; it reports no cache hit and
+    /// writes no response record; a failure comes back as it is, for refresh.rs to note
     pub(crate) async fn handle_packet_internal(
         &self,
         packet: &[u8],
         peer: SocketAddr,
-        skip_cache: bool,
         pre_parsed: Option<PreParsedData>,
         refresh: Option<RefreshTarget>,
         state_override: Option<Arc<EngineInner>>,
     ) -> anyhow::Result<Bytes> {
         let peer = client_address(peer);
+        let background_refresh = refresh.is_some();
         // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
         let flags = crate::proto_utils::QueryFlags::of(packet);
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
@@ -1395,7 +1387,7 @@ impl Engine {
             peer,
             pipeline_id.clone(),
             start,
-            skip_cache,
+            background_refresh,
         );
 
         // Observer handle for this request: borrows the parsed query and
@@ -1403,12 +1395,6 @@ impl Engine {
         // (listener timeouts drop the future) are reported as well.
         // 本请求的观察者句柄：借用已解析的查询，drop 时上报 request_finished，
         // 因此被取消的请求（监听器超时会丢弃 future）同样会上报。
-        // In this crate only background refresh skips the cache (see the design
-        // note on handle_packet_internal). Both fields below follow this one
-        // flag, so a new use of skip_cache has to decide on it here.
-        // 本 crate 里只有后台刷新跳过缓存（见 handle_packet_internal 的设计说明）。
-        // 下面两个字段都跟着这一个判断；skip_cache 有了新用法，要在这里一起定。
-        let background_refresh = skip_cache;
         let mut observed = self.observer.as_deref().map(|observer| {
             ObservedRequest::new(
                 observer,
@@ -1507,9 +1493,8 @@ impl Engine {
                 keys.slot = target.slot;
             }
 
-            // Background refresh: Skip cache lookup when skip_cache=true
-            // 后台刷新：当 skip_cache=true 时跳过缓存查找
-            if !skip_cache
+            // A background refresh looks up no cache / 后台刷新不查缓存
+            if !background_refresh
                 && let Some(resp_bytes) = self
                     .answer_from_cache(
                         &phases::CacheLookupContext {
@@ -1563,7 +1548,7 @@ impl Engine {
                         qclass,
                         edns_present,
                         skip,
-                        skip_cache,
+                        background_refresh,
                     )
                     .with_observed(observed_ctx),
                 )
@@ -1620,7 +1605,9 @@ impl Engine {
                 };
                 self.drop_refreshed(target.slot, &question, &view, target);
             };
-            let mut refresh_passed_an_answer = false;
+            // 规则已经越过了一个应答（continue，或响应阶段跳走）/ A rule has continued past an answer
+            // (a continue, or a response-phase jump)
+            let mut passed_an_answer = false;
             'decision_loop: loop {
                 while let Decision::Jump { pipeline } = &decision {
                     if jumps_left == 0 {
@@ -1695,7 +1682,7 @@ impl Engine {
                             // looked up as well; so is a request jumping in after a continue: the answer kept for
                             // reuse is dropped at the jump, and the target handles it as on a first pass. Neither
                             // used to look, every request through them asking upstream
-                            if !skip_cache
+                            if !background_refresh
                                 && let Some(resp_bytes) = self
                                     .answer_from_cache(
                                         &phases::CacheLookupContext {
@@ -1746,14 +1733,12 @@ impl Engine {
                         // 不是应答：刷新在往缓存写任何东西之前以失败结束，条目保留。刷新越过
                         // 一个应答之后，其他静态应答取代这条，handle_static_decision 在那里缓存
                         // 应答时会重新写入；上游失败之后的兜底除外。
-                        if rcode == ResponseCode::ServFail
-                            && (refresh.is_some() || refresh_passed_an_answer)
-                        {
+                        if rcode == ResponseCode::ServFail && background_refresh {
                             return Err(phases::refresh_found_no_answer(
                                 "the rules answered SERVFAIL",
                             ));
                         }
-                        if refresh_passed_an_answer && let Some(target) = &refresh {
+                        if passed_an_answer && let Some(target) = &refresh {
                             drop_refreshed(target);
                         }
                         return phases::handle_static_decision(
@@ -1807,7 +1792,6 @@ impl Engine {
                                 start,
                                 peer: &peer,
                                 requester,
-                                skip_cache,
                                 refresh: refresh.as_ref(),
                                 trail: &mut trail,
                                 echo_floor,
@@ -1849,7 +1833,7 @@ impl Engine {
                                 // 只要不是失败（SERVFAIL、截断的应答，或失败时返回的目标旧
                                 // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
                                 // 对不上。
-                                if refresh_passed_an_answer
+                                if passed_an_answer
                                     && let Some(target) = &refresh
                                     && keys.slot != target.slot
                                     && !phases::is_servfail(&bytes)
@@ -1861,7 +1845,7 @@ impl Engine {
                                 return Ok(bytes);
                             }
                             Ok(phases::ForwardResult::Continue { ctx }) => {
-                                refresh_passed_an_answer |= skip_cache;
+                                passed_an_answer = true;
                                 reused_response = *ctx;
                                 skip_rules.extend(rule_index);
 
@@ -1884,7 +1868,7 @@ impl Engine {
                                 // 跳过去以前那次转发的应答就是越过的那个，和 Continue 一样（刷新时上游失败的到不了
                                 // 这里）/ The answer of the forward before the jump is one passed over, as on
                                 // Continue (a refresh whose upstream failed never gets here)
-                                refresh_passed_an_answer |= skip_cache;
+                                passed_an_answer = true;
                                 // 第一次响应阶段的跳转起另算一份次数 / The first response-phase jump starts a budget of its own
                                 if jumped.is_none() {
                                     jumps_left = response_jump_limit;
@@ -1897,7 +1881,7 @@ impl Engine {
                                 // A background refresh answers no client: it gets the
                                 // failure itself, which refresh.rs logs.
                                 // 后台刷新没有要应答的客户端：失败原样交回，由 refresh.rs 记录。
-                                if skip_cache {
+                                if background_refresh {
                                     return Err(e);
                                 }
                                 // A rule continued (response_actions_on_match: [continue])
@@ -1980,7 +1964,7 @@ impl Engine {
         // waiters were handed the reply before this and do the same for their own clients
         // 每个应答都带着它的客户端该看到的 ECS 选项、照客户端写法的照抄部分离开（见
         // `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的处理
-        let result = if skip_cache {
+        let result = if background_refresh {
             result
         } else {
             let at_least = echo_floor.max(trail.echo_scope(&view));
@@ -2267,7 +2251,6 @@ mod tests {
             .handle_packet_internal(
                 &request.to_vec().unwrap(),
                 "127.0.0.1:53000".parse().unwrap(),
-                true,
                 None,
                 Some(engine.refresh_of(old_key)),
                 Some(old_state),
@@ -2358,7 +2341,7 @@ mod tests {
 
         engine.reload(config("new"));
         let answer = engine
-            .handle_packet_internal_with_pre_parsed(&packet, peer, false, pre_parsed)
+            .handle_packet_internal_with_pre_parsed(&packet, peer, pre_parsed)
             .await
             .expect("answered");
         let answer = Message::from_bytes(&answer).expect("parse answer");
@@ -2407,7 +2390,7 @@ mod tests {
         // entry pipeline's rules stay as they were
         engine.reload(jump_config(&upstream.address, "192.0.2.2"));
         let response = engine
-            .handle_packet_internal(&request, peer, false, None, None, Some(old_state))
+            .handle_packet_internal(&request, peer, None, None, Some(old_state))
             .await
             .expect("complete forwarded request with response jump");
         // The jump must execute the target pipeline of the request snapshot
@@ -3422,7 +3405,6 @@ mod tests {
             engine.handle_packet_internal(
                 &example_query(),
                 "10.0.0.1:53000".parse().unwrap(),
-                true,
                 None,
                 Some(engine.refresh_of(key)),
                 None,
@@ -4446,7 +4428,7 @@ mod tests {
                 hickory_proto::rr::DNSClass::IN,
                 false,
                 None,
-                false, // skip_cache
+                false, // background_refresh
             ),
         );
 
@@ -4494,7 +4476,7 @@ mod tests {
                 hickory_proto::rr::DNSClass::IN,
                 false,
                 None,
-                false, // skip_cache
+                false, // background_refresh
             ),
         );
 
@@ -4547,7 +4529,7 @@ mod tests {
                 hickory_proto::rr::DNSClass::IN,
                 false,
                 None,
-                false, // skip_cache
+                false, // background_refresh
             ),
         );
 
@@ -4581,7 +4563,7 @@ mod tests {
                 hickory_proto::rr::DNSClass::IN,
                 false,
                 None,
-                false, // skip_cache
+                false, // background_refresh
             ),
         );
 
@@ -4617,7 +4599,6 @@ mod tests {
         let pre_parsed = engine.handle_packet_internal_with_pre_parsed(
             &packet,
             peer,
-            false,
             engine.pre_parsed("a.test".to_string(), 1, 1, 0, false, Arc::from("main")),
         );
         for (entry, size) in [
@@ -6164,7 +6145,6 @@ mod tests {
             .handle_packet_internal(
                 &stale_com_query(),
                 peer,
-                true,
                 None,
                 Some(engine.refresh_of(cache_hash)),
                 None,

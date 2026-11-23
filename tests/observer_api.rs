@@ -2412,7 +2412,7 @@ async fn failed_and_cancelled_requests_lend_no_response() {
         Arc::from("main"),
     );
     let error = engine
-        .handle_packet_internal_with_pre_parsed(&packet, peer(), false, pre_parsed)
+        .handle_packet_internal_with_pre_parsed(&packet, peer(), pre_parsed)
         .await
         .expect_err("a request the engine cannot parse fails");
     let failed = recorder.outcome(request_id_for(&recorder.events(), "broken.example"));

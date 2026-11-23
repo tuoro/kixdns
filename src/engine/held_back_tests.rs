@@ -712,9 +712,10 @@ async fn a_refresh_is_asked_for_nobody() {
                 .map(|n| {
                     let engine = Arc::clone(&engine);
                     let packet = query(&format!("n{n}.{zone}"));
+                    let refresh = refresh.then(|| engine.refresh_of(0));
                     tokio::spawn(async move {
                         engine
-                            .handle_packet_internal(&packet, device, refresh, None, None, None)
+                            .handle_packet_internal(&packet, device, None, refresh, None)
                             .await
                     })
                 })

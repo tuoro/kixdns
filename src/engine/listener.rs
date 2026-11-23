@@ -47,7 +47,7 @@ impl Engine {
         let answered = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
             match pre_parsed {
                 Some(pre_parsed) => {
-                    self.handle_packet_internal_with_pre_parsed(packet, peer, false, pre_parsed)
+                    self.handle_packet_internal_with_pre_parsed(packet, peer, pre_parsed)
                         .await
                 }
                 None => self.handle_packet(packet, peer).await,

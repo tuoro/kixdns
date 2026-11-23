@@ -146,10 +146,10 @@ pub(crate) fn is_failure_reply(rcode: ResponseCode) -> bool {
 /// 拿回来）：它会替换掉同一个键下缓存的应答，而查缓存时这样的条目不会被当作旧结果返回。
 /// 刷新在这里拿到一个错误，不缓存它，缓存的应答保留。
 pub(crate) fn reject_failure_reply_on_refresh(
-    skip_cache: bool,
+    background_refresh: bool,
     reply: &[u8],
 ) -> anyhow::Result<()> {
-    if !skip_cache {
+    if !background_refresh {
         return Ok(());
     }
     match crate::proto_utils::parse_response_quick(reply).map(|qr| qr.rcode) {
@@ -2326,7 +2326,6 @@ mod refresh_failure_reply_tests {
             engine.handle_packet_internal(
                 &query().to_vec().unwrap(),
                 client,
-                true,
                 None,
                 Some(engine.refresh_of(key)),
                 Some(state),
