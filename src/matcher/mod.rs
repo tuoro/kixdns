@@ -856,6 +856,9 @@ pub struct RuntimeResponseMatcherWithOp {
     pub matcher: RuntimeResponseMatcher,
 }
 
+/// `dashmap_shards` 最多多少 / The most `dashmap_shards` may be
+const MAX_DASHMAP_SHARDS: usize = 1024;
+
 impl RuntimePipelineConfig {
     pub fn from_config(mut cfg: PipelineConfig) -> anyhow::Result<Self> {
         // Validate cache_capacity configuration
@@ -892,9 +895,26 @@ impl RuntimePipelineConfig {
         if cfg.settings.upstream_timeout_ms == 0 {
             anyhow::bail!("upstream_timeout_ms must be greater than 0");
         }
+        // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
+        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多一次就分配掉大量内存
+        // Settings read only at startup are checked against what building the engine needs: a value
+        // the check lets through and the build then fails on is accepted by a hot reload and a panel
+        // save, and the kernel does not start at the next restart. DashMap needs more than one
+        // shard, and too many shards allocate a great deal of memory at once
         let shards = cfg.settings.dashmap_shards;
-        if shards > 0 && !shards.is_power_of_two() {
-            anyhow::bail!("dashmap_shards must be a power of two");
+        if shards != 0 && !(shards.is_power_of_two() && (2..=MAX_DASHMAP_SHARDS).contains(&shards))
+        {
+            anyhow::bail!(
+                "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
+            );
+        }
+        let doq_idle = cfg.settings.doq_connection_idle_timeout_seconds;
+        if doq_idle > 0
+            && quinn::IdleTimeout::try_from(std::time::Duration::from_secs(doq_idle)).is_err()
+        {
+            anyhow::bail!(
+                "doq_connection_idle_timeout_seconds is more than QUIC can carry, got {doq_idle}"
+            );
         }
         if cfg.settings.cache_capacity > 1_000_000 {
             tracing::warn!(
@@ -2727,6 +2747,42 @@ mod tests {
             "cache_refresh_threshold_percent": 99
         })))
         .expect("boundary values must stay valid");
+    }
+
+    /// 只在启动时读的设置，校验放过的值引擎一定建得起来，建不起来的校验就拒掉。以前 `dashmap_shards: 1` 能过校验、
+    /// 热重载和面板保存，到下次启动 DashMap 断言分片数大于 1，内核直接 panic；DoQ 空闲超时写得太大，启动才报错
+    /// Of the settings read only at startup, a value the check lets through always builds an
+    /// engine, and one that cannot is refused by the check. `dashmap_shards: 1` used to pass the
+    /// check, a hot reload and a panel save, and at the next start DashMap's assertion of more
+    /// than one shard panicked the kernel; a DoQ idle timeout too large failed only at startup
+    #[tokio::test]
+    async fn startup_only_settings_the_check_lets_through_build_an_engine() {
+        let build = |settings: serde_json::Value| {
+            RuntimePipelineConfig::from_config(settings_config(settings)).map(|runtime| {
+                crate::engine::Engine::new(runtime, "test".to_string()).expect("engine builds")
+            })
+        };
+        for shards in [0usize, 2, 64, MAX_DASHMAP_SHARDS] {
+            build(serde_json::json!({ "dashmap_shards": shards }))
+                .unwrap_or_else(|error| panic!("dashmap_shards {shards}: {error:#}"));
+        }
+        for shards in [1usize, 3, MAX_DASHMAP_SHARDS * 2] {
+            let refused = build(serde_json::json!({ "dashmap_shards": shards }))
+                .err()
+                .unwrap_or_else(|| panic!("dashmap_shards {shards} must be refused"));
+            assert!(refused.to_string().contains("dashmap_shards"), "{refused}");
+        }
+        build(serde_json::json!({ "doq_connection_idle_timeout_seconds": 86_400 }))
+            .expect("a day of DoQ idle time");
+        let refused = build(serde_json::json!({ "doq_connection_idle_timeout_seconds": u64::MAX }))
+            .err()
+            .expect("more than QUIC can carry");
+        assert!(
+            refused
+                .to_string()
+                .contains("doq_connection_idle_timeout_seconds"),
+            "{refused}"
+        );
     }
 
     #[test]
