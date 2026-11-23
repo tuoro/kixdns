@@ -508,12 +508,12 @@ async fn forward_tcp_udp_dual(
 /// `observed` is the observer context of the request; every attempt and its
 /// result is reported through it. / `observed` 为所属请求的观察者上下文，每次尝试及其结果都经它上报。
 ///
-/// DNS cookie（RFC 7873）只在相邻两跳之间有效，这里两头把关：查询去掉客户端的 cookie 再发出，
-/// 应答去掉 cookie 再交回，于是它既不会进缓存，也不会交给别的客户端。所有发往上游的查询都经过这里。
-/// DNS cookies (RFC 7873) hold between two neighbouring hops only, so both ends are
-/// guarded here: a query goes out without the client's cookie and a reply comes back
-/// without any, so no cookie enters the cache or reaches another client. Every query
-/// for an upstream passes through here.
+/// DNS cookie（RFC 7873）和填充（RFC 7830）只在相邻两跳之间有意义，这里两头把关：查询去掉客户端的 cookie 和
+/// 填充再发出，应答去掉它们再交回，于是它们既不会进缓存，也不会交给别的客户端。所有发往上游的查询都经过这里。
+/// DNS cookies (RFC 7873) and padding (RFC 7830) mean something between two neighbouring
+/// hops only, so both ends are guarded here: a query goes out without the client's cookie
+/// and padding and a reply comes back without any, so neither enters the cache or reaches
+/// another client. Every query for an upstream passes through here.
 ///
 /// 应答交回之前，每条记录的 TTL 收进 `min_ttl..=cache_max_ttl`：客户端留一份应答的时间和缓存一样长。
 /// Before the reply is handed back, the TTL of every record is brought into
@@ -558,10 +558,11 @@ pub async fn forward_upstream(
         _ => None,
     };
     let packet =
-        crate::proto_utils::query_asking_ad(crate::proto_utils::query_without_cookie(packet));
+        crate::proto_utils::query_asking_ad(crate::proto_utils::query_without_hop_options(packet));
     let guarded = |reply| {
-        let reply =
-            crate::proto_utils::reply_without_aa(crate::proto_utils::reply_without_cookie(reply));
+        let reply = crate::proto_utils::reply_without_aa(
+            crate::proto_utils::reply_without_hop_options(reply),
+        );
         // 用当前配置的 min_ttl，而不是请求开始时那份：改 min_ttl 会轮换所有缓存命名空间，一个跨过重载
         // 的应答只会交给它自己的客户端
         // min_ttl comes from the current configuration rather than the request's own:
@@ -669,7 +670,7 @@ pub(crate) fn is_failure_reply_packet(reply: &[u8]) -> bool {
         .is_some_and(|flags| matches!(flags & 0x0f, 2 | 5))
 }
 
-/// [`forward_upstream`] 去掉 cookie 之前的部分 / [`forward_upstream`] short of its cookie guard
+/// [`forward_upstream`] 少了两头把关的部分 / [`forward_upstream`] short of its guards at both ends
 async fn forward_upstream_as_is(
     engine: &Engine,
     packet: &[u8],
@@ -1045,6 +1046,10 @@ fn report_aborted(observed: Observed<'_>, pending: &[(String, Transport, std::ti
 /// 把 `packet` 经 `transport` 发给一个上游，返回应答以及实际带回应答的传输（UDP 查询可能最后走了
 /// TCP；见 [`transport_label`]）。每种传输的收发单独在堆上分配，大小按这种传输来：放在调用方里时，
 /// 等上游的每个查询不管走的是哪种传输，都得按最大的那种（DoT，约 2 KB）预留。
+///
+/// 经加密传输发的查询在这里补齐长度（见 `padded_query`），明文传输上不填充（RFC 7830 第 6 节）
+/// A query over an encrypted transport is padded here (see `padded_query`); one over a
+/// cleartext transport is not (RFC 7830 section 6)
 async fn send_to_upstream(
     engine: &Engine,
     packet: &[u8],
@@ -1053,6 +1058,12 @@ async fn send_to_upstream(
     transport: Transport,
     tcp: UdpTcpFallback,
 ) -> (anyhow::Result<Bytes>, Transport) {
+    let packet: &[u8] = &match transport {
+        Transport::Doh | Transport::Dot | Transport::Doq => {
+            crate::proto_utils::padded_query(packet)
+        }
+        Transport::Udp | Transport::Tcp | Transport::TcpUdp => std::borrow::Cow::Borrowed(packet),
+    };
     match transport {
         Transport::Udp => {
             let r = Box::pin(forward_udp_smart(engine, packet, addr, timeout_dur, tcp)).await;

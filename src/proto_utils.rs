@@ -1215,25 +1215,25 @@ pub(crate) fn without_ecs(reply: Bytes) -> Result<Bytes, Bytes> {
             _ => Err(reply),
         };
     }
-    match without_option(&reply, &opt, 8) {
+    match without_options(&reply, &opt, &[8]) {
         Ok(Some(out)) => Ok(Bytes::from(out)),
         Ok(None) => Ok(reply),
         Err(()) => Err(reply),
     }
 }
 
-/// 去掉 OPT 里代码为 `code` 的选项之后的报文。OPT 必须是最后一条记录（见 `OptRecord::last`）。
-/// 没有这个选项时为 Ok(None)，选项结构不对时为 Err。
-/// The message without the options coded `code` in its OPT, which must be the
+/// 去掉 OPT 里代码在 `codes` 之中的选项之后的报文。OPT 必须是最后一条记录（见 `OptRecord::last`）。
+/// 没有这样的选项时为 Ok(None)，选项结构不对时为 Err。
+/// The message without the options in its OPT coded one of `codes`, the OPT being the
 /// last record (see `OptRecord::last`). Ok(None) when there is no such option,
 /// Err when the options are malformed.
-fn without_option(message: &[u8], opt: &OptRecord, code: u16) -> Result<Option<Vec<u8>>, ()> {
+fn without_options(message: &[u8], opt: &OptRecord, codes: &[u16]) -> Result<Option<Vec<u8>>, ()> {
     debug_assert!(opt.last, "only a last OPT can change its length");
     let mut kept = Vec::new();
     let mut found = false;
     for option in edns_options(message, opt.rdata.clone()) {
         let (option_code, bytes) = option?;
-        if option_code == code {
+        if codes.contains(&option_code) {
             found = true;
         } else {
             kept.push(bytes);
@@ -1256,59 +1256,132 @@ fn without_option(message: &[u8], opt: &OptRecord, code: u16) -> Result<Option<V
 /// RFC 7873 的 COOKIE 选项代码 / The COOKIE option code of RFC 7873
 const COOKIE: u16 = 10;
 
-/// OPT 的 RDATA（在 `rdata`）里有没有代码为 `code` 的选项；选项结构不对时为 false
-/// Whether the OPT RDATA at `rdata` has an option coded `code`; false when the
+/// RFC 7830 的 PADDING 选项代码 / The PADDING option code of RFC 7830
+const PADDING: u16 = 12;
+
+/// 只在相邻两跳之间有意义的选项：cookie 是两跳之间的（RFC 7873），填充的长短按那一跳的传输来，明文传输上
+/// 不许用（RFC 7830 第 6 节）
+/// The options that mean something between two neighbouring hops only: a cookie belongs
+/// between two hops (RFC 7873), and padding is sized for one hop's transport and must not
+/// be used over a cleartext one (RFC 7830 section 6)
+const HOP_BY_HOP: [u16; 2] = [COOKIE, PADDING];
+
+/// OPT 的 RDATA（在 `rdata`）里有没有代码在 `codes` 之中的选项；选项结构不对时为 false
+/// Whether the OPT RDATA at `rdata` has an option coded one of `codes`; false when the
 /// options are malformed
-fn has_option(message: &[u8], rdata: std::ops::Range<usize>, code: u16) -> bool {
+fn has_option(message: &[u8], rdata: std::ops::Range<usize>, codes: &[u16]) -> bool {
     edns_options(message, rdata)
         .map_while(Result::ok)
-        .any(|(option_code, _)| option_code == code)
+        .any(|(option_code, _)| codes.contains(&option_code))
 }
 
-/// 报文去掉 DNS cookie 之后的样子。没有 cookie，或者去不掉（OPT 后面还有记录、最后一条是
-/// TSIG：改了签名就不对了；或者 hickory 读不了）时为 None。
-/// The message without its DNS cookie. None when it has none, or when it cannot
-/// be taken out: records follow the OPT and the last one is a TSIG, which a
-/// change would invalidate, or hickory cannot read the message.
-fn cookie_removed(message: &[u8]) -> Option<Vec<u8>> {
+/// 报文去掉只在两跳之间有意义的选项（[`HOP_BY_HOP`]）之后的样子。没有这些选项，或者去不掉（OPT 后面还有
+/// 记录、最后一条是 TSIG：改了签名就不对了；或者 hickory 读不了）时为 None。
+/// The message without the options meaning something between two hops only (see
+/// [`HOP_BY_HOP`]). None when it has none, or when they cannot be taken out: records
+/// follow the OPT and the last one is a TSIG, which a change would invalidate, or
+/// hickory cannot read the message.
+fn hop_options_removed(message: &[u8]) -> Option<Vec<u8>> {
     let opt = find_opt(message).ok()??;
     if opt.last {
-        return without_option(message, &opt, COOKIE).ok().flatten();
+        return without_options(message, &opt, &HOP_BY_HOP).ok().flatten();
     }
-    // 改 OPT 的长度会挪动它后面的记录（见 `OptRecord::last`），确有 cookie 时交给 hickory 重新编码
+    // 改 OPT 的长度会挪动它后面的记录（见 `OptRecord::last`），确有这些选项时交给 hickory 重新编码
     // Changing the OPT's length would move the records after it (see
-    // `OptRecord::last`), so hickory encodes the message again when a cookie is there
-    if !has_option(message, opt.rdata, COOKIE) || last_record_is_tsig(message) {
+    // `OptRecord::last`), so hickory encodes the message again when such an option is there
+    if !has_option(message, opt.rdata, &HOP_BY_HOP) || last_record_is_tsig(message) {
         return None;
     }
     let mut msg = Message::from_vec(message).ok()?;
-    msg.edns
-        .as_mut()?
-        .options_mut()
-        .remove(hickory_proto::rr::rdata::opt::EdnsCode::Cookie);
+    let options = msg.edns.as_mut()?.options_mut();
+    for code in HOP_BY_HOP {
+        options.remove(hickory_proto::rr::rdata::opt::EdnsCode::from(code));
+    }
     msg.to_vec().ok()
 }
 
-/// 发往上游的查询去掉 DNS cookie。cookie 只在相邻两跳之间有效（RFC 7873）：客户端的
-/// cookie 是它和 KixDNS 之间的，转给上游的话，上游会把它带回来，随应答进缓存，再交给别的
-/// 客户端。没有 cookie 或者去不掉时原样交回（见 `cookie_removed`）。
-/// The query for an upstream without its DNS cookie. A cookie holds between two
-/// neighbouring hops only (RFC 7873): a client's cookie belongs between it and
-/// KixDNS, and forwarded it comes back from the upstream, enters the cache with
-/// the answer and goes to other clients. Handed back as it is when it has none or
-/// the cookie cannot be taken out (see `cookie_removed`).
-pub(crate) fn query_without_cookie(query: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    cookie_removed(query).map_or(std::borrow::Cow::Borrowed(query), std::borrow::Cow::Owned)
+/// 发往上游的查询去掉只在两跳之间有意义的选项。客户端的 cookie 是它和 KixDNS 之间的，转给上游的话，
+/// 上游会把它带回来，随应答进缓存，再交给别的客户端；客户端的填充是按它到 KixDNS 这一跳补的，到上游
+/// 这一跳要么不该填充（明文），要么按这一跳重新补（见 [`padded_query`]）。没有这些选项或者去不掉时原样
+/// 交回（见 `hop_options_removed`）。
+/// The query for an upstream without the options meaning something between two hops
+/// only. A client's cookie belongs between it and KixDNS, and forwarded it comes back
+/// from the upstream, enters the cache with the answer and goes to other clients; a
+/// client's padding was sized for its hop to KixDNS, and the hop to the upstream either
+/// takes none (cleartext) or its own (see [`padded_query`]). Handed back as it is when it
+/// has none or they cannot be taken out (see `hop_options_removed`).
+pub(crate) fn query_without_hop_options(query: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    hop_options_removed(query).map_or(std::borrow::Cow::Borrowed(query), std::borrow::Cow::Owned)
 }
 
-/// 上游应答去掉 DNS cookie。KixDNS 不发也不核对自己的 cookie，应答里的 cookie 只可能是上游
-/// 自己塞的（查询已经不带了），不该进缓存、也不该交给客户端。去不掉时原样交回。
-/// An upstream reply without its DNS cookie. KixDNS neither sends nor checks a
-/// cookie of its own, so one in a reply can only be the upstream's own addition
-/// (queries no longer carry any), which belongs neither in the cache nor in a
-/// client's reply. Handed back as it is when it cannot be taken out.
-pub(crate) fn reply_without_cookie(reply: Bytes) -> Bytes {
-    cookie_removed(&reply).map_or(reply, Bytes::from)
+/// 上游应答去掉只在两跳之间有意义的选项。KixDNS 不发也不核对自己的 cookie，应答里的 cookie 只可能是
+/// 上游自己塞的（查询已经不带了）；上游的填充是按它到 KixDNS 这一跳补的，应答进了缓存会经明文传输交给
+/// 客户端。两样都不该进缓存、也不该交给客户端。去不掉时原样交回。
+/// An upstream reply without the options meaning something between two hops only.
+/// KixDNS neither sends nor checks a cookie of its own, so one in a reply can only be the
+/// upstream's own addition (queries no longer carry any); the upstream's padding was sized
+/// for its hop to KixDNS, and a cached reply goes to clients over cleartext transports.
+/// Neither belongs in the cache or in a client's reply. Handed back as it is when they
+/// cannot be taken out.
+pub(crate) fn reply_without_hop_options(reply: Bytes) -> Bytes {
+    hop_options_removed(&reply).map_or(reply, Bytes::from)
+}
+
+/// 加密传输上的查询补齐到的块长（RFC 8467 第 4.1 节）/ The block length a query over an encrypted
+/// transport is padded to (RFC 8467 section 4.1)
+const QUERY_BLOCK: usize = 128;
+
+/// 经加密传输（DoT、DoH、DoQ）发往上游的查询：OPT 的末尾加一个全是零的 PADDING 选项（RFC 7830），整个
+/// 查询补到 [`QUERY_BLOCK`] 的整数倍（RFC 8467 第 4.1 节），密文的长度就看不出问的是什么。没有 OPT 的
+/// 查询补一条带这个选项的 OPT：RFC 9250 第 5.4 节要求 DoQ 的每个查询都填充，上游也只给带 EDNS 的查询填充
+/// 应答（RFC 7830 第 4 节）。签过名的、OPT 后面还有记录的（见 `OptRecord::last`）、读不出的和补了就超过
+/// 65535 字节的查询原样交回。查询里原有的填充已经去掉了（见 [`query_without_hop_options`]）
+/// A query for an upstream over an encrypted transport (DoT, DoH, DoQ): a PADDING option of
+/// zeros (RFC 7830) ends its OPT, bringing the whole query to a multiple of [`QUERY_BLOCK`]
+/// (RFC 8467 section 4.1), so the length of the ciphertext does not tell what is asked. A
+/// query without an OPT gets one carrying the option: RFC 9250 section 5.4 has every DoQ
+/// query padded, and an upstream pads its reply only to a query with EDNS (RFC 7830
+/// section 4). A signed query, one with records after its OPT (see `OptRecord::last`), one
+/// that cannot be read and one that padding would take past 65535 bytes are handed back as
+/// they are. Any padding the query had is already gone (see [`query_without_hop_options`])
+pub(crate) fn padded_query(query: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    padding_added(query).map_or(std::borrow::Cow::Borrowed(query), std::borrow::Cow::Owned)
+}
+
+/// [`padded_query`] 补好的查询；原样交回时为 None / The query [`padded_query`] pads; None when it
+/// is handed back as it is
+fn padding_added(query: &[u8]) -> Option<Vec<u8>> {
+    let walk = walk_records(query);
+    if walk.last_is_tsig {
+        return None;
+    }
+    // 填充选项接在最后一条记录 OPT 的末尾；没有 OPT 时末尾补一条空的，它的 RDLENGTH 是最后两个字节
+    // The padding option goes at the end of the OPT as the last record; without an OPT an
+    // empty one is appended, its RDLENGTH being the last two bytes
+    let (mut out, rdlen_at) = match walk.opt.ok()? {
+        Some(opt) if opt.last => {
+            let mut out = Vec::with_capacity(opt.rdata.end + 4 + QUERY_BLOCK);
+            out.extend_from_slice(&query[..opt.rdata.end]);
+            (out, opt.rdlen_at)
+        }
+        Some(_) => return None,
+        None => {
+            let out = with_opt(query, false, &[])?;
+            let rdlen_at = out.len() - 2;
+            (out, rdlen_at)
+        }
+    };
+    let padded = (out.len() + 4).next_multiple_of(QUERY_BLOCK);
+    if padded > usize::from(u16::MAX) {
+        return None;
+    }
+    let pad = padded - out.len() - 4;
+    let rd_len = u16::from_be_bytes([out[rdlen_at], out[rdlen_at + 1]]) + 4 + pad as u16;
+    out[rdlen_at..rdlen_at + 2].copy_from_slice(&rd_len.to_be_bytes());
+    out.extend_from_slice(&PADDING.to_be_bytes());
+    out.extend_from_slice(&(pad as u16).to_be_bytes());
+    out.resize(padded, 0);
+    Some(out)
 }
 
 /// 给缓存里的应答换上回显客户端自己 ECS 的选项，作用范围为 `scope`（RFC 7871 第 7.2.2 节：
@@ -3885,16 +3958,22 @@ mod tests {
         #[test]
         fn a_message_without_a_cookie_is_handed_back_untouched() {
             for packet in [query(false, false), query(false, true)] {
-                assert!(matches!(query_without_cookie(&packet), Cow::Borrowed(_)));
+                assert!(matches!(
+                    query_without_hop_options(&packet),
+                    Cow::Borrowed(_)
+                ));
                 let reply = Bytes::from(packet);
-                assert_eq!(reply_without_cookie(reply.clone()).as_ptr(), reply.as_ptr());
+                assert_eq!(
+                    reply_without_hop_options(reply.clone()).as_ptr(),
+                    reply.as_ptr()
+                );
             }
         }
 
         #[test]
         fn the_cookie_is_taken_out_and_the_other_options_kept() {
             let packet = query(true, true);
-            let stripped = query_without_cookie(&packet);
+            let stripped = query_without_hop_options(&packet);
             assert!(!has_cookie(&stripped));
             assert_eq!(
                 stripped.len(),
@@ -3906,7 +3985,7 @@ mod tests {
             assert!(edns.options().get(EdnsCode::Subnet).is_some(), "ECS stays");
             assert_eq!(edns.max_payload(), 1232);
             // 只有 cookie 一个选项时，OPT 留下，选项为空 / With the cookie alone, the OPT stays empty
-            let alone = query_without_cookie(&query(true, false)).into_owned();
+            let alone = query_without_hop_options(&query(true, false)).into_owned();
             assert!(!has_cookie(&alone));
             assert!(Message::from_vec(&alone).unwrap().edns.is_some());
         }
@@ -3922,7 +4001,7 @@ mod tests {
             packet.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7]);
             packet[11] += 1;
             assert!(has_cookie(&packet));
-            let stripped = reply_without_cookie(Bytes::from(packet));
+            let stripped = reply_without_hop_options(Bytes::from(packet));
             assert!(!has_cookie(&stripped));
             assert_eq!(
                 Message::from_vec(&stripped).unwrap().additionals.len(),
@@ -3937,7 +4016,77 @@ mod tests {
         fn a_cookie_before_a_tsig_is_left_alone() {
             let mut packet = query(true, false);
             super::push_bare_tsig(&mut packet);
-            assert!(matches!(query_without_cookie(&packet), Cow::Borrowed(_)));
+            assert!(matches!(
+                query_without_hop_options(&packet),
+                Cow::Borrowed(_)
+            ));
+        }
+    }
+
+    mod padding_wire {
+        use super::super::*;
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+        use hickory_proto::rr::{Name, RecordType};
+        use std::borrow::Cow;
+
+        /// 问 `name` 的 A 记录；`option` 为 Some 时带 EDNS 和这个长的未知选项，None 时 EDNS 也不带
+        /// An A query for `name`; with EDNS and an unknown option this long for Some, no EDNS at
+        /// all for None
+        fn query(name: &str, option: Option<usize>) -> Vec<u8> {
+            let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
+            msg.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+            if let Some(len) = option {
+                let mut edns = Edns::new();
+                edns.options_mut()
+                    .insert(EdnsOption::Unknown(65001, vec![7; len]));
+                msg.edns = Some(edns);
+            }
+            msg.to_vec().unwrap()
+        }
+
+        /// 名字越来越长，补到的长度跨过几个块，有的正好不用补字节：每次都补到下一个 128 的整数倍，原有的选项
+        /// 留在前面，填充排在最后、全是零；没有 OPT 的查询补一条 DO 位为零的 OPT
+        /// With ever longer names the padded length crosses several blocks, some needing no
+        /// padding bytes at all: each is padded to the next multiple of 128, the option already
+        /// there stays ahead, the padding comes last and is all zeros; a query without an OPT
+        /// gets one with the DO bit clear
+        #[test]
+        fn a_query_is_padded_to_the_next_multiple_of_128() {
+            for labels in 1..40 {
+                let name = format!("{}example.", "a.".repeat(labels));
+                for option in [None, Some(3)] {
+                    let packet = query(&name, option);
+                    let padded = padded_query(&packet);
+                    assert_eq!(padded.len() % QUERY_BLOCK, 0, "{name} {option:?}");
+                    let room = if option.is_some() { 4 } else { 15 };
+                    assert!(padded.len() - packet.len() < QUERY_BLOCK + room);
+                    let msg = Message::from_vec(&padded).expect("still a valid message");
+                    let edns = msg.edns.expect("an OPT");
+                    assert!(!edns.flags().dnssec_ok);
+                    let options = &edns.options().options;
+                    assert_eq!(options.len(), 1 + usize::from(option.is_some()));
+                    match options.last() {
+                        Some((EdnsCode::Padding, EdnsOption::Unknown(_, zeros))) => {
+                            assert!(zeros.iter().all(|&byte| byte == 0))
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+        }
+
+        /// 签过名的查询不补：改了签名就不对了；补了就超过 65535 字节的也不补
+        /// A signed query is not padded, as any change would break the signature; nor is one
+        /// padding would take past 65535 bytes
+        #[test]
+        fn a_query_padding_would_break_is_sent_as_it_is() {
+            let mut signed = query("example.", Some(3));
+            super::push_bare_tsig(&mut signed);
+            assert!(matches!(padded_query(&signed), Cow::Borrowed(_)));
+            let long = query("example.", Some(65_440));
+            assert!(long.len() > 65_408);
+            assert!(matches!(padded_query(&long), Cow::Borrowed(_)));
         }
     }
 }
