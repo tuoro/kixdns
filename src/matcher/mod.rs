@@ -17,6 +17,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use anyhow::Context;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
@@ -404,23 +405,39 @@ pub struct RuntimePipelineSelectorMatcherWithOp {
 
 /// `dashmap_shards` 最多多少 / The most `dashmap_shards` may be
 impl RuntimePipelineConfig {
+    /// 把一份配置编译成运行时的样子，转发时要用的都在这里先算好，只算这一遍：拆好的上游、几个 forward 合成的一次转发。
+    /// 编译不了的匹配器连同它的位置报出来，写成 `pipelines[0].rules[2].matchers[1]` 这样的路径，和读不懂的键一样
+    /// Compiles a configuration into its runtime form, working out here, once, what forwarding
+    /// needs: the upstreams split and the one forward several forwards merge into. A matcher
+    /// that cannot be compiled is reported with its place, a path like
+    /// `pipelines[0].rules[2].matchers[1]` as for the keys not read
     pub fn from_config(mut cfg: PipelineConfig) -> anyhow::Result<Self> {
         cfg.settings.validate()?;
         let warnings = config::warnings(&cfg);
+        // 默认上游有几个时同时问 / Several default upstreams are asked at once
+        cfg.settings.pre_split_default_upstream();
 
         let mut pipelines = Vec::new();
         // What each pipeline's rules tell requesters apart by / 每个 pipeline 的规则区分请求方的依据
         let mut reads = Vec::new();
-        for p in cfg.pipelines {
+        for (i, p) in cfg.pipelines.into_iter().enumerate() {
             let mut rules = Vec::new();
-            for r in p.rules {
+            for (j, mut r) in p.rules.into_iter().enumerate() {
+                // Pre-compute merged Forward upstreams for multi-Forward rules (performance optimization).
+                // Eliminates per-request FxHashSet + format! + join overhead on the hot path.
+                // 预计算多 Forward 规则的合并上游（性能优化）。
+                // 消除热路径上每请求的 FxHashSet + format! + join 开销。
+                r.compute_merged_forward();
                 let mut matchers = r
                     .matchers
                     .into_iter()
-                    .map(|m| {
+                    .enumerate()
+                    .map(|(k, m)| {
                         Ok(RuntimeMatcherWithOp {
                             operator: m.operator,
-                            matcher: RuntimeMatcher::from_config(m.matcher)?,
+                            matcher: RuntimeMatcher::from_config(m.matcher).with_context(|| {
+                                format!("pipelines[{i}].rules[{j}].matchers[{k}]")
+                            })?,
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -429,10 +446,13 @@ impl RuntimePipelineConfig {
                 let mut response_matchers = r
                     .response_matchers
                     .into_iter()
-                    .map(|rm| {
+                    .enumerate()
+                    .map(|(k, rm)| {
                         Ok(RuntimeResponseMatcherWithOp {
                             operator: rm.operator,
-                            matcher: RuntimeResponseMatcher::from_config(rm.matcher)?,
+                            matcher: RuntimeResponseMatcher::from_config(rm.matcher).with_context(
+                                || format!("pipelines[{i}].rules[{j}].response_matchers[{k}]"),
+                            )?,
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -487,14 +507,16 @@ impl RuntimePipelineConfig {
         }
 
         let mut pipeline_select = Vec::new();
-        for s in cfg.pipeline_select {
+        for (i, s) in cfg.pipeline_select.into_iter().enumerate() {
             let mut matchers = s
                 .matchers
                 .into_iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(k, m)| {
                     Ok(RuntimePipelineSelectorMatcherWithOp {
                         operator: m.operator,
-                        matcher: RuntimePipelineSelectorMatcher::from_config(m.matcher)?,
+                        matcher: RuntimePipelineSelectorMatcher::from_config(m.matcher)
+                            .with_context(|| format!("pipeline_select[{i}].matchers[{k}]"))?,
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -619,7 +641,7 @@ pub(crate) const MAX_REGEX_LEN: usize = 16 * 1024;
 
 /// 逗号分隔的 CIDR 列表，空项跳过，每项按 [`canonical_net`] 读
 /// A comma-separated CIDR list, empty items skipped, each read by [`canonical_net`]
-fn cidr_list(cidr: &str) -> Result<Vec<IpNet>, ipnet::AddrParseError> {
+fn cidr_list(cidr: &str) -> anyhow::Result<Vec<IpNet>> {
     cidr.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -627,17 +649,19 @@ fn cidr_list(cidr: &str) -> Result<Vec<IpNet>, ipnet::AddrParseError> {
         .collect()
 }
 
-/// 规则里写的网段。匹配器看到的地址都是规范的：双栈套接字上的 IPv4 客户端按 IPv4 地址看（见 engine/execution.rs
-/// 的 `client_address`），回答和作答上游里 IPv4 映射形式的地址也按它所指的 IPv4 地址看（见 `matcher_helpers`），
-/// 所以写成 IPv4 映射形式的网段（`::ffff:a.b.c.d/n`，n 不小于 96）换成它所指的 IPv4 网段。
-/// A network a rule writes. The addresses matchers see are canonical: an IPv4 client on a
-/// dual-stack socket is seen by its IPv4 address (see `client_address` in
-/// engine/execution.rs), and an IPv4-mapped address in an answer or of the answering
-/// upstream by the IPv4 address it names (see `matcher_helpers`), so a network written in
-/// the IPv4-mapped form (`::ffff:a.b.c.d/n`, n of 96 or more) becomes the IPv4 network it
-/// names.
-fn canonical_net(cidr: &str) -> Result<IpNet, ipnet::AddrParseError> {
-    let net: IpNet = cidr.parse()?;
+/// 规则里写的网段，写错时报出写的是什么。匹配器看到的地址都是规范的：双栈套接字上的 IPv4 客户端按 IPv4 地址看（见
+/// engine/execution.rs 的 `client_address`），回答和作答上游里 IPv4 映射形式的地址也按它所指的 IPv4 地址看（见
+/// `matcher_helpers`），所以写成 IPv4 映射形式的网段（`::ffff:a.b.c.d/n`，n 不小于 96）换成它所指的 IPv4 网段。
+/// A network a rule writes, naming what was written when it is mistyped. The addresses
+/// matchers see are canonical: an IPv4 client on a dual-stack socket is seen by its IPv4
+/// address (see `client_address` in engine/execution.rs), and an IPv4-mapped address in an
+/// answer or of the answering upstream by the IPv4 address it names (see `matcher_helpers`),
+/// so a network written in the IPv4-mapped form (`::ffff:a.b.c.d/n`, n of 96 or more)
+/// becomes the IPv4 network it names.
+fn canonical_net(cidr: &str) -> anyhow::Result<IpNet> {
+    let net: IpNet = cidr
+        .parse()
+        .with_context(|| format!("\"{cidr}\" is not an IP network"))?;
     if let IpNet::V6(v6) = net
         && let Some(v4) = v6.network().to_ipv4_mapped()
         && let Some(prefix) = v6.prefix_len().checked_sub(96)
