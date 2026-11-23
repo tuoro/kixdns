@@ -19,6 +19,7 @@ use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
 use parking_lot::RwLock;
 
+use super::bootstrap::Bootstrap;
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheRecord};
 use super::transport::{DohClient, DoqClient, DotMultiplexer, TcpMultiplexer, UdpClient};
@@ -208,10 +209,21 @@ impl Engine {
         // Collect TCP upstreams for warmup / 收集 TCP upstream 用于预热
         let tcp_upstreams = state.load().pipeline.collect_tcp_upstreams();
 
+        let udp_client =
+            Arc::new(UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?);
+        // 上游的主机名经 bootstrap 的服务器解析，用的是上面这个 UDP 客户端 / Upstream host names are
+        // resolved through the bootstrap servers, by the UDP client above
+        let bootstrap = Bootstrap::new(
+            &settings.bootstrap,
+            Arc::clone(&udp_client),
+            std::time::Duration::from_millis(settings.upstream_timeout_ms),
+        );
+
         let tcp_mux = Arc::new(TcpMultiplexer::new(
             settings.tcp_pool_size,
             settings.tcp_connection_max_age_seconds,
             settings.tcp_connection_idle_timeout_seconds,
+            Arc::clone(&bootstrap),
         ));
 
         let dot_mux = Arc::new(
@@ -219,6 +231,7 @@ impl Engine {
                 settings.dot_pool_size,
                 settings.tcp_connection_max_age_seconds,
                 settings.tcp_connection_idle_timeout_seconds,
+                Arc::clone(&bootstrap),
             )
             .context("initialize DoT multiplexer")?,
         );
@@ -227,6 +240,7 @@ impl Engine {
             DohClient::new(
                 settings.doh_pool_size,
                 settings.doh_health_check_error_threshold,
+                Arc::clone(&bootstrap),
             )
             .context("initialize DoH client")?,
         );
@@ -236,6 +250,7 @@ impl Engine {
                 settings.doq_connection_idle_timeout_seconds,
                 settings.doq_keepalive_interval_ms,
                 settings.doq_enable_0rtt,
+                bootstrap,
             )
             .context("initialize DoQ client")?,
         );
@@ -248,9 +263,7 @@ impl Engine {
             state,
             cache_max_ttl: settings.cache_max_ttl,
             cache,
-            udp_client: Arc::new(
-                UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?,
-            ),
+            udp_client,
             tcp_mux,
             doh_client,
             dot_mux,

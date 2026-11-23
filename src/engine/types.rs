@@ -515,6 +515,7 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         doq_connection_idle_timeout_seconds: _,
         doq_keepalive_interval_ms: _,
         doq_enable_0rtt: _,
+        bootstrap: _,
         flow_control_enabled: _,
         // No longer have any effect (see `GlobalSettings`), so they leave the caches alone
         // 已不起作用（见 `GlobalSettings`），不让缓存换代
@@ -866,13 +867,14 @@ mod tests {
         settings.doq_connection_idle_timeout_seconds += 1;
         settings.doq_keepalive_interval_ms += 1;
         settings.doq_enable_0rtt = !settings.doq_enable_0rtt;
+        settings.bootstrap = "192.0.2.53:53".into();
         settings.flow_control_enabled = !settings.flow_control_enabled;
         assert_eq!(
             after_config
                 .settings
                 .restart_pending(&before_config.settings)
                 .len(),
-            21,
+            22,
             "every setting read at startup changed"
         );
         let before = build_cache_namespaces(&before_config);
