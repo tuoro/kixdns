@@ -304,13 +304,8 @@ fn not_globally_routable(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, c, _] = v4.octets();
-            // 「本网络」0.0.0.0/8（RFC 791），0.0.0.0 也在里面：它不是哪台主机的地址；geoip_private 那边不算
-            // （见 `matcher::geoip::is_private_ip`）
-            // "This network" 0.0.0.0/8 (RFC 791), 0.0.0.0 included: it is no host's
-            // address; geoip_private does not count it (see `matcher::geoip::is_private_ip`)
-            a == 0
-                // 运营商级 NAT 共享地址 100.64.0.0/10 / Shared address space 100.64.0.0/10 (RFC 6598)
-                || (a == 100 && (b & 0xC0) == 64)
+            // 运营商级 NAT 共享地址 100.64.0.0/10 / Shared address space 100.64.0.0/10 (RFC 6598)
+            (a == 100 && (b & 0xC0) == 64)
                 // IETF 协议分配 192.0.0.0/24 / IETF protocol assignments 192.0.0.0/24 (RFC 6890)
                 || (a == 192 && b == 0 && c == 0)
                 // 基准测试 198.18.0.0/15 / Benchmarking 198.18.0.0/15 (RFC 2544)
