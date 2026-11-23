@@ -181,3 +181,36 @@ async fn the_compiled_index_misses_no_rule_that_matches() {
     // 规则真有命中，这个检查才有意义 / The check means something only if rules do match
     assert!(matched > 1000, "{matched}");
 }
+
+/// 「且」连起来的规则记在最挑的那个条件下：先看精确的名字，再看后缀，最后看类型，和条件写的先后无关。以前记在第一个能记的
+/// 条件下，「qtype A 且后缀 ads.example」的规则每个 A 查询都是候选
+/// A rule joined by "and" is filed under its most selective condition, an exact name first, then
+/// a suffix, then a type, whatever order the conditions are written in. It used to be filed under
+/// the first condition that could be, and a rule "qtype A and suffix ads.example" was a candidate
+/// for every A query
+#[test]
+fn a_rule_is_filed_under_its_most_selective_condition() {
+    let rule = |name: &str, matchers: Value| json!({ "name": name, "matchers": matchers, "actions": [{ "type": "deny" }] });
+    let config = serde_json::from_value(json!({
+        "settings": { "default_upstream": "127.0.0.1:9" },
+        "pipelines": [{ "id": "main", "rules": [
+            rule("suffix", json!([
+                { "type": "qtype", "value": "A" },
+                { "type": "domain_suffix", "value": "ads.example" }
+            ])),
+            rule("exact", json!([
+                { "type": "qtype", "value": "A" },
+                { "type": "domain_suffix", "value": "example" },
+                { "type": "domain_exact", "value": "x.example" }
+            ]))
+        ]}]
+    }))
+    .expect("parse config");
+    let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
+    let index = &compile_pipelines(&runtime)[0].index;
+    let candidates = |name: &str| index.get_candidates(name, RecordType::A).to_vec();
+    assert_eq!(candidates("other.test"), Vec::<usize>::new());
+    assert_eq!(candidates("y.example"), Vec::<usize>::new());
+    assert_eq!(candidates("a.ads.example"), [0]);
+    assert_eq!(candidates("x.example"), [1]);
+}

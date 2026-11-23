@@ -29,6 +29,7 @@ use crate::observe::{
 use crate::proto_utils::parse_quick;
 
 use super::concurrency::PermitGuard;
+use super::matcher_adapter::MatcherContext;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
 use super::response::{StaticAddresses, build_fast_static_response, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
@@ -855,6 +856,18 @@ impl Engine {
             ecs: q.client_subnet,
         };
         let view = requester.ecs_view();
+        // 编译规则照完整路径的样子求值，GeoIP、GeoSite 数据一样读（见 `CompiledRule::matchers`）
+        // The compiled rules are evaluated as on the full path, reading the GeoIP and GeoSite data
+        // alike (see `CompiledRule::matchers`)
+        let query = MatcherContext {
+            qname: qname_str,
+            qclass,
+            client_ip: peer.ip(),
+            edns_present: q.edns_present,
+            qtype,
+            geoip_manager: Some(&self.geoip_manager),
+            geosite_manager: Some(&self.geosite_manager),
+        };
         // 第一条命中的规则或规则缓存给的是跳转时，和完整路径一样跟过去（见 `decide`），按目标的键再查一遍，至多跳
         // response_jump_limit 次；再要跳的、目标不存在的交给完整路径，由它回 SERVFAIL。走过的跳转在答上时照完整路径的
         // 样子上报
@@ -1042,107 +1055,104 @@ impl Engine {
                 finish_static(built, answer)
             };
 
-            // 2. Compiled rule fast-path: what the first rule matching decides on the spot
-            // 2. 编译规则的快速路径：第一条命中的规则当场作出的决定
-            let matched = self.compiled_for(&state, pipeline_id).and_then(|compiled| {
-                fast_static_match_with_rule(
-                    compiled,
+            // 2. 规则缓存（L1）：和完整路径一样先看规则缓存（见 `apply_rules`），存着决定的不必再求值规则。以前快速路径
+            // 先把编译规则求值一遍，存着的是转发时那一遍白算
+            // 2. Check Rule Cache (L1): the rule cache comes first, as on the full path (see
+            // `apply_rules`), and a decision kept there needs no rules evaluated. The fast path
+            // used to evaluate the compiled rules first, for nothing when a forward was kept
+            let cached = pipeline.and_then(|p| {
+                let rule_requester = p.rule_requester.key(requester, Some(&self.geoip_manager));
+                let rule_hash = crate::engine::rules::calculate_rule_hash(
+                    cache_namespace,
+                    pipeline_id,
                     qname_str,
                     qtype,
                     qclass,
-                    peer.ip(),
-                    q.edns_present,
-                    Some(&self.geoip_manager),
-                )
-            });
-            let (next, hop) = match matched {
-                Some((PrecomputedAction::Jump(target), rule)) => (
-                    cfg.pipeline(target),
-                    Hop::Rule {
-                        pipeline: pipeline_id,
-                        rule,
-                        target,
-                    },
-                ),
-                Some((PrecomputedAction::Answer(action), rule_name)) => {
-                    // 规则按配置直接答的不做记录，写不了的才走下面 / What a rule answers straight from the config
-                    // makes no records; only what cannot be written goes on below
-                    let direct = match action {
-                        PrecomputedAnswer::Static { rcode } => {
-                            Some((*rcode, StaticAddresses::Configured(&[], qtype)))
-                        }
-                        PrecomputedAnswer::StaticIp {
-                            addresses: Some(addresses),
-                            ..
-                        } => Some((
-                            ResponseCode::NoError,
-                            StaticAddresses::Configured(addresses, qtype),
-                        )),
-                        _ => None,
-                    };
-                    if let Some((rcode, addresses)) = direct
-                        && let Some(reply) = write_static_reply(packet, rcode, addresses)
-                    {
-                        let answers = usize::from(u16::from_be_bytes([reply[6], reply[7]]));
-                        let answer = FastPathAnswer::StaticRule {
-                            rule: rule_name,
-                            rcode,
-                            answers,
-                        };
-                        let reply = shaped_static_reply(reply, packet, q.client_subnet.as_ref());
-                        return finish_static(Ok(reply), answer);
-                    }
-                    let (rcode, answers) = action.records(qname_str, qtype, qclass);
-                    let answer = FastPathAnswer::StaticRule {
-                        rule: rule_name,
-                        rcode,
-                        answers: answers.len(),
-                    };
-                    return answer_static(rcode, &answers, answer);
-                }
-                None => {
-                    // 3. Check Rule Cache (L1) / 3. 检查规则缓存（L1）
-                    // Zero-allocation lookup using hash / 使用哈希的零分配查找
-                    let Some(p) = pipeline else { break };
-                    let rule_requester = p.rule_requester.key(requester, Some(&self.geoip_manager));
-                    let rule_hash = crate::engine::rules::calculate_rule_hash(
-                        cache_namespace,
+                    &rule_requester,
+                );
+                // 过期的这里不去掉，见 `apply_rules` / An expired entry is not removed here, see `apply_rules`
+                self.rule_cache.get(rule_hash).filter(|record| {
+                    record.entry.matches_at(
+                        start,
                         pipeline_id,
                         qname_str,
                         qtype,
                         qclass,
                         &rule_requester,
-                    );
-                    // 过期的这里不去掉，见 `apply_rules` / An expired entry is not removed here, see `apply_rules`
-                    let Some(record) = self.rule_cache.get(rule_hash).filter(|record| {
-                        record.entry.matches_at(
-                            start,
-                            pipeline_id,
-                            qname_str,
-                            qtype,
-                            qclass,
-                            &rule_requester,
-                        )
-                    }) else {
-                        break;
-                    };
-                    match &record.entry.decision {
-                        Decision::Static { rcode, answers } => {
-                            return answer_static(
-                                *rcode,
-                                answers,
-                                FastPathAnswer::CachedRules { record: &record },
-                            );
-                        }
-                        Decision::Jump { pipeline: target } => (
-                            cfg.pipeline(target),
-                            Hop::CachedRules {
-                                pipeline: pipeline_id,
-                                record,
-                            },
-                        ),
-                        Decision::Forward { .. } => break,
+                    )
+                })
+            });
+            let (next, hop) = if let Some(record) = cached {
+                match &record.entry.decision {
+                    Decision::Static { rcode, answers } => {
+                        return answer_static(
+                            *rcode,
+                            answers,
+                            FastPathAnswer::CachedRules { record: &record },
+                        );
                     }
+                    Decision::Jump { pipeline: target } => (
+                        cfg.pipeline(target),
+                        Hop::CachedRules {
+                            pipeline: pipeline_id,
+                            record,
+                        },
+                    ),
+                    Decision::Forward { .. } => break,
+                }
+            } else {
+                // 3. 编译规则：第一条命中的规则当场作出的决定
+                // 3. Compiled rules: what the first rule matching decides on the spot
+                let matched = self
+                    .compiled_for(&state, pipeline_id)
+                    .and_then(|compiled| fast_static_match_with_rule(compiled, &query));
+                match matched {
+                    Some((PrecomputedAction::Jump(target), rule)) => (
+                        cfg.pipeline(target),
+                        Hop::Rule {
+                            pipeline: pipeline_id,
+                            rule,
+                            target,
+                        },
+                    ),
+                    Some((PrecomputedAction::Answer(action), rule_name)) => {
+                        // 规则按配置直接答的不做记录，写不了的才走下面 / What a rule answers straight from the config
+                        // makes no records; only what cannot be written goes on below
+                        let direct = match action {
+                            PrecomputedAnswer::Static { rcode } => {
+                                Some((*rcode, StaticAddresses::Configured(&[], qtype)))
+                            }
+                            PrecomputedAnswer::StaticIp {
+                                addresses: Some(addresses),
+                                ..
+                            } => Some((
+                                ResponseCode::NoError,
+                                StaticAddresses::Configured(addresses, qtype),
+                            )),
+                            _ => None,
+                        };
+                        if let Some((rcode, addresses)) = direct
+                            && let Some(reply) = write_static_reply(packet, rcode, addresses)
+                        {
+                            let answers = usize::from(u16::from_be_bytes([reply[6], reply[7]]));
+                            let answer = FastPathAnswer::StaticRule {
+                                rule: rule_name,
+                                rcode,
+                                answers,
+                            };
+                            let reply =
+                                shaped_static_reply(reply, packet, q.client_subnet.as_ref());
+                            return finish_static(Ok(reply), answer);
+                        }
+                        let (rcode, answers) = action.records(qname_str, qtype, qclass);
+                        let answer = FastPathAnswer::StaticRule {
+                            rule: rule_name,
+                            rcode,
+                            answers: answers.len(),
+                        };
+                        return answer_static(rcode, &answers, answer);
+                    }
+                    None => break,
                 }
             };
             let Some(next) =
@@ -6847,14 +6857,17 @@ mod tests {
 
     /// 快速路径和完整规则路径对同一个查询不能有不同结论。以前快速路径把 GeoIP 和
     /// GeoSite 条件一律当成不成立：越过本该决定的规则，用后面的静态规则作答；在「且非」
-    /// 里则反过来让规则命中。现在 GeoIP 条件在快速路径里判断；用到 GeoSite 的规则留给
-    /// 完整规则路径。
+    /// 里则反过来让规则命中。现在两种条件都和完整规则路径一样判断，快速路径答得出的都答，
+    /// 只把转发交出去。用到 GeoSite 的规则以前整条留给完整规则路径，`category-ads-all`
+    /// 这样的拦截规则排在前面时，快速路径每个查询都放手。
     /// The fast path and the full rule path must not reach different decisions for
     /// one query. The fast path used to take GeoIP and GeoSite matchers as never
     /// matching: it passed over the rule that should decide and answered from a
     /// later static rule, and under `and_not` it made a rule match the other way
-    /// round. GeoIP matchers are now judged on the fast path; rules that need
-    /// GeoSite are left to the full rule path.
+    /// round. Both are now judged as on the full rule path, and the fast path answers
+    /// whatever it can, handing on forwards only. Rules that need GeoSite used to be
+    /// left to the full rule path whole, and with a blocking rule like
+    /// `category-ads-all` in front the fast path let go of every query.
     #[tokio::test]
     async fn the_fast_path_agrees_with_the_full_rule_path_on_geoip_and_geosite() {
         use crate::matcher::advanced_rule::fast_static_match_with_rule;
@@ -6874,49 +6887,35 @@ mod tests {
             })
         };
         let block_rest = block("rest", serde_json::json!([{ "type": "any" }]));
-        // (规则, 快速路径是否把它们留给完整规则路径)
-        // (rules, whether the fast path leaves them to the full rule path)
         let rule_sets = [
-            (
+            serde_json::json!([
+                forward(
+                    "public",
+                    serde_json::json!([{ "type": "geoip_private", "expect": false }])
+                ),
+                block_rest.clone()
+            ]),
+            serde_json::json!([
+                forward(
+                    "from-jp",
+                    serde_json::json!([{ "type": "geoip_country", "country_codes": ["JP"] }])
+                ),
+                block_rest.clone()
+            ]),
+            serde_json::json!([
+                forward(
+                    "not-cn",
+                    serde_json::json!([{ "type": "geo_site_not", "value": "cn" }])
+                ),
+                block_rest
+            ]),
+            serde_json::json!([block(
+                "block-not-cn",
                 serde_json::json!([
-                    forward(
-                        "public",
-                        serde_json::json!([{ "type": "geoip_private", "expect": false }])
-                    ),
-                    block_rest.clone()
-                ]),
-                false,
-            ),
-            (
-                serde_json::json!([
-                    forward(
-                        "from-jp",
-                        serde_json::json!([{ "type": "geoip_country", "country_codes": ["JP"] }])
-                    ),
-                    block_rest.clone()
-                ]),
-                false,
-            ),
-            (
-                serde_json::json!([
-                    forward(
-                        "not-cn",
-                        serde_json::json!([{ "type": "geo_site_not", "value": "cn" }])
-                    ),
-                    block_rest
-                ]),
-                true,
-            ),
-            (
-                serde_json::json!([block(
-                    "block-not-cn",
-                    serde_json::json!([
-                        { "type": "any" },
-                        { "type": "geo_site", "value": "cn", "operator": "and_not" }
-                    ])
-                )]),
-                true,
-            ),
+                    { "type": "any" },
+                    { "type": "geo_site", "value": "cn", "operator": "and_not" }
+                ])
+            )]),
         ];
         let dir = tempfile::tempdir().expect("temp dir");
         let geoip = dir.path().join("geoip.json");
@@ -6927,7 +6926,7 @@ mod tests {
         .expect("write geoip");
 
         let mut disagreements = Vec::new();
-        for (rules, left_to_full_path) in &rule_sets {
+        for rules in &rule_sets {
             let raw = serde_json::json!({
                 "settings": { "default_upstream": "127.0.0.1:9" },
                 "pipelines": [{ "id": "main", "rules": rules }]
@@ -6968,17 +6967,19 @@ mod tests {
                     );
                     let fast = fast_static_match_with_rule(
                         compiled,
-                        domain,
-                        RecordType::A,
-                        DNSClass::IN,
-                        client_ip,
-                        false,
-                        Some(&engine.geoip_manager),
+                        &MatcherContext {
+                            qname: domain,
+                            qclass: DNSClass::IN,
+                            client_ip,
+                            edns_present: false,
+                            qtype: RecordType::A,
+                            geoip_manager: Some(&engine.geoip_manager),
+                            geosite_manager: Some(&engine.geosite_manager),
+                        },
                     );
                     let agrees = match (&fast, &full) {
-                        // 快速路径只在不该作答时放手 / The fast path holds back only where it should
-                        (None, Decision::Static { .. }) => *left_to_full_path,
-                        (None, _) => true,
+                        // 快速路径只把转发交出去 / The fast path hands on forwards only
+                        (None, full) => !matches!(full, Decision::Static { .. }),
                         (
                             Some((PrecomputedAction::Answer(answer), _)),
                             Decision::Static {
@@ -6988,8 +6989,7 @@ mod tests {
                         ) => {
                             let (rcode, answers) =
                                 answer.records(domain, RecordType::A, DNSClass::IN);
-                            !left_to_full_path
-                                && rcode == *full_rcode
+                            rcode == *full_rcode
                                 && format!("{answers:?}") == format!("{full_answers:?}")
                         }
                         (Some(_), _) => false,

@@ -28,6 +28,8 @@ pub mod execution;
 #[cfg(test)]
 mod failure_cache_tests;
 pub mod fair_queue;
+#[cfg(test)]
+mod fast_path_rule_tests;
 mod geo;
 #[cfg(test)]
 mod geo_reload_tests;
