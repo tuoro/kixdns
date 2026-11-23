@@ -94,6 +94,7 @@ impl CacheLookupContext<'_> {
             qname: self.qname,
             pipeline_id: self.pipeline_id,
             qtype: u16::from(self.qtype),
+            qclass: u16::from(self.qclass),
             flags: self.flags,
         }
     }
@@ -262,13 +263,7 @@ pub(crate) fn check_cache_logged(
         // The upstream comes first: the entry stays to go out when the wait runs out,
         // and its refresh, which is what is waited for, starts now
         None => {
-            engine.spawn_background_refresh(
-                context.state,
-                &hit,
-                context.slot,
-                context.qclass,
-                context.requester,
-            );
+            engine.spawn_background_refresh(context.state, &hit, context.slot, context.requester);
             Looked::Waiting(hit)
         }
     }
@@ -328,13 +323,7 @@ fn serve_fresh(
             original_ttl = hit.original_ttl,
             "Triggering background refresh for cached entry"
         );
-        engine.spawn_background_refresh(
-            context.state,
-            hit,
-            context.slot,
-            context.qclass,
-            context.requester,
-        );
+        engine.spawn_background_refresh(context.state, hit, context.slot, context.requester);
     }
 
     response.served_from_cache(hit);
@@ -495,13 +484,7 @@ pub(crate) fn serve_stale(
     // Start a background refresh to decide again. An answer the rules gave (one with no
     // upstream) is no different: it is what the check of that one reply came to, and not
     // decided again it would be renewed on every hit and served for ever
-    engine.spawn_background_refresh(
-        context.state,
-        hit,
-        context.slot,
-        context.qclass,
-        context.requester,
-    );
+    engine.spawn_background_refresh(context.state, hit, context.slot, context.requester);
     if let Some((observer, ctx)) = context.observed {
         observer.cache_hit(ctx, &cache_hit_of(hit, kind, 0));
     }
@@ -514,6 +497,7 @@ pub struct StaticDecisionContext<'a> {
     pub packet: &'a [u8],
     pub qname: &'a str,
     pub qtype: RecordType,
+    pub qclass: DNSClass,
     pub pipeline_id: &'a Arc<str>,
     /// Response cache slot / 响应缓存槽位
     pub slot: u64,
@@ -556,6 +540,7 @@ pub fn handle_static_decision(
         packet,
         qname,
         qtype,
+        qclass,
         pipeline_id: current_pipeline_id,
         slot,
         flags,
@@ -578,6 +563,7 @@ pub fn handle_static_decision(
                 qname,
                 current_pipeline_id.clone(),
                 u16::from(qtype),
+                u16::from(qclass),
                 flags,
                 ttl,
             )
@@ -1417,6 +1403,7 @@ impl<'a> Forwarding<'a> {
                 Arc::clone(cx.qname),
                 Arc::clone(cx.key_pipeline_id),
                 u16::from(cx.qtype),
+                u16::from(cx.qclass),
                 cx.keys.flags,
                 ttl,
             )
@@ -1442,6 +1429,7 @@ impl<'a> Forwarding<'a> {
                 qname: cx.qname,
                 pipeline_id: cx.key_pipeline_id,
                 qtype: u16::from(cx.qtype),
+                qclass: u16::from(cx.qclass),
                 flags: cx.keys.flags,
             };
             self.engine
@@ -1751,6 +1739,7 @@ mod refresh_response_rule_tests {
                 "example.com",
                 Arc::from(pipeline),
                 u16::from(RecordType::A),
+                u16::from(DNSClass::IN),
                 crate::proto_utils::QueryFlags::RECURSIVE,
                 ttl,
             )

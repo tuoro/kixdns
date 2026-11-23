@@ -1,7 +1,7 @@
 //! 响应缓存底下的存储：分片的哈希表，按 S3-FIFO 淘汰。
 //!
-//! 键是已经算好的 64 位槽位号，再用带随机密钥的 SipHash 散一遍才定分片和桶：槽位号出自不带密钥的
-//! 哈希，请求方能凑出一串落在同一处的名字，带密钥的这一遍让它们照样分散开。
+//! 键是已经算好的 64 位数，再用带随机密钥的 SipHash 散一遍才定分片和桶：键可能出自不带密钥的哈希（规则缓存的就是），
+//! 请求方能凑出一串落在同一处的名字，带密钥的这一遍让它们照样分散开。
 //!
 //! 每个分片一把读写锁。读只拿读锁，给条目的访问计数加一，不动队列；写拿写锁。淘汰按 S3-FIFO
 //! （Yang 等，SOSP 2023）：新条目先进小队列，在里面再被读到过才进主队列，没读到过的直接淘汰，
@@ -16,10 +16,10 @@
 //!
 //! The store under the response cache: a sharded hash table with S3-FIFO eviction.
 //!
-//! Keys are precomputed 64-bit slot numbers, hashed again with a randomly keyed
-//! SipHash to pick the shard and bucket: slot numbers come from an unkeyed hash,
-//! so a requester can make up a run of names that land in one place, and the keyed
-//! pass spreads them out regardless.
+//! Keys are precomputed 64-bit numbers, hashed again with a randomly keyed SipHash
+//! to pick the shard and bucket: a key may come from an unkeyed hash (the rule
+//! cache's do), so a requester can make up a run of names that land in one place,
+//! and the keyed pass spreads them out regardless.
 //!
 //! Each shard has one read-write lock. A read takes the read lock and bumps the
 //! entry's access count without touching the queues; a write takes the write lock.

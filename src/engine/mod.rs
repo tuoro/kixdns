@@ -6,6 +6,8 @@ pub(crate) mod bootstrap;
 #[cfg(test)]
 mod bootstrap_tests;
 #[cfg(test)]
+mod cache_class_tests;
+#[cfg(test)]
 mod client_address_tests;
 pub mod concurrency;
 #[cfg(test)]

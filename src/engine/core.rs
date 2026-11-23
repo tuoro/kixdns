@@ -385,12 +385,14 @@ impl Engine {
         written: &crate::ecs_scope::EcsReach,
         qname: &str,
         qtype: u16,
+        qclass: u16,
         flags: crate::proto_utils::QueryFlags,
     ) {
         let question = CachedQuestion {
             qname,
             pipeline_id: &target.pipeline,
             qtype,
+            qclass,
             flags,
         };
         self.cache.compute(target.slot, |current| match current {

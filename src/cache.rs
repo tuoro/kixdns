@@ -19,6 +19,7 @@ pub struct CacheEntry {
     pub qname: Arc<str>,
     pub pipeline_id: Arc<str>,
     pub qtype: u16,
+    pub qclass: u16,
     pub flags: QueryFlags,
     /// RFC 1035 §5.2: Record insertion time for TTL decrement / RFC 1035 §5.2：记录插入时间用于TTL递减
     pub inserted_at: Instant,
@@ -41,6 +42,7 @@ pub struct CacheEntry {
 
 impl CacheEntry {
     /// Build a cache entry from a DNS response and the TTL it is cached with.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_response(
         bytes: Bytes,
         rcode: ResponseCode,
@@ -48,6 +50,7 @@ impl CacheEntry {
         qname: impl Into<Arc<str>>,
         pipeline_id: Arc<str>,
         qtype: u16,
+        qclass: u16,
         flags: QueryFlags,
         ttl: u32,
     ) -> Self {
@@ -59,6 +62,7 @@ impl CacheEntry {
             qname: qname.into(),
             pipeline_id,
             qtype,
+            qclass,
             flags,
             inserted_at: now,
             original_ttl: ttl,
@@ -84,6 +88,7 @@ impl CacheEntry {
             qname: &self.qname,
             pipeline_id: &self.pipeline_id,
             qtype: self.qtype,
+            qclass: self.qclass,
             flags: self.flags,
         }
     }
@@ -119,18 +124,25 @@ impl CacheEntry {
     }
 }
 
-/// 缓存条目要回答的问题，用来排除哈希冲突 / The question a cached entry must answer, to rule out hash collisions
+/// 缓存条目要回答的问题，用来排除哈希冲突：槽位号只是问题的哈希，落在同一个槽位上的不同问题各要各的应答。类别也在里面，
+/// 以前不核对它，撞上的话 CH 类问题的应答就会交给 IN 类的同一个名字
+/// The question a cached entry must answer, to rule out hash collisions: a slot number is
+/// only a hash of the question, and different questions landing on one slot each want their
+/// own answer. The class is part of it; it used to go unchecked, and on a collision a CH
+/// question's answer would go to the same name asked in IN
 #[derive(Debug, Clone, Copy)]
 pub struct CachedQuestion<'a> {
     pub qname: &'a str,
     pub pipeline_id: &'a str,
     pub qtype: u16,
+    pub qclass: u16,
     pub flags: QueryFlags,
 }
 
 impl CachedQuestion<'_> {
     pub fn matches(&self, entry: &CacheEntry) -> bool {
         entry.qtype == self.qtype
+            && entry.qclass == self.qclass
             && entry.flags == self.flags
             && entry.qname.as_ref() == self.qname
             && entry.pipeline_id.as_ref() == self.pipeline_id
@@ -358,6 +370,7 @@ mod tests {
         qname: "example.com",
         pipeline_id: "main",
         qtype: 1,
+        qclass: 1,
     };
 
     /// 这么多字节的应答 / An answer of this many bytes
@@ -368,6 +381,7 @@ mod tests {
             None,
             qname,
             Arc::from("main"),
+            1,
             1,
             crate::proto_utils::QueryFlags::RECURSIVE,
             60,
@@ -456,6 +470,7 @@ mod tests {
             "example.com",
             Arc::from("main"),
             1,
+            1,
             crate::proto_utils::QueryFlags::RECURSIVE,
             ttl,
         )
@@ -482,6 +497,7 @@ mod tests {
                     None,
                     "example.com",
                     Arc::from("main"),
+                    1,
                     1,
                     flags,
                     300,
