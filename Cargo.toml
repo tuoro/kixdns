@@ -11,7 +11,7 @@ categories = ["network-programming", "asynchronous"]
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 hickory-proto = "0.26"
 serde = { version = "1", features = ["derive"] }

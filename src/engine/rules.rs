@@ -138,7 +138,7 @@ pub fn rule_cache_requester(
     pipeline: &RuntimePipeline,
     background_refresh: bool,
     requester: Requester,
-    geoip_manager: Option<&Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>>,
+    geoip_manager: Option<&Arc<parking_lot::RwLock<crate::matcher::geoip::GeoIpManager>>>,
 ) -> RequesterKey {
     RequesterKey {
         address: background_refresh.then_some(requester.address),
@@ -288,8 +288,8 @@ impl RuleCacheEntry {
 pub(crate) fn acquire_geo_locks<'a>(
     engine: &'a Engine,
 ) -> (
-    Option<crate::lock::RwLockReadGuard<'a, crate::matcher::geoip::GeoIpManager>>,
-    Option<crate::lock::RwLockReadGuard<'a, crate::matcher::geosite::GeoSiteManager>>,
+    Option<parking_lot::RwLockReadGuard<'a, crate::matcher::geoip::GeoIpManager>>,
+    Option<parking_lot::RwLockReadGuard<'a, crate::matcher::geosite::GeoSiteManager>>,
 ) {
     // Try to acquire read locks non-blockingly (fast path for concurrent reads)
     // 尝试非阻塞获取读锁（并发读的快速路径）

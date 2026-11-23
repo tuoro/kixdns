@@ -4,10 +4,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tracing;
 
-use crate::lock::RwLock;
 use crate::matcher::RuntimeMatcher;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
+use parking_lot::RwLock;
 
 /// Context for matcher evaluation
 /// Groups related parameters to reduce function argument count

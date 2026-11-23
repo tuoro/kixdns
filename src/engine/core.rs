@@ -13,11 +13,11 @@ use crate::cache::{CacheEntry, CacheSlot, CachedQuestion, DnsCache, new_cache};
 use crate::cache_store::{CacheStore, Op};
 use crate::ecs_scope::EcsView;
 use crate::engine::refresh::RefreshTarget;
-use crate::lock::RwLock;
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
+use parking_lot::RwLock;
 
 use super::concurrency::{FlowControlState, PermitManager};
 use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheRecord};

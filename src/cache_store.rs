@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use hashbrown::HashTable;
 
-use crate::lock::RwLock;
+use parking_lot::RwLock;
 
 /// 缓存里存的值 / A value kept in the cache
 pub trait Cached: Clone {

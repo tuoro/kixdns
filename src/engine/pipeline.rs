@@ -8,7 +8,6 @@ use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
 use crate::engine::utils::parse_rcode;
-use crate::lock::RwLock;
 use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
@@ -16,6 +15,7 @@ use crate::matcher::{
     PipelineSelectorQuery, Requester, RequesterKey, RuntimePipeline, RuntimePipelineConfig,
     eval_match_chain,
 };
+use parking_lot::RwLock;
 
 use super::core::Engine;
 use super::matcher_adapter::{MatcherContext, matcher_matches};

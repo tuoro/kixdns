@@ -343,7 +343,7 @@ impl RequesterTest {
     fn hash_outcome<H: Hasher>(
         &self,
         requester: Requester,
-        geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
+        geoip_manager: Option<&Arc<parking_lot::RwLock<geoip::GeoIpManager>>>,
         hasher: &mut H,
     ) {
         match self {
@@ -409,7 +409,7 @@ impl RequesterScope {
     pub fn key(
         &self,
         requester: Requester,
-        geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
+        geoip_manager: Option<&Arc<parking_lot::RwLock<geoip::GeoIpManager>>>,
     ) -> RequesterKey {
         let judge = |subnets: bool| {
             let mut tests = self
@@ -1114,7 +1114,7 @@ impl RuntimePipelineConfig {
         &self,
         pipeline: &str,
         requester: Requester,
-        geoip_manager: Option<&Arc<crate::lock::RwLock<geoip::GeoIpManager>>>,
+        geoip_manager: Option<&Arc<parking_lot::RwLock<geoip::GeoIpManager>>>,
     ) -> RequesterKey {
         self.pipeline(pipeline).map_or(RequesterKey::NONE, |p| {
             p.requester.key(requester, geoip_manager)
@@ -1468,10 +1468,10 @@ impl RuntimeMatcher {
         edns_present: bool,
         qtype: RecordType,
         geoip_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geoip::GeoIpManager>>,
+            &std::sync::Arc<parking_lot::RwLock<crate::matcher::geoip::GeoIpManager>>,
         >,
         geosite_manager: Option<
-            &std::sync::Arc<crate::lock::RwLock<crate::matcher::geosite::GeoSiteManager>>,
+            &std::sync::Arc<parking_lot::RwLock<crate::matcher::geosite::GeoSiteManager>>,
         >,
     ) -> bool {
         match self {
@@ -2857,7 +2857,7 @@ mod tests {
 
         let mut manager = geoip::GeoIpManager::default();
         manager.load_from_v2ray_file(&path).unwrap();
-        let manager = Arc::new(crate::lock::RwLock::new(manager));
+        let manager = Arc::new(parking_lot::RwLock::new(manager));
         let ip: IpAddr = "104.16.0.1".parse().unwrap();
         let tags = vec![Arc::from("cloudflare")];
 
