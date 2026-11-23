@@ -3292,7 +3292,17 @@ impl DoqMuxClient {
         packet: &[u8],
         original_id: u16,
     ) -> Result<Bytes, DoqFailure> {
-        let (mut send, mut recv) = conn.open_bi().await.map_err(DoqFailure::OpenStream)?;
+        let (send, recv) = conn.open_bi().await.map_err(DoqFailure::OpenStream)?;
+        let mut stream = DoqStream {
+            send,
+            recv,
+            answered: false,
+        };
+        let DoqStream {
+            send,
+            recv,
+            answered,
+        } = &mut stream;
 
         // RFC 9250 §4.2: DNS messages sent over QUIC streams MUST be prefixed
         // with a 2-octet length field, followed by the DNS message content.
@@ -3331,6 +3341,9 @@ impl DoqMuxClient {
             .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
             .await
             .map_err(DoqFailure::Read)?;
+        // 上游已经把流结束了：之后不论应答对不对，都不算放弃 / The upstream has ended the stream: whatever
+        // the answer, from here on it is no abandoning
+        *answered = true;
 
         if all_data.is_empty() {
             return Err(DoqFailure::Protocol(
@@ -3637,6 +3650,34 @@ impl DoqMuxClient {
         let connection = connecting.await.context("doq handshake failed")?;
 
         Ok((connection, false))
+    }
+}
+
+/// RFC 9250 第 4.3 节的 DOQ_REQUEST_CANCELLED：客户端不要这个查询的回答了 / RFC 9250 section
+/// 4.3's DOQ_REQUEST_CANCELLED: the client no longer wants this query's answer
+const DOQ_REQUEST_CANCELLED: quinn::VarInt = quinn::VarInt::from_u32(0x3);
+
+/// 一个 DoQ 查询的那一对流。没等到上游把回答发完就被丢掉（时限到了、几个上游竞速它输了）时，按 RFC 9250
+/// 第 4.3.1 节用 [`DOQ_REQUEST_CANCELLED`] 停止接收、重置发送。以前交给 quinn 丢掉流，发出的错误码是 0，
+/// 也就是 DOQ_NO_ERROR，上游当它正常结束
+/// The pair of streams of one DoQ query. Dropped before the upstream has finished sending the
+/// answer (a deadline that came first, a race between upstreams lost), it stops receiving and
+/// resets sending with [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks. Dropping the
+/// streams used to be left to quinn, whose error code 0 is DOQ_NO_ERROR, the upstream taking it
+/// for a normal end
+struct DoqStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    /// 上游已经把回答发完 / The upstream has finished sending the answer
+    answered: bool,
+}
+
+impl Drop for DoqStream {
+    fn drop(&mut self) {
+        if !self.answered {
+            let _ = self.send.reset(DOQ_REQUEST_CANCELLED);
+            let _ = self.recv.stop(DOQ_REQUEST_CANCELLED);
+        }
     }
 }
 
@@ -6346,6 +6387,59 @@ mod tests {
             second.is_ok(),
             "a connection the server already closed must be replaced, not used: {:?}",
             second.err()
+        );
+    }
+
+    /// 放弃一个查询时（竞速时别的上游先答了），上游收到的停止接收带着 DOQ_REQUEST_CANCELLED（RFC 9250 第 4.3.1 节）。
+    /// 以前是 0，也就是 DOQ_NO_ERROR。时限用完、连接上也没读到过别的回答时，整条连接换掉，用不着这个码
+    /// Abandoning a query (another upstream answering first in a race), the upstream is told to
+    /// stop sending with DOQ_REQUEST_CANCELLED (RFC 9250 section 4.3.1). It used to be 0,
+    /// DOQ_NO_ERROR. A deadline running out with no other answer read on the connection has the
+    /// whole connection replaced, where the code does not come into it
+    #[tokio::test]
+    async fn an_abandoned_doq_query_is_cancelled_with_request_cancelled() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
+        let endpoint = QuicEndpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("bind the DoQ test server");
+        let addr = endpoint.local_addr().expect("read the DoQ test address");
+        let (told, stopped) = oneshot::channel();
+        tokio::spawn(async move {
+            let conn = endpoint
+                .accept()
+                .await
+                .expect("a connection")
+                .await
+                .expect("handshake");
+            let (send, mut recv) = conn.accept_bi().await.expect("a query stream");
+            recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
+                .await
+                .expect("the query");
+            let _ = told.send(send.stopped().await);
+            // 连接要留到读完错误码 / The connection stays until the error code is read
+            let _ = (endpoint, conn);
+        });
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        // 外层先放弃（竞速时别的上游先答了），连接还在用 / Given up from outside (another upstream
+        // answering first in a race), with the connection still in use
+        let raced = timeout(
+            Duration::from_millis(100),
+            client.send(&udp_test_query("abandoned.example"), Duration::from_secs(2)),
+        )
+        .await;
+        assert!(raced.is_err(), "the server never answers");
+        let code = timeout(Duration::from_secs(2), stopped)
+            .await
+            .expect("the server is told")
+            .expect("the server reports");
+        assert_eq!(
+            code.as_ref().ok(),
+            Some(&Some(DOQ_REQUEST_CANCELLED)),
+            "{code:?}"
         );
     }
 
