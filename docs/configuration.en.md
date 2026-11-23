@@ -31,7 +31,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | doh_tls_key | null | PEM private-key path; required with bind_doh. |
 | doh_path | /dns-query | Inbound DoH request path. |
 | default_upstream | 1.1.1.1:53 | Default upstream. A comma-separated list is accepted. |
-| upstream_timeout_ms | 9000 | Timeout for one upstream operation; must be greater than zero. A UDP forward with no reply after a third of it sends the query again, and for the whole of the timeout from then on whichever of the two is answered first is used. |
+| upstream_timeout_ms | 9000 | Timeout for one upstream operation; must be greater than zero. A UDP forward with no reply after what the slowest one percent of this upstream's latest answers took sends the query again (waiting 50 ms at least and a third of the timeout at most, a third while this upstream has not answered yet), and for the whole of the timeout from then on whichever of the two is answered first is used. |
 | request_timeout_ms | null | Overall request timeout. When null, it is upstream_timeout_ms * 2.5. It must be at least upstream_timeout_ms. |
 | response_jump_limit | 10 | How many pipeline jumps the response phase may make (the jumps of answer actions and the rule-level jumps after them both count); one more answers SERVFAIL. |
 | udp_pool_size | 64 | Outbound UDP socket-pool size. Each query takes a socket and an ID at random; a socket that has sent 64 queries is replaced by a new one on another port the system picks, so no port lasts long, and the firewall's connection tracking gains just one entry per 64 misses. |

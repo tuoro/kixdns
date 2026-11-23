@@ -31,7 +31,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | doh_tls_key | null | PEM 私钥路径；设置 bind_doh 时必需。 |
 | doh_path | /dns-query | 入站 DoH 请求路径。 |
 | default_upstream | 1.1.1.1:53 | 默认上游；支持逗号分隔列表。 |
-| upstream_timeout_ms | 9000 | 单次上游操作超时；必须大于 0。UDP 转发过了它的三分之一还没有回答，会把查询再发一次，此后一整个超时里两次谁的回答先到用谁的。 |
+| upstream_timeout_ms | 9000 | 单次上游操作超时；必须大于 0。UDP 转发等过这个上游最近最慢百分之一回答的用时还没有回答，会把查询再发一次（至少等 50 毫秒，最多等超时的三分之一；这个上游还没回答过时等三分之一），此后一整个超时里两次谁的回答先到用谁的。 |
 | request_timeout_ms | null | 整体请求超时；为 null 时使用 upstream_timeout_ms * 2.5，且不能小于 upstream_timeout_ms。 |
 | response_jump_limit | 10 | 响应阶段最多跳转几次 Pipeline（回答动作里的跳转和跳转之后规则级的跳转都算）；再跳就回 SERVFAIL。 |
 | udp_pool_size | 64 | 出站 UDP socket 池大小。每个查询随机挑一个 socket、随机取 ID；一个 socket 发满 64 个查询就换成系统另挑端口的新 socket，端口用不了多久，防火墙的连接跟踪也只多出未命中数的六十四分之一。 |
