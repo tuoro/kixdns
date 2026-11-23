@@ -138,6 +138,8 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 - `response_answer_ip_geoip_country` 只检查 Answer；每个包含地址的 Answer 都必须命中请求的某个 GeoIP 标签。
 - `response_answer_ip` 和 `response_answer_ip_geoip_private` 同时检查 Answer 与 Additional，只要任一地址匹配即可。
 - 匹配器会检查 A/AAAA 地址以及 HTTPS/SVCB 的 `ipv4hint`/`ipv6hint`。同一 HTTPS/SVCB 记录中的 hints 是候选端点，任一 hint 匹配即可。
+- IPv4 映射形式的地址（AAAA 或 `ipv6hint` 里的 `::ffff:a.b.c.d`）按它所指的 IPv4 地址判断，写成 `::ffff:a.b.c.d/n` 的网段按它所指的 IPv4 网段处理，response_upstream_ip 也一样。
+- geoip_private 和 `response_answer_ip_geoip_private` 把私有网段（RFC 1918、ULA fc00::/7）、回环、链路本地、0.0.0.0/8、`::` 和 255.255.255.255 算作内网地址。
 
 这些匹配器只读取已有记录，不会创建或改写 HTTPS/SVCB 记录。
 

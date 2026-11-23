@@ -795,17 +795,22 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-/// `geoip_private` 和 ECS 都算作内网的地址：IPv4 的 RFC 1918 私有网段、回环、链路本地，IPv6 的
-/// 回环、未指定地址、ULA（fc00::/7）、链路本地（fe80::/10）。两边各自再多算一个地址，见
-/// [`is_private_ip`] 和 `ecs::is_private_ip`
+/// `geoip_private` 和 ECS 都算作内网的地址：IPv4 的 RFC 1918 私有网段、回环、链路本地、「本网络」0.0.0.0/8，
+/// IPv6 的回环、未指定地址、ULA（fc00::/7）、链路本地（fe80::/10）。0.0.0.0/8 和 `::` 一样不是哪台主机的地址
+/// （RFC 791），连 0.0.0.0 在 Linux、macOS 上连的是本机，回答它和回答 127.0.0.1 一样能拿来重绑定。两边各自
+/// 再多算一些，见 [`is_private_ip`] 和 `ecs::is_private_ip`
 /// The addresses both `geoip_private` and ECS count as local network ones: for IPv4 the
-/// RFC 1918 private networks, loopback and link-local; for IPv6 loopback, the
-/// unspecified address, ULA (fc00::/7) and link-local (fe80::/10). Each counts one more
-/// address of its own, see [`is_private_ip`] and `ecs::is_private_ip`
+/// RFC 1918 private networks, loopback, link-local and "this network" 0.0.0.0/8; for IPv6
+/// loopback, the unspecified address, ULA (fc00::/7) and link-local (fe80::/10). Like `::`,
+/// 0.0.0.0/8 is no host's address (RFC 791), and connecting to 0.0.0.0 reaches this machine
+/// on Linux and macOS, so an answer of it rebinds as one of 127.0.0.1 does. Each side counts
+/// some more of its own, see [`is_private_ip`] and `ecs::is_private_ip`
 #[inline]
 pub(crate) fn is_local_network(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.octets()[0] == 0
+        }
         IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
