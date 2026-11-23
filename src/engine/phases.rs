@@ -386,13 +386,12 @@ pub(crate) fn check_stale_cache_logged(
     Some(serve_stale(engine, context, &hit, &view, kind, response))
 }
 
-/// 把过期的 `hit` 当作 stale 提供（RFC 8767）：TTL 都设成 serve_stale_ttl；开着
-/// serve_stale_ttl_reset 时让它重新从刚过期算起；顺带发起后台刷新；按 `kind`
-/// 上报观察者，记下应答取自缓存
-/// Serve the expired `hit` stale (RFC 8767): every TTL set to serve_stale_ttl; with
-/// serve_stale_ttl_reset on it counts as just expired again; a background refresh is
-/// started too; the observer hears of it as `kind`, and the answer is noted as taken
-/// from the cache
+/// 把过期的 `hit` 当作 stale 提供（RFC 8767）：TTL 都设成 serve_stale_ttl；顺带发起后台刷新（刷新失败时
+/// serve_stale_ttl_reset 才续期，见 `spawn_background_refresh`）；按 `kind` 上报观察者，记下应答取自缓存
+/// Serve the expired `hit` stale (RFC 8767): every TTL set to serve_stale_ttl; a background
+/// refresh is started too (only its failure renews the answer, with serve_stale_ttl_reset on,
+/// see `spawn_background_refresh`); the observer hears of it as `kind`, and the answer is noted
+/// as taken from the cache
 fn serve_stale(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
@@ -1908,11 +1907,11 @@ mod refresh_response_rule_tests {
         assert_eq!(cached, None);
     }
 
-    /// 刷新进行中，这条过期应答被续用（serve_stale_ttl_reset）：它仍是刷新要更新的那份，
-    /// 刷新照样把它删掉，否则续用可以让过时的应答一直留着。
-    /// The stale answer renewed (serve_stale_ttl_reset) while its refresh runs is
-    /// still the answer the refresh renews, and the refresh drops it all the same;
-    /// otherwise renewals could keep an outdated answer forever.
+    /// 刷新按取得时刻认它更新的那份应答，不管条目换没换过：同一份应答续期后（serve_stale_ttl_reset）存成的新条目，
+    /// 刷新照样删掉，否则续期可以让过时的应答一直留着
+    /// A refresh knows the answer it renews by when it was fetched, however the entry was
+    /// replaced since: the new entry a renewal (serve_stale_ttl_reset) stores for the same
+    /// answer is dropped all the same, or renewals could keep an outdated answer forever
     #[tokio::test]
     async fn a_refresh_drops_the_entry_renewed_while_it_ran() {
         let first = answering_upstream(PASSED_OVER, 300).await.address;

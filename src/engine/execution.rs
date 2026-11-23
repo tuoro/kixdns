@@ -6180,13 +6180,12 @@ mod tests {
         );
     }
 
-    /// 所有上游都失败时，后台刷新要把失败原样交回刷新任务，由它记录。以前刷新会拿
-    /// 过期应答（或合成的 SERVFAIL）当成功返回：任务不告警，开着
-    /// serve_stale_ttl_reset 时还会给一条没有任何客户端拿到的过期条目重新计时。
-    /// When every upstream fails, a background refresh must hand the failure back to
-    /// the refresh task, which logs it. It used to return the stale answer (or a
-    /// synthesized SERVFAIL) as a success: the task did not warn, and with
-    /// serve_stale_ttl_reset it re-armed an entry no client was served.
+    /// 所有上游都失败时，后台刷新要把失败原样交回刷新任务，由它记录，开着 serve_stale_ttl_reset 时也由它续期（见
+    /// `spawn_background_refresh`）；刷新本身不动条目。以前刷新会拿过期应答（或合成的 SERVFAIL）当成功返回，任务不告警
+    /// When every upstream fails, a background refresh must hand the failure back to the
+    /// refresh task, which logs it and, with serve_stale_ttl_reset on, renews the entry (see
+    /// `spawn_background_refresh`); the refresh itself leaves the entry alone. It used to return
+    /// the stale answer (or a synthesized SERVFAIL) as a success, and the task did not warn
     #[tokio::test]
     async fn a_failed_background_refresh_reports_the_failure_and_leaves_the_entry_alone() {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
@@ -6203,7 +6202,7 @@ mod tests {
             .expect("a failed refresh must keep the stale entry");
         assert!(
             Arc::ptr_eq(&cached, &stale),
-            "a refresh serves no client, so it must not re-arm the stale entry"
+            "the refresh itself leaves the stale entry to the refresh task"
         );
     }
 
