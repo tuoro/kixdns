@@ -55,7 +55,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | serve_stale | false | 按 RFC 8767 行为保留并返回过期条目。一条过期应答刷新失败以后，30 秒内不再为它刷新，命中它的请求直接拿过期数据，不再等（RFC 8767 第 5 节的失败复查）；30 秒后的头一次命中再试一次。 |
 | serve_stale_ttl | 30 | 过期响应中写入的 TTL。 |
 | serve_stale_expire_ttl | 86400 | 允许返回过期条目的最大时间，单位秒；0 表示不限制过期时间。 |
-| serve_stale_ttl_reset | true | 返回过期数据时重置过期时间窗口。 |
+| serve_stale_ttl_reset | false | 过期应答的后台刷新失败以后，从这次失败起重新算它还能续用多久：上游一直取不到新的、又一直有人问的名字，就一直交出过期应答，不受 serve_stale_expire_ttl 限制（对应 Unbound 的 serve-expired-ttl-reset，那边默认也关）。以前默认开，而且每交出一次过期应答就重新算一次。 |
 | serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游最多指定毫秒数，并受 request_timeout_ms 剩余预算截断，保证过期应答来得及返回。这次刷新失败时不再等满，马上返回过期数据。 |
 | geoip_db_path | null | MaxMind MMDB 路径。 |
 | geoip_dat_path | null | V2Ray GeoIP 数据文件路径：可以是 protobuf `.dat`，也可以是下文说明的兼容 JSON。 |

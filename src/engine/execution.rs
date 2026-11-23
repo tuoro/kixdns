@@ -2009,7 +2009,7 @@ impl Engine {
     pub(crate) fn spawn_background_refresh(
         &self,
         state: &Arc<EngineInner>,
-        renewed: &CacheEntry,
+        renewed: &Arc<CacheEntry>,
         slot: u64,
         qclass: DNSClass,
         requester: Requester,
@@ -6058,13 +6058,15 @@ mod tests {
         }
     }
 
-    /// 开着 serve_stale_ttl_reset，每次当作 stale 提供都让这条应答重新从刚过期算起，查缓存和上游
-    /// 失败时的兜底都一样；关着就不动
-    /// With serve_stale_ttl_reset on, every time an answer is served stale it counts as
-    /// just expired again, on a lookup and on the fallback after an upstream failure
-    /// alike; with it off nothing changes
+    /// 当作 stale 提供不动这条应答的过期计时，查缓存和上游失败时的兜底都一样，开不开 serve_stale_ttl_reset 都是：
+    /// 续期只在后台刷新失败以后（见 `a_failed_refresh_renews_a_stale_answer_with_ttl_reset_on`）。以前开着时每交出
+    /// 一次就重新算一次
+    /// Serving an answer stale leaves its expiry alone, on a lookup and on the fallback after an
+    /// upstream failure alike, with serve_stale_ttl_reset on or off: renewal comes only after a
+    /// failed background refresh (see `a_failed_refresh_renews_a_stale_answer_with_ttl_reset_on`).
+    /// With it on, every answer served stale used to count afresh
     #[tokio::test]
-    async fn serving_stale_restarts_the_expiry_with_ttl_reset_on() {
+    async fn serving_stale_leaves_the_expiry_alone() {
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         for reset in [true, false] {
             for fallback in [false, true] {
@@ -6088,11 +6090,7 @@ mod tests {
                 let entry = engine.cached(slot).expect("still cached");
                 // `stale_entry` 10 秒前写入、TTL 5 秒 / `stale_entry` went in 10 s ago with a TTL of 5 s
                 let stale_for = entry.inserted_at.elapsed().as_secs() - entry.original_ttl as u64;
-                assert_eq!(
-                    stale_for,
-                    if reset { 0 } else { 5 },
-                    "reset {reset}, fallback {fallback}"
-                );
+                assert_eq!(stale_for, 5, "reset {reset}, fallback {fallback}");
             }
         }
     }
@@ -6182,13 +6180,12 @@ mod tests {
         );
     }
 
-    /// 所有上游都失败时，后台刷新要把失败原样交回刷新任务，由它记录。以前刷新会拿
-    /// 过期应答（或合成的 SERVFAIL）当成功返回：任务不告警，开着
-    /// serve_stale_ttl_reset 时还会给一条没有任何客户端拿到的过期条目重新计时。
-    /// When every upstream fails, a background refresh must hand the failure back to
-    /// the refresh task, which logs it. It used to return the stale answer (or a
-    /// synthesized SERVFAIL) as a success: the task did not warn, and with
-    /// serve_stale_ttl_reset it re-armed an entry no client was served.
+    /// 所有上游都失败时，后台刷新要把失败原样交回刷新任务，由它记录，开着 serve_stale_ttl_reset 时也由它续期（见
+    /// `spawn_background_refresh`）；刷新本身不动条目。以前刷新会拿过期应答（或合成的 SERVFAIL）当成功返回，任务不告警
+    /// When every upstream fails, a background refresh must hand the failure back to the
+    /// refresh task, which logs it and, with serve_stale_ttl_reset on, renews the entry (see
+    /// `spawn_background_refresh`); the refresh itself leaves the entry alone. It used to return
+    /// the stale answer (or a synthesized SERVFAIL) as a success, and the task did not warn
     #[tokio::test]
     async fn a_failed_background_refresh_reports_the_failure_and_leaves_the_entry_alone() {
         let (engine, dedupe_hash) = engine_without_an_answering_upstream(true);
@@ -6205,7 +6202,7 @@ mod tests {
             .expect("a failed refresh must keep the stale entry");
         assert!(
             Arc::ptr_eq(&cached, &stale),
-            "a refresh serves no client, so it must not re-arm the stale entry"
+            "the refresh itself leaves the stale entry to the refresh task"
         );
     }
 

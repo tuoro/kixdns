@@ -1153,46 +1153,67 @@ async fn a_failed_response_action_forward_stays_with_its_subnet() {
     assert!(second.queries() > failed);
 }
 
-/// 过期续用（serve_stale_ttl_reset）换下的是那一份应答本身：同一份应答（取得时刻不变）重新
-/// 存一次，过期计时从头开始。
-/// Renewing a stale answer (serve_stale_ttl_reset) replaces that answer itself:
-/// the same answer (fetched at the same moment) is stored again, its stale clock
-/// starting over.
+/// 开着 serve_stale_ttl_reset 时，过期应答的后台刷新失败以后才续期：换下的是那一份应答本身，同一份应答（取得时刻
+/// 不变）重新存一次，过期计时从头开始；关着时什么都不动。以前交出过期应答的那一刻就续期
+/// With serve_stale_ttl_reset on, a stale answer is renewed only once its background refresh
+/// fails: what is replaced is that answer itself, the same answer (fetched at the same moment)
+/// stored again with its stale clock starting over; with it off nothing changes. It used to be
+/// renewed the moment it was served stale
 #[tokio::test]
-async fn renewing_a_stale_answer_stores_the_same_answer_again() {
-    let up = upstream_with(Echo::Scope(24), ResponseCode::NoError, 1, Duration::ZERO).await;
-    let engine = engine_with(
-        serde_json::json!({ "serve_stale": true, "serve_stale_ttl_reset": true }),
-        forward_all(&up.address, None),
-    );
-    ask(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
-    let slot = Engine::cache_keys(
-        engine.state.load().cache_namespace("main"),
-        "main",
-        b"example.com",
-        RecordType::A,
-        hickory_proto::rr::DNSClass::IN,
-        crate::proto_utils::QueryFlags::RECURSIVE,
-        &crate::matcher::RequesterKey::NONE,
-        None,
-    )
-    .slot;
-    let before = engine.cached(slot).expect("cached");
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    up.silence(true);
-    assert_eq!(
-        ask(&engine, "10.0.0.2", Some(("198.51.100.0", 24))).await,
-        v4("198.51.100.0")
-    );
-    let after = engine.cached(slot).expect("still cached");
-    assert!(!Arc::ptr_eq(&before, &after), "renewed");
-    assert_eq!(after.fetched_at, before.fetched_at);
-    // Expired just now again: aged exactly its TTL, less than before the renewal
-    // 又是刚刚过期：存了正好一个 TTL，比续用之前短
-    assert!(
-        after.inserted_at.elapsed() < before.inserted_at.elapsed(),
-        "the stale clock starts over"
-    );
+async fn a_failed_refresh_renews_a_stale_answer_with_ttl_reset_on() {
+    for reset in [true, false] {
+        let up = upstream_with(Echo::Scope(24), ResponseCode::NoError, 1, Duration::ZERO).await;
+        let engine = engine_with(
+            serde_json::json!({
+                "serve_stale": true,
+                "serve_stale_ttl_reset": reset,
+                "upstream_timeout_ms": 200
+            }),
+            forward_all(&up.address, None),
+        );
+        ask(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
+        let slot = Engine::cache_keys(
+            engine.state.load().cache_namespace("main"),
+            "main",
+            b"example.com",
+            RecordType::A,
+            hickory_proto::rr::DNSClass::IN,
+            crate::proto_utils::QueryFlags::RECURSIVE,
+            &crate::matcher::RequesterKey::NONE,
+            None,
+        )
+        .slot;
+        let before = engine.cached(slot).expect("cached");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        up.silence(true);
+        assert_eq!(
+            ask(&engine, "10.0.0.2", Some(("198.51.100.0", 24))).await,
+            v4("198.51.100.0")
+        );
+        assert!(
+            Arc::ptr_eq(&before, &engine.cached(slot).expect("still cached")),
+            "reset {reset}: serving it stale renews nothing"
+        );
+        // 等后台刷新失败 / Wait for the background refresh to fail
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while engine.refresh_failures.map.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the refresh fails");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let after = engine.cached(slot).expect("still cached");
+        if reset {
+            assert!(!Arc::ptr_eq(&before, &after), "renewed");
+            assert_eq!(after.fetched_at, before.fetched_at);
+            // 又是刚刚过期：存了正好一个 TTL，比续用之前短 / Expired just now again: aged exactly its
+            // TTL, less than before the renewal
+            assert!(
+                after.inserted_at.elapsed() < before.inserted_at.elapsed(),
+                "the stale clock starts over"
+            );
+        } else {
+            assert!(Arc::ptr_eq(&before, &after), "left alone with it off");
+        }
+    }
 }
 
 /// 上游把作用范围从 /16 收窄到 /24：刷新回来的应答只适用于这个 /24，被刷新的 /16 那份让位，

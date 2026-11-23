@@ -55,7 +55,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | serve_stale | false | Keep and serve expired entries according to RFC 8767 behavior. Once the refresh of an expired answer fails, it is not refreshed again for 30 seconds, and requests hitting it get the stale data at once without waiting (the failure recheck of RFC 8767 section 5); the first hit after the 30 seconds tries again. |
 | serve_stale_ttl | 30 | TTL written into a stale response. |
 | serve_stale_expire_ttl | 86400 | Maximum stale age in seconds; 0 means no stale-age limit. |
-| serve_stale_ttl_reset | true | Reset the stale-age window when stale data is served. |
+| serve_stale_ttl_reset | false | Once the background refresh of a stale answer fails, how long it may still be served counts afresh from that failure: a name the upstream keeps giving nothing new for, and that keeps being asked, then goes out stale beyond serve_stale_expire_ttl (Unbound's serve-expired-ttl-reset, off there by default too). It used to be on by default and counted afresh on every stale answer served. |
 | serve_stale_client_timeout_ms | 0 | 0 serves stale immediately; a positive value tries the upstream for up to this many milliseconds first, bounded by what is left of request_timeout_ms so the stale answer still goes out in time. When that refresh fails, the stale answer goes out at once instead of after the full wait. |
 | geoip_db_path | null | MaxMind MMDB path. |
 | geoip_dat_path | null | V2Ray GeoIP data path: either a protobuf `.dat` file or the compatible JSON format described below. |
