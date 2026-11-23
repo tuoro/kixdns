@@ -1621,10 +1621,7 @@ impl Engine {
                 self.drop_refreshed(target.slot, &question, &view, target);
             };
             let mut refresh_passed_an_answer = false;
-            // 决策循环的第几轮：第一轮在任何转发之前 / Which pass of the decision loop: the first runs before anything is forwarded
-            let mut pass = 0u32;
             'decision_loop: loop {
-                pass += 1;
                 while let Decision::Jump { pipeline } = &decision {
                     if jumps_left == 0 {
                         crate::warn_sparse!("max jump limit reached");
@@ -1683,28 +1680,22 @@ impl Engine {
                             // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
                             // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
                             // 上游。后台刷新照请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），
-                            // 走的是同一条路线、写回同一个键。以下情况不查，保持原样：
-                            // - 不在第一轮：continue 之后，请求已经越过了一个应答，后面的规则可能复用它；
-                            // - 目标的应答因「谁在问」而不同：它给别的请求方的应答不一定是给这一个的。
-                            // 以前路线上按 EDNS 判断、或者类别不是 IN 时也不查：那时刷新重放的请求不带 EDNS、
-                            // 类别固定是 IN，可能走另一条路线
+                            // 走的是同一条路线、写回同一个键。键里带着目标按自己的规则（连同它跳得到的 pipeline）
+                            // 分辨请求方的结果，和直接选进目标的请求查的是同一套键，所以目标按「谁在问」给不同
+                            // 应答时也照查；continue 之后跳过来的请求也一样：留着复用的应答在跳转时已经丢掉，
+                            // 目标里的处理和第一轮没有分别。以前这两种都不查，经过它们的请求每次都问上游
                             // After a jump, look in the response cache again under the target pipeline's
                             // key. A forwarded answer is stored under that key, while the entry lookup used
                             // the entry pipeline's, so a request that jumped never found it and went upstream
                             // every time. A background refresh replays the request as it came (from the same
                             // address, with or without EDNS, in the same class, see refresh.rs), taking the same
-                            // route and writing back under the same key. These cases do not look and keep the
-                            // current behaviour:
-                            // - after the first pass: past a continue the request has passed over an answer
-                            //   that later rules may reuse;
-                            // - a target whose answer differs by who is asking: its answer to another
-                            //   requester is not necessarily its answer to this one.
-                            // A route matching on EDNS, or a class other than IN, used not to look either: the
-                            // refresh then replayed the query without EDNS and in class IN, and might take
-                            // another route
+                            // route and writing back under the same key. The key carries how the target's rules
+                            // (with the pipelines it can jump to) tell requesters apart, the same keys a request
+                            // selected into the target looks up, so a target answering by who is asking is
+                            // looked up as well; so is a request jumping in after a continue: the answer kept for
+                            // reuse is dropped at the jump, and the target handles it as on a first pass. Neither
+                            // used to look, every request through them asking upstream
                             if !skip_cache
-                                && pass == 1
-                                && !p.depends_on_requester
                                 && let Some(resp_bytes) = self
                                     .answer_from_cache(
                                         &phases::CacheLookupContext {
@@ -7345,17 +7336,17 @@ mod jump_response_cache_tests {
         assert_eq!(second_upstream.queries(), 1);
     }
 
-    /// continue 之后才遇到的跳转不查缓存，照常转发：那时请求已经越过了一个应答（可能被后面的
-    /// 规则复用），查缓存提前返回会绕开这些。只有还没转发过的第一轮才查。两次查询来自两个客户端：
-    /// 入口按客户端地址判断，规则缓存因此按客户端分开，两次都重新走 `try-first`。
-    /// A jump reached only after a continue is not looked up in the cache and forwards
-    /// as before: by then the request has passed over an answer (which later rules may
-    /// reuse), and returning early from the cache would bypass that. Only the first
-    /// pass, before anything was forwarded, looks up. The two queries come from two
-    /// clients: the entry matches on client address, so the rule cache keeps them apart
-    /// and both run `try-first` again.
+    /// continue 之后才遇到的跳转也查目标的缓存：越过的那份应答在跳转时已经丢掉，目标的应答和第一轮跳过来的
+    /// 一样。以前只有第一轮才查，经过 continue 的请求每次都问目标的上游。两次查询来自两个客户端：入口按客户端
+    /// 地址判断，规则缓存因此按客户端分开，两次都重新走 `try-first`
+    /// A jump reached only after a continue looks up the target's cache too: the answer
+    /// passed over is dropped at the jump, and the target's answer is the one a first-pass
+    /// jump gets. Only the first pass used to look up, every request through a continue
+    /// asking the target's upstream. The two queries come from two clients: the entry
+    /// matches on client address, so the rule cache keeps them apart and both run
+    /// `try-first` again
     #[tokio::test]
-    async fn a_jump_reached_after_a_continue_still_forwards() {
+    async fn a_jump_reached_after_a_continue_is_answered_from_the_target_cache() {
         let first_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
         let group_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
         let engine = engine_from(serde_json::json!({
@@ -7389,16 +7380,20 @@ mod jump_response_cache_tests {
             );
         }
         assert_eq!(first_upstream.queries(), 2);
-        assert_eq!(group_upstream.queries(), 2);
+        assert_eq!(
+            group_upstream.queries(),
+            1,
+            "the second from the target's cache"
+        );
     }
 
     /// 同一个客户端重复查询也一样：continue 之后得出的决策不进规则缓存（olicesx/kixdns#70），
-    /// 每次都从 `try-first` 开始，跳转发生在第二轮，照常转发。
+    /// 每次都从 `try-first` 开始，跳转发生在第二轮，目标的应答从缓存给出
     /// The same holds for one client asking again: a decision reached after a continue
     /// is not rule-cached (olicesx/kixdns#70), so every request starts at `try-first`,
-    /// jumps on its second pass and forwards as before.
+    /// jumps on its second pass and gets the target's answer from the cache
     #[tokio::test]
-    async fn a_repeated_request_that_continues_still_forwards_after_the_jump() {
+    async fn a_repeated_request_that_continues_is_answered_from_the_target_cache() {
         let first_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
         let group_upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 300).await;
         let engine = engine_from(serde_json::json!({
@@ -7432,16 +7427,22 @@ mod jump_response_cache_tests {
             );
         }
         assert_eq!(first_upstream.queries(), 2);
-        assert_eq!(group_upstream.queries(), 2);
+        assert_eq!(
+            group_upstream.queries(),
+            1,
+            "the second from the target's cache"
+        );
     }
 
-    /// 目标 pipeline 按客户端判断时，跳转后不从缓存给应答：这个客户端该被拦下，
-    /// 不能拿到另一个客户端转发回来、存在目标键下的应答。
-    /// A target that matches on the client is not answered from the cache after a
-    /// jump: a client that its rules block must not get the answer another client's
-    /// forward stored under the target's key.
+    /// 目标 pipeline 按客户端判断时，跳转后按它的键查缓存：键分辨请求方，被拦下的客户端拿不到另一个客户端转发回来的
+    /// 应答，放行的客户端再问时从缓存拿到，不再问上游。以前跳转后不查，放行的客户端每次都问上游
+    /// A target that matches on the client is looked up after a jump by its key: the key tells
+    /// requesters apart, so a client its rules block does not get the answer another client's
+    /// forward stored, and a client let through gets it from the cache when asking again, with no
+    /// further upstream query. Nothing used to be looked up after the jump, a client let through
+    /// asking upstream every time
     #[tokio::test]
-    async fn a_target_that_matches_on_the_client_is_not_served_from_the_cache() {
+    async fn a_target_that_matches_on_the_client_serves_each_client_its_own_answer() {
         let upstream = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
         let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 0 },
@@ -7468,10 +7469,13 @@ mod jump_response_cache_tests {
             ]
         }));
 
-        assert_eq!(
-            answer(&engine, "ads.example", "10.0.0.2").await,
-            Ipv4Addr::new(192, 0, 2, 1)
-        );
+        for _ in 0..3 {
+            assert_eq!(
+                answer(&engine, "ads.example", "10.0.0.2").await,
+                Ipv4Addr::new(192, 0, 2, 1)
+            );
+        }
+        assert_eq!(upstream.queries(), 1, "asked once, then from the cache");
         assert_eq!(
             answer(&engine, "ads.example", "10.0.0.1").await,
             Ipv4Addr::UNSPECIFIED
