@@ -88,12 +88,19 @@ pub(super) fn domain_regex(pattern: &str) -> anyhow::Result<Regex> {
     Ok(limited_regex(&ascii_regex_pattern(pattern)?)?)
 }
 
-/// 匹配器的正则（域名的，和 TXT 内容的）编译时状态空间和 DFA 各限 1 MB，防止复杂度攻击
+/// 一条正则编译后最多多大，防止复杂度攻击：匹配器的正则（见 [`limited_regex`]），以及 GeoSite 数据里合成一个集合的
+/// 一组正则（见 `geosite::Regexes::combine`）
+/// The most a regex may take compiled, against complexity attacks: a matcher's regex (see
+/// [`limited_regex`]), and a group of GeoSite data's regexes combined into one set (see
+/// `geosite::Regexes::combine`)
+pub(super) const REGEX_SIZE_LIMIT: usize = 1_000_000;
+
+/// 匹配器的正则（域名的，和 TXT 内容的）编译时状态空间和 DFA 各限 [`REGEX_SIZE_LIMIT`]
 /// A matcher's regex (for names, and for TXT content) compiled with the state space and the
-/// DFA each capped at 1 MB against complexity attacks
+/// DFA each capped at [`REGEX_SIZE_LIMIT`]
 pub(super) fn limited_regex(pattern: &str) -> Result<Regex, regex::Error> {
     RegexBuilder::new(pattern)
-        .size_limit(1_000_000)
-        .dfa_size_limit(1_000_000)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
 }

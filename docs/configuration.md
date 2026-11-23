@@ -111,7 +111,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 - `full:example.com` 只匹配域名本身，`keyword:`、`regexp:` 按关键词、正则匹配，不带前缀且含 `*` 的值按通配符匹配。
 - `.dat` 文件里的标签可以带属性键，写作 `tag@attr`（如 `google@cn`），和 V2Ray 一样按字面键匹配：`google@!cn` 选的是标记为 `!cn` 的域名。可以写几个属性，如 `google@cn@ads`，选的是每个属性都带的域名。不带属性的域名用 `geo_site: google` 加上 `geo_site_not: google@cn` 选出。
 - JSON 里前缀不认识、没有值或正则无效的条目会跳过并给出警告。
-- `regexp:` 的正则和 domain_regex 一样最长 16384 字节，更长的跳过并给出警告，`.dat` 和 JSON 都是。
+- `regexp:` 的正则和 domain_regex 一样最长 16384 字节、编译后最大 1 MB，超出的跳过并给出警告，`.dat` 和 JSON 都是；一个标签里的正则合在一起匹配，也照样按每条的这个上限。
 
 ### 响应匹配器
 
