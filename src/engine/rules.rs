@@ -4,9 +4,8 @@ use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use rustc_hash::FxHasher;
 use smallvec::SmallVec;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,6 +110,12 @@ pub enum ResponseActionResult {
     },
 }
 
+/// 规则缓存的键：和响应缓存的槽位一样用带密钥的 `Engine::question_hasher` 写进问题（为什么带密钥见那里），再写进规则对
+/// 请求方的判定。以前用不带密钥的 FxHash，请求方能凑出一串落在同一处的名字，存储层只好对所有键再散一遍
+/// The rule cache key: the question written into the keyed `Engine::question_hasher` as for a
+/// response cache slot (why keyed, see there), then how the rules judge the requester. It used
+/// to be an unkeyed FxHash, with which a requester could make up a run of names landing in one
+/// place, so the store hashed every key a second time
 #[inline]
 pub fn calculate_rule_hash(
     cache_namespace: u64,
@@ -120,12 +125,13 @@ pub fn calculate_rule_hash(
     qclass: DNSClass,
     requester: &RequesterKey,
 ) -> u64 {
-    let mut hasher = FxHasher::default();
-    cache_namespace.hash(&mut hasher);
-    pipeline_id.hash(&mut hasher);
-    qname.hash(&mut hasher);
-    u16::from(qtype).hash(&mut hasher);
-    u16::from(qclass).hash(&mut hasher);
+    let mut hasher = Engine::question_hasher(
+        cache_namespace,
+        pipeline_id,
+        qname.as_bytes(),
+        qtype,
+        qclass,
+    );
     requester.hash_into(&mut hasher);
     hasher.finish()
 }

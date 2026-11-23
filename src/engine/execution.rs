@@ -404,8 +404,8 @@ impl Engine {
         requester: &RequesterKey,
         client_ecs: Option<&crate::ecs::EcsKey>,
     ) -> CacheKeys {
-        let mut h =
-            Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass, flags);
+        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
+        flags.bits().hash(&mut h);
         let mut inflight = h.clone();
         // The requester, for a pipeline whose answer depends on it (see
         // `RuntimePipeline::requester`); nothing otherwise, so the key is unchanged
@@ -433,31 +433,34 @@ impl Engine {
         flags: crate::proto_utils::QueryFlags,
         requester: &RequesterKey,
     ) -> u64 {
-        let mut h =
-            Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass, flags);
+        let mut h = Self::question_hasher(cache_namespace, pipeline_id, qname, qtype, qclass);
+        flags.bits().hash(&mut h);
         requester.hash_into(&mut h);
         h.finish()
     }
 
-    /// 算槽位号和 inflight 键的哈希，先写进问题。带密钥（SipHash），密钥每个进程随机取一份：问题名是请求方随意挑的，
-    /// 不带密钥的哈希（以前的 FxHash 对同样长的输入，换什么初值都撞在一起），请求方就能算出一串落在同一个槽位上的名字，
-    /// 挤掉别人存着的应答，也能让 inflight 表的同一个桶越排越长。问题名带着长度写入（已经是小写，见 `parse_quick`），两个
-    /// 不同的问题写进去的不会是同一串字节
-    /// The hasher of slot numbers and inflight keys, with the question written in. It is
-    /// keyed (SipHash), the key drawn at random once per process: the question name is the
-    /// requester's to pick, and with an unkeyed hash (the FxHash this used, whose collisions
-    /// between inputs of one length hold whatever it starts from) a requester could work out
-    /// a run of names landing in one slot, pushing out the answers others have cached, or
-    /// piling up in one bucket of the inflight map. The name goes in with its length (it is
-    /// lowercase already, see `parse_quick`), so no two questions write the same bytes
+    /// 算槽位号、inflight 键和规则缓存的键的哈希，先写进问题；查询位由响应缓存自己再写（规则从不看它们）。带密钥
+    /// （SipHash），密钥每个进程随机取一份：问题名是请求方随意挑的，不带密钥的哈希（以前的 FxHash 对同样长的输入，换什么
+    /// 初值都撞在一起），请求方就能算出一串落在同一个槽位上的名字，挤掉别人存着的应答，也能让 inflight 表的同一个桶越排越
+    /// 长。存储层因此直接用这些键的各位定分片和桶，不再散一遍（见 `cache_store`）。问题名带着长度写入（已经是小写，见
+    /// `parse_quick`），两个不同的问题写进去的不会是同一串字节
+    /// The hasher of slot numbers, inflight keys and rule cache keys, with the question
+    /// written in; the response cache writes the query flags itself (rules never read them).
+    /// It is keyed (SipHash), the key drawn at random once per process: the question name is
+    /// the requester's to pick, and with an unkeyed hash (the FxHash this used, whose
+    /// collisions between inputs of one length hold whatever it starts from) a requester could
+    /// work out a run of names landing in one slot, pushing out the answers others have cached,
+    /// or piling up in one bucket of the inflight map. The store therefore picks shards and
+    /// buckets by the bits of these keys as they are, hashing them no second time (see
+    /// `cache_store`). The name goes in with its length (it is lowercase already, see
+    /// `parse_quick`), so no two questions write the same bytes
     #[inline]
-    fn question_hasher(
+    pub(crate) fn question_hasher(
         cache_namespace: u64,
         pipeline_id: &str,
         qname: &[u8],
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
-        flags: crate::proto_utils::QueryFlags,
     ) -> DefaultHasher {
         static KEYS: LazyLock<RandomState> = LazyLock::new(RandomState::new);
         let mut h = KEYS.build_hasher();
@@ -466,7 +469,6 @@ impl Engine {
         qname.hash(&mut h);
         u16::from(qtype).hash(&mut h);
         u16::from(qclass).hash(&mut h);
-        flags.bits().hash(&mut h);
         h
     }
 
@@ -2151,7 +2153,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use rustc_hash::{FxHashMap, FxHasher};
+    use rustc_hash::FxHashMap;
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -5001,13 +5003,9 @@ mod tests {
             ..RequesterKey::NONE
         };
 
-        // Act & Assert: Without requester facts the hash is the one it always was
-        let mut base = FxHasher::default();
-        0u64.hash(&mut base);
-        pipeline_id.hash(&mut base);
-        qname.hash(&mut base);
-        u16::from(qtype).hash(&mut base);
-        u16::from(qclass).hash(&mut base);
+        // Act & Assert: Without requester facts nothing more is written than the question
+        // 没有请求方的判定时，写进去的只有问题本身
+        let base = Engine::question_hasher(0, pipeline_id, qname.as_bytes(), qtype, qclass);
         assert_eq!(hash(RequesterKey::NONE), base.finish());
 
         // Act & Assert: Different requester classes should result in different hashes
