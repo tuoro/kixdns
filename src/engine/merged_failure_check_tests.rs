@@ -390,7 +390,7 @@ fn cache_expired(engine: &Engine, pipeline: &str, qname: &str) {
             Arc::from(pipeline),
             u16::from(RecordType::A),
             crate::proto_utils::QueryFlags::RECURSIVE,
-            (0, 0),
+            0,
         )
         .with_reach(reach),
     );
