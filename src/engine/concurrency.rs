@@ -70,6 +70,19 @@ pub const WAITING_TO_RUN_AT_MOST: usize = 64;
 /// thousand devices together
 pub const STUCK_KEPT: usize = 1000;
 
+/// 入站的 TCP 和 DoH 连接一共开到这么多以后，新连接只给还没占满自己那一份的设备（见 [`PermitManager::connection_permit`]），
+/// 流控开不开都一样。一条连接占一个文件描述符和几 KB 到几十 KB 内存（DoH 的 TLS 缓冲），连接多到描述符用光时，接不了的
+/// 不光是新连接，问上游的 socket 也开不出来；路由器上内核的描述符上限常常只有 1024。一个局域网用不了这么多：每台设备的
+/// DoH 一两条，TCP 只在回答被截断时才用
+/// Once this many inbound TCP and DoH connections are open in all, a new one goes only to a
+/// device not yet holding its share (see [`PermitManager::connection_permit`]), with flow control
+/// on or off. A connection holds a file descriptor and a few to some tens of KB of memory (the
+/// TLS buffers of DoH), and with connections enough to use up the descriptors it is not only
+/// new connections that fail but the sockets for asking upstreams too; on a router the kernel's
+/// descriptor limit is often just 1024. A local network needs nowhere near this many: one or
+/// two DoH connections per device, and TCP only when an answer was truncated
+pub const CONNECTION_BUDGET: usize = 512;
+
 /// 回答一般要多久，看最近这么多个回答里最慢的 `1 / SLOWEST_ONE_IN`，等过它的 [`WAITS_TIMES_SLOWEST`] 倍还没回答的算卡住
 /// How long answers usually take goes by the slowest `1 / SLOWEST_ONE_IN` of the latest
 /// answers, and a query waiting [`WAITS_TIMES_SLOWEST`] times that with no answer counts as
@@ -563,14 +576,16 @@ impl FlowControlState {
 
     /// `device` 的一条 TCP 或 DoH 新连接接不接：和查询一样只看内存，紧张时开着的连接不比各设备平均少，或者占着查询的那一份
     /// （见 [`Self::memory_refuses`]），就不接——占着内存的设备开新连接，连接上的查询反正也要被拒。连接和查询各比各的：
-    /// 只开着一条空闲连接不算占了查询的份，开着很多连接的设备（比如 DoH 前面的反向代理）也不把查询的份额压小
+    /// 只开着一条空闲连接不算占了查询的份，开着很多连接的设备（比如 DoH 前面的反向代理）也不把查询的份额压小。内存放得下时
+    /// 照样受连接一共的预算管（见 [`PermitManager::connection_permit`]）
     /// Whether a new TCP or DoH connection from `device` is taken: by memory alone, as for a
     /// query, and when tight a device holding no fewer open connections than the average, or
     /// holding its share of queries (see [`Self::memory_refuses`]), gets none: a device holding
     /// the memory would have the queries on a new connection refused anyway. Connections and
     /// queries are each compared with their own kind: one idle connection is no share of queries,
     /// and a device holding many connections (a reverse proxy in front of DoH, say) does not make
-    /// the shares of queries smaller
+    /// the shares of queries smaller. With room in memory the budget of connections in all still
+    /// applies (see [`PermitManager::connection_permit`])
     #[inline]
     pub fn connection_permit(
         &self,
@@ -591,7 +606,7 @@ impl FlowControlState {
             manager.count_refused(Defence::Connection);
             None
         } else {
-            Some(manager.acquire_connection_for(device))
+            manager.connection_permit(device)
         }
     }
 }
@@ -1329,8 +1344,8 @@ pub struct PermitManager {
     turns: AtomicU64,
     /// 开了流控时，每一份设备在途的查询 / With flow control on, the queries in flight per slot of devices
     queries: DeviceCounts,
-    /// 开了流控时，每一份设备开着的 TCP 和 DoH 连接 / With flow control on, the TCP and DoH
-    /// connections open per slot of devices
+    /// 每一份设备开着的 TCP 和 DoH 连接，流控开不开都记 / The TCP and DoH connections open per
+    /// slot of devices, counted with flow control on or off
     connections: DeviceCounts,
     /// 开了流控时，所有上游最近的回答各用了多久，见 [`Self::stuck_after`] / With flow control on, how long
     /// each of the latest answers of all upstreams took, see [`Self::stuck_after`]
@@ -1391,9 +1406,24 @@ impl PermitManager {
         )
     }
 
+    /// `device` 的一条 TCP 或 DoH 新连接：开着的连接一共到了 [`CONNECTION_BUDGET`]，它又占着平分的那一份（见
+    /// [`DeviceCounts::holds_share_of`]）就不给，否则给一个记在它那一份连接上的 permit。没开过连接的设备总连得上，一台
+    /// 设备开再多也只占到它那一份：一共最多比预算多出每台一条
+    /// A new TCP or DoH connection of `device`: none once [`CONNECTION_BUDGET`] are open in all and
+    /// it holds its share of them (see [`DeviceCounts::holds_share_of`]), otherwise a permit counted
+    /// among its slot's connections. A device holding none always connects, and one opening any
+    /// number gets no more than its share: in all at most one each over the budget
+    pub fn connection_permit(self: &Arc<Self>, device: DeviceSlot) -> Option<PermitGuard> {
+        if self.connections.holds_share_of(device, CONNECTION_BUDGET) {
+            self.count_refused(Defence::Connection);
+            return None;
+        }
+        Some(self.acquire_connection_for(device))
+    }
+
     /// 给 `device` 的一条连接拿 permit，也记在它那一份的连接上 / Takes a permit for a connection of
     /// `device`, counted among its slot's connections as well
-    pub fn acquire_connection_for(self: &Arc<Self>, device: DeviceSlot) -> PermitGuard {
+    fn acquire_connection_for(self: &Arc<Self>, device: DeviceSlot) -> PermitGuard {
         self.active_permits.fetch_add(1, Ordering::Release);
         self.connections.add(device);
         PermitGuard::new(Arc::clone(self), Some((device, Held::Connection)), None)
@@ -2972,7 +3002,7 @@ mod tests {
         let manager = Arc::new(PermitManager::new());
         let flow = state(Duration::from_secs(60));
         let busy = Some(Instant::now() - LONG_AGO);
-        let proxy: Vec<_> = (0..600)
+        let proxy: Vec<_> = (0..CONNECTION_BUDGET - 1)
             .map(|_| {
                 flow.connection_permit(&manager, OTHER)
                     .expect("plenty of memory")
@@ -2982,10 +3012,43 @@ mod tests {
         let mut flooder = Vec::new();
         while let Some(permit) = flow.permit(&manager, busy, ONE) {
             flooder.push(permit);
-            assert!(flooder.len() <= 600, "unbounded");
+            assert!(flooder.len() <= CONNECTION_BUDGET, "unbounded");
         }
         assert_eq!(flooder.len(), 1, "a lone device asking gets one in");
         drop((proxy, flooder));
+    }
+
+    /// 连接一共开到预算以后，开满了自己那一份的设备不再接，没开过的照常接，流控开不开都一样；关掉一条又能开一条。以前
+    /// 没开流控时一台设备开多少接多少，开到描述符用光，问上游的 socket 也开不出来
+    /// Once the budget of connections is open in all, a device holding its share gets no more and
+    /// one holding none still connects, with flow control on or off; closing one makes room for
+    /// one. Without flow control a device used to get every connection it opened, until the
+    /// descriptors ran out and no socket for asking upstreams could be opened either
+    #[test]
+    fn connections_past_the_budget_go_by_shares() {
+        let manager = Arc::new(PermitManager::new());
+        let mut held: Vec<_> = (0..CONNECTION_BUDGET)
+            .map(|_| manager.connection_permit(ONE).expect("under the budget"))
+            .collect();
+        assert!(manager.connection_permit(ONE).is_none(), "holding them all");
+        let other = manager.connection_permit(OTHER).expect("holding none");
+        assert!(
+            manager.connection_permit(OTHER).is_some(),
+            "holding less than its share"
+        );
+        assert_eq!(manager.dropped_requests(), 1);
+        held.pop();
+        assert!(
+            manager.connection_permit(ONE).is_none(),
+            "still holding its share"
+        );
+        let flow = state(Duration::from_secs(60));
+        assert!(
+            flow.connection_permit(&manager, ONE).is_none(),
+            "with flow control on as well"
+        );
+        drop((held, other));
+        assert!(manager.connection_permit(ONE).is_some(), "all closed");
     }
 
     /// 连接和连接比：内存紧张时，开着的连接不比平均少的设备不接新连接，没开连接的照常接；它连接上的查询按查询比

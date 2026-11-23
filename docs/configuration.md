@@ -223,6 +223,8 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 - EDNS 版本不是 0 的查询回 BADVERS（RFC 6891 第 6.1.3 节），回答里的 OPT 写版本 0。
 - 监听器处理错误、整体请求超时或流控拒绝时，对合法查询返回 SERVFAIL。
 - 大于客户端声明大小（EDNS 载荷大小；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试。
+- TCP 上声明的消息超过 4096 字节时不等它发完，连接当场关掉，之前的查询照样答。
+- 入站的 TCP 和 DoH 连接一共开到 512 条以后，新连接只给还没占满自己那一份的设备，流控开不开都一样：没开过连接的设备总连得上，一台设备开再多也只占到它那一份。接不了的连接当场关掉。
 - 双栈套接字（例如监听 `[::]` 的入站 DoH）把 IPv4 客户端报成 `::ffff:a.b.c.d`。规则、GeoIP、ECS 和缓存都按它背后的 IPv4 地址判断，client_ip 照常写 IPv4 网段；写成 `::ffff:a.b.c.d/n` 的网段按它所指的 IPv4 网段处理。
 
 只有设置 settings.bind_doh 后才会启用入站 DoH。启用时必须同时设置 settings.doh_tls_cert 和 settings.doh_tls_key，且路径指向 PEM 文件。路径默认为 /dns-query，可通过 settings.doh_path 修改。
@@ -230,10 +232,11 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 入站 DoH 处理器：
 
 - 支持 HTTP/2 和 HTTP/1.1：TLS 握手时客户端选了 h2 就用 HTTP/2，一条连接上最多同时处理 100 个请求；只会 HTTP/1.1 或不发 ALPN 的客户端照旧用 HTTP/1.1；
-- 连接空闲 10 秒（没有请求在处理，也没有新请求来）就关闭，两种 HTTP 版本一样；
+- 连接空闲 10 秒（没有请求在处理，也没有新请求来）就关闭，两种 HTTP 版本一样；HTTP/2 发了 GOAWAY 以后 10 秒还没关上就直接断开；
+- 写回答 10 秒没有进展（客户端只发不读）就断开连接；
 - 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
 - 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
-- 拒绝大于 64 KiB 的 DNS 请求体；
+- 拒绝超过 4096 字节的查询（POST 的请求体回 413，GET 的 dns 参数解码后超长回 400），和 UDP、TCP 的上限一样；
 - 和 UDP、TCP 一样只回答标准查询：QR=1 的应答、问题数不是 1、opcode 不是 0 等报文回 400；
 - 成功处理后返回 application/dns-message。
 

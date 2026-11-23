@@ -223,6 +223,8 @@ Inbound listener behavior:
 - A query whose EDNS version is not 0 is answered BADVERS (RFC 6891 section 6.1.3), with an OPT of version 0 in the reply.
 - A listener processing error, an overall request timeout, or flow control refusing a query returns SERVFAIL to the client for a valid query.
 - UDP responses larger than the client's advertised size (the EDNS payload size, or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP.
+- A message over TCP declaring more than 4096 bytes is not waited for: the connection closes there and then, the queries before it still answered.
+- Once 512 inbound TCP and DoH connections are open in all, a new one goes only to a device not yet holding its share, with flow control on or off: a device holding none always connects, and one opening any number gets no more than its share. A connection not taken is closed at once.
 - A dual-stack socket (inbound DoH listening on `[::]`, say) reports an IPv4 client as `::ffff:a.b.c.d`. Rules, GeoIP, ECS and the cache all judge it by the IPv4 address it carries, so client_ip takes IPv4 networks as usual; a network written as `::ffff:a.b.c.d/n` counts as the IPv4 network it names.
 
 Inbound DoH is disabled unless settings.bind_doh is set. When it is set, settings.doh_tls_cert and settings.doh_tls_key are required and must point to PEM files. The path defaults to /dns-query and can be changed with settings.doh_path.
@@ -230,10 +232,11 @@ Inbound DoH is disabled unless settings.bind_doh is set. When it is set, setting
 The inbound DoH handler:
 
 - speaks HTTP/2 and HTTP/1.1: a client that picks h2 in the TLS handshake gets HTTP/2, with up to 100 requests handled at once on one connection; a client that only speaks HTTP/1.1, or sends no ALPN, keeps HTTP/1.1;
-- closes a connection idle for 10 seconds (nothing being handled and nothing new coming), under either HTTP version;
+- closes a connection idle for 10 seconds (nothing being handled and nothing new coming), under either HTTP version; an HTTP/2 connection not closed 10 seconds after its GOAWAY is dropped;
+- drops a connection whose answers make no progress being written for 10 seconds (a client sending without reading);
 - accepts POST requests at the configured path and reads a DNS wire message body;
 - accepts GET requests at the configured path with a dns base64url-without-padding query parameter;
-- rejects DNS bodies larger than 64 KiB;
+- rejects queries over 4096 bytes (a POST body with 413, a GET dns parameter decoding longer with 400), the same bound as over UDP and TCP;
 - answers standard queries only, as UDP and TCP do: a response with QR=1, a question count other than 1, an opcode other than 0 and the like get 400;
 - returns application/dns-message for a successful DNS response.
 

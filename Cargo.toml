@@ -83,6 +83,8 @@ windows-sys = { version = "0.61", features = ["Win32_Security"] }
 
 [dev-dependencies]
 ctor = "0.2"
+# 测试里用暂停的时钟等超时，不必真等 / Tests wait out timeouts on a paused clock instead of for real
+tokio = { version = "1", features = ["test-util"] }
 rcgen = "0.13"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

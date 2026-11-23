@@ -31,9 +31,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::engine::{Engine, FastPathResponse, engine_helpers, write_cache_hit};
 use crate::observe::ClientTransport;
+use crate::proto_utils::MAX_QUERY_LEN;
 use crate::watcher;
-
-const MAX_DNS_MESSAGE: usize = 64 * 1024;
 
 /// 客户端发送完整请求头的时限，也覆盖 keep-alive 连接上等待下一个请求的空闲期；
 /// 到期由 hyper 关闭连接。RFC 7766 §6.2.3 建议 DNS 服务端对空闲连接设数秒量级
@@ -58,6 +57,12 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// 连上以后迟迟不完成 TLS 握手的客户端，过这么久就断开，和 DNS over TCP 上不说话的客户端一样；
 /// 以前它会一直占着任务和句柄。
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 写不出去的时限：连接上的一次写或 flush 这么久没有进展，就当它断了（见 [`WriteStall`]）。和 DNS over TCP 写回答的时限
+/// 一样
+/// How long a write may make no progress: a write or flush on the connection stuck this long
+/// means it is gone (see [`WriteStall`]). The same bound as for writing an answer over DNS over TCP
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 一条 HTTP/2 连接上最多同时处理这么多个请求（RFC 9113 第 6.5.2 节建议不低于 100）
 /// At most this many requests are handled at once on one HTTP/2 connection (RFC 9113
@@ -125,7 +130,7 @@ pub async fn run_doh_with_listener(
                     // picked h2 during the handshake, HTTP/1.1 otherwise
                     let http2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
                     // hyper 1.x 需要 TokioIo 适配器包装 IO
-                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let io = WriteStall::new(hyper_util::rt::TokioIo::new(tls_stream));
                     if http2 {
                         serve_http2(io, peer, engine, doh_path).await;
                         return;
@@ -165,7 +170,7 @@ pub async fn run_doh_with_listener(
 /// The comings and goings of requests on one HTTP/2 connection: how many are being
 /// handled, and when the last one ended
 struct Http2Activity {
-    started: std::time::Instant,
+    started: tokio::time::Instant,
     in_flight: std::sync::atomic::AtomicUsize,
     /// 最后一个请求结束时离连接建立多少毫秒 / When the last request ended, in milliseconds since the connection was made
     last_end_ms: std::sync::atomic::AtomicU64,
@@ -174,7 +179,7 @@ struct Http2Activity {
 impl Http2Activity {
     fn new() -> Self {
         Self {
-            started: std::time::Instant::now(),
+            started: tokio::time::Instant::now(),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             last_end_ms: std::sync::atomic::AtomicU64::new(0),
         }
@@ -214,13 +219,108 @@ impl Drop for Http2Request {
     }
 }
 
+/// 写不出去就断开的连接：一次写或 flush 卡了 [`WRITE_STALL_TIMEOUT`] 没有进展，报 TimedOut，hyper 随之关掉连接。只发不读
+/// 的客户端以前能让连接一直卡在写上：HTTP/1.1 流水线发来的请求答不出去，读请求头的时限也就轮不到
+/// A connection dropped once it cannot be written: a write or flush stuck for
+/// [`WRITE_STALL_TIMEOUT`] without progress fails with TimedOut, and hyper closes the connection.
+/// A client sending without reading used to keep a connection stuck on a write for good: the
+/// answers to pipelined HTTP/1.1 requests never went out, so the time limit on reading a
+/// request head never came round
+struct WriteStall<I> {
+    io: I,
+    /// 从卡住那一刻起的时限，有进展就清掉 / The deadline from when it got stuck, cleared on progress
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<I> WriteStall<I> {
+    fn new(io: I) -> Self {
+        Self { io, stalled: None }
+    }
+
+    /// 一次写的结果：有进展就清掉时限，卡住就等着时限 / What a write came to: progress clears the
+    /// deadline, being stuck waits on it
+    fn progress<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        poll: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        if poll.is_ready() {
+            self.stalled = None;
+            return poll;
+        }
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(WRITE_STALL_TIMEOUT)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::ErrorKind::TimedOut.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<I: hyper::rt::Read + Unpin> hyper::rt::Read for WriteStall<I> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<I: hyper::rt::Write + Unpin> hyper::rt::Write for WriteStall<I> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.io).poll_write(cx, buf);
+        self.progress(cx, poll)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.io).poll_write_vectored(cx, bufs);
+        self.progress(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let poll = std::pin::Pin::new(&mut self.io).poll_flush(cx);
+        self.progress(cx, poll)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let poll = std::pin::Pin::new(&mut self.io).poll_shutdown(cx);
+        self.progress(cx, poll)
+    }
+}
+
 /// HTTP/2 连接：一条连接上的请求同时处理，每个流照样经 [`handle_doh_request`]。空着
 /// [`HEADER_READ_TIMEOUT`]（没有请求在处理，也没有新请求来）就发 GOAWAY 关掉，和 HTTP/1.1 keep-alive 连接
-/// 空着的时限一样；还没发完的请求由它自己的时限管
+/// 空着的时限一样；还没发完的请求由它自己的时限管。GOAWAY 以后再过 [`HEADER_READ_TIMEOUT`] 还没关上就断开：优雅关闭
+/// 要等客户端回 PING，不回的客户端以前能让连接一直开着
 /// An HTTP/2 connection: its requests are handled at once, each stream through
 /// [`handle_doh_request`] as before. Idle for [`HEADER_READ_TIMEOUT`] (nothing being handled and
 /// nothing new coming) it is closed with GOAWAY, the same bound as an idle HTTP/1.1 keep-alive
-/// connection; a request still arriving is bounded by its own limits
+/// connection; a request still arriving is bounded by its own limits. Not closed another
+/// [`HEADER_READ_TIMEOUT`] after the GOAWAY, it is dropped: a graceful close waits for the client
+/// to answer a PING, and a client that never did used to keep the connection open for good
 async fn serve_http2<I>(io: I, peer: SocketAddr, engine: Arc<Engine>, doh_path: Arc<str>)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -243,7 +343,8 @@ where
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
         .serve_connection(io, svc);
     tokio::pin!(conn);
-    let mut closing = false;
+    // 发了 GOAWAY 以后最晚什么时候断开 / When at the latest to drop it once the GOAWAY is out
+    let mut closing: Option<tokio::time::Instant> = None;
     // 被叫醒后先让出一轮再干活，同一轮答好的请求就能一次写出去。不让的话，答完第一个请求时唤醒的连接任务排在
     // 最前面，马上写出这一个回答，一轮的回答各写一次；连接关了 Nagle，每次写就是一个包
     // Once woken, yield one round before working, so the requests answered during that round
@@ -252,9 +353,13 @@ where
     // connection, each write is a packet
     let mut yielded = false;
     loop {
-        // 下一次看看空了没有：最早也要在最后一个请求结束 HEADER_READ_TIMEOUT 以后 / When to look
-        // again whether it is idle: no earlier than HEADER_READ_TIMEOUT after the last request ended
-        let wait = HEADER_READ_TIMEOUT.saturating_sub(activity.idle_for().unwrap_or_default());
+        // 下一次看看空了没有：最早也要在最后一个请求结束 HEADER_READ_TIMEOUT 以后；关着的时候是断开的期限 / When to
+        // look again whether it is idle: no earlier than HEADER_READ_TIMEOUT after the last request
+        // ended; while closing, the deadline for dropping it
+        let wake = closing.unwrap_or_else(|| {
+            tokio::time::Instant::now()
+                + HEADER_READ_TIMEOUT.saturating_sub(activity.idle_for().unwrap_or_default())
+        });
         let served = std::future::poll_fn(|cx| {
             yielded = !yielded;
             if yielded {
@@ -265,10 +370,13 @@ where
         });
         tokio::select! {
             _ = served => return,
-            () = tokio::time::sleep(wait), if !closing => {
+            () = tokio::time::sleep_until(wake) => {
+                if closing.is_some() {
+                    return;
+                }
                 if activity.idle_for().is_some_and(|idle| idle >= HEADER_READ_TIMEOUT) {
                     conn.as_mut().graceful_shutdown();
-                    closing = true;
+                    closing = Some(tokio::time::Instant::now() + HEADER_READ_TIMEOUT);
                 }
             }
         }
@@ -288,17 +396,17 @@ async fn handle_doh_request(
         (&Method::POST, path) if path == doh_path => {
             // 先看 Content-Length：声明超限的请求一个字节都不读；再用 Limited 给
             // body 本身封顶，分块传输或与声明不符的发送方也只能让服务端缓冲
-            // MAX_DNS_MESSAGE 字节。此前 body 先被整个收进内存再比较长度。
+            // MAX_QUERY_LEN 字节。此前 body 先被整个收进内存再比较长度。
             // Check Content-Length first so a request that declares an oversized
             // body is refused without reading any of it, then cap the body itself
             // so chunked or lying senders cannot make the server buffer more than
-            // MAX_DNS_MESSAGE. Previously the whole body was collected before the
+            // MAX_QUERY_LEN. Previously the whole body was collected before the
             // length was compared.
             let declared = req.body().size_hint().exact();
-            if declared.is_some_and(|len| len > MAX_DNS_MESSAGE as u64) {
+            if declared.is_some_and(|len| len > MAX_QUERY_LEN as u64) {
                 return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
             }
-            let body = Limited::new(req.into_body(), MAX_DNS_MESSAGE).collect();
+            let body = Limited::new(req.into_body(), MAX_QUERY_LEN).collect();
             // 正文几乎总是和请求头一起到：先看一眼，到齐了就不必开定时器；没到齐才计时
             // The body nearly always arrives with the head: a first look that finds it whole
             // needs no timer, which is armed only when it is still coming
@@ -355,6 +463,10 @@ fn extract_get_dns_param(query: &str) -> Option<Bytes> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     for pair in query.split('&') {
         if let Some(val) = pair.strip_prefix("dns=") {
+            // 解码出来比 MAX_QUERY_LEN 长的不解码 / One that would decode longer than MAX_QUERY_LEN is not decoded
+            if val.len() > MAX_QUERY_LEN.div_ceil(3) * 4 {
+                return None;
+            }
             let decoded = URL_SAFE_NO_PAD.decode(val).ok()?;
             if !decoded.is_empty() {
                 return Some(Bytes::from(decoded));
@@ -987,8 +1099,6 @@ mod tests {
         assert_eq!(resp[3] & 0x0F, 0x02, "RCODE should be SERVFAIL (2)");
     }
 
-    // ---- MAX_DNS_MESSAGE size guard ----
-
     /// 数写了几次的连接：HTTP/2 把攒好的帧写完 flush 一次，一次连接 poll 就 flush 一次，不管有没有东西要写，
     /// 所以只数写过东西的那些 flush
     /// A connection counting its writes: HTTP/2 writes the frames it has gathered, then
@@ -1104,10 +1214,49 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_max_dns_message_constant() {
-        // RFC 1035 limits DNS messages to 65535 bytes; we cap at 64KB for safety
-        assert_eq!(MAX_DNS_MESSAGE, 64 * 1024);
+    /// 写卡住 WRITE_STALL_TIMEOUT 没有进展就报 TimedOut：对端不读，写满以后再写的那一次到期失败
+    /// A write stuck for WRITE_STALL_TIMEOUT without progress fails with TimedOut: with the peer not
+    /// reading, the write after the buffer fills fails at the deadline
+    #[tokio::test(start_paused = true)]
+    async fn a_write_stuck_for_the_stall_timeout_fails() {
+        use hyper::rt::Write;
+
+        let (near, _far) = tokio::io::duplex(16);
+        let mut io = WriteStall::new(hyper_util::rt::TokioIo::new(near));
+        let room = std::future::poll_fn(|cx| std::pin::Pin::new(&mut io).poll_write(cx, &[0; 16]));
+        assert_eq!(room.await.unwrap(), 16, "room for one");
+        let started = tokio::time::Instant::now();
+        let stuck = std::future::poll_fn(|cx| std::pin::Pin::new(&mut io).poll_write(cx, &[0; 16]))
+            .await
+            .expect_err("nobody reads");
+        assert_eq!(stuck.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), WRITE_STALL_TIMEOUT);
+    }
+
+    /// 空着的 HTTP/2 连接发了 GOAWAY，客户端不理（连 PING 都不回），再过 HEADER_READ_TIMEOUT 就断开。以前优雅关闭一直等
+    /// 客户端回 PING，连接永远开着
+    /// An idle HTTP/2 connection sent its GOAWAY and the client ignores it (not even answering the
+    /// PING): it is dropped HEADER_READ_TIMEOUT later. The graceful close used to wait for the
+    /// client's PING for good, the connection staying open forever
+    #[tokio::test(start_paused = true)]
+    async fn an_http2_client_ignoring_the_goaway_is_dropped() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let started = tokio::time::Instant::now();
+        let served = tokio::spawn(serve_http2(
+            hyper_util::rt::TokioIo::new(server),
+            "127.0.0.1:53000".parse().unwrap(),
+            Arc::new(make_static_engine("NXDOMAIN")),
+            Arc::from("/dns-query"),
+        ));
+        // 握手以后客户端的连接不再驱动：它什么也不读、什么也不回 / After the handshake the client's
+        // connection is driven no more: it reads nothing and answers nothing
+        let (_requests, connection) = h2::client::handshake(client).await.expect("handshake");
+        tokio::time::timeout(HEADER_READ_TIMEOUT * 3, served)
+            .await
+            .expect("dropped")
+            .unwrap();
+        assert_eq!(started.elapsed(), HEADER_READ_TIMEOUT * 2);
+        drop(connection);
     }
 
     // ---- build_tls_acceptor ----
