@@ -1,6 +1,9 @@
-//! 规则里的正则：按 ASCII 编译、限制编译后的大小，域名正则不分大小写
-//! The regexes in rules: compiled for ASCII with a bound on their compiled size, domain regexes
-//! ignoring case
+//! 规则里的正则：按 ASCII 编译、限制编译后的大小。域名正则照写的区分大小写（写了 `(?i)` 才不分），规则看到的名字
+//! 已转成小写（见 `proto_utils::name_text`），所以不带 `(?i)` 写成大写的字母不会命中
+//! The regexes in rules: compiled for ASCII with a bound on their compiled size. A domain regex
+//! is case-sensitive as written (ignoring case only under `(?i)`), and the names rules see are
+//! lowercased already (see `proto_utils::name_text`), so without `(?i)` a letter written in
+//! capitals never matches
 
 use super::*;
 /// 正则写得比 `max` 字节长时的报错 / The error for a regex written longer than `max` bytes

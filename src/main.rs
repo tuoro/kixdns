@@ -348,7 +348,7 @@ async fn async_main() -> anyhow::Result<()> {
 
             let filter_slice = filter_countries.as_deref();
 
-            match kixdns::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(
+            match kixdns::matcher::geoip_converter::convert_dat_to_mmdb(
                 &input,
                 &output,
                 filter_slice,

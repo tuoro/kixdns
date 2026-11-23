@@ -380,7 +380,7 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
     )
     .unwrap();
     let mmdb = dir.path().join("country.mmdb");
-    crate::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&mmdb_source, &mmdb, None).unwrap();
+    crate::matcher::geoip_converter::convert_dat_to_mmdb(&mmdb_source, &mmdb, None).unwrap();
     let data = dir.path().join("geoip.json");
     std::fs::write(
         &data,
@@ -446,7 +446,7 @@ async fn a_hot_reload_reads_an_mmdb_replaced_in_place() {
         let entries =
             format!(r#"{{"entries":[{{"country_code":"{country}","ips":["198.51.100.0/24"]}}]}}"#);
         std::fs::write(&source, entries).unwrap();
-        crate::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+        crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
     };
     convert("US");
     let cfg = || {
