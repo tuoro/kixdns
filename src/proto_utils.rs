@@ -93,11 +93,13 @@ pub fn is_standard_query_header(packet: &[u8]) -> bool {
     flags & 0x8000 == 0 && flags & 0x7800 == 0 && qd_count == 1 && an_count == 0 && ns_count == 0
 }
 
-/// 读不了的查询的 FORMERR：只有请求头，问题读得出来就带上问题（见 [`short_reply`]）
+/// 读不了的查询的 FORMERR：只有请求头，问题读得出来就带上问题（见 [`short_reply`]），查询带着读得出的 OPT 时也带 OPT（见
+/// [`reply_as_asked`]，RFC 6891 第 7 节）
 /// The FORMERR for a query that cannot be read: the header alone, with the question when that
-/// can be read (see [`short_reply`])
+/// can be read (see [`short_reply`]), and an OPT when the query carries one that can be read
+/// (see [`reply_as_asked`], RFC 6891 section 7)
 pub fn formerr_reply(query: &[u8]) -> Bytes {
-    short_reply(query, ResponseCode::FormErr, true)
+    reply_as_asked(short_reply(query, ResponseCode::FormErr, true), query)
 }
 
 /// 一个查询的 SERVFAIL，三个监听器过载拒绝和超时时都回它：照线上格式拼（见 [`short_reply`]），不必解析查询，再照查询规整
@@ -138,8 +140,8 @@ fn short_reply(request: &[u8], rcode: ResponseCode, question: bool) -> Bytes {
 }
 
 /// 请求头不是 KixDNS 回答的标准查询（见 [`is_standard_query_header`]）时的应答。只有请求头，带着它的 ID、
-/// 操作码、RD 和 CD，各段计数为 0：不比请求长，伪造来源也放大不了流量；别的操作码下各段的意思不同，
-/// 也不往应答里抄。
+/// 操作码、RD 和 CD，请求带着读得出的 OPT 时再加一条 OPT（RFC 6891 第 7 节：带 OPT 的请求，应答也要带）：不比请求长，
+/// 伪造来源也放大不了流量；别的操作码下各段的意思不同，也不往应答里抄。以前从不带 OPT，经 DoH 问时请求带了填充才碰巧带上
 /// - 操作码不是 QUERY（NOTIFY、UPDATE 这些 KixDNS 不做的）：NOTIMP（RFC 1035 第 4.1.1 节）。
 /// - 操作码是 QUERY，但问题数不是 1，或者带着回答、授权记录：FORMERR（RFC 9619）。RFC 7873 第 5.4 节那种
 ///   只带 cookie、没有问题的探测，也由此得到回答。
@@ -148,9 +150,11 @@ fn short_reply(request: &[u8], rcode: ResponseCode, question: bool) -> Bytes {
 /// 以前除了 NOTIMP，这些都被丢掉（UDP）或者断开连接（TCP）。
 ///
 /// The reply to a request whose header is not the standard query KixDNS answers (see
-/// [`is_standard_query_header`]). The header alone, with its ID, opcode, RD and CD and every
-/// count at 0: no longer than the request, a forged source gains no amplification, and the
-/// sections, meaning other things under other opcodes, are not copied.
+/// [`is_standard_query_header`]). The header alone, with its ID, opcode, RD and CD, and an OPT
+/// added when the request carries one that can be read (RFC 6891 section 7: a request with an
+/// OPT gets one back): no longer than the request, a forged source gains no amplification, and
+/// the sections, meaning other things under other opcodes, are not copied. It never carried an
+/// OPT before, except by chance over DoH when the request was padded.
 /// - An opcode other than QUERY (NOTIFY, UPDATE and the like, which KixDNS does not do) gets
 ///   NOTIMP (RFC 1035 section 4.1.1).
 /// - A QUERY with a question count other than 1, or carrying answer or authority records,
@@ -169,7 +173,7 @@ pub fn header_reply(packet: &[u8]) -> Option<Bytes> {
     } else {
         ResponseCode::FormErr
     };
-    Some(short_reply(packet, rcode, false))
+    Some(reply_as_asked(short_reply(packet, rcode, false), packet))
 }
 
 /// DNS 报文头的长度 / The length of a DNS header
@@ -2203,6 +2207,33 @@ mod tests {
             Some(jumps_from(16) + 2)
         );
         assert_eq!(strict_name_end(&packet, jumps_from(17)), None);
+    }
+
+    /// 带着读得出的 OPT 的请求，NOTIMP 和 FORMERR 也带 OPT，DO 位照抄（RFC 6891 第 7 节）；不带 OPT 的照旧不带
+    /// A request carrying an OPT that can be read gets one back with NOTIMP and FORMERR too, its DO
+    /// bit copied (RFC 6891 section 7); one without stays without
+    #[test]
+    fn notimp_and_formerr_carry_an_opt_for_a_request_with_one() {
+        // OPT 里的选项说有 10 字节、实际一个字节都没有：完整解析读不了，OPT 照样找得到
+        // An option in the OPT declaring 10 bytes and holding none: the full parse cannot read
+        // it, yet the OPT is found
+        let mut unreadable = vec![
+            0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1, 1, b'a', 0, 0, 1, 0, 1,
+        ];
+        push_opt(&mut unreadable, 0, true, &[0, 15, 0, 10]);
+        assert!(Message::from_bytes(&unreadable).is_err());
+        let mut notify = vec![0x56, 0x78, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 1];
+        push_opt(&mut notify, 0, true, &[]);
+        for (case, reply) in [
+            ("FORMERR", formerr_reply(&unreadable)),
+            ("NOTIMP", header_reply(&notify).unwrap()),
+        ] {
+            assert_eq!(reply[10..12], [0, 1], "{case}: one additional record");
+            let opt = find_opt(&reply).unwrap().expect("an OPT");
+            assert!(opt.dnssec_ok(&reply), "{case}: DO copied");
+        }
+        let without = [0x56, 0x78, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(header_reply(&without).unwrap().len(), 12);
     }
 
     /// 各段计数为 `counts`（问题、Answer、Authority、Additional）的应答报文头
