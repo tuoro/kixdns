@@ -388,3 +388,42 @@ async fn every_reply_carries_its_own_query_id() {
         [0x1111, 0x2222, 0x3333]
     );
 }
+
+/// 领头的请求被取消（客户端走了、外层先超时），等着它的请求重新排：一个接着去问，其余的等它，上游只多问一次。以前等着的
+/// 各自去问，一个领头带着五个等待者走掉，上游就从一次变成六次
+/// The leading request is cancelled (its client went away, an outer timeout came first), and those
+/// waiting on it line up again: one asks next and the rest wait on it, the upstream asked just once
+/// more. Each waiting used to ask by itself, a leader leaving with five waiting turning one query
+/// upstream into six
+#[tokio::test]
+async fn waiters_line_up_again_when_the_leader_is_cancelled() {
+    let up = upstream(Duration::from_millis(300)).await;
+    let engine = engine_from(json!({
+        "settings": counting_settings(json!({ "default_upstream": up.address })),
+        "pipelines": [{ "id": "main", "rules": [] }]
+    }));
+    let packet = query();
+    let ask = |client: String| {
+        let (engine, packet) = (engine.clone(), packet.clone());
+        tokio::spawn(async move { support::ask(&engine, &packet, peer(&client)).await })
+    };
+    let leader = ask("10.0.0.1".to_string());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while up.queries() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the leader asks the upstream");
+    let waiters: Vec<_> = (2..=6).map(|n| ask(format!("10.0.0.{n}"))).collect();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    leader.abort();
+    for waiter in waiters {
+        assert_eq!(first_a(&waiter.await.unwrap()), Some(ANSWER));
+    }
+    assert_eq!(
+        up.queries(),
+        2,
+        "the leader's question and one more after it left"
+    );
+}

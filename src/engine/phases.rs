@@ -721,9 +721,17 @@ pub(crate) async fn handle_forward_decision_logged(
         // 等别人的转发时卡住、不等了的失败 / The failure of waiting no more, stuck on another's
         // forward
         let mut gave_up = None;
-        if !skip_cache {
+        // 等的那个请求没交出结果就走了（被取消、超时）：重新排一次，空着就自己登记、去问，已经有人重新登记了就等它。
+        // 以前直接各自去问，一个领头的带着几个等待者走掉，上游就要被多问几遍。每一圈都有一个领头的走掉，圈数不会多过
+        // 同时在等的请求
+        // The one waited on went away without a result (cancelled, timed out): line up again,
+        // registering and asking when the place is free, or waiting on whoever registered again
+        // first. Each used to ask by itself, and a leader leaving with several waiting had the
+        // upstream asked that many times over. A leader leaves on every round, so there are no
+        // more rounds than requests waiting at once
+        while !skip_cache {
             use dashmap::mapref::entry::Entry;
-            let rx = match engine.inflight.entry(keys.inflight) {
+            let mut rx = match engine.inflight.entry(keys.inflight) {
                 Entry::Vacant(entry) => {
                     entry.insert(InflightEntry::sharing(
                         &inflight_question,
@@ -734,7 +742,7 @@ pub(crate) async fn handle_forward_decision_logged(
                         engine.inflight.clone(),
                         keys.inflight,
                     ));
-                    None
+                    break;
                 }
                 // A request holding an entry (see `held_inflight`) never waits
                 // on one: the entry may be its own, which the next rule forwards
@@ -745,14 +753,14 @@ pub(crate) async fn handle_forward_decision_logged(
                 // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
                 // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
                 // 自己转发。
-                Entry::Occupied(_) if held_inflight.is_some() => None,
+                Entry::Occupied(_) if held_inflight.is_some() => break,
                 // Another question's entry under the same key: the key is only a hash (see
                 // `InflightQuestion`), and waiting on it would hand this request another
                 // question's answer. It forwards itself instead.
                 // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
                 // 别的问题的应答交给这个请求。它自己转发。
-                Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
-                Entry::Occupied(mut entry) => Some(entry.get_mut().subscribe()),
+                Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => break,
+                Entry::Occupied(mut entry) => entry.get_mut().subscribe(),
             };
 
             // 等别人正在做的同一个转发。开了流控时这次等待也看卡没卡住（见 `PermitManager::join`）：卡住了、这台设备
@@ -761,43 +769,37 @@ pub(crate) async fn handle_forward_decision_logged(
             // is seen to for being stuck (see `PermitManager::join`): stuck with enough of the
             // device's kept waiting already it waits no more, and goes on below as the upstream
             // failing
-            let joined = match rx {
-                Some(mut rx) => {
-                    let waiting = async {
-                        rx.changed().await.ok()?;
-                        Some(rx.borrow().clone())
-                    };
-                    match crate::engine::upstream::wait_for_another(
-                        engine,
-                        peer.ip(),
-                        upstream,
-                        upstream_timeout,
-                        waiting,
-                    )
-                    .await
-                    {
-                        Ok(joined) => joined,
-                        Err(failure) => {
-                            gave_up = Some(failure);
-                            None
-                        }
-                    }
-                }
-                None => None,
+            let waiting = async {
+                rx.changed().await.ok()?;
+                Some(rx.borrow().clone())
             };
-            if let Some(result) = joined {
-                if let Some((observer, ctx)) = observed {
-                    observer.inflight_joined(ctx);
+            let result = match crate::engine::upstream::wait_for_another(
+                engine,
+                peer.ip(),
+                upstream,
+                upstream_timeout,
+                waiting,
+            )
+            .await
+            {
+                Ok(Some(result)) => result,
+                Ok(None) => continue,
+                Err(failure) => {
+                    gave_up = Some(failure);
+                    break;
                 }
-                match &result {
-                    Ok(bytes) => {
-                        let mut resp_mut = BytesMut::from(bytes.as_ref());
-                        set_id(&mut resp_mut, tx_id);
-                        response.upstream = Some(Arc::from("inflight"));
-                        return Ok(ForwardResult::Success(resp_mut.freeze()));
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("{}", e)),
+            };
+            if let Some((observer, ctx)) = observed {
+                observer.inflight_joined(ctx);
+            }
+            match &result {
+                Ok(bytes) => {
+                    let mut resp_mut = BytesMut::from(bytes.as_ref());
+                    set_id(&mut resp_mut, tx_id);
+                    response.upstream = Some(Arc::from("inflight"));
+                    return Ok(ForwardResult::Success(resp_mut.freeze()));
                 }
+                Err(e) => return Err(anyhow::anyhow!("{}", e)),
             }
         }
         match gave_up {
