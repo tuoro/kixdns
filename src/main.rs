@@ -251,6 +251,8 @@ use kixdns::panel::PanelMetrics;
 use kixdns::proto_utils::{header_reply, is_standard_query_header, truncate_udp_response};
 #[cfg(target_os = "linux")]
 use kixdns::socket_utils::udp_batch;
+#[cfg(unix)]
+use kixdns::socket_utils::udp_local;
 use kixdns::watcher;
 
 #[derive(Parser, Debug)]
@@ -1005,15 +1007,15 @@ fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::Udp
 
     set_udp_buffers(&socket);
 
-    // 监听在通配地址上时，回答要从查询发到的那个地址发出（见 `receive_in_batches`）。在绑定之前就开：绑定以后、
+    // 监听在通配地址上时，回答要从查询发到的那个地址发出（见 `learn_local_addresses`）。在绑定之前就开：绑定以后、
     // 开之前排进来的报文，内核没给它们记下本机地址
     // Listening on the wildcard address, a reply has to leave from the address the query was
-    // sent to (see `receive_in_batches`). Turned on before binding: for datagrams queued after
+    // sent to (see `learn_local_addresses`). Turned on before binding: for datagrams queued after
     // the bind and before this, the kernel has noted no local address
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if addr.ip().is_unspecified() {
         use std::os::fd::AsRawFd;
-        if let Err(error) = udp_batch::receive_local_addresses(socket.as_raw_fd(), addr.is_ipv6()) {
+        if let Err(error) = udp_local::receive_local_addresses(socket.as_raw_fd(), addr.is_ipv6()) {
             tracing::warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
         }
     }
@@ -1050,15 +1052,15 @@ fn set_udp_buffers(socket: &socket2::Socket) {
 }
 
 /// 一个 UDP 回答发给谁，从哪个本机地址发出。监听在通配地址上时，`local` 是查询发到的那个地址（见
-/// `socket_utils::LocalAddr`）；监听在具体地址上、或别的系统上没有，由内核挑
+/// `socket_utils::LocalAddr`）；监听在具体地址上、或在 Windows 上没有，由内核挑
 /// Whom a UDP reply goes to and which local address it leaves from. Listening on the wildcard
 /// address, `local` is the address the query was sent to (see `socket_utils::LocalAddr`);
-/// listening on one address, or on other systems, there is none and the kernel picks
+/// listening on one address, or on Windows, there is none and the kernel picks
 #[derive(Clone, Copy)]
 struct ReplyTo {
     peer: SocketAddr,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    // 只有 Linux 读得到、用得上 / Only Linux reads and uses it
+    #[cfg_attr(not(unix), allow(dead_code))]
+    // Windows 上读不到、用不上 / Windows neither reads nor uses it
     local: Option<kixdns::socket_utils::LocalAddr>,
 }
 
@@ -1082,12 +1084,11 @@ impl ReplyTo {
     /// 不等待地发一次；发送缓冲满时是 `WouldBlock` / Sends once without waiting; `WouldBlock`
     /// when the send buffer is full
     fn try_send(self, socket: &UdpSocket, data: &[u8]) -> std::io::Result<usize> {
-        #[cfg(target_os = "linux")]
-        if self.local.is_some() {
+        #[cfg(unix)]
+        if let Some(local) = self.local {
             use std::os::fd::AsRawFd;
-            let to = udp_batch::Peer::of(self.peer).from_local(self.local);
             return socket.try_io(tokio::io::Interest::WRITABLE, || {
-                udp_batch::send_one(socket.as_raw_fd(), data, &to)
+                udp_local::send(socket.as_raw_fd(), data, self.peer, local)
             });
         }
         socket.try_send_to(data, self.peer)
@@ -1244,11 +1245,31 @@ async fn run_udp_worker(
     receive_one_by_one(&socket, &engine).await;
 }
 
+/// 监听在通配地址上：回答要从查询发到的那个地址发出，所以让内核把它连同每个报文一起交上来，开上了返回 true。监听在
+/// 具体地址上时回答只会从那个地址发出，用不着
+/// Listening on the wildcard address: a reply has to leave from the address the query was sent
+/// to, so the kernel hands it over with each datagram, and true comes back once that is on.
+/// Listening on one address, replies can only leave from it, and none of this is needed
+#[cfg(unix)]
+fn learn_local_addresses(socket: &UdpSocket) -> bool {
+    use std::os::fd::AsRawFd;
+    socket.local_addr().is_ok_and(|bound| {
+        bound.ip().is_unspecified()
+            && udp_local::receive_local_addresses(socket.as_raw_fd(), bound.is_ipv6())
+                .inspect_err(|error| warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks"))
+                .is_ok()
+    })
+}
+
 /// 一个 worker 的接收循环里，快速路径要用的几样东西 / What the fast path needs in one worker's receive loop
 struct UdpAnswering<'a> {
     socket: &'a Arc<UdpSocket>,
     engine: &'a Arc<Engine>,
     pending: &'a Arc<PendingReplies>,
+    /// 内核连同每个报文交上它发到的本机地址（见 `learn_local_addresses`）/ The kernel hands over
+    /// with each datagram the local address it was sent to (see `learn_local_addresses`)
+    #[cfg(unix)]
+    local_addresses: bool,
     /// 自适应流控：每 100 个请求检查一次是否需要调整 permits / Adaptive flow control: check if adjustment needed every 100 requests
     request_count: u32,
     /// socket 上次收空的时刻，流控靠它判断内核忙不忙 / When the socket last ran empty, by which flow control tells whether the kernel is busy
@@ -1385,6 +1406,8 @@ impl<'a> UdpAnswering<'a> {
             socket,
             engine,
             pending,
+            #[cfg(unix)]
+            local_addresses: learn_local_addresses(socket),
             request_count: 0,
             emptied_at: Instant::now(),
             checks_since_empty: 0,
@@ -1499,10 +1522,28 @@ impl<'a> UdpAnswering<'a> {
             .flatten()
     }
 
+    /// 逐个收：不等待地收一个报文，和它的回答发给谁、从哪个地址发出。要本机地址时才用 recvmsg 连同它一起收，别的
+    /// 时候只收对端；没有报文时是 `WouldBlock`
+    /// Receiving one by one: takes a datagram without waiting, along with whom its reply goes to
+    /// and the address it leaves from. Only with local addresses wanted does recvmsg take one
+    /// along, otherwise just the peer is taken; `WouldBlock` when there is none
+    fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, ReplyTo)> {
+        #[cfg(unix)]
+        if self.local_addresses {
+            use std::os::fd::AsRawFd;
+            let (len, peer, local) = self.socket.try_io(tokio::io::Interest::READABLE, || {
+                udp_local::recv(self.socket.as_raw_fd(), buf)
+            })?;
+            return Ok((len, ReplyTo { peer, local }));
+        }
+        let (len, peer) = self.socket.try_recv_from(buf)?;
+        Ok((len, peer.into()))
+    }
+
     /// 逐个收的循环开始按设备轮流（见 `Turns::read_available`）/ The loop receiving one by one begins taking
     /// devices in turn (see `Turns::read_available`)
     #[cfg_attr(target_os = "linux", allow(dead_code))] // Linux 上只有测试用 / On Linux only the tests use it
-    fn begin_turns_one_by_one(&mut self) -> Turns<SocketAddr> {
+    fn begin_turns_one_by_one(&mut self) -> Turns<ReplyTo> {
         self.taking_turns = true;
         self.engine.permit_manager.note_turns_begun();
         Turns::new(self.queries_within_target, recv_buffer_holds(self.socket))
@@ -1619,28 +1660,16 @@ async fn receive_in_batches(socket: &Arc<UdpSocket>, engine: &Arc<Engine>) -> ! 
     use udp_batch::{Received, Replies};
 
     let fd = socket.as_raw_fd();
-    let mut received = Received::default();
-    // 监听在通配地址上：回答要从查询发到的那个地址发出，所以让内核把它连同每个报文一起交上来。监听在具体地址上
-    // 时回答只会从那个地址发出，用不着
-    // Listening on the wildcard address: a reply has to leave from the address the query was
-    // sent to, so the kernel hands it over with each datagram. Listening on one address, replies
-    // can only leave from it, and none of this is needed
-    if let Ok(bound) = socket.local_addr()
-        && bound.ip().is_unspecified()
-    {
-        match udp_batch::receive_local_addresses(fd, bound.is_ipv6()) {
-            Ok(()) => received = received.with_local_addresses(),
-            Err(error) => {
-                warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks")
-            }
-        }
-    }
     let mut replies = Replies::default();
     let pending = Arc::new(PendingReplies::default());
     pending
         .idle
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let mut answering = UdpAnswering::new(socket, engine, &pending);
+    let mut received = Received::default();
+    if answering.local_addresses {
+        received = received.with_local_addresses();
+    }
     let mut received_in_row = 0;
     let mut turns: Option<Box<TakingTurns>> = None;
     loop {
@@ -1949,22 +1978,17 @@ const ONE_BY_ONE_TURN: usize = 32;
 /// Devices taking turns under overload in the loop receiving one by one, for systems without
 /// recvmmsg: reading takes one non-blocking receive at a time
 #[cfg_attr(target_os = "linux", allow(dead_code))] // Linux 上只有测试用 / On Linux only the tests use it
-impl Turns<SocketAddr> {
+impl Turns<ReplyTo> {
     /// 把 socket 里现有的读出来排进队列，最多 `READS_PER_TURN` 轮那么多；读空了返回 true / Reads what the
     /// socket holds into the queue, at most `READS_PER_TURN` turns' worth; gives true once it is read
     /// empty
-    fn read_available(
-        &mut self,
-        socket: &UdpSocket,
-        buf: &mut [u8],
-        answering: &mut UdpAnswering<'_>,
-    ) -> bool {
+    fn read_available(&mut self, buf: &mut [u8], answering: &mut UdpAnswering<'_>) -> bool {
         let (mut got, mut drained) = (0, false);
         for _ in 0..READS_PER_TURN * ONE_BY_ONE_TURN {
-            match socket.try_recv_from(buf) {
-                Ok((len, peer)) => {
+            match answering.try_recv(buf) {
+                Ok((len, to)) => {
                     got += 1;
-                    self.offer(&buf[..len], peer.ip(), peer, answering);
+                    self.offer(&buf[..len], to.peer.ip(), to, answering);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     drained = true;
@@ -1981,13 +2005,13 @@ impl Turns<SocketAddr> {
     async fn answer_in_turn(&mut self, answering: &mut UdpAnswering<'_>, reply: &mut BytesMut) {
         self.begin_batch(answering);
         for _ in 0..ONE_BY_ONE_TURN {
-            let Some((packet, peer)) = self.next(answering) else {
+            let Some((packet, to)) = self.next(answering) else {
                 return;
             };
-            if answering.answer(&packet, peer, reply)
-                && let Err(error) = send_udp_datagram(answering.socket, reply, peer).await
+            if answering.answer(&packet, to, reply)
+                && let Err(error) = send_udp_datagram(answering.socket, reply, to).await
             {
-                debug!(%peer, %error, response_len = reply.len(), "failed to send UDP response");
+                debug!(peer = %to.peer, %error, response_len = reply.len(), "failed to send UDP response");
             }
         }
     }
@@ -2069,10 +2093,10 @@ async fn receive_one_by_one_reading_drops(
     let mut answering = UdpAnswering::new(socket, engine, &pending);
     answering.reads_drops = reads_drops;
     let mut received_in_row = 0;
-    let mut turns: Option<Turns<SocketAddr>> = None;
+    let mut turns: Option<Turns<ReplyTo>> = None;
     loop {
         if let Some(taking) = &mut turns {
-            let drained = taking.read_available(socket, &mut buf, &mut answering);
+            let drained = taking.read_available(&mut buf, &mut answering);
             if taking.queue.is_empty() {
                 if drained {
                     // 读空了也答完了：等新报文，不在这里收，下一轮照样先读 / Read empty and all answered:
@@ -2090,25 +2114,23 @@ async fn receive_one_by_one_reading_drops(
             tokio::task::yield_now().await;
             continue;
         }
-        let (len, peer) = match socket.try_recv_from(&mut buf) {
+        let (len, to) = match answering.try_recv(&mut buf) {
             Ok(result) => result,
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // 当前无包可读 — 让出 tokio / No packet available right now — yield to tokio
+                // 当前无包可读 — 让出 tokio，等到有了再收 / No packet available right now — yield to
+                // tokio until one comes, then receive it
                 received_in_row = 0;
                 answering.note_drops_before_waiting();
-                let received = socket.recv_from(&mut buf).await;
+                let _ = socket.readable().await;
                 answering.socket_ran_empty();
-                match received {
-                    Ok(result) => result,
-                    Err(_) => continue,
-                }
+                continue;
             }
             Err(_) => continue,
         };
-        if answering.answer(&buf[..len], peer, &mut reply)
-            && let Err(error) = send_udp_datagram(socket, &reply, peer).await
+        if answering.answer(&buf[..len], to, &mut reply)
+            && let Err(error) = send_udp_datagram(socket, &reply, to).await
         {
-            debug!(%peer, %error, response_len = reply.len(), "failed to send UDP response");
+            debug!(peer = %to.peer, %error, response_len = reply.len(), "failed to send UDP response");
         }
         if answering.overloaded {
             turns = Some(answering.begin_turns_one_by_one());
@@ -3394,13 +3416,14 @@ mod tests {
 
     /// 监听在通配地址上时，回答从查询发到的那个地址发出。一台机器有几个地址时（同一个网卡上的第二个地址、VIP、
     /// 回环上的服务地址），内核自己挑的源地址可能是另一个：客户端收到一个从别的地址来的回答，不认，查询超时。
-    /// 当场答出的和转发回来的都从查询发到的地址发出
+    /// 当场答出的和转发回来的都从查询发到的地址发出，两种循环都这样
     /// Listening on the wildcard address, a reply leaves from the address the query came to. On
     /// a machine with several addresses (a second one on an interface, a VIP, a service address
     /// on loopback) the source the kernel picks by itself may be another: the client gets a
     /// reply from an address it did not ask, refuses it, and the query times out. Replies given
-    /// on the spot and those back from a forward both leave from the address the query came to
-    #[cfg(target_os = "linux")]
+    /// on the spot and those back from a forward both leave from the address the query came to,
+    /// in both loops
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_reply_leaves_from_the_address_the_query_came_to() {
         let upstream = spawn_slow_udp_upstream(Duration::from_millis(20)).await;
@@ -3412,50 +3435,116 @@ mod tests {
             ),
         ];
         for (how, engine) in engines {
-            let server = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
-            let port = server.local_addr().unwrap().port();
-            let worker = tokio::spawn(async move { receive_in_batches(&server, &engine).await });
-            // 回环上 127.0.0.0/8 都是本机地址。connect 过的客户端只收从它问的那个地址来的回答
-            // On loopback all of 127.0.0.0/8 is local. A connected client takes replies from
-            // the address it asked alone
-            for (id, to) in ["127.0.0.2", "127.0.0.1", "127.9.9.9"]
-                .into_iter()
-                .enumerate()
+            #[cfg(target_os = "linux")]
             {
-                let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-                client.connect((to, port)).await.unwrap();
-                client
-                    .send(&query(&format!("n{id}.name.test"), id as u16))
-                    .await
-                    .unwrap();
-                let mut buf = [0u8; 512];
-                tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
-                    .await
-                    .unwrap_or_else(|_| panic!("{how}: no reply from {to}"))
-                    .unwrap();
-                assert_eq!(buf[..2], (id as u16).to_be_bytes(), "{how}");
+                let engine = Arc::clone(&engine);
+                replies_come_from_the_address_asked(how, "batches", move |server| {
+                    tokio::spawn(async move { receive_in_batches(&server, &engine).await })
+                })
+                .await;
             }
-            worker.abort();
+            replies_come_from_the_address_asked(how, "one-by-one", move |server| {
+                tokio::spawn(async move { receive_one_by_one(&server, &engine).await })
+            })
+            .await;
         }
     }
 
-    /// 转发回来、排着等下一批一起发的回答，和流控拒绝时当场发的 SERVFAIL，也从查询发到的地址发出
-    /// A reply back from a forward that waits for the next batch, and the SERVFAIL sent at once
-    /// when flow control refuses, leave from the address the query came to as well
-    #[cfg(target_os = "linux")]
+    /// 起一个监听在通配地址上的 worker，socket 和 `bind_udp_workers` 建的一样；客户端问它的每个本机地址（见
+    /// `addresses_asked`），都等到从那个地址来的回答。connect 过的客户端只收从它问的那个地址来的回答。`names`
+    /// 让每种循环问的名字不同，转发的不会碰上缓存
+    /// Starts a worker listening on the wildcard address, its socket built as `bind_udp_workers`
+    /// builds it; a client asks each of its local addresses (see `addresses_asked`) and waits for
+    /// the reply from that address. A connected client takes replies from the address it asked
+    /// alone. `names` keeps the names each loop asks apart, so a forward never meets the cache
+    #[cfg(unix)]
+    async fn replies_come_from_the_address_asked(
+        how: &str,
+        names: &str,
+        receive: impl FnOnce(Arc<UdpSocket>) -> tokio::task::JoinHandle<()>,
+    ) {
+        let (wildcard, client_at, asked) = addresses_asked();
+        let server = UdpSocket::from_std(create_reuseport_udp_socket(wildcard).unwrap()).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let worker = receive(Arc::new(server));
+        for (id, mut to) in asked.into_iter().enumerate() {
+            to.set_port(port);
+            let client = UdpSocket::bind(client_at).await.unwrap();
+            client.connect(to).await.unwrap();
+            client
+                .send(&query(&format!("n{id}.{names}.test"), id as u16))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 512];
+            tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("{how}, {names}: no reply from {to}"))
+                .unwrap();
+            assert_eq!(buf[..2], (id as u16).to_be_bytes(), "{how}, {names}");
+        }
+        worker.abort();
+    }
+
+    /// 监听的通配地址、客户端绑的地址，和客户端问的本机地址（端口留 0），第一个是内核自己不会挑来当源地址的。Linux 上整个
+    /// 127.0.0.0/8 都在回环上，内核自己挑 127.0.0.1；macOS 和 BSD 的回环上只有 127.0.0.1，问的是回环网卡上默认有的
+    /// fe80::1，内核自己挑 ::1
+    /// The wildcard address listened on, the address the client binds, and the local addresses
+    /// it asks (port left 0), the first being one the kernel would not pick as a source by
+    /// itself. On Linux all of 127.0.0.0/8 is on loopback and the kernel picks 127.0.0.1; on
+    /// macOS and the BSDs loopback holds 127.0.0.1 alone, so fe80::1, on the loopback interface
+    /// by default, is asked, where the kernel picks ::1
+    #[cfg(unix)]
+    fn addresses_asked() -> (SocketAddr, SocketAddr, Vec<SocketAddr>) {
+        #[cfg(target_os = "linux")]
+        let addresses = (
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            [[127, 0, 0, 2], [127, 0, 0, 1], [127, 9, 9, 9]]
+                .map(|ip| SocketAddr::from((ip, 0)))
+                .to_vec(),
+        );
+        #[cfg(not(target_os = "linux"))]
+        let addresses = {
+            use std::net::{Ipv6Addr, SocketAddrV6};
+            // SAFETY: 网卡名是以 NUL 结尾的字符串 / SAFETY: the interface name is a NUL-terminated string
+            let lo0 = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+            let link_local =
+                SocketAddrV6::new(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), 0, 0, lo0);
+            (
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+                vec![
+                    link_local.into(),
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+                ],
+            )
+        };
+        addresses
+    }
+
+    /// 转发回来、排着等下一批一起发的回答（Linux 的批量循环），流控拒绝时当场发的 SERVFAIL，和直接发的回答，也从查询发到
+    /// 的地址发出
+    /// A reply back from a forward that waits for the next batch (Linux's batched loop), the
+    /// SERVFAIL sent at once when flow control refuses, and a reply sent directly leave from the
+    /// address the query came to as well
+    #[cfg(unix)]
     #[tokio::test]
     async fn queued_and_refused_replies_leave_from_the_address_the_query_came_to() {
         use kixdns::socket_utils::LocalAddr;
-        use std::os::fd::AsRawFd;
 
-        let server = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let port = server.local_addr().unwrap().port();
-        let asked = std::net::Ipv4Addr::new(127, 0, 0, 2);
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client.connect((asked, port)).await.unwrap();
+        let (wildcard, client_at, addresses) = addresses_asked();
+        let server = UdpSocket::bind(wildcard).await.unwrap();
+        let mut asked = addresses[0];
+        asked.set_port(server.local_addr().unwrap().port());
+        let client = UdpSocket::bind(client_at).await.unwrap();
+        client.connect(asked).await.unwrap();
+        let local = match asked {
+            SocketAddr::V4(v4) => LocalAddr::V4(*v4.ip()),
+            SocketAddr::V6(v6) => LocalAddr::V6(*v6.ip(), v6.scope_id()),
+        };
         let to = ReplyTo {
             peer: client.local_addr().unwrap(),
-            local: Some(LocalAddr::V4(asked)),
+            local: Some(local),
         };
         let mut buf = [0u8; 64];
         let mut expect = async |sent: &[u8]| {
@@ -3467,14 +3556,20 @@ mod tests {
         };
 
         // 排着的回答挪进一批里发 / A queued reply moved into a batch and sent
-        let pending = PendingReplies::default();
-        pending.queue_and_wake(&Bytes::from_static(b"queued"), to);
-        let mut replies = udp_batch::Replies::default();
-        pending.fill(&mut replies);
-        assert_eq!(replies.send(server.as_raw_fd(), 0).unwrap(), 1);
-        expect(b"queued").await;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let pending = PendingReplies::default();
+            pending.queue_and_wake(&Bytes::from_static(b"queued"), to);
+            let mut replies = udp_batch::Replies::default();
+            pending.fill(&mut replies);
+            assert_eq!(replies.send(server.as_raw_fd(), 0).unwrap(), 1);
+            expect(b"queued").await;
+        }
 
-        // 流控拒绝时当场发的 / What is sent at once when flow control refuses
+        // 流控拒绝时当场发的，不等待：tokio 要先看到 socket 可写 / What is sent at once when flow
+        // control refuses, without waiting: tokio has to have seen the socket writable first
+        server.writable().await.unwrap();
         try_send_udp_response(&server, &query("a.test", 1), b"refused", to);
         expect(b"refused").await;
 
@@ -4171,7 +4266,7 @@ mod tests {
         let pending = Arc::new(PendingReplies::default());
         let mut answering = UdpAnswering::new(&socket, &engine, &pending);
         let mut turns = answering.begin_turns_one_by_one();
-        queue_four_each(&mut turns.queue, 1000, |from| from);
+        queue_four_each(&mut turns.queue, 1000, ReplyTo::from);
         engine
             .flow_control_state
             .as_ref()
