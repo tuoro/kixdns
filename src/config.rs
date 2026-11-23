@@ -708,8 +708,8 @@ impl Rule {
             self.merged_forward = Some(MergedForward {
                 upstream_str: Arc::from(merged_str.as_str()),
                 upstream_list: Arc::new(all_upstreams),
-                // 写得不一样时不发，启动时 `problems` 记一条警告 / None when they differ;
-                // at startup `problems` logs a warning
+                // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
+                // at startup `problems` logs an error
                 ecs: self.shared_forward_ecs().ok().flatten().cloned(),
             });
         }
@@ -1329,14 +1329,14 @@ pub struct ValidationReport {
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
 /// 别的事的写法（见 [`problems`]）、编译不了的匹配器和正则，以及监听地址和 DoH 的前提（见
 /// [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
-/// 启动不走这里：那时 [`problems`] 只记警告、照旧加载
+/// 启动不走这里：那时 [`problems`] 记成错误、照旧加载
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
 /// and trial all go through, refusing what would stop the kernel at startup: what silently does
 /// something else (see [`problems`]), matchers and regexes that do not compile, and the
 /// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). Hot reload
 /// used not to check the listeners, so a mistyped `bind_udp` reloaded fine and the kernel then
 /// failed to start at the next restart. Startup does not come here: there [`problems`] are
-/// only warned about and loaded as before
+/// logged as errors and loaded as before
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     refuse_problems(&cfg)?;
     let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
@@ -1368,7 +1368,7 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// 不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
-/// 启动时只记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
+/// 启动时记成错误、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
 /// 拒绝它们，下一次改配置时就得改掉。
 ///
 /// Ways of writing a configuration that silently do something else: an upstream

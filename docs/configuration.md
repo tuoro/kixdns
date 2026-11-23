@@ -145,7 +145,7 @@ upstream_equals 和 response_upstream_ip 看的是这次实际作答的上游：
 
 ### 逻辑运算符
 
-运算符从左到右计算，第一个匹配器作为初始结果：它身上写的 and_not、or_not（not）前面没有东西可合，也不把它取反；只有一个匹配器时，规则级的取反也一样白写。这两种写法作为配置问题报出来（启动时警告、照旧加载，重载和面板保存时拒绝）。要匹配某个条件不成立的查询，前面放一个 `{"type": "any"}`，再对它写 and_not。
+运算符从左到右计算，第一个匹配器作为初始结果：它身上写的 and_not、or_not（not）前面没有东西可合，也不把它取反；只有一个匹配器时，规则级的取反也一样白写。这两种写法作为配置问题报出来（启动时记一条错误、照旧加载，重载和面板保存时拒绝）。要匹配某个条件不成立的查询，前面放一个 `{"type": "any"}`，再对它写 and_not。
 
 | 运算符 | 含义 |
 |---|---|
@@ -422,7 +422,7 @@ Pipeline 的应答可能因请求方而不同时，响应缓存、并发未命�
 
 主配置 watcher 使用按 Pipeline 划分的缓存命名空间重载有效 JSON。发生变化的 Pipeline 会立即停止访问旧配置产生的响应缓存、规则缓存和进行中请求；未变化的 Pipeline 会保留热缓存。会改变应答的全局设置（min_ttl、default_upstream、response_jump_limit、enable_tcp_fallback）一改，所有 Pipeline 的缓存命名空间都轮换；只决定怎样用缓存的设置（各个超时、serve_stale 系列、后台刷新系列）改了不轮换。Pipeline 的命名空间还算上它的回答检查跳转能到达的 Pipeline：那里得到的应答缓存在它的键下，跳转目标一改，这些应答也不再用。旧命名空间中的条目不会被同步删除，而是继续受现有缓存容量和 TTL 策略限制。包括后台刷新和响应阶段跳转在内，每个请求都会保持选择其缓存命名空间时的配置快照，因此重载前启动的任务无法写入当前生效的缓存代际。无效的重载会保留旧配置，并在日志里记一条错误，默认日志级别也看得到。启动时先监控配置文件、再读它，内核启动这段时间里改的配置，起来以后照样重载。配置文件监控不了时（比如监控数用完了），改了不会重载，面板保存的配置也不生效：日志里记一条错误，控制通道 `config` 结果的 `watch_error` 写着原因（监控着时为 null）。
 
-下面这些写法以前能加载，却会悄悄做成别的事：读不懂的上游地址（端口不对、UDP 上游不是 IP 地址、不认识的前缀如 `http://`、IP 字面量的 DoQ 没写 SNI）、拼错的 rcode（以前回 NXDOMAIN）、无效的静态 IP 或 CNAME 目标、装不进一条记录的 TXT（以前回 SERVFAIL）、跳到不存在的 Pipeline（跳转动作或 pipeline_select），空的 domain_suffix 或 domain_regex（以前匹配所有域名），同一条规则里几个 forward 的 ecs 写得不一样（以前一个也不发），几个 Pipeline 写了同一个 id（按 id 只找得到其中一个，其余的规则不会照写的执行），ecs 的 static 模式里不是 IP 的地址（以前每个查询记一条警告、不发 ECS），以及内核不读的键：拼错的设置名，写错名字或层级的规则、Pipeline、pipeline_select 的键（比如把 `matchers` 写成 `matcher`，以前这条规则没有匹配器，匹配所有查询），动作、匹配器和 ecs 里拼错的或这一种不读的键（比如把 forward 的 `upstream` 写成 `upstrem`，以前问的是默认上游），按 `settings.min_tll`、`pipelines[0].rules[2].matcher`、`pipelines[0].rules[2].actions[0].upstrem` 这样的路径、按写的顺序报出来（那里拼错的必填字段照旧报解析错误）；已经删掉的旧设置（智能流控以前的五个数字、`prefetch`、从来数不到的 `tcp_health_check_error_threshold`、不再起作用的 `statistics_enabled` 和 `statistics_anonymize_client_ip`（排行照原样记客户端地址）、从来没被读过的 `geoip_auto_convert` 和 `geoip_filter_countries`）照常忽略，只记一条警告（见下一段）。启动时遇到它们只在日志里记警告、照旧加载，已经在用的配置升级以后行为不变（默认日志级别看不到这些警告，控制通道 `config` 结果的 `problems` 也把它们列出来，重载成功以后清空）；热重载和控制通道的配置校验会拒绝，并一次列出全部问题，所以下一次改配置时要把它们改掉。
+下面这些写法以前能加载，却会悄悄做成别的事：读不懂的上游地址（端口不对、UDP 上游不是 IP 地址、不认识的前缀如 `http://`、IP 字面量的 DoQ 没写 SNI）、拼错的 rcode（以前回 NXDOMAIN）、无效的静态 IP 或 CNAME 目标、装不进一条记录的 TXT（以前回 SERVFAIL）、跳到不存在的 Pipeline（跳转动作或 pipeline_select），空的 domain_suffix 或 domain_regex（以前匹配所有域名），同一条规则里几个 forward 的 ecs 写得不一样（以前一个也不发），几个 Pipeline 写了同一个 id（按 id 只找得到其中一个，其余的规则不会照写的执行），ecs 的 static 模式里不是 IP 的地址（以前每个查询记一条警告、不发 ECS），以及内核不读的键：拼错的设置名，写错名字或层级的规则、Pipeline、pipeline_select 的键（比如把 `matchers` 写成 `matcher`，以前这条规则没有匹配器，匹配所有查询），动作、匹配器和 ecs 里拼错的或这一种不读的键（比如把 forward 的 `upstream` 写成 `upstrem`，以前问的是默认上游），按 `settings.min_tll`、`pipelines[0].rules[2].matcher`、`pipelines[0].rules[2].actions[0].upstrem` 这样的路径、按写的顺序报出来（那里拼错的必填字段照旧报解析错误）；已经删掉的旧设置（智能流控以前的五个数字、`prefetch`、从来数不到的 `tcp_health_check_error_threshold`、不再起作用的 `statistics_enabled` 和 `statistics_anonymize_client_ip`（排行照原样记客户端地址）、从来没被读过的 `geoip_auto_convert` 和 `geoip_filter_countries`）照常忽略，只记一条警告（见下一段）。启动时遇到它们在日志里记错误（默认日志级别也看得到）、照旧加载，已经在用的配置升级以后行为不变（控制通道 `config` 结果的 `problems` 也把它们列出来，重载成功以后清空）；热重载和控制通道的配置校验会拒绝，并一次列出全部问题，所以下一次改配置时要把它们改掉。
 
 还有一些写法照样加载、照写的做，却值得知道：上面这些退役的设置和 background_refresh_rule，一个国家代码也没写的 geoip_country 和 response_answer_ip_geoip_country（永远不命中），大于 1000000 的 cache_capacity（可能占掉很多内存），不到 upstream_timeout_ms 两倍半的 request_timeout_ms（可能来不及重发和改用 TCP）。它们不算上面的问题，启动、重载和校验都不拒绝：配置每生效一次各记一条警告，控制通道 `config` 结果的 `warnings` 列出当前配置里的这些写法，配置校验的回答也带着 `warnings`。
 
