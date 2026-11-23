@@ -146,12 +146,19 @@ fn a_listening_port_in_the_system_range_is_not_taken_by_upstream_sockets() {
 
     for _ in 0..3 {
         let dir = tempfile::TempDir::new().unwrap();
-        // 系统现在空着的一个端口 / A port the system has free now
-        let port = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // 系统现在空着的一个端口，UDP 和 TCP 都空着：系统给出的 UDP 端口，同号的 TCP 可能正被别的连接占着
+        // A port the system has free now, for UDP and TCP alike: the UDP port the system gives may
+        // be held for TCP by another connection
+        let port = std::iter::repeat_with(|| {
+            let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = udp.local_addr().unwrap().port();
+            TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+                .is_ok()
+                .then_some(port)
+        })
+        .flatten()
+        .next()
+        .unwrap();
         let mut kernel = start(
             dir.path(),
             serde_json::json!({
