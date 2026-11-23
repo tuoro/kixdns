@@ -396,11 +396,11 @@ pub fn set_reuseport(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()
 }
 
 /// 一个 UDP 报文发到的本机地址。监听在通配地址上时，回答要从它发出：内核自己挑的源地址在有几个地址的机器上
-/// 可能是另一个，客户端不认从别的地址来的回答。只有 Linux 的批量收发读得到它（见 `udp_batch`），别的系统上总是没有
+/// 可能是另一个，客户端不认从别的地址来的回答。Unix 系统上收的时候读得到它（见 `udp_local`），Windows 上总是没有
 /// The local address a UDP datagram was sent to. Listening on the wildcard address, the reply has
 /// to leave from it: the source the kernel picks by itself may be another on a machine with
-/// several addresses, and a client refuses a reply from an address it did not ask. Only Linux's
-/// batched receive reads it (see `udp_batch`); on other systems there is never one
+/// several addresses, and a client refuses a reply from an address it did not ask. Unix systems
+/// read it on receive (see `udp_local`); on Windows there is never one
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalAddr {
     V4(std::net::Ipv4Addr),
@@ -410,40 +410,109 @@ pub enum LocalAddr {
     V6(std::net::Ipv6Addr, u32),
 }
 
-/// 批量收发 UDP 报文（Linux 的 recvmmsg / sendmmsg）。满负荷时一次系统调用收发多个报文，省下每个报文
-/// 进出内核的那一趟；空闲时一批只有一个，和单收单发一样。
-/// Batched UDP receive and send (Linux recvmmsg / sendmmsg). Under full load one system call takes
-/// or sends many datagrams, saving each one its own trip into the kernel; when idle a batch holds
-/// one, the same as single receives and sends.
-#[cfg(target_os = "linux")]
-pub mod udp_batch {
+/// 收发 UDP 报文时带上本机地址（见 [`LocalAddr`]），成批收发（`udp_batch`）和逐个收发共用。各系统用哪个选项、控制消息里
+/// 放什么结构，只有这里知道：IPv4 上 Linux 和 macOS 收发都用 IP_PKTINFO（in_pktinfo），FreeBSD 等 BSD 收用
+/// IP_RECVDSTADDR、发用 IP_SENDSRCADDR（都是 in_addr）；IPv6 上都是 RFC 3542 的 IPV6_RECVPKTINFO 和 IPV6_PKTINFO（in6_pktinfo）
+/// Receiving and sending UDP datagrams along with their local address (see [`LocalAddr`]), shared
+/// by batched receives and sends (`udp_batch`) and single ones. Which option each system uses and
+/// what struct its control message holds are known here alone: for IPv4, Linux and macOS use
+/// IP_PKTINFO both ways (an in_pktinfo), while FreeBSD and the other BSDs receive with
+/// IP_RECVDSTADDR and send with IP_SENDSRCADDR (an in_addr either way); for IPv6 all use RFC 3542's
+/// IPV6_RECVPKTINFO and IPV6_PKTINFO (an in6_pktinfo)
+#[cfg(unix)]
+pub mod udp_local {
     use std::io;
     use std::mem::{size_of, zeroed};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::fd::RawFd;
 
-    use bytes::BytesMut;
-
     use super::LocalAddr;
 
-    /// 一批最多这么多个报文 / The most datagrams in one batch
-    pub const BATCH: usize = 32;
-    /// 一个报文的控制消息缓冲：按 8 字节对齐，放得下一条本机地址的消息（IPv6 的占 40 字节）
+    /// 一个报文的控制消息缓冲：按 8 字节对齐，放得下一条本机地址的消息（IPv6 的最多占 40 字节）
     /// One datagram's control message buffer: aligned to 8 bytes, with room for one local
-    /// address message (40 bytes for IPv6)
-    type Control = [u64; 8];
+    /// address message (40 bytes at most for IPv6)
+    pub(super) type Control = [u64; 8];
 
-    /// 让内核把每个报文发到的本机地址一起交上来（IPv4 的 IP_PKTINFO，IPv6 的 IPV6_RECVPKTINFO）。监听在通配
-    /// 地址上才需要，见 [`LocalAddr`]
-    /// Has the kernel hand over the local address each datagram was sent to (IP_PKTINFO for
-    /// IPv4, IPV6_RECVPKTINFO for IPv6). Needed only when listening on the wildcard address, see
-    /// [`LocalAddr`]
+    /// IPv4 上 BSD 的做法：开 `RECEIVE` 收，收到的消息也是这个类型，里面是报文发到的地址；发的时候 `SEND` 带上源地址
+    /// The BSD way for IPv4: `RECEIVE` is turned on to receive and is also the type of the message
+    /// received, which holds the address the datagram was sent to; `SEND` carries the source to
+    /// send from
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    mod v4 {
+        use std::net::Ipv4Addr;
+
+        pub const RECEIVE: libc::c_int = libc::IP_RECVDSTADDR;
+        pub const SEND: libc::c_int = libc::IP_SENDSRCADDR;
+        pub type Info = libc::in_addr;
+
+        pub fn local(info: Info) -> Ipv4Addr {
+            Ipv4Addr::from(u32::from_be(info.s_addr))
+        }
+
+        pub fn source(addr: Ipv4Addr) -> Info {
+            libc::in_addr {
+                s_addr: u32::from(addr).to_be(),
+            }
+        }
+    }
+
+    /// IPv4 上 Linux 和 macOS 的做法：收发都是 IP_PKTINFO，消息里是 in_pktinfo
+    /// The Linux and macOS way for IPv4: IP_PKTINFO both ways, the message holding an in_pktinfo
+    #[cfg(not(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    mod v4 {
+        use std::net::Ipv4Addr;
+
+        pub const RECEIVE: libc::c_int = libc::IP_PKTINFO;
+        pub const SEND: libc::c_int = libc::IP_PKTINFO;
+        pub type Info = libc::in_pktinfo;
+
+        /// ipi_spec_dst 是 Linux 给的、能拿来当源地址的那个：单播时就是报文发到的地址，广播、组播时是内核按路由挑的本机
+        /// 地址。macOS 不填它（全零），Linux 上报文在 socket 开这个选项之前就排进来时也没填，这时用报文头里的目的地址
+        /// ipi_addr
+        /// ipi_spec_dst is the one Linux gives as usable for a source: the address the datagram was
+        /// sent to for unicast, and for broadcast or multicast the local address the kernel picks
+        /// by the route. macOS leaves it out (all zeroes), as does Linux for a datagram queued
+        /// before the socket turned the option on; then the destination in the header, ipi_addr,
+        /// serves
+        pub fn local(info: Info) -> Ipv4Addr {
+            let noted = Ipv4Addr::from(u32::from_be(info.ipi_spec_dst.s_addr));
+            if noted.is_unspecified() {
+                Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr))
+            } else {
+                noted
+            }
+        }
+
+        /// 只填 ipi_spec_dst，网卡号留 0、按路由走：macOS 上填了网卡号就不看 ipi_spec_dst
+        /// Only ipi_spec_dst is filled, the interface left 0 for the route to decide: on macOS a
+        /// set interface has ipi_spec_dst ignored
+        pub fn source(addr: Ipv4Addr) -> Info {
+            // SAFETY: 普通 C 结构，全零是合法值 / SAFETY: a plain C struct, all zeroes is valid
+            let mut info: Info = unsafe { std::mem::zeroed() };
+            info.ipi_spec_dst.s_addr = u32::from(addr).to_be();
+            info
+        }
+    }
+
+    /// 让内核把每个报文发到的本机地址一起交上来。监听在通配地址上才需要，见 [`LocalAddr`]
+    /// Has the kernel hand over the local address each datagram was sent to. Needed only when
+    /// listening on the wildcard address, see [`LocalAddr`]
     pub fn receive_local_addresses(fd: RawFd, v6: bool) -> io::Result<()> {
         let on: libc::c_int = 1;
         let (level, option) = if v6 {
             (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
         } else {
-            (libc::IPPROTO_IP, libc::IP_PKTINFO)
+            (libc::IPPROTO_IP, v4::RECEIVE)
         };
         // SAFETY: 选项的值是一个 c_int，活到调用结束 / SAFETY: the option's value is a c_int that outlives the call
         let ret = unsafe {
@@ -464,146 +533,132 @@ pub mod udp_batch {
 
     /// 让一个报文从 `local` 发出的控制消息，和它占的长度
     /// The control message that has a datagram leave from `local`, and the length it takes
-    fn source_control(local: LocalAddr) -> (Control, usize) {
+    pub(super) fn source_control(local: LocalAddr) -> (Control, usize) {
+        match local {
+            LocalAddr::V4(addr) => message(libc::IPPROTO_IP, v4::SEND, v4::source(addr)),
+            LocalAddr::V6(addr, interface) => {
+                // SAFETY: 普通 C 结构，全零是合法值 / SAFETY: a plain C struct, all zeroes is valid
+                let mut info: libc::in6_pktinfo = unsafe { zeroed() };
+                info.ipi6_addr.s6_addr = addr.octets();
+                info.ipi6_ifindex = interface as _;
+                message(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, info)
+            }
+        }
+    }
+
+    /// 只放着一条消息的控制缓冲，和它占的长度 / A control buffer holding one message, and the
+    /// length it takes
+    fn message<T>(level: libc::c_int, kind: libc::c_int, data: T) -> (Control, usize) {
+        let space = const {
+            // SAFETY: CMSG_SPACE 只做算术 / SAFETY: CMSG_SPACE only does arithmetic
+            let space = unsafe { libc::CMSG_SPACE(size_of::<T>() as u32) } as usize;
+            assert!(space <= size_of::<Control>());
+            space
+        };
         let mut control: Control = [0; 8];
         let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
-        // SAFETY: `control` 按 8 字节对齐、有 64 字节，放得下 cmsghdr 和后面的数据（最多 CMSG_SPACE(20) = 40 字节）；
-        // 数据用 write_unaligned 写。pktinfo 是普通 C 结构，全零是合法值
-        // SAFETY: `control` is aligned to 8 bytes and 64 bytes long, enough for a cmsghdr and the
-        // data after it (CMSG_SPACE(20) = 40 bytes at most); the data is written with
-        // write_unaligned. The pktinfo structs are plain C structs, all zeroes valid
-        let len = unsafe {
-            match local {
-                LocalAddr::V4(addr) => {
-                    let mut info: libc::in_pktinfo = zeroed();
-                    info.ipi_spec_dst.s_addr = u32::from(addr).to_be();
-                    (*cmsg).cmsg_level = libc::IPPROTO_IP;
-                    (*cmsg).cmsg_type = libc::IP_PKTINFO;
-                    (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as _;
-                    std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast(), info);
-                    libc::CMSG_SPACE(size_of::<libc::in_pktinfo>() as u32)
-                }
-                LocalAddr::V6(addr, interface) => {
-                    let mut info: libc::in6_pktinfo = zeroed();
-                    info.ipi6_addr.s6_addr = addr.octets();
-                    info.ipi6_ifindex = interface as _;
-                    (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
-                    (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
-                    (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::in6_pktinfo>() as u32) as _;
-                    std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast(), info);
-                    libc::CMSG_SPACE(size_of::<libc::in6_pktinfo>() as u32)
-                }
-            }
-        };
-        (control, len as usize)
+        // SAFETY: `control` 按 8 字节对齐，放得下 cmsghdr 和后面的数据（上面编译时查过）；数据用 write_unaligned 写
+        // SAFETY: `control` is aligned to 8 bytes and holds a cmsghdr and the data after it
+        // (checked at compile time above); the data is written with write_unaligned
+        unsafe {
+            (*cmsg).cmsg_level = level;
+            (*cmsg).cmsg_type = kind;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<T>() as u32) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast(), data);
+        }
+        (control, space)
     }
 
-    /// 不等待地把 `data` 发给 `peer`，带着本机地址的从那个地址发出；发送缓冲满时是 `WouldBlock`
-    /// Sends `data` to `peer` without waiting, from the local address it carries if any;
-    /// `WouldBlock` when the send buffer is full
-    pub fn send_one(fd: RawFd, data: &[u8], peer: &Peer) -> io::Result<usize> {
-        let mut iov = libc::iovec {
-            iov_base: data.as_ptr().cast_mut().cast(),
-            iov_len: data.len(),
-        };
+    /// 收到的控制消息里那个报文发到的本机地址；内核没给，或者给的当不了源地址（广播、组播）时没有
+    /// The local address the datagram was sent to, from the control messages received with it;
+    /// none when the kernel gave none or gave one that cannot be a source (broadcast, multicast)
+    ///
+    /// # Safety
+    /// `hdr.msg_control` 指向按 8 字节对齐的缓冲，前 `hdr.msg_controllen` 字节是内核写下的控制消息
+    /// `hdr.msg_control` points at a buffer aligned to 8 bytes whose first `hdr.msg_controllen`
+    /// bytes are control messages the kernel wrote
+    pub(super) unsafe fn local_in(hdr: &libc::msghdr) -> Option<LocalAddr> {
+        // SAFETY: CMSG_* 只在调用方保证的范围里走，缓冲的对齐读得了 cmsghdr；数据用 read_unaligned 读，读之前查过这条
+        // 消息够长
+        // SAFETY: the CMSG_* macros walk only inside the range the caller vouches for, aligned for
+        // reading a cmsghdr; the data is read with read_unaligned, after checking that the message
+        // is long enough
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
+            while !cmsg.is_null() {
+                let (level, kind, len) = (
+                    (*cmsg).cmsg_level,
+                    (*cmsg).cmsg_type,
+                    (*cmsg).cmsg_len as usize,
+                );
+                let holds = |size: usize| len >= libc::CMSG_LEN(size as u32) as usize;
+                if level == libc::IPPROTO_IP && kind == v4::RECEIVE && holds(size_of::<v4::Info>())
+                {
+                    let addr = v4::local(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast()));
+                    let usable =
+                        !(addr.is_unspecified() || addr.is_broadcast() || addr.is_multicast());
+                    return usable.then_some(LocalAddr::V4(addr));
+                }
+                if level == libc::IPPROTO_IPV6
+                    && kind == libc::IPV6_PKTINFO
+                    && holds(size_of::<libc::in6_pktinfo>())
+                {
+                    let info: libc::in6_pktinfo =
+                        std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
+                    let addr = Ipv6Addr::from(info.ipi6_addr.s6_addr);
+                    // 组播地址当不了源地址，由内核挑 / A multicast address cannot be a
+                    // source, so the kernel picks
+                    if addr.is_multicast() {
+                        return None;
+                    }
+                    let link_local = addr.segments()[0] & 0xffc0 == 0xfe80;
+                    let interface = if link_local {
+                        info.ipi6_ifindex as u32
+                    } else {
+                        0
+                    };
+                    return Some(LocalAddr::V6(addr, interface));
+                }
+                cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
+            }
+        }
+        None
+    }
+
+    /// `addr` 换成内核要的形式，和它的长度 / `addr` in the kernel's form, and its length
+    pub(super) fn raw_addr(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
         // SAFETY: 普通 C 结构，全零是合法值 / SAFETY: a plain C struct, all zeroes is valid
-        let mut hdr: libc::msghdr = unsafe { zeroed() };
-        hdr.msg_name = (&peer.raw as *const libc::sockaddr_storage)
-            .cast_mut()
-            .cast();
-        hdr.msg_namelen = peer.raw_len;
-        hdr.msg_iov = &mut iov;
-        hdr.msg_iovlen = 1;
-        let mut control;
-        if let Some(local) = peer.local {
-            let len;
-            (control, len) = source_control(local);
-            hdr.msg_control = control.as_mut_ptr().cast();
-            hdr.msg_controllen = len as _;
-        }
-        // SAFETY: 内核只读这些缓冲和地址，它们活到调用结束 / SAFETY: the kernel only reads these buffers and addresses, alive for the call
-        let sent = unsafe { libc::sendmsg(fd, &hdr, libc::MSG_DONTWAIT) };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(sent as usize)
-    }
-    /// 每个报文的接收缓冲，和单收时一样大，更长的报文被截断（见 `proto_utils::MAX_QUERY_LEN`）/ Each
-    /// datagram's receive buffer, as large as for single receives; a longer datagram is cut (see
-    /// `proto_utils::MAX_QUERY_LEN`)
-    pub const RECV_SIZE: usize = crate::proto_utils::MAX_QUERY_LEN;
-
-    /// 对端：内核给的原始地址发回时原样交回，`addr` 给引擎和日志用
-    /// A peer: the kernel's own address, handed back as it is to reply, and `addr` for the engine and logs
-    #[derive(Clone, Copy)]
-    pub struct Peer {
-        raw: libc::sockaddr_storage,
-        raw_len: libc::socklen_t,
-        addr: SocketAddr,
-        /// 它的报文发到的本机地址：有的话回答从这个地址发出，没有就由内核挑
-        /// The local address its datagram was sent to: the reply leaves from it when there is
-        /// one, and from the address the kernel picks when not
-        local: Option<LocalAddr>,
-    }
-
-    impl Peer {
-        /// `addr` 这个对端：转发回来的回答不是这一批收到的，按地址建出内核要的形式
-        /// The peer at `addr`: a reply that came back from a forward was not received in this
-        /// batch, so the kernel's form is built from the address
-        pub fn of(addr: SocketAddr) -> Self {
-            // SAFETY: 普通 C 结构，全零是合法值 / SAFETY: a plain C struct, all zeroes is valid
-            let mut raw: libc::sockaddr_storage = unsafe { zeroed() };
-            let raw_len = match addr {
-                SocketAddr::V4(v4) => {
-                    // SAFETY: sockaddr_storage 对 sockaddr_in 够大、对齐 / SAFETY: sockaddr_storage is large and aligned enough for a sockaddr_in
-                    let sin = unsafe {
-                        &mut *(&mut raw as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>()
-                    };
-                    sin.sin_family = libc::AF_INET as libc::sa_family_t;
-                    sin.sin_port = v4.port().to_be();
-                    sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
-                    size_of::<libc::sockaddr_in>()
-                }
-                SocketAddr::V6(v6) => {
-                    // SAFETY: 同上，sockaddr_in6 / SAFETY: as above, for a sockaddr_in6
-                    let sin6 = unsafe {
-                        &mut *(&mut raw as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
-                    };
-                    sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                    sin6.sin6_port = v6.port().to_be();
-                    sin6.sin6_flowinfo = v6.flowinfo();
-                    sin6.sin6_addr.s6_addr = v6.ip().octets();
-                    sin6.sin6_scope_id = v6.scope_id();
-                    size_of::<libc::sockaddr_in6>()
-                }
-            };
-            Self {
-                raw,
-                raw_len: raw_len as libc::socklen_t,
-                addr,
-                local: None,
+        let mut raw: libc::sockaddr_storage = unsafe { zeroed() };
+        let len = match addr {
+            SocketAddr::V4(v4) => {
+                // SAFETY: sockaddr_storage 对 sockaddr_in 够大、对齐 / SAFETY: sockaddr_storage is large and aligned enough for a sockaddr_in
+                let sin = unsafe {
+                    &mut *(&mut raw as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>()
+                };
+                sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                sin.sin_port = v4.port().to_be();
+                sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                size_of::<libc::sockaddr_in>()
             }
-        }
-
-        /// 回答从 `local` 发出；没有就由内核挑 / The reply leaves from `local`, or from the
-        /// address the kernel picks when there is none
-        pub fn from_local(mut self, local: Option<LocalAddr>) -> Self {
-            self.local = local;
-            self
-        }
-
-        pub fn addr(&self) -> SocketAddr {
-            self.addr
-        }
-
-        pub fn local(&self) -> Option<LocalAddr> {
-            self.local
-        }
+            SocketAddr::V6(v6) => {
+                // SAFETY: 同上，sockaddr_in6 / SAFETY: as above, for a sockaddr_in6
+                let sin6 = unsafe {
+                    &mut *(&mut raw as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
+                };
+                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sin6.sin6_port = v6.port().to_be();
+                sin6.sin6_flowinfo = v6.flowinfo();
+                sin6.sin6_addr.s6_addr = v6.ip().octets();
+                sin6.sin6_scope_id = v6.scope_id();
+                size_of::<libc::sockaddr_in6>()
+            }
+        };
+        (raw, len as libc::socklen_t)
     }
 
     /// 内核给的地址换成 `SocketAddr`；不是 IPv4、IPv6 的没有 / The kernel's address as a
     /// `SocketAddr`; none for a family other than IPv4 and IPv6
-    fn socket_addr(raw: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    pub(super) fn socket_addr(raw: &libc::sockaddr_storage) -> Option<SocketAddr> {
         match libc::c_int::from(raw.ss_family) {
             libc::AF_INET => {
                 // SAFETY: ss_family 是 AF_INET，存的就是 sockaddr_in；sockaddr_storage 对任何地址都够大、对齐
@@ -628,6 +683,133 @@ pub mod udp_batch {
                 )))
             }
             _ => None,
+        }
+    }
+
+    /// 不等待地收一个报文，连同它的对端和它发到的本机地址；socket 上要先开 [`receive_local_addresses`]。比 `buf` 长的
+    /// 报文截到 `buf` 那么长；没有报文时是 `WouldBlock`
+    /// Receives one datagram without waiting, along with its peer and the local address it was
+    /// sent to; the socket needs [`receive_local_addresses`] first. A datagram longer than `buf`
+    /// is cut to it; `WouldBlock` when there is none
+    pub fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Option<LocalAddr>)> {
+        // SAFETY: 普通 C 结构，全零是合法值 / SAFETY: plain C structs, all zeroes is valid
+        let mut raw: libc::sockaddr_storage = unsafe { zeroed() };
+        let mut hdr: libc::msghdr = unsafe { zeroed() };
+        let mut control: Control = [0; 8];
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        hdr.msg_name = (&mut raw as *mut libc::sockaddr_storage).cast();
+        hdr.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        hdr.msg_iov = &mut iov;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = control.as_mut_ptr().cast();
+        hdr.msg_controllen = size_of::<Control>() as _;
+        // SAFETY: 头指向的缓冲和地址都活到调用结束，内核只写在它们里面 / SAFETY: the buffers and the
+        // address the header points at outlive the call, and the kernel writes only within them
+        let got = unsafe { libc::recvmsg(fd, &mut hdr, libc::MSG_DONTWAIT) };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let peer = socket_addr(&raw).ok_or(io::ErrorKind::InvalidInput)?;
+        // SAFETY: msg_control 是上面按 8 字节对齐的 `control`，msg_controllen 是内核写下的长度
+        // SAFETY: msg_control is `control` above, aligned to 8 bytes, and msg_controllen the
+        // length the kernel wrote
+        Ok((got as usize, peer, unsafe { local_in(&hdr) }))
+    }
+
+    /// 不等待地把 `data` 从 `local` 发给 `peer`；发送缓冲满时是 `WouldBlock`
+    /// Sends `data` to `peer` from `local` without waiting; `WouldBlock` when the send buffer is
+    /// full
+    pub fn send(fd: RawFd, data: &[u8], peer: SocketAddr, local: LocalAddr) -> io::Result<usize> {
+        let (raw, raw_len) = raw_addr(peer);
+        let (mut control, control_len) = source_control(local);
+        let mut iov = libc::iovec {
+            iov_base: data.as_ptr().cast_mut().cast(),
+            iov_len: data.len(),
+        };
+        // SAFETY: 普通 C 结构，全零是合法值 / SAFETY: a plain C struct, all zeroes is valid
+        let mut hdr: libc::msghdr = unsafe { zeroed() };
+        hdr.msg_name = (&raw as *const libc::sockaddr_storage).cast_mut().cast();
+        hdr.msg_namelen = raw_len;
+        hdr.msg_iov = &mut iov;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = control.as_mut_ptr().cast();
+        hdr.msg_controllen = control_len as _;
+        // SAFETY: 内核只读这些缓冲和地址，它们活到调用结束 / SAFETY: the kernel only reads these buffers and addresses, alive for the call
+        let sent = unsafe { libc::sendmsg(fd, &hdr, libc::MSG_DONTWAIT) };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sent as usize)
+    }
+}
+
+/// 批量收发 UDP 报文（Linux 的 recvmmsg / sendmmsg）。满负荷时一次系统调用收发多个报文，省下每个报文
+/// 进出内核的那一趟；空闲时一批只有一个，和单收单发一样。
+/// Batched UDP receive and send (Linux recvmmsg / sendmmsg). Under full load one system call takes
+/// or sends many datagrams, saving each one its own trip into the kernel; when idle a batch holds
+/// one, the same as single receives and sends.
+#[cfg(target_os = "linux")]
+pub mod udp_batch {
+    use std::io;
+    use std::mem::{size_of, zeroed};
+    use std::net::SocketAddr;
+    use std::os::fd::RawFd;
+
+    use bytes::BytesMut;
+
+    use super::LocalAddr;
+    use super::udp_local::{Control, local_in, raw_addr, socket_addr, source_control};
+
+    /// 一批最多这么多个报文 / The most datagrams in one batch
+    pub const BATCH: usize = 32;
+    /// 每个报文的接收缓冲，和单收时一样大，更长的报文被截断（见 `proto_utils::MAX_QUERY_LEN`）/ Each
+    /// datagram's receive buffer, as large as for single receives; a longer datagram is cut (see
+    /// `proto_utils::MAX_QUERY_LEN`)
+    pub const RECV_SIZE: usize = crate::proto_utils::MAX_QUERY_LEN;
+
+    /// 对端：内核给的原始地址发回时原样交回，`addr` 给引擎和日志用
+    /// A peer: the kernel's own address, handed back as it is to reply, and `addr` for the engine and logs
+    #[derive(Clone, Copy)]
+    pub struct Peer {
+        raw: libc::sockaddr_storage,
+        raw_len: libc::socklen_t,
+        addr: SocketAddr,
+        /// 它的报文发到的本机地址：有的话回答从这个地址发出，没有就由内核挑
+        /// The local address its datagram was sent to: the reply leaves from it when there is
+        /// one, and from the address the kernel picks when not
+        local: Option<LocalAddr>,
+    }
+
+    impl Peer {
+        /// `addr` 这个对端：转发回来的回答不是这一批收到的，按地址建出内核要的形式
+        /// The peer at `addr`: a reply that came back from a forward was not received in this
+        /// batch, so the kernel's form is built from the address
+        pub fn of(addr: SocketAddr) -> Self {
+            let (raw, raw_len) = raw_addr(addr);
+            Self {
+                raw,
+                raw_len,
+                addr,
+                local: None,
+            }
+        }
+
+        /// 回答从 `local` 发出；没有就由内核挑 / The reply leaves from `local`, or from the
+        /// address the kernel picks when there is none
+        pub fn from_local(mut self, local: Option<LocalAddr>) -> Self {
+            self.local = local;
+            self
+        }
+
+        pub fn addr(&self) -> SocketAddr {
+            self.addr
+        }
+
+        pub fn local(&self) -> Option<LocalAddr> {
+            self.local
         }
     }
 
@@ -750,71 +932,10 @@ pub mod udp_batch {
             let mut hdr: libc::msghdr = unsafe { zeroed() };
             hdr.msg_control = control.as_ptr().cast_mut().cast();
             hdr.msg_controllen = self.control_lens[k].min(size_of::<Control>()) as _;
-            // SAFETY: msg_control 指向这个报文自己的控制缓冲，msg_controllen 是内核写进去的长度、不超过缓冲；
-            // CMSG_* 只在这个范围里走。缓冲按 8 字节对齐，读得了 cmsghdr；数据用 read_unaligned 读，读之前
-            // 查过这条消息够长
-            // SAFETY: msg_control points at this datagram's own control buffer and
-            // msg_controllen is the length the kernel wrote, within the buffer; the CMSG_*
-            // macros walk inside that range only. The buffer is aligned to 8 bytes, so a
-            // cmsghdr can be read; the data is read with read_unaligned, after checking that
-            // the message is long enough
-            unsafe {
-                let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
-                while !cmsg.is_null() {
-                    let (level, kind, len) = (
-                        (*cmsg).cmsg_level,
-                        (*cmsg).cmsg_type,
-                        (*cmsg).cmsg_len as usize,
-                    );
-                    let holds = |size: usize| len >= libc::CMSG_LEN(size as u32) as usize;
-                    if level == libc::IPPROTO_IP
-                        && kind == libc::IP_PKTINFO
-                        && holds(size_of::<libc::in_pktinfo>())
-                    {
-                        let info: libc::in_pktinfo =
-                            std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
-                        // ipi_spec_dst 是能拿来当源地址的那个：单播时就是报文发到的地址，广播、组播时
-                        // 是内核按路由挑的本机地址。报文在 socket 开这个选项之前就排进来时内核没记它
-                        // （全零），这时用报文头里的目的地址，它是单播地址才用得上
-                        // ipi_spec_dst is the one usable as a source: the address the datagram
-                        // was sent to for unicast, and for broadcast or multicast the local
-                        // address the kernel picks by the route. For a datagram queued before
-                        // the socket turned the option on the kernel noted none (all zeroes),
-                        // and the destination in its header serves, if that is a unicast address
-                        let noted = Ipv4Addr::from(u32::from_be(info.ipi_spec_dst.s_addr));
-                        let addr = if noted.is_unspecified() {
-                            Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr))
-                        } else {
-                            noted
-                        };
-                        let usable =
-                            !(addr.is_unspecified() || addr.is_broadcast() || addr.is_multicast());
-                        return usable.then_some(LocalAddr::V4(addr));
-                    }
-                    if level == libc::IPPROTO_IPV6
-                        && kind == libc::IPV6_PKTINFO
-                        && holds(size_of::<libc::in6_pktinfo>())
-                    {
-                        let info: libc::in6_pktinfo =
-                            std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
-                        let addr = Ipv6Addr::from(info.ipi6_addr.s6_addr);
-                        // 组播地址当不了源地址，由内核挑 / A multicast address cannot be a
-                        // source, so the kernel picks
-                        if addr.is_multicast() {
-                            return None;
-                        }
-                        let link_local = addr.segments()[0] & 0xffc0 == 0xfe80;
-                        let interface = if link_local {
-                            info.ipi6_ifindex as u32
-                        } else {
-                            0
-                        };
-                        return Some(LocalAddr::V6(addr, interface));
-                    }
-                    cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
-                }
-            }
-            None
+            // SAFETY: msg_control 指向这个报文自己的控制缓冲（按 8 字节对齐），msg_controllen 是内核写进去的长度、不超过缓冲
+            // SAFETY: msg_control points at this datagram's own control buffer (aligned to 8
+            // bytes) and msg_controllen is the length the kernel wrote, within the buffer
+            unsafe { local_in(&hdr) }
         }
 
         pub fn len(&self) -> usize {
@@ -922,20 +1043,130 @@ pub mod udp_batch {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod udp_batch_tests {
-    use super::udp_batch::{BATCH, RECV_SIZE, Received, Replies};
-    use std::net::UdpSocket;
+#[cfg(all(test, unix))]
+mod udp_local_tests {
+    use super::LocalAddr;
+    use super::udp_local::{receive_local_addresses, recv, send};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
 
+    /// 客户端在回环上问得到的本机地址：Linux 上整个 127.0.0.0/8 都是，别的系统默认只有 127.0.0.1
+    /// The local addresses a client can ask on loopback: all of 127.0.0.0/8 on Linux, only
+    /// 127.0.0.1 by default on other systems
+    #[cfg(target_os = "linux")]
+    pub(super) const LOOPBACK: &[Ipv4Addr] = &[
+        Ipv4Addr::new(127, 0, 0, 2),
+        Ipv4Addr::new(127, 9, 9, 9),
+        Ipv4Addr::LOCALHOST,
+    ];
+    #[cfg(not(target_os = "linux"))]
+    pub(super) const LOOPBACK: &[Ipv4Addr] = &[Ipv4Addr::LOCALHOST];
+
     /// 等到第一个报文到了：本机回环上先发的先到 / Waits for the first datagram: on loopback, what was sent first arrives first
-    fn wait_readable(socket: &UdpSocket) {
+    pub(super) fn wait_readable(socket: &UdpSocket) {
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         socket.peek_from(&mut [0u8; 1]).expect("a datagram arrives");
     }
+
+    /// 客户端收到 `expected` 这个回答，返回它从哪个地址来 / The client receives the reply
+    /// `expected`, and where it came from is returned
+    fn reply_source(client: &UdpSocket, expected: &[u8]) -> SocketAddr {
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (len, from) = client.recv_from(&mut buf).expect("a reply arrives");
+        assert_eq!(&buf[..len], expected);
+        from
+    }
+
+    /// 监听在通配地址上的 socket 收到一个报文，连同它发到的本机地址；回答带着这个地址发出，就从这个地址走：客户端问
+    /// 哪个地址，回答就从哪个地址来
+    /// A socket on the wildcard address receives a datagram along with the local address it was
+    /// sent to, and a reply sent with that address leaves from it: whichever address a client
+    /// asks, the reply comes from
+    #[test]
+    fn a_reply_sent_with_the_local_address_leaves_from_it() {
+        let server = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let fd = server.as_raw_fd();
+        receive_local_addresses(fd, false).unwrap();
+        let port = server.local_addr().unwrap().port();
+        for &asked in LOOPBACK {
+            let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+            client.send_to(b"query", (asked, port)).unwrap();
+            wait_readable(&server);
+            let mut buf = [0u8; 64];
+            let (len, peer, local) = recv(fd, &mut buf).unwrap();
+            assert_eq!(&buf[..len], b"query");
+            assert_eq!(peer, client.local_addr().unwrap());
+            assert_eq!(local, Some(LocalAddr::V4(asked)));
+            assert_eq!(send(fd, b"reply", peer, local.unwrap()).unwrap(), 5);
+            assert_eq!(
+                reply_source(&client, b"reply"),
+                SocketAddr::from((asked, port))
+            );
+        }
+    }
+
+    /// IPv6 也一样。不是链路本地地址时不带网卡号；链路本地地址带着收到它的网卡号，回答从那块网卡上的这个地址发出。
+    /// macOS 和 BSD 的回环网卡上默认有 fe80::1：问它的查询，内核自己挑的源地址是 ::1，connect 过的客户端不认；Linux
+    /// 的回环网卡上没有链路本地地址
+    /// The same for IPv6. No interface goes with an address that is not link-local; a link-local
+    /// one carries the interface it came in on, and the reply leaves from that address on that
+    /// interface. macOS and the BSDs have fe80::1 on the loopback interface by default: for a
+    /// query to it the kernel by itself would reply from ::1, which a connected client refuses;
+    /// Linux's loopback interface has no link-local address
+    #[test]
+    fn an_ipv6_reply_sent_with_the_local_address_leaves_from_it() {
+        // 没有 IPv6 的机器上绑不了，不测 / Cannot bind on a machine without IPv6: not tested there
+        let Ok(server) = UdpSocket::bind("[::]:0") else {
+            return;
+        };
+        let fd = server.as_raw_fd();
+        receive_local_addresses(fd, true).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let loopback = SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0);
+        #[cfg(target_os = "linux")]
+        let asked = [loopback];
+        #[cfg(not(target_os = "linux"))]
+        let asked = [loopback, link_local_on_loopback(port)];
+        for asked in asked {
+            let client = UdpSocket::bind("[::1]:0").unwrap();
+            client.connect(asked).unwrap();
+            client.send(b"query").unwrap();
+            wait_readable(&server);
+            let mut buf = [0u8; 64];
+            let (_, peer, local) = recv(fd, &mut buf).unwrap();
+            assert_eq!(local, Some(LocalAddr::V6(*asked.ip(), asked.scope_id())));
+            send(fd, b"reply", peer, local.unwrap()).unwrap();
+            assert_eq!(reply_source(&client, b"reply"), SocketAddr::V6(asked));
+        }
+    }
+
+    /// 回环网卡上的 fe80::1 的 `port` 端口 / Port `port` of fe80::1 on the loopback interface
+    #[cfg(not(target_os = "linux"))]
+    fn link_local_on_loopback(port: u16) -> SocketAddrV6 {
+        // SAFETY: 网卡名是以 NUL 结尾的字符串 / SAFETY: the interface name is a NUL-terminated string
+        let interface = unsafe { libc::if_nametoindex(c"lo0".as_ptr()) };
+        SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            port,
+            0,
+            interface,
+        )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod udp_batch_tests {
+    use super::udp_batch::{BATCH, RECV_SIZE, Received, Replies};
+    use super::udp_local_tests::wait_readable;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
+    use std::time::Duration;
 
     fn recv_one(socket: &UdpSocket) -> Vec<u8> {
         socket
@@ -946,17 +1177,19 @@ mod udp_batch_tests {
         buf[..len].to_vec()
     }
 
-    /// 监听在通配地址上的 socket 收到一个报文，连同它发到的本机地址；回答带着这个地址发出，就从这个地址走。
-    /// 回环上 127.0.0.0/8 都是本机地址：客户端问哪个地址，回答就从哪个地址来。成批发和单个发都是
-    /// A socket on the wildcard address receives a datagram along with the local address it
-    /// was sent to, and a reply carrying that address leaves from it. All of 127.0.0.0/8 is
-    /// local on loopback: whichever address a client asks, the reply comes from. So for a
-    /// batched send and for a single one
+    /// 成批收也一样：通配地址上收到的一批里，每个报文带着它发到的本机地址，成批发的回答从那个地址走；按地址重建、
+    /// 再带上本机地址的对端（转发回来的回答就这样发）也一样
+    /// Batched receives are the same: each datagram of a batch received on the wildcard address
+    /// carries the local address it was sent to, and a batched reply leaves from it; so does one
+    /// to a peer rebuilt from its address and given that local address, as a reply back from a
+    /// forward is sent
     #[test]
     fn a_reply_carrying_the_local_address_leaves_from_it() {
         use super::LocalAddr;
-        use super::udp_batch::{Peer, receive_local_addresses, send_one};
-        use std::net::{Ipv4Addr, SocketAddr};
+        use super::udp_batch::Peer;
+        use super::udp_local::receive_local_addresses;
+        use super::udp_local_tests::LOOPBACK;
+        use std::net::SocketAddr;
 
         let server = UdpSocket::bind("0.0.0.0:0").unwrap();
         server.set_nonblocking(true).unwrap();
@@ -966,11 +1199,7 @@ mod udp_batch_tests {
         let mut received = Received::default().with_local_addresses();
         let mut replies = Replies::default();
 
-        for asked in [
-            Ipv4Addr::new(127, 0, 0, 2),
-            Ipv4Addr::new(127, 9, 9, 9),
-            Ipv4Addr::LOCALHOST,
-        ] {
+        for &asked in LOOPBACK {
             let client = UdpSocket::bind("127.0.0.1:0").unwrap();
             client.send_to(b"query", (asked, port)).unwrap();
             wait_readable(&server);
@@ -979,22 +1208,21 @@ mod udp_batch_tests {
             assert_eq!(data, b"query");
             assert_eq!(peer.local(), Some(LocalAddr::V4(asked)));
 
-            // 成批发 / A batched send
             replies.clear();
-            replies.next_buf().clear();
-            replies.next_buf().extend_from_slice(b"batched");
-            replies.push(peer);
-            assert_eq!(replies.send(fd, 0).unwrap(), 1);
-            // 单个发：对端按地址重建，再带上本机地址 / A single send: the peer rebuilt from its
-            // address, then given the local address
             let rebuilt = Peer::of(peer.addr()).from_local(peer.local());
-            assert_eq!(send_one(fd, b"single", &rebuilt).unwrap(), 6);
+            for (reply, to) in [(&b"received"[..], peer), (b"rebuilt", rebuilt)] {
+                let buf = replies.next_buf();
+                buf.clear();
+                buf.extend_from_slice(reply);
+                replies.push(to);
+            }
+            assert_eq!(replies.send(fd, 0).unwrap(), 2);
 
             client
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let mut buf = [0u8; 64];
-            for expected in [&b"batched"[..], b"single"] {
+            for expected in [&b"received"[..], b"rebuilt"] {
                 let (len, from) = client.recv_from(&mut buf).expect("a reply arrives");
                 assert_eq!(&buf[..len], expected);
                 assert_eq!(from, SocketAddr::from((asked, port)), "{expected:?}");
@@ -1008,7 +1236,7 @@ mod udp_batch_tests {
     #[test]
     fn a_datagram_queued_before_asking_still_gives_its_address() {
         use super::LocalAddr;
-        use super::udp_batch::receive_local_addresses;
+        use super::udp_local::receive_local_addresses;
         use std::net::Ipv4Addr;
 
         let server = UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -1035,7 +1263,7 @@ mod udp_batch_tests {
     #[test]
     fn an_ipv6_reply_leaves_from_the_address_the_datagram_came_to() {
         use super::LocalAddr;
-        use super::udp_batch::receive_local_addresses;
+        use super::udp_local::receive_local_addresses;
         use std::net::Ipv6Addr;
 
         // 没有 IPv6 的机器上绑不了，不测 / Cannot bind on a machine without IPv6: not tested there
