@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 
 use crate::engine::matcher_adapter::{MatcherContext, matcher_matches};
 use crate::engine::test_support::engine_from;
-use crate::matcher::eval_match_chain;
+use crate::matcher::advanced_rule::compile_pipelines;
+use crate::matcher::{RuntimePipelineConfig, eval_match_chain};
 
 const LABELS: [&str; 9] = ["a", "b", "ex", "cn", "com", "google", "ads", "x", "a\\046b"];
 const OPERATORS: [&str; 4] = ["and", "or", "and_not", "or_not"];
@@ -112,20 +113,34 @@ async fn the_compiled_index_misses_no_rule_that_matches() {
     )
     .unwrap();
 
+    // 引擎只建一个，为了读进 GeoSite 名单；每一轮的规则只编译出来，不建引擎。以前每轮建一个，每个引擎都开一池上游
+    // socket，三百轮把同时在跑的测试要用的本机端口都用光了
+    // One engine only, to read the GeoSite list in; each round's rules are compiled with no
+    // engine of their own. One used to be built per round, each opening a pool of upstream
+    // sockets, and three hundred rounds used up the local ports the tests running alongside need
+    let settings = json!({
+        "default_upstream": "127.0.0.1:9",
+        "geosite_data_paths": [geosite.to_string_lossy()]
+    });
+    let engine = engine_from(json!({
+        "settings": settings,
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "g", "matchers": [{ "type": "geo_site", "value": "g" }], "actions": [{ "type": "allow" }]
+        }] }]
+    }));
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut matched = 0usize;
     for round in 0..300 {
         let rules: Vec<Value> = (0..1 + rng.below(8)).map(|index| rng.rule(index)).collect();
-        let engine = engine_from(json!({
-            "settings": {
-                "default_upstream": "127.0.0.1:9",
-                "geosite_data_paths": [geosite.to_string_lossy()]
-            },
+        let config = serde_json::from_value(json!({
+            "settings": settings,
             "pipelines": [{ "id": "main", "rules": rules }]
-        }));
-        let state = engine.state.load();
-        let pipeline = &state.pipeline.pipelines[0];
-        let index = &state.compiled_pipelines[0].index;
+        }))
+        .expect("parse config");
+        let runtime = RuntimePipelineConfig::from_config(config).expect("build runtime config");
+        let compiled = compile_pipelines(&runtime);
+        let pipeline = &runtime.pipelines[0];
+        let index = &compiled[0].index;
         for _ in 0..40 {
             let qname = if rng.below(20) == 0 {
                 String::new()
