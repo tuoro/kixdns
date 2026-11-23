@@ -719,6 +719,14 @@ pub(crate) async fn handle_forward_decision_logged(
             loop {
                 use dashmap::mapref::entry::Entry;
                 let mut rx = match engine.inflight.entry(keys.inflight) {
+                    // 进不了缓存的也不交给别人（流控拦过这个请求、它发出的 ECS 说不准适用于谁）：它不领头，自己转发。以前
+                    // 流控拦下以后 continue 到下一条规则，那里的转发照样登记条目，把这台设备拿到的兜底交给同时来问的别的设备
+                    // What may not go into the cache is not handed to others either (flow control
+                    // kept this request back, or whom the ECS it sends applies to is unknown): it
+                    // leads no entry and forwards itself. With flow control having kept it back,
+                    // continuing to the next rule used to register an entry there all the same,
+                    // handing this device's fallback to the other devices asking meanwhile
+                    Entry::Vacant(_) if trail.is_uncacheable() => break,
                     Entry::Vacant(entry) => {
                         entry.insert(InflightEntry::sharing(
                             &inflight_question,

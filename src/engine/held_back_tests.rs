@@ -790,6 +790,56 @@ async fn the_other_device_is_answered_when_a_held_back_one_led(
     );
 }
 
+/// 流控拦下一台设备以后，它 continue 到下一条规则去问备用上游：这次转发不登记条目，同时来问同一个名字的另一台设备不等它，
+/// 自己去问上游，拿到上游的回答。以前那次转发照样登记，另一台设备等在上面，拿到的是这台设备的兜底
+/// With a device held back, it continues to the next rule asking a backup upstream: that forward
+/// registers no entry, and another device asking the same name meanwhile does not wait on it but
+/// asks the upstream itself, getting the upstream's answer. That forward used to register all
+/// the same, the other device waiting on it and getting this device's fallback
+#[tokio::test]
+async fn a_held_back_device_continuing_leads_no_entry_for_others() {
+    let backup_answer = Ipv4Addr::new(192, 0, 2, 77);
+    let upstream = answering_upstream(ANSWER, 300).await;
+    upstream.silence(true);
+    let backup =
+        support::answering_upstream_after(backup_answer, 300, Duration::from_millis(100)).await;
+    let engine = Arc::new(engine_from(json!({
+        "settings": counting_settings(json!({
+            "flow_control_enabled": true,
+            "upstream_timeout_ms": 450,
+        })),
+        "pipelines": [{ "id": "main", "rules": [
+            { "name": "all", "matchers": [{ "type": "any" }],
+              "actions": [{ "type": "forward", "upstream": upstream.address }],
+              "response_actions_on_miss": [{ "type": "continue" }] },
+            { "name": "backup", "matchers": [{ "type": "any" }],
+              "actions": [{ "type": "forward", "upstream": backup.address }] },
+        ]}]
+    })));
+    for one in flood(&engine, client(1), "held", 64) {
+        one.await.unwrap();
+    }
+    upstream.silence(false);
+
+    let asked_backup = backup.queries();
+    let held_back = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move { ask(&engine, &query("same.test."), client(1)).await })
+    };
+    sent_to(&backup, asked_backup + 1).await;
+    let other = ask(&engine, &query("same.test."), client(2)).await;
+    assert_eq!(
+        first_a(&other),
+        Some(ANSWER),
+        "the other device gets the upstream's answer"
+    );
+    assert_eq!(
+        first_a(&held_back.await.unwrap()),
+        Some(backup_answer),
+        "the device held back gets the backup's"
+    );
+}
+
 /// 规则 continue 以后请求还留着它登记的条目（等最后的结果交给等着的请求）：后面那条规则的转发被流控拦下时，留着的条目也
 /// 放下，不把这台设备自己的 SERVFAIL 交给等着的别的设备
 /// After a rule continues the request still holds the entry it registered (for the final
