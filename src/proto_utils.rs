@@ -615,6 +615,28 @@ pub(crate) fn answers_query(query: &[u8], response: &[u8]) -> bool {
 /// it is never cached or handed to waiters (see `Engine::insert_dns_cache_entry`,
 /// `InflightCleanupGuard::hand_over`), so it is always this client's own forward's.
 pub(crate) fn reply_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    // 查询的 OPT 只找一次：它的 DO 位既决定应答留不留 AD，也决定应答的 OPT
+    // The query's OPT is looked for once: its DO bit decides both whether the reply keeps
+    // AD and the reply's OPT
+    shaped_as_asked(reply, query, asked_dnssec_ok(query))
+}
+
+/// [`reply_as_asked`]，查询带不带 OPT、DO 位是什么已经知道（快速解析读过它）：`asked_dnssec_ok` 有 OPT 时是它的 DO 位，
+/// 没有时是 None。缓存命中不必为此再把查询走一遍
+/// [`reply_as_asked`] with whether the query carries an OPT, and its DO bit, known already (the
+/// quick parse read it): `asked_dnssec_ok` is the DO bit with an OPT and None without one. A
+/// cache hit need not walk the query again for it
+pub(crate) fn reply_as_asked_knowing(
+    reply: Bytes,
+    query: &[u8],
+    asked_dnssec_ok: Option<bool>,
+) -> Bytes {
+    shaped_as_asked(reply, query, Ok(asked_dnssec_ok))
+}
+
+/// [`reply_as_asked`]，查询的 DO 位（见 [`asked_dnssec_ok`]）已经找过 / [`reply_as_asked`] with the query's
+/// DO bit (see [`asked_dnssec_ok`]) looked for already
+fn shaped_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bool>, ()>) -> Bytes {
     // 应答的记录只走一遍：问题名的写法和 RD、CD 位改的都是原位的字节，记录的位置不动，后面找 OPT 用的就是这一遍
     // The reply's records are walked once: the question name's spelling and the RD and CD
     // bits change bytes in place without moving any record, so the OPT is taken from this walk
@@ -625,10 +647,6 @@ pub(crate) fn reply_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     if walk.last_is_tsig {
         return reply;
     }
-    // 查询的 OPT 只找一次：它的 DO 位既决定应答留不留 AD，也决定应答的 OPT
-    // The query's OPT is looked for once: its DO bit decides both whether the reply keeps
-    // AD and the reply's OPT
-    let asked_dnssec_ok = asked_dnssec_ok(query);
     edns_as_asked_with(
         header_as_asked(question_as_asked(reply, query), query, asked_dnssec_ok),
         asked_dnssec_ok,
@@ -2103,28 +2121,75 @@ pub(crate) fn reply_within_ttls(reply: Bytes, floor: u32, cap: u32) -> Bytes {
 /// 41) pseudo-records are skipped: their TTL field holds the EDNS extended RCODE and
 /// flags (the DO bit among them), not a TTL.
 fn map_record_ttls(packet: &mut [u8], mut f: impl FnMut(u32) -> u32) {
-    if packet.len() < 12 {
-        return;
+    let mut fields = TtlFields::of(packet);
+    while let Some(at) = fields.next(packet) {
+        let ttl = at..at + 4;
+        let old_ttl = u32::from_be_bytes(packet[ttl.clone()].try_into().unwrap());
+        packet[ttl].copy_from_slice(&f(received_ttl(old_ttl)).to_be_bytes());
+    }
+}
+
+/// 把缓存里的应答 `cached` 接在 `buf` 后面，每条记录的 TTL 一边拷一边调低 `elapsed` 秒（同 [`patch_all_ttls`]）：拷和改是
+/// 同一遍。以前先整个拷过去，再走一遍改 TTL
+/// Appends the cached answer `cached` to `buf`, lowering every record's TTL by `elapsed`
+/// seconds as it is copied (as [`patch_all_ttls`] does): copying and changing are one pass. It
+/// used to be copied whole first and walked again for the TTLs
+pub(crate) fn extend_aged(buf: &mut BytesMut, cached: &[u8], elapsed: u32) {
+    let mut copied = 0;
+    if elapsed > 0 {
+        let mut fields = TtlFields::of(cached);
+        while let Some(at) = fields.next(cached) {
+            let old_ttl = u32::from_be_bytes(cached[at..at + 4].try_into().unwrap());
+            buf.extend_from_slice(&cached[copied..at]);
+            buf.extend_from_slice(&received_ttl(old_ttl).saturating_sub(elapsed).to_be_bytes());
+            copied = at + 4;
+        }
+    }
+    buf.extend_from_slice(&cached[copied..]);
+}
+
+/// 依次走到报文里每条记录的 TTL 字段；OPT（类型 41）伪记录跳过，见 [`map_record_ttls`]。自己不借着报文，所以边走边改 TTL
+/// 也行。遇到读不出的记录就停；RDATA 超出报文的那条也给出它的 TTL，到它为止（原来如此）
+/// Walks to the TTL field of each record of a message in turn; OPT (type 41) pseudo-records are
+/// skipped, see [`map_record_ttls`]. It holds no borrow of the message, so TTLs may be changed
+/// along the way. It stops at a record that cannot be read; one whose RDATA runs past the
+/// message still gives its TTL and is the last (as it always has been)
+struct TtlFields {
+    pos: usize,
+    records: usize,
+}
+
+impl TtlFields {
+    fn of(packet: &[u8]) -> Self {
+        let first = (packet.len() >= 12)
+            .then(|| skip_questions(packet, section_count(packet, 0)))
+            .flatten();
+        match first {
+            Some(pos) => Self {
+                pos,
+                records: (1..4).map(|index| section_count(packet, index)).sum(),
+            },
+            None => Self { pos: 0, records: 0 },
+        }
     }
 
-    let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
-        return;
-    };
-    for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
-        let Some(record) = record_at(packet, pos) else {
-            return;
-        };
-        if record.rr_type != 41 {
-            let ttl = record.fixed + 4..record.fixed + 8;
-            let old_ttl = u32::from_be_bytes(packet[ttl.clone()].try_into().unwrap());
-            packet[ttl].copy_from_slice(&f(received_ttl(old_ttl)).to_be_bytes());
+    fn next(&mut self, packet: &[u8]) -> Option<usize> {
+        while self.records > 0 {
+            let Some(record) = record_at(packet, self.pos) else {
+                self.records = 0;
+                return None;
+            };
+            self.records = if record.rdata.end > packet.len() {
+                0
+            } else {
+                self.records - 1
+            };
+            self.pos = record.rdata.end;
+            if record.rr_type != 41 {
+                return Some(record.fixed + 4);
+            }
         }
-        // 放不下的记录也已改过 TTL，到这里才停（原来如此）/ A record that does not fit has
-        // had its TTL rewritten too, and only now is it stopped at (as it always has been)
-        if record.rdata.end > packet.len() {
-            return;
-        }
-        pos = record.rdata.end;
+        None
     }
 }
 
@@ -2311,6 +2376,36 @@ mod tests {
         }
         let without = [0x56, 0x78, 0x20, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(header_reply(&without).unwrap().len(), 12);
+    }
+
+    /// 一边拷一边调低 TTL，和先拷再调低的结果一样，OPT 的标志不动；没过一秒时照拷
+    /// Lowering the TTLs while copying gives what copying and then lowering gives, the OPT's
+    /// flags untouched; under a second it is copied as it is
+    #[test]
+    fn aging_while_copying_matches_copying_then_aging() {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::{Name, RData, RecordType, rdata::A};
+        let name = Name::from_ascii("aged.example.").unwrap();
+        let mut reply = Message::new(7, MessageType::Response, OpCode::Query);
+        reply.add_query(Query::query(name.clone(), RecordType::A));
+        for (n, ttl) in [(1, 300), (2, 5), (3, 0x8000_0001)] {
+            reply.add_answer(Record::from_rdata(
+                name.clone(),
+                ttl,
+                RData::A(A::from(std::net::Ipv4Addr::from(n))),
+            ));
+        }
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(true);
+        reply.edns = Some(edns);
+        let cached = reply.to_vec().unwrap();
+        for elapsed in [0, 10] {
+            let mut copied_then_aged = cached.clone();
+            patch_all_ttls(&mut copied_then_aged, elapsed);
+            let mut aged = BytesMut::from(&b"prefix"[..]);
+            extend_aged(&mut aged, &cached, elapsed);
+            assert_eq!(&aged[6..], &copied_then_aged[..], "{elapsed}");
+        }
     }
 
     /// 各段计数为 `counts`（问题、Answer、Authority、Additional）的应答报文头

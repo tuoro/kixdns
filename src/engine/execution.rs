@@ -879,7 +879,9 @@ impl Engine {
                 // `phases::served_from_cache`）；其余的拿到存着的字节（不带 ECS），由监听器修正
                 // TTL。两种都按这个客户端问的样子规整
                 let echoed = q.client_subnet.is_some();
-                let reply = crate::proto_utils::reply_as_asked(
+                // 快速解析读过查询的 OPT，规整应答时不必再走一遍查询 / The quick parse read the query's
+                // OPT, so shaping the reply need not walk the query again
+                let reply = crate::proto_utils::reply_as_asked_knowing(
                     if echoed {
                         phases::served_from_cache(
                             &hit,
@@ -891,6 +893,7 @@ impl Engine {
                         hit.bytes.clone()
                     },
                     packet,
+                    q.edns_present.then_some(q.flags.dnssec_ok()),
                 );
                 if let Some(observer) = observed {
                     self.observe_fast_path(

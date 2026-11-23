@@ -22,8 +22,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 /// seconds the answer sat in the cache (RFC 1035 §5.2), and the query's transaction ID
 pub fn write_cache_hit(buf: &mut BytesMut, cached: &[u8], tx_id: u16, elapsed_secs: u32) {
     buf.clear();
-    buf.extend_from_slice(cached);
-    proto_utils::patch_all_ttls(buf, elapsed_secs);
+    proto_utils::extend_aged(buf, cached, elapsed_secs);
     utils::set_id(buf, tx_id);
 }
 
