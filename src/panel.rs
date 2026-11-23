@@ -123,6 +123,13 @@ struct ActiveConfig {
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
     restart_pending: Vec<String>,
+    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载，只记一条 warn，
+    /// 而默认日志级别是 error，所以经控制通道报出来；重载成功说明新配置没有这样的写法，就清空
+    /// What the configuration read at startup writes that a reload or a save from the panel
+    /// refuses (see `config::problems`). Startup loads it as before with only a warning, the
+    /// default log level being error, so they are reported over the control channel; a
+    /// successful reload means the new configuration has none, and they are cleared
+    problems: Vec<String>,
 }
 
 /// 一个线程记下的一格 / What one thread has counted in a bucket
@@ -857,6 +864,9 @@ impl PanelMetrics {
         active.last_reload_error = None;
         active.restart_pending = restart_pending;
         if !initial {
+            active.problems.clear();
+        }
+        if !initial {
             self.reload_success.fetch_add(1, Ordering::Relaxed);
             self.reload_sequence.fetch_add(1, Ordering::Release);
         }
@@ -942,7 +952,14 @@ impl PanelMetrics {
                 "error": active.last_reload_error,
             },
             "restart_pending": active.restart_pending,
+            "problems": active.problems,
         })
+    }
+
+    /// 启动时读的配置有这些问题（见 `ActiveConfig::problems`）/ The configuration read at startup
+    /// has these problems (see `ActiveConfig::problems`)
+    pub fn startup_problems(&self, problems: Vec<String>) {
+        self.active_config.write().problems = problems;
     }
 
     #[cfg(unix)]
@@ -4653,6 +4670,40 @@ mod diagnostic_tests {
             metrics.config_json()["restart_pending"],
             serde_json::json!([])
         );
+    }
+
+    /// 控制通道的 config 列出启动时读的配置里、重载和面板保存会拒绝的写法：默认日志级别看不到启动时的警告。
+    /// 初次加载不清掉它们，重载成功以后（新配置没有这样的写法）清空
+    /// The control channel's config lists what the configuration read at startup writes that a
+    /// reload or a save from the panel refuses: the default log level hides startup's warnings.
+    /// The initial load keeps them, and a successful reload (the new configuration having none)
+    /// clears them
+    #[tokio::test]
+    async fn config_reports_the_problems_of_the_configuration_read_at_startup() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "min_tll": 30 },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "rest", "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+            }] }]
+        });
+        let problems = crate::config::problems(
+            &crate::config::parse_config(&raw.to_string()).expect("parse config"),
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let metrics = Arc::new(PanelMetrics::new(false));
+        metrics.startup_problems(problems.clone());
+        let mut fixed = raw.clone();
+        fixed["settings"].as_object_mut().unwrap().remove("min_tll");
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        assert_eq!(
+            metrics.config_json()["problems"],
+            serde_json::json!(problems),
+            "the initial load keeps them"
+        );
+
+        engine.reload(runtime_for(fixed));
+        assert_eq!(metrics.config_json()["problems"], serde_json::json!([]));
     }
 
     /// 诊断回复里有一条回答写着这个地址 / Some answer in the diagnostic reply names this address

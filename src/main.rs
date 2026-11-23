@@ -425,7 +425,8 @@ async fn run_dns_server(
     // 启动时只记警告、照旧加载，升级以后已经在用的配置行为不变；重载和面板的校验会拒绝它们
     // Startup only warns and loads as before, so a configuration in use keeps its
     // behaviour across an upgrade; a reload and the panel's validation refuse these
-    for problem in kixdns::config::problems(&cfg) {
+    let problems = kixdns::config::problems(&cfg);
+    for problem in &problems {
         warn!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
     }
     kixdns::config::warn_ignored_settings(&cfg);
@@ -458,6 +459,11 @@ async fn run_dns_server(
         .as_ref()
         .filter(|_| cfg!(unix))
         .map(|_| Arc::new(PanelMetrics::new(debug)));
+    // 默认日志级别看不到上面那些警告，面板经控制通道读（`config` 的 `problems`）/ The default log level
+    // hides the warnings above, so the panel reads them over the control channel (`config`'s `problems`)
+    if let Some(metrics) = &panel_metrics {
+        metrics.startup_problems(problems);
+    }
     let mut engine = Engine::builder(cfg)
         .listener_label(listener_label.clone())
         .config_source(&config, config_source);
