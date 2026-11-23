@@ -645,27 +645,13 @@ impl GeoSiteManager {
             .insert(normalized.tag, TagMatchers::new(normalized.matchers));
     }
 
-    /// 检查域名是否匹配指定的 GeoSite 标签 / Check if domain matches specified GeoSite tag
-    ///
-    /// # 参数 / Parameters
-    /// - `tag`: GeoSite 标签（如 "cn", "google", "category-ads"）/ GeoSite tag
-    /// - `domain`: 要检查的域名 / Domain to check
-    ///
-    /// # 返回 / Returns
-    /// - `true`: 域名匹配该标签 / Domain matches the tag
-    /// - `false`: 域名不匹配该标签 / Domain does not match the tag
+    /// 域名在不在标签 `tag`（如 `cn`、`google`、`category-ads`）里。`tag` 是小写的：规则写的标签编译时就转了小写（见
+    /// `matcher::geosite_tag`），数据文件里的读进来时转
+    /// Whether the name is in tag `tag` (such as `cn`, `google` or `category-ads`). `tag` is
+    /// lowercase: the tags rules write are lowercased as they compile (see
+    /// `matcher::geosite_tag`), and those of data files as they are read
     #[inline]
     pub fn matches(&self, tag: &str, domain: &str) -> bool {
-        // 不区分大小写：按小写的 tag 查找；配置里的 tag 一般已是小写，就不另分配一份
-        // Case insensitive: looked up by the lowercased tag; tags in a config are usually lowercase
-        // already, and then no lowercased copy is made
-        let lowered;
-        let tag = if tag.bytes().any(|b| b.is_ascii_uppercase()) {
-            lowered = tag.to_ascii_lowercase();
-            lowered.as_str()
-        } else {
-            tag
-        };
         self.database
             .get(tag)
             .is_some_and(|matchers| matchers.matches(domain))
@@ -677,18 +663,14 @@ impl GeoSiteManager {
         self.database.contains_key(tag)
     }
 
-    /// `tags`（规则用到的，不分大小写）里哪些没有一个数据文件提供：用它们的规则永远不会命中
-    /// The tags among `tags` (the ones rules use, ignoring case) that no data file provides:
-    /// rules using them never match
+    /// `tags`（规则用到的，小写）里哪些没有一个数据文件提供：用它们的规则永远不会命中
+    /// The tags among `tags` (the ones rules use, lowercase) that no data file provides: rules
+    /// using them never match
     pub fn missing_tags(&self, tags: &[String]) -> Vec<String> {
-        let mut missing: Vec<String> = tags
-            .iter()
-            .map(|tag| tag.to_ascii_lowercase())
-            .filter(|tag| !self.database.contains_key(tag))
-            .collect();
-        missing.sort_unstable();
-        missing.dedup();
-        missing
+        tags.iter()
+            .filter(|tag| !self.database.contains_key(*tag))
+            .cloned()
+            .collect()
     }
 
     /// 把数据文件 `path` 眼下说了算的标签里、属于 `tags`（不分大小写）的拿出来，连同它们的数据。重新读这个文件
@@ -767,18 +749,18 @@ fn split_tag_attrs(tag: &str) -> (&str, Vec<&str>) {
     }
 }
 
-/// 一个域名的属性 `attrs` 里有没有 `wanted` 的每一个：和 V2Ray 一样都要有，按字面的键比较，不分大小写，
-/// 所以 `!cn` 要的是键 `!cn`（domain-list-community 自己就用这个键），不是取反
+/// 一个域名的属性 `attrs` 里有没有 `wanted` 的每一个：和 V2Ray 一样都要有，按字面的键比较，两边都已是小写（见
+/// `Domain::into_entry`、`matcher::geosite_tag`），所以 `!cn` 要的是键 `!cn`（domain-list-community 自己就用这个键），
+/// 不是取反
 /// Whether a domain's attributes `attrs` hold every one of `wanted`: all are required, as in
-/// V2Ray, each compared as a literal key ignoring case, so `!cn` asks for the key `!cn`
+/// V2Ray, each compared as a literal key, both sides lowercase already (see
+/// `Domain::into_entry` and `matcher::geosite_tag`), so `!cn` asks for the key `!cn`
 /// (domain-list-community uses that key itself), not for a negation
 ///
 /// The domains of a tag that lack an attribute are two matchers:
 /// `geosite: google` together with `geosite_not: google@cn`.
 fn has_attrs(attrs: &[String], wanted: &[String]) -> bool {
-    wanted
-        .iter()
-        .all(|key| attrs.iter().any(|attr| attr.eq_ignore_ascii_case(key)))
+    wanted.iter().all(|key| attrs.contains(key))
 }
 
 /// 数据文件里读出的一条。正则只留写法，等整个 tag 读完合成一个集合时才编译（见 [`Regexes::new`]）
@@ -1312,19 +1294,19 @@ impl GeoSiteManager {
         Self::parse_dat_entries(path, None)
     }
 
-    /// 按条目读 .dat 文件，留下要的 tag：`tags` 是点名的那些（可以带一个或几个 `@属性`），None 时每个 tag 都要
-    /// Read a .dat file entry by entry, keeping the wanted tags: the named `tags` (which may
-    /// carry `@attribute`s), or every tag with None
+    /// 按条目读 .dat 文件，留下要的 tag：`tags` 是点名的那些（小写，可以带一个或几个 `@属性`），None 时每个 tag 都要
+    /// Read a .dat file entry by entry, keeping the wanted tags: the named `tags` (lowercase,
+    /// and they may carry `@attribute`s), or every tag with None
     fn parse_dat_entries(path: &Path, tags: Option<&[String]>) -> anyhow::Result<ParsedGeoSite> {
         // Pre-process tags: split `tag@attr@…` syntax into (base, attributes)
-        // Map: base_tag_lower → Vec<(store_tag_lower, attributes_lower)>
-        let mut tag_requests: FxHashMap<String, Vec<(String, Vec<String>)>> = FxHashMap::default();
+        // Map: base_tag → Vec<(store_tag, attributes)>
+        let mut tag_requests: FxHashMap<&str, Vec<(String, Vec<String>)>> = FxHashMap::default();
         for tag in tags.unwrap_or_default() {
             let (base, attrs) = split_tag_attrs(tag);
-            tag_requests.entry(base.to_lowercase()).or_default().push((
-                tag.to_lowercase(),
-                attrs.iter().map(|attr| attr.to_lowercase()).collect(),
-            ));
+            tag_requests
+                .entry(base)
+                .or_default()
+                .push((tag.clone(), attrs.into_iter().map(str::to_owned).collect()));
         }
 
         if let Some(tags) = tags {
@@ -1366,12 +1348,12 @@ impl GeoSiteManager {
                     file.read(&mut field, len)?;
                     let tag = std::str::from_utf8(&field)
                         .context("GeoSite tag in .dat file is not UTF-8")?
-                        .to_lowercase();
+                        .to_ascii_lowercase();
                     debug!(target = "geosite", tag = %tag, "read GeoSite tag");
                     // Match against base tags (supports `@attr` split); with no tag named,
                     // every non-empty tag is wanted
                     match tags {
-                        Some(_) => tag_requests.get(&tag).cloned(),
+                        Some(_) => tag_requests.get(tag.as_str()).cloned(),
                         None => (!tag.is_empty()).then(|| vec![(tag, Vec::new())]),
                     }
                 }
@@ -2287,7 +2269,7 @@ mod tests {
                     count += 1;
                 }
                 (!site.country_code.is_empty() && count > 0)
-                    .then(|| (site.country_code.to_lowercase(), builder.finish()))
+                    .then(|| (site.country_code.to_ascii_lowercase(), builder.finish()))
             })
             .collect();
         let entries = |parsed: &ParsedGeoSite| {
@@ -2610,9 +2592,6 @@ mod tests {
         // Every attribute asked for is required, in any order
         assert!(has_attrs(&keys(&["cn", "ads"]), &keys(&["ads", "cn"])));
         assert!(!has_attrs(&cn, &keys(&["cn", "ads"])));
-        // case insensitive
-        assert!(has_attrs(&keys(&["CN"]), &cn));
-        assert!(has_attrs(&keys(&["!CN"]), &keys(&["!cn"])));
     }
 
     /// 标签里写了几个属性时，选出的是每个属性都带的域名，和 V2Ray 一样。以前只在第一个 `@` 处拆开，`test@cn@ads`
@@ -2874,8 +2853,9 @@ mod tests {
         assert!(!selective.matches("empty", "github.com"));
     }
 
-    /// JSON 的分类名和 .dat 一样不区分大小写；原来写成大写的分类永远查不到。
-    /// JSON tags ignore case as .dat tags do; a tag written in capitals used to be unreachable.
+    /// JSON 的分类名和 .dat 一样读进来转成小写；原来写成大写的分类永远查不到。
+    /// JSON tags are lowercased as they are read, as .dat tags are; a tag written in capitals
+    /// used to be unreachable.
     #[test]
     fn json_tags_ignore_case() {
         let json = r#"{"entries":[{"tag":"Ads","domains":["ads.example"]}]}"#;
@@ -2889,8 +2869,6 @@ mod tests {
         from_file.apply_source(&path, parsed);
         for manager in [&from_string, &from_file] {
             assert!(manager.matches("ads", "ads.example"));
-            assert!(manager.matches("ADS", "ads.example"));
-            assert!(manager.matches("Ads", "ads.example"));
         }
     }
 
