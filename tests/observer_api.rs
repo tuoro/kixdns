@@ -942,13 +942,13 @@ async fn an_observer_can_take_a_rule_answer_whole() {
     );
     assert!(observer.started.lock().unwrap().is_empty());
 
-    // 用到 GeoSite 的规则第一次走完整路径，之后由规则缓存答 / A rule using GeoSite takes the full path the first
-    // time, and the rule cache answers after that
+    // 先命中一条快速路径不当场决定的规则（这里 continue），第一次走完整路径，之后由规则缓存答 / A rule the fast
+    // path does not decide on the spot matching first (a continue here), the full path answers the first time and
+    // the rule cache after that
     let (engine, observer) = engine_with(serde_json::json!([{
         "id": "main",
         "rules": [
-            { "name": "geo", "matchers": [{ "type": "geo_site", "value": "nosuchtag" }],
-              "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }] },
+            { "name": "audit", "matchers": [{ "type": "any" }], "actions": [{ "type": "continue" }] },
             { "name": "ip", "matchers": [{ "type": "any" }], "actions": answer },
         ]
     }]));
@@ -978,7 +978,7 @@ async fn an_observer_can_take_a_rule_answer_whole() {
         *observer.whole.lock().unwrap(),
         vec![(
             "a.ip.test".to_string(),
-            vec!["ip".to_string()],
+            vec!["audit".to_string(), "ip".to_string()],
             true,
             ResponseCode::NoError,
             2,
@@ -1134,8 +1134,10 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
     );
 
     // Fast path again for the name the full path answered: a rule's own answer stays out of
-    // the response cache even with min_ttl, and the compiled rule answers it again
-    // 快速路径再问完整路径答过的名字：规则直接给的应答开着 min_ttl 也不进响应缓存，编译后的规则再答一次
+    // the response cache even with min_ttl, and the decision the full path kept in the rule
+    // cache answers it, looked at before the compiled rules as on the full path
+    // 快速路径再问完整路径答过的名字：规则直接给的应答开着 min_ttl 也不进响应缓存，由完整路径存进规则缓存的决定作答，
+    // 和完整路径一样先看规则缓存、再看编译后的规则
     let fast = engine
         .handle_packet_fast(&query("a.blocked.test"), peer())
         .unwrap();
@@ -1152,6 +1154,12 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
             },
             Event::CacheLookup { id },
             Event::CacheMiss { id },
+            Event::RuleCacheLookup {
+                id,
+                pipeline: "main".into(),
+                hit: true,
+                matched_rules: 1,
+            },
             Event::Rule {
                 id,
                 pipeline: "main".into(),
