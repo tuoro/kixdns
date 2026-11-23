@@ -22,7 +22,7 @@ Use it with [KixDNS Panel](https://github.com/tuoro/kixdns-panel): one command i
 - **Cache**: capacity, TTL floor and cap, merged concurrent misses, background refresh, serve-stale (RFC 8767); answers kept per ECS scope (RFC 7871).
 - **GeoIP and GeoSite**: MaxMind MMDB, V2Ray GeoIP and GeoSite data; a built-in command converts GeoIP `.dat` to MMDB.
 - **Hot reload**: the configuration, GeoSite and GeoIP `.dat` data and the DoH certificate files take effect when they change; an invalid new configuration or certificate keeps the previous one.
-- **Performance**: tokio async I/O, a UDP socket per worker, forwarding without full packet parsing when no rule needs it, optional adaptive flow control.
+- **Performance**: tokio async I/O, a UDP socket per worker on Linux and FreeBSD, forwarding without full packet parsing when no rule needs it, optional adaptive flow control.
 
 ## Running on its own
 
@@ -33,7 +33,7 @@ cargo build --release
 ./target/release/kixdns run -c config/pipeline.json
 ~~~
 
-It listens on UDP and TCP `0.0.0.0:5353` and forwards to `1.1.1.1:53` by default. It needs a toolchain that supports Rust edition 2024.
+It listens on UDP and TCP `0.0.0.0:5533` and forwards to `1.1.1.1:53` by default. It needs a toolchain that supports Rust edition 2024.
 
 ## Documentation
 

@@ -1,12 +1,11 @@
 // Socket utility functions with safe wrappers for FFI calls
 // Socket 工具函数，为 FFI 调用提供安全封装
 
-#[cfg(unix)]
 use socket2::Socket;
 use std::io;
 use std::time::Duration;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
 use std::os::fd::AsRawFd;
 
 /// How long an accept loop waits after an accept error before accepting again.
@@ -42,141 +41,54 @@ pub fn accept_retry_delay(err: &io::Error) -> Duration {
     }
 }
 
-/// Safely set IPV6_V6ONLY option on a socket
-/// 安全地设置 socket 的 IPV6_V6ONLY 选项
-///
-/// # Arguments
-/// * `socket` - The socket to configure
-/// * `enabled` - Whether to enable IPV6_V6ONLY (true = IPv6 only, false = dual-stack)
-///
-/// # Returns
-/// * `Ok(())` - Option set successfully
-/// * `Err(io::Error)` - Failed to set option (non-fatal, logged as warning)
-#[cfg(unix)]
-#[inline]
-pub fn set_ipv6_v6only(socket: &Socket, enabled: bool) -> io::Result<()> {
-    use libc::{IPPROTO_IPV6, IPV6_V6ONLY, c_int, setsockopt, socklen_t};
+/// 内核会不会把同一个端口上收到的报文分给绑在上面的几个 UDP socket：Linux 的 SO_REUSEPORT、FreeBSD 的 SO_REUSEPORT_LB
+/// 按来源哈希分；macOS、OpenBSD、NetBSD 的 SO_REUSEPORT 只让几个 socket 绑上同一个端口，单播报文都进其中一个，Windows
+/// 没有这样的选项。分不了的系统上几个 worker 各绑一个 socket 只会有一个在干活，所以共用一个
+/// Whether the kernel spreads the datagrams arriving at a port over the UDP sockets bound to it:
+/// Linux's SO_REUSEPORT and FreeBSD's SO_REUSEPORT_LB spread them by a hash of the source;
+/// macOS's, OpenBSD's and NetBSD's SO_REUSEPORT only lets several sockets bind one port, every
+/// unicast datagram going to one of them, and Windows has no such option. Where they are not
+/// spread, workers each binding a socket would leave all but one idle, so they share one
+pub const SPREADS_DATAGRAMS: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd"
+));
 
-    let val: c_int = if enabled { 1 } else { 0 };
-    let fd = socket.as_raw_fd();
-
-    let ret = unsafe {
-        setsockopt(
-            fd,
-            IPPROTO_IPV6,
-            IPV6_V6ONLY,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as socklen_t,
-        )
-    };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Safely set SO_REUSEPORT option on a socket
-/// 安全地设置 socket 的 SO_REUSEPORT 选项
-///
-/// # Arguments
-/// * `socket` - The socket to configure
-/// * `enabled` - Whether to enable SO_REUSEPORT
-///
-/// # Returns
-/// * `Ok(())` - Option set successfully
-/// * `Err(io::Error)` - Failed to set option or not supported
-#[cfg(unix)]
-#[inline]
-pub fn set_reuseport(socket: &Socket, enabled: bool) -> io::Result<()> {
-    use libc::{SO_REUSEPORT, SOL_SOCKET, c_int, setsockopt, socklen_t};
-
-    let val: c_int = if enabled { 1 } else { 0 };
-    let fd = socket.as_raw_fd();
-
-    let ret = unsafe {
-        setsockopt(
-            fd,
-            SOL_SOCKET,
-            SO_REUSEPORT,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&val) as socklen_t,
-        )
-    };
-
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Set SO_REUSEPORT with kernel-level load balancing for multi-worker UDP.
-/// 为多 worker UDP 设置带内核级负载均衡的 SO_REUSEPORT。
-///
-/// On FreeBSD, `SO_REUSEPORT` allows multiple sockets to bind to the same port
-/// but does NOT distribute incoming packets — all traffic goes to one socket.
-/// `SO_REUSEPORT_LB` (0x00010000) is FreeBSD's separate option that enables
-/// hash-based packet distribution across sockets in the reuseport group.
-/// FreeBSD 上，`SO_REUSEPORT` 允许多个 socket 绑定同一个端口，但不分发收到的包——流量全进一个
-/// socket。`SO_REUSEPORT_LB`（0x00010000）是 FreeBSD 另设的选项，在 reuseport 组的 socket 之间
-/// 按哈希分发。
-///
-/// On Linux, `SO_REUSEPORT` already includes hash-based distribution, so we
-/// use it directly.
-/// 在 Linux 上，`SO_REUSEPORT` 已包含哈希分发功能，直接使用即可。
-///
-/// # Arguments
-/// * `socket` - The socket to configure
-///
-/// # Returns
-/// * `Ok(())` - Option set successfully
-/// * `Err(io::Error)` - Failed to set option or not supported
-#[cfg(unix)]
-#[inline]
-pub fn set_reuseport_lb(socket: &Socket) -> io::Result<()> {
-    // FreeBSD: SO_REUSEPORT_LB (0x00010000) enables hash-based load balancing
-    // FreeBSD: SO_REUSEPORT_LB (0x00010000) 启用基于哈希的负载均衡
+/// 让内核把报文分给同一个端口上的几个 socket（见 [`SPREADS_DATAGRAMS`]），在绑定之前调用
+/// Has the kernel spread the datagrams over the sockets on one port (see
+/// [`SPREADS_DATAGRAMS`]), called before binding
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+pub fn spread_datagrams(socket: &Socket) -> io::Result<()> {
     #[cfg(target_os = "freebsd")]
-    {
-        use libc::{SOL_SOCKET, c_int, setsockopt, socklen_t};
-
-        const SO_REUSEPORT_LB: c_int = 0x00010000;
-        let val: c_int = 1;
-        let fd = socket.as_raw_fd();
-        let ret = unsafe {
-            setsockopt(
-                fd,
-                SOL_SOCKET,
-                SO_REUSEPORT_LB,
-                &val as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&val) as socklen_t,
-            )
-        };
-        if ret == 0 {
-            return Ok(());
-        }
-        // Fall back to plain SO_REUSEPORT if LB variant fails
-        // 如果 LB 变体失败，回退到普通 SO_REUSEPORT
+    let option = libc::SO_REUSEPORT_LB;
+    #[cfg(not(target_os = "freebsd"))]
+    let option = libc::SO_REUSEPORT;
+    let on: libc::c_int = 1;
+    // SAFETY: the option value is a valid c_int for the call, which only reads it
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
-
-    // Linux and fallback: plain SO_REUSEPORT already does load balancing on Linux
-    // Linux 和回退：普通 SO_REUSEPORT 在 Linux 上已自带负载均衡
-    set_reuseport(socket, true)
 }
 
-#[cfg(not(unix))]
-#[inline]
-pub fn set_reuseport_lb(_socket: &socket2::Socket) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "SO_REUSEPORT_LB not supported on this platform",
-    ))
+/// 分不了的系统上只绑一个 socket，什么也不用做 / Where datagrams are not spread only one socket is
+/// bound, and nothing needs doing
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+pub fn spread_datagrams(_socket: &Socket) -> io::Result<()> {
+    Ok(())
 }
 
-/// Non-Unix stub implementations (Windows and other platforms)
-/// 非 Unix 系统的存根实现（Windows 和其他平台）
 /// 这个 socket 因为接收缓冲满丢过多少报文；读不到时是 None
 /// How many datagrams this socket has dropped for a full receive buffer; None when that cannot be read
 #[cfg(target_os = "linux")]
@@ -373,26 +285,6 @@ fn local_ipv6_addresses() -> Vec<std::net::Ipv6Addr> {
 #[cfg(not(any(unix, windows)))]
 fn local_ipv6_addresses() -> Vec<std::net::Ipv6Addr> {
     Vec::new()
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)] // Stub implementations for cross-platform compatibility
-#[inline]
-pub fn set_ipv6_v6only(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "IPV6_V6ONLY not supported on this platform",
-    ))
-}
-
-#[cfg(not(unix))]
-#[allow(dead_code)] // Stub implementation for cross-platform compatibility
-#[inline]
-pub fn set_reuseport(_socket: &socket2::Socket, _enabled: bool) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "SO_REUSEPORT not supported on this platform",
-    ))
 }
 
 /// 一个 UDP 报文发到的本机地址。监听在通配地址上时，回答要从它发出：内核自己挑的源地址在有几个地址的机器上

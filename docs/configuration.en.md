@@ -24,8 +24,8 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | Field | Default | Meaning |
 |---|---:|---|
 | min_ttl | 0 | Minimum TTL of upstream answers in seconds: every record of an answer has its TTL raised to at least this, and the cache keeps the answer at least this long. |
-| bind_udp | 0.0.0.0:5353 | UDP listen address. With a wildcard address (`0.0.0.0`, `::`), on Linux, macOS, and FreeBSD and the other BSDs (OPNsense and pfSense among them) a reply leaves from the local address the query was sent to (RFC 2181 section 4.1), so a machine with several addresses (aliases, a CARP VIP that comes and goes) never answers from the wrong one; this adds about 0.1 microseconds of receive and send work to each query (measured on Linux), which writing the one address to serve avoids. On Windows the system picks the reply's source address. |
-| bind_tcp | 0.0.0.0:5353 | TCP listen address. |
+| bind_udp | 0.0.0.0:5533 | UDP listen address; with the port taken by another program, starting fails rather than sharing it. The default port used to be 5353, the mDNS port, often held by the system's mDNSResponder or avahi; to keep 5353, write the address out. With a wildcard address (`0.0.0.0`, `::`), on Linux, macOS, and FreeBSD and the other BSDs (OPNsense and pfSense among them) a reply leaves from the local address the query was sent to (RFC 2181 section 4.1), so a machine with several addresses (aliases, a CARP VIP that comes and goes) never answers from the wrong one; this adds about 0.1 microseconds of receive and send work to each query (measured on Linux), which writing the one address to serve avoids. On Windows the system picks the reply's source address. |
+| bind_tcp | 0.0.0.0:5533 | TCP listen address. |
 | bind_doh | null | Inbound DoH listen address; null disables it. |
 | doh_tls_cert | null | PEM certificate path; required with bind_doh. |
 | doh_tls_key | null | PEM private-key path; required with bind_doh. |
@@ -227,7 +227,7 @@ Inbound listener behavior:
 - UDP responses larger than the client's advertised size (the EDNS payload size, at most 1232 bytes so as not to fragment at the IP layer, see DNS Flag Day 2020; or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP; the OPT of every reply advertises 1232.
 - A message over TCP declaring more than 4096 bytes is not waited for: the connection closes there and then, the queries before it still answered.
 - Once 512 inbound TCP and DoH connections are open in all, a new one goes only to a device not yet holding its share, with flow control on or off: a device holding none always connects, and one opening any number gets no more than its share. A connection not taken is closed at once.
-- Listening on `[::]`, IPv4 gets a `0.0.0.0` of its own and `[::]` takes IPv6 alone: whether an IPv6 socket takes IPv4 differs by system (FreeBSD and the other BSDs do not, OpenBSD never does), and this way both families are answered on every system. TCP and inbound DoH do so everywhere, UDP everywhere but Windows. A dual-stack socket (UDP listening on `[::]` on Windows) reports an IPv4 client as `::ffff:a.b.c.d`; rules, GeoIP, ECS and the cache all judge it by the IPv4 address it carries, so client_ip takes IPv4 networks as usual; a network written as `::ffff:a.b.c.d/n` counts as the IPv4 network it names.
+- Listening on `[::]`, IPv4 gets a `0.0.0.0` of its own and `[::]` takes IPv6 alone: whether an IPv6 socket takes IPv4 differs by system (FreeBSD and the other BSDs do not, OpenBSD never does), and this way both families are answered on every system, over UDP, TCP and inbound DoH alike. A client address in the IPv4-mapped form `::ffff:a.b.c.d` is judged by rules, GeoIP, ECS and the cache by the IPv4 address it carries, so client_ip takes IPv4 networks as usual; a network written as `::ffff:a.b.c.d/n` counts as the IPv4 network it names.
 
 Inbound DoH is disabled unless settings.bind_doh is set. When it is set, settings.doh_tls_cert and settings.doh_tls_key are required and must point to PEM files. The path defaults to /dns-query and can be changed with settings.doh_path.
 
@@ -300,8 +300,8 @@ When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fa
 {
   "version": "1.0",
   "settings": {
-    "bind_udp": "0.0.0.0:5353",
-    "bind_tcp": "0.0.0.0:5353",
+    "bind_udp": "0.0.0.0:5533",
+    "bind_tcp": "0.0.0.0:5533",
     "default_upstream": "1.1.1.1:53"
   },
   "pipeline_select": [

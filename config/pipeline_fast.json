@@ -2,8 +2,8 @@
   "version": "1.0",
   "settings": {
     "min_ttl": 30,
-    "bind_udp": "0.0.0.0:5353",
-    "bind_tcp": "0.0.0.0:5353",
+    "bind_udp": "0.0.0.0:5533",
+    "bind_tcp": "0.0.0.0:5533",
     "default_upstream": "223.5.5.5:53",
     "upstream_timeout_ms": 500,
     "cache_capacity": 10000,

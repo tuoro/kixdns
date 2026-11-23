@@ -53,38 +53,13 @@ impl BoundListeners {
             tcp: bind_tcp,
             doh,
         } = listeners;
-        let mut udp = Vec::new();
-
-        #[cfg(unix)]
-        {
-            // ✅ OpenBSD 兼容性方案：双 socket（IPv4 + IPv6）+ 零拷贝 recv_buf_from
-            // ✅ OpenBSD compatibility: dual sockets (IPv4 + IPv6) + zero-copy recv_buf_from
-            // 为每个地址族创建独立的 socket 和 workers，避免 sockaddr 大小断言失败
-            // Create separate sockets and workers for each address family to avoid sockaddr size assertion failures
-
-            // 根据配置地址决定创建哪种 socket / Determine which socket type to create based on config
-            // IPv6 unspecified address (::) 需要同时创建 IPv4 和 IPv6 socket
-            // IPv6 other addresses 只创建 IPv6 socket
-            // IPv4 addresses 只创建 IPv4 socket
-            let ipv4_addr = ipv4_listen_addr(bind_addr);
-            let needs_ipv6 = bind_addr.is_ipv6();
-            let workers_per_family = if ipv4_addr.is_some() && needs_ipv6 {
-                udp_workers.div_ceil(2)
-            } else {
-                udp_workers
-            };
-
-            if let Some(ipv4_addr) = ipv4_addr {
-                udp.push(bind_udp_workers(ipv4_addr, workers_per_family)?);
-            }
-
-            if needs_ipv6 {
-                udp.push(bind_udp_workers(bind_addr, workers_per_family)?);
-            }
-        }
-
-        #[cfg(not(unix))]
-        udp.push(bind_udp_workers(bind_addr, udp_workers)?);
+        // `[::]` 拆成两个时 worker 两边平分 / With `[::]` split in two the workers are shared between them
+        let addrs: Vec<_> = listen_addrs(bind_addr).collect();
+        let workers = udp_workers.div_ceil(addrs.len());
+        let udp = addrs
+            .into_iter()
+            .map(|(addr, family)| bind_udp_workers(addr, family, workers))
+            .collect::<anyhow::Result<_>>()?;
 
         let tcp = bind_tcp_listeners(bind_tcp)?;
 
@@ -143,19 +118,13 @@ impl BoundListeners {
     }
 }
 
-/// 在 `addr` 上开 TCP 监听口，TCP 和入站 DoH 都用它：`[::]` 和 UDP 一样拆成 IPv4 的 `0.0.0.0` 和只收 IPv6 的
-/// `[::]` 两个。IPv6 socket 收不收 IPv4 各系统默认不同：Linux、macOS 收，FreeBSD 等 BSD 不收，OpenBSD 怎么都不收；
-/// 以前入站 DoH 直接绑 `[::]`，在 BSD 上 IPv4 客户端连不上，也没有哪种写法能让它两边都收
-/// Opens the TCP listeners on `addr`, for TCP and inbound DoH alike: as for UDP, `[::]` is
-/// split into `0.0.0.0` for IPv4 and an IPv6-only `[::]`. Whether an IPv6 socket takes IPv4
-/// differs by system: Linux and macOS do by default, FreeBSD and the other BSDs do not, and
-/// OpenBSD never does; inbound DoH used to bind `[::]` alone, leaving IPv4 clients out on the
+/// 在 `addr` 上开 TCP 监听口，TCP 和入站 DoH 都用它，和 UDP 一样按 [`listen_addrs`] 拆开。以前入站 DoH 直接绑
+/// `[::]`，在 BSD 上 IPv4 客户端连不上，也没有哪种写法能让它两边都收
+/// Opens the TCP listeners on `addr`, for TCP and inbound DoH alike, split as for UDP by
+/// [`listen_addrs`]. Inbound DoH used to bind `[::]` alone, leaving IPv4 clients out on the
 /// BSDs with no way to write it that took both
 fn bind_tcp_listeners(addr: SocketAddr) -> anyhow::Result<Vec<(TcpListener, &'static str)>> {
-    let ipv4 = ipv4_listen_addr(addr).map(|ipv4| (ipv4, "IPv4"));
-    let ipv6 = addr.is_ipv6().then_some((addr, "IPv6"));
-    ipv4.into_iter()
-        .chain(ipv6)
+    listen_addrs(addr)
         .map(|(addr, family)| {
             let listener =
                 tcp_listener(addr).with_context(|| format!("bind {family} TCP listener {addr}"))?;
@@ -186,49 +155,51 @@ fn tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::from_std(socket.into())
 }
 
-/// 要单独监听的 IPv4 地址：IPv4 地址本身，或者 `[::]` 的同伴 `0.0.0.0`（端口相同）；别的 IPv6 地址
-/// 没有
-/// The IPv4 address to listen on separately: an IPv4 address itself, or `0.0.0.0` on the
-/// same port as the twin of `[::]`; other IPv6 addresses have none
-fn ipv4_listen_addr(addr: SocketAddr) -> Option<SocketAddr> {
-    match addr {
+/// 监听 `addr` 要绑的地址和各自的地址族，UDP、TCP 和入站 DoH 都这样绑：IPv4 地址本身；IPv6 地址本身，`[::]` 之前还有
+/// 它的同伴 `0.0.0.0`（端口相同），`[::]` 只收 IPv6。IPv6 socket 收不收 IPv4 各系统默认不同（Linux、macOS 收，FreeBSD 等
+/// BSD 不收，OpenBSD 怎么都不收），IPv4 另绑，在哪里都一样
+/// The addresses to bind for listening on `addr`, with their families, as UDP, TCP and inbound
+/// DoH all bind: an IPv4 address itself; an IPv6 address itself, `[::]` preceded by its twin
+/// `0.0.0.0` on the same port, `[::]` taking IPv6 alone. Whether an IPv6 socket takes IPv4
+/// differs by system (Linux and macOS do by default, FreeBSD and the other BSDs do not, OpenBSD
+/// never does), and IPv4 bound apart is the same everywhere
+fn listen_addrs(addr: SocketAddr) -> impl Iterator<Item = (SocketAddr, &'static str)> {
+    let ipv4 = match addr {
         SocketAddr::V4(_) => Some(addr),
         SocketAddr::V6(v6) if v6.ip().is_unspecified() => Some(SocketAddr::new(
             std::net::Ipv4Addr::UNSPECIFIED.into(),
             addr.port(),
         )),
         SocketAddr::V6(_) => None,
-    }
+    };
+    let ipv6 = addr.is_ipv6().then_some((addr, "IPv6"));
+    ipv4.map(|ipv4| (ipv4, "IPv4")).into_iter().chain(ipv6)
 }
 
-// 为一个地址绑定 UDP workers 的 socket / Bind the UDP workers' sockets for one address
-#[cfg(unix)]
-fn bind_udp_workers(addr: SocketAddr, worker_count: usize) -> anyhow::Result<BoundUdp> {
-    let (family, lowercase) = if addr.is_ipv4() {
-        ("IPv4", "ipv4")
-    } else {
-        ("IPv6", "ipv6")
+/// 为一个地址绑定 UDP worker 的 socket。内核会把报文分给同一个端口上几个 socket 的系统上（见
+/// `socket_utils::SPREADS_DATAGRAMS`）每个 worker 一个，各收各的；别的系统上 worker 共用一个，那里各绑一个只有一个
+/// 收得到报文
+/// Binds the UDP workers' sockets for one address. Where the kernel spreads the datagrams over
+/// the sockets on one port (see `socket_utils::SPREADS_DATAGRAMS`) each worker gets its own and
+/// receives on it alone; elsewhere the workers share one, as only one of several would receive
+/// anything
+fn bind_udp_workers(
+    addr: SocketAddr,
+    family: &'static str,
+    worker_count: usize,
+) -> anyhow::Result<BoundUdp> {
+    let bind = || {
+        bind_udp_socket(addr)
+            .map(Arc::new)
+            .with_context(|| format!("bind {family} UDP socket {addr}"))
     };
-
-    // ✅ Per-worker SO_REUSEPORT_LB sockets: each worker gets its own fd.
-    // On FreeBSD, SO_REUSEPORT_LB enables kernel hash-based packet distribution
-    // across sockets. On Linux, SO_REUSEPORT already includes this behavior.
-    // This gives perfect multi-core scaling with zero contention — each worker
-    // owns its socket, no Arc<UdpSocket> sharing, no reactor thundering herd.
-    //
-    // ✅ 每 worker 独立 SO_REUSEPORT_LB socket：每个 worker 拥有自己的 fd。
-    // FreeBSD 上 SO_REUSEPORT_LB 启用内核级哈希分发，
-    // Linux 上 SO_REUSEPORT 已自带此行为。
-    // 实现无竞争的多核扩展——每个 worker 独占 socket，
-    // 无 Arc<UdpSocket> 共享，无 reactor 惊群效应。
-    let sockets = (0..worker_count)
-        .map(|worker_id| {
-            let std_socket = create_reuseport_udp_socket(addr)
-                .with_context(|| format!("create {lowercase} udp socket for worker {worker_id}"))?;
-            Ok(Arc::new(UdpSocket::from_std(std_socket)?))
-        })
-        .collect::<anyhow::Result<_>>()?;
-
+    let sockets = if crate::socket_utils::SPREADS_DATAGRAMS {
+        (0..worker_count)
+            .map(|_| bind())
+            .collect::<anyhow::Result<_>>()?
+    } else {
+        vec![bind()?; worker_count]
+    };
     Ok(BoundUdp {
         addr,
         family,
@@ -236,102 +207,41 @@ fn bind_udp_workers(addr: SocketAddr, worker_count: usize) -> anyhow::Result<Bou
     })
 }
 
-// Non-Unix: create a single shared socket that the workers share / 非 Unix：创建单个共享套接字，工作线程共用它
-#[cfg(not(unix))]
-fn bind_udp_workers(addr: SocketAddr, worker_count: usize) -> anyhow::Result<BoundUdp> {
-    // Use socket2 to set buffer sizes / 使用 socket2 设置缓冲区大小
+/// 一个监听用的 UDP socket。IPv6 的只收 IPv6（IPv4 有自己的，见 `listen_addrs`）。不设 SO_REUSEADDR：端口被别的
+/// 程序占着时绑不上、启动失败，说得清楚；设了的话，macOS 等 BSD 和 Linux 上会悄悄和占着它的程序共用这个端口（比如
+/// 5353 上的 mDNSResponder、avahi），查询进了别人那里，一个都答不上。SO_REUSEPORT 也只在内核会分报文时设（见
+/// `socket_utils::spread_datagrams`），只是为了每个 worker 一个 socket
+/// One UDP socket to listen on. An IPv6 one takes IPv6 alone (IPv4 has its own, see
+/// `listen_addrs`). No SO_REUSEADDR: with the port taken by another program binding fails
+/// and so does starting, saying why; with it, macOS and the other BSDs and Linux quietly share
+/// the port with the program holding it (mDNSResponder or avahi on 5353, say), the queries
+/// going to it and none getting an answer. SO_REUSEPORT too is set only where the kernel
+/// spreads datagrams (see `socket_utils::spread_datagrams`), just to give each worker a socket
+fn bind_udp_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let (domain, family) = if addr.is_ipv4() {
-        (Domain::IPV4, "IPv4")
-    } else {
-        (Domain::IPV6, "IPv6")
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("create socket")?;
-
-    // ✅ Windows 上设置 IPV6_V6ONLY=0 以支持双栈，与 Linux 行为一致
-    // ✅ On Windows, set IPV6_V6ONLY=0 for dual-stack support, consistent with Linux behavior
-    if domain == Domain::IPV6 {
-        if let Err(e) = socket.set_only_v6(false) {
-            debug!(
-                "failed to set IPV6_V6ONLY=0: {}, IPv4 may not work on [::] bind",
-                e
-            );
-        } else {
-            info!("UDP IPv6 socket set to dual-stack mode (IPV6_V6ONLY=0)");
-        }
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
     }
-
+    crate::socket_utils::spread_datagrams(&socket)?;
     set_udp_buffers(&socket);
 
-    socket.set_nonblocking(true).context("set nonblocking")?;
-    socket.bind(&addr.into()).context("bind socket")?;
-
-    let udp_socket = Arc::new(UdpSocket::from_std(socket.into()).context("from_std")?);
-    Ok(BoundUdp {
-        addr,
-        family,
-        sockets: vec![udp_socket; worker_count],
-    })
-}
-
-// 在 Unix 上创建带 SO_REUSEPORT 的 UDP socket；非 Unix 使用标准绑定 / Create UDP socket with SO_REUSEPORT on Unix; use standard binding on non-Unix
-#[cfg(unix)]
-fn create_reuseport_udp_socket(addr: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-
-    // ✅ OpenBSD/FreeBSD 安全措施：为 IPv6 socket 显式设置 IPV6_V6ONLY=1
-    // ✅ OpenBSD/FreeBSD safety: explicitly set IPV6_V6ONLY=1 for IPv6 sockets
-    // 双 socket 方案下，IPv6 socket 只处理 IPv6 流量，确保地址族一致性，避免 sockaddr 大小断言失败
-    // With dual-socket approach, IPv6 socket only handles IPv6 traffic, ensuring address family consistency
-    // 这使得我们可以安全地使用零拷贝的 recv_buf_from
-    // This allows us to safely use zero-copy recv_buf_from
-    if domain == Domain::IPV6
-        && let Err(e) = crate::socket_utils::set_ipv6_v6only(&socket, true)
-    {
-        tracing::warn!(
-            "Failed to set IPV6_V6ONLY=1: {}, this may cause issues on OpenBSD",
-            e
-        );
-    }
-
-    // Try to set SO_REUSEPORT_LB (FreeBSD) or SO_REUSEPORT (Linux) via safe wrapper
-    // 尝试通过安全封装设置 SO_REUSEPORT_LB (FreeBSD) 或 SO_REUSEPORT (Linux)
-    if let Err(e) = crate::socket_utils::set_reuseport_lb(&socket) {
-        // Log warning if SO_REUSEPORT_LB fails / SO_REUSEPORT_LB 失败时记录警告
-        tracing::warn!(
-            "SO_REUSEPORT_LB failed: {}, falling back to plain SO_REUSEPORT",
-            e
-        );
-        if let Err(e2) = crate::socket_utils::set_reuseport(&socket, true) {
-            tracing::warn!("SO_REUSEPORT also failed: {}", e2);
-        }
-    }
-
-    set_udp_buffers(&socket);
-
-    // 监听在通配地址上时，回答要从查询发到的那个地址发出（见 `learn_local_addresses`）。在绑定之前就开：绑定以后、
-    // 开之前排进来的报文，内核没给它们记下本机地址
+    // 监听在通配地址上时，回答要从查询发到的那个地址发出（见 `UdpAnswering::local_addresses`）。在绑定之前就开：绑定
+    // 以后、开之前排进来的报文，内核没给它们记下本机地址
     // Listening on the wildcard address, a reply has to leave from the address the query was
-    // sent to (see `learn_local_addresses`). Turned on before binding: for datagrams queued after
-    // the bind and before this, the kernel has noted no local address
+    // sent to (see `UdpAnswering::local_addresses`). Turned on before binding: for datagrams
+    // queued after the bind and before this, the kernel has noted no local address
     #[cfg(unix)]
     if addr.ip().is_unspecified() {
         use std::os::fd::AsRawFd;
         if let Err(error) = udp_local::receive_local_addresses(socket.as_raw_fd(), addr.is_ipv6()) {
-            tracing::warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
+            warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
         }
     }
 
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-    Ok(socket.into())
+    Ok(UdpSocket::from_std(socket.into())?)
 }
 
 /// UDP 收发缓冲平时的大小 / The usual size of the UDP send and receive buffers
@@ -554,29 +464,17 @@ async fn run_udp_worker(
     receive_one_by_one(&socket, &engine).await;
 }
 
-/// 监听在通配地址上：回答要从查询发到的那个地址发出，所以让内核把它连同每个报文一起交上来，开上了返回 true。监听在
-/// 具体地址上时回答只会从那个地址发出，用不着
-/// Listening on the wildcard address: a reply has to leave from the address the query was sent
-/// to, so the kernel hands it over with each datagram, and true comes back once that is on.
-/// Listening on one address, replies can only leave from it, and none of this is needed
-#[cfg(unix)]
-fn learn_local_addresses(socket: &UdpSocket) -> bool {
-    use std::os::fd::AsRawFd;
-    socket.local_addr().is_ok_and(|bound| {
-        bound.ip().is_unspecified()
-            && udp_local::receive_local_addresses(socket.as_raw_fd(), bound.is_ipv6())
-                .inspect_err(|error| warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks"))
-                .is_ok()
-    })
-}
-
 /// 一个 worker 的接收循环里，快速路径要用的几样东西 / What the fast path needs in one worker's receive loop
 struct UdpAnswering<'a> {
     socket: &'a Arc<UdpSocket>,
     engine: &'a Arc<Engine>,
     pending: &'a Arc<PendingReplies>,
-    /// 内核连同每个报文交上它发到的本机地址（见 `learn_local_addresses`）/ The kernel hands over
-    /// with each datagram the local address it was sent to (see `learn_local_addresses`)
+    /// 监听在通配地址上：回答要从查询发到的那个地址发出，内核连同每个报文交上这个地址（`bind_udp_socket` 绑定之前就让它
+    /// 这样做了）。监听在具体地址上时回答只会从那个地址发出，用不着
+    /// Listening on the wildcard address: a reply has to leave from the address the query was
+    /// sent to, which the kernel hands over with each datagram (as `bind_udp_socket` had it do
+    /// before binding). Listening on one address, replies can only leave from it, and none of
+    /// this is needed
     #[cfg(unix)]
     local_addresses: bool,
     /// 自适应流控：每 100 个请求检查一次是否需要调整 permits / Adaptive flow control: check if adjustment needed every 100 requests
@@ -716,7 +614,9 @@ impl<'a> UdpAnswering<'a> {
             engine,
             pending,
             #[cfg(unix)]
-            local_addresses: learn_local_addresses(socket),
+            local_addresses: socket
+                .local_addr()
+                .is_ok_and(|bound| bound.ip().is_unspecified()),
             request_count: 0,
             emptied_at: Instant::now(),
             checks_since_empty: 0,

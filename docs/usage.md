@@ -16,7 +16,7 @@ cargo build --release
 ./target/release/kixdns run -c config/pipeline.json
 ~~~
 
-UDP 和 TCP 默认监听 0.0.0.0:5353，默认上游是 1.1.1.1:53。所有路径都会按原样传给文件系统；相对路径相对于进程工作目录。
+UDP 和 TCP 默认监听 0.0.0.0:5533，默认上游是 1.1.1.1:53。所有路径都会按原样传给文件系统；相对路径相对于进程工作目录。
 
 Release profile 设置 opt-level = 3、lto = fat、codegen-units = 1、panic = abort 和 strip = true。
 
@@ -54,7 +54,7 @@ GeoIP 转换选项：
 
 转换和运行时读数据文件是同一套解析：地址里的主机位清掉，超过位宽的前缀按单个地址算，同一个国家的网段合并。输入也可以是 V2Ray 的 JSON 数据文件（扩展名不是 `.dat` 就按 JSON 读）。MMDB 里一个地址只有一个国家，所以只转两个字母的国家代码；PRIVATE、CLOUDFLARE 这类标签和国家的网段重叠，不转，运行时由 geoip_dat_path 指向的数据文件直接匹配。--filter 里写了这类标签会报错。
 
-Unix 构建会为 UDP worker 创建独立 socket，并使用平台提供的 reuse-port 能力；非 Unix 构建使用由多个 worker 共享的 UDP socket。这是实现细节，不代表固定吞吐承诺。
+Linux 和 FreeBSD 上每个 UDP worker 一个 socket，内核把报文分给它们（Linux 的 SO_REUSEPORT、FreeBSD 的 SO_REUSEPORT_LB）；别的系统（macOS、OpenBSD、NetBSD、Windows）的内核不这样分，各绑一个只有一个收得到报文，所以 worker 共用一个 socket。UDP 端口被别的程序占着时启动失败，不和它共用。这是实现细节，不代表固定吞吐承诺。
 
 ## 日志和响应统计
 

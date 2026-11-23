@@ -16,7 +16,7 @@ cargo build --release
 ./target/release/kixdns run -c config/pipeline.json
 ~~~
 
-The default listener addresses are UDP and TCP on 0.0.0.0:5353. The default upstream is 1.1.1.1:53. All paths are passed to the filesystem as written; relative paths are relative to the process working directory.
+The default listener addresses are UDP and TCP on 0.0.0.0:5533. The default upstream is 1.1.1.1:53. All paths are passed to the filesystem as written; relative paths are relative to the process working directory.
 
 The release profile sets opt-level = 3, lto = fat, codegen-units = 1, panic = abort, and strip = true.
 
@@ -54,7 +54,7 @@ GeoIP conversion options:
 
 Conversion parses the data file as the runtime reads it: host bits in an address are cleared, a prefix wider than the address is one address, and a country's networks are merged. The input may also be a V2Ray JSON data file (anything not named `.dat` is read as JSON). An MMDB holds one country per address, so only two-letter country codes are converted; tags like PRIVATE or CLOUDFLARE overlap countries' networks and are left out, matched at runtime from the data file geoip_dat_path names. Such a tag in --filter is an error.
 
-Unix builds create separate UDP sockets for workers with the platform's reuse-port support. Non-Unix builds use one UDP socket shared by the workers. This is an implementation detail, not a throughput guarantee.
+On Linux and FreeBSD each UDP worker has a socket of its own and the kernel spreads the datagrams over them (SO_REUSEPORT on Linux, SO_REUSEPORT_LB on FreeBSD); the kernels of other systems (macOS, OpenBSD, NetBSD, Windows) do not, only one of several sockets would receive anything, so the workers share one. With the UDP port taken by another program, starting fails rather than sharing the port with it. This is an implementation detail, not a throughput guarantee.
 
 ## Logs and response statistics
 
