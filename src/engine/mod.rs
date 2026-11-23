@@ -65,6 +65,8 @@ mod reply_flags_tests;
 pub mod response;
 pub(crate) mod response_log;
 #[cfg(test)]
+mod rule_cache_tests;
+#[cfg(test)]
 mod rule_identity_tests;
 #[cfg(test)]
 mod rule_index_tests;

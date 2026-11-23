@@ -23,9 +23,7 @@ use super::observation::{
     Observed, decision_kind, report_decision, report_matched_rules, report_rule_cache_hit,
 };
 use super::rules::Decision;
-use super::rules::{
-    RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, rule_cache_requester,
-};
+use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, calculate_rule_hash};
 use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_answer};
 use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
@@ -266,9 +264,7 @@ impl Engine {
         } = *request;
         // 1. Check Rule Cache
         // Use hash for lookup to avoid cloning String for key on every lookup
-        let requester_key = rule_cache_requester(
-            pipeline,
-            state.pipeline.settings.cache_background_refresh,
+        let requester_key = pipeline.rule_requester.key(
             Requester {
                 address: client_ip,
                 edns: edns_present,
@@ -322,7 +318,9 @@ impl Engine {
         //    default upstream applies.
         // 2. 按顺序求值规则；None 表示没有规则做出决策，使用默认上游。
         let mut matched_rules: SmallVec<[Arc<str>; 4]> = SmallVec::new();
-        let decided = self.evaluate_rules(state, pipeline, request, &mut matched_rules);
+        let mut logged = false;
+        let decided =
+            self.evaluate_rules(state, pipeline, request, &mut matched_rules, &mut logged);
         let decided_by_rule = decided.is_some();
         let decision =
             decided.unwrap_or_else(|| Decision::default_forward(&state.pipeline.settings));
@@ -348,11 +346,16 @@ impl Engine {
             );
         }
         // 规则直接回应的决定都存，快速路径靠它回重复的查询；转发和跳转只在有正则条件的 pipeline 里存，
-        // 别的 pipeline 重算一遍比存一条缓存便宜（见 `RuntimePipeline::matches_regex`）
+        // 别的 pipeline 重算一遍比存一条缓存便宜（见 `RuntimePipeline::matches_regex`）。求值时执行了 log 动作的决定不存：
+        // 规则缓存替求值给出决定，命中时不执行规则的动作，log 动作就不再记下这些查询
         // A rule's own answer is always kept, the fast path answers repeated queries from it; forward and
         // jump decisions are kept only in a pipeline with regex conditions, since elsewhere computing them
-        // again is cheaper than storing an entry (see `RuntimePipeline::matches_regex`)
-        let worth_keeping = pipeline.matches_regex || matches!(decision, Decision::Static { .. });
+        // again is cheaper than storing an entry (see `RuntimePipeline::matches_regex`). A decision whose
+        // evaluation ran a log action is not kept: the rule cache gives the decision in place of
+        // evaluating, running none of the rules' actions on a hit, and the log action would no longer
+        // record those queries
+        let worth_keeping =
+            !logged && (pipeline.matches_regex || matches!(decision, Decision::Static { .. }));
         if whole_pipeline && worth_keeping {
             self.insert_rule_cache(
                 state,
@@ -370,15 +373,17 @@ impl Engine {
 
     /// Evaluate `pipeline`'s rules in order for `request`. Returns the first
     /// decision, or `None` when every matching rule continued. The names of
-    /// the rules whose matchers matched are appended to `matched_rules`.
+    /// the rules whose matchers matched are appended to `matched_rules`, and
+    /// `logged` is set once a log action runs.
     /// 按顺序求值规则：返回第一个决策，所有命中规则都继续时返回 None。
-    /// 匹配器命中的规则名追加到 `matched_rules`。
+    /// 匹配器命中的规则名追加到 `matched_rules`，执行了 log 动作就把 `logged` 置上。
     fn evaluate_rules(
         &self,
         state: &EngineInner,
         pipeline: &RuntimePipeline,
         request: &RuleEvaluationContext<'_>,
         matched_rules: &mut SmallVec<[Arc<str>; 4]>,
+        logged: &mut bool,
     ) -> Option<Decision> {
         let RuleEvaluationContext {
             client_ip,
@@ -552,6 +557,7 @@ impl Engine {
                                 qname,
                                 client_ip,
                             );
+                            *logged = true;
                         }
                         Action::StaticTxtResponse { text, ttl } => {
                             // 和响应阶段一样：装不进一条记录的文本回 SERVFAIL
