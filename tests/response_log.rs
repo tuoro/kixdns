@@ -225,21 +225,33 @@ async fn background_refresh_is_not_a_client_response() {
 async fn static_fast_path_and_cached_static_answer_are_distinct() {
     let log = Log::default();
     let _capture = log.capture();
-    let engine = configured(json!({
+    let (addr, task) = upstream().await;
+    // A rule's own answer on the fast path, and one given on the upstream's answer, which
+    // is cached / 规则在快速路径上直接给的应答，和在上游回答上给的、会进缓存的应答
+    let outright = configured(json!({
         "settings": {"default_upstream": "127.0.0.1:9", "min_ttl": 60},
         "pipelines": [{"id": "main", "rules": [{
             "name": "block", "matchers": [{"type": "any"}],
             "actions": [{"type": "static_response", "rcode": "NXDOMAIN"}]
         }]}]
     }));
+    let checked = configured(json!({
+        "settings": {"default_upstream": "127.0.0.1:9", "min_ttl": 60},
+        "pipelines": [{"id": "main", "rules": [{
+            "name": "block", "matchers": [{"type": "any"}],
+            "actions": [{"type": "forward", "upstream": addr}],
+            "response_actions_on_match": [{"type": "static_response", "rcode": "NXDOMAIN"}]
+        }]}]
+    }));
     let packet = query();
     assert!(matches!(
-        engine.handle_packet_fast(&packet, peer()).unwrap(),
+        outright.handle_packet_fast(&packet, peer()).unwrap(),
         Some(FastPathResponse::Direct(_))
     ));
-    engine.handle_packet(&packet, peer()).await.unwrap();
+    checked.handle_packet(&packet, peer()).await.unwrap();
+    task.abort();
     assert!(matches!(
-        engine.handle_packet_fast(&packet, peer()).unwrap(),
+        checked.handle_packet_fast(&packet, peer()).unwrap(),
         Some(FastPathResponse::CacheHit { .. })
     ));
     let responses = log.responses();

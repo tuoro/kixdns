@@ -22,6 +22,7 @@ use super::matcher_adapter::{MatcherContext, matcher_matches};
 use super::observation::{
     Observed, decision_kind, report_decision, report_matched_rules, report_rule_cache_hit,
 };
+use super::response::least_ttl;
 use super::rules::Decision;
 use super::rules::{
     RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, calculate_rule_hash, rule_cache_requester,
@@ -200,8 +201,7 @@ impl Engine {
         } = *request;
         let ttl = match &decision {
             Decision::Static { answers, .. } => {
-                let min_ttl = answers.iter().map(|r| r.ttl).min();
-                min_ttl.map(|t| Duration::from_secs(t as u64))
+                least_ttl(answers).map(|ttl| Duration::from_secs(u64::from(ttl)))
             }
             Decision::Forward { response_phase, .. } => {
                 // If it has response-phase logic, it is not "static" in the user's terms.

@@ -234,11 +234,13 @@ async fn a_geoip_update_drops_cached_answers_judged_by_the_old_networks() {
     replace(&data, networks("192.0.2.0/24").as_bytes());
     wait_for_new_namespace(&engine, "main", before, in_testnet("192.0.2.1")).await;
     assert_eq!(both_paths(&engine, "cdn.example").await, [Some(MATCHED); 2]);
-    // 回答阶段给的静态应答在 min_ttl 为 0 时不缓存，所以两条路各问一次 / With min_ttl 0 the static answer of
-    // the response phase is not cached, so each path asks once
+    // 更新以后先问的那条路重新问上游、按新网段判断，回答阶段给的静态应答按它的 TTL 缓存，另一条路拿缓存里的
+    // After the update the path asking first asks the upstream again and judges by the new
+    // networks; the static answer of the response phase is cached for its TTL, and the other
+    // path takes it from the cache
     assert_eq!(
         up.queries(),
-        3,
+        2,
         "the answer was asked for again and judged anew"
     );
 }

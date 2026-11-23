@@ -40,7 +40,13 @@ pub enum ForwardResult {
     Fallback(Bytes),
     /// Request needs to continue (e.g. Action::Continue)
     /// Boxed to reduce enum size (ResponseContext is ~256 bytes)
-    Continue { ctx: Box<Option<ResponseContext>> },
+    /// `fallback`：这是 miss 动作在上游失败以后做的 continue，手里没有上游的应答（见 `Route::on_an_answer`）
+    /// `fallback`: a continue the miss actions made after an upstream failure, with no
+    /// upstream answer in hand (see `Route::on_an_answer`)
+    Continue {
+        ctx: Box<Option<ResponseContext>>,
+        fallback: bool,
+    },
     /// 响应动作跳到 `pipeline`：请求在那里接着走规则，转发照原样发出这次转发发出的 `packet`，它带的 ECS 是 `carried`；应答
     /// 照旧缓存在跳转前这个 pipeline 的键下（见 `handle_packet_internal`）。这次转发登记的条目留给请求（见 `held_inflight`），
     /// 等它拿到最终的应答再交出去
@@ -48,11 +54,12 @@ pub enum ForwardResult {
     /// forwards sending `packet`, what this forward sent, as it is, with `carried` as its ECS;
     /// answers are still cached under the key of this pipeline, the one jumped from (see
     /// `handle_packet_internal`). The entry this forward registered stays with the request (see
-    /// `held_inflight`) and is handed the final answer
+    /// `held_inflight`) and is handed the final answer. `fallback` as on Continue
     Jump {
         pipeline: Arc<str>,
         packet: Bytes,
         carried: ForwardEcs,
+        fallback: bool,
     },
 }
 use hickory_proto::serialize::binary::BinDecodable;
@@ -271,6 +278,23 @@ fn ttl_to_cache(engine: &Engine, answer_ttl: u64, min_ttl: Duration) -> u32 {
     proto_utils::saturating_u64_to_u32(answer_ttl.max(min_ttl.as_secs())).min(engine.ttl_cap())
 }
 
+/// 缓存留一份静态应答多久：它带的 TTL（`carried`，记录里最小的，见 `least_ttl`），不超过 cache_max_ttl；
+/// 不带记录的（deny 的 REFUSED、static_response、问的类型没有记录时的 NODATA）没有自己的 TTL，留 min_ttl。
+/// 0 就不缓存。请求阶段和响应阶段都照这一处算。min_ttl 只抬上游回答的 TTL，不抬规则写的：抬了缓存时间、
+/// 记录却不抬，缓存里的记录 TTL 先走完，交出去的就是 TTL 为 0 的记录
+/// How long the cache keeps a static answer: the TTL it carries (`carried`, the least of
+/// its records', see `least_ttl`), at most cache_max_ttl; one without records (deny's
+/// REFUSED, static_response, the NODATA of a type with no records) has no TTL of its own
+/// and is kept for min_ttl. 0 means not cached. The request phase and the response phase
+/// both go by this. min_ttl raises the TTLs of upstream answers, not those a rule writes:
+/// raising the time cached and not the records would have the cached records' TTLs run
+/// out first, going out as 0
+fn static_ttl(engine: &Engine, carried: Option<u32>, min_ttl: Duration) -> u32 {
+    carried
+        .unwrap_or_else(|| proto_utils::saturating_u64_to_u32(min_ttl.as_secs()))
+        .min(engine.ttl_cap())
+}
+
 /// How a reply served from the cache gets its TTLs / 从缓存给出的应答怎样设置 TTL
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ServedTtl {
@@ -398,12 +422,11 @@ pub(crate) fn serve_stale(
         view,
         ServedTtl::Stale(settings.serve_stale_ttl),
     );
-    // 发起后台刷新，重新决定一次。规则给的应答（没有上游的那种）也一样：它可能是上游失败时的兜底、对上游那次应答的
-    // 检查结果，不重新决定的话每次命中都把它续上，一直用下去
+    // 发起后台刷新，重新决定一次。规则给的应答（没有上游的那种）也一样：它是对上游那次应答的检查结果，不重新决定的话
+    // 每次命中都把它续上，一直用下去
     // Start a background refresh to decide again. An answer the rules gave (one with no
-    // upstream) is no different: it may be the fallback for an upstream failure or what the
-    // check of that one reply came to, and not decided again it would be renewed on every hit
-    // and served for ever
+    // upstream) is no different: it is what the check of that one reply came to, and not
+    // decided again it would be renewed on every hit and served for ever
     engine.spawn_background_refresh(
         context.state,
         hit,
@@ -433,13 +456,26 @@ pub struct StaticDecisionContext<'a> {
     /// 应答适用于谁：请求在它之前经过的转发（见 `ForwardDecisionContext::trail`）
     pub reach: &'a EcsReach,
     pub min_ttl: Duration,
-    /// Pipeline uses a client_ip matcher: skip dns_cache to avoid cross-client
-    /// reuse (rule_cache already isolates by client IP in that case).
-    pub uses_client_ip: bool,
+    /// 它取决于上游的一份应答（见 `Route::on_an_answer`）：缓存起来，下次不必再问上游。别的都不缓存：规则直接给出的，
+    /// 规则下次照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿的话查询日志和规则计数就记不到这条规则，它的 log
+    /// 动作也不执行；上游失败以后兜底给出的只是这一次请求的
+    /// It depends on an upstream's answer (see `Route::on_an_answer`): it is cached so the
+    /// upstream need not be asked next time. Nothing else is: one the rules give outright they
+    /// give again outright (the fast path, the rule cache) with nobody to ask, and taken from
+    /// the response cache it would be missing from the query log and rule counts under its
+    /// rule, its log action not run; one given as a fallback after an upstream failure is for
+    /// this request alone
+    pub on_an_answer: bool,
 }
 
-/// Handles Decision::Static.
-/// Parses request, builds response, updates cache, and returns bytes.
+/// 处理静态决定：照请求构造应答；取决于上游应答的（见 `StaticDecisionContext::on_an_answer`）按 `static_ttl` 说的
+/// 时长缓存。槽位把规则分得开的请求方分开（见 `RuntimePipeline::requester`），所以规则按「谁在问」给的应答也和别的应答
+/// 一样缓存。
+/// Handles Decision::Static: builds the answer for the request, and caches one that depends
+/// on an upstream's answer (see `StaticDecisionContext::on_an_answer`) for as long as
+/// `static_ttl` says. The slot keeps apart the requesters the rules tell apart (see
+/// `RuntimePipeline::requester`), so an answer the rules give by who is asking is cached like
+/// any other.
 /// Does not emit the `dns_response` record; only the engine request path logs it.
 /// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
 pub fn handle_static_decision(
@@ -457,17 +493,14 @@ pub fn handle_static_decision(
         flags,
         reach,
         min_ttl,
-        uses_client_ip,
+        on_an_answer,
     } = *context;
     // Need full request for building response / 需要完整请求来构建响应
     let req = Message::from_bytes(packet).context("parse request for static")?;
+    let ttl = static_ttl(engine, super::response::least_ttl(&answers), min_ttl);
     let resp_bytes = build_response(&req, rcode, answers)?;
 
-    // Skip dns_cache when the pipeline matches on client_ip: the slot has no
-    // client dimension, so a cached static answer could leak across clients.
-    // rule_cache already caches static decisions with client-IP isolation.
-    if !uses_client_ip && min_ttl > Duration::from_secs(0) {
-        let ttl = crate::proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
+    if on_an_answer && ttl > 0 {
         engine.insert_dns_cache_entry(
             slot,
             CacheEntry::from_response(
@@ -1198,9 +1231,6 @@ impl<'a> Forwarding<'a> {
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(background_refresh, &ctx.raw)?;
                 match ttl_to_cache(self.engine, extract_ttl(&ctx.msg), self.cx.min_ttl) {
-                    // 上游失败以后由别的上游兜底的不算：那是失败，条目保留 / Not after an upstream
-                    // failure covered by another upstream: that is a failure, and the entry stays
-                    0 if fallback => {}
                     0 => self.drop_renewed(),
                     ttl => self.cache(
                         &ctx.raw,
@@ -1213,7 +1243,9 @@ impl<'a> Forwarding<'a> {
                 response.upstream = Some(ctx.upstream);
                 Ok(finished(ctx.raw))
             }
-            ResponseActionResult::Static { bytes, rcode, .. } => {
+            ResponseActionResult::Static {
+                bytes, rcode, ttl, ..
+            } => {
                 // A SERVFAIL here mostly means the response actions found no answer
                 // either (a response-phase forward failed or ran past its limit, or the
                 // jump limit was reached); a static SERVFAIL the rules configure is taken
@@ -1229,13 +1261,21 @@ impl<'a> Forwarding<'a> {
                         "the response actions found no answer",
                     ));
                 }
-                match proto_utils::saturating_u64_to_u32(self.cx.min_ttl.as_secs()) {
-                    // An answer that is not cached cannot renew the entry, so the refresh
-                    // drops it and the next client request runs the rules.
-                    // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端请求自己
-                    // 执行规则。
-                    0 => self.drop_renewed(),
-                    ttl => self.cache(&bytes, rcode, None, ttl),
+                // 上游失败以后 miss 动作给的静态应答只是这一次请求的兜底，不是这个问题的应答，不缓存：缓存是所有
+                // 请求方共用的，写进去的话，上游恢复了它还要一直用到条目到期
+                // After an upstream failure a static answer of the miss actions is a fallback
+                // for this request, not the answer to the question, and is not cached: the
+                // cache is shared by every requester, and cached it would go on serving after
+                // the upstream recovered, until the entry expired
+                if !fallback {
+                    match static_ttl(self.engine, ttl, self.cx.min_ttl) {
+                        // An answer that is not cached cannot renew the entry, so the refresh
+                        // drops it and the next client request runs the rules.
+                        // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端请求自己
+                        // 执行规则。
+                        0 => self.drop_renewed(),
+                        ttl => self.cache(&bytes, rcode, None, ttl),
+                    }
                 }
                 self.hand_over(&bytes);
                 response.upstream = Some(Arc::from("static"));
@@ -1250,6 +1290,7 @@ impl<'a> Forwarding<'a> {
                     pipeline,
                     packet: Bytes::copy_from_slice(&self.packet),
                     carried: self.forward_ecs,
+                    fallback,
                 })
             }
             ResponseActionResult::Continue { ctx } => {
@@ -1265,7 +1306,10 @@ impl<'a> Forwarding<'a> {
                 // 那一条的等待者自己转发。以前上游失败以后在这里 defuse 守卫，条目留在表里却
                 // 没人持有，下一条转发会一直等它到监听器超时。
                 self.keep_for_request();
-                Ok(ForwardResult::Continue { ctx: Box::new(ctx) })
+                Ok(ForwardResult::Continue {
+                    ctx: Box::new(ctx),
+                    fallback,
+                })
             }
         }
     }
@@ -1539,6 +1583,13 @@ mod refresh_response_rule_tests {
 
     fn answer_static() -> Value {
         json!([{ "type": "static_ip_response", "ip": STATIC }])
+    }
+
+    /// 不进缓存的静态应答：不带记录，min_ttl 为 0 时不缓存（见 `static_ttl`）
+    /// A static answer that is not cached: it has no records, and is not cached with min_ttl
+    /// 0 (see `static_ttl`)
+    fn answer_uncached() -> Value {
+        json!([{ "type": "static_response", "rcode": "NXDOMAIN" }])
     }
 
     fn jump_to(pipeline: &str) -> Value {
@@ -1916,9 +1967,13 @@ mod refresh_response_rule_tests {
 
     #[tokio::test]
     async fn a_refresh_drops_the_entry_for_an_uncached_static_answer() {
-        let cached =
-            refresh_with_actions_on_the_answer(json!({}), answer_static(), vec![], static_target())
-                .await;
+        let cached = refresh_with_actions_on_the_answer(
+            json!({}),
+            answer_uncached(),
+            vec![],
+            static_target(),
+        )
+        .await;
         assert_eq!(cached, None);
     }
 
@@ -1936,7 +1991,7 @@ mod refresh_response_rule_tests {
                 { "id": "main", "rules": [rule(
                     "first",
                     forward(&first),
-                    json!({ "response_actions_on_match": answer_static() })
+                    json!({ "response_actions_on_match": answer_uncached() })
                 )] },
                 { "id": "other", "rules": [static_target()] }
             ]),
@@ -1959,7 +2014,7 @@ mod refresh_response_rule_tests {
                 { "id": "main", "rules": [rule(
                     "first",
                     forward(&first),
-                    json!({ "response_actions_on_match": answer_static() })
+                    json!({ "response_actions_on_match": answer_uncached() })
                 )] },
                 { "id": "other", "rules": [static_target()] }
             ]),
@@ -1975,36 +2030,33 @@ mod refresh_response_rule_tests {
     }
 
     #[tokio::test]
-    async fn a_refresh_caches_a_static_answer_under_min_ttl() {
-        let settings = json!({ "min_ttl": 60 });
+    async fn a_refresh_caches_a_static_answer_for_its_ttl() {
         let cached =
-            refresh_with_actions_on_the_answer(settings, answer_static(), vec![], static_target())
+            refresh_with_actions_on_the_answer(json!({}), answer_static(), vec![], static_target())
                 .await;
         assert_eq!(cached, Some(vec![STATIC.parse().unwrap()]));
     }
 
-    /// 回答检查跳过去拿到的应答缓存在原来的键下，刷新就用它更新条目；拿到的应答不缓存（没有 min_ttl 的静态应答）时，
-    /// 条目删掉，下一个客户端请求自己走规则
+    /// 回答检查跳过去拿到的应答缓存在原来的键下，刷新就用它更新条目；拿到的应答不缓存（min_ttl 为 0 时不带记录的静态
+    /// 应答）时，条目删掉，下一个客户端请求自己走规则
     /// The answer an answer check's jump gets is cached under the key it came from, and the
-    /// refresh renews the entry with it; when what it gets is not cached (a static answer with
-    /// no min_ttl), the entry goes and the next client request runs the rules itself
+    /// refresh renews the entry with it; when what it gets is not cached (a static answer
+    /// without records, with min_ttl 0), the entry goes and the next client request runs the
+    /// rules itself
     #[tokio::test]
     async fn a_refresh_renews_the_entry_with_what_the_jump_answers() {
-        for (settings, cached) in [
-            (
-                json!({ "min_ttl": 60 }),
-                Some(vec![STATIC.parse().unwrap()]),
-            ),
-            (json!({}), None),
+        for (target, cached) in [
+            (answer_static(), Some(vec![STATIC.parse().unwrap()])),
+            (answer_uncached(), None),
         ] {
             let renewed = refresh_with_actions_on_the_answer(
-                settings.clone(),
+                json!({}),
                 jump_to("other"),
                 vec![],
-                static_target(),
+                rule("target", target.clone(), json!({})),
             )
             .await;
-            assert_eq!(renewed, cached, "{settings}");
+            assert_eq!(renewed, cached, "{target}");
         }
     }
 
@@ -2140,7 +2192,7 @@ mod refresh_response_rule_tests {
 
     #[tokio::test]
     async fn a_refresh_drops_the_entry_when_a_continue_reaches_a_static_answer() {
-        let later = vec![rule("static", answer_static(), json!({}))];
+        let later = vec![rule("static", answer_uncached(), json!({}))];
         let cached =
             refresh_with_actions_on_the_answer(json!({}), continue_(), later, static_target())
                 .await;
@@ -2148,11 +2200,11 @@ mod refresh_response_rule_tests {
     }
 
     #[tokio::test]
-    async fn a_refresh_caches_a_static_answer_a_continue_reaches_under_min_ttl() {
+    async fn a_refresh_caches_a_static_answer_a_continue_reaches_for_its_ttl() {
         let later = vec![rule("static", answer_static(), json!({}))];
-        let settings = json!({ "min_ttl": 60 });
         let cached =
-            refresh_with_actions_on_the_answer(settings, continue_(), later, static_target()).await;
+            refresh_with_actions_on_the_answer(json!({}), continue_(), later, static_target())
+                .await;
         assert_eq!(cached, Some(vec![STATIC.parse().unwrap()]));
     }
 

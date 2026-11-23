@@ -214,8 +214,6 @@ pub struct RuntimePipelineConfig {
 pub struct RuntimePipeline {
     pub id: Arc<str>,
     pub rules: Vec<RuntimeRule>,
-    /// 是否包含依赖客户端 IP 的匹配规则 / Whether it contains rules that match based on client IP
-    pub uses_client_ip: bool,
     /// How the answer can depend on the requester: through this pipeline's rules,
     /// the rules along the response-jump paths its answer checks start, and, when
     /// an answer check continues, the pipelines its rules jump to. Response cache,
@@ -977,8 +975,6 @@ impl RuntimePipelineConfig {
 
             reads.push(RuleReads::of(&rules));
             let request_matchers = || rules.iter().flat_map(|rule| &rule.matchers);
-            let uses_client_ip =
-                request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::ClientIp { .. }));
             // A forward that sends an ECS subnet taken from the client does not count:
             // every cached answer is tagged with the subnets it applies to (see
             // `CacheEntry::reach`), and a lookup takes only answers for the requester's.
@@ -998,7 +994,6 @@ impl RuntimePipelineConfig {
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
-                uses_client_ip,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 requester: RequesterScope::default(),
                 rule_requester: RequesterScope::default(),
@@ -2015,45 +2010,6 @@ mod tests {
                 "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
             }] }]
         })
-    }
-
-    /// pipeline 有一条规则按客户端 IP 判断时，就算它不是第一条，也算「按客户端 IP」；按 GeoIP、
-    /// GeoSite 判断的不算
-    /// A pipeline with a rule matching on the client IP counts as matching on it, even
-    /// when that rule is not the first; rules matching on GeoIP or GeoSite do not count
-    #[test]
-    fn a_pipeline_uses_the_client_ip_when_any_rule_matches_on_it() {
-        let uses_client_ip = |rules: serde_json::Value| {
-            runtime_of(serde_json::json!({
-                "settings": { "default_upstream": "127.0.0.1:9" },
-                "pipelines": [{ "id": "main", "rules": rules }]
-            }))
-            .expect("build runtime config")
-            .pipelines[0]
-                .uses_client_ip
-        };
-        let rule = |name: &str, matcher: serde_json::Value| {
-            serde_json::json!({
-                "name": name,
-                "matchers": [matcher],
-                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
-            })
-        };
-        let geo = rule(
-            "geo",
-            serde_json::json!({ "type": "geoip_private", "expect": true }),
-        );
-        let site = rule(
-            "site",
-            serde_json::json!({ "type": "geo_site", "value": "cn" }),
-        );
-        let client = rule(
-            "client",
-            serde_json::json!({ "type": "client_ip", "cidr": "10.0.0.0/8" }),
-        );
-        assert!(!uses_client_ip(serde_json::json!([geo, site])));
-        assert!(uses_client_ip(serde_json::json!([geo, site, client])));
-        assert!(uses_client_ip(serde_json::json!([client, geo])));
     }
 
     /// CIDR 列表按逗号分开，各项去掉两边的空白，空项跳过；两种响应匹配器一样

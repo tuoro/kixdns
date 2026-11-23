@@ -82,6 +82,8 @@ mod stale_wait_tests;
 #[cfg(test)]
 mod static_answer_scope_tests;
 #[cfg(test)]
+mod static_answer_ttl_tests;
+#[cfg(test)]
 mod tcp_pool_tests;
 #[cfg(test)]
 pub(crate) mod test_support;

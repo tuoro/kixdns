@@ -1646,11 +1646,11 @@ impl Engine {
                     // its entry, which stays. After a refresh continued past an
                     // answer, any other static answer replaces the entry, which
                     // handle_static_decision stores again when it caches the answer
-                    // there, unless it is a fallback after an upstream failure.
+                    // there (an upstream failure ends a refresh before it gets here).
                     // 刷新时这里的 SERVFAIL（跳转目标不存在，或规则配置的静态 SERVFAIL）
                     // 不是应答：刷新在往缓存写任何东西之前以失败结束，条目保留。刷新越过
                     // 一个应答之后，其他静态应答取代这条，handle_static_decision 在那里缓存
-                    // 应答时会重新写入；上游失败之后的兜底除外。
+                    // 应答时会重新写入（上游失败时刷新到不了这里就已经结束）。
                     if rcode == ResponseCode::ServFail && background_refresh {
                         return Err(phases::refresh_found_no_answer(
                             "the rules answered SERVFAIL",
@@ -1672,7 +1672,7 @@ impl Engine {
                             flags: request.flags,
                             reach: &route.trail,
                             min_ttl,
-                            uses_client_ip: route.uses_client_ip,
+                            on_an_answer: route.on_an_answer,
                         },
                         rcode,
                         answers,
@@ -1761,8 +1761,8 @@ impl Engine {
                             }
                             return Ok(bytes);
                         }
-                        Ok(phases::ForwardResult::Continue { ctx }) => {
-                            route.continued(*ctx, rule_index);
+                        Ok(phases::ForwardResult::Continue { ctx, fallback }) => {
+                            route.continued(*ctx, rule_index, fallback);
                             let Some(pipeline) = cfg.pipeline(&route.pipeline) else {
                                 warn!("pipeline missing while continuing: {}", route.pipeline);
                                 return request.servfail("parse request");
@@ -1774,8 +1774,9 @@ impl Engine {
                             pipeline,
                             packet,
                             carried,
+                            fallback,
                         }) => {
-                            route.response_jumped(packet, carried, response_jump_limit);
+                            route.response_jumped(packet, carried, response_jump_limit, fallback);
                             decision = Decision::Jump { pipeline };
                             continue 'decision_loop;
                         }
@@ -2017,7 +2018,6 @@ impl Request<'_> {
 struct Route {
     /// 现在所在的 pipeline / The pipeline it is in now
     pipeline: Arc<str>,
-    uses_client_ip: bool,
     /// 应答缓存在哪个 pipeline 的键下：请求阶段的跳转换成目标的；响应阶段跳转以后不再换，跳过去拿到的应答照旧缓存在
     /// 跳转前那个 pipeline 的键下（见 `phases::ForwardResult::Jump`）
     /// The pipeline whose key answers are cached under: a request-phase jump changes it to the
@@ -2041,6 +2041,18 @@ struct Route {
     /// 规则已经越过了一个应答（continue，或响应阶段跳走）/ A rule has continued past an answer
     /// (a continue, or a response-phase jump)
     passed_an_answer: bool,
+    /// 接下来的应答取决于上游的一份应答：在这些键下最近一次 continue 或回答检查跳转，是在上游的应答上做的；miss 动作在
+    /// 上游失败以后做的不算，那时手里没有应答。这时规则给出的静态应答缓存起来，下次不必再问上游（见
+    /// `phases::StaticDecisionContext::on_an_answer`）。请求阶段跳进别的 pipeline、换了键，就又不是了：那里直接给出的，
+    /// 直接进那里的请求也照样直接拿到
+    /// What answers next depends on an upstream's answer: the latest continue or answer check's
+    /// jump under these keys was made on an upstream's answer; one the miss actions made after
+    /// an upstream failure does not count, there being no answer in hand. A static answer the
+    /// rules give now is cached so as not to ask the upstream again (see
+    /// `phases::StaticDecisionContext::on_an_answer`). A request-phase jump into another
+    /// pipeline, changing the keys, ends that: what is given outright there is given outright
+    /// to the requests entering there directly too
+    on_an_answer: bool,
     /// 在当前 pipeline 里经过的转发（见 `ForwardDecisionContext::trail`）；请求结束后就是它最后一份应答缓存时带的那份
     /// The forwards passed in the current pipeline (see `ForwardDecisionContext::trail`); after
     /// the request, what its last answer was cached with
@@ -2077,7 +2089,6 @@ impl Route {
         }
         Self {
             pipeline: Arc::clone(pipeline_id),
-            uses_client_ip: pipeline.is_some_and(|p| p.uses_client_ip),
             key_pipeline: Arc::clone(pipeline_id),
             keys,
             skip_rules: crate::engine::pipeline::Continued::new(),
@@ -2085,6 +2096,7 @@ impl Route {
             jumped: None,
             jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
             passed_an_answer: false,
+            on_an_answer: false,
             trail: EcsReach::default(),
             echo_floor: 0,
             held_inflight: None,
@@ -2103,7 +2115,6 @@ impl Route {
         p: &crate::matcher::RuntimePipeline,
     ) -> bool {
         self.pipeline = p.id.clone();
-        self.uses_client_ip = p.uses_client_ip;
         self.skip_rules.clear();
         // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的。
         // 带过来交给这里的 allow，就会写进这个 pipeline 的键，之后直接进入这里的请求
@@ -2124,6 +2135,7 @@ impl Route {
             .echo_floor
             .max(self.trail.echo_scope(&request.requester.ecs_view()));
         self.trail = EcsReach::default();
+        self.on_an_answer = false;
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
@@ -2134,28 +2146,32 @@ impl Route {
         true
     }
 
-    /// 规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，`rule` 下一轮不再求值
-    /// A rule continued past this answer: `reused` is kept for a later `allow`, and `rule` is not
-    /// evaluated again
-    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>) {
+    /// 规则越过了这个应答（continue；`fallback` 见 `phases::ForwardResult::Continue`）：`reused` 留给后面的
+    /// `allow`，`rule` 下一轮不再求值
+    /// A rule continued past this answer (`fallback` see `phases::ForwardResult::Continue`):
+    /// `reused` is kept for a later `allow`, and `rule` is not evaluated again
+    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>, fallback: bool) {
         self.passed_an_answer = true;
+        self.on_an_answer = !fallback;
         self.reused_response = reused;
         self.skip_rules.extend(rule);
     }
 
-    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（刷新时上游失败的到不了这里）；此后的转发
-    /// 照原样发出 `packet`。第一次响应阶段的跳转起另算一份次数（`limit`）
+    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（`fallback` 也一样；刷新时上游失败的到不了
+    /// 这里）；此后的转发照原样发出 `packet`。第一次响应阶段的跳转起另算一份次数（`limit`）
     /// A response action jumped away: the answer of the forward before the jump is one passed
-    /// over, as on a continue (a refresh whose upstream failed never gets here); the forwards from
-    /// here on send `packet` as it is. The first response-phase jump starts a budget of its own
-    /// (`limit`)
+    /// over, as on a continue (`fallback` too; a refresh whose upstream failed never gets here);
+    /// the forwards from here on send `packet` as it is. The first response-phase jump starts a
+    /// budget of its own (`limit`)
     fn response_jumped(
         &mut self,
         packet: Bytes,
         carried: crate::ecs_scope::ForwardEcs,
         limit: usize,
+        fallback: bool,
     ) {
         self.passed_an_answer = true;
+        self.on_an_answer = !fallback;
         if self.jumped.is_none() {
             self.jumps_left = limit;
         }
@@ -2202,18 +2218,19 @@ mod tests {
         RuntimePipelineConfig::from_config(config).expect("build runtime config")
     }
 
-    fn runtime_with_static_ip(ip: &str) -> RuntimePipelineConfig {
+    /// 回答检查在 `upstream` 回答以后给出 `ip` 的配置：这样的静态应答才进缓存
+    /// A configuration whose answer check gives `ip` once `upstream` answered: such a static
+    /// answer is one that is cached
+    fn runtime_with_static_ip(upstream: &str, ip: &str) -> RuntimePipelineConfig {
         let raw = serde_json::json!({
-            "settings": {
-                "default_upstream": "1.1.1.1:53",
-                "min_ttl": 60
-            },
+            "settings": { "default_upstream": "1.1.1.1:53" },
             "pipelines": [{
                 "id": "main",
                 "rules": [{
                     "name": "static",
                     "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "static_ip_response", "ip": ip }]
+                    "actions": [{ "type": "forward", "upstream": upstream }],
+                    "response_actions_on_match": [{ "type": "static_ip_response", "ip": ip }]
                 }]
             }]
         });
@@ -2294,8 +2311,14 @@ mod tests {
 
     #[tokio::test]
     async fn request_snapshot_cannot_write_into_the_active_generation_after_reload() {
-        let engine = Engine::new(runtime_with_static_ip("192.0.2.1"), "test".to_string())
-            .expect("create engine");
+        let upstream = answering_upstream("192.0.2.9".parse().unwrap(), 300)
+            .await
+            .address;
+        let engine = Engine::new(
+            runtime_with_static_ip(&upstream, "192.0.2.1"),
+            "test".to_string(),
+        )
+        .expect("create engine");
         let old_state = engine.state.load_full();
         let old_namespace = old_state.cache_namespace("main");
         let old_key = Engine::cache_keys(
@@ -2310,7 +2333,7 @@ mod tests {
         )
         .slot;
 
-        engine.reload(runtime_with_static_ip("192.0.2.2"));
+        engine.reload(runtime_with_static_ip(&upstream, "192.0.2.2"));
         let new_namespace = engine.state.load().cache_namespace("main");
         let new_key = Engine::cache_keys(
             new_namespace,
@@ -5005,62 +5028,6 @@ mod tests {
             }
             _ => panic!("expected static result"),
         }
-    }
-
-    #[tokio::test]
-    async fn static_decision_skips_dns_cache_when_pipeline_uses_client_ip() {
-        // Arrange: Build engine, request packet, and a static IP answer
-        let engine = build_test_engine();
-        let mut request = Message::new(0xBE, MessageType::Query, OpCode::Query);
-        request.metadata.recursion_desired = true;
-        request.add_query(Query::query(
-            Name::from_str("example.com").unwrap(),
-            RecordType::A,
-        ));
-        let packet = request.to_vec().unwrap();
-        let (rcode, answers) =
-            make_static_ip_answer("example.com", RecordType::A, DNSClass::IN, "192.0.2.1");
-
-        // Act: uses_client_ip=true must NOT write into dns_cache (client isolation)
-        let ctx = phases::StaticDecisionContext {
-            flags: crate::proto_utils::QueryFlags::RECURSIVE,
-            packet: &packet,
-            qname: "example.com",
-            qtype: RecordType::A,
-            pipeline_id: &Arc::from("p1"),
-            slot: 4242,
-            reach: &EcsReach::default(),
-            min_ttl: Duration::from_secs(60),
-            uses_client_ip: true,
-        };
-        phases::handle_static_decision(&engine, &ctx, rcode, answers.clone())
-            .expect("static decision");
-
-        // Assert: no dns_cache entry written
-        assert!(
-            engine.cached(4242).is_none(),
-            "static decision with client_ip matcher must not pollute dns_cache"
-        );
-
-        // Control: uses_client_ip=false DOES write into dns_cache
-        let ctx_plain = phases::StaticDecisionContext {
-            flags: crate::proto_utils::QueryFlags::RECURSIVE,
-            packet: &packet,
-            qname: "example.com",
-            qtype: RecordType::A,
-            pipeline_id: &Arc::from("p1"),
-            slot: 4243,
-            reach: &EcsReach::default(),
-            min_ttl: Duration::from_secs(60),
-            uses_client_ip: false,
-        };
-        phases::handle_static_decision(&engine, &ctx_plain, rcode, answers)
-            .expect("static decision");
-
-        assert!(
-            engine.cached(4243).is_some(),
-            "static decision without client_ip matcher should still be cached"
-        );
     }
 
     #[test]

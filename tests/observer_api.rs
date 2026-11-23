@@ -706,14 +706,15 @@ impl EngineObserver for Moments {
 
 #[tokio::test]
 async fn a_request_says_when_it_started_and_how_it_is_reported() {
+    let (upstream, _task) = spawn_echo_upstream(300).await;
     let raw = serde_json::json!({
-        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+        "settings": { "default_upstream": "127.0.0.1:9" },
         "pipelines": [{
             "id": "main",
             "rules": [{
-                "name": "block",
-                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
-                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                "name": "forward",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream }]
             }]
         }]
     })
@@ -726,12 +727,12 @@ async fn a_request_says_when_it_started_and_how_it_is_reported() {
 
     let before = Instant::now();
     engine
-        .handle_packet(&query("a.blocked.test"), peer())
+        .handle_packet(&query("a.cached.test"), peer())
         .await
         .unwrap();
     let slow = Instant::now();
     let fast = engine
-        .handle_packet_fast(&query("a.blocked.test"), peer())
+        .handle_packet_fast(&query("a.cached.test"), peer())
         .unwrap();
     assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
     let after = Instant::now();
@@ -789,15 +790,23 @@ impl EngineObserver for TakesHitsWhole {
 /// answer on the fast path is reported as ever
 #[tokio::test]
 async fn an_observer_can_take_a_cache_hit_whole() {
+    let (upstream, _task) = spawn_echo_upstream(300).await;
     let raw = serde_json::json!({
-        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+        "settings": { "default_upstream": "127.0.0.1:9" },
         "pipelines": [{
             "id": "main",
-            "rules": [{
-                "name": "block",
-                "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
-                "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
-            }]
+            "rules": [
+                {
+                    "name": "block",
+                    "matchers": [{ "type": "domain_suffix", "value": "blocked.test" }],
+                    "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                },
+                {
+                    "name": "forward",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": upstream }]
+                }
+            ]
         }]
     })
     .to_string();
@@ -808,22 +817,22 @@ async fn an_observer_can_take_a_cache_hit_whole() {
         .expect("build engine");
 
     engine
-        .handle_packet(&query("a.blocked.test"), peer())
+        .handle_packet(&query("a.cached.test"), peer())
         .await
         .unwrap();
     assert!(observer.whole.lock().unwrap().is_empty());
     assert_eq!(observer.started.lock().unwrap().len(), 1);
 
     let fast = engine
-        .handle_packet_fast(&query("a.blocked.test"), peer())
+        .handle_packet_fast(&query("a.cached.test"), peer())
         .unwrap();
     assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
     assert_eq!(
         *observer.whole.lock().unwrap(),
         vec![(
-            "a.blocked.test".to_string(),
+            "a.cached.test".to_string(),
             "main".to_string(),
-            Some(ResponseCode::NXDomain)
+            Some(ResponseCode::NoError)
         )]
     );
     assert_eq!(
@@ -1124,12 +1133,13 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
         ]
     );
 
-    // Fast path, response cache populated by the first request
-    // 快速路径：第一个请求已写入响应缓存
+    // Fast path again for the name the full path answered: a rule's own answer stays out of
+    // the response cache even with min_ttl, and the compiled rule answers it again
+    // 快速路径再问完整路径答过的名字：规则直接给的应答开着 min_ttl 也不进响应缓存，编译后的规则再答一次
     let fast = engine
         .handle_packet_fast(&query("a.blocked.test"), peer())
         .unwrap();
-    assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
+    assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     let events = recorder.drain();
     let id = request_id_for(&events, "a.blocked.test");
     assert_eq!(
@@ -1141,11 +1151,24 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
                 pipeline: "main".into()
             },
             Event::CacheLookup { id },
-            Event::CacheHit {
+            Event::CacheMiss { id },
+            Event::Rule {
                 id,
-                kind: CacheHitKind::Fresh,
-                has_remaining_ttl: true,
-                original_ttl: Some(Duration::from_secs(60)),
+                pipeline: "main".into(),
+                rule: "block".into(),
+                phase: RulePhase::Request,
+                decision: DecisionKind::Static,
+                fast_path: true,
+            },
+            Event::Decision {
+                id,
+                pipeline: "main".into(),
+                rule: Some("block".into()),
+                phase: RulePhase::Request,
+                detail: Detail::Static {
+                    rcode: ResponseCode::NXDomain,
+                    answers: 0,
+                },
             },
             finished(id),
         ]
@@ -2587,16 +2610,18 @@ async fn cache_hits_name_the_upstream_whose_answer_was_cached() {
     }));
     task.abort();
 
-    // A rule's answer is cached too when min_ttl allows; it has no upstream.
-    // min_ttl 允许时规则的应答也会进缓存；它没有上游。
+    // A rule's answer given on an upstream's answer is cached too; it has no upstream.
+    // 规则在上游的回答上给出的应答也进缓存；它没有上游。
+    let (upstream, task) = spawn_echo_upstream(300).await;
     let raw = serde_json::json!({
-        "settings": { "default_upstream": "127.0.0.1:9", "min_ttl": 60 },
+        "settings": { "default_upstream": "127.0.0.1:9" },
         "pipelines": [{
             "id": "main",
             "rules": [{
                 "name": "static",
                 "matchers": [{ "type": "any" }],
-                "actions": [{ "type": "static_ip_response", "ip": "192.0.2.7" }]
+                "actions": [{ "type": "forward", "upstream": upstream }],
+                "response_actions_on_match": [{ "type": "static_ip_response", "ip": "192.0.2.7" }]
             }]
         }]
     })
@@ -2611,6 +2636,7 @@ async fn cache_hits_name_the_upstream_whose_answer_was_cached() {
     let sources = recorder.cache_sources();
     assert_eq!(sources.len(), 1, "{sources:#?}");
     assert_eq!(sources[0].1, None);
+    task.abort();
 }
 
 /// 配置文件读完以后、监视开始重载之前改了：监视在读之前装好，这次改动排着队，开始以后照样重载。以前读完配置、建好引擎才装
