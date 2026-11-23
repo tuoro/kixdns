@@ -777,7 +777,7 @@ async fn forward_upstream_as_is(
                 if outcome == UpstreamOutcome::Throttled {
                     tracing::debug!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
                 } else {
-                    tracing::warn!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
+                    crate::warn_sparse!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
                 }
                 return Err(UpstreamFailure::error(err));
             }
@@ -932,14 +932,14 @@ async fn forward_upstream_as_is(
                         if outcome == UpstreamOutcome::Throttled {
                             tracing::debug!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
                         } else {
-                            tracing::warn!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                            crate::warn_sparse!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         }
                         last_err = Some(err);
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "upstream task join error, waiting for others");
+                crate::warn_sparse!(error = %e, "upstream task join error, waiting for others");
                 last_err = Some(anyhow::anyhow!(e));
             }
         }

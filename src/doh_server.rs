@@ -153,7 +153,7 @@ pub async fn run_doh_with_listener(
                         .await;
                 }
                 Ok(Err(e)) => {
-                    warn!(error = %e, "DoH TLS handshake failed");
+                    crate::warn_sparse!(error = %e, "DoH TLS handshake failed");
                 }
                 Err(_) => {
                     // Quiet, like a silent DNS-over-TCP client timing out: a flood of

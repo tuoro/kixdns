@@ -250,7 +250,7 @@ impl UdpClient {
                                 if src != *expected_addr {
                                     // Address mismatch: keep entry and wait for correct response
                                     // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
-                                    tracing::warn!(
+                                    crate::warn_sparse!(
                                         socket_idx = idx,
                                         response_id = id,
                                         expected_addr = %expected_addr,
@@ -264,7 +264,7 @@ impl UdpClient {
                                     // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致，
                                     // 而且得是这个查询的应答（见 `answers_query`）；保留条目继续
                                     // 等待真正的应答。
-                                    tracing::warn!(
+                                    crate::warn_sparse!(
                                         socket_idx = idx,
                                         response_id = id,
                                         upstream = %src,
@@ -403,7 +403,7 @@ impl UdpClient {
                     new_id = rand::random();
                     attempts += 1;
                     if attempts > 100 {
-                        warn!(
+                        crate::warn_sparse!(
                             "udp pool exhausted: socket_idx={} inflight_count={}",
                             idx,
                             state.inflight.len()
@@ -1118,7 +1118,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                         Some(e.remove())
                     }
                     entry::Entry::Occupied(_) => {
-                        warn!(target = T::LOG_TARGET, upstream = %upstream, resp_id, "{} response does not answer the query, dropped", T::NAME);
+                        crate::warn_sparse!(target = T::LOG_TARGET, upstream = %upstream, resp_id, "{} response does not answer the query, dropped", T::NAME);
                         None
                     }
                     entry::Entry::Vacant(_) => {
@@ -3330,7 +3330,7 @@ impl DoqMuxClient {
                             if remaining.is_zero() {
                                 return Err(anyhow::anyhow!("doq timeout"));
                             }
-                            warn!(
+                            crate::warn_sparse!(
                                 upstream = %self.upstream,
                                 "DoQ 0-RTT timeout detected, retrying without 0-RTT"
                             );

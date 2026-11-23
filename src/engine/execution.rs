@@ -1605,7 +1605,7 @@ impl Engine {
                 pass += 1;
                 while let Decision::Jump { pipeline } = &decision {
                     if jumps_left == 0 {
-                        warn!("max jump limit reached");
+                        crate::warn_sparse!("max jump limit reached");
                         // How many jumps a request has left depends on the way it
                         // came, which no key carries, so this SERVFAIL is its own: a
                         // waiter on its held entry may have jumps to spare, so the
@@ -1921,7 +1921,7 @@ impl Engine {
                                         "flow control kept the forward from the upstream, returning SERVFAIL"
                                     );
                                 } else {
-                                    warn!(
+                                    crate::warn_sparse!(
                                         event = "continue_reforward_failed",
                                         error = %e,
                                         rule = %rule_name,

@@ -13,4 +13,5 @@ mod panel_querylog;
 pub mod panel_trace;
 pub mod proto_utils;
 pub mod socket_utils;
+pub mod sparse_log;
 pub mod watcher;

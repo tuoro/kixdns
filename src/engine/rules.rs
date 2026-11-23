@@ -578,7 +578,7 @@ async fn run_response_actions(
             } => {
                 forward_attempts += 1;
                 if forward_attempts > MAX_RESPONSE_FORWARDS {
-                    warn!(
+                    crate::warn_sparse!(
                         event = "response_action_limit",
                         qname = %ctx.qname,
                         qtype = ?ctx.qtype,
@@ -629,7 +629,7 @@ async fn run_response_actions(
                                 "flow control kept the response action forward from the upstream"
                             );
                         } else {
-                            warn!(
+                            crate::warn_sparse!(
                                 event = "response_action_failure",
                                 upstream = %upstream_addr,
                                 qname = %ctx.qname,
