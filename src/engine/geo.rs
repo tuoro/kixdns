@@ -212,13 +212,6 @@ impl GeoSources {
     }
 }
 
-/// `path` 是否 `.dat` 文件 / Whether `path` is a `.dat` file
-fn is_dat(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("dat"))
-}
-
 /// 开始监视 `paths`；装不上就只记一条告警，数据照样加载
 /// Starts watching `paths`; when the watch cannot be installed a warning is logged and the
 /// data is loaded all the same
@@ -259,10 +252,10 @@ fn load_geosite(
         if !path.exists() {
             warn!(path = %path.display(), "GeoSite data file not found, skipping");
             missing.push(path);
-        } else if is_dat(&path) && spec.tags.is_empty() {
-            // .dat 只读规则用到的标签，一个都没用到就不必读，也不必监视
-            // A .dat is read only for the tags rules use; with none used it is neither read
-            // nor watched
+        } else if spec.tags.is_empty() {
+            // 数据文件只读规则用到的标签，一个都没用到就不必读，也不必监视
+            // A data file is read only for the tags rules use; with none used it is neither
+            // read nor watched
             info!(path = %path.display(), "No GeoSite tags used in config, skipping GeoSite data loading");
         } else {
             files.push(path);

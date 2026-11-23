@@ -59,7 +59,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游最多指定毫秒数，并受 request_timeout_ms 剩余预算截断，保证过期应答来得及返回。这次刷新失败时不再等满，马上返回过期数据。 |
 | geoip_db_path | null | MaxMind MMDB 路径。 |
 | geoip_dat_path | null | V2Ray GeoIP 数据文件路径：可以是 protobuf `.dat`，也可以是下文说明的兼容 JSON。 |
-| geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。几个文件声明同一个标签时，用排在后面的文件里的。 |
+| geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。几个文件声明同一个标签时，用排在后面的文件里的。两种格式都只读规则用到的标签，规则一个都没用到时文件不读也不监控。 |
 
 geoip_auto_convert 和 geoip_filter_countries 已经退役：运行时从来不读它们，写了照样加载，只在启动和每次重载时记一条告警；转换时的国家过滤请使用 convert-geo-ip 的 --filter。顶层 background_refresh_rule 也照样能读，但不会生效：后台刷新按原请求走过的规则重放。配置里写了它，启动和每次重载时各记一条告警，配置照常加载，删掉这一项即可。
 

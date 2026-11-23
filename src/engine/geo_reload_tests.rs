@@ -277,9 +277,10 @@ async fn the_watch_reloading_json_keeps_the_tags_a_dat_file_provides() {
     )
     .unwrap();
 
-    let engine = engine(geosite_config(&[&dat, &json], "cn"));
+    let engine = engine(geosite_config_any_of(&[&dat, &json], &["cn", "ads"]));
     let manager = &engine.geosite_manager;
     assert!(manager.read().matches("cn", "www.baidu.com"));
+    assert!(manager.read().matches("ads", "before.example"));
 
     std::fs::write(
         &json,

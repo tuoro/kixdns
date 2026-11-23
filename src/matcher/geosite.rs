@@ -1132,21 +1132,53 @@ impl GeoSiteManager {
         Ok(parsed)
     }
 
-    /// 解析 JSON 格式的数据文件，不触碰管理器状态
-    /// Parse a JSON data file without touching manager state
+    /// 解析 JSON 格式的数据文件里 `tags` 点名的标签（不分大小写；不点名时每个标签都要），不触碰管理器状态。
+    /// 没点名的条目，域名原样跳过：借着文件内容（`RawValue`），不解析也不分配。一份几十万个域名的文件，
+    /// 只为规则用到的几个标签建匹配器。以前每个标签都解析、都建匹配器，规则用不到的也一直占着内存
+    /// Parse the `tags` a JSON data file names (ignoring case; every tag when none is named)
+    /// without touching manager state. An entry not named has its domains skipped as they are,
+    /// borrowed from the file's content (`RawValue`), neither parsed nor allocated: a file of
+    /// hundreds of thousands of domains builds matchers only for the few tags rules use. Every
+    /// tag used to be parsed and given matchers, those no rule uses holding memory all along
     ///
     /// 与 [`Self::parse_dat_file_selective`] 对称，同样与 [`Self::apply_source`] 配合：
     /// 调用方在锁外解析，只在替换数据时短暂持写锁。
     /// The counterpart of [`Self::parse_dat_file_selective`], pairing with
     /// [`Self::apply_source`] the same way: callers parse outside the lock and
     /// hold the write lock only while swapping data in.
-    pub fn parse_json_file<P: AsRef<Path>>(path: P) -> anyhow::Result<ParsedGeoSite> {
+    pub fn parse_json_file<P: AsRef<Path>>(
+        path: P,
+        tags: &[String],
+    ) -> anyhow::Result<ParsedGeoSite> {
+        #[derive(Deserialize)]
+        struct Entry<'a> {
+            tag: String,
+            #[serde(borrow)]
+            domains: &'a serde_json::value::RawValue,
+        }
+        #[derive(Deserialize)]
+        struct List<'a> {
+            #[serde(borrow)]
+            entries: Vec<Entry<'a>>,
+        }
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("read geosite file: {}", path.display()))?;
-        let v2ray_data: V2RayGeoSiteList =
+        let list: List<'_> =
             serde_json::from_str(&content).with_context(|| "parse V2Ray GeoSite JSON format")?;
-        Ok(Self::convert_v2ray_to_entries(v2ray_data)
+        let entries = list
+            .entries
+            .into_iter()
+            .filter(|entry| tags.is_empty() || is_one_of(&entry.tag, tags))
+            .map(|entry| {
+                Ok(V2RayGeoSite {
+                    domains: serde_json::from_str(entry.domains.get())?,
+                    tag: entry.tag,
+                })
+            })
+            .collect::<serde_json::Result<_>>()
+            .with_context(|| "parse V2Ray GeoSite JSON format")?;
+        Ok(Self::convert_v2ray_to_entries(V2RayGeoSiteList { entries })
             .into_iter()
             .map(|entry| {
                 let normalized = entry.normalized();
@@ -1159,13 +1191,11 @@ impl GeoSiteManager {
     /// Parse a data file with the parser its extension selects, without
     /// touching manager state
     ///
-    /// `.dat` 走 V2Ray 二进制解析器，其余按 JSON 读。`tags` 只对 `.dat` 有意义
-    /// （二进制格式可以只解出需要的 tag）；JSON 一次读完整份，由调用方挑选。
+    /// `.dat` 走 V2Ray 二进制解析器，其余按 JSON 读；两种都只解出 `tags` 点名的标签，不点名时每个都解。
     /// 格式分派集中在这里：登记进 `sources` 的文件后续会被 `apply_source` 和
     /// `reload_tags_from` 再次读取，三处必须用同一套判定，否则会拿错解析器。
-    /// `.dat` uses the V2Ray binary parser and anything else is read as JSON.
-    /// `tags` only means something for `.dat`, where the binary format allows
-    /// decoding just the wanted tags; JSON is read whole and the caller picks.
+    /// `.dat` uses the V2Ray binary parser and anything else is read as JSON; both
+    /// decode just the tags `tags` names, or every tag when it names none.
     /// Keeping the dispatch in one place matters because a file registered in
     /// `sources` is read again later by `apply_source` and `reload_tags_from`,
     /// and all of them have to agree on which parser a path needs.
@@ -1176,7 +1206,7 @@ impl GeoSiteManager {
             .and_then(|s| s.to_str())
             .is_some_and(|s| s.eq_ignore_ascii_case("dat"));
         if !is_dat {
-            return Self::parse_json_file(path);
+            return Self::parse_json_file(path, tags);
         }
         if tags.is_empty() {
             Self::parse_dat_file_every_tag(path)
@@ -2910,9 +2940,36 @@ mod tests {
         let path = dir.path().join("geosite.json");
         std::fs::write(&path, V2RAY_JSON_ENTRIES).unwrap();
         let mut from_file = GeoSiteManager::new();
-        let parsed = GeoSiteManager::parse_json_file(&path).unwrap();
+        let parsed = GeoSiteManager::parse_json_file(&path, &[]).unwrap();
         from_file.apply_source(&path, parsed);
         assert_v2ray_json_entries(&from_file);
+    }
+
+    /// JSON 数据文件和 .dat 一样只解出点名的标签，不分大小写：没点名的条目连域名都不解，写坏了也不碍事。
+    /// 以前每个标签都解析、都建匹配器
+    /// A JSON data file, like a .dat, decodes only the tags named, ignoring case: an entry not
+    /// named does not have even its domains parsed, so a broken one does no harm. Every tag
+    /// used to be parsed and given matchers
+    #[test]
+    fn a_json_file_decodes_only_the_tags_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geosite.json");
+        std::fs::write(
+            &path,
+            r#"{"entries":[
+                {"tag":"ADS","domains":["domain:ads.example"]},
+                {"tag":"unused","domains":5},
+                {"tag":"cn","domains":["full:baidu.com"]}
+            ]}"#,
+        )
+        .unwrap();
+        let parsed = GeoSiteManager::parse_file(&path, &["ads".to_string()]).unwrap();
+        let tags: Vec<&str> = parsed.iter().map(|(tag, _)| tag.as_str()).collect();
+        assert_eq!(tags, ["ads"]);
+        assert!(
+            GeoSiteManager::parse_file(&path, &[]).is_err(),
+            "every tag wanted, the broken one is parsed too"
+        );
     }
 
     /// 前缀不认识、没有值或正则无效的条目跳过，其余照常加载；空值不会让整个分类匹配一切。
@@ -2977,7 +3034,7 @@ mod tests {
         let path = dir.path().join("geosite.json");
         std::fs::write(&path, json).unwrap();
         let mut from_file = GeoSiteManager::new();
-        let parsed = GeoSiteManager::parse_json_file(&path).unwrap();
+        let parsed = GeoSiteManager::parse_json_file(&path, &[]).unwrap();
         from_file.apply_source(&path, parsed);
         for manager in [&from_string, &from_file] {
             assert!(manager.matches("ads", "ads.example"));
@@ -3202,7 +3259,7 @@ mod tests {
         ] }] });
         let path = dir.path().join("geosite.json");
         std::fs::write(&path, json.to_string()).unwrap();
-        let parsed = GeoSiteManager::parse_json_file(&path).unwrap();
+        let parsed = GeoSiteManager::parse_json_file(&path, &[]).unwrap();
         check(&parsed[0].1);
     }
 
