@@ -483,8 +483,6 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         // cache. The last two do nothing at present
         geoip_db_path: _,
         geoip_dat_path: _,
-        geoip_auto_convert: _,
-        geoip_filter_countries: _,
         geosite_data_paths: _,
         enable_tcp_fallback,
         // 只在启动时读（见 `GlobalSettings::restart_pending`）：重载改了也不生效，应答不变，不让缓存换代
@@ -513,8 +511,6 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
         flow_control_enabled: _,
         // No longer have any effect (see `GlobalSettings`), so they leave the caches alone
         // 已不起作用（见 `GlobalSettings`），不让缓存换代
-        statistics_enabled: _,
-        statistics_anonymize_client_ip: _,
     } = settings;
 
     (
@@ -811,18 +807,12 @@ mod tests {
     #[test]
     fn geo_settings_leave_namespaces_to_the_geo_generation() {
         type Change = fn(&mut crate::config::GlobalSettings);
-        let changes: [(&str, Change); 5] = [
+        let changes: [(&str, Change); 3] = [
             ("geoip_db_path", |s| {
                 s.geoip_db_path = Some("/geo/a.mmdb".into())
             }),
             ("geoip_dat_path", |s| {
                 s.geoip_dat_path = Some("/geo/a.dat".into())
-            }),
-            ("geoip_auto_convert", |s| {
-                s.geoip_auto_convert = !s.geoip_auto_convert
-            }),
-            ("geoip_filter_countries", |s| {
-                s.geoip_filter_countries.push("ZZ".into())
             }),
             ("geosite_data_paths", |s| {
                 s.geosite_data_paths.push("/geo/site.dat".into())
@@ -835,22 +825,6 @@ mod tests {
             change(&mut after_config.settings);
             assert_eq!(before, build_cache_namespaces(&after_config), "{name}");
         }
-    }
-
-    /// 统计的两个设置已不起作用，改它们不让缓存换代
-    /// The two statistics settings no longer do anything, so changing them leaves
-    /// the caches alone
-    #[test]
-    fn panel_statistics_settings_leave_namespaces_alone() {
-        let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        let mut after_config = before_config.clone();
-        after_config.settings.statistics_enabled = true;
-        after_config.settings.statistics_anonymize_client_ip = true;
-        let before = build_cache_namespaces(&before_config);
-        let after = build_cache_namespaces(&after_config);
-
-        assert_eq!(before.get("first"), after.get("first"));
-        assert_eq!(before.get("second"), after.get("second"));
     }
 
     #[test]
