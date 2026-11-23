@@ -252,3 +252,82 @@ async fn a_failure_counts_only_against_the_answer_that_failed() {
     assert_eq!(ask_and_settle(&engine).await, Some(NEW), "stale again");
     assert_eq!(up.queries(), 4, "the new answer was refreshed");
 }
+
+/// 快速路径给出的一次过期应答：应答 ID、第一条记录的地址和 TTL；交给异步路径的为 None
+/// A stale answer the fast path gave: the reply's ID, its first record's address and TTL; None
+/// when it was left to the async path
+fn stale_on_the_fast_path(engine: &Engine) -> Option<(u16, Ipv4Addr, u32)> {
+    match engine
+        .handle_packet_fast(&query(), peer())
+        .expect("the fast path reads it")
+    {
+        Some(crate::engine::FastPathResponse::Direct(reply)) => {
+            let address = first_a(&reply).expect("an A record");
+            let reply = Message::from_vec(&reply).expect("a whole reply");
+            Some((reply.metadata.id, address, reply.answers[0].ttl))
+        }
+        Some(crate::engine::FastPathResponse::AsyncNeeded(_)) => None,
+        _ => panic!("a stale answer is given on the spot or left to the async path"),
+    }
+}
+
+/// 现在就能交出的过期应答由快速路径当场交出、发起一次刷新，不交给异步路径：过载时异步路径收不下，手上这份能用的
+/// 应答就成了 SERVFAIL。开着 `serve_stale_client_timeout_ms` 时先等上游，快速路径交给异步路径、自己不发起刷新；
+/// 刷新刚失败过以后不用再等，快速路径当场交出，也不再刷新
+/// A stale answer that may go out now is given on the spot by the fast path, with one refresh
+/// started, instead of being left to the async path: under overload the async path takes no
+/// more, and the usable answer in hand turned into SERVFAIL. With
+/// `serve_stale_client_timeout_ms` the upstream comes first, so the fast path leaves it to the
+/// async path and starts no refresh of its own; once a refresh has just failed there is no
+/// more waiting, and the fast path gives it on the spot without refreshing again
+#[tokio::test]
+async fn the_fast_path_serves_a_stale_answer_that_needs_no_wait() {
+    for wait in [false, true] {
+        let state = Arc::new(AtomicU8::new(ANSWERS_OLD));
+        let up = scripted(state.clone()).await;
+        let kinds = Arc::<StaleKinds>::default();
+        let settings = if wait {
+            json!({ "serve_stale_ttl": 7, "serve_stale_client_timeout_ms": 300 })
+        } else {
+            json!({ "serve_stale_ttl": 7 })
+        };
+        let engine = engine(&up, settings, kinds.clone());
+        assert_eq!(ask_and_settle(&engine).await, Some(OLD));
+        state.store(FAILS, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+        let stale = Some((0x8282, OLD, 7));
+        if wait {
+            assert_eq!(
+                stale_on_the_fast_path(&engine),
+                None,
+                "the upstream comes first"
+            );
+            assert!(
+                engine.refreshing.is_empty(),
+                "the async path starts the refresh"
+            );
+            assert!(kinds.0.lock().is_empty());
+            assert_eq!(
+                ask_and_settle(&engine).await,
+                Some(OLD),
+                "the failed refresh"
+            );
+            assert_eq!(up.queries(), 2);
+            assert_eq!(stale_on_the_fast_path(&engine), stale, "no more waiting");
+            assert!(engine.refreshing.is_empty(), "no refresh again at once");
+            assert_eq!(
+                *kinds.0.lock(),
+                [
+                    CacheHitKind::StaleUpstreamFailure,
+                    CacheHitKind::StaleUpstreamFailure
+                ]
+            );
+        } else {
+            assert_eq!(stale_on_the_fast_path(&engine), stale);
+            refreshes_done(&engine).await;
+            assert_eq!(up.queries(), 2, "one refresh started");
+            assert_eq!(*kinds.0.lock(), [CacheHitKind::Stale]);
+        }
+    }
+}
