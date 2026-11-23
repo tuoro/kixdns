@@ -5,6 +5,7 @@ pub mod doh_server;
 pub mod ecs;
 pub mod ecs_scope;
 pub mod engine;
+pub mod listeners;
 pub mod matcher;
 pub mod observe;
 pub mod panel;
