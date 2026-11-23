@@ -76,9 +76,9 @@ impl GeoIpSpec {
 /// 按一份 spec 加载的数据从哪来、谁在监视 / Where the data loaded for a spec came from, and what watches it
 struct Loaded<S> {
     spec: S,
-    /// 配置了、加载时却还不存在的文件：没有监视，再次热重载时它们出现了就重新加载
-    /// Configured files that did not exist when loading: they are not watched, and a later
-    /// hot reload loads again once they appear
+    /// 配置了、加载时却不存在或读不了的文件：没有监视，再次热重载时它们在了就重新加载
+    /// Configured files that were missing or could not be read when loading: they are not
+    /// watched, and a later hot reload loads again once they are there
     missing: Vec<PathBuf>,
     watch: Option<FileWatch>,
 }
@@ -384,16 +384,14 @@ fn load_geoip(
     rotation: &Rotation,
 ) -> Loaded<GeoIpSpec> {
     let mut missing = Vec::new();
+    let mut fresh = GeoIpManager::default();
+    // 读不了的 MMDB 等下次重载再读，告警 use_mmdb 自己记 / An MMDB that cannot be read waits for a
+    // later reload, use_mmdb logging the warning itself
     if let Some(db_path) = &spec.db_path
-        && !Path::new(db_path).exists()
+        && !fresh.use_mmdb(db_path, &shared.read())
     {
-        // GeoIpManager::new 自己记告警 / GeoIpManager::new logs the warning itself
         missing.push(PathBuf::from(db_path));
     }
-    let mut fresh = GeoIpManager::new(spec.db_path.clone()).unwrap_or_else(|e| {
-        warn!(error = %e, "Failed to initialize GeoIpManager, running without GeoIP support");
-        GeoIpManager::new(None).expect("GeoIpManager::new(None) should always succeed")
-    });
 
     // MMDB 加载上了，国家代码就只查它（见 GeoIpManager::matches_any_tag），数据文件只读其余的标签
     // With an MMDB loaded country codes are looked up there alone (see
