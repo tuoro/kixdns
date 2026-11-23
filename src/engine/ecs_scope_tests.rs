@@ -722,6 +722,35 @@ async fn a_response_action_forward_sends_its_own_ecs() {
     );
 }
 
+/// 回答动作里的转发按客户端地址发 ECS 时，两台不同网段的客户端同时问，各自拿到按自己网段取回的应答：等着合并的键里
+/// 算上了它。以前只算规则自己的转发，后来的那台合并进先来的那台，拿到别人网段的应答
+/// With a forward among the answer actions sending ECS by the client's address, two clients in
+/// different networks asking at once each get the answer fetched for their own network: the
+/// key requests merge under counts it. Only the rule's own forward used to count, and the later
+/// client merged into the earlier one, getting the other network's answer
+#[tokio::test]
+async fn a_response_action_forwarding_by_client_address_keeps_waiting_requests_apart() {
+    let checked = upstream_with(
+        Echo::Nothing,
+        ResponseCode::NoError,
+        300,
+        Duration::from_millis(150),
+    )
+    .await;
+    let second = upstream(Echo::Scope(24)).await;
+    let engine = engine(serde_json::json!([{ "id": "main", "rules": [{
+        "name": "check", "matchers": [{ "type": "any" }],
+        "actions": [forward_to(&checked.address, None)],
+        "response_matchers": [{ "type": "upstream_equals", "value": checked.address }],
+        "response_actions_on_match": [forward_to(&second.address, from_client_ip())]
+    }] }]));
+    assert_eq!(
+        ask_at_once(&engine, ("198.51.100.7", None), ("203.0.113.9", None)).await,
+        [v4("198.51.100.0"), v4("203.0.113.0")]
+    );
+    assert_eq!(second.queries(), 2);
+}
+
 /// 后台刷新带着触发它的客户端的 ECS 重放请求，不同子网的条目各自刷新。
 /// A background refresh replays the request with the ECS of the client that
 /// triggered it, and entries for different subnets refresh on their own.
