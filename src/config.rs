@@ -1008,7 +1008,7 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
         parse_config(&raw).with_context(|| format!("parse config file: {}", path.display()))?;
 
     if let Some(version) = cfg.version.as_ref() {
-        info!(target = "config", version = %version, "config loaded");
+        info!(version = %version, "config loaded");
     }
 
     Ok((cfg, raw))

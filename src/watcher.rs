@@ -57,14 +57,14 @@ impl ConfigWatch {
                 match loaded {
                     Ok((new_cfg, raw)) => {
                         engine.reload_from(new_cfg, path, &raw);
-                        info!(target = "watcher", path = %path.display(), "config reloaded");
+                        info!(path = %path.display(), "config reloaded");
                     }
                     // 默认日志级别是 error：记成 warn 的话，没开面板时重载失败谁也看不到
                     // The default log level is error: logged as a warn, a failed reload would go
                     // unseen without the panel
                     Err(err) => {
                         let error = format!("{err:#}");
-                        error!(target = "watcher", path = %path.display(), error = %error, "config reload failed, keeping current state");
+                        error!(path = %path.display(), error = %error, "config reload failed, keeping current state");
                         engine.notify_config_reload_failed(path, &error);
                     }
                 }
@@ -121,7 +121,7 @@ impl PendingWatch {
             .iter()
             .map(|target| target.configured.as_path())
             .collect();
-        info!(target = "watcher", name, files = ?files, "file watcher started (watching parent directories for atomic replacement support)");
+        info!(name, files = ?files, "file watcher started (watching parent directories for atomic replacement support)");
         let thread = thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
@@ -259,7 +259,7 @@ impl Targets {
         let points = match watch_points(&self.files[index].configured) {
             Ok(points) => points,
             Err(err) => {
-                warn!(target = "watcher", path = %self.files[index].configured.display(), error = %err, "cannot resolve the watched file again");
+                warn!(path = %self.files[index].configured.display(), error = %err, "cannot resolve the watched file again");
                 return;
             }
         };
@@ -267,7 +267,7 @@ impl Targets {
         // so a directory both use is never dropped
         for dir in points.iter().filter_map(|point| point.parent()) {
             if let Err(err) = self.add_dir(watcher, dir) {
-                warn!(target = "watcher", dir = %dir.display(), error = %err, "cannot watch a directory the file now resolves through");
+                warn!(dir = %dir.display(), error = %err, "cannot watch a directory the file now resolves through");
             }
         }
         let old = std::mem::replace(&mut self.files[index].points, points);
@@ -455,7 +455,7 @@ fn pump(
                 }
             }
             Ok(Message::Event(Err(err))) => {
-                warn!(target = "watcher", error = %err, "watcher event error");
+                warn!(error = %err, "watcher event error");
             }
             // 只有一阵改动在等时才会超时 / Only a burst being waited for times out
             Err(RecvTimeoutError::Timeout) => {

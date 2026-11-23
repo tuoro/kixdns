@@ -429,7 +429,7 @@ impl Engine {
         // What takes effect all the same yet is worth knowing (see `config::warnings`), each
         // logged every time a configuration takes effect
         for warning in &state.pipeline.warnings {
-            tracing::warn!(target = "config", %warning, "configuration warning");
+            tracing::warn!(%warning, "configuration warning");
         }
         if let Some(observer) = &self.observer {
             let config = &state.pipeline;

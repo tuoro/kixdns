@@ -478,7 +478,7 @@ async fn run_dns_server(
     let _config_watch = watch
         .and_then(|watch| watch.start(engine.clone()))
         .inspect_err(|err| {
-            error!(target = "watcher", path = %config.display(), error = %err, "cannot watch the config file, changes to it are not reloaded");
+            error!(path = %config.display(), error = %err, "cannot watch the config file, changes to it are not reloaded");
             if let Some(metrics) = &panel_metrics {
                 metrics.config_not_watched(err.to_string());
             }
@@ -494,17 +494,14 @@ async fn run_dns_server(
         let engine = engine.clone();
         all_handles.push(tokio::spawn(async move {
             if let Err(err) = kixdns::panel::serve_admin(path, engine, panel_metrics).await {
-                error!(target = "panel", error = %err, "panel control socket exited");
+                error!(error = %err, "panel control socket exited");
             }
         }));
     }
 
     #[cfg(not(unix))]
     if admin_socket.is_some() {
-        tracing::warn!(
-            target = "panel",
-            "admin-socket is not supported on this platform"
-        );
+        tracing::warn!("admin-socket is not supported on this platform");
     }
 
     // 流控按设备分时要认出和内核在同一个网段上的 IPv6 主机（见 `fair_queue::note_local_networks`）：隔一阵看一次本机网卡的

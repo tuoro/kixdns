@@ -539,11 +539,7 @@ impl GeoIpManager {
                         ipv6_count += 1;
                     }
                     len => {
-                        tracing::debug!(
-                            target = "geoip",
-                            len,
-                            "skipping CIDR with unsupported IP length"
-                        );
+                        tracing::debug!(len, "skipping a GeoIP CIDR with an unsupported IP length");
                     }
                 }
             }
@@ -639,7 +635,7 @@ impl GeoIpManager {
             .collect();
         if !missing.is_empty() {
             missing.sort_unstable();
-            tracing::warn!(target = "geoip", path = %path.display(), tags = ?missing, "GeoIP tags used by rules are not in the data file and never match");
+            tracing::warn!(path = %path.display(), tags = ?missing, "GeoIP tags used by rules are not in the data file and never match");
         }
         Ok(parsed)
     }
