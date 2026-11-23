@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config;
 use crate::engine::Engine;
@@ -28,32 +28,48 @@ const QUIET: Duration = Duration::from_millis(300);
 /// at most this long from its first event: a file written to without end is still read
 const AT_MOST: Duration = Duration::from_secs(2);
 
-pub fn spawn(path: PathBuf, engine: Engine) {
-    // 使用阻塞线程持有watcher，避免异步生命周期问题。 / Use blocking thread to hold watcher, avoiding async lifetime issues.
-    thread::spawn(move || {
-        let result = run_files_watcher(std::slice::from_ref(&path), || {
-            // 启动时只记警告的那些写法，重载时拒绝（见 config::compile）
-            // What startup only warns about, a reload refuses (see config::compile)
-            let loaded = config::load_config_with_source(&path).and_then(|(cfg, raw)| {
-                config::warn_ignored_settings(&cfg);
-                config::compile(cfg).map(|cfg| (cfg, raw))
-            });
-            match loaded {
-                Ok((new_cfg, raw)) => {
-                    engine.reload_from(new_cfg, &path, &raw);
-                    info!(target = "watcher", path = %path.display(), "config reloaded");
+/// 主配置文件的监视，读配置之前装好（见 `PendingWatch`）：读的时候文件又改了，这次改动排着队，[`ConfigWatch::start`]
+/// 以后照样重载。以前读完配置、建好引擎才装监视，这中间的改动就丢了，内核一直用着旧配置，等下一次改动才跟上
+/// The watch on the main configuration file, installed before the configuration is read (see
+/// `PendingWatch`): a change made while it is read waits in line and is still reloaded after
+/// [`ConfigWatch::start`]. The watch used to go in only once the configuration was read and the
+/// engine built, and a change in between was lost, the kernel keeping the old configuration
+/// until the next change
+pub struct ConfigWatch(PendingWatch);
+
+impl ConfigWatch {
+    /// 开始监视配置文件 `path`，在读它之前调用 / Starts watching the configuration file `path`;
+    /// call it before reading the file
+    pub fn new(path: &Path) -> notify::Result<Self> {
+        PendingWatch::new(&[path.to_path_buf()]).map(Self)
+    }
+
+    /// 配置文件每改一次（开始之前排着的也算）就照着它重载 `engine`，直到返回的 [`FileWatch`] 被丢掉
+    /// Reloads `engine` from the configuration file on every change to it (those queued before
+    /// the start included), until the returned [`FileWatch`] is dropped
+    pub fn start(self, engine: Engine) -> notify::Result<FileWatch> {
+        self.0
+            .start("config-watcher", move |path| {
+                // 启动时只记警告的那些写法，重载时拒绝（见 config::compile）
+                // What startup only warns about, a reload refuses (see config::compile)
+                let loaded = config::load_config_with_source(path).and_then(|(cfg, raw)| {
+                    config::warn_ignored_settings(&cfg);
+                    config::compile(cfg).map(|cfg| (cfg, raw))
+                });
+                match loaded {
+                    Ok((new_cfg, raw)) => {
+                        engine.reload_from(new_cfg, path, &raw);
+                        info!(target = "watcher", path = %path.display(), "config reloaded");
+                    }
+                    Err(err) => {
+                        let error = format!("{err:#}");
+                        warn!(target = "watcher", path = %path.display(), error = %error, "config reload failed, keeping current state");
+                        engine.notify_config_reload_failed(path, &error);
+                    }
                 }
-                Err(err) => {
-                    let error = format!("{err:#}");
-                    warn!(target = "watcher", path = %path.display(), error = %error, "config reload failed, keeping current state");
-                    engine.notify_config_reload_failed(&path, &error);
-                }
-            }
-        });
-        if let Err(err) = result {
-            error!(target = "watcher", error = %err, "config watcher exited with error");
-        }
-    });
+            })
+            .map_err(notify::Error::io)
+    }
 }
 
 /// Watch the given files and invoke `on_change` whenever any of them is created
@@ -144,7 +160,7 @@ impl PendingWatch {
 /// 不会再被调用。
 /// A file watch running on a thread of its own. Dropping it stops the thread and waits for it
 /// to end: a change being handled is finished first, and the callback is not called again.
-pub(crate) struct FileWatch {
+pub struct FileWatch {
     stop: Sender<Message>,
     thread: Option<JoinHandle<()>>,
 }

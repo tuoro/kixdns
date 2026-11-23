@@ -130,6 +130,12 @@ struct ActiveConfig {
     /// default log level being error, so they are reported over the control channel; a
     /// successful reload means the new configuration has none, and they are cleared
     problems: Vec<String>,
+    /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None。监视不了时文件改了不会重载，面板保存的配置
+    /// 也不生效，等不到重载序号变
+    /// Why the configuration file cannot be watched (see `watcher::ConfigWatch`), None while
+    /// it is. Without the watch a change to the file is not reloaded, nor is a save from the
+    /// panel applied, its reload sequence never moving on
+    watch_error: Option<String>,
 }
 
 /// 一个线程记下的一格 / What one thread has counted in a bucket
@@ -1048,6 +1054,7 @@ impl PanelMetrics {
             },
             "restart_pending": active.restart_pending,
             "problems": active.problems,
+            "watch_error": active.watch_error,
         })
     }
 
@@ -1055,6 +1062,12 @@ impl PanelMetrics {
     /// has these problems (see `ActiveConfig::problems`)
     pub fn startup_problems(&self, problems: Vec<String>) {
         self.active_config.write().problems = problems;
+    }
+
+    /// 配置文件监视不了，因为 `error`（见 `ActiveConfig::watch_error`）/ The configuration file
+    /// cannot be watched, because of `error` (see `ActiveConfig::watch_error`)
+    pub fn config_not_watched(&self, error: String) {
+        self.active_config.write().watch_error = Some(error);
     }
 
     #[cfg(unix)]
@@ -4850,6 +4863,35 @@ mod diagnostic_tests {
 
         engine.reload(runtime_for(fixed));
         assert_eq!(metrics.config_json()["problems"], serde_json::json!([]));
+    }
+
+    /// 控制通道的 config 报出配置文件为什么监视不了：那时改配置文件、面板保存都不会生效。监视着时为 null；这是进程的事，
+    /// 重载不清掉
+    /// The control channel's config tells why the configuration file cannot be watched: changes
+    /// to the file and saves from the panel then take no effect. It is null while the file is
+    /// watched; being the process's affair, a reload does not clear it
+    #[tokio::test]
+    async fn config_reports_why_the_configuration_file_is_not_watched() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "rest", "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "static_ip_response", "ip": "10.0.0.2" }]
+            }] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw.clone(), Arc::clone(&metrics));
+        assert_eq!(
+            metrics.config_json()["watch_error"],
+            serde_json::Value::Null
+        );
+
+        metrics.config_not_watched("too many open files".to_owned());
+        engine.reload(runtime_for(raw));
+        assert_eq!(
+            metrics.config_json()["watch_error"],
+            serde_json::json!("too many open files")
+        );
     }
 
     /// 诊断回复里有一条回答写着这个地址 / Some answer in the diagnostic reply names this address
