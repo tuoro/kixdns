@@ -7,7 +7,11 @@
 
 use prost::Message;
 
-/// GeoIPList:V2Ray .dat 顶层结构,`repeated GeoIP entry = 1`
+/// GeoIPList:V2Ray .dat 顶层结构,`repeated GeoIP entry = 1`。运行时按条目读（见
+/// `GeoIpManager::parse_dat_file`），只有测试拿它写 .dat
+/// GeoIPList: the top level of a V2Ray .dat, `repeated GeoIP entry = 1`. The runtime reads
+/// entry by entry (see `GeoIpManager::parse_dat_file`); only tests write a .dat with it
+#[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 pub struct GeoIPList {
     #[prost(message, repeated, tag = "1")]

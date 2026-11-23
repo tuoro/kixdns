@@ -52,6 +52,8 @@ GeoIP 转换选项：
 -f, --filter <CODES>            逗号分隔的国家代码，例如 CN,US,JP
 ~~~
 
+转换和运行时读数据文件是同一套解析：地址里的主机位清掉，超过位宽的前缀按单个地址算，同一个国家的网段合并。输入也可以是 V2Ray 的 JSON 数据文件（扩展名不是 `.dat` 就按 JSON 读）。MMDB 里一个地址只有一个国家，所以只转两个字母的国家代码；PRIVATE、CLOUDFLARE 这类标签和国家的网段重叠，不转，运行时由 geoip_dat_path 指向的数据文件直接匹配。--filter 里写了这类标签会报错。
+
 Unix 构建会为 UDP worker 创建独立 socket，并使用平台提供的 reuse-port 能力；非 Unix 构建使用由多个 worker 共享的 UDP socket。这是实现细节，不代表固定吞吐承诺。
 
 ## 日志和响应统计

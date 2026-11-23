@@ -1,18 +1,34 @@
-//! GeoIP .dat to MMDB converter
+//! GeoIP 数据文件（V2Ray .dat 或 JSON）转成 MaxMind MMDB 国家库
 //!
-//! 将 V2Ray GeoIP .dat 文件转换为 MaxMind MMDB 格式
-//! Convert V2Ray GeoIP .dat files to MaxMind MMDB format
+//! 解析和运行时读数据文件是同一份（见 `GeoIpManager::parse_matching`）：地址里的主机位清掉，超过位宽的
+//! 前缀按单个地址算，同一个国家的网段合并以后拆成恰好盖住它们的最少的 CIDR。只转两个字母的国家代码：MMDB
+//! 里一个地址只有一个国家，运行时也只有这样的标签查 MMDB（见 `is_country_tag`）。PRIVATE、CLOUDFLARE 这类
+//! 标签和国家的网段重叠，以前也照样写进去，盖掉了那些地址原来的国家，`geoip:us` 就匹配不上 Cloudflare 的
+//! 地址；这类标签运行时直接从数据文件里匹配。
+//!
+//! Converts a GeoIP data file (V2Ray .dat or JSON) into a MaxMind MMDB country database.
+//!
+//! It is parsed exactly as the runtime reads the data file (see
+//! `GeoIpManager::parse_matching`): host bits in an address are cleared, a prefix wider than
+//! the address is one address, and a country's networks are merged and then cut into the
+//! fewest CIDRs covering exactly them. Only two-letter country codes are converted: an MMDB
+//! holds one country per address, and only such tags are looked up in an MMDB at runtime
+//! (see `is_country_tag`). Tags like PRIVATE or CLOUDFLARE overlap countries' networks; they
+//! used to be written all the same, overwriting those addresses' countries, so `geoip:us`
+//! stopped matching Cloudflare's addresses. Such tags are matched from the data file itself
+//! at runtime.
 
 use anyhow::{Context, Result};
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::IpNet;
 use maxminddb_writer::paths::IpAddrWithMask;
-use prost::Message;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashSet as HashSet;
 use serde::Serialize;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 use tracing::info;
+
+use super::geoip::{GeoIpManager, ParsedGeoIp, is_country_tag};
 
 /// MMDB 输出数据结构
 /// MMDB output data structure
@@ -51,234 +67,109 @@ impl std::fmt::Display for ConversionStats {
     }
 }
 
-/// GeoIP 转换器
-/// GeoIP converter
-pub struct GeoIpConverter {
-    country_to_nets: HashMap<String, Vec<IpNet>>,
+/// 把 `source` 里的国家转成 MMDB 写到 `output`；`filter` 给了（不空）就只转这几个国家（两个字母的代码，不分
+/// 大小写），写了别的标签是错误
+/// Converts the countries of `source` into an MMDB written to `output`; with a `filter`
+/// (not empty) only those countries are converted (two-letter codes, ignoring case), any
+/// other tag in it being an error
+pub fn convert_dat_to_mmdb(
+    source: &Path,
+    output: &Path,
+    filter: Option<&[String]>,
+) -> Result<ConversionStats> {
+    info!(
+        "Starting conversion: {} -> {}",
+        source.display(),
+        output.display()
+    );
+    let filter: Option<HashSet<String>> = filter
+        .filter(|codes| !codes.is_empty())
+        .map(|codes| codes.iter().map(|code| code.to_ascii_uppercase()).collect());
+    if let Some(tag) = filter.iter().flatten().find(|code| !is_country_tag(code)) {
+        anyhow::bail!(
+            "{tag} is not a two-letter country code: an MMDB holds countries only, and other \
+             tags are matched from the data file itself (geoip_dat_path)"
+        );
+    }
+    let wanted = |code: &str| {
+        is_country_tag(code) && filter.as_ref().is_none_or(|filter| filter.contains(code))
+    };
+    let parsed = GeoIpManager::parse_matching(source, &wanted)?;
+    let stats = write_mmdb(&parsed, source, output)?;
+    info!("Conversion completed:\n{}", stats);
+    Ok(stats)
 }
 
-impl GeoIpConverter {
-    pub fn new() -> Self {
-        Self {
-            country_to_nets: HashMap::default(),
+/// 把 `parsed` 的国家写成 MMDB / Writes the countries of `parsed` as an MMDB
+fn write_mmdb(parsed: &ParsedGeoIp, source: &Path, output: &Path) -> Result<ConversionStats> {
+    use maxminddb_writer::{Database, metadata::IpVersion};
+    use std::io::Write;
+
+    let mut db = Database::default();
+
+    // 标准字段：libmaxminddb 要求 binary_format_major_version 与 build_epoch 非零，
+    // 否则报 "Is this a valid MaxMind DB file?"
+    // Standard fields: libmaxminddb needs binary_format_major_version and build_epoch
+    // non-zero, or it reports "Is this a valid MaxMind DB file?"
+    db.metadata.database_type = "KixDNS GeoIP".to_string();
+    db.metadata.description.insert(
+        "en".to_string(),
+        "GeoIP database converted from V2Ray .dat format".to_string(),
+    );
+    db.metadata.ip_version = IpVersion::V6;
+    db.metadata.binary_format_major_version = 2;
+    db.metadata.binary_format_minor_version = 0;
+    db.metadata.build_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1);
+    db.metadata.languages = vec!["en".to_string()];
+
+    let (mut ipv4_count, mut ipv6_count) = (0, 0);
+    // 收集所有插入项后按前缀升序插入（父网段先插），规避 maxminddb-writer 的 NodeTree::insert 先子后父
+    // 覆盖丢失子网的 bug
+    // Everything is collected and inserted by ascending prefix (parents first), working round
+    // maxminddb-writer's NodeTree::insert losing a child inserted before its parent
+    let mut inserts = Vec::new();
+    for (country, networks) in parsed.networks_by_tag() {
+        let data = MmdbCountryData {
+            country: MmdbCountry {
+                iso_code: country.to_string(),
+            },
+        };
+        let data_ref = db
+            .insert_value(&data)
+            .with_context(|| format!("Failed to insert data for country: {country}"))?;
+        for net in networks {
+            match net {
+                IpNet::V4(_) => ipv4_count += 1,
+                IpNet::V6(_) => ipv6_count += 1,
+            }
+            let path = ip_net_to_mmdb_path(&net);
+            inserts.push((path.mask, data_ref, path));
         }
     }
-
-    /// 从 V2Ray .dat 文件加载
-    /// Load from V2Ray .dat file
-    pub fn load_from_dat_file(&mut self, path: &Path) -> Result<usize> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("Failed to read .dat file: {}", path.display()))?;
-
-        // 使用 Google 标准 protobuf 库 (prost) 解析，与 dae pkg/geodata 对齐
-        let list = super::geoip_proto::GeoIPList::decode(data.as_slice())
-            .context("Failed to decode .dat file as protobuf GeoIPList")?;
-
-        let mut count = 0;
-        for entry in list.entry {
-            let country_code = entry.country_code.to_uppercase();
-            let mut cidr_list = Vec::new();
-            for cidr in entry.cidr {
-                match cidr.ip.len() {
-                    4 => {
-                        let ipv4 =
-                            std::net::Ipv4Addr::new(cidr.ip[0], cidr.ip[1], cidr.ip[2], cidr.ip[3]);
-                        if let Ok(net) = Ipv4Net::new(ipv4, cidr.prefix as u8) {
-                            cidr_list.push(IpNet::V4(net));
-                        }
-                    }
-                    16 => {
-                        let mut ipv6_bytes = [0u8; 16];
-                        ipv6_bytes.copy_from_slice(&cidr.ip);
-                        let ipv6 = std::net::Ipv6Addr::from(ipv6_bytes);
-                        if let Ok(net) = Ipv6Net::new(ipv6, cidr.prefix as u8) {
-                            cidr_list.push(IpNet::V6(net));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if !country_code.is_empty() && !cidr_list.is_empty() {
-                let entry_count = cidr_list.len();
-                self.country_to_nets
-                    .entry(country_code)
-                    .or_default()
-                    .extend(cidr_list);
-                count += entry_count;
-            }
-        }
-
-        info!(
-            "Loaded {} CIDR entries for {} countries from .dat file",
-            count,
-            self.country_to_nets.len()
-        );
-
-        Ok(count)
-    }
-    pub fn load_from_v2ray_file(&mut self, path: &Path) -> Result<usize> {
-        let data = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read JSON file: {}", path.display()))?;
-
-        let list: super::geoip::V2RayGeoIPList =
-            serde_json::from_str(&data).context("Failed to parse V2Ray GeoIP JSON")?;
-
-        let mut count = 0;
-
-        for geoip in list.entries {
-            // 国家代码一律大写，和 .dat 一样，过滤条件才认得 / Country codes in capitals, as
-            // for .dat, so that the filter knows them
-            let country_code = geoip.country_code.to_uppercase();
-            if country_code.is_empty() {
-                continue;
-            }
-            for ip_str in &geoip.ips {
-                if let Ok(net) = ip_str.parse::<IpNet>() {
-                    self.country_to_nets
-                        .entry(country_code.clone())
-                        .or_default()
-                        .push(net);
-                    count += 1;
-                }
-            }
-        }
-
-        info!(
-            "Loaded {} CIDR entries for {} countries from JSON file",
-            count,
-            self.country_to_nets.len()
-        );
-
-        Ok(count)
+    inserts.sort_by_key(|(mask, _, _)| *mask);
+    for (_, data_ref, path) in inserts {
+        db.insert_node(path, data_ref);
     }
 
-    /// 合并重叠或相邻的 CIDR
-    /// Merge overlapping or adjacent CIDRs
-    pub fn merge_cidrs(&mut self) {
-        for nets in self.country_to_nets.values_mut() {
-            // Separate IPv4 and IPv6
-            let mut ipv4_nets: Vec<Ipv4Net> = Vec::new();
-            let mut ipv6_nets: Vec<Ipv6Net> = Vec::new();
+    let file = File::create(output)
+        .with_context(|| format!("Failed to create output file: {}", output.display()))?;
+    let mut writer = BufWriter::new(file);
+    db.write_to(&mut writer)
+        .context("Failed to write MMDB database")?;
+    writer.flush().context("Failed to flush output")?;
 
-            for net in nets.drain(..) {
-                match net {
-                    IpNet::V4(v4) => ipv4_nets.push(v4),
-                    IpNet::V6(v6) => ipv6_nets.push(v6),
-                }
-            }
-
-            // 两族各自排序、合并 / Sort and merge each family
-            ipv4_nets = merge_ipv4_nets(ipv4_nets);
-            ipv6_nets = merge_ipv6_nets(ipv6_nets);
-
-            // Put back
-            for net in ipv4_nets {
-                nets.push(IpNet::V4(net));
-            }
-            for net in ipv6_nets {
-                nets.push(IpNet::V6(net));
-            }
-        }
-
-        info!("CIDR merging completed");
-    }
-
-    /// 应用国家代码过滤
-    /// Apply country code filter
-    pub fn filter_countries(&mut self, filter: &[String]) {
-        let filter_set: HashSet<String> = filter.iter().map(|s| s.to_uppercase()).collect();
-
-        self.country_to_nets
-            .retain(|country, _| filter_set.contains(country));
-
-        info!(
-            "After filtering: {} countries remain",
-            self.country_to_nets.len()
-        );
-    }
-
-    /// 写入 MMDB 文件
-    /// Write to MMDB file
-    pub fn write_mmdb(&self, source_path: &Path, output_path: &Path) -> Result<ConversionStats> {
-        use maxminddb_writer::{Database, metadata::IpVersion};
-        use std::io::Write;
-
-        let mut db = Database::default();
-
-        // Set metadata
-        // 标准字段：libmaxminddb 要求 binary_format_major_version 与 build_epoch 非零，
-        // 否则报 "Is this a valid MaxMind DB file?"
-        db.metadata.database_type = "KixDNS GeoIP".to_string();
-        db.metadata.description.insert(
-            "en".to_string(),
-            "GeoIP database converted from V2Ray .dat format".to_string(),
-        );
-        db.metadata.ip_version = IpVersion::V6;
-        db.metadata.binary_format_major_version = 2;
-        db.metadata.binary_format_minor_version = 0;
-        db.metadata.build_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(1);
-        db.metadata.languages = vec!["en".to_string()];
-
-        let mut ipv4_count = 0;
-        let mut ipv6_count = 0;
-
-        // 收集所有插入项后统一排序插入：按 prefix 升序（父网段先插），
-        // 规避 maxminddb-writer 的 NodeTree::insert 先子后父覆盖丢失子网的 bug
-        let mut inserts = Vec::new();
-        for (country_code, nets) in &self.country_to_nets {
-            let country_data = MmdbCountryData {
-                country: MmdbCountry {
-                    iso_code: country_code.clone(),
-                },
-            };
-
-            let data_ref = db
-                .insert_value(&country_data)
-                .with_context(|| format!("Failed to insert data for country: {}", country_code))?;
-
-            for net in nets {
-                let path = ip_net_to_mmdb_path(net);
-                inserts.push((path.mask, data_ref, path));
-                match net {
-                    IpNet::V4(_) => ipv4_count += 1,
-                    IpNet::V6(_) => ipv6_count += 1,
-                }
-            }
-        }
-
-        inserts.sort_by_key(|(mask, _, _)| *mask);
-        for (_, data_ref, path) in inserts {
-            db.insert_node(path, data_ref);
-        }
-
-        // Write to file
-        let file = File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
-        let mut writer = BufWriter::new(file);
-        db.write_to(&mut writer)
-            .context("Failed to write MMDB database")?;
-        writer.flush().context("Failed to flush output")?;
-
-        // Get file sizes
-        let source_size = std::fs::metadata(source_path).map(|m| m.len()).unwrap_or(0);
-        let output_size = std::fs::metadata(output_path)
+    Ok(ConversionStats {
+        source_file_size: std::fs::metadata(source).map(|m| m.len()).unwrap_or(0),
+        output_file_size: std::fs::metadata(output)
             .map(|m| m.len())
-            .with_context(|| {
-                format!("Failed to get output file size: {}", output_path.display())
-            })?;
-
-        Ok(ConversionStats {
-            source_file_size: source_size,
-            output_file_size: output_size,
-            countries_count: self.country_to_nets.len(),
-            ipv4_ranges_count: ipv4_count,
-            ipv6_ranges_count: ipv6_count,
-        })
-    }
+            .with_context(|| format!("Failed to get output file size: {}", output.display()))?,
+        countries_count: parsed.tag_count(),
+        ipv4_ranges_count: ipv4_count,
+        ipv6_ranges_count: ipv6_count,
+    })
 }
 
 /// 将 IP 网段转换为 MMDB 插入路径
@@ -288,354 +179,145 @@ impl GeoIpConverter {
 /// reader（Rust / libmaxminddb / Python）查询 IPv4 时都从树第 96 位（::/96
 /// 子树根）开始。maxminddb-writer 0.1.1 本身不处理嵌入，直接插树根会导致
 /// IPv4 网段全部落空。
+/// IPv4 has to be embedded in `::/96` (IPv6 addresses whose first 96 bits are zero), as
+/// every maxminddb reader (Rust, libmaxminddb, Python) looks IPv4 up from bit 96 of the tree,
+/// the root of the `::/96` subtree. maxminddb-writer 0.1.1 does no embedding itself, and
+/// inserted at the root the IPv4 networks would all be missed.
 fn ip_net_to_mmdb_path(net: &IpNet) -> IpAddrWithMask {
     match net {
-        IpNet::V4(v4) => {
-            let o = v4.addr().octets();
-            let ipv6 = std::net::Ipv6Addr::new(
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                ((o[0] as u16) << 8) | o[1] as u16,
-                ((o[2] as u16) << 8) | o[3] as u16,
-            );
-            IpAddrWithMask::new(std::net::IpAddr::V6(ipv6), v4.prefix_len() + 96)
-        }
+        IpNet::V4(v4) => IpAddrWithMask::new(
+            std::net::IpAddr::V6(v4.addr().to_ipv6_compatible()),
+            v4.prefix_len() + 96,
+        ),
         IpNet::V6(v6) => IpAddrWithMask::new(std::net::IpAddr::V6(v6.addr()), v6.prefix_len()),
     }
-}
-
-impl Default for GeoIpConverter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// IPv4、IPv6 各一份的网段合并，除了类型逐字相同
-/// Network merging, one copy for IPv4 and one for IPv6, word for word the same but for
-/// the types
-macro_rules! net_merging {
-    ($merge:ident, $try_merge:ident, $net:ty, $addr:ty, $bits:ty, $width:expr) => {
-        /// 合并网段
-        /// Merge networks
-        ///
-        /// 标准 CIDR 精确合并：完全包含取大者；同前缀的兄弟子网（低半 + 高半）
-        /// 合并为父网络；否则保持独立。合并后回退与已合并的前一个网络再尝试
-        /// 合并（链式），确保 4 个连续 /24 → /22。
-        fn $merge(mut nets: Vec<$net>) -> Vec<$net> {
-            nets.sort();
-
-            let mut merged: Vec<$net> = Vec::new();
-            for net in nets {
-                let mut current = net;
-                loop {
-                    if let Some(last) = merged.last() {
-                        if last.contains(&current.addr()) && last.contains(&current.broadcast()) {
-                            // current 完全被 last 覆盖，丢弃
-                            break;
-                        }
-                        if current.contains(&last.addr()) && current.contains(&last.broadcast()) {
-                            // last 完全被 current 覆盖，替换 last 后继续尝试与更前的合并
-                            merged.pop();
-                            continue;
-                        }
-                        if let Some(combined) = $try_merge(last, &current) {
-                            merged.pop();
-                            current = combined;
-                            continue;
-                        }
-                    }
-                    merged.push(current);
-                    break;
-                }
-            }
-            merged
-        }
-
-        /// 尝试将两个网络精确合并为父网络
-        /// Try to merge two networks into their parent network
-        ///
-        /// 仅当 `a` 是父网络的下半子网、`b` 是其相邻的高半兄弟子网时才可合并，
-        /// 合并结果恰好等于两者的并集（不会多覆盖地址）。返回 `None` 表示不可合并。
-        fn $try_merge(a: &$net, b: &$net) -> Option<$net> {
-            if a.prefix_len() != b.prefix_len() || a.prefix_len() == 0 {
-                return None;
-            }
-            let shift = $width - a.prefix_len();
-            let a_addr = <$bits>::from(a.addr());
-            let b_addr = <$bits>::from(b.addr());
-            if (a_addr & (1 << shift)) == 0 && b_addr == (a_addr | (1 << shift)) {
-                <$net>::new(<$addr>::from(a_addr & !(1 << shift)), a.prefix_len() - 1).ok()
-            } else {
-                None
-            }
-        }
-    };
-}
-
-net_merging!(
-    merge_ipv4_nets,
-    try_merge_ipv4,
-    Ipv4Net,
-    std::net::Ipv4Addr,
-    u32,
-    32
-);
-net_merging!(
-    merge_ipv6_nets,
-    try_merge_ipv6,
-    Ipv6Net,
-    std::net::Ipv6Addr,
-    u128,
-    128
-);
-
-/// 转换 .dat 为 MMDB 格式
-/// Convert .dat to MMDB format
-///
-/// # 参数 / Parameters
-/// - `dat_path`: V2Ray .dat 文件路径 / V2Ray .dat file path
-/// - `mmdb_path`: 输出 MMDB 文件路径 / Output MMDB file path
-/// - `filter`: 可选的国家代码过滤列表 / Optional country code filter list
-///
-/// # 返回 / Returns
-/// 转换统计信息 / Conversion statistics
-pub fn convert_dat_to_mmdb(
-    dat_path: &Path,
-    mmdb_path: &Path,
-    filter: Option<&[String]>,
-) -> Result<ConversionStats> {
-    info!(
-        "Starting conversion: {} -> {}",
-        dat_path.display(),
-        mmdb_path.display()
-    );
-
-    let mut converter = GeoIpConverter::new();
-
-    // Detect file type and load
-    let is_dat = dat_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.eq_ignore_ascii_case("dat"))
-        .unwrap_or(false);
-
-    if is_dat {
-        converter.load_from_dat_file(dat_path)?;
-    } else {
-        converter.load_from_v2ray_file(dat_path)?;
-    }
-
-    // Apply filter if provided
-    if let Some(filter) = filter
-        && !filter.is_empty()
-    {
-        info!("Applying country filter: {:?}", filter);
-        converter.filter_countries(filter);
-    }
-
-    // Merge CIDRs
-    converter.merge_cidrs();
-
-    // Write MMDB
-    let stats = converter.write_mmdb(dat_path, mmdb_path)?;
-
-    info!("Conversion completed:\n{}", stats);
-
-    Ok(stats)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matcher::geoip_proto::{Cidr, GeoIP, GeoIPList};
+    use prost::Message;
+    use serde::Deserialize;
 
-    fn v4net(s: &str) -> Ipv4Net {
-        s.parse().unwrap()
+    #[derive(Deserialize, Debug)]
+    struct CountryRec {
+        country: Option<CountryIso>,
     }
-    fn v6net(s: &str) -> Ipv6Net {
-        s.parse().unwrap()
+    #[derive(Deserialize, Debug)]
+    struct CountryIso {
+        iso_code: Option<String>,
     }
 
-    /// 网段不论原来什么顺序，合并结果都一样：乱序给出的兄弟子网照样合并，被包含的照样丢掉；
-    /// 经 `merge_cidrs` 也一样
-    /// Networks merge the same whatever their order: siblings given out of order still
-    /// merge and a contained one is still dropped; through `merge_cidrs` as well
+    fn cidr(ip: &str, prefix: u32) -> Cidr {
+        let ip = match ip.parse::<std::net::IpAddr>().unwrap() {
+            std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+            std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+        };
+        Cidr { ip, prefix }
+    }
+
+    /// 写一个 .dat：每项是一个标签和它的网段 / Writes a .dat, each entry a tag and its networks
+    fn dat(dir: &Path, entries: Vec<(&str, Vec<Cidr>)>) -> std::path::PathBuf {
+        let list = GeoIPList {
+            entry: entries
+                .into_iter()
+                .map(|(code, cidr)| GeoIP {
+                    country_code: code.to_string(),
+                    cidr,
+                })
+                .collect(),
+        };
+        let path = dir.join("geoip.dat");
+        std::fs::write(&path, list.encode_to_vec()).unwrap();
+        path
+    }
+
+    fn country_of(reader: &maxminddb::Reader<Vec<u8>>, ip: &str) -> Option<String> {
+        reader
+            .lookup(ip.parse().unwrap())
+            .unwrap()
+            .decode::<CountryRec>()
+            .unwrap()
+            .and_then(|rec| rec.country?.iso_code)
+    }
+
+    /// 转出来的 MMDB 和运行时读数据文件一样：主机位清掉，超过位宽的前缀按单个地址算，同一个国家的网段合并；
+    /// 只有国家，和国家重叠的 CLOUDFLARE、PRIVATE 这类标签不写进去，不盖掉那些地址的国家。以前前缀照
+    /// `as u8` 截断（280 成了 24），标签照样写进去
+    /// The MMDB converted reads as the runtime reads the data file: host bits cleared, a
+    /// prefix wider than the address one address, a country's networks merged; countries
+    /// only, tags like CLOUDFLARE and PRIVATE overlapping them left out rather than
+    /// overwriting those addresses' countries. Prefixes used to be cut `as u8` (280 becoming
+    /// 24), and the tags written all the same
     #[test]
-    fn nets_merge_the_same_whatever_their_order() {
-        let merged = merge_ipv4_nets(vec![
-            v4net("1.2.3.0/24"),
-            v4net("1.2.2.128/25"),
-            v4net("1.2.2.0/24"),
-        ]);
-        assert_eq!(merged, [v4net("1.2.2.0/23")]);
-        let merged = merge_ipv6_nets(vec![v6net("2001:db8:8000::/33"), v6net("2001:db8::/33")]);
-        assert_eq!(merged, [v6net("2001:db8::/32")]);
-
-        let mut converter = GeoIpConverter::new();
-        converter.country_to_nets.insert(
-            "CN".to_string(),
+    fn an_mmdb_holds_the_countries_as_the_runtime_reads_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dat(
+            dir.path(),
             vec![
-                IpNet::V4(v4net("1.2.3.0/24")),
-                IpNet::V6(v6net("2001:db8:8000::/33")),
-                IpNet::V4(v4net("1.2.2.0/24")),
-                IpNet::V6(v6net("2001:db8::/33")),
+                (
+                    "cn",
+                    vec![
+                        cidr("1.2.3.4", 24),
+                        cidr("1.2.2.0", 24),
+                        cidr("5.6.7.8", 280),
+                    ],
+                ),
+                ("US", vec![cidr("2001:db8::", 32), cidr("104.16.0.0", 12)]),
+                ("CLOUDFLARE", vec![cidr("104.16.0.0", 13)]),
+                ("PRIVATE", vec![cidr("10.0.0.0", 8)]),
             ],
         );
-        converter.merge_cidrs();
-        assert_eq!(
-            converter.country_to_nets["CN"],
-            [
-                IpNet::V4(v4net("1.2.2.0/23")),
-                IpNet::V6(v6net("2001:db8::/32"))
-            ]
-        );
-    }
+        let output = dir.path().join("out.mmdb");
+        let stats = convert_dat_to_mmdb(&source, &output, None).unwrap();
+        assert_eq!(stats.countries_count, 2, "CN and US");
+        // CN 的两个 /24 合成一个 /23，5.6.7.8 是单个地址 / CN's two /24s merge into a /23, 5.6.7.8 is one address
+        assert_eq!((stats.ipv4_ranges_count, stats.ipv6_ranges_count), (3, 1));
 
-    #[test]
-    fn test_merge_ipv4_siblings_into_parent() {
-        // 兄弟子网:1.2.2.0/24 + 1.2.3.0/24 → 1.2.2.0/23（精确合并，不多覆盖）
-        let a = v4net("1.2.2.0/24");
-        let b = v4net("1.2.3.0/24");
-        assert_eq!(try_merge_ipv4(&a, &b).unwrap().to_string(), "1.2.2.0/23");
-    }
-
-    #[test]
-    fn test_merge_ipv4_non_sibling_adjacent_not_merged() {
-        // 相邻但非兄弟:1.2.3.0/24 + 1.2.4.0/24 不能合并
-        // （并集 1.2.3.0-1.2.4.255 无法用单个网络精确表达，合并会多覆盖
-        //   1.2.0.0-1.2.2.255 与 1.2.5.0-1.2.7.255——即旧实现产出的 1.2.0.0/21）
-        let nets = vec![v4net("1.2.3.0/24"), v4net("1.2.4.0/24")];
-        let merged = merge_ipv4_nets(nets);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].to_string(), "1.2.3.0/24");
-        assert_eq!(merged[1].to_string(), "1.2.4.0/24");
-    }
-
-    #[test]
-    fn test_merge_ipv4_overlap_keeps_larger() {
-        // 完全包含:1.2.3.0/24 + 1.2.3.128/25 → 保留较大的 1.2.3.0/24
-        let nets = vec![v4net("1.2.3.0/24"), v4net("1.2.3.128/25")];
-        let merged = merge_ipv4_nets(nets);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].to_string(), "1.2.3.0/24");
-    }
-
-    #[test]
-    fn test_merge_ipv6_halves_correct() {
-        // 兄弟子网:2001:db8::/33 + 2001:db8:8000::/33 → 2001:db8::/32
-        let a = v6net("2001:db8::/33");
-        let b = v6net("2001:db8:8000::/33");
-        assert_eq!(try_merge_ipv6(&a, &b).unwrap().to_string(), "2001:db8::/32");
-    }
-
-    #[test]
-    fn test_merge_ipv4_nets_chain() {
-        // 四个连续 /24 → 链式合并成一个 /22 网络
-        let nets = vec![
-            v4net("10.0.0.0/24"),
-            v4net("10.0.1.0/24"),
-            v4net("10.0.2.0/24"),
-            v4net("10.0.3.0/24"),
-        ];
-        let merged = merge_ipv4_nets(nets);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].to_string(), "10.0.0.0/22");
-    }
-
-    #[test]
-    fn test_merge_ipv4_issue40_no_over_merge() {
-        // issue #40 场景:相邻 /24 序列，只有能精确合并的才合并。
-        // 1.2.2.0/24 + 1.2.3.0/24 → 1.2.2.0/23；1.2.3.0/24 与 1.2.4.0/24 不合并
-        let nets = vec![
-            v4net("1.2.2.0/24"),
-            v4net("1.2.3.0/24"),
-            v4net("1.2.4.0/24"),
-        ];
-        let merged = merge_ipv4_nets(nets);
-        let strs: Vec<String> = merged.iter().map(|n| n.to_string()).collect();
-        assert_eq!(strs, vec!["1.2.2.0/23", "1.2.4.0/24"]);
-    }
-
-    #[test]
-    fn test_mmdb_roundtrip_ipv4_ipv6() {
-        use serde::Deserialize;
-
-        #[derive(Deserialize, Debug)]
-        struct CountryRec {
-            country: Option<CountryIso>,
-        }
-        #[derive(Deserialize, Debug)]
-        struct CountryIso {
-            iso_code: Option<String>,
-        }
-
-        let mut converter = GeoIpConverter::new();
-        // CN: 1.2.3.0/24（IPv4）; US: 2001:db8::/32（IPv6）
-        converter
-            .country_to_nets
-            .insert("CN".to_string(), vec![IpNet::V4(v4net("1.2.3.0/24"))]);
-        converter
-            .country_to_nets
-            .insert("US".to_string(), vec![IpNet::V6(v6net("2001:db8::/32"))]);
-        converter.merge_cidrs();
-
-        let dir = std::env::temp_dir().join(format!("kixdns_mmdb_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("src.dat");
-        let out = dir.join("out.mmdb");
-        std::fs::write(&src, b"placeholder").unwrap();
-
-        let stats = converter.write_mmdb(&src, &out).unwrap();
-        assert_eq!(stats.ipv4_ranges_count, 1);
-        assert_eq!(stats.ipv6_ranges_count, 1);
-
-        let bytes = std::fs::read(&out).unwrap();
-        // 结构自校验:树区(6B/节点) + 16B separator + data + marker 不应越界
-        let marker = b"\xab\xcd\xefMaxMind.com";
-        let marker_idx = bytes
-            .windows(marker.len())
-            .rposition(|w| w == marker)
-            .expect("metadata marker not found");
-        assert!(marker_idx < bytes.len(), "metadata 越界");
-        let tree_end = bytes
-            .windows(16)
-            .position(|w| w == [0u8; 16])
-            .expect("data section separator not found");
-        assert!(tree_end < marker_idx, "树区应位于 data 之前");
-
-        let reader = maxminddb::Reader::from_source(&bytes).unwrap();
-        // metadata 标准字段（libmaxminddb 兼容）
+        let reader = maxminddb::Reader::from_source(std::fs::read(&output).unwrap()).unwrap();
         assert_eq!(reader.metadata.binary_format_major_version, 2);
-        assert!(
-            reader.metadata.build_epoch > 0,
-            "build_epoch 应为非零时间戳"
-        );
+        assert!(reader.metadata.build_epoch > 0);
         assert_eq!(reader.metadata.ip_version, 6);
+        for (ip, country) in [
+            ("1.2.3.200", Some("CN")),
+            ("1.2.2.1", Some("CN")),
+            ("5.6.7.8", Some("CN")),
+            ("5.6.7.9", None),
+            ("104.16.1.1", Some("US")),
+            ("2001:db8::1", Some("US")),
+            ("10.1.1.1", None),
+            ("9.9.9.9", None),
+        ] {
+            assert_eq!(country_of(&reader, ip).as_deref(), country, "{ip}");
+        }
+    }
 
-        // IPv4 查询应命中 CN（修复前:IPv4 未嵌入 ::/96，全部落空）
-        let rec: CountryRec = reader
-            .lookup("1.2.3.4".parse().unwrap())
-            .unwrap()
-            .decode()
-            .unwrap()
-            .expect("IPv4 range should contain country data");
-        assert_eq!(rec.country.unwrap().iso_code.as_deref(), Some("CN"));
-        // IPv6 查询应命中 US
-        let rec: CountryRec = reader
-            .lookup("2001:db8::1".parse().unwrap())
-            .unwrap()
-            .decode()
-            .unwrap()
-            .expect("IPv6 range should contain country data");
-        assert_eq!(rec.country.unwrap().iso_code.as_deref(), Some("US"));
-        // 未命中网段应返回空数据，而不是错误国家
-        let missing = reader.lookup("9.9.9.9".parse().unwrap()).unwrap();
-        assert!(!missing.has_data());
-        assert!(missing.decode::<CountryRec>().unwrap().is_none());
+    /// 只转过滤条件里的国家，不分大小写；写了不是国家的标签就报错，不转出一个没有它的库
+    /// Only the countries in the filter are converted, ignoring case; a tag in it that is no
+    /// country is an error, rather than a database without it
+    #[test]
+    fn a_filter_keeps_its_countries_and_refuses_other_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dat(
+            dir.path(),
+            vec![
+                ("CN", vec![cidr("1.2.3.0", 24)]),
+                ("US", vec![cidr("8.8.8.0", 24)]),
+            ],
+        );
+        let output = dir.path().join("out.mmdb");
+        let stats = convert_dat_to_mmdb(&source, &output, Some(&["cn".to_string()])).unwrap();
+        assert_eq!(stats.countries_count, 1);
+        let reader = maxminddb::Reader::from_source(std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(country_of(&reader, "1.2.3.4").as_deref(), Some("CN"));
+        assert_eq!(country_of(&reader, "8.8.8.8"), None);
 
-        std::fs::remove_dir_all(&dir).ok();
+        let refused = convert_dat_to_mmdb(&source, &output, Some(&["CN".into(), "private".into()]))
+            .unwrap_err();
+        assert!(
+            refused.to_string().starts_with("PRIVATE is not"),
+            "{refused}"
+        );
     }
 }
