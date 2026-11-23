@@ -724,21 +724,25 @@ impl<C> UpstreamPools<C> {
         self.pools.retain(|upstream, _| keep(upstream));
     }
 
-    /// `upstream` 的连接池，还没有就用 `clients` 建一个 / The pool for `upstream`, built from
-    /// `clients` if there is none
+    /// `upstream` 的连接池，还没有就用 `clients` 建一个。平常池已经在，只读一下：不分配键、不拿写锁，以前每个查询都分配一个
+    /// 键、拿一次分片的写锁 / The pool for `upstream`, built from `clients` if there is none.
+    /// Normally the pool is there and is only read: no key allocated and no write lock taken,
+    /// where every query used to allocate a key and take its shard's write lock
     fn get_or_create(
         &self,
         upstream: &str,
         clients: impl FnOnce(&Arc<str>) -> Vec<Arc<C>>,
     ) -> Arc<ConnectionPool<C>> {
-        let upstream_key: Arc<str> = Arc::from(upstream);
+        if let Some(pool) = self.get(upstream) {
+            return pool;
+        }
+        let upstream: Arc<str> = Arc::from(upstream);
         self.pools
-            .entry(upstream_key.clone())
-            .or_insert_with(|| Arc::new(ConnectionPool::new(clients(&upstream_key))))
+            .entry(Arc::clone(&upstream))
+            .or_insert_with(|| Arc::new(ConnectionPool::new(clients(&upstream))))
             .clone()
     }
 
-    #[cfg(test)]
     fn get(&self, upstream: &str) -> Option<Arc<ConnectionPool<C>>> {
         self.pools.get(upstream).map(|pool| Arc::clone(&pool))
     }
