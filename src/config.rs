@@ -742,9 +742,29 @@ pub struct DohListenerConfig {
     pub path: String,
 }
 
-/// `dashmap_shards` 的上限：分片太多一次就分配掉大量内存 / The most `dashmap_shards` may be: too
-/// many shards allocate a great deal of memory at once
-pub const MAX_DASHMAP_SHARDS: usize = 1024;
+/// `dashmap_shards` 的上限。每个分片启动时就占六百来字节（缓存行对齐的锁，加上容量摊到每片至少一条时的四格小表），
+/// 65536 片四十来 MB；以前没有上限时写过的 2048、4096 都在里面，以前的 1024 让它们升级以后起不来。再翻一倍就是八十来
+/// MB，同时在途的查询也用不了那么多片
+/// The most `dashmap_shards` may be. Each shard takes some six hundred bytes from startup (a
+/// cache-padded lock and a four-slot table, the capacity spread to at least one entry a
+/// shard), so 65536 shards are some forty MB; the 2048 and 4096 written before there was a
+/// limit fit, where the former 1024 kept them from starting after an upgrade. Twice as many is
+/// some eighty MB, more shards than the queries in flight together could ever use
+pub const MAX_DASHMAP_SHARDS: usize = 65_536;
+
+/// 每个连接池（`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`dot_pool_size`、`doq_pool_size`）最多多大，
+/// 默认值最大的也只有 64。UDP 池启动时就给每个地址族各开这么多 socket，两族最多 2048 个，在文档里的 systemd 服务和
+/// 面板的 OpenWrt 包设的 65536 个描述符以内；其余的池给每个上游备好这么多客户端。以前不设上限：多到开不出来的 socket，
+/// 热重载和面板保存照样收下，下次启动才起不来；大到 2^64 的数建池时分配不出内存，内核直接退出
+/// How large each connection pool (`udp_pool_size`, `tcp_pool_size`, `doh_pool_size`,
+/// `dot_pool_size`, `doq_pool_size`) may be, the largest default being 64. The UDP pool opens
+/// this many sockets per address family at startup, at most 2048 for both, within the 65536
+/// descriptors the systemd service in the docs and the panel's `OpenWrt` package allow; the
+/// other pools set up this many clients per upstream. There used to be no limit: more sockets
+/// than could be opened were accepted by a hot reload and a panel save and failed only at the
+/// next start, and a number as large as 2^64 could not be allocated as the pool was built,
+/// taking the kernel down
+pub const MAX_POOL_SIZE: usize = 1024;
 
 impl GlobalSettings {
     /// 和 `running`（进程启动时的设置）相比，改了以后要重启 KixDNS 才生效的设置名。这些设置只在启动时
@@ -920,17 +940,30 @@ impl GlobalSettings {
             anyhow::bail!("upstream_timeout_ms must be greater than 0");
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
-        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多一次就分配掉大量内存
+        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多、连接池太大，一次就要分配太多（见
+        // `MAX_DASHMAP_SHARDS`、`MAX_POOL_SIZE`）
         // Settings read only at startup are checked against what building the engine needs: a value
         // the check lets through and the build then fails on is accepted by a hot reload and a panel
         // save, and the kernel does not start at the next restart. DashMap needs more than one
-        // shard, and too many shards allocate a great deal of memory at once
+        // shard, and too many shards or too large a pool take too much at once (see
+        // `MAX_DASHMAP_SHARDS`, `MAX_POOL_SIZE`)
         let shards = self.dashmap_shards;
         if shards != 0 && !(shards.is_power_of_two() && (2..=MAX_DASHMAP_SHARDS).contains(&shards))
         {
             anyhow::bail!(
                 "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
             );
+        }
+        for (setting, size) in [
+            ("udp_pool_size", self.udp_pool_size),
+            ("tcp_pool_size", self.tcp_pool_size),
+            ("doh_pool_size", self.doh_pool_size),
+            ("dot_pool_size", self.dot_pool_size),
+            ("doq_pool_size", self.doq_pool_size),
+        ] {
+            if size > MAX_POOL_SIZE {
+                anyhow::bail!("{setting} must be at most {MAX_POOL_SIZE}, got {size}");
+            }
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
         if doq_idle > 0

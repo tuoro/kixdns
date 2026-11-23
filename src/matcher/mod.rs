@@ -1721,11 +1721,15 @@ mod tests {
     }
 
     /// 只在启动时读的设置，校验放过的值引擎一定建得起来，建不起来的校验就拒掉。以前 `dashmap_shards: 1` 能过校验、
-    /// 热重载和面板保存，到下次启动 DashMap 断言分片数大于 1，内核直接 panic；DoQ 空闲超时写得太大，启动才报错
+    /// 热重载和面板保存，到下次启动 DashMap 断言分片数大于 1，内核直接 panic；DoQ 空闲超时写得太大，启动才报错；
+    /// 连接池多大都收，UDP 池开不出那么多 socket、大到 2^64 的池分配不出内存。上限以内的分片数和连接池，引擎照样建得起来
     /// Of the settings read only at startup, a value the check lets through always builds an
     /// engine, and one that cannot is refused by the check. `dashmap_shards: 1` used to pass the
     /// check, a hot reload and a panel save, and at the next start DashMap's assertion of more
-    /// than one shard panicked the kernel; a DoQ idle timeout too large failed only at startup
+    /// than one shard panicked the kernel; a DoQ idle timeout too large failed only at startup;
+    /// a pool of any size was taken, with more UDP sockets than could be opened, or one as large
+    /// as 2^64 that could not be allocated. Shard counts and pools up to their limits still
+    /// build an engine
     #[tokio::test]
     async fn startup_only_settings_the_check_lets_through_build_an_engine() {
         let build = |settings: serde_json::Value| {
@@ -1733,8 +1737,8 @@ mod tests {
                 crate::engine::Engine::new(runtime, "test".to_string()).expect("engine builds")
             })
         };
-        use crate::config::MAX_DASHMAP_SHARDS;
-        for shards in [0usize, 2, 64, MAX_DASHMAP_SHARDS] {
+        use crate::config::{MAX_DASHMAP_SHARDS, MAX_POOL_SIZE};
+        for shards in [0usize, 2, 64, 4096, MAX_DASHMAP_SHARDS] {
             build(serde_json::json!({ "dashmap_shards": shards }))
                 .unwrap_or_else(|error| panic!("dashmap_shards {shards}: {error:#}"));
         }
@@ -1743,6 +1747,28 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("dashmap_shards {shards} must be refused"));
             assert!(refused.to_string().contains("dashmap_shards"), "{refused}");
+        }
+        let pools = [
+            "udp_pool_size",
+            "tcp_pool_size",
+            "doh_pool_size",
+            "dot_pool_size",
+            "doq_pool_size",
+        ];
+        build(serde_json::Value::Object(
+            pools
+                .iter()
+                .map(|pool| (pool.to_string(), serde_json::json!(MAX_POOL_SIZE)))
+                .collect(),
+        ))
+        .expect("every pool at its largest");
+        for pool in pools {
+            for size in [MAX_POOL_SIZE + 1, usize::MAX] {
+                let refused = build(serde_json::json!({ pool: size }))
+                    .err()
+                    .unwrap_or_else(|| panic!("{pool} {size} must be refused"));
+                assert!(refused.to_string().contains(pool), "{refused}");
+            }
         }
         build(serde_json::json!({ "doq_connection_idle_timeout_seconds": 86_400 }))
             .expect("a day of DoQ idle time");
