@@ -260,6 +260,15 @@ pub struct RuntimePipeline {
     /// with the old data are no longer valid, and the pipeline moves to a new cache namespace
     /// (see `EngineInner::at_geo`)
     pub geo_data: GeoData,
+    /// 经回答检查的跳转能到达的 pipeline（在 `RuntimePipelineConfig::pipelines` 里的下标），以及从那里再跳到的：跳过去
+    /// 拿到的应答缓存在这个 pipeline 的键下，所以它们的配置也算进这个 pipeline 的缓存命名空间（见
+    /// `engine::types::build_cache_namespaces`），它们一改，按旧配置缓存的应答就不再用
+    /// The pipelines an answer check's jump reaches (by index in `RuntimePipelineConfig::pipelines`),
+    /// and those jumped to from there: the answers got over there are cached under this
+    /// pipeline's key, so their configuration goes into this pipeline's cache namespace too (see
+    /// `engine::types::build_cache_namespaces`), and once they change, answers cached by the
+    /// old configuration are no longer used
+    pub answered_through: Vec<usize>,
 }
 
 /// 规则读的 Geo 数据 / The Geo data rules read
@@ -454,43 +463,6 @@ impl RequesterKey {
         address: None,
     };
 
-    /// The key of a request on the response-jump path. That path forwards the
-    /// packet the forward before the jump sent, with the ECS `carried` describes,
-    /// while a request that entered the pipeline otherwise sends a packet the
-    /// pipeline's own forwards prepare, so the two never share entries. How the
-    /// carried ECS was derived goes into the class (a fixed one as the subnet
-    /// itself, which then is the same for everyone); the subnet a requester sends
-    /// that way goes into the inflight part, and into the steps of the answers
-    /// cached on that path.
-    /// 响应跳转路径上的请求所用的键。跳转路径转发的是跳转前那次转发发出的包，带着
-    /// `carried` 所述的 ECS；以别的方式进入 pipeline 的请求发出的是本 pipeline 自己的转发
-    /// 准备的包，所以两者从不共用条目。携带的 ECS 怎样取得进入类别（固定的 ECS 就以子网本身
-    /// 计入，它对所有人都一样）；请求方这样发出的子网进入 inflight 部分，也进入这条路径上
-    /// 缓存的应答的步骤。
-    pub fn on_response_jump_path(self, carried: &crate::ecs_scope::ForwardEcs) -> Self {
-        let mut class = rustc_hash::FxHasher::default();
-        class.write_u8(b'J');
-        self.class.hash(&mut class);
-        match carried.source {
-            crate::ecs_scope::EcsSource::Fixed => {
-                class.write_u8(0);
-                carried.sent.hash(&mut class);
-            }
-            source => {
-                class.write_u8(1);
-                source.hash(&mut class);
-            }
-        }
-        let mut subnets = rustc_hash::FxHasher::default();
-        self.subnets.hash(&mut subnets);
-        carried.sent.hash(&mut subnets);
-        Self {
-            class: Some(class.finish()),
-            subnets: Some(subnets.finish()),
-            ..self
-        }
-    }
-
     /// The part of the response cache and rule cache keys / 响应缓存键和规则缓存键里的部分
     pub fn hash_into<H: Hasher>(&self, hasher: &mut H) {
         if let Some(class) = self.class {
@@ -680,24 +652,21 @@ fn reachable_pipelines(
 fn requester_scopes(
     reads: &[RuleReads],
     index: &FxHashMap<Arc<str>, usize>,
+    answered_through: &[Vec<usize>],
 ) -> Vec<RequesterScope> {
     (0..reads.len())
         .map(|idx| {
             let mut scope = reads[idx].matchers.clone();
             scope.extend(&reads[idx].forward_subnets);
             // After a forward, an answer check may jump, and the request runs the
-            // rules along the jump path before its waiters take the answer.
-            // Forwards there send the packet as it is (keys on that path carry
-            // its ECS, see `RequesterKey::on_response_jump_path`), so only
+            // rules along the jump path before its waiters, and the cache under this
+            // pipeline's key, take the answer. Forwards there send the packet this
+            // pipeline's forward sent as it is (its subnet counted above), so only
             // matchers count.
-            // 转发之后回答检查可能跳转，请求在等待者拿到应答之前运行跳转路径上的规则。
-            // 那里的转发原样发送包（那条路径上的键带着它的 ECS，见
-            // `RequesterKey::on_response_jump_path`），所以只有匹配器计入。
-            let targets = reads[idx]
-                .response_jumps
-                .iter()
-                .filter_map(|target| index.get(target).copied());
-            for reached in reachable_pipelines(reads, index, targets) {
+            // 转发之后回答检查可能跳转，请求运行跳转路径上的规则，之后等待者拿到应答，应答也缓存在
+            // 这个 pipeline 的键下。那里的转发原样发出这个 pipeline 的转发发出的包（它的子网上面已经
+            // 计入），所以只有匹配器计入。
+            for &reached in &answered_through[idx] {
                 scope.extend(&reads[reached].matchers);
             }
             // After an answer check continues, the request keeps its entry for the
@@ -1036,6 +1005,7 @@ impl RuntimePipelineConfig {
                 matches_regex,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 geo_data: GeoData::default(),
+                answered_through: Vec::new(),
             });
         }
 
@@ -1086,13 +1056,29 @@ impl RuntimePipelineConfig {
             .map(|(i, p)| (p.id.clone(), i))
             .collect();
 
-        for (idx, ((pipeline, scope), rule_reads)) in pipelines
+        let answered_through: Vec<Vec<usize>> = reads
+            .iter()
+            .map(|rule_reads| {
+                let targets = rule_reads
+                    .response_jumps
+                    .iter()
+                    .filter_map(|target| pipeline_id_index.get(target).copied());
+                reachable_pipelines(&reads, &pipeline_id_index, targets)
+            })
+            .collect();
+        for (idx, (((pipeline, scope), rule_reads), through)) in pipelines
             .iter_mut()
-            .zip(requester_scopes(&reads, &pipeline_id_index))
+            .zip(requester_scopes(
+                &reads,
+                &pipeline_id_index,
+                &answered_through,
+            ))
             .zip(&reads)
+            .zip(answered_through.clone())
             .enumerate()
         {
             pipeline.requester = scope;
+            pipeline.answered_through = through;
             pipeline.rule_requester = rule_reads.request_matchers.clone();
             // 跳转过去的 pipeline 的应答也缓存在这个 pipeline 的键下 / Answers of the pipelines it jumps to are
             // cached under this pipeline's keys as well

@@ -40,10 +40,26 @@ pub enum ForwardResult {
     /// Boxed to reduce enum size (ResponseContext is ~256 bytes)
     Continue {
         ctx: Box<Option<ResponseContext>>,
-        /// A miss action's continue after the upstream failed: what the later rules
-        /// answer is a fallback, as `Fallback` is
-        /// 上游失败之后 on_miss 动作的 continue：后面的规则给出的应答是兜底，和 `Fallback` 一样
-        after_failure: bool,
+        /// A miss action's continue after the upstream failed carries that failure: what
+        /// the later rules answer is a fallback, as `Fallback` is, and a refresh that ends
+        /// with no answer reports it, as it says why
+        /// 上游失败之后 on_miss 动作的 continue 带着那次失败：后面的规则给出的应答是兜底，和
+        /// `Fallback` 一样；刷新最后没拿到应答时报的就是它，它说明了原因
+        failure: Option<anyhow::Error>,
+    },
+    /// 响应动作跳到 `pipeline`：请求在那里接着走规则，转发照原样发出这次转发发出的 `packet`，它带的 ECS 是 `carried`；应答
+    /// 照旧缓存在跳转前这个 pipeline 的键下（见 `handle_packet_internal`）。这次转发登记的条目留给请求（见 `held_inflight`），
+    /// 等它拿到最终的应答再交出去。`failure` 同 `Continue`
+    /// A response action jumps to `pipeline`: the request goes on with the rules there, its
+    /// forwards sending `packet`, what this forward sent, as it is, with `carried` as its ECS;
+    /// answers are still cached under the key of this pipeline, the one jumped from (see
+    /// `handle_packet_internal`). The entry this forward registered stays with the request (see
+    /// `held_inflight`) and is handed the final answer. `failure` as for `Continue`
+    Jump {
+        pipeline: Arc<str>,
+        packet: Bytes,
+        carried: ForwardEcs,
+        failure: Option<anyhow::Error>,
     },
 }
 use hickory_proto::serialize::binary::BinDecodable;
@@ -527,7 +543,13 @@ pub struct ForwardDecisionContext<'a> {
     pub qtype: RecordType,
     pub qclass: DNSClass,
     pub tx_id: u16,
+    /// 规则所在的 pipeline / The pipeline the rule is in
     pub pipeline_id: &'a Arc<str>,
+    /// `keys` 属于哪个 pipeline，应答就缓存在它下面：就是 `pipeline_id`；响应阶段跳转以后是跳转前的那个（见
+    /// `ForwardResult::Jump`）
+    /// The pipeline `keys` belong to, under which answers are cached: `pipeline_id`, or after a
+    /// response-phase jump the one jumped from (see `ForwardResult::Jump`)
+    pub key_pipeline_id: &'a Arc<str>,
     pub rule_name: &'a str,
     pub keys: CacheKeys,
     pub min_ttl: Duration,
@@ -558,6 +580,12 @@ pub struct ForwardDecisionContext<'a> {
     pub response_actions_on_miss: &'a [Action],
     pub transport: Option<Transport>,
     pub ecs: Option<&'a crate::config::EcsMode>,
+    /// 响应阶段跳转以后才有：`packet` 是跳转前那次转发发出的，照原样发出，不再按 `ecs` 改写，它带的 ECS 是这个
+    /// Only after a response-phase jump: `packet` is what the forward before the jump sent, which
+    /// goes out as it is rather than rewritten by `ecs`, carrying this ECS
+    pub carried: Option<ForwardEcs>,
+    /// 响应动作还能跳几次 / How many more jumps the response actions may make
+    pub jumps_left: usize,
     pub allow_reuse: bool,
     pub reused_response: &'a mut Option<ResponseContext>,
     /// The inflight entry this request registered and still holds after a rule
@@ -591,6 +619,7 @@ pub(crate) async fn handle_forward_decision_logged(
         qclass,
         tx_id,
         pipeline_id,
+        key_pipeline_id,
         rule_name,
         keys,
         min_ttl,
@@ -609,6 +638,8 @@ pub(crate) async fn handle_forward_decision_logged(
         response_actions_on_miss,
         transport,
         ecs,
+        carried,
+        jumps_left,
         allow_reuse,
         reused_response,
         held_inflight,
@@ -619,19 +650,19 @@ pub(crate) async fn handle_forward_decision_logged(
     let view = requester.ecs_view();
     let question = CachedQuestion {
         qname,
-        pipeline_id,
+        pipeline_id: key_pipeline_id,
         qtype: u16::from(qtype),
         flags: keys.flags,
     };
     // What this forward sends as ECS, which decides whom its reply applies to
     // 这次转发发出的 ECS，它决定应答适用于谁
-    let forward_ecs = ForwardEcs::of(ecs, &view);
+    let forward_ecs = carried.unwrap_or_else(|| ForwardEcs::of(ecs, &view));
     // ECS request rewriting (RFC 7871): modify outgoing packet before forwarding.
     // Only runs on cache-miss path — cache hits and static responses are unaffected.
     //
     // ECS 请求改写 (RFC 7871)：在转发前修改出站包。
     // 仅在缓存未命中路径执行 — 缓存命中和静态响应不受影响。
-    let ecs_packet: std::borrow::Cow<[u8]> = match ecs {
+    let ecs_packet: std::borrow::Cow<[u8]> = match ecs.filter(|_| carried.is_none()) {
         Some(mode) => {
             let modified =
                 crate::ecs::apply_ecs_for(packet, mode, peer.ip(), requester.ecs.as_ref());
@@ -669,8 +700,8 @@ pub(crate) async fn handle_forward_decision_logged(
     // What this forward registers or waits under in the inflight map
     // 这次转发在 inflight 表里登记或等待的问题
     let inflight_question = InflightQuestion {
-        namespace: state.cache_namespace(pipeline_id),
-        pipeline_id,
+        namespace: state.cache_namespace(key_pipeline_id),
+        pipeline_id: key_pipeline_id,
         qname: qname.as_bytes(),
         qtype,
         qclass,
@@ -705,7 +736,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 Entry::Vacant(entry) => {
                     entry.insert(InflightEntry::sharing(
                         &inflight_question,
-                        pipeline_id,
+                        key_pipeline_id,
                         Arc::<[u8]>::from(Arc::clone(qname)),
                     ));
                     cleanup_guard = Some(InflightCleanupGuard::new(
@@ -900,7 +931,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 rcode,
                 upstream,
                 Arc::clone(qname),
-                Arc::clone(pipeline_id),
+                Arc::clone(key_pipeline_id),
                 u16::from(qtype),
                 keys.flags,
                 ttl,
@@ -1070,7 +1101,7 @@ pub(crate) async fn handle_forward_decision_logged(
                             qtype,
                             qclass,
                             flags: keys.flags,
-                            pipeline_id,
+                            pipeline_id: key_pipeline_id,
                             slot: keys.slot,
                             tx_id,
                             start,
@@ -1180,7 +1211,6 @@ pub(crate) async fn handle_forward_decision_logged(
             }
         };
         let default_upstream = state.pipeline.settings.default_upstream.as_str();
-        let response_jump_limit = state.pipeline.settings.response_jump_limit as usize;
 
         let ctx = rules::ApplyResponseActionsContext {
             engine,
@@ -1196,7 +1226,7 @@ pub(crate) async fn handle_forward_decision_logged(
             upstream_default: default_upstream,
             pipeline_id,
             rule_name,
-            remaining_jumps: response_jump_limit,
+            remaining_jumps: jumps_left,
             trail: Some((&mut *trail, forward_ecs)),
         };
 
@@ -1269,82 +1299,19 @@ pub(crate) async fn handle_forward_decision_logged(
                 response.upstream = Some(Arc::from("static"));
                 Ok(finished(bytes))
             }
-            ResponseActionResult::Jump {
-                pipeline,
-                remaining_jumps,
-            } => {
-                // 客户端自己的查询带不带 EDNS；`packet` 可能是转发时加过 ECS 的
-                // Whether the client's own query carries EDNS; `packet` may have had an ECS
-                // option added by the forward
-                let edns_present = requester.edns;
-
-                // 单独在堆上分配，见上 / Allocated on its own, see above
-                let resp_bytes = Box::pin(rules::process_response_jump(
-                    engine,
-                    rules::ResponseJumpContext {
-                        state,
-                        pipeline_id: pipeline,
-                        remaining_jumps,
-                        req: &req,
-                        packet,
-                        peer: *peer,
-                        qname,
-                        qtype,
-                        qclass,
-                        edns_present,
-                        client_ecs: requester.ecs,
-                        upstream_timeout,
-                        skip_cache,
-                        // The ECS the forward added travels with the packet / 转发加上的 ECS 随包带过去
-                        carried: forward_ecs,
-                        trail: &mut *trail,
-                        echo_floor,
-                        observed,
-                        held_inflight: [
-                            cleanup_guard.as_ref().map(|guard| guard.hash),
-                            held_inflight.as_ref().map(|guard| guard.hash),
-                        ],
-                    },
-                    response,
-                ))
-                .await?;
-
-                if skip_cache {
-                    match failure {
-                        // The target found no answer either: a refresh gets the upstream
-                        // failure, as in the Static arm
-                        // 目标也没拿到应答：刷新拿到的是上游的失败，同 Static 分支
-                        Some(e) => {
-                            if is_servfail(&resp_bytes) {
-                                return Err(e);
-                            }
-                        }
-                        // The target pipeline's answer is not stored under this key (it
-                        // caches under its own, if at all), so on a refresh the entry here
-                        // no longer matches the rules and is dropped (see the Static arm).
-                        // If the target found no answer, the refresh ends as a failure and
-                        // the entry stays.
-                        // 目标 pipeline 的应答不会存进这个键（要存也存在它自己的键下），所以刷新
-                        // 时这里的条目已经和规则对不上，删掉（同 Static 分支）。目标没拿到应答
-                        // 时，刷新以失败结束，条目保留。
-                        None => {
-                            if is_servfail(&resp_bytes)
-                                || proto_utils::truncated_response(&resp_bytes)
-                            {
-                                return Err(refresh_found_no_answer(
-                                    "the jump target found no answer",
-                                ));
-                            }
-                            if let Some(target) = refresh {
-                                engine.drop_refreshed(keys.slot, &question, &view, target);
-                            }
-                        }
-                    }
+            ResponseActionResult::Jump { pipeline } => {
+                // 跳过去以后的才是最终应答：条目留给请求，和 Continue 一样（见 `held_inflight`）
+                // What comes after the jump is the final answer: the entry stays with the
+                // request, as on Continue (see `held_inflight`)
+                if let Some(guard) = cleanup_guard.take() {
+                    *held_inflight = Some(guard);
                 }
-                if let Some(g) = cleanup_guard.as_mut() {
-                    g.hand_over(|| for_waiters(&resp_bytes, &requester, trail, echo_floor));
-                }
-                Ok(finished(resp_bytes))
+                Ok(ForwardResult::Jump {
+                    pipeline,
+                    packet: Bytes::copy_from_slice(packet),
+                    carried: forward_ecs,
+                    failure,
+                })
             }
             ResponseActionResult::Continue { ctx } => {
                 // The rule continued past this response, so it is not the answer: keep
@@ -1363,7 +1330,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 }
                 Ok(ForwardResult::Continue {
                     ctx: Box::new(ctx),
-                    after_failure: fallback,
+                    failure,
                 })
             }
         }
@@ -2021,16 +1988,29 @@ mod refresh_response_rule_tests {
         assert_eq!(cached, Some(vec![STATIC.parse().unwrap()]));
     }
 
+    /// 回答检查跳过去拿到的应答缓存在原来的键下，刷新就用它更新条目；拿到的应答不缓存（没有 min_ttl 的静态应答）时，
+    /// 条目删掉，下一个客户端请求自己走规则
+    /// The answer an answer check's jump gets is cached under the key it came from, and the
+    /// refresh renews the entry with it; when what it gets is not cached (a static answer with
+    /// no min_ttl), the entry goes and the next client request runs the rules itself
     #[tokio::test]
-    async fn a_refresh_drops_the_entry_when_the_answer_jumps() {
-        let cached = refresh_with_actions_on_the_answer(
-            json!({}),
-            jump_to("other"),
-            vec![],
-            static_target(),
-        )
-        .await;
-        assert_eq!(cached, None);
+    async fn a_refresh_renews_the_entry_with_what_the_jump_answers() {
+        for (settings, cached) in [
+            (
+                json!({ "min_ttl": 60 }),
+                Some(vec![STATIC.parse().unwrap()]),
+            ),
+            (json!({}), None),
+        ] {
+            let renewed = refresh_with_actions_on_the_answer(
+                settings.clone(),
+                jump_to("other"),
+                vec![],
+                static_target(),
+            )
+            .await;
+            assert_eq!(renewed, cached, "{settings}");
+        }
     }
 
     #[tokio::test]

@@ -1513,6 +1513,16 @@ impl Engine {
             // 这条路线上有没有按 EDNS 判断的 pipeline（见跳转后的缓存查找）/ Whether a pipeline on the route so far matches on EDNS (see the lookup after a jump)
             let mut route_matches_edns = pipeline_opt.is_some_and(|p| p.matches_edns);
             let mut reused_response: Option<ResponseContext> = None;
+            // 应答缓存在哪个 pipeline 的键下：请求阶段的跳转换成目标的；响应阶段跳转以后不再换，跳过去拿到的应答照旧缓存在
+            // 跳转前那个 pipeline 的键下（见 `phases::ForwardResult::Jump`）
+            // The pipeline whose key answers are cached under: a request-phase jump changes it to
+            // the target's; after a response-phase jump it changes no more, the answers got over
+            // there cached under the key of the pipeline jumped from (see
+            // `phases::ForwardResult::Jump`)
+            let mut key_pipeline_id = current_pipeline_id.clone();
+            // 响应阶段跳转以后：转发照原样发出的包，和它带的 ECS / After a response-phase jump: the
+            // packet the forwards send as it is, and the ECS it carries
+            let mut jumped: Option<(Bytes, crate::ecs_scope::ForwardEcs)> = None;
             // 求值 `pipeline` 的规则，跳过 `skip` 里的（continue 越过的那些）
             // Evaluate the rules of `pipeline`, skipping those in `skip` (the ones a continue passed)
             let evaluate = |pipeline: &crate::matcher::RuntimePipeline,
@@ -1563,11 +1573,13 @@ impl Engine {
             // This is a standard Rust RAII pattern that is safe and idiomatic.
             // 这是标准的 Rust RAII 模式，安全且符合惯用法。
 
-            // jump_count must live outside 'decision_loop so it is not reset
-            // when Forward returns Continue and we re-enter the outer loop.
-            // Without this, the response_jump_limit could be bypassed via:
-            //   Jump → Forward(Continue) → [jump_count reset to 0] → Jump → …
-            let mut jump_count = 0;
+            // 还能跳几次，在要跳的地方数：请求阶段的跳转一份，响应动作的跳转连同它之后的规则级跳转另一份（见
+            // `ForwardResult::Jump` 的分支）。放在 'decision_loop 外面，Forward 返回 Continue 再进循环时不会重置
+            // How many more jumps may be made, counted where a jump is made: the request phase's
+            // jumps have one budget, a response action's jump with the rule-level jumps after it
+            // another (see the `ForwardResult::Jump` arm). Kept outside 'decision_loop so that
+            // Forward returning Continue and the loop being entered again does not reset it
+            let mut jumps_left = response_jump_limit;
             // A refresh renews the entry `refresh` names. Once a rule has continued past an
             // answer, the outcome may be a static answer or come from a jump target, which
             // do not renew it: see the Static branch and the Success arm.
@@ -1587,20 +1599,21 @@ impl Engine {
             // continue) has no new answer from the route the entry came by: whatever
             // the later rules give is a fallback, like a miss action's own answer (see
             // `ForwardResult::Fallback`), and leaves the entry in place. The last
-            // continue decides: one past a fresh answer after that means the rules now
-            // pass over an answer they may have given before.
-            // 上游失败后规则接着往下走（on_miss 的 continue）的刷新，没有拿到条目来路上的新应答：
+            // continue or jump decides: one past a fresh answer after that means the rules
+            // now pass over an answer they may have given before. Ending with no answer, the
+            // refresh reports that failure, which says why.
+            // 上游失败后规则接着往下走（on_miss 的 continue 或跳转）的刷新，没有拿到条目来路上的新应答：
             // 后面的规则给出的都是兜底，和 on_miss 动作自己给出的应答一样（见
-            // `ForwardResult::Fallback`），不删条目。以最后一次 continue 为准：之后又越过一个
-            // 新拿到的应答，说明规则现在越过了它以前可能给出的应答。
-            let mut refresh_fell_back = false;
+            // `ForwardResult::Fallback`），不删条目。以最后一次 continue 或跳转为准：之后又越过一个
+            // 新拿到的应答，说明规则现在越过了它以前可能给出的应答。最后没拿到应答时，刷新报的就是这次
+            // 失败，它说明了原因。
+            let mut refresh_failure: Option<anyhow::Error> = None;
             // 决策循环的第几轮：第一轮在任何转发之前 / Which pass of the decision loop: the first runs before anything is forwarded
             let mut pass = 0u32;
             'decision_loop: loop {
                 pass += 1;
                 while let Decision::Jump { pipeline } = &decision {
-                    jump_count += 1;
-                    if jump_count > response_jump_limit {
+                    if jumps_left == 0 {
                         warn!("max jump limit reached");
                         // How many jumps a request has left depends on the way it
                         // came, which no key carries, so this SERVFAIL is its own: a
@@ -1614,6 +1627,7 @@ impl Engine {
                         response_log.info.upstream = Some(Arc::from("static"));
                         return servfail("parse request");
                     }
+                    jumps_left -= 1;
                     if let Some(p) = cfg.pipeline(pipeline) {
                         current_pipeline_id = p.id.clone();
                         response_log.info.pipeline = Some(current_pipeline_id.clone());
@@ -1625,77 +1639,83 @@ impl Engine {
                         // its forward and with its ECS. Handed to an allow here, it would be cached
                         // under this pipeline's key and served to requests that come here directly.
                         reused_response = None;
-                        // So do the forwards behind it: this pipeline's answers depend on its
-                        // own forwards only. What they made the answer depend on still counts
-                        // for the echo.
-                        // 它之前的转发也一样：这个 pipeline 的应答只取决于它自己的转发。它们让
-                        // 应答依赖的部分，回显时仍要算上。
-                        echo_floor = echo_floor.max(trail.echo_scope(&view));
-                        trail = EcsReach::default();
                         route_matches_edns |= p.matches_edns;
                         if let Some(observed) = &observed {
                             observed
                                 .observer
                                 .pipeline_selected(&observed.ctx, &current_pipeline_id);
                         }
-                        // The keys follow the pipeline / 键随 pipeline 改变
-                        keys = Self::cache_keys(
-                            state.cache_namespace(&current_pipeline_id),
-                            &current_pipeline_id,
-                            qname_bytes,
-                            qtype,
-                            qclass,
-                            flags,
-                            &p.requester.key(requester, Some(&self.geoip_manager)),
-                            client_ecs.as_ref(),
-                        );
-                        // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
-                        // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
-                        // 上游。以下情况不查，保持原样：
-                        // - 不在第一轮：continue 之后，请求已经越过了一个应答，后面的规则可能复用它；
-                        // - 目标的应答因「谁在问」而不同：它给别的请求方的应答不一定是给这一个的；
-                        // - 后台刷新走不回这条路线：刷新重放的请求不带 EDNS、类别固定是 IN，路线上（含
-                        //   pipeline 的选择）按 EDNS 判断，或者查询类别不是 IN 时，刷新可能走另一条路线，
-                        //   把别处的应答写进这个键，或者写进另一个键。
-                        // After a jump, look in the response cache again under the target pipeline's
-                        // key. A forwarded answer is stored under that key, while the entry lookup used
-                        // the entry pipeline's, so a request that jumped never found it and went upstream
-                        // every time. These cases do not look and keep the current behaviour:
-                        // - after the first pass: past a continue the request has passed over an answer
-                        //   that later rules may reuse;
-                        // - a target whose answer differs by who is asking: its answer to another
-                        //   requester is not necessarily its answer to this one;
-                        // - a route a background refresh cannot repeat: the refresh replays the query
-                        //   without EDNS and in class IN, so when the route (pipeline selection included)
-                        //   matches on EDNS, or the query class is not IN, it may take another route and
-                        //   write another answer under this key, or write under another key.
-                        if !skip_cache
-                            && pass == 1
-                            && !p.depends_on_requester
-                            && !route_matches_edns
-                            && qclass == DNSClass::IN
-                            && !cfg.selection_matches_edns()
-                            && let Some(resp_bytes) = self
-                                .answer_from_cache(
-                                    &phases::CacheLookupContext {
-                                        state: &state,
-                                        qname,
-                                        qtype,
-                                        qclass,
-                                        flags,
-                                        pipeline_id: &current_pipeline_id,
-                                        slot: keys.slot,
-                                        tx_id,
-                                        start,
-                                        peer: &peer,
-                                        requester,
-                                        observed: observed_ctx,
-                                    },
-                                    &mut response_log.info,
-                                )
-                                .await
-                        {
-                            return Ok(resp_bytes);
+                        // 响应阶段跳转以后，键和 trail 都留着：应答照旧缓存在跳转前那个 pipeline 的键下（见 `key_pipeline_id`）
+                        // After a response-phase jump the key and the trail stay: answers are still cached under
+                        // the key of the pipeline jumped from (see `key_pipeline_id`)
+                        if jumped.is_none() {
+                            // So do the forwards behind it: this pipeline's answers depend on its
+                            // own forwards only. What they made the answer depend on still counts
+                            // for the echo.
+                            // 它之前的转发也一样：这个 pipeline 的应答只取决于它自己的转发。它们让
+                            // 应答依赖的部分，回显时仍要算上。
+                            echo_floor = echo_floor.max(trail.echo_scope(&view));
+                            trail = EcsReach::default();
+                            key_pipeline_id = current_pipeline_id.clone();
+                            // The keys follow the pipeline / 键随 pipeline 改变
+                            keys = Self::cache_keys(
+                                state.cache_namespace(&current_pipeline_id),
+                                &current_pipeline_id,
+                                qname_bytes,
+                                qtype,
+                                qclass,
+                                flags,
+                                &p.requester.key(requester, Some(&self.geoip_manager)),
+                                client_ecs.as_ref(),
+                            );
+                            // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
+                            // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
+                            // 上游。以下情况不查，保持原样：
+                            // - 不在第一轮：continue 之后，请求已经越过了一个应答，后面的规则可能复用它；
+                            // - 目标的应答因「谁在问」而不同：它给别的请求方的应答不一定是给这一个的；
+                            // - 后台刷新走不回这条路线：刷新重放的请求不带 EDNS、类别固定是 IN，路线上（含
+                            //   pipeline 的选择）按 EDNS 判断，或者查询类别不是 IN 时，刷新可能走另一条路线，
+                            //   把别处的应答写进这个键，或者写进另一个键。
+                            // After a jump, look in the response cache again under the target pipeline's
+                            // key. A forwarded answer is stored under that key, while the entry lookup used
+                            // the entry pipeline's, so a request that jumped never found it and went upstream
+                            // every time. These cases do not look and keep the current behaviour:
+                            // - after the first pass: past a continue the request has passed over an answer
+                            //   that later rules may reuse;
+                            // - a target whose answer differs by who is asking: its answer to another
+                            //   requester is not necessarily its answer to this one;
+                            // - a route a background refresh cannot repeat: the refresh replays the query
+                            //   without EDNS and in class IN, so when the route (pipeline selection included)
+                            //   matches on EDNS, or the query class is not IN, it may take another route and
+                            //   write another answer under this key, or write under another key.
+                            if !skip_cache
+                                && pass == 1
+                                && !p.depends_on_requester
+                                && !route_matches_edns
+                                && qclass == DNSClass::IN
+                                && !cfg.selection_matches_edns()
+                                && let Some(resp_bytes) = self
+                                    .answer_from_cache(
+                                        &phases::CacheLookupContext {
+                                            state: &state,
+                                            qname,
+                                            qtype,
+                                            qclass,
+                                            flags,
+                                            pipeline_id: &current_pipeline_id,
+                                            slot: keys.slot,
+                                            tx_id,
+                                            start,
+                                            peer: &peer,
+                                            requester,
+                                            observed: observed_ctx,
+                                        },
+                                        &mut response_log.info,
+                                    )
+                                    .await
+                            {
+                                return Ok(resp_bytes);
+                            }
                         }
                         skip_rules.clear();
                         decision = evaluate(p, None);
@@ -1729,12 +1749,12 @@ impl Engine {
                         if rcode == ResponseCode::ServFail
                             && (refresh.is_some() || refresh_passed_an_answer)
                         {
-                            return Err(phases::refresh_found_no_answer(
-                                "the rules answered SERVFAIL",
-                            ));
+                            return Err(refresh_failure.take().unwrap_or_else(|| {
+                                phases::refresh_found_no_answer("the rules answered SERVFAIL")
+                            }));
                         }
                         if refresh_passed_an_answer
-                            && !refresh_fell_back
+                            && refresh_failure.is_none()
                             && let Some(target) = &refresh
                         {
                             drop_refreshed(target);
@@ -1745,7 +1765,7 @@ impl Engine {
                                 packet,
                                 qname,
                                 qtype,
-                                pipeline_id: &current_pipeline_id,
+                                pipeline_id: &key_pipeline_id,
                                 slot: keys.slot,
                                 flags,
                                 reach: &trail,
@@ -1775,12 +1795,13 @@ impl Engine {
                             self,
                             phases::ForwardDecisionContext {
                                 state: &state,
-                                packet,
+                                packet: jumped.as_ref().map_or(packet, |(packet, _)| packet),
                                 qname: qname_ref,
                                 qtype,
                                 qclass,
                                 tx_id,
                                 pipeline_id: &current_pipeline_id,
+                                key_pipeline_id: &key_pipeline_id,
                                 rule_name: &rule_name,
                                 keys,
                                 min_ttl,
@@ -1799,6 +1820,12 @@ impl Engine {
                                 response_actions_on_miss,
                                 transport,
                                 ecs: ecs.as_ref(),
+                                carried: jumped.as_ref().map(|(_, carried)| *carried),
+                                jumps_left: if jumped.is_some() {
+                                    jumps_left
+                                } else {
+                                    response_jump_limit
+                                },
                                 allow_reuse,
                                 reused_response: &mut reused_response,
                                 held_inflight: &mut held_inflight,
@@ -1825,7 +1852,7 @@ impl Engine {
                                 // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
                                 // 对不上。
                                 if refresh_passed_an_answer
-                                    && !refresh_fell_back
+                                    && refresh_failure.is_none()
                                     && let Some(target) = &refresh
                                     && keys.slot != target.slot
                                     && !phases::is_servfail(&bytes)
@@ -1836,9 +1863,9 @@ impl Engine {
                                 }
                                 return Ok(bytes);
                             }
-                            Ok(phases::ForwardResult::Continue { ctx, after_failure }) => {
+                            Ok(phases::ForwardResult::Continue { ctx, failure }) => {
                                 refresh_passed_an_answer |= skip_cache && ctx.is_some();
-                                refresh_fell_back = skip_cache && after_failure;
+                                refresh_failure = failure.filter(|_| skip_cache);
                                 reused_response = *ctx;
                                 skip_rules.extend(rule_index);
 
@@ -1851,6 +1878,24 @@ impl Engine {
                                 };
 
                                 decision = evaluate(pipeline, Some(&skip_rules));
+                                continue 'decision_loop;
+                            }
+                            Ok(phases::ForwardResult::Jump {
+                                pipeline,
+                                packet,
+                                carried,
+                                failure,
+                            }) => {
+                                // 跳过去以前那次转发的应答就是越过的那个，和 Continue 一样 / The answer of the
+                                // forward before the jump is one passed over, as on Continue
+                                refresh_passed_an_answer |= skip_cache && failure.is_none();
+                                refresh_failure = failure.filter(|_| skip_cache);
+                                // 第一次响应阶段的跳转起另算一份次数 / The first response-phase jump starts a budget of its own
+                                if jumped.is_none() {
+                                    jumps_left = response_jump_limit;
+                                }
+                                jumped = Some((packet, carried));
+                                decision = Decision::Jump { pipeline };
                                 continue 'decision_loop;
                             }
                             Err(e) => {
@@ -2278,52 +2323,74 @@ mod tests {
         RuntimePipelineConfig::from_config(config).expect("build runtime config")
     }
 
-    /// 响应跳转执行请求所用配置快照里的目标 pipeline，并且不写缓存：没有哪次查找用响应跳转
-    /// 路径的键，以前写在那里的应答从来没人读。
-    /// A response jump runs the target pipeline of the request's configuration
-    /// snapshot, and caches nothing: no lookup uses a key of the response-jump
-    /// path, and answers once written there were never read.
+    /// 响应跳转执行请求所用配置快照里的目标 pipeline，跳过去拿到的应答缓存在跳转前那个 pipeline 的键下，同样的问题
+    /// 再来就从缓存答。以前这条路径上什么都不缓存，用了回答检查跳转的配置（比如结果被污染时改问另一组上游）每次都要把
+    /// 两边的上游各问一遍。目标的配置算进入口的缓存命名空间：重载只改了目标，按旧配置缓存的应答也不再用
+    /// A response jump runs the target pipeline of the request's configuration snapshot, and
+    /// the answer got over there is cached under the key of the pipeline jumped from, the same
+    /// question coming again answered from the cache. Nothing on this path used to be cached, a
+    /// configuration with an answer check's jump (asking another upstream group when the result
+    /// is polluted, say) asking both sides' upstreams every time. The target's configuration goes
+    /// into the entry's cache namespace: with a reload changing only the target, answers cached
+    /// by the old configuration are no longer used either
     #[tokio::test]
-    async fn a_response_jump_runs_its_own_generation_and_caches_nothing() {
-        let upstream = answering_upstream(std::net::Ipv4Addr::LOCALHOST, 300)
-            .await
-            .address;
-        let engine =
-            Engine::new(jump_config(&upstream, "192.0.2.1"), "test".to_string()).expect("engine");
+    async fn a_response_jump_runs_its_own_generation_and_caches_its_answer() {
+        let upstream = answering_upstream(std::net::Ipv4Addr::LOCALHOST, 300).await;
+        let engine = Engine::new(
+            jump_config(&upstream.address, "192.0.2.1"),
+            "test".to_string(),
+        )
+        .expect("engine");
         let old_state = engine.state.load_full();
-
-        // Reload changes only the jump target, so "target" rotates its
-        // namespace while the entry pipeline stays warm.
-        engine.reload(jump_config(&upstream, "192.0.2.2"));
-
         let mut request = Message::new(0xBEEF, MessageType::Query, OpCode::Query);
         request.add_query(Query::query(
             Name::from_str("example.com").unwrap(),
             RecordType::A,
         ));
+        let request = request.to_vec().unwrap();
+        let peer: SocketAddr = "127.0.0.1:53000".parse().unwrap();
+        let answered = |response: Bytes| {
+            let response = Message::from_bytes(&response).expect("parse response");
+            match response.answers.first().map(|record| &record.data) {
+                Some(RData::A(address)) => address.0,
+                other => panic!("an A record, not {other:?}"),
+            }
+        };
+
+        // 重载只改跳转目标：入口 pipeline 的规则没变 / The reload changes only the jump target: the
+        // entry pipeline's rules stay as they were
+        engine.reload(jump_config(&upstream.address, "192.0.2.2"));
         let response = engine
-            .handle_packet_internal(
-                &request.to_vec().unwrap(),
-                "127.0.0.1:53000".parse().unwrap(),
-                false,
-                None,
-                None,
-                Some(old_state),
-            )
+            .handle_packet_internal(&request, peer, false, None, None, Some(old_state))
             .await
             .expect("complete forwarded request with response jump");
-        let response = Message::from_bytes(&response).expect("parse response");
-
         // The jump must execute the target pipeline of the request snapshot
         // (192.0.2.1), not the reloaded one (192.0.2.2).
-        assert!(matches!(
-            response.answers.first().map(|record| &record.data),
-            Some(RData::A(address)) if address.0 == "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
-        ));
+        assert_eq!(
+            answered(response),
+            "192.0.2.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
         assert_eq!(
             engine.cache.entry_count(),
-            0,
-            "nothing on the response-jump path is cached"
+            1,
+            "cached under the entry's key"
+        );
+
+        for round in ["miss", "hit"] {
+            let response = engine
+                .handle_packet(&request, peer)
+                .await
+                .expect("answered");
+            assert_eq!(
+                answered(response),
+                "192.0.2.2".parse::<std::net::Ipv4Addr>().unwrap(),
+                "{round}: the current target's answer"
+            );
+        }
+        assert_eq!(
+            upstream.queries(),
+            2,
+            "the second round came from the cache"
         );
     }
 
@@ -2671,11 +2738,12 @@ mod tests {
         }
     }
 
-    /// 响应跳转路径上也一样：两个请求从不同的 pipeline 跳进同一个 pipeline，跳转路径上的键相同时，
-    /// 后来的请求不等前一个的条目。
+    /// 响应跳转路径上也一样：两个请求从不同的 pipeline 跳进同一个 pipeline，后来的请求不拿前一个的应答，
+    /// 各自去问；同一个入口的两个请求问同一个问题时，第二个等在第一个跳转之前登记的条目上。
     /// The same on the response-jump path: two requests jump into one pipeline from different
-    /// pipelines, and when their keys on the jump path are the same the later one does not wait on
-    /// the earlier one's entry.
+    /// pipelines and the later one takes nothing of the earlier one's answer, each asking itself;
+    /// two requests of one entry pipeline asking one question, the second waits on the entry the
+    /// first registered before its jump.
     #[tokio::test]
     async fn a_request_on_the_jump_path_never_takes_another_questions_answer() {
         let pre = answering_upstream("192.0.2.10".parse().unwrap(), 300)
@@ -2742,19 +2810,21 @@ mod tests {
             );
             assert!(!steps.joined("10.0.0.2:53000"), "{action}");
 
-            // 对照：两个请求问同一个问题、时序一样，第二个挂在第一个的条目上，拿到第一个的应答，上游只问一次
-            // Control: two requests asking the same question with the same timing; the second
-            // joins the first one's entry and takes its answer, and the upstream is asked once
+            // 对照：同一个入口的两个请求问同一个问题、时序一样，第二个挂在第一个的条目上，拿到第一个跳过去以后的
+            // 应答，上游只问一次
+            // Control: two requests of one entry pipeline asking the same question with the same
+            // timing; the second joins the first one's entry and takes the answer it got after its
+            // jump, and the upstream is asked once
             let before = slow.queries();
             let [_, second] = ask_two(
                 &engine,
                 [SAME_NAME; 2],
-                ["10.0.0.1:53002", "10.0.0.2:53002"],
+                ["10.0.0.1:53002", "10.0.0.1:53003"],
             )
             .await;
             assert_eq!(answered_name(&second), format!("{SAME_NAME}."), "{action}");
             assert!(
-                steps.joined("10.0.0.2:53002"),
+                steps.joined("10.0.0.1:53003"),
                 "{action}: {:?}",
                 steps.taken()
             );
@@ -3169,11 +3239,12 @@ mod tests {
         );
     }
 
-    /// 两个请求各自经响应跳转进入同一个 pipeline，第二个等在第一个的转发上；第一个的
-    /// 规则随后 continue 越过了这个应答。等待者必须拿到最终应答，而不是被越过的那个。
-    /// Two requests each enter the same pipeline through a response jump, the second
-    /// waiting on the first's forward, whose rule then continues past the answer.
-    /// The waiter must get the final answer, not the one continued past.
+    /// 两个请求同时问，后到的等在先到的那个跳转之前登记的条目上；先到的经响应跳转进入 `shared`，那里的
+    /// 规则 continue 越过了 `checked` 的应答。等待者必须拿到最终应答，而不是被越过的那个。
+    /// Two requests ask at once, the later one waiting on the entry the earlier one registered
+    /// before its jump; the earlier one enters `shared` through a response jump, where a rule
+    /// continues past `checked`'s answer. The waiter must get the final answer, not the one
+    /// continued past.
     #[tokio::test]
     async fn a_waiter_on_a_jump_path_does_not_get_an_answer_continued_past() {
         let entry = answering_upstream("192.0.2.50".parse().unwrap(), 300)
@@ -3226,22 +3297,14 @@ mod tests {
             }]),
         )));
 
-        assert_eq!(
-            ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
-            [Some(answer); 2]
-        );
-        // 后一个请求走到 `checked` 那一步时，先到的那个在那里的转发还在等：它等在先到的那个的条目上；先到的越过了
-        // 那个应答，条目放掉以后，它才自己去问，没有挂上去拿应答
-        // When the later request got to the forward to `checked`, the earlier one's forward there
-        // still waited: it waited on the earlier one's entry, and once that one continued past the
-        // answer, letting the entry go, it asked itself rather than take an answer from it
-        let clients = ["10.0.0.1:53000", "10.0.0.2:53000"];
+        // 两个请求从同一个入口进来 / Both requests come in through one entry pipeline
+        let clients = ["10.0.0.1:53000", "10.0.0.1:53001"];
+        assert_eq!(ask_at_once(&engine, clients).await, [Some(answer); 2]);
         assert!(
-            steps.one_waited_on_the_other(&checked, clients),
+            clients.iter().any(|client| steps.joined(client)),
             "{:?}",
             steps.taken()
         );
-        assert!(!clients.iter().any(|client| steps.joined(client)));
 
         // 对照：shared 的规则不越过应答，同样两个请求，后到的挂在先到的条目上，拿到 `checked` 的应答
         // Control: the rule in shared does not continue past the answer; with the same two
@@ -3482,11 +3545,13 @@ mod tests {
 
     /// 在响应跳转路径上，跳转次数同样取决于请求一路怎么来的。经过更多跳转才到 `s` 的
     /// 请求先用完了次数（在 `s` 的回答检查要跳转时，或在之后一次规则级跳转时），它的
-    /// SERVFAIL 不能交给直接从 `p2` 跳来、还有余量的请求。
+    /// SERVFAIL 不能交给直接从 `p2` 跳来、还有余量的请求：两个请求的条目各在自己的入口，
+    /// 跳转之后谁也不等谁。
     /// On the response-jump path too, the jumps left depend on the way a request
     /// came. One that reached `s` through more jumps runs out first (when the answer
     /// check in `s` jumps, or at a rule-level hop after it), and its SERVFAIL must
-    /// not reach a request that jumped there from `p2` with jumps to spare.
+    /// not reach a request that jumped there from `p2` with jumps to spare: each keeps
+    /// its entry at its own entry pipeline, and after the jumps neither waits on the other.
     #[tokio::test]
     async fn a_jump_path_waiter_with_jumps_to_spare_does_not_take_the_jump_limit() {
         let entry = answering_upstream("192.0.2.50".parse().unwrap(), 300)
@@ -3591,31 +3656,15 @@ mod tests {
                 [None, Some(answer)],
                 "{where_it_runs_out}"
             );
-            // 第二个请求走到 `slow` 那一步时，第一个在那里的转发还在等：它等在第一个的条目上；第一个用完了跳转次数，
-            // 条目放掉以后，它才自己去问，没有挂上去拿应答
-            // When the second request got to the forward to `slow`, the first one's forward there
-            // still waited: it waited on the first one's entry, and once the first ran out of jumps,
-            // letting the entry go, it asked itself rather than take an answer from it
-            assert!(
-                steps.waited_on("10.0.0.1:53000", &slow, "10.0.0.2:53000"),
-                "{where_it_runs_out}: {:?}",
-                steps.taken()
-            );
-            assert!(!steps.joined("10.0.0.2:53000"));
+            assert!(!steps.joined("10.0.0.2:53000"), "{where_it_runs_out}");
 
-            // 对照：跳转次数用不完时，同样两个请求，第二个挂在第一个的条目上，拿到最终的应答
-            // Control: with jumps to spare, the same two requests: the second joins the first
-            // one's entry and takes the final answer
-            let (engine, steps) = engine_with_steps(roomy);
+            // 对照：跳转次数用不完时，同样两个请求都拿到最终的应答
+            // Control: with jumps to spare, the same two requests both get the final answer
+            let (engine, _) = engine_with_steps(roomy);
             assert_eq!(
                 ask_at_once(&engine, ["10.0.0.1:53000", "10.0.0.2:53000"]).await,
                 [Some(answer); 2],
                 "{where_it_runs_out}"
-            );
-            assert!(
-                steps.joined("10.0.0.2:53000"),
-                "{where_it_runs_out}: {:?}",
-                steps.taken()
             );
         }
     }

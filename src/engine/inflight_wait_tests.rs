@@ -85,31 +85,24 @@ async fn requests_an_allow_rule_forwards_wait_together() {
     assert_eq!(up.queries(), 1, "the second request waited on the first");
 }
 
-/// 两个客户端经不同的 pipeline 进来，响应跳转以后都走到同一条 `allow` 规则：第二个等第一个的
-/// 应答
-/// Two clients come in through different pipelines and, after a response jump, both
-/// reach the same `allow` rule: the second waits for the first one's answer
+/// 两个请求同时问，先到的响应跳转以后走到 `allow` 规则，问默认上游：后到的等在先到的跳转之前登记的条目上，
+/// 拿到它最后的应答
+/// Two requests at once, the earlier one reaching an `allow` rule after a response jump and
+/// asking the default upstream: the later one waits on the entry the earlier one registered
+/// before its jump and gets its final answer
 #[tokio::test]
 async fn requests_reaching_an_allow_rule_after_a_response_jump_wait_together() {
     let pre = upstream(Duration::ZERO).await;
     let last = upstream(Duration::from_millis(150)).await;
-    let entry = |id: &str| {
-        json!({ "id": id, "rules": [{
-            "name": "r", "matchers": [{ "type": "any" }],
-            "actions": [{ "type": "forward", "upstream": pre.address }],
-            "response_matchers": [{ "type": "upstream_equals", "value": pre.address }],
-            "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
-        }] })
-    };
     let engine = engine_from(json!({
         "settings": counting_settings(json!({ "default_upstream": last.address })),
-        "pipeline_select": [
-            { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-            { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-        ],
         "pipelines": [
-            entry("a"),
-            entry("b"),
+            { "id": "main", "rules": [{
+                "name": "r", "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": pre.address }],
+                "response_matchers": [{ "type": "upstream_equals", "value": pre.address }],
+                "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
+            }] },
             { "id": "other", "rules": [{
                 "name": "allow", "matchers": [{ "type": "any" }], "actions": [{ "type": "allow" }]
             }] }
@@ -119,21 +112,19 @@ async fn requests_reaching_an_allow_rule_after_a_response_jump_wait_together() {
         ask_at_once(&engine, ["10.0.0.1", "10.0.0.2"]).await,
         [Some(ANSWER), Some(ANSWER)]
     );
-    assert_eq!(pre.queries(), 2, "each entry pipeline asks on its own");
     assert_eq!(
-        last.queries(),
-        1,
-        "the second request waited on the jump path"
+        (pre.queries(), last.queries()),
+        (1, 1),
+        "the second request waited on the first"
     );
 }
 
-/// 两个客户端经不同的 pipeline 进来，响应跳转以后都在 `second` 转发给 `last`，后到的等先到的；
-/// `last` 应答以后执行响应动作 `then`。`more` 是另外的 pipeline，`settings` 盖在
-/// [`counting_settings`] 上面
-/// Two clients come in through different pipelines and, after a response jump, both
-/// forward to `last` in `second`, the later one waiting on the earlier; once `last`
-/// answers, the response actions `then` run. `more` are further pipelines, `settings`
-/// go on top of [`counting_settings`]
+/// 入口 pipeline 问 `pre`，响应跳转到 `second` 转发给 `last`，`last` 应答以后执行响应动作 `then`；同时来的请求等在先到的
+/// 那个跳转之前登记的条目上。`more` 是另外的 pipeline，`settings` 盖在 [`counting_settings`] 上面
+/// The entry pipeline asks `pre` and jumps through an answer check to `second`, which forwards
+/// to `last`, and once `last` answers the response actions `then` run; requests coming at the
+/// same time wait on the entry the earlier one registered before its jump. `more` are further
+/// pipelines, `settings` go on top of [`counting_settings`]
 fn waiting_on_the_jump_path(
     pre: &Upstream,
     last: &Upstream,
@@ -141,17 +132,13 @@ fn waiting_on_the_jump_path(
     more: serde_json::Value,
     settings: serde_json::Value,
 ) -> crate::engine::Engine {
-    let entry = |id: &str| {
-        json!({ "id": id, "rules": [{
+    let mut pipelines = vec![
+        json!({ "id": "main", "rules": [{
             "name": "r", "matchers": [{ "type": "any" }],
             "actions": [{ "type": "forward", "upstream": pre.address }],
             "response_matchers": [{ "type": "upstream_equals", "value": pre.address }],
             "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "second" }]
-        }] })
-    };
-    let mut pipelines = vec![
-        entry("a"),
-        entry("b"),
+        }] }),
         json!({ "id": "second", "rules": [{
             "name": "ask", "matchers": [{ "type": "any" }],
             "actions": [{ "type": "forward", "upstream": last.address }],
@@ -162,10 +149,6 @@ fn waiting_on_the_jump_path(
     pipelines.extend(more.as_array().unwrap().iter().cloned());
     engine_from(json!({
         "settings": counting_settings(settings),
-        "pipeline_select": [
-            { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-            { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-        ],
         "pipelines": pipelines
     }))
 }
@@ -189,7 +172,7 @@ async fn rcodes_at_once(
 /// 跳转路径上，等着的请求拿到先到的请求最后的应答，不再自己去问 `last`：响应跳转的目标不存在、
 /// 规则级跳转的目标不存在、跳转目标给出静态应答、响应动作给出静态应答，都是这样。配置检查会
 /// 拒收不存在的跳转目标，这里绕过它直接建引擎
-/// On the jump path a waiting request gets the earlier request's final answer and does
+/// After a jump a waiting request gets the earlier request's final answer and does
 /// not ask `last` itself: when the response jump's target does not exist, when a
 /// rule-level jump's target does not exist, when the jump target answers statically,
 /// and when a response action does. The configuration check refuses a missing jump
@@ -233,98 +216,19 @@ async fn waiters_on_the_jump_path_get_the_answer_it_ends_in() {
             "{case}"
         );
         assert_eq!(
-            pre.queries(),
-            2,
-            "each entry pipeline asks on its own: {case}"
-        );
-        assert_eq!(
-            last.queries(),
-            1,
-            "the second request waited on the jump path: {case}"
+            (pre.queries(), last.queries()),
+            (1, 1),
+            "the second request waited on the first: {case}"
         );
     }
 }
 
-/// 跳转路径上，等着别人的请求拿到应答以后，把它交给等着自己的请求：`a` 的请求先在 `third` 问
-/// `last`；`b`、`c` 的请求在 `second` 合并，领头的那个再跳到 `third` 等 `a` 的应答，拿到后交给
-/// 等它的那个
-/// On the jump path a request waiting on another hands the answer it gets to the
-/// requests waiting on it: the request from `a` asks `last` in `third` first; those from
-/// `b` and `c` merge in `second`, and the leading one jumps on to `third`, waits for
-/// `a`'s answer and hands it to the one waiting on it
-#[tokio::test]
-async fn a_waiter_on_the_jump_path_hands_what_it_got_to_its_own_waiters() {
-    let pre = upstream(Duration::ZERO).await;
-    let mid = upstream(Duration::from_millis(100)).await;
-    let last = upstream(Duration::from_millis(300)).await;
-    let entry = |id: &str, to: &str| {
-        json!({ "id": id, "rules": [{
-            "name": "r", "matchers": [{ "type": "any" }],
-            "actions": [{ "type": "forward", "upstream": pre.address }],
-            "response_matchers": [{ "type": "upstream_equals", "value": pre.address }],
-            "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": to }]
-        }] })
-    };
-    let engine = engine_from(json!({
-        "settings": counting_settings(json!({})),
-        "pipeline_select": [
-            { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-            { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] },
-            { "pipeline": "c", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.3/32" }] }
-        ],
-        "pipelines": [
-            entry("a", "third"),
-            entry("b", "second"),
-            entry("c", "second"),
-            { "id": "second", "rules": [{
-                "name": "ask", "matchers": [{ "type": "any" }],
-                "actions": [{ "type": "forward", "upstream": mid.address }],
-                "response_matchers": [{ "type": "upstream_equals", "value": mid.address }],
-                "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "third" }]
-            }] },
-            { "id": "third", "rules": [{
-                "name": "ask", "matchers": [{ "type": "any" }],
-                "actions": [{ "type": "forward", "upstream": last.address }]
-            }] }
-        ]
-    }));
-    let packet = query();
-    let (one, two, three) = tokio::join!(
-        support::ask(&engine, &packet, peer("10.0.0.1")),
-        support::ask(&engine, &packet, peer("10.0.0.2")),
-        support::ask(&engine, &packet, peer("10.0.0.3"))
-    );
-    assert_eq!(
-        [first_a(&one), first_a(&two), first_a(&three)],
-        [Some(ANSWER); 3]
-    );
-    assert_eq!(pre.queries(), 3, "each entry pipeline asks on its own");
-    assert_eq!(
-        mid.queries(),
-        1,
-        "the requests from `b` and `c` merged in `second`"
-    );
-    assert_eq!(
-        last.queries(),
-        1,
-        "the leader from `second` waited on `a` in `third`"
-    );
-}
-
-/// 跳转路径上转发失败（上游不应答），等着的请求拿到先到的请求给出的 SERVFAIL，不再自己去问。
-/// 跳转路径上的请求最多等上游超时的三分之一（见 `rules::process_response_jump`），所以 `b` 的
-/// 请求晚到：在 `a` 的请求失败之前的那三分之一里才到 `second`
-/// When the forward on the jump path fails (the upstream never answers), a waiting
-/// request gets the SERVFAIL the earlier request ends in and does not ask itself. A
-/// request on the jump path waits at most a third of the upstream timeout (see
-/// `rules::process_response_jump`), so the one from `b` comes late: it reaches `second`
-/// within the third before the one from `a` fails
+/// 跳转以后转发失败（上游不应答），等着的请求拿到先到的请求最后给出的 SERVFAIL，不再自己去问
+/// When the forward after the jump fails (the upstream never answers), a waiting request gets
+/// the SERVFAIL the earlier request ends in and does not ask itself
 #[tokio::test]
 async fn waiters_on_the_jump_path_get_the_failure_it_ends_in() {
     use hickory_proto::op::ResponseCode;
-    // 上游超时 900 ms：`a` 的请求两次 UDP 尝试，300 ms + 900 ms 后失败；`b` 的请求 1050 ms 时才来
-    // An upstream timeout of 900 ms: the request from `a` fails after two UDP attempts,
-    // 300 ms + 900 ms; the one from `b` only comes at 1050 ms
     let pre = upstream(Duration::ZERO).await;
     let silent = support::upstream(|_| Vec::new()).await;
     let engine = waiting_on_the_jump_path(
@@ -334,14 +238,8 @@ async fn waiters_on_the_jump_path_get_the_failure_it_ends_in() {
         json!([]),
         json!({ "upstream_timeout_ms": 900 }),
     );
-    let packet = query();
-    let (one, two) = tokio::join!(support::ask(&engine, &packet, peer("10.0.0.1")), async {
-        tokio::time::sleep(Duration::from_millis(1050)).await;
-        support::ask(&engine, &packet, peer("10.0.0.2")).await
-    });
-    for reply in [&one, &two] {
-        let message = Message::from_bytes(reply).expect("parse reply");
-        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+    for (rcode, _) in rcodes_at_once(&engine).await {
+        assert_eq!(rcode, ResponseCode::ServFail);
     }
     assert_eq!(
         silent.queries(),

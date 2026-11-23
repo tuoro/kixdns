@@ -1465,11 +1465,11 @@ async fn a_client_without_ecs_gets_no_ecs_when_records_follow_the_opt() {
     assert_eq!(reply_ecs(&fresh), None);
 }
 
-/// 两个客户端经不同的 pipeline 进来，都在响应跳转之后走到同一条路径，第二个等在第一个的条目
-/// 上：它拿到的回显同样算上跳转路径上那次 /24 的转发。
-/// Two clients come in through different pipelines and both reach the same
-/// response-jump path, the second waiting on the first's entry there: its echo
-/// counts that path's /24 forward as well.
+/// 两个客户端同时问，第二个等在第一个响应跳转之前登记的条目上：第一个跳过去拿到最终的应答再交给它，它拿到的回显同样
+/// 算上跳转路径上那次 /24 的转发。
+/// Two clients ask at once, the second waiting on the entry the first registered before its
+/// response jump: the first hands it the final answer it got over there, and its echo counts
+/// that path's /24 forward as well.
 #[tokio::test]
 async fn waiters_on_the_response_jump_path_get_the_full_echo() {
     let pre = upstream(Echo::Nothing).await;
@@ -1481,27 +1481,19 @@ async fn waiters_on_the_response_jump_path_get_the_full_echo() {
     )
     .await;
     let last = upstream(Echo::Scope(0)).await;
-    let entry = |id: &str| {
-        serde_json::json!({ "id": id, "rules": [{
-            "name": "r", "matchers": [{ "type": "any" }],
-            "actions": [forward_to(&pre.address, None)],
-            "response_matchers": [{ "type": "upstream_equals", "value": pre.address }],
-            "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
-        }] })
-    };
     let raw = serde_json::json!({
         "settings": {
             "default_upstream": "127.0.0.1:9",
             "upstream_timeout_ms": 1000,
             "enable_tcp_fallback": false
         },
-        "pipeline_select": [
-            { "pipeline": "a", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.1/32" }] },
-            { "pipeline": "b", "matchers": [{ "type": "client_ip", "cidr": "10.0.0.2/32" }] }
-        ],
         "pipelines": [
-            entry("a"),
-            entry("b"),
+            { "id": "main", "rules": [{
+                "name": "r", "matchers": [{ "type": "any" }],
+                "actions": [forward_to(&pre.address, None)],
+                "response_matchers": [{ "type": "upstream_equals", "value": pre.address }],
+                "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
+            }] },
             { "id": "other", "rules": [{
                 "name": "check", "matchers": [{ "type": "any" }],
                 "actions": [forward_to(&checked.address, None)],
@@ -1522,9 +1514,9 @@ async fn waiters_on_the_response_jump_path_get_the_full_echo() {
     .await
     .expect("answers in time");
     assert_eq!(
-        checked.queries(),
-        1,
-        "the second request waited on the jump path"
+        (pre.queries(), checked.queries()),
+        (1, 1),
+        "the second request waited on the first's entry"
     );
     for reply in [one.unwrap(), two.unwrap()] {
         assert_eq!(reply_ecs(&reply), Some((ip("198.51.100.0"), 24, 24)));
