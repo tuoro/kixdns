@@ -234,7 +234,7 @@ mod allocator_tuning {
         }
     }
 }
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kixdns::config::load_config_with_source;
@@ -418,12 +418,15 @@ async fn run_dns_server(
     // not missed (see `watcher::ConfigWatch`)
     let watch = watcher::ConfigWatch::new(&config);
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
-    // 启动时只记警告、照旧加载，升级以后已经在用的配置行为不变；重载和面板的校验会拒绝它们
-    // Startup only warns and loads as before, so a configuration in use keeps its
-    // behaviour across an upgrade; a reload and the panel's validation refuse these
+    // 启动时照旧加载，升级以后已经在用的配置行为不变；重载和面板的校验会拒绝它们。和重载拒绝时一样记 error，
+    // 默认日志级别就看得到：以前只记 warn，默认级别下谁也不知道下一次改配置会被拒
+    // Startup loads them as before, so a configuration in use keeps its behaviour across an
+    // upgrade; a reload and the panel's validation refuse them. They are logged at error, as
+    // the reload refusing them is, so the default log level shows them: they used to be a
+    // warn, and at the default level nobody learnt that the next change would be refused
     let problems = kixdns::config::problems(&cfg);
     for problem in &problems {
-        warn!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
+        error!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
     }
     let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
     // Listener addresses and DoH prerequisites, checked exactly as
@@ -454,8 +457,8 @@ async fn run_dns_server(
         .as_ref()
         .filter(|_| cfg!(unix))
         .map(|_| Arc::new(PanelMetrics::new(debug)));
-    // 默认日志级别看不到上面那些警告，面板经控制通道读（`config` 的 `problems`）/ The default log level
-    // hides the warnings above, so the panel reads them over the control channel (`config`'s `problems`)
+    // 面板经控制通道读上面那些问题（`config` 的 `problems`）/ The panel reads the problems above over
+    // the control channel (`config`'s `problems`)
     if let Some(metrics) = &panel_metrics {
         metrics.startup_problems(problems);
     }
@@ -498,7 +501,7 @@ async fn run_dns_server(
 
     #[cfg(not(unix))]
     if admin_socket.is_some() {
-        warn!("admin-socket is not supported on this platform");
+        tracing::warn!("admin-socket is not supported on this platform");
     }
 
     // 流控按设备分时要认出和内核在同一个网段上的 IPv6 主机（见 `fair_queue::note_local_networks`）：隔一阵看一次本机网卡的

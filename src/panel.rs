@@ -123,12 +123,12 @@ struct ActiveConfig {
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
     restart_pending: Vec<String>,
-    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载，只记一条 warn，
-    /// 而默认日志级别是 error，所以经控制通道报出来；重载成功说明新配置没有这样的写法，就清空
+    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载、各记一条 error，
+    /// 也经控制通道报出来，面板不用翻日志；重载成功说明新配置没有这样的写法，就清空
     /// What the configuration read at startup writes that a reload or a save from the panel
-    /// refuses (see `config::problems`). Startup loads it as before with only a warning, the
-    /// default log level being error, so they are reported over the control channel; a
-    /// successful reload means the new configuration has none, and they are cleared
+    /// refuses (see `config::problems`). Startup loads it as before and logs an error for each,
+    /// and they are reported over the control channel too, so the panel need not search the
+    /// log; a successful reload means the new configuration has none, and they are cleared
     problems: Vec<String>,
     /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None。监视不了时文件改了不会重载，面板保存的配置
     /// 也不生效，等不到重载序号变
@@ -1163,6 +1163,7 @@ impl PanelMetrics {
         metric(
             &mut output,
             "kixdns_cache_entries",
+            GAUGE,
             engine.cache.weighted_size(),
         );
         render_flow_control(&mut output, engine);
@@ -1175,28 +1176,32 @@ impl PanelMetrics {
         metric(
             output,
             "kixdns_requests_total",
+            COUNTER,
             self.requests_total.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_requests_inflight",
+            GAUGE,
             self.requests_inflight.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_cache_lookups_total",
+            COUNTER,
             self.cache_lookups_total.load(Ordering::Relaxed),
         );
+        family(output, "kixdns_cache_hits_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_cache_hits_total",
-            &[("kind", "fresh")],
+            [("kind", "fresh")],
             self.cache_hits_fresh.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_cache_hits_total",
-            &[("kind", "stale")],
+            [("kind", "stale")],
             self.cache_hits_stale.load(Ordering::Relaxed),
         );
         append_map(
@@ -1223,27 +1228,30 @@ impl PanelMetrics {
             &self.upstream_results,
             &["upstream", "transport", "result"],
         );
+        family(output, "kixdns_config_reload_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_config_reload_total",
-            &[("result", "success")],
+            [("result", "success")],
             self.reload_success.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_config_reload_total",
-            &[("result", "failure")],
+            [("result", "failure")],
             self.reload_failure.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_config_generation",
+            GAUGE,
             self.active_config.read().generation,
         );
+        family(output, "kixdns_cache_stale_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "expired")],
+            [("reason", "expired")],
             self.cache_hits_stale
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.cache_stale_client_timeout.load(Ordering::Relaxed))
@@ -1252,15 +1260,16 @@ impl PanelMetrics {
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "client_timeout")],
+            [("reason", "client_timeout")],
             self.cache_stale_client_timeout.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "upstream_failure")],
+            [("reason", "upstream_failure")],
             self.cache_stale_upstream_failure.load(Ordering::Relaxed),
         );
+        family(output, "kixdns_requests_finished_total", COUNTER);
         for (status, counter) in [
             ("completed", &self.requests_completed),
             ("failed", &self.requests_failed),
@@ -1269,17 +1278,18 @@ impl PanelMetrics {
             labeled_metric(
                 output,
                 "kixdns_requests_finished_total",
-                &[("status", status)],
+                [("status", status)],
                 counter.load(Ordering::Relaxed),
             );
         }
+        family(output, "kixdns_request_latency_ms", "histogram");
         let mut cumulative = 0u64;
         for (index, bound) in REQUEST_LATENCY_BUCKETS_MS.iter().enumerate() {
             cumulative += self.request_latency.buckets[index].load(Ordering::Relaxed);
             labeled_metric(
                 output,
                 "kixdns_request_latency_ms_bucket",
-                &[("le", &bound.to_string())],
+                [("le", bound.to_string().as_str())],
                 cumulative,
             );
         }
@@ -1288,17 +1298,19 @@ impl PanelMetrics {
         labeled_metric(
             output,
             "kixdns_request_latency_ms_bucket",
-            &[("le", "+Inf")],
+            [("le", "+Inf")],
             cumulative,
         );
-        metric(
+        labeled_metric(
             output,
             "kixdns_request_latency_ms_sum",
+            [],
             format_millis(self.request_latency.micros.load(Ordering::Relaxed)),
         );
-        metric(
+        labeled_metric(
             output,
             "kixdns_request_latency_ms_count",
+            [],
             self.request_latency.count.load(Ordering::Relaxed),
         );
         append_latency_map(
@@ -1328,6 +1340,7 @@ impl PanelMetrics {
         metric(
             output,
             "kixdns_panel_metric_series_dropped_total",
+            COUNTER,
             self.metric_series_dropped.load(Ordering::Relaxed),
         );
     }
@@ -1346,39 +1359,49 @@ fn render_flow_control(output: &mut String, engine: &Engine) {
     metric(
         output,
         "kixdns_flow_control_enabled",
+        GAUGE,
         u8::from(engine.flow_control_state.is_some()),
     );
+    family(output, "kixdns_flow_refused_total", COUNTER);
     for (defence, refused) in manager.refusals() {
         labeled_metric(
             output,
             "kixdns_flow_refused_total",
-            &[("defence", defence.label())],
+            [("defence", defence.label())],
             refused,
         );
     }
-    metric(output, "kixdns_flow_turns_total", manager.turns_begun());
-    metric(output, "kixdns_flow_stuck", manager.stuck());
+    metric(
+        output,
+        "kixdns_flow_turns_total",
+        COUNTER,
+        manager.turns_begun(),
+    );
+    metric(output, "kixdns_flow_stuck", GAUGE, manager.stuck());
     if let Some(margins) = engine
         .flow_control_state
         .as_ref()
         .and_then(|flow| flow.memory.margins_left())
     {
-        metric(output, "kixdns_flow_memory_room", margins);
+        metric(output, "kixdns_flow_memory_room", GAUGE, margins);
     }
+    // 每组的行挨在一起，两组各走一遍 / A family's lines stand together, so each family takes a pass
     let (clients, now) = manager.refused_clients();
-    for client in clients {
-        let address = client.client.to_string();
-        let labels = [("client", address.as_str())];
+    family(output, "kixdns_flow_refused_client_total", COUNTER);
+    for client in &clients {
         labeled_metric(
             output,
             "kixdns_flow_refused_client_total",
-            &labels,
+            [("client", client.client.to_string().as_str())],
             client.refused,
         );
+    }
+    family(output, "kixdns_flow_refused_client_age_seconds", GAUGE);
+    for client in &clients {
         labeled_metric(
             output,
             "kixdns_flow_refused_client_age_seconds",
-            &labels,
+            [("client", client.client.to_string().as_str())],
             now.saturating_sub(client.last_refused_secs),
         );
     }
@@ -1904,11 +1927,7 @@ async fn handle_request(
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/v1/health") => json_response(StatusCode::OK, metrics.health_json()),
         (&Method::GET, "/v1/config/active") => json_response(StatusCode::OK, metrics.config_json()),
-        (&Method::GET, "/v1/metrics") => text_response(
-            StatusCode::OK,
-            "text/plain; version=0.0.4; charset=utf-8",
-            metrics.render_prometheus(&engine),
-        ),
+        (&Method::GET, "/v1/metrics") => metrics_response(&metrics, engine).await,
         (&Method::GET, "/v1/stats/top") => match parse_stats_query(request.uri().query()) {
             Ok((window_seconds, limit)) => stats_response(&metrics, window_seconds, limit).await,
             Err(message) => json_response(
@@ -1997,8 +2016,9 @@ struct TrialOutput {
     body: serde_json::Value,
 }
 
-/// 草稿试跑的总时限：子进程启动、加载 Geo 数据、建引擎，再加查询自己的 6 秒
-/// The draft trial's overall limit: child start-up, Geo data loading and engine construction, plus the query's own 6 seconds
+/// 草稿试跑的总时限：排队等前面的试跑、子进程启动、加载 Geo 数据、建引擎，再加查询自己的 6 秒
+/// The draft trial's overall limit: the wait behind earlier trials, child start-up, Geo data loading and engine
+/// construction, plus the query's own 6 seconds
 #[cfg(unix)]
 const TRIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 /// 试跑的请求体：一份配置（与校验同上限）加上查询字段 / A trial body: one config (the validation limit) plus the query fields
@@ -2139,36 +2159,64 @@ async fn run_diagnostic(
     )
 }
 
-/// 读请求正文为什么失败 / Why reading a request body failed
+/// 一个端点怎么读请求正文：最多多少字节，读不成时回答里的错误码，太大和读不出来时各怎么说
+/// How an endpoint reads its request body: at most how many bytes, the error code of the
+/// answer when it cannot, and what that answer says for a body too large and for one that
+/// cannot be read
 #[cfg(unix)]
-enum BodyFailure {
-    TooLarge,
-    Unreadable,
-    /// [`REQUEST_READ_TIMEOUT`] 之内没发完 / Not finished within [`REQUEST_READ_TIMEOUT`]
-    Late,
+struct BodyRules {
+    limit: usize,
+    code: &'static str,
+    too_large: &'static str,
+    unreadable: &'static str,
 }
 
-/// 读请求正文，最多 `limit` 字节，最多等 [`REQUEST_READ_TIMEOUT`]
-/// Read a request body of at most `limit` bytes, waiting at most [`REQUEST_READ_TIMEOUT`]
 #[cfg(unix)]
-async fn collect_body(request: Request<Incoming>, limit: usize) -> Result<Bytes, BodyFailure> {
-    let body = Limited::new(request.into_body(), limit).collect();
-    match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
-        Ok(Ok(body)) => Ok(body.to_bytes()),
+const CONFIG_BODY: BodyRules = BodyRules {
+    limit: MAX_CONFIG_BODY,
+    code: "config_body_invalid",
+    too_large: "配置不能超过 4 MiB",
+    unreadable: "读取配置请求失败",
+};
+
+#[cfg(unix)]
+const DIAGNOSTIC_BODY: BodyRules = BodyRules {
+    limit: MAX_DIAGNOSTIC_BODY,
+    code: "diagnostic_body_invalid",
+    too_large: "诊断请求不能超过 2 KiB",
+    unreadable: "读取诊断请求失败",
+};
+
+#[cfg(unix)]
+const TRIAL_BODY: BodyRules = BodyRules {
+    limit: MAX_TRIAL_BODY,
+    code: "diagnostic_body_invalid",
+    too_large: "试跑请求不能超过 4 MiB",
+    unreadable: "读取试跑请求失败",
+};
+
+/// 照 `rules` 读请求正文，最多等 [`REQUEST_READ_TIMEOUT`]；读不成时拒掉：太大 413，正文本身坏了、读不出来 400，
+/// 没按时发完 408。以前读不出来也回 413，诊断和试跑还说成「不能超过」
+/// Reads a request body by `rules`, waiting at most [`REQUEST_READ_TIMEOUT`]; when it cannot,
+/// it is refused: 413 for a body too large, 400 for one broken and unreadable, 408 for one not
+/// sent in time. An unreadable body used to get a 413 too, the diagnostic and the trial calling
+/// it too large
+#[cfg(unix)]
+async fn collect_body(request: Request<Incoming>, rules: &BodyRules) -> Result<Bytes, Rejection> {
+    let body = Limited::new(request.into_body(), rules.limit).collect();
+    let (status, code, message) = match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
+        Ok(Ok(body)) => return Ok(body.to_bytes()),
         Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
-            Err(BodyFailure::TooLarge)
+            (StatusCode::PAYLOAD_TOO_LARGE, rules.code, rules.too_large)
         }
-        Ok(Err(_)) => Err(BodyFailure::Unreadable),
-        Err(_) => Err(BodyFailure::Late),
-    }
-}
-
-#[cfg(unix)]
-fn late_body_response() -> Response<Full<Bytes>> {
-    json_response(
-        StatusCode::REQUEST_TIMEOUT,
-        error_json("request_body_late", "请求正文没有在 10 秒内发完"),
-    )
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, rules.code, rules.unreadable),
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "request_body_late",
+            "请求正文没有在 10 秒内发完",
+        ),
+    };
+    Err((status, error_json(code, message)))
 }
 
 /// 把一个拒绝写成回答 / A rejection written out as the answer
@@ -2206,15 +2254,9 @@ fn config_invalid(error: &anyhow::Error) -> Rejection {
 
 #[cfg(unix)]
 async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_DIAGNOSTIC_BODY).await {
+    let body = match collect_body(request, &DIAGNOSTIC_BODY).await {
         Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("diagnostic_body_invalid", "诊断请求不能超过 2 KiB"),
-            );
-        }
+        Err(rejection) => return respond(rejection),
     };
     let request = match serde_json::from_slice::<DiagnosticRequest>(&body) {
         Ok(request) => request,
@@ -2237,7 +2279,7 @@ async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Respons
 
 /// 同一时间只跑一个草稿试跑：每次都要起一个子进程、加载 Geo 数据 / One draft trial at a time: each starts a child process and loads Geo data
 #[cfg(unix)]
-static TRIAL_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static TRIAL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 拿一份候选配置试跑一次查询，不碰正在用的配置、缓存和统计。
 ///
@@ -2256,15 +2298,9 @@ async fn diagnostic_trace_candidate(
     request: Request<Incoming>,
     engine: Engine,
 ) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_TRIAL_BODY).await {
+    let body = match collect_body(request, &TRIAL_BODY).await {
         Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("diagnostic_body_invalid", "试跑请求不能超过 4 MiB"),
-            );
-        }
+        Err(rejection) => return respond(rejection),
     };
     let request = match serde_json::from_slice::<CandidateTraceRequest>(&body) {
         Ok(request) => request,
@@ -2289,13 +2325,22 @@ async fn diagnostic_trace_candidate(
             );
         }
     };
-    let Ok(_permit) = TRIAL_GATE.acquire().await else {
-        return json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_json("diagnostic_trial_unavailable", "试跑暂时不可用"),
-        );
+    let (status, body) = trial_in_turn(input).await;
+    json_response(status, body)
+}
+
+/// 轮到自己时起子进程试跑，排队也算在 [`TRIAL_TIMEOUT`] 里：以前时限从轮到自己才开始算，前面排着几个试跑时，面板要
+/// 等上好几个 12 秒才有回答
+/// Runs the trial in a child once its turn comes, the wait for the turn counting towards
+/// [`TRIAL_TIMEOUT`]: the limit used to start only with the turn, so with several trials queued
+/// ahead the panel waited several times 12 seconds for an answer
+#[cfg(unix)]
+async fn trial_in_turn(input: Vec<u8>) -> (StatusCode, serde_json::Value) {
+    let trial = async {
+        let _turn = TRIAL_GATE.lock().await;
+        run_trial_child(input).await
     };
-    let (status, body) = match tokio::time::timeout(TRIAL_TIMEOUT, run_trial_child(input)).await {
+    match tokio::time::timeout(TRIAL_TIMEOUT, trial).await {
         Ok(Ok(output)) => (
             StatusCode::from_u16(output.status).unwrap_or(StatusCode::BAD_GATEWAY),
             output.body,
@@ -2312,8 +2357,7 @@ async fn diagnostic_trace_candidate(
             StatusCode::GATEWAY_TIMEOUT,
             error_json("diagnostic_timeout", "试跑超过 12 秒"),
         ),
-    };
-    json_response(status, body)
+    }
 }
 
 /// 起子进程、喂请求、读结果 / Start the child, feed it the request, read its result
@@ -2614,23 +2658,32 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
 
 #[cfg(unix)]
 async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_CONFIG_BODY).await {
-        Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(failure) => {
-            let message = if matches!(failure, BodyFailure::TooLarge) {
-                "配置不能超过 4 MiB"
-            } else {
-                "读取配置请求失败"
-            };
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("config_body_invalid", message),
-            );
-        }
-    };
+    match collect_body(request, &CONFIG_BODY).await {
+        Ok(body) => validate_body(body).await,
+        Err(rejection) => respond(rejection),
+    }
+}
 
-    validate_body(body).await
+/// Prometheus 文本格式的指标。拼它要把每组统计项排好序、一行行写出来，统计项多时上万行，放到阻塞线程池里做，和排行
+/// 一样不占着处理 DNS 的线程；以前就在收到请求的线程上拼
+/// The metrics in the Prometheus text format. Writing them sorts every set of series and writes
+/// them out line by line, tens of thousands of lines with many series, so it runs on the
+/// blocking thread pool and, as the rankings do, holds no thread that serves DNS; it used to be
+/// written on the thread that took the request
+#[cfg(unix)]
+async fn metrics_response(metrics: &Arc<PanelMetrics>, engine: Engine) -> Response<Full<Bytes>> {
+    let rendering = Arc::clone(metrics);
+    match tokio::task::spawn_blocking(move || rendering.render_prometheus(&engine)).await {
+        Ok(text) => text_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4; charset=utf-8",
+            text,
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("metrics_failed", &error.to_string()),
+        ),
+    }
 }
 
 /// 排行的回答。算排行要把窗口里每个钟头的每一项合起来再排序（24 小时的窗口最多二十万项），放到阻塞线程池里做，
@@ -2654,18 +2707,23 @@ async fn stats_response(
     }
 }
 
-/// 校验一份配置，给出回答。校验放到阻塞线程池里做，和取查询日志一样：它要解析整份配置、编译每条正则、读 DoH 的
-/// 证书文件，规则多的配置要几十到几百毫秒，在处理请求的线程上做的话，排在这个线程上的 DNS 查询这期间都等着
-/// Validates a configuration and gives the answer. The validation runs on the blocking thread
-/// pool, as taking the query log does: it parses the whole configuration, compiles every regex
-/// and reads the DoH certificate files, tens to hundreds of milliseconds for a configuration
-/// with many rules, during which the DNS queries queued on a thread serving requests would wait
+/// 校验一份配置，给出回答，和热重载拒绝的一样（见 `config::validate`）。校验放到阻塞线程池里做，和取查询日志一样：
+/// 它要解析整份配置、编译每条正则，规则多的配置要几十到几百毫秒，在处理请求的线程上做的话，排在这个线程上的 DNS
+/// 查询这期间都等着。正文不是 UTF-8 时回 400：以前当成空串去校验，回的是一份空配置的解析错误
+/// Validates a configuration and gives the answer, refusing what a hot reload refuses (see
+/// `config::validate`). The validation runs on the blocking thread pool, as taking the query
+/// log does: it parses the whole configuration and compiles every regex, tens to hundreds of
+/// milliseconds for a configuration with many rules, during which the DNS queries queued on a
+/// thread serving requests would wait. A body that is not UTF-8 gets a 400: it used to be
+/// validated as an empty string, answered with the parse error of an empty configuration
 #[cfg(unix)]
 async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
-    // 与引擎启动完全相同的校验路径，含监听地址与 DoH 证书检查。
-    // The exact validation the engine runs at startup, listener and DoH checks included.
-    let validated = tokio::task::spawn_blocking(move || {
-        crate::config::validate(std::str::from_utf8(&body).unwrap_or_default())
+    let validated = tokio::task::spawn_blocking(move || match std::str::from_utf8(&body) {
+        Ok(text) => crate::config::validate(text).map_err(|error| config_invalid(&error)),
+        Err(_) => Err((
+            StatusCode::BAD_REQUEST,
+            error_json("config_body_invalid", "配置不是 UTF-8 文本"),
+        )),
     })
     .await;
     match validated {
@@ -2679,7 +2737,7 @@ async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
                 "warnings": report.warnings,
             }),
         ),
-        Ok(Err(error)) => respond(config_invalid(&error)),
+        Ok(Err(rejection)) => respond(rejection),
         Err(error) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json("config_validate_failed", &error.to_string()),
@@ -2727,63 +2785,54 @@ fn error_json(code: &str, message: &str) -> serde_json::Value {
     json!({ "protocol_version": PROTOCOL_VERSION, "error": { "code": code, "message": message } })
 }
 
+/// 一组计数统计项，按键排好，每项一行 / A set of counting series, sorted by key, a line each
 fn append_map(output: &mut String, name: &str, series: &Series<ThreadCount>, labels: &[&str]) {
-    let mut rows = series
-        .snapshot()
-        .iter()
-        .map(|(key, counter)| (key.to_string(), counter.load(Ordering::Relaxed)))
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    for (key, value) in rows {
-        let values = key.split('\0').collect::<Vec<_>>();
-        if values.len() != labels.len() {
-            continue;
+    family(output, name, COUNTER);
+    let snapshot = series.snapshot();
+    let mut rows: Vec<_> = snapshot.iter().collect();
+    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, counter) in rows {
+        if let Some(pairs) = label_pairs(labels, key) {
+            labeled_metric(output, name, pairs, counter.load(Ordering::Relaxed));
         }
-        let pairs = labels
-            .iter()
-            .zip(values)
-            .map(|(label, value)| (*label, value))
-            .collect::<Vec<_>>();
-        labeled_metric(output, name, &pairs, value);
     }
 }
 
+/// 一组耗时统计项，按键排好，每项一行总和、一行次数 / A set of latency series, sorted by key, each
+/// with a line for the sum and one for the count
 fn append_latency_map(
     output: &mut String,
     name: &str,
     series: &Series<LatencySum>,
     labels: &[&str],
 ) {
-    let mut rows = series
-        .snapshot()
-        .iter()
-        .map(|(key, sum)| {
-            (
-                key.to_string(),
-                sum.micros.load(Ordering::Relaxed),
+    family(output, name, "summary");
+    let (sum_name, count_name) = (format!("{name}_sum"), format!("{name}_count"));
+    let snapshot = series.snapshot();
+    let mut rows: Vec<_> = snapshot.iter().collect();
+    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, sum) in rows {
+        if let Some(pairs) = label_pairs(labels, key) {
+            let micros = sum.micros.load(Ordering::Relaxed);
+            labeled_metric(output, &sum_name, pairs.clone(), format_millis(micros));
+            labeled_metric(
+                output,
+                &count_name,
+                pairs,
                 sum.count.load(Ordering::Relaxed),
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    for (key, micros, count) in rows {
-        let values = key.split('\0').collect::<Vec<_>>();
-        if values.len() != labels.len() {
-            continue;
+            );
         }
-        let pairs = labels
-            .iter()
-            .zip(values)
-            .map(|(label, value)| (*label, value))
-            .collect::<Vec<_>>();
-        labeled_metric(
-            output,
-            &format!("{name}_sum"),
-            &pairs,
-            format_millis(micros),
-        );
-        labeled_metric(output, &format!("{name}_count"), &pairs, count);
     }
+}
+
+/// 统计键的各段配上标签名。名字里写了 `\0` 时段数和标签数对不上，这一项不导出
+/// A metric key's parts paired with the label names. With a `\0` written in a name the parts
+/// and labels do not match up, and the series is not exported
+fn label_pairs<'a>(
+    labels: &'a [&'a str],
+    key: &'a str,
+) -> Option<impl Iterator<Item = (&'a str, &'a str)> + Clone> {
+    (key.split('\0').count() == labels.len()).then(|| labels.iter().copied().zip(key.split('\0')))
 }
 
 /// 微秒累计值以毫秒输出，保留三位小数。/ Render accumulated microseconds as milliseconds.
@@ -2791,31 +2840,57 @@ fn format_millis(micros: u64) -> String {
     format!("{}.{:03}", micros / 1_000, micros % 1_000)
 }
 
-fn metric(output: &mut String, name: &str, value: impl std::fmt::Display) {
-    let _ = writeln!(output, "{name} {value}");
+/// 计数和仪表，`# TYPE` 行里的两种 / Counters and gauges, two of the kinds of a `# TYPE` line
+const COUNTER: &str = "counter";
+const GAUGE: &str = "gauge";
+
+/// 一组指标的 `# TYPE` 行，写在这一组的头一行之前；同一组的行挨在一起
+/// A metric family's `# TYPE` line, written before the family's first line; a family's lines
+/// stand together
+fn family(output: &mut String, name: &str, kind: &str) {
+    let _ = writeln!(output, "# TYPE {name} {kind}");
 }
 
-fn labeled_metric(
+/// 只有一行、不带标签的一组指标 / A metric family of a single line without labels
+fn metric(output: &mut String, name: &str, kind: &str, value: impl std::fmt::Display) {
+    family(output, name, kind);
+    labeled_metric(output, name, [], value);
+}
+
+/// 一行指标，没有标签时不写花括号。标签值照 Prometheus 文本格式转义，直接写进输出：以前每个标签值替换三遍、每行还要
+/// 另拼几个字符串
+/// One metric line, without braces when it has no labels. Label values are escaped as the
+/// Prometheus text format says, straight into the output: each used to be replaced three times
+/// over, and every line built several more strings besides
+fn labeled_metric<'a>(
     output: &mut String,
     name: &str,
-    labels: &[(&str, &str)],
+    labels: impl IntoIterator<Item = (&'a str, &'a str)>,
     value: impl std::fmt::Display,
 ) {
-    let _ = write!(output, "{name}{{");
-    for (index, (label, label_value)) in labels.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
+    output.push_str(name);
+    let mut labels = labels.into_iter().peekable();
+    if labels.peek().is_some() {
+        output.push('{');
+        for (index, (label, label_value)) in labels.enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str(label);
+            output.push_str("=\"");
+            for c in label_value.chars() {
+                match c {
+                    '\\' => output.push_str("\\\\"),
+                    '\n' => output.push_str("\\n"),
+                    '"' => output.push_str("\\\""),
+                    c => output.push(c),
+                }
+            }
+            output.push('"');
         }
-        let _ = write!(output, "{label}=\"{}\"", escape_label(label_value));
+        output.push('}');
     }
-    let _ = writeln!(output, "}} {value}");
-}
-
-fn escape_label(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"")
+    let _ = writeln!(output, " {value}");
 }
 
 fn truncate(value: &str, max_length: usize) -> String {
@@ -3576,10 +3651,15 @@ mod tests {
         assert!(metrics.uptime_seconds() >= 61);
     }
 
-    #[cfg(unix)]
+    /// 标签值照 Prometheus 文本格式转义：反斜杠、换行和引号，别的原样写；不带标签的一行没有花括号
+    /// Label values are escaped as the Prometheus text format says: backslashes, newlines and
+    /// quotes, the rest written as is; a line without labels has no braces
     #[test]
     fn escapes_prometheus_labels() {
-        assert_eq!(super::escape_label("a\\b\n\"c"), "a\\\\b\\n\\\"c");
+        let mut output = String::new();
+        super::labeled_metric(&mut output, "m", [("a", "x\\y\n\"z\""), ("b", "名字")], 1);
+        super::labeled_metric(&mut output, "n", [], 2);
+        assert_eq!(output, "m{a=\"x\\\\y\\n\\\"z\\\"\",b=\"名字\"} 1\nn 2\n");
     }
 
     /// 一组统计项满了以后，再来的新名字只记一次丢弃，不去拿加统计项的那把锁。这把锁全进程共用；规则多过上限的配置下，
@@ -4818,6 +4898,101 @@ mod diagnostic_tests {
         }
     }
 
+    /// 导出照 Prometheus 文本格式写：每组指标前有一行 `# TYPE`，说它是计数、仪表、直方图还是摘要，同一组的行挨在一起
+    /// （直方图和摘要的 `_bucket`、`_sum`、`_count` 算在组里）。以前一行 `# TYPE` 也没有，被拦设备的两组还一行隔一行
+    /// The export follows the Prometheus text format: every metric family starts with a
+    /// `# TYPE` line saying whether it is a counter, a gauge, a histogram or a summary, and a
+    /// family's lines stand together (a histogram's or summary's `_bucket`, `_sum` and `_count`
+    /// belonging to it). There used to be no `# TYPE` line at all, and the two families of the
+    /// devices refused took turns line by line
+    #[tokio::test]
+    async fn every_metric_family_is_typed_once_before_its_lines() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "flow_control_enabled": true },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let manager = &engine.permit_manager;
+        for client in ["192.168.1.20", "192.168.1.21"] {
+            manager.note_refused(client.parse().unwrap());
+        }
+        metrics.record_pipeline_hit("main");
+        metrics.record_rule_match("main", "r", "request");
+        metrics.record_upstream_attempt("1.1.1.1:53", "udp");
+        metrics.record_upstream_latency(
+            &metrics.upstream_latency,
+            "1.1.1.1:53\0udp",
+            std::time::Duration::from_millis(5),
+        );
+        let text = metrics.render_prometheus(&engine);
+        let mut typed = Vec::new();
+        for line in text.lines() {
+            if let Some(family) = line.strip_prefix("# TYPE ") {
+                let (name, kind) = family.split_once(' ').expect("a name and a kind");
+                assert!(
+                    ["counter", "gauge", "histogram", "summary"].contains(&kind),
+                    "{line}"
+                );
+                assert!(!typed.contains(&name), "{name} typed twice in\n{text}");
+                typed.push(name);
+                continue;
+            }
+            let name = line.split(['{', ' ']).next().expect("a metric name");
+            let family = typed.last().expect("a line before any # TYPE");
+            assert!(
+                name == *family
+                    || ["_bucket", "_sum", "_count"]
+                        .iter()
+                        .any(|part| name.strip_suffix(part) == Some(family)),
+                "{name} under {family} in\n{text}"
+            );
+        }
+        for family in [
+            "kixdns_panel_metric_series_dropped_total",
+            "kixdns_request_latency_ms",
+            "kixdns_upstream_latency_ms",
+            "kixdns_flow_refused_client_total",
+            "kixdns_flow_refused_client_age_seconds",
+        ] {
+            assert!(typed.contains(&family), "{family} in\n{text}");
+        }
+    }
+
+    /// 拼指标也不占着处理 DNS 的线程：交给阻塞线程去拼，等的时候运行时照常干别的。测试用的是单线程运行时，在这里同步
+    /// 拼的话另一个任务一次也轮不到
+    /// Writing the metrics holds no thread that serves DNS either: a blocking thread writes them,
+    /// and while waiting the runtime goes on with other work. The test runs on a single-thread
+    /// runtime, where writing them inline would leave the other task not a single turn
+    #[tokio::test]
+    async fn writing_the_metrics_leaves_the_runtime_free() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let turns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counting = Arc::clone(&turns);
+        let other = tokio::spawn(async move {
+            loop {
+                counting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let before = turns.load(std::sync::atomic::Ordering::Relaxed);
+        let response = super::metrics_response(&metrics, engine).await;
+        let during = turns.load(std::sync::atomic::Ordering::Relaxed) - before;
+        other.abort();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert!(
+            during > 0,
+            "the runtime had no turn for other work while writing"
+        );
+    }
+
     /// 控制通道的 config 列出改了但要重启才生效的设置；改回去以后不再列
     /// The control channel's config lists the settings changed that take a restart to
     /// apply; once changed back they are no longer listed
@@ -5235,6 +5410,23 @@ mod diagnostic_tests {
         let (status, body) = run_trial(input).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"]["code"], "config_invalid", "{body}");
+    }
+
+    /// 排队等前面的试跑也算在时限里：前面那个一直占着，这个到 12 秒就回超时，不会一直等下去。以前时限从轮到自己才开始算
+    /// The wait behind an earlier trial counts towards the limit: with that one holding on, this
+    /// one answers a timeout at 12 seconds rather than waiting on. The limit used to start only
+    /// with the turn
+    #[tokio::test(start_paused = true)]
+    async fn a_trial_waiting_its_turn_times_out_within_the_limit() {
+        let _earlier = super::TRIAL_GATE.lock().await;
+        let started = tokio::time::Instant::now();
+        let answered =
+            tokio::time::timeout(super::TRIAL_TIMEOUT * 2, super::trial_in_turn(Vec::new()))
+                .await
+                .expect("answered within the limit, not after the earlier trial");
+        assert_eq!(answered.0, hyper::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(answered.1["error"]["code"], "diagnostic_timeout");
+        assert_eq!(started.elapsed(), super::TRIAL_TIMEOUT);
     }
 
     #[test]

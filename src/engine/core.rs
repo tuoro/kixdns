@@ -215,11 +215,7 @@ impl Engine {
             Arc::new(UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?);
         // 上游的主机名经 bootstrap 的服务器解析，用的是上面这个 UDP 客户端 / Upstream host names are
         // resolved through the bootstrap servers, by the UDP client above
-        let bootstrap = Bootstrap::new(
-            &settings.bootstrap,
-            Arc::clone(&udp_client),
-            std::time::Duration::from_millis(settings.upstream_timeout_ms),
-        );
+        let bootstrap = Bootstrap::new(&settings.bootstrap, Arc::clone(&udp_client));
 
         let tcp_mux = Arc::new(TcpMultiplexer::new(
             settings.tcp_pool_size,

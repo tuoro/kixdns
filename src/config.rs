@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
-use ipnet::IpNet;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
@@ -44,41 +43,31 @@ pub struct PipelineConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
-    #[serde(default = "default_min_ttl")]
     pub min_ttl: u32,
     /// UDP监听地址，缺省0.0.0.0:5353，避免1024以下端口权限问题。 / UDP listen address, defaults to 0.0.0.0:5353, avoiding port permission issues below 1024
-    #[serde(default = "default_bind_udp")]
     pub bind_udp: String,
     /// TCP监听地址，缺省0.0.0.0:5353。 / TCP listen address, defaults to 0.0.0.0:5353
-    #[serde(default = "default_bind_tcp")]
     pub bind_tcp: String,
     /// DoH 监听地址（留空则不启用）。 / DoH listen address (empty/null = disabled)
-    #[serde(default)]
     pub bind_doh: Option<String>,
     /// DoH TLS 证书路径（PEM）。 / TLS certificate path for DoH (PEM)
-    #[serde(default)]
     pub doh_tls_cert: Option<String>,
     /// DoH TLS 私钥路径（PEM）。 / TLS private key path for DoH (PEM)
-    #[serde(default)]
     pub doh_tls_key: Option<String>,
     /// DoH 查询路径，默认 /dns-query。可自定义为任意路径以避免探测。
     /// / DoH query path, defaults to /dns-query. Can be customized to any path to avoid detection.
-    #[serde(default = "default_doh_path")]
     pub doh_path: String,
     /// 响应缓存最多存放的应答份数（默认 10000），超过 1 KB 的应答每 1 KB 算一份
     /// / Most answers the response cache holds (default 10000), one over 1 KB counting once per KB
-    #[serde(default = "default_cache_capacity")]
     pub cache_capacity: u64,
     /// 响应缓存里的应答最多存多久（秒，默认 86400） / Longest the response cache keeps an answer (seconds, default 86400)
-    #[serde(default = "default_cache_max_ttl")]
     pub cache_max_ttl: u64,
     /// DashMap shard 数量（0=自动，默认 0）。更多 shards=更少锁竞争但更多内存开销 / DashMap shard count (0=auto, default 0). More shards=less lock contention but more memory overhead
-    #[serde(default = "default_dashmap_shards")]
     pub dashmap_shards: usize,
     /// 默认上游DNS。 / Default upstream DNS
-    #[serde(default = "default_upstream")]
     pub default_upstream: String,
     /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
     #[serde(skip)]
@@ -92,76 +81,57 @@ pub struct GlobalSettings {
     /// DoQ), comma-separated `IP:port`, asked at once with the first answer taken; empty (the
     /// default) leaves it to the system resolver, which loops back should it be KixDNS itself
     /// (see `engine::bootstrap`)
-    #[serde(default)]
     pub bootstrap: String,
     /// 上游超时（毫秒）。 / Upstream timeout (milliseconds)
     /// 单次上游请求的超时时间
-    #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
     /// 整体请求超时（毫秒）。 / Overall request timeout (milliseconds)
     /// 包含 hedge + TCP fallback 的总超时时间。如果未设置，自动计算为 upstream_timeout_ms * 2.5
     /// Total timeout including hedge + TCP fallback. If not set, auto-calculated as upstream_timeout_ms * 2.5
-    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
     /// 响应阶段 Pipeline 跳转上限。 / Response phase pipeline jump limit
-    #[serde(default = "default_response_jump_limit")]
     pub response_jump_limit: u32,
     /// UDP 上游连接池大小。 / UDP upstream connection pool size
-    #[serde(default = "default_udp_pool_size")]
     pub udp_pool_size: usize,
     /// TCP 上游连接池大小。 / TCP upstream connection pool size
-    #[serde(default = "default_tcp_pool_size")]
     pub tcp_pool_size: usize,
     /// DoH 上游连接池大小（每个 upstream 的最大空闲连接数）。 / DoH upstream pool size (max idle per host)
-    #[serde(default = "default_doh_pool_size")]
     pub doh_pool_size: usize,
     /// DoH 健康检查错误阈值（连续传输错误多少次后重建连接池以驱逐死连接）。 / DoH health check error threshold (rebuild pool after N consecutive transport errors to evict dead connections)
     /// 默认 3 次，0 表示禁用健康检查 / Default 3, 0 means disable health check
-    #[serde(default = "default_doh_health_check_error_threshold")]
     pub doh_health_check_error_threshold: usize,
     /// DoT 上游连接池大小。 / DoT upstream connection pool size
-    #[serde(default = "default_dot_pool_size")]
     pub dot_pool_size: usize,
     /// DoQ 上游连接池大小。 / DoQ upstream connection pool size
-    #[serde(default = "default_doq_pool_size")]
     pub doq_pool_size: usize,
     /// TCP 连接最大存活时间（秒，超过强制重置） / TCP connection max age (seconds, force reset after this time)
     /// 0 表示禁用连接老化检查 / 0 means disable connection aging check
-    #[serde(default = "default_tcp_connection_max_age_seconds")]
     pub tcp_connection_max_age_seconds: u64,
     /// TCP 连接空闲超时（秒，无请求超过此时间重置） / TCP connection idle timeout (seconds, reset if no requests for this time)
     /// 0 表示禁用空闲超时检查 / 0 means disable idle timeout check
-    #[serde(default = "default_tcp_connection_idle_timeout_seconds")]
     pub tcp_connection_idle_timeout_seconds: u64,
     /// DoQ 连接空闲超时（秒）。 / DoQ connection idle timeout (seconds)
-    #[serde(default = "default_doq_idle_timeout_seconds")]
     pub doq_connection_idle_timeout_seconds: u64,
     /// DoQ keepalive 间隔（毫秒）。0 表示禁用。 / DoQ keepalive interval (ms). 0 disables.
-    #[serde(default = "default_doq_keepalive_interval_ms")]
     pub doq_keepalive_interval_ms: u64,
     /// 是否启用 DoQ 0-RTT（默认 true）。 / Enable DoQ 0-RTT (default true)
-    #[serde(default = "default_doq_enable_0rtt")]
     pub doq_enable_0rtt: bool,
     /// 智能流控（默认关）：不用填数字，内核运行时自己判断，见 `engine::concurrency`。以前的
     /// `flow_control_initial_permits` 等五个数字已经删掉，旧配置里留着也照常加载，不起作用
     /// Smart flow control (off by default): no numbers to fill in, the kernel judges at run time,
     /// see `engine::concurrency`. The five numbers such as `flow_control_initial_permits` it used
     /// to have are gone; an old configuration still holding them loads as before, to no effect
-    #[serde(default = "default_flow_control_enabled")]
     pub flow_control_enabled: bool,
     /// RFC 8767: 上游不可用时返回过期缓存（默认 false）/ RFC 8767: Serve stale cached data when upstream is unavailable (default false)
-    #[serde(default = "default_serve_stale")]
     pub serve_stale: bool,
     /// RFC 8767: 过期缓存响应的 TTL（秒，默认 30）/ RFC 8767: TTL for stale responses (seconds, default 30)
     /// 对应 Unbound serve-expired-reply-ttl / Corresponds to Unbound serve-expired-reply-ttl
-    #[serde(default = "default_serve_stale_ttl")]
     pub serve_stale_ttl: u32,
     /// RFC 8767: 过期缓存可被服务的最大时间窗口（秒，默认 86400）
     /// 当缓存过期超过此时间后不再返回 stale 数据。0 表示无限制。
     /// RFC 8767: Maximum time window for serving stale cache (seconds, default 86400)
     /// Don't serve stale data after the entry has been expired for longer than this. 0 means no limit.
     /// 对应 Unbound serve-expired-ttl / Corresponds to Unbound serve-expired-ttl
-    #[serde(default = "default_serve_stale_expire_ttl")]
     pub serve_stale_expire_ttl: u64,
     /// RFC 8767：过期应答的后台刷新失败以后，从这次失败起重新算它还能续用多久（默认 false）。上游一直取不到新的、又一直
     /// 有人问的名字，就一直交出过期应答，不受 serve_stale_expire_ttl 限制。对应 Unbound 的 serve-expired-ttl-reset，
@@ -170,96 +140,89 @@ pub struct GlobalSettings {
     /// served counts afresh from that failure (default false). A name the upstream keeps giving
     /// nothing new for, and that keeps being asked, then goes out stale beyond
     /// serve_stale_expire_ttl. Corresponds to Unbound's serve-expired-ttl-reset, off there too
-    #[serde(default = "default_serve_stale_ttl_reset")]
     pub serve_stale_ttl_reset: bool,
     /// RFC 8767: 返回过期缓存前尝试上游查询的超时（毫秒，默认 0）
     /// 0 = 立即返回过期缓存（乐观模式）。 > 0 = 先尝试上游查询，超时后返回过期缓存。
     /// RFC 8767: Client timeout before serving stale (ms, default 0)
     /// 0 = serve stale immediately (optimistic mode). > 0 = try upstream first, serve stale on timeout.
     /// 对应 Unbound serve-expired-client-timeout / Corresponds to Unbound serve-expired-client-timeout
-    #[serde(default = "default_serve_stale_client_timeout_ms")]
     pub serve_stale_client_timeout_ms: u64,
     /// 缓存后台刷新是否启用（默认false） / Enable cache background refresh (default false)
-    #[serde(default = "default_cache_background_refresh")]
     pub cache_background_refresh: bool,
     /// 缓存后台刷新阈值（百分比，默认10）。当剩余TTL低于此百分比时触发后台刷新 / Cache background refresh threshold (percentage, default 10). Trigger background refresh when remaining TTL below this percentage
-    #[serde(default = "default_cache_refresh_threshold_percent")]
     pub cache_refresh_threshold_percent: u8,
     /// 缓存后台刷新最小TTL（秒，默认5）。防止TTL过短导致无限循环刷新 / Cache background refresh minimum TTL (seconds, default 5). Prevent infinite refresh loop for very short TTLs
-    #[serde(default = "default_cache_refresh_min_ttl")]
     pub cache_refresh_min_ttl: u32,
     /// GeoIP 数据库文件路径（MMDB 格式） / GeoIP database file path (MMDB format)
-    #[serde(default)]
     pub geoip_db_path: Option<String>,
     /// GeoIP 数据文件路径（V2Ray .dat 格式） / GeoIP data file path (V2Ray .dat format)
-    #[serde(default)]
     pub geoip_dat_path: Option<String>,
     /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
-    #[serde(default)]
     pub geosite_data_paths: Vec<String>,
     /// UDP 失败时是否自动 fallback 到 TCP（默认 true）。 / UDP failure automatically fallbacks to TCP (default true)
-    #[serde(default = "default_enable_tcp_fallback")]
     pub enable_tcp_fallback: bool,
 }
 
+/// 全局设置的默认值只写在这里：配置里没写的设置照这里取（见 `GlobalSettings` 上的 `#[serde(default)]`）。以前每个字段
+/// 另有一个默认值函数，同一个数写两遍，还得靠测试守着两边一致
+/// The global settings' defaults are written here alone: a setting a configuration leaves out
+/// takes its value from here (see `#[serde(default)]` on `GlobalSettings`). Every field used to
+/// have a default function of its own besides, the same number written twice, with a test to
+/// keep the two in step
 impl Default for GlobalSettings {
     fn default() -> Self {
         Self {
-            min_ttl: default_min_ttl(),
-            bind_udp: default_bind_udp(),
-            bind_tcp: default_bind_tcp(),
+            min_ttl: 0,
+            bind_udp: "0.0.0.0:5353".to_string(),
+            bind_tcp: "0.0.0.0:5353".to_string(),
             bind_doh: None,
             doh_tls_cert: None,
             doh_tls_key: None,
-            doh_path: default_doh_path(),
-            default_upstream: default_upstream(),
+            // RFC 8484 用的路径 / The path RFC 8484 uses
+            doh_path: "/dns-query".to_string(),
+            default_upstream: "1.1.1.1:53".to_string(),
             default_upstream_pre_split: None,
             default_upstream_shared: None,
             bootstrap: String::new(),
-            upstream_timeout_ms: default_upstream_timeout_ms(),
+            // Increased from 2000ms to 9000ms to align with idoq library best practices
+            // DoQ servers (especially Alibaba DNS) may require longer response times
+            // 从 2000ms 增加到 9000ms，以对齐 idoq 库的最佳实践
+            // DoQ 服务器（特别是阿里 DNS）可能需要更长的响应时间
+            upstream_timeout_ms: 9000,
             request_timeout_ms: None, // 默认自动计算 / Auto-calculated by default
-            response_jump_limit: default_response_jump_limit(),
-            udp_pool_size: default_udp_pool_size(),
-            tcp_pool_size: default_tcp_pool_size(),
-            doh_pool_size: default_doh_pool_size(),
-            doh_health_check_error_threshold: default_doh_health_check_error_threshold(),
-            dot_pool_size: default_dot_pool_size(),
-            doq_pool_size: default_doq_pool_size(),
-            tcp_connection_max_age_seconds: default_tcp_connection_max_age_seconds(),
-            tcp_connection_idle_timeout_seconds: default_tcp_connection_idle_timeout_seconds(),
-            doq_connection_idle_timeout_seconds: default_doq_idle_timeout_seconds(),
-            doq_keepalive_interval_ms: default_doq_keepalive_interval_ms(),
-            doq_enable_0rtt: default_doq_enable_0rtt(),
-            flow_control_enabled: default_flow_control_enabled(),
-            cache_capacity: default_cache_capacity(),
-            cache_max_ttl: default_cache_max_ttl(),
-            dashmap_shards: default_dashmap_shards(),
-            serve_stale: default_serve_stale(),
-            serve_stale_ttl: default_serve_stale_ttl(),
-            serve_stale_expire_ttl: default_serve_stale_expire_ttl(),
-            serve_stale_ttl_reset: default_serve_stale_ttl_reset(),
-            serve_stale_client_timeout_ms: default_serve_stale_client_timeout_ms(),
-            cache_background_refresh: default_cache_background_refresh(),
-            cache_refresh_threshold_percent: default_cache_refresh_threshold_percent(),
-            cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
+            response_jump_limit: 10,
+            udp_pool_size: 64,
+            tcp_pool_size: 64,
+            doh_pool_size: 8,
+            // 连续 3 次传输错误后重建连接池 / Rebuild pool after 3 consecutive transport errors
+            doh_health_check_error_threshold: 3,
+            dot_pool_size: 64,
+            doq_pool_size: 16,
+            tcp_connection_max_age_seconds: 300, // 5 分钟 / 5 minutes
+            tcp_connection_idle_timeout_seconds: 60, // 1 分钟 / 1 minute
+            doq_connection_idle_timeout_seconds: 60, // 1 分钟 / 1 minute
+            doq_keepalive_interval_ms: 15_000,
+            // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
+            // Enabled by default - system automatically detects and falls back for unsupported servers
+            doq_enable_0rtt: true,
+            flow_control_enabled: false,
+            cache_capacity: 10_000,
+            cache_max_ttl: 86400,
+            dashmap_shards: 0, // 0 means use DashMap default (num_cpus * 4)
+            serve_stale: false,
+            serve_stale_ttl: 30,
+            serve_stale_expire_ttl: 86400,
+            serve_stale_ttl_reset: false,
+            serve_stale_client_timeout_ms: 0,
+            cache_background_refresh: false,
+            cache_refresh_threshold_percent: 10,
+            cache_refresh_min_ttl: 5,
             geoip_db_path: None,
             geoip_dat_path: None,
             geosite_data_paths: Vec::new(),
-            enable_tcp_fallback: default_enable_tcp_fallback(),
+            enable_tcp_fallback: true,
         }
     }
-}
-
-fn default_cache_capacity() -> u64 {
-    10_000
-}
-
-fn default_cache_max_ttl() -> u64 {
-    86400
-}
-
-fn default_dashmap_shards() -> usize {
-    0 // 0 means use DashMap default (num_cpus * 4)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -708,8 +671,8 @@ impl Rule {
             self.merged_forward = Some(MergedForward {
                 upstream_str: Arc::from(merged_str.as_str()),
                 upstream_list: Arc::new(all_upstreams),
-                // 写得不一样时不发，启动时 `problems` 记一条警告 / None when they differ;
-                // at startup `problems` logs a warning
+                // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
+                // at startup `problems` logs an error
                 ecs: self.shared_forward_ecs().ok().flatten().cloned(),
             });
         }
@@ -742,9 +705,29 @@ pub struct DohListenerConfig {
     pub path: String,
 }
 
-/// `dashmap_shards` 的上限：分片太多一次就分配掉大量内存 / The most `dashmap_shards` may be: too
-/// many shards allocate a great deal of memory at once
-pub const MAX_DASHMAP_SHARDS: usize = 1024;
+/// `dashmap_shards` 的上限。每个分片启动时就占六百来字节（缓存行对齐的锁，加上容量摊到每片至少一条时的四格小表），
+/// 65536 片四十来 MB；以前没有上限时写过的 2048、4096 都在里面，以前的 1024 让它们升级以后起不来。再翻一倍就是八十来
+/// MB，同时在途的查询也用不了那么多片
+/// The most `dashmap_shards` may be. Each shard takes some six hundred bytes from startup (a
+/// cache-padded lock and a four-slot table, the capacity spread to at least one entry a
+/// shard), so 65536 shards are some forty MB; the 2048 and 4096 written before there was a
+/// limit fit, where the former 1024 kept them from starting after an upgrade. Twice as many is
+/// some eighty MB, more shards than the queries in flight together could ever use
+pub const MAX_DASHMAP_SHARDS: usize = 65_536;
+
+/// 每个连接池（`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`dot_pool_size`、`doq_pool_size`）最多多大，
+/// 默认值最大的也只有 64。UDP 池启动时就给每个地址族各开这么多 socket，两族最多 2048 个，在文档里的 systemd 服务和
+/// 面板的 OpenWrt 包设的 65536 个描述符以内；其余的池给每个上游备好这么多客户端。以前不设上限：多到开不出来的 socket，
+/// 热重载和面板保存照样收下，下次启动才起不来；大到 2^64 的数建池时分配不出内存，内核直接退出
+/// How large each connection pool (`udp_pool_size`, `tcp_pool_size`, `doh_pool_size`,
+/// `dot_pool_size`, `doq_pool_size`) may be, the largest default being 64. The UDP pool opens
+/// this many sockets per address family at startup, at most 2048 for both, within the 65536
+/// descriptors the systemd service in the docs and the panel's `OpenWrt` package allow; the
+/// other pools set up this many clients per upstream. There used to be no limit: more sockets
+/// than could be opened were accepted by a hot reload and a panel save and failed only at the
+/// next start, and a number as large as 2^64 could not be allocated as the pool was built,
+/// taking the kernel down
+pub const MAX_POOL_SIZE: usize = 1024;
 
 impl GlobalSettings {
     /// 和 `running`（进程启动时的设置）相比，改了以后要重启 KixDNS 才生效的设置名。这些设置只在启动时
@@ -920,17 +903,30 @@ impl GlobalSettings {
             anyhow::bail!("upstream_timeout_ms must be greater than 0");
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
-        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多一次就分配掉大量内存
+        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多、连接池太大，一次就要分配太多（见
+        // `MAX_DASHMAP_SHARDS`、`MAX_POOL_SIZE`）
         // Settings read only at startup are checked against what building the engine needs: a value
         // the check lets through and the build then fails on is accepted by a hot reload and a panel
         // save, and the kernel does not start at the next restart. DashMap needs more than one
-        // shard, and too many shards allocate a great deal of memory at once
+        // shard, and too many shards or too large a pool take too much at once (see
+        // `MAX_DASHMAP_SHARDS`, `MAX_POOL_SIZE`)
         let shards = self.dashmap_shards;
         if shards != 0 && !(shards.is_power_of_two() && (2..=MAX_DASHMAP_SHARDS).contains(&shards))
         {
             anyhow::bail!(
                 "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
             );
+        }
+        for (setting, size) in [
+            ("udp_pool_size", self.udp_pool_size),
+            ("tcp_pool_size", self.tcp_pool_size),
+            ("doh_pool_size", self.doh_pool_size),
+            ("dot_pool_size", self.dot_pool_size),
+            ("doq_pool_size", self.doq_pool_size),
+        ] {
+            if size > MAX_POOL_SIZE {
+                anyhow::bail!("{setting} must be at most {MAX_POOL_SIZE}, got {size}");
+            }
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
         if doq_idle > 0
@@ -1006,176 +1002,18 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
     Ok((cfg, raw))
 }
 
-/// Parse and normalize a configuration from its JSON text without touching
-/// the filesystem. Errors from the JSON layer carry line/column positions.
-/// 从 JSON 文本解析并规范化配置，不访问文件系统。JSON 层错误带行列位置。
+/// 从 JSON 文本解析配置，找出写了却不读的键（见 [`unread_keys`]），不访问文件系统。JSON 层的错误带行列位置。
+/// 预先算好的东西（拆好的上游、合并的转发）编译时才算（见 `RuntimePipelineConfig::from_config`），只算一遍；编译不了的
+/// 写法（比如写错的网段）也在编译时连同位置报出来
+/// Parse a configuration from its JSON text, finding the keys it writes that are not read (see
+/// [`unread_keys`]), without touching the filesystem. Errors from the JSON layer carry
+/// line/column positions. What is worked out ahead of time (the upstreams split, the merged
+/// forwards) is worked out once, as it compiles (see `RuntimePipelineConfig::from_config`), and
+/// what cannot be compiled (a mistyped network, say) is reported there with its place
 pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
     let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
     cfg.unread_keys = unread_keys(raw, &serde_json::to_value(&cfg)?)?;
-
-    // 预分割上游字符串，转发时不必每次再拆；默认上游有几个时同时问 / Pre-split the upstream
-    // strings so a forward does not split them each time; several default upstreams are
-    // asked at once
-    cfg.settings.pre_split_default_upstream();
-
-    for pipeline in &mut cfg.pipelines {
-        for rule in &mut pipeline.rules {
-            for action in &mut rule.actions {
-                action.pre_split_upstreams();
-            }
-            // Pre-compute merged Forward upstreams for multi-Forward rules (performance optimization).
-            // Eliminates per-request FxHashSet + format! + join overhead on the hot path.
-            // 预计算多 Forward 规则的合并上游（性能优化）。
-            // 消除热路径上每请求的 FxHashSet + format! + join 开销。
-            rule.compute_merged_forward();
-            // 下面的 CIDR 只在这里先解析一遍，好早点报出写错的；匹配器建好时会再解析
-            // The CIDRs below are parsed here only to report a bad one early; the matchers
-            // parse them again when built
-            for matcher in &rule.matchers {
-                if let Matcher::ClientIp { cidr } = &matcher.matcher {
-                    let _parsed: IpNet = cidr.parse()?;
-                }
-            }
-            for matcher in &rule.response_matchers {
-                if let ResponseMatcher::RequestDomainSuffix { value } = &matcher.matcher
-                    && value.is_empty()
-                {
-                    anyhow::bail!("response_matcher request_domain_suffix empty");
-                }
-                if let ResponseMatcher::ResponseUpstreamIp { cidr }
-                | ResponseMatcher::ResponseAnswerIp { cidr } = &matcher.matcher
-                {
-                    for part in cidr.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                        let _parsed: IpNet = part.parse()?;
-                    }
-                }
-            }
-        }
-    }
-
-    for sel in &cfg.pipeline_select {
-        for m in &sel.matchers {
-            if let PipelineSelectorMatcher::ClientIp { cidr } = &m.matcher {
-                let _parsed: IpNet = cidr.parse()?;
-            }
-        }
-    }
-
     Ok(cfg)
-}
-
-fn default_min_ttl() -> u32 {
-    0
-}
-
-fn default_bind_udp() -> String {
-    "0.0.0.0:5353".to_string()
-}
-
-fn default_bind_tcp() -> String {
-    "0.0.0.0:5353".to_string()
-}
-
-fn default_upstream() -> String {
-    "1.1.1.1:53".to_string()
-}
-
-fn default_upstream_timeout_ms() -> u64 {
-    // Increased from 2000ms to 9000ms to align with idoq library best practices
-    // DoQ servers (especially Alibaba DNS) may require longer response times
-    // 从 2000ms 增加到 9000ms，以对齐 idoq 库的最佳实践
-    // DoQ 服务器（特别是阿里 DNS）可能需要更长的响应时间
-    9000
-}
-
-fn default_response_jump_limit() -> u32 {
-    10
-}
-
-fn default_udp_pool_size() -> usize {
-    64
-}
-
-fn default_tcp_pool_size() -> usize {
-    64
-}
-
-fn default_doh_pool_size() -> usize {
-    8
-}
-
-fn default_doh_health_check_error_threshold() -> usize {
-    3 // 连续 3 次传输错误后重建连接池 / Rebuild pool after 3 consecutive transport errors
-}
-
-/// Default DoH query path (RFC 8484 standard) / 默认 DoH 查询路径（RFC 8484 标准）
-fn default_doh_path() -> String {
-    "/dns-query".to_string()
-}
-
-fn default_dot_pool_size() -> usize {
-    64
-}
-
-fn default_doq_pool_size() -> usize {
-    16
-}
-
-fn default_tcp_connection_max_age_seconds() -> u64 {
-    300 // 5 分钟 / 5 minutes
-}
-
-fn default_tcp_connection_idle_timeout_seconds() -> u64 {
-    60 // 1 分钟 / 1 minute
-}
-
-fn default_doq_idle_timeout_seconds() -> u64 {
-    60 // 1 分钟 / 1 minute
-}
-
-fn default_doq_keepalive_interval_ms() -> u64 {
-    15_000
-}
-
-fn default_doq_enable_0rtt() -> bool {
-    true // 默认启用 0-RTT，系统会自动检测并回退不支持的服务器
-    // Enabled by default - system automatically detects and falls back for unsupported servers
-}
-
-fn default_flow_control_enabled() -> bool {
-    false
-}
-
-fn default_serve_stale() -> bool {
-    false
-}
-
-fn default_serve_stale_ttl() -> u32 {
-    30
-}
-
-fn default_serve_stale_expire_ttl() -> u64 {
-    86400
-}
-
-fn default_serve_stale_ttl_reset() -> bool {
-    false
-}
-
-fn default_serve_stale_client_timeout_ms() -> u64 {
-    0
-}
-
-fn default_cache_background_refresh() -> bool {
-    false
-}
-
-fn default_cache_refresh_threshold_percent() -> u8 {
-    10
-}
-
-fn default_cache_refresh_min_ttl() -> u32 {
-    5
 }
 
 /// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式
@@ -1253,10 +1091,6 @@ where
     }
 }
 
-fn default_enable_tcp_fallback() -> bool {
-    true
-}
-
 /// EDNS Client Subnet (RFC 7871) 操作模式，用于 Forward 动作的请求改写。
 /// EDNS Client Subnet (RFC 7871) operation mode, used by the Forward action for request rewriting.
 ///
@@ -1329,14 +1163,14 @@ pub struct ValidationReport {
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
 /// 别的事的写法（见 [`problems`]）、编译不了的匹配器和正则，以及监听地址和 DoH 的前提（见
 /// [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
-/// 启动不走这里：那时 [`problems`] 只记警告、照旧加载
+/// 启动不走这里：那时 [`problems`] 记成错误、照旧加载
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
 /// and trial all go through, refusing what would stop the kernel at startup: what silently does
 /// something else (see [`problems`]), matchers and regexes that do not compile, and the
 /// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). Hot reload
 /// used not to check the listeners, so a mistyped `bind_udp` reloaded fine and the kernel then
 /// failed to start at the next restart. Startup does not come here: there [`problems`] are
-/// only warned about and loaded as before
+/// logged as errors and loaded as before
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     refuse_problems(&cfg)?;
     let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
@@ -1368,7 +1202,7 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// 不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
-/// 启动时只记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
+/// 启动时记成错误、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
 /// 拒绝它们，下一次改配置时就得改掉。
 ///
 /// Ways of writing a configuration that silently do something else: an upstream
@@ -1390,11 +1224,11 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         .next()
         .is_none()
     {
-        found.push(format!("default_upstream: {NO_UPSTREAM}"));
+        found.push(format!("settings.default_upstream: {NO_UPSTREAM}"));
     }
     for upstream in split_upstreams(&cfg.settings.default_upstream) {
         if let Some(problem) = crate::engine::upstream::upstream_problem(upstream, Transport::Udp) {
-            found.push(format!("default_upstream: {problem}"));
+            found.push(format!("settings.default_upstream: {problem}"));
         }
     }
     // bootstrap 自己就是解析上游名字的，只能写成 IP 和端口，经 UDP 问 / bootstrap is what resolves
@@ -1403,12 +1237,21 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         if let Err(error) = crate::engine::transport::check_upstream_address(server, Transport::Udp)
         {
             found.push(format!(
-                "bootstrap: server \"{server}\" is not usable: {error:#}"
+                "settings.bootstrap: server \"{server}\" is not usable: {error:#}"
             ));
         }
     }
+    // 请求的路径总以 `/` 开头，不以它开头的 doh_path 谁也对不上，DoH 对每个请求都回 404 / A request
+    // path always starts with `/`, so a doh_path not starting with it matches no request and DoH
+    // answers 404 to every one
+    if !cfg.settings.doh_path.starts_with('/') {
+        found.push(format!(
+            "settings.doh_path: \"{}\" does not start with \"/\", so it matches no request and DoH answers every query with 404",
+            cfg.settings.doh_path
+        ));
+    }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
-        let place = format!("pipeline_select {}", index + 1);
+        let place = format!("pipeline_select[{index}]");
         if !pipelines.contains(select.pipeline.as_str()) {
             found.push(format!("{place}: no pipeline \"{}\"", select.pipeline));
         }
@@ -1439,21 +1282,22 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     for pipeline in &cfg.pipelines {
         *written.entry(pipeline.id.as_str()).or_default() += 1;
     }
-    for pipeline in &cfg.pipelines {
+    for (index, pipeline) in cfg.pipelines.iter().enumerate() {
         if let Some(times) = written.remove(pipeline.id.as_str())
             && times > 1
         {
             found.push(format!(
-                "pipeline \"{}\": {times} pipelines are written with this id; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
+                "pipelines[{index}]: {times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
                 pipeline.id
             ));
         }
     }
-    for pipeline in &cfg.pipelines {
-        for rule in &pipeline.rules {
-            let place = format!("pipeline \"{}\" rule \"{}\"", pipeline.id, rule.name);
+    // 规则按位置报，和读不懂的键一样：名字可以重复，按名字说不清是哪一条 / Rules are raised by place,
+    // as the keys not read are: names may repeat, and a name may not tell which rule it is
+    for (i, pipeline) in cfg.pipelines.iter().enumerate() {
+        for (j, rule) in pipeline.rules.iter().enumerate() {
             rule_problems(rule, &pipelines, |problem| {
-                found.push(format!("{place}: {problem}"))
+                found.push(format!("pipelines[{i}].rules[{j}]: {problem}"))
             });
         }
     }
@@ -1466,18 +1310,21 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 }
 
 /// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，一个国家
-/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时。启动、重载
+/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时，没设
+/// bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`）。启动、重载
 /// 和面板的校验都不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制
 /// 通道 `config` 结果的 `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
 /// [`RETIRED_SETTINGS`]) and the background refresh rule, a geoip matcher written with no
-/// country code, which never matches, a cache so large it may take a lot of memory, and an
-/// overall timeout too short for the resend and the TCP fallback. Startup, reloads and the
-/// panel's validation refuse none of them, nor do they count among [`problems`]; they are
-/// found as the configuration compiles (see `RuntimePipelineConfig::warnings`), listed in the
-/// validation answer and as `warnings` in the control channel's `config` result, and each is
-/// logged as a warn every time the configuration takes effect. They used to be logged only, out
-/// of sight at the default log level, and validation said nothing of them
+/// country code, which never matches, a cache so large it may take a lot of memory, an overall
+/// timeout too short for the resend and the TCP fallback, and upstreams written with a host name
+/// while bootstrap is unset (resolving comes back round should the system resolver be KixDNS
+/// itself, see `engine::bootstrap`). Startup, reloads and the panel's validation refuse none of
+/// them, nor do they count among [`problems`]; they are found as the configuration compiles (see
+/// `RuntimePipelineConfig::warnings`), listed in the validation answer and as `warnings` in the
+/// control channel's `config` result, and each is logged as a warn every time the configuration
+/// takes effect. They used to be logged only, out of sight at the default log level, and
+/// validation said nothing of them
 pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     let mut found = Vec::new();
     if cfg.background_refresh_rule.is_some() {
@@ -1504,6 +1351,45 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
         found.push(format!(
             "settings.request_timeout_ms: {request_timeout} is under 2.5 times upstream_timeout_ms ({}), which may cut the resend and the TCP fallback short",
             settings.upstream_timeout_ms
+        ));
+    }
+    // 没设 bootstrap 时，写成主机名的上游交给系统的解析器解析（见 `engine::bootstrap`）。不写 upstream 的 forward 问的是
+    // 默认上游，按它自己的 transport 连 / Without bootstrap, upstreams written with a host name are
+    // resolved by the system resolver (see `engine::bootstrap`). A forward naming no upstream asks
+    // the default one, connected to by its own transport
+    let forwards = cfg
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| &pipeline.rules)
+        .flat_map(|rule| {
+            rule.actions
+                .iter()
+                .chain(&rule.response_actions_on_match)
+                .chain(&rule.response_actions_on_miss)
+        })
+        .filter_map(|action| match action {
+            Action::Forward {
+                upstream,
+                transport,
+                ..
+            } => Some((
+                upstream.as_deref().unwrap_or(&settings.default_upstream),
+                transport.unwrap_or(Transport::Udp),
+            )),
+            _ => None,
+        });
+    if !names_an_address(&settings.bootstrap)
+        && let Some(host) = std::iter::once((settings.default_upstream.as_str(), Transport::Udp))
+            .chain(forwards)
+            .flat_map(|(upstreams, transport)| {
+                split_upstreams(upstreams).map(move |upstream| (upstream, transport))
+            })
+            .find_map(|(upstream, transport)| {
+                crate::engine::upstream::host_name(upstream, transport)
+            })
+    {
+        found.push(format!(
+            "settings.bootstrap is unset, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
         ));
     }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
@@ -1810,7 +1696,8 @@ fn rule_problems(
                 "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
             ));
         }
-        if let ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
+        if let ResponseMatcher::RequestDomainSuffix { value }
+        | ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
             && value.is_empty()
         {
             report(EMPTY_DOMAIN_MATCHER.to_string());
@@ -1956,6 +1843,40 @@ mod merged_forward_tests {
             .collect();
         list.sort();
         list
+    }
+
+    /// 不经 `parse_config`、直接拿一份 `PipelineConfig` 编译的配置，几个 forward 也合成一次转发、上游也先拆好：这些都在
+    /// 编译时算。以前只有 `parse_config` 算，公开的 `RuntimePipelineConfig::from_config` 拿到别处建的配置时不合并，
+    /// 规则只问第一个 forward 的上游
+    /// A configuration compiled from a `PipelineConfig` straight, not through `parse_config`, merges
+    /// its forwards and splits their upstreams too, both being worked out as it compiles. Only
+    /// `parse_config` used to, so the public `RuntimePipelineConfig::from_config` given a
+    /// configuration built elsewhere merged nothing, and the rule asked the first forward's
+    /// upstream alone
+    #[test]
+    fn a_configuration_compiled_without_parse_config_merges_its_forwards() {
+        let config: super::PipelineConfig = serde_json::from_value(json!({
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "any" }],
+                "actions": [
+                    { "type": "forward", "upstream": "1.1.1.1:53, 1.0.0.1:53" },
+                    { "type": "forward", "upstream": "8.8.8.8:53" }
+                ]
+            }] }]
+        }))
+        .expect("parse config");
+        let runtime = crate::matcher::RuntimePipelineConfig::from_config(config).expect("compiles");
+        let rule = &runtime.pipelines[0].rules[0];
+        let merged = rule
+            .merged_forward
+            .as_ref()
+            .expect("several forwards merge");
+        assert_eq!(merged.upstream_list.len(), 3);
+        assert!(matches!(
+            &rule.actions[0],
+            super::Action::Forward { pre_split_upstreams: Some(split), .. } if split.len() == 2
+        ));
     }
 
     /// 合并后的这一次转发只能发一个 ECS：几个 forward 的 ecs 写得一样时就是它；写得不一样（包括有的写、
@@ -2218,6 +2139,64 @@ mod validation_tests {
         super::problems(&super::parse_config(&config.to_string()).expect("parses"))
     }
 
+    /// 没设 bootstrap 时，写成主机名的 TCP、DoT、DoH、DoQ 上游算一条 warning：默认上游、请求和回答阶段的 forward 都算，
+    /// 不写 upstream 的 forward 按它的 transport 连默认上游。都写成 IP、只有 UDP 上游或者设了 bootstrap 时没有。以前只在
+    /// 第一次经系统解析时记一条 warn，默认日志级别看不到
+    /// Without bootstrap, a TCP, DoT, DoH or DoQ upstream written with a host name counts as a
+    /// warning: the default upstream and request- and answer-phase forwards alike, a forward naming
+    /// no upstream connecting to the default one by its transport. None with every upstream an IP,
+    /// with UDP upstreams only, or with bootstrap set. It used to be a warn logged the first time
+    /// the system resolved a name, out of sight at the default log level
+    #[test]
+    fn a_named_upstream_without_bootstrap_is_a_warning() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let warned = |settings: serde_json::Value, actions: serde_json::Value| {
+            let config = serde_json::json!({
+                "settings": settings,
+                "pipelines": [{ "id": "main", "rules": [rule("r", any.clone(), actions)] }]
+            });
+            super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
+                .iter()
+                .any(|warning| warning.starts_with("settings.bootstrap is unset"))
+        };
+        let udp = serde_json::json!({ "default_upstream": "1.1.1.1:53" });
+        let forward =
+            |upstream: &str| serde_json::json!([{ "type": "forward", "upstream": upstream }]);
+        for named in [
+            "tcp://dns.example:53",
+            "tls://dns.example",
+            "https://dns.example/dns-query",
+            "quic://dns.example?sni=dns.example",
+        ] {
+            assert!(warned(udp.clone(), forward(named)), "{named}");
+            assert!(
+                !warned(
+                    serde_json::json!({ "default_upstream": "1.1.1.1:53", "bootstrap": "223.5.5.5:53" }),
+                    forward(named)
+                ),
+                "{named} with bootstrap"
+            );
+        }
+        assert!(warned(
+            serde_json::json!({ "default_upstream": "tls://dns.example" }),
+            serde_json::json!([{ "type": "allow" }])
+        ));
+        assert!(warned(
+            serde_json::json!({ "default_upstream": "dns.example:53" }),
+            serde_json::json!([{ "type": "forward", "transport": "tcp" }])
+        ));
+        for ip in [
+            "1.1.1.1:53",
+            "tcp://1.1.1.1:53",
+            "tcp://[2606:4700::1111]:53",
+            "tls://1.1.1.1?sni=one.one.one.one",
+            "https://1.1.1.1/dns-query",
+            "https://[2606:4700::1111]/dns-query",
+        ] {
+            assert!(!warned(udp.clone(), forward(ip)), "{ip}");
+        }
+    }
+
     /// 白写的取反报出来：第一个匹配器上的 `not`，只有一个匹配器时规则级的 `not`，入口、请求和回答的匹配器都一样。第一个上
     /// 的 `or`、规则级的取反配几个匹配器（第一个起头，后面的取反）照常
     /// A negation written for nothing is raised: `not` on the first matcher, or a chain-level
@@ -2246,7 +2225,7 @@ mod validation_tests {
             { "type": "domain_suffix", "value": "cn" },
             { "type": "domain_suffix", "value": "com" },
         ]);
-        let rule = "pipeline \"main\" rule \"r\": ";
+        let rule = "pipelines[0].rules[0]: ";
         let raised = |what: &str, matchers: &str| {
             format!(
                 "{what} on the first of {matchers} has nothing before it and does not negate it; to match what it does not, put {{\"type\": \"any\"}} first"
@@ -2257,7 +2236,7 @@ mod validation_tests {
             assert_eq!(
                 problems_of(config(matchers.clone(), operator)),
                 [
-                    format!("pipeline_select 1: {}", raised("and_not", "matchers")),
+                    format!("pipeline_select[0]: {}", raised("and_not", "matchers")),
                     format!("{rule}{}", raised("and_not", "matchers")),
                     answer.clone(),
                 ],
@@ -2295,8 +2274,8 @@ mod validation_tests {
         assert_eq!(
             problems_of(rule("SERVFAILL", "WARN")),
             [
-                "pipeline \"main\" rule \"r\": response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
-                "pipeline \"main\" rule \"r\": log level \"WARN\" is none of trace, debug, info, warn, error",
+                "pipelines[0].rules[0]: response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
+                "pipelines[0].rules[0]: log level \"WARN\" is none of trace, debug, info, warn, error",
             ]
         );
         for (rcode, level) in [("OTHER", "warn"), ("other", "debug"), ("servfail", "error")] {
@@ -2446,10 +2425,16 @@ mod validation_tests {
             ]}]
         });
         let found = problems_of(config);
-        for place in ["pipeline_select 1", "rule \"exact\"", "rule \"late\""] {
+        for place in [
+            "pipeline_select[0]",
+            "pipelines[0].rules[0]",
+            "pipelines[0].rules[1]",
+        ] {
             assert!(
-                found.iter().any(|problem| problem.contains(place)
-                    && problem.contains("empty domain_exact matches only the root name")),
+                found
+                    .iter()
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("empty domain_exact matches only the root name")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2521,11 +2506,16 @@ mod validation_tests {
             ]}]
         });
         let found = problems_of(config);
-        for place in ["default_upstream", "rule \"empty\"", "rule \"commas\""] {
+        for place in [
+            "settings.default_upstream",
+            "pipelines[0].rules[0]",
+            "pipelines[0].rules[1]",
+        ] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("no upstream")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2634,18 +2624,17 @@ mod validation_tests {
                 "response_actions_on_miss": [forward("")]
             }
         ])));
-        for place in ["rule \"all empty\"", "rule \"answer\""] {
+        for place in ["pipelines[0].rules[0]", "pipelines[0].rules[1]"] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("no upstream")),
                 "missing {place} in {found:#?}"
             );
         }
     }
 
-    /// 会悄悄做成别的事的写法，每一种都报出来，带上在哪条规则
-    /// Every way of writing that silently does something else is named, with where it is
     /// 一条规则里几个 forward 的 ecs 写得不一样时（包括有的写、有的不写），是一条配置问题：写明规则，说清怎么改。
     /// 写得一样、都不写、只有一个 forward 时不算
     /// A rule whose forwards write different ecs (some written and some not, too) is a
@@ -2678,10 +2667,10 @@ mod validation_tests {
         });
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:?}");
-        for place in ["mixed", "half"] {
+        for place in ["pipelines[0].rules[0]", "pipelines[0].rules[1]"] {
             assert!(
                 found.iter().any(|problem| {
-                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                    problem.starts_with(&format!("{place}: "))
                         && problem.contains("ecs settings differ")
                         && problem.contains("separate rules")
                 }),
@@ -2690,28 +2679,70 @@ mod validation_tests {
         }
     }
 
-    /// 读配置时就拦下写错的 CIDR：响应规则的 response_upstream_ip、response_answer_ip 两种都是
-    /// A CIDR written wrong is refused as the configuration is read, in both
-    /// response_upstream_ip and response_answer_ip
+    /// 写错的网段拒掉，报出写的是什么、在哪：规则的 client_ip、response_upstream_ip、response_answer_ip，以及
+    /// pipeline_select 的 client_ip。以前只说「invalid IP address syntax」，规则一多就不知道是哪一条的哪一项
+    /// A mistyped network is refused naming what was written and where: a rule's client_ip,
+    /// response_upstream_ip and response_answer_ip, and pipeline_select's client_ip. It used to
+    /// say only "invalid IP address syntax", leaving which item of which rule to guess
     #[test]
-    fn a_bad_response_cidr_is_refused_as_the_configuration_is_read() {
-        for kind in ["response_upstream_ip", "response_answer_ip"] {
-            let config = serde_json::json!({
-                "settings": { "default_upstream": "1.1.1.1:53" },
-                "pipelines": [{ "id": "main", "rules": [{
-                    "name": "r",
-                    "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
-                    "response_matchers": [{ "type": kind, "cidr": "10.0.0.0/8, nonsense" }],
-                    "response_actions_on_match": [{ "type": "allow" }]
-                }] }]
-            });
-            assert!(super::parse_config(&config.to_string()).is_err(), "{kind}");
+    fn a_mistyped_network_is_refused_naming_it_and_its_place() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let config =
+            |select: serde_json::Value, matchers: serde_json::Value, answer: serde_json::Value| {
+                serde_json::json!({
+                    "settings": { "default_upstream": "1.1.1.1:53" },
+                    "pipeline_select": [{ "pipeline": "main", "matchers": select }],
+                    "pipelines": [{ "id": "main", "rules": [
+                        rule("first", any.clone(), serde_json::json!([{ "type": "allow" }])),
+                        {
+                            "name": "r",
+                            "matchers": matchers,
+                            "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
+                            "response_matchers": answer,
+                            "response_actions_on_match": [{ "type": "allow" }]
+                        }
+                    ] }]
+                })
+            };
+        let client = |cidr: &str| serde_json::json!([{ "type": "client_ip", "cidr": cidr }]);
+        let answer =
+            |kind: &str| serde_json::json!([{ "type": kind, "cidr": "10.0.0.0/8, nonsense" }]);
+        let no_answer = serde_json::json!([]);
+        for (config, place, written) in [
+            (
+                config(any.clone(), client("10.0.0.0/33"), no_answer.clone()),
+                "pipelines[0].rules[1].matchers[0]",
+                "10.0.0.0/33",
+            ),
+            (
+                config(any.clone(), any.clone(), answer("response_upstream_ip")),
+                "pipelines[0].rules[1].response_matchers[0]",
+                "nonsense",
+            ),
+            (
+                config(any.clone(), any.clone(), answer("response_answer_ip")),
+                "pipelines[0].rules[1].response_matchers[0]",
+                "nonsense",
+            ),
+            (
+                config(client("nonsense"), any.clone(), no_answer.clone()),
+                "pipeline_select[0].matchers[0]",
+                "nonsense",
+            ),
+        ] {
+            let error = format!(
+                "{:#}",
+                super::validate(&config.to_string()).expect_err("refused")
+            );
+            assert!(
+                error.contains(&format!("{place}: \"{written}\" is not an IP network")),
+                "{error}"
+            );
         }
     }
 
-    /// 默认上游写了几个时，读配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
-    /// Several default upstreams are split as the configuration is read (each trimmed,
+    /// 默认上游写了几个时，编译配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
+    /// Several default upstreams are split as the configuration compiles (each trimmed,
     /// empty ones skipped); a single one is not
     #[test]
     fn several_default_upstreams_are_split_ahead() {
@@ -2720,8 +2751,8 @@ mod validation_tests {
                 "settings": { "default_upstream": default_upstream },
                 "pipelines": [{ "id": "main", "rules": [] }]
             });
-            super::parse_config(&config.to_string())
-                .expect("parses")
+            super::compile(super::parse_config(&config.to_string()).expect("parses"))
+                .expect("compiles")
                 .settings
                 .default_upstream_pre_split
                 .map(|list| {
@@ -2737,12 +2768,11 @@ mod validation_tests {
         assert_eq!(split("1.1.1.1:53"), None);
     }
 
-    /// 基础设置的默认值逐个写在这里：配置里不写时读进来的、`GlobalSettings::default()` 给的，都要是
-    /// 这些值，两者的 Debug 输出也一样。面板的基础设置也照这些值显示「默认 …」
-    /// Every basic setting's default is written out here: what a configuration that leaves
-    /// it out reads as, and what `GlobalSettings::default()` gives, must be these values,
-    /// and the two print the same. The panel's basic settings show these values as their
-    /// defaults too
+    /// 配置里不写的设置读进来就是 `GlobalSettings::default()` 给的；每个默认值逐个钉在这里，文档和面板的基础设置都照
+    /// 这些值写「默认 …」
+    /// A setting a configuration leaves out reads as what `GlobalSettings::default()` gives;
+    /// every default is pinned here one by one, as the docs and the panel's basic settings give
+    /// these values as the defaults
     #[test]
     fn every_setting_has_the_default_written_here() {
         use super::GlobalSettings;
@@ -2752,78 +2782,77 @@ mod validation_tests {
             format!("{read:?}"),
             format!("{:?}", GlobalSettings::default())
         );
-        for settings in [read, GlobalSettings::default()] {
-            assert_eq!(settings.min_ttl, 0, "min_ttl");
-            assert_eq!(settings.bind_udp, "0.0.0.0:5353", "bind_udp");
-            assert_eq!(settings.bind_tcp, "0.0.0.0:5353", "bind_tcp");
-            assert_eq!(settings.bind_doh, None, "bind_doh");
-            assert_eq!(settings.doh_tls_cert, None, "doh_tls_cert");
-            assert_eq!(settings.doh_tls_key, None, "doh_tls_key");
-            assert_eq!(settings.doh_path, "/dns-query", "doh_path");
-            assert_eq!(settings.cache_capacity, 10_000, "cache_capacity");
-            assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
-            assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
-            assert_eq!(settings.default_upstream, "1.1.1.1:53", "default_upstream");
-            assert!(
-                settings.default_upstream_pre_split.is_none(),
-                "default_upstream_pre_split"
-            );
-            assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");
-            assert_eq!(settings.request_timeout_ms, None, "request_timeout_ms");
-            assert_eq!(settings.response_jump_limit, 10, "response_jump_limit");
-            assert_eq!(settings.udp_pool_size, 64, "udp_pool_size");
-            assert_eq!(settings.tcp_pool_size, 64, "tcp_pool_size");
-            assert_eq!(settings.doh_pool_size, 8, "doh_pool_size");
-            assert_eq!(
-                settings.doh_health_check_error_threshold, 3,
-                "doh_health_check_error_threshold"
-            );
-            assert_eq!(settings.dot_pool_size, 64, "dot_pool_size");
-            assert_eq!(settings.doq_pool_size, 16, "doq_pool_size");
-            assert_eq!(
-                settings.tcp_connection_max_age_seconds, 300,
-                "tcp_connection_max_age_seconds"
-            );
-            assert_eq!(
-                settings.tcp_connection_idle_timeout_seconds, 60,
-                "tcp_connection_idle_timeout_seconds"
-            );
-            assert_eq!(
-                settings.doq_connection_idle_timeout_seconds, 60,
-                "doq_connection_idle_timeout_seconds"
-            );
-            assert_eq!(
-                settings.doq_keepalive_interval_ms, 15_000,
-                "doq_keepalive_interval_ms"
-            );
-            assert!(settings.doq_enable_0rtt, "doq_enable_0rtt");
-            assert!(settings.bootstrap.is_empty(), "bootstrap");
-            assert!(!settings.flow_control_enabled, "flow_control_enabled");
-            assert!(!settings.serve_stale, "serve_stale");
-            assert_eq!(settings.serve_stale_ttl, 30, "serve_stale_ttl");
-            assert_eq!(
-                settings.serve_stale_expire_ttl, 86400,
-                "serve_stale_expire_ttl"
-            );
-            assert!(!settings.serve_stale_ttl_reset, "serve_stale_ttl_reset");
-            assert_eq!(
-                settings.serve_stale_client_timeout_ms, 0,
-                "serve_stale_client_timeout_ms"
-            );
-            assert!(
-                !settings.cache_background_refresh,
-                "cache_background_refresh"
-            );
-            assert_eq!(
-                settings.cache_refresh_threshold_percent, 10,
-                "cache_refresh_threshold_percent"
-            );
-            assert_eq!(settings.cache_refresh_min_ttl, 5, "cache_refresh_min_ttl");
-            assert_eq!(settings.geoip_db_path, None, "geoip_db_path");
-            assert_eq!(settings.geoip_dat_path, None, "geoip_dat_path");
-            assert!(settings.geosite_data_paths.is_empty(), "geosite_data_paths");
-            assert!(settings.enable_tcp_fallback, "enable_tcp_fallback");
-        }
+        let settings = read;
+        assert_eq!(settings.min_ttl, 0, "min_ttl");
+        assert_eq!(settings.bind_udp, "0.0.0.0:5353", "bind_udp");
+        assert_eq!(settings.bind_tcp, "0.0.0.0:5353", "bind_tcp");
+        assert_eq!(settings.bind_doh, None, "bind_doh");
+        assert_eq!(settings.doh_tls_cert, None, "doh_tls_cert");
+        assert_eq!(settings.doh_tls_key, None, "doh_tls_key");
+        assert_eq!(settings.doh_path, "/dns-query", "doh_path");
+        assert_eq!(settings.cache_capacity, 10_000, "cache_capacity");
+        assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
+        assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
+        assert_eq!(settings.default_upstream, "1.1.1.1:53", "default_upstream");
+        assert!(
+            settings.default_upstream_pre_split.is_none(),
+            "default_upstream_pre_split"
+        );
+        assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");
+        assert_eq!(settings.request_timeout_ms, None, "request_timeout_ms");
+        assert_eq!(settings.response_jump_limit, 10, "response_jump_limit");
+        assert_eq!(settings.udp_pool_size, 64, "udp_pool_size");
+        assert_eq!(settings.tcp_pool_size, 64, "tcp_pool_size");
+        assert_eq!(settings.doh_pool_size, 8, "doh_pool_size");
+        assert_eq!(
+            settings.doh_health_check_error_threshold, 3,
+            "doh_health_check_error_threshold"
+        );
+        assert_eq!(settings.dot_pool_size, 64, "dot_pool_size");
+        assert_eq!(settings.doq_pool_size, 16, "doq_pool_size");
+        assert_eq!(
+            settings.tcp_connection_max_age_seconds, 300,
+            "tcp_connection_max_age_seconds"
+        );
+        assert_eq!(
+            settings.tcp_connection_idle_timeout_seconds, 60,
+            "tcp_connection_idle_timeout_seconds"
+        );
+        assert_eq!(
+            settings.doq_connection_idle_timeout_seconds, 60,
+            "doq_connection_idle_timeout_seconds"
+        );
+        assert_eq!(
+            settings.doq_keepalive_interval_ms, 15_000,
+            "doq_keepalive_interval_ms"
+        );
+        assert!(settings.doq_enable_0rtt, "doq_enable_0rtt");
+        assert!(settings.bootstrap.is_empty(), "bootstrap");
+        assert!(!settings.flow_control_enabled, "flow_control_enabled");
+        assert!(!settings.serve_stale, "serve_stale");
+        assert_eq!(settings.serve_stale_ttl, 30, "serve_stale_ttl");
+        assert_eq!(
+            settings.serve_stale_expire_ttl, 86400,
+            "serve_stale_expire_ttl"
+        );
+        assert!(!settings.serve_stale_ttl_reset, "serve_stale_ttl_reset");
+        assert_eq!(
+            settings.serve_stale_client_timeout_ms, 0,
+            "serve_stale_client_timeout_ms"
+        );
+        assert!(
+            !settings.cache_background_refresh,
+            "cache_background_refresh"
+        );
+        assert_eq!(
+            settings.cache_refresh_threshold_percent, 10,
+            "cache_refresh_threshold_percent"
+        );
+        assert_eq!(settings.cache_refresh_min_ttl, 5, "cache_refresh_min_ttl");
+        assert_eq!(settings.geoip_db_path, None, "geoip_db_path");
+        assert_eq!(settings.geoip_dat_path, None, "geoip_dat_path");
+        assert!(settings.geosite_data_paths.is_empty(), "geosite_data_paths");
+        assert!(settings.enable_tcp_fallback, "enable_tcp_fallback");
     }
 
     /// 只写了一部分设置时，写了的照写的读，没写的取默认值。挑的十来个字段类型各不相同：字符串、
@@ -2869,11 +2898,20 @@ mod validation_tests {
         }
     }
 
+    /// 会悄悄做成别的事的写法，每一种都报出来，按位置说在哪，和读不懂的键一样：`settings.` 下的设置、
+    /// `pipeline_select[i]`、`pipelines[i].rules[j]`。规则名可以重复，以前按名字说在哪，重名时分不清是哪一条。不以 `/`
+    /// 开头的 doh_path（DoH 对每个请求都回 404）以前不算问题，空的 request_domain_suffix 以前让整份配置读不进来
+    /// Every way of writing that silently does something else is named with its place, a path
+    /// as for the keys not read: a setting under `settings.`, `pipeline_select[i]`,
+    /// `pipelines[i].rules[j]`. Rule names may repeat, and the name a rule used to be raised by
+    /// could not tell which it was. A doh_path not starting with `/` (DoH answering every query
+    /// with 404) used to be no problem, and an empty request_domain_suffix used to keep the whole
+    /// configuration from being read
     #[test]
     fn problems_name_what_would_silently_do_something_else() {
         let any = serde_json::json!([{ "type": "any" }]);
         let config = serde_json::json!({
-            "settings": { "default_upstream": "dns.example:53", "bootstrap": "223.5.5.5:53, dns.google:53" },
+            "settings": { "default_upstream": "dns.example:53", "bootstrap": "223.5.5.5:53, dns.google:53", "doh_path": "dns-query" },
             "pipeline_select": [{ "pipeline": "gone", "matchers": [{ "type": "domain_suffix", "value": "" }] }],
             "pipelines": [{ "id": "main", "rules": [
                 rule("port", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "1.1.1.1:99999" }])),
@@ -2892,40 +2930,49 @@ mod validation_tests {
                     "name": "late",
                     "matchers": any,
                     "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
-                    "response_matchers": [{ "type": "request_domain_regex", "value": "" }],
+                    "response_matchers": [
+                        { "type": "request_domain_regex", "value": "" },
+                        { "type": "request_domain_suffix", "value": "" }
+                    ],
                     "response_actions_on_miss": [{ "type": "forward", "upstream": "udp+tcp://dns.example:53" }]
                 }
             ]}]
         });
         let found = problems_of(config);
         for (place, fragment) in [
-            ("default_upstream", "dns.example:53"),
-            ("bootstrap", "dns.google:53"),
-            ("pipeline_select 1", "no pipeline \"gone\""),
-            ("pipeline_select 1", "empty domain matcher"),
-            ("rule \"port\"", "1.1.1.1:99999"),
-            ("rule \"name\"", "nonsense"),
-            ("rule \"scheme\"", "unknown prefix \"http://\""),
-            ("rule \"doq\"", "sni"),
-            ("rule \"rcode\"", "WHATEVER"),
-            ("rule \"ip\"", "192.0.2.1, nope"),
-            ("rule \"noip\"", "ip \"\""),
-            ("rule \"cname\"", "cname target"),
-            ("rule \"txt\"", "256 bytes"),
-            ("rule \"jump\"", "\"gone\", which does not exist"),
-            ("rule \"suffix\"", "empty domain matcher"),
-            ("rule \"regex\"", "empty domain matcher"),
-            ("rule \"late\"", "empty domain matcher"),
-            ("rule \"late\"", "udp+tcp://dns.example:53"),
+            ("settings.default_upstream", "dns.example:53"),
+            ("settings.bootstrap", "dns.google:53"),
+            (
+                "settings.doh_path",
+                "\"dns-query\" does not start with \"/\"",
+            ),
+            ("pipeline_select[0]", "no pipeline \"gone\""),
+            ("pipeline_select[0]", "empty domain matcher"),
+            ("pipelines[0].rules[0]", "1.1.1.1:99999"),
+            ("pipelines[0].rules[1]", "nonsense"),
+            ("pipelines[0].rules[2]", "unknown prefix \"http://\""),
+            ("pipelines[0].rules[3]", "sni"),
+            ("pipelines[0].rules[4]", "WHATEVER"),
+            ("pipelines[0].rules[5]", "192.0.2.1, nope"),
+            ("pipelines[0].rules[6]", "ip \"\""),
+            ("pipelines[0].rules[7]", "cname target"),
+            ("pipelines[0].rules[8]", "256 bytes"),
+            ("pipelines[0].rules[9]", "\"gone\", which does not exist"),
+            ("pipelines[0].rules[10]", "empty domain matcher"),
+            ("pipelines[0].rules[11]", "empty domain matcher"),
+            ("pipelines[0].rules[12]", "empty domain matcher"),
+            ("pipelines[0].rules[12]", "udp+tcp://dns.example:53"),
         ] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains(fragment)),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains(fragment)),
                 "missing {place} / {fragment} in {found:#?}"
             );
         }
-        assert_eq!(found.len(), 18, "{found:#?}");
+        // 第 12 条的两个空匹配器各报一次 / The two empty matchers of rule 12 are raised once each
+        assert_eq!(found.len(), 20, "{found:#?}");
     }
 
     /// 平常的正确写法一条都不报 / The ordinary right ways of writing raise nothing
@@ -2977,11 +3024,13 @@ mod validation_tests {
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:#?}");
         assert!(
-            found[0].starts_with("pipeline \"main\": ") && found[0].contains("3 pipelines"),
+            found[0].starts_with("pipelines[0]: ")
+                && found[0].contains("3 pipelines are written with the id \"main\""),
             "{found:#?}"
         );
         assert!(
-            found[1].starts_with("pipeline \"other\": ") && found[1].contains("2 pipelines"),
+            found[1].starts_with("pipelines[1]: ")
+                && found[1].contains("2 pipelines are written with the id \"other\""),
             "{found:#?}"
         );
     }
@@ -3007,10 +3056,13 @@ mod validation_tests {
         });
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:#?}");
-        for (place, ip) in [("wrong", "203.0.113.300"), ("late", "somewhere")] {
+        for (place, ip) in [
+            ("pipelines[0].rules[0]", "203.0.113.300"),
+            ("pipelines[0].rules[3]", "somewhere"),
+        ] {
             assert!(
                 found.iter().any(|problem| {
-                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                    problem.starts_with(&format!("{place}: "))
                         && problem.contains(&format!("ecs ip \"{ip}\""))
                 }),
                 "missing {place} in {found:#?}"

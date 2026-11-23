@@ -748,41 +748,32 @@ impl<'a> Forwarding<'a> {
     }
 
     /// 拿这次转发的应答：规则越过的应答只在决定允许时复用（continue 之后的 `allow`）；其余的等已经在问同一个问题的
-    /// 那个，或者自己去问。被截断的应答改用 TCP 重取一次，取到的结果照常往下走。UDP 转发本身已经会用 TCP 重取截断的
-    /// 应答，所以这里只在两种情况下再试：它拿回的 TCP 应答仍带 TC 位；或者 `tcp+udp://` 上游双发时 TCP 那一路失败，
-    /// 留下了截断的 UDP 应答
+    /// 那个，或者自己去问。被截断的应答只在传输层处理一次（见 `forward_upstream`）：拿到的截断应答就是 TCP 也取不到
+    /// 完整应答时留下的，和别的应答一样往下走，客户端看到 TC 自己改用 TCP。以前这里对 UDP 转发再问一次 TCP，失败了就走
+    /// 失败路径，客户端拿到的是 SERVFAIL
     /// Get this forward's reply: an answer a rule continued past is reused only where the
     /// decision allows it (an `allow` after a continue); otherwise the forward waits on
     /// whoever already asks the same question, or asks for its own. A truncated answer is
-    /// fetched once more over TCP, and whatever comes back goes on as usual. The UDP forwarder
-    /// already fetches truncated answers again over TCP, so this only tries again in two cases:
-    /// the TCP answer it got still has TC set, or a `tcp+udp://` upstream's TCP leg failed and
-    /// left the truncated UDP answer
+    /// dealt with once, in the transport layer (see `forward_upstream`): one that comes back
+    /// here is what was left when TCP could not fetch the whole answer either, and goes on like
+    /// any other, the client turning to TCP itself on seeing TC. A UDP forward used to ask over
+    /// TCP once more here, and on failing took the failure path, the client getting SERVFAIL
     async fn fetch(&mut self, response: &mut ResponseInfo) -> Fetched {
         let allow_reuse = self.cx.allow_reuse;
-        let (reply, reused) = match self.cx.reused_response.take_if(|_| allow_reuse) {
-            Some(ctx) => (Ok((ctx.raw, ctx.upstream)), true),
-            None => match self.wait_on_another(response).await {
-                Some(Ok(answer)) => return Fetched::Joined(answer),
-                Some(Err(gave_up)) => (Err(gave_up), false),
-                None => (self.ask(self.cx.transport).await, false),
-            },
+        if let Some(ctx) = self.cx.reused_response.take_if(|_| allow_reuse) {
+            return Fetched::Own {
+                reply: Ok((ctx.raw, ctx.upstream)),
+                reused: true,
+            };
+        }
+        let reply = match self.wait_on_another(response).await {
+            Some(Ok(answer)) => return Fetched::Joined(answer),
+            Some(Err(gave_up)) => Err(gave_up),
+            None => self.ask().await,
         };
-        match reply {
-            Ok((raw, _))
-                if self.cx.transport == Some(Transport::Udp)
-                    && self.cx.state.pipeline.settings.enable_tcp_fallback
-                    && proto_utils::truncated_response(&raw) =>
-            {
-                tracing::debug!(event = "tc_flag_retry", upstream = %self.cx.upstream, "response truncated, retrying with tcp");
-                // 取回的是这次转发自己的应答，不论之前是不是复用的 / What comes back is a reply of
-                // this forward's own, reused or not before
-                Fetched::Own {
-                    reply: self.ask(Some(Transport::Tcp)).await,
-                    reused: false,
-                }
-            }
-            reply => Fetched::Own { reply, reused },
+        Fetched::Own {
+            reply,
+            reused: false,
         }
     }
 
@@ -915,15 +906,15 @@ impl<'a> Forwarding<'a> {
         }
     }
 
-    /// 把这次转发发给上游，经 `transport` / Send this forward upstream, over `transport`
-    async fn ask(&self, transport: Option<Transport>) -> Reply {
+    /// 把这次转发发给上游 / Send this forward upstream
+    async fn ask(&self) -> Reply {
         let cx = &self.cx;
         crate::engine::upstream::forward_upstream(
             self.engine,
             &self.packet,
             cx.upstream,
             cx.upstream_timeout,
-            transport,
+            cx.transport,
             cx.pre_split_upstreams,
             cx.observed,
             cx.refresh.is_none().then(|| cx.peer.ip()),
@@ -2825,6 +2816,8 @@ mod tcp_fallback_tests {
     /// The address a truncated answer may carry.
     /// 截断的应答里可能带的地址。
     const PARTIAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 9);
+    /// 只走 TCP 的上游答的地址 / The address a TCP-only upstream answers
+    const TCP_ONLY: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 77);
 
     fn reply(request: &[u8], answer: Option<Ipv4Addr>, truncated: bool) -> Option<Vec<u8>> {
         let request = Message::from_bytes(request).ok()?;
@@ -2946,44 +2939,34 @@ mod tcp_fallback_tests {
         }
     }
 
-    /// A TCP-only upstream: it answers 192.0.2.77 after `delay`, or, with no delay given,
-    /// holds the port without listening.
-    /// 只走 TCP 的上游：延迟 `delay` 后应答 192.0.2.77；不给延迟时占着端口但不监听。
-    async fn spawn_tcp_upstream(
-        delay: Option<Duration>,
-    ) -> (String, Option<tokio::net::TcpSocket>) {
-        match delay {
-            Some(delay) => {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let addr = listener.local_addr().unwrap();
-                drop(serve_tcp(listener, Ipv4Addr::new(192, 0, 2, 77), delay));
-                (format!("tcp://{addr}"), None)
-            }
-            None => {
-                let held = hold_tcp_port("127.0.0.1:0".parse().unwrap()).unwrap();
-                let addr = held.local_addr().unwrap();
-                (format!("tcp://{addr}"), Some(held))
-            }
-        }
+    /// 只走 TCP 的上游：延迟 `delay` 后应答 [`TCP_ONLY`] / A TCP-only upstream answering
+    /// [`TCP_ONLY`] after `delay`
+    async fn spawn_tcp_upstream(delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(serve_tcp(listener, TCP_ONLY, delay));
+        format!("tcp://{addr}")
     }
 
     fn engine_with_rule(upstream: &str, checks: serde_json::Value) -> Engine {
         engine_with(
-            serde_json::json!({ "type": "forward", "upstream": upstream, "transport": "udp" }),
+            serde_json::json!([{ "type": "forward", "upstream": upstream, "transport": "udp" }]),
             checks,
             true,
         )
     }
 
+    /// 一条规则的引擎：动作是 `actions`，`checks` 补上回答检查 / An engine of one rule doing
+    /// `actions`, `checks` adding its answer check
     fn engine_with(
-        action: serde_json::Value,
+        actions: serde_json::Value,
         checks: serde_json::Value,
         tcp_fallback: bool,
     ) -> Engine {
         let mut rule = serde_json::json!({
             "name": "forward",
             "matchers": [{ "type": "any" }],
-            "actions": [action]
+            "actions": actions
         });
         for (key, value) in checks.as_object().unwrap() {
             rule[key] = value.clone();
@@ -3057,7 +3040,7 @@ mod tcp_fallback_tests {
     #[tokio::test]
     async fn a_truncated_answer_fetched_over_tcp_goes_through_the_response_rules() {
         let truncating = spawn_truncating_upstream(Some(Duration::ZERO), None).await;
-        let (slow, _) = spawn_tcp_upstream(Some(Duration::from_millis(500))).await;
+        let slow = spawn_tcp_upstream(Duration::from_millis(500)).await;
         let engine = engine_with_rule(
             &format!("{},{slow}", truncating.addr),
             serde_json::json!({
@@ -3078,7 +3061,7 @@ mod tcp_fallback_tests {
     #[tokio::test]
     async fn a_truncated_answer_fetched_over_tcp_is_cached() {
         let truncating = spawn_truncating_upstream(Some(Duration::ZERO), None).await;
-        let (slow, _) = spawn_tcp_upstream(Some(Duration::from_millis(500))).await;
+        let slow = spawn_tcp_upstream(Duration::from_millis(500)).await;
         let engine = engine_with_rule(
             &format!("{},{slow}", truncating.addr),
             serde_json::json!({}),
@@ -3092,25 +3075,48 @@ mod tcp_fallback_tests {
         );
     }
 
-    /// When the TCP retry fails too, the failure path runs, miss actions included.
-    /// TCP 重试也失败时走失败路径，包括 on_miss 动作。
+    /// TCP 也取不到完整应答时，截断的应答和别的应答一样往下走：回答检查看到的是它，失败路径（这里是 on_miss 动作）
+    /// 不走，客户端看到 TC 自己改用 TCP。以前 UDP 转发在这之后再问一次 TCP，失败了就走失败路径
+    /// When TCP cannot fetch the whole answer either, the truncated answer goes on like any
+    /// other: the answer check sees it and the failure path (the miss actions here) does not
+    /// run, the client turning to TCP itself on seeing TC. A UDP forward used to ask over TCP
+    /// once more after that, and on failing took the failure path
     #[tokio::test]
-    async fn a_failed_tcp_retry_takes_the_failure_path() {
-        let truncating = spawn_truncating_upstream(None, None).await;
-        let (dead, _held) = spawn_tcp_upstream(None).await;
+    async fn a_truncated_answer_tcp_cannot_complete_goes_on_as_the_answer() {
+        let truncating = spawn_truncating_upstream(None, Some(PARTIAL)).await;
         let engine = engine_with_rule(
-            &format!("{},{dead}", truncating.addr),
+            &truncating.addr,
             serde_json::json!({
-                "response_matchers": [{ "type": "response_answer_ip", "cidr": "192.0.2.1/32" }],
+                "response_matchers": [{ "type": "response_answer_ip", "cidr": "192.0.2.9/32" }],
                 "response_actions_on_miss": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
             }),
         );
         let answer = ask(&engine).await;
-        assert_eq!(
-            answer.metadata.response_code,
-            ResponseCode::NXDomain,
-            "the miss actions must answer when the TCP retry fails: {answer:?}"
+        assert!(answer.metadata.truncation, "{answer:?}");
+        assert_eq!(addresses(&answer), [PARTIAL]);
+    }
+
+    /// 几个上游一起问时（这里是一条规则里的两个 forward），截断的应答不抢先：没有什么能补全它（这里关着 TCP 回退），
+    /// 就等别的上游的完整应答。以前它先到先赢，慢一些的完整应答被取消，客户端只拿到截断的那份
+    /// Of several upstreams asked together (two forwards of one rule here), a truncated answer
+    /// does not come first: with nothing to complete it (TCP fallback off here), the whole
+    /// answer of another upstream is waited for. It used to win by coming first, the slower
+    /// whole answer cancelled and the client getting only the truncated one
+    #[tokio::test]
+    async fn a_truncated_answer_does_not_beat_a_whole_one() {
+        let truncating = spawn_truncating_upstream(None, Some(PARTIAL)).await;
+        let slow = spawn_tcp_upstream(Duration::from_millis(300)).await;
+        let engine = engine_with(
+            serde_json::json!([
+                { "type": "forward", "upstream": truncating.addr },
+                { "type": "forward", "upstream": slow }
+            ]),
+            serde_json::json!({}),
+            false,
         );
+        let answer = ask(&engine).await;
+        assert!(!answer.metadata.truncation, "{answer:?}");
+        assert_eq!(addresses(&answer), [TCP_ONLY]);
     }
 
     /// An upstream written as `udp://` next to a TCP one: its truncated answer is fetched
@@ -3119,7 +3125,7 @@ mod tcp_fallback_tests {
     #[tokio::test]
     async fn a_udp_upstream_next_to_a_tcp_one_has_truncated_answers_fetched_over_tcp() {
         let truncating = spawn_truncating_upstream(Some(Duration::ZERO), Some(PARTIAL)).await;
-        let (slow, _) = spawn_tcp_upstream(Some(Duration::from_millis(500))).await;
+        let slow = spawn_tcp_upstream(Duration::from_millis(500)).await;
         let engine = engine_with_rule(
             &format!("udp://{},{slow}", truncating.addr),
             serde_json::json!({}),
@@ -3138,7 +3144,7 @@ mod tcp_fallback_tests {
         let truncating =
             spawn_truncating_upstream(Some(Duration::from_millis(200)), Some(PARTIAL)).await;
         let engine = engine_with(
-            serde_json::json!({ "type": "forward", "upstream": truncating.addr, "transport": "tcp_udp" }),
+            serde_json::json!([{ "type": "forward", "upstream": truncating.addr, "transport": "tcp_udp" }]),
             serde_json::json!({}),
             true,
         );
@@ -3223,7 +3229,7 @@ mod tcp_fallback_tests {
     async fn a_truncated_answer_is_never_cached() {
         let truncating = spawn_truncating_upstream(None, Some(PARTIAL)).await;
         let engine = engine_with(
-            serde_json::json!({ "type": "forward", "upstream": truncating.addr }),
+            serde_json::json!([{ "type": "forward", "upstream": truncating.addr }]),
             serde_json::json!({}),
             false,
         );

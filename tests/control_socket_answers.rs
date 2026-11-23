@@ -1,11 +1,11 @@
 //! The control socket's answers to request bodies it refuses or cannot use: too
-//! large, unreadable, not the JSON asked for, a configuration that fails to
-//! validate; and its answer to one that passes.
+//! large, unreadable, not UTF-8 or not the JSON asked for, a configuration that
+//! fails to validate; and its answer to one that passes.
 //!
 //! Runs the real binary with its control socket and checks each answer's status,
 //! error code and message word for word.
 //!
-//! 控制通道对拒收或用不了的请求正文的回答：太大、读不出来、不是要的 JSON、校验不过的配置；以及对
+//! 控制通道对拒收或用不了的请求正文的回答：太大、读不出来、不是 UTF-8 或不是要的 JSON、校验不过的配置；以及对
 //! 校验通过的配置的回答。在真的程序上开控制通道，逐个核对回答的状态码、错误码和说明。
 #![cfg(unix)]
 
@@ -127,15 +127,17 @@ fn the_control_socket_answers_bodies_it_cannot_use_in_its_own_words() {
         assert_eq!(body["protocol_version"], 1, "{path}");
     }
 
-    // 读不出来：chunked 正文的块长度写坏了 / Unreadable: a chunked body with a broken chunk size
+    // 读不出来：chunked 正文的块长度写坏了。是请求本身坏了，回 400，不是 413；以前三个都回 413，诊断和试跑还说成太大
+    // Unreadable: a chunked body with a broken chunk size. The request itself is broken, a 400
+    // and no 413; all three used to answer 413, the diagnostic and the trial calling it too large
     for (path, expected) in [
         (
             "/v1/diagnostics/trace",
-            ("diagnostic_body_invalid", "诊断请求不能超过 2 KiB"),
+            ("diagnostic_body_invalid", "读取诊断请求失败"),
         ),
         (
             "/v1/diagnostics/trace-candidate",
-            ("diagnostic_body_invalid", "试跑请求不能超过 4 MiB"),
+            ("diagnostic_body_invalid", "读取试跑请求失败"),
         ),
         (
             "/v1/config/validate",
@@ -143,9 +145,16 @@ fn the_control_socket_answers_bodies_it_cannot_use_in_its_own_words() {
         ),
     ] {
         let (status, body) = post(&control, path, "Transfer-Encoding: chunked\r\n", b"zz\r\n");
-        assert_eq!(status, 413, "{path}: {body}");
+        assert_eq!(status, 400, "{path}: {body}");
         assert_eq!(error(&body), expected, "{path}");
     }
+
+    // 不是 UTF-8 的配置：400，以前当成空串去校验，回一份空配置的解析错误
+    // A configuration that is not UTF-8: 400; it used to be validated as an empty string,
+    // answered with the parse error of an empty configuration
+    let (status, body) = sized(&control, "/v1/config/validate", b"{\xff}");
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(error(&body), ("config_body_invalid", "配置不是 UTF-8 文本"));
 
     // 不是要的 JSON / Not the JSON asked for
     for (path, prefix) in [

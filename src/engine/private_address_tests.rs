@@ -1,10 +1,9 @@
-//! 「是不是内网地址」在两处各多算一个地址：0.0.0.0 只在 ECS 那边算（见 `ecs_scope_tests`），
-//! 255.255.255.255 只在 `geoip_private` 这边算。这里固定 `geoip_private` 这边的两条路：客户端的
-//! 来源地址，和应答里的地址。
-//! Whether an address is on a local network counts one more address in each of two
-//! places: 0.0.0.0 only on the ECS side (see `ecs_scope_tests`), 255.255.255.255 only
-//! for `geoip_private`. This pins the two paths of `geoip_private`: the client's source
-//! address and the addresses in an answer.
+//! 「是不是内网地址」在两处各多算一些：255.255.255.255 只在 `geoip_private` 这边算，其他不可全球路由的网段只在
+//! ECS 那边算（见 `ecs_scope_tests`）。这里固定 `geoip_private` 这边的两条路：客户端的来源地址，和应答里的地址。
+//! Whether an address is on a local network counts some more in each of two places:
+//! 255.255.255.255 only for `geoip_private`, the other ranges that are not globally routable
+//! only on the ECS side (see `ecs_scope_tests`). This pins the two paths of `geoip_private`:
+//! the client's source address and the addresses in an answer.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -34,11 +33,14 @@ fn peer(client: &str) -> SocketAddr {
     format!("{client}:53000").parse().unwrap()
 }
 
-/// `geoip_private` 把 255.255.255.255 当作内网地址，0.0.0.0 不当作：来源地址和应答里的地址都这样
-/// `geoip_private` counts 255.255.255.255 as a local network address and 0.0.0.0 not, for
-/// the source address and for the addresses in an answer alike
+/// `geoip_private` 把 0.0.0.0 和 255.255.255.255 都当作内网地址，来源地址和应答里的地址都这样。以前 0.0.0.0 不算：
+/// 上游回 0.0.0.0（在 Linux、macOS 上连过去就是本机）时，防重绑定的规则放过了它
+/// `geoip_private` counts 0.0.0.0 and 255.255.255.255 as local network addresses, for the
+/// source address and for the addresses in an answer alike. 0.0.0.0 used not to count: an
+/// upstream answering it (which reaches this machine on Linux and macOS) got past
+/// anti-rebinding rules
 #[tokio::test]
-async fn geoip_private_counts_255_255_255_255_but_not_0_0_0_0() {
+async fn geoip_private_counts_0_0_0_0_and_255_255_255_255() {
     // 上游回问题名第一个标签写的地址：zero 回 0.0.0.0，broadcast 回 255.255.255.255
     // The upstream answers the address the first label names: zero 0.0.0.0, broadcast
     // 255.255.255.255
@@ -91,19 +93,23 @@ async fn geoip_private_counts_255_255_255_255_but_not_0_0_0_0() {
     }));
     let answer = |reply: bytes::Bytes| first_a(&reply);
     // 客户端的来源地址 / The client's source address
+    let public = peer("198.51.100.7");
+    assert_eq!(
+        answer(support::ask(&engine, &query("client.test."), public).await),
+        Some(PUBLIC_CLIENT)
+    );
     assert_eq!(
         answer(support::ask(&engine, &query("client.test."), peer("0.0.0.0")).await),
-        Some(PUBLIC_CLIENT)
+        Some(PRIVATE_CLIENT)
     );
     assert_eq!(
         answer(support::ask(&engine, &query("client.test."), peer("255.255.255.255")).await),
         Some(PRIVATE_CLIENT)
     );
     // 应答里的地址 / The address in an answer
-    let public = peer("198.51.100.7");
     assert_eq!(
         answer(support::ask(&engine, &query("zero.answer.test."), public).await),
-        Some(Ipv4Addr::UNSPECIFIED)
+        Some(PRIVATE_ANSWER)
     );
     assert_eq!(
         answer(support::ask(&engine, &query("broadcast.answer.test."), public).await),

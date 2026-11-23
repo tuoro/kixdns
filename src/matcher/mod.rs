@@ -17,6 +17,7 @@ use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use anyhow::Context;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
 use ipnet::IpNet;
@@ -150,7 +151,16 @@ mod matcher_helpers {
         !has_hint || matched
     }
 
-    /// Apply a predicate to direct addresses or any alternative HTTPS/SVCB IP hint.
+    /// 一条记录里的地址是否都满足 `predicate`：A/AAAA 的地址，HTTPS/SVCB 的地址提示里有一个满足就算。回答里的每个地址
+    /// 都从这里过，所以 IPv4 映射形式的 IPv6 地址（`::ffff:a.b.c.d`）在这里换成它所指的 IPv4 地址：连过去连的就是那个
+    /// IPv4 地址，而 `response_answer_ip`、`geoip_private`、`geoip_country` 按 IPv6 地址看它时，AAAA `::ffff:192.168.1.1`
+    /// 不算内网，防重绑定的规则就这样放过了它
+    /// Whether the addresses in a record all pass `predicate`: an A/AAAA's address, and for an
+    /// HTTPS/SVCB one of its hints passing is enough. Every address in an answer comes through
+    /// here, so an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) turns here into the IPv4 address
+    /// it names: connecting to it reaches that IPv4 address, while `response_answer_ip`,
+    /// `geoip_private` and `geoip_country` taking it as an IPv6 address did not count AAAA
+    /// `::ffff:192.168.1.1` as a local one, and anti-rebinding rules let it through
     pub fn all_rdata_ips_match<F>(
         data: &hickory_proto::rr::RData,
         has_ip: &mut bool,
@@ -161,6 +171,7 @@ mod matcher_helpers {
     {
         use hickory_proto::rr::RData;
 
+        let predicate = &mut |ip: IpAddr| predicate(ip.to_canonical());
         match data {
             RData::A(address) => {
                 *has_ip = true;
@@ -394,23 +405,39 @@ pub struct RuntimePipelineSelectorMatcherWithOp {
 
 /// `dashmap_shards` 最多多少 / The most `dashmap_shards` may be
 impl RuntimePipelineConfig {
+    /// 把一份配置编译成运行时的样子，转发时要用的都在这里先算好，只算这一遍：拆好的上游、几个 forward 合成的一次转发。
+    /// 编译不了的匹配器连同它的位置报出来，写成 `pipelines[0].rules[2].matchers[1]` 这样的路径，和读不懂的键一样
+    /// Compiles a configuration into its runtime form, working out here, once, what forwarding
+    /// needs: the upstreams split and the one forward several forwards merge into. A matcher
+    /// that cannot be compiled is reported with its place, a path like
+    /// `pipelines[0].rules[2].matchers[1]` as for the keys not read
     pub fn from_config(mut cfg: PipelineConfig) -> anyhow::Result<Self> {
         cfg.settings.validate()?;
         let warnings = config::warnings(&cfg);
+        // 默认上游有几个时同时问 / Several default upstreams are asked at once
+        cfg.settings.pre_split_default_upstream();
 
         let mut pipelines = Vec::new();
         // What each pipeline's rules tell requesters apart by / 每个 pipeline 的规则区分请求方的依据
         let mut reads = Vec::new();
-        for p in cfg.pipelines {
+        for (i, p) in cfg.pipelines.into_iter().enumerate() {
             let mut rules = Vec::new();
-            for r in p.rules {
+            for (j, mut r) in p.rules.into_iter().enumerate() {
+                // Pre-compute merged Forward upstreams for multi-Forward rules (performance optimization).
+                // Eliminates per-request FxHashSet + format! + join overhead on the hot path.
+                // 预计算多 Forward 规则的合并上游（性能优化）。
+                // 消除热路径上每请求的 FxHashSet + format! + join 开销。
+                r.compute_merged_forward();
                 let mut matchers = r
                     .matchers
                     .into_iter()
-                    .map(|m| {
+                    .enumerate()
+                    .map(|(k, m)| {
                         Ok(RuntimeMatcherWithOp {
                             operator: m.operator,
-                            matcher: RuntimeMatcher::from_config(m.matcher)?,
+                            matcher: RuntimeMatcher::from_config(m.matcher).with_context(|| {
+                                format!("pipelines[{i}].rules[{j}].matchers[{k}]")
+                            })?,
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -419,10 +446,13 @@ impl RuntimePipelineConfig {
                 let mut response_matchers = r
                     .response_matchers
                     .into_iter()
-                    .map(|rm| {
+                    .enumerate()
+                    .map(|(k, rm)| {
                         Ok(RuntimeResponseMatcherWithOp {
                             operator: rm.operator,
-                            matcher: RuntimeResponseMatcher::from_config(rm.matcher)?,
+                            matcher: RuntimeResponseMatcher::from_config(rm.matcher).with_context(
+                                || format!("pipelines[{i}].rules[{j}].response_matchers[{k}]"),
+                            )?,
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -477,14 +507,16 @@ impl RuntimePipelineConfig {
         }
 
         let mut pipeline_select = Vec::new();
-        for s in cfg.pipeline_select {
+        for (i, s) in cfg.pipeline_select.into_iter().enumerate() {
             let mut matchers = s
                 .matchers
                 .into_iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(k, m)| {
                     Ok(RuntimePipelineSelectorMatcherWithOp {
                         operator: m.operator,
-                        matcher: RuntimePipelineSelectorMatcher::from_config(m.matcher)?,
+                        matcher: RuntimePipelineSelectorMatcher::from_config(m.matcher)
+                            .with_context(|| format!("pipeline_select[{i}].matchers[{k}]"))?,
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -607,24 +639,29 @@ fn normalize_geoip_country_codes(country_codes: Vec<String>) -> Vec<Arc<str>> {
 /// once done. A name is at most 253 bytes and the regexes really used are far shorter
 pub(crate) const MAX_REGEX_LEN: usize = 16 * 1024;
 
-/// 逗号分隔的 CIDR 列表，空项跳过 / A comma-separated CIDR list, empty items skipped
-fn cidr_list(cidr: &str) -> Result<Vec<IpNet>, ipnet::AddrParseError> {
+/// 逗号分隔的 CIDR 列表，空项跳过，每项按 [`canonical_net`] 读
+/// A comma-separated CIDR list, empty items skipped, each read by [`canonical_net`]
+fn cidr_list(cidr: &str) -> anyhow::Result<Vec<IpNet>> {
     cidr.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::parse)
+        .map(canonical_net)
         .collect()
 }
 
-/// A `client_ip` network. The engine sees an IPv4 client on a dual-stack socket by
-/// its IPv4 address (see `client_address` in engine/execution.rs), so a network
-/// written in the IPv4-mapped form (`::ffff:a.b.c.d/n`, n of 96 or more) becomes
-/// the IPv4 network it names.
-/// `client_ip` 网段。引擎按 IPv4 地址看待双栈套接字上的 IPv4 客户端（见 engine/execution.rs
-/// 的 `client_address`），所以写成 IPv4 映射形式的网段（`::ffff:a.b.c.d/n`，n 不小于 96）换成
-/// 它所指的 IPv4 网段。
-fn client_net(cidr: &str) -> Result<IpNet, ipnet::AddrParseError> {
-    let net: IpNet = cidr.parse()?;
+/// 规则里写的网段，写错时报出写的是什么。匹配器看到的地址都是规范的：双栈套接字上的 IPv4 客户端按 IPv4 地址看（见
+/// engine/execution.rs 的 `client_address`），回答和作答上游里 IPv4 映射形式的地址也按它所指的 IPv4 地址看（见
+/// `matcher_helpers`），所以写成 IPv4 映射形式的网段（`::ffff:a.b.c.d/n`，n 不小于 96）换成它所指的 IPv4 网段。
+/// A network a rule writes, naming what was written when it is mistyped. The addresses
+/// matchers see are canonical: an IPv4 client on a dual-stack socket is seen by its IPv4
+/// address (see `client_address` in engine/execution.rs), and an IPv4-mapped address in an
+/// answer or of the answering upstream by the IPv4 address it names (see `matcher_helpers`),
+/// so a network written in the IPv4-mapped form (`::ffff:a.b.c.d/n`, n of 96 or more)
+/// becomes the IPv4 network it names.
+fn canonical_net(cidr: &str) -> anyhow::Result<IpNet> {
+    let net: IpNet = cidr
+        .parse()
+        .with_context(|| format!("\"{cidr}\" is not an IP network"))?;
     if let IpNet::V6(v6) = net
         && let Some(v4) = v6.network().to_ipv4_mapped()
         && let Some(prefix) = v6.prefix_len().checked_sub(96)
@@ -646,7 +683,7 @@ impl RuntimeMatcher {
                 value: domain_value(&value),
             },
             config::Matcher::ClientIp { cidr } => RuntimeMatcher::ClientIp {
-                net: client_net(&cidr)?,
+                net: canonical_net(&cidr)?,
             },
             config::Matcher::DomainRegex { value } => RuntimeMatcher::DomainRegex {
                 regex: domain_regex(&value)?,
@@ -917,8 +954,8 @@ mod dns_type_tests {
 }
 
 #[cfg(test)]
-mod client_net_tests {
-    use super::client_net;
+mod canonical_net_tests {
+    use super::canonical_net;
 
     #[test]
     fn an_ipv4_mapped_network_becomes_the_ipv4_network() {
@@ -933,12 +970,12 @@ mod client_net_tests {
             ("2001:db8::/32", "2001:db8::/32"),
         ] {
             assert_eq!(
-                client_net(written).unwrap(),
+                canonical_net(written).unwrap(),
                 net.parse::<ipnet::IpNet>().unwrap(),
                 "{written}"
             );
         }
-        assert!(client_net("not a network").is_err());
+        assert!(canonical_net("not a network").is_err());
     }
 }
 
@@ -1708,11 +1745,15 @@ mod tests {
     }
 
     /// 只在启动时读的设置，校验放过的值引擎一定建得起来，建不起来的校验就拒掉。以前 `dashmap_shards: 1` 能过校验、
-    /// 热重载和面板保存，到下次启动 DashMap 断言分片数大于 1，内核直接 panic；DoQ 空闲超时写得太大，启动才报错
+    /// 热重载和面板保存，到下次启动 DashMap 断言分片数大于 1，内核直接 panic；DoQ 空闲超时写得太大，启动才报错；
+    /// 连接池多大都收，UDP 池开不出那么多 socket、大到 2^64 的池分配不出内存。上限以内的分片数和连接池，引擎照样建得起来
     /// Of the settings read only at startup, a value the check lets through always builds an
     /// engine, and one that cannot is refused by the check. `dashmap_shards: 1` used to pass the
     /// check, a hot reload and a panel save, and at the next start DashMap's assertion of more
-    /// than one shard panicked the kernel; a DoQ idle timeout too large failed only at startup
+    /// than one shard panicked the kernel; a DoQ idle timeout too large failed only at startup;
+    /// a pool of any size was taken, with more UDP sockets than could be opened, or one as large
+    /// as 2^64 that could not be allocated. Shard counts and pools up to their limits still
+    /// build an engine
     #[tokio::test]
     async fn startup_only_settings_the_check_lets_through_build_an_engine() {
         let build = |settings: serde_json::Value| {
@@ -1720,8 +1761,8 @@ mod tests {
                 crate::engine::Engine::new(runtime, "test".to_string()).expect("engine builds")
             })
         };
-        use crate::config::MAX_DASHMAP_SHARDS;
-        for shards in [0usize, 2, 64, MAX_DASHMAP_SHARDS] {
+        use crate::config::{MAX_DASHMAP_SHARDS, MAX_POOL_SIZE};
+        for shards in [0usize, 2, 64, 4096, MAX_DASHMAP_SHARDS] {
             build(serde_json::json!({ "dashmap_shards": shards }))
                 .unwrap_or_else(|error| panic!("dashmap_shards {shards}: {error:#}"));
         }
@@ -1730,6 +1771,28 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("dashmap_shards {shards} must be refused"));
             assert!(refused.to_string().contains("dashmap_shards"), "{refused}");
+        }
+        let pools = [
+            "udp_pool_size",
+            "tcp_pool_size",
+            "doh_pool_size",
+            "dot_pool_size",
+            "doq_pool_size",
+        ];
+        build(serde_json::Value::Object(
+            pools
+                .iter()
+                .map(|pool| (pool.to_string(), serde_json::json!(MAX_POOL_SIZE)))
+                .collect(),
+        ))
+        .expect("every pool at its largest");
+        for pool in pools {
+            for size in [MAX_POOL_SIZE + 1, usize::MAX] {
+                let refused = build(serde_json::json!({ pool: size }))
+                    .err()
+                    .unwrap_or_else(|| panic!("{pool} {size} must be refused"));
+                assert!(refused.to_string().contains(pool), "{refused}");
+            }
         }
         build(serde_json::json!({ "doq_connection_idle_timeout_seconds": 86_400 }))
             .expect("a day of DoQ idle time");
@@ -2010,6 +2073,87 @@ mod tests {
 
         drop(guard);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 回答里 IPv4 映射形式的地址（AAAA 和 `ipv6hint` 里的 `::ffff:a.b.c.d`）按它所指的 IPv4 地址判断，写成映射形式
+    /// 的网段按它所指的 IPv4 网段读：看回答地址的三个匹配器都这样。以前按 IPv6 地址看，AAAA `::ffff:192.168.1.1`
+    /// 不算内网、不在 192.168.0.0/16 里，防重绑定的规则放过了它
+    /// An IPv4-mapped address in an answer (`::ffff:a.b.c.d` in an AAAA or an `ipv6hint`) is
+    /// judged as the IPv4 address it names, and a network written in the mapped form is read as
+    /// the IPv4 network it names, by all three matchers of answer addresses. Taken as an IPv6
+    /// address, AAAA `::ffff:192.168.1.1` used to be neither local nor in 192.168.0.0/16, and
+    /// anti-rebinding rules let it through
+    #[test]
+    fn an_ipv4_mapped_answer_counts_as_its_ipv4_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lan.json");
+        std::fs::write(
+            &path,
+            r#"{ "entries": [{ "country_code": "LAN", "ips": ["192.168.0.0/16"] }] }"#,
+        )
+        .unwrap();
+        let mut geoip = geoip::GeoIpManager::default();
+        geoip.load_from_v2ray_file(&path).unwrap();
+
+        let matcher = |config: serde_json::Value| {
+            RuntimeResponseMatcher::from_config(serde_json::from_value(config).unwrap()).unwrap()
+        };
+        let matchers = [
+            matcher(
+                serde_json::json!({ "type": "response_answer_ip_geoip_private", "expect": true }),
+            ),
+            matcher(serde_json::json!({ "type": "response_answer_ip", "cidr": "192.168.0.0/16" })),
+            matcher(
+                serde_json::json!({ "type": "response_answer_ip_geoip_country", "country_codes": ["LAN"] }),
+            ),
+        ];
+        let answer = |data: RData| {
+            let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+            message.add_answer(Record::from_rdata(Name::root(), 300, data));
+            message
+        };
+        let mapped: Ipv6Addr = "::ffff:192.168.1.1".parse().unwrap();
+        let answers = [
+            answer(RData::AAAA(AAAA(mapped))),
+            answer(RData::HTTPS(HTTPS(SVCB::new(
+                1,
+                Name::root(),
+                vec![(
+                    SvcParamKey::Ipv6Hint,
+                    SvcParamValue::Ipv6Hint(IpHint(vec![AAAA(mapped)])),
+                )],
+            )))),
+        ];
+        for (which, matcher) in matchers.iter().enumerate() {
+            for message in &answers {
+                assert!(
+                    matcher.matches(
+                        "udp:test",
+                        "example.com",
+                        RecordType::AAAA,
+                        DNSClass::IN,
+                        message,
+                        Some(&geoip),
+                        None,
+                    ),
+                    "matcher {which}: {:?}",
+                    message.answers[0].data
+                );
+            }
+        }
+
+        let mapped_net = matcher(
+            serde_json::json!({ "type": "response_answer_ip", "cidr": "::ffff:192.168.0.0/112" }),
+        );
+        assert!(mapped_net.matches(
+            "udp:test",
+            "example.com",
+            RecordType::A,
+            DNSClass::IN,
+            &answer(RData::A(A(Ipv4Addr::new(192, 168, 1, 1)))),
+            None,
+            None,
+        ));
     }
 
     /// 域名后缀按点分段：不带点的值命中它本身和子域名，带点的值只命中子域名，尾巴相同的别的域名都不算。
