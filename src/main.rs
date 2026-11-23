@@ -248,7 +248,7 @@ use kixdns::engine::{Engine, FastPathResponse, PreParsedData, engine_helpers, wr
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{ClientTransport, EngineObserver, TracingObserver};
 use kixdns::panel::PanelMetrics;
-use kixdns::proto_utils::{is_standard_query_header, truncate_udp_response};
+use kixdns::proto_utils::{is_standard_query_header, notimp_reply, truncate_udp_response};
 #[cfg(target_os = "linux")]
 use kixdns::socket_utils::udp_batch;
 use kixdns::watcher;
@@ -1547,7 +1547,14 @@ impl<'a> UdpAnswering<'a> {
     /// that waits on an upstream goes to its own task and anything that is not a query is dropped, both giving false.
     fn answer(&mut self, packet: &[u8], to: impl Into<ReplyTo>, reply: &mut BytesMut) -> bool {
         if !is_standard_query_header(packet) {
-            return false;
+            // 别的操作码回 NOTIMP，其余的（应答、问题数不对）丢掉 / Another opcode gets NOTIMP, and the
+            // rest (a response, a wrong question count) is dropped
+            let Some(notimp) = notimp_reply(packet) else {
+                return false;
+            };
+            reply.clear();
+            reply.extend_from_slice(&notimp);
+            return true;
         }
         let to = to.into();
         let peer = to.peer;
@@ -2341,8 +2348,16 @@ async fn serve_tcp_conn(
         // queued in answers, and what waits on an upstream goes to its own task, answered when done
         while let Some(packet_bytes) = take_tcp_message(&mut received) {
             waiting = None;
-            if packet_bytes.is_empty() || !is_standard_query_header(&packet_bytes) {
-                break 'connection;
+            if !is_standard_query_header(&packet_bytes) {
+                // 别的操作码回 NOTIMP，其余的不是查询，断开 / Another opcode gets NOTIMP; the rest is no
+                // query, and the connection closes
+                match notimp_reply(&packet_bytes) {
+                    Some(notimp) => {
+                        queue_tcp_answer(&mut answers, &notimp);
+                        continue;
+                    }
+                    None => break 'connection,
+                }
             }
             // ✅ 优化：使用 handle_packet_fast 进行快速路径检查 / ✅ Optimization: Use handle_packet_fast for fast path check
             let async_needed = match engine.handle_packet_fast(&packet_bytes, peer) {
@@ -3049,6 +3064,72 @@ mod tests {
             stream.read_exact(&mut reply).await.unwrap();
             assert_is_formerr_for(&reply, &packet, case);
         }
+        server.abort();
+    }
+
+    /// 操作码不是 QUERY 的请求（这里是 NOTIFY）回 NOTIMP，带着它的 ID 和操作码，只有请求头；UDP 和 TCP 都这样，
+    /// TCP 连接也照常接着用。以前 UDP 丢掉它、TCP 断开连接
+    /// A request whose opcode is not QUERY (NOTIFY here) gets NOTIMP with its ID and opcode, the
+    /// header alone; so over UDP and TCP, the TCP connection going on as usual. UDP used to drop
+    /// it and TCP to close the connection
+    #[tokio::test]
+    async fn a_request_of_another_opcode_gets_notimp() {
+        let mut notify = dns_query();
+        notify[2] = (notify[2] & 0x87) | (4 << 3);
+        let is_notimp_for = |reply: &[u8]| {
+            let reply = Message::from_bytes(reply).unwrap();
+            assert_eq!(reply.metadata.response_code, ResponseCode::NotImp);
+            assert_eq!(reply.metadata.message_type, MessageType::Response);
+            assert_eq!(reply.metadata.op_code, OpCode::Notify);
+            assert_eq!(
+                reply.metadata.id,
+                u16::from_be_bytes([notify[0], notify[1]])
+            );
+            assert!(reply.queries.is_empty() && reply.answers.is_empty());
+        };
+
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let engine = static_engine();
+        let worker = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { receive_one_by_one(&server, &Arc::new(engine)).await })
+        };
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&notify, server_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+            .await
+            .expect("NOTIMP over UDP")
+            .unwrap();
+        is_notimp_for(&buf[..len]);
+        worker.abort();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(run_tcp(listener, static_engine()));
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        for packet in [notify.clone(), dns_query()] {
+            stream
+                .write_all(&(packet.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&packet).await.unwrap();
+        }
+        let mut read_reply = async || {
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut reply = vec![0u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut reply).await.unwrap();
+            reply
+        };
+        is_notimp_for(&read_reply().await);
+        let answered = Message::from_bytes(&read_reply().await).unwrap();
+        assert_eq!(
+            answered.metadata.op_code,
+            OpCode::Query,
+            "the connection goes on"
+        );
         server.abort();
     }
 

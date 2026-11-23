@@ -466,19 +466,26 @@ async fn handle_doh_request(
         _ => return Ok(error_response(StatusCode::NOT_FOUND)),
     };
 
-    // 和 UDP、TCP 一样只回答标准查询：QR=1 的应答、问题数不是 1、opcode 不是 0 等不是查询。UDP 丢掉它们、
-    // TCP 断开，DoH 回 400，和报文太短时一样
-    // As over UDP and TCP, only a standard query is answered: a response with QR=1, a
-    // question count other than 1, an opcode other than 0 and so on are no queries. UDP
-    // drops them and TCP closes; DoH says 400, as for a message too short
+    // 和 UDP、TCP 一样只回答标准查询：别的操作码回 NOTIMP（见 `notimp_reply`）；QR=1 的应答、问题数不是 1 等
+    // 不是查询，UDP 丢掉它们、TCP 断开，DoH 回 400，和报文太短时一样
+    // As over UDP and TCP, only a standard query is answered: another opcode gets NOTIMP (see
+    // `notimp_reply`); a response with QR=1, a question count other than 1 and so on are no
+    // queries, which UDP drops and TCP closes on, and DoH says 400, as for a message too short
     if !crate::proto_utils::is_standard_query_header(&dns_wire) {
-        return Ok(error_response(StatusCode::BAD_REQUEST));
+        let Some(notimp) = crate::proto_utils::notimp_reply(&dns_wire) else {
+            return Ok(error_response(StatusCode::BAD_REQUEST));
+        };
+        return Ok(dns_message_response(notimp));
     }
 
     // ✅ 复用 Engine 公共入口 — 与 TCP/UDP 入站完全一致
     let resp = process_dns_wire(&dns_wire, peer, engine).await;
+    Ok(dns_message_response(resp))
+}
 
-    let mut response = Response::new(Full::new(resp));
+/// 装着 DNS 应答的 200 响应 / A 200 response carrying a DNS answer
+fn dns_message_response(answer: Bytes) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(answer));
     let headers = response.headers_mut();
     headers.insert(
         hyper::header::CONTENT_TYPE,
@@ -488,7 +495,7 @@ async fn handle_doh_request(
         hyper::header::CACHE_CONTROL,
         hyper::header::HeaderValue::from_static("max-age=0"),
     );
-    Ok(response)
+    response
 }
 
 /// 从 GET ?dns=base64url 提取 DNS 报文 / Extract DNS wire from GET ?dns=base64url
