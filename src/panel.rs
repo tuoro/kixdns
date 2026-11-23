@@ -4698,8 +4698,7 @@ mod diagnostic_tests {
         };
         engine
             .answer_after_fast_path(packet, peer, pre_parsed)
-            .await
-            .expect("an answer");
+            .await;
     }
 
     /// 缓存命中率只算要靠上游回答的查询：缓存里存着的上游回答直接答上的算命中，去问了上游的算没命中。规则自己给的回答——拦截

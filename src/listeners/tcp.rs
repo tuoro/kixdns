@@ -2,31 +2,24 @@
 //! The TCP listener: each connection reads queries framed by length prefixes, writes those answered on the
 //! spot out together, and gives each that waits on an upstream a task of its own (RFC 7766)
 
-use crate::engine::{Engine, OnTheSpot, engine_helpers};
+use crate::engine::{Engine, OnTheSpot};
 use crate::observe::ClientTransport;
-use crate::proto_utils::{header_reply, is_standard_query_header};
+use crate::proto_utils::servfail_reply;
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, warn};
+use tracing::warn;
 
-/// 在 `listener` 上跑 TCP 服务；`family` 是日志里的地址族
-/// Run the TCP server on `listener`; `family` names the address family in the logs
-pub(super) fn spawn_tcp(
-    listener: TcpListener,
-    engine: Engine,
-    family: &'static str,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = run_tcp(listener, engine).await {
-            error!(error = %err, "{family} tcp server exited");
-        }
-    })
-}
-
-pub(super) async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Result<()> {
+/// 在 `listener` 上接 TCP 连接，一直接下去，不返回 / Accepts TCP connections on `listener` for good, never
+/// returning
+pub(super) async fn run_tcp(listener: TcpListener, engine: Engine) -> ! {
+    // 一个监听口一份引擎，连接之间共享不复制：每条连接只加一次引用计数，不复制整个 Engine（二十多个 Arc）
+    // One engine per listener, shared between connections rather than copied: each connection
+    // takes one reference count instead of a copy of the whole Engine (twenty-odd Arcs)
+    let engine = Arc::new(engine.with_client_transport(ClientTransport::Tcp));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -50,10 +43,10 @@ pub(super) async fn run_tcp(listener: TcpListener, engine: Engine) -> anyhow::Re
         let Some(permit) = engine.connection_permit(peer.ip()) else {
             continue;
         };
-        let engine = engine.clone();
+        let engine = Arc::clone(&engine);
         tokio::spawn(async move {
             let _permit = permit;
-            let _ = handle_tcp_conn(stream, peer, engine).await;
+            handle_tcp_conn(stream, peer, engine).await;
         });
     }
 }
@@ -102,22 +95,29 @@ fn take_tcp_message(received: &mut bytes::BytesMut) -> Option<bytes::Bytes> {
     Some(message)
 }
 
-/// 当场答好的一个回答带上长度前缀排进 `answers`；放不进一个 TCP 消息的不发
-/// Queues one answer made on the spot into `answers` with its length prefix; one that does not
-/// fit a TCP message is not sent
-fn queue_tcp_answer(answers: &mut bytes::BytesMut, response: &[u8]) {
-    let Ok(len) = u16::try_from(response.len()) else {
-        return;
-    };
-    answers.extend_from_slice(&len.to_be_bytes());
-    answers.extend_from_slice(response);
+/// 能放进一个 TCP 消息的回答：长度前缀只有两个字节（RFC 1035 第 4.2.2 节），超过 65535 字节的换成这个查询的 SERVFAIL（见
+/// `proto_utils::servfail_reply`）。以前这样的回答不发，客户端一直等到超时
+/// The answer as it fits in one TCP message: the length prefix has two bytes (RFC 1035 section
+/// 4.2.2), and one over 65535 bytes gives way to the query's SERVFAIL (see
+/// `proto_utils::servfail_reply`). Such an answer used to go unsent, the client waiting until
+/// it timed out
+fn tcp_answer<'a>(query: &[u8], answer: &'a [u8]) -> Cow<'a, [u8]> {
+    if answer.len() > usize::from(u16::MAX) {
+        Cow::Owned(servfail_reply(query).into())
+    } else {
+        Cow::Borrowed(answer)
+    }
 }
 
-pub(super) async fn handle_tcp_conn(
-    stream: TcpStream,
-    peer: SocketAddr,
-    engine: Engine,
-) -> anyhow::Result<()> {
+/// 当场答好的一个回答带上长度前缀排进 `answers`（见 [`tcp_answer`]）/ Queues one answer made on the
+/// spot into `answers` with its length prefix (see [`tcp_answer`])
+fn queue_tcp_answer(answers: &mut bytes::BytesMut, query: &[u8], response: &[u8]) {
+    let response = tcp_answer(query, response);
+    answers.extend_from_slice(&(response.len() as u16).to_be_bytes());
+    answers.extend_from_slice(&response);
+}
+
+pub(super) async fn handle_tcp_conn(stream: TcpStream, peer: SocketAddr, engine: Arc<Engine>) {
     serve_tcp_conn(stream, peer, engine, TCP_READ_TIMEOUT).await
 }
 
@@ -127,11 +127,9 @@ pub(super) async fn handle_tcp_conn(
 pub(super) async fn serve_tcp_conn(
     stream: TcpStream,
     peer: SocketAddr,
-    engine: Engine,
+    engine: Arc<Engine>,
     read_timeout: Duration,
-) -> anyhow::Result<()> {
-    let engine = Arc::new(engine.with_client_transport(ClientTransport::Tcp));
-
+) {
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(TcpWriter {
         half: tokio::sync::Mutex::new(writer),
@@ -166,25 +164,14 @@ pub(super) async fn serve_tcp_conn(
         // queued in answers, and what waits on an upstream goes to its own task, answered when done
         while let Some(packet_bytes) = take_tcp_message(&mut received) {
             waiting = None;
-            if !is_standard_query_header(&packet_bytes) {
-                // 别的操作码回 NOTIMP，问题数不对回 FORMERR（见 `header_reply`）；应答不是查询，断开 / Another
-                // opcode gets NOTIMP and a wrong question count FORMERR (see `header_reply`); a response
-                // is no query, and the connection closes
-                match header_reply(&packet_bytes) {
-                    Some(refused) => {
-                        queue_tcp_answer(&mut answers, &refused);
-                        continue;
-                    }
-                    None => break 'connection,
-                }
-            }
             let async_needed = match engine.on_the_spot(&packet_bytes, peer, &mut spot) {
-                OnTheSpot::Answered => {
-                    queue_tcp_answer(&mut answers, &spot);
+                OnTheSpot::Reply => {
+                    queue_tcp_answer(&mut answers, &packet_bytes, &spot);
                     None
                 }
                 OnTheSpot::Forward(pre_parsed) => Some(pre_parsed),
-                OnTheSpot::Unanswered => None,
+                // 应答不是查询，断开 / A response is no query, and the connection closes
+                OnTheSpot::Drop => break 'connection,
             };
             if answers.len() >= TCP_ANSWERS_FLUSH {
                 write_tcp_answers(&writer, &mut answers).await;
@@ -193,11 +180,7 @@ pub(super) async fn serve_tcp_conn(
                 continue;
             };
             let Some(permit) = engine.query_permit(None, peer.ip()) else {
-                if let Some(response) =
-                    engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
-                {
-                    queue_tcp_answer(&mut answers, &response);
-                }
+                queue_tcp_answer(&mut answers, &packet_bytes, &servfail_reply(&packet_bytes));
                 continue;
             };
 
@@ -221,13 +204,8 @@ pub(super) async fn serve_tcp_conn(
                 let _permit = permit;
                 let answer = engine
                     .answer_after_fast_path(&packet_bytes, peer, pre_parsed)
-                    .await
-                    .or_else(|| {
-                        engine_helpers::try_build_listener_failure_from_wire(&packet_bytes)
-                    });
-                if let Some(answer) = answer {
-                    write_tcp_answer(&writer, &answer).await;
-                }
+                    .await;
+                write_tcp_answer(&writer, &packet_bytes, &answer).await;
             });
         }
         write_tcp_answers(&writer, &mut answers).await;
@@ -290,7 +268,7 @@ pub(super) async fn serve_tcp_conn(
     // The write side broke: the queries still waiting on an upstream need wait no more, their
     // answers having nowhere to go (cancelled as `pending` is dropped)
     if writer.broken.is_cancelled() {
-        return Ok(());
+        return;
     }
     // 读完了：先把当场答好的写出去，再等还在处理的查询把回答写出去，然后关连接；半关闭的客户端照样拿到回答
     // Reading is over: what was answered on the spot is written first, then the queries still
@@ -298,7 +276,6 @@ pub(super) async fn serve_tcp_conn(
     // still gets them
     write_tcp_answers(&writer, &mut answers).await;
     while pending.join_next().await.is_some() {}
-    Ok(())
 }
 
 /// 一条入站 TCP 连接的写端，和它坏没坏：写不出去（或 [`TCP_READ_TIMEOUT`] 内写不完，对方不读）时关掉写端、记下坏了。
@@ -344,16 +321,17 @@ async fn write_tcp_answers(writer: &TcpWriter, answers: &mut bytes::BytesMut) {
     answers.clear();
 }
 
-/// 写回一个回答：长度前缀加正文一次写完，写端加锁，不会和别的回答穿插。写不出去或 [`TCP_READ_TIMEOUT`]
-/// 内写不完（对方不读）时关掉写端：后面的回答立刻失败，任务不会一个个卡在这里。
-/// Writes one answer back: length prefix and body in one go under the writer's lock, so it
-/// cannot interleave with another answer. When it cannot be written, or not within
-/// [`TCP_READ_TIMEOUT`] (the peer does not read), the write side is shut: later answers fail
-/// at once instead of each task getting stuck here.
-async fn write_tcp_answer(writer: &TcpWriter, response: &[u8]) {
-    if response.len() > u16::MAX as usize || writer.broken.is_cancelled() {
+/// 写回 `query` 的一个回答（见 [`tcp_answer`]）：长度前缀加正文一次写完，写端加锁，不会和别的回答穿插。写不出去或
+/// [`TCP_READ_TIMEOUT`] 内写不完（对方不读）时关掉写端：后面的回答立刻失败，任务不会一个个卡在这里。
+/// Writes one answer to `query` back (see [`tcp_answer`]): length prefix and body in one go
+/// under the writer's lock, so it cannot interleave with another answer. When it cannot be
+/// written, or not within [`TCP_READ_TIMEOUT`] (the peer does not read), the write side is
+/// shut: later answers fail at once instead of each task getting stuck here.
+async fn write_tcp_answer(writer: &TcpWriter, query: &[u8], response: &[u8]) {
+    if writer.broken.is_cancelled() {
         return;
     }
+    let response = tcp_answer(query, response);
     // DNS-over-TCP framing must be written completely; write_vectored may be
     // partial, so use write_all_vectored: scatter-gather single syscall with
     // no frame allocation (write_all would copy prefix+body into a new Vec).
@@ -363,7 +341,7 @@ async fn write_tcp_answer(writer: &TcpWriter, response: &[u8]) {
     let len_bytes = (response.len() as u16).to_be_bytes();
     let mut bufs = [
         std::io::IoSlice::new(&len_bytes),
-        std::io::IoSlice::new(response),
+        std::io::IoSlice::new(&response),
     ];
     let mut half = writer.half.lock().await;
     let written = tokio::time::timeout(

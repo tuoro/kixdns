@@ -93,23 +93,42 @@ pub fn is_standard_query_header(packet: &[u8]) -> bool {
     flags & 0x8000 == 0 && flags & 0x7800 == 0 && qd_count == 1 && an_count == 0 && ns_count == 0
 }
 
-/// 读不了的查询的 FORMERR：只有请求头，问题读得出来就带上问题。不比查询长，伪造来源也放大不了流量。
-/// `query` 由调用方用 [`is_standard_query_header`] 查过，至少 12 字节。
-/// The FORMERR for a query that cannot be read: the header alone, with the question when
-/// that can be read. It is no longer than the query, so a forged source gains no
-/// amplification. The caller has checked `query` with [`is_standard_query_header`], so it
-/// has at least 12 bytes.
+/// 读不了的查询的 FORMERR：只有请求头，问题读得出来就带上问题（见 [`short_reply`]）
+/// The FORMERR for a query that cannot be read: the header alone, with the question when that
+/// can be read (see [`short_reply`])
 pub fn formerr_reply(query: &[u8]) -> Bytes {
-    let question_end = plain_question_end(query);
+    short_reply(query, ResponseCode::FormErr, true)
+}
+
+/// 一个查询的 SERVFAIL，三个监听器过载拒绝和超时时都回它：照线上格式拼（见 [`short_reply`]），不必解析查询，再照查询规整
+/// （见 [`reply_as_asked`]），查询带着 OPT 就带回 OPT。以前三个监听器各写一套，TCP 和 DoH 过载时还要把查询整个解析一遍，
+/// UDP 过载时快速解析读不了的查询不回
+/// The SERVFAIL for a query, which all three listeners answer when refusing under overload and
+/// on a timeout: put together on the wire (see [`short_reply`]) with no parse of the query,
+/// then shaped as the query asks (see [`reply_as_asked`]), an OPT coming back for a query with
+/// one. The three listeners used to write one each, TCP and DoH parsing the whole query under
+/// overload, and UDP under overload answering nothing to a query the quick parse could not read
+pub fn servfail_reply(query: &[u8]) -> Bytes {
+    reply_as_asked(short_reply(query, ResponseCode::ServFail, true), query)
+}
+
+/// 不读完请求就给得出的应答：请求头带着它的 ID、操作码、RD 和 CD，QR、RA 置位，RCODE 为 `rcode`；`question` 为 true 时
+/// 问题读得出不压缩的写法就带上（见 [`plain_question_end`]），各段计数都是 0。不比请求长，伪造来源也放大不了流量。请求至少
+/// 12 字节，由调用方查过
+/// A reply given without reading the request through: the request's header with its ID,
+/// opcode, RD and CD, QR and RA set, RCODE `rcode`; with `question` true, the question when it
+/// can be read uncompressed (see [`plain_question_end`]), every other count 0. It is no longer
+/// than the request, so a forged source gains no amplification. The request has at least 12
+/// bytes, as the caller has checked
+fn short_reply(request: &[u8], rcode: ResponseCode, question: bool) -> Bytes {
+    let question_end = question.then(|| plain_question_end(request)).flatten();
     let mut reply = Vec::with_capacity(question_end.unwrap_or(12));
-    reply.extend_from_slice(&query[..2]);
-    // QR=1，保留 opcode 和 RD；RA=1，保留 CD，RCODE=FORMERR
-    // QR=1, keeping the opcode and RD; RA=1, keeping CD, RCODE=FORMERR
-    reply.push(0x80 | (query[2] & 0x79));
-    reply.push(0x81 | (query[3] & 0x10));
+    reply.extend_from_slice(&request[..2]);
+    reply.push(0x80 | (request[2] & 0x79));
+    reply.push(0x80 | (request[3] & 0x10) | rcode.low());
     reply.extend_from_slice(&[0, u8::from(question_end.is_some()), 0, 0, 0, 0, 0, 0]);
     if let Some(end) = question_end {
-        reply.extend_from_slice(&query[12..end]);
+        reply.extend_from_slice(&request[12..end]);
     }
     Bytes::from(reply)
 }
@@ -138,22 +157,15 @@ pub fn formerr_reply(query: &[u8]) -> Bytes {
 /// response would have two servers answer each other on and on. All but NOTIMP used to be
 /// dropped (UDP) or have the connection closed (TCP).
 pub fn header_reply(packet: &[u8]) -> Option<Bytes> {
-    let header = packet.get(..12)?;
-    if header[2] & 0x80 != 0 {
+    if packet.get(..12)?[2] & 0x80 != 0 {
         return None;
     }
-    let rcode = if header[2] & 0x78 != 0 {
-        ResponseCode::NotImp.low()
+    let rcode = if packet[2] & 0x78 != 0 {
+        ResponseCode::NotImp
     } else {
-        ResponseCode::FormErr.low()
+        ResponseCode::FormErr
     };
-    let mut reply = Vec::with_capacity(12);
-    reply.extend_from_slice(&header[..2]);
-    // QR=1，保留 opcode 和 RD；RA=1，保留 CD / QR=1, keeping the opcode and RD; RA=1, keeping CD
-    reply.push(0x80 | (header[2] & 0x79));
-    reply.push(0x80 | (header[3] & 0x10) | rcode);
-    reply.extend_from_slice(&[0; 8]);
-    Some(Bytes::from(reply))
+    Some(short_reply(packet, rcode, false))
 }
 
 /// 查询里唯一一个问题的结尾，名字用了压缩指针、超长或问题没写完时为 None：这样的问题抄不到应答里
@@ -2167,6 +2179,94 @@ fn map_record_ttls(packet: &mut [u8], mut f: impl FnMut(u32) -> u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一个查询的请求头：ID 0x1234，RD、CD 置位，`qd` 个问题 / A query's header: ID 0x1234, RD and CD
+    /// set, `qd` questions
+    fn query_header(qd: u8) -> Vec<u8> {
+        vec![0x12, 0x34, 0x01, 0x10, 0, qd, 0, 0, 0, 0, 0, 0]
+    }
+
+    /// 线上格式的 SERVFAIL 带回 ID、RD、CD 和问题，QR、RA 置位；查询带 OPT 时带回 OPT，DO 位照抄
+    /// The wire SERVFAIL brings back the ID, RD, CD and question, with QR and RA set; a query
+    /// with an OPT gets one back with its DO bit
+    #[test]
+    fn a_servfail_on_the_wire_copies_the_header_and_the_question() {
+        let question = [4, b'D', b'a', b't', b'a', 0, 0, 28, 0, 1];
+        let query = [query_header(1), question.to_vec()].concat();
+        let servfail = servfail_reply(&query);
+        assert_eq!(
+            servfail[..12],
+            [0x12, 0x34, 0x81, 0x92, 0, 1, 0, 0, 0, 0, 0, 0],
+            "ID, QR and RD, RA and CD and SERVFAIL, one question"
+        );
+        assert_eq!(servfail[12..], question);
+
+        let mut with_opt = query.clone();
+        with_opt[11] = 1;
+        push_opt(&mut with_opt, 0, true, &[]);
+        let servfail = servfail_reply(&with_opt);
+        assert_eq!(servfail[10..12], [0, 1], "one additional record");
+        let opt = find_opt(&servfail).unwrap().expect("an OPT");
+        assert!(opt.dnssec_ok(&servfail));
+        assert_eq!(
+            servfail[12..opt.start],
+            question,
+            "the question, then the OPT"
+        );
+    }
+
+    /// 读不了的查询回 FORMERR：问题抄得过来就带上，抄不过来就只有请求头
+    /// A query that cannot be read gets FORMERR: its question when that can be copied, the
+    /// header alone otherwise
+    #[test]
+    fn a_formerr_carries_the_question_only_when_it_can_be_copied() {
+        let question = [1, b'a', 0, 0, 1, 0, 1];
+        let formerr = formerr_reply(&[query_header(1), question.to_vec()].concat());
+        assert_eq!(formerr[..2], [0x12, 0x34]);
+        assert_eq!(formerr[2], 0x81, "QR and RD");
+        assert_eq!(formerr[3], 0x91, "RA, CD and FORMERR");
+        assert_eq!(formerr[4..12], [0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(formerr[12..], question);
+
+        let mut name_too_long = query_header(1);
+        for _ in 0..5 {
+            name_too_long.push(63);
+            name_too_long.extend_from_slice(&[b'a'; 63]);
+        }
+        name_too_long.extend_from_slice(&[0, 0, 1, 0, 1]);
+        // 指针后面的字节够多，当成长度为 192 的标签也读得下去，只有查标签长度才拦得住
+        // Enough bytes follow the pointer to read on as a label of length 192, so only
+        // checking the label's length stops it
+        let mut pointer_with_room = query_header(1);
+        pointer_with_room.push(0xC0);
+        pointer_with_room.extend_from_slice(&[b'a'; 192]);
+        pointer_with_room.extend_from_slice(&[0, 0, 1, 0, 1]);
+        for (case, packet) in [
+            (
+                "label past the end",
+                [query_header(1), vec![63, b'a', 0, 0, 1, 0, 1]].concat(),
+            ),
+            (
+                "compression pointer",
+                [query_header(1), vec![0xC0, 0x0C, 0, 1, 0, 1]].concat(),
+            ),
+            (
+                "no room for type and class",
+                [query_header(1), vec![0, 0, 1]].concat(),
+            ),
+            ("no question bytes", query_header(1)),
+            (
+                "compression pointer with bytes behind it",
+                pointer_with_room,
+            ),
+            ("name over 255 bytes", name_too_long),
+        ] {
+            let formerr = formerr_reply(&packet);
+            assert_eq!(formerr.len(), 12, "{case}");
+            assert_eq!(formerr[3], 0x91, "{case}");
+            assert_eq!(formerr[4..6], [0, 0], "{case}");
+        }
+    }
 
     /// 各段计数为 `counts`（问题、Answer、Authority、Additional）的应答报文头
     /// A reply header with section counts `counts` (questions, Answer, Authority, Additional)

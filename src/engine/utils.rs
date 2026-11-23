@@ -3,7 +3,7 @@ use crate::matcher::RuntimePipelineConfig;
 use bytes::Bytes;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
+use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
@@ -102,82 +102,6 @@ pub mod engine_helpers {
     #[inline]
     pub fn build_servfail_response(req: &Message) -> anyhow::Result<Bytes> {
         build_response(req, ResponseCode::ServFail, Vec::new())
-    }
-
-    /// Build a SERVFAIL response for a validated, standard DNS query.
-    ///
-    /// Listener code must use this strict variant so malformed packets and DNS
-    /// responses cannot trigger reflection traffic.
-    pub fn try_build_servfail_response_from_wire(request: &[u8]) -> Option<Bytes> {
-        // Reuse the shared standard-query header guard so listener and fast-path
-        // validation cannot drift apart.
-        // 复用共享的标准查询头守卫，避免监听器与快速路径的校验漂移。
-        if !crate::proto_utils::is_standard_query_header(request)
-            || !crate::proto_utils::question_name_readable(request)
-        {
-            return None;
-        }
-
-        let request_message = Message::from_bytes(request).ok()?;
-        if request_message.metadata.message_type != MessageType::Query
-            || request_message.metadata.op_code != OpCode::Query
-            || request_message.queries.len() != 1
-        {
-            return None;
-        }
-
-        build_servfail_response(&request_message)
-            .ok()
-            .map(|reply| crate::proto_utils::reply_as_asked(reply, request))
-    }
-
-    /// 监听器答不上一个报文时回什么：读得了的查询回 SERVFAIL；请求头是标准查询、报文却读不了的回 FORMERR
-    /// （RFC 6891 第 6.1.1 节，见 `proto_utils::formerr_reply`）；其余的（响应包、非标准查询、不到 12 字节）
-    /// 不回，也就没有反射。
-    /// What a listener sends for a message it cannot answer: SERVFAIL for a query it can
-    /// read, FORMERR for one with a standard query header that it cannot (RFC 6891 section
-    /// 6.1.1, see `proto_utils::formerr_reply`), and nothing for the rest (responses,
-    /// non-standard queries, under 12 bytes), which leaves nothing to reflect.
-    pub fn try_build_listener_failure_from_wire(request: &[u8]) -> Option<Bytes> {
-        try_build_servfail_response_from_wire(request).or_else(|| {
-            crate::proto_utils::is_standard_query_header(request)
-                .then(|| crate::proto_utils::formerr_reply(request))
-        })
-    }
-
-    /// Build a SERVFAIL response directly from a DNS wire request.
-    ///
-    /// Valid requests preserve TXID, opcode, RD, and the Question section. The
-    /// header-only fallback is intentionally allocation-bounded and is used only
-    /// by request/response transports such as DoH, never by a UDP listener.
-    pub fn build_servfail_response_from_wire(request: &[u8]) -> Bytes {
-        fn header_only(request: &[u8]) -> Bytes {
-            if request.len() < 2 {
-                return Bytes::new();
-            }
-
-            let mut response = vec![0u8; 12];
-            response[0] = request[0];
-            response[1] = request[1];
-            if request.len() >= 4 {
-                // Preserve opcode, RD, and CD while setting QR=1, RA=1, SERVFAIL.
-                response[2] = 0x80 | (request[2] & 0x79);
-                response[3] = 0x82 | (request[3] & 0x10);
-            } else {
-                response[2] = 0x80;
-                response[3] = 0x82;
-            }
-            Bytes::from(response)
-        }
-
-        let Ok(request_message) = Message::from_bytes(request) else {
-            return header_only(request);
-        };
-
-        build_servfail_response(&request_message).map_or_else(
-            |_| header_only(request),
-            |reply| crate::proto_utils::reply_as_asked(reply, request),
-        )
     }
 
     /// 快速构建错误响应（ServFail），避免解析完整请求

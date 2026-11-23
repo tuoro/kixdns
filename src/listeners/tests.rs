@@ -21,6 +21,12 @@ fn static_engine() -> Engine {
     Engine::new(static_runtime(), "test".to_string()).expect("initialize engine")
 }
 
+/// `engine` 像 `run_tcp` 给每条连接的那样：标上 TCP，共享 / `engine` as `run_tcp` gives it to each
+/// connection: tagged TCP and shared
+fn tcp_engine(engine: Engine) -> Arc<Engine> {
+    Arc::new(engine.with_client_transport(ClientTransport::Tcp))
+}
+
 fn static_runtime() -> RuntimePipelineConfig {
     use crate::config::PipelineConfig;
 
@@ -2409,10 +2415,14 @@ fn memory_left(bytes: u64) -> Arc<std::sync::atomic::AtomicU64> {
 }
 
 /// 一个 TCP 服务端，返回它的地址 / A TCP server, giving its address
-async fn tcp_server(engine: &Engine) -> (SocketAddr, tokio::task::JoinHandle<anyhow::Result<()>>) {
+async fn tcp_server(engine: &Engine) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    (address, tokio::spawn(run_tcp(listener, engine.clone())))
+    let engine = engine.clone();
+    (
+        address,
+        tokio::spawn(async move { run_tcp(listener, engine).await }),
+    )
 }
 
 async fn send_tcp_query(stream: &mut TcpStream) {
@@ -2688,8 +2698,13 @@ async fn tight_memory_does_not_count_a_connection_as_a_share_of_queries() {
     tcp.abort();
 }
 
+/// 过载拒绝时回 SERVFAIL，照线上格式拼、不解析查询，快速解析读不了的也一样；以前 UDP 对它们不回，TCP 和 DoH 却回，只有不足
+/// 12 字节的报文和应答（QR=1）不回
+/// A refusal under overload answers SERVFAIL, put together on the wire with no parse, also to
+/// a query the quick parse cannot read, which UDP used to leave unanswered while TCP and DoH
+/// answered it; only a message under 12 bytes and a response (QR=1) get nothing
 #[tokio::test]
-async fn udp_permit_exhaustion_returns_servfail_but_malformed_packet_is_silent() {
+async fn udp_permit_exhaustion_returns_servfail_but_a_short_packet_is_silent() {
     let engine = forwarding_engine();
     engine
         .flow_control_state
@@ -2772,19 +2787,22 @@ async fn udp_permit_exhaustion_returns_servfail_but_malformed_packet_is_silent()
         "malformed UDP packets must not receive a reflected response"
     );
 
-    // A packet that passes the header gate but fails parse_quick (trailing
-    // data) still reaches the overload branch; it must stay silent there.
+    // 过了请求头检查、快速解析读不了（末尾多一个字节）的查询也到这里，同样回 SERVFAIL、带回问题
+    // A query past the header check that the quick parse cannot read (one byte too many at
+    // the end) gets here too, and the same SERVFAIL with its question
     let mut trailing = dns_query();
     trailing.extend_from_slice(&[0x00]);
     client.send_to(&trailing, server_addr).await.unwrap();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            client.recv_from(&mut response_buf),
-        )
-        .await
-        .is_err(),
-        "overload branch must drop packets that failed parse_quick"
+    let (response_len, _) =
+        tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut response_buf))
+            .await
+            .expect("the refused query is answered")
+            .unwrap();
+    let response = Message::from_bytes(&response_buf[..response_len]).unwrap();
+    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(
+        response.queries,
+        Message::from_bytes(&dns_query()).unwrap().queries
     );
 
     worker.abort();
@@ -2825,7 +2843,7 @@ async fn tcp_idle_connection_is_closed_after_the_read_timeout() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (stream, peer) = listener.accept().await.unwrap();
-        handle_tcp_conn(stream, peer, static_engine()).await
+        handle_tcp_conn(stream, peer, tcp_engine(static_engine())).await
     });
 
     let mut client = TcpStream::connect(addr).await.unwrap();
@@ -2837,7 +2855,7 @@ async fn tcp_idle_connection_is_closed_after_the_read_timeout() {
         .expect("server must close the idle connection instead of waiting forever")
         .expect("read after close");
     assert_eq!(read, 0, "an idle connection must be closed by the server");
-    server.await.unwrap().expect("connection handler");
+    server.await.expect("connection handler");
 }
 
 /// 长连接上的查询必须跟着热重载后的 request_timeout 走。此前超时值在进入
@@ -2863,7 +2881,11 @@ async fn tcp_request_timeout_follows_a_reload_on_an_open_connection() {
     let listener_addr = listener.local_addr().unwrap();
     let mut client = TcpStream::connect(listener_addr).await.unwrap();
     let (server_stream, peer) = listener.accept().await.unwrap();
-    let server_task = tokio::spawn(handle_tcp_conn(server_stream, peer, engine.clone()));
+    let server_task = tokio::spawn(handle_tcp_conn(
+        server_stream,
+        peer,
+        tcp_engine(engine.clone()),
+    ));
 
     let first = time_one_tcp_query(&mut client).await;
     assert!(
@@ -2966,15 +2988,16 @@ async fn read_tcp_answer(client: &mut TcpStream) -> Vec<u8> {
 }
 
 /// 连在 `engine` 上的一条入站 TCP 连接，和处理它的任务 / An inbound TCP connection to `engine` and the task handling it
-async fn tcp_connection(
-    engine: Engine,
-) -> (TcpStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
+async fn tcp_connection(engine: Engine) -> (TcpStream, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap())
         .await
         .unwrap();
     let (stream, peer) = listener.accept().await.unwrap();
-    (client, tokio::spawn(handle_tcp_conn(stream, peer, engine)))
+    (
+        client,
+        tokio::spawn(handle_tcp_conn(stream, peer, tcp_engine(engine))),
+    )
 }
 
 /// 一次写进来的一串查询都答上，各带自己的 ID；当场答的攒在一起写回
@@ -3076,15 +3099,18 @@ const SHORT_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 连在 `engine` 上、读超时是 SHORT_READ_TIMEOUT 的一条入站 TCP 连接 / An inbound TCP connection
 /// to `engine` with SHORT_READ_TIMEOUT as its read timeout
-async fn tcp_connection_timing_out(
-    engine: Engine,
-) -> (TcpStream, tokio::task::JoinHandle<anyhow::Result<()>>) {
+async fn tcp_connection_timing_out(engine: Engine) -> (TcpStream, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap())
         .await
         .unwrap();
     let (stream, peer) = listener.accept().await.unwrap();
-    let server = tokio::spawn(serve_tcp_conn(stream, peer, engine, SHORT_READ_TIMEOUT));
+    let server = tokio::spawn(serve_tcp_conn(
+        stream,
+        peer,
+        tcp_engine(engine),
+        SHORT_READ_TIMEOUT,
+    ));
     (client, server)
 }
 
@@ -3115,7 +3141,7 @@ async fn a_connection_waiting_on_an_answer_keeps_reading() {
     assert_eq!(ids, [1, 2], "both answered");
     let mut rest = [0u8; 1];
     assert_eq!(client.read(&mut rest).await.unwrap(), 0, "closed once idle");
-    server.await.unwrap().expect("connection handler");
+    server.await.expect("connection handler");
 }
 
 /// 声明的长度超过 MAX_QUERY_LEN 的消息不等它发完，连接当场关掉，之前的查询照样答。以前按长度前缀先留出 64 KiB，
@@ -3138,7 +3164,7 @@ async fn a_message_longer_than_any_query_closes_the_connection() {
         "{:?}",
         started.elapsed()
     );
-    server.await.unwrap().expect("connection handler");
+    server.await.expect("connection handler");
 }
 
 /// 半截消息一点点地发也不能一直挂着：正文从开始等起总共一个读超时，中途到的字节不重新计时
@@ -3162,7 +3188,6 @@ async fn a_trickled_message_still_times_out() {
     tokio::time::timeout(SHORT_READ_TIMEOUT * 3, server)
         .await
         .expect("the connection is closed")
-        .unwrap()
         .unwrap();
     let took = started.elapsed();
     trickle.abort();
@@ -3192,7 +3217,6 @@ async fn a_busy_connection_outlives_the_read_timeout() {
     tokio::time::timeout(SHORT_READ_TIMEOUT * 2, server)
         .await
         .expect("the quiet connection is closed")
-        .unwrap()
         .unwrap();
 }
 
@@ -3217,7 +3241,7 @@ async fn a_zero_length_message_ends_the_connection_after_the_answers_before_it()
         .expect("the connection closes")
         .unwrap();
     assert!(rest.is_empty());
-    server.await.unwrap().unwrap();
+    server.await.unwrap();
 }
 
 /// 同一条连接上，快查询不等它前面的慢查询，答完就回（RFC 7766 第 6.2.1.1 节）。此前一个接一个地
@@ -3266,7 +3290,6 @@ async fn a_half_closed_tcp_client_gets_its_pending_answers() {
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .expect("the handler ends")
-        .unwrap()
         .unwrap();
 }
 
@@ -3324,7 +3347,6 @@ async fn a_tcp_client_that_never_reads_does_not_hold_the_handler() {
     tokio::time::timeout(TCP_READ_TIMEOUT * 4, server)
         .await
         .expect("the handler ends once its blocked write times out")
-        .unwrap()
         .unwrap();
 }
 
@@ -3348,7 +3370,6 @@ async fn a_broken_tcp_write_side_ends_the_handler_though_the_client_keeps_sendin
     tokio::time::timeout(TCP_READ_TIMEOUT * 2, server)
         .await
         .expect("the handler ends once its write side breaks")
-        .unwrap()
         .unwrap();
 }
 
@@ -3939,7 +3960,7 @@ async fn doh_on_the_any_address_listens_on_both_families_as_tcp_does() {
     let listening: Vec<SocketAddr> = doh
         .listeners
         .iter()
-        .map(|(listener, _)| listener.local_addr().unwrap())
+        .map(|listener| listener.local_addr().unwrap())
         .collect();
     assert_eq!(
         listening,
@@ -3947,9 +3968,7 @@ async fn doh_on_the_any_address_listens_on_both_families_as_tcp_does() {
         "IPv4 apart, then IPv6"
     );
     assert!(
-        socket2::SockRef::from(&doh.listeners[1].0)
-            .only_v6()
-            .unwrap(),
+        socket2::SockRef::from(&doh.listeners[1]).only_v6().unwrap(),
         "the IPv6 listener takes IPv6 alone"
     );
 }
@@ -4009,6 +4028,48 @@ async fn udp_workers_share_a_socket_where_the_kernel_does_not_spread_datagrams()
         .all(|socket| Arc::ptr_eq(socket, &bound.sockets[0]));
     assert_eq!(bound.sockets.len(), 3);
     assert_eq!(shared, !crate::socket_utils::SPREADS_DATAGRAMS);
+}
+
+/// TCP 上放不进一个消息的回答（超过 65535 字节，长度前缀只有两个字节）换成只带问题的 SERVFAIL：以前不发，客户端一直等到超时
+/// An answer over TCP too long for one message (over 65535 bytes, the length prefix having two
+/// bytes) gives way to a SERVFAIL with the question: it used to go unsent, the client waiting
+/// until it timed out
+#[tokio::test]
+async fn a_tcp_answer_too_long_for_a_message_is_servfail() {
+    // 5000 条 A 记录，每条 16 字节 / 5000 A records of 16 bytes each
+    let addresses: Vec<String> = (0..5000u32)
+        .map(|n| std::net::Ipv4Addr::from(0x0A00_0000 + n).to_string())
+        .collect();
+    let config: crate::config::PipelineConfig = serde_json::from_value(serde_json::json!({
+        "settings": { "default_upstream": "127.0.0.1:9" },
+        "pipelines": [{
+            "id": "p",
+            "rules": [{
+                "name": "many",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "static_ip_response", "ip": addresses.join(",") }]
+            }]
+        }]
+    }))
+    .expect("parse config");
+    let engine = Engine::new(
+        RuntimePipelineConfig::from_config(config).expect("build runtime config"),
+        "test".to_string(),
+    )
+    .expect("initialize engine");
+    let (mut tcp, connection) = tcp_connection(engine).await;
+
+    let (answer, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        tcp_exchange(&mut tcp, &query("many.test", 7)),
+    )
+    .await
+    .expect("an answer");
+    assert_eq!(answer.metadata.id, 7);
+    assert_eq!(answer.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(answer.queries.len(), 1);
+    assert!(answer.answers.is_empty());
+    connection.abort();
 }
 
 /// 装不进一条记录的静态 TXT（一段超过 255 字节，或者总长超过 65535），UDP 和 TCP 都收到

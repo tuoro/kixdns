@@ -28,7 +28,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::engine::{Engine, OnTheSpot, engine_helpers};
+use crate::engine::{Engine, OnTheSpot};
 use crate::observe::ClientTransport;
 use crate::proto_utils::MAX_QUERY_LEN;
 use crate::watcher;
@@ -513,21 +513,13 @@ async fn handle_doh_request(
         _ => return Ok(error_response(StatusCode::NOT_FOUND)),
     };
 
-    // 和 UDP、TCP 一样只回答标准查询：别的操作码回 NOTIMP、问题数不对回 FORMERR（见 `header_reply`）；
-    // QR=1 的应答不是查询，回 400，和报文太短时一样
-    // As over UDP and TCP, only a standard query is answered: another opcode gets NOTIMP and a
-    // wrong question count FORMERR (see `header_reply`); a response with QR=1 is no query and
-    // gets 400, as a message too short does
-    if !crate::proto_utils::is_standard_query_header(&dns_wire) {
-        let Some(refused) = crate::proto_utils::header_reply(&dns_wire) else {
-            return Ok(error_response(StatusCode::BAD_REQUEST));
-        };
-        return Ok(dns_message_response(&dns_wire, refused));
-    }
-
-    // ✅ 复用 Engine 公共入口 — 与 TCP/UDP 入站完全一致
-    let resp = process_dns_wire(&dns_wire, peer, engine).await;
-    Ok(dns_message_response(&dns_wire, resp))
+    // QR=1 的应答不是查询，和报文太短时一样回 400（见 `OnTheSpot::Drop`）
+    // A response with QR=1 is no query and gets 400, as a message too short does (see
+    // `OnTheSpot::Drop`)
+    Ok(match process_dns_wire(&dns_wire, peer, engine).await {
+        Some(answer) => dns_message_response(&dns_wire, answer),
+        None => error_response(StatusCode::BAD_REQUEST),
+    })
 }
 
 /// 装着 `query` 的 DNS 应答的 200 响应；查询带了填充时应答也填充（见 `reply_padded_as_asked`）
@@ -566,40 +558,26 @@ fn extract_get_dns_param(query: &str) -> Option<Bytes> {
     None
 }
 
-/// 处理 DNS wire 报文，返回响应 bytes
-/// 完全复用 Engine 的 handle_packet_fast 快速路径 + handle_packet 完整路径
-async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> Bytes {
+/// 回答一个 DNS 报文，和 UDP、TCP 走同一个入口（见 `Engine::on_the_spot`）；应答（QR=1）和不足 12 字节的报文没有
+/// 回答，为 None
+/// Answers one DNS message through the same entry as UDP and TCP (see `Engine::on_the_spot`);
+/// None for a response (QR=1) or a message under 12 bytes, which get no answer
+async fn process_dns_wire(packet: &[u8], peer: SocketAddr, engine: &Engine) -> Option<Bytes> {
     let mut answer = bytes::BytesMut::new();
     let pre_parsed = match engine.on_the_spot(packet, peer, &mut answer) {
-        OnTheSpot::Answered => return answer.freeze(),
+        OnTheSpot::Reply => return Some(answer.freeze()),
         OnTheSpot::Forward(pre_parsed) => pre_parsed,
-        // 失败应答也构造不出：HTTP 请求总得有个回应（见 `empty_dns_response`）/ Not even a failure answer
-        // can be built: an HTTP request has to be answered (see `empty_dns_response`)
-        OnTheSpot::Unanswered => return engine_helpers::build_servfail_response_from_wire(packet),
+        OnTheSpot::Drop => return None,
     };
     let Some(_permit) = engine.query_permit(None, peer.ip()) else {
-        return empty_dns_response(packet);
+        return Some(crate::proto_utils::servfail_reply(packet));
     };
     // 要等上游的这一路放到堆上：它的状态有 4 KB 多，留在每个请求的 future 里，当场答完的请求也要跟着
     // 搬一遍，HTTP/2 下每个请求还要按这个大小分配
     // The path that waits on an upstream goes on the heap: its state is over 4 KB, and left inside
     // every request's future it is moved along with requests answered on the spot, and under HTTP/2
     // allocated at that size for each of them
-    Box::pin(engine.answer_after_fast_path(packet, peer, pre_parsed))
-        .await
-        .unwrap_or_else(|| empty_dns_response(packet))
-}
-
-/// 答不上一个报文时回什么。和 UDP、TCP 一样（见 `try_build_listener_failure_from_wire`）：读得了的查询回
-/// SERVFAIL，请求头是标准查询、报文却读不了的回 FORMERR。HTTP 请求总得有个回应，所以其余的回只有报文头的
-/// SERVFAIL，UDP、TCP 对它们不回
-/// What to answer a message that gets no answer. As over UDP and TCP (see
-/// `try_build_listener_failure_from_wire`): SERVFAIL for a query that can be read, FORMERR for
-/// one with a standard query's header that cannot. An HTTP request has to be answered, so the
-/// rest get a header-only SERVFAIL, where UDP and TCP send nothing
-fn empty_dns_response(request: &[u8]) -> Bytes {
-    engine_helpers::try_build_listener_failure_from_wire(request)
-        .unwrap_or_else(|| engine_helpers::build_servfail_response_from_wire(request))
+    Some(Box::pin(engine.answer_after_fast_path(packet, peer, pre_parsed)).await)
 }
 
 fn error_response(status: StatusCode) -> Response<Full<Bytes>> {
@@ -716,49 +694,6 @@ mod tests {
         assert!(result.is_some());
     }
 
-    // ---- empty_dns_response ----
-
-    #[test]
-    fn test_empty_dns_response_preserves_txid() {
-        let request = [
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        ];
-        let resp = empty_dns_response(&request);
-        assert_eq!(resp.len(), 12);
-        assert_eq!(resp[0], 0x12, "TXID high byte preserved");
-        assert_eq!(resp[1], 0x34, "TXID low byte preserved");
-    }
-
-    #[test]
-    fn test_empty_dns_response_qr_and_rcode() {
-        let request = [0xAB, 0xCD];
-        let resp = empty_dns_response(&request);
-        assert_eq!(resp.len(), 12);
-        // Byte 2: QR=1, Opcode=0, AA=0, TC=0, RD=0 → 0x80
-        assert_eq!(resp[2], 0x80, "QR should be 1");
-        // Byte 3: RA=1, Z=0, RCODE=2 (SERVFAIL) → 0x82
-        assert_eq!(resp[3], 0x82, "RA and SERVFAIL should be set");
-    }
-
-    #[test]
-    fn test_empty_dns_response_short_input() {
-        let resp = empty_dns_response(&[0xFF]);
-        assert!(resp.is_empty(), "input < 2 bytes should return empty");
-        let resp = empty_dns_response(&[]);
-        assert!(resp.is_empty());
-    }
-
-    #[test]
-    fn test_empty_dns_response_preserves_question() {
-        let request = make_dns_query_a("question.example.com", 0x1234);
-        let response = empty_dns_response(&request);
-        let decoded = Message::from_bytes(&response).expect("decode SERVFAIL response");
-
-        assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
-        assert_eq!(decoded.queries.len(), 1);
-        assert_eq!(decoded.queries[0].name().to_utf8(), "question.example.com.");
-    }
-
     // ---- error_response ----
 
     #[test]
@@ -838,7 +773,7 @@ mod tests {
         )
         .await
         .expect("refused at once");
-        let reply = Message::from_bytes(&reply).unwrap();
+        let reply = Message::from_bytes(&reply.expect("a DNS answer")).unwrap();
         assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
         assert_eq!(engine.permit_manager.dropped_requests(), 1);
         let mut buf = [0u8; 512];
@@ -963,7 +898,7 @@ mod tests {
         )
         .await
         .expect("the heavy device is refused at once");
-        let reply = Message::from_bytes(&reply).unwrap();
+        let reply = Message::from_bytes(&reply.expect("a DNS answer")).unwrap();
         assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
         let waiting = {
             let (engine, query) = (engine.clone(), query.clone());
@@ -1049,7 +984,9 @@ mod tests {
         let query = make_dns_query_a("test.example.com", 0x4242);
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
-        let resp = process_dns_wire(&query, peer, &engine).await;
+        let resp = process_dns_wire(&query, peer, &engine)
+            .await
+            .expect("a DNS answer");
 
         // Should be a valid DNS response
         assert!(resp.len() >= 12, "response should be >= 12 bytes");
@@ -1088,7 +1025,9 @@ mod tests {
             ("a question cut short", cut_short),
             ("a label past the message", long_label),
         ] {
-            let resp = process_dns_wire(&query, peer, &engine).await;
+            let resp = process_dns_wire(&query, peer, &engine)
+                .await
+                .expect("a DNS answer");
             assert!(resp.len() >= 12, "{what}");
             assert_eq!(&resp[..2], &[0x42, 0x42], "{what}: the transaction ID");
             assert_eq!(resp[2] & 0x80, 0x80, "{what}: a response");
@@ -1099,7 +1038,9 @@ mod tests {
             );
         }
         // 读得了的照常回答 / A readable one is answered as usual
-        let resp = process_dns_wire(&readable, peer, &engine).await;
+        let resp = process_dns_wire(&readable, peer, &engine)
+            .await
+            .expect("a DNS answer");
         assert_eq!(resp[3] & 0x0F, 0);
     }
 
@@ -1109,7 +1050,9 @@ mod tests {
         let query = make_dns_query_a("ok.example.com", 0x0001);
         let peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
-        let resp = process_dns_wire(&query, peer, &engine).await;
+        let resp = process_dns_wire(&query, peer, &engine)
+            .await
+            .expect("a DNS answer");
 
         assert!(resp.len() >= 12);
         assert_eq!(resp[0], 0x00, "TXID high byte preserved");
@@ -1118,20 +1061,18 @@ mod tests {
         assert_eq!(resp[3] & 0x0F, 0x00, "RCODE should be NOERROR (0)");
     }
 
+    /// 不足 12 字节的报文和应答（QR=1）没有 DNS 回答，处理请求时回 400
+    /// A message under 12 bytes and a response (QR=1) get no DNS answer, and the request is
+    /// answered 400
     #[tokio::test]
-    async fn test_process_dns_wire_short_query_returns_servfail() {
-        // Query shorter than DNS header — fast parse fails → fallback → SERVFAIL
+    async fn a_short_message_or_a_response_gets_no_dns_answer() {
         let engine = make_static_engine("NXDOMAIN");
-        let short = [0x12, 0x34, 0x00]; // only 3 bytes, not a valid DNS message
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-
-        let resp = process_dns_wire(&short, peer, &engine).await;
-
-        // Should return a SERVFAIL response preserving TXID
-        assert_eq!(resp.len(), 12);
-        assert_eq!(resp[0], 0x12, "TXID high byte preserved");
-        assert_eq!(resp[1], 0x34, "TXID low byte preserved");
-        assert_eq!(resp[3] & 0x0F, 0x02, "RCODE should be SERVFAIL (2)");
+        let mut response = make_dns_query_a("test.example.com", 0x4242);
+        response[2] |= 0x80;
+        for message in [&[0x12, 0x34, 0x00][..], &response] {
+            assert_eq!(process_dns_wire(message, peer, &engine).await, None);
+        }
     }
 
     /// 数写了几次的连接：HTTP/2 把攒好的帧写完 flush 一次，一次连接 poll 就 flush 一次，不管有没有东西要写，
@@ -1439,7 +1380,12 @@ mod tests {
     /// 经 DoH 问一次，读回回答 / Ask once over DoH and read the answer back
     async fn ask(engine: &Engine, query: &[u8]) -> Message {
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        Message::from_bytes(&process_dns_wire(query, peer, engine).await).expect("dns answer")
+        Message::from_bytes(
+            &process_dns_wire(query, peer, engine)
+                .await
+                .expect("a DNS answer"),
+        )
+        .expect("dns answer")
     }
 
     /// 缓存命中的应答带着这条查询自己的事务 ID；TTL 按应答在缓存里停留的整秒数调低（RFC 1035
@@ -1547,7 +1493,9 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         assert!(matches!(engine.handle_packet_fast(&query, peer), Ok(None)));
 
-        let answer = process_dns_wire(&query, peer, &engine).await;
+        let answer = process_dns_wire(&query, peer, &engine)
+            .await
+            .expect("a DNS answer");
         assert_eq!(
             &answer[..],
             [0x12, 0x34, 0x81, 0x81, 0, 0, 0, 0, 0, 0, 0, 0],
