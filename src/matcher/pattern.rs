@@ -1,6 +1,9 @@
-//! 规则里的正则：按 ASCII 编译、限制编译后的大小，域名正则不分大小写
-//! The regexes in rules: compiled for ASCII with a bound on their compiled size, domain regexes
-//! ignoring case
+//! 规则里的正则：按 ASCII 编译、限制编译后的大小。域名正则照写的区分大小写（写了 `(?i)` 才不分），规则看到的名字
+//! 已转成小写（见 `proto_utils::name_text`），所以不带 `(?i)` 写成大写的字母不会命中
+//! The regexes in rules: compiled for ASCII with a bound on their compiled size. A domain regex
+//! is case-sensitive as written (ignoring case only under `(?i)`), and the names rules see are
+//! lowercased already (see `proto_utils::name_text`), so without `(?i)` a letter written in
+//! capitals never matches
 
 use super::*;
 /// 正则写得比 `max` 字节长时的报错 / The error for a regex written longer than `max` bytes
@@ -88,12 +91,19 @@ pub(super) fn domain_regex(pattern: &str) -> anyhow::Result<Regex> {
     Ok(limited_regex(&ascii_regex_pattern(pattern)?)?)
 }
 
-/// 匹配器的正则（域名的，和 TXT 内容的）编译时状态空间和 DFA 各限 1 MB，防止复杂度攻击
+/// 一条正则编译后最多多大，防止复杂度攻击：匹配器的正则（见 [`limited_regex`]），以及 GeoSite 数据里合成一个集合的
+/// 一组正则（见 `geosite::Regexes::combine`）
+/// The most a regex may take compiled, against complexity attacks: a matcher's regex (see
+/// [`limited_regex`]), and a group of GeoSite data's regexes combined into one set (see
+/// `geosite::Regexes::combine`)
+pub(super) const REGEX_SIZE_LIMIT: usize = 1_000_000;
+
+/// 匹配器的正则（域名的，和 TXT 内容的）编译时状态空间和 DFA 各限 [`REGEX_SIZE_LIMIT`]
 /// A matcher's regex (for names, and for TXT content) compiled with the state space and the
-/// DFA each capped at 1 MB against complexity attacks
+/// DFA each capped at [`REGEX_SIZE_LIMIT`]
 pub(super) fn limited_regex(pattern: &str) -> Result<Regex, regex::Error> {
     RegexBuilder::new(pattern)
-        .size_limit(1_000_000)
-        .dfa_size_limit(1_000_000)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
 }

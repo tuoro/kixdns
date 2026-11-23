@@ -74,6 +74,16 @@ pub(crate) fn domain_value(value: &str) -> Arc<str> {
     }
 }
 
+/// 规则写的 GeoSite 标签，转成小写存：数据文件里的标签读进来就转小写（见 `geosite`），在这里转一次，每个查询就不用
+/// 再转，写法不同的同一个标签也只算一个（见 `extract_geosite_tags_from_config`），不会各读一遍数据、各建一份匹配器
+/// A GeoSite tag a rule writes, kept lowercased: the tags of data files are lowercased as they
+/// are read (see `geosite`), so lowering it once here spares every query doing it, and one tag
+/// written in different cases counts once (see `extract_geosite_tags_from_config`) instead of
+/// being read from the data and given matchers once for each spelling
+pub(crate) fn geosite_tag(value: &str) -> Arc<str> {
+    Arc::from(value.to_ascii_lowercase())
+}
+
 /// 域名后缀按点分段比较：`example.com` 命中它本身和每个子域名，`.example.com` 只命中子域名，
 /// `notexample.com` 两种都不命中。请求名在解析时已转小写、不带结尾的点，配置值在加载时已转小写。
 /// 规则、Pipeline 入口和响应阶段的 `request_domain_suffix` 都用这一个比较，按索引查到的候选和逐条检查的规则结果一致。
@@ -253,21 +263,6 @@ pub struct RuntimePipeline {
     /// 本 pipeline 自己的请求匹配器区分请求方的依据。规则决策只取决于它，所以规则
     /// 缓存按它区分。
     pub rule_requester: RequesterScope,
-    /// Pipeline 级 ECS 配置。缓存现在按上游返回的作用范围区分应答（见 `CacheEntry::reach`），
-    /// 不再用它；保留只为照常读入旧配置。
-    /// Pipeline-level ECS config. The cache now tells answers apart by the scope the
-    /// upstream returns (see `CacheEntry::reach`) and no longer uses it; it is kept
-    /// so older configurations still load.
-    pub ecs: Option<crate::config::EcsMode>,
-    /// 这个 pipeline 的应答会不会因「谁在问」而不同：请求阶段有按客户端 IP、它的 GeoIP 国家或
-    /// 私有地址、请求带不带 EDNS 判断的规则。是的话，它给一个请求的应答，不一定是同一个问题换一个
-    /// 请求方时的应答。因 ECS 子网而不同的应答不算在内，缓存按子网区分它们（见 `CacheEntry::reach`）。
-    /// Whether this pipeline's answer can differ by who is asking: a request rule matches
-    /// on the client IP, its GeoIP country or private range, or EDNS presence. If so, the
-    /// answer it gave one request is not necessarily its answer to another request with
-    /// the same question. Answers that differ by ECS subnet do not count: the cache tells
-    /// them apart by subnet (see `CacheEntry::reach`).
-    pub depends_on_requester: bool,
     /// 请求阶段有没有正则条件。规则缓存只给这样的 pipeline 存转发和跳转的决定：正则要一条条试，同一个名字
     /// 再来时值得省下；别的条件靠索引或几次比较就能算完，为每个新名字存一条缓存反而比重算还贵。规则直接
     /// 回应的决定不论哪个 pipeline 都存：快速路径靠它直接回重复的拦截查询。
@@ -319,23 +314,40 @@ impl GeoData {
     }
 }
 
+/// 编译好的一条规则。规则级的运算符编译时已经定进每个匹配器的运算符里（见 [`apply_rule_operator`]），不另存
+/// A compiled rule. The rule-level operators are settled into each matcher's operator as it
+/// compiles (see [`apply_rule_operator`]) and not kept apart
 #[derive(Debug, Clone)]
 pub struct RuntimeRule {
     pub name: Arc<str>,
-    pub matcher_operator: MatchOperator,
-    pub matchers: Vec<RuntimeMatcherWithOp>,
+    /// 请求匹配器，快速路径的规则共用这一份（见 `advanced_rule::CompiledRule`）
+    /// The request matchers, shared with the fast path's rule (see `advanced_rule::CompiledRule`)
+    pub matchers: Arc<[RuntimeMatcherWithOp]>,
     pub actions: Vec<Action>,
-    pub response_matchers: Vec<RuntimeResponseMatcherWithOp>,
-    pub response_matcher_operator: MatchOperator,
-    pub response_actions_on_match: Vec<Action>,
-    pub response_actions_on_miss: Vec<Action>,
-    /// 决策要带上的响应阶段；没有响应阶段的规则为 None，决策也就什么都不用带
-    /// The response phase decisions carry; None for a rule without one, whose decisions then
-    /// carry nothing
+    /// 回答检查：响应匹配器和两种结果下的动作，决策带上的就是这一份；没有响应阶段的规则为 None，决策也就什么都不用带。
+    /// 以前规则另存一份响应匹配器和动作，和它一模一样
+    /// The answer check, the response matchers and the actions for either result, which is
+    /// what decisions carry; None for a rule without one, whose decisions then carry nothing.
+    /// The rule used to keep its own copy of the response matchers and actions as well
     pub response_phase: Option<Arc<ResponsePhase>>,
     /// Pre-computed merge result for multiple Forward actions (None if <=1 Forward action).
     /// 多个 Forward action 的预计算合并结果（<=1 个 Forward 时为 None）。
     pub merged_forward: Option<config::MergedForward>,
+}
+
+impl RuntimeRule {
+    /// 回答检查的响应匹配器，没有回答检查时是空的 / The answer check's response matchers, empty
+    /// without one
+    pub fn response_matchers(&self) -> &[RuntimeResponseMatcherWithOp] {
+        ResponsePhase::parts(self.response_phase.as_deref()).0
+    }
+
+    /// 规则的全部动作：它自己的，和回答检查两种结果下的 / Every action of the rule: its own, and
+    /// its answer check's for either result
+    pub fn all_actions(&self) -> impl Iterator<Item = &Action> {
+        let (_, on_match, on_miss) = ResponsePhase::parts(self.response_phase.as_deref());
+        self.actions.iter().chain(on_match).chain(on_miss)
+    }
 }
 
 /// 一条规则的响应阶段，它的决策共用一份：每次决策都复制这些匹配器和动作，每个未命中要多分配好几次
@@ -403,7 +415,6 @@ pub struct RuntimePipelineSelectorMatcherWithOp {
     pub matcher: RuntimePipelineSelectorMatcher,
 }
 
-/// `dashmap_shards` 最多多少 / The most `dashmap_shards` may be
 impl RuntimePipelineConfig {
     /// 把一份配置编译成运行时的样子，转发时要用的都在这里先算好，只算这一遍：拆好的上游、几个 forward 合成的一次转发。
     /// 编译不了的匹配器连同它的位置报出来，写成 `pipelines[0].rules[2].matchers[1]` 这样的路径，和读不懂的键一样
@@ -459,46 +470,46 @@ impl RuntimePipelineConfig {
                 apply_rule_operator(&mut response_matchers, r.response_matcher_operator, |rm| {
                     &mut rm.operator
                 });
+                let (mut actions, mut on_match, mut on_miss) = (
+                    r.actions,
+                    r.response_actions_on_match,
+                    r.response_actions_on_miss,
+                );
+                // 预处理所有 Forward action 的 upstream 字段（性能优化）/ Pre-process all Forward upstreams (performance optimization)
+                actions
+                    .iter_mut()
+                    .chain(&mut on_match)
+                    .chain(&mut on_miss)
+                    .for_each(Action::pre_split_upstreams);
+                let response_phase =
+                    (!(response_matchers.is_empty() && on_match.is_empty() && on_miss.is_empty()))
+                        .then(|| {
+                            Arc::new(ResponsePhase {
+                                matchers: response_matchers,
+                                on_match,
+                                on_miss,
+                            })
+                        });
                 rules.push(RuntimeRule {
                     name: Arc::from(r.name),
-                    matcher_operator: r.matcher_operator,
-                    matchers,
-                    actions: r.actions,
-                    response_matchers,
-                    response_matcher_operator: r.response_matcher_operator,
-                    response_actions_on_match: r.response_actions_on_match,
-                    response_actions_on_miss: r.response_actions_on_miss,
-                    response_phase: None,
+                    matchers: matchers.into(),
+                    actions,
+                    response_phase,
                     merged_forward: r.merged_forward,
                 });
             }
 
             reads.push(RuleReads::of(&rules));
-            let request_matchers = || rules.iter().flat_map(|rule| &rule.matchers);
-            // A forward that sends an ECS subnet taken from the client does not count:
-            // every cached answer is tagged with the subnets it applies to (see
-            // `CacheEntry::reach`), and a lookup takes only answers for the requester's.
-            // 按客户端地址发送 ECS 子网的转发不算：缓存的每份应答都标着它适用的子网（见
-            // `CacheEntry::reach`），查找只取适用于请求方子网的应答。
-            let depends_on_requester = request_matchers().any(|m| {
-                matches!(
-                    m.matcher,
-                    RuntimeMatcher::ClientIp { .. }
-                        | RuntimeMatcher::GeoipCountry { .. }
-                        | RuntimeMatcher::GeoipPrivate { .. }
-                        | RuntimeMatcher::EdnsPresent { .. }
-                )
-            });
-            let matches_regex =
-                request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::DomainRegex { .. }));
+            let matches_regex = rules
+                .iter()
+                .flat_map(|rule| rule.matchers.iter())
+                .any(|m| matches!(m.matcher, RuntimeMatcher::DomainRegex { .. }));
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 rules,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 requester: RequesterScope::default(),
                 rule_requester: RequesterScope::default(),
-                ecs: p.ecs.clone(),
-                depends_on_requester,
                 matches_regex,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 geo_data: GeoData::default(),
@@ -527,24 +538,6 @@ impl RuntimePipelineConfig {
             });
         }
 
-        // 预处理所有 Forward action 的 upstream 字段（性能优化）/ Pre-process all Forward upstreams (performance optimization)
-        for rule in pipelines.iter_mut().flat_map(|p| &mut p.rules) {
-            rule.actions
-                .iter_mut()
-                .chain(&mut rule.response_actions_on_match)
-                .chain(&mut rule.response_actions_on_miss)
-                .for_each(Action::pre_split_upstreams);
-            rule.response_phase = (!(rule.response_matchers.is_empty()
-                && rule.response_actions_on_match.is_empty()
-                && rule.response_actions_on_miss.is_empty()))
-            .then(|| {
-                Arc::new(ResponsePhase {
-                    matchers: rule.response_matchers.clone(),
-                    on_match: rule.response_actions_on_match.clone(),
-                    on_miss: rule.response_actions_on_miss.clone(),
-                })
-            });
-        }
         cfg.settings.default_upstream_shared =
             Some(Arc::from(cfg.settings.default_upstream.as_str()));
 
@@ -563,7 +556,7 @@ impl RuntimePipelineConfig {
                 .flat_map(|rule| &rule.matchers)
                 .any(|m| needs(&m.matcher))
         };
-        Ok(Self {
+        let mut runtime = Self {
             settings: cfg.settings,
             select_needs_geosite: select_needs(RuntimePipelineSelectorMatcher::needs_geosite),
             select_needs_geoip: select_needs(RuntimePipelineSelectorMatcher::needs_geoip),
@@ -571,7 +564,14 @@ impl RuntimePipelineConfig {
             pipelines,
             pipeline_id_index,
             warnings,
-        })
+        };
+        let geo = config::geo_tags_without_data(
+            &runtime.settings,
+            crate::engine::utils::extract_geosite_tags_from_config(&runtime),
+            &crate::engine::utils::extract_geoip_tags_from_config(&runtime),
+        );
+        runtime.warnings.extend(geo);
+        Ok(runtime)
     }
 
     pub fn min_ttl(&self) -> std::time::Duration {
@@ -583,19 +583,6 @@ impl RuntimePipelineConfig {
         self.pipeline_id_index
             .get(id)
             .and_then(|&idx| self.pipelines.get(idx))
-    }
-
-    /// The requester's part of the keys for `pipeline` (none for an unknown pipeline).
-    /// `pipeline` 的键里属于请求方的部分（pipeline 不存在时为空）。
-    pub fn requester_key(
-        &self,
-        pipeline: &str,
-        requester: Requester,
-        geoip_manager: Option<&Arc<parking_lot::RwLock<geoip::GeoIpManager>>>,
-    ) -> RequesterKey {
-        self.pipeline(pipeline).map_or(RequesterKey::NONE, |p| {
-            p.requester.key(requester, geoip_manager)
-        })
     }
 
     pub fn upstream_timeout(&self) -> std::time::Duration {
@@ -697,10 +684,10 @@ impl RuntimeMatcher {
             },
             config::Matcher::EdnsPresent { expect } => RuntimeMatcher::EdnsPresent { expect },
             config::Matcher::GeoSite { value } => RuntimeMatcher::GeoSite {
-                tag: Arc::from(value),
+                tag: geosite_tag(&value),
             },
             config::Matcher::GeoSiteNot { value } => RuntimeMatcher::GeoSiteNot {
-                tag: Arc::from(value),
+                tag: geosite_tag(&value),
             },
             config::Matcher::Qtype { value } => RuntimeMatcher::Qtype {
                 value: parse_dns_type(&value)?,
@@ -1036,7 +1023,7 @@ mod tests {
                 expected
             );
             assert_eq!(
-                ops(rule.response_matchers.iter().map(|m| m.operator).collect()),
+                ops(phase(rule).matchers.iter().map(|m| m.operator).collect()),
                 expected
             );
             assert_eq!(
@@ -1089,6 +1076,60 @@ mod tests {
         assert_eq!(matched("and_not"), matched("not"));
     }
 
+    /// 规则用到、却没配可读的数据的 Geo 标签各算一条 warnings：没写 geosite_data_paths 时的 GeoSite 标签，没写 geoip_dat_path
+    /// 时 MMDB 也答不了的 GeoIP 标签；配了数据的不算。以前一个数据文件都没配时什么都不说，用它们的规则悄悄地从不按数据判断
+    /// The Geo tags rules use with no data configured to read them from make one warning for
+    /// each kind: GeoSite tags without geosite_data_paths, and without geoip_dat_path the GeoIP
+    /// tags the MMDB cannot answer either; tags with data do not count. With no data file
+    /// configured nothing used to be said, and rules using them quietly never judged by any data
+    #[test]
+    fn geo_tags_without_data_are_warned_about() {
+        let warnings = |settings: serde_json::Value| {
+            let mut all = serde_json::json!({ "default_upstream": "127.0.0.1:9" });
+            all.as_object_mut()
+                .unwrap()
+                .extend(settings.as_object().unwrap().clone());
+            runtime_of(serde_json::json!({
+                "settings": all,
+                "pipeline_select": [{
+                    "pipeline": "main",
+                    "matchers": [{ "type": "geo_site", "value": "ads" }]
+                }],
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "geoip_country", "country_codes": ["CN", "cloudflare"] }],
+                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                    "response_matchers": [{ "type": "response_request_domain_geo_site_not", "value": "cn" }],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }] }]
+            }))
+            .expect("build runtime config")
+            .warnings
+        };
+        let geosite = "GeoSite tags ads, cn have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does";
+        assert_eq!(
+            warnings(serde_json::json!({})),
+            [
+                geosite,
+                "GeoIP tags CLOUDFLARE, CN have no data to match against: settings.geoip_dat_path is not set and neither is settings.geoip_db_path, so geoip_country never matches them"
+            ]
+        );
+        assert_eq!(
+            warnings(serde_json::json!({ "geoip_db_path": "/data/country.mmdb" })),
+            [
+                geosite,
+                "GeoIP tags CLOUDFLARE have no data to match against: settings.geoip_dat_path is not set, and settings.geoip_db_path answers two-letter country codes alone, so geoip_country never matches them"
+            ]
+        );
+        assert!(
+            warnings(serde_json::json!({
+                "geoip_dat_path": "/data/geoip.dat",
+                "geosite_data_paths": ["/data/geosite.dat"]
+            }))
+            .is_empty()
+        );
+    }
+
     /// 按 JSON 建运行时配置 / A runtime configuration built from JSON
     fn runtime_of(raw: serde_json::Value) -> anyhow::Result<RuntimePipelineConfig> {
         RuntimePipelineConfig::from_config(serde_json::from_value(raw).expect("parse config"))
@@ -1104,6 +1145,11 @@ mod tests {
                 "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
             }] }]
         })
+    }
+
+    /// 规则的回答检查 / The rule's answer check
+    fn phase(rule: &RuntimeRule) -> &ResponsePhase {
+        rule.response_phase.as_deref().expect("an answer check")
     }
 
     /// CIDR 列表按逗号分开，各项去掉两边的空白，空项跳过；两种响应匹配器一样
@@ -1127,7 +1173,7 @@ mod tests {
                 }] }]
             }))
             .expect("build runtime config");
-            let nets = match &config.pipelines[0].rules[0].response_matchers[0].matcher {
+            let nets = match &phase(&config.pipelines[0].rules[0]).matchers[0].matcher {
                 RuntimeResponseMatcher::ResponseAnswerIp { nets }
                 | RuntimeResponseMatcher::ResponseUpstreamIp { nets } => nets.clone(),
                 other => panic!("{kind}: {other:?}"),
@@ -1284,7 +1330,7 @@ mod tests {
                 select.pipeline_select[0].matchers[0]
                     .matcher
                     .matches_with_ready_managers(&query, None, None),
-                response.pipelines[0].rules[0].response_matchers[0]
+                phase(&response.pipelines[0].rules[0]).matchers[0]
                     .matcher
                     .matches(
                         "udp:test",
@@ -1574,11 +1620,11 @@ mod tests {
             Some(vec!["192.0.2.1:53".to_string(), "192.0.2.2:53".to_string()])
         );
         assert_eq!(
-            split_ahead(&rule.response_actions_on_match),
+            split_ahead(&phase(rule).on_match),
             Some(vec!["192.0.2.3:53".to_string()])
         );
         assert_eq!(
-            split_ahead(&rule.response_actions_on_miss),
+            split_ahead(&phase(rule).on_miss),
             Some(vec!["192.0.2.4:53".to_string(), "192.0.2.5:53".to_string()])
         );
     }
@@ -1823,7 +1869,7 @@ mod tests {
         manager.load_from_v2ray_file(&path).unwrap();
         let manager = Arc::new(parking_lot::RwLock::new(manager));
         let ip: IpAddr = "104.16.0.1".parse().unwrap();
-        let tags = vec![Arc::from("cloudflare")];
+        let tags = vec![Arc::from("CLOUDFLARE")];
 
         let request = RuntimeMatcher::GeoipCountry {
             country_codes: tags.clone(),

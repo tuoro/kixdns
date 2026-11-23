@@ -790,3 +790,56 @@ impl tokio::io::AsyncWrite for CountedWrites {
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
+
+/// 测试里交给响应动作的请求：按 `engine` 当时的配置，来自 `peer`、不带 EDNS，问 `qname` 的 `qtype`，客户端发来的包是
+/// `packet`。请求只借用这些，所以先放在这里，再借出去（见 [`Self::request`]）
+/// A request handed to response actions in tests: under `engine`'s configuration at the time,
+/// from `peer` without EDNS, asking `qname` for `qtype`, the client's packet being `packet`. A
+/// request only borrows these, so they are kept here and lent from here (see
+/// [`Self::request`])
+pub(crate) struct Asked {
+    state: Arc<crate::engine::EngineInner>,
+    qname: Arc<str>,
+    qtype: RecordType,
+    packet: Vec<u8>,
+    peer: SocketAddr,
+}
+
+impl Asked {
+    pub(crate) fn new(
+        engine: &Engine,
+        qname: &str,
+        qtype: RecordType,
+        packet: Vec<u8>,
+        peer: SocketAddr,
+    ) -> Self {
+        Self {
+            state: engine.state.load_full(),
+            qname: Arc::from(qname),
+            qtype,
+            packet,
+            peer,
+        }
+    }
+
+    pub(crate) fn request(&self) -> crate::engine::execution::Request<'_> {
+        crate::engine::execution::Request {
+            state: &self.state,
+            packet: &self.packet,
+            qname: &self.qname,
+            qtype: self.qtype,
+            qclass: hickory_proto::rr::DNSClass::IN,
+            tx_id: 0,
+            flags: crate::proto_utils::QueryFlags::of(&self.packet),
+            peer: self.peer,
+            requester: crate::matcher::Requester {
+                address: self.peer.ip(),
+                edns: false,
+                ecs: None,
+            },
+            start: std::time::Instant::now(),
+            refresh: None,
+            observed: None,
+        }
+    }
+}

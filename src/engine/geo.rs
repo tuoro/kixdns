@@ -374,9 +374,10 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
     }
     let handed_over = GeoSiteManager::read_handovers(handovers);
     let mut manager = manager.write();
-    let count = manager.swap_source(path, parsed, handed_over, gives_none);
+    let swapped = manager.swap_source(path, parsed, handed_over, gives_none);
     let missing = manager.missing_tags(tags);
     drop(manager);
+    let count = swapped.finish();
     info!(path = %path.display(), loaded_count = count, "GeoSite data reloaded");
     warn_missing_geosite_tags(&missing);
     true
@@ -481,12 +482,16 @@ fn load_geoip(
     }
 }
 
-/// 监视到 GeoIP 数据文件 `path` 变了：在锁外读取、解码、建索引，只在换入时短暂持写锁——匹配
-/// 走读锁，整个重载都在写锁里时，三十万网段的 .dat 让所有 GeoIP 匹配停了 961 ms
-/// A watched GeoIP data file `path` changed: reading, decoding and indexing happen outside
-/// the lock, which is held only for the swap. Matching takes the read lock, and with the
+/// 监视到 GeoIP 数据文件 `path` 变了：在锁外读取、解码、建索引、记日志，装进一个和在用的共用 MMDB 的新管理器，只在
+/// 把它换进去时短暂持写锁，换下来的也在锁外放掉——匹配走读锁，整个重载都在写锁里时，三十万网段的 .dat 让所有 GeoIP
+/// 匹配停了 961 ms。监视线程是唯一写管理器的（热重载先停下监视再换数据），所以读锁下拿到的 MMDB 到换进去时仍是在用的那份
+/// A watched GeoIP data file `path` changed: reading, decoding, indexing and logging happen
+/// outside the lock, into a new manager sharing the MMDB in use, and the write lock is held only
+/// to swap it in, the old one freed outside it too. Matching takes the read lock, and with the
 /// whole reload under the write lock a .dat of 300k networks stalled every GeoIP match for
-/// 961 ms. Gives whether new data went in / 换进了新数据时为 true
+/// 961 ms. The watch thread is the only one writing to the manager (a hot reload stops the
+/// watch before swapping data), so the MMDB taken under the read lock is still the one in use
+/// at the swap. Gives whether new data went in / 换进了新数据时为 true
 fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String]) -> bool {
     let parsed = match GeoIpManager::parse_file(path, tags) {
         Ok(parsed) => parsed,
@@ -495,17 +500,18 @@ fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String
             return false;
         }
     };
-    {
-        // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
-        // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
-        // none of them any more, most likely a broken file, so the data in use stays
-        if parsed.tag_count() == 0 && manager.read().tag_count() > 0 {
-            warn!(path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
-            return false;
-        }
-        let count = manager.write().apply_parsed(parsed);
-        info!(path = %path.display(), loaded_count = count, "GeoIP data reloaded");
+    // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
+    // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
+    // none of them any more, most likely a broken file, so the data in use stays
+    if parsed.tag_count() == 0 && manager.read().tag_count() > 0 {
+        warn!(path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
+        return false;
     }
+    let mut fresh = manager.read().sharing_mmdb();
+    let count = fresh.apply_parsed(parsed);
+    let old = mem::replace(&mut *manager.write(), fresh);
+    drop(old);
+    info!(path = %path.display(), loaded_count = count, "GeoIP data reloaded");
     true
 }
 
@@ -520,6 +526,86 @@ mod tests {
     /// suffix
     fn json(tag: &str, suffix: &str) -> String {
         format!(r#"{{"entries":[{{"tag":"{tag}","domains":["domain:{suffix}"]}}]}}"#)
+    }
+
+    /// 数日志的订阅者层：一共记了几条，几条是在两个管理器有一个拿着写锁时记的
+    /// A subscriber layer counting log lines: how many there were, and how many came while
+    /// either manager's write lock was held
+    struct LogsUnderLock {
+        geosite: Arc<RwLock<GeoSiteManager>>,
+        geoip: Arc<RwLock<GeoIpManager>>,
+        logged: Arc<std::sync::atomic::AtomicUsize>,
+        under_lock: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogsUnderLock {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            self.logged.fetch_add(1, Ordering::SeqCst);
+            if self.geosite.is_locked_exclusive() || self.geoip.is_locked_exclusive() {
+                self.under_lock.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// 监视到数据文件变了时，日志都在写锁外记，换下来的数据也在锁外放掉：写锁只在换数据时拿着。以前换完的规模在写锁里记、
+    /// 放掉换下来的数据的线程在写锁里起，GeoIP 的日志也在写锁里记，旧数据在写锁里放掉，这期间所有按 Geo 数据匹配的查询
+    /// 都停着
+    /// When a watched data file changes, every log line is written outside the write lock, and
+    /// the data swapped out is freed outside it too: the write lock is held only for the swap.
+    /// The size after the swap used to be logged, and the thread freeing the data swapped out
+    /// started, under the write lock, and GeoIP logged and freed its old data under it too, every
+    /// match on Geo data stalled meanwhile
+    #[test]
+    fn a_reload_logs_nothing_under_the_write_lock() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (site, ip) = (dir.path().join("site.json"), dir.path().join("ip.json"));
+        let site_tags = ["ads".to_string()];
+        let ip_tags = ["LAN".to_string()];
+        let ip_json =
+            |net: &str| format!(r#"{{"entries":[{{"country_code":"LAN","ips":["{net}"]}}]}}"#);
+        std::fs::write(&site, json("ads", "old.test")).unwrap();
+        std::fs::write(&ip, ip_json("192.0.2.0/24")).unwrap();
+        let geosite = Arc::new(RwLock::new(GeoSiteManager::new()));
+        let parsed = GeoSiteManager::parse_file(&site, &site_tags).unwrap();
+        geosite.write().apply_source(&site, parsed);
+        let geoip = Arc::new(RwLock::new(GeoIpManager::default()));
+        geoip
+            .write()
+            .apply_parsed(GeoIpManager::parse_file(&ip, &ip_tags).unwrap());
+        std::fs::write(&site, json("ads", "new.test")).unwrap();
+        std::fs::write(&ip, ip_json("198.51.100.0/24")).unwrap();
+
+        let (logged, under_lock) = (Arc::default(), Arc::default());
+        let subscriber = tracing_subscriber::registry().with(LogsUnderLock {
+            geosite: Arc::clone(&geosite),
+            geoip: Arc::clone(&geoip),
+            logged: Arc::clone(&logged),
+            under_lock: Arc::clone(&under_lock),
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(reload_geosite_file(&geosite, &site, &site_tags));
+            assert!(reload_geoip_file(&geoip, &ip, &ip_tags));
+        });
+        assert!(logged.load(Ordering::SeqCst) > 0, "the reloads log");
+        assert_eq!(
+            under_lock.load(Ordering::SeqCst),
+            0,
+            "logged under the write lock"
+        );
+        assert!(geosite.read().matches("ads", "x.new.test"));
+        assert!(!geosite.read().matches("ads", "x.old.test"));
+        let lan = [Arc::from("LAN")];
+        assert!(
+            geoip
+                .read()
+                .matches_any_tag("198.51.100.7".parse().unwrap(), &lan)
+        );
+        assert!(
+            !geoip
+                .read()
+                .matches_any_tag("192.0.2.7".parse().unwrap(), &lan)
+        );
     }
 
     /// 监视到文件变了、共享的标签要从前面的文件读回来时，那个文件在锁外读：读的这段时间里匹配照常拿得到读锁。以前在写锁

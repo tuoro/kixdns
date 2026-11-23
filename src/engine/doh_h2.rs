@@ -24,14 +24,12 @@ use bytes::Bytes;
 use h2::RecvStream;
 use h2::client::SendRequest;
 use hyper::body::Frame;
-use hyper_util::client::legacy::connect::HttpConnector;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
-use tower_service::Service;
 use url::{Host, Url};
 
-use super::bootstrap::Resolver;
-use super::transport::{Connect, InFlight, StillOpen, least_busy};
+use super::bootstrap::Bootstrap;
+use super::transport::{Connect, InFlight, StillOpen, connect_tcp, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
 pub(crate) type H2Sender = SendRequest<Bytes>;
@@ -43,14 +41,15 @@ pub(crate) type H2Sender = SendRequest<Bytes>;
 /// and a request sent on one would only wait for its timeout
 pub(crate) const DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// 连接的接收窗口，DoQ 的连接也用它（见 `transport::doq_transport`）。每个流的窗口用协议默认的 64 KiB，正好装下最长的
-/// DNS 消息；连接的窗口大得多，同时在途的回答不用等窗口更新，又给一条连接上缓冲的字节封了顶。hyper 用 PING 估算带宽时延积
-/// 再放大窗口，DNS 回答很小，用不着
-/// The connection's receive window, which DoQ connections use too (see
-/// `transport::doq_transport`). Each stream keeps the protocol's default 64 KiB, which holds the
-/// longest DNS message; the connection's is much larger, so answers in flight together never wait
-/// for a window update, while it caps what one connection can have buffered. hyper widens its
-/// windows from PING-based bandwidth-delay estimates, which DNS answers are far too small to need
+/// 连接的接收窗口，DoQ 的连接和经 reqwest 的 HTTP/2 也用它（见 `transport::doq_transport`、
+/// `DohClient::build_client`）。每个流的窗口用协议默认的 64 KiB，正好装下最长的 DNS 消息；连接的窗口大得多，同时在途的
+/// 回答不用等窗口更新，又给一条连接上缓冲的字节封了顶。hyper 用 PING 估算带宽时延积再放大窗口，DNS 回答很小，用不着
+/// The connection's receive window, which DoQ connections and HTTP/2 through reqwest use too
+/// (see `transport::doq_transport` and `DohClient::build_client`). Each stream keeps the
+/// protocol's default 64 KiB, which holds the longest DNS message; the connection's is much
+/// larger, so answers in flight together never wait for a window update, while it caps what one
+/// connection can have buffered. hyper widens its windows from PING-based bandwidth-delay
+/// estimates, which DNS answers are far too small to need
 pub(super) const CONNECTION_WINDOW: u32 = 1 << 20;
 
 /// 一条打开的连接 / One open connection
@@ -126,7 +125,7 @@ impl H2Link {
         &self,
         url: &Url,
         tls: &Arc<ClientConfig>,
-        connector: &Connector,
+        bootstrap: &Arc<Bootstrap>,
     ) -> anyhow::Result<Option<(H2Sender, InFlight<'_>)>> {
         if self.no_h2.load(Ordering::Relaxed) {
             return Ok(None);
@@ -142,8 +141,8 @@ impl H2Link {
             return Ok(Some((sender, in_flight)));
         }
         let made = connecting.finish(|| {
-            let (url, tls, connector) = (url.clone(), Arc::clone(tls), connector.clone());
-            async move { connect(&url, &tls, &connector).await }
+            let (url, tls, bootstrap) = (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
+            async move { connect(&url, &tls, &bootstrap).await }
         });
         match made.await? {
             Some(sender) => {
@@ -200,30 +199,28 @@ impl StillOpen for Option<H2Sender> {
     }
 }
 
-/// 连上 `url`：TCP 走 reqwest 用的同一个连接器（解析域名、IPv6 连不上时退回 IPv4），TLS 握手报 h2 和
-/// http/1.1。对方选了 h2 就做 HTTP/2 握手，把连接交给后台任务；没选时是 None
-/// Connects to `url`: TCP through the same connector reqwest uses (name resolution, falling
-/// back to IPv4 when IPv6 does not connect), a TLS handshake offering h2 and http/1.1. When the
-/// peer picks h2 the HTTP/2 handshake follows and a background task drives the connection;
-/// otherwise None
+/// 连上 `url`：TCP 和 TCP、DoT 上游一样经 `transport::connect_tcp` 连（主机名交给 `bootstrap` 解析，几个地址错开着连），
+/// TLS 握手报 h2 和 http/1.1。对方选了 h2 就做 HTTP/2 握手，把连接交给后台任务；没选时是 None
+/// Connects to `url`: TCP through `transport::connect_tcp`, as TCP and DoT upstreams are (the
+/// host name resolved by `bootstrap`, several addresses connected to staggered), a TLS handshake
+/// offering h2 and http/1.1. When the peer picks h2 the HTTP/2 handshake follows and a background
+/// task drives the connection; otherwise None
 async fn connect(
     url: &Url,
     tls: &Arc<ClientConfig>,
-    connector: &Connector,
+    bootstrap: &Bootstrap,
 ) -> anyhow::Result<Option<H2Sender>> {
-    let server_name = match url.host().context("doh url has no host")? {
+    let host = url.host().context("doh url has no host")?;
+    let server_name = match &host {
         Host::Domain(name) => ServerName::try_from(name.to_string()).context("doh server name")?,
-        Host::Ipv4(ip) => ServerName::IpAddress(std::net::IpAddr::V4(ip).into()),
-        Host::Ipv6(ip) => ServerName::IpAddress(std::net::IpAddr::V6(ip).into()),
+        Host::Ipv4(ip) => ServerName::IpAddress(std::net::IpAddr::V4(*ip).into()),
+        Host::Ipv6(ip) => ServerName::IpAddress(std::net::IpAddr::V6(*ip).into()),
     };
-    let uri: hyper::Uri = url.as_str().parse().context("doh url as uri")?;
-    let tcp = connector
-        .clone()
-        .call(uri)
+    let port = url.port_or_known_default().context("doh url has no port")?;
+    // 主机写成 URL 里的样子，IPv6 带着方括号 / The host as a URL writes it, an IPv6 one in brackets
+    let tcp = connect_tcp(bootstrap, &format!("{host}:{port}"))
         .await
-        .map_err(|err| anyhow::anyhow!(err))
-        .context("doh connect failed")?
-        .into_inner();
+        .context("doh connect failed")?;
     let stream = tokio_rustls::TlsConnector::from(Arc::clone(tls))
         .connect(server_name, tcp)
         .await
@@ -356,25 +353,6 @@ impl hyper::body::Body for H2Body {
     fn is_end_stream(&self) -> bool {
         self.0.is_end_stream()
     }
-}
-
-/// 直连用的 TCP 连接器，主机名交给 [`Resolver`] 解析 / The direct connection's TCP connector, host
-/// names resolved by [`Resolver`]
-pub(crate) type Connector = HttpConnector<Resolver>;
-
-/// 和 reqwest 默认一样的 TCP 连接器：关 Nagle，不限 http（TLS 由这里接着做），TCP keepalive 15 秒起、
-/// 每 15 秒一次、3 次没回就断；主机名和 reqwest 一样交给 `resolver`
-/// A TCP connector set up as reqwest's default: Nagle off, any scheme allowed (TLS follows
-/// here), TCP keepalive from 15 seconds, every 15 seconds, given up after 3 unanswered; host
-/// names go to `resolver`, as reqwest's do
-pub(crate) fn tcp_connector(resolver: Resolver) -> Connector {
-    let mut connector = HttpConnector::new_with_resolver(resolver);
-    connector.enforce_http(false);
-    connector.set_nodelay(true);
-    connector.set_keepalive(Some(Duration::from_secs(15)));
-    connector.set_keepalive_interval(Some(Duration::from_secs(15)));
-    connector.set_keepalive_retries(Some(3));
-    connector
 }
 
 /// 设了代理环境变量时，reqwest 会让 https 请求走代理（它默认读这些变量）。这里的直连不认代理，所以那时
