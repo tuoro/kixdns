@@ -335,6 +335,18 @@ impl GeoIpManager {
             .is_some_and(|mmdb| FileStamp::of(Path::new(path)).is_ok_and(|file| file != mmdb.file))
     }
 
+    /// 和这个管理器用同一份 MMDB、还没有标签的管理器：监视到数据文件变了时，新的标签在它上面、锁外装好，写锁下只把整个
+    /// 管理器换进去（见 `engine::geo` 的 `reload_geoip_file`）
+    /// A manager with this one's very MMDB and no tags yet: when a watched data file changes, the
+    /// new tags go into it outside the lock, and the write lock is held only to swap the whole
+    /// manager in (see `reload_geoip_file` in `engine::geo`)
+    pub fn sharing_mmdb(&self) -> Self {
+        Self {
+            mmdb: self.mmdb.clone(),
+            tag_indexes: FxHashMap::default(),
+        }
+    }
+
     /// MMDB 是否已加载；加载了，两个字母的国家代码就只按它判断
     /// Whether an MMDB is loaded; when one is, two-letter country codes are judged by it alone
     #[inline]
@@ -680,8 +692,8 @@ impl GeoIpManager {
             let index = get_or_insert_tag_index(&mut tag_indexes, &tag);
 
             for ip_str in &geoip.ips {
-                match ip_str.parse::<ipnet::IpNet>() {
-                    Ok(ipnet::IpNet::V4(v4net)) => {
+                match json_network(ip_str) {
+                    Some(ipnet::IpNet::V4(v4net)) => {
                         index.ipv4_ranges.push(AddrRange {
                             start: u32::from(v4net.network()),
                             end: u32::from(v4net.broadcast()),
@@ -689,7 +701,7 @@ impl GeoIpManager {
                         count += 1;
                         ipv4_count += 1;
                     }
-                    Ok(ipnet::IpNet::V6(v6net)) => {
+                    Some(ipnet::IpNet::V6(v6net)) => {
                         index.ipv6_ranges.push(AddrRange {
                             start: u128::from(v6net.network()),
                             end: u128::from(v6net.broadcast()),
@@ -697,7 +709,7 @@ impl GeoIpManager {
                         count += 1;
                         ipv6_count += 1;
                     }
-                    Err(_) => continue,
+                    None => {}
                 }
             }
         }
@@ -714,6 +726,19 @@ impl GeoIpManager {
             source: "JSON file",
         })
     }
+}
+
+/// JSON 数据里的一项：带前缀长度的网段（`1.1.1.0/24`），或者不带前缀长度的单个地址（`1.1.1.1` 就是 `1.1.1.1/32`，
+/// IPv6 是 /128），和 .dat 里超过位宽的前缀按单个地址算一样。网段列表里写一个地址只有这一个意思，以前它读不出来，
+/// 悄悄丢掉，文件里明明列着的地址规则却匹配不上
+/// One item of JSON data: a network with its prefix length (`1.1.1.0/24`), or a single
+/// address without one (`1.1.1.1` is `1.1.1.1/32`, /128 for IPv6), as a .dat prefix wider than
+/// the address is one address. An address in a list of networks can mean nothing else; it used
+/// not to parse and was dropped in silence, so rules missed an address the file plainly lists
+fn json_network(text: &str) -> Option<ipnet::IpNet> {
+    text.parse()
+        .ok()
+        .or_else(|| text.parse::<IpAddr>().ok().map(ipnet::IpNet::from))
 }
 
 /// 从 `file` 读一个 protobuf 变长整数，`remaining` 是文件里还剩的字节数
@@ -755,17 +780,22 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-/// `geoip_private` 和 ECS 都算作内网的地址：IPv4 的 RFC 1918 私有网段、回环、链路本地，IPv6 的
-/// 回环、未指定地址、ULA（fc00::/7）、链路本地（fe80::/10）。两边各自再多算一个地址，见
-/// [`is_private_ip`] 和 `ecs::is_private_ip`
+/// `geoip_private` 和 ECS 都算作内网的地址：IPv4 的 RFC 1918 私有网段、回环、链路本地、「本网络」0.0.0.0/8，
+/// IPv6 的回环、未指定地址、ULA（fc00::/7）、链路本地（fe80::/10）。0.0.0.0/8 和 `::` 一样不是哪台主机的地址
+/// （RFC 791），连 0.0.0.0 在 Linux、macOS 上连的是本机，回答它和回答 127.0.0.1 一样能拿来重绑定。两边各自
+/// 再多算一些，见 [`is_private_ip`] 和 `ecs::is_private_ip`
 /// The addresses both `geoip_private` and ECS count as local network ones: for IPv4 the
-/// RFC 1918 private networks, loopback and link-local; for IPv6 loopback, the
-/// unspecified address, ULA (fc00::/7) and link-local (fe80::/10). Each counts one more
-/// address of its own, see [`is_private_ip`] and `ecs::is_private_ip`
+/// RFC 1918 private networks, loopback, link-local and "this network" 0.0.0.0/8; for IPv6
+/// loopback, the unspecified address, ULA (fc00::/7) and link-local (fe80::/10). Like `::`,
+/// 0.0.0.0/8 is no host's address (RFC 791), and connecting to 0.0.0.0 reaches this machine
+/// on Linux and macOS, so an answer of it rebinds as one of 127.0.0.1 does. Each side counts
+/// some more of its own, see [`is_private_ip`] and `ecs::is_private_ip`
 #[inline]
 pub(crate) fn is_local_network(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.octets()[0] == 0
+        }
         IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
@@ -1294,6 +1324,37 @@ mod tests {
 
     fn tags(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// JSON 里不带前缀长度的地址按单个地址算：`198.51.100.7` 是 /32，`2001:db8::7` 是 /128，旁边的地址不算。以前它们
+    /// 读不出来，悄悄丢掉
+    /// An address in JSON without a prefix length is that one address: `198.51.100.7` is a /32
+    /// and `2001:db8::7` a /128, the addresses next to them not included. They used not to
+    /// parse and were dropped in silence
+    #[test]
+    fn a_json_address_without_a_prefix_is_that_one_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        std::fs::write(
+            &path,
+            r#"{"entries":[{"country_code":"HOSTS","ips":["198.51.100.7","2001:db8::7"]}]}"#,
+        )
+        .unwrap();
+        let mut manager = GeoIpManager::default();
+        manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["hosts"])).unwrap());
+        let hosts = [Arc::from("HOSTS")];
+        for (ip, expected) in [
+            ("198.51.100.7", true),
+            ("198.51.100.8", false),
+            ("2001:db8::7", true),
+            ("2001:db8::8", false),
+        ] {
+            assert_eq!(
+                manager.matches_any_tag(ip.parse().unwrap(), &hosts),
+                expected,
+                "{ip}"
+            );
+        }
     }
 
     /// 只解析规则用到的标签，请求不分大小写；别的条目不留，文件里没有的标签不算错
