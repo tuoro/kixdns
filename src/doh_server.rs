@@ -69,6 +69,30 @@ const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// section 6.5.2 recommends no fewer than 100)
 const MAX_CONCURRENT_STREAMS: u32 = 100;
 
+/// 一条 DoH 连接替客户端缓冲多少。hyper 的默认值是给网页用的：HTTP/1.1 的读缓冲约 400 KiB，HTTP/2 每个流和整条连接的
+/// 接收窗口各 1 MiB、每个流的发送缓冲约 400 KiB。一台设备在请求头读完的时限里慢慢发一个超大的头，或者在 GET 的流上
+/// 一直发数据，每条连接就能占到几百 KiB 到几 MiB，连接预算（512 条）还没用完，256 MB 的路由器就先没了内存。DNS 消息
+/// 最长 [`MAX_QUERY_LEN`]（查询）和 64 KiB（回答），这里留的够装下一个请求头加一条查询，回答比发送缓冲大时分块等窗口
+/// How much one DoH connection buffers for a client. hyper's defaults are made for the web:
+/// some 400 KiB of HTTP/1.1 read buffer, and for HTTP/2 1 MiB of receive window for each stream
+/// and for the connection and some 400 KiB of send buffer per stream. A device sending one huge
+/// head slowly within the head-reading deadline, or data on a GET's stream without end, held a
+/// few hundred KiB to some MiB per connection, and a 256 MB router ran out of memory before the
+/// connection budget (512) did. A DNS message is at most [`MAX_QUERY_LEN`] (a query) and 64 KiB
+/// (an answer); what is kept here holds a request head and a query, and an answer larger than
+/// the send buffer goes out in pieces as the window allows
+mod buffered {
+    /// HTTP/1.1 的读缓冲（hyper 最少 8 KiB）/ The HTTP/1.1 read buffer (8 KiB at least in hyper)
+    pub(super) const HTTP1: usize = 16 * 1024;
+    /// HTTP/2 每个流的接收窗口 / The HTTP/2 receive window of each stream
+    pub(super) const STREAM_WINDOW: u32 = 16 * 1024;
+    /// HTTP/2 整条连接的接收窗口：正文都是马上读走的，读走的就还回窗口 / The HTTP/2 receive window of
+    /// the whole connection: bodies are read at once, and what is read goes back to the window
+    pub(super) const CONNECTION_WINDOW: u32 = 64 * 1024;
+    /// HTTP/2 每个流的发送缓冲 / The HTTP/2 send buffer of each stream
+    pub(super) const SEND: usize = 16 * 1024;
+}
+
 /// TLS acceptor shared between the accept loop and the certificate watcher:
 /// wait-free snapshot per connection, swapped wholesale on reload — the same
 /// hot-reload pattern as Engine's `Arc<ArcSwap<...>>` state.
@@ -147,6 +171,7 @@ pub async fn run_doh_with_listener(
                     // zero-sized, so this costs nothing per connection.
                     let _ = http1::Builder::new()
                         .timer(hyper_util::rt::TokioTimer::new())
+                        .max_buf_size(buffered::HTTP1)
                         .header_read_timeout(HEADER_READ_TIMEOUT)
                         .keep_alive(true)
                         .serve_connection(io, svc)
@@ -341,6 +366,9 @@ where
     let conn = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
         .timer(hyper_util::rt::TokioTimer::new())
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .initial_stream_window_size(buffered::STREAM_WINDOW)
+        .initial_connection_window_size(buffered::CONNECTION_WINDOW)
+        .max_send_buf_size(buffered::SEND)
         .serve_connection(io, svc);
     tokio::pin!(conn);
     // 发了 GOAWAY 以后最晚什么时候断开 / When at the latest to drop it once the GOAWAY is out
@@ -392,7 +420,11 @@ async fn handle_doh_request(
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     // RFC 8484 §4.1: POST with application/dns-message
     // RFC 8484 §4.1.5: GET with ?dns=base64url
-    let dns_wire = match (req.method(), req.uri().path()) {
+    // 正文只有 POST 读；GET 的先丢掉，免得客户端在它的流上发的数据一直攒在窗口里，攒到回答发出去
+    // Only a POST's body is read; a GET's goes at once, lest the data a client sends on its stream
+    // pile up in the window until the answer is out
+    let (parts, body) = req.into_parts();
+    let dns_wire = match (&parts.method, parts.uri.path()) {
         (&Method::POST, path) if path == doh_path => {
             // 先看 Content-Length：声明超限的请求一个字节都不读；再用 Limited 给
             // body 本身封顶，分块传输或与声明不符的发送方也只能让服务端缓冲
@@ -402,11 +434,11 @@ async fn handle_doh_request(
             // so chunked or lying senders cannot make the server buffer more than
             // MAX_QUERY_LEN. Previously the whole body was collected before the
             // length was compared.
-            let declared = req.body().size_hint().exact();
+            let declared = body.size_hint().exact();
             if declared.is_some_and(|len| len > MAX_QUERY_LEN as u64) {
                 return Ok(error_response(StatusCode::PAYLOAD_TOO_LARGE));
             }
-            let body = Limited::new(req.into_body(), MAX_QUERY_LEN).collect();
+            let body = Limited::new(body, MAX_QUERY_LEN).collect();
             // 正文几乎总是和请求头一起到：先看一眼，到齐了就不必开定时器；没到齐才计时
             // The body nearly always arrives with the head: a first look that finds it whole
             // needs no timer, which is armed only when it is still coming
@@ -425,7 +457,8 @@ async fn handle_doh_request(
             }
         }
         (&Method::GET, path) if path == doh_path => {
-            match extract_get_dns_param(req.uri().query().unwrap_or("")) {
+            drop(body);
+            match extract_get_dns_param(parts.uri.query().unwrap_or("")) {
                 Some(data) => data,
                 None => return Ok(error_response(StatusCode::BAD_REQUEST)),
             }
@@ -1258,6 +1291,46 @@ mod tests {
             .unwrap();
         assert_eq!(started.elapsed(), HEADER_READ_TIMEOUT * 2);
         drop(connection);
+    }
+
+    /// HTTP/2 的流最多替客户端缓冲一个窗口（[`buffered::STREAM_WINDOW`]）：正文还没发的 POST 开着流，客户端最多能往里塞
+    /// 这么多。以前窗口是 hyper 默认的 1 MiB，每个这样的流能占 1 MiB
+    /// An HTTP/2 stream buffers at most one window for the client ([`buffered::STREAM_WINDOW`]):
+    /// with a POST whose body is yet to come holding its stream open, the client may put this
+    /// much in and no more. The window used to be hyper's default 1 MiB, each such stream
+    /// holding 1 MiB
+    #[tokio::test]
+    async fn an_http2_stream_buffers_at_most_its_window() {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        tokio::spawn(serve_http2(
+            hyper_util::rt::TokioIo::new(server),
+            "127.0.0.1:53000".parse().unwrap(),
+            Arc::new(make_static_engine("NXDOMAIN")),
+            Arc::from("/dns-query"),
+        ));
+        let (requests, connection) = h2::client::handshake(client).await.expect("handshake");
+        tokio::spawn(connection);
+        let mut requests = requests.ready().await.expect("ready");
+        // 先答完一个，双方的设置就都交换过了 / One answered first, so both sides' settings are exchanged
+        let query = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(make_dns_query_a("window.example", 1));
+        let get = hyper::Request::get(format!("https://localhost/dns-query?dns={query}"))
+            .body(())
+            .unwrap();
+        let (answered, _) = requests.send_request(get, true).expect("sent");
+        assert_eq!(answered.await.expect("answered").status(), StatusCode::OK);
+
+        let post = hyper::Request::post("https://localhost/dns-query")
+            .header(hyper::header::CONTENT_TYPE, "application/dns-message")
+            .body(())
+            .unwrap();
+        let (_answer, mut body) = requests.send_request(post, false).expect("sent");
+        body.reserve_capacity(1 << 20);
+        let granted = std::future::poll_fn(|cx| body.poll_capacity(cx))
+            .await
+            .expect("capacity")
+            .expect("granted");
+        assert_eq!(granted, buffered::STREAM_WINDOW as usize);
     }
 
     // ---- build_tls_acceptor ----

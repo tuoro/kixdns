@@ -468,6 +468,29 @@ async fn test_doh_post_non_query_is_bad_request() {
     );
 }
 
+/// 请求头超过一条 DoH 连接替客户端缓冲的上限（16 KiB），马上回 431，不等它慢慢发完。以前读缓冲是 hyper 默认的约
+/// 400 KiB，在请求头的读取时限里慢慢发，每条连接都能占这么多
+/// A request head over what one DoH connection buffers for a client (16 KiB) is answered 431 at
+/// once, not waited for to the end. The read buffer used to be hyper's default of some 400 KiB,
+/// which each connection could take sending slowly within the head-reading deadline
+#[tokio::test]
+async fn test_doh_oversized_request_head_rejected_at_once() {
+    let server = start_doh(make_nxdomain_engine()).await;
+    let mut stream = raw_tls_connect(&server).await;
+    stream
+        .write_all(b"GET /dns-query?dns=AAAB HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Padding: ")
+        .await
+        .expect("write head");
+    stream
+        .write_all(&vec![b'a'; 32 * 1024])
+        .await
+        .expect("write padding");
+    let status = tokio::time::timeout(Duration::from_secs(5), read_status_line(&mut stream))
+        .await
+        .expect("server must answer without waiting for the rest of the head");
+    assert_eq!(status, "HTTP/1.1 431 Request Header Fields Too Large");
+}
+
 // ============================================================================
 // POST body limit tests: reject before buffering (RFC 8484 §4.1 message size)
 // ============================================================================
