@@ -31,6 +31,20 @@ pub struct PipelineConfig {
     /// a warn (see [`warn_ignored_settings`]).
     #[serde(default)]
     pub background_refresh_rule: Option<Rule>,
+
+    /// 配置里写了、内核却不读的键，解析时找出来（见 [`parse_config`]），写成 `pipelines[0].rules[2].matcher` 这样的路径。
+    /// 退役的旧设置（见 [`RETIRED_SETTINGS`]）只记 warn，其余的算 [`problems`]。找得到的是各层对象里的键：设置、pipeline、
+    /// 规则和选择规则；动作、匹配器和 ECS 按 `type` 或 `mode` 分种类，serde 先把整个对象缓冲下来再读，多出来的键在那里就丢了，
+    /// 找不到（那里拼错的必填字段照旧是解析错误）
+    /// The keys a configuration writes that the kernel does not read, found while parsing (see
+    /// [`parse_config`]), as paths like `pipelines[0].rules[2].matcher`. Retired settings (see
+    /// [`RETIRED_SETTINGS`]) only get a warn, and the rest count among [`problems`]. What is found
+    /// are the keys of the objects at each level: settings, pipelines, rules and selector rules;
+    /// actions, matchers and ECS are told apart by `type` or `mode`, which serde reads by buffering
+    /// the whole object first, dropping extra keys there out of sight (a misspelt required field
+    /// there is still a parse error)
+    #[serde(skip)]
+    pub unread_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -971,7 +985,13 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
 /// the filesystem. Errors from the JSON layer carry line/column positions.
 /// 从 JSON 文本解析并规范化配置，不访问文件系统。JSON 层错误带行列位置。
 pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
-    let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
+    let mut unread_keys = Vec::new();
+    let mut json = serde_json::Deserializer::from_str(raw);
+    let mut cfg: PipelineConfig =
+        serde_ignored::deserialize(&mut json, |key| unread_keys.push(key_path(&key)))
+            .context("parse config JSON")?;
+    json.end().context("parse config JSON")?;
+    cfg.unread_keys = unread_keys;
 
     // 预分割上游字符串，转发时不必每次再拆；默认上游有几个时同时问 / Pre-split the upstream
     // strings so a forward does not split them each time; several default upstreams are
@@ -1384,6 +1404,11 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             });
         }
     }
+    for key in cfg.unread_keys.iter().filter(|key| !retired(key)) {
+        found.push(format!(
+            "{key}: the kernel does not read this key, so what it says has no effect; check its spelling and where it is written"
+        ));
+    }
     found
 }
 
@@ -1395,6 +1420,50 @@ pub fn warn_ignored_settings(cfg: &PipelineConfig) {
         warn!(
             "background_refresh_rule has no effect: a background refresh replays the original request through its own rules; the entry can be removed"
         );
+    }
+    for key in cfg.unread_keys.iter().filter(|key| retired(key)) {
+        warn!("{key} is no longer read and has no effect; the entry can be removed");
+    }
+}
+
+/// 以前有、后来删掉的设置：老配置里留着的照样能读，启动和重载时各记一条 warn（见 [`warn_ignored_settings`]），不算
+/// [`problems`]，升级以后不必先改配置。智能流控的五个数字在流控改为自己判断以后不再用；`prefetch` 随它的实现撤掉了
+/// Settings there used to be and were taken out: an older configuration still writing them
+/// reads as before, each getting a warn at startup and on reload (see
+/// [`warn_ignored_settings`]) and none counting among [`problems`], so an upgrade needs no
+/// change first. The five numbers of flow control went out of use once it judged by itself;
+/// `prefetch` went with its implementation
+const RETIRED_SETTINGS: [&str; 6] = [
+    "flow_control_initial_permits",
+    "flow_control_min_permits",
+    "flow_control_max_permits",
+    "flow_control_latency_threshold_ms",
+    "flow_control_adjustment_interval_secs",
+    "prefetch",
+];
+
+/// `key` 是不是一个退役的设置（见 [`RETIRED_SETTINGS`]）/ Whether `key` is a retired setting (see [`RETIRED_SETTINGS`])
+fn retired(key: &str) -> bool {
+    key.strip_prefix("settings.")
+        .is_some_and(|setting| RETIRED_SETTINGS.contains(&setting))
+}
+
+/// 内核不读的一个键在配置里的路径：对象的键用点隔开，数组的下标写在方括号里（从 0 数）
+/// Where a key the kernel does not read sits in the configuration: an object's keys joined by
+/// dots, an array's index in brackets (counting from 0)
+fn key_path(key: &serde_ignored::Path<'_>) -> String {
+    use serde_ignored::Path;
+
+    match key {
+        Path::Root => String::new(),
+        Path::Seq { parent, index } => format!("{}[{index}]", key_path(parent)),
+        Path::Map { parent, key } => match key_path(parent) {
+            parent if parent.is_empty() => key.clone(),
+            parent => format!("{parent}.{key}"),
+        },
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => key_path(parent),
     }
 }
 
@@ -1862,6 +1931,55 @@ mod validation_tests {
 
     fn problems_of(config: serde_json::Value) -> Vec<String> {
         super::problems(&super::parse_config(&config.to_string()).expect("parses"))
+    }
+
+    /// 内核不读的键按路径报出来：拼错的设置、写错名字的匹配器（`matcher` 少了 s，规则就没有匹配器，匹配所有查询）、
+    /// 选择规则和规则里多出来的键都算；退役的旧设置不算，只记 warn。以前这些都悄悄忽略，一条拦截规则写错一个字母就拦下
+    /// 所有查询
+    /// The keys the kernel does not read are raised by path: a misspelt setting, matchers written
+    /// under the wrong name (`matcher` without its s leaves the rule with no matcher, so it matches
+    /// every query), and extra keys of selector rules and rules all count; retired settings do not,
+    /// getting only a warn. These used to be ignored without a word, a block rule one letter off
+    /// blocking every query
+    #[test]
+    fn keys_the_kernel_does_not_read_are_problems() {
+        let found = problems_of(serde_json::json!({
+            "settings": {
+                "default_upstream": "1.1.1.1:53",
+                "min_tll": 30,
+                "flow_control_max_permits": 500,
+                "prefetch": { "prefetch_enabled": true }
+            },
+            "pipeline_select": [{ "pipeline": "main", "matcher": [] }],
+            "pipelines": [{ "id": "main", "rules": [
+                {
+                    "name": "block-ads",
+                    "matcher": [{ "type": "domain_suffix", "value": "ads.example" }],
+                    "actions": [{ "type": "static_response", "rcode": "NXDOMAIN", "ttl": 60 }]
+                },
+                {
+                    "name": "late",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "allow" }],
+                    "response_matcher": [{ "type": "response_rcode", "value": "NXDOMAIN" }]
+                }
+            ] }]
+        }));
+        let unread: Vec<&str> = found
+            .iter()
+            .filter_map(|problem| problem.split_once(": the kernel does not read this key"))
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                "pipeline_select[0].matcher",
+                "pipelines[0].rules[0].matcher",
+                "pipelines[0].rules[1].response_matcher",
+                "settings.min_tll",
+            ],
+            "{found:#?}"
+        );
     }
 
     /// 空的 domain_exact 只命中根域名，不是「匹配所有名字」，提示照实说
