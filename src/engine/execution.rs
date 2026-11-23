@@ -19,7 +19,9 @@ use smallvec::SmallVec;
 
 use crate::cache::CacheEntry;
 use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::advanced_rule::{PrecomputedAction, fast_static_match_with_rule};
+use crate::matcher::advanced_rule::{
+    PrecomputedAction, PrecomputedAnswer, fast_static_match_with_rule,
+};
 use crate::observe::{
     CacheHit, CacheHitKind, DecisionDetail, DecisionKind, DecisionMade, EngineObserver,
     RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleMatched, RulePhase,
@@ -216,6 +218,65 @@ enum FastPathAnswer<'a> {
     },
     /// Rule cache entry holding a static decision / 规则缓存中的静态决策
     CachedRules { record: &'a RuleCacheRecord },
+}
+
+/// 快速路径跟着走过的一次请求阶段跳转：从哪个 pipeline、凭什么跳走的（见 `Engine::observe_fast_path`）
+/// A request-phase jump the fast path followed: from which pipeline, and on what (see
+/// `Engine::observe_fast_path`)
+enum Hop<'a> {
+    /// 编译后的跳转规则 `rule` 直接命中，跳到 `target` / The compiled jump rule `rule` matched,
+    /// jumping to `target`
+    Rule {
+        pipeline: &'a str,
+        rule: &'a str,
+        target: &'a str,
+    },
+    /// 规则缓存里的跳转决定 / A jump decision from the rule cache
+    CachedRules {
+        pipeline: &'a str,
+        record: Arc<RuleCacheRecord>,
+    },
+}
+
+impl Hop<'_> {
+    /// 从哪个 pipeline 跳走 / The pipeline jumped from
+    fn pipeline(&self) -> &str {
+        match self {
+            Self::Rule { pipeline, .. } | Self::CachedRules { pipeline, .. } => pipeline,
+        }
+    }
+}
+
+/// 快速路径上一条编译规则当场作出的决定，照完整路径求值时的样子上报：规则 `rule` 命中，作出 `detail`
+/// A decision a compiled rule made on the spot on the fast path, reported as the full path's
+/// evaluation reports it: the rule `rule` matched, deciding `detail`
+fn report_compiled_rule(
+    observer: &dyn EngineObserver,
+    ctx: &RequestContext<'_>,
+    pipeline: &str,
+    rule: &str,
+    decision: DecisionKind,
+    detail: DecisionDetail<'_>,
+) {
+    observer.rule_matched(
+        ctx,
+        &RuleMatched {
+            pipeline,
+            rule,
+            phase: RulePhase::Request,
+            decision,
+            fast_path: true,
+        },
+    );
+    observer.decision_made(
+        ctx,
+        &DecisionMade {
+            pipeline,
+            rule: Some(rule),
+            phase: RulePhase::Request,
+            detail,
+        },
+    );
 }
 
 use super::core::Engine;
@@ -564,13 +625,19 @@ impl Engine {
     /// Report a request that `handle_packet_fast` answered without the async
     /// path: the whole lifecycle is emitted in one batch at the answering site.
     /// `response` is the answer, or the error that stopped the engine from
-    /// building one; the listener then answers SERVFAIL by itself.
+    /// building one; the listener then answers SERVFAIL by itself. `hops` are the
+    /// request-phase jumps followed on the way to `pipeline_id`, reported as the
+    /// full path reports them; a request that jumped is not offered whole, an offer
+    /// having room for one pipeline.
     /// 上报由 handle_packet_fast 直接应答的请求：整个生命周期在应答处一次性上报。
-    /// `response` 是应答，或者引擎没能构造出应答的错误；此时由监听器自己回 SERVFAIL。
+    /// `response` 是应答，或者引擎没能构造出应答的错误；此时由监听器自己回 SERVFAIL。`hops` 是到
+    /// `pipeline_id` 之前跟着走过的请求阶段跳转，照完整路径的样子上报；跳转过的请求不整份提供，整份的只放得下一个
+    /// pipeline。
     fn observe_fast_path(
         &self,
         observer: &dyn EngineObserver,
         ctx: &RequestContext<'_>,
+        hops: &[Hop<'_>],
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
         response: Result<&[u8], &anyhow::Error>,
@@ -586,52 +653,74 @@ impl Engine {
             response: response.ok(),
             error: error.as_deref(),
         };
-        let taken_whole = match &answer {
-            FastPathAnswer::Cache(hit) => {
-                observer.answered_from_cache(ctx, pipeline_id, hit, &outcome)
-            }
-            FastPathAnswer::StaticRule {
-                rule,
-                rcode,
-                answers,
-            } => observer.answered_by_rule(
-                ctx,
-                pipeline_id,
-                &RuleAnswer {
-                    rules: &[rule],
-                    decided_by_rule: true,
-                    rcode: *rcode,
-                    answers: *answers,
-                },
-                &outcome,
-            ),
-            FastPathAnswer::CachedRules { record } => {
-                let rules: SmallVec<[&str; 4]> = record
-                    .matched_rules
-                    .iter()
-                    .flat_map(|rules| rules.iter())
-                    .map(AsRef::as_ref)
-                    .collect();
-                let Decision::Static { rcode, answers } = &record.entry.decision else {
-                    unreachable!("the fast path answers only static decisions from the rule cache");
-                };
-                observer.answered_by_rule(
+        let taken_whole = hops.is_empty()
+            && match &answer {
+                FastPathAnswer::Cache(hit) => {
+                    observer.answered_from_cache(ctx, pipeline_id, hit, &outcome)
+                }
+                FastPathAnswer::StaticRule {
+                    rule,
+                    rcode,
+                    answers,
+                } => observer.answered_by_rule(
                     ctx,
                     pipeline_id,
                     &RuleAnswer {
-                        rules: &rules,
-                        decided_by_rule: record.decided_by_rule && !rules.is_empty(),
+                        rules: &[rule],
+                        decided_by_rule: true,
                         rcode: *rcode,
-                        answers: answers.len(),
+                        answers: *answers,
                     },
                     &outcome,
-                )
-            }
-        };
+                ),
+                FastPathAnswer::CachedRules { record } => {
+                    let rules: SmallVec<[&str; 4]> = record
+                        .matched_rules
+                        .iter()
+                        .flat_map(|rules| rules.iter())
+                        .map(AsRef::as_ref)
+                        .collect();
+                    let Decision::Static { rcode, answers } = &record.entry.decision else {
+                        unreachable!(
+                            "the fast path answers only static decisions from the rule cache"
+                        );
+                    };
+                    observer.answered_by_rule(
+                        ctx,
+                        pipeline_id,
+                        &RuleAnswer {
+                            rules: &rules,
+                            decided_by_rule: record.decided_by_rule && !rules.is_empty(),
+                            rcode: *rcode,
+                            answers: answers.len(),
+                        },
+                        &outcome,
+                    )
+                }
+            };
         if taken_whole {
             return;
         }
         observer.request_started(ctx);
+        for hop in hops {
+            let pipeline = hop.pipeline();
+            observer.pipeline_selected(ctx, pipeline);
+            observer.cache_lookup(ctx);
+            observer.cache_miss(ctx);
+            match hop {
+                Hop::Rule { rule, target, .. } => report_compiled_rule(
+                    observer,
+                    ctx,
+                    pipeline,
+                    rule,
+                    DecisionKind::Jump,
+                    DecisionDetail::Jump { pipeline: target },
+                ),
+                Hop::CachedRules { record, .. } => {
+                    report_rule_cache_hit(observer, ctx, pipeline, record, true);
+                }
+            }
+        }
         observer.pipeline_selected(ctx, pipeline_id);
         observer.cache_lookup(ctx);
         match answer {
@@ -642,24 +731,13 @@ impl Engine {
                 answers,
             } => {
                 observer.cache_miss(ctx);
-                observer.rule_matched(
+                report_compiled_rule(
+                    observer,
                     ctx,
-                    &RuleMatched {
-                        pipeline: pipeline_id,
-                        rule,
-                        phase: RulePhase::Request,
-                        decision: DecisionKind::Static,
-                        fast_path: true,
-                    },
-                );
-                observer.decision_made(
-                    ctx,
-                    &DecisionMade {
-                        pipeline: pipeline_id,
-                        rule: Some(rule),
-                        phase: RulePhase::Request,
-                        detail: DecisionDetail::Static { rcode, answers },
-                    },
+                    pipeline_id,
+                    rule,
+                    DecisionKind::Static,
+                    DecisionDetail::Static { rcode, answers },
                 );
             }
             FastPathAnswer::CachedRules { record } => {
@@ -727,13 +805,22 @@ impl Engine {
             },
         );
 
-        let pipeline_id = pipeline_opt.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
-        let owned_pipeline_id =
-            || pipeline_opt.map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone());
-
-        // 在这里答上的请求各记一条响应日志 / Each request answered here gets a response record
-        let response_log =
-            || ResponseLog::with_pipeline(qname_str, qtype, peer, owned_pipeline_id, start, false);
+        let name_of = |pipeline: Option<&crate::matcher::RuntimePipeline>| {
+            pipeline.map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
+        };
+        // 在这里答上的请求各记一条响应日志，和完整路径一样记在最后到的那个 pipeline 下
+        // Each request answered here gets a response record, under the pipeline it got to last,
+        // as on the full path
+        let response_log = |pipeline| {
+            ResponseLog::with_pipeline(
+                qname_str,
+                qtype,
+                peer,
+                move || name_of(pipeline),
+                start,
+                false,
+            )
+        };
 
         // RFC 6891 第 6.1.3 节：不支持请求的 EDNS 版本时回 BADVERS，而不是照版本 0 去答
         // RFC 6891 section 6.1.3: an unsupported EDNS version is answered BADVERS rather
@@ -758,265 +845,317 @@ impl Engine {
             }
             // 和完整路径一样记一条响应日志，pipeline 是选中的那个
             // A response record as the full path writes, with the pipeline picked
-            response_log().answered(&reply);
+            response_log(pipeline_opt).answered(&reply);
             return Ok(Some(FastPathResponse::Direct(reply)));
         }
 
-        // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-        let cache_namespace = state.cache_namespace(pipeline_id);
         let requester = Requester {
             address: peer.ip(),
             edns: q.edns_present,
             ecs: q.client_subnet,
         };
         let view = requester.ecs_view();
-        let requester_key = pipeline_opt.map_or(RequesterKey::NONE, |p| {
-            p.requester.key(requester, Some(&self.geoip_manager))
-        });
-        let slot = Self::cache_slot(
-            cache_namespace,
-            pipeline_id,
-            q.qname.as_bytes(),
-            qtype,
-            qclass,
-            q.flags,
-            &requester_key,
-        );
+        // 第一条命中的规则或规则缓存给的是跳转时，和完整路径一样跟过去（见 `decide`），按目标的键再查一遍，至多跳
+        // response_jump_limit 次；再要跳的、目标不存在的交给完整路径，由它回 SERVFAIL。走过的跳转在答上时照完整路径的
+        // 样子上报
+        // When the first rule matching or the rule cache gives a jump, it is followed as on the
+        // full path (see `decide`) and the target looked in again under its own keys, up to
+        // response_jump_limit jumps; one jump more, or a target that does not exist, goes to the
+        // full path, which answers SERVFAIL. The jumps followed are reported as the full path
+        // reports them once the request is answered
+        let mut hops: SmallVec<[Hop<'_>; 2]> = SmallVec::new();
+        let mut pipeline = pipeline_opt;
+        loop {
+            let pipeline_id = pipeline.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
 
-        if let Some(hit) = self.cache_get(
-            slot,
-            &view,
-            &CachedQuestion {
-                qname: qname_str,
-                pipeline_id,
-                qtype: q.qtype,
-                qclass: q.qclass,
-                flags: q.flags,
-            },
-        ) {
-            let elapsed_secs = crate::proto_utils::saturating_u64_to_u32(
-                start.saturating_duration_since(hit.inserted_at).as_secs(),
-            );
-            let age = phases::age_of(&hit, u64::from(elapsed_secs), &cfg.settings);
-            // 现在就能交出的过期应答在这里交出，和查缓存一样（见 `phases::stale_at_once`）：留给异步路径的话，过载时
-            // 异步路径收不下，手上这份能用的应答就变成了 SERVFAIL
-            // A stale answer that may go out right now goes out here, as on the cache lookup
-            // (see `phases::stale_at_once`): left to the async path, under overload the async
-            // path takes no more, and the usable answer in hand turned into SERVFAIL
-            if age == phases::Age::Stale
-                && let Some(kind) = phases::stale_at_once(self, &cfg.settings, slot, &hit)
-            {
-                let context = phases::CacheLookupContext {
-                    state: &state,
-                    qname: qname_str,
-                    qtype,
-                    qclass,
-                    flags: q.flags,
-                    pipeline_id,
-                    slot,
-                    tx_id: q.tx_id,
-                    start,
-                    peer: &peer,
-                    requester,
-                    observed: None,
-                };
-                let mut log = response_log();
-                let reply = crate::proto_utils::reply_as_asked(
-                    phases::serve_stale(self, &context, &hit, &view, kind, &mut log.info),
-                    packet,
-                );
-                if let Some(observer) = observed {
-                    self.observe_fast_path(
-                        observer,
-                        &self.fast_path_context(start, peer, qname_str, qtype, qclass),
-                        pipeline_id,
-                        FastPathAnswer::Cache(phases::cache_hit_of(&hit, kind, elapsed_secs)),
-                        Ok(&reply),
-                    );
-                }
-                log.answered(&reply);
-                return Ok(Some(FastPathResponse::Direct(reply)));
-            }
-            // 其余过期的（不能再用的、要先等上游的）留给异步路径：那里的查找选中的是同一份，由它决定。在这里删掉，那次
-            // 查找就会退到一份更宽、更旧的应答上，而上游已不再把它给这个请求方
-            // Any other expired answer (of no further use, or waiting on the upstream first) is
-            // left to the async path, whose lookup picks this same answer and decides. Dropping
-            // it here would let that lookup fall back to a wider, older answer the upstream no
-            // longer meant for this requester
-            if age == phases::Age::Fresh {
-                self.refresh_if_due(&state, &hit, elapsed_secs, slot, requester);
-
-                // Return current cache immediately, don't wait for refresh to complete
-                // 直接返回当前缓存，不等待刷新完成
-                // Next query will automatically use refreshed new cache (if completed)
-                // 下次查询时会自动使用刷新后的新缓存（如果已完成）
-                // A client that sent ECS gets the echo of its own subnet, built here
-                // (see `phases::served_from_cache`); the rest get the stored bytes,
-                // which carry no ECS, and the listener ages them. Either way the
-                // answer is shaped as this client asked
-                // 带了 ECS 的客户端在这里拿到回显它自己子网的应答（见
-                // `phases::served_from_cache`）；其余的拿到存着的字节（不带 ECS），由监听器修正
-                // TTL。两种都按这个客户端问的样子规整
-                let echoed = q.client_subnet.is_some();
-                let reply = crate::proto_utils::reply_as_asked(
-                    if echoed {
-                        phases::served_from_cache(
-                            &hit,
-                            q.tx_id,
-                            &view,
-                            phases::ServedTtl::Elapsed(elapsed_secs),
-                        )
-                    } else {
-                        hit.bytes.clone()
-                    },
-                    packet,
-                );
-                if let Some(observer) = observed {
-                    self.observe_fast_path(
-                        observer,
-                        &self.fast_path_context(start, peer, qname_str, qtype, qclass),
-                        pipeline_id,
-                        FastPathAnswer::Cache(phases::cache_hit_of(
-                            &hit,
-                            CacheHitKind::Fresh,
-                            elapsed_secs,
-                        )),
-                        Ok(&reply),
-                    );
-                }
-                let mut log = response_log();
-                log.info.served_from_cache(&hit);
-                log.answered(&reply);
-                return Ok(Some(if echoed {
-                    FastPathResponse::Direct(reply)
-                } else {
-                    FastPathResponse::CacheHit {
-                        cached: reply,
-                        tx_id: q.tx_id,
-                        elapsed_secs,
-                    }
-                }));
-            }
-        }
-
-        // 编译规则或规则缓存给的静态应答。在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器
-        // 自己回 SERVFAIL。
-        // A static answer from a compiled rule or the rule cache. Report before `?`: a
-        // response that cannot be built still ends the request here, and the listener
-        // answers SERVFAIL by itself.
-        let finish_static = |built: anyhow::Result<Bytes>, answer: FastPathAnswer<'_>| {
-            if let Some(observer) = observed {
-                self.observe_fast_path(
-                    observer,
-                    &self.fast_path_context(start, peer, qname_str, qtype, qclass),
-                    pipeline_id,
-                    answer,
-                    built.as_deref(),
-                );
-            }
-            let resp = built?;
-            let mut log = response_log();
-            log.info.upstream = Some(Source::Static);
-            log.answered(&resp);
-            anyhow::Ok(Some(FastPathResponse::Direct(resp)))
-        };
-        let answer_static = |rcode, answers: &Vec<hickory_proto::rr::Record>, answer| {
-            let built = match write_static_reply(packet, rcode, StaticAddresses::Records(answers)) {
-                Some(reply) => Ok(shaped_static_reply(reply, packet, q.client_subnet.as_ref())),
-                None => build_fast_static_response(
-                    q.tx_id, qname_str, q.qtype, q.qclass, rcode, answers,
-                )
-                .map(|reply| {
-                    crate::proto_utils::reply_as_asked(
-                        fast_client_reply(reply, q.client_subnet.as_ref()),
-                        packet,
-                    )
-                }),
-            };
-            finish_static(built, answer)
-        };
-
-        // 2. Compiled rule fast-path for static decisions / 2. 编译规则的静态决策快速路径
-        if let Some(compiled) = self.compiled_for(&state, pipeline_id)
-            && let Some((action, rule_name)) = fast_static_match_with_rule(
-                compiled,
-                qname_str,
-                qtype,
-                qclass,
-                peer.ip(),
-                q.edns_present,
-                Some(&self.geoip_manager),
-            )
-        {
-            // 规则按配置直接答的不做记录，写不了的才走下面 / What a rule answers straight from the config makes no
-            // records; only what cannot be written goes on below
-            let direct = match action {
-                PrecomputedAction::Static { rcode } => {
-                    Some((*rcode, StaticAddresses::Configured(&[], qtype)))
-                }
-                PrecomputedAction::StaticIp {
-                    addresses: Some(addresses),
-                    ..
-                } => Some((
-                    ResponseCode::NoError,
-                    StaticAddresses::Configured(addresses, qtype),
-                )),
-                _ => None,
-            };
-            if let Some((rcode, addresses)) = direct
-                && let Some(reply) = write_static_reply(packet, rcode, addresses)
-            {
-                let answers = usize::from(u16::from_be_bytes([reply[6], reply[7]]));
-                let answer = FastPathAnswer::StaticRule {
-                    rule: rule_name,
-                    rcode,
-                    answers,
-                };
-                let reply = shaped_static_reply(reply, packet, q.client_subnet.as_ref());
-                return finish_static(Ok(reply), answer);
-            }
-            if let Decision::Static { rcode, answers } = action.decision(qname_str, qtype, qclass) {
-                let answer = FastPathAnswer::StaticRule {
-                    rule: rule_name,
-                    rcode,
-                    answers: answers.len(),
-                };
-                return answer_static(rcode, &answers, answer);
-            }
-        }
-
-        // 3. Check Rule Cache (L1) for Static Responses / 3. 检查规则缓存（L1）的静态响应
-        // Zero-allocation lookup using hash / 使用哈希的零分配查找
-        if let Some(p) = pipeline_opt {
-            let rule_requester = p.rule_requester.key(requester, Some(&self.geoip_manager));
-            let rule_hash = crate::engine::rules::calculate_rule_hash(
+            // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
+            let cache_namespace = state.cache_namespace(pipeline_id);
+            let requester_key = pipeline.map_or(RequesterKey::NONE, |p| {
+                p.requester.key(requester, Some(&self.geoip_manager))
+            });
+            let slot = Self::cache_slot(
                 cache_namespace,
                 pipeline_id,
-                qname_str,
+                q.qname.as_bytes(),
                 qtype,
                 qclass,
-                &rule_requester,
+                q.flags,
+                &requester_key,
             );
-            if let Some(record) = self.rule_cache.get(rule_hash) {
-                let entry = &record.entry;
-                // 过期的这里不去掉，见 `apply_rules` / An expired entry is not removed here, see `apply_rules`
-                if entry.matches_at(
-                    start,
+
+            if let Some(hit) = self.cache_get(
+                slot,
+                &view,
+                &CachedQuestion {
+                    qname: qname_str,
                     pipeline_id,
+                    qtype: q.qtype,
+                    qclass: q.qclass,
+                    flags: q.flags,
+                },
+            ) {
+                let elapsed_secs = crate::proto_utils::saturating_u64_to_u32(
+                    start.saturating_duration_since(hit.inserted_at).as_secs(),
+                );
+                let age = phases::age_of(&hit, u64::from(elapsed_secs), &cfg.settings);
+                // 现在就能交出的过期应答在这里交出，和查缓存一样（见 `phases::stale_at_once`）：留给异步路径的话，过载时
+                // 异步路径收不下，手上这份能用的应答就变成了 SERVFAIL
+                // A stale answer that may go out right now goes out here, as on the cache lookup
+                // (see `phases::stale_at_once`): left to the async path, under overload the async
+                // path takes no more, and the usable answer in hand turned into SERVFAIL
+                if age == phases::Age::Stale
+                    && let Some(kind) = phases::stale_at_once(self, &cfg.settings, slot, &hit)
+                {
+                    let context = phases::CacheLookupContext {
+                        state: &state,
+                        qname: qname_str,
+                        qtype,
+                        qclass,
+                        flags: q.flags,
+                        pipeline_id,
+                        slot,
+                        tx_id: q.tx_id,
+                        start,
+                        peer: &peer,
+                        requester,
+                        observed: None,
+                    };
+                    let mut log = response_log(pipeline);
+                    let reply = crate::proto_utils::reply_as_asked(
+                        phases::serve_stale(self, &context, &hit, &view, kind, &mut log.info),
+                        packet,
+                    );
+                    if let Some(observer) = observed {
+                        self.observe_fast_path(
+                            observer,
+                            &self.fast_path_context(start, peer, qname_str, qtype, qclass),
+                            &hops,
+                            pipeline_id,
+                            FastPathAnswer::Cache(phases::cache_hit_of(&hit, kind, elapsed_secs)),
+                            Ok(&reply),
+                        );
+                    }
+                    log.answered(&reply);
+                    return Ok(Some(FastPathResponse::Direct(reply)));
+                }
+                // 其余过期的（不能再用的、要先等上游的）留给异步路径：那里的查找选中的是同一份，由它决定。在这里删掉，那次
+                // 查找就会退到一份更宽、更旧的应答上，而上游已不再把它给这个请求方
+                // Any other expired answer (of no further use, or waiting on the upstream first) is
+                // left to the async path, whose lookup picks this same answer and decides. Dropping
+                // it here would let that lookup fall back to a wider, older answer the upstream no
+                // longer meant for this requester
+                if age == phases::Age::Fresh {
+                    self.refresh_if_due(&state, &hit, elapsed_secs, slot, requester);
+
+                    // Return current cache immediately, don't wait for refresh to complete
+                    // 直接返回当前缓存，不等待刷新完成
+                    // Next query will automatically use refreshed new cache (if completed)
+                    // 下次查询时会自动使用刷新后的新缓存（如果已完成）
+                    // A client that sent ECS gets the echo of its own subnet, built here
+                    // (see `phases::served_from_cache`); the rest get the stored bytes,
+                    // which carry no ECS, and the listener ages them. Either way the
+                    // answer is shaped as this client asked
+                    // 带了 ECS 的客户端在这里拿到回显它自己子网的应答（见
+                    // `phases::served_from_cache`）；其余的拿到存着的字节（不带 ECS），由监听器修正
+                    // TTL。两种都按这个客户端问的样子规整
+                    let echoed = q.client_subnet.is_some();
+                    let reply = crate::proto_utils::reply_as_asked(
+                        if echoed {
+                            phases::served_from_cache(
+                                &hit,
+                                q.tx_id,
+                                &view,
+                                phases::ServedTtl::Elapsed(elapsed_secs),
+                            )
+                        } else {
+                            hit.bytes.clone()
+                        },
+                        packet,
+                    );
+                    if let Some(observer) = observed {
+                        self.observe_fast_path(
+                            observer,
+                            &self.fast_path_context(start, peer, qname_str, qtype, qclass),
+                            &hops,
+                            pipeline_id,
+                            FastPathAnswer::Cache(phases::cache_hit_of(
+                                &hit,
+                                CacheHitKind::Fresh,
+                                elapsed_secs,
+                            )),
+                            Ok(&reply),
+                        );
+                    }
+                    let mut log = response_log(pipeline);
+                    log.info.served_from_cache(&hit);
+                    log.answered(&reply);
+                    return Ok(Some(if echoed {
+                        FastPathResponse::Direct(reply)
+                    } else {
+                        FastPathResponse::CacheHit {
+                            cached: reply,
+                            tx_id: q.tx_id,
+                            elapsed_secs,
+                        }
+                    }));
+                }
+            }
+
+            // 编译规则或规则缓存给的静态应答。在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器
+            // 自己回 SERVFAIL。
+            // A static answer from a compiled rule or the rule cache. Report before `?`: a
+            // response that cannot be built still ends the request here, and the listener
+            // answers SERVFAIL by itself.
+            let finish_static = |built: anyhow::Result<Bytes>, answer: FastPathAnswer<'_>| {
+                if let Some(observer) = observed {
+                    self.observe_fast_path(
+                        observer,
+                        &self.fast_path_context(start, peer, qname_str, qtype, qclass),
+                        &hops,
+                        pipeline_id,
+                        answer,
+                        built.as_deref(),
+                    );
+                }
+                let resp = built?;
+                let mut log = response_log(pipeline);
+                log.info.upstream = Some(Source::Static);
+                log.answered(&resp);
+                anyhow::Ok(Some(FastPathResponse::Direct(resp)))
+            };
+            let answer_static = |rcode, answers: &Vec<hickory_proto::rr::Record>, answer| {
+                let built =
+                    match write_static_reply(packet, rcode, StaticAddresses::Records(answers)) {
+                        Some(reply) => {
+                            Ok(shaped_static_reply(reply, packet, q.client_subnet.as_ref()))
+                        }
+                        None => build_fast_static_response(
+                            q.tx_id, qname_str, q.qtype, q.qclass, rcode, answers,
+                        )
+                        .map(|reply| {
+                            crate::proto_utils::reply_as_asked(
+                                fast_client_reply(reply, q.client_subnet.as_ref()),
+                                packet,
+                            )
+                        }),
+                    };
+                finish_static(built, answer)
+            };
+
+            // 2. Compiled rule fast-path: what the first rule matching decides on the spot
+            // 2. 编译规则的快速路径：第一条命中的规则当场作出的决定
+            let matched = self.compiled_for(&state, pipeline_id).and_then(|compiled| {
+                fast_static_match_with_rule(
+                    compiled,
                     qname_str,
                     qtype,
                     qclass,
-                    &rule_requester,
-                ) && let Decision::Static { rcode, answers } = &entry.decision
-                {
-                    return answer_static(
-                        *rcode,
-                        answers,
-                        FastPathAnswer::CachedRules { record: &record },
-                    );
+                    peer.ip(),
+                    q.edns_present,
+                    Some(&self.geoip_manager),
+                )
+            });
+            let (next, hop) = match matched {
+                Some((PrecomputedAction::Jump(target), rule)) => (
+                    cfg.pipeline(target),
+                    Hop::Rule {
+                        pipeline: pipeline_id,
+                        rule,
+                        target,
+                    },
+                ),
+                Some((PrecomputedAction::Answer(action), rule_name)) => {
+                    // 规则按配置直接答的不做记录，写不了的才走下面 / What a rule answers straight from the config
+                    // makes no records; only what cannot be written goes on below
+                    let direct = match action {
+                        PrecomputedAnswer::Static { rcode } => {
+                            Some((*rcode, StaticAddresses::Configured(&[], qtype)))
+                        }
+                        PrecomputedAnswer::StaticIp {
+                            addresses: Some(addresses),
+                            ..
+                        } => Some((
+                            ResponseCode::NoError,
+                            StaticAddresses::Configured(addresses, qtype),
+                        )),
+                        _ => None,
+                    };
+                    if let Some((rcode, addresses)) = direct
+                        && let Some(reply) = write_static_reply(packet, rcode, addresses)
+                    {
+                        let answers = usize::from(u16::from_be_bytes([reply[6], reply[7]]));
+                        let answer = FastPathAnswer::StaticRule {
+                            rule: rule_name,
+                            rcode,
+                            answers,
+                        };
+                        let reply = shaped_static_reply(reply, packet, q.client_subnet.as_ref());
+                        return finish_static(Ok(reply), answer);
+                    }
+                    let (rcode, answers) = action.records(qname_str, qtype, qclass);
+                    let answer = FastPathAnswer::StaticRule {
+                        rule: rule_name,
+                        rcode,
+                        answers: answers.len(),
+                    };
+                    return answer_static(rcode, &answers, answer);
                 }
-            }
+                None => {
+                    // 3. Check Rule Cache (L1) / 3. 检查规则缓存（L1）
+                    // Zero-allocation lookup using hash / 使用哈希的零分配查找
+                    let Some(p) = pipeline else { break };
+                    let rule_requester = p.rule_requester.key(requester, Some(&self.geoip_manager));
+                    let rule_hash = crate::engine::rules::calculate_rule_hash(
+                        cache_namespace,
+                        pipeline_id,
+                        qname_str,
+                        qtype,
+                        qclass,
+                        &rule_requester,
+                    );
+                    // 过期的这里不去掉，见 `apply_rules` / An expired entry is not removed here, see `apply_rules`
+                    let Some(record) = self.rule_cache.get(rule_hash).filter(|record| {
+                        record.entry.matches_at(
+                            start,
+                            pipeline_id,
+                            qname_str,
+                            qtype,
+                            qclass,
+                            &rule_requester,
+                        )
+                    }) else {
+                        break;
+                    };
+                    match &record.entry.decision {
+                        Decision::Static { rcode, answers } => {
+                            return answer_static(
+                                *rcode,
+                                answers,
+                                FastPathAnswer::CachedRules { record: &record },
+                            );
+                        }
+                        Decision::Jump { pipeline: target } => (
+                            cfg.pipeline(target),
+                            Hop::CachedRules {
+                                pipeline: pipeline_id,
+                                record,
+                            },
+                        ),
+                        Decision::Forward { .. } => break,
+                    }
+                }
+            };
+            let Some(next) =
+                next.filter(|_| hops.len() < cfg.settings.response_jump_limit as usize)
+            else {
+                break;
+            };
+            hops.push(hop);
+            pipeline = Some(next);
         }
+        // `hops` 借着这份配置，配置交给异步路径之前先放掉 / `hops` borrows this configuration, so it
+        // goes before the configuration is handed to the async path
+        drop(hops);
 
         // Cache miss, need async processing / 缓存未命中，需要异步处理
         // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
@@ -1027,7 +1166,7 @@ impl Engine {
             q.qclass,
             q.tx_id,
             q.edns_present,
-            owned_pipeline_id(),
+            name_of(pipeline_opt),
             arc_swap::Guard::into_inner(state),
         ))))
     }
@@ -5642,7 +5781,7 @@ mod tests {
         let compiled = engine.compiled_for(&state, "main").unwrap();
         assert!(matches!(
             compiled.rules[0].precomputed,
-            Some(PrecomputedAction::StaticIp { addresses: Some(ref addresses), .. }) if addresses.len() == 2
+            Some(PrecomputedAction::Answer(PrecomputedAnswer::StaticIp { addresses: Some(ref addresses), .. })) if addresses.len() == 2
         ));
         let a = ask("A.Ip.Test.", RecordType::A);
         assert_eq!(a.metadata.response_code, ResponseCode::NoError);
@@ -6841,17 +6980,14 @@ mod tests {
                         (None, Decision::Static { .. }) => *left_to_full_path,
                         (None, _) => true,
                         (
-                            Some((action, _)),
+                            Some((PrecomputedAction::Answer(answer), _)),
                             Decision::Static {
                                 rcode: full_rcode,
                                 answers: full_answers,
                             },
                         ) => {
-                            let Decision::Static { rcode, answers } =
-                                action.decision(domain, RecordType::A, DNSClass::IN)
-                            else {
-                                unreachable!("a fast-path action answers statically");
-                            };
+                            let (rcode, answers) =
+                                answer.records(domain, RecordType::A, DNSClass::IN);
                             !left_to_full_path
                                 && rcode == *full_rcode
                                 && format!("{answers:?}") == format!("{full_answers:?}")

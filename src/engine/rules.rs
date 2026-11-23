@@ -444,7 +444,7 @@ async fn run_response_actions(
                     });
                 }
                 return Ok(ResponseActionResult::Jump {
-                    pipeline: Arc::from(pipeline.as_str()),
+                    pipeline: Arc::clone(pipeline),
                 });
             }
             // 和所有动作执行完一样：有应答就交出它，没有就 SERVFAIL

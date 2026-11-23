@@ -2,13 +2,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::{DNSClass, RecordType};
+use hickory_proto::rr::{DNSClass, Record, RecordType};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
 use crate::engine::utils::parse_rcode;
-use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer, static_ips};
+use crate::engine::{make_static_cname_answer, make_static_ip_answer, static_ips};
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::{
     RuntimeMatcher, RuntimeMatcherWithOp, RuntimePipeline, RuntimePipelineConfig, RuntimeRule,
@@ -21,12 +21,12 @@ pub struct CompiledPipeline {
     pub id: Arc<str>,
     pub rules: Vec<CompiledRule>,
     pub index: RuleIndex,
-    /// 能当场作答的（见 `CompiledRule::precomputed`）最后一条规则的位置，一条都没有时为 None。快速路径求值候选规则到
+    /// 能当场决定的（见 `CompiledRule::precomputed`）最后一条规则的位置，一条都没有时为 None。快速路径求值候选规则到
     /// 这里为止：再往后不论哪条命中都只能交给完整路径，在快速路径上求值它们（正则、GeoIP）是白算一遍
-    /// Where the last rule that can be answered on the spot (see `CompiledRule::precomputed`)
-    /// is, None when there is none. The fast path evaluates candidate rules up to here: whichever
-    /// matches beyond it goes to the full path anyway, and evaluating them on the fast path (a
-    /// regex, GeoIP) was work done twice
+    /// Where the last rule that decides on the spot (see `CompiledRule::precomputed`) is, None
+    /// when there is none. The fast path evaluates candidate rules up to here: whichever matches
+    /// beyond it goes to the full path anyway, and evaluating them on the fast path (a regex,
+    /// GeoIP) was work done twice
     pub last_precomputed: Option<usize>,
 }
 
@@ -50,8 +50,18 @@ pub struct CompiledRule {
     pub needs_geosite: bool,
 }
 
+/// 规则当场作出的决定：照配置写好的应答，或跳到另一个 pipeline，快速路径跟过去在那里接着查
+/// What a rule decides on the spot: an answer as the configuration writes it, or a jump to
+/// another pipeline, which the fast path follows to go on looking there
 #[derive(Debug, Clone)]
 pub enum PrecomputedAction {
+    Answer(PrecomputedAnswer),
+    Jump(Arc<str>),
+}
+
+/// 照配置写好、当场就能给的应答 / An answer as the configuration writes it, ready on the spot
+#[derive(Debug, Clone)]
+pub enum PrecomputedAnswer {
     Static {
         rcode: ResponseCode,
     },
@@ -67,21 +77,19 @@ pub enum PrecomputedAction {
     },
 }
 
-impl PrecomputedAction {
-    /// 这个动作对这个查询的决定 / What this action decides for this query
-    pub(crate) fn decision(&self, qname: &str, qtype: RecordType, qclass: DNSClass) -> Decision {
+impl PrecomputedAnswer {
+    /// 这个应答对这个查询给的应答码和记录 / The response code and records this answer gives this query
+    pub(crate) fn records(
+        &self,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+    ) -> (ResponseCode, Vec<Record>) {
         match self {
-            Self::Static { rcode } => Decision::Static {
-                rcode: *rcode,
-                answers: Vec::new(),
-            },
-            Self::StaticIp { ip, .. } => {
-                let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
-                Decision::Static { rcode, answers }
-            }
+            Self::Static { rcode } => (*rcode, Vec::new()),
+            Self::StaticIp { ip, .. } => make_static_ip_answer(qname, qtype, qclass, ip),
             Self::StaticCname { target, ttl } => {
-                let (rcode, answers) = make_static_cname_answer(qname, qclass, target, *ttl);
-                Decision::Static { rcode, answers }
+                make_static_cname_answer(qname, qclass, target, *ttl)
             }
         }
     }
@@ -225,24 +233,27 @@ fn compile_rule(rule: &RuntimeRule) -> CompiledRule {
 }
 
 fn precompute_action(rule: &RuntimeRule) -> Option<PrecomputedAction> {
-    let action = rule.actions.first()?;
-    match action {
-        Action::StaticResponse { rcode } => {
-            parse_rcode(rcode).map(|rc| PrecomputedAction::Static { rcode: rc })
-        }
-        Action::StaticIpResponse { ip } => Some(PrecomputedAction::StaticIp {
+    let answer = match rule.actions.first()? {
+        Action::StaticResponse { rcode } => PrecomputedAnswer::Static {
+            rcode: parse_rcode(rcode)?,
+        },
+        Action::StaticIpResponse { ip } => PrecomputedAnswer::StaticIp {
             ip: ip.clone(),
             addresses: static_ips(ip).map(Vec::into_boxed_slice),
-        }),
-        Action::StaticCnameResponse { target, ttl } => Some(PrecomputedAction::StaticCname {
+        },
+        Action::StaticCnameResponse { target, ttl } => PrecomputedAnswer::StaticCname {
             target: target.clone(),
             ttl: ttl.unwrap_or(300),
-        }),
-        Action::Deny => Some(PrecomputedAction::Static {
+        },
+        Action::Deny => PrecomputedAnswer::Static {
             rcode: ResponseCode::Refused,
-        }),
-        _ => None,
-    }
+        },
+        Action::JumpToPipeline { pipeline } => {
+            return Some(PrecomputedAction::Jump(Arc::clone(pipeline)));
+        }
+        _ => return None,
+    };
+    Some(PrecomputedAction::Answer(answer))
 }
 
 /// Test-only shorthand for [`fast_static_match_with_rule`] without the rule name
@@ -255,7 +266,8 @@ pub(crate) fn fast_static_match(
     qclass: DNSClass,
     client_ip: IpAddr,
     edns_present: bool,
-) -> Option<Decision> {
+) -> Option<crate::engine::Decision> {
+    use crate::engine::Decision;
     fast_static_match_with_rule(
         pipeline,
         qname,
@@ -265,7 +277,15 @@ pub(crate) fn fast_static_match(
         edns_present,
         None,
     )
-    .map(|(action, _)| action.decision(qname, qtype, qclass))
+    .map(|(action, _)| match action {
+        PrecomputedAction::Answer(answer) => {
+            let (rcode, answers) = answer.records(qname, qtype, qclass);
+            Decision::Static { rcode, answers }
+        }
+        PrecomputedAction::Jump(pipeline) => Decision::Jump {
+            pipeline: Arc::clone(pipeline),
+        },
+    })
 }
 
 /// Like [`fast_static_match`], giving the matched rule's action instead of a decision, so that a
@@ -312,19 +332,16 @@ pub(crate) fn fast_static_match_with_rule<'a>(
                 )
             },
         );
-        if !matched {
-            continue;
-        }
-        // 找到第一个匹配的规则
-        // 如果它可预计算，使用快速路径；否则放弃快速路径以保持规则顺序
-        if let Some(action) = &rule.precomputed {
-            return Some((action, &rule.rule_name));
-        } else {
-            // 第一个匹配的规则不可预计算（如 Forward、Jump 等）
-            // 放弃快速路径，让规则走正常路径以保持配置顺序
-            // 这确保了像 "domain_regex → forward" 这样的规则不会被
-            // 后面的 "domain_suffix → static_ip" 规则跳过
-            return None;
+        if matched {
+            // 第一条命中的规则定下结果：不能当场决定的（转发、先记日志的）连同规则顺序一起留给完整路径，
+            // 「domain_regex → forward」不会被后面的「domain_suffix → static_ip」越过
+            // The first rule matching settles it: one that does not decide on the spot (a
+            // forward, one logging first) is left to the full path with the rule order, so a
+            // "domain_regex → forward" is not passed over for a later "domain_suffix → static_ip"
+            return rule
+                .precomputed
+                .as_ref()
+                .map(|action| (action, &*rule.rule_name));
         }
     }
     None
