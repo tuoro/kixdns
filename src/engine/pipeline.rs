@@ -154,15 +154,18 @@ impl<'a> RuleEvaluationContext<'a> {
 }
 
 impl Engine {
+    /// id 为 `pipeline_id` 的 pipeline 编译好的样子，和 `RuntimePipelineConfig::pipeline` 按同一个索引找：配置里有的
+    /// pipeline 都有，找到的就是同一个
+    /// The compiled form of the pipeline whose id is `pipeline_id`, found by the same index as
+    /// `RuntimePipelineConfig::pipeline`: every pipeline of the configuration has one, and the
+    /// one found is the same pipeline
     pub(crate) fn compiled_for<'a>(
         &self,
         state: &'a EngineInner,
         pipeline_id: &str,
     ) -> Option<&'a CompiledPipeline> {
-        state
-            .pipeline_index
-            .get(pipeline_id)
-            .and_then(|&idx| state.compiled_pipelines.get(idx))
+        let &idx = state.pipeline.pipeline_id_index.get(pipeline_id)?;
+        Some(&state.compiled_pipelines[idx])
     }
 
     /// `state` 是求出这个决定的那份配置：决定的有效期按它的 min_ttl 算，求值期间重载了也一样
@@ -200,10 +203,10 @@ impl Engine {
                     None
                 }
             }
-            _ => {
-                // Jump：120 秒 TTL / Jump: a 120 second TTL
-                Some(Duration::from_secs(120))
-            }
+            // 也只受 `RULE_CACHE_MAX_AGE` 限制。以前写的 120 秒比这个上限还长，从来没起过作用
+            // Bounded by `RULE_CACHE_MAX_AGE` alone too. The 120 seconds written here before were
+            // longer than that bound, and never took effect
+            Decision::Jump { .. } => None,
         };
 
         // If TTL is 0, do not cache / 如果 TTL 为 0，则不缓存
@@ -383,14 +386,18 @@ impl Engine {
             skip_rules,
             ..
         } = *request;
-        // 2. Candidate Selection: every pipeline is compiled, and its index gives every rule
-        // that can match (see `RuleIndex::add_rule`)
-        // 2. 候选规则：每个 pipeline 都编译过，它的索引给出所有可能命中的规则（见 `RuleIndex::add_rule`）
+        // 2. Candidate Selection: every pipeline is compiled with its configuration (see
+        // `compiled_for`), and its index gives every rule that can match (see
+        // `RuleIndex::add_rule`). Without it no rule would match, the request going past
+        // blocking rules to the default upstream, which is why there is no stand-in for it
+        // 2. 候选规则：每个 pipeline 都和它的配置一起编译过（见 `compiled_for`），它的索引给出所有可能命中的规则（见
+        // `RuleIndex::add_rule`）。没有它的话没有规则命中，请求绕过拦截规则去问默认上游，所以不给它找替代
         // SmallVec<[usize; 32]> avoids heap allocation for typical rule sets (<= 32 candidates)
         let candidate_indices: SmallVec<[usize; 32]> = self
             .compiled_for(state, &pipeline.id)
-            .map(|compiled| compiled.index.get_candidates(qname, qtype))
-            .unwrap_or_default();
+            .expect("every pipeline is compiled with its configuration")
+            .index
+            .get_candidates(qname, qtype);
 
         // 3. Execute Rules
         // 优化：提取 MatcherContext 到循环外部，避免重复构造
@@ -406,10 +413,9 @@ impl Engine {
         };
 
         'rules: for idx in candidate_indices {
-            let rule = match pipeline.rules.get(idx) {
-                Some(r) => r,
-                None => continue, // Skip if index is out of bounds due to reload race / 如果由于重载竞争导致索引越界，则跳过
-            };
+            // 候选出自这个 pipeline 自己的索引，同一份配置里编译出来的 / The candidates come from this
+            // pipeline's own index, compiled from the same configuration
+            let rule = &pipeline.rules[idx];
             if skip_rules.is_some_and(|set| set.contains(&idx)) {
                 continue;
             }

@@ -16,7 +16,6 @@ use hickory_proto::rr::DNSClass;
 
 use hickory_proto::serialize::binary::BinDecodable;
 use smallvec::SmallVec;
-use tracing::warn;
 
 use crate::cache::CacheEntry;
 use crate::matcher::RuntimePipelineConfig;
@@ -219,17 +218,13 @@ enum FastPathAnswer<'a> {
     CachedRules { record: &'a RuleCacheRecord },
 }
 
-// ============================================================================
-// Constants / 常量
-// ============================================================================
-
 use super::core::Engine;
 use super::pipeline::{
     NO_PIPELINE, PipelineSelectionContext, RuleEvaluationContext, select_pipeline,
 };
 
 // ============================================================================
-// Refreshing Bitmap Helpers / 刷新位图辅助函数
+// Constants / 常量
 // ============================================================================
 
 /// 留给"取出过期条目、改写 TXID、写回客户端"的余量。等待上限从本次请求的
@@ -711,8 +706,6 @@ impl Engine {
         let cfg = &state.pipeline;
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
-        // GeoSiteManager uses FxHashMap protected by RwLock, no additional locks needed
-        // GeoSiteManager 使用 FxHashMap + RwLock 保护，无需额外锁
         let qname_str = q.qname;
         let pipeline_opt = select_pipeline(
             cfg,
@@ -867,7 +860,7 @@ impl Engine {
                         min_ttl = cfg.settings.cache_refresh_min_ttl,
                         should_trigger = due,
                         upstream = ?hit.upstream,
-                        qname = %q.qname,  // Use unchecked for performance / 使用未检查版本以提高性能
+                        qname = %q.qname,
                         "cache background refresh check"
                     );
 
@@ -1716,10 +1709,12 @@ impl Engine {
                         }
                         Ok(phases::ForwardResult::Continue { ctx, fallback }) => {
                             route.continued(*ctx, rule_index, fallback);
-                            let Some(pipeline) = cfg.pipeline(&route.pipeline) else {
-                                warn!("pipeline missing while continuing: {}", route.pipeline);
-                                return request.servfail("parse request");
-                            };
+                            // 只有规则的回答检查会 continue，所以请求在配置里的某个 pipeline 里
+                            // Only a rule's answer check continues, so the request is in a
+                            // pipeline of the configuration
+                            let pipeline = cfg
+                                .pipeline(&route.pipeline)
+                                .expect("a rule of the pipeline continued");
                             decision = evaluate(pipeline, Some(&route.skip_rules));
                             continue 'decision_loop;
                         }
@@ -1780,14 +1775,14 @@ impl Engine {
         }
     }
 
-    /// 缓存后台刷新：当TTL即将过期时，异步刷新缓存条目
-    /// Cache background refresh: asynchronously refresh cache entry when TTL is about to expire
-    ///
-    /// 防止无限循环的保护措施：
-    /// Protection against infinite loops:
-    /// 1. 检查条目的 TTL >= cache_refresh_min_ttl（默认5秒）
-    /// 2. 使用与正常请求相同的 Singleflight 机制（inflight map）
-    /// 3. 刷新失败不会删除现有缓存条目
+    /// 为槽位 `slot` 里的 `renewed` 发起后台刷新，照 `requester` 的样子重放请求（见
+    /// `refresh::spawn_background_refresh`）。同一份应答同时只刷新一次（刷新标记，见 `RefreshingGuard`）；刷新不查缓存、
+    /// 不在 inflight 表里登记也不等别人；什么时候该刷新由调用的一方判断（见 `RefreshCheck`、`phases::serve_stale`）
+    /// Start a background refresh of `renewed` in slot `slot`, replaying the request as
+    /// `requester` sent it (see `refresh::spawn_background_refresh`). One answer is refreshed
+    /// once at a time (the refresh mark, see `RefreshingGuard`); a refresh looks up no cache, and
+    /// neither registers in the inflight map nor waits on it; when one is due the caller judges
+    /// (see `RefreshCheck`, `phases::serve_stale`)
     pub(crate) fn spawn_background_refresh(
         &self,
         state: &Arc<EngineInner>,

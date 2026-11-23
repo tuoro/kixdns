@@ -311,9 +311,9 @@ pub enum FastPathResponse {
 
 pub struct EngineInner {
     pub pipeline: RuntimePipelineConfig,
+    /// `pipeline.pipelines` 编译好的样子，下标一一对应（见 `Engine::compiled_for`）
+    /// `pipeline.pipelines` compiled, index for index (see `Engine::compiled_for`)
     pub compiled_pipelines: Vec<CompiledPipeline>,
-    /// O(1) pipeline lookup index: pipeline_id -> index in compiled_pipelines / O(1) 管道查找索引：pipeline_id -> compiled_pipelines 中的索引
-    pub pipeline_index: FxHashMap<Arc<str>, usize>,
     /// Response-affecting configuration fingerprint for each pipeline.
     /// It namespaces response/rule/inflight caches across hot reloads while
     /// allowing unchanged pipelines to keep their warm cache entries.
@@ -335,16 +335,9 @@ pub struct EngineInner {
 
 impl EngineInner {
     /// 从运行时配置建：编译各 pipeline，建按 id 的查找索引，算出缓存命名空间
-    /// Built from a runtime configuration: the pipelines compiled, the lookup index by
-    /// id, and the cache namespaces
+    /// Built from a runtime configuration: the pipelines compiled, and the cache namespaces
     pub(crate) fn new(cfg: RuntimePipelineConfig) -> Self {
         let compiled_pipelines = compile_pipelines(&cfg);
-        // Build O(1) compiled pipeline lookup index / 构建 O(1) 编译管道查找索引
-        let pipeline_index = compiled_pipelines
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (p.id.clone(), i))
-            .collect();
         let config_namespaces = build_cache_namespaces(&cfg);
         let geo = GeoGeneration::default();
         let no_pipeline_namespace = {
@@ -359,7 +352,6 @@ impl EngineInner {
             no_pipeline_namespace,
             pipeline: cfg,
             compiled_pipelines,
-            pipeline_index,
         }
     }
 
@@ -393,7 +385,6 @@ impl EngineInner {
             no_pipeline_namespace: self.no_pipeline_namespace,
             pipeline: self.pipeline.clone(),
             compiled_pipelines: self.compiled_pipelines.clone(),
-            pipeline_index: self.pipeline_index.clone(),
         })
     }
 

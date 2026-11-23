@@ -317,15 +317,16 @@ impl CacheSlot {
 ///  Engine 的副本共用同一个缓存 / Copies of the Engine share one cache
 pub type DnsCache = Arc<CacheStore<Arc<CacheSlot>>>;
 
-/// 每个槽位按它存的应答份数计重；里面的应答都过了 TTL 又过了缓存留着的那么久（见
-/// [`CacheEntry::spent`]），整个槽位就没用了
-/// Each slot weighs as many answers as it holds; once every answer in it is past its TTL by
-/// as long as the cache keeps it (see [`CacheEntry::spent`]), the whole slot is of no use
 /// 多少字节的应答算一份：容量按份算，大应答按它占的地方多算几份，容量才管得住内存
 /// The bytes of an answer that count as one: capacity counts answers, and a large one
 /// counts for the room it takes, so that capacity bounds the memory
 const BYTES_PER_ANSWER: usize = 1024;
 
+/// 每个槽位按它存的应答份数计重（见 [`BYTES_PER_ANSWER`]）；里面的应答都过了 TTL 又过了缓存留着的那么久（见
+/// [`CacheEntry::spent`]），整个槽位就没用了
+/// Each slot weighs as many answers as it holds (see [`BYTES_PER_ANSWER`]); once every
+/// answer in it is past its TTL by as long as the cache keeps it (see [`CacheEntry::spent`]),
+/// the whole slot is of no use
 impl Cached for Arc<CacheSlot> {
     fn weight(&self) -> u32 {
         CacheSlot::weight_of(&self.entries)

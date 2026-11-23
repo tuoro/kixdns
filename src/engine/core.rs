@@ -21,7 +21,7 @@ use parking_lot::RwLock;
 
 use super::bootstrap::Bootstrap;
 use super::concurrency::{FlowControlState, PermitManager};
-use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheRecord};
+use super::rules::RuleCacheRecord;
 use super::transport::{DohClient, DoqClient, DotMultiplexer, TcpMultiplexer, UdpClient};
 use super::types::{EngineInner, InflightMap};
 
@@ -182,9 +182,11 @@ impl Engine {
             settings.cache_capacity,
             super::phases::kept_past_ttl(&settings),
         );
-        // 规则缓存：1 万条，每条按自己的 expires_at 过期（见 `RULE_CACHE_MAX_AGE`）
+        // 规则缓存：1 万条，每条按自己的 expires_at 过期（见 `RULE_CACHE_MAX_AGE`），过期以后不再多留：它的
+        // `Cached::outlived` 不看存储的 kept
         // Rule cache: 10k entries, each expiring at its own expires_at (see `RULE_CACHE_MAX_AGE`)
-        let rule_cache = Arc::new(CacheStore::new(10_000, RULE_CACHE_MAX_AGE));
+        // and kept no longer: its `Cached::outlived` does not look at the store's kept
+        let rule_cache = Arc::new(CacheStore::new(10_000, std::time::Duration::ZERO));
 
         let geoip_manager = Arc::new(RwLock::new(GeoIpManager::default()));
         let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::new()));
@@ -292,10 +294,6 @@ impl Engine {
             refresh_failures: Arc::default(),
             permit_manager,
             flow_control_state,
-            // Cache background refresh settings / 缓存后台刷新设置
-
-            // RFC 8767: Serve stale cache settings / RFC 8767: 过期缓存设置
-
             // GeoIP manager / GeoIP 管理器
             geoip_manager,
             // GeoSite manager / GeoSite 管理器
