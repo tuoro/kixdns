@@ -34,7 +34,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | upstream_timeout_ms | 9000 | Timeout for one upstream operation; must be greater than zero. A UDP forward with no reply after a third of it sends the query again, and for the whole of the timeout from then on whichever of the two is answered first is used. |
 | request_timeout_ms | null | Overall request timeout. When null, it is upstream_timeout_ms * 2.5. It must be at least upstream_timeout_ms. |
 | response_jump_limit | 10 | How many pipeline jumps the response phase may make (the jumps of answer actions and the rule-level jumps after them both count); one more answers SERVFAIL. |
-| udp_pool_size | 64 | Outbound UDP socket-pool size. |
+| udp_pool_size | 64 | Outbound UDP socket-pool size. Each query takes a socket and an ID at random; a socket that has sent 64 queries is replaced by a new one on another port the system picks, so no port lasts long, and the firewall's connection tracking gains just one entry per 64 misses. |
 | tcp_pool_size | 64 | At most this many TCP connections per upstream. Normally only the first is used; further queries go to the later ones only while 32 or more are unanswered on it at once. |
 | doh_pool_size | 8 | Maximum idle DoH connections per upstream when the upstream does not support HTTP/2 or `HTTPS_PROXY` / `ALL_PROXY` is set. An upstream supporting HTTP/2 is connected to directly, with at most one connection per worker thread and normally one in use, busy by the same rule as `tcp_pool_size`. |
 | dot_pool_size | 64 | At most this many DoT connections per upstream, normally one in use, by the same rule as `tcp_pool_size`. |

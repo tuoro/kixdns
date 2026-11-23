@@ -94,12 +94,39 @@ impl<V> Drop for Waiting<V> {
     }
 }
 
+/// 池里的一个 socket：它在途的查询，发过多少个（见 [`UDP_SOCKET_QUERIES`]），和收它回答的任务。还在等回答的查询各拿着
+/// 一份，所以换下来以后也照样收得到它们的回答；最后一份放下时停掉接收任务，socket 随之关掉
+/// One socket of the pool: its queries in flight, how many it has sent (see
+/// [`UDP_SOCKET_QUERIES`]), and the task receiving its replies. Every query still waiting for a
+/// reply holds it too, so once replaced it still takes their replies; the last let go of stops
+/// the receiving task, and the socket closes with it
 struct UdpSocketState {
     socket: Arc<tokio::net::UdpSocket>,
     /// Inflight map: ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
     /// Note: Using FxBuildHasher for performance
     inflight: Arc<UdpInflightMap>,
+    sent: std::sync::atomic::AtomicU32,
+    reader: tokio::task::AbortHandle,
 }
+
+impl Drop for UdpSocketState {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+/// 一个 socket 发出这么多个查询以后，换成系统另挑端口的新 socket（RFC 5452 §9.2）。以前池里的端口用到进程结束，猜出或者
+/// 探出来（像 SAD DNS 那样借 ICMP 的限速去扫）一次就一直有效；现在一个端口最多用这么多次，查询越多换得越快。也不每个
+/// 查询都换：每个新端口在防火墙的连接跟踪里占一条、留一分钟，OpenWrt 上每秒两百来个未命中就能把表占满，满了整台路由器
+/// 的新连接都被丢掉；每个查询单开 socket 的未命中还多花四分之一的 CPU
+/// After sending this many queries a socket is replaced by a new one, on another port the system
+/// picks (RFC 5452 §9.2). The pool's ports used to last the process, so one guessed or probed
+/// (through the ICMP rate limit, as SAD DNS does) stayed good for ever; now a port serves this
+/// many at most, replaced the faster the more queries come. Nor is it replaced every query: each
+/// new port takes an entry in the firewall's connection tracking for a minute, a couple of
+/// hundred misses a second fill the table on OpenWrt, and with it full the whole router drops
+/// new connections; a socket per query also cost a miss a quarter more CPU
+const UDP_SOCKET_QUERIES: u32 = 64;
 
 /// 上游 UDP socket 接收出错以后，歇多久再接着收；None 是马上接着收。
 ///
@@ -122,15 +149,85 @@ fn recv_error_pause(error: &std::io::Error) -> Option<Duration> {
     }
 }
 
+thread_local! {
+    /// 收 UDP 回答的缓冲，每个线程一块，容得下最大的 DNS 报文：EDNS 允许把 UDP 应答协商到 65535 字节，比缓冲区长的数据报
+    /// 会被悄悄截掉尾部。以前每个 socket 各带一块，默认 64 个 socket 时常驻内存多约 1 MiB，换 socket 时还要重新分配
+    /// The buffer UDP replies are received into, one per thread, holding the largest DNS message:
+    /// EDNS lets a UDP answer be negotiated up to 65535 bytes, and a datagram longer than the
+    /// buffer loses its tail without notice. Each socket used to carry one, some 1 MiB more
+    /// resident with the default 64 sockets, allocated again whenever a socket was replaced
+    static UDP_RECEIVED: std::cell::RefCell<Box<[u8]>> =
+        std::cell::RefCell::new(vec![0; MAX_DNS_MESSAGE_SIZE].into_boxed_slice());
+}
+
+/// 把从 `src` 收到的数据报 `reply` 交给等着它的查询：ID 对得上在途的条目、来自它问的地址、而且回答的是它的问题（RFC 5452
+/// §9.1，见 `answers_query`）时，换回客户端的 ID，拷出一份正好大小的交过去；对不上的留着条目接着等真的回答
+/// Hands the datagram `reply` received from `src` to the query waiting for it: when the ID
+/// matches an entry in flight, it comes from the address that entry asked, and it answers that
+/// question (RFC 5452 §9.1, see `answers_query`), the client's ID is put back and a copy of
+/// exactly its size handed over; one that does not match leaves the entry waiting for the real reply
+fn hand_over_udp_reply(idx: usize, inflight: &UdpInflightMap, reply: &mut [u8], src: SocketAddr) {
+    let Some(id) = reply.get(..2).map(|id| u16::from_be_bytes([id[0], id[1]])) else {
+        return;
+    };
+    let entry::Entry::Occupied(entry) = inflight.entry(id) else {
+        return;
+    };
+    let (_, expected_addr, query, _) = entry.get();
+    if src != *expected_addr {
+        crate::warn_sparse!(
+            socket_idx = idx,
+            response_id = id,
+            expected_addr = %expected_addr,
+            actual_addr = %src,
+            "UDP response address mismatch, possible spoofing or routing anomaly"
+        );
+    } else if !crate::proto_utils::answers_query(query, reply) {
+        crate::warn_sparse!(
+            socket_idx = idx,
+            response_id = id,
+            upstream = %src,
+            "UDP response does not answer the query, possible spoofing"
+        );
+    } else {
+        let (_, (original_id, _, _, tx)) = entry.remove_entry();
+        reply[..2].copy_from_slice(&original_id.to_be_bytes());
+        if tx.send(Ok(Bytes::copy_from_slice(reply))).is_err() {
+            tracing::debug!(
+                socket_idx = idx,
+                original_id,
+                response_id = id,
+                "Failed to send UDP response, channel already closed"
+            );
+        }
+    }
+}
+
+/// 池里的 socket 各在一个位置上，用满 [`UDP_SOCKET_QUERIES`] 次换成新的 / The pool's sockets each in a
+/// place of their own, replaced once used [`UDP_SOCKET_QUERIES`] times
+type UdpPool = Box<[ArcSwap<UdpSocketState>]>;
+
 pub struct UdpClient {
     /// IPv4 sockets, one ephemeral port each. / IPv4 socket，各占一个临时端口。
-    pool: Vec<UdpSocketState>,
+    pool: UdpPool,
     /// IPv6 sockets (IPV6_V6ONLY), built on the first query to an IPv6 upstream
     /// so a deployment without one pays for nothing.
     /// IPv6 socket（IPV6_V6ONLY），第一次查询 IPv6 上游时才建立，
     /// 没有 IPv6 上游的部署不付出任何代价。
-    pool_v6: tokio::sync::OnceCell<Vec<UdpSocketState>>,
+    pool_v6: tokio::sync::OnceCell<UdpPool>,
     pool_size: usize,
+}
+
+/// 一个地址族的 socket 怎么建：哪一族，绑在哪 / How a family's sockets are made: which family, bound where
+fn udp_family(v6: bool) -> (Domain, SocketAddr) {
+    if v6 {
+        (
+            Domain::IPV6,
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+        )
+    } else {
+        (Domain::IPV4, SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
 }
 
 impl UdpClient {
@@ -138,11 +235,7 @@ impl UdpClient {
         // Prevent port exhaustion by enforcing minimum pool size
         let effective_size = if size == 0 { 1 } else { size };
         Ok(Self {
-            pool: Self::build_pool(
-                effective_size,
-                Domain::IPV4,
-                SocketAddr::from(([0, 0, 0, 0], 0)),
-            )?,
+            pool: Self::build_pool(effective_size, false)?,
             pool_v6: tokio::sync::OnceCell::new(),
             pool_size: effective_size,
         })
@@ -155,11 +248,8 @@ impl UdpClient {
     /// Every socket is created first and the readers start only once they have
     /// all succeeded: on a failure part way through, the sockets created so far
     /// are dropped with the error, leaving no unreachable descriptors or tasks.
-    fn build_pool(
-        size: usize,
-        domain: Domain,
-        bind_addr: SocketAddr,
-    ) -> anyhow::Result<Vec<UdpSocketState>> {
+    fn build_pool(size: usize, v6: bool) -> anyhow::Result<UdpPool> {
+        let (domain, bind_addr) = udp_family(v6);
         let mut sockets = Vec::with_capacity(size);
         for _ in 0..size {
             sockets.push(Self::create_socket(domain, bind_addr)?);
@@ -167,7 +257,7 @@ impl UdpClient {
         Ok(sockets
             .into_iter()
             .enumerate()
-            .map(|(idx, socket)| Self::spawn_reader(idx, socket))
+            .map(|(idx, socket)| ArcSwap::from_pointee(Self::spawn_reader(idx, socket)))
             .collect())
     }
 
@@ -209,107 +299,25 @@ impl UdpClient {
 
     /// 为一个建好的 socket 启动接收任务 / Start the reader task of a ready socket
     fn spawn_reader(idx: usize, socket: Arc<tokio::net::UdpSocket>) -> UdpSocketState {
-        let inflight = Arc::new(DashMap::with_hasher(FxBuildHasher));
-
-        let state = UdpSocketState {
-            socket: socket.clone(),
-            inflight: inflight.clone(),
-        };
-
-        tokio::spawn(async move {
-            // Use BytesMut for efficient buffer management. It holds the largest DNS
-            // message: EDNS lets a UDP answer be negotiated up to 65535 bytes, and a
-            // datagram longer than the buffer loses its tail without notice, so a
-            // 4096-byte buffer turned such answers into parse failures. Most of the
-            // buffer is never written; with the default 64 sockets the resident set
-            // measured about 1 MiB larger than with 4096-byte buffers.
-            // 缓冲区容得下最大的 DNS 报文：EDNS 允许把 UDP 应答协商到 65535 字节，比缓冲区长的
-            // 数据报会被悄悄截掉尾部，4096 字节的缓冲区因此把这样的应答变成了解析失败。缓冲区大部分
-            // 从不被写到；默认 64 个 socket 时，实测常驻内存比 4096 字节的缓冲区多约 1 MiB。
-            let mut buf = BytesMut::with_capacity(MAX_DNS_MESSAGE_SIZE);
+        let inflight: Arc<UdpInflightMap> = Arc::new(DashMap::with_hasher(FxBuildHasher));
+        let (reading, map) = (Arc::clone(&socket), Arc::clone(&inflight));
+        let reader = tokio::spawn(async move {
+            let (socket, inflight) = (reading, map);
             loop {
-                // Reset buffer: keep capacity but length=0
-                // 重置缓冲区：保留容量但长度设为 0
-                buf.clear();
-
-                // Use recv_buf_from to write directly into uninitialized memory part of BytesMut
-                // avoid zero-filling overhead from resize(). The buffer is never split, so it
-                // keeps the capacity it was built with.
-                // 使用 recv_buf_from 直接写入 BytesMut 的未初始化内存部分，避免 resize() 的置零开销。
-                // 缓冲区从不被切开，容量一直是建的时候那么大。
-
-                match socket.recv_buf_from(&mut buf).await {
-                    Ok((_len, src)) => {
-                        let len = buf.len();
-                        if len >= 2 {
-                            let id = u16::from_be_bytes([buf[0], buf[1]]);
-                            // 修复：使用 Entry API 原子操作，避免 remove-then-insert 导致的竞态条件
-                            // Fix: Use Entry API for atomic operations to avoid remove-then-insert race condition
-                            if let entry::Entry::Occupied(entry) = inflight.entry(id) {
-                                let (_, expected_addr, query, _) = entry.get();
-                                if src != *expected_addr {
-                                    // Address mismatch: keep entry and wait for correct response
-                                    // 地址不匹配：保留条目等待正确响应（可能是网络攻击或路由异常）
-                                    crate::warn_sparse!(
-                                        socket_idx = idx,
-                                        response_id = id,
-                                        expected_addr = %expected_addr,
-                                        actual_addr = %src,
-                                        "UDP response address mismatch, possible spoofing or routing anomaly"
-                                    );
-                                } else if !crate::proto_utils::answers_query(query, &buf) {
-                                    // RFC 5452 §9.1: matching ID and address are not enough,
-                                    // the question must match too, in a reply to this query
-                                    // (see `answers_query`). Keep waiting for the real one.
-                                    // RFC 5452 §9.1：ID 和地址相符还不够，question 段也必须一致，
-                                    // 而且得是这个查询的应答（见 `answers_query`）；保留条目继续
-                                    // 等待真正的应答。
-                                    crate::warn_sparse!(
-                                        socket_idx = idx,
-                                        response_id = id,
-                                        upstream = %src,
-                                        "UDP response does not answer the query, possible spoofing"
-                                    );
-                                } else {
-                                    let (_, (original_id, _, _, tx)) = entry.remove_entry();
-
-                                    // Restore original TXID
-                                    let orig_bytes = original_id.to_be_bytes();
-                                    buf[0] = orig_bytes[0];
-                                    buf[1] = orig_bytes[1];
-
-                                    // 拷出一份正好大小的应答，缓冲区留着下次接着收。以前切下缓冲区的一段交出去
-                                    // （split_to），应答就一直挂在 4 KiB 的缓冲区上：缓存里每条应答平均占着
-                                    // 148 字节，缓冲区也要不停重新分配。TCP 和 DoT 的读取同样处理。
-                                    // Copy out an answer of exactly its size and keep the buffer for the
-                                    // next read. Handing out a slice of the buffer (split_to) kept each
-                                    // answer on a 4 KiB buffer: every cached answer held 148 bytes of one
-                                    // on average, and the buffer kept being reallocated. The TCP and DoT
-                                    // readers do the same.
-                                    let response = Bytes::copy_from_slice(&buf[..len]);
-                                    let resp_len = response.len();
-
-                                    if tx.send(Ok(response)).is_err() {
-                                        tracing::debug!(
-                                            socket_idx = idx,
-                                            original_id = original_id,
-                                            response_id = id,
-                                            response_len = resp_len,
-                                            "Failed to send UDP response, channel already closed"
-                                        );
-                                    } else {
-                                        tracing::trace!(
-                                            socket_idx = idx,
-                                            original_id = original_id,
-                                            response_id = id,
-                                            response_len = resp_len,
-                                            "UDP response sent successfully"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // 等到可读，再同步收进这个线程的缓冲：socket 自己不带缓冲，换下来再建新的也不用每次分配
+                // Readable first, then received into this thread's buffer at once: the socket carries no
+                // buffer of its own, and replacing it allocates none
+                let received = match socket.readable().await {
+                    Ok(()) => UDP_RECEIVED.with_borrow_mut(|buf| {
+                        let (len, src) = socket.try_recv_from(buf)?;
+                        hand_over_udp_reply(idx, &inflight, &mut buf[..len], src);
+                        Ok(())
+                    }),
+                    Err(error) => Err(error),
+                };
+                match received {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
                         tracing::error!("UDP pool recv error: {}", e);
                         if let Some(pause) = recv_error_pause(&e) {
@@ -318,9 +326,14 @@ impl UdpClient {
                     }
                 }
             }
-        });
-
-        state
+        })
+        .abort_handle();
+        UdpSocketState {
+            socket,
+            inflight,
+            sent: std::sync::atomic::AtomicU32::new(0),
+            reader,
+        }
     }
 
     /// 发出查询并在 `timeout_dur` 内等它的回答（测试用）/ Sends the query and waits for its reply
@@ -349,13 +362,7 @@ impl UdpClient {
         // Pick the pool by address family; the IPv4 path only gains one check.
         let pool = if addr.is_ipv6() {
             self.pool_v6
-                .get_or_try_init(|| async {
-                    Self::build_pool(
-                        self.pool_size,
-                        Domain::IPV6,
-                        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
-                    )
-                })
+                .get_or_try_init(|| async { Self::build_pool(self.pool_size, true) })
                 .await
                 .context("create the IPv6 UDP pool")?
         } else {
@@ -371,7 +378,7 @@ impl UdpClient {
         // 一个临时端口），低 16 位作为 ID 起点。
         let draw: u32 = rand::random();
         let idx = (draw >> 16) as usize % pool.len();
-        let state = &pool[idx];
+        let state = pool[idx].load_full();
 
         if packet.len() < 2 {
             return Err(anyhow::anyhow!("packet too short"));
@@ -430,7 +437,21 @@ impl UdpClient {
             // Guard will remove inflight entry automatically
             return Err(e.into());
         }
-        Ok(UdpSent(waiting))
+        if (state.sent.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(UDP_SOCKET_QUERIES) {
+            // 建不出新的（描述符用光了）就接着用这个，再用满一轮时再换 / One that cannot be made (out of
+            // descriptors) leaves this one in use, replaced after another round
+            let (domain, bind_addr) = udp_family(addr.is_ipv6());
+            match Self::create_socket(domain, bind_addr) {
+                Ok(socket) => pool[idx].store(Arc::new(Self::spawn_reader(idx, socket))),
+                Err(error) => {
+                    crate::warn_sparse!(error = %error, "cannot replace a UDP socket, keeping it in use")
+                }
+            }
+        }
+        Ok(UdpSent {
+            waiting,
+            _socket: state,
+        })
     }
 }
 
@@ -439,7 +460,12 @@ impl UdpClient {
 /// One UDP query sent and waiting for its reply (see [`UdpClient::begin`]). For as long as it
 /// is kept the reply is taken whenever it arrives; let go of, it waits no more and the entry it
 /// registered goes with it (see [`Waiting`])
-pub struct UdpSent(Waiting<UdpInflight>);
+pub struct UdpSent {
+    waiting: Waiting<UdpInflight>,
+    /// 发它的 socket：等着回答时不能关，换下来了也一样 / The socket that sent it, which may not close
+    /// while the reply is waited for, replaced or not
+    _socket: Arc<UdpSocketState>,
+}
 
 impl UdpSent {
     /// 等它的回答。没等到就被放下的这次等待不影响下一次：回答到了，下一次照样拿得到。拿到过结果以后不要再等
@@ -447,7 +473,7 @@ impl UdpSent {
     /// the reply is still there for it once it arrives. Not to be waited on again once it has
     /// given its outcome
     pub async fn reply(&mut self) -> anyhow::Result<Bytes> {
-        match (&mut self.0.rx).await {
+        match (&mut self.waiting.rx).await {
             Ok(reply) => reply,
             // 发送的那一头没给结果就没了（正常不会，除非逻辑出错或者 panic）/ The sending end went
             // without an outcome (not normally, short of a logic error or a panic)
@@ -4122,6 +4148,90 @@ mod tests {
         );
     }
 
+    /// 一个 socket 发满 [`UDP_SOCKET_QUERIES`] 个查询就换成另一个端口上的新 socket。以前池里的端口用到进程结束
+    /// A socket that has sent [`UDP_SOCKET_QUERIES`] queries is replaced by a new one on another
+    /// port. The pool's ports used to last the process
+    #[tokio::test]
+    async fn a_udp_socket_moves_to_another_port_after_its_queries() {
+        let (upstream, seen) = spawn_udp_upstream(|query| vec![echo_answer(query)]).await;
+        let client = UdpClient::new(1).expect("create UDP client");
+        let per_socket = UDP_SOCKET_QUERIES as usize;
+        for _ in 0..2 * per_socket + 1 {
+            client
+                .send(
+                    &udp_test_query("turn.example."),
+                    &upstream,
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("query answered");
+        }
+        let ports: Vec<u16> = seen.lock().unwrap().iter().map(|(_, port)| *port).collect();
+        let rounds: Vec<&[u16]> = ports.chunks(per_socket).collect();
+        for round in &rounds {
+            assert!(round.iter().all(|port| *port == round[0]), "{round:?}");
+        }
+        assert_ne!(rounds[0][0], rounds[1][0]);
+        assert_ne!(rounds[1][0], rounds[2][0]);
+    }
+
+    /// 换下来的 socket 还收它在途查询的回答：查询发出去以后它的 socket 被换掉，回答照样到得了；这个查询放手以后旧 socket 关掉
+    /// A replaced socket still takes the replies to its queries in flight: a query whose socket
+    /// is replaced after it was sent still gets its reply; once that query lets go the old socket
+    /// closes
+    #[tokio::test]
+    async fn a_query_in_flight_is_answered_after_its_socket_is_replaced() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream = socket.local_addr().unwrap().to_string();
+        let per_socket = UDP_SOCKET_QUERIES as usize;
+        // 第一个查询的回答压着，等后面的查询把它的 socket 换掉以后再发 / The first query's reply is held
+        // back until the queries after it have had its socket replaced
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let mut held = None;
+            for seen in 1..=per_socket + 1 {
+                let (n, src) = socket.recv_from(&mut buf).await.unwrap();
+                let reply = echo_answer(&buf[..n]);
+                if seen == 1 {
+                    held = Some((reply, src));
+                    continue;
+                }
+                socket.send_to(&reply, src).await.unwrap();
+                if seen == per_socket + 1
+                    && let Some((reply, src)) = held.take()
+                {
+                    socket.send_to(&reply, src).await.unwrap();
+                }
+            }
+        });
+        let client = UdpClient::new(1).expect("create UDP client");
+        let query = udp_test_query("held.example.");
+        let mut first = client.begin(&query, &upstream).await.expect("sent");
+        for _ in 0..per_socket {
+            client
+                .send(&query, &upstream, Duration::from_secs(2))
+                .await
+                .expect("query answered");
+        }
+        let replaced = client.pool[0].load().socket.local_addr().unwrap();
+        assert_ne!(first._socket.socket.local_addr().unwrap(), replaced);
+        let reply = timeout(Duration::from_secs(2), first.reply())
+            .await
+            .expect("answered in time")
+            .expect("answered");
+        assert_eq!(&reply[..2], &query[..2], "original ID restored");
+
+        // 最后一个查询放手以后，接收任务停下，socket 关掉 / Once its last query lets go, the receiving
+        // task stops and the socket closes
+        let old_socket = Arc::downgrade(&first._socket.socket);
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            old_socket.upgrade().is_none(),
+            "the replaced socket is closed"
+        );
+    }
+
     #[tokio::test]
     async fn udp_send_ignores_answer_whose_question_differs() {
         // RFC 5452 §9.1: an answer is only accepted when its question section
@@ -5195,7 +5305,12 @@ mod tests {
             )
             .await;
         assert!(result.is_err(), "the upstream never answers");
-        assert!(client.pool.iter().all(|socket| socket.inflight.is_empty()));
+        assert!(
+            client
+                .pool
+                .iter()
+                .all(|socket| socket.load().inflight.is_empty())
+        );
 
         let tcp_client = TcpMuxClient::new(Arc::from(tcp_addr.as_str()));
         let result = tcp_client
