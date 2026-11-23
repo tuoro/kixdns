@@ -1786,11 +1786,15 @@ fn query_with_ecs_option(data: &[u8]) -> Vec<u8> {
     packet
 }
 
-/// 读不懂的 ECS 选项也要去掉，包括 hickory 解不开的（地址族未知、前缀超长）
-/// An ECS option nobody can read goes too, including ones hickory cannot decode
-/// (an unknown family, a prefix too long)
+/// 地址不合规的 ECS 选项（地址族未知、前缀超长、地址长度和前缀对不上、前缀之后的位不为零）当场回 FORMERR（RFC 7871 第 6 节、
+/// 第 7.2.1 节），不问上游；以前原样转给上游。查询里 SCOPE 不为 0 的（第 6 节不允许，却没要求回 FORMERR）读不懂，照旧去掉
+/// An ECS option with an improper address (an unknown family, a prefix too long, an address
+/// whose length does not match the prefix, bits set beyond the prefix) is answered FORMERR on the
+/// spot (RFC 7871 sections 6 and 7.2.1), no upstream asked; it used to be forwarded as it was. One
+/// with a nonzero SCOPE in a query (which section 6 forbids, asking no FORMERR) cannot be read,
+/// and still goes
 #[tokio::test]
-async fn from_client_ip_removes_ecs_options_hickory_cannot_decode() {
+async fn an_improper_client_ecs_is_formerr_and_one_with_a_scope_goes() {
     let up = upstream(Echo::Scope(24)).await;
     let engine = engine(forward_all(&up.address, from_client_ip()));
     for (case, data) in [
@@ -1799,20 +1803,36 @@ async fn from_client_ip_removes_ecs_options_hickory_cannot_decode() {
             "an IPv4 prefix over 32",
             vec![0, 1, 33, 0, 198, 51, 100, 7, 1],
         ),
-        ("a nonzero SCOPE", vec![0, 1, 24, 5, 198, 51, 100]),
+        ("an address too long", vec![0, 1, 24, 0, 198, 51, 100, 7]),
+        ("bits beyond the prefix", vec![0, 1, 20, 0, 198, 51, 127]),
     ] {
-        let reply = tokio::time::timeout(
-            Duration::from_secs(5),
-            engine.handle_packet(&query_with_ecs_option(&data), peer("198.51.100.7")),
-        )
-        .await
-        .expect("answer in time")
-        .expect("answer");
-        assert_eq!(first_a(&reply), Some(NO_SUBNET), "{case}");
+        let mut reply = bytes::BytesMut::new();
+        let spot = engine.on_the_spot(
+            &query_with_ecs_option(&data),
+            peer("198.51.100.7"),
+            &mut reply,
+        );
+        assert!(matches!(spot, crate::engine::OnTheSpot::Reply), "{case}");
+        assert_eq!(
+            Message::from_bytes(&reply).unwrap().metadata.response_code,
+            ResponseCode::FormErr,
+            "{case}"
+        );
     }
-    // 三次请求发给上游的都不带 ECS，所以第一次之后都从缓存拿
-    // All three send the upstream a query without ECS, so after the first they come from the cache
-    assert_eq!(seen(&up), vec![None]);
+    assert_eq!(up.queries(), 0, "no upstream asked");
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.handle_packet(
+            &query_with_ecs_option(&[0, 1, 24, 5, 198, 51, 100]),
+            peer("198.51.100.7"),
+        ),
+    )
+    .await
+    .expect("answer in time")
+    .expect("answer");
+    assert_eq!(first_a(&reply), Some(NO_SUBNET));
+    assert_eq!(seen(&up), vec![None], "asked without ECS");
 }
 
 /// 后台刷新照样不加地址：刷新重放的包放不进读不懂的选项，按缓存记下的请求方判断，和原请求一样

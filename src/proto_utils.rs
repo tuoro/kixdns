@@ -403,7 +403,9 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
             // TTL 字段依次是扩展 RCODE、版本和标志 / The TTL field holds the extended RCODE, the version and the flags
             edns_version = packet[next_pos + 5];
             dnssec_ok = packet[next_pos + 6] & 0x80 != 0;
-            client_subnet = query_subnet(packet, fixed_end..rdata_end);
+            // ECS 不合规的查询留给 `Engine::on_the_spot` 回 FORMERR / A query with an improper ECS is left
+            // for `Engine::on_the_spot` to answer FORMERR
+            client_subnet = query_subnet(packet, fixed_end..rdata_end).ok()?;
         }
         ar_pos = rdata_end;
     }
@@ -995,27 +997,34 @@ struct EcsOption {
 }
 
 impl EcsOption {
-    /// 是否完全符合 RFC 7871 第 6 节：已知的地址族、前缀不超过地址长度、ADDRESS 恰好
-    /// ceil(前缀/8) 个字节、前缀之后的位为零，SCOPE 也不超过地址长度。
-    /// Whether it follows RFC 7871 section 6 to the letter: a known family, a
-    /// prefix within the address length, an ADDRESS of exactly ceil(prefix/8)
-    /// octets with zero bits beyond the prefix, and a SCOPE within the address
-    /// length too.
+    /// 是否完全符合 RFC 7871 第 6 节：地址合规（见 [`Self::address_bits`]），SCOPE 也不超过地址长度。
+    /// Whether it follows RFC 7871 section 6 to the letter: a proper address (see
+    /// [`Self::address_bits`]), and a SCOPE within the address length too.
     fn is_well_formed(&self, packet: &[u8]) -> bool {
+        self.address_bits(packet)
+            .is_some_and(|bits| self.scope <= bits)
+    }
+
+    /// 地址合规时是地址族的位数：已知的地址族、前缀不超过地址长度、ADDRESS 恰好 ceil(前缀/8) 个字节、前缀之后的位为零。
+    /// 不合规的查询要回 FORMERR（RFC 7871 第 6 节、第 7.2.1 节）
+    /// The family's bit count when the address is proper: a known family, a prefix within the
+    /// address length, an ADDRESS of exactly ceil(prefix/8) octets with zero bits beyond the
+    /// prefix. A query with an improper one is answered FORMERR (RFC 7871 sections 6 and 7.2.1)
+    fn address_bits(&self, packet: &[u8]) -> Option<u8> {
         let bits = match self.family {
             1 => 32,
             2 => 128,
-            _ => return false,
+            _ => return None,
         };
         let address = &packet[self.address.clone()];
         let spare = self.source_prefix % 8;
-        self.source_prefix <= bits
-            && self.scope <= bits
+        (self.source_prefix <= bits
             && address.len() == (self.source_prefix as usize).div_ceil(8)
             && (spare == 0
                 || address
                     .last()
-                    .is_some_and(|last| last & (0xFF >> spare) == 0))
+                    .is_some_and(|last| last & (0xFF >> spare) == 0)))
+        .then_some(bits)
     }
 
     fn subnet(&self, packet: &[u8]) -> crate::ecs::EcsKey {
@@ -1079,28 +1088,46 @@ fn ecs_option(packet: &[u8], rdata: std::ops::Range<usize>) -> Result<Option<Ecs
     Ok(found)
 }
 
-/// 查询（OPT 的 RDATA 在 `rdata`）里客户端自己带的 ECS。不完全合规的选项得到
-/// `EcsKey::opaque`：它照样会被原样转给上游，应答却说不准适用于谁。
-/// The ECS a query carries itself, its OPT RDATA at `rdata`. An option that does
-/// not follow the rules to the letter gets an `EcsKey::opaque`: it still goes
-/// upstream as it is, but whom the answer applies to is unclear.
-fn query_subnet(packet: &[u8], rdata: std::ops::Range<usize>) -> Option<crate::ecs::EcsKey> {
-    match ecs_option(packet, rdata.clone()) {
-        Ok(None) => None,
-        Ok(Some(option)) if option.scope == 0 && option.is_well_formed(packet) => {
-            Some(option.subnet(packet))
-        }
-        _ => Some(crate::ecs::EcsKey::opaque(&packet[rdata])),
-    }
+/// 查询（OPT 的 RDATA 在 `rdata`）里客户端自己带的 ECS。地址不合规（见 `EcsOption::address_bits`）或者不止一个 ECS
+/// 选项时为 Err，这样的查询回 FORMERR（见 [`malformed_ecs`]）；SCOPE 不为 0 的得到 `EcsKey::opaque`（查询里它必须为 0，
+/// RFC 7871 第 6 节却没要求为此回 FORMERR）：它照样会被原样转给上游，应答却说不准适用于谁。
+/// The ECS a query carries itself, its OPT RDATA at `rdata`. Err for an improper address (see
+/// `EcsOption::address_bits`) or more than one ECS option, and such a query is answered FORMERR
+/// (see [`malformed_ecs`]); a nonzero SCOPE gets an `EcsKey::opaque` (it must be 0 in a query,
+/// but RFC 7871 section 6 asks no FORMERR for it): it still goes upstream as it is, but whom
+/// the answer applies to is unclear.
+fn query_subnet(
+    packet: &[u8],
+    rdata: std::ops::Range<usize>,
+) -> Result<Option<crate::ecs::EcsKey>, ()> {
+    let Some(option) = ecs_option(packet, rdata.clone())? else {
+        return Ok(None);
+    };
+    option.address_bits(packet).ok_or(())?;
+    Ok(Some(if option.scope == 0 {
+        option.subnet(packet)
+    } else {
+        crate::ecs::EcsKey::opaque(&packet[rdata])
+    }))
 }
 
-/// 查询报文里客户端自己带的 ECS（见 `query_subnet`）。报文读不出来时也按读不懂的选项算。
-/// The ECS a query message carries itself (see `query_subnet`). A message that
-/// cannot be read counts as an option that cannot be read too.
+/// 查询里的 ECS 选项不合规，要回 FORMERR（RFC 7871 第 6 节、第 7.2.1 节，见 `query_subnet`）。快速解析不收这样的查询，
+/// 所以只为快速解析读不了的查询看一遍
+/// Whether the query's ECS option is improper and to be answered FORMERR (RFC 7871 sections 6
+/// and 7.2.1, see `query_subnet`). The quick parse takes no such query, so only a query it
+/// cannot read is looked at for this
+pub(crate) fn malformed_ecs(query: &[u8]) -> bool {
+    matches!(find_opt(query), Ok(Some(opt)) if query_subnet(query, opt.rdata.clone()).is_err())
+}
+
+/// 查询报文里客户端自己带的 ECS（见 `query_subnet`）。报文或选项读不出来时按读不懂的选项算。
+/// The ECS a query message carries itself (see `query_subnet`). A message or an option that
+/// cannot be read counts as an option that cannot be read.
 pub(crate) fn client_subnet(packet: &[u8]) -> Option<crate::ecs::EcsKey> {
     match find_opt(packet) {
         Ok(None) => None,
-        Ok(Some(opt)) => query_subnet(packet, opt.rdata),
+        Ok(Some(opt)) => query_subnet(packet, opt.rdata.clone())
+            .unwrap_or_else(|()| Some(crate::ecs::EcsKey::opaque(&packet[opt.rdata]))),
         Err(()) => Some(crate::ecs::EcsKey::opaque(packet)),
     }
 }

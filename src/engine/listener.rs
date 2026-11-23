@@ -66,6 +66,13 @@ impl Engine {
                 Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
                     return OnTheSpot::Forward(Some(pre_parsed));
                 }
+                // ECS 不合规的查询快速解析不收，当场回 FORMERR（RFC 7871 第 6 节），不去问上游；以前原样转给上游
+                // A query with an improper ECS, which the quick parse does not take, is answered
+                // FORMERR on the spot (RFC 7871 section 6) rather than asked of an upstream; it
+                // used to be forwarded as it was
+                Ok(None) if proto_utils::malformed_ecs(packet) => {
+                    proto_utils::formerr_reply(packet)
+                }
                 Ok(None) => return OnTheSpot::Forward(None),
                 // 快速解析读过的查询才会出错，SERVFAIL 照线上格式拼，不必再解析
                 // Only a query the quick parse read can fail here, so the SERVFAIL is put
