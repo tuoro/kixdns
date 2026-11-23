@@ -79,16 +79,6 @@ pub struct CacheLookupContext<'a> {
     pub observed: Observed<'a>,
 }
 
-/// Does not emit the `dns_response` record; only the engine request path logs it.
-/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
-pub fn check_cache(engine: &Engine, context: &CacheLookupContext<'_>) -> Option<Bytes> {
-    check_cache_logged(engine, context, &mut ResponseInfo::default())
-}
-
-/// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
-/// background refresh; an expired one is served stale or dropped as serve_stale says.
-/// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期的按 serve_stale
-/// 的设置当作 stale 提供，或者删掉。
 /// 缓存里的一份应答现在算什么 / What a cached answer counts as now
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Age {
@@ -131,6 +121,10 @@ pub(crate) fn kept_past_ttl(settings: &GlobalSettings) -> Duration {
     }
 }
 
+/// Checks the response cache: a fresh answer goes out with its TTLs aged and may start a
+/// background refresh; an expired one is served stale or dropped as serve_stale says.
+/// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期的按 serve_stale
+/// 的设置当作 stale 提供，或者删掉。
 pub(crate) fn check_cache_logged(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
@@ -337,14 +331,6 @@ pub(crate) fn served_from_cache(
 ///
 /// Does not emit the `dns_response` record; only the engine request path logs it.
 /// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
-pub fn check_stale_cache(
-    engine: &Engine,
-    context: &CacheLookupContext<'_>,
-    kind: CacheHitKind,
-) -> Option<Bytes> {
-    check_stale_cache_logged(engine, context, kind, &mut ResponseInfo::default())
-}
-
 pub(crate) fn check_stale_cache_logged(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
@@ -1039,14 +1025,10 @@ pub(crate) async fn handle_forward_decision_logged(
                     return Ok(ForwardResult::Success(raw));
                 }
 
-                let empty_message = || {
-                    Message::new(
-                        0,
-                        hickory_proto::op::MessageType::Query,
-                        hickory_proto::op::OpCode::Query,
-                    )
-                };
-                let msg = msg_opt.unwrap_or_else(empty_message);
+                // 有响应规则时应答总经 hickory 解析，解析不了的上面已经让这次请求出错（见 `rules_read_the_reply`）
+                // With response rules the reply is always parsed by hickory, and one it cannot parse
+                // has failed the request above (see `rules_read_the_reply`)
+                let msg = msg_opt.expect("response rules have the reply parsed by hickory");
                 // 手里有应答时，这几个动作用不着请求本身，不必为它们解析一遍；分流规则常写的就是这几个
                 // With an answer in hand these actions have no use for the request itself, and
                 // it is not parsed for them; these are what splitting rules usually write
@@ -1056,11 +1038,21 @@ pub(crate) async fn handle_forward_decision_logged(
                         Action::Log { .. } | Action::Allow | Action::Continue
                     )
                 });
-                // 要执行的动作带着这份应答 / The actions to run carry this answer
-                let req_full = needs_request
-                    .then(|| Message::from_bytes(packet).ok())
-                    .flatten()
-                    .unwrap_or_else(empty_message);
+                // 要执行的动作带着这份应答。要用请求的动作，请求解析不了就让这次请求出错，和上游失败以后一样；以前拿一个
+                // TXID 为 0、没有问题的空报文去执行，答出去的客户端认不得。用不着请求的动作不读它，给个空报文占位
+                // The actions to run carry this answer. For actions that use the request, a request
+                // that cannot be parsed fails, as after an upstream failure; they used to run on an
+                // empty message with TXID 0 and no question, answering what no client recognises.
+                // Actions with no use for the request never read it, an empty message holding its place
+                let req_full = if needs_request {
+                    Message::from_bytes(packet).context("parse the request for response actions")?
+                } else {
+                    Message::new(
+                        0,
+                        hickory_proto::op::MessageType::Query,
+                        hickory_proto::op::OpCode::Query,
+                    )
+                };
                 let ctx = ResponseContext {
                     raw,
                     msg,
