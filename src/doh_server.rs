@@ -466,16 +466,16 @@ async fn handle_doh_request(
         _ => return Ok(error_response(StatusCode::NOT_FOUND)),
     };
 
-    // 和 UDP、TCP 一样只回答标准查询：别的操作码回 NOTIMP（见 `notimp_reply`）；QR=1 的应答、问题数不是 1 等
-    // 不是查询，UDP 丢掉它们、TCP 断开，DoH 回 400，和报文太短时一样
-    // As over UDP and TCP, only a standard query is answered: another opcode gets NOTIMP (see
-    // `notimp_reply`); a response with QR=1, a question count other than 1 and so on are no
-    // queries, which UDP drops and TCP closes on, and DoH says 400, as for a message too short
+    // 和 UDP、TCP 一样只回答标准查询：别的操作码回 NOTIMP、问题数不对回 FORMERR（见 `header_reply`）；
+    // QR=1 的应答不是查询，回 400，和报文太短时一样
+    // As over UDP and TCP, only a standard query is answered: another opcode gets NOTIMP and a
+    // wrong question count FORMERR (see `header_reply`); a response with QR=1 is no query and
+    // gets 400, as a message too short does
     if !crate::proto_utils::is_standard_query_header(&dns_wire) {
-        let Some(notimp) = crate::proto_utils::notimp_reply(&dns_wire) else {
+        let Some(refused) = crate::proto_utils::header_reply(&dns_wire) else {
             return Ok(error_response(StatusCode::BAD_REQUEST));
         };
-        return Ok(dns_message_response(notimp));
+        return Ok(dns_message_response(refused));
     }
 
     // ✅ 复用 Engine 公共入口 — 与 TCP/UDP 入站完全一致

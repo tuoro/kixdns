@@ -435,12 +435,7 @@ async fn test_doh_post_non_query_is_bad_request() {
         change(&mut packet);
         packet
     };
-    for (case, packet) in [
-        ("QR=1", with(|packet| packet[2] |= 0x80)),
-        ("QDCOUNT=0", with(|packet| packet[5] = 0)),
-        ("QDCOUNT=2", with(|packet| packet[5] = 2)),
-        ("ANCOUNT=1", with(|packet| packet[7] = 1)),
-    ] {
+    for (case, packet) in [("QR=1", with(|packet| packet[2] |= 0x80))] {
         let resp = post(&client, server.port, packet)
             .send()
             .await
@@ -453,19 +448,29 @@ async fn test_doh_post_non_query_is_bad_request() {
             "{case}: {status} with a {body}-byte body"
         );
     }
-    // 别的操作码不是错的报文，是 KixDNS 不做的请求：回 NOTIMP（只有请求头），和 UDP、TCP 一样
-    // Another opcode is no broken message but a request KixDNS does not do: NOTIMP (the header
-    // alone), as over UDP and TCP
-    let status_query = with(|packet| packet[2] = (packet[2] & 0x87) | (2 << 3));
-    let resp = post(&client, server.port, status_query)
-        .send()
-        .await
-        .expect("POST request");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let body = resp.bytes().await.expect("body");
-    assert_eq!(body.len(), 12, "the header alone");
-    assert_eq!(&body[..2], &[0x42, 0x42]);
-    assert_eq!(body[3] & 0x0F, 4, "NOTIMP");
+    // 别的操作码回 NOTIMP，问题数不对、带着回答记录回 FORMERR，都只有请求头，和 UDP、TCP 一样
+    // Another opcode gets NOTIMP, and a wrong question count or answer records FORMERR, the
+    // header alone, as over UDP and TCP
+    for (case, packet, rcode) in [
+        (
+            "opcode STATUS",
+            with(|packet| packet[2] = (packet[2] & 0x87) | (2 << 3)),
+            4,
+        ),
+        ("QDCOUNT=0", with(|packet| packet[5] = 0), 1),
+        ("QDCOUNT=2", with(|packet| packet[5] = 2), 1),
+        ("ANCOUNT=1", with(|packet| packet[7] = 1), 1),
+    ] {
+        let resp = post(&client, server.port, packet)
+            .send()
+            .await
+            .expect("POST request");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{case}");
+        let body = resp.bytes().await.expect("body");
+        assert_eq!(body.len(), 12, "{case}: the header alone");
+        assert_eq!(&body[..2], &[0x42, 0x42], "{case}");
+        assert_eq!(body[3] & 0x0F, rcode, "{case}");
+    }
     let resp = post(&client, server.port, query)
         .send()
         .await
