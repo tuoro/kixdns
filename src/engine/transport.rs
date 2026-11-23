@@ -51,6 +51,14 @@ fn unix_time_millis() -> u64 {
 /// 剩余不足这个值时现实路径上跑不完，只会在调用方截止后再失败一次。绝不延长调用方的截止。
 const MIN_RETRY_BUDGET: Duration = Duration::from_millis(50);
 
+/// 从 `started` 起有 `budget` 的查询还剩多少，够一次透明重试（见 [`MIN_RETRY_BUDGET`]）时给出来；TCP、DoT、DoH 和
+/// DoQ 都按它定重不重试
+/// What is left of a query's `budget` from `started`, given when it is enough for a transparent
+/// retry (see [`MIN_RETRY_BUDGET`]); TCP, DoT, DoH and DoQ all decide on a retry by it
+fn retry_budget(budget: Duration, started: tokio::time::Instant) -> Option<Duration> {
+    Some(budget.saturating_sub(started.elapsed())).filter(|left| *left >= MIN_RETRY_BUDGET)
+}
+
 /// 一个在途的 UDP 查询：客户端的 ID、发给谁、发出去的查询、回答交给谁 / One UDP query in flight: the
 /// client's ID, whom it was sent to, the query as sent, and whom the reply goes to
 type UdpInflight = (
@@ -437,21 +445,40 @@ impl UdpClient {
             // Guard will remove inflight entry automatically
             return Err(e.into());
         }
-        if (state.sent.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(UDP_SOCKET_QUERIES) {
-            // 建不出新的（描述符用光了）就接着用这个，再用满一轮时再换 / One that cannot be made (out of
-            // descriptors) leaves this one in use, replaced after another round
-            let (domain, bind_addr) = udp_family(addr.is_ipv6());
-            match Self::create_socket(domain, bind_addr) {
-                Ok(socket) => pool[idx].store(Arc::new(Self::spawn_reader(idx, socket))),
-                Err(error) => {
-                    crate::warn_sparse!(error = %error, "cannot replace a UDP socket, keeping it in use")
-                }
-            }
-        }
+        Self::note_sent(&pool[idx], idx, &state, addr.is_ipv6());
         Ok(UdpSent {
             waiting,
             _socket: state,
         })
+    }
+
+    /// `state`（从池里第 `idx` 个位置 `slot` 上取的，`v6` 那一族）又发出了一个查询。用满 [`UDP_SOCKET_QUERIES`] 次就在
+    /// `slot` 上换一个新的 socket，但只在 `slot` 上还是它时换：从取出它到数到这一次之间，别的查询可能已经把它换下来了，
+    /// 这时再换会把刚换上去、还没怎么用的那个也换掉。建不出新的（描述符用光了）就接着用这个，再用满一轮时再换
+    /// `state` (taken from `slot`, place `idx` of the pool, of the `v6` family) has sent one more
+    /// query. Once used [`UDP_SOCKET_QUERIES`] times it is replaced on `slot` by a new socket, but
+    /// only while `slot` still holds it: between taking it and counting this query another query
+    /// may have replaced it already, and replacing then would replace the one just put in, hardly
+    /// used yet. One that cannot be made (out of descriptors) leaves this one in use, replaced
+    /// after another round
+    fn note_sent(
+        slot: &ArcSwap<UdpSocketState>,
+        idx: usize,
+        state: &Arc<UdpSocketState>,
+        v6: bool,
+    ) {
+        if !(state.sent.fetch_add(1, Ordering::Relaxed) + 1).is_multiple_of(UDP_SOCKET_QUERIES) {
+            return;
+        }
+        let (domain, bind_addr) = udp_family(v6);
+        match Self::create_socket(domain, bind_addr) {
+            Ok(socket) => {
+                slot.compare_and_swap(state, Arc::new(Self::spawn_reader(idx, socket)));
+            }
+            Err(error) => {
+                crate::warn_sparse!(error = %error, "cannot replace a UDP socket, keeping it in use")
+            }
+        }
     }
 }
 
@@ -1480,10 +1507,9 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     .downcast_ref::<ConnectionGone>()
                     .is_some_and(|gone| gone.generation <= before) =>
             {
-                let remaining = timeout_dur.saturating_sub(start.elapsed());
-                if remaining < MIN_RETRY_BUDGET {
+                let Some(remaining) = retry_budget(timeout_dur, start) else {
                     return Err(err);
-                }
+                };
                 debug!(
                     upstream = %self.upstream,
                     error = %err,
@@ -2396,10 +2422,9 @@ impl DohClient {
                 // 透明重试：DNS 查询语义幂等，单次重试安全。
                 // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
                 let rebuilt = self.record_error(upstream, &state, generation);
-                let remaining = timeout_dur.saturating_sub(start.elapsed());
-                if remaining < MIN_RETRY_BUDGET {
+                let Some(remaining) = retry_budget(timeout_dur, start) else {
                     return Err(err);
-                }
+                };
                 debug!(
                     upstream = upstream,
                     error = %err,
@@ -3385,8 +3410,7 @@ impl DoqMuxClient {
                     } else {
                         false
                     };
-                    let remaining = timeout_dur.saturating_sub(start.elapsed());
-                    if retry && !remaining.is_zero() {
+                    if retry && let Some(remaining) = retry_budget(timeout_dur, start) {
                         allow_retry = false;
                         timeout_dur = remaining;
                         continue;
@@ -4370,6 +4394,28 @@ mod tests {
         }
         assert_ne!(rounds[0][0], rounds[1][0]);
         assert_ne!(rounds[1][0], rounds[2][0]);
+    }
+
+    /// 换 socket 只换数满的那一个：取了旧 socket 的查询在它换下来以后又把它数满一轮，池里刚换上的新 socket 留着。以前不看
+    /// 位置上现在是哪个，照换
+    /// A replacement replaces only the socket counted up: a query that took the old socket counting
+    /// it up to another round after it was replaced leaves the new one in the pool. Whatever the
+    /// place held used to be replaced
+    #[tokio::test]
+    async fn a_socket_replaced_already_is_not_replaced_again() {
+        let client = UdpClient::new(1).expect("create UDP client");
+        let old = client.pool[0].load_full();
+        old.sent.store(UDP_SOCKET_QUERIES - 1, Ordering::Relaxed);
+        UdpClient::note_sent(&client.pool[0], 0, &old, false);
+        let new = client.pool[0].load_full();
+        assert!(!Arc::ptr_eq(&new, &old), "used up, it is replaced");
+        old.sent
+            .store(2 * UDP_SOCKET_QUERIES - 1, Ordering::Relaxed);
+        UdpClient::note_sent(&client.pool[0], 0, &old, false);
+        assert!(
+            Arc::ptr_eq(&client.pool[0].load_full(), &new),
+            "the new one stays"
+        );
     }
 
     /// 换下来的 socket 还收它在途查询的回答：查询发出去以后它的 socket 被换掉，回答照样到得了；这个查询放手以后旧 socket 关掉
@@ -6391,8 +6437,9 @@ mod tests {
         Answer(Duration),
         /// 回答，100 ms 后关掉整条连接 / Answer, then close the whole connection 100 ms later
         AnswerThenClose,
-        /// 读完查询就关掉整条连接，不回答 / Read the query and close the connection unanswered
-        Close,
+        /// 读完查询，隔这么久关掉整条连接，不回答 / Read the query and close the connection after this
+        /// long, unanswered
+        Close(Duration),
         /// 一直不回答 / Never answer
         Silence,
         /// 回答别的问题 / Answer another question
@@ -6464,7 +6511,8 @@ mod tests {
                                     drop(send);
                                     return;
                                 }
-                                DoqReply::Close => {
+                                DoqReply::Close(delay) => {
+                                    tokio::time::sleep(delay).await;
                                     close();
                                     return;
                                 }
@@ -6694,7 +6742,7 @@ mod tests {
             if n == 0 {
                 DoqReply::Answer(Duration::ZERO)
             } else {
-                DoqReply::Close
+                DoqReply::Close(Duration::ZERO)
             }
         })
         .await;
@@ -6712,6 +6760,46 @@ mod tests {
             "a pooled connection closed under the query must be retried on a fresh one: {:?}",
             second.err()
         );
+    }
+
+    /// 池里的连接在查询途中断了，剩下的预算却不到 [`MIN_RETRY_BUDGET`]：不换连接重发，和别的传输一样。以前还剩 1 毫秒
+    /// 也重发
+    /// A pooled connection dying under a query with less than [`MIN_RETRY_BUDGET`] of its budget
+    /// left: the query is not sent again on a fresh one, as on the other transports. It used to
+    /// be sent again with a millisecond left
+    #[tokio::test]
+    async fn doq_does_not_retry_without_the_budget_for_it() {
+        /// 上游收到了几次 `second` / How many times the upstream received `second`
+        static SECOND: AtomicUsize = AtomicUsize::new(0);
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        // 预算 400 毫秒，连接在 355 毫秒时断：剩下的一定不到 MIN_RETRY_BUDGET，换一条新连接重发却来得及
+        // A budget of 400 ms and the connection gone at 355 ms: what is left is always short of
+        // MIN_RETRY_BUDGET, yet enough to send again on a fresh connection
+        let addr = spawn_doq_upstream(server, Duration::ZERO, |n, label| {
+            if label != "second" {
+                return DoqReply::Answer(Duration::ZERO);
+            }
+            if SECOND.fetch_add(1, Ordering::Relaxed) == 0 && n > 0 {
+                DoqReply::Close(Duration::from_millis(355))
+            } else {
+                DoqReply::Answer(Duration::ZERO)
+            }
+        })
+        .await;
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        client
+            .send(&udp_test_query("first.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+
+        let second = client
+            .send(
+                &udp_test_query("second.example"),
+                Duration::from_millis(400),
+            )
+            .await;
+        assert!(second.is_err(), "not sent again: {second:?}");
+        assert_eq!(SECOND.load(Ordering::Relaxed), 1, "sent once");
     }
 
     /// 没用 0-RTT 的连接上一次回答慢，曾被当成 0-RTT 被拒，把这个上游的 0-RTT 关到
