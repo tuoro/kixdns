@@ -1675,18 +1675,13 @@ impl RuntimeResponseMatcher {
                     value: parse_dns_type(&value)?,
                 }
             }
+            // None 是 `OTHER`：上面几个以外的 RCODE。别的写法读配置时就报出来（见 `config::problems`）
+            // None is `OTHER`: any RCODE besides those. Anything else written is raised when the
+            // configuration is read (see `config::problems`)
             config::ResponseMatcher::ResponseRcode { value } => {
-                let upper = value.to_ascii_uppercase();
-                let rc = match upper.as_str() {
-                    "NOERROR" => Some(ResponseCode::NoError),
-                    "FORMERR" => Some(ResponseCode::FormErr),
-                    "SERVFAIL" => Some(ResponseCode::ServFail),
-                    "NXDOMAIN" => Some(ResponseCode::NXDomain),
-                    "NOTIMP" => Some(ResponseCode::NotImp),
-                    "REFUSED" => Some(ResponseCode::Refused),
-                    _ => None, // "OTHER" 或未知码 — 回退为 catch-all / "OTHER" or unknown — fallback to catch-all
-                };
-                RuntimeResponseMatcher::ResponseRcode { value: rc }
+                RuntimeResponseMatcher::ResponseRcode {
+                    value: crate::engine::utils::parse_rcode(&value),
+                }
             }
             config::ResponseMatcher::ResponseQclass { value } => {
                 RuntimeResponseMatcher::ResponseQclass {

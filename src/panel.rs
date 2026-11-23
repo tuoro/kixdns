@@ -257,10 +257,11 @@ impl QueryStatsBucket {
 }
 
 /// 查询排行：开了控制通道就一直统计，客户端地址照原样记。配置里的 `statistics_enabled` 和
-/// `statistics_anonymize_client_ip` 还能读，但不再起作用。
+/// `statistics_anonymize_client_ip` 已经退役，还能读，只记一条警告（见 `config::RETIRED_SETTINGS`）。
 /// Query rankings: always collected while the control socket is open, with client
 /// addresses as they are. The config's `statistics_enabled` and
-/// `statistics_anonymize_client_ip` still load but no longer do anything.
+/// `statistics_anonymize_client_ip` are retired: they still load, with a warning (see
+/// `config::RETIRED_SETTINGS`).
 struct QueryStats {
     buckets: Box<[QueryStatsBucket]>,
     wall: WallClock,
@@ -2279,16 +2280,14 @@ async fn run_trial(input: TrialInput) -> (StatusCode, serde_json::Value) {
     // without it the first DoH/DoT upstream panics
     let _ = rustls::crypto::ring::default_provider().install_default();
     let raw = request.config.to_string();
-    let built = crate::config::validate(&raw)
-        .and_then(|_| crate::config::parse_config(&raw))
-        .and_then(|mut config| {
-            config.settings.cache_background_refresh = false;
-            let runtime = crate::matcher::RuntimePipelineConfig::from_config(config)?;
-            Engine::builder(runtime)
-                .listener_label(listener_label)
-                .observer(Arc::new(PanelMetrics::new(false)))
-                .build()
-        });
+    let built = crate::config::parse_config(&raw).and_then(|mut config| {
+        config.settings.cache_background_refresh = false;
+        let runtime = crate::config::compile(config)?;
+        Engine::builder(runtime)
+            .listener_label(listener_label)
+            .observer(Arc::new(PanelMetrics::new(false)))
+            .build()
+    });
     let engine = match built {
         Ok(engine) => engine,
         Err(error) => return config_invalid(&error),
@@ -3967,7 +3966,14 @@ mod tests {
             r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
         )
         .expect("old settings still load");
-        assert!(!config.settings.statistics_enabled);
+        assert_eq!(
+            config.unread_keys,
+            [
+                "settings.statistics_enabled",
+                "settings.statistics_anonymize_client_ip"
+            ],
+            "read as retired settings, warned about"
+        );
         let metrics = PanelMetrics::new(false);
         metrics.record_config_loaded(
             r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,

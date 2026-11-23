@@ -72,14 +72,19 @@ fn since_start() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// 和 `tracing::warn!` 一样，只是同一处 [`EVERY`] 之内只记一条，带上这期间没记的次数 `skipped`（见 [`Sparse`]）
+/// 和 `tracing::warn!` 一样，只是同一处 [`EVERY`] 之内只记一条，带上这期间没记的次数 `skipped`（见 [`Sparse`]）。
+/// warn 不记时什么都不做：不读钟，也不碰各核共用的计数。伪造回包这样由对方定频率的地方每个包都走这里
 /// As `tracing::warn!`, except that one place logs once within [`EVERY`], with `skipped`, how many went
-/// unlogged meanwhile (see [`Sparse`])
+/// unlogged meanwhile (see [`Sparse`]). With warnings not logged it does nothing: no clock read, no
+/// touch of the count every core shares. Places whose rate the other side sets, forged replies, come
+/// here on every packet
 #[macro_export]
 macro_rules! warn_sparse {
     ($($arg:tt)+) => {{
         static SPARSE: $crate::sparse_log::Sparse = $crate::sparse_log::Sparse::new();
-        if let Some(skipped) = SPARSE.due() {
+        if ::tracing::enabled!(::tracing::Level::WARN)
+            && let Some(skipped) = SPARSE.due()
+        {
             ::tracing::warn!(skipped, $($arg)+);
         }
     }};

@@ -10,7 +10,6 @@ use tracing::{error, info, warn};
 
 use crate::config;
 use crate::engine::Engine;
-use crate::matcher::RuntimePipelineConfig;
 
 /// 文件写完以后（写的一方关上了它，或者改名到了位）再等这么久，把同一次保存的其它事件收齐：改名盖过目标文件时
 /// notify 报一个「改名到这里」，再报一个同时列出两端的「改名」；证书和私钥前后脚换。
@@ -33,12 +32,11 @@ pub fn spawn(path: PathBuf, engine: Engine) {
     // 使用阻塞线程持有watcher，避免异步生命周期问题。 / Use blocking thread to hold watcher, avoiding async lifetime issues.
     thread::spawn(move || {
         let result = run_files_watcher(std::slice::from_ref(&path), || {
-            // 启动时只记警告的那些写法，重载时拒绝（见 config::problems）
-            // What startup only warns about, a reload refuses (see config::problems)
+            // 启动时只记警告的那些写法，重载时拒绝（见 config::compile）
+            // What startup only warns about, a reload refuses (see config::compile)
             let loaded = config::load_config_with_source(&path).and_then(|(cfg, raw)| {
-                config::refuse_problems(&cfg)?;
                 config::warn_ignored_settings(&cfg);
-                RuntimePipelineConfig::from_config(cfg).map(|cfg| (cfg, raw))
+                config::compile(cfg).map(|cfg| (cfg, raw))
             });
             match loaded {
                 Ok((new_cfg, raw)) => {

@@ -188,28 +188,12 @@ pub struct GlobalSettings {
     /// GeoIP 数据文件路径（V2Ray .dat 格式） / GeoIP data file path (V2Ray .dat format)
     #[serde(default)]
     pub geoip_dat_path: Option<String>,
-    /// 是否自动转换 .dat 为 MMDB（默认 false）/ Auto-convert .dat to MMDB (default false)
-    #[serde(default)]
-    pub geoip_auto_convert: bool,
-    /// GeoIP 转换时过滤的国家代码列表 / Country codes to filter during GeoIP conversion
-    #[serde(default)]
-    pub geoip_filter_countries: Vec<String>,
     /// GeoSite 数据文件路径列表（V2Ray 格式，支持多个文件） / GeoSite data file paths (V2Ray format, supports multiple files)
     #[serde(default)]
     pub geosite_data_paths: Vec<String>,
     /// UDP 失败时是否自动 fallback 到 TCP（默认 true）。 / UDP failure automatically fallbacks to TCP (default true)
     #[serde(default = "default_enable_tcp_fallback")]
     pub enable_tcp_fallback: bool,
-    /// 已不起作用：开了控制通道，面板的查询排行就一直在统计。留着字段，旧配置照样能读。
-    /// No longer has any effect: with the control socket open, the panel's query
-    /// rankings are always collected. The field stays so older configs still load.
-    #[serde(default)]
-    pub statistics_enabled: bool,
-    /// 已不起作用：排行记完整的客户端地址。留着字段，旧配置照样能读。
-    /// No longer has any effect: rankings record whole client addresses. The field
-    /// stays so older configs still load.
-    #[serde(default)]
-    pub statistics_anonymize_client_ip: bool,
 }
 
 impl Default for GlobalSettings {
@@ -253,12 +237,8 @@ impl Default for GlobalSettings {
             cache_refresh_min_ttl: default_cache_refresh_min_ttl(),
             geoip_db_path: None,
             geoip_dat_path: None,
-            geoip_auto_convert: false,
-            geoip_filter_countries: Vec::new(),
             geosite_data_paths: Vec::new(),
             enable_tcp_fallback: default_enable_tcp_fallback(),
-            statistics_enabled: false,
-            statistics_anonymize_client_ip: false,
         }
     }
 }
@@ -808,11 +788,7 @@ impl GlobalSettings {
                 cache_refresh_min_ttl,
                 geoip_db_path,
                 geoip_dat_path,
-                geoip_auto_convert,
-                geoip_filter_countries,
                 geosite_data_paths,
-                statistics_enabled,
-                statistics_anonymize_client_ip,
             ],
             // 只在启动时读取 / Read at startup only
             startup: [
@@ -1297,6 +1273,24 @@ pub struct ValidationReport {
     pub rule_count: usize,
 }
 
+/// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
+/// 别的事的写法（见 [`problems`]）、编译不了的匹配器和正则，以及监听地址和 DoH 的前提（见
+/// [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
+/// 启动不走这里：那时 [`problems`] 只记警告、照旧加载
+/// A configuration compiled into its runtime form, which hot reload and the panel's validation
+/// and trial all go through, refusing what would stop the kernel at startup: what silently does
+/// something else (see [`problems`]), matchers and regexes that do not compile, and the
+/// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). Hot reload
+/// used not to check the listeners, so a mistyped `bind_udp` reloaded fine and the kernel then
+/// failed to start at the next restart. Startup does not come here: there [`problems`] are
+/// only warned about and loaded as before
+pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
+    refuse_problems(&cfg)?;
+    let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
+    runtime.settings.listeners().context("validate listeners")?;
+    Ok(runtime)
+}
+
 /// Validate configuration text exactly as the server loads it: JSON parsing,
 /// normalisation, runtime compilation (matchers, regexes, CIDRs, timeout
 /// sanity) and the listener checks done at startup
@@ -1306,10 +1300,8 @@ pub struct ValidationReport {
 /// 启动时的监听检查（绑定地址与 DoH TLS 材料）。错误带完整原因链；JSON 语法错误包含行列位置。
 pub fn validate(raw: &str) -> Result<ValidationReport> {
     let cfg = parse_config(raw)?;
-    refuse_problems(&cfg)?;
     let version = cfg.version.clone();
-    let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
-    runtime.settings.listeners().context("validate listeners")?;
+    let runtime = compile(cfg)?;
     Ok(ValidationReport {
         version,
         pipeline_count: runtime.pipelines.len(),
@@ -1418,14 +1410,20 @@ pub fn warn_ignored_settings(cfg: &PipelineConfig) {
 
 /// 以前有、后来删掉的设置：老配置里留着的照样能读，启动和重载时各记一条 warn（见 [`warn_ignored_settings`]），不算
 /// [`problems`]，升级以后不必先改配置。智能流控的五个数字在流控改为自己判断以后不再用；`prefetch` 随它的实现撤掉了；
-/// `tcp_health_check_error_threshold` 从来数不到：TCP/DoT 连接一出错就重建，不按次数
+/// `tcp_health_check_error_threshold` 从来数不到：TCP/DoT 连接一出错就重建，不按次数；排行的两个设置在排行改为一直统计、
+/// 照原样记客户端地址以后不再起作用，`geoip_auto_convert`、`geoip_filter_countries` 从来没被读过。以前这四个静默接受，
+/// 配了 `statistics_anonymize_client_ip` 的人以为地址打了码
 /// Settings there used to be and were taken out: an older configuration still writing them
 /// reads as before, each getting a warn at startup and on reload (see
 /// [`warn_ignored_settings`]) and none counting among [`problems`], so an upgrade needs no
 /// change first. The five numbers of flow control went out of use once it judged by itself;
 /// `prefetch` went with its implementation; `tcp_health_check_error_threshold` was never
-/// counted up to, a TCP/DoT connection being rebuilt on its first failure, not by count
-const RETIRED_SETTINGS: [&str; 7] = [
+/// counted up to, a TCP/DoT connection being rebuilt on its first failure, not by count; the two
+/// ranking settings stopped doing anything once rankings were always kept with whole client
+/// addresses, and `geoip_auto_convert` and `geoip_filter_countries` were never read. These four
+/// used to be taken in silence, and whoever set `statistics_anonymize_client_ip` took the
+/// addresses for masked
+const RETIRED_SETTINGS: [&str; 11] = [
     "flow_control_initial_permits",
     "flow_control_min_permits",
     "flow_control_max_permits",
@@ -1433,6 +1431,10 @@ const RETIRED_SETTINGS: [&str; 7] = [
     "flow_control_adjustment_interval_secs",
     "prefetch",
     "tcp_health_check_error_threshold",
+    "statistics_enabled",
+    "statistics_anonymize_client_ip",
+    "geoip_auto_convert",
+    "geoip_filter_countries",
 ];
 
 /// `key` 是不是一个退役的设置（见 [`RETIRED_SETTINGS`]）/ Whether `key` is a retired setting (see [`RETIRED_SETTINGS`])
@@ -1491,6 +1493,9 @@ fn names_an_address(upstreams: &str) -> bool {
     split_upstreams(upstreams).next().is_some()
 }
 
+/// `log` 动作认的级别 / The levels a `log` action takes
+const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+
 fn rule_problems(
     rule: &Rule,
     pipelines: &rustc_hash::FxHashSet<&str>,
@@ -1526,6 +1531,17 @@ fn rule_problems(
         }
     }
     for matcher in &rule.response_matchers {
+        // 以前写错的 rcode 悄悄当成 OTHER，匹配所有不常见的 RCODE，这条规则几乎永远不中
+        // A misspelt rcode used to pass for OTHER, matching every uncommon RCODE, so the rule
+        // hardly ever matched
+        if let ResponseMatcher::ResponseRcode { value } = &matcher.matcher
+            && !value.eq_ignore_ascii_case("OTHER")
+            && crate::engine::utils::parse_rcode(value).is_none()
+        {
+            report(format!(
+                "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
+            ));
+        }
         if let ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
             && value.is_empty()
         {
@@ -1599,6 +1615,14 @@ fn rule_problems(
                 if let Some(problem) = txt_size_problem(text, 1) {
                     report(problem);
                 }
+            }
+            // 以前写错的级别（比如大写的 `WARN`）悄悄当成 info / A misspelt level (an uppercase
+            // `WARN`, say) used to pass for info
+            Action::Log { level: Some(level) } if !LOG_LEVELS.contains(&level.as_str()) => {
+                report(format!(
+                    "log level \"{level}\" is none of {}",
+                    LOG_LEVELS.join(", ")
+                ));
             }
             Action::JumpToPipeline { pipeline } if !pipelines.contains(pipeline.as_str()) => {
                 report(format!(
@@ -1924,6 +1948,64 @@ mod validation_tests {
 
     fn problems_of(config: serde_json::Value) -> Vec<String> {
         super::problems(&super::parse_config(&config.to_string()).expect("parses"))
+    }
+
+    /// 回答检查里写错的 rcode、`log` 动作写错的级别都报出来；`OTHER`、小写的 rcode 和认得的级别照常。以前前者悄悄当成
+    /// OTHER，后者悄悄当成 info
+    /// A misspelt rcode in an answer check and a misspelt level of a `log` action are raised;
+    /// `OTHER`, lowercase rcodes and known levels pass. The first used to pass for OTHER, the
+    /// second for info
+    #[test]
+    fn misspelt_rcodes_and_log_levels_are_problems() {
+        let rule = |rcode: &str, level: &str| {
+            serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "log", "level": level }, { "type": "forward" }],
+                    "response_matchers": [{ "type": "response_rcode", "value": rcode }],
+                    "response_actions_on_match": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+                }] }]
+            })
+        };
+        assert_eq!(
+            problems_of(rule("SERVFAILL", "WARN")),
+            [
+                "pipeline \"main\" rule \"r\": response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
+                "pipeline \"main\" rule \"r\": log level \"WARN\" is none of trace, debug, info, warn, error",
+            ]
+        );
+        for (rcode, level) in [("OTHER", "warn"), ("other", "debug"), ("servfail", "error")] {
+            assert!(
+                problems_of(rule(rcode, level)).is_empty(),
+                "{rcode} {level}"
+            );
+        }
+    }
+
+    /// 编译配置时查监听地址和 DoH 的前提，和启动时一样：热重载以前不查，`bind_udp` 写错了照样重载成功，等到重启内核才
+    /// 起不来
+    /// Compiling a configuration checks the listener addresses and the DoH prerequisites as
+    /// startup does: hot reload used not to, so a mistyped `bind_udp` reloaded fine and the
+    /// kernel failed to start at the next restart
+    #[test]
+    fn compiling_refuses_what_would_stop_the_kernel_at_startup() {
+        for (settings, cause) in [
+            (
+                serde_json::json!({ "bind_udp": "0.0.0.0:5353x" }),
+                "parse bind addr",
+            ),
+            (
+                serde_json::json!({ "bind_doh": "0.0.0.0:443" }),
+                "doh_tls_cert is required when bind_doh is set",
+            ),
+        ] {
+            let config = serde_json::json!({ "settings": settings, "pipelines": [] });
+            let err = super::compile(super::parse_config(&config.to_string()).expect("parses"))
+                .expect_err("refused");
+            assert!(format!("{err:#}").contains(cause), "{err:#}");
+        }
     }
 
     /// 内核不读的键按路径报出来：拼错的设置、写错名字的匹配器（`matcher` 少了 s，规则就没有匹配器，匹配所有查询）、
@@ -2369,18 +2451,8 @@ mod validation_tests {
             assert_eq!(settings.cache_refresh_min_ttl, 5, "cache_refresh_min_ttl");
             assert_eq!(settings.geoip_db_path, None, "geoip_db_path");
             assert_eq!(settings.geoip_dat_path, None, "geoip_dat_path");
-            assert!(!settings.geoip_auto_convert, "geoip_auto_convert");
-            assert!(
-                settings.geoip_filter_countries.is_empty(),
-                "geoip_filter_countries"
-            );
             assert!(settings.geosite_data_paths.is_empty(), "geosite_data_paths");
             assert!(settings.enable_tcp_fallback, "enable_tcp_fallback");
-            assert!(!settings.statistics_enabled, "statistics_enabled");
-            assert!(
-                !settings.statistics_anonymize_client_ip,
-                "statistics_anonymize_client_ip"
-            );
         }
     }
 
@@ -2393,7 +2465,6 @@ mod validation_tests {
     fn written_settings_are_read_and_the_rest_take_their_defaults() {
         use super::GlobalSettings;
         {
-            let countries = serde_json::json!(["cn", "us"]);
             let read: GlobalSettings = serde_json::from_value(serde_json::json!({
                 "bind_udp": "127.0.0.1:53",
                 "bind_doh": "127.0.0.1:443",
@@ -2406,7 +2477,6 @@ mod validation_tests {
                 "request_timeout_ms": 1234,
                 "doq_enable_0rtt": false,
                 "flow_control_enabled": true,
-                "geoip_filter_countries": countries,
                 "geosite_data_paths": ["a.dat"]
             }))
             .expect("settings read");
@@ -2422,7 +2492,6 @@ mod validation_tests {
                 request_timeout_ms: Some(1234),
                 doq_enable_0rtt: false,
                 flow_control_enabled: true,
-                geoip_filter_countries: vec!["cn".to_string(), "us".to_string()],
                 geosite_data_paths: vec!["a.dat".to_string()],
                 ..GlobalSettings::default()
             };
