@@ -38,7 +38,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | tcp_pool_size | 64 | 每个上游最多几条 TCP 连接。平常只用第一条；它上面同时有 32 个以上查询没答完时，再来的查询才用后面的。 |
 | doh_pool_size | 8 | 上游不支持 HTTP/2、或设了 `HTTPS_PROXY` / `ALL_PROXY` 时，每个上游最多保留的 DoH 空闲连接数。支持 HTTP/2 的上游直连，每个工作线程最多一条，平常只用一条，忙起来的规则和 `tcp_pool_size` 一样。 |
 | dot_pool_size | 64 | 每个上游最多几条 DoT 连接，平常只用一条，规则和 `tcp_pool_size` 一样。 |
-| doq_pool_size | 16 | 每个上游的 DoQ 连接池大小。 |
+| doq_pool_size | 16 | 每个上游最多几条 DoQ 连接，平常只用一条，规则和 `tcp_pool_size` 一样。连接没了、或者查询超时而这期间连接上没有别的回答时才换新的；回答不合协议、流被重置只算这一个查询失败。 |
 | tcp_connection_max_age_seconds | 300 | TCP/DoT 连接最大存活时间；0 禁用。 |
 | tcp_connection_idle_timeout_seconds | 60 | TCP/DoT 空闲超时；0 禁用。 |
 | doq_connection_idle_timeout_seconds | 60 | DoQ 空闲超时；0 禁用。 |
