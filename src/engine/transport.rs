@@ -1964,6 +1964,20 @@ impl std::fmt::Display for DohAnswerError {
 
 impl std::error::Error for DohAnswerError {}
 
+/// 没连上 DoH 上游：TCP、TLS 或 HTTP/2 握手没成，或者还在建连失败以后的退避里。没有建好的连接可换，重建连接池、
+/// 重发都无济于事（见 [`is_transport_error`]）
+/// No connection to the DoH upstream: the TCP, TLS or HTTP/2 handshake failed, or a failed
+/// connect is still being backed off from. There is no connection made to replace, so neither
+/// rebuilding the pool nor sending again helps (see [`is_transport_error`])
+#[derive(Debug)]
+struct DohNotConnected;
+
+impl std::fmt::Display for DohNotConnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no connection to the doh upstream")
+    }
+}
+
 fn doh_answer_error(message: String) -> anyhow::Error {
     anyhow::Error::new(DohAnswerError {
         message,
@@ -2505,8 +2519,11 @@ impl DohClient {
             // :authority, with no Host header (see [`DohTarget::uri`]). hyper and reqwest add
             // content-length themselves, h2 does not
             if let Some(uri) = uri
-                && let Some((sender, _in_flight)) =
-                    state.h2.sender(url, &self.tls_h2, &self.connector).await?
+                && let Some((sender, _in_flight)) = state
+                    .h2
+                    .sender(url, &self.tls_h2, &self.connector)
+                    .await
+                    .context(DohNotConnected)?
             {
                 let request = hyper::Request::post(uri.clone())
                     .header(ACCEPT, DOH_MEDIA_TYPE)
@@ -2539,10 +2556,10 @@ impl DohClient {
         .await;
 
         // 超时算传输层错误，可以重试；内层的错误照原样交出：发送、IO、正文出错可以重试，
-        // DohAnswerError 不行（见 `is_transport_error`）
+        // DohAnswerError、DohNotConnected 不行（见 `is_transport_error`）
         // A timeout is a transport error and can be retried; inner errors go out as they
-        // are: send, IO and body errors can be retried, a DohAnswerError cannot (see
-        // `is_transport_error`)
+        // are: send, IO and body errors can be retried, a DohAnswerError or DohNotConnected
+        // cannot (see `is_transport_error`)
         result.map_err(|_elapsed| anyhow::anyhow!("doh request timeout"))?
     }
 
@@ -2594,7 +2611,7 @@ impl DohClient {
                 warn!(upstream = upstream, error = %e, "failed to rebuild DoH client, keeping old pool")
             }
         }
-        warn!(
+        crate::warn_sparse!(
             upstream = upstream,
             consecutive_errors = count,
             threshold = self.health_error_threshold,
@@ -2741,14 +2758,22 @@ where
     ))
 }
 
-/// A transport-level error is anything that is NOT an unusable answer (see
-/// [`DohAnswerError`]): timeouts, connection failures, and IO errors all indicate a
-/// possibly dead connection and are safe to retry once (DoH queries are
-/// semantically idempotent).
-/// 传输层错误 = 不是用不了的回答（见 [`DohAnswerError`]）：超时、连接失败、IO 错误都指示连接可能已死，
-/// 单次重试安全（DoH 查询语义幂等）
+/// 传输层错误：在建好的连接上收发时出的错，超时也算，连接死了多半就是这样；不是用不了的回答（见 [`DohAnswerError`]），也不是
+/// 没连上（见 [`DohNotConnected`]，reqwest 的建连错误也是）。只有它重发一次（DoH 查询语义幂等），算进重建连接池的门槛。
+/// 以前没连上也算：上游不通时每个请求都去重建一次连接池，可池里没有坏掉的连接可丢，reqwest 还要再连一次
+/// A transport-level error: one sending or receiving on a connection made, a timeout included,
+/// which is mostly how a dead connection shows; neither an unusable answer (see
+/// [`DohAnswerError`]) nor no connection (see [`DohNotConnected`], reqwest's connect errors too).
+/// Only such an error is sent again once (DoH queries are semantically idempotent) and counts
+/// toward rebuilding the pool. No connection used to count as well: with the upstream
+/// unreachable every request went to rebuild the pool, which held no broken connection to drop,
+/// and reqwest connected once more
 fn is_transport_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<DohAnswerError>().is_none()
+        && err.downcast_ref::<DohNotConnected>().is_none()
+        && !err
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect)
 }
 
 fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
@@ -5437,6 +5462,55 @@ mod tests {
             !is_transport_error(&status_err),
             "HTTP status is NOT transport-level"
         );
+
+        // 没连上也不是：没有建好的连接可换 / Nor is no connection: there is none made to replace
+        let not_connected = anyhow::anyhow!("doh tls handshake failed").context(DohNotConnected);
+        assert!(
+            !is_transport_error(&not_connected),
+            "no connection is NOT transport-level"
+        );
+    }
+
+    /// 没连上 DoH 上游（这里是 TLS 握手时连接就被关掉），直连和经 reqwest 都一样：不重发，也不算进重建连接池的门槛，没有
+    /// 建好的连接可换。以前都算，门槛是 1 时每个请求都要重建一次连接池，经 reqwest 的还要再连一次
+    /// No connection to the DoH upstream (here closed during the TLS handshake), directly or
+    /// through reqwest alike: it is not sent again and does not count toward rebuilding the pool,
+    /// there being no connection made to replace. Both used to count, so with a threshold of 1
+    /// every request rebuilt the pool, and through reqwest connected once more
+    #[tokio::test]
+    async fn a_failed_doh_connect_is_neither_sent_again_nor_counted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("https://{}/dns-query", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        for direct in [true, false] {
+            let mut client = DohClient::new(8, 1, Bootstrap::system()).expect("build doh client");
+            if !direct {
+                client.reqwest_only_for_tests();
+            }
+            let before = accepted.load(Ordering::Relaxed);
+            client
+                .send(&doh_test_query("closed"), &upstream, Duration::from_secs(2))
+                .await
+                .expect_err("no connection");
+            assert_eq!(
+                accepted.load(Ordering::Relaxed) - before,
+                1,
+                "connected once (direct = {direct})"
+            );
+            let state = client.upstreams.get(upstream.as_str()).expect("state");
+            assert_eq!(
+                state.generation.load(Ordering::Acquire),
+                0,
+                "the pool is not rebuilt (direct = {direct})"
+            );
+        }
     }
 
     #[tokio::test]
