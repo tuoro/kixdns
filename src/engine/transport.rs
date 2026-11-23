@@ -614,7 +614,7 @@ impl Drop for InFlight<'_> {
 pub(super) struct Connect<C> {
     /// 建连的任务，建完了也留着，直到有查询取走结果 / The connecting task, kept after it is through
     /// until a query takes what it made
-    task: Option<tokio::task::JoinHandle<anyhow::Result<C>>>,
+    task: Option<tokio::task::JoinHandle<Made<C>>>,
     /// 退避到什么时候，下一次失败退避多久 / Backing off until when, and for how long after the next failure
     retry_at: Option<std::time::Instant>,
     backoff: Duration,
@@ -628,6 +628,47 @@ const CONNECT_BACKOFF: Duration = Duration::from_millis(250);
 /// 建连接连失败时退避最多多久 / The longest backing off after failed connects in a row
 const CONNECT_BACKOFF_AT_MOST: Duration = Duration::from_secs(5);
 
+/// 一次建连的结果和它建完的时刻 / What a connect gave, and when it was through
+struct Made<C> {
+    outcome: anyhow::Result<C>,
+    at: std::time::Instant,
+}
+
+/// 建好以后放着没人取的连接，取用之前看一下还通不通（见 [`Connect::finish`]）/ A connection made and left
+/// waiting for a taker is checked before it is used (see [`Connect::finish`])
+pub(super) trait StillOpen {
+    /// 还能用：放着的这段时间里上游没把它关掉 / Still of use: the upstream did not close it while it waited
+    fn still_open(&mut self) -> bool;
+}
+
+/// TCP、DoT 的两半：放着的时候没人读，上游关掉了的话，FIN（DoT 还有 close_notify）已经在缓冲里，不等就读得到；
+/// 还开着时读不到任何东西（还没发查询，上游没什么可回的）
+/// The two halves of TCP or DoT: nobody read while it waited, so an upstream that closed it has
+/// left its FIN (and for DoT its close_notify) in the buffer, read at once without waiting; one
+/// still open has nothing to read (no query was sent, the upstream has nothing to answer)
+impl<R: tokio::io::AsyncRead + Unpin, W> StillOpen for (R, W) {
+    fn still_open(&mut self) -> bool {
+        let mut byte = [0u8; 1];
+        let mut probe = tokio::io::ReadBuf::new(&mut byte);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        std::pin::Pin::new(&mut self.0)
+            .poll_read(&mut cx, &mut probe)
+            .is_pending()
+    }
+}
+
+/// 新建的一条 DoQ 连接，和它有没有用 0-RTT / A DoQ connection newly made, and whether it used 0-RTT
+struct NewDoqConn {
+    conn: QuicConnection,
+    used_0rtt: bool,
+}
+
+impl StillOpen for NewDoqConn {
+    fn still_open(&mut self) -> bool {
+        self.conn.close_reason().is_none()
+    }
+}
+
 impl<C> Default for Connect<C> {
     fn default() -> Self {
         Self {
@@ -638,49 +679,80 @@ impl<C> Default for Connect<C> {
     }
 }
 
-impl<C: Send + 'static> Connect<C> {
-    /// 等在建的连接建完；没有在建的就用 `start` 起一个任务去建，退避期间不起、报错。等的时候可以取消：任务留着，下一次接着等
+impl<C: StillOpen + Send + 'static> Connect<C> {
+    /// 等在建的连接建完；没有在建的就用 `start` 起一个任务去建，退避期间不起、报错。等的时候可以取消：任务留着，下一次接着等。
+    /// 取到的是这次调用之前就建完、放着没人取的结果时：连接先看还通不通，上游关掉了就丢掉重建；失败按它发生的时刻退避，
+    /// 退避早已过去就作废重建。以前放着的连接照用，上游早关了的话查询登记上去就断，算新连接也不重发；放了几分钟的失败照样
+    /// 让查询失败，还从这一刻重新退避。最多重建一次：重建出来的不算放着的
     /// Waits for the connection being made; with none, `start` gives the task making one, except
     /// while backing off, which is an error. The wait may be cancelled: the task stays, and the
-    /// next call waits on
-    pub(super) async fn finish<F>(&mut self, start: impl FnOnce() -> F) -> anyhow::Result<C>
+    /// next call waits on. When what it gets was through before this call and left waiting for a
+    /// taker: a connection is checked first and, closed by the upstream meanwhile, dropped and made
+    /// again; a failure backs off from when it happened, and with that long past it is voided and
+    /// a connect made again. A connection left waiting used to be used as it was, breaking as a
+    /// query registered on it when the upstream had long closed it, and counting as new it was not
+    /// sent again; a failure minutes old failed the query all the same and backed off afresh from
+    /// then. At most one connect is made again: what it makes was not left waiting
+    pub(super) async fn finish<F>(&mut self, start: impl Fn() -> F) -> anyhow::Result<C>
     where
         F: Future<Output = anyhow::Result<C>> + Send + 'static,
     {
-        let task = match &mut self.task {
-            Some(task) => task,
-            None => {
-                if let Some(left) = self
-                    .retry_at
-                    .and_then(|at| at.checked_duration_since(std::time::Instant::now()))
-                {
-                    anyhow::bail!(
-                        "connect failed lately, trying again in {}ms",
-                        left.as_millis()
-                    );
+        let asked_at = std::time::Instant::now();
+        loop {
+            let task = match &mut self.task {
+                Some(task) => task,
+                None => {
+                    if let Some(left) = self
+                        .retry_at
+                        .and_then(|at| at.checked_duration_since(std::time::Instant::now()))
+                    {
+                        anyhow::bail!(
+                            "connect failed lately, trying again in {}ms",
+                            left.as_millis()
+                        );
+                    }
+                    let connect = timeout(CONNECT_BUDGET, start());
+                    self.task.insert(tokio::spawn(async move {
+                        let outcome = connect.await.unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!(
+                                "connect timeout after {}ms",
+                                CONNECT_BUDGET.as_millis()
+                            ))
+                        });
+                        Made {
+                            outcome,
+                            at: std::time::Instant::now(),
+                        }
+                    }))
                 }
-                let connect = timeout(CONNECT_BUDGET, start());
-                self.task.insert(tokio::spawn(async move {
-                    connect.await.unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!(
-                            "connect timeout after {}ms",
-                            CONNECT_BUDGET.as_millis()
-                        ))
-                    })
-                }))
+            };
+            // 建连的任务只会在 panic 时没有结果 / The connecting task has no result only on a panic
+            let Made { outcome, at } = task.await.unwrap_or_else(|panicked| Made {
+                outcome: Err(panicked.into()),
+                at: std::time::Instant::now(),
+            });
+            self.task = None;
+            let waited = at < asked_at;
+            match outcome {
+                Ok(mut made) => {
+                    if waited && !made.still_open() {
+                        continue;
+                    }
+                    self.retry_at = None;
+                    self.backoff = CONNECT_BACKOFF;
+                    return Ok(made);
+                }
+                Err(error) => {
+                    let retry_at = at + self.backoff;
+                    if waited && retry_at <= std::time::Instant::now() {
+                        continue;
+                    }
+                    self.retry_at = Some(retry_at);
+                    self.backoff = (self.backoff * 2).min(CONNECT_BACKOFF_AT_MOST);
+                    return Err(error);
+                }
             }
-        };
-        // 建连的任务只会在 panic 时没有结果 / The connecting task has no result only on a panic
-        let made = task.await.unwrap_or_else(|panicked| Err(panicked.into()));
-        self.task = None;
-        if made.is_ok() {
-            self.retry_at = None;
-            self.backoff = CONNECT_BACKOFF;
-        } else {
-            self.retry_at = Some(std::time::Instant::now() + self.backoff);
-            self.backoff = (self.backoff * 2).min(CONNECT_BACKOFF_AT_MOST);
         }
-        made
     }
 }
 
@@ -2965,7 +3037,7 @@ pub struct DoqMuxClient {
     /// 在建的连接、建连失败以后的退避（见 [`Connect`]）；等它算在各个查询自己的预算里 / The
     /// connection being made and the backing off after a failed connect (see [`Connect`]); waiting
     /// for it counts against each query's own budget
-    connecting: Mutex<Connect<(QuicConnection, bool)>>,
+    connecting: Mutex<Connect<NewDoqConn>>,
     /// 这个客户端上还没答完的查询数（见 [`least_busy`]）/ Queries on this client not yet answered (see [`least_busy`])
     in_flight: AtomicUsize,
     runtime: Arc<DoqRuntime>,
@@ -3446,7 +3518,7 @@ impl DoqMuxClient {
         if let Some(pooled) = self.usable() {
             return Ok(reused(pooled));
         }
-        let (conn, used_0rtt) = connecting
+        let NewDoqConn { conn, used_0rtt } = connecting
             .finish(|| {
                 Self::connect_new(
                     Arc::clone(&self.runtime),
@@ -3587,7 +3659,7 @@ impl DoqMuxClient {
         upstream: Arc<str>,
         target: DoqTarget,
         zero_rtt: bool,
-    ) -> anyhow::Result<(QuicConnection, bool)> {
+    ) -> anyhow::Result<NewDoqConn> {
         let addr_str = host_port(&target.host, target.port);
         let addrs = tokio::net::lookup_host(&addr_str)
             .await
@@ -3649,7 +3721,10 @@ impl DoqMuxClient {
                         upstream = %upstream,
                         "DoQ 0-RTT connection established"
                     );
-                    return Ok((conn, true));
+                    return Ok(NewDoqConn {
+                        conn,
+                        used_0rtt: true,
+                    });
                 }
                 // 0-RTT not available (no previous session), fall back to normal connect
                 // 0-RTT 不可用（无先前会话），回退到正常连接
@@ -3661,7 +3736,10 @@ impl DoqMuxClient {
 
         let connection = connecting.await.context("doq handshake failed")?;
 
-        Ok((connection, false))
+        Ok(NewDoqConn {
+            conn: connection,
+            used_0rtt: false,
+        })
     }
 }
 
@@ -4563,6 +4641,107 @@ mod tests {
             .await
             .expect("the connection made meanwhile answers at once");
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "one connection made");
+    }
+
+    /// DoT 的前置：第一条连接压 300 ms 再接到 `upstream`，接通 `first_for` 以后关掉（None 是不接通、直接关掉）；之后的
+    /// 连接马上接通、一直通着。返回地址和接下了几条连接
+    /// A DoT front: the first connection is held 300 ms before it is put through to `upstream`
+    /// and closed after `first_for` through (None: closed without being put through); later ones
+    /// are put through at once and stay so. Its address, and how many connections it accepted
+    async fn front_closing_the_first(
+        upstream: SocketAddr,
+        first_for: Option<Duration>,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let front = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the front");
+        let addr = front.local_addr().expect("read the front address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = front.accept().await {
+                let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+                tokio::spawn(async move {
+                    if first {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    let through = if first {
+                        first_for
+                    } else {
+                        Some(Duration::MAX)
+                    };
+                    let Some(through) = through else { return };
+                    let mut upstream = tokio::net::TcpStream::connect(upstream)
+                        .await
+                        .expect("reach the upstream");
+                    let _ = timeout(
+                        through,
+                        tokio::io::copy_bidirectional(&mut stream, &mut upstream),
+                    )
+                    .await;
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_connection_left_waiting_and_closed_meanwhile_is_made_again() {
+        // 发起建连的查询被取消了，连接建好以后放着，上游这期间把它关了：下一个查询先看出它关了，重建一条再答。以前照用，
+        // 登记上去就断，算新连接也不重发，查询失败
+        // The query that started the connect is cancelled, the connection made is left waiting,
+        // and the upstream closes it meanwhile: the next query sees it closed first, makes another
+        // and is answered. It used to be used as it was, breaking as the query registered, and
+        // counting as new it was not sent again, so the query failed
+        let (server, client_tls) = localhost_tls(&[]);
+        let upstream = spawn_stream_upstream(Some(server)).await;
+        let (addr, accepted) =
+            front_closing_the_first(upstream, Some(Duration::from_millis(150))).await;
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(client_tls),
+        );
+        let raced = timeout(
+            Duration::from_millis(100),
+            client.send(&udp_test_query("first.example"), Duration::from_secs(2)),
+        )
+        .await;
+        assert!(raced.is_err(), "cancelled while the handshake goes on");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        client
+            .send(&udp_test_query("second.example"), Duration::from_secs(2))
+            .await
+            .expect("answered on a connection made again");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failure_left_waiting_past_its_backoff_does_not_fail_the_next_query() {
+        // 发起建连的查询被取消了，建连随后失败、结果放着；下一个查询来时，这次失败的退避早已过去：作废，重新建连再答。
+        // 以前拿这次旧失败直接失败，还从这一刻重新退避
+        // The query that started the connect is cancelled, the connect then fails and its result
+        // is left waiting; by the time the next query comes the backing off from that failure is
+        // long over, so it is voided and a connect made again before answering. The old failure
+        // used to fail the query outright and back off afresh from then
+        let (server, client_tls) = localhost_tls(&[]);
+        let upstream = spawn_stream_upstream(Some(server)).await;
+        let (addr, accepted) = front_closing_the_first(upstream, None).await;
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(client_tls),
+        );
+        let raced = timeout(
+            Duration::from_millis(100),
+            client.send(&udp_test_query("first.example"), Duration::from_secs(2)),
+        )
+        .await;
+        assert!(raced.is_err(), "cancelled while the handshake goes on");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        client
+            .send(&udp_test_query("second.example"), Duration::from_secs(2))
+            .await
+            .expect("answered after connecting again");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

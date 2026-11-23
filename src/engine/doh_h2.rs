@@ -30,7 +30,7 @@ use rustls::pki_types::ServerName;
 use tower_service::Service;
 use url::{Host, Url};
 
-use super::transport::{Connect, InFlight, least_busy};
+use super::transport::{Connect, InFlight, StillOpen, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
 pub(crate) type H2Sender = SendRequest<Bytes>;
@@ -187,6 +187,15 @@ impl H2Link {
             slot.conn.store(None);
         }
         self.no_h2.store(false, Ordering::Relaxed);
+    }
+}
+
+/// 建好以后放着的连接：对方没选 h2 时没有连接可查；有的话要还能开新流 / A connection left waiting:
+/// with no h2 picked there is none to check; with one, it has to be open to new streams
+impl StillOpen for Option<H2Sender> {
+    fn still_open(&mut self) -> bool {
+        self.as_ref()
+            .is_none_or(|sender| open_to_new_streams(sender).is_some())
     }
 }
 
