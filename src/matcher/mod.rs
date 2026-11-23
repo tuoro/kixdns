@@ -238,12 +238,6 @@ pub struct RuntimePipeline {
     /// the same question. Answers that differ by ECS subnet do not count: the cache tells
     /// them apart by subnet (see `CacheEntry::reach`).
     pub depends_on_requester: bool,
-    /// 请求阶段有没有按请求带不带 EDNS 判断的规则。后台刷新重放的请求不带 EDNS，
-    /// 经过这样的 pipeline 的路线，刷新时不一定走得一样。
-    /// Whether any request rule matches on EDNS presence. A background refresh replays
-    /// the query without EDNS, so a route through such a pipeline may not repeat when
-    /// the answer is refreshed.
-    pub matches_edns: bool,
     /// 请求阶段有没有正则条件。规则缓存只给这样的 pipeline 存转发和跳转的决定：正则要一条条试，同一个名字
     /// 再来时值得省下；别的条件靠索引或几次比较就能算完，为每个新名字存一条缓存反而比重算还贵。规则直接
     /// 回应的决定不论哪个 pipeline 都存：快速路径靠它直接回重复的拦截查询。
@@ -869,20 +863,6 @@ pub struct RuntimeResponseMatcherWithOp {
 }
 
 impl RuntimePipelineConfig {
-    /// pipeline 的选择有没有按请求带不带 EDNS 判断。后台刷新重放的请求不带 EDNS，可能选到另一个 pipeline。
-    /// Whether pipeline selection matches on EDNS presence. A background refresh replays the
-    /// query without EDNS and may select another pipeline.
-    pub(crate) fn selection_matches_edns(&self) -> bool {
-        self.pipeline_select.iter().any(|rule| {
-            rule.matchers.iter().any(|m| {
-                matches!(
-                    m.matcher,
-                    RuntimePipelineSelectorMatcher::EdnsPresent { .. }
-                )
-            })
-        })
-    }
-
     pub fn from_config(mut cfg: PipelineConfig) -> anyhow::Result<Self> {
         // Validate cache_capacity configuration
         if cfg.settings.cache_capacity == 0 {
@@ -998,8 +978,6 @@ impl RuntimePipelineConfig {
                         | RuntimeMatcher::EdnsPresent { .. }
                 )
             });
-            let matches_edns =
-                request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::EdnsPresent { .. }));
             let matches_regex =
                 request_matchers().any(|m| matches!(m.matcher, RuntimeMatcher::DomainRegex { .. }));
             pipelines.push(RuntimePipeline {
@@ -1011,7 +989,6 @@ impl RuntimePipelineConfig {
                 rule_requester: RequesterScope::default(),
                 ecs: p.ecs.clone(),
                 depends_on_requester,
-                matches_edns,
                 matches_regex,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 geo_data: GeoData::default(),
