@@ -431,6 +431,50 @@ async fn the_mmdb_answers_country_codes_and_the_data_file_named_tags() {
     assert_eq!(ask_from(&engine, "c.test", testnet).await, Some(MATCHED));
 }
 
+/// MMDB 不被监视：原地换成新的以后，配置不变的热重载也重读它，新库马上用上。以前配置里的 GeoIP 设置没变就不重读，新库要等
+/// 重启
+/// The MMDB is not watched: once replaced in place, a hot reload with the configuration unchanged
+/// reads it again and the new database is used at once. It used not to be read again while the
+/// configuration's GeoIP settings stayed the same, the new database waiting for a restart
+#[tokio::test]
+async fn a_hot_reload_reads_an_mmdb_replaced_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("mmdb-source.json");
+    let mmdb = dir.path().join("country.mmdb");
+    let convert = |country: &str| {
+        let entries =
+            format!(r#"{{"entries":[{{"country_code":"{country}","ips":["198.51.100.0/24"]}}]}}"#);
+        std::fs::write(&source, entries).unwrap();
+        crate::matcher::geoip::GeoIpManager::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+    };
+    convert("US");
+    let cfg = || {
+        config(
+            json!({ "geoip_db_path": mmdb.to_str().unwrap() }),
+            json!({ "type": "geoip_country", "country_codes": ["JP"] }),
+        )
+    };
+    let client: SocketAddr = "198.51.100.7:53000".parse().unwrap();
+    let engine = engine(cfg());
+    assert_ne!(
+        ask_from(&engine, "before.test", client).await,
+        Some(MATCHED)
+    );
+
+    // 一样长的库，写明晚一秒，像隔了一阵才换上的那样 / A database as long, set a second later, as
+    // for one replaced a while on
+    convert("JP");
+    let later = std::fs::metadata(&mmdb).unwrap().modified().unwrap() + Duration::from_secs(1);
+    std::fs::File::options()
+        .write(true)
+        .open(&mmdb)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    engine.reload(cfg());
+    assert_eq!(ask_from(&engine, "after.test", client).await, Some(MATCHED));
+}
+
 /// GeoIP .dat 内容：一个标签一个 IPv4 网段 / GeoIP .dat content: one tag with one IPv4 network
 fn geoip_dat(tag: &str, network: [u8; 4], prefix: u8) -> Vec<u8> {
     // CIDR { ip, prefix (varint) }

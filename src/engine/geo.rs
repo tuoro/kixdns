@@ -197,7 +197,13 @@ impl GeoSources {
             self.geosite = load_geosite(spec, geosite, &self.rotation);
         }
         let spec = GeoIpSpec::of(cfg);
-        if !self.geoip.is_current(&spec) {
+        // MMDB 不被监视：热重载时它换过了也要重新读（见 `GeoIpManager::mmdb_replaced`）/ The MMDB is not
+        // watched: a hot reload reads it again once it was replaced (see `GeoIpManager::mmdb_replaced`)
+        let mmdb_replaced = spec
+            .db_path
+            .as_deref()
+            .is_some_and(|path| geoip.read().mmdb_replaced(path));
+        if !self.geoip.is_current(&spec) || mmdb_replaced {
             info!(target = "geoip", tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
             self.geoip.watch = None;
             let in_use = self.geoip.spec.dat_path.clone();
