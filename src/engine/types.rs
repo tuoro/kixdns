@@ -27,13 +27,13 @@ pub type InflightMap = DashMap<u64, InflightEntry, FxBuildHasher>;
 pub type InflightResult = Option<Bytes>;
 
 /// 一个请求在 inflight 表里登记或等待时问的是什么：算它的 inflight 键用到的全部输入（见
-/// `Engine::cache_keys`）。键只是这些输入的哈希，而且不带密钥，落在同一个键上的两个不同问题可以算出来；
+/// `Engine::cache_keys`）。键只是这些输入的哈希，带了密钥也难免有两个不同问题落在同一个键上；
 /// 所以登记时把问题存进条目，等待之前先核对（见 `InflightEntry::asks`），对不上就自己转发。
 /// What a request registers or waits under in the inflight map: everything its inflight key is
-/// computed from (see `Engine::cache_keys`). The key is only a hash of these, and an unkeyed one, so
-/// two different questions landing on one key can be computed; the question is therefore stored in the
-/// entry when it is registered and checked before waiting (see `InflightEntry::asks`), and a request
-/// whose question differs forwards by itself.
+/// computed from (see `Engine::cache_keys`). The key is only a hash of these, keyed or not, and two
+/// different questions may still land on one key; the question is therefore stored in the entry when
+/// it is registered and checked before waiting (see `InflightEntry::asks`), and a request whose
+/// question differs forwards by itself.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InflightQuestion<'a> {
     pub namespace: u64,

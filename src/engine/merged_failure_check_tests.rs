@@ -389,6 +389,7 @@ fn cache_expired(engine: &Engine, pipeline: &str, qname: &str) {
             qname,
             Arc::from(pipeline),
             u16::from(RecordType::A),
+            u16::from(DNSClass::IN),
             crate::proto_utils::QueryFlags::RECURSIVE,
             0,
         )

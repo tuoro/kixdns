@@ -226,19 +226,18 @@ pub(crate) const REFRESHES_AT_ONCE: usize = 128;
 /// ECS，这样 ECS（RFC 7871）和 pipeline 选择都和那个请求一样。
 ///
 /// `renewed` is the cached answer to renew, in slot `slot`: its question
-/// (pipeline, name, type) is the one replayed, in class `qclass`.
-/// `renewed` 是槽位 `slot` 里要更新的那份应答：重放的就是它的问题（pipeline、名字、类型），
-/// 类别为 `qclass`。
+/// (pipeline, name, type, class) is the one replayed.
+/// `renewed` 是槽位 `slot` 里要更新的那份应答：重放的就是它的问题（pipeline、名字、类型、类别）。
 pub fn spawn_background_refresh(
     engine: &Engine,
     state: &Arc<EngineInner>,
     renewed: &Arc<crate::cache::CacheEntry>,
     slot: u64,
-    qclass: DNSClass,
     requester: Requester,
 ) {
     let (pipeline_id, qname) = (renewed.pipeline_id.as_ref(), renewed.qname.as_ref());
     let qtype = RecordType::from(renewed.qtype);
+    let qclass = DNSClass::from(renewed.qclass);
     // 先打上刷新标记，打不上就是已经有人在刷新（见 `RefreshingGuard::try_new`）；guard 在任务
     // 结束时清掉标记，下面提前返回时也一样
     // Set the refresh mark first; failing that, someone is refreshing already (see

@@ -1,9 +1,9 @@
-use rustc_hash::FxHasher;
 use std::cell::Cell;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher, RandomState};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -444,6 +444,17 @@ impl Engine {
         h.finish()
     }
 
+    /// 算槽位号和 inflight 键的哈希，先写进问题。带密钥（SipHash），密钥每个进程随机取一份：问题名是请求方随意挑的，
+    /// 不带密钥的哈希（以前的 FxHash 对同样长的输入，换什么初值都撞在一起），请求方就能算出一串落在同一个槽位上的名字，
+    /// 挤掉别人存着的应答，也能让 inflight 表的同一个桶越排越长。问题名带着长度写入（已经是小写，见 `parse_quick`），两个
+    /// 不同的问题写进去的不会是同一串字节
+    /// The hasher of slot numbers and inflight keys, with the question written in. It is
+    /// keyed (SipHash), the key drawn at random once per process: the question name is the
+    /// requester's to pick, and with an unkeyed hash (the FxHash this used, whose collisions
+    /// between inputs of one length hold whatever it starts from) a requester could work out
+    /// a run of names landing in one slot, pushing out the answers others have cached, or
+    /// piling up in one bucket of the inflight map. The name goes in with its length (it is
+    /// lowercase already, see `parse_quick`), so no two questions write the same bytes
     #[inline]
     fn question_hasher(
         cache_namespace: u64,
@@ -452,18 +463,13 @@ impl Engine {
         qtype: hickory_proto::rr::RecordType,
         qclass: hickory_proto::rr::DNSClass,
         flags: crate::proto_utils::QueryFlags,
-    ) -> FxHasher {
-        let mut h = FxHasher::default();
+    ) -> DefaultHasher {
+        static KEYS: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+        let mut h = KEYS.build_hasher();
         cache_namespace.hash(&mut h);
         pipeline_id.hash(&mut h);
-        // Hash qname case-insensitively without allocation / 不分配内存地进行不区分大小写的 qname 哈希
-        // qname is already lowercased from parse_quick() / qname 已经在 parse_quick() 中转为小写
-        for b in qname {
-            h.write_u8(*b);
-        }
-        // RecordType implements Copy+Debug, hash by its u16 representation / RecordType 实现了 Copy+Debug，使用其 u16 表示进行哈希
+        qname.hash(&mut h);
         u16::from(qtype).hash(&mut h);
-        // DNSClass implements Copy+Debug, hash by its u16 representation / DNSClass 实现了 Copy+Debug，使用其 u16 表示进行哈希
         u16::from(qclass).hash(&mut h);
         flags.bits().hash(&mut h);
         h
@@ -790,7 +796,8 @@ impl Engine {
             &CachedQuestion {
                 qname: qname_str,
                 pipeline_id,
-                qtype: u16::from(qtype),
+                qtype: q.qtype,
+                qclass: q.qclass,
                 flags: q.flags,
             },
         ) {
@@ -882,7 +889,7 @@ impl Engine {
                             remaining_ttl = remaining_ttl,
                             "triggering background cache refresh"
                         );
-                        self.spawn_background_refresh(&state, &hit, slot, qclass, requester);
+                        self.spawn_background_refresh(&state, &hit, slot, requester);
                     }
                 }
 
@@ -1364,6 +1371,7 @@ impl Engine {
                 &route.trail,
                 request.qname,
                 u16::from(request.qtype),
+                u16::from(request.qclass),
                 request.flags,
             );
         }
@@ -1620,6 +1628,7 @@ impl Engine {
                             packet,
                             qname: request.qname,
                             qtype: request.qtype,
+                            qclass: request.qclass,
                             pipeline_id: &route.key_pipeline,
                             slot: route.keys.slot,
                             flags: request.flags,
@@ -1793,12 +1802,9 @@ impl Engine {
         state: &Arc<EngineInner>,
         renewed: &Arc<CacheEntry>,
         slot: u64,
-        qclass: DNSClass,
         requester: Requester,
     ) {
-        crate::engine::refresh::spawn_background_refresh(
-            self, state, renewed, slot, qclass, requester,
-        )
+        crate::engine::refresh::spawn_background_refresh(self, state, renewed, slot, requester)
     }
 
     /// Construct standard DNS query packet using hickory_proto
@@ -1959,6 +1965,7 @@ impl Request<'_> {
             qname: self.qname,
             pipeline_id: &target.pipeline,
             qtype: u16::from(self.qtype),
+            qclass: u16::from(self.qclass),
             flags: self.flags,
         };
         engine.drop_refreshed(target.slot, &question, &self.requester.ecs_view(), target);
@@ -2149,7 +2156,7 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::rdata::A;
     use hickory_proto::rr::{Name, RData, Record, RecordType};
-    use rustc_hash::FxHashMap;
+    use rustc_hash::{FxHashMap, FxHasher};
     use std::net::IpAddr;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -2224,6 +2231,7 @@ mod tests {
                 "example.com",
                 Arc::from("main"),
                 u16::from(RecordType::A),
+                u16::from(DNSClass::IN),
                 crate::proto_utils::QueryFlags::RECURSIVE,
                 60,
             ),
@@ -2516,14 +2524,17 @@ mod tests {
         request.to_vec().unwrap()
     }
 
-    /// 两个落在同一个 inflight 键上的不同名字。FxHasher 对每个字节算 (h + b) * K mod 2^64，两个等长的名字
-    /// 只在第一个标签上不同时，两个键的差是各字节的差乘上 K 的各次幂之和，与前面写入的命名空间和 pipeline
-    /// 无关。用格基约简找到一组都在 ±25 以内、这个和为 0 的差，换成小写字母就是这两个标签。
-    /// Two different names landing on one inflight key. FxHasher computes (h + b) * K mod 2^64 for
-    /// every byte, so for two names of equal length that differ only in their first label the keys
-    /// differ by the byte differences times powers of K, summed, whatever namespace and pipeline were
-    /// written before. Lattice reduction found differences within ±25 for which that sum is zero,
-    /// and lowercase letters spell them as these two labels.
+    /// 两个按以前的写法（逐字节写进不带密钥的 FxHash）落在同一个槽位、同一个 inflight 键上的不同名字。FxHasher 对每个
+    /// 字节算 (h + b) * K mod 2^64，两个等长的名字只在第一个标签上不同时，两个键的差是各字节的差乘上 K 的各次幂之和，
+    /// 与前面写入的命名空间和 pipeline 无关。用格基约简找到一组都在 ±25 以内、这个和为 0 的差，换成小写字母就是这两个
+    /// 标签。键带了密钥以后它们落在不同的地方（见 `names_made_to_collide_in_an_unkeyed_hash_land_apart`）
+    /// Two different names landing on one slot and one inflight key the way keys used to be
+    /// made (written byte by byte into the unkeyed FxHash). FxHasher computes (h + b) * K mod
+    /// 2^64 for every byte, so for two names of equal length that differ only in their first label
+    /// the keys differ by the byte differences times powers of K, summed, whatever namespace and
+    /// pipeline were written before. Lattice reduction found differences within ±25 for which
+    /// that sum is zero, and lowercase letters spell them as these two labels. With keys keyed
+    /// they land apart (see `names_made_to_collide_in_an_unkeyed_hash_land_apart`)
     const COLLIDING_NAMES: [&str; 2] = [
         "abacaacgbafgoaca.example.com",
         "jafaekaaaiaaaaad.example.com",
@@ -2738,18 +2749,41 @@ mod tests {
         }
     }
 
+    /// 请求方能凑出一串落在同一个槽位、同一个 inflight 键上的名字，挤掉别人存着的应答，排长 inflight 表的一个桶。键带了
+    /// 密钥，以前撞在一起的名字现在落在不同的地方
+    /// A requester used to be able to make up a run of names landing on one slot and one
+    /// inflight key, pushing out the answers others had cached and piling up one bucket of the
+    /// inflight map. With keys keyed, names that used to collide land apart
+    #[test]
+    fn names_made_to_collide_in_an_unkeyed_hash_land_apart() {
+        let [first, second] = COLLIDING_NAMES.map(|name| {
+            Engine::cache_keys(
+                0,
+                "main",
+                name.as_bytes(),
+                RecordType::A,
+                DNSClass::IN,
+                crate::proto_utils::QueryFlags::RECURSIVE,
+                &RequesterKey::NONE,
+                None,
+            )
+        });
+        assert_ne!(first.slot, second.slot);
+        assert_ne!(first.inflight, second.inflight);
+    }
+
+    /// 合并只合并问同一个问题的请求。另一个问题的条目落在同一个键上时（键只是哈希，见 `InflightQuestion`；带了密钥，两个
+    /// 问题撞上只能是碰巧，这里直接把那个条目放上去），请求自己去问，拿到自己问题的应答，不挂在那个条目上，也什么都不交给它
     /// Merging only merges requests asking the same question. When another question's entry lands
-    /// on the same key, the request forwards by itself and gets the answer to its own question,
-    /// not the other question's answer that entry hands out.
+    /// on the same key (the key is only a hash, see `InflightQuestion`; keyed, two questions
+    /// collide by chance alone, and the entry is put there directly here), the request forwards
+    /// by itself and gets the answer to its own question, joining that entry and handing it
+    /// nothing.
     #[tokio::test]
     async fn a_request_never_takes_another_questions_answer_from_a_shared_key() {
-        let slow = answering_upstream_after(
-            "192.0.2.20".parse().unwrap(),
-            300,
-            Duration::from_millis(200),
-        )
-        .await;
-        for action in forwarding_actions(&slow.address) {
+        let upstream = answering_upstream("192.0.2.20".parse().unwrap(), 300).await;
+        let [other, asked] = COLLIDING_NAMES;
+        for action in forwarding_actions(&upstream.address) {
             let (engine, steps) = engine_with_steps(config_with_default_upstream(
                 serde_json::json!([]),
                 serde_json::json!([{ "id": "main", "rules": [{
@@ -2757,71 +2791,45 @@ mod tests {
                     "matchers": [{ "type": "any" }],
                     "actions": [action]
                 }] }]),
-                &slow.address,
+                &upstream.address,
             ));
-            let keys = COLLIDING_NAMES.map(|name| {
-                Engine::cache_keys(
-                    engine.state.load().cache_namespace("main"),
-                    "main",
-                    name.as_bytes(),
-                    RecordType::A,
-                    DNSClass::IN,
-                    crate::proto_utils::QueryFlags::RECURSIVE,
-                    &RequesterKey::NONE,
-                    None,
-                )
-                .inflight
-            });
-            assert_eq!(
-                keys[0], keys[1],
-                "the two names land on the same inflight key"
+            let namespace = engine.state.load().cache_namespace("main");
+            let question = |name: &'static str| InflightQuestion {
+                flags: crate::proto_utils::QueryFlags::of(&query_for(name)),
+                namespace,
+                pipeline_id: "main",
+                qname: name.as_bytes(),
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                requester: RequesterKey::NONE,
+                client_ecs: None,
+            };
+            // 另一个问题的条目，放在这个问题的 inflight 键下 / Another question's entry under this
+            // question's inflight key
+            let (owner, waiting) = tokio::sync::watch::channel(None);
+            engine.inflight.insert(
+                question(asked).key(),
+                InflightEntry::new(&question(other)).with_channel(owner),
             );
 
-            let before = slow.queries();
-            let [_, second] =
-                ask_colliding_names(&engine, ["10.0.0.1:53000", "10.0.0.1:53001"]).await;
+            let before = upstream.queries();
+            let reply = engine
+                .handle_packet(&query_for(asked), "10.0.0.1:53000".parse().unwrap())
+                .await
+                .expect("an answer");
+            assert_eq!(answered_name(&reply), format!("{asked}."), "{action}");
             assert_eq!(
-                answered_name(&second),
-                format!("{}.", COLLIDING_NAMES[1]),
-                "{action}"
+                upstream.queries() - before,
+                1,
+                "{action}: asked upstream itself"
             );
-            assert_eq!(
-                slow.queries() - before,
-                2,
-                "{action}: each name asked upstream itself"
-            );
-            // 第二个问题自己的转发发出时，第一个的转发还在等慢上游：它查到的键正被别的问题占着，自己去问，
-            // 没有挂上去
-            // The second question's own forward went out while the first's still waited on the
-            // slow upstream: the key it looked up was held by another question, and it asked
-            // itself rather than join
+            assert!(!steps.joined("10.0.0.1:53000"), "{action}");
             assert!(
-                steps.forwarded_while_waiting(
-                    ("10.0.0.1:53000", &slow.address),
-                    ("10.0.0.1:53001", &slow.address)
-                ),
-                "{action}: {:?}",
-                steps.taken()
+                !waiting
+                    .has_changed()
+                    .expect("the entry's owner is still there"),
+                "{action}: nothing handed to the other question's entry"
             );
-            assert!(!steps.joined("10.0.0.1:53001"), "{action}");
-
-            // 对照：两个请求问同一个问题、时序一样，第二个挂在第一个的条目上，拿到第一个的应答，上游只问一次
-            // Control: two requests asking the same question with the same timing; the second
-            // joins the first one's entry and takes its answer, and the upstream is asked once
-            let before = slow.queries();
-            let [_, second] = ask_two(
-                &engine,
-                [SAME_NAME; 2],
-                ["10.0.0.1:53002", "10.0.0.1:53003"],
-            )
-            .await;
-            assert_eq!(answered_name(&second), format!("{SAME_NAME}."), "{action}");
-            assert!(
-                steps.joined("10.0.0.1:53003"),
-                "{action}: {:?}",
-                steps.taken()
-            );
-            assert_eq!(slow.queries() - before, 1, "{action}: asked once");
         }
     }
 
@@ -2882,11 +2890,10 @@ mod tests {
                 2,
                 "{action}: each name asked upstream itself"
             );
-            // 第二个问题自己的转发发出时，第一个的转发还在等慢上游：它查到的键正被别的问题占着，自己去问，
-            // 没有挂上去
+            // 第二个问题自己的转发发出时，第一个的转发还在等慢上游：它持有跳转之前登记的条目，自己去问，没有挂上去
             // The second question's own forward went out while the first's still waited on the
-            // slow upstream: the key it looked up was held by another question, and it asked
-            // itself rather than join
+            // slow upstream: holding the entry it registered before its jump, it asked itself
+            // rather than join
             assert!(
                 steps.forwarded_while_waiting(
                     ("10.0.0.1:53000", &slow.address),
@@ -5372,6 +5379,7 @@ mod tests {
             qname: Arc::from("stale.com"),
             pipeline_id: Arc::from(pipeline_id),
             qtype: u16::from(RecordType::A),
+            qclass: u16::from(DNSClass::IN),
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5,
             reach: Default::default(),
@@ -6257,7 +6265,6 @@ mod tests {
                             &engine.state.load_full(),
                             &renewed,
                             slot,
-                            DNSClass::IN,
                             requester,
                         );
                     });
@@ -6292,7 +6299,6 @@ mod tests {
             &engine.state.load_full(),
             &renewed,
             dedupe_hash,
-            DNSClass::IN,
             Requester {
                 address: "127.0.0.1".parse().unwrap(),
                 edns: false,

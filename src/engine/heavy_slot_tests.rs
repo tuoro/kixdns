@@ -26,6 +26,7 @@ fn large(reach: EcsReach) -> Arc<CacheEntry> {
             "name.test",
             Arc::from("main"),
             1,
+            1,
             QueryFlags::RECURSIVE,
             300,
         )
