@@ -29,7 +29,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | bind_doh | null | Inbound DoH listen address; null disables it. |
 | doh_tls_cert | null | PEM certificate path; required with bind_doh. |
 | doh_tls_key | null | PEM private-key path; required with bind_doh. |
-| doh_path | /dns-query | Inbound DoH request path. |
+| doh_path | /dns-query | Inbound DoH request path, starting with `/`; one that does not matches no request and counts as a configuration problem (see below). |
 | default_upstream | 1.1.1.1:53 | Default upstream. A comma-separated list is accepted. |
 | bootstrap | empty | The plain DNS servers that resolve upstreams written with a host name (TCP, DoT, DoH, DoQ), comma-separated `IP:port`, asked over UDP; they are asked together and the first to answer with addresses is taken. The addresses are kept for their TTL, and once it is past and none of the servers can be asked, the last ones stay in use. Unset, the system resolver has them: should that be KixDNS itself, resolving an upstream's name comes back round to KixDNS and the upstream cannot be reached, so then the first name the system resolves logs a warning. An upstream written as an IP needs no resolving. |
 | upstream_timeout_ms | 9000 | Timeout for one upstream operation; must be greater than zero. A UDP forward with no reply after what the slowest one percent of this upstream's latest answers took sends the query again (waiting 50 ms at least and a third of the timeout at most, a third while this upstream has not answered yet), and for the whole of the timeout from then on whichever of the two is answered first is used. |

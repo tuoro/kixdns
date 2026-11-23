@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
-use ipnet::IpNet;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
@@ -1006,61 +1005,17 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
     Ok((cfg, raw))
 }
 
-/// Parse and normalize a configuration from its JSON text without touching
-/// the filesystem. Errors from the JSON layer carry line/column positions.
-/// 从 JSON 文本解析并规范化配置，不访问文件系统。JSON 层错误带行列位置。
+/// 从 JSON 文本解析配置，找出写了却不读的键（见 [`unread_keys`]），不访问文件系统。JSON 层的错误带行列位置。
+/// 预先算好的东西（拆好的上游、合并的转发）编译时才算（见 `RuntimePipelineConfig::from_config`），只算一遍；编译不了的
+/// 写法（比如写错的网段）也在编译时连同位置报出来
+/// Parse a configuration from its JSON text, finding the keys it writes that are not read (see
+/// [`unread_keys`]), without touching the filesystem. Errors from the JSON layer carry
+/// line/column positions. What is worked out ahead of time (the upstreams split, the merged
+/// forwards) is worked out once, as it compiles (see `RuntimePipelineConfig::from_config`), and
+/// what cannot be compiled (a mistyped network, say) is reported there with its place
 pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
     let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
     cfg.unread_keys = unread_keys(raw, &serde_json::to_value(&cfg)?)?;
-
-    // 预分割上游字符串，转发时不必每次再拆；默认上游有几个时同时问 / Pre-split the upstream
-    // strings so a forward does not split them each time; several default upstreams are
-    // asked at once
-    cfg.settings.pre_split_default_upstream();
-
-    for pipeline in &mut cfg.pipelines {
-        for rule in &mut pipeline.rules {
-            for action in &mut rule.actions {
-                action.pre_split_upstreams();
-            }
-            // Pre-compute merged Forward upstreams for multi-Forward rules (performance optimization).
-            // Eliminates per-request FxHashSet + format! + join overhead on the hot path.
-            // 预计算多 Forward 规则的合并上游（性能优化）。
-            // 消除热路径上每请求的 FxHashSet + format! + join 开销。
-            rule.compute_merged_forward();
-            // 下面的 CIDR 只在这里先解析一遍，好早点报出写错的；匹配器建好时会再解析
-            // The CIDRs below are parsed here only to report a bad one early; the matchers
-            // parse them again when built
-            for matcher in &rule.matchers {
-                if let Matcher::ClientIp { cidr } = &matcher.matcher {
-                    let _parsed: IpNet = cidr.parse()?;
-                }
-            }
-            for matcher in &rule.response_matchers {
-                if let ResponseMatcher::RequestDomainSuffix { value } = &matcher.matcher
-                    && value.is_empty()
-                {
-                    anyhow::bail!("response_matcher request_domain_suffix empty");
-                }
-                if let ResponseMatcher::ResponseUpstreamIp { cidr }
-                | ResponseMatcher::ResponseAnswerIp { cidr } = &matcher.matcher
-                {
-                    for part in cidr.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                        let _parsed: IpNet = part.parse()?;
-                    }
-                }
-            }
-        }
-    }
-
-    for sel in &cfg.pipeline_select {
-        for m in &sel.matchers {
-            if let PipelineSelectorMatcher::ClientIp { cidr } = &m.matcher {
-                let _parsed: IpNet = cidr.parse()?;
-            }
-        }
-    }
-
     Ok(cfg)
 }
 
@@ -1390,11 +1345,11 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         .next()
         .is_none()
     {
-        found.push(format!("default_upstream: {NO_UPSTREAM}"));
+        found.push(format!("settings.default_upstream: {NO_UPSTREAM}"));
     }
     for upstream in split_upstreams(&cfg.settings.default_upstream) {
         if let Some(problem) = crate::engine::upstream::upstream_problem(upstream, Transport::Udp) {
-            found.push(format!("default_upstream: {problem}"));
+            found.push(format!("settings.default_upstream: {problem}"));
         }
     }
     // bootstrap 自己就是解析上游名字的，只能写成 IP 和端口，经 UDP 问 / bootstrap is what resolves
@@ -1403,12 +1358,21 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         if let Err(error) = crate::engine::transport::check_upstream_address(server, Transport::Udp)
         {
             found.push(format!(
-                "bootstrap: server \"{server}\" is not usable: {error:#}"
+                "settings.bootstrap: server \"{server}\" is not usable: {error:#}"
             ));
         }
     }
+    // 请求的路径总以 `/` 开头，不以它开头的 doh_path 谁也对不上，DoH 对每个请求都回 404 / A request
+    // path always starts with `/`, so a doh_path not starting with it matches no request and DoH
+    // answers 404 to every one
+    if !cfg.settings.doh_path.starts_with('/') {
+        found.push(format!(
+            "settings.doh_path: \"{}\" does not start with \"/\", so it matches no request and DoH answers every query with 404",
+            cfg.settings.doh_path
+        ));
+    }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
-        let place = format!("pipeline_select {}", index + 1);
+        let place = format!("pipeline_select[{index}]");
         if !pipelines.contains(select.pipeline.as_str()) {
             found.push(format!("{place}: no pipeline \"{}\"", select.pipeline));
         }
@@ -1439,21 +1403,22 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     for pipeline in &cfg.pipelines {
         *written.entry(pipeline.id.as_str()).or_default() += 1;
     }
-    for pipeline in &cfg.pipelines {
+    for (index, pipeline) in cfg.pipelines.iter().enumerate() {
         if let Some(times) = written.remove(pipeline.id.as_str())
             && times > 1
         {
             found.push(format!(
-                "pipeline \"{}\": {times} pipelines are written with this id; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
+                "pipelines[{index}]: {times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
                 pipeline.id
             ));
         }
     }
-    for pipeline in &cfg.pipelines {
-        for rule in &pipeline.rules {
-            let place = format!("pipeline \"{}\" rule \"{}\"", pipeline.id, rule.name);
+    // 规则按位置报，和读不懂的键一样：名字可以重复，按名字说不清是哪一条 / Rules are raised by place,
+    // as the keys not read are: names may repeat, and a name may not tell which rule it is
+    for (i, pipeline) in cfg.pipelines.iter().enumerate() {
+        for (j, rule) in pipeline.rules.iter().enumerate() {
             rule_problems(rule, &pipelines, |problem| {
-                found.push(format!("{place}: {problem}"))
+                found.push(format!("pipelines[{i}].rules[{j}]: {problem}"))
             });
         }
     }
@@ -1810,7 +1775,8 @@ fn rule_problems(
                 "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
             ));
         }
-        if let ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
+        if let ResponseMatcher::RequestDomainSuffix { value }
+        | ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
             && value.is_empty()
         {
             report(EMPTY_DOMAIN_MATCHER.to_string());
@@ -1956,6 +1922,40 @@ mod merged_forward_tests {
             .collect();
         list.sort();
         list
+    }
+
+    /// 不经 `parse_config`、直接拿一份 `PipelineConfig` 编译的配置，几个 forward 也合成一次转发、上游也先拆好：这些都在
+    /// 编译时算。以前只有 `parse_config` 算，公开的 `RuntimePipelineConfig::from_config` 拿到别处建的配置时不合并，
+    /// 规则只问第一个 forward 的上游
+    /// A configuration compiled from a `PipelineConfig` straight, not through `parse_config`, merges
+    /// its forwards and splits their upstreams too, both being worked out as it compiles. Only
+    /// `parse_config` used to, so the public `RuntimePipelineConfig::from_config` given a
+    /// configuration built elsewhere merged nothing, and the rule asked the first forward's
+    /// upstream alone
+    #[test]
+    fn a_configuration_compiled_without_parse_config_merges_its_forwards() {
+        let config: super::PipelineConfig = serde_json::from_value(json!({
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "any" }],
+                "actions": [
+                    { "type": "forward", "upstream": "1.1.1.1:53, 1.0.0.1:53" },
+                    { "type": "forward", "upstream": "8.8.8.8:53" }
+                ]
+            }] }]
+        }))
+        .expect("parse config");
+        let runtime = crate::matcher::RuntimePipelineConfig::from_config(config).expect("compiles");
+        let rule = &runtime.pipelines[0].rules[0];
+        let merged = rule
+            .merged_forward
+            .as_ref()
+            .expect("several forwards merge");
+        assert_eq!(merged.upstream_list.len(), 3);
+        assert!(matches!(
+            &rule.actions[0],
+            super::Action::Forward { pre_split_upstreams: Some(split), .. } if split.len() == 2
+        ));
     }
 
     /// 合并后的这一次转发只能发一个 ECS：几个 forward 的 ecs 写得一样时就是它；写得不一样（包括有的写、
@@ -2246,7 +2246,7 @@ mod validation_tests {
             { "type": "domain_suffix", "value": "cn" },
             { "type": "domain_suffix", "value": "com" },
         ]);
-        let rule = "pipeline \"main\" rule \"r\": ";
+        let rule = "pipelines[0].rules[0]: ";
         let raised = |what: &str, matchers: &str| {
             format!(
                 "{what} on the first of {matchers} has nothing before it and does not negate it; to match what it does not, put {{\"type\": \"any\"}} first"
@@ -2257,7 +2257,7 @@ mod validation_tests {
             assert_eq!(
                 problems_of(config(matchers.clone(), operator)),
                 [
-                    format!("pipeline_select 1: {}", raised("and_not", "matchers")),
+                    format!("pipeline_select[0]: {}", raised("and_not", "matchers")),
                     format!("{rule}{}", raised("and_not", "matchers")),
                     answer.clone(),
                 ],
@@ -2295,8 +2295,8 @@ mod validation_tests {
         assert_eq!(
             problems_of(rule("SERVFAILL", "WARN")),
             [
-                "pipeline \"main\" rule \"r\": response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
-                "pipeline \"main\" rule \"r\": log level \"WARN\" is none of trace, debug, info, warn, error",
+                "pipelines[0].rules[0]: response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
+                "pipelines[0].rules[0]: log level \"WARN\" is none of trace, debug, info, warn, error",
             ]
         );
         for (rcode, level) in [("OTHER", "warn"), ("other", "debug"), ("servfail", "error")] {
@@ -2446,10 +2446,16 @@ mod validation_tests {
             ]}]
         });
         let found = problems_of(config);
-        for place in ["pipeline_select 1", "rule \"exact\"", "rule \"late\""] {
+        for place in [
+            "pipeline_select[0]",
+            "pipelines[0].rules[0]",
+            "pipelines[0].rules[1]",
+        ] {
             assert!(
-                found.iter().any(|problem| problem.contains(place)
-                    && problem.contains("empty domain_exact matches only the root name")),
+                found
+                    .iter()
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("empty domain_exact matches only the root name")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2521,11 +2527,16 @@ mod validation_tests {
             ]}]
         });
         let found = problems_of(config);
-        for place in ["default_upstream", "rule \"empty\"", "rule \"commas\""] {
+        for place in [
+            "settings.default_upstream",
+            "pipelines[0].rules[0]",
+            "pipelines[0].rules[1]",
+        ] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("no upstream")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2634,18 +2645,17 @@ mod validation_tests {
                 "response_actions_on_miss": [forward("")]
             }
         ])));
-        for place in ["rule \"all empty\"", "rule \"answer\""] {
+        for place in ["pipelines[0].rules[0]", "pipelines[0].rules[1]"] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("no upstream")),
                 "missing {place} in {found:#?}"
             );
         }
     }
 
-    /// 会悄悄做成别的事的写法，每一种都报出来，带上在哪条规则
-    /// Every way of writing that silently does something else is named, with where it is
     /// 一条规则里几个 forward 的 ecs 写得不一样时（包括有的写、有的不写），是一条配置问题：写明规则，说清怎么改。
     /// 写得一样、都不写、只有一个 forward 时不算
     /// A rule whose forwards write different ecs (some written and some not, too) is a
@@ -2678,10 +2688,10 @@ mod validation_tests {
         });
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:?}");
-        for place in ["mixed", "half"] {
+        for place in ["pipelines[0].rules[0]", "pipelines[0].rules[1]"] {
             assert!(
                 found.iter().any(|problem| {
-                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                    problem.starts_with(&format!("{place}: "))
                         && problem.contains("ecs settings differ")
                         && problem.contains("separate rules")
                 }),
@@ -2690,28 +2700,70 @@ mod validation_tests {
         }
     }
 
-    /// 读配置时就拦下写错的 CIDR：响应规则的 response_upstream_ip、response_answer_ip 两种都是
-    /// A CIDR written wrong is refused as the configuration is read, in both
-    /// response_upstream_ip and response_answer_ip
+    /// 写错的网段拒掉，报出写的是什么、在哪：规则的 client_ip、response_upstream_ip、response_answer_ip，以及
+    /// pipeline_select 的 client_ip。以前只说「invalid IP address syntax」，规则一多就不知道是哪一条的哪一项
+    /// A mistyped network is refused naming what was written and where: a rule's client_ip,
+    /// response_upstream_ip and response_answer_ip, and pipeline_select's client_ip. It used to
+    /// say only "invalid IP address syntax", leaving which item of which rule to guess
     #[test]
-    fn a_bad_response_cidr_is_refused_as_the_configuration_is_read() {
-        for kind in ["response_upstream_ip", "response_answer_ip"] {
-            let config = serde_json::json!({
-                "settings": { "default_upstream": "1.1.1.1:53" },
-                "pipelines": [{ "id": "main", "rules": [{
-                    "name": "r",
-                    "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
-                    "response_matchers": [{ "type": kind, "cidr": "10.0.0.0/8, nonsense" }],
-                    "response_actions_on_match": [{ "type": "allow" }]
-                }] }]
-            });
-            assert!(super::parse_config(&config.to_string()).is_err(), "{kind}");
+    fn a_mistyped_network_is_refused_naming_it_and_its_place() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let config =
+            |select: serde_json::Value, matchers: serde_json::Value, answer: serde_json::Value| {
+                serde_json::json!({
+                    "settings": { "default_upstream": "1.1.1.1:53" },
+                    "pipeline_select": [{ "pipeline": "main", "matchers": select }],
+                    "pipelines": [{ "id": "main", "rules": [
+                        rule("first", any.clone(), serde_json::json!([{ "type": "allow" }])),
+                        {
+                            "name": "r",
+                            "matchers": matchers,
+                            "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
+                            "response_matchers": answer,
+                            "response_actions_on_match": [{ "type": "allow" }]
+                        }
+                    ] }]
+                })
+            };
+        let client = |cidr: &str| serde_json::json!([{ "type": "client_ip", "cidr": cidr }]);
+        let answer =
+            |kind: &str| serde_json::json!([{ "type": kind, "cidr": "10.0.0.0/8, nonsense" }]);
+        let no_answer = serde_json::json!([]);
+        for (config, place, written) in [
+            (
+                config(any.clone(), client("10.0.0.0/33"), no_answer.clone()),
+                "pipelines[0].rules[1].matchers[0]",
+                "10.0.0.0/33",
+            ),
+            (
+                config(any.clone(), any.clone(), answer("response_upstream_ip")),
+                "pipelines[0].rules[1].response_matchers[0]",
+                "nonsense",
+            ),
+            (
+                config(any.clone(), any.clone(), answer("response_answer_ip")),
+                "pipelines[0].rules[1].response_matchers[0]",
+                "nonsense",
+            ),
+            (
+                config(client("nonsense"), any.clone(), no_answer.clone()),
+                "pipeline_select[0].matchers[0]",
+                "nonsense",
+            ),
+        ] {
+            let error = format!(
+                "{:#}",
+                super::validate(&config.to_string()).expect_err("refused")
+            );
+            assert!(
+                error.contains(&format!("{place}: \"{written}\" is not an IP network")),
+                "{error}"
+            );
         }
     }
 
-    /// 默认上游写了几个时，读配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
-    /// Several default upstreams are split as the configuration is read (each trimmed,
+    /// 默认上游写了几个时，编译配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
+    /// Several default upstreams are split as the configuration compiles (each trimmed,
     /// empty ones skipped); a single one is not
     #[test]
     fn several_default_upstreams_are_split_ahead() {
@@ -2720,8 +2772,8 @@ mod validation_tests {
                 "settings": { "default_upstream": default_upstream },
                 "pipelines": [{ "id": "main", "rules": [] }]
             });
-            super::parse_config(&config.to_string())
-                .expect("parses")
+            super::compile(super::parse_config(&config.to_string()).expect("parses"))
+                .expect("compiles")
                 .settings
                 .default_upstream_pre_split
                 .map(|list| {
@@ -2869,11 +2921,20 @@ mod validation_tests {
         }
     }
 
+    /// 会悄悄做成别的事的写法，每一种都报出来，按位置说在哪，和读不懂的键一样：`settings.` 下的设置、
+    /// `pipeline_select[i]`、`pipelines[i].rules[j]`。规则名可以重复，以前按名字说在哪，重名时分不清是哪一条。不以 `/`
+    /// 开头的 doh_path（DoH 对每个请求都回 404）以前不算问题，空的 request_domain_suffix 以前让整份配置读不进来
+    /// Every way of writing that silently does something else is named with its place, a path
+    /// as for the keys not read: a setting under `settings.`, `pipeline_select[i]`,
+    /// `pipelines[i].rules[j]`. Rule names may repeat, and the name a rule used to be raised by
+    /// could not tell which it was. A doh_path not starting with `/` (DoH answering every query
+    /// with 404) used to be no problem, and an empty request_domain_suffix used to keep the whole
+    /// configuration from being read
     #[test]
     fn problems_name_what_would_silently_do_something_else() {
         let any = serde_json::json!([{ "type": "any" }]);
         let config = serde_json::json!({
-            "settings": { "default_upstream": "dns.example:53", "bootstrap": "223.5.5.5:53, dns.google:53" },
+            "settings": { "default_upstream": "dns.example:53", "bootstrap": "223.5.5.5:53, dns.google:53", "doh_path": "dns-query" },
             "pipeline_select": [{ "pipeline": "gone", "matchers": [{ "type": "domain_suffix", "value": "" }] }],
             "pipelines": [{ "id": "main", "rules": [
                 rule("port", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "1.1.1.1:99999" }])),
@@ -2892,40 +2953,49 @@ mod validation_tests {
                     "name": "late",
                     "matchers": any,
                     "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
-                    "response_matchers": [{ "type": "request_domain_regex", "value": "" }],
+                    "response_matchers": [
+                        { "type": "request_domain_regex", "value": "" },
+                        { "type": "request_domain_suffix", "value": "" }
+                    ],
                     "response_actions_on_miss": [{ "type": "forward", "upstream": "udp+tcp://dns.example:53" }]
                 }
             ]}]
         });
         let found = problems_of(config);
         for (place, fragment) in [
-            ("default_upstream", "dns.example:53"),
-            ("bootstrap", "dns.google:53"),
-            ("pipeline_select 1", "no pipeline \"gone\""),
-            ("pipeline_select 1", "empty domain matcher"),
-            ("rule \"port\"", "1.1.1.1:99999"),
-            ("rule \"name\"", "nonsense"),
-            ("rule \"scheme\"", "unknown prefix \"http://\""),
-            ("rule \"doq\"", "sni"),
-            ("rule \"rcode\"", "WHATEVER"),
-            ("rule \"ip\"", "192.0.2.1, nope"),
-            ("rule \"noip\"", "ip \"\""),
-            ("rule \"cname\"", "cname target"),
-            ("rule \"txt\"", "256 bytes"),
-            ("rule \"jump\"", "\"gone\", which does not exist"),
-            ("rule \"suffix\"", "empty domain matcher"),
-            ("rule \"regex\"", "empty domain matcher"),
-            ("rule \"late\"", "empty domain matcher"),
-            ("rule \"late\"", "udp+tcp://dns.example:53"),
+            ("settings.default_upstream", "dns.example:53"),
+            ("settings.bootstrap", "dns.google:53"),
+            (
+                "settings.doh_path",
+                "\"dns-query\" does not start with \"/\"",
+            ),
+            ("pipeline_select[0]", "no pipeline \"gone\""),
+            ("pipeline_select[0]", "empty domain matcher"),
+            ("pipelines[0].rules[0]", "1.1.1.1:99999"),
+            ("pipelines[0].rules[1]", "nonsense"),
+            ("pipelines[0].rules[2]", "unknown prefix \"http://\""),
+            ("pipelines[0].rules[3]", "sni"),
+            ("pipelines[0].rules[4]", "WHATEVER"),
+            ("pipelines[0].rules[5]", "192.0.2.1, nope"),
+            ("pipelines[0].rules[6]", "ip \"\""),
+            ("pipelines[0].rules[7]", "cname target"),
+            ("pipelines[0].rules[8]", "256 bytes"),
+            ("pipelines[0].rules[9]", "\"gone\", which does not exist"),
+            ("pipelines[0].rules[10]", "empty domain matcher"),
+            ("pipelines[0].rules[11]", "empty domain matcher"),
+            ("pipelines[0].rules[12]", "empty domain matcher"),
+            ("pipelines[0].rules[12]", "udp+tcp://dns.example:53"),
         ] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains(fragment)),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains(fragment)),
                 "missing {place} / {fragment} in {found:#?}"
             );
         }
-        assert_eq!(found.len(), 18, "{found:#?}");
+        // 第 12 条的两个空匹配器各报一次 / The two empty matchers of rule 12 are raised once each
+        assert_eq!(found.len(), 20, "{found:#?}");
     }
 
     /// 平常的正确写法一条都不报 / The ordinary right ways of writing raise nothing
@@ -2977,11 +3047,13 @@ mod validation_tests {
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:#?}");
         assert!(
-            found[0].starts_with("pipeline \"main\": ") && found[0].contains("3 pipelines"),
+            found[0].starts_with("pipelines[0]: ")
+                && found[0].contains("3 pipelines are written with the id \"main\""),
             "{found:#?}"
         );
         assert!(
-            found[1].starts_with("pipeline \"other\": ") && found[1].contains("2 pipelines"),
+            found[1].starts_with("pipelines[1]: ")
+                && found[1].contains("2 pipelines are written with the id \"other\""),
             "{found:#?}"
         );
     }
@@ -3007,10 +3079,13 @@ mod validation_tests {
         });
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:#?}");
-        for (place, ip) in [("wrong", "203.0.113.300"), ("late", "somewhere")] {
+        for (place, ip) in [
+            ("pipelines[0].rules[0]", "203.0.113.300"),
+            ("pipelines[0].rules[3]", "somewhere"),
+        ] {
             assert!(
                 found.iter().any(|problem| {
-                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                    problem.starts_with(&format!("{place}: "))
                         && problem.contains(&format!("ecs ip \"{ip}\""))
                 }),
                 "missing {place} in {found:#?}"
