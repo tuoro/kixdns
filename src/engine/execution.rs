@@ -1324,6 +1324,17 @@ impl Engine {
             .decide(&request, pipeline, &mut route, &mut response_log.info)
             .await;
 
+        // 刷新的结果只在这里定下：一路上它和客户端请求一样作答、写缓存，被刷新的那份留不留，到这里一次决定（见
+        // `renewing`）
+        // What a refresh comes to is settled here alone: on the way it answers and caches as a
+        // client request does, and whether the answer it renews stays is decided here once (see
+        // `renewing`)
+        let result = match request.refresh {
+            Some(target) => result
+                .and_then(renewing)
+                .inspect(|_| request.drop_refreshed(self, target)),
+            None => result,
+        };
         // A request that continued still holds its entry here, and its waiters get
         // the final answer: the entry's key keeps them to requesters that the rules
         // run after the continue treat alike (see `RuntimePipeline::requester`). If
@@ -1332,41 +1343,12 @@ impl Engine {
         // continue 过的请求走到这里仍持有条目，等待者拿到最终应答：条目的键只让 continue
         // 之后运行的规则一样对待的请求方等在上面（见 `RuntimePipeline::requester`）。请求
         // 返回错误或被取消时，守卫被丢弃并移除条目，等待者自己转发。
-        // A refresh is after an answer to renew its entry with. SERVFAIL is none,
-        // whatever produced it (the jump limit, a jump target that does not exist, a
-        // static SERVFAIL), and neither is a truncated answer, which is never cached:
-        // the refresh ends as a failure, which refresh.rs logs, and the entry stays as
-        // it is.
-        // 刷新要的是拿来更新条目的应答。SERVFAIL 不是，不论它从哪里来（跳转上限、跳转目标
-        // 不存在、静态 SERVFAIL）；截断的应答也不是，它从不写缓存。刷新以失败结束，由
-        // refresh.rs 记录，条目保持原样。
-        let result = match result {
-            Ok(bytes) if background_refresh && phases::is_servfail(&bytes) => Err(
-                phases::refresh_found_no_answer("the rules answered SERVFAIL"),
-            ),
-            Ok(bytes) if background_refresh && crate::proto_utils::truncated_response(&bytes) => {
-                Err(phases::refresh_found_no_answer(
-                    "only a truncated answer came back",
-                ))
-            }
-            result => result,
-        };
         if let Some(mut guard) = route.held_inflight.take()
             && let Ok(bytes) = &result
         {
             guard.hand_over(|| {
                 phases::for_waiters(bytes, &request.requester, &route.trail, route.echo_floor)
             });
-        }
-        if let (Some(target), Ok(_)) = (request.refresh, &result) {
-            self.settle_refresh(
-                target,
-                &route.trail,
-                request.qname,
-                u16::from(request.qtype),
-                u16::from(request.qclass),
-                request.flags,
-            );
         }
         // Every reply leaves with the ECS option its client should see, and with what it
         // copies from the query as the client wrote it (see `proto_utils::reply_as_asked`);
@@ -1594,27 +1576,6 @@ impl Engine {
                 Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
                 Decision::Static { rcode, answers } => {
                     info.upstream = Some(Source::Static);
-                    // On a refresh, a SERVFAIL here (a jump target that does not
-                    // exist, or a static SERVFAIL the rules configure) is no answer:
-                    // the refresh ends as a failure before anything is cached over
-                    // its entry, which stays. After a refresh continued past an
-                    // answer, any other static answer replaces the entry, which
-                    // handle_static_decision stores again when it caches the answer
-                    // there (an upstream failure ends a refresh before it gets here).
-                    // 刷新时这里的 SERVFAIL（跳转目标不存在，或规则配置的静态 SERVFAIL）
-                    // 不是应答：刷新在往缓存写任何东西之前以失败结束，条目保留。刷新越过
-                    // 一个应答之后，其他静态应答取代这条，handle_static_decision 在那里缓存
-                    // 应答时会重新写入（上游失败时刷新到不了这里就已经结束）。
-                    if rcode == ResponseCode::ServFail && background_refresh {
-                        return Err(phases::refresh_found_no_answer(
-                            "the rules answered SERVFAIL",
-                        ));
-                    }
-                    if route.passed_an_answer
-                        && let Some(target) = request.refresh
-                    {
-                        request.drop_refreshed(self, target);
-                    }
                     return phases::handle_static_decision(
                         self,
                         &phases::StaticDecisionContext {
@@ -1690,32 +1651,7 @@ impl Engine {
                     .await;
 
                     match forwarded {
-                        // The target's upstream failed: as when the rule's own upstream
-                        // fails, the refresh has no new answer and the entry stays
-                        // 目标的上游失败：和规则自己的上游失败时一样，刷新没有新应答，条目保留
-                        Ok(phases::ForwardResult::Fallback(bytes)) => return Ok(bytes),
-                        Ok(phases::ForwardResult::Success(bytes)) => {
-                            // After a refresh continued past an answer and then
-                            // jumped, the answer is not stored in the refreshed slot:
-                            // unless it is a failure (SERVFAIL, a truncated answer,
-                            // or the target's stale answer served on one, the only
-                            // cache hit a refresh can have), the entry there no
-                            // longer matches the rules.
-                            // 刷新越过一个应答又跳转之后，应答不会存进被刷新的槽位：
-                            // 只要不是失败（SERVFAIL、截断的应答，或失败时返回的目标旧
-                            // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
-                            // 对不上。
-                            if route.passed_an_answer
-                                && let Some(target) = request.refresh
-                                && route.keys.slot != target.slot
-                                && !phases::is_servfail(&bytes)
-                                && !crate::proto_utils::truncated_response(&bytes)
-                                && !info.cache_hit
-                            {
-                                request.drop_refreshed(self, target);
-                            }
-                            return Ok(bytes);
-                        }
+                        Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
                         Ok(phases::ForwardResult::Continue { ctx, fallback }) => {
                             route.continued(*ctx, rule_index, fallback);
                             // 只有规则的回答检查会 continue，所以请求在配置里的某个 pipeline 里
@@ -1951,10 +1887,8 @@ impl Request<'_> {
         engine_helpers::build_servfail_response(&Message::from_bytes(self.packet).context(context)?)
     }
 
-    /// 去掉刷新要更新、却已经和规则对不上的条目：规则越过一个应答之后，结果可能是静态应答或来自跳转目标，它们不会更新它
-    /// Drop the entry the refresh renews when it no longer matches the rules: once a rule has
-    /// continued past an answer, the outcome may be a static answer or come from a jump target,
-    /// which do not renew it
+    /// 去掉刷新要更新的那份应答，它还在的话（见 [`renewing`]）/ Drop the answer the refresh
+    /// renews, if it is still there (see [`renewing`])
     fn drop_refreshed(&self, engine: &Engine, target: &RefreshTarget) {
         let question = CachedQuestion {
             qname: self.qname,
@@ -1963,8 +1897,46 @@ impl Request<'_> {
             qclass: u16::from(self.qclass),
             flags: self.flags,
         };
-        engine.drop_refreshed(target.slot, &question, &self.requester.ecs_view(), target);
+        engine.drop_refreshed(&question, target);
     }
+}
+
+/// 后台刷新以 `answer` 结束时拿不拿得来更新条目。缓存从来不收的应答（SERVFAIL，不论从哪里来：跳转上限、跳转目标不存在、
+/// 静态 SERVFAIL；截断的；TSIG 签过的，见 `Engine::insert_dns_cache_entry`）拿不来：刷新以失败结束，由 refresh.rs 记下，
+/// 被刷新的那份原样留着（开着 serve_stale_ttl_reset 时还续期）。别的应答都拿得来，被刷新的那份随后去掉：照它的问题和适用
+/// 范围写回了缓存的，已经取代了它；没写回去的（TTL 为 0、没有 SOA 的否定应答、不缓存的静态应答，或者写在了别的键、别的
+/// 适用范围下），它就和规则、和上游现在的说法对不上了，留着的话每次命中都被当过期应答交出去再续上（RFC 8767 只在取不到
+/// 新应答时才用过期的），下一个客户端请求自己走规则。以前这些各在半路判断：只拿到截断的应答时，条目先当作不进缓存的
+/// 完整应答删了，到出口才算失败，续期也落了空
+/// Whether a background refresh ending in `answer` can renew its entry with it. Not with an
+/// answer the cache never takes (SERVFAIL, wherever it comes from: the jump limit, a jump
+/// target that does not exist, a static SERVFAIL; a truncated one; a TSIG-signed one, see
+/// `Engine::insert_dns_cache_entry`): the refresh ends as a failure, which refresh.rs notes,
+/// and the answer it renews stays as it is (renewed with serve_stale_ttl_reset on). Any other
+/// answer will do, and the renewed one is dropped after: written back under its question and
+/// reach, the new one has taken its place already; not written back (a TTL of 0, a negative
+/// answer without SOA, a static answer that is not cached, or written under another key or
+/// reach), it no longer matches the rules or what the upstream says now, and kept it would go
+/// out stale and be renewed on every hit (RFC 8767 serves stale only when no new answer can be
+/// had), so the next client request runs the rules itself. These used to be judged halfway:
+/// with only a truncated answer back, the entry was first dropped as for a whole answer that
+/// is not cached, the refresh counting as failed only at the exit, its renewal coming to
+/// nothing
+fn renewing(answer: Bytes) -> anyhow::Result<Bytes> {
+    let no_answer = if crate::proto_utils::parse_response_quick(&answer)
+        .is_some_and(|qr| qr.rcode == ResponseCode::ServFail)
+    {
+        "the rules answered SERVFAIL"
+    } else if crate::proto_utils::truncated_response(&answer) {
+        "only a truncated answer came back"
+    } else if crate::proto_utils::last_record_is_tsig(&answer) {
+        "only a signed answer came back"
+    } else {
+        return Ok(answer);
+    };
+    Err(crate::engine::upstream::UpstreamFailure::error(
+        anyhow::anyhow!(no_answer),
+    ))
 }
 
 /// 请求沿着规则走的路线：现在在哪个 pipeline、应答缓存在哪个键下、还能跳几次、规则越过了什么，以及它在路上记下的
@@ -1993,9 +1965,6 @@ struct Route {
     /// have one budget, a response action's jump with the rule-level jumps after it another (see
     /// `Route::response_jumped`)
     jumps_left: usize,
-    /// 规则已经越过了一个应答（continue，或响应阶段跳走）/ A rule has continued past an answer
-    /// (a continue, or a response-phase jump)
-    passed_an_answer: bool,
     /// 接下来的应答取决于上游的一份应答：在这些键下最近一次 continue 或回答检查跳转，是在上游的应答上做的；miss 动作在
     /// 上游失败以后做的不算，那时手里没有应答。这时规则给出的静态应答缓存起来，下次不必再问上游（见
     /// `phases::StaticDecisionContext::on_an_answer`）。请求阶段跳进别的 pipeline、换了键，就又不是了：那里直接给出的，
@@ -2050,7 +2019,6 @@ impl Route {
             reused_response: None,
             jumped: None,
             jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
-            passed_an_answer: false,
             on_an_answer: false,
             trail: EcsReach::default(),
             echo_floor: 0,
@@ -2106,7 +2074,6 @@ impl Route {
     /// A rule continued past this answer (`fallback` see `phases::ForwardResult::Continue`):
     /// `reused` is kept for a later `allow`, and `rule` is not evaluated again
     fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>, fallback: bool) {
-        self.passed_an_answer = true;
         self.on_an_answer = !fallback;
         self.reused_response = reused;
         self.skip_rules.extend(rule);
@@ -2125,7 +2092,6 @@ impl Route {
         limit: usize,
         fallback: bool,
     ) {
-        self.passed_an_answer = true;
         self.on_an_answer = !fallback;
         if self.jumped.is_none() {
             self.jumps_left = limit;
