@@ -248,3 +248,36 @@ async fn a_replaced_txt_fits_the_message_or_is_servfail() {
         }
     }
 }
+
+/// 换成的 TXT 和静态 TXT 一样看问的是什么：只有 TXT 查询拿到这条记录，A 查询回 NODATA；上游回 NXDOMAIN 时换成的照样是
+/// NOERROR 加这条 TXT。以前不看这些：A 查询也拿到 TXT 记录，NXDOMAIN 的应答里还带着它
+/// A TXT the answer is replaced with looks at what was asked as a static TXT does: only a TXT
+/// query gets the record, an A query NODATA; with the upstream answering NXDOMAIN the
+/// replacement is NOERROR with the TXT all the same. None of this used to be looked at: an A
+/// query got the TXT record too, and an NXDOMAIN answer carried it
+#[tokio::test]
+async fn a_replaced_txt_answers_as_a_static_txt_does() {
+    let upstream = crate::engine::test_support::upstream(|query: &Message| {
+        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        reply.add_queries(query.queries.iter().cloned());
+        reply.metadata.response_code = ResponseCode::NXDomain;
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    })
+    .await;
+    let engine = engine_with(json!([{
+        "name": "replace",
+        "matchers": [{ "type": "any" }],
+        "actions": [{ "type": "forward", "upstream": upstream.address }],
+        "response_actions_on_match": [{ "type": "replace_txt_response", "text": ["replaced"] }]
+    }]));
+    for (qtype, answers) in [(RecordType::TXT, 1), (RecordType::A, 0)] {
+        let mut query = Message::new(0x3434, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii(QNAME).unwrap(), qtype));
+        let answer = reply(&engine, &query.to_vec().unwrap()).await;
+        assert_eq!(
+            summary(&answer),
+            (ResponseCode::NoError, false, answers),
+            "{qtype}"
+        );
+    }
+}

@@ -173,9 +173,9 @@ The aliases and-not, andnot, or-not, and ornot are also accepted.
 | deny | none | Returns REFUSED. |
 | forward | upstream (optional), transport (optional), ecs (optional) | Forwards to the selected upstream. A missing upstream (or null, or []) uses default_upstream; an empty string is not missing. |
 | continue | none | Continues with the next request rule, or the next pipeline decision in the response flow. |
-| replace_txt_response | text | Response-phase action that replaces TXT records in the current response. In the request phase it does not produce a response. text has the same size limits as static_txt_response. |
+| replace_txt_response | text | Response-phase action that replaces the answer in hand with what static_txt_response gives (TTL 300): only TXT and ANY queries get the TXT record, other query types receive NODATA, with NOERROR whatever the upstream answered; run after an upstream failure it has no answer to replace and gives SERVFAIL. In the request phase it does not produce a response. text has the same size limits as static_txt_response. |
 
-The records static_ip_response, static_cname_response and static_txt_response give are all of class IN, so they answer only questions of class IN or ANY; a question of another class (CH, for example) receives NODATA.
+The records static_ip_response, static_cname_response, static_txt_response and replace_txt_response give are all of class IN, so they answer only questions of class IN or ANY; a question of another class (CH, for example) receives NODATA.
 
 ### ECS
 

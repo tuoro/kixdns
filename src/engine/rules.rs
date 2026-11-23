@@ -1,15 +1,13 @@
 use anyhow::Context;
 use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::rdata::TXT;
-use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::warn;
 
 use super::observation::report_response_decision;
 use crate::cache_store::Cached;
@@ -464,35 +462,20 @@ async fn run_response_actions(
             Action::Continue => {
                 return Ok(ResponseActionResult::Continue { ctx: ctx.ctx_opt });
             }
+            // 换掉手上的应答，换成的和 static_txt_response 给出的一样（TTL 是它的默认值）：只有 TXT、ANY 查询拿到
+            // TXT 记录，别的类型、别的类别回 NODATA，响应码是 NOERROR，装不下时回 SERVFAIL。以前不看这些，A 查询也
+            // 拿到 TXT 记录，上游回 NXDOMAIN 时还带着它。手上没有应答（上游失败以后）就没有可换的，回 SERVFAIL
+            // The answer in hand is replaced with what static_txt_response gives (its default
+            // TTL): only TXT and ANY queries get the TXT record, other types and classes NODATA,
+            // with NOERROR, and SERVFAIL when it does not fit. None of this used to be looked at,
+            // an A query getting the TXT record too, and an upstream's NXDOMAIN keeping it. With
+            // no answer in hand (after an upstream failure) there is nothing to replace: SERVFAIL
             Action::ReplaceTxtResponse { text } => {
-                if let Some(ref resp_ctx) = ctx.ctx_opt {
-                    let name = resp_ctx
-                        .msg
-                        .queries
-                        .first()
-                        .map(|q| q.name().clone())
-                        .ok_or_else(|| anyhow::anyhow!("No query name"))?;
-
-                    // 和静态 TXT 一样，装不进应答时回 SERVFAIL（见 `txt_size_problem`）
-                    // As for a static TXT, SERVFAIL when it does not fit the answer (see
-                    // `txt_size_problem`)
-                    if let Some(problem) = crate::engine::response::txt_size_problem(
-                        text,
-                        crate::engine::response::name_wire_len(&name),
-                    ) {
-                        warn!(qname = %qname, %problem, "replaced TXT answer does not fit a message");
-                        return response_action_servfail(ctx.req);
-                    }
-                    // Replace TXT records in answers / 替换答案中的 TXT 记录
-                    let record = Record::from_rdata(name, 300, RData::TXT(TXT::new(text.to_vec())));
-                    return static_answer(
-                        ctx.req,
-                        resp_ctx.msg.metadata.response_code,
-                        vec![record],
-                        "replace_txt",
-                    );
+                if ctx.ctx_opt.is_none() {
+                    return response_action_servfail(ctx.req);
                 }
-                return response_action_servfail(ctx.req);
+                let (rcode, answers) = make_static_txt_answer(qname, qtype, qclass, text, 300);
+                return static_answer(ctx.req, rcode, answers, "replace_txt");
             }
             Action::Forward {
                 upstream,
