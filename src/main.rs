@@ -446,7 +446,7 @@ async fn run_dns_server(
     // The listening ports are taken before the engine is built: it opens a batch of upstream sockets, and
     // the ports the system picks for them may be the very one to listen on, and the kernel would not start.
     // Queries arriving while the engine is built wait in the sockets and are answered once it is ready
-    let bound = BoundListeners::bind(listeners, udp_workers_final).await?;
+    let bound = BoundListeners::bind(listeners, udp_workers_final)?;
 
     // 面板的统计只能经控制通道读，所以只在开了控制通道时装面板观察者 / The panel's statistics can
     // only be read over the control socket, so the panel observer is installed only with one

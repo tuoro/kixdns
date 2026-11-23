@@ -223,7 +223,7 @@ fn a_taken_doh_port_leaves_dns_answering() {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     assert!(until(&mut kernel, || udp_answers(address) && tcp_answers(address)));
     let log = log_of(dir.path());
-    assert!(log.contains("DoH server exited"), "{log}");
+    assert!(log.contains("DoH server cannot start"), "{log}");
     assert!(log.contains("Address already in use"), "{log}");
 }
 

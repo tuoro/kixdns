@@ -225,7 +225,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 - 大于客户端声明大小（EDNS 载荷大小，最多 1232 字节，免得在 IP 层分片，见 DNS Flag Day 2020；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试；回答里的 OPT 都通告 1232。
 - TCP 上声明的消息超过 4096 字节时不等它发完，连接当场关掉，之前的查询照样答。
 - 入站的 TCP 和 DoH 连接一共开到 512 条以后，新连接只给还没占满自己那一份的设备，流控开不开都一样：没开过连接的设备总连得上，一台设备开再多也只占到它那一份。接不了的连接当场关掉。
-- 双栈套接字（例如监听 `[::]` 的入站 DoH）把 IPv4 客户端报成 `::ffff:a.b.c.d`。规则、GeoIP、ECS 和缓存都按它背后的 IPv4 地址判断，client_ip 照常写 IPv4 网段；写成 `::ffff:a.b.c.d/n` 的网段按它所指的 IPv4 网段处理。
+- 监听 `[::]` 时 IPv4 另开一个 `0.0.0.0`，`[::]` 那个只收 IPv6：IPv6 套接字收不收 IPv4 各系统默认不同（FreeBSD 等 BSD 不收，OpenBSD 怎么都不收），这样在哪个系统上两个地址族都答。TCP 和入站 DoH 在各系统上都这样，UDP 在 Windows 以外这样。双栈套接字（Windows 上监听 `[::]` 的 UDP）把 IPv4 客户端报成 `::ffff:a.b.c.d`；规则、GeoIP、ECS 和缓存都按它背后的 IPv4 地址判断，client_ip 照常写 IPv4 网段；写成 `::ffff:a.b.c.d/n` 的网段按它所指的 IPv4 网段处理。
 
 只有设置 settings.bind_doh 后才会启用入站 DoH。启用时必须同时设置 settings.doh_tls_cert 和 settings.doh_tls_key，且路径指向 PEM 文件。路径默认为 /dns-query，可通过 settings.doh_path 修改。
 
