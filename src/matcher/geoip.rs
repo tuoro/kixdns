@@ -305,6 +305,21 @@ impl GeoIpManager {
         }
     }
 
+    /// 读进来的 MMDB 换过了：`path` 现在是另一个样子的文件（路径、长度、修改时间有一样不同，见 [`Self::use_mmdb`]）。热重载
+    /// 靠它知道要重读：MMDB 不被监视，以前配置里的 GeoIP 设置没变就不再读它，原地换上的新库要等重启才用上。没读进来过的不算，
+    /// 那是还缺着的文件，另有地方等它出现
+    /// Whether the MMDB read in was replaced: `path` is now a file that looks otherwise (path,
+    /// length or modification time differ, see [`Self::use_mmdb`]). A hot reload learns from it to
+    /// read it again: it is not watched, and it used not to be read again while the
+    /// configuration's GeoIP settings stayed the same, a new database put in place going unused
+    /// until a restart. One never read in does not count: that is a file still missing, waited for
+    /// elsewhere
+    pub fn mmdb_replaced(&self, path: &str) -> bool {
+        self.mmdb
+            .as_ref()
+            .is_some_and(|mmdb| FileStamp::of(Path::new(path)).is_ok_and(|file| file != mmdb.file))
+    }
+
     /// MMDB 是否已加载；加载了，两个字母的国家代码就只按它判断
     /// Whether an MMDB is loaded; when one is, two-letter country codes are judged by it alone
     #[inline]
