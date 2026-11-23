@@ -729,77 +729,79 @@ pub(crate) async fn handle_forward_decision_logged(
         // first. Each used to ask by itself, and a leader leaving with several waiting had the
         // upstream asked that many times over. A leader leaves on every round, so there are no
         // more rounds than requests waiting at once
-        while !skip_cache {
-            use dashmap::mapref::entry::Entry;
-            let mut rx = match engine.inflight.entry(keys.inflight) {
-                Entry::Vacant(entry) => {
-                    entry.insert(InflightEntry::sharing(
-                        &inflight_question,
-                        key_pipeline_id,
-                        Arc::<[u8]>::from(Arc::clone(qname)),
-                    ));
-                    cleanup_guard = Some(InflightCleanupGuard::new(
-                        engine.inflight.clone(),
-                        keys.inflight,
-                    ));
-                    break;
-                }
-                // A request holding an entry (see `held_inflight`) never waits
-                // on one: the entry may be its own, which the next rule forwards
-                // under after a continue, or another request's that waits on
-                // this one in turn (continue, then jump into each other's
-                // pipeline). It forwards itself instead.
-                // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
-                // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
-                // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
-                // 自己转发。
-                Entry::Occupied(_) if held_inflight.is_some() => break,
-                // Another question's entry under the same key: the key is only a hash (see
-                // `InflightQuestion`), and waiting on it would hand this request another
-                // question's answer. It forwards itself instead.
-                // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
-                // 别的问题的应答交给这个请求。它自己转发。
-                Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => break,
-                Entry::Occupied(mut entry) => entry.get_mut().subscribe(),
-            };
+        if !skip_cache {
+            loop {
+                use dashmap::mapref::entry::Entry;
+                let mut rx = match engine.inflight.entry(keys.inflight) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(InflightEntry::sharing(
+                            &inflight_question,
+                            key_pipeline_id,
+                            Arc::<[u8]>::from(Arc::clone(qname)),
+                        ));
+                        cleanup_guard = Some(InflightCleanupGuard::new(
+                            engine.inflight.clone(),
+                            keys.inflight,
+                        ));
+                        break;
+                    }
+                    // A request holding an entry (see `held_inflight`) never waits
+                    // on one: the entry may be its own, which the next rule forwards
+                    // under after a continue, or another request's that waits on
+                    // this one in turn (continue, then jump into each other's
+                    // pipeline). It forwards itself instead.
+                    // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
+                    // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
+                    // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
+                    // 自己转发。
+                    Entry::Occupied(_) if held_inflight.is_some() => break,
+                    // Another question's entry under the same key: the key is only a hash (see
+                    // `InflightQuestion`), and waiting on it would hand this request another
+                    // question's answer. It forwards itself instead.
+                    // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
+                    // 别的问题的应答交给这个请求。它自己转发。
+                    Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => break,
+                    Entry::Occupied(mut entry) => entry.get_mut().subscribe(),
+                };
 
-            // 等别人正在做的同一个转发。开了流控时这次等待也看卡没卡住（见 `PermitManager::join`）：卡住了、这台设备
-            // 留着等的又已经够多，就不等了，照上游失败往下走
-            // Waiting on the same forward another is making. With flow control on this wait too
-            // is seen to for being stuck (see `PermitManager::join`): stuck with enough of the
-            // device's kept waiting already it waits no more, and goes on below as the upstream
-            // failing
-            let waiting = async {
-                rx.changed().await.ok()?;
-                Some(rx.borrow().clone())
-            };
-            let result = match crate::engine::upstream::wait_for_another(
-                engine,
-                peer.ip(),
-                upstream,
-                upstream_timeout,
-                waiting,
-            )
-            .await
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => continue,
-                Err(failure) => {
-                    gave_up = Some(failure);
-                    break;
+                // 等别人正在做的同一个转发。开了流控时这次等待也看卡没卡住（见 `PermitManager::join`）：卡住了、这台设备
+                // 留着等的又已经够多，就不等了，照上游失败往下走
+                // Waiting on the same forward another is making. With flow control on this wait too
+                // is seen to for being stuck (see `PermitManager::join`): stuck with enough of the
+                // device's kept waiting already it waits no more, and goes on below as the upstream
+                // failing
+                let waiting = async {
+                    rx.changed().await.ok()?;
+                    Some(rx.borrow().clone())
+                };
+                let result = match crate::engine::upstream::wait_for_another(
+                    engine,
+                    peer.ip(),
+                    upstream,
+                    upstream_timeout,
+                    waiting,
+                )
+                .await
+                {
+                    Ok(Some(result)) => result,
+                    Ok(None) => continue,
+                    Err(failure) => {
+                        gave_up = Some(failure);
+                        break;
+                    }
+                };
+                if let Some((observer, ctx)) = observed {
+                    observer.inflight_joined(ctx);
                 }
-            };
-            if let Some((observer, ctx)) = observed {
-                observer.inflight_joined(ctx);
-            }
-            match &result {
-                Ok(bytes) => {
-                    let mut resp_mut = BytesMut::from(bytes.as_ref());
-                    set_id(&mut resp_mut, tx_id);
-                    response.upstream = Some(Arc::from("inflight"));
-                    return Ok(ForwardResult::Success(resp_mut.freeze()));
+                match &result {
+                    Ok(bytes) => {
+                        let mut resp_mut = BytesMut::from(bytes.as_ref());
+                        set_id(&mut resp_mut, tx_id);
+                        response.upstream = Some(Arc::from("inflight"));
+                        return Ok(ForwardResult::Success(resp_mut.freeze()));
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("{}", e)),
                 }
-                Err(e) => return Err(anyhow::anyhow!("{}", e)),
             }
         }
         match gave_up {
