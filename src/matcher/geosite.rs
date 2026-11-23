@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::thread;
 
 use std::hash::BuildHasher;
 use std::io::Read;
@@ -508,20 +507,37 @@ impl TagMatchers {
     }
 }
 
-/// 被替换下来的 tag 交给另一个线程释放：释放一个大 tag 的索引和建它差不多费时，而调用方这时
-/// 正持有管理器的写锁。起不了线程时就在这里释放。
-/// Frees replaced tags on another thread: freeing a large tag's index takes about as
-/// long as building it, and the caller holds the manager's write lock meanwhile.
-/// When no thread can be started they are freed here.
-fn retire(retired: Vec<TagMatchers>) {
-    if retired.is_empty() {
-        return;
+/// 数据换进管理器以后、放掉写锁才做的事：记下换完以后的规模，放掉换下来的数据（见 [`GeoSiteManager::swap_source`]）。
+/// 以前两样都在写锁里做：日志要格式化、写出去，释放一个大 tag 的索引和建它差不多费时，为此还在锁里起一个线程，这期间
+/// 所有按 GeoSite 匹配的查询都停着
+/// What is left once data is swapped into a manager, done after the write lock is released:
+/// logging the size the swap left, and freeing the data swapped out (see
+/// [`GeoSiteManager::swap_source`]). Both used to happen under the write lock: a log line is
+/// formatted and written out, freeing a large tag's index takes about as long as building it
+/// and a thread was started for that under the lock, and every GeoSite match stalled meanwhile
+#[must_use = "finish it once the manager's write lock is released"]
+pub struct Swapped {
+    /// 这个文件换进来几个 tag / How many tags the file swapped in
+    loaded: usize,
+    /// 换完以后的 tag 数和条目总数 / The tags and all their entries after the swap
+    totals: (usize, usize),
+    /// 换下来的数据 / The data swapped out
+    retired: Vec<TagMatchers>,
+}
+
+impl Swapped {
+    /// 记下规模、放掉换下来的数据，给出这个文件换进来几个 tag / Logs the size and frees the data
+    /// swapped out, giving how many tags the file swapped in
+    pub fn finish(self) -> usize {
+        let (tags, domains) = self.totals;
+        info!(
+            geosite_tags = tags,
+            total_domains = domains,
+            "GeoSite data loaded"
+        );
+        drop(self.retired);
+        self.loaded
     }
-    // On failure the closure, and `retired` with it, is dropped right here
-    // 失败时闭包连同 `retired` 就在这里释放
-    let _ = thread::Builder::new()
-        .name("geosite-retire".to_string())
-        .spawn(move || drop(retired));
 }
 
 /// GeoSite 数据库管理器 / GeoSite database manager
@@ -567,16 +583,6 @@ impl GeoSiteManager {
             database: FxHashMap::default(),
             sources: Vec::new(),
         }
-    }
-
-    /// 记下加载后的规模（加载完数据后调用）/ Log the size after loading (call after loading data)
-    fn log_totals(&self) {
-        let total_domains: usize = self.database.values().map(TagMatchers::len).sum();
-        tracing::info!(
-            geosite_tags = self.database.len(),
-            total_domains = total_domains,
-            "GeoSite data loaded"
-        );
     }
 
     /// 添加 GeoSite 条目 / Add GeoSite entry
@@ -1010,7 +1016,7 @@ impl GeoSiteManager {
     pub fn apply_source<P: AsRef<Path>>(&mut self, path: P, parsed: ParsedGeoSite) -> usize {
         let path = path.as_ref();
         let handed_over = Self::read_handovers(self.handovers(path, &parsed));
-        self.swap_source(path, parsed, handed_over, false)
+        self.swap_source(path, parsed, handed_over, false).finish()
     }
 
     /// 数据文件 `path` 换成 `parsed` 时它不再提供、此前由它说了算、前面还有文件提供的 tag，按其中排得最后的那个文件
@@ -1080,21 +1086,23 @@ impl GeoSiteManager {
     }
 
     /// 把数据文件 `path` 新解析出的 `parsed` 换进来，替换它此前贡献的 tag；它不再提供、前面的文件顶上的 tag 换成
-    /// `handed_over`（见 [`Self::read_handovers`]）里的数据。只换数据、不读文件，共享的管理器在写锁下调用。
-    /// 它不再提供、也没有别的文件提供的 tag 随之消失；`keep_unprovided` 时留着正在用的数据，仍算它提供的
+    /// `handed_over`（见 [`Self::read_handovers`]）里的数据。只换数据、不读文件，共享的管理器在写锁下调用，放锁以后
+    /// 再把它交回的 [`Swapped`] 做完。它不再提供、也没有别的文件提供的 tag 随之消失；`keep_unprovided` 时留着正在用的
+    /// 数据，仍算它提供的
     /// Swaps in `parsed`, data file `path`'s new content, in place of the tags it
     /// contributed; the tags it no longer provides that earlier files take over get the
     /// data in `handed_over` (see [`Self::read_handovers`]). It swaps data and reads no
-    /// file, so a shared manager calls it under the write lock. The tags it no longer
-    /// provides that no other file provides disappear with it; with `keep_unprovided` they
-    /// keep the data in use and still count as provided by it
+    /// file, so a shared manager calls it under the write lock and finishes the [`Swapped`]
+    /// it gives back once the lock is released. The tags it no longer provides that no other
+    /// file provides disappear with it; with `keep_unprovided` they keep the data in use and
+    /// still count as provided by it
     pub fn swap_source(
         &mut self,
         path: &Path,
         parsed: ParsedGeoSite,
         handed_over: ParsedGeoSite,
         keep_unprovided: bool,
-    ) -> usize {
+    ) -> Swapped {
         let key = Self::source_key(path);
         // 这个文件排第几：读过的留在原位，头一次读的排到最后 / The file's place: one read before
         // keeps it, one read for the first time goes last
@@ -1147,9 +1155,14 @@ impl GeoSiteManager {
         }
         self.sources[place].1 = tags;
 
-        self.log_totals();
-        retire(retired);
-        loaded_count
+        Swapped {
+            loaded: loaded_count,
+            totals: (
+                self.database.len(),
+                self.database.values().map(TagMatchers::len).sum(),
+            ),
+            retired,
+        }
     }
 
     /// 排在第 `place` 个文件后面的文件里，有没有提供这个 tag 的
@@ -1416,8 +1429,6 @@ impl GeoSiteManager {
         // 逐个添加条目，保留现有数据 / Add entries one by one, preserving existing data
         self.database
             .extend(Self::convert_v2ray_to_entries(v2ray_data));
-
-        self.log_totals();
 
         Ok(count)
     }

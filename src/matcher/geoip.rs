@@ -338,6 +338,18 @@ impl GeoIpManager {
             .is_some_and(|mmdb| FileStamp::of(Path::new(path)).is_ok_and(|file| file != mmdb.file))
     }
 
+    /// 和这个管理器用同一份 MMDB、还没有标签的管理器：监视到数据文件变了时，新的标签在它上面、锁外装好，写锁下只把整个
+    /// 管理器换进去（见 `engine::geo` 的 `reload_geoip_file`）
+    /// A manager with this one's very MMDB and no tags yet: when a watched data file changes, the
+    /// new tags go into it outside the lock, and the write lock is held only to swap the whole
+    /// manager in (see `reload_geoip_file` in `engine::geo`)
+    pub fn sharing_mmdb(&self) -> Self {
+        Self {
+            mmdb: self.mmdb.clone(),
+            tag_indexes: FxHashMap::default(),
+        }
+    }
+
     /// MMDB 是否已加载；加载了，两个字母的国家代码就只按它判断
     /// Whether an MMDB is loaded; when one is, two-letter country codes are judged by it alone
     #[inline]
