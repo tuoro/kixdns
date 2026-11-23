@@ -2054,7 +2054,7 @@ async fn receive_one_by_one_reading_drops(
     engine: &Arc<Engine>,
     reads_drops: bool,
 ) -> ! {
-    let mut buf = vec![0; 4096];
+    let mut buf = vec![0; kixdns::proto_utils::MAX_QUERY_LEN];
     // 复用发送缓冲区：缓存命中时在这里改 TTL 和 TXID，避免每包堆分配 / Reuse send buffer to patch TTLs and the TXID on cache hits, avoiding per-packet heap allocation
     let mut reply = BytesMut::with_capacity(512);
     // 这个循环从不说自己在忙，转发回来的回答都直接发 / This loop never says it is busy, so replies
@@ -2257,18 +2257,19 @@ const TCP_READ_CHUNK: usize = 4096;
 /// once this much has gathered, without waiting for the rest of the batch
 const TCP_ANSWERS_FLUSH: usize = 16 * 1024;
 
-/// 从读进来的字节里取出下一个完整的消息（不带长度前缀）；还不完整时没有
-/// Takes the next complete message (without its length prefix) out of the bytes read; none
-/// while it is still incomplete
+/// 从读进来的字节里取出下一个完整的消息（不带长度前缀），拷成单独的一份；还不完整时没有。查询只有几十到几百字节，拷出来
+/// 不费事：在途的查询不再钉住整块读缓冲，读缓冲留在原地接着用，不必每读一轮都另分配一块
+/// Takes the next complete message (without its length prefix) out of the bytes read, copied
+/// into a piece of its own; none while it is still incomplete. A query is a few tens to hundreds
+/// of bytes and cheap to copy: the queries in flight no longer pin the whole read buffer, which
+/// stays where it is for the next reads instead of a new one being allocated each round
 fn take_tcp_message(received: &mut bytes::BytesMut) -> Option<bytes::Bytes> {
     use bytes::Buf;
 
     let len = u16::from_be_bytes(received.get(..2)?.try_into().ok()?) as usize;
-    if received.len() < 2 + len {
-        return None;
-    }
-    received.advance(2);
-    Some(received.split_to(len).freeze())
+    let message = bytes::Bytes::copy_from_slice(received.get(2..2 + len)?);
+    received.advance(2 + len);
+    Some(message)
 }
 
 /// 当场答好的一个回答带上长度前缀排进 `answers`；放不进一个 TCP 消息的不发
@@ -2417,9 +2418,12 @@ async fn serve_tcp_conn(
             }
         };
         let missing = match received.get(..2) {
-            Some(prefix) => {
-                2 + u16::from_be_bytes([prefix[0], prefix[1]]) as usize - received.len()
-            }
+            Some(prefix) => match u16::from_be_bytes([prefix[0], prefix[1]]) as usize {
+                // 没有这么长的查询（见 MAX_QUERY_LEN）：不为它留 64 KiB，关掉连接 / No query is this
+                // long (see MAX_QUERY_LEN): no 64 KiB is set aside for it, and the connection closes
+                len if len > kixdns::proto_utils::MAX_QUERY_LEN => break,
+                len => 2 + len - received.len(),
+            },
             None => 2 - received.len(),
         };
         received.reserve(missing.max(TCP_READ_CHUNK));
@@ -5479,13 +5483,15 @@ mod tests {
         assert_eq!(read_answer_id(&mut client).await, 9);
     }
 
-    /// 比一次读的大小还长的消息照样读完，后面的查询照样答
-    /// A message longer than one read is still read whole, and the query after it is answered
+    /// 比一次读的大小还长的消息照样读完，后面的查询照样答：最长的查询带上长度前缀就比一次读的多
+    /// A message longer than one read is still read whole, and the query after it is answered:
+    /// the longest query with its length prefix is more than one read
     #[tokio::test]
     async fn a_message_longer_than_one_read_is_read_whole() {
         let (mut client, _server) = tcp_connection(static_engine()).await;
         let mut long = query("long.example.", 1);
-        long.resize(TCP_READ_CHUNK * 3 + 17, 0);
+        long.resize(kixdns::proto_utils::MAX_QUERY_LEN, 0);
+        assert!(2 + long.len() > TCP_READ_CHUNK);
         let frames = [
             &(long.len() as u16).to_be_bytes()[..],
             &long,
@@ -5541,6 +5547,29 @@ mod tests {
         let (stream, peer) = listener.accept().await.unwrap();
         let server = tokio::spawn(serve_tcp_conn(stream, peer, engine, SHORT_READ_TIMEOUT));
         (client, server)
+    }
+
+    /// 声明的长度超过 MAX_QUERY_LEN 的消息不等它发完，连接当场关掉，之前的查询照样答。以前按长度前缀先留出 64 KiB，
+    /// 再等正文等一个读超时：几千条这样的连接就占满路由器的内存
+    /// A message declaring more than MAX_QUERY_LEN is not waited for: the connection closes there
+    /// and then, the queries before it still answered. A length prefix used to set aside 64 KiB
+    /// and wait a read timeout for the body: a few thousand such connections filled a router's memory
+    #[tokio::test]
+    async fn a_message_longer_than_any_query_closes_the_connection() {
+        let (mut client, server) = tcp_connection_timing_out(static_engine()).await;
+        let mut sent = tcp_frame("before.example.", 7);
+        sent.extend_from_slice(&u16::MAX.to_be_bytes());
+        let started = std::time::Instant::now();
+        client.write_all(&sent).await.unwrap();
+        assert_eq!(read_answer_id(&mut client).await, 7);
+        let mut rest = [0u8; 1];
+        assert_eq!(client.read(&mut rest).await.unwrap(), 0, "closed");
+        assert!(
+            started.elapsed() < SHORT_READ_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+        server.await.unwrap().expect("connection handler");
     }
 
     /// 半截消息一点点地发也不能一直挂着：正文从开始等起总共一个读超时，中途到的字节不重新计时

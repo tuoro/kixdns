@@ -140,6 +140,16 @@ const HEADER_LEN: usize = 12;
 /// 1035 section 2.3.4). Every function that reads a name keeps to it
 const MAX_NAME_LEN: usize = 255;
 
+/// 客户端发来的一个查询最长多少字节：UDP 一次收这么多，再长的被截断、答 FORMERR；TCP 上声明更长的关掉连接，DoH 的请求
+/// 正文也到此为止。真实的查询远没有这么长（按 RFC 8467 填充也只填到 128 字节的整数倍），定这个数是不让一个客户端凭一个
+/// 长度前缀或请求头就让内核为每条连接、每个请求留下 64 KiB
+/// The longest query a client may send, in bytes: UDP takes this much at a time, a longer one
+/// cut and answered FORMERR; over TCP a longer one declared closes the connection, and the body
+/// of a DoH request ends here too. Real queries are nowhere near this long (padded to a
+/// multiple of 128 bytes under RFC 8467), and the bound keeps a client from having the kernel
+/// set aside 64 KiB per connection or request on the strength of a length prefix or a header
+pub const MAX_QUERY_LEN: usize = 4096;
+
 /// 查询的第一个问题名读得了：标签、长度合规，压缩指针只往前指、不指进报文头（见 [`strict_name_end`]）。
 /// hickory 不管指针指不指进报文头，所以快速解析读不了、要交给 hickory 的查询先过这一关。
 /// Whether the query's first question name can be read: proper labels and length, and

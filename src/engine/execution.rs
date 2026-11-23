@@ -336,18 +336,20 @@ impl Engine {
         permit
     }
 
-    /// `client` 的一条 TCP 或 DoH 新连接接不接（见 `FlowControlState::connection_permit`）。连接本身也占内存，
-    /// 所以也算在途；没开流控时都接
-    /// Whether a new TCP or DoH connection from `client` is taken (see
-    /// `FlowControlState::connection_permit`). A connection holds memory too, so it counts as in
-    /// flight; without flow control it always is
+    /// `client` 的一条 TCP 或 DoH 新连接接不接：连接一共开得太多时不给占满了自己那一份的设备（见
+    /// `PermitManager::connection_permit`），开着流控时还看内存（见 `FlowControlState::connection_permit`）。连接本身也占
+    /// 内存，所以也算在途
+    /// Whether a new TCP or DoH connection from `client` is taken: with too many open in all, not
+    /// for a device holding its share (see `PermitManager::connection_permit`), and with flow
+    /// control on by memory too (see `FlowControlState::connection_permit`). A connection holds
+    /// memory too, so it counts as in flight
     #[inline]
     pub fn connection_permit(&self, client: IpAddr) -> Option<PermitGuard> {
-        let Some(state) = &self.flow_control_state else {
-            return Some(self.permit_manager.acquire());
+        let device = self.permit_manager.slot_of(client);
+        let permit = match &self.flow_control_state {
+            Some(state) => state.connection_permit(&self.permit_manager, device),
+            None => self.permit_manager.connection_permit(device),
         };
-        let permit =
-            state.connection_permit(&self.permit_manager, self.permit_manager.slot_of(client));
         if permit.is_none() {
             self.permit_manager.note_refused(client);
         }

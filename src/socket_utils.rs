@@ -528,9 +528,10 @@ pub mod udp_batch {
         }
         Ok(sent as usize)
     }
-    /// 每个报文的接收缓冲，和单收时一样大，更长的报文被截断 / Each datagram's receive buffer, as
-    /// large as for single receives; a longer datagram is cut
-    pub const RECV_SIZE: usize = 4096;
+    /// 每个报文的接收缓冲，和单收时一样大，更长的报文被截断（见 `proto_utils::MAX_QUERY_LEN`）/ Each
+    /// datagram's receive buffer, as large as for single receives; a longer datagram is cut (see
+    /// `proto_utils::MAX_QUERY_LEN`)
+    pub const RECV_SIZE: usize = crate::proto_utils::MAX_QUERY_LEN;
 
     /// 对端：内核给的原始地址发回时原样交回，`addr` 给引擎和日志用
     /// A peer: the kernel's own address, handed back as it is to reply, and `addr` for the engine and logs

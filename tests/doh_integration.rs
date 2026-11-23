@@ -388,8 +388,8 @@ async fn test_doh_post_too_large() {
     let server = start_doh(make_nxdomain_engine()).await;
     let client = make_https_client();
 
-    // 70 KiB body, well over the 64 KiB limit
-    let oversized = vec![0xAAu8; 70 * 1024];
+    // One byte over the longest query (proto_utils::MAX_QUERY_LEN)
+    let oversized = vec![0xAAu8; kixdns::proto_utils::MAX_QUERY_LEN + 1];
 
     let resp = post(&client, server.port, oversized)
         .send()
@@ -534,7 +534,7 @@ async fn test_doh_post_body_at_limit_still_processed() {
 
     // A standard query header (QR=0, opcode 0, one question) so it passes the
     // query check, then 0xAA up to the limit: the question cannot be read.
-    let mut at_limit = vec![0xAAu8; 64 * 1024];
+    let mut at_limit = vec![0xAAu8; kixdns::proto_utils::MAX_QUERY_LEN];
     at_limit[2..12].copy_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
 
     let resp = post(&client, server.port, at_limit)
