@@ -213,11 +213,7 @@ impl Engine {
             Arc::new(UdpClient::new(settings.udp_pool_size).context("initialize UDP client")?);
         // 上游的主机名经 bootstrap 的服务器解析，用的是上面这个 UDP 客户端 / Upstream host names are
         // resolved through the bootstrap servers, by the UDP client above
-        let bootstrap = Bootstrap::new(
-            &settings.bootstrap,
-            Arc::clone(&udp_client),
-            std::time::Duration::from_millis(settings.upstream_timeout_ms),
-        );
+        let bootstrap = Bootstrap::new(&settings.bootstrap, Arc::clone(&udp_client));
 
         let tcp_mux = Arc::new(TcpMultiplexer::new(
             settings.tcp_pool_size,
@@ -436,15 +432,37 @@ impl Engine {
             tracing::warn!(target = "config", %warning, "configuration warning");
         }
         if let Some(observer) = &self.observer {
+            let config = &state.pipeline;
+            // 没有 pipeline 时请求报的是 `NO_PIPELINE` / With no pipelines requests report `NO_PIPELINE`
+            let pipelines: Vec<&str> = if config.pipelines.is_empty() {
+                vec![super::pipeline::NO_PIPELINE]
+            } else {
+                config
+                    .pipelines
+                    .iter()
+                    .map(|pipeline| &*pipeline.id)
+                    .collect()
+            };
+            let rules: Vec<(&str, &str)> = config
+                .pipelines
+                .iter()
+                .flat_map(|pipeline| {
+                    pipeline
+                        .rules
+                        .iter()
+                        .map(|rule| (&*pipeline.id, &*rule.name))
+                })
+                .collect();
+            let upstreams: Vec<_> = super::upstream::upstreams(config).into_iter().collect();
             observer.config_loaded(&ConfigLoaded {
                 path,
                 generation,
                 source,
-                restart_pending: &state
-                    .pipeline
-                    .settings
-                    .restart_pending(&self.running_settings),
-                warnings: &state.pipeline.warnings,
+                restart_pending: &config.settings.restart_pending(&self.running_settings),
+                warnings: &config.warnings,
+                pipelines: &pipelines,
+                rules: &rules,
+                upstreams: &upstreams,
             });
         }
     }

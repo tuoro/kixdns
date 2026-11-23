@@ -28,7 +28,7 @@ use hyper::{Method, Request, Response, StatusCode};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(unix)]
 use serde::Deserialize;
 #[cfg(unix)]
@@ -112,6 +112,17 @@ fn push_key_parts(buffer: &mut String, parts: &[&str]) {
     }
 }
 
+/// 统计键的头两段：规则的项是 pipeline 和规则名，上游的项是地址和传输（响应码的项是地址和响应码）
+/// A metric key's first two parts: a pipeline and a rule name for a rule's series, an address
+/// and a transport for an upstream's (an address and a response code for a response code's)
+fn leading_parts(key: &str) -> Option<(&str, &str)> {
+    let (first, rest) = key.split_once('\0')?;
+    Some((
+        first,
+        rest.split_once('\0').map_or(rest, |(second, _)| second),
+    ))
+}
+
 #[derive(Clone, Default)]
 struct ActiveConfig {
     generation: u64,
@@ -123,12 +134,12 @@ struct ActiveConfig {
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
     restart_pending: Vec<String>,
-    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载，只记一条 warn，
-    /// 而默认日志级别是 error，所以经控制通道报出来；重载成功说明新配置没有这样的写法，就清空
+    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载、各记一条 error，
+    /// 也经控制通道报出来，面板不用翻日志；重载成功说明新配置没有这样的写法，就清空
     /// What the configuration read at startup writes that a reload or a save from the panel
-    /// refuses (see `config::problems`). Startup loads it as before with only a warning, the
-    /// default log level being error, so they are reported over the control channel; a
-    /// successful reload means the new configuration has none, and they are cleared
+    /// refuses (see `config::problems`). Startup loads it as before and logs an error for each,
+    /// and they are reported over the control channel too, so the panel need not search the
+    /// log; a successful reload means the new configuration has none, and they are cleared
     problems: Vec<String>,
     /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None。监视不了时文件改了不会重载，面板保存的配置
     /// 也不生效，等不到重载序号变
@@ -502,104 +513,97 @@ impl RequestLatency {
 /// under `metric_series_insert_lock`, adds itself and swaps the copy in. The table holds `Arc`s, so
 /// counts made through the old table and the new one land on the same value.
 ///
-/// 每一项记着最后在第几代配置里计过数，换配置时整整一代都没计过数的去掉（见
-/// [`PanelMetrics::forget_series_unused_since`]）：改了名的规则、换掉的上游不会一直留在表里和导出里，
-/// 表也不会被它们占满、让新规则的计数加不进去
-/// Each series notes the configuration generation it last counted in, and those that counted
-/// nothing through a whole generation go when the configuration changes (see
-/// [`PanelMetrics::forget_series_unused_since`]): renamed rules and replaced upstreams do not
-/// stay in the table and the export for good, nor fill the table so that new rules' counts
-/// find no room
+/// 统计项跟着配置走：换配置时，配置里已经没有的 pipeline、规则和上游的项去掉，还在的不管多久没计数都留着（见
+/// [`PanelMetrics::keep_series_of`]）。改了名的规则、换掉的上游不会一直留在表里和导出里，表也不会被它们占满、让
+/// 新规则的计数加不进去。以前按上一代配置里计没计过数去留，两次挨着保存就清掉了还在配置里的规则的累计计数
+/// Series follow the configuration: when it changes, those of the pipelines, rules and upstreams
+/// it no longer has go, and the rest stay however long they went without a count (see
+/// [`PanelMetrics::keep_series_of`]). Renamed rules and replaced upstreams do not stay in the
+/// table and the export for good, nor fill the table so that new rules' counts find no room.
+/// Whether a series counted in the previous configuration used to decide, so two saves in a row
+/// cleared the counts of rules still in the configuration
 struct Series<V> {
-    table: ArcSwap<FxHashMap<Arc<str>, Arc<Stamped<V>>>>,
-}
-
-/// 一项统计和它最后计数的配置代数 / A series' value and the configuration generation it last counted in
-struct Stamped<V> {
-    value: V,
-    counted_in: AtomicU64,
-}
-
-impl<V> std::ops::Deref for Stamped<V> {
-    type Target = V;
-
-    fn deref(&self) -> &V {
-        &self.value
-    }
+    table: ArcSwap<FxHashMap<Arc<str>, Arc<V>>>,
+    /// 加不进表的统计项（键太长，或表满了），每项只算一次丢弃（见 [`PanelMetrics::drop_series`]）；和表一样跟着
+    /// 配置走
+    /// The series that found no room in the table (a key too long, or the table full), each
+    /// counted as dropped once (see [`PanelMetrics::drop_series`]); they follow the
+    /// configuration as the table does
+    dropped: ArcSwap<FxHashSet<Arc<str>>>,
 }
 
 impl<V> Default for Series<V> {
     fn default() -> Self {
         Self {
             table: ArcSwap::from_pointee(FxHashMap::default()),
+            dropped: ArcSwap::from_pointee(FxHashSet::default()),
         }
     }
 }
 
 impl<V> Series<V> {
-    /// 把 `key` 那一项交给 `update`，记下它在第 `generation` 代计过数；没有这一项时为 None。代数只在变了时才写，
-    /// 一代配置里每项只写一次 / Hands the series under `key` to `update`, noting it counted in generation
-    /// `generation`; None when there is none. The generation is written only when it changed, once
-    /// per series and configuration
+    /// 把 `key` 那一项交给 `update`；没有这一项时为 None / Hands the series under `key` to
+    /// `update`; None when there is none
     #[inline]
-    fn with<R>(&self, key: &str, generation: u64, update: impl FnOnce(&V) -> R) -> Option<R> {
-        let table = self.table.load();
-        let stamped = table.get(key)?;
-        if stamped.counted_in.load(Ordering::Relaxed) < generation {
-            stamped.counted_in.store(generation, Ordering::Relaxed);
-        }
-        Some(update(&stamped.value))
+    fn with<R>(&self, key: &str, update: impl FnOnce(&V) -> R) -> Option<R> {
+        self.table.load().get(key).map(|value| update(value))
     }
 
     fn len(&self) -> usize {
         self.table.load().len()
     }
 
-    /// 测试用：读 `key` 那一项，不算计数 / For tests: reads the series under `key`, counting nothing
-    #[cfg(test)]
-    fn read<R>(&self, key: &str, read: impl FnOnce(&V) -> R) -> Option<R> {
-        self.table
-            .load()
-            .get(key)
-            .map(|stamped| read(&stamped.value))
-    }
-
     /// 此刻的整张表，导出时用 / The whole table as it is now, for export
-    fn snapshot(&self) -> Arc<FxHashMap<Arc<str>, Arc<Stamped<V>>>> {
+    fn snapshot(&self) -> Arc<FxHashMap<Arc<str>, Arc<V>>> {
         self.table.load_full()
     }
 
-    /// 加上第 `generation` 代里头一次计数的一项。`_locked` 是 `metric_series_insert_lock` 的锁：两个新项不会
-    /// 各拿一份旧表、互相覆盖
-    /// Adds a series counting for the first time in generation `generation`. `_locked` is the
-    /// guard of `metric_series_insert_lock`: two new series never each copy the old table and
-    /// overwrite each other
-    fn insert(&self, _locked: &MutexGuard<'_, ()>, key: &str, value: V, generation: u64) {
+    /// 加上头一次计数的一项。`_locked` 是 `metric_series_insert_lock` 的锁：两个新项不会各拿一份旧表、互相覆盖
+    /// Adds a series counting for the first time. `_locked` is the guard of
+    /// `metric_series_insert_lock`: two new series never each copy the old table and overwrite
+    /// each other
+    fn insert(&self, _locked: &MutexGuard<'_, ()>, key: &str, value: V) {
         let mut table = (**self.table.load()).clone();
-        let stamped = Stamped {
-            value,
-            counted_in: AtomicU64::new(generation),
-        };
-        table.insert(Arc::from(key), Arc::new(stamped));
+        table.insert(Arc::from(key), Arc::new(value));
         self.table.store(Arc::new(table));
     }
 
-    /// 去掉第 `since` 代以来没计过数的项，锁同 [`Self::insert`] / Drops the series that counted
-    /// nothing since generation `since`, under the lock [`Self::insert`] takes
-    fn forget_unused_since(&self, _locked: &MutexGuard<'_, ()>, since: u64) {
-        let table = self.table.load();
-        if table
-            .values()
-            .all(|stamped| stamped.counted_in.load(Ordering::Relaxed) >= since)
-        {
-            return;
+    /// 记下加不进表的 `key`，头一回记下时为真。不拿锁：几个线程同时记下同一项时只有一个为真
+    /// Notes `key` as finding no room, true the first time. No lock is taken: of several
+    /// threads noting the same series at once, only one is told true
+    fn note_dropped(&self, key: &str) -> bool {
+        if self.dropped.load().contains(key) {
+            return false;
         }
-        let kept = table
+        let mut first = false;
+        self.dropped.rcu(|dropped| {
+            let mut dropped = FxHashSet::clone(dropped);
+            first = dropped.insert(Arc::from(key));
+            dropped
+        });
+        first
+    }
+
+    /// 只留下 `keep` 认可的项，锁同 [`Self::insert`]。记下的丢弃也一样，[`Self::note_dropped`] 同时改了的话
+    /// 重来一遍
+    /// Keeps only the series `keep` accepts, under the lock [`Self::insert`] takes. The same goes
+    /// for those noted as dropped, done over should [`Self::note_dropped`] change them meanwhile
+    fn retain(&self, _locked: &MutexGuard<'_, ()>, keep: impl Fn(&str) -> bool) {
+        let kept = self
+            .table
+            .load()
             .iter()
-            .filter(|(_, stamped)| stamped.counted_in.load(Ordering::Relaxed) >= since)
-            .map(|(key, stamped)| (Arc::clone(key), Arc::clone(stamped)))
+            .filter(|(key, _)| keep(key))
+            .map(|(key, value)| (Arc::clone(key), Arc::clone(value)))
             .collect();
         self.table.store(Arc::new(kept));
+        self.dropped.rcu(|dropped| {
+            dropped
+                .iter()
+                .filter(|key| keep(key))
+                .cloned()
+                .collect::<FxHashSet<_>>()
+        });
     }
 }
 
@@ -743,11 +747,9 @@ pub struct PanelMetrics {
     upstream_attempts: Series<ThreadCount>,
     upstream_results: Series<ThreadCount>,
     metric_series_insert_lock: Mutex<()>,
+    /// 加不进表的统计项有几个，每项只算一次（见 [`Series::note_dropped`]）/ How many series found no
+    /// room in their table, each counted once (see [`Series::note_dropped`])
     metric_series_dropped: AtomicU64,
-    /// 现在是第几代配置，统计项计数时记下（见 [`Series`]）；和 `active_config` 的代数一样，计数时不必拿锁
-    /// The configuration generation now, which series note as they count (see [`Series`]); the
-    /// same as `active_config`'s, read without its lock as counts are made
-    config_generation: AtomicU64,
     reload_success: AtomicU64,
     reload_failure: AtomicU64,
     reload_sequence: AtomicU64,
@@ -791,7 +793,6 @@ impl Default for PanelMetrics {
             upstream_results: Series::default(),
             metric_series_insert_lock: Mutex::new(()),
             metric_series_dropped: AtomicU64::new(0),
-            config_generation: AtomicU64::new(0),
             reload_success: AtomicU64::new(0),
             reload_failure: AtomicU64::new(0),
             reload_sequence: AtomicU64::new(0),
@@ -924,41 +925,33 @@ impl PanelMetrics {
         );
     }
 
-    /// 一份配置生效了：第一次加载时代数是 1；之后每次重载加一，并在写锁里计一次重载成功、加重载序号
-    /// （见 `config_json`）
-    /// A configuration became active: generation 1 on the first load; each reload after
-    /// that adds one and, under the write lock, counts a reload success and bumps the
-    /// reload sequence (see `config_json`)
-    fn config_became_active(
-        &self,
-        sha256: String,
-        initial: bool,
-        restart_pending: Vec<String>,
-        warnings: Vec<String>,
-    ) {
+    /// 一份配置生效了，代数照引擎报的记：代数 1 是第一次加载，之后的都是重载，在写锁里计一次重载成功、加重载序号
+    /// （见 `config_json`）。没带原文时摘要照旧。以前面板自己数代数，第一次加载还按带没带原文分两种判断
+    /// A configuration became active, at the generation the engine gives: generation 1 is the
+    /// first load and every later one a reload, which under the write lock counts a reload
+    /// success and bumps the reload sequence (see `config_json`). Without the text the digest
+    /// stays. The panel used to count the generations itself, telling the first load two ways
+    /// by whether the text came along
+    fn config_became_active(&self, config: &ConfigLoaded<'_>) {
+        let sha256 = config
+            .source
+            .map(|source| format!("{:x}", Sha256::digest(source.as_bytes())));
         let mut active = self.active_config.write();
-        active.generation = if initial {
-            1
-        } else {
-            active.generation.saturating_add(1)
-        };
-        self.config_generation
-            .store(active.generation, Ordering::Relaxed);
-        // 上一代配置里一次都没计过数的统计项去掉（见 `Series`）/ The series that counted nothing
-        // through the last configuration go (see `Series`)
-        if !initial {
-            self.forget_series_unused_since(active.generation - 1);
+        active.generation = config.generation;
+        if let Some(sha256) = sha256 {
+            active.sha256 = sha256;
         }
-        active.sha256 = sha256;
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
         active.last_reload_error = None;
-        active.restart_pending = restart_pending;
-        active.warnings = warnings;
-        if !initial {
+        active.restart_pending = config
+            .restart_pending
+            .iter()
+            .map(|setting| setting.to_string())
+            .collect();
+        active.warnings = config.warnings.to_vec();
+        if config.generation > 1 {
             active.problems.clear();
-        }
-        if !initial {
             self.reload_success.fetch_add(1, Ordering::Relaxed);
             self.reload_sequence.fetch_add(1, Ordering::Release);
         }
@@ -973,56 +966,89 @@ impl PanelMetrics {
         });
     }
 
-    /// 把 `key` 那一项交给 `update`。头一次出现的统计项在锁里加上；键太长或这一组已满时不加，只计一次
-    /// 丢弃。
+    /// 把 `key` 那一项交给 `update`。头一次出现的统计项在锁里加上；键太长或这一组已满时不加，算作丢弃（见
+    /// [`Self::drop_series`]）。
     /// Hands the series under `key` to `update`. A series seen for the first time is added under the
-    /// lock; a key too long or a full set adds nothing and counts one dropped series.
+    /// lock; a key too long or a full set adds nothing and is counted as dropped (see
+    /// [`Self::drop_series`]).
     #[inline]
     fn update_series<V: Default>(&self, series: &Series<V>, key: &str, update: impl Fn(&V)) {
-        let generation = self.config_generation.load(Ordering::Relaxed);
-        if series.with(key, generation, &update).is_some() {
+        if series.with(key, &update).is_some() {
             return;
         }
-        // 键太长，或者这一组已经满了：都加不进去，不必拿锁。满了的表不会再变小，而锁是全进程共用的：规则多过上限的
-        // 配置下，命中表外规则的每个查询都拿一次的话，几个核就互相等
+        // 键太长，或者这一组已经满了：都加不进去，不必拿锁。满了的表换配置以前不会变小，而锁是全进程共用的：规则多过
+        // 上限的配置下，命中表外规则的每个查询都拿一次的话，几个核就互相等
         // A key too long, or a set already full: neither can be added, so no lock is taken. A
-        // full table never shrinks, and the lock is shared by the whole process: with more rules
-        // than the limit, every query matching a rule outside the table taking it would have the
-        // cores wait on one another
+        // full table does not shrink until the configuration changes, and the lock is shared by
+        // the whole process: with more rules than the limit, every query matching a rule outside
+        // the table taking it would have the cores wait on one another
         if key.len() > MAX_METRIC_KEY_BYTES || series.len() >= MAX_METRIC_SERIES_PER_MAP {
-            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+            self.drop_series(series, key);
             return;
         }
         let locked = self.metric_series_insert_lock.lock();
         // 等锁的时候别的线程可能已经加上了 / Another thread may have added it while this one waited
-        if series.with(key, generation, &update).is_some() {
+        if series.with(key, &update).is_some() {
             return;
         }
         if series.len() >= MAX_METRIC_SERIES_PER_MAP {
-            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+            self.drop_series(series, key);
             return;
         }
         let value = V::default();
         update(&value);
-        series.insert(&locked, key, value, generation);
+        series.insert(&locked, key, value);
     }
 
-    /// 每组统计里去掉第 `since` 代以来没计过数的项（见 [`Series`]）/ Drops from every set the series that
-    /// counted nothing since generation `since` (see [`Series`])
-    fn forget_series_unused_since(&self, since: u64) {
+    /// `key` 那一项加不进 `series`：头一回加不进时计一次丢弃。以前每次计数都算一次，丢弃数跟着流量涨，说不出导出里
+    /// 少了几项
+    /// The series under `key` finds no room in `series`: the first time counts one dropped
+    /// series. Every count used to add one, so the number grew with the traffic and told nothing
+    /// of how many series the export lacks
+    fn drop_series<V>(&self, series: &Series<V>, key: &str) {
+        if series.note_dropped(key) {
+            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 每组统计里只留下 `config` 还有的 pipeline、规则和上游的项（见 [`Series`]）。上游的项按地址和传输留，响应码的项
+    /// 不分传输，只按地址
+    /// Keeps in every set only the series of the pipelines, rules and upstreams `config` still
+    /// has (see [`Series`]). An upstream's series are kept by its address and transport, those of
+    /// response codes, which do not tell transports apart, by its address alone
+    fn keep_series_of(&self, config: &ConfigLoaded<'_>) {
+        let pipelines: FxHashSet<&str> = config.pipelines.iter().copied().collect();
+        let rules: FxHashSet<(&str, &str)> = config.rules.iter().copied().collect();
+        let upstreams: FxHashSet<(&str, &str)> = config
+            .upstreams
+            .iter()
+            .map(|&(address, transport)| (address, transport_label(transport)))
+            .collect();
+        let addresses: FxHashSet<&str> = config
+            .upstreams
+            .iter()
+            .map(|&(address, _)| address)
+            .collect();
+        let named_by = |names: &FxHashSet<(&str, &str)>, key: &str| {
+            leading_parts(key).is_some_and(|parts| names.contains(&parts))
+        };
         let locked = self.metric_series_insert_lock.lock();
+        self.pipeline_hits
+            .retain(&locked, |pipeline| pipelines.contains(pipeline));
+        self.rule_matches
+            .retain(&locked, |key| named_by(&rules, key));
+        self.upstream_rcodes.retain(&locked, |key| {
+            leading_parts(key).is_some_and(|(address, _)| addresses.contains(address))
+        });
         for series in [&self.upstream_latency, &self.upstream_response_latency] {
-            series.forget_unused_since(&locked, since);
+            series.retain(&locked, |key| named_by(&upstreams, key));
         }
         for series in [
-            &self.upstream_rcodes,
             &self.upstream_via,
-            &self.pipeline_hits,
-            &self.rule_matches,
             &self.upstream_attempts,
             &self.upstream_results,
         ] {
-            series.forget_unused_since(&locked, since);
+            series.retain(&locked, |key| named_by(&upstreams, key));
         }
     }
 
@@ -1032,18 +1058,6 @@ impl PanelMetrics {
         active.last_reload_error = Some(truncate(error, MAX_ERROR_LENGTH));
         self.reload_failure.fetch_add(1, Ordering::Relaxed);
         self.reload_sequence.fetch_add(1, Ordering::Release);
-    }
-
-    /// 从观察者收到的配置原文更新摘要。/ Refresh the digest from the loaded source.
-    fn record_config_loaded(
-        &self,
-        source: &str,
-        restart_pending: Vec<String>,
-        warnings: Vec<String>,
-    ) {
-        let sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
-        let initial = self.active_config.read().generation == 0;
-        self.config_became_active(sha256, initial, restart_pending, warnings);
     }
 
     #[cfg(unix)]
@@ -1163,6 +1177,7 @@ impl PanelMetrics {
         metric(
             &mut output,
             "kixdns_cache_entries",
+            GAUGE,
             engine.cache.weighted_size(),
         );
         render_flow_control(&mut output, engine);
@@ -1175,28 +1190,32 @@ impl PanelMetrics {
         metric(
             output,
             "kixdns_requests_total",
+            COUNTER,
             self.requests_total.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_requests_inflight",
+            GAUGE,
             self.requests_inflight.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_cache_lookups_total",
+            COUNTER,
             self.cache_lookups_total.load(Ordering::Relaxed),
         );
+        family(output, "kixdns_cache_hits_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_cache_hits_total",
-            &[("kind", "fresh")],
+            [("kind", "fresh")],
             self.cache_hits_fresh.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_cache_hits_total",
-            &[("kind", "stale")],
+            [("kind", "stale")],
             self.cache_hits_stale.load(Ordering::Relaxed),
         );
         append_map(
@@ -1223,27 +1242,30 @@ impl PanelMetrics {
             &self.upstream_results,
             &["upstream", "transport", "result"],
         );
+        family(output, "kixdns_config_reload_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_config_reload_total",
-            &[("result", "success")],
+            [("result", "success")],
             self.reload_success.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_config_reload_total",
-            &[("result", "failure")],
+            [("result", "failure")],
             self.reload_failure.load(Ordering::Relaxed),
         );
         metric(
             output,
             "kixdns_config_generation",
+            GAUGE,
             self.active_config.read().generation,
         );
+        family(output, "kixdns_cache_stale_total", COUNTER);
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "expired")],
+            [("reason", "expired")],
             self.cache_hits_stale
                 .load(Ordering::Relaxed)
                 .saturating_sub(self.cache_stale_client_timeout.load(Ordering::Relaxed))
@@ -1252,15 +1274,16 @@ impl PanelMetrics {
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "client_timeout")],
+            [("reason", "client_timeout")],
             self.cache_stale_client_timeout.load(Ordering::Relaxed),
         );
         labeled_metric(
             output,
             "kixdns_cache_stale_total",
-            &[("reason", "upstream_failure")],
+            [("reason", "upstream_failure")],
             self.cache_stale_upstream_failure.load(Ordering::Relaxed),
         );
+        family(output, "kixdns_requests_finished_total", COUNTER);
         for (status, counter) in [
             ("completed", &self.requests_completed),
             ("failed", &self.requests_failed),
@@ -1269,17 +1292,18 @@ impl PanelMetrics {
             labeled_metric(
                 output,
                 "kixdns_requests_finished_total",
-                &[("status", status)],
+                [("status", status)],
                 counter.load(Ordering::Relaxed),
             );
         }
+        family(output, "kixdns_request_latency_ms", "histogram");
         let mut cumulative = 0u64;
         for (index, bound) in REQUEST_LATENCY_BUCKETS_MS.iter().enumerate() {
             cumulative += self.request_latency.buckets[index].load(Ordering::Relaxed);
             labeled_metric(
                 output,
                 "kixdns_request_latency_ms_bucket",
-                &[("le", &bound.to_string())],
+                [("le", bound.to_string().as_str())],
                 cumulative,
             );
         }
@@ -1288,17 +1312,19 @@ impl PanelMetrics {
         labeled_metric(
             output,
             "kixdns_request_latency_ms_bucket",
-            &[("le", "+Inf")],
+            [("le", "+Inf")],
             cumulative,
         );
-        metric(
+        labeled_metric(
             output,
             "kixdns_request_latency_ms_sum",
+            [],
             format_millis(self.request_latency.micros.load(Ordering::Relaxed)),
         );
-        metric(
+        labeled_metric(
             output,
             "kixdns_request_latency_ms_count",
+            [],
             self.request_latency.count.load(Ordering::Relaxed),
         );
         append_latency_map(
@@ -1328,6 +1354,7 @@ impl PanelMetrics {
         metric(
             output,
             "kixdns_panel_metric_series_dropped_total",
+            COUNTER,
             self.metric_series_dropped.load(Ordering::Relaxed),
         );
     }
@@ -1346,39 +1373,49 @@ fn render_flow_control(output: &mut String, engine: &Engine) {
     metric(
         output,
         "kixdns_flow_control_enabled",
+        GAUGE,
         u8::from(engine.flow_control_state.is_some()),
     );
+    family(output, "kixdns_flow_refused_total", COUNTER);
     for (defence, refused) in manager.refusals() {
         labeled_metric(
             output,
             "kixdns_flow_refused_total",
-            &[("defence", defence.label())],
+            [("defence", defence.label())],
             refused,
         );
     }
-    metric(output, "kixdns_flow_turns_total", manager.turns_begun());
-    metric(output, "kixdns_flow_stuck", manager.stuck());
+    metric(
+        output,
+        "kixdns_flow_turns_total",
+        COUNTER,
+        manager.turns_begun(),
+    );
+    metric(output, "kixdns_flow_stuck", GAUGE, manager.stuck());
     if let Some(margins) = engine
         .flow_control_state
         .as_ref()
         .and_then(|flow| flow.memory.margins_left())
     {
-        metric(output, "kixdns_flow_memory_room", margins);
+        metric(output, "kixdns_flow_memory_room", GAUGE, margins);
     }
+    // 每组的行挨在一起，两组各走一遍 / A family's lines stand together, so each family takes a pass
     let (clients, now) = manager.refused_clients();
-    for client in clients {
-        let address = client.client.to_string();
-        let labels = [("client", address.as_str())];
+    family(output, "kixdns_flow_refused_client_total", COUNTER);
+    for client in &clients {
         labeled_metric(
             output,
             "kixdns_flow_refused_client_total",
-            &labels,
+            [("client", client.client.to_string().as_str())],
             client.refused,
         );
+    }
+    family(output, "kixdns_flow_refused_client_age_seconds", GAUGE);
+    for client in &clients {
         labeled_metric(
             output,
             "kixdns_flow_refused_client_age_seconds",
-            &labels,
+            [("client", client.client.to_string().as_str())],
             now.saturating_sub(client.last_refused_secs),
         );
     }
@@ -1800,21 +1837,8 @@ impl EngineObserver for PanelMetrics {
 
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
         debug_forward!(self.config_loaded(event));
-        let restart_pending = event
-            .restart_pending
-            .iter()
-            .map(|setting| setting.to_string())
-            .collect();
-        let warnings = event.warnings.to_vec();
-        match event.source {
-            Some(source) => self.record_config_loaded(source, restart_pending, warnings),
-            // 没带原文时摘要照旧；第一次加载（代数 1）不算重载
-            // Without the text the digest stays; the first load (generation 1) is no reload
-            None => {
-                let sha256 = self.active_config.read().sha256.clone();
-                self.config_became_active(sha256, event.generation <= 1, restart_pending, warnings);
-            }
-        }
+        self.keep_series_of(event);
+        self.config_became_active(event);
     }
 
     fn config_reload_failed(&self, event: &ConfigReloadFailed<'_>) {
@@ -1904,11 +1928,7 @@ async fn handle_request(
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/v1/health") => json_response(StatusCode::OK, metrics.health_json()),
         (&Method::GET, "/v1/config/active") => json_response(StatusCode::OK, metrics.config_json()),
-        (&Method::GET, "/v1/metrics") => text_response(
-            StatusCode::OK,
-            "text/plain; version=0.0.4; charset=utf-8",
-            metrics.render_prometheus(&engine),
-        ),
+        (&Method::GET, "/v1/metrics") => metrics_response(&metrics, engine).await,
         (&Method::GET, "/v1/stats/top") => match parse_stats_query(request.uri().query()) {
             Ok((window_seconds, limit)) => stats_response(&metrics, window_seconds, limit).await,
             Err(message) => json_response(
@@ -1997,8 +2017,9 @@ struct TrialOutput {
     body: serde_json::Value,
 }
 
-/// 草稿试跑的总时限：子进程启动、加载 Geo 数据、建引擎，再加查询自己的 6 秒
-/// The draft trial's overall limit: child start-up, Geo data loading and engine construction, plus the query's own 6 seconds
+/// 草稿试跑的总时限：排队等前面的试跑、子进程启动、加载 Geo 数据、建引擎，再加查询自己的 6 秒
+/// The draft trial's overall limit: the wait behind earlier trials, child start-up, Geo data loading and engine
+/// construction, plus the query's own 6 seconds
 #[cfg(unix)]
 const TRIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 /// 试跑的请求体：一份配置（与校验同上限）加上查询字段 / A trial body: one config (the validation limit) plus the query fields
@@ -2139,36 +2160,64 @@ async fn run_diagnostic(
     )
 }
 
-/// 读请求正文为什么失败 / Why reading a request body failed
+/// 一个端点怎么读请求正文：最多多少字节，读不成时回答里的错误码，太大和读不出来时各怎么说
+/// How an endpoint reads its request body: at most how many bytes, the error code of the
+/// answer when it cannot, and what that answer says for a body too large and for one that
+/// cannot be read
 #[cfg(unix)]
-enum BodyFailure {
-    TooLarge,
-    Unreadable,
-    /// [`REQUEST_READ_TIMEOUT`] 之内没发完 / Not finished within [`REQUEST_READ_TIMEOUT`]
-    Late,
+struct BodyRules {
+    limit: usize,
+    code: &'static str,
+    too_large: &'static str,
+    unreadable: &'static str,
 }
 
-/// 读请求正文，最多 `limit` 字节，最多等 [`REQUEST_READ_TIMEOUT`]
-/// Read a request body of at most `limit` bytes, waiting at most [`REQUEST_READ_TIMEOUT`]
 #[cfg(unix)]
-async fn collect_body(request: Request<Incoming>, limit: usize) -> Result<Bytes, BodyFailure> {
-    let body = Limited::new(request.into_body(), limit).collect();
-    match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
-        Ok(Ok(body)) => Ok(body.to_bytes()),
+const CONFIG_BODY: BodyRules = BodyRules {
+    limit: MAX_CONFIG_BODY,
+    code: "config_body_invalid",
+    too_large: "配置不能超过 4 MiB",
+    unreadable: "读取配置请求失败",
+};
+
+#[cfg(unix)]
+const DIAGNOSTIC_BODY: BodyRules = BodyRules {
+    limit: MAX_DIAGNOSTIC_BODY,
+    code: "diagnostic_body_invalid",
+    too_large: "诊断请求不能超过 2 KiB",
+    unreadable: "读取诊断请求失败",
+};
+
+#[cfg(unix)]
+const TRIAL_BODY: BodyRules = BodyRules {
+    limit: MAX_TRIAL_BODY,
+    code: "diagnostic_body_invalid",
+    too_large: "试跑请求不能超过 4 MiB",
+    unreadable: "读取试跑请求失败",
+};
+
+/// 照 `rules` 读请求正文，最多等 [`REQUEST_READ_TIMEOUT`]；读不成时拒掉：太大 413，正文本身坏了、读不出来 400，
+/// 没按时发完 408。以前读不出来也回 413，诊断和试跑还说成「不能超过」
+/// Reads a request body by `rules`, waiting at most [`REQUEST_READ_TIMEOUT`]; when it cannot,
+/// it is refused: 413 for a body too large, 400 for one broken and unreadable, 408 for one not
+/// sent in time. An unreadable body used to get a 413 too, the diagnostic and the trial calling
+/// it too large
+#[cfg(unix)]
+async fn collect_body(request: Request<Incoming>, rules: &BodyRules) -> Result<Bytes, Rejection> {
+    let body = Limited::new(request.into_body(), rules.limit).collect();
+    let (status, code, message) = match tokio::time::timeout(REQUEST_READ_TIMEOUT, body).await {
+        Ok(Ok(body)) => return Ok(body.to_bytes()),
         Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
-            Err(BodyFailure::TooLarge)
+            (StatusCode::PAYLOAD_TOO_LARGE, rules.code, rules.too_large)
         }
-        Ok(Err(_)) => Err(BodyFailure::Unreadable),
-        Err(_) => Err(BodyFailure::Late),
-    }
-}
-
-#[cfg(unix)]
-fn late_body_response() -> Response<Full<Bytes>> {
-    json_response(
-        StatusCode::REQUEST_TIMEOUT,
-        error_json("request_body_late", "请求正文没有在 10 秒内发完"),
-    )
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, rules.code, rules.unreadable),
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "request_body_late",
+            "请求正文没有在 10 秒内发完",
+        ),
+    };
+    Err((status, error_json(code, message)))
 }
 
 /// 把一个拒绝写成回答 / A rejection written out as the answer
@@ -2206,15 +2255,9 @@ fn config_invalid(error: &anyhow::Error) -> Rejection {
 
 #[cfg(unix)]
 async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_DIAGNOSTIC_BODY).await {
+    let body = match collect_body(request, &DIAGNOSTIC_BODY).await {
         Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("diagnostic_body_invalid", "诊断请求不能超过 2 KiB"),
-            );
-        }
+        Err(rejection) => return respond(rejection),
     };
     let request = match serde_json::from_slice::<DiagnosticRequest>(&body) {
         Ok(request) => request,
@@ -2237,7 +2280,7 @@ async fn diagnostic_trace(request: Request<Incoming>, engine: Engine) -> Respons
 
 /// 同一时间只跑一个草稿试跑：每次都要起一个子进程、加载 Geo 数据 / One draft trial at a time: each starts a child process and loads Geo data
 #[cfg(unix)]
-static TRIAL_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+static TRIAL_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 拿一份候选配置试跑一次查询，不碰正在用的配置、缓存和统计。
 ///
@@ -2256,15 +2299,9 @@ async fn diagnostic_trace_candidate(
     request: Request<Incoming>,
     engine: Engine,
 ) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_TRIAL_BODY).await {
+    let body = match collect_body(request, &TRIAL_BODY).await {
         Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(BodyFailure::TooLarge | BodyFailure::Unreadable) => {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("diagnostic_body_invalid", "试跑请求不能超过 4 MiB"),
-            );
-        }
+        Err(rejection) => return respond(rejection),
     };
     let request = match serde_json::from_slice::<CandidateTraceRequest>(&body) {
         Ok(request) => request,
@@ -2289,13 +2326,22 @@ async fn diagnostic_trace_candidate(
             );
         }
     };
-    let Ok(_permit) = TRIAL_GATE.acquire().await else {
-        return json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_json("diagnostic_trial_unavailable", "试跑暂时不可用"),
-        );
+    let (status, body) = trial_in_turn(input).await;
+    json_response(status, body)
+}
+
+/// 轮到自己时起子进程试跑，排队也算在 [`TRIAL_TIMEOUT`] 里：以前时限从轮到自己才开始算，前面排着几个试跑时，面板要
+/// 等上好几个 12 秒才有回答
+/// Runs the trial in a child once its turn comes, the wait for the turn counting towards
+/// [`TRIAL_TIMEOUT`]: the limit used to start only with the turn, so with several trials queued
+/// ahead the panel waited several times 12 seconds for an answer
+#[cfg(unix)]
+async fn trial_in_turn(input: Vec<u8>) -> (StatusCode, serde_json::Value) {
+    let trial = async {
+        let _turn = TRIAL_GATE.lock().await;
+        run_trial_child(input).await
     };
-    let (status, body) = match tokio::time::timeout(TRIAL_TIMEOUT, run_trial_child(input)).await {
+    match tokio::time::timeout(TRIAL_TIMEOUT, trial).await {
         Ok(Ok(output)) => (
             StatusCode::from_u16(output.status).unwrap_or(StatusCode::BAD_GATEWAY),
             output.body,
@@ -2312,8 +2358,7 @@ async fn diagnostic_trace_candidate(
             StatusCode::GATEWAY_TIMEOUT,
             error_json("diagnostic_timeout", "试跑超过 12 秒"),
         ),
-    };
-    json_response(status, body)
+    }
 }
 
 /// 起子进程、喂请求、读结果 / Start the child, feed it the request, read its result
@@ -2614,23 +2659,32 @@ fn parse_querylog_query(query: Option<&str>) -> Result<QueryLogTake, &'static st
 
 #[cfg(unix)]
 async fn validate_config(request: Request<Incoming>) -> Response<Full<Bytes>> {
-    let body = match collect_body(request, MAX_CONFIG_BODY).await {
-        Ok(body) => body,
-        Err(BodyFailure::Late) => return late_body_response(),
-        Err(failure) => {
-            let message = if matches!(failure, BodyFailure::TooLarge) {
-                "配置不能超过 4 MiB"
-            } else {
-                "读取配置请求失败"
-            };
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                error_json("config_body_invalid", message),
-            );
-        }
-    };
+    match collect_body(request, &CONFIG_BODY).await {
+        Ok(body) => validate_body(body).await,
+        Err(rejection) => respond(rejection),
+    }
+}
 
-    validate_body(body).await
+/// Prometheus 文本格式的指标。拼它要把每组统计项排好序、一行行写出来，统计项多时上万行，放到阻塞线程池里做，和排行
+/// 一样不占着处理 DNS 的线程；以前就在收到请求的线程上拼
+/// The metrics in the Prometheus text format. Writing them sorts every set of series and writes
+/// them out line by line, tens of thousands of lines with many series, so it runs on the
+/// blocking thread pool and, as the rankings do, holds no thread that serves DNS; it used to be
+/// written on the thread that took the request
+#[cfg(unix)]
+async fn metrics_response(metrics: &Arc<PanelMetrics>, engine: Engine) -> Response<Full<Bytes>> {
+    let rendering = Arc::clone(metrics);
+    match tokio::task::spawn_blocking(move || rendering.render_prometheus(&engine)).await {
+        Ok(text) => text_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4; charset=utf-8",
+            text,
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error_json("metrics_failed", &error.to_string()),
+        ),
+    }
 }
 
 /// 排行的回答。算排行要把窗口里每个钟头的每一项合起来再排序（24 小时的窗口最多二十万项），放到阻塞线程池里做，
@@ -2654,18 +2708,23 @@ async fn stats_response(
     }
 }
 
-/// 校验一份配置，给出回答。校验放到阻塞线程池里做，和取查询日志一样：它要解析整份配置、编译每条正则、读 DoH 的
-/// 证书文件，规则多的配置要几十到几百毫秒，在处理请求的线程上做的话，排在这个线程上的 DNS 查询这期间都等着
-/// Validates a configuration and gives the answer. The validation runs on the blocking thread
-/// pool, as taking the query log does: it parses the whole configuration, compiles every regex
-/// and reads the DoH certificate files, tens to hundreds of milliseconds for a configuration
-/// with many rules, during which the DNS queries queued on a thread serving requests would wait
+/// 校验一份配置，给出回答，和热重载拒绝的一样（见 `config::validate`）。校验放到阻塞线程池里做，和取查询日志一样：
+/// 它要解析整份配置、编译每条正则，规则多的配置要几十到几百毫秒，在处理请求的线程上做的话，排在这个线程上的 DNS
+/// 查询这期间都等着。正文不是 UTF-8 时回 400：以前当成空串去校验，回的是一份空配置的解析错误
+/// Validates a configuration and gives the answer, refusing what a hot reload refuses (see
+/// `config::validate`). The validation runs on the blocking thread pool, as taking the query
+/// log does: it parses the whole configuration and compiles every regex, tens to hundreds of
+/// milliseconds for a configuration with many rules, during which the DNS queries queued on a
+/// thread serving requests would wait. A body that is not UTF-8 gets a 400: it used to be
+/// validated as an empty string, answered with the parse error of an empty configuration
 #[cfg(unix)]
 async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
-    // 与引擎启动完全相同的校验路径，含监听地址与 DoH 证书检查。
-    // The exact validation the engine runs at startup, listener and DoH checks included.
-    let validated = tokio::task::spawn_blocking(move || {
-        crate::config::validate(std::str::from_utf8(&body).unwrap_or_default())
+    let validated = tokio::task::spawn_blocking(move || match std::str::from_utf8(&body) {
+        Ok(text) => crate::config::validate(text).map_err(|error| config_invalid(&error)),
+        Err(_) => Err((
+            StatusCode::BAD_REQUEST,
+            error_json("config_body_invalid", "配置不是 UTF-8 文本"),
+        )),
     })
     .await;
     match validated {
@@ -2679,7 +2738,7 @@ async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
                 "warnings": report.warnings,
             }),
         ),
-        Ok(Err(error)) => respond(config_invalid(&error)),
+        Ok(Err(rejection)) => respond(rejection),
         Err(error) => json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json("config_validate_failed", &error.to_string()),
@@ -2727,63 +2786,54 @@ fn error_json(code: &str, message: &str) -> serde_json::Value {
     json!({ "protocol_version": PROTOCOL_VERSION, "error": { "code": code, "message": message } })
 }
 
+/// 一组计数统计项，按键排好，每项一行 / A set of counting series, sorted by key, a line each
 fn append_map(output: &mut String, name: &str, series: &Series<ThreadCount>, labels: &[&str]) {
-    let mut rows = series
-        .snapshot()
-        .iter()
-        .map(|(key, counter)| (key.to_string(), counter.load(Ordering::Relaxed)))
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    for (key, value) in rows {
-        let values = key.split('\0').collect::<Vec<_>>();
-        if values.len() != labels.len() {
-            continue;
+    family(output, name, COUNTER);
+    let snapshot = series.snapshot();
+    let mut rows: Vec<_> = snapshot.iter().collect();
+    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, counter) in rows {
+        if let Some(pairs) = label_pairs(labels, key) {
+            labeled_metric(output, name, pairs, counter.load(Ordering::Relaxed));
         }
-        let pairs = labels
-            .iter()
-            .zip(values)
-            .map(|(label, value)| (*label, value))
-            .collect::<Vec<_>>();
-        labeled_metric(output, name, &pairs, value);
     }
 }
 
+/// 一组耗时统计项，按键排好，每项一行总和、一行次数 / A set of latency series, sorted by key, each
+/// with a line for the sum and one for the count
 fn append_latency_map(
     output: &mut String,
     name: &str,
     series: &Series<LatencySum>,
     labels: &[&str],
 ) {
-    let mut rows = series
-        .snapshot()
-        .iter()
-        .map(|(key, sum)| {
-            (
-                key.to_string(),
-                sum.micros.load(Ordering::Relaxed),
+    family(output, name, "summary");
+    let (sum_name, count_name) = (format!("{name}_sum"), format!("{name}_count"));
+    let snapshot = series.snapshot();
+    let mut rows: Vec<_> = snapshot.iter().collect();
+    rows.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, sum) in rows {
+        if let Some(pairs) = label_pairs(labels, key) {
+            let micros = sum.micros.load(Ordering::Relaxed);
+            labeled_metric(output, &sum_name, pairs.clone(), format_millis(micros));
+            labeled_metric(
+                output,
+                &count_name,
+                pairs,
                 sum.count.load(Ordering::Relaxed),
-            )
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-    for (key, micros, count) in rows {
-        let values = key.split('\0').collect::<Vec<_>>();
-        if values.len() != labels.len() {
-            continue;
+            );
         }
-        let pairs = labels
-            .iter()
-            .zip(values)
-            .map(|(label, value)| (*label, value))
-            .collect::<Vec<_>>();
-        labeled_metric(
-            output,
-            &format!("{name}_sum"),
-            &pairs,
-            format_millis(micros),
-        );
-        labeled_metric(output, &format!("{name}_count"), &pairs, count);
     }
+}
+
+/// 统计键的各段配上标签名。名字里写了 `\0` 时段数和标签数对不上，这一项不导出
+/// A metric key's parts paired with the label names. With a `\0` written in a name the parts
+/// and labels do not match up, and the series is not exported
+fn label_pairs<'a>(
+    labels: &'a [&'a str],
+    key: &'a str,
+) -> Option<impl Iterator<Item = (&'a str, &'a str)> + Clone> {
+    (key.split('\0').count() == labels.len()).then(|| labels.iter().copied().zip(key.split('\0')))
 }
 
 /// 微秒累计值以毫秒输出，保留三位小数。/ Render accumulated microseconds as milliseconds.
@@ -2791,31 +2841,57 @@ fn format_millis(micros: u64) -> String {
     format!("{}.{:03}", micros / 1_000, micros % 1_000)
 }
 
-fn metric(output: &mut String, name: &str, value: impl std::fmt::Display) {
-    let _ = writeln!(output, "{name} {value}");
+/// 计数和仪表，`# TYPE` 行里的两种 / Counters and gauges, two of the kinds of a `# TYPE` line
+const COUNTER: &str = "counter";
+const GAUGE: &str = "gauge";
+
+/// 一组指标的 `# TYPE` 行，写在这一组的头一行之前；同一组的行挨在一起
+/// A metric family's `# TYPE` line, written before the family's first line; a family's lines
+/// stand together
+fn family(output: &mut String, name: &str, kind: &str) {
+    let _ = writeln!(output, "# TYPE {name} {kind}");
 }
 
-fn labeled_metric(
+/// 只有一行、不带标签的一组指标 / A metric family of a single line without labels
+fn metric(output: &mut String, name: &str, kind: &str, value: impl std::fmt::Display) {
+    family(output, name, kind);
+    labeled_metric(output, name, [], value);
+}
+
+/// 一行指标，没有标签时不写花括号。标签值照 Prometheus 文本格式转义，直接写进输出：以前每个标签值替换三遍、每行还要
+/// 另拼几个字符串
+/// One metric line, without braces when it has no labels. Label values are escaped as the
+/// Prometheus text format says, straight into the output: each used to be replaced three times
+/// over, and every line built several more strings besides
+fn labeled_metric<'a>(
     output: &mut String,
     name: &str,
-    labels: &[(&str, &str)],
+    labels: impl IntoIterator<Item = (&'a str, &'a str)>,
     value: impl std::fmt::Display,
 ) {
-    let _ = write!(output, "{name}{{");
-    for (index, (label, label_value)) in labels.iter().enumerate() {
-        if index > 0 {
-            output.push(',');
+    output.push_str(name);
+    let mut labels = labels.into_iter().peekable();
+    if labels.peek().is_some() {
+        output.push('{');
+        for (index, (label, label_value)) in labels.enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str(label);
+            output.push_str("=\"");
+            for c in label_value.chars() {
+                match c {
+                    '\\' => output.push_str("\\\\"),
+                    '\n' => output.push_str("\\n"),
+                    '"' => output.push_str("\\\""),
+                    c => output.push(c),
+                }
+            }
+            output.push('"');
         }
-        let _ = write!(output, "{label}=\"{}\"", escape_label(label_value));
+        output.push('}');
     }
-    let _ = writeln!(output, "}} {value}");
-}
-
-fn escape_label(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"")
+    let _ = writeln!(output, " {value}");
 }
 
 fn truncate(value: &str, max_length: usize) -> String {
@@ -3307,6 +3383,9 @@ mod tests {
                 source: Some("{}"),
                 restart_pending: &[],
                 warnings: &[],
+                pipelines: &[],
+                rules: &[],
+                upstreams: &[],
             });
             metrics.config_reload_failed(&ConfigReloadFailed {
                 path: std::path::Path::new("pipeline.json"),
@@ -3317,45 +3396,132 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// 整整一代配置里都没计过数的统计项，换配置时去掉：改了名的规则不会一直留在表里和导出里，表也不会被这样的项
-    /// 占满、让新规则的计数加不进去；还在计数的照常留着，计数不清零
-    /// A series that counted nothing through a whole configuration goes when the configuration
-    /// changes: a renamed rule does not stay in the table and the export for good, nor fill the
-    /// table so that new rules' counts find no room; those still counting stay as they are, their
-    /// counts kept
+    /// 统计项跟着配置走：配置里还有的 pipeline、规则和上游，换几次配置计数都留着，不管其间计没计过数；配置里没有了的
+    /// 去掉，导出里也没有了，上游换了传输也一样（响应码不分传输，按地址留）。以前按上一代配置里计没计过数去留，两次挨着
+    /// 保存就清掉了还在配置里的规则的累计计数
+    /// Series follow the configuration: those of the pipelines, rules and upstreams it still has
+    /// keep their counts across any number of loads, counted in between or not; those it no
+    /// longer has go, from the export too, and so do an upstream's when its transport changes
+    /// (response codes, which do not tell transports apart, stay by the address). Whether a series
+    /// counted in the previous configuration used to decide, so two saves in a row cleared the
+    /// counts of rules still in the configuration
     #[test]
-    fn a_series_unused_through_a_whole_configuration_is_forgotten() {
-        use crate::observe::{ConfigLoaded, EngineObserver};
+    fn series_stay_while_the_configuration_has_what_they_count() {
+        use crate::config::Transport;
+        use crate::observe::{ConfigLoaded, EngineObserver, UpstreamAttempt, UpstreamOutcome};
+        use hickory_proto::op::ResponseCode;
         let metrics = PanelMetrics::default();
-        let load = |generation| {
+        let load = |generation,
+                    pipelines: &[&str],
+                    rules: &[(&str, &str)],
+                    upstreams: &[(&str, Transport)]| {
             metrics.config_loaded(&ConfigLoaded {
                 path: None,
                 generation,
                 source: Some("{}"),
                 restart_pending: &[],
                 warnings: &[],
+                pipelines,
+                rules,
+                upstreams,
             })
         };
-        let count = |rule: &str| {
-            metrics
-                .rule_matches
-                .read(&format!("main\0{rule}\0request"), |counter| {
-                    counter.load(Ordering::Relaxed)
-                })
+        let count = |series: &super::Series<super::ThreadCount>, key: &str| {
+            series.with(key, |counter| counter.load(Ordering::Relaxed))
         };
-        load(1);
-        metrics.record_rule_match("main", "old", "request");
-        metrics.record_rule_match("main", "kept", "request");
-        load(2);
-        assert_eq!(
-            count("old"),
-            Some(1),
-            "counted in the configuration just replaced"
+        let pipelines = ["main", "gone"];
+        let rules = [("main", "kept"), ("main", "old")];
+        let upstreams = [
+            ("1.1.1.1:53", Transport::Udp),
+            ("192.0.2.9:53", Transport::Udp),
+        ];
+        load(1, &pipelines, &rules, &upstreams);
+        let ctx = request(1, "127.0.0.1:5353", "example.com");
+        for pipeline in pipelines {
+            metrics.record_pipeline_hit(pipeline);
+        }
+        for (pipeline, rule) in rules {
+            metrics.record_rule_match(pipeline, rule, "request");
+        }
+        for (upstream, transport) in upstreams {
+            metrics.upstream_attempt(
+                &ctx,
+                &UpstreamAttempt {
+                    upstream,
+                    transport,
+                },
+            );
+            metrics.upstream_result(
+                &ctx,
+                &crate::observe::UpstreamResult {
+                    upstream,
+                    ..udp_result(
+                        UpstreamOutcome::Success,
+                        Transport::Udp,
+                        Some(ResponseCode::NoError),
+                        5,
+                    )
+                },
+            );
+        }
+        // 两次挨着保存，其间什么也没计 / Two saves in a row, nothing counted in between
+        load(2, &pipelines, &rules, &upstreams);
+        load(3, &pipelines, &rules, &upstreams);
+        for pipeline in pipelines {
+            assert_eq!(
+                count(&metrics.pipeline_hits, pipeline),
+                Some(1),
+                "{pipeline}"
+            );
+        }
+        for (pipeline, rule) in rules {
+            let key = format!("{pipeline}\0{rule}\0request");
+            assert_eq!(count(&metrics.rule_matches, &key), Some(1), "{rule}");
+        }
+        let upstream_series = |address: &str| {
+            [
+                count(&metrics.upstream_attempts, &format!("{address}\0udp")),
+                count(
+                    &metrics.upstream_results,
+                    &format!("{address}\0udp\0success"),
+                ),
+                count(&metrics.upstream_via, &format!("{address}\0udp\0udp")),
+                metrics
+                    .upstream_latency
+                    .with(&format!("{address}\0udp"), |sum| {
+                        sum.count.load(Ordering::Relaxed)
+                    }),
+                metrics
+                    .upstream_response_latency
+                    .with(&format!("{address}\0udp"), |sum| {
+                        sum.count.load(Ordering::Relaxed)
+                    }),
+            ]
+        };
+        let rcodes =
+            |address: &str| count(&metrics.upstream_rcodes, &format!("{address}\0NoError"));
+        for (address, _) in upstreams {
+            assert_eq!(upstream_series(address), [Some(1); 5], "{address}");
+            assert_eq!(rcodes(address), Some(1), "{address}");
+        }
+
+        // 一个 pipeline、一条规则、一个上游不在了，留下的上游改成 TCP 问
+        // A pipeline, a rule and an upstream gone, the upstream left now asked over TCP
+        load(
+            4,
+            &["main"],
+            &[("main", "kept")],
+            &[("1.1.1.1:53", Transport::Tcp)],
         );
-        metrics.record_rule_match("main", "kept", "request");
-        load(3);
-        assert_eq!(count("old"), None, "nothing counted through generation 2");
-        assert_eq!(count("kept"), Some(2));
+        assert_eq!(count(&metrics.pipeline_hits, "main"), Some(1));
+        assert_eq!(count(&metrics.pipeline_hits, "gone"), None);
+        assert_eq!(count(&metrics.rule_matches, "main\0kept\0request"), Some(1));
+        assert_eq!(count(&metrics.rule_matches, "main\0old\0request"), None);
+        for address in ["1.1.1.1:53", "192.0.2.9:53"] {
+            assert_eq!(upstream_series(address), [None; 5], "{address}");
+        }
+        assert_eq!(rcodes("1.1.1.1:53"), Some(1));
+        assert_eq!(rcodes("192.0.2.9:53"), None);
         let mut output = String::new();
         super::append_map(
             &mut output,
@@ -3369,31 +3535,44 @@ mod tests {
         );
     }
 
-    /// 第一次加载的配置没带原文时也不算一次重载：重载次数和重载序号不变，代数是 1；之后的加载才算
-    /// The first configuration loaded without its text is no reload either: the reload
-    /// count and sequence stay, the generation is 1; the loads after it are reloads
+    /// 代数照引擎报的记，第一次加载就是代数 1 的那次，带不带原文都一样：它不算重载，重载次数和序号不动；之后每次加载
+    /// 都是重载。以前面板自己数代数，第一次加载还按带没带原文分两种判断
+    /// The generation is the one the engine gives, and the first load is the one at generation
+    /// 1, with its text or without: it is no reload, the reload count and sequence stay; every
+    /// load after it is one. The panel used to count the generations itself, telling the first
+    /// load two ways by whether the text came along
     #[test]
-    fn the_first_load_without_its_text_is_no_reload() {
+    fn the_generation_is_the_engines_and_the_first_load_is_no_reload() {
         use crate::observe::{ConfigLoaded, EngineObserver};
         use std::sync::atomic::Ordering;
-        let metrics = PanelMetrics::default();
-        let load = |generation| {
-            metrics.config_loaded(&ConfigLoaded {
-                path: None,
-                generation,
-                source: None,
-                restart_pending: &[],
-                warnings: &[],
-            })
-        };
-        load(1);
-        assert_eq!(metrics.reload_success.load(Ordering::Relaxed), 0);
-        assert_eq!(metrics.reload_sequence.load(Ordering::Acquire), 0);
-        assert_eq!(metrics.active_config.read().generation, 1);
-        load(2);
-        assert_eq!(metrics.reload_success.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.reload_sequence.load(Ordering::Acquire), 1);
-        assert_eq!(metrics.active_config.read().generation, 2);
+        for source in [None, Some("{}")] {
+            let metrics = PanelMetrics::default();
+            let load = |generation| {
+                metrics.config_loaded(&ConfigLoaded {
+                    path: None,
+                    generation,
+                    source,
+                    restart_pending: &[],
+                    warnings: &[],
+                    pipelines: &[],
+                    rules: &[],
+                    upstreams: &[],
+                })
+            };
+            let reloads = || {
+                (
+                    metrics.reload_success.load(Ordering::Relaxed),
+                    metrics.reload_sequence.load(Ordering::Acquire),
+                    metrics.active_config.read().generation,
+                )
+            };
+            load(1);
+            assert_eq!(reloads(), (0, 0, 1), "{source:?}");
+            load(2);
+            assert_eq!(reloads(), (1, 1, 2), "{source:?}");
+            load(5);
+            assert_eq!(reloads(), (2, 2, 5), "{source:?}");
+        }
     }
 
     /// 跳转过的请求会在目标 pipeline 下再查一次缓存，但只计一次查找：命中率按请求算，
@@ -3576,10 +3755,15 @@ mod tests {
         assert!(metrics.uptime_seconds() >= 61);
     }
 
-    #[cfg(unix)]
+    /// 标签值照 Prometheus 文本格式转义：反斜杠、换行和引号，别的原样写；不带标签的一行没有花括号
+    /// Label values are escaped as the Prometheus text format says: backslashes, newlines and
+    /// quotes, the rest written as is; a line without labels has no braces
     #[test]
     fn escapes_prometheus_labels() {
-        assert_eq!(super::escape_label("a\\b\n\"c"), "a\\\\b\\n\\\"c");
+        let mut output = String::new();
+        super::labeled_metric(&mut output, "m", [("a", "x\\y\n\"z\""), ("b", "名字")], 1);
+        super::labeled_metric(&mut output, "n", [], 2);
+        assert_eq!(output, "m{a=\"x\\\\y\\n\\\"z\\\"\",b=\"名字\"} 1\nn 2\n");
     }
 
     /// 一组统计项满了以后，再来的新名字只记一次丢弃，不去拿加统计项的那把锁。这把锁全进程共用；规则多过上限的配置下，
@@ -3698,23 +3882,32 @@ mod tests {
         );
     }
 
+    /// 加不进表的统计项各算一次丢弃，不管又计了多少次：丢弃数说的是导出里少了几项。以前每次计数都算一次，跟着流量涨
+    /// A series finding no room counts one drop, however many times it is counted again: the
+    /// number says how many series the export lacks. Every count used to add one, growing with
+    /// the traffic
     #[test]
-    fn caps_metric_keys_and_counts_dropped_series() {
+    fn caps_metric_keys_and_counts_each_dropped_series_once() {
         let metrics = PanelMetrics::default();
-        for index in 0..MAX_METRIC_SERIES_PER_MAP + 10 {
-            metrics.record_pipeline_hit(&format!("pipeline-{index}"));
+        let too_long = "x".repeat(super::MAX_METRIC_KEY_BYTES + 1);
+        for _ in 0..3 {
+            for index in 0..MAX_METRIC_SERIES_PER_MAP + 10 {
+                metrics.record_pipeline_hit(&format!("pipeline-{index}"));
+            }
+            metrics.record_rule_match("main", &too_long, "request");
         }
         metrics.record_pipeline_hit("pipeline-0");
 
         assert_eq!(metrics.pipeline_hits.len(), MAX_METRIC_SERIES_PER_MAP);
+        assert_eq!(metrics.rule_matches.len(), 0);
         assert_eq!(
             metrics.metric_series_dropped.load(super::Ordering::Relaxed),
-            10
+            11
         );
         assert_eq!(
-            metrics.pipeline_hits.read("pipeline-0", |counter| counter
+            metrics.pipeline_hits.with("pipeline-0", |counter| counter
                 .load(super::Ordering::Relaxed)),
-            Some(2)
+            Some(4)
         );
     }
 
@@ -3730,7 +3923,7 @@ mod tests {
         }
         metrics.record_rule_match("main", "cn", "request");
         let count = |series: &super::Series<super::ThreadCount>, key: &str| {
-            series.read(key, |counter| counter.load(super::Ordering::Relaxed))
+            series.with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(metrics.rule_matches.len(), 2);
         assert_eq!(count(&metrics.rule_matches, "main\0ads\0request"), Some(3));
@@ -3767,7 +3960,7 @@ mod tests {
         let count = |key: &str| {
             metrics
                 .pipeline_hits
-                .read(key, |counter| counter.load(super::Ordering::Relaxed))
+                .with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(count("shared"), Some(8_000));
         assert_eq!(metrics.pipeline_hits.len(), 1 + 8 * 50);
@@ -3828,6 +4021,9 @@ mod tests {
             source: Some(source),
             restart_pending: &[],
             warnings: &[],
+            pipelines: &[],
+            rules: &[],
+            upstreams: &[],
         });
         {
             let active = metrics.active_config.read();
@@ -3883,7 +4079,7 @@ mod tests {
             1
         );
         let count = |series: &super::Series<super::ThreadCount>, key: &str| {
-            series.read(key, |counter| counter.load(super::Ordering::Relaxed))
+            series.with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(count(&metrics.pipeline_hits, "main"), Some(1));
         assert_eq!(
@@ -3909,6 +4105,9 @@ mod tests {
             source: Some("{}"),
             restart_pending: &[],
             warnings: &[],
+            pipelines: &[],
+            rules: &[],
+            upstreams: &[],
         });
         let active = metrics.active_config.read();
         assert_eq!(active.generation, 2);
@@ -4175,10 +4374,20 @@ mod tests {
             "read as retired settings, warned about"
         );
         let metrics = PanelMetrics::new(false);
-        metrics.record_config_loaded(
-            r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
-            Vec::new(),
-            Vec::new(),
+        crate::observe::EngineObserver::config_loaded(
+            &metrics,
+            &crate::observe::ConfigLoaded {
+                path: None,
+                generation: 1,
+                source: Some(
+                    r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
+                ),
+                restart_pending: &[],
+                warnings: &[],
+                pipelines: &[],
+                rules: &[],
+                upstreams: &[],
+            },
         );
         metrics.record_query(
             "example.com",
@@ -4818,6 +5027,101 @@ mod diagnostic_tests {
         }
     }
 
+    /// 导出照 Prometheus 文本格式写：每组指标前有一行 `# TYPE`，说它是计数、仪表、直方图还是摘要，同一组的行挨在一起
+    /// （直方图和摘要的 `_bucket`、`_sum`、`_count` 算在组里）。以前一行 `# TYPE` 也没有，被拦设备的两组还一行隔一行
+    /// The export follows the Prometheus text format: every metric family starts with a
+    /// `# TYPE` line saying whether it is a counter, a gauge, a histogram or a summary, and a
+    /// family's lines stand together (a histogram's or summary's `_bucket`, `_sum` and `_count`
+    /// belonging to it). There used to be no `# TYPE` line at all, and the two families of the
+    /// devices refused took turns line by line
+    #[tokio::test]
+    async fn every_metric_family_is_typed_once_before_its_lines() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9", "flow_control_enabled": true },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let manager = &engine.permit_manager;
+        for client in ["192.168.1.20", "192.168.1.21"] {
+            manager.note_refused(client.parse().unwrap());
+        }
+        metrics.record_pipeline_hit("main");
+        metrics.record_rule_match("main", "r", "request");
+        metrics.record_upstream_attempt("1.1.1.1:53", "udp");
+        metrics.record_upstream_latency(
+            &metrics.upstream_latency,
+            "1.1.1.1:53\0udp",
+            std::time::Duration::from_millis(5),
+        );
+        let text = metrics.render_prometheus(&engine);
+        let mut typed = Vec::new();
+        for line in text.lines() {
+            if let Some(family) = line.strip_prefix("# TYPE ") {
+                let (name, kind) = family.split_once(' ').expect("a name and a kind");
+                assert!(
+                    ["counter", "gauge", "histogram", "summary"].contains(&kind),
+                    "{line}"
+                );
+                assert!(!typed.contains(&name), "{name} typed twice in\n{text}");
+                typed.push(name);
+                continue;
+            }
+            let name = line.split(['{', ' ']).next().expect("a metric name");
+            let family = typed.last().expect("a line before any # TYPE");
+            assert!(
+                name == *family
+                    || ["_bucket", "_sum", "_count"]
+                        .iter()
+                        .any(|part| name.strip_suffix(part) == Some(family)),
+                "{name} under {family} in\n{text}"
+            );
+        }
+        for family in [
+            "kixdns_panel_metric_series_dropped_total",
+            "kixdns_request_latency_ms",
+            "kixdns_upstream_latency_ms",
+            "kixdns_flow_refused_client_total",
+            "kixdns_flow_refused_client_age_seconds",
+        ] {
+            assert!(typed.contains(&family), "{family} in\n{text}");
+        }
+    }
+
+    /// 拼指标也不占着处理 DNS 的线程：交给阻塞线程去拼，等的时候运行时照常干别的。测试用的是单线程运行时，在这里同步
+    /// 拼的话另一个任务一次也轮不到
+    /// Writing the metrics holds no thread that serves DNS either: a blocking thread writes them,
+    /// and while waiting the runtime goes on with other work. The test runs on a single-thread
+    /// runtime, where writing them inline would leave the other task not a single turn
+    #[tokio::test]
+    async fn writing_the_metrics_leaves_the_runtime_free() {
+        let raw = serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [] }]
+        });
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        let turns = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counting = Arc::clone(&turns);
+        let other = tokio::spawn(async move {
+            loop {
+                counting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let before = turns.load(std::sync::atomic::Ordering::Relaxed);
+        let response = super::metrics_response(&metrics, engine).await;
+        let during = turns.load(std::sync::atomic::Ordering::Relaxed) - before;
+        other.abort();
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert!(
+            during > 0,
+            "the runtime had no turn for other work while writing"
+        );
+    }
+
     /// 控制通道的 config 列出改了但要重启才生效的设置；改回去以后不再列
     /// The control channel's config lists the settings changed that take a restart to
     /// apply; once changed back they are no longer listed
@@ -5235,6 +5539,23 @@ mod diagnostic_tests {
         let (status, body) = run_trial(input).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"]["code"], "config_invalid", "{body}");
+    }
+
+    /// 排队等前面的试跑也算在时限里：前面那个一直占着，这个到 12 秒就回超时，不会一直等下去。以前时限从轮到自己才开始算
+    /// The wait behind an earlier trial counts towards the limit: with that one holding on, this
+    /// one answers a timeout at 12 seconds rather than waiting on. The limit used to start only
+    /// with the turn
+    #[tokio::test(start_paused = true)]
+    async fn a_trial_waiting_its_turn_times_out_within_the_limit() {
+        let _earlier = super::TRIAL_GATE.lock().await;
+        let started = tokio::time::Instant::now();
+        let answered =
+            tokio::time::timeout(super::TRIAL_TIMEOUT * 2, super::trial_in_turn(Vec::new()))
+                .await
+                .expect("answered within the limit, not after the earlier trial");
+        assert_eq!(answered.0, hyper::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(answered.1["error"]["code"], "diagnostic_timeout");
+        assert_eq!(started.elapsed(), super::TRIAL_TIMEOUT);
     }
 
     #[test]
