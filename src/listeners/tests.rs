@@ -729,7 +729,7 @@ async fn replies_come_from_the_address_asked(
     receive: impl FnOnce(Arc<UdpSocket>) -> tokio::task::JoinHandle<()>,
 ) {
     let (wildcard, client_at, asked) = addresses_asked();
-    let server = UdpSocket::from_std(create_reuseport_udp_socket(wildcard).unwrap()).unwrap();
+    let server = bind_udp_socket(wildcard).unwrap();
     let port = server.local_addr().unwrap().port();
     let worker = receive(Arc::new(server));
     for (id, mut to) in asked.into_iter().enumerate() {
@@ -797,7 +797,7 @@ async fn queued_and_refused_replies_leave_from_the_address_the_query_came_to() {
     use crate::socket_utils::LocalAddr;
 
     let (wildcard, client_at, addresses) = addresses_asked();
-    let server = UdpSocket::bind(wildcard).await.unwrap();
+    let server = bind_udp_socket(wildcard).unwrap();
     let mut asked = addresses[0];
     asked.set_port(server.local_addr().unwrap().port());
     let client = UdpSocket::bind(client_at).await.unwrap();
@@ -3888,21 +3888,19 @@ async fn listeners_answer_servfail_when_the_request_timeout_runs_out() {
     connection.abort();
 }
 
-/// 要单独监听的 IPv4 地址：IPv4 地址本身；`[::]` 的同伴 `0.0.0.0`，端口相同；别的 IPv6 地址没有
-/// The IPv4 address listened on separately: an IPv4 address itself; `0.0.0.0` on the same
-/// port as the twin of `[::]`; none for other IPv6 addresses
+/// 要绑的地址：IPv4 地址本身；IPv6 地址本身，`[::]` 之前还有同伴 `0.0.0.0`，端口相同
+/// The addresses bound: an IPv4 address itself; an IPv6 address itself, `[::]` preceded by its
+/// twin `0.0.0.0` on the same port
 #[test]
-fn the_ipv4_listen_address_is_the_address_itself_or_the_twin_of_any() {
+fn the_listen_addresses_split_any_into_both_families() {
     let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+    let addrs = |text: &str| listen_addrs(addr(text)).collect::<Vec<_>>();
+    assert_eq!(addrs("192.0.2.1:53"), [(addr("192.0.2.1:53"), "IPv4")]);
     assert_eq!(
-        ipv4_listen_addr(addr("192.0.2.1:53")),
-        Some(addr("192.0.2.1:53"))
+        addrs("[::]:53"),
+        [(addr("0.0.0.0:53"), "IPv4"), (addr("[::]:53"), "IPv6")]
     );
-    assert_eq!(
-        ipv4_listen_addr(addr("[::]:5353")),
-        Some(addr("0.0.0.0:5353"))
-    );
-    assert_eq!(ipv4_listen_addr(addr("[::1]:53")), None);
+    assert_eq!(addrs("[::1]:53"), [(addr("[::1]:53"), "IPv6")]);
 }
 
 /// 入站 DoH 监听 `[::]` 时和 TCP 一样开两个监听口：IPv4 的 `0.0.0.0` 和只收 IPv6 的 `[::]`。以前 DoH 只绑一个 `[::]`，
@@ -3954,6 +3952,63 @@ async fn doh_on_the_any_address_listens_on_both_families_as_tcp_does() {
             .unwrap(),
         "the IPv6 listener takes IPv6 alone"
     );
+}
+
+/// 端口被别的程序占着时 UDP 绑不上，启动失败：以前设着 SO_REUSEADDR 和 SO_REUSEPORT，悄悄和占着端口的程序共用（默认的
+/// 5353 上就是 mDNSResponder、avahi），查询进了别人那里。占端口的这个和它们一样设 SO_REUSEADDR；Linux 上 SO_REUSEPORT
+/// 只在同一个用户的 socket 之间共用，avahi 是另一个用户，这里同一个用户就只设 SO_REUSEADDR，内核不分报文的系统上再像
+/// mDNSResponder 那样设 SO_REUSEPORT
+/// A UDP port taken by another program cannot be bound, and starting fails: SO_REUSEADDR and
+/// SO_REUSEPORT used to be set, quietly sharing the port with the program holding it
+/// (mDNSResponder or avahi on the default 5353), the queries going there. The one holding it
+/// here sets SO_REUSEADDR as they do; on Linux SO_REUSEPORT is shared only between one user's
+/// sockets and avahi runs as another, so being the same user it sets SO_REUSEADDR alone there,
+/// and SO_REUSEPORT as mDNSResponder does where the kernel does not spread datagrams
+#[cfg(unix)]
+#[tokio::test]
+async fn a_udp_port_taken_by_another_program_cannot_be_bound() {
+    use std::os::fd::AsRawFd;
+    let taken = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+    taken.set_reuse_address(true).unwrap();
+    if !crate::socket_utils::SPREADS_DATAGRAMS {
+        let on: libc::c_int = 1;
+        // SAFETY: the option value is a valid c_int for the call, which only reads it
+        let set = unsafe {
+            libc::setsockopt(
+                taken.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of_val(&on) as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0);
+    }
+    taken
+        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let addr = taken.local_addr().unwrap().as_socket().unwrap();
+
+    let Err(err) = bind_udp_workers(addr, "IPv4", 2) else {
+        panic!("{addr} is shared with the program holding it");
+    };
+    assert!(format!("{err:#}").contains("in use"), "{err:#}");
+}
+
+/// 内核不分报文的系统上（macOS、OpenBSD、NetBSD、Windows）worker 共用一个 socket，分得开的系统上每个一个。以前各绑
+/// 一个，报文都进其中一个，别的 worker 白等着
+/// Where the kernel does not spread datagrams (macOS, OpenBSD, NetBSD, Windows) the workers
+/// share one socket, and where it does each has its own. Each used to bind one, every datagram
+/// going to one of them and the other workers waiting for nothing
+#[tokio::test]
+async fn udp_workers_share_a_socket_where_the_kernel_does_not_spread_datagrams() {
+    let bound = bind_udp_workers(SocketAddr::from(([127, 0, 0, 1], 0)), "IPv4", 3).unwrap();
+    let shared = bound
+        .sockets
+        .iter()
+        .all(|socket| Arc::ptr_eq(socket, &bound.sockets[0]));
+    assert_eq!(bound.sockets.len(), 3);
+    assert_eq!(shared, !crate::socket_utils::SPREADS_DATAGRAMS);
 }
 
 /// 装不进一条记录的静态 TXT（一段超过 255 字节，或者总长超过 65535），UDP 和 TCP 都收到

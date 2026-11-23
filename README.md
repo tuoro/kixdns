@@ -22,7 +22,7 @@ KixDNS 是用 Rust 写的异步、非递归 DNS 转发服务器：接收 UDP、T
 - **缓存**：容量、TTL 上下限、并发未命中合并、后台刷新、过期兜底（RFC 8767）；按 ECS 作用范围保存应答（RFC 7871）。
 - **GeoIP 与 GeoSite**：MaxMind MMDB、V2Ray GeoIP 和 GeoSite 数据；自带把 GeoIP `.dat` 转成 MMDB 的命令。
 - **热加载**：配置、GeoSite 和 GeoIP `.dat` 数据、DoH 证书文件更新后自动生效；新配置或新证书无效时继续用旧的。
-- **性能**：基于 tokio 的异步 I/O，UDP 按 worker 分 socket，规则用不到时转发路径不完整解析报文，可选自适应流控。
+- **性能**：基于 tokio 的异步 I/O，Linux、FreeBSD 上 UDP 按 worker 分 socket，规则用不到时转发路径不完整解析报文，可选自适应流控。
 
 ## 单独运行
 
