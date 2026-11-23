@@ -981,14 +981,13 @@ async fn a_client_with_ecs_is_answered_on_the_fast_path_with_its_echo() {
     assert_eq!(up.queries(), 1);
 }
 
-/// 上游失败时（转发之后的那条兜底路径），过期兜底同样只给请求方自己子网的旧应答。目标
-/// pipeline 按客户端地址判断，跳转之后不查缓存，请求直接转发、失败，再落到兜底。
-/// When the upstream fails (the fallback taken after a forward), the stale answer
-/// is again the one for the requester's own subnet. The target pipeline judges by
-/// client address, so nothing is looked up after the jump: the request forwards,
-/// fails and falls back.
+/// 跳进按客户端地址判断的 pipeline 以后，查缓存给出的过期应答同样只是请求方自己子网的那份：
+/// 目标的键分辨请求方，跳转后照常按它查
+/// After a jump into a pipeline judging by client address, the stale answer the cache lookup
+/// gives is again the one for the requester's own subnet: the target's key tells requesters
+/// apart, and it is looked up after the jump as usual
 #[tokio::test]
-async fn the_fallback_after_a_failed_forward_serves_the_requesters_own_subnet() {
+async fn a_stale_answer_after_a_jump_serves_the_requesters_own_subnet() {
     let up = upstream_with(Echo::Scope(24), ResponseCode::NoError, 1, Duration::ZERO).await;
     let engine = engine_with(
         serde_json::json!({ "serve_stale": true, "upstream_timeout_ms": 200 }),
@@ -1015,9 +1014,6 @@ async fn the_fallback_after_a_failed_forward_serves_the_requesters_own_subnet() 
         ask(&engine, "10.0.0.4", Some(("198.51.100.0", 24))).await,
         v4("198.51.100.0")
     );
-    // Both forwarded (a failed forward retries, so the count varies) and fell back
-    // 两个请求都转发了（失败的转发会重试，次数不定），然后落到兜底
-    assert!(up.queries() > 2, "both fell back after forwarding");
 }
 
 /// 一个子网的应答（作用范围 /24）过期后，这个子网的客户端经快速路径进来时重新去问上游，而不是
