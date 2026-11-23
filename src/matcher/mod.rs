@@ -202,6 +202,12 @@ pub struct RuntimePipelineConfig {
     pub pipelines: Vec<RuntimePipeline>,
     /// O(1) pipeline lookup index: pipeline_id -> index in pipelines / O(1) 管道查找索引：pipeline_id -> pipelines 中的索引
     pub pipeline_id_index: FxHashMap<Arc<str>, usize>,
+    /// 这份配置照样加载、值得知道的写法（见 [`config::warnings`]），编译时找出来：校验的回答、配置生效时的日志和
+    /// `ConfigLoaded` 都从这里拿
+    /// What this configuration writes that loads all the same yet is worth knowing (see
+    /// [`config::warnings`]), found as it compiles: the validation answer, the log as it takes
+    /// effect and `ConfigLoaded` all take them from here
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -916,18 +922,13 @@ impl RuntimePipelineConfig {
                 "doq_connection_idle_timeout_seconds is more than QUIC can carry, got {doq_idle}"
             );
         }
-        if cfg.settings.cache_capacity > 1_000_000 {
-            tracing::warn!(
-                cache_capacity = cfg.settings.cache_capacity,
-                "cache_capacity is very large, may cause high memory usage"
-            );
-        }
 
         // ✅ 验证超时配置的合理性
         // ✅ Validate timeout configuration sanity
         cfg.settings
             .validate_timeouts()
             .context("validate timeout configuration")?;
+        let warnings = config::warnings(&cfg);
 
         let mut pipelines = Vec::new();
         // What each pipeline's rules tell requesters apart by / 每个 pipeline 的规则区分请求方的依据
@@ -1095,6 +1096,7 @@ impl RuntimePipelineConfig {
             pipeline_select,
             pipelines,
             pipeline_id_index,
+            warnings,
         })
     }
 
@@ -1206,13 +1208,7 @@ fn normalize_upstream_addr(addr: &str) -> String {
     }
 }
 
-fn normalize_geoip_country_codes(country_codes: Vec<String>, matcher: &str) -> Vec<Arc<str>> {
-    if country_codes.is_empty() {
-        tracing::warn!(
-            matcher,
-            "GeoIP country matcher has no country codes and will never match"
-        );
-    }
+fn normalize_geoip_country_codes(country_codes: Vec<String>) -> Vec<Arc<str>> {
     country_codes
         .into_iter()
         .map(|code| Arc::from(code.to_ascii_uppercase()))
@@ -1369,7 +1365,7 @@ impl RuntimeMatcher {
                 regex: domain_regex(&value)?,
             },
             config::Matcher::GeoipCountry { country_codes } => RuntimeMatcher::GeoipCountry {
-                country_codes: normalize_geoip_country_codes(country_codes, "geoip_country"),
+                country_codes: normalize_geoip_country_codes(country_codes),
             },
             config::Matcher::GeoipPrivate { expect } => RuntimeMatcher::GeoipPrivate { expect },
             config::Matcher::Qclass { value } => RuntimeMatcher::Qclass {
@@ -1653,10 +1649,7 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
                 RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
-                    country_codes: normalize_geoip_country_codes(
-                        country_codes,
-                        "response_answer_ip_geoip_country",
-                    ),
+                    country_codes: normalize_geoip_country_codes(country_codes),
                 }
             }
             config::ResponseMatcher::ResponseAnswerIpGeoipPrivate { expect } => {

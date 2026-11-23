@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config;
 use crate::engine::Engine;
@@ -52,18 +52,19 @@ impl ConfigWatch {
             .start("config-watcher", move |path| {
                 // 启动时只记警告的那些写法，重载时拒绝（见 config::compile）
                 // What startup only warns about, a reload refuses (see config::compile)
-                let loaded = config::load_config_with_source(path).and_then(|(cfg, raw)| {
-                    config::warn_ignored_settings(&cfg);
-                    config::compile(cfg).map(|cfg| (cfg, raw))
-                });
+                let loaded = config::load_config_with_source(path)
+                    .and_then(|(cfg, raw)| config::compile(cfg).map(|cfg| (cfg, raw)));
                 match loaded {
                     Ok((new_cfg, raw)) => {
                         engine.reload_from(new_cfg, path, &raw);
                         info!(target = "watcher", path = %path.display(), "config reloaded");
                     }
+                    // 默认日志级别是 error：记成 warn 的话，没开面板时重载失败谁也看不到
+                    // The default log level is error: logged as a warn, a failed reload would go
+                    // unseen without the panel
                     Err(err) => {
                         let error = format!("{err:#}");
-                        warn!(target = "watcher", path = %path.display(), error = %error, "config reload failed, keeping current state");
+                        error!(target = "watcher", path = %path.display(), error = %error, "config reload failed, keeping current state");
                         engine.notify_config_reload_failed(path, &error);
                     }
                 }

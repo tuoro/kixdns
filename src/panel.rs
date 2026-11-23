@@ -136,6 +136,10 @@ struct ActiveConfig {
     /// it is. Without the watch a change to the file is not reloaded, nor is a save from the
     /// panel applied, its reload sequence never moving on
     watch_error: Option<String>,
+    /// 当前配置照样加载、值得知道的写法（见 `config::warnings`），每次生效换成那份配置的
+    /// What the current configuration writes that loads all the same yet is worth knowing (see
+    /// `config::warnings`), replaced by those of each configuration as it takes effect
+    warnings: Vec<String>,
 }
 
 /// 一个线程记下的一格 / What one thread has counted in a bucket
@@ -925,7 +929,13 @@ impl PanelMetrics {
     /// A configuration became active: generation 1 on the first load; each reload after
     /// that adds one and, under the write lock, counts a reload success and bumps the
     /// reload sequence (see `config_json`)
-    fn config_became_active(&self, sha256: String, initial: bool, restart_pending: Vec<String>) {
+    fn config_became_active(
+        &self,
+        sha256: String,
+        initial: bool,
+        restart_pending: Vec<String>,
+        warnings: Vec<String>,
+    ) {
         let mut active = self.active_config.write();
         active.generation = if initial {
             1
@@ -944,6 +954,7 @@ impl PanelMetrics {
         active.last_reload_success = true;
         active.last_reload_error = None;
         active.restart_pending = restart_pending;
+        active.warnings = warnings;
         if !initial {
             active.problems.clear();
         }
@@ -1024,10 +1035,15 @@ impl PanelMetrics {
     }
 
     /// 从观察者收到的配置原文更新摘要。/ Refresh the digest from the loaded source.
-    fn record_config_loaded(&self, source: &str, restart_pending: Vec<String>) {
+    fn record_config_loaded(
+        &self,
+        source: &str,
+        restart_pending: Vec<String>,
+        warnings: Vec<String>,
+    ) {
         let sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
         let initial = self.active_config.read().generation == 0;
-        self.config_became_active(sha256, initial, restart_pending);
+        self.config_became_active(sha256, initial, restart_pending, warnings);
     }
 
     #[cfg(unix)]
@@ -1055,6 +1071,7 @@ impl PanelMetrics {
             "restart_pending": active.restart_pending,
             "problems": active.problems,
             "watch_error": active.watch_error,
+            "warnings": active.warnings,
         })
     }
 
@@ -1788,13 +1805,14 @@ impl EngineObserver for PanelMetrics {
             .iter()
             .map(|setting| setting.to_string())
             .collect();
+        let warnings = event.warnings.to_vec();
         match event.source {
-            Some(source) => self.record_config_loaded(source, restart_pending),
+            Some(source) => self.record_config_loaded(source, restart_pending, warnings),
             // 没带原文时摘要照旧；第一次加载（代数 1）不算重载
             // Without the text the digest stays; the first load (generation 1) is no reload
             None => {
                 let sha256 = self.active_config.read().sha256.clone();
-                self.config_became_active(sha256, event.generation <= 1, restart_pending);
+                self.config_became_active(sha256, event.generation <= 1, restart_pending, warnings);
             }
         }
     }
@@ -2658,6 +2676,7 @@ async fn validate_body(body: Bytes) -> Response<Full<Bytes>> {
                 "valid": true,
                 "pipeline_count": report.pipeline_count,
                 "rule_count": report.rule_count,
+                "warnings": report.warnings,
             }),
         ),
         Ok(Err(error)) => respond(config_invalid(&error)),
@@ -3287,6 +3306,7 @@ mod tests {
                 generation: 1,
                 source: Some("{}"),
                 restart_pending: &[],
+                warnings: &[],
             });
             metrics.config_reload_failed(&ConfigReloadFailed {
                 path: std::path::Path::new("pipeline.json"),
@@ -3313,6 +3333,7 @@ mod tests {
                 generation,
                 source: Some("{}"),
                 restart_pending: &[],
+                warnings: &[],
             })
         };
         let count = |rule: &str| {
@@ -3362,6 +3383,7 @@ mod tests {
                 generation,
                 source: None,
                 restart_pending: &[],
+                warnings: &[],
             })
         };
         load(1);
@@ -3805,6 +3827,7 @@ mod tests {
             generation: 1,
             source: Some(source),
             restart_pending: &[],
+            warnings: &[],
         });
         {
             let active = metrics.active_config.read();
@@ -3885,6 +3908,7 @@ mod tests {
             generation: 2,
             source: Some("{}"),
             restart_pending: &[],
+            warnings: &[],
         });
         let active = metrics.active_config.read();
         assert_eq!(active.generation, 2);
@@ -4153,6 +4177,7 @@ mod tests {
         let metrics = PanelMetrics::new(false);
         metrics.record_config_loaded(
             r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
+            Vec::new(),
             Vec::new(),
         );
         metrics.record_query(
@@ -4892,6 +4917,74 @@ mod diagnostic_tests {
             metrics.config_json()["watch_error"],
             serde_json::json!("too many open files")
         );
+    }
+
+    /// 照样加载、值得知道的写法（见 `config::warnings`）报出来：校验的回答列出草稿里的，控制通道的 config 列出当前配置的，
+    /// 重载以后换成新配置的。以前只记 warn，默认日志级别看不到，校验也不说
+    /// What loads all the same yet is worth knowing (see `config::warnings`) is reported: the
+    /// validation answer lists a draft's, and the control channel's config the current
+    /// configuration's, replaced by the new one's on a reload. They used to be logged as a warn
+    /// only, out of sight at the default log level, and validation said nothing of them
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validation_and_config_list_what_loads_yet_is_worth_knowing() {
+        let raw = serde_json::json!({
+            "settings": {
+                "default_upstream": "127.0.0.1:9",
+                "prefetch": true,
+                "cache_capacity": 2_000_000,
+                "upstream_timeout_ms": 2000,
+                "request_timeout_ms": 3000
+            },
+            "background_refresh_rule": { "name": "old" },
+            "pipeline_select": [{
+                "pipeline": "main",
+                "matchers": [{ "type": "geoip_country", "country_codes": "" }]
+            }],
+            "pipelines": [{ "id": "main", "rules": [
+                {
+                    "name": "request",
+                    "matchers": [{ "type": "geoip_country", "country_codes": [] }],
+                    "actions": [{ "type": "allow" }]
+                },
+                {
+                    "name": "answer",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward" }],
+                    "response_matchers": [{ "type": "response_answer_ip_geoip_country", "country_codes": "," }],
+                    "response_actions_on_match": [{ "type": "allow" }]
+                }
+            ] }]
+        });
+        let warnings = serde_json::json!([
+            "background_refresh_rule has no effect: a background refresh replays the original request through its own rules; the entry can be removed",
+            "settings.prefetch is no longer read and has no effect; the entry can be removed",
+            "settings.cache_capacity: 2000000 is very large and may take a lot of memory",
+            "settings.request_timeout_ms: 3000 is under 2.5 times upstream_timeout_ms (2000), which may cut the resend and the TCP fallback short",
+            "pipeline_select 1: a geoip matcher written with no country code never matches",
+            "pipeline \"main\" rule \"request\": a geoip matcher written with no country code never matches",
+            "pipeline \"main\" rule \"answer\": a geoip matcher written with no country code never matches",
+        ]);
+
+        let response = super::validate_body(bytes::Bytes::from(raw.to_string())).await;
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["valid"], true, "{answer}");
+        assert_eq!(answer["warnings"], warnings, "{answer}");
+
+        let metrics = Arc::new(PanelMetrics::new(false));
+        let engine = engine_for(raw, Arc::clone(&metrics));
+        assert_eq!(metrics.config_json()["warnings"], warnings);
+        engine.reload(runtime_for(serde_json::json!({
+            "settings": { "default_upstream": "127.0.0.1:9" },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "rest", "matchers": [{ "type": "any" }], "actions": [{ "type": "allow" }]
+            }] }]
+        })));
+        assert_eq!(metrics.config_json()["warnings"], serde_json::json!([]));
     }
 
     /// 诊断回复里有一条回答写着这个地址 / Some answer in the diagnostic reply names this address

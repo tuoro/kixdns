@@ -9,7 +9,7 @@ use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::matcher::RuntimePipelineConfig;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PipelineConfig {
@@ -24,11 +24,10 @@ pub struct PipelineConfig {
     pub pipelines: Vec<Pipeline>,
 
     /// 旧配置里的后台刷新专用规则。照样能读，但不会生效：后台刷新按原请求走过的规则重放（见
-    /// `engine::refresh`）。写了它，启动和每次重载时各记一条 warn（见 [`warn_ignored_settings`]）。
+    /// `engine::refresh`）。写了它算一条 [`warnings`]。
     /// The background refresh rule of older configurations. It is still read but never
     /// takes effect: a background refresh replays the original request through the rules
-    /// it went through (see `engine::refresh`). When present, startup and every reload log
-    /// a warn (see [`warn_ignored_settings`]).
+    /// it went through (see `engine::refresh`). When present, it counts among [`warnings`].
     #[serde(default)]
     pub background_refresh_rule: Option<Rule>,
 
@@ -874,31 +873,15 @@ impl GlobalSettings {
     pub fn validate_timeouts(&self) -> anyhow::Result<()> {
         // Validate request_timeout >= upstream_timeout
         // 验证 request_timeout >= upstream_timeout
-        if let Some(request_timeout) = self.request_timeout_ms {
-            if request_timeout < self.upstream_timeout_ms {
-                anyhow::bail!(
-                    "Configuration error: request_timeout_ms ({request_timeout}) must be >= upstream_timeout_ms ({upstream})\n\
-                     配置错误: request_timeout_ms ({request_timeout}) 必须大于等于 upstream_timeout_ms ({upstream})",
-                    upstream = self.upstream_timeout_ms
-                );
-            }
-
-            // Recommended value check (warning only, doesn't block)
-            // 建议值检查（警告但不阻止）
-            // Recommended value should be at least upstream * 2.5 to allow hedge + TCP fallback to complete
-            // 建议值应至少为 upstream * 2.5，以允许 hedge + TCP fallback 完成
-            let recommended = self.upstream_timeout_ms * 5 / 2;
-            if request_timeout < recommended {
-                tracing::warn!(
-                    upstream_timeout_ms = self.upstream_timeout_ms,
-                    request_timeout_ms = request_timeout,
-                    recommended = recommended,
-                    "request_timeout_ms may be too short, may interrupt hedge and TCP fallback\n\
-                     request_timeout_ms 可能太短，可能会中断 hedge 和 TCP fallback"
-                );
-            }
+        if let Some(request_timeout) = self.request_timeout_ms
+            && request_timeout < self.upstream_timeout_ms
+        {
+            anyhow::bail!(
+                "Configuration error: request_timeout_ms ({request_timeout}) must be >= upstream_timeout_ms ({upstream})\n\
+                 配置错误: request_timeout_ms ({request_timeout}) 必须大于等于 upstream_timeout_ms ({upstream})",
+                upstream = self.upstream_timeout_ms
+            );
         }
-
         Ok(())
     }
 }
@@ -1273,6 +1256,9 @@ pub struct ValidationReport {
     pub pipeline_count: usize,
     /// Total number of rules across all pipelines.
     pub rule_count: usize,
+    /// 照样加载、值得知道的写法（见 [`warnings`]）/ What loads all the same yet is worth
+    /// knowing (see [`warnings`])
+    pub warnings: Vec<String>,
 }
 
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
@@ -1308,6 +1294,7 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
         version,
         pipeline_count: runtime.pipelines.len(),
         rule_count: runtime.pipelines.iter().map(|p| p.rules.len()).sum(),
+        warnings: runtime.warnings,
     })
 }
 
@@ -1403,28 +1390,84 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     found
 }
 
-/// 照样能读、但不会生效的配置项：启动和每次重载时各记一条 warn，不算 [`problems`]
-/// Settings still read but never in effect: each gets a warn at startup and on every
-/// reload, and none counts among [`problems`]
-pub fn warn_ignored_settings(cfg: &PipelineConfig) {
+/// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，一个国家
+/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时。启动、重载
+/// 和面板的校验都不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制
+/// 通道 `config` 结果的 `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
+/// What loads and runs as written yet is worth knowing: settings no longer in effect (see
+/// [`RETIRED_SETTINGS`]) and the background refresh rule, a geoip matcher written with no
+/// country code, which never matches, a cache so large it may take a lot of memory, and an
+/// overall timeout too short for the resend and the TCP fallback. Startup, reloads and the
+/// panel's validation refuse none of them, nor do they count among [`problems`]; they are
+/// found as the configuration compiles (see `RuntimePipelineConfig::warnings`), listed in the
+/// validation answer and as `warnings` in the control channel's `config` result, and each is
+/// logged as a warn every time the configuration takes effect. They used to be logged only, out
+/// of sight at the default log level, and validation said nothing of them
+pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
+    let mut found = Vec::new();
     if cfg.background_refresh_rule.is_some() {
-        warn!(
-            "background_refresh_rule has no effect: a background refresh replays the original request through its own rules; the entry can be removed"
-        );
+        found.push("background_refresh_rule has no effect: a background refresh replays the original request through its own rules; the entry can be removed".to_owned());
     }
     for key in cfg.unread_keys.iter().filter(|key| retired(key)) {
-        warn!("{key} is no longer read and has no effect; the entry can be removed");
+        found.push(format!(
+            "{key} is no longer read and has no effect; the entry can be removed"
+        ));
     }
+    let settings = &cfg.settings;
+    if settings.cache_capacity > 1_000_000 {
+        found.push(format!(
+            "settings.cache_capacity: {} is very large and may take a lot of memory",
+            settings.cache_capacity
+        ));
+    }
+    // UDP 转发在三分之一处重发，等满一段上游超时，失败了再用 TCP 等一段：整体超时短过两段半就可能把它们掐断
+    // A UDP forward resends at a third of the upstream timeout, waits it out and on failure
+    // waits once more over TCP: an overall timeout under two and a half of them may cut that short
+    if let Some(request_timeout) = settings.request_timeout_ms
+        && request_timeout < settings.upstream_timeout_ms * 5 / 2
+    {
+        found.push(format!(
+            "settings.request_timeout_ms: {request_timeout} is under 2.5 times upstream_timeout_ms ({}), which may cut the resend and the TCP fallback short",
+            settings.upstream_timeout_ms
+        ));
+    }
+    for (index, select) in cfg.pipeline_select.iter().enumerate() {
+        if select.matchers.iter().any(|matcher| {
+            matches!(&matcher.matcher, PipelineSelectorMatcher::GeoipCountry { country_codes } if country_codes.is_empty())
+        }) {
+            found.push(format!("pipeline_select {}: {NO_COUNTRY_CODE}", index + 1));
+        }
+    }
+    for pipeline in &cfg.pipelines {
+        for rule in &pipeline.rules {
+            let request = rule.matchers.iter().any(|matcher| {
+                matches!(&matcher.matcher, Matcher::GeoipCountry { country_codes } if country_codes.is_empty())
+            });
+            let response = rule.response_matchers.iter().any(|matcher| {
+                matches!(&matcher.matcher, ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } if country_codes.is_empty())
+            });
+            if request || response {
+                found.push(format!(
+                    "pipeline \"{}\" rule \"{}\": {NO_COUNTRY_CODE}",
+                    pipeline.id, rule.name
+                ));
+            }
+        }
+    }
+    found
 }
 
-/// 以前有、后来删掉的设置：老配置里留着的照样能读，启动和重载时各记一条 warn（见 [`warn_ignored_settings`]），不算
+/// 一个国家代码也没写的 geoip 匹配器 / A geoip matcher written with no country code
+const NO_COUNTRY_CODE: &str = "a geoip matcher written with no country code never matches";
+
+/// 以前有、后来删掉的设置：老配置里留着的照样能读，各算一条 [`warnings`]（配置每生效一次列出来、记一条 warn），不算
 /// [`problems`]，升级以后不必先改配置。智能流控的五个数字在流控改为自己判断以后不再用；`prefetch` 随它的实现撤掉了；
 /// `tcp_health_check_error_threshold` 从来数不到：TCP/DoT 连接一出错就重建，不按次数；排行的两个设置在排行改为一直统计、
 /// 照原样记客户端地址以后不再起作用，`geoip_auto_convert`、`geoip_filter_countries` 从来没被读过。以前这四个静默接受，
 /// 配了 `statistics_anonymize_client_ip` 的人以为地址打了码
 /// Settings there used to be and were taken out: an older configuration still writing them
-/// reads as before, each getting a warn at startup and on reload (see
-/// [`warn_ignored_settings`]) and none counting among [`problems`], so an upgrade needs no
+/// reads as before, each counting among [`warnings`], listed and logged whenever the
+/// configuration takes effect, and none among [`problems`], so an upgrade needs no
 /// change first. The five numbers of flow control went out of use once it judged by itself;
 /// `prefetch` went with its implementation; `tcp_health_check_error_threshold` was never
 /// counted up to, a TCP/DoT connection being rebuilt on its first failure, not by count; the two

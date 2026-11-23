@@ -612,6 +612,10 @@ pub struct ConfigLoaded<'a> {
     /// 这份配置改了、但要重启 KixDNS 才生效的设置，和进程启动时的设置相比（见
     /// [`crate::config::GlobalSettings::restart_pending`]）；初始配置时为空。
     pub restart_pending: &'a [&'static str],
+    /// What this configuration writes that loads all the same yet is worth knowing,
+    /// such as settings no longer in effect (see [`crate::config::warnings`]).
+    /// 这份配置照样加载、值得知道的写法，比如不再起作用的设置（见 [`crate::config::warnings`]）。
+    pub warnings: &'a [String],
 }
 
 /// A hot reload failed and the previous configuration remains active.
@@ -992,6 +996,7 @@ mod tests {
                 generation: 1,
                 source: Some("{}"),
                 restart_pending: &[],
+                warnings: &[],
             });
             observer.config_reload_failed(&ConfigReloadFailed {
                 path: Path::new("config/pipeline.json"),
