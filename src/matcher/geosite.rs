@@ -17,17 +17,12 @@ use tracing::{debug, info, warn};
 
 use super::{MAX_REGEX_LEN, ascii_regex_pattern, domain_suffix_matches};
 
-/// 编译 GeoSite 数据里的一条正则。数据是给 v2ray 写的，v2ray 用 Go 的正则，那里 `\w`、`\d`、`\s`、`\b` 只认
-/// ASCII；Rust 的正则默认按 Unicode 理解，`\w{5}` 要展开整张 Unicode 字母表，`cn` 里这样的正则让进程多占好几 MiB。
-/// 所以先把这几类写法改成 Go 的 ASCII 写法（见 [`super::go_classes`]），其余照旧；改写后编译不了（不该发生）就按
-/// 原样编译。只含 ASCII 的名字两种写法结果相同，含其他字符的名字按 v2ray 的理解。配置里的域名正则也这样改写
-/// Compiles one regex of GeoSite data. The data is written for v2ray, whose Go regexes treat
-/// `\w`, `\d`, `\s` and `\b` as ASCII only; Rust regexes default to Unicode, where `\w{5}` spells
-/// out the whole Unicode alphabet, and such regexes in `cn` cost the process several MiB. So these
-/// classes are first rewritten the Go way (see [`super::go_classes`]) and the rest is left as it
-/// is; a rewrite that does not compile (it should not happen) compiles as written instead. Names
-/// of ASCII alone match the same either way; names with other characters match as v2ray reads
-/// the pattern. A configuration's domain regexes are rewritten the same way
+/// 编译 GeoSite 数据里的一条正则：字符类只留 ASCII 的部分，和配置里的域名正则一样（见 [`ascii_regex_pattern`]）。数据是给
+/// v2ray 写的，Go 的正则里 `\w`、`\d`、`\s`、`\b` 本来就只认 ASCII；规则看到的名字只有 ASCII，别的字符类也匹配得一样
+/// Compiles one regex of GeoSite data, every class kept to its ASCII part as in a
+/// configuration's domain regexes (see [`ascii_regex_pattern`]). The data is written for v2ray,
+/// whose Go regexes read `\w`, `\d`, `\s` and `\b` as ASCII already; the names rules see are
+/// ASCII alone, so the other classes match the same too
 fn compile_geosite_regex(pattern: &str) -> anyhow::Result<Regex> {
     Ok(Regexes::compile(&ascii_regex_pattern(pattern)?)?)
 }
@@ -1830,7 +1825,6 @@ impl GeoSiteManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::go_classes;
 
     fn encode_varint(mut value: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -3057,36 +3051,13 @@ mod tests {
         }
     }
 
-    /// GeoSite 正则里的 `\w`、`\d`、`\s`、`\b` 按 Go（v2ray）的 ASCII 含义改写，字符类里外各有写法，别的转义
-    /// 和转义的反斜杠不动
-    /// `\w`, `\d`, `\s` and `\b` in GeoSite regexes take their Go (v2ray) ASCII meaning, written
-    /// one way outside a class and another inside, while other escapes and escaped backslashes
-    /// stay
+    /// GeoSite 正则只留 ASCII：只含 ASCII 的名字结果和按 Unicode 编译时相同，`\w` 不认非 ASCII 字母，和 v2ray 一样；
+    /// `\pL{20}` 编出来和 `[A-Za-z]{20}` 一样小；写错的照旧是错
+    /// GeoSite regexes are kept to ASCII: names of ASCII alone match as compiled for Unicode, and
+    /// `\w` takes no non-ASCII letter, as in v2ray; `\pL{20}` compiles as small as `[A-Za-z]{20}`;
+    /// one written wrong is still wrong
     #[test]
-    fn geosite_regex_classes_are_rewritten_the_go_way() {
-        for (pattern, rewritten) in [
-            (r"cdn\d-x", r"cdn[0-9]-x"),
-            (r"^\w{5}\.com$", r"^[0-9A-Za-z_]{5}\.com$"),
-            (r"a\Sb\Dc\Wd", r"a[^\t\n\f\r ]b[^0-9]c[^0-9A-Za-z_]d"),
-            (r"[\w-]+", r"[0-9A-Za-z_-]+"),
-            (r"[^\d.]", r"[^0-9.]"),
-            (r"[a\W]", r"[a[^0-9A-Za-z_]]"),
-            (r"[]\d]", r"[]0-9]"),
-            (r"[[:alpha:]\d]x\d", r"[[:alpha:]0-9]x[0-9]"),
-            (r"\bfoo\B", r"(?-u:\b)foo(?-u:\B)"),
-            (r"\\d", r"\\d"),
-            (r"\p{L}\.\[\d\]", r"\p{L}\.\[[0-9]\]"),
-        ] {
-            assert_eq!(go_classes(pattern), rewritten, "{pattern}");
-        }
-        assert!(matches!(
-            go_classes(r"plain\.com$"),
-            std::borrow::Cow::Borrowed(_)
-        ));
-
-        // 只含 ASCII 的名字结果和按 Unicode 编译时相同，`\w` 不认非 ASCII 字母，和 v2ray 一样
-        // Names of ASCII alone match as compiled for Unicode, and `\w` takes no non-ASCII letter,
-        // as in v2ray
+    fn geosite_regexes_are_kept_to_ascii() {
         let word = r"^r+[0-9]+(---|\.)sn-(2x3|ni5|j5o)\w{5}\.googlevideo\.com$";
         let go = compile_geosite_regex(word).unwrap();
         let unicode = Regex::new(word).unwrap();
@@ -3099,34 +3070,26 @@ mod tests {
         }
         assert!(!go.is_match("r1---sn-2x3abcdé.googlevideo.com"));
         assert!(unicode.is_match("r1---sn-2x3abcdé.googlevideo.com"));
-        assert!(compile_geosite_regex("(unclosed").is_err());
-    }
 
-    /// `\b{start}`、`\b{end}` 这类带名字的词边界整个放进 `(?-u:…)`，`\<`、`\>` 也按 ASCII 改写：以前只包住 `\b`，
-    /// 剩下的 `{start}` 成了写错的重复次数，整条正则只好照写的按 Unicode 编译。`\b{2}` 是 `\b` 重复两次，照旧只包
-    /// `\b`。改写后的都能解析
-    /// A named word boundary such as `\b{start}` or `\b{end}` goes into `(?-u:…)` whole, and
-    /// `\<` and `\>` are rewritten as ASCII too: only `\b` used to be wrapped, leaving `{start}`
-    /// as a broken repetition, so the whole regex compiled as written, as Unicode. `\b{2}` is
-    /// `\b` twice and still wraps just `\b`. Every rewrite parses
-    #[test]
-    fn named_word_boundaries_are_rewritten_whole() {
-        for (pattern, rewritten) in [
-            (r"\b{start}x\b{end}", r"(?-u:\b{start})x(?-u:\b{end})"),
-            (
-                r"\b{start-half}\w\b{end-half}",
-                r"(?-u:\b{start-half})[0-9A-Za-z_](?-u:\b{end-half})",
-            ),
-            (r"\<x\>", r"(?-u:\<)x(?-u:\>)"),
-            (r"\b{2}x\B", r"(?-u:\b){2}x(?-u:\B)"),
-            (r"[<>]\<", r"[<>](?-u:\<)"),
-        ] {
-            assert_eq!(go_classes(pattern), rewritten, "{pattern}");
-            assert!(
-                regex_syntax::Parser::new().parse(rewritten).is_ok(),
-                "{rewritten}"
-            );
-        }
+        let within_64_kib = |pattern: &str| {
+            RegexBuilder::new(pattern)
+                .size_limit(64 * 1024)
+                .build()
+                .is_ok()
+        };
+        let letters = r"^\pL{20}\.example\.com$";
+        assert!(!within_64_kib(letters), "as written, as Unicode");
+        assert!(within_64_kib(&ascii_regex_pattern(letters).unwrap()));
+        assert!(
+            compile_geosite_regex(letters)
+                .unwrap()
+                .is_match("abcdefghijklmnopqrst.example.com")
+        );
+        assert!(compile_geosite_regex("(unclosed").is_err());
+        assert!(
+            compile_geosite_regex(r"[\w-a]").is_err(),
+            "a class cannot end a range"
+        );
     }
 
     /// 名字集合按小写存一份：大小写不同的同一个名字只存一次，重复加入什么都不变；查找时调用方
