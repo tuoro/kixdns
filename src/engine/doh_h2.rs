@@ -42,13 +42,15 @@ pub(crate) type H2Sender = SendRequest<Bytes>;
 /// and a request sent on one would only wait for its timeout
 pub(crate) const DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// 连接的接收窗口。每个流的窗口用协议默认的 64 KiB，正好装下最长的 DNS 消息；连接的窗口大得多，同时在途的
-/// 回答不用等窗口更新。hyper 用 PING 估算带宽时延积再放大窗口，DNS 回答很小，用不着
-/// The connection's receive window. Each stream keeps the protocol's default 64 KiB, which holds
-/// the longest DNS message; the connection's is much larger, so answers in flight together never
-/// wait for a window update. hyper widens its windows from PING-based bandwidth-delay estimates,
-/// which DNS answers are far too small to need
-const CONNECTION_WINDOW: u32 = 1 << 20;
+/// 连接的接收窗口，DoQ 的连接也用它（见 `transport::doq_transport`）。每个流的窗口用协议默认的 64 KiB，正好装下最长的
+/// DNS 消息；连接的窗口大得多，同时在途的回答不用等窗口更新，又给一条连接上缓冲的字节封了顶。hyper 用 PING 估算带宽时延积
+/// 再放大窗口，DNS 回答很小，用不着
+/// The connection's receive window, which DoQ connections use too (see
+/// `transport::doq_transport`). Each stream keeps the protocol's default 64 KiB, which holds the
+/// longest DNS message; the connection's is much larger, so answers in flight together never wait
+/// for a window update, while it caps what one connection can have buffered. hyper widens its
+/// windows from PING-based bandwidth-delay estimates, which DNS answers are far too small to need
+pub(super) const CONNECTION_WINDOW: u32 = 1 << 20;
 
 /// 一条打开的连接 / One open connection
 struct H2Conn {

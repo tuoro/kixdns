@@ -2895,6 +2895,51 @@ pub struct DoqMuxClient {
     last_health_check_time: AtomicU64,
 }
 
+/// DoQ 连接的传输参数。查询都是我们开的流，一个流问一个（RFC 9250 第 4.2 节），所以：
+/// - 上游能开给我们的流是 0。quinn 的 `max_concurrent_bidi/uni_streams` 限的是对端开过来的流，以前各给了 100，却从不
+///   去接，上游开过来的流和发来的数据就一直缓冲着；
+/// - 每个流的接收窗口正好装下最长的回答（65535 字节加两字节长度前缀），连接的窗口和 DoH 的 HTTP/2 连接一样（见
+///   `doh_h2::CONNECTION_WINDOW`）。quinn 默认每个流 1.25 MB、连接不设上限，一个恶意上游能让一条连接缓冲上百 MB；
+/// - 不收 QUIC datagram，DoQ 用不着。
+///
+/// 初始 RTT 定 100 ms，好让拥塞控制一开始估得准一些；`keepalive_interval_ms`、`idle_timeout_secs` 为 0 时不设
+/// The transport parameters of a DoQ connection. Every query is a stream we open, one query
+/// a stream (RFC 9250 section 4.2), so:
+/// - the upstream may open no stream to us. quinn's `max_concurrent_bidi/uni_streams` bound the
+///   streams the peer opens, and were 100 each while never accepted, so streams an upstream
+///   opened and the data it sent on them stayed buffered;
+/// - each stream's receive window holds just the longest answer (65535 bytes and its two-byte
+///   length prefix), and the connection's is that of an HTTP/2 DoH connection (see
+///   `doh_h2::CONNECTION_WINDOW`). quinn's defaults are 1.25 MB a stream and no bound on the
+///   connection, which let a malicious upstream have one connection buffer hundreds of MB;
+/// - no QUIC datagram is taken, DoQ has no use for them.
+///
+/// The initial RTT is 100 ms, for congestion control to start from a better estimate;
+/// `keepalive_interval_ms` and `idle_timeout_secs` at 0 leave theirs unset
+fn doq_transport(
+    keepalive_interval_ms: u64,
+    idle_timeout_secs: u64,
+) -> anyhow::Result<QuicTransportConfig> {
+    let mut transport = QuicTransportConfig::default();
+    transport
+        .initial_rtt(Duration::from_millis(100))
+        .max_concurrent_bidi_streams(0u32.into())
+        .max_concurrent_uni_streams(0u32.into())
+        .stream_receive_window(quinn::VarInt::from_u32(MAX_DNS_MESSAGE_SIZE as u32 + 2))
+        .receive_window(doh_h2::CONNECTION_WINDOW.into())
+        .datagram_receive_buffer_size(None);
+    if keepalive_interval_ms > 0 {
+        transport.keep_alive_interval(Some(Duration::from_millis(keepalive_interval_ms)));
+    }
+    if idle_timeout_secs > 0 {
+        let idle_timeout = Duration::from_secs(idle_timeout_secs)
+            .try_into()
+            .context("invalid doq idle timeout")?;
+        transport.max_idle_timeout(Some(idle_timeout));
+    }
+    Ok(transport)
+}
+
 /// DoQ 连接最长用多久（毫秒）：30 分钟 / How long a DoQ connection may live (ms): 30 minutes
 const DOQ_MAX_AGE_MS: u64 = 30 * 60 * 1000;
 /// DoQ 连接空闲多久（毫秒）就换新的：5 分钟 / How long a DoQ connection may sit idle (ms) before a new one: 5 minutes
@@ -2922,31 +2967,10 @@ impl DoqClient {
 
         let quic_crypto = QuicClientConfig::try_from(tls).context("build quic client config")?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
-
-        let mut transport_config = QuicTransportConfig::default();
-
-        // Set initial RTT to 100ms (idoq best practice)
-        // This helps QUIC estimate initial round-trip time for better congestion control
-        // 设置初始 RTT 为 100ms（idoq 最佳实践）
-        // 这有助于 QUIC 估算初始往返时间，以实现更好的拥塞控制
-        transport_config.initial_rtt(Duration::from_millis(100));
-
-        // Set max concurrent streams (idoq best practice)
-        // 设置最大并发流数（idoq 最佳实践）
-        transport_config.max_concurrent_bidi_streams(100u32.into());
-        transport_config.max_concurrent_uni_streams(100u32.into());
-
-        if keepalive_interval_ms > 0 {
-            transport_config
-                .keep_alive_interval(Some(Duration::from_millis(keepalive_interval_ms)));
-        }
-        if idle_timeout_secs > 0 {
-            let idle_timeout = Duration::from_secs(idle_timeout_secs)
-                .try_into()
-                .context("invalid doq idle timeout")?;
-            transport_config.max_idle_timeout(Some(idle_timeout));
-        }
-        client_config.transport_config(Arc::new(transport_config));
+        client_config.transport_config(Arc::new(doq_transport(
+            keepalive_interval_ms,
+            idle_timeout_secs,
+        )?));
 
         let mut endpoint_v4 = QuicEndpoint::client("0.0.0.0:0".parse()?)?;
         endpoint_v4.set_default_client_config(client_config.clone());
@@ -5918,7 +5942,8 @@ mod tests {
     /// 只信任 `client_tls` 里那张证书的 DoQ 端点 / DoQ endpoints trusting only the certificate in `client_tls`
     fn doq_test_runtime(client_tls: ClientConfig, enable_0rtt: bool) -> Arc<DoqRuntime> {
         let crypto = QuicClientConfig::try_from(client_tls).expect("quic client crypto");
-        let config = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::new(doq_transport(0, 0).expect("transport")));
         let mut endpoint_v4 =
             QuicEndpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind the DoQ client");
         endpoint_v4.set_default_client_config(config.clone());
@@ -5954,6 +5979,48 @@ mod tests {
             format!("{err:#}").contains("does not answer the query"),
             "{err:#}"
         );
+    }
+
+    /// 上游开不出流给我们：查询都是我们开的流，上游开过来的流不会有人接，以前各能开 100 个，开过来的流和上面的数据
+    /// 就一直缓冲着。它照样回答我们开的流
+    /// An upstream can open no stream to us: every query is a stream we open, and nobody would
+    /// accept one it opened; it used to be allowed 100 of each, those streams and their data
+    /// staying buffered. It still answers the streams we open
+    #[tokio::test]
+    async fn a_doq_upstream_cannot_open_streams_to_us() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
+        let endpoint = QuicEndpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("bind the DoQ test upstream");
+        let addr = endpoint.local_addr().unwrap();
+        let opened = tokio::spawn(async move {
+            let conn = endpoint
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("connected");
+            let (mut send, mut recv) = conn.accept_bi().await.expect("the query's stream");
+            let mut frame = recv.read_to_end(MAX_DNS_MESSAGE_SIZE + 2).await.unwrap();
+            let wait = Duration::from_millis(300);
+            let uni = tokio::time::timeout(wait, conn.open_uni()).await.is_ok();
+            let bi = tokio::time::timeout(wait, conn.open_bi()).await.is_ok();
+            frame[4] |= 0x80;
+            send.write_all(&frame).await.unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+            (uni, bi)
+        });
+        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        client
+            .send(&udp_test_query("streams.example"), Duration::from_secs(3))
+            .await
+            .expect("the stream we opened is answered");
+        assert_eq!(opened.await.unwrap(), (false, false), "(uni, bi) opened");
     }
 
     /// 阿里的 DoQ 服务器大约 10 秒就关掉空闲连接，比 15 秒一次的保活还短。池里那条已经
