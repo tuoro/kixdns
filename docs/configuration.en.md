@@ -281,7 +281,7 @@ An upstream answer is taken only when it answers this query's question (the name
 
 Queries sent upstream always carry the AD bit (RFC 6840 section 5.7), so a validating upstream's answer always carries its verdict; for a client whose query had neither AD nor DO the answer loses AD (section 5.8), so the AD a client sees does not depend on who filled the cache. A TSIG-signed query is sent as it is. An answer handed on always loses its AA bit: KixDNS is not the authority for that data, less so for what comes from its cache.
 
-When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fallback is enabled by default and can be disabled with settings.enable_tcp_fallback. The fallback is applied by the forwarding path; it is not an additional listener.
+When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fallback is enabled by default and can be disabled with settings.enable_tcp_fallback. When TCP gives no full answer for a truncated one (the upstream's TCP blocked, say), the truncated answer goes back, and the client turns to TCP itself on seeing the TC bit. The fallback is applied by the forwarding path; it is not an additional listener.
 
 ## Configuration examples
 

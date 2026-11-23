@@ -281,7 +281,7 @@ TCP、DoT、DoQ 上游和走 HTTP/2 的 DoH 上游，连接都在后台建，最
 
 发给上游的查询一律带 AD 位（RFC 6840 第 5.7 节），验证型上游的回答因此都带着它验证的结论；交给客户端时，查询既没带 AD 也没带 DO 的，回答去掉 AD（第 5.8 节），所以客户端看到的 AD 不取决于谁先把缓存填上。签过名（TSIG）的查询原样发出。转交的回答一律去掉 AA 位：KixDNS 不是这些数据的权威，从缓存里取出的更不是。
 
-UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通过 settings.enable_tcp_fallback 禁用。该 fallback 属于转发路径，不是额外监听器。
+UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通过 settings.enable_tcp_fallback 禁用。截断的应答改用 TCP 也拿不到完整应答时（比如上游的 TCP 被挡住），交回截断的那份，客户端看到 TC 位会自己改用 TCP。该 fallback 属于转发路径，不是额外监听器。
 
 ## 配置示例
 
