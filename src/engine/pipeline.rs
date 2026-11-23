@@ -168,13 +168,9 @@ impl Engine {
         Some(&state.compiled_pipelines[idx])
     }
 
-    /// `state` 是求出这个决定的那份配置：决定的有效期按它的 min_ttl 算，求值期间重载了也一样
-    /// `state` is the configuration the decision was made under: its min_ttl sets how long
-    /// the decision holds, even if a reload came in meanwhile
     #[allow(clippy::too_many_arguments)]
     pub fn insert_rule_cache(
         &self,
-        state: &EngineInner,
         hash: u64,
         pipeline_id: Arc<str>,
         request: &RuleEvaluationContext<'_>,
@@ -193,20 +189,14 @@ impl Engine {
             Decision::Static { answers, .. } => {
                 least_ttl(answers).map(|ttl| Duration::from_secs(u64::from(ttl)))
             }
-            Decision::Forward { response_phase, .. } => {
-                // If it has response-phase logic, it is not "static" in the user's terms.
-                // It should expire based on the configured min_ttl.
-                if response_phase.is_some() {
-                    Some(Duration::from_secs(state.pipeline.settings.min_ttl as u64))
-                } else {
-                    // 只受 `RULE_CACHE_MAX_AGE` 限制 / Bounded by `RULE_CACHE_MAX_AGE` alone
-                    None
-                }
-            }
-            // 也只受 `RULE_CACHE_MAX_AGE` 限制。以前写的 120 秒比这个上限还长，从来没起过作用
-            // Bounded by `RULE_CACHE_MAX_AGE` alone too. The 120 seconds written here before were
-            // longer than that bound, and never took effect
-            Decision::Jump { .. } => None,
+            // 转发和跳转本身不过期，只受 `RULE_CACHE_MAX_AGE` 限制。带回答检查的转发也一样：检查看的是每次上游给的应答，
+            // 规则缓存只替请求阶段记下由哪条规则去转发。以前它按 min_ttl 过期，默认的 0 让它从不进规则缓存，正则每次重算
+            // Forwards and jumps do not expire of themselves and are bounded by
+            // `RULE_CACHE_MAX_AGE` alone. So is a forward with an answer check: the check reads
+            // each answer the upstream gives, and the rule cache only stands in for the request
+            // phase naming the rule that forwards. It used to expire by min_ttl, kept out of the
+            // rule cache at the default 0 and its regexes evaluated every time
+            Decision::Forward { .. } | Decision::Jump { .. } => None,
         };
 
         // If TTL is 0, do not cache / 如果 TTL 为 0，则不缓存
@@ -337,20 +327,21 @@ impl Engine {
                 &decision,
             );
         }
-        // 规则直接回应的决定都存，快速路径靠它回重复的查询；转发和跳转只在有正则条件的 pipeline 里存，
-        // 别的 pipeline 重算一遍比存一条缓存便宜（见 `RuntimePipeline::matches_regex`）。求值时执行了 log 动作的决定不存：
-        // 规则缓存替求值给出决定，命中时不执行规则的动作，log 动作就不再记下这些查询
-        // A rule's own answer is always kept, the fast path answers repeated queries from it; forward and
-        // jump decisions are kept only in a pipeline with regex conditions, since elsewhere computing them
-        // again is cheaper than storing an entry (see `RuntimePipeline::matches_regex`). A decision whose
-        // evaluation ran a log action is not kept: the rule cache gives the decision in place of
-        // evaluating, running none of the rules' actions on a hit, and the log action would no longer
-        // record those queries
+        // 规则直接回应的决定和跳转都存：快速路径靠前者回重复的查询，跟着后者到目标 pipeline 里去查（跳转不带记录，存一条
+        // 很便宜）；转发只在有正则条件的 pipeline 里存，别的 pipeline 重算一遍比存一条缓存便宜（见
+        // `RuntimePipeline::matches_regex`）。求值时执行了 log 动作的决定不存：规则缓存替求值给出决定，命中时不执行规则的
+        // 动作，log 动作就不再记下这些查询
+        // A rule's own answer and a jump are always kept: the fast path answers repeated queries from
+        // the former and follows the latter to look in its target pipeline (a jump carries no records,
+        // cheap to keep); a forward decision is kept only in a pipeline with regex conditions, since
+        // elsewhere computing it again is cheaper than storing an entry (see
+        // `RuntimePipeline::matches_regex`). A decision whose evaluation ran a log action is not kept:
+        // the rule cache gives the decision in place of evaluating, running none of the rules' actions
+        // on a hit, and the log action would no longer record those queries
         let worth_keeping =
-            !logged && (pipeline.matches_regex || matches!(decision, Decision::Static { .. }));
+            !logged && (pipeline.matches_regex || !matches!(decision, Decision::Forward { .. }));
         if whole_pipeline && worth_keeping {
             self.insert_rule_cache(
-                state,
                 rule_hash,
                 pipeline.id.clone(),
                 request,
@@ -475,7 +466,7 @@ impl Engine {
                         }
                         Action::JumpToPipeline { pipeline: target } => {
                             let d = Decision::Jump {
-                                pipeline: Arc::from(target.as_str()),
+                                pipeline: Arc::clone(target),
                             };
                             return Some(d);
                         }
@@ -747,11 +738,12 @@ mod continued_rule_cache_tests {
     }
 }
 
-/// 规则缓存存什么：规则直接回应的决定（快速路径靠它回重复的拦截查询）都存；转发决定只在带正则条件的
-/// pipeline 里存，别处重算一遍比为每个新名字存一条缓存便宜。
-/// What the rule cache keeps: a rule's own answer always (the fast path answers repeated blocked
-/// queries from it); a forward decision only in a pipeline with regex conditions, since elsewhere
-/// computing it again is cheaper than storing an entry for every new name.
+/// 规则缓存存什么：规则直接回应的决定（快速路径靠它回重复的拦截查询）和跳转（快速路径跟着它到目标里去查）都存；转发决定只在
+/// 带正则条件的 pipeline 里存，别处重算一遍比为每个新名字存一条缓存便宜。
+/// What the rule cache keeps: a rule's own answer (the fast path answers repeated blocked
+/// queries from it) and a jump (the fast path follows it to look in the target) always; a
+/// forward decision only in a pipeline with regex conditions, since elsewhere computing it again
+/// is cheaper than storing an entry for every new name.
 #[cfg(test)]
 mod rule_cache_policy_tests {
     use std::sync::Arc;
@@ -780,6 +772,11 @@ mod rule_cache_policy_tests {
                             "actions": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
                         },
                         {
+                            "name": "elsewhere",
+                            "matchers": [{ "type": "domain_suffix", "value": "jump.example" }],
+                            "actions": [{ "type": "jump_to_pipeline", "pipeline": "regex" }]
+                        },
+                        {
                             "name": "rest",
                             "matchers": [{ "type": "any" }],
                             "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
@@ -806,7 +803,7 @@ mod rule_cache_policy_tests {
     }
 
     #[tokio::test]
-    async fn own_answers_are_kept_and_forwards_only_where_regexes_run() {
+    async fn own_answers_and_jumps_are_kept_and_forwards_only_where_regexes_run() {
         let engine = engine();
         let state = engine.state.load_full();
         let [plain, regex] = [0, 1].map(|index| &state.pipeline.pipelines[index]);
@@ -825,6 +822,7 @@ mod rule_cache_policy_tests {
             engine.apply_rules(&state, pipeline, &request)
         };
         assert!(matches!(ask(plain, "ads.example"), Decision::Static { .. }));
+        assert!(matches!(ask(plain, "jump.example"), Decision::Jump { .. }));
         assert!(matches!(
             ask(plain, "example.com"),
             Decision::Forward { .. }
@@ -846,7 +844,7 @@ mod rule_cache_policy_tests {
                 let kind = match &record.entry.decision {
                     Decision::Static { .. } => "static",
                     Decision::Forward { .. } => "forward",
-                    _ => "other",
+                    Decision::Jump { .. } => "jump",
                 };
                 (record.entry.pipeline_id.to_string(), kind)
             })
@@ -855,6 +853,7 @@ mod rule_cache_policy_tests {
         assert_eq!(
             kept,
             [
+                ("plain".to_owned(), "jump"),
                 ("plain".to_owned(), "static"),
                 ("regex".to_owned(), "forward"),
                 ("regex".to_owned(), "forward"),
@@ -925,7 +924,7 @@ mod rule_cache_policy_tests {
                             "actions": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
                         },
                         {
-                            // 有正则的 pipeline 才缓存转发和跳转 / Only a pipeline with regexes caches forwards and jumps
+                            // 有正则的 pipeline 才缓存转发 / Only a pipeline with regexes caches forwards
                             "name": "www",
                             "matchers": [{ "type": "domain_regex", "value": "^www\\." }],
                             "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }]
@@ -1031,12 +1030,13 @@ mod rule_cache_policy_tests {
         assert!(Arc::ptr_eq(&default.1, &again.1));
     }
 
-    /// 带响应阶段的转发在规则缓存里按 min_ttl 过期，min_ttl 为 0 时不缓存；没有响应阶段的只受
-    /// `RULE_CACHE_MAX_AGE` 限制
-    /// A forward with a response phase lasts min_ttl in the rule cache and is not cached at a
-    /// min_ttl of 0; one without is bounded by `RULE_CACHE_MAX_AGE` alone
+    /// 转发在规则缓存里只受 `RULE_CACHE_MAX_AGE` 限制，带不带响应阶段、min_ttl 是多少都一样。以前带响应阶段的按 min_ttl
+    /// 过期，默认的 0 让它从不进规则缓存
+    /// A forward is bounded by `RULE_CACHE_MAX_AGE` alone in the rule cache, with a response
+    /// phase or without, whatever min_ttl is. One with a response phase used to expire by
+    /// min_ttl, kept out of the rule cache at the default 0
     #[tokio::test]
-    async fn a_forward_with_a_response_phase_lasts_min_ttl_in_the_rule_cache() {
+    async fn a_forward_lasts_the_rule_cache_max_age_with_or_without_a_response_phase() {
         let lasts = |min_ttl: u64, response_phase: bool| {
             let mut rule = serde_json::json!({
                 "name": "www",
@@ -1067,16 +1067,15 @@ mod rule_cache_policy_tests {
                 expires.saturating_duration_since(before).as_secs_f64()
             })
         };
-        assert_eq!(lasts(0, true), None, "not cached");
-        let thirty = lasts(30, true).expect("cached");
-        assert!((29.0..31.0).contains(&thirty), "{thirty}");
+        let longest = RULE_CACHE_MAX_AGE.as_secs_f64();
         for min_ttl in [0, 30] {
-            let bounded = lasts(min_ttl, false).expect("cached");
-            let longest = RULE_CACHE_MAX_AGE.as_secs_f64();
-            assert!(
-                (longest - 1.0..longest + 1.0).contains(&bounded),
-                "{bounded}"
-            );
+            for response_phase in [true, false] {
+                let bounded = lasts(min_ttl, response_phase).expect("cached");
+                assert!(
+                    (longest - 1.0..longest + 1.0).contains(&bounded),
+                    "min_ttl {min_ttl}, response phase {response_phase}: {bounded}"
+                );
+            }
         }
     }
 
@@ -1155,6 +1154,34 @@ mod rule_cache_policy_tests {
                 "{first}"
             );
         }
+    }
+
+    /// 跳转的决策共用配置读进来的那份目标名字，每次决策不再各分配一份
+    /// Jump decisions share the target's name read in with the configuration, rather than
+    /// allocating one each
+    #[tokio::test]
+    async fn jumps_share_one_copy_of_their_target() {
+        let engine = engine();
+        let state = engine.state.load_full();
+        let plain = &state.pipeline.pipelines[0];
+        let target_of = |name: &str| {
+            let request = RuleEvaluationContext::new(
+                "127.0.0.1".parse().unwrap(),
+                name,
+                RecordType::A,
+                DNSClass::IN,
+                false,
+                None,
+                false,
+            );
+            match engine.apply_rules(&state, plain, &request) {
+                Decision::Jump { pipeline } => pipeline,
+                other => panic!("{name} jumps, got {other:?}"),
+            }
+        };
+        let first = target_of("a.jump.example");
+        assert_eq!(&*first, "regex");
+        assert!(Arc::ptr_eq(&first, &target_of("b.jump.example")));
     }
 
     /// 过期的决策不拿来用；重新求值后原地写回，访问计数还在，也就还留在淘汰队列原来的位置

@@ -316,6 +316,23 @@ impl RuntimeResponseMatcher {
             }
         }
     }
+
+    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
+    #[inline]
+    pub const fn needs_geosite(&self) -> bool {
+        matches!(
+            self,
+            Self::ResponseRequestDomainGeoSite { .. }
+                | Self::ResponseRequestDomainGeoSiteNot { .. }
+        )
+    }
+
+    /// 要不要 GeoIP 数据（`response_answer_ip_geoip_private` 不要）/ Whether it needs GeoIP data
+    /// (`response_answer_ip_geoip_private` does not)
+    #[inline]
+    pub const fn needs_geoip(&self) -> bool {
+        matches!(self, Self::ResponseAnswerIpGeoipCountry { .. })
+    }
 }
 
 #[cfg(test)]

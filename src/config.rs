@@ -69,7 +69,11 @@ pub struct GlobalSettings {
     /// 响应缓存最多存放的应答份数（默认 10000），超过 1 KB 的应答每 1 KB 算一份
     /// / Most answers the response cache holds (default 10000), one over 1 KB counting once per KB
     pub cache_capacity: u64,
-    /// 响应缓存里的应答最多存多久（秒，默认 86400） / Longest the response cache keeps an answer (seconds, default 86400)
+    /// 应答 TTL 的上限（秒，默认 86400）：上游回答里每条记录的 TTL、缓存把一份应答当作新鲜的时间都不超过它；过了 TTL
+    /// 还能当过期应答用的另外再留（见 `serve_stale_expire_ttl`）
+    /// The cap on an answer's TTL (seconds, default 86400): neither the TTL of any record in an
+    /// upstream answer nor how long the cache holds an answer fresh goes past it; one still of
+    /// use past its TTL is kept on beyond that (see `serve_stale_expire_ttl`)
     pub cache_max_ttl: u64,
     /// DashMap shard 数量（0=自动，默认 0）。更多 shards=更少锁竞争但更多内存开销 / DashMap shard count (0=auto, default 0). More shards=less lock contention but more memory overhead
     pub dashmap_shards: usize,
@@ -481,8 +485,10 @@ pub enum Action {
         #[serde(default)]
         ttl: Option<u32>,
     },
-    /// 跳转到指定 Pipeline 继续处理。 / Jump to specified Pipeline to continue processing
-    JumpToPipeline { pipeline: String },
+    /// 跳转到指定 Pipeline 继续处理。目标名字读进来就是共用的一份，每次跳转不再各复制一份
+    /// Jump to specified Pipeline to continue processing. The target's name is read in as one
+    /// shared copy, so no jump makes a copy of its own
+    JumpToPipeline { pipeline: Arc<str> },
     /// 终止匹配。请求阶段使用默认上游，响应阶段使用当前响应。 / Terminate matching. Request phase uses default upstream, response phase uses current response
     Allow,
     /// 终止并丢弃（返回 REFUSED）。 / Terminate and drop (return REFUSED)
@@ -1002,7 +1008,7 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
         parse_config(&raw).with_context(|| format!("parse config file: {}", path.display()))?;
 
     if let Some(version) = cfg.version.as_ref() {
-        info!(target = "config", version = %version, "config loaded");
+        info!(version = %version, "config loaded");
     }
 
     Ok((cfg, raw))
@@ -1833,7 +1839,7 @@ fn rule_problems(
                     LOG_LEVELS.join(", ")
                 ));
             }
-            Action::JumpToPipeline { pipeline } if !pipelines.contains(pipeline.as_str()) => {
+            Action::JumpToPipeline { pipeline } if !pipelines.contains(&**pipeline) => {
                 report(format!(
                     "jump to pipeline \"{pipeline}\", which does not exist"
                 ));

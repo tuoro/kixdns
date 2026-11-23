@@ -28,6 +28,8 @@ pub mod execution;
 #[cfg(test)]
 mod failure_cache_tests;
 pub mod fair_queue;
+#[cfg(test)]
+mod fast_path_rule_tests;
 mod geo;
 #[cfg(test)]
 mod geo_reload_tests;
@@ -39,6 +41,8 @@ mod heavy_slot_tests;
 mod held_back_tests;
 #[cfg(test)]
 mod inflight_wait_tests;
+#[cfg(test)]
+mod jump_fast_path_tests;
 pub mod listener;
 pub mod matcher_adapter;
 pub mod memory_watermark;

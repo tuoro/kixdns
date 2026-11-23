@@ -1,11 +1,12 @@
 //! 响应缓存底下的存储：分片的哈希表，按 S3-FIFO 淘汰。
 //!
-//! 键是已经算好的 64 位数，再用带随机密钥的 SipHash 散一遍才定分片和桶：键可能出自不带密钥的哈希（规则缓存的就是），
-//! 请求方能凑出一串落在同一处的名字，带密钥的这一遍让它们照样分散开。
+//! 键是已经算好的 64 位数，出自带随机密钥的哈希（响应缓存的槽位和规则缓存的键都是，见 `Engine::question_hasher`），
+//! 请求方凑不出一串落在同一处的名字，所以直接用键的各位定分片和桶。以前规则缓存的键出自不带密钥的 FxHash，所有键都要
+//! 再散一遍。
 //!
 //! 每个分片一把读写锁。读只拿读锁，给条目的访问计数加一，不动队列；写拿写锁。淘汰按 S3-FIFO
 //! （Yang 等，SOSP 2023）：新条目先进小队列，在里面再被读到过才进主队列，没读到过的直接淘汰，
-//! 只记下它的哈希（幽灵队列）；幽灵队列里有的条目再来时直接进主队列。主队列像 CLOCK：读到过的
+//! 只记下它的键（幽灵队列）；幽灵队列里有的条目再来时直接进主队列。主队列像 CLOCK：读到过的
 //! 计数减一放回队尾，计数为零的淘汰。只问一次的名字因此挤不掉常用的。
 //!
 //! 容量按条目的计重算（响应缓存里见 `Arc<CacheSlot>` 的 [`Cached::weight`]），平分给各分片；一个
@@ -16,16 +17,17 @@
 //!
 //! The store under the response cache: a sharded hash table with S3-FIFO eviction.
 //!
-//! Keys are precomputed 64-bit numbers, hashed again with a randomly keyed SipHash
-//! to pick the shard and bucket: a key may come from an unkeyed hash (the rule
-//! cache's do), so a requester can make up a run of names that land in one place,
-//! and the keyed pass spreads them out regardless.
+//! Keys are precomputed 64-bit numbers from a randomly keyed hash (response cache
+//! slots and rule cache keys both, see `Engine::question_hasher`), so a requester
+//! cannot make up a run of names that land in one place, and the key's own bits pick
+//! the shard and the bucket. Rule cache keys used to come from the unkeyed FxHash,
+//! and every key was hashed a second time.
 //!
 //! Each shard has one read-write lock. A read takes the read lock and bumps the
 //! entry's access count without touching the queues; a write takes the write lock.
 //! Eviction follows S3-FIFO (Yang et al., SOSP 2023): a new entry joins the small
 //! queue and moves to the main queue only if it is read again while there; one
-//! that was not is evicted at once, leaving only its hash behind (the ghost
+//! that was not is evicted at once, leaving only its key behind (the ghost
 //! queue), and an entry the ghost queue remembers goes straight to the main queue
 //! when it comes back. The main queue works like CLOCK: an entry read since its
 //! last turn has its count lowered and goes to the back, one at zero is evicted.
@@ -41,7 +43,6 @@
 //! it never holds the write lock for long.
 
 use std::collections::VecDeque;
-use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -80,8 +81,8 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// The most places one write walks for the sweep, under 100 µs when cold, so the write
 /// lock is held no longer however large the shard
 const SWEEP_PLACES: u32 = 256;
-/// 分片号取哈希的这几位：低位留给分片里的桶，最高 7 位是 hashbrown 的标签，两者都要分散
-/// The hash bits that pick the shard: the low bits pick the bucket inside the shard and
+/// 分片号取键的这几位：低位留给分片里的桶，最高 7 位是 hashbrown 的标签，两者都要分散
+/// The key bits that pick the shard: the low bits pick the bucket inside the shard and
 /// the top 7 are hashbrown's tag, and both must stay spread
 const SHARD_BITS_AT: u32 = 40;
 /// 去掉了还排在队列里的位置多过存着的条目（至少这么多）时，整理一次队列把它们收回来；缓存没满时
@@ -97,7 +98,6 @@ pub struct CacheStore<V> {
     /// smallest shard holds: a value heavier than this may fit no shard (see
     /// [`Self::heaviest_value`])
     heaviest_value: u64,
-    hasher: RandomState,
     /// 条目过期以后再留多少秒，重载可以改 / How many seconds entries stay past their expiry,
     /// which a reload can change
     kept_secs: AtomicU64,
@@ -108,7 +108,7 @@ impl<V: Cached> CacheStore<V> {
     /// A cache holding at most `capacity` in weight, whose entries stay `kept` past their expiry
     pub fn new(capacity: u64, kept: Duration) -> Self {
         let shards = (capacity / MIN_SHARD_CAPACITY).clamp(1, MAX_SHARDS);
-        // 取不超过它的 2 的幂，分片号就是哈希的几位 / The power of two at or below it, so a shard number is some hash bits
+        // 取不超过它的 2 的幂，分片号就是键的几位 / The power of two at or below it, so a shard number is some key bits
         let shards = 1u64 << (63 - shards.leading_zeros());
         let now = Instant::now();
         Self {
@@ -119,7 +119,6 @@ impl<V: Cached> CacheStore<V> {
                     RwLock::new(Shard::new(share, now))
                 })
                 .collect(),
-            hasher: RandomState::new(),
             kept_secs: AtomicU64::new(kept.as_secs()),
             heaviest_value: capacity / shards,
         }
@@ -147,10 +146,8 @@ impl<V: Cached> CacheStore<V> {
         self.kept_secs.store(kept.as_secs(), Ordering::Relaxed);
     }
 
-    fn locate(&self, key: u64) -> (u64, &RwLock<Shard<V>>) {
-        let hash = self.hasher.hash_one(key);
-        let index = (hash >> SHARD_BITS_AT) as usize & (self.shards.len() - 1);
-        (hash, &self.shards[index])
+    fn locate(&self, key: u64) -> &RwLock<Shard<V>> {
+        &self.shards[(key >> SHARD_BITS_AT) as usize & (self.shards.len() - 1)]
     }
 
     /// `key` 的值；读到算一次访问 / The value of `key`; a read counts as an access
@@ -164,9 +161,8 @@ impl<V: Cached> CacheStore<V> {
     /// cloned: when only a part of it is wanted, this spares cloning the whole (a slot's `Arc`,
     /// say, whose reference count every core writes); a read counts as an access
     pub fn get_with<R>(&self, key: u64, f: impl FnOnce(&V) -> R) -> Option<R> {
-        let (hash, shard) = self.locate(key);
-        let shard = shard.read();
-        let node = &shard.nodes[shard.find(hash, key)? as usize];
+        let shard = self.locate(key).read();
+        let node = &shard.nodes[shard.find(key)? as usize];
         let freq = node.freq.load(Ordering::Relaxed);
         if freq < MAX_FREQ {
             // 几个读者同时加可能少加一次，计数本来就是近似的 / Readers adding at once may lose a bump; the count is approximate anyway
@@ -179,8 +175,7 @@ impl<V: Cached> CacheStore<V> {
     /// Read the value of `key` and change it as `f` says, under the shard's write lock: no
     /// other write comes between the read and the write
     pub fn compute(&self, key: u64, f: impl FnOnce(Option<&V>) -> Op<V>) {
-        let (hash, shard) = self.locate(key);
-        let mut shard = shard.write();
+        let mut shard = self.locate(key).write();
         let now = Instant::now();
         if shard.sweeping.is_none() && now.saturating_duration_since(shard.swept_at) >= SWEEP_EVERY
         {
@@ -190,7 +185,7 @@ impl<V: Cached> CacheStore<V> {
         if shard.sweeping.is_some() {
             shard.sweep_some(self.kept(), now);
         }
-        let found = shard.find(hash, key);
+        let found = shard.find(key);
         let current = found.and_then(|index| shard.nodes[index as usize].value.as_ref());
         match (f(current), found) {
             (Op::Nop, _) | (Op::Remove, None) => {}
@@ -207,7 +202,7 @@ impl<V: Cached> CacheStore<V> {
                 } else if let Some(index) = found {
                     shard.replace(index, value, weight);
                 } else {
-                    shard.insert(hash, key, value, weight);
+                    shard.insert(key, value, weight);
                 }
             }
         }
@@ -249,9 +244,8 @@ impl<V: Cached> CacheStore<V> {
     /// 测试用：`key` 的访问计数，读它不算一次访问 / For tests: the access count of `key`, not counting as an access
     #[cfg(test)]
     pub(crate) fn access_count(&self, key: u64) -> Option<u8> {
-        let (hash, shard) = self.locate(key);
-        let shard = shard.read();
-        let index = shard.find(hash, key)?;
+        let shard = self.locate(key).read();
+        let index = shard.find(key)?;
         Some(shard.nodes[index as usize].freq.load(Ordering::Relaxed))
     }
 
@@ -288,7 +282,6 @@ enum Queue {
 
 struct Node<V> {
     key: u64,
-    hash: u64,
     /// None：已经去掉，还排在队列里，轮到时才回收这个位置
     /// None: removed but still queued; the place is reclaimed when its turn comes
     value: Option<V>,
@@ -305,7 +298,7 @@ struct Shard<V> {
     free: Vec<u32>,
     small: VecDeque<u32>,
     main: VecDeque<u32>,
-    /// 从小队列淘汰的哈希，值是它进幽灵队列的序号 / Hashes evicted from the small queue, each with its ghost sequence number
+    /// 从小队列淘汰的键，值是它进幽灵队列的序号 / Keys evicted from the small queue, each with its ghost sequence number
     ghost: HashTable<(u64, u32)>,
     ghost_order: VecDeque<(u64, u32)>,
     ghost_seq: u32,
@@ -341,9 +334,9 @@ impl<V: Cached> Shard<V> {
         }
     }
 
-    fn find(&self, hash: u64, key: u64) -> Option<u32> {
+    fn find(&self, key: u64) -> Option<u32> {
         self.table
-            .find(hash, |&index| self.nodes[index as usize].key == key)
+            .find(key, |&index| self.nodes[index as usize].key == key)
             .copied()
     }
 
@@ -354,9 +347,9 @@ impl<V: Cached> Shard<V> {
         }
     }
 
-    fn insert(&mut self, hash: u64, key: u64, value: V, weight: u32) {
+    fn insert(&mut self, key: u64, value: V, weight: u32) {
         // 幽灵队列记得的直接进主队列 / One the ghost queue remembers goes straight to the main queue
-        let queue = match self.ghost.find_entry(hash, |&(ghost, _)| ghost == hash) {
+        let queue = match self.ghost.find_entry(key, |&(ghost, _)| ghost == key) {
             Ok(entry) => {
                 entry.remove();
                 Queue::Main
@@ -365,7 +358,6 @@ impl<V: Cached> Shard<V> {
         };
         let node = Node {
             key,
-            hash,
             value: Some(value),
             weight,
             freq: AtomicU8::new(0),
@@ -383,7 +375,7 @@ impl<V: Cached> Shard<V> {
         };
         let nodes = &self.nodes;
         self.table
-            .insert_unique(hash, index, |&other| nodes[other as usize].hash);
+            .insert_unique(key, index, |&other| nodes[other as usize].key);
         match queue {
             Queue::Small => self.small.push_back(index),
             Queue::Main => self.main.push_back(index),
@@ -435,25 +427,25 @@ impl<V: Cached> Shard<V> {
     fn unlink(&mut self, index: u32) {
         let node = &mut self.nodes[index as usize];
         node.value = None;
-        let (hash, queue, weight) = (node.hash, node.queue, node.weight);
-        if let Ok(entry) = self.table.find_entry(hash, |&other| other == index) {
+        let (key, queue, weight) = (node.key, node.queue, node.weight);
+        if let Ok(entry) = self.table.find_entry(key, |&other| other == index) {
             entry.remove();
         }
         *self.queue_weight(queue) -= u64::from(weight);
         self.live -= 1;
     }
 
-    fn remember(&mut self, hash: u64) {
+    fn remember(&mut self, key: u64) {
         self.ghost_seq = self.ghost_seq.wrapping_add(1);
         let seq = self.ghost_seq;
-        match self.ghost.find_entry(hash, |&(ghost, _)| ghost == hash) {
+        match self.ghost.find_entry(key, |&(ghost, _)| ghost == key) {
             Ok(mut entry) => entry.get_mut().1 = seq,
             Err(_) => {
                 self.ghost
-                    .insert_unique(hash, (hash, seq), |&(ghost, _)| ghost);
+                    .insert_unique(key, (key, seq), |&(ghost, _)| ghost);
             }
         }
-        self.ghost_order.push_back((hash, seq));
+        self.ghost_order.push_back((key, seq));
         // 幽灵队列记得的个数和容量一样多 / The ghost queue remembers as many as the capacity
         while self.ghost_order.len() as u64 > self.capacity.max(1) {
             let (old, old_seq) = self
@@ -498,10 +490,10 @@ impl<V: Cached> Shard<V> {
             self.main_weight += weight;
             self.main.push_back(index);
         } else {
-            let hash = node.hash;
+            let key = node.key;
             self.unlink(index);
             self.free.push(index);
-            self.remember(hash);
+            self.remember(key);
         }
     }
 
@@ -560,7 +552,7 @@ impl<V: Cached> Shard<V> {
                 if node.value.is_some() {
                     weights[queue as usize] += u64::from(node.weight);
                     assert_eq!(
-                        self.find(node.hash, node.key),
+                        self.find(node.key),
                         Some(index),
                         "live node {index} not in the table"
                     );
@@ -639,15 +631,27 @@ mod tests {
         store.compute(key, |_| Op::Put(value));
     }
 
+    /// 存储层直接用键的各位定分片和桶，真正的键出自带密钥的哈希（见 `Engine::question_hasher`）：要分到各个分片的测试，
+    /// 键也先这样散开
+    /// The store picks shards and buckets by a key's own bits, real keys coming from a keyed
+    /// hash (see `Engine::question_hasher`): tests meant to reach every shard spread their keys
+    /// so too
+    fn spread(n: u64) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        n.hash(&mut hasher);
+        hasher.finish()
+    }
+
     const DAY: Duration = Duration::from_secs(86400);
 
     #[test]
     fn weight_never_exceeds_the_capacity() {
         let store = CacheStore::new(1000, DAY);
         for key in 0..20_000u64 {
-            put(&store, key, weighted(key, 1 + (key % 5) as u32));
+            put(&store, spread(key), weighted(key, 1 + (key % 5) as u32));
             if key % 3 == 0 {
-                store.get(key / 2);
+                store.get(spread(key / 2));
             }
         }
         store.check();
@@ -691,7 +695,7 @@ mod tests {
             let store = CacheStore::new(capacity, DAY);
             assert_eq!(store.shards.len(), shards, "capacity {capacity}");
             for key in 0..20_000 {
-                put(&store, key, value(key));
+                put(&store, spread(key), value(key));
             }
             store.check();
             assert_eq!(store.weighted_size(), capacity, "capacity {capacity}");
@@ -708,19 +712,90 @@ mod tests {
         }
     }
 
+    /// 键的各位直接定分片，不再散一遍：键都出自带密钥的哈希，再散一遍只是白算
+    /// A key's own bits pick its shard, with no second hashing: keys all come from a keyed hash,
+    /// and hashing them again was work for nothing
+    #[test]
+    fn a_key_picks_its_shard_by_its_own_bits() {
+        let store = CacheStore::<Value>::new(64 * MIN_SHARD_CAPACITY, DAY);
+        assert_eq!(store.shards.len(), 64);
+        for shard in 0..64u64 {
+            assert!(
+                std::ptr::eq(
+                    store.locate(shard << SHARD_BITS_AT),
+                    &store.shards[shard as usize]
+                ),
+                "shard {shard}"
+            );
+        }
+    }
+
+    /// 引擎给一串名字算出的键（响应缓存的槽位、规则缓存的键）分到每个分片，各片多少差不多：存储层直接用键的各位，靠的就是这个
+    /// The keys the engine makes for a run of names (response cache slots, rule cache keys) reach
+    /// every shard, about evenly: the store, using a key's own bits, relies on this
+    #[test]
+    fn the_engines_keys_spread_over_every_shard() {
+        use crate::engine::Engine;
+        use crate::engine::rules::calculate_rule_hash;
+        use crate::matcher::RequesterKey;
+        use crate::proto_utils::QueryFlags;
+        use hickory_proto::rr::{DNSClass, RecordType};
+
+        let store = CacheStore::<Value>::new(64 * MIN_SHARD_CAPACITY, DAY);
+        let names: Vec<String> = (0..64 * 64).map(|n| format!("n{n}.example")).collect();
+        let keys: [fn(&str) -> u64; 2] = [
+            |name| {
+                Engine::cache_slot(
+                    0,
+                    "main",
+                    name.as_bytes(),
+                    RecordType::A,
+                    DNSClass::IN,
+                    QueryFlags::RECURSIVE,
+                    &RequesterKey::NONE,
+                )
+            },
+            |name| {
+                calculate_rule_hash(
+                    0,
+                    "main",
+                    name,
+                    RecordType::A,
+                    DNSClass::IN,
+                    &RequesterKey::NONE,
+                )
+            },
+        ];
+        for key in keys {
+            let mut per_shard = [0u32; 64];
+            for name in &names {
+                let shard = store.locate(key(name));
+                let index = store
+                    .shards
+                    .iter()
+                    .position(|other| std::ptr::eq(other, shard));
+                per_shard[index.expect("one of the shards")] += 1;
+            }
+            assert!(
+                per_shard.iter().all(|&count| (16..=128).contains(&count)),
+                "{per_shard:?}"
+            );
+        }
+    }
+
     #[test]
     fn names_asked_once_do_not_push_out_one_in_use() {
         let store = CacheStore::new(1000, DAY);
-        put(&store, 7, value(7));
+        put(&store, spread(7), value(7));
         for key in 1_000_000..1_050_000u64 {
             // 常用的那个时不时被读到 / The one in use is read now and then
             if key % 50 == 0 {
                 assert!(
-                    store.get(7).is_some(),
+                    store.get(spread(7)).is_some(),
                     "the name in use was evicted by key {key}"
                 );
             }
-            put(&store, key, value(key));
+            put(&store, spread(key), value(key));
         }
         store.check();
     }
@@ -755,9 +830,8 @@ mod tests {
         }
         assert!(store.get(0).is_none(), "evicted unread");
         put(&store, 0, value(0));
-        let (hash, shard) = store.locate(0);
-        let shard = shard.read();
-        let index = shard.find(hash, 0).expect("stored again");
+        let shard = store.locate(0).read();
+        let index = shard.find(0).expect("stored again");
         assert_eq!(shard.nodes[index as usize].queue, Queue::Main);
         shard.check();
     }
@@ -829,8 +903,12 @@ mod tests {
     fn invalidate_all_empties_every_shard() {
         let store = CacheStore::new(1000, DAY);
         for key in 0..500 {
-            put(&store, key, value(key));
+            put(&store, spread(key), value(key));
         }
+        assert!(
+            store.shards.iter().all(|shard| shard.read().live > 0),
+            "every shard holds some"
+        );
         store.invalidate_all();
         assert_eq!((store.entry_count(), store.weighted_size()), (0, 0));
         assert!(store.get(1).is_none());
@@ -878,7 +956,7 @@ mod tests {
         let count = u64::from(SWEEP_PLACES) * 2 + 10;
         let mut shard = Shard::new(count, now);
         for key in 0..count {
-            shard.insert(key, key, aged(key, Duration::from_secs(40)), 1);
+            shard.insert(key, aged(key, Duration::from_secs(40)), 1);
         }
         shard.sweeping = Some(0);
         shard.sweep_some(kept, now);
@@ -892,7 +970,7 @@ mod tests {
         assert_eq!(shard.sweeping, None, "the round is over");
         shard.check();
         // 这一轮结束了就不再走 / A round that is over walks no further
-        shard.insert(1, 1, aged(1, Duration::from_secs(40)), 1);
+        shard.insert(1, aged(1, Duration::from_secs(40)), 1);
         shard.sweep_some(kept, now);
         assert_eq!(shard.live, 1);
     }
@@ -903,7 +981,7 @@ mod tests {
     fn outlived_in_first_shard(stored: u64) -> (CacheStore<Value>, Vec<u64>) {
         let store = CacheStore::new(64 * 4 * u64::from(SWEEP_PLACES), Duration::from_secs(30));
         let mut keys: Vec<u64> = (0u64..)
-            .filter(|key| std::ptr::eq(store.locate(*key).1, &store.shards[0]))
+            .filter(|key| std::ptr::eq(store.locate(*key), &store.shards[0]))
             .take(stored as usize + 8)
             .collect();
         let spare = keys.split_off(stored as usize);
@@ -1063,7 +1141,7 @@ mod tests {
         }
         let state = || {
             let mut shard = store.shards[0].write();
-            let index = shard.find(store.locate(0).0, 0).unwrap();
+            let index = shard.find(0).unwrap();
             let node = &mut shard.nodes[index as usize];
             (node.queue, *node.freq.get_mut())
         };
@@ -1088,7 +1166,7 @@ mod tests {
                         state ^= state << 13;
                         state ^= state >> 7;
                         state ^= state << 17;
-                        let key = state % 5000;
+                        let key = spread(state % 5000);
                         match state % 7 {
                             0 => store.compute(key, |_| Op::Remove),
                             1 | 2 => put(&store, key, weighted(key, 1 + (state % 4) as u32)),

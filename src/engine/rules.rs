@@ -1,15 +1,12 @@
 use anyhow::Context;
 use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::rdata::TXT;
-use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
+use hickory_proto::rr::{DNSClass, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
-use rustc_hash::FxHasher;
 use smallvec::SmallVec;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::warn;
 
 use super::observation::report_response_decision;
 use crate::cache_store::Cached;
@@ -111,6 +108,12 @@ pub enum ResponseActionResult {
     },
 }
 
+/// 规则缓存的键：和响应缓存的槽位一样用带密钥的 `Engine::question_hasher` 写进问题（为什么带密钥见那里），再写进规则对
+/// 请求方的判定。以前用不带密钥的 FxHash，请求方能凑出一串落在同一处的名字，存储层只好对所有键再散一遍
+/// The rule cache key: the question written into the keyed `Engine::question_hasher` as for a
+/// response cache slot (why keyed, see there), then how the rules judge the requester. It used
+/// to be an unkeyed FxHash, with which a requester could make up a run of names landing in one
+/// place, so the store hashed every key a second time
 #[inline]
 pub fn calculate_rule_hash(
     cache_namespace: u64,
@@ -120,12 +123,13 @@ pub fn calculate_rule_hash(
     qclass: DNSClass,
     requester: &RequesterKey,
 ) -> u64 {
-    let mut hasher = FxHasher::default();
-    cache_namespace.hash(&mut hasher);
-    pipeline_id.hash(&mut hasher);
-    qname.hash(&mut hasher);
-    u16::from(qtype).hash(&mut hasher);
-    u16::from(qclass).hash(&mut hasher);
+    let mut hasher = Engine::question_hasher(
+        cache_namespace,
+        pipeline_id,
+        qname.as_bytes(),
+        qtype,
+        qclass,
+    );
     requester.hash_into(&mut hasher);
     hasher.finish()
 }
@@ -253,48 +257,6 @@ impl RuleCacheEntry {
     }
 }
 
-/// 辅助函数：获取 GeoIP 和 GeoSite 锁（带非阻塞快速路径）
-/// Helper function: Acquire GeoIP and GeoSite locks (with non-blocking fast path)
-///
-/// 优化：消除重复的锁获取逻辑 / Optimization: Eliminate duplicate lock acquisition logic
-///
-/// 有争用时，先放掉已经拿到的那把，再按固定顺序阻塞读取：先 GeoSite、后 GeoIP，和 `select_pipeline`
-/// 一样。不这样做会卡死，原因有两个：
-/// - 再读一次已经持有的锁：parking_lot 的 `read()` 在有写者排队时要等那个写者，而写者在等这个线程
-///   放掉第一次读；
-/// - 拿着一把、按相反的顺序等另一把：两边的写者同时排队时，几方互相等待。
-///
-/// On contention, drop whichever lock was taken and block in one fixed order, GeoSite then GeoIP,
-/// as `select_pipeline` does. Otherwise it can deadlock in two ways:
-/// - reading a held lock again: parking_lot's `read()` waits behind a queued writer, which waits
-///   for this thread's first read;
-/// - holding one lock while waiting for the other in the opposite order: once writers queue on
-///   both, the parties wait on each other.
-#[inline]
-pub(crate) fn acquire_geo_locks<'a>(
-    engine: &'a Engine,
-) -> (
-    Option<parking_lot::RwLockReadGuard<'a, crate::matcher::geoip::GeoIpManager>>,
-    Option<parking_lot::RwLockReadGuard<'a, crate::matcher::geosite::GeoSiteManager>>,
-) {
-    // Try to acquire read locks non-blockingly (fast path for concurrent reads)
-    // 尝试非阻塞获取读锁（并发读的快速路径）
-    let mut geoip_manager = engine.geoip_manager.try_read();
-    let mut geosite_manager = engine.geosite_manager.try_read();
-
-    // Fallback to blocking read if try_read fails (rare write operation in progress)
-    // 如果 try_read 失败则回退到阻塞读取（罕见的写操作进行中）
-    if geoip_manager.is_none() || geosite_manager.is_none() {
-        tracing::debug!("GeoIP/GeoSite lock contention, falling back to blocking read");
-        drop(geoip_manager.take());
-        drop(geosite_manager.take());
-        geosite_manager = Some(engine.geosite_manager.read());
-        geoip_manager = Some(engine.geoip_manager.read());
-    }
-
-    (geoip_manager, geosite_manager)
-}
-
 /// 几个上游一起问、全都失败（`failure`）、其中有上游回了失败应答时（见 `UpstreamFailure`），把最先收到的那个
 /// 应答连同回它的上游交给规则的回答检查 `check`：检查通过、而且通过后有动作（`on_match`）要执行时，它就是这次转发
 /// 的应答，和只问一个上游时一样，连同回它的上游和解析好的报文一起给出。其余情况给出 None，照旧是失败：检查不通过时
@@ -324,11 +286,15 @@ pub(crate) fn check_failure_reply(
     Some((raw.clone(), upstream.clone(), msg))
 }
 
-/// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给的应答 `msg` 是否成立；没有应答（`None`）时不成立。没有匹配器时成立，也不用去拿
-/// GeoIP、GeoSite 的读锁；有匹配器时读锁只在求值时拿着
+/// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给的应答 `msg` 是否成立；没有应答（`None`）时不成立，没有匹配器时
+/// 成立。每个匹配器只在求值时拿它要的那把 Geo 读锁，和请求规则一样（见 `RuntimeMatcher::matches_with_qtype`）：不用 Geo
+/// 数据的检查一把都不拿；一次只拿一把，也就不会和排队的写者互相等。以前每次检查都把 GeoIP、GeoSite 两把一起拿上
 /// Whether the response matchers hold for the answer `msg` that `upstream` gave (the
-/// answering upstream, `udp:1.1.1.1:53`); without an answer (`None`) they do not. With no matchers they hold, and the GeoIP and GeoSite read locks are not
-/// taken; with some, the locks are held only while they are evaluated
+/// answering upstream, `udp:1.1.1.1:53`); without an answer (`None`) they do not, and with no
+/// matchers they do. Each matcher takes the Geo read lock it needs only while it is evaluated,
+/// as request rules do (see `RuntimeMatcher::matches_with_qtype`): a check using no Geo data
+/// takes none, and holding one at a time, it never waits on a queued writer that waits on it.
+/// Every check used to take both the GeoIP and the GeoSite lock
 pub(crate) fn response_matches(
     engine: &Engine,
     matchers: &[RuntimeResponseMatcherWithOp],
@@ -338,28 +304,28 @@ pub(crate) fn response_matches(
     qclass: DNSClass,
     msg: Option<&Message>,
 ) -> bool {
-    let Some(msg) = msg else {
-        return false;
-    };
-    if matchers.is_empty() {
-        return true;
-    }
-    let (geoip_manager, geosite_manager) = acquire_geo_locks(engine);
-    eval_match_chain(
-        matchers,
-        |m| m.operator,
-        |m| {
-            m.matcher.matches(
-                upstream,
-                qname,
-                qtype,
-                qclass,
-                msg,
-                geoip_manager.as_deref(),
-                geosite_manager.as_deref(),
-            )
-        },
-    )
+    msg.is_some_and(|msg| {
+        eval_match_chain(
+            matchers,
+            |m| m.operator,
+            |m| {
+                let geoip = m.matcher.needs_geoip().then(|| engine.geoip_manager.read());
+                let geosite = m
+                    .matcher
+                    .needs_geosite()
+                    .then(|| engine.geosite_manager.read());
+                m.matcher.matches(
+                    upstream,
+                    qname,
+                    qtype,
+                    qclass,
+                    msg,
+                    geoip.as_deref(),
+                    geosite.as_deref(),
+                )
+            },
+        )
+    })
 }
 
 /// 执行响应动作要的：请求本身（问题、谁在问、用的配置、观察者），和它这次转发的几样
@@ -446,7 +412,7 @@ async fn run_response_actions(
                     });
                 }
                 return Ok(ResponseActionResult::Jump {
-                    pipeline: Arc::from(pipeline.as_str()),
+                    pipeline: Arc::clone(pipeline),
                 });
             }
             // 和所有动作执行完一样：有应答就交出它，没有就 SERVFAIL
@@ -464,35 +430,20 @@ async fn run_response_actions(
             Action::Continue => {
                 return Ok(ResponseActionResult::Continue { ctx: ctx.ctx_opt });
             }
+            // 换掉手上的应答，换成的和 static_txt_response 给出的一样（TTL 是它的默认值）：只有 TXT、ANY 查询拿到
+            // TXT 记录，别的类型、别的类别回 NODATA，响应码是 NOERROR，装不下时回 SERVFAIL。以前不看这些，A 查询也
+            // 拿到 TXT 记录，上游回 NXDOMAIN 时还带着它。手上没有应答（上游失败以后）就没有可换的，回 SERVFAIL
+            // The answer in hand is replaced with what static_txt_response gives (its default
+            // TTL): only TXT and ANY queries get the TXT record, other types and classes NODATA,
+            // with NOERROR, and SERVFAIL when it does not fit. None of this used to be looked at,
+            // an A query getting the TXT record too, and an upstream's NXDOMAIN keeping it. With
+            // no answer in hand (after an upstream failure) there is nothing to replace: SERVFAIL
             Action::ReplaceTxtResponse { text } => {
-                if let Some(ref resp_ctx) = ctx.ctx_opt {
-                    let name = resp_ctx
-                        .msg
-                        .queries
-                        .first()
-                        .map(|q| q.name().clone())
-                        .ok_or_else(|| anyhow::anyhow!("No query name"))?;
-
-                    // 和静态 TXT 一样，装不进应答时回 SERVFAIL（见 `txt_size_problem`）
-                    // As for a static TXT, SERVFAIL when it does not fit the answer (see
-                    // `txt_size_problem`)
-                    if let Some(problem) = crate::engine::response::txt_size_problem(
-                        text,
-                        crate::engine::response::name_wire_len(&name),
-                    ) {
-                        warn!(qname = %qname, %problem, "replaced TXT answer does not fit a message");
-                        return response_action_servfail(ctx.req);
-                    }
-                    // Replace TXT records in answers / 替换答案中的 TXT 记录
-                    let record = Record::from_rdata(name, 300, RData::TXT(TXT::new(text.to_vec())));
-                    return static_answer(
-                        ctx.req,
-                        resp_ctx.msg.metadata.response_code,
-                        vec![record],
-                        "replace_txt",
-                    );
+                if ctx.ctx_opt.is_none() {
+                    return response_action_servfail(ctx.req);
                 }
-                return response_action_servfail(ctx.req);
+                let (rcode, answers) = make_static_txt_answer(qname, qtype, qclass, text, 300);
+                return static_answer(ctx.req, rcode, answers, "replace_txt");
             }
             Action::Forward {
                 upstream,
@@ -814,122 +765,50 @@ mod response_jump_tests {
 
 #[cfg(test)]
 mod geo_lock_tests {
+    use std::net::Ipv4Addr;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    use super::acquire_geo_locks;
-    use crate::engine::Engine;
-    use crate::engine::test_support::engine_from;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{Name, RecordType};
 
-    fn engine() -> Engine {
-        engine_from(serde_json::json!({
+    use crate::engine::test_support::{answering_upstream, ask, engine_from, first_a, peer};
+
+    /// 不用 Geo 数据的回答检查一把 Geo 读锁都不拿：GeoIP、GeoSite 都在写入时，它照样答上。以前每次检查都等着把两把锁都拿到
+    /// An answer check using no Geo data takes no Geo read lock: with GeoIP and GeoSite both
+    /// being written it still answers. Every check used to wait until it held both
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_check_without_geo_conditions_takes_no_geo_lock() {
+        let answer = Ipv4Addr::new(192, 0, 2, 1);
+        let upstream = answering_upstream(answer, 60).await;
+        let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9" },
-            "pipelines": [{ "id": "main", "rules": [] }]
-        }))
-    }
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "checked", "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream.address }],
+                "response_matchers": [{ "type": "response_answer_ip", "cidr": "192.0.2.0/24" }],
+                "response_actions_on_match": [{ "type": "allow" }]
+            }] }]
+        }));
+        let mut query = Message::new(0x6c6c, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
 
-    /// GeoIP is being written, so the reader gets only GeoSite and waits for GeoIP.
-    /// Meanwhile a GeoSite writer queues behind the reader's read. Reading GeoSite a
-    /// second time would wait behind that writer, which waits for the reader: a deadlock.
-    /// GeoIP 正在写入，读者只拿到 GeoSite，然后等 GeoIP；这时一个 GeoSite 写者排在它的读锁
-    /// 后面。再读一次 GeoSite 就要等那个写者，而写者在等读者，两边卡死。
-    #[tokio::test]
-    async fn waiting_for_one_geo_lock_never_reads_the_other_again() {
-        let engine = engine();
-        let geoip = engine.geoip_manager.clone();
-        let geosite = engine.geosite_manager.clone();
-
-        let geoip_write = geoip.write();
-        let (done, finished) = mpsc::channel();
-        let reader_engine = engine.clone();
-        let reader = std::thread::spawn(move || {
-            let (geoip_read, geosite_read) = acquire_geo_locks(&reader_engine);
-            let both = geoip_read.is_some() && geosite_read.is_some();
-            drop((geoip_read, geosite_read));
-            let _ = done.send(both);
+        let (geoip, geosite) = (engine.geoip_manager.clone(), engine.geosite_manager.clone());
+        let writing = (geoip.write(), geosite.write());
+        // 等在这个线程上，不用运行时的计时器：读锁要是拿不到，等着的那个工作线程也就不再推动计时器
+        // Waited for on this thread, not with the runtime's timer: a worker stuck waiting for a
+        // read lock no longer drives the timer either
+        let (answered, reply) = mpsc::channel();
+        tokio::spawn(async move {
+            let _ = answered.send(ask(&engine, &query, peer()).await);
         });
-
-        // The reader holds GeoSite once its try_read succeeded; it then waits for GeoIP.
-        // 读者的 try_read 拿到 GeoSite 后就一直持有，接着等 GeoIP。
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !geosite.is_locked() {
-            assert!(Instant::now() < deadline, "the reader never took GeoSite");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let queued = geosite.clone();
-        let writer = std::thread::spawn(move || drop(queued.write()));
-        // Give the writer time to queue behind the reader's read.
-        // 给写者时间排到读者的读锁后面。
-        std::thread::sleep(Duration::from_millis(200));
-
-        drop(geoip_write);
-        assert_eq!(
-            finished.recv_timeout(Duration::from_secs(5)),
-            Ok(true),
-            "the reader must get both locks without reading GeoSite twice"
-        );
-        reader.join().unwrap();
-        writer.join().unwrap();
-    }
-
-    /// Another reader, like `select_pipeline`, holds GeoSite and goes on to read GeoIP. A GeoSite
-    /// writer queues behind it, so the helper gets GeoIP but not GeoSite. Had the helper kept
-    /// GeoIP and waited for GeoSite, a GeoIP writer queued behind it would stop the other
-    /// reader's GeoIP read, and the four would wait on each other.
-    /// 另一个读者像 `select_pipeline` 那样拿着 GeoSite、接着读 GeoIP；一个 GeoSite 写者排在它后面，
-    /// 于是辅助函数拿到 GeoIP、拿不到 GeoSite。要是它拿着 GeoIP 等 GeoSite，排在它后面的 GeoIP 写者
-    /// 会挡住另一个读者读 GeoIP，四方互相等待。
-    #[tokio::test]
-    async fn the_fallback_takes_geosite_before_geoip_as_select_pipeline_does() {
-        let engine = engine();
-        let geoip = engine.geoip_manager.clone();
-        let geosite = engine.geosite_manager.clone();
-        let pause = || std::thread::sleep(Duration::from_millis(200));
-
-        let (go, wait_for_go) = mpsc::channel::<()>();
-        let (holding, held) = mpsc::channel::<()>();
-        let (other_done, other_finished) = mpsc::channel::<()>();
-        let (other_geosite, other_geoip) = (geosite.clone(), geoip.clone());
-        let other = std::thread::spawn(move || {
-            let geosite_read = other_geosite.read();
-            holding.send(()).unwrap();
-            wait_for_go.recv().unwrap();
-            let geoip_read = other_geoip.read();
-            drop((geoip_read, geosite_read));
-            let _ = other_done.send(());
-        });
-        held.recv().unwrap();
-
-        let queued_geosite = geosite.clone();
-        let geosite_writer = std::thread::spawn(move || drop(queued_geosite.write()));
-        pause();
-
-        let (done, finished) = mpsc::channel();
-        let reader_engine = engine.clone();
-        let reader = std::thread::spawn(move || {
-            let (geoip_read, geosite_read) = acquire_geo_locks(&reader_engine);
-            let both = geoip_read.is_some() && geosite_read.is_some();
-            drop((geoip_read, geosite_read));
-            let _ = done.send(both);
-        });
-        pause();
-
-        let queued_geoip = geoip.clone();
-        let geoip_writer = std::thread::spawn(move || drop(queued_geoip.write()));
-        pause();
-        go.send(()).unwrap();
-
-        assert_eq!(
-            finished.recv_timeout(Duration::from_secs(5)),
-            Ok(true),
-            "the helper must wait for GeoSite holding nothing, then take GeoIP"
-        );
-        assert!(
-            other_finished.recv_timeout(Duration::from_secs(5)).is_ok(),
-            "the other reader must get GeoIP"
-        );
-        for thread in [other, geosite_writer, reader, geoip_writer] {
-            thread.join().unwrap();
-        }
+        let reply = reply.recv_timeout(Duration::from_secs(3));
+        drop(writing);
+        let reply = reply.expect("answered while the Geo data was written");
+        assert_eq!(first_a(&reply), Some(answer));
     }
 }

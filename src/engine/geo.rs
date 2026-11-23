@@ -189,7 +189,7 @@ impl GeoSources {
     ) {
         let spec = GeoSiteSpec::of(cfg);
         if !self.geosite.is_current(&spec) {
-            info!(target = "geosite", paths = ?spec.paths, tags = spec.tags.len(), "GeoSite data follows the new configuration");
+            info!(paths = ?spec.paths, tags = spec.tags.len(), "GeoSite data follows the new configuration");
             // 先停下旧的监视并等它结束，它就不会在新数据换入以后再写进来
             // Stop the old watch and wait for it first, so it cannot write into the new
             // data after the swap
@@ -204,7 +204,7 @@ impl GeoSources {
             .as_deref()
             .is_some_and(|path| geoip.read().mmdb_replaced(path));
         if !self.geoip.is_current(&spec) || mmdb_replaced {
-            info!(target = "geoip", tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
+            info!(tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
             self.geoip.watch = None;
             let in_use = self.geoip.spec.dat_path.clone();
             self.geoip = load_geoip(spec, in_use.as_deref(), geoip, &self.rotation);
@@ -220,7 +220,7 @@ fn pending_watch(what: &str, paths: &[PathBuf]) -> Option<PendingWatch> {
         return None;
     }
     PendingWatch::new(paths)
-        .inspect_err(|err| warn!(target = "watcher", what, error = %err, "cannot watch data files for changes"))
+        .inspect_err(|err| warn!(what, error = %err, "cannot watch data files for changes"))
         .ok()
 }
 
@@ -233,7 +233,7 @@ fn start_watch(
 ) -> Option<FileWatch> {
     pending?
         .start(name, on_change)
-        .inspect_err(|err| warn!(target = "watcher", name, error = %err, "cannot start the data file watcher"))
+        .inspect_err(|err| warn!(name, error = %err, "cannot start the data file watcher"))
         .ok()
 }
 
@@ -304,7 +304,7 @@ fn load_geosite(
         for path in gave_nothing {
             let kept = in_use.take_source(path, &unprovided);
             if !kept.is_empty() {
-                warn!(target = "geosite", path = %path.display(), tags = kept.len(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
+                warn!(path = %path.display(), tags = kept.len(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
                 fresh.apply_source(path, kept);
             }
         }
@@ -351,7 +351,7 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
     let parsed = match GeoSiteManager::parse_file(path, tags) {
         Ok(parsed) => parsed,
         Err(err) => {
-            warn!(target = "geosite_watcher", path = %path.display(), error = %format!("{err:#}"), "GeoSite data reload failed, keeping the data in use");
+            warn!(path = %path.display(), error = %format!("{err:#}"), "GeoSite data reload failed, keeping the data in use");
             return false;
         }
     };
@@ -367,7 +367,7 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
     // another file still provided went on with this file's old data
     let gives_none = !parsed_provides_any(&parsed, tags);
     if gives_none {
-        warn!(target = "geosite_watcher", path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data only it provided");
+        warn!(path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data only it provided");
         if handovers.is_empty() {
             return false;
         }
@@ -378,7 +378,7 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
     let missing = manager.missing_tags(tags);
     drop(manager);
     let count = swapped.finish();
-    info!(target = "geosite_watcher", path = %path.display(), loaded_count = count, "GeoSite data reloaded");
+    info!(path = %path.display(), loaded_count = count, "GeoSite data reloaded");
     warn_missing_geosite_tags(&missing);
     true
 }
@@ -387,7 +387,7 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
 /// Logs the tags rules use that no GeoSite data file provides, as GeoIP does
 fn warn_missing_geosite_tags(missing: &[String]) {
     if !missing.is_empty() {
-        warn!(target = "geosite", tags = ?missing, "GeoSite tags used by rules are not in any data file and never match");
+        warn!(tags = ?missing, "GeoSite tags used by rules are not in any data file and never match");
     }
 }
 
@@ -460,7 +460,7 @@ fn load_geoip(
             && in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path())
             && fresh.keep_tags_of(&mut current, &dat_tags) > 0
         {
-            warn!(target = "geoip", path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
+            warn!(path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
         }
         mem::replace(&mut *current, fresh)
     };
@@ -496,7 +496,7 @@ fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String
     let parsed = match GeoIpManager::parse_file(path, tags) {
         Ok(parsed) => parsed,
         Err(err) => {
-            warn!(target = "geoip_watcher", path = %path.display(), error = %format!("{err:#}"), "GeoIP data reload failed, keeping the data in use");
+            warn!(path = %path.display(), error = %format!("{err:#}"), "GeoIP data reload failed, keeping the data in use");
             return false;
         }
     };
@@ -504,14 +504,14 @@ fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String
     // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
     // none of them any more, most likely a broken file, so the data in use stays
     if parsed.tag_count() == 0 && manager.read().tag_count() > 0 {
-        warn!(target = "geoip_watcher", path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
+        warn!(path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
         return false;
     }
     let mut fresh = manager.read().sharing_mmdb();
     let count = fresh.apply_parsed(parsed);
     let old = mem::replace(&mut *manager.write(), fresh);
     drop(old);
-    info!(target = "geoip_watcher", path = %path.display(), loaded_count = count, "GeoIP data reloaded");
+    info!(path = %path.display(), loaded_count = count, "GeoIP data reloaded");
     true
 }
 

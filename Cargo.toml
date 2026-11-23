@@ -14,7 +14,7 @@ readme = "README.md"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 hickory-proto = "0.26"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 arc-swap = "1.8"

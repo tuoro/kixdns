@@ -1045,13 +1045,13 @@ async fn an_observer_can_take_a_rule_answer_whole() {
     );
     assert!(observer.started.lock().unwrap().is_empty());
 
-    // 用到 GeoSite 的规则第一次走完整路径，之后由规则缓存答 / A rule using GeoSite takes the full path the first
-    // time, and the rule cache answers after that
+    // 先命中一条快速路径不当场决定的规则（这里 continue），第一次走完整路径，之后由规则缓存答 / A rule the fast
+    // path does not decide on the spot matching first (a continue here), the full path answers the first time and
+    // the rule cache after that
     let (engine, observer) = engine_with(serde_json::json!([{
         "id": "main",
         "rules": [
-            { "name": "geo", "matchers": [{ "type": "geo_site", "value": "nosuchtag" }],
-              "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }] },
+            { "name": "audit", "matchers": [{ "type": "any" }], "actions": [{ "type": "continue" }] },
             { "name": "ip", "matchers": [{ "type": "any" }], "actions": answer },
         ]
     }]));
@@ -1081,7 +1081,7 @@ async fn an_observer_can_take_a_rule_answer_whole() {
         *observer.whole.lock().unwrap(),
         vec![(
             "a.ip.test".to_string(),
-            vec!["ip".to_string()],
+            vec!["audit".to_string(), "ip".to_string()],
             true,
             ResponseCode::NoError,
             2,
@@ -1237,8 +1237,10 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
     );
 
     // Fast path again for the name the full path answered: a rule's own answer stays out of
-    // the response cache even with min_ttl, and the compiled rule answers it again
-    // 快速路径再问完整路径答过的名字：规则直接给的应答开着 min_ttl 也不进响应缓存，编译后的规则再答一次
+    // the response cache even with min_ttl, and the decision the full path kept in the rule
+    // cache answers it, looked at before the compiled rules as on the full path
+    // 快速路径再问完整路径答过的名字：规则直接给的应答开着 min_ttl 也不进响应缓存，由完整路径存进规则缓存的决定作答，
+    // 和完整路径一样先看规则缓存、再看编译后的规则
     let fast = engine
         .handle_packet_fast(&query("a.blocked.test"), peer())
         .unwrap();
@@ -1255,6 +1257,12 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
             },
             Event::CacheLookup { id },
             Event::CacheMiss { id },
+            Event::RuleCacheLookup {
+                id,
+                pipeline: "main".into(),
+                hit: true,
+                matched_rules: 1,
+            },
             Event::Rule {
                 id,
                 pipeline: "main".into(),
@@ -3252,6 +3260,88 @@ async fn an_expired_answer_found_after_a_jump_is_served_stale() {
             "lookup",
             "hit Stale"
         ]
+    );
+}
+
+/// 一个请求走过的路：选中的 pipeline、响应缓存的查找和结果、命中的请求阶段规则和作出的决定，按发生顺序。快速路径没有的不算：
+/// 它不另报规则缓存的查找，命中也记着是不是在快速路径上
+/// The way a request went: the pipelines it selected, its response-cache lookups and
+/// outcomes, the request-phase rules that matched and the decisions made, in order. What the
+/// fast path has no counterpart of is left out: it reports no rule cache lookup of its own,
+/// and a match tells whether it came on the fast path
+fn way_of(events: &[Event], request_id: u64) -> Vec<String> {
+    events_of(events, request_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Pipeline { pipeline, .. } => Some(format!("pipeline {pipeline}")),
+            Event::CacheLookup { .. } => Some("lookup".to_owned()),
+            Event::CacheMiss { .. } => Some("miss".to_owned()),
+            Event::CacheHit { kind, .. } => Some(format!("hit {kind:?}")),
+            Event::Rule {
+                pipeline,
+                rule,
+                decision,
+                ..
+            } => Some(format!("rule {pipeline}/{rule} {decision:?}")),
+            Event::Decision {
+                pipeline,
+                rule,
+                detail,
+                ..
+            } => Some(format!("decision {pipeline}/{rule:?} {detail:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 快速路径跟着跳转在目标的缓存里答上的请求，上报的路和完整路径答它时一样：两个 pipeline 都选中过，入口的缓存查过没查到，
+/// 跳转规则命中、决定跳走，目标的缓存命中。以前快速路径遇到跳转就交给异步路径
+/// A request the fast path answers from the target's cache after following a jump reports
+/// the way the full path reports when it answers: both pipelines selected, the entry's cache
+/// looked in and missed, the jump rule matched and deciding the jump, the target's cache hit.
+/// The fast path used to hand a jump to the async path
+#[tokio::test]
+async fn a_jump_followed_on_the_fast_path_is_reported_as_on_the_full_path() {
+    let (upstream, _echo) = spawn_echo_upstream(300).await;
+    let raw = jump_config(
+        &upstream,
+        serde_json::json!({ "default_upstream": "127.0.0.1:9", "min_ttl": 0 }),
+    );
+    let (engine, recorder) = observed_engine(&raw);
+    engine
+        .handle_packet(&query("jumped.example"), peer())
+        .await
+        .unwrap();
+    recorder.drain();
+
+    engine
+        .handle_packet(&query("jumped.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let full = way_of(&events, request_id_for(&events, "jumped.example"));
+    assert_eq!(
+        full,
+        [
+            "pipeline main",
+            "lookup",
+            "miss",
+            "rule main/to-group Jump",
+            "decision main/Some(\"to-group\") Jump { pipeline: \"group\" }",
+            "pipeline group",
+            "lookup",
+            "hit Fresh"
+        ]
+    );
+
+    assert!(matches!(
+        engine.handle_packet_fast(&query("jumped.example"), peer()),
+        Ok(Some(FastPathResponse::CacheHit { .. }))
+    ));
+    let events = recorder.drain();
+    assert_eq!(
+        way_of(&events, request_id_for(&events, "jumped.example")),
+        full
     );
 }
 
