@@ -83,6 +83,7 @@ pub struct InflightEntry {
 
 impl InflightEntry {
     /// `question` 的条目 / The entry of `question`
+    #[cfg(test)]
     pub(crate) fn new(question: &InflightQuestion<'_>) -> Self {
         Self::sharing(
             question,
@@ -470,6 +471,11 @@ pub(crate) fn build_cache_namespaces(cfg: &RuntimePipelineConfig) -> FxHashMap<A
             // processing, so they are part of every pipeline namespace.
             hash_global_settings_semantics(&cfg.settings, &mut hasher);
             hash_pipeline_semantics(pipeline, &mut hasher);
+            // 回答检查跳过去拿到的应答也缓存在这个 pipeline 的键下 / The answers an answer check's jump gets
+            // are cached under this pipeline's key too
+            for &reached in &pipeline.answered_through {
+                hash_pipeline_semantics(&cfg.pipelines[reached], &mut hasher);
+            }
             (pipeline.id.clone(), hasher.finish())
         })
         .collect()

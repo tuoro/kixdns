@@ -2091,8 +2091,7 @@ mod tests {
 mod refresh_failure_reply_tests {
     use super::{UpstreamFailure, is_failure_reply, reject_failure_reply_on_refresh};
     use crate::engine::core::Engine;
-    use crate::engine::response_log::ResponseInfo;
-    use crate::engine::rules::{ResponseJumpContext, process_response_jump};
+
     use crate::matcher::RuntimePipelineConfig;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
@@ -2154,13 +2153,17 @@ mod refresh_failure_reply_tests {
     }
 
     fn engine_with(pipeline: Value) -> Engine {
+        engine_with_pipelines(json!([pipeline]))
+    }
+
+    fn engine_with_pipelines(pipelines: Value) -> Engine {
         let raw = json!({
             "settings": {
                 "default_upstream": DEAD_UPSTREAM,
                 "upstream_timeout_ms": 200,
                 "min_ttl": 60
             },
-            "pipelines": [pipeline]
+            "pipelines": pipelines
         });
         let config: crate::config::PipelineConfig =
             serde_json::from_value(raw).expect("parse config");
@@ -2251,46 +2254,6 @@ mod refresh_failure_reply_tests {
         .expect("refresh finishes");
     }
 
-    /// Enters `pipeline` through a response-phase jump, as a refresh does.
-    /// 像刷新那样，经由响应阶段的跳转进入 `pipeline`。
-    async fn refresh_through_a_jump_into(engine: &Engine, pipeline: &str) {
-        let state = engine.state.load_full();
-        let request = query();
-        let packet = request.to_vec().unwrap();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            process_response_jump(
-                engine,
-                ResponseJumpContext {
-                    state: &state,
-                    pipeline_id: Arc::from(pipeline),
-                    remaining_jumps: 1,
-                    req: &request,
-                    packet: &packet,
-                    peer: CLIENT.parse().unwrap(),
-                    qname: "example.com",
-                    qtype: RecordType::A,
-                    qclass: DNSClass::IN,
-                    edns_present: false,
-                    client_ecs: None,
-                    upstream_timeout: Duration::from_millis(200),
-                    skip_cache: true,
-                    carried: crate::ecs_scope::ForwardEcs {
-                        source: crate::ecs_scope::EcsSource::Client,
-                        sent: crate::ecs_scope::Sent::Absent,
-                    },
-                    trail: &mut Default::default(),
-                    echo_floor: 0,
-                    observed: None,
-                    held_inflight: [None, None],
-                },
-                &mut ResponseInfo::default(),
-            ),
-        )
-        .await
-        .expect("refresh finishes");
-    }
-
     fn assert_still_cached(engine: &Engine, key: u64, entry: &Arc<crate::cache::CacheEntry>) {
         let cached = engine.cached(key).expect("the entry stays cached");
         assert!(
@@ -2333,15 +2296,31 @@ mod refresh_failure_reply_tests {
         assert_still_cached(&engine, key, &entry);
     }
 
+    /// `entry` 的应答都经回答检查跳到 `target`，`target` 的规则另带 `target_rules`。跳过去拿到的应答缓存在 `entry` 的键下
+    /// Every answer of `entry` jumps to `target` through an answer check, `target`'s rule carrying
+    /// `target_rules` besides. The answers got over there are cached under `entry`'s key
+    async fn jumping_to(target_upstream: &str, target_rules: Value) -> Engine {
+        // 它的任务一直在收发，`Upstream` 丢掉也不停 / Its task keeps answering after the `Upstream` is dropped
+        let entry = Upstream::spawn().await.addr;
+        let jump = json!({ "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "target" }] });
+        engine_with_pipelines(json!([
+            forwarding("entry", &entry, jump),
+            forwarding("target", target_upstream, target_rules)
+        ]))
+    }
+
+    /// 经响应阶段的跳转刷新：跳过去的上游回了失败，刷新以失败结束，条目留着
+    /// A refresh through a response-phase jump: the upstream jumped to replies with a failure,
+    /// the refresh ends as a failure and the entry stays
     #[tokio::test]
     async fn a_refresh_through_a_jump_keeps_the_entry() {
         let upstream = Upstream::spawn().await;
-        let engine = engine_with(forwarding("target", &upstream.addr, json!({})));
-        let key = cache_key(&engine, "target");
+        let engine = jumping_to(&upstream.addr, json!({})).await;
+        let key = cache_key(&engine, "entry");
         let entry = cache_an_answer(&engine, key).await;
 
         upstream.answer(ResponseCode::ServFail);
-        refresh_through_a_jump_into(&engine, "target").await;
+        refresh(&engine, key).await;
         assert_still_cached(&engine, key, &entry);
     }
 
@@ -2351,12 +2330,12 @@ mod refresh_failure_reply_tests {
         let first = Upstream::spawn().await;
         let second = Upstream::spawn().await;
         let on_match = json!({ "response_actions_on_match": forward_to(&second.addr) });
-        let engine = engine_with(forwarding("target", &first.addr, on_match));
-        let key = cache_key(&engine, "target");
+        let engine = jumping_to(&first.addr, on_match).await;
+        let key = cache_key(&engine, "entry");
         let entry = cache_an_answer(&engine, key).await;
 
         second.answer(ResponseCode::ServFail);
-        refresh_through_a_jump_into(&engine, "target").await;
+        refresh(&engine, key).await;
         assert_still_cached(&engine, key, &entry);
     }
 

@@ -2677,32 +2677,24 @@ fn inflight_config(held: &str, echo: &str, action: &str, via_jump: bool) -> Stri
         })
         .to_string();
     }
-    let entry = |id: &str| {
-        serde_json::json!({
-            "id": id,
-            "rules": [{
-                "name": "echo-then-jump",
-                "matchers": [{ "type": "any" }],
-                "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
-                "response_matchers": [{ "type": "upstream_equals", "value": echo }],
-                "response_actions_on_match": [
-                    { "type": "jump_to_pipeline", "pipeline": "shared" }
-                ]
-            }]
-        })
-    };
+    // 跟随者等在领头者响应跳转之前登记的条目上，领头者跳过去拿到最终的应答再交给它
+    // The follower waits on the entry the leader registered before its response jump, which
+    // the leader hands the final answer it gets over there
     serde_json::json!({
         "settings": settings,
-        "pipeline_select": [
-            {
-                "pipeline": "first",
-                "matchers": [{ "type": "client_ip", "cidr": "127.0.0.1/32" }]
-            },
-            { "pipeline": "second", "matchers": [{ "type": "any" }] }
-        ],
         "pipelines": [
-            entry("first"),
-            entry("second"),
+            {
+                "id": "entry",
+                "rules": [{
+                    "name": "echo-then-jump",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": echo, "transport": "udp" }],
+                    "response_matchers": [{ "type": "upstream_equals", "value": echo }],
+                    "response_actions_on_match": [
+                        { "type": "jump_to_pipeline", "pipeline": "shared" }
+                    ]
+                }]
+            },
             { "id": "shared", "rules": [held_rule] }
         ]
     })

@@ -306,13 +306,6 @@ impl Steps {
             || self.forwarded_while_waiting((b, upstream), (a, upstream))
     }
 
-    /// 两个请求里有一个等在了另一个发往 `upstream` 的那次转发的条目上（见 [`Self::waited_on`]）。谁先到那一步不定
-    /// One of the two requests waited on the entry of the other's forward to `upstream` (see
-    /// [`Self::waited_on`]). Which got there first may go either way
-    pub(crate) fn one_waited_on_the_other(&self, upstream: &str, [a, b]: [&str; 2]) -> bool {
-        self.waited_on(a, upstream, b) || self.waited_on(b, upstream, a)
-    }
-
     /// 记下的全部事件，断言失败时看 / Every step recorded, for a failing assertion
     pub(crate) fn taken(&self) -> Vec<Step> {
         self.0.lock().clone()

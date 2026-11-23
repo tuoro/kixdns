@@ -1,5 +1,5 @@
 use anyhow::Context;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::rdata::TXT;
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType};
@@ -7,25 +7,22 @@ use hickory_proto::serialize::binary::BinDecodable;
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-use super::observation::{Observed, report_response_decision, report_response_rule};
+use super::observation::{Observed, report_response_decision};
 use crate::cache_store::Cached;
 use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
 use crate::engine::matcher_adapter::log_match;
-use crate::engine::pipeline::RuleEvaluationContext;
 use crate::engine::response::{
     make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
 };
-use crate::engine::types::EngineInner;
-use crate::engine::types::{InflightEntry, InflightQuestion};
-use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
+use crate::engine::upstream::UpstreamFailure;
 use crate::engine::utils::engine_helpers::{self, build_response};
-use crate::engine::utils::{InflightCleanupGuard, parse_rcode, set_id};
+use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
 use crate::matcher::{Requester, RequesterKey, ResponsePhase, RuntimePipeline};
@@ -100,9 +97,11 @@ pub enum ResponseActionResult {
         rcode: ResponseCode,
         source: &'static str,
     },
+    /// 跳到 `pipeline` 接着走规则；次数由跳过去的一方数（见 `handle_packet_internal`），这里只看还剩没剩
+    /// Jump to `pipeline` and go on with its rules; the side making the jump counts it (see
+    /// `handle_packet_internal`), and this only checks whether any are left
     Jump {
         pipeline: Arc<str>,
-        remaining_jumps: usize,
     },
     Continue {
         ctx: Option<ResponseContext>,
@@ -518,7 +517,6 @@ async fn run_response_actions(
                 }
                 return Ok(ResponseActionResult::Jump {
                     pipeline: Arc::from(pipeline.as_str()),
-                    remaining_jumps: ctx.remaining_jumps - 1,
                 });
             }
             // 和所有动作执行完一样：有应答就交出它，没有就 SERVFAIL
@@ -685,548 +683,6 @@ fn response_action_servfail(req: &Message) -> anyhow::Result<ResponseActionResul
     })
 }
 
-pub(crate) struct ResponseJumpContext<'a> {
-    pub state: &'a EngineInner,
-    pub pipeline_id: Arc<str>,
-    pub remaining_jumps: usize,
-    pub req: &'a Message,
-    pub packet: &'a [u8],
-    pub peer: SocketAddr,
-    pub qname: &'a str,
-    pub qtype: RecordType,
-    pub qclass: DNSClass,
-    pub edns_present: bool,
-    /// The ECS option the client carries itself / 客户端自己带的 ECS 选项
-    pub client_ecs: Option<crate::ecs::EcsKey>,
-    pub upstream_timeout: Duration,
-    pub skip_cache: bool,
-    /// The ECS the packet carries: how the forward before the jump derived it, and
-    /// what it sent
-    /// 包里携带的 ECS：跳转前那次转发怎样取得它，以及发出了什么
-    pub carried: crate::ecs_scope::ForwardEcs,
-    /// Where the forwards on the path record their replies, for the echo the client
-    /// gets (nothing on this path is cached), and the floor from before the jump
-    /// (see `phases::client_reply`)
-    /// 这条路径上的转发在哪里记下应答，供客户端拿到的回显使用（这条路径不缓存），以及跳转之前
-    /// 的下限（见 `phases::client_reply`）
-    pub trail: &'a mut crate::ecs_scope::EcsReach,
-    pub echo_floor: u8,
-    /// Observer context of the request / 所属请求的观察者上下文
-    pub observed: Observed<'a>,
-    /// In-flight entries the request already holds as it jumps: the one its
-    /// forward registered, and one a `continue` kept (see
-    /// `ForwardDecisionContext::held_inflight`). Nobody else answers them, so
-    /// the jump target never waits on them.
-    /// 请求跳转时已经握着的 in-flight 条目：这次转发登记的那条，以及 `continue` 留下的
-    /// 那条（见 `ForwardDecisionContext::held_inflight`）。没有别人会应答它们，所以跳转
-    /// 目标从不等它们。
-    pub held_inflight: [Option<u64>; 2],
-}
-
-pub(crate) async fn process_response_jump(
-    engine: &Engine,
-    context: ResponseJumpContext<'_>,
-    response: &mut crate::engine::response_log::ResponseInfo,
-) -> anyhow::Result<Bytes> {
-    let ResponseJumpContext {
-        state,
-        mut pipeline_id,
-        mut remaining_jumps,
-        req,
-        packet,
-        peer,
-        qname,
-        qtype,
-        qclass,
-        edns_present,
-        client_ecs,
-        upstream_timeout,
-        skip_cache,
-        carried,
-        trail,
-        echo_floor,
-        observed,
-        held_inflight,
-    } = context;
-    let requester = Requester {
-        address: peer.ip(),
-        edns: edns_present,
-        ecs: client_ecs,
-    };
-    let cfg = &state.pipeline;
-    let mut skip_rules = crate::engine::pipeline::Continued::new();
-    let mut reused_response: Option<ResponseContext> = None;
-    let mut cleanup_guards: Vec<InflightCleanupGuard> = Vec::new();
-    // The request's own entries: the ones it held before the jump and the ones
-    // it registers on the way. Waiting on one waits on itself, since only this
-    // request answers it, and the query hangs until the client gives up; it
-    // forwards by itself instead, as `handle_forward_decision_logged` does with a held
-    // entry. Other requests' entries are still joined.
-    // 请求自己的条目：跳转前握着的，和一路上登记的。等它就是等自己（只有这个请求
-    // 会应答它），查询会一直挂到客户端放弃；改为自己转发，和 `handle_forward_decision_logged`
-    // 对握着的条目的做法一样。别的请求的条目照旧合并等待。
-    let holds = |guards: &[InflightCleanupGuard], hash: u64| {
-        guards.iter().any(|guard| guard.hash == hash) || held_inflight.contains(&Some(hash))
-    };
-    // Whether this pass enters a pipeline (by the jump that led here, or a
-    // later one) rather than resuming the same pipeline after a `continue`:
-    // only entering reports `pipeline_selected`.
-    // 这一轮是不是进入一个 pipeline（经由引来的跳转或之后的跳转），而不是
-    // `continue` 后在同一 pipeline 继续：只有进入才上报 `pipeline_selected`。
-    let mut entering = true;
-    let join_wait = crate::engine::upstream::hedge_timeout(upstream_timeout);
-
-    loop {
-        response.pipeline = Some(pipeline_id.clone());
-        response.upstream = None;
-        // 跳转上限在要跳的地方数（下面规则级的跳转，和响应动作里的跳转）：还剩 0 次时不让再跳。带着 0 次进到这里
-        // 不算超限，引来的那次跳转本身在上限之内；以前在这里也拦一次，上限 N 就只让跳 N−1 次
-        // The jump limit is counted where a jump is about to be made (the rule-level jumps
-        // below and the jumps of response actions): with none left, no further jump. Arriving
-        // here with none left is within the limit, as the jump that led here was; this used
-        // to be refused here too, so a limit of N allowed N−1 jumps
-        let Some(pipeline) = cfg.pipeline(&pipeline_id) else {
-            let resp_bytes = engine_helpers::build_servfail_response(req)?;
-            for g in &mut cleanup_guards {
-                g.hand_over(|| {
-                    crate::engine::phases::for_waiters(&resp_bytes, &requester, trail, echo_floor)
-                });
-            }
-            return Ok(resp_bytes);
-        };
-        if entering && let Some((observer, ctx)) = observed {
-            observer.pipeline_selected(ctx, &pipeline.id);
-        }
-        entering = true;
-
-        let mut decision = engine.apply_rules(
-            state,
-            pipeline,
-            &RuleEvaluationContext::new(
-                peer.ip(),
-                qname,
-                qtype,
-                qclass,
-                edns_present,
-                // 空集和 None 一样：一条也不跳过 / An empty set is as None: nothing skipped
-                Some(&skip_rules),
-                skip_cache,
-            )
-            .with_observed(observed),
-        );
-
-        // Resolve nested rule-level jumps first
-        let mut local_jumps = remaining_jumps;
-        loop {
-            if let Decision::Jump { pipeline } = decision {
-                if local_jumps == 0 {
-                    // See the jump limit above / 同上面的跳转上限
-                    response.upstream = Some(Arc::from("static"));
-                    return engine_helpers::build_servfail_response(req);
-                }
-                pipeline_id = pipeline;
-                response.pipeline = Some(pipeline_id.clone());
-                local_jumps -= 1;
-                if let Some(next_pipeline) = cfg.pipeline(&pipeline_id) {
-                    if let Some((observer, ctx)) = observed {
-                        observer.pipeline_selected(ctx, &next_pipeline.id);
-                    }
-                    skip_rules.clear();
-                    // 留着复用的应答属于上一个 pipeline，见 handle_packet_internal 里请求阶段的跳转
-                    // An answer kept for reuse belongs to the previous pipeline; see the
-                    // request-phase jump in handle_packet_internal
-                    reused_response = None;
-                    decision = engine.apply_rules(
-                        state,
-                        next_pipeline,
-                        &RuleEvaluationContext::new(
-                            peer.ip(),
-                            qname,
-                            qtype,
-                            qclass,
-                            edns_present,
-                            None,
-                            skip_cache,
-                        )
-                        .with_observed(observed),
-                    );
-                    continue;
-                } else {
-                    let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                    for g in &mut cleanup_guards {
-                        g.hand_over(|| {
-                            crate::engine::phases::for_waiters(
-                                &resp_bytes,
-                                &requester,
-                                trail,
-                                echo_floor,
-                            )
-                        });
-                    }
-                    return Ok(resp_bytes);
-                }
-            }
-            break;
-        }
-
-        remaining_jumps = local_jumps;
-        // Answers on this path are not cached: no lookup uses a key of the
-        // response-jump path, so they would only take up room. Only the inflight key
-        // is needed.
-        // 这条路径上的应答不写缓存：没有哪次查找用响应跳转路径的键，写进去只会占地方。这里只需要
-        // inflight 键。
-        let inflight_question = InflightQuestion {
-            namespace: state.cache_namespace(&pipeline_id),
-            pipeline_id: &pipeline_id,
-            qname: qname.as_bytes(),
-            qtype,
-            qclass,
-            flags: crate::proto_utils::QueryFlags::of(packet),
-            requester: cfg
-                .requester_key(
-                    &pipeline_id,
-                    Requester {
-                        address: peer.ip(),
-                        edns: edns_present,
-                        ecs: client_ecs,
-                    },
-                    Some(&engine.geoip_manager),
-                )
-                .on_response_jump_path(&carried),
-            client_ecs,
-        };
-        let dedupe_hash = inflight_question.key();
-
-        match decision {
-            Decision::Static { rcode, answers } => {
-                response.upstream = Some(Arc::from("static"));
-                let resp_bytes = build_response(req, rcode, answers)?;
-                for g in &mut cleanup_guards {
-                    g.hand_over(|| {
-                        crate::engine::phases::for_waiters(
-                            &resp_bytes,
-                            &requester,
-                            trail,
-                            echo_floor,
-                        )
-                    });
-                }
-                return Ok(resp_bytes);
-            }
-            Decision::Forward {
-                upstream,
-                pre_split_upstreams,
-                response_phase,
-                rule_name,
-                rule_index,
-                transport,
-                ecs: _,
-                allow_reuse,
-            } => {
-                let (response_matchers, response_actions_on_match, response_actions_on_miss) =
-                    ResponsePhase::parts(response_phase.as_deref());
-                response.upstream = Some(upstream.clone());
-                // A reused answer is in the trail already / 复用的应答已经记在 trail 里
-                let mut reused = false;
-                // 规则越过的应答只在决定允许时复用（见 `handle_forward_decision_logged`）
-                // An answer a rule continued past is reused only where the decision allows
-                // it (see `handle_forward_decision_logged`)
-                let resp = if let Some(ctx) = reused_response.take_if(|_| allow_reuse) {
-                    reused = true;
-                    Ok((ctx.raw, ctx.upstream))
-                } else {
-                    // FIX: Background refresh must skip inflight check
-                    // 修复：后台刷新必须跳过 inflight 检查
-                    if !skip_cache {
-                        use dashmap::mapref::entry::Entry;
-                        let rx = match engine.inflight.entry(dedupe_hash) {
-                            Entry::Vacant(entry) => {
-                                // No other request in progress / 没有其他请求在进行
-                                entry.insert(InflightEntry::new(&inflight_question));
-                                cleanup_guards.push(InflightCleanupGuard::new(
-                                    engine.inflight.clone(),
-                                    dedupe_hash,
-                                ));
-                                None
-                            }
-                            // This request's own entry: forward instead (see `holds`)
-                            // 这个请求自己的条目：改为自己转发（见 `holds`）
-                            Entry::Occupied(_) if holds(&cleanup_guards, dedupe_hash) => None,
-                            // Another question's entry under the same key: forward instead (see
-                            // `InflightQuestion`)
-                            // 同一个键下别的问题的条目：改为自己转发（见 `InflightQuestion`）
-                            Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
-                            Entry::Occupied(mut entry) => {
-                                // Another request in progress, subscribe to its result
-                                // 已有请求在进行,订阅其结果
-                                Some(entry.get_mut().subscribe())
-                            }
-                        };
-
-                        if let Some(mut rx) = rx {
-                            // The request holds entries of its own on the jump path, so the one it
-                            // waits on may in turn be waiting on it (two requests that jumped into
-                            // each other's pipeline). Wait only until an upstream should have
-                            // answered (see `hedge_timeout`), then forward by itself.
-                            // 跳转路上的请求自己握着条目，它等的那一个可能反过来也在等它（两个请求互相
-                            // 跳进了对方的 pipeline）。只等到上游应当已经应答的时间点（见
-                            // `hedge_timeout`），之后自己转发。
-                            // 开了流控时这次等待也看卡没卡住，卡住不等了的失败原样交回（见
-                            // `PermitManager::join`、`UpstreamFailure::withheld`）
-                            // With flow control on this wait too is seen to for being stuck, and
-                            // the failure of waiting no more goes back as it is (see
-                            // `PermitManager::join`, `UpstreamFailure::withheld`)
-                            let waiting = tokio::time::timeout(join_wait, rx.changed());
-                            let joined = crate::engine::upstream::wait_for_another(
-                                engine,
-                                peer.ip(),
-                                &upstream,
-                                upstream_timeout,
-                                waiting,
-                            )
-                            .await?;
-                            if let Ok(Ok(())) = joined {
-                                if let Some((observer, ctx)) = observed {
-                                    observer.inflight_joined(ctx);
-                                }
-                                // Clone result to avoid holding RwLockReadGuard across await
-                                // 克隆结果以避免在 await 跨度持有 RwLockReadGuard
-                                let result = rx.borrow().clone();
-                                match &result {
-                                    Ok(bytes) => {
-                                        // 换上这个请求的事务 ID / This request's transaction ID
-                                        let mut resp_mut = BytesMut::from(bytes.as_ref());
-                                        set_id(&mut resp_mut, req.metadata.id);
-                                        let resp_bytes = resp_mut.freeze();
-
-                                        for g in &mut cleanup_guards {
-                                            g.hand_over(|| {
-                                                crate::engine::phases::for_waiters(
-                                                    bytes, &requester, trail, echo_floor,
-                                                )
-                                            });
-                                        }
-                                        response.upstream = Some(Arc::from("inflight"));
-                                        return Ok(resp_bytes);
-                                    }
-                                    Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                                }
-                            }
-                            // Otherwise the sender dropped, or no answer came within the upstream
-                            // timeout: forward by itself
-                            // 否则发送端已丢弃，或上游超时内没等到应答：自己转发
-                        }
-                    }
-                    crate::engine::upstream::forward_upstream(
-                        engine,
-                        packet,
-                        &upstream,
-                        upstream_timeout,
-                        transport,
-                        pre_split_upstreams.as_ref(),
-                        observed,
-                        (!skip_cache).then(|| peer.ip()),
-                    )
-                    .await
-                };
-                // As in handle_forward_decision_logged / 同 handle_forward_decision_logged
-                let resp = check_failure_reply(resp, response_actions_on_match, |msg, answered| {
-                    response_matches(
-                        engine,
-                        response_matchers,
-                        answered,
-                        qname,
-                        qtype,
-                        qclass,
-                        Some(msg),
-                    )
-                });
-                let resp = resp.and_then(|reply| {
-                    reject_failure_reply_on_refresh(skip_cache, &reply.0).map(|()| reply)
-                });
-                // Forwards here send the carried packet / 这里的转发发出的是带过来的包
-                match &resp {
-                    Ok(_) if reused => {}
-                    Ok((raw, _)) => trail.record_reply(carried, raw),
-                    Err(_) => trail.record_failure(carried),
-                }
-
-                match resp {
-                    Ok((raw, actual_upstream)) => {
-                        response.upstream = Some(Arc::clone(&actual_upstream));
-                        let msg = Message::from_bytes(&raw).context("parse upstream response")?;
-
-                        let resp_match_ok = response_matches(
-                            engine,
-                            response_matchers,
-                            &actual_upstream,
-                            qname,
-                            qtype,
-                            qclass,
-                            Some(&msg),
-                        );
-                        report_response_rule(
-                            observed,
-                            &pipeline_id,
-                            &rule_name,
-                            response_matchers.len(),
-                            resp_match_ok,
-                            response_actions_on_match,
-                        );
-                        let actions_to_run = if resp_match_ok {
-                            &response_actions_on_match
-                        } else {
-                            &response_actions_on_miss
-                        };
-
-                        if actions_to_run.is_empty() {
-                            for g in &mut cleanup_guards {
-                                g.hand_over(|| {
-                                    crate::engine::phases::for_waiters(
-                                        &raw, &requester, trail, echo_floor,
-                                    )
-                                });
-                            }
-                            return Ok(raw);
-                        }
-
-                        let ctx = ResponseContext {
-                            raw,
-                            msg,
-                            upstream: actual_upstream, // Use actual responding upstream
-                        };
-                        let apply_ctx = ApplyResponseActionsContext {
-                            engine,
-                            actions: actions_to_run,
-                            ctx_opt: Some(ctx),
-                            req,
-                            packet,
-                            upstream_timeout,
-                            qname,
-                            qtype,
-                            client_ip: peer.ip(),
-                            asker: (!skip_cache).then(|| peer.ip()),
-                            upstream_default: cfg.settings.default_upstream.as_str(),
-                            pipeline_id: &pipeline_id,
-                            rule_name: &rule_name,
-                            remaining_jumps,
-                            // For the echo only: nothing on this path is cached
-                            // 只为回显：这条路径上不缓存
-                            trail: Some((&mut *trail, carried)),
-                        };
-                        let action_result =
-                            apply_response_actions_observed(apply_ctx, observed).await?;
-
-                        match action_result {
-                            ResponseActionResult::Upstream { ctx } => {
-                                // The reply to a response action's forward / 响应动作转发拿到的应答
-                                reject_failure_reply_on_refresh(skip_cache, &ctx.raw)?;
-                                for g in &mut cleanup_guards {
-                                    g.hand_over(|| {
-                                        crate::engine::phases::for_waiters(
-                                            &ctx.raw, &requester, trail, echo_floor,
-                                        )
-                                    });
-                                }
-                                response.upstream = Some(ctx.upstream);
-                                return Ok(ctx.raw);
-                            }
-                            ResponseActionResult::Static { bytes, source, .. } => {
-                                // A jump limit reached here is this request's own (see
-                                // the jump limit above) / 在这里到达的跳转上限只属于本请求（见上）
-                                if source == JUMP_LIMIT {
-                                    response.upstream = Some(Arc::from("static"));
-                                    return Ok(bytes);
-                                }
-                                for g in &mut cleanup_guards {
-                                    g.hand_over(|| {
-                                        crate::engine::phases::for_waiters(
-                                            &bytes, &requester, trail, echo_floor,
-                                        )
-                                    });
-                                }
-                                response.upstream = Some(Arc::from("static"));
-                                return Ok(bytes);
-                            }
-                            ResponseActionResult::Jump {
-                                pipeline,
-                                remaining_jumps: next_remaining,
-                            } => {
-                                pipeline_id = pipeline;
-                                remaining_jumps = next_remaining;
-                                // Rules passed by a continue belong to the pipeline
-                                // being left; the target starts from its first rule,
-                                // as on a rule-level jump.
-                                // continue 越过的规则属于要离开的 pipeline；与规则阶段的
-                                // 跳转一样，目标从第一条规则开始。
-                                skip_rules.clear();
-                                // 同上：留着复用的应答不带进下一个 pipeline
-                                // As above: an answer kept for reuse stays behind
-                                reused_response = None;
-                                continue;
-                            }
-                            ResponseActionResult::Continue { ctx } => {
-                                // The rule continued past this answer, so it is not one
-                                // to hand over: drop the guards, which removes the
-                                // entries without it, and their waiters forward
-                                // themselves. The next rule's Forward (same
-                                // dedupe_hash) then finds no entry of this request's to
-                                // wait on.
-                                // 规则越过了这个应答，它不该交给别人：丢弃守卫，条目随之
-                                // 移除而不交出它，等待者自己转发。下一条规则的 Forward
-                                // （相同 dedupe_hash）也就不会等在本请求自己的条目上。
-                                cleanup_guards.clear();
-                                reused_response = ctx;
-                                skip_rules.extend(rule_index);
-                                entering = false;
-                                continue;
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        // A background refresh answers no client, so it gets the failure
-                        // itself (see handle_forward_decision_logged).
-                        // 后台刷新没有要应答的客户端，失败原样交回（同 handle_forward_decision_logged）。
-                        // 流控没让等的失败也原样交回：那是这台设备自己的事，不交给等着的别的请求（见
-                        // `UpstreamFailure::withheld`）
-                        // A failure with flow control keeping the query from waiting goes back as
-                        // it is too: the device's own affair, not handed to the other requests
-                        // waiting (see `UpstreamFailure::withheld`)
-                        if skip_cache
-                            || err.downcast_ref::<UpstreamFailure>().is_none()
-                            || UpstreamFailure::was_withheld(&err)
-                        {
-                            return Err(err);
-                        }
-                        let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                        for g in &mut cleanup_guards {
-                            g.hand_over(|| {
-                                crate::engine::phases::for_waiters(
-                                    &resp_bytes,
-                                    &requester,
-                                    trail,
-                                    echo_floor,
-                                )
-                            });
-                        }
-                        return Ok(resp_bytes);
-                    }
-                }
-            }
-            Decision::Jump { pipeline } => {
-                pipeline_id = pipeline;
-                if remaining_jumps > 0 {
-                    remaining_jumps -= 1;
-                    continue;
-                } else {
-                    let resp_bytes = engine_helpers::build_servfail_response(req)?;
-                    return Ok(resp_bytes);
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod response_jump_tests {
     use crate::engine::test_support::{answering_upstream, engine_from};
@@ -1298,6 +754,94 @@ mod response_jump_tests {
             })
             .collect();
         assert_eq!(answers, [Ipv4Addr::new(192, 0, 2, 5)]);
+    }
+
+    /// `peer` 问 `example.com.` 的 A 记录，应答里的 A 记录 / The A records of the answer `peer`
+    /// gets asking the A record of `example.com.`
+    async fn ask(engine: &crate::engine::Engine) -> Vec<Ipv4Addr> {
+        let mut request = Message::new(0x5157, MessageType::Query, OpCode::Query);
+        request.add_query(Query::query(
+            Name::from_str("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet(
+                &request.to_vec().unwrap(),
+                "127.0.0.1:53000".parse().unwrap(),
+            ),
+        )
+        .await
+        .expect("request finishes")
+        .expect("request succeeds");
+        Message::from_bytes(&bytes)
+            .expect("parse reply")
+            .answers
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 回答检查跳过去以后上游失败，照样执行那条规则的 on_miss，和不经跳转一样。以前跳转路径另有一套转发处理，
+    /// 上游失败直接回 SERVFAIL
+    /// An upstream failing after an answer check's jump runs that rule's miss actions as it
+    /// would without the jump. The jump path used to have a forward handling of its own, an
+    /// upstream failure answering SERVFAIL there and then
+    #[tokio::test]
+    async fn an_upstream_failure_after_a_response_jump_runs_the_miss_actions() {
+        let first = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300)
+            .await
+            .address;
+        let engine = engine_from(serde_json::json!({
+            "settings": { "default_upstream": first, "upstream_timeout_ms": 300 },
+            "pipelines": [
+                { "id": "entry", "rules": [{
+                    "name": "hop", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": first }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "other" }]
+                }] },
+                { "id": "other", "rules": [{
+                    "name": "dead", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
+                    "response_actions_on_miss": [{ "type": "static_ip_response", "ip": "192.0.2.7" }]
+                }] }
+            ]
+        }));
+        assert_eq!(ask(&engine).await, [Ipv4Addr::new(192, 0, 2, 7)]);
+    }
+
+    /// 分流常见的写法：先问一组上游，回答检查不满意（比如结果被污染）就跳去问另一组。跳过去拿到的应答缓存在入口的键下，
+    /// 同样的问题再来，两组上游都不必再问。以前这条路径什么都不缓存，每次都两边各问一遍
+    /// The usual way of splitting: ask one group of upstreams, and when the answer check is
+    /// not satisfied (a polluted result, say) jump to ask another. The answer got over there is
+    /// cached under the entry's key, and the same question coming again asks neither group. This
+    /// path used to cache nothing, asking both every time
+    #[tokio::test]
+    async fn an_answer_got_through_a_response_jump_is_cached() {
+        let domestic = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 300).await;
+        let abroad = answering_upstream(Ipv4Addr::new(198, 51, 100, 1), 300).await;
+        let engine = engine_from(serde_json::json!({
+            "settings": { "default_upstream": domestic.address },
+            "pipelines": [
+                { "id": "entry", "rules": [{
+                    "name": "domestic", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": domestic.address }],
+                    "response_matchers": [{ "type": "response_answer_ip", "cidr": "192.0.2.0/24" }],
+                    "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "abroad" }]
+                }] },
+                { "id": "abroad", "rules": [{
+                    "name": "abroad", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": abroad.address }]
+                }] }
+            ]
+        }));
+        for _ in 0..3 {
+            assert_eq!(ask(&engine).await, [Ipv4Addr::new(198, 51, 100, 1)]);
+        }
+        assert_eq!((domestic.queries(), abroad.queries()), (1, 1));
     }
 }
 
