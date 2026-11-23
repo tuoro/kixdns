@@ -753,26 +753,36 @@ pub struct V2RayGeoSiteList {
     pub entries: Vec<V2RayGeoSite>,
 }
 
-/// Split a GeoSite tag with optional `@attr` filter into (base, Option<attr>)
-/// `category-games@cn` → (`category-games`, Some(`cn`))
-/// `category-games`    → (`category-games`, None)
-fn split_tag_attr(tag: &str) -> (&str, Option<&str>) {
+/// GeoSite 标签在每个 `@` 处拆开，得到分类名和要求的属性：`category-games@cn@ads` 拆成 `category-games` 和
+/// `cn`、`ads` 两个属性，`category-games` 就是它自己、不要求属性。分类名或哪个属性是空的（`tag@`、`@cn`、
+/// `a@@b`）时不拆，整个就是分类名。以前只在第一个 `@` 处拆开，`a@cn@ads` 要的是一个叫 `cn@ads` 的属性，什么都
+/// 选不出
+/// Splits a GeoSite tag at every `@` into the list name and the attributes it asks for:
+/// `category-games@cn@ads` is `category-games` with the attributes `cn` and `ads`, and
+/// `category-games` is itself, asking for none. With the name or any attribute empty (`tag@`, `@cn`, `a@@b`)
+/// nothing is split and the whole is the name. Only the first `@` used to split, so
+/// `a@cn@ads` asked for one attribute named `cn@ads` and selected nothing
+fn split_tag_attrs(tag: &str) -> (&str, Vec<&str>) {
     match tag.split_once('@') {
-        Some((base, attr)) if !base.is_empty() && !attr.is_empty() => (base, Some(attr)),
-        _ => (tag, None),
+        Some((base, attrs)) if !base.is_empty() && !attrs.split('@').any(str::is_empty) => {
+            (base, attrs.split('@').collect())
+        }
+        _ => (tag, Vec::new()),
     }
 }
 
-/// Check if a domain's attributes satisfy the `@attr` filter
-/// The filter is an attribute key, compared without case, as in V2Ray:
-/// `cn`   → domain has attribute `cn`
-/// `!cn`  → domain has attribute `!cn`, a key domain-list-community uses
-///          itself, so it is not a negation
+/// 一个域名的属性 `attrs` 里有没有 `wanted` 的每一个：和 V2Ray 一样都要有，按字面的键比较，不分大小写，
+/// 所以 `!cn` 要的是键 `!cn`（domain-list-community 自己就用这个键），不是取反
+/// Whether a domain's attributes `attrs` hold every one of `wanted`: all are required, as in
+/// V2Ray, each compared as a literal key ignoring case, so `!cn` asks for the key `!cn`
+/// (domain-list-community uses that key itself), not for a negation
 ///
 /// The domains of a tag that lack an attribute are two matchers:
 /// `geosite: google` together with `geosite_not: google@cn`.
-fn attr_filter_matches(attrs: &[String], filter: &str) -> bool {
-    attrs.iter().any(|a| a.eq_ignore_ascii_case(filter))
+fn has_attrs(attrs: &[String], wanted: &[String]) -> bool {
+    wanted
+        .iter()
+        .all(|key| attrs.iter().any(|attr| attr.eq_ignore_ascii_case(key)))
 }
 
 /// 数据文件里读出的一条。正则只留写法，等整个 tag 读完合成一个集合时才编译（见 [`Regexes::new`]）
@@ -1399,20 +1409,19 @@ impl GeoSiteManager {
         Self::parse_dat_entries(path, None)
     }
 
-    /// 按条目读 .dat 文件，留下要的 tag：`tags` 是点名的那些（可以带 `@属性`），None 时每个 tag 都要
+    /// 按条目读 .dat 文件，留下要的 tag：`tags` 是点名的那些（可以带一个或几个 `@属性`），None 时每个 tag 都要
     /// Read a .dat file entry by entry, keeping the wanted tags: the named `tags` (which may
-    /// carry `@attribute`), or every tag with None
+    /// carry `@attribute`s), or every tag with None
     fn parse_dat_entries(path: &Path, tags: Option<&[String]>) -> anyhow::Result<ParsedGeoSite> {
-        // Pre-process tags: split `tag@attr` syntax into (base, attr_filter)
-        // Map: base_tag_lower → Vec<(store_tag_lower, Option<attr_filter>)>
-        let mut tag_requests: FxHashMap<String, Vec<(String, Option<String>)>> =
-            FxHashMap::default();
+        // Pre-process tags: split `tag@attr@…` syntax into (base, attributes)
+        // Map: base_tag_lower → Vec<(store_tag_lower, attributes_lower)>
+        let mut tag_requests: FxHashMap<String, Vec<(String, Vec<String>)>> = FxHashMap::default();
         for tag in tags.unwrap_or_default() {
-            let (base, attr) = split_tag_attr(tag);
-            tag_requests
-                .entry(base.to_lowercase())
-                .or_default()
-                .push((tag.to_lowercase(), attr.map(|a| a.to_lowercase())));
+            let (base, attrs) = split_tag_attrs(tag);
+            tag_requests.entry(base.to_lowercase()).or_default().push((
+                tag.to_lowercase(),
+                attrs.iter().map(|attr| attr.to_lowercase()).collect(),
+            ));
         }
 
         if let Some(tags) = tags {
@@ -1459,7 +1468,7 @@ impl GeoSiteManager {
 
             // 先解析 tag，判断是否需要加载 / Parse tag first to check if we need to load it
             // Clone matching requests out of the map to release the borrow before mutating self
-            let matching_requests: Option<Vec<(String, Option<String>)>> = loop {
+            let matching_requests: Option<Vec<(String, Vec<String>)>> = loop {
                 if file.pos >= entry_end {
                     break None;
                 }
@@ -1484,7 +1493,7 @@ impl GeoSiteManager {
                         // every non-empty tag is wanted
                         let reqs = match tags {
                             Some(_) => tag_requests.get(&tag_lower).cloned(),
-                            None => (!tag_lower.is_empty()).then(|| vec![(tag_lower, None)]),
+                            None => (!tag_lower.is_empty()).then(|| vec![(tag_lower, Vec::new())]),
                         };
                         if let Some(reqs) = reqs {
                             debug!(target = "geosite", tag = %tag_str,
@@ -1533,13 +1542,10 @@ impl GeoSiteManager {
                 match Self::parse_v2ray_domains(&field) {
                     Ok(domains) => {
                         if let Some((entry, attrs)) = domains {
-                            for ((builder, count), (_, attr_filter)) in
+                            for ((builder, count), (_, wanted)) in
                                 builders.iter_mut().zip(&requests)
                             {
-                                if attr_filter
-                                    .as_deref()
-                                    .is_none_or(|f| attr_filter_matches(&attrs, f))
-                                {
+                                if has_attrs(&attrs, wanted) {
                                     builder.add_entry(entry.clone());
                                     *count += 1;
                                 }
@@ -2765,34 +2771,79 @@ mod tests {
     }
 
     #[test]
-    fn test_split_tag_attr() {
-        assert_eq!(split_tag_attr("category-games"), ("category-games", None));
+    fn test_split_tag_attrs() {
         assert_eq!(
-            split_tag_attr("category-games@cn"),
-            ("category-games", Some("cn"))
+            split_tag_attrs("category-games"),
+            ("category-games", vec![])
         );
         assert_eq!(
-            split_tag_attr("category-games@!cn"),
-            ("category-games", Some("!cn"))
+            split_tag_attrs("category-games@cn"),
+            ("category-games", vec!["cn"])
+        );
+        assert_eq!(
+            split_tag_attrs("category-games@!cn"),
+            ("category-games", vec!["!cn"])
+        );
+        assert_eq!(
+            split_tag_attrs("category-games@cn@ads"),
+            ("category-games", vec!["cn", "ads"])
         );
         // Edge: empty parts → no split
-        assert_eq!(split_tag_attr("tag@"), ("tag@", None));
-        assert_eq!(split_tag_attr("@cn"), ("@cn", None));
+        for tag in ["tag@", "@cn", "tag@cn@", "tag@@cn"] {
+            assert_eq!(split_tag_attrs(tag), (tag, vec![]));
+        }
     }
 
     #[test]
-    fn test_attr_filter_matches() {
-        let cn = vec!["cn".to_string()];
-        assert!(attr_filter_matches(&cn, "cn"));
-        assert!(!attr_filter_matches(&[], "cn"));
+    fn test_has_attrs() {
+        let keys = |keys: &[&str]| keys.iter().map(|key| key.to_string()).collect::<Vec<_>>();
+        let cn = keys(&["cn"]);
+        assert!(has_attrs(&cn, &cn));
+        assert!(!has_attrs(&[], &cn));
+        // Nothing asked for: every domain
+        assert!(has_attrs(&[], &[]));
         // `!cn` is the literal key, as in V2Ray: neither `cn` nor no attribute
-        assert!(!attr_filter_matches(&cn, "!cn"));
-        assert!(!attr_filter_matches(&[], "!cn"));
-        assert!(attr_filter_matches(&["!cn".to_string()], "!cn"));
-        assert!(!attr_filter_matches(&["!cn".to_string()], "cn"));
+        assert!(!has_attrs(&cn, &keys(&["!cn"])));
+        assert!(!has_attrs(&[], &keys(&["!cn"])));
+        assert!(has_attrs(&keys(&["!cn"]), &keys(&["!cn"])));
+        assert!(!has_attrs(&keys(&["!cn"]), &cn));
+        // Every attribute asked for is required, in any order
+        assert!(has_attrs(&keys(&["cn", "ads"]), &keys(&["ads", "cn"])));
+        assert!(!has_attrs(&cn, &keys(&["cn", "ads"])));
         // case insensitive
-        assert!(attr_filter_matches(&["CN".to_string()], "cn"));
-        assert!(attr_filter_matches(&["!CN".to_string()], "!cn"));
+        assert!(has_attrs(&keys(&["CN"]), &cn));
+        assert!(has_attrs(&keys(&["!CN"]), &keys(&["!cn"])));
+    }
+
+    /// 标签里写了几个属性时，选出的是每个属性都带的域名，和 V2Ray 一样。以前只在第一个 `@` 处拆开，`test@cn@ads`
+    /// 要的是一个叫 `cn@ads` 的属性，一个域名都选不出
+    /// A tag naming several attributes selects the domains carrying every one of them, as in
+    /// V2Ray. Only the first `@` used to split, so `test@cn@ads` asked for one attribute named
+    /// `cn@ads` and selected no domain at all
+    #[test]
+    fn a_tag_with_several_attributes_selects_the_domains_carrying_all_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dat(
+            &dir,
+            &[build_geosite(
+                "TEST",
+                &[
+                    build_domain(3, "both.example", &["cn", "ads"]),
+                    build_domain(3, "cn.example", &["cn"]),
+                    build_domain(3, "ads.example", &["ads"]),
+                    build_domain(3, "none.example", &[]),
+                ],
+            )],
+        );
+        let tag = "test@cn@ads".to_string();
+        let mut manager = GeoSiteManager::new();
+        manager
+            .load_from_dat_file_selective(&path, std::slice::from_ref(&tag))
+            .unwrap();
+        assert!(manager.matches(&tag, "both.example"));
+        for name in ["cn.example", "ads.example", "none.example"] {
+            assert!(!manager.matches(&tag, name), "{name}");
+        }
     }
 
     #[test]

@@ -108,7 +108,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 
 - Entries are written as in V2Ray's domain lists (domain-list-community). `domain:example.com` and a bare `example.com` match the domain and every subdomain by whole labels (not `notexample.com`); unlike `domain_suffix`, a leading dot changes nothing here.
 - `full:example.com` matches the domain only, `keyword:` and `regexp:` match a keyword or a regular expression, and a bare value with `*` is a wildcard.
-- In `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. The domains without an attribute are `geo_site: google` together with `geo_site_not: google@cn`.
+- In `.dat` files a tag may carry an attribute key, `tag@attr` (`google@cn`), matched as a literal key as in V2Ray: `google@!cn` selects the domains marked `!cn`. Several attributes may be written, as in `google@cn@ads`, selecting the domains that carry every one of them. The domains without an attribute are `geo_site: google` together with `geo_site_not: google@cn`.
 - JSON entries with an unknown prefix, no value or an invalid regex are skipped with a warning.
 - A `regexp:` regex is at most 16384 bytes, as a `domain_regex` is; a longer one is skipped with a warning, in `.dat` and JSON alike.
 
