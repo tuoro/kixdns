@@ -97,7 +97,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 #### GeoIP 数据源与标签
 
 - `geoip_db_path` 加载 MaxMind MMDB，用于 `CN`、`US` 等两位国家代码。
-- `geoip_dat_path` 加载 V2Ray protobuf `.dat` 或兼容 JSON。这里的 JSON 是 GeoIP 数据文件，不是 KixDNS 主配置文件；格式示例：`{"entries":[{"country_code":"CLOUDFLARE","ips":["1.1.1.0/24"]}]}`。
+- `geoip_dat_path` 加载 V2Ray protobuf `.dat` 或兼容 JSON。这里的 JSON 是 GeoIP 数据文件，不是 KixDNS 主配置文件；格式示例：`{"entries":[{"country_code":"CLOUDFLARE","ips":["1.1.1.0/24"]}]}`。不带前缀长度的地址按单个地址算，`1.1.1.1` 就是 `1.1.1.1/32`（IPv6 是 /128）。
 - V2Ray 数据既可以包含国家代码，也可以包含 `CLOUDFLARE`、`NETFLIX`、`TELEGRAM` 等命名标签；同一 IP 可以属于多个标签。
 - 同时配置两种数据源时，两位国家代码以 MMDB 为准；命名标签仍从 `geoip_dat_path` 读取。
 - 只读入规则用到的国家代码和标签。MMDB 只在规则用到两位国家代码时读入；`geoip_dat_path` 只读入规则用到、又不由 MMDB 判断的标签，所以配置了 MMDB、规则只用两位国家代码时，这个文件不读。规则用到的标签不在文件里时会记一条告警，这样的规则不会命中。
