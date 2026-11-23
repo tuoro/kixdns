@@ -1051,6 +1051,44 @@ async fn an_expired_subnet_answer_is_fetched_again_rather_than_widened() {
     assert_eq!(up.queries(), 3);
 }
 
+/// 一个子网的应答过期、不能再用了，查缓存时不把它删掉：它留在原处，直到重新取回的应答写进来。这期间同一个子网的别的请求
+/// 照样选中它、等那次转发，而不是退到别的子网取来的、所有人共用的那份。以前头一次查到就删掉，紧跟着来的请求就拿到了那份
+/// 更宽的旧应答
+/// Once a subnet's answer has expired and is of no further use, a lookup does not drop it:
+/// it stays where it is until the answer fetched again is written. Meanwhile another request
+/// of that subnet picks it all the same and waits on that forward, rather than falling back to
+/// the answer another subnet fetched for everyone. It used to be dropped on the first lookup,
+/// and the request right after got that wider, older answer
+#[tokio::test]
+async fn a_spent_subnet_answer_is_not_widened_while_it_is_fetched_again() {
+    let up = upstream_answering(
+        |subnet| match subnet.map(|subnet| subnet.addr()) {
+            Some(address) if address == ip("198.51.100.0") => (Echo::Scope(24), 1),
+            _ => (Echo::Scope(0), 300),
+        },
+        ResponseCode::NoError,
+        Duration::from_millis(300),
+    )
+    .await;
+    let engine = engine(forward_all(&up.address, None));
+    let subnet = Some(("198.51.100.0", 24));
+    assert_eq!(
+        ask_like_a_listener(&engine, "10.0.0.1", subnet).await,
+        v4("198.51.100.0")
+    );
+    assert_eq!(
+        ask_like_a_listener(&engine, "10.0.0.2", Some(("203.0.113.0", 24))).await,
+        v4("203.0.113.0")
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (first, right_after) =
+        tokio::join!(ask_like_a_listener(&engine, "10.0.0.1", subnet), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ask_like_a_listener(&engine, "10.0.0.3", subnet).await
+        });
+    assert_eq!([first, right_after], [v4("198.51.100.0"); 2]);
+}
+
 /// 规则越过一个按 /24 作答的应答（continue），最终应答来自作用范围为 0 的上游：缓存只在这个
 /// /24 里共用它，回给带 ECS 的客户端的作用范围也是 24，刚转发回来的、等在同一个条目上的、从缓存
 /// 拿的都一样。报 0 会让下游的解析器把它分给所有子网。

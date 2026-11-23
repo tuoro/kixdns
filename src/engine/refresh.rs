@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
 use hickory_proto::rr::{DNSClass, RecordType};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::cache::CacheEntry;
 use crate::config::GlobalSettings;
@@ -235,7 +235,7 @@ pub fn spawn_background_refresh(
     slot: u64,
     requester: Requester,
 ) {
-    let (pipeline_id, qname) = (renewed.pipeline_id.as_ref(), renewed.qname.as_ref());
+    let qname = renewed.qname.as_ref();
     let qtype = RecordType::from(renewed.qtype);
     let qclass = DNSClass::from(renewed.qclass);
     // 先打上刷新标记，打不上就是已经有人在刷新（见 `RefreshingGuard::try_new`）；guard 在任务
@@ -312,8 +312,6 @@ pub fn spawn_background_refresh(
     let settings = &state.pipeline.settings;
     let renew_on_failure = settings.serve_stale && settings.serve_stale_ttl_reset;
     let renewed = Arc::clone(renewed);
-    let qname_owned = qname.to_string();
-    let pipeline_id_owned = pipeline_id.to_string();
 
     tokio::spawn(async move {
         // Move guard into the async task so it clears when task completes
@@ -341,9 +339,9 @@ pub fn spawn_background_refresh(
             Ok(_resp_bytes) => {
                 debug!(
                     event = "background_refresh_success",
-                    qname = %qname_owned,
+                    qname = %renewed.qname,
                     qtype = ?qtype,
-                    pipeline_id = %pipeline_id_owned,
+                    pipeline_id = %renewed.pipeline_id,
                     "Background refresh completed successfully"
                 );
             }
@@ -373,11 +371,14 @@ pub fn spawn_background_refresh(
                 if renew_on_failure && !renewed.is_fresh() {
                     engine.cache_replace(slot, &renewed, renewed.clone_with_refreshed_ttl());
                 }
-                warn!(
+                // 上游出故障时每个快到期、过期的名字都刷新失败一次，一秒能有上百条，所以隔一阵才记一条
+                // With an upstream down every name near or past its expiry fails a refresh, a
+                // hundred a second and more, so one is logged in a while
+                crate::warn_sparse!(
                     event = "background_refresh_failed",
-                    qname = %qname_owned,
+                    qname = %renewed.qname,
                     qtype = ?qtype,
-                    pipeline_id = %pipeline_id_owned,
+                    pipeline_id = %renewed.pipeline_id,
                     error = %format_args!("{e:#}"),
                     "Background refresh failed"
                 );

@@ -60,8 +60,6 @@ pub struct Engine {
     /// One `Arc` per record: taking one touches a single reference count, so cores reading the same record
     /// over and over do not take turns on several
     pub(crate) rule_cache: Arc<CacheStore<Arc<RuleCacheRecord>>>,
-    // Per-request id generator for tracing / 每个请求的 ID 生成器用于追踪
-    pub request_id_counter: Arc<AtomicU64>,
     /// In-flight request deduplication map using tokio::watch for lock-free concurrent waiting
     /// 使用 tokio::watch 实现无锁并发等待的进行中请求去重 map
     /// Key: the hash of the question asked (see `InflightQuestion::key`)
@@ -277,7 +275,6 @@ impl Engine {
             running_settings,
             reload_lock: Arc::new(Mutex::new(geo_sources)),
             rule_cache,
-            request_id_counter: Arc::new(AtomicU64::new(1)),
             // DashMap configuration: shard count and initial capacity
             // If dashmap_shards is 0, use DashMap default (num_cpus * 4)
             // More shards = less lock contention but more memory overhead
@@ -329,11 +326,6 @@ impl Engine {
         });
     }
 
-    /// 从槽位 `slot` 去掉这一份应答 / Remove this one answer from slot `slot`
-    pub(crate) fn cache_invalidate(&self, slot: u64, entry: &Arc<CacheEntry>) {
-        self.cache_remove(slot, |cached| std::ptr::eq(cached, entry.as_ref()));
-    }
-
     /// 把槽位 `slot` 里的 `old` 这一份换成 `new`；`old` 已经不在（被取代或去掉）时什么都不做。
     /// 过期应答续期用它，不碰槽位里的其他应答。
     /// Replace `old` itself in slot `slot` with `new`; nothing happens when `old` is
@@ -350,66 +342,15 @@ impl Engine {
         });
     }
 
-    /// 去掉后台刷新发现已和规则对不上的条目：刷新的就是这个槽位时，去掉它要更新的那条；
-    /// 否则（刷新走到了别的 pipeline）去掉这个槽位里适用于它的请求方、在刷新开始之前取得的
-    /// 条目；之后取得的来自别的请求，不动。
-    /// Drop the entry a background refresh found no longer matches the rules: the
-    /// one it renews when it renews this slot, otherwise (the refresh went to
-    /// another pipeline) the ones in this slot for its requester fetched before
-    /// the refresh started; later ones come from other requests and stay.
-    pub(crate) fn drop_refreshed(
-        &self,
-        slot: u64,
-        question: &CachedQuestion<'_>,
-        view: &EcsView,
-        target: &RefreshTarget,
-    ) {
-        self.cache_remove(slot, |entry| {
+    /// 从后台刷新要更新的槽位里去掉被刷新的那份应答（见 `RefreshTarget`），不论之后被续用或复制过；已经被取代、
+    /// 不在了的什么都不做
+    /// Drop the answer a background refresh renews from its slot (see `RefreshTarget`),
+    /// whatever renewed or copied it since; nothing happens when it was replaced and is gone
+    pub(crate) fn drop_refreshed(&self, question: &CachedQuestion<'_>, target: &RefreshTarget) {
+        self.cache_remove(target.slot, |entry| {
             question.matches(entry)
-                && if target.slot == slot {
-                    // The renewed answer itself, whatever renewed or copied it since
-                    // 就是被刷新的那份应答，不论之后被续用或复制过
-                    entry.reach == target.reach && entry.fetched_at == target.fetched_at
-                } else {
-                    entry.reach.admits(view) && entry.fetched_at < target.started
-                }
-        });
-    }
-
-    /// 后台刷新成功之后整理它刷新的槽位（见 `CacheSlot::after_refresh`）
-    /// Tidy the slot a background refresh renewed once it succeeded (see
-    /// `CacheSlot::after_refresh`)
-    pub(crate) fn settle_refresh(
-        &self,
-        target: &RefreshTarget,
-        written: &crate::ecs_scope::EcsReach,
-        qname: &str,
-        qtype: u16,
-        qclass: u16,
-        flags: crate::proto_utils::QueryFlags,
-    ) {
-        let question = CachedQuestion {
-            qname,
-            pipeline_id: &target.pipeline,
-            qtype,
-            qclass,
-            flags,
-        };
-        self.cache.compute(target.slot, |current| match current {
-            None => Op::Nop,
-            Some(current) => {
-                match current.after_refresh(
-                    &question,
-                    &target.reach,
-                    target.fetched_at,
-                    written,
-                    target.started,
-                ) {
-                    None => Op::Nop,
-                    Some(rest) if rest.is_empty() => Op::Remove,
-                    Some(rest) => Op::Put(Arc::new(rest)),
-                }
-            }
+                && entry.reach == target.reach
+                && entry.fetched_at == target.fetched_at
         });
     }
 
