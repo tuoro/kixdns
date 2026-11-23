@@ -949,6 +949,26 @@ pub struct StreamMuxClient<T: StreamTransport> {
     connect: Mutex<Connect<(T::Read, T::Write)>>,
 }
 
+/// 查询等回答时，它登记的那条连接没了：读写失败、被复位、到期摘下后断了，或者在登记之前就被拆了。带着那条连接
+/// 是第几代，`send` 据此判断要不要换新连接重发
+/// The connection a query registered on went while it waited: a read or write failed, it was
+/// reset, it broke after being taken out at its max age, or it was torn down before the query
+/// could register. It carries that connection's generation, by which `send` decides whether to
+/// send again on a fresh one
+#[derive(Debug)]
+struct ConnectionGone {
+    generation: u64,
+    why: String,
+}
+
+impl std::fmt::Display for ConnectionGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for ConnectionGone {}
+
 /// 一条 TCP/DoT 连接的健康检查设置，建客户端时给定，之后不变
 /// A TCP/DoT connection's health check settings, given when the client is built and fixed after
 #[derive(Debug, Clone, Copy)]
@@ -1360,43 +1380,39 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             anyhow::bail!("dns packet too short for {}", T::LABEL);
         }
 
-        // Check if we are reusing an existing connection (for potential retry strategy)
-        // 检查我们是否在重用现有连接（用于潜在的重试策略）
-        // 不等连接锁：这一步在预算之外，以前前面有查询占着锁时会一直等。锁正被拿着，多半是有查询
-        // 在用这条连接，就当复用
-        // Without waiting for the connection lock: this step lies outside the budget
-        // and used to wait as long as the lock was held ahead of it. A held lock most
-        // likely means a query is using the connection, so it counts as reused
-        let is_reused = match self.conn.try_lock() {
-            Ok(guard) => guard.is_some(),
-            Err(_) => true,
-        };
-
+        // 发之前最新的那一代：查询登记的连接没了（见 [`ConnectionGone`]），而它不比这一代新，就是这次之前
+        // 就有的连接（多半是空闲久了被上游关掉的），换一条新的在剩下的预算里重发一次。别的失败不重发：建连失败、
+        // 退避、超时，再来一次也一样；这次自己新建的连接一上来就断了，再建一条多半还是断。以前事先拿 try_lock
+        // 猜是不是复用（锁被占着就当复用），猜成复用的不管什么失败都重发
+        // The latest generation before sending: when the connection the query registered on is gone
+        // (see [`ConnectionGone`]) and was no newer than that, it was there before this send (most
+        // likely closed by the upstream after sitting idle), and the query is sent once more on a
+        // fresh one within what is left of the budget. Other failures are not sent again: a failed
+        // connect, backing off and timeouts would only come round again, and a connection this
+        // send made itself breaking at once most likely breaks again. Whether the connection was
+        // reused used to be guessed beforehand with try_lock (a held lock counting as reused), and
+        // a send guessed to reuse one was sent again on any failure
+        let before = self.generation.load(Ordering::Acquire);
         match self.send_attempt(packet, timeout_dur).await {
-            Ok(res) => Ok(res),
-            Err(err) => {
-                // TRANSPARENT RETRY: If connection was reused and failed with transport error,
-                // retry once with a fresh connection, within what is left of the budget
-                // 透明重试：如果连接是复用的并且因传输错误失败，则在剩余预算内用新连接重试一次
-                if is_reused {
-                    let remaining = timeout_dur.saturating_sub(start.elapsed());
-                    if remaining < MIN_RETRY_BUDGET {
-                        return Err(err);
-                    }
-
-                    debug!(
-                        upstream = %self.upstream,
-                        error = %err,
-                        retry_timeout_ms = remaining.as_millis() as u64,
-                        "Connection reuse failed, performing transparent retry with fresh connection"
-                    );
-
-                    // Connection should have been reset by send_attempt already upon error
-                    // send_attempt 出错时连接应该已经被重置
-                    return self.send_attempt(packet, remaining).await;
+            Err(err)
+                if err
+                    .downcast_ref::<ConnectionGone>()
+                    .is_some_and(|gone| gone.generation <= before) =>
+            {
+                let remaining = timeout_dur.saturating_sub(start.elapsed());
+                if remaining < MIN_RETRY_BUDGET {
+                    return Err(err);
                 }
-                Err(err)
+                debug!(
+                    upstream = %self.upstream,
+                    error = %err,
+                    retry_timeout_ms = remaining.as_millis() as u64,
+                    "{} connection gone under a query, sending again on a fresh one",
+                    T::NAME
+                );
+                self.send_attempt(packet, remaining).await
             }
+            result => result,
         }
     }
 
@@ -1658,7 +1674,11 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
         let conn_guard = self.conn.lock().await;
         let Some(live) = conn_guard.as_ref() else {
-            anyhow::bail!("connection closed before registration");
+            return Err(ConnectionGone {
+                generation: self.generation.load(Ordering::Acquire),
+                why: "connection closed before registration".into(),
+            }
+            .into());
         };
         let (queue, generation) = (&live.queue, live.generation);
         live.last_deadline_ms
@@ -1754,7 +1774,11 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             .collect();
         for key in keys {
             if let Some((_, p)) = pending.remove_if(&key, |_, p| p.generation == generation) {
-                let _ = p.tx.send(Err(anyhow::anyhow!(why.to_owned())));
+                let gone = ConnectionGone {
+                    generation,
+                    why: why.to_owned(),
+                };
+                let _ = p.tx.send(Err(gone.into()));
             }
         }
         closed.is_some()
@@ -4599,6 +4623,79 @@ mod tests {
             elapsed < Duration::from_millis(700),
             "second query took {elapsed:?} on a 200 ms budget: {err:#}"
         );
+    }
+
+    /// TCP 上游：每条连接上的前 `answers` 个查询回显作答，再来一个就关掉这条连接；返回地址和接下了几条连接
+    /// A TCP upstream answering the first `answers` queries on each connection with an echo and
+    /// closing the connection on the next; its address, and how many connections it accepted
+    async fn closing_tcp_upstream(answers: usize) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closing upstream");
+        let addr = listener
+            .local_addr()
+            .expect("read closing upstream address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    for answered in 0.. {
+                        let mut len = [0u8; 2];
+                        if stream.read_exact(&mut len).await.is_err() {
+                            return;
+                        }
+                        let mut frame = vec![0u8; u16::from_be_bytes(len) as usize];
+                        if stream.read_exact(&mut frame).await.is_err() || answered == answers {
+                            return;
+                        }
+                        frame[2] |= 0x80;
+                        let _ = stream.write_all(&len).await;
+                        let _ = stream.write_all(&frame).await;
+                    }
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_query_on_a_connection_the_upstream_closed_is_sent_again() {
+        // 连接在这次发送之前就有，上游在查询到达时把它关了（空闲久了的连接常这样）：换一条新连接重发，拿到回答
+        // The connection was there before this send and the upstream closed it as the query
+        // arrived (as idle connections often go): it is sent again on a fresh one and answered
+        let (addr, accepted) = closing_tcp_upstream(1).await;
+        let client = TcpMuxClient::new(Arc::from(addr.to_string()));
+        let query = udp_test_query("again.example");
+        client
+            .send(&query, Duration::from_secs(1))
+            .await
+            .expect("answered on the first connection");
+        client
+            .send(&query, Duration::from_secs(1))
+            .await
+            .expect("sent again on a fresh connection and answered");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_send_whose_own_connection_breaks_is_not_sent_again() {
+        // 这次发送自己建的连接一收到查询就断了：不重发，再建一条多半还是断。以前事先拿 try_lock 猜是不是复用，
+        // 锁正被占着就当复用，于是再连一次
+        // The connection this send made itself breaks on receiving the query: it is not sent
+        // again, as another would most likely break as well. Whether the connection was reused
+        // used to be guessed beforehand with try_lock, a held lock counting as reused, so it
+        // connected once more
+        let (addr, accepted) = closing_tcp_upstream(0).await;
+        let client = TcpMuxClient::new(Arc::from(addr.to_string()));
+        let query = udp_test_query("broken.example");
+        let (_, sent) = tokio::join!(client.hold_connection(Duration::from_millis(100)), async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            client.send(&query, Duration::from_secs(1)).await
+        });
+        assert!(sent.is_err(), "the upstream never answers");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "connected once");
     }
 
     /// 绑定在 `bind` 上、把每个查询置 QR 位后原样回显的 UDP 上游；该地址族不可用时为 None。
