@@ -52,35 +52,24 @@ pub fn select_pipeline<'a>(
     let edns_present = request.edns_present;
     let qtype = request.qtype;
     let listener_label = request.listener_label;
-    let geosite_manager = request.geosite_manager;
-    let geoip_manager = request.geoip_manager;
-    // Optimization: only acquire geosite/geoip read locks if at least one matcher
-    // actually needs them. For the common case (Any/ListenerLabel/Qtype matchers),
-    // this avoids two parking_lot RwLock read acquisitions per cache-hit query,
-    // eliminating cross-core cache-line bouncing at high QPS.
+    // Only acquire the geosite/geoip read locks if a matcher needs them (see
+    // `RuntimePipelineConfig::select_needs_geosite`). For the common case
+    // (Any/ListenerLabel/Qtype matchers), this avoids two parking_lot RwLock read
+    // acquisitions per cache-hit query, eliminating cross-core cache-line bouncing at
+    // high QPS.
     //
-    // 优化：仅当至少一个匹配器实际需要 geosite/geoip 时才获取读锁。
-    // 常见情况（Any/ListenerLabel/Qtype 匹配器）下，避免了每次 cache-hit 查询
-    // 获取两个 parking_lot RwLock 读锁，消除高 QPS 下的跨核 cache line 乒乓。
-    let needs_geosite = cfg
-        .pipeline_select
-        .iter()
-        .any(|r| r.matchers.iter().any(|m| m.matcher.needs_geosite()));
-    let needs_geoip = cfg
-        .pipeline_select
-        .iter()
-        .any(|r| r.matchers.iter().any(|m| m.matcher.needs_geoip()));
-
-    let geosite_guard = if needs_geosite {
-        geosite_manager.map(|m| m.read())
-    } else {
-        None
-    };
-    let geoip_guard = if needs_geoip {
-        geoip_manager.map(|m| m.read())
-    } else {
-        None
-    };
+    // 仅当有匹配器需要 geosite/geoip 时才获取读锁（见
+    // `RuntimePipelineConfig::select_needs_geosite`）。常见情况（Any/ListenerLabel/Qtype
+    // 匹配器）下，避免了每次 cache-hit 查询获取两个 parking_lot RwLock 读锁，消除高 QPS
+    // 下的跨核 cache line 乒乓。
+    let geosite_guard = request
+        .geosite_manager
+        .filter(|_| cfg.select_needs_geosite)
+        .map(|m| m.read());
+    let geoip_guard = request
+        .geoip_manager
+        .filter(|_| cfg.select_needs_geoip)
+        .map(|m| m.read());
     let geosite_ref = geosite_guard.as_deref();
     let geoip_ref = geoip_guard.as_deref();
     let selector_query = PipelineSelectorQuery {

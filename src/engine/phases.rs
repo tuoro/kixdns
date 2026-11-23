@@ -7,7 +7,7 @@ use crate::engine::execution::CacheKeys;
 use crate::engine::observation::{Observed, cached_source, report_response_rule};
 use crate::engine::refresh::{RefreshCheck, RefreshTarget};
 use crate::engine::response::extract_ttl;
-use crate::engine::response_log::ResponseInfo;
+use crate::engine::response_log::{ResponseInfo, Source};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
@@ -569,7 +569,7 @@ pub(crate) async fn handle_forward_decision_logged(
     context: ForwardDecisionContext<'_>,
     response: &mut ResponseInfo,
 ) -> anyhow::Result<ForwardResult> {
-    response.upstream = Some(Arc::clone(context.upstream));
+    response.upstream = Some(Source::Upstream(Arc::clone(context.upstream)));
     let mut forwarding = Forwarding::new(engine, context);
     let (reply, reused) = match forwarding.fetch(response).await {
         Fetched::Joined(answer) => return Ok(ForwardResult::Success(answer)),
@@ -587,6 +587,14 @@ pub(crate) async fn handle_forward_decision_logged(
 
 /// 上游的应答，和给出它的上游 / An upstream's reply, and the upstream that gave it
 type Reply = anyhow::Result<(Bytes, Arc<str>)>;
+
+/// [`Forwarding::weigh`] 掂量过的应答：上游的应答和给出它的上游；几个上游都回了失败应答、回答检查照样放行的那一个，还带着
+/// 解析好的报文，回答阶段拿它当已经检查过的应答，不再解析、检查一遍
+/// A reply [`Forwarding::weigh`] weighed: the upstream's answer and the upstream that gave
+/// it; the failure reply of several upstreams the answer check let through all the same
+/// comes with its parsed message too, which the answer phase takes as an answer checked
+/// already, with no second parse or check
+type Weighed = anyhow::Result<(Bytes, Arc<str>, Option<Message>)>;
 
 /// 进行中的一次转发：转发决定，加上这次发出的包、它带的 ECS、它在 inflight 表里登记的条目
 /// A forward under way: the forward decision, with the packet it sends, the ECS that packet
@@ -815,7 +823,7 @@ impl<'a> Forwarding<'a> {
             }
             let mut answer = BytesMut::from(answer.as_ref());
             set_id(&mut answer, tx_id);
-            response.upstream = Some(Arc::from("inflight"));
+            response.upstream = Some(Source::Inflight);
             return Some(Ok(answer.freeze()));
         }
     }
@@ -839,7 +847,7 @@ impl<'a> Forwarding<'a> {
     /// 掂量这次转发拿到的应答或失败，记进 trail：它决定此后得到的每份应答适用于谁
     /// Weigh the reply or failure this forward got, and note it in the trail: it decides whom
     /// every answer reached from here applies to
-    fn weigh(&mut self, reply: Reply, reused: bool) -> Reply {
+    fn weigh(&mut self, reply: Reply, reused: bool) -> Weighed {
         // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：这个请求登记的条目、规则 continue 以后还
         // 留着的条目，现在都放下，等在上面的别的请求各自去问，不拿这一个的结果；这个请求此后得到的应答也一律不写缓存——规则在
         // 上游失败时给的静态应答、改问备用上游得到的回答、continue 到后面的规则或者跳到别的规则组得到的回答都一样。缓存是所有
@@ -862,30 +870,39 @@ impl<'a> Forwarding<'a> {
         }
         let cx = &self.cx;
         // 几个上游都回了失败应答时，规则的回答检查照样看得到最先收到的那个（见
-        // `rules::check_failure_reply`）；刷新随后照旧拒收它
+        // `rules::check_failure_reply`）；放行的那个连同解析好的报文交给回答阶段（见 [`Weighed`]）。刷新随后照旧拒收它
         // When several upstreams all replied with a failure, the rule's answer check still sees
-        // the first of those replies (see `rules::check_failure_reply`); a refresh still rejects
-        // it right after
-        let reply =
-            rules::check_failure_reply(reply, cx.response_actions_on_match, |msg, answered| {
-                rules::response_matches(
-                    self.engine,
-                    cx.response_matchers,
-                    answered,
-                    cx.qname,
-                    cx.qtype,
-                    cx.qclass,
-                    Some(msg),
-                )
-            });
-        // Now that a refresh runs the response rules, it takes a failure reply as a
-        // failed attempt before they see it, as forward_upstream does for a rule with
-        // several upstreams: the refresh takes the failure path such a rule takes,
-        // miss actions included, and never caches the reply (see
-        // reject_failure_reply_on_refresh).
-        // 刷新执行响应规则之后，失败应答在响应规则看到之前就被当作一次失败的尝试，和规则有
-        // 多个上游时 forward_upstream 的做法一样：刷新走这样的规则会走的失败路径（包括
-        // on_miss 动作），也不缓存这个应答（见 reject_failure_reply_on_refresh）。
+        // the first of those replies (see `rules::check_failure_reply`); one let through goes
+        // to the answer phase with its parsed message (see [`Weighed`]). A refresh still
+        // rejects it right after
+        let reply = match reply {
+            Err(failure) => match rules::check_failure_reply(
+                &failure,
+                cx.response_actions_on_match,
+                |msg, answered| {
+                    rules::response_matches(
+                        self.engine,
+                        cx.response_matchers,
+                        answered,
+                        cx.qname,
+                        cx.qtype,
+                        cx.qclass,
+                        Some(msg),
+                    )
+                },
+            ) {
+                Some((raw, upstream, msg)) => Ok((raw, upstream, Some(msg))),
+                None => Err(failure),
+            },
+            Ok((raw, upstream)) => Ok((raw, upstream, None)),
+        };
+        // A refresh takes a failure reply as a failed attempt before the response rules
+        // see it, as forward_upstream does for a rule with several upstreams: the
+        // refresh fails as it does on any upstream failure (see `Self::settle`), and
+        // never caches the reply (see reject_failure_reply_on_refresh).
+        // 刷新在响应规则看到失败应答之前就把它当作一次失败的尝试，和规则有多个上游时
+        // forward_upstream 的做法一样：刷新和上游别的失败一样以失败结束（见 `Self::settle`），
+        // 也不缓存这个应答（见 reject_failure_reply_on_refresh）。
         let reply = reply.and_then(|reply| {
             reject_failure_reply_on_refresh(cx.refresh.is_some(), &reply.0).map(|()| reply)
         });
@@ -893,7 +910,7 @@ impl<'a> Forwarding<'a> {
             // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里 / An answer a rule continued
             // past, reused here: the trail already has its forward
             Ok(_) if reused => {}
-            Ok((raw, _)) => self.cx.trail.record_reply(self.forward_ecs, raw),
+            Ok((raw, ..)) => self.cx.trail.record_reply(self.forward_ecs, raw),
             Err(_) => self.cx.trail.record_failure(self.forward_ecs),
         }
         reply
@@ -906,12 +923,12 @@ impl<'a> Forwarding<'a> {
     /// between the two in only a few places (see `fallback` in [`Self::act`])
     async fn settle(
         mut self,
-        reply: Reply,
+        reply: Weighed,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
         let on_miss = self.cx.response_actions_on_miss;
         match reply {
-            Ok((raw, upstream)) => self.answered(raw, upstream, response).await,
+            Ok((raw, upstream, checked)) => self.answered(raw, upstream, checked, response).await,
             // 后台刷新没有客户端，也没在 inflight 里登记：上游失败就到此为止，把失败原样交回（refresh.rs 记下、退避），
             // 缓存条目和别的请求的等待者都不受影响。miss 动作给出的只是兜底，刷新用不着：以前照跑，静态兜底、问备用
             // 上游拿到的都写进缓存，把预取时还新鲜的那条顶掉，刷新还算成功、不退避
@@ -937,10 +954,11 @@ impl<'a> Forwarding<'a> {
         mut self,
         raw: Bytes,
         upstream: Arc<str>,
+        checked: Option<Message>,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
         let cx = &self.cx;
-        response.upstream = Some(Arc::clone(&upstream));
+        response.upstream = Some(Source::Upstream(Arc::clone(&upstream)));
         // Response rules read the parsed message, so they always take hickory's.
         // Otherwise the quick parse is cached as read for a reply whose structure
         // holds up (see `well_formed_reply`); any other is cached as hickory reads
@@ -955,11 +973,15 @@ impl<'a> Forwarding<'a> {
         let quick = (!rules_read_the_reply)
             .then(|| proto_utils::parse_response_quick(&raw))
             .flatten();
-        let (rcode, ttl, msg) = match quick {
-            Some(qr) if proto_utils::well_formed_reply(&raw) => {
+        // 回答检查已经放行的失败应答（见 [`Weighed`]）照它解析好的报文来 / A failure reply the
+        // answer check let through already (see [`Weighed`]) goes by its parsed message
+        let passed = checked.is_some();
+        let (rcode, ttl, msg) = match (checked, quick) {
+            (Some(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
+            (None, Some(qr)) if proto_utils::well_formed_reply(&raw) => {
                 (qr.rcode, u64::from(qr.min_ttl), None)
             }
-            quick => match (Message::from_bytes(&raw), quick) {
+            (None, quick) => match (Message::from_bytes(&raw), quick) {
                 (Ok(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
                 (Err(_), Some(qr)) => (qr.rcode, 0, None),
                 (Err(error), None) => {
@@ -967,15 +989,16 @@ impl<'a> Forwarding<'a> {
                 }
             },
         };
-        let matched = rules::response_matches(
-            self.engine,
-            cx.response_matchers,
-            &upstream,
-            cx.qname,
-            cx.qtype,
-            cx.qclass,
-            msg.as_ref(),
-        );
+        let matched = passed
+            || rules::response_matches(
+                self.engine,
+                cx.response_matchers,
+                &upstream,
+                cx.qname,
+                cx.qtype,
+                cx.qclass,
+                msg.as_ref(),
+            );
         // A refresh reports these too: it acts on the response rules like a client
         // request, and the observer tells the two apart by background_refresh.
         // 刷新同样上报：它和客户端请求一样按响应规则行事，观察者按 background_refresh 区分。
@@ -1210,7 +1233,7 @@ impl<'a> Forwarding<'a> {
                     ),
                 }
                 self.hand_over(&ctx.raw);
-                response.upstream = Some(ctx.upstream);
+                response.upstream = Some(Source::Upstream(ctx.upstream));
                 Ok(finished(ctx.raw))
             }
             ResponseActionResult::Static { bytes, rcode, .. } => {
@@ -1238,7 +1261,7 @@ impl<'a> Forwarding<'a> {
                     ttl => self.cache(&bytes, rcode, None, ttl),
                 }
                 self.hand_over(&bytes);
-                response.upstream = Some(Arc::from("static"));
+                response.upstream = Some(Source::Static);
                 Ok(finished(bytes))
             }
             ResponseActionResult::Jump { pipeline } => {

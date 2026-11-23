@@ -199,6 +199,13 @@ mod matcher_helpers {
 pub struct RuntimePipelineConfig {
     pub settings: config::GlobalSettings,
     pub pipeline_select: Vec<RuntimePipelineSelectRule>,
+    /// pipeline_select 的匹配器要不要 GeoSite 数据、要不要 GeoIP 数据，建配置时算好：不要的那份，选 pipeline 时不拿它的
+    /// 读锁（见 `select_pipeline`），每个查询也不用再把匹配器过一遍
+    /// Whether pipeline_select's matchers need GeoSite data, and GeoIP data, worked out as the
+    /// configuration is built: choosing a pipeline takes no read lock on what they do not need
+    /// (see `select_pipeline`), and no query goes through the matchers again to find out
+    pub select_needs_geosite: bool,
+    pub select_needs_geoip: bool,
     pub pipelines: Vec<RuntimePipeline>,
     /// O(1) pipeline lookup index: pipeline_id -> index in pipelines / O(1) 管道查找索引：pipeline_id -> pipelines 中的索引
     pub pipeline_id_index: FxHashMap<Arc<str>, usize>,
@@ -1091,8 +1098,16 @@ impl RuntimePipelineConfig {
                 });
         }
 
+        let select_needs = |needs: fn(&RuntimePipelineSelectorMatcher) -> bool| {
+            pipeline_select
+                .iter()
+                .flat_map(|rule| &rule.matchers)
+                .any(|m| needs(&m.matcher))
+        };
         Ok(Self {
             settings: cfg.settings,
+            select_needs_geosite: select_needs(RuntimePipelineSelectorMatcher::needs_geosite),
+            select_needs_geoip: select_needs(RuntimePipelineSelectorMatcher::needs_geoip),
             pipeline_select,
             pipelines,
             pipeline_id_index,
