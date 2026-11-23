@@ -2530,6 +2530,49 @@ async fn cache_hits_name_the_upstream_whose_answer_was_cached() {
     assert_eq!(sources[0].1, None);
 }
 
+/// 配置文件读完以后、监视开始重载之前改了：监视在读之前装好，这次改动排着队，开始以后照样重载。以前读完配置、建好引擎才装
+/// 监视，这中间的改动丢了，内核一直用着旧配置
+/// The configuration file changing after it was read and before the watch starts reloading:
+/// the watch is installed before the read, so the change waits in line and is reloaded once it
+/// starts. The watch used to go in only once the configuration was read and the engine built,
+/// and a change in between was lost, the kernel keeping the old configuration
+#[tokio::test]
+async fn a_config_change_made_before_the_watch_starts_is_reloaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pipeline.json");
+    let v1 = static_config("192.0.2.1");
+    std::fs::write(&path, &v1).unwrap();
+
+    let watch = kixdns::watcher::ConfigWatch::new(&path).expect("watch");
+    let (config, source) = kixdns::config::load_config_with_source(&path).expect("load");
+    let v2 = static_config("192.0.2.2");
+    atomically_replace(&path, &v2);
+
+    let recorder = Arc::new(Recorder::default());
+    let engine = Engine::builder(RuntimePipelineConfig::from_config(config).expect("compile"))
+        .observer(recorder.clone())
+        .config_source(&path, &source)
+        .build()
+        .expect("build engine");
+    let _watching = watch.start(engine.clone()).expect("start");
+
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::ConfigLoaded { generation: 2, source, .. }
+                            if source.as_deref() == Some(v2.as_str())
+                    )
+                })
+            })
+            .await,
+        "the change made before the start must be reloaded: {:#?}",
+        recorder.events()
+    );
+}
+
 #[tokio::test]
 async fn hot_reload_reports_success_and_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -2553,11 +2596,13 @@ async fn hot_reload_reports_success_and_failure() {
         }]
     );
 
-    kixdns::watcher::spawn(path.clone(), engine.clone());
+    let _watch = kixdns::watcher::ConfigWatch::new(&path)
+        .expect("watch")
+        .start(engine.clone())
+        .expect("start");
 
-    // Successful reload: re-swap until the watcher (which registers its
-    // watch asynchronously) reports the new generation.
-    // 成功重载：重复替换直到异步注册的 watcher 上报新的代数。
+    // Successful reload: re-swap until the watcher reports the new generation.
+    // 成功重载：重复替换直到 watcher 上报新的代数。
     let v2 = static_config("192.0.2.2");
     let mut reloaded = false;
     for _ in 0..20 {

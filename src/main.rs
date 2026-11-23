@@ -421,6 +421,10 @@ async fn run_dns_server(
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
 
+    // 读配置之前先装好配置文件的监视，读的时候文件又改了也不会漏（见 `watcher::ConfigWatch`）
+    // The configuration file is watched before it is read, so a change made while it is read is
+    // not missed (see `watcher::ConfigWatch`)
+    let watch = watcher::ConfigWatch::new(&config);
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
     // 启动时只记警告、照旧加载，升级以后已经在用的配置行为不变；重载和面板的校验会拒绝它们
     // Startup only warns and loads as before, so a configuration in use keeps its
@@ -472,7 +476,20 @@ async fn run_dns_server(
     }
     let engine = engine.build().context("initialize DNS engine")?;
 
-    watcher::spawn(config.clone(), engine.clone());
+    // 监视不了时配置文件改了不会重载，面板保存的配置也不生效：记一条 error，默认日志级别看得到，面板经控制通道读
+    // （`config` 的 `watch_error`）
+    // Without the watch a change to the configuration file is not reloaded, nor is a save from
+    // the panel applied: an error is logged, seen at the default log level, and the panel reads
+    // it over the control channel (`config`'s `watch_error`)
+    let _config_watch = watch
+        .and_then(|watch| watch.start(engine.clone()))
+        .inspect_err(|err| {
+            error!(target = "watcher", path = %config.display(), error = %err, "cannot watch the config file, changes to it are not reloaded");
+            if let Some(metrics) = &panel_metrics {
+                metrics.config_not_watched(err.to_string());
+            }
+        })
+        .ok();
 
     info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
 
