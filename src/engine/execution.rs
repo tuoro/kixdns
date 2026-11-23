@@ -1277,8 +1277,6 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         let peer = client_address(peer);
         let background_refresh = refresh.is_some();
-        // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
-        let flags = crate::proto_utils::QueryFlags::of(packet);
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let request_id = next_request_id();
         // A request uses one immutable configuration snapshot from selection
@@ -1290,85 +1288,7 @@ impl Engine {
             (None, Some(pre)) => Arc::clone(&pre.state),
             (None, None) => self.state.load_full(),
         };
-        let cfg = &state.pipeline;
-        let min_ttl = cfg.min_ttl();
-        let upstream_timeout = cfg.upstream_timeout();
-        let response_jump_limit = cfg.settings.response_jump_limit as usize;
-
-        // Use pre-parsed data if available, otherwise parse / 如果有预解析数据则使用，否则解析
-        let (qname_text, qtype, qclass, tx_id, edns_present, pipeline_id, client_ecs) =
-            if let Some(pre) = pre_parsed {
-                (
-                    pre.qname,
-                    pre.qtype,
-                    pre.qclass,
-                    pre.tx_id,
-                    pre.edns_present,
-                    pre.pipeline_id,
-                    // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
-                    crate::proto_utils::client_subnet(packet),
-                )
-            } else {
-                // Lazy Parse: Use quick parse first / 延迟解析：首先使用快速解析
-                // Allocate qname_buf outside the if-else to extend lifetime
-                // 在 if-else 外部分配 qname_buf 以延长生命周期
-                let mut qname_buf = [0u8; 256];
-                let q = parse_quick(packet, &mut qname_buf);
-
-                let (qname_text, qtype, qclass, tx_id, edns_present, client_ecs) =
-                    if let Some(q) = q {
-                        (
-                            Arc::<str>::from(q.qname),
-                            hickory_proto::rr::RecordType::from(q.qtype),
-                            DNSClass::from(q.qclass),
-                            q.tx_id,
-                            q.edns_present,
-                            q.client_subnet,
-                        )
-                    } else {
-                        // Fallback to full parse if quick parse fails (unlikely for standard queries) / 如果快速解析失败则回退到完整解析（对于标准查询不太可能）
-                        anyhow::ensure!(
-                            crate::proto_utils::question_name_readable(packet),
-                            "unreadable question name"
-                        );
-                        let req = Message::from_bytes(packet).context("parse request")?;
-                        let question = req.queries.first().context("empty question")?;
-                        (
-                            // The text parse_quick would have built / parse_quick 会拼出的同一段文本
-                            Arc::from(crate::proto_utils::name_text(question.name())),
-                            question.query_type(),
-                            question.query_class(),
-                            req.metadata.id,
-                            req.edns.is_some(),
-                            crate::proto_utils::client_subnet(packet),
-                        )
-                    };
-
-                let pipeline_id = select_pipeline(
-                    cfg,
-                    &PipelineSelectionContext {
-                        qname: &qname_text,
-                        client_ip: peer.ip(),
-                        qclass,
-                        edns_present,
-                        qtype,
-                        listener_label: &self.listener_label,
-                        geosite_manager: Some(&self.geosite_manager),
-                        geoip_manager: Some(&self.geoip_manager),
-                    },
-                )
-                .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone());
-
-                (
-                    qname_text,
-                    qtype,
-                    qclass,
-                    tx_id,
-                    edns_present,
-                    pipeline_id,
-                    client_ecs,
-                )
-            };
+        let head = self.read_request(packet, peer, pre_parsed, &state.pipeline)?;
         // A refresh replays its request's ECS from the key the cache kept, as an option
         // nobody can read does not survive into the replayed packet (see
         // `RefreshTarget::client_ecs`)
@@ -1377,15 +1297,13 @@ impl Engine {
         let client_ecs = refresh
             .as_ref()
             .and_then(|target| target.client_ecs)
-            .or(client_ecs);
-
-        let qname_ref = &qname_text;
-        let start = std::time::Instant::now();
+            .or(head.client_ecs);
+        let start = Instant::now();
         let mut response_log = ResponseLog::new(
-            qname_ref,
-            qtype,
+            &head.qname,
+            head.qtype,
             peer,
-            pipeline_id.clone(),
+            head.pipeline_id.clone(),
             start,
             background_refresh,
         );
@@ -1409,521 +1327,50 @@ impl Engine {
                     } else {
                         self.client_transport
                     },
-                    qname: qname_ref,
-                    qtype,
-                    qclass,
+                    qname: &head.qname,
+                    qtype: head.qtype,
+                    qclass: head.qclass,
                     background_refresh,
                     started: start,
                     reported_at_once: false,
                 },
             )
         });
-        let observed_ctx = observed
-            .as_ref()
-            .map(|observed| (observed.observer, &observed.ctx));
         if let Some(observed) = &observed {
             observed.observer.request_started(&observed.ctx);
             observed
                 .observer
-                .pipeline_selected(&observed.ctx, &pipeline_id);
+                .pipeline_selected(&observed.ctx, &head.pipeline_id);
         }
 
-        // Everything below may return the response from several places.
-        // The async block funnels every exit through one point so the
-        // observer learns the outcome; the block is awaited immediately.
-        // 以下代码在多处返回响应；用 async 块包裹使所有出口汇聚到一处，便于观察者
-        // 获得请求结果。该块会被立即 await。
-        // Inflight entry the request still holds after a rule continued (see
-        // `ForwardDecisionContext::held_inflight`)
-        // 规则 continue 后本请求仍持有的 inflight 条目
-        let mut held_inflight: Option<InflightCleanupGuard> = None;
-        // The forwards passed in the current pipeline (see `ForwardDecisionContext::trail`);
-        // after the request, what its last answer was cached with
-        // 在当前 pipeline 里经过的转发（见 `ForwardDecisionContext::trail`）；请求结束后就是
-        // 它最后一份应答缓存时带的那份
-        let mut trail = EcsReach::default();
-        // How many bits of the client's ECS the answer depends on through the pipelines
-        // the request left by a jump, whose trails are gone (see `phases::client_reply`)
-        // 经由请求跳离的 pipeline（它们的 trail 已经清掉）应答依赖客户端 ECS 的多少位（见
-        // `phases::client_reply`）
-        let mut echo_floor = 0u8;
-        // 把请求读出来、回它的 SERVFAIL；`context` 是读不出来时的错误说明
-        // Read the request and answer its SERVFAIL; `context` describes the error when it
-        // cannot be read
-        let servfail = |context: &'static str| {
-            engine_helpers::build_servfail_response(&Message::from_bytes(packet).context(context)?)
+        let request = Request {
+            state: &state,
+            packet,
+            qname: &head.qname,
+            qtype: head.qtype,
+            qclass: head.qclass,
+            tx_id: head.tx_id,
+            // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
+            flags: crate::proto_utils::QueryFlags::of(packet),
+            peer,
+            // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
+            requester: Requester {
+                address: peer.ip(),
+                edns: head.edns_present,
+                ecs: client_ecs,
+            },
+            start,
+            refresh: refresh.as_ref(),
+            observed: observed
+                .as_ref()
+                .map(|observed| (observed.observer, &observed.ctx)),
         };
-        // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
-        let requester = Requester {
-            address: peer.ip(),
-            edns: edns_present,
-            ecs: client_ecs,
-        };
-        let view = requester.ecs_view();
-        let result: anyhow::Result<Bytes> = async {
-            // RFC 6891 section 6.1.3, as on the fast path: an unsupported EDNS version is
-            // answered BADVERS. Read off the packet itself, so a query the fast parser
-            // cannot read (trailing bytes, a name that needs escapes) meets it too
-            // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS。从包本身读，
-            // 快速解析读不了的查询（结尾多了字节、名字要转义）也一样
-            if crate::proto_utils::edns_version(packet).is_some_and(|version| version != 0) {
-                return crate::proto_utils::badvers_response(packet)
-                    .context("build BADVERS response");
-            }
+        let pipeline = state.pipeline.pipeline(&head.pipeline_id);
+        let mut route = Route::new(self, &request, &head.pipeline_id, pipeline);
+        let result = self
+            .decide(&request, pipeline, &mut route, &mut response_log.info)
+            .await;
 
-            // Find pipeline_opt from pipeline_id / 从 pipeline_id 查找 pipeline_opt
-            let pipeline_opt = cfg.pipeline(&pipeline_id);
-
-            // Convert qname_ref to bytes for hash calculation / 将 qname_ref 转换为 bytes 进行哈希计算
-            let qname_bytes = qname_ref.as_bytes();
-            let mut keys = Self::cache_keys(
-                state.cache_namespace(&pipeline_id),
-                &pipeline_id,
-                qname_bytes,
-                qtype,
-                qclass,
-                flags,
-                &pipeline_opt.map_or(RequesterKey::NONE, |p| {
-                    p.requester.key(requester, Some(&self.geoip_manager))
-                }),
-                client_ecs.as_ref(),
-            );
-            // A refresh writes into the slot of the entry it renews / 刷新写进它要更新的条目的槽位
-            if let Some(target) = &refresh {
-                keys.slot = target.slot;
-            }
-
-            // A background refresh looks up no cache / 后台刷新不查缓存
-            if !background_refresh
-                && let Some(resp_bytes) = self
-                    .answer_from_cache(
-                        &phases::CacheLookupContext {
-                            state: &state,
-                            qname: qname_ref,
-                            qtype,
-                            qclass,
-                            flags,
-                            pipeline_id: &pipeline_id,
-                            slot: keys.slot,
-                            tx_id,
-                            start,
-                            peer: &peer,
-                            requester,
-                            observed: observed_ctx,
-                        },
-                        &mut response_log.info,
-                    )
-                    .await
-            {
-                return Ok(resp_bytes);
-            }
-
-            let qname: &str = qname_ref;
-            let mut skip_rules = crate::engine::pipeline::Continued::new();
-            let mut current_pipeline_id = pipeline_id.clone();
-            let mut current_uses_client_ip =
-                pipeline_opt.map(|p| p.uses_client_ip).unwrap_or(false);
-            let mut reused_response: Option<ResponseContext> = None;
-            // 应答缓存在哪个 pipeline 的键下：请求阶段的跳转换成目标的；响应阶段跳转以后不再换，跳过去拿到的应答照旧缓存在
-            // 跳转前那个 pipeline 的键下（见 `phases::ForwardResult::Jump`）
-            // The pipeline whose key answers are cached under: a request-phase jump changes it to
-            // the target's; after a response-phase jump it changes no more, the answers got over
-            // there cached under the key of the pipeline jumped from (see
-            // `phases::ForwardResult::Jump`)
-            let mut key_pipeline_id = current_pipeline_id.clone();
-            // 响应阶段跳转以后：转发照原样发出的包，和它带的 ECS / After a response-phase jump: the
-            // packet the forwards send as it is, and the ECS it carries
-            let mut jumped: Option<(Bytes, crate::ecs_scope::ForwardEcs)> = None;
-            // 求值 `pipeline` 的规则，跳过 `skip` 里的（continue 越过的那些）
-            // Evaluate the rules of `pipeline`, skipping those in `skip` (the ones a continue passed)
-            let evaluate = |pipeline: &crate::matcher::RuntimePipeline,
-                            skip: Option<&[usize]>| {
-                self.apply_rules(
-                    &state,
-                    pipeline,
-                    &RuleEvaluationContext::new(
-                        peer.ip(),
-                        qname,
-                        qtype,
-                        qclass,
-                        edns_present,
-                        skip,
-                        background_refresh,
-                    )
-                    .with_observed(observed_ctx),
-                )
-            };
-
-            let mut decision = match pipeline_opt {
-                Some(p) => evaluate(p, None),
-                None => {
-                    let decision = Decision::default_forward(&cfg.settings);
-                    if let Some((observer, ctx)) = observed_ctx {
-                        report_decision(observer, ctx, &pipeline_id, None, &decision);
-                    }
-                    decision
-                }
-            };
-
-            // DESIGN NOTE: InflightCleanupGuard safety analysis
-            // 设计说明：InflightCleanupGuard 安全性分析
-            //
-            // Safety Guarantee: No race condition exists
-            // 安全性保证：不存在竞态条件
-            //
-            // The guard is always used as a local stack variable (never shared via Arc/Mutex).
-            // Rust's ownership model guarantees that:
-            // - Mutable borrow via as_mut() (for defuse()) and Drop execution are mutually exclusive
-            // - The compiler prevents concurrent access at compile time
-            //
-            // 该守卫始终作为局部栈变量使用（从不通过 Arc/Mutex 共享）。
-            // Rust 所有权模型保证：
-            // - 通过 as_mut() 的可变借用（用于 defuse()）和 Drop 执行互斥
-            // - 编译器在编译期阻止并发访问
-            //
-            // This is a standard Rust RAII pattern that is safe and idiomatic.
-            // 这是标准的 Rust RAII 模式，安全且符合惯用法。
-
-            // 还能跳几次，在要跳的地方数：请求阶段的跳转一份，响应动作的跳转连同它之后的规则级跳转另一份（见
-            // `ForwardResult::Jump` 的分支）。放在 'decision_loop 外面，Forward 返回 Continue 再进循环时不会重置
-            // How many more jumps may be made, counted where a jump is made: the request phase's
-            // jumps have one budget, a response action's jump with the rule-level jumps after it
-            // another (see the `ForwardResult::Jump` arm). Kept outside 'decision_loop so that
-            // Forward returning Continue and the loop being entered again does not reset it
-            let mut jumps_left = response_jump_limit;
-            // A refresh renews the entry `refresh` names. Once a rule has continued past an
-            // answer, the outcome may be a static answer or come from a jump target, which
-            // do not renew it: see the Static branch and the Success arm.
-            // 刷新更新的是 `refresh` 所指的条目。规则越过一个应答之后，结果可能是静态应答或
-            // 来自跳转目标，它们不会更新这条：见 Static 分支和 Success 分支。
-            let drop_refreshed = |target: &RefreshTarget| {
-                let question = CachedQuestion {
-                    qname: qname_ref,
-                    pipeline_id: &target.pipeline,
-                    qtype: u16::from(qtype),
-                    flags,
-                };
-                self.drop_refreshed(target.slot, &question, &view, target);
-            };
-            // 规则已经越过了一个应答（continue，或响应阶段跳走）/ A rule has continued past an answer
-            // (a continue, or a response-phase jump)
-            let mut passed_an_answer = false;
-            'decision_loop: loop {
-                while let Decision::Jump { pipeline } = &decision {
-                    if jumps_left == 0 {
-                        crate::warn_sparse!("max jump limit reached");
-                        // How many jumps a request has left depends on the way it
-                        // came, which no key carries, so this SERVFAIL is its own: a
-                        // waiter on its held entry may have jumps to spare, so the
-                        // entry goes rather than hand it over, and it is not cached
-                        // for a request that enters this pipeline directly.
-                        // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
-                        // SERVFAIL 只属于它：等在持有条目上的请求可能还有余量，所以放掉
-                        // 条目，不把它交出去；也不缓存给直接进入这个 pipeline 的请求。
-                        drop(held_inflight.take());
-                        response_log.info.upstream = Some(Arc::from("static"));
-                        return servfail("parse request");
-                    }
-                    jumps_left -= 1;
-                    if let Some(p) = cfg.pipeline(pipeline) {
-                        current_pipeline_id = p.id.clone();
-                        response_log.info.pipeline = Some(current_pipeline_id.clone());
-                        current_uses_client_ip = p.uses_client_ip;
-                        // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的。
-                        // 带过来交给这里的 allow，就会写进这个 pipeline 的键，之后直接进入这里的请求
-                        // 也会拿到它。
-                        // An answer kept for reuse belongs to the pipeline that fetched it, through
-                        // its forward and with its ECS. Handed to an allow here, it would be cached
-                        // under this pipeline's key and served to requests that come here directly.
-                        reused_response = None;
-                        if let Some(observed) = &observed {
-                            observed
-                                .observer
-                                .pipeline_selected(&observed.ctx, &current_pipeline_id);
-                        }
-                        // 响应阶段跳转以后，键和 trail 都留着：应答照旧缓存在跳转前那个 pipeline 的键下（见 `key_pipeline_id`）
-                        // After a response-phase jump the key and the trail stay: answers are still cached under
-                        // the key of the pipeline jumped from (see `key_pipeline_id`)
-                        if jumped.is_none() {
-                            // So do the forwards behind it: this pipeline's answers depend on its
-                            // own forwards only. What they made the answer depend on still counts
-                            // for the echo.
-                            // 它之前的转发也一样：这个 pipeline 的应答只取决于它自己的转发。它们让
-                            // 应答依赖的部分，回显时仍要算上。
-                            echo_floor = echo_floor.max(trail.echo_scope(&view));
-                            trail = EcsReach::default();
-                            key_pipeline_id = current_pipeline_id.clone();
-                            // The keys follow the pipeline / 键随 pipeline 改变
-                            keys = Self::cache_keys(
-                                state.cache_namespace(&current_pipeline_id),
-                                &current_pipeline_id,
-                                qname_bytes,
-                                qtype,
-                                qclass,
-                                flags,
-                                &p.requester.key(requester, Some(&self.geoip_manager)),
-                                client_ecs.as_ref(),
-                            );
-                            // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
-                            // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
-                            // 上游。后台刷新照请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），
-                            // 走的是同一条路线、写回同一个键。键里带着目标按自己的规则（连同它跳得到的 pipeline）
-                            // 分辨请求方的结果，和直接选进目标的请求查的是同一套键，所以目标按「谁在问」给不同
-                            // 应答时也照查；continue 之后跳过来的请求也一样：留着复用的应答在跳转时已经丢掉，
-                            // 目标里的处理和第一轮没有分别。以前这两种都不查，经过它们的请求每次都问上游
-                            // After a jump, look in the response cache again under the target pipeline's
-                            // key. A forwarded answer is stored under that key, while the entry lookup used
-                            // the entry pipeline's, so a request that jumped never found it and went upstream
-                            // every time. A background refresh replays the request as it came (from the same
-                            // address, with or without EDNS, in the same class, see refresh.rs), taking the same
-                            // route and writing back under the same key. The key carries how the target's rules
-                            // (with the pipelines it can jump to) tell requesters apart, the same keys a request
-                            // selected into the target looks up, so a target answering by who is asking is
-                            // looked up as well; so is a request jumping in after a continue: the answer kept for
-                            // reuse is dropped at the jump, and the target handles it as on a first pass. Neither
-                            // used to look, every request through them asking upstream
-                            if !background_refresh
-                                && let Some(resp_bytes) = self
-                                    .answer_from_cache(
-                                        &phases::CacheLookupContext {
-                                            state: &state,
-                                            qname,
-                                            qtype,
-                                            qclass,
-                                            flags,
-                                            pipeline_id: &current_pipeline_id,
-                                            slot: keys.slot,
-                                            tx_id,
-                                            start,
-                                            peer: &peer,
-                                            requester,
-                                            observed: observed_ctx,
-                                        },
-                                        &mut response_log.info,
-                                    )
-                                    .await
-                            {
-                                return Ok(resp_bytes);
-                            }
-                        }
-                        skip_rules.clear();
-                        decision = evaluate(p, None);
-                    } else {
-                        crate::warn_sparse!(pipeline = %pipeline, "jump target pipeline not found");
-                        decision = Decision::Static {
-                            rcode: ResponseCode::ServFail,
-                            answers: Vec::new(),
-                        };
-                        break;
-                    }
-                }
-
-                match decision {
-                    Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
-                    Decision::Static { rcode, answers } => {
-                        response_log.info.upstream = Some(Arc::from("static"));
-                        // On a refresh, a SERVFAIL here (a jump target that does not
-                        // exist, or a static SERVFAIL the rules configure) is no answer:
-                        // the refresh ends as a failure before anything is cached over
-                        // its entry, which stays. After a refresh continued past an
-                        // answer, any other static answer replaces the entry, which
-                        // handle_static_decision stores again when it caches the answer
-                        // there, unless it is a fallback after an upstream failure.
-                        // 刷新时这里的 SERVFAIL（跳转目标不存在，或规则配置的静态 SERVFAIL）
-                        // 不是应答：刷新在往缓存写任何东西之前以失败结束，条目保留。刷新越过
-                        // 一个应答之后，其他静态应答取代这条，handle_static_decision 在那里缓存
-                        // 应答时会重新写入；上游失败之后的兜底除外。
-                        if rcode == ResponseCode::ServFail && background_refresh {
-                            return Err(phases::refresh_found_no_answer(
-                                "the rules answered SERVFAIL",
-                            ));
-                        }
-                        if passed_an_answer && let Some(target) = &refresh {
-                            drop_refreshed(target);
-                        }
-                        return phases::handle_static_decision(
-                            self,
-                            &phases::StaticDecisionContext {
-                                packet,
-                                qname,
-                                qtype,
-                                pipeline_id: &key_pipeline_id,
-                                slot: keys.slot,
-                                flags,
-                                reach: &trail,
-                                min_ttl,
-                                uses_client_ip: current_uses_client_ip,
-                            },
-                            rcode,
-                            answers,
-                        );
-                    }
-                    Decision::Forward {
-                        upstream,
-                        pre_split_upstreams,
-                        response_phase,
-                        rule_name,
-                        rule_index,
-                        transport,
-                        ecs,
-                        allow_reuse,
-                    } => {
-                        let (
-                            response_matchers,
-                            response_actions_on_match,
-                            response_actions_on_miss,
-                        ) = crate::matcher::ResponsePhase::parts(response_phase.as_deref());
-                        let res = phases::handle_forward_decision_logged(
-                            self,
-                            phases::ForwardDecisionContext {
-                                state: &state,
-                                packet: jumped.as_ref().map_or(packet, |(packet, _)| packet),
-                                query: packet,
-                                qname: qname_ref,
-                                qtype,
-                                qclass,
-                                tx_id,
-                                pipeline_id: &current_pipeline_id,
-                                key_pipeline_id: &key_pipeline_id,
-                                rule_name: &rule_name,
-                                keys,
-                                min_ttl,
-                                upstream_timeout,
-                                start,
-                                peer: &peer,
-                                requester,
-                                refresh: refresh.as_ref(),
-                                trail: &mut trail,
-                                echo_floor,
-                                upstream: &upstream,
-                                pre_split_upstreams: pre_split_upstreams.as_ref(),
-                                response_matchers,
-                                response_actions_on_match,
-                                response_actions_on_miss,
-                                transport,
-                                ecs: ecs.as_ref(),
-                                carried: jumped.as_ref().map(|(_, carried)| *carried),
-                                jumps_left: if jumped.is_some() {
-                                    jumps_left
-                                } else {
-                                    response_jump_limit
-                                },
-                                allow_reuse,
-                                reused_response: &mut reused_response,
-                                held_inflight: &mut held_inflight,
-                                observed: observed_ctx,
-                            },
-                            &mut response_log.info,
-                        )
-                        .await;
-
-                        match res {
-                            // The target's upstream failed: as when the rule's own upstream
-                            // fails, the refresh has no new answer and the entry stays
-                            // 目标的上游失败：和规则自己的上游失败时一样，刷新没有新应答，条目保留
-                            Ok(phases::ForwardResult::Fallback(bytes)) => return Ok(bytes),
-                            Ok(phases::ForwardResult::Success(bytes)) => {
-                                // After a refresh continued past an answer and then
-                                // jumped, the answer is not stored in the refreshed slot:
-                                // unless it is a failure (SERVFAIL, a truncated answer,
-                                // or the target's stale answer served on one, the only
-                                // cache hit a refresh can have), the entry there no
-                                // longer matches the rules.
-                                // 刷新越过一个应答又跳转之后，应答不会存进被刷新的槽位：
-                                // 只要不是失败（SERVFAIL、截断的应答，或失败时返回的目标旧
-                                // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
-                                // 对不上。
-                                if passed_an_answer
-                                    && let Some(target) = &refresh
-                                    && keys.slot != target.slot
-                                    && !phases::is_servfail(&bytes)
-                                    && !crate::proto_utils::truncated_response(&bytes)
-                                    && !response_log.info.cache_hit
-                                {
-                                    drop_refreshed(target);
-                                }
-                                return Ok(bytes);
-                            }
-                            Ok(phases::ForwardResult::Continue { ctx }) => {
-                                passed_an_answer = true;
-                                reused_response = *ctx;
-                                skip_rules.extend(rule_index);
-
-                                let Some(pipeline) = cfg.pipeline(&current_pipeline_id) else {
-                                    warn!(
-                                        "pipeline missing while continuing: {}",
-                                        current_pipeline_id
-                                    );
-                                    return servfail("parse request");
-                                };
-
-                                decision = evaluate(pipeline, Some(&skip_rules));
-                                continue 'decision_loop;
-                            }
-                            Ok(phases::ForwardResult::Jump {
-                                pipeline,
-                                packet,
-                                carried,
-                            }) => {
-                                // 跳过去以前那次转发的应答就是越过的那个，和 Continue 一样（刷新时上游失败的到不了
-                                // 这里）/ The answer of the forward before the jump is one passed over, as on
-                                // Continue (a refresh whose upstream failed never gets here)
-                                passed_an_answer = true;
-                                // 第一次响应阶段的跳转起另算一份次数 / The first response-phase jump starts a budget of its own
-                                if jumped.is_none() {
-                                    jumps_left = response_jump_limit;
-                                }
-                                jumped = Some((packet, carried));
-                                decision = Decision::Jump { pipeline };
-                                continue 'decision_loop;
-                            }
-                            Err(e) => {
-                                // A background refresh answers no client: it gets the
-                                // failure itself, which refresh.rs logs.
-                                // 后台刷新没有要应答的客户端：失败原样交回，由 refresh.rs 记录。
-                                if background_refresh {
-                                    return Err(e);
-                                }
-                                // A rule continued (response_actions_on_match: [continue])
-                                // and the next Forward attempt failed. The client must
-                                // receive a definitive answer, never silence: DNS clients
-                                // treat a missing reply as TIMEOUT. Return SERVFAIL so the
-                                // stub resolver can retry (RFC 1035).
-                                // 规则 continue 后，下一条 Forward 查询失败。必须给客户端
-                                // 一个确定性的响应而非静默：DNS 客户端会把无响应视为
-                                // TIMEOUT。返回 SERVFAIL 以便 stub resolver 重试。
-                                // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：规则
-                                // continue 以后还留着的条目现在放下，这个 SERVFAIL 不交给等在上面的别的请求；
-                                // 也不逐个记警告，拦着的时候每秒可以有几万个
-                                // A failure with flow control keeping the query from waiting is the
-                                // device's own affair (see `UpstreamFailure::withheld`): the entry
-                                // still held after a rule continued goes now, and this SERVFAIL is
-                                // not handed to the other requests waiting on it; nor is a warning
-                                // logged for each, held back there being tens of thousands a second
-                                if crate::engine::upstream::UpstreamFailure::was_withheld(&e) {
-                                    drop(held_inflight.take());
-                                    tracing::debug!(
-                                        event = "forward_withheld",
-                                        error = %e,
-                                        rule = %rule_name,
-                                        "flow control kept the forward from the upstream, returning SERVFAIL"
-                                    );
-                                } else {
-                                    crate::warn_sparse!(
-                                        event = "continue_reforward_failed",
-                                        error = %e,
-                                        rule = %rule_name,
-                                        "continue re-forward failed, returning SERVFAIL"
-                                    );
-                                }
-                                return servfail("parse request for SERVFAIL");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .await;
         // A request that continued still holds its entry here, and its waiters get
         // the final answer: the entry's key keeps them to requesters that the rules
         // run after the continue treat alike (see `RuntimePipeline::requester`). If
@@ -1941,23 +1388,31 @@ impl Engine {
         // 不存在、静态 SERVFAIL）；截断的应答也不是，它从不写缓存。刷新以失败结束，由
         // refresh.rs 记录，条目保持原样。
         let result = match result {
-            Ok(bytes) if refresh.is_some() && phases::is_servfail(&bytes) => Err(
+            Ok(bytes) if background_refresh && phases::is_servfail(&bytes) => Err(
                 phases::refresh_found_no_answer("the rules answered SERVFAIL"),
             ),
-            Ok(bytes) if refresh.is_some() && crate::proto_utils::truncated_response(&bytes) => {
+            Ok(bytes) if background_refresh && crate::proto_utils::truncated_response(&bytes) => {
                 Err(phases::refresh_found_no_answer(
                     "only a truncated answer came back",
                 ))
             }
             result => result,
         };
-        if let Some(mut guard) = held_inflight.take()
+        if let Some(mut guard) = route.held_inflight.take()
             && let Ok(bytes) = &result
         {
-            guard.hand_over(|| phases::for_waiters(bytes, &requester, &trail, echo_floor));
+            guard.hand_over(|| {
+                phases::for_waiters(bytes, &request.requester, &route.trail, route.echo_floor)
+            });
         }
-        if let (Some(target), Ok(_)) = (&refresh, &result) {
-            self.settle_refresh(target, &trail, qname_ref, u16::from(qtype), flags);
+        if let (Some(target), Ok(_)) = (request.refresh, &result) {
+            self.settle_refresh(
+                target,
+                &route.trail,
+                request.qname,
+                u16::from(request.qtype),
+                request.flags,
+            );
         }
         // Every reply leaves with the ECS option its client should see, and with what it
         // copies from the query as the client wrote it (see `proto_utils::reply_as_asked`);
@@ -1967,7 +1422,9 @@ impl Engine {
         let result = if background_refresh {
             result
         } else {
-            let at_least = echo_floor.max(trail.echo_scope(&view));
+            let at_least = route
+                .echo_floor
+                .max(route.trail.echo_scope(&request.requester.ecs_view()));
             result.map(|bytes| {
                 crate::proto_utils::reply_as_asked(
                     phases::client_reply(bytes, client_ecs.as_ref(), at_least),
@@ -1980,6 +1437,393 @@ impl Engine {
             observed.finish(&result);
         }
         result
+    }
+
+    /// 读出请求的问题，选好 pipeline：快速路径预解析过的照用；否则先快速解析，读不了再完整解析
+    /// Read the request's question and pick its pipeline: what the fast path pre-parsed is
+    /// taken as it is; otherwise the quick parse comes first, the full one when it cannot read it
+    fn read_request(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+        pre_parsed: Option<PreParsedData>,
+        cfg: &RuntimePipelineConfig,
+    ) -> anyhow::Result<RequestHead> {
+        if let Some(pre) = pre_parsed {
+            return Ok(RequestHead {
+                qname: pre.qname,
+                qtype: pre.qtype,
+                qclass: pre.qclass,
+                tx_id: pre.tx_id,
+                edns_present: pre.edns_present,
+                pipeline_id: pre.pipeline_id,
+                // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
+                client_ecs: crate::proto_utils::client_subnet(packet),
+            });
+        }
+        let mut qname_buf = [0u8; 256];
+        let (qname, qtype, qclass, tx_id, edns_present, client_ecs) =
+            match parse_quick(packet, &mut qname_buf) {
+                Some(q) => (
+                    Arc::<str>::from(q.qname),
+                    hickory_proto::rr::RecordType::from(q.qtype),
+                    DNSClass::from(q.qclass),
+                    q.tx_id,
+                    q.edns_present,
+                    q.client_subnet,
+                ),
+                None => {
+                    anyhow::ensure!(
+                        crate::proto_utils::question_name_readable(packet),
+                        "unreadable question name"
+                    );
+                    let req = Message::from_bytes(packet).context("parse request")?;
+                    let question = req.queries.first().context("empty question")?;
+                    (
+                        // The text parse_quick would have built / parse_quick 会拼出的同一段文本
+                        Arc::from(crate::proto_utils::name_text(question.name())),
+                        question.query_type(),
+                        question.query_class(),
+                        req.metadata.id,
+                        req.edns.is_some(),
+                        crate::proto_utils::client_subnet(packet),
+                    )
+                }
+            };
+        let pipeline_id = select_pipeline(
+            cfg,
+            &PipelineSelectionContext {
+                qname: &qname,
+                client_ip: peer.ip(),
+                qclass,
+                edns_present,
+                qtype,
+                listener_label: &self.listener_label,
+                geosite_manager: Some(&self.geosite_manager),
+                geoip_manager: Some(&self.geoip_manager),
+            },
+        )
+        .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone());
+        Ok(RequestHead {
+            qname,
+            qtype,
+            qclass,
+            tx_id,
+            edns_present,
+            pipeline_id,
+            client_ecs,
+        })
+    }
+
+    /// 决定怎么回答 `request`：不支持的 EDNS 版本回 BADVERS；查缓存；然后沿着规则走（跳转、continue、静态应答、转发），
+    /// 直到得出应答。每个出口都在这里，收尾在 `handle_packet_internal`
+    /// Decide how to answer `request`: BADVERS for an unsupported EDNS version; the cache; then
+    /// along the rules (jumps, continues, static answers, forwards) until an answer comes out.
+    /// Every exit is here, the finishing in `handle_packet_internal`
+    async fn decide(
+        &self,
+        request: &Request<'_>,
+        pipeline: Option<&crate::matcher::RuntimePipeline>,
+        route: &mut Route,
+        info: &mut ResponseInfo,
+    ) -> anyhow::Result<Bytes> {
+        let packet = request.packet;
+        // RFC 6891 section 6.1.3, as on the fast path: an unsupported EDNS version is
+        // answered BADVERS. Read off the packet itself, so a query the fast parser
+        // cannot read (trailing bytes, a name that needs escapes) meets it too
+        // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS。从包本身读，
+        // 快速解析读不了的查询（结尾多了字节、名字要转义）也一样
+        if crate::proto_utils::edns_version(packet).is_some_and(|version| version != 0) {
+            return crate::proto_utils::badvers_response(packet).context("build BADVERS response");
+        }
+        let background_refresh = request.refresh.is_some();
+        // A background refresh looks up no cache / 后台刷新不查缓存
+        if !background_refresh
+            && let Some(answer) = self
+                .answer_from_cache(&request.lookup(&route.pipeline, route.keys.slot), info)
+                .await
+        {
+            return Ok(answer);
+        }
+
+        let cfg = &request.state.pipeline;
+        let min_ttl = cfg.min_ttl();
+        let upstream_timeout = cfg.upstream_timeout();
+        let response_jump_limit = cfg.settings.response_jump_limit as usize;
+        // 求值 `pipeline` 的规则，跳过 `skip` 里的（continue 越过的那些）
+        // Evaluate the rules of `pipeline`, skipping those in `skip` (the ones a continue passed)
+        let evaluate = |pipeline: &crate::matcher::RuntimePipeline, skip: Option<&[usize]>| {
+            self.apply_rules(
+                request.state,
+                pipeline,
+                &RuleEvaluationContext::new(
+                    request.peer.ip(),
+                    request.qname,
+                    request.qtype,
+                    request.qclass,
+                    request.requester.edns,
+                    skip,
+                    background_refresh,
+                )
+                .with_observed(request.observed),
+            )
+        };
+        let mut decision = match pipeline {
+            Some(p) => evaluate(p, None),
+            None => {
+                let decision = Decision::default_forward(&cfg.settings);
+                if let Some((observer, ctx)) = request.observed {
+                    report_decision(observer, ctx, &route.pipeline, None, &decision);
+                }
+                decision
+            }
+        };
+        'decision_loop: loop {
+            while let Decision::Jump { pipeline } = &decision {
+                if route.jumps_left == 0 {
+                    crate::warn_sparse!("max jump limit reached");
+                    // How many jumps a request has left depends on the way it
+                    // came, which no key carries, so this SERVFAIL is its own: a
+                    // waiter on its held entry may have jumps to spare, so the
+                    // entry goes rather than hand it over, and it is not cached
+                    // for a request that enters this pipeline directly.
+                    // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
+                    // SERVFAIL 只属于它：等在持有条目上的请求可能还有余量，所以放掉
+                    // 条目，不把它交出去；也不缓存给直接进入这个 pipeline 的请求。
+                    drop(route.held_inflight.take());
+                    info.upstream = Some(Arc::from("static"));
+                    return request.servfail("parse request");
+                }
+                route.jumps_left -= 1;
+                let Some(p) = cfg.pipeline(pipeline) else {
+                    crate::warn_sparse!(pipeline = %pipeline, "jump target pipeline not found");
+                    decision = Decision::Static {
+                        rcode: ResponseCode::ServFail,
+                        answers: Vec::new(),
+                    };
+                    break;
+                };
+                info.pipeline = Some(p.id.clone());
+                if let Some((observer, ctx)) = request.observed {
+                    observer.pipeline_selected(ctx, &p.id);
+                }
+                // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
+                // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
+                // 上游。后台刷新照请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），
+                // 走的是同一条路线、写回同一个键。键里带着目标按自己的规则（连同它跳得到的 pipeline）
+                // 分辨请求方的结果，和直接选进目标的请求查的是同一套键，所以目标按「谁在问」给不同
+                // 应答时也照查；continue 之后跳过来的请求也一样：留着复用的应答在跳转时已经丢掉，
+                // 目标里的处理和第一轮没有分别。以前这两种都不查，经过它们的请求每次都问上游
+                // After a jump, look in the response cache again under the target pipeline's
+                // key. A forwarded answer is stored under that key, while the entry lookup used
+                // the entry pipeline's, so a request that jumped never found it and went upstream
+                // every time. A background refresh replays the request as it came (from the same
+                // address, with or without EDNS, in the same class, see refresh.rs), taking the same
+                // route and writing back under the same key. The key carries how the target's rules
+                // (with the pipelines it can jump to) tell requesters apart, the same keys a request
+                // selected into the target looks up, so a target answering by who is asking is
+                // looked up as well; so is a request jumping in after a continue: the answer kept for
+                // reuse is dropped at the jump, and the target handles it as on a first pass. Neither
+                // used to look, every request through them asking upstream
+                if route.enter(self, request, p)
+                    && !background_refresh
+                    && let Some(answer) = self
+                        .answer_from_cache(&request.lookup(&route.pipeline, route.keys.slot), info)
+                        .await
+                {
+                    return Ok(answer);
+                }
+                decision = evaluate(p, None);
+            }
+
+            match decision {
+                Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
+                Decision::Static { rcode, answers } => {
+                    info.upstream = Some(Arc::from("static"));
+                    // On a refresh, a SERVFAIL here (a jump target that does not
+                    // exist, or a static SERVFAIL the rules configure) is no answer:
+                    // the refresh ends as a failure before anything is cached over
+                    // its entry, which stays. After a refresh continued past an
+                    // answer, any other static answer replaces the entry, which
+                    // handle_static_decision stores again when it caches the answer
+                    // there, unless it is a fallback after an upstream failure.
+                    // 刷新时这里的 SERVFAIL（跳转目标不存在，或规则配置的静态 SERVFAIL）
+                    // 不是应答：刷新在往缓存写任何东西之前以失败结束，条目保留。刷新越过
+                    // 一个应答之后，其他静态应答取代这条，handle_static_decision 在那里缓存
+                    // 应答时会重新写入；上游失败之后的兜底除外。
+                    if rcode == ResponseCode::ServFail && background_refresh {
+                        return Err(phases::refresh_found_no_answer(
+                            "the rules answered SERVFAIL",
+                        ));
+                    }
+                    if route.passed_an_answer
+                        && let Some(target) = request.refresh
+                    {
+                        request.drop_refreshed(self, target);
+                    }
+                    return phases::handle_static_decision(
+                        self,
+                        &phases::StaticDecisionContext {
+                            packet,
+                            qname: request.qname,
+                            qtype: request.qtype,
+                            pipeline_id: &route.key_pipeline,
+                            slot: route.keys.slot,
+                            flags: request.flags,
+                            reach: &route.trail,
+                            min_ttl,
+                            uses_client_ip: route.uses_client_ip,
+                        },
+                        rcode,
+                        answers,
+                    );
+                }
+                Decision::Forward {
+                    upstream,
+                    pre_split_upstreams,
+                    response_phase,
+                    rule_name,
+                    rule_index,
+                    transport,
+                    ecs,
+                    allow_reuse,
+                } => {
+                    let (response_matchers, response_actions_on_match, response_actions_on_miss) =
+                        crate::matcher::ResponsePhase::parts(response_phase.as_deref());
+                    let forwarded = phases::handle_forward_decision_logged(
+                        self,
+                        phases::ForwardDecisionContext {
+                            state: request.state,
+                            packet: route.jumped.as_ref().map_or(packet, |(packet, _)| packet),
+                            query: packet,
+                            qname: request.qname,
+                            qtype: request.qtype,
+                            qclass: request.qclass,
+                            tx_id: request.tx_id,
+                            pipeline_id: &route.pipeline,
+                            key_pipeline_id: &route.key_pipeline,
+                            rule_name: &rule_name,
+                            keys: route.keys,
+                            min_ttl,
+                            upstream_timeout,
+                            start: request.start,
+                            peer: &request.peer,
+                            requester: request.requester,
+                            refresh: request.refresh,
+                            trail: &mut route.trail,
+                            echo_floor: route.echo_floor,
+                            upstream: &upstream,
+                            pre_split_upstreams: pre_split_upstreams.as_ref(),
+                            response_matchers,
+                            response_actions_on_match,
+                            response_actions_on_miss,
+                            transport,
+                            ecs: ecs.as_ref(),
+                            carried: route.jumped.as_ref().map(|(_, carried)| *carried),
+                            jumps_left: if route.jumped.is_some() {
+                                route.jumps_left
+                            } else {
+                                response_jump_limit
+                            },
+                            allow_reuse,
+                            reused_response: &mut route.reused_response,
+                            held_inflight: &mut route.held_inflight,
+                            observed: request.observed,
+                        },
+                        info,
+                    )
+                    .await;
+
+                    match forwarded {
+                        // The target's upstream failed: as when the rule's own upstream
+                        // fails, the refresh has no new answer and the entry stays
+                        // 目标的上游失败：和规则自己的上游失败时一样，刷新没有新应答，条目保留
+                        Ok(phases::ForwardResult::Fallback(bytes)) => return Ok(bytes),
+                        Ok(phases::ForwardResult::Success(bytes)) => {
+                            // After a refresh continued past an answer and then
+                            // jumped, the answer is not stored in the refreshed slot:
+                            // unless it is a failure (SERVFAIL, a truncated answer,
+                            // or the target's stale answer served on one, the only
+                            // cache hit a refresh can have), the entry there no
+                            // longer matches the rules.
+                            // 刷新越过一个应答又跳转之后，应答不会存进被刷新的槽位：
+                            // 只要不是失败（SERVFAIL、截断的应答，或失败时返回的目标旧
+                            // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
+                            // 对不上。
+                            if route.passed_an_answer
+                                && let Some(target) = request.refresh
+                                && route.keys.slot != target.slot
+                                && !phases::is_servfail(&bytes)
+                                && !crate::proto_utils::truncated_response(&bytes)
+                                && !info.cache_hit
+                            {
+                                request.drop_refreshed(self, target);
+                            }
+                            return Ok(bytes);
+                        }
+                        Ok(phases::ForwardResult::Continue { ctx }) => {
+                            route.continued(*ctx, rule_index);
+                            let Some(pipeline) = cfg.pipeline(&route.pipeline) else {
+                                warn!("pipeline missing while continuing: {}", route.pipeline);
+                                return request.servfail("parse request");
+                            };
+                            decision = evaluate(pipeline, Some(&route.skip_rules));
+                            continue 'decision_loop;
+                        }
+                        Ok(phases::ForwardResult::Jump {
+                            pipeline,
+                            packet,
+                            carried,
+                        }) => {
+                            route.response_jumped(packet, carried, response_jump_limit);
+                            decision = Decision::Jump { pipeline };
+                            continue 'decision_loop;
+                        }
+                        Err(e) => {
+                            // A background refresh answers no client: it gets the
+                            // failure itself, which refresh.rs logs.
+                            // 后台刷新没有要应答的客户端：失败原样交回，由 refresh.rs 记录。
+                            if background_refresh {
+                                return Err(e);
+                            }
+                            // A rule continued (response_actions_on_match: [continue])
+                            // and the next Forward attempt failed. The client must
+                            // receive a definitive answer, never silence: DNS clients
+                            // treat a missing reply as TIMEOUT. Return SERVFAIL so the
+                            // stub resolver can retry (RFC 1035).
+                            // 规则 continue 后，下一条 Forward 查询失败。必须给客户端
+                            // 一个确定性的响应而非静默：DNS 客户端会把无响应视为
+                            // TIMEOUT。返回 SERVFAIL 以便 stub resolver 重试。
+                            // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：规则
+                            // continue 以后还留着的条目现在放下，这个 SERVFAIL 不交给等在上面的别的请求；
+                            // 也不逐个记警告，拦着的时候每秒可以有几万个
+                            // A failure with flow control keeping the query from waiting is the
+                            // device's own affair (see `UpstreamFailure::withheld`): the entry
+                            // still held after a rule continued goes now, and this SERVFAIL is
+                            // not handed to the other requests waiting on it; nor is a warning
+                            // logged for each, held back there being tens of thousands a second
+                            if crate::engine::upstream::UpstreamFailure::was_withheld(&e) {
+                                drop(route.held_inflight.take());
+                                tracing::debug!(
+                                    event = "forward_withheld",
+                                    error = %e,
+                                    rule = %rule_name,
+                                    "flow control kept the forward from the upstream, returning SERVFAIL"
+                                );
+                            } else {
+                                crate::warn_sparse!(
+                                    event = "continue_reforward_failed",
+                                    error = %e,
+                                    rule = %rule_name,
+                                    "continue re-forward failed, returning SERVFAIL"
+                                );
+                            }
+                            return request.servfail("parse request for SERVFAIL");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 缓存后台刷新：当TTL即将过期时，异步刷新缓存条目
@@ -2078,6 +1922,244 @@ impl Engine {
         let bytes = msg.to_vec()?;
 
         Ok(Bytes::from(bytes))
+    }
+}
+
+/// 读出来的请求问题和选中的 pipeline（见 `Engine::read_request`）
+/// The request's question as read, and the pipeline picked (see `Engine::read_request`)
+struct RequestHead {
+    qname: Arc<str>,
+    qtype: hickory_proto::rr::RecordType,
+    qclass: DNSClass,
+    tx_id: u16,
+    edns_present: bool,
+    pipeline_id: Arc<str>,
+    client_ecs: Option<crate::ecs::EcsKey>,
+}
+
+/// 一个请求在整个处理过程中不变的部分：它的包、问题、谁在问、用的配置快照，和后台刷新时要更新的条目
+/// What stays the same for a request all the way through: its packet, its question, who is
+/// asking, the configuration snapshot it uses, and for a background refresh the entry it renews
+struct Request<'a> {
+    state: &'a Arc<EngineInner>,
+    packet: &'a [u8],
+    qname: &'a Arc<str>,
+    qtype: hickory_proto::rr::RecordType,
+    qclass: DNSClass,
+    tx_id: u16,
+    flags: crate::proto_utils::QueryFlags,
+    peer: SocketAddr,
+    requester: Requester,
+    start: Instant,
+    refresh: Option<&'a RefreshTarget>,
+    observed: super::observation::Observed<'a>,
+}
+
+impl Request<'_> {
+    /// `pipeline` 下这个问题的缓存键，按 `requester` 分辨请求方
+    /// This question's keys under `pipeline`, requesters told apart by `requester`
+    fn keys(&self, pipeline: &str, requester: &RequesterKey) -> CacheKeys {
+        Engine::cache_keys(
+            self.state.cache_namespace(pipeline),
+            pipeline,
+            self.qname.as_bytes(),
+            self.qtype,
+            self.qclass,
+            self.flags,
+            requester,
+            self.requester.ecs.as_ref(),
+        )
+    }
+
+    /// 在 `pipeline` 的槽位 `slot` 里查这个请求的应答 / Looking up this request's answer in slot
+    /// `slot` of `pipeline`
+    fn lookup<'s>(&'s self, pipeline: &'s str, slot: u64) -> phases::CacheLookupContext<'s> {
+        phases::CacheLookupContext {
+            state: self.state,
+            qname: self.qname,
+            qtype: self.qtype,
+            qclass: self.qclass,
+            flags: self.flags,
+            pipeline_id: pipeline,
+            slot,
+            tx_id: self.tx_id,
+            start: self.start,
+            peer: &self.peer,
+            requester: self.requester,
+            observed: self.observed,
+        }
+    }
+
+    /// 回这个请求的 SERVFAIL；`context` 是请求读不出来时的错误说明
+    /// Answer this request SERVFAIL; `context` describes the error when it cannot be read
+    fn servfail(&self, context: &'static str) -> anyhow::Result<Bytes> {
+        engine_helpers::build_servfail_response(&Message::from_bytes(self.packet).context(context)?)
+    }
+
+    /// 去掉刷新要更新、却已经和规则对不上的条目：规则越过一个应答之后，结果可能是静态应答或来自跳转目标，它们不会更新它
+    /// Drop the entry the refresh renews when it no longer matches the rules: once a rule has
+    /// continued past an answer, the outcome may be a static answer or come from a jump target,
+    /// which do not renew it
+    fn drop_refreshed(&self, engine: &Engine, target: &RefreshTarget) {
+        let question = CachedQuestion {
+            qname: self.qname,
+            pipeline_id: &target.pipeline,
+            qtype: u16::from(self.qtype),
+            flags: self.flags,
+        };
+        engine.drop_refreshed(target.slot, &question, &self.requester.ecs_view(), target);
+    }
+}
+
+/// 请求沿着规则走的路线：现在在哪个 pipeline、应答缓存在哪个键下、还能跳几次、规则越过了什么，以及它在路上记下的
+/// What a request's way along the rules has come to: which pipeline it is in, which key its answers
+/// are cached under, how many jumps are left, what rules continued past, and what it noted on the way
+struct Route {
+    /// 现在所在的 pipeline / The pipeline it is in now
+    pipeline: Arc<str>,
+    uses_client_ip: bool,
+    /// 应答缓存在哪个 pipeline 的键下：请求阶段的跳转换成目标的；响应阶段跳转以后不再换，跳过去拿到的应答照旧缓存在
+    /// 跳转前那个 pipeline 的键下（见 `phases::ForwardResult::Jump`）
+    /// The pipeline whose key answers are cached under: a request-phase jump changes it to the
+    /// target's; after a response-phase jump it changes no more, the answers got over there
+    /// cached under the key of the pipeline jumped from (see `phases::ForwardResult::Jump`)
+    key_pipeline: Arc<str>,
+    keys: CacheKeys,
+    /// continue 越过的规则，下一轮求值跳过它们 / The rules a continue passed, which the next evaluation skips
+    skip_rules: crate::engine::pipeline::Continued,
+    /// 规则越过、留着给后面的 `allow` 复用的应答 / The answer a rule continued past, kept for a later `allow`
+    reused_response: Option<ResponseContext>,
+    /// 响应阶段跳转以后：转发照原样发出的包，和它带的 ECS / After a response-phase jump: the
+    /// packet the forwards send as it is, and the ECS it carries
+    jumped: Option<(Bytes, crate::ecs_scope::ForwardEcs)>,
+    /// 还能跳几次，在要跳的地方数：请求阶段的跳转一份，响应动作的跳转连同它之后的规则级跳转另一份（见
+    /// `Route::response_jumped`）
+    /// How many more jumps may be made, counted where a jump is made: the request phase's jumps
+    /// have one budget, a response action's jump with the rule-level jumps after it another (see
+    /// `Route::response_jumped`)
+    jumps_left: usize,
+    /// 规则已经越过了一个应答（continue，或响应阶段跳走）/ A rule has continued past an answer
+    /// (a continue, or a response-phase jump)
+    passed_an_answer: bool,
+    /// 在当前 pipeline 里经过的转发（见 `ForwardDecisionContext::trail`）；请求结束后就是它最后一份应答缓存时带的那份
+    /// The forwards passed in the current pipeline (see `ForwardDecisionContext::trail`); after
+    /// the request, what its last answer was cached with
+    trail: EcsReach,
+    /// 经由请求跳离的 pipeline（它们的 trail 已经清掉）应答依赖客户端 ECS 的多少位（见 `phases::client_reply`）
+    /// How many bits of the client's ECS the answer depends on through the pipelines the request
+    /// left by a jump, whose trails are gone (see `phases::client_reply`)
+    echo_floor: u8,
+    /// 规则 continue 后本请求仍持有的 inflight 条目（见 `ForwardDecisionContext::held_inflight`）
+    /// The inflight entry the request still holds after a rule continued (see
+    /// `ForwardDecisionContext::held_inflight`)
+    held_inflight: Option<InflightCleanupGuard>,
+}
+
+impl Route {
+    /// 从选中的 `pipeline_id` 出发（`pipeline` 是它，选不到时为 None）。刷新写进它要更新的条目的槽位
+    /// Starting from the picked `pipeline_id` (`pipeline` being it, None when none was picked).
+    /// A refresh writes into the slot of the entry it renews
+    fn new(
+        engine: &Engine,
+        request: &Request<'_>,
+        pipeline_id: &Arc<str>,
+        pipeline: Option<&crate::matcher::RuntimePipeline>,
+    ) -> Self {
+        let mut keys = request.keys(
+            pipeline_id,
+            &pipeline.map_or(RequesterKey::NONE, |p| {
+                p.requester
+                    .key(request.requester, Some(&engine.geoip_manager))
+            }),
+        );
+        if let Some(target) = request.refresh {
+            keys.slot = target.slot;
+        }
+        Self {
+            pipeline: Arc::clone(pipeline_id),
+            uses_client_ip: pipeline.is_some_and(|p| p.uses_client_ip),
+            key_pipeline: Arc::clone(pipeline_id),
+            keys,
+            skip_rules: crate::engine::pipeline::Continued::new(),
+            reused_response: None,
+            jumped: None,
+            jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
+            passed_an_answer: false,
+            trail: EcsReach::default(),
+            echo_floor: 0,
+            held_inflight: None,
+        }
+    }
+
+    /// 请求阶段跳进 `p`，给出缓存键换没换（换了就该按新键再查一次缓存）。响应阶段跳转以后键和 trail 都留着：应答照旧
+    /// 缓存在跳转前那个 pipeline 的键下（见 `key_pipeline`）
+    /// Jump into `p` in the request phase, telling whether the keys changed (and the cache is to
+    /// be looked up again under them). After a response-phase jump the keys and the trail stay:
+    /// answers are still cached under the key of the pipeline jumped from (see `key_pipeline`)
+    fn enter(
+        &mut self,
+        engine: &Engine,
+        request: &Request<'_>,
+        p: &crate::matcher::RuntimePipeline,
+    ) -> bool {
+        self.pipeline = p.id.clone();
+        self.uses_client_ip = p.uses_client_ip;
+        self.skip_rules.clear();
+        // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的。
+        // 带过来交给这里的 allow，就会写进这个 pipeline 的键，之后直接进入这里的请求
+        // 也会拿到它。
+        // An answer kept for reuse belongs to the pipeline that fetched it, through
+        // its forward and with its ECS. Handed to an allow here, it would be cached
+        // under this pipeline's key and served to requests that come here directly.
+        self.reused_response = None;
+        if self.jumped.is_some() {
+            return false;
+        }
+        // So do the forwards behind it: this pipeline's answers depend on its
+        // own forwards only. What they made the answer depend on still counts
+        // for the echo.
+        // 它之前的转发也一样：这个 pipeline 的应答只取决于它自己的转发。它们让
+        // 应答依赖的部分，回显时仍要算上。
+        self.echo_floor = self
+            .echo_floor
+            .max(self.trail.echo_scope(&request.requester.ecs_view()));
+        self.trail = EcsReach::default();
+        self.key_pipeline = p.id.clone();
+        // The keys follow the pipeline / 键随 pipeline 改变
+        self.keys = request.keys(
+            &p.id,
+            &p.requester
+                .key(request.requester, Some(&engine.geoip_manager)),
+        );
+        true
+    }
+
+    /// 规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，`rule` 下一轮不再求值
+    /// A rule continued past this answer: `reused` is kept for a later `allow`, and `rule` is not
+    /// evaluated again
+    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>) {
+        self.passed_an_answer = true;
+        self.reused_response = reused;
+        self.skip_rules.extend(rule);
+    }
+
+    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（刷新时上游失败的到不了这里）；此后的转发
+    /// 照原样发出 `packet`。第一次响应阶段的跳转起另算一份次数（`limit`）
+    /// A response action jumped away: the answer of the forward before the jump is one passed
+    /// over, as on a continue (a refresh whose upstream failed never gets here); the forwards from
+    /// here on send `packet` as it is. The first response-phase jump starts a budget of its own
+    /// (`limit`)
+    fn response_jumped(
+        &mut self,
+        packet: Bytes,
+        carried: crate::ecs_scope::ForwardEcs,
+        limit: usize,
+    ) {
+        self.passed_an_answer = true;
+        if self.jumped.is_none() {
+            self.jumps_left = limit;
+        }
+        self.jumped = Some((packet, carried));
     }
 }
 
