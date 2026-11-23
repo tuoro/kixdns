@@ -130,7 +130,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | response_answer_ip_geoip_private | expect：布尔值 |
 | response_request_domain_geo_site | value：GeoSite tag |
 | response_request_domain_geo_site_not | value：GeoSite tag |
-| response_txt_content | mode：exact、prefix 或 regex；value 为文本/模式，regex 最长 1000 字节 |
+| response_txt_content | mode：exact、prefix 或 regex；value 为文本/模式，regex 最长 1000 字节。应答里的每条 TXT 记录分开比较，有一条命中就算命中；一条记录里的几个字符串先不加空格连起来再比（和 RFC 7208 读 SPF 记录一样），没有 TXT 记录的应答不命中 |
 
 响应地址匹配范围如下：
 

@@ -1791,35 +1791,27 @@ impl RuntimeResponseMatcher {
                 geosite_manager.is_some_and(|mgr| !mgr.matches(value, qname))
             }
             RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
-                // 从响应中提取 TXT 记录 / Extract TXT records from response
+                // 每条 TXT 记录分开比较，有一条命中就算命中；一条记录里的几个字符串先不加空格连起来，和
+                // RFC 7208 §3.3 读 SPF 记录一样（长过 255 字节的文字只能拆成几个字符串写）。以前所有记录
+                // 连成一串再比：同时有两条记录时，exact 和带 `^…$` 的正则哪条都对不上，prefix 只看得到第一条
+                // Each TXT record is compared on its own, and one matching is enough; a record's
+                // strings are first joined without spaces, as RFC 7208 §3.3 reads an SPF record
+                // (text longer than 255 bytes can only be written as several strings). All
+                // records used to be joined into one string: with two records present, exact and
+                // a regex anchored with `^…$` matched neither, and prefix saw only the first
                 use hickory_proto::rr::RData;
-                let txt_data = msg
-                    .answers
-                    .iter()
-                    .filter_map(|r| {
-                        if let RData::TXT(txt) = &r.data {
-                            Some(txt)
-                        } else {
-                            None
-                        }
-                    })
-                    .flat_map(|txt| txt.txt_data.iter().flat_map(|s| s.as_ref()))
-                    .copied()
-                    .collect::<Vec<u8>>();
-
-                let txt_str = String::from_utf8_lossy(&txt_data);
-
-                match mode {
-                    TxtMatchMode::Exact => txt_str == value.as_ref(),
-                    TxtMatchMode::Prefix => txt_str.starts_with(value.as_ref()),
-                    TxtMatchMode::Regex => {
-                        if let Some(re) = regex {
-                            re.is_match(&txt_str)
-                        } else {
-                            false
-                        }
+                msg.answers.iter().any(|record| {
+                    let RData::TXT(txt) = &record.data else {
+                        return false;
+                    };
+                    let joined = txt.txt_data.concat();
+                    let text = String::from_utf8_lossy(&joined);
+                    match mode {
+                        TxtMatchMode::Exact => text == value.as_ref(),
+                        TxtMatchMode::Prefix => text.starts_with(value.as_ref()),
+                        TxtMatchMode::Regex => regex.as_ref().is_some_and(|re| re.is_match(&text)),
                     }
-                }
+                })
             }
         }
     }
@@ -3239,6 +3231,68 @@ mod txt_regex_tests {
                 ),
                 "{pattern} against {text}"
             );
+        }
+    }
+
+    /// 每条 TXT 记录分开比较，有一条命中就算命中；一条记录里的几个字符串先不加空格连起来（RFC 7208 §3.3）。以前
+    /// 所有记录连成一串再比：SPF 记录旁边还有一条验证记录时，exact 和带 `^…$` 的正则哪条都对不上，prefix 只对得上
+    /// 第一条；没有 TXT 记录的应答反倒算作内容为空，`exact ""` 和 `.*` 这样的正则都命中
+    /// Each TXT record is compared on its own, and one matching is enough; a record's strings
+    /// are first joined without spaces (RFC 7208 §3.3). All records used to be joined into one
+    /// string: with a verification record next to an SPF record, exact and a regex anchored
+    /// with `^…$` matched neither, and prefix matched the first alone; and an answer without
+    /// a TXT record counted as empty content, which `exact ""` and a regex such as `.*` matched
+    #[test]
+    fn each_txt_record_is_matched_on_its_own() {
+        use hickory_proto::op::{Message, MessageType, OpCode};
+        use hickory_proto::rr::rdata::TXT;
+        use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+        let answer = |records: &[&[&str]]| {
+            let mut message = Message::new(0, MessageType::Response, OpCode::Query);
+            for strings in records {
+                message.add_answer(Record::from_rdata(
+                    Name::from_ascii("example.com.").unwrap(),
+                    300,
+                    RData::TXT(TXT::new(strings.iter().map(|s| s.to_string()).collect())),
+                ));
+            }
+            message
+        };
+        let matches = |mode: &str, value: &str, message: &Message| {
+            RuntimeResponseMatcher::from_config(
+                crate::config::ResponseMatcher::ResponseTxtContent {
+                    mode: mode.to_string(),
+                    value: value.to_string(),
+                },
+            )
+            .unwrap()
+            .matches(
+                "udp:test",
+                "example.com",
+                RecordType::TXT,
+                DNSClass::IN,
+                message,
+                None,
+                None,
+            )
+        };
+        let two_records = answer(&[
+            &["v=spf1 include:_spf.example", " -all"],
+            &["site-verification=abc"],
+        ]);
+        for (mode, value) in [
+            ("exact", "v=spf1 include:_spf.example -all"),
+            ("exact", "site-verification=abc"),
+            ("prefix", "site-verification="),
+            ("regex", r"^v=spf1 .* -all$"),
+            ("regex", r"^site-verification=\w+$"),
+        ] {
+            assert!(matches(mode, value, &two_records), "{mode} {value}");
+        }
+        // 两条记录之间不连 / Two records are not joined
+        assert!(!matches("regex", "-allsite", &two_records));
+        for (mode, value) in [("exact", ""), ("regex", ".*")] {
+            assert!(!matches(mode, value, &answer(&[])), "{mode} {value}");
         }
     }
 
