@@ -140,6 +140,24 @@ impl ParsedGeoIp {
     pub fn tag_count(&self) -> usize {
         self.tag_indexes.len()
     }
+
+    /// 每个标签和它的网段：合并过的区间拆成恰好盖住它们的最少的 CIDR
+    /// Each tag with its networks: the merged ranges cut into the fewest CIDRs covering exactly them
+    pub(super) fn networks_by_tag(
+        &self,
+    ) -> impl Iterator<Item = (&str, impl Iterator<Item = ipnet::IpNet> + '_)> {
+        self.tag_indexes.iter().map(|(tag, index)| {
+            let v4 = index.ipv4_ranges.iter().flat_map(|range| {
+                ipnet::Ipv4Subnets::new(range.start.into(), range.end.into(), 0)
+                    .map(ipnet::IpNet::V4)
+            });
+            let v6 = index.ipv6_ranges.iter().flat_map(|range| {
+                ipnet::Ipv6Subnets::new(range.start.into(), range.end.into(), 0)
+                    .map(ipnet::IpNet::V6)
+            });
+            (&**tag, v4.chain(v6))
+        })
+    }
 }
 
 /// 默认的管理器没有 MMDB、也没有标签 / The default manager has no MMDB and no tags
@@ -627,16 +645,7 @@ impl GeoIpManager {
     /// the file lacks are logged as a warning, since rules using them never match.
     pub fn parse_file(path: &Path, tags: &[String]) -> anyhow::Result<ParsedGeoIp> {
         let wanted: FxHashSet<String> = tags.iter().map(|tag| tag.to_ascii_uppercase()).collect();
-        let is_wanted = |code: &str| wanted.contains(code);
-        let is_dat = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("dat"));
-        let parsed = if is_dat {
-            Self::parse_dat_entries(path, &is_wanted)
-        } else {
-            Self::parse_v2ray_entries(path, &is_wanted)
-        }?;
+        let parsed = Self::parse_matching(path, &|code| wanted.contains(code))?;
 
         let mut missing: Vec<&str> = wanted
             .iter()
@@ -648,6 +657,24 @@ impl GeoIpManager {
             tracing::warn!(target = "geoip", path = %path.display(), tags = ?missing, "GeoIP tags used by rules are not in the data file and never match");
         }
         Ok(parsed)
+    }
+
+    /// 按扩展名解析数据文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）：`.dat` 按条目读，其余按 JSON 读
+    /// Parses the entries of a data file that `wanted` accepts (given the uppercase country
+    /// code or tag) by its extension: `.dat` entry by entry, anything else as JSON
+    pub(super) fn parse_matching(
+        path: &Path,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> anyhow::Result<ParsedGeoIp> {
+        let is_dat = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("dat"));
+        if is_dat {
+            Self::parse_dat_entries(path, wanted)
+        } else {
+            Self::parse_v2ray_entries(path, wanted)
+        }
     }
 
     /// 解析 JSON 格式的数据文件，不触碰管理器状态
