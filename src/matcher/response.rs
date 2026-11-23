@@ -78,11 +78,12 @@ pub struct RuntimeResponseMatcherWithOp {
     pub matcher: RuntimeResponseMatcher,
 }
 
-/// 作答上游 `upstream`（`udp:1.1.1.1:53`，不带传输名也行）的 IP：地址里的主机是 IP 字面量时有，是域名时没有。
-/// 路径（DoH）和参数（`?sni=`）不看
+/// 作答上游 `upstream`（`udp:1.1.1.1:53`，不带传输名也行）的 IP：地址里的主机是 IP 字面量时有，是域名时没有；
+/// IPv4 映射形式的按它所指的 IPv4 地址算，和网段的写法一致（见 `canonical_net`）。路径（DoH）和参数（`?sni=`）不看
 /// The IP of the answering upstream `upstream` (`udp:1.1.1.1:53`, or without the transport):
-/// there is one when the host in its address is an IP literal, none when it is a name. A path
-/// (DoH) and parameters (`?sni=`) are not read
+/// there is one when the host in its address is an IP literal, none when it is a name; an
+/// IPv4-mapped one counts as the IPv4 address it names, as networks are read (see
+/// `canonical_net`). A path (DoH) and parameters (`?sni=`) are not read
 #[inline]
 fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
     let address = crate::engine::upstream::answered_address(upstream);
@@ -91,6 +92,7 @@ fn try_parse_upstream_ip(upstream: &str) -> Option<IpAddr> {
         .ok()
         .map(|sa| sa.ip())
         .or_else(|| host.parse::<IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
 }
 
 impl RuntimeResponseMatcher {
@@ -160,12 +162,12 @@ impl RuntimeResponseMatcher {
             }
             config::ResponseMatcher::ResponseRequestDomainGeoSite { value } => {
                 RuntimeResponseMatcher::ResponseRequestDomainGeoSite {
-                    value: Arc::from(value),
+                    value: geosite_tag(&value),
                 }
             }
             config::ResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
                 RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot {
-                    value: Arc::from(value),
+                    value: geosite_tag(&value),
                 }
             }
             config::ResponseMatcher::ResponseTxtContent { mode, value } => {
@@ -278,13 +280,16 @@ impl RuntimeResponseMatcher {
                 matcher_helpers::any_ip_matches(msg, crate::matcher::geoip::is_private_ip)
                     == *expect
             }
+            // 没有 GeoSite 数据时和请求规则一样：geo_site 不命中、geo_site_not 命中（见 `RuntimeMatcher::matches_ready`）。
+            // 以前这里的 geo_site_not 也不命中，同一个条件写在回答检查里和写在请求规则里结果相反
+            // Without GeoSite data, as in request rules: geo_site does not match and geo_site_not
+            // does (see `RuntimeMatcher::matches_ready`). geo_site_not used not to match here
+            // either, so one condition gave opposite results in an answer check and a request rule
             RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
-                // 使用辅助函数检查请求域名是否属于指定的 GeoSite 分类 / Use helper to check if request domain belongs to GeoSite category
                 geosite_manager.is_some_and(|mgr| mgr.matches(value, qname))
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
-                // 使用辅助函数检查请求域名是否不属于指定的 GeoSite 分类 / Use helper to check if request domain does NOT belong to GeoSite category
-                geosite_manager.is_some_and(|mgr| !mgr.matches(value, qname))
+                geosite_manager.is_none_or(|mgr| !mgr.matches(value, qname))
             }
             RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
                 // 每条 TXT 记录分开比较，有一条命中就算命中；一条记录里的几个字符串先不加空格连起来，和
@@ -349,12 +354,74 @@ mod upstream_ip_tests {
             ("doh:192.0.2.1:8443/dns-query", ip("192.0.2.1")),
             ("dot:192.0.2.1:853?sni=dns.example", ip("192.0.2.1")),
             ("doq:[2001:db8::1]:853?sni=dns.example", ip("2001:db8::1")),
+            ("udp:[::ffff:192.0.2.1]:53", ip("192.0.2.1")),
             ("192.0.2.1:53", ip("192.0.2.1")),
             ("192.0.2.1", ip("192.0.2.1")),
             ("doh:dns.example/dns-query", None),
             ("dot:dns.example:853", None),
         ] {
             assert_eq!(try_parse_upstream_ip(upstream), expected, "{upstream}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod geosite_tests {
+    use super::*;
+
+    /// 没有 GeoSite 数据时，回答检查里的 geo_site_not 和请求规则里的一样命中，geo_site 两边都不命中。以前回答检查里的
+    /// geo_site_not 也不命中，同一个条件写在两处结果相反
+    /// Without GeoSite data, geo_site_not in an answer check matches as in a request rule, and
+    /// geo_site matches in neither. geo_site_not in an answer check used not to match either, so
+    /// one condition gave opposite results in the two places
+    #[test]
+    fn without_geosite_data_an_answer_check_judges_as_a_request_rule() {
+        let message = Message::new(
+            0,
+            hickory_proto::op::MessageType::Response,
+            hickory_proto::op::OpCode::Query,
+        );
+        for (request, response) in [
+            (
+                config::Matcher::GeoSite {
+                    value: "ads".into(),
+                },
+                config::ResponseMatcher::ResponseRequestDomainGeoSite {
+                    value: "ads".into(),
+                },
+            ),
+            (
+                config::Matcher::GeoSiteNot {
+                    value: "ads".into(),
+                },
+                config::ResponseMatcher::ResponseRequestDomainGeoSiteNot {
+                    value: "ads".into(),
+                },
+            ),
+        ] {
+            let request = RuntimeMatcher::from_config(request).unwrap();
+            let response = RuntimeResponseMatcher::from_config(response).unwrap();
+            assert_eq!(
+                response.matches(
+                    "udp:test",
+                    "ads.example",
+                    RecordType::A,
+                    DNSClass::IN,
+                    &message,
+                    None,
+                    None,
+                ),
+                request.matches_ready(
+                    "ads.example",
+                    DNSClass::IN,
+                    IpAddr::from([192, 0, 2, 1]),
+                    false,
+                    RecordType::A,
+                    None,
+                    None,
+                ),
+                "{request:?}"
+            );
         }
     }
 }

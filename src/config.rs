@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
-use ipnet::IpNet;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
@@ -678,8 +677,8 @@ impl Rule {
             self.merged_forward = Some(MergedForward {
                 upstream_str: Arc::from(merged_str.as_str()),
                 upstream_list: Arc::new(all_upstreams),
-                // 写得不一样时不发，启动时 `problems` 记一条警告 / None when they differ;
-                // at startup `problems` logs a warning
+                // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
+                // at startup `problems` logs an error
                 ecs: self.shared_forward_ecs().ok().flatten().cloned(),
             });
         }
@@ -712,9 +711,29 @@ pub struct DohListenerConfig {
     pub path: String,
 }
 
-/// `dashmap_shards` 的上限：分片太多一次就分配掉大量内存 / The most `dashmap_shards` may be: too
-/// many shards allocate a great deal of memory at once
-pub const MAX_DASHMAP_SHARDS: usize = 1024;
+/// `dashmap_shards` 的上限。每个分片启动时就占六百来字节（缓存行对齐的锁，加上容量摊到每片至少一条时的四格小表），
+/// 65536 片四十来 MB；以前没有上限时写过的 2048、4096 都在里面，以前的 1024 让它们升级以后起不来。再翻一倍就是八十来
+/// MB，同时在途的查询也用不了那么多片
+/// The most `dashmap_shards` may be. Each shard takes some six hundred bytes from startup (a
+/// cache-padded lock and a four-slot table, the capacity spread to at least one entry a
+/// shard), so 65536 shards are some forty MB; the 2048 and 4096 written before there was a
+/// limit fit, where the former 1024 kept them from starting after an upgrade. Twice as many is
+/// some eighty MB, more shards than the queries in flight together could ever use
+pub const MAX_DASHMAP_SHARDS: usize = 65_536;
+
+/// 每个连接池（`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`dot_pool_size`、`doq_pool_size`）最多多大，
+/// 默认值最大的也只有 64。UDP 池启动时就给每个地址族各开这么多 socket，两族最多 2048 个，在文档里的 systemd 服务和
+/// 面板的 OpenWrt 包设的 65536 个描述符以内；其余的池给每个上游备好这么多客户端。以前不设上限：多到开不出来的 socket，
+/// 热重载和面板保存照样收下，下次启动才起不来；大到 2^64 的数建池时分配不出内存，内核直接退出
+/// How large each connection pool (`udp_pool_size`, `tcp_pool_size`, `doh_pool_size`,
+/// `dot_pool_size`, `doq_pool_size`) may be, the largest default being 64. The UDP pool opens
+/// this many sockets per address family at startup, at most 2048 for both, within the 65536
+/// descriptors the systemd service in the docs and the panel's `OpenWrt` package allow; the
+/// other pools set up this many clients per upstream. There used to be no limit: more sockets
+/// than could be opened were accepted by a hot reload and a panel save and failed only at the
+/// next start, and a number as large as 2^64 could not be allocated as the pool was built,
+/// taking the kernel down
+pub const MAX_POOL_SIZE: usize = 1024;
 
 impl GlobalSettings {
     /// 和 `running`（进程启动时的设置）相比，改了以后要重启 KixDNS 才生效的设置名。这些设置只在启动时
@@ -890,17 +909,30 @@ impl GlobalSettings {
             anyhow::bail!("upstream_timeout_ms must be greater than 0");
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
-        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多一次就分配掉大量内存
+        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多、连接池太大，一次就要分配太多（见
+        // `MAX_DASHMAP_SHARDS`、`MAX_POOL_SIZE`）
         // Settings read only at startup are checked against what building the engine needs: a value
         // the check lets through and the build then fails on is accepted by a hot reload and a panel
         // save, and the kernel does not start at the next restart. DashMap needs more than one
-        // shard, and too many shards allocate a great deal of memory at once
+        // shard, and too many shards or too large a pool take too much at once (see
+        // `MAX_DASHMAP_SHARDS`, `MAX_POOL_SIZE`)
         let shards = self.dashmap_shards;
         if shards != 0 && !(shards.is_power_of_two() && (2..=MAX_DASHMAP_SHARDS).contains(&shards))
         {
             anyhow::bail!(
                 "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
             );
+        }
+        for (setting, size) in [
+            ("udp_pool_size", self.udp_pool_size),
+            ("tcp_pool_size", self.tcp_pool_size),
+            ("doh_pool_size", self.doh_pool_size),
+            ("dot_pool_size", self.dot_pool_size),
+            ("doq_pool_size", self.doq_pool_size),
+        ] {
+            if size > MAX_POOL_SIZE {
+                anyhow::bail!("{setting} must be at most {MAX_POOL_SIZE}, got {size}");
+            }
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
         if doq_idle > 0
@@ -976,61 +1008,17 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
     Ok((cfg, raw))
 }
 
-/// Parse and normalize a configuration from its JSON text without touching
-/// the filesystem. Errors from the JSON layer carry line/column positions.
-/// 从 JSON 文本解析并规范化配置，不访问文件系统。JSON 层错误带行列位置。
+/// 从 JSON 文本解析配置，找出写了却不读的键（见 [`unread_keys`]），不访问文件系统。JSON 层的错误带行列位置。
+/// 预先算好的东西（拆好的上游、合并的转发）编译时才算（见 `RuntimePipelineConfig::from_config`），只算一遍；编译不了的
+/// 写法（比如写错的网段）也在编译时连同位置报出来
+/// Parse a configuration from its JSON text, finding the keys it writes that are not read (see
+/// [`unread_keys`]), without touching the filesystem. Errors from the JSON layer carry
+/// line/column positions. What is worked out ahead of time (the upstreams split, the merged
+/// forwards) is worked out once, as it compiles (see `RuntimePipelineConfig::from_config`), and
+/// what cannot be compiled (a mistyped network, say) is reported there with its place
 pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
     let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
     cfg.unread_keys = unread_keys(raw, &serde_json::to_value(&cfg)?)?;
-
-    // 预分割上游字符串，转发时不必每次再拆；默认上游有几个时同时问 / Pre-split the upstream
-    // strings so a forward does not split them each time; several default upstreams are
-    // asked at once
-    cfg.settings.pre_split_default_upstream();
-
-    for pipeline in &mut cfg.pipelines {
-        for rule in &mut pipeline.rules {
-            for action in &mut rule.actions {
-                action.pre_split_upstreams();
-            }
-            // Pre-compute merged Forward upstreams for multi-Forward rules (performance optimization).
-            // Eliminates per-request FxHashSet + format! + join overhead on the hot path.
-            // 预计算多 Forward 规则的合并上游（性能优化）。
-            // 消除热路径上每请求的 FxHashSet + format! + join 开销。
-            rule.compute_merged_forward();
-            // 下面的 CIDR 只在这里先解析一遍，好早点报出写错的；匹配器建好时会再解析
-            // The CIDRs below are parsed here only to report a bad one early; the matchers
-            // parse them again when built
-            for matcher in &rule.matchers {
-                if let Matcher::ClientIp { cidr } = &matcher.matcher {
-                    let _parsed: IpNet = cidr.parse()?;
-                }
-            }
-            for matcher in &rule.response_matchers {
-                if let ResponseMatcher::RequestDomainSuffix { value } = &matcher.matcher
-                    && value.is_empty()
-                {
-                    anyhow::bail!("response_matcher request_domain_suffix empty");
-                }
-                if let ResponseMatcher::ResponseUpstreamIp { cidr }
-                | ResponseMatcher::ResponseAnswerIp { cidr } = &matcher.matcher
-                {
-                    for part in cidr.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                        let _parsed: IpNet = part.parse()?;
-                    }
-                }
-            }
-        }
-    }
-
-    for sel in &cfg.pipeline_select {
-        for m in &sel.matchers {
-            if let PipelineSelectorMatcher::ClientIp { cidr } = &m.matcher {
-                let _parsed: IpNet = cidr.parse()?;
-            }
-        }
-    }
-
     Ok(cfg)
 }
 
@@ -1181,14 +1169,14 @@ pub struct ValidationReport {
 /// 一份配置编译成运行时配置，热重载、面板的校验和试用都走这里，拒掉的和启动时会让内核起不来的一样：会悄悄做成
 /// 别的事的写法（见 [`problems`]）、编译不了的匹配器和正则，以及监听地址和 DoH 的前提（见
 /// [`GlobalSettings::listeners`]）。以前热重载不查监听地址，`bind_udp` 写错了照样重载成功，等到重启内核才起不来。
-/// 启动不走这里：那时 [`problems`] 只记警告、照旧加载
+/// 启动不走这里：那时 [`problems`] 记成错误、照旧加载
 /// A configuration compiled into its runtime form, which hot reload and the panel's validation
 /// and trial all go through, refusing what would stop the kernel at startup: what silently does
 /// something else (see [`problems`]), matchers and regexes that do not compile, and the
 /// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]). Hot reload
 /// used not to check the listeners, so a mistyped `bind_udp` reloaded fine and the kernel then
 /// failed to start at the next restart. Startup does not come here: there [`problems`] are
-/// only warned about and loaded as before
+/// logged as errors and loaded as before
 pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     refuse_problems(&cfg)?;
     let runtime = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
@@ -1220,7 +1208,7 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// 不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
-/// 启动时只记警告、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
+/// 启动时记成错误、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
 /// 拒绝它们，下一次改配置时就得改掉。
 ///
 /// Ways of writing a configuration that silently do something else: an upstream
@@ -1242,11 +1230,11 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         .next()
         .is_none()
     {
-        found.push(format!("default_upstream: {NO_UPSTREAM}"));
+        found.push(format!("settings.default_upstream: {NO_UPSTREAM}"));
     }
     for upstream in split_upstreams(&cfg.settings.default_upstream) {
         if let Some(problem) = crate::engine::upstream::upstream_problem(upstream, Transport::Udp) {
-            found.push(format!("default_upstream: {problem}"));
+            found.push(format!("settings.default_upstream: {problem}"));
         }
     }
     // bootstrap 自己就是解析上游名字的，只能写成 IP 和端口，经 UDP 问 / bootstrap is what resolves
@@ -1255,12 +1243,21 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         if let Err(error) = crate::engine::transport::check_upstream_address(server, Transport::Udp)
         {
             found.push(format!(
-                "bootstrap: server \"{server}\" is not usable: {error:#}"
+                "settings.bootstrap: server \"{server}\" is not usable: {error:#}"
             ));
         }
     }
+    // 请求的路径总以 `/` 开头，不以它开头的 doh_path 谁也对不上，DoH 对每个请求都回 404 / A request
+    // path always starts with `/`, so a doh_path not starting with it matches no request and DoH
+    // answers 404 to every one
+    if !cfg.settings.doh_path.starts_with('/') {
+        found.push(format!(
+            "settings.doh_path: \"{}\" does not start with \"/\", so it matches no request and DoH answers every query with 404",
+            cfg.settings.doh_path
+        ));
+    }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
-        let place = format!("pipeline_select {}", index + 1);
+        let place = format!("pipeline_select[{index}]");
         if !pipelines.contains(select.pipeline.as_str()) {
             found.push(format!("{place}: no pipeline \"{}\"", select.pipeline));
         }
@@ -1291,21 +1288,22 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     for pipeline in &cfg.pipelines {
         *written.entry(pipeline.id.as_str()).or_default() += 1;
     }
-    for pipeline in &cfg.pipelines {
+    for (index, pipeline) in cfg.pipelines.iter().enumerate() {
         if let Some(times) = written.remove(pipeline.id.as_str())
             && times > 1
         {
             found.push(format!(
-                "pipeline \"{}\": {times} pipelines are written with this id; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
+                "pipelines[{index}]: {times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
                 pipeline.id
             ));
         }
     }
-    for pipeline in &cfg.pipelines {
-        for rule in &pipeline.rules {
-            let place = format!("pipeline \"{}\" rule \"{}\"", pipeline.id, rule.name);
+    // 规则按位置报，和读不懂的键一样：名字可以重复，按名字说不清是哪一条 / Rules are raised by place,
+    // as the keys not read are: names may repeat, and a name may not tell which rule it is
+    for (i, pipeline) in cfg.pipelines.iter().enumerate() {
+        for (j, rule) in pipeline.rules.iter().enumerate() {
             rule_problems(rule, &pipelines, |problem| {
-                found.push(format!("{place}: {problem}"))
+                found.push(format!("pipelines[{i}].rules[{j}]: {problem}"))
             });
         }
     }
@@ -1318,18 +1316,24 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 }
 
 /// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，一个国家
-/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时。启动、重载
-/// 和面板的校验都不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制
-/// 通道 `config` 结果的 `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
+/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时，没设
+/// bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），还有规则用到、
+/// 却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
+/// 不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制通道 `config` 结果的
+/// `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
 /// [`RETIRED_SETTINGS`]) and the background refresh rule, a geoip matcher written with no
-/// country code, which never matches, a cache so large it may take a lot of memory, and an
-/// overall timeout too short for the resend and the TCP fallback. Startup, reloads and the
-/// panel's validation refuse none of them, nor do they count among [`problems`]; they are
-/// found as the configuration compiles (see `RuntimePipelineConfig::warnings`), listed in the
-/// validation answer and as `warnings` in the control channel's `config` result, and each is
-/// logged as a warn every time the configuration takes effect. They used to be logged only, out
-/// of sight at the default log level, and validation said nothing of them
+/// country code, which never matches, a cache so large it may take a lot of memory, an overall
+/// timeout too short for the resend and the TCP fallback, upstreams written with a host name
+/// while bootstrap is unset (resolving comes back round should the system resolver be KixDNS
+/// itself, see `engine::bootstrap`), and Geo tags rules use with no data configured to read them
+/// from (which tags rules use is known once they compile, see [`geo_tags_without_data`]).
+/// Startup, reloads and the panel's validation refuse none of them, nor do they count among
+/// [`problems`]; they are found as the configuration compiles (see
+/// `RuntimePipelineConfig::warnings`), listed in the validation answer and as `warnings` in the
+/// control channel's `config` result, and each is logged as a warn every time the configuration
+/// takes effect. They used to be logged only, out of sight at the default log level, and
+/// validation said nothing of them
 pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     let mut found = Vec::new();
     if cfg.background_refresh_rule.is_some() {
@@ -1356,6 +1360,45 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
         found.push(format!(
             "settings.request_timeout_ms: {request_timeout} is under 2.5 times upstream_timeout_ms ({}), which may cut the resend and the TCP fallback short",
             settings.upstream_timeout_ms
+        ));
+    }
+    // 没设 bootstrap 时，写成主机名的上游交给系统的解析器解析（见 `engine::bootstrap`）。不写 upstream 的 forward 问的是
+    // 默认上游，按它自己的 transport 连 / Without bootstrap, upstreams written with a host name are
+    // resolved by the system resolver (see `engine::bootstrap`). A forward naming no upstream asks
+    // the default one, connected to by its own transport
+    let forwards = cfg
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| &pipeline.rules)
+        .flat_map(|rule| {
+            rule.actions
+                .iter()
+                .chain(&rule.response_actions_on_match)
+                .chain(&rule.response_actions_on_miss)
+        })
+        .filter_map(|action| match action {
+            Action::Forward {
+                upstream,
+                transport,
+                ..
+            } => Some((
+                upstream.as_deref().unwrap_or(&settings.default_upstream),
+                transport.unwrap_or(Transport::Udp),
+            )),
+            _ => None,
+        });
+    if !names_an_address(&settings.bootstrap)
+        && let Some(host) = std::iter::once((settings.default_upstream.as_str(), Transport::Udp))
+            .chain(forwards)
+            .flat_map(|(upstreams, transport)| {
+                split_upstreams(upstreams).map(move |upstream| (upstream, transport))
+            })
+            .find_map(|(upstream, transport)| {
+                crate::engine::upstream::host_name(upstream, transport)
+            })
+    {
+        found.push(format!(
+            "settings.bootstrap is unset, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
         ));
     }
     for (index, select) in cfg.pipeline_select.iter().enumerate() {
@@ -1386,6 +1429,51 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
 
 /// 一个国家代码也没写的 geoip 匹配器 / A geoip matcher written with no country code
 const NO_COUNTRY_CODE: &str = "a geoip matcher written with no country code never matches";
+
+/// 规则用到（`geosite`、`geoip` 是它们用到的标签）、却没配可读的数据的 Geo 标签，每种一条 [`warnings`]：没写
+/// `geosite_data_paths` 时的 GeoSite 标签，没写 `geoip_dat_path` 时 MMDB 也答不了的 GeoIP 标签（MMDB 只有两个字母的
+/// 国家代码）。配置照样加载，用它们的规则却从不按数据判断：geo_site 和 geoip_country 永远不命中，geo_site_not 永远命中。
+/// 以前只在读了数据文件、文件里没有某个标签时才记一条告警，一个数据文件都没配时什么都不说
+/// The Geo tags rules use (`geosite` and `geoip` being those they use) with no data
+/// configured to read them from, one of the [`warnings`] for each kind: GeoSite tags without
+/// `geosite_data_paths`, and without `geoip_dat_path` the GeoIP tags the MMDB cannot answer
+/// either (it holds two-letter country codes alone). The configuration loads all the same,
+/// yet rules using them never judge by any data: geo_site and geoip_country never match, and
+/// geo_site_not always does. A warning used to be logged only once a data file was read and
+/// lacked a tag, and with no data file configured nothing was said at all
+pub(crate) fn geo_tags_without_data(
+    settings: &GlobalSettings,
+    mut geosite: Vec<String>,
+    geoip: &[String],
+) -> Vec<String> {
+    let mut found = Vec::new();
+    geosite.sort_unstable();
+    geosite.dedup();
+    if settings.geosite_data_paths.is_empty() && !geosite.is_empty() {
+        found.push(format!(
+            "GeoSite tags {} have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does",
+            geosite.join(", ")
+        ));
+    }
+    let unanswered: Vec<&str> = geoip
+        .iter()
+        .map(String::as_str)
+        .filter(|tag| {
+            settings.geoip_db_path.is_none() || !crate::matcher::geoip::is_country_tag(tag)
+        })
+        .collect();
+    if settings.geoip_dat_path.is_none() && !unanswered.is_empty() {
+        let mmdb = match settings.geoip_db_path {
+            Some(_) => ", and settings.geoip_db_path answers two-letter country codes alone",
+            None => " and neither is settings.geoip_db_path",
+        };
+        found.push(format!(
+            "GeoIP tags {} have no data to match against: settings.geoip_dat_path is not set{mmdb}, so geoip_country never matches them",
+            unanswered.join(", ")
+        ));
+    }
+    found
+}
 
 /// 以前有、后来删掉的设置：老配置里留着的照样能读，各算一条 [`warnings`]（配置每生效一次列出来、记一条 warn），不算
 /// [`problems`]，升级以后不必先改配置。智能流控的五个数字在流控改为自己判断以后不再用；`prefetch` 随它的实现撤掉了；
@@ -1662,7 +1750,8 @@ fn rule_problems(
                 "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
             ));
         }
-        if let ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
+        if let ResponseMatcher::RequestDomainSuffix { value }
+        | ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
             && value.is_empty()
         {
             report(EMPTY_DOMAIN_MATCHER.to_string());
@@ -1808,6 +1897,40 @@ mod merged_forward_tests {
             .collect();
         list.sort();
         list
+    }
+
+    /// 不经 `parse_config`、直接拿一份 `PipelineConfig` 编译的配置，几个 forward 也合成一次转发、上游也先拆好：这些都在
+    /// 编译时算。以前只有 `parse_config` 算，公开的 `RuntimePipelineConfig::from_config` 拿到别处建的配置时不合并，
+    /// 规则只问第一个 forward 的上游
+    /// A configuration compiled from a `PipelineConfig` straight, not through `parse_config`, merges
+    /// its forwards and splits their upstreams too, both being worked out as it compiles. Only
+    /// `parse_config` used to, so the public `RuntimePipelineConfig::from_config` given a
+    /// configuration built elsewhere merged nothing, and the rule asked the first forward's
+    /// upstream alone
+    #[test]
+    fn a_configuration_compiled_without_parse_config_merges_its_forwards() {
+        let config: super::PipelineConfig = serde_json::from_value(json!({
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "any" }],
+                "actions": [
+                    { "type": "forward", "upstream": "1.1.1.1:53, 1.0.0.1:53" },
+                    { "type": "forward", "upstream": "8.8.8.8:53" }
+                ]
+            }] }]
+        }))
+        .expect("parse config");
+        let runtime = crate::matcher::RuntimePipelineConfig::from_config(config).expect("compiles");
+        let rule = &runtime.pipelines[0].rules[0];
+        let merged = rule
+            .merged_forward
+            .as_ref()
+            .expect("several forwards merge");
+        assert_eq!(merged.upstream_list.len(), 3);
+        assert!(matches!(
+            &rule.actions[0],
+            super::Action::Forward { pre_split_upstreams: Some(split), .. } if split.len() == 2
+        ));
     }
 
     /// 合并后的这一次转发只能发一个 ECS：几个 forward 的 ecs 写得一样时就是它；写得不一样（包括有的写、
@@ -2070,6 +2193,64 @@ mod validation_tests {
         super::problems(&super::parse_config(&config.to_string()).expect("parses"))
     }
 
+    /// 没设 bootstrap 时，写成主机名的 TCP、DoT、DoH、DoQ 上游算一条 warning：默认上游、请求和回答阶段的 forward 都算，
+    /// 不写 upstream 的 forward 按它的 transport 连默认上游。都写成 IP、只有 UDP 上游或者设了 bootstrap 时没有。以前只在
+    /// 第一次经系统解析时记一条 warn，默认日志级别看不到
+    /// Without bootstrap, a TCP, DoT, DoH or DoQ upstream written with a host name counts as a
+    /// warning: the default upstream and request- and answer-phase forwards alike, a forward naming
+    /// no upstream connecting to the default one by its transport. None with every upstream an IP,
+    /// with UDP upstreams only, or with bootstrap set. It used to be a warn logged the first time
+    /// the system resolved a name, out of sight at the default log level
+    #[test]
+    fn a_named_upstream_without_bootstrap_is_a_warning() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let warned = |settings: serde_json::Value, actions: serde_json::Value| {
+            let config = serde_json::json!({
+                "settings": settings,
+                "pipelines": [{ "id": "main", "rules": [rule("r", any.clone(), actions)] }]
+            });
+            super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
+                .iter()
+                .any(|warning| warning.starts_with("settings.bootstrap is unset"))
+        };
+        let udp = serde_json::json!({ "default_upstream": "1.1.1.1:53" });
+        let forward =
+            |upstream: &str| serde_json::json!([{ "type": "forward", "upstream": upstream }]);
+        for named in [
+            "tcp://dns.example:53",
+            "tls://dns.example",
+            "https://dns.example/dns-query",
+            "quic://dns.example?sni=dns.example",
+        ] {
+            assert!(warned(udp.clone(), forward(named)), "{named}");
+            assert!(
+                !warned(
+                    serde_json::json!({ "default_upstream": "1.1.1.1:53", "bootstrap": "223.5.5.5:53" }),
+                    forward(named)
+                ),
+                "{named} with bootstrap"
+            );
+        }
+        assert!(warned(
+            serde_json::json!({ "default_upstream": "tls://dns.example" }),
+            serde_json::json!([{ "type": "allow" }])
+        ));
+        assert!(warned(
+            serde_json::json!({ "default_upstream": "dns.example:53" }),
+            serde_json::json!([{ "type": "forward", "transport": "tcp" }])
+        ));
+        for ip in [
+            "1.1.1.1:53",
+            "tcp://1.1.1.1:53",
+            "tcp://[2606:4700::1111]:53",
+            "tls://1.1.1.1?sni=one.one.one.one",
+            "https://1.1.1.1/dns-query",
+            "https://[2606:4700::1111]/dns-query",
+        ] {
+            assert!(!warned(udp.clone(), forward(ip)), "{ip}");
+        }
+    }
+
     /// 白写的取反报出来：第一个匹配器上的 `not`，只有一个匹配器时规则级的 `not`，入口、请求和回答的匹配器都一样。第一个上
     /// 的 `or`、规则级的取反配几个匹配器（第一个起头，后面的取反）照常
     /// A negation written for nothing is raised: `not` on the first matcher, or a chain-level
@@ -2098,7 +2279,7 @@ mod validation_tests {
             { "type": "domain_suffix", "value": "cn" },
             { "type": "domain_suffix", "value": "com" },
         ]);
-        let rule = "pipeline \"main\" rule \"r\": ";
+        let rule = "pipelines[0].rules[0]: ";
         let raised = |what: &str, matchers: &str| {
             format!(
                 "{what} on the first of {matchers} has nothing before it and does not negate it; to match what it does not, put {{\"type\": \"any\"}} first"
@@ -2109,7 +2290,7 @@ mod validation_tests {
             assert_eq!(
                 problems_of(config(matchers.clone(), operator)),
                 [
-                    format!("pipeline_select 1: {}", raised("and_not", "matchers")),
+                    format!("pipeline_select[0]: {}", raised("and_not", "matchers")),
                     format!("{rule}{}", raised("and_not", "matchers")),
                     answer.clone(),
                 ],
@@ -2147,8 +2328,8 @@ mod validation_tests {
         assert_eq!(
             problems_of(rule("SERVFAILL", "WARN")),
             [
-                "pipeline \"main\" rule \"r\": response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
-                "pipeline \"main\" rule \"r\": log level \"WARN\" is none of trace, debug, info, warn, error",
+                "pipelines[0].rules[0]: response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
+                "pipelines[0].rules[0]: log level \"WARN\" is none of trace, debug, info, warn, error",
             ]
         );
         for (rcode, level) in [("OTHER", "warn"), ("other", "debug"), ("servfail", "error")] {
@@ -2298,10 +2479,16 @@ mod validation_tests {
             ]}]
         });
         let found = problems_of(config);
-        for place in ["pipeline_select 1", "rule \"exact\"", "rule \"late\""] {
+        for place in [
+            "pipeline_select[0]",
+            "pipelines[0].rules[0]",
+            "pipelines[0].rules[1]",
+        ] {
             assert!(
-                found.iter().any(|problem| problem.contains(place)
-                    && problem.contains("empty domain_exact matches only the root name")),
+                found
+                    .iter()
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("empty domain_exact matches only the root name")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2373,11 +2560,16 @@ mod validation_tests {
             ]}]
         });
         let found = problems_of(config);
-        for place in ["default_upstream", "rule \"empty\"", "rule \"commas\""] {
+        for place in [
+            "settings.default_upstream",
+            "pipelines[0].rules[0]",
+            "pipelines[0].rules[1]",
+        ] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("no upstream")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2486,18 +2678,17 @@ mod validation_tests {
                 "response_actions_on_miss": [forward("")]
             }
         ])));
-        for place in ["rule \"all empty\"", "rule \"answer\""] {
+        for place in ["pipelines[0].rules[0]", "pipelines[0].rules[1]"] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains("no upstream")),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains("no upstream")),
                 "missing {place} in {found:#?}"
             );
         }
     }
 
-    /// 会悄悄做成别的事的写法，每一种都报出来，带上在哪条规则
-    /// Every way of writing that silently does something else is named, with where it is
     /// 一条规则里几个 forward 的 ecs 写得不一样时（包括有的写、有的不写），是一条配置问题：写明规则，说清怎么改。
     /// 写得一样、都不写、只有一个 forward 时不算
     /// A rule whose forwards write different ecs (some written and some not, too) is a
@@ -2530,10 +2721,10 @@ mod validation_tests {
         });
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:?}");
-        for place in ["mixed", "half"] {
+        for place in ["pipelines[0].rules[0]", "pipelines[0].rules[1]"] {
             assert!(
                 found.iter().any(|problem| {
-                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                    problem.starts_with(&format!("{place}: "))
                         && problem.contains("ecs settings differ")
                         && problem.contains("separate rules")
                 }),
@@ -2542,28 +2733,70 @@ mod validation_tests {
         }
     }
 
-    /// 读配置时就拦下写错的 CIDR：响应规则的 response_upstream_ip、response_answer_ip 两种都是
-    /// A CIDR written wrong is refused as the configuration is read, in both
-    /// response_upstream_ip and response_answer_ip
+    /// 写错的网段拒掉，报出写的是什么、在哪：规则的 client_ip、response_upstream_ip、response_answer_ip，以及
+    /// pipeline_select 的 client_ip。以前只说「invalid IP address syntax」，规则一多就不知道是哪一条的哪一项
+    /// A mistyped network is refused naming what was written and where: a rule's client_ip,
+    /// response_upstream_ip and response_answer_ip, and pipeline_select's client_ip. It used to
+    /// say only "invalid IP address syntax", leaving which item of which rule to guess
     #[test]
-    fn a_bad_response_cidr_is_refused_as_the_configuration_is_read() {
-        for kind in ["response_upstream_ip", "response_answer_ip"] {
-            let config = serde_json::json!({
-                "settings": { "default_upstream": "1.1.1.1:53" },
-                "pipelines": [{ "id": "main", "rules": [{
-                    "name": "r",
-                    "matchers": [{ "type": "any" }],
-                    "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
-                    "response_matchers": [{ "type": kind, "cidr": "10.0.0.0/8, nonsense" }],
-                    "response_actions_on_match": [{ "type": "allow" }]
-                }] }]
-            });
-            assert!(super::parse_config(&config.to_string()).is_err(), "{kind}");
+    fn a_mistyped_network_is_refused_naming_it_and_its_place() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let config =
+            |select: serde_json::Value, matchers: serde_json::Value, answer: serde_json::Value| {
+                serde_json::json!({
+                    "settings": { "default_upstream": "1.1.1.1:53" },
+                    "pipeline_select": [{ "pipeline": "main", "matchers": select }],
+                    "pipelines": [{ "id": "main", "rules": [
+                        rule("first", any.clone(), serde_json::json!([{ "type": "allow" }])),
+                        {
+                            "name": "r",
+                            "matchers": matchers,
+                            "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
+                            "response_matchers": answer,
+                            "response_actions_on_match": [{ "type": "allow" }]
+                        }
+                    ] }]
+                })
+            };
+        let client = |cidr: &str| serde_json::json!([{ "type": "client_ip", "cidr": cidr }]);
+        let answer =
+            |kind: &str| serde_json::json!([{ "type": kind, "cidr": "10.0.0.0/8, nonsense" }]);
+        let no_answer = serde_json::json!([]);
+        for (config, place, written) in [
+            (
+                config(any.clone(), client("10.0.0.0/33"), no_answer.clone()),
+                "pipelines[0].rules[1].matchers[0]",
+                "10.0.0.0/33",
+            ),
+            (
+                config(any.clone(), any.clone(), answer("response_upstream_ip")),
+                "pipelines[0].rules[1].response_matchers[0]",
+                "nonsense",
+            ),
+            (
+                config(any.clone(), any.clone(), answer("response_answer_ip")),
+                "pipelines[0].rules[1].response_matchers[0]",
+                "nonsense",
+            ),
+            (
+                config(client("nonsense"), any.clone(), no_answer.clone()),
+                "pipeline_select[0].matchers[0]",
+                "nonsense",
+            ),
+        ] {
+            let error = format!(
+                "{:#}",
+                super::validate(&config.to_string()).expect_err("refused")
+            );
+            assert!(
+                error.contains(&format!("{place}: \"{written}\" is not an IP network")),
+                "{error}"
+            );
         }
     }
 
-    /// 默认上游写了几个时，读配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
-    /// Several default upstreams are split as the configuration is read (each trimmed,
+    /// 默认上游写了几个时，编译配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
+    /// Several default upstreams are split as the configuration compiles (each trimmed,
     /// empty ones skipped); a single one is not
     #[test]
     fn several_default_upstreams_are_split_ahead() {
@@ -2572,8 +2805,8 @@ mod validation_tests {
                 "settings": { "default_upstream": default_upstream },
                 "pipelines": [{ "id": "main", "rules": [] }]
             });
-            super::parse_config(&config.to_string())
-                .expect("parses")
+            super::compile(super::parse_config(&config.to_string()).expect("parses"))
+                .expect("compiles")
                 .settings
                 .default_upstream_pre_split
                 .map(|list| {
@@ -2719,11 +2952,20 @@ mod validation_tests {
         }
     }
 
+    /// 会悄悄做成别的事的写法，每一种都报出来，按位置说在哪，和读不懂的键一样：`settings.` 下的设置、
+    /// `pipeline_select[i]`、`pipelines[i].rules[j]`。规则名可以重复，以前按名字说在哪，重名时分不清是哪一条。不以 `/`
+    /// 开头的 doh_path（DoH 对每个请求都回 404）以前不算问题，空的 request_domain_suffix 以前让整份配置读不进来
+    /// Every way of writing that silently does something else is named with its place, a path
+    /// as for the keys not read: a setting under `settings.`, `pipeline_select[i]`,
+    /// `pipelines[i].rules[j]`. Rule names may repeat, and the name a rule used to be raised by
+    /// could not tell which it was. A doh_path not starting with `/` (DoH answering every query
+    /// with 404) used to be no problem, and an empty request_domain_suffix used to keep the whole
+    /// configuration from being read
     #[test]
     fn problems_name_what_would_silently_do_something_else() {
         let any = serde_json::json!([{ "type": "any" }]);
         let config = serde_json::json!({
-            "settings": { "default_upstream": "dns.example:53", "bootstrap": "223.5.5.5:53, dns.google:53" },
+            "settings": { "default_upstream": "dns.example:53", "bootstrap": "223.5.5.5:53, dns.google:53", "doh_path": "dns-query" },
             "pipeline_select": [{ "pipeline": "gone", "matchers": [{ "type": "domain_suffix", "value": "" }] }],
             "pipelines": [{ "id": "main", "rules": [
                 rule("port", any.clone(), serde_json::json!([{ "type": "forward", "upstream": "1.1.1.1:99999" }])),
@@ -2742,40 +2984,49 @@ mod validation_tests {
                     "name": "late",
                     "matchers": any,
                     "actions": [{ "type": "forward", "upstream": "1.1.1.1:53" }],
-                    "response_matchers": [{ "type": "request_domain_regex", "value": "" }],
+                    "response_matchers": [
+                        { "type": "request_domain_regex", "value": "" },
+                        { "type": "request_domain_suffix", "value": "" }
+                    ],
                     "response_actions_on_miss": [{ "type": "forward", "upstream": "udp+tcp://dns.example:53" }]
                 }
             ]}]
         });
         let found = problems_of(config);
         for (place, fragment) in [
-            ("default_upstream", "dns.example:53"),
-            ("bootstrap", "dns.google:53"),
-            ("pipeline_select 1", "no pipeline \"gone\""),
-            ("pipeline_select 1", "empty domain matcher"),
-            ("rule \"port\"", "1.1.1.1:99999"),
-            ("rule \"name\"", "nonsense"),
-            ("rule \"scheme\"", "unknown prefix \"http://\""),
-            ("rule \"doq\"", "sni"),
-            ("rule \"rcode\"", "WHATEVER"),
-            ("rule \"ip\"", "192.0.2.1, nope"),
-            ("rule \"noip\"", "ip \"\""),
-            ("rule \"cname\"", "cname target"),
-            ("rule \"txt\"", "256 bytes"),
-            ("rule \"jump\"", "\"gone\", which does not exist"),
-            ("rule \"suffix\"", "empty domain matcher"),
-            ("rule \"regex\"", "empty domain matcher"),
-            ("rule \"late\"", "empty domain matcher"),
-            ("rule \"late\"", "udp+tcp://dns.example:53"),
+            ("settings.default_upstream", "dns.example:53"),
+            ("settings.bootstrap", "dns.google:53"),
+            (
+                "settings.doh_path",
+                "\"dns-query\" does not start with \"/\"",
+            ),
+            ("pipeline_select[0]", "no pipeline \"gone\""),
+            ("pipeline_select[0]", "empty domain matcher"),
+            ("pipelines[0].rules[0]", "1.1.1.1:99999"),
+            ("pipelines[0].rules[1]", "nonsense"),
+            ("pipelines[0].rules[2]", "unknown prefix \"http://\""),
+            ("pipelines[0].rules[3]", "sni"),
+            ("pipelines[0].rules[4]", "WHATEVER"),
+            ("pipelines[0].rules[5]", "192.0.2.1, nope"),
+            ("pipelines[0].rules[6]", "ip \"\""),
+            ("pipelines[0].rules[7]", "cname target"),
+            ("pipelines[0].rules[8]", "256 bytes"),
+            ("pipelines[0].rules[9]", "\"gone\", which does not exist"),
+            ("pipelines[0].rules[10]", "empty domain matcher"),
+            ("pipelines[0].rules[11]", "empty domain matcher"),
+            ("pipelines[0].rules[12]", "empty domain matcher"),
+            ("pipelines[0].rules[12]", "udp+tcp://dns.example:53"),
         ] {
             assert!(
                 found
                     .iter()
-                    .any(|problem| problem.contains(place) && problem.contains(fragment)),
+                    .any(|problem| problem.starts_with(&format!("{place}: "))
+                        && problem.contains(fragment)),
                 "missing {place} / {fragment} in {found:#?}"
             );
         }
-        assert_eq!(found.len(), 18, "{found:#?}");
+        // 第 12 条的两个空匹配器各报一次 / The two empty matchers of rule 12 are raised once each
+        assert_eq!(found.len(), 20, "{found:#?}");
     }
 
     /// 平常的正确写法一条都不报 / The ordinary right ways of writing raise nothing
@@ -2827,11 +3078,13 @@ mod validation_tests {
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:#?}");
         assert!(
-            found[0].starts_with("pipeline \"main\": ") && found[0].contains("3 pipelines"),
+            found[0].starts_with("pipelines[0]: ")
+                && found[0].contains("3 pipelines are written with the id \"main\""),
             "{found:#?}"
         );
         assert!(
-            found[1].starts_with("pipeline \"other\": ") && found[1].contains("2 pipelines"),
+            found[1].starts_with("pipelines[1]: ")
+                && found[1].contains("2 pipelines are written with the id \"other\""),
             "{found:#?}"
         );
     }
@@ -2857,10 +3110,13 @@ mod validation_tests {
         });
         let found = problems_of(config);
         assert_eq!(found.len(), 2, "{found:#?}");
-        for (place, ip) in [("wrong", "203.0.113.300"), ("late", "somewhere")] {
+        for (place, ip) in [
+            ("pipelines[0].rules[0]", "203.0.113.300"),
+            ("pipelines[0].rules[3]", "somewhere"),
+        ] {
             assert!(
                 found.iter().any(|problem| {
-                    problem.starts_with(&format!("pipeline \"main\" rule \"{place}\": "))
+                    problem.starts_with(&format!("{place}: "))
                         && problem.contains(&format!("ecs ip \"{ip}\""))
                 }),
                 "missing {place} in {found:#?}"
