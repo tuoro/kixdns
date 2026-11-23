@@ -7698,11 +7698,11 @@ mod jump_response_cache_tests {
         assert_eq!(upstream.queries(), 1);
     }
 
-    /// 按「谁在问」判断的四种请求匹配会让 pipeline 带上标记，按问题本身判断的不会
-    /// The four request matchers that look at who is asking flag the pipeline, and
-    /// those that look at the question do not
+    /// 按「谁在问」判断的四种请求匹配让 pipeline 的规则决策按请求方区分，按问题本身判断的不会
+    /// The four request matchers that look at who is asking make the pipeline's rule decisions
+    /// tell requesters apart, and those that look at the question do not
     #[test]
-    fn pipelines_that_match_on_the_requester_are_flagged() {
+    fn pipelines_that_match_on_the_requester_tell_requesters_apart() {
         let forward = |ecs: serde_json::Value| {
             serde_json::json!({
                 "name": "fwd",
@@ -7743,7 +7743,8 @@ mod jump_response_cache_tests {
             .expect("parse config");
             let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
             assert_eq!(
-                runtime.pipelines[0].depends_on_requester, requester,
+                !runtime.pipelines[0].rule_requester.tests().is_empty(),
+                requester,
                 "{pipeline}"
             );
         }
@@ -7787,7 +7788,11 @@ mod jump_response_cache_tests {
             .expect("parse config");
             let runtime = RuntimePipelineConfig::from_config(config).expect("runtime config");
             let pipeline = &runtime.pipelines[0];
-            assert_eq!(pipeline.depends_on_requester, requester, "{matcher}");
+            assert_eq!(
+                !pipeline.rule_requester.tests().is_empty(),
+                requester,
+                "{matcher}"
+            );
         }
     }
 }

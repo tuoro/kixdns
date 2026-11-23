@@ -237,7 +237,9 @@ impl RuleReads {
         };
         let mut answer_edns = false;
         for rule in rules {
-            for m in &rule.matchers {
+            let (response_matchers, on_match, on_miss) =
+                ResponsePhase::parts(rule.response_phase.as_deref());
+            for m in rule.matchers.iter() {
                 if matches!(
                     m.matcher,
                     RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
@@ -245,7 +247,7 @@ impl RuleReads {
                     reads.geo.site = true;
                 }
             }
-            for m in &rule.response_matchers {
+            for m in response_matchers {
                 match m.matcher {
                     RuntimeResponseMatcher::ResponseRequestDomainGeoSite { .. }
                     | RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { .. } => {
@@ -257,7 +259,7 @@ impl RuleReads {
                     _ => {}
                 }
             }
-            for m in &rule.matchers {
+            for m in rule.matchers.iter() {
                 let test = match &m.matcher {
                     RuntimeMatcher::ClientIp { net } => RequesterTest::InNet(*net),
                     RuntimeMatcher::GeoipPrivate { .. } => RequesterTest::Private,
@@ -269,7 +271,7 @@ impl RuleReads {
                 };
                 reads.request_matchers.add(test);
             }
-            answer_edns |= rule.response_matchers.iter().any(|m| {
+            answer_edns |= response_matchers.iter().any(|m| {
                 matches!(
                     m.matcher,
                     RuntimeResponseMatcher::ResponseEdnsPresent { .. }
@@ -282,12 +284,7 @@ impl RuleReads {
             // the rule's own used to count, so of two clients in different networks asking at once
             // the later merged into the earlier's entry and got the answer fetched for the
             // earlier's network
-            for action in rule
-                .actions
-                .iter()
-                .chain(&rule.response_actions_on_match)
-                .chain(&rule.response_actions_on_miss)
-            {
+            for action in rule.all_actions() {
                 if let Action::Forward {
                     ecs:
                         Some(config::EcsMode::FromClientIp {
@@ -303,21 +300,15 @@ impl RuleReads {
                     });
                 }
             }
-            reads.continues |= rule
-                .response_actions_on_match
+            reads.continues |= on_match
                 .iter()
-                .chain(&rule.response_actions_on_miss)
+                .chain(on_miss)
                 .any(|action| matches!(action, Action::Continue));
             let jump_target = |action: &Action| match action {
                 Action::JumpToPipeline { pipeline } => Some(Arc::<str>::from(pipeline.as_str())),
                 _ => None,
             };
-            for target in rule
-                .response_actions_on_match
-                .iter()
-                .chain(&rule.response_actions_on_miss)
-                .filter_map(jump_target)
-            {
+            for target in on_match.iter().chain(on_miss).filter_map(jump_target) {
                 reads.response_jumps.push(target.clone());
                 reads.jumps.push(target);
             }

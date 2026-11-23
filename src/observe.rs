@@ -619,6 +619,24 @@ pub struct ConfigLoaded<'a> {
     /// such as settings no longer in effect (see [`crate::config::warnings`]).
     /// 这份配置照样加载、值得知道的写法，比如不再起作用的设置（见 [`crate::config::warnings`]）。
     pub warnings: &'a [String],
+    /// The pipelines of this configuration, by id as
+    /// [`EngineObserver::pipeline_selected`] names them: `default` alone for one
+    /// with no pipelines. With [`Self::rules`] and [`Self::upstreams`] it lets an
+    /// observer that keeps something per pipeline, rule or upstream drop what the
+    /// configuration no longer has, and keep the rest, however long it went unused.
+    /// 这份配置的 pipeline，按 [`EngineObserver::pipeline_selected`] 报的 id：没有 pipeline
+    /// 的配置只有一个 `default`。按 pipeline、规则或上游记东西的观察者，凭它和 [`Self::rules`]、
+    /// [`Self::upstreams`] 去掉配置里已经没有的，其余的不管多久没用到都留着。
+    pub pipelines: &'a [&'a str],
+    /// The rules of this configuration, each as its pipeline's id and its name, as
+    /// [`RuleMatched`] names them.
+    /// 这份配置的规则，各是所在 pipeline 的 id 和规则名，和 [`RuleMatched`] 报的一样。
+    pub rules: &'a [(&'a str, &'a str)],
+    /// The upstreams this configuration may forward to, each once, as
+    /// [`UpstreamAttempt`] names them: the address without its transport prefix
+    /// and the transport it is asked over.
+    /// 这份配置可能转发到的上游，各一次，和 [`UpstreamAttempt`] 报的一样：去掉传输前缀的地址和问它用的传输。
+    pub upstreams: &'a [(&'a str, Transport)],
 }
 
 /// A hot reload failed and the previous configuration remains active.
@@ -1000,6 +1018,9 @@ mod tests {
                 source: Some("{}"),
                 restart_pending: &[],
                 warnings: &[],
+                pipelines: &[],
+                rules: &[],
+                upstreams: &[],
             });
             observer.config_reload_failed(&ConfigReloadFailed {
                 path: Path::new("config/pipeline.json"),
