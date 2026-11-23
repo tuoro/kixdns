@@ -123,12 +123,12 @@ struct ActiveConfig {
     /// Settings the current configuration changes that take a restart to apply (see
     /// `ConfigLoaded::restart_pending`)
     restart_pending: Vec<String>,
-    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载，只记一条 warn，
-    /// 而默认日志级别是 error，所以经控制通道报出来；重载成功说明新配置没有这样的写法，就清空
+    /// 启动时读的配置里、重载和面板保存会拒绝的写法（见 `config::problems`）。启动时照旧加载、各记一条 error，
+    /// 也经控制通道报出来，面板不用翻日志；重载成功说明新配置没有这样的写法，就清空
     /// What the configuration read at startup writes that a reload or a save from the panel
-    /// refuses (see `config::problems`). Startup loads it as before with only a warning, the
-    /// default log level being error, so they are reported over the control channel; a
-    /// successful reload means the new configuration has none, and they are cleared
+    /// refuses (see `config::problems`). Startup loads it as before and logs an error for each,
+    /// and they are reported over the control channel too, so the panel need not search the
+    /// log; a successful reload means the new configuration has none, and they are cleared
     problems: Vec<String>,
     /// 配置文件为什么监视不了（见 `watcher::ConfigWatch`），监视着时为 None。监视不了时文件改了不会重载，面板保存的配置
     /// 也不生效，等不到重载序号变
