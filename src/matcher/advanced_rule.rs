@@ -285,7 +285,7 @@ pub(crate) fn fast_static_match_with_rule<'a>(
     // 候选按规则顺序排好（见 `RuleIndex::get_candidates_into`）/ Candidates come in rule order (see
     // `RuleIndex::get_candidates_into`)
     for idx in candidates.into_iter().take_while(|&idx| idx <= last) {
-        let rule = pipeline.rules.get(idx)?;
+        let rule = &pipeline.rules[idx];
         // GeoSite matching can scan a whole tag for a name it has not seen, and
         // the fast path runs before a request is admitted, so a rule that needs
         // it is left to the full rule path, which also keeps the rule order.

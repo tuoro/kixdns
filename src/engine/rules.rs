@@ -100,9 +100,9 @@ pub enum ResponseActionResult {
         ttl: Option<u32>,
         source: &'static str,
     },
-    /// 跳到 `pipeline` 接着走规则；次数由跳过去的一方数（见 `handle_packet_internal`），这里只看还剩没剩
+    /// 跳到 `pipeline` 接着走规则；次数由跳过去的一方数（见 `Route::response_jumped`），这里只看还剩没剩
     /// Jump to `pipeline` and go on with its rules; the side making the jump counts it (see
-    /// `handle_packet_internal`), and this only checks whether any are left
+    /// `Route::response_jumped`), and this only checks whether any are left
     Jump {
         pipeline: Arc<str>,
     },
@@ -165,11 +165,13 @@ pub struct RuleCacheRecord {
     pub decided_by_rule: bool,
 }
 
-/// 规则缓存里的决策最多用这么久，不论决策本身的 TTL：键不随 GeoIP/GeoSite 数据更新而变，靠它限制
-/// 按旧数据做的决策还能用多久
-/// The longest a rule cache decision serves, whatever its own TTL: the key does not
-/// change when GeoIP/GeoSite data updates, so this bounds how long a decision made on
-/// the old data goes on serving
+/// 规则缓存里的决策最多用这么久，不论决策本身的 TTL。键已经跟着配置和 Geo 数据走（命名空间见
+/// `EngineInner::at_geo`，请求方的判定见 `RequesterScope`），这个上限让一条决策过一阵就重新求值，只问过一次的
+/// 名字占着的地方也由清扫收回
+/// The longest a rule cache decision serves, whatever its own TTL. The keys already follow
+/// the configuration and the Geo data (the namespaces see `EngineInner::at_geo`, the
+/// judgement of the requester `RequesterScope`); this bound has a decision evaluated again
+/// after a while, and the room a name asked once takes is reclaimed by the sweep
 pub(crate) const RULE_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// 每条记录计重 1；`expires_at` 已经含了 `RULE_CACHE_MAX_AGE`，按它判断过期

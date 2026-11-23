@@ -33,10 +33,10 @@ pub enum ForwardResult {
     /// entry, SERVFAIL, or what the miss actions produced. For a client it is an
     /// answer like any other. For a background refresh it is no new answer from
     /// the route the entry came by, so the refresh does not drop that entry for it
-    /// (see the Success arm in `handle_packet_internal`).
+    /// (see the Success arm in `Engine::decide`).
     /// 上游失败，这是请求改用的应答：过期条目、SERVFAIL，或 on_miss 动作给出的结果。对客户端
     /// 来说它和别的应答一样。对后台刷新来说，它不是条目来路上的新应答，刷新不会因为它删掉
-    /// 那个条目（见 `handle_packet_internal` 里的 Success 分支）。
+    /// 那个条目（见 `Engine::decide` 里的 Success 分支）。
     Fallback(Bytes),
     /// Request needs to continue (e.g. Action::Continue)
     /// Boxed to reduce enum size (ResponseContext is ~256 bytes)
