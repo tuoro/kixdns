@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::{DNSClass, RecordType};
-use ipnet::IpNet;
-use regex::Regex;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -12,8 +10,10 @@ use crate::config::{Action, MatchOperator};
 use crate::engine::utils::parse_rcode;
 use crate::engine::{Decision, make_static_cname_answer, make_static_ip_answer, static_ips};
 use crate::matcher::geoip::GeoIpManager;
-use crate::matcher::{RuntimeMatcher, RuntimePipeline, RuntimePipelineConfig, RuntimeRule};
-use crate::matcher::{domain_suffix_index_key, domain_suffix_matches, eval_match_chain};
+use crate::matcher::{
+    RuntimeMatcher, RuntimeMatcherWithOp, RuntimePipeline, RuntimePipelineConfig, RuntimeRule,
+};
+use crate::matcher::{domain_suffix_index_key, eval_match_chain};
 use parking_lot::RwLock;
 
 #[derive(Debug, Clone)]
@@ -25,53 +25,22 @@ pub struct CompiledPipeline {
 
 #[derive(Debug, Clone)]
 pub struct CompiledRule {
-    #[allow(dead_code)]
-    pub rule_idx: usize,
     /// Rule name from the configuration, reported to observers on fast-path matches.
     /// 配置中的规则名，快速路径命中时上报给观察者。
     pub rule_name: Arc<str>,
-    #[allow(dead_code)]
-    pub matcher_operator: MatchOperator,
-    pub matchers: Vec<CompiledMatcherWithOp>,
+    /// 规则的匹配器，和完整规则路径用的是同一份、同一个判断（`RuntimeMatcher::matches_with_qtype`），两条路径对规则
+    /// 是否命中从不分歧。以前快速路径另有一份 `CompiledMatcher`，把每种匹配器重写了一遍
+    /// The rule's matchers, the same ones the full rule path uses, judged the same way
+    /// (`RuntimeMatcher::matches_with_qtype`), so the two paths never disagree on whether a rule
+    /// matches. The fast path used to keep a `CompiledMatcher` of its own, every kind of
+    /// matcher written out again
+    pub matchers: Vec<RuntimeMatcherWithOp>,
     pub precomputed: Option<PrecomputedAction>,
     /// Whether a matcher needs GeoSite data, which the fast path leaves to the
     /// full rule path (see `fast_static_match_with_rule`).
     /// 是否有匹配器要用 GeoSite 数据；快速路径把这样的规则留给完整规则路径
     /// （见 `fast_static_match_with_rule`）。
     pub needs_geosite: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompiledMatcherWithOp {
-    pub operator: MatchOperator,
-    pub matcher: CompiledMatcher,
-}
-
-#[derive(Debug, Clone)]
-pub enum CompiledMatcher {
-    #[allow(dead_code)]
-    DomainExact {
-        domain: Arc<str>,
-    },
-    DomainSuffix {
-        suffix: Arc<str>,
-    },
-    ClientIp {
-        net: IpNet,
-    },
-    #[allow(dead_code)]
-    QueryType {
-        qtype: RecordType,
-    },
-    Qclass {
-        qclass: DNSClass,
-    },
-    Regex {
-        regex: Regex,
-    },
-    Complex {
-        matcher: RuntimeMatcher,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -139,26 +108,26 @@ impl RuleIndex {
         let mut indexed = false;
         for m in &rule.matchers {
             match &m.matcher {
-                CompiledMatcher::DomainExact { domain } if !domain.is_empty() => {
+                RuntimeMatcher::DomainExact { value } if !value.is_empty() => {
                     self.domain_exact
-                        .entry(domain.clone())
+                        .entry(value.clone())
                         .or_default()
                         .push(rule_idx);
                     indexed = true;
                     break;
                 }
-                CompiledMatcher::DomainSuffix { suffix }
-                    if !domain_suffix_index_key(suffix).is_empty() =>
+                RuntimeMatcher::DomainSuffix { value }
+                    if !domain_suffix_index_key(value.as_ref()).is_empty() =>
                 {
                     self.domain_suffix
-                        .entry(Arc::from(domain_suffix_index_key(suffix)))
+                        .entry(Arc::from(domain_suffix_index_key(value.as_ref())))
                         .or_default()
                         .push(rule_idx);
                     indexed = true;
                     break;
                 }
-                CompiledMatcher::QueryType { qtype } => {
-                    self.query_type.entry(*qtype).or_default().push(rule_idx);
+                RuntimeMatcher::Qtype { value } => {
+                    self.query_type.entry(*value).or_default().push(rule_idx);
                     indexed = true;
                     break;
                 }
@@ -221,7 +190,7 @@ fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
     let mut index = RuleIndex::new();
 
     for (idx, rule) in p.rules.iter().enumerate() {
-        let compiled = compile_rule(rule, idx);
+        let compiled = compile_rule(rule);
         index.add_rule(idx, &compiled);
         rules.push(compiled);
     }
@@ -233,67 +202,17 @@ fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
     }
 }
 
-fn compile_rule(rule: &RuntimeRule, rule_idx: usize) -> CompiledRule {
-    let matchers = rule
-        .matchers
-        .iter()
-        .map(|m| CompiledMatcherWithOp {
-            operator: m.operator,
-            matcher: compile_matcher(&m.matcher),
-        })
-        .collect();
-
-    let precomputed = precompute_action(rule);
-
+fn compile_rule(rule: &RuntimeRule) -> CompiledRule {
     CompiledRule {
-        rule_idx,
         rule_name: rule.name.clone(),
-        matcher_operator: rule.matcher_operator,
-        matchers,
-        precomputed,
+        matchers: rule.matchers.clone(),
+        precomputed: precompute_action(rule),
         needs_geosite: rule.matchers.iter().any(|m| {
             matches!(
                 m.matcher,
                 RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
             )
         }),
-    }
-}
-
-fn compile_matcher(m: &RuntimeMatcher) -> CompiledMatcher {
-    match m {
-        RuntimeMatcher::Any => CompiledMatcher::DomainSuffix {
-            suffix: Arc::from(""),
-        },
-        RuntimeMatcher::DomainExact { value } => CompiledMatcher::DomainExact {
-            domain: value.clone(),
-        },
-        RuntimeMatcher::DomainSuffix { value } => CompiledMatcher::DomainSuffix {
-            suffix: value.clone(),
-        },
-        RuntimeMatcher::ClientIp { net } => CompiledMatcher::ClientIp { net: *net },
-        RuntimeMatcher::DomainRegex { regex } => CompiledMatcher::Regex {
-            regex: regex.clone(),
-        },
-        RuntimeMatcher::GeoipCountry { country_codes } => CompiledMatcher::Complex {
-            matcher: RuntimeMatcher::GeoipCountry {
-                country_codes: country_codes.clone(),
-            },
-        },
-        RuntimeMatcher::GeoipPrivate { expect } => CompiledMatcher::Complex {
-            matcher: RuntimeMatcher::GeoipPrivate { expect: *expect },
-        },
-        RuntimeMatcher::Qclass { value } => CompiledMatcher::Qclass { qclass: *value },
-        RuntimeMatcher::EdnsPresent { expect } => CompiledMatcher::Complex {
-            matcher: RuntimeMatcher::EdnsPresent { expect: *expect },
-        },
-        RuntimeMatcher::GeoSite { tag } => CompiledMatcher::Complex {
-            matcher: RuntimeMatcher::GeoSite { tag: tag.clone() },
-        },
-        RuntimeMatcher::GeoSiteNot { tag } => CompiledMatcher::Complex {
-            matcher: RuntimeMatcher::GeoSiteNot { tag: tag.clone() },
-        },
-        RuntimeMatcher::Qtype { value } => CompiledMatcher::QueryType { qtype: *value },
     }
 }
 
@@ -364,18 +283,21 @@ pub(crate) fn fast_static_match_with_rule<'a>(
         if rule.needs_geosite {
             return None;
         }
+        // GeoIP 和完整规则路径一样求值；GeoSite 走不到这里（见 `CompiledRule::needs_geosite`）
+        // GeoIP is evaluated as on the full rule path; GeoSite never gets here (see
+        // `CompiledRule::needs_geosite`)
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
             |m| {
-                compiled_matcher_matches(
-                    &m.matcher,
+                m.matcher.matches_with_qtype(
                     qname,
-                    qtype,
                     qclass,
                     client_ip,
                     edns_present,
+                    qtype,
                     geoip,
+                    None,
                 )
             },
         );
@@ -395,31 +317,4 @@ pub(crate) fn fast_static_match_with_rule<'a>(
         }
     }
     None
-}
-
-fn compiled_matcher_matches(
-    matcher: &CompiledMatcher,
-    qname: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
-    client_ip: IpAddr,
-    edns_present: bool,
-    geoip: Option<&Arc<RwLock<GeoIpManager>>>,
-) -> bool {
-    match matcher {
-        CompiledMatcher::DomainExact { domain } => qname.eq_ignore_ascii_case(domain),
-        CompiledMatcher::DomainSuffix { suffix } => domain_suffix_matches(qname, suffix),
-        CompiledMatcher::ClientIp { net } => net.contains(&client_ip),
-        CompiledMatcher::QueryType { qtype: rt } => *rt == qtype,
-        CompiledMatcher::Qclass { qclass: cls } => *cls == qclass,
-        CompiledMatcher::Regex { regex } => regex.is_match(qname),
-        // Evaluated as on the full rule path, GeoIP included, so the two paths
-        // never disagree on whether a rule matches. GeoSite never reaches here
-        // (see `CompiledRule::needs_geosite`).
-        // 与完整规则路径一样求值，包括 GeoIP，两条路径对规则是否命中从不分歧。GeoSite
-        // 不会走到这里（见 `CompiledRule::needs_geosite`）。
-        CompiledMatcher::Complex { matcher } => {
-            matcher.matches_with_qtype(qname, qclass, client_ip, edns_present, qtype, geoip, None)
-        }
-    }
 }
