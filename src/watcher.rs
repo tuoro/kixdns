@@ -73,27 +73,6 @@ impl ConfigWatch {
     }
 }
 
-/// Watch the given files and invoke `on_change` whenever any of them is created
-/// or its data modified (see [`Targets`] for how each file is watched).
-///
-/// Blocking — pumps events until the internal channel closes; run it on a
-/// dedicated thread. Used for both config hot-reload and DoH TLS certificate
-/// reload; the reload action itself belongs to the `on_change` callback.
-pub(crate) fn run_files_watcher(
-    paths: &[PathBuf],
-    mut on_change: impl FnMut(),
-) -> notify::Result<()> {
-    let (tx, rx) = mpsc::channel();
-    let (mut watcher, mut targets) = Targets::watch(paths, move |event| {
-        let _ = tx.send(Message::Event(event));
-    })?;
-
-    info!(target = "watcher", files = ?paths, "file watcher started (watching parent directories for atomic replacement support)");
-
-    pump(&mut watcher, &mut targets, &rx, |_| on_change());
-    Ok(())
-}
-
 /// 已经装好、还没开始处理的文件监视：这期间的变化先排队，[`PendingWatch::start`] 以后再交给回调。
 /// 先装好监视再读文件，读的时候文件又变了也不会漏掉。
 /// A file watch that is installed but not yet handling changes: changes queue meanwhile and
@@ -496,68 +475,6 @@ fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The watcher fires `on_change` when a watched file is atomically replaced
-    /// (write sibling tmp + rename over target) and reports it exactly per event.
-    #[test]
-    fn run_files_watcher_detects_atomic_replacement() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("target.file");
-        std::fs::write(&target, "v1").expect("seed file");
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let watched = target.clone();
-        let signal = tx.clone();
-        // The watcher pumps events until the process exits by design, so the
-        // thread is never joined here — assert via the channel instead.
-        thread::spawn(move || {
-            let _ = run_files_watcher(std::slice::from_ref(&watched), || {
-                let _ = signal.send(());
-            });
-        });
-
-        // The watcher thread may not have registered its watch() yet when the
-        // first swap lands, so re-swap until the resulting event is observed.
-        let mut fired = false;
-        for _ in 0..20 {
-            let tmp = dir.path().join("target.renew.tmp");
-            std::fs::write(&tmp, "v2").expect("write tmp");
-            std::fs::rename(&tmp, &target).expect("atomic rename");
-            if rx.recv_timeout(Duration::from_millis(500)).is_ok() {
-                fired = true;
-                break;
-            }
-        }
-        assert!(fired, "on_change must fire on atomic replacement");
-    }
-
-    /// Events for sibling files (e.g. the tmp side of an atomic replace) must
-    /// not trigger `on_change`.
-    #[test]
-    fn run_files_watcher_ignores_unrelated_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("target.file");
-        std::fs::write(&target, "v1").expect("seed file");
-
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let watched = target.clone();
-        let signal = tx.clone();
-        let _handle = thread::spawn(move || {
-            let _ = run_files_watcher(std::slice::from_ref(&watched), || {
-                signal.send(()).ok();
-            });
-        });
-
-        thread::sleep(Duration::from_millis(300));
-        // Only the sibling changes; the watched file stays untouched.
-        std::fs::write(dir.path().join("target.renew.tmp"), "other").expect("write sibling");
-
-        let fired = rx.recv_timeout(Duration::from_secs(2));
-        assert!(
-            fired.is_err(),
-            "on_change must not fire for unrelated files"
-        );
-    }
 
     /// 监视装好、还没开始处理时文件变了，开始处理以后这次变化照样交给回调
     /// A change made after the watch is installed but before it starts handling changes

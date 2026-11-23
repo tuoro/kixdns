@@ -4,7 +4,8 @@
 //! spot or handing them to the full path, receiving and sending under adaptive flow control. They
 //! used to live in the binary's main.rs, out of reach of the library's tests and other entry points
 
-use crate::config::{DohListenerConfig, ListenerConfig};
+use crate::config::ListenerConfig;
+use crate::doh_server::{DohCertificate, run_doh};
 use crate::engine::concurrency::QUEUE_TARGET;
 use crate::engine::fair_queue::{Device, FairQueue};
 use crate::engine::{Engine, OnTheSpot, PreParsedData, engine_helpers};
@@ -33,11 +34,20 @@ struct BoundUdp {
 pub struct BoundListeners {
     udp: Vec<BoundUdp>,
     tcp: Vec<(TcpListener, &'static str)>,
-    doh: Option<(TcpListener, DohListenerConfig)>,
+    doh: Option<BoundDoh>,
+}
+
+/// 绑定好、证书也读好了的入站 DoH：`[::]` 时 IPv4、IPv6 各一个监听口（见 [`bind_tcp_listeners`]），共用一份证书
+/// Inbound DoH, bound and with its certificate read: for `[::]` one listener for IPv4 and one
+/// for IPv6 (see [`bind_tcp_listeners`]), sharing one certificate
+struct BoundDoh {
+    listeners: Vec<(TcpListener, &'static str)>,
+    certificate: Arc<DohCertificate>,
+    path: Arc<str>,
 }
 
 impl BoundListeners {
-    pub async fn bind(listeners: ListenerConfig, udp_workers: usize) -> anyhow::Result<Self> {
+    pub fn bind(listeners: ListenerConfig, udp_workers: usize) -> anyhow::Result<Self> {
         let ListenerConfig {
             udp: bind_addr,
             tcp: bind_tcp,
@@ -76,49 +86,24 @@ impl BoundListeners {
         #[cfg(not(unix))]
         udp.push(bind_udp_workers(bind_addr, udp_workers)?);
 
-        // TCP listener / TCP 监听器
-        // ✅ 双 socket 方案，与 UDP 行为一致 / Dual-socket approach, consistent with UDP
-        let mut tcp = Vec::new();
-        // --- 启动 IPv4 TCP 监听 / Start IPv4 TCP listener ---
-        if let Some(addr) = ipv4_listen_addr(bind_tcp) {
-            // 纯 IPv4 绑定，不受 bindv6only 影响 / Pure IPv4 bind, unaffected by bindv6only
-            let listener = TcpListener::bind(addr).await.context("bind ipv4 tcp")?;
-            tcp.push((listener, "ipv4"));
-        }
+        let tcp = bind_tcp_listeners(bind_tcp)?;
 
-        // --- 启动 IPv6 TCP 监听 / Start IPv6 TCP listener ---
-        if bind_tcp.is_ipv6() {
-            use socket2::{Domain, Protocol, Socket, Type};
-            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-
-            // ⭐️ 核心：强制 IPV6_V6ONLY=1，避免和 IPv4 监听器冲突
-            // ⭐️ Key: force IPV6_V6ONLY=1 to avoid conflict with IPv4 listener
-            socket
-                .set_only_v6(true)
-                .context("set ipv6 only for kixdns")?;
-            socket.set_reuse_address(true)?;
-
-            socket
-                .bind(&bind_tcp.into())
-                .context("bind ipv6 tcp socket")?;
-            socket.listen(128)?;
-            socket.set_nonblocking(true)?;
-
-            tcp.push((TcpListener::from_std(socket.into())?, "ipv6"));
-        }
-
-        // DoH listener — 仅在配置了 bind_doh 时启动：绑不上只记错误，DNS 照常答
-        // DoH listener — only if bind_doh is configured: failing to bind is only logged, DNS answers as usual
-        let doh = match doh {
-            Some(doh) => match TcpListener::bind(doh.bind).await {
-                Ok(listener) => Some((listener, doh)),
-                Err(err) => {
-                    error!(error = %err, "DoH server exited");
-                    None
-                }
-            },
-            None => None,
-        };
+        // 入站 DoH 只在配置了 bind_doh 时开：绑不上、证书读不了只记错误，DNS 照常答
+        // Inbound DoH only with bind_doh configured: failing to bind or to read the certificate
+        // is only logged, and DNS answers as usual
+        let doh = doh.and_then(|doh| {
+            let bound = bind_tcp_listeners(doh.bind).and_then(|listeners| {
+                Ok(BoundDoh {
+                    listeners,
+                    certificate: DohCertificate::load(&doh.tls_cert, &doh.tls_key)?,
+                    path: Arc::from(doh.path),
+                })
+            });
+            bound
+                .inspect(|bound| info!(addr = %doh.bind, doh_path = %bound.path, "DoH server listening"))
+                .inspect_err(|err| error!(addr = %doh.bind, error = %format!("{err:#}"), "DoH server cannot start"))
+                .ok()
+        });
 
         Ok(Self { udp, tcp, doh })
     }
@@ -146,24 +131,59 @@ impl BoundListeners {
             all_handles.push(spawn_tcp(listener, engine.clone(), family));
         }
 
-        if let Some((listener, doh)) = self.doh {
-            info!(addr = %doh.bind, doh_path = %doh.path, "DoH server listening");
-            let engine = engine.clone();
-            all_handles.push(tokio::spawn(async move {
-                if let Err(err) = crate::doh_server::run_doh_with_listener(
-                    listener,
-                    &doh.tls_cert,
-                    &doh.tls_key,
-                    engine,
-                    doh.path,
-                )
-                .await
-                {
-                    error!(error = %err, "DoH server exited");
-                }
-            }));
+        if let Some(doh) = self.doh {
+            for (listener, _) in doh.listeners {
+                let (certificate, engine) = (Arc::clone(&doh.certificate), engine.clone());
+                let path = Arc::clone(&doh.path);
+                all_handles.push(tokio::spawn(async move {
+                    run_doh(listener, certificate, engine, path).await
+                }));
+            }
         }
     }
+}
+
+/// 在 `addr` 上开 TCP 监听口，TCP 和入站 DoH 都用它：`[::]` 和 UDP 一样拆成 IPv4 的 `0.0.0.0` 和只收 IPv6 的
+/// `[::]` 两个。IPv6 socket 收不收 IPv4 各系统默认不同：Linux、macOS 收，FreeBSD 等 BSD 不收，OpenBSD 怎么都不收；
+/// 以前入站 DoH 直接绑 `[::]`，在 BSD 上 IPv4 客户端连不上，也没有哪种写法能让它两边都收
+/// Opens the TCP listeners on `addr`, for TCP and inbound DoH alike: as for UDP, `[::]` is
+/// split into `0.0.0.0` for IPv4 and an IPv6-only `[::]`. Whether an IPv6 socket takes IPv4
+/// differs by system: Linux and macOS do by default, FreeBSD and the other BSDs do not, and
+/// OpenBSD never does; inbound DoH used to bind `[::]` alone, leaving IPv4 clients out on the
+/// BSDs with no way to write it that took both
+fn bind_tcp_listeners(addr: SocketAddr) -> anyhow::Result<Vec<(TcpListener, &'static str)>> {
+    let ipv4 = ipv4_listen_addr(addr).map(|ipv4| (ipv4, "IPv4"));
+    let ipv6 = addr.is_ipv6().then_some((addr, "IPv6"));
+    ipv4.into_iter()
+        .chain(ipv6)
+        .map(|(addr, family)| {
+            let listener =
+                tcp_listener(addr).with_context(|| format!("bind {family} TCP listener {addr}"))?;
+            Ok((listener, family))
+        })
+        .collect()
+}
+
+/// 一个 TCP 监听口，两个地址族一样开：IPv6 的只收 IPv6（IPv4 有自己的，见 [`bind_tcp_listeners`]）；排队等接受的连接最多
+/// 1024 个，SO_REUSEADDR 只在 Windows 以外设，都和 tokio 的 `TcpListener::bind` 一样。Windows 上的 SO_REUSEADDR 让别的
+/// 程序能绑上同一个端口，抢走连接。以前 IPv6 的另有一套写法，只排 128 个，Windows 上也设 SO_REUSEADDR
+/// One TCP listener, opened alike for both families: an IPv6 one takes IPv6 alone (IPv4 has
+/// its own, see [`bind_tcp_listeners`]); at most 1024 connections wait to be accepted, and
+/// SO_REUSEADDR is set outside Windows only, both as tokio's `TcpListener::bind` does. On
+/// Windows SO_REUSEADDR lets another program bind the same port and take the connections. The
+/// IPv6 one used to be written apart, with a queue of 128, setting SO_REUSEADDR on Windows too
+fn tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    TcpListener::from_std(socket.into())
 }
 
 /// 要单独监听的 IPv4 地址：IPv4 地址本身，或者 `[::]` 的同伴 `0.0.0.0`（端口相同）；别的 IPv6 地址

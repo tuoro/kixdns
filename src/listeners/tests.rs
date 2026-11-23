@@ -3905,6 +3905,57 @@ fn the_ipv4_listen_address_is_the_address_itself_or_the_twin_of_any() {
     assert_eq!(ipv4_listen_addr(addr("[::1]:53")), None);
 }
 
+/// 入站 DoH 监听 `[::]` 时和 TCP 一样开两个监听口：IPv4 的 `0.0.0.0` 和只收 IPv6 的 `[::]`。以前 DoH 只绑一个 `[::]`，
+/// 收不收 IPv4 要看系统的默认：FreeBSD 等 BSD 上 IPv4 客户端连不上。这台机器没有 IPv6 就不测
+/// Inbound DoH on `[::]` opens two listeners as TCP does: `0.0.0.0` for IPv4 and an IPv6-only
+/// `[::]`. DoH used to bind `[::]` alone, whether that took IPv4 being up to the system's
+/// default: on FreeBSD and the other BSDs IPv4 clients could not connect. Skipped on a machine
+/// without IPv6
+#[tokio::test]
+async fn doh_on_the_any_address_listens_on_both_families_as_tcp_does() {
+    // 两个地址族都空着的端口：IPv6 socket 在 Linux、macOS 上默认两边都占 / A port free in both
+    // families: on Linux and macOS an IPv6 socket takes both by default
+    let Ok(probe) = std::net::TcpListener::bind("[::]:0") else {
+        return;
+    };
+    let any = probe.local_addr().unwrap();
+    drop(probe);
+    let dir = tempfile::tempdir().unwrap();
+    let (tls_cert, tls_key) = crate::engine::test_support::write_certificate(dir.path());
+    let bound = BoundListeners::bind(
+        ListenerConfig {
+            udp: "127.0.0.1:0".parse().unwrap(),
+            tcp: "127.0.0.1:0".parse().unwrap(),
+            doh: Some(crate::config::DohListenerConfig {
+                bind: any,
+                tls_cert,
+                tls_key,
+                path: "/dns-query".to_string(),
+            }),
+        },
+        1,
+    )
+    .unwrap();
+
+    let doh = bound.doh.expect("DoH is bound");
+    let listening: Vec<SocketAddr> = doh
+        .listeners
+        .iter()
+        .map(|(listener, _)| listener.local_addr().unwrap())
+        .collect();
+    assert_eq!(
+        listening,
+        [SocketAddr::from(([0, 0, 0, 0], any.port())), any],
+        "IPv4 apart, then IPv6"
+    );
+    assert!(
+        socket2::SockRef::from(&doh.listeners[1].0)
+            .only_v6()
+            .unwrap(),
+        "the IPv6 listener takes IPv6 alone"
+    );
+}
+
 /// 装不进一条记录的静态 TXT（一段超过 255 字节，或者总长超过 65535），UDP 和 TCP 都收到
 /// SERVFAIL，不带 TC。以前总长超长时两边收到的都是 NOERROR、TC 置位、没有答案的应答
 /// A static TXT that does not fit a record (a segment over 255 bytes, or a total over

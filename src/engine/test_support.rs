@@ -676,6 +676,25 @@ async fn next_http_request(
     Some((head, body))
 }
 
+/// 在 `dir` 里放一对自签的证书和私钥（给 localhost），返回两个路径。已经有的整个换掉，像续期那样先写好再改名盖过去
+/// Puts a self-signed certificate (for localhost) and its key in `dir`, giving both paths. Ones
+/// already there are replaced whole, written aside and renamed over them as a renewal does
+pub(crate) fn write_certificate(dir: &std::path::Path) -> (String, String) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let paths = [("cert.pem", cert.pem()), ("key.pem", key.serialize_pem())].map(|(name, pem)| {
+        let (path, aside) = (dir.join(name), dir.join(format!("{name}.new")));
+        std::fs::write(&aside, pem).unwrap();
+        std::fs::rename(&aside, &path).unwrap();
+        path.to_str().unwrap().to_owned()
+    });
+    let [cert, key] = paths;
+    (cert, key)
+}
+
 /// 测试期间记下的 warn 及以上的日志 / The warn-and-above log lines written during a test
 #[derive(Clone, Default)]
 pub(crate) struct Warnings(Arc<Mutex<Vec<u8>>>);
