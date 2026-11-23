@@ -129,24 +129,6 @@ impl EngineBuilder {
     }
 }
 
-/// 应答在缓存里留多少秒，每份应答各自遵守（见 `CacheEntry::stored_at`）：自己的 TTL 最长是
-/// `cache_max_ttl`；开着 serve_stale 时，TTL 到了之后还要留够续用的时间，也就是
-/// `serve_stale_expire_ttl` 秒，0 是不限，只受缓存容量约束。
-/// How many seconds an answer stays in the cache, which each answer keeps to on its own
-/// (see `CacheEntry::stored_at`): its own TTL is at most `cache_max_ttl`, and with
-/// serve_stale on it stays past that for as long as it may be served stale, which is
-/// `serve_stale_expire_ttl` seconds, 0 meaning no limit but the cache's capacity.
-pub(super) fn cache_retention_secs(
-    cache_max_ttl: u64,
-    settings: &crate::config::GlobalSettings,
-) -> u64 {
-    match (settings.serve_stale, settings.serve_stale_expire_ttl) {
-        (false, _) => cache_max_ttl,
-        (true, 0) => u64::MAX,
-        (true, stale) => cache_max_ttl.saturating_add(stale),
-    }
-}
-
 impl Engine {
     /// 应答带的、缓存用的 TTL 最长多少：`cache_max_ttl`
     /// The longest TTL an answer may carry or be cached with: `cache_max_ttl`
@@ -190,13 +172,14 @@ impl Engine {
         listener_label: String,
         observer: Option<Arc<dyn EngineObserver>>,
     ) -> anyhow::Result<Self> {
-        // 响应缓存：容量由配置控制（默认 10000 份，见 `new_cache`），最大生存时间由 cache_max_ttl 控制
-        // Response cache: capacity and max age come from the settings
+        // 响应缓存：容量由配置控制（默认 10000 份，见 `new_cache`），应答留到没用为止（见 `phases::kept_past_ttl`）
+        // Response cache: capacity from the settings, answers kept until of no use (see
+        // `phases::kept_past_ttl`)
         let running_settings = Arc::new(cfg.settings.clone());
         let settings = Arc::clone(&running_settings);
         let cache = new_cache(
             settings.cache_capacity,
-            cache_retention_secs(settings.cache_max_ttl, &settings),
+            super::phases::kept_past_ttl(&settings),
         );
         // 规则缓存：1 万条，每条按自己的 expires_at 过期（见 `RULE_CACHE_MAX_AGE`）
         // Rule cache: 10k entries, each expiring at its own expires_at (see `RULE_CACHE_MAX_AGE`)
@@ -310,22 +293,15 @@ impl Engine {
     /// 槽位 `slot` 里 `question` 的、适用于 `view` 的那份应答（见 `CacheSlot::select`）
     /// The answer to `question` in slot `slot` that applies to `view` (see
     /// `CacheSlot::select`)
-    /// `now` 是查找的时刻，调用方用同一个时刻算应答已经存了多久，免得每次命中多读一次时钟。
-    /// `now` is the time of the lookup; callers age the answer from the same instant,
-    /// so a hit reads the clock once.
     pub(crate) fn cache_get(
         &self,
         slot: u64,
         view: &EcsView,
         question: &CachedQuestion<'_>,
-        now: std::time::Instant,
     ) -> Option<Arc<CacheEntry>> {
-        self.cache.get(slot)?.select(
-            view,
-            |entry| question.matches(entry),
-            Some(self.cache.max_age()),
-            now,
-        )
+        self.cache
+            .get(slot)?
+            .select(view, |entry| question.matches(entry))
     }
 
     /// 从槽位 `slot` 去掉 `remove` 选中的应答 / Remove from slot `slot` the answers `remove` picks
@@ -427,12 +403,12 @@ impl Engine {
     /// Store an answer in slot `slot` (see `CacheSlot::with`). Writes go through
     /// here and `insert_dns_cache_entry` only.
     pub(crate) fn cache_insert(&self, slot: u64, entry: Arc<CacheEntry>) {
-        let max_age = Some(self.cache.max_age());
+        let kept = self.cache.kept();
         let heaviest = self.cache.heaviest_value();
         self.cache.compute(slot, |current| {
             let slot = match current {
-                Some(current) => current.with(entry, max_age),
-                None => CacheSlot::default().with(entry, max_age),
+                Some(current) => current.with(entry, kept),
+                None => CacheSlot::default().with(entry, kept),
             };
             Op::Put(Arc::new(slot.fitting(heaviest)))
         });

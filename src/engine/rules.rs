@@ -196,7 +196,7 @@ impl Cached for Arc<RuleCacheRecord> {
         1
     }
 
-    fn outlived(&self, _max_age: Duration, now: Instant) -> bool {
+    fn outlived(&self, _kept: Duration, now: Instant) -> bool {
         !self.entry.is_valid_at(now)
     }
 }

@@ -307,14 +307,11 @@ impl Engine {
         // The Geo data follows the new configuration first, so the new rules
         // find the new tags and files from their first query
         geo_sources.follow(&inner.pipeline, &self.geosite_manager, &self.geoip_manager);
-        // serve_stale 重载即生效，能续用多久决定了应答要留多久
+        // serve_stale 重载即生效，能续用多久决定了应答过了 TTL 还留多久
         // serve_stale takes effect on reload, and how long an answer may be served stale
-        // decides how long it stays
+        // decides how long it stays past its TTL
         self.cache
-            .set_max_age(Duration::from_secs(super::core::cache_retention_secs(
-                self.cache_max_ttl,
-                &inner.pipeline.settings,
-            )));
+            .set_kept(super::phases::kept_past_ttl(&inner.pipeline.settings));
         // 按 Geo 数据现在的代数存。监视线程这时换了数据、改了状态，rcu 就重来一遍，用上新的代数
         // Stored at the Geo data's generation now. When a watcher swaps data and changes
         // the state meanwhile, rcu starts over and takes the new generation
@@ -822,7 +819,6 @@ impl Engine {
                 qtype: u16::from(qtype),
                 flags: q.flags,
             },
-            start,
         ) {
             // Check if expired / 检查是否已过期
             let elapsed_secs = crate::proto_utils::saturating_u64_to_u32(
@@ -1155,12 +1151,10 @@ impl Engine {
                 qtype: u16::from(lookup.qtype),
                 flags: lookup.flags,
             };
-            let stale = self
-                .cache_get(lookup.slot, &view, &question, Instant::now())
-                .filter(|hit| {
-                    phases::age_of(hit, hit.inserted_at.elapsed().as_secs(), settings)
-                        == phases::Age::Stale
-                });
+            let stale = self.cache_get(lookup.slot, &view, &question).filter(|hit| {
+                phases::age_of(hit, hit.inserted_at.elapsed().as_secs(), settings)
+                    == phases::Age::Stale
+            });
 
             if let Some(stale) = stale {
                 // 这个条目的刷新标记：查缓存时已经为它发起刷新（见 `check_cache_logged`），刷新一结束标记就放开
@@ -1212,7 +1206,7 @@ impl Engine {
                 };
                 let fresh = refresh_ended
                     && self
-                        .cache_get(lookup.slot, &view, &question, Instant::now())
+                        .cache_get(lookup.slot, &view, &question)
                         .is_some_and(|hit| {
                             phases::age_of(&hit, hit.inserted_at.elapsed().as_secs(), settings)
                                 == phases::Age::Fresh
@@ -5267,7 +5261,6 @@ mod tests {
             Arc::new(CacheEntry {
                 bytes: Bytes::from(answer.to_vec().unwrap()),
                 inserted_at: then,
-                stored_at: then,
                 original_ttl: cache_max_ttl,
                 ..(*stale_entry("default")).clone()
             }),
@@ -5322,24 +5315,24 @@ mod tests {
         }
     }
 
-    /// 能留多久跟着重载走：打开 serve_stale 后马上留得更久，关掉后退回 cache_max_ttl
-    /// How long answers stay follows a reload: longer as soon as serve_stale goes on, back to
-    /// cache_max_ttl when it goes off
+    /// 过了 TTL 还留多久跟着重载走：打开 serve_stale 后马上留到续用的时限，关掉后到 TTL 为止
+    /// How long answers stay past their TTL follows a reload: as long as they may be served
+    /// stale as soon as serve_stale goes on, up to their TTL once it goes off
     #[tokio::test]
     async fn a_reload_changes_how_long_answers_stay() {
         let engine = Engine::new(stale_settings(false, 10), "lbl".to_string()).unwrap();
-        assert_eq!(engine.cache.max_age(), Duration::from_secs(2));
+        assert_eq!(engine.cache.kept(), Duration::ZERO);
         assert!(!answers_after(&engine, 2, 3).await);
 
         engine.reload(stale_settings(true, 10));
-        assert_eq!(engine.cache.max_age(), Duration::from_secs(12));
+        assert_eq!(engine.cache.kept(), Duration::from_secs(10));
         assert!(answers_after(&engine, 2, 3).await);
 
         engine.reload(stale_settings(true, 0));
-        assert_eq!(engine.cache.max_age(), Duration::from_secs(u64::MAX));
+        assert_eq!(engine.cache.kept(), Duration::from_secs(u64::MAX));
 
         engine.reload(stale_settings(false, 10));
-        assert_eq!(engine.cache.max_age(), Duration::from_secs(2));
+        assert_eq!(engine.cache.kept(), Duration::ZERO);
         assert_eq!(engine.ttl_cap(), 2);
     }
 
@@ -5431,7 +5424,6 @@ mod tests {
             inserted_at: Instant::now() - Duration::from_secs(10),
             original_ttl: 5,
             reach: Default::default(),
-            stored_at: Instant::now(),
             fetched_at: Instant::now(),
         })
     }

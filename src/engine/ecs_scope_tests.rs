@@ -1191,7 +1191,6 @@ async fn renewing_a_stale_answer_stores_the_same_answer_again() {
     let after = engine.cached(slot).expect("still cached");
     assert!(!Arc::ptr_eq(&before, &after), "renewed");
     assert_eq!(after.fetched_at, before.fetched_at);
-    assert!(after.stored_at > before.stored_at);
     // Expired just now again: aged exactly its TTL, less than before the renewal
     // 又是刚刚过期：存了正好一个 TTL，比续用之前短
     assert!(
