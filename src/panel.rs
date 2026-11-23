@@ -925,34 +925,33 @@ impl PanelMetrics {
         );
     }
 
-    /// 一份配置生效了：第一次加载时代数是 1；之后每次重载加一，并在写锁里计一次重载成功、加重载序号
-    /// （见 `config_json`）
-    /// A configuration became active: generation 1 on the first load; each reload after
-    /// that adds one and, under the write lock, counts a reload success and bumps the
-    /// reload sequence (see `config_json`)
-    fn config_became_active(
-        &self,
-        sha256: String,
-        initial: bool,
-        restart_pending: Vec<String>,
-        warnings: Vec<String>,
-    ) {
+    /// 一份配置生效了，代数照引擎报的记：代数 1 是第一次加载，之后的都是重载，在写锁里计一次重载成功、加重载序号
+    /// （见 `config_json`）。没带原文时摘要照旧。以前面板自己数代数，第一次加载还按带没带原文分两种判断
+    /// A configuration became active, at the generation the engine gives: generation 1 is the
+    /// first load and every later one a reload, which under the write lock counts a reload
+    /// success and bumps the reload sequence (see `config_json`). Without the text the digest
+    /// stays. The panel used to count the generations itself, telling the first load two ways
+    /// by whether the text came along
+    fn config_became_active(&self, config: &ConfigLoaded<'_>) {
+        let sha256 = config
+            .source
+            .map(|source| format!("{:x}", Sha256::digest(source.as_bytes())));
         let mut active = self.active_config.write();
-        active.generation = if initial {
-            1
-        } else {
-            active.generation.saturating_add(1)
-        };
-        active.sha256 = sha256;
+        active.generation = config.generation;
+        if let Some(sha256) = sha256 {
+            active.sha256 = sha256;
+        }
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
         active.last_reload_error = None;
-        active.restart_pending = restart_pending;
-        active.warnings = warnings;
-        if !initial {
+        active.restart_pending = config
+            .restart_pending
+            .iter()
+            .map(|setting| setting.to_string())
+            .collect();
+        active.warnings = config.warnings.to_vec();
+        if config.generation > 1 {
             active.problems.clear();
-        }
-        if !initial {
             self.reload_success.fetch_add(1, Ordering::Relaxed);
             self.reload_sequence.fetch_add(1, Ordering::Release);
         }
@@ -1059,18 +1058,6 @@ impl PanelMetrics {
         active.last_reload_error = Some(truncate(error, MAX_ERROR_LENGTH));
         self.reload_failure.fetch_add(1, Ordering::Relaxed);
         self.reload_sequence.fetch_add(1, Ordering::Release);
-    }
-
-    /// 从观察者收到的配置原文更新摘要。/ Refresh the digest from the loaded source.
-    fn record_config_loaded(
-        &self,
-        source: &str,
-        restart_pending: Vec<String>,
-        warnings: Vec<String>,
-    ) {
-        let sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
-        let initial = self.active_config.read().generation == 0;
-        self.config_became_active(sha256, initial, restart_pending, warnings);
     }
 
     #[cfg(unix)]
@@ -1828,21 +1815,7 @@ impl EngineObserver for PanelMetrics {
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
         debug_forward!(self.config_loaded(event));
         self.keep_series_of(event);
-        let restart_pending = event
-            .restart_pending
-            .iter()
-            .map(|setting| setting.to_string())
-            .collect();
-        let warnings = event.warnings.to_vec();
-        match event.source {
-            Some(source) => self.record_config_loaded(source, restart_pending, warnings),
-            // 没带原文时摘要照旧；第一次加载（代数 1）不算重载
-            // Without the text the digest stays; the first load (generation 1) is no reload
-            None => {
-                let sha256 = self.active_config.read().sha256.clone();
-                self.config_became_active(sha256, event.generation <= 1, restart_pending, warnings);
-            }
-        }
+        self.config_became_active(event);
     }
 
     fn config_reload_failed(&self, event: &ConfigReloadFailed<'_>) {
@@ -3487,34 +3460,44 @@ mod tests {
         );
     }
 
-    /// 第一次加载的配置没带原文时也不算一次重载：重载次数和重载序号不变，代数是 1；之后的加载才算
-    /// The first configuration loaded without its text is no reload either: the reload
-    /// count and sequence stay, the generation is 1; the loads after it are reloads
+    /// 代数照引擎报的记，第一次加载就是代数 1 的那次，带不带原文都一样：它不算重载，重载次数和序号不动；之后每次加载
+    /// 都是重载。以前面板自己数代数，第一次加载还按带没带原文分两种判断
+    /// The generation is the one the engine gives, and the first load is the one at generation
+    /// 1, with its text or without: it is no reload, the reload count and sequence stay; every
+    /// load after it is one. The panel used to count the generations itself, telling the first
+    /// load two ways by whether the text came along
     #[test]
-    fn the_first_load_without_its_text_is_no_reload() {
+    fn the_generation_is_the_engines_and_the_first_load_is_no_reload() {
         use crate::observe::{ConfigLoaded, EngineObserver};
         use std::sync::atomic::Ordering;
-        let metrics = PanelMetrics::default();
-        let load = |generation| {
-            metrics.config_loaded(&ConfigLoaded {
-                path: None,
-                generation,
-                source: None,
-                restart_pending: &[],
-                warnings: &[],
-                pipelines: &[],
-                rules: &[],
-                upstreams: &[],
-            })
-        };
-        load(1);
-        assert_eq!(metrics.reload_success.load(Ordering::Relaxed), 0);
-        assert_eq!(metrics.reload_sequence.load(Ordering::Acquire), 0);
-        assert_eq!(metrics.active_config.read().generation, 1);
-        load(2);
-        assert_eq!(metrics.reload_success.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.reload_sequence.load(Ordering::Acquire), 1);
-        assert_eq!(metrics.active_config.read().generation, 2);
+        for source in [None, Some("{}")] {
+            let metrics = PanelMetrics::default();
+            let load = |generation| {
+                metrics.config_loaded(&ConfigLoaded {
+                    path: None,
+                    generation,
+                    source,
+                    restart_pending: &[],
+                    warnings: &[],
+                    pipelines: &[],
+                    rules: &[],
+                    upstreams: &[],
+                })
+            };
+            let reloads = || {
+                (
+                    metrics.reload_success.load(Ordering::Relaxed),
+                    metrics.reload_sequence.load(Ordering::Acquire),
+                    metrics.active_config.read().generation,
+                )
+            };
+            load(1);
+            assert_eq!(reloads(), (0, 0, 1), "{source:?}");
+            load(2);
+            assert_eq!(reloads(), (1, 1, 2), "{source:?}");
+            load(5);
+            assert_eq!(reloads(), (2, 2, 5), "{source:?}");
+        }
     }
 
     /// 跳转过的请求会在目标 pipeline 下再查一次缓存，但只计一次查找：命中率按请求算，
@@ -4311,10 +4294,20 @@ mod tests {
             "read as retired settings, warned about"
         );
         let metrics = PanelMetrics::new(false);
-        metrics.record_config_loaded(
-            r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
-            Vec::new(),
-            Vec::new(),
+        crate::observe::EngineObserver::config_loaded(
+            &metrics,
+            &crate::observe::ConfigLoaded {
+                path: None,
+                generation: 1,
+                source: Some(
+                    r#"{"settings":{"statistics_enabled":false,"statistics_anonymize_client_ip":true}}"#,
+                ),
+                restart_pending: &[],
+                warnings: &[],
+                pipelines: &[],
+                rules: &[],
+                upstreams: &[],
+            },
         );
         metrics.record_query(
             "example.com",
