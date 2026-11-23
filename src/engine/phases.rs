@@ -767,7 +767,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 // failing
                 let waiting = async {
                     rx.changed().await.ok()?;
-                    Some(rx.borrow().clone())
+                    rx.borrow().clone()
                 };
                 let result = match crate::engine::upstream::wait_for_another(
                     engine,
@@ -778,7 +778,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 )
                 .await
                 {
-                    Ok(Some(result)) => result,
+                    Ok(Some(bytes)) => bytes,
                     Ok(None) => continue,
                     Err(failure) => {
                         gave_up = Some(failure);
@@ -788,15 +788,10 @@ pub(crate) async fn handle_forward_decision_logged(
                 if let Some((observer, ctx)) = observed {
                     observer.inflight_joined(ctx);
                 }
-                match &result {
-                    Ok(bytes) => {
-                        let mut resp_mut = BytesMut::from(bytes.as_ref());
-                        set_id(&mut resp_mut, tx_id);
-                        response.upstream = Some(Arc::from("inflight"));
-                        return Ok(ForwardResult::Success(resp_mut.freeze()));
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("{}", e)),
-                }
+                let mut resp_mut = BytesMut::from(result.as_ref());
+                set_id(&mut resp_mut, tx_id);
+                response.upstream = Some(Arc::from("inflight"));
+                return Ok(ForwardResult::Success(resp_mut.freeze()));
             }
         }
         match gave_up {

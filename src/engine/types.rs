@@ -14,14 +14,17 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 pub type InflightMap = DashMap<u64, InflightEntry, FxBuildHasher>;
 
-/// 合并查询的结果：领头请求拿到的应答，或它失败的原因 / The result of a merged query: the answer the
-/// leading request got, or why it failed
-pub type InflightResult = Result<Bytes, Arc<anyhow::Error>>;
+/// 合并查询的通道里的值：领头请求交出的应答，交出之前是 None。领头请求失败时不交任何东西，放下条目，等着的请求
+/// 各自转发（见 `InflightCleanupGuard`）
+/// The value on a merged query's channel: the answer the leading request hands over, None until it
+/// does. A leading request that fails hands over nothing and lets the entry go, the waiting
+/// requests then forwarding themselves (see `InflightCleanupGuard`)
+pub type InflightResult = Option<Bytes>;
 
 /// 一个请求在 inflight 表里登记或等待时问的是什么：算它的 inflight 键用到的全部输入（见
 /// `Engine::cache_keys`）。键只是这些输入的哈希，而且不带密钥，落在同一个键上的两个不同问题可以算出来；
@@ -116,7 +119,7 @@ impl InflightEntry {
     /// 等这个条目的结果 / Wait for this entry's result
     pub(crate) fn subscribe(&mut self) -> watch::Receiver<InflightResult> {
         self.tx
-            .get_or_insert_with(|| watch::channel(inflight_pending()).0)
+            .get_or_insert_with(|| watch::channel(None).0)
             .subscribe()
     }
 
@@ -145,19 +148,6 @@ impl InflightEntry {
             && self.requester == question.requester
             && self.client_ecs == question.client_ecs
     }
-}
-
-/// 合并查询的通道在领头请求拿到结果之前的值。等待的请求只在领头请求发出结果之后才读
-/// （`changed()`），从来读不到它，所以所有通道共用这一个：每次缓存没命中都新建一个错误要分配内存，
-/// 设了 `RUST_BACKTRACE` 时还要抓一份完整的调用栈（实测新名字的吞吐因此低 18%）。
-/// The value an in-flight channel holds until the leading request has its result. Waiting requests
-/// read only after the leader sends one (`changed()`) and never see it, so every channel shares this
-/// one: building a new error on each cache miss allocates, and with `RUST_BACKTRACE` set it also
-/// captures a whole backtrace (measured at 18% less throughput for new names).
-pub(crate) fn inflight_pending() -> InflightResult {
-    static PENDING: LazyLock<Arc<anyhow::Error>> =
-        LazyLock::new(|| Arc::new(anyhow::anyhow!("Pending")));
-    Err(Arc::clone(&PENDING))
 }
 
 #[cfg(test)]
@@ -193,10 +183,10 @@ mod inflight_entry_tests {
         let mut second = entry.subscribe();
         let tx = entry.waiting().expect("two wait");
         assert_eq!(tx.receiver_count(), 2);
-        tx.send(Ok(bytes::Bytes::from_static(b"answer"))).unwrap();
+        tx.send(Some(bytes::Bytes::from_static(b"answer"))).unwrap();
         for rx in [&mut first, &mut second] {
             rx.changed().await.unwrap();
-            let got = rx.borrow().as_ref().map(bytes::Bytes::clone).unwrap();
+            let got = rx.borrow().clone().unwrap();
             assert_eq!(&got[..], b"answer");
         }
         drop((first, second));
@@ -292,23 +282,6 @@ mod inflight_entry_tests {
         for other in others {
             assert!(!entry.asks(&other), "{other:?}");
         }
-    }
-}
-
-#[cfg(test)]
-mod inflight_pending_tests {
-    use super::inflight_pending;
-    use std::sync::Arc;
-
-    /// 每个通道拿到的都是同一份占位值，没命中时不再新建错误
-    /// Every channel gets the same placeholder, so a miss builds no new error
-    #[test]
-    fn every_channel_shares_one_placeholder() {
-        let (Err(first), Err(second)) = (inflight_pending(), inflight_pending()) else {
-            panic!("the placeholder is an error");
-        };
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.to_string(), "Pending");
     }
 }
 
