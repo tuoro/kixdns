@@ -492,7 +492,8 @@ pub enum CacheHitKind {
     /// The entry is within its TTL.
     Fresh,
     /// The entry is past its TTL and served immediately (RFC 8767 with
-    /// `serve_stale_client_timeout_ms = 0`).
+    /// `serve_stale_client_timeout_ms = 0`, or with nothing to wait for: an answer the
+    /// rules gave, or one whose refresh is not running and has not failed lately).
     Stale,
     /// The entry is past its TTL and served because the upstream did not
     /// answer within `serve_stale_client_timeout_ms`.

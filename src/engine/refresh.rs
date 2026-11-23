@@ -208,7 +208,7 @@ impl RefreshFailures {
 /// starts one on a hit, each waiting out the upstream timeout, and with no limit they used
 /// to grow as many as there are cache entries, unseen by flow control and the memory
 /// watermark
-const REFRESHES_AT_ONCE: usize = 128;
+pub(crate) const REFRESHES_AT_ONCE: usize = 128;
 
 /// spawn_background_refresh spawns a task to refresh a DNS record in the background.
 ///

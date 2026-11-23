@@ -313,8 +313,10 @@ impl Engine {
         question: &CachedQuestion<'_>,
     ) -> Option<Arc<CacheEntry>> {
         self.cache
-            .get(slot)?
-            .select(view, |entry| question.matches(entry))
+            .get_with(slot, |cached| {
+                cached.select(view, |entry| question.matches(entry))
+            })
+            .flatten()
     }
 
     /// 从槽位 `slot` 去掉 `remove` 选中的应答 / Remove from slot `slot` the answers `remove` picks

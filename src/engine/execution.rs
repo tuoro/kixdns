@@ -1127,125 +1127,86 @@ impl Engine {
         lookup: &phases::CacheLookupContext<'_>,
         info: &mut ResponseInfo,
     ) -> Option<Bytes> {
-        let settings = &lookup.state.pipeline.settings;
         if let Some((observer, ctx)) = lookup.observed {
             observer.cache_lookup(ctx);
         }
-        if let Some(resp_bytes) = phases::check_cache_logged(self, lookup, info) {
-            return Some(resp_bytes);
-        }
-
-        // RFC 8767 Client Timeout: When serve_stale is enabled with client_timeout > 0,
-        // try upstream for client_timeout_ms before falling back to stale data.
-        // RFC 8767 客户端超时：当 serve_stale 启用且 client_timeout > 0 时，
-        // 先尝试上游查询 client_timeout_ms 毫秒，超时后返回过期数据。
-        // Corresponds to Unbound serve-expired-client-timeout
-        //
-        // Design: check_cache() already triggers spawn_background_refresh() for expired entries
-        // when client_timeout > 0. Here the request waits for that refresh to end (see
-        // `RefreshingGuard`), then serves the fresh answer it brought, or the stale one.
-        // 设计：check_cache() 在 client_timeout > 0 且缓存过期时已触发 spawn_background_refresh。
-        // 这里等那次刷新结束（见 `RefreshingGuard`），交出它带回的新应答，或者过期应答。
-        if settings.serve_stale && settings.serve_stale_client_timeout_ms > 0 {
-            let view = lookup.requester.ecs_view();
-            let question = CachedQuestion {
-                qname: lookup.qname,
-                pipeline_id: lookup.pipeline_id,
-                qtype: u16::from(lookup.qtype),
-                flags: lookup.flags,
-            };
-            let stale = self.cache_get(lookup.slot, &view, &question).filter(|hit| {
-                phases::age_of(hit, hit.inserted_at.elapsed().as_secs(), settings)
-                    == phases::Age::Stale
-            });
-
-            if let Some(stale) = stale {
-                // 这个条目的刷新标记：查缓存时已经为它发起刷新（见 `check_cache_logged`），刷新一结束标记就放开
-                // The refresh mark of this entry: the lookup already started its refresh (see
-                // `check_cache_logged`), and the mark goes as soon as the refresh ends
-                let mark = super::refresh::RefreshTarget::mark_of(lookup.slot, &stale.reach);
-                // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
-                // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
-                // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
-                //
-                // 上界不能取单次上游超时：后台刷新没有外层包裹，UDP 链是
-                // hedge(T/3) + 全量(T) + TCP 回落(T)，最坏约 2.33T，按 T 截断
-                // 会把本来能成功的刷新提前掐掉，白白把新鲜应答降级成过期应答。
-                //
-                // Bound the wait by the smaller of the client wait and what is
-                // left of this request's budget. The stale answer in hand is
-                // only worth anything if it goes out before the outer request
-                // timeout; past that the client gets SERVFAIL and an answer
-                // that was ready is dropped. One upstream timeout is the wrong
-                // bound: a background refresh has no outer wrapper and its UDP
-                // chain is hedge at T/3, a full attempt at T and a TCP fallback
-                // at T, so roughly 2.33T in the worst case. Cutting at T ends
-                // refreshes that would have landed and downgrades a fresh
-                // answer to a stale one for nothing.
-                let budget = Duration::from_millis(request_timeout_ms(settings));
-                let client_timeout = Duration::from_millis(settings.serve_stale_client_timeout_ms)
-                    .min(
-                        budget
-                            .saturating_sub(lookup.start.elapsed())
-                            .saturating_sub(STALE_SERVE_RESERVE),
-                    );
-                let wait_start = Instant::now();
-                // 等刷新结束：先登记要被叫醒，再看刷新还在不在，这样不会错过在两步之间结束的刷新。刷新结束以后没带回
-                // 新应答（上游失败了）就马上交出过期应答。以前每 5 毫秒查一次缓存，等 1.8 秒要醒 360 次
-                // Wait for the refresh to end: being woken is registered first and whether the
-                // refresh still runs is looked at after, so one ending in between is not missed.
-                // Ended without a fresh answer (the upstream failed), the stale answer goes out at
-                // once. It used to look at the cache every 5 ms, 360 times in a wait of 1.8 seconds
-                let refresh_ended = match self.refreshing.get(&mark).map(|ended| Arc::clone(&ended))
-                {
-                    None => true,
-                    Some(ended) => {
-                        let ending = ended.notified();
-                        tokio::pin!(ending);
-                        ending.as_mut().enable();
-                        !self.refreshing.contains_key(&mark)
-                            || tokio::time::timeout(client_timeout, ending).await.is_ok()
-                    }
-                };
-                let fresh = refresh_ended
-                    && self
-                        .cache_get(lookup.slot, &view, &question)
-                        .is_some_and(|hit| {
-                            phases::age_of(&hit, hit.inserted_at.elapsed().as_secs(), settings)
-                                == phases::Age::Fresh
-                        });
-                if fresh && let Some(fresh_bytes) = phases::check_cache_logged(self, lookup, info) {
-                    tracing::debug!(
-                        event = "serve_fresh_after_client_wait",
-                        qname = %lookup.qname,
-                        wait_ms = wait_start.elapsed().as_millis() as u64,
-                        "background refresh completed within client_timeout"
-                    );
-                    return Some(fresh_bytes);
-                }
-
-                // 刷新失败了，或者客户端等待的时间到了：交出过期缓存
-                // The refresh failed, or the client wait ran out: serve the stale entry
-                let kind = if refresh_ended {
-                    CacheHitKind::StaleUpstreamFailure
-                } else {
-                    CacheHitKind::StaleClientTimeout
-                };
-                if let Some(stale_bytes) =
-                    phases::check_stale_cache_logged(self, lookup, kind, info)
-                {
-                    return Some(stale_bytes);
-                }
-                // No stale entry left in the cache - fall through to normal processing
+        let answer = match phases::check_cache_logged(self, lookup, info) {
+            phases::Looked::Answered(answer) => Some(answer),
+            phases::Looked::Waiting(stale) => {
+                let still_refreshing = self.wait_for_refresh(lookup, &stale).await;
+                phases::check_cache_after_wait(self, lookup, still_refreshing, info)
             }
-        }
-
-        // The response cache had nothing usable for this request
-        // 响应缓存中没有本请求可用的条目
-        if let Some((observer, ctx)) = lookup.observed {
+            phases::Looked::Missed => None,
+        };
+        if answer.is_none()
+            && let Some((observer, ctx)) = lookup.observed
+        {
             observer.cache_miss(ctx);
         }
-        None
+        answer
+    }
+
+    /// RFC 8767 客户端超时（对应 Unbound 的 serve-expired-client-timeout）：等过期的 `stale` 的刷新结束，最多等
+    /// serve_stale_client_timeout_ms，给出等到头时刷新还在不在跑。刷新是查缓存时发起的（见 `phases::check_cache_logged`），
+    /// 刷新标记一放开就叫醒这里；没有刷新在跑（已经结束了，或者同时在刷的太多、没发起）就不等
+    /// RFC 8767 client timeout (Unbound's serve-expired-client-timeout): wait for the refresh of
+    /// the stale `stale` to end, for serve_stale_client_timeout_ms at most, telling whether it
+    /// still runs when the wait is over. The lookup started the refresh (see
+    /// `phases::check_cache_logged`), and its mark going wakes this; with no refresh running (it
+    /// ended already, or none started, too many running at once) there is no wait
+    async fn wait_for_refresh(
+        &self,
+        lookup: &phases::CacheLookupContext<'_>,
+        stale: &CacheEntry,
+    ) -> bool {
+        let settings = &lookup.state.pipeline.settings;
+        let mark = super::refresh::RefreshTarget::mark_of(lookup.slot, &stale.reach);
+        // 等待上限取客户端等待与本次请求剩余预算中的较小者。手上这份
+        // 过期应答只有赶在外层请求超时之前返回才有意义，否则客户端拿到
+        // 的是 SERVFAIL，而那条本可以立刻给出的应答被丢掉。
+        //
+        // 上界不能取单次上游超时：后台刷新没有外层包裹，UDP 链是
+        // hedge(T/3) + 全量(T) + TCP 回落(T)，最坏约 2.33T，按 T 截断
+        // 会把本来能成功的刷新提前掐掉，白白把新鲜应答降级成过期应答。
+        //
+        // Bound the wait by the smaller of the client wait and what is
+        // left of this request's budget. The stale answer in hand is
+        // only worth anything if it goes out before the outer request
+        // timeout; past that the client gets SERVFAIL and an answer
+        // that was ready is dropped. One upstream timeout is the wrong
+        // bound: a background refresh has no outer wrapper and its UDP
+        // chain is hedge at T/3, a full attempt at T and a TCP fallback
+        // at T, so roughly 2.33T in the worst case. Cutting at T ends
+        // refreshes that would have landed and downgrades a fresh
+        // answer to a stale one for nothing.
+        let budget = Duration::from_millis(request_timeout_ms(settings));
+        let client_timeout = Duration::from_millis(settings.serve_stale_client_timeout_ms).min(
+            budget
+                .saturating_sub(lookup.start.elapsed())
+                .saturating_sub(STALE_SERVE_RESERVE),
+        );
+        // 先登记要被叫醒，再看刷新还在不在，这样不会错过在两步之间结束的刷新。以前每 5 毫秒查一次缓存，等 1.8 秒要醒
+        // 360 次
+        // Being woken is registered first and whether the refresh still runs is looked at
+        // after, so one ending in between is not missed. It used to look at the cache every
+        // 5 ms, 360 times in a wait of 1.8 seconds
+        let Some(ended) = self.refreshing.get(&mark).map(|ended| Arc::clone(&ended)) else {
+            return false;
+        };
+        let ending = ended.notified();
+        tokio::pin!(ending);
+        ending.as_mut().enable();
+        let wait_start = Instant::now();
+        let still_refreshing = self.refreshing.contains_key(&mark)
+            && tokio::time::timeout(client_timeout, ending).await.is_err();
+        tracing::debug!(
+            event = "client_wait_for_refresh",
+            qname = %lookup.qname,
+            wait_ms = wait_start.elapsed().as_millis() as u64,
+            still_refreshing,
+            "waited for the background refresh of a stale answer"
+        );
+        still_refreshing
     }
 
     /// Internal handle_packet implementation / 内部 handle_packet 实现
@@ -5136,7 +5097,10 @@ mod tests {
             },
             &mut Default::default(),
         );
-        assert!(looked_up.is_none(), "an expired entry is not served");
+        assert!(
+            matches!(looked_up, phases::Looked::Missed),
+            "an expired entry is not served"
+        );
 
         // Assert: Verify cache entry was invalidated (serve_stale disabled in build_test_engine)
         assert!(
@@ -6037,13 +6001,8 @@ mod tests {
             let state = engine.state.load_full();
             let context = stale_com_lookup(&state, &peer, slot);
             assert_eq!(
-                phases::check_stale_cache_logged(
-                    &engine,
-                    &context,
-                    crate::observe::CacheHitKind::StaleUpstreamFailure,
-                    &mut Default::default()
-                )
-                .is_some(),
+                phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                    .is_some(),
                 served,
                 "expire_ttl {expire_ttl}: the fallback"
             );
@@ -6053,7 +6012,10 @@ mod tests {
             );
             engine.cache_insert(slot, stale_entry("default"));
             assert_eq!(
-                phases::check_cache_logged(&engine, &context, &mut Default::default()).is_some(),
+                matches!(
+                    phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                    phases::Looked::Answered(_)
+                ),
                 served,
                 "expire_ttl {expire_ttl}: the lookup"
             );
@@ -6084,16 +6046,15 @@ mod tests {
                 let state = engine.state.load_full();
                 let context = stale_com_lookup(&state, &peer, slot);
                 let served = if fallback {
-                    phases::check_stale_cache_logged(
-                        &engine,
-                        &context,
-                        crate::observe::CacheHitKind::StaleUpstreamFailure,
-                        &mut Default::default(),
-                    )
+                    phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                        .is_some()
                 } else {
-                    phases::check_cache_logged(&engine, &context, &mut Default::default())
+                    matches!(
+                        phases::check_cache_logged(&engine, &context, &mut Default::default()),
+                        phases::Looked::Answered(_)
+                    )
                 };
-                assert!(served.is_some(), "reset {reset}, fallback {fallback}");
+                assert!(served, "reset {reset}, fallback {fallback}");
                 let entry = engine.cached(slot).expect("still cached");
                 // `stale_entry` 10 秒前写入、TTL 5 秒 / `stale_entry` went in 10 s ago with a TTL of 5 s
                 let stale_for = entry.inserted_at.elapsed().as_secs() - entry.original_ttl as u64;
@@ -6144,13 +6105,8 @@ mod tests {
             };
             engine.cache_insert(dedupe_hash, entry.clone());
             assert_eq!(
-                phases::check_stale_cache_logged(
-                    &engine,
-                    &context,
-                    crate::observe::CacheHitKind::StaleUpstreamFailure,
-                    &mut Default::default()
-                )
-                .is_some(),
+                phases::check_stale_cache_logged(&engine, &context, &mut Default::default())
+                    .is_some(),
                 served,
                 "{rcode}: the fallback"
             );

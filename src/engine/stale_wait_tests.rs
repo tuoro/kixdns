@@ -57,16 +57,30 @@ impl EngineObserver for StaleKinds {
 }
 
 fn engine(upstream: &Upstream, kinds: Arc<StaleKinds>) -> Engine {
-    let config: crate::config::PipelineConfig = serde_json::from_value(json!({
-        "settings": counting_settings(json!({
-            "min_ttl": 0,
-            "serve_stale": true,
-            "serve_stale_client_timeout_ms": CLIENT_WAIT_MS
-        })),
-        "pipelines": [{ "id": "main", "rules": [{
+    engine_with(
+        json!({ "min_ttl": 0 }),
+        json!({
             "name": "all", "matchers": [{ "type": "any" }],
             "actions": [{ "type": "forward", "upstream": upstream.address }]
-        }]}]
+        }),
+        kinds,
+    )
+}
+
+/// 开着 serve_stale、客户端等 [`CLIENT_WAIT_MS`]，只有一条规则 `rule` 的引擎 / An engine with serve_stale
+/// on, a client wait of [`CLIENT_WAIT_MS`], and the one rule `rule`
+fn engine_with(
+    settings: serde_json::Value,
+    rule: serde_json::Value,
+    kinds: Arc<StaleKinds>,
+) -> Engine {
+    let mut all = json!({ "serve_stale": true, "serve_stale_client_timeout_ms": CLIENT_WAIT_MS });
+    for (key, value) in settings.as_object().unwrap() {
+        all[key] = value.clone();
+    }
+    let config: crate::config::PipelineConfig = serde_json::from_value(json!({
+        "settings": counting_settings(all),
+        "pipelines": [{ "id": "main", "rules": [rule] }]
     }))
     .expect("parse config");
     Engine::builder(
@@ -151,4 +165,60 @@ async fn a_refresh_still_running_is_waited_for() {
         "took {took:?}: the refresh was still running"
     );
     assert_eq!(*kinds.0.lock(), vec![CacheHitKind::StaleClientTimeout]);
+}
+
+/// 没有刷新可等时（同时在刷的到了上限，这次没发起）不等，交出的过期应答记成直接交出的那种。以前记成上游失败：刷新没在跑，
+/// 就当它失败过
+/// With no refresh to wait for (as many running at once as allowed, so this one did not
+/// start) the request does not wait, and the stale answer it gets is recorded as served at
+/// once. It used to be recorded as an upstream failure: no refresh running was taken for one
+/// that had failed
+#[tokio::test]
+async fn a_stale_answer_with_no_refresh_running_is_served_at_once() {
+    let up = failing_later(Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+    let kinds = Arc::new(StaleKinds::default());
+    let engine = engine(&up, kinds.clone());
+    ask(&engine, &query(), peer()).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    for mark in 0..crate::engine::refresh::REFRESHES_AT_ONCE as u64 {
+        engine
+            .refreshing
+            .insert(mark, Arc::new(tokio::sync::Notify::new()));
+    }
+
+    let started = Instant::now();
+    assert_eq!(first_a(&ask(&engine, &query(), peer()).await), Some(ANSWER));
+    assert!(started.elapsed() < Duration::from_millis(500), "no wait");
+    assert_eq!(*kinds.0.lock(), vec![CacheHitKind::Stale]);
+}
+
+/// 规则自己给出的过期应答没有上游可等，马上交出，记成直接交出的那种；它的刷新照样发起，把它重新决定一遍。以前也是马上交出，
+/// 却记成上游失败
+/// A stale answer the rules gave has no upstream to wait for: it goes out at once, recorded as
+/// served at once, its refresh starting all the same to decide it again. It went out at once
+/// before too, yet was recorded as an upstream failure
+#[tokio::test]
+async fn a_stale_answer_the_rules_gave_is_served_at_once() {
+    let up = failing_later(Arc::new(AtomicBool::new(false)), Duration::ZERO).await;
+    let kinds = Arc::new(StaleKinds::default());
+    let engine = engine_with(
+        json!({ "min_ttl": 1 }),
+        json!({
+            "name": "checked", "matchers": [{ "type": "any" }],
+            "actions": [{ "type": "forward", "upstream": up.address }],
+            "response_actions_on_match": [{ "type": "static_response", "rcode": "NXDOMAIN" }]
+        }),
+        kinds.clone(),
+    );
+    ask(&engine, &query(), peer()).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let started = Instant::now();
+    let reply = ask(&engine, &query(), peer()).await;
+    assert_eq!(
+        Message::from_vec(&reply).unwrap().metadata.response_code,
+        ResponseCode::NXDomain
+    );
+    assert!(started.elapsed() < Duration::from_millis(500), "no wait");
+    assert_eq!(*kinds.0.lock(), vec![CacheHitKind::Stale]);
 }
