@@ -83,6 +83,18 @@ pub const STUCK_KEPT: usize = 1000;
 /// two DoH connections per device, and TCP only when an answer was truncated
 pub const CONNECTION_BUDGET: usize = 512;
 
+/// 没开流控时，要等上游的查询一共在途到了这么多以后，再来的只给还没占满自己那一份的设备（见
+/// [`PermitManager::query_permit`]）。流控关着时这是唯一的上限：随机子域名洪泛碰上上游变慢，在途数约是每秒查询数乘以请求
+/// 超时，一个在途查询占几 KB，以前没有上限，路由器的内存就被撑满。开着流控时它按内存和排队来判断，不看这个数
+/// Without flow control, once this many queries waiting on an upstream are in flight in all, a
+/// further one goes only to a device not yet holding its share (see
+/// [`PermitManager::query_permit`]). With flow control off this is the only bound: with a flood
+/// of random subdomains meeting a slow upstream the queries in flight come to some queries a
+/// second times the request timeout, each holding a few KB, and with no bound there used to be
+/// a router's memory filled up. With flow control on it judges by memory and queueing instead,
+/// paying this no heed
+pub const QUERY_BUDGET: usize = 4096;
+
 /// 回答一般要多久，看最近这么多个回答里最慢的 `1 / SLOWEST_ONE_IN`，等过它的 [`WAITS_TIMES_SLOWEST`] 倍还没回答的算卡住
 /// How long answers usually take goes by the slowest `1 / SLOWEST_ONE_IN` of the latest
 /// answers, and a query waiting [`WAITS_TIMES_SLOWEST`] times that with no answer counts as
@@ -1419,6 +1431,19 @@ impl PermitManager {
             return None;
         }
         Some(self.acquire_connection_for(device))
+    }
+
+    /// 没开流控时 `device` 的一个要等上游的查询：在途的一共到了 [`QUERY_BUDGET`]，它又占着平分的那一份就不给，和连接一样
+    /// （见 [`Self::connection_permit`]）
+    /// A query of `device` waiting on an upstream without flow control: none once
+    /// [`QUERY_BUDGET`] are in flight in all and it holds its share of them, as for connections
+    /// (see [`Self::connection_permit`])
+    pub fn query_permit(self: &Arc<Self>, device: DeviceSlot) -> Option<PermitGuard> {
+        if self.queries.holds_share_of(device, QUERY_BUDGET) {
+            self.count_refused(Defence::Capacity);
+            return None;
+        }
+        Some(self.acquire_for(device))
     }
 
     /// 给 `device` 的一条连接拿 permit，也记在它那一份的连接上 / Takes a permit for a connection of
@@ -3024,6 +3049,30 @@ mod tests {
     /// one holding none still connects, with flow control on or off; closing one makes room for
     /// one. Without flow control a device used to get every connection it opened, until the
     /// descriptors ran out and no socket for asking upstreams could be opened either
+    /// 没开流控时要等上游的查询也有预算：一共在途到了预算以后，占满了自己那一份的设备不再给，没有在途的照常给；答完一个
+    /// 也只是它自己那一份少一个。以前没开流控时一台设备发多少放多少
+    /// Without flow control the queries waiting on an upstream have a budget too: once that many
+    /// are in flight in all, a device holding its share gets no more and one holding none still
+    /// gets one; one answered makes room in its own share alone. Without flow control a device
+    /// used to get every query it sent through
+    #[test]
+    fn queries_past_the_budget_go_by_shares_without_flow_control() {
+        let manager = Arc::new(PermitManager::new());
+        let mut held: Vec<_> = (0..QUERY_BUDGET)
+            .map(|_| manager.query_permit(ONE).expect("under the budget"))
+            .collect();
+        assert!(manager.query_permit(ONE).is_none(), "holding them all");
+        let _other = manager.query_permit(OTHER).expect("holding none");
+        assert_eq!(manager.dropped_requests(), 1);
+        held.pop();
+        assert!(
+            manager.query_permit(ONE).is_none(),
+            "still holding its share"
+        );
+        drop(held);
+        assert!(manager.query_permit(ONE).is_some(), "all answered");
+    }
+
     #[test]
     fn connections_past_the_budget_go_by_shares() {
         let manager = Arc::new(PermitManager::new());

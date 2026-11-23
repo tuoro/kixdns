@@ -340,20 +340,18 @@ impl Engine {
     }
 
     /// `client` 的一个要等上游的查询能不能处理，`emptied_at` 是 UDP socket 上次收空的时刻，TCP、DoH 和轮流时没有（见
-    /// `FlowControlState::permit`）；没开流控时都能处理
+    /// `FlowControlState::permit`）；没开流控时看在途的预算（见 `PermitManager::query_permit`）
     /// Whether a query from `client` that waits on an upstream can go ahead, `emptied_at` being
     /// when the UDP socket last ran empty, with none over TCP, DoH and while taking turns (see
-    /// `FlowControlState::permit`); without flow control it always can
+    /// `FlowControlState::permit`); without flow control by the budget in flight (see
+    /// `PermitManager::query_permit`)
     #[inline]
     pub fn query_permit(&self, emptied_at: Option<Instant>, client: IpAddr) -> Option<PermitGuard> {
-        let Some(state) = &self.flow_control_state else {
-            return Some(self.permit_manager.acquire());
+        let device = self.permit_manager.slot_of(client);
+        let permit = match &self.flow_control_state {
+            Some(state) => state.permit(&self.permit_manager, emptied_at, device),
+            None => self.permit_manager.query_permit(device),
         };
-        let permit = state.permit(
-            &self.permit_manager,
-            emptied_at,
-            self.permit_manager.slot_of(client),
-        );
         if permit.is_none() {
             self.permit_manager.note_refused(client);
         }
