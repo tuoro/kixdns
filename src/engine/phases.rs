@@ -721,71 +721,75 @@ pub(crate) async fn handle_forward_decision_logged(
         // 等别人的转发时卡住、不等了的失败 / The failure of waiting no more, stuck on another's
         // forward
         let mut gave_up = None;
+        // 等的那个请求没交出结果就走了（被取消、超时）：重新排一次，空着就自己登记、去问，已经有人重新登记了就等它。
+        // 以前直接各自去问，一个领头的带着几个等待者走掉，上游就要被多问几遍。每一圈都有一个领头的走掉，圈数不会多过
+        // 同时在等的请求
+        // The one waited on went away without a result (cancelled, timed out): line up again,
+        // registering and asking when the place is free, or waiting on whoever registered again
+        // first. Each used to ask by itself, and a leader leaving with several waiting had the
+        // upstream asked that many times over. A leader leaves on every round, so there are no
+        // more rounds than requests waiting at once
         if !skip_cache {
-            use dashmap::mapref::entry::Entry;
-            let rx = match engine.inflight.entry(keys.inflight) {
-                Entry::Vacant(entry) => {
-                    entry.insert(InflightEntry::sharing(
-                        &inflight_question,
-                        key_pipeline_id,
-                        Arc::<[u8]>::from(Arc::clone(qname)),
-                    ));
-                    cleanup_guard = Some(InflightCleanupGuard::new(
-                        engine.inflight.clone(),
-                        keys.inflight,
-                    ));
-                    None
-                }
-                // A request holding an entry (see `held_inflight`) never waits
-                // on one: the entry may be its own, which the next rule forwards
-                // under after a continue, or another request's that waits on
-                // this one in turn (continue, then jump into each other's
-                // pipeline). It forwards itself instead.
-                // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
-                // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
-                // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
-                // 自己转发。
-                Entry::Occupied(_) if held_inflight.is_some() => None,
-                // Another question's entry under the same key: the key is only a hash (see
-                // `InflightQuestion`), and waiting on it would hand this request another
-                // question's answer. It forwards itself instead.
-                // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
-                // 别的问题的应答交给这个请求。它自己转发。
-                Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => None,
-                Entry::Occupied(mut entry) => Some(entry.get_mut().subscribe()),
-            };
-
-            // 等别人正在做的同一个转发。开了流控时这次等待也看卡没卡住（见 `PermitManager::join`）：卡住了、这台设备
-            // 留着等的又已经够多，就不等了，照上游失败往下走
-            // Waiting on the same forward another is making. With flow control on this wait too
-            // is seen to for being stuck (see `PermitManager::join`): stuck with enough of the
-            // device's kept waiting already it waits no more, and goes on below as the upstream
-            // failing
-            let joined = match rx {
-                Some(mut rx) => {
-                    let waiting = async {
-                        rx.changed().await.ok()?;
-                        Some(rx.borrow().clone())
-                    };
-                    match crate::engine::upstream::wait_for_another(
-                        engine,
-                        peer.ip(),
-                        upstream,
-                        upstream_timeout,
-                        waiting,
-                    )
-                    .await
-                    {
-                        Ok(joined) => joined,
-                        Err(failure) => {
-                            gave_up = Some(failure);
-                            None
-                        }
+            loop {
+                use dashmap::mapref::entry::Entry;
+                let mut rx = match engine.inflight.entry(keys.inflight) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(InflightEntry::sharing(
+                            &inflight_question,
+                            key_pipeline_id,
+                            Arc::<[u8]>::from(Arc::clone(qname)),
+                        ));
+                        cleanup_guard = Some(InflightCleanupGuard::new(
+                            engine.inflight.clone(),
+                            keys.inflight,
+                        ));
+                        break;
                     }
-                }
-                None => None,
-            };
-            if let Some(result) = joined {
+                    // A request holding an entry (see `held_inflight`) never waits
+                    // on one: the entry may be its own, which the next rule forwards
+                    // under after a continue, or another request's that waits on
+                    // this one in turn (continue, then jump into each other's
+                    // pipeline). It forwards itself instead.
+                    // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
+                    // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
+                    // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
+                    // 自己转发。
+                    Entry::Occupied(_) if held_inflight.is_some() => break,
+                    // Another question's entry under the same key: the key is only a hash (see
+                    // `InflightQuestion`), and waiting on it would hand this request another
+                    // question's answer. It forwards itself instead.
+                    // 同一个键下别的问题的条目：键只是哈希（见 `InflightQuestion`），等它就会把
+                    // 别的问题的应答交给这个请求。它自己转发。
+                    Entry::Occupied(entry) if !entry.get().asks(&inflight_question) => break,
+                    Entry::Occupied(mut entry) => entry.get_mut().subscribe(),
+                };
+
+                // 等别人正在做的同一个转发。开了流控时这次等待也看卡没卡住（见 `PermitManager::join`）：卡住了、这台设备
+                // 留着等的又已经够多，就不等了，照上游失败往下走
+                // Waiting on the same forward another is making. With flow control on this wait too
+                // is seen to for being stuck (see `PermitManager::join`): stuck with enough of the
+                // device's kept waiting already it waits no more, and goes on below as the upstream
+                // failing
+                let waiting = async {
+                    rx.changed().await.ok()?;
+                    Some(rx.borrow().clone())
+                };
+                let result = match crate::engine::upstream::wait_for_another(
+                    engine,
+                    peer.ip(),
+                    upstream,
+                    upstream_timeout,
+                    waiting,
+                )
+                .await
+                {
+                    Ok(Some(result)) => result,
+                    Ok(None) => continue,
+                    Err(failure) => {
+                        gave_up = Some(failure);
+                        break;
+                    }
+                };
                 if let Some((observer, ctx)) = observed {
                     observer.inflight_joined(ctx);
                 }
