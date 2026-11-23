@@ -764,21 +764,15 @@ pub struct RuntimeMatcherWithOp {
     pub matcher: RuntimeMatcher,
 }
 
+/// pipeline_select 的匹配器：监听器标签，或者和规则一样的请求匹配器，读法和判断都是同一份（见
+/// [`RuntimeMatcher::matches_ready`]）。以前另有一套变体，把每种匹配器重写了一遍
+/// A pipeline_select matcher: the listener label, or a request matcher as rules have, read and
+/// judged the same way (see [`RuntimeMatcher::matches_ready`]). It used to have variants of its
+/// own, every kind of matcher written out again
 #[derive(Debug, Clone)]
 pub enum RuntimePipelineSelectorMatcher {
     ListenerLabel { value: Arc<str> },
-    ClientIp { net: IpNet },
-    DomainSuffix { value: Arc<str> },
-    DomainExact { value: Arc<str> },
-    DomainRegex { regex: Regex },
-    Any,
-    Qclass { value: DNSClass },
-    EdnsPresent { expect: bool },
-    GeoSite { tag: Arc<str> },
-    GeoSiteNot { tag: Arc<str> },
-    GeoipCountry { country_codes: Vec<Arc<str>> },
-    GeoipPrivate { expect: bool },
-    Qtype { value: RecordType },
+    Request(RuntimeMatcher),
 }
 
 #[derive(Debug, Clone)]
@@ -1389,6 +1383,39 @@ impl RuntimeMatcher {
             &std::sync::Arc<parking_lot::RwLock<crate::matcher::geosite::GeoSiteManager>>,
         >,
     ) -> bool {
+        // 按需拿锁：只有要用 Geo 数据的匹配器才拿 / Locks on demand: only a matcher using Geo data takes one
+        let geoip = geoip_manager
+            .filter(|_| self.needs_geoip())
+            .map(|manager| manager.read());
+        let geosite = geosite_manager
+            .filter(|_| self.needs_geosite())
+            .map(|manager| manager.read());
+        self.matches_ready(
+            qname,
+            qclass,
+            client_ip,
+            edns_present,
+            qtype,
+            geoip.as_deref(),
+            geosite.as_deref(),
+        )
+    }
+
+    /// 拿着现成的 Geo 数据判断：规则（经 [`Self::matches_with_qtype`]）和 pipeline_select 都走这里。没有
+    /// GeoSite 数据时 geo_site 不命中、geo_site_not 命中，没有 GeoIP 数据时 geoip_country 不命中
+    /// Judges with the Geo data at hand: rules (through [`Self::matches_with_qtype`]) and
+    /// pipeline_select both come here. Without GeoSite data geo_site does not match and
+    /// geo_site_not does, and without GeoIP data geoip_country does not match
+    pub fn matches_ready(
+        &self,
+        qname: &str,
+        qclass: DNSClass,
+        client_ip: IpAddr,
+        edns_present: bool,
+        qtype: RecordType,
+        geoip: Option<&crate::matcher::geoip::GeoIpManager>,
+        geosite: Option<&crate::matcher::geosite::GeoSiteManager>,
+    ) -> bool {
         match self {
             RuntimeMatcher::Any => true,
             RuntimeMatcher::DomainExact { value } => {
@@ -1399,10 +1426,7 @@ impl RuntimeMatcher {
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
             RuntimeMatcher::GeoipCountry { country_codes } => {
-                // 按需获取锁：只在GeoIP matcher时才获取 / On-demand lock: only acquire for GeoIP matcher
-                geoip_manager
-                    .map(|mgr| mgr.read())
-                    .is_some_and(|guard| guard.matches_any_tag(client_ip, country_codes))
+                geoip.is_some_and(|manager| manager.matches_any_tag(client_ip, country_codes))
             }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 crate::matcher::geoip::is_private_ip(client_ip) == *expect
@@ -1410,22 +1434,28 @@ impl RuntimeMatcher {
             RuntimeMatcher::Qclass { value } => &qclass == value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
             RuntimeMatcher::GeoSite { tag } => {
-                // 按需获取锁：只在GeoSite matcher时才获取 / On-demand lock: only acquire for GeoSite matcher
-                geosite_manager
-                    .map(|mgr| mgr.read())
-                    .is_some_and(|guard| guard.matches(tag, qname))
+                geosite.is_some_and(|manager| manager.matches(tag, qname))
             }
             RuntimeMatcher::GeoSiteNot { tag } => {
-                // 按需获取锁：只在GeoSite matcher时才获取
-                if let Some(manager) = geosite_manager {
-                    let guard = manager.read();
-                    !guard.matches(tag, qname)
-                } else {
-                    true // 无GeoSite管理器时，GeoSiteNot返回true
-                }
+                geosite.is_none_or(|manager| !manager.matches(tag, qname))
             }
             RuntimeMatcher::Qtype { value } => *value == qtype,
         }
+    }
+
+    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
+    #[inline]
+    pub const fn needs_geosite(&self) -> bool {
+        matches!(
+            self,
+            RuntimeMatcher::GeoSite { .. } | RuntimeMatcher::GeoSiteNot { .. }
+        )
+    }
+
+    /// 要不要 GeoIP 数据（`geoip_private` 不要）/ Whether it needs GeoIP data (`geoip_private` does not)
+    #[inline]
+    pub const fn needs_geoip(&self) -> bool {
+        matches!(self, RuntimeMatcher::GeoipCountry { .. })
     }
 }
 
@@ -1441,87 +1471,40 @@ pub struct PipelineSelectorQuery<'a> {
 
 impl RuntimePipelineSelectorMatcher {
     fn from_config(m: config::PipelineSelectorMatcher) -> anyhow::Result<Self> {
-        Ok(match m {
-            config::PipelineSelectorMatcher::ListenerLabel { value } => {
-                RuntimePipelineSelectorMatcher::ListenerLabel {
+        use config::{Matcher, PipelineSelectorMatcher as Selector};
+        let request = match m {
+            Selector::ListenerLabel { value } => {
+                return Ok(Self::ListenerLabel {
                     value: Arc::from(value),
-                }
+                });
             }
-            config::PipelineSelectorMatcher::ClientIp { cidr } => {
-                RuntimePipelineSelectorMatcher::ClientIp {
-                    net: client_net(&cidr)?,
-                }
-            }
-            config::PipelineSelectorMatcher::DomainSuffix { value } => {
-                RuntimePipelineSelectorMatcher::DomainSuffix {
-                    value: domain_value(&value),
-                }
-            }
-            config::PipelineSelectorMatcher::DomainExact { value } => {
-                RuntimePipelineSelectorMatcher::DomainExact {
-                    value: domain_value(&value),
-                }
-            }
-            config::PipelineSelectorMatcher::DomainRegex { value } => {
-                RuntimePipelineSelectorMatcher::DomainRegex {
-                    regex: domain_regex(&value)?,
-                }
-            }
-            config::PipelineSelectorMatcher::Any => RuntimePipelineSelectorMatcher::Any,
-            config::PipelineSelectorMatcher::Qclass { value } => {
-                RuntimePipelineSelectorMatcher::Qclass {
-                    value: parse_dns_class(&value)?,
-                }
-            }
-            config::PipelineSelectorMatcher::EdnsPresent { expect } => {
-                RuntimePipelineSelectorMatcher::EdnsPresent { expect }
-            }
-            config::PipelineSelectorMatcher::GeoSite { value } => {
-                RuntimePipelineSelectorMatcher::GeoSite {
-                    tag: Arc::from(value),
-                }
-            }
-            config::PipelineSelectorMatcher::GeoSiteNot { value } => {
-                RuntimePipelineSelectorMatcher::GeoSiteNot {
-                    tag: Arc::from(value),
-                }
-            }
-            config::PipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                RuntimePipelineSelectorMatcher::GeoipCountry {
-                    country_codes: normalize_geoip_country_codes(country_codes, "geoip_country"),
-                }
-            }
-            config::PipelineSelectorMatcher::GeoipPrivate { expect } => {
-                RuntimePipelineSelectorMatcher::GeoipPrivate { expect }
-            }
-            config::PipelineSelectorMatcher::Qtype { value } => {
-                RuntimePipelineSelectorMatcher::Qtype {
-                    value: parse_dns_type(&value)?,
-                }
-            }
-        })
+            Selector::ClientIp { cidr } => Matcher::ClientIp { cidr },
+            Selector::DomainSuffix { value } => Matcher::DomainSuffix { value },
+            Selector::DomainExact { value } => Matcher::DomainExact { value },
+            Selector::DomainRegex { value } => Matcher::DomainRegex { value },
+            Selector::Any => Matcher::Any,
+            Selector::Qclass { value } => Matcher::Qclass { value },
+            Selector::EdnsPresent { expect } => Matcher::EdnsPresent { expect },
+            Selector::GeoSite { value } => Matcher::GeoSite { value },
+            Selector::GeoSiteNot { value } => Matcher::GeoSiteNot { value },
+            Selector::GeoipCountry { country_codes } => Matcher::GeoipCountry { country_codes },
+            Selector::GeoipPrivate { expect } => Matcher::GeoipPrivate { expect },
+            Selector::Qtype { value } => Matcher::Qtype { value },
+        };
+        RuntimeMatcher::from_config(request).map(Self::Request)
     }
 
-    /// Returns true if this matcher requires the GeoSite manager to evaluate.
-    /// Used to skip unnecessary RwLock acquisition in the hot path.
-    ///
-    /// 如果此匹配器需要 GeoSite 管理器才能评估则返回 true。
-    /// 用于在热路径中跳过不必要的 RwLock 获取。
+    /// 要不要 GeoSite 数据；不要的话选 pipeline 时不拿它的锁 / Whether it needs GeoSite data; without
+    /// that, choosing a pipeline takes no lock on it
     #[inline]
     pub const fn needs_geosite(&self) -> bool {
-        matches!(
-            self,
-            RuntimePipelineSelectorMatcher::GeoSite { .. }
-                | RuntimePipelineSelectorMatcher::GeoSiteNot { .. }
-        )
+        matches!(self, Self::Request(matcher) if matcher.needs_geosite())
     }
 
-    /// Returns true if this matcher requires the GeoIP manager to evaluate.
-    ///
-    /// 如果此匹配器需要 GeoIP 管理器才能评估则返回 true。
+    /// 要不要 GeoIP 数据 / Whether it needs GeoIP data
     #[inline]
     pub const fn needs_geoip(&self) -> bool {
-        matches!(self, RuntimePipelineSelectorMatcher::GeoipCountry { .. })
+        matches!(self, Self::Request(matcher) if matcher.needs_geoip())
     }
 
     #[inline]
@@ -1531,47 +1514,17 @@ impl RuntimePipelineSelectorMatcher {
         geoip_ready: Option<&crate::matcher::geoip::GeoIpManager>,
         geosite_ready: Option<&crate::matcher::geosite::GeoSiteManager>,
     ) -> bool {
-        let PipelineSelectorQuery {
-            listener_label,
-            client_ip,
-            qname,
-            qclass,
-            edns_present,
-            qtype,
-        } = *query;
-
         match self {
-            RuntimePipelineSelectorMatcher::ListenerLabel { value } => {
-                value.eq_ignore_ascii_case(listener_label)
-            }
-            RuntimePipelineSelectorMatcher::ClientIp { net } => net.contains(&client_ip),
-            RuntimePipelineSelectorMatcher::DomainSuffix { value } => {
-                domain_suffix_matches(qname, value)
-            }
-            RuntimePipelineSelectorMatcher::DomainExact { value } => {
-                qname.eq_ignore_ascii_case(value)
-            }
-            RuntimePipelineSelectorMatcher::DomainRegex { regex } => regex.is_match(qname),
-            RuntimePipelineSelectorMatcher::Any => true,
-            RuntimePipelineSelectorMatcher::Qclass { value } => value == &qclass,
-            RuntimePipelineSelectorMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimePipelineSelectorMatcher::GeoSite { tag } => {
-                geosite_ready.is_some_and(|mgr| mgr.matches(tag, qname))
-            }
-            RuntimePipelineSelectorMatcher::GeoSiteNot { tag } => {
-                if let Some(mgr) = geosite_ready {
-                    !mgr.matches(tag, qname)
-                } else {
-                    false
-                }
-            }
-            RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                geoip_ready.is_some_and(|mgr| mgr.matches_any_tag(client_ip, country_codes))
-            }
-            RuntimePipelineSelectorMatcher::GeoipPrivate { expect } => {
-                crate::matcher::geoip::is_private_ip(client_ip) == *expect
-            }
-            RuntimePipelineSelectorMatcher::Qtype { value } => *value == qtype,
+            Self::ListenerLabel { value } => value.eq_ignore_ascii_case(query.listener_label),
+            Self::Request(matcher) => matcher.matches_ready(
+                query.qname,
+                query.qclass,
+                query.client_ip,
+                query.edns_present,
+                query.qtype,
+                geoip_ready,
+                geosite_ready,
+            ),
         }
     }
 }
@@ -2807,9 +2760,9 @@ mod tests {
             None,
         ));
 
-        let pipeline = RuntimePipelineSelectorMatcher::GeoipCountry {
+        let pipeline = RuntimePipelineSelectorMatcher::Request(RuntimeMatcher::GeoipCountry {
             country_codes: tags.clone(),
-        };
+        });
         let query = PipelineSelectorQuery {
             listener_label: "test",
             client_ip: ip,

@@ -269,13 +269,10 @@ pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<Stri
     // Scan pipeline_select rules / 扫描 pipeline_select 规则
     for rule in &cfg.pipeline_select {
         for matcher in &rule.matchers {
-            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSite { tag } =
-                &matcher.matcher
-            {
-                tags_set.insert(tag.clone());
-            }
-            if let crate::matcher::RuntimePipelineSelectorMatcher::GeoSiteNot { tag } =
-                &matcher.matcher
+            if let crate::matcher::RuntimePipelineSelectorMatcher::Request(
+                crate::matcher::RuntimeMatcher::GeoSite { tag }
+                | crate::matcher::RuntimeMatcher::GeoSiteNot { tag },
+            ) = &matcher.matcher
             {
                 tags_set.insert(tag.clone());
             }
@@ -326,9 +323,9 @@ pub fn extract_geoip_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String
         .iter()
         .flat_map(|rule| &rule.matchers)
         .filter_map(|matcher| match &matcher.matcher {
-            crate::matcher::RuntimePipelineSelectorMatcher::GeoipCountry { country_codes } => {
-                Some(country_codes)
-            }
+            crate::matcher::RuntimePipelineSelectorMatcher::Request(
+                crate::matcher::RuntimeMatcher::GeoipCountry { country_codes },
+            ) => Some(country_codes),
             _ => None,
         });
     let rules = cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules);
