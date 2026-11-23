@@ -198,8 +198,11 @@ fn a_taken_dns_port_ends_the_kernel_with_the_reason() {
 fn a_taken_doh_port_leaves_dns_answering() {
     let dir = tempfile::TempDir::new().unwrap();
     let port = free_port();
-    let doh_port = free_port();
-    let _doh = TcpListener::bind((Ipv4Addr::LOCALHOST, doh_port)).unwrap();
+    // 占着的端口直接由系统给，拿到时就已经占上：先挑一个空着的再去占，中间可能被别的测试抢走
+    // The taken port comes straight from the system, taken the moment it is had: picking a free one
+    // and then taking it left a gap in which another test could take it first
+    let doh = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let doh_port = doh.local_addr().unwrap().port();
     let mut kernel = start(
         dir.path(),
         serde_json::json!({

@@ -108,9 +108,21 @@ jobs:
 
       - name: Install musl toolchain
         if: matrix.toolset == 'musl'
+        timeout-minutes: 20
         run: |
-          sudo apt update
-          sudo apt install -y musl-tools musl-dev
+          # apt 偶尔卡在一条不动的连接上，自己的超时不管用，一等就是一个多小时（这台构建机的镜像连不上，退到
+          # archive.ubuntu.com 以后读完一个 InRelease 就再没动静）。每次最多等 5 分钟，卡住就重来，最多 3 次
+          # apt now and then hangs on a connection that does not move, which its own timeouts do not
+          # catch, for over an hour (the runner's mirror unreachable, it turned to archive.ubuntu.com
+          # and went still after one InRelease). Each try gets at most 5 minutes, and a stuck one is
+          # tried again, 3 times at most
+          for attempt in 1 2 3; do
+            sudo timeout 300 apt-get -o Acquire::Retries=3 update \
+              && sudo timeout 300 apt-get -o Acquire::Retries=3 install -y musl-tools musl-dev \
+              && exit 0
+            echo "apt attempt $attempt failed"
+          done
+          exit 1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
