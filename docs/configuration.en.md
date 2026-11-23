@@ -237,7 +237,8 @@ The inbound DoH handler:
 - accepts GET requests at the configured path with a dns base64url-without-padding query parameter;
 - rejects queries over 4096 bytes (a POST body with 413, a GET dns parameter decoding longer with 400), the same bound as over UDP and TCP;
 - answers standard queries only, as UDP and TCP do: a request with an opcode other than 0 gets NOTIMP, and a query with a question count other than 1 and the like FORMERR (both 200, the header alone); a response with QR=1 gets 400;
-- returns application/dns-message for a successful DNS response.
+- returns application/dns-message for a successful DNS response;
+- pads the answer to a query carrying EDNS padding (RFC 7830) to a multiple of 468 bytes (RFC 8467 section 4.1), and an answer to one without none. The UDP and TCP listeners are cleartext and pad nothing (RFC 7830 section 6).
 
 DoT and DoQ are implemented as outbound transports. There are no inbound DoT or DoQ listeners.
 
@@ -281,7 +282,7 @@ An upstream answer is taken only when it answers this query's question (the name
 
 Queries sent upstream always carry the AD bit (RFC 6840 section 5.7), so a validating upstream's answer always carries its verdict; for a client whose query had neither AD nor DO the answer loses AD (section 5.8), so the AD a client sees does not depend on who filled the cache. A TSIG-signed query is sent as it is. An answer handed on always loses its AA bit: KixDNS is not the authority for that data, less so for what comes from its cache.
 
-Queries sent upstream over DoT, DoH and DoQ carry EDNS padding (RFC 7830) bringing them to a multiple of 128 bytes (RFC 8467 section 4.1); a query without EDNS gets an OPT for it (RFC 9250 section 5.4 has every DoQ query padded), and such a client still gets an answer without one. Nothing is padded over UDP or TCP (RFC 7830 section 6). Padding belongs to one hop: the padding in a client's query is not passed upstream, and the padding in an upstream's answer enters neither the cache nor a client's answer. A signed query goes out as it is.
+Queries sent upstream over DoT, DoH and DoQ carry EDNS padding (RFC 7830) bringing them to a multiple of 128 bytes (RFC 8467 section 4.1); a query without EDNS gets an OPT for it (RFC 9250 section 5.4 has every DoQ query padded), and such a client still gets an answer without one. Nothing is padded over UDP or TCP (RFC 7830 section 6). Padding belongs to one hop: the padding in a client's query is not passed upstream, and the padding in an upstream's answer enters neither the cache nor a client's answer (inbound DoH pads by the client's query itself, see above). A signed query goes out as it is.
 
 When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fallback is enabled by default and can be disabled with settings.enable_tcp_fallback. When TCP gives no full answer for a truncated one (the upstream's TCP blocked, say), the truncated answer goes back, and the client turns to TCP itself on seeing the TC bit. The fallback is applied by the forwarding path; it is not an additional listener.
 

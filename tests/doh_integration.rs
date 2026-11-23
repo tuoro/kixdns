@@ -346,6 +346,81 @@ async fn test_doh_get_missing_dns_param() {
 }
 
 // ============================================================================
+// EDNS padding (RFC 7830, RFC 8467)
+// ============================================================================
+
+/// 带 EDNS 的 A 查询；`padded` 时再带一个 7 字节的 PADDING 选项
+/// An A query with EDNS, carrying a 7-byte PADDING option as well when `padded`
+fn make_edns_query(domain: &str, txid: u16, padded: bool) -> Vec<u8> {
+    use hickory_proto::op::Edns;
+    use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+    let mut msg = Message::from_vec(&make_dns_query(domain, txid)).unwrap();
+    let mut edns = Edns::new();
+    edns.set_max_payload(1232);
+    if padded {
+        edns.options_mut().insert(EdnsOption::Unknown(
+            u16::from(EdnsCode::Padding),
+            vec![0; 7],
+        ));
+    }
+    msg.edns = Some(edns);
+    msg.to_vec().unwrap()
+}
+
+/// 查询带了填充，回答就填充（RFC 7830 第 4 节）：补到 468 字节的整数倍（RFC 8467 第 4.1 节），OPT 的最后
+/// 一个选项是全零的填充；查询没带填充的，回答也不带。POST 和 GET 一样
+/// A padded query gets a padded answer (RFC 7830 section 4): brought to a multiple of 468 bytes
+/// (RFC 8467 section 4.1), the last option of its OPT padding of zeros; a query without padding
+/// gets an answer without. POST and GET alike
+#[tokio::test]
+async fn test_doh_pads_the_answer_to_a_padded_query() {
+    use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+    let server = start_doh(make_static_ip_engine()).await;
+    let client = make_https_client();
+
+    for padded in [true, false] {
+        let query = make_edns_query("padded.example.com", 0x7777, padded);
+        let get = format!(
+            "{}?dns={}",
+            doh_url(server.port),
+            URL_SAFE_NO_PAD.encode(&query)
+        );
+        let answers = [
+            post(&client, server.port, query)
+                .send()
+                .await
+                .expect("POST request"),
+            client.get(&get).send().await.expect("GET request"),
+        ];
+        for answer in answers {
+            let body = answer.bytes().await.expect("read body");
+            let msg = Message::from_bytes(&body).expect("parse DNS response");
+            assert!(
+                !msg.answers.is_empty(),
+                "padded {padded}: the answer itself"
+            );
+            let options = &msg.edns.as_ref().expect("an OPT").options().options;
+            let paddings: Vec<_> = options
+                .iter()
+                .filter(|(code, _)| *code == EdnsCode::Padding)
+                .collect();
+            if !padded {
+                assert!(paddings.is_empty(), "{options:?}");
+                continue;
+            }
+            assert_eq!(body.len() % 468, 0, "{} bytes", body.len());
+            assert_eq!(paddings.len(), 1, "{options:?}");
+            match options.last() {
+                Some((EdnsCode::Padding, EdnsOption::Unknown(_, zeros))) => {
+                    assert!(zeros.iter().all(|&byte| byte == 0))
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Error path tests
 // ============================================================================
 

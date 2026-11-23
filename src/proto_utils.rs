@@ -1331,6 +1331,10 @@ pub(crate) fn reply_without_hop_options(reply: Bytes) -> Bytes {
 /// transport is padded to (RFC 8467 section 4.1)
 const QUERY_BLOCK: usize = 128;
 
+/// 加密传输上的应答补齐到的块长（RFC 8467 第 4.1 节）/ The block length a reply over an encrypted
+/// transport is padded to (RFC 8467 section 4.1)
+const REPLY_BLOCK: usize = 468;
+
 /// 经加密传输（DoT、DoH、DoQ）发往上游的查询：OPT 的末尾加一个全是零的 PADDING 选项（RFC 7830），整个
 /// 查询补到 [`QUERY_BLOCK`] 的整数倍（RFC 8467 第 4.1 节），密文的长度就看不出问的是什么。没有 OPT 的
 /// 查询补一条带这个选项的 OPT：RFC 9250 第 5.4 节要求 DoQ 的每个查询都填充，上游也只给带 EDNS 的查询填充
@@ -1345,13 +1349,32 @@ const QUERY_BLOCK: usize = 128;
 /// that cannot be read and one that padding would take past 65535 bytes are handed back as
 /// they are. Any padding the query had is already gone (see [`query_without_hop_options`])
 pub(crate) fn padded_query(query: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    padding_added(query).map_or(std::borrow::Cow::Borrowed(query), std::borrow::Cow::Owned)
+    padding_added(query, QUERY_BLOCK)
+        .map_or(std::borrow::Cow::Borrowed(query), std::borrow::Cow::Owned)
 }
 
-/// [`padded_query`] 补好的查询；原样交回时为 None / The query [`padded_query`] pads; None when it
-/// is handed back as it is
-fn padding_added(query: &[u8]) -> Option<Vec<u8>> {
-    let walk = walk_records(query);
+/// 经入站 DoH 交回的应答：查询带了 PADDING 选项时补到 [`REPLY_BLOCK`] 的整数倍（RFC 8467 第 4.1 节），
+/// 补法同 [`padded_query`]，RFC 7830 第 4 节要求这样的查询得到填充过的应答。查询没带时原样交回：交给客户端
+/// 的应答本身不带填充（见 [`reply_without_hop_options`]）
+/// A reply handed back over inbound DoH: padded to a multiple of [`REPLY_BLOCK`] (RFC 8467
+/// section 4.1) the way [`padded_query`] pads when the query carried a PADDING option, as RFC
+/// 7830 section 4 requires for such a query. Without one it is handed back as it is: a reply
+/// for a client carries no padding of its own (see [`reply_without_hop_options`])
+pub(crate) fn reply_padded_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
+    let asked = find_opt(query)
+        .ok()
+        .flatten()
+        .is_some_and(|opt| has_option(query, opt.rdata, &[PADDING]));
+    if !asked {
+        return reply;
+    }
+    padding_added(&reply, REPLY_BLOCK).map_or(reply, Bytes::from)
+}
+
+/// 补到 `block` 的整数倍的报文（见 [`padded_query`]）；原样交回时为 None / The message padded to a
+/// multiple of `block` (see [`padded_query`]); None when it is handed back as it is
+fn padding_added(message: &[u8], block: usize) -> Option<Vec<u8>> {
+    let walk = walk_records(message);
     if walk.last_is_tsig {
         return None;
     }
@@ -1360,18 +1383,18 @@ fn padding_added(query: &[u8]) -> Option<Vec<u8>> {
     // empty one is appended, its RDLENGTH being the last two bytes
     let (mut out, rdlen_at) = match walk.opt.ok()? {
         Some(opt) if opt.last => {
-            let mut out = Vec::with_capacity(opt.rdata.end + 4 + QUERY_BLOCK);
-            out.extend_from_slice(&query[..opt.rdata.end]);
+            let mut out = Vec::with_capacity(opt.rdata.end + 4 + block);
+            out.extend_from_slice(&message[..opt.rdata.end]);
             (out, opt.rdlen_at)
         }
         Some(_) => return None,
         None => {
-            let out = with_opt(query, false, &[])?;
+            let out = with_opt(message, false, &[])?;
             let rdlen_at = out.len() - 2;
             (out, rdlen_at)
         }
     };
-    let padded = (out.len() + 4).next_multiple_of(QUERY_BLOCK);
+    let padded = (out.len() + 4).next_multiple_of(block);
     if padded > usize::from(u16::MAX) {
         return None;
     }
