@@ -6,6 +6,7 @@
 //! lookups and replays, rule evaluation and decisions, upstream attempts,
 //! shared in-flight queries, cancelled requests and configuration reloads.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -680,6 +681,108 @@ async fn reload_events_carry_the_generation_they_allocated() {
                 source: None,
             },
         ]
+    );
+}
+
+/// 每份生效的配置里有哪些 pipeline、规则和上游 / The pipelines, rules and upstreams of each
+/// configuration taking effect
+type Names = (Vec<String>, Vec<(String, String)>, Vec<(String, Transport)>);
+
+#[derive(Default)]
+struct ConfigNames(Mutex<Vec<Names>>);
+
+impl EngineObserver for ConfigNames {
+    fn config_loaded(&self, event: &ConfigLoaded<'_>) {
+        self.0.lock().unwrap().push((
+            event.pipelines.iter().map(|id| id.to_string()).collect(),
+            event
+                .rules
+                .iter()
+                .map(|&(pipeline, rule)| (pipeline.to_string(), rule.to_string()))
+                .collect(),
+            event
+                .upstreams
+                .iter()
+                .map(|&(address, transport)| (address.to_string(), transport))
+                .collect(),
+        ));
+    }
+}
+
+/// 每份生效的配置都告诉观察者它的 pipeline、规则和上游，名字和请求的事件里报的一样：上游是去掉前缀的地址和问它的
+/// 传输，各一次，回答阶段的转发和没写上游、问默认上游的也算；没有 pipeline 的配置报 `default`
+/// Every configuration taking effect tells the observer its pipelines, rules and upstreams,
+/// named as the request events name them: an upstream is its address short of the prefix and
+/// the transport it is asked over, each once, answer-phase forwards and those naming no
+/// upstream, which ask the default one, included; a configuration with no pipelines reports
+/// `default`
+#[tokio::test]
+async fn a_loaded_configuration_names_its_pipelines_rules_and_upstreams() {
+    let raw = serde_json::json!({
+        "settings": { "default_upstream": "1.1.1.1:53" },
+        "pipelines": [
+            { "id": "main", "rules": [
+                { "name": "encrypted", "matchers": [{ "type": "domain_suffix", "value": "a.test" }],
+                  "actions": [{ "type": "forward", "upstream": "tls://dns.example, 9.9.9.9:53" }] },
+                { "name": "checked", "matchers": [{ "type": "any" }],
+                  "actions": [{ "type": "forward", "upstream": null, "transport": "tcp" }],
+                  "response_matchers": [{ "type": "response_rcode", "value": "SERVFAIL" }],
+                  "response_actions_on_match": [{ "type": "forward", "upstream": "https://doh.example/dns-query" }] },
+                { "name": "again", "matchers": [{ "type": "domain_suffix", "value": "b.test" }],
+                  "actions": [{ "type": "forward", "upstream": "9.9.9.9:53" }] }
+            ] },
+            { "id": "other", "rules": [] }
+        ]
+    })
+    .to_string();
+    let names = Arc::new(ConfigNames::default());
+    let engine = Engine::builder(runtime_config(&raw))
+        .observer(names.clone())
+        .build()
+        .expect("build engine");
+    engine.reload(runtime_config(
+        r#"{ "settings": { "default_upstream": "1.1.1.1:53" } }"#,
+    ));
+
+    // 上游各报一次，顺序不定 / Each upstream is reported once, in no set order
+    let upstreams = |loaded: &Names| {
+        let set: HashSet<_> = loaded.2.iter().cloned().collect();
+        assert_eq!(set.len(), loaded.2.len(), "an upstream reported twice");
+        set
+    };
+    let set = |items: &[(&str, Transport)]| {
+        items
+            .iter()
+            .map(|&(address, transport)| (address.to_string(), transport))
+            .collect::<HashSet<_>>()
+    };
+    let loaded = names.0.lock().unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].0, ["main", "other"]);
+    assert_eq!(
+        loaded[0].1,
+        [
+            ("main", "encrypted"),
+            ("main", "checked"),
+            ("main", "again")
+        ]
+        .map(|(pipeline, rule)| (pipeline.to_string(), rule.to_string()))
+    );
+    assert_eq!(
+        upstreams(&loaded[0]),
+        set(&[
+            ("1.1.1.1:53", Transport::Udp),
+            ("dns.example", Transport::Dot),
+            ("9.9.9.9:53", Transport::Udp),
+            ("1.1.1.1:53", Transport::Tcp),
+            ("doh.example/dns-query", Transport::Doh),
+        ])
+    );
+    assert_eq!(loaded[1].0, ["default"]);
+    assert!(loaded[1].1.is_empty());
+    assert_eq!(
+        upstreams(&loaded[1]),
+        set(&[("1.1.1.1:53", Transport::Udp)])
     );
 }
 

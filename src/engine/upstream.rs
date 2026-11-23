@@ -293,54 +293,62 @@ pub(crate) struct PoolKeys {
     pub(crate) doq: rustc_hash::FxHashSet<String>,
 }
 
-/// `cfg` 用到的每个上游在连接池里的键，和转发时的算法一样（见 [`parse_upstream_addr`]）：默认上游，
-/// 以及请求阶段和回答阶段每个转发动作的上游（没写就是默认上游）。UDP 上游在应答被截断或失败时改用
-/// TCP，所以也算一个 TCP 键。
-/// The pool key of every upstream `cfg` uses, worked out as a forward does (see
-/// [`parse_upstream_addr`]): the default upstream, and the upstream of every forward
-/// action in the request and response phases (the default upstream when it names none). A
-/// UDP upstream falls back to TCP on a truncated or failed answer, so it has a TCP key too.
-pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys {
-    let mut keys = PoolKeys::default();
-    let mut add = |upstreams: &str, transport: Option<Transport>| {
-        for upstream in upstreams
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let (addr, transport) =
-                parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp));
-            let set = match transport {
-                Transport::Udp | Transport::Tcp | Transport::TcpUdp => &mut keys.tcp,
-                Transport::Dot => &mut keys.dot,
-                Transport::Doq => &mut keys.doq,
-                Transport::Doh => continue,
-            };
-            set.insert(addr.to_owned());
-        }
-    };
-    add(&cfg.settings.default_upstream, None);
-    for rule in cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules) {
-        for action in rule
-            .actions
-            .iter()
-            .chain(&rule.response_actions_on_match)
-            .chain(&rule.response_actions_on_miss)
-        {
-            if let crate::config::Action::Forward {
+/// `cfg` 可能转发到的每个上游，各一次，和转发时的算法一样（见 [`parse_upstream_addr`]）：去掉前缀的地址和问它用的
+/// 传输。默认上游，以及请求阶段和回答阶段每个转发动作的上游（没写就是默认上游）
+/// Every upstream `cfg` may forward to, each once, worked out as a forward does (see
+/// [`parse_upstream_addr`]): the address short of its prefix and the transport it is asked
+/// over. The default upstream, and the upstream of every forward action in the request and
+/// response phases (the default upstream when it names none)
+pub(crate) fn upstreams(
+    cfg: &crate::matcher::RuntimePipelineConfig,
+) -> rustc_hash::FxHashSet<(&str, Transport)> {
+    let default = cfg.settings.default_upstream.as_str();
+    let forwards = cfg
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| &pipeline.rules)
+        .flat_map(|rule| {
+            rule.actions
+                .iter()
+                .chain(&rule.response_actions_on_match)
+                .chain(&rule.response_actions_on_miss)
+        })
+        .filter_map(|action| match action {
+            crate::config::Action::Forward {
                 upstream,
                 transport,
                 ..
-            } = action
-            {
-                add(
-                    upstream
-                        .as_deref()
-                        .unwrap_or(&cfg.settings.default_upstream),
-                    *transport,
-                );
-            }
-        }
+            } => Some((upstream.as_deref().unwrap_or(default), *transport)),
+            _ => None,
+        });
+    std::iter::once((default, None))
+        .chain(forwards)
+        .flat_map(|(upstreams, transport)| {
+            upstreams
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(move |upstream| {
+                    parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp))
+                })
+        })
+        .collect()
+}
+
+/// `cfg` 用到的每个上游在连接池里的键（见 [`upstreams`]）。UDP 上游在应答被截断或失败时改用 TCP，所以也算一个
+/// TCP 键
+/// The pool key of every upstream `cfg` uses (see [`upstreams`]). A UDP upstream falls back
+/// to TCP on a truncated or failed answer, so it has a TCP key too
+pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys {
+    let mut keys = PoolKeys::default();
+    for (address, transport) in upstreams(cfg) {
+        let set = match transport {
+            Transport::Udp | Transport::Tcp | Transport::TcpUdp => &mut keys.tcp,
+            Transport::Dot => &mut keys.dot,
+            Transport::Doq => &mut keys.doq,
+            Transport::Doh => continue,
+        };
+        set.insert(address.to_owned());
     }
     keys
 }

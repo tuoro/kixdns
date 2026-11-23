@@ -28,7 +28,7 @@ use hyper::{Method, Request, Response, StatusCode};
 #[cfg(unix)]
 use hyper_util::rt::TokioIo;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 #[cfg(unix)]
 use serde::Deserialize;
 #[cfg(unix)]
@@ -110,6 +110,17 @@ fn push_key_parts(buffer: &mut String, parts: &[&str]) {
         }
         buffer.push_str(part);
     }
+}
+
+/// 统计键的头两段：规则的项是 pipeline 和规则名，上游的项是地址和传输（响应码的项是地址和响应码）
+/// A metric key's first two parts: a pipeline and a rule name for a rule's series, an address
+/// and a transport for an upstream's (an address and a response code for a response code's)
+fn leading_parts(key: &str) -> Option<(&str, &str)> {
+    let (first, rest) = key.split_once('\0')?;
+    Some((
+        first,
+        rest.split_once('\0').map_or(rest, |(second, _)| second),
+    ))
 }
 
 #[derive(Clone, Default)]
@@ -502,104 +513,97 @@ impl RequestLatency {
 /// under `metric_series_insert_lock`, adds itself and swaps the copy in. The table holds `Arc`s, so
 /// counts made through the old table and the new one land on the same value.
 ///
-/// 每一项记着最后在第几代配置里计过数，换配置时整整一代都没计过数的去掉（见
-/// [`PanelMetrics::forget_series_unused_since`]）：改了名的规则、换掉的上游不会一直留在表里和导出里，
-/// 表也不会被它们占满、让新规则的计数加不进去
-/// Each series notes the configuration generation it last counted in, and those that counted
-/// nothing through a whole generation go when the configuration changes (see
-/// [`PanelMetrics::forget_series_unused_since`]): renamed rules and replaced upstreams do not
-/// stay in the table and the export for good, nor fill the table so that new rules' counts
-/// find no room
+/// 统计项跟着配置走：换配置时，配置里已经没有的 pipeline、规则和上游的项去掉，还在的不管多久没计数都留着（见
+/// [`PanelMetrics::keep_series_of`]）。改了名的规则、换掉的上游不会一直留在表里和导出里，表也不会被它们占满、让
+/// 新规则的计数加不进去。以前按上一代配置里计没计过数去留，两次挨着保存就清掉了还在配置里的规则的累计计数
+/// Series follow the configuration: when it changes, those of the pipelines, rules and upstreams
+/// it no longer has go, and the rest stay however long they went without a count (see
+/// [`PanelMetrics::keep_series_of`]). Renamed rules and replaced upstreams do not stay in the
+/// table and the export for good, nor fill the table so that new rules' counts find no room.
+/// Whether a series counted in the previous configuration used to decide, so two saves in a row
+/// cleared the counts of rules still in the configuration
 struct Series<V> {
-    table: ArcSwap<FxHashMap<Arc<str>, Arc<Stamped<V>>>>,
-}
-
-/// 一项统计和它最后计数的配置代数 / A series' value and the configuration generation it last counted in
-struct Stamped<V> {
-    value: V,
-    counted_in: AtomicU64,
-}
-
-impl<V> std::ops::Deref for Stamped<V> {
-    type Target = V;
-
-    fn deref(&self) -> &V {
-        &self.value
-    }
+    table: ArcSwap<FxHashMap<Arc<str>, Arc<V>>>,
+    /// 加不进表的统计项（键太长，或表满了），每项只算一次丢弃（见 [`PanelMetrics::drop_series`]）；和表一样跟着
+    /// 配置走
+    /// The series that found no room in the table (a key too long, or the table full), each
+    /// counted as dropped once (see [`PanelMetrics::drop_series`]); they follow the
+    /// configuration as the table does
+    dropped: ArcSwap<FxHashSet<Arc<str>>>,
 }
 
 impl<V> Default for Series<V> {
     fn default() -> Self {
         Self {
             table: ArcSwap::from_pointee(FxHashMap::default()),
+            dropped: ArcSwap::from_pointee(FxHashSet::default()),
         }
     }
 }
 
 impl<V> Series<V> {
-    /// 把 `key` 那一项交给 `update`，记下它在第 `generation` 代计过数；没有这一项时为 None。代数只在变了时才写，
-    /// 一代配置里每项只写一次 / Hands the series under `key` to `update`, noting it counted in generation
-    /// `generation`; None when there is none. The generation is written only when it changed, once
-    /// per series and configuration
+    /// 把 `key` 那一项交给 `update`；没有这一项时为 None / Hands the series under `key` to
+    /// `update`; None when there is none
     #[inline]
-    fn with<R>(&self, key: &str, generation: u64, update: impl FnOnce(&V) -> R) -> Option<R> {
-        let table = self.table.load();
-        let stamped = table.get(key)?;
-        if stamped.counted_in.load(Ordering::Relaxed) < generation {
-            stamped.counted_in.store(generation, Ordering::Relaxed);
-        }
-        Some(update(&stamped.value))
+    fn with<R>(&self, key: &str, update: impl FnOnce(&V) -> R) -> Option<R> {
+        self.table.load().get(key).map(|value| update(value))
     }
 
     fn len(&self) -> usize {
         self.table.load().len()
     }
 
-    /// 测试用：读 `key` 那一项，不算计数 / For tests: reads the series under `key`, counting nothing
-    #[cfg(test)]
-    fn read<R>(&self, key: &str, read: impl FnOnce(&V) -> R) -> Option<R> {
-        self.table
-            .load()
-            .get(key)
-            .map(|stamped| read(&stamped.value))
-    }
-
     /// 此刻的整张表，导出时用 / The whole table as it is now, for export
-    fn snapshot(&self) -> Arc<FxHashMap<Arc<str>, Arc<Stamped<V>>>> {
+    fn snapshot(&self) -> Arc<FxHashMap<Arc<str>, Arc<V>>> {
         self.table.load_full()
     }
 
-    /// 加上第 `generation` 代里头一次计数的一项。`_locked` 是 `metric_series_insert_lock` 的锁：两个新项不会
-    /// 各拿一份旧表、互相覆盖
-    /// Adds a series counting for the first time in generation `generation`. `_locked` is the
-    /// guard of `metric_series_insert_lock`: two new series never each copy the old table and
-    /// overwrite each other
-    fn insert(&self, _locked: &MutexGuard<'_, ()>, key: &str, value: V, generation: u64) {
+    /// 加上头一次计数的一项。`_locked` 是 `metric_series_insert_lock` 的锁：两个新项不会各拿一份旧表、互相覆盖
+    /// Adds a series counting for the first time. `_locked` is the guard of
+    /// `metric_series_insert_lock`: two new series never each copy the old table and overwrite
+    /// each other
+    fn insert(&self, _locked: &MutexGuard<'_, ()>, key: &str, value: V) {
         let mut table = (**self.table.load()).clone();
-        let stamped = Stamped {
-            value,
-            counted_in: AtomicU64::new(generation),
-        };
-        table.insert(Arc::from(key), Arc::new(stamped));
+        table.insert(Arc::from(key), Arc::new(value));
         self.table.store(Arc::new(table));
     }
 
-    /// 去掉第 `since` 代以来没计过数的项，锁同 [`Self::insert`] / Drops the series that counted
-    /// nothing since generation `since`, under the lock [`Self::insert`] takes
-    fn forget_unused_since(&self, _locked: &MutexGuard<'_, ()>, since: u64) {
-        let table = self.table.load();
-        if table
-            .values()
-            .all(|stamped| stamped.counted_in.load(Ordering::Relaxed) >= since)
-        {
-            return;
+    /// 记下加不进表的 `key`，头一回记下时为真。不拿锁：几个线程同时记下同一项时只有一个为真
+    /// Notes `key` as finding no room, true the first time. No lock is taken: of several
+    /// threads noting the same series at once, only one is told true
+    fn note_dropped(&self, key: &str) -> bool {
+        if self.dropped.load().contains(key) {
+            return false;
         }
-        let kept = table
+        let mut first = false;
+        self.dropped.rcu(|dropped| {
+            let mut dropped = FxHashSet::clone(dropped);
+            first = dropped.insert(Arc::from(key));
+            dropped
+        });
+        first
+    }
+
+    /// 只留下 `keep` 认可的项，锁同 [`Self::insert`]。记下的丢弃也一样，[`Self::note_dropped`] 同时改了的话
+    /// 重来一遍
+    /// Keeps only the series `keep` accepts, under the lock [`Self::insert`] takes. The same goes
+    /// for those noted as dropped, done over should [`Self::note_dropped`] change them meanwhile
+    fn retain(&self, _locked: &MutexGuard<'_, ()>, keep: impl Fn(&str) -> bool) {
+        let kept = self
+            .table
+            .load()
             .iter()
-            .filter(|(_, stamped)| stamped.counted_in.load(Ordering::Relaxed) >= since)
-            .map(|(key, stamped)| (Arc::clone(key), Arc::clone(stamped)))
+            .filter(|(key, _)| keep(key))
+            .map(|(key, value)| (Arc::clone(key), Arc::clone(value)))
             .collect();
         self.table.store(Arc::new(kept));
+        self.dropped.rcu(|dropped| {
+            dropped
+                .iter()
+                .filter(|key| keep(key))
+                .cloned()
+                .collect::<FxHashSet<_>>()
+        });
     }
 }
 
@@ -743,11 +747,9 @@ pub struct PanelMetrics {
     upstream_attempts: Series<ThreadCount>,
     upstream_results: Series<ThreadCount>,
     metric_series_insert_lock: Mutex<()>,
+    /// 加不进表的统计项有几个，每项只算一次（见 [`Series::note_dropped`]）/ How many series found no
+    /// room in their table, each counted once (see [`Series::note_dropped`])
     metric_series_dropped: AtomicU64,
-    /// 现在是第几代配置，统计项计数时记下（见 [`Series`]）；和 `active_config` 的代数一样，计数时不必拿锁
-    /// The configuration generation now, which series note as they count (see [`Series`]); the
-    /// same as `active_config`'s, read without its lock as counts are made
-    config_generation: AtomicU64,
     reload_success: AtomicU64,
     reload_failure: AtomicU64,
     reload_sequence: AtomicU64,
@@ -791,7 +793,6 @@ impl Default for PanelMetrics {
             upstream_results: Series::default(),
             metric_series_insert_lock: Mutex::new(()),
             metric_series_dropped: AtomicU64::new(0),
-            config_generation: AtomicU64::new(0),
             reload_success: AtomicU64::new(0),
             reload_failure: AtomicU64::new(0),
             reload_sequence: AtomicU64::new(0),
@@ -942,13 +943,6 @@ impl PanelMetrics {
         } else {
             active.generation.saturating_add(1)
         };
-        self.config_generation
-            .store(active.generation, Ordering::Relaxed);
-        // 上一代配置里一次都没计过数的统计项去掉（见 `Series`）/ The series that counted nothing
-        // through the last configuration go (see `Series`)
-        if !initial {
-            self.forget_series_unused_since(active.generation - 1);
-        }
         active.sha256 = sha256;
         active.loaded_at_unix = unix_timestamp();
         active.last_reload_success = true;
@@ -973,56 +967,89 @@ impl PanelMetrics {
         });
     }
 
-    /// 把 `key` 那一项交给 `update`。头一次出现的统计项在锁里加上；键太长或这一组已满时不加，只计一次
-    /// 丢弃。
+    /// 把 `key` 那一项交给 `update`。头一次出现的统计项在锁里加上；键太长或这一组已满时不加，算作丢弃（见
+    /// [`Self::drop_series`]）。
     /// Hands the series under `key` to `update`. A series seen for the first time is added under the
-    /// lock; a key too long or a full set adds nothing and counts one dropped series.
+    /// lock; a key too long or a full set adds nothing and is counted as dropped (see
+    /// [`Self::drop_series`]).
     #[inline]
     fn update_series<V: Default>(&self, series: &Series<V>, key: &str, update: impl Fn(&V)) {
-        let generation = self.config_generation.load(Ordering::Relaxed);
-        if series.with(key, generation, &update).is_some() {
+        if series.with(key, &update).is_some() {
             return;
         }
-        // 键太长，或者这一组已经满了：都加不进去，不必拿锁。满了的表不会再变小，而锁是全进程共用的：规则多过上限的
-        // 配置下，命中表外规则的每个查询都拿一次的话，几个核就互相等
+        // 键太长，或者这一组已经满了：都加不进去，不必拿锁。满了的表换配置以前不会变小，而锁是全进程共用的：规则多过
+        // 上限的配置下，命中表外规则的每个查询都拿一次的话，几个核就互相等
         // A key too long, or a set already full: neither can be added, so no lock is taken. A
-        // full table never shrinks, and the lock is shared by the whole process: with more rules
-        // than the limit, every query matching a rule outside the table taking it would have the
-        // cores wait on one another
+        // full table does not shrink until the configuration changes, and the lock is shared by
+        // the whole process: with more rules than the limit, every query matching a rule outside
+        // the table taking it would have the cores wait on one another
         if key.len() > MAX_METRIC_KEY_BYTES || series.len() >= MAX_METRIC_SERIES_PER_MAP {
-            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+            self.drop_series(series, key);
             return;
         }
         let locked = self.metric_series_insert_lock.lock();
         // 等锁的时候别的线程可能已经加上了 / Another thread may have added it while this one waited
-        if series.with(key, generation, &update).is_some() {
+        if series.with(key, &update).is_some() {
             return;
         }
         if series.len() >= MAX_METRIC_SERIES_PER_MAP {
-            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+            self.drop_series(series, key);
             return;
         }
         let value = V::default();
         update(&value);
-        series.insert(&locked, key, value, generation);
+        series.insert(&locked, key, value);
     }
 
-    /// 每组统计里去掉第 `since` 代以来没计过数的项（见 [`Series`]）/ Drops from every set the series that
-    /// counted nothing since generation `since` (see [`Series`])
-    fn forget_series_unused_since(&self, since: u64) {
+    /// `key` 那一项加不进 `series`：头一回加不进时计一次丢弃。以前每次计数都算一次，丢弃数跟着流量涨，说不出导出里
+    /// 少了几项
+    /// The series under `key` finds no room in `series`: the first time counts one dropped
+    /// series. Every count used to add one, so the number grew with the traffic and told nothing
+    /// of how many series the export lacks
+    fn drop_series<V>(&self, series: &Series<V>, key: &str) {
+        if series.note_dropped(key) {
+            self.metric_series_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 每组统计里只留下 `config` 还有的 pipeline、规则和上游的项（见 [`Series`]）。上游的项按地址和传输留，响应码的项
+    /// 不分传输，只按地址
+    /// Keeps in every set only the series of the pipelines, rules and upstreams `config` still
+    /// has (see [`Series`]). An upstream's series are kept by its address and transport, those of
+    /// response codes, which do not tell transports apart, by its address alone
+    fn keep_series_of(&self, config: &ConfigLoaded<'_>) {
+        let pipelines: FxHashSet<&str> = config.pipelines.iter().copied().collect();
+        let rules: FxHashSet<(&str, &str)> = config.rules.iter().copied().collect();
+        let upstreams: FxHashSet<(&str, &str)> = config
+            .upstreams
+            .iter()
+            .map(|&(address, transport)| (address, transport_label(transport)))
+            .collect();
+        let addresses: FxHashSet<&str> = config
+            .upstreams
+            .iter()
+            .map(|&(address, _)| address)
+            .collect();
+        let named_by = |names: &FxHashSet<(&str, &str)>, key: &str| {
+            leading_parts(key).is_some_and(|parts| names.contains(&parts))
+        };
         let locked = self.metric_series_insert_lock.lock();
+        self.pipeline_hits
+            .retain(&locked, |pipeline| pipelines.contains(pipeline));
+        self.rule_matches
+            .retain(&locked, |key| named_by(&rules, key));
+        self.upstream_rcodes.retain(&locked, |key| {
+            leading_parts(key).is_some_and(|(address, _)| addresses.contains(address))
+        });
         for series in [&self.upstream_latency, &self.upstream_response_latency] {
-            series.forget_unused_since(&locked, since);
+            series.retain(&locked, |key| named_by(&upstreams, key));
         }
         for series in [
-            &self.upstream_rcodes,
             &self.upstream_via,
-            &self.pipeline_hits,
-            &self.rule_matches,
             &self.upstream_attempts,
             &self.upstream_results,
         ] {
-            series.forget_unused_since(&locked, since);
+            series.retain(&locked, |key| named_by(&upstreams, key));
         }
     }
 
@@ -1800,6 +1827,7 @@ impl EngineObserver for PanelMetrics {
 
     fn config_loaded(&self, event: &ConfigLoaded<'_>) {
         debug_forward!(self.config_loaded(event));
+        self.keep_series_of(event);
         let restart_pending = event
             .restart_pending
             .iter()
@@ -3307,6 +3335,9 @@ mod tests {
                 source: Some("{}"),
                 restart_pending: &[],
                 warnings: &[],
+                pipelines: &[],
+                rules: &[],
+                upstreams: &[],
             });
             metrics.config_reload_failed(&ConfigReloadFailed {
                 path: std::path::Path::new("pipeline.json"),
@@ -3317,45 +3348,132 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// 整整一代配置里都没计过数的统计项，换配置时去掉：改了名的规则不会一直留在表里和导出里，表也不会被这样的项
-    /// 占满、让新规则的计数加不进去；还在计数的照常留着，计数不清零
-    /// A series that counted nothing through a whole configuration goes when the configuration
-    /// changes: a renamed rule does not stay in the table and the export for good, nor fill the
-    /// table so that new rules' counts find no room; those still counting stay as they are, their
-    /// counts kept
+    /// 统计项跟着配置走：配置里还有的 pipeline、规则和上游，换几次配置计数都留着，不管其间计没计过数；配置里没有了的
+    /// 去掉，导出里也没有了，上游换了传输也一样（响应码不分传输，按地址留）。以前按上一代配置里计没计过数去留，两次挨着
+    /// 保存就清掉了还在配置里的规则的累计计数
+    /// Series follow the configuration: those of the pipelines, rules and upstreams it still has
+    /// keep their counts across any number of loads, counted in between or not; those it no
+    /// longer has go, from the export too, and so do an upstream's when its transport changes
+    /// (response codes, which do not tell transports apart, stay by the address). Whether a series
+    /// counted in the previous configuration used to decide, so two saves in a row cleared the
+    /// counts of rules still in the configuration
     #[test]
-    fn a_series_unused_through_a_whole_configuration_is_forgotten() {
-        use crate::observe::{ConfigLoaded, EngineObserver};
+    fn series_stay_while_the_configuration_has_what_they_count() {
+        use crate::config::Transport;
+        use crate::observe::{ConfigLoaded, EngineObserver, UpstreamAttempt, UpstreamOutcome};
+        use hickory_proto::op::ResponseCode;
         let metrics = PanelMetrics::default();
-        let load = |generation| {
+        let load = |generation,
+                    pipelines: &[&str],
+                    rules: &[(&str, &str)],
+                    upstreams: &[(&str, Transport)]| {
             metrics.config_loaded(&ConfigLoaded {
                 path: None,
                 generation,
                 source: Some("{}"),
                 restart_pending: &[],
                 warnings: &[],
+                pipelines,
+                rules,
+                upstreams,
             })
         };
-        let count = |rule: &str| {
-            metrics
-                .rule_matches
-                .read(&format!("main\0{rule}\0request"), |counter| {
-                    counter.load(Ordering::Relaxed)
-                })
+        let count = |series: &super::Series<super::ThreadCount>, key: &str| {
+            series.with(key, |counter| counter.load(Ordering::Relaxed))
         };
-        load(1);
-        metrics.record_rule_match("main", "old", "request");
-        metrics.record_rule_match("main", "kept", "request");
-        load(2);
-        assert_eq!(
-            count("old"),
-            Some(1),
-            "counted in the configuration just replaced"
+        let pipelines = ["main", "gone"];
+        let rules = [("main", "kept"), ("main", "old")];
+        let upstreams = [
+            ("1.1.1.1:53", Transport::Udp),
+            ("192.0.2.9:53", Transport::Udp),
+        ];
+        load(1, &pipelines, &rules, &upstreams);
+        let ctx = request(1, "127.0.0.1:5353", "example.com");
+        for pipeline in pipelines {
+            metrics.record_pipeline_hit(pipeline);
+        }
+        for (pipeline, rule) in rules {
+            metrics.record_rule_match(pipeline, rule, "request");
+        }
+        for (upstream, transport) in upstreams {
+            metrics.upstream_attempt(
+                &ctx,
+                &UpstreamAttempt {
+                    upstream,
+                    transport,
+                },
+            );
+            metrics.upstream_result(
+                &ctx,
+                &crate::observe::UpstreamResult {
+                    upstream,
+                    ..udp_result(
+                        UpstreamOutcome::Success,
+                        Transport::Udp,
+                        Some(ResponseCode::NoError),
+                        5,
+                    )
+                },
+            );
+        }
+        // 两次挨着保存，其间什么也没计 / Two saves in a row, nothing counted in between
+        load(2, &pipelines, &rules, &upstreams);
+        load(3, &pipelines, &rules, &upstreams);
+        for pipeline in pipelines {
+            assert_eq!(
+                count(&metrics.pipeline_hits, pipeline),
+                Some(1),
+                "{pipeline}"
+            );
+        }
+        for (pipeline, rule) in rules {
+            let key = format!("{pipeline}\0{rule}\0request");
+            assert_eq!(count(&metrics.rule_matches, &key), Some(1), "{rule}");
+        }
+        let upstream_series = |address: &str| {
+            [
+                count(&metrics.upstream_attempts, &format!("{address}\0udp")),
+                count(
+                    &metrics.upstream_results,
+                    &format!("{address}\0udp\0success"),
+                ),
+                count(&metrics.upstream_via, &format!("{address}\0udp\0udp")),
+                metrics
+                    .upstream_latency
+                    .with(&format!("{address}\0udp"), |sum| {
+                        sum.count.load(Ordering::Relaxed)
+                    }),
+                metrics
+                    .upstream_response_latency
+                    .with(&format!("{address}\0udp"), |sum| {
+                        sum.count.load(Ordering::Relaxed)
+                    }),
+            ]
+        };
+        let rcodes =
+            |address: &str| count(&metrics.upstream_rcodes, &format!("{address}\0NoError"));
+        for (address, _) in upstreams {
+            assert_eq!(upstream_series(address), [Some(1); 5], "{address}");
+            assert_eq!(rcodes(address), Some(1), "{address}");
+        }
+
+        // 一个 pipeline、一条规则、一个上游不在了，留下的上游改成 TCP 问
+        // A pipeline, a rule and an upstream gone, the upstream left now asked over TCP
+        load(
+            4,
+            &["main"],
+            &[("main", "kept")],
+            &[("1.1.1.1:53", Transport::Tcp)],
         );
-        metrics.record_rule_match("main", "kept", "request");
-        load(3);
-        assert_eq!(count("old"), None, "nothing counted through generation 2");
-        assert_eq!(count("kept"), Some(2));
+        assert_eq!(count(&metrics.pipeline_hits, "main"), Some(1));
+        assert_eq!(count(&metrics.pipeline_hits, "gone"), None);
+        assert_eq!(count(&metrics.rule_matches, "main\0kept\0request"), Some(1));
+        assert_eq!(count(&metrics.rule_matches, "main\0old\0request"), None);
+        for address in ["1.1.1.1:53", "192.0.2.9:53"] {
+            assert_eq!(upstream_series(address), [None; 5], "{address}");
+        }
+        assert_eq!(rcodes("1.1.1.1:53"), Some(1));
+        assert_eq!(rcodes("192.0.2.9:53"), None);
         let mut output = String::new();
         super::append_map(
             &mut output,
@@ -3384,6 +3502,9 @@ mod tests {
                 source: None,
                 restart_pending: &[],
                 warnings: &[],
+                pipelines: &[],
+                rules: &[],
+                upstreams: &[],
             })
         };
         load(1);
@@ -3698,23 +3819,32 @@ mod tests {
         );
     }
 
+    /// 加不进表的统计项各算一次丢弃，不管又计了多少次：丢弃数说的是导出里少了几项。以前每次计数都算一次，跟着流量涨
+    /// A series finding no room counts one drop, however many times it is counted again: the
+    /// number says how many series the export lacks. Every count used to add one, growing with
+    /// the traffic
     #[test]
-    fn caps_metric_keys_and_counts_dropped_series() {
+    fn caps_metric_keys_and_counts_each_dropped_series_once() {
         let metrics = PanelMetrics::default();
-        for index in 0..MAX_METRIC_SERIES_PER_MAP + 10 {
-            metrics.record_pipeline_hit(&format!("pipeline-{index}"));
+        let too_long = "x".repeat(super::MAX_METRIC_KEY_BYTES + 1);
+        for _ in 0..3 {
+            for index in 0..MAX_METRIC_SERIES_PER_MAP + 10 {
+                metrics.record_pipeline_hit(&format!("pipeline-{index}"));
+            }
+            metrics.record_rule_match("main", &too_long, "request");
         }
         metrics.record_pipeline_hit("pipeline-0");
 
         assert_eq!(metrics.pipeline_hits.len(), MAX_METRIC_SERIES_PER_MAP);
+        assert_eq!(metrics.rule_matches.len(), 0);
         assert_eq!(
             metrics.metric_series_dropped.load(super::Ordering::Relaxed),
-            10
+            11
         );
         assert_eq!(
-            metrics.pipeline_hits.read("pipeline-0", |counter| counter
+            metrics.pipeline_hits.with("pipeline-0", |counter| counter
                 .load(super::Ordering::Relaxed)),
-            Some(2)
+            Some(4)
         );
     }
 
@@ -3730,7 +3860,7 @@ mod tests {
         }
         metrics.record_rule_match("main", "cn", "request");
         let count = |series: &super::Series<super::ThreadCount>, key: &str| {
-            series.read(key, |counter| counter.load(super::Ordering::Relaxed))
+            series.with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(metrics.rule_matches.len(), 2);
         assert_eq!(count(&metrics.rule_matches, "main\0ads\0request"), Some(3));
@@ -3767,7 +3897,7 @@ mod tests {
         let count = |key: &str| {
             metrics
                 .pipeline_hits
-                .read(key, |counter| counter.load(super::Ordering::Relaxed))
+                .with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(count("shared"), Some(8_000));
         assert_eq!(metrics.pipeline_hits.len(), 1 + 8 * 50);
@@ -3828,6 +3958,9 @@ mod tests {
             source: Some(source),
             restart_pending: &[],
             warnings: &[],
+            pipelines: &[],
+            rules: &[],
+            upstreams: &[],
         });
         {
             let active = metrics.active_config.read();
@@ -3883,7 +4016,7 @@ mod tests {
             1
         );
         let count = |series: &super::Series<super::ThreadCount>, key: &str| {
-            series.read(key, |counter| counter.load(super::Ordering::Relaxed))
+            series.with(key, |counter| counter.load(super::Ordering::Relaxed))
         };
         assert_eq!(count(&metrics.pipeline_hits, "main"), Some(1));
         assert_eq!(
@@ -3909,6 +4042,9 @@ mod tests {
             source: Some("{}"),
             restart_pending: &[],
             warnings: &[],
+            pipelines: &[],
+            rules: &[],
+            upstreams: &[],
         });
         let active = metrics.active_config.read();
         assert_eq!(active.generation, 2);

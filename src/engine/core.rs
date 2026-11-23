@@ -495,15 +495,37 @@ impl Engine {
             tracing::warn!(target = "config", %warning, "configuration warning");
         }
         if let Some(observer) = &self.observer {
+            let config = &state.pipeline;
+            // 没有 pipeline 时请求报的是 `NO_PIPELINE` / With no pipelines requests report `NO_PIPELINE`
+            let pipelines: Vec<&str> = if config.pipelines.is_empty() {
+                vec![super::pipeline::NO_PIPELINE]
+            } else {
+                config
+                    .pipelines
+                    .iter()
+                    .map(|pipeline| &*pipeline.id)
+                    .collect()
+            };
+            let rules: Vec<(&str, &str)> = config
+                .pipelines
+                .iter()
+                .flat_map(|pipeline| {
+                    pipeline
+                        .rules
+                        .iter()
+                        .map(|rule| (&*pipeline.id, &*rule.name))
+                })
+                .collect();
+            let upstreams: Vec<_> = super::upstream::upstreams(config).into_iter().collect();
             observer.config_loaded(&ConfigLoaded {
                 path,
                 generation,
                 source,
-                restart_pending: &state
-                    .pipeline
-                    .settings
-                    .restart_pending(&self.running_settings),
-                warnings: &state.pipeline.warnings,
+                restart_pending: &config.settings.restart_pending(&self.running_settings),
+                warnings: &config.warnings,
+                pipelines: &pipelines,
+                rules: &rules,
+                upstreams: &upstreams,
             });
         }
     }
