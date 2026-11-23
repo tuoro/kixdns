@@ -1774,9 +1774,7 @@ impl Engine {
                 }
 
                 match decision {
-                    Decision::Jump { .. } => {
-                        anyhow::bail!("unresolved pipeline jump");
-                    }
+                    Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
                     Decision::Static { rcode, answers } => {
                         response_log.info.upstream = Some(Arc::from("static"));
                         // On a refresh, a SERVFAIL here (a jump target that does not
@@ -3460,8 +3458,7 @@ mod tests {
         );
         let key = keys.slot;
         // 另一个请求在刷新所用的 inflight 键下登记的条目 / Another request's entry under the refresh's inflight key
-        let (owner, waiter) =
-            tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+        let (owner, waiter) = tokio::sync::watch::channel(None);
         engine.inflight.insert(
             keys.inflight,
             InflightEntry::new(&question).with_channel(owner),
@@ -6267,7 +6264,7 @@ mod tests {
         // Another request registered under the inflight key a forward of this query uses
         // 另一个请求在这个查询转发时所用的 inflight 键下登记了条目
         let inflight = stale_com_keys(&engine).inflight;
-        let (tx, rx) = tokio::sync::watch::channel(Err(Arc::new(anyhow::anyhow!("Pending"))));
+        let (tx, rx) = tokio::sync::watch::channel(None);
         engine.inflight.insert(
             inflight,
             InflightEntry::new(&stale_com_question(&engine)).with_channel(tx),

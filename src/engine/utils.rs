@@ -43,7 +43,7 @@ impl InflightCleanupGuard {
         {
             let reply = reply();
             if !crate::proto_utils::last_record_is_tsig(&reply) {
-                let _ = tx.send(Ok(reply));
+                let _ = tx.send(Some(reply));
             }
         }
     }
