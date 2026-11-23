@@ -6221,30 +6221,33 @@ mod tests {
     }
 
     /// 好几个请求同时为同一个条目发起后台刷新，只刷新一次：查标记和打标记是同一步，不会两个都看见
-    /// 「没在刷新」再各刷一次
+    /// 「没在刷新」再各刷一次。上游的应答扣到所有请求都发起过才放行，刷新一直在途：以前上游 50 毫秒就答，
+    /// 机器忙时晚过屏障的那个请求赶上的已是刷新结束以后，另发起一次刷新本是对的，测试却算它错
     /// Several requests starting the background refresh of one entry at once refresh it
     /// once: checking and setting the mark is a single step, so no two both see "not
-    /// refreshing" and refresh each
+    /// refreshing" and refresh each. The upstream's answer is held until every request has
+    /// started, so the refresh stays in flight: the upstream used to answer in 50 ms, and on a
+    /// busy machine a request late past the barrier came after the refresh had ended, rightly
+    /// starting another, which the test counted against it
     #[test]
     fn concurrent_refreshes_of_one_entry_start_once() {
-        use hickory_proto::op::{Message, MessageType, OpCode};
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
-        let up = runtime.block_on(crate::engine::test_support::upstream(|query| {
-            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-            reply.metadata.recursion_desired = query.metadata.recursion_desired;
-            reply.add_queries(query.queries.iter().cloned());
-            vec![(Duration::from_millis(50), reply.to_vec().unwrap())]
-        }));
+        let (up, held) = runtime.block_on(crate::engine::test_support::answering_upstream_held(
+            std::net::Ipv4Addr::new(192, 0, 2, 1),
+            60,
+        ));
         // 引擎要在运行时里建 / The engine is built inside the runtime
         let _runtime = runtime.enter();
         let engine = Engine::new(
             runtime_with_settings(GlobalSettings {
                 default_upstream: up.address.clone(),
-                upstream_timeout_ms: 3000,
+                // 对冲重发在三分之一处，远在放行之后 / The hedged resend comes at a third of it,
+                // long after the answer is let out
+                upstream_timeout_ms: 30_000,
                 enable_tcp_fallback: false,
                 ..Default::default()
             }),
@@ -6261,6 +6264,7 @@ mod tests {
         };
         const STARTERS: usize = 8;
         for round in 1..=30 {
+            held.hold();
             let barrier = std::sync::Barrier::new(STARTERS);
             std::thread::scope(|scope| {
                 for _ in 0..STARTERS {
@@ -6277,6 +6281,7 @@ mod tests {
                     });
                 }
             });
+            held.release();
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     while engine.refreshing.contains_key(&mark) {
