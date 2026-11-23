@@ -155,6 +155,15 @@ impl<V: Cached> CacheStore<V> {
 
     /// `key` 的值；读到算一次访问 / The value of `key`; a read counts as an access
     pub fn get(&self, key: u64) -> Option<V> {
+        self.get_with(key, V::clone)
+    }
+
+    /// 把 `key` 的值交给 `f`，在读锁里看完，值本身不复制：只要值里的一部分时，省下复制整个值（比如槽位的 `Arc`，所有核
+    /// 都要改它的引用计数）；读到算一次访问
+    /// Hand the value of `key` to `f`, looked at under the read lock with the value itself not
+    /// cloned: when only a part of it is wanted, this spares cloning the whole (a slot's `Arc`,
+    /// say, whose reference count every core writes); a read counts as an access
+    pub fn get_with<R>(&self, key: u64, f: impl FnOnce(&V) -> R) -> Option<R> {
         let (hash, shard) = self.locate(key);
         let shard = shard.read();
         let node = &shard.nodes[shard.find(hash, key)? as usize];
@@ -163,7 +172,7 @@ impl<V: Cached> CacheStore<V> {
             // 几个读者同时加可能少加一次，计数本来就是近似的 / Readers adding at once may lose a bump; the count is approximate anyway
             node.freq.store(freq + 1, Ordering::Relaxed);
         }
-        node.value.clone()
+        node.value.as_ref().map(f)
     }
 
     /// 在分片的写锁里读出 `key` 的值、按 `f` 改：读和写之间不会插进别的写入
