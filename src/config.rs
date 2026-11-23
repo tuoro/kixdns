@@ -48,10 +48,16 @@ pub struct GlobalSettings {
     /// 最小TTL秒数，缺省0。 / Minimum TTL in seconds, defaults to 0
     #[serde(default = "default_min_ttl")]
     pub min_ttl: u32,
-    /// UDP监听地址，缺省0.0.0.0:5353，避免1024以下端口权限问题。 / UDP listen address, defaults to 0.0.0.0:5353, avoiding port permission issues below 1024
+    /// UDP 监听地址，缺省 0.0.0.0:5533：1024 以下的端口要权限；5353 是 mDNS 的端口，常被系统的 mDNSResponder、avahi
+    /// 占着；5533 在 IANA 没有分配，常见的本地 DNS 软件也都不默认用它（Pi-hole 指南里的 Unbound 和 luci-app-mosdns
+    /// 用 5335，OpenWrt 上的 SmartDNS 用 6053）
+    /// UDP listen address, defaulting to 0.0.0.0:5533: ports below 1024 take privileges; 5353 is
+    /// the mDNS port, often held by the system's mDNSResponder or avahi; 5533 is unassigned at
+    /// IANA and the default of no common local DNS software (Unbound in the Pi-hole guide and
+    /// luci-app-mosdns use 5335, SmartDNS on OpenWrt 6053)
     #[serde(default = "default_bind_udp")]
     pub bind_udp: String,
-    /// TCP监听地址，缺省0.0.0.0:5353。 / TCP listen address, defaults to 0.0.0.0:5353
+    /// TCP 监听地址，缺省 0.0.0.0:5533 / TCP listen address, defaulting to 0.0.0.0:5533
     #[serde(default = "default_bind_tcp")]
     pub bind_tcp: String,
     /// DoH 监听地址（留空则不启用）。 / DoH listen address (empty/null = disabled)
@@ -1069,11 +1075,11 @@ fn default_min_ttl() -> u32 {
 }
 
 fn default_bind_udp() -> String {
-    "0.0.0.0:5353".to_string()
+    "0.0.0.0:5533".to_string()
 }
 
 fn default_bind_tcp() -> String {
-    "0.0.0.0:5353".to_string()
+    "0.0.0.0:5533".to_string()
 }
 
 fn default_upstream() -> String {
@@ -2754,8 +2760,8 @@ mod validation_tests {
         );
         for settings in [read, GlobalSettings::default()] {
             assert_eq!(settings.min_ttl, 0, "min_ttl");
-            assert_eq!(settings.bind_udp, "0.0.0.0:5353", "bind_udp");
-            assert_eq!(settings.bind_tcp, "0.0.0.0:5353", "bind_tcp");
+            assert_eq!(settings.bind_udp, "0.0.0.0:5533", "bind_udp");
+            assert_eq!(settings.bind_tcp, "0.0.0.0:5533", "bind_tcp");
             assert_eq!(settings.bind_doh, None, "bind_doh");
             assert_eq!(settings.doh_tls_cert, None, "doh_tls_cert");
             assert_eq!(settings.doh_tls_key, None, "doh_tls_key");

@@ -24,8 +24,8 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | 字段 | 默认值 | 说明 |
 |---|---:|---|
 | min_ttl | 0 | 上游回答的 TTL 下限，单位秒：回答里每条记录的 TTL 至少提高到这个值，缓存也至少留这么久。 |
-| bind_udp | 0.0.0.0:5353 | UDP 监听地址；端口被别的程序占着时启动失败，不和它共用。写通配地址（`0.0.0.0`、`::`）时，Linux、macOS 和 FreeBSD 等 BSD（OPNsense、pfSense 也是）上回答从查询发到的那个本机地址发出（RFC 2181 第 4.1 节），机器有几个地址（别名地址、随时会来去的 CARP VIP）也不会答错地址；为此每个查询的收发多约 0.1 微秒（Linux 上量的），只服务一个地址时写那个具体地址就没有这份开销。Windows 上回答的源地址由系统挑。 |
-| bind_tcp | 0.0.0.0:5353 | TCP 监听地址。 |
+| bind_udp | 0.0.0.0:5533 | UDP 监听地址；端口被别的程序占着时启动失败，不和它共用。默认端口以前是 5353，那是 mDNS 的端口，常被系统的 mDNSResponder、avahi 占着；照旧要 5353 的写明这个地址。写通配地址（`0.0.0.0`、`::`）时，Linux、macOS 和 FreeBSD 等 BSD（OPNsense、pfSense 也是）上回答从查询发到的那个本机地址发出（RFC 2181 第 4.1 节），机器有几个地址（别名地址、随时会来去的 CARP VIP）也不会答错地址；为此每个查询的收发多约 0.1 微秒（Linux 上量的），只服务一个地址时写那个具体地址就没有这份开销。Windows 上回答的源地址由系统挑。 |
+| bind_tcp | 0.0.0.0:5533 | TCP 监听地址。 |
 | bind_doh | null | 入站 DoH 监听地址；null 表示禁用。 |
 | doh_tls_cert | null | PEM 证书路径；设置 bind_doh 时必需。 |
 | doh_tls_key | null | PEM 私钥路径；设置 bind_doh 时必需。 |
@@ -295,8 +295,8 @@ UDP 转发失败或 UDP 响应被截断时，TCP fallback 默认启用，可通�
 {
   "version": "1.0",
   "settings": {
-    "bind_udp": "0.0.0.0:5353",
-    "bind_tcp": "0.0.0.0:5353",
+    "bind_udp": "0.0.0.0:5533",
+    "bind_tcp": "0.0.0.0:5533",
     "default_upstream": "1.1.1.1:53"
   },
   "pipeline_select": [

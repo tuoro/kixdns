@@ -33,7 +33,7 @@ cargo build --release
 ./target/release/kixdns run -c config/pipeline.json
 ~~~
 
-默认在 UDP 和 TCP `0.0.0.0:5353` 上监听，上游是 `1.1.1.1:53`。需要支持 Rust edition 2024 的工具链。
+默认在 UDP 和 TCP `0.0.0.0:5533` 上监听，上游是 `1.1.1.1:53`。需要支持 Rust edition 2024 的工具链。
 
 ## 文档
 

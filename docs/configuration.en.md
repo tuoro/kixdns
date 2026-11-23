@@ -24,8 +24,8 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | Field | Default | Meaning |
 |---|---:|---|
 | min_ttl | 0 | Minimum TTL of upstream answers in seconds: every record of an answer has its TTL raised to at least this, and the cache keeps the answer at least this long. |
-| bind_udp | 0.0.0.0:5353 | UDP listen address; with the port taken by another program, starting fails rather than sharing it. With a wildcard address (`0.0.0.0`, `::`), on Linux, macOS, and FreeBSD and the other BSDs (OPNsense and pfSense among them) a reply leaves from the local address the query was sent to (RFC 2181 section 4.1), so a machine with several addresses (aliases, a CARP VIP that comes and goes) never answers from the wrong one; this adds about 0.1 microseconds of receive and send work to each query (measured on Linux), which writing the one address to serve avoids. On Windows the system picks the reply's source address. |
-| bind_tcp | 0.0.0.0:5353 | TCP listen address. |
+| bind_udp | 0.0.0.0:5533 | UDP listen address; with the port taken by another program, starting fails rather than sharing it. The default port used to be 5353, the mDNS port, often held by the system's mDNSResponder or avahi; to keep 5353, write the address out. With a wildcard address (`0.0.0.0`, `::`), on Linux, macOS, and FreeBSD and the other BSDs (OPNsense and pfSense among them) a reply leaves from the local address the query was sent to (RFC 2181 section 4.1), so a machine with several addresses (aliases, a CARP VIP that comes and goes) never answers from the wrong one; this adds about 0.1 microseconds of receive and send work to each query (measured on Linux), which writing the one address to serve avoids. On Windows the system picks the reply's source address. |
+| bind_tcp | 0.0.0.0:5533 | TCP listen address. |
 | bind_doh | null | Inbound DoH listen address; null disables it. |
 | doh_tls_cert | null | PEM certificate path; required with bind_doh. |
 | doh_tls_key | null | PEM private-key path; required with bind_doh. |
@@ -295,8 +295,8 @@ When UDP forwarding fails, or when an upstream UDP response is truncated, TCP fa
 {
   "version": "1.0",
   "settings": {
-    "bind_udp": "0.0.0.0:5353",
-    "bind_tcp": "0.0.0.0:5353",
+    "bind_udp": "0.0.0.0:5533",
+    "bind_tcp": "0.0.0.0:5533",
     "default_upstream": "1.1.1.1:53"
   },
   "pipeline_select": [

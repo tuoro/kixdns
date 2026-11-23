@@ -16,7 +16,7 @@ cargo build --release
 ./target/release/kixdns run -c config/pipeline.json
 ~~~
 
-The default listener addresses are UDP and TCP on 0.0.0.0:5353. The default upstream is 1.1.1.1:53. All paths are passed to the filesystem as written; relative paths are relative to the process working directory.
+The default listener addresses are UDP and TCP on 0.0.0.0:5533. The default upstream is 1.1.1.1:53. All paths are passed to the filesystem as written; relative paths are relative to the process working directory.
 
 The release profile sets opt-level = 3, lto = fat, codegen-units = 1, panic = abort, and strip = true.
 

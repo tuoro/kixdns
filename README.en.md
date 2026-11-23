@@ -33,7 +33,7 @@ cargo build --release
 ./target/release/kixdns run -c config/pipeline.json
 ~~~
 
-It listens on UDP and TCP `0.0.0.0:5353` and forwards to `1.1.1.1:53` by default. It needs a toolchain that supports Rust edition 2024.
+It listens on UDP and TCP `0.0.0.0:5533` and forwards to `1.1.1.1:53` by default. It needs a toolchain that supports Rust edition 2024.
 
 ## Documentation
 

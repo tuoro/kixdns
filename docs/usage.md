@@ -16,7 +16,7 @@ cargo build --release
 ./target/release/kixdns run -c config/pipeline.json
 ~~~
 
-UDP 和 TCP 默认监听 0.0.0.0:5353，默认上游是 1.1.1.1:53。所有路径都会按原样传给文件系统；相对路径相对于进程工作目录。
+UDP 和 TCP 默认监听 0.0.0.0:5533，默认上游是 1.1.1.1:53。所有路径都会按原样传给文件系统；相对路径相对于进程工作目录。
 
 Release profile 设置 opt-level = 3、lto = fat、codegen-units = 1、panic = abort 和 strip = true。
 
