@@ -1639,19 +1639,6 @@ impl Engine {
                 self.drop_refreshed(target.slot, &question, &view, target);
             };
             let mut refresh_passed_an_answer = false;
-            // A refresh whose upstream failed and whose rules went on (a miss action's
-            // continue) has no new answer from the route the entry came by: whatever
-            // the later rules give is a fallback, like a miss action's own answer (see
-            // `ForwardResult::Fallback`), and leaves the entry in place. The last
-            // continue or jump decides: one past a fresh answer after that means the rules
-            // now pass over an answer they may have given before. Ending with no answer, the
-            // refresh reports that failure, which says why.
-            // 上游失败后规则接着往下走（on_miss 的 continue 或跳转）的刷新，没有拿到条目来路上的新应答：
-            // 后面的规则给出的都是兜底，和 on_miss 动作自己给出的应答一样（见
-            // `ForwardResult::Fallback`），不删条目。以最后一次 continue 或跳转为准：之后又越过一个
-            // 新拿到的应答，说明规则现在越过了它以前可能给出的应答。最后没拿到应答时，刷新报的就是这次
-            // 失败，它说明了原因。
-            let mut refresh_failure: Option<anyhow::Error> = None;
             // 决策循环的第几轮：第一轮在任何转发之前 / Which pass of the decision loop: the first runs before anything is forwarded
             let mut pass = 0u32;
             'decision_loop: loop {
@@ -1791,14 +1778,11 @@ impl Engine {
                         if rcode == ResponseCode::ServFail
                             && (refresh.is_some() || refresh_passed_an_answer)
                         {
-                            return Err(refresh_failure.take().unwrap_or_else(|| {
-                                phases::refresh_found_no_answer("the rules answered SERVFAIL")
-                            }));
+                            return Err(phases::refresh_found_no_answer(
+                                "the rules answered SERVFAIL",
+                            ));
                         }
-                        if refresh_passed_an_answer
-                            && refresh_failure.is_none()
-                            && let Some(target) = &refresh
-                        {
+                        if refresh_passed_an_answer && let Some(target) = &refresh {
                             drop_refreshed(target);
                         }
                         return phases::handle_static_decision(
@@ -1895,7 +1879,6 @@ impl Engine {
                                 // 结果，也是刷新唯一可能的缓存命中），那里的条目就已经和规则
                                 // 对不上。
                                 if refresh_passed_an_answer
-                                    && refresh_failure.is_none()
                                     && let Some(target) = &refresh
                                     && keys.slot != target.slot
                                     && !phases::is_servfail(&bytes)
@@ -1906,9 +1889,8 @@ impl Engine {
                                 }
                                 return Ok(bytes);
                             }
-                            Ok(phases::ForwardResult::Continue { ctx, failure }) => {
-                                refresh_passed_an_answer |= skip_cache && ctx.is_some();
-                                refresh_failure = failure.filter(|_| skip_cache);
+                            Ok(phases::ForwardResult::Continue { ctx }) => {
+                                refresh_passed_an_answer |= skip_cache;
                                 reused_response = *ctx;
                                 skip_rules.extend(rule_index);
 
@@ -1927,12 +1909,11 @@ impl Engine {
                                 pipeline,
                                 packet,
                                 carried,
-                                failure,
                             }) => {
-                                // 跳过去以前那次转发的应答就是越过的那个，和 Continue 一样 / The answer of the
-                                // forward before the jump is one passed over, as on Continue
-                                refresh_passed_an_answer |= skip_cache && failure.is_none();
-                                refresh_failure = failure.filter(|_| skip_cache);
+                                // 跳过去以前那次转发的应答就是越过的那个，和 Continue 一样（刷新时上游失败的到不了
+                                // 这里）/ The answer of the forward before the jump is one passed over, as on
+                                // Continue (a refresh whose upstream failed never gets here)
+                                refresh_passed_an_answer |= skip_cache;
                                 // 第一次响应阶段的跳转起另算一份次数 / The first response-phase jump starts a budget of its own
                                 if jumped.is_none() {
                                     jumps_left = response_jump_limit;
