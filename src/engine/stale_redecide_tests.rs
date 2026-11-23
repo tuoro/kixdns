@@ -203,11 +203,11 @@ async fn an_answer_a_response_actions_forward_cannot_cache_ends_the_old_one() {
     );
 }
 
-/// 上游失败以后由别的上游兜底、兜底的应答又不能缓存：这是一次失败的刷新，旧应答照旧留着顶着用，不因为兜底的上游说了
+/// 上游失败、规则写着由别的上游兜底：刷新到失败就结束，不问兜底的上游，旧应答照旧留着顶着用，不因为兜底的上游说了
 /// 别的就丢掉
-/// With the upstream failing, another covering for it, and that one's answer not cacheable:
-/// this is a failed refresh, and the old answer stays to stand in as before, not thrown away
-/// for what the covering upstream says
+/// With the upstream failing and the rule having another cover for it: the refresh ends at the
+/// failure without asking the covering upstream, and the old answer stays to stand in as
+/// before, not thrown away for what the covering upstream says
 #[tokio::test]
 async fn after_an_upstream_failure_an_uncacheable_fallback_answer_keeps_the_old_one() {
     let primary = upstream(|query| vec![(Duration::ZERO, real(query))]).await;
@@ -231,20 +231,14 @@ async fn after_an_upstream_failure_an_uncacheable_fallback_answer_keeps_the_old_
     tokio::time::sleep(Duration::from_millis(1200)).await;
     let stale = ask(&engine, &query("name.test."), peer()).await;
     assert_eq!(first_a(&stale), Some(REAL), "stale while the refresh runs");
-    // 等这次刷新走完：主上游超时，兜底的上游回了 NXDOMAIN / Until that refresh is over: the
-    // primary times out and the covering upstream says NXDOMAIN
+    // 等这次刷新走完：主上游超时 / Until that refresh is over: the primary times out
     let asked = fallback.queries();
-    for _ in 0..40 {
-        if fallback.queries() > asked {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        fallback.queries() > asked,
-        "the refresh reached the fallback"
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        fallback.queries(),
+        asked,
+        "the refresh does not reach the fallback"
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let still = ask(&engine, &query("name.test."), peer()).await;
     assert_eq!(first_a(&still), Some(REAL), "the old answer is still there");
 }

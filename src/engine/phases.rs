@@ -39,28 +39,19 @@ pub enum ForwardResult {
     Fallback(Bytes),
     /// Request needs to continue (e.g. Action::Continue)
     /// Boxed to reduce enum size (ResponseContext is ~256 bytes)
-    Continue {
-        ctx: Box<Option<ResponseContext>>,
-        /// A miss action's continue after the upstream failed carries that failure: what
-        /// the later rules answer is a fallback, as `Fallback` is, and a refresh that ends
-        /// with no answer reports it, as it says why
-        /// 上游失败之后 on_miss 动作的 continue 带着那次失败：后面的规则给出的应答是兜底，和
-        /// `Fallback` 一样；刷新最后没拿到应答时报的就是它，它说明了原因
-        failure: Option<anyhow::Error>,
-    },
+    Continue { ctx: Box<Option<ResponseContext>> },
     /// 响应动作跳到 `pipeline`：请求在那里接着走规则，转发照原样发出这次转发发出的 `packet`，它带的 ECS 是 `carried`；应答
     /// 照旧缓存在跳转前这个 pipeline 的键下（见 `handle_packet_internal`）。这次转发登记的条目留给请求（见 `held_inflight`），
-    /// 等它拿到最终的应答再交出去。`failure` 同 `Continue`
+    /// 等它拿到最终的应答再交出去
     /// A response action jumps to `pipeline`: the request goes on with the rules there, its
     /// forwards sending `packet`, what this forward sent, as it is, with `carried` as its ECS;
     /// answers are still cached under the key of this pipeline, the one jumped from (see
     /// `handle_packet_internal`). The entry this forward registered stays with the request (see
-    /// `held_inflight`) and is handed the final answer. `failure` as for `Continue`
+    /// `held_inflight`) and is handed the final answer
     Jump {
         pipeline: Arc<str>,
         packet: Bytes,
         carried: ForwardEcs,
-        failure: Option<anyhow::Error>,
     },
 }
 use hickory_proto::serialize::binary::BinDecodable;
@@ -1062,17 +1053,22 @@ pub(crate) async fn handle_forward_decision_logged(
                 };
                 (actions_to_run, Some(ctx), req_full, None)
             }
+            // 后台刷新没有客户端，也没在 inflight 里登记：上游失败就到此为止，把失败原样交回（refresh.rs 记下、退避），
+            // 缓存条目和别的请求的等待者都不受影响。miss 动作给出的只是兜底，刷新用不着：以前照跑，静态兜底、问备用
+            // 上游拿到的都写进缓存，把预取时还新鲜的那条顶掉，刷新还算成功、不退避
+            // A background refresh has no client and never registered in `inflight`: an upstream
+            // failure ends it there with the failure itself (refresh.rs notes it and backs off),
+            // the cached entry and other requests' waiters untouched. What miss actions give is a
+            // fallback a refresh has no use for: they used to run, a static fallback or a backup
+            // upstream's answer going into the cache over the entry still fresh at a prefetch,
+            // and the refresh counting as a success with no backing off
+            Err(e) if skip_cache => return Err(e),
             Err(e) => {
                 if response_actions_on_miss.is_empty() {
+                    // 下面的过期应答和 SERVFAIL 只在所有上游尝试都耗尽时用来应答客户端
                     // The stale answer and the SERVFAIL below answer a client once every
-                    // upstream attempt is exhausted. A background refresh has no client and
-                    // never registered in `inflight`, so it gets the failure itself, which
-                    // refresh.rs logs, and neither the cached entry nor other requests'
-                    // waiters are touched.
-                    // 下面的过期应答和 SERVFAIL 只在所有上游尝试都耗尽时用来应答客户端。
-                    // 后台刷新没有客户端，也没在 inflight 里登记，所以把失败原样交回，由
-                    // refresh.rs 记录；缓存条目和别的请求的等待者都不受影响。
-                    if skip_cache || e.downcast_ref::<UpstreamFailure>().is_none() {
+                    // upstream attempt is exhausted
+                    if e.downcast_ref::<UpstreamFailure>().is_none() {
                         return Err(e);
                     }
 
@@ -1184,9 +1180,9 @@ pub(crate) async fn handle_forward_decision_logged(
             }
         };
 
-        // 上游失败以后执行的动作给出的结果算回落；刷新时它们也找不到应答，刷新交回的是上游的失败
-        // What the actions run after an upstream failure give counts as a fallback; when
-        // they find no answer either on a refresh, the refresh gets the upstream's failure
+        // 上游失败以后执行的动作给出的结果算回落（刷新到不了这里，见上面）
+        // What the actions run after an upstream failure give counts as a fallback (a refresh
+        // never gets here, see above)
         let fallback = failure.is_some();
         let finished = |bytes| {
             if fallback {
@@ -1264,14 +1260,14 @@ pub(crate) async fn handle_forward_decision_logged(
                 // 结束，而不是把 SERVFAIL 写进缓存、盖掉它要刷新的那条；上游失败以后，交回的
                 // 就是上游的失败。
                 if skip_cache && rcode == ResponseCode::ServFail {
-                    return Err(failure.unwrap_or_else(|| {
-                        refresh_found_no_answer("the response actions found no answer")
-                    }));
+                    return Err(refresh_found_no_answer(
+                        "the response actions found no answer",
+                    ));
                 }
                 if min_ttl > Duration::from_secs(0) {
                     let ttl = proto_utils::saturating_u64_to_u32(min_ttl.as_secs());
                     cache(&bytes, rcode, None, ttl, trail);
-                } else if skip_cache && !fallback {
+                } else if skip_cache {
                     // An answer that is not cached cannot renew the entry, so the refresh
                     // drops it and the next client request runs the rules.
                     // 不缓存的应答无法更新这条缓存，所以刷新把它删掉，下一个客户端请求自己
@@ -1297,7 +1293,6 @@ pub(crate) async fn handle_forward_decision_logged(
                     pipeline,
                     packet: Bytes::copy_from_slice(packet),
                     carried: forward_ecs,
-                    failure,
                 })
             }
             ResponseActionResult::Continue { ctx } => {
@@ -1315,10 +1310,7 @@ pub(crate) async fn handle_forward_decision_logged(
                 if let Some(guard) = cleanup_guard.take() {
                     *held_inflight = Some(guard);
                 }
-                Ok(ForwardResult::Continue {
-                    ctx: Box::new(ctx),
-                    failure,
-                })
+                Ok(ForwardResult::Continue { ctx: Box::new(ctx) })
             }
         }
     })
@@ -2036,25 +2028,34 @@ mod refresh_response_rule_tests {
         assert_eq!(cached, Some(vec![OLD]));
     }
 
+    /// 刷新时上游回了失败应答：刷新到此为止，miss 动作不跑，条目原样留着。以前问了备用上游，拿它的回答把还新鲜的条目
+    /// 换掉
+    /// A refresh whose upstream gives a failure reply ends there: the miss actions do not run
+    /// and the entry stays as it is. The backup upstream used to be asked, its answer replacing
+    /// the entry while still fresh
     #[tokio::test]
-    async fn a_refresh_runs_the_miss_actions_on_a_failure_reply() {
+    async fn a_refresh_ends_at_a_failure_reply_without_running_the_miss_actions() {
         let failing = spawn_upstream_answering_servfail().await;
-        let backup = answering_upstream(FINAL, 300).await.address;
+        let backup = answering_upstream(FINAL, 300).await;
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([{ "id": "main", "rules": [rule(
                 "first",
                 forward(&failing),
-                json!({ "response_actions_on_miss": forward(&backup) })
+                json!({ "response_actions_on_miss": forward(&backup.address) })
             )]}]),
         );
-        assert_eq!(refresh(&engine, key).await, Some(vec![FINAL]));
+        assert_eq!(refresh(&engine, key).await, Some(vec![OLD]));
+        assert_eq!(backup.queries(), 0, "the backup is not asked");
     }
 
-    /// 上游失败以后 on_miss 动作给出的静态答案，有 min_ttl 时按它缓存
-    /// A static answer the miss actions give once the upstream failed is cached under min_ttl
+    /// 上游失败以后 on_miss 动作给出的静态答案不顶掉条目：刷新到上游失败就结束了。以前按 min_ttl 写进缓存，预取时一次
+    /// 抖动就把还新鲜的应答换成兜底
+    /// A static answer of the miss actions does not replace the entry once the upstream failed:
+    /// the refresh ends at the failure. It used to be cached under min_ttl, one blip at a
+    /// prefetch replacing an answer still fresh with the fallback
     #[tokio::test]
-    async fn a_refresh_caches_a_static_miss_answer_after_a_failure_under_min_ttl() {
+    async fn a_refresh_keeps_the_entry_over_a_static_miss_answer_after_a_failure() {
         let failing = spawn_upstream_answering_servfail().await;
         let (engine, key) = engine_with_a_cached_answer(
             json!({ "min_ttl": 60 }),
@@ -2064,10 +2065,7 @@ mod refresh_response_rule_tests {
                 json!({ "response_actions_on_miss": answer_static() })
             )]}]),
         );
-        assert_eq!(
-            refresh(&engine, key).await,
-            Some(vec![STATIC.parse().unwrap()])
-        );
+        assert_eq!(refresh(&engine, key).await, Some(vec![OLD]));
     }
 
     /// 响应跳转以后，规则越过的应答交给下一条 `allow` 规则复用，不再去问默认上游
@@ -2458,14 +2456,13 @@ mod refresh_response_rule_tests {
         }
     }
 
-    /// After the failure the rules get a fresh answer and continue past it: they now
-    /// pass over an answer they may have given before, so the entry goes, as when no
-    /// upstream failed.
-    /// 失败之后规则又拿到一个新应答并越过它：规则现在越过了它以前可能给出的应答，所以和没有
-    /// 上游失败时一样，删掉条目。
+    /// 上游失败、miss 动作写着 continue：刷新到失败就结束，后面的规则不跑，条目留着
+    /// The upstream failing with a miss action that continues: the refresh ends at the failure,
+    /// the later rules do not run, and the entry stays
     #[tokio::test]
-    async fn a_refresh_drops_the_entry_when_it_passes_a_fresh_answer_after_a_failure() {
-        let second = answering_upstream(PASSED_OVER, 300).await.address;
+    async fn a_refresh_ends_at_the_failure_before_the_later_rules() {
+        let later = answering_upstream(PASSED_OVER, 300).await;
+        let second = later.address.clone();
         let (engine, key) = engine_with_a_cached_answer(
             json!({}),
             json!([{ "id": "main", "rules": [
@@ -2482,7 +2479,8 @@ mod refresh_response_rule_tests {
                 rule("static", answer_static(), json!({}))
             ]}]),
         );
-        assert_eq!(refresh(&engine, key).await, None);
+        assert_eq!(refresh(&engine, key).await, Some(vec![OLD]));
+        assert_eq!(later.queries(), 0, "the later rule's upstream is not asked");
     }
 
     /// The upstream failed and the miss action found no answer either: the refresh
