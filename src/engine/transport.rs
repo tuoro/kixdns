@@ -528,19 +528,106 @@ impl StreamTransport for Tcp {
         bootstrap: &Arc<Bootstrap>,
         upstream: &str,
     ) -> anyhow::Result<(Self::Read, OwnedWriteHalf)> {
-        let stream = bootstrap
-            .connect(upstream)
+        let stream = connect_tcp(bootstrap, upstream)
             .await
             .map_err(|e| anyhow::anyhow!("tcp connect failed: {e:#}"))?;
-        tune_stream_socket(&stream, upstream);
         let (read, write) = stream.into_split();
         Ok((tokio::io::BufReader::new(read), write))
     }
 }
 
-/// 刚建好的 TCP 连接（DoT 在握手之前也是）：关掉 Nagle，打开激进的 keepalive
-/// A freshly connected TCP stream (DoT's too, before its handshake): Nagle off and an
-/// aggressive keepalive on
+/// RFC 8305 第 5 节的 Connection Attempt Delay：一个尝试这么久还没连上，就起下一个 / The Connection
+/// Attempt Delay of RFC 8305 section 5: an attempt not through after this long has the next one
+/// started
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
+/// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时报最后那个失败。
+/// TCP、DoT、直连的 DoH 和 DoQ 都这样连。以前 TCP、DoT 一个个依次连，前面的地址不回应时等到建连的时限也轮不到后面的；
+/// DoH 直连同一族的地址也是依次连；DoQ 只连一个
+/// Connects through `attempt` to one of `addresses` (RFC 8305 sections 4 and 5): the addresses
+/// alternate by family, the first address's family first; one attempt is started, and once it is
+/// not through after [`ATTEMPT_DELAY`], or has failed, the next one is, the first to connect
+/// being used and the rest given up; with all failed the last failure is reported. TCP, DoT,
+/// direct DoH and DoQ all connect so. TCP and DoT used to try one address after another, so with
+/// an early one not answering the later ones never had their turn within the connect's time
+/// limit; direct DoH did the same within a family; DoQ tried a single one
+async fn staggered<T, F>(
+    addresses: Vec<SocketAddr>,
+    attempt: impl Fn(SocketAddr) -> F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    use futures::StreamExt;
+
+    let mut waiting = interleaved(addresses).into_iter();
+    let mut attempts = futures::stream::FuturesUnordered::new();
+    let mut failed = None;
+    loop {
+        match waiting.next() {
+            Some(address) => attempts.push(attempt(address)),
+            None if attempts.is_empty() => {
+                return Err(failed.unwrap_or_else(|| anyhow::anyhow!("no address to connect to")));
+            }
+            None => {}
+        }
+        tokio::select! {
+            Some(outcome) = attempts.next() => match outcome {
+                Ok(connected) => return Ok(connected),
+                Err(error) => failed = Some(error),
+            },
+            () = tokio::time::sleep(ATTEMPT_DELAY), if !waiting.as_slice().is_empty() => {}
+        }
+    }
+}
+
+/// `addresses` 按族交替排开，第一个地址那一族在前，同一族里照原来的先后（RFC 8305 第 4 节）/ `addresses`
+/// alternating by family, the first address's family first and each family in its own order
+/// (RFC 8305 section 4)
+fn interleaved(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let first_v4 = addresses.first().is_some_and(SocketAddr::is_ipv4);
+    let mut seen = [0usize; 2];
+    let mut ranked: Vec<_> = addresses
+        .into_iter()
+        .map(|address| {
+            let family = usize::from(address.is_ipv4() != first_v4);
+            seen[family] += 1;
+            ((seen[family], family), address)
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, address)| address).collect()
+}
+
+/// 连上写成 `主机:端口` 的地址（TCP、DoT 上游，直连的 DoH 上游）：主机名交给 `bootstrap` 解析，几个地址错开着连
+/// （见 [`staggered`]），连上的那条再调好（见 [`tune_stream_socket`]）
+/// Connects to an address written as `host:port` (TCP and DoT upstreams, a direct DoH one): the
+/// host name goes to `bootstrap`, several addresses are connected to staggered (see
+/// [`staggered`]), and the one connected is tuned (see [`tune_stream_socket`])
+pub(super) async fn connect_tcp(bootstrap: &Bootstrap, address: &str) -> anyhow::Result<TcpStream> {
+    let addresses = match address.parse::<SocketAddr>() {
+        Ok(address) => vec![address],
+        Err(_) => {
+            let (host, port) = address
+                .rsplit_once(':')
+                .context("expected a host and a port")?;
+            bootstrap
+                .addresses(host, port.parse().context("invalid port")?)
+                .await?
+        }
+    };
+    let stream = staggered(addresses, |address| async move {
+        Ok(TcpStream::connect(address).await?)
+    })
+    .await?;
+    tune_stream_socket(&stream, address);
+    Ok(stream)
+}
+
+/// 刚建好的 TCP 连接（DoT、直连的 DoH 在握手之前也是）：关掉 Nagle，打开激进的 keepalive
+/// A freshly connected TCP stream (DoT's and a direct DoH one's too, before their handshakes):
+/// Nagle off and an aggressive keepalive on
 fn tune_stream_socket(stream: &TcpStream, upstream: &str) {
     // Configure socket options for robustness
     // 配置 socket 选项以增强健壮性
@@ -2119,8 +2206,6 @@ pub struct DohClient {
     latest_pause_end: AtomicU64,
     /// 直连 HTTP/2 用的 TLS 设置：握手时报 h2 和 http/1.1 / The TLS settings of the direct HTTP/2 connection: h2 and http/1.1 offered in the handshake
     tls_h2: Arc<ClientConfig>,
-    /// 直连用的 TCP 连接器，设置和 reqwest 的一样 / The TCP connector of the direct connection, set up as reqwest's
-    connector: doh_h2::Connector,
     /// 上游的主机名怎样解析（见 [`Bootstrap`]），直连和 reqwest 都用它 / How upstream host names are
     /// resolved (see [`Bootstrap`]), by the direct connection and reqwest alike
     resolver: Resolver,
@@ -2161,7 +2246,6 @@ impl DohClient {
             epoch: std::time::Instant::now(),
             latest_pause_end: AtomicU64::new(0),
             tls_h2: direct_tls_config(build_tls_client_config()?),
-            connector: doh_h2::tcp_connector(resolver.clone()),
             resolver,
             direct_h2: !doh_h2::proxy_configured(),
             idle_timeout: doh_h2::DOH_IDLE_TIMEOUT,
@@ -2266,7 +2350,10 @@ impl DohClient {
             // DoH 服务器没有理由跳转，跟着跳可能把查询发到别处，包括明文 HTTP；3xx 和别的非成功状态一样算失败
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(self.resolver.clone()))
-            .http2_adaptive_window(true)
+            // HTTP/2 的窗口和直连的一样，理由见 `doh_h2::CONNECTION_WINDOW` / The HTTP/2 windows of the
+            // direct connection, for the reasons given at `doh_h2::CONNECTION_WINDOW`
+            .http2_initial_stream_window_size(MAX_DNS_MESSAGE_SIZE as u32)
+            .http2_initial_connection_window_size(doh_h2::CONNECTION_WINDOW)
             .pool_idle_timeout(self.idle_timeout)
             .pool_max_idle_per_host(self.pool_max_idle_per_host.max(1))
             .build()
@@ -2506,7 +2593,7 @@ impl DohClient {
             // content-length themselves, h2 does not
             if let Some(uri) = uri
                 && let Some((sender, _in_flight)) =
-                    state.h2.sender(url, &self.tls_h2, &self.connector).await?
+                    state.h2.sender(url, &self.tls_h2, &self.resolver.0).await?
             {
                 let request = hyper::Request::post(uri.clone())
                     .header(ACCEPT, DOH_MEDIA_TYPE)
@@ -2818,11 +2905,9 @@ impl StreamTransport for Dot {
     ) -> anyhow::Result<(Self::Read, Self::Write)> {
         let target = parse_dot_target(upstream)?;
         let server_name = build_server_name(&target.sni)?;
-        let stream = bootstrap
-            .connect(&target.connect_addr)
+        let stream = connect_tcp(bootstrap, &target.connect_addr)
             .await
             .map_err(|e| anyhow::anyhow!("dot connect failed: {e:#}"))?;
-        tune_stream_socket(&stream, upstream);
         let tls_stream = TlsConnector::from(tls_config.clone())
             .connect(server_name, stream)
             .await
@@ -3699,15 +3784,17 @@ impl DoqMuxClient {
             );
         }
     }
-    /// 建一条到 `target` 的连接，`zero_rtt` 时先试 0-RTT；连接和用没用 0-RTT / Connects to `target`,
-    /// trying 0-RTT first when `zero_rtt`; the connection and whether 0-RTT was used
+    /// 建一条到 `target` 的连接，`zero_rtt` 时先试 0-RTT；连接和用没用 0-RTT。几个地址错开着连（见
+    /// [`staggered`]），握手失败了马上连下一个 / Connects to `target`, trying 0-RTT first when
+    /// `zero_rtt`; the connection and whether 0-RTT was used. Several addresses are connected to
+    /// staggered (see [`staggered`]), a failed handshake moving on to the next at once
     async fn connect_new(
         runtime: Arc<DoqRuntime>,
         upstream: Arc<str>,
         target: DoqTarget,
         zero_rtt: bool,
     ) -> anyhow::Result<NewDoqConn> {
-        let addrs_vec = runtime
+        let mut addresses = runtime
             .bootstrap
             .addresses(&target.host, target.port)
             .await
@@ -3717,21 +3804,29 @@ impl DoqMuxClient {
         // Prefer IPv4 addresses to avoid IPv6 connection issues
         // 某些网络的 IPv6 连接不稳定或 MTU 限制导致 QUIC Initial 数据包发送失败
         // Some networks have unstable IPv6 or MTU limits causing QUIC Initial packet send failures
-        let addr = addrs_vec
-            .iter()
-            .find(|a| a.is_ipv4())
-            .or_else(|| addrs_vec.first())
-            .context("doq resolve returned no addresses")?;
+        addresses.sort_by_key(SocketAddr::is_ipv6);
+        staggered(addresses, |address| {
+            Self::connect_to(&runtime, &upstream, &target, address, zero_rtt)
+        })
+        .await
+    }
 
-        let addr = *addr;
-
-        let endpoint = if addr.is_ipv6() {
+    /// 在 `address` 上建一条到 `target` 的连接（见 [`Self::connect_new`]）/ Connects to `target` at
+    /// `address` (see [`Self::connect_new`])
+    async fn connect_to(
+        runtime: &DoqRuntime,
+        upstream: &str,
+        target: &DoqTarget,
+        address: SocketAddr,
+        zero_rtt: bool,
+    ) -> anyhow::Result<NewDoqConn> {
+        let endpoint = if address.is_ipv6() {
             &runtime.endpoint_v6
         } else {
             &runtime.endpoint_v4
         };
         let connecting = endpoint
-            .connect(addr, target.sni.as_ref())
+            .connect(address, target.sni.as_ref())
             .context("doq connect failed")?;
 
         // 0-RTT：上游设置优先于全局设置，之前被拒绝过就跳过（见 `zero_rtt_retry_allowed`）
@@ -6517,6 +6612,16 @@ mod tests {
 
     /// 只信任 `client_tls` 里那张证书的 DoQ 端点 / DoQ endpoints trusting only the certificate in `client_tls`
     fn doq_test_runtime(client_tls: ClientConfig, enable_0rtt: bool) -> Arc<DoqRuntime> {
+        doq_test_runtime_through(client_tls, enable_0rtt, Bootstrap::system())
+    }
+
+    /// 同 [`doq_test_runtime`]，主机名交给 `bootstrap` 解析 / As [`doq_test_runtime`], host names
+    /// resolved by `bootstrap`
+    fn doq_test_runtime_through(
+        client_tls: ClientConfig,
+        enable_0rtt: bool,
+        bootstrap: Arc<Bootstrap>,
+    ) -> Arc<DoqRuntime> {
         let crypto = QuicClientConfig::try_from(client_tls).expect("quic client crypto");
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::new(doq_transport(0, 0).expect("transport")));
@@ -6533,7 +6638,7 @@ mod tests {
         Arc::new(DoqRuntime {
             endpoint_v4,
             endpoint_v6,
-            bootstrap: Bootstrap::system(),
+            bootstrap,
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
         })
@@ -7542,6 +7647,120 @@ mod tests {
             .send(&udp_test_query("v6.example"), Duration::from_secs(2))
             .await
             .expect("an IPv6 literal DoQ upstream answers");
+    }
+
+    /// 两族交替排开，第一个地址那一族在前，同一族里照原来的先后 / The families alternate, the first
+    /// address's family first, each family in its own order
+    #[test]
+    fn addresses_alternate_by_family() {
+        let parse = |addresses: &[&str]| -> Vec<SocketAddr> {
+            addresses
+                .iter()
+                .map(|address| address.parse().unwrap())
+                .collect()
+        };
+        let (a, b, c) = ("192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53");
+        let (x, y) = ("[2001:db8::1]:53", "[2001:db8::2]:53");
+        assert_eq!(
+            interleaved(parse(&[a, b, c, x, y])),
+            parse(&[a, x, b, y, c])
+        );
+        assert_eq!(interleaved(parse(&[x, a, y, b])), parse(&[x, a, y, b]));
+        assert_eq!(interleaved(parse(&[x, y, a])), parse(&[x, a, y]));
+        assert!(interleaved(Vec::new()).is_empty());
+    }
+
+    /// 本机的 bootstrap 服务器，`upstream.test` 解析成 127.0.0.1 和 ::1，IPv4 在前 / A local bootstrap
+    /// server, `upstream.test` resolving to 127.0.0.1 and ::1, IPv4 first
+    async fn loopback_names() -> (crate::engine::test_support::Upstream, Arc<Bootstrap>) {
+        let server = crate::engine::test_support::loopback_bootstrap(300).await;
+        let bootstrap = Bootstrap::new(
+            &server.address,
+            Arc::new(UdpClient::new(1).expect("UDP client")),
+            Duration::from_secs(2),
+        );
+        (server, bootstrap)
+    }
+
+    /// 错开着连（RFC 8305）：第一个尝试不回应，过了 [`ATTEMPT_DELAY`] 才起第二个，用先连上的那个；一个失败了马上起下一个，
+    /// 不等；都失败时报最后那个失败。TCP、DoT、直连的 DoH 都经这里连（见 [`connect_tcp`]），DoQ 也是。以前 TCP、DoT 一个个
+    /// 依次连，第一个不回应就等到建连的时限
+    /// Connecting staggered (RFC 8305): with the first attempt not answering, the second starts
+    /// only after [`ATTEMPT_DELAY`] and the first to connect is used; a failed attempt has the next
+    /// one started at once, with no wait; with all failed the last failure is reported. TCP, DoT
+    /// and direct DoH all connect through here (see [`connect_tcp`]), DoQ too. TCP and DoT used to
+    /// try one after another, waiting out the connect's time limit on a first one not answering
+    #[tokio::test(start_paused = true)]
+    async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "192.0.2.1:53".parse().unwrap(),
+            "[2001:db8::1]:53".parse().unwrap(),
+        );
+        let started = tokio::time::Instant::now();
+        let connected = staggered(vec![a, b], |address| async move {
+            if address == a {
+                std::future::pending::<anyhow::Result<SocketAddr>>().await
+            } else {
+                Ok(address)
+            }
+        })
+        .await
+        .expect("the second connects");
+        assert_eq!((connected, started.elapsed()), (b, ATTEMPT_DELAY));
+
+        let started = tokio::time::Instant::now();
+        let connected = staggered(vec![a, b], |address| async move {
+            anyhow::ensure!(address != a, "{address} refused");
+            Ok(address)
+        })
+        .await
+        .expect("the second connects");
+        assert_eq!((connected, started.elapsed()), (b, Duration::ZERO));
+
+        let failed = staggered(vec![a, b], |address| async move {
+            Err::<SocketAddr, _>(anyhow::anyhow!("{address} refused"))
+        })
+        .await
+        .expect_err("none connects");
+        assert_eq!(failed.to_string(), format!("{b} refused"));
+    }
+
+    /// DoQ 也一样：127.0.0.1 上同一个端口的 UDP 从不回应，过 [`ATTEMPT_DELAY`] 就在 ::1 上握手。以前只连 IPv4 的那一个
+    /// DoQ alike: with UDP on the same port of 127.0.0.1 never answering, the handshake goes to ::1
+    /// after [`ATTEMPT_DELAY`]. The IPv4 address used to be the only one tried
+    #[tokio::test]
+    async fn a_doq_connect_moves_on_from_an_address_that_does_not_answer() {
+        let (_server, bootstrap) = loopback_names().await;
+        let answer = |_: usize, _: &str| DoqReply::Answer(Duration::ZERO);
+        let mut tries = 0;
+        let (port, client_tls, _silent) = loop {
+            tries += 1;
+            assert!(tries <= 20, "no port free on both loopbacks in 20 tries");
+            let (server, client_tls) = localhost_tls(&[b"doq"]);
+            let Some(v6) = spawn_doq_upstream_on(
+                "[::1]:0".parse().unwrap(),
+                server,
+                Duration::ZERO,
+                answer,
+                None,
+            ) else {
+                eprintln!("skipped: IPv6 loopback unavailable on this host");
+                return;
+            };
+            // 收下发来的握手却从不读 / Takes the handshakes sent to it but never reads them
+            if let Ok(silent) = std::net::UdpSocket::bind(("127.0.0.1", v6.port())) {
+                break (v6.port(), client_tls, silent);
+            }
+        };
+        let client = DoqMuxClient::new(
+            Arc::from(format!("doq://upstream.test:{port}?sni=localhost")),
+            doq_test_runtime_through(client_tls, false, bootstrap),
+            Arc::new(AtomicBool::new(false)),
+        );
+        client
+            .send(&udp_test_query("named.example"), Duration::from_secs(2))
+            .await
+            .expect("the second address answers");
     }
 
     /// 写成主机名的 TCP、DoT、DoQ 上游经 Bootstrap 解析：`upstream.test` 只有本机的 bootstrap 服务器认得，

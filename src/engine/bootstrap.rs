@@ -9,9 +9,7 @@
 //! An upstream written as an IP needs no resolving
 
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -19,7 +17,6 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RData, RecordType};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
@@ -111,22 +108,6 @@ impl Bootstrap {
             .map(|&ip| SocketAddr::new(ip, port))
             .collect())
     }
-
-    /// 连上写成 `主机:端口` 的地址，几个地址依次试 / Connects to an address written as `host:port`,
-    /// trying its addresses in turn
-    pub(crate) async fn connect(&self, address: &str) -> anyhow::Result<TcpStream> {
-        let addresses = match address.parse::<SocketAddr>() {
-            Ok(address) => vec![address],
-            Err(_) => {
-                let (host, port) = address
-                    .rsplit_once(':')
-                    .context("expected a host and a port")?;
-                self.addresses(host, port.parse().context("invalid port")?)
-                    .await?
-            }
-        };
-        Ok(TcpStream::connect(&addresses[..]).await?)
-    }
 }
 
 impl Through {
@@ -214,42 +195,18 @@ impl Through {
     }
 }
 
-/// DoH 的两条路各要一种解析器：直连的 TCP 连接器（hyper-util）和 reqwest 接口不同，都交给 [`Bootstrap`]。端口由
-/// 它们按 URL 补上
-/// The resolver each of DoH's two ways asks for: the direct connection's TCP connector
-/// (hyper-util) and reqwest differ in interface, and both go to [`Bootstrap`]. They fill in the
-/// port from the URL
+/// reqwest 用的解析器，主机名交给 [`Bootstrap`]，端口由 reqwest 按 URL 补上 / The resolver reqwest
+/// uses, host names going to [`Bootstrap`], the port filled in by reqwest from the URL
 #[derive(Clone)]
 pub(crate) struct Resolver(pub(crate) Arc<Bootstrap>);
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// `host` 的地址，端口留 0 / The addresses of `host`, the port left at 0
-async fn addresses_of(
-    bootstrap: Arc<Bootstrap>,
-    host: String,
-) -> Result<std::vec::IntoIter<SocketAddr>, BoxError> {
-    Ok(bootstrap.addresses(&host, 0).await?.into_iter())
-}
-
-impl tower_service::Service<hyper_util::client::legacy::connect::dns::Name> for Resolver {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut TaskContext<'_>) -> Poll<Result<(), BoxError>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, name: hyper_util::client::legacy::connect::dns::Name) -> Self::Future {
-        Box::pin(addresses_of(Arc::clone(&self.0), name.as_str().to_owned()))
-    }
-}
-
 impl reqwest::dns::Resolve for Resolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let resolving = addresses_of(Arc::clone(&self.0), name.as_str().to_owned());
-        Box::pin(async move { Ok(Box::new(resolving.await?) as reqwest::dns::Addrs) })
+        let (bootstrap, host) = (Arc::clone(&self.0), name.as_str().to_owned());
+        Box::pin(async move {
+            let addresses = bootstrap.addresses(&host, 0).await?;
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
     }
 }
 
