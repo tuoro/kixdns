@@ -97,7 +97,7 @@ Pipeline selectors support all of the rows above. Request rules support all rows
 #### GeoIP data sources and tags
 
 - `geoip_db_path` loads a MaxMind MMDB database. It supplies two-letter country codes such as `CN` and `US`.
-- `geoip_dat_path` loads either a V2Ray protobuf `.dat` file or a compatible JSON file. The JSON file is GeoIP data, not the main KixDNS configuration. Its shape is `{"entries":[{"country_code":"CLOUDFLARE","ips":["1.1.1.0/24"]}]}`.
+- `geoip_dat_path` loads either a V2Ray protobuf `.dat` file or a compatible JSON file. The JSON file is GeoIP data, not the main KixDNS configuration. Its shape is `{"entries":[{"country_code":"CLOUDFLARE","ips":["1.1.1.0/24"]}]}`. An address without a prefix length is that one address: `1.1.1.1` is `1.1.1.1/32` (/128 for IPv6).
 - V2Ray data may contain country codes and named tags such as `CLOUDFLARE`, `NETFLIX`, or `TELEGRAM`. One IP may belong to several tags.
 - When both sources are configured, MMDB decides two-letter country codes; named tags still come from `geoip_dat_path`.
 - Only the country codes and tags rules use are read. The MMDB is read only when rules use a two-letter country code; `geoip_dat_path` is read only for the tags rules use that the MMDB does not decide, so with an MMDB configured and rules using two-letter country codes alone that file is not read. A tag rules use that the file lacks is logged as a warning, and rules using it never match.

@@ -705,8 +705,8 @@ impl GeoIpManager {
             let index = get_or_insert_tag_index(&mut tag_indexes, &tag);
 
             for ip_str in &geoip.ips {
-                match ip_str.parse::<ipnet::IpNet>() {
-                    Ok(ipnet::IpNet::V4(v4net)) => {
+                match json_network(ip_str) {
+                    Some(ipnet::IpNet::V4(v4net)) => {
                         index.ipv4_ranges.push(AddrRange {
                             start: u32::from(v4net.network()),
                             end: u32::from(v4net.broadcast()),
@@ -714,7 +714,7 @@ impl GeoIpManager {
                         count += 1;
                         ipv4_count += 1;
                     }
-                    Ok(ipnet::IpNet::V6(v6net)) => {
+                    Some(ipnet::IpNet::V6(v6net)) => {
                         index.ipv6_ranges.push(AddrRange {
                             start: u128::from(v6net.network()),
                             end: u128::from(v6net.broadcast()),
@@ -722,7 +722,7 @@ impl GeoIpManager {
                         count += 1;
                         ipv6_count += 1;
                     }
-                    Err(_) => continue,
+                    None => {}
                 }
             }
         }
@@ -754,6 +754,19 @@ impl GeoIpManager {
     ) -> anyhow::Result<ConversionStats> {
         convert_dat_to_mmdb(dat_path, mmdb_path, filter_countries)
     }
+}
+
+/// JSON 数据里的一项：带前缀长度的网段（`1.1.1.0/24`），或者不带前缀长度的单个地址（`1.1.1.1` 就是 `1.1.1.1/32`，
+/// IPv6 是 /128），和 .dat 里超过位宽的前缀按单个地址算一样。网段列表里写一个地址只有这一个意思，以前它读不出来，
+/// 悄悄丢掉，文件里明明列着的地址规则却匹配不上
+/// One item of JSON data: a network with its prefix length (`1.1.1.0/24`), or a single
+/// address without one (`1.1.1.1` is `1.1.1.1/32`, /128 for IPv6), as a .dat prefix wider than
+/// the address is one address. An address in a list of networks can mean nothing else; it used
+/// not to parse and was dropped in silence, so rules missed an address the file plainly lists
+fn json_network(text: &str) -> Option<ipnet::IpNet> {
+    text.parse()
+        .ok()
+        .or_else(|| text.parse::<IpAddr>().ok().map(ipnet::IpNet::from))
 }
 
 /// 从 `file` 读一个 protobuf 变长整数，`remaining` 是文件里还剩的字节数
@@ -1334,6 +1347,37 @@ mod tests {
 
     fn tags(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// JSON 里不带前缀长度的地址按单个地址算：`198.51.100.7` 是 /32，`2001:db8::7` 是 /128，旁边的地址不算。以前它们
+    /// 读不出来，悄悄丢掉
+    /// An address in JSON without a prefix length is that one address: `198.51.100.7` is a /32
+    /// and `2001:db8::7` a /128, the addresses next to them not included. They used not to
+    /// parse and were dropped in silence
+    #[test]
+    fn a_json_address_without_a_prefix_is_that_one_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        std::fs::write(
+            &path,
+            r#"{"entries":[{"country_code":"HOSTS","ips":["198.51.100.7","2001:db8::7"]}]}"#,
+        )
+        .unwrap();
+        let mut manager = GeoIpManager::default();
+        manager.apply_parsed(GeoIpManager::parse_file(&path, &tags(&["hosts"])).unwrap());
+        let hosts = [Arc::from("HOSTS")];
+        for (ip, expected) in [
+            ("198.51.100.7", true),
+            ("198.51.100.8", false),
+            ("2001:db8::7", true),
+            ("2001:db8::8", false),
+        ] {
+            assert_eq!(
+                manager.matches_any_tag(ip.parse().unwrap(), &hosts),
+                expected,
+                "{ip}"
+            );
+        }
     }
 
     /// 只解析规则用到的标签，请求不分大小写；别的条目不留，文件里没有的标签不算错
