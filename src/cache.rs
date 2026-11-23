@@ -259,40 +259,6 @@ impl CacheSlot {
         Some(Self { entries })
     }
 
-    /// 刷新之后的槽位：刷新写进了一份适用范围不同的新应答（`written`，例如上游的作用范围
-    /// 变窄了），它就不会取代被刷新的那份（`renewed`）；那份留着，每次命中都会再发起一次
-    /// 刷新。上游最新的说法已经在新应答里，所以去掉它，它适用的请求方各自重新查询。刷新什么
-    /// 都没写时，它照旧留着。None 表示不用改动。
-    /// The slot after a refresh. A refresh that wrote a new answer with another
-    /// reach (`written`; the upstream narrowed its scope, say) does not replace the
-    /// answer it renewed (`renewed`); left in place, that one would start another
-    /// refresh on every hit. The upstream's latest word is in the new answer, so the
-    /// renewed one goes and its requesters ask again. When the refresh wrote
-    /// nothing, it stays as it was. None means nothing changes.
-    pub fn after_refresh(
-        &self,
-        question: &CachedQuestion<'_>,
-        renewed: &EcsReach,
-        renewed_fetched_at: Instant,
-        written: &EcsReach,
-        started: Instant,
-    ) -> Option<Self> {
-        if written == renewed {
-            return None;
-        }
-        let rewritten = self.entries.iter().any(|entry| {
-            question.matches(entry) && entry.fetched_at >= started && entry.reach == *written
-        });
-        if !rewritten {
-            return None;
-        }
-        self.without(|entry| {
-            question.matches(entry)
-                && entry.reach == *renewed
-                && entry.fetched_at == renewed_fetched_at
-        })
-    }
-
     /// 去掉 `remove` 选中的应答后的槽位；什么都没去掉时为 None
     /// The slot without the answers `remove` picks; None when it picks none
     pub fn without(&self, remove: impl Fn(&CacheEntry) -> bool) -> Option<Self> {
@@ -679,73 +645,5 @@ mod tests {
         let alone = fitted.fitting(1);
         assert_eq!(alone.len(), 1);
         assert!(alone.entries().all(|entry| Arc::ptr_eq(entry, &newest)));
-    }
-
-    /// 刷新写进了适用范围不同的新应答，被刷新的那份就让位；什么都没写时它留着
-    /// A refresh that wrote an answer with another reach retires the one it renewed;
-    /// one that wrote nothing leaves it
-    #[test]
-    fn a_refresh_with_another_reach_retires_the_renewed_answer() {
-        let renewed = entry(
-            reach("198.51.100.0/24", Some(16)),
-            300,
-            Duration::from_secs(1),
-        );
-        let started = Instant::now();
-        let slot = CacheSlot::default().with(renewed.clone(), Duration::MAX);
-        let narrower = entry(reach("198.51.100.0/24", Some(24)), 300, Duration::ZERO);
-        assert!(
-            slot.after_refresh(
-                &QUESTION,
-                &renewed.reach,
-                renewed.fetched_at,
-                &narrower.reach,
-                started,
-            )
-            .is_none(),
-            "the refresh wrote nothing"
-        );
-        // Another client's answer written meanwhile is not the refresh's
-        // 这期间别的客户端写入的应答不是刷新写的
-        let other = entry(reach("203.0.113.0/24", Some(24)), 300, Duration::ZERO);
-        let with_other = slot.with(other, Duration::MAX);
-        assert!(
-            with_other
-                .after_refresh(
-                    &QUESTION,
-                    &renewed.reach,
-                    renewed.fetched_at,
-                    &narrower.reach,
-                    started,
-                )
-                .is_none()
-        );
-        let slot = with_other.with(narrower.clone(), Duration::MAX);
-        let settled = slot
-            .after_refresh(
-                &QUESTION,
-                &renewed.reach,
-                renewed.fetched_at,
-                &narrower.reach,
-                started,
-            )
-            .expect("the renewed answer goes");
-        assert_eq!(settled.len(), 2);
-        assert!(settled.entries().any(|entry| Arc::ptr_eq(entry, &narrower)));
-        assert!(settled.entries().all(|entry| entry.reach != renewed.reach));
-        // A stale renewal of the renewed answer during the refresh is still that answer
-        // 刷新期间对被刷新那份的过期续用，仍是那一份
-        let copy = Arc::new(renewed.clone_with_refreshed_ttl());
-        let with_copy = slot.replacing(&renewed, copy).expect("still there");
-        let settled = with_copy
-            .after_refresh(
-                &QUESTION,
-                &renewed.reach,
-                renewed.fetched_at,
-                &narrower.reach,
-                started,
-            )
-            .expect("the renewed copy goes");
-        assert!(settled.entries().all(|entry| entry.reach != renewed.reach));
     }
 }

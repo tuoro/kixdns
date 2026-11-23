@@ -177,21 +177,23 @@ fn answer_of(query: &Message, address: Ipv4Addr, ttl: u32) -> Replies {
 /// A local bootstrap server: whatever the name asked, A gets 127.0.0.1 and AAAA ::1, both of
 /// TTL `ttl`
 pub(crate) async fn loopback_bootstrap(ttl: u32) -> Upstream {
-    upstream(move |query| {
-        let Some(question) = query.queries.first() else {
-            return Vec::new();
-        };
-        let address = match question.query_type() {
-            RecordType::A => RData::A(A(Ipv4Addr::LOCALHOST)),
-            RecordType::AAAA => RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
-            _ => return Vec::new(),
-        };
-        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-        reply.add_query(question.clone());
-        reply.add_answer(Record::from_rdata(question.name().clone(), ttl, address));
-        vec![(Duration::ZERO, reply.to_vec().unwrap())]
-    })
-    .await
+    upstream(move |query| loopback_addresses(query, ttl)).await
+}
+
+/// [`loopback_bootstrap`] 对 `query` 的应答 / What [`loopback_bootstrap`] answers `query` with
+pub(super) fn loopback_addresses(query: &Message, ttl: u32) -> Replies {
+    let Some(question) = query.queries.first() else {
+        return Vec::new();
+    };
+    let address = match question.query_type() {
+        RecordType::A => RData::A(A(Ipv4Addr::LOCALHOST)),
+        RecordType::AAAA => RData::AAAA(AAAA(std::net::Ipv6Addr::LOCALHOST)),
+        _ => return Vec::new(),
+    };
+    let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+    reply.add_query(question.clone());
+    reply.add_answer(Record::from_rdata(question.name().clone(), ttl, address));
+    vec![(Duration::ZERO, reply.to_vec().unwrap())]
 }
 
 /// UDP 和 TCP 占同一个端口的本机上游：收下查询、接下连接，从不回答
@@ -786,5 +788,58 @@ impl tokio::io::AsyncWrite for CountedWrites {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// 测试里交给响应动作的请求：按 `engine` 当时的配置，来自 `peer`、不带 EDNS，问 `qname` 的 `qtype`，客户端发来的包是
+/// `packet`。请求只借用这些，所以先放在这里，再借出去（见 [`Self::request`]）
+/// A request handed to response actions in tests: under `engine`'s configuration at the time,
+/// from `peer` without EDNS, asking `qname` for `qtype`, the client's packet being `packet`. A
+/// request only borrows these, so they are kept here and lent from here (see
+/// [`Self::request`])
+pub(crate) struct Asked {
+    state: Arc<crate::engine::EngineInner>,
+    qname: Arc<str>,
+    qtype: RecordType,
+    packet: Vec<u8>,
+    peer: SocketAddr,
+}
+
+impl Asked {
+    pub(crate) fn new(
+        engine: &Engine,
+        qname: &str,
+        qtype: RecordType,
+        packet: Vec<u8>,
+        peer: SocketAddr,
+    ) -> Self {
+        Self {
+            state: engine.state.load_full(),
+            qname: Arc::from(qname),
+            qtype,
+            packet,
+            peer,
+        }
+    }
+
+    pub(crate) fn request(&self) -> crate::engine::execution::Request<'_> {
+        crate::engine::execution::Request {
+            state: &self.state,
+            packet: &self.packet,
+            qname: &self.qname,
+            qtype: self.qtype,
+            qclass: hickory_proto::rr::DNSClass::IN,
+            tx_id: 0,
+            flags: crate::proto_utils::QueryFlags::of(&self.packet),
+            peer: self.peer,
+            requester: crate::matcher::Requester {
+                address: self.peer.ip(),
+                edns: false,
+                ecs: None,
+            },
+            start: std::time::Instant::now(),
+            refresh: None,
+            observed: None,
+        }
     }
 }

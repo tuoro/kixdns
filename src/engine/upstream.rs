@@ -191,41 +191,14 @@ fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Trans
     }
 }
 
-/// 配置里经 TCP 问的上游地址（去掉前缀），启动时据此预热连接：请求阶段、命中后和未命中时三类动作里的转发都算，逗号分开的
-/// 各算一个；走哪种传输和真正转发时一样，地址前缀优先于规则写的 `transport`（见 [`parse_upstream_addr`]），`tcp` 和
-/// `tcp_udp` 算 TCP
-/// The addresses (short of their prefix) of the upstreams asked over TCP in the configuration,
-/// whose connections are warmed up at startup: forwards among the request-phase, on-match and
-/// on-miss actions all count, each of a comma-separated list on its own; the transport is the one
-/// a forward really takes, an address prefix coming before the rule's `transport` (see
-/// [`parse_upstream_addr`]), and `tcp` and `tcp_udp` count as TCP
+/// `cfg` 里经 TCP 问的上游地址（去掉前缀，见 [`upstreams`]），启动时据此预热连接；`tcp` 和 `tcp_udp` 算 TCP
+/// The addresses (short of their prefix, see [`upstreams`]) of the upstreams `cfg` asks over
+/// TCP, whose connections are warmed up at startup; `tcp` and `tcp_udp` count as TCP
 pub(crate) fn tcp_upstreams(
     cfg: &crate::matcher::RuntimePipelineConfig,
 ) -> rustc_hash::FxHashSet<String> {
-    cfg.pipelines
-        .iter()
-        .flat_map(|p| &p.rules)
-        .flat_map(|rule| {
-            rule.actions
-                .iter()
-                .chain(&rule.response_actions_on_match)
-                .chain(&rule.response_actions_on_miss)
-        })
-        .filter_map(|action| match action {
-            crate::config::Action::Forward {
-                upstream: Some(upstream),
-                transport,
-                ..
-            } => Some((upstream, transport.unwrap_or(Transport::Udp))),
-            _ => None,
-        })
-        .flat_map(|(upstream, transport)| {
-            upstream
-                .split(',')
-                .map(str::trim)
-                .filter(|member| !member.is_empty())
-                .map(move |member| parse_upstream_addr(member, transport))
-        })
+    upstreams(cfg)
+        .into_iter()
         .filter(|(_, transport)| matches!(transport, Transport::Tcp | Transport::TcpUdp))
         .map(|(address, _)| address.to_owned())
         .collect()
@@ -283,6 +256,14 @@ pub(crate) fn upstream_problem(upstream: &str, default_transport: Transport) -> 
         .map(|error| format!("upstream \"{upstream}\" is not usable: {error:#}"))
 }
 
+/// 连上 `upstream` 之前要解析的主机名，没写前缀的按 `default_transport` 连（见 `transport::host_name`）
+/// The host name to resolve before connecting to `upstream`, one without a prefix connected to
+/// by `default_transport` (see `transport::host_name`)
+pub(crate) fn host_name(upstream: &str, default_transport: Transport) -> Option<String> {
+    let (address, transport) = parse_upstream_addr(upstream, default_transport);
+    crate::engine::transport::host_name(address, transport)
+}
+
 /// 一份配置里的上游在各连接池里的键，按传输分开；DoH 自己清理不用的上游，不在这里
 /// The pool keys of a configuration's upstreams, by transport; DoH prunes the upstreams it
 /// stops using on its own, so it is not here
@@ -293,54 +274,57 @@ pub(crate) struct PoolKeys {
     pub(crate) doq: rustc_hash::FxHashSet<String>,
 }
 
-/// `cfg` 用到的每个上游在连接池里的键，和转发时的算法一样（见 [`parse_upstream_addr`]）：默认上游，
-/// 以及请求阶段和回答阶段每个转发动作的上游（没写就是默认上游）。UDP 上游在应答被截断或失败时改用
-/// TCP，所以也算一个 TCP 键。
-/// The pool key of every upstream `cfg` uses, worked out as a forward does (see
-/// [`parse_upstream_addr`]): the default upstream, and the upstream of every forward
-/// action in the request and response phases (the default upstream when it names none). A
-/// UDP upstream falls back to TCP on a truncated or failed answer, so it has a TCP key too.
-pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys {
-    let mut keys = PoolKeys::default();
-    let mut add = |upstreams: &str, transport: Option<Transport>| {
-        for upstream in upstreams
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let (addr, transport) =
-                parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp));
-            let set = match transport {
-                Transport::Udp | Transport::Tcp | Transport::TcpUdp => &mut keys.tcp,
-                Transport::Dot => &mut keys.dot,
-                Transport::Doq => &mut keys.doq,
-                Transport::Doh => continue,
-            };
-            set.insert(addr.to_owned());
-        }
-    };
-    add(&cfg.settings.default_upstream, None);
-    for rule in cfg.pipelines.iter().flat_map(|pipeline| &pipeline.rules) {
-        for action in rule
-            .actions
-            .iter()
-            .chain(&rule.response_actions_on_match)
-            .chain(&rule.response_actions_on_miss)
-        {
-            if let crate::config::Action::Forward {
+/// `cfg` 可能转发到的每个上游，各一次，和转发时的算法一样（见 [`parse_upstream_addr`]）：去掉前缀的地址和问它用的
+/// 传输。默认上游，以及请求阶段和回答阶段每个转发动作的上游（没写就是默认上游）
+/// Every upstream `cfg` may forward to, each once, worked out as a forward does (see
+/// [`parse_upstream_addr`]): the address short of its prefix and the transport it is asked
+/// over. The default upstream, and the upstream of every forward action in the request and
+/// response phases (the default upstream when it names none)
+pub(crate) fn upstreams(
+    cfg: &crate::matcher::RuntimePipelineConfig,
+) -> rustc_hash::FxHashSet<(&str, Transport)> {
+    let default = cfg.settings.default_upstream.as_str();
+    let forwards = cfg
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| &pipeline.rules)
+        .flat_map(crate::matcher::RuntimeRule::all_actions)
+        .filter_map(|action| match action {
+            crate::config::Action::Forward {
                 upstream,
                 transport,
                 ..
-            } = action
-            {
-                add(
-                    upstream
-                        .as_deref()
-                        .unwrap_or(&cfg.settings.default_upstream),
-                    *transport,
-                );
-            }
-        }
+            } => Some((upstream.as_deref().unwrap_or(default), *transport)),
+            _ => None,
+        });
+    std::iter::once((default, None))
+        .chain(forwards)
+        .flat_map(|(upstreams, transport)| {
+            upstreams
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(move |upstream| {
+                    parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp))
+                })
+        })
+        .collect()
+}
+
+/// `cfg` 用到的每个上游在连接池里的键（见 [`upstreams`]）。UDP 上游在应答被截断或失败时改用 TCP，所以也算一个
+/// TCP 键
+/// The pool key of every upstream `cfg` uses (see [`upstreams`]). A UDP upstream falls back
+/// to TCP on a truncated or failed answer, so it has a TCP key too
+pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys {
+    let mut keys = PoolKeys::default();
+    for (address, transport) in upstreams(cfg) {
+        let set = match transport {
+            Transport::Udp | Transport::Tcp | Transport::TcpUdp => &mut keys.tcp,
+            Transport::Dot => &mut keys.dot,
+            Transport::Doq => &mut keys.doq,
+            Transport::Doh => continue,
+        };
+        set.insert(address.to_owned());
     }
     keys
 }
@@ -808,6 +792,13 @@ async fn forward_upstream_as_is(
     // The first failure reply received, carried out when every attempt fails (see
     // `UpstreamFailure::reply`)
     let mut first_failure_reply: Option<(Bytes, Arc<str>)> = None;
+    // 最先收到的截断应答：它是传输层用 TCP 也取不到完整应答时留下的（见 `forward_udp_smart`），只在别的上游都给不出
+    // 完整应答时交回，客户端看到 TC 自己改用 TCP。以前它和完整应答一样先到先赢，把还在路上的完整应答取消掉
+    // The first truncated answer received: what the transport was left with when TCP could
+    // not fetch the whole answer either (see `forward_udp_smart`). It goes back only when no
+    // other upstream gives a whole answer, the client turning to TCP itself on seeing TC. It
+    // used to win like a whole answer by coming first, cancelling a whole one still on its way
+    let mut first_truncated: Option<(Bytes, Arc<str>)> = None;
 
     // If any TCP/TCP+UDP upstream is present, a failed UDP attempt does not fall back to TCP, to
     // prevent duplicate TCP sends (truncated answers are still fetched again over TCP)
@@ -868,10 +859,11 @@ async fn forward_upstream_as_is(
                     Ok(bytes) => {
                         // 快速解析响应码 / Quick parse response code
                         let quick = crate::proto_utils::parse_response_quick(&bytes);
-                        let should_accept =
-                            quick.as_ref().is_none_or(|qr| !is_failure_reply(qr.rcode));
-
-                        if should_accept {
+                        let kept = if quick.as_ref().is_some_and(|qr| is_failure_reply(qr.rcode)) {
+                            &mut first_failure_reply
+                        } else if crate::proto_utils::truncated_response(&bytes) {
+                            &mut first_truncated
+                        } else {
                             report(UpstreamOutcome::Success, quick.as_ref(), None);
                             // 显式取消其他正在进行的任务，它们的尝试竞争失败（见 `Attempts`）
                             // Cancel the attempts still running, which lose the race (see
@@ -879,9 +871,9 @@ async fn forward_upstream_as_is(
                             tasks.abort_all();
 
                             return Ok((bytes, up_proto));
-                        }
+                        };
                         report(UpstreamOutcome::Rejected, quick.as_ref(), None);
-                        first_failure_reply.get_or_insert((bytes, up_proto));
+                        kept.get_or_insert((bytes, up_proto));
                     }
                     Err(err) => {
                         let outcome = failed_outcome(&err);
@@ -904,6 +896,9 @@ async fn forward_upstream_as_is(
         }
     }
 
+    if let Some(truncated) = first_truncated {
+        return Ok(truncated);
+    }
     // 所有上游都失败 / All upstreams failed
     let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
     Err(UpstreamFailure::with_reply(err, first_failure_reply))
@@ -1432,12 +1427,13 @@ mod tests {
 
     /// 预热收集请求阶段、命中后和未命中时三类动作里用 TCP（含 tcp_udp）转发的上游，逗号分开的各算
     /// 一个，去掉协议前缀；UDP 的不算。只写了 `tcp://` 前缀、没写 `transport` 的也走 TCP，也算：以前只看
-    /// `transport`，它们不预热
+    /// `transport`，它们不预热。没写上游、经 TCP 转发的是经 TCP 问默认上游，也算：以前只看写了的上游
     /// Warm-up collects the upstreams forwarded to over TCP (tcp_udp included) by the
     /// request-phase, on-match and on-miss actions, each of a comma-separated list on its
     /// own, protocol prefix removed; UDP ones do not count. One written with a `tcp://`
     /// prefix and no `transport` goes over TCP and counts too: only `transport` used to be
-    /// looked at, and such upstreams were not warmed up
+    /// looked at, and such upstreams were not warmed up. A forward over TCP naming no upstream
+    /// asks the default one over TCP and counts too: only upstreams written out used to
     #[test]
     fn warm_up_collects_the_tcp_upstreams_of_every_action_phase() {
         let config = crate::matcher::RuntimePipelineConfig::from_config(
@@ -1448,7 +1444,8 @@ mod tests {
                 "matchers": [{ "type": "any" }],
                 "actions": [
                     { "type": "forward", "upstream": "192.0.2.1:53, 192.0.2.2:53", "transport": "tcp" },
-                    { "type": "forward", "upstream": "192.0.2.9:53", "transport": "udp" }
+                    { "type": "forward", "upstream": "192.0.2.9:53", "transport": "udp" },
+                    { "type": "forward", "transport": "tcp" }
                 ],
                 "response_matchers": [{ "type": "upstream_equals", "value": "192.0.2.1:53" }],
                 "response_actions_on_match": [
@@ -1469,6 +1466,7 @@ mod tests {
         assert_eq!(
             upstreams,
             [
+                "127.0.0.1:9",
                 "192.0.2.1:53",
                 "192.0.2.2:53",
                 "192.0.2.3:53",
