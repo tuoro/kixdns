@@ -1587,8 +1587,7 @@ impl Engine {
                             slot: route.keys.slot,
                             flags: request.flags,
                             reach: &route.trail,
-                            min_ttl,
-                            on_an_answer: route.on_an_answer,
+                            answer_ttl: route.answer_ttl,
                         },
                         rcode,
                         answers,
@@ -1652,8 +1651,8 @@ impl Engine {
 
                     match forwarded {
                         Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
-                        Ok(phases::ForwardResult::Continue { ctx, fallback }) => {
-                            route.continued(*ctx, rule_index, fallback);
+                        Ok(phases::ForwardResult::Continue { ctx, answer_ttl }) => {
+                            route.continued(*ctx, rule_index, answer_ttl);
                             // 只有规则的回答检查会 continue，所以请求在配置里的某个 pipeline 里
                             // Only a rule's answer check continues, so the request is in a
                             // pipeline of the configuration
@@ -1667,9 +1666,9 @@ impl Engine {
                             pipeline,
                             packet,
                             carried,
-                            fallback,
+                            answer_ttl,
                         }) => {
-                            route.response_jumped(packet, carried, response_jump_limit, fallback);
+                            route.response_jumped(packet, carried, response_jump_limit, answer_ttl);
                             decision = Decision::Jump { pipeline };
                             continue 'decision_loop;
                         }
@@ -1965,18 +1964,19 @@ struct Route {
     /// have one budget, a response action's jump with the rule-level jumps after it another (see
     /// `Route::response_jumped`)
     jumps_left: usize,
-    /// 接下来的应答取决于上游的一份应答：在这些键下最近一次 continue 或回答检查跳转，是在上游的应答上做的；miss 动作在
-    /// 上游失败以后做的不算，那时手里没有应答。这时规则给出的静态应答缓存起来，下次不必再问上游（见
-    /// `phases::StaticDecisionContext::on_an_answer`）。请求阶段跳进别的 pipeline、换了键，就又不是了：那里直接给出的，
-    /// 直接进那里的请求也照样直接拿到
-    /// What answers next depends on an upstream's answer: the latest continue or answer check's
-    /// jump under these keys was made on an upstream's answer; one the miss actions made after
-    /// an upstream failure does not count, there being no answer in hand. A static answer the
-    /// rules give now is cached so as not to ask the upstream again (see
-    /// `phases::StaticDecisionContext::on_an_answer`). A request-phase jump into another
-    /// pipeline, changing the keys, ends that: what is given outright there is given outright
-    /// to the requests entering there directly too
-    on_an_answer: bool,
+    /// 接下来的应答所依据的上游应答在缓存里能留多久：在这些键下最近一次 continue 或回答检查跳转，是在那份上游应答上
+    /// 做的（见 `phases::ForwardResult::Continue`）。这时规则给出的静态应答缓存起来，下次不必再问上游，只是不比那份应答
+    /// 留得久（见 `phases::StaticDecisionContext::answer_ttl`）。miss 动作在上游失败以后做的不据哪份应答，手里没有；请求
+    /// 阶段跳进别的 pipeline、换了键，也就不再据它：那里直接给出的，直接进那里的请求也照样直接拿到。这两种都是 0
+    /// How long the upstream answer what answers next goes by may stay in the cache: the latest
+    /// continue or answer check's jump under these keys was made on that upstream answer (see
+    /// `phases::ForwardResult::Continue`). A static answer the rules give now is cached so as
+    /// not to ask the upstream again, only no longer than that answer may be (see
+    /// `phases::StaticDecisionContext::answer_ttl`). One the miss actions made after an
+    /// upstream failure goes by no answer, there being none in hand; a request-phase jump into
+    /// another pipeline, changing the keys, goes by it no more: what is given outright there is
+    /// given outright to the requests entering there directly too. Both are 0
+    answer_ttl: u32,
     /// 在当前 pipeline 里经过的转发（见 `ForwardDecisionContext::trail`）；请求结束后就是它最后一份应答缓存时带的那份
     /// The forwards passed in the current pipeline (see `ForwardDecisionContext::trail`); after
     /// the request, what its last answer was cached with
@@ -2019,7 +2019,7 @@ impl Route {
             reused_response: None,
             jumped: None,
             jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
-            on_an_answer: false,
+            answer_ttl: 0,
             trail: EcsReach::default(),
             echo_floor: 0,
             held_inflight: None,
@@ -2058,7 +2058,7 @@ impl Route {
             .echo_floor
             .max(self.trail.echo_scope(&request.requester.ecs_view()));
         self.trail = EcsReach::default();
-        self.on_an_answer = false;
+        self.answer_ttl = 0;
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
@@ -2069,20 +2069,20 @@ impl Route {
         true
     }
 
-    /// 规则越过了这个应答（continue；`fallback` 见 `phases::ForwardResult::Continue`）：`reused` 留给后面的
+    /// 规则越过了这个应答（continue；`answer_ttl` 见 `phases::ForwardResult::Continue`）：`reused` 留给后面的
     /// `allow`，`rule` 下一轮不再求值
-    /// A rule continued past this answer (`fallback` see `phases::ForwardResult::Continue`):
+    /// A rule continued past this answer (`answer_ttl` see `phases::ForwardResult::Continue`):
     /// `reused` is kept for a later `allow`, and `rule` is not evaluated again
-    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>, fallback: bool) {
-        self.on_an_answer = !fallback;
+    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>, answer_ttl: u32) {
+        self.answer_ttl = answer_ttl;
         self.reused_response = reused;
         self.skip_rules.extend(rule);
     }
 
-    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（`fallback` 也一样；刷新时上游失败的到不了
+    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（`answer_ttl` 也一样；刷新时上游失败的到不了
     /// 这里）；此后的转发照原样发出 `packet`。第一次响应阶段的跳转起另算一份次数（`limit`）
     /// A response action jumped away: the answer of the forward before the jump is one passed
-    /// over, as on a continue (`fallback` too; a refresh whose upstream failed never gets here);
+    /// over, as on a continue (`answer_ttl` too; a refresh whose upstream failed never gets here);
     /// the forwards from here on send `packet` as it is. The first response-phase jump starts a
     /// budget of its own (`limit`)
     fn response_jumped(
@@ -2090,9 +2090,9 @@ impl Route {
         packet: Bytes,
         carried: crate::ecs_scope::ForwardEcs,
         limit: usize,
-        fallback: bool,
+        answer_ttl: u32,
     ) {
-        self.on_an_answer = !fallback;
+        self.answer_ttl = answer_ttl;
         if self.jumped.is_none() {
             self.jumps_left = limit;
         }

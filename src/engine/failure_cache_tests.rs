@@ -159,14 +159,15 @@ async fn a_servfail_from_failed_response_actions_is_not_cached() {
     assert_eq!(backup.queries(), backup_before);
 }
 
-/// 规则自己给出的应答照常按 min_ttl 缓存：回答阶段的 deny（REFUSED）就是一例，拦截名单靠它走缓存
-/// An answer the rules give themselves is cached for min_ttl as before: a response-phase
-/// deny (REFUSED) is one, and blocking relies on it being cached
+/// 规则自己给出的应答照常缓存，按它所依据的上游回答的 TTL：回答阶段的 deny（REFUSED）就是一例，拦截名单靠它走缓存
+/// An answer the rules give themselves is cached as before, for the TTL of the upstream
+/// answer it goes by: a response-phase deny (REFUSED) is one, and blocking relies on it being
+/// cached
 #[tokio::test]
 async fn a_deny_the_rules_give_is_still_cached() {
     let up = answering_upstream(ANSWER, 300).await;
     let engine = engine_with(
-        json!({ "min_ttl": 60 }),
+        json!({}),
         json!([{
             "name": "block_after",
             "matchers": [{ "type": "any" }],
