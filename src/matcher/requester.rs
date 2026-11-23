@@ -309,7 +309,7 @@ impl RuleReads {
                 .chain(&rule.response_actions_on_miss)
                 .any(|action| matches!(action, Action::Continue));
             let jump_target = |action: &Action| match action {
-                Action::JumpToPipeline { pipeline } => Some(Arc::<str>::from(pipeline.as_str())),
+                Action::JumpToPipeline { pipeline } => Some(Arc::clone(pipeline)),
                 _ => None,
             };
             for target in rule

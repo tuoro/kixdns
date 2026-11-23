@@ -39,6 +39,8 @@ mod heavy_slot_tests;
 mod held_back_tests;
 #[cfg(test)]
 mod inflight_wait_tests;
+#[cfg(test)]
+mod jump_fast_path_tests;
 pub mod listener;
 pub mod matcher_adapter;
 pub mod memory_watermark;

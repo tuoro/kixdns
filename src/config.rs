@@ -512,8 +512,10 @@ pub enum Action {
         #[serde(default)]
         ttl: Option<u32>,
     },
-    /// 跳转到指定 Pipeline 继续处理。 / Jump to specified Pipeline to continue processing
-    JumpToPipeline { pipeline: String },
+    /// 跳转到指定 Pipeline 继续处理。目标名字读进来就是共用的一份，每次跳转不再各复制一份
+    /// Jump to specified Pipeline to continue processing. The target's name is read in as one
+    /// shared copy, so no jump makes a copy of its own
+    JumpToPipeline { pipeline: Arc<str> },
     /// 终止匹配。请求阶段使用默认上游，响应阶段使用当前响应。 / Terminate matching. Request phase uses default upstream, response phase uses current response
     Allow,
     /// 终止并丢弃（返回 REFUSED）。 / Terminate and drop (return REFUSED)
@@ -1892,7 +1894,7 @@ fn rule_problems(
                     LOG_LEVELS.join(", ")
                 ));
             }
-            Action::JumpToPipeline { pipeline } if !pipelines.contains(pipeline.as_str()) => {
+            Action::JumpToPipeline { pipeline } if !pipelines.contains(&**pipeline) => {
                 report(format!(
                     "jump to pipeline \"{pipeline}\", which does not exist"
                 ));

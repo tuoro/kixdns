@@ -3163,6 +3163,88 @@ async fn an_expired_answer_found_after_a_jump_is_served_stale() {
     );
 }
 
+/// 一个请求走过的路：选中的 pipeline、响应缓存的查找和结果、命中的请求阶段规则和作出的决定，按发生顺序。快速路径没有的不算：
+/// 它不另报规则缓存的查找，命中也记着是不是在快速路径上
+/// The way a request went: the pipelines it selected, its response-cache lookups and
+/// outcomes, the request-phase rules that matched and the decisions made, in order. What the
+/// fast path has no counterpart of is left out: it reports no rule cache lookup of its own,
+/// and a match tells whether it came on the fast path
+fn way_of(events: &[Event], request_id: u64) -> Vec<String> {
+    events_of(events, request_id)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Pipeline { pipeline, .. } => Some(format!("pipeline {pipeline}")),
+            Event::CacheLookup { .. } => Some("lookup".to_owned()),
+            Event::CacheMiss { .. } => Some("miss".to_owned()),
+            Event::CacheHit { kind, .. } => Some(format!("hit {kind:?}")),
+            Event::Rule {
+                pipeline,
+                rule,
+                decision,
+                ..
+            } => Some(format!("rule {pipeline}/{rule} {decision:?}")),
+            Event::Decision {
+                pipeline,
+                rule,
+                detail,
+                ..
+            } => Some(format!("decision {pipeline}/{rule:?} {detail:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 快速路径跟着跳转在目标的缓存里答上的请求，上报的路和完整路径答它时一样：两个 pipeline 都选中过，入口的缓存查过没查到，
+/// 跳转规则命中、决定跳走，目标的缓存命中。以前快速路径遇到跳转就交给异步路径
+/// A request the fast path answers from the target's cache after following a jump reports
+/// the way the full path reports when it answers: both pipelines selected, the entry's cache
+/// looked in and missed, the jump rule matched and deciding the jump, the target's cache hit.
+/// The fast path used to hand a jump to the async path
+#[tokio::test]
+async fn a_jump_followed_on_the_fast_path_is_reported_as_on_the_full_path() {
+    let (upstream, _echo) = spawn_echo_upstream(300).await;
+    let raw = jump_config(
+        &upstream,
+        serde_json::json!({ "default_upstream": "127.0.0.1:9", "min_ttl": 0 }),
+    );
+    let (engine, recorder) = observed_engine(&raw);
+    engine
+        .handle_packet(&query("jumped.example"), peer())
+        .await
+        .unwrap();
+    recorder.drain();
+
+    engine
+        .handle_packet(&query("jumped.example"), peer())
+        .await
+        .unwrap();
+    let events = recorder.drain();
+    let full = way_of(&events, request_id_for(&events, "jumped.example"));
+    assert_eq!(
+        full,
+        [
+            "pipeline main",
+            "lookup",
+            "miss",
+            "rule main/to-group Jump",
+            "decision main/Some(\"to-group\") Jump { pipeline: \"group\" }",
+            "pipeline group",
+            "lookup",
+            "hit Fresh"
+        ]
+    );
+
+    assert!(matches!(
+        engine.handle_packet_fast(&query("jumped.example"), peer()),
+        Ok(Some(FastPathResponse::CacheHit { .. }))
+    ));
+    let events = recorder.drain();
+    assert_eq!(
+        way_of(&events, request_id_for(&events, "jumped.example")),
+        full
+    );
+}
+
 /// Response-phase decisions of `id`: what its answer checks decided.
 /// 请求 `id` 的响应阶段决定：回答检查作出的决定。
 fn response_decisions(events: &[Event], id: u64) -> Vec<(String, Option<String>, Detail)> {

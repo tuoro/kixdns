@@ -257,14 +257,15 @@ pub struct RuntimePipeline {
     /// the same question. Answers that differ by ECS subnet do not count: the cache tells
     /// them apart by subnet (see `CacheEntry::reach`).
     pub depends_on_requester: bool,
-    /// 请求阶段有没有正则条件。规则缓存只给这样的 pipeline 存转发和跳转的决定：正则要一条条试，同一个名字
+    /// 请求阶段有没有正则条件。规则缓存只给这样的 pipeline 存转发的决定：正则要一条条试，同一个名字
     /// 再来时值得省下；别的条件靠索引或几次比较就能算完，为每个新名字存一条缓存反而比重算还贵。规则直接
-    /// 回应的决定不论哪个 pipeline 都存：快速路径靠它直接回重复的拦截查询。
-    /// Whether any request rule has a regex condition. The rule cache keeps forward and jump decisions
-    /// only for such pipelines: regexes are tried one by one, which is worth saving when the same name
+    /// 回应的决定和跳转不论哪个 pipeline 都存：快速路径靠前者直接回重复的拦截查询，跟着后者到目标里去查。
+    /// Whether any request rule has a regex condition. The rule cache keeps forward decisions only
+    /// for such pipelines: regexes are tried one by one, which is worth saving when the same name
     /// comes back, while other conditions finish with an index lookup or a few comparisons, and storing
-    /// an entry for every new name costs more than computing them again. A rule's own answer is kept
-    /// whatever the pipeline: the fast path answers repeated blocked queries from it.
+    /// an entry for every new name costs more than computing them again. A rule's own answer and a
+    /// jump are kept whatever the pipeline: the fast path answers repeated blocked queries from the
+    /// former and follows the latter to look in its target.
     pub matches_regex: bool,
     /// 这个 pipeline 的应答取决于哪些 Geo 数据：它自己的规则、它跳到的 pipeline 的规则读的。数据换了，按旧数据缓存的
     /// 应答和规则决定就不能再用，这个 pipeline 换缓存命名空间（见 `EngineInner::at_geo`）
