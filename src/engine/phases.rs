@@ -3,7 +3,7 @@ use crate::cache::{CacheEntry, CachedQuestion};
 use crate::config::GlobalSettings;
 use crate::config::{Action, Transport};
 use crate::ecs_scope::{EcsReach, EcsView, ForwardEcs};
-use crate::engine::execution::CacheKeys;
+use crate::engine::execution::{Request, Route};
 use crate::engine::observation::{Observed, cached_source, report_response_rule};
 use crate::engine::refresh::{RefreshCheck, RefreshTarget};
 use crate::engine::response::extract_ttl;
@@ -46,13 +46,13 @@ pub enum ForwardResult {
         answer_ttl: u32,
     },
     /// 响应动作跳到 `pipeline`：请求在那里接着走规则，转发照原样发出这次转发发出的 `packet`，它带的 ECS 是 `carried`；应答
-    /// 照旧缓存在跳转前这个 pipeline 的键下（见 `handle_packet_internal`）。这次转发登记的条目留给请求（见 `held_inflight`），
+    /// 照旧缓存在跳转前这个 pipeline 的键下（见 `handle_packet_internal`）。这次转发登记的条目留给请求（见 `Route::held_inflight`），
     /// 等它拿到最终的应答再交出去
     /// A response action jumps to `pipeline`: the request goes on with the rules there, its
     /// forwards sending `packet`, what this forward sent, as it is, with `carried` as its ECS;
     /// answers are still cached under the key of this pipeline, the one jumped from (see
     /// `handle_packet_internal`). The entry this forward registered stays with the request (see
-    /// `held_inflight`) and is handed the final answer. `answer_ttl` as on Continue
+    /// `Route::held_inflight`) and is handed the final answer. `answer_ttl` as on Continue
     Jump {
         pipeline: Arc<str>,
         packet: Bytes,
@@ -509,8 +509,8 @@ pub struct StaticDecisionContext<'a> {
     /// The query bits the slot was computed with / 算槽位时用的查询位
     pub flags: proto_utils::QueryFlags,
     /// Whom the answer applies to: the forwards the request passed before it
-    /// (see `ForwardDecisionContext::trail`)
-    /// 应答适用于谁：请求在它之前经过的转发（见 `ForwardDecisionContext::trail`）
+    /// (see `Route::trail`)
+    /// 应答适用于谁：请求在它之前经过的转发（见 `Route::trail`）
     pub reach: &'a EcsReach,
     /// 它所依据的那份上游应答在缓存里能留多久（见 `Route::answer_ttl`、`static_ttl`）：取决于上游应答的缓存起来，下次
     /// 不必再问上游。别的都是 0、不缓存：规则直接给出的，规则下次照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿
@@ -578,90 +578,38 @@ pub fn handle_static_decision(
     Ok(resp_bytes)
 }
 
-/// Request data a forward decision needs / 转发决定需要的请求数据
-pub struct ForwardDecisionContext<'a> {
-    pub state: &'a Arc<EngineInner>,
-    pub packet: &'a [u8],
-    /// 客户端发来的查询，没经过哪次转发改写；响应动作里自己写了 `ecs` 的转发从它改写（`packet` 在响应阶段跳转以后
-    /// 是跳转前那次转发发出的包）
-    /// The query as the client sent it, rewritten by no forward; a forward among the response
-    /// actions that writes an `ecs` of its own rewrites from it (after a response-phase jump
-    /// `packet` is what the forward before the jump sent)
-    pub query: &'a [u8],
-    pub qname: &'a Arc<str>,
-    pub qtype: RecordType,
-    pub qclass: DNSClass,
-    pub tx_id: u16,
-    /// 规则所在的 pipeline / The pipeline the rule is in
-    pub pipeline_id: &'a Arc<str>,
-    /// `keys` 属于哪个 pipeline，应答就缓存在它下面：就是 `pipeline_id`；响应阶段跳转以后是跳转前的那个（见
-    /// `ForwardResult::Jump`）
-    /// The pipeline `keys` belong to, under which answers are cached: `pipeline_id`, or after a
-    /// response-phase jump the one jumped from (see `ForwardResult::Jump`)
-    pub key_pipeline_id: &'a Arc<str>,
-    pub rule_name: &'a str,
-    pub keys: CacheKeys,
-    pub min_ttl: Duration,
-    pub upstream_timeout: Duration,
-    pub start: Instant,
-    pub peer: &'a std::net::SocketAddr,
-    /// Who is asking (address, EDNS, the client's own ECS) / 谁在问（地址、EDNS、客户端自己的 ECS）
-    pub requester: Requester,
-    /// For a background refresh, the entry it renews; the request is one exactly when it is
-    /// given / 后台刷新时它要更新的条目，有它就是后台刷新
-    pub refresh: Option<&'a RefreshTarget>,
-    /// The forwards the request passed in this pipeline so far, each with the ECS
-    /// it sent and whom its reply applies to; every answer the request caches
-    /// applies to the requesters all of them admit (see `CacheEntry::reach`). A
-    /// forward adds its own here.
-    /// 请求在这个 pipeline 里到目前为止经过的转发，每次都记着它发出的 ECS 和应答适用于谁；
-    /// 请求缓存的每份应答适用于它们全都接受的请求方（见 `CacheEntry::reach`）。转发把自己
-    /// 的这一次记在这里。
-    pub trail: &'a mut EcsReach,
-    /// What pipelines the request left by a jump made the answer depend on (see
-    /// `client_reply`), for the echo
-    /// 请求跳离的 pipeline 让应答依赖的部分（见 `client_reply`），回显时用
-    pub echo_floor: u8,
-    pub upstream: &'a Arc<str>,
-    pub pre_split_upstreams: Option<&'a Arc<Vec<Arc<str>>>>,
-    pub response_matchers: &'a [RuntimeResponseMatcherWithOp],
-    pub response_actions_on_match: &'a [Action],
-    pub response_actions_on_miss: &'a [Action],
-    pub transport: Option<Transport>,
-    pub ecs: Option<&'a crate::config::EcsMode>,
-    /// 响应阶段跳转以后才有：`packet` 是跳转前那次转发发出的，照原样发出，不再按 `ecs` 改写，它带的 ECS 是这个
-    /// Only after a response-phase jump: `packet` is what the forward before the jump sent, which
-    /// goes out as it is rather than rewritten by `ecs`, carrying this ECS
-    pub carried: Option<ForwardEcs>,
-    /// 响应动作还能跳几次 / How many more jumps the response actions may make
-    pub jumps_left: usize,
-    pub allow_reuse: bool,
-    pub reused_response: &'a mut Option<ResponseContext>,
-    /// The inflight entry this request registered and still holds after a rule
-    /// continued. The request keeps it for the rest of the decision loop, so its
-    /// waiters get the final answer rather than one a rule continued past; a
-    /// request holding an entry never waits on one. The entry's key keeps its
-    /// waiters to requesters that the rules run after the continue treat alike
-    /// (see `RuntimePipeline::requester`).
-    /// 规则 continue 后本请求仍持有的 inflight 条目。它在决策循环余下的部分一直由
-    /// 本请求持有，等待者拿到的是最终应答，而不是规则越过的那一个；持有条目的请求
-    /// 从不等条目。条目的键只让 continue 之后运行的规则一样对待的请求方等在上面（见
-    /// `RuntimePipeline::requester`）。
-    pub held_inflight: &'a mut Option<InflightCleanupGuard>,
-    /// Observer context of the request / 所属请求的观察者上下文
-    pub observed: Observed<'a>,
+/// 转发决定自己说的：问哪些上游、怎样问、回答检查做什么。请求本身见 `Request`，它沿着规则走到了哪里见 `Route`
+/// What a forward decision itself says: which upstreams to ask, how, and what the answer check
+/// does. The request itself is in `Request`, how far along the rules it has come in `Route`
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardDecision<'a> {
+    pub(crate) upstream: &'a Arc<str>,
+    pub(crate) pre_split_upstreams: Option<&'a Arc<Vec<Arc<str>>>>,
+    pub(crate) rule_name: &'a str,
+    pub(crate) response_matchers: &'a [RuntimeResponseMatcherWithOp],
+    pub(crate) response_actions_on_match: &'a [Action],
+    pub(crate) response_actions_on_miss: &'a [Action],
+    pub(crate) transport: Option<Transport>,
+    /// 发出去之前怎样改写 ECS；响应阶段跳转以后不再改写（见 `Route::jumped`）/ How the ECS is rewritten
+    /// before the query goes out; no longer after a response-phase jump (see `Route::jumped`)
+    pub(crate) ecs: Option<&'a crate::config::EcsMode>,
+    /// continue 之后的 `allow`：复用规则越过的那份应答（见 `Route::reused_response`）/ An `allow` after
+    /// a continue: the answer a rule continued past is reused (see `Route::reused_response`)
+    pub(crate) allow_reuse: bool,
 }
 
 /// Handles Decision::Forward: joins or registers in the inflight map, forwards upstream,
 /// applies the response rules and caches the answer.
 /// 处理转发决定：合并等待或登记 inflight，转发给上游，执行响应规则，缓存应答。
-pub(crate) async fn handle_forward_decision_logged(
-    engine: &Engine,
-    context: ForwardDecisionContext<'_>,
+pub(crate) async fn handle_forward_decision_logged<'a>(
+    engine: &'a Engine,
+    request: &'a Request<'a>,
+    route: &'a mut Route,
+    decision: ForwardDecision<'a>,
     response: &mut ResponseInfo,
 ) -> anyhow::Result<ForwardResult> {
-    response.upstream = Some(Source::Upstream(Arc::clone(context.upstream)));
-    let mut forwarding = Forwarding::new(engine, context);
+    response.upstream = Some(Source::Upstream(Arc::clone(decision.upstream)));
+    let mut forwarding = Forwarding::new(engine, request, route, decision);
     let (reply, reused) = match forwarding.fetch(response).await {
         Fetched::Joined(answer) => return Ok(ForwardResult::Success(answer)),
         Fetched::Own { reply, reused } => (reply, reused),
@@ -687,15 +635,22 @@ type Reply = anyhow::Result<(Bytes, Arc<str>)>;
 /// already, with no second parse or check
 type Weighed = anyhow::Result<(Bytes, Arc<str>, Option<Message>)>;
 
-/// 进行中的一次转发：转发决定，加上这次发出的包、它带的 ECS、它在 inflight 表里登记的条目
-/// A forward under way: the forward decision, with the packet it sends, the ECS that packet
-/// carries and the entry it registered in the inflight map
+/// 进行中的一次转发：请求、它沿着规则走的路线和转发决定，加上这次发出的包、它带的 ECS、它在 inflight 表里登记的条目。
+/// 路线由这次转发接着往下记：它经过的转发（`trail`）、留给后面复用的应答、continue 以后还持有的条目
+/// A forward under way: the request, its route along the rules and the forward decision, with
+/// the packet it sends, the ECS that packet carries and the entry it registered in the inflight
+/// map. The forward goes on noting the route: the forwards passed (`trail`), the answer kept for
+/// reuse, the entry still held after a continue
 struct Forwarding<'a> {
     engine: &'a Engine,
-    cx: ForwardDecisionContext<'a>,
-    /// ECS 请求改写（RFC 7871）以后发出的包；只在缓存未命中的路上改写，缓存命中和静态应答不受影响
-    /// The packet sent after ECS request rewriting (RFC 7871), which only the cache-miss path
-    /// does: cache hits and static answers are unaffected
+    request: &'a Request<'a>,
+    route: &'a mut Route,
+    decision: ForwardDecision<'a>,
+    /// 发出的包：ECS 请求改写（RFC 7871）以后的，响应阶段跳转以后是跳转前那次转发发出的那个（见 `Route::jumped`）；只在
+    /// 缓存未命中的路上改写，缓存命中和静态应答不受影响
+    /// The packet sent: after ECS request rewriting (RFC 7871), or after a response-phase jump
+    /// what the forward before the jump sent (see `Route::jumped`); only the cache-miss path
+    /// rewrites, cache hits and static answers being unaffected
     packet: Cow<'a, [u8]>,
     /// 这次转发发出的 ECS，它决定应答适用于谁 / What this forward sends as ECS, which decides
     /// whom its reply applies to
@@ -720,31 +675,42 @@ enum Fetched {
 }
 
 impl<'a> Forwarding<'a> {
-    fn new(engine: &'a Engine, cx: ForwardDecisionContext<'a>) -> Self {
-        let forward_ecs = cx
-            .carried
-            .unwrap_or_else(|| ForwardEcs::of(cx.ecs, &cx.requester.ecs_view()));
-        let packet = match cx.ecs.filter(|_| cx.carried.is_none()) {
-            Some(mode) => {
+    fn new(
+        engine: &'a Engine,
+        request: &'a Request<'a>,
+        route: &'a mut Route,
+        decision: ForwardDecision<'a>,
+    ) -> Self {
+        let (packet, forward_ecs) = match (&route.jumped, decision.ecs) {
+            (Some((packet, carried)), _) => (Cow::Owned(packet.to_vec()), *carried),
+            (None, Some(mode)) => {
                 let modified = crate::ecs::apply_ecs_for(
-                    cx.packet,
+                    request.packet,
                     mode,
-                    cx.peer.ip(),
-                    cx.requester.ecs.as_ref(),
+                    request.peer.ip(),
+                    request.requester.ecs.as_ref(),
                 );
                 tracing::debug!(
                     ecs_mode = ?mode,
-                    modified = modified.len() != cx.packet.len(),
+                    modified = modified.len() != request.packet.len(),
                     "ECS request rewriting applied / 已应用 ECS 请求改写"
                 );
-                Cow::Owned(modified)
+                (
+                    Cow::Owned(modified),
+                    ForwardEcs::of(Some(mode), &request.requester.ecs_view()),
+                )
             }
-            None => Cow::Borrowed(cx.packet),
+            (None, None) => (
+                Cow::Borrowed(request.packet),
+                ForwardEcs::of(None, &request.requester.ecs_view()),
+            ),
         };
-        cx.trail.check_sent(&packet, &forward_ecs);
+        route.trail.check_sent(&packet, &forward_ecs);
         Self {
             engine,
-            cx,
+            request,
+            route,
+            decision,
             packet,
             forward_ecs,
             registered: None,
@@ -763,8 +729,8 @@ impl<'a> Forwarding<'a> {
     /// any other, the client turning to TCP itself on seeing TC. A UDP forward used to ask over
     /// TCP once more here, and on failing took the failure path, the client getting SERVFAIL
     async fn fetch(&mut self, response: &mut ResponseInfo) -> Fetched {
-        let allow_reuse = self.cx.allow_reuse;
-        if let Some(ctx) = self.cx.reused_response.take_if(|_| allow_reuse) {
+        let allow_reuse = self.decision.allow_reuse;
+        if let Some(ctx) = self.route.reused_response.take_if(|_| allow_reuse) {
             return Fetched::Own {
                 reply: Ok((ctx.raw, ctx.upstream)),
                 reused: true,
@@ -791,36 +757,22 @@ impl<'a> Forwarding<'a> {
         &mut self,
         response: &mut ResponseInfo,
     ) -> Option<anyhow::Result<Bytes>> {
-        if self.cx.refresh.is_some() {
+        let (engine, request) = (self.engine, self.request);
+        if request.refresh.is_some() {
             return None;
         }
-        let ForwardDecisionContext {
-            state,
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            key_pipeline_id,
-            keys,
-            upstream_timeout,
-            peer,
-            requester,
-            upstream,
-            observed,
-            ..
-        } = self.cx;
-        let engine = self.engine;
+        let (keys, key_pipeline) = (self.route.keys, &self.route.key_pipeline);
         // What this forward registers or waits under in the inflight map
         // 这次转发在 inflight 表里登记或等待的问题
         let question = InflightQuestion {
-            namespace: state.cache_namespace(key_pipeline_id),
-            pipeline_id: key_pipeline_id,
-            qname: qname.as_bytes(),
-            qtype,
-            qclass,
+            namespace: request.state.cache_namespace(key_pipeline),
+            pipeline_id: key_pipeline,
+            qname: request.qname.as_bytes(),
+            qtype: request.qtype,
+            qclass: request.qclass,
             flags: keys.flags,
             requester: keys.requester,
-            client_ecs: requester.ecs,
+            client_ecs: request.requester.ecs,
         };
         debug_assert_eq!(
             question.key(),
@@ -845,12 +797,12 @@ impl<'a> Forwarding<'a> {
                 // leads no entry and forwards itself. With flow control having kept it back,
                 // continuing to the next rule used to register an entry there all the same,
                 // handing this device's fallback to the other devices asking meanwhile
-                Entry::Vacant(_) if self.cx.trail.is_uncacheable() => return None,
+                Entry::Vacant(_) if self.route.trail.is_uncacheable() => return None,
                 Entry::Vacant(entry) => {
                     entry.insert(InflightEntry::sharing(
                         &question,
-                        key_pipeline_id,
-                        Arc::<[u8]>::from(Arc::clone(qname)),
+                        key_pipeline,
+                        Arc::<[u8]>::from(Arc::clone(request.qname)),
                     ));
                     self.registered = Some(InflightCleanupGuard::new(
                         engine.inflight.clone(),
@@ -858,16 +810,16 @@ impl<'a> Forwarding<'a> {
                     ));
                     return None;
                 }
-                // A request holding an entry (see `held_inflight`) never waits
+                // A request holding an entry (see `Route::held_inflight`) never waits
                 // on one: the entry may be its own, which the next rule forwards
                 // under after a continue, or another request's that waits on
                 // this one in turn (continue, then jump into each other's
                 // pipeline). It forwards itself instead.
-                // 持有条目的请求（见 `held_inflight`）从不等条目：这一条可能就是它
+                // 持有条目的请求（见 `Route::held_inflight`）从不等条目：这一条可能就是它
                 // 自己的（continue 后下一条规则以相同 hash 转发），也可能是另一个
                 // 反过来在等它的请求的（continue 后互相跳进对方的 pipeline）。它
                 // 自己转发。
-                Entry::Occupied(_) if self.cx.held_inflight.is_some() => return None,
+                Entry::Occupied(_) if self.route.held_inflight.is_some() => return None,
                 // Another question's entry under the same key: the key is only a hash (see
                 // `InflightQuestion`), and waiting on it would hand this request another
                 // question's answer. It forwards itself instead.
@@ -889,9 +841,9 @@ impl<'a> Forwarding<'a> {
             };
             let answer = match crate::engine::upstream::wait_for_another(
                 engine,
-                peer.ip(),
-                upstream,
-                upstream_timeout,
+                request.peer.ip(),
+                self.decision.upstream,
+                request.state.pipeline.upstream_timeout(),
                 waiting,
             )
             .await
@@ -900,11 +852,11 @@ impl<'a> Forwarding<'a> {
                 Ok(None) => continue,
                 Err(gave_up) => return Some(Err(gave_up)),
             };
-            if let Some((observer, ctx)) = observed {
+            if let Some((observer, ctx)) = request.observed {
                 observer.inflight_joined(ctx);
             }
             let mut answer = BytesMut::from(answer.as_ref());
-            set_id(&mut answer, tx_id);
+            set_id(&mut answer, request.tx_id);
             response.upstream = Some(Source::Inflight);
             return Some(Ok(answer.freeze()));
         }
@@ -912,16 +864,16 @@ impl<'a> Forwarding<'a> {
 
     /// 把这次转发发给上游 / Send this forward upstream
     async fn ask(&self) -> Reply {
-        let cx = &self.cx;
+        let (request, decision) = (self.request, self.decision);
         crate::engine::upstream::forward_upstream(
             self.engine,
             &self.packet,
-            cx.upstream,
-            cx.upstream_timeout,
-            cx.transport,
-            cx.pre_split_upstreams,
-            cx.observed,
-            cx.refresh.is_none().then(|| cx.peer.ip()),
+            decision.upstream,
+            request.state.pipeline.upstream_timeout(),
+            decision.transport,
+            decision.pre_split_upstreams,
+            request.observed,
+            request.asker(),
         )
         .await
     }
@@ -947,10 +899,10 @@ impl<'a> Forwarding<'a> {
         // as long as the entry lives
         if reply.as_ref().is_err_and(UpstreamFailure::was_withheld) {
             self.registered = None;
-            *self.cx.held_inflight = None;
-            self.cx.trail.mark_uncacheable();
+            self.route.held_inflight = None;
+            self.route.trail.mark_uncacheable();
         }
-        let cx = &self.cx;
+        let (request, decision) = (self.request, self.decision);
         // 几个上游都回了失败应答时，规则的回答检查照样看得到最先收到的那个（见
         // `rules::check_failure_reply`）；放行的那个连同解析好的报文交给回答阶段（见 [`Weighed`]）。刷新随后照旧拒收它
         // When several upstreams all replied with a failure, the rule's answer check still sees
@@ -960,15 +912,15 @@ impl<'a> Forwarding<'a> {
         let reply = match reply {
             Err(failure) => match rules::check_failure_reply(
                 &failure,
-                cx.response_actions_on_match,
+                decision.response_actions_on_match,
                 |msg, answered| {
                     rules::response_matches(
                         self.engine,
-                        cx.response_matchers,
+                        decision.response_matchers,
                         answered,
-                        cx.qname,
-                        cx.qtype,
-                        cx.qclass,
+                        request.qname,
+                        request.qtype,
+                        request.qclass,
                         Some(msg),
                     )
                 },
@@ -986,14 +938,14 @@ impl<'a> Forwarding<'a> {
         // forward_upstream 的做法一样：刷新和上游别的失败一样以失败结束（见 `Self::settle`），
         // 也不缓存这个应答（见 reject_failure_reply_on_refresh）。
         let reply = reply.and_then(|reply| {
-            reject_failure_reply_on_refresh(cx.refresh.is_some(), &reply.0).map(|()| reply)
+            reject_failure_reply_on_refresh(request.refresh.is_some(), &reply.0).map(|()| reply)
         });
         match &reply {
             // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里 / An answer a rule continued
             // past, reused here: the trail already has its forward
             Ok(_) if reused => {}
-            Ok((raw, ..)) => self.cx.trail.record_reply(self.forward_ecs, raw),
-            Err(_) => self.cx.trail.record_failure(self.forward_ecs),
+            Ok((raw, ..)) => self.route.trail.record_reply(self.forward_ecs, raw),
+            Err(_) => self.route.trail.record_failure(self.forward_ecs),
         }
         reply
     }
@@ -1009,7 +961,7 @@ impl<'a> Forwarding<'a> {
         reply: Weighed,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
-        let on_miss = self.cx.response_actions_on_miss;
+        let on_miss = self.decision.response_actions_on_miss;
         match reply {
             Ok((raw, upstream, checked)) => self.answered(raw, upstream, checked, response).await,
             // 后台刷新没有客户端，也没在 inflight 里登记：上游失败就到此为止，把失败原样交回（refresh.rs 记下、退避），
@@ -1021,7 +973,7 @@ impl<'a> Forwarding<'a> {
             // fallback a refresh has no use for: they used to run, a static fallback or a backup
             // upstream's answer going into the cache over the entry still fresh at a prefetch,
             // and the refresh counting as a success with no backing off
-            Err(e) if self.cx.refresh.is_some() => Err(e),
+            Err(e) if self.request.refresh.is_some() => Err(e),
             Err(e) if on_miss.is_empty() => self.upstream_failed(e, response),
             Err(e) => match Message::from_bytes(&self.packet) {
                 Ok(req) => self.act(on_miss, None, req, response).await,
@@ -1040,7 +992,7 @@ impl<'a> Forwarding<'a> {
         checked: Option<Message>,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
-        let cx = &self.cx;
+        let (request, decision) = (self.request, self.decision);
         response.upstream = Some(Source::Upstream(Arc::clone(&upstream)));
         // Response rules read the parsed message, so they always take hickory's.
         // Otherwise the quick parse is cached as read for a reply whose structure
@@ -1050,9 +1002,9 @@ impl<'a> Forwarding<'a> {
         // 响应规则要读解析好的报文，所以总用 hickory 的。没有响应规则时，结构经得起检查的应答
         // 照快速解析的结果缓存（见 `well_formed_reply`）；其余的照 hickory 读出的结果缓存，只有
         // 快速解析读得了的不缓存、照样交出去；两边都读不了的，这次请求出错
-        let rules_read_the_reply = !(cx.response_matchers.is_empty()
-            && cx.response_actions_on_match.is_empty()
-            && cx.response_actions_on_miss.is_empty());
+        let rules_read_the_reply = !(decision.response_matchers.is_empty()
+            && decision.response_actions_on_match.is_empty()
+            && decision.response_actions_on_miss.is_empty());
         let quick = (!rules_read_the_reply)
             .then(|| proto_utils::parse_response_quick(&raw))
             .flatten();
@@ -1075,23 +1027,23 @@ impl<'a> Forwarding<'a> {
         let matched = passed
             || rules::response_matches(
                 self.engine,
-                cx.response_matchers,
+                decision.response_matchers,
                 &upstream,
-                cx.qname,
-                cx.qtype,
-                cx.qclass,
+                request.qname,
+                request.qtype,
+                request.qclass,
                 msg.as_ref(),
             );
         // A refresh reports these too: it acts on the response rules like a client
         // request, and the observer tells the two apart by background_refresh.
         // 刷新同样上报：它和客户端请求一样按响应规则行事，观察者按 background_refresh 区分。
         report_response_rule(
-            cx.observed,
-            cx.pipeline_id,
-            cx.rule_name,
-            cx.response_matchers.len(),
+            request.observed,
+            &self.route.pipeline,
+            decision.rule_name,
+            decision.response_matchers.len(),
             matched,
-            cx.response_actions_on_match,
+            decision.response_actions_on_match,
         );
         // A background refresh applies the response rules as a client request
         // does (a failure reply never gets here, see above): an answer a rule
@@ -1099,12 +1051,12 @@ impl<'a> Forwarding<'a> {
         // 后台刷新和客户端请求一样执行响应规则（失败应答到不了这里，见上）：规则
         // 越过或替换掉的应答，不能成为刷新写进缓存的结果。
         let actions = if matched {
-            cx.response_actions_on_match
+            decision.response_actions_on_match
         } else {
-            cx.response_actions_on_miss
+            decision.response_actions_on_miss
         };
         if actions.is_empty() {
-            let ttl = ttl_to_cache(self.engine, ttl, cx.min_ttl);
+            let ttl = ttl_to_cache(self.engine, ttl, request.state.pipeline.min_ttl());
             self.cache(&raw, rcode, Some(upstream), ttl);
             self.hand_over(&raw);
             return Ok(ForwardResult::Success(raw));
@@ -1154,24 +1106,11 @@ impl<'a> Forwarding<'a> {
         if e.downcast_ref::<UpstreamFailure>().is_none() {
             return Err(e);
         }
-        let cx = &self.cx;
+        let (request, decision, route) = (self.request, self.decision, &*self.route);
         let withheld = UpstreamFailure::was_withheld(&e);
         let stale = check_stale_cache_logged(
             self.engine,
-            &CacheLookupContext {
-                state: cx.state,
-                qname: cx.qname,
-                qtype: cx.qtype,
-                qclass: cx.qclass,
-                flags: cx.keys.flags,
-                pipeline_id: cx.key_pipeline_id,
-                slot: cx.keys.slot,
-                tx_id: cx.tx_id,
-                start: cx.start,
-                peer: cx.peer,
-                requester: cx.requester,
-                observed: cx.observed,
-            },
+            &request.lookup(&route.key_pipeline, route.keys.slot),
             response,
         );
         let answer = match stale {
@@ -1179,20 +1118,20 @@ impl<'a> Forwarding<'a> {
                 if withheld {
                     debug!(
                         event = "serve_stale_on_upstream_withheld",
-                        upstream = %cx.upstream,
-                        qname = %cx.qname,
-                        client_ip = %cx.peer.ip(),
+                        upstream = %decision.upstream,
+                        qname = %request.qname,
+                        client_ip = %request.peer.ip(),
                         error = %e,
                         "RFC 8767: flow control kept the query from the upstream, serving stale cache"
                     );
                 } else {
                     crate::warn_sparse!(
                         event = "serve_stale_on_upstream_failure",
-                        upstream = %cx.upstream,
-                        qname = %cx.qname,
-                        qtype = ?cx.qtype,
-                        client_ip = %cx.peer.ip(),
-                        pipeline = %cx.pipeline_id,
+                        upstream = %decision.upstream,
+                        qname = %request.qname,
+                        qtype = ?request.qtype,
+                        client_ip = %request.peer.ip(),
+                        pipeline = %route.pipeline,
                         error = %e,
                         "RFC 8767: upstream failed, serving stale cache"
                     );
@@ -1203,23 +1142,23 @@ impl<'a> Forwarding<'a> {
                 if withheld {
                     debug!(
                         event = "upstream_withheld",
-                        upstream = %cx.upstream,
-                        qname = %cx.qname,
-                        client_ip = %cx.peer.ip(),
+                        upstream = %decision.upstream,
+                        qname = %request.qname,
+                        client_ip = %request.peer.ip(),
                         error = %e,
                         "flow control kept the query from the upstream"
                     );
                 } else {
                     crate::warn_sparse!(
                        event = "upstream_failure",
-                       upstream = %cx.upstream,
-                       qname = %cx.qname,
-                       qtype = ?cx.qtype,
+                       upstream = %decision.upstream,
+                       qname = %request.qname,
+                       qtype = ?request.qtype,
                        rcode = ?ResponseCode::ServFail,
-                       client_ip = %cx.peer.ip(),
+                       client_ip = %request.peer.ip(),
                        error = %e,
-                       pipeline = %cx.pipeline_id,
-                       transport = ?cx.transport,
+                       pipeline = %route.pipeline,
+                       transport = ?decision.transport,
                        "upstream failed"
                     );
                 }
@@ -1227,13 +1166,12 @@ impl<'a> Forwarding<'a> {
                 // The question name's text always reads back as a name (see
                 // `proto_utils::name_text`); when it does not, the failure goes back and the
                 // listener answers SERVFAIL by itself
-                let rd = self.packet.get(2).is_some_and(|b| b & 0x01 != 0);
                 let Ok(servfail) = build_servfail_response_fast(
-                    cx.tx_id,
-                    cx.qname,
-                    u16::from(cx.qtype),
-                    u16::from(cx.qclass),
-                    rd,
+                    request.tx_id,
+                    request.qname,
+                    u16::from(request.qtype),
+                    u16::from(request.qclass),
+                    request.flags.recursion_desired(),
                 ) else {
                     return Err(e);
                 };
@@ -1259,29 +1197,24 @@ impl<'a> Forwarding<'a> {
         req: Message,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
+        let request = self.request;
+        let min_ttl = request.state.pipeline.min_ttl();
         let answer_ttl = ctx.as_ref().map_or(0, |ctx| {
-            ttl_to_cache(self.engine, extract_ttl(&ctx.msg), self.cx.min_ttl)
+            ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl)
         });
-        let background_refresh = self.cx.refresh.is_some();
-        let cx = &mut self.cx;
         let ctx = rules::ApplyResponseActionsContext {
             engine: self.engine,
+            request,
             actions,
             ctx_opt: ctx,
             req: &req,
             packet: &self.packet,
-            query: cx.query,
-            client_ecs: cx.requester.ecs,
-            upstream_timeout: cx.upstream_timeout,
-            qname: cx.qname,
-            qtype: cx.qtype,
-            client_ip: cx.peer.ip(),
-            asker: (!background_refresh).then(|| cx.peer.ip()),
-            upstream_default: cx.state.pipeline.settings.default_upstream.as_str(),
-            pipeline_id: cx.pipeline_id,
-            rule_name: cx.rule_name,
-            remaining_jumps: cx.jumps_left,
-            trail: Some((&mut *cx.trail, self.forward_ecs)),
+            pipeline_id: &self.route.pipeline,
+            rule_name: self.decision.rule_name,
+            remaining_jumps: self
+                .route
+                .response_jumps_left(request.state.pipeline.settings.response_jump_limit as usize),
+            trail: Some((&mut self.route.trail, self.forward_ecs)),
         };
         // 响应动作和响应跳转的状态单独在堆上分配：不走这两条路的查询就不必为它们预留地方。
         // 以前每个等待中的查询都按最大的那条路（跳转）留着 8 KB，慢上游上挂着三万个查询时，
@@ -1290,19 +1223,19 @@ impl<'a> Forwarding<'a> {
         // of their own, so a query that takes neither path reserves no room for them.
         // Every waiting query used to reserve 8 KB for the largest path (the jump), over
         // two hundred megabytes for thirty thousand queries on a slow upstream
-        let outcome = Box::pin(rules::apply_response_actions_observed(ctx, cx.observed)).await?;
+        let outcome = Box::pin(rules::apply_response_actions(ctx)).await?;
 
         match outcome {
             ResponseActionResult::Upstream { ctx } => {
                 // The reply to a response action's forward (see
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
-                reject_failure_reply_on_refresh(background_refresh, &ctx.raw)?;
+                reject_failure_reply_on_refresh(request.refresh.is_some(), &ctx.raw)?;
                 self.cache(
                     &ctx.raw,
                     ctx.msg.metadata.response_code,
                     Some(ctx.upstream.clone()),
-                    ttl_to_cache(self.engine, extract_ttl(&ctx.msg), self.cx.min_ttl),
+                    ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl),
                 );
                 self.hand_over(&ctx.raw);
                 response.upstream = Some(Source::Upstream(ctx.upstream));
@@ -1323,9 +1256,9 @@ impl<'a> Forwarding<'a> {
                 Ok(ForwardResult::Success(bytes))
             }
             ResponseActionResult::Jump { pipeline } => {
-                // 跳过去以后的才是最终应答：条目留给请求，和 Continue 一样（见 `held_inflight`）
+                // 跳过去以后的才是最终应答：条目留给请求，和 Continue 一样（见 `Route::held_inflight`）
                 // What comes after the jump is the final answer: the entry stays with the
-                // request, as on Continue (see `held_inflight`)
+                // request, as on Continue (see `Route::held_inflight`)
                 self.keep_for_request();
                 Ok(ForwardResult::Jump {
                     pipeline,
@@ -1336,14 +1269,14 @@ impl<'a> Forwarding<'a> {
             }
             ResponseActionResult::Continue { ctx } => {
                 // The rule continued past this response, so it is not the answer: keep
-                // the entry for the rest of the decision loop (see `held_inflight`)
+                // the entry for the rest of the decision loop (see `Route::held_inflight`)
                 // instead of handing it to waiters. An entry held from an earlier
                 // continue is dropped in its place, and its waiters forward themselves.
                 // Defusing the guard here after a failure used to leave the entry behind
                 // with nobody holding it, so the next Forward waited on it until the
                 // listener timeout.
                 // 规则越过了这个应答，它不是最终结果：条目留给决策循环的后续部分（见
-                // `held_inflight`），不把它交给等待者。之前 continue 时持有的条目被它替换掉，
+                // `Route::held_inflight`），不把它交给等待者。之前 continue 时持有的条目被它替换掉，
                 // 那一条的等待者自己转发。以前上游失败以后在这里 defuse 守卫，条目留在表里却
                 // 没人持有，下一条转发会一直等它到监听器超时。
                 self.keep_for_request();
@@ -1363,21 +1296,21 @@ impl<'a> Forwarding<'a> {
         if ttl == 0 {
             return;
         }
-        let cx = &self.cx;
+        let (request, route) = (self.request, &*self.route);
         self.engine.insert_dns_cache_entry(
-            cx.keys.slot,
+            route.keys.slot,
             CacheEntry::from_response(
                 bytes.clone(),
                 rcode,
                 upstream,
-                Arc::clone(cx.qname),
-                Arc::clone(cx.key_pipeline_id),
-                u16::from(cx.qtype),
-                u16::from(cx.qclass),
-                cx.keys.flags,
+                Arc::clone(request.qname),
+                Arc::clone(&route.key_pipeline),
+                u16::from(request.qtype),
+                u16::from(request.qclass),
+                route.keys.flags,
                 ttl,
             )
-            .with_reach(cx.trail.clone()),
+            .with_reach(route.trail.clone()),
         );
     }
 
@@ -1385,17 +1318,19 @@ impl<'a> Forwarding<'a> {
     /// waiting on the entry this forward registered
     fn hand_over(&mut self, answer: &Bytes) {
         if let Some(guard) = self.registered.as_mut() {
-            let cx = &self.cx;
-            guard.hand_over(|| for_waiters(answer, &cx.requester, cx.trail, cx.echo_floor));
+            let (request, route) = (self.request, &*self.route);
+            guard.hand_over(|| {
+                for_waiters(answer, &request.requester, &route.trail, route.echo_floor)
+            });
         }
     }
 
-    /// 规则越过了这个应答，或者跳走了：登记的条目留给请求，等最终应答（见 `held_inflight`）
+    /// 规则越过了这个应答，或者跳走了：登记的条目留给请求，等最终应答（见 `Route::held_inflight`）
     /// A rule continued past this answer, or jumped away: the entry registered stays with the
-    /// request for the final answer (see `held_inflight`)
+    /// request for the final answer (see `Route::held_inflight`)
     fn keep_for_request(&mut self) {
         if let Some(guard) = self.registered.take() {
-            *self.cx.held_inflight = Some(guard);
+            self.route.held_inflight = Some(guard);
         }
     }
 }
