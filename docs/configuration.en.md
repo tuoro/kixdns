@@ -236,7 +236,8 @@ The inbound DoH handler:
 - speaks HTTP/2 and HTTP/1.1: a client that picks h2 in the TLS handshake gets HTTP/2, with up to 100 requests handled at once on one connection; a client that only speaks HTTP/1.1, or sends no ALPN, keeps HTTP/1.1;
 - closes a connection idle for 10 seconds (nothing being handled and nothing new coming), under either HTTP version; an HTTP/2 connection not closed 10 seconds after its GOAWAY is dropped;
 - drops a connection whose answers make no progress being written for 10 seconds (a client sending without reading);
-- accepts POST requests at the configured path and reads a DNS wire message body;
+- accepts POST requests at the configured path and reads a DNS wire message body; one whose Content-Type is not application/dns-message gets 415 (RFC 8484 section 4.1);
+- answers another method at the configured path with 405 and an Allow header of GET, POST, and another path with 404;
 - accepts GET requests at the configured path with a dns base64url-without-padding query parameter;
 - rejects queries over 4096 bytes (a POST body with 413, a GET dns parameter decoding longer with 400), the same bound as over UDP and TCP;
 - answers standard queries only, as UDP and TCP do: a request with an opcode other than 0 gets NOTIMP, and a query with a question count other than 1 and the like FORMERR (both 200, the header alone); a response with QR=1 gets 400;

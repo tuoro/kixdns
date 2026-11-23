@@ -236,7 +236,8 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 - 支持 HTTP/2 和 HTTP/1.1：TLS 握手时客户端选了 h2 就用 HTTP/2，一条连接上最多同时处理 100 个请求；只会 HTTP/1.1 或不发 ALPN 的客户端照旧用 HTTP/1.1；
 - 连接空闲 10 秒（没有请求在处理，也没有新请求来）就关闭，两种 HTTP 版本一样；HTTP/2 发了 GOAWAY 以后 10 秒还没关上就直接断开；
 - 写回答 10 秒没有进展（客户端只发不读）就断开连接；
-- 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
+- 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；Content-Type 不是 application/dns-message 的回 415（RFC 8484 第 4.1 节）；
+- 配置路径上别的方法回 405，Allow 头写着 GET, POST；别的路径回 404；
 - 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
 - 拒绝超过 4096 字节的查询（POST 的请求体回 413，GET 的 dns 参数解码后超长回 400），和 UDP、TCP 的上限一样；
 - 和 UDP、TCP 一样只回答标准查询：opcode 不是 0 的请求回 NOTIMP，问题数不是 1 等的查询回 FORMERR（都是 200，只有请求头）；QR=1 的应答回 400；
