@@ -127,7 +127,7 @@ impl DohCertificate {
                     .start("doh-cert-watcher", move |_| reload(&reloaded, &cert, &key))
                     .map_err(notify::Error::io)
             })
-            .inspect_err(|err| error!(target = "doh", cert = cert_path, key = key_path, error = %err, "cannot watch the DoH certificate, a renewed one is not used until restart"))
+            .inspect_err(|err| error!(cert = cert_path, key = key_path, error = %err, "cannot watch the DoH certificate, a renewed one is not used until restart"))
             .ok();
         Ok(Arc::new(Self {
             current,
@@ -143,13 +143,13 @@ fn reload(current: &ArcSwap<TlsAcceptor>, cert: &str, key: &str) {
     match build_tls_acceptor(cert, key) {
         Ok(acceptor) => {
             current.store(Arc::new(acceptor));
-            info!(target = "doh", cert, key, "DoH TLS certificate reloaded");
+            info!(cert, key, "DoH TLS certificate reloaded");
         }
         // 默认日志级别是 error：记成 warn 的话，续期失败谁也看不到，直到旧证书过期
         // The default log level is error: logged as a warn, a failed renewal would go unseen
         // until the old certificate expired
         Err(err) => {
-            error!(target = "doh", cert, key, error = %format!("{err:#}"), "DoH TLS certificate reload failed, keeping the one in use");
+            error!(cert, key, error = %format!("{err:#}"), "DoH TLS certificate reload failed, keeping the one in use");
         }
     }
 }
