@@ -19,7 +19,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 
 use kixdns::config::{Transport, parse_config};
 use kixdns::doh_server::run_doh_with_listener;
-use kixdns::engine::{Engine, FastPathResponse, PreParsedData};
+use kixdns::engine::{Engine, FastPathResponse};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
     CacheHit, CacheHitKind, ClientTransport, ConfigLoaded, ConfigReloadFailed, DecisionDetail,
@@ -2403,7 +2403,7 @@ async fn failed_and_cancelled_requests_lend_no_response() {
     let (engine, recorder) = observed_engine(&static_config("192.0.2.7"));
     let mut packet = query("broken.example");
     packet[11] = 1; // ARCOUNT = 1, no additional record follows / ARCOUNT 为 1 但没有附加记录
-    let pre_parsed = PreParsedData::new(
+    let pre_parsed = engine.pre_parsed(
         "broken.example".to_string(),
         u16::from(RecordType::A),
         1,
