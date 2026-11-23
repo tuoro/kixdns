@@ -537,6 +537,80 @@ async fn an_empty_geosite_file_keeps_the_tags_in_use() {
     assert!(!manager.read().matches("testa", "x.geo.test"));
 }
 
+/// 两个数据文件都提供一个标签时排在后面的说了算；它被换成空文件以后，这个标签用前面那个文件的数据，和全部重新读一遍
+/// 一样，只有它提供的标签照旧留着正在用的数据。以前空文件的数据整个留着：前面那个文件明明还提供着这个标签，用的仍是
+/// 后面那个文件被清空之前的数据，直到重启或者它再写一次
+/// Of two data files providing one tag the later decides; once it is replaced by an empty
+/// one, the tag takes the earlier file's data, as a full load would have it, and only the
+/// tags it alone provided keep the data in use. The empty file's data used to be kept whole:
+/// though the earlier file still provided the tag, it went on with the later file's data from
+/// before it was emptied, until a restart or the file being written again
+#[tokio::test]
+async fn an_emptied_geosite_file_hands_a_shared_tag_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, last) = (dir.path().join("first.dat"), dir.path().join("last.dat"));
+    std::fs::write(&first, geosite_dat(&[("shared", "first.test")])).unwrap();
+    std::fs::write(
+        &last,
+        geosite_dat(&[("shared", "last.test"), ("only", "only.test")]),
+    )
+    .unwrap();
+    let engine = engine(geosite_config_any_of(&[&first, &last], &["shared", "only"]));
+    let manager = &engine.geosite_manager;
+    assert!(manager.read().matches("shared", "x.last.test"));
+
+    replace(&last, b"");
+    wait_for("the shared tag must take the earlier file's data", || {
+        manager.read().matches("shared", "x.first.test")
+    })
+    .await;
+    let manager = manager.read();
+    assert!(!manager.matches("shared", "x.last.test"));
+    assert!(
+        manager.matches("only", "x.only.test"),
+        "a tag only the emptied file provided keeps the data in use"
+    );
+}
+
+/// 热重载重新读入时遇到成了空文件的那个文件也一样：它此前说了算的共享标签用前面那个文件的数据，只有它提供的标签留着
+/// 正在用的数据。以前它此前说了算的标签都留着它的旧数据，盖过了前面那个文件刚读出来的
+/// The same for a hot reload reading the file that became empty: the shared tag it decided
+/// takes the earlier file's data, and only the tags it alone provided keep the data in use.
+/// Every tag it decided used to keep its old data, over what the earlier file had just given
+#[tokio::test]
+async fn a_reload_reading_an_emptied_geosite_file_hands_a_shared_tag_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let [first, last, other] =
+        ["first.dat", "last.dat", "other.dat"].map(|name| dir.path().join(name));
+    std::fs::write(&first, geosite_dat(&[("shared", "first.test")])).unwrap();
+    std::fs::write(
+        &last,
+        geosite_dat(&[("shared", "last.test"), ("only", "only.test")]),
+    )
+    .unwrap();
+    std::fs::write(&other, geosite_dat(&[("else", "else.test")])).unwrap();
+    let tags = ["shared", "only"];
+    let engine = engine(geosite_config_any_of(&[&first, &last], &tags));
+    assert!(
+        engine
+            .geosite_manager
+            .read()
+            .matches("shared", "x.last.test")
+    );
+
+    // 多了一个文件，热重载把每个文件重新读一遍 / One more file, so the hot reload reads every
+    // file again
+    replace(&last, b"");
+    engine.reload(geosite_config_any_of(&[&first, &last, &other], &tags));
+    let manager = engine.geosite_manager.read();
+    assert!(manager.matches("shared", "x.first.test"));
+    assert!(!manager.matches("shared", "x.last.test"));
+    assert!(
+        manager.matches("only", "x.only.test"),
+        "a tag only the emptied file provided keeps the data in use"
+    );
+}
+
 /// GeoIP 的 .dat 数据文件被换成空文件，规则用到的标签照旧在，和 GeoSite 一样
 /// A GeoIP .dat data file replaced by an empty one keeps the tags rules use, as for GeoSite
 #[tokio::test]
@@ -699,6 +773,4 @@ async fn geosite_tags_no_file_provides_are_found() {
     let manager = engine.geosite_manager.read();
     let used = ["TestA".to_string(), "gone".to_string(), "Gone".to_string()];
     assert_eq!(manager.missing_tags(&used), ["gone"]);
-    assert!(manager.source_provides_any(&path, &used));
-    assert!(!manager.source_provides_any(&path, &["gone".to_string()]));
 }

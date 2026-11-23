@@ -288,15 +288,21 @@ fn load_geosite(
                  "loaded GeoSite data from file");
         }
     }
+    // 规则用到、刚读的文件却一个都不提供的标签 / The tags rules use that none of the files just
+    // read provides
+    let unprovided = fresh.missing_tags(&spec.tags);
     let old = {
         let mut in_use = shared.write();
         // 和监视到文件变了时一样（见 `reload_geosite_file`）：这份文件此前提供着规则现在还用的标签，重新读出来
-        // 却一个都没有，多半是空文件或写坏了的文件。这些标签留着正在用的数据，等文件下次改动
+        // 却一个都没有，多半是空文件或写坏了的文件。其中别的文件都不提供的标签留着正在用的数据，等文件下次改动；
+        // 别的文件也提供的用那个文件的，和全部重新读一遍一样
         // As when a watched file changes (see `reload_geosite_file`): the file provided tags
         // the rules still use, yet reading it again gives none of them, most likely an empty or
-        // broken file. Those tags keep the data in use until the file changes again
+        // broken file. Those of them no other file provides keep the data in use until the
+        // file changes again; those another file provides too take that file's, as a full
+        // load would have them
         for path in gave_nothing {
-            let kept = in_use.take_source(path, &spec.tags);
+            let kept = in_use.take_source(path, &unprovided);
             if !kept.is_empty() {
                 warn!(target = "geosite", path = %path.display(), tags = kept.len(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
                 fresh.apply_source(path, kept);
@@ -329,12 +335,18 @@ fn load_geosite(
     }
 }
 
-/// 监视到 GeoSite 数据文件 `path` 变了：在锁外重新读这一份，再短暂持写锁只替换它贡献的标签，
-/// 其它文件贡献的标签不动（见 [`GeoSiteManager::apply_source`]）
-/// A watched GeoSite data file `path` changed: it is read again outside the lock, then the
-/// write lock is held briefly to replace only the tags it contributes, leaving other files'
-/// tags alone (see [`GeoSiteManager::apply_source`]). Gives whether new data went in
-/// 换进了新数据时为 true
+/// 监视到 GeoSite 数据文件 `path` 变了：只替换它贡献的标签，其它文件贡献的标签不动（见
+/// [`GeoSiteManager::apply_source`]）。文件都在锁外读：先在读锁下算出哪些标签要由前面的文件顶上，在锁外读那些
+/// 文件，再短暂持写锁换进去。以前要顶上的标签在写锁里读，这期间所有按 GeoSite 匹配的查询都停着。监视线程是管理器
+/// 唯一写数据的（热重载先停下监视再换数据），所以读锁下算出来的到换进去时仍然成立
+/// A watched GeoSite data file `path` changed: only the tags it contributes are replaced,
+/// leaving other files' tags alone (see [`GeoSiteManager::apply_source`]). Every file is read
+/// outside the lock: which tags earlier files are to take over is worked out under the read
+/// lock, those files are read outside it, and the write lock is held briefly to swap in. The
+/// tags taken over used to be read under the write lock, stalling every GeoSite match
+/// meanwhile. The watch thread is the only one writing to the manager (a hot reload stops
+/// the watch before swapping data), so what was worked out under the read lock still holds
+/// at the swap. Gives whether new data went in / 换进了新数据时为 true
 fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[String]) -> bool {
     let parsed = match GeoSiteManager::parse_file(path, tags) {
         Ok(parsed) => parsed,
@@ -343,26 +355,30 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
             return false;
         }
     };
-    {
-        // 这份文件此前提供着规则用到的标签，新读出来却一个都没有了：多半是空文件或写坏了的文件（下载
-        // 失败、磁盘写满）。换进去会让这些规则一下子全不命中，所以留着正在用的数据，等文件下次改动
-        // The file provided tags rules use until now, yet the new read has none of them: most
-        // likely an empty or broken file (a failed download, a full disk). Swapping it in would
-        // stop those rules matching at once, so the data in use stays until the file changes again
-        if !tags.is_empty()
-            && !parsed_provides_any(&parsed, tags)
-            && manager.read().source_provides_any(path, tags)
-        {
-            warn!(target = "geosite_watcher", path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
+    let handovers = manager.read().handovers(path, &parsed);
+    // 新读出来一个规则用到的标签都没有：多半是空文件或写坏了的文件（下载失败、磁盘写满）。只有它提供的标签换掉会让用
+    // 它们的规则一下子全不命中，所以留着正在用的数据，等文件下次改动；别的文件也提供的标签照常交给那个文件，和全部
+    // 重新读一遍一样。没有要交出去的标签时什么都不变。以前整份留着，别的文件明明还提供着的标签也一直用这份的旧数据
+    // The new read has none of the tags rules use: most likely an empty or broken file (a
+    // failed download, a full disk). Dropping the tags only it provides would stop the rules
+    // using them matching at once, so they keep the data in use until the file changes again;
+    // the tags another file provides too go over to that file as usual, as a full load would
+    // have it. With none to hand over nothing changes. It used to be kept whole, so a tag
+    // another file still provided went on with this file's old data
+    let gives_none = !parsed_provides_any(&parsed, tags);
+    if gives_none {
+        warn!(target = "geosite_watcher", path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data only it provided");
+        if handovers.is_empty() {
             return false;
         }
-        let mut manager = manager.write();
-        let count = manager.apply_source(path, parsed);
-        let missing = manager.missing_tags(tags);
-        drop(manager);
-        info!(target = "geosite_watcher", path = %path.display(), loaded_count = count, "GeoSite data reloaded");
-        warn_missing_geosite_tags(&missing);
     }
+    let handed_over = GeoSiteManager::read_handovers(handovers);
+    let mut manager = manager.write();
+    let count = manager.swap_source(path, parsed, handed_over, gives_none);
+    let missing = manager.missing_tags(tags);
+    drop(manager);
+    info!(target = "geosite_watcher", path = %path.display(), loaded_count = count, "GeoSite data reloaded");
+    warn_missing_geosite_tags(&missing);
     true
 }
 
@@ -491,4 +507,75 @@ fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String
         info!(target = "geoip_watcher", path = %path.display(), loaded_count = count, "GeoIP data reloaded");
     }
     true
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    use super::*;
+
+    /// 只有一个标签、标签里只有一个后缀的 JSON 数据文件 / A JSON data file with one tag holding one
+    /// suffix
+    fn json(tag: &str, suffix: &str) -> String {
+        format!(r#"{{"entries":[{{"tag":"{tag}","domains":["domain:{suffix}"]}}]}}"#)
+    }
+
+    /// 监视到文件变了、共享的标签要从前面的文件读回来时，那个文件在锁外读：读的这段时间里匹配照常拿得到读锁。以前在写锁
+    /// 里读，读一个大文件要几十毫秒，这期间所有按 GeoSite 匹配的查询都停着。前面那个文件换成命名管道，读它的一方停在
+    /// 那里等写的一方，正好看这时锁有没有被拿着
+    /// When a watched file changes and a shared tag is read back from an earlier file, that file
+    /// is read outside the lock: matching gets the read lock as usual while it is read. It used
+    /// to be read under the write lock, and reading a large file takes tens of milliseconds, with
+    /// every GeoSite match stalled meanwhile. The earlier file is made a named pipe, whose reader
+    /// waits there for the writer, just when the lock can be looked at
+    #[test]
+    fn a_shared_tag_is_read_back_outside_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, last) = (dir.path().join("first.json"), dir.path().join("last.json"));
+        let tags = ["shared".to_string(), "only".to_string()];
+        std::fs::write(&first, json("shared", "first.test")).unwrap();
+        std::fs::write(
+            &last,
+            r#"{"entries":[{"tag":"shared","domains":["domain:last.test"]},{"tag":"only","domains":["domain:only.test"]}]}"#,
+        )
+        .unwrap();
+        let manager = RwLock::new(GeoSiteManager::new());
+        for path in [&first, &last] {
+            let parsed = GeoSiteManager::parse_file(path, &tags).unwrap();
+            manager.write().apply_source(path, parsed);
+        }
+
+        // 后面的文件交出 shared，前面的文件换成命名管道 / The later file gives up `shared`, and
+        // the earlier one becomes a named pipe
+        std::fs::write(&last, json("only", "only.test")).unwrap();
+        std::fs::remove_file(&first).unwrap();
+        let fifo = std::ffi::CString::new(first.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` 是以 NUL 结尾的路径，调用期间一直在 / `fifo` is a NUL-terminated path that
+        // outlives the call
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        std::thread::scope(|scope| {
+            let reload = scope.spawn(|| reload_geosite_file(&manager, &last, &tags));
+            // 打开写的一端要等读的一端也打开：这时重载正在读前面那个文件 / Opening the writing end
+            // waits for the reading end to open: the reload is reading the earlier file now
+            let mut pipe = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&first)
+                .unwrap();
+            assert!(
+                manager.try_read().is_some(),
+                "matching must not wait while another file is read"
+            );
+            pipe.write_all(json("shared", "first.test").as_bytes())
+                .unwrap();
+            drop(pipe);
+            assert!(reload.join().unwrap());
+        });
+        let manager = manager.read();
+        assert!(manager.matches("shared", "x.first.test"));
+        assert!(!manager.matches("shared", "x.last.test"));
+        assert!(manager.matches("only", "x.only.test"));
+    }
 }

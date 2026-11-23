@@ -607,6 +607,11 @@ pub struct GeoSiteManager {
 /// 已经建好索引（见 [`TagMatchers`]）：索引在解析时、管理器的写锁之外建好，应用时只是换进去。
 pub type ParsedGeoSite = Vec<(String, TagMatchers)>;
 
+/// 一个数据文件不再提供、要由前面的文件顶上的 tag，按顶上的文件分组（见 [`GeoSiteManager::handovers`]）
+/// The tags a data file no longer provides that earlier files are to take over, grouped by
+/// the file taking them (see [`GeoSiteManager::handovers`])
+pub type Handovers = FxHashMap<PathBuf, Vec<String>>;
+
 impl Default for GeoSiteManager {
     fn default() -> Self {
         Self::new()
@@ -684,16 +689,6 @@ impl GeoSiteManager {
         missing.sort_unstable();
         missing.dedup();
         missing
-    }
-
-    /// 数据文件 `path` 眼下有没有提供 `tags`（不分大小写）里的标签
-    /// Whether data file `path` provides any of `tags` (ignoring case) right now
-    pub fn source_provides_any(&self, path: &Path, tags: &[String]) -> bool {
-        let key = Self::source_key(path);
-        self.sources
-            .iter()
-            .find(|(source, _)| *source == key)
-            .is_some_and(|(_, provided)| provided.iter().any(|tag| is_one_of(tag, tags)))
     }
 
     /// 把数据文件 `path` 眼下说了算的标签里、属于 `tags`（不分大小写）的拿出来，连同它们的数据。重新读这个文件
@@ -1060,13 +1055,13 @@ impl GeoSiteManager {
     /// touching manager state
     ///
     /// `.dat` 走 V2Ray 二进制解析器，其余按 JSON 读；两种都只解出 `tags` 点名的标签，不点名时每个都解。
-    /// 格式分派集中在这里：登记进 `sources` 的文件后续会被 `apply_source` 和
-    /// `reload_tags_from` 再次读取，三处必须用同一套判定，否则会拿错解析器。
+    /// 格式分派集中在这里：登记进 `sources` 的文件后续会被 `read_handovers` 再次读取，
+    /// 两处必须用同一套判定，否则会拿错解析器。
     /// `.dat` uses the V2Ray binary parser and anything else is read as JSON; both
     /// decode just the tags `tags` names, or every tag when it names none.
     /// Keeping the dispatch in one place matters because a file registered in
-    /// `sources` is read again later by `apply_source` and `reload_tags_from`,
-    /// and all of them have to agree on which parser a path needs.
+    /// `sources` is read again later by `read_handovers`, and both have to agree on
+    /// which parser a path needs.
     pub fn parse_file<P: AsRef<Path>>(path: P, tags: &[String]) -> anyhow::Result<ParsedGeoSite> {
         let path = path.as_ref();
         let is_dat = path
@@ -1087,11 +1082,103 @@ impl GeoSiteManager {
     /// Replace the tags a data file contributed with its freshly parsed content
     ///
     /// 文件里删掉的 tag 随之消失，其它文件贡献的 tag 保持不变
-    /// （`geosite_data_paths` 接受多个文件）。
+    /// （`geosite_data_paths` 接受多个文件）。要由前面的文件顶上的 tag 当场从那些文件里读出来
+    /// （见 [`Self::handovers`]），所以只用在别人读不到的管理器上；共享的管理器分三步换（见
+    /// `engine::geo` 的 `reload_geosite_file`）
     /// Tags dropped from the file disappear with it while tags from other files
-    /// stay (`geosite_data_paths` accepts several files).
+    /// stay (`geosite_data_paths` accepts several files). The tags earlier files are to
+    /// take over are read from those files on the spot (see [`Self::handovers`]), so this
+    /// is only for a manager nobody else reads; a shared one is swapped in three steps (see
+    /// `reload_geosite_file` in `engine::geo`)
     pub fn apply_source<P: AsRef<Path>>(&mut self, path: P, parsed: ParsedGeoSite) -> usize {
-        let key = Self::source_key(path.as_ref());
+        let path = path.as_ref();
+        let handed_over = Self::read_handovers(self.handovers(path, &parsed));
+        self.swap_source(path, parsed, handed_over, false)
+    }
+
+    /// 数据文件 `path` 换成 `parsed` 时它不再提供、此前由它说了算、前面还有文件提供的 tag，按其中排得最后的那个文件
+    /// 分组：那个文件把它们顶上，和全部重新读一遍的结果一样，不然名义上 tag 还在，命中的却是已经被删掉的数据。只读
+    /// 管理器，共享的管理器在读锁下算
+    /// The tags data file `path` no longer provides once it is `parsed`, that it decided
+    /// until now and that earlier files still provide, grouped by the latest of those files:
+    /// that file takes them over, as a full load would have it, or else the tag survives but
+    /// matches data that was deleted. It only reads the manager, so a shared one works it
+    /// out under the read lock
+    pub fn handovers(&self, path: &Path, parsed: &ParsedGeoSite) -> Handovers {
+        let key = Self::source_key(path);
+        let mut handovers = Handovers::default();
+        let Some(place) = self.sources.iter().position(|(source, _)| *source == key) else {
+            return handovers;
+        };
+        for tag in &self.sources[place].1 {
+            if parsed.iter().any(|(provided, _)| provided == tag)
+                || self.later_source_provides(place, tag)
+            {
+                continue;
+            }
+            if let Some(other) = self.earlier_source_providing(place, tag) {
+                handovers
+                    .entry(other.to_path_buf())
+                    .or_default()
+                    .push(tag.clone());
+            }
+        }
+        handovers
+    }
+
+    /// 从各个文件里读出 `handovers` 要它们顶上的 tag，不触碰管理器状态，调用方在锁外读：读文件、建索引要几十毫秒，
+    /// 而写锁是整个匹配器共享的，以前在写锁里读，这期间所有查询都停着。一个文件不论顶上多少个 tag 都只解析一次。
+    /// 读不出来、或者文件里已经没有的 tag 不在结果里，它正在用的数据留着，等那个文件自己重载时纠正，总好过留下一个空 tag
+    /// Reads from each file the tags `handovers` gives it to take over, without touching
+    /// manager state, so callers read outside the lock: reading a file and building its
+    /// index takes tens of milliseconds, and the write lock is shared with matching, so
+    /// reading under it, as was done before, stalled every query meanwhile. A file is
+    /// parsed once however many tags it takes over. A tag that cannot be read, or that the
+    /// file no longer has, is left out and keeps the data in use until that file's own
+    /// reload fixes it, which beats leaving the tag empty
+    pub fn read_handovers(handovers: Handovers) -> ParsedGeoSite {
+        let mut handed_over = Vec::new();
+        for (path, wanted) in handovers {
+            match Self::parse_file(&path, &wanted) {
+                Ok(parsed) => {
+                    if parsed.len() < wanted.len() {
+                        warn!(
+                            target = "geosite",
+                            path = %path.display(), wanted = wanted.len(), taken = parsed.len(),
+                            "data file no longer contains every tag it was recorded as providing"
+                        );
+                    }
+                    handed_over.extend(parsed);
+                }
+                Err(e) => {
+                    warn!(
+                        target = "geosite",
+                        path = %path.display(), tags = wanted.len(), error = %e,
+                        "failed to re-read shared tags, keeping the current entries"
+                    );
+                }
+            }
+        }
+        handed_over
+    }
+
+    /// 把数据文件 `path` 新解析出的 `parsed` 换进来，替换它此前贡献的 tag；它不再提供、前面的文件顶上的 tag 换成
+    /// `handed_over`（见 [`Self::read_handovers`]）里的数据。只换数据、不读文件，共享的管理器在写锁下调用。
+    /// 它不再提供、也没有别的文件提供的 tag 随之消失；`keep_unprovided` 时留着正在用的数据，仍算它提供的
+    /// Swaps in `parsed`, data file `path`'s new content, in place of the tags it
+    /// contributed; the tags it no longer provides that earlier files take over get the
+    /// data in `handed_over` (see [`Self::read_handovers`]). It swaps data and reads no
+    /// file, so a shared manager calls it under the write lock. The tags it no longer
+    /// provides that no other file provides disappear with it; with `keep_unprovided` they
+    /// keep the data in use and still count as provided by it
+    pub fn swap_source(
+        &mut self,
+        path: &Path,
+        parsed: ParsedGeoSite,
+        handed_over: ParsedGeoSite,
+        keep_unprovided: bool,
+    ) -> usize {
+        let key = Self::source_key(path);
         // 这个文件排第几：读过的留在原位，头一次读的排到最后 / The file's place: one read before
         // keeps it, one read for the first time goes last
         let place = self
@@ -1117,39 +1204,30 @@ impl GeoSiteManager {
             }
             tags.push(tag);
         }
+        let loaded_count = tags.len();
+        for (tag, matchers) in handed_over {
+            retired.extend(self.database.insert(tag, matchers));
+        }
 
-        // 这个文件不再提供的 tag：排在后面的文件还提供着，索引里本来就是那个文件的数据，不用动。否则
-        // 索引里是本文件的旧条目：没有别的文件提供就删掉；前面还有文件提供，就从其中排得最后的那个里
-        // 重新读出来顶上，和全部重新读一遍的结果一样——不然名义上 tag 还在，命中的却是已经被删掉的数据。
+        // 这个文件不再提供的 tag：排在后面的文件还提供着，索引里本来就是那个文件的数据；前面的文件还提供着，刚换成了
+        // 它的数据（读不出来时留着正在用的）。都没有时，索引里是本文件的旧条目，随之删掉
         // For tags this file no longer provides: with a later file still providing one the
-        // index holds that file's data already and nothing changes. Otherwise the index
-        // holds this file's stale entries: they are dropped when no other file provides the
-        // tag, and with earlier files providing it the tag is re-read from the latest of
-        // them, as a full load would have it. Without that the tag survives but matches
-        // data that was deleted.
-        // 先按提供者分组再读：同一个文件顶上多少个 tag 都只解析一次，代价与被删
-        // 的 tag 数无关。写锁是整个匹配器共享的，这里多读一遍就是多停顿一次查询。
-        // Group by provider before reading: one parse per file however many tags
-        // it takes over, so the cost no longer scales with the number of dropped
-        // tags. The write lock is shared with matching, so every extra read here
-        // is another stall for queries.
-        let mut takeovers: FxHashMap<PathBuf, Vec<String>> = FxHashMap::default();
+        // index holds that file's data already; with an earlier file providing it, it just
+        // got that file's data (or keeps the data in use when it could not be read). With
+        // neither, the index holds this file's stale entries, which go with it
         for tag in previous {
-            if tags.contains(&tag) || self.later_source_provides(place, &tag) {
+            if tags.contains(&tag)
+                || self.later_source_provides(place, &tag)
+                || self.earlier_source_providing(place, &tag).is_some()
+            {
                 continue;
             }
-            match self.earlier_source_providing(place, &tag) {
-                Some(other) => takeovers.entry(other).or_default().push(tag),
-                None => {
-                    retired.extend(self.database.remove(&tag));
-                }
+            if keep_unprovided {
+                tags.push(tag);
+            } else {
+                retired.extend(self.database.remove(&tag));
             }
         }
-        for (path, wanted) in takeovers {
-            self.reload_tags_from(&path, &wanted, &mut retired);
-        }
-
-        let loaded_count = tags.len();
         self.sources[place].1 = tags;
 
         self.log_totals();
@@ -1167,45 +1245,12 @@ impl GeoSiteManager {
 
     /// 排在第 `place` 个文件前面、仍在提供这个 tag 的文件里排得最后的那个
     /// The latest of the files before the one at `place` that still provide this tag
-    fn earlier_source_providing(&self, place: usize, tag: &str) -> Option<PathBuf> {
+    fn earlier_source_providing(&self, place: usize, tag: &str) -> Option<&Path> {
         self.sources[..place]
             .iter()
             .rev()
             .find(|(_, provided)| provided.iter().any(|name| name == tag))
-            .map(|(path, _)| path.clone())
-    }
-
-    /// 从另一个数据文件里重新读出单个 tag；读不出来就保持原样，等那个文件自己
-    /// 重载时纠正，总好过留下一个空 tag。
-    /// Re-read a single tag from another data file; leave the index as it is when
-    /// that fails and let the other file's own reload fix it, which beats leaving
-    /// the tag empty.
-    fn reload_tags_from(&mut self, path: &Path, wanted: &[String], retired: &mut Vec<TagMatchers>) {
-        match Self::parse_file(path, wanted) {
-            Ok(parsed) => {
-                let mut taken = 0usize;
-                for (tag, matchers) in parsed {
-                    if wanted.contains(&tag) {
-                        retired.extend(self.database.insert(tag, matchers));
-                        taken += 1;
-                    }
-                }
-                if taken < wanted.len() {
-                    warn!(
-                        target = "geosite",
-                        path = %path.display(), wanted = wanted.len(), taken,
-                        "data file no longer contains every tag it was recorded as providing"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    target = "geosite",
-                    path = %path.display(), tags = wanted.len(), error = %e,
-                    "failed to re-read shared tags, keeping the current entries"
-                );
-            }
-        }
+            .map(|(path, _)| path.as_path())
     }
 
     /// 数据文件的身份：尽量用规范化后的绝对路径，这样配置里写的相对路径与
