@@ -112,6 +112,30 @@ pub fn formerr_reply(query: &[u8]) -> Bytes {
     Bytes::from(reply)
 }
 
+/// 操作码不是 QUERY 的请求（NOTIFY、UPDATE 这些 KixDNS 不做的）的应答：RFC 1035 第 4.1.1 节的 NOTIMP。只有请求头，
+/// 各段计数为 0：别的操作码各段的意思不同，不往应答里抄；不比请求长，伪造来源也放大不了流量。应答（QR=1）、
+/// 操作码是 QUERY 的报文和不足 12 字节的报文没有这样的应答，为 None。以前它们和应答一样被丢掉（UDP）或断开连接（TCP）
+/// The reply to a request whose opcode is not QUERY (NOTIFY, UPDATE and the like, which KixDNS
+/// does not do): NOTIMP, as RFC 1035 section 4.1.1 has it. The header alone with every count
+/// at 0: the sections mean other things under other opcodes and are not copied; no longer than
+/// the request, a forged source gains no amplification. A response (QR=1), a message whose
+/// opcode is QUERY and one shorter than 12 bytes have no such reply, None. They used to be
+/// dropped (UDP) or have the connection closed (TCP), as a response is
+pub fn notimp_reply(packet: &[u8]) -> Option<Bytes> {
+    let header = packet.get(..12)?;
+    if header[2] & 0x80 != 0 || header[2] & 0x78 == 0 {
+        return None;
+    }
+    let mut reply = Vec::with_capacity(12);
+    reply.extend_from_slice(&header[..2]);
+    // QR=1，保留 opcode 和 RD；RA=1，保留 CD，RCODE=NOTIMP
+    // QR=1, keeping the opcode and RD; RA=1, keeping CD, RCODE=NOTIMP
+    reply.push(0x80 | (header[2] & 0x79));
+    reply.push(0x84 | (header[3] & 0x10));
+    reply.extend_from_slice(&[0; 8]);
+    Some(Bytes::from(reply))
+}
+
 /// 查询里唯一一个问题的结尾，名字用了压缩指针、超长或问题没写完时为 None：这样的问题抄不到应答里
 /// Where the query's one question ends; None when its name has a compression pointer or
 /// is too long, or the question is cut short, as such a question cannot be copied to a reply

@@ -218,7 +218,7 @@ UDP and TCP listeners are always created from settings.bind_udp and settings.bin
 
 Inbound listener behavior:
 
-- Only standard single-question QUERY messages are processed. Non-QUERY opcodes, messages without exactly one question, DNS response packets and packets under 12 bytes are silently dropped. A message with a standard query header that cannot be read (two OPT records, say, or a UDP query over 4096 bytes) gets FORMERR, with the header and question alone and no longer than the query; while flow control is refusing queries such a message is dropped.
+- Only standard single-question QUERY messages are processed. A request whose opcode is not QUERY (NOTIFY, UPDATE and the like) gets NOTIMP, the header alone; messages without exactly one question, DNS response packets and packets under 12 bytes are silently dropped (over TCP the connection closes). A message with a standard query header that cannot be read (two OPT records, say, or a UDP query over 4096 bytes) gets FORMERR, with the header and question alone and no longer than the query; while flow control is refusing queries such a message is dropped.
 - A query whose EDNS version is not 0 is answered BADVERS (RFC 6891 section 6.1.3), with an OPT of version 0 in the reply.
 - A listener processing error, an overall request timeout, or flow control refusing a query returns SERVFAIL to the client for a valid query.
 - UDP responses larger than the client's advertised size (the EDNS payload size, at most 1232 bytes so as not to fragment at the IP layer, see DNS Flag Day 2020; or 512 bytes without EDNS) are truncated at record boundaries with the TC bit set, so the client can retry over TCP; the OPT of every reply advertises 1232.
@@ -236,7 +236,7 @@ The inbound DoH handler:
 - accepts POST requests at the configured path and reads a DNS wire message body;
 - accepts GET requests at the configured path with a dns base64url-without-padding query parameter;
 - rejects queries over 4096 bytes (a POST body with 413, a GET dns parameter decoding longer with 400), the same bound as over UDP and TCP;
-- answers standard queries only, as UDP and TCP do: a response with QR=1, a question count other than 1, an opcode other than 0 and the like get 400;
+- answers standard queries only, as UDP and TCP do: a request with an opcode other than 0 gets NOTIMP (200, the header alone); a response with QR=1, a question count other than 1 and the like get 400;
 - returns application/dns-message for a successful DNS response.
 
 DoT and DoQ are implemented as outbound transports. There are no inbound DoT or DoQ listeners.

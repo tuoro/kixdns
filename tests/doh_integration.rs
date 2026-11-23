@@ -439,10 +439,6 @@ async fn test_doh_post_non_query_is_bad_request() {
         ("QR=1", with(|packet| packet[2] |= 0x80)),
         ("QDCOUNT=0", with(|packet| packet[5] = 0)),
         ("QDCOUNT=2", with(|packet| packet[5] = 2)),
-        (
-            "opcode STATUS",
-            with(|packet| packet[2] = (packet[2] & 0x87) | (2 << 3)),
-        ),
         ("ANCOUNT=1", with(|packet| packet[7] = 1)),
     ] {
         let resp = post(&client, server.port, packet)
@@ -457,6 +453,19 @@ async fn test_doh_post_non_query_is_bad_request() {
             "{case}: {status} with a {body}-byte body"
         );
     }
+    // 别的操作码不是错的报文，是 KixDNS 不做的请求：回 NOTIMP（只有请求头），和 UDP、TCP 一样
+    // Another opcode is no broken message but a request KixDNS does not do: NOTIMP (the header
+    // alone), as over UDP and TCP
+    let status_query = with(|packet| packet[2] = (packet[2] & 0x87) | (2 << 3));
+    let resp = post(&client, server.port, status_query)
+        .send()
+        .await
+        .expect("POST request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.bytes().await.expect("body");
+    assert_eq!(body.len(), 12, "the header alone");
+    assert_eq!(&body[..2], &[0x42, 0x42]);
+    assert_eq!(body[3] & 0x0F, 4, "NOTIMP");
     let resp = post(&client, server.port, query)
         .send()
         .await

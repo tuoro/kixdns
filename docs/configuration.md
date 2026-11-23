@@ -218,7 +218,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 
 入站监听器行为：
 
-- 只处理标准单 question 的 QUERY 消息。非 QUERY opcode、问题数不是 1 的报文、DNS 响应包和不足 12 字节的包会被静默丢弃。请求头是标准查询、报文却读不了的（比如带两条 OPT，或 UDP 查询超过 4096 字节）回 FORMERR，只带请求头和问题，不比查询长；流控拒绝查询时这类报文直接丢弃。
+- 只处理标准单 question 的 QUERY 消息。opcode 不是 QUERY 的请求（NOTIFY、UPDATE 等）回 NOTIMP，只有请求头；问题数不是 1 的报文、DNS 响应包和不足 12 字节的包会被静默丢弃（TCP 上断开连接）。请求头是标准查询、报文却读不了的（比如带两条 OPT，或 UDP 查询超过 4096 字节）回 FORMERR，只带请求头和问题，不比查询长；流控拒绝查询时这类报文直接丢弃。
 - EDNS 版本不是 0 的查询回 BADVERS（RFC 6891 第 6.1.3 节），回答里的 OPT 写版本 0。
 - 监听器处理错误、整体请求超时或流控拒绝时，对合法查询返回 SERVFAIL。
 - 大于客户端声明大小（EDNS 载荷大小，最多 1232 字节，免得在 IP 层分片，见 DNS Flag Day 2020；无 EDNS 时为 512 字节）的 UDP 响应会在记录边界截断并置 TC 位，客户端可据此改用 TCP 重试；回答里的 OPT 都通告 1232。
@@ -236,7 +236,7 @@ UDP 和 TCP 监听器分别由 settings.bind_udp 和 settings.bind_tcp 创建。
 - 接收配置路径上的 POST 请求，并读取 DNS wire message 请求体；
 - 接收配置路径上的 GET 请求，并读取 dns 查询参数中的无填充 base64url 数据；
 - 拒绝超过 4096 字节的查询（POST 的请求体回 413，GET 的 dns 参数解码后超长回 400），和 UDP、TCP 的上限一样；
-- 和 UDP、TCP 一样只回答标准查询：QR=1 的应答、问题数不是 1、opcode 不是 0 等报文回 400；
+- 和 UDP、TCP 一样只回答标准查询：opcode 不是 0 的请求回 NOTIMP（200，只有请求头）；QR=1 的应答、问题数不是 1 等报文回 400；
 - 成功处理后返回 application/dns-message。
 
 DoT 和 DoQ 只作为出站传输实现，代码没有入站 DoT/DoQ 监听器。
