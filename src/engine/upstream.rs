@@ -1261,13 +1261,22 @@ async fn forward_udp_smart(
             "udp forward attempt failed",
         );
     };
-    // UDP 带回来的应答：截断的改用 TCP 重取，别的原样交回 / A reply UDP brought back: a truncated one
-    // is fetched again over TCP, any other goes back as it is
+    // UDP 带回来的应答：截断的改用 TCP 重取，TCP 拿不到完整应答时交回截断的这份，客户端看到 TC 自己会改用 TCP，
+    // 和双发一样；别的原样交回。以前 TCP 一失败整次查询就失败（上游的 TCP 被挡住时，每个大应答都成了 SERVFAIL）
+    // A reply UDP brought back: a truncated one is fetched again over TCP, and when TCP gives no
+    // full answer the truncated one goes back, the client turning to TCP itself on seeing TC, as
+    // a dual send does; any other goes back as it is. A TCP failure used to fail the whole query
+    // (with the upstream's TCP blocked, every large answer became a SERVFAIL)
     let answered = async |bytes: Bytes| {
         // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
         if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
             debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
-            return over_tcp(engine, packet, upstream, timeout_dur).await;
+            return over_tcp(engine, packet, upstream, timeout_dur)
+                .await
+                .or_else(|error| {
+                    debug!(event = "tc_udp_answer_kept", upstream = %upstream, error = %error, "tcp gave no answer, keeping the truncated udp answer");
+                    Ok((bytes, Transport::Udp))
+                });
         }
         Ok((bytes, Transport::Udp))
     };
@@ -1807,6 +1816,42 @@ mod tests {
             }
         }
         panic!("could not find a port free for both udp and tcp after 16 attempts");
+    }
+
+    /// UDP 应答截断、改用 TCP 却连不上时（上游的 TCP 被挡住了），交回截断的这份：客户端看到 TC 自己会改用 TCP。
+    /// 以前整次查询失败，每个大应答都成了 SERVFAIL
+    /// With the UDP answer truncated and TCP not reachable (the upstream's TCP blocked), the
+    /// truncated answer goes back: the client turns to TCP itself on seeing TC. The whole query
+    /// used to fail, every large answer becoming a SERVFAIL
+    #[tokio::test]
+    async fn a_truncated_answer_is_kept_when_tcp_cannot_fetch_the_full_one() {
+        let _ = ring::default_provider().install_default();
+        let (udp_socket, tcp_listener, upstream_addr) = bind_udp_and_tcp_on_one_port().await;
+        // 这个端口上的 TCP 没人听 / Nobody listens over TCP on this port
+        drop(tcp_listener);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = udp_socket.recv_from(&mut buf).await.expect("udp recv");
+            buf[2] = 0x82; // QR=1, TC=1
+            buf[3] = 0x00;
+            let _ = udp_socket.send_to(&buf[..len], peer).await;
+        });
+        let engine = build_test_engine(true);
+        let packet = build_dns_query_packet("example.com");
+        let (reply, via) = forward_udp_smart(
+            &engine,
+            &packet,
+            &upstream_addr.to_string(),
+            Duration::from_millis(1000),
+            UdpTcpFallback {
+                retry_truncated: true,
+                on_failure: false,
+            },
+        )
+        .await
+        .expect("the truncated answer");
+        assert_eq!(via, Transport::Udp);
+        assert!(crate::proto_utils::truncated_response(&reply), "TC kept");
     }
 
     #[tokio::test]
