@@ -52,8 +52,7 @@ async fn a_question_name_pointing_into_the_header_is_not_forwarded() {
             full.is_err(),
             "pointer to {target}: the full path refuses it"
         );
-        let failure = crate::engine::engine_helpers::try_build_listener_failure_from_wire(&packet)
-            .expect("a standard query header gets an answer");
+        let failure = engine.answer_after_fast_path(&packet, peer(), None).await;
         assert_eq!(
             failure[3] & 0x0F,
             1,

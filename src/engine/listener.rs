@@ -1,9 +1,8 @@
 //! 三个监听器（UDP、TCP、DoH）共用的部分：快速路径当场答什么（见 [`Engine::on_the_spot`]），要等上游的查询
-//! 怎么在时限内答完。各监听器过载时怎么办、答不上的报文回不回，留在它们自己那里。
+//! 怎么在时限内答完、答不上回什么。各监听器过载时怎么办，留在它们自己那里。
 //! What the three listeners (UDP, TCP, DoH) share: what the fast path answers on the spot (see
 //! [`Engine::on_the_spot`]), and how a query that waits on an upstream is answered within the
-//! timeout. What each listener does under overload, and whether it answers a message nothing
-//! can answer, stay with it.
+//! timeout, and what when it cannot be. What each listener does under overload stays with it.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -14,6 +13,8 @@ use tracing::debug;
 use super::{Engine, FastPathResponse, PreParsedData, utils};
 use crate::observe::ClientTransport;
 use crate::proto_utils;
+use hickory_proto::op::Message;
+use hickory_proto::serialize::binary::BinDecodable;
 
 /// 把缓存命中的应答写进 `buf`（先清空）：TTL 按应答在缓存里停留的整秒数调低（RFC 1035 §5.2），
 /// 事务 ID 换成这条查询的
@@ -26,69 +27,79 @@ pub fn write_cache_hit(buf: &mut BytesMut, cached: &[u8], tx_id: u16, elapsed_se
     utils::set_id(buf, tx_id);
 }
 
-/// 快速路径对一个查询做了什么（见 [`Engine::on_the_spot`]）/ What the fast path did with a query (see
+/// 快速路径对一个报文做了什么（见 [`Engine::on_the_spot`]）/ What the fast path did with a message (see
 /// [`Engine::on_the_spot`])
 pub enum OnTheSpot {
-    /// 当场答了，应答写在给的缓冲里 / Answered on the spot, the answer written to the buffer given
-    Answered,
+    /// 当场答了，回答写在给的缓冲里 / Answered on the spot, the answer written to the buffer given
+    Reply,
     /// 要走完整路径（见 [`Engine::answer_after_fast_path`]），带着快速路径解析出的内容；快速解析读不了时为 None
     /// To take the full path (see [`Engine::answer_after_fast_path`]), with what the fast path
     /// parsed; None when the quick parse could not read it
     Forward(Option<PreParsedData>),
-    /// 快速路径出了错（已经记下），连失败应答也构造不出（见
-    /// `engine_helpers::try_build_listener_failure_from_wire`）：UDP、TCP 不回，DoH 总得回点什么
-    /// The fast path failed (as logged), and not even a failure answer can be built (see
-    /// `engine_helpers::try_build_listener_failure_from_wire`): UDP and TCP send nothing, while
-    /// DoH has to answer something
-    Unanswered,
+    /// 不回：应答（QR=1）和不足 12 字节的报文（见 `proto_utils::header_reply`）。UDP 丢掉，TCP 断开连接，DoH 回 400
+    /// No answer: a response (QR=1) or a message under 12 bytes (see `proto_utils::header_reply`).
+    /// UDP drops it, TCP closes the connection, DoH answers 400
+    Drop,
 }
 
 impl Engine {
-    /// 让快速路径当场处理 `packet`：答得上的（静态应答、缓存命中、出错时的失败应答）写进 `reply`（先清空），缓存命中
-    /// 的 TTL 按它在缓存里停留的时间调低。三个监听器都从这里进来
-    /// Let the fast path handle `packet` on the spot: what it can answer (a static answer, a cache
-    /// hit, the failure answer for an error) is written to `reply` (cleared first), a cache hit's
-    /// TTLs lowered by its time in the cache. All three listeners come in through here
+    /// 让快速路径当场处理 `packet`：答得上的写进 `reply`（先清空），缓存命中的 TTL 按它在缓存里停留的时间调低。答得上的有
+    /// 静态应答、缓存命中、快速路径出错时的 SERVFAIL，以及请求头不是标准查询的 NOTIMP 和 FORMERR（见
+    /// `proto_utils::header_reply`）。三个监听器都从这里进来，以前各自先查请求头
+    /// Let the fast path handle `packet` on the spot: what it can answer is written to `reply`
+    /// (cleared first), a cache hit's TTLs lowered by its time in the cache. It answers a static
+    /// answer, a cache hit, the SERVFAIL for an error on the fast path, and the NOTIMP and FORMERR
+    /// for a header that is no standard query (see `proto_utils::header_reply`). All three
+    /// listeners come in through here, where each used to check the header itself first
     pub fn on_the_spot(&self, packet: &[u8], peer: SocketAddr, reply: &mut BytesMut) -> OnTheSpot {
-        let answer = match self.handle_packet_fast(packet, peer) {
-            Ok(Some(FastPathResponse::Direct(answer))) => answer,
-            Ok(Some(FastPathResponse::CacheHit {
-                cached,
-                tx_id,
-                elapsed_secs,
-            })) => {
-                write_cache_hit(reply, &cached, tx_id, elapsed_secs);
-                return OnTheSpot::Answered;
-            }
-            Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
-                return OnTheSpot::Forward(Some(pre_parsed));
-            }
-            Ok(None) => return OnTheSpot::Forward(None),
-            Err(error) => {
-                self.log_fast_path_error(&error);
-                match utils::engine_helpers::try_build_listener_failure_from_wire(packet) {
-                    Some(failure) => failure,
-                    None => return OnTheSpot::Unanswered,
+        let answer = if proto_utils::is_standard_query_header(packet) {
+            match self.handle_packet_fast(packet, peer) {
+                Ok(Some(FastPathResponse::Direct(answer))) => answer,
+                Ok(Some(FastPathResponse::CacheHit {
+                    cached,
+                    tx_id,
+                    elapsed_secs,
+                })) => {
+                    write_cache_hit(reply, &cached, tx_id, elapsed_secs);
+                    return OnTheSpot::Reply;
                 }
+                Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) => {
+                    return OnTheSpot::Forward(Some(pre_parsed));
+                }
+                Ok(None) => return OnTheSpot::Forward(None),
+                // 快速解析读过的查询才会出错，SERVFAIL 照线上格式拼，不必再解析
+                // Only a query the quick parse read can fail here, so the SERVFAIL is put
+                // together on the wire with no parse
+                Err(error) => {
+                    debug!(%error, "{} fast-path error, returning SERVFAIL", self.listener_name());
+                    proto_utils::servfail_reply(packet)
+                }
+            }
+        } else {
+            match proto_utils::header_reply(packet) {
+                Some(refused) => refused,
+                None => return OnTheSpot::Drop,
             }
         };
         reply.clear();
         reply.extend_from_slice(&answer);
-        OnTheSpot::Answered
+        OnTheSpot::Reply
     }
 
-    /// 快速路径没能当场回答的查询：在整体请求时限内走完整处理。出错或超时时记一条日志、返回
-    /// None，由监听器回它自己的 SERVFAIL。`pre_parsed` 为 None 时快速解析没成，从头解析。
+    /// 快速路径没能当场回答的查询：在整体请求时限内走完整处理。出错或超时时记一条日志：超时回 SERVFAIL（见
+    /// `proto_utils::servfail_reply`），出错时读不了的查询回 FORMERR、读得了的回 SERVFAIL（见 [`failure_reply`]）。`pre_parsed`
+    /// 为 None 时快速解析没成，从头解析。
     /// A query the fast path could not answer on the spot: the full path within the overall
-    /// request timeout. On an error or a timeout it logs and returns None, and the listener
-    /// answers its own SERVFAIL. With `pre_parsed` None the quick parse failed, and the query
-    /// is parsed from scratch.
+    /// request timeout. An error or a timeout is logged: a timeout gets SERVFAIL (see
+    /// `proto_utils::servfail_reply`), and an error FORMERR for a query that cannot be read and
+    /// SERVFAIL for one that can (see [`failure_reply`]). With `pre_parsed` None the quick parse
+    /// failed, and the query is parsed from scratch.
     pub async fn answer_after_fast_path(
         &self,
         packet: &[u8],
         peer: SocketAddr,
         pre_parsed: Option<PreParsedData>,
-    ) -> Option<Bytes> {
+    ) -> Bytes {
         // 每个查询重新取整体请求时限（含 hedge 与 TCP fallback）。RFC 7766 的客户端会把一条连接用
         // 很久，热重载改了 request_timeout 之后，这条连接上的后续查询必须跟着新值走。
         // Re-read the overall request timeout (hedge and TCP fallback included) per query. An
@@ -107,9 +118,10 @@ impl Engine {
         .await;
         let listener = self.listener_name();
         match answered {
-            Ok(Ok(answer)) => return Some(answer),
+            Ok(Ok(answer)) => answer,
             Ok(Err(error)) => {
-                debug!(%error, "{listener} request processing error, returning SERVFAIL");
+                debug!(%error, "{listener} request processing error");
+                failure_reply(packet)
             }
             Err(_) => {
                 crate::warn_sparse!(
@@ -117,19 +129,9 @@ impl Engine {
                     upstream_timeout_ms = self.get_upstream_timeout_ms(),
                     "{listener} request timeout"
                 );
+                proto_utils::servfail_reply(packet)
             }
         }
-        None
-    }
-
-    /// 快速路径出错：记一条日志，由监听器回它自己的 SERVFAIL
-    /// The fast path failed: log it, and the listener answers its own SERVFAIL
-    fn log_fast_path_error(&self, error: &anyhow::Error) {
-        debug!(
-            %error,
-            "{} fast-path error, returning SERVFAIL for valid query",
-            self.listener_name()
-        );
     }
 
     /// 日志里的监听器名 / The listener's name in the logs
@@ -140,5 +142,19 @@ impl Engine {
             Some(ClientTransport::Doh) => "DoH",
             None => "DNS",
         }
+    }
+}
+
+/// 完整路径出错时的回答：读不了的查询回 FORMERR（RFC 6891 第 6.1.1 节，见 `proto_utils::formerr_reply`），读得了的回
+/// SERVFAIL（见 `proto_utils::servfail_reply`）。只有出错时才为分辨这两种解析一遍，过载拒绝和超时都不必
+/// The answer when the full path fails: FORMERR for a query that cannot be read (RFC 6891
+/// section 6.1.1, see `proto_utils::formerr_reply`), SERVFAIL for one that can (see
+/// `proto_utils::servfail_reply`). Only a failure parses the query to tell the two apart;
+/// refusals under overload and timeouts need not
+fn failure_reply(packet: &[u8]) -> Bytes {
+    if proto_utils::question_name_readable(packet) && Message::from_bytes(packet).is_ok() {
+        proto_utils::servfail_reply(packet)
+    } else {
+        proto_utils::formerr_reply(packet)
     }
 }

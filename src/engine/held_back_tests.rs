@@ -68,7 +68,7 @@ async fn know_answers_are_quick(engine: &Arc<Engine>) {
     for n in 0..20 {
         let (_, answered) =
             ask_as_a_listener(engine, format!("quick{n}.alive.test."), client(9)).await;
-        assert_eq!(answered, Some(ResponseCode::NoError));
+        assert_eq!(answered, ResponseCode::NoError);
     }
 }
 
@@ -266,7 +266,7 @@ async fn a_flood_of_names_failing_late_is_held_by_the_share_of_stuck_queries() {
     let sent = failing.queries();
     let started = Instant::now();
     let (_, answered) = ask_as_a_listener(&engine, "more.dead.test.".to_string(), client(1)).await;
-    assert_eq!(answered, Some(ResponseCode::ServFail));
+    assert_eq!(answered, ResponseCode::ServFail);
     assert!(
         started.elapsed() < Duration::from_millis(100),
         "answered without waiting on the upstream, took {:?}",
@@ -274,7 +274,7 @@ async fn a_flood_of_names_failing_late_is_held_by_the_share_of_stuck_queries() {
     );
     assert_eq!(failing.queries(), sent, "not sent upstream");
     for one in flood {
-        assert_eq!(one.await.unwrap().1, Some(ResponseCode::ServFail));
+        assert_eq!(one.await.unwrap().1, ResponseCode::ServFail);
     }
 }
 
@@ -292,19 +292,19 @@ async fn without_flow_control_no_device_is_held_back() {
     assert!(dead.queries() > sent, "still sent upstream");
 }
 
-/// 像监听器那样走完整路径，返回等了多久，以及应答的 RCODE（等到请求的时限时没有应答，是 None）
+/// 像监听器那样走完整路径，返回等了多久，以及应答的 RCODE（等到请求的时限时是 SERVFAIL）
 /// Through the full path as a listener goes, giving how long it took and the answer's RCODE
-/// (None with no answer, at the request timeout)
+/// (SERVFAIL at the request timeout)
 async fn ask_as_a_listener(
     engine: &Arc<Engine>,
     name: String,
     from: SocketAddr,
-) -> (Duration, Option<ResponseCode>) {
+) -> (Duration, ResponseCode) {
     let started = Instant::now();
     let answer = engine
         .answer_after_fast_path(&query(&name), from, None)
         .await;
-    (started.elapsed(), answer.map(|answer| rcode(&answer)))
+    (started.elapsed(), rcode(&answer))
 }
 
 /// `from` 一下子问 `dead.test` 下的 `count` 个不同名字，不等结果 / `from` asks `count` different names
@@ -314,7 +314,7 @@ fn flood(
     from: SocketAddr,
     tag: &'static str,
     count: usize,
-) -> Vec<tokio::task::JoinHandle<(Duration, Option<ResponseCode>)>> {
+) -> Vec<tokio::task::JoinHandle<(Duration, ResponseCode)>> {
     (0..count)
         .map(|n| {
             let engine = Arc::clone(engine);
@@ -337,7 +337,7 @@ async fn flood_reaching(
     tag: &'static str,
     count: usize,
     upstream: &Upstream,
-) -> Vec<tokio::task::JoinHandle<(Duration, Option<ResponseCode>)>> {
+) -> Vec<tokio::task::JoinHandle<(Duration, ResponseCode)>> {
     const LOT: usize = 50;
     let before = upstream.queries();
     let mut asked = Vec::with_capacity(count);
@@ -376,7 +376,7 @@ async fn stuck_queries_past_a_devices_share_give_up_early() {
     let mut gave_up_early = 0;
     for one in flood {
         let (took, answered) = one.await.unwrap();
-        assert_eq!(answered, Some(ResponseCode::ServFail));
+        assert_eq!(answered, ResponseCode::ServFail);
         if took < Duration::from_millis(1500) {
             gave_up_early += 1;
         }
@@ -386,7 +386,7 @@ async fn stuck_queries_past_a_devices_share_give_up_early() {
         "{gave_up_early} gave up early"
     );
     let (took, answered) = other.await.unwrap();
-    assert_eq!(answered, Some(ResponseCode::ServFail));
+    assert_eq!(answered, ResponseCode::ServFail);
     assert!(
         took >= Duration::from_millis(2000),
         "another device's waits out the upstream, took {took:?}"
@@ -435,7 +435,7 @@ async fn an_answer_won_by_resending_is_noted_by_its_own_exchange() {
     for n in 0..8 {
         let (took, answered) =
             ask_as_a_listener(&engine, format!("again{n}.dead.test."), client(1)).await;
-        assert_eq!(answered, Some(ResponseCode::NoError));
+        assert_eq!(answered, ResponseCode::NoError);
         assert!(took >= Duration::from_millis(50), "took {took:?}");
     }
     // 记的要是查询一共等了多久，头一个的 300 多毫秒让这里至少是 600 毫秒 / Had how long each query
@@ -486,12 +486,12 @@ async fn a_slow_upstream_is_not_stuck_once_its_answers_arrive() {
     know_answers_are_quick(&engine).await;
     let stuck_after = || engine.permit_manager.stuck_after(&slow.address, LIMIT);
     let quick = stuck_after();
-    let outcomes = |asked: Vec<tokio::task::JoinHandle<(Duration, Option<ResponseCode>)>>| async {
+    let outcomes = |asked: Vec<tokio::task::JoinHandle<(Duration, ResponseCode)>>| async {
         let (mut answered, mut gave_up) = (0, 0);
         for one in asked {
             match one.await.unwrap().1 {
-                Some(ResponseCode::NoError) => answered += 1,
-                Some(ResponseCode::ServFail) => gave_up += 1,
+                ResponseCode::NoError => answered += 1,
+                ResponseCode::ServFail => gave_up += 1,
                 other => panic!("{other:?}"),
             }
         }
@@ -563,11 +563,11 @@ async fn a_slow_upstreams_failure_replies_are_judged_by_its_own_answers() {
             })
             .collect();
         for one in quick {
-            assert_eq!(one.await.unwrap().1, Some(ResponseCode::NoError));
+            assert_eq!(one.await.unwrap().1, ResponseCode::NoError);
         }
     }
     for one in flood(&engine, client(9), "fine", 16) {
-        assert_eq!(one.await.unwrap().1, Some(ResponseCode::NoError));
+        assert_eq!(one.await.unwrap().1, ResponseCode::NoError);
     }
     let limit = Duration::from_millis(2000);
     let manager = &engine.permit_manager;
@@ -588,11 +588,11 @@ async fn a_slow_upstreams_failure_replies_are_judged_by_its_own_answers() {
     );
 
     for one in flood(&engine, client(1), "broken", 100) {
-        assert_eq!(one.await.unwrap().1, Some(ResponseCode::ServFail));
+        assert_eq!(one.await.unwrap().1, ResponseCode::ServFail);
     }
     let sent = slow.queries();
     let (_, answered) = ask_as_a_listener(&engine, "fine.dead.test.".to_string(), client(1)).await;
-    assert_eq!(answered, Some(ResponseCode::NoError), "not held back");
+    assert_eq!(answered, ResponseCode::NoError, "not held back");
     assert!(slow.queries() > sent, "sent upstream");
 }
 
@@ -626,12 +626,12 @@ async fn another_device_waiting_on_the_same_forward_asks_for_itself() {
         ask_as_a_listener(&engine, "same.dead.test.".to_string(), client(2)).await;
     assert_eq!(
         answered,
-        Some(ResponseCode::NoError),
+        ResponseCode::NoError,
         "the other device is answered"
     );
     assert!(waited >= Duration::from_millis(400), "took {waited:?}");
     let (took, answered) = leader.await.unwrap();
-    assert_eq!(answered, Some(ResponseCode::ServFail));
+    assert_eq!(answered, ResponseCode::ServFail);
     assert!(took < Duration::from_millis(350), "gave up, took {took:?}");
     drop(kept);
 }
@@ -663,7 +663,7 @@ async fn a_wait_on_another_devices_forward_gives_up_as_its_own_would() {
     let sent = dead.queries();
     let (took, answered) =
         ask_as_a_listener(&engine, "same.dead.test.".to_string(), client(1)).await;
-    assert_eq!(answered, Some(ResponseCode::ServFail));
+    assert_eq!(answered, ResponseCode::ServFail);
     assert!(
         took >= Duration::from_millis(80) && took < Duration::from_millis(1000),
         "gave up when stuck, took {took:?}"
@@ -767,7 +767,7 @@ async fn the_other_device_is_answered_when_a_held_back_one_led(
         "pipelines": pipelines(&first, &second),
     })));
     for one in flood(&engine, client(1), "held", 64) {
-        assert_ne!(one.await.unwrap().1, Some(ResponseCode::NoError));
+        assert_ne!(one.await.unwrap().1, ResponseCode::NoError);
     }
     second.silence(false);
 
@@ -782,12 +782,12 @@ async fn the_other_device_is_answered_when_a_held_back_one_led(
     let (_, answered) = ask_as_a_listener(&engine, "same.test.".to_string(), client(2)).await;
     assert_eq!(
         answered,
-        Some(ResponseCode::NoError),
+        ResponseCode::NoError,
         "the other device is answered"
     );
     assert_ne!(
         leader.await.unwrap().1,
-        Some(ResponseCode::NoError),
+        ResponseCode::NoError,
         "the leader was held back"
     );
 }
@@ -943,13 +943,13 @@ async fn a_forward_kept_back_after_a_response_jump_logs_no_warning() {
         ]
     })));
     for one in flood(&engine, client(1), "held", 64) {
-        assert_ne!(one.await.unwrap().1, Some(ResponseCode::NoError));
+        assert_ne!(one.await.unwrap().1, ResponseCode::NoError);
     }
     let sent = second.queries();
     let (warnings, guard) = Warnings::capture();
     for n in 0..20 {
         let (_, answered) = ask_as_a_listener(&engine, format!("more{n}.test."), client(1)).await;
-        assert_eq!(answered, Some(ResponseCode::ServFail));
+        assert_eq!(answered, ResponseCode::ServFail);
     }
     drop(guard);
     assert_eq!(second.queries(), sent, "none of them sent upstream");

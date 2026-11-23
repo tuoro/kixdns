@@ -18,7 +18,6 @@ use hickory_proto::serialize::binary::BinDecodable;
 use crate::engine::test_support::{
     self as support, STATIC, Upstream, first_a, peer, static_or_forward,
 };
-use crate::engine::utils::engine_helpers;
 use crate::engine::{Engine, FastPathResponse};
 
 /// 假上游给的地址 / The address the fake upstream answers
@@ -302,16 +301,9 @@ fn a_listener_servfail_carries_what_its_query_asked() {
             ..answered(asked, ANSWER)
         };
         assert_eq!(
-            read(
-                &engine_helpers::try_build_servfail_response_from_wire(&packet).expect("SERVFAIL")
-            ),
+            read(&crate::proto_utils::servfail_reply(&packet)),
             servfail,
             "{asked:?}"
-        );
-        assert_eq!(
-            read(&engine_helpers::build_servfail_response_from_wire(&packet)),
-            servfail,
-            "{asked:?}, from wire"
         );
     }
 }

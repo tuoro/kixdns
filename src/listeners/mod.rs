@@ -8,9 +8,9 @@ use crate::config::ListenerConfig;
 use crate::doh_server::{DohCertificate, run_doh};
 use crate::engine::concurrency::QUEUE_TARGET;
 use crate::engine::fair_queue::{Device, FairQueue};
-use crate::engine::{Engine, OnTheSpot, PreParsedData, engine_helpers};
+use crate::engine::{Engine, OnTheSpot, PreParsedData};
 use crate::observe::ClientTransport;
-use crate::proto_utils::{header_reply, is_standard_query_header, truncate_udp_response};
+use crate::proto_utils::{servfail_reply, truncate_udp_response};
 #[cfg(target_os = "linux")]
 use crate::socket_utils::udp_batch;
 #[cfg(unix)]
@@ -33,7 +33,7 @@ struct BoundUdp {
 /// 绑定好、还没开始答的监听口 / Listeners bound and not answering yet
 pub struct BoundListeners {
     udp: Vec<BoundUdp>,
-    tcp: Vec<(TcpListener, &'static str)>,
+    tcp: Vec<TcpListener>,
     doh: Option<BoundDoh>,
 }
 
@@ -41,7 +41,7 @@ pub struct BoundListeners {
 /// Inbound DoH, bound and with its certificate read: for `[::]` one listener for IPv4 and one
 /// for IPv6 (see [`bind_tcp_listeners`]), sharing one certificate
 struct BoundDoh {
-    listeners: Vec<(TcpListener, &'static str)>,
+    listeners: Vec<TcpListener>,
     certificate: Arc<DohCertificate>,
     path: Arc<str>,
 }
@@ -95,19 +95,18 @@ impl BoundListeners {
             for (worker_id, socket) in sockets.into_iter().enumerate() {
                 let engine = engine.clone();
                 all_handles.push(tokio::spawn(async move {
-                    if let Err(err) = run_udp_worker(worker_id, socket, engine).await {
-                        error!(worker_id, error = %err, "{family} udp worker exited");
-                    }
+                    run_udp_worker(worker_id, socket, engine).await
                 }));
             }
         }
 
-        for (listener, family) in self.tcp {
-            all_handles.push(spawn_tcp(listener, engine.clone(), family));
+        for listener in self.tcp {
+            let engine = engine.clone();
+            all_handles.push(tokio::spawn(async move { run_tcp(listener, engine).await }));
         }
 
         if let Some(doh) = self.doh {
-            for (listener, _) in doh.listeners {
+            for listener in doh.listeners {
                 let (certificate, engine) = (Arc::clone(&doh.certificate), engine.clone());
                 let path = Arc::clone(&doh.path);
                 all_handles.push(tokio::spawn(async move {
@@ -123,12 +122,10 @@ impl BoundListeners {
 /// Opens the TCP listeners on `addr`, for TCP and inbound DoH alike, split as for UDP by
 /// [`listen_addrs`]. Inbound DoH used to bind `[::]` alone, leaving IPv4 clients out on the
 /// BSDs with no way to write it that took both
-fn bind_tcp_listeners(addr: SocketAddr) -> anyhow::Result<Vec<(TcpListener, &'static str)>> {
+fn bind_tcp_listeners(addr: SocketAddr) -> anyhow::Result<Vec<TcpListener>> {
     listen_addrs(addr)
         .map(|(addr, family)| {
-            let listener =
-                tcp_listener(addr).with_context(|| format!("bind {family} TCP listener {addr}"))?;
-            Ok((listener, family))
+            tcp_listener(addr).with_context(|| format!("bind {family} TCP listener {addr}"))
         })
         .collect()
 }
@@ -448,11 +445,7 @@ impl PendingReplies {
 }
 
 /// 高性能 UDP worker：直接在接收循环中处理请求，避免 spawn 开销 / High-performance UDP worker: process requests directly in receive loop, avoiding spawn overhead
-async fn run_udp_worker(
-    worker_id: usize,
-    socket: Arc<UdpSocket>,
-    engine: Engine,
-) -> anyhow::Result<()> {
+async fn run_udp_worker(worker_id: usize, socket: Arc<UdpSocket>, engine: Engine) -> ! {
     // 共享不复制：要等上游的查询各自起一个任务，每个只加一次引用计数，不复制整个 Engine（二十多个 Arc）
     // Shared, not copied: each query that waits on an upstream gets its own task, which takes one
     // reference count instead of a copy of the whole Engine (twenty-odd Arcs)
@@ -806,22 +799,13 @@ impl<'a> UdpAnswering<'a> {
         }
     }
 
-    /// 处理收到的一个报文。快速路径当场答得上的（缓存命中、静态规则、解析出错的 SERVFAIL），把回答写进 `reply`
-    /// 并返回 true，超过客户端上限的已经截断；要等上游的交给单独的任务，不是查询的丢掉，都返回 false。
-    /// Handles one received datagram. What the fast path answers on the spot (a cache hit, a static rule, the
-    /// SERVFAIL for an error) is written to `reply`, already cut to the client's limit, and gives true; a query
-    /// that waits on an upstream goes to its own task and anything that is not a query is dropped, both giving false.
+    /// 处理收到的一个报文。快速路径当场答得上的（见 `Engine::on_the_spot`）写进 `reply` 并返回 true，超过客户端上限的已经
+    /// 截断；要等上游的交给单独的任务，应答和太短的报文丢掉，都返回 false。
+    /// Handles one received datagram. What the fast path answers on the spot (see
+    /// `Engine::on_the_spot`) is written to `reply`, already cut to the client's limit, and gives
+    /// true; a query that waits on an upstream goes to its own task and a response or a message
+    /// too short is dropped, both giving false.
     fn answer(&mut self, packet: &[u8], to: impl Into<ReplyTo>, reply: &mut BytesMut) -> bool {
-        if !is_standard_query_header(packet) {
-            // 别的操作码回 NOTIMP，问题数不对回 FORMERR，应答丢掉（见 `header_reply`）/ Another opcode gets
-            // NOTIMP, a wrong question count FORMERR, and a response is dropped (see `header_reply`)
-            let Some(refused) = header_reply(packet) else {
-                return false;
-            };
-            reply.clear();
-            reply.extend_from_slice(&refused);
-            return true;
-        }
         let to = to.into();
         let peer = to.peer;
         self.request_count += 1;
@@ -830,7 +814,7 @@ impl<'a> UdpAnswering<'a> {
             self.shrink_buffer_if_overflowing();
         }
         match self.engine.on_the_spot(packet, peer, reply) {
-            OnTheSpot::Answered => {}
+            OnTheSpot::Reply => {}
             // 要等上游的放进它自己的任务，带着快速路径解析出的内容 / One that waits on an upstream goes to
             // its own task, with what the fast path parsed
             OnTheSpot::Forward(pre_parsed) => {
@@ -838,7 +822,7 @@ impl<'a> UdpAnswering<'a> {
                 self.refused |= !spawn_udp_answer(self, packet, to, pre_parsed);
                 return false;
             }
-            OnTheSpot::Unanswered => return false,
+            OnTheSpot::Drop => return false,
         }
         // 截断超限响应，避免 UDP 报文超过客户端声明上限 / Truncate to the client's advertised UDP limit
         if let Some(truncated) = truncate_udp_response(packet, reply) {
@@ -1352,17 +1336,14 @@ async fn receive_one_by_one_reading_drops(
     }
 }
 
-/// 要等上游的查询交给单独的任务，在请求时限内回答，答不上回 SERVFAIL。流控拒绝时（过载），
-/// 快速解析成了的立刻回一个现成的 SERVFAIL，非阻塞发送（发送缓冲满就丢掉，背压）；没成
-/// 的多半是畸形包，静默丢弃——过载时要做最便宜的拒绝，对已经解析失败的包再完整解析一遍只会加重过载，
-/// hickory 大概率同样失败。流控拒绝时返回 false。
-/// A query that waits on an upstream goes to its own task, answered within the request
-/// timeout and SERVFAIL when it cannot be. When flow control refuses it (overload), a query
-/// the quick parse read gets a ready-made SERVFAIL at
-/// once, sent without blocking (dropped when the send buffer is full, as backpressure); one
-/// it could not read is most likely malformed and dropped silently. Overload rejection must
-/// be cheap, and a full parse of an already-failed packet wastes CPU, as hickory most
-/// likely fails too. Gives false when flow control refused it.
+/// 要等上游的查询交给单独的任务，在请求时限内回答（见 `Engine::answer_after_fast_path`）。流控拒绝时（过载）立刻回
+/// SERVFAIL，照线上格式拼、不解析查询（见 `proto_utils::servfail_reply`），非阻塞发送，发送缓冲满就丢掉（背压）。流控
+/// 拒绝时返回 false。
+/// A query that waits on an upstream goes to its own task, answered within the request timeout
+/// (see `Engine::answer_after_fast_path`). When flow control refuses it (overload) it gets
+/// SERVFAIL at once, put together on the wire with no parse of the query (see
+/// `proto_utils::servfail_reply`), sent without blocking and dropped when the send buffer is
+/// full (backpressure). Gives false when flow control refused it.
 fn spawn_udp_answer(
     answering: &UdpAnswering<'_>,
     packet: bytes::Bytes,
@@ -1376,11 +1357,7 @@ fn spawn_udp_answer(
     let emptied_at = (!answering.taking_turns).then_some(answering.emptied_at);
     let permit = answering.engine.query_permit(emptied_at, peer.ip());
     let Some(permit) = permit else {
-        if let Some(pre_parsed) = pre_parsed
-            && let Ok(response) = pre_parsed.servfail(&packet)
-        {
-            try_send_udp_response(answering.socket, &packet, &response, to);
-        }
+        try_send_udp_response(answering.socket, &packet, &servfail_reply(&packet), to);
         return false;
     };
     let engine = Arc::clone(answering.engine);
@@ -1396,18 +1373,12 @@ fn spawn_udp_answer(
         if let (Some(queued_at), Some(flow)) = (queued_at, &engine.flow_control_state) {
             flow.note_queue_delay(queued_at.elapsed());
         }
-        // 答不上（处理失败、超时）回 SERVFAIL，读不了回 FORMERR / SERVFAIL when no answer came (a failure, a timeout), FORMERR when the query cannot be read
-        let response = match engine
-            .answer_after_fast_path(&packet, peer, pre_parsed)
-            .await
-        {
-            Some(response) => response,
-            None => match engine_helpers::try_build_listener_failure_from_wire(&packet) {
-                Some(failure) => failure,
-                None => return,
-            },
-        };
-        let response = udp_reply(&packet, response);
+        let response = udp_reply(
+            &packet,
+            engine
+                .answer_after_fast_path(&packet, peer, pre_parsed)
+                .await,
+        );
         if !pending.try_queue(&response, to)
             && let Err(error) = send_udp_datagram(&socket, &response, to).await
         {
@@ -1434,7 +1405,7 @@ fn spawn_udp_answer(
 }
 
 mod tcp;
-use tcp::spawn_tcp;
+use tcp::run_tcp;
 
 #[cfg(test)]
 mod tests;
