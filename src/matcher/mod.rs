@@ -1886,22 +1886,47 @@ fn parse_dns_class(v: &str) -> anyhow::Result<DNSClass> {
     Ok(parsed)
 }
 
+/// `qtype`、`response_type` 写的类型：hickory 认得的名字（HTTPS、SVCB、CAA、ANY……），或者 RFC 3597 的 `TYPEnnn`。以前只认
+/// 十种，「HTTPS 查询回 NODATA」这样的规则写不出来，整份配置被拒
+/// The type a `qtype` or `response_type` writes: a name hickory knows (HTTPS, SVCB, CAA, ANY…),
+/// or RFC 3597's `TYPEnnn`. Only ten used to be known, so a rule like "answer HTTPS queries
+/// with NODATA" could not be written and the whole configuration was refused
 fn parse_dns_type(v: &str) -> anyhow::Result<RecordType> {
     let upper = v.to_ascii_uppercase();
-    let parsed = match upper.as_str() {
-        "A" => RecordType::A,
-        "AAAA" => RecordType::AAAA,
-        "CNAME" => RecordType::CNAME,
-        "MX" => RecordType::MX,
-        "TXT" => RecordType::TXT,
-        "NS" => RecordType::NS,
-        "PTR" => RecordType::PTR,
-        "SOA" => RecordType::SOA,
-        "SRV" => RecordType::SRV,
-        "OPT" => RecordType::OPT,
-        _ => anyhow::bail!("unsupported qtype: {upper}"),
-    };
-    Ok(parsed)
+    if let Some(code) = upper
+        .strip_prefix("TYPE")
+        .and_then(|code| code.parse::<u16>().ok())
+    {
+        return Ok(RecordType::from(code));
+    }
+    <RecordType as std::str::FromStr>::from_str(&upper)
+        .map_err(|_| anyhow::anyhow!("unsupported qtype: {upper}"))
+}
+
+#[cfg(test)]
+mod dns_type_tests {
+    use super::parse_dns_type;
+    use hickory_proto::rr::RecordType;
+
+    /// hickory 认得的类型名都能写，大小写不论，还能写 `TYPEnnn`；不认得的照旧是错。以前只认十种，HTTPS、SVCB 写不出来
+    /// Every type name hickory knows can be written, in any case, and `TYPEnnn` too; an unknown
+    /// one is still an error. Only ten used to be known, HTTPS and SVCB among those that were not
+    #[test]
+    fn query_types_go_by_name_or_number() {
+        for (written, expected) in [
+            ("HTTPS", RecordType::HTTPS),
+            ("svcb", RecordType::SVCB),
+            ("CAA", RecordType::CAA),
+            ("ANY", RecordType::ANY),
+            ("a", RecordType::A),
+            ("TYPE65", RecordType::HTTPS),
+            ("type4321", RecordType::Unknown(4321)),
+        ] {
+            assert_eq!(parse_dns_type(written).unwrap(), expected, "{written}");
+        }
+        assert!(parse_dns_type("HTTPSS").is_err());
+        assert!(parse_dns_type("TYPE70000").is_err());
+    }
 }
 
 #[cfg(test)]

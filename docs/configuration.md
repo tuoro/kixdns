@@ -89,7 +89,7 @@ pipeline_select 的每项包含 Pipeline id、可选的匹配器列表和可选�
 | geo_site_not | value：GeoSite tag |
 | geoip_country | country_codes：字符串数组 |
 | geoip_private | expect：布尔值 |
-| qtype | value：A、AAAA、CNAME、MX、TXT、NS、PTR、SOA、SRV 或 OPT |
+| qtype | value：记录类型名（A、AAAA、CNAME、HTTPS、SVCB、CAA、ANY 等，大小写不论），或 RFC 3597 的 `TYPE65` 这样的数字写法 |
 
 Pipeline selector 支持上表全部类型；请求规则支持除 listener_label 之外的全部类型。
 
@@ -144,7 +144,7 @@ upstream_equals 和 response_upstream_ip 看的是这次实际作答的上游：
 
 ### 逻辑运算符
 
-运算符从左到右计算，第一个匹配器作为初始结果。
+运算符从左到右计算，第一个匹配器作为初始结果：它身上写的 and_not、or_not（not）前面没有东西可合，也不把它取反；只有一个匹配器时，规则级的取反也一样白写。这两种写法作为配置问题报出来（启动时警告、照旧加载，重载和面板保存时拒绝）。要匹配某个条件不成立的查询，前面放一个 `{"type": "any"}`，再对它写 and_not。
 
 | 运算符 | 含义 |
 |---|---|
