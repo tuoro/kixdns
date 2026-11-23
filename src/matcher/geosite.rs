@@ -10,6 +10,7 @@ use std::io::Read;
 
 use anyhow::Context;
 use hashbrown::HashTable;
+use prost::Message;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Deserialize;
@@ -794,78 +795,68 @@ enum DatEntry {
     Regex(String),
 }
 
-/// 一条 V2Ray Domain 消息里用到的字段（见 [`GeoSiteManager::read_domain`]）
-/// The fields of a V2Ray Domain message used here (see [`GeoSiteManager::read_domain`])
-struct V2rayDomain<'a> {
-    /// `type`，没写时是 0（关键词） / `type`, 0 (keyword) when left out
-    kind: usize,
-    /// `value`，没写时没有 / `value`, absent when left out
-    value: Option<&'a [u8]>,
-    /// 各个 `attribute` 的 key / The key of each `attribute`
-    attrs: Vec<String>,
+/// V2Ray 数据里的一条域名（`Domain`），只留这里用到的字段，用 prost 按 protobuf 的规矩解：字段头和长度都是
+/// 变长整数，字段不论先后，不认识的字段按线上类型跳过，长度越出消息就是坏数据，和 GeoIP 一样（见
+/// `geoip_proto`）。proto3 不写取默认值的字段：没有类型时是 0（Plain，即关键词），v2ray 数据里的关键词条目正是
+/// 这样写的；值为空时同样不写，这样的条目没有值
+/// One domain (`Domain`) of V2Ray data with just the fields used here, decoded by protobuf's
+/// rules with prost: keys and lengths are varints, fields come in any order, unknown fields
+/// are skipped by wire type, and a length running past the message means broken data, as for
+/// GeoIP (see `geoip_proto`). proto3 leaves out fields holding their default: without a type
+/// it is 0 (Plain, that is a keyword), which is exactly how keyword entries are written in
+/// v2ray data; an empty value is left out the same way, and such an entry has no value
+#[derive(Clone, PartialEq, prost::Message)]
+struct Domain {
+    /// `type`
+    #[prost(int32, tag = "1")]
+    kind: i32,
+    #[prost(string, tag = "2")]
+    value: String,
+    #[prost(message, repeated, tag = "3")]
+    attribute: Vec<Attribute>,
 }
 
-/// 跳过 `data` 里 `pos` 处一个线上类型为 `wire_type` 的字段值（字段头已经读过）。值越出 `data`、
-/// 或者线上类型不认识时为 Err
-/// Skips the value of one field of wire type `wire_type` at `pos` in `data` (its key
-/// already read). Err when the value runs past `data` or the wire type is unknown
-fn skip_field(data: &[u8], pos: &mut usize, wire_type: u8) -> anyhow::Result<()> {
-    match wire_type {
-        0 => {
-            parse_varint(data, pos)?;
+impl Domain {
+    /// 这条域名的条目和各个属性的 key（小写，供 `@attr` 筛选）；没有值时是 None
+    /// This domain's entry and the key of each attribute (lowercase, for `@attr` filtering);
+    /// None without a value
+    fn into_entry(self) -> Option<(DatEntry, Vec<String>)> {
+        if self.value.is_empty() {
+            return None;
         }
-        1 => {
-            if runs_past(*pos, 8, data.len()) {
-                anyhow::bail!("invalid domain data: incomplete fixed64");
+        let value = self.value;
+        // 根据 V2Ray Domain.Type 创建匹配器 / Create matcher based on V2Ray Domain.Type
+        let entry = match self.kind {
+            0 => DatEntry::Matcher(DomainMatcher::Keyword(value)), // Plain
+            1 => DatEntry::Regex(value),                           // Regex
+            2 => {
+                // RootDomain - 转换为 Suffix 匹配器 / Convert to Suffix matcher
+                DatEntry::Matcher(DomainMatcher::Suffix(format!(".{value}")))
             }
-            *pos += 8;
-        }
-        5 => {
-            if runs_past(*pos, 4, data.len()) {
-                anyhow::bail!("invalid domain data: incomplete fixed32");
+            3 => DatEntry::Matcher(DomainMatcher::Full(value)), // Full
+            kind => {
+                warn!(target = "geosite", type = kind,
+                     "unknown V2Ray domain type, using full matcher");
+                DatEntry::Matcher(DomainMatcher::Full(value))
             }
-            *pos += 4;
-        }
-        2 => {
-            let len = parse_varint(data, pos)?;
-            if runs_past(*pos, len, data.len()) {
-                anyhow::bail!("invalid domain data: incomplete length-delimited");
-            }
-            *pos += len;
-        }
-        _ => anyhow::bail!("unknown wire type: {}", wire_type),
+        };
+        let attrs = self
+            .attribute
+            .into_iter()
+            .map(|attribute| attribute.key.to_ascii_lowercase())
+            .collect();
+        Some((entry, attrs))
     }
-    Ok(())
 }
 
-/// Parse a V2Ray Domain.Attribute protobuf message to extract the key field
-/// Attribute { string key = 1; oneof typed_value { ... } }
-fn parse_attribute_key(data: &[u8]) -> Option<String> {
-    let mut pos = 0;
-    while pos < data.len() {
-        let field_tag = data[pos] >> 3;
-        let wire_type = data[pos] & 0x07;
-        pos += 1;
-
-        match field_tag {
-            1 => {
-                let len = parse_varint(data, &mut pos).ok()?;
-                if runs_past(pos, len, data.len()) {
-                    return None;
-                }
-                return std::str::from_utf8(&data[pos..pos + len])
-                    .ok()
-                    .map(|s| s.to_ascii_lowercase());
-            }
-            // 跳过越出 `data` 时，原来也是走出循环、得到 None / A skip past `data` left the loop
-            // with None before as well
-            _ => skip_field(data, &mut pos, wire_type).ok()?,
-        }
-    }
-    None
+/// `Domain.Attribute` 的 key；`typed_value` 用不到，跳过不解 / The key of a `Domain.Attribute`;
+/// its `typed_value` is not used and skipped undecoded
+#[derive(Clone, PartialEq, prost::Message)]
+struct Attribute {
+    #[prost(string, tag = "1")]
+    key: String,
 }
 
-/// 解析 varint / Parse varint
 /// .dat 文件的顺序读取：按需读出字段、跳过不要的部分，不把整个文件读进内存
 /// Sequential reading of a .dat file: fields are read as needed and the rest skipped, without
 /// reading the whole file into memory
@@ -888,24 +879,17 @@ impl DatReader {
         })
     }
 
-    /// 下一个字节，文件读完了是 None / The next byte, or None at the end of the file
-    fn byte(&mut self) -> anyhow::Result<Option<u8>> {
-        if self.pos >= self.len {
-            return Ok(None);
-        }
+    /// 下一个字节，必须有 / The next byte, which must be there
+    fn next_byte(&mut self) -> anyhow::Result<u8> {
+        anyhow::ensure!(self.pos < self.len, "unexpected end of file");
         let mut byte = [0u8];
         self.file.read_exact(&mut byte)?;
         self.pos += 1;
-        Ok(Some(byte[0]))
+        Ok(byte[0])
     }
 
-    /// 下一个字节，必须有 / The next byte, which must be there
-    fn next_byte(&mut self) -> anyhow::Result<u8> {
-        self.byte()?
-            .ok_or_else(|| anyhow::anyhow!("unexpected end of file"))
-    }
-
-    /// 和 [`parse_varint`] 一样读一个变长整数 / Reads a varint as [`parse_varint`] does
+    /// 读一个变长整数：最多 10 个字节，多了就是坏文件 / Reads a varint: 10 bytes at most,
+    /// more means a broken file
     fn varint(&mut self) -> anyhow::Result<usize> {
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {
@@ -916,6 +900,47 @@ impl DatReader {
             }
         }
         anyhow::bail!("invalid varint in .dat file")
+    }
+
+    /// 从当前位置往后读到 `end` 为止，找下一个字段号是 `number` 的字段，给出它的值有多长，读的位置停在值的开头；
+    /// 别的字段按线上类型跳过。字段头和长度都是变长整数。找的字段不是带长度的、哪个字段越出 `end`、线上类型不认识，
+    /// 都是坏文件：越出的字段以前让条目到此为止，余下的域名悄悄丢掉。读到 `end` 也没找到时是 None
+    /// Reads on from the current position up to `end` for the next field numbered `number`,
+    /// giving the length of its value with the position left where the value starts; other
+    /// fields are skipped by wire type. Keys and lengths are varints. The field not being
+    /// length-delimited, any field running past `end`, or a wire type not known means a
+    /// broken file: a field running past used to end its entry there, quietly dropping the
+    /// domains left. None when `end` is reached without finding it
+    fn next_field(&mut self, number: usize, end: usize) -> anyhow::Result<Option<usize>> {
+        while self.pos < end {
+            let key = self.varint()?;
+            let (field, wire_type) = (key >> 3, key & 0x07);
+            let len = match wire_type {
+                0 => {
+                    self.varint()?;
+                    0
+                }
+                1 => 8,
+                2 => self.varint()?,
+                5 => 4,
+                other => anyhow::bail!("invalid wire type {other} in .dat file"),
+            };
+            if runs_past(self.pos, len, end) {
+                anyhow::bail!(
+                    "truncated .dat file: field {field} at offset {} needs {len} bytes, past the end of its message at {end}",
+                    self.pos
+                );
+            }
+            if field == number {
+                anyhow::ensure!(
+                    wire_type == 2,
+                    "invalid wire type {wire_type} for field {number} in .dat file"
+                );
+                return Ok(Some(len));
+            }
+            self.seek_to(self.pos + len)?;
+        }
+        Ok(None)
     }
 
     /// 接下来的 `len` 个字节，读进 `buf` / The next `len` bytes, read into `buf`
@@ -934,24 +959,6 @@ impl DatReader {
         self.pos = pos;
         Ok(())
     }
-}
-
-/// 读一个变长整数：最多 10 个字节，多了就是坏文件 / Reads a varint: 10 bytes at most,
-/// more means a broken file
-fn parse_varint(data: &[u8], pos: &mut usize) -> anyhow::Result<usize> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        if *pos >= data.len() {
-            anyhow::bail!("unexpected end of file");
-        }
-        let byte = data[*pos];
-        *pos += 1;
-        value |= u64::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            return varint_len(value);
-        }
-    }
-    anyhow::bail!("invalid varint in .dat file")
 }
 
 /// 变长整数当作长度或位置用 / A varint used as a length or position
@@ -991,155 +998,6 @@ impl GeoSiteManager {
         let path = path.as_ref();
         let parsed = Self::parse_file(path, &[])?;
         Ok(self.apply_source(path, parsed))
-    }
-
-    /// 用完整解析器（见 [`Self::parse_dat_file`]）加载 .dat 文件里的每一个 tag，只给测试用
-    /// Load every tag of a .dat file with the full parser (see [`Self::parse_dat_file`]),
-    /// for tests only
-    #[cfg(test)]
-    pub fn load_from_dat_file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<usize> {
-        let path = path.as_ref();
-        let parsed = Self::parse_dat_file(path)?;
-        Ok(self.apply_source(path, parsed))
-    }
-
-    /// 完整解析器：一次读进整个 .dat 文件，解出每一个 tag，只给测试用。生产代码只用按需解析
-    /// （[`Self::parse_dat_file_selective`]，不点名 tag 时是 `parse_dat_file_every_tag`）；这一份是
-    /// 另写的实现，留作测试里的独立对照。
-    /// The full parser: reads a whole .dat file at once and decodes every tag, for tests
-    /// only. Production code only parses selectively ([`Self::parse_dat_file_selective`],
-    /// or `parse_dat_file_every_tag` when no tag is named); this separately written one
-    /// stays as an independent reference in tests.
-    #[cfg(test)]
-    pub fn parse_dat_file<P: AsRef<Path>>(path: P) -> anyhow::Result<ParsedGeoSite> {
-        let path = path.as_ref();
-
-        // 读取文件内容 / Read file content
-        let content =
-            fs::read(path).with_context(|| format!("read .dat file: {}", path.display()))?;
-
-        // V2Ray .dat 文件格式分析 / V2Ray .dat file format analysis
-        // 外层结构：repeated GeoSite 条目 / Outer structure: repeated GeoSite entries
-        // 每个 GeoSite 条目包含 / Each GeoSite entry contains:
-        //   - tag (string, field tag 0x0A)
-        //   - domains (repeated message, field tag 0x12)
-        //     每个域名包含 / Each domain contains:
-        //       - type (uint64, field tag 0x08)
-        //       - value (string, field tag 0x12)
-
-        let mut pos = 0;
-        let mut parsed: ParsedGeoSite = Vec::new();
-
-        while pos < content.len() {
-            // 读取外层字段标签 / Read outer field tag
-            let field_tag = content[pos];
-            pos += 1;
-
-            // 解析 varint 长度 / Parse varint length
-            let entry_len = parse_varint(&content, &mut pos)?;
-
-            // 文件被截断（写入中断或读到写了一半的覆盖）：拒绝整份文件，
-            // 否则调用方会把读到的那部分当成完整版本，文件里其余的 tag 就被删掉了。
-            // A truncated file (an interrupted write, or a half-written overwrite
-            // caught in the act) is rejected outright: otherwise the caller takes
-            // the part that was read as the complete file and drops every tag the
-            // rest of it holds.
-            if runs_past(pos, entry_len, content.len()) {
-                anyhow::bail!(
-                    "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
-                    content.len() - pos
-                );
-            }
-
-            let entry_end = pos + entry_len;
-
-            // field_tag = 0x0A 表示 GeoSite 条目 (field 1, wire type 2: string)
-            // field_tag = 0x0A indicates GeoSite entry (field 1, wire type 2: string)
-            if field_tag == 0x0A {
-                let mut tag = String::new();
-                // 这个条目的匹配器和条数 / This entry's matchers and how many
-                let (mut builder, mut domain_count) = (TagBuilder::default(), 0);
-
-                // 解析 GeoSite 条目内容 / Parse GeoSite entry content
-                while pos < entry_end {
-                    let inner_tag = content[pos];
-                    pos += 1;
-
-                    let inner_len = parse_varint(&content, &mut pos)?;
-
-                    if runs_past(pos, inner_len, entry_end) {
-                        break;
-                    }
-
-                    match inner_tag {
-                        // 0x0A: country_code (string, field 1)
-                        0x0A => {
-                            if let Ok(tag_str) = std::str::from_utf8(&content[pos..pos + inner_len])
-                            {
-                                tag = tag_str.to_string();
-                                tracing::debug!(target = "geosite", tag = %tag_str, "parsed GeoSite country_code");
-                            }
-                            pos += inner_len;
-                        }
-                        // 0x12: domain (repeated Domain message, field 2)
-                        0x12 => {
-                            // V2Ray 的 domain 字段是 repeated Domain 消息
-                            // V2Ray's domain field is repeated Domain messages
-                            // 每个 Domain 消息包含: type (field 1) 和 value (field 2)
-                            // Each Domain message contains: type (field 1) and value (field 2)
-                            let domains_data = &content[pos..pos + inner_len];
-                            match Self::parse_v2ray_domains(domains_data) {
-                                Ok(parsed) => {
-                                    let count = usize::from(parsed.is_some());
-                                    if let Some((entry, _)) = parsed {
-                                        builder.add_entry(entry);
-                                    }
-                                    domain_count += count;
-                                    tracing::debug!(target = "geosite", tag = %tag,
-                                                 count = count,
-                                                 "parsed domains from V2Ray protobuf format");
-                                }
-                                Err(err) => {
-                                    tracing::warn!(target = "geosite", tag = %tag, error = %err,
-                                                  "failed to parse V2Ray domains, skipping tag");
-                                }
-                            }
-                            pos += inner_len;
-                        }
-                        _ => {
-                            // 跳过未知字段 / Skip unknown field
-                            pos += inner_len;
-                        }
-                    }
-                }
-
-                // 使用解析好的 matchers / Use parsed matchers
-                if !tag.is_empty() && domain_count > 0 {
-                    tracing::info!(target = "geosite", tag = %tag,
-                                domain_count = domain_count,
-                                "loaded GeoSite tag with domains");
-                    // 将 tag 转换为小写以支持大小写不敏感的匹配 / Convert tag to lowercase for case-insensitive matching
-                    let tag_lower = tag.to_lowercase();
-                    tracing::debug!(target = "geosite", original_tag = %tag, tag_lower = %tag_lower,
-                                 "inserting tag into database");
-                    parsed.push((tag_lower, builder.finish()));
-                } else if !tag.is_empty() {
-                    tracing::warn!(target = "geosite", tag = %tag,
-                                  "tag has no valid domains, skipping");
-                }
-            } else {
-                // 跳过未知字段 / Skip unknown field
-                pos = entry_end;
-            }
-        }
-
-        // 根据实际加载的条数重建缓存
-        info!(
-            target = "geosite",
-            loaded_count = parsed.len(),
-            "loaded GeoSite data from V2Ray .dat file"
-        );
-        Ok(parsed)
     }
 
     /// 解析 JSON 格式的数据文件里 `tags` 点名的标签（不分大小写；不点名时每个标签都要），不触碰管理器状态。
@@ -1439,77 +1297,42 @@ impl GeoSiteManager {
         let mut field = Vec::new();
         let mut parsed: ParsedGeoSite = Vec::new();
 
-        while let Some(field_tag) = file.byte()? {
-            let entry_len = file.varint()?;
-            let pos = file.pos;
+        // GeoSiteList 顶层只有 `repeated GeoSite entry = 1`，别的字段跳过。条目越出文件（写入中断或读到写了一半的
+        // 覆盖）时整份文件拒绝，否则调用方会把读到的那部分当成完整版本，文件里其余的 tag 就被删掉了（见
+        // `DatReader::next_field`）
+        // GeoSiteList holds only `repeated GeoSite entry = 1` at the top; other fields are
+        // skipped. An entry running past the file (an interrupted write, or a half-written
+        // overwrite caught in the act) gets the whole file rejected: otherwise the caller
+        // takes the part that was read as the complete file and drops every tag the rest of
+        // it holds (see `DatReader::next_field`)
+        while let Some(entry_len) = file.next_field(1, file.len)? {
+            let entry_start = file.pos;
+            let entry_end = entry_start + entry_len;
 
-            // 文件被截断（写入中断或读到写了一半的覆盖）：拒绝整份文件，
-            // 否则调用方会把读到的那部分当成完整版本，文件里其余的 tag 就被删掉了。
-            // A truncated file (an interrupted write, or a half-written overwrite
-            // caught in the act) is rejected outright: otherwise the caller takes
-            // the part that was read as the complete file and drops every tag the
-            // rest of it holds.
-            if runs_past(pos, entry_len, file.len) {
-                anyhow::bail!(
-                    "truncated .dat file: entry at offset {pos} needs {entry_len} bytes, {} left",
-                    file.len - pos
-                );
-            }
-
-            let entry_start = pos;
-            let entry_end = pos + entry_len;
-
-            // field_tag = 0x0A 表示 GeoSite 条目 / 0x0A is a GeoSite entry
-            if field_tag != 0x0A {
-                file.seek_to(entry_end)?;
-                continue;
-            }
-            let mut tag = String::new();
-
-            // 先解析 tag，判断是否需要加载 / Parse tag first to check if we need to load it
-            // Clone matching requests out of the map to release the borrow before mutating self
-            let matching_requests: Option<Vec<(String, Vec<String>)>> = loop {
-                if file.pos >= entry_end {
-                    break None;
-                }
-                let inner_tag = file.next_byte()?;
-                let inner_len = file.varint()?;
-                if runs_past(file.pos, inner_len, entry_end) {
-                    break None;
-                }
-                // 0x0A: tag/country_code (string, field 1)
-                // 只看第一个 tag 字段：protobuf 规定同一个字段写了几次时取最后一个，可那样每个条目都得
-                // 把字段走完，不要的条目就没法读到 tag 就整段跳过；真实数据里每个条目只有一个 tag
-                // Only the first tag field counts: protobuf takes the last when a field is
-                // written more than once, but then every entry's fields would have to be walked
-                // and an unwanted entry could not be skipped whole once its tag is read; real
-                // data has one tag per entry
-                if inner_tag == 0x0A {
-                    file.read(&mut field, inner_len)?;
-                    if let Ok(tag_str) = std::str::from_utf8(&field) {
-                        tag = tag_str.to_string();
-                        let tag_lower = tag.to_lowercase();
-                        // Match against base tags (supports `@attr` split); with no tag named,
-                        // every non-empty tag is wanted
-                        let reqs = match tags {
-                            Some(_) => tag_requests.get(&tag_lower).cloned(),
-                            None => (!tag_lower.is_empty()).then(|| vec![(tag_lower, Vec::new())]),
-                        };
-                        if let Some(reqs) = reqs {
-                            debug!(target = "geosite", tag = %tag_str,
-                                  "loading requested tag");
-                            break Some(reqs);
-                        } else {
-                            debug!(target = "geosite", tag = %tag_str,
-                                   "skipping unwanted tag");
-                        }
+            // 先只读 tag（字段 1），判断这个条目要不要。只看第一个 tag 字段：protobuf 规定同一个字段写了几次时
+            // 取最后一个，可那样每个条目都得把字段走完，不要的条目就没法读到 tag 就整段跳过；真实数据里每个条目
+            // 只有一个 tag
+            // The tag (field 1) first, to tell whether the entry is wanted. Only the first tag
+            // field counts: protobuf takes the last when a field is written more than once,
+            // but then every entry's fields would have to be walked and an unwanted entry could
+            // not be skipped whole once its tag is read; real data has one tag per entry
+            let requests = match file.next_field(1, entry_end)? {
+                Some(len) => {
+                    file.read(&mut field, len)?;
+                    let tag = std::str::from_utf8(&field)
+                        .context("GeoSite tag in .dat file is not UTF-8")?
+                        .to_lowercase();
+                    debug!(target = "geosite", tag = %tag, "read GeoSite tag");
+                    // Match against base tags (supports `@attr` split); with no tag named,
+                    // every non-empty tag is wanted
+                    match tags {
+                        Some(_) => tag_requests.get(&tag).cloned(),
+                        None => (!tag.is_empty()).then(|| vec![(tag, Vec::new())]),
                     }
-                    break None;
                 }
-                file.seek_to(file.pos + inner_len)?;
+                None => None,
             };
-
-            let Some(requests) = matching_requests else {
+            let Some(requests) = requests else {
                 file.seek_to(entry_end)?;
                 continue;
             };
@@ -1528,37 +1351,21 @@ impl GeoSiteManager {
                 .map(|_| (TagBuilder::with_capacity(full, suffixes), 0))
                 .collect();
 
-            while file.pos < entry_end {
-                let inner_tag = file.next_byte()?;
-                let inner_len = file.varint()?;
-                if runs_past(file.pos, inner_len, entry_end) {
-                    break;
-                }
-                if inner_tag != 0x12 {
-                    file.seek_to(file.pos + inner_len)?;
+            // 读不出来的一条让整份文件被拒绝，和越出的字段一样；以前跳过它照样往下读
+            // A domain that cannot be read gets the whole file rejected, as a field running past
+            // does; it used to be skipped and reading went on
+            while let Some(len) = file.next_field(2, entry_end)? {
+                file.read(&mut field, len)?;
+                let Some((entry, attrs)) = Domain::decode(field.as_slice())?.into_entry() else {
                     continue;
-                }
-                file.read(&mut field, inner_len)?;
-                match Self::parse_v2ray_domains(&field) {
-                    Ok(domains) => {
-                        if let Some((entry, attrs)) = domains {
-                            for ((builder, count), (_, wanted)) in
-                                builders.iter_mut().zip(&requests)
-                            {
-                                if has_attrs(&attrs, wanted) {
-                                    builder.add_entry(entry.clone());
-                                    *count += 1;
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!(target = "geosite", tag = %tag, error = %err,
-                             "failed to parse V2Ray domains, skipping domain entry");
+                };
+                for ((builder, count), (_, wanted)) in builders.iter_mut().zip(&requests) {
+                    if has_attrs(&attrs, wanted) {
+                        builder.add_entry(entry.clone());
+                        *count += 1;
                     }
                 }
             }
-            file.seek_to(entry_end)?;
 
             // Store each request's tag under its original name
             // 每个请求的 tag 按原来的名字存放
@@ -1611,140 +1418,21 @@ impl GeoSiteManager {
         entry_end: usize,
     ) -> anyhow::Result<((usize, usize), (usize, usize))> {
         let (mut full, mut suffixes) = ((0, 0), (0, 0));
-        while file.pos < entry_end {
-            let inner_tag = file.next_byte()?;
-            let inner_len = file.varint()?;
-            if runs_past(file.pos, inner_len, entry_end) {
-                break;
-            }
-            if inner_tag != 0x12 {
-                file.seek_to(file.pos + inner_len)?;
-                continue;
-            }
-            file.read(field, inner_len)?;
-            match Self::domain_type_and_len(field) {
-                // 和 `parse_v2ray_domains` 一样：2 是后缀，3 和不认识的类型按完整域名
-                // As in `parse_v2ray_domains`: 2 is a suffix, 3 and unknown types are full names
-                Some((2, len)) => (suffixes.0, suffixes.1) = (suffixes.0 + 1, suffixes.1 + len),
-                Some((kind, len)) if kind >= 3 => (full.0, full.1) = (full.0 + 1, full.1 + len),
-                _ => {}
+        while let Some(len) = file.next_field(2, entry_end)? {
+            file.read(field, len)?;
+            let domain = Domain::decode(field.as_slice())?;
+            match (domain.kind, domain.value.len()) {
+                // 和 `Domain::into_entry` 一样：没有值的不算一条，0 和 1（关键词、正则）不存成名字，2 是后缀，
+                // 3 和不认识的类型按完整域名
+                // As in `Domain::into_entry`: one without a value is no entry, 0 and 1 (keywords,
+                // regexes) are not stored as names, 2 is a suffix, and 3 and unknown types are
+                // full names
+                (_, 0) | (0 | 1, _) => {}
+                (2, len) => (suffixes.0, suffixes.1) = (suffixes.0 + 1, suffixes.1 + len),
+                (_, len) => (full.0, full.1) = (full.0 + 1, full.1 + len),
             }
         }
         Ok((full, suffixes))
-    }
-
-    /// 一条 Domain 消息的类型和值的长度（见 [`Self::read_domain`]），给 [`Self::count_names`] 用
-    /// One Domain message's type and value length (see [`Self::read_domain`]), for
-    /// [`Self::count_names`]
-    fn domain_type_and_len(data: &[u8]) -> Option<(usize, usize)> {
-        let domain = Self::read_domain(data, false).ok()?;
-        Some((domain.kind, domain.value?.len()))
-    }
-
-    /// 读出一条 V2Ray Domain 消息的类型（字段 1）、值（字段 2）和属性（字段 3，`with_attrs` 时才取），字段不论先后。
-    /// proto3 不写取默认值的字段：没有字段 1 时类型是 0（Plain，即关键词），v2ray 数据里的关键词条目正是这样写的；
-    /// 值为空时同样不写，这样的条目没有值。
-    /// Reads one V2Ray Domain message's type (field 1), value (field 2) and attributes (field 3,
-    /// taken only `with_attrs`), in whatever order they come. proto3 leaves out fields holding
-    /// their default: without field 1 the type is 0 (Plain, that is a keyword), which is exactly
-    /// how keyword entries are written in v2ray data; an empty value is left out the same way, and
-    /// such an entry has no value.
-    fn read_domain(data: &[u8], with_attrs: bool) -> anyhow::Result<V2rayDomain<'_>> {
-        let mut domain = V2rayDomain {
-            kind: 0,
-            value: None,
-            attrs: Vec::new(),
-        };
-        let mut pos = 0;
-        while pos < data.len() {
-            // 读取 field tag 和 wire type / Read field tag and wire type
-            let field_tag = data[pos] >> 3;
-            let wire_type = data[pos] & 0x07;
-            pos += 1;
-
-            match field_tag {
-                1 => {
-                    // field 1: type (varint, wire_type 0)
-                    if wire_type != 0 {
-                        anyhow::bail!("invalid wire type for type field");
-                    }
-                    domain.kind = parse_varint(data, &mut pos)?;
-                }
-                2 => {
-                    // field 2: value (string, wire_type 2)
-                    if wire_type != 2 {
-                        anyhow::bail!("invalid wire type for value field");
-                    }
-                    let value_len = parse_varint(data, &mut pos)?;
-                    if runs_past(pos, value_len, data.len()) {
-                        anyhow::bail!("invalid domain data: incomplete value string");
-                    }
-                    domain.value = Some(&data[pos..pos + value_len]);
-                    pos += value_len;
-                }
-                3 => {
-                    // field 3: attribute (repeated Attribute message, wire_type 2)
-                    // Domain.Attribute { string key = 1; oneof typed_value { ... } }
-                    if wire_type != 2 {
-                        anyhow::bail!("invalid wire type for attribute field");
-                    }
-                    let attr_len = parse_varint(data, &mut pos)?;
-                    if runs_past(pos, attr_len, data.len()) {
-                        anyhow::bail!("invalid domain data: incomplete attribute");
-                    }
-                    if with_attrs && let Some(key) = parse_attribute_key(&data[pos..pos + attr_len])
-                    {
-                        domain.attrs.push(key);
-                    }
-                    pos += attr_len;
-                }
-                // 跳过未知字段 / Skip unknown field
-                _ => skip_field(data, &mut pos, wire_type)?,
-            }
-        }
-        Ok(domain)
-    }
-
-    /// 解析 V2Ray protobuf 格式的 Domain 消息列表 / Parse V2Ray protobuf format Domain message list
-    ///
-    /// V2Ray .dat 文件中的 domains 字段是 repeated Domain 消息
-    /// The domains field in V2Ray .dat file is repeated Domain messages
-    /// 每个 Domain 消息包含: type (field 1, varint) 和 value (field 2, string)
-    /// Each Domain message contains: type (field 1, varint) and value (field 2, string)
-    /// Returns the entry and its attribute keys, which enable `@attr` filtering; None for a
-    /// domain without a value
-    fn parse_v2ray_domains(data: &[u8]) -> anyhow::Result<Option<(DatEntry, Vec<String>)>> {
-        tracing::debug!(
-            target = "geosite",
-            data_len = data.len(),
-            "starting to parse V2Ray domains"
-        );
-
-        let domain = Self::read_domain(data, true)?;
-        let Some(value) = domain.value else {
-            return Ok(None);
-        };
-        let domain_value = String::from_utf8_lossy(value).into_owned();
-
-        // 根据 V2Ray Domain.Type 创建匹配器 / Create matcher based on V2Ray Domain.Type
-        let entry = match domain.kind {
-            0 => DatEntry::Matcher(DomainMatcher::Keyword(domain_value)), // Plain
-            1 => DatEntry::Regex(domain_value),                           // Regex
-            2 => {
-                // RootDomain - 转换为 Suffix 匹配器 / Convert to Suffix matcher
-                DatEntry::Matcher(DomainMatcher::Suffix(format!(".{}", domain_value)))
-            }
-            3 => DatEntry::Matcher(DomainMatcher::Full(domain_value)), // Full
-            kind => {
-                warn!(target = "geosite", type = kind,
-                     "unknown V2Ray domain type, using full matcher");
-                DatEntry::Matcher(DomainMatcher::Full(domain_value))
-            }
-        };
-
-        tracing::debug!(target = "geosite", "parsed V2Ray domains");
-
-        Ok(Some((entry, domain.attrs)))
     }
 
     /// 从 V2Ray 格式字符串加载 GeoSite 数据 / Load GeoSite data from V2Ray format string
@@ -1971,7 +1659,7 @@ mod tests {
         assert!(!tag.matches("b.example"));
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
         assert!(manager.matches("v", "a.example"));
         assert!(!manager.matches("v", "b.example"));
         assert!(!manager.has_tag("e"));
@@ -1994,7 +1682,7 @@ mod tests {
         assert!(!tag.matches("www.only.test"));
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
         assert!(manager.matches("g", "www.google.com"));
         assert!(manager.matches("g", "only.test"));
     }
@@ -2030,7 +1718,7 @@ mod tests {
         assert!(!tag.matches("cdnx.example.com"));
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
         assert!(manager.matches("r", "cdn7.example.com"));
         assert!(!manager.matches("r", "b.test"));
         assert!(!manager.matches("r", ""));
@@ -2050,14 +1738,14 @@ mod tests {
             ],
         );
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
         assert!(manager.matches("ads", "www.doubleclick.net"));
 
         write_dat(
             &dir,
             &[build_geosite("CN", &[build_domain(2, "qq.com", &[])])],
         );
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
 
         assert!(
             !manager.matches("ads", "www.doubleclick.net"),
@@ -2078,7 +1766,7 @@ mod tests {
             &[build_geosite("OLD", &[build_domain(2, "old.example", &[])])],
         );
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
 
         // One good entry followed by an unterminated varint.
         let mut corrupt =
@@ -2087,7 +1775,7 @@ mod tests {
         std::fs::write(&path, corrupt).unwrap();
 
         manager
-            .load_from_dat_file(&path)
+            .load_from_v2ray_file(&path)
             .expect_err("corrupt file must be rejected");
         assert!(
             manager.matches("old", "www.old.example"),
@@ -2125,14 +1813,14 @@ mod tests {
         let indirect = dir.path().join("sub").join("..").join("geosite.dat");
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&indirect).unwrap();
+        manager.load_from_v2ray_file(&indirect).unwrap();
         assert!(manager.matches("ads", "www.doubleclick.net"));
 
         write_dat(
             &dir,
             &[build_geosite("CN", &[build_domain(2, "qq.com", &[])])],
         );
-        manager.load_from_dat_file(&absolute).unwrap();
+        manager.load_from_v2ray_file(&absolute).unwrap();
 
         assert!(
             !manager.matches("ads", "www.doubleclick.net"),
@@ -2217,8 +1905,8 @@ mod tests {
         .unwrap();
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&a).unwrap();
-        manager.load_from_dat_file(&b).unwrap();
+        manager.load_from_v2ray_file(&a).unwrap();
+        manager.load_from_v2ray_file(&b).unwrap();
 
         // a.dat 去掉 ads，b.dat 原封不动 / ads leaves a.dat, b.dat is untouched
         std::fs::write(
@@ -2229,7 +1917,7 @@ mod tests {
             )]),
         )
         .unwrap();
-        manager.load_from_dat_file(&a).unwrap();
+        manager.load_from_v2ray_file(&a).unwrap();
 
         assert!(
             manager.has_tag("ads"),
@@ -2262,20 +1950,20 @@ mod tests {
         write_ads(&a, "from-a.example");
         write_ads(&b, "from-b.example");
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&a).unwrap();
-        manager.load_from_dat_file(&b).unwrap();
+        manager.load_from_v2ray_file(&a).unwrap();
+        manager.load_from_v2ray_file(&b).unwrap();
         assert!(manager.matches("ads", "www.from-b.example"));
         assert!(!manager.matches("ads", "www.from-a.example"));
 
         write_ads(&a, "again-from-a.example");
-        manager.load_from_dat_file(&a).unwrap();
+        manager.load_from_v2ray_file(&a).unwrap();
         assert!(manager.matches("ads", "www.from-b.example"));
         assert!(!manager.matches("ads", "www.again-from-a.example"));
 
         // 后面的文件不再声明它，才轮到前面那个现在的数据 / Only once the later file drops it does
         // the earlier one's present data have its turn
         std::fs::write(&b, build_dat(&[])).unwrap();
-        manager.load_from_dat_file(&b).unwrap();
+        manager.load_from_v2ray_file(&b).unwrap();
         assert!(manager.matches("ads", "www.again-from-a.example"));
         assert!(!manager.matches("ads", "www.from-b.example"));
     }
@@ -2293,12 +1981,12 @@ mod tests {
         write_ads(&last, "from-last.example");
         let mut manager = GeoSiteManager::new();
         for path in [&first, &second, &last] {
-            manager.load_from_dat_file(path).unwrap();
+            manager.load_from_v2ray_file(path).unwrap();
         }
         assert!(manager.matches("ads", "www.from-last.example"));
 
         std::fs::write(&last, build_dat(&[])).unwrap();
-        manager.load_from_dat_file(&last).unwrap();
+        manager.load_from_v2ray_file(&last).unwrap();
         assert!(manager.matches("ads", "www.from-second.example"));
         assert!(!manager.matches("ads", "www.from-first.example"));
         assert!(!manager.matches("ads", "www.from-last.example"));
@@ -2329,15 +2017,15 @@ mod tests {
         .unwrap();
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&a).unwrap();
+        manager.load_from_v2ray_file(&a).unwrap();
         // b.dat 后加载，此刻 ads 命中的是 b.dat 的数据
         // b.dat loads last, so ads matches b.dat's data at this point
-        manager.load_from_dat_file(&b).unwrap();
+        manager.load_from_v2ray_file(&b).unwrap();
         assert!(manager.matches("ads", "www.ads.example"));
 
         // b.dat 去掉 ads，只剩 a.dat 在提供 / ads leaves b.dat, only a.dat provides it
         std::fs::write(&b, build_dat(&[])).unwrap();
-        manager.load_from_dat_file(&b).unwrap();
+        manager.load_from_v2ray_file(&b).unwrap();
 
         assert!(
             manager.matches("ads", "www.doubleclick.net"),
@@ -2458,8 +2146,8 @@ mod tests {
         .unwrap();
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&a).unwrap();
-        manager.load_from_dat_file(&b).unwrap();
+        manager.load_from_v2ray_file(&a).unwrap();
+        manager.load_from_v2ray_file(&b).unwrap();
         assert!(manager.matches("ads", "www.ads.example"));
         assert!(manager.matches("track", "www.track.example"));
 
@@ -2472,7 +2160,7 @@ mod tests {
             )]),
         )
         .unwrap();
-        manager.load_from_dat_file(&b).unwrap();
+        manager.load_from_v2ray_file(&b).unwrap();
 
         assert!(
             manager.matches("ads", "www.doubleclick.net"),
@@ -2487,16 +2175,32 @@ mod tests {
         assert!(manager.matches("only-b", "www.only-b.example"));
     }
 
-    /// 不点名 tag 时（`parse_file` 拿到空的 tags），读出的标签和条目与完整解析器对同一份数据读出的一致：
+    /// 整个 GeoSiteList，测试里拿 prost 一次解出整份文件作对照 / A whole GeoSiteList: tests decode
+    /// a whole file at once with prost for reference
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct GeoSiteList {
+        #[prost(message, repeated, tag = "1")]
+        entry: Vec<GeoSite>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct GeoSite {
+        #[prost(string, tag = "1")]
+        country_code: String,
+        #[prost(message, repeated, tag = "2")]
+        domain: Vec<Domain>,
+    }
+
+    /// 不点名 tag 时（`parse_file` 拿到空的 tags），按条目读出的标签和条目与 prost 一次解出整份文件的结果一致：
     /// 标签的名字和先后、每个标签里的条目、匹配的结果。数据里有重复的 tag、空 tag、只有空值的 tag、
     /// 域名写在 tag 前面的条目，还有一个不是 GeoSite 条目的外层字段
-    /// With no tag named (`parse_file` given empty tags), the tags and entries read agree
-    /// with what the full parser reads from the same data: the tag names and their
-    /// order, each tag's entries, and what they match. The data has a repeated tag, an
+    /// With no tag named (`parse_file` given empty tags), the tags and entries read entry by
+    /// entry agree with what prost decodes from the whole file at once: the tag names and
+    /// their order, each tag's entries, and what they match. The data has a repeated tag, an
     /// empty tag, a tag of only valueless entries, an entry with its domains before its
     /// tag, and an outer field that is no GeoSite entry
     #[test]
-    fn every_tag_parsing_reads_what_the_full_parser_reads() {
+    fn every_tag_parsing_reads_what_protobuf_reads() {
         let dir = tempfile::tempdir().unwrap();
         let mut domains_first = encode_ld(2, &build_domain(3, "first.example", &[]));
         domains_first.extend(encode_str(1, "Late"));
@@ -2524,7 +2228,23 @@ mod tests {
         std::fs::write(&path, data).unwrap();
 
         let every = GeoSiteManager::parse_file(&path, &[]).unwrap();
-        let full = GeoSiteManager::parse_dat_file(&path).unwrap();
+        // 有 tag、也有带值的域名的条目，和按条目读时一样 / The entries with a tag and a domain
+        // holding a value, as reading entry by entry keeps
+        let full: ParsedGeoSite = GeoSiteList::decode(std::fs::read(&path).unwrap().as_slice())
+            .unwrap()
+            .entry
+            .into_iter()
+            .filter_map(|site| {
+                let mut builder = TagBuilder::default();
+                let mut count = 0;
+                for (entry, _) in site.domain.into_iter().filter_map(Domain::into_entry) {
+                    builder.add_entry(entry);
+                    count += 1;
+                }
+                (!site.country_code.is_empty() && count > 0)
+                    .then(|| (site.country_code.to_lowercase(), builder.finish()))
+            })
+            .collect();
         let entries = |parsed: &ParsedGeoSite| {
             parsed
                 .iter()
@@ -2566,48 +2286,67 @@ mod tests {
         }
     }
 
-    /// Domain 和 Attribute 消息里不认识的字段按线上类型跳过（varint、8 字节、4 字节、带长度），之后的
-    /// 字段照常读出；跳过的部分越出消息、或者线上类型不认识时，Domain 读不出，Attribute 没有 key
-    /// Unknown fields in Domain and Attribute messages are skipped by wire type (varint,
-    /// 8 bytes, 4 bytes, length-delimited) and the fields after them read as usual; when
-    /// the skipped part runs past the message, or the wire type is unknown, the Domain
-    /// cannot be read and the Attribute has no key
+    /// 字段头和长度都按变长整数读，字段号从 16 起字段头就有两个字节。不认识的字段按线上类型跳过（varint、8 字节、
+    /// 4 字节、带长度），在文件顶层、条目里和 Domain、Attribute 消息里都一样，之后的字段照常读出。以前字段头只读
+    /// 一个字节，遇到字段号大的字段就错了位；文件顶层和条目里的字段一律当成带长度的读，varint 的值被当成了长度
+    /// Keys and lengths are read as varints, and from field 16 on a key takes two bytes.
+    /// Unknown fields are skipped by wire type (varint, 8 bytes, 4 bytes, length-delimited) at
+    /// the top of the file, inside an entry and inside Domain and Attribute messages alike,
+    /// and the fields after them read as usual. A key used to be read as one byte, so a field
+    /// with a large number threw everything after it out of place; at the top of the file and
+    /// inside an entry every field was read as length-delimited, a varint's value taken for a
+    /// length
     #[test]
     fn unknown_fields_are_skipped_by_their_wire_type() {
-        let mut unknown = vec![(4 << 3), 0x96, 0x01];
-        unknown.extend([(5 << 3) | 1, 1, 2, 3, 4, 5, 6, 7, 8]);
+        // 每种线上类型一个不认识的字段，两个用两字节的字段头 / One unknown field of every wire
+        // type, two of them with two-byte keys
+        let mut unknown = encode_varint_field(4, 150);
+        unknown.extend(encode_varint((20 << 3) | 1));
+        unknown.extend([1, 2, 3, 4, 5, 6, 7, 8]);
         unknown.extend([(6 << 3) | 5, 1, 2, 3, 4]);
-        unknown.extend(encode_ld(7, b"skip me"));
-
-        let mut domain = unknown.clone();
-        domain.extend(build_domain(3, "a.example", &["cn"]));
-        let read = GeoSiteManager::read_domain(&domain, true).unwrap();
-        assert_eq!(read.kind, 3);
-        assert_eq!(read.value, Some(&b"a.example"[..]));
-        assert_eq!(read.attrs, ["cn"]);
+        unknown.extend(encode_varint((300 << 3) | 2));
+        unknown.extend(encode_varint(7));
+        unknown.extend(b"skip me");
 
         let mut attribute = unknown.clone();
-        attribute.extend(encode_str(1, "Ads"));
-        assert_eq!(parse_attribute_key(&attribute).as_deref(), Some("ads"));
-
-        for cut in [
-            vec![(5 << 3) | 1, 1, 2, 3],
-            vec![(6 << 3) | 5, 1, 2],
-            vec![(7 << 3) | 2, 9, 1, 2],
-            vec![(4 << 3) | 3, 1],
-        ] {
-            assert!(GeoSiteManager::read_domain(&cut, true).is_err(), "{cut:?}");
-            assert_eq!(parse_attribute_key(&cut), None, "{cut:?}");
-        }
-
-        // 线上类型 3（已废弃的 group）不认识：后面的字段即使完好也不读 / Wire type 3 (the
-        // deprecated group) is not known: the fields after it are not read even when whole
-        let mut domain = vec![(4 << 3) | 3];
+        attribute.extend(encode_str(1, "CN"));
+        let mut domain = unknown.clone();
         domain.extend(build_domain(3, "a.example", &[]));
-        assert!(GeoSiteManager::read_domain(&domain, true).is_err());
-        let mut attribute = vec![(4 << 3) | 3];
-        attribute.extend(encode_str(1, "ads"));
-        assert_eq!(parse_attribute_key(&attribute), None);
+        domain.extend(encode_ld(3, &attribute));
+        let mut entry = unknown.clone();
+        entry.extend(build_geosite(
+            "Test",
+            &[domain, build_domain(2, "b.example", &[])],
+        ));
+        entry.extend(&unknown);
+        let mut data = unknown.clone();
+        data.extend(encode_ld(1, &entry));
+        data.extend(&unknown);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geosite.dat");
+        std::fs::write(&path, data).unwrap();
+
+        let tags = ["test".to_string(), "test@cn".to_string()];
+        let selective = GeoSiteManager::parse_dat_file_selective(&path, &tags).unwrap();
+        let every = GeoSiteManager::parse_file(&path, &[]).unwrap();
+        let matching = |parsed: &ParsedGeoSite, name: &str| {
+            parsed
+                .iter()
+                .filter(|(_, matchers)| matchers.matches(name))
+                .map(|(tag, _)| tag.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matching(&selective, "a.example"), ["test", "test@cn"]);
+        assert_eq!(matching(&selective, "www.b.example"), ["test"]);
+        assert_eq!(matching(&every, "a.example"), ["test"]);
+        assert_eq!(matching(&every, "www.b.example"), ["test"]);
+
+        // 线上类型 3（已废弃的 group）不认识，整份文件拒绝 / Wire type 3 (the deprecated group)
+        // is not known, and the whole file is refused
+        assert_refused(
+            build_dat(&[[vec![(4 << 3) | 3], encode_str(1, "CN")].concat()]),
+            "group",
+        );
     }
 
     /// 在另一个线程里跑 `parse`，5 秒内要有结果：坏的长度既不能让解析 panic，也不能让它原地打转
@@ -2623,103 +2362,119 @@ mod tests {
             .expect("parsing must neither panic nor hang")
     }
 
-    /// 文件里读出的长度大到「位置 + 长度」溢出时（u64::MAX，或者刚好回绕到 0）：外层条目的长度让整份
-    /// 文件被拒绝；条目里某个字段的长度让这个条目到此为止，和别的越出条目的字段一样；Domain、
-    /// Attribute 消息里的长度让它读不出。都不 panic、不原地打转。按需、全部和完整三种解析都验。
-    /// 只有损坏或特意构造的数据文件会碰到
+    /// 按需和全部两种解析都拒绝 `data`，而且都不 panic、不原地打转 / Both selective and every-tag
+    /// parsing refuse `data`, neither panicking nor going round in circles
+    fn assert_refused(data: Vec<u8>, what: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("geosite.dat");
+        std::fs::write(&path, data).unwrap();
+        let tags = vec!["cn".to_string(), "ads".to_string()];
+        for every in [false, true] {
+            let (path, tags) = (path.clone(), tags.clone());
+            let parsed = within_five_seconds(move || {
+                if every {
+                    GeoSiteManager::parse_file(&path, &[]).map(|_| ())
+                } else {
+                    GeoSiteManager::parse_dat_file_selective(&path, &tags).map(|_| ())
+                }
+            });
+            assert!(parsed.is_err(), "{what}, every tag {every}");
+        }
+    }
+
+    /// 文件里读出的长度大到「位置 + 长度」溢出时（u64::MAX，或者刚好回绕到 0），不论在文件顶层、条目里，还是在
+    /// Domain、Attribute 消息里，整份文件都被拒绝，不 panic、不原地打转。只有损坏或特意构造的数据文件会碰到
     /// A length read from the file so large that position plus length overflows (u64::MAX,
-    /// or one that wraps to exactly 0): an outer entry's length gets the whole file
-    /// refused; a field's length inside an entry ends that entry there, like any other
-    /// field running past its entry; a length inside a Domain or Attribute message leaves
-    /// it unreadable. None panics or goes round in circles. Selective, every-tag and full
-    /// parsing are all checked. Only a broken or deliberately crafted data file gets here
+    /// or one that wraps to exactly 0) gets the whole file refused, whether at the top of the
+    /// file, inside an entry, or inside a Domain or Attribute message, without panicking or
+    /// going round in circles. Only a broken or deliberately crafted data file gets here
     #[test]
     fn a_length_that_overflows_the_position_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
         let good = build_geosite("CN", &[build_domain(3, "good.example", &[])]);
         // 长度 varint 之后的位置是 11（1 字节字段头加 10 字节 varint），所以 2^64 - 11 刚好回绕到 0
         // The position after the length varint is 11 (a 1-byte key and a 10-byte varint),
         // so 2^64 - 11 wraps to exactly 0
         for huge in [usize::MAX, usize::MAX - 10] {
-            for before in [Vec::new(), encode_ld(1, &good)] {
-                let mut data = before.clone();
-                data.push(0x0A);
-                data.extend(encode_varint(huge));
-                let path = dir.path().join("outer.dat");
-                std::fs::write(&path, data).unwrap();
-                let tags = vec!["cn".to_string()];
-                for every in [false, true] {
-                    let (path, tags) = (path.clone(), tags.clone());
-                    let parsed = within_five_seconds(move || {
-                        if every {
-                            GeoSiteManager::parse_file(&path, &[]).map(|_| ())
-                        } else {
-                            GeoSiteManager::parse_dat_file_selective(&path, &tags).map(|_| ())
-                        }
-                    });
-                    assert!(parsed.is_err(), "outer {huge}, every tag {every}");
-                }
-                let full =
-                    within_five_seconds(move || GeoSiteManager::parse_dat_file(&path).map(|_| ()));
-                assert!(full.is_err(), "outer {huge}, full");
-            }
-
-            // 条目里的字段：放在 tag 前面时整个条目不要，放在一条好域名后面时只留下那条
-            // A field inside an entry: before the tag it drops the whole entry, after a good
-            // domain only that domain stays
-            let mut bad_field = vec![0x12];
-            bad_field.extend(encode_varint(huge));
-            let mut tag_first = encode_str(1, "CN");
-            tag_first.extend(encode_ld(2, &build_domain(3, "good.example", &[])));
-            tag_first.extend(&bad_field);
-            let mut field_first = bad_field.clone();
-            field_first.extend(encode_str(1, "CN"));
-            for (entry, kept) in [(tag_first, true), (field_first, false)] {
-                let path = dir.path().join("inner.dat");
-                std::fs::write(&path, build_dat(&[entry])).unwrap();
-                let tags = vec!["cn".to_string()];
-                let (selective, every, full) = within_five_seconds(move || {
-                    let found = |parsed: anyhow::Result<ParsedGeoSite>| {
-                        parsed
-                            .unwrap()
-                            .iter()
-                            .any(|(tag, matchers)| tag == "cn" && matchers.matches("good.example"))
-                    };
-                    (
-                        found(GeoSiteManager::parse_dat_file_selective(&path, &tags)),
-                        found(GeoSiteManager::parse_file(&path, &[])),
-                        found(GeoSiteManager::parse_dat_file(&path)),
-                    )
-                });
-                assert_eq!(
-                    [selective, every, full],
-                    [kept; 3],
-                    "inner {huge}, kept {kept}"
-                );
-            }
-
-            // Domain、Attribute 消息里的值、属性和未知字段 / Values, attributes and unknown
-            // fields in Domain and Attribute messages
+            let huge_field = |key: u8| [vec![key], encode_varint(huge)].concat();
+            assert_refused(huge_field(0x0A), "outer");
+            assert_refused(
+                [encode_ld(1, &good), huge_field(0x0A)].concat(),
+                "outer after a good entry",
+            );
+            // 条目里的字段，放在 tag 前面和一条好域名后面 / A field inside an entry, before the
+            // tag and after a good domain
+            assert_refused(
+                build_dat(&[[huge_field(0x12), encode_str(1, "CN")].concat()]),
+                "inner before the tag",
+            );
+            assert_refused(
+                build_dat(&[[good.clone(), huge_field(0x12)].concat()]),
+                "inner after a good domain",
+            );
+            // Domain 消息里的值、属性和未知字段，Attribute 消息里的 key 和未知字段 / A Domain's
+            // value, attribute and unknown field, an Attribute's key and unknown field
             for key in [(2 << 3) | 2, (3 << 3) | 2, (7 << 3) | 2] {
-                let mut message = vec![key];
-                message.extend(encode_varint(huge));
-                assert!(
-                    within_five_seconds({
-                        let message = message.clone();
-                        move || GeoSiteManager::read_domain(&message, true).is_err()
-                    }),
-                    "domain field {key:#x}, {huge}"
+                assert_refused(
+                    build_dat(&[build_geosite("CN", &[huge_field(key)])]),
+                    &format!("domain field {key:#x}, {huge}"),
                 );
             }
             for key in [(1 << 3) | 2, (7 << 3) | 2] {
-                let mut message = vec![key];
-                message.extend(encode_varint(huge));
-                assert_eq!(
-                    within_five_seconds(move || parse_attribute_key(&message)),
-                    None,
-                    "attribute field {key:#x}, {huge}"
+                let domain = [
+                    encode_str(2, "good.example"),
+                    encode_ld(3, &huge_field(key)),
+                ]
+                .concat();
+                assert_refused(
+                    build_dat(&[build_geosite("CN", &[domain])]),
+                    &format!("attribute field {key:#x}, {huge}"),
                 );
             }
+        }
+    }
+
+    /// 长度越出所在消息的字段让整份文件被拒绝，和越出文件的条目一样：条目里放在 tag 前面或一条好域名后面的
+    /// 字段、Domain 消息里的值、Attribute 消息里的 key 都是。以前越出条目的字段让条目到此为止（放在 tag 前面时
+    /// 整个条目不见了，放在后面时余下的域名不见了），读不出的 Domain 跳过，读不出的 Attribute 不算，文件照样
+    /// 当成完好的读进来，规则悄悄少了一部分名单
+    /// A field whose length runs past the message holding it gets the whole file refused, as
+    /// an entry running past the file does: a field in an entry before its tag or after a
+    /// good domain, a Domain's value and an Attribute's key alike. A field running past its
+    /// entry used to end the entry there (before the tag the whole entry vanished, after a
+    /// domain the domains left did), a Domain that could not be read was skipped and an
+    /// Attribute that could not be read did not count, and the file was taken as whole, the
+    /// rules quietly missing part of their list
+    #[test]
+    fn a_length_past_its_message_refuses_the_file() {
+        let good = build_domain(3, "good.example", &[]);
+        // 说要 9 个字节、后面只有 3 个的字段 / A field saying 9 bytes with only 3 after it
+        let short = |key: u8| [vec![key, 9], b"abc".to_vec()].concat();
+        let bad_attribute = [
+            encode_str(2, "a.example"),
+            encode_ld(3, &short((1 << 3) | 2)),
+        ]
+        .concat();
+        for (what, entry) in [
+            (
+                "field after a good domain",
+                [encode_str(1, "CN"), encode_ld(2, &good), short(0x12)].concat(),
+            ),
+            (
+                "field before the tag",
+                [short(0x12), encode_str(1, "CN")].concat(),
+            ),
+            (
+                "domain value",
+                build_geosite("CN", &[good.clone(), short((2 << 3) | 2)]),
+            ),
+            ("attribute key", build_geosite("CN", &[bad_attribute])),
+        ] {
+            // 后面还有一个好条目，所以不是截断的文件 / A good entry follows, so the file is not
+            // a truncated one
+            assert_refused(
+                build_dat(&[entry, build_geosite("ADS", std::slice::from_ref(&good))]),
+                what,
+            );
         }
     }
 
@@ -2736,13 +2491,13 @@ mod tests {
             ],
         );
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
 
         // 只写出前半段，模拟覆盖写到一半 / Write only the first half
         let full = std::fs::read(&path).unwrap();
         std::fs::write(&path, &full[..full.len() * 2 / 3]).unwrap();
         manager
-            .load_from_dat_file(&path)
+            .load_from_v2ray_file(&path)
             .expect_err("a truncated file must be rejected");
 
         assert!(
@@ -2846,19 +2601,19 @@ mod tests {
         }
     }
 
+    /// 属性只取 key，转成小写；`typed_value` 跳过 / An attribute gives just its key, lowercased;
+    /// its `typed_value` is skipped
     #[test]
-    fn test_parse_attribute_key() {
-        // Attribute { key = "cn" }
-        let attr = encode_str(1, "cn");
-        assert_eq!(parse_attribute_key(&attr), Some("cn".to_string()));
-
-        // Attribute with extra fields (bool_value)
-        let mut attr = encode_str(1, "geolocation");
-        attr.extend(encode_varint_field(2, 1)); // bool_value = true
-        assert_eq!(parse_attribute_key(&attr), Some("geolocation".to_string()));
-
-        // Empty message
-        assert_eq!(parse_attribute_key(&[]), None);
+    fn attribute_keys_are_read_without_their_values() {
+        let mut attribute = encode_str(1, "GeoLocation");
+        attribute.extend(encode_varint_field(2, 1)); // bool_value = true
+        let mut domain = build_domain(3, "a.example", &["cn"]);
+        domain.extend(encode_ld(3, &attribute));
+        let (_, attrs) = Domain::decode(domain.as_slice())
+            .unwrap()
+            .into_entry()
+            .unwrap();
+        assert_eq!(attrs, ["cn", "geolocation"]);
     }
 
     #[test]
@@ -3056,7 +2811,7 @@ mod tests {
             ],
         );
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
         assert!(manager.matches("t", "github.com"));
         assert!(manager.matches("t", "api.github.com"));
         assert!(!manager.matches("t", "notgithub.com"));
@@ -3441,7 +3196,7 @@ mod tests {
         assert!(parsed[0].1.matches("www.google.com"));
 
         let mut manager = GeoSiteManager::new();
-        manager.load_from_dat_file(&path).unwrap();
+        manager.load_from_v2ray_file(&path).unwrap();
         assert!(manager.matches("k", "www.google.com"));
         assert!(!manager.matches("k", "www.example.com"));
     }
@@ -3457,7 +3212,7 @@ mod tests {
         data.extend([0xFF; 11]);
         data.push(0x01);
         std::fs::write(&path, data).unwrap();
-        assert!(GeoSiteManager::parse_dat_file(&path).is_err());
+        assert!(GeoSiteManager::parse_file(&path, &[]).is_err());
         assert!(GeoSiteManager::parse_dat_file_selective(&path, &["x".to_string()]).is_err());
     }
 }
