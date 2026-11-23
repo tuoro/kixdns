@@ -2303,7 +2303,10 @@ async fn serve_tcp_conn(
     let engine = Arc::new(engine.with_client_transport(ClientTransport::Tcp));
 
     let (mut reader, writer) = stream.into_split();
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let writer = Arc::new(TcpWriter {
+        half: tokio::sync::Mutex::new(writer),
+        broken: tokio_util::sync::CancellationToken::new(),
+    });
     let slots = Arc::new(tokio::sync::Semaphore::new(TCP_MAX_QUERIES_PER_CONN));
     let mut pending = tokio::task::JoinSet::<()>::new();
     // 读进来还没处理的字节：一次读到的可能是好几个查询，也可能是半个
@@ -2321,6 +2324,9 @@ async fn serve_tcp_conn(
     let mut waiting: Option<(bool, tokio::time::Instant)> = None;
 
     'connection: loop {
+        if writer.broken.is_cancelled() {
+            break;
+        }
         // 收掉已经答完的 / Reap the ones already answered
         while pending.try_join_next().is_some() {}
 
@@ -2432,14 +2438,21 @@ async fn serve_tcp_conn(
         // Idle timeout, a half-sent message timing out, the peer's end of stream or an error:
         // reading stops, and once the queries still being handled have written their answers
         // the connection closes, releasing the task and the file descriptor
-        if !matches!(
-            tokio::time::timeout_at(deadline, reader.read_buf(&mut received)).await,
-            Ok(Ok(1..))
-        ) {
+        let read = tokio::select! {
+            _ = writer.broken.cancelled() => break,
+            read = tokio::time::timeout_at(deadline, reader.read_buf(&mut received)) => read,
+        };
+        if !matches!(read, Ok(Ok(1..))) {
             break;
         }
     }
 
+    // 写端坏了：还在等上游的查询不必再等，它们的回答写不出去了（丢掉 pending 时一起取消）
+    // The write side broke: the queries still waiting on an upstream need wait no more, their
+    // answers having nowhere to go (cancelled as `pending` is dropped)
+    if writer.broken.is_cancelled() {
+        return Ok(());
+    }
     // 读完了：先把当场答好的写出去，再等还在处理的查询把回答写出去，然后关连接；半关闭的客户端照样拿到回答
     // Reading is over: what was answered on the spot is written first, then the queries still
     // being handled write their answers before the connection closes, so a half-closed client
@@ -2449,24 +2462,45 @@ async fn serve_tcp_conn(
     Ok(())
 }
 
+/// 一条入站 TCP 连接的写端，和它坏没坏：写不出去（或 [`TCP_READ_TIMEOUT`] 内写不完，对方不读）时关掉写端、记下坏了。
+/// 读的那边见了就不再读，还在等上游的查询也不再等。以前只关写端，读循环照样解析、问上游，要等空闲满读取时限才退出，
+/// 一个只发不读的客户端能让服务端一直白干活
+/// The write side of one inbound TCP connection, and whether it broke: when an answer cannot be
+/// written, or not within [`TCP_READ_TIMEOUT`] (the peer does not read), the write side is shut
+/// and noted broken. Seeing that, the reading side reads no more and the queries waiting on an
+/// upstream wait no more. Only the write side used to be shut, the read loop parsing and asking
+/// upstreams as before until idle for the whole read timeout, so a client sending without ever
+/// reading kept the server working for nothing
+struct TcpWriter {
+    half: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
+    broken: tokio_util::sync::CancellationToken,
+}
+
+impl TcpWriter {
+    /// 关掉写端，记下坏了 / Shuts the write side and notes it broken
+    async fn shut(&self, half: &mut tokio::net::tcp::OwnedWriteHalf) {
+        use tokio::io::AsyncWriteExt;
+        let _ = half.shutdown().await;
+        self.broken.cancel();
+    }
+}
+
 /// 把排好的回答一次写出去，和 [`write_tcp_answer`] 一样：写端加锁，不和别的回答穿插；写不出去或
 /// [`TCP_READ_TIMEOUT`] 内写不完时关掉写端
 /// Writes the queued answers in one go, like [`write_tcp_answer`]: under the writer's lock, so
 /// they cannot interleave with another answer; when they cannot be written, or not within
 /// [`TCP_READ_TIMEOUT`], the write side is shut
-async fn write_tcp_answers(
-    writer: &tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
-    answers: &mut bytes::BytesMut,
-) {
+async fn write_tcp_answers(writer: &TcpWriter, answers: &mut bytes::BytesMut) {
     use tokio::io::AsyncWriteExt;
 
-    if answers.is_empty() {
+    if answers.is_empty() || writer.broken.is_cancelled() {
+        answers.clear();
         return;
     }
-    let mut writer = writer.lock().await;
-    let written = tokio::time::timeout(TCP_READ_TIMEOUT, writer.write_all(answers)).await;
+    let mut half = writer.half.lock().await;
+    let written = tokio::time::timeout(TCP_READ_TIMEOUT, half.write_all(answers)).await;
     if !matches!(written, Ok(Ok(()))) {
-        let _ = writer.shutdown().await;
+        writer.shut(&mut half).await;
     }
     answers.clear();
 }
@@ -2477,13 +2511,8 @@ async fn write_tcp_answers(
 /// cannot interleave with another answer. When it cannot be written, or not within
 /// [`TCP_READ_TIMEOUT`] (the peer does not read), the write side is shut: later answers fail
 /// at once instead of each task getting stuck here.
-async fn write_tcp_answer(
-    writer: &tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
-    response: &[u8],
-) {
-    use tokio::io::AsyncWriteExt;
-
-    if response.len() > u16::MAX as usize {
+async fn write_tcp_answer(writer: &TcpWriter, response: &[u8]) {
+    if response.len() > u16::MAX as usize || writer.broken.is_cancelled() {
         return;
     }
     // DNS-over-TCP framing must be written completely; write_vectored may be
@@ -2497,14 +2526,14 @@ async fn write_tcp_answer(
         std::io::IoSlice::new(&len_bytes),
         std::io::IoSlice::new(response),
     ];
-    let mut writer = writer.lock().await;
+    let mut half = writer.half.lock().await;
     let written = tokio::time::timeout(
         TCP_READ_TIMEOUT,
-        tokio_util::io::write_all_vectored(&mut *writer, &mut bufs),
+        tokio_util::io::write_all_vectored(&mut *half, &mut bufs),
     )
     .await;
     if !matches!(written, Ok(Ok(()))) {
-        let _ = writer.shutdown().await;
+        writer.shut(&mut half).await;
     }
 }
 
@@ -5755,6 +5784,30 @@ mod tests {
         tokio::time::timeout(TCP_READ_TIMEOUT * 4, server)
             .await
             .expect("the handler ends once its blocked write times out")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// 写端坏了以后客户端还一直发：处理这条连接的任务照样马上结束，不再读、不再问上游。以前只关写端，读循环接着解析、
+    /// 问上游，客户端隔一会儿发一个，它就一直不空闲、一直不结束
+    /// The client keeps sending after the write side broke: the task handling the connection ends
+    /// at once all the same, reading and asking upstreams no more. Only the write side used to be
+    /// shut, the read loop parsing and asking upstreams on, never idle and never ending while the
+    /// client sent one every now and then
+    #[tokio::test]
+    async fn a_broken_tcp_write_side_ends_the_handler_though_the_client_keeps_sending() {
+        let upstream = spawn_slow_udp_upstream(Duration::from_millis(10)).await;
+        let (mut client, server) = tcp_connection(slow_and_fast_engine(upstream)).await;
+        let frame = tcp_frame("c.fast.test.", 9);
+        // 一帧接一帧地发、从不读，写不出去才停：服务端堵在写上时这里也堵着，服务端一读就接着发。每帧都完整写完，不会
+        // 半截留在流里
+        // Frame after frame, never reading, stopping only once it cannot be sent: blocked while
+        // the server is stuck writing, sending on as soon as it reads. Each frame is written
+        // whole, none left halfway in the stream
+        tokio::spawn(async move { while client.write_all(&frame).await.is_ok() {} });
+        tokio::time::timeout(TCP_READ_TIMEOUT * 2, server)
+            .await
+            .expect("the handler ends once its write side breaks")
             .unwrap()
             .unwrap();
     }
