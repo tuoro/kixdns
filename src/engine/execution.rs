@@ -981,26 +981,10 @@ impl Engine {
             // `apply_rules`), and a decision kept there needs no rules evaluated. The fast path
             // used to evaluate the compiled rules first, for nothing when a forward was kept
             let cached = pipeline.and_then(|p| {
-                let rule_requester = p.rule_requester.key(requester, Some(&self.geoip_manager));
-                let rule_hash = crate::engine::rules::calculate_rule_hash(
-                    cache_namespace,
-                    pipeline_id,
-                    qname_str,
-                    qtype,
-                    qclass,
-                    &rule_requester,
-                );
-                // 过期的这里不去掉，见 `apply_rules` / An expired entry is not removed here, see `apply_rules`
-                self.rule_cache.get(rule_hash).filter(|record| {
-                    record.entry.matches_at(
-                        start,
-                        pipeline_id,
-                        qname_str,
-                        qtype,
-                        qclass,
-                        &rule_requester,
-                    )
-                })
+                self.cached_decision(
+                    &self.rule_question(cache_namespace, p, qname_str, qtype, qclass, requester),
+                    start,
+                )
             });
             let (next, hop) = if let Some(record) = cached {
                 match &record.entry.decision {
@@ -5601,29 +5585,27 @@ mod tests {
         matched_rules: Option<&[&str]>,
         decided_by_rule: bool,
     ) -> u64 {
-        let key = crate::engine::rules::calculate_rule_hash(
+        let pipeline_id: Arc<str> = Arc::from("main");
+        let question = crate::engine::rules::RuleQuestion::new(
             engine.state.load().cache_namespace("main"),
-            "main",
+            &pipeline_id,
             "ip.test",
             RecordType::A,
             DNSClass::IN,
-            &RequesterKey::NONE,
+            RequesterKey::NONE,
         );
+        let key = question.key;
         engine.rule_cache.insert(
             key,
             Arc::new(RuleCacheRecord {
-                entry: RuleCacheEntry {
-                    pipeline_id: Arc::from("main"),
-                    qname: "ip.test".as_bytes().into(),
-                    qtype: u16::from(RecordType::A),
-                    qclass: u16::from(DNSClass::IN),
-                    requester: RequesterKey::NONE,
-                    decision: Decision::Static {
+                entry: RuleCacheEntry::new(
+                    &question,
+                    Decision::Static {
                         rcode: ResponseCode::NXDomain,
                         answers: Vec::new(),
                     },
                     expires_at,
-                },
+                ),
                 matched_rules: matched_rules
                     .map(|rules| rules.iter().map(|rule| Arc::from(*rule)).collect()),
                 decided_by_rule,
@@ -6350,30 +6332,47 @@ mod tests {
         );
     }
 
+    /// `test_p` 里 `qname` 的 A 查询、请求方判定为 `requester` 的规则缓存问题 / The rule cache question
+    /// of an A query for `qname` in `test_p`, the requester judged as `requester`
+    fn rule_question<'a>(
+        pipeline_id: &'a Arc<str>,
+        qname: &'a str,
+        requester: RequesterKey,
+    ) -> crate::engine::rules::RuleQuestion<'a> {
+        crate::engine::rules::RuleQuestion::new(
+            0,
+            pipeline_id,
+            qname,
+            RecordType::A,
+            DNSClass::IN,
+            requester,
+        )
+    }
+
+    fn no_records() -> Decision {
+        Decision::Static {
+            rcode: ResponseCode::NoError,
+            answers: vec![],
+        }
+    }
+
     #[test]
     fn test_rule_cache_entry_matches_respects_the_requester_key() {
         let pipeline_id: Arc<str> = Arc::from("test_p");
         let qname = "example.com";
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-        let entry = |requester| RuleCacheEntry {
-            pipeline_id: pipeline_id.clone(),
-            qname: qname.as_bytes().into(),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
-            requester,
-            decision: Decision::Static {
-                rcode: ResponseCode::NoError,
-                answers: vec![],
-            },
-            expires_at: None,
+        let entry = |requester| {
+            RuleCacheEntry::new(
+                &rule_question(&pipeline_id, qname, requester),
+                no_records(),
+                None,
+            )
         };
         let class = |class| RequesterKey {
             class: Some(class),
             ..RequesterKey::NONE
         };
         let matches = |entry: &RuleCacheEntry, key: RequesterKey| {
-            entry.matches("test_p", qname, qtype, qclass, &key)
+            entry.answers(&rule_question(&pipeline_id, qname, key), Instant::now())
         };
 
         // An entry without requester facts matches only a key without them
@@ -6393,26 +6392,18 @@ mod tests {
     /// its last character is no match
     #[test]
     fn test_rule_cache_entry_matches_only_its_whole_name() {
+        let pipeline_id: Arc<str> = Arc::from("test_p");
         let long = format!("{}.example", "a".repeat(60));
         for name in ["short.example", long.as_str()] {
             let entry = RuleCacheEntry::new(
-                Arc::from("test_p"),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                RequesterKey::NONE,
-                Decision::Static {
-                    rcode: ResponseCode::NoError,
-                    answers: vec![],
-                },
+                &rule_question(&pipeline_id, name, RequesterKey::NONE),
+                no_records(),
+                None,
             );
             let matches = |asked: &str| {
-                entry.matches(
-                    "test_p",
-                    asked,
-                    RecordType::A,
-                    DNSClass::IN,
-                    &RequesterKey::NONE,
+                entry.answers(
+                    &rule_question(&pipeline_id, asked, RequesterKey::NONE),
+                    Instant::now(),
                 )
             };
             assert!(matches(name));
@@ -6423,49 +6414,20 @@ mod tests {
 
     #[test]
     fn test_rule_cache_expiration() {
-        // Arrange: Define test data
         let pipeline_id: Arc<str> = Arc::from("test_p");
-        let qname = "expire.com";
-        let qtype = RecordType::A;
-        let qclass = DNSClass::IN;
-        let decision = Decision::Static {
-            rcode: ResponseCode::NoError,
-            answers: vec![],
-        };
+        let question = rule_question(&pipeline_id, "expire.com", RequesterKey::NONE);
+        let now = Instant::now();
 
-        // Arrange: Expired entry
-        let entry_expired = RuleCacheEntry {
-            pipeline_id: pipeline_id.clone(),
-            qname: qname.as_bytes().into(),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
-            requester: RequesterKey::NONE,
-            decision: decision.clone(),
-            expires_at: Some(Instant::now() - Duration::from_secs(1)),
-        };
-
-        // Act & Assert: Expired entry should not match
+        let expired =
+            RuleCacheEntry::new(&question, no_records(), Some(now - Duration::from_secs(1)));
         assert!(
-            !entry_expired.matches("test_p", qname, qtype, qclass, &RequesterKey::NONE),
+            !expired.answers(&question, now),
             "Expired entry should not match"
         );
 
-        // Arrange: Fresh entry
-        let entry_fresh = RuleCacheEntry {
-            pipeline_id: pipeline_id.clone(),
-            qname: qname.as_bytes().into(),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
-            requester: RequesterKey::NONE,
-            decision,
-            expires_at: Some(Instant::now() + Duration::from_secs(60)),
-        };
-
-        // Act & Assert: Fresh entry should match
-        assert!(
-            entry_fresh.matches("test_p", qname, qtype, qclass, &RequesterKey::NONE),
-            "Fresh entry should match"
-        );
+        let fresh =
+            RuleCacheEntry::new(&question, no_records(), Some(now + Duration::from_secs(60)));
+        assert!(fresh.answers(&question, now), "Fresh entry should match");
     }
 
     /// 测试 DNS 响应缓存键包含 QCLASS

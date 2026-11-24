@@ -193,63 +193,79 @@ impl Cached for Arc<RuleCacheRecord> {
     }
 }
 
-impl RuleCacheEntry {
-    pub fn new(
-        pipeline_id: Arc<str>,
-        qname: &str,
+/// 规则缓存里一个决定所答的问题：哪个 pipeline、名字、类型、类别，和规则对请求方的判定；`key` 是它在规则缓存里的键（见
+/// [`calculate_rule_hash`]）。查和写都按它（见 `Engine::cached_decision`、`Engine::insert_rule_cache`）
+/// The question a decision in the rule cache answers: which pipeline, name, type and class, and
+/// how the rules judge the requester; `key` is where it sits in the rule cache (see
+/// [`calculate_rule_hash`]). Lookups and writes both go by it (see `Engine::cached_decision`,
+/// `Engine::insert_rule_cache`)
+#[derive(Clone, Copy)]
+pub(crate) struct RuleQuestion<'a> {
+    pub(crate) pipeline_id: &'a Arc<str>,
+    pub(crate) qname: &'a str,
+    pub(crate) qtype: RecordType,
+    pub(crate) qclass: DNSClass,
+    pub(crate) requester: RequesterKey,
+    pub(crate) key: u64,
+}
+
+impl<'a> RuleQuestion<'a> {
+    /// 命名空间 `cache_namespace` 下的这个问题 / This question under the namespace `cache_namespace`
+    pub(crate) fn new(
+        cache_namespace: u64,
+        pipeline_id: &'a Arc<str>,
+        qname: &'a str,
         qtype: RecordType,
         qclass: DNSClass,
         requester: RequesterKey,
-        decision: Decision,
     ) -> Self {
         Self {
+            key: calculate_rule_hash(
+                cache_namespace,
+                pipeline_id,
+                qname,
+                qtype,
+                qclass,
+                &requester,
+            ),
             pipeline_id,
-            qname: SmallVec::from_slice(qname.as_bytes()),
-            qtype: u16::from(qtype),
-            qclass: u16::from(qclass),
+            qname,
+            qtype,
+            qclass,
             requester,
+        }
+    }
+}
+
+impl RuleCacheEntry {
+    /// 给 `question` 的决定 `decision`，到 `expires_at` 为止 / The decision `decision` for
+    /// `question`, until `expires_at`
+    pub(crate) fn new(
+        question: &RuleQuestion<'_>,
+        decision: Decision,
+        expires_at: Option<Instant>,
+    ) -> Self {
+        Self {
+            pipeline_id: Arc::clone(question.pipeline_id),
+            qname: SmallVec::from_slice(question.qname.as_bytes()),
+            qtype: u16::from(question.qtype),
+            qclass: u16::from(question.qclass),
+            requester: question.requester,
             decision,
-            expires_at: None,
+            expires_at,
         }
     }
 
+    /// 这个决定在 `now` 这一刻还有效、答的就是 `question` / Whether this decision is still valid at
+    /// `now` and answers `question`
     #[inline]
-    pub fn matches(
-        &self,
-        pipeline_id: &str,
-        qname: &str,
-        qtype: RecordType,
-        qclass: DNSClass,
-        requester: &RequesterKey,
-    ) -> bool {
-        self.matches_at(Instant::now(), pipeline_id, qname, qtype, qclass, requester)
-    }
-
-    /// 同 [`Self::matches`]，时刻是已经读好的 / As [`Self::matches`], with the moment already read
-    #[inline]
-    pub fn matches_at(
-        &self,
-        now: Instant,
-        pipeline_id: &str,
-        qname: &str,
-        qtype: RecordType,
-        qclass: DNSClass,
-        requester: &RequesterKey,
-    ) -> bool {
-        // Check expiration first / 首先检查过期
-        if !self.is_valid_at(now) {
-            return false;
-        }
-
-        if self.qtype != u16::from(qtype) || self.qclass != u16::from(qclass) {
-            return false;
-        }
-
-        if self.requester != *requester {
-            return false;
-        }
-
-        self.pipeline_id.as_ref() == pipeline_id && self.qname.as_slice() == qname.as_bytes()
+    pub(crate) fn answers(&self, question: &RuleQuestion<'_>, now: Instant) -> bool {
+        self.is_valid_at(now)
+            && self.qtype == u16::from(question.qtype)
+            && self.qclass == u16::from(question.qclass)
+            && self.requester == question.requester
+            && *self.pipeline_id == **question.pipeline_id
+            && self.qname.as_slice() == question.qname.as_bytes()
     }
 
     /// 在 `now` 这一刻还有效 / Still valid at `now`
