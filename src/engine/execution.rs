@@ -499,7 +499,7 @@ impl Engine {
                 event = "failure_not_cached",
                 qname = %entry.qname,
                 pipeline = %entry.pipeline_id,
-                rcode = %entry.rcode,
+                rcode = %crate::observe::rcode_name(entry.rcode.into()),
                 "failure reply is not cached"
             );
             return;
@@ -5283,6 +5283,38 @@ mod tests {
 
         let dedupe_hash = stale_com_keys(&engine).slot;
         (engine, dedupe_hash)
+    }
+
+    /// 上游失败、回 SERVFAIL 时记的那条 warn 带着失败的完整原因（上游是没回答、拒绝了连接还是别的什么），不带每次都一样的
+    /// RCODE 字段
+    /// The warning logged when the upstream failed and SERVFAIL goes out carries the failure's
+    /// whole cause (whether the upstream did not answer, refused the connection or what else),
+    /// with no RCODE field that is the same every time
+    #[tokio::test]
+    async fn an_upstream_failure_is_logged_with_its_cause() {
+        let (engine, _) = engine_without_an_answering_upstream(false);
+        let (warnings, guard) = support::Warnings::capture();
+        let reply = engine
+            .handle_packet(&stale_com_query(), "127.0.0.1:12345".parse().unwrap())
+            .await
+            .expect("answered");
+        drop(guard);
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
+        let lines = warnings.lines();
+        let failed: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("event=\"upstream_failure\""))
+            .collect();
+        assert_eq!(failed.len(), 1, "{lines:#?}");
+        assert!(
+            failed[0].contains("all upstreams failed: "),
+            "{}",
+            failed[0]
+        );
+        assert!(!failed[0].contains("rcode="), "{}", failed[0]);
     }
 
     /// The keys of the `stale.com` query in the default pipeline / 默认 pipeline 里 `stale.com` 查询的键

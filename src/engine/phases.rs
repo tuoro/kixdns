@@ -408,7 +408,7 @@ pub(crate) fn serve_stale(
         kind = ?kind,
         qname = %context.qname,
         qtype = ?context.qtype,
-        rcode = ?hit.rcode,
+        rcode = %crate::observe::rcode_name(hit.rcode.into()),
         original_ttl = hit.original_ttl,
         stale_for_secs = hit
             .inserted_at
@@ -1033,7 +1033,7 @@ impl<'a> Forwarding<'a> {
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "flow control kept the query from the upstream, answering from the cache"
                     );
                 } else {
@@ -1044,7 +1044,7 @@ impl<'a> Forwarding<'a> {
                         qtype = ?request.qtype,
                         client_ip = %request.peer.ip(),
                         pipeline = %route.pipeline,
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "upstream failed, answering from the cache"
                     );
                 }
@@ -1057,7 +1057,7 @@ impl<'a> Forwarding<'a> {
                         upstream = %decision.upstream,
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
-                        error = %e,
+                        error = %format_args!("{e:#}"),
                         "flow control kept the query from the upstream"
                     );
                 } else {
@@ -1066,9 +1066,8 @@ impl<'a> Forwarding<'a> {
                        upstream = %decision.upstream,
                        qname = %request.qname,
                        qtype = ?request.qtype,
-                       rcode = ?ResponseCode::ServFail,
                        client_ip = %request.peer.ip(),
-                       error = %e,
+                       error = %format_args!("{e:#}"),
                        pipeline = %route.pipeline,
                        transport = ?decision.transport,
                        "upstream failed"
