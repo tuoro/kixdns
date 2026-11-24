@@ -10,7 +10,7 @@ use crate::engine::concurrency::QUEUE_TARGET;
 use crate::engine::fair_queue::{Device, FairQueue};
 use crate::engine::{Engine, OnTheSpot, PreParsedData};
 use crate::observe::ClientTransport;
-use crate::proto_utils::{servfail_reply, truncate_udp_response};
+use crate::proto_utils::{MAX_QUERY_LEN, servfail_reply, truncate_udp_response};
 #[cfg(target_os = "linux")]
 use crate::socket_utils::udp_batch;
 #[cfg(unix)]
@@ -511,23 +511,26 @@ const RECV_BUFFER_PER_QUERY: usize = 480;
 
 /// 大接收缓冲放得下多少个小查询，读不到实际大小时按这个算 / How many small queries the large receive
 /// buffer holds, taken when the actual size cannot be read
-#[cfg(target_os = "linux")]
 const QUERIES_IN_RECV_BUFFER: usize = UDP_BUFFER_SIZE / RECV_BUFFER_PER_QUERY;
 
-/// 这个 socket 的接收缓冲放得下多少个小查询，开始轮流时先这么算。`net.core.rmem_max` 比 4 MiB 小时，设下去的
-/// 大小会被内核截短；内核报的是翻过倍的大小，一个小查询按 `2 * RECV_BUFFER_PER_QUERY` 算。网卡收的包内核记得更多，
-/// 读的时候再量（见 `TakingTurns::read`）
-/// How many small queries this socket's receive buffer holds, as reckoned when turns begin. With
-/// `net.core.rmem_max` below 4 MiB the kernel cuts the size that was set; it reports the doubled
-/// size, a small query reckoned at `2 * RECV_BUFFER_PER_QUERY`. The kernel charges datagrams from
-/// a network card more, so reading measures it again (see `TakingTurns::read`)
-#[cfg(target_os = "linux")]
-fn queries_in_recv_buffer(socket: &UdpSocket) -> usize {
+/// 这个 socket 的接收缓冲放得下多少个小查询，两种接收循环开始轮流时都先这么算。`net.core.rmem_max` 比 4 MiB 小时，
+/// 设下去的大小会被 Linux 截短；Linux 报的是翻过倍的大小，一个小查询按 `2 * RECV_BUFFER_PER_QUERY` 算，别的系统报的就是
+/// 设下的大小。读不到时按大缓冲算。网卡收的包内核记得更多，批量收的循环边读边量（见 `TakingTurns::read`）
+/// How many small queries this socket's receive buffer holds, as both receive loops reckon when
+/// turns begin. With `net.core.rmem_max` below 4 MiB Linux cuts the size that was set; it reports
+/// the doubled size, a small query reckoned at `2 * RECV_BUFFER_PER_QUERY`, while other systems
+/// report the size that was set. When it cannot be read the large buffer is reckoned. The kernel
+/// charges datagrams from a network card more, so the batched loop measures it as it reads (see
+/// `TakingTurns::read`)
+fn recv_buffer_holds(socket: &UdpSocket) -> usize {
+    let reported_per_query = if cfg!(target_os = "linux") {
+        2 * RECV_BUFFER_PER_QUERY
+    } else {
+        RECV_BUFFER_PER_QUERY
+    };
     socket2::SockRef::from(socket)
         .recv_buffer_size()
-        .map_or(QUERIES_IN_RECV_BUFFER, |size| {
-            size / (2 * RECV_BUFFER_PER_QUERY)
-        })
+        .map_or(QUERIES_IN_RECV_BUFFER, |size| size / reported_per_query)
         .max(MIN_QUERIES_IN_RECV_BUFFER)
 }
 
@@ -684,7 +687,7 @@ impl<'a> UdpAnswering<'a> {
         self.engine.permit_manager.note_turns_begun();
         Box::new(TakingTurns::new(
             self.queries_within_target,
-            queries_in_recv_buffer(self.socket),
+            recv_buffer_holds(self.socket),
         ))
     }
 
@@ -715,23 +718,16 @@ impl<'a> UdpAnswering<'a> {
     /// the whole datagram (see [`ONE_BY_ONE_RECV_SIZE`]), and the length given stops at
     /// `MAX_QUERY_LEN`, a longer one cut there as in the batched receive
     fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, ReplyTo)> {
-        let (len, to) = self.try_recv_whole(buf)?;
-        Ok((len.min(crate::proto_utils::MAX_QUERY_LEN), to))
-    }
-
-    /// 同 [`Self::try_recv`]，给出的是整个报文的长度 / The same as [`Self::try_recv`], giving the
-    /// whole datagram's length
-    fn try_recv_whole(&self, buf: &mut [u8]) -> std::io::Result<(usize, ReplyTo)> {
         #[cfg(unix)]
         if self.local_addresses {
             use std::os::fd::AsRawFd;
             let (len, peer, local) = self.socket.try_io(tokio::io::Interest::READABLE, || {
                 udp_local::recv(self.socket.as_raw_fd(), buf)
             })?;
-            return Ok((len, ReplyTo { peer, local }));
+            return Ok((len.min(MAX_QUERY_LEN), ReplyTo { peer, local }));
         }
         let (len, peer) = self.socket.try_recv_from(buf)?;
-        Ok((len, peer.into()))
+        Ok((len.min(MAX_QUERY_LEN), peer.into()))
     }
 
     /// 逐个收的循环开始按设备轮流（见 `Turns::read_available`）/ The loop receiving one by one begins taking
@@ -1134,26 +1130,6 @@ impl TakingTurns {
             }
         }
     }
-}
-
-/// 这个 socket 的接收缓冲放得下多少个小查询。Linux 报的是翻过倍的大小（见 `queries_in_recv_buffer`），别的系统报的就是设下的
-/// 大小；读不到时按平常的大小算
-/// How many small queries this socket's receive buffer holds. Linux reports the doubled size
-/// (see `queries_in_recv_buffer`) and other systems the size that was set; when it cannot be
-/// read the usual size is reckoned
-#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux 上只有测试用 / On Linux only the tests use it
-fn recv_buffer_holds(socket: &UdpSocket) -> usize {
-    let reported_per_query = if cfg!(target_os = "linux") {
-        2 * RECV_BUFFER_PER_QUERY
-    } else {
-        RECV_BUFFER_PER_QUERY
-    };
-    socket2::SockRef::from(socket)
-        .recv_buffer_size()
-        .unwrap_or(UDP_BUFFER_SIZE)
-        .checked_div(reported_per_query)
-        .unwrap_or(0)
-        .max(MIN_QUERIES_IN_RECV_BUFFER)
 }
 
 /// 逐个收的循环一轮答多少个 / How many the loop receiving one by one answers per turn
