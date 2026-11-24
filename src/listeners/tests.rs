@@ -3905,11 +3905,13 @@ async fn a_cache_hit_carries_the_query_id_and_ages_its_ttls() {
 }
 
 /// 引擎在请求时限内答不上来时，监听器到点回 SERVFAIL：不早于时限，也不等引擎自己放弃。快速解析
-/// 读得了的查询和要从头解析的一样，UDP 和 TCP 一样。每次超时记的告警说是哪个监听器、哪个查询、哪个客户端
+/// 读得了的查询和要从头解析的一样，UDP 和 TCP 一样。每次超时记的告警标着 `request_timeout`，说是哪个监听器、查询的名字
+/// 和类型、哪个客户端
 /// When the engine cannot answer within the request timeout, the listener answers
 /// SERVFAIL when it runs out: not before, and without waiting for the engine to give up.
 /// A query the quick parse reads and one parsed from scratch alike, over UDP as over TCP.
-/// The warning each timeout logs names the listener, the query and the client
+/// The warning each timeout logs is marked `request_timeout` and names the listener, the
+/// query's name and type, and the client
 #[tokio::test]
 async fn listeners_answer_servfail_when_the_request_timeout_runs_out() {
     let (warnings, guard) = crate::engine::test_support::Warnings::capture();
@@ -3958,7 +3960,8 @@ async fn listeners_answer_servfail_when_the_request_timeout_runs_out() {
         for qname in ["quick.test", r"\032slow.test"] {
             let named = |line: &&String| {
                 line.contains(&format!("{listener} request timeout"))
-                    && line.contains(&format!("qname={qname} "))
+                    && line.contains(r#"event="request_timeout""#)
+                    && line.contains(&format!("qname={qname} qtype=A "))
                     && line.contains("client_ip=127.0.0.1")
             };
             assert_eq!(
