@@ -1070,61 +1070,83 @@ pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
     Ok(cfg)
 }
 
-/// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式
-/// Deserialize upstream field, supports string, comma-separated string, or array format
+/// 写成一个字符串或者一个字符串数组的值，读的时候不先缓冲下来逐种试：两种写法各个调用方自己再处理（拆逗号、去掉空白、
+/// 连起来）；都不是时报「expected a string or an array of strings」，说清要的是什么
+/// A value written as one string or as an array of strings, read without buffering it to try
+/// each way in turn: each caller handles the two ways on its own (splitting at commas, trimming,
+/// joining); anything else is refused as "expected a string or an array of strings", saying
+/// what is wanted
+enum StringOrList {
+    String(String),
+    List(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for StringOrList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Expecting;
+
+        impl<'de> Visitor<'de> for Expecting {
+            type Value = StringOrList;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<StringOrList, E> {
+                Ok(StringOrList::String(value.to_owned()))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<StringOrList, E> {
+                Ok(StringOrList::String(value))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<StringOrList, A::Error> {
+                let mut list = Vec::new();
+                while let Some(value) = seq.next_element()? {
+                    list.push(value);
+                }
+                Ok(StringOrList::List(list))
+            }
+        }
+
+        deserializer.deserialize_any(Expecting)
+    }
+}
+
+/// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式；数组连成逗号分隔的一串，空数组和 null 一样是没写
+/// Deserialize upstream field, supports string, comma-separated string, or array format; an
+/// array is joined into one comma-separated string, and an empty one is as unwritten as null
 fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::Deserialize;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum UpstreamInput {
-        String(String),
-        Array(Vec<String>),
-    }
-
-    let input = Option::<UpstreamInput>::deserialize(deserializer)?;
-
-    match input {
-        None => Ok(None),
-        Some(UpstreamInput::String(s)) => Ok(Some(s)),
-        Some(UpstreamInput::Array(arr)) => {
-            if arr.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(arr.join(",")))
-            }
-        }
-    }
+    Ok(match Option::<StringOrList>::deserialize(deserializer)? {
+        None => None,
+        Some(StringOrList::String(upstreams)) => Some(upstreams),
+        Some(StringOrList::List(upstreams)) => (!upstreams.is_empty()).then(|| upstreams.join(",")),
+    })
 }
 
-/// Deserialize a string field that also accepts an array of strings.
+/// 反序列化也可以写成数组的逗号分隔字符串：每一项去掉两头的空白，空的不要
+/// Deserialize a comma-separated string field that also accepts an array of strings: each item
+/// trimmed, and empty ones dropped
 fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrVec {
-        String(String),
-        Array(Vec<String>),
-    }
-
-    match StringOrVec::deserialize(deserializer)? {
-        StringOrVec::String(value) => Ok(value
+    Ok(match StringOrList::deserialize(deserializer)? {
+        StringOrList::String(value) => value
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .collect()),
-        StringOrVec::Array(values) => Ok(values
+            .collect(),
+        StringOrList::List(values) => values
             .into_iter()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .collect()),
-    }
+            .collect(),
+    })
 }
 
 /// 反序列化TXT文本字段，支持单个字符串或字符串数组 / Deserialize TXT text field, supports single string or string array
@@ -1132,17 +1154,10 @@ fn deserialize_txt_text<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum TxtTextInput {
-        String(String),
-        Array(Vec<String>),
-    }
-
-    match TxtTextInput::deserialize(deserializer)? {
-        TxtTextInput::String(value) => Ok(vec![value]),
-        TxtTextInput::Array(values) => Ok(values),
-    }
+    Ok(match StringOrList::deserialize(deserializer)? {
+        StringOrList::String(text) => vec![text],
+        StringOrList::List(texts) => texts,
+    })
 }
 
 /// EDNS Client Subnet (RFC 7871) 操作模式，用于 Forward 动作的请求改写。
@@ -2117,7 +2132,7 @@ fn rule_problems(
 
 #[cfg(test)]
 mod tests {
-    use super::{Matcher, ResponseMatcher};
+    use super::{Action, Matcher, ResponseMatcher, parse_config};
 
     #[test]
     fn geoip_country_codes_accept_string_or_array() {
@@ -2144,6 +2159,66 @@ mod tests {
             panic!("unexpected response matcher variant");
         };
         assert_eq!(country_codes, ["CN", "cloudflare"]);
+    }
+
+    /// 上游、国家代码和 TXT 文本写成一个字符串或者一个字符串数组都行，各按自己的办法读：上游的数组连成一串，空数组算没写；
+    /// 国家代码拆开逗号、去掉空白；TXT 一个字符串就是一段。写成别的时，错误说要的是什么、拿到的是什么
+    /// Upstreams, country codes and TXT text may each be written as a string or as an array of
+    /// strings, read each its own way: upstreams in an array are joined into one string, an
+    /// empty array counting as none written; country codes are split at commas and trimmed; a
+    /// TXT string is one piece. Written any other way, the error says what is wanted and what
+    /// was found
+    #[test]
+    fn a_string_or_a_list_is_read_by_each_field_its_own_way() {
+        let forward = |upstream: serde_json::Value| match serde_json::from_value(
+            serde_json::json!({ "type": "forward", "upstream": upstream }),
+        ) {
+            Ok(Action::Forward { upstream, .. }) => Ok(upstream),
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => Err(error.to_string()),
+        };
+        assert_eq!(
+            forward(serde_json::json!("a:53, b:53")),
+            Ok(Some("a:53, b:53".to_owned()))
+        );
+        assert_eq!(
+            forward(serde_json::json!(["a:53", "b:53"])),
+            Ok(Some("a:53,b:53".to_owned()))
+        );
+        assert_eq!(forward(serde_json::json!([])), Ok(None));
+        assert_eq!(forward(serde_json::json!(null)), Ok(None));
+        let txt = |text: serde_json::Value| match serde_json::from_value(
+            serde_json::json!({ "type": "static_txt_response", "text": text }),
+        ) {
+            Ok(Action::StaticTxtResponse { text, .. }) => Ok(text),
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => Err(error.to_string()),
+        };
+        assert_eq!(txt(serde_json::json!("a, b")), Ok(vec!["a, b".to_owned()]));
+        assert_eq!(
+            txt(serde_json::json!(["a", " b"])),
+            Ok(vec!["a".to_owned(), " b".to_owned()])
+        );
+
+        let wanted = "expected a string or an array of strings";
+        for (written, found) in [
+            (serde_json::json!(53), "invalid type: integer `53`"),
+            (serde_json::json!({ "a": "b" }), "invalid type: map"),
+        ] {
+            assert_eq!(forward(written.clone()), Err(format!("{found}, {wanted}")));
+            assert_eq!(txt(written.clone()), Err(format!("{found}, {wanted}")));
+            let config = serde_json::json!({ "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [{ "type": "geoip_country", "country_codes": written }],
+                "actions": [{ "type": "allow" }]
+            }] }] });
+            let refused = format!("{:#}", parse_config(&config.to_string()).unwrap_err());
+            assert!(refused.contains(&format!("{found}, {wanted}")), "{refused}");
+        }
+        assert_eq!(
+            forward(serde_json::json!(["a:53", 53])),
+            Err("invalid type: integer `53`, expected a string".to_owned())
+        );
     }
 }
 
