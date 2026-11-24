@@ -216,16 +216,20 @@ async fn geoip_first_used_after_a_reload_is_loaded() {
     assert_eq!(ask_from(&engine, "b.test", client).await, Some(MATCHED));
 }
 
-/// 配置里写了、启动时还不存在的文件，出现以后再热重载一次就读进来
-/// A configured file that did not exist at startup is read in by a hot reload after it appears
+/// 配置里写了、启动时连所在的目录都不存在的文件监视不了，出现以后再热重载一次就读进来（目录在的见
+/// `a_missing_geosite_file_is_read_once_it_appears`）
+/// A configured file that did not exist at startup, its directory neither, cannot be watched,
+/// and is read in by a hot reload after it appears (for one whose directory is there see
+/// `a_missing_geosite_file_is_read_once_it_appears`)
 #[tokio::test]
 async fn a_data_file_that_appears_later_is_loaded_by_the_next_reload() {
     let dir = tempfile::tempdir().unwrap();
-    let dat = dir.path().join("geosite.dat");
+    let dat = dir.path().join("later").join("geosite.dat");
 
     let engine = engine(geosite_config(&[&dat], "ads"));
     assert_eq!(ask(&engine, "www.ads.test").await, Some(OTHER));
 
+    std::fs::create_dir(dat.parent().unwrap()).unwrap();
     std::fs::write(&dat, geosite_dat(&[("ads", "ads.test")])).unwrap();
     engine.reload(geosite_config(&[&dat], "ads"));
     assert_eq!(ask(&engine, "x.ads.test").await, Some(MATCHED));
@@ -837,4 +841,183 @@ async fn geosite_tags_count_once_whatever_their_case() {
     let engine = engine(cfg);
     assert_eq!(ask(&engine, "www.geo.test").await, Some(MATCHED));
     assert_eq!(engine.geosite_manager.read().missing_tags(&used), ["gone"]);
+}
+
+/// 配置了、启动时还不存在的数据文件也被监视（它所在的目录在就行）：文件一出现就读进来，不必等热重载。它在文件里的先后照
+/// 配置写的算：几个文件声明同一个标签时排在后面的照旧说了算，后出现的文件不因此排到最后。以前不存在的文件不被监视，出现
+/// 以后要等下一次热重载
+/// A configured data file that is not there at startup is watched too (its directory being
+/// there is enough): it is read in as soon as it appears, with no hot reload to wait for. Its
+/// place among the files is the one the configuration writes: of files declaring one tag the
+/// later still decides, and a file appearing later is not ranked last for it. A file not there
+/// used not to be watched, and once it appeared it waited for the next hot reload
+#[tokio::test]
+async fn a_missing_geosite_file_is_read_once_it_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, last) = (dir.path().join("first.dat"), dir.path().join("last.dat"));
+    std::fs::write(&last, geosite_dat(&[("ads", "last.test")])).unwrap();
+    let engine = engine(geosite_config_any_of(&[&first, &last], &["ads", "cn"]));
+    assert_eq!(ask(&engine, "a.cn.test").await, Some(OTHER));
+
+    replace(
+        &first,
+        &geosite_dat(&[("ads", "first.test"), ("cn", "cn.test")]),
+    );
+    wait_for("the file that appeared is read in", || {
+        engine.geosite_manager.read().matches("cn", "x.cn.test")
+    })
+    .await;
+    assert_eq!(ask(&engine, "b.cn.test").await, Some(MATCHED));
+    // 两个文件都写着 ads，后面的说了算 / Both files write ads, and the later decides
+    let manager = engine.geosite_manager.read();
+    assert!(manager.matches("ads", "x.last.test"));
+    assert!(!manager.matches("ads", "x.first.test"));
+}
+
+/// 引擎随时说得出 Geo 数据有什么不对，一样一句话（面板经控制通道读）：配置了却不存在的文件、读不了的文件和 MMDB、规则
+/// 用到却没有数据提供的标签；文件改好了，监视读进来以后那句话就没了，MMDB 不被监视，下一次热重载读进来以后没了。以前
+/// 这些只记在日志里，规则悄悄地一直不按数据判断，geo_site_not 对所有查询都成立
+/// The engine can tell at any time what is wrong with the Geo data, a sentence each (the panel
+/// reads them over the control channel): configured files that are not there, data files and
+/// an MMDB that cannot be read, and tags rules use that no data provides; once a file is put
+/// right its sentence goes as the watch reads it in, and the MMDB's, which is not watched,
+/// once the next hot reload reads it in. These used to be in the log alone, rules quietly
+/// never judging by the data, and geo_site_not holding for every query
+#[tokio::test]
+async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+    let site = dir.path().join("geosite.dat");
+    let engine = engine(config(
+        json!({ "geosite_data_paths": [site.to_str().unwrap()] }),
+        json!({ "type": "geo_site_not", "value": "cn" }),
+    ));
+    assert_eq!(
+        engine.geo_data_warnings(),
+        [
+            format!("GeoSite data file {} does not exist", site.display()),
+            "GeoSite tags cn are in no data file: geo_site never matches them and geo_site_not always does".to_string(),
+        ]
+    );
+    replace(&site, &geosite_dat(&[("cn", "cn.test")]));
+    wait_for("the GeoSite file is read in", || {
+        engine.geo_data_warnings().is_empty()
+    })
+    .await;
+    assert_eq!(ask(&engine, "a.cn.test").await, Some(OTHER));
+
+    let (mmdb, data) = (
+        dir.path().join("country.mmdb"),
+        dir.path().join("geoip.json"),
+    );
+    std::fs::write(&mmdb, b"not a database").unwrap();
+    std::fs::write(&data, b"{ not json").unwrap();
+    let cfg = || {
+        config(
+            json!({
+                "geoip_db_path": mmdb.to_str().unwrap(),
+                "geoip_dat_path": data.to_str().unwrap(),
+            }),
+            json!({ "type": "geoip_country", "country_codes": ["US", "TESTNET"] }),
+        )
+    };
+    let engine = self::engine(cfg());
+    let warnings = engine.geo_data_warnings();
+    let unreadable =
+        |what: &str, path: &Path| format!("{what} {} cannot be read: ", path.display());
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with(&unreadable("GeoIP database", &mmdb)),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings[1].starts_with(&unreadable("GeoIP data file", &data)),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        warnings[2],
+        "GeoIP tags TESTNET, US are in no GeoIP data: geoip_country never matches them"
+    );
+
+    replace(
+        &data,
+        br#"{"entries":[{"country_code":"TESTNET","ips":["203.0.113.0/24"]}]}"#,
+    );
+    wait_for("the GeoIP data file is read in", || {
+        engine.geo_data_warnings().len() == 2
+    })
+    .await;
+    let warnings = engine.geo_data_warnings();
+    assert!(
+        warnings[0].starts_with(&unreadable("GeoIP database", &mmdb)),
+        "{warnings:?}"
+    );
+    // MMDB 读不了，国家代码改由数据文件答 / With the MMDB unreadable, the data file answers country codes
+    assert_eq!(
+        warnings[1],
+        "GeoIP tags US are in no GeoIP data: geoip_country never matches them"
+    );
+
+    let source = dir.path().join("mmdb-source.json");
+    std::fs::write(
+        &source,
+        r#"{"entries":[{"country_code":"US","ips":["198.51.100.0/24"]}]}"#,
+    )
+    .unwrap();
+    crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+    engine.reload(cfg());
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+}
+
+/// 配置了却不存在、读不了的 Geo 数据文件和 MMDB 记成错误：默认日志级别是 error，记成 warn 的话没开面板时谁也看不到。
+/// 以前都记成 warn
+/// Geo data files and an MMDB that are configured yet not there or unreadable are logged as
+/// errors: the default log level is error, and logged as warns they went unseen without the
+/// panel. They used to be logged as warns
+#[tokio::test]
+async fn missing_and_unreadable_geo_files_are_logged_as_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (site, mmdb, data) = (
+        dir.path().join("geosite.dat"),
+        dir.path().join("country.mmdb"),
+        dir.path().join("geoip.json"),
+    );
+    std::fs::write(&mmdb, b"not a database").unwrap();
+    std::fs::write(&data, b"{ not json").unwrap();
+    let config: crate::config::PipelineConfig = serde_json::from_value(json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "geosite_data_paths": [site.to_str().unwrap()],
+            "geoip_db_path": mmdb.to_str().unwrap(),
+            "geoip_dat_path": data.to_str().unwrap(),
+        },
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "r",
+            "matchers": [
+                { "type": "geo_site", "value": "ads" },
+                { "type": "geoip_country", "country_codes": ["US", "TESTNET"], "operator": "or" }
+            ],
+            "actions": [{ "type": "static_ip_response", "ip": MATCHED.to_string() }]
+        }]}]
+    }))
+    .unwrap();
+    let cfg = RuntimePipelineConfig::from_config(config).unwrap();
+    let (logged, guard) = crate::engine::test_support::Warnings::capture();
+    let _engine = engine(cfg);
+    drop(guard);
+    let lines = logged.lines();
+    let errors: Vec<&str> = lines
+        .iter()
+        .map(|line| line.trim_start())
+        .filter(|line| line.starts_with("ERROR"))
+        .collect();
+    for wanted in [
+        "GeoSite data file not found",
+        "GeoIP database",
+        "GeoIP data",
+    ] {
+        assert!(
+            errors.iter().any(|message| message.contains(wanted)),
+            "{wanted}: {errors:?}"
+        );
+    }
 }

@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 
-use super::geo::GeoSources;
+use super::geo::{GeoSources, GeoStatus};
 use crate::cache::{CacheEntry, CacheSlot, CachedQuestion, DnsCache, new_cache};
 use crate::cache_store::{CacheStore, Op};
 use crate::ecs_scope::EcsView;
@@ -54,6 +54,9 @@ pub struct Engine {
     // 串行化重载，使一次重载的状态存储、代数分配与 config_loaded 事件不与另一次交错；
     // 同时保管 Geo 数据的来源，只有重载会改它。
     pub(crate) reload_lock: Arc<Mutex<GeoSources>>,
+    // Geo 数据眼下的问题（见 `Engine::geo_data_warnings`）/ What is wrong with the Geo data right
+    // now (see `Engine::geo_data_warnings`)
+    pub(crate) geo_status: Arc<GeoStatus>,
     // Rule execution result cache: Hash -> (Key, Decision) / 规则执行结果缓存：哈希 -> (键, 决策)
     // Key is stored to verify collisions / 存储键以验证冲突
     /// 一条记录一个 `Arc`：取一次只动一个引用计数，几个核反复读同一条时不用轮流抢好几个
@@ -269,6 +272,7 @@ impl Engine {
             observer,
             config_generation: Arc::new(AtomicU64::new(1)),
             running_settings,
+            geo_status: geo_sources.status(),
             reload_lock: Arc::new(Mutex::new(geo_sources)),
             rule_cache,
             // DashMap configuration: shard count and initial capacity

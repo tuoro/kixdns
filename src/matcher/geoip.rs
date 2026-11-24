@@ -282,25 +282,25 @@ fn record_country<'a>(found: &maxminddb::LookupResult<'a, Vec<u8>>) -> Option<&'
 impl GeoIpManager {
     /// 用 `path` 的 MMDB。`current` 在用的正是这个文件、文件也没变（路径、长度、修改时间都一样）时共用它那份，不再
     /// 读一遍：以前只改了规则用的标签也要把整个库（约 10 MB）再读一遍、每个网段再走一遍，旧库还占着内存。读不了
-    /// （不存在、正被替换、写坏了）时，`current` 用的是同一个路径就留着它那份，返回 false；文件换了样子以后的热重载
-    /// 再读它（见 `engine::geo` 的 `Loaded`）。以前换进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直不按
-    /// MMDB 判断，直到重启
+    /// （不存在、正被替换、写坏了）时，`current` 用的是同一个路径就留着它那份，返回读不了的原因；文件换了样子以后的
+    /// 热重载再读它（见 `engine::geo` 的 `Loaded`）。以前换进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直
+    /// 不按 MMDB 判断，直到重启
     /// Uses the MMDB at `path`. When `current` uses that very file and the file is unchanged
     /// (same path, length and modification time) its data is shared rather than read again: a
     /// change to nothing but the tags rules use used to read the whole database (some 10 MB) and
     /// walk every network again while the old one still held memory. When it cannot be read
     /// (missing, being replaced, broken) the data `current` has from the same path stays, and
-    /// it gives false; the hot reload after the file looks otherwise reads it again (see
+    /// it gives why; the hot reload after the file looks otherwise reads it again (see
     /// `Loaded` in `engine::geo`). A manager with no MMDB used to be swapped in, and with the
     /// file still there country codes were no longer judged by the MMDB until a restart
-    pub fn use_mmdb(&mut self, path: &str, current: &Self) -> bool {
+    pub fn use_mmdb(&mut self, path: &str, current: &Self) -> anyhow::Result<()> {
         let file = FileStamp::of(Path::new(path));
         let in_use = current.mmdb.as_ref();
         if let (Ok(file), Some(in_use)) = (&file, in_use)
             && *file == in_use.file
         {
             self.mmdb = Some(Arc::clone(in_use));
-            return true;
+            return Ok(());
         }
         let opened = file
             .map_err(anyhow::Error::new)
@@ -309,14 +309,13 @@ impl GeoIpManager {
             Ok(mmdb) => {
                 tracing::info!(geoip_db = %path, records = mmdb.countries.len(), "GeoIP database loaded successfully");
                 self.mmdb = Some(Arc::new(mmdb));
-                true
+                Ok(())
             }
             Err(e) => {
                 self.mmdb = in_use
                     .filter(|in_use| in_use.file.path == Path::new(path))
                     .cloned();
-                tracing::warn!(geoip_db = %path, error = %e, keeping_the_one_in_use = self.mmdb.is_some(), "Failed to open GeoIP database");
-                false
+                Err(e)
             }
         }
     }
@@ -604,26 +603,28 @@ impl GeoIpManager {
     }
 
     /// 按扩展名解析数据文件里 `tags` 这几个标签（不分大小写），其余条目不解，不触碰管理器状态：
-    /// `.dat` 按条目读（见 `parse_dat_entries`），其余按 JSON 读（`parse_v2ray_entries`）。
-    /// 文件里没有的标签记一条告警，用它的规则不会命中。
+    /// `.dat` 按条目读（见 `parse_dat_entries`），其余按 JSON 读（`parse_v2ray_entries`）。文件里没有的标签见
+    /// [`Self::missing_tags`]
     /// Parses the `tags` of a data file (ignoring case) by its extension, leaving the other
     /// entries undecoded and the manager untouched: `.dat` is read entry by entry (see
-    /// `parse_dat_entries`) and anything else as JSON (`parse_v2ray_entries`). Tags the file
-    /// lacks are logged as a warning, since rules using them never match.
+    /// `parse_dat_entries`) and anything else as JSON (`parse_v2ray_entries`). For the tags the
+    /// file lacks see [`Self::missing_tags`]
     pub fn parse_file(path: &Path, tags: &[String]) -> anyhow::Result<ParsedGeoIp> {
         let wanted: FxHashSet<String> = tags.iter().map(|tag| tag.to_ascii_uppercase()).collect();
-        let parsed = Self::parse_matching(path, &|code| wanted.contains(code))?;
+        Self::parse_matching(path, &|code| wanted.contains(code))
+    }
 
-        let mut missing: Vec<&str> = wanted
-            .iter()
-            .map(String::as_str)
-            .filter(|tag| !parsed.tag_indexes.contains_key(*tag))
-            .collect();
-        if !missing.is_empty() {
-            missing.sort_unstable();
-            tracing::warn!(path = %path.display(), tags = ?missing, "GeoIP tags used by rules are not in the data file and never match");
-        }
-        Ok(parsed)
+    /// `tags`（规则用到的，大写）里哪些既不是 MMDB 答得了的国家代码、也没有数据文件提供：用它们的规则不会命中
+    /// The tags among `tags` (the ones rules use, uppercase) that are neither country codes the
+    /// MMDB answers nor provided by the data file: rules using them never match
+    pub fn missing_tags(&self, tags: &[String]) -> Vec<String> {
+        tags.iter()
+            .filter(|tag| {
+                !(self.has_mmdb() && is_country_tag(tag))
+                    && !self.tag_indexes.contains_key(tag.as_str())
+            })
+            .cloned()
+            .collect()
     }
 
     /// 按扩展名解析数据文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）：`.dat` 按条目读，其余按 JSON 读
@@ -920,7 +921,8 @@ mod tests {
         assert_eq!(stats.countries_count, 1);
 
         let mut mgr = GeoIpManager::default();
-        assert!(mgr.use_mmdb(&mmdb.to_string_lossy(), &GeoIpManager::default()));
+        mgr.use_mmdb(&mmdb.to_string_lossy(), &GeoIpManager::default())
+            .unwrap();
         assert!(mgr.matches_tag("198.51.100.7".parse().unwrap(), "CN"));
         assert!(!mgr.matches_tag("203.0.113.7".parse().unwrap(), "JP"));
     }
@@ -943,10 +945,10 @@ mod tests {
         };
         convert(r#"{ "entries": [{ "country_code": "CN", "ips": ["198.51.100.0/24"] }] }"#);
         let mut first = GeoIpManager::default();
-        assert!(first.use_mmdb(&path, &GeoIpManager::default()));
+        first.use_mmdb(&path, &GeoIpManager::default()).unwrap();
 
         let mut unchanged = GeoIpManager::default();
-        assert!(unchanged.use_mmdb(&path, &first));
+        unchanged.use_mmdb(&path, &first).unwrap();
         assert!(Arc::ptr_eq(
             unchanged.mmdb.as_ref().unwrap(),
             first.mmdb.as_ref().unwrap()
@@ -954,7 +956,7 @@ mod tests {
 
         std::fs::write(&mmdb, b"not a database").unwrap();
         let mut broken = GeoIpManager::default();
-        assert!(!broken.use_mmdb(&path, &first), "it was not read");
+        assert!(broken.use_mmdb(&path, &first).is_err(), "it was not read");
         assert!(broken.matches_tag("198.51.100.7".parse().unwrap(), "CN"));
 
         convert(r#"{ "entries": [{ "country_code": "JP", "ips": ["198.51.100.0/24"] }] }"#);
@@ -972,7 +974,7 @@ mod tests {
             .set_modified(later)
             .unwrap();
         let mut fixed = GeoIpManager::default();
-        assert!(fixed.use_mmdb(&path, &broken));
+        fixed.use_mmdb(&path, &broken).unwrap();
         assert!(fixed.matches_tag("198.51.100.7".parse().unwrap(), "JP"));
     }
 
@@ -1284,7 +1286,8 @@ mod tests {
             .unwrap();
 
         let mut mgr = GeoIpManager::default();
-        assert!(mgr.use_mmdb(&mmdb_path.to_string_lossy(), &GeoIpManager::default()));
+        mgr.use_mmdb(&mmdb_path.to_string_lossy(), &GeoIpManager::default())
+            .unwrap();
         mgr.load_from_dat_file(&dat_path).unwrap();
 
         let ip: IpAddr = "2001:db8::1".parse().unwrap();

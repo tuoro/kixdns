@@ -1171,15 +1171,25 @@ impl GeoSiteManager {
             .map(|(path, _)| path.as_path())
     }
 
-    /// 数据文件的身份：尽量用规范化后的绝对路径，这样配置里写的相对路径与
-    /// 监视器事件带来的绝对路径指向同一条记录；无法规范化（文件刚被删掉等）时
-    /// 退回原路径。
-    /// Identity of a data file: the canonical absolute path where possible, so a
-    /// relative path from the configuration and the absolute path a watcher
-    /// event carries refer to the same entry; falls back to the path as given
-    /// when it cannot be canonicalised (the file was just removed, say).
+    /// 数据文件的身份：尽量用规范化后的绝对路径，这样配置里写的相对路径与监视器事件带来的绝对路径指向同一条记录。文件
+    /// 不存在时规范化它所在的目录：配置里写了、还没有的文件先占着位置（见 `engine::geo` 的 `load_geosite`），出现以后
+    /// 还是同一条。目录也规范化不了时退回原路径
+    /// Identity of a data file: the canonical absolute path where possible, so a relative path
+    /// from the configuration and the absolute path a watcher event carries refer to the same
+    /// entry. For a file that is not there its directory is canonicalised: a configured file
+    /// not there yet holds its place (see `load_geosite` in `engine::geo`), and is the same
+    /// entry once it appears. When the directory cannot be canonicalised either, the path as
+    /// given
     fn source_key(path: &Path) -> PathBuf {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        std::fs::canonicalize(path)
+            .or_else(|_| {
+                let name = path.file_name().ok_or(std::io::ErrorKind::NotFound)?;
+                let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+                Ok::<_, std::io::Error>(
+                    std::fs::canonicalize(dir.unwrap_or(Path::new(".")))?.join(name),
+                )
+            })
+            .unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// 从 .dat 文件加载 `tags` 这几个标签，给出加载了几个，测试用 / Loads the tags `tags` from a .dat

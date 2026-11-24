@@ -10,15 +10,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
+use super::Engine;
 use super::types::EngineInner;
 use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::{FileStamp, GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, Swapped, parsed_provides_any};
 use crate::watcher::{FileWatch, PendingWatch};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
 #[derive(Debug, PartialEq, Eq)]
@@ -76,12 +77,13 @@ impl GeoIpSpec {
 /// 按一份 spec 加载的数据从哪来、谁在监视 / Where the data loaded for a spec came from, and what watches it
 struct Loaded<S> {
     spec: S,
-    /// 加载时看过、没有监视的文件：配置了却不存在的数据文件，以及 MMDB（读不了时照样算）。再次热重载时有哪个换了
-    /// 样子就重新加载；还是那个样子的，存在却读不了的也一样，读出来的数据不会不同，就不重新加载
-    /// The files looked at when loading that nothing watches: configured data files that were
-    /// missing, and the MMDB (one that could not be read included). A later hot reload loads
-    /// again once any of them looks otherwise; while each looks the same, one there yet
-    /// unreadable included, reading again would give the same data, so nothing is loaded again
+    /// 加载时看过、没有监视的文件：MMDB（读不了时照样算），所在目录也不在的数据文件，监视装不上时还有全部数据文件。
+    /// 再次热重载时有哪个换了样子就重新加载；还是那个样子的，存在却读不了的也一样，读出来的数据不会不同，就不重新加载
+    /// The files looked at when loading that nothing watches: the MMDB (one that could not be
+    /// read included), data files whose directory is not there either, and every data file
+    /// when the watch could not be installed. A later hot reload loads again once any of them
+    /// looks otherwise; while each looks the same, one there yet unreadable included, reading
+    /// again would give the same data, so nothing is loaded again
     unwatched: Vec<Unwatched>,
     watch: Option<FileWatch>,
 }
@@ -164,6 +166,118 @@ impl Rotation {
     }
 }
 
+/// 两种 Geo 数据眼下的问题：配置了却不存在或读不了的文件、装不上的监视、规则用到却没有数据提供的标签。启动、热重载和
+/// 监视到文件变了时跟着更新，面板经控制通道读（见 [`Engine::geo_data_warnings`]）
+/// What is wrong with the two kinds of Geo data right now: configured files that are missing
+/// or cannot be read, watches that cannot be installed, and tags rules use that no data
+/// provides. Kept up to date at startup, on hot reloads and as watched files change, and read
+/// by the panel over the control channel (see [`Engine::geo_data_warnings`])
+#[derive(Default)]
+pub(crate) struct GeoStatus {
+    site: Mutex<DataStatus>,
+    ip: Mutex<DataStatus>,
+}
+
+/// 一种 Geo 数据的问题，每样一句话 / What is wrong with one kind of Geo data, a sentence each
+#[derive(Default)]
+struct DataStatus {
+    /// 读不进来的文件，各带说它的那句话 / The files that could not be read in, each with the sentence saying so
+    files: Vec<(PathBuf, String)>,
+    /// 监视装不上时说它的那句话 / The sentence saying the watch could not be installed, when it could not
+    watch: Option<String>,
+    /// 规则用到、却没有数据提供的标签，说它们的那句话 / The sentence naming the tags rules use that no data provides
+    tags: Option<String>,
+}
+
+impl DataStatus {
+    /// `what`（比如 GeoSite data file）`path` 不存在 / `what` (GeoSite data file, say) `path` is not there
+    fn missing(&mut self, what: &str, path: &Path) {
+        self.file(path, format!("{what} {} does not exist", path.display()));
+    }
+
+    /// 读 `what` `path` 时出了 `err`：不存在，或者读不了 / Reading `what` `path` failed with `err`:
+    /// it is not there, or cannot be read
+    fn not_read(&mut self, what: &str, path: &Path, err: &anyhow::Error) {
+        if path.exists() {
+            self.file(
+                path,
+                format!("{what} {} cannot be read: {err:#}", path.display()),
+            );
+        } else {
+            self.missing(what, path);
+        }
+    }
+
+    fn file(&mut self, path: &Path, said: String) {
+        match self.files.iter_mut().find(|(file, _)| file == path) {
+            Some((_, was)) => *was = said,
+            None => self.files.push((path.to_path_buf(), said)),
+        }
+    }
+
+    /// `what` 的监视因为 `err` 装不上 / The watch on `what` could not be installed because of `err`
+    fn not_watched(&mut self, what: &str, err: &dyn std::fmt::Display) {
+        self.watch = Some(format!(
+            "{what} cannot be watched for changes, which are read at the next configuration reload: {err}"
+        ));
+    }
+
+    /// `path` 读进来了 / `path` was read in
+    fn read(&mut self, path: &Path) {
+        self.files.retain(|(file, _)| file != path);
+    }
+
+    fn sentences(&self) -> impl Iterator<Item = &str> {
+        let files = self.files.iter().map(|(_, said)| said.as_str());
+        files
+            .chain(self.watch.as_deref())
+            .chain(self.tags.as_deref())
+    }
+}
+
+impl Engine {
+    /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、装不上的文件监视、规则用到却没有数据提供的标签
+    /// （这样的规则 geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到
+    /// 文件变了时跟着更新
+    /// What is wrong with the Geo data right now, a sentence each: configured files that are
+    /// missing or cannot be read, file watches that cannot be installed, and tags rules use
+    /// that no data provides (geo_site and geoip_country never match them, and geo_site_not
+    /// always does). Empty when nothing is wrong. Kept up to date at startup, on hot reloads and
+    /// as watched files change
+    pub fn geo_data_warnings(&self) -> Vec<String> {
+        let (site, ip) = (self.geo_status.site.lock(), self.geo_status.ip.lock());
+        site.sentences()
+            .chain(ip.sentences())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// 规则用到、却没有 GeoSite 数据文件提供的标签记一条告警，给出状态里说它们的那句话
+/// Logs the tags rules use that no GeoSite data file provides, giving the status's sentence
+/// naming them
+fn unprovided_geosite_tags(missing: &[String]) -> Option<String> {
+    (!missing.is_empty()).then(|| {
+        warn!(tags = ?missing, "GeoSite tags used by rules are not in any data file and never match");
+        format!(
+            "GeoSite tags {} are in no data file: geo_site never matches them and geo_site_not always does",
+            missing.join(", ")
+        )
+    })
+}
+
+/// 规则用到、却没有 GeoIP 数据提供的标签记一条告警，给出状态里说它们的那句话
+/// Logs the tags rules use that no GeoIP data provides, giving the status's sentence naming them
+fn unprovided_geoip_tags(missing: &[String]) -> Option<String> {
+    (!missing.is_empty()).then(|| {
+        warn!(tags = ?missing, "GeoIP tags used by rules are in no GeoIP data and never match");
+        format!(
+            "GeoIP tags {} are in no GeoIP data: geoip_country never matches them",
+            missing.join(", ")
+        )
+    })
+}
+
 /// 两个管理器里现在的 Geo 数据从哪来；只在重载锁下使用（见 `Engine::reload_lock`）
 /// Where the Geo data now in the two managers came from; used only under the reload lock
 /// (see `Engine::reload_lock`)
@@ -171,6 +285,7 @@ pub(crate) struct GeoSources {
     geosite: Loaded<GeoSiteSpec>,
     geoip: Loaded<GeoIpSpec>,
     rotation: Rotation,
+    status: Arc<GeoStatus>,
 }
 
 impl GeoSources {
@@ -188,16 +303,24 @@ impl GeoSources {
             ip: Arc::default(),
             state: Arc::clone(state),
         };
+        let status = Arc::default();
         Self {
-            geosite: load_geosite(GeoSiteSpec::of(cfg), geosite, &rotation),
-            geoip: load_geoip(GeoIpSpec::of(cfg), None, geoip, &rotation),
+            geosite: load_geosite(GeoSiteSpec::of(cfg), geosite, &rotation, &status),
+            geoip: load_geoip(GeoIpSpec::of(cfg), None, geoip, &rotation, &status),
             rotation,
+            status,
         }
     }
 
     /// 两种 Geo 数据现在的代数 / The two kinds of Geo data's generations now
     pub(crate) fn generation(&self) -> GeoGeneration {
         self.rotation.generation()
+    }
+
+    /// 两种 Geo 数据眼下的问题，加载和监视都往这里写 / What is wrong with the two kinds of Geo data,
+    /// which loading and the watches write to
+    pub(crate) fn status(&self) -> Arc<GeoStatus> {
+        Arc::clone(&self.status)
     }
 
     /// 热重载到 `cfg`：它要的 Geo 数据和现在的不同时，换成新数据并改为监视新的文件。在换入新规则
@@ -218,93 +341,129 @@ impl GeoSources {
             // Stop the old watch and wait for it first, so it cannot write into the new
             // data after the swap
             self.geosite.watch = None;
-            self.geosite = load_geosite(spec, geosite, &self.rotation);
+            self.geosite = load_geosite(spec, geosite, &self.rotation, &self.status);
         }
         let spec = GeoIpSpec::of(cfg);
         if !self.geoip.is_current(&spec) {
             info!(tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
             self.geoip.watch = None;
             let in_use = self.geoip.spec.dat_path.clone();
-            self.geoip = load_geoip(spec, in_use.as_deref(), geoip, &self.rotation);
+            self.geoip = load_geoip(spec, in_use.as_deref(), geoip, &self.rotation, &self.status);
         }
     }
 }
 
-/// 开始监视 `paths`；装不上就只记一条告警，数据照样加载
-/// Starts watching `paths`; when the watch cannot be installed a warning is logged and the
-/// data is loaded all the same
-fn pending_watch(what: &str, paths: &[PathBuf]) -> Option<PendingWatch> {
-    if paths.is_empty() {
-        return None;
+/// 开始监视 `files` 里监视得了的：在的文件，以及所在的目录在、出现时看得见的不在的文件。装不上时记一条错误、写进
+/// `problems`，数据照样加载。给出装好的监视和它监视的文件
+/// Starts watching those of `files` that can be: the files there, and those not there whose
+/// directory is, where they show up once created. When the watch cannot be installed an
+/// error is logged and written to `problems`, and the data is loaded all the same. Gives the
+/// watch installed and the files it watches
+fn pending_watch(
+    what: &str,
+    files: &[PathBuf],
+    problems: &mut DataStatus,
+) -> (Option<PendingWatch>, Vec<PathBuf>) {
+    let watchable: Vec<PathBuf> = files
+        .iter()
+        .filter(|path| {
+            path.exists()
+                || path
+                    .parent()
+                    .is_none_or(|dir| dir.as_os_str().is_empty() || dir.is_dir())
+        })
+        .cloned()
+        .collect();
+    if watchable.is_empty() {
+        return (None, watchable);
     }
-    PendingWatch::new(paths)
-        .inspect_err(|err| warn!(what, error = %err, "cannot watch data files for changes"))
-        .ok()
+    match PendingWatch::new(&watchable) {
+        Ok(pending) => (Some(pending), watchable),
+        Err(err) => {
+            error!(what, error = %err, "cannot watch data files for changes, they are read again at the next configuration reload");
+            problems.not_watched(what, &err);
+            (None, Vec::new())
+        }
+    }
 }
 
-/// 起线程处理监视到的变化；起不了线程就只记一条告警
-/// Starts the thread that handles watched changes; when it cannot start a warning is logged
+/// 起线程处理监视到的变化；起不了线程就记一条错误，写进 `status`
+/// Starts the thread that handles watched changes; when it cannot start an error is logged and
+/// written to `status`
 fn start_watch(
     pending: Option<PendingWatch>,
+    what: &str,
     name: &str,
+    status: &Mutex<DataStatus>,
     on_change: impl FnMut(&Path) + Send + 'static,
 ) -> Option<FileWatch> {
     pending?
         .start(name, on_change)
-        .inspect_err(|err| warn!(name, error = %err, "cannot start the data file watcher"))
+        .inspect_err(|err| {
+            error!(name, error = %err, "cannot start the data file watcher, the files are read again at the next configuration reload");
+            status.lock().not_watched(what, err);
+        })
         .ok()
 }
 
-/// 在锁外建好 `spec` 的 GeoSite 数据，整体换进 `shared`，再按新的文件和标签监视
+/// 在锁外建好 `spec` 的 GeoSite 数据，整体换进 `shared`，再按新的文件和标签监视；读的时候出的问题写进 `status`
 /// Builds `spec`'s GeoSite data outside the lock, swaps it into `shared` whole, then watches
-/// the new files for the new tags
+/// the new files for the new tags; what goes wrong reading them is written to `status`
 fn load_geosite(
     spec: GeoSiteSpec,
     shared: &Arc<RwLock<GeoSiteManager>>,
     rotation: &Rotation,
+    status: &Arc<GeoStatus>,
 ) -> Loaded<GeoSiteSpec> {
-    let mut unwatched = Vec::new();
-    let mut files = Vec::new();
-    for path_str in &spec.paths {
-        let path = PathBuf::from(path_str);
-        if !path.exists() {
-            warn!(path = %path.display(), "GeoSite data file not found, skipping");
-            unwatched.push(Unwatched::now(path));
-        } else if spec.tags.is_empty() {
-            // 数据文件只读规则用到的标签，一个都没用到就不必读，也不必监视
-            // A data file is read only for the tags rules use; with none used it is neither
-            // read nor watched
-            info!(path = %path.display(), "No GeoSite tags used in config, skipping GeoSite data loading");
-        } else {
-            files.push(path);
+    // 数据文件只读规则用到的标签，一个都没用到就不必读，也不必监视
+    // A data file is read only for the tags rules use; with none used it is neither read nor
+    // watched
+    let files: Vec<PathBuf> = if spec.tags.is_empty() {
+        if !spec.paths.is_empty() {
+            info!(paths = ?spec.paths, "No GeoSite tags used in config, skipping GeoSite data loading");
         }
-    }
-
-    let pending = pending_watch("GeoSite data", &files);
+        Vec::new()
+    } else {
+        spec.paths.iter().map(PathBuf::from).collect()
+    };
+    let mut problems = DataStatus::default();
+    let seen: Vec<Unwatched> = files.iter().map(Unwatched::now).collect();
+    let (pending, watched) = pending_watch("GeoSite data files", &files, &mut problems);
     let mut fresh = GeoSiteManager::new();
     // 读出来没有一个规则用到的标签的文件（读不了的也算）/ The files whose read gave none of the
     // tags rules use (unreadable ones included)
     let mut gave_nothing = Vec::new();
     for path in &files {
-        // 解析失败的文件照样监视：写了一半或被截断的文件在下次写完时能自己恢复，不必重启进程。它在文件里的
-        // 先后也照样记下（几个文件声明同一个标签时排在后面的说了算）
+        // 解析失败的文件照样监视：写了一半或被截断的文件在下次写完时能自己恢复，不必重启进程
         // A file that failed to parse is watched all the same: a half-written or truncated
-        // file heals itself on the next write instead of needing a restart. Its place among
-        // the files is recorded all the same (of files declaring one tag the later decides)
-        let parsed = GeoSiteManager::parse_file(path, &spec.tags)
-            .inspect_err(|e| warn!(path = %path.display(), error = %e, "failed to load GeoSite data, waiting for the file to change"))
-            .ok();
-        let readable = parsed.is_some();
-        let parsed = parsed.unwrap_or_default();
-        if !parsed_provides_any(&parsed, &spec.tags) {
-            gave_nothing.push(path);
-        }
-        let count = fresh.apply_source(path, parsed);
-        if readable {
-            info!(path = %path.display(), loaded_count = count,
-                 used_tags = spec.tags.len(),
-                 "loaded GeoSite data from file");
-        }
+        // file heals itself on the next write instead of needing a restart
+        let parsed = if path.exists() {
+            let parsed = match GeoSiteManager::parse_file(path, &spec.tags) {
+                Ok(parsed) => {
+                    info!(path = %path.display(), loaded_count = parsed.len(), used_tags = spec.tags.len(), "loaded GeoSite data from file");
+                    parsed
+                }
+                Err(err) => {
+                    error!(path = %path.display(), error = %format!("{err:#}"), "failed to load GeoSite data, waiting for the file to change");
+                    problems.not_read("GeoSite data file", path, &err);
+                    Vec::new()
+                }
+            };
+            if !parsed_provides_any(&parsed, &spec.tags) {
+                gave_nothing.push(path);
+            }
+            parsed
+        } else {
+            error!(path = %path.display(), "GeoSite data file not found, waiting for it to appear");
+            problems.missing("GeoSite data file", path);
+            Vec::new()
+        };
+        // 每个文件在文件里的先后都记下，不在的、读不了的也算（几个文件声明同一个标签时排在后面的说了算），它们之后读进来
+        // 的数据照样排在这里
+        // Every file's place among the files is recorded, those not there or unreadable
+        // included (of files declaring one tag the later decides), so what is read from them
+        // later still ranks there
+        fresh.apply_source(path, parsed);
     }
     // 规则用到、刚读的文件却一个都不提供的标签 / The tags rules use that none of the files just
     // read provides
@@ -338,30 +497,50 @@ fn load_geosite(
         let tags = swapped.finish();
         warn!(path = %path.display(), tags, "GeoSite data file now has none of the tags rules use, keeping the data in use");
     }
-    if !files.is_empty() {
-        warn_missing_geosite_tags(&missing_tags);
-    }
+    // 没有要读的文件时不算，配置的告警已经说了（见 `config::geo_tags_without_data`）/ Not with no
+    // file to read: the configuration's warnings say so already (see `config::geo_tags_without_data`)
+    problems.tags = (!files.is_empty())
+        .then(|| unprovided_geosite_tags(&missing_tags))
+        .flatten();
     rotation.site_swapped();
 
+    // 状态在监视开始之前写好：监视线程之后写进来的不会被它盖掉 / The status is written before the
+    // watch starts, so what the watch thread writes later is not overwritten by it
+    *status.site.lock() = problems;
     let manager = Arc::clone(shared);
     let tags = spec.tags.clone();
     let rotation = rotation.clone();
-    let watch = start_watch(pending, "geosite-watch", move |path| {
-        if reload_geosite_file(&manager, path, &tags) {
-            rotation.site_swapped();
-        }
-    });
+    let watching = Arc::clone(status);
+    let watch = start_watch(
+        pending,
+        "GeoSite data files",
+        "geosite-watch",
+        &status.site,
+        move |path| {
+            if reload_geosite_file(&manager, path, &tags, &watching.site) {
+                rotation.site_swapped();
+            }
+        },
+    );
     Loaded {
         spec,
-        unwatched,
+        unwatched: unwatched(seen, watch.is_some().then_some(&watched)),
         watch,
     }
+}
+
+/// `seen` 里不在 `watched` 之下的文件（没有监视时是全部）/ The files of `seen` that `watched` does
+/// not cover (all of them without a watch)
+fn unwatched(seen: Vec<Unwatched>, watched: Option<&Vec<PathBuf>>) -> Vec<Unwatched> {
+    seen.into_iter()
+        .filter(|file| watched.is_none_or(|watched| !watched.contains(&file.path)))
+        .collect()
 }
 
 /// 监视到 GeoSite 数据文件 `path` 变了：只替换它贡献的标签，其它文件贡献的标签不动（见
 /// [`GeoSiteManager::apply_source`]）。文件都在锁外读：先在读锁下算出哪些标签要由前面的文件顶上，在锁外读那些
 /// 文件，再短暂持写锁换进去。以前要顶上的标签在写锁里读，这期间所有按 GeoSite 匹配的查询都停着。监视线程是管理器
-/// 唯一写数据的（热重载先停下监视再换数据），所以读锁下算出来的到换进去时仍然成立
+/// 唯一写数据的（热重载先停下监视再换数据），所以读锁下算出来的到换进去时仍然成立。读得了、读不了都写进 `status`
 /// A watched GeoSite data file `path` changed: only the tags it contributes are replaced,
 /// leaving other files' tags alone (see [`GeoSiteManager::apply_source`]). Every file is read
 /// outside the lock: which tags earlier files are to take over is worked out under the read
@@ -369,15 +548,23 @@ fn load_geosite(
 /// tags taken over used to be read under the write lock, stalling every GeoSite match
 /// meanwhile. The watch thread is the only one writing to the manager (a hot reload stops
 /// the watch before swapping data), so what was worked out under the read lock still holds
-/// at the swap. Gives whether new data went in / 换进了新数据时为 true
-fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[String]) -> bool {
+/// at the swap. Whether it could be read or not goes to `status`. Gives whether new data went
+/// in / 换进了新数据时为 true
+fn reload_geosite_file(
+    manager: &RwLock<GeoSiteManager>,
+    path: &Path,
+    tags: &[String],
+    status: &Mutex<DataStatus>,
+) -> bool {
     let parsed = match GeoSiteManager::parse_file(path, tags) {
         Ok(parsed) => parsed,
         Err(err) => {
-            warn!(path = %path.display(), error = %format!("{err:#}"), "GeoSite data reload failed, keeping the data in use");
+            error!(path = %path.display(), error = %format!("{err:#}"), "GeoSite data reload failed, keeping the data in use");
+            status.lock().not_read("GeoSite data file", path, &err);
             return false;
         }
     };
+    status.lock().read(path);
     let handovers = manager.read().handovers(path, &parsed);
     // 新读出来一个规则用到的标签都没有：多半是空文件或写坏了的文件（下载失败、磁盘写满）。只有它提供的标签换掉会让用
     // 它们的规则一下子全不命中，所以留着正在用的数据，等文件下次改动；别的文件也提供的标签照常交给那个文件，和全部
@@ -402,37 +589,32 @@ fn reload_geosite_file(manager: &RwLock<GeoSiteManager>, path: &Path, tags: &[St
     drop(manager);
     let count = swapped.finish();
     info!(path = %path.display(), loaded_count = count, "GeoSite data reloaded");
-    warn_missing_geosite_tags(&missing);
+    status.lock().tags = unprovided_geosite_tags(&missing);
     true
 }
 
-/// 规则用到、却没有一个 GeoSite 数据文件提供的标签记一条告警，和 GeoIP 一样
-/// Logs the tags rules use that no GeoSite data file provides, as GeoIP does
-fn warn_missing_geosite_tags(missing: &[String]) {
-    if !missing.is_empty() {
-        warn!(tags = ?missing, "GeoSite tags used by rules are not in any data file and never match");
-    }
-}
-
-/// 在锁外建好 `spec` 的 GeoIP 数据，整体换进 `shared`，再监视新的数据文件。`in_use` 是 `shared` 里正在用的
-/// 数据读自哪个数据文件（启动时还没有）
+/// 在锁外建好 `spec` 的 GeoIP 数据，整体换进 `shared`，再监视新的数据文件；读的时候出的问题写进 `status`。`in_use` 是
+/// `shared` 里正在用的数据读自哪个数据文件（启动时还没有）
 /// Builds `spec`'s GeoIP data outside the lock, swaps it into `shared` whole, then watches the
-/// new data file. `in_use` is the data file the data in `shared` was read from (none yet at
-/// startup)
+/// new data file; what goes wrong reading it is written to `status`. `in_use` is the data file
+/// the data in `shared` was read from (none yet at startup)
 fn load_geoip(
     spec: GeoIpSpec,
     in_use: Option<&str>,
     shared: &Arc<RwLock<GeoIpManager>>,
     rotation: &Rotation,
+    status: &Arc<GeoStatus>,
 ) -> Loaded<GeoIpSpec> {
+    let mut problems = DataStatus::default();
     let mut fresh = GeoIpManager::default();
-    // MMDB 不被监视，换了样子由热重载读（见 `Loaded::unwatched`）；读不了时告警 use_mmdb 自己记
-    // The MMDB is not watched, a hot reload reading it once it looks otherwise (see
-    // `Loaded::unwatched`); when it cannot be read use_mmdb logs the warning itself
-    let mut unwatched = Vec::new();
-    if let Some(db_path) = &spec.db_path {
-        unwatched.push(Unwatched::now(db_path));
-        fresh.use_mmdb(db_path, &shared.read());
+    // MMDB 不被监视，换了样子由热重载读（见 `Loaded::unwatched`）/ The MMDB is not watched, a hot
+    // reload reading it once it looks otherwise (see `Loaded::unwatched`)
+    let mmdb = spec.db_path.as_ref().map(Unwatched::now);
+    if let Some(db_path) = &spec.db_path
+        && let Err(err) = fresh.use_mmdb(db_path, &shared.read())
+    {
+        error!(geoip_db = %db_path, error = %format!("{err:#}"), keeping_the_one_in_use = fresh.has_mmdb(), "failed to open GeoIP database, waiting for it to change");
+        problems.not_read("GeoIP database", Path::new(db_path), &err);
     }
 
     // MMDB 加载上了，国家代码就只查它（见 GeoIpManager::matches_any_tag），数据文件只读其余的标签
@@ -446,27 +628,36 @@ fn load_geoip(
         .collect();
     let mut files = Vec::new();
     if let Some(dat_path) = &spec.dat_path {
-        let path = PathBuf::from(dat_path);
         if dat_tags.is_empty() {
-            info!(path = %path.display(), "every GeoIP tag rules use is a country code the GeoIP database answers, skipping the GeoIP data file");
-        } else if path.exists() {
-            files.push(path);
+            info!(path = %dat_path, "every GeoIP tag rules use is a country code the GeoIP database answers, skipping the GeoIP data file");
         } else {
-            warn!(path = %path.display(), "GeoIP data file not found, skipping");
-            unwatched.push(Unwatched::now(path));
+            files.push(PathBuf::from(dat_path));
         }
     }
-
-    let pending = pending_watch("GeoIP data", &files);
+    let seen: Vec<Unwatched> = files.iter().map(Unwatched::now).collect();
+    let (pending, watched) = pending_watch("GeoIP data file", &files, &mut problems);
+    // 读出来没有一个规则用到的标签的数据文件（读不了的也算）/ The data file if its read gave none of
+    // the tags rules use (an unreadable one included)
+    let mut gave_nothing = None;
     for path in &files {
+        if !path.exists() {
+            error!(path = %path.display(), "GeoIP data file not found, waiting for it to appear");
+            problems.missing("GeoIP data file", path);
+            continue;
+        }
         // 解析失败的文件和 GeoSite 一样照样监视 / A file that failed to parse is watched, as for GeoSite
         match GeoIpManager::parse_file(path, &dat_tags) {
             Ok(parsed) => {
+                if parsed.tag_count() == 0 {
+                    gave_nothing = Some(path);
+                }
                 let count = fresh.apply_parsed(parsed);
                 info!(path = %path.display(), loaded_count = count, used_tags = dat_tags.len(), "loaded GeoIP data from file");
             }
-            Err(e) => {
-                warn!(path = %path.display(), error = %e, "failed to load GeoIP data, waiting for the file to change");
+            Err(err) => {
+                error!(path = %path.display(), error = %format!("{err:#}"), "failed to load GeoIP data, waiting for the file to change");
+                problems.not_read("GeoIP data file", path, &err);
+                gave_nothing = Some(path);
             }
         }
     }
@@ -478,13 +669,13 @@ fn load_geoip(
     // likely an empty or broken file. The tags the rules still use keep the data in use until
     // the file changes again. The write lock is held only to move data: the warning waits
     // until it is released, and the old data is freed outside it too
-    let gave_nothing = files.first().filter(|path| {
-        fresh.tag_count() == 0 && in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path())
-    });
-    let (old, kept) = {
+    let gave_nothing = gave_nothing
+        .filter(|path| in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path()));
+    let (old, kept, missing_tags) = {
         let mut current = shared.write();
         let kept = gave_nothing.map_or(0, |_| fresh.keep_tags_of(&mut current, &dat_tags));
-        (mem::replace(&mut *current, fresh), kept)
+        let missing_tags = fresh.missing_tags(&spec.tags);
+        (mem::replace(&mut *current, fresh), kept, missing_tags)
     };
     drop(old);
     if let Some(path) = gave_nothing
@@ -492,40 +683,66 @@ fn load_geoip(
     {
         warn!(path = %path.display(), tags = kept, "GeoIP data file now has none of the tags rules use, keeping the data in use");
     }
+    // 配置里没给数据的标签不算，配置的告警已经说了（见 `config::geo_tags_without_data`）/ Tags the
+    // configuration gives no data for do not count: its warnings say so already (see
+    // `config::geo_tags_without_data`)
+    let given_data =
+        |tag: &String| spec.dat_path.is_some() || (spec.db_path.is_some() && is_country_tag(tag));
+    let missing_tags: Vec<String> = missing_tags.into_iter().filter(given_data).collect();
+    problems.tags = unprovided_geoip_tags(&missing_tags);
     rotation.ip_swapped();
 
+    // 状态在监视开始之前写好，和 GeoSite 一样 / The status is written before the watch starts, as for GeoSite
+    *status.ip.lock() = problems;
     let manager = Arc::clone(shared);
     let rotation = rotation.clone();
-    let watch = start_watch(pending, "geoip-watch", move |path| {
-        if reload_geoip_file(&manager, path, &dat_tags) {
-            rotation.ip_swapped();
-        }
-    });
+    let watching = Arc::clone(status);
+    let watch = start_watch(
+        pending,
+        "GeoIP data file",
+        "geoip-watch",
+        &status.ip,
+        move |path| {
+            if reload_geoip_file(&manager, path, &dat_tags, &watching.ip) {
+                rotation.ip_swapped();
+            }
+        },
+    );
+    let files = unwatched(seen, watch.is_some().then_some(&watched));
     Loaded {
         spec,
-        unwatched,
+        unwatched: mmdb.into_iter().chain(files).collect(),
         watch,
     }
 }
 
 /// 监视到 GeoIP 数据文件 `path` 变了：在锁外读取、解码、建索引、记日志，装进一个和在用的共用 MMDB 的新管理器，只在
 /// 把它换进去时短暂持写锁，换下来的也在锁外放掉——匹配走读锁，整个重载都在写锁里时，三十万网段的 .dat 让所有 GeoIP
-/// 匹配停了 961 ms。监视线程是唯一写管理器的（热重载先停下监视再换数据），所以读锁下拿到的 MMDB 到换进去时仍是在用的那份
+/// 匹配停了 961 ms。监视线程是唯一写管理器的（热重载先停下监视再换数据），所以读锁下拿到的 MMDB 到换进去时仍是在用的那份。
+/// 读得了、读不了都写进 `status`
 /// A watched GeoIP data file `path` changed: reading, decoding, indexing and logging happen
 /// outside the lock, into a new manager sharing the MMDB in use, and the write lock is held only
 /// to swap it in, the old one freed outside it too. Matching takes the read lock, and with the
 /// whole reload under the write lock a .dat of 300k networks stalled every GeoIP match for
 /// 961 ms. The watch thread is the only one writing to the manager (a hot reload stops the
 /// watch before swapping data), so the MMDB taken under the read lock is still the one in use
-/// at the swap. Gives whether new data went in / 换进了新数据时为 true
-fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String]) -> bool {
+/// at the swap. Whether it could be read or not goes to `status`. Gives whether new data went
+/// in / 换进了新数据时为 true
+fn reload_geoip_file(
+    manager: &RwLock<GeoIpManager>,
+    path: &Path,
+    tags: &[String],
+    status: &Mutex<DataStatus>,
+) -> bool {
     let parsed = match GeoIpManager::parse_file(path, tags) {
         Ok(parsed) => parsed,
         Err(err) => {
-            warn!(path = %path.display(), error = %format!("{err:#}"), "GeoIP data reload failed, keeping the data in use");
+            error!(path = %path.display(), error = %format!("{err:#}"), "GeoIP data reload failed, keeping the data in use");
+            status.lock().not_read("GeoIP data file", path, &err);
             return false;
         }
     };
+    status.lock().read(path);
     // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
     // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
     // none of them any more, most likely a broken file, so the data in use stays
@@ -535,9 +752,11 @@ fn reload_geoip_file(manager: &RwLock<GeoIpManager>, path: &Path, tags: &[String
     }
     let mut fresh = manager.read().sharing_mmdb();
     let count = fresh.apply_parsed(parsed);
+    let missing = fresh.missing_tags(tags);
     let old = mem::replace(&mut *manager.write(), fresh);
     drop(old);
     info!(path = %path.display(), loaded_count = count, "GeoIP data reloaded");
+    status.lock().tags = unprovided_geoip_tags(&missing);
     true
 }
 
@@ -610,8 +829,14 @@ mod tests {
             under_lock: Arc::clone(&under_lock),
         });
         tracing::subscriber::with_default(subscriber, || {
-            assert!(reload_geosite_file(&geosite, &site, &site_tags));
-            assert!(reload_geoip_file(&geoip, &ip, &ip_tags));
+            let status = GeoStatus::default();
+            assert!(reload_geosite_file(
+                &geosite,
+                &site,
+                &site_tags,
+                &status.site
+            ));
+            assert!(reload_geoip_file(&geoip, &ip, &ip_tags, &status.ip));
         });
         assert!(logged.load(Ordering::SeqCst) > 0, "the reloads log");
         assert_eq!(
@@ -697,13 +922,14 @@ mod tests {
                 paths: vec![site.to_str().unwrap().to_string()],
                 tags: site_tags,
             };
-            drop(load_geosite(spec, &geosite, &rotation));
+            let status = Arc::default();
+            drop(load_geosite(spec, &geosite, &rotation, &status));
             let spec = GeoIpSpec {
                 tags: ip_tags,
                 db_path: None,
                 dat_path: Some(ip_path.to_string()),
             };
-            drop(load_geoip(spec, Some(ip_path), &geoip, &rotation));
+            drop(load_geoip(spec, Some(ip_path), &geoip, &rotation, &status));
         });
         assert!(logged.load(Ordering::SeqCst) > 0, "the reloads log");
         assert_eq!(
@@ -753,8 +979,9 @@ mod tests {
         // outlives the call
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
+        let status = Mutex::default();
         std::thread::scope(|scope| {
-            let reload = scope.spawn(|| reload_geosite_file(&manager, &last, &tags));
+            let reload = scope.spawn(|| reload_geosite_file(&manager, &last, &tags, &status));
             // 打开写的一端要等读的一端也打开：这时重载正在读前面那个文件 / Opening the writing end
             // waits for the reading end to open: the reload is reading the earlier file now
             let mut pipe = std::fs::OpenOptions::new()
