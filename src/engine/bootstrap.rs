@@ -25,16 +25,13 @@ use rustc_hash::FxHashMap;
 use tokio::time::{Instant, timeout};
 use tracing::debug;
 
-use super::transport::UdpClient;
+use super::transport::{UdpClient, UdpExchange};
 
 /// 问一次 bootstrap 最多等多久。从没问到过的名字，建连要等它问完，而建连一共只有 `transport::CONNECT_BUDGET`
-/// （5 秒），剩下的留给 TCP 和 TLS 握手。以前等的是 `upstream_timeout_ms`（默认 9 秒），比整个建连还长：bootstrap
-/// 不答时还没轮到用上次的地址，建连就超时了
+/// （5 秒），剩下的留给 TCP 和 TLS 握手
 /// How long one asking of bootstrap waits at most. For a name never given any addresses the
 /// connect waits for the asking, and a connect has `transport::CONNECT_BUDGET` (5 seconds) in
-/// all, the rest of which the TCP and TLS handshakes need. It used to wait `upstream_timeout_ms`
-/// (9 seconds by default), longer than the whole connect: with bootstrap not answering, the
-/// connect timed out before the last addresses could stand in
+/// all, the rest of which the TCP and TLS handshakes need
 const ASK_BUDGET: Duration = Duration::from_secs(2);
 
 /// A 和 AAAA 有一种先答出了地址，另一种最多再等多久（RFC 8305 §3 的 Resolution Delay）
@@ -212,13 +209,11 @@ impl Through {
     }
 
     /// 向 `server` 问 A 和 AAAA 记录（`queries` 是这两个查询），给出地址和各自的 TTL。一种先答出了地址，
-    /// 另一种只是添头：最多再等 [`RESOLUTION_DELAY`]，没答上来、出了错都不要了。以前两种都要答，丢了一个 AAAA 就
-    /// 等满整个时限，答了的 A 也一起丢掉
+    /// 另一种只是添头：最多再等 [`RESOLUTION_DELAY`]，没答上来、出了错都不要了，不为它丢掉已经答了的那种
     /// Asks `server` for the A and AAAA records (`queries` being those two queries),
     /// giving the addresses with their TTLs. With one answered with addresses first, the other is
-    /// a bonus: waited for [`RESOLUTION_DELAY`] at most, and left out unanswered or failed. Both
-    /// used to be needed, so a lost AAAA waited out the whole time limit and threw the A answered
-    /// away with it
+    /// a bonus: waited for [`RESOLUTION_DELAY`] at most, and left out unanswered or failed, never
+    /// costing the one answered
     async fn ask_server(
         &self,
         server: &str,
@@ -240,9 +235,23 @@ impl Through {
         Ok(given)
     }
 
-    /// `server` 对 `query` 答的地址和各自的 TTL / The addresses `server` answers `query` with, and their TTLs
+    /// `server` 对 `query` 答的地址和各自的 TTL。一份查询过了这次问的时限（[`ASK_BUDGET`]）的三分之一还没有回答就再发
+    /// 一份，和还没答过的上游一样（见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见
+    /// [`UdpExchange`]）：丢了一个包的查询不用等满整个时限
+    /// The addresses `server` answers `query` with, and their TTLs. A copy left unanswered for a
+    /// third of the asking's time limit ([`ASK_BUDGET`]) has another sent, as for an upstream yet to
+    /// answer (see `upstream::hedge_timeout`); the earlier ones are still waited for, the first
+    /// reply to come being used (see [`UdpExchange`]): a query with a packet lost does not wait
+    /// out the whole limit
     async fn records(&self, server: &str, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
-        let reply = self.udp.begin(query, server).await?.reply().await?;
+        let resend_after = super::upstream::hedge_timeout(ASK_BUDGET);
+        let mut exchange = UdpExchange::new(&self.udp, query, server);
+        let reply = loop {
+            exchange.send(()).await?;
+            if let Ok(Some((reply, ()))) = timeout(resend_after, exchange.reply()).await {
+                break reply?;
+            }
+        };
         Ok(Message::from_vec(&reply)?
             .answers
             .into_iter()
@@ -357,6 +366,40 @@ mod tests {
             assert_eq!(addresses.unwrap().len(), 2);
         }
         assert_eq!(server.queries(), 2, "A and AAAA asked once");
+    }
+
+    /// 只有 IPv4 的名字，服务器没收到第一份 A 查询（包丢在了路上）：过了时限的三分之一再发一份，照样问到，用不着等满
+    /// 整个时限
+    /// A name with IPv4 only whose first A query never reached the server (the packet lost on the
+    /// way): another copy goes after a third of the time limit and is answered, well within the
+    /// whole limit
+    #[tokio::test]
+    async fn a_query_lost_on_the_way_is_sent_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked_a = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked_a);
+        let server = upstream(move |query| {
+            if query.queries[0].query_type() != RecordType::A {
+                // 有这个名字，没有这种记录 / The name is there, with no record of this type
+                let mut reply =
+                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+                reply.add_query(query.queries[0].clone());
+                return vec![(Duration::ZERO, reply.to_vec().unwrap())];
+            }
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Vec::new();
+            }
+            loopback_addresses(query, 300)
+        })
+        .await;
+        let addresses = timeout(
+            Duration::from_millis(1500),
+            through(&server.address).addresses("upstream.test", 853),
+        )
+        .await
+        .expect("well within the time limit");
+        assert_eq!(addresses.unwrap(), ["127.0.0.1:853".parse().unwrap()]);
+        assert_eq!(asked_a.load(Ordering::SeqCst), 2, "sent once more");
     }
 
     /// 只答 A、不答 AAAA 的服务器（或者反过来）给的地址照用，不等丢了的那个。以前两种都要答，等满整个时限后失败

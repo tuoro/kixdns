@@ -3,6 +3,8 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use dashmap::mapref::entry;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::{
     Connection as QuicConnection, Endpoint as QuicEndpoint, TransportConfig as QuicTransportConfig,
@@ -25,22 +27,13 @@ use tokio::net::{
     TcpStream,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
-
-#[inline]
-fn unix_time_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_millis().min(u64::MAX as u128) as u64
-        })
-}
 
 /// Least budget worth spending on a transparent retry over a fresh connection.
 /// A retry has to reconnect (SYN, plus a TLS handshake for DoT and DoH) and
@@ -68,24 +61,22 @@ type UdpInflight = (
     oneshot::Sender<anyhow::Result<Bytes>>,
 );
 
-/// Type alias for UDP inflight request tracking
-/// ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
-/// The sent query (ID already rewritten) stays in the entry so the reader can
-/// match the answer's question section against it (RFC 5452 §9.1).
-/// 条目保留已改写 ID 的查询报文，供 reader 比对应答的 question 段（RFC 5452 §9.1）。
+/// 在途的 UDP 查询，按改写过的 ID（见 [`UdpInflight`]）。条目留着改写过 ID 的查询报文，供读取任务比对应答的问题（RFC
+/// 5452 §9.1）/ The UDP queries in flight, by rewritten ID (see [`UdpInflight`]). An entry keeps
+/// the query as sent, its ID rewritten, for the reader to match the answer's question against
+/// (RFC 5452 §9.1)
 type UdpInflightMap = DashMap<u16, UdpInflight, FxBuildHasher>;
 
 /// 等着一个在途条目的回答的那一头：回答从 `rx` 来。放手时（拿到了回答、超时、取消、提前返回、panic）把 `map` 里
 /// `id` 下已经没人等的条目删掉：先关掉自己这一头再删，所以自己的条目一定删得掉。回答到了、读取任务把条目拿走以后，
-/// 这个 ID 可能已经分给了后来的查询，那一条有人等着，不动；以前按 ID 无条件删，会把后来的条目带走，它的回答到了
-/// 找不到条目，只能等到超时
+/// 这个 ID 可能已经分给了后来的查询，那一条有人等着，不动：按 ID 不管是谁都删的话，会把它带走，它的回答到了找不到
+/// 条目，只能等到超时
 /// The end that waits for an in-flight entry's answer, which comes on `rx`. On letting go (with
 /// the answer, at a timeout, on cancellation, an early return or a panic) it removes the entry
 /// under `id` in `map` if nobody waits on it any more: its own end is closed first, so its own
 /// entry always goes. Once an answer has come and the reader has taken the entry, the ID may
-/// have gone to a later query, whose entry is waited on and stays; removing by ID whatever was
-/// there used to take that later entry along, so its answer found no entry and the query
-/// waited out its timeout
+/// have gone to a later query, whose entry is waited on and stays: removing by ID whatever is
+/// there would take it along, its answer finding no entry and the query waiting out its timeout
 struct Waiting<V> {
     rx: oneshot::Receiver<anyhow::Result<Bytes>>,
     map: Arc<DashMap<u16, V, FxBuildHasher>>,
@@ -110,8 +101,6 @@ impl<V> Drop for Waiting<V> {
 /// the receiving task, and the socket closes with it
 struct UdpSocketState {
     socket: Arc<tokio::net::UdpSocket>,
-    /// Inflight map: ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
-    /// Note: Using FxBuildHasher for performance
     inflight: Arc<UdpInflightMap>,
     sent: std::sync::atomic::AtomicU32,
     reader: tokio::task::AbortHandle,
@@ -123,47 +112,51 @@ impl Drop for UdpSocketState {
     }
 }
 
-/// 一个 socket 发出这么多个查询以后，换成系统另挑端口的新 socket（RFC 5452 §9.2）。以前池里的端口用到进程结束，猜出或者
-/// 探出来（像 SAD DNS 那样借 ICMP 的限速去扫）一次就一直有效；现在一个端口最多用这么多次，查询越多换得越快。也不每个
+/// 一个 socket 发出这么多个查询以后，换成系统另挑端口的新 socket（RFC 5452 §9.2）：一个端口要是一直用下去，猜出或者
+/// 探出来（像 SAD DNS 那样借 ICMP 的限速去扫）一次就一直有效；一个端口最多用这么多次，查询越多换得越快。也不每个
 /// 查询都换：每个新端口在防火墙的连接跟踪里占一条、留一分钟，OpenWrt 上每秒两百来个未命中就能把表占满，满了整台路由器
 /// 的新连接都被丢掉；每个查询单开 socket 的未命中还多花四分之一的 CPU
 /// After sending this many queries a socket is replaced by a new one, on another port the system
-/// picks (RFC 5452 §9.2). The pool's ports used to last the process, so one guessed or probed
-/// (through the ICMP rate limit, as SAD DNS does) stayed good for ever; now a port serves this
-/// many at most, replaced the faster the more queries come. Nor is it replaced every query: each
+/// picks (RFC 5452 §9.2): a port kept for good stays good for ever once guessed or probed
+/// (through the ICMP rate limit, as SAD DNS does), so a port serves this many at most, replaced
+/// the faster the more queries come. Nor is it replaced every query: each
 /// new port takes an entry in the firewall's connection tracking for a minute, a couple of
 /// hundred misses a second fill the table on OpenWrt, and with it full the whole router drops
-/// new connections; a socket per query also cost a miss a quarter more CPU
+/// new connections; a socket per query also costs a miss a quarter more CPU
 const UDP_SOCKET_QUERIES: u32 = 64;
 
-/// 上游 UDP socket 接收出错以后，歇多久再接着收；None 是马上接着收。
+/// 池里第 `idx` 个 UDP socket 接收出错：记下来，给出歇多久再接着收，None 是马上接着收。
 ///
-/// Windows 上没有连接的 UDP socket 收到 ICMP 端口不可达时，`recv_from` 会报 ConnectionReset
-/// （WSAECONNRESET）。这只说明之前发出的某个查询没人收，socket 本身好好的；歇着只会耽误这个 socket
-/// 上别的查询的应答，所以马上接着收。别的错误照旧歇 100 ms，免得反复出错时空转。
+/// Windows 上没有连接的 UDP socket 收到 ICMP 端口不可达时，`recv_from` 会报 ConnectionReset（WSAECONNRESET）。这只说明之前
+/// 发出的某个查询没人收，socket 本身好好的，那个查询自己会超时、重发：只记 debug，马上接着收，歇着只会耽误这个 socket 上
+/// 别的查询的应答。别的错误记 warn（同一处一阵子只记一条），歇 100 ms，免得反复出错时空转
 ///
-/// How long to pause after a receive error on an upstream UDP socket before reading on;
-/// None reads on at once.
+/// A receive error on socket `idx` of the pool: it is logged, and how long to pause before reading
+/// on is given, None reading on at once.
 ///
 /// On Windows, an unconnected UDP socket that gets an ICMP port unreachable reports
-/// ConnectionReset (WSAECONNRESET) from `recv_from`. That only says some earlier query
-/// reached nobody; the socket itself is fine, and pausing would only delay the answers to
-/// the other queries on it, so it reads on at once. Any other error still pauses 100 ms,
-/// so a repeating one does not spin.
-fn recv_error_pause(error: &std::io::Error) -> Option<Duration> {
-    match error.kind() {
-        std::io::ErrorKind::ConnectionReset => None,
-        _ => Some(Duration::from_millis(100)),
+/// ConnectionReset (WSAECONNRESET) from `recv_from`. That only says some earlier query reached
+/// nobody; the socket itself is fine and that query times out and is sent again on its own: it
+/// is logged at debug and reading goes on at once, a pause only delaying the answers to the other
+/// queries on the socket. Any other error logs a warn (one in a while from this place) and pauses
+/// 100 ms, so a repeating one does not spin
+fn after_recv_error(idx: usize, error: &std::io::Error) -> Option<Duration> {
+    if error.kind() == std::io::ErrorKind::ConnectionReset {
+        debug!(socket_idx = idx, error = %error, "UDP pool socket told a query reached nobody");
+        return None;
     }
+    crate::warn_sparse!(socket_idx = idx, error = %error, "UDP pool recv error, pausing");
+    Some(Duration::from_millis(100))
 }
 
 thread_local! {
     /// 收 UDP 回答的缓冲，每个线程一块，容得下最大的 DNS 报文：EDNS 允许把 UDP 应答协商到 65535 字节，比缓冲区长的数据报
-    /// 会被悄悄截掉尾部。以前每个 socket 各带一块，默认 64 个 socket 时常驻内存多约 1 MiB，换 socket 时还要重新分配
+    /// 会被悄悄截掉尾部。不跟着 socket 走：每个 socket 各带一块的话，默认 64 个 socket 常驻内存多约 1 MiB，换 socket
+    /// 时还要重新分配
     /// The buffer UDP replies are received into, one per thread, holding the largest DNS message:
     /// EDNS lets a UDP answer be negotiated up to 65535 bytes, and a datagram longer than the
-    /// buffer loses its tail without notice. Each socket used to carry one, some 1 MiB more
-    /// resident with the default 64 sockets, allocated again whenever a socket was replaced
+    /// buffer loses its tail without notice. It goes with no socket: one each would keep some 1 MiB
+    /// more resident with the default 64 sockets, allocated again whenever a socket is replaced
     static UDP_RECEIVED: std::cell::RefCell<Box<[u8]>> =
         std::cell::RefCell::new(vec![0; MAX_DNS_MESSAGE_SIZE].into_boxed_slice());
 }
@@ -326,9 +319,8 @@ impl UdpClient {
                 match received {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        tracing::error!("UDP pool recv error: {}", e);
-                        if let Some(pause) = recv_error_pause(&e) {
+                    Err(error) => {
+                        if let Some(pause) = after_recv_error(idx, &error) {
                             tokio::time::sleep(pause).await;
                         }
                     }
@@ -353,18 +345,20 @@ impl UdpClient {
         upstream: &str,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        let mut sent = self.begin(packet, upstream).await?;
-        match timeout(timeout_dur, sent.reply()).await {
-            Ok(reply) => reply,
+        let mut exchange = UdpExchange::new(self, packet, upstream);
+        exchange.send(()).await?;
+        match timeout(timeout_dur, exchange.reply()).await {
+            Ok(Some((reply, ()))) => reply,
+            Ok(None) => unreachable!("one copy sent and waited for"),
             Err(_) => Err(anyhow::anyhow!("upstream timeout")),
         }
     }
 
-    /// 把查询发给 `upstream`，返回等它回答的那一头（见 [`UdpSent`]）：等多久、同时还等着什么，由调用方定
-    /// Sends the query to `upstream` and gives the end that waits for its reply (see
-    /// [`UdpSent`]): how long to wait, and what else is waited for meanwhile, is the caller's
+    /// 把查询发给 `upstream` 一次，返回等它回答的那一头（见 [`UdpSent`]）
+    /// Sends the query to `upstream` once and gives the end that waits for its reply (see
+    /// [`UdpSent`])
     #[inline]
-    pub async fn begin(&self, packet: &[u8], upstream: &str) -> anyhow::Result<UdpSent> {
+    async fn begin(&self, packet: &[u8], upstream: &str) -> anyhow::Result<UdpSent> {
         let addr: SocketAddr = upstream.parse().context("invalid upstream address")?;
         // 按目标地址族选池：IPv4 路径只多一次判别
         // Pick the pool by address family; the IPv4 path only gains one check.
@@ -482,30 +476,83 @@ impl UdpClient {
     }
 }
 
-/// 发出去、在等回答的一个 UDP 查询（见 [`UdpClient::begin`]）。只要它还在，回答什么时候到都收得到；放手时不再等，
+/// 发出去、在等回答的一份 UDP 查询（见 [`UdpClient::begin`]）。只要它还在，回答什么时候到都收得到；放手时不再等，
 /// 它登记的条目跟着删掉（见 [`Waiting`]）
-/// One UDP query sent and waiting for its reply (see [`UdpClient::begin`]). For as long as it
-/// is kept the reply is taken whenever it arrives; let go of, it waits no more and the entry it
-/// registered goes with it (see [`Waiting`])
-pub struct UdpSent {
+/// One copy of a UDP query sent and waiting for its reply (see [`UdpClient::begin`]). For as
+/// long as it is kept the reply is taken whenever it arrives; let go of, it waits no more and the
+/// entry it registered goes with it (see [`Waiting`])
+struct UdpSent {
     waiting: Waiting<UdpInflight>,
     /// 发它的 socket：等着回答时不能关，换下来了也一样 / The socket that sent it, which may not close
     /// while the reply is waited for, replaced or not
     _socket: Arc<UdpSocketState>,
 }
 
-impl UdpSent {
-    /// 等它的回答。没等到就被放下的这次等待不影响下一次：回答到了，下一次照样拿得到。拿到过结果以后不要再等
-    /// Waits for its reply. A wait dropped before the reply came leaves the next one unaffected:
-    /// the reply is still there for it once it arrives. Not to be waited on again once it has
-    /// given its outcome
-    pub async fn reply(&mut self) -> anyhow::Result<Bytes> {
-        match (&mut self.waiting.rx).await {
-            Ok(reply) => reply,
-            // 发送的那一头没给结果就没了（正常不会，除非逻辑出错或者 panic）/ The sending end went
-            // without an outcome (not normally, short of a logic error or a panic)
-            Err(_) => Err(anyhow::anyhow!("channel closed")),
+/// 一个查询和一个上游经 UDP 的一次收发：没等到回答就再发一份，发出去的每一份都一直登记着，谁的回答先到用谁的。后发的
+/// 那份不顶替前面的：前一份的回答在重发以后才到也照样收下，回答比重发慢的上游不用多等一个重发的间隔。什么时候重发由调用方
+/// 定（见 `upstream::forward_udp_smart` 和 `bootstrap`）；`T` 是调用方给每一份记的东西，比如它是什么时候发的。第一份放在
+/// 自己里面，再发的才另外分配
+/// One query's exchange with one upstream over UDP: with no reply yet another copy is sent, and
+/// every copy sent stays registered, the first reply to come being used. A later copy does not
+/// replace the earlier: a reply to an earlier one arriving after the resend is taken all the
+/// same, so an upstream slower than the resend costs no resend's interval more. When to send
+/// again is the caller's (see `upstream::forward_udp_smart` and `bootstrap`); `T` is what the
+/// caller notes with each copy, when it was sent, say. The first copy is held inline, only further
+/// ones are allocated
+pub(crate) struct UdpExchange<'a, T> {
+    udp: &'a UdpClient,
+    packet: &'a [u8],
+    upstream: &'a str,
+    sent: smallvec::SmallVec<[(UdpSent, T); 1]>,
+}
+
+impl<'a, T> UdpExchange<'a, T> {
+    /// 经 `udp` 把 `packet` 发给 `upstream` 的收发，还一份也没发 / The exchange sending `packet` to
+    /// `upstream` through `udp`, no copy sent yet
+    pub(crate) fn new(udp: &'a UdpClient, packet: &'a [u8], upstream: &'a str) -> Self {
+        Self {
+            udp,
+            packet,
+            upstream,
+            sent: smallvec::SmallVec::new(),
         }
+    }
+
+    /// 再发一份，记上 `note`；发不出去的什么也不登记 / Sends one more copy noted `note`; one that cannot be
+    /// sent registers nothing
+    pub(crate) async fn send(&mut self, note: T) -> anyhow::Result<()> {
+        let sent = self.udp.begin(self.packet, self.upstream).await?;
+        self.sent.push((sent, note));
+        Ok(())
+    }
+
+    /// 发出去的几份里先到的结果，和那一份记的东西；一份也不在等时是 None。给了结果的那一份不再等，别的接着等。没等到就被
+    /// 放下的这次等待不影响下一次：回答到了，下一次照样拿得到
+    /// The first outcome among the copies sent, with what that copy was noted with; None with no
+    /// copy waited for. The copy that gave it waits no more, the others still do. A wait dropped
+    /// before any outcome leaves the next one unaffected: a reply arriving is still there for it
+    pub(crate) async fn reply(&mut self) -> Option<(anyhow::Result<Bytes>, T)> {
+        if self.sent.is_empty() {
+            return None;
+        }
+        let (at, outcome) = std::future::poll_fn(|cx| {
+            self.sent
+                .iter_mut()
+                .enumerate()
+                .find_map(|(at, (sent, _))| {
+                    match std::pin::Pin::new(&mut sent.waiting.rx).poll(cx) {
+                        std::task::Poll::Ready(outcome) => Some((at, outcome)),
+                        std::task::Poll::Pending => None,
+                    }
+                })
+                .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
+        })
+        .await;
+        let (_, note) = self.sent.swap_remove(at);
+        // 发送的那一头没给结果就没了（正常不会，除非逻辑出错或者 panic）/ The sending end went without an
+        // outcome (not normally, short of a logic error or a panic)
+        let reply = outcome.unwrap_or_else(|_| Err(anyhow::anyhow!("channel closed")));
+        Some((reply, note))
     }
 }
 
@@ -543,7 +590,7 @@ pub struct Tcp;
 impl StreamTransport for Tcp {
     /// 读回答经过缓冲：一次读进好几条回答，长度前缀和正文不用各读一次系统调用。DoT 的 TLS 流自己有缓冲
     /// Answers are read through a buffer: one read takes in several answers, and a length
-    /// prefix and its body no longer cost a system call each. DoT's TLS stream buffers on its own
+    /// prefix and its body do not cost a system call each. DoT's TLS stream buffers on its own
     type Read = tokio::io::BufReader<OwnedReadHalf>;
     type Write = OwnedWriteHalf;
     type Shared = Arc<Bootstrap>;
@@ -570,15 +617,13 @@ const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
 /// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时报最后那个失败。
-/// TCP、DoT、直连的 DoH 和 DoQ 都这样连。以前 TCP、DoT 一个个依次连，前面的地址不回应时等到建连的时限也轮不到后面的；
-/// DoH 直连同一族的地址也是依次连；DoQ 只连一个
+/// TCP、DoT、直连的 DoH 和 DoQ 都这样连：前面的地址不回应时，后面的不用等到建连的时限才轮到
 /// Connects through `attempt` to one of `addresses` (RFC 8305 sections 4 and 5): the addresses
 /// alternate by family, the first address's family first; one attempt is started, and once it is
 /// not through after [`ATTEMPT_DELAY`], or has failed, the next one is, the first to connect
 /// being used and the rest given up; with all failed the last failure is reported. TCP, DoT,
-/// direct DoH and DoQ all connect so. TCP and DoT used to try one address after another, so with
-/// an early one not answering the later ones never had their turn within the connect's time
-/// limit; direct DoH did the same within a family; DoQ tried a single one
+/// direct DoH and DoQ all connect so: with an early address not answering, the later ones have
+/// their turn well within the connect's time limit
 async fn staggered<T, F>(
     addresses: Vec<SocketAddr>,
     attempt: impl Fn(SocketAddr) -> F,
@@ -652,25 +697,33 @@ pub(super) async fn connect_tcp(bootstrap: &Bootstrap, address: &str) -> anyhow:
     Ok(stream)
 }
 
-/// 刚建好的 TCP 连接（DoT、直连的 DoH 在握手之前也是）：关掉 Nagle，打开激进的 keepalive
+/// TCP 连接的保活，TCP、DoT 和 DoH（直连的和经 reqwest 的）都一样：这么久没有收发就探一次，没回应隔这么久再探，探到系统定的
+/// 次数都没回应算断了。连接留着、还没到空闲时限（见 [`Aging`]）的时候，死掉的上游二十来秒就看得出来，NAT 也不会忘掉它；什么
+/// 时候关掉不用的连接只由 [`Aging`] 定。DoQ 的保活是 QUIC 自己的 PING，照 `doq_keepalive_interval_ms`
+/// The keepalive of TCP connections, the same for TCP, DoT and DoH (direct and through
+/// reqwest): a probe after this long with nothing sent or received, again this far apart while
+/// unanswered, and dead once as many as the system sets go unanswered. While a connection is kept
+/// and short of its idle limit (see [`Aging`]), a dead upstream shows within twenty seconds or
+/// so, and no NAT forgets the connection; when an unused one closes is for [`Aging`] alone to
+/// say. DoQ keeps alive by QUIC's own PINGs, as `doq_keepalive_interval_ms` sets
+const KEEPALIVE_TIME: Duration = Duration::from_secs(5);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// 刚建好的 TCP 连接（DoT、直连的 DoH 在握手之前也是）：关掉 Nagle，打开保活（见 [`KEEPALIVE_TIME`]）
 /// A freshly connected TCP stream (DoT's and a direct DoH one's too, before their handshakes):
-/// Nagle off and an aggressive keepalive on
+/// Nagle off and the keepalive on (see [`KEEPALIVE_TIME`])
 fn tune_stream_socket(stream: &TcpStream, upstream: &str) {
-    // Configure socket options for robustness
-    // 配置 socket 选项以增强健壮性
     let _ = stream.set_nodelay(true);
-
-    // Set Check to 5s to detect dead connections faster (Aggressive Keepalive)
     let sock = SockRef::from(stream);
-    let ka = TcpKeepalive::new()
-        .with_time(Duration::from_secs(5))
-        .with_interval(Duration::from_secs(2));
-
-    // Explicitly enable SO_KEEPALIVE (Essential for Windows/Linux)
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_TIME)
+        .with_interval(KEEPALIVE_INTERVAL);
+    // SO_KEEPALIVE 要另外打开，Windows 和 Linux 上都是 / SO_KEEPALIVE is switched on apart, on Windows
+    // and Linux alike
     if let Err(e) = sock.set_keepalive(true) {
         warn!(upstream = %upstream, error = %e, "Failed to enable SO_KEEPALIVE");
     }
-    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+    if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
         warn!(upstream = %upstream, error = %e, "Failed to set TCP keepalive params");
     }
 }
@@ -715,28 +768,48 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// 建一条连接（TCP、DoT、DoQ、DoH 的 HTTP/2）。建连在自己的任务里做，最多 [`CONNECT_BUDGET`]：发起它的查询被取消了
-/// （几个上游竞速时别的先答完、外层超时），连接照样建完，留给下一个来要连接的查询。以前建连就在查询里，查询一取消握手就
-/// 丢了：竞速时这些连接几乎建不起来，每个查询都从头连。失败以后退避：从 [`CONNECT_BACKOFF`] 起每失败一次翻倍，最多
-/// [`CONNECT_BACKOFF_AT_MOST`]，这期间来要连接的查询马上失败、不去连；以前上游不通时排着队的查询每个都去连一次。
-/// 放在一把锁里，同一时刻只建一条
+/// 建一条连接（TCP、DoT、DoQ、DoH 的 HTTP/2）。建连在自己的任务里做，最多 [`CONNECT_BUDGET`]，建好了由这个任务自己装上
+/// （各传输给的 `make` 连同装上一起做）：发起它的查询被取消了（几个上游竞速时别的先答完、外层超时），连接照样建完、装上，
+/// 从一开始就有人读它、看它关没关，留给接着来的查询。同时要连接的查询都等这同一次，各自最多等到自己的期限。失败以后退避：
+/// 从 [`CONNECT_BACKOFF`] 起每失败一次翻倍，最多 [`CONNECT_BACKOFF_AT_MOST`]，从失败的那一刻算，这期间来要连接的查询马上
+/// 失败、不去连。它放在各传输自己的锁里，那把锁只在看一眼、起一次建连的那一下拿着
 /// Making a connection (TCP, DoT, DoQ, DoH over HTTP/2). The connect happens in a task of its
-/// own, taking at most [`CONNECT_BUDGET`]: with the query that started it cancelled (another
-/// upstream answering first in a race, an outer timeout), the connection is made all the same,
-/// for the next query to ask for one. Connecting used to happen within the query, and a
-/// cancelled query lost the handshake: in a race these connections were hardly ever made, every
-/// query starting over. After a failure it backs off, from [`CONNECT_BACKOFF`] doubling on each
-/// failure up to [`CONNECT_BACKOFF_AT_MOST`], the queries asking meanwhile failing at once
-/// without connecting; with the upstream unreachable, every query queued up used to connect.
-/// Kept behind a lock, so one is made at a time
-pub(super) struct Connect<C> {
-    /// 建连的任务，建完了也留着，直到有查询取走结果 / The connecting task, kept after it is through
-    /// until a query takes what it made
-    task: Option<tokio::task::JoinHandle<Made<C>>>,
+/// own, taking at most [`CONNECT_BUDGET`], and that task puts the connection in place itself
+/// (the `make` each transport gives does both): with the query that started it cancelled
+/// (another upstream answering first in a race, an outer timeout), the connection is made and put
+/// in place all the same, read and watched for closing from the start, for the queries coming
+/// next. Queries wanting a connection meanwhile all wait for this one connect, each until its own
+/// deadline at most. After a failure it backs off, from [`CONNECT_BACKOFF`] doubling on each
+/// failure up to [`CONNECT_BACKOFF_AT_MOST`], counted from the failure, the queries asking
+/// meanwhile failing at once without connecting. It sits under each transport's own lock, held
+/// only for the moment of a look and of starting a connect
+pub(super) struct Connect {
+    /// 这一次建连，等它的各拿一份；建完了也留着，下一个来要连接的查询看过结果再丢掉 / This connect, a copy
+    /// for each waiting on it; kept once through, until the next query asking for a connection has
+    /// looked at what it gave
+    attempt: Option<Attempt>,
     /// 退避到什么时候，下一次失败退避多久 / Backing off until when, and for how long after the next failure
     retry_at: Option<std::time::Instant>,
     backoff: Duration,
 }
+
+/// 一次建连的结果，等着它的各拿一份 / One connect's outcome, a copy for each waiting on it
+pub(super) type Attempt = Shared<BoxFuture<'static, Result<(), ConnectFailed>>>;
+
+/// 一次建连为什么失败、什么时候失败的 / Why a connect failed, and when
+#[derive(Clone, Debug)]
+pub(super) struct ConnectFailed {
+    why: Arc<str>,
+    at: std::time::Instant,
+}
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for ConnectFailed {}
 
 /// 建一条连接最多花多久（解析名字、TCP 或 QUIC 握手、TLS 握手）/ The most a connect may take
 /// (resolving the name, the TCP or QUIC handshake, the TLS one)
@@ -746,130 +819,159 @@ const CONNECT_BACKOFF: Duration = Duration::from_millis(250);
 /// 建连接连失败时退避最多多久 / The longest backing off after failed connects in a row
 const CONNECT_BACKOFF_AT_MOST: Duration = Duration::from_secs(5);
 
-/// 一次建连的结果和它建完的时刻 / What a connect gave, and when it was through
-struct Made<C> {
-    outcome: anyhow::Result<C>,
-    at: std::time::Instant,
-}
-
-/// 建好以后放着没人取的连接，取用之前看一下还通不通（见 [`Connect::finish`]）/ A connection made and left
-/// waiting for a taker is checked before it is used (see [`Connect::finish`])
-pub(super) trait StillOpen {
-    /// 还能用：放着的这段时间里上游没把它关掉 / Still of use: the upstream did not close it while it waited
-    fn still_open(&mut self) -> bool;
-}
-
-/// TCP、DoT 的两半：放着的时候没人读，上游关掉了的话，FIN（DoT 还有 close_notify）已经在缓冲里，不等就读得到；
-/// 还开着时读不到任何东西（还没发查询，上游没什么可回的）
-/// The two halves of TCP or DoT: nobody read while it waited, so an upstream that closed it has
-/// left its FIN (and for DoT its close_notify) in the buffer, read at once without waiting; one
-/// still open has nothing to read (no query was sent, the upstream has nothing to answer)
-impl<R: tokio::io::AsyncRead + Unpin, W> StillOpen for (R, W) {
-    fn still_open(&mut self) -> bool {
-        let mut byte = [0u8; 1];
-        let mut probe = tokio::io::ReadBuf::new(&mut byte);
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        std::pin::Pin::new(&mut self.0)
-            .poll_read(&mut cx, &mut probe)
-            .is_pending()
-    }
-}
-
-/// 新建的一条 DoQ 连接，和它有没有用 0-RTT / A DoQ connection newly made, and whether it used 0-RTT
-struct NewDoqConn {
-    conn: QuicConnection,
-    used_0rtt: bool,
-}
-
-impl StillOpen for NewDoqConn {
-    fn still_open(&mut self) -> bool {
-        self.conn.close_reason().is_none()
-    }
-}
-
-impl<C> Default for Connect<C> {
+impl Default for Connect {
     fn default() -> Self {
         Self {
-            task: None,
+            attempt: None,
             retry_at: None,
             backoff: CONNECT_BACKOFF,
         }
     }
 }
 
-impl<C: StillOpen + Send + 'static> Connect<C> {
-    /// 等在建的连接建完；没有在建的就用 `start` 起一个任务去建，退避期间不起、报错。等的时候可以取消：任务留着，下一次接着等。
-    /// 取到的是这次调用之前就建完、放着没人取的结果时：连接先看还通不通，上游关掉了就丢掉重建；失败按它发生的时刻退避，
-    /// 退避早已过去就作废重建。以前放着的连接照用，上游早关了的话查询登记上去就断，算新连接也不重发；放了几分钟的失败照样
-    /// 让查询失败，还从这一刻重新退避。最多重建一次：重建出来的不算放着的
-    /// Waits for the connection being made; with none, `start` gives the task making one, except
-    /// while backing off, which is an error. The wait may be cancelled: the task stays, and the
-    /// next call waits on. When what it gets was through before this call and left waiting for a
-    /// taker: a connection is checked first and, closed by the upstream meanwhile, dropped and made
-    /// again; a failure backs off from when it happened, and with that long past it is voided and
-    /// a connect made again. A connection left waiting used to be used as it was, breaking as a
-    /// query registered on it when the upstream had long closed it, and counting as new it was not
-    /// sent again; a failure minutes old failed the query all the same and backed off afresh from
-    /// then. At most one connect is made again: what it makes was not left waiting
-    pub(super) async fn finish<F>(&mut self, start: impl Fn() -> F) -> anyhow::Result<C>
+impl Connect {
+    /// 在建的那一次；没有就用 `make` 起一次，退避期间是 Err。上一次建完了的，先照它的结果定退避：成功了不退避，失败了从
+    /// 失败的那一刻起退避
+    /// The connect under way; with none, one started with `make`, except while backing off, which
+    /// is an Err. One through already sets the backing off first by what it gave: none after a
+    /// success, and after a failure counted from when it failed
+    pub(super) fn attempt<F>(&mut self, make: impl FnOnce() -> F) -> anyhow::Result<Attempt>
     where
-        F: Future<Output = anyhow::Result<C>> + Send + 'static,
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let asked_at = std::time::Instant::now();
-        loop {
-            let task = match &mut self.task {
-                Some(task) => task,
-                None => {
-                    if let Some(left) = self
-                        .retry_at
-                        .and_then(|at| at.checked_duration_since(std::time::Instant::now()))
-                    {
-                        anyhow::bail!(
-                            "connect failed lately, trying again in {}ms",
-                            left.as_millis()
-                        );
-                    }
-                    let connect = timeout(CONNECT_BUDGET, start());
-                    self.task.insert(tokio::spawn(async move {
-                        let outcome = connect.await.unwrap_or_else(|_| {
-                            Err(anyhow::anyhow!(
-                                "connect timeout after {}ms",
-                                CONNECT_BUDGET.as_millis()
-                            ))
-                        });
-                        Made {
-                            outcome,
-                            at: std::time::Instant::now(),
-                        }
-                    }))
-                }
-            };
-            // 建连的任务只会在 panic 时没有结果 / The connecting task has no result only on a panic
-            let Made { outcome, at } = task.await.unwrap_or_else(|panicked| Made {
-                outcome: Err(panicked.into()),
-                at: std::time::Instant::now(),
-            });
-            self.task = None;
-            let waited = at < asked_at;
-            match outcome {
-                Ok(mut made) => {
-                    if waited && !made.still_open() {
-                        continue;
-                    }
+        if let Some(attempt) = &self.attempt {
+            match attempt.peek() {
+                None => return Ok(attempt.clone()),
+                Some(Ok(())) => {
                     self.retry_at = None;
                     self.backoff = CONNECT_BACKOFF;
-                    return Ok(made);
                 }
-                Err(error) => {
-                    let retry_at = at + self.backoff;
-                    if waited && retry_at <= std::time::Instant::now() {
-                        continue;
-                    }
-                    self.retry_at = Some(retry_at);
+                Some(Err(failed)) => {
+                    self.retry_at = Some(failed.at + self.backoff);
                     self.backoff = (self.backoff * 2).min(CONNECT_BACKOFF_AT_MOST);
-                    return Err(error);
                 }
             }
+            self.attempt = None;
+        }
+        if let Some(left) = self
+            .retry_at
+            .and_then(|at| at.checked_duration_since(std::time::Instant::now()))
+        {
+            anyhow::bail!(
+                "connect failed lately, trying again in {}ms",
+                left.as_millis()
+            );
+        }
+        let made = timeout(CONNECT_BUDGET, make());
+        let attempt = async move {
+            made.await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "connect timeout after {}ms",
+                        CONNECT_BUDGET.as_millis()
+                    ))
+                })
+                .map_err(|error| ConnectFailed {
+                    why: format!("{error:#}").into(),
+                    at: std::time::Instant::now(),
+                })
+        }
+        .boxed()
+        .shared();
+        tokio::spawn(attempt.clone());
+        Ok(self.attempt.insert(attempt).clone())
+    }
+}
+
+/// 一条上游连接怎样老化，TCP、DoT、DoQ 和直连的 DoH 共用一套：活满 `max_age`，或者空闲满 `idle`，就从池里摘下，接着来的
+/// 查询另建一条；它上面还在等的查询照样等到各自的期限，过了最晚的那个再关。空闲从它上面最晚的那个期限算起：那以后没有查询
+/// 在等，也这么久没有新的查询（RFC 7766 §6.2.3）。None 是不限。连接自己的任务到了时候就摘下、关掉它（见 [`Aging::worn`]），
+/// 不等下一个查询来看，没人用的连接也不会一直开着。时间按单调时钟算，调系统时间不影响
+/// How an upstream connection ages, one rule for TCP, DoT, DoQ and direct DoH: once it has lived
+/// `max_age`, or sat idle for `idle`, it is taken out of its pool and queries coming next make
+/// another; the queries still waiting on it go on to their own deadlines, and it closes once the
+/// latest has passed. Idleness counts from the latest of its deadlines: from then on no query
+/// waits on it, and none has come for that long (RFC 7766 §6.2.3). None is no limit. The
+/// connection's own task takes it out and closes it when the time comes (see [`Aging::worn`]),
+/// without waiting for a next query to look, so a connection nobody uses does not stay open.
+/// Times run on the monotonic clock, untouched by the system time being set
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Aging {
+    pub(super) max_age: Option<Duration>,
+    pub(super) idle: Option<Duration>,
+}
+
+impl Aging {
+    /// 活满 `max_age`、空闲满 `idle` 就摘下，0 是不限 / Taken out once it has lived `max_age` or sat
+    /// idle for `idle`, 0 being no limit
+    pub(super) fn new(max_age: Duration, idle: Duration) -> Self {
+        Self {
+            max_age: Some(max_age).filter(|age| !age.is_zero()),
+            idle: Some(idle).filter(|idle| !idle.is_zero()),
+        }
+    }
+
+    /// 等到 `wear` 那条连接该摘下的时候，给出原因：活满了 `max_age`，或者空闲满了 `idle`；都不限时一直等
+    /// Waits until the connection of `wear` is to be taken out, giving why: it has lived `max_age`,
+    /// or sat idle for `idle`; with neither limited it waits for ever
+    pub(super) async fn worn(self, wear: &Wear) -> &'static str {
+        loop {
+            let old = self.max_age.map(|age| (wear.made + age, "too old"));
+            let idle = self
+                .idle
+                .map(|idle| (wear.latest_deadline() + idle, "idle"));
+            let Some((at, why)) = old.into_iter().chain(idle).min_by_key(|(at, _)| *at) else {
+                return std::future::pending().await;
+            };
+            if tokio::time::Instant::now() >= at {
+                return why;
+            }
+            // 醒来再看一次：这期间来的查询把最晚的期限往后推了 / Looked at again on waking: queries
+            // meanwhile have pushed the latest deadline later
+            tokio::time::sleep_until(at).await;
+        }
+    }
+}
+
+/// 一条连接用了多久、多久没人用：什么时候建的，用它的查询里最晚的期限 / How long a connection has
+/// lived and gone unused: when it was made, and the latest deadline of the queries using it
+pub(super) struct Wear {
+    made: tokio::time::Instant,
+    /// 用它的查询里最晚的期限，从 `made` 起的微秒数 / The latest deadline of the queries using it, in
+    /// microseconds from `made`
+    latest_deadline_us: AtomicU64,
+}
+
+impl Wear {
+    /// 刚建好的连接，还没有查询用过 / A connection just made, used by no query yet
+    pub(super) fn new() -> Self {
+        Self {
+            made: tokio::time::Instant::now(),
+            latest_deadline_us: AtomicU64::new(0),
+        }
+    }
+
+    /// 一个期限在 `deadline` 的查询用上了它 / A query with its deadline at `deadline` uses it
+    pub(super) fn note(&self, deadline: tokio::time::Instant) {
+        let us = deadline.saturating_duration_since(self.made).as_micros();
+        self.latest_deadline_us
+            .fetch_max(u64::try_from(us).unwrap_or(u64::MAX), Ordering::AcqRel);
+    }
+
+    /// 用它的查询里最晚的期限；还没有查询用过时是建好的那一刻 / The latest deadline of the queries
+    /// using it; the moment it was made while none has
+    pub(super) fn latest_deadline(&self) -> tokio::time::Instant {
+        self.made + Duration::from_micros(self.latest_deadline_us.load(Ordering::Acquire))
+    }
+
+    /// 等到用它的查询都过了各自的期限 / Waits until every query using it is past its deadline
+    pub(super) async fn settled(&self) {
+        loop {
+            let at = self.latest_deadline();
+            if tokio::time::Instant::now() >= at {
+                return;
+            }
+            tokio::time::sleep_until(at).await;
         }
     }
 }
@@ -914,10 +1016,9 @@ impl<C> UpstreamPools<C> {
         self.pools.retain(|upstream, _| keep(upstream));
     }
 
-    /// `upstream` 的连接池，还没有就用 `clients` 建一个。平常池已经在，只读一下：不分配键、不拿写锁，以前每个查询都分配一个
-    /// 键、拿一次分片的写锁 / The pool for `upstream`, built from `clients` if there is none.
-    /// Normally the pool is there and is only read: no key allocated and no write lock taken,
-    /// where every query used to allocate a key and take its shard's write lock
+    /// `upstream` 的连接池，还没有就用 `clients` 建一个。平常池已经在，只读一下：不分配键、不拿写锁 / The pool for
+    /// `upstream`, built from `clients` if there is none. Normally the pool is there and is only
+    /// read: no key allocated and no write lock taken
     fn get_or_create(
         &self,
         upstream: &str,
@@ -946,9 +1047,9 @@ pub struct StreamMultiplexer<T: StreamTransport> {
     pool_size: usize,
     /// 建连用的共享部分 / What connects share
     shared: T::Shared,
-    /// 健康检查配置 / Health check configuration
-    max_age_secs: u64,
-    idle_timeout_secs: u64,
+    /// 连接怎样老化（`tcp_connection_max_age_seconds`、`tcp_connection_idle_timeout_seconds`）/ How
+    /// connections age (`tcp_connection_max_age_seconds`, `tcp_connection_idle_timeout_seconds`)
+    aging: Aging,
 }
 
 /// TCP 连接复用器 / TCP connection multiplexer
@@ -973,16 +1074,15 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
             pools: UpstreamPools::new(),
             pool_size: pool_size.max(1),
             shared,
-            max_age_secs,
-            idle_timeout_secs,
+            aging: Aging::new(
+                Duration::from_secs(max_age_secs),
+                Duration::from_secs(idle_timeout_secs),
+            ),
         }
     }
 
-    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
-    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
-    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
-    /// upstream the configuration no longer names is dropped: queries using it hold on to
-    /// it until they finish, and its connections close after that.
+    /// 只留下 `keep` 认可的上游的连接池（见 [`UpstreamPools::retain`]）/ Keeps only the pools of the
+    /// upstreams `keep` accepts (see [`UpstreamPools::retain`])
     pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
         self.pools.retain(keep);
     }
@@ -998,10 +1098,7 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
                     Arc::new(StreamMuxClient::with_shared(
                         self.shared.clone(),
                         upstream.clone(),
-                        StreamHealth {
-                            max_age_ms: self.max_age_secs * 1000,
-                            idle_timeout_ms: self.idle_timeout_secs * 1000,
-                        },
+                        self.aging,
                     ))
                 })
                 .collect()
@@ -1086,11 +1183,11 @@ impl DotMultiplexer {
     }
 }
 
-/// 一条连接：它的写入队列（见 [`WriteQueue`]）、它是第几代、停掉它的读取和写入任务的令牌、它读到过几个回答。几样放在
-/// 一起、在同一把锁下，拆连接时才说得清拆的是哪一条
+/// 一条连接：它的写入队列（见 [`WriteQueue`]）、它是第几代、停掉它的读取和写入任务的令牌、它读到过几个回答、它用了多久
+/// （见 [`Wear`]）。几样放在一起、在同一把锁下，拆连接时才说得清拆的是哪一条
 /// One connection: its write queue (see [`WriteQueue`]), which generation it is, the token that
-/// stops its reader and writer, and how many answers it has read. They sit together under one
-/// lock, so a teardown can say which connection it means
+/// stops its reader and writer, how many answers it has read, and how long it has lived (see
+/// [`Wear`]). They sit together under one lock, so a teardown can say which connection it means
 struct Live {
     queue: Arc<WriteQueue>,
     generation: u64,
@@ -1102,41 +1199,55 @@ struct Live {
     /// gone looks whether it ever did: one that answered was closed by the upstream, and the
     /// queries left unanswered are sent again on another (see [`ConnectionGone`])
     answers: Arc<AtomicU64>,
+    /// 登记的查询都记上自己的期限，它的写入任务按它老化（见 [`Aging`]）/ Every query registered notes its
+    /// deadline here, and the connection's writer ages it by this (see [`Aging`])
+    wear: Arc<Wear>,
+}
+
+/// 一个客户端的连接槽：现在的连接（没有时是 None），和在建的连接（见 [`Connect`]）/ A client's connection
+/// slot: the connection now (None without one), and the connection being made (see [`Connect`])
+#[derive(Default)]
+struct Slot {
+    live: Option<Live>,
+    connect: Connect,
+}
+
+/// 等着回答的查询，按改写过的 ID / The queries waiting for answers, by their rewritten IDs
+type PendingMap = DashMap<u16, Pending, FxBuildHasher>;
+
+/// 一个客户端的连接都要用的那几样，建连、读取和写入的任务各拿一份 / What a client's connections all use, a
+/// copy for each connecting, reading and writing task
+#[derive(Clone)]
+struct Wires {
+    upstream: Arc<str>,
+    /// 连接槽。锁只在登记查询、装上和拆掉连接的那一下拿着，拿着它时不等任何东西；登记和拆除因此排得出先后：一个查询要么在拆
+    /// 之前登记上、被告知失败，要么看到连接已经没了
+    /// The connection slot. Its lock is held only for the moment of registering a query, and of
+    /// putting a connection in place or tearing one down, never across a wait; registration and
+    /// teardown are thereby ordered: a query either registers before the teardown and is told of
+    /// the failure, or finds the connection gone
+    slot: Arc<parking_lot::Mutex<Slot>>,
+    pending: Arc<PendingMap>,
+    /// 最近建的那条连接是第几代，从 1 起，装上连接时在槽的锁下加一。拆连接的决定都点名一代（见 `close_locked`）
+    /// The generation of the connection made last, from 1, raised under the slot's lock as a
+    /// connection is put in place. Every decision to tear one down names a generation (see
+    /// `close_locked`)
+    generation: Arc<AtomicU64>,
+    /// 客户端被丢掉时取消：每条连接的令牌都是它的子令牌 / Cancelled when the client is dropped:
+    /// every connection's token is a child of it
+    stop: CancellationToken,
+    /// 连接怎样老化 / How the connections age
+    aging: Aging,
 }
 
 /// 一个上游的一条多路复用连接（TCP 或 DoT）/ One multiplexed connection to an upstream (TCP or DoT)
 pub struct StreamMuxClient<T: StreamTransport> {
-    pub upstream: Arc<str>,
+    wires: Wires,
     /// 建连用的共享部分 / What connects share
     shared: T::Shared,
-    /// 现在的连接，没有时是 None。锁同时把查询的登记和连接的拆除排出先后
-    /// The connection now, None without one. The lock also orders a query's registration
-    /// against the connection's teardown
-    conn: Arc<Mutex<Option<Live>>>,
     /// 这个客户端上还没答完的查询数（见 [`BUSY_AT`]）/ Queries on this client not yet answered (see [`BUSY_AT`])
     in_flight: AtomicUsize,
-    pending: Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
     next_id: AtomicU16,
-    /// 最近建的那条连接是第几代，从 1 起，建连时在连接锁下加一。拆连接的决定都点名一代（见 `close_locked`）
-    /// The generation of the connection made last, from 1, raised under the connection lock as a
-    /// connection is made. Every decision to tear one down names a generation (see `close_locked`)
-    generation: Arc<AtomicU64>,
-    /// 欠着要拆的那一代，0 是不欠（见 `reset_after_deadline`）/ The generation whose teardown is
-    /// owed, 0 for none (see `reset_after_deadline`)
-    reset_owed: AtomicU64,
-    /// 健康检查的设置 / Health check settings
-    health: StreamHealth,
-    /// 连接老化：创建时间戳（毫秒）/ Connection aging: creation timestamp (ms)
-    conn_create_time: AtomicU64,
-    /// 性能优化：上次健康检查时间（毫秒）/ Performance: last health check time (ms)
-    last_health_check_time: AtomicU64,
-    /// 客户端被丢掉时取消：每条连接的令牌都是它的子令牌 / Cancelled when the client is dropped:
-    /// every connection's token is a child of it
-    stop: CancellationToken,
-    /// 在建的连接、建连失败以后的退避（见 [`Connect`]），只在拿着连接锁时锁它 / The connection
-    /// being made and the backing off after a failed connect (see [`Connect`]), locked only with
-    /// the connection lock held
-    connect: Mutex<Connect<(T::Read, T::Write)>>,
 }
 
 /// 查询等回答时，它登记的那条连接没了：读写失败、被复位、空闲关掉、到期摘下后断了，或者在登记之前就被拆了。带着那条
@@ -1160,28 +1271,6 @@ impl std::fmt::Display for ConnectionGone {
 
 impl std::error::Error for ConnectionGone {}
 
-/// 一条 TCP/DoT 连接的健康检查设置，建客户端时给定，之后不变
-/// A TCP/DoT connection's health check settings, given when the client is built and fixed after
-#[derive(Debug, Clone, Copy)]
-struct StreamHealth {
-    /// 连接最长存活多久（毫秒），0 不限 / How long a connection may live (ms), 0 for no limit
-    max_age_ms: u64,
-    /// 空闲多久（毫秒）就关掉（见 [`WriteQueue::wait`]），0 不限 / How long it may sit idle (ms)
-    /// before it is closed (see [`WriteQueue::wait`]), 0 for no limit
-    idle_timeout_ms: u64,
-}
-
-#[cfg(test)]
-impl Default for StreamHealth {
-    /// 5 分钟、1 分钟 / 5 minutes, 1 minute
-    fn default() -> Self {
-        Self {
-            max_age_ms: 300_000,
-            idle_timeout_ms: 60_000,
-        }
-    }
-}
-
 pub type TcpMuxClient = StreamMuxClient<Tcp>;
 pub type DotMuxClient = StreamMuxClient<Dot>;
 
@@ -1196,59 +1285,33 @@ struct Pending {
     tx: oneshot::Sender<anyhow::Result<Bytes>>,
 }
 
-/// 一条连接上排着要写出去的帧。查询登记时把帧放进来，连接的写入任务被叫醒后先让一轮，再把这一轮里
-/// 排进来的帧一次写出去。查询自己不写：以前每个查询拿着连接锁各写一次，一个查询一次系统调用、DoT 还要
-/// 一个 TLS 记录；写到一半被取消（外层超时先到、多上游竞速输了被 abort）时，还会把半条帧留在连接上
-/// The frames queued for writing on one connection. A query puts its frame here when it
-/// registers; once woken, the connection's writer yields one round and then writes the frames
-/// queued during that round at once. Queries do not write themselves: each used to write under
-/// the connection lock, one system call per query and for DoT one TLS record, and a write
-/// cancelled part way (the outer timeout first, or the loser of a multi-upstream race aborted)
-/// left half a frame on the connection
+/// 一条连接上排着要写出去的帧，各带着它的查询改写过的 ID。查询登记时把帧放进来，连接的写入任务被叫醒后先让一轮，再把这一轮
+/// 里排进来、查询还在等的帧一次写出去（见 [`write_frames`]）。查询自己不写：一个查询一次系统调用、DoT 一个 TLS 记录太贵，
+/// 写到一半被取消（外层超时先到、多上游竞速输了被 abort）还会把半条帧留在连接上
+/// The frames queued for writing on one connection, each with its query's rewritten ID. A query
+/// puts its frame here when it registers; once woken, the connection's writer yields one round
+/// and then writes at once the frames queued during that round whose queries still wait (see
+/// [`write_frames`]). Queries do not write themselves: a system call per query, and for DoT a TLS
+/// record, cost too much, and a write cancelled part way (the outer timeout first, or the loser of
+/// a multi-upstream race aborted) would leave half a frame on the connection
 #[derive(Default)]
 struct WriteQueue {
-    frames: parking_lot::Mutex<BytesMut>,
+    queued: parking_lot::Mutex<Vec<(u16, Bytes)>>,
     wake: tokio::sync::Notify,
-    /// 排进来的帧所属的查询里最晚的期限（毫秒，同 `unix_time_millis`）：用到最长时间摘下以后过了这一刻才关（见
-    /// [`StreamMuxClient::retire`]），空闲也从这一刻算起（见 [`WriteQueue::wait`]）/ The latest deadline of
-    /// the queries whose frames were queued (ms, as `unix_time_millis`): once taken out at its max
-    /// age, the connection closes only past this (see [`StreamMuxClient::retire`]), and idleness
-    /// counts from it too (see [`WriteQueue::wait`])
-    last_deadline_ms: AtomicU64,
 }
 
 impl WriteQueue {
-    /// 排进一帧，叫醒写入任务 / Queues a frame and wakes the writer
-    fn push(&self, frame: &[u8]) {
-        self.frames.lock().extend_from_slice(frame);
+    /// 排进 ID 为 `id` 的查询的帧 `frame`，叫醒写入任务 / Queues `frame`, the frame of the query whose ID
+    /// is `id`, and wakes the writer
+    fn push(&self, id: u16, frame: Bytes) {
+        self.queued.lock().push((id, frame));
         self.wake.notify_one();
     }
 
-    /// 等有帧排进来，是 true。给了 `idle` 时最多等到最晚那个期限再过 `idle`，是 false：这时连接上没有查询在等，
-    /// 也这么久没有新的查询，算空闲（RFC 7766 §6.2.3）
-    /// Waits for a frame to be queued, true. With `idle` given it waits until the latest deadline
-    /// and `idle` after it at most, false: by then no query waits on the connection and none has
-    /// come for that long, which counts as idle (RFC 7766 §6.2.3)
-    async fn wait(&self, idle: Option<Duration>) -> bool {
-        let Some(idle) = idle else {
-            self.wake.notified().await;
-            return true;
-        };
-        let waited_on = self
-            .last_deadline_ms
-            .load(Ordering::Acquire)
-            .saturating_sub(unix_time_millis());
-        timeout(
-            Duration::from_millis(waited_on) + idle,
-            self.wake.notified(),
-        )
-        .await
-        .is_ok()
-    }
-
-    /// 取走排着的全部帧，换进 `batch` 里那块空缓冲 / Takes every queued frame, leaving the empty buffer in `batch` in their place
-    fn take(&self, batch: &mut BytesMut) {
-        std::mem::swap(batch, &mut *self.frames.lock());
+    /// 取走排着的全部帧，换进 `taken` 里那个空的 / Takes every queued frame, leaving the empty one in
+    /// `taken` in their place
+    fn take(&self, taken: &mut Vec<(u16, Bytes)>) {
+        std::mem::swap(taken, &mut *self.queued.lock());
     }
 }
 
@@ -1270,34 +1333,36 @@ async fn yield_one_round() {
     .await;
 }
 
-/// 写入任务为什么停了 / Why a writer stopped
-enum Stopped {
-    /// 写失败了，连接废了 / A write failed, and the connection is broken
-    Failed(std::io::Error),
-    /// 空闲到了时限（见 [`WriteQueue::wait`]）/ Idle up to the limit (see [`WriteQueue::wait`])
-    Idle,
-}
-
-/// 把 `queue` 里排着的帧写到 `writer`，直到写失败或者空闲了 `idle`（见 [`WriteQueue::wait`]）/ Writes the frames
-/// queued on `queue` to `writer` until a write fails or it has been idle for `idle` (see
-/// [`WriteQueue::wait`])
+/// 把 `queue` 里排着的帧写到 `writer`，直到写失败，给出那次失败。`waited(ID, 帧)` 说这一帧的查询还等不等：已经放弃了的
+/// （时限到了、竞速输了）不写，上游不用白答，写不出去时排着的帧也不会越积越多地全写给它
+/// Writes the frames queued on `queue` to `writer` until a write fails, giving that failure.
+/// `waited(ID, frame)` says whether the frame's query still waits: one given up already (its
+/// deadline past, a race lost) is not written, so the upstream answers nothing for nobody, and a
+/// backlog built up while writes were stuck does not all go to it
 ///
 /// 叫醒以后先让一轮再取（见 [`yield_one_round`]）：tokio 让刚被叫醒的任务插到最前面先跑，不让的话，
 /// 第一个查询一叫醒写入任务，它就只写这一帧，一个查询写一次
 /// Once woken it yields one round before taking the frames (see [`yield_one_round`]): tokio runs
 /// a task it was just woken for first, so without the yield the first query to wake the writer
 /// would be written alone, one write per query
-async fn write_frames<W>(mut writer: W, queue: &WriteQueue, idle: Option<Duration>) -> Stopped
+async fn write_frames<W>(
+    mut writer: W,
+    queue: &WriteQueue,
+    waited: impl Fn(u16, &Bytes) -> bool,
+) -> std::io::Error
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut batch = BytesMut::new();
+    let (mut taken, mut batch) = (Vec::new(), BytesMut::new());
     loop {
-        if !queue.wait(idle).await {
-            return Stopped::Idle;
-        }
+        queue.wake.notified().await;
         yield_one_round().await;
-        queue.take(&mut batch);
+        queue.take(&mut taken);
+        for (id, frame) in taken.drain(..) {
+            if waited(id, &frame) {
+                batch.extend_from_slice(&frame);
+            }
+        }
         if batch.is_empty() {
             continue;
         }
@@ -1312,7 +1377,7 @@ where
             writer.flush().await
         };
         if let Err(err) = written.await {
-            return Stopped::Failed(err);
+            return err;
         }
         batch.clear();
     }
@@ -1333,14 +1398,23 @@ const CLOSE_BUDGET: Duration = Duration::from_secs(1);
 /// open while they run.
 impl<T: StreamTransport> Drop for StreamMuxClient<T> {
     fn drop(&mut self) {
-        self.stop.cancel();
+        self.wires.stop.cancel();
+    }
+}
+
+#[cfg(test)]
+impl Aging {
+    /// 测试里的客户端用的老化：5 分钟、1 分钟，和默认配置一样 / The aging of clients in tests: 5 minutes and
+    /// 1 minute, as the default configuration has
+    fn for_tests() -> Self {
+        Self::new(Duration::from_secs(300), Duration::from_secs(60))
     }
 }
 
 #[cfg(test)]
 impl TcpMuxClient {
     fn new(upstream: Arc<str>) -> Self {
-        Self::with_shared(Bootstrap::system(), upstream, StreamHealth::default())
+        Self::with_shared(Bootstrap::system(), upstream, Aging::for_tests())
     }
 }
 
@@ -1350,67 +1424,111 @@ impl DotMuxClient {
         Self::with_shared(
             (tls_config, Bootstrap::system()),
             upstream,
-            StreamHealth::default(),
+            Aging::for_tests(),
         )
     }
 }
 
+#[cfg(test)]
 impl<T: StreamTransport> StreamMuxClient<T> {
-    fn with_shared(shared: T::Shared, upstream: Arc<str>, health: StreamHealth) -> Self {
+    /// 测试里连上上游，不发查询 / In tests, connect to the upstream without sending a query
+    async fn connect_for_tests(&self) -> anyhow::Result<()> {
+        let attempt = {
+            let mut slot = self.wires.slot.lock();
+            if slot.live.is_some() {
+                return Ok(());
+            }
+            slot.connect.attempt(|| self.connecting())?
+        };
+        Ok(attempt.await?)
+    }
+
+    /// 测试里看槽里有没有连接 / In tests, whether the slot holds a connection
+    fn connected(&self) -> bool {
+        self.wires.slot.lock().live.is_some()
+    }
+}
+
+impl<T: StreamTransport> StreamMuxClient<T> {
+    fn with_shared(shared: T::Shared, upstream: Arc<str>, aging: Aging) -> Self {
         Self {
-            upstream,
+            wires: Wires {
+                upstream,
+                slot: Arc::default(),
+                pending: Arc::new(DashMap::with_hasher(FxBuildHasher)),
+                generation: Arc::new(AtomicU64::new(0)),
+                stop: CancellationToken::new(),
+                aging,
+            },
             shared,
-            conn: Arc::new(Mutex::new(None)),
             in_flight: AtomicUsize::new(0),
-            pending: Arc::new(dashmap::DashMap::with_hasher(FxBuildHasher)),
             next_id: AtomicU16::new(1),
-            generation: Arc::new(AtomicU64::new(0)),
-            reset_owed: AtomicU64::new(0),
-            health,
-            conn_create_time: AtomicU64::new(0),
-            last_health_check_time: AtomicU64::new(0),
-            stop: CancellationToken::new(),
-            connect: Mutex::new(Connect::default()),
         }
     }
 
-    /// 等一条新连接，最多等 `budget`；等不到时连接照样建完，留给下一个查询（见 [`Connect`]）。只在拿着连接锁时调用
-    /// Waits up to `budget` for a new connection; past it the connection is made all the same,
-    /// for the next query (see [`Connect`]). Called only with the connection lock held
-    async fn connect(&self, budget: Duration) -> anyhow::Result<(T::Read, T::Write)> {
-        let mut connect = self.connect.lock().await;
-        let made = connect.finish(|| {
-            let (shared, upstream) = (self.shared.clone(), Arc::clone(&self.upstream));
-            async move { T::connect(&shared, &upstream).await }
+    /// 建一条到上游的连接并装上（见 [`Connect`]、[`Self::install`]）/ Connects to the upstream and puts the
+    /// connection in place (see [`Connect`] and [`Self::install`])
+    fn connecting(&self) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+        let (shared, wires) = (self.shared.clone(), self.wires.clone());
+        async move {
+            let (read_half, write_half) = T::connect(&shared, &wires.upstream).await?;
+            Self::install(&wires, read_half, write_half);
+            Ok(())
+        }
+    }
+
+    /// 把刚建好的连接装进槽里：新的一代，起它的读取和写入任务。槽里原来的那条（没有时是 None）不会还在：只有槽空着时才建连
+    /// Puts a connection just made in the slot: a new generation, with its reader and writer
+    /// started. The slot holds no other: a connect is only made while it is empty
+    fn install(wires: &Wires, read_half: T::Read, write_half: T::Write) {
+        let mut slot = wires.slot.lock();
+        let generation = wires.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // 这条连接自己的取消令牌；客户端被丢掉时也跟着取消
+        // The connection's own cancellation token, cancelled with the client too
+        let cancel = wires.stop.child_token();
+        let (queue, answers) = (Arc::new(WriteQueue::default()), Arc::new(AtomicU64::new(0)));
+        let wear = Arc::new(Wear::new());
+        Self::spawn_reader(
+            wires,
+            read_half,
+            cancel.clone(),
+            generation,
+            Arc::clone(&answers),
+        );
+        Self::spawn_writer(
+            wires,
+            write_half,
+            Arc::clone(&queue),
+            Arc::clone(&wear),
+            cancel.clone(),
+            generation,
+        );
+        slot.live = Some(Live {
+            queue,
+            generation,
+            cancel,
+            answers,
+            wear,
         });
-        let Ok(made) = timeout(budget, made).await else {
-            anyhow::bail!(
-                "{} timeout waiting for the connection after {}ms",
-                T::LABEL,
-                budget.as_millis()
-            );
-        };
-        made
+        info!(upstream = %wires.upstream, "{} connection established", T::NAME);
     }
 
     fn spawn_reader(
-        &self,
+        wires: &Wires,
         mut reader: T::Read,
         cancel_token: CancellationToken,
         my_generation: u64,
         answers: Arc<AtomicU64>,
     ) {
-        let pending = Arc::clone(&self.pending);
-        let upstream = self.upstream.clone();
-        let conn = Arc::clone(&self.conn);
-
+        let wires = wires.clone();
         tokio::spawn(async move {
+            let (pending, upstream) = (&wires.pending, &wires.upstream);
             // Pre-allocate a reusable buffer for reads
             // DNS TCP max is 65535 bytes, but typical responses are much smaller
             let mut reusable_buf = BytesMut::with_capacity(4096);
-            // 一直读到这一代被取消：复位时马上取消，用到最长时间摘下的等它的查询都到了期限再取消（见 `retire`）
+            // 一直读到这一代被取消：复位时马上取消，用旧了摘下的等它的查询都到了期限再取消（见 `spawn_writer`）
             // Reading goes on until this generation is cancelled: at once on a reset, and once its
-            // queries have all reached their deadlines when taken out at its max age (see `retire`)
+            // queries have all reached their deadlines when taken out as worn (see `spawn_writer`)
             loop {
                 let mut len_buf = [0u8; 2];
                 // Cancellation: select! interrupts blocked read_exact on reset
@@ -1426,7 +1544,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                             // The generation this reader belongs to is what goes; one already
                             // replaced is left alone
                             let why = format!("{} read len failed", T::LABEL);
-                            if Self::close(&pending, &conn, my_generation, &why).await {
+                            if Self::close(&wires, my_generation, &why) {
                                 debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read len failed", T::LABEL);
                             } else {
                                 debug!(target = T::LOG_TARGET, upstream = %upstream, gen = my_generation, "{} reader failed but generation changed, ignoring", T::NAME);
@@ -1452,7 +1570,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     result = reader.read_exact(&mut reusable_buf[..resp_len]) => {
                         if let Err(err) = result {
                             let why = format!("{} read body failed", T::LABEL);
-                            if Self::close(&pending, &conn, my_generation, &why).await {
+                            if Self::close(&wires, my_generation, &why) {
                                 debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{} read body failed", T::LABEL);
                             }
                             break;
@@ -1527,89 +1645,66 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         });
     }
 
-    /// 起这条连接的写入任务（见 [`WriteQueue`]）。写失败时这条连接就废了：让还在等它的查询失败，读取任务也
-    /// 跟着结束；空闲到了 `tcp_connection_idle_timeout_seconds` 就关掉它（RFC 7766 §6.2.3），排在池后面、平常轮不到
-    /// 的连接也一样，以前要等下一个用到它的查询来查，一直没有就一直开着。自己关的连接好好地关：DoT 发 close_notify，
-    /// 再发 FIN（见 [`CLOSE_BUDGET`]）。连接已经换了代就不去动槽里的新连接
-    /// Starts the connection's writer (see [`WriteQueue`]). A failed write ends the connection:
-    /// the queries still waiting on it fail and the reader ends too; idle for
-    /// `tcp_connection_idle_timeout_seconds` it is closed (RFC 7766 §6.2.3), one far down the
-    /// pool and normally left alone too, which used to wait for the next query using it to look,
-    /// and stayed open while none came. A connection closed of our own accord is closed properly:
-    /// DoT sends close_notify, then the FIN (see [`CLOSE_BUDGET`]). The new connection in the slot
-    /// of a newer generation is left alone
+    /// 起这条连接的写入任务（见 [`WriteQueue`]），它也照 [`Aging`] 给这条连接老化。写失败时这条连接就废了：让还在等它的
+    /// 查询失败，读取任务也跟着结束。用旧了（活满 `tcp_connection_max_age_seconds`，或者空闲满
+    /// `tcp_connection_idle_timeout_seconds`，RFC 7766 §6.2.3）就从槽里摘下，排在池后面、平常轮不到的连接也一样；它上面还在
+    /// 等的查询照样等到各自的期限，帧照写、回答照收，过了最晚的那个再关。自己关的连接好好地关：DoT 发 close_notify，再发
+    /// FIN（见 [`CLOSE_BUDGET`]）。连接已经换了代就不去动槽里的新连接
+    /// Starts the connection's writer (see [`WriteQueue`]), which also ages the connection by
+    /// [`Aging`]. A failed write ends the connection: the queries still waiting on it fail and the
+    /// reader ends too. Worn (it has lived `tcp_connection_max_age_seconds`, or sat idle for
+    /// `tcp_connection_idle_timeout_seconds`, RFC 7766 §6.2.3) it is taken out of the slot, one
+    /// far down the pool and normally left alone too; the queries still waiting on it go on to
+    /// their own deadlines, their frames written and their answers taken, and it closes once the
+    /// latest has passed. A connection closed of our own accord is closed properly: DoT sends
+    /// close_notify, then the FIN (see [`CLOSE_BUDGET`]). The new connection in the slot of a
+    /// newer generation is left alone
     fn spawn_writer(
-        &self,
+        wires: &Wires,
         mut writer: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
         queue: Arc<WriteQueue>,
+        wear: Arc<Wear>,
         cancel_token: CancellationToken,
         my_generation: u64,
     ) {
-        let pending = Arc::clone(&self.pending);
-        let upstream = self.upstream.clone();
-        let conn = Arc::clone(&self.conn);
-        let idle =
-            Some(Duration::from_millis(self.health.idle_timeout_ms)).filter(|idle| !idle.is_zero());
-
+        let wires = wires.clone();
         tokio::spawn(async move {
-            let stopped = tokio::select! {
-                _ = cancel_token.cancelled() => None,
-                stopped = write_frames(&mut writer, &queue, idle) => Some(stopped),
-            };
-            match stopped {
-                // 写不出去的连接没法好好地关 / A connection that cannot be written to cannot be
-                // closed properly
-                Some(Stopped::Failed(err)) => {
-                    cancel_token.cancel();
-                    let why = format!("{} write failed", T::LABEL);
-                    if Self::close(&pending, &conn, my_generation, &why).await {
-                        debug!(target = T::LOG_TARGET, upstream = %upstream, error = %err, "{why}");
-                    }
-                    return;
+            let failed = async {
+                // 帧的查询还登记着、还在等：同一个 ID 后来的查询的帧是另一份 / The frame's query is still
+                // registered and waiting: a later query on the same ID has a frame of its own
+                let waited = |id, frame: &Bytes| {
+                    wires.pending.get(&id).is_some_and(|pending| {
+                        pending.frame.as_ptr() == frame.as_ptr() && !pending.tx.is_closed()
+                    })
+                };
+                let mut writing = std::pin::pin!(write_frames(&mut writer, &queue, waited));
+                let why = tokio::select! {
+                    () = cancel_token.cancelled() => return None,
+                    err = &mut writing => return Some(err),
+                    why = wires.aging.worn(&wear) => why,
+                };
+                if Self::retire(&wires, my_generation) {
+                    info!(target = T::LOG_TARGET, upstream = %wires.upstream, why, "{} connection worn, closing it once its queries are done", T::NAME);
                 }
-                Some(Stopped::Idle) => {
-                    cancel_token.cancel();
-                    let why = format!("{} connection idle", T::NAME);
-                    if Self::close(&pending, &conn, my_generation, &why).await {
-                        info!(target = T::LOG_TARGET, upstream = %upstream, "{why}, closing it");
-                    }
+                tokio::select! {
+                    () = cancel_token.cancelled() => None,
+                    err = &mut writing => Some(err),
+                    () = wear.settled() => None,
                 }
-                None => {}
+            }
+            .await;
+            cancel_token.cancel();
+            // 写不出去的连接没法好好地关 / A connection that cannot be written to cannot be closed
+            // properly
+            if let Some(err) = failed {
+                let why = format!("{} write failed", T::LABEL);
+                if Self::close(&wires, my_generation, &why) {
+                    debug!(target = T::LOG_TARGET, upstream = %wires.upstream, error = %err, "{why}");
+                }
+                return;
             }
             let _ = timeout(CLOSE_BUDGET, writer.shutdown()).await;
         });
-    }
-
-    // ========== Health check methods / 健康检查方法 ==========
-
-    /// 连接用到了最长时间就摘下（见 [`Self::retire`]）；空闲由写入任务自己关（见 [`Self::spawn_writer`]）
-    /// A connection at its max age is taken out (see [`Self::retire`]); an idle one is closed by its
-    /// own writer (see [`Self::spawn_writer`])
-    async fn check_connection_health(&self) {
-        let now = unix_time_millis();
-        // 先记下看的是哪一代，再读它的时刻：几个查询可能同时判断「该拆了」，后到的那个动手时连接也许已经
-        // 换成新的，它拆的还得是当初看的那一代
-        // Which generation is looked at is noted first, its times read after: several queries may
-        // decide together that it has to go, and by the time the later one acts the connection
-        // may have been replaced; what it tears down must still be the generation it looked at
-        let generation = self.generation.load(Ordering::Acquire);
-
-        // Check connection aging / 检查连接老化
-        let create_time = self.conn_create_time.load(Ordering::Acquire);
-        let max_age = self.health.max_age_ms;
-        if create_time > 0 && max_age > 0 {
-            let age_ms = now.saturating_sub(create_time);
-            if age_ms > max_age {
-                info!(
-                    upstream = %self.upstream,
-                    age_ms = age_ms,
-                    max_age_ms = max_age,
-                    "{} connection too old, replacing it once its queries are done",
-                    T::NAME
-                );
-                self.retire(generation).await;
-            }
-        }
     }
 
     async fn send(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
@@ -1621,8 +1716,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // 发之前最新的那一代：查询登记的连接没了（见 [`ConnectionGone`]），而它不比这一代新（这次之前就有的连接，
         // 多半是空闲久了被上游关掉的），或者它回答过别的查询（上游答了一些就关掉，RFC 7766 §6.2.1.1 要客户端把没答的
         // 重发），就换一条新的在剩下的预算里重发一次。别的失败不重发：建连失败、退避、超时，再来一次也一样；这次自己
-        // 新建、一个也没答就断了的连接，再建一条多半还是断。以前新建的连接答过别的再断也不重发；更早事先拿 try_lock
-        // 猜是不是复用（锁被占着就当复用），猜成复用的不管什么失败都重发
+        // 新建、一个也没答就断了的连接，再建一条多半还是断
         // The latest generation before sending: when the connection the query registered on is gone
         // (see [`ConnectionGone`]) and was no newer than that (there before this send, most likely
         // closed by the upstream after sitting idle), or had answered other queries (an upstream
@@ -1630,11 +1724,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         // send again), the query is sent once more on a fresh one within what is left of the
         // budget. Other failures are not sent again: a failed connect, backing off and timeouts
         // would only come round again, and a connection this send made breaking before answering
-        // anything most likely breaks again. A new connection answering others before it broke
-        // used not to be sent again on either; earlier still, whether the connection was reused
-        // was guessed beforehand with try_lock (a held lock counting as reused), and a send guessed
-        // to reuse one was sent again on any failure
-        let before = self.generation.load(Ordering::Acquire);
+        // anything most likely breaks again
+        let before = self.wires.generation.load(Ordering::Acquire);
         match self.send_attempt(packet, timeout_dur).await {
             Err(err)
                 if err
@@ -1645,7 +1736,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     return Err(err);
                 };
                 debug!(
-                    upstream = %self.upstream,
+                    upstream = %self.wires.upstream,
                     error = %err,
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "{} connection gone under a query, sending again on a fresh one",
@@ -1658,255 +1749,131 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     }
 
     async fn send_attempt(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
-        let start = tokio::time::Instant::now();
-
-        // 性能优化：仅在距离上次检查超过 30 秒时才执行健康检查
-        // Performance: Only check connection health if 30 seconds have passed since last check
-        const HEALTH_CHECK_INTERVAL_MS: u64 = 30_000; // 30 秒
-        let now = unix_time_millis();
-        let last_check = self.last_health_check_time.load(Ordering::Relaxed);
-        // 检查也守这次查询的预算：拆连接要等连接锁，前面有登记占着锁时不能等过自己的时限；没做完的下一个查询再查
-        // The check keeps to this query's budget too: tearing a connection down waits for the
-        // connection lock, which must not hold a query past its deadline while registrations hold it
-        // ahead; a check left unfinished is made by the next query
-        if (last_check == 0 || now.saturating_sub(last_check) >= HEALTH_CHECK_INTERVAL_MS)
-            && timeout(timeout_dur, self.check_connection_health())
-                .await
-                .is_ok()
-        {
-            self.last_health_check_time.store(now, Ordering::Relaxed);
-        }
-
-        // 1. Ensure the connection exists (connecting if needed), within what is left
-        //    of the budget
-        // 确保连接存在（没有就建连），受剩余预算约束
-        self.ensure_connection(timeout_dur.saturating_sub(start.elapsed()))
-            .await?;
-
-        let elapsed = start.elapsed();
-        if elapsed >= timeout_dur {
-            anyhow::bail!("{} timeout before processing", T::LABEL);
-        }
-        let remaining = timeout_dur - elapsed;
-
-        let original_id = u16::from_be_bytes([packet[0], packet[1]]);
-
-        // 生成通道
+        let deadline = tokio::time::Instant::now() + timeout_dur;
         let (tx, rx) = oneshot::channel();
-
-        // 原子操作：分配 ID 并注册到 pending map，避免竞态条件
-        // 注册要等连接锁，也受剩余预算约束：以前排在一长串注册后面的查询，会远远超出自己的时限
-        // Registration waits for the connection lock, so it is bounded by what is left
-        // of the budget too: a query queued behind a long run of registrations used to
-        // run far past its own deadline
-        let Ok(registered) = timeout(
-            remaining,
-            self.register_pending(
-                packet,
-                original_id,
-                unix_time_millis() + remaining.as_millis() as u64,
-                tx,
-            ),
-        )
-        .await
-        else {
-            anyhow::bail!(
-                "{name} timeout waiting to register for upstream {upstream}",
-                name = T::NAME,
-                upstream = self.upstream
-            );
-        };
         // 登记在哪一代连接上：之后要拆连接、要记错误，说的都是这一代；它读到过几个回答
         // The generation of the connection it registered on: a later teardown or a recorded
         // error means this one; and how many answers it has read
-        let (new_id, generation, answers) = registered?;
+        let (new_id, generation, answers) = self.register(packet, deadline, tx).await?;
 
         // RAII Guard: ensures entry is removed from map when guard is dropped
         // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
         let mut waiting = Waiting {
             rx,
-            map: self.pending.clone(),
+            map: Arc::clone(&self.wires.pending),
             id: new_id,
             abandoned: |pending| pending.tx.is_closed(),
         };
-
         let answers_at_queue = answers.load(Ordering::Acquire);
 
-        // 2. Wait for response; the connection's writer sends the frame (see `WriteQueue`)
-        // 2. 等待响应；帧由连接的写入任务发出（见 `WriteQueue`）
-        let elapsed_after_queue = start.elapsed();
-        if elapsed_after_queue >= timeout_dur {
-            // Guard will remove pending entry automatically
-
-            // 登记完就到了时限：连接还没机会回答，不怪它，不复位
-            // The deadline passed as registration finished: the connection had no chance to
-            // answer, so it is not blamed and not reset
-            return Err(anyhow::anyhow!(
-                "{name} timeout before waiting for response from upstream {upstream} (elapsed: {elapsed_ms}ms, timeout: {timeout_ms}ms)",
+        // 等待响应；帧由连接的写入任务发出（见 `WriteQueue`）。登记完就到了时限：连接还没机会回答，不怪它，不复位
+        // Wait for the response; the connection's writer sends the frame (see `WriteQueue`). The
+        // deadline passed as registration finished: the connection had no chance to answer, so it
+        // is not blamed and not reset
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "{name} timeout before waiting for response from upstream {upstream} (timeout: {timeout_ms}ms)",
                 name = T::NAME,
-                upstream = self.upstream,
-                elapsed_ms = elapsed_after_queue.as_millis(),
+                upstream = self.wires.upstream,
                 timeout_ms = timeout_dur.as_millis()
-            ));
+            );
         }
-        let final_remaining = timeout_dur - elapsed_after_queue;
 
-        let resp = match timeout(final_remaining, &mut waiting.rx).await {
-            Ok(Ok(Ok(response))) => response,
-            Ok(Ok(Err(err))) => {
-                // 连接在等待期间断开或被重置，所有等待的查询都被告知了；这不是成功，
-                // 是否换新连接重发由 send() 决定
-                // The connection broke or was reset while this query waited, and
-                // every waiter was told. That is no success; send() decides on a
-                // retry over a fresh connection
-                return Err(err);
-            }
-            Ok(Err(_canceled)) => {
-                // 发送的那一头没给结果就没了（正常不会：拿走条目的都先给结果）/ The sending end went
-                // without an outcome (not normally: whatever takes an entry gives its outcome first)
-                return Err(anyhow::anyhow!(
-                    "{name} response canceled for upstream {upstream}",
-                    name = T::NAME,
-                    upstream = self.upstream
-                ));
-            }
+        match tokio::time::timeout_at(deadline, &mut waiting.rx).await {
+            Ok(Ok(Ok(response))) => Ok(response),
+            // 连接在等待期间断开或被重置，所有等待的查询都被告知了；这不是成功，是否换新连接重发由 send() 决定
+            // The connection broke or was reset while this query waited, and every waiter was
+            // told. That is no success; send() decides on a retry over a fresh connection
+            Ok(Ok(Err(err))) => Err(err),
+            // 发送的那一头没给结果就没了（正常不会：拿走条目的都先给结果）/ The sending end went
+            // without an outcome (not normally: whatever takes an entry gives its outcome first)
+            Ok(Err(_canceled)) => Err(anyhow::anyhow!(
+                "{name} response canceled for upstream {upstream}",
+                name = T::NAME,
+                upstream = self.wires.upstream
+            )),
             Err(_elapsed) => {
-                // Guard will remove pending entry automatically
-
-                // 排进去之后这条连接还在回答别的查询：连接是活的，只是这一个回答慢。重建
-                // 连接只会让同一条连接上其他查询的回答跟着丢掉，也不算连接出错
-                // The connection kept answering other queries after this one was
-                // queued: it is alive and only this answer is slow. Rebuilding it
-                // would only lose the other answers on it, and it is no connection error
+                // 排进去之后这条连接还在回答别的查询：连接是活的，只是这一个回答慢。重建连接只会让同一条连接上其他查询的
+                // 回答跟着丢掉，也不算连接出错
+                // The connection kept answering other queries after this one was queued: it is
+                // alive and only this answer is slow. Rebuilding it would only lose the other
+                // answers on it, and it is no connection error
                 if answers.load(Ordering::Acquire) > answers_at_queue {
                     return Err(anyhow::anyhow!(
-                        "{name} response timeout from upstream {upstream} (remaining: {timeout_ms}ms); the connection is still answering",
+                        "{name} response timeout from upstream {upstream} (timeout: {timeout_ms}ms); the connection is still answering",
                         name = T::NAME,
-                        upstream = self.upstream,
-                        timeout_ms = final_remaining.as_millis()
+                        upstream = self.wires.upstream,
+                        timeout_ms = timeout_dur.as_millis()
                     ));
                 }
-
-                // No answer in time and the connection has gone quiet (likely dead or
-                // stalled): reset it, or have the next connect reset it when the lock is busy
-                // (see `reset_after_deadline`)
-                // 时限内没有回答，连接也没了动静（多半已死或卡住）：复位它，锁被占着时交给下一次建连去
-                // 复位（见 `reset_after_deadline`）
-                self.reset_after_deadline(generation).await;
-
-                return Err(anyhow::anyhow!(
-                    "{name} response timeout from upstream {upstream} (remaining: {timeout_ms}ms)",
+                // 时限内没有回答，连接也没了动静（多半已死或卡住）：复位它
+                // No answer in time and the connection has gone quiet (likely dead or stalled):
+                // reset it
+                self.reset(generation);
+                Err(anyhow::anyhow!(
+                    "{name} response timeout from upstream {upstream} (timeout: {timeout_ms}ms)",
                     name = T::NAME,
-                    upstream = self.upstream,
-                    timeout_ms = final_remaining.as_millis()
-                ));
+                    upstream = self.wires.upstream,
+                    timeout_ms = timeout_dur.as_millis()
+                ))
             }
-        };
-        Ok(resp)
+        }
     }
 
-    /// Ensure the connection exists, connecting if needed. One connection carries
-    /// any number of queries at once (multiplexing).
-    /// 确保连接存在，没有就建连。一条连接上可以同时跑任意多个查询（多路复用）。
-    ///
-    /// `budget` bounds the connect (DoT's TLS handshake included); on failure
-    /// the lock is released immediately.
-    /// `budget` 约束建连（包括 DoT 的 TLS 握手）；失败时立即释放锁。
-    async fn ensure_connection(&self, budget: Duration) -> anyhow::Result<()> {
-        let started = tokio::time::Instant::now();
-        // 欠着要拆的那一代（见 `reset_after_deadline`）先拆掉；拆的时候连接已经换过就什么都不动
-        // The generation whose teardown is owed (see `reset_after_deadline`) goes first; a
-        // connection replaced by the time of the teardown is left alone
-        let owed = self.reset_owed.load(Ordering::Acquire);
-        if owed != 0 {
-            let generation = owed;
-            debug!(
-                upstream = %self.upstream,
-                "{} connection owes a reset before ensure",
-                T::NAME
-            );
-            // 欠着的复位也守预算：前面的登记占着锁时不能等过时限；没做完下次再做
-            // An owed reset keeps to the budget too: with registrations holding the lock
-            // ahead of it, it must not wait past the deadline; if unfinished, the next
-            // connect does it
-            if timeout(budget, self.reset(generation)).await.is_err() {
-                anyhow::bail!(
-                    "{} timeout resetting the connection after {}ms",
-                    T::LABEL,
-                    budget.as_millis()
-                );
-            }
-            // 做完了才销账；这期间又欠了别的一代就留着 / The debt is cleared only once done; another
-            // generation owed meanwhile stays
-            let _ = self.reset_owed.compare_exchange(
-                generation,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-
-        // 等连接锁也算在预算里：前面有查询占着锁时，不能等过自己的时限
-        // Waiting for the connection lock counts against the budget too: with the lock
-        // held ahead of it, a query must not wait past its own deadline
-        let Ok(mut guard) =
-            timeout(budget.saturating_sub(started.elapsed()), self.conn.lock()).await
-        else {
-            anyhow::bail!(
-                "{} timeout waiting for the connection after {}ms",
-                T::LABEL,
-                budget.as_millis()
-            );
-        };
-        if guard.is_none() {
-            let (read_half, write_half) = self
-                .connect(budget.saturating_sub(started.elapsed()))
-                .await?;
-            let queue = Arc::new(WriteQueue::default());
-
-            // Increment generation for new connection
-            // 为新连接增加代数
-            let new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-
-            // 这条连接自己的取消令牌；客户端被丢掉时也跟着取消
-            // The connection's own cancellation token, cancelled with the client too
-            let new_token = self.stop.child_token();
-
-            // Spawn reader and writer while holding the lock to prevent races
-            // 持有锁时启动读取和写入任务以防止竞争
-            let answers = Arc::new(AtomicU64::new(0));
-            self.spawn_reader(read_half, new_token.clone(), new_gen, Arc::clone(&answers));
-            self.spawn_writer(write_half, Arc::clone(&queue), new_token.clone(), new_gen);
-            *guard = Some(Live {
-                queue,
-                generation: new_gen,
-                cancel: new_token,
-                answers,
-            });
-
-            // 设置连接创建时间
-            // Set connection creation time
-            self.conn_create_time
-                .store(unix_time_millis(), Ordering::Release);
-
-            info!(upstream = %self.upstream, "{} connection established", T::NAME);
-        }
-
-        Ok(())
-    }
-
-    /// Rewrite DNS transaction ID, register in pending map and queue the frame for writing
-    /// atomically, returning the new ID, the connection's generation and its answer count (see
-    /// [`Live::answers`])
-    /// 原子操作：重写 DNS 事务 ID、注册到 pending map、把帧排进写入队列，返回新的 ID、连接是第几代和它的回答数（见
-    /// [`Live::answers`]）
-    async fn register_pending(
+    /// 登记一个查询：在现在的连接上登记（见 [`Self::register_on`]）；没有连接就等一条，最多到 `deadline`（见 [`Connect`]）。
+    /// 一条连接上可以同时跑任意多个查询（多路复用）。等来的连接在登记之前就没了时不再等下一条
+    /// Registers a query: on the connection now (see [`Self::register_on`]); with none, one is
+    /// waited for until `deadline` at most (see [`Connect`]). One connection carries any number of
+    /// queries at once (multiplexing). A connection waited for and gone before the query could
+    /// register is not followed by a wait for another
+    async fn register(
         &self,
         packet: &[u8],
-        original_id: u16,
-        deadline_ms: u64,
+        deadline: tokio::time::Instant,
         tx: oneshot::Sender<anyhow::Result<Bytes>>,
     ) -> anyhow::Result<(u16, u64, Arc<AtomicU64>)> {
+        for waited in [false, true] {
+            let attempt = {
+                let mut slot = self.wires.slot.lock();
+                if let Some(live) = &slot.live {
+                    return self.register_on(live, packet, deadline, tx);
+                }
+                if waited {
+                    break;
+                }
+                slot.connect.attempt(|| self.connecting())?
+            };
+            match tokio::time::timeout_at(deadline, attempt).await {
+                Ok(made) => made?,
+                Err(_) => anyhow::bail!(
+                    "{} timeout waiting for the connection to upstream {}",
+                    T::LABEL,
+                    self.wires.upstream
+                ),
+            }
+        }
+        Err(ConnectionGone {
+            generation: self.wires.generation.load(Ordering::Acquire),
+            answered: false,
+            why: "connection closed before registration".into(),
+        }
+        .into())
+    }
+
+    /// 在连接 `live` 上登记一个期限在 `deadline` 的查询：记上期限（见 [`Wear`]），重写 DNS 事务 ID、登记进 pending、
+    /// 把帧排进写入队列，返回新的 ID、连接是第几代和它的回答数（见 [`Live::answers`]）。拿着槽的锁调用
+    /// Registers a query with its deadline at `deadline` on the connection `live`: the deadline
+    /// noted (see [`Wear`]), the DNS transaction ID rewritten, the query registered in pending and
+    /// its frame queued for writing, returning the new ID, the connection's generation and its
+    /// answer count (see [`Live::answers`]). Called with the slot's lock held
+    fn register_on(
+        &self,
+        live: &Live,
+        packet: &[u8],
+        deadline: tokio::time::Instant,
+        tx: oneshot::Sender<anyhow::Result<Bytes>>,
+    ) -> anyhow::Result<(u16, u64, Arc<AtomicU64>)> {
+        let original_id = u16::from_be_bytes([packet[0], packet[1]]);
         // Build complete TCP/DoT wire frame (2-byte length prefix + DNS message). The same
         // buffer stays in the pending entry for the answer's question check, as on UDP.
         // 构建完整 TCP/DoT wire frame（2 字节长度前缀 + DNS 消息）。同一份缓冲还留在 pending 条目里
@@ -1914,22 +1881,8 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         let mut frame = BytesMut::with_capacity(2 + packet.len());
         frame.extend_from_slice(&(packet.len() as u16).to_be_bytes());
         frame.extend_from_slice(packet);
-
-        // Serialize registration with connection teardown so a failed reader cannot miss a waiter.
-        // 将 pending 注册与连接清理串行化，避免失败的 reader 遗漏 waiter。
-        let conn_guard = self.conn.lock().await;
-        let Some(live) = conn_guard.as_ref() else {
-            return Err(ConnectionGone {
-                generation: self.generation.load(Ordering::Acquire),
-                answered: false,
-                why: "connection closed before registration".into(),
-            }
-            .into());
-        };
-        let (queue, generation) = (&live.queue, live.generation);
-        queue
-            .last_deadline_ms
-            .fetch_max(deadline_ms, Ordering::AcqRel);
+        let (queue, generation, pending) = (&live.queue, live.generation, &self.wires.pending);
+        live.wear.note(deadline);
 
         let mut tries = 0;
         let new_id = loop {
@@ -1938,7 +1891,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
             // Use Entry API to check vacancy and insert atomically
             // 使用 Entry API 检查空位并原子插入
-            if let entry::Entry::Vacant(e) = self.pending.entry(cand) {
+            if let entry::Entry::Vacant(e) = pending.entry(cand) {
                 // TXID at offset 2 (after length prefix) / 偏移 2 处（长度前缀之后）
                 frame[2..4].copy_from_slice(&cand.to_be_bytes());
                 let frame = frame.freeze();
@@ -1948,52 +1901,36 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     frame: frame.clone(),
                     tx,
                 });
-                queue.push(&frame);
+                queue.push(cand, frame);
                 break cand;
             }
 
-            // 头一个 ID 就被占着时看看是不是全被占了：65536 个 ID 都被等着的查询占着时立刻说没有，
-            // 不在连接锁下把每个 ID 都试一遍。以前一大批这样的查询排着队各试一遍，后面的都远远超出
-            // 时限。数一遍要锁每个分片，所以平常拿到空 ID 时不数
-            // The first ID taken, see whether all are: with all 65536 held by waiting
-            // queries, say so at once rather than try every ID under the connection
-            // lock. A crowd of such queries used to take turns trying them all, the later
-            // ones running far past their deadlines. Counting locks every shard, so it
-            // is skipped while the first ID is free
-            if tries == 1 && self.pending.len() > u16::MAX as usize {
-                anyhow::bail!("no available dns ids for {} mux", T::LABEL);
-            }
-            if tries > u16::MAX as usize {
+            // 头一个 ID 就被占着时看看是不是全被占了：65536 个 ID 都被等着的查询占着时立刻说没有，不在槽的锁下把每个 ID
+            // 都试一遍。数一遍要锁每个分片，所以平常拿到空 ID 时不数
+            // The first ID taken, see whether all are: with all 65536 held by waiting queries,
+            // say so at once rather than try every ID under the slot's lock. Counting locks every
+            // shard, so it is skipped while the first ID is free
+            if (tries == 1 && pending.len() > u16::MAX as usize) || tries > u16::MAX as usize {
                 anyhow::bail!("no available dns ids for {} mux", T::LABEL);
             }
         };
-        let answers = Arc::clone(&live.answers);
-        drop(conn_guard);
-        Ok((new_id, generation, answers))
+        Ok((new_id, generation, Arc::clone(&live.answers)))
     }
 
-    /// 拆掉第 `generation` 代连接，等连接锁（见 [`close_locked`](Self::close_locked)）。登记也拿这把锁，所以一个查询
-    /// 要么在拆之前登记上、被告知失败，要么看到连接已经没了
-    /// Tears down the connection of `generation`, waiting for the connection lock (see
-    /// [`close_locked`](Self::close_locked)). Registration takes the same lock, so a query either
-    /// registers before the teardown and is told of the failure, or finds the connection gone
-    async fn close(
-        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
-        conn: &Arc<Mutex<Option<Live>>>,
-        generation: u64,
-        why: &str,
-    ) -> bool {
-        let mut slot = conn.lock().await;
-        Self::close_locked(pending, &mut slot, generation, why)
+    /// 拆掉第 `generation` 代连接，拿槽的锁（见 [`close_locked`](Self::close_locked)）
+    /// Tears down the connection of `generation`, taking the slot's lock (see
+    /// [`close_locked`](Self::close_locked))
+    fn close(wires: &Wires, generation: u64, why: &str) -> bool {
+        Self::close_locked(&wires.pending, &mut wires.slot.lock().live, generation, why)
     }
 
-    /// 连接锁已经拿在手里，拆掉第 `generation` 代连接：停掉它的读取和写入任务，丢掉写入队列，让等在它上面的
+    /// 槽的锁已经拿在手里，拆掉第 `generation` 代连接：停掉它的读取和写入任务，丢掉写入队列，让等在它上面的
     /// 查询都以 `why` 失败。现在的连接不是这一代（已经换成新的，或者已经拆了）就什么都不做，返回 false。
     ///
     /// 拆连接的决定都是对着某一条连接作的：它空闲太久了、它读写失败了、它上面的查询超时了。作出决定到拿到锁
     /// 之间连接可能已经换过，这个决定不能落到替它的那条上：那会让刚建好的连接白建，登记在它上面的查询失败
     ///
-    /// With the connection lock held, tears down the connection of `generation`: its reader and
+    /// With the slot's lock held, tears down the connection of `generation`: its reader and
     /// writer are stopped, its write queue dropped, and the queries waiting on it fail with
     /// `why`. When the connection now is not of that generation (replaced by a new one, or torn
     /// down already) nothing is done and false comes back.
@@ -2003,7 +1940,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
     /// lock the connection may have been replaced, and the decision must not land on the one in
     /// its place, which would waste a connection just made and fail the queries registered on it
     fn close_locked(
-        pending: &Arc<dashmap::DashMap<u16, Pending, FxBuildHasher>>,
+        pending: &PendingMap,
         slot: &mut Option<Live>,
         generation: u64,
         why: &str,
@@ -2039,72 +1976,31 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         closed.is_some()
     }
 
-    /// Reset connection: cancel the reader and writer tasks, then drop the write queue and
-    /// fail every waiting query
-    /// 重置连接：取消读取和写入任务，然后丢掉写入队列、让所有等待中的查询失败
-    ///
-    /// The cancellation token interrupts the reader's blocked read and the writer's
-    /// blocked write so they exit immediately instead of leaking the connection. With the reader
-    /// gone nothing can answer the queries still waiting on this connection, so
-    /// they are failed at once: each can then retry over a fresh connection
-    /// instead of sitting out its whole deadline and resetting the next
-    /// connection in turn.
-    /// 取消令牌中断读取任务阻塞的读和写入任务阻塞的写，使它们立即退出而非泄漏连接。reader 没了，
-    /// 这条连接上还在等的查询再也等不到回答，所以立刻让它们失败：各自可以换新连接重发，
-    /// 而不是干等到截止时间、再轮流把下一条连接也重置掉。
-    ///
-    /// 拆的是第 `generation` 代；现在的连接已经不是它就什么都不做，返回 false（见 `close_locked`）
-    /// What goes is the connection of `generation`; when the connection now is another, nothing
-    /// is done and false comes back (see `close_locked`)
-    async fn reset(&self, generation: u64) -> bool {
+    /// 复位第 `generation` 代连接：取消读取和写入任务，丢掉写入队列，让所有等在它上面的查询马上失败，各自可以换新连接
+    /// 重发，而不是干等到期限、再轮流把下一条连接也复位掉。现在的连接已经不是它就什么都不做，返回 false（见 `close_locked`）
+    /// Resets the connection of `generation`: its reader and writer are cancelled, its write
+    /// queue dropped, and every query waiting on it fails at once, free to retry over a fresh
+    /// connection instead of sitting out its deadline and resetting the next connection in turn.
+    /// When the connection now is another, nothing is done and false comes back (see
+    /// `close_locked`)
+    fn reset(&self, generation: u64) -> bool {
         let why = format!("{} connection reset", T::NAME);
-        Self::close(&self.pending, &self.conn, generation, &why).await
+        Self::close(&self.wires, generation, &why)
     }
 
-    /// 第 `generation` 代连接用到了最长时间：从槽里摘下，接着来的查询去建新连接；它上面还在等的查询照样收它的回答，
-    /// 最晚的那个期限过了再关。以前到期就复位，在途的查询一起失败，靠透明重试再发一遍
-    /// The connection of `generation` has reached its max age: it is taken out of the slot, and
-    /// queries coming next make a new one; those still waiting on it go on taking its answers,
-    /// and it closes once the latest of their deadlines has passed. It used to be reset on the
-    /// spot, failing the queries in flight together, sent again by the transparent retry
-    async fn retire(&self, generation: u64) {
-        let Some(live) = self
-            .conn
+    /// 第 `generation` 代连接用旧了（见 [`Aging`]）：从槽里摘下，接着来的查询去建新连接；它上面还在等的查询照样收它的回答
+    /// （见 [`Self::spawn_writer`]）。现在的连接已经不是它就什么都不做，返回 false
+    /// The connection of `generation` is worn (see [`Aging`]): it is taken out of the slot, and
+    /// queries coming next make a new one; those still waiting on it go on taking its answers (see
+    /// [`Self::spawn_writer`]). When the connection now is another, nothing is done and false
+    /// comes back
+    fn retire(wires: &Wires, generation: u64) -> bool {
+        wires
+            .slot
             .lock()
-            .await
+            .live
             .take_if(|live| live.generation == generation)
-        else {
-            return;
-        };
-        let left = live
-            .queue
-            .last_deadline_ms
-            .load(Ordering::Acquire)
-            .saturating_sub(unix_time_millis());
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(left)).await;
-            live.cancel.cancel();
-        });
-    }
-
-    /// 时限已经到了的查询复位连接。连接锁空着就马上复位；被别人拿着时（多半是排着队的登记）不等，
-    /// 记下欠着拆哪一代，下一次建连会先拆它（见 `ensure_connection`）。以前这里一直等锁，排在长队后面的
-    /// 查询要远远超出时限才返回。
-    /// Reset the connection for a query whose deadline has passed. With the
-    /// connection lock free it resets at once; held by someone else (most likely a
-    /// queue of registrations) it does not wait but notes which generation is owed a teardown,
-    /// and the next connect does that first (see `ensure_connection`). It used to wait for the
-    /// lock, so a query at the back of a long queue returned far past its deadline.
-    ///
-    /// 要拆的是查询登记的那一代 `generation`，欠着的也记的是这一代
-    /// What goes is `generation`, the one the query registered on, and that is what is noted as owed
-    async fn reset_after_deadline(&self, generation: u64) {
-        let Ok(mut slot) = self.conn.try_lock() else {
-            self.reset_owed.store(generation, Ordering::Release);
-            return;
-        };
-        let why = format!("{} connection reset", T::NAME);
-        Self::close_locked(&self.pending, &mut slot, generation, &why);
+            .is_some()
     }
 }
 
@@ -2226,8 +2122,9 @@ struct DohUpstream {
     /// raised by each rebuild. A request notes the generation it started under, and an error
     /// found once it has changed does not count (see [`DohClient::record_error`])
     generation: AtomicU64,
-    /// 最近一次使用的时刻，用于清理热重载换掉的旧上游
-    /// When the entry was last used, so upstreams dropped by a reload can be pruned
+    /// 最近一次使用的时刻（从 `DohClient::epoch` 起算的毫秒数），用于清理热重载换掉的旧上游
+    /// When the entry was last used (in milliseconds from `DohClient::epoch`), so upstreams
+    /// dropped by a reload can be pruned
     last_used_millis: AtomicU64,
     /// 回了 429 以后暂停到什么时候，从 `DohClient::epoch` 起算的毫秒数；没暂停过是 0
     /// Until when a 429 paused it, in milliseconds from `DohClient::epoch`; 0 if it never was
@@ -2287,11 +2184,12 @@ pub struct DohClient {
     /// Threshold of consecutive transport errors that triggers a pool rebuild.
     /// 触发连接池重建的连续传输错误阈值
     health_error_threshold: usize,
-    /// 上次清理空闲上游的时刻 / When idle upstreams were last pruned
+    /// 上次清理空闲上游的时刻（从 `epoch` 起算的毫秒数）/ When idle upstreams were last pruned (in
+    /// milliseconds from `epoch`)
     last_prune_millis: AtomicU64,
-    /// 暂停时刻的起点。用单调时钟，调系统时间不会让暂停变长或变短
-    /// The origin of pause deadlines. A monotonic clock, so setting the system time makes
-    /// no pause longer or shorter
+    /// 暂停时刻、清理时刻的起点。用单调时钟，调系统时间不会让它们变长或变短
+    /// The origin of pause deadlines and of pruning times. A monotonic clock, so setting the
+    /// system time makes none of them longer or shorter
     epoch: std::time::Instant,
     /// 所有上游里最晚的暂停结束时刻（同样从 `epoch` 起算），过了就清回 0。合并转发先看它：
     /// 没有上游在暂停时，判断只花这一次读取
@@ -2308,9 +2206,9 @@ pub struct DohClient {
     /// Whether an upstream that picked h2 is connected to directly: not with a proxy
     /// environment variable set, when everything goes to reqwest as before (see `doh_h2::proxy_configured`)
     direct_h2: bool,
-    /// 连接空闲多久就不再用（见 `doh_h2::DOH_IDLE_TIMEOUT`），测试里可以改短
-    /// How long a connection may sit idle before it is not used again (see
-    /// `doh_h2::DOH_IDLE_TIMEOUT`), shorter in some tests
+    /// 连接空闲多久就关掉（见 `doh_h2::DOH_IDLE_TIMEOUT`），直连和 reqwest 都是，测试里可以改短
+    /// How long a connection may sit idle before it is closed (see `doh_h2::DOH_IDLE_TIMEOUT`),
+    /// direct and through reqwest alike, shorter in some tests
     idle_timeout: Duration,
     /// 每个上游最多几条直连：每个工作线程一条，平常只用一条（见 `doh_h2::BUSY_AT`）
     /// How many direct connections an upstream may have at most: one per worker thread, with
@@ -2337,7 +2235,7 @@ impl DohClient {
             upstreams: DashMap::with_hasher(FxBuildHasher),
             pool_max_idle_per_host,
             health_error_threshold,
-            last_prune_millis: AtomicU64::new(unix_time_millis()),
+            last_prune_millis: AtomicU64::new(0),
             epoch: std::time::Instant::now(),
             latest_pause_end: AtomicU64::new(0),
             tls_h2: direct_tls_config(build_tls_client_config()?),
@@ -2375,6 +2273,14 @@ impl DohClient {
         self.upstreams
             .get(upstream)
             .is_some_and(|state| state.h2.is_connected())
+    }
+
+    /// 测试里看 `upstream` 的连接池重建过几次 / In tests, how many times `upstream`'s pool has been rebuilt
+    #[cfg(test)]
+    pub(crate) fn rebuilds(&self, upstream: &str) -> u64 {
+        self.upstreams
+            .get(upstream)
+            .map_or(0, |state| state.generation.load(Ordering::Acquire))
     }
 
     /// 测试里改短连接的空闲时限 / In tests, shorten how long a connection may sit idle
@@ -2451,6 +2357,11 @@ impl DohClient {
             .http2_initial_connection_window_size(doh_h2::CONNECTION_WINDOW)
             .pool_idle_timeout(self.idle_timeout)
             .pool_max_idle_per_host(self.pool_max_idle_per_host.max(1))
+            // 和别的 TCP 连接一样保活，探多少次由系统定 / Kept alive as every other TCP connection is,
+            // as many probes as the system sets
+            .tcp_keepalive(KEEPALIVE_TIME)
+            .tcp_keepalive_interval(KEEPALIVE_INTERVAL)
+            .tcp_keepalive_retries(None)
             .build()
             .context("build doh http client")
     }
@@ -2459,7 +2370,12 @@ impl DohClient {
     /// the hot path; the key is allocated once per upstream.
     /// `upstream` 的状态，首次遇到时创建。热路径每查询一次 map 读取；key 每个上游只分配一次。
     fn upstream(&self, upstream: &str) -> anyhow::Result<Arc<DohUpstream>> {
-        let now = unix_time_millis();
+        self.upstream_at(upstream, self.millis_since_epoch())
+    }
+
+    /// [`Self::upstream`]，现在是 `now`（从 `epoch` 起算的毫秒数）/ [`Self::upstream`] with the time now
+    /// at `now` (in milliseconds from `epoch`)
+    fn upstream_at(&self, upstream: &str, now: u64) -> anyhow::Result<Arc<DohUpstream>> {
         let state = self.lookup_or_create(upstream, now)?;
         // 清理放在查表之后：此刻没有持有任何分片守卫，retain 不会和自己抢锁。
         // Prune after the lookup: no shard guard is held here, so retain cannot
@@ -2518,16 +2434,12 @@ impl DohClient {
         if now.saturating_sub(last_prune) < prune_every {
             return;
         }
-        // 先占下这一轮：CAS 成功的调用者负责扫描，其它调用者立刻返回。时间戳在
-        // 扫描之前就推后，所以无论这轮删没删掉东西，热路径都要再等一个间隔才会
-        // 走到这里——之前的数量门槛放在 CAS 之前，不满足时直接 return 而不推后
-        // 时间戳，于是每一次查询都要付一次 DashMap::len()（逐分片取读锁）。
-        // Claim the round first: the caller that wins the CAS does the scan and
-        // the others return. The timestamp moves before the scan, so whether or
-        // not this round drops anything the hot path waits another interval to
-        // get here. The entry-count gate used to sit before the CAS and return
-        // without moving the timestamp, so every lookup paid a DashMap::len(),
-        // which takes a read lock on every shard.
+        // 先占下这一轮：CAS 成功的调用者负责扫描，其它调用者立刻返回。时间戳在扫描之前就推后，所以无论这轮删没删掉东西，
+        // 热路径都要再等一个间隔才会走到这里，不会每个查询都去数一遍条目（DashMap::len() 逐分片取读锁）
+        // Claim the round first: the caller that wins the CAS does the scan and the others
+        // return. The timestamp moves before the scan, so whether or not this round drops
+        // anything the hot path waits another interval to get here, and no lookup counts the
+        // entries (a DashMap::len() takes a read lock on every shard)
         if self
             .last_prune_millis
             .compare_exchange(last_prune, now, Ordering::AcqRel, Ordering::Relaxed)
@@ -2563,24 +2475,18 @@ impl DohClient {
 
         let start = tokio::time::Instant::now();
         let generation = state.generation.load(Ordering::Acquire);
-        let result = match self
+        let mut result = self
             .send_once(&state, packet, url, uri, host, timeout_dur)
-            .await
+            .await;
+        if let Err(err) = &result
+            && is_transport_error(err)
         {
-            Ok(bytes) => {
-                state.consecutive_errors.store(0, Ordering::Release);
-                return Ok(restore_query_id(packet, bytes));
-            }
-            Err(err) if is_transport_error(&err) => {
-                // TRANSPARENT RETRY: DNS queries are semantically idempotent, so a
-                // single retry is safe. record_error() may rebuild the pool first;
-                // the retry then loads the fresh client (new connections).
-                // 透明重试：DNS 查询语义幂等，单次重试安全。
-                // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
-                let rebuilt = self.record_error(upstream, &state, generation);
-                let Some(remaining) = retry_budget(timeout_dur, start) else {
-                    return Err(err);
-                };
+            // 透明重试：DNS 查询语义幂等，单次重试安全。record_error() 可能先重建连接池，重试时就用新客户端（新连接）
+            // Transparent retry: DNS queries are semantically idempotent, so a single retry is
+            // safe. record_error() may rebuild the pool first, the retry then using the fresh
+            // client (new connections)
+            let rebuilt = self.record_error(upstream, &state, generation);
+            if let Some(remaining) = retry_budget(timeout_dur, start) {
                 debug!(
                     upstream = upstream,
                     error = %err,
@@ -2588,17 +2494,25 @@ impl DohClient {
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                self.send_once(&state, packet, url, uri, host, remaining)
-                    .await
+                result = self
+                    .send_once(&state, packet, url, uri, host, remaining)
+                    .await;
             }
-            Err(e) => Err(e),
-        };
-        // 429，不管是第一次还是重试时回的：这个上游暂停一会儿
-        // A 429, whether to the first send or to the retry: the upstream pauses for a while
-        if let Err(err) = &result
-            && let Some(throttle) = throttle_of(err)
-        {
-            self.pause(upstream, &state, throttle);
+        }
+        match &result {
+            // 答上了，第一次就答上还是重试才答上都一样：连续错误数清零。服务器关掉空闲的连接、GOAWAY 赶上请求，都是第一次
+            // 失败、重试答上，这样的不该一次次攒到重建
+            // Answered, whether at once or by the retry: the errors in a row are cleared. A server
+            // closing an idle connection, or a GOAWAY crossing a request, fails the first send and
+            // has the retry answered, which must not add up to a rebuild
+            Ok(_) => state.consecutive_errors.store(0, Ordering::Release),
+            // 429，不管是第一次还是重试时回的：这个上游暂停一会儿
+            // A 429, whether to the first send or to the retry: the upstream pauses for a while
+            Err(err) => {
+                if let Some(throttle) = throttle_of(err) {
+                    self.pause(upstream, &state, throttle);
+                }
+            }
         }
         result.map(|bytes| restore_query_id(packet, bytes))
     }
@@ -2663,8 +2577,16 @@ impl DohClient {
         })
     }
 
-    /// Single attempt: send the request and read the body within a timeout.
-    /// 单次尝试：在超时内发送请求并读取响应体
+    /// 问一次，最多 `timeout_dur`：握手时选了 h2 的上游先等直连的连接，再在上面发请求、读回答；别的经 reqwest。等连接用掉的
+    /// 时间算在这一次里，等不到算没连上（见 [`DohNotConnected`]）：握手慢说明不了哪条建好的连接坏了。连上以后请求本身超时
+    /// 才是传输错误，可以重试（见 [`is_transport_error`]）；正文迟迟不来也算在这个时限里
+    /// Asks once, within `timeout_dur`: an upstream that picked h2 first waits for its direct
+    /// connection, then sends the request on it and reads the answer; any other goes through
+    /// reqwest. The wait for the connection counts against this one budget, and running out there
+    /// is no connection (see [`DohNotConnected`]): a slow handshake says nothing of a connection
+    /// made being broken. Once connected, the request itself timing out is a transport error,
+    /// open to a retry (see [`is_transport_error`]); a body slow to come counts against the same
+    /// limit
     async fn send_once(
         &self,
         state: &DohUpstream,
@@ -2674,24 +2596,35 @@ impl DohClient {
         host_override: Option<&str>,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        // Wrap entire operation (send + read body) in a single timeout to prevent
-        // hanging if the server sends headers but delays the body.
-        // 将整个操作（发送 + 读取响应体）包裹在单个超时中，
-        // 防止服务器发送头信息但延迟响应体时挂起。
-        let result = timeout(timeout_dur, async {
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let direct = match uri {
+            Some(uri) => {
+                let connected = tokio::time::timeout_at(
+                    deadline,
+                    state
+                        .h2
+                        .sender(url, &self.tls_h2, &self.resolver.0, deadline),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "doh connect timeout after {}ms",
+                        timeout_dur.as_millis()
+                    ))
+                })
+                .context(DohNotConnected)?;
+                connected.map(|sender| (uri, sender))
+            }
+            None => None,
+        };
+        let answered = tokio::time::timeout_at(deadline, async {
             // 握手时选了 h2 的上游直接经 h2 发，请求和 reqwest 经 HTTP/2 发的一样：同样的方法、地址和头。覆盖的 Host
             // 就是 :authority，不另带 Host 头（见 [`DohTarget::uri`]）。content-length 是 hyper 和 reqwest 自己补的，h2 不补
             // An upstream that picked h2 is asked straight through h2, with the request reqwest
             // would send over HTTP/2: the same method, address and headers. A Host override is the
             // :authority, with no Host header (see [`DohTarget::uri`]). hyper and reqwest add
             // content-length themselves, h2 does not
-            if let Some(uri) = uri
-                && let Some((sender, _in_flight)) = state
-                    .h2
-                    .sender(url, &self.tls_h2, &self.resolver.0)
-                    .await
-                    .context(DohNotConnected)?
-            {
+            if let Some((uri, (sender, _in_flight))) = direct {
                 let request = hyper::Request::post(uri.clone())
                     .header(ACCEPT, DOH_MEDIA_TYPE)
                     .header(CONTENT_TYPE, DOH_MEDIA_TYPE)
@@ -2704,10 +2637,8 @@ impl DohClient {
                 return doh_answer(packet, resp).await;
             }
 
-            // load_full() returns an owned Arc<Client>, keeping the Future Send across
-            // await points (an ArcSwap Guard would not). The Arc is cheap to hold.
-            // load_full() 返回 owned Arc<Client>，保持 Future 跨 await 点 Send
-            // （ArcSwap 的 Guard 不满足）。持有 Arc 很廉价。
+            // load_full() 给出自己拿着的 Arc<Client>，跨 await 也是 Send（ArcSwap 的 Guard 不是）
+            // load_full() gives an Arc<Client> of its own, Send across awaits (an ArcSwap Guard is not)
             let client = state.client.load_full();
             let mut req = client
                 .post(url.clone())
@@ -2721,27 +2652,24 @@ impl DohClient {
             doh_answer(packet, hyper::Response::from(resp)).await
         })
         .await;
-
-        // 超时算传输层错误，可以重试；内层的错误照原样交出：发送、IO、正文出错可以重试，
-        // DohAnswerError、DohNotConnected 不行（见 `is_transport_error`）
-        // A timeout is a transport error and can be retried; inner errors go out as they
-        // are: send, IO and body errors can be retried, a DohAnswerError or DohNotConnected
-        // cannot (see `is_transport_error`)
-        result.map_err(|_elapsed| anyhow::anyhow!("doh request timeout"))?
+        // 内层的错误照原样交出：发送、IO、正文出错可以重试，DohAnswerError、DohNotConnected 不行
+        // Inner errors go out as they are: send, IO and body errors can be retried, a
+        // DohAnswerError or DohNotConnected cannot
+        answered.map_err(|_elapsed| anyhow::anyhow!("doh request timeout"))?
     }
 
     /// 记下 `upstream` 一个传输错误，出错的请求是在第 `generation` 代开始的。连续错误数到了阈值就换一代：清掉直连的
     /// 连接，重建 reqwest 客户端（丢掉它的连接池），计数清零。换了代返回 true。同一批断掉的请求一起报错时只换一次：换代
-    /// 用比较交换，只有一个请求换得成；已经换过代以后，旧连接上迟到的错误不算。以前每数到阈值就重建一次，一百个在途
-    /// 请求一起超时就要重建三十来次，还把重试刚连上的新连接一次次拆掉
+    /// 用比较交换，只有一个请求换得成；已经换过代以后，旧连接上迟到的错误不算。一百个在途请求一起超时也只重建一次，
+    /// 不会把重试刚连上的新连接一次次拆掉
     /// Records a transport error of `upstream`, from a request started under generation
     /// `generation`. Once errors in a row reach the threshold the generation moves on: the direct
     /// connections are dropped, the reqwest client rebuilt (dropping its pool), and the count
     /// cleared; true when it moved on. Requests broken together, erring together, move it once:
     /// the move is a compare-and-swap only one of them wins, and once it has moved, errors
-    /// arriving late from the old connections do not count. Every count up to the threshold used
-    /// to rebuild, some thirty rebuilds for a hundred requests in flight timing out together,
-    /// each one tearing down the connection the retries had just made
+    /// arriving late from the old connections do not count. A hundred requests in flight timing
+    /// out together rebuild once, never tearing down again and again the connections the retries
+    /// have just made
     fn record_error(&self, upstream: &str, state: &DohUpstream, generation: u64) -> bool {
         if state.generation.load(Ordering::Acquire) != generation {
             return false;
@@ -2822,11 +2750,6 @@ fn restore_query_id(packet: &[u8], response: Bytes) -> Bytes {
     restored.freeze()
 }
 
-/// Read a DoH answer body, at most one DNS message long. A server sending without
-/// end used to have every byte kept until the request timed out, gigabytes for a
-/// single answer.
-/// 读 DoH 回答的正文，最多一条 DNS 消息那么长。以前一个不停往回发的服务器发多少就收多少，直到请求超时，
-/// 一个回答就能占掉几个 GB。
 /// 上游的 HTTP 应答里的 DNS 回答。直连 HTTP/2 和 reqwest 两种发法的应答都在这里检查：429 记下暂停多久，
 /// 别的错误状态、不是 DNS 消息的媒体类型、太长的正文、答的不是这个问题，都算用不了的回答
 /// The DNS answer in an upstream's HTTP response. Responses to both ways of sending, the direct
@@ -2882,6 +2805,9 @@ where
     Ok(body)
 }
 
+/// 读 DoH 回答的正文，最多一条 DNS 消息那么长：读到比这还长就不再往下读，算用不了的回答，不等服务器发完
+/// Reads a DoH answer body, one DNS message long at most: once it runs longer, reading stops and
+/// it is an unusable answer, without waiting for the server to finish sending
 async fn read_doh_body<B>(mut body: B) -> anyhow::Result<Bytes>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
@@ -2926,15 +2852,13 @@ where
 }
 
 /// 传输层错误：在建好的连接上收发时出的错，超时也算，连接死了多半就是这样；不是用不了的回答（见 [`DohAnswerError`]），也不是
-/// 没连上（见 [`DohNotConnected`]，reqwest 的建连错误也是）。只有它重发一次（DoH 查询语义幂等），算进重建连接池的门槛。
-/// 以前没连上也算：上游不通时每个请求都去重建一次连接池，可池里没有坏掉的连接可丢，reqwest 还要再连一次
+/// 没连上（见 [`DohNotConnected`]，reqwest 的建连错误也是）。只有它重发一次（DoH 查询语义幂等），算进重建连接池的门槛：
+/// 没连上时池里没有坏掉的连接可丢
 /// A transport-level error: one sending or receiving on a connection made, a timeout included,
 /// which is mostly how a dead connection shows; neither an unusable answer (see
 /// [`DohAnswerError`]) nor no connection (see [`DohNotConnected`], reqwest's connect errors too).
 /// Only such an error is sent again once (DoH queries are semantically idempotent) and counts
-/// toward rebuilding the pool. No connection used to count as well: with the upstream
-/// unreachable every request went to rebuild the pool, which held no broken connection to drop,
-/// and reqwest connected once more
+/// toward rebuilding the pool: with no connection, the pool holds no broken one to drop
 fn is_transport_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<DohAnswerError>().is_none()
         && err.downcast_ref::<DohNotConnected>().is_none()
@@ -3199,6 +3123,9 @@ struct DoqTarget {
 struct DoqRuntime {
     endpoint_v4: QuicEndpoint,
     endpoint_v6: QuicEndpoint,
+    /// 连接怎样老化：最长 [`DOQ_MAX_AGE`]，空闲 `doq_connection_idle_timeout_seconds` / How connections
+    /// age: [`DOQ_MAX_AGE`] at most, idle for `doq_connection_idle_timeout_seconds`
+    aging: Aging,
     /// 上游的主机名怎样解析（见 [`Bootstrap`]）/ How upstream host names are resolved (see [`Bootstrap`])
     bootstrap: Arc<Bootstrap>,
     enable_0rtt: bool,
@@ -3217,14 +3144,11 @@ pub type DoqConnectionPool = ConnectionPool<DoqMuxClient>;
 /// DoQ 一次尝试的失败原因，按类型保留 quinn 的原始错误
 /// Why one DoQ attempt failed, keeping quinn's own error by type
 ///
-/// 此前内层每一步都被 `.context()` 包过，而 `anyhow::Error::to_string()` 只
-/// 输出最外层那一句，所以判定 0-RTT 是否被拒绝时拿到的永远只是那几个固定
-/// 短语，quinn 说的话根本到不了。把原始错误原样带出来，判定就能落在类型上。
-/// Every step used to be wrapped in `.context()`, and
-/// `anyhow::Error::to_string()` renders only the outermost one, so the check
-/// for a rejected 0-RTT attempt never saw anything but a handful of fixed
-/// phrases and never quinn's own words. Carrying the error out untouched lets
-/// the decision rest on types.
+/// 每一步都包进 `.context()` 的话，`anyhow::Error::to_string()` 只给出最外层那一句，判定 0-RTT 是否被拒绝时看不到 quinn
+/// 说了什么。原始错误原样带出来，判定就落在类型上
+/// With every step wrapped in `.context()`, `anyhow::Error::to_string()` would render only the
+/// outermost one, and the check for a rejected 0-RTT attempt would never see quinn's own words.
+/// Carried out untouched, the error lets the decision rest on types
 #[derive(Debug)]
 enum DoqFailure {
     /// `open_bi` 失败：连接已经不可用 / the connection is already unusable
@@ -3284,16 +3208,19 @@ pub struct DoqMuxClient {
     upstream: Arc<str>,
     /// 解析好的上游地址，第一个查询时算 / The upstream address parsed, worked out at the first query
     target: std::sync::OnceLock<DoqTarget>,
-    /// 池里的连接。读它不加锁，只有建连时拿 `connecting` / The pooled connection, read without a
-    /// lock; only making one takes `connecting`
-    pooled: ArcSwapOption<DoqConn>,
+    /// 池里的连接。读它不加锁，建连的任务建好了把连接放进来 / The pooled connection, read without a
+    /// lock; the connecting task puts the connection here once made
+    pooled: Arc<ArcSwapOption<DoqConn>>,
     /// 在建的连接、建连失败以后的退避（见 [`Connect`]）；等它算在各个查询自己的预算里 / The
     /// connection being made and the backing off after a failed connect (see [`Connect`]); waiting
     /// for it counts against each query's own budget
-    connecting: Mutex<Connect<NewDoqConn>>,
+    connecting: parking_lot::Mutex<Connect>,
     /// 这个客户端上还没答完的查询数（见 [`least_busy`]）/ Queries on this client not yet answered (see [`least_busy`])
     in_flight: AtomicUsize,
     runtime: Arc<DoqRuntime>,
+    /// 客户端被丢掉时取消：它的连接马上关掉（见 [`DoqMuxClient::watch`]）/ Cancelled when the client is
+    /// dropped: its connection closes at once (see [`DoqMuxClient::watch`])
+    stop: CancellationToken,
     /// Track whether 0-RTT has been rejected by the server for auto-fallback
     /// 跟踪服务器是否拒绝了 0-RTT，用于自动回退
     /// Once rejected, 0-RTT will be skipped for subsequent connections
@@ -3304,6 +3231,12 @@ pub struct DoqMuxClient {
     /// Shared by every connection in the upstream's pool: what one connection
     /// learned, the others need not each fail and sit out a timeout to learn again
     zero_rtt_rejected: Arc<AtomicBool>,
+}
+
+/// 新建的一条 DoQ 连接，和它有没有用 0-RTT / A DoQ connection newly made, and whether it used 0-RTT
+struct NewDoqConn {
+    conn: QuicConnection,
+    used_0rtt: bool,
 }
 
 /// 发查询用的连接，和它是怎么来的 / The connection to send on, and how it came
@@ -3317,41 +3250,30 @@ struct DoqConnected {
 /// 池里的一条 QUIC 连接 / One pooled QUIC connection
 struct DoqConn {
     conn: QuicConnection,
-    /// 什么时候建的，什么时候最后答过（毫秒）/ When it was made, and when it last answered (ms)
-    created_ms: u64,
-    last_answer_ms: AtomicU64,
+    /// 建它时用了 0-RTT / Made with 0-RTT
+    used_0rtt: bool,
+    /// 用它的查询都记上自己的期限，它的看守任务按它老化（见 [`DoqMuxClient::watch`]）/ Every query using it
+    /// notes its deadline here, and its watching task ages it by this (see [`DoqMuxClient::watch`])
+    wear: Wear,
     /// 在它上面读到过几个回答。查询超时时看这期间涨没涨：涨了说明连接照常在回答，慢的只是这一个，不换连接
     /// Answers read on it. A query timing out looks whether this grew meanwhile: if so the
     /// connection kept answering and only this one is slow, so it is not replaced
     answers: AtomicU64,
 }
 
-/// 连接用旧了就换：活得比 [`DOQ_MAX_AGE_MS`] 久，或者比 [`DOQ_IDLE_TIMEOUT_MS`] 还久没答过。给出原因
-/// A connection worn out is replaced: alive longer than [`DOQ_MAX_AGE_MS`], or unanswered for
-/// longer than [`DOQ_IDLE_TIMEOUT_MS`]. Gives the reason
-fn doq_worn_out(created_ms: u64, last_answer_ms: u64, now: u64) -> Option<&'static str> {
-    if now.saturating_sub(created_ms) > DOQ_MAX_AGE_MS {
-        Some("too old")
-    } else if now.saturating_sub(last_answer_ms) > DOQ_IDLE_TIMEOUT_MS {
-        Some("idle too long")
-    } else {
-        None
-    }
-}
-
 /// DoQ 连接的传输参数。查询都是我们开的流，一个流问一个（RFC 9250 第 4.2 节），所以：
-/// - 上游能开给我们的流是 0。quinn 的 `max_concurrent_bidi/uni_streams` 限的是对端开过来的流，以前各给了 100，却从不
-///   去接，上游开过来的流和发来的数据就一直缓冲着；
+/// - 上游能开给我们的流是 0。quinn 的 `max_concurrent_bidi/uni_streams` 限的是对端开过来的流，我们从不去接，给了的话
+///   上游开过来的流和发来的数据会一直缓冲着；
 /// - 每个流的接收窗口正好装下最长的回答（65535 字节加两字节长度前缀），连接的窗口和 DoH 的 HTTP/2 连接一样（见
-///   `doh_h2::CONNECTION_WINDOW`）。quinn 默认每个流 1.25 MB、连接不设上限，一个恶意上游能让一条连接缓冲上百 MB；
+///   `doh_h2::CONNECTION_WINDOW`）。照 quinn 默认的每个流 1.25 MB、连接不设上限，一个恶意上游能让一条连接缓冲上百 MB；
 /// - 不收 QUIC datagram，DoQ 用不着。
 ///
 /// 初始 RTT 定 100 ms，好让拥塞控制一开始估得准一些；`keepalive_interval_ms`、`idle_timeout_secs` 为 0 时不设
 /// The transport parameters of a DoQ connection. Every query is a stream we open, one query
 /// a stream (RFC 9250 section 4.2), so:
 /// - the upstream may open no stream to us. quinn's `max_concurrent_bidi/uni_streams` bound the
-///   streams the peer opens, and were 100 each while never accepted, so streams an upstream
-///   opened and the data it sent on them stayed buffered;
+///   streams the peer opens, which we never accept, so streams an upstream opened and the data
+///   it sent on them would stay buffered;
 /// - each stream's receive window holds just the longest answer (65535 bytes and its two-byte
 ///   length prefix), and the connection's is that of an HTTP/2 DoH connection (see
 ///   `doh_h2::CONNECTION_WINDOW`). quinn's defaults are 1.25 MB a stream and no bound on the
@@ -3384,17 +3306,12 @@ fn doq_transport(
     Ok(transport)
 }
 
-/// DoQ 连接最长用多久（毫秒）：30 分钟 / How long a DoQ connection may live (ms): 30 minutes
-const DOQ_MAX_AGE_MS: u64 = 30 * 60 * 1000;
-/// DoQ 连接空闲多久（毫秒）就换新的：5 分钟 / How long a DoQ connection may sit idle (ms) before a new one: 5 minutes
-const DOQ_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+/// DoQ 连接最长用多久：30 分钟 / How long a DoQ connection may live: 30 minutes
+const DOQ_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
 impl DoqClient {
-    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
-    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
-    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
-    /// upstream the configuration no longer names is dropped: queries using it hold on to
-    /// it until they finish, and its connections close after that.
+    /// 只留下 `keep` 认可的上游的连接池（见 [`UpstreamPools::retain`]）/ Keeps only the pools of the
+    /// upstreams `keep` accepts (see [`UpstreamPools::retain`])
     pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
         self.pools.retain(keep);
     }
@@ -3434,6 +3351,7 @@ impl DoqClient {
         let runtime = Arc::new(DoqRuntime {
             endpoint_v4,
             endpoint_v6,
+            aging: Aging::new(DOQ_MAX_AGE, Duration::from_secs(idle_timeout_secs)),
             bootstrap,
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
@@ -3471,6 +3389,14 @@ impl DoqClient {
     }
 }
 
+/// 客户端被丢掉（它的上游在重载后不在配置里了）时，它的连接马上关掉 / When the client is dropped (its
+/// upstream left the configuration on a reload), its connection closes at once
+impl Drop for DoqMuxClient {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
 impl DoqMuxClient {
     fn new(
         upstream: Arc<str>,
@@ -3480,10 +3406,11 @@ impl DoqMuxClient {
         Self {
             upstream,
             target: std::sync::OnceLock::new(),
-            pooled: ArcSwapOption::empty(),
-            connecting: Mutex::new(Connect::default()),
+            pooled: Arc::default(),
+            connecting: parking_lot::Mutex::default(),
             in_flight: AtomicUsize::new(0),
             runtime,
+            stop: CancellationToken::new(),
             zero_rtt_rejected,
         }
     }
@@ -3546,14 +3473,12 @@ impl DoqMuxClient {
             if query_budget.is_zero() {
                 anyhow::bail!("doq timeout before sending the query");
             }
+            pooled.wear.note(start + timeout_dur);
             let answers_before = pooled.answers.load(Ordering::Acquire);
 
             match timeout(query_budget, Self::ask(&pooled.conn, packet, original_id)).await {
                 Ok(Ok(bytes)) => {
                     pooled.answers.fetch_add(1, Ordering::AcqRel);
-                    pooled
-                        .last_answer_ms
-                        .store(unix_time_millis(), Ordering::Release);
                     return Ok(bytes);
                 }
                 Ok(Err(failure)) => {
@@ -3562,7 +3487,7 @@ impl DoqMuxClient {
                     // answer is this one query's matter, and the connection stays in use
                     let gone = Self::connection_gone(&failure);
                     if gone {
-                        self.forget(&pooled);
+                        forget(&self.pooled, &pooled);
                     }
                     let retry = if !allow_retry {
                         false
@@ -3612,7 +3537,7 @@ impl DoqMuxClient {
                     // 这期间连接上没读到过别的回答（多半死了或者卡住了）才换 / Replaced only when no
                     // other answer was read on it meanwhile (it is most likely dead or stalled)
                     if pooled.answers.load(Ordering::Acquire) == answers_before {
-                        self.forget(&pooled);
+                        forget(&self.pooled, &pooled);
                     }
                     return Err(anyhow::anyhow!("doq timeout"));
                 }
@@ -3668,13 +3593,6 @@ impl DoqMuxClient {
         // We need to read all data until FIN, then parse the length prefix
         // 注意：服务器发送响应后用 FIN 关闭流
         // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-        // 连接被对端关掉的判断此前靠字符串，而且那个判断把所有原因都
-        // 折叠成同一句话；现在原样把 quinn 的错误带出去，由
-        // zero_rtt_likely_rejected 按类型判定。
-        // Detecting a peer-closed connection used to go through strings,
-        // and that check folded every cause into one sentence. The quinn
-        // error is now carried out as it is and
-        // zero_rtt_likely_rejected decides by type.
         let mut all_data = recv
             .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
             .await
@@ -3739,78 +3657,104 @@ impl DoqMuxClient {
         Ok::<Bytes, DoqFailure>(Bytes::from(all_data).slice(2..))
     }
 
-    /// 池里的连接还能用就给出来：没被关掉，也没用旧（见 [`doq_worn_out`]）
-    /// The pooled connection when still usable: not closed, and not worn out (see [`doq_worn_out`])
+    /// 池里的连接还能用（没被关掉）就给出来；用旧了的看守任务已经把它从池里拿掉了（见 [`Self::watch`]）
+    /// The pooled connection when still usable (not closed); one worn out has been taken out of
+    /// the pool by its watching task already (see [`Self::watch`])
     fn usable(&self) -> Option<Arc<DoqConn>> {
         let pooled = self.pooled.load_full()?;
         if let Some(reason) = pooled.conn.close_reason() {
             debug!(upstream = %self.upstream, reason = %reason, "DoQ pooled connection already closed, reconnecting");
             return None;
         }
-        let now = unix_time_millis();
-        let last_answer = pooled.last_answer_ms.load(Ordering::Acquire);
-        if let Some(why) = doq_worn_out(pooled.created_ms, last_answer, now) {
-            info!(upstream = %self.upstream, why, "DoQ connection replaced");
-            return None;
-        }
         Some(pooled)
     }
 
-    /// 发查询用的连接：池里的能用就用，不能用就建一条放进池里
-    /// The connection to send on: the pooled one when usable, otherwise one made and pooled
+    /// 发查询用的连接：池里的能用就用，不能用就等一条新的（见 [`Connect`]）：建连的任务建好了放进池里，这个查询再取用。
+    /// 等来的连接在取用之前就没了时不再等下一条。等来的连接不算取自池里，用没用 0-RTT 照建它时的
+    /// The connection to send on: the pooled one when usable, otherwise a new one waited for (see
+    /// [`Connect`]): the connecting task pools it once made, and this query takes it from there. A
+    /// connection waited for and gone before it could be taken is not followed by a wait for
+    /// another. A connection waited for does not count as taken from the pool, and used 0-RTT as
+    /// it was made
     async fn get_or_connect(&self, target: &DoqTarget) -> anyhow::Result<DoqConnected> {
-        let reused = |pooled| DoqConnected {
-            pooled,
-            used_0rtt: false,
-            reused: true,
-        };
-        if let Some(pooled) = self.usable() {
-            return Ok(reused(pooled));
+        for waited in [false, true] {
+            if let Some(pooled) = self.usable() {
+                return Ok(DoqConnected {
+                    used_0rtt: waited && pooled.used_0rtt,
+                    reused: !waited,
+                    pooled,
+                });
+            }
+            if waited {
+                break;
+            }
+            let attempt = {
+                let mut connecting = self.connecting.lock();
+                // 别的查询的连接可能刚放进池里 / Another query's connection may have just been pooled
+                if let Some(pooled) = self.usable() {
+                    return Ok(DoqConnected {
+                        used_0rtt: false,
+                        reused: true,
+                        pooled,
+                    });
+                }
+                connecting.attempt(|| {
+                    let (pool, upstream) = (Arc::clone(&self.pooled), Arc::clone(&self.upstream));
+                    let (aging, stop) = (self.runtime.aging, self.stop.clone());
+                    let made = Self::connect_new(
+                        Arc::clone(&self.runtime),
+                        Arc::clone(&self.upstream),
+                        target.clone(),
+                        self.zero_rtt_retry_allowed(target),
+                    );
+                    async move {
+                        let NewDoqConn { conn, used_0rtt } = made.await?;
+                        let pooled = Arc::new(DoqConn {
+                            conn,
+                            used_0rtt,
+                            wear: Wear::new(),
+                            answers: AtomicU64::new(0),
+                        });
+                        pool.store(Some(Arc::clone(&pooled)));
+                        tokio::spawn(Self::watch(pooled, pool, aging, stop, upstream));
+                        Ok(())
+                    }
+                })?
+            };
+            attempt.await?;
         }
-        let mut connecting = self.connecting.lock().await;
-        // 等锁的时候别的查询可能已经连好了 / Another query may have connected while this one waited for the lock
-        if let Some(pooled) = self.usable() {
-            return Ok(reused(pooled));
-        }
-        let NewDoqConn { conn, used_0rtt } = connecting
-            .finish(|| {
-                Self::connect_new(
-                    Arc::clone(&self.runtime),
-                    Arc::clone(&self.upstream),
-                    target.clone(),
-                    self.zero_rtt_retry_allowed(target),
-                )
-            })
-            .await?;
-        let now = unix_time_millis();
-        let pooled = Arc::new(DoqConn {
-            conn,
-            created_ms: now,
-            last_answer_ms: AtomicU64::new(now),
-            answers: AtomicU64::new(0),
-        });
-        self.pooled.store(Some(Arc::clone(&pooled)));
-        Ok(DoqConnected {
-            pooled,
-            used_0rtt,
-            reused: false,
-        })
+        anyhow::bail!("doq connection closed as soon as it was made")
     }
 
-    /// 把 `pooled` 从池里拿掉，下一个查询新建一条。池里现在的已经不是它（换成了新的，或者已经拿掉了）就什么都不做：
-    /// 几个查询在同一条连接上一起失败时，先失败的那个已经换了新连接，后面的不能把新连接也拿掉、让每个查询各建一条。
-    /// 不用锁：别的查询正在建连时也不用等
-    /// Takes `pooled` out of the pool, so the next query makes a new one. When what is pooled now
-    /// is not it (replaced by a new one, or taken out already) nothing is done: with several
-    /// queries failing together on one connection, the first has had a new one made, and the
-    /// rest must not take that out too, each making its own. Lock-free: it never waits for
-    /// another query's connect
-    fn forget(&self, pooled: &Arc<DoqConn>) {
-        self.pooled.rcu(|current| {
-            current
-                .clone()
-                .filter(|current| !Arc::ptr_eq(current, pooled))
-        });
+    /// 看着池里的一条连接直到它走：上游关了它就从池里拿掉；用旧了（见 [`Aging`]）也拿掉，接着来的查询另建一条，它上面的查询
+    /// 都过了期限再关；客户端被丢掉时马上关。keepalive 让上游看它一直在用，不由这里关的话，没人用的连接会一直开着
+    /// Watches a pooled connection until it goes: closed by the upstream, it is taken out of the
+    /// pool; worn (see [`Aging`]), it is taken out too, queries coming next make another, and it
+    /// closes once the queries on it are past their deadlines; with the client dropped it closes at
+    /// once. Its keepalive has the upstream see it in use all along, so a connection nobody uses
+    /// would stay open were it not closed here
+    async fn watch(
+        pooled: Arc<DoqConn>,
+        pool: Arc<ArcSwapOption<DoqConn>>,
+        aging: Aging,
+        stop: CancellationToken,
+        upstream: Arc<str>,
+    ) {
+        let worn = tokio::select! {
+            () = stop.cancelled() => None,
+            _ = pooled.conn.closed() => None,
+            why = aging.worn(&pooled.wear) => Some(why),
+        };
+        forget(&pool, &pooled);
+        if let Some(why) = worn {
+            info!(upstream = %upstream, why, "DoQ connection worn, closing it once its queries are done");
+            tokio::select! {
+                () = stop.cancelled() => {}
+                _ = pooled.conn.closed() => {}
+                () = pooled.wear.settled() => {}
+            }
+        }
+        pooled.conn.close(DOQ_NO_ERROR, b"");
     }
 
     /// 这次失败是否像 0-RTT 被拒绝，值得关掉 0-RTT 再试一次
@@ -3852,11 +3796,11 @@ impl DoqMuxClient {
     }
 
     /// quinn 明说这个查询发出去的是早期数据、被上游拒收了。只有 0-RTT 期间开的流才会报这个，所以不管这条连接是不是
-    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次：搭在别的查询建的连接上的查询以前不重发，直接失败
+    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次，搭在别的查询建的连接上的也一样
     /// quinn says outright that what this query sent was early data the upstream refused. Only
     /// a stream opened during 0-RTT is told so, and whether or not this query made the
-    /// connection it is to be sent again on one without 0-RTT: a query riding a connection
-    /// another query made used not to be sent again, and failed
+    /// connection it is to be sent again on one without 0-RTT, one riding a connection another
+    /// query made included
     fn early_data_refused(failure: &DoqFailure) -> bool {
         matches!(
             failure,
@@ -4007,18 +3951,38 @@ impl DoqMuxClient {
     }
 }
 
+/// 把 `pooled` 从池 `pool` 里拿掉，下一个查询新建一条。池里现在的已经不是它（换成了新的，或者已经拿掉了）就什么都不做：
+/// 几个查询在同一条连接上一起失败时，先失败的那个已经换了新连接，后面的不能把新连接也拿掉、让每个查询各建一条。
+/// 不用锁：别的查询正在建连时也不用等
+/// Takes `pooled` out of the pool `pool`, so the next query makes a new one. When what is
+/// pooled now is not it (replaced by a new one, or taken out already) nothing is done: with
+/// several queries failing together on one connection, the first has had a new one made, and
+/// the rest must not take that out too, each making its own. Lock-free: it never waits for
+/// another query's connect
+fn forget(pool: &ArcSwapOption<DoqConn>, pooled: &Arc<DoqConn>) {
+    pool.rcu(|current| {
+        current
+            .clone()
+            .filter(|current| !Arc::ptr_eq(current, pooled))
+    });
+}
+
+/// RFC 9250 第 4.4 节的 DOQ_NO_ERROR：自己关掉连接、没出什么错 / RFC 9250 section 4.4's DOQ_NO_ERROR:
+/// the connection closed of our own accord, nothing wrong
+const DOQ_NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0x0);
+
 /// RFC 9250 第 4.3 节的 DOQ_REQUEST_CANCELLED：客户端不要这个查询的回答了 / RFC 9250 section
 /// 4.3's DOQ_REQUEST_CANCELLED: the client no longer wants this query's answer
 const DOQ_REQUEST_CANCELLED: quinn::VarInt = quinn::VarInt::from_u32(0x3);
 
 /// 一个 DoQ 查询的那一对流。没等到上游把回答发完就被丢掉（时限到了、几个上游竞速它输了）时，按 RFC 9250
-/// 第 4.3.1 节用 [`DOQ_REQUEST_CANCELLED`] 停止接收、重置发送。以前交给 quinn 丢掉流，发出的错误码是 0，
-/// 也就是 DOQ_NO_ERROR，上游当它正常结束
+/// 第 4.3.1 节用 [`DOQ_REQUEST_CANCELLED`] 停止接收、重置发送：交给 quinn 丢掉流的话，发出的错误码是 0，
+/// 也就是 DOQ_NO_ERROR，上游会当它正常结束
 /// The pair of streams of one DoQ query. Dropped before the upstream has finished sending the
 /// answer (a deadline that came first, a race between upstreams lost), it stops receiving and
-/// resets sending with [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks. Dropping the
-/// streams used to be left to quinn, whose error code 0 is DOQ_NO_ERROR, the upstream taking it
-/// for a normal end
+/// resets sending with [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks: streams left
+/// for quinn to drop would carry error code 0, DOQ_NO_ERROR, which the upstream takes for a
+/// normal end
 struct DoqStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -4075,6 +4039,12 @@ fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
 mod tests {
     use super::*;
     use crate::engine::test_support::{DohReply, http_ok, spawn_doh_upstream};
+    use tokio::sync::Mutex;
+
+    /// 远在任何测试结束之后的期限 / A deadline far past the end of any test
+    fn far_off() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(3600)
+    }
 
     /// reqwest + rustls 要有进程级的加密实现，明文 http 也一样
     /// reqwest + rustls needs a process-level crypto provider, plain http included
@@ -4095,28 +4065,35 @@ mod tests {
         peer: tokio::task::JoinHandle<()>,
     ) {
         client
-            .ensure_connection(Duration::from_secs(2))
+            .connect_for_tests()
             .await
             .expect("connect to the test peer");
-        // 排进比两头的缓冲加起来还多的字节，写入停在 await 上
-        // Queue more bytes than both ends' buffers hold, so the writer parks on an await
-        client
-            .conn
-            .lock()
-            .await
-            .as_ref()
-            .expect("connected")
-            .queue
-            .push(&vec![0u8; 32 << 20]);
+        // 排进比两头的缓冲加起来还多的字节，当作一个还在等的查询的帧，写入停在 await 上
+        // Queue more bytes than both ends' buffers hold, as the frame of a query still waiting, so
+        // the writer parks on an await
+        let blob = Bytes::from(vec![0u8; 32 << 20]);
+        let (tx, _waiting) = oneshot::channel();
+        let queue = {
+            let slot = client.wires.slot.lock();
+            let live = slot.live.as_ref().expect("connected");
+            client.wires.pending.insert(
+                0,
+                Pending {
+                    original_id: 0,
+                    generation: live.generation,
+                    frame: blob.clone(),
+                    tx,
+                },
+            );
+            Arc::clone(&live.queue)
+        };
+        queue.push(0, blob);
         let err = client
             .send(&udp_test_query("stuck.example"), Duration::from_millis(500))
             .await
             .expect_err("nothing answers");
         assert!(err.to_string().contains("response timeout"), "{err:#}");
-        assert!(
-            client.conn.lock().await.is_none(),
-            "the quiet connection is reset"
-        );
+        assert!(!client.connected(), "the quiet connection is reset");
         read_now.send(()).expect("the peer waits");
         tokio::time::timeout(Duration::from_secs(10), peer)
             .await
@@ -4166,17 +4143,14 @@ mod tests {
         });
         let client = TcpMuxClient::new(Arc::from(addr.to_string().as_str()));
         client
-            .ensure_connection(Duration::from_secs(2))
+            .connect_for_tests()
             .await
             .expect("connect to the test peer");
         tokio::time::timeout(Duration::from_secs(5), peer)
             .await
             .expect("the writer lets go of the write half, so the peer reads to the close")
             .expect("join the peer");
-        assert!(
-            client.conn.lock().await.is_none(),
-            "the connection is cleared"
-        );
+        assert!(!client.connected(), "the connection is cleared");
     }
 
     /// 同一轮里排进来的帧一次写出去。一个工作线程，排帧的任务都从这个线程上起，和收到一批查询时一样；不先让
@@ -4194,9 +4168,9 @@ mod tests {
             writes: Arc::clone(&writes),
         };
         let draining = Arc::clone(&queue);
-        tokio::spawn(async move { write_frames(writer, &draining, None).await });
+        tokio::spawn(async move { write_frames(writer, &draining, |_, _| true).await });
         // 先写一帧，写入任务写完转回去等着 / One frame first, after which the writer is back to waiting
-        queue.push(&[0, 1, 9]);
+        queue.push(9, Bytes::from_static(&[0, 1, 9]));
         server_io.read_exact(&mut [0u8; 3]).await.unwrap();
         let before = writes.load(Ordering::SeqCst);
         // 排完帧的任务接着等，和查询排完帧等回答一样 / The tasks keep waiting once their frames are
@@ -4207,7 +4181,7 @@ mod tests {
                 .map(|index| {
                     let queue = Arc::clone(&queuing);
                     tokio::spawn(async move {
-                        queue.push(&[0, 1, index]);
+                        queue.push(u16::from(index), Bytes::copy_from_slice(&[0, 1, index]));
                         std::future::pending::<()>().await
                     })
                 })
@@ -4222,6 +4196,47 @@ mod tests {
         assert!(
             (0..8u8).all(|index| written.chunks(3).any(|frame| frame == [0, 1, index])),
             "every frame is written whole: {written:?}"
+        );
+    }
+
+    /// 帧还没写出去，它的查询就放弃了（时限先到、竞速输了）：这一帧不写，上游不用白答；还在等的照写
+    /// A query giving up (its deadline first, a race lost) before its frame is written has the
+    /// frame left unwritten, so the upstream answers nothing for nobody; the frames still waited
+    /// for are written as ever
+    #[tokio::test]
+    async fn a_frame_whose_query_gave_up_is_not_written() {
+        let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
+        let queue = Arc::new(WriteQueue::default());
+        client.wires.slot.lock().live = Some(planted(Arc::clone(&queue)));
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        TcpMuxClient::spawn_writer(
+            &client.wires,
+            ours,
+            queue,
+            Arc::new(Wear::new()),
+            CancellationToken::new(),
+            1,
+        );
+        // 两个查询在写入任务醒来之前登记好，第一个随即放弃 / Both queries register before the writer
+        // wakes, and the first gives up at once
+        let (gave_up, given_up) = oneshot::channel();
+        client
+            .register(&udp_test_query("given-up.example"), far_off(), gave_up)
+            .await
+            .expect("registered");
+        drop(given_up);
+        let (waits, _waiting) = oneshot::channel();
+        client
+            .register(&udp_test_query("waited.example"), far_off(), waits)
+            .await
+            .expect("registered");
+        let written = read_frame(&mut theirs).await.expect("a frame written");
+        assert_eq!(first_label(&written), "waited");
+        assert!(
+            timeout(Duration::from_millis(100), read_frame(&mut theirs))
+                .await
+                .is_err(),
+            "nothing more is written"
         );
     }
 
@@ -4269,7 +4284,8 @@ mod tests {
             written_at: Arc::clone(&written_at),
         };
         let draining = Arc::clone(&queue);
-        let writing = tokio::spawn(async move { write_frames(writer, &draining, None).await });
+        let writing =
+            tokio::spawn(async move { write_frames(writer, &draining, |_, _| true).await });
         // 一直有活的任务：每圈记一次数，让一轮再来 / A task that always has work: it counts each turn and yields a round
         let counting = Arc::clone(&turns);
         let busy = tokio::spawn(async move {
@@ -4283,7 +4299,7 @@ mod tests {
             let (queuing, counted) = (Arc::clone(&queue), Arc::clone(&turns));
             let pushed_at = tokio::spawn(async move {
                 let at = counted.load(Ordering::SeqCst);
-                queuing.push(&[0, 1, 2]);
+                queuing.push(2, Bytes::from_static(&[0, 1, 2]));
                 at
             })
             .await
@@ -4330,14 +4346,21 @@ mod tests {
 
         let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
         let queue = Arc::new(WriteQueue::default());
-        *client.conn.lock().await = Some(planted(Arc::clone(&queue)));
+        client.wires.slot.lock().live = Some(planted(Arc::clone(&queue)));
         let token = CancellationToken::new();
         // 写入任务属于摆进去的那条连接（第 1 代）/ The writer belongs to the planted connection
         // (generation 1)
-        client.spawn_writer(Broken, queue, token.clone(), 1);
+        TcpMuxClient::spawn_writer(
+            &client.wires,
+            Broken,
+            queue,
+            Arc::new(Wear::new()),
+            token.clone(),
+            1,
+        );
         let (tx, rx) = oneshot::channel();
         client
-            .register_pending(&udp_test_query("broken.example"), 7, u64::MAX, tx)
+            .register(&udp_test_query("broken.example"), far_off(), tx)
             .await
             .expect("register while connected");
         let answer = tokio::time::timeout(Duration::from_secs(2), rx)
@@ -4350,7 +4373,7 @@ mod tests {
                 .to_string()
                 .contains("write failed")
         );
-        assert!(client.conn.lock().await.is_none(), "the slot is cleared");
+        assert!(!client.connected(), "the slot is cleared");
         assert!(token.is_cancelled(), "the reader ends too");
     }
 
@@ -4370,19 +4393,19 @@ mod tests {
                 .send(&udp_test_query("cancelled.example"), Duration::from_secs(5))
                 .await
         });
-        while client.pending.is_empty() {
+        while client.wires.pending.is_empty() {
             tokio::task::yield_now().await;
         }
         task.abort();
         let _ = task.await;
-        let generation = client.generation.load(Ordering::Acquire);
+        let generation = client.wires.generation.load(Ordering::Acquire);
         let answer = client
             .send(&udp_test_query("next.example"), Duration::from_secs(5))
             .await
             .expect("answered");
         assert_eq!(first_label(&answer), "next");
         assert_eq!(
-            client.generation.load(Ordering::Acquire),
+            client.wires.generation.load(Ordering::Acquire),
             generation,
             "on the same connection"
         );
@@ -4642,7 +4665,8 @@ mod tests {
         });
         let client = UdpClient::new(1).expect("create UDP client");
         let query = udp_test_query("held.example.");
-        let mut first = client.begin(&query, &upstream).await.expect("sent");
+        let mut first = UdpExchange::new(&client, &query, &upstream);
+        first.send(()).await.expect("sent");
         for _ in 0..per_socket {
             client
                 .send(&query, &upstream, Duration::from_secs(2))
@@ -4650,17 +4674,23 @@ mod tests {
                 .expect("query answered");
         }
         let replaced = client.pool[0].load().socket.local_addr().unwrap();
-        assert_ne!(first._socket.socket.local_addr().unwrap(), replaced);
-        let reply = timeout(Duration::from_secs(2), first.reply())
+        let old_socket = Arc::downgrade(&first.sent[0].0._socket.socket);
+        assert_ne!(
+            old_socket.upgrade().unwrap().local_addr().unwrap(),
+            replaced
+        );
+        let (reply, ()) = timeout(Duration::from_secs(2), first.reply())
             .await
             .expect("answered in time")
-            .expect("answered");
-        assert_eq!(&reply[..2], &query[..2], "original ID restored");
+            .expect("waited for");
+        assert_eq!(
+            &reply.expect("answered")[..2],
+            &query[..2],
+            "original ID restored"
+        );
 
-        // 最后一个查询放手以后，接收任务停下，socket 关掉 / Once its last query lets go, the receiving
-        // task stops and the socket closes
-        let old_socket = Arc::downgrade(&first._socket.socket);
-        drop(first);
+        // 最后一个查询拿到了结果、放了手，接收任务停下，socket 关掉 / Once its last query has its
+        // outcome and lets go, the receiving task stops and the socket closes
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             old_socket.upgrade().is_none(),
@@ -4898,12 +4928,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_dot_handshake_outlives_the_query_that_started_it() {
-        // 发起建连的查询在 TLS 握手做完前被取消了（竞速时别的上游先答完），握手照样做完，下一个查询直接用上，
-        // 不另建。以前握手跟着查询一起丢，竞速时每个查询都从 SYN 重来
+        // 发起建连的查询在 TLS 握手做完前被取消了（竞速时别的上游先答完），握手照样做完，下一个查询直接用上，不另建
         // The query that started the connect is cancelled before the TLS handshake is through
         // (another upstream answering first in a race); the handshake goes on all the same and
-        // the next query uses it, making no other. The handshake used to be lost with the
-        // query, every query in a race starting over from the SYN
+        // the next query uses it, making no other
         let (server, client_tls) = localhost_tls(&[]);
         let upstream = spawn_stream_upstream(Some(server)).await;
         let (addr, accepted) =
@@ -4971,14 +4999,50 @@ mod tests {
         (addr, accepted)
     }
 
+    /// 发起建连的查询在握手做完前被取消了，连接照样建完、装上，从一开始就有人读它：上游随后把它关了，这边跟着关掉，不会
+    /// 停在 CLOSE_WAIT 里等下一个查询来取
+    /// The query that started the connect is cancelled before the handshake is through; the
+    /// connection is made and put in place all the same, read from the start: when the upstream
+    /// then closes it, this end closes too rather than sitting in CLOSE_WAIT until another query
+    /// comes to take it
+    #[tokio::test]
+    async fn a_connection_made_for_a_cancelled_query_closes_with_the_upstream() {
+        let (server, client_tls) = localhost_tls(&[]);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            tls.shutdown().await.unwrap();
+            read_to_close(tls).await;
+            let _ = closed_tx.send(());
+        });
+        let client = DotMuxClient::new(
+            Arc::from(format!("dot://{addr}?sni=localhost")),
+            Arc::new(client_tls),
+        );
+        let raced = timeout(
+            Duration::from_millis(100),
+            client.send(&udp_test_query("first.example"), Duration::from_secs(2)),
+        )
+        .await;
+        assert!(raced.is_err(), "cancelled while the handshake goes on");
+        timeout(Duration::from_secs(2), closed_rx)
+            .await
+            .expect("this end closes once the upstream has")
+            .expect("the upstream noted it");
+        assert!(!client.connected(), "the slot is cleared");
+    }
+
     #[tokio::test]
     async fn a_connection_left_waiting_and_closed_meanwhile_is_made_again() {
-        // 发起建连的查询被取消了，连接建好以后放着，上游这期间把它关了：下一个查询先看出它关了，重建一条再答。以前照用，
-        // 登记上去就断，算新连接也不重发，查询失败
-        // The query that started the connect is cancelled, the connection made is left waiting,
-        // and the upstream closes it meanwhile: the next query sees it closed first, makes another
-        // and is answered. It used to be used as it was, breaking as the query registered, and
-        // counting as new it was not sent again, so the query failed
+        // 发起建连的查询被取消了，连接照样建完、装上，上游这期间把它关了：读取任务看到就拆掉它，下一个查询重建一条再答
+        // The query that started the connect is cancelled, the connection is made and put in
+        // place all the same, and the upstream closes it meanwhile: its reader sees that and
+        // tears it down, and the next query makes another and is answered
         let (server, client_tls) = localhost_tls(&[]);
         let upstream = spawn_stream_upstream(Some(server)).await;
         let (addr, accepted) =
@@ -5003,12 +5067,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_failure_left_waiting_past_its_backoff_does_not_fail_the_next_query() {
-        // 发起建连的查询被取消了，建连随后失败、结果放着；下一个查询来时，这次失败的退避早已过去：作废，重新建连再答。
-        // 以前拿这次旧失败直接失败，还从这一刻重新退避
-        // The query that started the connect is cancelled, the connect then fails and its result
-        // is left waiting; by the time the next query comes the backing off from that failure is
-        // long over, so it is voided and a connect made again before answering. The old failure
-        // used to fail the query outright and back off afresh from then
+        // 发起建连的查询被取消了，建连随后失败；下一个查询来时，从这次失败算起的退避早已过去：重新建连再答
+        // The query that started the connect is cancelled and the connect then fails; by the time
+        // the next query comes the backing off counted from that failure is long over, so a
+        // connect is made again before answering
         let (server, client_tls) = localhost_tls(&[]);
         let upstream = spawn_stream_upstream(Some(server)).await;
         let (addr, accepted) = front_closing_the_first(upstream, None).await;
@@ -5199,19 +5261,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_send_whose_own_connection_breaks_is_not_sent_again() {
-        // 这次发送自己建的连接一收到查询就断了：不重发，再建一条多半还是断。以前事先拿 try_lock 猜是不是复用，
-        // 锁正被占着就当复用，于是再连一次
+        // 这次发送自己建的连接一收到查询就断了：不重发，再建一条多半还是断
         // The connection this send made itself breaks on receiving the query: it is not sent
-        // again, as another would most likely break as well. Whether the connection was reused
-        // used to be guessed beforehand with try_lock, a held lock counting as reused, so it
-        // connected once more
+        // again, as another would most likely break as well
         let (addr, accepted) = closing_tcp_upstream(0).await;
         let client = TcpMuxClient::new(Arc::from(addr.to_string()));
         let query = udp_test_query("broken.example");
-        let (_, sent) = tokio::join!(client.hold_connection(Duration::from_millis(100)), async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            client.send(&query, Duration::from_secs(1)).await
-        });
+        let sent = client.send(&query, Duration::from_secs(1)).await;
         assert!(sent.is_err(), "the upstream never answers");
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "connected once");
     }
@@ -5405,10 +5461,10 @@ mod tests {
         }
         let live = "https://live.example/dns-query";
         client.upstream(live).expect("create live upstream");
-        age_out_idle_upstreams(&client, live);
+        let now = age_out_idle_upstreams(&client, live);
 
         client
-            .upstream("https://new.example/dns-query")
+            .upstream_at("https://new.example/dns-query", now)
             .expect("create upstream");
 
         assert!(
@@ -5437,11 +5493,13 @@ mod tests {
         }
         let live = "https://live.example/dns-query";
         client.upstream(live).expect("create live upstream");
-        age_out_idle_upstreams(&client, live);
+        let now = age_out_idle_upstreams(&client, live);
 
         // 只重复查询已有上游，不插入任何新键
         // Only look the existing upstream up again; no new key is inserted
-        client.upstream(live).expect("look up live upstream");
+        client
+            .upstream_at(live, now)
+            .expect("look up live upstream");
 
         assert!(
             client.upstreams.len() <= 2,
@@ -5468,14 +5526,12 @@ mod tests {
         client.upstream(live).expect("create upstream");
 
         // 窗口过期，但条目都是刚用过的 / interval lapsed, every entry just used
-        let lapsed =
-            unix_time_millis().saturating_sub(DOH_UPSTREAM_PRUNE_EVERY.as_millis() as u64 * 2);
-        client.last_prune_millis.store(lapsed, Ordering::Relaxed);
+        let lapsed = client.millis_since_epoch() + DOH_UPSTREAM_PRUNE_EVERY.as_millis() as u64 * 2;
+        client.upstream_at(live, lapsed).expect("look up upstream");
 
-        client.upstream(live).expect("look up upstream");
-
-        assert!(
-            client.last_prune_millis.load(Ordering::Relaxed) > lapsed,
+        assert_eq!(
+            client.last_prune_millis.load(Ordering::Relaxed),
+            lapsed,
             "a lapsed interval must be claimed even when nothing is dropped"
         );
         assert!(
@@ -5484,23 +5540,18 @@ mod tests {
         );
     }
 
-    /// 把除 `live` 之外的条目标记为长期未使用，并让节流窗口过期
-    /// Age every entry except `live`, and let the prune interval lapse
-    fn age_out_idle_upstreams(client: &DohClient, live: &str) {
-        let now = unix_time_millis();
-        let stale = now.saturating_sub(DOH_UPSTREAM_IDLE.as_millis() as u64 * 2);
-        for entry in client.upstreams.iter() {
-            if entry.key().as_ref() != live {
-                entry
-                    .value()
-                    .last_used_millis
-                    .store(stale, Ordering::Relaxed);
-            }
-        }
-        client.last_prune_millis.store(
-            now.saturating_sub(DOH_UPSTREAM_PRUNE_EVERY.as_millis() as u64 * 2),
-            Ordering::Relaxed,
-        );
+    /// 往后看一段：除 `live` 之外的条目都长期未使用，节流窗口也过期了，给出那时的 `now`（见 `DohClient::upstream_at`）
+    /// A look ahead: every entry but `live` has long gone unused and the prune interval has lapsed,
+    /// giving the `now` of then (see `DohClient::upstream_at`)
+    fn age_out_idle_upstreams(client: &DohClient, live: &str) -> u64 {
+        let now = client.millis_since_epoch() + DOH_UPSTREAM_IDLE.as_millis() as u64 * 2;
+        client
+            .upstreams
+            .get(live)
+            .expect("the live upstream")
+            .last_used_millis
+            .store(now, Ordering::Relaxed);
+        now
     }
 
     /// 同一代开始的请求一起断掉、一起报错，只重建一次；旧连接上迟到的错误不算，新的一代从头数。以前每数到阈值就重建
@@ -5727,6 +5778,68 @@ mod tests {
         }
     }
 
+    /// 经 reqwest 的 DoH 连接和别的 TCP 连接一样保活（见 [`KEEPALIVE_TIME`]）：连上以后到这个进程里找出那条连接的
+    /// socket，读它的保活设置
+    /// A DoH connection through reqwest keeps alive as every other TCP connection does (see
+    /// [`KEEPALIVE_TIME`]): once it is made, its socket is found in this process and its keepalive
+    /// read
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_reqwest_connection_keeps_alive_as_the_others_do() {
+        let (addr, _) = spawn_doh_upstream(|_, query| {
+            DohReply::Raw(http_ok(Some(DOH_MEDIA_TYPE), &echo_answer(query)))
+        })
+        .await;
+        let mut client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
+        client.reqwest_only_for_tests();
+        let upstream = format!("http://{addr}/dns-query");
+        client
+            .send(&doh_test_query("kept"), &upstream, Duration::from_secs(2))
+            .await
+            .expect("the upstream answers");
+        assert_eq!(
+            tcp_keepalive_towards(addr),
+            Some((KEEPALIVE_TIME, KEEPALIVE_INTERVAL))
+        );
+    }
+
+    /// 这个进程里连到 `peer` 的那条 TCP 连接的保活：多久没有收发开始探、隔多久探一次 / The keepalive of
+    /// this process's TCP connection to `peer`: how long without traffic before probing, and how far
+    /// apart the probes are
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn tcp_keepalive_towards(peer: SocketAddr) -> Option<(Duration, Duration)> {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        #[cfg(target_os = "macos")]
+        const IDLE: libc::c_int = libc::TCP_KEEPALIVE;
+        #[cfg(target_os = "linux")]
+        const IDLE: libc::c_int = libc::TCP_KEEPIDLE;
+        let seconds = |fd: &BorrowedFd<'_>, option| {
+            let (mut value, mut len) = (
+                0 as libc::c_int,
+                size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            // SAFETY: 只读一个整数选项，写进这里的 `value`；`fd` 不是 socket 时调用失败 / Reads an
+            // integer option into `value` here alone; on an `fd` that is no socket the call fails
+            let read = unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    option,
+                    (&raw mut value).cast(),
+                    &raw mut len,
+                )
+            };
+            (read == 0).then(|| Duration::from_secs(value as u64))
+        };
+        (0..4096).find_map(|raw| {
+            // SAFETY: 只在下面几次调用里借用；没打开的描述符让它们失败 / Borrowed for the calls below
+            // only; a descriptor not open makes them fail
+            let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+            let to = SockRef::from(&fd).peer_addr().ok()?.as_socket()?;
+            (to == peer).then(|| Some((seconds(&fd, IDLE)?, seconds(&fd, libc::TCP_KEEPINTVL)?)))?
+        })
+    }
+
     #[tokio::test]
     async fn reqwest_client_drop_closes_pooled_connections() {
         // Empirical foundation of DohClient's pool-rebuild healing: dropping a
@@ -5793,9 +5906,9 @@ mod tests {
     async fn tcp_mux_rewrite_id_no_deadlock_under_contention() {
         // Arrange: Prepare a TCP client with many pending IDs to force contention
         let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        *client.conn.lock().await = Some(planted(Arc::new(WriteQueue::default())));
+        client.wires.slot.lock().live = Some(planted(Arc::new(WriteQueue::default())));
         for id in 1u16..200u16 {
-            client.pending.insert(
+            client.wires.pending.insert(
                 id,
                 Pending {
                     original_id: id,
@@ -5813,7 +5926,7 @@ mod tests {
                 async move {
                     let dummy = vec![0u8; 4];
                     let (tx, _) = oneshot::channel();
-                    client.register_pending(&dummy, 0, u64::MAX, tx).await
+                    client.register(&dummy, far_off(), tx).await
                 }
             })
             .collect::<Vec<_>>();
@@ -5872,44 +5985,25 @@ mod tests {
         assert!(map.is_empty(), "its own entry goes");
     }
 
+    /// 登记和拆除都在槽的锁下做完：拆之前登记上的查询，拆的时候都被告知，条目也不留下
+    /// Registration and teardown are each done under the slot's lock: a query registered before
+    /// the teardown is told of it, and leaves no entry behind
     #[tokio::test]
-    async fn tcp_fail_all_cannot_miss_a_concurrent_registration() {
-        let client = Arc::new(TcpMuxClient::new(Arc::from("127.0.0.1:0")));
-        *client.conn.lock().await = Some(planted(Arc::new(WriteQueue::default())));
-
-        // Hold the connection lock so registration queues before fail_all. The old implementation
-        // took its pending snapshot before this lock, then allowed the queued registration to land
-        // after the snapshot. The waiter was never notified.
-        let conn_guard = client.conn.lock().await;
-        let register_client = Arc::clone(&client);
-        let register = tokio::spawn(async move {
-            let packet = [0u8; 4];
-            let (tx, rx) = oneshot::channel();
-            let result = register_client
-                .register_pending(&packet, 0, u64::MAX, tx)
-                .await;
-            (result, rx)
-        });
-        tokio::task::yield_now().await;
-
-        let pending = Arc::clone(&client.pending);
-        let conn = Arc::clone(&client.conn);
-        let fail_all = tokio::spawn(async move {
-            assert!(TcpMuxClient::close(&pending, &conn, 1, "reader failed").await);
-        });
-        tokio::task::yield_now().await;
-        drop(conn_guard);
-
-        let (registration, receiver) = register.await.expect("join registration task");
-        registration.expect("registration should complete before teardown");
-        fail_all.await.expect("join fail_all task");
-
-        assert!(client.pending.is_empty());
-        let result = timeout(Duration::from_millis(100), receiver)
+    async fn a_teardown_tells_the_queries_registered_before_it() {
+        let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
+        client.wires.slot.lock().live = Some(planted(Arc::new(WriteQueue::default())));
+        let (tx, rx) = oneshot::channel();
+        client
+            .register(&[0u8; 4], far_off(), tx)
             .await
-            .expect("pending waiter was not notified")
-            .expect("pending sender was dropped without a result");
-        assert!(result.is_err(), "reader failure should reach the waiter");
+            .expect("registered on the planted connection");
+        assert!(TcpMuxClient::close(&client.wires, 1, "reader failed"));
+        assert!(client.wires.pending.is_empty());
+        let result = timeout(Duration::from_millis(100), rx)
+            .await
+            .expect("the waiter is told at once")
+            .expect("the sender is used, not dropped");
+        assert!(result.is_err(), "the teardown reaches the waiter");
     }
 
     /// DoT、DoQ 的上游必须有建连时用得上的主机名：空的不行，做不成 TLS 服务器名的（`%20`、`.`）
@@ -5951,27 +6045,37 @@ mod tests {
         assert!(check_upstream_address("dns.example:853", Transport::Doq).is_ok());
     }
 
-    /// 接收报 ConnectionReset（Windows 上 ICMP 端口不可达）时马上接着收，别的错误照旧歇 100 ms
-    /// ConnectionReset from a receive (an ICMP port unreachable on Windows) reads on at once;
-    /// any other error still pauses 100 ms
+    /// 接收报 ConnectionReset（Windows 上 ICMP 端口不可达）时马上接着收，不记 warn 以上的日志：每个没人收的查询都有一个，记
+    /// 下来就是每个查询一条。别的错误记 warn（`warn_sparse`，单元测试里每条都记），歇 100 ms
+    /// ConnectionReset from a receive (an ICMP port unreachable on Windows) reads on at once and
+    /// logs nothing at warn or above: every query reaching nobody brings one, which logged would be
+    /// a line a query. Any other error logs a warn (`warn_sparse`, every one logged in unit tests)
+    /// and pauses 100 ms
     #[test]
-    fn a_connection_reset_on_receive_reads_on_at_once() {
+    fn a_connection_reset_on_receive_reads_on_at_once_and_quietly() {
         use std::io::{Error, ErrorKind};
-        assert_eq!(
-            recv_error_pause(&Error::from(ErrorKind::ConnectionReset)),
-            None
-        );
+        let (warnings, _capturing) = crate::engine::test_support::Warnings::capture();
+        for _ in 0..3 {
+            assert_eq!(
+                after_recv_error(0, &Error::from(ErrorKind::ConnectionReset)),
+                None
+            );
+        }
+        assert_eq!(warnings.lines(), Vec::<String>::new());
         for kind in [
             ErrorKind::Other,
             ErrorKind::ConnectionRefused,
             ErrorKind::OutOfMemory,
         ] {
             assert_eq!(
-                recv_error_pause(&Error::from(kind)),
+                after_recv_error(0, &Error::from(kind)),
                 Some(Duration::from_millis(100)),
                 "{kind:?}"
             );
         }
+        let lines = warnings.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines.iter().all(|line| line.contains("WARN")), "{lines:?}");
     }
 
     /// 预热建的连接池和发送时现建的一样大，每个客户端各有自己的连接位
@@ -5987,7 +6091,10 @@ mod tests {
             .expect("the upstream is warmed up")
             .clone();
         assert_eq!(pool.clients.len(), 3);
-        assert!(!Arc::ptr_eq(&pool.clients[0].conn, &pool.clients[1].conn));
+        assert!(!Arc::ptr_eq(
+            &pool.clients[0].wires.slot,
+            &pool.clients[1].wires.slot
+        ));
     }
 
     /// 同一个池的客户端各用各的连接，不同上游各有各的池：经池里两个客户端各发一个查询，上游收到两条
@@ -6088,7 +6195,7 @@ mod tests {
             .send(&udp_test_query("a.example"), Duration::from_millis(100))
             .await;
         assert!(result.is_err(), "the upstream never answers");
-        assert!(tcp_client.pending.is_empty());
+        assert!(tcp_client.wires.pending.is_empty());
     }
 
     /// 连接池大小写成 0 时按 1 算：TCP（DoT 用同一套）和 DoQ 的池里都有一个客户端
@@ -6205,23 +6312,29 @@ mod tests {
         assert_eq!(pooled.answers.load(Ordering::Acquire), 2);
     }
 
-    /// DoQ 连接用了超过 30 分钟，或者超过 5 分钟没答过，就算用旧了、换新的；没到时照用
-    /// A DoQ connection over 30 minutes old, or unanswered for over 5 minutes, counts as worn out
-    /// and is replaced; short of that it stays in use
-    #[test]
-    fn a_doq_connection_is_worn_out_when_too_old_or_idle_too_long() {
-        let minute = 60 * 1000;
-        let now = 100 * minute;
-        assert_eq!(
-            doq_worn_out(now - 29 * minute, now - 4 * minute, now),
-            None,
-            "young and busy enough"
-        );
-        assert_eq!(doq_worn_out(now - 31 * minute, now, now), Some("too old"));
-        assert_eq!(
-            doq_worn_out(now - minute, now - 6 * minute, now),
-            Some("idle too long")
-        );
+    /// 连接活满最长时间、或者最晚的期限过后空闲满时限就用旧了，看哪个先到；中途来的查询把空闲往后推，用旧的时刻按单调时钟
+    /// 算；都不限时一直不会用旧
+    /// A connection is worn once it has lived its max age, or sat idle its limit past the latest
+    /// deadline, whichever comes first; a query coming meanwhile puts idleness later, and the
+    /// moment counts on the monotonic clock; with neither limited it never wears out
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_wears_out_by_age_or_idleness_whichever_comes_first() {
+        let second = Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+        let (wear, aging) = (Wear::new(), Aging::new(1800 * second, 60 * second));
+        wear.note(started + 2 * second);
+        let (why, ()) = tokio::join!(aging.worn(&wear), async {
+            tokio::time::sleep(30 * second).await;
+            wear.note(tokio::time::Instant::now() + 2 * second);
+        });
+        assert_eq!((why, started.elapsed()), ("idle", 92 * second));
+
+        let (started, wear) = (tokio::time::Instant::now(), Wear::new());
+        let why = Aging::new(10 * second, 60 * second).worn(&wear).await;
+        assert_eq!((why, started.elapsed()), ("too old", 10 * second));
+
+        let never = Aging::new(Duration::ZERO, Duration::ZERO);
+        assert!(timeout(3600 * second, never.worn(&wear)).await.is_err());
     }
 
     /// DoT 和 DoQ 的上游地址：`sni`/`servername` 取最后一个非空的；出错时错误文字带着协议名
@@ -6817,9 +6930,28 @@ mod tests {
         enable_0rtt: bool,
         bootstrap: Arc<Bootstrap>,
     ) -> Arc<DoqRuntime> {
+        doq_runtime_aging(
+            client_tls,
+            enable_0rtt,
+            bootstrap,
+            0,
+            Aging::new(DOQ_MAX_AGE, Duration::from_secs(60)),
+        )
+    }
+
+    /// 同 [`doq_test_runtime_through`]，QUIC 每 `keepalive_ms` 毫秒保活一次（0 不保活），连接照 `aging` 老化 / As
+    /// [`doq_test_runtime_through`], QUIC keeping alive every `keepalive_ms` (0 for never) and
+    /// connections aging by `aging`
+    fn doq_runtime_aging(
+        client_tls: ClientConfig,
+        enable_0rtt: bool,
+        bootstrap: Arc<Bootstrap>,
+        keepalive_ms: u64,
+        aging: Aging,
+    ) -> Arc<DoqRuntime> {
         let crypto = QuicClientConfig::try_from(client_tls).expect("quic client crypto");
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(doq_transport(0, 0).expect("transport")));
+        config.transport_config(Arc::new(doq_transport(keepalive_ms, 0).expect("transport")));
         let mut endpoint_v4 =
             QuicEndpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind the DoQ client");
         endpoint_v4.set_default_client_config(config.clone());
@@ -6833,6 +6965,7 @@ mod tests {
         Arc::new(DoqRuntime {
             endpoint_v4,
             endpoint_v6,
+            aging,
             bootstrap,
             enable_0rtt,
             zero_rtt_notice: std::sync::Once::new(),
@@ -7238,6 +7371,7 @@ mod tests {
             generation: 1,
             cancel: CancellationToken::new(),
             answers: Arc::default(),
+            wear: Arc::new(Wear::new()),
         }
     }
 
@@ -7246,8 +7380,6 @@ mod tests {
         fn connection_generation(&self) -> u64;
         async fn drop_connection(&self);
         fn pending(&self) -> &DashMap<u16, Pending, FxBuildHasher>;
-        /// 拿着连接锁 `hold` 这么久 / Hold the connection lock for `hold`
-        async fn hold_connection(&self, hold: Duration);
     }
 
     impl<T: StreamTransport> StreamMux for StreamMuxClient<T> {
@@ -7255,17 +7387,13 @@ mod tests {
             self.send(packet, timeout_dur).await
         }
         fn connection_generation(&self) -> u64 {
-            self.generation.load(Ordering::Acquire)
+            self.wires.generation.load(Ordering::Acquire)
         }
         async fn drop_connection(&self) {
-            self.reset(self.generation.load(Ordering::Acquire)).await;
+            self.reset(self.wires.generation.load(Ordering::Acquire));
         }
         fn pending(&self) -> &DashMap<u16, Pending, FxBuildHasher> {
-            &self.pending
-        }
-        async fn hold_connection(&self, hold: Duration) {
-            let _held = self.conn.lock().await;
-            tokio::time::sleep(hold).await;
+            &self.wires.pending
         }
     }
 
@@ -7337,117 +7465,6 @@ mod tests {
     #[tokio::test]
     async fn a_full_dot_id_space_fails_queries_at_once() {
         a_full_id_space_fails_queries_at_once(&dot_test_client().await).await;
-    }
-
-    /// 连接锁被别人拿着时，查询等锁也守自己的时限，时限到了只有它失败，连接照常用。此前看连接
-    /// 是不是复用的、建连、登记都要等这把锁，要等多久就等多久：排在长队后面的查询远远超出时限，
-    /// 最后还把连接重建了。
-    /// With the connection lock held by someone else, a query waiting for it keeps to
-    /// its own deadline, and when that passes only the query fails while the
-    /// connection stays in use. Checking for a reused connection, connecting and
-    /// registering all waited for this lock as long as it took: a query at the back
-    /// of a long queue ran far past its deadline and then rebuilt the connection.
-    async fn waiting_for_the_connection_keeps_to_the_deadline(client: &impl StreamMux) {
-        client
-            .query(&udp_test_query("warm.example"), Duration::from_secs(2))
-            .await
-            .expect("a fresh connection answers");
-        let generation = client.connection_generation();
-
-        let query = udp_test_query("queued.example");
-        let (_, (result, took)) =
-            tokio::join!(client.hold_connection(Duration::from_millis(800)), async {
-                // 等锁先被拿住 / Let the lock be taken first
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let started = tokio::time::Instant::now();
-                let result = client.query(&query, Duration::from_millis(200)).await;
-                (result, started.elapsed())
-            });
-        assert!(result.is_err(), "the lock is held past the deadline");
-        assert!(
-            took < Duration::from_millis(450),
-            "the query failed after {took:?}"
-        );
-        assert_eq!(
-            client.connection_generation(),
-            generation,
-            "nothing was wrong with the connection"
-        );
-        client
-            .query(&udp_test_query("after.example"), Duration::from_secs(2))
-            .await
-            .expect("the same connection answers");
-        assert_eq!(client.connection_generation(), generation);
-    }
-
-    #[tokio::test]
-    async fn waiting_for_a_tcp_connection_keeps_to_the_deadline() {
-        waiting_for_the_connection_keeps_to_the_deadline(&tcp_test_client().await).await;
-    }
-
-    #[tokio::test]
-    async fn waiting_for_a_dot_connection_keeps_to_the_deadline() {
-        waiting_for_the_connection_keeps_to_the_deadline(&dot_test_client().await).await;
-    }
-
-    /// 时限到了的查询要复位连接、锁却被别人拿着时，它不等，按时返回；复位留给下一次建连。此前它
-    /// 要等到锁放开，排在长队后面的查询远远超出时限才返回。
-    /// A query past its deadline that has to reset the connection while someone else
-    /// holds the lock does not wait but returns on time, leaving the reset to the
-    /// next connect. It used to wait for the lock, so a query at the back of a long
-    /// queue returned far past its deadline.
-    async fn a_reset_past_the_deadline_does_not_wait_for_the_lock(client: &impl StreamMux) {
-        client
-            .query(&udp_test_query("warm.example"), Duration::from_secs(2))
-            .await
-            .expect("a fresh connection answers");
-        let generation = client.connection_generation();
-
-        let query = udp_test_query("slow.example");
-        let next = udp_test_query("next.example");
-        let ((result, took, next_took), _) = tokio::join!(
-            async {
-                let started = tokio::time::Instant::now();
-                let result = client.query(&query, Duration::from_millis(300)).await;
-                let took = started.elapsed();
-                // 锁还被拿着：下一个查询做欠着的复位时也守自己的时限
-                // The lock is still held: the next query keeps to its own deadline
-                // while doing the owed reset
-                let started = tokio::time::Instant::now();
-                let next = client.query(&next, Duration::from_millis(200)).await;
-                assert!(next.is_err(), "the lock is still held");
-                (result, took, started.elapsed())
-            },
-            async {
-                // 查询的时限到之前把锁拿住 / Take the lock before the query's deadline
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                client.hold_connection(Duration::from_millis(800)).await;
-            }
-        );
-        assert!(result.is_err(), "the upstream never answers `slow`");
-        assert!(took < Duration::from_millis(500), "returned after {took:?}");
-        assert!(
-            next_took < Duration::from_millis(450),
-            "the next query returned after {next_took:?}"
-        );
-
-        // 下一次建连先把欠着的复位做完，再换新连接回答
-        // The next connect first does the owed reset, then answers over a new connection
-        client
-            .query(&udp_test_query("after.example"), Duration::from_secs(2))
-            .await
-            .expect("a new connection answers");
-        assert_eq!(client.connection_generation(), generation + 1);
-    }
-
-    #[tokio::test]
-    async fn a_tcp_reset_past_the_deadline_does_not_wait_for_the_lock() {
-        a_reset_past_the_deadline_does_not_wait_for_the_lock(&tcp_test_client().await).await;
-    }
-
-    #[tokio::test]
-    async fn a_dot_reset_past_the_deadline_does_not_wait_for_the_lock() {
-        a_reset_past_the_deadline_does_not_wait_for_the_lock(&dot_test_client().await).await;
     }
 
     /// 同一个 ID 下回答别的问题的不收，查询接着等自己的回答，和 UDP 一样。此前只按 ID 对号：
@@ -7593,80 +7610,36 @@ mod tests {
         a_reset_fails_waiting_queries_at_once(&dot_test_client().await).await;
     }
 
-    /// 连接用到了最长时间、健康检查要摘下它时，连接锁正被别的登记占着：查询照样守自己的时限，不等锁放开。以前健康检查在
-    /// 预算之外，锁占多久查询就等多久
-    /// With a connection at its max age and the health check about to take it out while other
-    /// registrations hold the connection lock, the query keeps to its own deadline and does not
-    /// wait for the lock. The health check used to lie outside the budget, the query waiting as
-    /// long as the lock was held
-    #[tokio::test]
-    async fn the_health_check_keeps_to_the_query_budget() {
-        let addr = spawn_stream_upstream(None).await;
-        let client = TcpMuxClient::with_shared(
-            Bootstrap::system(),
-            Arc::from(addr.to_string()),
-            StreamHealth {
-                max_age_ms: 1,
-                ..StreamHealth::default()
-            },
-        );
-        client
-            .send(&udp_test_query("warm.example"), Duration::from_secs(2))
-            .await
-            .expect("a fresh connection answers");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        client.last_health_check_time.store(0, Ordering::Release);
-        let (_, (sent, took)) =
-            tokio::join!(client.hold_connection(Duration::from_secs(2)), async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                let started = tokio::time::Instant::now();
-                let sent = client
-                    .send(&udp_test_query("late.example"), Duration::from_millis(300))
-                    .await;
-                (sent, started.elapsed())
-            });
-        assert!(sent.is_err(), "the lock is held past the budget");
-        assert!(took < Duration::from_millis(1000), "took {took:?}");
-    }
-
-    /// 握手被压住 250 ms、回答再等 250 ms：300 ms 预算的请求曾跑满 560 ms 才成功
-    /// A handshake held back 250 ms and an answer after another 250 ms: a request
-    /// with a 300 ms budget used to run the full 560 ms and succeed
-    /// 连接用到了最长时间以后同时来几个查询（一次解析的 A 和 AAAA 就是这样）：旧连接摘下一次，新连接建一条，查询都
-    /// 答上。以前几个查询各自判断「该拆了」，后到的那个拆的时候旧连接已经换成了新的，拆掉的是新连接：先到的
-    /// 查询登记不上或被告知连接已复位，新连接白建一条，它的读写任务也没人去停
-    /// With a connection at its max age and several queries arriving together (the A and AAAA of
-    /// one lookup do), the old connection is taken out once, one new one is made, and every query
-    /// is answered. Each query used to decide for itself that it had to go, and by the time the
-    /// later one tore down, the old connection had been replaced: the new one went instead, the
-    /// earlier query could not register or was told of a reset, a connection was made for
-    /// nothing, and nobody stopped its reader and writer
+    /// 连接用旧了以后同时来几个查询（一次解析的 A 和 AAAA 就是这样）：旧连接只由它自己的写入任务摘下一次，新连接建一条，
+    /// 查询都等这同一次建连、都答上
+    /// With a connection worn and several queries arriving together (the A and AAAA of one lookup
+    /// do), the old connection is taken out once, by its own writer, one new one is made, and every
+    /// query waits for that one connect and is answered
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_expired_connection_is_replaced_once_for_queries_arriving_together() {
         let addr = spawn_stream_upstream(None).await;
         let client = Arc::new(TcpMuxClient::with_shared(
             Bootstrap::system(),
             Arc::from(addr.to_string()),
-            StreamHealth {
-                max_age_ms: 1,
-                ..StreamHealth::default()
+            Aging {
+                max_age: Some(Duration::from_millis(100)),
+                ..Aging::for_tests()
             },
         ));
         client
-            .send(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .send(&udp_test_query("warm.example"), Duration::from_millis(50))
             .await
             .expect("a fresh connection answers");
-        for round in 0..300 {
-            // 用到了最长时间，并让健康检查这一轮再看一次 / At its max age, with the health check due
-            // again this round
-            tokio::time::sleep(Duration::from_millis(3)).await;
-            client.last_health_check_time.store(0, Ordering::Release);
-            let before = client.generation.load(Ordering::Acquire);
+        for round in 0..5 {
+            // 用到了最长时间，期限也都过了：摘下了 / Past its max age and its deadlines: taken out
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(!client.connected(), "round {round}: worn and taken out");
+            let before = client.wires.generation.load(Ordering::Acquire);
             let queries = (0..4).map(|n| {
                 let client = Arc::clone(&client);
                 tokio::spawn(async move {
                     let query = udp_test_query(&format!("r{round}q{n}.example"));
-                    client.send(&query, Duration::from_secs(2)).await
+                    client.send(&query, Duration::from_millis(50)).await
                 })
             });
             for answered in futures::future::join_all(queries).await {
@@ -7675,45 +7648,41 @@ mod tests {
                     .unwrap_or_else(|err| panic!("round {round}: {err:#}"));
             }
             assert_eq!(
-                client.generation.load(Ordering::Acquire),
+                client.wires.generation.load(Ordering::Acquire),
                 before + 1,
                 "round {round}: the expired connection is replaced once"
             );
         }
     }
 
-    /// 连接用到了最长时间：它上面还在等的查询照样在它上面拿到回答，接着的查询走新连接；最晚的期限过了以后旧连接关掉。
-    /// 以前到期就复位，在途的查询一起失败（`send` 的透明重试会再发一遍，`send_attempt` 看得出来）
+    /// 连接用到了最长时间：它上面还在等的查询照样在它上面拿到回答，接着的查询走新连接；最晚的期限过了以后旧连接关掉
     /// A connection reaching its max age: a query still waiting on it gets its answer there, and
-    /// the next query goes over a new one; past the latest deadline the old connection closes. It
-    /// used to be reset on the spot, failing the queries in flight together (sent again by the
-    /// transparent retry of `send`, which `send_attempt` shows)
+    /// the next query goes over a new one; past the latest deadline the old connection closes
     #[tokio::test]
     async fn a_query_in_flight_outlives_its_connection_reaching_max_age() {
         let (addr, mut closed) = upstream_noting_closes(None).await;
-        let client = TcpMuxClient::new(Arc::from(addr.to_string()));
-        // 期限短一些：旧连接要等登记在它上面最晚的那个期限 / A short deadline: the old connection waits
-        // for the latest deadline registered on it
-        client
-            .send(&udp_test_query("warm.example"), Duration::from_millis(300))
-            .await
-            .expect("a fresh connection answers");
-        let old = client.generation.load(Ordering::Acquire);
+        let client = TcpMuxClient::with_shared(
+            Bootstrap::system(),
+            Arc::from(addr.to_string()),
+            Aging {
+                max_age: Some(Duration::from_millis(50)),
+                ..Aging::for_tests()
+            },
+        );
         let mid = udp_test_query("mid.example");
         let (waited, ()) = tokio::join!(
             client.send_attempt(&mid, Duration::from_millis(500)),
             async {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                client.conn_create_time.store(
-                    unix_time_millis() - 2 * StreamHealth::default().max_age_ms,
-                    Ordering::Release,
-                );
-                client.last_health_check_time.store(0, Ordering::Relaxed);
+                // 上游 100 毫秒后才答 `mid`，连接 50 毫秒就用到了最长时间 / The upstream answers `mid`
+                // after 100 ms, and the connection reaches its max age at 50 ms
+                tokio::time::sleep(Duration::from_millis(70)).await;
+                let old = client.wires.generation.load(Ordering::Acquire);
+                assert!(!client.connected(), "taken out at its max age");
                 client
                     .send_attempt(&udp_test_query("next.example"), Duration::from_secs(2))
                     .await
                     .expect("a new connection answers");
-                assert_eq!(client.generation.load(Ordering::Acquire), old + 1);
+                assert_eq!(client.wires.generation.load(Ordering::Acquire), old + 1);
             }
         );
         waited.expect("the query on the aged connection is answered on it");
@@ -7723,12 +7692,50 @@ mod tests {
             .expect("a close noted");
     }
 
+    /// 连接活了多久按单调时钟算，系统时间被往回调也照样到最长时间就摘下：这里 tokio 的钟走了 20 秒，墙上的钟几乎没动
+    /// How long a connection has lived counts on the monotonic clock, so it is taken out at its max
+    /// age however the system time is set back: here tokio's clock moves 20 seconds on while the
+    /// wall clock hardly moves at all
+    #[tokio::test]
+    async fn a_connection_ages_on_the_monotonic_clock() {
+        let addr = spawn_stream_upstream(None).await;
+        let client = TcpMuxClient::with_shared(
+            Bootstrap::system(),
+            Arc::from(addr.to_string()),
+            Aging {
+                max_age: Some(Duration::from_secs(10)),
+                ..Aging::for_tests()
+            },
+        );
+        client
+            .send(&udp_test_query("warm.example"), Duration::from_secs(2))
+            .await
+            .expect("a fresh connection answers");
+        let old = client.wires.generation.load(Ordering::Acquire);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        // 让写入任务跑一跑，到了时候它就把连接摘下 / Let the writer run: when the time has come it takes
+        // the connection out
+        for _ in 0..100 {
+            if !client.connected() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        client
+            .send(&udp_test_query("next.example"), Duration::from_secs(2))
+            .await
+            .expect("a new connection answers");
+        assert_eq!(client.wires.generation.load(Ordering::Acquire), old + 1);
+    }
+
     /// 拆连接的决定点名一代：点的那一代已经换成新连接时，什么都不动。新连接照常用，等在它上面的查询不受影响，
-    /// 也没有多建一条。拆除的每条路都这样：直接复位、时限到了的查询复位、欠着的复位
+    /// 也没有多建一条。拆除的每条路都这样：复位、读写失败时的拆除
     /// A decision to tear a connection down names a generation, and does nothing once that
     /// generation has been replaced: the new connection goes on being used, a query waiting on
     /// it is untouched, and no further connection is made. So for every way of tearing down: a
-    /// plain reset, the reset of a query past its deadline, an owed reset
+    /// reset, the teardown after a failed read or write
     #[tokio::test]
     async fn a_teardown_naming_a_replaced_connection_leaves_the_new_one_alone() {
         let client = tcp_test_client().await;
@@ -7737,63 +7744,32 @@ mod tests {
         ask("warm.example")
             .await
             .expect("a fresh connection answers");
-        let old = client.generation.load(Ordering::Acquire);
-        assert!(
-            client.reset(old).await,
-            "the connection it names is torn down"
-        );
-        assert!(!client.reset(old).await, "torn down already");
+        let old = client.wires.generation.load(Ordering::Acquire);
+        assert!(client.reset(old), "the connection it names is torn down");
+        assert!(!client.reset(old), "torn down already");
         ask("again.example")
             .await
             .expect("a new connection answers");
-        let new = client.generation.load(Ordering::Acquire);
+        let new = client.wires.generation.load(Ordering::Acquire);
         assert_eq!(new, old + 1);
 
         // 新连接上有一个查询在等（上游 100 毫秒后才答）/ A query waits on the new connection (the
         // upstream answers after 100 ms)
         let (waiting, ()) = tokio::join!(ask("mid.example"), async {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            assert!(!client.reset(old).await);
-            client.reset_after_deadline(old).await;
-            let why = "stale";
-            assert!(!TcpMuxClient::close(&client.pending, &client.conn, old, why).await);
-            // 欠着拆旧的那一代：下一次建连去拆，拆不到新连接，账销掉
-            // The old generation owed a teardown: the next connect goes to do it, cannot reach
-            // the new connection, and the debt is cleared
-            client.reset_owed.store(old, Ordering::Release);
+            assert!(!client.reset(old));
+            assert!(!TcpMuxClient::close(&client.wires, old, "stale"));
             ask("next.example")
                 .await
                 .expect("the same connection answers");
-            assert_eq!(client.reset_owed.load(Ordering::Acquire), 0);
         });
         waiting.expect("the query on the new connection is answered");
-        assert_eq!(client.generation.load(Ordering::Acquire), new);
+        assert_eq!(client.wires.generation.load(Ordering::Acquire), new);
     }
 
-    /// 时限到了的查询要拆连接、锁却被别人拿着时，记下欠着拆的是它登记的那一代；下一次建连拆的就是这一代
-    /// A query past its deadline that cannot take the lock notes the generation it registered on
-    /// as owed, and that generation is what the next connect tears down
-    #[tokio::test]
-    async fn an_owed_reset_names_the_generation_the_query_was_on() {
-        let client = tcp_test_client().await;
-        client
-            .send(&udp_test_query("warm.example"), Duration::from_secs(2))
-            .await
-            .expect("a fresh connection answers");
-        let generation = client.generation.load(Ordering::Acquire);
-        {
-            let _held = client.conn.lock().await;
-            client.reset_after_deadline(generation).await;
-        }
-        assert_eq!(client.reset_owed.load(Ordering::Acquire), generation);
-        client
-            .send(&udp_test_query("after.example"), Duration::from_secs(2))
-            .await
-            .expect("a new connection answers");
-        assert_eq!(client.generation.load(Ordering::Acquire), generation + 1);
-        assert_eq!(client.reset_owed.load(Ordering::Acquire), 0);
-    }
-
+    /// 握手被压住 250 ms、回答再等 250 ms：300 ms 预算的请求不跑满 500 ms，到时限就失败
+    /// A handshake held back 250 ms and an answer after another 250 ms: a request with a 300 ms
+    /// budget does not run the full 500 ms but fails at its limit
     #[tokio::test]
     async fn doq_handshake_and_answer_share_one_budget() {
         let (server, client_tls) = localhost_tls(&[b"doq"]);
@@ -8194,12 +8170,12 @@ mod tests {
         kept_then_dropped(&mut closed, |keep| mux.retain_upstreams(|_| keep)).await;
     }
 
-    /// 连接池里的客户端用的是建多路复用器时给的健康设置：连接最长存活（把连接的出生时间往前拨 2 秒，下一次发送的健康
-    /// 检查让设成 1 秒的旧连接关掉）、空闲时长（设成 1 秒的连接不再有查询时自己关掉）
-    /// A pool's clients take the health settings the multiplexer was built with: the longest a
-    /// connection may live (with its birth wound back 2 seconds, the next send's health check has
-    /// the old connection, given 1 second, close) and how long it may sit idle (given 1 second,
-    /// it closes by itself once no query comes)
+    /// 连接池里的客户端用的是建多路复用器时给的老化设置：连接最长存活（设成 1 秒的连接到时候自己摘下、关掉，不等下一个
+    /// 查询来看）、空闲时长（设成 1 秒的连接不再有查询时自己关掉）
+    /// A pool's clients take the aging the multiplexer was built with: the longest a connection
+    /// may live (given 1 second, it takes itself out and closes when the time comes, with no next
+    /// query to look) and how long it may sit idle (given 1 second, it closes by itself once no
+    /// query comes)
     #[tokio::test]
     async fn pool_clients_take_the_configured_health_settings() {
         let query = udp_test_query("a.example");
@@ -8211,17 +8187,9 @@ mod tests {
         mux.send(&query, &upstream, Duration::from_millis(300))
             .await
             .expect("the upstream answers");
-        let client = &mux.get_or_init_pool_for_test(&upstream).clients[0];
-        client
-            .conn_create_time
-            .store(unix_time_millis() - 2_000, Ordering::Release);
-        client.last_health_check_time.store(0, Ordering::Relaxed);
-        mux.send(&query, &upstream, Duration::from_secs(2))
+        timeout(Duration::from_secs(3), closed.recv())
             .await
-            .expect("the upstream answers again");
-        timeout(Duration::from_secs(2), closed.recv())
-            .await
-            .expect("the health check closes the old connection");
+            .expect("past its max age and its deadline, it closes with no query coming");
 
         let mux = TcpMultiplexer::new(1, 0, 1, Bootstrap::system());
         let (addr, mut closed) = upstream_noting_closes(None).await;
@@ -8262,9 +8230,9 @@ mod tests {
         let client = DotMuxClient::with_shared(
             (Arc::new(client_tls), Bootstrap::system()),
             Arc::from(format!("dot://{addr}?sni=localhost")),
-            StreamHealth {
-                idle_timeout_ms: 100,
-                ..StreamHealth::default()
+            Aging {
+                idle: Some(Duration::from_millis(100)),
+                ..Aging::for_tests()
             },
         );
         client
@@ -8276,7 +8244,7 @@ mod tests {
             .expect("the idle connection closes with no query coming")
             .expect("the upstream says how");
         assert!(clean, "closed with close_notify");
-        assert!(client.conn.lock().await.is_none(), "the slot is cleared");
+        assert!(!client.connected(), "the slot is cleared");
     }
 
     /// 新建的连接答了一些查询就被上游关掉，没答的查询换一条新连接重发（RFC 7766 §6.2.1.1）。以前只看连接是不是这次之前
@@ -8361,6 +8329,43 @@ mod tests {
             .map(|client| client.pooled.load().is_some())
             .collect();
         assert_eq!(connected, [true, false, false, false]);
+    }
+
+    /// QUIC 的保活让上游看这条连接一直在用；没人用了它照样关：最后一个查询的期限过后空闲满时限，从池里拿掉、关掉，不等下一个
+    /// 查询来看
+    /// QUIC's keepalive has the upstream see this connection in use all along; once nobody uses it
+    /// it closes all the same: idle its limit past the last query's deadline, it is taken out of
+    /// the pool and closed, with no next query to look
+    #[tokio::test]
+    async fn an_unused_doq_connection_closes_once_idle_despite_its_keepalive() {
+        let (server, client_tls) = localhost_tls(&[b"doq"]);
+        let (closed_tx, mut closed) = tokio::sync::mpsc::unbounded_channel();
+        let addr = spawn_doq_upstream_on(
+            "127.0.0.1:0".parse().unwrap(),
+            server,
+            Duration::ZERO,
+            |_, _| DoqReply::Answer(Duration::ZERO),
+            Some(closed_tx),
+        )
+        .expect("bind the DoQ test upstream");
+        let aging = Aging {
+            idle: Some(Duration::from_millis(200)),
+            ..Aging::for_tests()
+        };
+        let client = DoqMuxClient::new(
+            Arc::from(format!("{addr}?sni=localhost")),
+            doq_runtime_aging(client_tls, false, Bootstrap::system(), 50, aging),
+            Arc::new(AtomicBool::new(false)),
+        );
+        client
+            .send(&udp_test_query("a.example"), Duration::from_millis(100))
+            .await
+            .expect("the upstream answers");
+        timeout(Duration::from_secs(2), closed.recv())
+            .await
+            .expect("idle past the last deadline, it closes with no query coming")
+            .expect("a close noted");
+        assert!(client.pooled.load().is_none(), "taken out of the pool");
     }
 
     #[tokio::test]
