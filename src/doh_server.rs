@@ -581,8 +581,10 @@ fn extract_get_dns_param(query: &str) -> Option<Bytes> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     for pair in query.split('&') {
         if let Some(val) = pair.strip_prefix("dns=") {
-            // 解码出来比 MAX_QUERY_LEN 长的不解码 / One that would decode longer than MAX_QUERY_LEN is not decoded
-            if val.len() > MAX_QUERY_LEN.div_ceil(3) * 4 {
+            // 不带填充的 base64url 把 n 字节写成 ⌈4n/3⌉ 个字符，比 MAX_QUERY_LEN 字节写出来还长的值不解码，上限和 POST、
+            // UDP、TCP 一样 / Unpadded base64url writes n bytes in ⌈4n/3⌉ characters; a value longer than
+            // the encoding of MAX_QUERY_LEN bytes is not decoded, the limit POST, UDP and TCP have
+            if val.len() > (MAX_QUERY_LEN * 4).div_ceil(3) {
                 return None;
             }
             let decoded = URL_SAFE_NO_PAD.decode(val).ok()?;
@@ -719,6 +721,26 @@ mod tests {
     #[test]
     fn test_extract_get_dns_param_invalid_base64() {
         assert!(extract_get_dns_param("dns=!!!invalid").is_none());
+    }
+
+    /// GET 收的查询和 POST、UDP、TCP 一样最长 `MAX_QUERY_LEN` 字节：不带填充的 base64url 写成 5462 个字符的 4096 字节
+    /// 照收，多一个字节的就不解码
+    /// A GET query is at most `MAX_QUERY_LEN` bytes, as over POST, UDP and TCP: 4096 bytes,
+    /// which unpadded base64url writes in 5462 characters, are taken, and one byte more is not
+    /// decoded
+    #[test]
+    fn a_get_query_is_decoded_up_to_max_query_len() {
+        let encode = |len: usize| {
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![0; len]);
+            format!("dns={encoded}")
+        };
+        let longest = encode(MAX_QUERY_LEN);
+        assert_eq!(longest.len() - "dns=".len(), 5462);
+        let decoded = extract_get_dns_param(&longest).expect("4096 bytes are decoded");
+        assert_eq!(decoded.len(), MAX_QUERY_LEN);
+        for len in [MAX_QUERY_LEN + 1, MAX_QUERY_LEN + 2] {
+            assert!(extract_get_dns_param(&encode(len)).is_none(), "{len} bytes");
+        }
     }
 
     #[test]
