@@ -1,15 +1,15 @@
-//! 「是不是内网地址」在两处各多算一些：255.255.255.255 只在 `geoip_private` 这边算，其他不可全球路由的网段只在
-//! ECS 那边算（见 `ecs_scope_tests`）。这里固定 `geoip_private` 这边的两条路：客户端的来源地址，和应答里的地址。
-//! Whether an address is on a local network counts some more in each of two places:
-//! 255.255.255.255 only for `geoip_private`, the other ranges that are not globally routable
-//! only on the ECS side (see `ecs_scope_tests`). This pins the two paths of `geoip_private`:
-//! the client's source address and the addresses in an answer.
+//! 「是不是内网地址」只有一份，`geoip_private` 和 ECS 都用它（见 `geoip::is_private_ip`；ECS 另外再算本地用的转换前缀，
+//! 见 `ecs_scope_tests`）。这里固定 `geoip_private` 这边的两条路：客户端的来源地址，和应答里的地址。
+//! Whether an address is on a local network is one list, which `geoip_private` and ECS both
+//! use (see `geoip::is_private_ip`; ECS counts the local-use translation prefix more, see
+//! `ecs_scope_tests`). This pins the two paths of `geoip_private`: the client's source address
+//! and the addresses in an answer.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use serde_json::json;
 
@@ -33,34 +33,37 @@ fn peer(client: &str) -> SocketAddr {
     format!("{client}:53000").parse().unwrap()
 }
 
-/// `geoip_private` 把 0.0.0.0 和 255.255.255.255 都当作内网地址，来源地址和应答里的地址都这样。以前 0.0.0.0 不算：
-/// 上游回 0.0.0.0（在 Linux、macOS 上连过去就是本机）时，防重绑定的规则放过了它
-/// `geoip_private` counts 0.0.0.0 and 255.255.255.255 as local network addresses, for the
-/// source address and for the addresses in an answer alike. 0.0.0.0 used not to count: an
-/// upstream answering it (which reaches this machine on Linux and macOS) got past
-/// anti-rebinding rules
+/// `geoip_private` 的两条路，来源地址和应答里的地址，按同一份内网地址判断：0.0.0.0、255.255.255.255，运营商级 NAT 和
+/// Tailscale 的 100.64.0.0/10，嵌着内网地址的 NAT64 地址都算；公网地址和嵌着公网地址的 NAT64 地址（DNS64 的寻常回答）
+/// 不算。以前 0.0.0.0 不算：上游回 0.0.0.0（在 Linux、macOS 上连过去就是本机）时，防重绑定的规则放过了它；100.64.0.0/10
+/// 和 NAT64 地址也都不算
+/// Both paths of `geoip_private`, the source address and the addresses in an answer, judge by
+/// the one list of local network addresses: 0.0.0.0, 255.255.255.255, carrier-grade NAT's and
+/// Tailscale's 100.64.0.0/10, and NAT64 addresses embedding a local one count; public
+/// addresses and NAT64 addresses embedding a public one (an ordinary DNS64 answer) do not.
+/// 0.0.0.0 used not to count: an upstream answering it (which reaches this machine on Linux
+/// and macOS) got past anti-rebinding rules; nor did 100.64.0.0/10 or NAT64 addresses
 #[tokio::test]
-async fn geoip_private_counts_0_0_0_0_and_255_255_255_255() {
-    // 上游回问题名第一个标签写的地址：zero 回 0.0.0.0，broadcast 回 255.255.255.255
-    // The upstream answers the address the first label names: zero 0.0.0.0, broadcast
-    // 255.255.255.255
+async fn geoip_private_counts_every_local_network_address() {
+    // 上游回问题名第一个标签说的地址 / The upstream answers the address the first label names
     let up = support::upstream(|query| {
         let Some(question) = query.queries.first() else {
             return Vec::new();
         };
-        let address = if question.name().to_ascii().starts_with("zero.") {
-            Ipv4Addr::UNSPECIFIED
-        } else {
-            Ipv4Addr::BROADCAST
+        let name = question.name().to_ascii();
+        let label = name.split('.').next().unwrap_or_default();
+        let data = match label {
+            "zero" => RData::A(A(Ipv4Addr::UNSPECIFIED)),
+            "broadcast" => RData::A(A(Ipv4Addr::BROADCAST)),
+            "cgnat" => RData::A(A(Ipv4Addr::new(100, 64, 1, 1))),
+            "nat64" => RData::AAAA(AAAA("64:ff9b::c0a8:101".parse().unwrap())),
+            "dns64" => RData::AAAA(AAAA("64:ff9b::808:808".parse().unwrap())),
+            _ => RData::A(A(Ipv4Addr::new(8, 8, 8, 8))),
         };
         let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
         reply.metadata.recursion_desired = query.metadata.recursion_desired;
         reply.add_query(question.clone());
-        reply.add_answer(Record::from_rdata(
-            question.name().clone(),
-            300,
-            RData::A(A(address)),
-        ));
+        reply.add_answer(Record::from_rdata(question.name().clone(), 300, data));
         vec![(std::time::Duration::ZERO, reply.to_vec().unwrap())]
     })
     .await;
@@ -93,26 +96,29 @@ async fn geoip_private_counts_0_0_0_0_and_255_255_255_255() {
     }));
     let answer = |reply: bytes::Bytes| first_a(&reply);
     // 客户端的来源地址 / The client's source address
-    let public = peer("198.51.100.7");
-    assert_eq!(
-        answer(support::ask(&engine, &query("client.test."), public).await),
-        Some(PUBLIC_CLIENT)
-    );
-    assert_eq!(
-        answer(support::ask(&engine, &query("client.test."), peer("0.0.0.0")).await),
-        Some(PRIVATE_CLIENT)
-    );
-    assert_eq!(
-        answer(support::ask(&engine, &query("client.test."), peer("255.255.255.255")).await),
-        Some(PRIVATE_CLIENT)
-    );
+    for (client, expected) in [
+        ("198.51.100.7", PUBLIC_CLIENT),
+        ("0.0.0.0", PRIVATE_CLIENT),
+        ("255.255.255.255", PRIVATE_CLIENT),
+        ("100.100.100.100", PRIVATE_CLIENT),
+    ] {
+        assert_eq!(
+            answer(support::ask(&engine, &query("client.test."), peer(client)).await),
+            Some(expected),
+            "{client}"
+        );
+    }
     // 应答里的地址 / The address in an answer
-    assert_eq!(
-        answer(support::ask(&engine, &query("zero.answer.test."), public).await),
-        Some(PRIVATE_ANSWER)
-    );
-    assert_eq!(
-        answer(support::ask(&engine, &query("broadcast.answer.test."), public).await),
-        Some(PRIVATE_ANSWER)
-    );
+    let public = peer("198.51.100.7");
+    for (label, private) in [
+        ("zero", true),
+        ("broadcast", true),
+        ("cgnat", true),
+        ("nat64", true),
+        ("dns64", false),
+        ("public", false),
+    ] {
+        let reply = support::ask(&engine, &query(&format!("{label}.answer.test.")), public).await;
+        assert_eq!(answer(reply) == Some(PRIVATE_ANSWER), private, "{label}");
+    }
 }

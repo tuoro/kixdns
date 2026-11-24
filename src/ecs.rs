@@ -286,40 +286,18 @@ fn strip_ecs(packet: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Check if an IP address is private/internal (RFC 1918, ULA, loopback, link-local).
-/// 检查 IP 地址是否为私有/内网地址 (RFC 1918, ULA, loopback, link-local)。
-///
-/// Private addresses must never be leaked via ECS.
-/// 私有地址绝不能通过 ECS 泄露。
+/// ECS 不带给上游的客户端地址：`geoip_private` 算作内网的那些（见 `geoip::is_private_ip`，两边只用这一份），再加上
+/// 本地用的转换前缀 64:ff9b:1::/48（RFC 8215）整个：它不可全球路由，不论嵌着哪个 IPv4 地址，拿它算出的子网都说明不了
+/// 客户端在哪里。`geoip_private` 那边只看它嵌着的地址：嵌着公网地址的是 DNS64 的寻常回答，不算内网
+/// The client addresses ECS does not carry upstream: those `geoip_private` counts as local
+/// network ones (see `geoip::is_private_ip`, the one list both use), and the local-use
+/// translation prefix 64:ff9b:1::/48 (RFC 8215) whole: it is not globally routable, and
+/// whatever IPv4 address it embeds, a subnet worked out from it says nothing about where the
+/// client is. `geoip_private` looks at the address it embeds alone: one embedding a public
+/// address is an ordinary DNS64 answer, no local one
 pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
-    crate::matcher::geoip::is_local_network(*ip) || not_globally_routable(ip)
-}
-
-/// 不可全球路由、又不在 `is_local_network` 里的网段（RFC 6890）：拿它们算出的子网说明不了客户端在哪里，还把
-/// 内部编址漏给上游
-/// Ranges that are not globally routable yet not in `is_local_network` (RFC 6890): a
-/// subnet worked out from them says nothing about where the client is, and leaks internal
-/// addressing upstream
-fn not_globally_routable(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let [a, b, c, _] = v4.octets();
-            // 运营商级 NAT 共享地址 100.64.0.0/10 / Shared address space 100.64.0.0/10 (RFC 6598)
-            (a == 100 && (b & 0xC0) == 64)
-                // IETF 协议分配 192.0.0.0/24 / IETF protocol assignments 192.0.0.0/24 (RFC 6890)
-                || (a == 192 && b == 0 && c == 0)
-                // 基准测试 198.18.0.0/15 / Benchmarking 198.18.0.0/15 (RFC 2544)
-                || (a == 198 && (b & 0xFE) == 18)
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            // 丢弃前缀 100::/64 / Discard-only prefix 100::/64 (RFC 6666)
-            (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0)
-                // 本地用的 IPv4/IPv6 转换前缀 64:ff9b:1::/48 / Local-use IPv4/IPv6 translation
-                // prefix 64:ff9b:1::/48 (RFC 8215)
-                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
-        }
-    }
+    crate::matcher::geoip::is_private_ip(*ip)
+        || matches!(ip, IpAddr::V6(v6) if v6.segments()[..3] == [0x64, 0xff9b, 1])
 }
 
 // ============================================================================
@@ -836,10 +814,20 @@ mod tests {
         assert!(is_private_ip(&"fd00::1".parse::<IpAddr>().unwrap()));
         assert!(is_private_ip(&"fe80::1".parse::<IpAddr>().unwrap()));
 
+        // 运营商级 NAT、站点本地，和本地用的转换前缀里嵌着公网地址的 / Carrier-grade NAT, site-local,
+        // and the local-use translation prefix embedding a public address
+        for address in ["100.64.0.1", "fec0::1", "64:ff9b:1::808:808"] {
+            assert!(is_private_ip(&address.parse().unwrap()), "{address}");
+        }
+
         // Public v6
         assert!(!is_private_ip(
             &"2001:4860:4860::8888".parse::<IpAddr>().unwrap()
         ));
+        assert!(!is_private_ip(&"64:ff9b::808:808".parse().unwrap()));
+        // fake-ip 的默认网段，和 `geoip_private` 一样不算 / fake-ip's default range, not counted, as
+        // for `geoip_private`
+        assert!(!is_private_ip(&"198.18.0.1".parse().unwrap()));
         assert!(!is_private_ip(
             &"2606:4700::1111".parse::<IpAddr>().unwrap()
         ));

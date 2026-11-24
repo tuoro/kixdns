@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -776,45 +776,140 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-/// `geoip_private` 和 ECS 都算作内网的地址：IPv4 的 RFC 1918 私有网段、回环、链路本地、「本网络」0.0.0.0/8，
-/// IPv6 的回环、未指定地址、ULA（fc00::/7）、链路本地（fe80::/10）。0.0.0.0/8 和 `::` 一样不是哪台主机的地址
-/// （RFC 791），连 0.0.0.0 在 Linux、macOS 上连的是本机，回答它和回答 127.0.0.1 一样能拿来重绑定。两边各自
-/// 再多算一些，见 [`is_private_ip`] 和 `ecs::is_private_ip`
-/// The addresses both `geoip_private` and ECS count as local network ones: for IPv4 the
-/// RFC 1918 private networks, loopback, link-local and "this network" 0.0.0.0/8; for IPv6
-/// loopback, the unspecified address, ULA (fc00::/7) and link-local (fe80::/10). Like `::`,
-/// 0.0.0.0/8 is no host's address (RFC 791), and connecting to 0.0.0.0 reaches this machine
-/// on Linux and macOS, so an answer of it rebinds as one of 127.0.0.1 does. Each side counts
-/// some more of its own, see [`is_private_ip`] and `ecs::is_private_ip`
+/// `geoip_private`、`response_answer_ip_geoip_private` 和 ECS 都算作内网的地址，只有这一份（ECS 另外再算一个转换前缀，见
+/// `ecs::is_private_ip`）。连过去到的是本机、本地网络或运营商的内部网络，或者哪儿也到不了的地址：
+/// - IPv4：RFC 1918 私有网段，运营商级 NAT 的共享地址 100.64.0.0/10（RFC 6598，Tailscale 也用它），回环，链路本地，
+///   「本网络」0.0.0.0/8，IETF 协议分配 192.0.0.0/24（RFC 6890，DS-Lite 等的内部地址），受限广播 255.255.255.255。
+///   0.0.0.0/8 和 `::` 一样不是哪台主机的地址（RFC 791），连 0.0.0.0 在 Linux、macOS 上连的是本机，回答它和回答
+///   127.0.0.1 一样能拿来重绑定
+/// - IPv6：回环，未指定地址，ULA（fc00::/7），链路本地（fe80::/10），已废弃、仍有内网在用的站点本地（fec0::/10，
+///   RFC 3879），丢弃前缀 100::/64（RFC 6666）
+/// - NAT64 地址（64:ff9b::/96，RFC 6052；本地用的 64:ff9b:1::/48，RFC 8215）按它末 32 位嵌着的 IPv4 地址判断（/96
+///   的写法）：连过去，转换网关连的就是那个 IPv4 地址，嵌着内网地址的照样能拿来重绑定，嵌着公网地址的是 DNS64 的
+///   寻常回答
+///
+/// 基准测试的 198.18.0.0/15（RFC 2544）不算：它是 Clash、mihomo 等 fake-ip 的默认网段，算进去的话，转给 fake-ip 上游的
+/// 查询，回答都会被防重绑定的规则拦下。文档用的网段（192.0.2.0/24 这些）也不算：不可全球路由，却也不在哪个内网里
+/// The addresses `geoip_private`, `response_answer_ip_geoip_private` and ECS count as local
+/// network ones, this one list alone (ECS counts one translation prefix more, see
+/// `ecs::is_private_ip`). Connecting to them reaches this machine, the local network or the
+/// operator's internal network, or nowhere at all:
+/// - IPv4: the RFC 1918 private networks, carrier-grade NAT's shared space 100.64.0.0/10
+///   (RFC 6598, which Tailscale uses too), loopback, link-local, "this network" 0.0.0.0/8,
+///   the IETF protocol assignments 192.0.0.0/24 (RFC 6890, internal addresses of DS-Lite and
+///   the like), and limited broadcast 255.255.255.255. Like `::`, 0.0.0.0/8 is no host's
+///   address (RFC 791), and connecting to 0.0.0.0 reaches this machine on Linux and macOS, so
+///   an answer of it rebinds as one of 127.0.0.1 does
+/// - IPv6: loopback, the unspecified address, ULA (fc00::/7), link-local (fe80::/10),
+///   site-local (fec0::/10, RFC 3879), deprecated yet still used on internal networks, and the
+///   discard-only prefix 100::/64 (RFC 6666)
+/// - NAT64 addresses (64:ff9b::/96, RFC 6052; the local-use 64:ff9b:1::/48, RFC 8215) count
+///   by the IPv4 address their last 32 bits embed (the /96 format): connecting to one, the
+///   translator connects to that IPv4 address, so one embedding a local address rebinds all
+///   the same, while one embedding a public address is an ordinary DNS64 answer
+///
+/// Benchmarking's 198.18.0.0/15 (RFC 2544) does not count: it is the default fake-ip range of
+/// Clash, mihomo and the like, and counted, every answer to a query forwarded to a fake-ip
+/// upstream would be stopped by anti-rebinding rules. Nor do the documentation networks
+/// (192.0.2.0/24 and the like): not globally routable, yet not on any local network either
 #[inline]
-pub(crate) fn is_local_network(ip: IpAddr) -> bool {
+pub fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.octets()[0] == 0
-        }
+        IpAddr::V4(v4) => is_private_v4(v4),
         IpAddr::V6(v6) => {
+            let segments = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unique_local()
                 || v6.is_unicast_link_local()
+                || segments[0] & 0xffc0 == 0xfec0
+                || segments[..4] == [0x0100, 0, 0, 0]
+                || nat64_ipv4(v6).is_some_and(is_private_v4)
         }
     }
 }
 
-/// `geoip_private` 匹配器眼里的内网地址 / A local network address as `geoip_private` sees it
-#[inline]
-pub fn is_private_ip(ip: IpAddr) -> bool {
-    // 受限广播地址 255.255.255.255 只在本链路上发、出不了本地网络，所以 geoip_private 一直把它
-    // 算作内网地址；ECS 那边不算（见 `ecs::is_private_ip`）
-    // The limited broadcast address 255.255.255.255 only goes out on the local link and
-    // never leaves the local network, so geoip_private has always counted it as a local
-    // one; ECS does not (see `ecs::is_private_ip`)
-    is_local_network(ip) || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
+/// [`is_private_ip`] 的 IPv4 部分 / The IPv4 part of [`is_private_ip`]
+fn is_private_v4(v4: Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || a == 0
+        || (a == 100 && b & 0xc0 == 64)
+        || (a == 192 && b == 0 && c == 0)
+}
+
+/// NAT64 地址（64:ff9b::/96、64:ff9b:1::/48）末 32 位嵌着的 IPv4 地址 / The IPv4 address the last 32
+/// bits of a NAT64 address (64:ff9b::/96, 64:ff9b:1::/48) embed
+fn nat64_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = v6.segments();
+    (segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || segments[..3] == [0x64, 0xff9b, 1])
+        .then(|| Ipv4Addr::from_bits(v6.to_bits() as u32))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 内网地址只有一份：私有网段、运营商级 NAT 和 Tailscale 的 100.64.0.0/10、192.0.0.0/24、回环、链路本地、0.0.0.0/8、
+    /// 广播，IPv6 的 ULA、链路本地、站点本地 fec0::/10、丢弃前缀 100::/64；NAT64 地址按末 32 位嵌着的 IPv4 地址判断。
+    /// 各网段两边的边界都看。fake-ip 的 198.18.0.0/15 不算。以前 100.64.0.0/10、192.0.0.0/24、100::/64 只有 ECS 算，
+    /// fec0::/10 和嵌着内网地址的 NAT64 地址哪边都不算，防重绑定的规则放过了 Tailscale 和运营商级 NAT 的地址
+    /// One list of local network addresses: the private networks, carrier-grade NAT's and
+    /// Tailscale's 100.64.0.0/10, 192.0.0.0/24, loopback, link-local, 0.0.0.0/8 and broadcast,
+    /// and in IPv6 ULA, link-local, site-local fec0::/10 and the discard-only 100::/64; a NAT64
+    /// address counts by the IPv4 address its last 32 bits embed. Each range is checked at both
+    /// of its edges. fake-ip's 198.18.0.0/15 does not count. 100.64.0.0/10, 192.0.0.0/24 and
+    /// 100::/64 used to count for ECS alone, and fec0::/10 and NAT64 addresses embedding a local
+    /// one for neither, so anti-rebinding rules let Tailscale and carrier-grade NAT addresses
+    /// through
+    #[test]
+    fn local_network_addresses_are_one_list() {
+        for (address, local) in [
+            ("10.1.2.3", true),
+            ("172.31.255.255", true),
+            ("192.168.1.1", true),
+            ("127.0.0.1", true),
+            ("169.254.1.1", true),
+            ("0.1.2.3", true),
+            ("255.255.255.255", true),
+            ("100.64.0.0", true),
+            ("100.100.100.100", true),
+            ("100.127.255.255", true),
+            ("100.63.255.255", false),
+            ("100.128.0.0", false),
+            ("192.0.0.8", true),
+            ("192.0.1.0", false),
+            ("198.18.0.1", false),
+            ("198.19.255.255", false),
+            ("192.0.2.1", false),
+            ("203.0.113.1", false),
+            ("8.8.8.8", false),
+            ("::", true),
+            ("::1", true),
+            ("fd00::1", true),
+            ("fe80::1", true),
+            ("fec0::1", true),
+            ("feff:ffff::1", true),
+            ("ff02::1", false),
+            ("100::1", true),
+            ("100:0:0:1::1", false),
+            ("64:ff9b::c0a8:101", true),
+            ("64:ff9b::7f00:1", true),
+            ("64:ff9b::808:808", false),
+            ("64:ff9b:1::a00:1", true),
+            ("64:ff9b:1:ab::6440:1", true),
+            ("64:ff9b:1::808:808", false),
+            ("64:ff9b:0:0:0:1:a00:1", false),
+            ("64:ff9b:2::a00:1", false),
+            ("2001:db8::1", false),
+            ("2606:4700::1111", false),
+        ] {
+            assert_eq!(is_private_ip(address.parse().unwrap()), local, "{address}");
+        }
+    }
 
     /// 构造 V2Ray .dat 格式的 protobuf 字节（含 v4 和/或 v6 CIDR）
     /// Build V2Ray .dat protobuf bytes (with v4 and/or v6 CIDRs)
