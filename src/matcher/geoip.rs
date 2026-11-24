@@ -120,9 +120,14 @@ impl GeoIpTagIndex {
     }
 }
 
-/// 一个数据文件解析出的 GeoIP 索引，已 finalize，尚未进入管理器
-/// GeoIP indexes parsed out of one data file, already finalised and not yet
-/// applied to a manager
+/// 一个数据文件解析出的 GeoIP 索引，尚未进入管理器。读取、解码、建索引、finalize 都在解析时、管理器的锁外做完，
+/// 调用方只在把它换进去时短暂持写锁（见 [`GeoIpManager::apply_parsed`]）。finalize 是整个重载里最重的一段：要排序
+/// 并合并每个标签的全部网段
+/// GeoIP indexes parsed out of one data file, not yet applied to a manager. Reading,
+/// decoding, building the indexes and finalising are all done while parsing, outside the
+/// manager's lock, and callers hold the write lock only while swapping them in (see
+/// [`GeoIpManager::apply_parsed`]). Finalising is the heaviest part of a reload: it sorts and
+/// merges every tag's networks
 pub struct ParsedGeoIp {
     tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex>,
     count: usize,
@@ -416,37 +421,22 @@ impl GeoIpManager {
         Ok(self.apply_parsed(parsed))
     }
 
-    /// 解析 .dat 文件里的每个标签，不触碰管理器状态；测试用，运行时只解析规则用到的（见 [`Self::parse_file`]）
-    /// Parse every tag of a .dat file without touching manager state; for tests, as at run time
-    /// only the tags rules use are parsed (see [`Self::parse_file`])
-    ///
-    /// 读取、解码、建索引、finalize 全在这里完成，与 [`Self::apply_parsed`]
-    /// 配合：调用方在锁外解析，只在替换数据时短暂持写锁。finalize 必须留在
-    /// 这一侧——它要排序并合并每个 tag 的全部网段，是整个重载里最重的一段，
-    /// 只把读取和解码搬出去拿不到多少。
-    /// Reading, decoding, building the indexes and finalising all happen here.
-    /// It pairs with [`Self::apply_parsed`]: callers parse outside the lock and
-    /// hold the write lock only while swapping data in. Finalising has to stay
-    /// on this side, since sorting and merging every tag's ranges is the
-    /// heaviest part of a reload and moving only the read and the decode would
-    /// leave most of it behind.
+    /// 解析 .dat 文件里的每个标签，测试用；运行时只解析规则用到的（见 [`Self::parse_file`]）
+    /// Parse every tag of a .dat file, for tests; at run time only the tags rules use are
+    /// parsed (see [`Self::parse_file`])
     #[cfg(test)]
     pub fn parse_dat_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
         Self::parse_dat_entries(path, &|_| true)
     }
 
-    /// 解析 .dat 文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）。按条目顺序读，不把整个
-    /// 文件读进内存：每个条目先只解国家代码，要的条目才整个解，一百多万个网段里规则只用到几个标签时，
-    /// 别的标签既不解也不留。
-    /// 使用 Google 标准 protobuf 库 (prost) 解码条目，与 dae pkg/geodata 对齐：手写 wire 解析假设
-    /// 字段顺序固定、无未知字段，任何 .dat 格式变体都会产生静默错位或错误网段。
+    /// 解析 .dat 文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）。顶层在这里一个个条目读，不把整个文件读进
+    /// 内存：每个条目先只解国家代码，要的条目才整个解，一百多万个网段里规则只用到几个标签时，别的标签既不解也不留。
+    /// 条目交给 prost 按 protobuf 的规矩解（见 `geoip_proto`）
     /// Parses the entries of a .dat file that `wanted` accepts (given the uppercase country code
-    /// or tag). The file is read entry by entry rather than into memory whole: each entry's
-    /// country code is decoded first and only wanted entries are decoded whole, so when rules use
-    /// a few tags out of over a million networks the other tags are neither decoded nor kept.
-    /// Entries are decoded with Google's standard protobuf library (prost), in line with dae's
-    /// pkg/geodata: hand-written wire parsing assumes a fixed field order and no unknown fields,
-    /// and any .dat variant would silently shift fields or yield wrong networks.
+    /// or tag). The top level is read here entry by entry rather than into memory whole: each
+    /// entry's country code is decoded first and only wanted entries are decoded whole, so when
+    /// rules use a few tags out of over a million networks the other tags are neither decoded
+    /// nor kept. Entries are decoded by protobuf's rules with prost (see `geoip_proto`)
     fn parse_dat_entries(
         path: &Path,
         wanted: &dyn Fn(&str) -> bool,
