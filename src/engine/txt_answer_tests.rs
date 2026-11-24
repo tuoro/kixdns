@@ -1,8 +1,8 @@
 //! 引擎自己编出来的 TXT 应答（静态 TXT、替换 TXT）整个报文都装得下，不管客户端带不带 EDNS、ECS；装不下时回
-//! SERVFAIL（见 `response::txt_size_problem`）。RDATA 里每段除了内容还有一个长度字节。
+//! SERVFAIL（见 `response::txt_problem`）。RDATA 里每段除了内容还有一个长度字节。
 //! A TXT answer the engine builds itself (a static TXT, a replaced TXT) fits a message whole,
 //! whether or not the client asked with EDNS and ECS, and is SERVFAIL when it does not (see
-//! `response::txt_size_problem`). In RDATA each segment has a length byte besides its content.
+//! `response::txt_problem`). In RDATA each segment has a length byte besides its content.
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::Duration;
@@ -13,7 +13,7 @@ use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
-use crate::engine::response::txt_size_problem;
+use crate::engine::response::txt_problem;
 use crate::engine::test_support::{answering_upstream, counting_settings, engine_from, peer};
 
 /// 问的名字，编码以后 8 字节 / The name asked, 8 bytes once encoded
@@ -122,11 +122,11 @@ fn the_longest_name_is_255_bytes_once_encoded() {
 /// and the room kept for an OPT and ECS: exactly [`ROOM`] fits, one byte more does not. Only
 /// the content used to count: 256 segments of 255 bytes (RDATA 65536) passed
 #[test]
-fn txt_size_problem_counts_length_bytes_against_the_whole_message() {
-    assert_eq!(txt_size_problem(&text_of_rdata(ROOM)), None);
-    assert!(txt_size_problem(&text_of_rdata(ROOM + 1)).is_some());
-    assert!(txt_size_problem(&vec!["a".repeat(255); 256]).is_some());
-    let long_segment = txt_size_problem(&["a".repeat(256)]).unwrap();
+fn txt_problem_counts_length_bytes_against_the_whole_message() {
+    assert_eq!(txt_problem(&text_of_rdata(ROOM)), None);
+    assert!(txt_problem(&text_of_rdata(ROOM + 1)).is_some());
+    assert!(txt_problem(&vec!["a".repeat(255); 256]).is_some());
+    let long_segment = txt_problem(&["a".repeat(256)]).unwrap();
     assert!(
         long_segment.contains("segment of 256 bytes"),
         "{long_segment}"
@@ -315,5 +315,67 @@ async fn a_request_phase_replace_txt_leaves_the_actions_after_it_to_run() {
         ));
         let answer = reply(&engine, &query.to_vec().unwrap()).await;
         assert_eq!(summary(&answer), answered, "{then}");
+    }
+}
+
+/// 一个字符串也没写的 TXT（`text: []`）配置检查报出来，静态的和替换的一样，作答时回 SERVFAIL；写成 `[""]` 的是一条空
+/// 的 TXT，照常作答。以前 `[]` 不报，编出 RDATA 为空的 TXT 记录，客户端整个应答都读不了
+/// A TXT written with no string (`text: []`) is named by the configuration check, static or
+/// replaced alike, and answers SERVFAIL; one written `[""]` is an empty TXT, answered as usual.
+/// `[]` used to pass, compiling to a TXT record with empty RDATA that left the client unable to
+/// read the whole answer
+#[tokio::test]
+async fn a_txt_with_no_string_is_a_problem_and_servfail() {
+    let upstream = answering_upstream(std::net::Ipv4Addr::new(192, 0, 2, 1), 300).await;
+    let rules = |text: Value| {
+        json!([
+            {
+                "name": "static",
+                "matchers": [{ "type": "domain_suffix", "value": "static.test" }],
+                "actions": [{ "type": "static_txt_response", "text": text }]
+            },
+            {
+                "name": "replaced",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream.address }],
+                "response_actions_on_match": [{ "type": "replace_txt_response", "text": text }]
+            }
+        ])
+    };
+    let problems = |text: Value| {
+        crate::config::problems(
+            &serde_json::from_value(json!({
+                "settings": { "default_upstream": "192.0.2.53:53" },
+                "pipelines": [{ "id": "main", "rules": rules(text) }]
+            }))
+            .unwrap(),
+        )
+    };
+    let said =
+        r#"text names no string; a TXT record holds at least one, write "" for an empty one"#;
+    assert_eq!(
+        problems(json!([])),
+        [
+            format!("pipelines[0].rules[0]: {said}"),
+            format!("pipelines[0].rules[1]: {said}")
+        ]
+    );
+    assert_eq!(problems(json!([""])), Vec::<String>::new());
+
+    for (text, answered) in [
+        (json!([]), (ResponseCode::ServFail, false, 0)),
+        (json!([""]), (ResponseCode::NoError, false, 1)),
+    ] {
+        let engine = engine_with(rules(text.clone()));
+        for name in ["a.static.test.", "a.replaced.test."] {
+            let mut query = Message::new(0x3636, MessageType::Query, OpCode::Query);
+            query.add_query(Query::query(
+                Name::from_ascii(name).unwrap(),
+                RecordType::TXT,
+            ));
+            let answer = reply(&engine, &query.to_vec().unwrap()).await;
+            assert_eq!(summary(&answer), answered, "{text} {name}");
+            Message::from_vec(&answer).expect("a reply the client can read");
+        }
     }
 }

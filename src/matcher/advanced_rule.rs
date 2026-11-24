@@ -105,12 +105,13 @@ impl StaticAnswer {
         })
     }
 
-    /// static_txt_response 和 replace_txt_response 的应答；按最长的名字算装不下时是 SERVFAIL（见
-    /// `engine::response::txt_size_problem`），编好的 TXT 问什么名字都装得下 / What static_txt_response and
-    /// replace_txt_response answer; SERVFAIL when it does not fit for the longest name (see
-    /// `engine::response::txt_size_problem`), so a TXT compiled fits whatever name is asked
+    /// static_txt_response 和 replace_txt_response 的应答；一个字符串也没有、按最长的名字算装不下时是 SERVFAIL（见
+    /// `engine::response::txt_problem`），编好的 TXT 问什么名字都装得下 / What static_txt_response and
+    /// replace_txt_response answer; SERVFAIL with no string, or when it does not fit for the
+    /// longest name (see `engine::response::txt_problem`), so a TXT compiled fits whatever name
+    /// is asked
     pub fn txt(text: &[String], ttl: Option<u32>) -> Self {
-        if crate::engine::response::txt_size_problem(text).is_some() {
+        if crate::engine::response::txt_problem(text).is_some() {
             return Self::Rcode(ResponseCode::ServFail);
         }
         Self::Records(StaticRecords::Txt {
