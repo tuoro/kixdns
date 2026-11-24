@@ -1970,6 +1970,10 @@ pub(crate) fn answered_address(name: &str) -> &str {
     split_answered(name).1
 }
 
+/// 一个名字编码以后最长 255 字节（RFC 1035 第 2.3.4 节）/ A name is at most 255 bytes once
+/// encoded (RFC 1035 section 2.3.4)
+const LONGEST_NAME: usize = 255;
+
 /// `log` 动作认的级别 / The levels a `log` action takes
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
@@ -2358,9 +2362,9 @@ fn rule_problems(
                 report(format!("cname target \"{target}\" is not a domain name"));
             }
             Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text, .. } => {
-                // 不知道会问什么名字，按最短的根名字算 / What will be asked is unknown, so the
-                // shortest name, the root, is taken
-                if let Some(problem) = txt_size_problem(text, 1) {
+                // 不知道会问什么名字，按最长的名字算：这样装得下的，问什么都装得下 / What will be asked is
+                // unknown, so the longest name is taken: what fits it then fits every question
+                if let Some(problem) = txt_size_problem(text, LONGEST_NAME) {
                     report(problem);
                 }
             }

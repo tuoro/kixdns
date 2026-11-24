@@ -6,7 +6,6 @@ use hickory_proto::rr::{
 };
 use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
 use std::net::IpAddr;
-use tracing::warn;
 
 use crate::matcher::advanced_rule::{StaticAnswer, StaticRecords};
 use crate::proto_utils::received_ttl;
@@ -256,12 +255,12 @@ fn txt_room(name_len: usize) -> usize {
 }
 
 /// TXT 内容放不进问 `name_len` 字节长的名字时的应答时说明原因：一段超过 255 字节，或者 RDATA（每段的内容
-/// 加一个长度字节）超过 [`txt_room`]。配置检查不知道会问什么名字，按最短的根名字（1 字节）算：这时还装不下，
-/// 问什么都装不下
+/// 加一个长度字节）超过 [`txt_room`]。配置检查不知道会问什么名字，按最长的名字（255 字节）算：这时装得下，
+/// 问什么都装得下
 /// Why TXT content does not fit the answer for a name `name_len` bytes long, when it does
 /// not: a segment over 255 bytes, or RDATA (each segment's content plus one length byte)
 /// over [`txt_room`]. The configuration check does not know what will be asked and takes
-/// the shortest name, the root (1 byte): what does not fit then fits no question at all
+/// the longest name (255 bytes): what fits then fits every question
 pub(crate) fn txt_size_problem(text: &[String], name_len: usize) -> Option<String> {
     if let Some(segment) = text.iter().find(|segment| segment.len() > MAX_TXT_SEGMENT) {
         return Some(format!(
@@ -310,12 +309,15 @@ impl StaticRecords {
         let Some(name) = crate::proto_utils::name_from_text(qname) else {
             return (ResponseCode::ServFail, Vec::new());
         };
-        // 装不下的先报：和读不出来的名字一样，不看问的是什么 / What does not fit is reported first: like a
-        // name that cannot be read, whatever is asked
+        // 装不下的先报：和读不出来的名字一样，不看问的是什么。配置检查按最长的名字算过（见 `config::problems`），走到这里的
+        // 是启动时照样加载的那条问题，启动时已经记过错误，这里不再每个查询记一条
+        // What does not fit is reported first: like a name that cannot be read, whatever is
+        // asked. The configuration check reckons with the longest name (see `config::problems`),
+        // so what comes here is that problem loaded all the same at startup, logged as an error
+        // then already and not again on every query
         if let Self::Txt { text, .. } = self
-            && let Some(problem) = txt_size_problem(text, name_wire_len(&name))
+            && txt_size_problem(text, name_wire_len(&name)).is_some()
         {
-            warn!(qname = %qname, %problem, "static TXT answer does not fit a message");
             return (ResponseCode::ServFail, Vec::new());
         }
         if !has_static_records(qclass) {

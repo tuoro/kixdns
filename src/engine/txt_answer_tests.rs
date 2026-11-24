@@ -123,7 +123,7 @@ fn txt_size_problem_counts_length_bytes_against_the_whole_message() {
     assert_eq!(txt_size_problem(&text_of_rdata(ROOM), name_len), None);
     assert!(txt_size_problem(&text_of_rdata(ROOM + 1), name_len).is_some());
     assert!(txt_size_problem(&vec!["a".repeat(255); 256], name_len).is_some());
-    // 配置检查按最短的根名字算 / The configuration check takes the shortest name, the root
+    // 根名字最短，地方最多 / The root, the shortest name, leaves the most room
     let root_room = ROOM + 7;
     assert_eq!(txt_size_problem(&text_of_rdata(root_room), 1), None);
     assert!(txt_size_problem(&text_of_rdata(root_room + 1), 1).is_some());
@@ -134,11 +134,14 @@ fn txt_size_problem_counts_length_bytes_against_the_whole_message() {
     );
 }
 
-/// 配置检查报出不管问什么名字都装不下的 TXT，静态的和替换的一样；按根名字正好装得下的不报
-/// The configuration check names a TXT that fits no question at all, static or replaced
-/// alike; one that just fits for the root name is no problem
+/// 配置检查报出不是问什么名字都装得下的 TXT，静态的和替换的一样：按最长的名字（255 字节）算，正好装得下的不报，多一个
+/// 字节的报。以前按最短的根名字算，问长名字时装不下的照样通过，每个这样的查询记一条不限频的 warn
+/// The configuration check names a TXT that does not fit every question, static or replaced
+/// alike: reckoned with the longest name (255 bytes), one that just fits is no problem and one
+/// byte more is. The shortest name, the root, used to be taken, so one not fitting a long name
+/// asked passed, and every such query logged a warn with no limit
 #[test]
-fn the_configuration_check_names_a_txt_no_answer_can_hold() {
+fn the_configuration_check_names_a_txt_some_answer_cannot_hold() {
     let problems = |text: Vec<String>| {
         crate::config::problems(
             &serde_json::from_value(json!({
@@ -160,8 +163,15 @@ fn the_configuration_check_names_a_txt_no_answer_can_hold() {
             .unwrap(),
         )
     };
-    assert_eq!(problems(text_of_rdata(ROOM + 7)), Vec::<String>::new());
-    for text in [text_of_rdata(ROOM + 8), vec!["a".repeat(255); 256]] {
+    // 问 [`QNAME`]（8 字节）时的 ROOM，换成 255 字节的名字少 247 / ROOM for [`QNAME`] (8 bytes),
+    // 247 less for a name of 255
+    let longest_room = ROOM - 247;
+    assert_eq!(problems(text_of_rdata(longest_room)), Vec::<String>::new());
+    for text in [
+        text_of_rdata(longest_room + 1),
+        text_of_rdata(ROOM + 8),
+        vec!["a".repeat(255); 256],
+    ] {
         let found = problems(text);
         assert_eq!(found.len(), 2, "{found:#?}");
         assert!(
