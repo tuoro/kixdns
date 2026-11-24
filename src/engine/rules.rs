@@ -17,8 +17,8 @@ use crate::engine::response::{
     static_reply,
 };
 use crate::engine::upstream::UpstreamFailure;
-use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
+use crate::matcher::{GeoManagers, RuntimeResponseMatcherWithOp};
 use crate::matcher::{RequestFacts, RequesterKey, ResponsePhase, parse_rcode};
 
 #[derive(Debug, Clone)]
@@ -322,22 +322,21 @@ pub(crate) fn check_failure_reply(
 }
 
 /// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给请求 `facts` 的应答 `msg` 是否成立；没有应答（`None`）时不成立，
-/// 没有匹配器时成立。每个匹配器只在求值时拿它要的那把 Geo 读锁，和请求规则一样（见 `RuntimeResponseMatcher::matches`）：
-/// 不用 Geo 数据的检查一把都不拿；一次只拿一把，也就不会和排队的写者互相等
+/// 没有匹配器时成立。和请求规则一样按请求自己那份 Geo 数据 `geo` 判断（见 `GeoManagers`）：上游应答的这段时间里换了数据，
+/// 检查照旧按请求开始时的那份，和它的键、缓存命名空间一致
 /// Whether the response matchers hold for the answer `msg` that `upstream` gave request
 /// `facts` (the answering upstream, `udp:1.1.1.1:53`); without an answer (`None`) they do not,
-/// and with no matchers they do. Each matcher takes the Geo read lock it needs only while it is
-/// evaluated, as request rules do (see `RuntimeResponseMatcher::matches`): a check using no Geo
-/// data takes none, and holding one at a time, it never waits on a queued writer that waits on
-/// it
+/// and with no matchers they do. They judge by the request's own Geo data `geo`, as request
+/// rules do (see `GeoManagers`): with the data changed while the upstream was answering, the
+/// check still goes by the data the request started with, in line with its keys and cache
+/// namespace
 pub(crate) fn response_matches(
-    engine: &Engine,
+    geo: &GeoManagers,
     matchers: &[RuntimeResponseMatcherWithOp],
     facts: &RequestFacts<'_>,
     upstream: &str,
     msg: Option<&Message>,
 ) -> bool {
-    let geo = engine.geo();
     msg.is_some_and(|msg| {
         eval_match_chain(
             matchers,
@@ -827,55 +826,5 @@ mod response_jump_tests {
             assert_eq!(ask(&engine).await, [Ipv4Addr::new(198, 51, 100, 1)]);
         }
         assert_eq!((domestic.queries(), abroad.queries()), (1, 1));
-    }
-}
-
-#[cfg(test)]
-mod geo_lock_tests {
-    use std::net::Ipv4Addr;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    use hickory_proto::op::{Message, MessageType, OpCode, Query};
-    use hickory_proto::rr::{Name, RecordType};
-
-    use crate::engine::test_support::{answering_upstream, ask, engine_from, first_a, peer};
-
-    /// 不用 Geo 数据的回答检查一把 Geo 读锁都不拿：GeoIP、GeoSite 都在写入时，它照样答上。以前每次检查都等着把两把锁都拿到
-    /// An answer check using no Geo data takes no Geo read lock: with GeoIP and GeoSite both
-    /// being written it still answers. Every check used to wait until it held both
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_answer_check_without_geo_conditions_takes_no_geo_lock() {
-        let answer = Ipv4Addr::new(192, 0, 2, 1);
-        let upstream = answering_upstream(answer, 60).await;
-        let engine = engine_from(serde_json::json!({
-            "settings": { "default_upstream": "127.0.0.1:9" },
-            "pipelines": [{ "id": "main", "rules": [{
-                "name": "checked", "matchers": [{ "type": "any" }],
-                "actions": [{ "type": "forward", "upstream": upstream.address }],
-                "response_matchers": [{ "type": "response_answer_ip", "cidr": "192.0.2.0/24" }],
-                "response_actions_on_match": [{ "type": "allow" }]
-            }] }]
-        }));
-        let mut query = Message::new(0x6c6c, MessageType::Query, OpCode::Query);
-        query.add_query(Query::query(
-            Name::from_ascii("example.com.").unwrap(),
-            RecordType::A,
-        ));
-        let query = query.to_vec().unwrap();
-
-        let (geoip, geosite) = (engine.geoip_manager.clone(), engine.geosite_manager.clone());
-        let writing = (geoip.write(), geosite.write());
-        // 等在这个线程上，不用运行时的计时器：读锁要是拿不到，等着的那个工作线程也就不再推动计时器
-        // Waited for on this thread, not with the runtime's timer: a worker stuck waiting for a
-        // read lock no longer drives the timer either
-        let (answered, reply) = mpsc::channel();
-        tokio::spawn(async move {
-            let _ = answered.send(ask(&engine, &query, peer()).await);
-        });
-        let reply = reply.recv_timeout(Duration::from_secs(3));
-        drop(writing);
-        let reply = reply.expect("answered while the Geo data was written");
-        assert_eq!(first_a(&reply), Some(answer));
     }
 }

@@ -205,17 +205,17 @@ impl RuntimeResponseMatcher {
         })
     }
 
-    /// `upstream`（作答的上游，`udp:1.1.1.1:53`）给请求 `facts` 的应答 `msg` 合不合这个匹配器。Geo 数据和请求匹配器
-    /// 一样只在要用时拿读锁（见 [`GeoManagers`]）
+    /// `upstream`（作答的上游，`udp:1.1.1.1:53`）给请求 `facts` 的应答 `msg` 合不合这个匹配器，和请求匹配器一样按 Geo
+    /// 数据 `geo` 判断（见 [`GeoManagers`]）
     /// Whether the answer `msg` that `upstream` (the answering upstream, `udp:1.1.1.1:53`) gave
-    /// request `facts` meets this matcher. The Geo data is read-locked only when used, as for
-    /// request matchers (see [`GeoManagers`])
+    /// request `facts` meets this matcher, judged by the Geo data `geo` as request matchers are
+    /// (see [`GeoManagers`])
     pub fn matches(
         &self,
         facts: &RequestFacts<'_>,
         upstream: &str,
         msg: &Message,
-        geo: GeoManagers<'_>,
+        geo: &GeoManagers,
     ) -> bool {
         let RequestFacts {
             qname,
@@ -276,9 +276,8 @@ impl RuntimeResponseMatcher {
                 edns == *expect
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                let manager = geo.geoip.read();
                 let mut has_ip = false;
-                let mut matches_country = |ip| manager.matches_any_tag(ip, country_codes);
+                let mut matches_country = |ip| geo.geoip.matches_any_tag(ip, country_codes);
                 let all_match = msg.answers.iter().all(|record| {
                     matcher_helpers::all_rdata_ips_match(
                         &record.data,
@@ -298,10 +297,10 @@ impl RuntimeResponseMatcher {
             // does (see `RuntimeMatcher::matches`). geo_site_not used not to match here
             // either, so one condition gave opposite results in an answer check and a request rule
             RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
-                geo.geosite.read().matches(value, qname)
+                geo.geosite.matches(value, qname)
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
-                !geo.geosite.read().matches(value, qname)
+                !geo.geosite.matches(value, qname)
             }
             RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
                 // 每条 TXT 记录分开比较，有一条命中就算命中；一条记录里的几个字符串先不加空格连起来，和
