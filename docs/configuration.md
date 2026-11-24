@@ -164,7 +164,7 @@ upstream_equals 和 response_upstream_ip 看的是这次实际作答的上游：
 
 | 类型 | 字段 | 行为 |
 |---|---|---|
-| log | level（可选） | 输出匹配规则的 tracing 事件，每个命中的查询都输出（这样的决策不进规则缓存；从响应缓存答的查询不走规则，也就不输出）；支持 trace、debug、info、warn、error。 |
+| log | level（可选） | 输出匹配规则的 tracing 事件，每个命中的查询都输出（这样的决策不进规则缓存；从响应缓存答的查询不走规则，也就不输出）；支持 trace、debug、info、warn、error，不写时为 info。日志默认只记 error（见使用说明的日志一节），低于 error 的要用 --debug 或 RUST_LOG 放开才看得到（比如 `RUST_LOG=error,kixdns::engine=info`），或者把 level 写成 error。 |
 | static_response | rcode | 返回 NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP 或 REFUSED。 |
 | static_ip_response | ip | 按查询类型返回 A 或 AAAA 记录（ANY 查询返回两者）；HTTPS、SVCB 等其他查询类型返回 NODATA，且不会合成 IP hints。`ip` 支持单个地址或逗号分隔的 IPv4/IPv6 地址列表（例如 `192.0.2.1,2001:db8::1`）。地址列表原样返回；列表过大时响应可能超过 UDP 大小限制。 |
 | static_cname_response | target、ttl（可选） | 对所有查询类型返回将查询域名映射到 `target` 的 CNAME 记录；ttl 默认 300。服务端不会继续解析目标域名，也不会附带目标地址记录，客户端或解析器必须自行追踪别名；不能追踪裸 CNAME 的客户端可能返回无数据。查询域名或目标域名无效时返回 SERVFAIL。 |
