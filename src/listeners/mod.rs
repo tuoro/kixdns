@@ -21,7 +21,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UdpSocket};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// 绑定好、还没开始答的 UDP socket，每个 worker 一个 / UDP sockets bound and not answering yet, one per worker
 struct BoundUdp {
@@ -232,7 +232,7 @@ fn bind_udp_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     if addr.ip().is_unspecified() {
         use std::os::fd::AsRawFd;
         if let Err(error) = udp_local::receive_local_addresses(socket.as_raw_fd(), addr.is_ipv6()) {
-            warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
+            tracing::warn!(%error, "cannot learn which address UDP queries are sent to; replies leave from the address the system picks");
         }
     }
 
@@ -333,19 +333,6 @@ async fn send_udp_datagram(
 /// limit when over it (RFC 6891)
 fn udp_reply(request: &[u8], response: Bytes) -> Bytes {
     truncate_udp_response(request, &response).unwrap_or(response)
-}
-
-/// 非阻塞发送 UDP 响应（过载保护路径）：截断 + 纯 try_send_to，WouldBlock 背压丢弃
-/// Non-blocking UDP send for overload paths: truncate + try_send_to only; drop on WouldBlock
-fn try_send_udp_response(socket: &UdpSocket, request: &[u8], response: &[u8], to: ReplyTo) {
-    let truncated = truncate_udp_response(request, response);
-    let response = truncated.as_deref().unwrap_or(response);
-    if let Err(error) = to.try_send(socket, response)
-        && error.kind() != std::io::ErrorKind::WouldBlock
-    {
-        debug!(peer = %to.peer, %error, response_len = response.len(), "failed to send UDP response");
-    }
-    // WouldBlock: 发送缓冲满，丢弃（背压）/ send buffer full, drop (backpressure)
 }
 
 /// 转发回来、等着和下一批一起发出去的回答。接收循环忙着的时候（它很快会回来收发下一批），转发完的任务把
@@ -1357,7 +1344,14 @@ fn spawn_udp_answer(
     let emptied_at = (!answering.taking_turns).then_some(answering.emptied_at);
     let permit = answering.engine.query_permit(emptied_at, peer.ip());
     let Some(permit) = permit else {
-        try_send_udp_response(answering.socket, &packet, &servfail_reply(&packet), to);
+        // 只有报文头、问题和 OPT，不超过 512 字节，不必截断 / Only the header, the question and an OPT,
+        // within 512 bytes, so nothing to cut
+        let servfail = servfail_reply(&packet);
+        if let Err(error) = to.try_send(answering.socket, &servfail)
+            && error.kind() != std::io::ErrorKind::WouldBlock
+        {
+            debug!(%peer, %error, "failed to send UDP response");
+        }
         return false;
     };
     let engine = Arc::clone(answering.engine);

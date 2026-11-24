@@ -145,6 +145,94 @@ async fn a_static_answer_on_an_upstream_answer_is_cached_no_longer_than_that_ans
     }
 }
 
+/// 一路上经过几次回答检查时，此后的静态应答按它们据过的应答里最短的那个缓存，不论那份应答排在前面还是后面：60 秒的应答
+/// 到期以后，它的回答检查就可能走另一条路。continue 和回答检查跳转都一样。以前只看最后一次，排在后面的 3600 秒顶掉了前面的
+/// 60 秒
+/// After several answer checks on the way, a static answer from there on is cached by the
+/// least of the answers they went by, whether that answer came first or last: once the
+/// answer of 60 seconds expires its check may take another way. A continue and an answer
+/// check's jump alike. Only the last used to count, the 3600 seconds coming later taking the
+/// place of the 60 before
+#[tokio::test]
+async fn a_static_answer_after_several_checks_is_cached_by_the_least_answer() {
+    let short = answering_upstream(UPSTREAM_ANSWER, 60).await.address;
+    let long = answering_upstream(UPSTREAM_ANSWER, 3600).await.address;
+    let address = json!({ "type": "static_ip_response", "ip": STATIC.to_string() });
+    let deny = json!({ "type": "deny" });
+    for (first, second) in [(&short, &long), (&long, &short)] {
+        for action in [&address, &deny] {
+            let paths = [
+                (
+                    "two continues",
+                    json!([{ "id": "main", "rules": [
+                        checked(first, json!([{ "type": "continue" }])),
+                        checked(second, json!([{ "type": "continue" }])),
+                        rule("static", any(), json!([action])),
+                    ]}]),
+                ),
+                (
+                    "a continue, then a jump",
+                    json!([
+                        { "id": "main", "rules": [
+                            checked(first, json!([{ "type": "continue" }])),
+                            checked(
+                                second,
+                                json!([{ "type": "jump_to_pipeline", "pipeline": "static" }]),
+                            ),
+                        ]},
+                        { "id": "static", "rules": [rule("static", any(), json!([action]))] },
+                    ]),
+                ),
+                (
+                    "a continue, then the check's own action",
+                    json!([{ "id": "main", "rules": [
+                        checked(first, json!([{ "type": "continue" }])),
+                        checked(second, json!([action])),
+                    ]}]),
+                ),
+            ];
+            for (path, pipelines) in paths {
+                let engine = engine_with(&json!({}), pipelines);
+                ask(&engine, &query(), peer()).await;
+                assert_eq!(
+                    cached_ttls(&engine),
+                    [60],
+                    "{path}: {action} after answers from {first} and then {second}"
+                );
+            }
+        }
+    }
+}
+
+/// 上游失败以后 miss 动作 continue 了，后面的规则即使又据一份上游应答做了决定，给出的也只是这一次请求的兜底，不进缓存。以前后
+/// 一次回答检查的 TTL 顶掉了失败记下的 0，兜底照那份应答缓存，上游恢复了还一直用到条目到期
+/// After the miss actions continued on an upstream failure, what a later rule gives is still
+/// a fallback for this request, even with another upstream answer decided on in between, and
+/// it stays out of the cache. The later check's TTL used to take the place of the 0 the
+/// failure noted, the fallback being cached by that answer and served after the upstream
+/// recovered, until the entry expired
+#[tokio::test]
+async fn a_fallback_after_an_upstream_failure_stays_uncached_past_a_later_check() {
+    let answering = answering_upstream(UPSTREAM_ANSWER, 600).await.address;
+    let mut failing = rule(
+        "failing",
+        any(),
+        json!([{ "type": "forward", "upstream": DEAD_UPSTREAM }]),
+    );
+    failing["response_actions_on_miss"] = json!([{ "type": "continue" }]);
+    let fallback = json!([{ "type": "static_ip_response", "ip": STATIC.to_string() }]);
+    let engine = engine_with(
+        &json!({}),
+        json!([{ "id": "main", "rules": [
+            failing,
+            checked(&answering, json!([{ "type": "continue" }])),
+            rule("fallback", any(), fallback),
+        ]}]),
+    );
+    assert_eq!(first_a(&ask(&engine, &query(), peer()).await), Some(STATIC));
+    assert_eq!(cached_ttls(&engine), Vec::<u32>::new());
+}
+
 /// 规则直接给出的静态应答不进响应缓存：快速路径、规则缓存下次照样直接给出，记在这条规则名下。请求阶段跳过去以后直接给出的也
 /// 一样，哪怕跳之前越过了一份应答：那是目标 pipeline 直接给的，直接进它的请求也照样直接拿到。以前开着 min_ttl 时按它缓存，
 /// 之后的请求从响应缓存拿到它，查询日志和规则计数里就没有这条规则
