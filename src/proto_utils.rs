@@ -518,10 +518,11 @@ pub(crate) fn reply_as_asked_knowing(
 /// [`reply_as_asked`]，查询的 DO 位（见 [`asked_dnssec_ok`]）已经找过 / [`reply_as_asked`] with the query's
 /// DO bit (see [`asked_dnssec_ok`]) looked for already
 fn shaped_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bool>, ()>) -> Bytes {
-    // 应答的记录只走一遍：问题名的写法和 RD、CD、AD 位改的都是原位的字节，记录的位置不动，后面找 OPT 用的就是这一遍。
-    // 这几样连同 DO 位都改在同一份上：头一样要改的在应答还有别处持有时复制一份，之后的就是独占的，原地改
+    // 应答的记录只走一遍：问题名的写法和 RD、CD、AD 位改的都是原位的字节，记录的位置不动，后面找 OPT、在末尾补 OPT
+    // 用的都是这一遍。这几样连同 DO 位都改在同一份上：头一样要改的在应答还有别处持有时复制一份，之后的就是独占的，原地改
     // The reply's records are walked once: the question name's spelling and the RD, CD and AD
-    // bits change bytes in place without moving any record, so the OPT is taken from this walk.
+    // bits change bytes in place without moving any record, so the OPT, and the end where one
+    // is appended, are taken from this walk.
     // These and the DO bit are all changed in one copy: the first change copies the reply when
     // something else holds it too, and the copy, held alone, takes the rest in place
     let walk = walk_records(&reply);
@@ -534,7 +535,7 @@ fn shaped_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bo
     edns_as_asked_with(
         header_as_asked(question_as_asked(reply, query), query, asked_dnssec_ok),
         asked_dnssec_ok,
-        walk.opt,
+        &walk,
     )
 }
 
@@ -609,26 +610,30 @@ pub(crate) fn reply_without_aa(reply: Bytes) -> Bytes {
 /// RCODE; a message that cannot be read, or a reply signed with TSIG, is left as it is.
 #[cfg(test)]
 fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
-    let opt = find_opt(&reply);
-    edns_as_asked_with(reply, asked_dnssec_ok(query), opt)
+    let walk = walk_records(&reply);
+    if walk.last_is_tsig {
+        return reply;
+    }
+    edns_as_asked_with(reply, asked_dnssec_ok(query), &walk)
 }
 
-/// [`edns_as_asked`]，应答的 OPT（[`find_opt`] 的结论）和查询的 DO 位（[`asked_dnssec_ok`]）都已经
-/// 找过 / [`edns_as_asked`] with the reply's OPT (what [`find_opt`] concludes) and the query's
-/// DO bit (see [`asked_dnssec_ok`]) already looked for
+/// [`edns_as_asked`]，应答的记录（`walk`，见 [`walk_records`]）和查询的 DO 位（[`asked_dnssec_ok`]）都已经
+/// 找过，TSIG 签过的应答调用方已经排除 / [`edns_as_asked`] with the reply's records (`walk`, see
+/// [`walk_records`]) walked and the query's DO bit (see [`asked_dnssec_ok`]) looked for already,
+/// the caller having left out a reply signed with TSIG
 fn edns_as_asked_with(
     reply: Bytes,
     asked_dnssec_ok: Result<Option<bool>, ()>,
-    opt: Result<Option<OptRecord>, ()>,
+    walk: &RecordsWalk,
 ) -> Bytes {
     let Ok(asked_dnssec_ok) = asked_dnssec_ok else {
         return reply;
     };
-    let Ok(opt) = opt else {
+    let Ok(opt) = &walk.opt else {
         return reply;
     };
     let resized = match (asked_dnssec_ok, opt) {
-        (Some(dnssec_ok), None) => with_opt(&reply, dnssec_ok, &[]),
+        (Some(dnssec_ok), None) => with_opt(&reply, walk, dnssec_ok, &[]),
         // DO 位是原位的一位：只有一处持有应答时原地改 / The DO bit is one bit in place: changed in
         // place when nothing else holds the reply
         (Some(dnssec_ok), Some(opt)) if opt.dnssec_ok(&reply) != dnssec_ok => {
@@ -636,22 +641,24 @@ fn edns_as_asked_with(
             reply[opt.extended_rcode_at + 2] ^= 0x80;
             return reply.freeze();
         }
-        (None, Some(opt)) if reply[opt.extended_rcode_at] == 0 => without_opt(&reply, &opt),
+        (None, Some(opt)) if reply[opt.extended_rcode_at] == 0 => without_opt(&reply, opt),
         _ => None,
     };
     resized.map_or(reply, Bytes::from)
 }
 
-/// 末尾补一条 OPT 的报文（扩展 RCODE 0，见 [`push_opt`]），带着选项 `options`。读不出或最后
-/// 一条是 TSIG（它必须排在最后）时为 None。
-/// The message with an OPT appended (extended RCODE 0, see [`push_opt`]) carrying
-/// `options`. None when it cannot be read or its last record is a TSIG, which must stay
-/// last.
-fn with_opt(message: &[u8], dnssec_ok: bool, options: &[u8]) -> Option<Vec<u8>> {
-    let end = valid_message_len(message)?;
-    if last_record_is_tsig(message) {
-        return None;
-    }
+/// 末尾补一条 OPT 的报文（扩展 RCODE 0，见 [`push_opt`]），带着选项 `options`，`walk` 是它的记录走过的结论（见
+/// [`walk_records`]）。最后一条是 TSIG 的报文调用方已经排除（TSIG 必须排在最后）；读不出时为 None。
+/// The message with an OPT appended (extended RCODE 0, see [`push_opt`]) carrying `options`,
+/// `walk` being what walking its records concluded (see [`walk_records`]). The caller has left
+/// out a message whose last record is a TSIG, which must stay last; None when it cannot be read.
+fn with_opt(
+    message: &[u8],
+    walk: &RecordsWalk,
+    dnssec_ok: bool,
+    options: &[u8],
+) -> Option<Vec<u8>> {
+    let end = walk.end?;
     let ar_count = u16::from_be_bytes([message[10], message[11]]).checked_add(1)?;
     let mut out = Vec::with_capacity(end + 11 + options.len());
     out.extend_from_slice(&message[..end]);
@@ -675,14 +682,12 @@ fn push_opt(out: &mut Vec<u8>, extended_rcode: u8, dnssec_ok: bool, options: &[u
 }
 
 /// 去掉 OPT 的报文。OPT 是最后一条记录时直接截掉（见 `OptRecord::last`），否则由 hickory 重新编码；
-/// 读不了、写不出，或者最后一条是 TSIG 时为 None。
+/// 最后一条是 TSIG 的报文调用方已经排除（重新编码会让签名失效）；读不了、写不出时为 None。
 /// The message without its OPT: cut off when it is the last record (see
-/// `OptRecord::last`), encoded again through hickory otherwise. None when it cannot be
-/// read or written, or its last record is a TSIG.
+/// `OptRecord::last`), encoded again through hickory otherwise. The caller has left out a
+/// message whose last record is a TSIG, whose signature encoding it again would break; None
+/// when it cannot be read or written.
 fn without_opt(message: &[u8], opt: &OptRecord) -> Option<Vec<u8>> {
-    if last_record_is_tsig(message) {
-        return None;
-    }
     if !opt.last {
         let mut msg = Message::from_vec(message).ok()?;
         msg.edns = None;
@@ -948,24 +953,27 @@ fn find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
     walk_records(packet).opt
 }
 
-/// 把报文的记录走一遍，同时得出 [`find_opt`] 和 [`last_record_is_tsig`] 两者的结论：照应答规整时
-/// 两样都要，同一份应答不必走两遍
-/// Walks a message's records once for what [`find_opt`] and [`last_record_is_tsig`] each
-/// conclude: shaping a reply needs both, and one walk serves them
+/// 把报文的记录走一遍，同时得出 [`find_opt`]、[`valid_message_len`] 和 [`last_record_is_tsig`] 三者的结论：照应答
+/// 规整、给报文补 OPT 时都要用到几样，同一份报文不必走几遍
+/// Walks a message's records once for what [`find_opt`], [`valid_message_len`] and
+/// [`last_record_is_tsig`] each conclude: shaping a reply and adding an OPT to a message need
+/// several of them, and one walk serves them all
 struct RecordsWalk {
     opt: Result<Option<OptRecord>, ()>,
+    end: Option<usize>,
     last_is_tsig: bool,
 }
 
 fn walk_records(packet: &[u8]) -> RecordsWalk {
     const UNREADABLE: RecordsWalk = RecordsWalk {
         opt: Err(()),
+        end: None,
         last_is_tsig: false,
     };
     let Some(records) = Records::of(packet) else {
         return UNREADABLE;
     };
-    let (mut opt, mut last) = (Ok(None), None);
+    let (mut opt, mut end, mut last) = (Ok(None), records.pos, None);
     for record in records {
         let Ok(record) = record else {
             return UNREADABLE;
@@ -986,6 +994,7 @@ fn walk_records(packet: &[u8]) -> RecordsWalk {
                 last: false,
             });
         }
+        end = record.rdata.end;
         last = Some(record);
     }
     // 后面没有记录的 OPT 是最后一条 / An OPT with no record after it is the last
@@ -994,6 +1003,7 @@ fn walk_records(packet: &[u8]) -> RecordsWalk {
     }
     RecordsWalk {
         opt,
+        end: (end <= packet.len()).then_some(end),
         last_is_tsig: last.is_some_and(|last| last.rr_type == TSIG),
     }
 }
@@ -1377,7 +1387,7 @@ fn padding_added(message: &[u8], block: usize) -> Option<Vec<u8>> {
     // 填充选项接在最后一条记录 OPT 的末尾；没有 OPT 时末尾补一条空的，它的 RDLENGTH 是最后两个字节
     // The padding option goes at the end of the OPT as the last record; without an OPT an
     // empty one is appended, its RDLENGTH being the last two bytes
-    let (mut out, rdlen_at) = match walk.opt.ok()? {
+    let (mut out, rdlen_at) = match walk.opt.as_ref().ok()? {
         Some(opt) if opt.last => {
             let mut out = Vec::with_capacity(opt.rdata.end + 4 + block);
             out.extend_from_slice(&message[..opt.rdata.end]);
@@ -1385,7 +1395,7 @@ fn padding_added(message: &[u8], block: usize) -> Option<Vec<u8>> {
         }
         Some(_) => return None,
         None => {
-            let out = with_opt(message, false, &[])?;
+            let out = with_opt(message, &walk, false, &[])?;
             let rdlen_at = out.len() - 2;
             (out, rdlen_at)
         }
@@ -1426,7 +1436,11 @@ pub(crate) fn with_ecs_echo(
     option.push(scope);
     option.extend_from_slice(address);
 
-    match find_opt(message).ok()? {
+    let walk = walk_records(message);
+    if walk.last_is_tsig {
+        return None;
+    }
+    match walk.opt.as_ref().ok()? {
         // See `OptRecord::last` / 见 `OptRecord::last`
         Some(opt) if !opt.last => None,
         Some(opt) => {
@@ -1444,7 +1458,7 @@ pub(crate) fn with_ecs_echo(
             out[opt.rdlen_at..opt.rdlen_at + 2].copy_from_slice(&rd_len.to_be_bytes());
             Some(out)
         }
-        None => with_opt(message, false, &option),
+        None => with_opt(message, &walk, false, &option),
     }
 }
 
@@ -1508,20 +1522,17 @@ pub(crate) fn last_record_is_tsig(packet: &[u8]) -> bool {
     walk_records(packet).last_is_tsig
 }
 
-/// Byte length of the last complete record, or `None` on malformed structure.
-///
-/// hickory's bounded encoder rolls back its write offset but not the backing
-/// buffer when a record does not fit, so truncated output can carry partial
-/// bytes from the failed record past the (corrected) header counts. Re-walking
-/// the emitted sections yields the exact valid boundary so the response stays
-/// within RFC 1035 §4.2.1 record boundaries.
+/// 报文到最后一条记录为止的长度（没有记录时到问题段为止）；读不出，或者最后一条的 RDATA 超出报文时为 None。hickory
+/// 有上限的编码器放不下一条记录时退回写入位置，却不缩回底下的缓冲，截断的输出可能在（改过的）计数之后带着那条记录的
+/// 半截字节；照计数再走一遍得出准确的边界，应答守着 RFC 1035 第 4.2.1 节的记录边界
+/// The length of a message up to its last record (up to its questions when it has none); None
+/// when it cannot be read or its last record's RDATA runs past it. hickory's bounded encoder
+/// rolls back its write offset but not the backing buffer when a record does not fit, so
+/// truncated output can carry partial bytes of that record past the (corrected) header counts;
+/// walking the sections again by the counts gives the exact boundary, keeping the response
+/// within RFC 1035 section 4.2.1's record boundaries
 fn valid_message_len(packet: &[u8]) -> Option<usize> {
-    let records = Records::of(packet)?;
-    let mut end = records.pos;
-    for record in records {
-        end = record.ok()?.rdata.end;
-    }
-    (end <= packet.len()).then_some(end)
+    walk_records(packet).end
 }
 
 /// 快速解析响应包，仅提取 RCODE、TC 标志和 TTL 范围 / Quick parse response packet, extracting only RCODE, TC flag and TTL range
@@ -4553,37 +4564,38 @@ mod one_walk_tests {
     use hickory_proto::op::{Edns, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-    /// 照下标读出的 OPT 和最后一条是不是 TSIG：记录读不了、OPT 不在 Additional、不止一条或者属主不是根名时 OPT 读不成，
-    /// 最后一条也不算 TSIG；RDATA 超出报文的记录让 OPT 读不成，是最后一条的话照样算
-    /// The OPT, and whether the last record is a TSIG, read by index: with a record that cannot
-    /// be read, or an OPT outside Additional, more than one or owned by other than the root, the
-    /// OPT cannot be read and the last record is no TSIG; a record whose RDATA runs past the
-    /// message leaves the OPT unreadable, and still counts as the last
-    fn reference_walk(packet: &[u8]) -> (Result<Option<OptRecord>, ()>, bool) {
+    /// 照下标读出的 OPT、记录的结尾和最后一条是不是 TSIG：记录读不了、OPT 不在 Additional、不止一条或者属主不是根名时
+    /// OPT 和结尾都读不成，最后一条也不算 TSIG；RDATA 超出报文的记录让 OPT 和结尾读不成，是最后一条的话照样算
+    /// The OPT, the records' end, and whether the last record is a TSIG, read by index: with a
+    /// record that cannot be read, or an OPT outside Additional, more than one or owned by other
+    /// than the root, neither the OPT nor the end can be read and the last record is no TSIG; a
+    /// record whose RDATA runs past the message leaves the OPT and the end unreadable, and still
+    /// counts as the last
+    fn reference_walk(packet: &[u8]) -> (Result<Option<OptRecord>, ()>, Option<usize>, bool) {
         if packet.len() < 12 {
-            return (Err(()), false);
+            return (Err(()), None, false);
         }
         let before_additional = section_count(packet, 1) + section_count(packet, 2);
         let records = before_additional + section_count(packet, 3);
         let Some(mut pos) =
             skip_questions(packet, section_count(packet, 0)).filter(|&pos| pos <= packet.len())
         else {
-            return (Err(()), false);
+            return (Err(()), None, false);
         };
         let (mut found, mut cut, mut last_type) = (None, false, None);
         for index in 0..records {
             let Some(fixed) = strict_name_end(packet, pos) else {
-                return (Err(()), false);
+                return (Err(()), None, false);
             };
             let Some(header) = packet.get(fixed..fixed + 10) else {
-                return (Err(()), false);
+                return (Err(()), None, false);
             };
             let rr_type = u16::from_be_bytes([header[0], header[1]]);
             let rdata =
                 fixed + 10..fixed + 10 + u16::from_be_bytes([header[8], header[9]]) as usize;
             if rr_type == 41 {
                 if index < before_additional || found.is_some() || packet[pos] != 0 {
-                    return (Err(()), false);
+                    return (Err(()), None, false);
                 }
                 found = Some(OptRecord {
                     start: pos,
@@ -4597,8 +4609,10 @@ mod one_walk_tests {
             last_type = Some(rr_type);
             pos = rdata.end;
         }
-        let opt = if cut { Err(()) } else { Ok(found) };
-        (opt, last_type == Some(250))
+        if cut {
+            return (Err(()), None, last_type == Some(250));
+        }
+        (Ok(found), Some(pos), last_type == Some(250))
     }
 
     /// 真实形状的报文：查询和应答、带不带 OPT、几条回答、CNAME 链带压缩指针、Authority 段、末尾的 TSIG
@@ -4701,7 +4715,7 @@ mod one_walk_tests {
         for message in &messages {
             let walk = walk_records(message);
             assert_eq!(
-                (walk.opt, walk.last_is_tsig),
+                (walk.opt, walk.end, walk.last_is_tsig),
                 reference_walk(message),
                 "{message:?}"
             );
@@ -4729,7 +4743,7 @@ mod one_walk_tests {
         for reply in &messages {
             for query in &queries {
                 let reply = Bytes::from(reply.clone());
-                let expected = if reference_walk(&reply).1 {
+                let expected = if reference_walk(&reply).2 {
                     reply.clone()
                 } else {
                     edns_as_asked(
