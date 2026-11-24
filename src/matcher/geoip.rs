@@ -785,7 +785,7 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
 }
 
 /// `geoip_private`、`response_answer_ip_geoip_private` 和 ECS 都算作内网的地址，只有这一份（ECS 另外再算一个转换前缀和基准测试
-/// 网段，见 `ecs::is_private_ip`）。连过去到的是本机、本地网络或运营商的内部网络，或者哪儿也到不了的地址：
+/// 网段，见 `ecs::withheld_from_ecs`）。连过去到的是本机、本地网络或运营商的内部网络，或者哪儿也到不了的地址：
 /// - IPv4：RFC 1918 私有网段，运营商级 NAT 的共享地址 100.64.0.0/10（RFC 6598，Tailscale 也用它），回环，链路本地，
 ///   「本网络」0.0.0.0/8，IETF 协议分配 192.0.0.0/24（RFC 6890，DS-Lite 等的内部地址），受限广播 255.255.255.255。
 ///   0.0.0.0/8 和 `::` 一样不是哪台主机的地址（RFC 791），连 0.0.0.0 在 Linux、macOS 上连的是本机，回答它和回答
@@ -800,7 +800,7 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
 /// 转给 fake-ip 上游的查询，回答都会被防重绑定的规则拦下。文档用的网段（192.0.2.0/24 这些）也不算：不可全球路由，却也不在哪个内网里
 /// The addresses `geoip_private`, `response_answer_ip_geoip_private` and ECS count as local
 /// network ones, this one list alone (ECS counts one translation prefix and the benchmarking
-/// range more, see `ecs::is_private_ip`). Connecting to them reaches this machine, the local network or the
+/// range more, see `ecs::withheld_from_ecs`). Connecting to them reaches this machine, the local network or the
 /// operator's internal network, or nowhere at all:
 /// - IPv4: the RFC 1918 private networks, carrier-grade NAT's shared space 100.64.0.0/10
 ///   (RFC 6598, which Tailscale uses too), loopback, link-local, "this network" 0.0.0.0/8,
