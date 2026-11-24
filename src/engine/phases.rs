@@ -818,10 +818,8 @@ impl<'a> Forwarding<'a> {
                     rules::response_matches(
                         self.engine,
                         decision.response_matchers,
+                        &request.facts(),
                         answered,
-                        request.qname,
-                        request.qtype,
-                        request.qclass,
                         Some(msg),
                     )
                 },
@@ -969,10 +967,8 @@ impl<'a> Forwarding<'a> {
             || rules::response_matches(
                 self.engine,
                 decision.response_matchers,
+                &request.facts(),
                 &upstream,
-                request.qname,
-                request.qtype,
-                request.qclass,
                 msg.as_ref(),
             );
         // A refresh reports these too: it acts on the response rules like a client

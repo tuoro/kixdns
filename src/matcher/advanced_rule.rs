@@ -270,7 +270,7 @@ pub(crate) fn fast_static_match(
             client_ip,
             edns_present,
         },
-        GeoManagers::default(),
+        GeoManagers::empty(),
     )
     .map(|(action, _)| match action {
         PrecomputedAction::Answer(answer) => {

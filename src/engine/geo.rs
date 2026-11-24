@@ -16,7 +16,7 @@ use super::Engine;
 use super::types::EngineInner;
 use crate::matcher::geoip::{FileStamp, GeoIpFingerprints, GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, Swapped, parsed_provides_any};
-use crate::matcher::{GeoData, RuntimePipelineConfig};
+use crate::matcher::{GeoData, GeoManagers, RuntimePipelineConfig};
 use crate::watcher::{FileWatch, PendingWatch};
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
@@ -268,6 +268,12 @@ impl DataStatus {
 }
 
 impl Engine {
+    /// 匹配器判断时读的 Geo 数据，各自要用时才拿读锁（见 [`GeoManagers`]）/ The Geo data matchers read
+    /// as they judge, each read-locking it only to use it (see [`GeoManagers`])
+    pub(crate) fn geo(&self) -> GeoManagers<'_> {
+        GeoManagers::new(&self.geoip_manager, &self.geosite_manager)
+    }
+
     /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（只有它提供的
     /// 标签留着先前读进来的数据，重启以后就没有了）、装不上的文件监视、规则用到却没有数据提供的标签（这样的规则
     /// geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到文件变了时跟着更新

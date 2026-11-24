@@ -29,9 +29,7 @@ use super::concurrency::PermitGuard;
 use super::core::Engine;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
 use super::phases;
-use super::pipeline::{
-    NO_PIPELINE, PipelineSelectionContext, RuleEvaluationContext, select_pipeline,
-};
+use super::pipeline::{NO_PIPELINE, RuleEvaluationContext, select_pipeline};
 use super::refresh::{RefreshCheck, RefreshTarget};
 use super::response::{StaticAddresses, static_reply, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
@@ -716,8 +714,17 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let qname_str = q.qname;
-        let pipeline_opt =
-            self.pick_pipeline(cfg, qname_str, qtype, qclass, peer.ip(), q.edns_present);
+        // 选 pipeline、求值编译规则都看这一份，GeoIP、GeoSite 数据和完整路径一样读（见 `CompiledRule::matchers`）
+        // Choosing the pipeline and evaluating the compiled rules both look at this one, reading
+        // the GeoIP and GeoSite data as the full path does (see `CompiledRule::matchers`)
+        let facts = crate::matcher::RequestFacts {
+            qname: qname_str,
+            qtype,
+            qclass,
+            client_ip: peer.ip(),
+            edns_present: q.edns_present,
+        };
+        let pipeline_opt = self.pick_pipeline(cfg, &facts);
 
         let name_of = |pipeline: Option<&crate::matcher::RuntimePipeline>| {
             pipeline.map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
@@ -769,17 +776,6 @@ impl Engine {
             ecs: q.client_subnet,
         };
         let view = requester.ecs_view();
-        // 编译规则照完整路径的样子求值，GeoIP、GeoSite 数据一样读（见 `CompiledRule::matchers`）
-        // The compiled rules are evaluated as on the full path, reading the GeoIP and GeoSite data
-        // alike (see `CompiledRule::matchers`)
-        let facts = crate::matcher::RequestFacts {
-            qname: qname_str,
-            qtype,
-            qclass,
-            client_ip: peer.ip(),
-            edns_present: q.edns_present,
-        };
-        let geo = crate::matcher::GeoManagers::new(&self.geoip_manager, &self.geosite_manager);
         // 第一条命中的规则或规则缓存给的是跳转时，和完整路径一样跟过去（见 `decide`），按目标的键再查一遍，至多跳
         // response_jump_limit 次；再要跳的、目标不存在的交给完整路径，由它回 SERVFAIL。走过的跳转在答上时照完整路径的
         // 样子上报
@@ -987,7 +983,7 @@ impl Engine {
                 // 3. Compiled rules: what the first rule matching decides on the spot
                 let matched = self
                     .compiled_for(&state, pipeline_id)
-                    .and_then(|compiled| fast_static_match_with_rule(compiled, &facts, geo));
+                    .and_then(|compiled| fast_static_match_with_rule(compiled, &facts, self.geo()));
                 match matched {
                     Some((PrecomputedAction::Jump(target), rule)) => (
                         cfg.pipeline(target),
@@ -1367,7 +1363,14 @@ impl Engine {
     ) -> Result<RequestHead, UnreadableQuery> {
         let pipeline_of = |head: (&str, RecordType, DNSClass, bool)| {
             let (qname, qtype, qclass, edns_present) = head;
-            self.pick_pipeline(cfg, qname, qtype, qclass, client, edns_present)
+            let facts = crate::matcher::RequestFacts {
+                qname,
+                qtype,
+                qclass,
+                client_ip: client,
+                edns_present,
+            };
+            self.pick_pipeline(cfg, &facts)
                 .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
         };
         let mut qname_buf = [0u8; 256];
@@ -1404,31 +1407,15 @@ impl Engine {
         })
     }
 
-    /// `cfg` 为这个问题、这个客户端选的 pipeline（见 [`select_pipeline`]），快速路径和完整路径都从这里选
-    /// The pipeline `cfg` picks for this question and this client (see [`select_pipeline`]), the
-    /// fast path and the full path both picking here
+    /// `cfg` 为请求 `facts` 选的 pipeline（见 [`select_pipeline`]），快速路径和完整路径都从这里选
+    /// The pipeline `cfg` picks for request `facts` (see [`select_pipeline`]), the fast path and
+    /// the full path both picking here
     fn pick_pipeline<'a>(
         &self,
         cfg: &'a RuntimePipelineConfig,
-        qname: &str,
-        qtype: RecordType,
-        qclass: DNSClass,
-        client_ip: IpAddr,
-        edns_present: bool,
+        facts: &crate::matcher::RequestFacts<'_>,
     ) -> Option<&'a crate::matcher::RuntimePipeline> {
-        select_pipeline(
-            cfg,
-            &PipelineSelectionContext {
-                qname,
-                client_ip,
-                qclass,
-                edns_present,
-                qtype,
-                listener_label: &self.listener_label,
-                geosite_manager: Some(&self.geosite_manager),
-                geoip_manager: Some(&self.geoip_manager),
-            },
-        )
+        select_pipeline(cfg, &self.listener_label, facts, self.geo())
     }
 
     /// 决定怎么回答 `request`：不支持的 EDNS 版本回 BADVERS；查缓存；然后沿着规则走（跳转、continue、静态应答、转发），
@@ -1470,20 +1457,14 @@ impl Engine {
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
         // 从第 `resume_at` 条规则起求值 `pipeline`（见 `Route::resume_at`）
         // Evaluate `pipeline` from its rule at `resume_at` on (see `Route::resume_at`)
+        let facts = request.facts();
         let evaluate = |pipeline: &crate::matcher::RuntimePipeline, resume_at: usize| {
             self.apply_rules(
                 request.state,
                 pipeline,
-                &RuleEvaluationContext::new(
-                    request.peer.ip(),
-                    request.qname,
-                    request.qtype,
-                    request.qclass,
-                    request.requester.edns,
-                    resume_at,
-                    background_refresh,
-                )
-                .with_observed(request.observed),
+                &facts,
+                &RuleEvaluationContext::new(resume_at, background_refresh)
+                    .with_observed(request.observed),
             )
         };
         let mut decision = match pipeline {
@@ -1927,6 +1908,18 @@ pub(crate) struct Request<'a> {
 }
 
 impl Request<'_> {
+    /// 匹配器看的这个请求（见 [`crate::matcher::RequestFacts`]）/ This request as matchers see it
+    /// (see [`crate::matcher::RequestFacts`])
+    pub(crate) fn facts(&self) -> crate::matcher::RequestFacts<'_> {
+        crate::matcher::RequestFacts {
+            qname: self.qname,
+            qtype: self.qtype,
+            qclass: self.qclass,
+            client_ip: self.requester.address,
+            edns_present: self.requester.edns,
+        }
+    }
+
     /// `pipeline` 下这个问题的缓存键，按 `requester` 分辨请求方
     /// This question's keys under `pipeline`, requesters told apart by `requester`
     fn keys(&self, pipeline: &str, requester: &RequesterKey) -> CacheKeys {
@@ -4330,16 +4323,9 @@ mod tests {
         // Act: Select pipeline for edge listener
         let opt = select_pipeline(
             &runtime,
-            &PipelineSelectionContext {
-                qname: "any.example.com",
-                client_ip: "127.0.0.1".parse().unwrap(),
-                qclass: hickory_proto::rr::DNSClass::IN,
-                edns_present: false,
-                qtype: hickory_proto::rr::RecordType::A,
-                listener_label: "edge",
-                geosite_manager: None,
-                geoip_manager: None,
-            },
+            "edge",
+            &crate::matcher::RequestFacts::a_query("any.example.com"),
+            crate::matcher::GeoManagers::empty(),
         );
         let id = opt.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
 
@@ -4375,16 +4361,9 @@ mod tests {
         // Act: Select pipeline for edge listener
         let opt = select_pipeline(
             &runtime,
-            &PipelineSelectionContext {
-                qname: "example.com",
-                client_ip: "127.0.0.1".parse().unwrap(),
-                qclass: hickory_proto::rr::DNSClass::IN,
-                edns_present: false,
-                qtype: hickory_proto::rr::RecordType::A,
-                listener_label: "edge",
-                geosite_manager: None,
-                geoip_manager: None,
-            },
+            "edge",
+            &crate::matcher::RequestFacts::a_query("example.com"),
+            crate::matcher::GeoManagers::empty(),
         );
         let id = opt.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
 
@@ -4423,15 +4402,8 @@ mod tests {
         let decision = engine.apply_rules(
             &state,
             &state.pipeline.pipelines[0],
-            &RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                "a.example.com",
-                hickory_proto::rr::RecordType::A,
-                hickory_proto::rr::DNSClass::IN,
-                false,
-                0,
-                false, // background_refresh
-            ),
+            &crate::matcher::RequestFacts::a_query("a.example.com"),
+            &RuleEvaluationContext::new(0, false),
         );
 
         // Assert: Verify StaticResponse returns NXDOMAIN
@@ -4471,15 +4443,8 @@ mod tests {
         let decision2 = engine2.apply_rules(
             &state2,
             &state2.pipeline.pipelines[0],
-            &RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                "x.example.com",
-                hickory_proto::rr::RecordType::A,
-                hickory_proto::rr::DNSClass::IN,
-                false,
-                0,
-                false, // background_refresh
-            ),
+            &crate::matcher::RequestFacts::a_query("x.example.com"),
+            &RuleEvaluationContext::new(0, false),
         );
 
         // Assert: Verify Forward action returns correct upstream and matchers
@@ -4524,15 +4489,8 @@ mod tests {
         let decision3 = engine3.apply_rules(
             &state3,
             &state3.pipeline.pipelines[0],
-            &RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                "y.example.com",
-                hickory_proto::rr::RecordType::A,
-                hickory_proto::rr::DNSClass::IN,
-                false,
-                0,
-                false, // background_refresh
-            ),
+            &crate::matcher::RequestFacts::a_query("y.example.com"),
+            &RuleEvaluationContext::new(0, false),
         );
 
         // Assert: Verify Allow action forwards to default upstream
@@ -4558,15 +4516,8 @@ mod tests {
         let decision4 = engine4.apply_rules(
             &state4,
             &state4.pipeline.pipelines[0],
-            &RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                "z.example.com",
-                hickory_proto::rr::RecordType::A,
-                hickory_proto::rr::DNSClass::IN,
-                false,
-                0,
-                false, // background_refresh
-            ),
+            &crate::matcher::RequestFacts::a_query("z.example.com"),
+            &RuleEvaluationContext::new(0, false),
         );
 
         // Assert: Verify JumpToPipeline returns correct target pipeline
@@ -6832,33 +6783,17 @@ mod tests {
                 for domain in ["example.com", "example.cn"] {
                     let client_ip: IpAddr = client.parse().unwrap();
                     let case = format!("{} from {client} for {domain}", rules[0]["name"]);
+                    let facts = crate::matcher::RequestFacts {
+                        client_ip,
+                        ..crate::matcher::RequestFacts::a_query(domain)
+                    };
                     let full = engine.apply_rules(
                         &state,
                         pipeline,
-                        &RuleEvaluationContext::new(
-                            client_ip,
-                            domain,
-                            RecordType::A,
-                            DNSClass::IN,
-                            false,
-                            0,
-                            true,
-                        ),
+                        &facts,
+                        &RuleEvaluationContext::new(0, true),
                     );
-                    let fast = fast_static_match_with_rule(
-                        compiled,
-                        &crate::matcher::RequestFacts {
-                            qname: domain,
-                            qtype: RecordType::A,
-                            qclass: DNSClass::IN,
-                            client_ip,
-                            edns_present: false,
-                        },
-                        crate::matcher::GeoManagers::new(
-                            &engine.geoip_manager,
-                            &engine.geosite_manager,
-                        ),
-                    );
+                    let fast = fast_static_match_with_rule(compiled, &facts, engine.geo());
                     let agrees = match (&fast, &full) {
                         // 快速路径只把转发交出去 / The fast path hands on forwards only
                         (None, full) => !matches!(full, Decision::Static { .. }),
