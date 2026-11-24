@@ -205,14 +205,12 @@ impl std::fmt::Display for NoAddress {
 impl std::error::Error for NoAddress {}
 
 impl Bootstrap {
-    /// `servers` 是 `bootstrap` 的写法：逗号分隔的 `IP:端口`，空的就交给系统的解析器
-    /// `servers` as `bootstrap` writes them: comma-separated `IP:port`, none leaving it to the
-    /// system resolver
+    /// `servers` 是 `bootstrap` 的写法：逗号分隔的 `IP:端口`，照配置检查那样拆（见 `config::split_upstreams`），
+    /// 空的就交给系统的解析器
+    /// `servers` as `bootstrap` writes them: comma-separated `IP:port`, split as the configuration
+    /// check splits them (see `config::split_upstreams`), none leaving it to the system resolver
     pub(crate) fn new(servers: &str, udp: Arc<UdpClient>) -> Arc<Self> {
-        let servers: Box<[Box<str>]> = servers
-            .split(',')
-            .map(str::trim)
-            .filter(|server| !server.is_empty())
+        let servers: Box<[Box<str>]> = crate::config::split_upstreams(servers)
             .map(Box::from)
             .collect();
         Arc::new(Self {
