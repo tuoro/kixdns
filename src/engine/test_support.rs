@@ -831,6 +831,7 @@ impl Asked {
             qclass: hickory_proto::rr::DNSClass::IN,
             tx_id: 0,
             flags: crate::proto_utils::QueryFlags::of(&self.packet),
+            edns_version: 0,
             peer: self.peer,
             requester: crate::matcher::Requester {
                 address: self.peer.ip(),
