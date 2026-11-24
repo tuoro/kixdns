@@ -2008,7 +2008,7 @@ fn rule_problems(
         } = action
         {
             report(format!(
-                "ecs ip \"{ip}\" is not an IP address, so no ECS is sent"
+                "ecs ip \"{ip}\" is not an IP address, so no subnet is set and the client's own ECS, if any, goes upstream"
             ));
         }
         match action {

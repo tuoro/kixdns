@@ -104,9 +104,7 @@ impl Engine {
             qname,
             qtype,
             qclass,
-            pipeline
-                .rule_requester
-                .key(requester, Some(&self.geoip_manager)),
+            pipeline.rule_requester.key(requester, &self.geoip_manager),
         )
     }
 
