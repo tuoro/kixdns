@@ -42,6 +42,9 @@ struct TlsUpstream {
     cert: CertificateDer<'static>,
     connections: Arc<AtomicUsize>,
     seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    /// 关掉了几条连接（只有 `spawn_upstream` 起的上游数）/ How many connections have closed (counted by
+    /// upstreams `spawn_upstream` starts only)
+    closed: Arc<AtomicUsize>,
 }
 
 impl TlsUpstream {
@@ -114,14 +117,23 @@ async fn spawn_upstream(
     let addr = listener.local_addr().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let closed = Arc::new(AtomicUsize::new(0));
     let reply = Arc::new(reply);
     {
-        let (connections, seen) = (Arc::clone(&connections), Arc::clone(&seen));
+        let (connections, seen, closed) = (
+            Arc::clone(&connections),
+            Arc::clone(&seen),
+            Arc::clone(&closed),
+        );
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 connections.fetch_add(1, Ordering::SeqCst);
-                let (acceptor, seen, reply) =
-                    (acceptor.clone(), Arc::clone(&seen), Arc::clone(&reply));
+                let (acceptor, seen, reply, closed) = (
+                    acceptor.clone(),
+                    Arc::clone(&seen),
+                    Arc::clone(&reply),
+                    Arc::clone(&closed),
+                );
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
@@ -180,6 +192,7 @@ async fn spawn_upstream(
                                 let _ = tokio::time::timeout(Duration::from_millis(100), conn.as_mut()).await;
                             }
                         }
+                        closed.fetch_add(1, Ordering::SeqCst);
                     } else {
                         let conn =
                             hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
@@ -200,6 +213,7 @@ async fn spawn_upstream(
         cert: cert_der,
         connections,
         seen,
+        closed,
     }
 }
 
@@ -446,6 +460,7 @@ async fn spawn_h2_upstream_answering_after(after: Duration) -> TlsUpstream {
         cert,
         connections: Arc::new(AtomicUsize::new(0)),
         seen: Arc::default(),
+        closed: Arc::default(),
     };
     let connections = Arc::clone(&upstream.connections);
     tokio::spawn(async move {
@@ -566,6 +581,7 @@ async fn a_leaving_connection_takes_no_new_requests() {
         cert,
         connections: Arc::new(AtomicUsize::new(0)),
         seen: Arc::default(),
+        closed: Arc::default(),
     };
     let connections = Arc::clone(&upstream.connections);
     let leaving = Arc::new(tokio::sync::Notify::new());
@@ -708,17 +724,30 @@ async fn a_closed_connection_is_replaced() {
     assert_eq!(upstream.connections.load(Ordering::SeqCst), 2);
 }
 
-/// 空闲超过时限的连接不再用：NAT 可能早就忘了它 / A connection idle past the limit is not used again: a NAT may long have forgotten it
+/// 最后一个请求的期限过后空闲满时限的连接自己关掉，不等下一个请求来看：NAT 可能早就忘了它。下一个请求另连一条
+/// A connection idle its limit past the last request's deadline closes by itself, with no next
+/// request to look: a NAT may long have forgotten it. The next request connects again
 #[tokio::test]
-async fn an_idle_connection_is_not_reused() {
+async fn an_idle_connection_closes_by_itself() {
     let upstream = spawn_upstream(&[b"h2"], None, |q| dns_ok(echo(q))).await;
     let mut client = upstream.client(3);
     client.set_idle_timeout_for_tests(Duration::from_millis(150));
     let url = upstream.url("");
-    ask(&client, &url, 1).await.unwrap();
-    ask(&client, &url, 2).await.unwrap();
+    for id in 1..=2 {
+        let answer = client
+            .send(&query(id), &url, Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert_eq!(answer[..2], id.to_be_bytes());
+    }
     assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        upstream.closed.load(Ordering::SeqCst),
+        1,
+        "closed while idle"
+    );
+    assert!(!client.has_direct_connection(&url));
     ask(&client, &url, 3).await.unwrap();
     assert_eq!(upstream.connections.load(Ordering::SeqCst), 2);
 }
@@ -738,6 +767,7 @@ async fn a_query_answered_by_its_retry_clears_the_errors_in_a_row() {
         cert,
         connections: Arc::new(AtomicUsize::new(0)),
         seen: Arc::default(),
+        closed: Arc::default(),
     };
     let connections = Arc::clone(&upstream.connections);
     tokio::spawn(async move {
