@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,13 +7,10 @@ use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
 use crate::matcher::advanced_rule::CompiledPipeline;
-use crate::matcher::geoip::GeoIpManager;
-use crate::matcher::geosite::GeoSiteManager;
 use crate::matcher::{
     GeoManagers, RequestFacts, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
     parse_rcode,
 };
-use parking_lot::RwLock;
 
 use super::core::Engine;
 use super::observation::{
@@ -27,40 +23,22 @@ use super::types::EngineInner;
 use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_answer};
 use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
 
-/// Request and manager references required to select a runtime pipeline.
-pub struct PipelineSelectionContext<'a> {
-    pub qname: &'a str,
-    pub client_ip: IpAddr,
-    pub qclass: DNSClass,
-    pub edns_present: bool,
-    pub qtype: RecordType,
-    pub listener_label: &'a str,
-    pub geosite_manager: Option<&'a Arc<RwLock<GeoSiteManager>>>,
-    pub geoip_manager: Option<&'a Arc<RwLock<GeoIpManager>>>,
-}
-
+/// `cfg` 给从 `listener_label` 进来的请求 `facts` 选的 pipeline：第一条命中的 pipeline_select，都不命中时是第一个
+/// pipeline；匹配器要用 Geo 数据时才拿读锁（见 `GeoManagers`）
+/// The pipeline `cfg` picks for request `facts` come in at `listener_label`: that of the first
+/// pipeline_select matching, the first pipeline when none does; a matcher read-locks Geo data
+/// only to use it (see `GeoManagers`)
 pub fn select_pipeline<'a>(
     cfg: &'a RuntimePipelineConfig,
-    request: &PipelineSelectionContext<'_>,
+    listener_label: &str,
+    facts: &RequestFacts<'_>,
+    geo: GeoManagers<'_>,
 ) -> Option<&'a RuntimePipeline> {
-    let facts = RequestFacts {
-        qname: request.qname,
-        qtype: request.qtype,
-        qclass: request.qclass,
-        client_ip: request.client_ip,
-        edns_present: request.edns_present,
-    };
-    // 匹配器要用 Geo 数据时才拿读锁（见 `GeoManagers`）/ A matcher read-locks Geo data only to use it
-    // (see `GeoManagers`)
-    let geo = GeoManagers {
-        geoip: request.geoip_manager.map(|manager| &**manager),
-        geosite: request.geosite_manager.map(|manager| &**manager),
-    };
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
-            |m| m.matcher.matches(request.listener_label, &facts, geo),
+            |m| m.matcher.matches(listener_label, facts, geo),
         );
         if matched && let Some(p) = cfg.pipeline(&rule.pipeline) {
             return Some(p);
@@ -78,13 +56,9 @@ pub(crate) const NO_PIPELINE: &str = "default";
 /// one or two as a rule, kept off the heap
 pub(crate) type Continued = SmallVec<[usize; 4]>;
 
-/// Immutable request state shared across rule evaluation and rule-cache insertion.
+/// 一次规则求值自己的设定，请求本身见 [`RequestFacts`] / What one rule evaluation is set to do, the
+/// request itself being [`RequestFacts`]
 pub struct RuleEvaluationContext<'a> {
-    pub client_ip: IpAddr,
-    pub qname: &'a str,
-    pub qtype: RecordType,
-    pub qclass: DNSClass,
-    pub edns_present: bool,
     /// 这次求值不看的规则，按它们在规则组里的位置（见 [`Continued`]）
     /// The rules this evaluation leaves out, by their place in the pipeline (see [`Continued`])
     pub skip_rules: Option<&'a [usize]>,
@@ -98,21 +72,8 @@ pub struct RuleEvaluationContext<'a> {
 }
 
 impl<'a> RuleEvaluationContext<'a> {
-    pub fn new(
-        client_ip: IpAddr,
-        qname: &'a str,
-        qtype: RecordType,
-        qclass: DNSClass,
-        edns_present: bool,
-        skip_rules: Option<&'a [usize]>,
-        background_refresh: bool,
-    ) -> Self {
+    pub fn new(skip_rules: Option<&'a [usize]>, background_refresh: bool) -> Self {
         Self {
-            client_ip,
-            qname,
-            qtype,
-            qclass,
-            edns_present,
             skip_rules,
             background_refresh,
             observed: None,
@@ -231,14 +192,10 @@ impl Engine {
         &self,
         state: &EngineInner,
         pipeline: &RuntimePipeline,
+        facts: &RequestFacts<'_>,
         request: &RuleEvaluationContext<'_>,
     ) -> Decision {
         let RuleEvaluationContext {
-            client_ip,
-            qname,
-            qtype,
-            qclass,
-            edns_present,
             skip_rules,
             background_refresh,
             ..
@@ -247,12 +204,12 @@ impl Engine {
         let question = self.rule_question(
             state.cache_namespace(&pipeline.id),
             pipeline,
-            qname,
-            qtype,
-            qclass,
+            facts.qname,
+            facts.qtype,
+            facts.qclass,
             Requester {
-                address: client_ip,
-                edns: edns_present,
+                address: facts.client_ip,
+                edns: facts.edns_present,
                 ecs: None,
             },
         );
@@ -290,8 +247,14 @@ impl Engine {
         // 2. 按顺序求值规则；None 表示没有规则做出决策，使用默认上游。
         let mut matched_rules: SmallVec<[Arc<str>; 4]> = SmallVec::new();
         let mut logged = false;
-        let decided =
-            self.evaluate_rules(state, pipeline, request, &mut matched_rules, &mut logged);
+        let decided = self.evaluate_rules(
+            state,
+            pipeline,
+            facts,
+            request,
+            &mut matched_rules,
+            &mut logged,
+        );
         let decided_by_rule = decided.is_some();
         let decision =
             decided.unwrap_or_else(|| Decision::default_forward(&state.pipeline.settings));
@@ -340,7 +303,7 @@ impl Engine {
         decision
     }
 
-    /// Evaluate `pipeline`'s rules in order for `request`. Returns the first
+    /// Evaluate `pipeline`'s rules in order for `facts` as `request` says. Returns the first
     /// decision, or `None` when every matching rule continued. The names of
     /// the rules whose matchers matched are appended to `matched_rules`, and
     /// `logged` is set once a log action runs.
@@ -350,19 +313,19 @@ impl Engine {
         &self,
         state: &EngineInner,
         pipeline: &RuntimePipeline,
+        facts: &RequestFacts<'_>,
         request: &RuleEvaluationContext<'_>,
         matched_rules: &mut SmallVec<[Arc<str>; 4]>,
         logged: &mut bool,
     ) -> Option<Decision> {
-        let RuleEvaluationContext {
-            client_ip,
+        let RequestFacts {
             qname,
             qtype,
             qclass,
-            edns_present,
-            skip_rules,
+            client_ip,
             ..
-        } = *request;
+        } = *facts;
+        let skip_rules = request.skip_rules;
         // 2. Candidate Selection: every pipeline is compiled with its configuration (see
         // `compiled_for`), and its index gives every rule that can match (see
         // `RuleIndex::add_rule`). Without it no rule would match, the request going past
@@ -377,14 +340,7 @@ impl Engine {
             .get_candidates(qname, qtype);
 
         // 3. Execute Rules
-        let facts = RequestFacts {
-            qname,
-            qtype,
-            qclass,
-            client_ip,
-            edns_present,
-        };
-        let geo = GeoManagers::new(&self.geoip_manager, &self.geosite_manager);
+        let geo = self.geo();
 
         'rules: for idx in candidate_indices {
             // 候选出自这个 pipeline 自己的索引，同一份配置里编译出来的 / The candidates come from this
@@ -396,7 +352,7 @@ impl Engine {
             let req_match = eval_match_chain(
                 &rule.matchers,
                 |m| m.operator,
-                |m| m.matcher.matches(&facts, geo),
+                |m| m.matcher.matches(facts, geo),
             );
             if let Some((observer, observed_ctx)) = request.observed {
                 observer.rule_evaluated(
@@ -428,18 +384,13 @@ impl Engine {
                             return Some(d);
                         }
                         Action::StaticIpResponse { ip } => {
-                            let (rcode, answers) =
-                                make_static_ip_answer(qname, request.qtype, request.qclass, ip);
+                            let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
                             let d = Decision::Static { rcode, answers };
                             return Some(d);
                         }
                         Action::StaticCnameResponse { target, ttl } => {
-                            let (rcode, answers) = make_static_cname_answer(
-                                qname,
-                                request.qclass,
-                                target,
-                                ttl.unwrap_or(300),
-                            );
+                            let (rcode, answers) =
+                                make_static_cname_answer(qname, qclass, target, ttl.unwrap_or(300));
                             let d = Decision::Static { rcode, answers };
                             return Some(d);
                         }
@@ -527,8 +478,8 @@ impl Engine {
                             // answered SERVFAIL
                             let (rcode, answers) = make_static_txt_answer(
                                 qname,
-                                request.qtype,
-                                request.qclass,
+                                qtype,
+                                qclass,
                                 text,
                                 ttl.unwrap_or(300),
                             );
@@ -627,12 +578,11 @@ mod observer_rule_cache_tests {
 
 #[cfg(test)]
 mod continued_rule_cache_tests {
-    use hickory_proto::rr::{DNSClass, RecordType};
-
     use super::RuleEvaluationContext;
     use crate::engine::Engine;
     use crate::engine::rules::Decision;
     use crate::engine::test_support::engine_from;
+    use crate::matcher::RequestFacts;
 
     /// `first` forwards and continues on a miss; `next` forwards elsewhere. `first` matches by
     /// regex: only a pipeline with regex conditions keeps forward decisions in the rule cache.
@@ -680,22 +630,22 @@ mod continued_rule_cache_tests {
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
         let continued = [0usize];
-        let request = |skip_rules| {
-            RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                "example.com",
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                skip_rules,
-                false,
-            )
-        };
+        let request = |skip_rules| RuleEvaluationContext::new(skip_rules, false);
 
-        let after_continue = engine.apply_rules(&state, pipeline, &request(Some(&continued[..])));
+        let after_continue = engine.apply_rules(
+            &state,
+            pipeline,
+            &RequestFacts::a_query("example.com"),
+            &request(Some(&continued[..])),
+        );
         assert_eq!(rule_of(&after_continue), "next");
 
-        let fresh = engine.apply_rules(&state, pipeline, &request(None));
+        let fresh = engine.apply_rules(
+            &state,
+            pipeline,
+            &RequestFacts::a_query("example.com"),
+            &request(None),
+        );
         assert_eq!(
             rule_of(&fresh),
             "first",
@@ -730,7 +680,7 @@ mod rule_cache_policy_tests {
     use crate::engine::Engine;
     use crate::engine::rules::{Decision, RULE_CACHE_MAX_AGE, calculate_rule_hash};
     use crate::engine::test_support::engine_from;
-    use crate::matcher::RequesterKey;
+    use crate::matcher::{RequestFacts, RequesterKey};
 
     /// `plain` pipeline 只有后缀和 any 条件，`regex` pipeline 带正则条件
     /// The `plain` pipeline has suffix and any conditions only, the `regex` one a regex condition
@@ -785,16 +735,8 @@ mod rule_cache_policy_tests {
         assert!(!plain.matches_regex);
         assert!(regex.matches_regex);
         let ask = |pipeline, name| {
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
-            );
-            engine.apply_rules(&state, pipeline, &request)
+            let request = RuleEvaluationContext::new(None, false);
+            engine.apply_rules(&state, pipeline, &RequestFacts::a_query(name), &request)
         };
         assert!(matches!(ask(plain, "ads.example"), Decision::Static { .. }));
         assert!(matches!(ask(plain, "jump.example"), Decision::Jump { .. }));
@@ -845,16 +787,8 @@ mod rule_cache_policy_tests {
         let state = engine.state.load_full();
         let plain = &state.pipeline.pipelines[0];
         let ask = |name| {
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
-            );
-            engine.apply_rules(&state, plain, &request)
+            let request = RuleEvaluationContext::new(None, false);
+            engine.apply_rules(&state, plain, &RequestFacts::a_query(name), &request)
         };
         let key_of = |name| {
             calculate_rule_hash(
@@ -926,16 +860,8 @@ mod rule_cache_policy_tests {
         assert!(pipeline.matches_regex);
         let before = Instant::now();
         for name in ["ads.example", "jump.example", "example.com"] {
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
-            );
-            engine.apply_rules(&state, pipeline, &request);
+            let request = RuleEvaluationContext::new(None, false);
+            engine.apply_rules(&state, pipeline, &RequestFacts::a_query(name), &request);
         }
         let after = Instant::now();
 
@@ -977,16 +903,8 @@ mod rule_cache_policy_tests {
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
         let upstream_of = |name: &str| {
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
-            );
-            match engine.apply_rules(&state, pipeline, &request) {
+            let request = RuleEvaluationContext::new(None, false);
+            match engine.apply_rules(&state, pipeline, &RequestFacts::a_query(name), &request) {
                 Decision::Forward {
                     upstream,
                     rule_name,
@@ -1026,17 +944,14 @@ mod rule_cache_policy_tests {
                 "pipelines": [{ "id": "main", "rules": [rule] }]
             }));
             let state = engine.state.load_full();
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                "www.example.com",
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
-            );
+            let request = RuleEvaluationContext::new(None, false);
             let before = Instant::now();
-            engine.apply_rules(&state, &state.pipeline.pipelines[0], &request);
+            engine.apply_rules(
+                &state,
+                &state.pipeline.pipelines[0],
+                &RequestFacts::a_query("www.example.com"),
+                &request,
+            );
             engine.rule_cache.values().first().map(|record| {
                 let expires = record.entry.expires_at.expect("every decision expires");
                 expires.saturating_duration_since(before).as_secs_f64()
@@ -1097,16 +1012,8 @@ mod rule_cache_policy_tests {
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
         let phase_of = |name: &str| {
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
-            );
-            match engine.apply_rules(&state, pipeline, &request) {
+            let request = RuleEvaluationContext::new(None, false);
+            match engine.apply_rules(&state, pipeline, &RequestFacts::a_query(name), &request) {
                 Decision::Forward { response_phase, .. } => response_phase,
                 _ => panic!("every name here forwards"),
             }
@@ -1140,16 +1047,8 @@ mod rule_cache_policy_tests {
         let state = engine.state.load_full();
         let plain = &state.pipeline.pipelines[0];
         let target_of = |name: &str| {
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                name,
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
-            );
-            match engine.apply_rules(&state, plain, &request) {
+            let request = RuleEvaluationContext::new(None, false);
+            match engine.apply_rules(&state, plain, &RequestFacts::a_query(name), &request) {
                 Decision::Jump { pipeline } => pipeline,
                 other => panic!("{name} jumps, got {other:?}"),
             }
@@ -1178,16 +1077,13 @@ mod rule_cache_policy_tests {
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
         let evaluate = || {
-            let request = RuleEvaluationContext::new(
-                "127.0.0.1".parse().unwrap(),
-                "ads.example",
-                RecordType::A,
-                DNSClass::IN,
-                false,
-                None,
-                false,
+            let request = RuleEvaluationContext::new(None, false);
+            engine.apply_rules(
+                &state,
+                pipeline,
+                &RequestFacts::a_query("ads.example"),
+                &request,
             );
-            engine.apply_rules(&state, pipeline, &request);
         };
         evaluate();
         let key = calculate_rule_hash(

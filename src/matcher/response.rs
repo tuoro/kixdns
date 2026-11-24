@@ -207,16 +207,24 @@ impl RuntimeResponseMatcher {
         })
     }
 
+    /// `upstream`（作答的上游，`udp:1.1.1.1:53`）给请求 `facts` 的应答 `msg` 合不合这个匹配器。Geo 数据和请求匹配器
+    /// 一样只在要用时拿读锁（见 [`GeoManagers`]）
+    /// Whether the answer `msg` that `upstream` (the answering upstream, `udp:1.1.1.1:53`) gave
+    /// request `facts` meets this matcher. The Geo data is read-locked only when used, as for
+    /// request matchers (see [`GeoManagers`])
     pub fn matches(
         &self,
+        facts: &RequestFacts<'_>,
         upstream: &str,
-        qname: &str,
-        qtype: RecordType,
-        qclass: DNSClass,
         msg: &Message,
-        geoip_manager: Option<&crate::matcher::geoip::GeoIpManager>,
-        geosite_manager: Option<&crate::matcher::geosite::GeoSiteManager>,
+        geo: GeoManagers<'_>,
     ) -> bool {
+        let RequestFacts {
+            qname,
+            qtype,
+            qclass,
+            ..
+        } = *facts;
         match self {
             RuntimeResponseMatcher::UpstreamEquals { value, addresses } => {
                 upstream == value.as_ref() || {
@@ -270,9 +278,7 @@ impl RuntimeResponseMatcher {
                 edns == *expect
             }
             RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } => {
-                let Some(manager) = geoip_manager else {
-                    return false;
-                };
+                let manager = geo.geoip.read();
                 let mut has_ip = false;
                 let mut matches_country = |ip| manager.matches_any_tag(ip, country_codes);
                 let all_match = msg.answers.iter().all(|record| {
@@ -294,10 +300,10 @@ impl RuntimeResponseMatcher {
             // does (see `RuntimeMatcher::matches`). geo_site_not used not to match here
             // either, so one condition gave opposite results in an answer check and a request rule
             RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
-                geosite_manager.is_some_and(|mgr| mgr.matches(value, qname))
+                geo.geosite.read().matches(value, qname)
             }
             RuntimeResponseMatcher::ResponseRequestDomainGeoSiteNot { value } => {
-                geosite_manager.is_none_or(|mgr| !mgr.matches(value, qname))
+                !geo.geosite.read().matches(value, qname)
             }
             RuntimeResponseMatcher::ResponseTxtContent { mode, value, regex } => {
                 // 每条 TXT 记录分开比较，有一条命中就算命中；一条记录里的几个字符串先不加空格连起来，和
@@ -337,18 +343,6 @@ impl RuntimeResponseMatcher {
             }
             _ => None,
         }
-    }
-
-    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
-    #[inline]
-    pub fn needs_geosite(&self) -> bool {
-        matches!(self.geo_tags(), Some(GeoTags::Site(_)))
-    }
-
-    /// 要不要 GeoIP 数据 / Whether it needs GeoIP data
-    #[inline]
-    pub fn needs_geoip(&self) -> bool {
-        matches!(self.geo_tags(), Some(GeoTags::Ip(_)))
     }
 }
 
@@ -420,13 +414,10 @@ mod geosite_tests {
             let response = RuntimeResponseMatcher::from_config(response).unwrap();
             assert_eq!(
                 response.matches(
+                    &RequestFacts::a_query("ads.example"),
                     "udp:test",
-                    "ads.example",
-                    RecordType::A,
-                    DNSClass::IN,
                     &message,
-                    None,
-                    None,
+                    GeoManagers::empty(),
                 ),
                 request.matches(
                     &RequestFacts {
@@ -436,7 +427,7 @@ mod geosite_tests {
                         client_ip: IpAddr::from([192, 0, 2, 1]),
                         edns_present: false,
                     },
-                    GeoManagers::default(),
+                    GeoManagers::empty(),
                 ),
                 "{request:?}"
             );
@@ -447,6 +438,7 @@ mod geosite_tests {
 #[cfg(test)]
 mod txt_regex_tests {
     use super::RuntimeResponseMatcher;
+    use crate::matcher::{GeoManagers, RequestFacts};
 
     fn built(pattern: &str) -> anyhow::Result<RuntimeResponseMatcher> {
         RuntimeResponseMatcher::from_config(crate::config::ResponseMatcher::ResponseTxtContent {
@@ -511,13 +503,14 @@ mod txt_regex_tests {
             let matcher = built(pattern).unwrap();
             assert!(
                 matcher.matches(
+                    &RequestFacts {
+                        qtype: RecordType::TXT,
+                        qclass: DNSClass::IN,
+                        ..RequestFacts::a_query("example.com")
+                    },
                     "udp:test",
-                    "example.com",
-                    RecordType::TXT,
-                    DNSClass::IN,
                     &answer(text),
-                    None,
-                    None,
+                    GeoManagers::empty(),
                 ),
                 "{pattern} against {text}"
             );
@@ -557,13 +550,14 @@ mod txt_regex_tests {
             )
             .unwrap()
             .matches(
+                &RequestFacts {
+                    qtype: RecordType::TXT,
+                    qclass: DNSClass::IN,
+                    ..RequestFacts::a_query("example.com")
+                },
                 "udp:test",
-                "example.com",
-                RecordType::TXT,
-                DNSClass::IN,
                 message,
-                None,
-                None,
+                GeoManagers::empty(),
             )
         };
         let two_records = answer(&[

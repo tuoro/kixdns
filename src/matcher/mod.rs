@@ -787,11 +787,12 @@ impl RuntimeMatcher {
     }
 
     /// 请求 `facts` 合不合这个匹配器。规则、pipeline_select 和快速路径都走这里，Geo 数据只在要用时拿读锁（见
-    /// [`GeoManagers`]）：没有 GeoSite 数据时 geo_site 不命中、geo_site_not 命中，没有 GeoIP 数据时 geoip_country 不命中
+    /// [`GeoManagers`]）：没有那个 GeoSite 标签的数据时 geo_site 不命中、geo_site_not 命中，没有 GeoIP 数据时
+    /// geoip_country 不命中
     /// Whether request `facts` meets this matcher. Rules, pipeline_select and the fast path all
-    /// come here, the Geo data read-locked only when used (see [`GeoManagers`]): without GeoSite
-    /// data geo_site does not match and geo_site_not does, and without GeoIP data geoip_country
-    /// does not match
+    /// come here, the Geo data read-locked only when used (see [`GeoManagers`]): without data for
+    /// the GeoSite tag geo_site does not match and geo_site_not does, and without GeoIP data
+    /// geoip_country does not match
     pub fn matches(&self, facts: &RequestFacts<'_>, geo: GeoManagers<'_>) -> bool {
         let RequestFacts {
             qname,
@@ -809,20 +810,16 @@ impl RuntimeMatcher {
             RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
-            RuntimeMatcher::GeoipCountry { country_codes } => geo
-                .geoip
-                .is_some_and(|manager| manager.read().matches_any_tag(client_ip, country_codes)),
+            RuntimeMatcher::GeoipCountry { country_codes } => {
+                geo.geoip.read().matches_any_tag(client_ip, country_codes)
+            }
             RuntimeMatcher::GeoipPrivate { expect } => {
                 crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
             RuntimeMatcher::Qclass { value } => qclass == *value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimeMatcher::GeoSite { tag } => geo
-                .geosite
-                .is_some_and(|manager| manager.read().matches(tag, qname)),
-            RuntimeMatcher::GeoSiteNot { tag } => geo
-                .geosite
-                .is_none_or(|manager| !manager.read().matches(tag, qname)),
+            RuntimeMatcher::GeoSite { tag } => geo.geosite.read().matches(tag, qname),
+            RuntimeMatcher::GeoSiteNot { tag } => !geo.geosite.read().matches(tag, qname),
             RuntimeMatcher::Qtype { value } => *value == qtype,
         }
     }
@@ -840,9 +837,11 @@ impl RuntimeMatcher {
     }
 }
 
-/// 请求匹配器看的请求：名字（名字文本，见 `proto_utils::name_text`）、类型、类别、客户端地址、带不带 EDNS
-/// The request as request matchers see it: the name (as name text, see
-/// `proto_utils::name_text`), type, class, client address, and whether it carries EDNS
+/// 请求匹配器和回答检查看的请求：名字（名字文本，见 `proto_utils::name_text`）、类型、类别、客户端地址、带不带 EDNS。
+/// 每个请求只建一份：选 pipeline、求值规则、检查回答都拿它
+/// The request as request matchers and answer checks see it: the name (as name text, see
+/// `proto_utils::name_text`), type, class, client address, and whether it carries EDNS. Each
+/// request builds one: choosing the pipeline, evaluating rules and checking answers all take it
 #[derive(Debug, Clone, Copy)]
 pub struct RequestFacts<'a> {
     pub qname: &'a str,
@@ -852,28 +851,49 @@ pub struct RequestFacts<'a> {
     pub edns_present: bool,
 }
 
+#[cfg(test)]
+impl<'a> RequestFacts<'a> {
+    /// 测试用：127.0.0.1 不带 EDNS 问 `qname` 的 A 记录 / For tests: 127.0.0.1 asking for the A
+    /// record of `qname` without EDNS
+    pub(crate) fn a_query(qname: &'a str) -> Self {
+        Self {
+            qname,
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            client_ip: IpAddr::from([127, 0, 0, 1]),
+            edns_present: false,
+        }
+    }
+}
+
 /// 匹配器判断时能读的 Geo 数据。每个匹配器要用时才拿读锁，用完就放：不读 Geo 数据的匹配器不碰锁，每个查询不必为
-/// 它们去改所有核共用的锁计数。没有的那份当作没有数据（见 [`RuntimeMatcher::matches`]）
+/// 它们去改所有核共用的锁计数
 /// The Geo data matchers may read as they judge. Each matcher read-locks it when it uses it and
 /// lets go once done: matchers reading no Geo data leave the locks alone, so no query writes the
-/// lock count all cores share for them. One missing counts as no data (see
-/// [`RuntimeMatcher::matches`])
-#[derive(Clone, Copy, Default)]
+/// lock count all cores share for them
+#[derive(Clone, Copy)]
 pub struct GeoManagers<'a> {
-    pub geoip: Option<&'a parking_lot::RwLock<geoip::GeoIpManager>>,
-    pub geosite: Option<&'a parking_lot::RwLock<geosite::GeoSiteManager>>,
+    pub geoip: &'a parking_lot::RwLock<geoip::GeoIpManager>,
+    pub geosite: &'a parking_lot::RwLock<geosite::GeoSiteManager>,
 }
 
 impl<'a> GeoManagers<'a> {
-    /// 两份数据都在 / With both kinds of data
     pub fn new(
         geoip: &'a parking_lot::RwLock<geoip::GeoIpManager>,
         geosite: &'a parking_lot::RwLock<geosite::GeoSiteManager>,
     ) -> Self {
-        Self {
-            geoip: Some(geoip),
-            geosite: Some(geosite),
-        }
+        Self { geoip, geosite }
+    }
+}
+
+#[cfg(test)]
+impl GeoManagers<'static> {
+    /// 测试用：两份都还没有数据 / For tests: neither holding any data yet
+    pub(crate) fn empty() -> Self {
+        type Empty<T> = std::sync::LazyLock<parking_lot::RwLock<T>>;
+        static GEOIP: Empty<geoip::GeoIpManager> = std::sync::LazyLock::new(Default::default);
+        static GEOSITE: Empty<geosite::GeoSiteManager> = std::sync::LazyLock::new(Default::default);
+        Self::new(&GEOIP, &GEOSITE)
     }
 }
 
@@ -1139,7 +1159,7 @@ mod tests {
                                 client_ip: IpAddr::from([192, 0, 2, 1]),
                                 edns_present: false,
                             },
-                            GeoManagers::default(),
+                            GeoManagers::empty(),
                         )
                     },
                 )
@@ -1418,7 +1438,7 @@ mod tests {
                 client_ip: IpAddr::from([192, 0, 2, 1]),
                 edns_present: false,
             };
-            let geo = GeoManagers::default();
+            let geo = GeoManagers::empty();
             [
                 rule.pipelines[0].rules[0].matchers[0]
                     .matcher
@@ -1428,15 +1448,7 @@ mod tests {
                     .matches("test", &facts, geo),
                 phase(&response.pipelines[0].rules[0]).matchers[0]
                     .matcher
-                    .matches(
-                        "udp:test",
-                        name,
-                        RecordType::A,
-                        DNSClass::IN,
-                        &message,
-                        None,
-                        None,
-                    ),
+                    .matches(&facts, "udp:test", &message, geo),
             ]
         }
     }
@@ -1966,10 +1978,7 @@ mod tests {
             client_ip: ip,
             edns_present: false,
         };
-        let geo = GeoManagers {
-            geoip: Some(&manager),
-            geosite: None,
-        };
+        let geo = GeoManagers::new(&manager, GeoManagers::empty().geosite);
         let request = RuntimeMatcher::GeoipCountry {
             country_codes: tags.clone(),
         };
@@ -1979,8 +1988,6 @@ mod tests {
             country_codes: tags.clone(),
         });
         assert!(pipeline.matches("test", &facts, geo));
-        let guard = manager.read();
-
         let response = RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
             country_codes: tags,
         };
@@ -1991,13 +1998,10 @@ mod tests {
             RData::A(A(Ipv4Addr::new(104, 16, 0, 1))),
         ));
         assert!(response.matches(
+            &RequestFacts::a_query("example.com"),
             "udp:test",
-            "example.com",
-            RecordType::A,
-            DNSClass::IN,
             &message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
         let mut https_message = Message::new(0, MessageType::Response, OpCode::Query);
@@ -2022,25 +2026,27 @@ mod tests {
             ))),
         ));
         assert!(response.matches(
+            &RequestFacts {
+                qtype: RecordType::HTTPS,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::HTTPS,
-            DNSClass::IN,
             &https_message,
-            Some(&guard),
-            None,
+            geo,
         ));
         let country_response = RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
             country_codes: vec![Arc::from("US")],
         };
         assert!(country_response.matches(
+            &RequestFacts {
+                qtype: RecordType::HTTPS,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::HTTPS,
-            DNSClass::IN,
             &https_message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
         let no_hint_record = Record::from_rdata(
@@ -2051,47 +2057,51 @@ mod tests {
         let mut no_hint_message = Message::new(0, MessageType::Response, OpCode::Query);
         no_hint_message.add_answer(no_hint_record.clone());
         assert!(!country_response.matches(
+            &RequestFacts {
+                qtype: RecordType::HTTPS,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::HTTPS,
-            DNSClass::IN,
             &no_hint_message,
-            Some(&guard),
-            None,
+            geo,
         ));
         let mut mixed_no_hint_message = https_message.clone();
         mixed_no_hint_message.add_answer(no_hint_record);
         assert!(country_response.matches(
+            &RequestFacts {
+                qtype: RecordType::HTTPS,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::HTTPS,
-            DNSClass::IN,
             &mixed_no_hint_message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
         assert!(!response.matches(
+            &RequestFacts {
+                qtype: RecordType::HTTPS,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::HTTPS,
-            DNSClass::IN,
             &https_message,
-            None,
-            None,
+            GeoManagers::empty(),
         ));
 
         let cidr_response = RuntimeResponseMatcher::ResponseAnswerIp {
             nets: vec!["104.21.0.0/16".parse().unwrap()],
         };
         assert!(cidr_response.matches(
+            &RequestFacts {
+                qtype: RecordType::HTTPS,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::HTTPS,
-            DNSClass::IN,
             &https_message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
         let mut svcb_answer_message = Message::new(0, MessageType::Response, OpCode::Query);
@@ -2116,22 +2126,24 @@ mod tests {
             )),
         ));
         assert!(country_response.matches(
+            &RequestFacts {
+                qtype: RecordType::SVCB,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::SVCB,
-            DNSClass::IN,
             &svcb_answer_message,
-            Some(&guard),
-            None,
+            geo,
         ));
         assert!(cidr_response.matches(
+            &RequestFacts {
+                qtype: RecordType::SVCB,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::SVCB,
-            DNSClass::IN,
             &svcb_answer_message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
         let mut mixed_message = https_message.clone();
@@ -2141,13 +2153,14 @@ mod tests {
             RData::A(A(Ipv4Addr::new(203, 0, 113, 1))),
         ));
         assert!(!response.matches(
+            &RequestFacts {
+                qtype: RecordType::HTTPS,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::HTTPS,
-            DNSClass::IN,
             &mixed_message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
         let mut additional_message = Message::new(0, MessageType::Response, OpCode::Query);
@@ -2157,22 +2170,16 @@ mod tests {
             RData::A(A(Ipv4Addr::new(104, 21, 11, 126))),
         ));
         assert!(!response.matches(
+            &RequestFacts::a_query("example.com"),
             "udp:test",
-            "example.com",
-            RecordType::A,
-            DNSClass::IN,
             &additional_message,
-            Some(&guard),
-            None,
+            geo,
         ));
         assert!(cidr_response.matches(
+            &RequestFacts::a_query("example.com"),
             "udp:test",
-            "example.com",
-            RecordType::A,
-            DNSClass::IN,
             &additional_message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
         let mut svcb_message = Message::new(0, MessageType::Response, OpCode::Query);
@@ -2191,16 +2198,16 @@ mod tests {
         let private_response =
             RuntimeResponseMatcher::ResponseAnswerIpGeoipPrivate { expect: true };
         assert!(private_response.matches(
+            &RequestFacts {
+                qtype: RecordType::SVCB,
+                qclass: DNSClass::IN,
+                ..RequestFacts::a_query("example.com")
+            },
             "udp:test",
-            "example.com",
-            RecordType::SVCB,
-            DNSClass::IN,
             &svcb_message,
-            Some(&guard),
-            None,
+            geo,
         ));
 
-        drop(guard);
         let _ = std::fs::remove_file(path);
     }
 
@@ -2223,6 +2230,8 @@ mod tests {
         .unwrap();
         let mut geoip = geoip::GeoIpManager::default();
         geoip.load_from_v2ray_file(&path).unwrap();
+        let geoip = parking_lot::RwLock::new(geoip);
+        let geo = GeoManagers::new(&geoip, GeoManagers::empty().geosite);
 
         let matcher = |config: serde_json::Value| {
             RuntimeResponseMatcher::from_config(serde_json::from_value(config).unwrap()).unwrap()
@@ -2257,13 +2266,14 @@ mod tests {
             for message in &answers {
                 assert!(
                     matcher.matches(
+                        &RequestFacts {
+                            qtype: RecordType::AAAA,
+                            qclass: DNSClass::IN,
+                            ..RequestFacts::a_query("example.com")
+                        },
                         "udp:test",
-                        "example.com",
-                        RecordType::AAAA,
-                        DNSClass::IN,
                         message,
-                        Some(&geoip),
-                        None,
+                        geo,
                     ),
                     "matcher {which}: {:?}",
                     message.answers[0].data
@@ -2275,13 +2285,10 @@ mod tests {
             serde_json::json!({ "type": "response_answer_ip", "cidr": "::ffff:192.168.0.0/112" }),
         );
         assert!(mapped_net.matches(
+            &RequestFacts::a_query("example.com"),
             "udp:test",
-            "example.com",
-            RecordType::A,
-            DNSClass::IN,
             &answer(RData::A(A(Ipv4Addr::new(192, 168, 1, 1)))),
-            None,
-            None,
+            GeoManagers::empty(),
         ));
     }
 
@@ -2348,13 +2355,10 @@ mod tests {
                 value: Arc::from(value),
             }
             .matches(
+                &RequestFacts::a_query(qname),
                 "udp:test",
-                qname,
-                RecordType::A,
-                DNSClass::IN,
                 &message,
-                None,
-                None,
+                GeoManagers::empty(),
             )
         };
         assert!(check("svc.test", "svc.test"));

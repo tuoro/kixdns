@@ -19,7 +19,7 @@ use crate::engine::response::{
 use crate::engine::upstream::UpstreamFailure;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
-use crate::matcher::{RequesterKey, ResponsePhase, parse_rcode};
+use crate::matcher::{RequestFacts, RequesterKey, ResponsePhase, parse_rcode};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -302,44 +302,28 @@ pub(crate) fn check_failure_reply(
     Some((raw.clone(), upstream.clone(), msg))
 }
 
-/// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给的应答 `msg` 是否成立；没有应答（`None`）时不成立，没有匹配器时
-/// 成立。每个匹配器只在求值时拿它要的那把 Geo 读锁，和请求规则一样（见 `RuntimeMatcher::matches`）：不用 Geo
-/// 数据的检查一把都不拿；一次只拿一把，也就不会和排队的写者互相等。以前每次检查都把 GeoIP、GeoSite 两把一起拿上
-/// Whether the response matchers hold for the answer `msg` that `upstream` gave (the
-/// answering upstream, `udp:1.1.1.1:53`); without an answer (`None`) they do not, and with no
-/// matchers they do. Each matcher takes the Geo read lock it needs only while it is evaluated,
-/// as request rules do (see `RuntimeMatcher::matches`): a check using no Geo data
-/// takes none, and holding one at a time, it never waits on a queued writer that waits on it.
-/// Every check used to take both the GeoIP and the GeoSite lock
+/// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给请求 `facts` 的应答 `msg` 是否成立；没有应答（`None`）时不成立，
+/// 没有匹配器时成立。每个匹配器只在求值时拿它要的那把 Geo 读锁，和请求规则一样（见 `RuntimeResponseMatcher::matches`）：
+/// 不用 Geo 数据的检查一把都不拿；一次只拿一把，也就不会和排队的写者互相等
+/// Whether the response matchers hold for the answer `msg` that `upstream` gave request
+/// `facts` (the answering upstream, `udp:1.1.1.1:53`); without an answer (`None`) they do not,
+/// and with no matchers they do. Each matcher takes the Geo read lock it needs only while it is
+/// evaluated, as request rules do (see `RuntimeResponseMatcher::matches`): a check using no Geo
+/// data takes none, and holding one at a time, it never waits on a queued writer that waits on
+/// it
 pub(crate) fn response_matches(
     engine: &Engine,
     matchers: &[RuntimeResponseMatcherWithOp],
+    facts: &RequestFacts<'_>,
     upstream: &str,
-    qname: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
     msg: Option<&Message>,
 ) -> bool {
+    let geo = engine.geo();
     msg.is_some_and(|msg| {
         eval_match_chain(
             matchers,
             |m| m.operator,
-            |m| {
-                let geoip = m.matcher.needs_geoip().then(|| engine.geoip_manager.read());
-                let geosite = m
-                    .matcher
-                    .needs_geosite()
-                    .then(|| engine.geosite_manager.read());
-                m.matcher.matches(
-                    upstream,
-                    qname,
-                    qtype,
-                    qclass,
-                    msg,
-                    geoip.as_deref(),
-                    geosite.as_deref(),
-                )
-            },
+            |m| m.matcher.matches(facts, upstream, msg, geo),
         )
     })
 }
