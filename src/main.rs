@@ -408,24 +408,23 @@ async fn run_dns_server(
     // not missed (see `watcher::ConfigWatch`)
     let watch = watcher::ConfigWatch::new(&config);
     let (cfg, config_source) = load_config_with_source(&config).context("load initial config")?;
-    // 启动时照样加载（超过上限的设置按上限用，见 `config::problems`），升级以后已经在用的配置照样起得来；重载和面板的校验
-    // 会拒绝它们。和重载拒绝时一样记 error，默认日志级别就看得到：以前只记 warn，默认级别下谁也不知道下一次改配置会被拒
-    // Startup loads them all the same (a setting over its limit held to it, see
+    let version = cfg.version.clone();
+    // 起不来时问题和说不通的设置、编译不了的匹配器、监听地址和 DoH 的前提一起，一次列全在那条致命错误里，每条开头就写着
+    // 是哪个设置或匹配器，和重载、校验时一样（见 `config::compile_at_startup`）
+    // When it cannot start, the problems are listed all at once in the fatal error together with
+    // the settings that make no sense, the matchers that do not compile and the listener addresses
+    // and DoH prerequisites, each starting with the setting or matcher it is about, as on a reload
+    // and in validation (see `config::compile_at_startup`)
+    let (cfg, listeners, problems) = kixdns::config::compile_at_startup(cfg)?;
+    // 起得来时问题照样加载（超过上限的设置按上限用，见 `config::problems`），升级以后已经在用的配置照样起得来；重载和面板
+    // 的校验会拒绝它们。和重载拒绝时一样记 error，默认日志级别就看得到
+    // Once it starts the problems load all the same (a setting over its limit held to it, see
     // `config::problems`), so a configuration in use still starts after an upgrade; a reload and
     // the panel's validation refuse them. They are logged at error, as the reload refusing them
-    // is, so the default log level shows them: they used to be a warn, and at the default level
-    // nobody learnt that the next change would be refused
-    let problems = kixdns::config::problems(&cfg);
-    let version = cfg.version.clone();
+    // is, so the default log level shows them
     for problem in &problems {
         error!(%problem, "configuration problem, loaded all the same; a reload or a save from the panel refuses it");
     }
-    // 说不通的设置、编译不了的匹配器、监听地址和 DoH 的前提一次列全，每条开头就写着是哪个设置或匹配器，和重载、校验时一样
-    // （见 `config::compile_at_startup`）/ Settings that make no sense, matchers that do not compile,
-    // and the listener addresses and DoH prerequisites are listed all at once, each starting with
-    // the setting or matcher it is about, as on a reload and in validation (see
-    // `config::compile_at_startup`)
-    let (cfg, listeners) = kixdns::config::compile_at_startup(cfg)?;
     let bind_addr = listeners.udp;
     let bind_tcp = listeners.tcp;
 
