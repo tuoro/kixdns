@@ -1779,11 +1779,24 @@ impl AnyMatcher<'_> {
         }
     }
 
-    /// 这个匹配器照样加载、却值得知道的写法（见 [`warnings`]）/ How this matcher is written
-    /// that loads all the same yet is worth knowing (see [`warnings`])
+    /// 这个匹配器照样加载、却值得知道的写法（见 [`warnings`]）：值写成空、永远不命中的，和域名正则里照写永远命不中的
+    /// 大写字母（见 `matcher::capitals_warning`）/ How this matcher is written that loads all
+    /// the same yet is worth knowing (see [`warnings`]): with its value written empty never
+    /// matching, or with capitals in a name regex that never match as written (see
+    /// `matcher::capitals_warning`)
     fn warning(self) -> Option<String> {
-        self.written_empty()
-            .and_then(|(weight, warning)| (weight == Weight::Warning).then_some(warning))
+        if let Some((weight, warning)) = self.written_empty() {
+            return (weight == Weight::Warning).then_some(warning);
+        }
+        match self {
+            Self::Request(Matcher::DomainRegex { value }) => {
+                crate::matcher::capitals_warning("domain_regex", value)
+            }
+            Self::Response(ResponseMatcher::RequestDomainRegex { value }) => {
+                crate::matcher::capitals_warning("request_domain_regex", value)
+            }
+            _ => None,
+        }
     }
 
     /// 值写成空的这个匹配器做成了什么，按它的意思分：它看的每一样都匹配的（每个名字，或者每份带 TXT 记录的回答）
