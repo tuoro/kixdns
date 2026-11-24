@@ -107,13 +107,17 @@ impl Drop for RefreshingGuard {
     }
 }
 
-/// 规则（连同 pipeline_select 和回答检查）用到的 GeoSite 标签（已经是小写），排好序、去掉重复：数据文件只读这些标签
+/// 规则（连同 pipeline_select 和回答检查）用到的 GeoSite 标签（已经是小写），排好序、去掉重复：数据文件只读这些标签。
+/// 写成空的不算：那样的匹配器已经算一条问题或告警（见 `config::problems`、`config::warnings`），不再算作没有数据的标签
 /// The GeoSite tags rules use (pipeline_select and answer checks included), lowercase already,
-/// sorted and deduplicated: data files are read for these tags alone
+/// sorted and deduplicated: data files are read for these tags alone. One written empty does not
+/// count: its matcher is a problem or a warning already (see `config::problems`,
+/// `config::warnings`), not one more tag without data
 pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
     used_tags(
         cfg.geo_tags()
             .filter_map(GeoTags::site)
+            .filter(|tag| !tag.is_empty())
             .map(std::slice::from_ref),
     )
 }

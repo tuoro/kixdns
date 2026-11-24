@@ -301,6 +301,9 @@ struct RunArgs {
     #[arg(long = "udp-workers", default_value_t = 0)]
     udp_workers_count: usize,
     /// 本机管理 Socket；不设置时禁用增强管理接口。 / Local panel control socket; disabled when omitted.
+    // 控制通道只有 Unix 上有（见 lib.rs）：别的系统没有这个参数，写了 clap 就拒绝 / Only Unix has the control
+    // socket (see lib.rs): elsewhere there is no such argument, and clap refuses it
+    #[cfg(unix)]
     #[arg(long = "admin-socket")]
     admin_socket: Option<PathBuf>,
 }
@@ -383,6 +386,7 @@ async fn run_dns_server(
         listener_label,
         debug,
         udp_workers_count,
+        #[cfg(unix)]
         admin_socket,
     }: RunArgs,
 ) -> anyhow::Result<()> {
@@ -458,12 +462,7 @@ async fn run_dns_server(
         .clone()
         .map(|metrics| metrics as Arc<dyn EngineObserver>);
     #[cfg(not(unix))]
-    let panel_observer = {
-        if admin_socket.is_some() {
-            tracing::warn!("admin-socket is not supported on this platform");
-        }
-        None
-    };
+    let panel_observer = None;
     let mut engine = Engine::builder(cfg)
         .listener_label(listener_label.clone())
         .config_source(&config, config_source);
@@ -914,6 +913,19 @@ mod tests {
             "{}",
             command(&["kixdns"])
         );
+    }
+
+    /// `--admin-socket` 只有 Unix 上有：别的系统没有控制通道，写了 clap 就拒绝，`--help` 也不列
+    /// `--admin-socket` is there on Unix alone: elsewhere there is no control socket, clap refuses
+    /// the argument and `--help` does not list it
+    #[test]
+    fn the_admin_socket_is_an_argument_on_unix_alone() {
+        use clap::{CommandFactory as _, Parser as _};
+        let parsed =
+            super::Args::try_parse_from(["kixdns", "run", "--admin-socket", "kixdns.sock"]);
+        assert_eq!(parsed.is_ok(), cfg!(unix), "{parsed:?}");
+        let help = super::RunArgs::command().render_help().to_string();
+        assert_eq!(help.contains("--admin-socket"), cfg!(unix), "{help}");
     }
 
     /// 没有面板时和上游一样：不带 `--debug` 不装观察者，带了装参考观察者；有面板时装的就是面板观察者
