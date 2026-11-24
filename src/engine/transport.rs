@@ -881,6 +881,38 @@ impl Connect {
         tokio::spawn(attempt.clone());
         Ok(self.attempt.insert(attempt).clone())
     }
+
+    /// 拿一条连接，没有就等一次建连：`take` 从 `lock` 锁着的东西里拿现成的连接，`connect` 在那里面找到 [`Connect`]。拿不到就
+    /// 用 `make` 起一次建连，或者等在建的那一次（见 [`Self::attempt`]），建完了再拿一次。给出连接和它是不是等来的；等来的
+    /// 连接在拿到之前就没了时是 None，不再等下一条。锁只在拿和起建连的那一下拿着，等建连时不拿；调用方先不拿锁看一眼的话，
+    /// 这里拿着锁再看一次，免得别人的连接刚建好、这里又去建一条
+    /// Takes a connection, waiting for a connect when there is none: `take` takes a ready
+    /// connection out of what `lock` guards, `connect` finding the [`Connect`] in there. With
+    /// none, a connect is started with `make`, or the one under way waited for (see
+    /// [`Self::attempt`]), and once it is through `take` tries again. It gives the connection and whether it was waited for; one waited
+    /// for and gone before it could be taken gives None, with no wait for another. The lock is held
+    /// only for the moments of taking and of starting a connect, never across the wait; a caller
+    /// that first looks without the lock has it looked at again here under the lock, so a
+    /// connection someone else just made is not made a second time
+    pub(super) async fn get_or_make<L, T, F>(
+        lock: &parking_lot::Mutex<L>,
+        connect: impl FnOnce(&mut L) -> &mut Connect,
+        take: impl Fn(&mut L) -> Option<T>,
+        make: impl FnOnce() -> F,
+    ) -> anyhow::Result<Option<(T, bool)>>
+    where
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let attempt = {
+            let mut locked = lock.lock();
+            if let Some(ready) = take(&mut locked) {
+                return Ok(Some((ready, false)));
+            }
+            connect(&mut locked).attempt(make)?
+        };
+        attempt.await?;
+        Ok(take(&mut lock.lock()).map(|made| (made, true)))
+    }
 }
 
 /// 一条上游连接怎样老化，TCP、DoT、DoQ 和直连的 DoH 共用一套：活满 `max_age`，或者空闲满 `idle`，就从池里摘下，接着来的
@@ -1436,14 +1468,14 @@ impl DotMuxClient {
 impl<T: StreamTransport> StreamMuxClient<T> {
     /// 测试里连上上游，不发查询 / In tests, connect to the upstream without sending a query
     async fn connect_for_tests(&self) -> anyhow::Result<()> {
-        let attempt = {
-            let mut slot = self.wires.slot.lock();
-            if slot.live.is_some() {
-                return Ok(());
-            }
-            slot.connect.attempt(|| self.connecting())?
-        };
-        Ok(attempt.await?)
+        Connect::get_or_make(
+            &self.wires.slot,
+            |slot| &mut slot.connect,
+            |slot| slot.live.as_ref().map(drop),
+            || self.connecting(),
+        )
+        .await?;
+        Ok(())
     }
 
     /// 测试里看槽里有没有连接 / In tests, whether the slot holds a connection
@@ -1753,20 +1785,10 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
     async fn send_attempt(&self, packet: &[u8], timeout_dur: Duration) -> anyhow::Result<Bytes> {
         let deadline = tokio::time::Instant::now() + timeout_dur;
-        let (tx, rx) = oneshot::channel();
         // 登记在哪一代连接上：之后要拆连接、要记错误，说的都是这一代；它读到过几个回答
         // The generation of the connection it registered on: a later teardown or a recorded
         // error means this one; and how many answers it has read
-        let (new_id, generation, answers) = self.register(packet, deadline, tx).await?;
-
-        // RAII Guard: ensures entry is removed from map when guard is dropped
-        // RAII Guard：确保在 guard 丢弃时（超时、取消、提前返回）移除条目
-        let mut waiting = Waiting {
-            rx,
-            map: Arc::clone(&self.wires.pending),
-            id: new_id,
-            abandoned: |pending| pending.tx.is_closed(),
-        };
+        let (mut waiting, generation, answers) = self.register(packet, deadline).await?;
         let answers_at_queue = answers.load(Ordering::Acquire);
 
         // 等待响应；帧由连接的写入任务发出（见 `WriteQueue`）。登记完就到了时限：连接还没机会回答，不怪它，不复位
@@ -1823,59 +1845,64 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         }
     }
 
-    /// 登记一个查询：在现在的连接上登记（见 [`Self::register_on`]）；没有连接就等一条，最多到 `deadline`（见 [`Connect`]）。
-    /// 一条连接上可以同时跑任意多个查询（多路复用）。等来的连接在登记之前就没了时不再等下一条
+    /// 登记一个查询：在现在的连接上登记（见 [`Self::register_on`]）；没有连接就等一条，最多到 `deadline`（见
+    /// [`Connect::get_or_make`]）。一条连接上可以同时跑任意多个查询（多路复用）。等来的连接在登记之前就没了时不再等下一条
     /// Registers a query: on the connection now (see [`Self::register_on`]); with none, one is
-    /// waited for until `deadline` at most (see [`Connect`]). One connection carries any number of
-    /// queries at once (multiplexing). A connection waited for and gone before the query could
-    /// register is not followed by a wait for another
+    /// waited for until `deadline` at most (see [`Connect::get_or_make`]). One connection carries
+    /// any number of queries at once (multiplexing). A connection waited for and gone before the
+    /// query could register is not followed by a wait for another
     async fn register(
         &self,
         packet: &[u8],
         deadline: tokio::time::Instant,
-        tx: oneshot::Sender<anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<(u16, u64, Arc<AtomicU64>)> {
-        for waited in [false, true] {
-            let attempt = {
-                let mut slot = self.wires.slot.lock();
-                if let Some(live) = &slot.live {
-                    return self.register_on(live, packet, deadline, tx);
-                }
-                if waited {
-                    break;
-                }
-                slot.connect.attempt(|| self.connecting())?
-            };
-            match tokio::time::timeout_at(deadline, attempt).await {
-                Ok(made) => made?,
-                Err(_) => anyhow::bail!(
-                    "{} timeout waiting for the connection to upstream {}",
-                    T::LABEL,
-                    self.wires.upstream
-                ),
-            }
+    ) -> anyhow::Result<(Waiting<Pending>, u64, Arc<AtomicU64>)> {
+        let register = |slot: &mut Slot| {
+            let live = slot.live.as_ref()?;
+            Some(self.register_on(live, packet, deadline))
+        };
+        // 平常连接在，只拿一下锁就登记上，不起计时器 / Normally the connection is there, and the query
+        // registers in one take of the lock, with no timer set
+        if let Some(registered) = register(&mut self.wires.slot.lock()) {
+            return registered;
         }
-        Err(ConnectionGone {
-            generation: self.wires.generation.load(Ordering::Acquire),
-            answered: false,
-            why: "connection closed before registration".into(),
+        let waited = Connect::get_or_make(
+            &self.wires.slot,
+            |slot| &mut slot.connect,
+            register,
+            || self.connecting(),
+        );
+        match tokio::time::timeout_at(deadline, waited).await {
+            Ok(waited) => match waited? {
+                Some((registered, _)) => registered,
+                None => Err(ConnectionGone {
+                    generation: self.wires.generation.load(Ordering::Acquire),
+                    answered: false,
+                    why: "connection closed before registration".into(),
+                }
+                .into()),
+            },
+            Err(_) => anyhow::bail!(
+                "{} timeout waiting for the connection to upstream {}",
+                T::LABEL,
+                self.wires.upstream
+            ),
         }
-        .into())
     }
 
     /// 在连接 `live` 上登记一个期限在 `deadline` 的查询：记上期限（见 [`Wear`]），重写 DNS 事务 ID、登记进 pending、
-    /// 把帧排进写入队列，返回新的 ID、连接是第几代和它的回答数（见 [`Live::answers`]）。拿着槽的锁调用
+    /// 把帧排进写入队列，返回等它回答的那一头（见 [`Waiting`]）、连接是第几代和它的回答数（见 [`Live::answers`]）。拿着槽的
+    /// 锁调用
     /// Registers a query with its deadline at `deadline` on the connection `live`: the deadline
     /// noted (see [`Wear`]), the DNS transaction ID rewritten, the query registered in pending and
-    /// its frame queued for writing, returning the new ID, the connection's generation and its
-    /// answer count (see [`Live::answers`]). Called with the slot's lock held
+    /// its frame queued for writing, returning the end that waits for its answer (see
+    /// [`Waiting`]), the connection's generation and its answer count (see [`Live::answers`]).
+    /// Called with the slot's lock held
     fn register_on(
         &self,
         live: &Live,
         packet: &[u8],
         deadline: tokio::time::Instant,
-        tx: oneshot::Sender<anyhow::Result<Bytes>>,
-    ) -> anyhow::Result<(u16, u64, Arc<AtomicU64>)> {
+    ) -> anyhow::Result<(Waiting<Pending>, u64, Arc<AtomicU64>)> {
         let original_id = u16::from_be_bytes([packet[0], packet[1]]);
         // Build complete TCP/DoT wire frame (2-byte length prefix + DNS message). The same
         // buffer stays in the pending entry for the answer's question check, as on UDP.
@@ -1886,6 +1913,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         frame.extend_from_slice(packet);
         let (queue, generation, pending) = (&live.queue, live.generation, &self.wires.pending);
         live.wear.note(deadline);
+        let (tx, rx) = oneshot::channel();
 
         let mut tries = 0;
         let new_id = loop {
@@ -1917,7 +1945,15 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                 anyhow::bail!("no available dns ids for {} mux", T::LABEL);
             }
         };
-        Ok((new_id, generation, Arc::clone(&live.answers)))
+        // 从这一刻起放手时就把条目删掉（超时、取消、提前返回）/ From here on the entry goes when this is
+        // let go of (a timeout, a cancellation, an early return)
+        let waiting = Waiting {
+            rx,
+            map: Arc::clone(pending),
+            id: new_id,
+            abandoned: |pending| pending.tx.is_closed(),
+        };
+        Ok((waiting, generation, Arc::clone(&live.answers)))
     }
 
     /// 拆掉第 `generation` 代连接，拿槽的锁（见 [`close_locked`](Self::close_locked)）
@@ -3672,61 +3708,49 @@ impl DoqMuxClient {
         Some(pooled)
     }
 
-    /// 发查询用的连接：池里的能用就用，不能用就等一条新的（见 [`Connect`]）：建连的任务建好了放进池里，这个查询再取用。
-    /// 等来的连接在取用之前就没了时不再等下一条。等来的连接不算取自池里，用没用 0-RTT 照建它时的
+    /// 发查询用的连接：池里的能用就用，不能用就等一条新的（见 [`Connect::get_or_make`]）：建连的任务建好了放进池里，这个
+    /// 查询再取用。等来的连接在取用之前就没了时不再等下一条。等来的连接不算取自池里，用没用 0-RTT 照建它时的
     /// The connection to send on: the pooled one when usable, otherwise a new one waited for (see
-    /// [`Connect`]): the connecting task pools it once made, and this query takes it from there. A
-    /// connection waited for and gone before it could be taken is not followed by a wait for
-    /// another. A connection waited for does not count as taken from the pool, and used 0-RTT as
-    /// it was made
+    /// [`Connect::get_or_make`]): the connecting task pools it once made, and this query takes it
+    /// from there. A connection waited for and gone before it could be taken is not followed by a
+    /// wait for another. A connection waited for does not count as taken from the pool, and used
+    /// 0-RTT as it was made
     async fn get_or_connect(&self, target: &DoqTarget) -> anyhow::Result<DoqConnected> {
-        for waited in [false, true] {
-            if let Some(pooled) = self.usable() {
-                return Ok(DoqConnected {
-                    used_0rtt: waited && pooled.used_0rtt,
-                    reused: !waited,
-                    pooled,
-                });
-            }
-            if waited {
-                break;
-            }
-            let attempt = {
-                let mut connecting = self.connecting.lock();
-                // 别的查询的连接可能刚放进池里 / Another query's connection may have just been pooled
-                if let Some(pooled) = self.usable() {
-                    return Ok(DoqConnected {
-                        used_0rtt: false,
-                        reused: true,
-                        pooled,
-                    });
-                }
-                connecting.attempt(|| {
-                    let (pool, upstream) = (Arc::clone(&self.pooled), Arc::clone(&self.upstream));
-                    let (aging, stop) = (self.runtime.aging, self.stop.clone());
-                    let made = Self::connect_new(
-                        Arc::clone(&self.runtime),
-                        Arc::clone(&self.upstream),
-                        target.clone(),
-                        self.zero_rtt_retry_allowed(target),
-                    );
-                    async move {
-                        let NewDoqConn { conn, used_0rtt } = made.await?;
-                        let pooled = Arc::new(DoqConn {
-                            conn,
-                            used_0rtt,
-                            wear: Wear::new(),
-                            answers: AtomicU64::new(0),
-                        });
-                        pool.store(Some(Arc::clone(&pooled)));
-                        tokio::spawn(Self::watch(pooled, pool, aging, stop, upstream));
-                        Ok(())
-                    }
-                })?
-            };
-            attempt.await?;
+        let connected = |pooled: Arc<DoqConn>, waited: bool| DoqConnected {
+            used_0rtt: waited && pooled.used_0rtt,
+            reused: !waited,
+            pooled,
+        };
+        if let Some(pooled) = self.usable() {
+            return Ok(connected(pooled, false));
         }
-        anyhow::bail!("doq connection closed as soon as it was made")
+        let make = || {
+            let (pool, upstream) = (Arc::clone(&self.pooled), Arc::clone(&self.upstream));
+            let (aging, stop) = (self.runtime.aging, self.stop.clone());
+            let made = Self::connect_new(
+                Arc::clone(&self.runtime),
+                Arc::clone(&self.upstream),
+                target.clone(),
+                self.zero_rtt_retry_allowed(target),
+            );
+            async move {
+                let NewDoqConn { conn, used_0rtt } = made.await?;
+                let pooled = Arc::new(DoqConn {
+                    conn,
+                    used_0rtt,
+                    wear: Wear::new(),
+                    answers: AtomicU64::new(0),
+                });
+                pool.store(Some(Arc::clone(&pooled)));
+                tokio::spawn(Self::watch(pooled, pool, aging, stop, upstream));
+                Ok(())
+            }
+        };
+        let (pooled, waited) =
+            Connect::get_or_make(&self.connecting, |connect| connect, |_| self.usable(), make)
+                .await?
+                .context("doq connection closed as soon as it was made")?;
+        Ok(connected(pooled, waited))
     }
 
     /// 看着池里的一条连接直到它走：上游关了它就从池里拿掉；用旧了（见 [`Aging`]）也拿掉，接着来的查询另建一条，它上面的查询
@@ -3954,15 +3978,15 @@ impl DoqMuxClient {
     }
 }
 
-/// 把 `pooled` 从池 `pool` 里拿掉，下一个查询新建一条。池里现在的已经不是它（换成了新的，或者已经拿掉了）就什么都不做：
-/// 几个查询在同一条连接上一起失败时，先失败的那个已经换了新连接，后面的不能把新连接也拿掉、让每个查询各建一条。
-/// 不用锁：别的查询正在建连时也不用等
-/// Takes `pooled` out of the pool `pool`, so the next query makes a new one. When what is
-/// pooled now is not it (replaced by a new one, or taken out already) nothing is done: with
-/// several queries failing together on one connection, the first has had a new one made, and
-/// the rest must not take that out too, each making its own. Lock-free: it never waits for
-/// another query's connect
-fn forget(pool: &ArcSwapOption<DoqConn>, pooled: &Arc<DoqConn>) {
+/// 把连接 `pooled` 从放它的地方 `pool`（DoQ 客户端的池、DoH 的连接位）拿掉，下一个要连接的新建一条。那里现在的已经不是它
+/// （换成了新的，或者已经拿掉了）就什么都不做：几个查询在同一条连接上一起失败时，先失败的那个已经换了新连接，后面的不能把
+/// 新连接也拿掉、让每个查询各建一条。不用锁：别人正在建连时也不用等
+/// Takes the connection `pooled` out of `pool`, where it is kept (a DoQ client's pool, a DoH
+/// slot), so the next to want a connection makes a new one. When what is kept there now is not
+/// it (replaced by a new one, or taken out already) nothing is done: with several queries failing
+/// together on one connection, the first has had a new one made, and the rest must not take that
+/// out too, each making its own. Lock-free: it never waits for another's connect
+pub(super) fn forget<T>(pool: &ArcSwapOption<T>, pooled: &Arc<T>) {
     pool.rcu(|current| {
         current
             .clone()
@@ -4222,15 +4246,13 @@ mod tests {
         );
         // 两个查询在写入任务醒来之前登记好，第一个随即放弃 / Both queries register before the writer
         // wakes, and the first gives up at once
-        let (gave_up, given_up) = oneshot::channel();
-        client
-            .register(&udp_test_query("given-up.example"), far_off(), gave_up)
+        let given_up = client
+            .register(&udp_test_query("given-up.example"), far_off())
             .await
             .expect("registered");
         drop(given_up);
-        let (waits, _waiting) = oneshot::channel();
-        client
-            .register(&udp_test_query("waited.example"), far_off(), waits)
+        let _waiting = client
+            .register(&udp_test_query("waited.example"), far_off())
             .await
             .expect("registered");
         let written = read_frame(&mut theirs).await.expect("a frame written");
@@ -4361,12 +4383,11 @@ mod tests {
             token.clone(),
             1,
         );
-        let (tx, rx) = oneshot::channel();
-        client
-            .register(&udp_test_query("broken.example"), far_off(), tx)
+        let (mut waiting, _, _) = client
+            .register(&udp_test_query("broken.example"), far_off())
             .await
             .expect("register while connected");
-        let answer = tokio::time::timeout(Duration::from_secs(2), rx)
+        let answer = tokio::time::timeout(Duration::from_secs(2), &mut waiting.rx)
             .await
             .expect("told at once, not at a timeout")
             .expect("the sender is used, not dropped");
@@ -5928,8 +5949,7 @@ mod tests {
                 let client = Arc::clone(&client);
                 async move {
                     let dummy = vec![0u8; 4];
-                    let (tx, _) = oneshot::channel();
-                    client.register(&dummy, far_off(), tx).await
+                    client.register(&dummy, far_off()).await
                 }
             })
             .collect::<Vec<_>>();
@@ -5941,8 +5961,11 @@ mod tests {
         // Assert: Verify all IDs are unique (no duplicates under contention)
         let mut ids = rustc_hash::FxHashSet::default();
         for r in results {
-            let (id, _, _) = r.expect("register_pending failed");
-            assert!(ids.insert(id), "duplicate id allocated under contention");
+            let (waiting, _, _) = r.expect("register_pending failed");
+            assert!(
+                ids.insert(waiting.id),
+                "duplicate id allocated under contention"
+            );
         }
     }
 
@@ -5995,14 +6018,13 @@ mod tests {
     async fn a_teardown_tells_the_queries_registered_before_it() {
         let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
         client.wires.slot.lock().live = Some(planted(Arc::new(WriteQueue::default())));
-        let (tx, rx) = oneshot::channel();
-        client
-            .register(&[0u8; 4], far_off(), tx)
+        let (mut waiting, _, _) = client
+            .register(&[0u8; 4], far_off())
             .await
             .expect("registered on the planted connection");
         assert!(TcpMuxClient::close(&client.wires, 1, "reader failed"));
         assert!(client.wires.pending.is_empty());
-        let result = timeout(Duration::from_millis(100), rx)
+        let result = timeout(Duration::from_millis(100), &mut waiting.rx)
             .await
             .expect("the waiter is told at once")
             .expect("the sender is used, not dropped");
