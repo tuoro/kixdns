@@ -65,9 +65,8 @@ impl ConfigWatch {
                     // The default log level is error: logged as a warn, a failed reload would go
                     // unseen without the panel
                     Err(err) => {
-                        let error = format!("{err:#}");
-                        error!(path = %path.display(), error = %error, "config reload failed, keeping current state");
-                        engine.notify_config_reload_failed(path, &error);
+                        error!(path = %path.display(), error = %format!("{err:#}"), "config reload failed, keeping current state");
+                        engine.notify_config_reload_failed(path, &err);
                     }
                 }
             })
