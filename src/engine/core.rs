@@ -350,10 +350,11 @@ impl Engine {
         });
     }
 
-    /// 把一份应答存进槽位 `slot`（见 `CacheSlot::with`）。写入只经过这里和
-    /// `insert_dns_cache_entry`。
-    /// Store an answer in slot `slot` (see `CacheSlot::with`). Writes go through
-    /// here and `insert_dns_cache_entry` only.
+    /// 把一份应答存进槽位 `slot`（见 `CacheSlot::with`）。新应答只经过这里写入，先过
+    /// `insert_dns_cache_entry` 那一关；已有的应答由 `cache_replace` 续期、由 `cache_remove` 去掉。
+    /// Store an answer in slot `slot` (see `CacheSlot::with`). New answers are written through
+    /// here alone, past `insert_dns_cache_entry` first; answers already there are renewed by
+    /// `cache_replace` and removed by `cache_remove`.
     pub(crate) fn cache_insert(&self, slot: u64, entry: Arc<CacheEntry>) {
         let kept = self.cache.kept();
         let heaviest = self.cache.heaviest_value();

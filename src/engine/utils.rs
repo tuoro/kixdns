@@ -1,9 +1,7 @@
 use super::types::InflightMap;
 use crate::matcher::{GeoTags, RuntimePipelineConfig};
 use bytes::Bytes;
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{DNSClass, RecordType};
-use hickory_proto::serialize::binary::{BinEncodable, BinEncoder};
+use hickory_proto::op::ResponseCode;
 use std::sync::Arc;
 
 /// RAII Guard for cleaning up inflight request map
@@ -63,80 +61,6 @@ impl Drop for InflightCleanupGuard {
 pub(crate) fn set_id(message: &mut [u8], id: u16) {
     if let Some(head) = message.get_mut(..2) {
         head.copy_from_slice(&id.to_be_bytes());
-    }
-}
-
-// ============================================================================
-// Engine Helper Functions / 引擎辅助函数
-// ============================================================================
-
-/// 引擎辅助函数模块 - 提供可复用的引擎逻辑 / Engine helper functions module - provides reusable engine logic
-pub mod engine_helpers {
-    use super::*;
-
-    pub fn build_response(
-        req: &Message,
-        rcode: ResponseCode,
-        answers: Vec<hickory_proto::rr::Record>,
-    ) -> anyhow::Result<Bytes> {
-        let mut msg = Message::new(
-            req.metadata.id,
-            hickory_proto::op::MessageType::Response,
-            req.metadata.op_code,
-        );
-        msg.metadata.response_code = rcode;
-        msg.metadata.recursion_desired = req.metadata.recursion_desired;
-        msg.metadata.recursion_available = true;
-        msg.add_queries(req.queries.iter().cloned());
-        msg.insert_answers(answers);
-
-        let mut buf = Vec::with_capacity(512);
-        let mut encoder = BinEncoder::new(&mut buf);
-        msg.emit(&mut encoder)?;
-        Ok(Bytes::from(buf))
-    }
-
-    /// 构建错误响应（ServFail）
-    /// Build error response (ServFail)
-    #[inline]
-    pub fn build_servfail_response(req: &Message) -> anyhow::Result<Bytes> {
-        build_response(req, ResponseCode::ServFail, Vec::new())
-    }
-
-    /// 快速构建错误响应（ServFail），避免解析完整请求
-    /// Fast build ServFail response without parsing full request
-    #[inline]
-    pub fn build_servfail_response_fast(
-        tx_id: u16,
-        qname: &str,
-        qtype: u16,
-        qclass: u16,
-        rd: bool,
-    ) -> anyhow::Result<Bytes> {
-        let mut msg = Message::new(tx_id, MessageType::Response, OpCode::Query);
-        msg.metadata.response_code = ResponseCode::ServFail;
-        msg.metadata.recursion_desired = rd;
-        msg.metadata.recursion_available = true;
-
-        let name = crate::proto_utils::name_from_text(qname)
-            .ok_or_else(|| anyhow::anyhow!("query name text {qname:?}"))?;
-        let mut query = Query::new();
-        query.set_name(name);
-        query.set_query_type(RecordType::from(qtype));
-        query.set_query_class(DNSClass::from(qclass));
-        msg.add_query(query);
-
-        let mut buf = Vec::with_capacity(128);
-        let mut encoder = BinEncoder::new(&mut buf);
-        msg.emit(&mut encoder)?;
-        Ok(Bytes::from(buf))
-    }
-
-    /// 构建拒绝响应（Refused）
-    /// Build refused response (Refused)
-    #[inline]
-    pub fn build_refused_response(req: &Message) -> anyhow::Result<Bytes> {
-        build_response(req, ResponseCode::Refused, Vec::new())
     }
 }
 

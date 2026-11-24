@@ -961,12 +961,13 @@ async fn a_forward_kept_back_after_a_response_jump_logs_no_warning() {
     );
 }
 
-/// 响应动作里的转发被流控拦下时，这个请求出错（监听器回 SERVFAIL），而不是拿一个 SERVFAIL 当结果交给等着的别的请求：这台
-/// 设备在这个上游上被拦住以后，替它做的响应动作转发交回的是流控的失败
-/// With a forward among the response actions kept back by flow control the request fails (the
-/// listener answering SERVFAIL), instead of a SERVFAIL being taken as the outcome and handed
-/// to the other requests waiting: once the device is held back from the upstream, a response
-/// action's forward made for it gives back flow control's failure
+/// 响应动作里的转发被流控拦下时，这个请求出错（只给自己回 SERVFAIL，见 `Engine::handle_packet_internal`），而不是拿一个
+/// SERVFAIL 当结果交给等着的别的请求：这台设备在这个上游上被拦住以后，替它做的响应动作转发交回的是流控的失败
+/// With a forward among the response actions kept back by flow control the request fails
+/// (answering SERVFAIL to itself alone, see `Engine::handle_packet_internal`), instead of a
+/// SERVFAIL being taken as the outcome and handed to the other requests waiting: once the
+/// device is held back from the upstream, a response action's forward made for it gives back
+/// flow control's failure
 #[tokio::test]
 async fn a_response_actions_forward_kept_back_fails_the_request() {
     let dead = support::upstream(|_| Vec::new()).await;
@@ -979,7 +980,6 @@ async fn a_response_actions_forward_kept_back_fails_the_request() {
     )
     .unwrap()];
     let packet = query("more.dead.test.");
-    let req = Message::from_vec(&packet).unwrap();
     let asked = support::Asked::new(
         &engine,
         "more.dead.test",
@@ -987,18 +987,19 @@ async fn a_response_actions_forward_kept_back_fails_the_request() {
         packet.clone(),
         client(1),
     );
+    let request = asked.request();
     let outcome = crate::engine::rules::apply_response_actions(
         crate::engine::rules::ApplyResponseActionsContext {
             engine: &engine,
-            request: &asked.request(),
+            request: &request,
             actions: &actions,
             ctx_opt: None,
-            req: &req,
             packet: &packet,
             pipeline_id: "main",
             rule_name: "dead",
             remaining_jumps: 4,
-            trail: None,
+            trail: &mut Default::default(),
+            rule_ecs: crate::ecs_scope::ForwardEcs::of(None, &request.requester.ecs_view()),
         },
     )
     .await;
