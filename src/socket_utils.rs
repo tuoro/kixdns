@@ -919,10 +919,6 @@ pub mod udp_batch {
             // bytes) and msg_controllen is the length the kernel wrote, within the buffer
             unsafe { local_in(&hdr) }
         }
-
-        pub fn is_empty(&self) -> bool {
-            self.count == 0
-        }
     }
 
     /// 一批要发的回答 / One batch of replies to send
@@ -1349,7 +1345,7 @@ mod udp_batch_tests {
         assert!(received.get(3).is_none());
         let error = received.recv(server.as_raw_fd()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(received.is_empty());
+        assert!(received.get(0).is_none());
     }
 
     /// 比接收缓冲长的报文截到缓冲那么长，和单收时一样 / A datagram longer than the buffer is cut to it, as for single receives

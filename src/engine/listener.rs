@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use hickory_proto::rr::RecordType;
 use tracing::debug;
 
 use super::execution::UnreadableQuery;
@@ -126,11 +127,14 @@ impl Engine {
             // 每个监听器各算各的节流：UDP 上一直在超时，TCP、DoH 的超时照样看得见 / Each listener
             // throttles on its own: with UDP timing out all the time, TCP and DoH timeouts still show
             Err(_) => {
+                let (qname, qtype) = question_text(packet).unzip();
                 crate::warn_sparse!(
                     per listener;
+                    event = "request_timeout",
                     timeout_ms,
                     upstream_timeout_ms = self.get_upstream_timeout_ms(),
-                    qname = %question_text(packet).unwrap_or_default(),
+                    qname = qname.map(tracing::field::display),
+                    qtype = qtype.map(tracing::field::debug),
                     client_ip = %peer.ip(),
                     "{listener} request timeout"
                 );
@@ -150,12 +154,16 @@ impl Engine {
     }
 }
 
-/// 日志里的问题名：第一个问题的名字，写法同 [`proto_utils::name_text`]，读不出时没有。只在记日志时读
-/// The question name for the logs: the first question's, written as [`proto_utils::name_text`]
-/// writes it, and none when it cannot be read. It is read only when logging
-fn question_text(packet: &[u8]) -> Option<String> {
-    use hickory_proto::rr::Name;
+/// 日志里的问题：第一个问题的名字（写法同 [`proto_utils::name_text`]）和类型，一次读出，读不出时没有。只在记日志时读
+/// The question for the logs: the first question's name (written as [`proto_utils::name_text`]
+/// writes it) and type, read in one pass, and none when they cannot be read. It is read only
+/// when logging
+fn question_text(packet: &[u8]) -> Option<(String, RecordType)> {
+    use hickory_proto::op::Query;
     use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
-    let name = Name::read(&mut BinDecoder::new(packet).clone(12)).ok()?;
-    Some(proto_utils::name_text(&name))
+    let question = Query::read(&mut BinDecoder::new(packet).clone(12)).ok()?;
+    Some((
+        proto_utils::name_text(question.name()),
+        question.query_type(),
+    ))
 }
