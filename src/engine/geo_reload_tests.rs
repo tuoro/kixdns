@@ -476,6 +476,63 @@ async fn a_hot_reload_reads_an_mmdb_replaced_in_place() {
     assert_eq!(ask_from(&engine, "after.test", client).await, Some(MATCHED));
 }
 
+/// 存在却读不了的 MMDB，文件不换就不再读：别的配置改了的热重载不让 GeoIP 数据换代，用到它的 pipeline 留着缓存；换成读得
+/// 了的，下一次热重载就读进来。在用的库被换成读不了的，那一次热重载读它、留着在用的，之后也不再读。以前读不了的和不存在的
+/// 一样记成缺着的，文件又在，每次热重载都重读一遍、换一代，等于清掉这些 pipeline 的缓存
+/// An MMDB that is there yet cannot be read is not read again until the file changes: a hot
+/// reload changing other parts of the configuration leaves the GeoIP data's generation, and
+/// the caches of the pipelines using it, alone; once it is replaced by a readable one, the next
+/// hot reload reads it in. When the database in use is replaced by an unreadable one, that one
+/// hot reload reads it and keeps the database in use, and later ones do not read it again. An
+/// unreadable file used to count as missing, as a file not there does, and being there it was
+/// read again, and the data moved to a new generation, on every hot reload, clearing those
+/// pipelines' caches
+#[tokio::test]
+async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("mmdb-source.json");
+    let mmdb = dir.path().join("country.mmdb");
+    std::fs::write(&mmdb, b"not a database").unwrap();
+    let cfg = |upstream: &str| {
+        let mut cfg = config(
+            json!({ "geoip_db_path": mmdb.to_str().unwrap() }),
+            json!({ "type": "geoip_country", "country_codes": ["JP"] }),
+        );
+        cfg.settings.default_upstream = upstream.to_string();
+        cfg
+    };
+    let generation = |engine: &Engine| engine.reload_lock.lock().generation().ip;
+    let client: SocketAddr = "198.51.100.7:53000".parse().unwrap();
+    let engine = engine(cfg("127.0.0.1:9"));
+    let unreadable = generation(&engine);
+    for upstream in ["127.0.0.1:10", "127.0.0.1:11"] {
+        engine.reload(cfg(upstream));
+        assert_eq!(generation(&engine), unreadable, "an unrelated reload");
+    }
+
+    let entries = r#"{"entries":[{"country_code":"JP","ips":["198.51.100.0/24"]}]}"#;
+    std::fs::write(&source, entries).unwrap();
+    crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
+    engine.reload(cfg("127.0.0.1:9"));
+    assert!(generation(&engine) > unreadable, "a readable database");
+    assert_eq!(ask_from(&engine, "a.test", client).await, Some(MATCHED));
+
+    replace(&mmdb, b"broken again");
+    engine.reload(cfg("127.0.0.1:10"));
+    let broken = generation(&engine);
+    engine.reload(cfg("127.0.0.1:11"));
+    assert_eq!(
+        generation(&engine),
+        broken,
+        "the broken file is not read again"
+    );
+    assert_eq!(
+        ask_from(&engine, "b.test", client).await,
+        Some(MATCHED),
+        "the database in use stays"
+    );
+}
+
 /// GeoIP .dat 内容：一个标签一个 IPv4 网段 / GeoIP .dat content: one tag with one IPv4 network
 fn geoip_dat(tag: &str, network: [u8; 4], prefix: u8) -> Vec<u8> {
     // CIDR { ip, prefix (varint) }
