@@ -48,8 +48,10 @@ struct TlsUpstream {
 }
 
 impl TlsUpstream {
-    fn url(&self, query: &str) -> String {
-        format!("https://{}/dns-query{query}", self.addr)
+    /// 这个上游的地址，和转发交给 DoH 客户端的一样去掉了前缀，后面接着 `query` / This upstream's
+    /// address, short of its prefix as a forward hands it to the DoH client, followed by `query`
+    fn address(&self, query: &str) -> String {
+        format!("{}/dns-query{query}", self.addr)
     }
 
     fn client(&self, threshold: usize) -> DohClient {
@@ -233,7 +235,7 @@ async fn ask(client: &DohClient, upstream: &str, id: u16) -> anyhow::Result<Byte
 async fn an_h2_upstream_shares_one_connection() {
     let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
     let client = upstream.client(3);
-    let url = upstream.url("");
+    let url = upstream.address("");
     for id in 0..20u16 {
         assert_eq!(ask(&client, &url, id).await.unwrap()[..2], id.to_be_bytes());
     }
@@ -267,7 +269,7 @@ async fn an_h2_upstream_shares_one_connection() {
 async fn a_named_doh_upstream_is_resolved_through_bootstrap() {
     let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
     let server = super::test_support::loopback_bootstrap(300).await;
-    let url = format!("https://upstream.test:{}/dns-query", upstream.addr.port());
+    let url = format!("upstream.test:{}/dns-query", upstream.addr.port());
     for direct in [true, false] {
         let bootstrap = Bootstrap::new(
             &server.address,
@@ -292,7 +294,7 @@ async fn a_named_doh_upstream_is_resolved_through_bootstrap() {
 async fn an_upstream_without_h2_goes_through_reqwest() {
     let upstream = spawn_upstream(&[b"http/1.1"], None, |q| dns_ok(echo(q))).await;
     let client = upstream.client(3);
-    let url = upstream.url("");
+    let url = upstream.address("");
     for id in 0..10u16 {
         assert_eq!(ask(&client, &url, id).await.unwrap()[..2], id.to_be_bytes());
     }
@@ -318,7 +320,7 @@ async fn an_upstream_without_h2_goes_through_reqwest() {
 async fn the_direct_request_is_the_one_reqwest_sends() {
     let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
     for query_string in ["", "?ct&x=1"] {
-        let url = upstream.url(query_string);
+        let url = upstream.address(query_string);
         let direct = upstream.client(3);
         let mut via_reqwest = upstream.client(3);
         via_reqwest.reqwest_only_for_tests();
@@ -344,7 +346,7 @@ async fn the_direct_request_is_the_one_reqwest_sends() {
 #[tokio::test]
 async fn a_host_override_is_the_authority_of_the_request() {
     let upstream = spawn_upstream(&[b"h2", b"http/1.1"], None, |q| dns_ok(echo(q))).await;
-    let url = upstream.url("?ct&host=front.example&x=1");
+    let url = upstream.address("?ct&host=front.example&x=1");
     let direct = upstream.client(3);
     let mut via_reqwest = upstream.client(3);
     via_reqwest.reqwest_only_for_tests();
@@ -498,7 +500,7 @@ async fn a_handshake_outlives_the_request_that_started_it() {
     let client = upstream.client(3);
     let (front, accepted) =
         super::test_support::slow_front(upstream.addr, Duration::from_millis(300)).await;
-    let url = format!("https://{front}/dns-query");
+    let url = format!("{front}/dns-query");
     let raced = tokio::time::timeout(Duration::from_millis(100), ask(&client, &url, 1)).await;
     assert!(raced.is_err(), "cancelled while the handshake goes on");
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -521,7 +523,7 @@ async fn light_load_stays_on_one_connection() {
     let upstream = spawn_h2_upstream_answering_after(Duration::from_millis(20)).await;
     let mut client = upstream.client(3);
     client.set_direct_connections_for_tests(4);
-    let url = upstream.url("");
+    let url = upstream.address("");
     for id in 0..10u16 {
         assert_eq!(ask(&client, &url, id).await.unwrap()[..2], id.to_be_bytes());
     }
@@ -538,7 +540,7 @@ async fn a_busy_connection_spills_to_the_next() {
     let upstream = spawn_h2_upstream_answering_after(Duration::from_millis(200)).await;
     let mut client = upstream.client(3);
     client.set_direct_connections_for_tests(4);
-    let url = upstream.url("");
+    let url = upstream.address("");
     let many = 2 * BUSY_AT + BUSY_AT / 2;
     ask_together(&client, &url, 0..many as u16).await;
     assert_eq!(upstream.connections.load(Ordering::SeqCst), 3);
@@ -557,7 +559,7 @@ async fn answers_keep_coming_past_the_receive_window() {
     })
     .await;
     let client = upstream.client(3);
-    let url = upstream.url("");
+    let url = upstream.address("");
     // 40 个 60 KB 的回答，是连接窗口的两倍多 / Forty 60 KB answers, over twice the connection window
     for id in 0..40u16 {
         let answer = ask(&client, &url, id).await.unwrap();
@@ -611,7 +613,7 @@ async fn a_leaving_connection_takes_no_new_requests() {
         }
     });
     let client = upstream.client(3);
-    let url = upstream.url("");
+    let url = upstream.address("");
     let later = async {
         // 等 GOAWAY 到了客户端再问 / Ask once the GOAWAY has reached the client
         leaving.notified().await;
@@ -688,7 +690,9 @@ async fn answer_checks_hold_over_the_direct_connection() {
     for (label, reason, reply) in cases {
         let upstream = spawn_upstream(&[b"h2"], None, reply).await;
         let client = upstream.client(3);
-        let err = ask(&client, &upstream.url(""), 1).await.expect_err(label);
+        let err = ask(&client, &upstream.address(""), 1)
+            .await
+            .expect_err(label);
         assert!(format!("{err:#}").contains(reason), "{label}: {err:#}");
         assert_eq!(
             upstream.seen.lock().unwrap().len(),
@@ -696,7 +700,7 @@ async fn answer_checks_hold_over_the_direct_connection() {
             "{label}: not retried"
         );
         assert_eq!(
-            client.direct_in_flight(&upstream.url("")),
+            client.direct_in_flight(&upstream.address("")),
             0,
             "{label}: the failed request let go"
         );
@@ -714,7 +718,7 @@ async fn answer_checks_hold_over_the_direct_connection() {
 async fn a_closed_connection_is_replaced() {
     let upstream = spawn_upstream(&[b"h2"], Some(1), |q| dns_ok(echo(q))).await;
     let client = upstream.client(3);
-    let url = upstream.url("");
+    let url = upstream.address("");
     ask(&client, &url, 1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
@@ -732,7 +736,7 @@ async fn an_idle_connection_closes_by_itself() {
     let upstream = spawn_upstream(&[b"h2"], None, |q| dns_ok(echo(q))).await;
     let mut client = upstream.client(3);
     client.set_idle_timeout_for_tests(Duration::from_millis(150));
-    let url = upstream.url("");
+    let url = upstream.address("");
     for id in 1..=2 {
         let answer = client
             .send(&query(id), &url, Duration::from_millis(100))
@@ -792,7 +796,7 @@ async fn a_query_answered_by_its_retry_clears_the_errors_in_a_row() {
     });
     let threshold = 3;
     let client = upstream.client(threshold);
-    let url = upstream.url("");
+    let url = upstream.address("");
     for id in 0..2 * threshold as u16 {
         assert_eq!(ask(&client, &url, id).await.unwrap()[..2], id.to_be_bytes());
     }
@@ -812,7 +816,7 @@ async fn a_handshake_slower_than_the_request_is_not_counted() {
     let client = upstream.client(1);
     let (front, accepted) =
         super::test_support::slow_front(upstream.addr, Duration::from_millis(300)).await;
-    let url = format!("https://{front}/dns-query");
+    let url = format!("{front}/dns-query");
     let err = client
         .send(&query(1), &url, Duration::from_millis(100))
         .await
@@ -837,7 +841,7 @@ async fn a_handshake_slower_than_the_request_is_not_counted() {
 async fn a_rebuild_drops_the_direct_connection() {
     let upstream = spawn_upstream(&[b"h2"], None, |q| dns_ok(echo(q))).await;
     let client = upstream.client(1);
-    let url = upstream.url("");
+    let url = upstream.address("");
     ask(&client, &url, 1).await.unwrap();
     assert!(client.record_error_of(&url), "rebuilt at the threshold");
     ask(&client, &url, 2).await.unwrap();

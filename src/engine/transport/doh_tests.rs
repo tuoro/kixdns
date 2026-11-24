@@ -22,7 +22,7 @@ use tokio::time::timeout;
 #[test]
 fn doh_record_error_treats_a_zero_threshold_as_disabled() {
     let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
-    let upstream = "doh://8.8.8.8";
+    let upstream = "8.8.8.8";
     let ptr_before = Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
 
     for attempt in 1..=5 {
@@ -46,15 +46,15 @@ fn doh_prunes_upstreams_nothing_has_used() {
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
     for idx in 0..4 {
         client
-            .upstream(&format!("https://{idx}.example/dns-query"))
+            .upstream(&format!("{idx}.example/dns-query"))
             .expect("create upstream");
     }
-    let live = "https://live.example/dns-query";
+    let live = "live.example/dns-query";
     client.upstream(live).expect("create live upstream");
     let now = age_out_idle_upstreams(&client, live);
 
     client
-        .upstream_at("https://new.example/dns-query", now)
+        .upstream_at("new.example/dns-query", now)
         .expect("create upstream");
 
     assert!(
@@ -78,10 +78,10 @@ fn doh_prunes_idle_upstreams_without_new_keys() {
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
     for idx in 0..4 {
         client
-            .upstream(&format!("https://{idx}.example/dns-query"))
+            .upstream(&format!("{idx}.example/dns-query"))
             .expect("create upstream");
     }
-    let live = "https://live.example/dns-query";
+    let live = "live.example/dns-query";
     client.upstream(live).expect("create live upstream");
     let now = age_out_idle_upstreams(&client, live);
 
@@ -112,7 +112,7 @@ fn doh_prunes_idle_upstreams_without_new_keys() {
 #[test]
 fn doh_prune_round_is_claimed_even_when_nothing_expires() {
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
-    let live = "https://live.example/dns-query";
+    let live = "live.example/dns-query";
     client.upstream(live).expect("create upstream");
 
     // 窗口过期，但条目都是刚用过的 / interval lapsed, every entry just used
@@ -153,7 +153,7 @@ fn age_out_idle_upstreams(client: &DohClient, live: &str) -> u64 {
 #[test]
 fn requests_broken_together_rebuild_once() {
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
-    let upstream = "doh://8.8.8.8";
+    let upstream = "8.8.8.8";
     let state = client.upstream(upstream).unwrap();
     let started = state.generation.load(Ordering::Acquire);
     let before = state.client.load_full();
@@ -180,7 +180,7 @@ fn doh_record_error_rebuilds_pool_at_threshold() {
     // 达阈值时重建连接池（新 reqwest::Client 是清除 reqwest 自身无法检测的
     // 死/半开连接的唯一手段）。
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
-    let upstream = "doh://8.8.8.8";
+    let upstream = "8.8.8.8";
 
     let ptr_before = Arc::as_ptr(&client.upstream(upstream).unwrap().client.load_full()) as usize;
     // Two errors stay below the threshold (3): no rebuild.
@@ -219,8 +219,8 @@ fn doh_rebuild_is_scoped_to_the_failing_upstream() {
     // 上游的连接池一起换掉，健康上游丢失 keep-alive 连接、被迫重新握手。
     // 现在每个上游各持一个客户端。
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
-    let healthy = "doh://1.1.1.1";
-    let failing = "doh://bad.example";
+    let healthy = "1.1.1.1";
+    let failing = "bad.example";
     let healthy_before =
         Arc::as_ptr(&client.upstream(healthy).unwrap().client.load_full()) as usize;
     let failing_before =
@@ -249,7 +249,7 @@ fn doh_record_success_resets_counter() {
     // not accumulate toward a rebuild across an intervening healthy request.
     // record_success 清零 per-upstream 计数，避免偶发错误跨健康请求累积到重建。
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
-    let upstream = "doh://1.1.1.1";
+    let upstream = "1.1.1.1";
 
     client.record_error_of(upstream);
     client.record_error_of(upstream);
@@ -277,13 +277,13 @@ fn doh_error_counts_are_isolated_per_upstream() {
     // 一个 upstream 的错误不得累加到另一个 upstream。
     let client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
 
-    client.record_error_of("doh://8.8.8.8");
-    client.record_error_of("doh://8.8.8.8");
+    client.record_error_of("8.8.8.8");
+    client.record_error_of("8.8.8.8");
     // A success on a *different* upstream must not touch 8.8.8.8's count.
-    client.record_success("doh://1.1.1.1");
+    client.record_success("1.1.1.1");
     // 8.8.8.8 still at 2 — the 3rd error rebuilds.
     assert!(
-        client.record_error_of("doh://8.8.8.8"),
+        client.record_error_of("8.8.8.8"),
         "isolated counter reaches threshold independently"
     );
 }
@@ -334,7 +334,7 @@ fn doh_is_transport_error_classifies_correctly() {
 #[tokio::test]
 async fn a_failed_doh_connect_is_neither_sent_again_nor_counted() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream = format!("https://{}/dns-query", listener.local_addr().unwrap());
+    let upstream = format!("{}/dns-query", listener.local_addr().unwrap());
     let accepted = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&accepted);
     tokio::spawn(async move {
@@ -375,7 +375,7 @@ async fn a_failed_doh_connect_is_neither_sent_again_nor_counted() {
 #[tokio::test]
 async fn a_doh_handshake_left_unanswered_is_not_counted() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream = format!("https://{}/dns-query", listener.local_addr().unwrap());
+    let upstream = format!("{}/dns-query", listener.local_addr().unwrap());
     let accepted = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&accepted);
     tokio::spawn(async move {
@@ -428,7 +428,8 @@ async fn a_reqwest_connection_keeps_alive_as_the_others_do() {
     .await;
     let mut client = DohClient::new(8, 3, Bootstrap::system()).expect("build doh client");
     client.reqwest_only_for_tests();
-    let upstream = format!("http://{addr}/dns-query");
+    client.use_plain_http();
+    let upstream = format!("{addr}/dns-query");
     client
         .send(&doh_test_query("kept"), &upstream, Duration::from_secs(2))
         .await
@@ -571,8 +572,9 @@ async fn doh_upstream_answering_with_id_zero_keeps_the_query_id() {
             DohReply::Raw(http_ok(Some(DOH_MEDIA_TYPE), &answer))
         })
         .await;
-        let upstream = format!("http://{addr}/dns-query");
+        let upstream = format!("{addr}/dns-query");
         let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
+        client.use_plain_http();
         for id in [0xBEEF_u16, 0xCAFE] {
             let mut query = vec![0u8; 12];
             query[..2].copy_from_slice(&id.to_be_bytes());
@@ -631,8 +633,9 @@ async fn doh_refuses_an_answer_longer_than_a_dns_message() {
         DohReply::Raw(http_ok(Some(DOH_MEDIA_TYPE), &answer))
     })
     .await;
-    let upstream = format!("http://{addr}/dns-query");
+    let upstream = format!("{addr}/dns-query");
     let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
+    client.use_plain_http();
 
     // 正好一条最长的 DNS 消息：照收，分几块到也拼得回来
     // Exactly one longest DNS message: taken, put back together from its pieces
@@ -676,8 +679,9 @@ async fn doh_refuses_an_answer_of_another_media_type() {
         DohReply::Raw(http_ok(media_type, &echo_answer(query)))
     })
     .await;
-    let upstream = format!("http://{addr}/dns-query");
+    let upstream = format!("{addr}/dns-query");
     let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
+    client.use_plain_http();
     for label in ["html", "none"] {
         let err = client
             .send(&doh_test_query(label), &upstream, Duration::from_secs(5))
@@ -711,10 +715,11 @@ async fn doh_does_not_follow_redirects() {
     })
     .await;
     let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
+    client.use_plain_http();
     let err = client
         .send(
             &doh_test_query("move"),
-            &format!("http://{addr}/dns-query"),
+            &format!("{addr}/dns-query"),
             Duration::from_secs(5),
         )
         .await
@@ -736,10 +741,11 @@ async fn a_doh_answer_to_another_question_fails_the_query() {
     })
     .await;
     let client = DohClient::new(8, 0, Bootstrap::system()).expect("build doh client");
+    client.use_plain_http();
     let err = client
         .send(
             &udp_test_query("swap.example"),
-            &format!("http://{addr}/dns-query"),
+            &format!("{addr}/dns-query"),
             Duration::from_secs(2),
         )
         .await
@@ -798,9 +804,10 @@ async fn a_429_is_not_retried_and_pauses_its_upstream() {
         )
     })
     .await;
-    let upstream = format!("http://{addr}/dns-query");
+    let upstream = format!("{addr}/dns-query");
     // 阈值 1：记一次传输错误就会重建 / Threshold 1: a single transport error would rebuild
     let client = DohClient::new(8, 1, Bootstrap::system()).expect("build doh client");
+    client.use_plain_http();
     assert!(!client.any_paused());
     let state = client.upstream(&upstream).expect("doh upstream state");
     let pool = Arc::as_ptr(&state.client.load_full());
