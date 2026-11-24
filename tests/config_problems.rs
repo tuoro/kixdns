@@ -100,13 +100,25 @@ fn a_background_refresh_rule_only_warns_at_startup_and_on_reload() {
     });
     write_config_with(&config, port, "192.0.2.1", "REFUSED", refresh_rule.clone());
     let _kernel = start(&config, &log, port, Some("info"));
-    let warnings = || {
-        std::fs::read_to_string(&log)
-            .unwrap()
+    // 配置每生效一次记一条：启动一次，每次重载一次。重载几次照日志数：macOS 的 FSEvents 可能把起内核之前写配置的那一下
+    // 晚些报给刚装好的监视，内核起来以后就把同一份配置多重载一次
+    // One is logged each time a configuration takes effect: once at startup, once on each reload.
+    // The reloads are counted from the log: macOS's FSEvents may report the write made before the
+    // kernel started to the watch just installed, late, and the kernel then reloads the same
+    // configuration once more
+    let logged = || std::fs::read_to_string(&log).unwrap();
+    let warned_once_a_load = || {
+        let logged = logged();
+        let warnings = logged
             .matches("background_refresh_rule: has no effect")
-            .count()
+            .count();
+        warnings == 1 + logged.matches("config reloaded").count()
     };
-    assert_eq!(warnings(), 1, "startup warns once");
+    assert!(
+        eventually(Duration::from_secs(5), warned_once_a_load),
+        "startup warns once: {}",
+        logged()
+    );
 
     write_config_with(&config, port, "192.0.2.2", "REFUSED", refresh_rule);
     assert!(
@@ -116,8 +128,9 @@ fn a_background_refresh_rule_only_warns_at_startup_and_on_reload() {
         "the reload goes through"
     );
     assert!(
-        eventually(Duration::from_secs(5), || warnings() == 2),
-        "the reload warns once more"
+        eventually(Duration::from_secs(5), warned_once_a_load),
+        "the reload warns once more: {}",
+        logged()
     );
 }
 
@@ -134,22 +147,37 @@ fn a_problem_starts_as_before_and_refuses_a_reload() {
     let port = free_port();
     write_config(&config, port, "192.0.2.1", "WHATEVER");
     let _kernel = start(&config, &log, port, None);
-    let logged = |needle: &str| std::fs::read_to_string(&log).unwrap().contains(needle);
+    // 有一行同时写着这几样 / A line saying all of these
+    let logged = |needles: &[&str]| {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .any(|line| needles.iter().all(|needle| line.contains(needle)))
+    };
 
     // 启动照旧：问题记成错误，拼错的 rcode 还是回 NXDOMAIN
     // Startup as before: the problem is logged as an error and the misspelt rcode still
     // answers NXDOMAIN
-    assert!(logged("WHATEVER"), "startup names the problem");
+    assert!(
+        logged(&["loaded all the same", "WHATEVER"]),
+        "startup names the problem"
+    );
     assert_eq!(
         ask(port, "old.test").map(|reply| reply.metadata.response_code),
         Some(ResponseCode::NXDomain)
     );
 
-    // 保留着问题的重载被拒绝，正在用的配置不变
-    // A reload keeping the problem is refused and the running configuration stays
-    write_config(&config, port, "192.0.2.2", "WHATEVER");
+    // 保留着问题的重载被拒绝，正在用的配置不变。拒掉的是新写的这份：问题换了个写法，启动以后同一份配置多重载一次也
+    // 对不上（见 a_background_refresh_rule_only_warns_at_startup_and_on_reload）
+    // A reload keeping the problem is refused and the running configuration stays. What is refused
+    // is the one written now, its problem written another way, which the same configuration
+    // reloaded once more after startup does not match (see
+    // a_background_refresh_rule_only_warns_at_startup_and_on_reload)
+    write_config(&config, port, "192.0.2.2", "WHATNOT");
     assert!(
-        eventually(Duration::from_secs(10), || logged("reload failed")),
+        eventually(Duration::from_secs(10), || {
+            logged(&["config reload failed", "WHATNOT"])
+        }),
         "the reload is refused"
     );
     assert_eq!(static_ip(port), Some(Ipv4Addr::new(192, 0, 2, 1)));
