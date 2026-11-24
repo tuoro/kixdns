@@ -61,24 +61,22 @@ type UdpInflight = (
     oneshot::Sender<anyhow::Result<Bytes>>,
 );
 
-/// Type alias for UDP inflight request tracking
-/// ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
-/// The sent query (ID already rewritten) stays in the entry so the reader can
-/// match the answer's question section against it (RFC 5452 §9.1).
-/// 条目保留已改写 ID 的查询报文，供 reader 比对应答的 question 段（RFC 5452 §9.1）。
+/// 在途的 UDP 查询，按改写过的 ID（见 [`UdpInflight`]）。条目留着改写过 ID 的查询报文，供读取任务比对应答的问题（RFC
+/// 5452 §9.1）/ The UDP queries in flight, by rewritten ID (see [`UdpInflight`]). An entry keeps
+/// the query as sent, its ID rewritten, for the reader to match the answer's question against
+/// (RFC 5452 §9.1)
 type UdpInflightMap = DashMap<u16, UdpInflight, FxBuildHasher>;
 
 /// 等着一个在途条目的回答的那一头：回答从 `rx` 来。放手时（拿到了回答、超时、取消、提前返回、panic）把 `map` 里
 /// `id` 下已经没人等的条目删掉：先关掉自己这一头再删，所以自己的条目一定删得掉。回答到了、读取任务把条目拿走以后，
-/// 这个 ID 可能已经分给了后来的查询，那一条有人等着，不动；以前按 ID 无条件删，会把后来的条目带走，它的回答到了
-/// 找不到条目，只能等到超时
+/// 这个 ID 可能已经分给了后来的查询，那一条有人等着，不动：按 ID 不管是谁都删的话，会把它带走，它的回答到了找不到
+/// 条目，只能等到超时
 /// The end that waits for an in-flight entry's answer, which comes on `rx`. On letting go (with
 /// the answer, at a timeout, on cancellation, an early return or a panic) it removes the entry
 /// under `id` in `map` if nobody waits on it any more: its own end is closed first, so its own
 /// entry always goes. Once an answer has come and the reader has taken the entry, the ID may
-/// have gone to a later query, whose entry is waited on and stays; removing by ID whatever was
-/// there used to take that later entry along, so its answer found no entry and the query
-/// waited out its timeout
+/// have gone to a later query, whose entry is waited on and stays: removing by ID whatever is
+/// there would take it along, its answer finding no entry and the query waiting out its timeout
 struct Waiting<V> {
     rx: oneshot::Receiver<anyhow::Result<Bytes>>,
     map: Arc<DashMap<u16, V, FxBuildHasher>>,
@@ -103,8 +101,6 @@ impl<V> Drop for Waiting<V> {
 /// the receiving task, and the socket closes with it
 struct UdpSocketState {
     socket: Arc<tokio::net::UdpSocket>,
-    /// Inflight map: ID -> (OriginalID, ExpectedAddr, SentQuery, Sender)
-    /// Note: Using FxBuildHasher for performance
     inflight: Arc<UdpInflightMap>,
     sent: std::sync::atomic::AtomicU32,
     reader: tokio::task::AbortHandle,
@@ -116,17 +112,17 @@ impl Drop for UdpSocketState {
     }
 }
 
-/// 一个 socket 发出这么多个查询以后，换成系统另挑端口的新 socket（RFC 5452 §9.2）。以前池里的端口用到进程结束，猜出或者
-/// 探出来（像 SAD DNS 那样借 ICMP 的限速去扫）一次就一直有效；现在一个端口最多用这么多次，查询越多换得越快。也不每个
+/// 一个 socket 发出这么多个查询以后，换成系统另挑端口的新 socket（RFC 5452 §9.2）：一个端口要是一直用下去，猜出或者
+/// 探出来（像 SAD DNS 那样借 ICMP 的限速去扫）一次就一直有效；一个端口最多用这么多次，查询越多换得越快。也不每个
 /// 查询都换：每个新端口在防火墙的连接跟踪里占一条、留一分钟，OpenWrt 上每秒两百来个未命中就能把表占满，满了整台路由器
 /// 的新连接都被丢掉；每个查询单开 socket 的未命中还多花四分之一的 CPU
 /// After sending this many queries a socket is replaced by a new one, on another port the system
-/// picks (RFC 5452 §9.2). The pool's ports used to last the process, so one guessed or probed
-/// (through the ICMP rate limit, as SAD DNS does) stayed good for ever; now a port serves this
-/// many at most, replaced the faster the more queries come. Nor is it replaced every query: each
+/// picks (RFC 5452 §9.2): a port kept for good stays good for ever once guessed or probed
+/// (through the ICMP rate limit, as SAD DNS does), so a port serves this many at most, replaced
+/// the faster the more queries come. Nor is it replaced every query: each
 /// new port takes an entry in the firewall's connection tracking for a minute, a couple of
 /// hundred misses a second fill the table on OpenWrt, and with it full the whole router drops
-/// new connections; a socket per query also cost a miss a quarter more CPU
+/// new connections; a socket per query also costs a miss a quarter more CPU
 const UDP_SOCKET_QUERIES: u32 = 64;
 
 /// 上游 UDP socket 接收出错以后，歇多久再接着收；None 是马上接着收。
@@ -152,11 +148,12 @@ fn recv_error_pause(error: &std::io::Error) -> Option<Duration> {
 
 thread_local! {
     /// 收 UDP 回答的缓冲，每个线程一块，容得下最大的 DNS 报文：EDNS 允许把 UDP 应答协商到 65535 字节，比缓冲区长的数据报
-    /// 会被悄悄截掉尾部。以前每个 socket 各带一块，默认 64 个 socket 时常驻内存多约 1 MiB，换 socket 时还要重新分配
+    /// 会被悄悄截掉尾部。不跟着 socket 走：每个 socket 各带一块的话，默认 64 个 socket 常驻内存多约 1 MiB，换 socket
+    /// 时还要重新分配
     /// The buffer UDP replies are received into, one per thread, holding the largest DNS message:
     /// EDNS lets a UDP answer be negotiated up to 65535 bytes, and a datagram longer than the
-    /// buffer loses its tail without notice. Each socket used to carry one, some 1 MiB more
-    /// resident with the default 64 sockets, allocated again whenever a socket was replaced
+    /// buffer loses its tail without notice. It goes with no socket: one each would keep some 1 MiB
+    /// more resident with the default 64 sockets, allocated again whenever a socket is replaced
     static UDP_RECEIVED: std::cell::RefCell<Box<[u8]>> =
         std::cell::RefCell::new(vec![0; MAX_DNS_MESSAGE_SIZE].into_boxed_slice());
 }
@@ -536,7 +533,7 @@ pub struct Tcp;
 impl StreamTransport for Tcp {
     /// 读回答经过缓冲：一次读进好几条回答，长度前缀和正文不用各读一次系统调用。DoT 的 TLS 流自己有缓冲
     /// Answers are read through a buffer: one read takes in several answers, and a length
-    /// prefix and its body no longer cost a system call each. DoT's TLS stream buffers on its own
+    /// prefix and its body do not cost a system call each. DoT's TLS stream buffers on its own
     type Read = tokio::io::BufReader<OwnedReadHalf>;
     type Write = OwnedWriteHalf;
     type Shared = Arc<Bootstrap>;
@@ -563,15 +560,13 @@ const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
 /// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时报最后那个失败。
-/// TCP、DoT、直连的 DoH 和 DoQ 都这样连。以前 TCP、DoT 一个个依次连，前面的地址不回应时等到建连的时限也轮不到后面的；
-/// DoH 直连同一族的地址也是依次连；DoQ 只连一个
+/// TCP、DoT、直连的 DoH 和 DoQ 都这样连：前面的地址不回应时，后面的不用等到建连的时限才轮到
 /// Connects through `attempt` to one of `addresses` (RFC 8305 sections 4 and 5): the addresses
 /// alternate by family, the first address's family first; one attempt is started, and once it is
 /// not through after [`ATTEMPT_DELAY`], or has failed, the next one is, the first to connect
 /// being used and the rest given up; with all failed the last failure is reported. TCP, DoT,
-/// direct DoH and DoQ all connect so. TCP and DoT used to try one address after another, so with
-/// an early one not answering the later ones never had their turn within the connect's time
-/// limit; direct DoH did the same within a family; DoQ tried a single one
+/// direct DoH and DoQ all connect so: with an early address not answering, the later ones have
+/// their turn well within the connect's time limit
 async fn staggered<T, F>(
     addresses: Vec<SocketAddr>,
     attempt: impl Fn(SocketAddr) -> F,
@@ -964,10 +959,9 @@ impl<C> UpstreamPools<C> {
         self.pools.retain(|upstream, _| keep(upstream));
     }
 
-    /// `upstream` 的连接池，还没有就用 `clients` 建一个。平常池已经在，只读一下：不分配键、不拿写锁，以前每个查询都分配一个
-    /// 键、拿一次分片的写锁 / The pool for `upstream`, built from `clients` if there is none.
-    /// Normally the pool is there and is only read: no key allocated and no write lock taken,
-    /// where every query used to allocate a key and take its shard's write lock
+    /// `upstream` 的连接池，还没有就用 `clients` 建一个。平常池已经在，只读一下：不分配键、不拿写锁 / The pool for
+    /// `upstream`, built from `clients` if there is none. Normally the pool is there and is only
+    /// read: no key allocated and no write lock taken
     fn get_or_create(
         &self,
         upstream: &str,
@@ -1030,11 +1024,8 @@ impl<T: StreamTransport> StreamMultiplexer<T> {
         }
     }
 
-    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
-    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
-    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
-    /// upstream the configuration no longer names is dropped: queries using it hold on to
-    /// it until they finish, and its connections close after that.
+    /// 只留下 `keep` 认可的上游的连接池（见 [`UpstreamPools::retain`]）/ Keeps only the pools of the
+    /// upstreams `keep` accepts (see [`UpstreamPools::retain`])
     pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
         self.pools.retain(keep);
     }
@@ -2386,16 +2377,12 @@ impl DohClient {
         if now.saturating_sub(last_prune) < prune_every {
             return;
         }
-        // 先占下这一轮：CAS 成功的调用者负责扫描，其它调用者立刻返回。时间戳在
-        // 扫描之前就推后，所以无论这轮删没删掉东西，热路径都要再等一个间隔才会
-        // 走到这里——之前的数量门槛放在 CAS 之前，不满足时直接 return 而不推后
-        // 时间戳，于是每一次查询都要付一次 DashMap::len()（逐分片取读锁）。
-        // Claim the round first: the caller that wins the CAS does the scan and
-        // the others return. The timestamp moves before the scan, so whether or
-        // not this round drops anything the hot path waits another interval to
-        // get here. The entry-count gate used to sit before the CAS and return
-        // without moving the timestamp, so every lookup paid a DashMap::len(),
-        // which takes a read lock on every shard.
+        // 先占下这一轮：CAS 成功的调用者负责扫描，其它调用者立刻返回。时间戳在扫描之前就推后，所以无论这轮删没删掉东西，
+        // 热路径都要再等一个间隔才会走到这里，不会每个查询都去数一遍条目（DashMap::len() 逐分片取读锁）
+        // Claim the round first: the caller that wins the CAS does the scan and the others
+        // return. The timestamp moves before the scan, so whether or not this round drops
+        // anything the hot path waits another interval to get here, and no lookup counts the
+        // entries (a DashMap::len() takes a read lock on every shard)
         if self
             .last_prune_millis
             .compare_exchange(last_prune, now, Ordering::AcqRel, Ordering::Relaxed)
@@ -3100,14 +3087,11 @@ pub type DoqConnectionPool = ConnectionPool<DoqMuxClient>;
 /// DoQ 一次尝试的失败原因，按类型保留 quinn 的原始错误
 /// Why one DoQ attempt failed, keeping quinn's own error by type
 ///
-/// 此前内层每一步都被 `.context()` 包过，而 `anyhow::Error::to_string()` 只
-/// 输出最外层那一句，所以判定 0-RTT 是否被拒绝时拿到的永远只是那几个固定
-/// 短语，quinn 说的话根本到不了。把原始错误原样带出来，判定就能落在类型上。
-/// Every step used to be wrapped in `.context()`, and
-/// `anyhow::Error::to_string()` renders only the outermost one, so the check
-/// for a rejected 0-RTT attempt never saw anything but a handful of fixed
-/// phrases and never quinn's own words. Carrying the error out untouched lets
-/// the decision rest on types.
+/// 每一步都包进 `.context()` 的话，`anyhow::Error::to_string()` 只给出最外层那一句，判定 0-RTT 是否被拒绝时看不到 quinn
+/// 说了什么。原始错误原样带出来，判定就落在类型上
+/// With every step wrapped in `.context()`, `anyhow::Error::to_string()` would render only the
+/// outermost one, and the check for a rejected 0-RTT attempt would never see quinn's own words.
+/// Carried out untouched, the error lets the decision rest on types
 #[derive(Debug)]
 enum DoqFailure {
     /// `open_bi` 失败：连接已经不可用 / the connection is already unusable
@@ -3221,18 +3205,18 @@ struct DoqConn {
 }
 
 /// DoQ 连接的传输参数。查询都是我们开的流，一个流问一个（RFC 9250 第 4.2 节），所以：
-/// - 上游能开给我们的流是 0。quinn 的 `max_concurrent_bidi/uni_streams` 限的是对端开过来的流，以前各给了 100，却从不
-///   去接，上游开过来的流和发来的数据就一直缓冲着；
+/// - 上游能开给我们的流是 0。quinn 的 `max_concurrent_bidi/uni_streams` 限的是对端开过来的流，我们从不去接，给了的话
+///   上游开过来的流和发来的数据会一直缓冲着；
 /// - 每个流的接收窗口正好装下最长的回答（65535 字节加两字节长度前缀），连接的窗口和 DoH 的 HTTP/2 连接一样（见
-///   `doh_h2::CONNECTION_WINDOW`）。quinn 默认每个流 1.25 MB、连接不设上限，一个恶意上游能让一条连接缓冲上百 MB；
+///   `doh_h2::CONNECTION_WINDOW`）。照 quinn 默认的每个流 1.25 MB、连接不设上限，一个恶意上游能让一条连接缓冲上百 MB；
 /// - 不收 QUIC datagram，DoQ 用不着。
 ///
 /// 初始 RTT 定 100 ms，好让拥塞控制一开始估得准一些；`keepalive_interval_ms`、`idle_timeout_secs` 为 0 时不设
 /// The transport parameters of a DoQ connection. Every query is a stream we open, one query
 /// a stream (RFC 9250 section 4.2), so:
 /// - the upstream may open no stream to us. quinn's `max_concurrent_bidi/uni_streams` bound the
-///   streams the peer opens, and were 100 each while never accepted, so streams an upstream
-///   opened and the data it sent on them stayed buffered;
+///   streams the peer opens, which we never accept, so streams an upstream opened and the data
+///   it sent on them would stay buffered;
 /// - each stream's receive window holds just the longest answer (65535 bytes and its two-byte
 ///   length prefix), and the connection's is that of an HTTP/2 DoH connection (see
 ///   `doh_h2::CONNECTION_WINDOW`). quinn's defaults are 1.25 MB a stream and no bound on the
@@ -3269,11 +3253,8 @@ fn doq_transport(
 const DOQ_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
 impl DoqClient {
-    /// 只留下 `keep` 认可的上游的连接池。重载后配置里不再有的上游，连接池就此丢掉：正在用它的
-    /// 查询拿着连接池，做完才释放；之后它的连接随之关闭。
-    /// Keeps only the pools of the upstreams `keep` accepts. After a reload, the pool of an
-    /// upstream the configuration no longer names is dropped: queries using it hold on to
-    /// it until they finish, and its connections close after that.
+    /// 只留下 `keep` 认可的上游的连接池（见 [`UpstreamPools::retain`]）/ Keeps only the pools of the
+    /// upstreams `keep` accepts (see [`UpstreamPools::retain`])
     pub(crate) fn retain_upstreams(&self, keep: impl Fn(&str) -> bool) {
         self.pools.retain(keep);
     }
@@ -3555,13 +3536,6 @@ impl DoqMuxClient {
         // We need to read all data until FIN, then parse the length prefix
         // 注意：服务器发送响应后用 FIN 关闭流
         // 我们需要读取所有数据直到 FIN，然后解析长度前缀
-        // 连接被对端关掉的判断此前靠字符串，而且那个判断把所有原因都
-        // 折叠成同一句话；现在原样把 quinn 的错误带出去，由
-        // zero_rtt_likely_rejected 按类型判定。
-        // Detecting a peer-closed connection used to go through strings,
-        // and that check folded every cause into one sentence. The quinn
-        // error is now carried out as it is and
-        // zero_rtt_likely_rejected decides by type.
         let mut all_data = recv
             .read_to_end(MAX_DNS_MESSAGE_SIZE + 2)
             .await
@@ -3765,11 +3739,11 @@ impl DoqMuxClient {
     }
 
     /// quinn 明说这个查询发出去的是早期数据、被上游拒收了。只有 0-RTT 期间开的流才会报这个，所以不管这条连接是不是
-    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次：搭在别的查询建的连接上的查询以前不重发，直接失败
+    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次，搭在别的查询建的连接上的也一样
     /// quinn says outright that what this query sent was early data the upstream refused. Only
     /// a stream opened during 0-RTT is told so, and whether or not this query made the
-    /// connection it is to be sent again on one without 0-RTT: a query riding a connection
-    /// another query made used not to be sent again, and failed
+    /// connection it is to be sent again on one without 0-RTT, one riding a connection another
+    /// query made included
     fn early_data_refused(failure: &DoqFailure) -> bool {
         matches!(
             failure,
@@ -3945,13 +3919,13 @@ const DOQ_NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0x0);
 const DOQ_REQUEST_CANCELLED: quinn::VarInt = quinn::VarInt::from_u32(0x3);
 
 /// 一个 DoQ 查询的那一对流。没等到上游把回答发完就被丢掉（时限到了、几个上游竞速它输了）时，按 RFC 9250
-/// 第 4.3.1 节用 [`DOQ_REQUEST_CANCELLED`] 停止接收、重置发送。以前交给 quinn 丢掉流，发出的错误码是 0，
-/// 也就是 DOQ_NO_ERROR，上游当它正常结束
+/// 第 4.3.1 节用 [`DOQ_REQUEST_CANCELLED`] 停止接收、重置发送：交给 quinn 丢掉流的话，发出的错误码是 0，
+/// 也就是 DOQ_NO_ERROR，上游会当它正常结束
 /// The pair of streams of one DoQ query. Dropped before the upstream has finished sending the
 /// answer (a deadline that came first, a race between upstreams lost), it stops receiving and
-/// resets sending with [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks. Dropping the
-/// streams used to be left to quinn, whose error code 0 is DOQ_NO_ERROR, the upstream taking it
-/// for a normal end
+/// resets sending with [`DOQ_REQUEST_CANCELLED`], as RFC 9250 section 4.3.1 asks: streams left
+/// for quinn to drop would carry error code 0, DOQ_NO_ERROR, which the upstream takes for a
+/// normal end
 struct DoqStream {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
