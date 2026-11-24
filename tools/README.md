@@ -183,7 +183,7 @@ Forward 的 transport 值为 udp、tcp、tcp_udp、doh、dot、doq。upstream �
 
 - `doq_enable_0rtt` 控制全局默认值，默认启用。
 - DoQ upstream 可以使用 `0rtt=true` 或 `0rtt=false` 覆盖全局设置。
-- 服务器拒绝或请求超时后，该上游在本次进程生命周期内会禁用 0-RTT，重启后重新尝试。
+- 服务器拒绝 0-RTT（比如重启过、不认先前的票据）时，查询在这条连接握手完以后在它上面重发，0-RTT 照用，下一条连接用新票据。
 - `sni` 或 `servername` 用于设置 TLS 名称；DoQ 使用 IP literal 时必须显式设置 SNI。
 
 ### RFC 8767 过期缓存
