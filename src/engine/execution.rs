@@ -5254,36 +5254,79 @@ mod tests {
         (engine, dedupe_hash)
     }
 
-    /// 上游失败、回 SERVFAIL 时记的那条 warn 带着失败的完整原因（上游是没回答、拒绝了连接还是别的什么），不带每次都一样的
-    /// RCODE 字段
-    /// The warning logged when the upstream failed and SERVFAIL goes out carries the failure's
-    /// whole cause (whether the upstream did not answer, refused the connection or what else),
-    /// with no RCODE field that is the same every time
+    /// 上游失败只记一条 warn，带着查询名、规则组和失败的完整原因（上游是没回答、拒绝了连接还是别的什么）：回 SERVFAIL 的、
+    /// 执行 miss 动作的、响应动作转发失败的都一样。只问了一个上游时不说「所有上游」，也不带每次都一样的 RCODE 字段和规则写的
+    /// 默认传输（写了前缀的上游不走它）。以前只问一个上游时 `forward_upstream` 先记一条不带查询名的，调用方再记一条，原因前头
+    /// 是「all upstreams failed」
+    /// An upstream failure logs one warning, with the query name, the pipeline and the failure's
+    /// whole cause (whether the upstream did not answer, refused the connection or what else):
+    /// answering SERVFAIL, running the miss actions, or a response action's forward failing
+    /// alike. With one upstream asked it says nothing of "all upstreams", and carries no RCODE
+    /// field that is the same every time nor the rule's default transport (which an upstream
+    /// written with a scheme does not take). With one upstream asked, `forward_upstream` used to
+    /// log one first without the query name, the caller another, its cause led by "all
+    /// upstreams failed"
     #[tokio::test]
-    async fn an_upstream_failure_is_logged_with_its_cause() {
-        let (engine, _) = engine_without_an_answering_upstream(false);
-        let (warnings, guard) = support::Warnings::capture();
-        let reply = engine
-            .handle_packet(&stale_com_query(), "127.0.0.1:12345".parse().unwrap())
+    async fn an_upstream_failure_is_logged_once_with_its_cause() {
+        let answering = support::answering_upstream(std::net::Ipv4Addr::new(192, 0, 2, 1), 300)
             .await
-            .expect("answered");
-        drop(guard);
-        assert_eq!(
-            Message::from_vec(&reply).unwrap().metadata.response_code,
-            ResponseCode::ServFail
-        );
-        let lines = warnings.lines();
-        let failed: Vec<_> = lines
-            .iter()
-            .filter(|line| line.contains("event=\"upstream_failure\""))
-            .collect();
-        assert_eq!(failed.len(), 1, "{lines:#?}");
-        assert!(
-            failed[0].contains("all upstreams failed: "),
-            "{}",
-            failed[0]
-        );
-        assert!(!failed[0].contains("rcode="), "{}", failed[0]);
+            .address;
+        let dead = serde_json::json!([{ "type": "forward", "upstream": DEAD_UPSTREAM }]);
+        let fallback = serde_json::json!([{ "type": "static_ip_response", "ip": "192.0.2.9" }]);
+        let cases = [
+            (
+                "SERVFAIL",
+                serde_json::json!({ "name": "r", "matchers": [{ "type": "any" }], "actions": dead.clone() }),
+                "upstream_failure",
+                "upstream failed",
+            ),
+            (
+                "the miss actions",
+                serde_json::json!({
+                    "name": "r", "matchers": [{ "type": "any" }], "actions": dead.clone(),
+                    "response_actions_on_miss": fallback
+                }),
+                "miss_actions_on_upstream_failure",
+                "upstream failed, running the miss actions",
+            ),
+            (
+                "a response action's forward",
+                serde_json::json!({
+                    "name": "r", "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": answering }],
+                    "response_actions_on_match": dead.clone()
+                }),
+                "response_action_failure",
+                "response action forward failed",
+            ),
+        ];
+        for (path, rule, event, message) in cases {
+            let engine = support::engine_from(serde_json::json!({
+                "settings": { "default_upstream": DEAD_UPSTREAM, "upstream_timeout_ms": 100 },
+                "pipelines": [{ "id": "main", "rules": [rule] }]
+            }));
+            let (warnings, guard) = support::Warnings::capture();
+            engine
+                .handle_packet(&stale_com_query(), "127.0.0.1:12345".parse().unwrap())
+                .await
+                .expect("answered");
+            drop(guard);
+            let lines = warnings.lines();
+            assert_eq!(lines.len(), 1, "{path}: {lines:#?}");
+            let line = &lines[0];
+            for part in [
+                format!("event=\"{event}\""),
+                format!("{message} "),
+                "qname=stale.com".to_owned(),
+                "pipeline=main".to_owned(),
+                "upstream failed: ".to_owned(),
+            ] {
+                assert!(line.contains(&part), "{path}: {part} in {line}");
+            }
+            for absent in ["all upstreams", "transport=", "rcode="] {
+                assert!(!line.contains(absent), "{path}: {absent} in {line}");
+            }
+        }
     }
 
     /// The keys of the `stale.com` query in the default pipeline / 默认 pipeline 里 `stale.com` 查询的键

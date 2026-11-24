@@ -540,6 +540,7 @@ async fn run_response_actions(
                             return Err(err);
                         }
                         crate::warn_sparse!(
+                            per upstream_addr;
                             event = "response_action_failure",
                             upstream = %upstream_addr,
                             qname = %qname,
