@@ -15,14 +15,17 @@ use crate::engine::types::EngineInner;
 use crate::engine::utils::RefreshingGuard;
 use crate::matcher::Requester;
 
-/// 一条缓存命中的刷新时机。后台刷新开着、应答来自上游、条目的 TTL 不低于下限时才有；剩余的
-/// TTL 不超过阈值时，就到了刷新的时候。照条目自己的 TTL 算，也就是它真正过期的时候：CNAME 3600
-/// 加 A 60 的应答 60 秒就过期，照最长的 TTL 算的话永远轮不到刷新
+/// 一条缓存命中的刷新时机。后台刷新开着、条目的 TTL 不低于下限时才有；剩余的 TTL 不超过阈值时，就到了刷新的时候。
+/// 缓存里的应答都取决于上游的应答（规则直接给出的不进缓存，见 `phases::handle_static_decision`），规则据它
+/// 给出的也照样刷新：刷新去问上游、把规则重新走一遍。照条目自己的 TTL 算，也就是它真正过期的时候：CNAME 3600 加 A 60
+/// 的应答 60 秒就过期，照最长的 TTL 算的话永远轮不到刷新
 /// When a cache hit is due for a background refresh. There is one only with background
-/// refresh on, for an answer from an upstream whose TTL is not below the minimum; it is due
-/// once the remaining TTL is at most the threshold. It goes by the entry's own TTL, when it
-/// really expires: an answer of CNAME 3600 and A 60 expires after 60 seconds, and going by
-/// the longest TTL it would never come due
+/// refresh on, for an entry whose TTL is not below the minimum; it is due once the remaining
+/// TTL is at most the threshold. Every cached answer depends on an upstream's (what the rules
+/// give outright stays out of the cache, see `phases::handle_static_decision`), and
+/// one the rules gave by it is refreshed all the same: the refresh asks the upstream and runs
+/// the rules again. It goes by the entry's own TTL, when it really expires: an answer of CNAME
+/// 3600 and A 60 expires after 60 seconds, and going by the longest TTL it would never come due
 #[derive(Clone, Copy)]
 pub(crate) struct RefreshCheck {
     /// 条目的 TTL 还剩几秒 / Seconds left of the entry's TTL
@@ -37,9 +40,7 @@ impl RefreshCheck {
         hit: &CacheEntry,
         elapsed_secs: u32,
     ) -> Option<Self> {
-        (settings.cache_background_refresh
-            && hit.upstream.is_some()
-            && hit.original_ttl >= settings.cache_refresh_min_ttl)
+        (settings.cache_background_refresh && hit.original_ttl >= settings.cache_refresh_min_ttl)
             .then(|| Self {
                 remaining_ttl: hit.original_ttl.saturating_sub(elapsed_secs),
                 // 至少提前一秒：TTL 短到按比例算出 0 时，剩 0 秒的条目已经过期，等不到刷新
@@ -70,9 +71,6 @@ pub struct RefreshTarget {
     /// When the renewed answer was fetched (see `CacheEntry::fetched_at`): it is
     /// recognised by this
     pub fetched_at: Instant,
-    /// 刷新开始的时刻：之后取得的应答来自刷新本身或别的请求
-    /// When the refresh started: answers fetched later come from the refresh or other requests
-    pub started: Instant,
     /// 被刷新的请求自己带的 ECS 选项，按缓存看到的样子。读不懂的选项放不回重放的包里，所以刷新
     /// 按这一项判断，而不是从重放的包里读
     /// The ECS option the renewed request carried itself, as the cache saw it. One
@@ -88,7 +86,6 @@ impl RefreshTarget {
             pipeline,
             reach,
             fetched_at,
-            started: Instant::now(),
             client_ecs: None,
         }
     }
@@ -493,6 +490,53 @@ mod refresh_timing_tests {
         })
         .await
         .expect("the hit refreshes the answer from the upstream");
+        assert_eq!(upstream.queries(), 2);
+    }
+
+    /// 回答检查据上游应答给出的静态应答快到期时照样预取：刷新去问上游、把规则重新走一遍。以前只预取上游自己的应答，
+    /// 规则给出的没有上游，到期之前从不刷新
+    /// A static answer an answer check gave by an upstream answer is prefetched all the same
+    /// when it comes due: the refresh asks the upstream and runs the rules again. Only an
+    /// upstream's own answer used to be prefetched, and one the rules gave, having no upstream,
+    /// was never refreshed before it expired
+    #[tokio::test]
+    async fn a_static_answer_the_rules_gave_by_an_upstream_answer_is_prefetched() {
+        let upstream = crate::engine::test_support::answering_upstream(
+            std::net::Ipv4Addr::new(192, 0, 2, 1),
+            2,
+        )
+        .await;
+        let engine = engine_from(json!({
+            "settings": {
+                "cache_background_refresh": true,
+                "cache_refresh_threshold_percent": 50,
+                "cache_refresh_min_ttl": 1
+            },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "checked",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream.address }],
+                "response_actions_on_match": [{ "type": "deny" }]
+            }] }]
+        }));
+        let mut query = Message::new(0x2a2a, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_str("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        let peer = "10.0.0.1:53000".parse().unwrap();
+
+        engine.handle_packet(&query, peer).await.expect("answered");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine.handle_packet(&query, peer).await.expect("answered");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while upstream.queries() < 2 || !engine.refreshing.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hit refreshes the deny from the upstream");
         assert_eq!(upstream.queries(), 2);
     }
 
