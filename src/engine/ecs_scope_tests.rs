@@ -753,6 +753,44 @@ async fn a_response_action_forwarding_by_client_address_keeps_waiting_requests_a
     assert_eq!(second.queries(), 2);
 }
 
+/// 回答检查跳到的 pipeline 里，回答动作的转发按客户端地址发 ECS：两台不同网段的客户端同时问，各自拿到按自己网段取回
+/// 的应答。跳转之前登记的条目键里算上了它，后来的那台不合并进先来的那台的条目
+/// A forward among the answer actions of the pipeline an answer check jumps to sends ECS by the
+/// client's address: two clients in different networks asking at once each get the answer
+/// fetched for their own network. The key of the entry registered before the jump counts it, so
+/// the later client does not merge into the earlier one's entry
+#[tokio::test]
+async fn a_response_action_forwarding_by_client_address_on_the_jump_path_keeps_waiters_apart() {
+    let relay = upstream_with(
+        Echo::Nothing,
+        ResponseCode::NoError,
+        300,
+        Duration::from_millis(150),
+    )
+    .await;
+    let checked = upstream(Echo::Nothing).await;
+    let second = upstream(Echo::Scope(24)).await;
+    let engine = engine(serde_json::json!([
+        { "id": "main", "rules": [{
+            "name": "relay", "matchers": [{ "type": "any" }],
+            "actions": [forward_to(&relay.address, None)],
+            "response_matchers": [{ "type": "upstream_equals", "value": relay.address }],
+            "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "geo" }]
+        }] },
+        { "id": "geo", "rules": [{
+            "name": "check", "matchers": [{ "type": "any" }],
+            "actions": [forward_to(&checked.address, None)],
+            "response_matchers": [{ "type": "upstream_equals", "value": checked.address }],
+            "response_actions_on_match": [forward_to(&second.address, from_client_ip())]
+        }] }
+    ]));
+    assert_eq!(
+        ask_at_once(&engine, ("198.51.100.7", None), ("203.0.113.9", None)).await,
+        [v4("198.51.100.0"), v4("203.0.113.0")]
+    );
+    assert_eq!((relay.queries(), second.queries()), (2, 2));
+}
+
 /// 后台刷新带着触发它的客户端的 ECS 重放请求，不同子网的条目各自刷新。
 /// A background refresh replays the request with the ECS of the client that
 /// triggered it, and entries for different subnets refresh on their own.

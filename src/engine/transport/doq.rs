@@ -126,16 +126,26 @@ pub struct DoqMuxClient {
     /// 客户端被丢掉时取消：它的连接马上关掉（见 [`DoqMuxClient::watch`]）/ Cancelled when the client is
     /// dropped: its connection closes at once (see [`DoqMuxClient::watch`])
     stop: CancellationToken,
-    /// Track whether 0-RTT has been rejected by the server for auto-fallback
-    /// 跟踪服务器是否拒绝了 0-RTT，用于自动回退
-    /// Once rejected, 0-RTT will be skipped for subsequent connections
-    /// 一旦被拒绝，后续连接将跳过 0-RTT
-    ///
-    /// 同一个上游连接池里的所有连接共用这个标记：一条连接学到的事，其余连接不必再各
-    /// 失败一次、各等满一次超时
-    /// Shared by every connection in the upstream's pool: what one connection
-    /// learned, the others need not each fail and sit out a timeout to learn again
-    zero_rtt_rejected: Arc<AtomicBool>,
+    /// 这个上游的连接池对 0-RTT 的了解，池里的客户端共用（见 [`ZeroRtt`]）/ What this upstream's pool
+    /// knows of 0-RTT, shared by the pool's clients (see [`ZeroRtt`])
+    zero_rtt: Arc<ZeroRtt>,
+}
+
+/// 一个上游的连接池对 0-RTT 的了解，池里的客户端共用：一条连接学到的事，其余连接不必再各失败一次、各等满一次超时
+/// What one upstream's pool knows of 0-RTT, shared by the pool's clients: what one connection
+/// learned, the others need not each fail and sit out a timeout to learn again
+#[derive(Default)]
+struct ZeroRtt {
+    /// 上游拒绝了 0-RTT，或者上游回了握手的 0-RTT 连接上超时：到重启都不再用（见 [`DoqMuxClient::disable_zero_rtt`]）
+    /// The upstream rejected 0-RTT, or a 0-RTT connection timed out with its handshake answered:
+    /// it is not used again until a restart (see [`DoqMuxClient::disable_zero_rtt`])
+    rejected: AtomicBool,
+    /// 上一次完整握手连上的地址，0-RTT 只发往它：恢复会话的连接当场就算连上，连的地址不通也看不出来，错开建连就轮不到
+    /// 别的地址
+    /// The address the last full handshake reached, the only one 0-RTT goes to: a resumed
+    /// connection counts as made at once, its address dead or not, so a staggered connect would
+    /// never get to the other addresses
+    reached: parking_lot::Mutex<Option<SocketAddr>>,
 }
 
 /// 新建的一条 DoQ 连接，和它有没有用 0-RTT / A DoQ connection newly made, and whether it used 0-RTT
@@ -277,13 +287,13 @@ impl DoqClient {
     ) -> anyhow::Result<Bytes> {
         let pool = self.pools.get_or_create(upstream, |upstream| {
             // 一个池的连接共用对 0-RTT 的了解 / A pool's connections share what they learn about 0-RTT
-            let zero_rtt_rejected = Arc::new(AtomicBool::new(false));
+            let zero_rtt = Arc::<ZeroRtt>::default();
             (0..self.pool_size)
                 .map(|_| {
                     Arc::new(DoqMuxClient::new(
                         upstream.clone(),
                         Arc::clone(&self.runtime),
-                        Arc::clone(&zero_rtt_rejected),
+                        Arc::clone(&zero_rtt),
                     ))
                 })
                 .collect()
@@ -303,11 +313,7 @@ impl Drop for DoqMuxClient {
 }
 
 impl DoqMuxClient {
-    fn new(
-        upstream: Arc<str>,
-        runtime: Arc<DoqRuntime>,
-        zero_rtt_rejected: Arc<AtomicBool>,
-    ) -> Self {
+    fn new(upstream: Arc<str>, runtime: Arc<DoqRuntime>, zero_rtt: Arc<ZeroRtt>) -> Self {
         Self {
             upstream,
             target: std::sync::OnceLock::new(),
@@ -316,7 +322,7 @@ impl DoqMuxClient {
             in_flight: AtomicUsize::new(0),
             runtime,
             stop: CancellationToken::new(),
-            zero_rtt_rejected,
+            zero_rtt,
         }
     }
 
@@ -402,7 +408,7 @@ impl DoqMuxClient {
                             && Self::zero_rtt_likely_rejected(&failure))
                     {
                         self.disable_zero_rtt();
-                        warn!(
+                        debug!(
                             upstream = %self.upstream,
                             error = %failure,
                             "DoQ 0-RTT likely rejected, retrying without 0-RTT"
@@ -431,12 +437,19 @@ impl DoqMuxClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(_) => {
-                    // 用了 0-RTT 的连接上超时，算 0-RTT 的嫌疑，往后不再用；普通连接上的超时只是这次回答慢。预算已经
-                    // 用完，不再重试
-                    // A timeout on a connection that used 0-RTT puts 0-RTT under suspicion, and it
-                    // is not used from then on; on a normal connection it is just a slow answer.
-                    // The budget is spent, so there is no retry
-                    if used_0rtt {
+                    // 用了 0-RTT 的连接上超时：上游连握手都没回的，是这个地址不通，和 0-RTT 无关，忘掉这个地址，下一次
+                    // 建连几个地址照常错开着完整握手；握手回了的，算 0-RTT 的嫌疑，往后不再用。普通连接上的超时只是这次
+                    // 回答慢。预算已经用完，不再重试
+                    // A timeout on a connection that used 0-RTT: with its handshake never answered,
+                    // the address is down, which says nothing about 0-RTT, and it is forgotten, the
+                    // next connect shaking hands in full staggered over the addresses as ever; with
+                    // the handshake answered, 0-RTT is under suspicion and not used from then on. On
+                    // a normal connection it is just a slow answer. The budget is spent, so there is
+                    // no retry
+                    if pooled.used_0rtt && pooled.conn.handshake_data().is_none() {
+                        let address = pooled.conn.remote_address();
+                        self.zero_rtt.reached.lock().take_if(|at| *at == address);
+                    } else if used_0rtt {
                         self.disable_zero_rtt();
                     }
                     // 这期间连接上没读到过别的回答（多半死了或者卡住了）才换：从池里拿掉、关掉它，和 TCP、DoT 复位连接
@@ -599,15 +612,25 @@ impl DoqMuxClient {
         let make = |deadline| {
             let (pool, upstream) = (Arc::clone(&self.pooled), Arc::clone(&self.upstream));
             let (aging, stop) = (self.runtime.aging, self.stop.clone());
+            let zero_rtt = Arc::clone(&self.zero_rtt);
+            // 0-RTT 还允许时，发往上一次完整握手连上的地址 / With 0-RTT still allowed, it goes to the
+            // address the last full handshake reached
+            let zero_rtt_at = self
+                .zero_rtt_retry_allowed(target)
+                .then(|| *self.zero_rtt.reached.lock())
+                .flatten();
             let made = Self::connect_new(
                 Arc::clone(&self.runtime),
                 Arc::clone(&self.upstream),
                 target.clone(),
-                self.zero_rtt_retry_allowed(target),
+                zero_rtt_at,
                 deadline,
             );
             async move {
                 let NewDoqConn { conn, used_0rtt } = made.await?;
+                if !used_0rtt {
+                    *zero_rtt.reached.lock() = Some(conn.remote_address());
+                }
                 let pooled = Arc::new(DoqConn {
                     conn,
                     used_0rtt,
@@ -737,30 +760,31 @@ impl DoqMuxClient {
     /// not already marked as rejected
     fn zero_rtt_retry_allowed(&self, target: &DoqTarget) -> bool {
         target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt)
-            && !self.zero_rtt_rejected.load(Ordering::Relaxed)
+            && !self.zero_rtt.rejected.load(Ordering::Relaxed)
     }
 
     /// 给这个上游关掉 0-RTT；查和改是同一步，同时来的几个里只有一个记 warn
     /// Switch 0-RTT off for this upstream; checking and setting is one step, so of
     /// several arriving at once only one logs the warn
     fn disable_zero_rtt(&self) {
-        if !self.zero_rtt_rejected.swap(true, Ordering::Relaxed) {
+        if !self.zero_rtt.rejected.swap(true, Ordering::Relaxed) {
             warn!(
                 upstream = %self.upstream,
                 "DoQ 0-RTT rejected or unstable, disabling 0-RTT for this upstream until restart"
             );
         }
     }
-    /// 建一条到 `target` 的连接，`zero_rtt` 时先试 0-RTT，最晚到建连的期限 `deadline`；连接和用没用 0-RTT。几个地址
-    /// 错开着连（见 [`staggered`]），握手失败了马上连下一个 / Connects to `target`, trying 0-RTT first when
-    /// `zero_rtt`, by the connect's `deadline`; the connection and whether 0-RTT was used. Several
-    /// addresses are connected to staggered (see [`staggered`]), a failed handshake moving on to
-    /// the next at once
+    /// 建一条到 `target` 的连接，最晚到建连的期限 `deadline`；连接和用没用 0-RTT。几个地址错开着连（见 [`staggered`]），
+    /// 握手失败了马上连下一个。给了 `zero_rtt_at` 而它在解析出的地址里时，它排最前、在它上面先试 0-RTT，别的地址完整握手
+    /// Connects to `target` by the connect's `deadline`; the connection and whether 0-RTT was
+    /// used. Several addresses are connected to staggered (see [`staggered`]), a failed handshake
+    /// moving on to the next at once. With `zero_rtt_at` given and among the addresses resolved,
+    /// it comes first and tries 0-RTT first, the other addresses shaking hands in full
     async fn connect_new(
         runtime: Arc<DoqRuntime>,
         upstream: Arc<str>,
         target: DoqTarget,
-        zero_rtt: bool,
+        zero_rtt_at: Option<SocketAddr>,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<NewDoqConn> {
         let mut addresses = runtime
@@ -769,12 +793,12 @@ impl DoqMuxClient {
             .await
             .context("doq resolve failed")?;
 
-        // 优先使用 IPv4 地址，避免 IPv6 连接问题
-        // Prefer IPv4 addresses to avoid IPv6 connection issues
-        // 某些网络的 IPv6 连接不稳定或 MTU 限制导致 QUIC Initial 数据包发送失败
-        // Some networks have unstable IPv6 or MTU limits causing QUIC Initial packet send failures
-        addresses.sort_by_key(SocketAddr::is_ipv6);
+        // 发 0-RTT 的地址排最前，其余 IPv4 在前：有些网络的 IPv6 不稳定，或者 MTU 限制让 QUIC 的 Initial 包发不出去
+        // The address sending 0-RTT first, then IPv4 before IPv6: on some networks IPv6 is
+        // unstable, or an MTU limit keeps QUIC's Initial packets from getting through
+        addresses.sort_by_key(|address| (Some(*address) != zero_rtt_at, address.is_ipv6()));
         staggered(addresses, deadline, |address| {
+            let zero_rtt = Some(address) == zero_rtt_at;
             Self::connect_to(&runtime, &upstream, &target, address, zero_rtt)
         })
         .await
@@ -798,9 +822,9 @@ impl DoqMuxClient {
             .connect(address, target.sni.as_ref())
             .context("doq connect failed")?;
 
-        // 0-RTT：上游设置优先于全局设置，之前被拒绝过就跳过（见 `zero_rtt_retry_allowed`）
-        // 0-RTT: the upstream's setting before the global one, skipped once it was
-        // rejected (see `zero_rtt_retry_allowed`)
+        // 0-RTT 只在上一次完整握手连上的地址上试，而且还允许（见 `get_or_connect`）
+        // 0-RTT is tried only at the address the last full handshake reached, while still
+        // allowed (see `get_or_connect`)
         let connecting = if zero_rtt {
             // Security warning: 0-RTT (early data) is vulnerable to replay attacks
             // per RFC 8446 §8 and RFC 9001 §5.4. DNS queries are idempotent, so
@@ -822,12 +846,11 @@ impl DoqMuxClient {
             });
             match connecting.into_0rtt() {
                 Ok((conn, _zero_rtt_accepted)) => {
-                    // 0-RTT connection established
-                    // Note: Some DoQ servers (e.g., Alibaba DNS) may reject 0-RTT data
-                    // If you see timeouts, the system will automatically disable 0-RTT for this upstream
-                    // 0-RTT 连接已建立
-                    // 注意：某些 DoQ 服务器（如阿里 DNS）可能拒绝 0-RTT 数据
-                    // 如果遇到超时，系统将自动为此上游禁用 0-RTT
+                    // 0-RTT 连接已建立。某些 DoQ 服务器（如阿里 DNS）会拒绝 0-RTT 数据，被拒绝、或者握手回了还超时，
+                    // 就为此上游禁用 0-RTT（见 `send_with_retry`）
+                    // 0-RTT connection established. Some DoQ servers (e.g. Alibaba DNS) reject
+                    // 0-RTT data; once rejected, or timing out with the handshake answered, 0-RTT
+                    // is disabled for this upstream (see `send_with_retry`)
                     debug!(
                         upstream = %upstream,
                         "DoQ 0-RTT connection established"

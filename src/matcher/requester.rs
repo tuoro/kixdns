@@ -207,6 +207,9 @@ pub(super) struct RuleReads {
     /// The ECS subnets taken from the client that its forwards send
     /// 转发发送的取自客户端的 ECS 子网
     forward_subnets: RequesterScope,
+    /// Those of them that the forwards among its answer actions send
+    /// 其中回答动作里的转发发送的
+    answer_subnets: RequesterScope,
     /// Pipelines its answer checks jump to / 回答检查跳到的 pipeline
     response_jumps: Vec<Arc<str>>,
     /// Pipelines its rules jump to after an earlier rule's answer check may have continued
@@ -224,12 +227,29 @@ impl RuleReads {
             request_matchers: RequesterScope::default(),
             matchers: RequesterScope::default(),
             forward_subnets: RequesterScope::default(),
+            answer_subnets: RequesterScope::default(),
             response_jumps: Vec::new(),
             continued_jumps: Vec::new(),
             jumps: Vec::new(),
             geo: GeoData::default(),
         };
         let mut answer_edns = false;
+        // 按客户端地址发 ECS 的转发发送的子网
+        // The subnet a forward sending ECS by the client's address sends
+        let subnet = |action: &Action| match action {
+            Action::Forward {
+                ecs:
+                    Some(config::EcsMode::FromClientIp {
+                        prefix_v4,
+                        prefix_v6,
+                    }),
+                ..
+            } => Some(RequesterTest::Subnet {
+                prefix_v4: *prefix_v4,
+                prefix_v6: *prefix_v6,
+            }),
+            _ => None,
+        };
         // 前面有没有哪条规则的回答检查会 continue / Whether an earlier rule's answer check continues
         let mut continued = false;
         for rule in rules {
@@ -266,28 +286,15 @@ impl RuleReads {
                     RuntimeResponseMatcher::ResponseEdnsPresent { .. }
                 )
             });
-            // 规则自己的转发和回答动作里的转发都可能按客户端地址发 ECS：回答动作里的照它自己写的 `ecs` 发。以前只看规则
-            // 自己的，两台不同网段的客户端同时问，后来的那台合并进先来的那台的条目，拿到按先来的那台网段取回的应答
-            // The rule's own forward and the forwards among its answer actions may each send ECS by
-            // the client's address, those among the answer actions by the `ecs` they write. Only
-            // the rule's own used to count, so of two clients in different networks asking at once
-            // the later merged into the earlier's entry and got the answer fetched for the
-            // earlier's network
-            for action in rule.all_actions() {
-                if let Action::Forward {
-                    ecs:
-                        Some(config::EcsMode::FromClientIp {
-                            prefix_v4,
-                            prefix_v6,
-                        }),
-                    ..
-                } = action
-                {
-                    reads.forward_subnets.add(RequesterTest::Subnet {
-                        prefix_v4: *prefix_v4,
-                        prefix_v6: *prefix_v6,
-                    });
-                }
+            // 规则自己的转发和回答动作里的转发都可能按客户端地址发 ECS，回答动作里的照它自己写的 `ecs` 发
+            // The rule's own forward and the forwards among its answer actions may each send ECS
+            // by the client's address, those among the answer actions by the `ecs` they write
+            for test in rule.actions.iter().filter_map(subnet) {
+                reads.forward_subnets.add(test);
+            }
+            for test in on_match.iter().chain(on_miss).filter_map(subnet) {
+                reads.forward_subnets.add(test.clone());
+                reads.answer_subnets.add(test);
             }
             let jump_target = |action: &Action| match action {
                 Action::JumpToPipeline { pipeline } => Some(Arc::clone(pipeline)),
@@ -352,22 +359,26 @@ fn requester_scopes(
         .map(|idx| {
             let mut scope = reads[idx].matchers.clone();
             scope.extend(&reads[idx].forward_subnets);
+            // 转发之后回答检查可能跳转，或者 continue 到会跳转的规则，请求运行这些路径上的规则，之后等待者（见
+            // `Route::held_inflight`）拿到应答，应答也缓存在这个 pipeline 的键下（见
+            // `RuntimePipeline::answered_through`）：那里的匹配器计入。回答检查跳转路径上规则自己的转发原样发出这个
+            // pipeline 的转发发出的包（它的子网上面已经计入），那里回答动作里自己写了 `ecs` 的转发却照它从客户端的
+            // 查询改写（见 `engine::rules::run_response_actions`），所以它的子网也计入。
             // After a forward, an answer check may jump, or continue to rules that jump, and
             // the request runs the rules along those paths before its waiters (see
             // `Route::held_inflight`), and the cache under this pipeline's key, take the
-            // answer (see `RuntimePipeline::answered_through`): their matchers count.
-            // 转发之后回答检查可能跳转，或者 continue 到会跳转的规则，请求运行这些路径上的规则，之后等待者（见
-            // `Route::held_inflight`）拿到应答，应答也缓存在这个 pipeline 的键下（见
-            // `RuntimePipeline::answered_through`）：那里的匹配器计入。
+            // answer (see `RuntimePipeline::answered_through`): their matchers count. A rule's
+            // own forward on an answer check's jump path sends the packet this pipeline's
+            // forward sent as it is (its subnet counted above), while a forward among the
+            // answer actions there with an `ecs` of its own rewrites the client's query by it
+            // (see `engine::rules::run_response_actions`), so its subnets count too.
             for &reached in &answered_through[idx] {
                 scope.extend(&reads[reached].matchers);
+                scope.extend(&reads[reached].answer_subnets);
             }
-            // Forwards on an answer check's jump path send the packet this pipeline's
-            // forward sent as it is (its subnet counted above); those reached by a jump
-            // after a continue send their own ECS, which this pipeline's key does not
-            // carry otherwise, so their subnets count too.
-            // 回答检查跳转路径上的转发原样发出这个 pipeline 的转发发出的包（它的子网上面已经计入）；
-            // continue 之后跳到的转发发送自己的 ECS，本 pipeline 的键本来不带着，所以它们的子网也计入。
+            // continue 之后跳到的转发发送自己的 ECS，本 pipeline 的键本来不带着，所以它们的子网都计入。
+            // Forwards reached by a jump after a continue send their own ECS, which this
+            // pipeline's key does not carry otherwise, so all their subnets count.
             let targets = reads[idx]
                 .continued_jumps
                 .iter()
