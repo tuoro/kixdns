@@ -114,13 +114,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 版本是发布那天的北京时间日期，同一天已经有了就依次加 .2、.3。只发布 main 的最新提交，
-      # 同一个提交只发一次：重跑旧的运行、从别的分支手动触发都只检查和构建，不发布。
-      # 另外记下基于上游 olicesx/kixdns 的哪个提交。
+      # 版本是发布那天的北京时间日期，同一天已经有了就依次加 .2、.3。只发布 main 的提交，
+      # 同一个提交只发一次：从别的分支手动触发只检查和构建，不发布；是不是 main 的最新提交到
+      # 发布那一刻再查（见 Publish release）。另外记下基于上游 olicesx/kixdns 的哪个提交。
       # The version is the release's date in Beijing time, with .2, .3 and so on when that
-      # day already has one. Only the tip of main is released, and each commit once:
-      # re-running an old run or dispatching from another branch only checks and builds. The
-      # upstream olicesx/kixdns commit it is based on is recorded too.
+      # day already has one. Only commits of main are released, and each once: dispatching
+      # from another branch only checks and builds; whether the commit is still the tip of
+      # main is checked at the moment of release (see Publish release). The upstream
+      # olicesx/kixdns commit it is based on is recorded too.
       - name: Pick the date version
         id: pick
         env:
@@ -141,11 +142,8 @@ jobs:
           done
           publish=false
           if [[ "${EVENT}" != "pull_request" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
-            tip="$(git rev-parse origin/main)"
             released="$(git tag --points-at "${GITHUB_SHA}" | grep -E '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' || true)"
-            if [[ "${GITHUB_SHA}" != "${tip}" ]]; then
-              echo "::notice::${GITHUB_SHA} 已经不是 main 的最新提交（${tip}），这次不发布"
-            elif [[ -n "${released}" ]]; then
+            if [[ -n "${released}" ]]; then
               echo "::notice::${GITHUB_SHA} 已经发布为 ${released}，这次不发布"
             else
               publish=true
@@ -419,8 +417,18 @@ jobs:
           } > dist/notes.md
           cat dist/notes.md
 
+      # 只发 main 的最新提交，而且到这一刻才查：构建要好几分钟，这期间 main 往前走了，就留给
+      # 更新的那次运行去发（重跑旧的运行也就不会发布）
+      # Only the tip of main is released, checked only now: the builds take minutes, and when
+      # main moves on meanwhile the newer run releases instead (so re-running an old run
+      # releases nothing either)
       - name: Publish release
         run: |
+          tip="$(git ls-remote --exit-code origin refs/heads/main | cut -f1)"
+          if [[ "${tip}" != "${GITHUB_SHA}" ]]; then
+            echo "::notice::${GITHUB_SHA} 已经不是 main 的最新提交（${tip}），留给更新的那次运行发布"
+            exit 0
+          fi
           gh release create "${VERSION}" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
