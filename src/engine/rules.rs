@@ -511,7 +511,7 @@ async fn run_response_actions(
                     packet,
                     &upstream_addr,
                     request.state.pipeline.upstream_timeout(),
-                    Some(use_transport),
+                    use_transport,
                     pre_split_upstreams.as_ref(),
                     request.observed,
                     request.asker(),
@@ -531,12 +531,12 @@ async fn run_response_actions(
                         ctx.trail.record_failure(sent_ecs);
                         // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：原样交回，这个
                         // 请求只给自己回 SERVFAIL，它登记的条目随之放下，不把 SERVFAIL 交给等着的别的请求（见
-                        // `Engine::handle_packet_internal`）
+                        // `Engine::answer`）
                         // A failure with flow control keeping the query from waiting is the
                         // device's own affair (see `UpstreamFailure::withheld`): it goes back
                         // as it is, the request answering SERVFAIL to itself alone, and the
                         // entries it registered go with it, no SERVFAIL being handed to the other
-                        // requests waiting (see `Engine::handle_packet_internal`)
+                        // requests waiting (see `Engine::answer`)
                         if UpstreamFailure::was_withheld(&err) {
                             tracing::debug!(
                                 event = "response_action_withheld",

@@ -959,7 +959,9 @@ mod tests {
             Name::from_ascii("example.com.").unwrap(),
             RecordType::A,
         ));
-        let badvers = crate::proto_utils::badvers_response(&query.to_vec().unwrap()).unwrap();
+        let query = query.to_vec().unwrap();
+        let question_end = crate::proto_utils::question_name_end(&query).unwrap() + 4;
+        let badvers = crate::proto_utils::badvers_response(&query, question_end);
         let ctx = RequestContext {
             request_id: 7,
             listener_label: "default",

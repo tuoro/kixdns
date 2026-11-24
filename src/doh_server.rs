@@ -1531,7 +1531,7 @@ mod tests {
         }
         query.extend_from_slice(&[0, 0, 1, 0, 1]); // root, QTYPE A, QCLASS IN
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        assert!(matches!(engine.handle_packet_fast(&query, peer), Ok(None)));
+        assert!(engine.handle_packet_fast(&query, peer).is_none());
 
         let answer = process_dns_wire(&query, peer, &engine)
             .await

@@ -498,22 +498,16 @@ pub(super) async fn ask_fast_path_first(
     packet: &[u8],
     peer: SocketAddr,
 ) -> Option<Bytes> {
-    Some(
-        match engine
-            .handle_packet_fast(packet, peer)
-            .expect("fast path")?
-        {
-            FastPathResponse::Direct(reply) => reply,
-            FastPathResponse::CacheHit { cached, .. } => cached,
-            FastPathResponse::AsyncNeeded(pre_parsed) => tokio::time::timeout(
-                Duration::from_secs(5),
-                engine.handle_packet_internal_with_pre_parsed(packet, peer, pre_parsed),
-            )
-            .await
-            .expect("answer in time")
-            .expect("answer"),
-        },
-    )
+    Some(match engine.handle_packet_fast(packet, peer)? {
+        FastPathResponse::Direct(reply) => reply,
+        FastPathResponse::CacheHit { cached, .. } => cached,
+        FastPathResponse::AsyncNeeded(pre_parsed) => tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.handle_packet_internal_with_pre_parsed(packet, peer, pre_parsed),
+        )
+        .await
+        .expect("answer in time"),
+    })
 }
 
 /// 像监听器那样问：快速路径读不了的查询，和监听器一样交给完整路径
@@ -832,6 +826,9 @@ impl Asked {
             tx_id: 0,
             flags: crate::proto_utils::QueryFlags::of(&self.packet),
             edns_version: 0,
+            question_end: crate::proto_utils::question_name_end(&self.packet)
+                .expect("the packet asks a question")
+                + 4,
             peer: self.peer,
             requester: crate::matcher::Requester {
                 address: self.peer.ip(),

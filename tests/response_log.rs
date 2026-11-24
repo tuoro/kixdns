@@ -139,7 +139,7 @@ async fn info_logs_include_fast_and_slow_cache_hits() {
     let packet = query();
     engine.handle_packet(&packet, peer()).await.unwrap();
     assert!(matches!(
-        engine.handle_packet_fast(&packet, peer()).unwrap(),
+        engine.handle_packet_fast(&packet, peer()),
         Some(FastPathResponse::CacheHit { .. })
     ));
     engine.handle_packet(&packet, peer()).await.unwrap();
@@ -245,13 +245,13 @@ async fn static_fast_path_and_cached_static_answer_are_distinct() {
     }));
     let packet = query();
     assert!(matches!(
-        outright.handle_packet_fast(&packet, peer()).unwrap(),
+        outright.handle_packet_fast(&packet, peer()),
         Some(FastPathResponse::Direct(_))
     ));
     checked.handle_packet(&packet, peer()).await.unwrap();
     task.abort();
     assert!(matches!(
-        checked.handle_packet_fast(&packet, peer()).unwrap(),
+        checked.handle_packet_fast(&packet, peer()),
         Some(FastPathResponse::CacheHit { .. })
     ));
     let responses = log.responses();
@@ -537,7 +537,7 @@ async fn a_badvers_on_the_fast_path_is_logged_as_on_the_full_path() {
     message.edns = Some(edns);
     let packet = message.to_vec().unwrap();
     assert!(matches!(
-        engine.handle_packet_fast(&packet, peer()).unwrap(),
+        engine.handle_packet_fast(&packet, peer()),
         Some(FastPathResponse::Direct(_))
     ));
     engine.handle_packet(&packet, peer()).await.unwrap();
