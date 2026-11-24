@@ -33,11 +33,12 @@ pub enum Decision {
         pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
         response_phase: Option<Arc<ResponsePhase>>,
         rule_name: Arc<str>,
-        /// 作出决策的规则在它的规则组里排第几（从 0 起）；没有规则作出决策时为 None。它 continue 以后求值从这个
-        /// 位置的下一条接着走（见 `Route::resume_at`），不按名字找它：名字只是标签，两条规则可以同名
-        /// The place in its pipeline (from 0) of the rule that decided; None when no rule did.
-        /// Once it continues, evaluation resumes at the place after this one (see
-        /// `Route::resume_at`), not by its name: a name is a label, and two rules may share one
+        /// 作出决策的转发规则在它的规则组里排第几（从 0 起）；没有规则作出决策、或是从不 continue 的 allow 时为 None。它
+        /// continue 以后求值从这个位置的下一条接着走（见 `Route::resume_at`），不按名字找它：名字只是标签，两条规则可以同名
+        /// The place in its pipeline (from 0) of the forwarding rule that decided; None when no
+        /// rule did, or for an allow, which never continues. Once it continues, evaluation resumes
+        /// at the place after this one (see `Route::resume_at`), not by its name: a name is a
+        /// label, and two rules may share one
         rule_index: Option<usize>,
         /// 没写协议前缀的上游用的传输；写了前缀（`tcp://`、`https://` 这些）的照前缀（见 `upstream::forward_upstream`）
         /// The transport of an upstream written without a scheme; one written with a scheme
@@ -60,39 +61,36 @@ impl Decision {
     /// 没有规则作出决策时：用 UDP 转发给默认上游 / When no rule decides: forwarded over UDP to
     /// the default upstream
     pub(crate) fn default_forward(settings: &crate::config::GlobalSettings) -> Self {
-        Self::to_default_upstream(settings, Arc::clone(&DEFAULT_RULE_NAME), None)
+        Self::to_default_upstream(settings, Arc::clone(&DEFAULT_RULE_NAME), false)
     }
 
-    /// 排第 `rule_index` 的规则 `rule_name` 的 `allow`：和没有规则作出决策时一样转发给默认上游，continue 之后复用规则越过的
-    /// 应答（见 `Route::reused_response`）
-    /// The `allow` of rule `rule_name` at `rule_index`: forwarded to the default upstream as
-    /// when no rule decides, reusing the answer a rule continued past after a continue (see
-    /// `Route::reused_response`)
-    pub(crate) fn allow(
-        settings: &crate::config::GlobalSettings,
-        rule_name: Arc<str>,
-        rule_index: usize,
-    ) -> Self {
-        Self::to_default_upstream(settings, rule_name, Some(rule_index))
+    /// 规则 `rule_name` 的 `allow`：和没有规则作出决策时一样转发给默认上游，continue 之后复用规则越过的应答（见
+    /// `Route::reused_response`）。它没有回答检查，从不 continue，所以不记规则的位置
+    /// The `allow` of rule `rule_name`: forwarded to the default upstream as when no rule
+    /// decides, reusing the answer a rule continued past after a continue (see
+    /// `Route::reused_response`). It has no answer check and never continues, so the rule's
+    /// place is not kept
+    pub(crate) fn allow(settings: &crate::config::GlobalSettings, rule_name: Arc<str>) -> Self {
+        Self::to_default_upstream(settings, rule_name, true)
     }
 
-    /// 用 UDP 转发给默认上游，记在 `rule_name` 下；规则（排第 `rule_index`）的 allow 复用越过的应答，没有规则作出决策时不复用
-    /// Forwarded over UDP to the default upstream, under `rule_name`; a rule's allow (at
-    /// `rule_index`) reuses the answer continued past, the default with no rule deciding does not
+    /// 用 UDP 转发给默认上游，记在 `rule_name` 下；`allow_reuse` 时复用越过的应答（规则的 allow 是，没有规则作出决策时不是）
+    /// Forwarded over UDP to the default upstream, under `rule_name`; reusing the answer
+    /// continued past with `allow_reuse` (a rule's allow, not the default with no rule deciding)
     fn to_default_upstream(
         settings: &crate::config::GlobalSettings,
         rule_name: Arc<str>,
-        rule_index: Option<usize>,
+        allow_reuse: bool,
     ) -> Self {
         Decision::Forward {
             upstream: settings.default_upstream_arc(),
             pre_split_upstreams: settings.default_upstream_pre_split.clone(),
             response_phase: None,
             rule_name,
-            rule_index,
+            rule_index: None,
             transport: Transport::Udp,
             ecs: None,
-            allow_reuse: rule_index.is_some(),
+            allow_reuse,
         }
     }
 }
@@ -103,10 +101,6 @@ pub struct ResponseContext {
     pub msg: Message,
     pub upstream: Arc<str>,
 }
-
-/// The `source` of the SERVFAIL that a response action's jump answers when no
-/// jumps are left / 响应动作的跳转没有剩余次数时给出的 SERVFAIL 的 `source`
-pub const JUMP_LIMIT: &str = "jump_limit";
 
 #[derive(Debug)]
 pub enum ResponseActionResult {
@@ -119,7 +113,6 @@ pub enum ResponseActionResult {
         /// 它带的 TTL：记录里最小的，没有记录时为 None（见 `Route::static_ttl`）/ The TTL it
         /// carries: the least of its records', None without records (see `Route::static_ttl`)
         ttl: Option<u32>,
-        source: &'static str,
     },
     /// 跳到 `pipeline` 接着走规则；次数由跳过去的一方数（见 `Route::response_jumped`），这里只看还剩没剩
     /// Jump to `pipeline` and go on with its rules; the side making the jump counts it (see
@@ -414,25 +407,26 @@ async fn run_response_actions(
             }
             Action::StaticResponse { rcode } => {
                 let code = parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain);
-                return Ok(static_answer(request, code, &[], "response_action"));
+                return Ok(static_answer(request, code, &[]));
             }
             Action::StaticIpResponse { ip } => {
                 let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
-                return Ok(static_answer(request, rcode, &answers, "response_action"));
+                return Ok(static_answer(request, rcode, &answers));
             }
             Action::StaticCnameResponse { target, ttl } => {
                 let (rcode, answers) =
                     make_static_cname_answer(qname, qclass, target, ttl.unwrap_or(300));
-                return Ok(static_answer(request, rcode, &answers, "response_action"));
+                return Ok(static_answer(request, rcode, &answers));
             }
             Action::StaticTxtResponse { text, ttl } => {
                 let (rcode, answers) =
                     make_static_txt_answer(qname, qtype, qclass, text, ttl.unwrap_or(300));
-                return Ok(static_answer(request, rcode, &answers, "response_action"));
+                return Ok(static_answer(request, rcode, &answers));
             }
             Action::JumpToPipeline { pipeline } => {
                 if ctx.remaining_jumps == 0 {
-                    return Ok(servfail(request, JUMP_LIMIT));
+                    warn_jump_limit(request, ctx.pipeline_id, pipeline, "response");
+                    return Ok(servfail(request));
                 }
                 return Ok(ResponseActionResult::Jump {
                     pipeline: Arc::clone(pipeline),
@@ -442,12 +436,7 @@ async fn run_response_actions(
             // As when every action has run: the answer if there is one, SERVFAIL if not
             Action::Allow => break,
             Action::Deny => {
-                return Ok(static_answer(
-                    request,
-                    ResponseCode::Refused,
-                    &[],
-                    "response_action",
-                ));
+                return Ok(static_answer(request, ResponseCode::Refused, &[]));
             }
             Action::Continue => {
                 return Ok(ResponseActionResult::Continue { ctx: ctx.ctx_opt });
@@ -462,10 +451,10 @@ async fn run_response_actions(
             // no answer in hand (after an upstream failure) there is nothing to replace: SERVFAIL
             Action::ReplaceTxtResponse { text } => {
                 if ctx.ctx_opt.is_none() {
-                    return Ok(servfail(request, "response_action"));
+                    return Ok(servfail(request));
                 }
                 let (rcode, answers) = make_static_txt_answer(qname, qtype, qclass, text, 300);
-                return Ok(static_answer(request, rcode, &answers, "replace_txt"));
+                return Ok(static_answer(request, rcode, &answers));
             }
             Action::Forward {
                 upstream,
@@ -485,7 +474,7 @@ async fn run_response_actions(
                         rule = %ctx.rule_name,
                         "response actions exceeded forward limit"
                     );
-                    return Ok(servfail(request, "response_action"));
+                    return Ok(servfail(request));
                 }
 
                 // 手上应答记的来源（`udp:1.1.1.1:53`）不是能发查询的地址，所以没写 upstream 时和请求
@@ -558,7 +547,7 @@ async fn run_response_actions(
                                 upstream = %upstream_addr,
                                 qname = %qname,
                                 client_ip = %request.peer.ip(),
-                                error = %err,
+                                error = %format_args!("{err:#}"),
                                 "flow control kept the response action forward from the upstream"
                             );
                             return Err(err);
@@ -575,7 +564,7 @@ async fn run_response_actions(
                             error = %format_args!("{err:#}"),
                             "response action forward failed"
                         );
-                        return Ok(servfail(request, "response_action"));
+                        return Ok(servfail(request));
                     }
                 }
             }
@@ -586,7 +575,7 @@ async fn run_response_actions(
     // Every action has run: the answer if there is one, SERVFAIL if not
     Ok(match ctx.ctx_opt {
         Some(resp_ctx) => ResponseActionResult::Upstream { ctx: resp_ctx },
-        None => servfail(request, "response_action"),
+        None => servfail(request),
     })
 }
 
@@ -630,7 +619,6 @@ fn static_answer(
     request: &Request<'_>,
     rcode: ResponseCode,
     answers: &[Record],
-    source: &'static str,
 ) -> ResponseActionResult {
     ResponseActionResult::Static {
         ttl: least_ttl(answers),
@@ -643,20 +631,41 @@ fn static_answer(
             answers,
         ),
         rcode,
-        source,
     }
 }
 
-/// 响应动作给不出应答时的 SERVFAIL，`source` 说明为什么（见 `ResponseActionResult::Static`）
-/// The SERVFAIL of response actions that find no answer, `source` telling why (see
-/// `ResponseActionResult::Static`)
-fn servfail(request: &Request<'_>, source: &'static str) -> ResponseActionResult {
+/// 响应动作给不出应答时的 SERVFAIL / The SERVFAIL of response actions that find no answer
+fn servfail(request: &Request<'_>) -> ResponseActionResult {
     ResponseActionResult::Static {
         bytes: crate::proto_utils::servfail_reply(request.packet),
         rcode: ResponseCode::ServFail,
         ttl: None,
-        source,
     }
+}
+
+/// 跳转次数用完了，`pipeline` 里要跳到 `target` 的这一次不跳、回 SERVFAIL：记一条，请求阶段和回答阶段（`phase`）都记在
+/// 这里。上限 `limit` 是 response_jump_limit，跳转环（见 `config::warnings`）走到这里才停
+/// The jumps are used up, and the one from `pipeline` to `target` is not made, SERVFAIL answered
+/// instead: one warning, logged here for the request phase and the response phase (`phase`)
+/// alike. The limit `limit` is response_jump_limit, where a jump cycle (see `config::warnings`)
+/// comes to a stop
+pub(crate) fn warn_jump_limit(
+    request: &Request<'_>,
+    pipeline: &str,
+    target: &str,
+    phase: &'static str,
+) {
+    crate::warn_sparse!(
+        event = "jump_limit",
+        qname = %request.qname,
+        qtype = ?request.qtype,
+        client_ip = %request.peer.ip(),
+        pipeline = %pipeline,
+        target = %target,
+        limit = request.state.pipeline.settings.response_jump_limit,
+        phase,
+        "the jump limit was reached, answering SERVFAIL"
+    );
 }
 
 #[cfg(test)]

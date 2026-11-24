@@ -350,7 +350,6 @@ impl Engine {
                             return Some(Decision::allow(
                                 &state.pipeline.settings,
                                 rule.name.clone(),
-                                idx,
                             ));
                         }
                         Action::Deny => {
@@ -432,9 +431,10 @@ impl Engine {
                             );
                             return Some(Decision::Static { rcode, answers });
                         }
-                        Action::ReplaceTxtResponse { .. } => {
-                            continue 'rules;
-                        }
+                        // 请求阶段手上没有应答可换：这一个动作什么也不做，规则后面的动作照常执行
+                        // In the request phase there is no answer in hand to replace: this action
+                        // does nothing, and the rule's actions after it run as usual
+                        Action::ReplaceTxtResponse { .. } => {}
                         Action::Continue => {
                             continue 'rules;
                         }

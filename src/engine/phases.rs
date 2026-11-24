@@ -1147,9 +1147,7 @@ impl<'a> Forwarding<'a> {
                 response.upstream = Some(Source::Upstream(ctx.upstream));
                 Ok(ForwardResult::Success(raw))
             }
-            ResponseActionResult::Static {
-                bytes, rcode, ttl, ..
-            } => {
+            ResponseActionResult::Static { bytes, rcode, ttl } => {
                 // 上游失败以后 miss 动作给的静态应答只是这一次请求的兜底，不是这个问题的应答，不缓存（见
                 // `Route::fell_back`）：缓存是所有请求方共用的，写进去的话，上游恢复了它还要一直用到条目到期
                 // After an upstream failure a static answer of the miss actions is a fallback
