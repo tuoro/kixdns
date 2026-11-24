@@ -101,6 +101,8 @@ mod txt_answer_tests;
 pub mod types;
 #[cfg(test)]
 mod udp_resend_tests;
+#[cfg(test)]
+mod unreadable_query_tests;
 pub mod upstream;
 #[cfg(test)]
 mod upstream_reply_tests;
@@ -119,4 +121,3 @@ pub(crate) use response::{
     make_static_cname_answer, make_static_ip_answer, make_static_txt_answer, static_ips,
 };
 pub use rules::Decision;
-pub use utils::engine_helpers;
