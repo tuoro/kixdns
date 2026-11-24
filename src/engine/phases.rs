@@ -98,14 +98,14 @@ pub(crate) enum Age {
     Spent,
 }
 
-/// 存了 `elapsed_secs` 秒的 `hit` 现在算什么：TTL 之内是新鲜的；TTL 到了以后，开着 serve_stale、不是失败应答
-/// （SERVFAIL、REFUSED、扩展 RCODE，见 `is_failure_reply`）、过期没超过 serve_stale_expire_ttl（0 不限）的还能当过期应答
-/// 交出去，其余的不能再用。查缓存、上游失败时找过期应答、等刷新时都按这一处判断
+/// 存了 `elapsed_secs` 秒的 `hit` 现在算什么：TTL 之内是新鲜的；TTL 到了以后，开着 serve_stale、过期没超过
+/// serve_stale_expire_ttl（0 不限）的还能当过期应答交出去（见 `CacheEntry::spent`），其余的不能再用。查缓存、上游失败时
+/// 找过期应答、等刷新时都按这一处判断
 /// What `hit`, stored `elapsed_secs` seconds ago, counts as now: within its TTL it is fresh;
-/// past it, with serve_stale on, no failure reply (SERVFAIL, REFUSED, an extended RCODE, see
-/// `is_failure_reply`) and no longer past its TTL than serve_stale_expire_ttl (0 for no limit)
-/// it can still go out stale, and otherwise it is of no use. The cache lookup, looking for a
-/// stale answer after an upstream failure and waiting for a refresh all go by this alone
+/// past it, with serve_stale on and no longer past its TTL than serve_stale_expire_ttl (0 for
+/// no limit), it can still go out stale (see `CacheEntry::spent`), and otherwise it is of no
+/// use. The cache lookup, looking for a stale answer after an upstream failure and waiting for
+/// a refresh all go by this alone
 pub(crate) fn age_of(hit: &CacheEntry, elapsed_secs: u64, settings: &GlobalSettings) -> Age {
     if elapsed_secs < u64::from(hit.original_ttl) {
         Age::Fresh
