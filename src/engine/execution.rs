@@ -54,21 +54,22 @@ fn client_address(peer: SocketAddr) -> SocketAddr {
 }
 
 /// A query read already, so as not to parse it again: the query as `handle_packet_fast` or
-/// `Engine::handle_packet` read it and the pipeline picked, for this very packet (see
+/// `Engine::read_full` read it and the pipeline picked, for this very packet (see
 /// `Engine::handle_packet_full`)
-/// 读好的查询，不必再解析一遍：`handle_packet_fast` 或 `Engine::handle_packet` 读出的查询和选中的 pipeline，是这一个包的
+/// 读好的查询，不必再解析一遍：`handle_packet_fast` 或 `Engine::read_full` 读出的查询和选中的 pipeline，是这一个包的
 /// （见 `Engine::handle_packet_full`）
 #[derive(Clone)]
 pub struct PreParsedData {
     head: RequestHead,
-    /// 选出 `pipeline_id` 的那份配置：请求接着在异步路径上也用它。以前异步路径再取一次当前的配置，中间赶上热重载时，
-    /// 旧配置选的 pipeline 在新配置里没有，就落到默认转发上，既不是旧配置也不是新配置会给的回答（新配置里的拦截规则也
-    /// 就被绕过）
-    /// The configuration that selected `pipeline_id`, which the request keeps using on the async path.
-    /// The async path used to take the current configuration again, and with a hot reload in between
-    /// a pipeline the old one selected that the new one lacks fell through to the default forward, an
-    /// answer neither configuration would give (going past the new one's blocking rules as well)
-    state: Arc<EngineInner>,
+    /// 选出 `pipeline_id` 的那份配置：请求从头到尾照它走，异步路径上的规则、缓存，连同监听器给它的整体时限（见
+    /// `Engine::answer_after_fast_path`）。中间赶上热重载也不换：这份配置选的 pipeline 新配置里可能没有，请求里面各段等待的
+    /// 上限也是照这份配置算的
+    /// The configuration that selected `pipeline_id`, which the request follows all the way: the
+    /// rules and the cache on the async path, and the overall time limit the listener gives it
+    /// (see `Engine::answer_after_fast_path`). A hot reload in between changes none of it: the
+    /// new configuration may lack the pipeline this one picked, and the waits within the request
+    /// are bounded by this configuration
+    pub(super) state: Arc<EngineInner>,
 }
 /// 配置快照太大，不打出来 / The configuration snapshot is too large to print
 impl std::fmt::Debug for PreParsedData {
@@ -216,11 +217,6 @@ fn report_compiled_rule(
 /// runs right up to the deadline and loses the race with the outer timeout.
 const STALE_SERVE_RESERVE: Duration = Duration::from_millis(20);
 
-/// UDP payload size a background refresh advertises when it replays a request
-/// that carried EDNS, the same 1232 the ECS rewrite advertises.
-/// 后台刷新重放带 EDNS 的请求时声明的 UDP 载荷大小，与 ECS 改写声明的 1232 相同。
-const REFRESH_EDNS_PAYLOAD: u16 = 1232;
-
 /// 整体请求超时：显式配置优先，否则按 upstream_timeout_ms 的 2.5 倍推导
 /// （hedge 1/3 + 全量 1 倍 + TCP 回落 1 倍，再留一点余量）。
 /// The overall request timeout: the configured value when set, otherwise 2.5
@@ -232,7 +228,7 @@ const REFRESH_EDNS_PAYLOAD: u16 = 1232;
 /// It is a function so a caller already holding a config snapshot derives from
 /// that same snapshot instead of loading state again, and so the derivation
 /// never drifts between two copies.
-fn request_timeout_ms(settings: &crate::config::GlobalSettings) -> u64 {
+pub(super) fn request_timeout_ms(settings: &crate::config::GlobalSettings) -> u64 {
     settings
         .request_timeout_ms
         .unwrap_or(settings.default_request_timeout_ms())
@@ -335,25 +331,6 @@ impl Engine {
             self.permit_manager.note_refused(client);
         }
         permit
-    }
-
-    /// Get the configured upstream timeout in milliseconds
-    /// 获取配置的上游超时时间（毫秒）
-    #[inline]
-    pub fn get_upstream_timeout_ms(&self) -> u64 {
-        self.state.load().pipeline.settings.upstream_timeout_ms
-    }
-
-    /// Get the overall request timeout in milliseconds (including hedge + TCP fallback)
-    /// 获取整体请求超时时间（毫秒），包含 hedge + TCP fallback
-    ///
-    /// 如果用户显式配置了 request_timeout_ms，使用配置值
-    /// 否则自动计算为 upstream_timeout_ms * 2.5
-    /// If request_timeout_ms is explicitly configured, use that value
-    /// Otherwise auto-calculate as upstream_timeout_ms * 2.5
-    #[inline]
-    pub fn get_request_timeout_ms(&self) -> u64 {
-        request_timeout_ms(&self.state.load().pipeline.settings)
     }
 
     /// 算槽位号、inflight 键和规则缓存的键的哈希，先写进问题；查询位由响应缓存自己再写（规则从不看它们）。带密钥
@@ -957,32 +934,44 @@ impl Engine {
         }))
     }
 
-    /// 客户端的查询走完整路径，从头读：读不了的是 [`UnreadableQuery`]，监听器据此回 FORMERR（见
-    /// `Engine::answer_after_fast_path`）；读得了的照 [`Self::handle_packet_full`] 作答
-    /// The full path for a client's query, read from scratch: one that cannot be read is an
-    /// [`UnreadableQuery`], which the listener answers FORMERR (see
-    /// `Engine::answer_after_fast_path`); one that can is answered as
+    /// 客户端的查询走完整路径，从头读（见 [`Self::read_full`]）：读不了的是 [`UnreadableQuery`]；读得了的照
+    /// [`Self::handle_packet_full`] 作答
+    /// The full path for a client's query, read from scratch (see [`Self::read_full`]): one that
+    /// cannot be read is an [`UnreadableQuery`]; one that can is answered as
     /// [`Self::handle_packet_full`] answers it
     pub async fn handle_packet(
         &self,
         packet: &[u8],
         peer: SocketAddr,
     ) -> Result<Bytes, UnreadableQuery> {
+        let pre_parsed = self.read_full(packet, peer)?;
+        Ok(self.handle_packet_full(packet, peer, pre_parsed).await)
+    }
+
+    /// 从头读客户端的查询，照当前的配置选好 pipeline，请求以后就照这份配置走（见 [`PreParsedData`]）。读不了的是
+    /// [`UnreadableQuery`]，监听器据此回 FORMERR（见 `Engine::answer_after_fast_path`）
+    /// A client's query read from scratch and its pipeline picked by the current configuration,
+    /// which the request follows from then on (see [`PreParsedData`]). One that cannot be read is
+    /// an [`UnreadableQuery`], which the listener answers FORMERR (see
+    /// `Engine::answer_after_fast_path`)
+    pub(super) fn read_full(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+    ) -> Result<PreParsedData, UnreadableQuery> {
         let state = self.state.load_full();
         let head = self.read_request(packet, client_address(peer).ip(), &state)?;
-        Ok(self
-            .handle_packet_full(packet, peer, PreParsedData { head, state })
-            .await)
+        Ok(PreParsedData { head, state })
     }
 
     /// 读好的客户端查询走完整路径：`pre_parsed` 是这同一个包读出来的请求和选中它的 pipeline 的那份配置（`handle_packet_fast`
-    /// 给的，或者 [`Self::handle_packet`] 刚读的），不再解析一遍。客户端总拿到应答：以错误结束的请求（跳转上限、流控没让转发等，
+    /// 给的，或者 [`Self::read_full`] 刚读的），不再解析一遍。客户端总拿到应答：以错误结束的请求（跳转上限、流控没让转发等，
     /// 见 `decide`）回 SERVFAIL，没有回音在客户端看来就是超时，stub 解析器会重试（RFC 1035）。每个应答都带着它的客户端该看到的
     /// ECS 选项、照客户端写法的照抄部分离开（见 `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的
     /// 处理。三个监听器都经 `Engine::answer_after_fast_path` 从这里进来
     /// The full path for a client's query that has been read: `pre_parsed` is the request read
     /// from this very packet and the configuration that picked its pipeline (given by
-    /// `handle_packet_fast`, or just read by [`Self::handle_packet`]), with no second parse. The
+    /// `handle_packet_fast`, or just read by [`Self::read_full`]), with no second parse. The
     /// client always gets an answer: a request that ended in an error (the jump limit, flow
     /// control keeping a forward from waiting, see `decide`) is answered SERVFAIL, silence being
     /// a timeout to the client, which the stub resolver retries (RFC 1035). Every reply leaves
@@ -1616,7 +1605,7 @@ impl Engine {
         // An ECS option and the DO bit only travel inside EDNS / ECS 选项和 DO 位只能放在 EDNS 里
         if edns || ecs.is_some() || flags.dnssec_ok() {
             let mut opt = hickory_proto::op::Edns::new();
-            opt.set_max_payload(REFRESH_EDNS_PAYLOAD);
+            opt.set_max_payload(crate::proto_utils::UDP_PAYLOAD);
             opt.set_dnssec_ok(flags.dnssec_ok());
             if let Some(subnet) = ecs
                 && let Some(address) = subnet.ip()
