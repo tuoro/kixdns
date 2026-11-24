@@ -2477,9 +2477,9 @@ fn rule_problems(
                 report(format!("cname target \"{target}\" is not a domain name"));
             }
             Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text, .. } => {
-                // 不知道会问什么名字，按最短的根名字算 / What will be asked is unknown, so the
-                // shortest name, the root, is taken
-                if let Some(problem) = txt_size_problem(text, 1) {
+                // 按最长的名字算（见 `txt_size_problem`）/ Reckoned with the longest name (see
+                // `txt_size_problem`)
+                if let Some(problem) = txt_size_problem(text) {
                     report(problem);
                 }
             }
