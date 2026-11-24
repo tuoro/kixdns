@@ -590,7 +590,7 @@ impl Action {
     /// Whether this action, run in the answer phase, is the last of its list to run (see
     /// `engine::rules`): every action but log and forward (the reply it gets replaces the
     /// answer in hand, and the actions after it run on)
-    fn ends_response(&self) -> bool {
+    pub(crate) fn ends_response(&self) -> bool {
         !matches!(self, Action::Log { .. } | Action::Forward { .. })
     }
 }
@@ -598,7 +598,7 @@ impl Action {
 /// `actions` 里执行得到的：按写的顺序到第一个 `ends` 的为止（含它）
 /// The part of `actions` that runs: in the order written, up to and including the first that
 /// `ends`
-fn run_until(actions: &[Action], ends: fn(&Action) -> bool) -> &[Action] {
+pub(crate) fn run_until(actions: &[Action], ends: fn(&Action) -> bool) -> &[Action] {
     let end = actions
         .iter()
         .position(ends)
