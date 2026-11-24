@@ -179,7 +179,7 @@ pub(crate) fn cache_hit_of(
     }
 }
 
-/// [`check_cache_logged`] 在缓存里找到的 / What [`check_cache_logged`] found in the cache
+/// [`check_cache`] 在缓存里找到的 / What [`check_cache`] found in the cache
 pub(crate) enum Looked {
     /// 交出去的应答 / The answer that goes out
     Answered(Bytes),
@@ -223,7 +223,7 @@ fn usable_hit(
 /// serve_stale says; one of no further use is a miss, left where it is (see `usable_hit`).
 /// 查响应缓存：新鲜的应答按停留时间减 TTL 后给出，必要时发起后台刷新；过期还能用的按 serve_stale
 /// 的设置当作 stale 提供或者等它的刷新；不能再用的算未命中，留在原处（见 `usable_hit`）。
-pub(crate) fn check_cache_logged(
+pub(crate) fn check_cache(
     engine: &Engine,
     context: &CacheLookupContext<'_>,
     response: &mut ResponseInfo,
@@ -514,7 +514,7 @@ pub(crate) struct ForwardDecision<'a> {
     pub(crate) response_matchers: &'a [RuntimeResponseMatcherWithOp],
     pub(crate) response_actions_on_match: &'a [Action],
     pub(crate) response_actions_on_miss: &'a [Action],
-    pub(crate) transport: Option<Transport>,
+    pub(crate) transport: Transport,
     /// 发出去之前怎样改写 ECS；响应阶段跳转以后不再改写（见 `Route::jumped`）/ How the ECS is rewritten
     /// before the query goes out; no longer after a response-phase jump (see `Route::jumped`)
     pub(crate) ecs: Option<&'a crate::config::EcsMode>,
@@ -526,7 +526,7 @@ pub(crate) struct ForwardDecision<'a> {
 /// Handles Decision::Forward: joins or registers in the inflight map, forwards upstream,
 /// applies the response rules and caches the answer.
 /// 处理转发决定：合并等待或登记 inflight，转发给上游，执行响应规则，缓存应答。
-pub(crate) async fn handle_forward_decision_logged<'a>(
+pub(crate) async fn handle_forward_decision<'a>(
     engine: &'a Engine,
     request: &'a Request<'a>,
     route: &'a mut Route,
@@ -808,7 +808,7 @@ impl<'a> Forwarding<'a> {
             &self.packet,
             decision.upstream,
             request.state.pipeline.upstream_timeout(),
-            decision.transport,
+            Some(decision.transport),
             decision.pre_split_upstreams,
             request.observed,
             request.asker(),
@@ -1133,7 +1133,8 @@ impl<'a> Forwarding<'a> {
             remaining_jumps: self
                 .route
                 .response_jumps_left(request.state.pipeline.settings.response_jump_limit as usize),
-            trail: Some((&mut self.route.trail, self.forward_ecs)),
+            trail: &mut self.route.trail,
+            rule_ecs: self.forward_ecs,
         };
         // 响应动作和响应跳转的状态单独在堆上分配：不走这两条路的查询就不必为它们预留地方。
         // 以前每个等待中的查询都按最大的那条路（跳转）留着 8 KB，慢上游上挂着三万个查询时，

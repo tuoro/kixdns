@@ -987,17 +987,19 @@ async fn a_response_actions_forward_kept_back_fails_the_request() {
         packet.clone(),
         client(1),
     );
+    let request = asked.request();
     let outcome = crate::engine::rules::apply_response_actions(
         crate::engine::rules::ApplyResponseActionsContext {
             engine: &engine,
-            request: &asked.request(),
+            request: &request,
             actions: &actions,
             ctx_opt: None,
             packet: &packet,
             pipeline_id: "main",
             rule_name: "dead",
             remaining_jumps: 4,
-            trail: None,
+            trail: &mut Default::default(),
+            rule_ecs: crate::ecs_scope::ForwardEcs::of(None, &request.requester.ecs_view()),
         },
     )
     .await;

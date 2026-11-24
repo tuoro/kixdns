@@ -41,7 +41,10 @@ pub enum Decision {
         /// Once it continues it is skipped by this place, not by name: a name is a label, and
         /// two rules may share one
         rule_index: Option<usize>,
-        transport: Option<Transport>, // None means each upstream decides itself (via protocol prefix) / None 表示每个 upstream 自己决定（通过协议前缀）
+        /// 没写协议前缀的上游用的传输；写了前缀（`tcp://`、`https://` 这些）的照前缀（见 `upstream::forward_upstream`）
+        /// The transport of an upstream written without a scheme; one written with a scheme
+        /// (`tcp://`, `https://` and so on) goes by it (see `upstream::forward_upstream`)
+        transport: Transport,
         /// EDNS Client Subnet (RFC 7871) request rewriting mode / EDNS 客户端子网 (RFC 7871) 请求改写模式
         ecs: Option<crate::config::EcsMode>,
         allow_reuse: bool,
@@ -65,7 +68,7 @@ impl Decision {
             response_phase: None,
             rule_name: Arc::clone(&DEFAULT_RULE_NAME),
             rule_index: None,
-            transport: Some(Transport::Udp),
+            transport: Transport::Udp,
             ecs: None,
             allow_reuse: false,
         }
@@ -342,16 +345,13 @@ pub(crate) struct ApplyResponseActionsContext<'a> {
     pub(crate) pipeline_id: &'a str,
     pub(crate) rule_name: &'a str,
     pub(crate) remaining_jumps: usize,
-    /// Where a forward among the actions records its reply, or its failure, and the
-    /// ECS the rule's own forward sent, which a forward among the actions without an `ecs` of
-    /// its own sends too, forwarding the same packet (see `Route::trail`).
-    /// None where nothing is cached.
-    /// 动作里的转发在哪里记下它的应答或失败，以及规则自己的转发发出的 ECS：动作里没写 `ecs` 的转发发的是同一个包，
-    /// 也就是这一份（见 `Route::trail`）。不缓存的地方为 None。
-    pub(crate) trail: Option<(
-        &'a mut crate::ecs_scope::EcsReach,
-        crate::ecs_scope::ForwardEcs,
-    )>,
+    /// Where a forward among the actions records its reply, or its failure (see `Route::trail`)
+    /// 动作里的转发在哪里记下它的应答或失败（见 `Route::trail`）
+    pub(crate) trail: &'a mut crate::ecs_scope::EcsReach,
+    /// The ECS the rule's own forward sent, which a forward among the actions without an `ecs`
+    /// of its own sends too, forwarding the same packet
+    /// 规则自己的转发发出的 ECS：动作里没写 `ecs` 的转发发的是同一个包，也就是这一份
+    pub(crate) rule_ecs: crate::ecs_scope::ForwardEcs,
 }
 
 /// 执行响应动作：响应阶段 forward 动作的上游尝试和动作最后作出的决定，都经请求的观察者上报
@@ -483,12 +483,10 @@ async fn run_response_actions(
                     (packet, crate::ecs_scope::ForwardEcs::of(Some(mode), &view))
                 });
                 let packet = own_ecs.as_ref().map_or(ctx.packet, |(packet, _)| packet);
-                if let (Some((trail, _)), Some((packet, sent))) = (ctx.trail.as_mut(), &own_ecs) {
-                    trail.check_sent(packet, sent);
+                if let Some((packet, sent)) = &own_ecs {
+                    ctx.trail.check_sent(packet, sent);
                 }
-                let sent_ecs = |rule_ecs: crate::ecs_scope::ForwardEcs| {
-                    own_ecs.as_ref().map_or(rule_ecs, |(_, sent)| *sent)
-                };
+                let sent_ecs = own_ecs.as_ref().map_or(ctx.rule_ecs, |(_, sent)| *sent);
                 // hickory 读不了的应答，回答检查和后面的动作都用不了，和上游失败一样算这次转发失败
                 // A reply hickory cannot read is of no use to the checks and actions after, and
                 // fails this forward as the upstream failing does
@@ -510,15 +508,11 @@ async fn run_response_actions(
                 });
                 match forwarded {
                     Ok(answer) => {
-                        if let Some((trail, rule_ecs)) = ctx.trail.as_mut() {
-                            trail.record_reply(sent_ecs(*rule_ecs), &answer.raw);
-                        }
+                        ctx.trail.record_reply(sent_ecs, &answer.raw);
                         ctx.ctx_opt = Some(answer);
                     }
                     Err(err) => {
-                        if let Some((trail, rule_ecs)) = ctx.trail.as_mut() {
-                            trail.record_failure(sent_ecs(*rule_ecs));
-                        }
+                        ctx.trail.record_failure(sent_ecs);
                         // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：原样交回，这个
                         // 请求只给自己回 SERVFAIL，它登记的条目随之放下，不把 SERVFAIL 交给等着的别的请求（见
                         // `Engine::handle_packet_internal`）
