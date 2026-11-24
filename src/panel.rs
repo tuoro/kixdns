@@ -1477,23 +1477,19 @@ fn render_flow_control(output: &mut String, engine: &Engine) {
     }
 }
 
-/// 传输写成面板认得的短名：就是它在配置里的写法（serde 的名字，比如 `tcp_udp`），照它生成、不另写一张表
+/// 传输写成面板认得的短名：和它在配置里的写法（serde 的名字，比如 `tcp_udp`）一样，测试钉着两边不走样
 /// A transport in the short name the panel reads: the way the configuration writes it (its
-/// serde name, `tcp_udp` say), generated from that rather than kept in a table of its own
+/// serde name, `tcp_udp` say), a test keeping the two from drifting apart
 pub(crate) fn transport_label(transport: crate::config::Transport) -> &'static str {
     use crate::config::Transport;
-    static LABELS: std::sync::LazyLock<[String; Transport::ALL.len()]> =
-        std::sync::LazyLock::new(|| {
-            let mut labels = <[String; Transport::ALL.len()]>::default();
-            for transport in Transport::ALL {
-                labels[transport as usize] = match serde_json::to_value(transport) {
-                    Ok(serde_json::Value::String(name)) => name,
-                    other => unreachable!("a transport serializes as its name: {other:?}"),
-                };
-            }
-            labels
-        });
-    &LABELS[transport as usize]
+    match transport {
+        Transport::Udp => "udp",
+        Transport::Tcp => "tcp",
+        Transport::TcpUdp => "tcp_udp",
+        Transport::Doh => "doh",
+        Transport::Dot => "dot",
+        Transport::Doq => "doq",
+    }
 }
 
 /// 上游一次尝试的结果，写成面板认得的短名 / An upstream attempt's outcome in the short name the panel reads
@@ -2949,6 +2945,21 @@ mod tests {
         MAX_METRIC_SERIES_PER_MAP, PanelMetrics, QUERY_STATS_BUCKET_SECONDS, QUERY_STATS_BUCKETS,
         QUERY_STATS_KEPT, QueryStats, QueryStatsBucket, TopStat,
     };
+
+    /// 面板认得的传输名就是配置里的写法（serde 的名字）：每种传输都一样，配置改了名字或者添了传输，这里跟着失败
+    /// The transport names the panel reads are the way the configuration writes them (their
+    /// serde names): alike for every transport, so renaming one in the configuration, or adding
+    /// one, fails here until the panel follows
+    #[test]
+    fn transport_labels_are_the_serde_names() {
+        for transport in crate::config::Transport::ALL {
+            assert_eq!(
+                serde_json::to_value(transport).unwrap(),
+                super::transport_label(transport),
+                "{transport:?}"
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct SharedBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
