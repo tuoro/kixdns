@@ -439,10 +439,14 @@ async fn run_dns_server(
         .as_ref()
         .filter(|_| cfg!(unix))
         .map(|_| Arc::new(PanelMetrics::new(debug)));
-    // 面板经控制通道读上面那些问题（`config` 的 `problems`）/ The panel reads the problems above over
-    // the control channel (`config`'s `problems`)
+    // 面板经控制通道读上面那些问题（`config` 的 `problems`）和入站 DoH 为什么没起来（`doh_error`）/ The
+    // panel reads the problems above over the control channel (`config`'s `problems`), and why the
+    // inbound DoH did not start (`doh_error`)
     if let Some(metrics) = &panel_metrics {
         metrics.startup_problems(problems);
+        if let Some(error) = bound.doh_error() {
+            metrics.doh_not_started(error.to_owned());
+        }
     }
     let mut engine = Engine::builder(cfg)
         .listener_label(listener_label.clone())

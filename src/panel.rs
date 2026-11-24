@@ -147,6 +147,12 @@ struct ActiveConfig {
     /// it is. Without the watch a change to the file is not reloaded, nor is a save from the
     /// panel applied, its reload sequence never moving on
     watch_error: Option<String>,
+    /// 配了的入站 DoH 为什么没起来（见 `listeners::BoundListeners::doh_error`），起来了或没配时为 None。DoH 的设置只在
+    /// 启动时读，校验和重载不读证书，这一项到下次启动才会变
+    /// Why the inbound DoH configured did not start (see `listeners::BoundListeners::doh_error`),
+    /// None when it started or none is configured. The DoH settings are read at startup alone, and
+    /// validation and reloads read no certificate, so it changes at the next start only
+    doh_error: Option<String>,
     /// 当前配置照样加载、值得知道的写法（见 `config::warnings`），每次生效换成那份配置的
     /// What the current configuration writes that loads all the same yet is worth knowing (see
     /// `config::warnings`), replaced by those of each configuration as it takes effect
@@ -1085,6 +1091,7 @@ impl PanelMetrics {
             "restart_pending": active.restart_pending,
             "problems": active.problems,
             "watch_error": active.watch_error,
+            "doh_error": active.doh_error,
             "warnings": active.warnings,
         })
     }
@@ -1099,6 +1106,12 @@ impl PanelMetrics {
     /// cannot be watched, because of `error` (see `ActiveConfig::watch_error`)
     pub fn config_not_watched(&self, error: String) {
         self.active_config.write().watch_error = Some(error);
+    }
+
+    /// 入站 DoH 没起来，因为 `error`（见 `ActiveConfig::doh_error`）/ The inbound DoH did not
+    /// start, because of `error` (see `ActiveConfig::doh_error`)
+    pub fn doh_not_started(&self, error: String) {
+        self.active_config.write().doh_error = Some(error);
     }
 
     #[cfg(unix)]
