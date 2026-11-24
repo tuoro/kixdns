@@ -38,6 +38,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | udp_pool_size | 64 | 出站 UDP socket 池大小。每个查询随机挑一个 socket、随机取 ID；一个 socket 发满 64 个查询就换成系统另挑端口的新 socket，端口用不了多久，防火墙的连接跟踪也只多出未命中数的六十四分之一。不能超过 1024。 |
 | tcp_pool_size | 64 | 每个上游最多几条 TCP 连接。平常只用第一条；它上面同时有 32 个以上查询没答完时，再来的查询才用后面的。不能超过 1024。 |
 | doh_pool_size | 8 | 上游不支持 HTTP/2、或设了 `HTTPS_PROXY` / `ALL_PROXY` 时，每个上游最多保留的 DoH 空闲连接数。支持 HTTP/2 的上游直连，每个工作线程最多一条，平常只用一条，忙起来的规则和 `tcp_pool_size` 一样。不能超过 1024。 |
+| doh_health_check_error_threshold | 3 | DoH 上游连续出这么多次传输错误（超时、连不上、读写出错）以后，丢掉它的全部连接重新连：直连的连接断开，经代理或 HTTP/1.1 用的连接池重建；同一批一起断掉的请求只让它重连一次。0 表示不做这项检查。 |
 | dot_pool_size | 64 | 每个上游最多几条 DoT 连接，平常只用一条，规则和 `tcp_pool_size` 一样。不能超过 1024。 |
 | doq_pool_size | 16 | 每个上游最多几条 DoQ 连接，平常只用一条，规则和 `tcp_pool_size` 一样。连接没了、或者查询超时而这期间连接上没有别的回答时才换新的；回答不合协议、流被重置只算这一个查询失败。不能超过 1024。 |
 | tcp_connection_max_age_seconds | 300 | TCP/DoT 连接最大存活时间；0 禁用。 |
@@ -124,7 +125,7 @@ Pipeline selector 支持上表全部类型；请求规则支持除 listener_labe
 | response_upstream_ip | cidr；支持逗号分隔 CIDR |
 | response_answer_ip | cidr；支持逗号分隔 CIDR |
 | response_type | value；优先检查第一个 Answer 记录，没有 Answer 时使用查询类型 |
-| response_rcode | value：NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP、REFUSED；未知值作为 OTHER 回退匹配 |
+| response_rcode | value：NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP、REFUSED，或 OTHER（其余的 RCODE），大小写不论；别的写法是配置问题（见下文） |
 | response_qclass | value |
 | response_edns_present | expect：布尔值 |
 | response_answer_ip_geoip_country | country_codes：字符串数组 |
