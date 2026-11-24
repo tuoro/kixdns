@@ -1680,7 +1680,7 @@ impl Engine {
                             slot: route.keys.slot,
                             flags: request.flags,
                             reach: &route.trail,
-                            answer_ttl: route.answer_ttl,
+                            answer_ttl: route.answer_ttl.unwrap_or(0),
                         },
                         rcode,
                         answers,
@@ -1719,8 +1719,8 @@ impl Engine {
 
                     match forwarded {
                         Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
-                        Ok(phases::ForwardResult::Continue { ctx, answer_ttl }) => {
-                            route.continued(*ctx, rule_index, answer_ttl);
+                        Ok(phases::ForwardResult::Continue { ctx }) => {
+                            route.continued(*ctx, rule_index);
                             // 只有规则的回答检查会 continue，所以请求在配置里的某个 pipeline 里
                             // Only a rule's answer check continues, so the request is in a
                             // pipeline of the configuration
@@ -1734,9 +1734,8 @@ impl Engine {
                             pipeline,
                             packet,
                             carried,
-                            answer_ttl,
                         }) => {
-                            route.response_jumped(packet, carried, response_jump_limit, answer_ttl);
+                            route.response_jumped(packet, carried, response_jump_limit);
                             decision = Decision::Jump { pipeline };
                             continue 'decision_loop;
                         }
@@ -2086,19 +2085,22 @@ pub(crate) struct Route {
     /// have one budget, a response action's jump with the rule-level jumps after it another (see
     /// `Route::response_jumped`)
     jumps_left: usize,
-    /// 接下来的应答所依据的上游应答在缓存里能留多久：在这些键下最近一次 continue 或回答检查跳转，是在那份上游应答上
-    /// 做的（见 `phases::ForwardResult::Continue`）。这时规则给出的静态应答缓存起来，下次不必再问上游，只是不比那份应答
-    /// 留得久（见 `phases::StaticDecisionContext::answer_ttl`）。miss 动作在上游失败以后做的不据哪份应答，手里没有；请求
-    /// 阶段跳进别的 pipeline、换了键，也就不再据它：那里直接给出的，直接进那里的请求也照样直接拿到。这两种都是 0
-    /// How long the upstream answer what answers next goes by may stay in the cache: the latest
-    /// continue or answer check's jump under these keys was made on that upstream answer (see
-    /// `phases::ForwardResult::Continue`). A static answer the rules give now is cached so as
-    /// not to ask the upstream again, only no longer than that answer may be (see
-    /// `phases::StaticDecisionContext::answer_ttl`). One the miss actions made after an
-    /// upstream failure goes by no answer, there being none in hand; a request-phase jump into
-    /// another pipeline, changing the keys, goes by it no more: what is given outright there is
-    /// given outright to the requests entering there directly too. Both are 0
-    answer_ttl: u32,
+    /// 接下来的应答所依据的上游应答在缓存里能留多久：在这些键下回答检查做决定时据的每一份上游应答里最短的那个（见
+    /// `Route::went_by`），还没据过哪份应答时为 None。规则此后给出的静态应答缓存起来，下次不必再问上游，只是不比其中哪一份
+    /// 留得久（见 `phases::static_ttl`）：哪一份到期了，上游都可能答得不一样，回答检查也就可能走另一条路。miss 动作在上游
+    /// 失败以后做的决定不据哪份应答，记作 0，此后给出的都不缓存；请求阶段跳进别的 pipeline、换了键，又从 None 开始：那里直接
+    /// 给出的，直接进那里的请求也照样直接拿到
+    /// How long the upstream answers what answers next goes by may stay in the cache: the
+    /// least of every upstream answer an answer check decided on under these keys (see
+    /// `Route::went_by`), None while none has been gone by. A static answer the rules give
+    /// from here on is cached so as not to ask the upstream again, only no longer than any of
+    /// them may be (see `phases::static_ttl`): once any one expires the upstream may answer
+    /// otherwise, and the checks may take another way. What the miss actions decide after an
+    /// upstream failure goes by no answer and counts as 0, nothing given after it being
+    /// cached; a request-phase jump into another pipeline, changing the keys, starts again
+    /// from None: what is given outright there is given outright to the requests entering
+    /// there directly too
+    answer_ttl: Option<u32>,
     /// The forwards the request passed in the current pipeline, each with the ECS it sent
     /// and whom its reply applies to; every answer the request caches applies to the
     /// requesters all of them admit (see `CacheEntry::reach`). A forward adds its own here.
@@ -2151,7 +2153,7 @@ impl Route {
             reused_response: None,
             jumped: None,
             jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
-            answer_ttl: 0,
+            answer_ttl: None,
             trail: EcsReach::default(),
             echo_floor: 0,
             held_inflight: None,
@@ -2190,7 +2192,7 @@ impl Route {
             .echo_floor
             .max(self.trail.echo_scope(&request.requester.ecs_view()));
         self.trail = EcsReach::default();
-        self.answer_ttl = 0;
+        self.answer_ttl = None;
         self.key_pipeline = p.id.clone();
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
@@ -2201,14 +2203,23 @@ impl Route {
         true
     }
 
-    /// 规则越过了这个应答（continue；`answer_ttl` 见 `phases::ForwardResult::Continue`）：`reused` 留给后面的
-    /// `allow`，`rule` 下一轮不再求值
-    /// A rule continued past this answer (`answer_ttl` see `phases::ForwardResult::Continue`):
-    /// `reused` is kept for a later `allow`, and `rule` is not evaluated again
-    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>, answer_ttl: u32) {
-        self.answer_ttl = answer_ttl;
+    /// 规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，`rule` 下一轮不再求值
+    /// A rule continued past this answer: `reused` is kept for a later `allow`, and `rule` is
+    /// not evaluated again
+    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>) {
         self.reused_response = reused;
         self.skip_rules.extend(rule);
+    }
+
+    /// 回答检查据一份能在缓存里留 `ttl` 秒的上游应答做了决定（上游失败以后的 miss 动作是 0）：记进 `answer_ttl`，给出
+    /// 此后的静态应答最多缓存多久
+    /// An answer check decided on an upstream answer that may stay in the cache `ttl` seconds
+    /// (0 for the miss actions after an upstream failure): noted in `answer_ttl`, giving how
+    /// long a static answer from here on may be cached at most
+    pub(crate) fn went_by(&mut self, ttl: u32) -> u32 {
+        let least = self.answer_ttl.map_or(ttl, |before| before.min(ttl));
+        self.answer_ttl = Some(least);
+        least
     }
 
     /// 响应动作还能跳几次：头一次响应阶段的跳转之前是整份 `limit`，之后是那一份剩下的（见 [`Self::response_jumped`]）
@@ -2222,20 +2233,17 @@ impl Route {
         }
     }
 
-    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样（`answer_ttl` 也一样；刷新时上游失败的到不了
-    /// 这里）；此后的转发照原样发出 `packet`。第一次响应阶段的跳转起另算一份次数（`limit`）
+    /// 响应动作跳走：跳过去以前那次转发的应答就是越过的那个，和 continue 一样；此后的转发照原样发出 `packet`。第一次
+    /// 响应阶段的跳转起另算一份次数（`limit`）
     /// A response action jumped away: the answer of the forward before the jump is one passed
-    /// over, as on a continue (`answer_ttl` too; a refresh whose upstream failed never gets here);
-    /// the forwards from here on send `packet` as it is. The first response-phase jump starts a
-    /// budget of its own (`limit`)
+    /// over, as on a continue; the forwards from here on send `packet` as it is. The first
+    /// response-phase jump starts a budget of its own (`limit`)
     fn response_jumped(
         &mut self,
         packet: Bytes,
         carried: crate::ecs_scope::ForwardEcs,
         limit: usize,
-        answer_ttl: u32,
     ) {
-        self.answer_ttl = answer_ttl;
         if self.jumped.is_none() {
             self.jumps_left = limit;
         }
