@@ -52,12 +52,14 @@ impl ConfigWatch {
             .start("config-watcher", move |path| {
                 // 启动时只记警告的那些写法，重载时拒绝（见 config::compile）
                 // What startup only warns about, a reload refuses (see config::compile)
-                let loaded = config::load_config_with_source(path)
-                    .and_then(|(cfg, raw)| config::compile(cfg).map(|cfg| (cfg, raw)));
+                let loaded = config::load_config_with_source(path).and_then(|(cfg, raw)| {
+                    let version = cfg.version.clone();
+                    config::compile(cfg).map(|cfg| (cfg, raw, version))
+                });
                 match loaded {
-                    Ok((new_cfg, raw)) => {
+                    Ok((new_cfg, raw, version)) => {
                         engine.reload_from(new_cfg, path, &raw);
-                        info!(path = %path.display(), "config reloaded");
+                        info!(path = %path.display(), version, "config reloaded");
                     }
                     // 默认日志级别是 error：记成 warn 的话，没开面板时重载失败谁也看不到
                     // The default log level is error: logged as a warn, a failed reload would go

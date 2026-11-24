@@ -9,7 +9,6 @@ use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::matcher::RuntimePipelineConfig;
-use tracing::info;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineConfig {
@@ -297,10 +296,20 @@ pub struct Rule {
     pub merged_forward: Option<MergedForward>,
 }
 
+/// 请求匹配器：规则和 pipeline_select 用的是同一套，pipeline_select 另外认 `listener_label`
+/// A request matcher: rules and pipeline_select share the one set, pipeline_select also taking
+/// `listener_label`
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Matcher {
     Any,
+    /// 入口标签（启动参数 `--listener-label`），不分大小写。只有 pipeline_select 看得到是哪个入口收的查询，规则里
+    /// 写了编译不过 / The entry label (the `--listener-label` startup argument), ignoring case.
+    /// Only pipeline_select sees which entry took the query; written in a rule it does not
+    /// compile
+    ListenerLabel {
+        value: String,
+    },
     /// 匹配域名后缀，大小写不敏感。 / Match domain suffix, case insensitive
     DomainSuffix {
         value: String,
@@ -350,44 +359,10 @@ pub enum Matcher {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PipelineSelectorMatcher {
-    /// 入口标签匹配（来自启动参数 listener_label）。 / Entry label matching (from listener_label startup parameter)
-    ListenerLabel { value: String },
-    /// 客户端IP CIDR。 / Client IP CIDR
-    ClientIp { cidr: String },
-    /// 请求域名后缀。 / Request domain suffix
-    DomainSuffix { value: String },
-    /// 请求域名本身，不含子域名。 / The request domain itself, not its subdomains
-    DomainExact { value: String },
-    /// 请求域名正则。 / Request domain regex
-    DomainRegex { value: String },
-    /// 任意请求（总是匹配）。 / Any request (always matches)
-    Any,
-    /// 请求 QCLASS（如 IN/CH/HS）。 / Request QCLASS (e.g., IN/CH/HS)
-    Qclass { value: String },
-    /// 请求是否携带 EDNS。 / Whether request carries EDNS
-    EdnsPresent { expect: bool },
-    /// GeoSite 分类匹配（如 "cn", "google", "category-ads"）。 / GeoSite category matching (e.g., "cn", "google", "category-ads")
-    GeoSite { value: String },
-    /// GeoSite 否定匹配（匹配不在该分类的域名）。 / GeoSite negation matching (match domains NOT in category)
-    GeoSiteNot { value: String },
-    /// 匹配客户端 IP 的 GeoIP 国家代码或命名标签（大小写不敏感）。 / Match client IP GeoIP country code or named tag (case insensitive)
-    GeoipCountry {
-        #[serde(deserialize_with = "deserialize_string_or_vec")]
-        country_codes: Vec<String>,
-    },
-    /// 匹配客户端IP是否为私有IP（内网）。 / Match whether client IP is private (internal network)
-    GeoipPrivate { expect: bool },
-    /// 请求 QTYPE（如 A/AAAA/CNAME/TXT/MX 等）。 / Request QTYPE (e.g., A/AAAA/CNAME/TXT/MX, etc.)
-    Qtype { value: String },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineSelectRule {
     pub pipeline: String,
     #[serde(default)]
-    pub matchers: Vec<PipelineSelectorMatcherWithOp>,
+    pub matchers: Vec<MatcherWithOp>,
     #[serde(default = "default_match_operator")]
     pub matcher_operator: MatchOperator,
 }
@@ -398,14 +373,6 @@ pub struct MatcherWithOp {
     pub operator: MatchOperator,
     #[serde(flatten)]
     pub matcher: Matcher,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PipelineSelectorMatcherWithOp {
-    #[serde(default = "default_match_operator")]
-    pub operator: MatchOperator,
-    #[serde(flatten)]
-    pub matcher: PipelineSelectorMatcher,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -656,14 +623,14 @@ impl Rule {
             .collect();
 
         if all_upstreams.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 rule = %self.name,
                 forward_count,
                 "all forward actions have empty upstream, merged_forward not set"
             );
             self.merged_forward = None;
         } else {
-            tracing::info!(
+            tracing::debug!(
                 rule = %self.name,
                 forward_count,
                 tcp_count = sets[0].len(),
@@ -718,27 +685,29 @@ pub struct DohListenerConfig {
 }
 
 /// `dashmap_shards` 的上限。每个分片启动时就占六百来字节（缓存行对齐的锁，加上容量摊到每片至少一条时的四格小表），
-/// 65536 片四十来 MB；以前没有上限时写过的 2048、4096 都在里面，以前的 1024 让它们升级以后起不来。再翻一倍就是八十来
-/// MB，同时在途的查询也用不了那么多片
+/// 65536 片四十来 MB，再翻一倍就是八十来 MB，同时在途的查询也用不了那么多片。超过的按它截断（见
+/// [`GlobalSettings::hold_to_limits`]）
 /// The most `dashmap_shards` may be. Each shard takes some six hundred bytes from startup (a
 /// cache-padded lock and a four-slot table, the capacity spread to at least one entry a
-/// shard), so 65536 shards are some forty MB; the 2048 and 4096 written before there was a
-/// limit fit, where the former 1024 kept them from starting after an upgrade. Twice as many is
-/// some eighty MB, more shards than the queries in flight together could ever use
+/// shard), so 65536 shards are some forty MB, and twice as many some eighty MB, more shards
+/// than the queries in flight together could ever use. More is held to it (see
+/// [`GlobalSettings::hold_to_limits`])
 pub const MAX_DASHMAP_SHARDS: usize = 65_536;
 
 /// 每个连接池（`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`dot_pool_size`、`doq_pool_size`）最多多大，
 /// 默认值最大的也只有 64。UDP 池启动时就给每个地址族各开这么多 socket，两族最多 2048 个，在文档里的 systemd 服务和
-/// 面板的 OpenWrt 包设的 65536 个描述符以内；其余的池给每个上游备好这么多客户端。以前不设上限：多到开不出来的 socket，
-/// 热重载和面板保存照样收下，下次启动才起不来；大到 2^64 的数建池时分配不出内存，内核直接退出
+/// 面板的 OpenWrt 包设的 65536 个描述符以内；其余的池给每个上游备好这么多客户端。超过的按它截断（见
+/// [`GlobalSettings::hold_to_limits`]）。以前不设上限：多到开不出来的 socket，热重载和面板保存照样收下，下次启动才起
+/// 不来；大到 2^64 的数建池时分配不出内存，内核直接退出
 /// How large each connection pool (`udp_pool_size`, `tcp_pool_size`, `doh_pool_size`,
 /// `dot_pool_size`, `doq_pool_size`) may be, the largest default being 64. The UDP pool opens
 /// this many sockets per address family at startup, at most 2048 for both, within the 65536
 /// descriptors the systemd service in the docs and the panel's `OpenWrt` package allow; the
-/// other pools set up this many clients per upstream. There used to be no limit: more sockets
-/// than could be opened were accepted by a hot reload and a panel save and failed only at the
-/// next start, and a number as large as 2^64 could not be allocated as the pool was built,
-/// taking the kernel down
+/// other pools set up this many clients per upstream. More is held to it (see
+/// [`GlobalSettings::hold_to_limits`]). There used to be no limit: more sockets than could be
+/// opened were accepted by a hot reload and a panel save and failed only at the next start,
+/// and a number as large as 2^64 could not be allocated as the pool was built, taking the
+/// kernel down
 pub const MAX_POOL_SIZE: usize = 1024;
 
 impl GlobalSettings {
@@ -874,6 +843,39 @@ impl GlobalSettings {
             .unwrap_or_else(|| Arc::from(self.default_upstream.as_str()))
     }
 
+    /// 分片数和连接池超过上限的截到上限（见 [`MAX_DASHMAP_SHARDS`]、[`MAX_POOL_SIZE`]），说出截了哪些。截过的算
+    /// [`problems`]：启动时记一条错误、按上限照常起来，没有上限时能用的配置（`tcp_pool_size: 2048`）升级以后照样起得来；
+    /// 重载和面板保存拒绝。编译配置时先截（见 `RuntimePipelineConfig::from_config`）
+    /// Holds the shard count and the connection pools over their limits to them (see
+    /// [`MAX_DASHMAP_SHARDS`], [`MAX_POOL_SIZE`]), saying which it held. Each counts among
+    /// [`problems`]: startup logs an error and starts at the limit, so a configuration that
+    /// worked before there were limits (`tcp_pool_size: 2048`) still starts after an upgrade,
+    /// while a reload and a panel save refuse it. Compiling a configuration holds them first
+    /// (see `RuntimePipelineConfig::from_config`)
+    pub fn hold_to_limits(&mut self) -> Vec<String> {
+        let mut held = Vec::new();
+        for (setting, value, most) in [
+            (
+                "dashmap_shards",
+                &mut self.dashmap_shards,
+                MAX_DASHMAP_SHARDS,
+            ),
+            ("udp_pool_size", &mut self.udp_pool_size, MAX_POOL_SIZE),
+            ("tcp_pool_size", &mut self.tcp_pool_size, MAX_POOL_SIZE),
+            ("doh_pool_size", &mut self.doh_pool_size, MAX_POOL_SIZE),
+            ("dot_pool_size", &mut self.dot_pool_size, MAX_POOL_SIZE),
+            ("doq_pool_size", &mut self.doq_pool_size, MAX_POOL_SIZE),
+        ] {
+            if *value > most {
+                held.push(format!(
+                    "settings.{setting}: {value} is more than {most}, the most it may be, so {most} is used"
+                ));
+                *value = most;
+            }
+        }
+        held
+    }
+
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
     /// 启动、热重载和面板校验都经过这里
     /// Whether the settings make sense on their own: their ranges, how they relate, and the few read
@@ -915,30 +917,19 @@ impl GlobalSettings {
             anyhow::bail!("upstream_timeout_ms must be greater than 0");
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
-        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多、连接池太大，一次就要分配太多（见
-        // `MAX_DASHMAP_SHARDS`、`MAX_POOL_SIZE`）
+        // 收下，到下次重启内核就起不来。DashMap 要求分片数是大于 1 的 2 的幂，不是的从来起不来；分片太多、连接池太大
+        // 一次就要分配太多，那是按上限截断（见 `hold_to_limits`）
         // Settings read only at startup are checked against what building the engine needs: a value
         // the check lets through and the build then fails on is accepted by a hot reload and a panel
-        // save, and the kernel does not start at the next restart. DashMap needs more than one
-        // shard, and too many shards or too large a pool take too much at once (see
-        // `MAX_DASHMAP_SHARDS`, `MAX_POOL_SIZE`)
+        // save, and the kernel does not start at the next restart. DashMap needs a power of two
+        // above 1 for its shards, and with any other number it never started; too many shards or
+        // too large a pool take too much at once, which is held to the limits instead (see
+        // `hold_to_limits`)
         let shards = self.dashmap_shards;
-        if shards != 0 && !(shards.is_power_of_two() && (2..=MAX_DASHMAP_SHARDS).contains(&shards))
-        {
+        if shards != 0 && !(shards.is_power_of_two() && shards >= 2) {
             anyhow::bail!(
                 "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
             );
-        }
-        for (setting, size) in [
-            ("udp_pool_size", self.udp_pool_size),
-            ("tcp_pool_size", self.tcp_pool_size),
-            ("doh_pool_size", self.doh_pool_size),
-            ("dot_pool_size", self.dot_pool_size),
-            ("doq_pool_size", self.doq_pool_size),
-        ] {
-            if size > MAX_POOL_SIZE {
-                anyhow::bail!("{setting} must be at most {MAX_POOL_SIZE}, got {size}");
-            }
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
         if doq_idle > 0
@@ -1006,11 +997,6 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
         .with_context(|| format!("read config file: {}", path.display()))?;
     let cfg =
         parse_config(&raw).with_context(|| format!("parse config file: {}", path.display()))?;
-
-    if let Some(version) = cfg.version.as_ref() {
-        info!(version = %version, "config loaded");
-    }
-
     Ok((cfg, raw))
 }
 
@@ -1190,13 +1176,19 @@ pub fn compile(cfg: PipelineConfig) -> Result<RuntimePipelineConfig> {
     Ok(runtime)
 }
 
-/// Validate configuration text exactly as the server loads it: JSON parsing,
-/// normalisation, runtime compilation (matchers, regexes, CIDRs, timeout
-/// sanity) and the listener checks done at startup
-/// ([`GlobalSettings::listeners`]: bind addresses and DoH TLS material).
-/// Errors carry their cause chain; JSON syntax errors include the line and
-/// column. / 按服务器加载配置的方式校验文本：JSON 解析、规范化、运行时编译以及
-/// 启动时的监听检查（绑定地址与 DoH TLS 材料）。错误带完整原因链；JSON 语法错误包含行列位置。
+/// 按热重载的方式校验配置文本（见 [`compile`]）：JSON 解析、配置问题（见 [`problems`]，启动时只记错误、照旧加载，
+/// 这里和重载一样拒绝）、运行时编译（匹配器、正则、网段、超时）以及监听地址和 DoH 的前提（见
+/// [`GlobalSettings::listeners`]：写了证书和私钥的路径）。不读证书、不绑端口：证书读不了、端口绑不上，到启动时才
+/// 知道，那时 DNS 照常答，入站 DoH 不开，控制通道 `config` 结果的 `doh_error` 写着原因。错误带完整原因链；JSON 语法
+/// 错误包含行列位置
+/// Validate configuration text as a hot reload takes it (see [`compile`]): JSON parsing, the
+/// configuration problems (see [`problems`], which startup only logs and loads as before, refused
+/// here as on a reload), runtime compilation (matchers, regexes, CIDRs, timeouts) and the
+/// listener addresses and DoH prerequisites (see [`GlobalSettings::listeners`]: paths written
+/// for the certificate and key). No certificate is read and no port bound: one that cannot be
+/// read, or a port that cannot be bound, shows at startup, when DNS answers as usual without
+/// inbound DoH and the control channel's `config` result gives the reason as `doh_error`.
+/// Errors carry their cause chain; JSON syntax errors include the line and column
 pub fn validate(raw: &str) -> Result<ValidationReport> {
     let cfg = parse_config(raw)?;
     let version = cfg.version.clone();
@@ -1210,8 +1202,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 }
 
 /// 配置里会悄悄做成别的事的写法：读不懂的上游地址、拼错的 rcode、无效的静态 IP 或 CNAME 目标、
-/// 装不进一条记录的 TXT、跳到不存在的 pipeline、会匹配所有域名的空域名匹配器、几个 pipeline 写了同一个 id、
-/// 不是 IP 的静态 ECS 地址。以前这些都照常加载：
+/// 装不进一条记录的 TXT、跳到不存在的 pipeline、值写成空而什么都匹配的匹配器（见
+/// `AnyMatcher::written_empty`）、几个 pipeline 写了同一个 id、不是 IP 的静态 ECS 地址。以前这些都照常加载：
 /// 上游一直失败、rcode 变成 NXDOMAIN、静态应答变成 SERVFAIL、空后缀什么都匹配。
 ///
 /// 启动时记成错误、照旧加载，已经在用的配置升级以后行为不变；热重载和面板的校验（见 [`validate`]）
@@ -1220,8 +1212,8 @@ pub fn validate(raw: &str) -> Result<ValidationReport> {
 /// Ways of writing a configuration that silently do something else: an upstream
 /// address nothing can read, a misspelt rcode, an invalid static IP or CNAME target,
 /// TXT content that does not fit a record, a jump to a pipeline that does not exist,
-/// an empty domain matcher that matches every name, several pipelines written with
-/// one id, a static ECS address that is no IP. These all used to load as
+/// a matcher written empty that so matches everything (see `AnyMatcher::written_empty`),
+/// several pipelines written with one id, a static ECS address that is no IP. These all used to load as
 /// usual: the upstream kept failing, the rcode became NXDOMAIN, the static answer
 /// became SERVFAIL, the empty suffix matched everything.
 ///
@@ -1262,55 +1254,44 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             cfg.settings.doh_path
         ));
     }
-    for (index, select) in cfg.pipeline_select.iter().enumerate() {
-        let place = format!("pipeline_select[{index}]");
-        if !pipelines.contains(select.pipeline.as_str()) {
-            found.push(format!("{place}: no pipeline \"{}\"", select.pipeline));
-        }
-        if let Some(problem) = ignored_negation(
-            "matchers",
-            select.matchers.iter().map(|m| m.operator),
-            select.matcher_operator,
-        ) {
-            found.push(format!("{place}: {problem}"));
-        }
-        for matcher in &select.matchers {
-            if let PipelineSelectorMatcher::DomainSuffix { value }
-            | PipelineSelectorMatcher::DomainRegex { value } = &matcher.matcher
-                && value.is_empty()
-            {
-                found.push(format!("{place}: {EMPTY_DOMAIN_MATCHER}"));
-            }
-            if let PipelineSelectorMatcher::DomainExact { value } = &matcher.matcher
-                && value.is_empty()
-            {
-                found.push(format!("{place}: {EMPTY_EXACT_MATCHER}"));
-            }
-        }
-    }
+    found.extend(cfg.settings.clone().hold_to_limits());
     // 一个 id 写了几次，在它第一次出现的地方报一次 / An id written several times is raised once,
     // where it first appears
     let mut written: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
     for pipeline in &cfg.pipelines {
         *written.entry(pipeline.id.as_str()).or_default() += 1;
     }
-    for (index, pipeline) in cfg.pipelines.iter().enumerate() {
-        if let Some(times) = written.remove(pipeline.id.as_str())
-            && times > 1
-        {
-            found.push(format!(
-                "pipelines[{index}]: {times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
-                pipeline.id
-            ));
+    for (place, entry) in entries(cfg) {
+        let mut report = |problem: String| found.push(format!("{place}: {problem}"));
+        match entry {
+            Entry::Select(select) => {
+                if !pipelines.contains(select.pipeline.as_str()) {
+                    report(format!("no pipeline \"{}\"", select.pipeline));
+                }
+                if let Some(problem) = ignored_negation(
+                    "matchers",
+                    select.matchers.iter().map(|m| m.operator),
+                    select.matcher_operator,
+                ) {
+                    report(problem);
+                }
+            }
+            Entry::Pipeline(pipeline) => {
+                if let Some(times) = written.remove(pipeline.id.as_str())
+                    && times > 1
+                {
+                    report(format!(
+                        "{times} pipelines are written with the id \"{}\"; a jump or pipeline_select finds only one of them by it, and the rules of the others do not run as written; give each pipeline its own id",
+                        pipeline.id
+                    ));
+                }
+            }
+            Entry::Rule(rule) => rule_problems(rule, &pipelines, report),
         }
-    }
-    // 规则按位置报，和读不懂的键一样：名字可以重复，按名字说不清是哪一条 / Rules are raised by place,
-    // as the keys not read are: names may repeat, and a name may not tell which rule it is
-    for (i, pipeline) in cfg.pipelines.iter().enumerate() {
-        for (j, rule) in pipeline.rules.iter().enumerate() {
-            rule_problems(rule, &pipelines, |problem| {
-                found.push(format!("pipelines[{i}].rules[{j}]: {problem}"))
-            });
+        for (within, matcher) in entry.matchers() {
+            if let Some(problem) = matcher.problem() {
+                found.push(format!("{place}.{within}: {problem}"));
+            }
         }
     }
     for key in cfg.unread_keys.iter().filter(|key| !retired(key)) {
@@ -1321,16 +1302,16 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     found
 }
 
-/// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，一个国家
-/// 代码也没写、永远不命中的 geoip 匹配器，大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体超时，没设
-/// bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），还有规则用到、
+/// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，值写成空而
+/// 永远不命中的匹配器（见 `AnyMatcher::written_empty`），大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体
+/// 超时，没设 bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），还有规则用到、
 /// 却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
 /// 不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制通道 `config` 结果的
 /// `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
-/// [`RETIRED_SETTINGS`]) and the background refresh rule, a geoip matcher written with no
-/// country code, which never matches, a cache so large it may take a lot of memory, an overall
-/// timeout too short for the resend and the TCP fallback, upstreams written with a host name
+/// [`RETIRED_SETTINGS`]) and the background refresh rule, a matcher written empty that so never
+/// matches (see `AnyMatcher::written_empty`), a cache so large it may take a lot of memory, an
+/// overall timeout too short for the resend and the TCP fallback, upstreams written with a host name
 /// while bootstrap is unset (resolving comes back round should the system resolver be KixDNS
 /// itself, see `engine::bootstrap`), and Geo tags rules use with no data configured to read them
 /// from (which tags rules use is known once they compile, see [`geo_tags_without_data`]).
@@ -1407,34 +1388,15 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
             "settings.bootstrap is unset, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
         ));
     }
-    for (index, select) in cfg.pipeline_select.iter().enumerate() {
-        if select.matchers.iter().any(|matcher| {
-            matches!(&matcher.matcher, PipelineSelectorMatcher::GeoipCountry { country_codes } if country_codes.is_empty())
-        }) {
-            found.push(format!("pipeline_select {}: {NO_COUNTRY_CODE}", index + 1));
-        }
-    }
-    for pipeline in &cfg.pipelines {
-        for rule in &pipeline.rules {
-            let request = rule.matchers.iter().any(|matcher| {
-                matches!(&matcher.matcher, Matcher::GeoipCountry { country_codes } if country_codes.is_empty())
-            });
-            let response = rule.response_matchers.iter().any(|matcher| {
-                matches!(&matcher.matcher, ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes } if country_codes.is_empty())
-            });
-            if request || response {
-                found.push(format!(
-                    "pipeline \"{}\" rule \"{}\": {NO_COUNTRY_CODE}",
-                    pipeline.id, rule.name
-                ));
+    for (place, entry) in entries(cfg) {
+        for (within, matcher) in entry.matchers() {
+            if let Some(warning) = matcher.warning() {
+                found.push(format!("{place}.{within}: {warning}"));
             }
         }
     }
     found
 }
-
-/// 一个国家代码也没写的 geoip 匹配器 / A geoip matcher written with no country code
-const NO_COUNTRY_CODE: &str = "a geoip matcher written with no country code never matches";
 
 /// 规则用到（`geosite`、`geoip` 是它们用到的标签）、却没配可读的数据的 Geo 标签，每种一条 [`warnings`]：没写
 /// `geosite_data_paths` 时的 GeoSite 标签，没写 `geoip_dat_path` 时 MMDB 也答不了的 GeoIP 标签（MMDB 只有两个字母的
@@ -1635,13 +1597,10 @@ pub fn refuse_problems(cfg: &PipelineConfig) -> Result<()> {
     Ok(())
 }
 
-const EMPTY_DOMAIN_MATCHER: &str = "an empty domain matcher matches every name";
-
 /// 一条规则里几个 forward 的 ecs 写得不一样：它们合成一次转发，只能发一个 ECS，所以一个也不发
 /// A rule whose forwards write different ecs: they merge into one forward, which can send
 /// one ECS only, so none is sent
 const MERGED_ECS_DIFFER: &str = "its forward actions are asked together as one forward, which sends one ECS, but their ecs settings differ, so none of them is sent; write the same ecs on each, or split them into separate rules";
-const EMPTY_EXACT_MATCHER: &str = "an empty domain_exact matches only the root name";
 
 /// 一个上游也没写：每个查询都会失败 / Not a single upstream written: every query would fail
 const NO_UPSTREAM: &str = "no upstream is written, so every query it gets would fail";
@@ -1693,6 +1652,247 @@ fn ignored_negation(
     ))
 }
 
+/// 配置里按位置排的每一项：pipeline_select 的每一条、每个 pipeline 和它的每条规则，各带着自己的路径，写法和读不懂的键
+/// 一样（`pipeline_select[0]`、`pipelines[1]`、`pipelines[1].rules[2]`）。[`problems`] 和 [`warnings`] 都照它说在哪：规则名
+/// 可以重复，按名字说不清是哪一条
+/// Every entry of a configuration by place: each pipeline_select entry, each pipeline and each
+/// of its rules, with its path written as for the keys not read (`pipeline_select[0]`,
+/// `pipelines[1]`, `pipelines[1].rules[2]`). Both [`problems`] and [`warnings`] say where by
+/// it: rule names may repeat, and a name may not tell which rule it is
+fn entries(cfg: &PipelineConfig) -> impl Iterator<Item = (String, Entry<'_>)> {
+    let selects = cfg
+        .pipeline_select
+        .iter()
+        .enumerate()
+        .map(|(i, select)| (format!("pipeline_select[{i}]"), Entry::Select(select)));
+    let pipelines = cfg.pipelines.iter().enumerate().flat_map(|(i, pipeline)| {
+        let rules = pipeline
+            .rules
+            .iter()
+            .enumerate()
+            .map(move |(j, rule)| (format!("pipelines[{i}].rules[{j}]"), Entry::Rule(rule)));
+        std::iter::once((format!("pipelines[{i}]"), Entry::Pipeline(pipeline))).chain(rules)
+    });
+    selects.chain(pipelines)
+}
+
+/// [`entries`] 给出的一项 / An entry [`entries`] gives
+#[derive(Clone, Copy)]
+enum Entry<'a> {
+    Select(&'a PipelineSelectRule),
+    Pipeline(&'a Pipeline),
+    Rule(&'a Rule),
+}
+
+impl<'a> Entry<'a> {
+    /// 这一项的匹配器，各带着在这一项里的路径（`matchers[1]`、`response_matchers[0]`）/ This entry's
+    /// matchers, each with its path within the entry (`matchers[1]`, `response_matchers[0]`)
+    fn matchers(self) -> impl Iterator<Item = (String, AnyMatcher<'a>)> {
+        let (request, response): (&[MatcherWithOp], &[ResponseMatcherWithOp]) = match self {
+            Entry::Select(select) => (&select.matchers, &[]),
+            Entry::Pipeline(_) => (&[], &[]),
+            Entry::Rule(rule) => (&rule.matchers, &rule.response_matchers),
+        };
+        let request = request
+            .iter()
+            .enumerate()
+            .map(|(k, m)| (format!("matchers[{k}]"), AnyMatcher::Request(&m.matcher)));
+        let response = response.iter().enumerate().map(|(k, m)| {
+            (
+                format!("response_matchers[{k}]"),
+                AnyMatcher::Response(&m.matcher),
+            )
+        });
+        request.chain(response)
+    }
+}
+
+/// 请求或回答的一个匹配器 / A request or answer matcher
+#[derive(Clone, Copy)]
+enum AnyMatcher<'a> {
+    Request(&'a Matcher),
+    Response(&'a ResponseMatcher),
+}
+
+impl AnyMatcher<'_> {
+    /// 这个匹配器会悄悄做成别的事的写法（见 [`problems`]）/ How this matcher is written to
+    /// silently do something else (see [`problems`])
+    fn problem(self) -> Option<String> {
+        if let Some((Weight::Problem, problem)) = self.written_empty() {
+            return Some(problem);
+        }
+        // 以前写错的 rcode 悄悄当成 OTHER，匹配所有不常见的 RCODE，这条规则几乎永远不中
+        // A misspelt rcode used to pass for OTHER, matching every uncommon RCODE, so the rule
+        // hardly ever matched
+        match self {
+            Self::Response(ResponseMatcher::ResponseRcode { value })
+                if !value.eq_ignore_ascii_case("OTHER")
+                    && crate::engine::utils::parse_rcode(value).is_none() =>
+            {
+                Some(format!(
+                    "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// 这个匹配器照样加载、却值得知道的写法（见 [`warnings`]）/ How this matcher is written
+    /// that loads all the same yet is worth knowing (see [`warnings`])
+    fn warning(self) -> Option<String> {
+        self.written_empty()
+            .and_then(|(weight, warning)| (weight == Weight::Warning).then_some(warning))
+    }
+
+    /// 值写成空的这个匹配器做成了什么，按它的意思分：它看的每一样都匹配的（每个名字，或者每份带 TXT 记录的回答）
+    /// 和只匹配根名字的空 domain_exact 算 [`problems`]，永远不匹配的算 [`warnings`]。域名按读进来的样子看，单独一个点
+    /// 是根（见 `matcher::domain_value`），所以 domain_suffix 写成 `.` 和写成空的一样，domain_exact 写成 `.` 正是要根；
+    /// 逗号分隔的列表一项也没写算空。值写成空的编译不过（网段、qclass、qtype）、另有检查（rcode）或者根本没有值的，为
+    /// None。逐个列出每一种，新加的匹配器编译时就得决定
+    /// What this matcher comes to with its value written empty, by what it means: one matching
+    /// everything it looks at (every name, or every answer carrying a TXT record) and an empty
+    /// domain_exact, matching only the root name, count among [`problems`], one never matching
+    /// among [`warnings`]. A domain is looked at as read, a lone dot being the root (see
+    /// `matcher::domain_value`), so domain_suffix written `.` is as written empty, and
+    /// domain_exact written `.` means the root indeed; a comma-separated list naming nothing
+    /// counts as empty. None for one that written empty does not compile (a network, a qclass, a
+    /// qtype), is checked otherwise (an rcode) or has no value at all. Every kind is listed, so a
+    /// new matcher has to be decided on to compile
+    fn written_empty(self) -> Option<(Weight, String)> {
+        use crate::matcher::domain_value;
+        let every_name = |kind: &str, value: &str| {
+            (
+                Weight::Problem,
+                format!("{kind} \"{value}\" matches every name"),
+            )
+        };
+        let root = |kind: &str| {
+            (
+                Weight::Problem,
+                format!("{kind} \"\" matches only the root name; write \".\" to mean the root"),
+            )
+        };
+        let never = |kind: &str, value: &str| {
+            (Weight::Warning, format!("{kind} \"{value}\" never matches"))
+        };
+        let no_country = |kind: &str| {
+            (
+                Weight::Warning,
+                format!("{kind} with no country code never matches"),
+            )
+        };
+        let lists_nothing = |list: &str| split_upstreams(list).next().is_none();
+        match self {
+            Self::Request(matcher) => match matcher {
+                Matcher::DomainSuffix { value } if domain_value(value).is_empty() => {
+                    Some(every_name("domain_suffix", value))
+                }
+                Matcher::DomainRegex { value } if value.is_empty() => {
+                    Some(every_name("domain_regex", value))
+                }
+                Matcher::GeoSiteNot { value } if value.is_empty() => {
+                    Some(every_name("geo_site_not", value))
+                }
+                Matcher::DomainExact { value } if value.is_empty() => Some(root("domain_exact")),
+                Matcher::ListenerLabel { value } if value.is_empty() => {
+                    Some(never("listener_label", value))
+                }
+                Matcher::GeoSite { value } if value.is_empty() => Some(never("geo_site", value)),
+                Matcher::GeoipCountry { country_codes } if country_codes.is_empty() => {
+                    Some(no_country("geoip_country"))
+                }
+                Matcher::Any
+                | Matcher::ListenerLabel { .. }
+                | Matcher::DomainSuffix { .. }
+                | Matcher::DomainExact { .. }
+                | Matcher::DomainRegex { .. }
+                | Matcher::ClientIp { .. }
+                | Matcher::GeoipCountry { .. }
+                | Matcher::GeoipPrivate { .. }
+                | Matcher::Qclass { .. }
+                | Matcher::EdnsPresent { .. }
+                | Matcher::GeoSite { .. }
+                | Matcher::GeoSiteNot { .. }
+                | Matcher::Qtype { .. } => None,
+            },
+            Self::Response(matcher) => match matcher {
+                ResponseMatcher::RequestDomainSuffix { value }
+                    if domain_value(value).is_empty() =>
+                {
+                    Some(every_name("request_domain_suffix", value))
+                }
+                ResponseMatcher::RequestDomainRegex { value } if value.is_empty() => {
+                    Some(every_name("request_domain_regex", value))
+                }
+                ResponseMatcher::ResponseRequestDomainGeoSiteNot { value } if value.is_empty() => {
+                    Some(every_name("response_request_domain_geo_site_not", value))
+                }
+                ResponseMatcher::RequestDomainExact { value } if value.is_empty() => {
+                    Some(root("request_domain_exact"))
+                }
+                // 空的前缀和正则对什么文字都成立；精确比较空文字的是有意要空的 TXT 记录
+                // An empty prefix or regex holds for any text; an exact match on empty text
+                // means an empty TXT record indeed
+                ResponseMatcher::ResponseTxtContent { mode, value }
+                    if value.is_empty()
+                        && !matches!(
+                            crate::matcher::TxtMatchMode::from_str(mode),
+                            Ok(crate::matcher::TxtMatchMode::Exact) | Err(_)
+                        ) =>
+                {
+                    Some((
+                        Weight::Problem,
+                        format!(
+                            "response_txt_content in {} mode with an empty value matches every answer carrying a TXT record",
+                            mode.to_ascii_lowercase()
+                        ),
+                    ))
+                }
+                ResponseMatcher::UpstreamEquals { value } if lists_nothing(value) => {
+                    Some(never("upstream_equals", value))
+                }
+                ResponseMatcher::ResponseUpstreamIp { cidr } if lists_nothing(cidr) => {
+                    Some(never("response_upstream_ip", cidr))
+                }
+                ResponseMatcher::ResponseAnswerIp { cidr } if lists_nothing(cidr) => {
+                    Some(never("response_answer_ip", cidr))
+                }
+                ResponseMatcher::ResponseRequestDomainGeoSite { value } if value.is_empty() => {
+                    Some(never("response_request_domain_geo_site", value))
+                }
+                ResponseMatcher::ResponseAnswerIpGeoipCountry { country_codes }
+                    if country_codes.is_empty() =>
+                {
+                    Some(no_country("response_answer_ip_geoip_country"))
+                }
+                ResponseMatcher::UpstreamEquals { .. }
+                | ResponseMatcher::RequestDomainSuffix { .. }
+                | ResponseMatcher::RequestDomainExact { .. }
+                | ResponseMatcher::RequestDomainRegex { .. }
+                | ResponseMatcher::ResponseUpstreamIp { .. }
+                | ResponseMatcher::ResponseAnswerIp { .. }
+                | ResponseMatcher::ResponseType { .. }
+                | ResponseMatcher::ResponseRcode { .. }
+                | ResponseMatcher::ResponseQclass { .. }
+                | ResponseMatcher::ResponseEdnsPresent { .. }
+                | ResponseMatcher::ResponseAnswerIpGeoipCountry { .. }
+                | ResponseMatcher::ResponseAnswerIpGeoipPrivate { .. }
+                | ResponseMatcher::ResponseRequestDomainGeoSite { .. }
+                | ResponseMatcher::ResponseRequestDomainGeoSiteNot { .. }
+                | ResponseMatcher::ResponseTxtContent { .. } => None,
+            },
+        }
+    }
+}
+
+/// 一种写法算 [`problems`] 还是 [`warnings`] / Whether a way of writing counts among
+/// [`problems`] or [`warnings`]
+#[derive(PartialEq)]
+enum Weight {
+    Problem,
+    Warning,
+}
+
 fn rule_problems(
     rule: &Rule,
     pipelines: &rustc_hash::FxHashSet<&str>,
@@ -1732,42 +1932,6 @@ fn rule_problems(
         && rule.actions.iter().any(|action| {
             matches!(action, Action::Forward { upstream: Some(upstreams), .. } if names_an_address(upstreams))
         });
-    for matcher in &rule.matchers {
-        if let Matcher::DomainSuffix { value } | Matcher::DomainRegex { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_DOMAIN_MATCHER.to_string());
-        }
-        if let Matcher::DomainExact { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_EXACT_MATCHER.to_string());
-        }
-    }
-    for matcher in &rule.response_matchers {
-        // 以前写错的 rcode 悄悄当成 OTHER，匹配所有不常见的 RCODE，这条规则几乎永远不中
-        // A misspelt rcode used to pass for OTHER, matching every uncommon RCODE, so the rule
-        // hardly ever matched
-        if let ResponseMatcher::ResponseRcode { value } = &matcher.matcher
-            && !value.eq_ignore_ascii_case("OTHER")
-            && crate::engine::utils::parse_rcode(value).is_none()
-        {
-            report(format!(
-                "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
-            ));
-        }
-        if let ResponseMatcher::RequestDomainSuffix { value }
-        | ResponseMatcher::RequestDomainRegex { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_DOMAIN_MATCHER.to_string());
-        }
-        if let ResponseMatcher::RequestDomainExact { value } = &matcher.matcher
-            && value.is_empty()
-        {
-            report(EMPTY_EXACT_MATCHER.to_string());
-        }
-    }
     // 回答动作里的 forward 各自转发，不合并 / The forwards among the answer actions forward
     // each on its own and do not merge
     let actions = rule
@@ -1851,7 +2015,7 @@ fn rule_problems(
 
 #[cfg(test)]
 mod tests {
-    use super::{Matcher, PipelineSelectorMatcher, ResponseMatcher};
+    use super::{Matcher, ResponseMatcher};
 
     #[test]
     fn geoip_country_codes_accept_string_or_array() {
@@ -1863,11 +2027,11 @@ mod tests {
         };
         assert_eq!(country_codes, ["cloudflare"]);
 
-        let PipelineSelectorMatcher::GeoipCountry { country_codes } =
+        let Matcher::GeoipCountry { country_codes } =
             serde_json::from_str(r#"{"type":"geoip_country","country_codes":"CN, cloudflare"}"#)
-                .expect("pipeline selector should accept a comma-separated string")
+                .expect("request matcher should accept a comma-separated string")
         else {
-            panic!("unexpected pipeline selector matcher variant");
+            panic!("unexpected request matcher variant");
         };
         assert_eq!(country_codes, ["CN", "cloudflare"]);
 
@@ -2257,6 +2421,47 @@ mod validation_tests {
         }
     }
 
+    /// 警告和问题一样按位置说在哪：`pipeline_select[i].matchers[k]`、`pipelines[i].rules[j].matchers[k]`、
+    /// `.response_matchers[k]`。三条都叫 r 的规则也分得清。以前警告写成 `pipeline_select 1`（从 1 数）、
+    /// `pipeline "main" rule "r"`，和问题的写法不一样，重名的规则分不清
+    /// Warnings say where as problems do: `pipeline_select[i].matchers[k]`,
+    /// `pipelines[i].rules[j].matchers[k]`, `.response_matchers[k]`, which tells apart three rules
+    /// all named r. Warnings used to be placed as `pipeline_select 1` (counting from 1) and
+    /// `pipeline "main" rule "r"`, unlike problems, and rules sharing a name were not told apart
+    #[test]
+    fn warnings_are_placed_as_problems_are() {
+        let no_country = serde_json::json!([{ "type": "geoip_country", "country_codes": [] }]);
+        let any = serde_json::json!([{ "type": "any" }]);
+        let allow = serde_json::json!([{ "type": "allow" }]);
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipeline_select": [
+                { "pipeline": "main", "matchers": any },
+                { "pipeline": "main", "matchers": [{ "type": "any" }, no_country[0]] }
+            ],
+            "pipelines": [{ "id": "main", "rules": [
+                rule("r", any.clone(), allow.clone()),
+                rule("r", no_country.clone(), allow.clone()),
+                {
+                    "name": "r",
+                    "matchers": any,
+                    "actions": [{ "type": "forward" }],
+                    "response_matchers": [{ "type": "response_answer_ip_geoip_country", "country_codes": "" }],
+                    "response_actions_on_match": allow
+                }
+            ] }]
+        });
+        let warned = super::warnings(&super::parse_config(&config.to_string()).expect("parses"));
+        assert_eq!(
+            warned,
+            [
+                "pipeline_select[1].matchers[1]: geoip_country with no country code never matches",
+                "pipelines[0].rules[1].matchers[0]: geoip_country with no country code never matches",
+                "pipelines[0].rules[2].response_matchers[0]: response_answer_ip_geoip_country with no country code never matches",
+            ]
+        );
+    }
+
     /// 白写的取反报出来：第一个匹配器上的 `not`，只有一个匹配器时规则级的 `not`，入口、请求和回答的匹配器都一样。第一个上
     /// 的 `or`、规则级的取反配几个匹配器（第一个起头，后面的取反）照常
     /// A negation written for nothing is raised: `not` on the first matcher, or a chain-level
@@ -2334,8 +2539,8 @@ mod validation_tests {
         assert_eq!(
             problems_of(rule("SERVFAILL", "WARN")),
             [
-                "pipelines[0].rules[0]: response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
                 "pipelines[0].rules[0]: log level \"WARN\" is none of trace, debug, info, warn, error",
+                "pipelines[0].rules[0].response_matchers[0]: response_rcode \"SERVFAILL\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER",
             ]
         );
         for (rcode, level) in [("OTHER", "warn"), ("other", "debug"), ("servfail", "error")] {
@@ -2486,15 +2691,15 @@ mod validation_tests {
         });
         let found = problems_of(config);
         for place in [
-            "pipeline_select[0]",
-            "pipelines[0].rules[0]",
-            "pipelines[0].rules[1]",
+            "pipeline_select[0].matchers[0]",
+            "pipelines[0].rules[0].matchers[0]",
+            "pipelines[0].rules[1].response_matchers[0]",
         ] {
             assert!(
                 found
                     .iter()
                     .any(|problem| problem.starts_with(&format!("{place}: "))
-                        && problem.contains("empty domain_exact matches only the root name")),
+                        && problem.contains("exact \"\" matches only the root name")),
                 "missing {place} in {found:#?}"
             );
         }
@@ -2504,6 +2709,179 @@ mod validation_tests {
                 .any(|problem| problem.contains("matches every name")),
             "{found:#?}"
         );
+    }
+
+    /// 每种带值的匹配器，值写成空的都按它的意思报出来：对每个名字都成立的（domain_suffix、domain_regex、geo_site_not 和
+    /// 回答阶段对应的几种，以及 prefix、regex 模式的 response_txt_content，对每份带 TXT 记录的回答成立）算问题；永远不成立
+    /// 的（geo_site、listener_label、upstream_equals，一个网段也没写的 response_upstream_ip、response_answer_ip，一个国家代码
+    /// 也没写的 geoip 匹配器）算警告。精确比较空文字的 response_txt_content 是有意要空的 TXT 记录，不报。以前只查了域名类
+    /// 和 geoip，geo_site_not 写成空的对所有名字都成立，也不算问题
+    /// Every matcher with a value is raised, written empty, by what it then means: one holding
+    /// for every name (domain_suffix, domain_regex, geo_site_not and their answer-phase
+    /// counterparts, and response_txt_content in prefix or regex mode, holding for every answer
+    /// carrying a TXT record) is a problem; one never holding (geo_site, listener_label,
+    /// upstream_equals, response_upstream_ip and response_answer_ip naming no network, a geoip
+    /// matcher naming no country code) is a warning. response_txt_content comparing exactly with
+    /// empty text means an empty TXT record and is not raised. Only domains and geoip used to be
+    /// checked, and geo_site_not written empty held for every name without being a problem
+    #[test]
+    fn every_matcher_written_empty_is_raised_by_what_it_means() {
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipeline_select": [{ "pipeline": "main", "matchers": [
+                { "type": "listener_label", "value": "" },
+                { "type": "geo_site_not", "value": "" }
+            ] }],
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r",
+                "matchers": [
+                    { "type": "geo_site", "value": "" },
+                    { "type": "domain_suffix", "value": "." },
+                    { "type": "geoip_country", "country_codes": [] }
+                ],
+                "actions": [{ "type": "forward" }],
+                "response_matchers": [
+                    { "type": "upstream_equals", "value": "" },
+                    { "type": "response_upstream_ip", "cidr": "" },
+                    { "type": "response_answer_ip", "cidr": " , " },
+                    { "type": "response_request_domain_geo_site", "value": "" },
+                    { "type": "response_request_domain_geo_site_not", "value": "" },
+                    { "type": "response_txt_content", "mode": "prefix", "value": "" },
+                    { "type": "response_txt_content", "mode": "Regex", "value": "" },
+                    { "type": "response_txt_content", "mode": "exact", "value": "" }
+                ],
+                "response_actions_on_match": [{ "type": "allow" }]
+            }] }]
+        });
+        let parsed = super::parse_config(&config.to_string()).expect("parses");
+        assert_eq!(
+            super::problems(&parsed),
+            [
+                "pipeline_select[0].matchers[1]: geo_site_not \"\" matches every name",
+                "pipelines[0].rules[0].matchers[1]: domain_suffix \".\" matches every name",
+                "pipelines[0].rules[0].response_matchers[4]: response_request_domain_geo_site_not \"\" matches every name",
+                "pipelines[0].rules[0].response_matchers[5]: response_txt_content in prefix mode with an empty value matches every answer carrying a TXT record",
+                "pipelines[0].rules[0].response_matchers[6]: response_txt_content in regex mode with an empty value matches every answer carrying a TXT record",
+            ]
+        );
+        assert_eq!(
+            super::warnings(&parsed),
+            [
+                "pipeline_select[0].matchers[0]: listener_label \"\" never matches",
+                "pipelines[0].rules[0].matchers[0]: geo_site \"\" never matches",
+                "pipelines[0].rules[0].matchers[2]: geoip_country with no country code never matches",
+                "pipelines[0].rules[0].response_matchers[0]: upstream_equals \"\" never matches",
+                "pipelines[0].rules[0].response_matchers[1]: response_upstream_ip \"\" never matches",
+                "pipelines[0].rules[0].response_matchers[2]: response_answer_ip \" , \" never matches",
+                "pipelines[0].rules[0].response_matchers[3]: response_request_domain_geo_site \"\" never matches",
+            ]
+        );
+    }
+
+    /// 单独一个点是根：domain_exact 写成 `.` 不算问题，只命中根名字（拦对根的 ANY、NS 放大查询就这样写），写成空的才
+    /// 算问题；domain_suffix 写成 `.` 和写成空的一样匹配每个名字，算问题。以前 `.` 原样留着，名字文本里没有它，两种都什么
+    /// 也不匹配，也不报
+    /// A lone dot is the root: domain_exact written `.` is no problem and matches the root name
+    /// alone (as a rule blocking ANY or NS amplification at the root is written), and only one
+    /// written empty is a problem; domain_suffix written `.` matches every name as one written
+    /// empty does, a problem. The dot used to stay as written, which no name text holds, so both
+    /// matched nothing and nothing was raised
+    #[tokio::test]
+    async fn a_lone_dot_is_the_root() {
+        let upstream = crate::engine::test_support::answering_upstream(
+            std::net::Ipv4Addr::new(192, 0, 2, 7),
+            300,
+        )
+        .await;
+        let config = serde_json::json!({
+            "settings": { "default_upstream": upstream.address, "upstream_timeout_ms": 3000 },
+            "pipelines": [{ "id": "main", "rules": [
+                rule(
+                    "root",
+                    serde_json::json!([{ "type": "domain_exact", "value": "." }]),
+                    serde_json::json!([{ "type": "static_response", "rcode": "REFUSED" }])
+                ),
+                rule("rest", serde_json::json!([{ "type": "any" }]), serde_json::json!([{ "type": "forward" }]))
+            ] }]
+        });
+        assert_eq!(problems_of(config.clone()), Vec::<String>::new());
+        let engine = crate::engine::test_support::engine_from(config);
+        for (name, answered) in [
+            (".", hickory_proto::op::ResponseCode::Refused),
+            ("example.com.", hickory_proto::op::ResponseCode::NoError),
+        ] {
+            let mut query = hickory_proto::op::Message::new(
+                0x5151,
+                hickory_proto::op::MessageType::Query,
+                hickory_proto::op::OpCode::Query,
+            );
+            query.add_query(hickory_proto::op::Query::query(
+                hickory_proto::rr::Name::from_ascii(name).unwrap(),
+                hickory_proto::rr::RecordType::NS,
+            ));
+            let reply = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.handle_packet(&query.to_vec().unwrap(), "127.0.0.1:53000".parse().unwrap()),
+            )
+            .await
+            .expect("answer in time")
+            .expect("answer");
+            let reply = hickory_proto::op::Message::from_vec(&reply).unwrap();
+            assert_eq!(reply.metadata.response_code, answered, "{name}");
+        }
+
+        let suffix = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [{ "id": "main", "rules": [rule(
+                "all",
+                serde_json::json!([{ "type": "domain_suffix", "value": "." }]),
+                serde_json::json!([{ "type": "allow" }])
+            )] }]
+        });
+        assert_eq!(
+            problems_of(suffix),
+            ["pipelines[0].rules[0].matchers[0]: domain_suffix \".\" matches every name"]
+        );
+    }
+
+    /// 分片数和连接池超过上限时，启动照常起来、按上限用，算一条配置问题（启动时记错误），重载和面板保存拒绝。以前编译
+    /// 直接失败：没有上限时能用的 `tcp_pool_size: 2048` 升级以后内核起不来
+    /// A shard count or connection pool over its limit starts as usual at the limit and counts as
+    /// a configuration problem (logged as an error at startup), which a reload and a panel save
+    /// refuse. Compiling used to fail outright: a `tcp_pool_size: 2048` that worked before there
+    /// were limits kept the kernel from starting after an upgrade
+    #[tokio::test]
+    async fn settings_over_their_limits_start_held_to_them() {
+        use super::{MAX_DASHMAP_SHARDS, MAX_POOL_SIZE};
+        for (setting, over, most) in [
+            ("dashmap_shards", MAX_DASHMAP_SHARDS * 2, MAX_DASHMAP_SHARDS),
+            ("udp_pool_size", usize::MAX, MAX_POOL_SIZE),
+            ("tcp_pool_size", 2048, MAX_POOL_SIZE),
+            ("doh_pool_size", 2048, MAX_POOL_SIZE),
+            ("dot_pool_size", MAX_POOL_SIZE + 1, MAX_POOL_SIZE),
+            ("doq_pool_size", 2048, MAX_POOL_SIZE),
+        ] {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53", setting: over },
+                "pipelines": []
+            });
+            let parsed = super::parse_config(&config.to_string()).expect("parses");
+            assert_eq!(
+                super::problems(&parsed),
+                [format!(
+                    "settings.{setting}: {over} is more than {most}, the most it may be, so {most} is used"
+                )]
+            );
+            let runtime = crate::matcher::RuntimePipelineConfig::from_config(parsed.clone())
+                .unwrap_or_else(|error| panic!("{setting} {over} starts: {error:#}"));
+            assert_eq!(
+                serde_json::to_value(&runtime.settings).unwrap()[setting],
+                most,
+                "{setting}"
+            );
+            crate::engine::Engine::new(runtime, "test".to_string()).expect("engine builds");
+            super::compile(parsed).expect_err("a reload refuses it");
+        }
     }
 
     /// ECS 没写前缀时的默认值：from_client_ip 是 IPv4 24、IPv6 56，static 是 24
@@ -2801,6 +3179,38 @@ mod validation_tests {
         }
     }
 
+    /// listener_label 只有 pipeline_select 认：写在规则里编译不过，报出写在哪；写在 pipeline_select 里照常。两边读的是
+    /// 同一套请求匹配器
+    /// listener_label is pipeline_select's alone: written in a rule it does not compile, naming
+    /// where it is written; in pipeline_select it compiles as usual. Both read the one set of
+    /// request matchers
+    #[test]
+    fn a_listener_label_compiles_in_pipeline_select_only() {
+        let label = serde_json::json!([{ "type": "listener_label", "value": "lan" }]);
+        let any = serde_json::json!([{ "type": "any" }]);
+        let config = |select: &serde_json::Value, matchers: &serde_json::Value| {
+            serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipeline_select": [{ "pipeline": "main", "matchers": select }],
+                "pipelines": [{ "id": "main", "rules": [
+                    rule("r", matchers.clone(), serde_json::json!([{ "type": "allow" }]))
+                ] }]
+            })
+            .to_string()
+        };
+        validate(&config(&label, &any)).expect("pipeline_select reads listener_label");
+        let refused = format!(
+            "{:#}",
+            validate(&config(&any, &label)).expect_err("a rule cannot read it")
+        );
+        assert!(
+            refused.contains(
+                "pipelines[0].rules[0].matchers[0]: listener_label works in pipeline_select only"
+            ),
+            "{refused}"
+        );
+    }
+
     /// 默认上游写了几个时，编译配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
     /// Several default upstreams are split as the configuration compiles (each trimmed,
     /// empty ones skipped); a single one is not
@@ -2959,11 +3369,13 @@ mod validation_tests {
     }
 
     /// 会悄悄做成别的事的写法，每一种都报出来，按位置说在哪，和读不懂的键一样：`settings.` 下的设置、
-    /// `pipeline_select[i]`、`pipelines[i].rules[j]`。规则名可以重复，以前按名字说在哪，重名时分不清是哪一条。不以 `/`
-    /// 开头的 doh_path（DoH 对每个请求都回 404）以前不算问题，空的 request_domain_suffix 以前让整份配置读不进来
+    /// `pipeline_select[i]`、`pipelines[i].rules[j]`，匹配器的再往下写到 `.matchers[k]`、`.response_matchers[k]`。规则名
+    /// 可以重复，以前按名字说在哪，重名时分不清是哪一条。不以 `/` 开头的 doh_path（DoH 对每个请求都回 404）以前不算问题，
+    /// 空的 request_domain_suffix 以前让整份配置读不进来
     /// Every way of writing that silently does something else is named with its place, a path
     /// as for the keys not read: a setting under `settings.`, `pipeline_select[i]`,
-    /// `pipelines[i].rules[j]`. Rule names may repeat, and the name a rule used to be raised by
+    /// `pipelines[i].rules[j]`, a matcher's going on to `.matchers[k]` or
+    /// `.response_matchers[k]`. Rule names may repeat, and the name a rule used to be raised by
     /// could not tell which it was. A doh_path not starting with `/` (DoH answering every query
     /// with 404) used to be no problem, and an empty request_domain_suffix used to keep the whole
     /// configuration from being read
@@ -3007,7 +3419,7 @@ mod validation_tests {
                 "\"dns-query\" does not start with \"/\"",
             ),
             ("pipeline_select[0]", "no pipeline \"gone\""),
-            ("pipeline_select[0]", "empty domain matcher"),
+            ("pipeline_select[0].matchers[0]", "matches every name"),
             ("pipelines[0].rules[0]", "1.1.1.1:99999"),
             ("pipelines[0].rules[1]", "nonsense"),
             ("pipelines[0].rules[2]", "unknown prefix \"http://\""),
@@ -3018,9 +3430,16 @@ mod validation_tests {
             ("pipelines[0].rules[7]", "cname target"),
             ("pipelines[0].rules[8]", "256 bytes"),
             ("pipelines[0].rules[9]", "\"gone\", which does not exist"),
-            ("pipelines[0].rules[10]", "empty domain matcher"),
-            ("pipelines[0].rules[11]", "empty domain matcher"),
-            ("pipelines[0].rules[12]", "empty domain matcher"),
+            ("pipelines[0].rules[10].matchers[0]", "matches every name"),
+            ("pipelines[0].rules[11].matchers[0]", "matches every name"),
+            (
+                "pipelines[0].rules[12].response_matchers[0]",
+                "matches every name",
+            ),
+            (
+                "pipelines[0].rules[12].response_matchers[1]",
+                "matches every name",
+            ),
             ("pipelines[0].rules[12]", "udp+tcp://dns.example:53"),
         ] {
             assert!(
@@ -3172,5 +3591,56 @@ mod validation_tests {
             configured.restart_pending(&running),
             ["cache_capacity", "flow_control_enabled"]
         );
+    }
+
+    /// 读配置、编译配置在 info 级别什么也不记：配置生效了才记（重载记 `config reloaded`，启动记
+    /// `dns server started`，都带着配置的 version）。以前读出来就记一条 `config loaded`，重载被拒时先说 loaded 再说
+    /// failed；几个 forward 合并时每条规则记一条 info，面板每校验一次都刷一遍
+    /// Reading and compiling a configuration log nothing at the info level: what is logged is the
+    /// configuration taking effect (`config reloaded` on a reload, `dns server started` at
+    /// startup, both with the configuration's version). `config loaded` used to be logged as soon
+    /// as it was read, a refused reload saying loaded before it said failed, and merging several
+    /// forwards logged an info for every such rule, all over again on every panel validation
+    #[test]
+    fn reading_and_compiling_a_configuration_log_nothing_at_info() {
+        use tracing_subscriber::layer::SubscriberExt;
+        struct Counted(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counted {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() <= tracing::Level::INFO {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline.json");
+        let forward =
+            |upstream: &str| serde_json::json!({ "type": "forward", "upstream": upstream });
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": "v7",
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{ "id": "main", "rules": [rule(
+                    "both",
+                    serde_json::json!([{ "type": "any" }]),
+                    serde_json::json!([forward("1.1.1.1:53"), forward("8.8.8.8:53")])
+                )] }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let logged = std::sync::Arc::default();
+        let subscriber =
+            tracing_subscriber::registry().with(Counted(std::sync::Arc::clone(&logged)));
+        tracing::subscriber::with_default(subscriber, || {
+            let (config, _) = super::load_config_with_source(&path).expect("reads");
+            super::compile(config).expect("compiles");
+        });
+        assert_eq!(logged.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }
