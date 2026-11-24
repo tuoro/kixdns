@@ -15,6 +15,7 @@ use crate::proto_utils::{servfail_reply, truncate_udp_response};
 use crate::socket_utils::udp_batch;
 #[cfg(unix)]
 use crate::socket_utils::udp_local;
+use crate::socket_utils::{UDP_BUFFER_SIZE, set_udp_buffers};
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use std::net::{IpAddr, SocketAddr};
@@ -259,32 +260,6 @@ fn bind_udp_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(UdpSocket::from_std(socket.into())?)
-}
-
-/// UDP 收发缓冲平时的大小 / The usual size of the UDP send and receive buffers
-const UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
-
-/// 设置 UDP 收发缓冲区，免得负载高时丢包：先试 4 MiB，设不上再退到 1 MiB
-/// Set the UDP buffer sizes to prevent packet loss under load: 4 MiB first, falling back
-/// to 1 MiB if that fails
-fn set_udp_buffers(socket: &socket2::Socket) {
-    let desired_size = UDP_BUFFER_SIZE;
-    let fallback_size = 1024 * 1024;
-
-    if let Err(e) = socket.set_recv_buffer_size(desired_size) {
-        debug!(
-            "failed to set udp recv buffer to {} bytes: {}, trying {}",
-            desired_size, e, fallback_size
-        );
-        let _ = socket.set_recv_buffer_size(fallback_size);
-    }
-    if let Err(e) = socket.set_send_buffer_size(desired_size) {
-        debug!(
-            "failed to set udp send buffer to {} bytes: {}, trying {}",
-            desired_size, e, fallback_size
-        );
-        let _ = socket.set_send_buffer_size(fallback_size);
-    }
 }
 
 /// 一个 UDP 回答发给谁，从哪个本机地址发出。监听在通配地址上时，`local` 是查询发到的那个地址（见
