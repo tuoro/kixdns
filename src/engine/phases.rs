@@ -463,83 +463,44 @@ pub(crate) fn serve_stale(
     resp_bytes
 }
 
-/// Request data required to build and cache a static DNS response.
-pub struct StaticDecisionContext<'a> {
-    pub packet: &'a [u8],
-    pub qname: &'a str,
-    pub qtype: RecordType,
-    pub qclass: DNSClass,
-    pub pipeline_id: &'a Arc<str>,
-    /// Response cache slot / 响应缓存槽位
-    pub slot: u64,
-    /// The query bits the slot was computed with / 算槽位时用的查询位
-    pub flags: proto_utils::QueryFlags,
-    /// Whom the answer applies to: the forwards the request passed before it
-    /// (see `Route::trail`)
-    /// 应答适用于谁：请求在它之前经过的转发（见 `Route::trail`）
-    pub reach: &'a EcsReach,
-    /// 它所依据的上游应答在缓存里最多能留多久（见 `Route::answer_ttl`、`static_ttl`）：取决于上游应答的缓存起来，下次
-    /// 不必再问上游。别的都是 0、不缓存：规则直接给出的，规则下次照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿
-    /// 的话查询日志和规则计数就记不到这条规则，它的 log 动作也不执行；上游失败以后兜底给出的只是这一次请求的
-    /// How long the upstream answers it goes by may all stay in the cache (see `Route::answer_ttl`,
-    /// `static_ttl`): one depending on an upstream's answer is cached so the upstream need not
-    /// be asked next time. Anything else has 0 and is not cached: one the rules give outright
-    /// they give again outright (the fast path, the rule cache) with nobody to ask, and taken
-    /// from the response cache it would be missing from the query log and rule counts under its
-    /// rule, its log action not run; one given as a fallback after an upstream failure is for
-    /// this request alone
-    pub answer_ttl: u32,
-}
-
-/// 处理静态决定：照请求构造应答；取决于上游应答的（见 `StaticDecisionContext::answer_ttl`）按 `static_ttl` 说的
-/// 时长缓存。槽位把规则分得开的请求方分开（见 `RuntimePipeline::requester`），所以规则按「谁在问」给的应答也和别的应答
-/// 一样缓存。
-/// Handles Decision::Static: builds the answer for the request, and caches one that depends
-/// on an upstream's answer (see `StaticDecisionContext::answer_ttl`) for as long as
-/// `static_ttl` says. The slot keeps apart the requesters the rules tell apart (see
-/// `RuntimePipeline::requester`), so an answer the rules give by who is asking is cached like
-/// any other.
-/// Does not emit the `dns_response` record; only the engine request path logs it.
-/// 不输出 `dns_response` 记录；该记录只由引擎请求路径输出。
-pub fn handle_static_decision(
+/// 处理静态决定：照请求构造应答（见 `response::static_reply`），取决于上游应答的按 `static_ttl` 说的时长缓存在路线的键下
+/// （见 `Route::cache`）。取决于上游应答的才缓存，留多久见 `Route::answer_ttl`：它缓存起来，下次不必再问上游。规则直接
+/// 给出的不缓存，规则下次照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿的话查询日志和规则计数就记不到这条规则，
+/// 它的 log 动作也不执行；上游失败以后兜底给出的也不缓存，那只是这一次请求的。槽位把规则分得开的请求方分开（见
+/// `RuntimePipeline::requester`），所以规则按「谁在问」给的应答也和别的应答一样缓存。不输出 `dns_response` 记录，那只由
+/// 引擎的请求路径输出
+/// Handles Decision::Static: builds the answer for the request (see `response::static_reply`),
+/// and caches one that depends on an upstream's answer under the route's keys (see
+/// `Route::cache`) for as long as `static_ttl` says. Only one depending on an upstream's answer
+/// is cached, for as long as `Route::answer_ttl` allows, so the upstream need not be asked next
+/// time. One the rules give outright is not: they give it again outright (the fast path, the
+/// rule cache) with nobody to ask, and taken from the response cache it would be missing from
+/// the query log and rule counts under its rule, its log action not run; nor is one given as a
+/// fallback after an upstream failure, which is for this request alone. The slot keeps apart
+/// the requesters the rules tell apart (see `RuntimePipeline::requester`), so an answer the
+/// rules give by who is asking is cached like any other. Emits no `dns_response` record, which
+/// only the engine request path does
+pub(crate) fn handle_static_decision(
     engine: &Engine,
-    context: &StaticDecisionContext<'_>,
+    request: &Request<'_>,
+    route: &Route,
     rcode: ResponseCode,
-    answers: Vec<Record>,
+    answers: &[Record],
 ) -> Bytes {
-    let StaticDecisionContext {
-        packet,
-        qname,
-        qtype,
-        qclass,
-        pipeline_id: current_pipeline_id,
-        slot,
-        flags,
-        reach,
-        answer_ttl,
-    } = *context;
-    let ttl = static_ttl(super::response::least_ttl(&answers), answer_ttl);
-    let resp_bytes = super::response::static_reply(packet, qname, qtype, qclass, rcode, &answers);
-
-    if ttl > 0 {
-        engine.insert_dns_cache_entry(
-            slot,
-            CacheEntry::from_response(
-                resp_bytes.clone(),
-                rcode,
-                None, // Static responses have no upstream
-                qname,
-                current_pipeline_id.clone(),
-                u16::from(qtype),
-                u16::from(qclass),
-                flags,
-                ttl,
-            )
-            .with_reach(reach.clone()),
-        );
-    }
-
-    resp_bytes
+    let reply = super::response::static_reply(
+        request.packet,
+        request.qname,
+        request.qtype,
+        request.qclass,
+        rcode,
+        answers,
+    );
+    let ttl = static_ttl(
+        super::response::least_ttl(answers),
+        route.answer_ttl.unwrap_or(0),
+    );
+    route.cache(engine, request, &reply, rcode, None, ttl);
+    reply
 }
 
 /// 转发决定自己说的：问哪些上游、怎样问、回答检查做什么。请求本身见 `Request`，它沿着规则走到了哪里见 `Route`
@@ -1058,7 +1019,8 @@ impl<'a> Forwarding<'a> {
         };
         if actions.is_empty() {
             let ttl = ttl_to_cache(self.engine, ttl, request.state.pipeline.min_ttl());
-            self.cache(&raw, rcode, Some(upstream), ttl);
+            self.route
+                .cache(self.engine, request, &raw, rcode, Some(upstream), ttl);
             self.hand_over(&raw);
             return Ok(ForwardResult::Success(raw));
         }
@@ -1188,7 +1150,9 @@ impl<'a> Forwarding<'a> {
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(request.refresh.is_some(), &ctx.raw)?;
-                self.cache(
+                self.route.cache(
+                    self.engine,
+                    request,
                     &ctx.raw,
                     ctx.msg.metadata.response_code,
                     Some(ctx.upstream.clone()),
@@ -1207,7 +1171,14 @@ impl<'a> Forwarding<'a> {
                 // for this request, not the answer to the question, and is not cached
                 // (`answer_ttl` is 0): the cache is shared by every requester, and cached it
                 // would go on serving after the upstream recovered, until the entry expired
-                self.cache(&bytes, rcode, None, static_ttl(ttl, answer_ttl));
+                self.route.cache(
+                    self.engine,
+                    request,
+                    &bytes,
+                    rcode,
+                    None,
+                    static_ttl(ttl, answer_ttl),
+                );
                 self.hand_over(&bytes);
                 response.upstream = Some(Source::Static);
                 Ok(ForwardResult::Success(bytes))
@@ -1239,32 +1210,6 @@ impl<'a> Forwarding<'a> {
                 Ok(ForwardResult::Continue { ctx: Box::new(ctx) })
             }
         }
-    }
-
-    /// 在这次转发的问题下写一条缓存，留 `ttl` 秒，适用于 trail 接受的请求方；`ttl` 为 0 时不写（见 `ttl_to_cache`、
-    /// `static_ttl`）
-    /// Cache an answer under this forward's question for `ttl` seconds, for the requesters
-    /// the trail admits; with `ttl` 0 nothing is cached (see `ttl_to_cache`, `static_ttl`)
-    fn cache(&self, bytes: &Bytes, rcode: ResponseCode, upstream: Option<Arc<str>>, ttl: u32) {
-        if ttl == 0 {
-            return;
-        }
-        let (request, route) = (self.request, &*self.route);
-        self.engine.insert_dns_cache_entry(
-            route.keys.slot,
-            CacheEntry::from_response(
-                bytes.clone(),
-                rcode,
-                upstream,
-                Arc::clone(request.qname),
-                Arc::clone(&route.key_pipeline),
-                u16::from(request.qtype),
-                u16::from(request.qclass),
-                route.keys.flags,
-                ttl,
-            )
-            .with_reach(route.trail.clone()),
-        );
     }
 
     /// 把最终应答交给等在这次转发登记的条目上的请求 / Hand the final answer to the requests

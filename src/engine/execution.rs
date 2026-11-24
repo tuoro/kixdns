@@ -12,7 +12,7 @@ use anyhow::Context;
 use bytes::Bytes;
 
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::DNSClass;
+use hickory_proto::rr::{DNSClass, RecordType};
 
 use hickory_proto::serialize::binary::BinDecodable;
 use smallvec::SmallVec;
@@ -78,16 +78,13 @@ pub struct CacheKeys {
     pub requester: RequesterKey,
 }
 
-/// Pre-parsed data from handle_packet_fast to avoid re-parsing
-/// 来自 handle_packet_fast 的预解析数据，避免重新解析
+/// Pre-parsed data from handle_packet_fast to avoid re-parsing: the query as the quick parse
+/// read it and the pipeline picked, for this very packet (see `Engine::answer_after_fast_path`)
+/// 来自 handle_packet_fast 的预解析数据，避免重新解析：快速解析读出的查询和选中的 pipeline，是这一个包的（见
+/// `Engine::answer_after_fast_path`）
 #[derive(Clone)]
 pub struct PreParsedData {
-    qname: Arc<str>,
-    qtype: hickory_proto::rr::RecordType,
-    qclass: DNSClass,
-    tx_id: u16,
-    edns_present: bool,
-    pipeline_id: Arc<str>,
+    head: RequestHead,
     /// 选出 `pipeline_id` 的那份配置：请求接着在异步路径上也用它。以前异步路径再取一次当前的配置，中间赶上热重载时，
     /// 旧配置选的 pipeline 在新配置里没有，就落到默认转发上，既不是旧配置也不是新配置会给的回答（新配置里的拦截规则也
     /// 就被绕过）
@@ -101,35 +98,8 @@ pub struct PreParsedData {
 impl std::fmt::Debug for PreParsedData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreParsedData")
-            .field("qname", &self.qname)
-            .field("qtype", &self.qtype)
-            .field("qclass", &self.qclass)
-            .field("tx_id", &self.tx_id)
-            .field("edns_present", &self.edns_present)
-            .field("pipeline_id", &self.pipeline_id)
+            .field("head", &self.head)
             .finish_non_exhaustive()
-    }
-}
-
-impl PreParsedData {
-    pub(crate) fn new(
-        qname: impl Into<Arc<str>>,
-        qtype: u16,
-        qclass: u16,
-        tx_id: u16,
-        edns_present: bool,
-        pipeline_id: Arc<str>,
-        state: Arc<EngineInner>,
-    ) -> Self {
-        Self {
-            qname: qname.into(),
-            qtype: hickory_proto::rr::RecordType::from(qtype),
-            qclass: DNSClass::from(qclass),
-            tx_id,
-            edns_present,
-            pipeline_id,
-            state,
-        }
     }
 }
 
@@ -760,19 +730,8 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let qname_str = q.qname;
-        let pipeline_opt = select_pipeline(
-            cfg,
-            &PipelineSelectionContext {
-                qname: qname_str,
-                client_ip: peer.ip(),
-                qclass,
-                edns_present: q.edns_present,
-                qtype,
-                listener_label: &self.listener_label,
-                geosite_manager: Some(&self.geosite_manager),
-                geoip_manager: Some(&self.geoip_manager),
-            },
-        );
+        let pipeline_opt =
+            self.pick_pipeline(cfg, qname_str, qtype, qclass, peer.ip(), q.edns_present);
 
         let name_of = |pipeline: Option<&crate::matcher::RuntimePipeline>| {
             pipeline.map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
@@ -1125,38 +1084,10 @@ impl Engine {
         // Cache miss, need async processing / 缓存未命中，需要异步处理
         // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
         // 返回 AsyncNeeded 包含预解析数据，避免在 handle_packet 中重新解析
-        Ok(Some(FastPathResponse::AsyncNeeded(PreParsedData::new(
-            qname_str,
-            q.qtype,
-            q.qclass,
-            q.tx_id,
-            q.edns_present,
-            name_of(pipeline_opt),
-            arc_swap::Guard::into_inner(state),
-        ))))
-    }
-
-    /// 引擎现在这份配置下的一个查询的预解析数据，和快速路径交给异步路径的一样（见 [`PreParsedData`]）
-    /// The pre-parsed data of a query under the engine's configuration now, as the fast path hands
-    /// to the async path (see [`PreParsedData`])
-    pub fn pre_parsed(
-        &self,
-        qname: impl Into<Arc<str>>,
-        qtype: u16,
-        qclass: u16,
-        tx_id: u16,
-        edns_present: bool,
-        pipeline_id: Arc<str>,
-    ) -> PreParsedData {
-        PreParsedData::new(
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            edns_present,
-            pipeline_id,
-            self.state.load_full(),
-        )
+        Ok(Some(FastPathResponse::AsyncNeeded(PreParsedData {
+            head: RequestHead::quick(&q, name_of(pipeline_opt)),
+            state: arc_swap::Guard::into_inner(state),
+        })))
     }
 
     pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
@@ -1303,12 +1234,14 @@ impl Engine {
         // through response actions and cache writes. Background refresh passes
         // the snapshot that produced its cache key via `state_override`, and the
         // fast path the one that selected its pipeline via `pre_parsed`.
-        let state = match (state_override, &pre_parsed) {
-            (Some(state), _) => state,
-            (None, Some(pre)) => Arc::clone(&pre.state),
-            (None, None) => self.state.load_full(),
+        let (state, head) = match pre_parsed {
+            Some(pre) => (pre.state, pre.head),
+            None => {
+                let state = state_override.unwrap_or_else(|| self.state.load_full());
+                let head = self.read_request(packet, peer, &state.pipeline)?;
+                (state, head)
+            }
         };
-        let head = self.read_request(packet, peer, pre_parsed, &state.pipeline)?;
         // A refresh replays its request's ECS from the key the cache kept, as an option
         // nobody can read does not survive into the replayed packet (see
         // `RefreshTarget::client_ecs`)
@@ -1370,8 +1303,8 @@ impl Engine {
             qtype: head.qtype,
             qclass: head.qclass,
             tx_id: head.tx_id,
-            // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
-            flags: crate::proto_utils::QueryFlags::of(packet),
+            flags: head.flags,
+            edns_version: head.edns_version,
             peer,
             // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
             requester: Requester {
@@ -1448,64 +1381,70 @@ impl Engine {
         result
     }
 
-    /// 读出请求的问题，选好 pipeline：快速路径预解析过的照用；否则先快速解析，读不了再完整解析，还读不了就是
-    /// [`UnreadableQuery`]
-    /// Read the request's question and pick its pipeline: what the fast path pre-parsed is
-    /// taken as it is; otherwise the quick parse comes first, the full one when it cannot read
-    /// it, and a query neither reads is an [`UnreadableQuery`]
+    /// 读出请求的问题，选好 pipeline：先快速解析，读不了再完整解析，还读不了就是 [`UnreadableQuery`]
+    /// Read the request's question and pick its pipeline: the quick parse first, the full one
+    /// when it cannot read it, and a query neither reads is an [`UnreadableQuery`]
     fn read_request(
         &self,
         packet: &[u8],
         peer: SocketAddr,
-        pre_parsed: Option<PreParsedData>,
         cfg: &RuntimePipelineConfig,
     ) -> anyhow::Result<RequestHead> {
-        if let Some(pre) = pre_parsed {
-            return Ok(RequestHead {
-                qname: pre.qname,
-                qtype: pre.qtype,
-                qclass: pre.qclass,
-                tx_id: pre.tx_id,
-                edns_present: pre.edns_present,
-                pipeline_id: pre.pipeline_id,
-                // Read off the packet itself, whoever pre-parsed it / 无论谁预解析，都从包本身读
-                client_ecs: crate::proto_utils::client_subnet(packet),
-            });
-        }
+        let pipeline_of = |head: (&str, RecordType, DNSClass, bool)| {
+            let (qname, qtype, qclass, edns_present) = head;
+            self.pick_pipeline(cfg, qname, qtype, qclass, peer.ip(), edns_present)
+                .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
+        };
         let mut qname_buf = [0u8; 256];
-        let (qname, qtype, qclass, tx_id, edns_present, client_ecs) =
-            match parse_quick(packet, &mut qname_buf) {
-                Some(q) => (
-                    Arc::<str>::from(q.qname),
-                    hickory_proto::rr::RecordType::from(q.qtype),
-                    DNSClass::from(q.qclass),
-                    q.tx_id,
-                    q.edns_present,
-                    q.client_subnet,
-                ),
-                None => {
-                    anyhow::ensure!(
-                        crate::proto_utils::question_name_readable(packet),
-                        UnreadableQuery
-                    );
-                    let req = Message::from_bytes(packet).context(UnreadableQuery)?;
-                    let question = req.queries.first().context(UnreadableQuery)?;
-                    (
-                        // The text parse_quick would have built / parse_quick 会拼出的同一段文本
-                        Arc::from(crate::proto_utils::name_text(question.name())),
-                        question.query_type(),
-                        question.query_class(),
-                        req.metadata.id,
-                        req.edns.is_some(),
-                        crate::proto_utils::client_subnet(packet),
-                    )
-                }
-            };
-        let pipeline_id = select_pipeline(
+        if let Some(q) = parse_quick(packet, &mut qname_buf) {
+            let pipeline_id = pipeline_of((
+                q.qname,
+                RecordType::from(q.qtype),
+                DNSClass::from(q.qclass),
+                q.edns_present,
+            ));
+            return Ok(RequestHead::quick(&q, pipeline_id));
+        }
+        anyhow::ensure!(
+            crate::proto_utils::question_name_readable(packet),
+            UnreadableQuery
+        );
+        let req = Message::from_bytes(packet).context(UnreadableQuery)?;
+        let question = req.queries.first().context(UnreadableQuery)?;
+        // The text parse_quick would have built / parse_quick 会拼出的同一段文本
+        let qname: Arc<str> = Arc::from(crate::proto_utils::name_text(question.name()));
+        let (qtype, qclass) = (question.query_type(), question.query_class());
+        let edns_present = req.edns.is_some();
+        Ok(RequestHead {
+            pipeline_id: pipeline_of((&qname, qtype, qclass, edns_present)),
+            qname,
+            qtype,
+            qclass,
+            tx_id: req.metadata.id,
+            flags: crate::proto_utils::QueryFlags::of(packet),
+            edns_present,
+            edns_version: crate::proto_utils::edns_version(packet).unwrap_or(0),
+            client_ecs: crate::proto_utils::client_subnet(packet),
+        })
+    }
+
+    /// `cfg` 为这个问题、这个客户端选的 pipeline（见 [`select_pipeline`]），快速路径和完整路径都从这里选
+    /// The pipeline `cfg` picks for this question and this client (see [`select_pipeline`]), the
+    /// fast path and the full path both picking here
+    fn pick_pipeline<'a>(
+        &self,
+        cfg: &'a RuntimePipelineConfig,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        client_ip: IpAddr,
+        edns_present: bool,
+    ) -> Option<&'a crate::matcher::RuntimePipeline> {
+        select_pipeline(
             cfg,
             &PipelineSelectionContext {
-                qname: &qname,
-                client_ip: peer.ip(),
+                qname,
+                client_ip,
                 qclass,
                 edns_present,
                 qtype,
@@ -1514,16 +1453,6 @@ impl Engine {
                 geoip_manager: Some(&self.geoip_manager),
             },
         )
-        .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone());
-        Ok(RequestHead {
-            qname,
-            qtype,
-            qclass,
-            tx_id,
-            edns_present,
-            pipeline_id,
-            client_ecs,
-        })
     }
 
     /// 决定怎么回答 `request`：不支持的 EDNS 版本回 BADVERS；查缓存；然后沿着规则走（跳转、continue、静态应答、转发），
@@ -1540,11 +1469,11 @@ impl Engine {
     ) -> anyhow::Result<Bytes> {
         let packet = request.packet;
         // RFC 6891 section 6.1.3, as on the fast path: an unsupported EDNS version is
-        // answered BADVERS. Read off the packet itself, so a query the fast parser
-        // cannot read (trailing bytes, a name that needs escapes) meets it too
-        // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS。从包本身读，
-        // 快速解析读不了的查询（结尾多了字节、名字要转义）也一样
-        if crate::proto_utils::edns_version(packet).is_some_and(|version| version != 0) {
+        // answered BADVERS, a query the fast parser cannot read (trailing bytes, a name that
+        // needs escapes) included
+        // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS，快速解析读不了的查询（结尾多了
+        // 字节、名字要转义）也一样
+        if request.edns_version != 0 {
             return crate::proto_utils::badvers_response(packet).context("build BADVERS response");
         }
         let background_refresh = request.refresh.is_some();
@@ -1648,20 +1577,7 @@ impl Engine {
                 Decision::Static { rcode, answers } => {
                     info.upstream = Some(Source::Static);
                     return Ok(phases::handle_static_decision(
-                        self,
-                        &phases::StaticDecisionContext {
-                            packet,
-                            qname: request.qname,
-                            qtype: request.qtype,
-                            qclass: request.qclass,
-                            pipeline_id: &route.key_pipeline,
-                            slot: route.keys.slot,
-                            flags: request.flags,
-                            reach: &route.trail,
-                            answer_ttl: route.answer_ttl.unwrap_or(0),
-                        },
-                        rcode,
-                        answers,
+                        self, request, route, rcode, &answers,
                     ));
                 }
                 Decision::Forward {
@@ -1894,16 +1810,38 @@ impl std::fmt::Display for UnreadableQuery {
 
 impl std::error::Error for UnreadableQuery {}
 
-/// 读出来的请求问题和选中的 pipeline（见 `Engine::read_request`）
-/// The request's question as read, and the pipeline picked (see `Engine::read_request`)
+/// 读出来的请求和选中的 pipeline（见 `Engine::read_request`）；快速路径读过的照样交给异步路径（见 [`PreParsedData`]）
+/// The request as read, and the pipeline picked (see `Engine::read_request`); what the fast
+/// path read goes on to the async path as it is (see [`PreParsedData`])
+#[derive(Debug, Clone)]
 struct RequestHead {
     qname: Arc<str>,
-    qtype: hickory_proto::rr::RecordType,
+    qtype: RecordType,
     qclass: DNSClass,
     tx_id: u16,
+    flags: crate::proto_utils::QueryFlags,
     edns_present: bool,
-    pipeline_id: Arc<str>,
+    /// 请求 OPT 里的 EDNS 版本，没有 OPT 时为 0 / The EDNS version in the request's OPT, 0 without one
+    edns_version: u8,
     client_ecs: Option<crate::ecs::EcsKey>,
+    pipeline_id: Arc<str>,
+}
+
+impl RequestHead {
+    /// 快速解析读出的 `q`，选中的是 `pipeline_id` / `q` as the quick parse read it, `pipeline_id` picked
+    fn quick(q: &crate::proto_utils::QuickQuery<'_>, pipeline_id: Arc<str>) -> Self {
+        Self {
+            qname: Arc::from(q.qname),
+            qtype: RecordType::from(q.qtype),
+            qclass: DNSClass::from(q.qclass),
+            tx_id: q.tx_id,
+            flags: q.flags,
+            edns_present: q.edns_present,
+            edns_version: q.edns_version,
+            client_ecs: q.client_subnet,
+            pipeline_id,
+        }
+    }
 }
 
 /// 一个请求在整个处理过程中不变的部分：它的包、问题、谁在问、用的配置快照，和后台刷新时要更新的条目
@@ -1919,6 +1857,9 @@ pub(crate) struct Request<'a> {
     pub(crate) qclass: DNSClass,
     pub(crate) tx_id: u16,
     pub(crate) flags: crate::proto_utils::QueryFlags,
+    /// 请求 OPT 里的 EDNS 版本，没有 OPT 时为 0 / The EDNS version in the request's OPT, 0
+    /// without one
+    pub(crate) edns_version: u8,
     pub(crate) peer: SocketAddr,
     /// Who is asking (address, EDNS, the client's own ECS) / 谁在问（地址、EDNS、客户端自己的 ECS）
     pub(crate) requester: Requester,
@@ -2070,7 +2011,7 @@ pub(crate) struct Route {
     /// cached; a request-phase jump into another pipeline, changing the keys, starts again
     /// from None: what is given outright there is given outright to the requests entering
     /// there directly too
-    answer_ttl: Option<u32>,
+    pub(crate) answer_ttl: Option<u32>,
     /// The forwards the request passed in the current pipeline, each with the ECS it sent
     /// and whom its reply applies to; every answer the request caches applies to the
     /// requesters all of them admit (see `CacheEntry::reach`). A forward adds its own here.
@@ -2186,6 +2127,41 @@ impl Route {
         let least = self.answer_ttl.map_or(ttl, |before| before.min(ttl));
         self.answer_ttl = Some(least);
         least
+    }
+
+    /// 在这条路线的键下为 `request` 缓存应答 `bytes`，留 `ttl` 秒，适用于 trail 接受的请求方；`ttl` 为 0 时不写（见
+    /// `phases::ttl_to_cache`、`phases::static_ttl`）。转发得到的、规则给出的应答都经这里写
+    /// Cache the answer `bytes` for `request` under this route's keys for `ttl` seconds, for the
+    /// requesters the trail admits; with `ttl` 0 nothing is cached (see `phases::ttl_to_cache`,
+    /// `phases::static_ttl`). Answers forwards got and answers the rules gave are written here
+    /// alike
+    pub(crate) fn cache(
+        &self,
+        engine: &Engine,
+        request: &Request<'_>,
+        bytes: &Bytes,
+        rcode: ResponseCode,
+        upstream: Option<Arc<str>>,
+        ttl: u32,
+    ) {
+        if ttl == 0 {
+            return;
+        }
+        engine.insert_dns_cache_entry(
+            self.keys.slot,
+            CacheEntry::from_response(
+                bytes.clone(),
+                rcode,
+                upstream,
+                Arc::clone(request.qname),
+                Arc::clone(&self.key_pipeline),
+                u16::from(request.qtype),
+                u16::from(request.qclass),
+                self.keys.flags,
+                ttl,
+            )
+            .with_reach(self.trail.clone()),
+        );
     }
 
     /// 响应动作还能跳几次：头一次响应阶段的跳转之前是整份 `limit`，之后是那一份剩下的（见 [`Self::response_jumped`]）
@@ -4537,13 +4513,14 @@ mod tests {
         const LIMIT: usize = 4608;
         let engine = build_test_engine();
         let peer: SocketAddr = "127.0.0.1:5300".parse().expect("peer");
-        let packet = [0u8; 12];
+        let packet = query_for("a.test");
         let full = engine.handle_packet(&packet, peer);
-        let pre_parsed = engine.handle_packet_internal_with_pre_parsed(
-            &packet,
-            peer,
-            engine.pre_parsed("a.test".to_string(), 1, 1, 0, false, Arc::from("main")),
-        );
+        let Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) =
+            engine.handle_packet_fast(&packet, peer)
+        else {
+            panic!("the fast path leaves a forward to the async path");
+        };
+        let pre_parsed = engine.handle_packet_internal_with_pre_parsed(&packet, peer, pre_parsed);
         for (entry, size) in [
             ("handle_packet", std::mem::size_of_val(&full)),
             ("pre-parsed", std::mem::size_of_val(&pre_parsed)),
