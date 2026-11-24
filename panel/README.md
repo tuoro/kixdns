@@ -44,7 +44,7 @@ glibc 版是 `kixdns-<版本>-linux-<架构>.zip`，musl 版是 `kixdns-<版本>
 
 ## 日志格式
 
-标准输出接 journald 时（systemd 下），每行开头是 journald 认的 `<N>` 优先级前缀，时间由 journald 自己记。不接 journald 时（终端，或者 OpenWrt 上 procd 把输出写进文件），每行是「UTC 时间 级别 消息」，比如 `2026-11-22T07:00:00.123456Z  INFO dns server started`；面板的 procd 后端就按这个格式读日志文件，级别取时间后面的第一个词。
+标准输出接 journald 时（systemd 下），每行开头是 journald 认的 `<N>` 优先级前缀，一条日志跨几行时每行都带它，时间由 journald 自己记。不接 journald 时（终端，或者 OpenWrt 上 procd 把输出写进文件），每行是「UTC 时间 级别 消息」，比如 `2026-11-22T07:00:00.123456Z  INFO dns server started`；面板的 procd 后端就按这个格式读日志文件，级别取时间后面的第一个词；一条日志里的换行写成 `\n`，一条日志只占一行。
 
 ## English summary
 

@@ -736,7 +736,18 @@ async fn forward_upstream_as_is(
     // Use Bytes for cheap clone (refcount) instead of Vec full copy
     // 使用 Bytes 实现低成本克隆（引用计数）而非 Vec 全量拷贝
     let packet_owned = Bytes::copy_from_slice(packet);
-    let mut last_err: Option<anyhow::Error> = None;
+    // 每个失败的上游和它的原因（`udp:a answered SERVFAIL; udp:b: no reply within 800ms`），全都失败时就是这次失败的原因：
+    // 调用方只记一条 warn（见 `phases::Forwarding::settle`），每个上游的原因都在里面，这里每个上游只记 debug
+    // Each failed upstream with its cause (`udp:a answered SERVFAIL; udp:b: no reply within
+    // 800ms`), the cause of this failure when every one fails: the caller logs a single warn (see
+    // `phases::Forwarding::settle`) with every upstream's cause in it, each upstream logging at
+    // debug alone here
+    let mut why = String::new();
+    let mut failed = |upstream: &str, cause: std::fmt::Arguments<'_>| {
+        use std::fmt::Write;
+        let gap = if why.is_empty() { "" } else { "; " };
+        let _ = write!(why, "{gap}{upstream}{cause}");
+    };
     // 最先收到的失败应答，全都失败时带出去（见 `UpstreamFailure::reply`）
     // The first failure reply received, carried out when every attempt fails (see
     // `UpstreamFailure::reply`)
@@ -808,7 +819,13 @@ async fn forward_upstream_as_is(
                     Ok(bytes) => {
                         // 快速解析响应码 / Quick parse response code
                         let quick = crate::proto_utils::parse_response_quick(&bytes);
-                        let kept = if quick.as_ref().is_some_and(|qr| is_failure_reply(qr.rcode)) {
+                        let rcode = quick.as_ref().map(|qr| qr.rcode);
+                        let kept = if let Some(rcode) =
+                            rcode.filter(|&rcode| is_failure_reply(rcode))
+                        {
+                            let rcode = crate::observe::rcode_name(rcode.into());
+                            tracing::debug!(upstream=%up_proto, %rcode, elapsed_ns = dur.as_nanos() as u64, "upstream answered a failure reply");
+                            failed(&up_proto, format_args!(" answered {rcode}"));
                             &mut first_failure_reply
                         } else if crate::proto_utils::truncated_response(&bytes) {
                             &mut first_truncated
@@ -825,23 +842,13 @@ async fn forward_upstream_as_is(
                         kept.get_or_insert((bytes, up_proto));
                     }
                     Err(err) => {
-                        let outcome = failed_outcome(&err);
-                        report(outcome, None, Some(&err));
-                        // 回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
-                        // A 429 logs at debug: the DoH client logged one warn as the pause began
-                        if outcome == UpstreamOutcome::Throttled {
-                            tracing::debug!(upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
-                        } else {
-                            crate::warn_sparse!(per up_proto; upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
-                        }
-                        last_err = Some(err);
+                        report(failed_outcome(&err), None, Some(&err));
+                        tracing::debug!(upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream call failed");
+                        failed(&up_proto, format_args!(": {err:#}"));
                     }
                 }
             }
-            Err(e) => {
-                crate::warn_sparse!(error = %e, "upstream task join error, waiting for others");
-                last_err = Some(anyhow::anyhow!(e));
-            }
+            Err(e) => failed("an upstream task", format_args!(": {e}")),
         }
     }
 
@@ -849,8 +856,10 @@ async fn forward_upstream_as_is(
         return Ok(truncated);
     }
     // 所有上游都失败 / All upstreams failed
-    let err = last_err.unwrap_or_else(|| anyhow::anyhow!("all upstreams failed"));
-    Err(UpstreamFailure::with_reply(err, first_failure_reply))
+    Err(UpstreamFailure::with_reply(
+        anyhow::Error::msg(why),
+        first_failure_reply,
+    ))
 }
 
 /// 一组上游里去掉正在暂停的 DoH 上游（见 `DohClient::is_paused`），逐个报给观察者。只有一个上游时，
@@ -1226,7 +1235,10 @@ async fn forward_udp_smart(
     let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
     let retry_truncated = tcp.retry_truncated && enable_tcp_fallback;
     let fallback_on_failure = tcp.on_failure && enable_tcp_fallback;
-    let failed = |attempt: u8, waited: Duration, error: &anyhow::Error| {
+    // 最后一次失败的原因：UDP 没问到时它就是 UDP 的失败原因 / The last failure's cause, which is UDP's
+    // when UDP gets no answer
+    let mut why = None;
+    let mut failed = |attempt: u8, waited: Duration, error: anyhow::Error| {
         debug!(
             event = "udp_forward_retry",
             upstream = %upstream,
@@ -1235,6 +1247,7 @@ async fn forward_udp_smart(
             error = %error,
             "udp forward attempt failed",
         );
+        why = Some(error);
     };
     // UDP 带回来的应答：截断的改用 TCP 重取，TCP 拿不到完整应答时交回截断的这份，客户端看到 TC 自己会改用 TCP，
     // 和双发一样；别的原样交回。上游的 TCP 被挡住时，大应答照样有截断的这份，不成 SERVFAIL
@@ -1263,9 +1276,12 @@ async fn forward_udp_smart(
     // for the whole of the timeout (see `UdpExchange`); failing that, TCP is left
     let first_wait = engine.permit_manager.resend_after(upstream, timeout_dur);
     let mut exchange = UdpExchange::new(&engine.udp_client, packet, upstream);
+    // 等到时限也没有回答的那几份一共等了多久 / How long the copies unanswered by their deadlines waited
+    // in all
+    let mut waited = Duration::ZERO;
     for (attempt, wait) in [(1, first_wait), (2, timeout_dur)] {
         if let Err(error) = exchange.send(sent_if_timed(engine)).await {
-            failed(attempt, wait, &error);
+            failed(attempt, wait, error);
         }
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -1276,28 +1292,35 @@ async fn forward_udp_smart(
                     note_round_trip(engine, upstream, timeout_dur, sent, &reply);
                     match reply {
                         Ok(bytes) => return answered(bytes).await,
-                        Err(error) => failed(attempt, wait, &error),
+                        Err(error) => failed(attempt, wait, error),
                     }
                 }
                 // 一份也没在等了 / No copy waited for any more
                 Ok(None) => break,
                 Err(_) => {
-                    failed(attempt, wait, &anyhow::anyhow!("upstream timeout"));
+                    waited += wait;
+                    let waited = waited.as_millis();
+                    failed(attempt, wait, anyhow::anyhow!("no reply within {waited}ms"));
                     break;
                 }
             }
         }
     }
+    // 每一份不是发不出去、收的时候出了错，就是等到时限也没有回答，都记下了原因 / Every copy failed to
+    // go, failed on receiving or was unanswered by the deadline, each noting why
+    let udp = why.expect("UDP gave no answer without a failure");
 
     if fallback_on_failure {
         // Both UDP queries failed, try TCP fallback before failing.
         debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
-        return over_tcp(engine, packet, upstream, timeout_dur).await;
+        return over_tcp(engine, packet, upstream, timeout_dur)
+            .await
+            .map_err(|tcp| anyhow::anyhow!("udp: {udp:#}; tcp: {tcp:#}"));
     }
     // Every UDP attempt failed and none fell back to TCP: the fallback is off, or the
     // caller tries TCP itself (a dual send, a batch with TCP upstreams)
     // UDP 全部失败，也没有改用 TCP：要么回退关着，要么调用方自己会走 TCP（双发、带 TCP 上游的批次）
-    anyhow::bail!("all udp attempts failed")
+    Err(udp)
 }
 
 /// UDP 转发改用 TCP 问一次（应答截断了，或者 UDP 没等到回答）。TCP 的收发单独在堆上分配：只有这两种情况才走 TCP，
@@ -2154,27 +2177,27 @@ mod tests {
         assert_eq!(hedge_timeout(Duration::ZERO), Duration::ZERO);
     }
 
-    /// 几个上游一起问时，失败的那个记的 warn 带着完整的原因，不只是最外层那一句。这里 DoH 上游读完请求就断开，最外层只说
-    /// 请求没发成，为什么没发成在里层。只有一个上游时这里不记 warn：调用方记的那一条带着原因（见
-    /// `execution::tests::an_upstream_failure_is_logged_once_with_its_cause`）
-    /// With several upstreams asked together, a failed one's warn carries the whole reason, not
-    /// just its outermost sentence. The DoH upstream here closes once it has read the request, the
-    /// outermost sentence only saying the request was not sent, why it was not being further in.
-    /// With a single upstream no warn is logged here: the caller's one carries the reason (see
-    /// `execution::tests::an_upstream_failure_is_logged_once_with_its_cause`)
+    /// 上游失败的原因带着完整的原因链，不只是最外层那一句：只问一个上游时是它的，几个一起问时是每一个的。这里 DoH 上游读完
+    /// 请求就断开，最外层只说请求没发成，为什么没发成在里层。这里一条 warn 也不记：调用方记的那一条带着原因（见
+    /// [`a_failure_of_several_upstreams_logs_one_warn`]）
+    /// An upstream failure's cause carries its whole chain, not just its outermost sentence: the
+    /// one upstream's with one asked, every one's with several asked together. The DoH upstream
+    /// here closes once it has read the request, the outermost sentence only saying the request was
+    /// not sent, why it was not being further in. No warn is logged here: the caller's one carries
+    /// the cause (see [`a_failure_of_several_upstreams_logs_one_warn`])
     #[tokio::test]
-    async fn a_failed_upstream_is_logged_with_its_whole_reason() {
+    async fn a_failed_upstream_gives_its_whole_reason() {
         use crate::engine::test_support::{DohReply, Warnings, spawn_doh_upstream};
         let (doh, _) = spawn_doh_upstream(|_, _| DohReply::Close).await;
         let engine = build_test_engine(false);
         engine.doh_client.use_plain_http();
         let packet = build_dns_query_packet("example.com.");
         let (warnings, guard) = Warnings::capture();
-        for upstream in [
-            format!("doh://{doh}/a"),
-            format!("doh://{doh}/a,doh://{doh}/b"),
+        for (upstream, failed) in [
+            (format!("doh://{doh}/a"), 1),
+            (format!("doh://{doh}/a,doh://{doh}/b"), 2),
         ] {
-            let forwarded = forward_upstream(
+            let err = forward_upstream(
                 &engine,
                 &packet,
                 &upstream,
@@ -2184,25 +2207,140 @@ mod tests {
                 None,
                 None,
             )
-            .await;
-            assert!(forwarded.is_err());
+            .await
+            .expect_err("the upstream closes");
+            let err = format!("{err:#}");
+            assert_eq!(
+                err.matches("doh request send failed: error sending request")
+                    .count(),
+                failed,
+                "{err}"
+            );
         }
         drop(guard);
-        let lines = warnings.lines();
-        let failed = |message: &str| {
-            lines
-                .iter()
-                .filter(|line| line.contains(message))
-                .collect::<Vec<_>>()
+        assert_eq!(warnings.lines(), Vec::<String>::new());
+    }
+
+    /// 几个上游都失败时，原因里有每一个上游和它的原因：回了失败应答的写回了什么，没回答的写等了多久。以前两个都回失败应答时
+    /// 是「all upstreams failed: all upstreams failed」，一个 REFUSED 一个不回答时只写「all udp attempts failed」
+    /// With every one of several upstreams failing, the cause names each upstream and its own
+    /// cause: what one answering with a failure reply answered, how long one not answering was
+    /// waited for. Both answering failure replies used to come out as "all upstreams failed: all
+    /// upstreams failed", and one REFUSED with one not answering as "all udp attempts failed" alone
+    #[tokio::test]
+    async fn a_failure_of_several_upstreams_names_each_with_its_cause() {
+        use crate::engine::test_support::{answering_rcode, silent_upstream};
+        let servfail = answering_rcode(ResponseCode::ServFail).await.address;
+        let refused = answering_rcode(ResponseCode::Refused).await.address;
+        let silent = silent_upstream().await.to_string();
+        let engine = build_test_engine(false);
+        let packet = build_dns_query_packet("example.com.");
+        for (upstreams, causes) in [
+            (
+                [&servfail, &refused],
+                [
+                    format!("udp:{servfail} answered SERVFAIL"),
+                    format!("udp:{refused} answered REFUSED"),
+                ],
+            ),
+            (
+                [&refused, &silent],
+                [
+                    format!("udp:{refused} answered REFUSED"),
+                    format!("udp:{silent}: no reply within 400ms"),
+                ],
+            ),
+        ] {
+            let err = forward_upstream(
+                &engine,
+                &packet,
+                &upstreams.map(String::as_str).join(","),
+                Duration::from_millis(300),
+                Transport::Udp,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("every upstream fails");
+            let err = format!("{err:#}");
+            let listed = err
+                .strip_prefix("all upstreams failed: ")
+                .unwrap_or_else(|| panic!("{err}"));
+            assert_eq!(listed.split("; ").count(), 2, "{err}");
+            for cause in causes {
+                assert!(listed.contains(&cause), "{cause} in {err}");
+            }
+        }
+    }
+
+    /// UDP 没问到时说得出为什么（这里是等了多久也没有回答）；改用 TCP 也没问到时两样都说。以前只说「all udp attempts
+    /// failed」，改用 TCP 的只交出 TCP 的原因
+    /// UDP getting no answer says why (how long it waited without a reply, here); with TCP tried
+    /// as well and failing, both are said. It used to say "all udp attempts failed" alone, and a
+    /// TCP fallback handed out TCP's cause alone
+    #[tokio::test]
+    async fn a_udp_failure_says_why_and_so_does_its_tcp_fallback() {
+        // UDP 收下不回，TCP 连不上 / UDP takes queries without answering, TCP refuses
+        let (_udp, tcp, addr) = bind_udp_and_tcp_on_one_port().await;
+        drop(tcp);
+        let packet = build_dns_query_packet("example.com.");
+        for (fallback, udp) in [(false, ""), (true, "udp: ")] {
+            let engine = build_test_engine(fallback);
+            let err = forward_upstream(
+                &engine,
+                &packet,
+                &addr.to_string(),
+                Duration::from_millis(300),
+                Transport::Udp,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("no answer");
+            let err = format!("{err:#}");
+            // 第一份等三分之一时限，再发的一份等满时限 / The first copy waits a third of the
+            // timeout, the one sent again the whole timeout
+            let udp = format!("the upstream failed: {udp}no reply within 400ms");
+            assert!(err.starts_with(&udp), "{err}");
+            assert_eq!(err.contains("; tcp: "), fallback, "{err}");
+        }
+    }
+
+    /// 几个上游都失败时只记一条 warn：调用方那一条，带着每个上游的原因。以前每个没回答的上游各记一条「upstream call
+    /// failed, waiting for others」，最后一个也说在等别的，回了失败应答的却一条不记
+    /// With every one of several upstreams failing a single warn is logged: the caller's, with
+    /// each upstream's cause. Each upstream not answering used to log an "upstream call failed,
+    /// waiting for others" of its own, the last one too with nothing left to wait for, while one
+    /// answering a failure reply logged none
+    #[tokio::test]
+    async fn a_failure_of_several_upstreams_logs_one_warn() {
+        use crate::engine::test_support::{
+            Warnings, answering_rcode, ask, engine_from, peer, silent_upstream,
         };
-        let single = failed("single upstream call failed");
-        let several = failed("upstream call failed, waiting for others");
-        assert_eq!((single.len(), several.len()), (0, 2), "{lines:#?}");
-        for line in several {
-            assert!(
-                line.contains("error=doh request send failed: error sending request"),
-                "{line}"
-            );
+        let refused = answering_rcode(ResponseCode::Refused).await.address;
+        let silent = silent_upstream().await.to_string();
+        let engine = engine_from(serde_json::json!({
+            "settings": {
+                "default_upstream": format!("{refused},{silent}"),
+                "upstream_timeout_ms": 300,
+                "enable_tcp_fallback": false
+            },
+            "pipelines": [{ "id": "main", "rules": [{
+                "name": "r", "matchers": [{ "type": "any" }], "actions": [{ "type": "forward" }]
+            }] }]
+        }));
+        let (warnings, guard) = Warnings::capture();
+        ask(&engine, &build_dns_query_packet("example.com."), peer()).await;
+        drop(guard);
+        let lines = warnings.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        for cause in [
+            format!("udp:{refused} answered REFUSED"),
+            format!("udp:{silent}: no reply within 400ms"),
+        ] {
+            assert!(lines[0].contains(&cause), "{cause} in {}", lines[0]);
         }
     }
 }
