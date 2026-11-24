@@ -39,7 +39,6 @@ nul
 # Local development and testing files (keep locally, don't commit)
 /test/
 /benches/
-/tests/
 test_parse_response_quick.rs
 # Historical code comparison files (keep locally, don't commit)
 *_old.rs
