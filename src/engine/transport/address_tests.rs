@@ -97,3 +97,34 @@ fn doq_target_with_an_ipv6_literal_requires_sni() {
         .expect("an IPv6 literal with sni is fine");
     assert_eq!(host_port(&target.host, target.port), "[2400:3200::1]:853");
 }
+
+/// DoH 上游一律走 https：地址是去掉前缀的那部分（见 `config::parse_upstream_addr`），没写路径时用 `/dns-query`，`host`
+/// 参数拿出来做覆盖的 Host。后面又写了一个前缀的不认，配置检查也就报出来：以前 `doh://http://…` 过得了检查，却悄悄走明文
+/// A DoH upstream always goes over https: its address is what follows the prefix (see
+/// `config::parse_upstream_addr`), `/dns-query` taken with no path written and the `host`
+/// parameter taken out as the Host override. One with a second prefix after the first is not
+/// taken, so the configuration check reports it: `doh://http://…` used to pass the check and go
+/// over plain http unseen
+#[test]
+fn a_doh_upstream_always_goes_over_https() {
+    let (url, host) = build_doh_url("dns.example").unwrap();
+    assert_eq!(
+        (url.as_str(), host),
+        ("https://dns.example/dns-query", None)
+    );
+    let (url, host) = build_doh_url("192.0.2.1:8443/q?host=front.example&x=1").unwrap();
+    assert_eq!(
+        (url.as_str(), host.as_deref()),
+        ("https://192.0.2.1:8443/q?x=1", Some("front.example"))
+    );
+    for second in [
+        "http://dns.example/dns-query",
+        "https://dns.example/dns-query",
+        "doh://dns.example",
+    ] {
+        let err = check_upstream_address(second, crate::config::Transport::Doh)
+            .expect_err(second)
+            .to_string();
+        assert!(err.contains("a second prefix"), "{second}: {err}");
+    }
+}

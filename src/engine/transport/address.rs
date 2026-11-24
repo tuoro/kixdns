@@ -9,16 +9,21 @@ use std::sync::Arc;
 use tracing::warn;
 use url::Url;
 
+/// DoH 上游 `upstream` 的 URL 和覆盖的 Host（`host` 查询参数，不发给上游）。`upstream` 是去掉前缀的地址
+/// （`dns.example/dns-query`，见 `config::parse_upstream_addr`），一律走 https；后面又写了一个前缀的（`doh://http://…`）
+/// 不认，不然它就悄悄走了明文。没写路径时用 `/dns-query`
+/// The URL of the DoH upstream `upstream` and the Host override (the `host` query parameter,
+/// not sent on). `upstream` is the address short of its prefix (`dns.example/dns-query`, see
+/// `config::parse_upstream_addr`), always over https; one with a second prefix after the first
+/// (`doh://http://…`) is not taken, as it would otherwise go over plain http unseen. With no path
+/// written it is `/dns-query`
 pub(super) fn build_doh_url(upstream: &str) -> anyhow::Result<(Url, Option<String>)> {
-    let url_str = if upstream.starts_with("http://") || upstream.starts_with("https://") {
-        upstream.to_string()
-    } else if let Some(stripped) = upstream.strip_prefix("doh://") {
-        format!("https://{}", stripped)
-    } else {
-        format!("https://{}", upstream)
-    };
-
-    let mut url = Url::parse(&url_str).context("invalid doh url")?;
+    if let Some((scheme, _)) = crate::config::split_scheme(upstream) {
+        anyhow::bail!(
+            "a second prefix \"{scheme}://\" after the first; a DoH upstream always goes over https"
+        );
+    }
+    let mut url = Url::parse(&format!("https://{upstream}")).context("invalid doh url")?;
 
     // Default path for DoH if not provided
     if url.path().is_empty() || url.path() == "/" {
