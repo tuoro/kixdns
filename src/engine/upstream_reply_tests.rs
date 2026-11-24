@@ -196,6 +196,36 @@ async fn a_reply_neither_parser_reads_is_answered_servfail() {
     }
 }
 
+/// 两种解析都读不了的应答算这次转发失败，和上游没回答一样：同时在等的请求拿到同一个 SERVFAIL，上游只问一次。以前这次请求
+/// 出错，条目放下了却没交出结果，等着的请求一个接一个自己再去问，六个同时来的要依次等六轮
+/// A reply neither parser reads fails this forward as an upstream giving no answer does: the
+/// requests waiting at once get the same SERVFAIL, the upstream asked once. The request used
+/// to end in an error, its entry
+/// let go with no outcome handed over, and the waiters asked again one after another, six
+/// arriving together waiting six rounds in turn
+#[tokio::test]
+async fn waiters_share_the_servfail_of_a_reply_neither_parser_reads() {
+    let up = upstream(|query| {
+        let mut reply = reply_to(query, ResponseCode::NoError, Vec::new())
+            .to_vec()
+            .unwrap();
+        reply[7] = 1;
+        vec![(Duration::from_millis(100), reply)]
+    })
+    .await;
+    let engine = engine(&[&up.address]);
+    let packet = query("example.com.", RecordType::A);
+    let replies = futures::future::join_all((1..=6).map(|client| {
+        let peer = std::net::SocketAddr::from(([10, 0, 0, client], 53000));
+        support::ask(&engine, &packet, peer)
+    }))
+    .await;
+    for reply in &replies {
+        assert_eq!(read(reply), (ResponseCode::ServFail, None));
+    }
+    assert_eq!(up.queries(), 1, "the waiters got the leader's SERVFAIL");
+}
+
 /// 这里不逐字节检查的类型（HTTPS）由 hickory 读，读得了就照常缓存
 /// A type not checked byte by byte here (HTTPS) is read by hickory and cached as usual
 /// when it can be read
