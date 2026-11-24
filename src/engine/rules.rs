@@ -1,3 +1,4 @@
+use anyhow::Context;
 use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
@@ -98,6 +99,14 @@ pub struct ResponseContext {
     pub raw: Bytes,
     pub msg: Message,
     pub upstream: Arc<str>,
+}
+
+/// hickory 读 `upstream` 给的应答 `raw`：回答检查和响应动作读的都是这样解析好的报文，读不了的算这次转发失败，错误说是哪个上游的
+/// The reply `raw` that `upstream` gave, read by hickory: the answer check and the response
+/// actions read the message parsed so, and one it cannot read fails the forward, with an error
+/// naming the upstream
+pub(crate) fn read_reply(raw: &[u8], upstream: &str) -> anyhow::Result<Message> {
+    Message::from_bytes(raw).with_context(|| format!("the reply from {upstream} cannot be read"))
 }
 
 #[derive(Debug)]
@@ -291,57 +300,56 @@ impl RuleCacheEntry {
 }
 
 /// 几个上游一起问、全都失败（`failure`）、其中有上游回了失败应答时（见 `UpstreamFailure`），把最先收到的那个
-/// 应答连同回它的上游交给规则的回答检查 `check`：检查通过、而且通过后有动作（`on_match`）要执行时，它就是这次转发
-/// 的应答，和只问一个上游时一样，连同回它的上游和解析好的报文一起给出。其余情况给出 None，照旧是失败：检查不通过时
-/// on_miss 照旧在没有应答的情况下执行，没有 on_miss 时照旧是过期缓存或 SERVFAIL。后台刷新不受影响：调用之后紧跟着
-/// `reject_failure_reply_on_refresh`，刷新照旧拿到失败，缓存的条目不动。
+/// 应答连同回它的上游、解析好的报文交给规则的回答检查 `check`：检查通过、而且通过后有动作（`on_match`）要执行时，它就是
+/// 这次转发的应答，和只问一个上游时一样。其余情况给出 None，照旧是失败：检查不通过时 on_miss 照旧在没有应答的情况下执行，
+/// 没有 on_miss 时照旧是过期缓存或 SERVFAIL。后台刷新不受影响：调用之后紧跟着 `reject_failure_reply_on_refresh`，刷新照旧
+/// 拿到失败，缓存的条目不动。
 /// When several upstreams asked together all failed with `failure` and one of them replied
 /// with a failure (see `UpstreamFailure`), the first such reply goes to the rule's answer
-/// check `check` with the upstream that sent it: when it passes and has actions to run
-/// (`on_match`), that reply is this forward's answer, as with a single upstream, and comes
-/// back with the upstream and its parsed message. Otherwise this gives None and it stays a
-/// failure: when the check fails on_miss still runs without an answer, and without on_miss
-/// the stale entry or SERVFAIL still answers. A background refresh is not affected: the
-/// caller runs `reject_failure_reply_on_refresh` right after, so the refresh still gets the
-/// failure and leaves the cached entry alone.
+/// check `check` with the upstream that sent it and its parsed message: when it passes and
+/// has actions to run (`on_match`), that reply is this forward's answer, as with a single
+/// upstream. Otherwise this gives None and it stays a failure: when the check fails on_miss
+/// still runs without an answer, and without on_miss the stale entry or SERVFAIL still
+/// answers. A background refresh is not affected: the caller runs
+/// `reject_failure_reply_on_refresh` right after, so the refresh still gets the failure and
+/// leaves the cached entry alone.
 pub(crate) fn check_failure_reply(
     failure: &anyhow::Error,
     on_match: &[Action],
-    check: impl FnOnce(&Message, &str) -> bool,
-) -> Option<(Bytes, Arc<str>, Message)> {
+    check: impl FnOnce(&ResponseContext) -> bool,
+) -> Option<ResponseContext> {
     if on_match.is_empty() {
         return None;
     }
     let (raw, upstream) = UpstreamFailure::reply_of(failure)?;
-    let msg = Message::from_bytes(raw)
-        .ok()
-        .filter(|msg| check(msg, upstream))?;
-    Some((raw.clone(), upstream.clone(), msg))
+    let ctx = ResponseContext {
+        msg: Message::from_bytes(raw).ok()?,
+        raw: raw.clone(),
+        upstream: upstream.clone(),
+    };
+    check(&ctx).then_some(ctx)
 }
 
-/// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给请求 `facts` 的应答 `msg` 是否成立；没有应答（`None`）时不成立，
-/// 没有匹配器时成立。和请求规则一样按请求自己那份 Geo 数据 `geo` 判断（见 `GeoManagers`）：上游应答的这段时间里换了数据，
-/// 检查照旧按请求开始时的那份，和它的键、缓存命名空间一致
+/// 响应匹配器对 `upstream`（作答的上游，`udp:1.1.1.1:53`）给请求 `facts` 的应答 `msg` 是否成立，没有匹配器时成立。和请求
+/// 规则一样按请求自己那份 Geo 数据 `geo` 判断（见 `GeoManagers`）：上游应答的这段时间里换了数据，检查照旧按请求开始时的那份，
+/// 和它的键、缓存命名空间一致
 /// Whether the response matchers hold for the answer `msg` that `upstream` gave request
-/// `facts` (the answering upstream, `udp:1.1.1.1:53`); without an answer (`None`) they do not,
-/// and with no matchers they do. They judge by the request's own Geo data `geo`, as request
-/// rules do (see `GeoManagers`): with the data changed while the upstream was answering, the
-/// check still goes by the data the request started with, in line with its keys and cache
-/// namespace
+/// `facts` (the answering upstream, `udp:1.1.1.1:53`), as they do with no matchers. They judge
+/// by the request's own Geo data `geo`, as request rules do (see `GeoManagers`): with the data
+/// changed while the upstream was answering, the check still goes by the data the request
+/// started with, in line with its keys and cache namespace
 pub(crate) fn response_matches(
     geo: &GeoManagers,
     matchers: &[RuntimeResponseMatcherWithOp],
     facts: &RequestFacts<'_>,
     upstream: &str,
-    msg: Option<&Message>,
+    msg: &Message,
 ) -> bool {
-    msg.is_some_and(|msg| {
-        eval_match_chain(
-            matchers,
-            |m| m.operator,
-            |m| m.matcher.matches(facts, upstream, msg, geo),
-        )
-    })
+    eval_match_chain(
+        matchers,
+        |m| m.operator,
+        |m| m.matcher.matches(facts, upstream, msg, geo),
+    )
 }
 
 /// 执行响应动作要的：请求本身（问题、谁在问、用的配置、观察者），和它这次转发的几样
@@ -505,10 +513,9 @@ async fn run_response_actions(
                     request.asker(),
                 )
                 .await
-                .and_then(|(raw, upstream)| match Message::from_bytes(&raw) {
-                    Ok(msg) => Ok(ResponseContext { raw, msg, upstream }),
-                    Err(error) => Err(anyhow::Error::new(error)
-                        .context(format!("the reply from {upstream} cannot be read"))),
+                .and_then(|(raw, upstream)| {
+                    let msg = read_reply(&raw, &upstream)?;
+                    Ok(ResponseContext { raw, msg, upstream })
                 });
                 match forwarded {
                     Ok(answer) => {
