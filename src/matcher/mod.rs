@@ -498,21 +498,21 @@ fn compiled<T>(
 }
 
 impl RuntimePipelineConfig {
-    /// 把一份配置编译成运行时的样子，转发时要用的都在这里先算好，只算这一遍：拆好的上游、几个 forward 合成的一次转发。
-    /// 说不通的设置（见 `GlobalSettings::validate`）和编译不了的匹配器一次列全（见 [`config::Problems`]），匹配器的开头
-    /// 写着它的位置，写成 `pipelines[0].rules[2].matchers[1]` 这样的路径，和读不懂的键一样
+    /// 把一份配置编译成运行时的样子，转发时要用的在这里先算好，只算这一遍：几个 forward 合成的一次转发（上游读配置时就
+    /// 拆好，见 `config::ForwardTarget`）。说不通的设置（见 `GlobalSettings::validate`）和编译不了的匹配器一次列全（见
+    /// [`config::Problems`]），匹配器的开头写着它的位置，写成 `pipelines[0].rules[2].matchers[1]` 这样的路径，和读不懂
+    /// 的键一样
     /// Compiles a configuration into its runtime form, working out here, once, what forwarding
-    /// needs: the upstreams split and the one forward several forwards merge into. Settings that
-    /// make no sense (see `GlobalSettings::validate`) and matchers that cannot be compiled are
-    /// listed all at once (see [`config::Problems`]), a matcher's starting with its place, a path
-    /// like `pipelines[0].rules[2].matchers[1]` as for the keys not read
+    /// needs: the one forward several forwards merge into (the upstreams being split as the
+    /// configuration is read, see `config::ForwardTarget`). Settings that make no sense (see
+    /// `GlobalSettings::validate`) and matchers that cannot be compiled are listed all at once
+    /// (see [`config::Problems`]), a matcher's starting with its place, a path like
+    /// `pipelines[0].rules[2].matchers[1]` as for the keys not read
     pub fn from_config(mut cfg: PipelineConfig) -> Result<Self, config::Problems> {
         cfg.settings.hold_to_limits();
         let mut refused = Vec::new();
         config::Problems::gather(&mut refused, cfg.settings.validate());
         let warnings = config::warnings(&cfg);
-        // 默认上游有几个时同时问 / Several default upstreams are asked at once
-        cfg.settings.pre_split_default_upstream();
 
         let mut pipelines = Vec::new();
         // What each pipeline's rules tell requesters apart by / 每个 pipeline 的规则区分请求方的依据
@@ -564,12 +564,10 @@ impl RuntimePipelineConfig {
                     r.response_actions_on_match,
                     r.response_actions_on_miss,
                 );
-                // 转发的上游先拆好，作答动作的静态应答先编好，每个查询不再读一遍（见 `Action::pre_split_upstreams`、
-                // `Action::compile_answer`）/ The forwards' upstreams split and the answering actions'
-                // static answers compiled now, so no query reads them again (see
-                // `Action::pre_split_upstreams`, `Action::compile_answer`)
+                // 作答动作的静态应答先编好，每个查询不再读一遍（见 `Action::compile_answer`）/ The
+                // answering actions' static answers compiled now, so no query reads them again (see
+                // `Action::compile_answer`)
                 for action in actions.iter_mut().chain(&mut on_match).chain(&mut on_miss) {
-                    action.pre_split_upstreams();
                     action.compile_answer();
                 }
                 let response_phase =
@@ -635,8 +633,6 @@ impl RuntimePipelineConfig {
         }
 
         config::Problems::refuse(refused)?;
-        cfg.settings.default_upstream_shared =
-            Some(Arc::from(cfg.settings.default_upstream.as_str()));
 
         // Build O(1) pipeline id lookup index / 构建 O(1) pipeline id 查找索引
         let pipeline_id_index: FxHashMap<Arc<str>, usize> = pipelines
@@ -1853,12 +1849,13 @@ mod tests {
         .expect("build runtime config");
         let rule = &config.pipelines[0].rules[0];
         let split_ahead = |actions: &[Action]| match &actions[0] {
-            Action::Forward {
-                pre_split_upstreams,
-                ..
-            } => pre_split_upstreams
-                .as_ref()
-                .map(|list| list.iter().map(|u| u.to_string()).collect::<Vec<_>>()),
+            Action::Forward { upstream, .. } => upstream.as_ref().map(|target| {
+                target
+                    .pre_split_upstreams
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+            }),
             other => panic!("{other:?}"),
         };
         assert_eq!(

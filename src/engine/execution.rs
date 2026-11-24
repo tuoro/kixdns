@@ -1430,8 +1430,7 @@ impl Engine {
                     ));
                 }
                 Decision::Forward {
-                    upstream,
-                    pre_split_upstreams,
+                    target,
                     response_phase,
                     rule_name,
                     rule_index,
@@ -1444,8 +1443,7 @@ impl Engine {
                         request,
                         route,
                         phases::ForwardDecision {
-                            upstream: &upstream,
-                            pre_split_upstreams: pre_split_upstreams.as_ref(),
+                            target: &target,
                             rule_name: &rule_name,
                             response: response_phase.as_deref(),
                             transport,
@@ -4420,14 +4418,14 @@ mod tests {
         // Assert: Verify Forward action returns correct upstream and matchers
         match decision2 {
             Decision::Forward {
-                upstream,
+                target,
                 response_phase,
                 ..
             } => {
                 let (response_matchers, _, _) =
                     crate::matcher::ResponsePhase::parts(response_phase.as_deref());
                 assert_eq!(
-                    upstream.as_ref(),
+                    target.upstream.as_ref(),
                     "8.8.8.8:53",
                     "Forward should use configured upstream"
                 );
@@ -4465,8 +4463,8 @@ mod tests {
 
         // Assert: Verify Allow action forwards to default upstream
         match decision3 {
-            Decision::Forward { upstream, .. } => assert_eq!(
-                upstream.as_ref(),
+            Decision::Forward { target, .. } => assert_eq!(
+                target.upstream.as_ref(),
                 "1.2.3.4:53",
                 "Allow should forward to default upstream"
             ),
@@ -4538,7 +4536,7 @@ mod tests {
 
     fn build_test_engine() -> Engine {
         let runtime = runtime_with_settings(GlobalSettings {
-            default_upstream: TEST_UPSTREAM.to_string(),
+            default_upstream: TEST_UPSTREAM.into(),
             ..Default::default()
         });
         Engine::new(runtime, "lbl".to_string()).expect("initialize test engine")
@@ -4994,7 +4992,7 @@ mod tests {
         engine.reload(runtime_with_settings(GlobalSettings {
             // TEST-NET-1：可路由地发出去、永远没有应答
             // TEST-NET-1: the datagram leaves and nothing ever answers
-            default_upstream: "192.0.2.1:53".to_string(),
+            default_upstream: "192.0.2.1:53".into(),
             serve_stale: true,
             serve_stale_client_timeout_ms: CLIENT_WAIT_MS,
             upstream_timeout_ms: UPSTREAM_TIMEOUT_MS,
@@ -5041,7 +5039,7 @@ mod tests {
     async fn reloaded_serve_stale_setting_keeps_expired_entries() {
         let engine = build_test_engine();
         engine.reload(runtime_with_settings(GlobalSettings {
-            default_upstream: TEST_UPSTREAM.to_string(),
+            default_upstream: TEST_UPSTREAM.into(),
             serve_stale: true,
             ..Default::default()
         }));
@@ -5095,7 +5093,7 @@ mod tests {
     /// An engine of global settings alone: a TTL cap of 2 seconds, `serve_stale` and `stale` as given
     fn stale_settings(serve_stale: bool, stale: u64) -> RuntimePipelineConfig {
         runtime_with_settings(GlobalSettings {
-            default_upstream: DEAD_UPSTREAM.to_string(),
+            default_upstream: DEAD_UPSTREAM.into(),
             upstream_timeout_ms: 100,
             cache_max_ttl: 2,
             serve_stale,
@@ -5173,7 +5171,7 @@ mod tests {
     fn engine_without_an_answering_upstream(serve_stale: bool) -> (Engine, u64) {
         let engine = Engine::new(
             runtime_with_settings(GlobalSettings {
-                default_upstream: DEAD_UPSTREAM.to_string(),
+                default_upstream: DEAD_UPSTREAM.into(),
                 upstream_timeout_ms: 100,
                 serve_stale,
                 serve_stale_ttl_reset: true,
@@ -5948,7 +5946,7 @@ mod tests {
     fn engine_with_a_stale_answer(settings: GlobalSettings) -> (Engine, u64) {
         let engine = Engine::new(
             runtime_with_settings(GlobalSettings {
-                default_upstream: DEAD_UPSTREAM.to_string(),
+                default_upstream: DEAD_UPSTREAM.into(),
                 upstream_timeout_ms: 100,
                 serve_stale: true,
                 ..settings
@@ -6194,7 +6192,7 @@ mod tests {
         let _runtime = runtime.enter();
         let engine = Engine::new(
             runtime_with_settings(GlobalSettings {
-                default_upstream: up.address.clone(),
+                default_upstream: up.address.as_str().into(),
                 // 对冲重发在三分之一处，远在放行之后 / The hedged resend comes at a third of it,
                 // long after the answer is let out
                 upstream_timeout_ms: 30_000,
@@ -6901,7 +6899,7 @@ mod tests_multi_upstream {
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
                 assert_eq!(
-                    upstream.as_ref().map(|s| s.as_str()),
+                    upstream.as_ref().map(|s| &*s.upstream),
                     Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"),
                     "Comma-separated upstream should be preserved"
                 );
@@ -6939,7 +6937,7 @@ mod tests_multi_upstream {
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
                 assert_eq!(
-                    upstream.as_ref().map(|s| s.as_str()),
+                    upstream.as_ref().map(|s| &*s.upstream),
                     Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"),
                     "Array upstream should be joined with commas"
                 );
@@ -7014,7 +7012,7 @@ mod tests_multi_upstream {
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
                 assert_eq!(
-                    upstream.as_ref().map(|s| s.as_str()),
+                    upstream.as_ref().map(|s| &*s.upstream),
                     Some("1.1.1.1:53"),
                     "Single-element array should be converted to string"
                 );

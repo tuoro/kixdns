@@ -367,6 +367,55 @@ async fn a_response_forward_without_an_upstream_goes_to_the_default_upstream() {
     assert_eq!((first.queries(), default.queries()), (1, 1));
 }
 
+/// 只写了一个、前后带空白的默认上游，问它的每条路都照去掉空白的地址问，和校验读它、和 forward 写的上游一样：没有规则
+/// 作决定、allow、不写 upstream 的 forward，请求阶段和回答阶段都是
+/// A default upstream written alone with spaces around it is asked at the address without
+/// them on every path that asks it, as the validation reads it and as the upstreams a forward
+/// writes are asked: with no rule deciding, on an allow, and by a forward writing no upstream,
+/// in the request phase and in the answer phase
+#[tokio::test]
+async fn a_default_upstream_with_spaces_around_it_is_asked_on_every_path() {
+    use serde_json::json;
+    let (first_address, default_address) =
+        (Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2));
+    let first = support::answering_upstream(first_address, 60).await;
+    let default = support::answering_upstream(default_address, 60).await;
+    let rule = |extra: serde_json::Value| {
+        let mut rule = json!({ "name": "r", "matchers": [{ "type": "any" }] });
+        rule.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!([rule])
+    };
+    let cases = [
+        ("no rule deciding", json!([])),
+        ("allow", rule(json!({ "actions": [{ "type": "allow" }] }))),
+        (
+            "request-phase forward",
+            rule(json!({ "actions": [{ "type": "forward" }] })),
+        ),
+        (
+            "answer-phase forward",
+            rule(json!({
+                "actions": [{ "type": "forward", "upstream": first.address }],
+                "response_matchers": [{ "type": "response_answer_ip", "cidr": "192.0.2.1/32" }],
+                "response_actions_on_match": [{ "type": "forward" }]
+            })),
+        ),
+    ];
+    for (case, rules) in &cases {
+        let engine = engine_from(json!({
+            "settings": counting_settings(json!({
+                "default_upstream": format!(" {} ", default.address)
+            })),
+            "pipelines": [{ "id": "main", "rules": rules }]
+        }));
+        let reply = support::ask(&engine, &query("spaced.test", RecordType::A), peer()).await;
+        assert_eq!(support::first_a(&reply), Some(default_address), "{case}");
+    }
+    assert_eq!((first.queries(), default.queries()), (1, cases.len()));
+}
+
 /// 请求在路上时换了 min_ttl：应答的 TTL 照请求开始时那份配置收，写进的也是那份配置的缓存命名空间，换回那份配置以后命中
 /// 缓存的照样是它。这里 min_ttl 0 上的请求在路上时换成 300，上游这才回答 TTL 60：客户端拿到 60，换回 0 以后命中缓存的
 /// 也是 60；反过来 300 上的请求拿到抬过的 300。请求阶段的转发和回答检查以后的转发都一样
