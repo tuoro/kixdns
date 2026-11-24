@@ -97,6 +97,29 @@ fn documented_type_names_are_the_accepted_ones() {
     }
 }
 
+/// 全局设置表和程序认的设置一一对应：`GlobalSettings::default()` 写出来的每个设置在两份文档的表里各有一行，表里也没有
+/// 不存在的设置。以前 doh_health_check_error_threshold 一直没写进表里
+/// The global settings tables match the settings the program reads one for one: every setting
+/// `GlobalSettings::default()` writes out has a row in the tables of both documents, and the
+/// tables hold none that does not exist. doh_health_check_error_threshold used to be missing
+#[test]
+fn every_setting_has_a_row_in_the_settings_tables() {
+    let settings: BTreeSet<String> =
+        serde_json::to_value(kixdns::config::GlobalSettings::default())
+            .expect("settings serialize")
+            .as_object()
+            .expect("settings are an object")
+            .keys()
+            .cloned()
+            .collect();
+    for (path, heading) in [
+        ("docs/configuration.md", "### 全局设置"),
+        ("docs/configuration.en.md", "### Global settings"),
+    ] {
+        assert_eq!(table_types(&read(path), heading), settings, "{path}");
+    }
+}
+
 #[test]
 fn documented_config_examples_load() {
     for (path, _) in DOCS {

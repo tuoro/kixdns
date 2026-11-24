@@ -38,6 +38,7 @@ version is optional. settings, pipeline_select, and pipelines default to an empt
 | udp_pool_size | 64 | Outbound UDP socket-pool size. Each query takes a socket and an ID at random; a socket that has sent 64 queries is replaced by a new one on another port the system picks, so no port lasts long, and the firewall's connection tracking gains just one entry per 64 misses. At most 1024. |
 | tcp_pool_size | 64 | At most this many TCP connections per upstream. Normally only the first is used; further queries go to the later ones only while 32 or more are unanswered on it at once. At most 1024. |
 | doh_pool_size | 8 | Maximum idle DoH connections per upstream when the upstream does not support HTTP/2 or `HTTPS_PROXY` / `ALL_PROXY` is set. An upstream supporting HTTP/2 is connected to directly, with at most one connection per worker thread and normally one in use, busy by the same rule as `tcp_pool_size`. At most 1024. |
+| doh_health_check_error_threshold | 3 | After this many transport errors in a row (a timeout, a failure to connect, to read or to write), a DoH upstream has all its connections dropped and made anew: the direct connections are closed and the pool used through a proxy or over HTTP/1.1 is rebuilt; requests broken together have it reconnect once. 0 turns the check off. |
 | dot_pool_size | 64 | At most this many DoT connections per upstream, normally one in use, by the same rule as `tcp_pool_size`. At most 1024. |
 | doq_pool_size | 16 | At most this many DoQ connections per upstream, normally one in use, by the same rule as `tcp_pool_size`. A connection is replaced only once it is gone, or a query timed out with no other answer on it meanwhile; a malformed answer or a reset stream fails just that query. At most 1024. |
 | tcp_connection_max_age_seconds | 300 | Maximum TCP/DoT connection age; 0 disables aging. |
@@ -124,7 +125,7 @@ Domain suffix and GeoSite matching are also case-insensitive. `domain_suffix` an
 | response_upstream_ip | cidr; comma-separated CIDRs are accepted |
 | response_answer_ip | cidr; comma-separated CIDRs are accepted |
 | response_type | value; the first answer record type, or the query type if there is no answer |
-| response_rcode | value: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED; an unknown value acts as the OTHER fallback |
+| response_rcode | value: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, or OTHER (any other RCODE), in any case; anything else written is a configuration problem (see below) |
 | response_qclass | value |
 | response_edns_present | expect: boolean |
 | response_answer_ip_geoip_country | country_codes: string array |
