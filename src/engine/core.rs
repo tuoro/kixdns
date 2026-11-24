@@ -436,6 +436,19 @@ impl Engine {
         for warning in &state.pipeline.warnings {
             tracing::warn!(%warning, "configuration warning");
         }
+        // 改了只在启动时读的设置，要重启才生效（见 `GlobalSettings::restart_pending`）：面板之外也记一条，没开面板时也看得见
+        // Settings read at startup alone were changed, taking a restart to apply (see
+        // `GlobalSettings::restart_pending`): logged besides the panel, to be seen without one
+        let restart_pending = state
+            .pipeline
+            .settings
+            .restart_pending(&self.running_settings);
+        if !restart_pending.is_empty() {
+            tracing::warn!(
+                settings = %restart_pending.join(", "),
+                "configuration settings take effect after a restart"
+            );
+        }
         if let Some(observer) = &self.observer {
             let config = &state.pipeline;
             // 没有 pipeline 时请求报的是 `NO_PIPELINE` / With no pipelines requests report `NO_PIPELINE`
@@ -463,7 +476,7 @@ impl Engine {
                 path,
                 generation,
                 source,
-                restart_pending: &config.settings.restart_pending(&self.running_settings),
+                restart_pending: &restart_pending,
                 warnings: &config.warnings,
                 pipelines: &pipelines,
                 rules: &rules,

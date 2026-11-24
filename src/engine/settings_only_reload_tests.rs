@@ -1,7 +1,9 @@
-//! 只写了全局设置、没有 pipeline 的配置，重载时缓存一样要换：全局设置变了，按旧设置得到的应答不再用。
+//! 只写了全局设置、没有 pipeline 的配置，重载时缓存一样要换：全局设置变了，按旧设置得到的应答不再用。改了只在启动时读的
+//! 设置时，重载记一条 warn，列出要重启才生效的设置。
 //! A configuration of global settings alone, with no pipeline, moves to a new cache on reload
 //! like any other: with a global setting changed, answers got under the old one are used no
-//! more.
+//! more. With settings read at startup alone changed, a reload logs a warning naming those
+//! that take a restart to apply.
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
@@ -11,7 +13,7 @@ use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::test_support::{
-    answering_upstream, ask, counting_settings, engine_from, first_a, peer,
+    Warnings, answering_upstream, ask, counting_settings, engine_from, first_a, peer,
 };
 use crate::matcher::RuntimePipelineConfig;
 
@@ -50,4 +52,41 @@ async fn a_reload_of_settings_alone_leaves_the_old_answers_behind() {
         "asked of the new upstream"
     );
     assert_eq!(new.queries(), 1);
+}
+
+/// 重载改了只在启动时读的设置（这里是监听地址和缓存容量）时记一条 warn，列出它们：没开面板时也看得见要重启。改回去以后，
+/// 或者只改了重载即生效的设置时不记
+/// A reload changing settings read at startup alone (the listening address and the cache
+/// capacity here) logs a warning naming them, so a restart is seen to be due without the
+/// panel too. Once they are changed back, or with only settings applied on a reload changed,
+/// none is logged
+#[tokio::test]
+async fn a_reload_names_the_settings_that_take_a_restart() {
+    let engine = engine_from(settings_only("127.0.0.1:9"));
+    let reload = |settings: Value| {
+        let mut config = settings_only("127.0.0.1:9");
+        for (key, value) in settings.as_object().unwrap() {
+            config["settings"][key] = value.clone();
+        }
+        let config: crate::config::PipelineConfig = serde_json::from_value(config).unwrap();
+        let (warnings, guard) = Warnings::capture();
+        engine.reload(RuntimePipelineConfig::from_config(config).unwrap());
+        drop(guard);
+        warnings
+            .lines()
+            .into_iter()
+            .filter(|line| line.contains("take effect after a restart"))
+            .collect::<Vec<_>>()
+    };
+    let pending = reload(json!({ "bind_udp": "127.0.0.1:5300", "cache_capacity": 1234 }));
+    assert_eq!(pending.len(), 1, "{pending:#?}");
+    assert!(
+        pending[0].contains("settings=bind_udp, cache_capacity"),
+        "{}",
+        pending[0]
+    );
+    assert_eq!(
+        reload(json!({ "upstream_timeout_ms": 1234 })),
+        Vec::<String>::new()
+    );
 }
