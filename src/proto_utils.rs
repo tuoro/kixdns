@@ -2236,6 +2236,33 @@ mod tests {
         );
     }
 
+    /// SERVFAIL 最长也只是报文头、名字 255 字节的问题和不带选项的 OPT，不到 512 字节：UDP 过载时不必截断就发（见
+    /// `listeners::spawn_udp_answer`）
+    /// A SERVFAIL is at its longest the header, a question with a 255-byte name and an OPT with
+    /// no options, under 512 bytes: under UDP overload it goes out uncut (see
+    /// `listeners::spawn_udp_answer`)
+    #[test]
+    fn a_servfail_fits_in_512_bytes() {
+        let mut query = query_header(1);
+        query[11] = 1;
+        for len in [63, 63, 63, 61] {
+            query.push(len);
+            query.extend(std::iter::repeat_n(b'a', usize::from(len)));
+        }
+        query.extend([0, 0, 1, 0, 1]);
+        assert_eq!(question_name_end(&query), Some(12 + MAX_NAME_LEN));
+        // 查询的 OPT 带着长长的填充，应答的不带 / The query's OPT carries a long padding, the reply's none
+        push_opt(
+            &mut query,
+            0,
+            true,
+            &[[0, 12, 1, 0].as_slice(), &[0; 256]].concat(),
+        );
+        let servfail = servfail_reply(&query);
+        assert_eq!(servfail.len(), 12 + MAX_NAME_LEN + 4 + 11);
+        assert!(servfail.len() <= 512);
+    }
+
     /// 读不了的查询回 FORMERR：问题抄得过来就带上，抄不过来就只有请求头
     /// A query that cannot be read gets FORMERR: its question when that can be copied, the
     /// header alone otherwise
