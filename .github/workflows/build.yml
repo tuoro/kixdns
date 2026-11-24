@@ -242,11 +242,11 @@ jobs:
         with:
           files: dist/kixdns-freebsd-${{ matrix.arch }}
 
-  # 各平台只在那个平台上编译的代码（cfg(windows)、BSD、musl/arm64），在 Linux 上用 zig 交叉编译跑 clippy：几分钟，
-  # 不出产物。Linux 本身的 clippy 和测试在 panel-release.yml 的 Verify 里
-  # The code each platform alone compiles (cfg(windows), BSD, musl/arm64), checked with clippy
-  # cross-compiled through zig on Linux: a few minutes and no artifacts. Linux's own clippy and
-  # tests are in Verify, panel-release.yml
+  # 各平台只在那个平台上编译的代码（cfg(windows)、BSD、musl/arm64），测试代码也算，在 Linux 上用 zig 交叉编译跑
+  # clippy：几分钟，不出产物。Linux 本身的 clippy 和测试在 panel-release.yml 的 Verify 里
+  # The code each platform alone compiles (cfg(windows), BSD, musl/arm64), the tests' included,
+  # checked with clippy cross-compiled through zig on Linux: a few minutes and no artifacts.
+  # Linux's own clippy and tests are in Verify, panel-release.yml
   cross-check:
     name: Cross check (Windows, FreeBSD, arm64 musl)
     if: github.event_name == 'pull_request'
@@ -275,13 +275,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy for Windows
-        run: cargo-zigbuild clippy --locked --target x86_64-pc-windows-gnu --lib --bins -- -D warnings
+        run: cargo-zigbuild clippy --locked --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 
       - name: Clippy for FreeBSD
-        run: cargo-zigbuild clippy --locked --target x86_64-unknown-freebsd --lib --bins -- -D warnings
+        run: cargo-zigbuild clippy --locked --target x86_64-unknown-freebsd --all-targets -- -D warnings
 
       - name: Clippy for arm64 musl
-        run: cargo-zigbuild clippy --locked --target aarch64-unknown-linux-musl --lib --bins -- -D warnings
+        run: cargo-zigbuild clippy --locked --target aarch64-unknown-linux-musl --all-targets -- -D warnings
 
   audit-linux:
     name: Audit dependencies (RustSec)
