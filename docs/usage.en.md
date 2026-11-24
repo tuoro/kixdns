@@ -40,6 +40,7 @@ Run options:
     --listener-label <LABEL>    Listener label used by pipeline selectors (default: default)
     --debug                     Enable debug-level logging
     --udp-workers <NUM>         UDP worker count (0 selects available CPU parallelism)
+    --admin-socket <PATH>       Local control socket (Unix socket) for the panel; off when omitted, unsupported on Windows
 -h, --help                      Show help
 -V, --version                   Show version
 ~~~
@@ -58,7 +59,7 @@ On Linux and FreeBSD each UDP worker has a socket of its own and the kernel spre
 
 ## Logs and response statistics
 
-The logging subscriber is text formatted by default, with RFC 3339 timestamps following the system's local timezone. The default filter is error unless --debug or the RUST_LOG environment variable changes it. The code does not configure JSON log output.
+The logging subscriber is text formatted by default. Without journald (a terminal, or the log file procd writes on OpenWrt) each line is an RFC 3339 time in UTC (ending in Z), the level and the message; under journald, which records the time and priority itself, the time in the line follows the system's local timezone. The default filter is error unless --debug or the RUST_LOG environment variable changes it. The code does not configure JSON log output.
 
 When a DoH upstream answers 429 Too Many Requests, one warning is logged as its pause starts, naming the upstream, the seconds and whether Retry-After set them (see the configuration document); further 429s during the pause, and the forwards that leave it out meanwhile, log at debug level only.
 
