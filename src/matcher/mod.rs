@@ -228,13 +228,6 @@ mod matcher_helpers {
 pub struct RuntimePipelineConfig {
     pub settings: config::GlobalSettings,
     pub pipeline_select: Vec<RuntimePipelineSelectRule>,
-    /// pipeline_select 的匹配器要不要 GeoSite 数据、要不要 GeoIP 数据，建配置时算好：不要的那份，选 pipeline 时不拿它的
-    /// 读锁（见 `select_pipeline`），每个查询也不用再把匹配器过一遍
-    /// Whether pipeline_select's matchers need GeoSite data, and GeoIP data, worked out as the
-    /// configuration is built: choosing a pipeline takes no read lock on what they do not need
-    /// (see `select_pipeline`), and no query goes through the matchers again to find out
-    pub select_needs_geosite: bool,
-    pub select_needs_geoip: bool,
     pub pipelines: Vec<RuntimePipeline>,
     /// O(1) pipeline lookup index: pipeline_id -> index in pipelines / O(1) 管道查找索引：pipeline_id -> pipelines 中的索引
     pub pipeline_id_index: FxHashMap<Arc<str>, usize>,
@@ -433,10 +426,9 @@ pub struct RuntimeMatcherWithOp {
 }
 
 /// pipeline_select 的匹配器：监听器标签，或者和规则一样的请求匹配器，读法和判断都是同一份（见
-/// [`RuntimeMatcher::matches_ready`]）。以前另有一套变体，把每种匹配器重写了一遍
+/// [`RuntimeMatcher::matches`]）
 /// A pipeline_select matcher: the listener label, or a request matcher as rules have, read and
-/// judged the same way (see [`RuntimeMatcher::matches_ready`]). It used to have variants of its
-/// own, every kind of matcher written out again
+/// judged the same way (see [`RuntimeMatcher::matches`])
 #[derive(Debug, Clone)]
 pub enum RuntimePipelineSelectorMatcher {
     ListenerLabel { value: Arc<str> },
@@ -584,17 +576,8 @@ impl RuntimePipelineConfig {
 
         fill_requester_scopes(&mut pipelines, &reads, &pipeline_id_index);
 
-        let select_needs = |needs: fn(GeoTags<'_>) -> bool| {
-            pipeline_select
-                .iter()
-                .flat_map(|rule| &rule.matchers)
-                .filter_map(|m| m.matcher.geo_tags())
-                .any(needs)
-        };
         let mut runtime = Self {
             settings: cfg.settings,
-            select_needs_geosite: select_needs(|tags| tags.site().is_some()),
-            select_needs_geoip: select_needs(|tags| tags.ip().is_some()),
             pipeline_select,
             pipelines,
             pipeline_id_index,
@@ -749,54 +732,20 @@ impl RuntimeMatcher {
         })
     }
 
-    #[inline]
-    pub fn matches_with_qtype(
-        &self,
-        qname: &str,
-        qclass: DNSClass,
-        client_ip: IpAddr,
-        edns_present: bool,
-        qtype: RecordType,
-        geoip_manager: Option<
-            &std::sync::Arc<parking_lot::RwLock<crate::matcher::geoip::GeoIpManager>>,
-        >,
-        geosite_manager: Option<
-            &std::sync::Arc<parking_lot::RwLock<crate::matcher::geosite::GeoSiteManager>>,
-        >,
-    ) -> bool {
-        // 按需拿锁：只有要用 Geo 数据的匹配器才拿 / Locks on demand: only a matcher using Geo data takes one
-        let geoip = geoip_manager
-            .filter(|_| self.needs_geoip())
-            .map(|manager| manager.read());
-        let geosite = geosite_manager
-            .filter(|_| self.needs_geosite())
-            .map(|manager| manager.read());
-        self.matches_ready(
+    /// 请求 `facts` 合不合这个匹配器。规则、pipeline_select 和快速路径都走这里，Geo 数据只在要用时拿读锁（见
+    /// [`GeoManagers`]）：没有 GeoSite 数据时 geo_site 不命中、geo_site_not 命中，没有 GeoIP 数据时 geoip_country 不命中
+    /// Whether request `facts` meets this matcher. Rules, pipeline_select and the fast path all
+    /// come here, the Geo data read-locked only when used (see [`GeoManagers`]): without GeoSite
+    /// data geo_site does not match and geo_site_not does, and without GeoIP data geoip_country
+    /// does not match
+    pub fn matches(&self, facts: &RequestFacts<'_>, geo: GeoManagers<'_>) -> bool {
+        let RequestFacts {
             qname,
+            qtype,
             qclass,
             client_ip,
             edns_present,
-            qtype,
-            geoip.as_deref(),
-            geosite.as_deref(),
-        )
-    }
-
-    /// 拿着现成的 Geo 数据判断：规则（经 [`Self::matches_with_qtype`]）和 pipeline_select 都走这里。没有
-    /// GeoSite 数据时 geo_site 不命中、geo_site_not 命中，没有 GeoIP 数据时 geoip_country 不命中
-    /// Judges with the Geo data at hand: rules (through [`Self::matches_with_qtype`]) and
-    /// pipeline_select both come here. Without GeoSite data geo_site does not match and
-    /// geo_site_not does, and without GeoIP data geoip_country does not match
-    pub fn matches_ready(
-        &self,
-        qname: &str,
-        qclass: DNSClass,
-        client_ip: IpAddr,
-        edns_present: bool,
-        qtype: RecordType,
-        geoip: Option<&crate::matcher::geoip::GeoIpManager>,
-        geosite: Option<&crate::matcher::geosite::GeoSiteManager>,
-    ) -> bool {
+        } = *facts;
         match self {
             RuntimeMatcher::Any => true,
             RuntimeMatcher::DomainExact { value } => {
@@ -806,20 +755,20 @@ impl RuntimeMatcher {
             RuntimeMatcher::DomainSuffix { value } => domain_suffix_matches(qname, value),
             RuntimeMatcher::ClientIp { net } => net.contains(&client_ip),
             RuntimeMatcher::DomainRegex { regex } => regex.is_match(qname),
-            RuntimeMatcher::GeoipCountry { country_codes } => {
-                geoip.is_some_and(|manager| manager.matches_any_tag(client_ip, country_codes))
-            }
+            RuntimeMatcher::GeoipCountry { country_codes } => geo
+                .geoip
+                .is_some_and(|manager| manager.read().matches_any_tag(client_ip, country_codes)),
             RuntimeMatcher::GeoipPrivate { expect } => {
                 crate::matcher::geoip::is_private_ip(client_ip) == *expect
             }
-            RuntimeMatcher::Qclass { value } => &qclass == value,
+            RuntimeMatcher::Qclass { value } => qclass == *value,
             RuntimeMatcher::EdnsPresent { expect } => *expect == edns_present,
-            RuntimeMatcher::GeoSite { tag } => {
-                geosite.is_some_and(|manager| manager.matches(tag, qname))
-            }
-            RuntimeMatcher::GeoSiteNot { tag } => {
-                geosite.is_none_or(|manager| !manager.matches(tag, qname))
-            }
+            RuntimeMatcher::GeoSite { tag } => geo
+                .geosite
+                .is_some_and(|manager| manager.read().matches(tag, qname)),
+            RuntimeMatcher::GeoSiteNot { tag } => geo
+                .geosite
+                .is_none_or(|manager| !manager.read().matches(tag, qname)),
             RuntimeMatcher::Qtype { value } => *value == qtype,
         }
     }
@@ -835,28 +784,43 @@ impl RuntimeMatcher {
             _ => None,
         }
     }
-
-    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
-    #[inline]
-    pub fn needs_geosite(&self) -> bool {
-        matches!(self.geo_tags(), Some(GeoTags::Site(_)))
-    }
-
-    /// 要不要 GeoIP 数据 / Whether it needs GeoIP data
-    #[inline]
-    pub fn needs_geoip(&self) -> bool {
-        matches!(self.geo_tags(), Some(GeoTags::Ip(_)))
-    }
 }
 
-/// Immutable DNS request fields used by pipeline selector matchers.
-pub struct PipelineSelectorQuery<'a> {
-    pub listener_label: &'a str,
-    pub client_ip: IpAddr,
+/// 请求匹配器看的请求：名字（名字文本，见 `proto_utils::name_text`）、类型、类别、客户端地址、带不带 EDNS
+/// The request as request matchers see it: the name (as name text, see
+/// `proto_utils::name_text`), type, class, client address, and whether it carries EDNS
+#[derive(Debug, Clone, Copy)]
+pub struct RequestFacts<'a> {
     pub qname: &'a str,
-    pub qclass: DNSClass,
-    pub edns_present: bool,
     pub qtype: RecordType,
+    pub qclass: DNSClass,
+    pub client_ip: IpAddr,
+    pub edns_present: bool,
+}
+
+/// 匹配器判断时能读的 Geo 数据。每个匹配器要用时才拿读锁，用完就放：不读 Geo 数据的匹配器不碰锁，每个查询不必为
+/// 它们去改所有核共用的锁计数。没有的那份当作没有数据（见 [`RuntimeMatcher::matches`]）
+/// The Geo data matchers may read as they judge. Each matcher read-locks it when it uses it and
+/// lets go once done: matchers reading no Geo data leave the locks alone, so no query writes the
+/// lock count all cores share for them. One missing counts as no data (see
+/// [`RuntimeMatcher::matches`])
+#[derive(Clone, Copy, Default)]
+pub struct GeoManagers<'a> {
+    pub geoip: Option<&'a parking_lot::RwLock<geoip::GeoIpManager>>,
+    pub geosite: Option<&'a parking_lot::RwLock<geosite::GeoSiteManager>>,
+}
+
+impl<'a> GeoManagers<'a> {
+    /// 两份数据都在 / With both kinds of data
+    pub fn new(
+        geoip: &'a parking_lot::RwLock<geoip::GeoIpManager>,
+        geosite: &'a parking_lot::RwLock<geosite::GeoSiteManager>,
+    ) -> Self {
+        Self {
+            geoip: Some(geoip),
+            geosite: Some(geosite),
+        }
+    }
 }
 
 impl RuntimePipelineSelectorMatcher {
@@ -884,8 +848,7 @@ impl RuntimePipelineSelectorMatcher {
         RuntimeMatcher::from_config(request).map(Self::Request)
     }
 
-    /// 读的 Geo 数据；不读的那份，选 pipeline 时不拿它的锁 / The Geo data it reads; choosing a
-    /// pipeline takes no lock on what it does not read
+    /// 读的 Geo 数据 / The Geo data it reads
     #[inline]
     pub fn geo_tags(&self) -> Option<GeoTags<'_>> {
         match self {
@@ -894,24 +857,19 @@ impl RuntimePipelineSelectorMatcher {
         }
     }
 
+    /// 从 `listener_label` 来的请求 `facts` 合不合这个匹配器，请求匹配器的判断见 [`RuntimeMatcher::matches`]
+    /// Whether request `facts`, come in at `listener_label`, meets this matcher, a request
+    /// matcher judging as in [`RuntimeMatcher::matches`]
     #[inline]
-    pub fn matches_with_ready_managers(
+    pub fn matches(
         &self,
-        query: &PipelineSelectorQuery<'_>,
-        geoip_ready: Option<&crate::matcher::geoip::GeoIpManager>,
-        geosite_ready: Option<&crate::matcher::geosite::GeoSiteManager>,
+        listener_label: &str,
+        facts: &RequestFacts<'_>,
+        geo: GeoManagers<'_>,
     ) -> bool {
         match self {
-            Self::ListenerLabel { value } => value.eq_ignore_ascii_case(query.listener_label),
-            Self::Request(matcher) => matcher.matches_ready(
-                query.qname,
-                query.qclass,
-                query.client_ip,
-                query.edns_present,
-                query.qtype,
-                geoip_ready,
-                geosite_ready,
-            ),
+            Self::ListenerLabel { value } => value.eq_ignore_ascii_case(listener_label),
+            Self::Request(matcher) => matcher.matches(facts, geo),
         }
     }
 }
@@ -1119,14 +1077,15 @@ mod tests {
                     &rule.matchers,
                     |m| m.operator,
                     |m| {
-                        m.matcher.matches_with_qtype(
-                            qname,
-                            DNSClass::IN,
-                            IpAddr::from([192, 0, 2, 1]),
-                            false,
-                            RecordType::A,
-                            None,
-                            None,
+                        m.matcher.matches(
+                            &RequestFacts {
+                                qname,
+                                qtype: RecordType::A,
+                                qclass: DNSClass::IN,
+                                client_ip: IpAddr::from([192, 0, 2, 1]),
+                                edns_present: false,
+                            },
+                            GeoManagers::default(),
                         )
                     },
                 )
@@ -1366,30 +1325,21 @@ mod tests {
             .map(|config| runtime_of(config).unwrap_or_else(|err| panic!("{pattern}: {err:#}")));
         let message = Message::new(0, MessageType::Response, OpCode::Query);
         move |name: &str| {
-            let client_ip = IpAddr::from([192, 0, 2, 1]);
-            let query = PipelineSelectorQuery {
-                listener_label: "test",
-                client_ip,
+            let facts = RequestFacts {
                 qname: name,
-                qclass: DNSClass::IN,
-                edns_present: false,
                 qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                client_ip: IpAddr::from([192, 0, 2, 1]),
+                edns_present: false,
             };
+            let geo = GeoManagers::default();
             [
                 rule.pipelines[0].rules[0].matchers[0]
                     .matcher
-                    .matches_with_qtype(
-                        name,
-                        DNSClass::IN,
-                        client_ip,
-                        false,
-                        RecordType::A,
-                        None,
-                        None,
-                    ),
+                    .matches(&facts, geo),
                 select.pipeline_select[0].matchers[0]
                     .matcher
-                    .matches_with_ready_managers(&query, None, None),
+                    .matches("test", &facts, geo),
                 phase(&response.pipelines[0].rules[0]).matchers[0]
                     .matcher
                     .matches(
@@ -1931,32 +1881,27 @@ mod tests {
         let ip: IpAddr = "104.16.0.1".parse().unwrap();
         let tags = vec![Arc::from("CLOUDFLARE")];
 
+        let facts = RequestFacts {
+            qname: "example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            client_ip: ip,
+            edns_present: false,
+        };
+        let geo = GeoManagers {
+            geoip: Some(&manager),
+            geosite: None,
+        };
         let request = RuntimeMatcher::GeoipCountry {
             country_codes: tags.clone(),
         };
-        assert!(request.matches_with_qtype(
-            "example.com",
-            DNSClass::IN,
-            ip,
-            false,
-            RecordType::A,
-            Some(&manager),
-            None,
-        ));
+        assert!(request.matches(&facts, geo));
 
         let pipeline = RuntimePipelineSelectorMatcher::Request(RuntimeMatcher::GeoipCountry {
             country_codes: tags.clone(),
         });
-        let query = PipelineSelectorQuery {
-            listener_label: "test",
-            client_ip: ip,
-            qname: "example.com",
-            qclass: DNSClass::IN,
-            edns_present: false,
-            qtype: RecordType::A,
-        };
+        assert!(pipeline.matches("test", &facts, geo));
         let guard = manager.read();
-        assert!(pipeline.matches_with_ready_managers(&query, Some(&guard), None));
 
         let response = RuntimeResponseMatcher::ResponseAnswerIpGeoipCountry {
             country_codes: tags,

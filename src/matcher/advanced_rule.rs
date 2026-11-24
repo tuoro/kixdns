@@ -7,11 +7,11 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
-use crate::engine::matcher_adapter::{MatcherContext, matcher_matches};
 use crate::engine::utils::parse_rcode;
 use crate::engine::{make_static_cname_answer, make_static_ip_answer, static_ips};
 use crate::matcher::{
-    RuntimeMatcher, RuntimeMatcherWithOp, RuntimePipeline, RuntimePipelineConfig, RuntimeRule,
+    GeoManagers, RequestFacts, RuntimeMatcher, RuntimeMatcherWithOp, RuntimePipeline,
+    RuntimePipelineConfig, RuntimeRule,
 };
 use crate::matcher::{domain_suffix_index_key, eval_match_chain};
 
@@ -34,11 +34,11 @@ pub struct CompiledRule {
     /// Rule name from the configuration, reported to observers on fast-path matches.
     /// 配置中的规则名，快速路径命中时上报给观察者。
     pub rule_name: Arc<str>,
-    /// 规则的匹配器，和完整规则路径共用同一份、同一个判断（`matcher_matches`，GeoIP、GeoSite 数据也一样读），两条
+    /// 规则的匹配器，和完整规则路径共用同一份、同一个判断（`RuntimeMatcher::matches`，GeoIP、GeoSite 数据也一样读），两条
     /// 路径对规则是否命中从不分歧。以前快速路径另有一份 `CompiledMatcher`，把每种匹配器重写了一遍，后来又复制一份
     /// 完整规则的
     /// The rule's matchers, shared with the full rule path and judged the same way
-    /// (`matcher_matches`, reading the GeoIP and GeoSite data alike), so the two paths never
+    /// (`RuntimeMatcher::matches`, reading the GeoIP and GeoSite data alike), so the two paths never
     /// disagree on whether a rule matches. The fast path used to keep a `CompiledMatcher` of its
     /// own, every kind of matcher written out again, and then a copy of the full rule's
     pub matchers: Arc<[RuntimeMatcherWithOp]>,
@@ -277,15 +277,14 @@ pub(crate) fn fast_static_match(
     use crate::engine::Decision;
     fast_static_match_with_rule(
         pipeline,
-        &MatcherContext {
+        &RequestFacts {
             qname,
+            qtype,
             qclass,
             client_ip,
             edns_present,
-            qtype,
-            geoip_manager: None,
-            geosite_manager: None,
         },
+        GeoManagers::default(),
     )
     .map(|(action, _)| match action {
         PrecomputedAction::Answer(answer) => {
@@ -303,10 +302,11 @@ pub(crate) fn fast_static_match(
 /// 同 [`fast_static_match`]，但给出命中规则的动作而不是决策（能直接按动作回答的就不必做记录），以及规则名。
 pub(crate) fn fast_static_match_with_rule<'a>(
     pipeline: &'a CompiledPipeline,
-    query: &MatcherContext<'_>,
+    facts: &RequestFacts<'_>,
+    geo: GeoManagers<'_>,
 ) -> Option<(&'a PrecomputedAction, &'a str)> {
     let last = pipeline.last_precomputed?;
-    let candidates = pipeline.index.get_candidates(query.qname, query.qtype);
+    let candidates = pipeline.index.get_candidates(facts.qname, facts.qtype);
     // 候选按规则顺序排好（见 `RuleIndex::get_candidates_into`）/ Candidates come in rule order (see
     // `RuleIndex::get_candidates_into`)
     for idx in candidates.into_iter().take_while(|&idx| idx <= last) {
@@ -314,7 +314,7 @@ pub(crate) fn fast_static_match_with_rule<'a>(
         let matched = eval_match_chain(
             &rule.matchers,
             |m| m.operator,
-            |m| matcher_matches(&m.matcher, query),
+            |m| m.matcher.matches(facts, geo),
         );
         if matched {
             // 第一条命中的规则定下结果：不能当场决定的（转发、先记日志的）连同规则顺序一起留给完整路径，

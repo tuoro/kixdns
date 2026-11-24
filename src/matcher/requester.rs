@@ -241,7 +241,10 @@ impl RuleReads {
                 ResponsePhase::parts(rule.response_phase.as_deref());
             // 请求匹配器读的 GeoIP 只按客户端地址判断，不算（见 [`GeoData`]）/ The GeoIP request
             // matchers read judges the client address alone and does not count (see [`GeoData`])
-            reads.geo.site |= rule.matchers.iter().any(|m| m.matcher.needs_geosite());
+            reads.geo.site |= rule
+                .matchers
+                .iter()
+                .any(|m| matches!(m.matcher.geo_tags(), Some(GeoTags::Site(_))));
             for tags in response_matchers
                 .iter()
                 .filter_map(|m| m.matcher.geo_tags())

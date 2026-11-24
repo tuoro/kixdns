@@ -280,10 +280,10 @@ impl RuntimeResponseMatcher {
                 matcher_helpers::any_ip_matches(msg, crate::matcher::geoip::is_private_ip)
                     == *expect
             }
-            // 没有 GeoSite 数据时和请求规则一样：geo_site 不命中、geo_site_not 命中（见 `RuntimeMatcher::matches_ready`）。
+            // 没有 GeoSite 数据时和请求规则一样：geo_site 不命中、geo_site_not 命中（见 `RuntimeMatcher::matches`）。
             // 以前这里的 geo_site_not 也不命中，同一个条件写在回答检查里和写在请求规则里结果相反
             // Without GeoSite data, as in request rules: geo_site does not match and geo_site_not
-            // does (see `RuntimeMatcher::matches_ready`). geo_site_not used not to match here
+            // does (see `RuntimeMatcher::matches`). geo_site_not used not to match here
             // either, so one condition gave opposite results in an answer check and a request rule
             RuntimeResponseMatcher::ResponseRequestDomainGeoSite { value } => {
                 geosite_manager.is_some_and(|mgr| mgr.matches(value, qname))
@@ -420,14 +420,15 @@ mod geosite_tests {
                     None,
                     None,
                 ),
-                request.matches_ready(
-                    "ads.example",
-                    DNSClass::IN,
-                    IpAddr::from([192, 0, 2, 1]),
-                    false,
-                    RecordType::A,
-                    None,
-                    None,
+                request.matches(
+                    &RequestFacts {
+                        qname: "ads.example",
+                        qtype: RecordType::A,
+                        qclass: DNSClass::IN,
+                        client_ip: IpAddr::from([192, 0, 2, 1]),
+                        edns_present: false,
+                    },
+                    GeoManagers::default(),
                 ),
                 "{request:?}"
             );
