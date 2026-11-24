@@ -10,11 +10,10 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use tracing::debug;
 
+use super::execution::UnreadableQuery;
 use super::{Engine, FastPathResponse, PreParsedData, utils};
 use crate::observe::ClientTransport;
 use crate::proto_utils;
-use hickory_proto::op::Message;
-use hickory_proto::serialize::binary::BinDecodable;
 
 /// 把缓存命中的应答写进 `buf`（先清空）：TTL 按应答在缓存里停留的整秒数调低（RFC 1035 §5.2），
 /// 事务 ID 换成这条查询的
@@ -92,14 +91,16 @@ impl Engine {
         OnTheSpot::Reply
     }
 
-    /// 快速路径没能当场回答的查询：在整体请求时限内走完整处理。出错或超时时记一条日志：超时回 SERVFAIL（见
-    /// `proto_utils::servfail_reply`），出错时读不了的查询回 FORMERR、读得了的回 SERVFAIL（见 [`failure_reply`]）。`pre_parsed`
-    /// 为 None 时快速解析没成，从头解析。
+    /// 快速路径没能当场回答的查询：在整体请求时限内走完整处理。出错或超时时记一条日志：读不了的查询回 FORMERR（RFC 6891
+    /// 第 6.1.1 节，见 `proto_utils::formerr_reply`），读得了读不了在读的那一刻就定下了（见 [`UnreadableQuery`]），不必为此
+    /// 再解析一遍；超时和别的错误回 SERVFAIL（见 `proto_utils::servfail_reply`）。`pre_parsed` 为 None 时快速解析没成，
+    /// 从头解析。
     /// A query the fast path could not answer on the spot: the full path within the overall
-    /// request timeout. An error or a timeout is logged: a timeout gets SERVFAIL (see
-    /// `proto_utils::servfail_reply`), and an error FORMERR for a query that cannot be read and
-    /// SERVFAIL for one that can (see [`failure_reply`]). With `pre_parsed` None the quick parse
-    /// failed, and the query is parsed from scratch.
+    /// request timeout. An error or a timeout is logged: a query that cannot be read gets
+    /// FORMERR (RFC 6891 section 6.1.1, see `proto_utils::formerr_reply`), which was settled
+    /// the moment it was read (see [`UnreadableQuery`]) with no second parse for it; a timeout
+    /// and any other error get SERVFAIL (see `proto_utils::servfail_reply`). With `pre_parsed`
+    /// None the quick parse failed, and the query is parsed from scratch.
     pub async fn answer_after_fast_path(
         &self,
         packet: &[u8],
@@ -127,7 +128,11 @@ impl Engine {
             Ok(Ok(answer)) => answer,
             Ok(Err(error)) => {
                 debug!(%error, "{listener} request processing error");
-                failure_reply(packet)
+                if error.is::<UnreadableQuery>() {
+                    proto_utils::formerr_reply(packet)
+                } else {
+                    proto_utils::servfail_reply(packet)
+                }
             }
             Err(_) => {
                 crate::warn_sparse!(
@@ -148,19 +153,5 @@ impl Engine {
             Some(ClientTransport::Doh) => "DoH",
             None => "DNS",
         }
-    }
-}
-
-/// 完整路径出错时的回答：读不了的查询回 FORMERR（RFC 6891 第 6.1.1 节，见 `proto_utils::formerr_reply`），读得了的回
-/// SERVFAIL（见 `proto_utils::servfail_reply`）。只有出错时才为分辨这两种解析一遍，过载拒绝和超时都不必
-/// The answer when the full path fails: FORMERR for a query that cannot be read (RFC 6891
-/// section 6.1.1, see `proto_utils::formerr_reply`), SERVFAIL for one that can (see
-/// `proto_utils::servfail_reply`). Only a failure parses the query to tell the two apart;
-/// refusals under overload and timeouts need not
-fn failure_reply(packet: &[u8]) -> Bytes {
-    if proto_utils::question_name_end(packet).is_some() && Message::from_bytes(packet).is_ok() {
-        proto_utils::servfail_reply(packet)
-    } else {
-        proto_utils::formerr_reply(packet)
     }
 }

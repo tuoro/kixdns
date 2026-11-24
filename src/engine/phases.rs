@@ -11,12 +11,10 @@ use crate::engine::response_log::{ResponseInfo, Source};
 use crate::engine::rules::{self, ResponseActionResult, ResponseContext};
 use crate::engine::types::{EngineInner, InflightEntry, InflightQuestion};
 use crate::engine::upstream::{UpstreamFailure, reject_failure_reply_on_refresh};
-use crate::engine::utils::engine_helpers::{build_response, build_servfail_response_fast};
 use crate::engine::utils::{InflightCleanupGuard, set_id};
 use crate::matcher::{Requester, RuntimeResponseMatcherWithOp};
 use crate::observe::{CacheHit, CacheHitKind};
 use crate::proto_utils;
-use anyhow::Context;
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::{DNSClass, Record, RecordType};
@@ -521,7 +519,7 @@ pub fn handle_static_decision(
     context: &StaticDecisionContext<'_>,
     rcode: ResponseCode,
     answers: Vec<Record>,
-) -> anyhow::Result<Bytes> {
+) -> Bytes {
     let StaticDecisionContext {
         packet,
         qname,
@@ -533,10 +531,8 @@ pub fn handle_static_decision(
         reach,
         answer_ttl,
     } = *context;
-    // Need full request for building response / 需要完整请求来构建响应
-    let req = Message::from_bytes(packet).context("parse request for static")?;
     let ttl = static_ttl(super::response::least_ttl(&answers), answer_ttl);
-    let resp_bytes = build_response(&req, rcode, answers)?;
+    let resp_bytes = super::response::static_reply(packet, qname, qtype, qclass, rcode, &answers);
 
     if ttl > 0 {
         engine.insert_dns_cache_entry(
@@ -556,7 +552,7 @@ pub fn handle_static_decision(
         );
     }
 
-    Ok(resp_bytes)
+    resp_bytes
 }
 
 /// 转发决定自己说的：问哪些上游、怎样问、回答检查做什么。请求本身见 `Request`，它沿着规则走到了哪里见 `Route`
@@ -608,13 +604,26 @@ pub(crate) async fn handle_forward_decision_logged<'a>(
 /// 上游的应答，和给出它的上游 / An upstream's reply, and the upstream that gave it
 type Reply = anyhow::Result<(Bytes, Arc<str>)>;
 
-/// [`Forwarding::weigh`] 掂量过的应答：上游的应答和给出它的上游；几个上游都回了失败应答、回答检查照样放行的那一个，还带着
-/// 解析好的报文，回答阶段拿它当已经检查过的应答，不再解析、检查一遍
-/// A reply [`Forwarding::weigh`] weighed: the upstream's answer and the upstream that gave
-/// it; the failure reply of several upstreams the answer check let through all the same
-/// comes with its parsed message too, which the answer phase takes as an answer checked
-/// already, with no second parse or check
-type Weighed = anyhow::Result<(Bytes, Arc<str>, Option<Message>)>;
+/// [`Forwarding::weigh`] 掂量过的应答（见 [`Answer`]），或者这次转发的失败
+/// A reply [`Forwarding::weigh`] weighed (see [`Answer`]), or this forward's failure
+type Weighed = anyhow::Result<Answer>;
+
+/// 读出来的上游应答（见 [`Forwarding::read`]）：应答本身、给出它的上游、它的 RCODE 和自己的 TTL（见 `ttl_to_cache`），
+/// hickory 读过的还有解析好的报文。`checked` 的是几个上游都回了失败应答、回答检查照样放行的那一个（见
+/// `rules::check_failure_reply`）：回答阶段拿它当已经检查过的应答，不再检查一遍
+/// An upstream reply as read (see [`Forwarding::read`]): the reply itself, the upstream that
+/// gave it, its RCODE and its own TTL (see `ttl_to_cache`), with the parsed message when hickory
+/// read it. A `checked` one is the failure reply of several upstreams the answer check let
+/// through all the same (see `rules::check_failure_reply`): the answer phase takes it as an
+/// answer checked already, with no second check
+struct Answer {
+    raw: Bytes,
+    upstream: Arc<str>,
+    rcode: ResponseCode,
+    ttl: u64,
+    msg: Option<Message>,
+    checked: bool,
+}
 
 /// 进行中的一次转发：请求、它沿着规则走的路线和转发决定，加上这次发出的包、它带的 ECS、它在 inflight 表里登记的条目。
 /// 路线由这次转发接着往下记：它经过的转发（`trail`）、留给后面复用的应答、continue 以后还持有的条目
@@ -885,11 +894,13 @@ impl<'a> Forwarding<'a> {
         }
         let (request, decision) = (self.request, self.decision);
         // 几个上游都回了失败应答时，规则的回答检查照样看得到最先收到的那个（见
-        // `rules::check_failure_reply`）；放行的那个连同解析好的报文交给回答阶段（见 [`Weighed`]）。刷新随后照旧拒收它
+        // `rules::check_failure_reply`）；放行的那个连同解析好的报文交给回答阶段（见 [`Answer`]）。刷新随后照旧拒收它。
+        // 别的应答先读出来（见 [`Self::read`]），读不了的和上游失败一样记进 trail
         // When several upstreams all replied with a failure, the rule's answer check still sees
         // the first of those replies (see `rules::check_failure_reply`); one let through goes
-        // to the answer phase with its parsed message (see [`Weighed`]). A refresh still
-        // rejects it right after
+        // to the answer phase with its parsed message (see [`Answer`]). A refresh still
+        // rejects it right after. Any other reply is read first (see [`Self::read`]), and one
+        // that cannot be read goes into the trail as the upstream failing does
         let reply = match reply {
             Err(failure) => match rules::check_failure_reply(
                 &failure,
@@ -906,10 +917,17 @@ impl<'a> Forwarding<'a> {
                     )
                 },
             ) {
-                Some((raw, upstream, msg)) => Ok((raw, upstream, Some(msg))),
+                Some((raw, upstream, msg)) => Ok(Answer {
+                    rcode: msg.metadata.response_code,
+                    ttl: extract_ttl(&msg),
+                    raw,
+                    upstream,
+                    msg: Some(msg),
+                    checked: true,
+                }),
                 None => Err(failure),
             },
-            Ok((raw, upstream)) => Ok((raw, upstream, None)),
+            Ok((raw, upstream)) => self.read(raw, upstream),
         };
         // A refresh takes a failure reply as a failed attempt before the response rules
         // see it, as forward_upstream does for a rule with several upstreams: the
@@ -918,17 +936,59 @@ impl<'a> Forwarding<'a> {
         // 刷新在响应规则看到失败应答之前就把它当作一次失败的尝试，和规则有多个上游时
         // forward_upstream 的做法一样：刷新和上游别的失败一样以失败结束（见 `Self::settle`），
         // 也不缓存这个应答（见 reject_failure_reply_on_refresh）。
-        let reply = reply.and_then(|reply| {
-            reject_failure_reply_on_refresh(request.refresh.is_some(), &reply.0).map(|()| reply)
+        let reply = reply.and_then(|answer| {
+            reject_failure_reply_on_refresh(request.refresh.is_some(), &answer.raw).map(|()| answer)
         });
         match &reply {
             // 这里复用的、规则越过的应答：它那次转发已经记在 trail 里 / An answer a rule continued
             // past, reused here: the trail already has its forward
             Ok(_) if reused => {}
-            Ok((raw, ..)) => self.route.trail.record_reply(self.forward_ecs, raw),
+            Ok(answer) => self.route.trail.record_reply(self.forward_ecs, &answer.raw),
             Err(_) => self.route.trail.record_failure(self.forward_ecs),
         }
         reply
+    }
+
+    /// 读 `upstream` 给的应答 `raw`。响应规则要读解析好的报文，所以总用 hickory 的。没有响应规则时，结构经得起检查的应答
+    /// 照快速解析的结果读（见 `well_formed_reply`）；其余的照 hickory 读出的，只有快速解析读得了的照样交出去、不缓存（TTL
+    /// 记 0）。两边都读不了的算这次转发失败（见 [`Self::settle`]）：和上游没回答一样，有过期应答就交出过期应答、没有就回
+    /// SERVFAIL，或者执行 miss 动作，等在这次转发登记的条目上的请求也拿到它
+    /// Read the reply `raw` that `upstream` gave. Response rules read the parsed message, so
+    /// they always take hickory's. Otherwise a reply whose structure holds up is read as the
+    /// quick parse reads it (see `well_formed_reply`); any other as hickory reads it, or, when
+    /// only the quick parse can read it, it goes on as it is and is not cached (a TTL of 0). One
+    /// neither can read fails this forward (see [`Self::settle`]): as when the upstream gives no
+    /// answer, a stale answer goes out if there is one and SERVFAIL if not, or the miss actions
+    /// run, and the requests waiting on the entry this forward registered get it too
+    fn read(&self, raw: Bytes, upstream: Arc<str>) -> anyhow::Result<Answer> {
+        let decision = self.decision;
+        let rules_read_the_reply = !(decision.response_matchers.is_empty()
+            && decision.response_actions_on_match.is_empty()
+            && decision.response_actions_on_miss.is_empty());
+        let quick = (!rules_read_the_reply)
+            .then(|| proto_utils::parse_response_quick(&raw))
+            .flatten();
+        let (rcode, ttl, msg) = match quick {
+            Some(qr) if proto_utils::well_formed_reply(&raw) => {
+                (qr.rcode, u64::from(qr.min_ttl), None)
+            }
+            quick => match (Message::from_bytes(&raw), quick) {
+                (Ok(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
+                (Err(_), Some(qr)) => (qr.rcode, 0, None),
+                (Err(error), None) => {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("the reply from {upstream} cannot be read")));
+                }
+            },
+        };
+        Ok(Answer {
+            raw,
+            upstream,
+            rcode,
+            ttl,
+            msg,
+            checked: false,
+        })
     }
 
     /// 应答或失败之后：上游有应答时按响应匹配器执行 on_match 或 on_miss，上游失败时执行 on_miss；两边接下来的处理只差在
@@ -944,7 +1004,7 @@ impl<'a> Forwarding<'a> {
     ) -> anyhow::Result<ForwardResult> {
         let on_miss = self.decision.response_actions_on_miss;
         match reply {
-            Ok((raw, upstream, checked)) => self.answered(raw, upstream, checked, response).await,
+            Ok(answer) => self.answered(answer, response).await,
             // 后台刷新没有客户端，也没在 inflight 里登记：上游失败就到此为止，把失败原样交回（refresh.rs 记下、退避），
             // 缓存条目和别的请求的等待者都不受影响。miss 动作给出的只是兜底，刷新用不着：以前照跑，静态兜底、问备用
             // 上游拿到的都写进缓存，把预取时还新鲜的那条顶掉，刷新还算成功、不退避
@@ -955,11 +1015,8 @@ impl<'a> Forwarding<'a> {
             // upstream's answer going into the cache over the entry still fresh at a prefetch,
             // and the refresh counting as a success with no backing off
             Err(e) if self.request.refresh.is_some() => Err(e),
-            Err(e) if on_miss.is_empty() => self.upstream_failed(e, response),
-            Err(e) => match Message::from_bytes(&self.packet) {
-                Ok(req) => self.act(on_miss, None, req, response).await,
-                Err(_) => Err(e),
-            },
+            Err(e) if on_miss.is_empty() => Ok(self.upstream_failed(e, response)),
+            Err(_) => self.act(on_miss, None, response).await,
         }
     }
 
@@ -968,44 +1025,20 @@ impl<'a> Forwarding<'a> {
     /// it; with none the answer is the outcome, cached by its TTL
     async fn answered(
         mut self,
-        raw: Bytes,
-        upstream: Arc<str>,
-        checked: Option<Message>,
+        answer: Answer,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
         let (request, decision) = (self.request, self.decision);
+        let Answer {
+            raw,
+            upstream,
+            rcode,
+            ttl,
+            msg,
+            checked,
+        } = answer;
         response.upstream = Some(Source::Upstream(Arc::clone(&upstream)));
-        // Response rules read the parsed message, so they always take hickory's.
-        // Otherwise the quick parse is cached as read for a reply whose structure
-        // holds up (see `well_formed_reply`); any other is cached as hickory reads
-        // it, or, when only the quick parse can read it, not at all and goes on as it
-        // is; a reply neither can read fails the request
-        // 响应规则要读解析好的报文，所以总用 hickory 的。没有响应规则时，结构经得起检查的应答
-        // 照快速解析的结果缓存（见 `well_formed_reply`）；其余的照 hickory 读出的结果缓存，只有
-        // 快速解析读得了的不缓存、照样交出去；两边都读不了的，这次请求出错
-        let rules_read_the_reply = !(decision.response_matchers.is_empty()
-            && decision.response_actions_on_match.is_empty()
-            && decision.response_actions_on_miss.is_empty());
-        let quick = (!rules_read_the_reply)
-            .then(|| proto_utils::parse_response_quick(&raw))
-            .flatten();
-        // 回答检查已经放行的失败应答（见 [`Weighed`]）照它解析好的报文来 / A failure reply the
-        // answer check let through already (see [`Weighed`]) goes by its parsed message
-        let passed = checked.is_some();
-        let (rcode, ttl, msg) = match (checked, quick) {
-            (Some(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
-            (None, Some(qr)) if proto_utils::well_formed_reply(&raw) => {
-                (qr.rcode, u64::from(qr.min_ttl), None)
-            }
-            (None, quick) => match (Message::from_bytes(&raw), quick) {
-                (Ok(msg), _) => (msg.metadata.response_code, extract_ttl(&msg), Some(msg)),
-                (Err(_), Some(qr)) => (qr.rcode, 0, None),
-                (Err(error), None) => {
-                    return Err(anyhow::Error::new(error).context("parse upstream response"));
-                }
-            },
-        };
-        let matched = passed
+        let matched = checked
             || rules::response_matches(
                 self.engine,
                 decision.response_matchers,
@@ -1042,51 +1075,20 @@ impl<'a> Forwarding<'a> {
             self.hand_over(&raw);
             return Ok(ForwardResult::Success(raw));
         }
-        // 有响应规则时应答总经 hickory 解析，解析不了的上面已经让这次请求出错（见 `rules_read_the_reply`）
+        // 有响应规则时应答总经 hickory 解析，解析不了的算这次转发失败（见 `Self::read`）
         // With response rules the reply is always parsed by hickory, and one it cannot parse
-        // has failed the request above (see `rules_read_the_reply`)
+        // fails this forward (see `Self::read`)
         let msg = msg.expect("response rules have the reply parsed by hickory");
-        // 手里有应答时，这几个动作用不着请求本身，不必为它们解析一遍；分流规则常写的就是这几个。要用请求的动作，请求解析
-        // 不了就让这次请求出错，和上游失败以后一样；以前拿一个 TXID 为 0、没有问题的空报文去执行，答出去的客户端认不得。
-        // 用不着请求的动作不读它，给个空报文占位
-        // With an answer in hand these actions have no use for the request itself, and it is
-        // not parsed for them; these are what splitting rules usually write. For actions that
-        // use the request, a request that cannot be parsed fails, as after an upstream failure;
-        // they used to run on an empty message with TXID 0 and no question, answering what no
-        // client recognises. Actions with no use for the request never read it, an empty message
-        // holding its place
-        let needs_request = !actions.iter().all(|action| {
-            matches!(
-                action,
-                Action::Log { .. } | Action::Allow | Action::Continue
-            )
-        });
-        let req = if needs_request {
-            Message::from_bytes(&self.packet).context("parse the request for response actions")?
-        } else {
-            Message::new(
-                0,
-                hickory_proto::op::MessageType::Query,
-                hickory_proto::op::OpCode::Query,
-            )
-        };
         let ctx = ResponseContext { raw, msg, upstream };
-        self.act(actions, Some(ctx), req, response).await
+        self.act(actions, Some(ctx), response).await
     }
 
-    /// 上游失败、规则没有 miss 动作时给客户端的应答：所有上游尝试都耗尽了才这样答（别的错误原样交回），先找过期应答
-    /// （RFC 8767），没有就 SERVFAIL
+    /// 上游失败、规则没有 miss 动作时给客户端的应答：所有上游尝试都耗尽了、或者上游的应答读不了（见 [`Self::read`]）才
+    /// 这样答，先找过期应答（RFC 8767），没有就 SERVFAIL
     /// The answer for the client when the upstream failed and the rule has no miss actions,
-    /// given once every upstream attempt is exhausted (any other error goes back as it is): a
-    /// stale answer (RFC 8767), or else SERVFAIL
-    fn upstream_failed(
-        &mut self,
-        e: anyhow::Error,
-        response: &mut ResponseInfo,
-    ) -> anyhow::Result<ForwardResult> {
-        if e.downcast_ref::<UpstreamFailure>().is_none() {
-            return Err(e);
-        }
+    /// given once every upstream attempt is exhausted or the upstream's reply cannot be read
+    /// (see [`Self::read`]): a stale answer (RFC 8767), or else SERVFAIL
+    fn upstream_failed(&mut self, e: anyhow::Error, response: &mut ResponseInfo) -> ForwardResult {
         let (request, decision, route) = (self.request, self.decision, &*self.route);
         let withheld = UpstreamFailure::was_withheld(&e);
         let stale = check_stale_cache_logged(
@@ -1143,24 +1145,11 @@ impl<'a> Forwarding<'a> {
                        "upstream failed"
                     );
                 }
-                // 问题名的文本总能读回成名字（见 `proto_utils::name_text`）；读不回时交回失败，由监听器自己回 SERVFAIL
-                // The question name's text always reads back as a name (see
-                // `proto_utils::name_text`); when it does not, the failure goes back and the
-                // listener answers SERVFAIL by itself
-                let Ok(servfail) = build_servfail_response_fast(
-                    request.tx_id,
-                    request.qname,
-                    u16::from(request.qtype),
-                    u16::from(request.qclass),
-                    request.flags.recursion_desired(),
-                ) else {
-                    return Err(e);
-                };
-                servfail
+                proto_utils::servfail_reply(request.packet)
             }
         };
         self.hand_over(&answer);
-        Ok(ForwardResult::Success(answer))
+        ForwardResult::Success(answer)
     }
 
     /// 执行 `actions`：带着回答检查看过的上游应答 `ctx`，或者上游失败以后不带，那时给出的结果是兜底（刷新到不了那里，
@@ -1176,7 +1165,6 @@ impl<'a> Forwarding<'a> {
         mut self,
         actions: &'a [Action],
         ctx: Option<ResponseContext>,
-        req: Message,
         response: &mut ResponseInfo,
     ) -> anyhow::Result<ForwardResult> {
         let request = self.request;
@@ -1189,7 +1177,6 @@ impl<'a> Forwarding<'a> {
             request,
             actions,
             ctx_opt: ctx,
-            req: &req,
             packet: &self.packet,
             pipeline_id: &self.route.pipeline,
             rule_name: self.decision.rule_name,

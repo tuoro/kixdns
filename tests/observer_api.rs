@@ -2600,31 +2600,68 @@ async fn request_finished_lends_the_response_the_engine_produced() {
 
 #[tokio::test]
 async fn failed_and_cancelled_requests_lend_no_response() {
-    // A listener hands a query the fast path deferred to the async path with
-    // its pre-parsed fields. A request whose header announces an additional
-    // record it does not carry passes that quick parse; the static decision
-    // then parses the whole message and fails the request.
-    // 监听器把快速路径推迟的查询连同预解析字段交给异步路径。头部声明了附加记录却没有
-    // 携带的请求能通过快速解析；静态决策随后完整解析报文失败，请求因此失败。
-    let (engine, recorder) = observed_engine(&static_config("192.0.2.7"));
-    let mut packet = query("broken.example");
-    packet[11] = 1; // ARCOUNT = 1, no additional record follows / ARCOUNT 为 1 但没有附加记录
-    let pre_parsed = engine.pre_parsed(
-        "broken.example".to_string(),
-        u16::from(RecordType::A),
-        1,
-        0x1234,
-        false,
-        Arc::from("main"),
-    );
-    let error = engine
-        .handle_packet_internal_with_pre_parsed(&packet, peer(), pre_parsed)
+    // A request the engine answers ends with an answer, a SERVFAIL of its own
+    // included; what fails is a background refresh whose upstream fails, which has no
+    // client to answer: a stale entry whose upstream has stopped answering.
+    // 引擎作答的请求都以应答结束，它自己的 SERVFAIL 也是；失败的是上游失败的后台刷新，它没有
+    // 要回答的客户端：上游已不再回答的过期条目。
+    let (upstream, answering) = spawn_silenceable_echo_upstream(1).await;
+    let raw = serde_json::json!({
+        "settings": {
+            "default_upstream": "127.0.0.1:9",
+            "serve_stale": true,
+            "upstream_timeout_ms": 200,
+            "enable_tcp_fallback": false
+        },
+        "pipelines": [{
+            "id": "main",
+            "rules": [{
+                "name": "fwd",
+                "matchers": [{ "type": "any" }],
+                "actions": [{ "type": "forward", "upstream": upstream, "transport": "udp" }]
+            }]
+        }]
+    })
+    .to_string();
+    let (engine, recorder) = observed_engine(&raw);
+    engine
+        .handle_packet(&query("broken.example"), peer())
         .await
-        .expect_err("a request the engine cannot parse fails");
-    let failed = recorder.outcome(request_id_for(&recorder.events(), "broken.example"));
+        .unwrap();
+    answering.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    recorder.drain();
+    engine
+        .handle_packet(&query("broken.example"), peer())
+        .await
+        .unwrap();
+    let refresh = |events: &[Event]| {
+        events.iter().find_map(|event| match event {
+            Event::Started {
+                id,
+                background: true,
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+    };
+    assert!(
+        recorder
+            .wait_for(Duration::from_secs(5), |events| {
+                refresh(events).is_some_and(|refresh| {
+                    events
+                        .iter()
+                        .any(|event| matches!(event, Event::Finished { id, .. } if *id == refresh))
+                })
+            })
+            .await,
+        "the background refresh must finish: {:#?}",
+        recorder.events()
+    );
+    let failed = recorder.outcome(refresh(&recorder.events()).unwrap());
     assert_eq!(failed.status, RequestStatus::Failed);
     assert_eq!(failed.response, None);
-    assert_eq!(failed.error, Some(format!("{error:#}")));
+    assert!(failed.error.is_some());
 
     // A dropped request never produced a message and did not fail.
     // 被丢弃的请求既没有产出应答，也不算失败。

@@ -11,41 +11,65 @@ use tracing::warn;
 
 use crate::proto_utils::received_ttl;
 
-#[inline]
-pub(crate) fn build_fast_static_response(
-    tx_id: u16,
+/// 照查询 `packet`（问 `qname` 的 `qtype`、`qclass`）写的静态应答，RCODE 为 `rcode`、带着 `answers`：先照线上格式写（见
+/// [`write_static_reply`]），写不了的交给 hickory，再按查询的样子规整（见 `proto_utils::reply_as_asked`）。两种再照查询
+/// 规整以后一字不差；客户端的 ECS 回显和照查询的规整由交出应答的一方来做。hickory 也编不出来的（记录多到一个报文装不下）回
+/// SERVFAIL，和 TXT 装不下时一样。快速路径、规则的静态决定和响应动作都从这里写，谁也不必为它解析请求
+/// A static answer to the query `packet` (asking `qname` for `qtype` in `qclass`), with RCODE
+/// `rcode` and `answers`: written on the wire first (see [`write_static_reply`]), and what that
+/// cannot write goes to hickory, then shaped as the query asks (see `proto_utils::reply_as_asked`).
+/// Shaped as the query asks once more, the two are byte for byte the same; the client's ECS echo
+/// and that shaping are left to whoever hands the answer out. What hickory cannot encode either
+/// (more records than a message holds) is answered SERVFAIL, as a TXT that does not fit is. The
+/// fast path, the rules' static decisions and the response actions all write here, none of them
+/// parsing the request for it
+pub(crate) fn static_reply(
+    packet: &[u8],
     qname: &str,
-    qtype: u16,
-    qclass: u16,
+    qtype: RecordType,
+    qclass: DNSClass,
     rcode: ResponseCode,
-    answers: &Vec<Record>,
-) -> anyhow::Result<Bytes> {
-    let mut msg = Message::new(tx_id, MessageType::Response, OpCode::Query);
+    answers: &[Record],
+) -> Bytes {
+    write_static_reply(packet, rcode, StaticAddresses::Records(answers)).unwrap_or_else(|| {
+        hickory_static_reply(packet, qname, qtype, qclass, rcode, answers).map_or_else(
+            || crate::proto_utils::servfail_reply(packet),
+            |reply| crate::proto_utils::reply_as_asked(reply, packet),
+        )
+    })
+}
+
+/// hickory 编出的静态应答：问题照快速解析读出的写（名字的文本总能读回，见 `proto_utils::name_from_text`），RD 置位，
+/// 交出之前还要按查询规整；编不出来时为 None
+/// A static answer hickory encodes: the question written from what the quick parse read (a
+/// name's text always reads back, see `proto_utils::name_from_text`), RD set, to be shaped as
+/// the query asks before it goes out; None when it cannot be encoded
+pub(super) fn hickory_static_reply(
+    packet: &[u8],
+    qname: &str,
+    qtype: RecordType,
+    qclass: DNSClass,
+    rcode: ResponseCode,
+    answers: &[Record],
+) -> Option<Bytes> {
+    let mut msg = Message::new(
+        u16::from_be_bytes([packet[0], packet[1]]),
+        MessageType::Response,
+        OpCode::Query,
+    );
     msg.metadata.recursion_desired = true;
     msg.metadata.recursion_available = true;
-    msg.metadata.authoritative = false;
     msg.metadata.response_code = rcode;
-
-    // Build question from quick parse data
-    let name = crate::proto_utils::name_from_text(qname)
-        .ok_or_else(|| anyhow::anyhow!("query name text {qname:?}"))?;
     let mut query = Query::new();
-    query.set_name(name);
-    query.set_query_type(hickory_proto::rr::RecordType::from(qtype));
-    let qclass = DNSClass::from(qclass);
+    query.set_name(crate::proto_utils::name_from_text(qname)?);
+    query.set_query_type(qtype);
     query.set_query_class(qclass);
     msg.add_query(query);
-
-    for ans in answers {
-        msg.add_answer(ans.clone());
-    }
+    msg.insert_answers(answers.to_vec());
 
     let mut out = Vec::with_capacity(512);
-    {
-        let mut encoder = BinEncoder::new(&mut out);
-        msg.emit(&mut encoder)?;
-    }
-    Ok(Bytes::from(out))
+    msg.emit(&mut BinEncoder::new(&mut out)).ok()?;
+    Some(Bytes::from(out))
 }
 
 /// `static_ip_response` 答的 TTL / The TTL a `static_ip_response` answers with
@@ -70,14 +94,14 @@ pub(crate) fn has_static_records(qclass: DNSClass) -> bool {
 }
 
 /// 把静态应答直接写成字节：报文头，照抄查询的问题段，每条地址一条指回问题名的记录。写出来和
-/// [`build_fast_static_response`] 经 `reply_as_asked` 规整之后的一字不差，只是不必为每个查询解析名字、搭一份报文再编码。
-/// 写不了的交回 None，由 [`build_fast_static_response`] 去写：问题名压缩过、根名（根名的记录不用指针）、名字超长、
+/// hickory 编出、经 `reply_as_asked` 规整之后的一字不差（见 [`static_reply`]），只是不必为每个查询解析名字、搭一份报文再编码。
+/// 写不了的交回 None，由 hickory 去写：问题名压缩过、根名（根名的记录不用指针）、名字超长、
 /// 响应码要 OPT 才写得下，或者记录不是这个问题名的 A、AAAA
 /// Writes a static answer directly as bytes: the header, the query's question section as it is, and for
 /// each address a record pointing back at the question name. What comes out is, byte for byte, what
-/// [`build_fast_static_response`] makes once `reply_as_asked` has shaped it, without reading a name and
+/// hickory encodes once `reply_as_asked` has shaped it (see [`static_reply`]), without reading a name and
 /// putting a message together to encode for every query. What it cannot write gives None and goes to
-/// [`build_fast_static_response`]: a compressed question name, the root (whose records use no pointer), a
+/// hickory: a compressed question name, the root (whose records use no pointer), a
 /// name too long, a response code that needs an OPT, or records other than this question name's A and AAAA
 pub(crate) fn write_static_reply(
     query: &[u8],

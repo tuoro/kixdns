@@ -31,11 +31,11 @@ use crate::proto_utils::parse_quick;
 use super::concurrency::PermitGuard;
 use super::matcher_adapter::MatcherContext;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
-use super::response::{StaticAddresses, build_fast_static_response, write_static_reply};
+use super::response::{StaticAddresses, static_reply, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
 use super::rules::RuleCacheRecord;
 use super::types::{EngineInner, FastPathResponse};
-use super::utils::{InflightCleanupGuard, engine_helpers};
+use super::utils::InflightCleanupGuard;
 use crate::cache::CachedQuestion;
 use crate::ecs_scope::EcsReach;
 use crate::engine::refresh::{RefreshCheck, RefreshTarget};
@@ -133,29 +133,22 @@ impl PreParsedData {
     }
 }
 
-/// A static answer built on the fast path, as its client gets it: a client that
-/// sent ECS gets the echo of its own subnet (see `phases::client_reply`), and a
-/// static answer, carrying no ECS, goes to the others as it is.
-/// 快速路径上构造的静态应答，按客户端该收到的样子：带了 ECS 的客户端拿到回显它自己子网的
-/// 应答（见 `phases::client_reply`）；静态应答本来不带 ECS，原样交给其他客户端。
-fn fast_client_reply(reply: Bytes, client: Option<&crate::ecs::EcsKey>) -> Bytes {
-    match client {
-        // A static answer depends on no ECS / 静态应答不取决于任何 ECS
-        Some(_) => phases::client_reply(reply, client, 0),
-        None => reply,
-    }
-}
-
-/// 写成字节的静态应答（见 [`write_static_reply`]）交给客户端前的样子。查询没有附加段就不会有 OPT，写好的就是最后的
-/// 样子，不必再规整一遍
-/// A static answer written as bytes (see [`write_static_reply`]) as it goes to the client. A query with
-/// no additional section has no OPT, and the answer as written is final, with nothing left to shape
+/// 静态应答（见 [`static_reply`]）交给客户端前的样子：带了 ECS 的客户端拿到回显它自己子网的应答（见
+/// `phases::client_reply`），静态应答本来不带 ECS、不取决于任何 ECS；再照查询规整。查询没有附加段就不会有 OPT 和 ECS，
+/// 写好的就是最后的样子，不必再规整一遍
+/// A static answer (see [`static_reply`]) as it goes to the client: a client that sent ECS gets
+/// the echo of its own subnet (see `phases::client_reply`), a static answer carrying no ECS and
+/// depending on none; then shaped as the query asks. A query with no additional section has no
+/// OPT and no ECS, and the answer as written is final, with nothing left to shape
 fn shaped_static_reply(reply: Bytes, packet: &[u8], client: Option<&crate::ecs::EcsKey>) -> Bytes {
     if packet[10..12] == [0, 0] {
-        reply
-    } else {
-        crate::proto_utils::reply_as_asked(fast_client_reply(reply, client), packet)
+        return reply;
     }
+    let reply = match client {
+        Some(_) => phases::client_reply(reply, client, 0),
+        None => reply,
+    };
+    crate::proto_utils::reply_as_asked(reply, packet)
 }
 
 /// 请求编号一个线程一次领这么多，用完再领：这个数所有核都要写，每个查询领一次就是每个查询抢一次
@@ -608,15 +601,12 @@ impl Engine {
 
     /// Report a request that `handle_packet_fast` answered without the async
     /// path: the whole lifecycle is emitted in one batch at the answering site.
-    /// `response` is the answer, or the error that stopped the engine from
-    /// building one; the listener then answers SERVFAIL by itself. `hops` are the
-    /// request-phase jumps followed on the way to `pipeline_id`, reported as the
-    /// full path reports them; a request that jumped is not offered whole, an offer
-    /// having room for one pipeline.
+    /// `response` is the answer. `hops` are the request-phase jumps followed on the
+    /// way to `pipeline_id`, reported as the full path reports them; a request that
+    /// jumped is not offered whole, an offer having room for one pipeline.
     /// 上报由 handle_packet_fast 直接应答的请求：整个生命周期在应答处一次性上报。
-    /// `response` 是应答，或者引擎没能构造出应答的错误；此时由监听器自己回 SERVFAIL。`hops` 是到
-    /// `pipeline_id` 之前跟着走过的请求阶段跳转，照完整路径的样子上报；跳转过的请求不整份提供，整份的只放得下一个
-    /// pipeline。
+    /// `response` 是应答。`hops` 是到 `pipeline_id` 之前跟着走过的请求阶段跳转，照完整路径的样子上报；跳转过的请求不整份
+    /// 提供，整份的只放得下一个 pipeline。
     fn observe_fast_path(
         &self,
         observer: &dyn EngineObserver,
@@ -624,18 +614,13 @@ impl Engine {
         hops: &[Hop<'_>],
         pipeline_id: &str,
         answer: FastPathAnswer<'_>,
-        response: Result<&[u8], &anyhow::Error>,
+        response: &[u8],
     ) {
-        let error = response.as_ref().err().map(|error| format!("{error:#}"));
         let outcome = RequestOutcome {
             latency: ctx.started.elapsed(),
-            status: if error.is_some() {
-                RequestStatus::Failed
-            } else {
-                RequestStatus::Completed
-            },
-            response: response.ok(),
-            error: error.as_deref(),
+            status: RequestStatus::Completed,
+            response: Some(response),
+            error: None,
         };
         let taken_whole = hops.is_empty()
             && match &answer {
@@ -928,7 +913,7 @@ impl Engine {
                             &hops,
                             pipeline_id,
                             FastPathAnswer::Cache(phases::cache_hit_of(&hit, kind, elapsed_secs)),
-                            Ok(&reply),
+                            &reply,
                         );
                     }
                     log.answered(&reply);
@@ -982,7 +967,7 @@ impl Engine {
                                 CacheHitKind::Fresh,
                                 elapsed_secs,
                             )),
-                            Ok(&reply),
+                            &reply,
                         );
                     }
                     let mut log = response_log(pipeline);
@@ -1000,12 +985,11 @@ impl Engine {
                 }
             }
 
-            // 编译规则或规则缓存给的静态应答。在 `?` 之前上报：构造不出应答的请求也在这里结束，由监听器
-            // 自己回 SERVFAIL。
-            // A static answer from a compiled rule or the rule cache. Report before `?`: a
-            // response that cannot be built still ends the request here, and the listener
-            // answers SERVFAIL by itself.
-            let finish_static = |built: anyhow::Result<Bytes>, answer: FastPathAnswer<'_>| {
+            // 编译规则或规则缓存给的静态应答，照客户端问的样子交出（见 `shaped_static_reply`）
+            // A static answer from a compiled rule or the rule cache, going out as the client
+            // asked (see `shaped_static_reply`)
+            let finish_static = |reply: Bytes, answer: FastPathAnswer<'_>| {
+                let reply = shaped_static_reply(reply, packet, q.client_subnet.as_ref());
                 if let Some(observer) = observed {
                     self.observe_fast_path(
                         observer,
@@ -1013,32 +997,19 @@ impl Engine {
                         &hops,
                         pipeline_id,
                         answer,
-                        built.as_deref(),
+                        &reply,
                     );
                 }
-                let resp = built?;
                 let mut log = response_log(pipeline);
                 log.info.upstream = Some(Source::Static);
-                log.answered(&resp);
-                anyhow::Ok(Some(FastPathResponse::Direct(resp)))
+                log.answered(&reply);
+                Some(FastPathResponse::Direct(reply))
             };
-            let answer_static = |rcode, answers: &Vec<hickory_proto::rr::Record>, answer| {
-                let built =
-                    match write_static_reply(packet, rcode, StaticAddresses::Records(answers)) {
-                        Some(reply) => {
-                            Ok(shaped_static_reply(reply, packet, q.client_subnet.as_ref()))
-                        }
-                        None => build_fast_static_response(
-                            q.tx_id, qname_str, q.qtype, q.qclass, rcode, answers,
-                        )
-                        .map(|reply| {
-                            crate::proto_utils::reply_as_asked(
-                                fast_client_reply(reply, q.client_subnet.as_ref()),
-                                packet,
-                            )
-                        }),
-                    };
-                finish_static(built, answer)
+            let answer_static = |rcode, answers: &[hickory_proto::rr::Record], answer| {
+                finish_static(
+                    static_reply(packet, qname_str, qtype, qclass, rcode, answers),
+                    answer,
+                )
             };
 
             // 2. 规则缓存（L1）：和完整路径一样先看规则缓存（见 `apply_rules`），存着决定的不必再求值规则。以前快速路径
@@ -1071,11 +1042,11 @@ impl Engine {
             let (next, hop) = if let Some(record) = cached {
                 match &record.entry.decision {
                     Decision::Static { rcode, answers } => {
-                        return answer_static(
+                        return Ok(answer_static(
                             *rcode,
                             answers,
                             FastPathAnswer::CachedRules { record: &record },
-                        );
+                        ));
                     }
                     Decision::Jump { pipeline: target } => (
                         cfg.pipeline(target),
@@ -1126,9 +1097,7 @@ impl Engine {
                                 rcode,
                                 answers,
                             };
-                            let reply =
-                                shaped_static_reply(reply, packet, q.client_subnet.as_ref());
-                            return finish_static(Ok(reply), answer);
+                            return Ok(finish_static(reply, answer));
                         }
                         let (rcode, answers) = action.records(qname_str, qtype, qclass);
                         let answer = FastPathAnswer::StaticRule {
@@ -1136,7 +1105,7 @@ impl Engine {
                             rcode,
                             answers: answers.len(),
                         };
-                        return answer_static(rcode, &answers, answer);
+                        return Ok(answer_static(rcode, &answers, answer));
                     }
                     None => break,
                 }
@@ -1435,12 +1404,14 @@ impl Engine {
         };
         // A request that continued still holds its entry here, and its waiters get
         // the final answer: the entry's key keeps them to requesters that the rules
-        // run after the continue treat alike (see `RuntimePipeline::requester`). If
-        // the request returns an error or is cancelled, the guard drops and removes
-        // the entry, and the waiters forward themselves.
+        // run after the continue treat alike (see `RuntimePipeline::requester`). A
+        // request that ends without an answer to share (an error: the jump limit, flow
+        // control keeping a forward from waiting, see `decide`) or is cancelled drops
+        // the guard, which removes the entry, and the waiters forward themselves.
         // continue 过的请求走到这里仍持有条目，等待者拿到最终应答：条目的键只让 continue
         // 之后运行的规则一样对待的请求方等在上面（见 `RuntimePipeline::requester`）。请求
-        // 返回错误或被取消时，守卫被丢弃并移除条目，等待者自己转发。
+        // 没以可以交出的应答结束（出错：跳转上限、流控没让转发等，见 `decide`）或者被取消时，
+        // 守卫被丢弃并移除条目，等待者自己转发。
         if let Some(mut guard) = route.held_inflight.take()
             && let Ok(bytes) = &result
         {
@@ -1450,21 +1421,25 @@ impl Engine {
         }
         // Every reply leaves with the ECS option its client should see, and with what it
         // copies from the query as the client wrote it (see `proto_utils::reply_as_asked`);
-        // waiters were handed the reply before this and do the same for their own clients
+        // waiters were handed the reply before this and do the same for their own clients.
+        // A request that ended in an error answers its client SERVFAIL, which the client
+        // must get rather than silence, a missing reply being a timeout to it; the stub
+        // resolver retries (RFC 1035)
         // 每个应答都带着它的客户端该看到的 ECS 选项、照客户端写法的照抄部分离开（见
-        // `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的处理
+        // `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的处理。
+        // 以错误结束的请求给它的客户端回 SERVFAIL：客户端得拿到确定的应答，没有回音在它看来就是超时；
+        // stub 解析器会重试（RFC 1035）
         let result = if background_refresh {
             result
         } else {
             let at_least = route
                 .echo_floor
                 .max(route.trail.echo_scope(&request.requester.ecs_view()));
-            result.map(|bytes| {
-                crate::proto_utils::reply_as_asked(
-                    phases::client_reply(bytes, client_ecs.as_ref(), at_least),
-                    packet,
-                )
-            })
+            let reply = result.unwrap_or_else(|_| crate::proto_utils::servfail_reply(packet));
+            Ok(crate::proto_utils::reply_as_asked(
+                phases::client_reply(reply, client_ecs.as_ref(), at_least),
+                packet,
+            ))
         };
         response_log.finish(&result);
         if let Some(observed) = observed.as_mut() {
@@ -1473,9 +1448,11 @@ impl Engine {
         result
     }
 
-    /// 读出请求的问题，选好 pipeline：快速路径预解析过的照用；否则先快速解析，读不了再完整解析
+    /// 读出请求的问题，选好 pipeline：快速路径预解析过的照用；否则先快速解析，读不了再完整解析，还读不了就是
+    /// [`UnreadableQuery`]
     /// Read the request's question and pick its pipeline: what the fast path pre-parsed is
-    /// taken as it is; otherwise the quick parse comes first, the full one when it cannot read it
+    /// taken as it is; otherwise the quick parse comes first, the full one when it cannot read
+    /// it, and a query neither reads is an [`UnreadableQuery`]
     fn read_request(
         &self,
         packet: &[u8],
@@ -1509,10 +1486,10 @@ impl Engine {
                 None => {
                     anyhow::ensure!(
                         crate::proto_utils::question_name_end(packet).is_some(),
-                        "unreadable question name"
+                        UnreadableQuery
                     );
-                    let req = Message::from_bytes(packet).context("parse request")?;
-                    let question = req.queries.first().context("empty question")?;
+                    let req = Message::from_bytes(packet).context(UnreadableQuery)?;
+                    let question = req.queries.first().context(UnreadableQuery)?;
                     (
                         // The text parse_quick would have built / parse_quick 会拼出的同一段文本
                         Arc::from(crate::proto_utils::name_text(question.name())),
@@ -1615,25 +1592,23 @@ impl Engine {
                 if route.jumps_left == 0 {
                     crate::warn_sparse!("max jump limit reached");
                     // How many jumps a request has left depends on the way it
-                    // came, which no key carries, so this SERVFAIL is its own: a
-                    // waiter on its held entry may have jumps to spare, so the
-                    // entry goes rather than hand it over, and it is not cached
-                    // for a request that enters this pipeline directly.
+                    // came, which no key carries, so this SERVFAIL is its own
+                    // (see `handle_packet_internal`): a waiter on its held entry
+                    // may have jumps to spare, so the entry goes rather than hand
+                    // it over, and it is not cached for a request that enters
+                    // this pipeline directly.
                     // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
-                    // SERVFAIL 只属于它：等在持有条目上的请求可能还有余量，所以放掉
-                    // 条目，不把它交出去；也不缓存给直接进入这个 pipeline 的请求。
-                    drop(route.held_inflight.take());
+                    // SERVFAIL 只属于它（见 `handle_packet_internal`）：等在持有条目上的
+                    // 请求可能还有余量，所以放掉条目，不把它交出去；也不缓存给直接进入
+                    // 这个 pipeline 的请求。
                     info.upstream = Some(Source::Static);
-                    return request.servfail("parse request");
+                    anyhow::bail!("the jump limit was reached");
                 }
                 route.jumps_left -= 1;
                 let Some(p) = cfg.pipeline(pipeline) else {
                     crate::warn_sparse!(pipeline = %pipeline, "jump target pipeline not found");
-                    decision = Decision::Static {
-                        rcode: ResponseCode::ServFail,
-                        answers: Vec::new(),
-                    };
-                    break;
+                    info.upstream = Some(Source::Static);
+                    return Ok(crate::proto_utils::servfail_reply(packet));
                 };
                 info.pipeline = Some(p.id.clone());
                 if let Some((observer, ctx)) = request.observed {
@@ -1672,7 +1647,7 @@ impl Engine {
                 Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
                 Decision::Static { rcode, answers } => {
                     info.upstream = Some(Source::Static);
-                    return phases::handle_static_decision(
+                    return Ok(phases::handle_static_decision(
                         self,
                         &phases::StaticDecisionContext {
                             packet,
@@ -1687,7 +1662,7 @@ impl Engine {
                         },
                         rcode,
                         answers,
-                    );
+                    ));
                 }
                 Decision::Forward {
                     upstream,
@@ -1742,50 +1717,31 @@ impl Engine {
                             decision = Decision::Jump { pipeline };
                             continue 'decision_loop;
                         }
+                        // 这次转发没以应答结束。后台刷新没有要应答的客户端：上游失败了就到此为止，失败原样交回，由
+                        // refresh.rs 记录。客户端请求只剩流控没让等的这一种（见 `UpstreamFailure::withheld`）：上游失败、
+                        // 应答读不了都已经在转发里化成了过期应答、SERVFAIL 或 miss 动作的结果。它是这台设备自己的事，
+                        // 这个请求只给自己回 SERVFAIL，不交给等在它条目上的别的请求（见 `handle_packet_internal`）；
+                        // 也不逐个记警告，拦着的时候每秒可以有几万个
+                        // The forward ended without an answer. A background refresh answers no
+                        // client: once the upstream failed it ends there, the failure coming back
+                        // as it is for refresh.rs to log. For a client request only one is left,
+                        // flow control keeping the query from waiting (see
+                        // `UpstreamFailure::withheld`): an upstream failure or a reply that cannot be
+                        // read has become a stale answer, SERVFAIL or the miss actions' outcome
+                        // within the forward. It is the device's own affair, so the request answers
+                        // SERVFAIL to itself alone and not to the requests waiting on its entry (see
+                        // `handle_packet_internal`); nor is a warning logged for each, held back
+                        // there being tens of thousands a second
                         Err(e) => {
-                            // A background refresh answers no client: it gets the
-                            // failure itself, which refresh.rs logs.
-                            // 后台刷新没有要应答的客户端：失败原样交回，由 refresh.rs 记录。
-                            if background_refresh {
-                                return Err(e);
-                            }
-                            // 这次转发没有以应答结束，以错误结束：上游的应答两种解析都读不了、响应动作要用的请求
-                            // 解析不了、响应动作里的转发被流控拦下，等等；有没有 continue 过都一样（上游失败本身
-                            // 已经在转发里化成了过期应答、SERVFAIL 或 miss 动作的结果）。客户端也得拿到确定的应答，
-                            // 不能没有回音：DNS 客户端把没有回音当超时。回 SERVFAIL，stub 解析器会重试（RFC 1035）
-                            // The forward ended in an error rather than an answer: an upstream reply
-                            // neither parser reads, a request the response actions need that cannot
-                            // be parsed, a response action's forward flow control kept back, and so
-                            // on, whether or not a rule continued before (an upstream failure itself
-                            // has become a stale answer, SERVFAIL or the miss actions' outcome within
-                            // the forward). The client must still get a definitive answer, never
-                            // silence: DNS clients treat a missing reply as a timeout. SERVFAIL lets
-                            // the stub resolver retry (RFC 1035)
-                            // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：规则
-                            // continue 以后还留着的条目现在放下，这个 SERVFAIL 不交给等在上面的别的请求；
-                            // 也不逐个记警告，拦着的时候每秒可以有几万个
-                            // A failure with flow control keeping the query from waiting is the
-                            // device's own affair (see `UpstreamFailure::withheld`): the entry
-                            // still held after a rule continued goes now, and this SERVFAIL is
-                            // not handed to the other requests waiting on it; nor is a warning
-                            // logged for each, held back there being tens of thousands a second
-                            if crate::engine::upstream::UpstreamFailure::was_withheld(&e) {
-                                drop(route.held_inflight.take());
+                            if !background_refresh {
                                 tracing::debug!(
                                     event = "forward_withheld",
                                     error = %e,
                                     rule = %rule_name,
                                     "flow control kept the forward from the upstream, returning SERVFAIL"
                                 );
-                            } else {
-                                crate::warn_sparse!(
-                                    event = "forward_failed",
-                                    error = %e,
-                                    rule = %rule_name,
-                                    "forward failed, returning SERVFAIL"
-                                );
                             }
-                            return request.servfail("parse request for SERVFAIL");
+                            return Err(e);
                         }
                     }
                 }
@@ -1921,6 +1877,23 @@ impl Engine {
     }
 }
 
+/// 读不了的查询：问题名不合规、完整解析也读不了、没有问题（见 `Engine::read_request`）。读得了读不了在读的那一刻定下，
+/// 监听器据此回 FORMERR（见 `Engine::answer_after_fast_path`）；读得了的查询以后怎样都不会再是它
+/// A query that cannot be read: a question name that breaks the rules, the full parse failing
+/// too, no question (see `Engine::read_request`). Whether a query can be read is settled the
+/// moment it is read, and the listener answers FORMERR by it (see
+/// `Engine::answer_after_fast_path`); a query that was read never becomes one later
+#[derive(Debug)]
+pub struct UnreadableQuery;
+
+impl std::fmt::Display for UnreadableQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the query cannot be read")
+    }
+}
+
+impl std::error::Error for UnreadableQuery {}
+
 /// 读出来的请求问题和选中的 pipeline（见 `Engine::read_request`）
 /// The request's question as read, and the pipeline picked (see `Engine::read_request`)
 struct RequestHead {
@@ -2001,12 +1974,6 @@ impl Request<'_> {
     /// the client; nobody, None, for a background refresh
     pub(crate) fn asker(&self) -> Option<std::net::IpAddr> {
         self.refresh.is_none().then(|| self.peer.ip())
-    }
-
-    /// 回这个请求的 SERVFAIL；`context` 是请求读不出来时的错误说明
-    /// Answer this request SERVFAIL; `context` describes the error when it cannot be read
-    fn servfail(&self, context: &'static str) -> anyhow::Result<Bytes> {
-        engine_helpers::build_servfail_response(&Message::from_bytes(self.packet).context(context)?)
     }
 
     /// 去掉刷新要更新的那份应答，它还在的话（见 [`renewing`]）/ Drop the answer the refresh
@@ -3921,99 +3888,6 @@ mod tests {
     }
 
     // ========================================================================
-    // Engine Helper Functions Unit Tests / 引擎辅助函数单元测试
-    // ========================================================================
-
-    #[test]
-    fn test_engine_helpers_build_servfail_response() {
-        // Arrange: Create test request
-        let mut req = Message::new(12345, hickory_proto::op::MessageType::Query, OpCode::Query);
-        req.metadata.recursion_desired = true;
-        let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
-        req.add_query(query);
-
-        // Act: Build ServFail response
-        let result = engine_helpers::build_servfail_response(&req);
-
-        // Assert: Verify response
-        assert!(
-            result.is_ok(),
-            "Should successfully build ServFail response"
-        );
-        let bytes = result.unwrap();
-        assert!(!bytes.is_empty(), "Response should not be empty");
-
-        // Verify it's a valid DNS message
-        let msg = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(msg.metadata.id, 12345, "TXID should be preserved");
-        assert_eq!(
-            msg.metadata.response_code,
-            ResponseCode::ServFail,
-            "Should be ServFail"
-        );
-        assert_eq!(
-            msg.metadata.op_code,
-            OpCode::Query,
-            "Should be Query opcode"
-        );
-        assert!(
-            msg.metadata.recursion_desired,
-            "RD flag should be preserved"
-        );
-        assert_eq!(msg.queries.len(), 1, "Should have one query");
-    }
-
-    #[test]
-    fn test_engine_helpers_build_refused_response() {
-        // Arrange: Create test request
-        let mut req = Message::new(54321, MessageType::Query, OpCode::Query);
-        let query = Query::query(Name::from_str("example.com").unwrap(), RecordType::A);
-        req.add_query(query);
-
-        // Act: Build Refused response
-        let result = engine_helpers::build_refused_response(&req);
-
-        // Assert: Verify response
-        assert!(result.is_ok(), "Should successfully build Refused response");
-        let bytes = result.unwrap();
-        assert!(!bytes.is_empty(), "Response should not be empty");
-
-        // Verify it's a valid DNS message
-        let msg = Message::from_bytes(&bytes).unwrap();
-        assert_eq!(msg.metadata.id, 54321, "TXID should be preserved");
-        assert_eq!(
-            msg.metadata.response_code,
-            ResponseCode::Refused,
-            "Should be Refused"
-        );
-        assert_eq!(msg.queries.len(), 1, "Should have one query");
-    }
-
-    #[test]
-    fn test_engine_helpers_build_servfail_vs_refused_different() {
-        // Arrange: Create test request
-        let mut req = Message::new(11111, MessageType::Query, OpCode::Query);
-        let query = Query::query(Name::from_str("test.com").unwrap(), RecordType::A);
-        req.add_query(query);
-
-        // Act: Build both response types
-        let servfail = engine_helpers::build_servfail_response(&req).unwrap();
-        let refused = engine_helpers::build_refused_response(&req).unwrap();
-
-        // Assert: Should produce different responses
-        assert_ne!(
-            servfail, refused,
-            "ServFail and Refused should be different"
-        );
-
-        // Verify different response codes
-        let sf_msg = Message::from_bytes(&servfail).unwrap();
-        let ref_msg = Message::from_bytes(&refused).unwrap();
-        assert_eq!(sf_msg.metadata.response_code, ResponseCode::ServFail);
-        assert_eq!(ref_msg.metadata.response_code, ResponseCode::Refused);
-    }
-
-    // ========================================================================
     // Original Engine Tests / 原有引擎测试
     // ========================================================================
     use std::net::Ipv4Addr;
@@ -4716,6 +4590,13 @@ mod tests {
         }
     }
 
+    /// 问 `qname` 的 `qtype` 的查询 / A query asking `qname` for `qtype`
+    fn query_packet(qname: &str, qtype: RecordType) -> Vec<u8> {
+        let mut query = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_str(qname).unwrap(), qtype));
+        query.to_vec().unwrap()
+    }
+
     /// 来自 10.0.0.1、问 `qname` 的 `qtype` 的请求，包是 `packet` / A request from 10.0.0.1 asking
     /// `qname` for `qtype`, its packet being `packet`
     fn asked(
@@ -4733,22 +4614,20 @@ mod tests {
         )
     }
 
-    /// 在 `engine` 上为 `request`（解析出来是 `req`）执行 `actions` 的上下文，手上的应答是 `ctx_opt`
-    /// The context for running `actions` on `engine` for `request` (`req` once parsed), with
-    /// `ctx_opt` the answer in hand
+    /// 在 `engine` 上为 `request` 执行 `actions` 的上下文，手上的应答是 `ctx_opt`
+    /// The context for running `actions` on `engine` for `request`, with `ctx_opt` the answer
+    /// in hand
     fn response_actions_context<'a>(
         engine: &'a Engine,
         request: &'a Request<'a>,
         actions: &'a [Action],
         ctx_opt: Option<ResponseContext>,
-        req: &'a Message,
     ) -> ApplyResponseActionsContext<'a> {
         ApplyResponseActionsContext {
             engine,
             request,
             actions,
             ctx_opt,
-            req,
             packet: request.packet,
             pipeline_id: "pipeline",
             rule_name: "rule",
@@ -4762,14 +4641,13 @@ mod tests {
         // Arrange: Build test engine and response context
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Allow];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Allow action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx));
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed");
@@ -4797,23 +4675,17 @@ mod tests {
     #[tokio::test]
     async fn response_actions_stop_at_allow() {
         let engine = build_test_engine();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [
             Action::Allow,
             Action::StaticIpResponse {
                 ip: "192.0.2.9".to_string(),
             },
         ];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(
-            &engine,
-            &request,
-            &actions,
-            Some(build_response_context()),
-            &req,
-        );
+        let ctx =
+            response_actions_context(&engine, &request, &actions, Some(build_response_context()));
         match apply_response_actions(ctx).await.expect("response actions") {
             ResponseActionResult::Upstream { ctx, .. } => {
                 assert_eq!(ctx.raw.as_ref(), b"resp", "the upstream's answer goes out");
@@ -4827,14 +4699,13 @@ mod tests {
         // Arrange: Build test engine, response context, and Continue action
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Continue];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Continue action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx));
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions continue should succeed");
@@ -4856,14 +4727,13 @@ mod tests {
         // Arrange: Build test engine and response context with non-matching response matcher
         let engine = build_test_engine();
         let ctx = build_response_context();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Log { level: None }, Action::Allow];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Allow action and non-matching matcher
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx), &req);
+        let ctx = response_actions_context(&engine, &request, &actions, Some(ctx));
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions allow should succeed even on miss");
@@ -4886,14 +4756,13 @@ mod tests {
     async fn response_actions_deny_returns_refused() {
         // Arrange: Build test engine with Deny action
         let engine = build_test_engine();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::Deny];
-        let packet = [0u8];
+        let packet = query_packet("example.com", RecordType::A);
 
         // Act: Apply response actions with Deny action
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, None, &req);
+        let ctx = response_actions_context(&engine, &request, &actions, None);
         let result = apply_response_actions(ctx)
             .await
             .expect("response actions deny should return static");
@@ -4915,19 +4784,19 @@ mod tests {
     async fn response_actions_static_ip_filters_answers_by_query_type() {
         // Arrange: Build test engine with a multi-address static IP response action
         let engine = build_test_engine();
-        let req = Message::new(0, MessageType::Query, OpCode::Query);
         let actions = [Action::StaticIpResponse {
             ip: "192.0.2.1,2001:db8::1,192.0.2.2".to_string(),
         }];
-        let packet = [0u8];
-
         let run = async |qtype: RecordType| {
-            let asked = asked(&engine, "example.com", qtype, &packet);
+            let asked = asked(
+                &engine,
+                "example.com",
+                qtype,
+                &query_packet("example.com", qtype),
+            );
             let request = asked.request();
-            apply_response_actions(response_actions_context(
-                &engine, &request, &actions, None, &req,
-            ))
-            .await
+            apply_response_actions(response_actions_context(&engine, &request, &actions, None))
+                .await
         };
         let answer_ips = |resp: &Message| -> Vec<IpAddr> {
             resp.answers
@@ -4983,19 +4852,14 @@ mod tests {
     #[tokio::test]
     async fn response_actions_static_cname_returns_configured_alias() {
         let engine = build_test_engine();
-        let mut req = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
-        req.add_query(Query::query(
-            Name::from_str("alias.example").unwrap(),
-            RecordType::A,
-        ));
         let actions = [Action::StaticCnameResponse {
             target: "origin.example.".to_string(),
             ttl: Some(60),
         }];
-        let packet = req.to_vec().unwrap();
+        let packet = query_packet("alias.example", RecordType::A);
         let asked = asked(&engine, "alias.example", RecordType::A, &packet);
         let request = asked.request();
-        let ctx = response_actions_context(&engine, &request, &actions, None, &req);
+        let ctx = response_actions_context(&engine, &request, &actions, None);
 
         match apply_response_actions(ctx).await.expect("static cname") {
             ResponseActionResult::Static { bytes, rcode, .. } => {
@@ -5467,11 +5331,20 @@ mod tests {
                 crate::engine::static_ips(ips).unwrap()
             };
             let old = || {
-                build_fast_static_response(q.tx_id, text, q.qtype, q.qclass, rcode, &records)
-                    .map(|reply| {
-                        crate::proto_utils::reply_as_asked(fast_client_reply(reply, subnet), packet)
-                    })
-                    .expect("what can be written can be built")
+                let built = super::super::response::hickory_static_reply(
+                    packet,
+                    text,
+                    qtype,
+                    DNSClass::from(q.qclass),
+                    rcode,
+                    &records,
+                )
+                .expect("what can be written can be built");
+                shaped_static_reply(
+                    crate::proto_utils::reply_as_asked(built, packet),
+                    packet,
+                    subnet,
+                )
             };
             for written in [
                 write_static_reply(
