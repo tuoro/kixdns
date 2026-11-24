@@ -74,10 +74,10 @@ pub(crate) fn domain_value(value: &str) -> Arc<str> {
 }
 
 /// 规则写的 GeoSite 标签，转成小写存：数据文件里的标签读进来就转小写（见 `geosite`），在这里转一次，每个查询就不用
-/// 再转，写法不同的同一个标签也只算一个（见 `extract_geosite_tags_from_config`），不会各读一遍数据、各建一份匹配器
+/// 再转，写法不同的同一个标签也只算一个（见 [`RuntimePipelineConfig::geosite_tags`]），不会各读一遍数据、各建一份匹配器
 /// A GeoSite tag a rule writes, kept lowercased: the tags of data files are lowercased as they
 /// are read (see `geosite`), so lowering it once here spares every query doing it, and one tag
-/// written in different cases counts once (see `extract_geosite_tags_from_config`) instead of
+/// written in different cases counts once (see [`RuntimePipelineConfig::geosite_tags`]) instead of
 /// being read from the data and given matchers once for each spelling
 pub(crate) fn geosite_tag(value: &str) -> Arc<str> {
     Arc::from(value.to_ascii_lowercase())
@@ -609,8 +609,8 @@ impl RuntimePipelineConfig {
         };
         let geo = config::geo_tags_without_data(
             &runtime.settings,
-            crate::engine::utils::extract_geosite_tags_from_config(&runtime),
-            &crate::engine::utils::extract_geoip_tags_from_config(&runtime),
+            &runtime.geosite_tags(),
+            &runtime.geoip_tags(),
         );
         runtime.warnings.extend(geo);
         Ok(runtime)
@@ -631,6 +631,24 @@ impl RuntimePipelineConfig {
         std::time::Duration::from_millis(self.settings.upstream_timeout_ms)
     }
 
+    /// 规则（连同 pipeline_select 和回答检查）用到的 GeoSite 标签（已经是小写），排好序、去掉重复：数据文件只读这些标签
+    /// The GeoSite tags rules use (pipeline_select and answer checks included), lowercase
+    /// already, sorted and deduplicated: data files are read for these tags alone
+    pub fn geosite_tags(&self) -> Vec<String> {
+        used_tags(
+            self.geo_tags()
+                .filter_map(GeoTags::site)
+                .map(std::slice::from_ref),
+        )
+    }
+
+    /// 规则按 GeoIP 匹配的国家代码和命名标签（已经是大写），排好序、去掉重复；`geoip_private` 不需要 GeoIP 数据，不算在内
+    /// The country codes and named tags rules match on GeoIP (uppercase already), sorted and
+    /// deduplicated; `geoip_private` needs no GeoIP data and does not count
+    pub fn geoip_tags(&self) -> Vec<String> {
+        used_tags(self.geo_tags().filter_map(GeoTags::ip))
+    }
+
     /// 配置里每个匹配器读的 Geo 数据：pipeline_select 的、规则的、回答检查的 / The Geo data every
     /// matcher of the configuration reads: pipeline_select's, the rules', the answer checks'
     pub fn geo_tags(&self) -> impl Iterator<Item = GeoTags<'_>> {
@@ -649,6 +667,14 @@ impl RuntimePipelineConfig {
             .filter_map(|m| m.matcher.geo_tags());
         select.chain(request).chain(response)
     }
+}
+
+/// 几组标签合起来，排好序、去掉重复 / Groups of tags put together, sorted and deduplicated
+fn used_tags<'a>(groups: impl Iterator<Item = &'a [Arc<str>]>) -> Vec<String> {
+    let mut tags: Vec<String> = groups.flatten().map(|tag| tag.to_string()).collect();
+    tags.sort_unstable();
+    tags.dedup();
+    tags
 }
 
 /// 规则级的运算符：每个匹配器都还是默认的 and 时，由它替所有匹配器定运算符
@@ -928,6 +954,21 @@ fn parse_dns_class(v: &str) -> anyhow::Result<DNSClass> {
     Ok(parsed)
 }
 
+/// 配置里写的 RCODE（不分大小写）：NOERROR、FORMERR、SERVFAIL、NXDOMAIN、NOTIMP、REFUSED，别的为 None
+/// An RCODE as a configuration writes it (in any case): NOERROR, FORMERR, SERVFAIL, NXDOMAIN,
+/// NOTIMP or REFUSED, None for anything else
+pub(crate) fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
+    match rcode.to_ascii_uppercase().as_str() {
+        "NOERROR" => Some(ResponseCode::NoError),
+        "FORMERR" => Some(ResponseCode::FormErr),
+        "SERVFAIL" => Some(ResponseCode::ServFail),
+        "NXDOMAIN" => Some(ResponseCode::NXDomain),
+        "NOTIMP" => Some(ResponseCode::NotImp),
+        "REFUSED" => Some(ResponseCode::Refused),
+        _ => None,
+    }
+}
+
 /// `qtype`、`response_type` 写的类型：hickory 认得的名字（HTTPS、SVCB、CAA、ANY……），或者 RFC 3597 的 `TYPEnnn`。以前只认
 /// 十种，「HTTPS 查询回 NODATA」这样的规则写不出来，整份配置被拒
 /// The type a `qtype` or `response_type` writes: a name hickory knows (HTTPS, SVCB, CAA, ANY…),
@@ -1165,6 +1206,38 @@ mod tests {
     /// 按 JSON 建运行时配置 / A runtime configuration built from JSON
     fn runtime_of(raw: serde_json::Value) -> anyhow::Result<RuntimePipelineConfig> {
         RuntimePipelineConfig::from_config(serde_json::from_value(raw).expect("parse config"))
+    }
+
+    /// 规则按 GeoIP 匹配的标签算上 pipeline_select 的，`geoip_private` 不读 GeoIP 数据，不算
+    /// The tags rules match on GeoIP count pipeline_select's, and `geoip_private`, reading no
+    /// GeoIP data, does not count
+    #[test]
+    fn geoip_tags_cover_selectors_but_not_private_matchers() {
+        let selector = runtime_of(serde_json::json!({
+            "pipeline_select": [{
+                "pipeline": "default",
+                "matchers": [{ "type": "geoip_country", "country_codes": ["CN"] }]
+            }],
+            "pipelines": [{ "id": "default" }]
+        }))
+        .unwrap();
+        assert_eq!(selector.geoip_tags(), ["CN"]);
+
+        let private_only = runtime_of(serde_json::json!({
+            "pipelines": [{
+                "id": "default",
+                "rules": [{
+                    "name": "private-only",
+                    "matchers": [{ "type": "geoip_private", "expect": true }],
+                    "response_matchers": [{
+                        "type": "response_answer_ip_geoip_private",
+                        "expect": true
+                    }]
+                }]
+            }]
+        }))
+        .unwrap();
+        assert!(private_only.geoip_tags().is_empty());
     }
 
     /// 只有一条规则、规则只有 `matchers` 的 pipeline / A pipeline of one rule with `matchers`

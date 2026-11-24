@@ -28,11 +28,17 @@ pub enum RuntimeResponseMatcher {
     ResponseUpstreamIp {
         nets: Vec<IpNet>,
     },
-    /// Match Answer A/AAAA addresses and HTTPS/SVCB IP hints.
+    /// 应答里有没有落在这些网段里的地址：先看 Answer 段，再看 Additional 段的，A/AAAA 记录和 HTTPS/SVCB 的地址提示都算
+    /// （见 `matcher_helpers::any_ip_matches`）
+    /// Whether any address in the answer falls in these networks: the Answer section's, then
+    /// the Additional section's, A/AAAA records and HTTPS/SVCB address hints alike (see
+    /// `matcher_helpers::any_ip_matches`)
     ResponseAnswerIp {
         nets: Vec<IpNet>,
     },
-    /// 匹配 Answer 中第一个记录的记录类型 / Match the record type of the first record in the Answer
+    /// Answer 段第一条记录的类型，没有 Answer 时按查询的类型判断（NODATA、NXDOMAIN 也就照问的类型算）/ The type of the
+    /// first record in the Answer section, the query's type without any Answer (so NODATA and
+    /// NXDOMAIN count as the type asked)
     ResponseType {
         value: RecordType,
     },
@@ -141,7 +147,7 @@ impl RuntimeResponseMatcher {
             // configuration is read (see `config::problems`)
             config::ResponseMatcher::ResponseRcode { value } => {
                 RuntimeResponseMatcher::ResponseRcode {
-                    value: crate::engine::utils::parse_rcode(&value),
+                    value: super::parse_rcode(&value),
                 }
             }
             config::ResponseMatcher::ResponseQclass { value } => {

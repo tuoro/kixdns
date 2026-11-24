@@ -7,12 +7,12 @@ use hickory_proto::rr::{DNSClass, RecordType};
 use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
-use crate::engine::utils::parse_rcode;
 use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::geoip::GeoIpManager;
 use crate::matcher::geosite::GeoSiteManager;
 use crate::matcher::{
     GeoManagers, RequestFacts, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
+    parse_rcode,
 };
 use parking_lot::RwLock;
 
@@ -518,12 +518,7 @@ impl Engine {
                             });
                         }
                         Action::Log { level } => {
-                            super::matcher_adapter::log_match(
-                                level.as_deref(),
-                                &rule.name,
-                                qname,
-                                client_ip,
-                            );
+                            super::rules::log_match(level.as_deref(), &rule.name, qname, client_ip);
                             *logged = true;
                         }
                         Action::StaticTxtResponse { text, ttl } => {

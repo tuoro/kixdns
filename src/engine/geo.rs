@@ -14,7 +14,6 @@ use tracing::{error, info, warn};
 
 use super::Engine;
 use super::types::EngineInner;
-use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
 use crate::matcher::geoip::{FileStamp, GeoIpFingerprints, GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, Swapped, parsed_provides_any};
 use crate::matcher::{GeoData, RuntimePipelineConfig};
@@ -26,17 +25,16 @@ use rustc_hash::FxHashMap;
 #[derive(Debug, PartialEq, Eq)]
 struct GeoSiteSpec {
     paths: Vec<String>,
-    /// 规则用到的标签，排好序以便比较 / The tags rules use, sorted so specs compare
+    /// 规则用到的标签，排好序（见 `RuntimePipelineConfig::geosite_tags`），可以比较 / The tags
+    /// rules use, sorted (see `RuntimePipelineConfig::geosite_tags`), so specs compare
     tags: Vec<String>,
 }
 
 impl GeoSiteSpec {
     fn of(cfg: &RuntimePipelineConfig) -> Self {
-        let mut tags = extract_geosite_tags_from_config(cfg);
-        tags.sort_unstable();
         Self {
             paths: cfg.settings.geosite_data_paths.clone(),
-            tags,
+            tags: cfg.geosite_tags(),
         }
     }
 }
@@ -57,7 +55,7 @@ struct GeoIpSpec {
 
 impl GeoIpSpec {
     fn of(cfg: &RuntimePipelineConfig) -> Self {
-        let tags = extract_geoip_tags_from_config(cfg);
+        let tags = cfg.geoip_tags();
         let wants_countries = tags.iter().any(|tag| is_country_tag(tag));
         Self {
             db_path: cfg
@@ -482,7 +480,7 @@ fn load_geosite(
     let mut problems = DataStatus::default();
     let seen: Vec<Unwatched> = files.iter().map(Unwatched::now).collect();
     let (pending, watched) = pending_watch("GeoSite data files", &files, &mut problems);
-    let mut fresh = GeoSiteManager::new();
+    let mut fresh = GeoSiteManager::default();
     // 读出来没有一个规则用到的标签的文件（读不了的也算）/ The files whose read gave none of the
     // tags rules use (unreadable ones included)
     let mut gave_nothing = Vec::new();
@@ -893,7 +891,7 @@ mod tests {
             |net: &str| format!(r#"{{"entries":[{{"country_code":"LAN","ips":["{net}"]}}]}}"#);
         std::fs::write(&site, json("ads", "old.test")).unwrap();
         std::fs::write(&ip, ip_json("192.0.2.0/24")).unwrap();
-        let geosite = Arc::new(RwLock::new(GeoSiteManager::new()));
+        let geosite = Arc::new(RwLock::new(GeoSiteManager::default()));
         let parsed = GeoSiteManager::parse_file(&site, &site_tags).unwrap();
         geosite.write().apply_source(&site, parsed);
         let geoip = Arc::new(RwLock::new(GeoIpManager::default()));
@@ -981,7 +979,7 @@ mod tests {
         std::fs::write(&ip, ip_json("LAN")).unwrap();
         let site_tags = vec!["ads".to_string()];
         let ip_tags = vec!["LAN".to_string()];
-        let geosite = Arc::new(RwLock::new(GeoSiteManager::new()));
+        let geosite = Arc::new(RwLock::new(GeoSiteManager::default()));
         let parsed = GeoSiteManager::parse_file(&site, &site_tags).unwrap();
         geosite.write().apply_source(&site, parsed);
         let geoip = Arc::new(RwLock::new(GeoIpManager::default()));
@@ -1050,7 +1048,7 @@ mod tests {
             r#"{"entries":[{"tag":"shared","domains":["domain:last.test"]},{"tag":"only","domains":["domain:only.test"]}]}"#,
         )
         .unwrap();
-        let manager = RwLock::new(GeoSiteManager::new());
+        let manager = RwLock::new(GeoSiteManager::default());
         for path in [&first, &last] {
             let parsed = GeoSiteManager::parse_file(path, &tags).unwrap();
             manager.write().apply_source(path, parsed);

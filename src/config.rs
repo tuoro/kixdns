@@ -1411,12 +1411,10 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
 /// lacked a tag, and with no data file configured nothing was said at all
 pub(crate) fn geo_tags_without_data(
     settings: &GlobalSettings,
-    mut geosite: Vec<String>,
+    geosite: &[String],
     geoip: &[String],
 ) -> Vec<String> {
     let mut found = Vec::new();
-    geosite.sort_unstable();
-    geosite.dedup();
     if settings.geosite_data_paths.is_empty() && !geosite.is_empty() {
         found.push(format!(
             "GeoSite tags {} have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does",
@@ -1727,7 +1725,7 @@ impl AnyMatcher<'_> {
         match self {
             Self::Response(ResponseMatcher::ResponseRcode { value })
                 if !value.eq_ignore_ascii_case("OTHER")
-                    && crate::engine::utils::parse_rcode(value).is_none() =>
+                    && crate::matcher::parse_rcode(value).is_none() =>
             {
                 Some(format!(
                     "response_rcode \"{value}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, OTHER"
@@ -1973,9 +1971,7 @@ fn rule_problems(
                     }
                 }
             }
-            Action::StaticResponse { rcode }
-                if crate::engine::utils::parse_rcode(rcode).is_none() =>
-            {
+            Action::StaticResponse { rcode } if crate::matcher::parse_rcode(rcode).is_none() => {
                 report(format!(
                     "rcode \"{rcode}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED"
                 ));
