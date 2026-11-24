@@ -16,14 +16,16 @@
 //! slot kept apart by how the rules judge the requester.
 
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::BinDecodable;
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
 use crate::engine::test_support::{
-    answering_rcode, answering_upstream, ask, engine_from, first_a, peer,
+    answering_rcode, answering_upstream, answering_upstream_after, ask, engine_from, first_a, peer,
 };
 
 /// 上游的回答 / The upstream's answer
@@ -84,20 +86,42 @@ fn cached_ttls(engine: &Engine) -> Vec<u32> {
         .collect()
 }
 
+/// 应答里每条答案记录的 TTL / The TTL of every answer record in a reply
+fn record_ttls(reply: &[u8]) -> Vec<u32> {
+    Message::from_bytes(reply)
+        .expect("parse reply")
+        .answers
+        .iter()
+        .map(|record| record.ttl)
+        .collect()
+}
+
+/// 缓存里每份应答的答案记录 TTL / The answer record TTLs of every answer in the cache
+fn cached_record_ttls(engine: &Engine) -> Vec<Vec<u32>> {
+    engine
+        .cache
+        .values()
+        .iter()
+        .flat_map(|slot| slot.entries().map(|entry| record_ttls(&entry.bytes)))
+        .collect()
+}
+
 /// 带 TTL 120 的静态 CNAME、带 TTL 300 的静态地址、不带记录的 deny，依据不同 TTL 的上游回答、在不同的设置下缓存多久：
 /// 回答检查的动作给出的、回答检查 continue 或跳转以后的规则给出的都一样。带记录的取自己的 TTL 和那份回答在缓存里能留的
-/// 时间中短的那个，不带记录的就按那份回答的；那份回答不进缓存（TTL 为 0）时据它给的也不缓存。以前不看那份回答：静态地址
-/// 写死的 300 秒比回答的 60 秒长，规则早该给别的了还在用；deny 按 min_ttl，默认为 0 时不缓存，防重绑定的 deny 每次都要
-/// 再问一遍上游
+/// 时间中短的那个，交出去的记录也是这个 TTL；不带记录的就按那份回答的；那份回答不进缓存（TTL 为 0）时据它给的也不缓存，
+/// 记录的 TTL 交出去也是 0。以前不看那份回答：静态地址写死的 300 秒比回答的 60 秒长，规则早该给别的了还在用；deny 按
+/// min_ttl，默认为 0 时不缓存，防重绑定的 deny 每次都要再问一遍上游。后来条目照那份回答缓存了，记录却照原样交出 300 秒
 /// How long a static CNAME with TTL 120, a static address with TTL 300 and a deny with no
 /// records are cached, going by upstream answers of various TTLs under various settings:
 /// given by an answer check's actions, or by the rules after an answer check continued or
 /// jumped, alike. One with records takes the shorter of its own TTL and how long that answer
-/// may stay in the cache, one without takes that answer's; with that answer kept out of the
-/// cache (TTL 0) nothing given by it is cached either. It used to ignore that answer: the
-/// static address's hard-coded 300 seconds outlasted an answer's 60, in use long after the
-/// rules would have given something else; a deny went by min_ttl, and with the default 0 was
-/// not cached, a deny against rebinding asking the upstream again every time
+/// may stay in the cache, its records going out with that TTL too; one without takes that
+/// answer's; with that answer kept out of the cache (TTL 0) nothing given by it is cached
+/// either, its records going out with a TTL of 0. It used to ignore that answer: the static
+/// address's hard-coded 300 seconds outlasted an answer's 60, in use long after the rules
+/// would have given something else; a deny went by min_ttl, and with the default 0 was not
+/// cached, a deny against rebinding asking the upstream again every time. The entry then went
+/// by that answer while the records still went out with their 300 seconds
 #[tokio::test]
 async fn a_static_answer_on_an_upstream_answer_is_cached_no_longer_than_that_answer() {
     let cname = json!({ "type": "static_cname_response", "target": "target.test.", "ttl": 120 });
@@ -141,14 +165,17 @@ async fn a_static_answer_on_an_upstream_answer_is_cached_no_longer_than_that_ans
                 ]),
             ),
         ];
+        let records = if action == &deny {
+            Vec::new()
+        } else {
+            vec![cached.unwrap_or(0)]
+        };
         for (path, pipelines) in paths {
             let engine = engine_with(&settings, pipelines);
-            ask(&engine, &query(), peer()).await;
-            assert_eq!(
-                cached_ttls(&engine),
-                Vec::from_iter(cached),
-                "{path}: {action} on an answer of TTL {answer_ttl} with {settings}"
-            );
+            let reply = ask(&engine, &query(), peer()).await;
+            let case = format!("{path}: {action} on an answer of TTL {answer_ttl} with {settings}");
+            assert_eq!(cached_ttls(&engine), Vec::from_iter(cached), "{case}");
+            assert_eq!(record_ttls(&reply), records, "{case}");
         }
     }
 }
@@ -262,6 +289,88 @@ async fn an_answer_forwarded_after_a_check_is_cached_no_longer_than_the_checked_
                 "{path}: an answer of TTL {forwarded_ttl} after a check on one of {checked_ttl}"
             );
         }
+    }
+}
+
+/// 回答检查以后交出去的应答，记录 TTL 也不比回答检查据的那份上游回答在缓存里留得久：客户端、同时等着它的请求拿到的，和缓存里
+/// 存的、之后命中缓存交出的是同一份，客户端留它的时间和缓存一样长。回答检查的动作转发的、continue 以后的规则转发的、跳去的
+/// pipeline 转发的、规则给的静态应答都一样。以前只封了条目的 TTL，记录照原样交出：据 60 秒的回答转发拿到 3600 秒的，客户端
+/// 和等待者拿 3600，命中缓存交出 3599，条目却 60 秒就过期
+/// An answer going out after an answer check carries no record TTL longer than the upstream
+/// answer the check went by may stay in the cache: the client and the requests waiting on it
+/// get the copy the cache keeps and later serves, the client keeping it as long as the cache
+/// does. Forwarded by the check's actions, by a rule after its continue or by the pipeline it
+/// jumps to, or a static answer of the rules, alike. Only the entry's TTL used to be bounded
+/// and the records went out as they were: forwarding to an answer of 3600 seconds on one of
+/// 60, the client and the waiters got 3600 and a cache hit 3599, while the entry expired at 60
+#[tokio::test]
+async fn an_answer_after_a_check_goes_out_with_ttls_no_longer_than_the_checked_answer() {
+    // 回答晚一点到，同时问的第二个请求等在第一个登记的条目上 / The answer comes a little late, so the
+    // second request asking at the same time waits on the entry the first registered
+    let checked_upstream =
+        answering_upstream_after(UPSTREAM_ANSWER, 60, Duration::from_millis(100)).await;
+    let checked_at = &checked_upstream.address;
+    let then = answering_upstream(FORWARDED, 3600).await.address;
+    let forward = json!([{ "type": "forward", "upstream": then }]);
+    let address = json!([{ "type": "static_ip_response", "ip": STATIC.to_string() }]);
+    let paths = [
+        (
+            "the check's own forward",
+            json!([{ "id": "main", "rules": [checked(checked_at, forward.clone())] }]),
+            FORWARDED,
+        ),
+        (
+            "a rule after a continue",
+            json!([{ "id": "main", "rules": [
+                checked(checked_at, json!([{ "type": "continue" }])),
+                rule("forward", any(), forward.clone()),
+            ]}]),
+            FORWARDED,
+        ),
+        (
+            "a pipeline jumped to",
+            json!([
+                { "id": "main", "rules": [checked(
+                    checked_at,
+                    json!([{ "type": "jump_to_pipeline", "pipeline": "then" }]),
+                )]},
+                { "id": "then", "rules": [rule("forward", any(), forward.clone())] },
+            ]),
+            FORWARDED,
+        ),
+        (
+            "a static answer after a continue",
+            json!([{ "id": "main", "rules": [
+                checked(checked_at, json!([{ "type": "continue" }])),
+                rule("static", any(), address.clone()),
+            ]}]),
+            STATIC,
+        ),
+    ];
+    for (path, pipelines, answer) in paths {
+        // UDP 过了预算的三分之一再发一次（`upstream::hedge_timeout`）：预算留够，晚到的回答之前不重发
+        // UDP sends again past a third of the budget (`upstream::hedge_timeout`): with budget to
+        // spare, nothing is sent again before the late answer
+        let engine = engine_with(&json!({ "upstream_timeout_ms": 3000 }), pipelines);
+        let asked_before = checked_upstream.queries();
+        let packet = query();
+        let (one, two) = tokio::join!(ask(&engine, &packet, peer()), ask(&engine, &packet, peer()));
+        assert_eq!(
+            checked_upstream.queries(),
+            asked_before + 1,
+            "{path}: the second request waited on the first"
+        );
+        for reply in [&one, &two] {
+            assert_eq!(first_a(reply), Some(answer), "{path}");
+            assert_eq!(record_ttls(reply), [60], "{path}");
+        }
+        assert_eq!(cached_record_ttls(&engine), [[60]], "{path}");
+        let hit = ask(&engine, &query(), peer()).await;
+        assert!(
+            record_ttls(&hit).iter().all(|&ttl| ttl <= 60),
+            "{path}: {:?} from the cache",
+            record_ttls(&hit)
+        );
     }
 }
 
