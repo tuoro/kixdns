@@ -136,25 +136,28 @@ impl Drop for UdpSocketState {
 /// new connections; a socket per query also cost a miss a quarter more CPU
 const UDP_SOCKET_QUERIES: u32 = 64;
 
-/// 上游 UDP socket 接收出错以后，歇多久再接着收；None 是马上接着收。
+/// 池里第 `idx` 个 UDP socket 接收出错：记下来，给出歇多久再接着收，None 是马上接着收。
 ///
-/// Windows 上没有连接的 UDP socket 收到 ICMP 端口不可达时，`recv_from` 会报 ConnectionReset
-/// （WSAECONNRESET）。这只说明之前发出的某个查询没人收，socket 本身好好的；歇着只会耽误这个 socket
-/// 上别的查询的应答，所以马上接着收。别的错误照旧歇 100 ms，免得反复出错时空转。
+/// Windows 上没有连接的 UDP socket 收到 ICMP 端口不可达时，`recv_from` 会报 ConnectionReset（WSAECONNRESET）。这只说明之前
+/// 发出的某个查询没人收，socket 本身好好的，那个查询自己会超时、重发：只记 debug，马上接着收，歇着只会耽误这个 socket 上
+/// 别的查询的应答。别的错误记 warn（同一处一阵子只记一条），歇 100 ms，免得反复出错时空转
 ///
-/// How long to pause after a receive error on an upstream UDP socket before reading on;
-/// None reads on at once.
+/// A receive error on socket `idx` of the pool: it is logged, and how long to pause before reading
+/// on is given, None reading on at once.
 ///
 /// On Windows, an unconnected UDP socket that gets an ICMP port unreachable reports
-/// ConnectionReset (WSAECONNRESET) from `recv_from`. That only says some earlier query
-/// reached nobody; the socket itself is fine, and pausing would only delay the answers to
-/// the other queries on it, so it reads on at once. Any other error still pauses 100 ms,
-/// so a repeating one does not spin.
-fn recv_error_pause(error: &std::io::Error) -> Option<Duration> {
-    match error.kind() {
-        std::io::ErrorKind::ConnectionReset => None,
-        _ => Some(Duration::from_millis(100)),
+/// ConnectionReset (WSAECONNRESET) from `recv_from`. That only says some earlier query reached
+/// nobody; the socket itself is fine and that query times out and is sent again on its own: it
+/// is logged at debug and reading goes on at once, a pause only delaying the answers to the other
+/// queries on the socket. Any other error logs a warn (one in a while from this place) and pauses
+/// 100 ms, so a repeating one does not spin
+fn after_recv_error(idx: usize, error: &std::io::Error) -> Option<Duration> {
+    if error.kind() == std::io::ErrorKind::ConnectionReset {
+        debug!(socket_idx = idx, error = %error, "UDP pool socket told a query reached nobody");
+        return None;
     }
+    crate::warn_sparse!(socket_idx = idx, error = %error, "UDP pool recv error, pausing");
+    Some(Duration::from_millis(100))
 }
 
 thread_local! {
@@ -326,9 +329,8 @@ impl UdpClient {
                 match received {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        tracing::error!("UDP pool recv error: {}", e);
-                        if let Some(pause) = recv_error_pause(&e) {
+                    Err(error) => {
+                        if let Some(pause) = after_recv_error(idx, &error) {
                             tokio::time::sleep(pause).await;
                         }
                     }
@@ -5951,27 +5953,37 @@ mod tests {
         assert!(check_upstream_address("dns.example:853", Transport::Doq).is_ok());
     }
 
-    /// 接收报 ConnectionReset（Windows 上 ICMP 端口不可达）时马上接着收，别的错误照旧歇 100 ms
-    /// ConnectionReset from a receive (an ICMP port unreachable on Windows) reads on at once;
-    /// any other error still pauses 100 ms
+    /// 接收报 ConnectionReset（Windows 上 ICMP 端口不可达）时马上接着收，不记 warn 以上的日志：每个没人收的查询都有一个，记
+    /// 下来就是每个查询一条。别的错误记 warn（`warn_sparse`，单元测试里每条都记），歇 100 ms
+    /// ConnectionReset from a receive (an ICMP port unreachable on Windows) reads on at once and
+    /// logs nothing at warn or above: every query reaching nobody brings one, which logged would be
+    /// a line a query. Any other error logs a warn (`warn_sparse`, every one logged in unit tests)
+    /// and pauses 100 ms
     #[test]
-    fn a_connection_reset_on_receive_reads_on_at_once() {
+    fn a_connection_reset_on_receive_reads_on_at_once_and_quietly() {
         use std::io::{Error, ErrorKind};
-        assert_eq!(
-            recv_error_pause(&Error::from(ErrorKind::ConnectionReset)),
-            None
-        );
+        let (warnings, _capturing) = crate::engine::test_support::Warnings::capture();
+        for _ in 0..3 {
+            assert_eq!(
+                after_recv_error(0, &Error::from(ErrorKind::ConnectionReset)),
+                None
+            );
+        }
+        assert_eq!(warnings.lines(), Vec::<String>::new());
         for kind in [
             ErrorKind::Other,
             ErrorKind::ConnectionRefused,
             ErrorKind::OutOfMemory,
         ] {
             assert_eq!(
-                recv_error_pause(&Error::from(kind)),
+                after_recv_error(0, &Error::from(kind)),
                 Some(Duration::from_millis(100)),
                 "{kind:?}"
             );
         }
+        let lines = warnings.lines();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines.iter().all(|line| line.contains("WARN")), "{lines:?}");
     }
 
     /// 预热建的连接池和发送时现建的一样大，每个客户端各有自己的连接位
