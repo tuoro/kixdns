@@ -1144,15 +1144,15 @@ impl Engine {
     }
 
     /// 读好的请求 `head` 照配置 `state` 作答（见 [`Self::decide`]）：交回得出的结果，和还没收尾的记录，由入口照它交回去的样子
-    /// 收尾。请求从选 pipeline 到响应动作、写缓存都用这同一份配置：选中它的那份（快速路径选的、刚读的），后台刷新是写下它
-    /// 要更新的条目的那份。`refresh` 是后台刷新要更新的条目，有它就是后台刷新（见 [`Self::handle_refresh`]），它的结果在这里
+    /// 收尾。请求从选 pipeline 到响应动作、写缓存都用这同一份配置：选中它的那份（快速路径选的、刚读的），后台刷新是发起它的
+    /// 那次命中 load 的快照。`refresh` 是后台刷新要更新的条目，有它就是后台刷新（见 [`Self::handle_refresh`]），它的结果在这里
     /// 定下（见 [`renewing`]）
     /// Answer the request `head` as read under the configuration `state` (see
     /// [`Self::decide`]): what it came to goes back with the records not yet finished, for the
     /// entry to finish by what it hands back. A request uses this one configuration from picking
     /// its pipeline through response actions and cache writes: the one that picked it (on the
-    /// fast path, or just read), for a background refresh the one its renewed entry was written
-    /// under. `refresh` is the entry a background refresh renews, the request being one exactly
+    /// fast path, or just read), for a background refresh the snapshot the hit that started it
+    /// loaded. `refresh` is the entry a background refresh renews, the request being one exactly
     /// when it is given (see [`Self::handle_refresh`]), and what it comes to is settled here
     /// (see [`renewing`])
     async fn answer<'a>(
@@ -2366,7 +2366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_snapshot_cannot_write_into_the_active_generation_after_reload() {
+    async fn a_request_snapshot_writes_only_into_its_own_namespace_after_reload() {
         let upstream = answering_upstream("192.0.2.9".parse().unwrap(), 300)
             .await
             .address;
@@ -2419,19 +2419,22 @@ mod tests {
         assert!(engine.cached(old_key).is_some());
         assert!(
             engine.cached(new_key).is_none(),
-            "work from the old snapshot must not populate the active generation"
+            "work from the old snapshot must not populate the new configuration's namespace"
         );
     }
 
     /// 刷新照客户端请求的样子把应答写在它这一路的键下，查这个问题的请求就在那里找到它，不论被刷新的条目在哪个槽位。这里
-    /// 条目在请求阶段跳转的目标下，而刷新这次没有跳过去（请求阶段的规则据实时更新的 Geo 数据改了主意，比如）。以前刷新把
-    /// 槽位改成条目的：应答连同入口 pipeline 的问题落在目标的槽位里，查这个问题的请求谁也不去那里找
+    /// 条目在请求阶段跳转的目标下，而刷新这次没有跳过去。同一份配置快照下两者本来走同一条路，这里把它们分开，验的是兜底：
+    /// 刷新只认自己这一路的键，不靠被刷新条目的槽位。以前刷新把槽位改成条目的：应答连同入口 pipeline 的问题落在目标的槽位
+    /// 里，查这个问题的请求谁也不去那里找
     /// A refresh writes its answer under the keys of the way it goes, as a client request does,
     /// and a request asking the question finds it there, whichever slot the renewed entry is in.
     /// Here the entry is under the target of a request-phase jump, which the refresh does not
-    /// make this time (the request-phase rules changing their mind on live Geo data, say). A
-    /// refresh used to take the entry's slot for its own: the answer, with the entry pipeline's
-    /// question, landed in the target's slot, where no request asking that question looks
+    /// make this time. Under one configuration snapshot the two go the same way; parting them here
+    /// checks the fallback: a refresh goes by the keys of its own way alone, not by the renewed
+    /// entry's slot. A refresh used to take the entry's slot for its own: the answer, with the
+    /// entry pipeline's question, landed in the target's slot, where no request asking that
+    /// question looks
     #[tokio::test]
     async fn a_refresh_caches_its_answer_where_its_route_leads() {
         let upstream = answering_upstream("192.0.2.9".parse().unwrap(), 300).await;
@@ -2567,7 +2570,7 @@ mod tests {
     /// into the entry's cache namespace: with a reload changing only the target, answers cached
     /// by the old configuration are no longer used either
     #[tokio::test]
-    async fn a_response_jump_runs_its_own_generation_and_caches_its_answer() {
+    async fn a_response_jump_runs_its_own_snapshot_and_caches_its_answer() {
         let upstream = answering_upstream(std::net::Ipv4Addr::LOCALHOST, 300).await;
         let engine = Engine::new(
             jump_config(&upstream.address, "192.0.2.1"),
@@ -7087,6 +7090,7 @@ mod tests_multi_upstream {
 mod jump_response_cache_tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
@@ -7098,6 +7102,7 @@ mod jump_response_cache_tests {
     use crate::engine::Engine;
     use crate::engine::test_support::{self as support, Upstream, answering_upstream, engine_from};
     use crate::matcher::RuntimePipelineConfig;
+    use crate::observe::{CacheHit, CacheHitKind, EngineObserver, RequestContext};
 
     /// 每个查询都答 `ip`（TTL 为 `ttl` 秒）的 UDP 上游，并把查询带来的 ECS 原样回显，作用范围为
     /// `scope`，像支持 ECS 的上游那样
@@ -7302,15 +7307,19 @@ mod jump_response_cache_tests {
         assert_eq!(group_upstream.queries(), 1);
     }
 
-    /// 入口规则问 `first`（回答检查 continue），后面的规则跳到 `group` 问 `second`
+    /// 入口规则问 `first`（回答检查 continue），后面的规则跳到 `group` 问 `second`，`settings` 覆盖在设置上
     /// The entry's rule asks `first` (its answer check continuing), and a later rule jumps to
-    /// `group`, which asks `second`
-    fn continue_then_jump(first: &str, second: &str, settings: serde_json::Value) -> Engine {
+    /// `group`, which asks `second`, with `settings` on top of the settings
+    fn continue_then_jump(
+        first: &str,
+        second: &str,
+        settings: serde_json::Value,
+    ) -> PipelineConfig {
         let mut all = serde_json::json!({ "default_upstream": "127.0.0.1:9", "min_ttl": 0 });
         for (key, value) in settings.as_object().unwrap() {
             all[key] = value.clone();
         }
-        engine_from(serde_json::json!({
+        serde_json::from_value(serde_json::json!({
             "settings": all,
             "pipelines": [
                 {
@@ -7332,6 +7341,7 @@ mod jump_response_cache_tests {
                 { "id": "group", "rules": [forward_rule("fwd", second)] }
             ]
         }))
+        .expect("parse config")
     }
 
     /// 同一个客户端重复查询：continue 之后得出的决策不进规则缓存（olicesx/kixdns#70），每次都从入口查起，应答从入口的缓存
@@ -7347,7 +7357,16 @@ mod jump_response_cache_tests {
     async fn a_repeated_request_that_continues_is_answered_from_the_entry_cache() {
         let first = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 60).await;
         let second = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 3600).await;
-        let engine = continue_then_jump(&first.address, &second.address, serde_json::json!({}));
+        let engine = Engine::new(
+            RuntimePipelineConfig::from_config(continue_then_jump(
+                &first.address,
+                &second.address,
+                serde_json::json!({}),
+            ))
+            .expect("build runtime config"),
+            "test".to_string(),
+        )
+        .expect("engine");
         for round in 0..5 {
             let (address, ttl) =
                 ask(&engine, "continued.example", "192.0.2.10", DNSClass::IN).await;
@@ -7358,28 +7377,54 @@ mod jump_response_cache_tests {
         assert_eq!(second.queries(), 1);
     }
 
-    /// continue 之后跳过去拿到的应答过期以后，入口据的上游没有回答时照 serve_stale 交出这份过期应答（RFC 8767）。以前入口
-    /// 这条路线从不缓存，入口键下什么也没有，上游失败就是 SERVFAIL
+    /// 记下客户端请求拿到的过期应答是哪一种 / Records which kind of stale answer client requests got
+    #[derive(Default)]
+    struct StaleKinds(parking_lot::Mutex<Vec<CacheHitKind>>);
+
+    impl EngineObserver for StaleKinds {
+        fn cache_hit(&self, ctx: &RequestContext<'_>, event: &CacheHit<'_>) {
+            if !ctx.background_refresh && event.kind != CacheHitKind::Fresh {
+                self.0.lock().push(event.kind);
+            }
+        }
+    }
+
+    /// continue 之后跳过去拿到的应答过期以后，入口据的上游没有回答时照 serve_stale 交出这份过期应答（RFC 8767）：客户端
+    /// 先等刷新，刷新去问入口据的 `first`，`first` 不回答，刷新失败，交出的是上游失败时的过期应答
     /// Once the answer got through a jump after a continue has expired, with the upstream the
-    /// entry goes by not answering, serve_stale gives that expired answer (RFC 8767). The entry's
-    /// route used to be never cached, nothing under the entry's key, and the upstream failing
-    /// meant SERVFAIL
+    /// entry goes by not answering, serve_stale gives that expired answer (RFC 8767): the client
+    /// waits on the refresh first, the refresh asks `first`, which the entry goes by, `first`
+    /// does not answer, the refresh fails, and what goes out is the stale answer of an upstream
+    /// failure
     #[tokio::test]
     async fn a_jump_after_a_continue_serves_stale_when_the_checked_upstream_fails() {
         let first = answering_upstream(Ipv4Addr::new(192, 0, 2, 1), 1).await;
         let second = answering_upstream(Ipv4Addr::new(192, 0, 2, 2), 1).await;
-        let engine = continue_then_jump(
+        let kinds = Arc::new(StaleKinds::default());
+        let config = continue_then_jump(
             &first.address,
             &second.address,
-            serde_json::json!({ "serve_stale": true, "upstream_timeout_ms": 200 }),
+            serde_json::json!({
+                "serve_stale": true,
+                "upstream_timeout_ms": 200,
+                "serve_stale_client_timeout_ms": 1000
+            }),
         );
+        let engine =
+            Engine::builder(RuntimePipelineConfig::from_config(config).expect("runtime config"))
+                .observer(kinds.clone())
+                .build()
+                .expect("engine");
         answer(&engine, "continued.example", "192.0.2.10").await;
         // TTL 按整秒算：过了 1 秒就过期 / TTLs go by whole seconds: past 1 second it has expired
         tokio::time::sleep(Duration::from_millis(1100)).await;
         first.silence(true);
+        let asked = first.queries();
         let (address, ttl) = ask(&engine, "continued.example", "192.0.2.10", DNSClass::IN).await;
         assert_eq!(address, Ipv4Addr::new(192, 0, 2, 2));
         assert_eq!(ttl, 30, "serve_stale_ttl");
+        assert!(first.queries() > asked, "the refresh asked `first`");
+        assert_eq!(*kinds.0.lock(), [CacheHitKind::StaleUpstreamFailure]);
     }
 
     /// 目标 pipeline 按客户端判断时，跳转后按它的键查缓存：键分辨请求方，被拦下的客户端拿不到另一个客户端转发回来的
