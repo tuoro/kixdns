@@ -1911,17 +1911,27 @@ pub async fn serve_admin(
 
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
         if !metadata.file_type().is_socket() {
-            anyhow::bail!("管理 Socket 路径已存在且不是 Socket：{}", path.display());
+            anyhow::bail!(
+                "control socket path {} exists and is not a socket",
+                path.display()
+            );
         }
-        std::fs::remove_file(&path).context("删除遗留管理 Socket 失败")?;
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove the stale control socket {}", path.display()))?;
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("创建管理 Socket 目录失败")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create the control socket directory {}", parent.display()))?;
     }
 
-    let listener = UnixListener::bind(&path).context("绑定管理 Socket 失败")?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
-        .context("设置管理 Socket 权限失败")?;
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("bind the control socket {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).with_context(|| {
+        format!(
+            "set the permissions of the control socket {}",
+            path.display()
+        )
+    })?;
     tracing::info!(path = %path.display(), "panel control socket started");
 
     loop {
@@ -6479,6 +6489,45 @@ mod diagnostic_tests {
                 && step["decision"] == "jump"
                 && step["target"] == "fallback"),
             "{entry}"
+        );
+    }
+
+    /// 控制通道起不来时，错误和别的日志一样写英文，连着路径：路径上已经有不是 socket 的文件，或者它的目录建不出来
+    /// When the control socket cannot start, the error is in English as every other log is, with
+    /// the path: a file that is no socket already at the path, or a directory for it that cannot
+    /// be made
+    #[tokio::test]
+    async fn control_socket_errors_say_what_failed_and_where_in_english() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let serve = |path: std::path::PathBuf| {
+            let metrics = Arc::new(PanelMetrics::new(false));
+            let engine = engine_for(
+                json!({ "settings": { "default_upstream": "127.0.0.1:9" }, "pipelines": [] }),
+                Arc::clone(&metrics),
+            );
+            async move {
+                let error = super::serve_admin(path, engine, metrics)
+                    .await
+                    .expect_err("does not start");
+                format!("{error:#}")
+            }
+        };
+        let file = dir.path().join("panel.sock");
+        std::fs::write(&file, "not a socket").expect("write a file");
+        assert_eq!(
+            serve(file.clone()).await,
+            format!(
+                "control socket path {} exists and is not a socket",
+                file.display()
+            )
+        );
+        let error = serve(file.join("panel.sock")).await;
+        assert!(
+            error.starts_with(&format!(
+                "create the control socket directory {}: ",
+                file.display()
+            )),
+            "{error}"
         );
     }
 }
