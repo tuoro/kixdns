@@ -49,11 +49,12 @@ pub trait StreamTransport: Send + Sync + 'static {
     /// 日志的 `target` 字段 / The logs' `target` field
     const LOG_TARGET: &'static str;
 
-    /// 建好一条到 `upstream` 的连接，时限由 [`Connect`] 管 / Connect to `upstream`, within the
-    /// time [`Connect`] allows
+    /// 建好一条到 `upstream` 的连接，最晚到 [`Connect`] 给的期限 `deadline` / Connect to `upstream`, by
+    /// the `deadline` [`Connect`] gives
     fn connect(
         shared: &Self::Shared,
         upstream: &str,
+        deadline: tokio::time::Instant,
     ) -> impl Future<Output = anyhow::Result<(Self::Read, Self::Write)>> + Send;
 }
 
@@ -74,8 +75,9 @@ impl StreamTransport for Tcp {
     async fn connect(
         bootstrap: &Arc<Bootstrap>,
         upstream: &str,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<(Self::Read, OwnedWriteHalf)> {
-        let stream = connect_tcp(bootstrap, upstream)
+        let stream = connect_tcp(bootstrap, upstream, deadline)
             .await
             .map_err(|e| anyhow::anyhow!("tcp connect failed: {e:#}"))?;
         let (read, write) = stream.into_split();
@@ -472,7 +474,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             &self.wires.slot,
             |slot| &mut slot.connect,
             |slot| slot.live.as_ref().map(drop),
-            || self.connecting(),
+            |deadline| self.connecting(deadline),
         )
         .await?;
         Ok(())
@@ -503,10 +505,13 @@ impl<T: StreamTransport> StreamMuxClient<T> {
 
     /// 建一条到上游的连接并装上（见 [`Connect`]、[`Self::install`]）/ Connects to the upstream and puts the
     /// connection in place (see [`Connect`] and [`Self::install`])
-    fn connecting(&self) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+    fn connecting(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
         let (shared, wires) = (self.shared.clone(), self.wires.clone());
         async move {
-            let (read_half, write_half) = T::connect(&shared, &wires.upstream).await?;
+            let (read_half, write_half) = T::connect(&shared, &wires.upstream, deadline).await?;
             Self::install(&wires, read_half, write_half);
             Ok(())
         }
@@ -864,7 +869,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
             &self.wires.slot,
             |slot| &mut slot.connect,
             register,
-            || self.connecting(),
+            |deadline| self.connecting(deadline),
         );
         match tokio::time::timeout_at(deadline, waited).await {
             Ok(waited) => match waited? {
@@ -1061,10 +1066,11 @@ impl StreamTransport for Dot {
     async fn connect(
         (tls_config, bootstrap): &(Arc<ClientConfig>, Arc<Bootstrap>),
         upstream: &str,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<(Self::Read, Self::Write)> {
         let target = parse_dot_target(upstream)?;
         let server_name = build_server_name(&target.sni)?;
-        let stream = connect_tcp(bootstrap, &target.connect_addr)
+        let stream = connect_tcp(bootstrap, &target.connect_addr, deadline)
             .await
             .map_err(|e| anyhow::anyhow!("dot connect failed: {e:#}"))?;
         let tls_stream = TlsConnector::from(tls_config.clone())

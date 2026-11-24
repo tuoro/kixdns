@@ -140,11 +140,11 @@ impl H2Link {
             }
             Self::usable(slot, deadline).map(Some)
         };
-        let make = || {
+        let make = |deadline| {
             let (url, tls, bootstrap) = (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
             let (slot, no_h2, aging) = (Arc::clone(slot), Arc::clone(&self.no_h2), self.aging);
             async move {
-                match connect(&url, &tls, &bootstrap).await? {
+                match connect(&url, &tls, &bootstrap, deadline).await? {
                     Some(sender) => {
                         let wear = Arc::new(Wear::new());
                         let conn = Arc::new(H2Conn {
@@ -226,16 +226,17 @@ async fn watch(slot: Weak<Slot>, conn: Weak<H2Conn>, wear: Arc<Wear>, aging: Agi
     }
 }
 
-/// 连上 `url`：TCP 和 TCP、DoT 上游一样经 `transport::connect_tcp` 连（主机名交给 `bootstrap` 解析，几个地址错开着连），
-/// TLS 握手报 h2 和 http/1.1。对方选了 h2 就做 HTTP/2 握手，把连接交给后台任务；没选时是 None
+/// 连上 `url`：TCP 和 TCP、DoT 上游一样经 `transport::connect_tcp` 连（主机名交给 `bootstrap` 解析，几个地址错开着连，
+/// 最晚到建连的期限 `deadline`），TLS 握手报 h2 和 http/1.1。对方选了 h2 就做 HTTP/2 握手，把连接交给后台任务；没选时是 None
 /// Connects to `url`: TCP through `transport::connect_tcp`, as TCP and DoT upstreams are (the
-/// host name resolved by `bootstrap`, several addresses connected to staggered), a TLS handshake
-/// offering h2 and http/1.1. When the peer picks h2 the HTTP/2 handshake follows and a background
-/// task drives the connection; otherwise None
+/// host name resolved by `bootstrap`, several addresses connected to staggered, by the connect's
+/// `deadline`), a TLS handshake offering h2 and http/1.1. When the peer picks h2 the HTTP/2
+/// handshake follows and a background task drives the connection; otherwise None
 async fn connect(
     url: &Url,
     tls: &Arc<ClientConfig>,
     bootstrap: &Bootstrap,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<Option<H2Sender>> {
     let host = url.host().context("doh url has no host")?;
     let server_name = match &host {
@@ -245,7 +246,7 @@ async fn connect(
     };
     let port = url.port_or_known_default().context("doh url has no port")?;
     // 主机写成 URL 里的样子，IPv6 带着方括号 / The host as a URL writes it, an IPv6 one in brackets
-    let tcp = connect_tcp(bootstrap, &format!("{host}:{port}"))
+    let tcp = connect_tcp(bootstrap, &format!("{host}:{port}"), deadline)
         .await
         .context("doh connect failed")?;
     let stream = tokio_rustls::TlsConnector::from(Arc::clone(tls))

@@ -558,9 +558,14 @@ mod tests {
         })
         .await;
         let bootstrap = through(&server.address);
-        super::super::transport::connect_tcp(&bootstrap, &format!("upstream.test:{port}"))
-            .await
-            .expect("connected to the address A gives");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        super::super::transport::connect_tcp(
+            &bootstrap,
+            &format!("upstream.test:{port}"),
+            deadline,
+        )
+        .await
+        .expect("connected to the address A gives");
         assert_eq!(
             bootstrap.addresses("upstream.test", port).await.unwrap(),
             [

@@ -773,6 +773,32 @@ async fn doq_handshake_and_answer_share_one_budget() {
     );
 }
 
+/// DoQ 握手一直不回（上游收下 Initial 包、从不回答）：到建连的时限失败，原因里写着连的是哪个地址、多久没回应。以前外层的
+/// 时限先到，只剩「connect timeout after 5000ms」
+/// A DoQ handshake never answered (the upstream taking the Initial packets and never replying)
+/// fails at the connect's time limit, its cause naming the address dialled and how long it went
+/// unanswered. The outer time limit used to come first, leaving "connect timeout after 5000ms"
+/// alone
+#[tokio::test]
+async fn a_doq_handshake_left_unanswered_names_the_address() {
+    let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = silent.local_addr().unwrap();
+    let (_, client_tls) = localhost_tls(&[b"doq"]);
+    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let budget = crate::engine::transport::connect::CONNECT_BUDGET + Duration::from_secs(2);
+    let err = client
+        .send(&udp_test_query("silent.example"), budget)
+        .await
+        .expect_err("no handshake");
+    let err = format!("{err:#}");
+    let waited = err
+        .split_once(&format!("connect {addr}: no answer in "))
+        .and_then(|(_, rest)| rest.split_once("ms"))
+        .and_then(|(ms, _)| ms.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!((4900..5500).contains(&waited), "{err}");
+}
+
 #[tokio::test]
 async fn doq_reaches_an_ipv6_literal_upstream() {
     let (server, client_tls) = localhost_tls(&[b"doq"]);
