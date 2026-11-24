@@ -16,7 +16,7 @@ use super::types::EngineInner;
 use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
 use crate::matcher::RuntimePipelineConfig;
 use crate::matcher::geoip::{GeoIpManager, is_country_tag};
-use crate::matcher::geosite::{GeoSiteManager, parsed_provides_any};
+use crate::matcher::geosite::{GeoSiteManager, Swapped, parsed_provides_any};
 use crate::watcher::{FileWatch, PendingWatch};
 use parking_lot::RwLock;
 
@@ -291,33 +291,38 @@ fn load_geosite(
     // 规则用到、刚读的文件却一个都不提供的标签 / The tags rules use that none of the files just
     // read provides
     let unprovided = fresh.missing_tags(&spec.tags);
-    let old = {
+    // 和监视到文件变了时一样（见 `reload_geosite_file`）：这份文件此前提供着规则现在还用的标签，重新读出来却一个都没有，
+    // 多半是空文件或写坏了的文件。其中别的文件都不提供的标签留着正在用的数据，等文件下次改动；别的文件也提供的用那个
+    // 文件的，和全部重新读一遍一样。写锁下只换数据，换完的收尾和日志放锁以后再做，旧数据也在锁外释放
+    // As when a watched file changes (see `reload_geosite_file`): the file provided tags the
+    // rules still use, yet reading it again gives none of them, most likely an empty or broken
+    // file. Those of them no other file provides keep the data in use until the file changes
+    // again; those another file provides too take that file's, as a full load would have them.
+    // The write lock is held only to swap data: finishing the swaps and logging wait until it
+    // is released, and the old data is freed outside it too
+    let (old, kept, missing_tags) = {
         let mut in_use = shared.write();
-        // 和监视到文件变了时一样（见 `reload_geosite_file`）：这份文件此前提供着规则现在还用的标签，重新读出来
-        // 却一个都没有，多半是空文件或写坏了的文件。其中别的文件都不提供的标签留着正在用的数据，等文件下次改动；
-        // 别的文件也提供的用那个文件的，和全部重新读一遍一样
-        // As when a watched file changes (see `reload_geosite_file`): the file provided tags
-        // the rules still use, yet reading it again gives none of them, most likely an empty or
-        // broken file. Those of them no other file provides keep the data in use until the
-        // file changes again; those another file provides too take that file's, as a full
-        // load would have them
-        for path in gave_nothing {
-            let kept = in_use.take_source(path, &unprovided);
-            if !kept.is_empty() {
-                warn!(path = %path.display(), tags = kept.len(), "GeoSite data file now has none of the tags rules use, keeping the data in use");
-                fresh.apply_source(path, kept);
-            }
-        }
-        let missing = fresh.missing_tags(&spec.tags);
-        let old = mem::replace(&mut *in_use, fresh);
-        drop(in_use);
-        if !files.is_empty() {
-            warn_missing_geosite_tags(&missing);
-        }
-        old
+        let kept: Vec<(&PathBuf, Swapped)> = gave_nothing
+            .into_iter()
+            .filter_map(|path| {
+                let taken = in_use.take_source(path, &unprovided);
+                // 这份文件在 `fresh` 里什么都没提供，没有要交出去的标签 / The file provides nothing
+                // in `fresh`, so there are no tags to hand over
+                (!taken.is_empty())
+                    .then(|| (path, fresh.swap_source(path, taken, Vec::new(), false)))
+            })
+            .collect();
+        let missing_tags = fresh.missing_tags(&spec.tags);
+        (mem::replace(&mut *in_use, fresh), kept, missing_tags)
     };
-    // 旧数据在锁外释放 / The old data is freed outside the lock
     drop(old);
+    for (path, swapped) in kept {
+        let tags = swapped.finish();
+        warn!(path = %path.display(), tags, "GeoSite data file now has none of the tags rules use, keeping the data in use");
+    }
+    if !files.is_empty() {
+        warn_missing_geosite_tags(&missing_tags);
+    }
     rotation.site_swapped();
 
     let manager = Arc::clone(shared);
@@ -447,25 +452,28 @@ fn load_geoip(
             }
         }
     }
-    let old = {
+    // 和监视到文件变了时一样（见 `reload_geoip_file`）：还是正在用的那份数据文件，重新读出来却没有一个规则用到的标签，
+    // 多半是空文件或写坏了的文件。规则现在还用的标签留着正在用的数据，等文件下次改动。写锁下只搬数据，告警放锁以后
+    // 再记，旧数据也在锁外释放
+    // As when a watched file changes (see `reload_geoip_file`): the data file is the one the
+    // data in use came from, yet reading it again gives none of the tags rules use, most
+    // likely an empty or broken file. The tags the rules still use keep the data in use until
+    // the file changes again. The write lock is held only to move data: the warning waits
+    // until it is released, and the old data is freed outside it too
+    let gave_nothing = files.first().filter(|path| {
+        fresh.tag_count() == 0 && in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path())
+    });
+    let (old, kept) = {
         let mut current = shared.write();
-        // 和监视到文件变了时一样（见 `reload_geoip_file`）：还是正在用的那份数据文件，重新读出来却没有一个规则
-        // 用到的标签，多半是空文件或写坏了的文件。规则现在还用的标签留着正在用的数据，等文件下次改动
-        // As when a watched file changes (see `reload_geoip_file`): the data file is the one
-        // the data in use came from, yet reading it again gives none of the tags rules use,
-        // most likely an empty or broken file. The tags the rules still use keep the data in
-        // use until the file changes again
-        if fresh.tag_count() == 0
-            && let Some(path) = files.first()
-            && in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path())
-            && fresh.keep_tags_of(&mut current, &dat_tags) > 0
-        {
-            warn!(path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
-        }
-        mem::replace(&mut *current, fresh)
+        let kept = gave_nothing.map_or(0, |_| fresh.keep_tags_of(&mut current, &dat_tags));
+        (mem::replace(&mut *current, fresh), kept)
     };
-    // 旧数据在锁外释放 / The old data is freed outside the lock
     drop(old);
+    if let Some(path) = gave_nothing
+        && kept > 0
+    {
+        warn!(path = %path.display(), tags = kept, "GeoIP data file now has none of the tags rules use, keeping the data in use");
+    }
     rotation.ip_swapped();
 
     let manager = Arc::clone(shared);
@@ -605,6 +613,91 @@ mod tests {
             !geoip
                 .read()
                 .matches_any_tag("192.0.2.7".parse().unwrap(), &lan)
+        );
+    }
+
+    /// 换数据时把代数加一、换命名空间的引擎状态：一份什么规则都没有的配置的 / The engine state a swap
+    /// moves to the next generation's namespaces: that of a configuration without rules
+    fn rotation() -> Rotation {
+        let cfg = RuntimePipelineConfig::from_config(
+            serde_json::from_value(serde_json::json!({
+                "settings": { "default_upstream": "127.0.0.1:9" },
+                "pipelines": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Rotation {
+            site: Arc::default(),
+            ip: Arc::default(),
+            state: Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg))),
+        }
+    }
+
+    /// 热重载读出来的数据文件一个规则用到的标签都没有、留着正在用的数据时，日志也都在写锁外记，和监视到文件变了时
+    /// 一样。以前这条告警和换数据的收尾日志都在写锁里记，这期间所有按 Geo 数据匹配的查询都停着
+    /// When a hot reload reads a data file giving none of the tags rules use and the data in
+    /// use stays, every log line is written outside the write lock too, as when a watched file
+    /// changes. That warning and the log ending the swap used to be written under it, every
+    /// match on Geo data stalled meanwhile
+    #[test]
+    fn a_hot_reload_keeping_the_data_in_use_logs_nothing_under_the_write_lock() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (site, ip) = (dir.path().join("site.json"), dir.path().join("ip.json"));
+        let ip_json = |tag: &str| {
+            format!(r#"{{"entries":[{{"country_code":"{tag}","ips":["192.0.2.0/24"]}}]}}"#)
+        };
+        std::fs::write(&site, json("ads", "old.test")).unwrap();
+        std::fs::write(&ip, ip_json("LAN")).unwrap();
+        let site_tags = vec!["ads".to_string()];
+        let ip_tags = vec!["LAN".to_string()];
+        let geosite = Arc::new(RwLock::new(GeoSiteManager::new()));
+        let parsed = GeoSiteManager::parse_file(&site, &site_tags).unwrap();
+        geosite.write().apply_source(&site, parsed);
+        let geoip = Arc::new(RwLock::new(GeoIpManager::default()));
+        geoip
+            .write()
+            .apply_parsed(GeoIpManager::parse_file(&ip, &ip_tags).unwrap());
+        // 两个文件都换成别的标签 / Both files now hold other tags only
+        std::fs::write(&site, json("other", "new.test")).unwrap();
+        std::fs::write(&ip, ip_json("OTHER")).unwrap();
+
+        let (logged, under_lock) = (Arc::default(), Arc::default());
+        let subscriber = tracing_subscriber::registry().with(LogsUnderLock {
+            geosite: Arc::clone(&geosite),
+            geoip: Arc::clone(&geoip),
+            logged: Arc::clone(&logged),
+            under_lock: Arc::clone(&under_lock),
+        });
+        let rotation = rotation();
+        let ip_path = ip.to_str().unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            // 监视一装上就停下，它的线程不会在这期间写数据 / Each watch is stopped as soon as it is
+            // installed, so its thread writes no data meanwhile
+            let spec = GeoSiteSpec {
+                paths: vec![site.to_str().unwrap().to_string()],
+                tags: site_tags,
+            };
+            drop(load_geosite(spec, &geosite, &rotation));
+            let spec = GeoIpSpec {
+                tags: ip_tags,
+                db_path: None,
+                dat_path: Some(ip_path.to_string()),
+            };
+            drop(load_geoip(spec, Some(ip_path), &geoip, &rotation));
+        });
+        assert!(logged.load(Ordering::SeqCst) > 0, "the reloads log");
+        assert_eq!(
+            under_lock.load(Ordering::SeqCst),
+            0,
+            "logged under the write lock"
+        );
+        assert!(geosite.read().matches("ads", "x.old.test"));
+        assert!(
+            geoip
+                .read()
+                .matches_any_tag("192.0.2.7".parse().unwrap(), &[Arc::from("LAN")])
         );
     }
 
