@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::Record;
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable, BinEncoder};
 
 /// 快速解析结果，零拷贝实现 / Quick parse result with zero-copy implementation
@@ -1999,20 +1999,25 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
             response.emit(&mut encoder)
         };
         if encoded.is_ok() && out.len() <= room {
+            // 回答段、授权段都还在，只是 Additional 放不下时不置 TC，放不下的 RRset 整个省掉（RFC 2181 第 9 节，见
+            // [`whole_rrsets`]）：客户端改用 TCP 拿到的也只多几条附加记录，用不着为它重问一遍。上游自己置了 TC 的照旧，
+            // 截开的 RRset 也就留着前一截
+            // With the answer and authority sections whole and only Additional cut, TC is
+            // not set and an RRset that does not fit is left out whole (RFC 2181 section 9,
+            // see [`whole_rrsets`]): retrying over TCP would bring only a few more additional
+            // records, not worth asking again for. A TC the upstream set stays, and with it
+            // the first part of an RRset cut through
+            if out[6..10] == response_packet[6..10] && response_packet[2] & 0x02 == 0 {
+                let whole = whole_rrsets(&response.additionals, section_count(&out, 3));
+                out[10..12].copy_from_slice(&(whole as u16).to_be_bytes());
+                out[2] &= !0x02;
+            }
             // hickory's rollback does not shrink the backing buffer, so the
             // output can carry partial bytes from the record that did not fit.
             // Trim to the last complete record boundary from the corrected
             // header counts; fall back to the raw output if the walk fails.
             if let Some(valid_len) = valid_message_len(&out) {
                 out.truncate(valid_len);
-            }
-            // 回答段、授权段都还在，只是 Additional 放不下时不置 TC（RFC 2181 第 9 节）：客户端改用 TCP 拿到的也只多
-            // 几条附加记录，用不着为它重问一遍。上游自己置了 TC 的照旧
-            // With the answer and authority sections whole and only Additional cut, TC is
-            // not set (RFC 2181 section 9): retrying over TCP would bring only a few more
-            // additional records, not worth asking again for. A TC the upstream set stays
-            if out[6..10] == response_packet[6..10] && response_packet[2] & 0x02 == 0 {
-                out[2] &= !0x02;
             }
             if !opt.is_empty() {
                 out.extend_from_slice(&opt);
@@ -2031,6 +2036,61 @@ pub fn truncate_udp_response(request_packet: &[u8], response_packet: &[u8]) -> O
         response_packet,
         max_payload,
     ))
+}
+
+/// Additional 段的记录 `records` 只发得出前 `sent` 条时，留下前多少条才不会截开哪个 RRset：留下的每一条，它那个
+/// RRset 的成员都在留下的里面（RFC 2181 第 9 节：放不下的 RRset 整个省掉）。成员不挨着排的 RRset 也一样，夹在它们中间
+/// 的 RRset 整个跟着省掉。`sent` 不少于记录数时什么都没截，原样返回
+/// How many of the Additional records `records` stay, when only the first `sent` of them go
+/// out, so that no RRset is cut through: each record kept has all of its RRset kept with it (RFC
+/// 2181 section 9: an RRset that does not fit is left out whole). So too for an RRset whose
+/// members are not next to each other, the RRsets in between going whole with it. With `sent`
+/// no less than the records, nothing was cut, and it is returned as it is
+fn whole_rrsets(records: &[Record], sent: usize) -> usize {
+    if sent >= records.len() {
+        return sent;
+    }
+    // 每个 RRset 的最后一条排在哪 / Where each RRset's last record sits
+    let last: std::collections::HashMap<_, _> = records
+        .iter()
+        .enumerate()
+        .map(|(at, record)| (rrset_of(record), at))
+        .collect();
+    // 到 `at` 为止开始的 RRset 最远排到哪；正好是 `at` 时，前面的都在这一条或之前排完
+    // How far the RRsets begun up to `at` reach; exactly `at`, and all before end here or earlier
+    let (mut reach, mut whole) = (0, 0);
+    for (at, record) in records[..sent].iter().enumerate() {
+        reach = reach.max(last[&rrset_of(record)]);
+        if reach == at {
+            whole = at + 1;
+        }
+    }
+    whole
+}
+
+/// 一条记录属于哪个 RRset：属主、类别和类型相同的算一个（RFC 2181 第 5 节），RRSIG 算进它签的那个类型（RFC 4034
+/// 第 3.1.1 节的 Type Covered），签名和它签的记录一起留、一起省。属主名不分大小写（hickory 的 `Name` 就这样比较、
+/// 这样算哈希）
+/// Which RRset a record belongs to: records with the same owner, class and type make one (RFC
+/// 2181 section 5), and an RRSIG counts with the type it covers (Type Covered, RFC 4034 section
+/// 3.1.1), so a signature stays or goes with what it signs. Owners are compared ignoring case
+/// (as hickory's `Name` compares and hashes)
+fn rrset_of(record: &Record) -> (&Name, DNSClass, RecordType) {
+    let covered = match &record.data {
+        RData::Unknown {
+            code: RecordType::RRSIG,
+            rdata,
+        } => rdata
+            .anything
+            .get(..2)
+            .map(|covered| RecordType::from(u16::from_be_bytes([covered[0], covered[1]]))),
+        _ => None,
+    };
+    (
+        &record.name,
+        record.dns_class,
+        covered.unwrap_or(record.record_type()),
+    )
 }
 
 fn build_minimal_truncated_response(
@@ -2313,9 +2373,11 @@ mod tests {
         assert_eq!(strict_name_end(&packet, jumps_from(17)), None);
     }
 
-    /// UDP 回答只是 Additional 放不下时不置 TC（RFC 2181 第 9 节），回答段照样整个带上；回答段放不下时照旧置 TC
+    /// UDP 回答只是 Additional 放不下时不置 TC（RFC 2181 第 9 节），回答段照样整个带上，放不下的 RRset 整个省掉；
+    /// 回答段放不下时照旧置 TC
     /// A UDP reply with only Additional cut sets no TC (RFC 2181 section 9), the answer section
-    /// whole; with the answer section cut it sets TC as before
+    /// whole and the RRset that does not fit left out whole; with the answer section cut it sets
+    /// TC as before
     #[test]
     fn cutting_only_additional_records_sets_no_tc() {
         use hickory_proto::op::{MessageType, OpCode, Query};
@@ -2340,7 +2402,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cut.answers.len(), 1);
-        assert!(cut.additionals.len() < 60);
+        assert!(
+            cut.additionals.is_empty(),
+            "the 60 A records are one RRset, which does not fit"
+        );
         assert!(!cut.metadata.truncation, "only Additional was cut");
 
         let mut long = query.clone();
@@ -2353,6 +2418,91 @@ mod tests {
         .unwrap();
         assert!(cut.answers.len() < 60);
         assert!(cut.metadata.truncation, "answers were cut");
+    }
+
+    /// 只截 Additional 时留下的是放得下的、不截开任何 RRset 的最长一段：RRSIG 跟它签的类型算一个 RRset，属主不分
+    /// 大小写，成员不挨着排的 RRset 连同夹在中间的一起省掉。每个载荷都和逐个试出来的结果比
+    /// With only Additional cut, what stays is the longest run that fits and cuts no RRset
+    /// through: an RRSIG counts with the type it covers, owners ignore case, and an RRset whose
+    /// members are apart goes with what lies between them. Every payload is checked against the
+    /// result found by trying each length
+    #[test]
+    fn cutting_additional_records_leaves_out_whole_rrsets() {
+        use hickory_proto::op::{Edns, MessageType, OpCode, Query};
+        use hickory_proto::rr::rdata::{A, NULL};
+        let name = |text: &str| Name::from_ascii(text).unwrap();
+        let a = |owner: &str, last: u8| {
+            Record::from_rdata(name(owner), 300, RData::A(A::new(192, 0, 2, last)))
+        };
+        let rrsig = |owner: &str, covered: RecordType| {
+            let rdata = [&u16::from(covered).to_be_bytes()[..], &[0; 40]].concat();
+            Record::from_rdata(
+                name(owner),
+                300,
+                RData::Unknown {
+                    code: RecordType::RRSIG,
+                    rdata: NULL::with(rdata),
+                },
+            )
+        };
+        let mut additionals = Vec::new();
+        for server in 0..16 {
+            let owner = format!("ns{server}.example.");
+            additionals.extend([a(&owner, 1), a(&owner, 2), rrsig(&owner, RecordType::A)]);
+        }
+        // x 的 A 记录不挨着排，大写的 X 也是它；y 的签名签的是 AAAA，自成一组
+        // x's A records are apart, the upper-case X being x too; y's signature covers AAAA,
+        // a set of its own
+        additionals.splice(
+            6..6,
+            [a("x.example.", 1), a("y.example.", 1), a("X.example.", 2)],
+        );
+        additionals.splice(
+            12..12,
+            [rrsig("y.example.", RecordType::AAAA), a("x.example.", 3)],
+        );
+        let rrset_of = |record: &Record| {
+            let covered = match &record.data {
+                RData::Unknown { rdata, .. } => {
+                    u16::from_be_bytes([rdata.anything[0], rdata.anything[1]]).into()
+                }
+                _ => record.record_type(),
+            };
+            (record.name.clone(), covered)
+        };
+        let reply = |additionals: &[Record]| {
+            let mut reply = Message::new(0x1234, MessageType::Response, OpCode::Query);
+            reply.add_query(Query::query(name("www.example."), RecordType::A));
+            reply.add_answers((0..4).map(|last| a("www.example.", last)));
+            reply.add_additionals(additionals.iter().cloned());
+            let mut edns = Edns::new();
+            edns.set_max_payload(UDP_PAYLOAD);
+            reply.set_edns(edns);
+            reply.to_vec().unwrap()
+        };
+        let full = reply(&additionals);
+        assert!(full.len() > usize::from(UDP_PAYLOAD));
+        for payload in 512..=UDP_PAYLOAD {
+            let cut = Message::from_bytes(
+                &truncate_udp_response(&txt_query(Some(payload)), &full).expect("must cut"),
+            )
+            .unwrap();
+            let kept = (0..=additionals.len())
+                .rev()
+                .find(|&kept| {
+                    let (before, after) = additionals.split_at(kept);
+                    reply(before).len() <= usize::from(payload)
+                        && before.iter().all(|record| {
+                            after
+                                .iter()
+                                .all(|later| rrset_of(record) != rrset_of(later))
+                        })
+                })
+                .unwrap();
+            assert_eq!(cut.answers.len(), 4, "payload {payload}");
+            assert!(!cut.metadata.truncation, "payload {payload}");
+            assert_eq!(cut.additionals, additionals[..kept], "payload {payload}");
+        }
     }
 
     /// 带着读得出的 OPT 的请求，NOTIMP 和 FORMERR 也带 OPT，DO 位照抄（RFC 6891 第 7 节）；不带 OPT 的照旧不带
