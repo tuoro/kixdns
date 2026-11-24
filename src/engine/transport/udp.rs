@@ -88,7 +88,12 @@ fn after_recv_error(idx: usize, error: &std::io::Error) -> Option<Duration> {
         debug!(socket_idx = idx, error = %error, "UDP pool socket told a query reached nobody");
         return None;
     }
-    crate::warn_sparse!(socket_idx = idx, error = %error, "UDP pool recv error, pausing");
+    crate::warn_sparse!(
+        event = "udp_recv_error",
+        socket_idx = idx,
+        error = %error,
+        "UDP pool recv error, pausing"
+    );
     Some(Duration::from_millis(100))
 }
 
@@ -120,6 +125,7 @@ fn hand_over_udp_reply(idx: usize, inflight: &UdpInflightMap, reply: &mut [u8], 
     let (_, expected_addr, query, _) = entry.get();
     if src != *expected_addr {
         crate::warn_sparse!(
+            event = "reply_from_wrong_address",
             socket_idx = idx,
             response_id = id,
             expected_addr = %expected_addr,
@@ -131,6 +137,7 @@ fn hand_over_udp_reply(idx: usize, inflight: &UdpInflightMap, reply: &mut [u8], 
         // the upstream asked here, so there are no more keys than upstreams
         crate::warn_sparse!(
             per src;
+            event = "reply_not_for_query",
             socket_idx = idx,
             response_id = id,
             upstream = %src,
@@ -377,9 +384,10 @@ impl UdpClient {
                     attempts += 1;
                     if attempts > 100 {
                         crate::warn_sparse!(
-                            "udp pool exhausted: socket_idx={} inflight_count={}",
-                            idx,
-                            state.inflight.len()
+                            event = "udp_ids_exhausted",
+                            socket_idx = idx,
+                            inflight_count = state.inflight.len(),
+                            "udp pool exhausted"
                         );
                         return Err(anyhow::anyhow!(
                             "udp pool exhausted (too many inflight requests)"
@@ -434,7 +442,11 @@ impl UdpClient {
                 slot.compare_and_swap(state, Arc::new(Self::spawn_reader(idx, socket)));
             }
             Err(error) => {
-                crate::warn_sparse!(error = %error, "cannot replace a UDP socket, keeping it in use")
+                crate::warn_sparse!(
+                    event = "udp_socket_not_replaced",
+                    error = %error,
+                    "cannot replace a UDP socket, keeping it in use"
+                )
             }
         }
     }

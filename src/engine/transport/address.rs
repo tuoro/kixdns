@@ -6,7 +6,6 @@ use anyhow::Context;
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::warn;
 use url::Url;
 
 /// DoH 上游 `upstream` 的 URL 和覆盖的 Host（`host` 查询参数，不发给上游）。`upstream` 是去掉前缀的地址
@@ -149,48 +148,79 @@ pub(crate) fn host_name(address: &str, transport: crate::config::Transport) -> O
         Transport::Udp | Transport::TcpUdp => return None,
         Transport::Tcp if address.parse::<SocketAddr>().is_ok() => return None,
         Transport::Tcp => address.rsplit_once(':')?.0.to_owned(),
-        Transport::Dot => parse_tls_upstream(address, "dot").ok()?.1,
-        Transport::Doq => parse_tls_upstream(address, "doq").ok()?.1,
+        Transport::Dot | Transport::Doq => parse_tls_upstream(address, transport).ok()?.host,
         Transport::Doh => url_host(&build_doh_url(address).ok()?.0)?,
     };
     host.parse::<std::net::IpAddr>().is_err().then_some(host)
 }
 
-/// DoT、DoQ 上游地址共有的部分：没写协议时补上 `scheme`，主机，端口（默认 853），不许带路径，
-/// `sni`/`servername` 参数（空的不算，多个时取最后一个）。错误文字里的协议名就是 `scheme`
-/// What DoT and DoQ upstream addresses share: `scheme` added when none is written, the
-/// host, the port (853 by default), no path, and the `sni`/`servername` parameter (an
-/// empty one does not count, the last of several wins). The errors name `scheme`
+/// DoT、DoQ 上游地址读出来的样子：主机，端口（默认 853），`sni`/`servername` 参数（空的不算，多个时取最后一个），
+/// DoQ 的 `0rtt`/`enable_0rtt` 参数
+/// What a DoT or DoQ upstream address reads as: the host, the port (853 by default), the
+/// `sni`/`servername` parameter (an empty one does not count, the last of several wins), and
+/// DoQ's `0rtt`/`enable_0rtt` parameter
+struct TlsUpstream {
+    host: String,
+    port: u16,
+    sni: Option<String>,
+    enable_0rtt: Option<bool>,
+}
+
+/// 读一个 DoT 或 DoQ（`transport`）上游去掉前缀的地址（见 `config::parse_upstream_addr`），见 [`TlsUpstream`]。不许
+/// 带路径；后面又写了一个前缀的（`dot://tcp://…`）不认，和 DoH 一样（见 [`build_doh_url`]）；参数只认这一种传输读的
+/// （DoT 是 `sni`、`servername`，DoQ 再加 `0rtt`、`enable_0rtt`），别的参数和读不懂的 `0rtt` 值都是错，配置检查报出来，
+/// 不悄悄忽略。错误文字里的协议名就是这种传输的
+/// Reads the address of a DoT or DoQ (`transport`) upstream short of its prefix (see
+/// `config::parse_upstream_addr`), see [`TlsUpstream`]. It may carry no path; one with a second
+/// prefix after the first (`dot://tcp://…`) is not taken, as for DoH (see [`build_doh_url`]);
+/// only the parameters this transport reads are (`sni` and `servername` for DoT, `0rtt` and
+/// `enable_0rtt` too for DoQ), any other and a `0rtt` value it cannot read being errors the
+/// configuration check reports rather than ignored unseen. The errors name the transport
 fn parse_tls_upstream(
     upstream: &str,
-    scheme: &str,
-) -> anyhow::Result<(Url, String, u16, Option<String>)> {
-    let url = if upstream.contains("://") {
-        Url::parse(upstream)
-    } else {
-        Url::parse(&format!("{scheme}://{upstream}"))
+    transport: crate::config::Transport,
+) -> anyhow::Result<TlsUpstream> {
+    let scheme = transport.label();
+    if let Some((second, _)) = crate::config::split_scheme(upstream) {
+        anyhow::bail!("a second prefix \"{second}://\" after the first");
     }
-    .with_context(|| format!("invalid {scheme} upstream url"))?;
-
+    let url = Url::parse(&format!("{scheme}://{upstream}"))
+        .with_context(|| format!("invalid {scheme} upstream url"))?;
     let host = url_host(&url).with_context(|| format!("{scheme} upstream missing host"))?;
-    let port = url.port().unwrap_or(853);
-
     if !url.path().is_empty() && url.path() != "/" {
         anyhow::bail!("{scheme} upstream should not contain path");
     }
-
-    let sni = url
-        .query_pairs()
-        .filter(|(k, v)| {
-            (k.eq_ignore_ascii_case("sni") || k.eq_ignore_ascii_case("servername")) && !v.is_empty()
-        })
-        .last()
-        .map(|(_, v)| v.to_string());
-    Ok((url, host, port, sni))
+    let (mut sni, mut enable_0rtt) = (None, None);
+    for (key, value) in url.query_pairs() {
+        let is = |name: &str| key.eq_ignore_ascii_case(name);
+        if is("sni") || is("servername") {
+            if !value.is_empty() {
+                sni = Some(value.into_owned());
+            }
+        } else if transport == crate::config::Transport::Doq && (is("0rtt") || is("enable_0rtt")) {
+            enable_0rtt = Some(match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => true,
+                "false" | "0" | "no" | "off" => false,
+                _ => anyhow::bail!(
+                    "invalid {key} \"{value}\", expected true, false, 1, 0, yes, no, on or off"
+                ),
+            });
+        } else {
+            anyhow::bail!("{scheme} upstream does not take the parameter \"{key}\"");
+        }
+    }
+    Ok(TlsUpstream {
+        host,
+        port: url.port().unwrap_or(853),
+        sni,
+        enable_0rtt,
+    })
 }
 
 pub(super) fn parse_dot_target(upstream: &str) -> anyhow::Result<DotTarget> {
-    let (_, host, port, sni) = parse_tls_upstream(upstream, "dot")?;
+    let TlsUpstream {
+        host, port, sni, ..
+    } = parse_tls_upstream(upstream, crate::config::Transport::Dot)?;
 
     let connect_addr = host_port(&host, port);
     let sni_value = sni.unwrap_or(host);
@@ -214,23 +244,12 @@ pub(super) struct DoqTarget {
 }
 
 pub(super) fn parse_doq_target(upstream: &str) -> anyhow::Result<DoqTarget> {
-    let (url, host, port, sni) = parse_tls_upstream(upstream, "doq")?;
-
-    let mut enable_0rtt: Option<bool> = None;
-    for (k, v) in url.query_pairs() {
-        if k.eq_ignore_ascii_case("0rtt") || k.eq_ignore_ascii_case("enable_0rtt") {
-            // Parse 0rtt parameter: true/false/1/0
-            // 解析 0rtt 参数：true/false/1/0
-            enable_0rtt = match v.to_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => Some(true),
-                "false" | "0" | "no" | "off" => Some(false),
-                _ => {
-                    warn!("invalid doq 0rtt value: {}, ignoring", v);
-                    None
-                }
-            };
-        }
-    }
+    let TlsUpstream {
+        host,
+        port,
+        sni,
+        enable_0rtt,
+    } = parse_tls_upstream(upstream, crate::config::Transport::Doq)?;
 
     let is_ip = host.parse::<std::net::IpAddr>().is_ok();
     if sni.is_none() && is_ip {
