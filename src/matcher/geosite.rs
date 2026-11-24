@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
 
 use anyhow::Context;
 use hashbrown::HashTable;
@@ -18,7 +18,7 @@ use super::dat_reader::DatReader;
 use super::{MAX_REGEX_LEN, REGEX_SIZE_LIMIT, ascii_regex_pattern, domain_suffix_matches};
 
 /// 域名匹配器类型 / Domain matcher type
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub enum DomainMatcher {
     /// 完全匹配 / Full domain match
     Full(String),
@@ -206,6 +206,13 @@ impl std::fmt::Debug for NameSet {
 /// entry one by one.
 #[derive(Debug, Default)]
 pub struct TagMatchers {
+    /// 数据的指纹：读出来的条目照数据文件里的先后算出的哈希，同一份数据再读一遍还是这个数。缓存命名空间算上它（见
+    /// [`GeoSiteManager::fingerprints`]），数据真换了样子，读这个 tag 的 pipeline 才换命名空间
+    /// The data's fingerprint: a hash of the entries read, in the data file's order, the same
+    /// number for the same data read again. Cache namespaces take it in (see
+    /// [`GeoSiteManager::fingerprints`]), so only once the data really changes do the pipelines
+    /// reading this tag move to a new namespace
+    fingerprint: u64,
     /// `Full` 条目，小写 / `Full` entries, lowercased
     full: NameSet,
     /// `Suffix` 条目去掉开头一个点后的值，小写 / `Suffix` entries with one leading dot removed, lowercased
@@ -346,6 +353,9 @@ struct TagBuilder {
     tag: TagMatchers,
     /// 正则的写法，到 `finish` 才合成编译 / The regexes' patterns, combined and compiled in `finish`
     regexes: Vec<String>,
+    /// 加进来的条目一条条算进去，`finish` 时成为指纹（见 [`TagMatchers::fingerprint`]）/ Each entry
+    /// added goes into it, which becomes the fingerprint in `finish` (see [`TagMatchers::fingerprint`])
+    fingerprint: DefaultHasher,
 }
 
 impl TagBuilder {
@@ -358,7 +368,7 @@ impl TagBuilder {
                 suffixes: NameSet::with_capacity(suffixes.0, suffixes.1),
                 ..TagMatchers::default()
             },
-            regexes: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -400,6 +410,7 @@ impl TagBuilder {
 
     /// 加入数据文件里读出的一条 / Adds one entry read from a data file
     fn add_entry(&mut self, entry: DatEntry) {
+        entry.hash(&mut self.fingerprint);
         match entry {
             DatEntry::Matcher(matcher) => self.add(matcher),
             // 写错的正则跳过，什么名字都不匹配，和 JSON 数据里一样。以前换成 `^$` 顶替，而根域名的名字正是空的
@@ -417,6 +428,7 @@ impl TagBuilder {
 
     fn finish(self) -> TagMatchers {
         let mut tag = self.tag;
+        tag.fingerprint = self.fingerprint.finish();
         tag.regexes = Regexes::new(self.regexes);
         tag.full.shrink_to_fit();
         tag.suffixes.shrink_to_fit();
@@ -594,6 +606,15 @@ impl GeoSiteManager {
         self.database.contains_key(tag)
     }
 
+    /// 每个 tag 眼下的数据的指纹（见 [`TagMatchers::fingerprint`]）/ The fingerprint of each tag's
+    /// data right now (see [`TagMatchers::fingerprint`])
+    pub fn fingerprints(&self) -> FxHashMap<String, u64> {
+        self.database
+            .iter()
+            .map(|(tag, matchers)| (tag.clone(), matchers.fingerprint))
+            .collect()
+    }
+
     /// `tags`（规则用到的，小写）里哪些没有一个数据文件提供：用它们的规则永远不会命中
     /// The tags among `tags` (the ones rules use, lowercase) that no data file provides: rules
     /// using them never match
@@ -713,7 +734,7 @@ fn has_attrs(attrs: &[String], wanted: &[String]) -> bool {
 /// [`Regexes::new`]）
 /// One entry read from a data file (.dat or JSON). A regex keeps only its pattern, compiled once
 /// the whole tag is read and combined into sets, and only then (see [`Regexes::new`])
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 enum DatEntry {
     Matcher(DomainMatcher),
     Regex(String),
