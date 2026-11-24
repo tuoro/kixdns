@@ -138,14 +138,18 @@ pub(crate) fn is_failure_reply(rcode: ResponseCode) -> bool {
     matches!(rcode, ResponseCode::ServFail | ResponseCode::Refused) || u16::from(rcode) >= 16
 }
 
-/// A background refresh does not cache a failure reply (see [`is_failure_reply`]),
-/// which a rule with a single upstream gets back as its answer: it would replace the
-/// answer cached under the same key, and a lookup never serves such an entry as
-/// stale. The refresh gets an error here instead of caching it, and the cached
-/// answer stays.
-/// 后台刷新不缓存失败应答（见 [`is_failure_reply`]；只有一个上游的规则会把它当作应答
-/// 拿回来）：它会替换掉同一个键下缓存的应答，而查缓存时这样的条目不会被当作旧结果返回。
-/// 刷新在这里拿到一个错误，不缓存它，缓存的应答保留。
+/// A background refresh takes a failure reply (see [`is_failure_reply`]), which a rule with
+/// a single upstream gets back as its answer, as a failed attempt, as it takes an upstream
+/// that does not answer. The cache never takes such a reply (see
+/// `Engine::insert_dns_cache_entry`), and a refresh ending on a REFUSED or an extended RCODE
+/// as its answer would count as a success (see `execution::renewing`, which turns away a
+/// SERVFAIL alone): the answer it renews would be dropped with nothing in its place, and the
+/// failure neither noted nor backed off. The refresh gets an error here instead, and the
+/// cached answer stays (renewed with serve_stale_ttl_reset on).
+/// 后台刷新把失败应答（见 [`is_failure_reply`]；只有一个上游的规则会把它当作应答拿回来）当作一次失败的尝试，和上游
+/// 不回答一样。缓存从来不收这样的应答（见 `Engine::insert_dns_cache_entry`），刷新要是以 REFUSED 或扩展 RCODE 作答
+/// 结束，就算成功（见 `execution::renewing`，它只拒 SERVFAIL）：被刷新的那份随之去掉，却没有新的顶上，这次失败也
+/// 不记下、不退避。刷新在这里拿到一个错误，缓存的应答保留（开着 serve_stale_ttl_reset 时还续期）。
 pub(crate) fn reject_failure_reply_on_refresh(
     background_refresh: bool,
     reply: &[u8],
@@ -562,7 +566,7 @@ pub async fn forward_upstream(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    transport: Option<Transport>,
+    transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
     asker: Option<std::net::IpAddr>,
@@ -698,13 +702,10 @@ async fn forward_upstream_as_is(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    transport: Option<Transport>,
+    default_transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
-    // 如果 transport 为 None，使用默认 UDP
-    let default_transport = transport.unwrap_or(Transport::Udp);
-
     // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
     // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
     let upstreams: Upstreams = if let Some(pre_split) = pre_split_upstreams {
@@ -759,7 +760,7 @@ async fn forward_upstream_as_is(
                     None,
                 );
                 if let Some(qr) = quick {
-                    tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
+                    tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %crate::observe::rcode_name(u16::from(qr.rcode)), "upstream call succeeded");
                 }
                 return Ok((bytes, upstream_label(via, addr)));
             }
@@ -770,9 +771,9 @@ async fn forward_upstream_as_is(
                 // No prefix is built on failure, only a warn; a 429 logs at debug, the DoH
                 // client having logged one warn as the pause began
                 if outcome == UpstreamOutcome::Throttled {
-                    tracing::debug!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
+                    tracing::debug!(upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
                 } else {
-                    crate::warn_sparse!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
+                    crate::warn_sparse!(per up; upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
                 }
                 return Err(UpstreamFailure::error(err));
             }
@@ -879,9 +880,9 @@ async fn forward_upstream_as_is(
                         // 回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
                         // A 429 logs at debug: the DoH client logged one warn as the pause began
                         if outcome == UpstreamOutcome::Throttled {
-                            tracing::debug!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
+                            tracing::debug!(upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
                         } else {
-                            crate::warn_sparse!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                            crate::warn_sparse!(per up_proto; upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         }
                         last_err = Some(err);
                     }
@@ -1004,9 +1005,12 @@ impl<'a> Attempts<'a> {
         attempt
     }
 
-    /// 报 `attempt` 的结果：`via` 是带回应答的传输，`reply` 是快速解析出的应答 / Reports the
-    /// result of `attempt`: `via` is the transport that carried the answer, `reply` the answer
-    /// as quickly parsed
+    /// 报 `attempt` 的结果：`via` 是带回应答的传输，`latency` 是从发出到拿到应答（或失败）的总时长，UDP 的重发、截断后改用
+    /// TCP 重取、失败后回退到 TCP 都算在里面，`via` 是 TCP 时也不只是 TCP 那一段；`reply` 是快速解析出的应答 / Reports the
+    /// result of `attempt`: `via` is the transport that carried the answer, `latency` the whole
+    /// time from sending to the answer (or the failure), a UDP resend, a TCP retry after
+    /// truncation and a TCP fallback after failure all counted in, so with `via` TCP it is not the
+    /// TCP exchange alone; `reply` is the answer as quickly parsed
     fn finish(
         &mut self,
         attempt: usize,
@@ -2212,6 +2216,56 @@ mod tests {
         );
         assert_eq!(hedge_timeout(Duration::ZERO), Duration::ZERO);
     }
+
+    /// 上游失败的 warn 带着完整的原因，不只是最外层那一句：只有一个上游时、几个上游一起问时都是。这里 DoH 上游读完请求
+    /// 就断开，最外层只说请求没发成，为什么没发成在里层
+    /// A failed upstream's warn carries the whole reason, not just its outermost sentence: with a
+    /// single upstream and with several asked together alike. The DoH upstream here closes once it
+    /// has read the request, the outermost sentence only saying the request was not sent, why it
+    /// was not being further in
+    #[tokio::test]
+    async fn a_failed_upstream_is_logged_with_its_whole_reason() {
+        use crate::engine::test_support::{DohReply, Warnings, spawn_doh_upstream};
+        let (doh, _) = spawn_doh_upstream(|_, _| DohReply::Close).await;
+        let engine = build_test_engine(false);
+        engine.doh_client.use_plain_http();
+        let packet = build_dns_query_packet("example.com.");
+        let (warnings, guard) = Warnings::capture();
+        for upstream in [
+            format!("doh://{doh}/a"),
+            format!("doh://{doh}/a,doh://{doh}/b"),
+        ] {
+            let forwarded = forward_upstream(
+                &engine,
+                &packet,
+                &upstream,
+                Duration::from_secs(2),
+                Transport::Udp,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(forwarded.is_err());
+        }
+        drop(guard);
+        let lines = warnings.lines();
+        let failed = |message: &str| {
+            lines
+                .iter()
+                .filter(|line| line.contains(message))
+                .collect::<Vec<_>>()
+        };
+        let single = failed("single upstream call failed");
+        let several = failed("upstream call failed, waiting for others");
+        assert_eq!((single.len(), several.len()), (1, 2), "{lines:#?}");
+        for line in single.into_iter().chain(several) {
+            assert!(
+                line.contains("error=doh request send failed: error sending request"),
+                "{line}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2368,12 +2422,11 @@ mod refresh_failure_reply_tests {
         let client: SocketAddr = CLIENT.parse().unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
-            engine.handle_packet_internal(
+            engine.handle_refresh(
                 &query().to_vec().unwrap(),
                 client,
-                None,
-                Some(engine.refresh_of(key)),
-                Some(state),
+                engine.refresh_of(key),
+                state,
             ),
         )
         .await

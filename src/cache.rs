@@ -93,20 +93,17 @@ impl CacheEntry {
         }
     }
 
-    /// 存了 `elapsed_secs` 秒，已经没用了：过了 TTL 又过了 `kept_past_ttl`（见
-    /// `phases::kept_past_ttl`）。失败应答（见 `is_failure_reply`）过了 TTL 就没用了，不当过期应答交出去。
-    /// 缓存留着一份应答，正好留到它没用为止；能不能用（`phases::age_of`）也照这一处
+    /// 存了 `elapsed_secs` 秒，已经没用了：过了 TTL 又过了 `kept_past_ttl`（见 `phases::kept_past_ttl`）。缓存里的应答
+    /// 都一样：上游的失败应答进不了缓存（见 `Engine::insert_dns_cache_entry`），规则据上游应答给出的 deny（REFUSED）和别的
+    /// 应答一样过期以后还能续用。缓存留着一份应答，正好留到它没用为止；能不能用（`phases::age_of`）也照这一处
     /// Stored `elapsed_secs` seconds ago and of no further use: past its TTL by `kept_past_ttl`
-    /// (see `phases::kept_past_ttl`). A failure reply (see `is_failure_reply`) is of no use once
-    /// past its TTL, never going out stale. The cache keeps an answer exactly until it is of
-    /// no use, and whether it can be used (`phases::age_of`) goes by this too
+    /// (see `phases::kept_past_ttl`). Every answer in the cache alike: an upstream's failure
+    /// reply never goes in (see `Engine::insert_dns_cache_entry`), and a deny (REFUSED) the
+    /// rules gave by an upstream's answer goes out stale as any other answer does. The cache
+    /// keeps an answer exactly until it is of no use, and whether it can be used
+    /// (`phases::age_of`) goes by this too
     pub fn spent(&self, elapsed_secs: u64, kept_past_ttl: Duration) -> bool {
-        let kept = if crate::engine::upstream::is_failure_reply(self.rcode) {
-            0
-        } else {
-            kept_past_ttl.as_secs()
-        };
-        elapsed_secs >= u64::from(self.original_ttl).saturating_add(kept)
+        elapsed_secs >= u64::from(self.original_ttl).saturating_add(kept_past_ttl.as_secs())
     }
 
     /// 到 `now` 为止存了多少秒 / How many seconds it has been stored by `now`
@@ -547,12 +544,11 @@ mod tests {
         assert!(slot.replacing(&wide, renewed).is_none());
     }
 
-    /// 应答在缓存里留到它没用为止：过了 TTL 又过了 `kept_past_ttl` 就去掉，失败应答过了 TTL 就去掉。以前按
-    /// 写进缓存的时刻加 cache_max_ttl（默认一天）算，TTL 300 秒的应答没用了还占着容量一天
+    /// 应答在缓存里留到它没用为止：过了 TTL 又过了 `kept_past_ttl` 就去掉，不是按写进缓存的时刻加 cache_max_ttl（默认
+    /// 一天）算：TTL 300 秒的应答没用了不再占着容量
     /// An answer stays in the cache until it is of no use: once past its TTL by
-    /// `kept_past_ttl` it goes, and a failure reply once past its TTL. It used to go by when it
-    /// was written plus cache_max_ttl (a day by default), an answer with a TTL of 300 seconds
-    /// taking up room for a day after it was of no use
+    /// `kept_past_ttl` it goes, not by when it was written plus cache_max_ttl (a day by
+    /// default): an answer with a TTL of 300 seconds takes up no room once of no use
     #[test]
     fn an_answer_stays_until_it_is_of_no_use() {
         let expired = || {
@@ -577,13 +573,6 @@ mod tests {
         let fresh = entry(reach("203.0.113.0/24", Some(24)), 300, Duration::ZERO);
         assert_eq!(slot.with(Arc::clone(&fresh), Duration::ZERO).len(), 1);
         assert_eq!(slot.with(fresh, stale_for).len(), 2);
-
-        let mut failed = (*expired()).clone();
-        failed.rcode = ResponseCode::ServFail;
-        assert!(
-            failed.spent(400, stale_for),
-            "a failure reply never goes out stale"
-        );
     }
 
     /// 槽位满了，最后才淘汰按「带不带 ECS」区分、大家共用的那份

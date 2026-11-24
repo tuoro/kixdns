@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use smallvec::SmallVec;
 
 use crate::config::EcsMode;
-use crate::ecs::{EcsKey, EcsPlan, plan};
+use crate::ecs::{EcsKey, EcsPlan, StaticEcsIp, plan};
 
 /// 转发发给上游的 ECS / The ECS a forward sends upstream
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,13 +76,10 @@ impl EcsSource {
                 prefix_v4: *prefix_v4,
                 prefix_v6: *prefix_v6,
             },
-            Some(EcsMode::Static { ip, .. }) => {
-                if ip.parse::<IpAddr>().is_ok() {
-                    Self::Fixed
-                } else {
-                    Self::Client
-                }
-            }
+            Some(EcsMode::Static { ip, .. }) => match ip {
+                StaticEcsIp::Ip(_) => Self::Fixed,
+                StaticEcsIp::NotAnIp(_) => Self::Client,
+            },
         }
     }
 

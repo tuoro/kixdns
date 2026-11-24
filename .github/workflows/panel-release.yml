@@ -85,14 +85,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      # 全部单元、程序和集成测试，tests/ 下新加的文件不用再来这里登记
+      # Every unit, binary and integration test, so a file added under tests/ needs no entry here
       - name: Tests
-        run: |
-          cargo test --locked --lib
-          cargo test --locked --bin kixdns
-          cargo test --locked --test doh_integration
-          cargo test --locked --test response_log
-          cargo test --locked --test observer_api
-          cargo test --locked --test listener_port
+        run: cargo test --locked --no-fail-fast --lib --bins --tests
 
       # 漏洞、不健全、已撤回挡住发布；无人维护和通知只报告。
       # Vulnerabilities, unsound and yanked crates block a release; unmaintained and notices are only reported.
@@ -162,8 +158,12 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
           echo "Version: ${version}; upstream: ${upstream}; publish: ${publish}"
 
+  # 打包只在推到 main 和手动触发时跑：PR 上 Verify 已经检查过代码，包要等发版才用得上
+  # Packaging runs on pushes to main and by hand: on a pull request Verify has checked the code,
+  # and the packages are of use only to a release
   build:
     name: Build ${{ matrix.arch }}${{ matrix.suffix }}
+    if: github.event_name != 'pull_request'
     needs: [verify, version]
     runs-on: ${{ matrix.runner }}
     # 在 Ubuntu 22.04 里构建，GLIBC 不超过 2.35，和面板以前发的内核一样能在老系统上跑。

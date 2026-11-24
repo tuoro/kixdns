@@ -31,6 +31,10 @@ COMMANDS:
   run              Run the DNS server
   convert-geo-ip   Convert a GeoIP .dat file to MMDB
   help             Print help
+
+OPTIONS:
+  -h, --help       Show help
+  -V, --version    Show version
 ~~~
 
 Run options:
@@ -40,9 +44,8 @@ Run options:
     --listener-label <LABEL>    Listener label used by pipeline selectors (default: default)
     --debug                     Enable debug-level logging
     --udp-workers <NUM>         UDP worker count (0 selects available CPU parallelism)
-    --admin-socket <PATH>       Local control socket (Unix socket) for the panel; off when omitted, unsupported on Windows
+    --admin-socket <PATH>       Local control socket (Unix socket) for the panel; off when omitted, not an option on Windows
 -h, --help                      Show help
--V, --version                   Show version
 ~~~
 
 GeoIP conversion options:

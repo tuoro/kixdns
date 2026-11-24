@@ -8,8 +8,8 @@ mod pattern;
 mod requester;
 mod response;
 
-pub(crate) use pattern::regex_within;
 use pattern::*;
+pub(crate) use pattern::{capitals_warning, regex_within};
 use requester::*;
 pub use requester::{Requester, RequesterKey, RequesterScope, RequesterTest};
 pub use response::{RuntimeResponseMatcher, RuntimeResponseMatcherWithOp};
@@ -631,13 +631,17 @@ impl RuntimePipelineConfig {
         std::time::Duration::from_millis(self.settings.upstream_timeout_ms)
     }
 
-    /// 规则（连同 pipeline_select 和回答检查）用到的 GeoSite 标签（已经是小写），排好序、去掉重复：数据文件只读这些标签
+    /// 规则（连同 pipeline_select 和回答检查）用到的 GeoSite 标签（已经是小写），排好序、去掉重复：数据文件只读这些标签。
+    /// 写成空的不算：那样的匹配器已经算一条问题或告警（见 `config::problems`、`config::warnings`），不再算作没有数据的标签
     /// The GeoSite tags rules use (pipeline_select and answer checks included), lowercase
-    /// already, sorted and deduplicated: data files are read for these tags alone
+    /// already, sorted and deduplicated: data files are read for these tags alone. One written
+    /// empty does not count: its matcher is a problem or a warning already (see
+    /// `config::problems`, `config::warnings`), not one more tag without data
     pub fn geosite_tags(&self) -> Vec<String> {
         used_tags(
             self.geo_tags()
                 .filter_map(GeoTags::site)
+                .filter(|tag| !tag.is_empty())
                 .map(std::slice::from_ref),
         )
     }
@@ -1688,6 +1692,54 @@ mod tests {
                     err.contains(cause) && err.contains(pattern) && !err.contains("0-9A-Za-z_"),
                     "{pattern}, matcher {which}: {err}"
                 );
+            }
+        }
+    }
+
+    /// 域名正则里不在 `(?i)` 下写成大写的字母照写永远命不中（规则看到的名字是小写的），三种域名正则都记一条警告，说在哪、
+    /// 是哪一段：带大写的字面量，只取大写字母的字符类。`(?i)` 下的、字符类里也有别的字符的不算。以前配置不提示，这样的
+    /// 规则悄悄地从不命中
+    /// Capitals in a domain regex outside `(?i)` never match as written (the names rules see are
+    /// lowercase), and each of the three domain regexes gets a warning saying where and which
+    /// part: a literal holding a capital, a class taking capitals alone. Those under `(?i)`, and
+    /// classes taking other characters too, do not count. The configuration used to say
+    /// nothing, and such a rule silently never matched
+    #[test]
+    fn capitals_in_a_domain_regex_are_warned_about() {
+        let places = [
+            ("pipelines[0].rules[0].matchers[0]", "domain_regex"),
+            ("pipeline_select[0].matchers[0]", "domain_regex"),
+            (
+                "pipelines[0].rules[0].response_matchers[0]",
+                "request_domain_regex",
+            ),
+        ];
+        for (pattern, capitals) in [
+            (r"^Ads\.example$", r#""Ads\.example""#),
+            (r"^(?:ads|Track)\.[A-Z]+$", r#""Track", "[A-Z]""#),
+            (r"^\x41\d$", r#""A""#),
+            (r"^(?-u:[A-Z])x$", r#""(?-u:[A-Z])""#),
+        ] {
+            assert_eq!(domain_regex_matchers(pattern)("ads.example"), [false; 3]);
+            for (config, (place, kind)) in domain_regex_configs(pattern).into_iter().zip(places) {
+                let warnings = runtime_of(config).unwrap().warnings;
+                assert_eq!(
+                    warnings,
+                    [format!(
+                        "{place}: {kind} \"{pattern}\": the capitals in {capitals} never match, as the names rules see are lowercase; write them in lowercase or under (?i)"
+                    )],
+                    "{pattern}"
+                );
+            }
+        }
+        for pattern in [
+            r"(?i)^Ads\.example$",
+            r"^ads\.(?i:EXAMPLE)$",
+            r"^[A-Z0-9]+\.example$",
+            r"^\w+\.example$",
+        ] {
+            for config in domain_regex_configs(pattern) {
+                assert!(runtime_of(config).unwrap().warnings.is_empty(), "{pattern}");
             }
         }
     }

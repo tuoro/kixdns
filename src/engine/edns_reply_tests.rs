@@ -194,9 +194,7 @@ async fn a_static_answer_from_the_rule_cache_carries_what_its_query_asked() {
         // Asked once on the full path, so the rule cache holds the decision for it
         // 先在完整路径上问一次，规则缓存里就有了它的决定
         ask(&engine, &packet).await;
-        let Some(FastPathResponse::Direct(reply)) = engine
-            .handle_packet_fast(&packet, peer())
-            .expect("fast path")
+        let Some(FastPathResponse::Direct(reply)) = engine.handle_packet_fast(&packet, peer())
         else {
             panic!("{asked:?}: the rule cache answers on the fast path");
         };
