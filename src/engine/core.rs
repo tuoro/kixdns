@@ -190,7 +190,7 @@ impl Engine {
         let rule_cache = Arc::new(CacheStore::new(10_000, std::time::Duration::ZERO));
 
         let geoip_manager = Arc::new(RwLock::new(GeoIpManager::default()));
-        let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::new()));
+        let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::default()));
         let state = Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg)));
         let geo_sources = GeoSources::load(
             &state.load_full().pipeline,

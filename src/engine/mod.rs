@@ -44,7 +44,6 @@ mod inflight_wait_tests;
 #[cfg(test)]
 mod jump_fast_path_tests;
 pub mod listener;
-pub mod matcher_adapter;
 pub mod memory_watermark;
 #[cfg(test)]
 mod merged_failure_check_tests;
@@ -112,7 +111,6 @@ pub use concurrency::PermitManager;
 pub use core::{Engine, EngineBuilder};
 pub use execution::{PreParsedData, UnreadableQuery};
 pub use listener::{OnTheSpot, write_cache_hit};
-pub use matcher_adapter::*;
 pub use pipeline::select_pipeline;
 pub use types::{EngineInner, FastPathResponse};
 

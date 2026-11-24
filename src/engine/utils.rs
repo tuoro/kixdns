@@ -1,7 +1,5 @@
 use super::types::InflightMap;
-use crate::matcher::{GeoTags, RuntimePipelineConfig};
 use bytes::Bytes;
-use hickory_proto::op::ResponseCode;
 use std::sync::Arc;
 
 /// RAII Guard for cleaning up inflight request map
@@ -104,96 +102,5 @@ impl Drop for RefreshingGuard {
         if let Some((_, ended)) = self.refreshing.remove(&self.mark) {
             ended.notify_waiters();
         }
-    }
-}
-
-/// 规则（连同 pipeline_select 和回答检查）用到的 GeoSite 标签（已经是小写），排好序、去掉重复：数据文件只读这些标签。
-/// 写成空的不算：那样的匹配器已经算一条问题或告警（见 `config::problems`、`config::warnings`），不再算作没有数据的标签
-/// The GeoSite tags rules use (pipeline_select and answer checks included), lowercase already,
-/// sorted and deduplicated: data files are read for these tags alone. One written empty does not
-/// count: its matcher is a problem or a warning already (see `config::problems`,
-/// `config::warnings`), not one more tag without data
-pub fn extract_geosite_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
-    used_tags(
-        cfg.geo_tags()
-            .filter_map(GeoTags::site)
-            .filter(|tag| !tag.is_empty())
-            .map(std::slice::from_ref),
-    )
-}
-
-/// 规则按 GeoIP 匹配的国家代码和命名标签（已经是大写），排好序、去掉重复；`geoip_private` 不需要
-/// GeoIP 数据，不算在内
-/// The country codes and named tags rules match on GeoIP (uppercase already), sorted and
-/// deduplicated; `geoip_private` needs no GeoIP data and does not count
-pub fn extract_geoip_tags_from_config(cfg: &RuntimePipelineConfig) -> Vec<String> {
-    used_tags(cfg.geo_tags().filter_map(GeoTags::ip))
-}
-
-/// 几组标签合起来，排好序、去掉重复 / Groups of tags put together, sorted and deduplicated
-fn used_tags<'a>(groups: impl Iterator<Item = &'a [Arc<str>]>) -> Vec<String> {
-    let mut tags: Vec<String> = groups.flatten().map(|tag| tag.to_string()).collect();
-    tags.sort_unstable();
-    tags.dedup();
-    tags
-}
-
-/// 将字符串形式的 DNS Rcode 解析为 ResponseCode
-/// Parse DNS Rcode string to ResponseCode
-///
-/// 支持的 Rcode: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED
-/// Supported Rcodes: NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED
-#[inline]
-pub(crate) fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
-    match rcode.to_ascii_uppercase().as_str() {
-        "NOERROR" => Some(ResponseCode::NoError),
-        "FORMERR" => Some(ResponseCode::FormErr),
-        "SERVFAIL" => Some(ResponseCode::ServFail),
-        "NXDOMAIN" => Some(ResponseCode::NXDomain),
-        "NOTIMP" => Some(ResponseCode::NotImp),
-        "REFUSED" => Some(ResponseCode::Refused),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::extract_geoip_tags_from_config;
-    use crate::{config::PipelineConfig, matcher::RuntimePipelineConfig};
-
-    fn runtime_config(json: &str) -> RuntimePipelineConfig {
-        let config: PipelineConfig = serde_json::from_str(json).unwrap();
-        RuntimePipelineConfig::from_config(config).unwrap()
-    }
-
-    #[test]
-    fn geoip_tags_cover_selectors_but_not_private_matchers() {
-        let selector = runtime_config(
-            r#"{
-                "pipeline_select": [{
-                    "pipeline": "default",
-                    "matchers": [{"type":"geoip_country","country_codes":["CN"]}]
-                }],
-                "pipelines": [{"id":"default"}]
-            }"#,
-        );
-        assert_eq!(extract_geoip_tags_from_config(&selector), ["CN"]);
-
-        let private_only = runtime_config(
-            r#"{
-                "pipelines": [{
-                    "id":"default",
-                    "rules": [{
-                        "name":"private-only",
-                        "matchers": [{"type":"geoip_private","expect":true}],
-                        "response_matchers": [{
-                            "type":"response_answer_ip_geoip_private",
-                            "expect":true
-                        }]
-                    }]
-                }]
-            }"#,
-        );
-        assert!(extract_geoip_tags_from_config(&private_only).is_empty());
     }
 }

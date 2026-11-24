@@ -12,16 +12,14 @@ use crate::cache_store::Cached;
 use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
 use crate::engine::execution::Request;
-use crate::engine::matcher_adapter::log_match;
 use crate::engine::response::{
     least_ttl, make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
     static_reply,
 };
 use crate::engine::upstream::UpstreamFailure;
-use crate::engine::utils::parse_rcode;
 use crate::matcher::RuntimeResponseMatcherWithOp;
 use crate::matcher::eval_match_chain;
-use crate::matcher::{RequesterKey, ResponsePhase};
+use crate::matcher::{RequesterKey, ResponsePhase, parse_rcode};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -581,6 +579,34 @@ async fn run_response_actions(
 /// A static answer the response actions give for the request, with the least TTL of its records:
 /// written on the wire from the client's query (see `response::static_reply`), with no parse of
 /// the request for it
+/// 执行 log 动作：按 `level`（trace、debug、warn、error，别的和不写都是 info）记下命中的规则、查询名和客户端地址
+/// Runs a log action: records the rule that matched, the query name and the client address at
+/// `level` (trace, debug, warn or error, info for anything else or none)
+pub(crate) fn log_match(
+    level: Option<&str>,
+    rule_name: &str,
+    qname: &str,
+    client_ip: std::net::IpAddr,
+) {
+    match level.unwrap_or("info") {
+        "trace" => {
+            tracing::trace!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "trace")
+        }
+        "debug" => {
+            tracing::debug!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "debug")
+        }
+        "warn" => {
+            tracing::warn!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "warn")
+        }
+        "error" => {
+            tracing::error!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "error")
+        }
+        _ => {
+            tracing::info!(event = "matcher_log", rule = %rule_name, qname = %qname, client_ip = %client_ip, level = "info")
+        }
+    }
+}
+
 fn static_answer(
     request: &Request<'_>,
     rcode: ResponseCode,

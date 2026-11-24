@@ -543,8 +543,9 @@ impl Swapped {
     }
 }
 
-/// GeoSite 数据库管理器 / GeoSite database manager
+/// GeoSite 数据库管理器，默认的什么数据都没有 / GeoSite database manager, the default one holding no data
 /// 使用 FxHashMap 实现高性能查找（由外层 RwLock 保护线程安全）/ Uses FxHashMap for high-performance lookup (thread-safety protected by outer RwLock)
+#[derive(Default)]
 pub struct GeoSiteManager {
     // Tag -> its matchers, indexed (see `TagMatchers`). Matching needs no cache in front: it is
     // a few hash lookups plus one regex-set scan, cheaper than a cache lookup and insert, and a
@@ -573,21 +574,7 @@ pub type ParsedGeoSite = Vec<(String, TagMatchers)>;
 /// the file taking them (see [`GeoSiteManager::handovers`])
 pub type Handovers = FxHashMap<PathBuf, Vec<String>>;
 
-impl Default for GeoSiteManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GeoSiteManager {
-    /// 创建新的 GeoSite 管理器 / Create new GeoSite manager
-    pub fn new() -> Self {
-        Self {
-            database: FxHashMap::default(),
-            sources: Vec::new(),
-        }
-    }
-
     /// 域名在不在标签 `tag`（如 `cn`、`google`、`category-ads`）里。`tag` 是小写的：规则写的标签编译时就转了小写（见
     /// `matcher::geosite_tag`），数据文件里的读进来时转
     /// Whether the name is in tag `tag` (such as `cn`, `google` or `category-ads`). `tag` is
@@ -1506,7 +1493,7 @@ mod tests {
                 build_geosite("ADS", &[build_domain(2, "doubleclick.net", &[])]),
             ],
         );
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&path, &["cn", "ads"]).unwrap();
         assert!(manager.matches("ads", "www.doubleclick.net"));
 
@@ -1534,7 +1521,7 @@ mod tests {
             &dir,
             &[build_geosite("OLD", &[build_domain(2, "old.example", &[])])],
         );
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&path, &["old", "new"]).unwrap();
 
         // One good entry followed by an unterminated varint.
@@ -1581,7 +1568,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let indirect = dir.path().join("sub").join("..").join("geosite.dat");
 
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&indirect, &["cn", "ads"]).unwrap();
         assert!(manager.matches("ads", "www.doubleclick.net"));
 
@@ -1621,7 +1608,7 @@ mod tests {
         };
         std::fs::write(&json, json_body("doubleclick.net")).unwrap();
 
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&dat, &["cn", "ads"]).unwrap();
         manager.load_file(&json, &["cn", "ads"]).unwrap();
         assert!(manager.matches("cn", "www.baidu.com"));
@@ -1673,7 +1660,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&a, &["ads", "only-a"]).unwrap();
         manager.load_file(&b, &["ads", "only-a"]).unwrap();
 
@@ -1718,7 +1705,7 @@ mod tests {
         let (a, b) = (dir.path().join("a.dat"), dir.path().join("b.dat"));
         write_ads(&a, "from-a.example");
         write_ads(&b, "from-b.example");
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&a, &["ads"]).unwrap();
         manager.load_file(&b, &["ads"]).unwrap();
         assert!(manager.matches("ads", "www.from-b.example"));
@@ -1748,7 +1735,7 @@ mod tests {
         write_ads(&first, "from-first.example");
         write_ads(&second, "from-second.example");
         write_ads(&last, "from-last.example");
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         for path in [&first, &second, &last] {
             manager.load_file(path, &["ads"]).unwrap();
         }
@@ -1785,7 +1772,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&a, &["ads"]).unwrap();
         // b.dat 后加载，此刻 ads 命中的是 b.dat 的数据
         // b.dat loads last, so ads matches b.dat's data at this point
@@ -1830,7 +1817,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&json, &["cn"]).unwrap();
         manager.load_file(&dat, &["cn"]).unwrap();
         assert!(manager.matches("cn", "www.baidu.com"));
@@ -1868,7 +1855,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&first, &["ads"]).unwrap();
         manager.load_file(&second, &["ads"]).unwrap();
         assert!(manager.matches("ads", "second.example"));
@@ -1914,7 +1901,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&a, &["ads", "track", "only-b"]).unwrap();
         manager.load_file(&b, &["ads", "track", "only-b"]).unwrap();
         assert!(manager.matches("ads", "www.ads.example"));
@@ -2250,7 +2237,7 @@ mod tests {
             ],
         );
         let tags = ["cn", "ads"];
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&path, &tags).unwrap();
 
         // 只写出前半段，模拟覆盖写到一半 / Write only the first half
@@ -2330,7 +2317,7 @@ mod tests {
             )],
         );
         let tag = "test@cn@ads";
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&path, &[tag]).unwrap();
         assert!(manager.matches(tag, "both.example"));
         for name in ["cn.example", "ads.example", "none.example"] {
@@ -2368,28 +2355,28 @@ mod tests {
         std::fs::write(&path, &dat).unwrap();
 
         // @cn: only example.com
-        let mut m1 = GeoSiteManager::new();
+        let mut m1 = GeoSiteManager::default();
         m1.load_file(&path, &["test@cn"]).unwrap();
         assert!(m1.matches("test@cn", "example.com"));
         assert!(!m1.matches("test@cn", "other.com"));
         assert!(!m1.matches("test@cn", "foreign.com"));
 
         // no filter: all three
-        let mut m2 = GeoSiteManager::new();
+        let mut m2 = GeoSiteManager::default();
         m2.load_file(&path, &["test"]).unwrap();
         assert!(m2.matches("test", "example.com"));
         assert!(m2.matches("test", "other.com"));
         assert!(m2.matches("test", "foreign.com"));
 
         // @!cn: the domains carrying the key `!cn`, as in V2Ray; not a negation
-        let mut m3 = GeoSiteManager::new();
+        let mut m3 = GeoSiteManager::default();
         m3.load_file(&path, &["test@!cn"]).unwrap();
         assert!(!m3.matches("test@!cn", "example.com"));
         assert!(!m3.matches("test@!cn", "other.com"));
         assert!(m3.matches("test@!cn", "foreign.com"));
 
         // Without `cn` is the tag minus `@cn`, the two matchers a rule combines
-        let mut m4 = GeoSiteManager::new();
+        let mut m4 = GeoSiteManager::default();
         m4.load_file(&path, &["test", "test@cn"]).unwrap();
         let without_cn =
             |domain: &str| m4.matches("test", domain) && !m4.matches("test@cn", domain);
@@ -2414,7 +2401,7 @@ mod tests {
         let path = dir.path().join("kixdns_test_dual.dat");
         std::fs::write(&path, &dat).unwrap();
 
-        let mut m = GeoSiteManager::new();
+        let mut m = GeoSiteManager::default();
         let count = m.load_file(&path, &["dual", "dual@cn"]).unwrap();
         assert_eq!(count, 2); // both loaded
 
@@ -2467,7 +2454,7 @@ mod tests {
     /// (parse_file) are checked.
     #[test]
     fn json_entries_follow_v2ray_and_match_whole_labels() {
-        let mut from_string = GeoSiteManager::new();
+        let mut from_string = GeoSiteManager::default();
         from_string
             .load_from_v2ray_string(V2RAY_JSON_ENTRIES)
             .unwrap();
@@ -2476,7 +2463,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("geosite.json");
         std::fs::write(&path, V2RAY_JSON_ENTRIES).unwrap();
-        let mut from_file = GeoSiteManager::new();
+        let mut from_file = GeoSiteManager::default();
         from_file.load_file(&path, &["t"]).unwrap();
         assert_v2ray_json_entries(&from_file);
     }
@@ -2513,7 +2500,7 @@ mod tests {
     /// an empty value does not make the whole tag match everything.
     #[test]
     fn json_entries_that_cannot_match_are_skipped() {
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager
             .load_from_v2ray_string(
                 r#"{"entries":[{"tag":"t","domains":[
@@ -2540,7 +2527,7 @@ mod tests {
                 build_geosite("empty", &[build_domain(2, "", &[])]),
             ],
         );
-        let mut manager = GeoSiteManager::new();
+        let mut manager = GeoSiteManager::default();
         manager.load_file(&path, &["t", "empty"]).unwrap();
         assert!(manager.matches("t", "github.com"));
         assert!(manager.matches("t", "api.github.com"));
@@ -2554,12 +2541,12 @@ mod tests {
     #[test]
     fn json_tags_ignore_case() {
         let json = r#"{"entries":[{"tag":"Ads","domains":["ads.example"]}]}"#;
-        let mut from_string = GeoSiteManager::new();
+        let mut from_string = GeoSiteManager::default();
         from_string.load_from_v2ray_string(json).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("geosite.json");
         std::fs::write(&path, json).unwrap();
-        let mut from_file = GeoSiteManager::new();
+        let mut from_file = GeoSiteManager::default();
         from_file.load_file(&path, &["ads"]).unwrap();
         for manager in [&from_string, &from_file] {
             assert!(manager.matches("ads", "ads.example"));

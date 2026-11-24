@@ -7,13 +7,12 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
-use crate::engine::utils::parse_rcode;
 use crate::engine::{make_static_cname_answer, make_static_ip_answer, static_ips};
 use crate::matcher::{
     GeoManagers, RequestFacts, RuntimeMatcher, RuntimeMatcherWithOp, RuntimePipeline,
     RuntimePipelineConfig, RuntimeRule,
 };
-use crate::matcher::{domain_suffix_index_key, eval_match_chain};
+use crate::matcher::{domain_suffix_index_key, eval_match_chain, parse_rcode};
 
 #[derive(Debug, Clone)]
 pub struct CompiledPipeline {

@@ -889,8 +889,7 @@ async fn geosite_tags_count_once_whatever_their_case() {
     let path = dir.path().join("geosite.dat");
     std::fs::write(&path, geosite_dat(&[("testa", "geo.test")])).unwrap();
     let cfg = geosite_config_any_of(&[&path], &["TestA", "testa", "gone", "Gone"]);
-    let mut used = crate::engine::utils::extract_geosite_tags_from_config(&cfg);
-    used.sort_unstable();
+    let used = cfg.geosite_tags();
     assert_eq!(used, ["gone", "testa"]);
     let engine = engine(cfg);
     assert_eq!(ask(&engine, "www.geo.test").await, Some(MATCHED));
