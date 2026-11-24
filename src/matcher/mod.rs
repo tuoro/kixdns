@@ -664,6 +664,10 @@ impl RuntimeMatcher {
     fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
         Ok(match m {
             config::Matcher::Any => RuntimeMatcher::Any,
+            // 规则看不到是哪个入口收的查询 / A rule does not see which entry took the query
+            config::Matcher::ListenerLabel { .. } => {
+                anyhow::bail!("listener_label works in pipeline_select only")
+            }
             config::Matcher::DomainSuffix { value } => RuntimeMatcher::DomainSuffix {
                 value: domain_value(&value),
             },
@@ -798,28 +802,13 @@ pub struct PipelineSelectorQuery<'a> {
 }
 
 impl RuntimePipelineSelectorMatcher {
-    fn from_config(m: config::PipelineSelectorMatcher) -> anyhow::Result<Self> {
-        use config::{Matcher, PipelineSelectorMatcher as Selector};
-        let request = match m {
-            Selector::ListenerLabel { value } => {
-                return Ok(Self::ListenerLabel {
-                    value: Arc::from(value),
-                });
-            }
-            Selector::ClientIp { cidr } => Matcher::ClientIp { cidr },
-            Selector::DomainSuffix { value } => Matcher::DomainSuffix { value },
-            Selector::DomainExact { value } => Matcher::DomainExact { value },
-            Selector::DomainRegex { value } => Matcher::DomainRegex { value },
-            Selector::Any => Matcher::Any,
-            Selector::Qclass { value } => Matcher::Qclass { value },
-            Selector::EdnsPresent { expect } => Matcher::EdnsPresent { expect },
-            Selector::GeoSite { value } => Matcher::GeoSite { value },
-            Selector::GeoSiteNot { value } => Matcher::GeoSiteNot { value },
-            Selector::GeoipCountry { country_codes } => Matcher::GeoipCountry { country_codes },
-            Selector::GeoipPrivate { expect } => Matcher::GeoipPrivate { expect },
-            Selector::Qtype { value } => Matcher::Qtype { value },
-        };
-        RuntimeMatcher::from_config(request).map(Self::Request)
+    fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
+        match m {
+            config::Matcher::ListenerLabel { value } => Ok(Self::ListenerLabel {
+                value: Arc::from(value),
+            }),
+            request => RuntimeMatcher::from_config(request).map(Self::Request),
+        }
     }
 
     /// 要不要 GeoSite 数据；不要的话选 pipeline 时不拿它的锁 / Whether it needs GeoSite data; without

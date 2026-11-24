@@ -5,9 +5,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use kixdns::config::{
-    Action, Matcher, PipelineSelectorMatcher, ResponseMatcher, parse_config, refuse_problems,
-};
+use kixdns::config::{Action, Matcher, ResponseMatcher, parse_config, refuse_problems};
 use serde::de::DeserializeOwned;
 
 /// 中英文两份配置参考，各自三张类型表的标题 / The two configuration references and the headings of their three type tables
@@ -71,19 +69,18 @@ fn accepted<T: DeserializeOwned>() -> BTreeSet<String> {
 
 #[test]
 fn documented_type_names_are_the_accepted_ones() {
-    let selector = accepted::<PipelineSelectorMatcher>();
-    let request = accepted::<Matcher>();
     for (path, [requests, responses, actions]) in DOCS {
         let doc = read(path);
-        // 请求匹配器表同时说 Pipeline selector 和请求规则：规则认表里除 listener_label 之外的全部
-        // The request matcher table covers the pipeline selector and request rules alike: rules accept all of it but listener_label
-        let table = table_types(&doc, requests);
-        assert_eq!(table, selector, "{path}: {requests}");
-        let rules: BTreeSet<String> = table
-            .into_iter()
-            .filter(|name| name != "listener_label")
-            .collect();
-        assert_eq!(rules, request, "{path}: request rules");
+        // 请求匹配器表同时说 Pipeline selector 和请求规则，两边读的是同一套；写在规则里的 listener_label 编译不过（见
+        // config 的测试）
+        // The request matcher table covers the pipeline selector and request rules alike, both
+        // reading the one set; a listener_label written in a rule does not compile (see the
+        // config tests)
+        assert_eq!(
+            table_types(&doc, requests),
+            accepted::<Matcher>(),
+            "{path}: {requests}"
+        );
         assert_eq!(
             table_types(&doc, responses),
             accepted::<ResponseMatcher>(),
