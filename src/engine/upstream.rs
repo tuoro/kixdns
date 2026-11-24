@@ -756,7 +756,7 @@ async fn forward_upstream_as_is(
                     None,
                 );
                 if let Some(qr) = quick {
-                    tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %qr.rcode, "upstream call succeeded");
+                    tracing::debug!(upstream=%up, upstream_ns = dur.as_nanos() as u64, rcode = %crate::observe::rcode_name(u16::from(qr.rcode)), "upstream call succeeded");
                 }
                 return Ok((bytes, upstream_label(via, addr)));
             }
@@ -767,9 +767,9 @@ async fn forward_upstream_as_is(
                 // No prefix is built on failure, only a warn; a 429 logs at debug, the DoH
                 // client having logged one warn as the pause began
                 if outcome == UpstreamOutcome::Throttled {
-                    tracing::debug!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
+                    tracing::debug!(upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
                 } else {
-                    crate::warn_sparse!(upstream=%up, error=%err, elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
+                    crate::warn_sparse!(upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
                 }
                 return Err(UpstreamFailure::error(err));
             }
@@ -876,9 +876,9 @@ async fn forward_upstream_as_is(
                         // 回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
                         // A 429 logs at debug: the DoH client logged one warn as the pause began
                         if outcome == UpstreamOutcome::Throttled {
-                            tracing::debug!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
+                            tracing::debug!(upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
                         } else {
-                            crate::warn_sparse!(upstream=%up_proto, error=%err, elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                            crate::warn_sparse!(upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         }
                         last_err = Some(err);
                     }
@@ -1001,9 +1001,12 @@ impl<'a> Attempts<'a> {
         attempt
     }
 
-    /// 报 `attempt` 的结果：`via` 是带回应答的传输，`reply` 是快速解析出的应答 / Reports the
-    /// result of `attempt`: `via` is the transport that carried the answer, `reply` the answer
-    /// as quickly parsed
+    /// 报 `attempt` 的结果：`via` 是带回应答的传输，`latency` 是从发出到拿到应答（或失败）的总时长，UDP 的重发、截断后改用
+    /// TCP 重取、失败后回退到 TCP 都算在里面，`via` 是 TCP 时也不只是 TCP 那一段；`reply` 是快速解析出的应答 / Reports the
+    /// result of `attempt`: `via` is the transport that carried the answer, `latency` the whole
+    /// time from sending to the answer (or the failure), a UDP resend, a TCP retry after
+    /// truncation and a TCP fallback after failure all counted in, so with `via` TCP it is not the
+    /// TCP exchange alone; `reply` is the answer as quickly parsed
     fn finish(
         &mut self,
         attempt: usize,
@@ -2208,6 +2211,56 @@ mod tests {
             Duration::from_millis(1000)
         );
         assert_eq!(hedge_timeout(Duration::ZERO), Duration::ZERO);
+    }
+
+    /// 上游失败的 warn 带着完整的原因，不只是最外层那一句：只有一个上游时、几个上游一起问时都是。这里 DoH 上游读完请求
+    /// 就断开，最外层只说请求没发成，为什么没发成在里层
+    /// A failed upstream's warn carries the whole reason, not just its outermost sentence: with a
+    /// single upstream and with several asked together alike. The DoH upstream here closes once it
+    /// has read the request, the outermost sentence only saying the request was not sent, why it
+    /// was not being further in
+    #[tokio::test]
+    async fn a_failed_upstream_is_logged_with_its_whole_reason() {
+        use crate::engine::test_support::{DohReply, Warnings, spawn_doh_upstream};
+        let (doh, _) = spawn_doh_upstream(|_, _| DohReply::Close).await;
+        let engine = build_test_engine(false);
+        engine.doh_client.use_plain_http();
+        let packet = build_dns_query_packet("example.com.");
+        let (warnings, guard) = Warnings::capture();
+        for upstream in [
+            format!("doh://{doh}/a"),
+            format!("doh://{doh}/a,doh://{doh}/b"),
+        ] {
+            let forwarded = forward_upstream(
+                &engine,
+                &packet,
+                &upstream,
+                Duration::from_secs(2),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            assert!(forwarded.is_err());
+        }
+        drop(guard);
+        let lines = warnings.lines();
+        let failed = |message: &str| {
+            lines
+                .iter()
+                .filter(|line| line.contains(message))
+                .collect::<Vec<_>>()
+        };
+        let single = failed("single upstream call failed");
+        let several = failed("upstream call failed, waiting for others");
+        assert_eq!((single.len(), several.len()), (1, 2), "{lines:#?}");
+        for line in single.into_iter().chain(several) {
+            assert!(
+                line.contains("error=doh request send failed: error sending request"),
+                "{line}"
+            );
+        }
     }
 }
 

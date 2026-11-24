@@ -29,7 +29,7 @@ use rustls::pki_types::ServerName;
 use url::{Host, Url};
 
 use super::bootstrap::Bootstrap;
-use super::transport::{Aging, Connect, InFlight, Wear, connect_tcp, least_busy};
+use super::transport::{Aging, Connect, InFlight, Wear, connect_tcp, forget, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
 pub(crate) type H2Sender = SendRequest<Bytes>;
@@ -114,15 +114,15 @@ impl H2Link {
         Some(sender)
     }
 
-    /// 发请求用的发送端和它占着的连接位：位上有能用的连接就用它，没有就等一条新的（见 [`Connect`]：建连的任务建好了放到
-    /// 位上，这个请求再取用；等来的连接在取用之前就没了时不再等下一条）。请求答完（或放弃）之前一直拿着 [`InFlight`]。上游
-    /// 没选 h2 时是 None，交给 reqwest。`deadline` 是这个请求的期限
+    /// 发请求用的发送端和它占着的连接位：位上有能用的连接就用它，没有就等一条新的（见 [`Connect::get_or_make`]：建连的任务
+    /// 建好了放到位上，这个请求再取用；等来的连接在取用之前就没了时不再等下一条）。请求答完（或放弃）之前一直拿着
+    /// [`InFlight`]。上游没选 h2 时是 None，交给 reqwest。`deadline` 是这个请求的期限
     /// The sender for a request and the slot it holds: the slot's connection when usable, a new
-    /// one waited for otherwise (see [`Connect`]: the connecting task puts it on the slot once
-    /// made, and this request takes it from there; a connection waited for and gone before it
-    /// could be taken is not followed by a wait for another). The [`InFlight`] is kept until the
-    /// request is answered (or given up). None when the upstream did not pick h2, for reqwest to
-    /// handle. `deadline` is the request's
+    /// one waited for otherwise (see [`Connect::get_or_make`]: the connecting task puts it on the
+    /// slot once made, and this request takes it from there; a connection waited for and gone
+    /// before it could be taken is not followed by a wait for another). The [`InFlight`] is kept
+    /// until the request is answered (or given up). None when the upstream did not pick h2, for
+    /// reqwest to handle. `deadline` is the request's
     pub(crate) async fn sender(
         &self,
         url: &Url,
@@ -132,52 +132,48 @@ impl H2Link {
     ) -> anyhow::Result<Option<(H2Sender, InFlight<'_>)>> {
         let slot = least_busy(&self.slots, |slot| slot.in_flight.load(Ordering::Relaxed));
         let in_flight = InFlight::enter(&slot.in_flight);
-        for waited in [false, true] {
+        // 位上能用的发送端；上游没选 h2 时是 Some(None) / The slot's usable sender; Some(None) when the
+        // upstream did not pick h2
+        let ready = || {
             if self.no_h2.load(Ordering::Relaxed) {
-                return Ok(None);
+                return Some(None);
             }
-            if let Some(sender) = Self::usable(slot, deadline) {
-                return Ok(Some((sender, in_flight)));
-            }
-            if waited {
-                break;
-            }
-            let attempt = {
-                let mut connecting = slot.connecting.lock();
-                // 别的请求的连接可能刚放到位上 / Another request's connection may have just been put on the slot
-                if let Some(sender) = Self::usable(slot, deadline) {
-                    return Ok(Some((sender, in_flight)));
-                }
-                connecting.attempt(|| {
-                    let (url, tls, bootstrap) =
-                        (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
-                    let (slot, no_h2, aging) =
-                        (Arc::clone(slot), Arc::clone(&self.no_h2), self.aging);
-                    async move {
-                        match connect(&url, &tls, &bootstrap).await? {
-                            Some(sender) => {
-                                let wear = Arc::new(Wear::new());
-                                let conn = Arc::new(H2Conn {
-                                    sender,
-                                    wear: Arc::clone(&wear),
-                                });
-                                tokio::spawn(watch(
-                                    Arc::downgrade(&slot),
-                                    Arc::downgrade(&conn),
-                                    wear,
-                                    aging,
-                                ));
-                                slot.conn.store(Some(conn));
-                            }
-                            None => no_h2.store(true, Ordering::Relaxed),
-                        }
-                        Ok(())
+            Self::usable(slot, deadline).map(Some)
+        };
+        let make = || {
+            let (url, tls, bootstrap) = (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
+            let (slot, no_h2, aging) = (Arc::clone(slot), Arc::clone(&self.no_h2), self.aging);
+            async move {
+                match connect(&url, &tls, &bootstrap).await? {
+                    Some(sender) => {
+                        let wear = Arc::new(Wear::new());
+                        let conn = Arc::new(H2Conn {
+                            sender,
+                            wear: Arc::clone(&wear),
+                        });
+                        tokio::spawn(watch(
+                            Arc::downgrade(&slot),
+                            Arc::downgrade(&conn),
+                            wear,
+                            aging,
+                        ));
+                        slot.conn.store(Some(conn));
                     }
-                })?
-            };
-            attempt.await?;
-        }
-        anyhow::bail!("doh connection closed as soon as it was made")
+                    None => no_h2.store(true, Ordering::Relaxed),
+                }
+                Ok(())
+            }
+        };
+        let sender = match ready() {
+            Some(sender) => sender,
+            None => {
+                Connect::get_or_make(&slot.connecting, |connect| connect, |_| ready(), make)
+                    .await?
+                    .context("doh connection closed as soon as it was made")?
+                    .0
+            }
+        };
+        Ok(sender.map(|sender| (sender, in_flight)))
     }
 
     /// 现在有没有一条直连的连接 / Whether a direct connection is open now
@@ -222,11 +218,7 @@ impl H2Link {
 async fn watch(slot: Weak<Slot>, conn: Weak<H2Conn>, wear: Arc<Wear>, aging: Aging) {
     let why = aging.worn(&wear).await;
     if let (Some(slot), Some(conn)) = (slot.upgrade(), conn.upgrade()) {
-        slot.conn.rcu(|current| {
-            current
-                .clone()
-                .filter(|current| !Arc::ptr_eq(current, &conn))
-        });
+        forget(&slot.conn, &conn);
         tracing::debug!(
             why,
             "DoH HTTP/2 connection worn, closing it once its requests are done"
