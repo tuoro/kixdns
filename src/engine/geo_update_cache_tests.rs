@@ -509,15 +509,16 @@ async fn rules_judging_the_client_country_follow_new_networks_without_a_namespac
 }
 
 /// 配置重载换进来的新规则沿用数据更新后的命名空间，不会退回去拿按旧数据缓存的应答；重载时读进来的数据（配置里写了、
-/// 此前还不存在的文件）同样换命名空间。以前重载后命名空间只看配置
+/// 此前连所在的目录都不存在、监视不了的文件）同样换命名空间。以前重载后命名空间只看配置
 /// New rules a configuration reload swaps in keep the namespace a data update moved to, and
 /// do not go back to answers cached with the old data; data a reload reads in (a file the
-/// configuration names that did not exist before) moves the namespace too. The namespace
-/// after a reload used to depend on the configuration alone
+/// configuration names that did not exist before, its directory neither, so nothing could
+/// watch it) moves the namespace too. The namespace after a reload used to depend on the
+/// configuration alone
 #[tokio::test]
 async fn a_configuration_reload_keeps_up_with_the_geo_data() {
     let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("geosite.dat");
+    let data = dir.path().join("later").join("geosite.dat");
     let otherwise = json!({ "type": "static_ip_response", "ip": OTHER.to_string() });
     // 文件还不存在 / The file does not exist yet
     let engine =
@@ -526,6 +527,7 @@ async fn a_configuration_reload_keeps_up_with_the_geo_data() {
         both_paths(&engine, "tracker.example").await,
         [Some(OTHER); 2]
     );
+    std::fs::create_dir(data.parent().unwrap()).unwrap();
     std::fs::write(&data, ads(&["tracker.example"])).unwrap();
     let before = namespace(&engine, "main");
     engine.reload(geosite_config(&data, otherwise.clone()));
@@ -556,13 +558,14 @@ async fn a_configuration_reload_keeps_up_with_the_geo_data() {
     );
 }
 
-/// GeoIP 也一样：配置里写了、此前还不存在的数据文件在重载时读进来，按回答地址判断的 Pipeline 换命名空间
-/// GeoIP likewise: a data file the configuration names that did not exist before is read in
-/// on a reload, and a pipeline judging answer addresses moves to a new namespace
+/// GeoIP 也一样：配置里写了、此前连所在的目录都不存在的数据文件在重载时读进来，按回答地址判断的 Pipeline 换命名空间
+/// GeoIP likewise: a data file the configuration names that did not exist before, its
+/// directory neither, is read in on a reload, and a pipeline judging answer addresses moves
+/// to a new namespace
 #[tokio::test]
 async fn a_reload_reading_geoip_data_in_moves_the_namespace() {
     let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("geoip.json");
+    let data = dir.path().join("later").join("geoip.json");
     let config = || {
         runtime(json!({
             "settings": settings(json!({ "geoip_dat_path": data.to_str().unwrap() })),
@@ -581,6 +584,7 @@ async fn a_reload_reading_geoip_data_in_moves_the_namespace() {
     };
     let engine = Engine::new(config(), "test".to_string()).expect("engine");
     let before = namespace(&engine, "main");
+    std::fs::create_dir(data.parent().unwrap()).unwrap();
     std::fs::write(
         &data,
         r#"{"entries":[{"country_code":"TESTNET","ips":["192.0.2.0/24"]}]}"#,

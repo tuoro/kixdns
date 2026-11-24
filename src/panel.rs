@@ -1927,7 +1927,11 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let response = match (request.method(), request.uri().path()) {
         (&Method::GET, "/v1/health") => json_response(StatusCode::OK, metrics.health_json()),
-        (&Method::GET, "/v1/config/active") => json_response(StatusCode::OK, metrics.config_json()),
+        (&Method::GET, "/v1/config/active") => {
+            let mut config = metrics.config_json();
+            config["data_warnings"] = json!(engine.geo_data_warnings());
+            json_response(StatusCode::OK, config)
+        }
         (&Method::GET, "/v1/metrics") => metrics_response(&metrics, engine).await,
         (&Method::GET, "/v1/stats/top") => match parse_stats_query(request.uri().query()) {
             Ok((window_seconds, limit)) => stats_response(&metrics, window_seconds, limit).await,
