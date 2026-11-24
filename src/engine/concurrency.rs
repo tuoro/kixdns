@@ -8,6 +8,7 @@ use dashmap::DashMap;
 
 use super::fair_queue::{Device, MAX_QUEUED_DEVICES};
 use super::memory_watermark::Room;
+use crate::config::ForwardTarget;
 
 /// 查询在内核里排队超过这么久，就算内核跟不上。这是延迟目标，和机器无关：快机器和慢机器都一样
 /// Queries waiting longer than this inside the kernel means it cannot keep up. This is a
@@ -1112,7 +1113,7 @@ pub struct Asking<'a> {
     manager: &'a PermitManager,
     flow: &'a FlowControlState,
     client: std::net::IpAddr,
-    upstream: &'a str,
+    target: &'a ForwardTarget,
     /// 上游的时限 / The upstream's timeout
     limit: Duration,
     /// 这一次是什么时候开始等的 / When this wait began
@@ -1172,7 +1173,7 @@ impl Asking<'_> {
         // 开始等的那一刻已经读过时钟 / The clock was read as the wait began
         let mut now = self.since;
         loop {
-            let stuck_at = self.since + self.manager.stuck_after(self.upstream, self.limit);
+            let stuck_at = self.since + self.manager.stuck_after(self.target, self.limit);
             if now >= stuck_at {
                 break;
             }
@@ -1207,7 +1208,7 @@ impl Drop for Asking<'_> {
                 if !self.stuck && self.since.elapsed() < self.limit {
                     return;
                 }
-                let slots = self.manager.asked_slots(self.client, self.upstream);
+                let slots = self.manager.asked_slots(self.client, self.target);
                 if self.flow.behind() && self.manager.asked.ever_answered(slots) {
                     return;
                 }
@@ -1225,7 +1226,7 @@ impl Drop for Asking<'_> {
                 Noted::Answered(ANSWERED_NOTED_ONE_IN)
             }
         };
-        let slots = self.manager.asked_slots(self.client, self.upstream);
+        let slots = self.manager.asked_slots(self.client, self.target);
         self.manager.asked.note(slots, noted);
     }
 }
@@ -1558,7 +1559,7 @@ impl PermitManager {
         self.active_permits.load(Ordering::Acquire)
     }
 
-    /// 等 `upstream`（规则里写的那一串上游）的一个查询等多久算卡住，`limit` 是上游的时限。这个上游最近的回答里最慢的
+    /// 等 `target`（规则里写的那一串上游）的一个查询等多久算卡住，`limit` 是上游的时限。这个上游最近的回答里最慢的
     /// `1 / SLOWEST_ONE_IN` 用时的 [`WAITS_TIMES_SLOWEST`] 倍，至少 `BUSY_AFTER`。回答要多久是每个上游自己的：国内的上游十毫秒、国外的两百多毫秒，合在一起看的话，
     /// 查询少的那个慢上游永远排不进最慢的那一小部分，它每个回答都算卡住。一串里有几个上游时取最慢的那个；哪个上游还没等到过
     /// 回答，先按所有上游合起来的算——它不通还是慢，等它自己的回答来了才知道；哪个上游都还没等到过回答时（刚启动），按上游
@@ -1572,7 +1573,7 @@ impl PermitManager {
     /// 之前在内核里排的队不在里面；内核忙时上游的回答晚读出来，量到的用时里已经带着这一段。加上的话，在途越多排得越久、
     /// 排得越久越没有谁算卡住，在途就一直涨下去。按这个时间看错了的后果：太短，一台设备超出它那一份的慢查询不等了，留着的等到回答以后就改过来；
     /// 太长，不回答的查询多占一阵内存。两样都不会拒掉新来的查询
-    /// How long a query waiting on `upstream` (the upstreams as the rule writes them) counts as
+    /// How long a query waiting on `target` (the upstreams as the rule writes them) counts as
     /// stuck after, `limit` being the upstream's timeout. It is [`WAITS_TIMES_SLOWEST`] times
     /// what the slowest `1 / SLOWEST_ONE_IN` of this upstream's latest answers took, at least
     /// `BUSY_AFTER`. How long answers take is each upstream's own: with a
@@ -1603,9 +1604,10 @@ impl PermitManager {
     /// a wrong time costs: too short, a device's slow
     /// queries past its share wait no more, put right once those kept get their answers; too
     /// long, queries with no answer hold memory a while longer. Neither refuses a new query
-    pub fn stuck_after(&self, upstream: &str, limit: Duration) -> Duration {
+    pub fn stuck_after(&self, target: &ForwardTarget, limit: Duration) -> Duration {
         let slowest = self.answer_time.slowest().map(|all| {
-            crate::config::upstream_addresses(upstream)
+            target
+                .addresses()
                 .map(|address| {
                     self.answer_time_of
                         .get(address)
@@ -1661,14 +1663,14 @@ impl PermitManager {
         })
     }
 
-    /// 替 `client` 等 `upstream`（规则里写的那一串上游）之前调，`limit` 是上游的时限：返回的 [`Asking`] 跟着这一次等待。这台
+    /// 替 `client` 等 `target`（规则里写的那一串上游）之前调，`limit` 是上游的时限：返回的 [`Asking`] 跟着这一次等待。这台
     /// 设备最近在这个上游上的等待多半没等到回答时返回 None，这一个不等，记一次拒绝，调用方照上游失败处理（规则写了失败时的
     /// 动作就照做，比如改问备用的上游）；每隔 [`TRIES_APART`] 放一个去试，试的那个等到了回答就都放开。新来的查询等不等得到
     /// 回答，放进来时没法知道；这里看的是这台设备在这个上游上已经有的结果，是整个流控里唯一一处按过去的结果拦新查询的地方，
     /// 所以拦得窄：只拦这台设备、只拦这个上游——别的设备、这台设备走别的上游的查询都不受影响；一个上游不通，或者一台设备冲得
     /// 上游不再回答它时，是这里把它拦住，不让它一直往一个不回答的上游发；没回答的要多过回答了的才拦，一成两成名字不回答的
     /// 设备不会被拦。代价：一台设备问同一个上游的名字多半都不回答时，它在这个上游上答得上的那小半也被拦住
-    /// Called before waiting on `upstream` (the upstreams as the rule writes them) for `client`,
+    /// Called before waiting on `target` (the upstreams as the rule writes them) for `client`,
     /// `limit` being the upstream's timeout: the [`Asking`] returned goes with this wait. With
     /// most of this device's latest waits on this upstream unanswered it returns None, this one
     /// does not wait and counts as refused, and the caller treats it as the upstream failing
@@ -1687,12 +1689,12 @@ impl PermitManager {
         &'a self,
         flow: &'a FlowControlState,
         client: std::net::IpAddr,
-        upstream: &'a str,
+        target: &'a ForwardTarget,
         limit: Duration,
     ) -> Option<Asking<'a>> {
         // 平常谁都没被拦：不用算哈希 / As a rule nobody is held back: no hash to work out
         let tries = self.asked.mostly_unanswered.load(Ordering::Relaxed) > 0 && {
-            let slots = self.asked_slots(client, upstream);
+            let slots = self.asked_slots(client, target);
             let held_back = self.asked.held_back(slots);
             if held_back && !self.asked.tries_now(slots[0]) {
                 self.count_refused(Defence::Unanswered);
@@ -1705,7 +1707,7 @@ impl PermitManager {
             manager: self,
             flow,
             client,
-            upstream,
+            target,
             limit,
             since: Instant::now(),
             replied: None,
@@ -1715,12 +1717,12 @@ impl PermitManager {
         })
     }
 
-    /// 替 `client` 等别的请求正在做的、给 `upstream` 的同一个转发之前调：返回的 [`Asking`] 只管这次等待卡没卡住——等过了
+    /// 替 `client` 等别的请求正在做的、给 `target` 的同一个转发之前调：返回的 [`Asking`] 只管这次等待卡没卡住——等过了
     /// 算卡住的时间，这台设备留着等的没到它那一份就留着，到了就不等了（见 [`Asking::wait`]）；不然对着同一个不回答的名字
     /// 洪泛的设备，在途的全都陪着领头的等到上游超时。它不记进「设备、上游」的结果，被拦着的设备也照样等：这个查询自己
     /// 没有问上游，领头的交回来的可能是过期缓存、规则给的应答、备用上游的回答，说明不了这个上游回不回答；领头的那次等待
     /// 已经记在它自己头上。算卡住的时间按这个查询自己这条规则的上游算，领头的那时等的是不是它，这里看不到
-    /// Called before waiting for `client` on the same forward to `upstream` that another request
+    /// Called before waiting for `client` on the same forward to `target` that another request
     /// is making: the [`Asking`] returned sees only to whether this wait is stuck. Past the time
     /// a query counts as stuck after, it is kept while what this device keeps waiting is under
     /// its share and waits no more at its share (see [`Asking::wait`]); otherwise a device
@@ -1736,14 +1738,14 @@ impl PermitManager {
         &'a self,
         flow: &'a FlowControlState,
         client: std::net::IpAddr,
-        upstream: &'a str,
+        target: &'a ForwardTarget,
         limit: Duration,
     ) -> Asking<'a> {
         Asking {
             manager: self,
             flow,
             client,
-            upstream,
+            target,
             limit,
             since: Instant::now(),
             replied: None,
@@ -1753,10 +1755,10 @@ impl PermitManager {
         }
     }
 
-    /// 「`client` 所属的设备、`upstream`」按两个哈希各落在 `asked` 的哪一份 / The slots of `asked` the device
-    /// of `client` and `upstream` land in by each of the two hashes
-    fn asked_slots(&self, client: std::net::IpAddr, upstream: &str) -> [usize; 2] {
-        let hash = self.hasher.hash_one((Device::of(client), upstream));
+    /// 「`client` 所属的设备、`target`」按两个哈希各落在 `asked` 的哪一份 / The slots of `asked` the device
+    /// of `client` and `target` land in by each of the two hashes
+    fn asked_slots(&self, client: std::net::IpAddr, target: &ForwardTarget) -> [usize; 2] {
+        let hash = self.hasher.hash_one((Device::of(client), target));
         let slot = |bits: u64| (bits % DEVICE_SLOTS as u64) as usize;
         [slot(hash), DEVICE_SLOTS + slot(hash >> 32)]
     }
@@ -1980,7 +1982,8 @@ mod tests {
     }
 
     /// 测试里的上游、它的地址和时限 / The upstream of the tests, its address and its timeout
-    const UP: &str = "udp://198.51.100.1:53";
+    static UP: std::sync::LazyLock<ForwardTarget> =
+        std::sync::LazyLock::new(|| ForwardTarget::new("udp://198.51.100.1:53"));
     const UP_ADDRESS: &str = "198.51.100.1:53";
     const LIMIT: Duration = Duration::from_secs(3);
 
@@ -1996,16 +1999,16 @@ mod tests {
     #[test]
     fn before_any_answer_a_wait_is_stuck_after_the_hedge_point() {
         let manager = PermitManager::new();
-        assert_eq!(manager.stuck_after(UP, LIMIT), Duration::from_secs(1));
+        assert_eq!(manager.stuck_after(&UP, LIMIT), Duration::from_secs(1));
         assert_eq!(
-            manager.stuck_after(UP, Duration::from_millis(150)),
+            manager.stuck_after(&UP, Duration::from_millis(150)),
             BUSY_AFTER,
             "never under the floor"
         );
         manager.answer_time.note(20);
-        assert_eq!(manager.stuck_after(UP, LIMIT), BUSY_AFTER);
+        assert_eq!(manager.stuck_after(&UP, LIMIT), BUSY_AFTER);
         manager.answer_time.note(300);
-        let after = manager.stuck_after(UP, LIMIT);
+        let after = manager.stuck_after(&UP, LIMIT);
         assert!(
             after >= Duration::from_millis(600) && after <= Duration::from_millis(760),
             "{after:?}"
@@ -2027,11 +2030,11 @@ mod tests {
             manager.answer_time.note(300);
         }
         manager.answer_time.work_out();
-        assert_eq!(manager.stuck_after(UP, LIMIT), BUSY_AFTER);
+        assert_eq!(manager.stuck_after(&UP, LIMIT), BUSY_AFTER);
         for _ in 0..15 {
             manager.answer_time.note(300);
         }
-        let after = manager.stuck_after(UP, LIMIT);
+        let after = manager.stuck_after(&UP, LIMIT);
         assert!(
             after >= Duration::from_millis(600) && after <= Duration::from_millis(760),
             "{after:?}"
@@ -2047,11 +2050,11 @@ mod tests {
         for _ in 0..1024 {
             manager.answer_time.note(10);
         }
-        assert_eq!(manager.stuck_after(UP, LIMIT), BUSY_AFTER);
+        assert_eq!(manager.stuck_after(&UP, LIMIT), BUSY_AFTER);
         for _ in 0..11 {
             manager.answer_time.note(500);
         }
-        let after = manager.stuck_after(UP, LIMIT);
+        let after = manager.stuck_after(&UP, LIMIT);
         assert!(after >= Duration::from_secs(1), "{after:?}");
     }
 
@@ -2066,15 +2069,15 @@ mod tests {
         for _ in 0..8000 {
             manager.answer_time.note(500);
         }
-        assert!(manager.stuck_after(UP, LIMIT) >= Duration::from_secs(1));
+        assert!(manager.stuck_after(&UP, LIMIT) >= Duration::from_secs(1));
         for _ in 0..20_000 {
             manager.answer_time.note(5);
         }
-        assert!(manager.stuck_after(UP, LIMIT) >= Duration::from_secs(1));
+        assert!(manager.stuck_after(&UP, LIMIT) >= Duration::from_secs(1));
         for _ in 0..20_000 {
             manager.answer_time.note(5);
         }
-        assert_eq!(manager.stuck_after(UP, LIMIT), BUSY_AFTER);
+        assert_eq!(manager.stuck_after(&UP, LIMIT), BUSY_AFTER);
         assert!(
             manager.answer_time.noted.load(Ordering::Relaxed) < ANSWERS_REMEMBERED,
             "halved along the way"
@@ -2100,7 +2103,7 @@ mod tests {
                 manager.note_answer_took(far, Duration::from_millis(250));
             }
         }
-        let after = |upstream| manager.stuck_after(upstream, LIMIT);
+        let after = |upstream| manager.stuck_after(&ForwardTarget::new(upstream), LIMIT);
         assert_eq!(after("udp://198.51.100.1:53"), BUSY_AFTER);
         assert_eq!(after("198.51.100.1:53"), BUSY_AFTER, "with no prefix");
         assert!(
@@ -2141,7 +2144,8 @@ mod tests {
         }
         assert_eq!(manager.answer_time_of.len(), UPSTREAMS_TIMED);
         assert!(
-            manager.stuck_after("udp://upstream-4100:53", LIMIT) >= Duration::from_millis(800),
+            manager.stuck_after(&ForwardTarget::new("udp://upstream-4100:53"), LIMIT)
+                >= Duration::from_millis(800),
             "by all together"
         );
     }
@@ -2215,7 +2219,7 @@ mod tests {
     fn knowing() -> PermitManager {
         let manager = PermitManager::new();
         manager.answer_time.note(1);
-        assert_eq!(manager.stuck_after(UP, LIMIT), BUSY_AFTER);
+        assert_eq!(manager.stuck_after(&UP, LIMIT), BUSY_AFTER);
         manager
     }
 
@@ -2238,13 +2242,17 @@ mod tests {
 
     /// 替 `client` 等 `upstream`，流控没在跟不上 / Waits on `upstream` for `client`, flow control not
     /// falling behind
-    fn ask<'a>(manager: &'a PermitManager, client: &str, upstream: &'a str) -> Option<Asking<'a>> {
+    fn ask<'a>(
+        manager: &'a PermitManager,
+        client: &str,
+        upstream: &'a ForwardTarget,
+    ) -> Option<Asking<'a>> {
         manager.ask(&FLOW, client.parse().unwrap(), upstream, LIMIT)
     }
 
     /// 「`client`、`upstream`」记着的回答了的和没回答的 / What is noted for `client` and `upstream`:
     /// answered and unanswered
-    fn noted(manager: &PermitManager, client: &str, upstream: &str) -> (u64, u64) {
+    fn noted(manager: &PermitManager, client: &str, upstream: &ForwardTarget) -> (u64, u64) {
         let slots = manager.asked_slots(client.parse().unwrap(), upstream);
         let word = manager.asked.per_slot[slots[0]].load(Ordering::Relaxed);
         (word & 0xffff, (word >> 16) & 0xffff)
@@ -2255,12 +2263,12 @@ mod tests {
     #[tokio::test]
     async fn a_wait_done_in_time_gives_its_result() {
         let manager = knowing();
-        let mut asking = ask(&manager, CLIENT, UP).expect("asked");
+        let mut asking = ask(&manager, CLIENT, &UP).expect("asked");
         let done = asking.wait(std::pin::pin!(async { 7 })).await;
         assert_eq!(done, Ok(7));
         assert_eq!(manager.stuck(), 0);
         drop(asking);
-        assert_eq!(noted(&manager, CLIENT, UP), (0, 0), "ended quickly");
+        assert_eq!(noted(&manager, CLIENT, &UP), (0, 0), "ended quickly");
     }
 
     /// 卡住了、这台设备留着等的还没到它那一份：留着等到转发自己结束，这期间算在卡住的里面，结束了不再算；没等到回答就
@@ -2271,7 +2279,7 @@ mod tests {
     #[tokio::test]
     async fn a_stuck_wait_under_the_share_waits_to_the_end() {
         let manager = knowing();
-        let mut asking = ask(&manager, CLIENT, UP).expect("asked");
+        let mut asking = ask(&manager, CLIENT, &UP).expect("asked");
         let started = Instant::now();
         let forward = std::pin::pin!(async {
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -2289,7 +2297,7 @@ mod tests {
         assert_eq!(manager.stuck(), 0);
         assert_eq!(manager.dropped_requests(), 0);
         drop(asking);
-        assert_eq!(noted(&manager, CLIENT, UP), (0, 1));
+        assert_eq!(noted(&manager, CLIENT, &UP), (0, 1));
     }
 
     /// 卡住了、这台设备留着等的已经到了它那一份：到算卡住的时候就不等了，不等转发自己结束，记一个没回答；别的设备的照样留着
@@ -2301,7 +2309,7 @@ mod tests {
         let manager = knowing();
         let kept: Vec<_> = all_it_may_keep(&manager, device(&manager, CLIENT));
         let refused = manager.dropped_requests();
-        let mut asking = ask(&manager, CLIENT, UP).expect("asked");
+        let mut asking = ask(&manager, CLIENT, &UP).expect("asked");
         let started = Instant::now();
         let done = soon(asking.wait(std::pin::pin!(std::future::pending::<()>()))).await;
         assert_eq!(done, Err(GaveUp));
@@ -2313,9 +2321,9 @@ mod tests {
         assert_eq!(manager.dropped_requests(), refused + 1);
         assert_eq!(manager.stuck(), STUCK_KEPT);
         drop(asking);
-        assert_eq!(noted(&manager, CLIENT, UP), (0, 1));
+        assert_eq!(noted(&manager, CLIENT, &UP), (0, 1));
 
-        let mut other = ask(&manager, "192.0.2.2", UP).expect("asked");
+        let mut other = ask(&manager, "192.0.2.2", &UP).expect("asked");
         let done = other
             .wait(std::pin::pin!(async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2339,7 +2347,7 @@ mod tests {
             .ask(
                 &FLOW,
                 CLIENT.parse().unwrap(),
-                UP,
+                &UP,
                 Duration::from_millis(900),
             )
             .expect("asked");
@@ -2367,19 +2375,19 @@ mod tests {
             manager.note_answer_took(UP_ADDRESS, Duration::from_millis(250));
             9
         };
-        let mut asking = ask(&manager, CLIENT, UP).expect("asked");
+        let mut asking = ask(&manager, CLIENT, &UP).expect("asked");
         let done = asking.wait(std::pin::pin!(slow())).await;
         assert_eq!(done, Ok(9));
         asking.replied(true);
         assert_eq!(manager.stuck(), 0);
-        let after = manager.stuck_after(UP, LIMIT);
+        let after = manager.stuck_after(&UP, LIMIT);
         assert!(after >= Duration::from_millis(500), "{after:?}");
 
         // 留满以后，同样慢的下一个没到算卡住的时候就回答了，照常等到
         // With all kept, the next one as slow is answered before it counts as stuck and is
         // waited for as usual
         let kept: Vec<_> = all_it_may_keep(&manager, device(&manager, CLIENT));
-        let mut next = ask(&manager, CLIENT, UP).expect("asked");
+        let mut next = ask(&manager, CLIENT, &UP).expect("asked");
         let done = next.wait(std::pin::pin!(slow())).await;
         assert_eq!(done, Ok(9));
         drop(kept);
@@ -2395,7 +2403,7 @@ mod tests {
     async fn answers_getting_slower_meanwhile_put_off_being_stuck() {
         let manager = knowing();
         let kept: Vec<_> = all_it_may_keep(&manager, device(&manager, CLIENT));
-        let mut asking = ask(&manager, CLIENT, UP).expect("asked");
+        let mut asking = ask(&manager, CLIENT, &UP).expect("asked");
         let slower = async {
             tokio::time::sleep(Duration::from_millis(40)).await;
             for _ in 0..4 {
@@ -2422,7 +2430,7 @@ mod tests {
         behind.note_queue_delay(Duration::from_secs(3600));
         let kept: Vec<_> = all_it_may_keep(&manager, device(&manager, CLIENT));
         let mut never = manager
-            .ask(&behind, CLIENT.parse().unwrap(), UP, LIMIT)
+            .ask(&behind, CLIENT.parse().unwrap(), &UP, LIMIT)
             .expect("asked");
         let started = Instant::now();
         let done = soon(never.wait(std::pin::pin!(std::future::pending::<()>()))).await;
@@ -2443,7 +2451,7 @@ mod tests {
 
     /// 替 `client` 等 `upstream` 的 `count` 次等待都卡住了、没等到回答 / `count` waits on `upstream` for
     /// `client`, each stuck and none answered
-    fn unanswered(manager: &PermitManager, client: &str, upstream: &str, count: usize) {
+    fn unanswered(manager: &PermitManager, client: &str, upstream: &ForwardTarget, count: usize) {
         for _ in 0..count {
             let mut asking = ask(manager, client, upstream).expect("asked");
             asking.stuck = true;
@@ -2452,7 +2460,7 @@ mod tests {
 
     /// 替 `client` 等 `upstream` 的一次等待等到了回答；被拦着没等的是 false / One wait on `upstream` for
     /// `client` gets its answer; false when held back and not waiting
-    fn asks(manager: &PermitManager, client: &str, upstream: &str) -> bool {
+    fn asks(manager: &PermitManager, client: &str, upstream: &ForwardTarget) -> bool {
         match ask(manager, client, upstream) {
             Some(asking) => {
                 asking.answered();
@@ -2470,20 +2478,24 @@ mod tests {
     #[test]
     fn a_device_is_held_back_from_an_upstream_that_mostly_does_not_answer_it() {
         let manager = knowing();
-        unanswered(&manager, CLIENT, UP, 63);
-        let last = ask(&manager, CLIENT, UP).map(|mut asking| asking.stuck = true);
+        unanswered(&manager, CLIENT, &UP, 63);
+        let last = ask(&manager, CLIENT, &UP).map(|mut asking| asking.stuck = true);
         assert!(last.is_some(), "63 unanswered pass");
         assert_eq!(manager.dropped_requests(), 0);
         assert!(
-            ask(&manager, CLIENT, UP).is_none(),
+            ask(&manager, CLIENT, &UP).is_none(),
             "64 unanswered and none answered"
         );
         assert_eq!(manager.dropped_requests(), 1);
         assert!(
-            asks(&manager, CLIENT, "udp://198.51.100.2:53"),
+            asks(
+                &manager,
+                CLIENT,
+                &ForwardTarget::new("udp://198.51.100.2:53")
+            ),
             "another upstream"
         );
-        assert!(asks(&manager, "192.0.2.2", UP), "another device");
+        assert!(asks(&manager, "192.0.2.2", &UP), "another device");
     }
 
     /// 没回答的要多过回答了的才拦：五个里一个不回答，等多少都不拦；回答了 160 个之后，没回答的到 160 个还不拦，161 个才拦。
@@ -2495,7 +2507,7 @@ mod tests {
     fn a_device_is_not_held_back_while_more_are_answered() {
         let manager = knowing();
         for n in 0..5000 {
-            let mut asking = ask(&manager, CLIENT, UP).expect("one in five unanswered");
+            let mut asking = ask(&manager, CLIENT, &UP).expect("one in five unanswered");
             if n % 5 != 0 {
                 asking.answered();
             } else {
@@ -2505,13 +2517,13 @@ mod tests {
         assert_eq!(manager.dropped_requests(), 0);
 
         for _ in 0..160 {
-            assert!(asks(&manager, "192.0.2.9", UP));
+            assert!(asks(&manager, "192.0.2.9", &UP));
         }
-        unanswered(&manager, "192.0.2.9", UP, 160);
-        let last = ask(&manager, "192.0.2.9", UP).map(|mut asking| asking.stuck = true);
+        unanswered(&manager, "192.0.2.9", &UP, 160);
+        let last = ask(&manager, "192.0.2.9", &UP).map(|mut asking| asking.stuck = true);
         assert!(last.is_some(), "as many unanswered as answered");
         assert!(
-            ask(&manager, "192.0.2.9", UP).is_none(),
+            ask(&manager, "192.0.2.9", &UP).is_none(),
             "one more unanswered than answered"
         );
     }
@@ -2526,10 +2538,10 @@ mod tests {
     fn a_long_good_record_does_not_keep_a_device_from_being_held_back() {
         let manager = knowing();
         for _ in 0..10_000 {
-            assert!(asks(&manager, CLIENT, UP));
+            assert!(asks(&manager, CLIENT, &UP));
         }
         let mut asked = 0;
-        while let Some(mut asking) = ask(&manager, CLIENT, UP) {
+        while let Some(mut asking) = ask(&manager, CLIENT, &UP) {
             asking.stuck = true;
             asked += 1;
             assert!(asked <= 2000, "never held back");
@@ -2551,27 +2563,27 @@ mod tests {
         // 内核已经跑了一阵：那一秒是从拦住那一刻算的，不是从启动算的 / The kernel has been up a
         // while: the second counts from when it was held back, not from the start
         later(&mut manager, TRIES_APART * 3);
-        unanswered(&manager, CLIENT, UP, 64);
-        assert!(ask(&manager, CLIENT, UP).is_none(), "just held back");
+        unanswered(&manager, CLIENT, &UP, 64);
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "just held back");
         later(&mut manager, TRIES_APART - Duration::from_millis(100));
-        assert!(ask(&manager, CLIENT, UP).is_none(), "not a second yet");
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "not a second yet");
         later(&mut manager, Duration::from_millis(100));
-        let mut first = ask(&manager, CLIENT, UP).expect("a try a second on");
-        assert!(ask(&manager, CLIENT, UP).is_none(), "one try only");
+        let mut first = ask(&manager, CLIENT, &UP).expect("a try a second on");
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "one try only");
         first.stuck = true;
         drop(first);
         assert!(
-            ask(&manager, CLIENT, UP).is_none(),
+            ask(&manager, CLIENT, &UP).is_none(),
             "the try went unanswered"
         );
         later(&mut manager, TRIES_APART);
-        ask(&manager, CLIENT, UP).expect("another try").answered();
+        ask(&manager, CLIENT, &UP).expect("another try").answered();
         for _ in 0..10 {
-            assert!(asks(&manager, CLIENT, UP), "answered again");
+            assert!(asks(&manager, CLIENT, &UP), "answered again");
         }
-        unanswered(&manager, CLIENT, UP, 63);
+        unanswered(&manager, CLIENT, &UP, 63);
         assert!(
-            ask(&manager, CLIENT, UP).is_some(),
+            ask(&manager, CLIENT, &UP).is_some(),
             "noted afresh: 63 unanswered pass"
         );
     }
@@ -2582,11 +2594,15 @@ mod tests {
     #[test]
     fn a_try_getting_a_failure_reply_does_not_let_it_through() {
         let mut manager = knowing();
-        unanswered(&manager, CLIENT, UP, 64);
+        unanswered(&manager, CLIENT, &UP, 64);
         later(&mut manager, TRIES_APART);
-        ask(&manager, CLIENT, UP).expect("a try").replied(false);
-        assert!(ask(&manager, CLIENT, UP).is_none(), "still held back");
-        assert_eq!(noted(&manager, CLIENT, UP), (0, 64), "and noted as neither");
+        ask(&manager, CLIENT, &UP).expect("a try").replied(false);
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "still held back");
+        assert_eq!(
+            noted(&manager, CLIENT, &UP),
+            (0, 64),
+            "and noted as neither"
+        );
     }
 
     /// 上游回了失败应答，两样都不记，回得再晚也一样：上游是回了的，只是这个名字解析不了。一个程序反复问一个坏掉的名字，
@@ -2599,12 +2615,12 @@ mod tests {
     fn a_failure_reply_is_noted_as_neither_however_late() {
         let manager = knowing();
         for _ in 0..500 {
-            let mut asking = ask(&manager, CLIENT, UP).expect("never held back");
+            let mut asking = ask(&manager, CLIENT, &UP).expect("never held back");
             asking.stuck = true;
             asking.since -= LIMIT;
             asking.replied(false);
         }
-        assert_eq!(noted(&manager, CLIENT, UP), (0, 0));
+        assert_eq!(noted(&manager, CLIENT, &UP), (0, 0));
         assert_eq!(manager.dropped_requests(), 0);
     }
 
@@ -2622,17 +2638,17 @@ mod tests {
     fn answers_to_waits_begun_before_being_held_back_do_not_let_it_through() {
         let mut manager = knowing();
         let begun_before: Vec<_> = (0..20)
-            .map(|_| ask(&manager, CLIENT, UP).expect("asked"))
+            .map(|_| ask(&manager, CLIENT, &UP).expect("asked"))
             .collect();
-        unanswered(&manager, CLIENT, UP, 64);
-        assert!(ask(&manager, CLIENT, UP).is_none(), "held back");
+        unanswered(&manager, CLIENT, &UP, 64);
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "held back");
         for late in begun_before {
             late.answered();
         }
-        assert!(ask(&manager, CLIENT, UP).is_none(), "still held back");
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "still held back");
         later(&mut manager, TRIES_APART);
-        ask(&manager, CLIENT, UP).expect("a try").answered();
-        assert!(asks(&manager, CLIENT, UP), "let through by the try");
+        ask(&manager, CLIENT, &UP).expect("a try").answered();
+        assert!(asks(&manager, CLIENT, &UP), "let through by the try");
     }
 
     /// 拦着的时候，之前开始的等待等到的回答多过了没回答的，也就不拦了：上游确实又在回答它
@@ -2642,14 +2658,14 @@ mod tests {
     fn enough_late_answers_end_the_holding_back() {
         let manager = knowing();
         let begun_before: Vec<_> = (0..65)
-            .map(|_| ask(&manager, CLIENT, UP).expect("asked"))
+            .map(|_| ask(&manager, CLIENT, &UP).expect("asked"))
             .collect();
-        unanswered(&manager, CLIENT, UP, 64);
-        assert!(ask(&manager, CLIENT, UP).is_none(), "held back");
+        unanswered(&manager, CLIENT, &UP, 64);
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "held back");
         for late in begun_before {
             late.answered();
         }
-        assert!(asks(&manager, CLIENT, UP), "more answered than not");
+        assert!(asks(&manager, CLIENT, &UP), "more answered than not");
     }
 
     /// 上游什么都没回的等待，等得久的才记：很快就结束的（上游一连就断）两样都不记；等过了算卡住的时间的，或者等满了上游的
@@ -2663,29 +2679,29 @@ mod tests {
     fn only_waits_that_lasted_long_count_as_unanswered() {
         let manager = knowing();
         for _ in 0..500 {
-            drop(ask(&manager, CLIENT, UP).expect("ending quickly"));
+            drop(ask(&manager, CLIENT, &UP).expect("ending quickly"));
         }
-        assert_eq!(noted(&manager, CLIENT, UP), (0, 0));
+        assert_eq!(noted(&manager, CLIENT, &UP), (0, 0));
         assert_eq!(manager.dropped_requests(), 0);
 
-        unanswered(&manager, CLIENT, UP, 64);
-        assert!(ask(&manager, CLIENT, UP).is_none(), "64 past being stuck");
+        unanswered(&manager, CLIENT, &UP, 64);
+        assert!(ask(&manager, CLIENT, &UP).is_none(), "64 past being stuck");
 
         let other = "192.0.2.2";
         for _ in 0..64 {
-            let mut asking = ask(&manager, other, UP).expect("asked");
+            let mut asking = ask(&manager, other, &UP).expect("asked");
             asking.since -= LIMIT;
         }
         assert!(
-            ask(&manager, other, UP).is_none(),
+            ask(&manager, other, &UP).is_none(),
             "64 lasting the whole timeout"
         );
         let nearly = "192.0.2.3";
         for _ in 0..64 {
-            let mut asking = ask(&manager, nearly, UP).expect("asked");
+            let mut asking = ask(&manager, nearly, &UP).expect("asked");
             asking.since -= LIMIT - Duration::from_millis(500);
         }
-        assert!(ask(&manager, nearly, UP).is_some(), "short of the timeout");
+        assert!(ask(&manager, nearly, &UP).is_some(), "short of the timeout");
     }
 
     /// 内核自己正跟不上时，等得久说明不了上游：不记没回答，除非这台设备在这个上游上一个回答都没等到过
@@ -2697,14 +2713,14 @@ mod tests {
         let behind = state(Duration::ZERO);
         behind.note_queue_delay(Duration::from_secs(2));
         let stuck = |manager: &PermitManager, client| {
-            let mut asking = manager.ask(&behind, client, UP, LIMIT).expect("asked");
+            let mut asking = manager.ask(&behind, client, &UP, LIMIT).expect("asked");
             asking.stuck = true;
         };
 
         let manager = knowing();
         for _ in 0..16 {
             manager
-                .ask(&behind, client, UP, LIMIT)
+                .ask(&behind, client, &UP, LIMIT)
                 .expect("asked")
                 .answered();
         }
@@ -2712,17 +2728,17 @@ mod tests {
             stuck(&manager, client);
         }
         assert!(
-            manager.ask(&behind, client, UP, LIMIT).is_some(),
+            manager.ask(&behind, client, &UP, LIMIT).is_some(),
             "the kernel falling behind, with answers from this upstream before"
         );
-        assert_eq!(noted(&manager, CLIENT, UP), (16, 0));
+        assert_eq!(noted(&manager, CLIENT, &UP), (16, 0));
 
         let other: std::net::IpAddr = "192.0.2.2".parse().unwrap();
         for _ in 0..64 {
             stuck(&manager, other);
         }
         assert!(
-            manager.ask(&behind, other, UP, LIMIT).is_none(),
+            manager.ask(&behind, other, &UP, LIMIT).is_none(),
             "never an answer from this upstream"
         );
     }
@@ -2734,13 +2750,13 @@ mod tests {
     fn answered_ones_are_noted_sixteen_at_a_time() {
         let manager = knowing();
         for _ in 0..15 {
-            assert!(asks(&manager, CLIENT, UP));
+            assert!(asks(&manager, CLIENT, &UP));
         }
-        assert_eq!(noted(&manager, CLIENT, UP), (0, 0));
-        assert!(asks(&manager, CLIENT, UP));
-        assert_eq!(noted(&manager, CLIENT, UP), (16, 0));
-        unanswered(&manager, CLIENT, UP, 3);
-        assert_eq!(noted(&manager, CLIENT, UP), (16, 3));
+        assert_eq!(noted(&manager, CLIENT, &UP), (0, 0));
+        assert!(asks(&manager, CLIENT, &UP));
+        assert_eq!(noted(&manager, CLIENT, &UP), (16, 0));
+        unanswered(&manager, CLIENT, &UP, 3);
+        assert_eq!(noted(&manager, CLIENT, &UP), (16, 3));
     }
 
     /// 有几份是没回答的多，记着个数：拦住一台是 2，放开以后回到 0——平常是 0，等之前不用算哈希去看
@@ -2752,12 +2768,12 @@ mod tests {
         let held =
             |manager: &PermitManager| manager.asked.mostly_unanswered.load(Ordering::Relaxed);
         assert_eq!(held(&manager), 0);
-        unanswered(&manager, CLIENT, UP, 64);
+        unanswered(&manager, CLIENT, &UP, 64);
         assert_eq!(held(&manager), 2);
-        unanswered(&manager, "192.0.2.2", UP, 64);
+        unanswered(&manager, "192.0.2.2", &UP, 64);
         assert_eq!(held(&manager), 4);
         later(&mut manager, TRIES_APART);
-        ask(&manager, CLIENT, UP).expect("a try").answered();
+        ask(&manager, CLIENT, &UP).expect("a try").answered();
         assert_eq!(held(&manager), 2);
     }
 

@@ -82,7 +82,7 @@ impl Decision {
         allow_reuse: bool,
     ) -> Self {
         Decision::Forward {
-            target: settings.forward_target(None),
+            target: settings.default_upstream.clone(),
             response_phase: None,
             rule_name,
             rule_index: None,
@@ -487,7 +487,7 @@ async fn run_response_actions(
                     ctx.engine,
                     &request.state.pipeline.settings,
                     packet,
-                    &target,
+                    target,
                     use_transport,
                     request.observed,
                     request.asker(),
@@ -515,7 +515,7 @@ async fn run_response_actions(
                         if UpstreamFailure::was_withheld(&err) {
                             tracing::debug!(
                                 event = "response_action_withheld",
-                                upstream = %target.upstream,
+                                upstream = %target.upstream(),
                                 qname = %qname,
                                 client_ip = %request.peer.ip(),
                                 error = %format_args!("{err:#}"),
@@ -524,9 +524,9 @@ async fn run_response_actions(
                             return Err(err);
                         }
                         crate::warn_sparse!(
-                            per target.upstream;
+                            per target.upstream();
                             event = "response_action_failure",
-                            upstream = %target.upstream,
+                            upstream = %target.upstream(),
                             qname = %qname,
                             qtype = ?qtype,
                             client_ip = %request.peer.ip(),

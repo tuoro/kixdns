@@ -106,7 +106,10 @@ impl RuntimeResponseMatcher {
         Ok(match m {
             config::ResponseMatcher::UpstreamEquals { value } => {
                 RuntimeResponseMatcher::UpstreamEquals {
-                    addresses: config::upstream_addresses(&value).map(Box::from).collect(),
+                    addresses: config::ForwardTarget::new(&value)
+                        .addresses()
+                        .map(Box::from)
+                        .collect(),
                     value: Arc::from(value),
                 }
             }

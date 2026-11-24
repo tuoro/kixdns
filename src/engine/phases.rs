@@ -488,7 +488,7 @@ pub(crate) async fn handle_forward_decision<'a>(
     decision: ForwardDecision<'a>,
     response: &mut ResponseInfo,
 ) -> anyhow::Result<ForwardResult> {
-    response.upstream = Some(Source::Upstream(Arc::clone(&decision.target.upstream)));
+    response.upstream = Some(Source::Upstream(Arc::clone(decision.target.upstream())));
     let mut forwarding = Forwarding::new(engine, request, route, decision);
     let reply = match forwarding.fetch(response).await {
         Fetched::Joined(answer) => return Ok(ForwardResult::Success(answer)),
@@ -729,7 +729,7 @@ impl<'a> Forwarding<'a> {
             let answer = match crate::engine::upstream::wait_for_another(
                 engine,
                 request.peer.ip(),
-                &self.decision.target.upstream,
+                self.decision.target,
                 request.state.pipeline.upstream_timeout(),
                 waiting,
             )
@@ -922,9 +922,9 @@ impl<'a> Forwarding<'a> {
                 if !UpstreamFailure::was_withheld(&e) {
                     let (request, decision) = (self.request, self.decision);
                     crate::warn_sparse!(
-                        per decision.target.upstream;
+                        per decision.target.upstream();
                         event = "miss_actions_on_upstream_failure",
-                        upstream = %decision.target.upstream,
+                        upstream = %decision.target.upstream(),
                         qname = %request.qname,
                         qtype = ?request.qtype,
                         client_ip = %request.peer.ip(),
@@ -1036,7 +1036,7 @@ impl<'a> Forwarding<'a> {
                 if withheld {
                     debug!(
                         event = "cached_answer_on_upstream_withheld",
-                        upstream = %decision.target.upstream,
+                        upstream = %decision.target.upstream(),
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
                         error = %format_args!("{e:#}"),
@@ -1044,9 +1044,9 @@ impl<'a> Forwarding<'a> {
                     );
                 } else {
                     crate::warn_sparse!(
-                        per decision.target.upstream;
+                        per decision.target.upstream();
                         event = "cached_answer_on_upstream_failure",
-                        upstream = %decision.target.upstream,
+                        upstream = %decision.target.upstream(),
                         qname = %request.qname,
                         qtype = ?request.qtype,
                         client_ip = %request.peer.ip(),
@@ -1061,7 +1061,7 @@ impl<'a> Forwarding<'a> {
                 if withheld {
                     debug!(
                         event = "upstream_withheld",
-                        upstream = %decision.target.upstream,
+                        upstream = %decision.target.upstream(),
                         qname = %request.qname,
                         client_ip = %request.peer.ip(),
                         error = %format_args!("{e:#}"),
@@ -1069,9 +1069,9 @@ impl<'a> Forwarding<'a> {
                     );
                 } else {
                     crate::warn_sparse!(
-                       per decision.target.upstream;
+                       per decision.target.upstream();
                        event = "upstream_failure",
-                       upstream = %decision.target.upstream,
+                       upstream = %decision.target.upstream(),
                        qname = %request.qname,
                        qtype = ?request.qtype,
                        client_ip = %request.peer.ip(),

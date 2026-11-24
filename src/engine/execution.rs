@@ -4425,7 +4425,7 @@ mod tests {
                 let (response_matchers, _, _) =
                     crate::matcher::ResponsePhase::parts(response_phase.as_deref());
                 assert_eq!(
-                    target.upstream.as_ref(),
+                    target.upstream().as_ref(),
                     "8.8.8.8:53",
                     "Forward should use configured upstream"
                 );
@@ -4464,7 +4464,7 @@ mod tests {
         // Assert: Verify Allow action forwards to default upstream
         match decision3 {
             Decision::Forward { target, .. } => assert_eq!(
-                target.upstream.as_ref(),
+                target.upstream().as_ref(),
                 "1.2.3.4:53",
                 "Allow should forward to default upstream"
             ),
@@ -6899,7 +6899,7 @@ mod tests_multi_upstream {
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
                 assert_eq!(
-                    upstream.as_ref().map(|s| &*s.upstream),
+                    upstream.as_ref().map(|s| &**s.upstream()),
                     Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"),
                     "Comma-separated upstream should be preserved"
                 );
@@ -6937,7 +6937,7 @@ mod tests_multi_upstream {
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
                 assert_eq!(
-                    upstream.as_ref().map(|s| &*s.upstream),
+                    upstream.as_ref().map(|s| &**s.upstream()),
                     Some("1.1.1.1:53,8.8.8.8:53,9.9.9.9:53"),
                     "Array upstream should be joined with commas"
                 );
@@ -7012,7 +7012,7 @@ mod tests_multi_upstream {
         match &rule.actions[0] {
             Action::Forward { upstream, .. } => {
                 assert_eq!(
-                    upstream.as_ref().map(|s| &*s.upstream),
+                    upstream.as_ref().map(|s| &**s.upstream()),
                     Some("1.1.1.1:53"),
                     "Single-element array should be converted to string"
                 );
