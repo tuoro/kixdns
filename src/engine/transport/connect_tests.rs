@@ -86,13 +86,14 @@ fn addresses_alternate_by_family() {
 }
 
 /// 错开着连（RFC 8305）：第一个尝试不回应，过了 [`ATTEMPT_DELAY`] 才起第二个，用先连上的那个；一个失败了马上起下一个，
-/// 不等；都失败时报最后那个失败。TCP、DoT、直连的 DoH 都经这里连（见 [`connect_tcp`]），DoQ 也是。以前 TCP、DoT 一个个
-/// 依次连，第一个不回应就等到建连的时限
+/// 不等；都失败时列出每个地址和它的失败。TCP、DoT、直连的 DoH 都经这里连（见 [`connect_tcp`]），DoQ 也是。以前 TCP、DoT
+/// 一个个依次连，第一个不回应就等到建连的时限
 /// Connecting staggered (RFC 8305): with the first attempt not answering, the second starts
 /// only after [`ATTEMPT_DELAY`] and the first to connect is used; a failed attempt has the next
-/// one started at once, with no wait; with all failed the last failure is reported. TCP, DoT
-/// and direct DoH all connect through here (see [`connect_tcp`]), DoQ too. TCP and DoT used to
-/// try one after another, waiting out the connect's time limit on a first one not answering
+/// one started at once, with no wait; with all failed every address is reported with its
+/// failure. TCP, DoT and direct DoH all connect through here (see [`connect_tcp`]), DoQ too. TCP
+/// and DoT used to try one after another, waiting out the connect's time limit on a first one
+/// not answering
 #[tokio::test(start_paused = true)]
 async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
     let (a, b): (SocketAddr, SocketAddr) = (
@@ -120,10 +121,13 @@ async fn attempts_are_staggered_and_a_failure_moves_on_at_once() {
     .expect("the second connects");
     assert_eq!((connected, started.elapsed()), (b, Duration::ZERO));
 
-    let failed = staggered(vec![a, b], |address| async move {
-        Err::<SocketAddr, _>(anyhow::anyhow!("{address} refused"))
+    let failed = staggered(vec![a, b], |_| async move {
+        Err::<SocketAddr, _>(anyhow::anyhow!("refused"))
     })
     .await
     .expect_err("none connects");
-    assert_eq!(failed.to_string(), format!("{b} refused"));
+    assert_eq!(
+        failed.to_string(),
+        format!("connect {a}: refused; connect {b}: refused")
+    );
 }
