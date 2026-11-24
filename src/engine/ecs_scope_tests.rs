@@ -18,6 +18,7 @@ use crate::engine::Engine;
 use crate::engine::test_support::{
     self as support, Upstream, counting_settings, engine_from, first_a,
 };
+use crate::engine::types::KeyedQuestion;
 
 /// 查询没带 ECS 时应答的地址 / The address answered when a query carries no ECS
 const NO_SUBNET: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 99);
@@ -793,17 +794,17 @@ async fn a_background_refresh_replays_the_clients_ecs() {
     let mut refreshed = seen(&up)[2..4].to_vec();
     refreshed.sort();
     // Each refreshed answer replaced its subnet's entry / 每份刷新回来的应答都换下了它那个子网的条目
-    let slot = Engine::cache_keys(
-        engine.state.load().cache_namespace("main"),
-        "main",
-        b"example.com",
-        RecordType::A,
-        hickory_proto::rr::DNSClass::IN,
-        crate::proto_utils::QueryFlags::RECURSIVE,
-        &crate::matcher::RequesterKey::NONE,
-        None,
-    )
-    .slot;
+    let slot = KeyedQuestion {
+        namespace: engine.state.load().cache_namespace("main"),
+        pipeline_id: "main",
+        qname: b"example.com",
+        qtype: RecordType::A,
+        qclass: hickory_proto::rr::DNSClass::IN,
+        flags: crate::proto_utils::QueryFlags::RECURSIVE,
+        requester: crate::matcher::RequesterKey::NONE,
+        client_ecs: None,
+    }
+    .slot();
     tokio::time::timeout(Duration::from_secs(5), async {
         while engine
             .cached_entries(slot)
@@ -1211,17 +1212,17 @@ async fn a_failed_refresh_renews_a_stale_answer_with_ttl_reset_on() {
             forward_all(&up.address, None),
         );
         ask(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
-        let slot = Engine::cache_keys(
-            engine.state.load().cache_namespace("main"),
-            "main",
-            b"example.com",
-            RecordType::A,
-            hickory_proto::rr::DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &crate::matcher::RequesterKey::NONE,
-            None,
-        )
-        .slot;
+        let slot = KeyedQuestion {
+            namespace: engine.state.load().cache_namespace("main"),
+            pipeline_id: "main",
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: hickory_proto::rr::DNSClass::IN,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: crate::matcher::RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
         let before = engine.cached(slot).expect("cached");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         up.silence(true);
@@ -1286,17 +1287,17 @@ async fn a_refresh_with_a_narrower_scope_retires_the_wider_answer() {
         forward_all(&up.address, None),
     );
     ask(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
-    let slot = Engine::cache_keys(
-        engine.state.load().cache_namespace("main"),
-        "main",
-        b"example.com",
-        RecordType::A,
-        hickory_proto::rr::DNSClass::IN,
-        crate::proto_utils::QueryFlags::RECURSIVE,
-        &crate::matcher::RequesterKey::NONE,
-        None,
-    )
-    .slot;
+    let slot = KeyedQuestion {
+        namespace: engine.state.load().cache_namespace("main"),
+        pipeline_id: "main",
+        qname: b"example.com",
+        qtype: RecordType::A,
+        qclass: hickory_proto::rr::DNSClass::IN,
+        flags: crate::proto_utils::QueryFlags::RECURSIVE,
+        requester: crate::matcher::RequesterKey::NONE,
+        client_ecs: None,
+    }
+    .slot();
     let wider = engine.cached(slot).expect("cached");
     tokio::time::sleep(Duration::from_millis(1100)).await;
     // A hit due for a refresh / 到了刷新时机的一次命中

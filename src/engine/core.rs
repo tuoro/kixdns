@@ -65,9 +65,9 @@ pub struct Engine {
     pub(crate) rule_cache: Arc<CacheStore<Arc<RuleCacheRecord>>>,
     /// In-flight request deduplication map using tokio::watch for lock-free concurrent waiting
     /// 使用 tokio::watch 实现无锁并发等待的进行中请求去重 map
-    /// Key: the hash of the question asked (see `InflightQuestion::key`)
+    /// Key: the hash of the question asked (see `KeyedQuestion::keys`)
     /// Value: watch sender that will be notified when upstream query completes
-    /// 键：所问问题的哈希（见 `InflightQuestion::key`）；值：上游查询结束时通知的 watch sender
+    /// 键：所问问题的哈希（见 `KeyedQuestion::keys`）；值：上游查询结束时通知的 watch sender
     pub inflight: Arc<InflightMap>,
     /// 正在刷新的条目的刷新标记（见 `RefreshingGuard`）：同一条同时只刷新一次
     /// The refresh marks of the entries being refreshed (see `RefreshingGuard`): one

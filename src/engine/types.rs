@@ -26,16 +26,19 @@ pub type InflightMap = DashMap<u64, InflightEntry, FxBuildHasher>;
 /// requests then forwarding themselves (see `InflightCleanupGuard`)
 pub type InflightResult = Option<Bytes>;
 
-/// 一个请求在 inflight 表里登记或等待时问的是什么：算它的 inflight 键用到的全部输入（见
-/// `Engine::cache_keys`）。键只是这些输入的哈希，带了密钥也难免有两个不同问题落在同一个键上；
-/// 所以登记时把问题存进条目，等待之前先核对（见 `InflightEntry::asks`），对不上就自己转发。
-/// What a request registers or waits under in the inflight map: everything its inflight key is
-/// computed from (see `Engine::cache_keys`). The key is only a hash of these, keyed or not, and two
-/// different questions may still land on one key; the question is therefore stored in the entry when
-/// it is registered and checked before waiting (see `InflightEntry::asks`), and a request whose
-/// question differs forwards by itself.
+/// 一个请求在一个 pipeline 下问的问题：算它的响应缓存槽位和 inflight 键用到的全部输入（见 [`Self::keys`]）。请求（见
+/// `Request::question`）和快速路径都只照它算键，转发也照路线算键时的那一份在 inflight 表里登记、等待（见
+/// `Route::question`）。键只是这些输入的哈希，带了密钥也难免有两个不同问题落在同一个键上；所以登记时把问题存进条目，等待
+/// 之前先核对（见 `InflightEntry::asks`），对不上就自己转发
+/// The question a request asks under one pipeline: everything its response cache slot and its
+/// inflight key are computed from (see [`Self::keys`]). The request (see `Request::question`)
+/// and the fast path compute keys from it alone, and a forward registers and waits in the
+/// inflight map under the one its route's keys came from (see `Route::question`). The key is
+/// only a hash of these, keyed or not, and two different questions may still land on one key;
+/// the question is therefore stored in the entry when it is registered and checked before
+/// waiting (see `InflightEntry::asks`), and a request whose question differs forwards by itself
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct InflightQuestion<'a> {
+pub(crate) struct KeyedQuestion<'a> {
     pub namespace: u64,
     pub pipeline_id: &'a str,
     pub qname: &'a [u8],
@@ -46,21 +49,68 @@ pub(crate) struct InflightQuestion<'a> {
     pub client_ecs: Option<EcsKey>,
 }
 
-impl InflightQuestion<'_> {
-    /// 它的 inflight 键 / Its inflight key
-    pub(crate) fn key(&self) -> u64 {
-        Engine::cache_keys(
+impl KeyedQuestion<'_> {
+    /// 写进了问题和查询位的哈希（见 `Engine::question_hasher`）/ The hasher with the question and
+    /// the query bits written in (see `Engine::question_hasher`)
+    fn hasher(&self) -> DefaultHasher {
+        let mut h = Engine::question_hasher(
             self.namespace,
             self.pipeline_id,
             self.qname,
             self.qtype,
             self.qclass,
-            self.flags,
-            &self.requester,
-            self.client_ecs.as_ref(),
-        )
-        .inflight
+        );
+        self.flags.bits().hash(&mut h);
+        h
     }
+
+    /// 响应缓存槽位和 inflight 键。槽位存放这个问题的所有应答，每份标着它适用的 ECS 子网（见 `CacheEntry::reach`），所以
+    /// 它的键不含子网；请求只有发送相同的子网才能互相等待，所以 inflight 键带上转发会为这个请求方发送的子网，以及客户端自己
+    /// 带的 ECS。请求方只在 pipeline 的应答取决于它时写入（见 `RuntimePipeline::requester`），否则键不变
+    /// The response cache slot and the inflight key. The slot holds every answer to the
+    /// question, each tagged with the ECS subnets it applies to (see `CacheEntry::reach`), so
+    /// its key carries no subnet; requests wait on one another only when they send the same, so
+    /// the inflight key carries the subnets the forwards would send for the requester and the
+    /// client's own ECS. The requester goes in only for a pipeline whose answer depends on it
+    /// (see `RuntimePipeline::requester`), the keys unchanged otherwise
+    pub(crate) fn keys(&self) -> CacheKeys {
+        let mut slot = self.hasher();
+        let mut inflight = slot.clone();
+        self.requester.hash_into(&mut slot);
+        self.requester
+            .hash_inflight_into(self.client_ecs.as_ref(), &mut inflight);
+        CacheKeys {
+            slot: slot.finish(),
+            inflight: inflight.finish(),
+            namespace: self.namespace,
+            requester: self.requester,
+        }
+    }
+
+    /// 只算 [`Self::keys`] 的槽位，用于不登记 inflight 条目的查找 / The slot of [`Self::keys`]
+    /// alone, for a lookup that registers no inflight entry
+    pub(crate) fn slot(&self) -> u64 {
+        let mut slot = self.hasher();
+        self.requester.hash_into(&mut slot);
+        slot.finish()
+    }
+}
+
+/// 一个请求在一个 pipeline 下的键（见 [`KeyedQuestion::keys`]），连同问题里随路线而定的两样：命名空间和请求方部分。
+/// 它们和请求自己的那几样一起就是这些键所依据的问题（见 `Route::question`）
+/// The keys of one request under one pipeline (see [`KeyedQuestion::keys`]), with the two parts
+/// of the question that go by the route: the namespace and the requester's part. With the
+/// request's own parts they make up the question the keys came from (see `Route::question`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheKeys {
+    /// Response cache slot / 响应缓存槽位
+    pub slot: u64,
+    /// Inflight entry / inflight 条目
+    pub inflight: u64,
+    /// The cache namespace the keys were computed in / 算这些键时用的缓存命名空间
+    pub namespace: u64,
+    /// The requester's part the keys were computed with / 算这些键时用的请求方部分
+    pub requester: RequesterKey,
 }
 
 /// inflight 表里的条目：领头请求发出结果的通道，和它问的是什么
@@ -87,7 +137,7 @@ pub struct InflightEntry {
 impl InflightEntry {
     /// `question` 的条目 / The entry of `question`
     #[cfg(test)]
-    pub(crate) fn new(question: &InflightQuestion<'_>) -> Self {
+    pub(crate) fn new(question: &KeyedQuestion<'_>) -> Self {
         Self::sharing(
             question,
             &Arc::from(question.pipeline_id),
@@ -99,7 +149,7 @@ impl InflightEntry {
     /// The entry of `question`, whose `pipeline_id` and `qname` the request already holds a
     /// copy of, so that no other is made
     pub(crate) fn sharing(
-        question: &InflightQuestion<'_>,
+        question: &KeyedQuestion<'_>,
         pipeline_id: &Arc<str>,
         qname: Arc<[u8]>,
     ) -> Self {
@@ -138,7 +188,7 @@ impl InflightEntry {
     /// 条目是不是 `question` 的：只有问的完全一样，才能等它的结果
     /// Whether the entry is `question`'s: only a request asking exactly the same may wait on its
     /// result
-    pub(crate) fn asks(&self, question: &InflightQuestion<'_>) -> bool {
+    pub(crate) fn asks(&self, question: &KeyedQuestion<'_>) -> bool {
         self.namespace == question.namespace
             && *self.pipeline_id == *question.pipeline_id
             && *self.qname == *question.qname
@@ -152,7 +202,7 @@ impl InflightEntry {
 
 #[cfg(test)]
 mod inflight_entry_tests {
-    use super::{InflightEntry, InflightQuestion};
+    use super::{InflightEntry, KeyedQuestion};
     use crate::ecs::EcsKey;
     use crate::matcher::RequesterKey;
     use hickory_proto::rr::{DNSClass, RecordType};
@@ -160,8 +210,8 @@ mod inflight_entry_tests {
     /// 条目只认问得完全一样的请求：问题的任何一部分不同都不算 / An entry is only for a request asking
     /// exactly the same: any part of the question differing rules it out
     /// 这些测试问的问题 / The question these tests ask
-    fn asked<'a>(pipeline_id: &'a str, qname: &'a [u8]) -> InflightQuestion<'a> {
-        InflightQuestion {
+    fn asked<'a>(pipeline_id: &'a str, qname: &'a [u8]) -> KeyedQuestion<'a> {
+        KeyedQuestion {
             flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: 1,
             pipeline_id,
@@ -225,7 +275,7 @@ mod inflight_entry_tests {
 
     #[test]
     fn an_entry_is_only_for_its_own_question() {
-        let question = InflightQuestion {
+        let question = KeyedQuestion {
             flags: crate::proto_utils::QueryFlags::RECURSIVE,
             namespace: 1,
             pipeline_id: "main",
@@ -238,38 +288,38 @@ mod inflight_entry_tests {
         let entry = InflightEntry::new(&question);
         assert!(entry.asks(&question));
         let others = [
-            InflightQuestion {
+            KeyedQuestion {
                 namespace: 2,
                 ..question
             },
-            InflightQuestion {
+            KeyedQuestion {
                 pipeline_id: "other",
                 ..question
             },
-            InflightQuestion {
+            KeyedQuestion {
                 qname: b"example.org",
                 ..question
             },
-            InflightQuestion {
+            KeyedQuestion {
                 qtype: RecordType::AAAA,
                 ..question
             },
-            InflightQuestion {
+            KeyedQuestion {
                 qclass: DNSClass::CH,
                 ..question
             },
-            InflightQuestion {
+            KeyedQuestion {
                 flags: crate::proto_utils::QueryFlags::new(true, false, true),
                 ..question
             },
-            InflightQuestion {
+            KeyedQuestion {
                 requester: RequesterKey {
                     class: Some(1),
                     ..RequesterKey::NONE
                 },
                 ..question
             },
-            InflightQuestion {
+            KeyedQuestion {
                 client_ecs: Some(EcsKey {
                     family: 1,
                     source_prefix: 24,

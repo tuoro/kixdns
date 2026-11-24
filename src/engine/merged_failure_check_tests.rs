@@ -341,17 +341,17 @@ async fn a_failure_reply_the_check_rejects_leaves_on_miss_without_an_answer() {
 /// for `qname` A into `pipeline`
 fn cache_expired(engine: &Engine, pipeline: &str, qname: &str) {
     let state = engine.state.load_full();
-    let slot = Engine::cache_keys(
-        state.cache_namespace(pipeline),
-        pipeline,
-        qname.as_bytes(),
-        RecordType::A,
-        DNSClass::IN,
-        crate::proto_utils::QueryFlags::RECURSIVE,
-        &crate::matcher::RequesterKey::NONE,
-        None,
-    )
-    .slot;
+    let slot = crate::engine::types::KeyedQuestion {
+        namespace: state.cache_namespace(pipeline),
+        pipeline_id: pipeline,
+        qname: qname.as_bytes(),
+        qtype: RecordType::A,
+        qclass: DNSClass::IN,
+        flags: crate::proto_utils::QueryFlags::RECURSIVE,
+        requester: crate::matcher::RequesterKey::NONE,
+        client_ecs: None,
+    }
+    .slot();
     let name = Name::from_ascii(qname).unwrap();
     let mut reply = Message::new(0, MessageType::Response, OpCode::Query);
     reply.add_query(Query::query(name.clone(), RecordType::A));

@@ -17,6 +17,7 @@ use crate::engine::Engine;
 use crate::engine::test_support::{
     self as support, Upstream, counting_settings, engine_from, first_a, peer,
 };
+use crate::engine::types::KeyedQuestion;
 use crate::matcher::RequesterKey;
 use crate::proto_utils::QueryFlags;
 
@@ -229,15 +230,17 @@ async fn a_background_refresh_asks_with_the_entrys_query_bits() {
     // 每份刷新回来的应答都换下了它那几位的条目
     let namespace = engine.state.load().cache_namespace("main");
     for flags in every_flags() {
-        let slot = Engine::cache_slot(
+        let slot = KeyedQuestion {
             namespace,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
+            pipeline_id: "main",
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
             flags,
-            &RequesterKey::NONE,
-        );
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !engine
                 .cached_entries(slot)
@@ -296,36 +299,38 @@ async fn a_refresh_packet_carries_the_given_query_bits() {
     }
 }
 
-/// 查询位不同，槽位和 inflight 键都不同；快速路径算的槽位和 `cache_keys` 的一样
+/// 查询位不同，槽位和 inflight 键都不同；快速路径算的槽位（`KeyedQuestion::slot`）和 `KeyedQuestion::keys` 的一样
 /// Other query bits give another slot and inflight key; the slot the fast path
-/// computes is the one `cache_keys` gives
+/// computes (`KeyedQuestion::slot`) is the one `KeyedQuestion::keys` gives
 #[test]
 fn the_keys_carry_the_query_bits() {
     let keys = |flags| {
-        Engine::cache_keys(
-            0,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
+        KeyedQuestion {
+            namespace: 0,
+            pipeline_id: "main",
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
             flags,
-            &RequesterKey::NONE,
-            None,
-        )
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .keys()
     };
     let all = every_flags();
     for (index, flags) in all.iter().enumerate() {
-        assert_eq!(keys(*flags).flags, *flags);
         assert_eq!(
-            Engine::cache_slot(
-                0,
-                "main",
-                b"example.com",
-                RecordType::A,
-                DNSClass::IN,
-                *flags,
-                &RequesterKey::NONE,
-            ),
+            KeyedQuestion {
+                namespace: 0,
+                pipeline_id: "main",
+                qname: b"example.com",
+                qtype: RecordType::A,
+                qclass: DNSClass::IN,
+                flags: *flags,
+                requester: RequesterKey::NONE,
+                client_ecs: None
+            }
+            .slot(),
             keys(*flags).slot
         );
         for other in &all[index + 1..] {

@@ -2464,17 +2464,17 @@ mod refresh_failure_reply_tests {
 
     fn cache_key(engine: &Engine, pipeline: &str) -> u64 {
         let state = engine.state.load_full();
-        Engine::cache_keys(
-            state.cache_namespace(pipeline),
-            pipeline,
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &crate::matcher::RequesterKey::NONE,
-            None,
-        )
-        .slot
+        crate::engine::types::KeyedQuestion {
+            namespace: state.cache_namespace(pipeline),
+            pipeline_id: pipeline,
+            qname: b"example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            flags: crate::proto_utils::QueryFlags::RECURSIVE,
+            requester: crate::matcher::RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot()
     }
 
     /// The entry a client request leaves under `key`, holding an answer.

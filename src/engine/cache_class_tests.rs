@@ -8,7 +8,6 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 use serde_json::json;
 
-use crate::engine::Engine;
 use crate::engine::test_support::{answering_upstream, ask, engine_from, peer};
 use crate::matcher::RequesterKey;
 use crate::proto_utils::QueryFlags;
@@ -39,17 +38,17 @@ async fn an_answer_for_another_class_in_the_slot_is_not_taken() {
         }]}]
     }));
     let slot = |class| {
-        Engine::cache_keys(
-            engine.state.load().cache_namespace("main"),
-            "main",
-            b"class.test",
-            RecordType::A,
-            class,
-            QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot
+        crate::engine::types::KeyedQuestion {
+            namespace: engine.state.load().cache_namespace("main"),
+            pipeline_id: "main",
+            qname: b"class.test",
+            qtype: RecordType::A,
+            qclass: class,
+            flags: QueryFlags::RECURSIVE,
+            requester: RequesterKey::NONE,
+            client_ecs: None,
+        }
+        .slot()
     };
     ask(&engine, &query(DNSClass::CH), peer()).await;
     let chaos = engine
