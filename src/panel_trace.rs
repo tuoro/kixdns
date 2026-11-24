@@ -105,7 +105,7 @@ pub fn record_decision(event: &DecisionMade<'_>) {
         DecisionDetail::Static { rcode, answers } => record(
             "decision",
             "selected",
-            format!("静态响应 {rcode}"),
+            format!("静态响应 {}", crate::observe::rcode_name(rcode.into())),
             Some(format!("答案记录数：{answers}")),
         ),
         DecisionDetail::Forward {

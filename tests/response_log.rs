@@ -264,7 +264,7 @@ async fn static_fast_path_and_cached_static_answer_are_distinct() {
         vec![json!(false), json!(false), json!(true)]
     );
     assert!(
-        responses.iter().all(|r| r["rcode"] == "NXDomain"
+        responses.iter().all(|r| r["rcode"] == "NXDOMAIN"
             && r["pipeline"] == "main"
             && r["upstream"] == "static")
     );
@@ -311,7 +311,7 @@ async fn stale_answer_counts_once_and_its_refresh_does_not_count() {
     let responses = log.responses();
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[1]["cache_hit"], true);
-    assert_eq!(responses[1]["rcode"], "NoError");
+    assert_eq!(responses[1]["rcode"], "NOERROR");
 }
 
 #[tokio::test]
@@ -486,7 +486,7 @@ async fn a_jump_limit_on_the_response_jump_path_is_logged_as_static() {
         );
         let responses = log.responses();
         assert_eq!(responses.len(), 1, "{pipelines}");
-        assert_eq!(responses[0]["rcode"], "ServFail", "{pipelines}");
+        assert_eq!(responses[0]["rcode"], "SERVFAIL", "{pipelines}");
         assert_eq!(responses[0]["upstream"], "static", "{pipelines}");
     }
     task.abort();

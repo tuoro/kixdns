@@ -12,7 +12,7 @@
 //! back) and leaves the panel's interpretation to the panel: whether a static answer is a block or a
 //! custom answer, and what a rule is called on the config page, are read from the config there.
 
-use std::borrow::{Borrow, Cow};
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -33,7 +33,7 @@ use crate::config::Transport;
 use crate::observe::{
     CacheHit, CacheHitKind, ClientTransport, DecisionDetail, DecisionKind, DecisionMade,
     RequestContext, RequestOutcome, RequestStatus, RuleAnswer, RuleEvaluated, RuleMatched,
-    RulePhase, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
+    RulePhase, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped, rcode_name,
 };
 use crate::panel::{outcome_label, phase_label, skip_reason_label, transport_label};
 
@@ -2131,25 +2131,6 @@ fn name_end(packet: &[u8], mut pos: usize) -> Option<usize> {
             _ if len & 0xC0 == 0xC0 => return Some(pos + 2),
             _ => pos += 1 + usize::from(len),
         }
-    }
-}
-
-/// 响应码的助记名（NOERROR、NXDOMAIN……），和配置里写的一样 / The response code mnemonic
-/// (NOERROR, NXDOMAIN, …), as written in the config
-fn rcode_name(code: u16) -> Cow<'static, str> {
-    match code {
-        0 => Cow::Borrowed("NOERROR"),
-        1 => Cow::Borrowed("FORMERR"),
-        2 => Cow::Borrowed("SERVFAIL"),
-        3 => Cow::Borrowed("NXDOMAIN"),
-        4 => Cow::Borrowed("NOTIMP"),
-        5 => Cow::Borrowed("REFUSED"),
-        6 => Cow::Borrowed("YXDOMAIN"),
-        7 => Cow::Borrowed("YXRRSET"),
-        8 => Cow::Borrowed("NXRRSET"),
-        9 => Cow::Borrowed("NOTAUTH"),
-        10 => Cow::Borrowed("NOTZONE"),
-        other => Cow::Owned(format!("RCODE{other}")),
     }
 }
 
