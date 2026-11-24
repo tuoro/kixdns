@@ -251,19 +251,9 @@ impl Through {
                 let mut query = Message::new(0, MessageType::Query, OpCode::Query);
                 query.metadata.recursion_desired = true;
                 query.add_query(Query::query(name, record_type));
-                let query = &query.to_vec()?;
-                let asked = self.servers.iter().map(|server| {
-                    Box::pin(async move {
-                        timeout(ASK_BUDGET, self.records(server, query))
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(anyhow::anyhow!("{server} gave no answer in time"))
-                            })
-                    })
-                });
-                let given = futures::future::select_ok(asked)
+                let given = self
+                    .first_answer(&query.to_vec()?)
                     .await
-                    .map(|(given, _)| given)
                     .with_context(|| record_type.to_string());
                 if let Err(error) = &given {
                     debug!(host, error = %format_args!("{error:#}"), "bootstrap asking failed");
@@ -274,6 +264,32 @@ impl Through {
         let (a, aaaa) =
             futures::future::join(family(RecordType::A), family(RecordType::AAAA)).await;
         Ok([a, aaaa])
+    }
+
+    /// 同时向每个服务器问 `query`，先答上的那个的回答（见 [`Self::records`]），各自最多等 [`ASK_BUDGET`]。都没答上时
+    /// 按先后列出每个服务器为什么没答上
+    /// `query` asked of every server at once, the answer of the first to answer (see
+    /// [`Self::records`]), each waited for [`ASK_BUDGET`] at most. With none answering, why each
+    /// did not is listed, in the order they failed
+    async fn first_answer(&self, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
+        use futures::StreamExt;
+        let mut asked: futures::stream::FuturesUnordered<_> = self
+            .servers
+            .iter()
+            .map(|server| async move {
+                timeout(ASK_BUDGET, self.records(server, query))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("{server} gave no answer in time")))
+            })
+            .collect();
+        let mut failed = Vec::new();
+        while let Some(answer) = asked.next().await {
+            match answer {
+                Ok(given) => return Ok(given),
+                Err(error) => failed.push(format!("{error:#}")),
+            }
+        }
+        anyhow::bail!("{}", failed.join(", "))
     }
 
     /// `server` 对 `query` 答的地址和各自的 TTL；答了失败应答（见 `upstream::is_failure_reply`）是 Err，和答了没有这种
@@ -628,6 +644,27 @@ mod tests {
             ]
         );
         assert_eq!(server.queries(), 6, "only upstream.test asked again");
+    }
+
+    /// 每个服务器都没答上时，原因里每一族列出每个服务器为什么没答上。以前每一族只留最后一个服务器的
+    /// With no server answering, the cause lists for each family why each server did not. Each
+    /// family used to keep the last server's alone
+    #[tokio::test]
+    async fn every_server_is_named_when_none_answers() {
+        use crate::engine::test_support::answering_rcode;
+        let servfail = answering_rcode(ResponseCode::ServFail).await.address;
+        let refused = answering_rcode(ResponseCode::Refused).await.address;
+        let err = through(&format!("{servfail}, {refused}"))
+            .addresses("upstream.test", 853)
+            .await
+            .expect_err("no server answers");
+        let err = format!("{err:#}");
+        for failure in [
+            format!("{servfail} answered SERVFAIL"),
+            format!("{refused} answered REFUSED"),
+        ] {
+            assert_eq!(err.matches(&failure).count(), 2, "{failure} in {err}");
+        }
     }
 
     /// 后台再问时 A 答了 SERVFAIL：A 上回问到的 127.0.0.1 留着，不换成只有 AAAA 的那半张
