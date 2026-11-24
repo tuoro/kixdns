@@ -19,6 +19,7 @@ use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use serde::{Deserialize, Serialize};
 
 use crate::config::EcsMode;
+use crate::proto_utils::UDP_PAYLOAD;
 
 /// The family `EcsKey::opaque` uses: not one RFC 7871 or IANA defines
 /// `EcsKey::opaque` 用的地址族：RFC 7871 和 IANA 都没有定义
@@ -203,15 +204,15 @@ pub(crate) fn forwards_own_ecs(peer_ip: IpAddr, client: Option<&EcsKey>) -> bool
     }
 }
 
-/// 把报文 OPT 里的 ECS 换成 `subnet`；没有 OPT 时新建一个，负载上限 1232 字节。hickory-proto
+/// 把报文 OPT 里的 ECS 换成 `subnet`；没有 OPT 时新建一个，负载上限 [`UDP_PAYLOAD`]。hickory-proto
 /// 0.26 的 OPT 用 Vec 存选项，insert() 总是追加，所以先去掉已有的 ECS，免得重复。
-/// Make `subnet` the ECS of the message's OPT, creating one with a 1232-byte payload
+/// Make `subnet` the ECS of the message's OPT, creating one with a [`UDP_PAYLOAD`] payload
 /// when there is none. hickory-proto 0.26 keeps OPT options in a Vec whose insert()
 /// always appends, so any existing ECS is removed first to avoid duplicates.
 pub(crate) fn set_ecs_option(msg: &mut Message, subnet: ClientSubnet) {
     let edns = msg.edns.get_or_insert_with(|| {
         let mut edns = hickory_proto::op::Edns::new();
-        edns.set_max_payload(1232);
+        edns.set_max_payload(UDP_PAYLOAD);
         edns
     });
     edns.options_mut().remove(EdnsCode::Subnet);
