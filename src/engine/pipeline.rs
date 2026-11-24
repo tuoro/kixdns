@@ -336,10 +336,9 @@ impl Engine {
                             ));
                         }
                         Action::Forward {
+                            upstream,
                             transport,
                             ecs,
-                            target,
-                            ..
                         } => {
                             // 规则写了几个 forward 时，轮到头一个就照配置加载时合并好的一起问（见
                             // `Rule::compute_merged_forward`），每个上游的传输写在它自己的地址里，没写前缀的用 UDP；
@@ -355,7 +354,7 @@ impl Engine {
                                     (merged.target.clone(), Transport::Udp, merged.ecs.clone())
                                 }
                                 None => (
-                                    state.pipeline.settings.forward_target(target.as_ref()),
+                                    state.pipeline.settings.forward_target(upstream.as_ref()),
                                     transport.unwrap_or(Transport::Udp),
                                     ecs.clone(),
                                 ),
@@ -828,11 +827,11 @@ mod rule_cache_policy_tests {
         assert_eq!(kinds, ["forward", "jump", "static", "static", "static"]);
     }
 
-    /// 规则和默认上游的决策共用配置加载时备好的那份上游名字和拆好的列表，每次决策不再各分配一份；不写 upstream 的
+    /// 规则和默认上游的决策共用读配置时备好的那份上游名字和拆好的列表，每次决策不再各分配一份；不写 upstream 的
     /// forward 用的是默认上游备好的那份
     /// Decisions by a rule and by the default upstream share the upstream name and split list
-    /// made at config load, rather than allocating them each; a forward writing no upstream uses
-    /// those of the default upstream
+    /// made as the configuration is read, rather than allocating them each; a forward writing no
+    /// upstream uses those of the default upstream
     #[tokio::test]
     async fn decisions_share_one_copy_of_their_upstream() {
         let engine = engine_from(serde_json::json!({

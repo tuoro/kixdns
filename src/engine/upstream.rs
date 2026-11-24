@@ -12,7 +12,7 @@ use tracing::debug;
 use super::Engine;
 use super::concurrency::GaveUp;
 use super::transport::UdpExchange;
-use crate::config::{ForwardTarget, Transport, parse_upstream_addr, split_upstreams};
+use crate::config::{ForwardTarget, Transport, parse_upstream_addr};
 use crate::observe::{
     UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
@@ -212,7 +212,7 @@ pub(crate) struct PoolKeys {
 pub(crate) fn upstreams(
     cfg: &crate::matcher::RuntimePipelineConfig,
 ) -> rustc_hash::FxHashSet<(&str, Transport)> {
-    let default = cfg.settings.default_upstream.as_str();
+    let default = &cfg.settings.default_upstream;
     let forwards = cfg
         .pipelines
         .iter()
@@ -223,13 +223,13 @@ pub(crate) fn upstreams(
                 upstream,
                 transport,
                 ..
-            } => Some((upstream.as_deref().unwrap_or(default), *transport)),
+            } => Some((upstream.as_ref().unwrap_or(default), *transport)),
             _ => None,
         });
     std::iter::once((default, None))
         .chain(forwards)
         .flat_map(|(upstreams, transport)| {
-            split_upstreams(upstreams).map(move |upstream| {
+            upstreams.pre_split_upstreams.iter().map(move |upstream| {
                 parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp))
             })
         })
@@ -1486,7 +1486,7 @@ mod tests {
     /// 测试引擎的设置 / The settings of a test engine
     fn test_settings(enable_tcp_fallback: bool) -> GlobalSettings {
         GlobalSettings {
-            default_upstream: "127.0.0.1:0".to_string(),
+            default_upstream: "127.0.0.1:0".into(),
             enable_tcp_fallback,
             udp_pool_size: 1,
             tcp_pool_size: 1,
@@ -1515,7 +1515,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_seen_later_than_the_upstreams_timeout_is_not_noted() {
         let settings = GlobalSettings {
-            default_upstream: "127.0.0.1:0".to_string(),
+            default_upstream: "127.0.0.1:0".into(),
             flow_control_enabled: true,
             ..GlobalSettings::default()
         };

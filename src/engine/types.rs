@@ -515,7 +515,6 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
     let GlobalSettings {
         min_ttl,
         default_upstream,
-        default_target: _,
         response_jump_limit,
         // 怎样用缓存（等上游多久、过期了还续用多久、提前多久刷新），不改变缓存里的应答：改了不让缓存换代。以前算了进去，
         // 在面板上调一下超时或预取的百分比，响应缓存和规则缓存就全都冷掉，上游被一下子问一遍
@@ -781,7 +780,8 @@ mod tests {
         let mut second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         // Derived data is deliberately excluded from the semantic fingerprint.
         // Mutating it must not rotate a cache namespace.
-        second.settings.default_target = Some(crate::config::ForwardTarget::new("derived"));
+        second.settings.default_upstream.pre_split_upstreams =
+            std::sync::Arc::new(vec![std::sync::Arc::from("derived")]);
 
         assert_eq!(
             build_cache_namespaces(&first),
@@ -877,7 +877,7 @@ mod tests {
     fn global_response_setting_changes_all_namespaces() {
         let before_config = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         let mut after_config = before_config.clone();
-        after_config.settings.default_upstream = "1.0.0.1:53".to_string();
+        after_config.settings.default_upstream = "1.0.0.1:53".into();
         let before = build_cache_namespaces(&before_config);
         let after = build_cache_namespaces(&after_config);
 

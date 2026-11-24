@@ -978,13 +978,10 @@ async fn a_response_actions_forward_kept_back_fails_the_request() {
     let engine = engine(&dead, &good, true, 150);
     know_answers_are_quick(&engine).await;
     ask_dead_names(&engine, client(1), "a", 64).await;
-    let mut action = serde_json::from_value::<crate::config::Action>(
+    let actions = [serde_json::from_value::<crate::config::Action>(
         json!({ "type": "forward", "upstream": dead.address }),
     )
-    .unwrap();
-    // 和配置加载时一样把它写的上游备好 / Its upstreams made ready as at config load
-    action.pre_split_upstreams();
-    let actions = [action];
+    .unwrap()];
     let packet = query("more.dead.test.");
     let asked = support::Asked::new(
         &engine,

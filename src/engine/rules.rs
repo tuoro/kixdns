@@ -446,10 +446,9 @@ async fn run_response_actions(
             | Action::StaticTxtResponse { .. }
             | Action::Deny => {}
             Action::Forward {
+                upstream,
                 transport,
                 ecs,
-                target,
-                ..
             } => {
                 // 手上应答记的来源（`udp:1.1.1.1:53`）不是能发查询的地址，所以没写 upstream 时和请求
                 // 阶段一样用 default_upstream
@@ -459,7 +458,7 @@ async fn run_response_actions(
                     .state
                     .pipeline
                     .settings
-                    .forward_target(target.as_ref());
+                    .forward_target(upstream.as_ref());
                 let use_transport = transport.unwrap_or(Transport::Udp);
                 // 自己写了 `ecs` 的照它从客户端的查询改写，应答适用于谁也按它算；没写的和规则自己的转发发同一个包。以前
                 // 这里的 `ecs` 读进来就丢掉了

@@ -77,12 +77,9 @@ pub struct GlobalSettings {
     pub cache_max_ttl: u64,
     /// DashMap shard 数量（0=自动，默认 0）。更多 shards=更少锁竞争但更多内存开销 / DashMap shard count (0=auto, default 0). More shards=less lock contention but more memory overhead
     pub dashmap_shards: usize,
-    /// 默认上游DNS。 / Default upstream DNS
-    pub default_upstream: String,
-    /// `default_upstream` 备好的样子（见 [`ForwardTarget`]），配置加载时算 / `default_upstream` made ready
-    /// (see [`ForwardTarget`]), worked out at config load
-    #[serde(skip)]
-    pub default_target: Option<ForwardTarget>,
+    /// 默认上游DNS，读进来就拆好（见 [`ForwardTarget`]） / Default upstream DNS, split as it is read
+    /// (see [`ForwardTarget`])
+    pub default_upstream: ForwardTarget,
     /// 解析写成主机名的上游（TCP、DoT、DoH、DoQ）用的明文 DNS 服务器，逗号分隔的 `IP:端口`，同时问、取先答的；
     /// 空的（默认）就交给系统的解析器，系统的解析器要是 KixDNS 自己，解析就会绕回来（见 `engine::bootstrap`）
     /// The plain DNS servers that resolve the upstreams written with a host name (TCP, DoT, DoH,
@@ -192,8 +189,7 @@ impl Default for GlobalSettings {
             doh_tls_key: None,
             // RFC 8484 用的路径 / The path RFC 8484 uses
             doh_path: "/dns-query".to_string(),
-            default_upstream: "1.1.1.1:53".to_string(),
-            default_target: None,
+            default_upstream: ForwardTarget::new("1.1.1.1:53"),
             bootstrap: String::new(),
             // 9 秒：DoQ 服务器（特别是阿里 DNS）可能要等更久才回，和 idoq 库的建议一致
             // 9 seconds: DoQ servers (Alibaba DNS especially) may take longer to answer, as the
@@ -250,12 +246,14 @@ pub struct Pipeline {
     pub ecs: Option<EcsMode>,
 }
 
-/// 一次转发问的上游，配置加载时备好：写出来的那串（流控、日志和应答的来源按它认），和照它拆好的各个（见
-/// [`split_upstreams`]），转发时不再拆，也不为它分配内存
-/// The upstreams a forward asks, made ready at config load: the list as written (by which flow
-/// control, the logs and an answer's source know it), and each upstream split from it (see
+/// 一次转发问的上游，读配置时就备好：写出来的那串（流控、日志和应答的来源按它认，写回配置也是它，一字不改），和照它
+/// 拆好的各个（见 [`split_upstreams`]），转发时不再拆，也不为它分配内存
+/// The upstreams a forward asks, made ready as the configuration is read: the list as written
+/// (by which flow control, the logs and an answer's source know it, and what is written back
+/// into the configuration, unchanged), and each upstream split from it (see
 /// [`split_upstreams`]), so that a forward neither splits nor allocates for it
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(from = "String", into = "String")]
 pub struct ForwardTarget {
     pub upstream: Arc<str>,
     pub pre_split_upstreams: Arc<Vec<Arc<str>>>,
@@ -268,6 +266,37 @@ impl ForwardTarget {
             upstream: Arc::from(upstream),
             pre_split_upstreams: Arc::new(split_upstreams(upstream).map(Arc::from).collect()),
         }
+    }
+
+    /// 拆得出至少一个地址 / Splits into at least one address
+    pub(crate) fn names_an_address(&self) -> bool {
+        !self.pre_split_upstreams.is_empty()
+    }
+}
+
+impl From<&str> for ForwardTarget {
+    fn from(upstream: &str) -> Self {
+        Self::new(upstream)
+    }
+}
+
+impl From<String> for ForwardTarget {
+    fn from(upstream: String) -> Self {
+        Self::new(&upstream)
+    }
+}
+
+impl From<ForwardTarget> for String {
+    fn from(target: ForwardTarget) -> Self {
+        target.upstream.to_string()
+    }
+}
+
+/// 拆好的部分是照写出来的那串算的，只看那串 / What is split comes from the list as written, so
+/// that alone counts
+impl std::hash::Hash for ForwardTarget {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.upstream.hash(state);
     }
 }
 
@@ -503,20 +532,17 @@ pub enum Action {
     /// format for multiple upstreams (concurrent requests, take fastest result); transport
     /// defaults to udp; supports udp/tcp/tcp_udp/doh/dot/doq.
     Forward {
+        /// 读进来就拆好（见 [`ForwardTarget`]）；没写时问 `default_upstream`（见
+        /// [`GlobalSettings::forward_target`]） / Split as it is read (see [`ForwardTarget`]);
+        /// `default_upstream` is asked without it (see [`GlobalSettings::forward_target`])
         #[serde(default, deserialize_with = "deserialize_upstream")]
-        upstream: Option<String>,
+        upstream: Option<ForwardTarget>,
         #[serde(default)]
         transport: Option<Transport>,
         /// EDNS Client Subnet (RFC 7871) 请求改写，缺省 None = 不修改。
         /// EDNS Client Subnet (RFC 7871) request rewriting, default None = no modification.
         #[serde(default)]
         ecs: Option<EcsMode>,
-        /// `upstream` 备好的样子（见 [`ForwardTarget`]），配置加载时算；没写 upstream 时为 None，问的是
-        /// `default_upstream`（见 [`GlobalSettings::forward_target`]）
-        /// `upstream` made ready (see [`ForwardTarget`]), worked out at config load; None without
-        /// an upstream, `default_upstream` being asked (see [`GlobalSettings::forward_target`])
-        #[serde(skip)]
-        target: Option<ForwardTarget>,
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
@@ -534,17 +560,6 @@ pub enum Action {
 
 /// Action 辅助函数 / Action helper functions
 impl Action {
-    /// 把 forward 写的上游备好（见 [`ForwardTarget`]，配置加载时调用）/ Make ready the upstreams a
-    /// forward writes (see [`ForwardTarget`], called at config load)
-    pub fn pre_split_upstreams(&mut self) {
-        if let Action::Forward {
-            upstream, target, ..
-        } = self
-        {
-            *target = upstream.as_deref().map(ForwardTarget::new);
-        }
-    }
-
     /// 把作答动作写的应答编好存在它身上（配置加载时调用）：RCODE、地址、CNAME 目标、TXT 文本和 TTL 都读好，每个查询照它给
     /// 记录（见 [`StaticAnswer`]）
     /// Compile the answer an answering action writes and keep it on the action (called at
@@ -665,7 +680,7 @@ impl Rule {
                 upstream: Some(upstream),
                 ecs,
                 ..
-            } if names_an_address(upstream) => Some(ecs.as_ref()),
+            } if upstream.names_an_address() => Some(ecs.as_ref()),
             _ => None,
         });
         let first = ecs.next().flatten();
@@ -719,7 +734,7 @@ impl Rule {
             } = action
             {
                 let action_transport = transport.unwrap_or(Transport::Udp);
-                for addr in split_upstreams(upstream) {
+                for addr in upstream.pre_split_upstreams.iter() {
                     // 前缀照单个转发那样认，没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的
                     // 上游只记一份，合并后仍然双发
                     // The prefix is read as for a single forward, the action's transport taken
@@ -936,7 +951,6 @@ impl GlobalSettings {
             reload: [
                 min_ttl,
                 default_upstream,
-                default_target,
                 upstream_timeout_ms,
                 request_timeout_ms,
                 response_jump_limit,
@@ -1060,12 +1074,6 @@ impl GlobalSettings {
             .unwrap_or_else(|| self.default_request_timeout_ms())
     }
 
-    /// 把 `default_upstream` 备好（见 [`ForwardTarget`]，配置加载时调用）/ Make `default_upstream`
-    /// ready (see [`ForwardTarget`], called at config load)
-    pub fn pre_split_default_upstream(&mut self) {
-        self.default_target = Some(ForwardTarget::new(&self.default_upstream));
-    }
-
     /// 一次转发问的上游：forward 自己写了的（`written`，见 [`Action::Forward`]）就是它们，没写、或者不是 forward 写的
     /// （没有规则作决定、allow）是 `default_upstream`。请求阶段和回答阶段的 forward 都照它挑
     /// The upstreams a forward asks: those the forward writes (`written`, see
@@ -1073,10 +1081,7 @@ impl GlobalSettings {
     /// forward is no action's (no rule deciding, an allow). The request phase's forwards and the
     /// answer phase's alike pick by it
     pub(crate) fn forward_target(&self, written: Option<&ForwardTarget>) -> ForwardTarget {
-        written
-            .or(self.default_target.as_ref())
-            .cloned()
-            .unwrap_or_else(|| ForwardTarget::new(&self.default_upstream))
+        written.unwrap_or(&self.default_upstream).clone()
     }
 
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
@@ -1266,13 +1271,13 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
 }
 
 /// 从 JSON 文本解析配置，找出写了却不读的键（见 [`unread_keys`]），不访问文件系统。JSON 层的错误带行列位置。
-/// 预先算好的东西（拆好的上游、合并的转发）编译时才算（见 `RuntimePipelineConfig::from_config`），只算一遍；编译不了的
-/// 写法（比如写错的网段）也在编译时连同位置报出来
+/// 上游读的时候就拆好（见 [`ForwardTarget`]），合并的转发编译时才算（见 `RuntimePipelineConfig::from_config`），只算
+/// 一遍；编译不了的写法（比如写错的网段）也在编译时连同位置报出来
 /// Parse a configuration from its JSON text, finding the keys it writes that are not read (see
 /// [`unread_keys`]), without touching the filesystem. Errors from the JSON layer carry
-/// line/column positions. What is worked out ahead of time (the upstreams split, the merged
-/// forwards) is worked out once, as it compiles (see `RuntimePipelineConfig::from_config`), and
-/// what cannot be compiled (a mistyped network, say) is reported there with its place
+/// line/column positions. The upstreams are split as they are read (see [`ForwardTarget`]), the
+/// merged forwards worked out once, as it compiles (see `RuntimePipelineConfig::from_config`),
+/// and what cannot be compiled (a mistyped network, say) is reported there with its place
 pub fn parse_config(raw: &str) -> Result<PipelineConfig> {
     let mut cfg: PipelineConfig = serde_json::from_str(raw).context("parse config JSON")?;
     cfg.unread_keys = unread_keys(raw, &serde_json::to_value(&cfg)?)?;
@@ -1322,17 +1327,21 @@ impl<'de> Deserialize<'de> for StringOrList {
     }
 }
 
-/// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式；数组连成逗号分隔的一串，空数组和 null 一样是没写
+/// 反序列化 upstream 字段，支持字符串、逗号分隔字符串或数组格式；数组连成逗号分隔的一串，空数组和 null 一样是没写。
+/// 读出来就是拆好的（见 [`ForwardTarget`]）
 /// Deserialize upstream field, supports string, comma-separated string, or array format; an
-/// array is joined into one comma-separated string, and an empty one is as unwritten as null
-fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// array is joined into one comma-separated string, and an empty one is as unwritten as null.
+/// It reads as split already (see [`ForwardTarget`])
+fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<ForwardTarget>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     Ok(match Option::<StringOrList>::deserialize(deserializer)? {
         None => None,
-        Some(StringOrList::String(upstreams)) => Some(upstreams),
-        Some(StringOrList::List(upstreams)) => (!upstreams.is_empty()).then(|| upstreams.join(",")),
+        Some(StringOrList::String(upstreams)) => Some(upstreams.into()),
+        Some(StringOrList::List(upstreams)) => {
+            (!upstreams.is_empty()).then(|| upstreams.join(",").into())
+        }
     })
 }
 
@@ -1544,13 +1553,10 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     let pipelines: rustc_hash::FxHashSet<&str> =
         cfg.pipelines.iter().map(|p| p.id.as_str()).collect();
     let mut found = Vec::new();
-    if split_upstreams(&cfg.settings.default_upstream)
-        .next()
-        .is_none()
-    {
+    if !cfg.settings.default_upstream.names_an_address() {
         found.push(format!("settings.default_upstream: {NO_UPSTREAM}"));
     }
-    for upstream in split_upstreams(&cfg.settings.default_upstream) {
+    for upstream in cfg.settings.default_upstream.pre_split_upstreams.iter() {
         if let Some(problem) = upstream_problem(upstream, Transport::Udp) {
             found.push(format!("settings.default_upstream: {problem}"));
         }
@@ -2453,7 +2459,7 @@ fn rule_problems(
     // skipped, and the query still has upstreams to answer it
     let merge_has_an_address = forwards > 1
         && rule.actions.iter().any(|action| {
-            matches!(action, Action::Forward { upstream: Some(upstreams), .. } if names_an_address(upstreams))
+            matches!(action, Action::Forward { upstream: Some(upstreams), .. } if upstreams.names_an_address())
         });
     // 回答动作里的 forward 各自转发，不合并 / The forwards among the answer actions forward
     // each on its own and do not merge
@@ -2487,10 +2493,10 @@ fn rule_problems(
                 transport,
                 ..
             } => {
-                if !names_an_address(upstreams) && !skipped_when_empty {
+                if !upstreams.names_an_address() && !skipped_when_empty {
                     report(NO_UPSTREAM.to_string());
                 }
-                for upstream in split_upstreams(upstreams) {
+                for upstream in upstreams.pre_split_upstreams.iter() {
                     if let Some(problem) =
                         upstream_problem(upstream, transport.unwrap_or(Transport::Udp))
                     {
@@ -2581,7 +2587,7 @@ mod tests {
         let forward = |upstream: serde_json::Value| match serde_json::from_value(
             serde_json::json!({ "type": "forward", "upstream": upstream }),
         ) {
-            Ok(Action::Forward { upstream, .. }) => Ok(upstream),
+            Ok(Action::Forward { upstream, .. }) => Ok(upstream.map(String::from)),
             Ok(other) => panic!("{other:?}"),
             Err(error) => Err(error.to_string()),
         };
@@ -2655,11 +2661,11 @@ mod merged_forward_tests {
         list
     }
 
-    /// 不经 `parse_config`、直接拿一份 `PipelineConfig` 编译的配置，几个 forward 也合成一次转发、上游也先拆好：这些都在
-    /// 编译时算。以前只有 `parse_config` 算，公开的 `RuntimePipelineConfig::from_config` 拿到别处建的配置时不合并，
+    /// 不经 `parse_config`、直接拿一份 `PipelineConfig` 编译的配置，几个 forward 也合成一次转发（编译时算），上游也拆好
+    /// （读的时候就拆）。以前只有 `parse_config` 算，公开的 `RuntimePipelineConfig::from_config` 拿到别处建的配置时不合并，
     /// 规则只问第一个 forward 的上游
     /// A configuration compiled from a `PipelineConfig` straight, not through `parse_config`, merges
-    /// its forwards and splits their upstreams too, both being worked out as it compiles. Only
+    /// its forwards too (worked out as it compiles), its upstreams split (as they are read). Only
     /// `parse_config` used to, so the public `RuntimePipelineConfig::from_config` given a
     /// configuration built elsewhere merged nothing, and the rule asked the first forward's
     /// upstream alone
@@ -2685,7 +2691,7 @@ mod merged_forward_tests {
         assert_eq!(merged.target.pre_split_upstreams.len(), 3);
         assert!(matches!(
             &rule.actions[0],
-            super::Action::Forward { target: Some(target), .. } if target.pre_split_upstreams.len() == 2
+            super::Action::Forward { upstream: Some(target), .. } if target.pre_split_upstreams.len() == 2
         ));
     }
 
@@ -4242,33 +4248,49 @@ mod validation_tests {
         );
     }
 
-    /// 默认上游编译配置时就拆好（各项去掉空白、空项跳过），写了一个也拆，和 forward 写的上游一样
-    /// The default upstreams are split as the configuration compiles (each trimmed, empty ones
-    /// skipped), a single one too, as with the upstreams a forward writes
+    /// 默认上游和 forward 写的上游读配置时就拆好（各项去掉空白、空项跳过），只写一个的也拆；写回配置的还是原来写的那串，
+    /// 一字不改（面板照它读写配置）
+    /// The default upstreams and those a forward writes are split as the configuration is read
+    /// (each trimmed, empty ones skipped), a single one too; what is written back into the
+    /// configuration is the list as written, unchanged (the panel reads and writes configurations
+    /// by it)
     #[test]
-    fn default_upstreams_are_split_ahead() {
-        let split = |default_upstream: &str| {
+    fn upstreams_are_split_as_read_and_written_back_as_written() {
+        for (written, split) in [
+            (
+                " 1.1.1.1:53 ,, 8.8.8.8:53",
+                &["1.1.1.1:53", "8.8.8.8:53"][..],
+            ),
+            (" 1.1.1.1:53 ", &["1.1.1.1:53"][..]),
+        ] {
             let config = serde_json::json!({
-                "settings": { "default_upstream": default_upstream },
-                "pipelines": [{ "id": "main", "rules": [] }]
+                "settings": { "default_upstream": written },
+                "pipelines": [{ "id": "main", "rules": [{
+                    "name": "r",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "forward", "upstream": written }]
+                }] }]
             });
-            let target = super::compile(super::parse_config(&config.to_string()).expect("parses"))
-                .expect("compiles")
-                .settings
-                .default_target
-                .expect("made ready");
-            assert_eq!(&*target.upstream, default_upstream);
-            target
-                .pre_split_upstreams
-                .iter()
-                .map(|upstream| upstream.to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            split(" 1.1.1.1:53 ,, 8.8.8.8:53"),
-            ["1.1.1.1:53", "8.8.8.8:53"]
-        );
-        assert_eq!(split(" 1.1.1.1:53 "), ["1.1.1.1:53"]);
+            let read = super::parse_config(&config.to_string()).expect("parses");
+            let super::Action::Forward {
+                upstream: Some(forward),
+                ..
+            } = &read.pipelines[0].rules[0].actions[0]
+            else {
+                panic!("a forward with an upstream")
+            };
+            for target in [&read.settings.default_upstream, forward] {
+                assert_eq!(&*target.upstream, written);
+                let each: Vec<&str> = target.pre_split_upstreams.iter().map(|u| &**u).collect();
+                assert_eq!(each, split, "{written:?}");
+            }
+            let back = serde_json::to_value(&read).expect("writes");
+            assert_eq!(back["settings"]["default_upstream"], written);
+            assert_eq!(
+                back["pipelines"][0]["rules"][0]["actions"][0]["upstream"],
+                written
+            );
+        }
     }
 
     /// 配置里不写的设置读进来就是 `GlobalSettings::default()` 给的；每个默认值逐个钉在这里，文档和面板的基础设置都照
@@ -4296,8 +4318,10 @@ mod validation_tests {
         assert_eq!(settings.cache_capacity, 10_000, "cache_capacity");
         assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
         assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
-        assert_eq!(settings.default_upstream, "1.1.1.1:53", "default_upstream");
-        assert!(settings.default_target.is_none(), "default_target");
+        assert_eq!(
+            &*settings.default_upstream.upstream, "1.1.1.1:53",
+            "default_upstream"
+        );
         assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");
         assert_eq!(settings.request_timeout_ms, None, "request_timeout_ms");
         assert_eq!(settings.response_jump_limit, 10, "response_jump_limit");
@@ -4382,7 +4406,7 @@ mod validation_tests {
             let expected = GlobalSettings {
                 bind_udp: "127.0.0.1:53".to_string(),
                 bind_doh: Some("127.0.0.1:443".to_string()),
-                default_upstream: "9.9.9.9:53".to_string(),
+                default_upstream: "9.9.9.9:53".into(),
                 cache_capacity: 5,
                 min_ttl: 7,
                 dashmap_shards: 4,
@@ -4615,7 +4639,7 @@ mod validation_tests {
         configured.flow_control_enabled = !configured.flow_control_enabled;
         configured.upstream_timeout_ms += 1;
         configured.serve_stale = !configured.serve_stale;
-        configured.default_upstream = "9.9.9.9:53".to_string();
+        configured.default_upstream = "9.9.9.9:53".into();
         assert_eq!(
             configured.restart_pending(&running),
             ["bind_udp", "cache_capacity", "flow_control_enabled"]
