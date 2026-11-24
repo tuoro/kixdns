@@ -1034,6 +1034,14 @@ impl GlobalSettings {
         upstream.saturating_mul(2).saturating_add(upstream / 2)
     }
 
+    /// 一个请求整体的时限（毫秒）：写了 `request_timeout_ms` 就是它，不写按 [`Self::default_request_timeout_ms`] 推
+    /// A request's overall time limit (milliseconds): `request_timeout_ms` when written,
+    /// otherwise derived as [`Self::default_request_timeout_ms`] says
+    pub(crate) fn request_budget_ms(&self) -> u64 {
+        self.request_timeout_ms
+            .unwrap_or_else(|| self.default_request_timeout_ms())
+    }
+
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
     #[inline]
     pub fn pre_split_default_upstream(&mut self) {
