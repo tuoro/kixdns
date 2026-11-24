@@ -58,6 +58,10 @@ pub struct UpstreamFailure {
     /// every attempt was a transport error. The rule's answer check still reads it (see
     /// `rules::check_failure_reply`)
     reply: Option<(Bytes, Arc<str>)>,
+    /// 是几个上游一起问、全都失败了（见 [`Self::with_reply`]），不是只问了一个
+    /// Several upstreams were asked together and all failed (see [`Self::with_reply`]), not
+    /// just one asked
+    several: bool,
 }
 
 impl UpstreamFailure {
@@ -65,6 +69,7 @@ impl UpstreamFailure {
         Self {
             source,
             reply: None,
+            several: false,
         }
     }
 
@@ -98,10 +103,15 @@ impl UpstreamFailure {
             .is_some_and(|failure| failure.source.is::<Withheld>())
     }
 
-    /// 同 [`Self::error`]，带着最先收到的失败应答 / As [`Self::error`], carrying the first
-    /// failure reply received
+    /// 同 [`Self::error`]，几个上游一起问、全都失败了，带着最先收到的失败应答 / As [`Self::error`],
+    /// with several upstreams asked together all failing, carrying the first failure reply
+    /// received
     fn with_reply(source: anyhow::Error, reply: Option<(Bytes, Arc<str>)>) -> anyhow::Error {
-        anyhow::Error::new(Self { source, reply })
+        anyhow::Error::new(Self {
+            source,
+            reply,
+            several: true,
+        })
     }
 
     /// `err` 是上游都失败了、而且带着失败应答时，那个应答和回它的上游
@@ -115,7 +125,11 @@ impl UpstreamFailure {
 
 impl std::fmt::Display for UpstreamFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "all upstreams failed")
+        f.write_str(if self.several {
+            "all upstreams failed"
+        } else {
+            "the upstream failed"
+        })
     }
 }
 
@@ -703,14 +717,14 @@ async fn forward_upstream_as_is(
             Err(err) => {
                 let outcome = failed_outcome(&err);
                 attempts.finish(attempt, transport_for_addr, outcome, dur, None, Some(&err));
-                // 失败时不构造 prefix，只 warn；回了 429 的只记 debug：暂停开始时 DoH 客户端已经记过一条 warn
-                // No prefix is built on failure, only a warn; a 429 logs at debug, the DoH
-                // client having logged one warn as the pause began
-                if outcome == UpstreamOutcome::Throttled {
-                    tracing::debug!(upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
-                } else {
-                    crate::warn_sparse!(per up; upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
-                }
+                // 失败时不构造 prefix，也不记 warn：调用方各记一条，带着问题和规则组（见
+                // `phases::Forwarding::settle`、`rules::apply_response_actions`、refresh.rs），回了 429 的
+                // 暂停开始时 DoH 客户端也已经记过一条
+                // No prefix is built on failure, nor a warn logged: each caller logs one with the
+                // question and the pipeline (see `phases::Forwarding::settle`,
+                // `rules::apply_response_actions`, refresh.rs), and for a 429 the DoH client
+                // logged one as the pause began
+                tracing::debug!(upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
                 return Err(UpstreamFailure::error(err));
             }
         }
@@ -2140,12 +2154,14 @@ mod tests {
         assert_eq!(hedge_timeout(Duration::ZERO), Duration::ZERO);
     }
 
-    /// 上游失败的 warn 带着完整的原因，不只是最外层那一句：只有一个上游时、几个上游一起问时都是。这里 DoH 上游读完请求
-    /// 就断开，最外层只说请求没发成，为什么没发成在里层
-    /// A failed upstream's warn carries the whole reason, not just its outermost sentence: with a
-    /// single upstream and with several asked together alike. The DoH upstream here closes once it
-    /// has read the request, the outermost sentence only saying the request was not sent, why it
-    /// was not being further in
+    /// 几个上游一起问时，失败的那个记的 warn 带着完整的原因，不只是最外层那一句。这里 DoH 上游读完请求就断开，最外层只说
+    /// 请求没发成，为什么没发成在里层。只有一个上游时这里不记 warn：调用方记的那一条带着原因（见
+    /// `execution::tests::an_upstream_failure_is_logged_once_with_its_cause`）
+    /// With several upstreams asked together, a failed one's warn carries the whole reason, not
+    /// just its outermost sentence. The DoH upstream here closes once it has read the request, the
+    /// outermost sentence only saying the request was not sent, why it was not being further in.
+    /// With a single upstream no warn is logged here: the caller's one carries the reason (see
+    /// `execution::tests::an_upstream_failure_is_logged_once_with_its_cause`)
     #[tokio::test]
     async fn a_failed_upstream_is_logged_with_its_whole_reason() {
         use crate::engine::test_support::{DohReply, Warnings, spawn_doh_upstream};
@@ -2181,8 +2197,8 @@ mod tests {
         };
         let single = failed("single upstream call failed");
         let several = failed("upstream call failed, waiting for others");
-        assert_eq!((single.len(), several.len()), (1, 2), "{lines:#?}");
-        for line in single.into_iter().chain(several) {
+        assert_eq!((single.len(), several.len()), (0, 2), "{lines:#?}");
+        for line in several {
             assert!(
                 line.contains("error=doh request send failed: error sending request"),
                 "{line}"

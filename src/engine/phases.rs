@@ -937,7 +937,27 @@ impl<'a> Forwarding<'a> {
             // and the refresh counting as a success with no backing off
             Err(e) if self.request.refresh.is_some() => Err(e),
             Err(e) if on_miss.is_empty() => Ok(self.upstream_failed(e, response)),
-            Err(_) => self.act(on_miss, None, response).await,
+            Err(e) => {
+                // 上游失败这一次只在这里记一条，带着问题、规则组和原因（见 `upstream_failed`）；流控没让等的不逐个记
+                // The upstream failure is logged here once, with the question, the pipeline and
+                // the reason (see `upstream_failed`); one with flow control keeping the query
+                // from waiting is not logged one by one
+                if !UpstreamFailure::was_withheld(&e) {
+                    let (request, decision) = (self.request, self.decision);
+                    crate::warn_sparse!(
+                        per decision.upstream;
+                        event = "miss_actions_on_upstream_failure",
+                        upstream = %decision.upstream,
+                        qname = %request.qname,
+                        qtype = ?request.qtype,
+                        client_ip = %request.peer.ip(),
+                        pipeline = %self.route.pipeline,
+                        error = %format_args!("{e:#}"),
+                        "upstream failed, running the miss actions"
+                    );
+                }
+                self.act(on_miss, None, response).await
+            }
         }
     }
 
@@ -1008,11 +1028,13 @@ impl<'a> Forwarding<'a> {
     }
 
     /// 上游失败、规则没有 miss 动作时给客户端的应答：所有上游尝试都耗尽了、或者上游的应答读不了（见 [`Self::read`]）才
-    /// 这样答，先再查一次缓存（见 `check_cache_after_failure`），没有就 SERVFAIL
+    /// 这样答，先再查一次缓存（见 `check_cache_after_failure`），没有就 SERVFAIL。这次失败只在这里记一条 warn，带着问题、
+    /// 规则组和原因（只问一个上游时 `forward_upstream` 不另记）
     /// The answer for the client when the upstream failed and the rule has no miss actions,
     /// given once every upstream attempt is exhausted or the upstream's reply cannot be read
     /// (see [`Self::read`]): the cache looked in again (see `check_cache_after_failure`), or else
-    /// SERVFAIL
+    /// SERVFAIL. The failure is logged here as one warning, with the question, the pipeline and
+    /// the reason (`forward_upstream` logging none of its own for a single upstream)
     fn upstream_failed(&mut self, e: anyhow::Error, response: &mut ResponseInfo) -> ForwardResult {
         let (request, decision, route) = (self.request, self.decision, &*self.route);
         let withheld = UpstreamFailure::was_withheld(&e);
@@ -1067,7 +1089,6 @@ impl<'a> Forwarding<'a> {
                        client_ip = %request.peer.ip(),
                        error = %format_args!("{e:#}"),
                        pipeline = %route.pipeline,
-                       transport = ?decision.transport,
                        "upstream failed"
                     );
                 }
