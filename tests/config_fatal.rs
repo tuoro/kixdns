@@ -8,11 +8,10 @@
 //! 让内核起不来的配置写成一条日志。像 OpenWrt 上 procd 那样把输出写进文件（既不是终端也不是 journald）跑真程序：
 //! 致命错误和事件一样只占一行，UTC 时间开头、第二个词是 ERROR，面板读这个文件时只看 error 也看得到内核为什么没起来。
 
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{Kernel, free_port};
+use common::{free_port, run_logging};
 
 /// 正则写错的错误说明有好几行，照样只占一行，里面的换行写成 `\n`。以前写成 `Error: {err:?}`，这份配置是 7 行，
 /// 没有时间也没有级别
@@ -45,19 +44,7 @@ fn a_fatal_error_in_a_log_file_is_one_line_with_time_and_level() {
         .to_string(),
     )
     .unwrap();
-    let output = std::fs::File::create(&log).unwrap();
-    let mut kernel = Kernel(
-        Command::new(env!("CARGO_BIN_EXE_kixdns"))
-            .args(["run", "--config"])
-            .arg(&config)
-            .env_remove("RUST_LOG")
-            .env_remove("JOURNAL_STREAM")
-            .stdout(output.try_clone().unwrap())
-            .stderr(output)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut kernel = run_logging(&config, &log, None);
     let start = Instant::now();
     let status = loop {
         if let Some(status) = kernel.0.try_wait().unwrap() {

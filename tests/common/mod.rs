@@ -52,16 +52,19 @@ impl Drop for Kernel {
     }
 }
 
-/// 起一个读 `config` 的内核，日志按 `level` 写进 `log`（None 是默认级别，不看测试自己的 RUST_LOG），不等它开始应答
-/// Starts a kernel reading `config`, logging into `log` at `level` (None for the default level,
-/// whatever RUST_LOG the test itself has), without waiting for it to answer
+/// 起一个读 `config` 的内核，不等它开始应答。日志像 OpenWrt 上 procd 那样写进文件 `log`，既不是终端也不是 journald，
+/// 级别是 `level`（None 是默认级别，不看测试自己的 RUST_LOG）
+/// Starts a kernel reading `config`, without waiting for it to answer. It logs into the file
+/// `log` as procd has it on OpenWrt, neither a terminal nor journald, at `level` (None for the
+/// default level, whatever RUST_LOG the test itself has)
 pub fn run_logging(config: &Path, log: &Path, level: Option<&str>) -> Kernel {
     let output = std::fs::File::create(log).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kixdns"));
     command
         .args(["run", "--config"])
         .arg(config)
-        .env_remove("RUST_LOG");
+        .env_remove("RUST_LOG")
+        .env_remove("JOURNAL_STREAM");
     if let Some(level) = level {
         command.env("RUST_LOG", level);
     }
