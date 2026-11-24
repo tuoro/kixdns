@@ -9,7 +9,6 @@ use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::matcher::RuntimePipelineConfig;
-use tracing::info;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineConfig {
@@ -656,14 +655,14 @@ impl Rule {
             .collect();
 
         if all_upstreams.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 rule = %self.name,
                 forward_count,
                 "all forward actions have empty upstream, merged_forward not set"
             );
             self.merged_forward = None;
         } else {
-            tracing::info!(
+            tracing::debug!(
                 rule = %self.name,
                 forward_count,
                 tcp_count = sets[0].len(),
@@ -1006,11 +1005,6 @@ pub fn load_config_with_source(path: &Path) -> Result<(PipelineConfig, String)> 
         .with_context(|| format!("read config file: {}", path.display()))?;
     let cfg =
         parse_config(&raw).with_context(|| format!("parse config file: {}", path.display()))?;
-
-    if let Some(version) = cfg.version.as_ref() {
-        info!(version = %version, "config loaded");
-    }
-
     Ok((cfg, raw))
 }
 
@@ -3172,5 +3166,56 @@ mod validation_tests {
             configured.restart_pending(&running),
             ["cache_capacity", "flow_control_enabled"]
         );
+    }
+
+    /// 读配置、编译配置在 info 级别什么也不记：配置生效了才记（重载记 `config reloaded`，启动记
+    /// `dns server started`，都带着配置的 version）。以前读出来就记一条 `config loaded`，重载被拒时先说 loaded 再说
+    /// failed；几个 forward 合并时每条规则记一条 info，面板每校验一次都刷一遍
+    /// Reading and compiling a configuration log nothing at the info level: what is logged is the
+    /// configuration taking effect (`config reloaded` on a reload, `dns server started` at
+    /// startup, both with the configuration's version). `config loaded` used to be logged as soon
+    /// as it was read, a refused reload saying loaded before it said failed, and merging several
+    /// forwards logged an info for every such rule, all over again on every panel validation
+    #[test]
+    fn reading_and_compiling_a_configuration_log_nothing_at_info() {
+        use tracing_subscriber::layer::SubscriberExt;
+        struct Counted(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counted {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() <= tracing::Level::INFO {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline.json");
+        let forward =
+            |upstream: &str| serde_json::json!({ "type": "forward", "upstream": upstream });
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": "v7",
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{ "id": "main", "rules": [rule(
+                    "both",
+                    serde_json::json!([{ "type": "any" }]),
+                    serde_json::json!([forward("1.1.1.1:53"), forward("8.8.8.8:53")])
+                )] }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let logged = std::sync::Arc::default();
+        let subscriber =
+            tracing_subscriber::registry().with(Counted(std::sync::Arc::clone(&logged)));
+        tracing::subscriber::with_default(subscriber, || {
+            let (config, _) = super::load_config_with_source(&path).expect("reads");
+            super::compile(config).expect("compiles");
+        });
+        assert_eq!(logged.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

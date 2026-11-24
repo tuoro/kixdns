@@ -255,23 +255,7 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run DNS server / 运行 DNS 服务器
-    Run {
-        /// 配置文件路径（JSON） / Config file path (JSON)
-        #[arg(short = 'c', long = "config", default_value = "config/pipeline.json")]
-        config: PathBuf,
-        /// 监听实例标签，用于 pipeline 选择（可选）。 / Listener instance label for pipeline selection (optional)
-        #[arg(long = "listener-label", default_value = "default")]
-        listener_label: String,
-        /// 启用调试日志 / Enable debug logging
-        #[arg(long = "debug", default_value_t = false)]
-        debug: bool,
-        /// UDP worker 数量（默认 CPU 核心数） / Number of UDP workers (defaults to CPU core count)
-        #[arg(long = "udp-workers", default_value_t = 0)]
-        udp_workers_count: usize,
-        /// 本机管理 Socket；不设置时禁用增强管理接口。 / Local panel control socket; disabled when omitted.
-        #[arg(long = "admin-socket")]
-        admin_socket: Option<PathBuf>,
-    },
+    Run(RunArgs),
     /// 面板诊断的草稿试跑（面板内部使用）：从标准输入读请求、往标准输出写结果，不绑定任何端口
     /// Panel diagnostics' draft trial (internal): request on stdin, result on stdout, no port bound
     #[command(hide = true)]
@@ -288,6 +272,35 @@ enum Commands {
         #[arg(short = 'f', long = "filter")]
         filter: Option<String>,
     },
+}
+
+impl Args {
+    /// 要做的事：不带子命令就是不带参数的 `run`，默认值照 [`RunArgs`] 里写的取 / What to do: no
+    /// subcommand is `run` with no arguments, taking the defaults [`RunArgs`] writes
+    fn command(self) -> Commands {
+        self.command
+            .unwrap_or_else(|| Commands::Run(RunArgs::parse_from(["kixdns"])))
+    }
+}
+
+/// `run` 的参数 / The arguments of `run`
+#[derive(Parser, Debug)]
+struct RunArgs {
+    /// 配置文件路径（JSON） / Config file path (JSON)
+    #[arg(short = 'c', long = "config", default_value = "config/pipeline.json")]
+    config: PathBuf,
+    /// 监听实例标签，用于 pipeline 选择（可选）。 / Listener instance label for pipeline selection (optional)
+    #[arg(long = "listener-label", default_value = "default")]
+    listener_label: String,
+    /// 启用调试日志 / Enable debug logging
+    #[arg(long = "debug", default_value_t = false)]
+    debug: bool,
+    /// UDP worker 数量（默认 CPU 核心数） / Number of UDP workers (defaults to CPU core count)
+    #[arg(long = "udp-workers", default_value_t = 0)]
+    udp_workers_count: usize,
+    /// 本机管理 Socket；不设置时禁用增强管理接口。 / Local panel control socket; disabled when omitted.
+    #[arg(long = "admin-socket")]
+    admin_socket: Option<PathBuf>,
 }
 
 fn main() {
@@ -333,74 +346,42 @@ fn real_main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    match args.command {
-        Some(Commands::PanelTrial) => kixdns::panel::trial_from_stdio().await,
-        Some(Commands::ConvertGeoIp {
+    match Args::parse().command() {
+        Commands::PanelTrial => kixdns::panel::trial_from_stdio().await,
+        Commands::ConvertGeoIp {
             input,
             output,
             filter,
-        }) => {
+        } => {
             // Convert GeoIP .dat to MMDB
             let filter_countries: Option<Vec<String>> =
                 filter.map(|f| f.split(',').map(|s| s.trim().to_uppercase()).collect());
 
             let filter_slice = filter_countries.as_deref();
 
-            match kixdns::matcher::geoip_converter::convert_dat_to_mmdb(
+            // 失败时由 main 连同原因链打出来：这里还没装日志 / A failure is printed by main with its
+            // cause chain: no logging is installed here
+            let stats = kixdns::matcher::geoip_converter::convert_dat_to_mmdb(
                 &input,
                 &output,
                 filter_slice,
-            ) {
-                Ok(stats) => {
-                    println!("Conversion completed successfully:\n{}", stats);
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("Conversion failed: {}", e);
-                    Err(e)
-                }
-            }
+            )?;
+            println!("Conversion completed successfully:\n{}", stats);
+            Ok(())
         }
-        Some(Commands::Run {
-            config,
-            listener_label,
-            debug,
-            udp_workers_count,
-            admin_socket,
-        }) => {
-            run_dns_server(
-                config,
-                listener_label,
-                debug,
-                udp_workers_count,
-                admin_socket,
-            )
-            .await
-        }
-        None => {
-            // No subcommand provided - run DNS server with defaults
-            run_dns_server(
-                PathBuf::from("config/pipeline.json"),
-                "default".to_string(),
-                false,
-                0,
-                None,
-            )
-            .await
-        }
+        Commands::Run(args) => run_dns_server(args).await,
     }
 }
 
 /// 运行 DNS 服务器 / Run DNS server
-/// 提取公共逻辑以消除代码重复 / Extract common logic to eliminate code duplication
 async fn run_dns_server(
-    config: PathBuf,
-    listener_label: String,
-    debug: bool,
-    udp_workers_count: usize,
-    admin_socket: Option<PathBuf>,
+    RunArgs {
+        config,
+        listener_label,
+        debug,
+        udp_workers_count,
+        admin_socket,
+    }: RunArgs,
 ) -> anyhow::Result<()> {
     // Run DNS server
     init_tracing(debug);
@@ -425,6 +406,7 @@ async fn run_dns_server(
     // the reload refusing them is, so the default log level shows them: they used to be a
     // warn, and at the default level nobody learnt that the next change would be refused
     let problems = kixdns::config::problems(&cfg);
+    let version = cfg.version.clone();
     for problem in &problems {
         error!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
     }
@@ -485,7 +467,7 @@ async fn run_dns_server(
         })
         .ok();
 
-    info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, "dns server started");
+    info!(bind_udp = %bind_addr, bind_tcp = %bind_tcp, udp_workers_count = udp_workers_final, config_version = version, "dns server started");
 
     let mut all_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -494,7 +476,7 @@ async fn run_dns_server(
         let engine = engine.clone();
         all_handles.push(tokio::spawn(async move {
             if let Err(err) = kixdns::panel::serve_admin(path, engine, panel_metrics).await {
-                error!(error = %err, "panel control socket exited");
+                error!(error = %format!("{err:#}"), "panel control socket exited");
             }
         }));
     }
@@ -550,10 +532,7 @@ fn engine_observer(
 }
 
 fn init_tracing(debug: bool) {
-    // 默认仅保留错误日志以平衡性能与可观测性，除非显式指定
-    // Default to error-level logging to balance performance with observability unless explicitly enabled
-    let level = if debug { "debug" } else { "error" };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let (filter, unreadable) = log_filter(std::env::var(EnvFilter::DEFAULT_ENV).ok(), debug);
     let registry = tracing_subscriber::registry().with(filter);
     if stdout_is_journald() {
         // journald 自己记时间，优先级靠行首的 `<N>` 前缀，行里的时间和级别只是给人看的，照旧
@@ -571,6 +550,31 @@ fn init_tracing(debug: bool) {
         registry
             .with(fmt::layer().event_format(plain_log_format()))
             .init();
+    }
+    if let Some(error) = unreadable {
+        error!(%error, "RUST_LOG is not a log filter, logging at the default level instead");
+    }
+}
+
+/// 日志过滤：设了 RUST_LOG（`rust_log`，空的当没设）就照它，否则只记 error；`--debug` 时 KixDNS 自己记到 debug，依赖（h2、hyper、
+/// rustls、quinn）只到 warn，免得淹在它们的 debug 里。RUST_LOG 写错时也用默认的，连同为什么读不了一起交回来，日志装好
+/// 以后记一条 error：以前悄悄退回 error 级别，看着就像设了没用
+/// The log filter: RUST_LOG (`rust_log`, empty taken as unset) when set, error alone otherwise; with `--debug` KixDNS
+/// itself logs down to debug and its dependencies (h2, hyper, rustls, quinn) to warn, so as not
+/// to drown in their debug. A RUST_LOG written wrong gets the default too, handed back with why
+/// it cannot be read, to be logged as an error once logging is in place: it used to fall back to
+/// the error level in silence, looking as if setting it did nothing
+fn log_filter(
+    rust_log: Option<String>,
+    debug: bool,
+) -> (EnvFilter, Option<tracing_subscriber::filter::ParseError>) {
+    let default = || EnvFilter::new(if debug { "kixdns=debug,warn" } else { "error" });
+    match rust_log.filter(|directives| !directives.trim().is_empty()) {
+        None => (default(), None),
+        Some(directives) => match EnvFilter::try_new(directives) {
+            Ok(filter) => (filter, None),
+            Err(error) => (default(), Some(error)),
+        },
     }
 }
 
@@ -855,6 +859,49 @@ mod tests {
         assert_eq!(super::panic_message(formatted.as_ref()), "formatted 42");
         let opaque: Box<dyn std::any::Any + Send> = Box::new(42u8);
         assert_eq!(super::panic_message(opaque.as_ref()), "Box<dyn Any>");
+    }
+
+    /// 不设 RUST_LOG（或设成空的）时只记 error，`--debug` 时 KixDNS 自己记到 debug、依赖只到 warn；设了就照它。写错了
+    /// 的照默认的记，交回为什么读不了。以前写错时悄悄退回 error 级别，`--debug` 把 h2、hyper、rustls 也开到 debug
+    /// Without RUST_LOG (or with it empty) only errors are logged, and with `--debug` KixDNS itself
+    /// down to debug and its dependencies to warn; when set, as it says. One written wrong logs by
+    /// the default, handed back with why it cannot be read. It used to fall back to the error level
+    /// in silence, and `--debug` turned h2, hyper and rustls to debug too
+    #[test]
+    fn the_log_filter_reads_rust_log_and_says_when_it_cannot() {
+        let filter = |rust_log: Option<&str>, debug| {
+            let (filter, error) = super::log_filter(rust_log.map(str::to_owned), debug);
+            (filter.to_string(), error.is_some())
+        };
+        assert_eq!(filter(None, false), ("error".to_owned(), false));
+        assert_eq!(filter(Some(" "), false), ("error".to_owned(), false));
+        let (debug, unreadable) = filter(None, true);
+        assert!(!unreadable);
+        let mut directives: Vec<&str> = debug.split(',').collect();
+        directives.sort_unstable();
+        assert_eq!(directives, ["kixdns=debug", "warn"]);
+        assert_eq!(
+            filter(Some("kixdns::engine::phases=info"), true),
+            ("kixdns::engine::phases=info".to_owned(), false)
+        );
+        assert_eq!(
+            filter(Some("kixdns=loud"), false),
+            ("error".to_owned(), true)
+        );
+    }
+
+    /// 不带子命令和不带参数的 `run` 一样，默认值只写在 `RunArgs` 里 / No subcommand is the same as
+    /// `run` with no arguments, the defaults written in `RunArgs` alone
+    #[test]
+    fn no_subcommand_runs_with_the_defaults_of_run() {
+        use clap::Parser as _;
+        let command = |args: &[&str]| format!("{:?}", super::Args::parse_from(args).command());
+        assert_eq!(command(&["kixdns"]), command(&["kixdns", "run"]));
+        assert!(
+            command(&["kixdns"]).contains("config/pipeline.json"),
+            "{}",
+            command(&["kixdns"])
+        );
     }
 
     /// 没有面板时和上游一样：不带 `--debug` 不装观察者，带了装参考观察者；有面板时装的就是面板观察者
