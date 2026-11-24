@@ -231,13 +231,22 @@ const MAX_NAME: usize = 255;
 /// most 4 + 4 + 16). The answer then fits whatever name is asked, with EDNS or without
 const TXT_ROOM: usize = MAX_MESSAGE - (12 + MAX_NAME + 4 + 2 + 10 + 11 + 24);
 
-/// TXT 内容放不进应答时说明原因：一段超过 255 字节，或者 RDATA（每段的内容加一个长度字节）超过 [`TXT_ROOM`]。配置检查
-/// 报出它（见 `config::problems`），编应答时编成 SERVFAIL（见 `StaticAnswer::txt`），所以编好的 TXT 问什么都装得下
-/// Why TXT content does not fit an answer, when it does not: a segment over 255 bytes, or
-/// RDATA (each segment's content plus one length byte) over [`TXT_ROOM`]. The configuration
-/// check reports it (see `config::problems`) and the answer is compiled to SERVFAIL (see
-/// `StaticAnswer::txt`), so a TXT compiled fits whatever is asked
-pub(crate) fn txt_size_problem(text: &[String]) -> Option<String> {
+/// TXT 内容编不成一条应答里的记录时说明原因：一个字符串也没有（一条 TXT 记录至少有一个，RDATA 为空的记录客户端整个
+/// 应答都读不了），一段超过 255 字节，或者 RDATA（每段的内容加一个长度字节）超过 [`TXT_ROOM`]。配置检查报出它（见
+/// `config::problems`），编应答时编成 SERVFAIL（见 `StaticAnswer::txt`），所以编好的 TXT 问什么都装得下、读得了
+/// Why TXT content cannot be made a record in an answer, when it cannot: it has no string (a
+/// TXT record holds at least one, and one with empty RDATA leaves the client unable to read
+/// the whole answer), a segment is over 255 bytes, or RDATA (each segment's content plus one
+/// length byte) is over [`TXT_ROOM`]. The configuration check reports it (see
+/// `config::problems`) and the answer is compiled to SERVFAIL (see `StaticAnswer::txt`), so a
+/// TXT compiled fits and reads whatever is asked
+pub(crate) fn txt_problem(text: &[String]) -> Option<String> {
+    if text.is_empty() {
+        return Some(
+            r#"text names no string; a TXT record holds at least one, write "" for an empty one"#
+                .to_owned(),
+        );
+    }
     if let Some(segment) = text.iter().find(|segment| segment.len() > MAX_TXT_SEGMENT) {
         return Some(format!(
             "a TXT segment of {} bytes is longer than {MAX_TXT_SEGMENT}",
@@ -294,13 +303,13 @@ impl StaticRecords {
 
     /// 给问 `qname` 的 `qtype`、`qclass` 的查询的记录，都指回问题名：地址只给问的地址族（ANY 都给），TXT 只答 TXT 和 ANY
     /// 查询，别的类型回 NODATA；只给 IN 和 ANY 类的问题（见 [`has_static_records`]）。问题名读不出来的，不管问什么都回
-    /// SERVFAIL。TXT 问什么名字都装得下：装不下的编成了 SERVFAIL（见 [`txt_size_problem`]）
+    /// SERVFAIL。TXT 问什么名字都装得下：装不下的编成了 SERVFAIL（见 [`txt_problem`]）
     /// The records for a query asking `qname` for `qtype` in `qclass`, each owned by the question
     /// name: addresses of the family asked alone (both for ANY), a TXT for TXT and ANY queries
     /// alone, NODATA for other types; only for questions of class IN and ANY (see
     /// [`has_static_records`]). A question name that cannot be read is SERVFAIL whatever is
     /// asked. A TXT fits whatever name is asked: one that does not was compiled to SERVFAIL (see
-    /// [`txt_size_problem`])
+    /// [`txt_problem`])
     fn of(&self, qname: &str, qtype: RecordType, qclass: DNSClass) -> (ResponseCode, Vec<Record>) {
         let Some(name) = crate::proto_utils::name_from_text(qname) else {
             return (ResponseCode::ServFail, Vec::new());
