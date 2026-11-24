@@ -75,9 +75,10 @@ Internal background refreshes and intermediate forwarding attempts are excluded.
 `cache_hit` is true only when the response cache supplied the answer. The old
 `cache` field is removed: it meant "cacheable", and reusing the name would have
 silently flipped its meaning. RCODE is read from the answer and omitted when the
-answer does not parse as DNS. A failed or cancelled
-request without an answer uses `event="dns_request_finished"` and `status`, with
-no inferred RCODE. Singleflight followers use `upstream="inflight"` because the
+answer does not parse as DNS. A request cancelled
+without an answer uses `event="dns_request_finished"` and `status`, with no
+inferred RCODE (one ending in an error is answered SERVFAIL and logged as
+`dns_response`). Singleflight followers use `upstream="inflight"` because the
 shared result does not carry the leader's upstream identity.
 
 Older logs lack `cache_hit`: their `cache=true` can mean a cacheable forwarded

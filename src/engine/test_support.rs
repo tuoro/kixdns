@@ -503,7 +503,7 @@ pub(super) async fn ask_fast_path_first(
         FastPathResponse::CacheHit { cached, .. } => cached,
         FastPathResponse::AsyncNeeded(pre_parsed) => tokio::time::timeout(
             Duration::from_secs(5),
-            engine.handle_packet_internal_with_pre_parsed(packet, peer, pre_parsed),
+            engine.handle_packet_full(packet, peer, pre_parsed),
         )
         .await
         .expect("answer in time"),

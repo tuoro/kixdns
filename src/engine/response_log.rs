@@ -1,11 +1,13 @@
+//! 引擎产出的每个应答记一条 INFO 应答记录，快速路径的也算；它不是送达回执。没等到应答就被取消的请求记另一种事件（以错误
+//! 结束的客户端请求也有应答：SERVFAIL）；重试和后台刷新不是给客户端的应答，不记。
 //! One INFO response record per answer produced by the engine, including fast paths.
-//! This is not a delivery receipt. Failed/cancelled requests use a separate event;
-//! retries and background refresh are not client responses.
+//! This is not a delivery receipt. A request cancelled before its answer uses a separate
+//! event (a client request ending in an error still has one: SERVFAIL); retries and
+//! background refresh are not client responses.
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use hickory_proto::serialize::binary::BinDecodable;
@@ -62,7 +64,6 @@ pub(crate) struct ResponseLog<'a> {
     enabled: bool,
     rcode: Option<ResponseCode>,
     answered: bool,
-    status: &'static str,
 }
 
 impl<'a> ResponseLog<'a> {
@@ -103,7 +104,6 @@ impl<'a> ResponseLog<'a> {
             // No response exists yet; never infer an RCODE from a dropped future.
             rcode: None,
             answered: false,
-            status: "cancelled",
         }
     }
 
@@ -120,14 +120,6 @@ impl<'a> ResponseLog<'a> {
             });
         // An answer exists even if it does not parse as DNS.
         self.answered = true;
-        self.status = "completed";
-    }
-
-    pub fn finish(&mut self, result: &anyhow::Result<Bytes>) {
-        match result {
-            Ok(bytes) => self.answered(bytes),
-            Err(_) => self.status = "failed",
-        }
     }
 }
 
@@ -151,7 +143,7 @@ impl Drop for ResponseLog<'_> {
             rcode = rcode.as_deref(),
             cache_hit = self.info.cache_hit,
             latency_ms = self.start.elapsed().as_millis() as u64,
-            status = self.status,
+            status = if self.answered { "completed" } else { "cancelled" },
             "client request finished"
         );
     }

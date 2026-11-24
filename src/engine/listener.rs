@@ -82,16 +82,16 @@ impl Engine {
     }
 
     /// 快速路径没能当场回答的查询：在整体请求时限内走完整处理，完整路径读得了的总有应答（见
-    /// `Engine::handle_packet_internal_with_pre_parsed`）。读不了的查询回 FORMERR（RFC 6891 第 6.1.1 节，见
+    /// `Engine::handle_packet_full`）。读不了的查询回 FORMERR（RFC 6891 第 6.1.1 节，见
     /// `proto_utils::formerr_reply`），读得了读不了在读的那一刻就定下了（见 [`UnreadableQuery`]），不必为此再解析一遍；超时
     /// 回 SERVFAIL（见 `proto_utils::servfail_reply`）。这两种各记一条日志。`pre_parsed` 为 None 时快速解析没成，从头解析。
     /// A query the fast path could not answer on the spot: the full path within the overall
     /// request timeout, which always answers a query it can read (see
-    /// `Engine::handle_packet_internal_with_pre_parsed`). A query that cannot be read gets
-    /// FORMERR (RFC 6891 section 6.1.1, see `proto_utils::formerr_reply`), which was settled
-    /// the moment it was read (see [`UnreadableQuery`]) with no second parse for it; a timeout
-    /// gets SERVFAIL (see `proto_utils::servfail_reply`). Each of the two is logged. With
-    /// `pre_parsed` None the quick parse failed, and the query is parsed from scratch.
+    /// `Engine::handle_packet_full`). A query that cannot be read gets FORMERR (RFC 6891
+    /// section 6.1.1, see `proto_utils::formerr_reply`), which was settled the moment it was
+    /// read (see [`UnreadableQuery`]) with no second parse for it; a timeout gets SERVFAIL (see
+    /// `proto_utils::servfail_reply`). Each of the two is logged. With `pre_parsed` None the
+    /// quick parse failed, and the query is parsed from scratch.
     pub async fn answer_after_fast_path(
         &self,
         packet: &[u8],
@@ -106,9 +106,7 @@ impl Engine {
         let timeout_ms = self.get_request_timeout_ms();
         let answered = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
             match pre_parsed {
-                Some(pre_parsed) => Ok(self
-                    .handle_packet_internal_with_pre_parsed(packet, peer, pre_parsed)
-                    .await),
+                Some(pre_parsed) => Ok(self.handle_packet_full(packet, peer, pre_parsed).await),
                 None => self.handle_packet(packet, peer).await,
             }
         })

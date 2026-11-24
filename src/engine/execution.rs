@@ -75,9 +75,9 @@ pub struct CacheKeys {
 
 /// A query read already, so as not to parse it again: the query as `handle_packet_fast` or
 /// `Engine::handle_packet` read it and the pipeline picked, for this very packet (see
-/// `Engine::handle_packet_internal_with_pre_parsed`)
+/// `Engine::handle_packet_full`)
 /// 读好的查询，不必再解析一遍：`handle_packet_fast` 或 `Engine::handle_packet` 读出的查询和选中的 pipeline，是这一个包的
-/// （见 `Engine::handle_packet_internal_with_pre_parsed`）
+/// （见 `Engine::handle_packet_full`）
 #[derive(Clone)]
 pub struct PreParsedData {
     head: RequestHead,
@@ -955,10 +955,7 @@ impl Engine {
             // `apply_rules`), and a decision kept there needs no rules evaluated. The fast path
             // used to evaluate the compiled rules first, for nothing when a forward was kept
             let cached = pipeline.and_then(|p| {
-                self.cached_decision(
-                    &self.rule_question(cache_namespace, p, qname_str, qtype, qclass, requester),
-                    start,
-                )
+                self.cached_decision(&self.rule_question(cache_namespace, p, &facts), start)
             });
             let (next, hop) = if let Some(record) = cached {
                 match &record.entry.decision {
@@ -1052,11 +1049,11 @@ impl Engine {
     }
 
     /// 客户端的查询走完整路径，从头读：读不了的是 [`UnreadableQuery`]，监听器据此回 FORMERR（见
-    /// `Engine::answer_after_fast_path`）；读得了的照 [`Self::handle_packet_internal_with_pre_parsed`] 作答
+    /// `Engine::answer_after_fast_path`）；读得了的照 [`Self::handle_packet_full`] 作答
     /// The full path for a client's query, read from scratch: one that cannot be read is an
     /// [`UnreadableQuery`], which the listener answers FORMERR (see
     /// `Engine::answer_after_fast_path`); one that can is answered as
-    /// [`Self::handle_packet_internal_with_pre_parsed`] answers it
+    /// [`Self::handle_packet_full`] answers it
     pub async fn handle_packet(
         &self,
         packet: &[u8],
@@ -1065,7 +1062,7 @@ impl Engine {
         let state = self.state.load_full();
         let head = self.read_request(packet, client_address(peer).ip(), &state.pipeline)?;
         Ok(self
-            .handle_packet_internal_with_pre_parsed(packet, peer, PreParsedData { head, state })
+            .handle_packet_full(packet, peer, PreParsedData { head, state })
             .await)
     }
 
@@ -1084,7 +1081,7 @@ impl Engine {
     /// client wrote it (see `proto_utils::reply_as_asked`); waiters were handed the reply before
     /// this and do the same for their own clients. All three listeners come in here through
     /// `Engine::answer_after_fast_path`
-    pub async fn handle_packet_internal_with_pre_parsed(
+    pub async fn handle_packet_full(
         &self,
         packet: &[u8],
         peer: SocketAddr,
@@ -1243,8 +1240,6 @@ impl Engine {
     ) -> Answered<'a> {
         let peer = client_address(peer);
         let background_refresh = refresh.is_some();
-        // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
-        let request_id = next_request_id();
         // A refresh replays its request's ECS from the key the cache kept, as an option
         // nobody can read does not survive into the replayed packet (see
         // `RefreshTarget::client_ecs`)
@@ -1264,7 +1259,7 @@ impl Engine {
                 ObservedRequest::new(
                     observer,
                     RequestContext {
-                        request_id,
+                        request_id: next_request_id(),
                         listener_label: &self.listener_label,
                         client: peer,
                         // A refresh is the engine's own query, whichever listener's request scheduled it.
@@ -1476,64 +1471,71 @@ impl Engine {
                 decision
             }
         };
-        'decision_loop: loop {
-            while let Decision::Jump { pipeline } = &decision {
-                if route.jumps_left == 0 {
-                    crate::warn_sparse!("max jump limit reached");
-                    // How many jumps a request has left depends on the way it
-                    // came, which no key carries, so this SERVFAIL is its own
-                    // (see `Engine::answer`): a waiter on its held entry
-                    // may have jumps to spare, so the entry goes rather than hand
-                    // it over, and it is not cached for a request that enters
-                    // this pipeline directly.
-                    // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
-                    // SERVFAIL 只属于它（见 `Engine::answer`）：等在持有条目上的
-                    // 请求可能还有余量，所以放掉条目，不把它交出去；也不缓存给直接进入
-                    // 这个 pipeline 的请求。
-                    info.upstream = Some(Source::Static);
-                    anyhow::bail!("the jump limit was reached");
-                }
-                route.jumps_left -= 1;
-                let Some(p) = cfg.pipeline(pipeline) else {
-                    crate::warn_sparse!(pipeline = %pipeline, "jump target pipeline not found");
-                    info.upstream = Some(Source::Static);
-                    return Ok(crate::proto_utils::servfail_reply(packet));
-                };
-                info.pipeline = Some(p.id.clone());
-                if let Some((observer, ctx)) = request.observed {
-                    observer.pipeline_selected(ctx, &p.id);
-                }
-                // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
-                // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
-                // 上游。后台刷新照请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），
-                // 走的是同一条路线、写回同一个键。键里带着目标按自己的规则（连同它跳得到的 pipeline）
-                // 分辨请求方的结果，和直接选进目标的请求查的是同一套键，所以目标按「谁在问」给不同
-                // 应答时也照查；continue 之后跳过来的请求也一样：留着复用的应答在跳转时已经丢掉，
-                // 目标里的处理和第一轮没有分别。以前这两种都不查，经过它们的请求每次都问上游
-                // After a jump, look in the response cache again under the target pipeline's
-                // key. A forwarded answer is stored under that key, while the entry lookup used
-                // the entry pipeline's, so a request that jumped never found it and went upstream
-                // every time. A background refresh replays the request as it came (from the same
-                // address, with or without EDNS, in the same class, see refresh.rs), taking the same
-                // route and writing back under the same key. The key carries how the target's rules
-                // (with the pipelines it can jump to) tell requesters apart, the same keys a request
-                // selected into the target looks up, so a target answering by who is asking is
-                // looked up as well; so is a request jumping in after a continue: the answer kept for
-                // reuse is dropped at the jump, and the target handles it as on a first pass. Neither
-                // used to look, every request through them asking upstream
-                if route.enter(self, request, p)
-                    && !background_refresh
-                    && let Some(answer) = self
-                        .answer_from_cache(&request.lookup(&route.pipeline, route.keys.slot), info)
-                        .await
-                {
-                    return Ok(answer);
-                }
-                decision = evaluate(p, route.resume_at);
-            }
-
+        // 请求现在所在的 pipeline，continue 以后在它里面接着求值；选不到 pipeline 时为 None，那时的默认转发不会 continue
+        // The pipeline the request is in now, where evaluation resumes after a continue; None
+        // when no pipeline was picked, whose default forward never continues
+        let mut current = pipeline;
+        loop {
             match decision {
-                Decision::Jump { .. } => unreachable!("the loop above resolves every jump"),
+                Decision::Jump { pipeline: target } => {
+                    if route.jumps_left == 0 {
+                        crate::warn_sparse!("max jump limit reached");
+                        // How many jumps a request has left depends on the way it
+                        // came, which no key carries, so this SERVFAIL is its own
+                        // (see `Engine::answer`): a waiter on its held entry
+                        // may have jumps to spare, so the entry goes rather than hand
+                        // it over, and it is not cached for a request that enters
+                        // this pipeline directly.
+                        // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
+                        // SERVFAIL 只属于它（见 `Engine::answer`）：等在持有条目上的
+                        // 请求可能还有余量，所以放掉条目，不把它交出去；也不缓存给直接进入
+                        // 这个 pipeline 的请求。
+                        info.upstream = Some(Source::Static);
+                        anyhow::bail!("the jump limit was reached");
+                    }
+                    route.jumps_left -= 1;
+                    let Some(p) = cfg.pipeline(&target) else {
+                        crate::warn_sparse!(pipeline = %target, "jump target pipeline not found");
+                        info.upstream = Some(Source::Static);
+                        return Ok(crate::proto_utils::servfail_reply(packet));
+                    };
+                    info.pipeline = Some(p.id.clone());
+                    if let Some((observer, ctx)) = request.observed {
+                        observer.pipeline_selected(ctx, &p.id);
+                    }
+                    // 跳转后按目标 pipeline 的键再查一次响应缓存。转发回来的应答存在这个键下，而入口
+                    // 那次查找用的是入口 pipeline 的键，所以以前跳转过的请求永远查不到它，每次都去问
+                    // 上游。后台刷新照请求原样重放（同一个地址，带不带 EDNS、类别都一样，见 refresh.rs），
+                    // 走的是同一条路线、写回同一个键。键里带着目标按自己的规则（连同它跳得到的 pipeline）
+                    // 分辨请求方的结果，和直接选进目标的请求查的是同一套键，所以目标按「谁在问」给不同
+                    // 应答时也照查；continue 之后跳过来的请求也一样：留着复用的应答在跳转时已经丢掉，
+                    // 目标里的处理和第一轮没有分别。以前这两种都不查，经过它们的请求每次都问上游
+                    // After a jump, look in the response cache again under the target pipeline's
+                    // key. A forwarded answer is stored under that key, while the entry lookup used
+                    // the entry pipeline's, so a request that jumped never found it and went
+                    // upstream every time. A background refresh replays the request as it came
+                    // (from the same address, with or without EDNS, in the same class, see
+                    // refresh.rs), taking the same route and writing back under the same key. The
+                    // key carries how the target's rules (with the pipelines it can jump to) tell
+                    // requesters apart, the same keys a request selected into the target looks up,
+                    // so a target answering by who is asking is looked up as well; so is a request
+                    // jumping in after a continue: the answer kept for reuse is dropped at the
+                    // jump, and the target handles it as on a first pass. Neither used to look,
+                    // every request through them asking upstream
+                    if route.enter(self, request, p)
+                        && !background_refresh
+                        && let Some(answer) = self
+                            .answer_from_cache(
+                                &request.lookup(&route.pipeline, route.keys.slot),
+                                info,
+                            )
+                            .await
+                    {
+                        return Ok(answer);
+                    }
+                    current = Some(p);
+                    decision = evaluate(p, route.resume_at);
+                }
                 Decision::Static { rcode, answers } => {
                     info.upstream = Some(Source::Static);
                     return Ok(phases::handle_static_decision(
@@ -1574,18 +1576,14 @@ impl Engine {
                     match forwarded {
                         Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
                         Ok(phases::ForwardResult::Continue { ctx }) => {
-                            // 只有规则的回答检查会 continue，所以作出决定的是配置里某个 pipeline 的一条规则
-                            // Only a rule's answer check continues, so a rule of a pipeline of
-                            // the configuration made the decision
-                            route.continued(
-                                *ctx,
-                                rule_index.expect("only a rule's answer check continues"),
-                            );
-                            let pipeline = cfg
-                                .pipeline(&route.pipeline)
-                                .expect("a rule of the pipeline continued");
-                            decision = evaluate(pipeline, route.resume_at);
-                            continue 'decision_loop;
+                            // 只有规则的回答检查会 continue，所以作出决定的是当前 pipeline 的一条规则
+                            // Only a rule's answer check continues, so a rule of the current
+                            // pipeline made the decision
+                            let (Some(p), Some(rule)) = (current, rule_index) else {
+                                unreachable!("only a rule's answer check continues");
+                            };
+                            route.continued(*ctx, rule);
+                            decision = evaluate(p, route.resume_at);
                         }
                         Ok(phases::ForwardResult::Jump {
                             pipeline,
@@ -1594,7 +1592,6 @@ impl Engine {
                         }) => {
                             route.response_jumped(packet, carried, response_jump_limit);
                             decision = Decision::Jump { pipeline };
-                            continue 'decision_loop;
                         }
                         // 这次转发没以应答结束。后台刷新没有要应答的客户端：上游失败了就到此为止，失败原样交回，由
                         // refresh.rs 记录。客户端请求只剩流控没让等的这一种（见 `UpstreamFailure::withheld`）：上游失败、
@@ -1782,14 +1779,19 @@ struct Journal<'a> {
 }
 
 impl Journal<'_> {
-    /// 记下请求以 `result` 结束：客户端的请求是交给客户端的应答，后台刷新是它得出的结果
+    /// 记下请求以 `result` 结束：客户端的请求是交给客户端的应答，后台刷新是它得出的结果。失败只有观察者记得到：应答日志只记
+    /// 客户端的请求（见 `ResponseLog::with_pipeline`），它们总以应答结束（见 `Engine::handle_packet_full`）
     /// Note that the request ended in `result`: for a client's request the reply its client
-    /// gets, for a background refresh what it came to
+    /// gets, for a background refresh what it came to. Only the observer notes a failure: the
+    /// response log records client requests alone (see `ResponseLog::with_pipeline`), which
+    /// always end in a reply (see `Engine::handle_packet_full`)
     fn finish(mut self, result: &anyhow::Result<Bytes>) {
         if let Some(observed) = self.observed.as_mut() {
             observed.finish(result);
         }
-        self.log.finish(result);
+        if let Ok(reply) = result {
+            self.log.answered(reply);
+        }
     }
 }
 
@@ -2587,9 +2589,7 @@ mod tests {
         };
 
         engine.reload(config("new"));
-        let answer = engine
-            .handle_packet_internal_with_pre_parsed(&packet, peer, pre_parsed)
-            .await;
+        let answer = engine.handle_packet_full(&packet, peer, pre_parsed).await;
         let answer = Message::from_bytes(&answer).expect("parse answer");
         assert!(matches!(
             answer.answers.first().map(|record| &record.data),
@@ -2641,9 +2641,7 @@ mod tests {
                 .expect("a query"),
             state: old_state,
         };
-        let response = engine
-            .handle_packet_internal_with_pre_parsed(&request, peer, pre_parsed)
-            .await;
+        let response = engine.handle_packet_full(&request, peer, pre_parsed).await;
         // The jump must execute the target pipeline of the request snapshot
         // (192.0.2.1), not the reloaded one (192.0.2.2).
         assert_eq!(
@@ -4553,7 +4551,7 @@ mod tests {
         else {
             panic!("the fast path leaves a forward to the async path");
         };
-        let pre_parsed = engine.handle_packet_internal_with_pre_parsed(&packet, peer, pre_parsed);
+        let pre_parsed = engine.handle_packet_full(&packet, peer, pre_parsed);
         for (entry, size) in [
             ("handle_packet", std::mem::size_of_val(&full)),
             ("pre-parsed", std::mem::size_of_val(&pre_parsed)),

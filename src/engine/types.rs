@@ -303,17 +303,13 @@ pub enum FastPathResponse {
         elapsed_secs: u32,
     },
     /// Cache miss, needs async processing, with what the fast path already parsed and the
-    /// pipeline it picked, to pass on to `handle_packet_internal_with_pre_parsed`.
-    /// 缓存未命中，需要异步处理；带着快速路径已经解析出的内容和选好的 pipeline，交给
-    /// `handle_packet_internal_with_pre_parsed`。
+    /// pipeline it picked, to pass on to `handle_packet_full`.
+    /// 缓存未命中，需要异步处理；带着快速路径已经解析出的内容和选好的 pipeline，交给 `handle_packet_full`。
     AsyncNeeded(super::PreParsedData),
 }
 
 pub struct EngineInner {
     pub pipeline: RuntimePipelineConfig,
-    /// Response-affecting configuration fingerprint for each pipeline.
-    /// It namespaces response/rule/inflight caches across hot reloads while
-    /// allowing unchanged pipelines to keep their warm cache entries.
     /// 每个 pipeline 影响应答的配置指纹，加上它用到的 Geo 数据的代数（见 [`Self::at_geo`]）
     /// Each pipeline's response-affecting configuration fingerprint, combined with the
     /// generations of the Geo data it uses (see [`Self::at_geo`])
@@ -331,8 +327,8 @@ pub struct EngineInner {
 }
 
 impl EngineInner {
-    /// 从运行时配置建：编译各 pipeline，建按 id 的查找索引，算出缓存命名空间
-    /// Built from a runtime configuration: the pipelines compiled, and the cache namespaces
+    /// 从运行时配置建，算出各 pipeline 的缓存命名空间 / Built from a runtime configuration, with the
+    /// cache namespaces of its pipelines
     pub(crate) fn new(cfg: RuntimePipelineConfig) -> Self {
         let config_namespaces = build_cache_namespaces(&cfg);
         let geo = GeoGeneration::default();
