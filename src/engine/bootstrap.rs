@@ -34,6 +34,22 @@ use super::transport::{UdpClient, UdpExchange};
 /// and TLS handshakes need
 const ASK_BUDGET: Duration = Duration::from_secs(2);
 
+/// 一族地址（A 或 AAAA）这次没问到时，多久之后再问（见 [`Known::new`]）。这时这一族要么没有地址（头一回问），要么是上回
+/// 问到的；在只连得上一族的主机上（比如 IPv6 只有 ULA），少了能连的那一族上游就连不上，所以要短。也不必更短：解析器把一次
+/// 失败至少记 1 秒（RFC 9520 3.2），它举的例子从 5 秒起退避，再早问多半拿回同一个失败。再问在后台，最多 [`ASK_BUDGET`]，
+/// 谁也不等它，有建连要地址时才问，一个名字每 10 秒至多两个查询，所以不退避：一族一直问不到（AAAA 查询被丢掉的网络）
+/// 也就这点开销
+/// How long until a family of addresses (A or AAAA) not given this time is asked again (see
+/// [`Known::new`]). Until then that family has no addresses (asked the first time) or those last
+/// given; on a host reaching one family only (IPv6 with ULA only, say), the upstream cannot be
+/// reached without the family it can reach, so this is short. Nor is shorter any use: a resolver
+/// holds a failure for 1 second at least (RFC 9520 3.2), its example backing off from 5 seconds,
+/// and asking sooner would mostly get the same failure back. Asking again is in the background,
+/// [`ASK_BUDGET`] at most, nothing waiting on it, and only when a connect wants addresses, two
+/// queries per name per 10 seconds at most, so there is no backing off: a family never given (a
+/// network dropping AAAA queries) costs no more than that
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(10);
+
 /// 上游主机名的解析：经 `bootstrap` 的服务器，或者系统的解析器 / Resolving upstream host names: through the
 /// `bootstrap` servers, or by the system resolver
 pub struct Bootstrap {
@@ -59,12 +75,63 @@ struct Host {
     asking: Option<Asking>,
 }
 
-/// 一个名字问到的地址，TTL 到 `until` 为止 / The addresses a name was given, their TTL lasting until `until`
+/// 一个名字问到的地址，到 `until` 再问 / The addresses a name was given, asked again at `until`
 struct Known {
     /// IPv4 在前 / IPv4 first
     addresses: Arc<[IpAddr]>,
     until: Instant,
 }
+
+impl Known {
+    /// 这次问到的两族（`asked`，A 在前）。没问到的那一族沿用 `last` 里这一族的地址，[`ASK_AGAIN_AFTER`] 之后再问；
+    /// 问到了的那一族（没有这一族的记录也算问到）用这次的地址，按它们里最短的 TTL。头一回问和后台再问都是这一条：头一回
+    /// 没有 `last`，没问到的那一族就先没有地址。一个地址也没有时是 Err
+    /// What this asking gave of the two families (`asked`, A first). A family not given keeps the
+    /// addresses `last` has of it, asked again after [`ASK_AGAIN_AFTER`]; a family given (no
+    /// record of it counting as given) takes this asking's addresses, by the shortest TTL among
+    /// them. Asking the first time and asking again in the background are the one rule: the first
+    /// time has no `last`, a family not given then having no addresses for now. Err with no
+    /// address at all
+    fn new(asked: [Family; 2], last: Option<&Known>) -> anyhow::Result<Self> {
+        let (mut addresses, mut ttl, mut failures) = (Vec::new(), Duration::MAX, Vec::new());
+        for (family, ipv6) in asked.into_iter().zip([false, true]) {
+            match family {
+                Ok(given) => {
+                    for (address, record) in given {
+                        addresses.push(address);
+                        ttl = ttl.min(Duration::from_secs(u64::from(record)));
+                    }
+                }
+                Err(error) => {
+                    let last = last.map_or(&[][..], |last| &last.addresses[..]);
+                    addresses.extend(last.iter().filter(|address| address.is_ipv6() == ipv6));
+                    ttl = ttl.min(ASK_AGAIN_AFTER);
+                    failures.push(format!("{error:#}"));
+                }
+            }
+        }
+        if addresses.is_empty() {
+            let why = match failures.is_empty() {
+                true => "no A or AAAA record".to_owned(),
+                false => failures.join("; "),
+            };
+            anyhow::bail!(why);
+        }
+        // 有地址时 ttl 已不是 Duration::MAX：地址要么来自一条记录，要么来自没问到的一族 / With addresses ttl is no
+        // longer Duration::MAX: each comes from a record or from a family not given
+        Ok(Self {
+            addresses: addresses.into(),
+            until: Instant::now() + ttl,
+        })
+    }
+}
+
+/// 一族地址这次问到的样子：地址和各自的 TTL（空的是没有这一族的记录）；Err 是没问到：每个服务器都出了错、答了失败应答
+/// （见 `upstream::is_failure_reply`）或者到时没答上
+/// What one family of addresses came to this time: the addresses with their TTLs (none being no
+/// record of the family); Err when not given: every server failing, answering with a failure
+/// reply (see `upstream::is_failure_reply`) or not answering in time
+type Family = anyhow::Result<Vec<(IpAddr, u32)>>;
 
 /// 问一次的结果，等着它的各拿一份 / One asking's outcome, a copy for each that waits on it
 type Asking = Shared<BoxFuture<'static, Result<Arc<[IpAddr]>, Arc<str>>>>;
@@ -151,20 +218,17 @@ impl Through {
     fn ask(self: &Arc<Self>, host: &str) -> Asking {
         let (through, host) = (Arc::clone(self), Box::<str>::from(host));
         let asking: Asking = async move {
-            let asked = through.ask_servers(&host).await.map_err(|error| {
-                Arc::<str>::from(format!("bootstrap gave no address for {host}: {error:#}"))
-            });
-            if let Err(error) = &asked {
-                debug!(%error, "bootstrap asking failed");
-            }
+            let asked = through.ask_servers(&host).await;
             let mut hosts = through.hosts.lock();
-            let entry = hosts.entry(host).or_default();
+            let entry = hosts.entry(host.clone()).or_default();
             entry.asking = None;
-            let (addresses, ttl) = asked?;
-            entry.known = Some(Known {
-                addresses: Arc::clone(&addresses),
-                until: Instant::now() + ttl,
-            });
+            let known = asked
+                .and_then(|asked| Known::new(asked, entry.known.as_ref()))
+                .map_err(|error| {
+                    Arc::<str>::from(format!("bootstrap gave no address for {host}: {error:#}"))
+                })?;
+            let addresses = Arc::clone(&known.addresses);
+            entry.known = Some(known);
             Ok(addresses)
         }
         .boxed()
@@ -173,71 +237,61 @@ impl Through {
         asking
     }
 
-    /// 同时问每个服务器，取先答出地址的那个：地址（IPv4 在前）和它们里最短的 TTL / Asks every server at
-    /// once and takes the first to answer with addresses: those (IPv4 first) and the shortest
-    /// TTL among them
-    async fn ask_servers(&self, host: &str) -> anyhow::Result<(Arc<[IpAddr]>, Duration)> {
+    /// 问 `host` 的两族地址（A 在前）：两族同时问、都等到答上，晚答上的照样记下；每族同时问每个服务器，取先答上的那个，
+    /// 各自最多等 [`ASK_BUDGET`]。一族没问到不连累另一族（见 [`Family`]），记一条 debug
+    /// Asks for the two families of addresses of `host` (A first): both are asked at once and each
+    /// is waited for until answered, one answered late kept all the same; each family is asked of
+    /// every server at once, the first to answer taken, [`ASK_BUDGET`] at most each. A family not
+    /// given never costs the other (see [`Family`]), and is logged at debug
+    async fn ask_servers(&self, host: &str) -> anyhow::Result<[Family; 2]> {
         let name = Name::from_ascii(host).context("invalid host name")?;
-        let query = |record_type| {
-            let mut query = Message::new(0, MessageType::Query, OpCode::Query);
-            query.metadata.recursion_desired = true;
-            query.add_query(Query::query(name.clone(), record_type));
-            query.to_vec()
+        let family = |record_type| {
+            let name = name.clone();
+            async move {
+                let mut query = Message::new(0, MessageType::Query, OpCode::Query);
+                query.metadata.recursion_desired = true;
+                query.add_query(Query::query(name, record_type));
+                let query = &query.to_vec()?;
+                let asked = self.servers.iter().map(|server| {
+                    Box::pin(async move {
+                        timeout(ASK_BUDGET, self.records(server, query))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!("{server} gave no answer in time"))
+                            })
+                    })
+                });
+                let given = futures::future::select_ok(asked)
+                    .await
+                    .map(|(given, _)| given)
+                    .with_context(|| record_type.to_string());
+                if let Err(error) = &given {
+                    debug!(host, error = %format_args!("{error:#}"), "bootstrap asking failed");
+                }
+                given
+            }
         };
-        let queries = [query(RecordType::A)?, query(RecordType::AAAA)?];
-        let asked = self
-            .servers
-            .iter()
-            .map(|server| Box::pin(self.ask_server(server, &queries)));
-        let (mut given, _) = futures::future::select_ok(asked).await?;
-        given.sort_by_key(|(address, _)| address.is_ipv6());
-        let ttl = given
-            .iter()
-            .fold(u32::MAX, |ttl, &(_, record)| ttl.min(record));
-        Ok((
-            given.into_iter().map(|(address, _)| address).collect(),
-            Duration::from_secs(u64::from(ttl)),
-        ))
+        let (a, aaaa) =
+            futures::future::join(family(RecordType::A), family(RecordType::AAAA)).await;
+        Ok([a, aaaa])
     }
 
-    /// 向 `server` 问 A 和 AAAA 记录（`queries` 是这两个查询），给出地址和各自的 TTL。两种同时问、都等到答上，各自最多
-    /// 等 [`ASK_BUDGET`]：晚答上的那种照样记下，到时还没答上、出了错的那种不要了，不为它丢掉答了的那种
-    /// Asks `server` for the A and AAAA records (`queries` being those two queries), giving the
-    /// addresses with their TTLs. Both are asked at once and each is waited for until answered,
-    /// [`ASK_BUDGET`] at most: one answered late is kept all the same, and one still unanswered
-    /// by then or failed is left out, never costing the one answered
-    async fn ask_server(
-        &self,
-        server: &str,
-        [a, aaaa]: &[Vec<u8>; 2],
-    ) -> anyhow::Result<Vec<(IpAddr, u32)>> {
-        let records = |query| async move {
-            timeout(ASK_BUDGET, self.records(server, query))
-                .await
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("{server} gave no answer in time")))
-        };
-        let given: Vec<_> = match futures::future::join(records(a), records(aaaa)).await {
-            (Err(error), Err(_)) => return Err(error),
-            (a, aaaa) => a.into_iter().chain(aaaa).flatten().collect(),
-        };
-        anyhow::ensure!(!given.is_empty(), "{server} answered no A or AAAA record");
-        Ok(given)
-    }
-
-    /// `server` 对 `query` 答的地址和各自的 TTL。一份查询过了这次问的时限（[`ASK_BUDGET`]）的三分之一还没有回答就再发
-    /// 一份，和还没答过的上游一样（见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见
-    /// [`UdpExchange`]）：丢了一个包的查询不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了再发的时候照样再发，
-    /// 直到时限。UDP 转发（见 `upstream::forward_udp_smart`）不一样：它一共只发两份，第一份发不出去就马上发第二份；这里
-    /// 一直按间隔再发，发不出去时马上再发只会空转
-    /// The addresses `server` answers `query` with, and their TTLs. A copy left unanswered for a
-    /// third of the asking's time limit ([`ASK_BUDGET`]) has another sent, as for an upstream yet to
-    /// answer (see `upstream::hedge_timeout`); the earlier ones are still waited for, the first
-    /// reply to come being used (see [`UdpExchange`]): a query with a packet lost does not wait
-    /// out the whole limit. Nor does a copy that cannot be sent fail the asking: it is logged, and
-    /// another goes when the time to send again comes, up to the time limit. UDP forwarding (see
-    /// `upstream::forward_udp_smart`) differs: it sends two copies in all, the second at once when
-    /// the first cannot be sent; here copies keep going at the interval, and sending again at once
-    /// while sending fails would only spin
+    /// `server` 对 `query` 答的地址和各自的 TTL；答了失败应答（见 `upstream::is_failure_reply`）是 Err，和答了没有这种
+    /// 记录（空的）分开。一份查询过了这次问的时限（[`ASK_BUDGET`]）的三分之一还没有回答就再发一份，和还没答过的上游一样
+    /// （见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见 [`UdpExchange`]）：丢了一个包的查询
+    /// 不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了再发的时候照样再发，直到时限。UDP 转发（见
+    /// `upstream::forward_udp_smart`）不一样：它一共只发两份，第一份发不出去就马上发第二份；这里一直按间隔再发，发不出去
+    /// 时马上再发只会空转
+    /// The addresses `server` answers `query` with, and their TTLs; Err for a failure reply (see
+    /// `upstream::is_failure_reply`), told apart from an answer with no such record (none). A copy
+    /// left unanswered for a third of the asking's time limit ([`ASK_BUDGET`]) has another sent,
+    /// as for an upstream yet to answer (see `upstream::hedge_timeout`); the earlier ones are
+    /// still waited for, the first reply to come being used (see [`UdpExchange`]): a query with a
+    /// packet lost does not wait out the whole limit. Nor does a copy that cannot be sent fail the
+    /// asking: it is logged, and another goes when the time to send again comes, up to the time
+    /// limit. UDP forwarding (see `upstream::forward_udp_smart`) differs: it sends two copies in
+    /// all, the second at once when the first cannot be sent; here copies keep going at the
+    /// interval, and sending again at once while sending fails would only spin
     async fn records(&self, server: &str, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
         let resend_after = super::upstream::hedge_timeout(ASK_BUDGET);
         let mut exchange = UdpExchange::new(&self.udp, query, server);
@@ -253,7 +307,14 @@ impl Through {
                 Err(_) => {}
             }
         };
-        Ok(Message::from_vec(&reply)?
+        let reply = Message::from_vec(&reply)?;
+        let rcode = reply.metadata.response_code;
+        anyhow::ensure!(
+            !super::upstream::is_failure_reply(rcode),
+            "{server} answered {}",
+            crate::observe::rcode_name(rcode.into())
+        );
+        Ok(reply
             .answers
             .into_iter()
             .filter_map(|record| {
@@ -286,12 +347,39 @@ impl reqwest::dns::Resolve for Resolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_support::{loopback_addresses, loopback_bootstrap, upstream};
+    use crate::engine::test_support::{Replies, loopback_addresses, loopback_bootstrap, upstream};
+    use hickory_proto::op::ResponseCode;
 
     /// 经本机 bootstrap 服务器 `server` 解析的 Bootstrap / A Bootstrap resolving through the
     /// local bootstrap server `server`
     fn through(server: &str) -> Arc<Bootstrap> {
         Bootstrap::new(server, Arc::new(UdpClient::new(1).expect("UDP client")))
+    }
+
+    /// `host` 正在问的那一次 / The asking of `host` under way
+    fn asking(bootstrap: &Bootstrap, host: &str) -> Option<Asking> {
+        let through = bootstrap
+            .through
+            .as_ref()
+            .expect("through bootstrap servers");
+        through.hosts.lock().get(host)?.asking.clone()
+    }
+
+    /// 对 `query` 答 `rcode`、不带记录；NOERROR 就是有这个名字、没有这种记录
+    /// Answers `query` with `rcode` and no records; with NOERROR the name is there, with no
+    /// record of this type
+    fn no_records(query: &Message, rcode: ResponseCode) -> Replies {
+        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        reply.metadata.response_code = rcode;
+        reply.add_query(query.queries[0].clone());
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    }
+
+    /// 时间往前拨 `by` / Moves the clock on by `by`
+    async fn later_by(by: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(by).await;
+        tokio::time::resume();
     }
 
     /// 问到的地址 IPv4 在前，TTL 没过就不再问。写成 IP 的不用问
@@ -381,11 +469,7 @@ mod tests {
         let counted = Arc::clone(&asked_a);
         let server = upstream(move |query| {
             if query.queries[0].query_type() != RecordType::A {
-                // 有这个名字，没有这种记录 / The name is there, with no record of this type
-                let mut reply =
-                    Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-                reply.add_query(query.queries[0].clone());
-                return vec![(Duration::ZERO, reply.to_vec().unwrap())];
+                return no_records(query, ResponseCode::NoError);
             }
             if counted.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Vec::new();
@@ -486,5 +570,88 @@ mod tests {
             "both families kept"
         );
         assert_eq!(server.queries(), 2, "A and AAAA asked once");
+    }
+
+    /// 头一回问，A 答了 SERVFAIL、AAAA 答上：先只用 AAAA 的地址，[`ASK_AGAIN_AFTER`] 之后就再问，问到 A 的地址。只有
+    /// IPv6 的名字（A 答了没有记录）两族都算问到，TTL 内不再问
+    /// Asked the first time, A answering SERVFAIL and AAAA answered: AAAA's address is used alone
+    /// for now, asked again after [`ASK_AGAIN_AFTER`], which gives A's address. A name with IPv6
+    /// only (A answered with no record) has both families given, and is not asked again while its
+    /// TTL lasts
+    #[tokio::test]
+    async fn a_family_not_given_is_asked_again_soon() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let failing = Arc::new(AtomicBool::new(true));
+        let server = upstream({
+            let failing = Arc::clone(&failing);
+            move |query| match query.queries[0].query_type() {
+                RecordType::A if query.queries[0].name().to_ascii().starts_with("ipv6only.") => {
+                    no_records(query, ResponseCode::NoError)
+                }
+                RecordType::A if failing.load(Ordering::SeqCst) => {
+                    no_records(query, ResponseCode::ServFail)
+                }
+                _ => loopback_addresses(query, 300),
+            }
+        })
+        .await;
+        let bootstrap = through(&server.address);
+        let ipv6 = vec!["[::1]:853".parse::<SocketAddr>().unwrap()];
+        for host in ["upstream.test", "ipv6only.test"] {
+            assert_eq!(
+                bootstrap.addresses(host, 853).await.unwrap(),
+                ipv6,
+                "{host}"
+            );
+        }
+        failing.store(false, Ordering::SeqCst);
+        later_by(ASK_AGAIN_AFTER).await;
+        for host in ["upstream.test", "ipv6only.test"] {
+            let now = bootstrap.addresses(host, 853).now_or_never();
+            assert_eq!(now.expect("at once").unwrap(), ipv6, "{host}");
+        }
+        assert!(
+            asking(&bootstrap, "ipv6only.test").is_none(),
+            "within its TTL"
+        );
+        let asked = asking(&bootstrap, "upstream.test").expect("asked again");
+        assert_eq!(
+            asked.await.unwrap()[..],
+            [
+                IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+                IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+            ]
+        );
+        assert_eq!(server.queries(), 6, "only upstream.test asked again");
+    }
+
+    /// 后台再问时 A 答了 SERVFAIL：A 上回问到的 127.0.0.1 留着，不换成只有 AAAA 的那半张
+    /// A answering SERVFAIL when asked again in the background: the 127.0.0.1 A gave last time
+    /// stays, not traded for the half that is AAAA's alone
+    #[tokio::test]
+    async fn a_family_not_given_again_keeps_its_last_addresses() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let failing = Arc::new(AtomicBool::new(false));
+        let server = upstream({
+            let failing = Arc::clone(&failing);
+            move |query| match query.queries[0].query_type() {
+                RecordType::A if failing.load(Ordering::SeqCst) => {
+                    no_records(query, ResponseCode::ServFail)
+                }
+                // TTL 为 0：每次要都在后台再问 / TTL 0: asked again in the background each time wanted
+                _ => loopback_addresses(query, 0),
+            }
+        })
+        .await;
+        let bootstrap = through(&server.address);
+        let given = bootstrap.addresses("upstream.test", 853).await.unwrap();
+        assert_eq!(given.len(), 2, "both families given");
+        failing.store(true, Ordering::SeqCst);
+        let now = bootstrap.addresses("upstream.test", 853).now_or_never();
+        assert_eq!(now.expect("at once").unwrap(), given);
+        let asked = asking(&bootstrap, "upstream.test").expect("asked again");
+        asked.await.unwrap();
+        let now = bootstrap.addresses("upstream.test", 853).now_or_never();
+        assert_eq!(now.expect("at once").unwrap(), given, "127.0.0.1 kept");
     }
 }
