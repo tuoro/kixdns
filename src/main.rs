@@ -468,7 +468,7 @@ async fn run_dns_server(
     let panel_observer = None;
     let mut engine = Engine::builder(cfg)
         .listener_label(listener_label.clone())
-        .config_source(&config, config_source);
+        .config_source(&config, &config_source);
     if let Some(observer) = engine_observer(panel_observer, debug) {
         engine = engine.observer(observer);
     }
@@ -494,7 +494,7 @@ async fn run_dns_server(
     #[cfg(not(unix))]
     let on_watch = |_: Option<&notify::Error>| {};
     let _config_watch = watch
-        .and_then(|watch| watch.start_reporting(engine.clone(), on_watch))
+        .and_then(|watch| watch.start_reporting(engine.clone(), config_source, on_watch))
         .inspect_err(|err| {
             error!(path = %config.display(), error = %err, "cannot watch the config file, changes to it are not reloaded");
             #[cfg(unix)]

@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::config;
 use crate::engine::Engine;
+use crate::matcher::geoip::FileStamp;
 
 /// 文件写完以后（写的一方关上了它，或者改名到了位）再等这么久，把同一次保存的其它事件收齐：改名盖过目标文件时
 /// notify 报一个「改名到这里」，再报一个同时列出两端的「改名」；证书和私钥前后脚换。
@@ -35,41 +36,77 @@ const AT_MOST: Duration = Duration::from_secs(2);
 /// [`ConfigWatch::start`]. The watch used to go in only once the configuration was read and the
 /// engine built, and a change in between was lost, the kernel keeping the old configuration
 /// until the next change
-pub struct ConfigWatch(PendingWatch);
+pub struct ConfigWatch {
+    watch: PendingWatch,
+    /// 读之前配置文件什么样（见 [`ConfigWatch::start_reporting`]）/ What the configuration file
+    /// looked like before it was read (see [`ConfigWatch::start_reporting`])
+    before_read: Option<FileStamp>,
+}
 
 impl ConfigWatch {
     /// 开始监视配置文件 `path`，在读它之前调用 / Starts watching the configuration file `path`;
     /// call it before reading the file
     pub fn new(path: &Path) -> notify::Result<Self> {
-        PendingWatch::new(&[path.to_path_buf()]).map(Self)
+        let watch = PendingWatch::new(&[path.to_path_buf()])?;
+        let before_read = FileStamp::of(path).ok();
+        Ok(Self { watch, before_read })
     }
 
-    /// 配置文件每改一次（开始之前排着的也算）就照着它重载 `engine`，直到返回的 [`FileWatch`] 被丢掉
+    /// 配置文件每改一次（开始之前排着的也算）就照着它重载 `engine`，直到返回的 [`FileWatch`] 被丢掉。`read` 是启动时
+    /// 读到的配置文本（见 [`ConfigWatch::start_reporting`]）
     /// Reloads `engine` from the configuration file on every change to it (those queued before
-    /// the start included), until the returned [`FileWatch`] is dropped
-    pub fn start(self, engine: Engine) -> notify::Result<FileWatch> {
-        self.start_reporting(engine, |_| {})
+    /// the start included), until the returned [`FileWatch`] is dropped. `read` is the
+    /// configuration text startup read (see [`ConfigWatch::start_reporting`])
+    pub fn start(self, engine: Engine, read: String) -> notify::Result<FileWatch> {
+        self.start_reporting(engine, read, |_| {})
     }
 
     /// 同 [`ConfigWatch::start`]，监视得怎样交给 `on_watch`：为什么有位置监视不上，都监视上了是 None。开始时报一次装的
     /// 时候的（见 [`PendingWatch::uncovered`]），之后每次重载之前文件重新解析、监视跟着换，再报一次（见
     /// [`PendingWatch::start_reporting`]）
+    ///
+    /// 头一次重载之前，文件还是启动时读它之前的样子（见 [`FileStamp`]）、内容也和启动时读到的 `read` 一字不差时不重载：
+    /// 内核用的就是它。macOS 的 FSEvents 会把装监视之前不久的写入报给刚装上的监视，同一份配置就会在启动以后又重载一次，
+    /// 配置里有问题时还多记一条重载失败。一字不差地再存一次照样重载（让重载重读 MMDB、监视不了的 Geo 文件），存过以后
+    /// 修改时间就变了；修改时间只精确到秒的文件系统上，同一秒里改成一样长的别的内容，靠内容看得出来
     /// As [`ConfigWatch::start`], with how the file is watched going to `on_watch`: why some of
     /// its places cannot be watched, None when every one is. It is reported once at the start, as
     /// installed (see [`PendingWatch::uncovered`]), and again before each reload, as the file is
     /// resolved again with the watches following (see [`PendingWatch::start_reporting`])
+    ///
+    /// Until the first reload, the file still looking as it did before startup read it (see
+    /// [`FileStamp`]) and holding word for word the `read` startup got is not reloaded: it is
+    /// what the kernel runs. macOS's FSEvents reports a write made shortly before the watch was
+    /// installed to the watch just installed, and the same configuration would be reloaded once
+    /// more after startup, a failed reload logged besides for a configuration with a problem.
+    /// Saved again word for word it is reloaded all the same (making the reload read the MMDB or
+    /// Geo files that cannot be watched again), the save changing its modification time; on a
+    /// file system keeping that time to the second, other content of the same length written
+    /// within that second is told by the content
     pub fn start_reporting(
         self,
         engine: Engine,
+        read: String,
         mut on_watch: impl FnMut(Option<&notify::Error>) + Send + 'static,
     ) -> notify::Result<FileWatch> {
-        on_watch(self.0.uncovered().next().map(|(_, err)| err));
-        self.0
+        let Self { watch, before_read } = self;
+        let mut as_read = before_read.map(|stamp| (stamp, read));
+        on_watch(watch.uncovered().next().map(|(_, err)| err));
+        watch
             .start_reporting("config-watcher", move |path| {
+                let loaded = config::load_config_with_source(path);
+                if as_read.as_ref().is_some_and(|(stamp, read)| {
+                    FileStamp::of(path).is_ok_and(|now| now == *stamp)
+                        && loaded.as_ref().is_ok_and(|(_, raw)| raw == read)
+                }) {
+                    debug!(path = %path.display(), "config file as read at startup, not reloaded");
+                    return;
+                }
+                as_read = None;
                 // 启动时只记错误、照样加载的那些写法，重载时拒绝（见 config::compile）
                 // What startup only logs as errors and loads all the same, a reload refuses (see
                 // config::compile)
-                let loaded = config::load_config_with_source(path).and_then(|(cfg, raw)| {
+                let loaded = loaded.and_then(|(cfg, raw)| {
                     let version = cfg.version.clone();
                     config::compile(cfg).map(|cfg| (cfg, raw, version))
                 });
@@ -1155,9 +1192,10 @@ mod tests {
 
         for (path, uncovered) in [(linked, true), (plain, false)] {
             let (tx, rx) = mpsc::channel();
+            let read = std::fs::read_to_string(&path).unwrap_or_default();
             let _watch = ConfigWatch::new(&path)
                 .expect("watch")
-                .start_reporting(engine.clone(), move |watched| {
+                .start_reporting(engine.clone(), read, move |watched| {
                     let _ = tx.send(watched.map(ToString::to_string));
                 })
                 .expect("start");
