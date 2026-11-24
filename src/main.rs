@@ -242,6 +242,7 @@ use kixdns::engine::Engine;
 use kixdns::listeners::BoundListeners;
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{EngineObserver, TracingObserver};
+#[cfg(unix)]
 use kixdns::panel::PanelMetrics;
 use kixdns::watcher;
 
@@ -258,6 +259,7 @@ enum Commands {
     Run(RunArgs),
     /// 面板诊断的草稿试跑（面板内部使用）：从标准输入读请求、往标准输出写结果，不绑定任何端口
     /// Panel diagnostics' draft trial (internal): request on stdin, result on stdout, no port bound
+    #[cfg(unix)]
     #[command(hide = true)]
     PanelTrial,
     /// Convert GeoIP .dat to MMDB format / 转换 GeoIP .dat 为 MMDB 格式
@@ -347,6 +349,7 @@ fn real_main() -> anyhow::Result<()> {
 
 async fn async_main() -> anyhow::Result<()> {
     match Args::parse().command() {
+        #[cfg(unix)]
         Commands::PanelTrial => kixdns::panel::trial_from_stdio().await,
         Commands::ConvertGeoIp {
             input,
@@ -433,25 +436,38 @@ async fn run_dns_server(
     // Queries arriving while the engine is built wait in the sockets and are answered once it is ready
     let bound = BoundListeners::bind(listeners, udp_workers_final)?;
 
-    // 面板的统计只能经控制通道读，所以只在开了控制通道时装面板观察者 / The panel's statistics can
-    // only be read over the control socket, so the panel observer is installed only with one
+    // 面板的统计只能经控制通道读，所以只在开了控制通道时装面板观察者；控制通道只有 Unix 上有（见 lib.rs）/ The
+    // panel's statistics can only be read over the control socket, so the panel observer is
+    // installed only with one; only Unix has the control socket (see lib.rs)
+    #[cfg(unix)]
     let panel_metrics = admin_socket
         .as_ref()
-        .filter(|_| cfg!(unix))
         .map(|_| Arc::new(PanelMetrics::new(debug)));
     // 面板经控制通道读上面那些问题（`config` 的 `problems`）和入站 DoH 为什么没起来（`doh_error`）/ The
     // panel reads the problems above over the control channel (`config`'s `problems`), and why the
     // inbound DoH did not start (`doh_error`)
+    #[cfg(unix)]
     if let Some(metrics) = &panel_metrics {
         metrics.startup_problems(problems);
         if let Some(error) = bound.doh_error() {
             metrics.doh_not_started(error.to_owned());
         }
     }
+    #[cfg(unix)]
+    let panel_observer = panel_metrics
+        .clone()
+        .map(|metrics| metrics as Arc<dyn EngineObserver>);
+    #[cfg(not(unix))]
+    let panel_observer = {
+        if admin_socket.is_some() {
+            tracing::warn!("admin-socket is not supported on this platform");
+        }
+        None
+    };
     let mut engine = Engine::builder(cfg)
         .listener_label(listener_label.clone())
         .config_source(&config, config_source);
-    if let Some(observer) = engine_observer(panel_metrics.as_ref(), debug) {
+    if let Some(observer) = engine_observer(panel_observer, debug) {
         engine = engine.observer(observer);
     }
     let engine = engine.build().context("initialize DNS engine")?;
@@ -465,6 +481,7 @@ async fn run_dns_server(
         .and_then(|watch| watch.start(engine.clone()))
         .inspect_err(|err| {
             error!(path = %config.display(), error = %err, "cannot watch the config file, changes to it are not reloaded");
+            #[cfg(unix)]
             if let Some(metrics) = &panel_metrics {
                 metrics.config_not_watched(err.to_string());
             }
@@ -483,11 +500,6 @@ async fn run_dns_server(
                 error!(error = %format!("{err:#}"), "panel control socket exited");
             }
         }));
-    }
-
-    #[cfg(not(unix))]
-    if admin_socket.is_some() {
-        tracing::warn!("admin-socket is not supported on this platform");
     }
 
     // 流控按设备分时要认出和内核在同一个网段上的 IPv6 主机（见 `fair_queue::note_local_networks`）：隔一阵看一次本机网卡的
@@ -525,14 +537,10 @@ const LOCAL_NETWORKS_LOOKED_AT: Duration = Duration::from_secs(30);
 /// events itself; without the panel, as upstream, the reference observer only with `--debug`
 /// and otherwise none, so requests pay nothing for observation
 fn engine_observer(
-    panel_metrics: Option<&Arc<PanelMetrics>>,
+    panel: Option<Arc<dyn EngineObserver>>,
     debug: bool,
 ) -> Option<Arc<dyn EngineObserver>> {
-    match panel_metrics {
-        Some(panel_metrics) => Some(panel_metrics.clone()),
-        None if debug => Some(Arc::new(TracingObserver)),
-        None => None,
-    }
+    panel.or_else(|| debug.then(|| Arc::new(TracingObserver) as Arc<dyn EngineObserver>))
 }
 
 fn init_tracing(debug: bool) {
@@ -911,13 +919,14 @@ mod tests {
     /// 没有面板时和上游一样：不带 `--debug` 不装观察者，带了装参考观察者；有面板时装的就是面板观察者
     /// Without the panel, as upstream: no observer without `--debug` and the reference observer
     /// with it; with the panel, the panel observer itself
+    #[cfg(unix)]
     #[test]
     fn only_the_panel_brings_the_panel_observer() {
         assert!(super::engine_observer(None, false).is_none());
         assert!(super::engine_observer(None, true).is_some());
         let panel = Arc::new(super::PanelMetrics::new(false));
         for debug in [false, true] {
-            let observer = super::engine_observer(Some(&panel), debug).unwrap();
+            let observer = super::engine_observer(Some(panel.clone()), debug).unwrap();
             assert!(std::ptr::addr_eq(
                 Arc::as_ptr(&observer),
                 Arc::as_ptr(&panel)

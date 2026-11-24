@@ -46,7 +46,6 @@ use crate::panel::{outcome_label, phase_label, skip_reason_label, transport_labe
 /// many it missed
 pub(crate) const CAPACITY: usize = 131_072;
 /// 一次最多取走多少条 / At most this many records per collection
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const MAX_PAGE: usize = 2_000;
 /// 同时在跟的请求上限：超过的不记，只计个数（`untracked`），面板据此说漏记了几条。每秒几万个查询、上游
 /// 慢到一百多毫秒时，同时在途的就上了四千
@@ -81,7 +80,6 @@ const MAX_TEXT: usize = 256;
 /// 面板多久没来取就停记 / How long without a collection before recording stops
 const IDLE_AFTER: Duration = Duration::from_secs(120);
 /// 面板等着取时最多等多久 / The longest a panel waiting to collect is kept waiting
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const MAX_WAIT: Duration = Duration::from_secs(5);
 
 /// 这么多条命中的规则放得进一条记录：一步 Pipeline、一步缓存、每条规则一步、可能还有一步决定，都不超过步数上限
@@ -1797,7 +1795,6 @@ impl QueryLog {
     /// `wait` has passed: a panel waiting like this takes records as soon as traffic brings them, before the
     /// ring can fill, and comes only once per `wait` while things are quiet. A cursor of another kernel
     /// process gets no wait but an answer at once, so the panel soon finds out the kernel has changed
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) async fn wait_for_page(
         &self,
         after: u64,
@@ -1849,7 +1846,6 @@ impl QueryLog {
     /// `after` still deletes only up to `after`, never what was not taken yet. A cursor of no stated
     /// process (the panel probing which process this is, or one that does not know `querylog_wait_v1`) or
     /// of another one deletes nothing
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn take(
         &self,
         after: u64,

@@ -16,7 +16,6 @@ tokio-util = { version = "0.7", features = ["rt", "io"] }
 hickory-proto = "0.26"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sha2 = "0.10"
 arc-swap = "1.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter", "local-time"] }
@@ -56,10 +55,13 @@ http-body-util = "0.1"
 base64 = "0.22"
 prost = { version = "0.14.4", features = ["derive"] }
 
-# 面板诊断用子进程试跑草稿配置：只在 unix 下给 tokio 补 process / io-util，特性与上面那一行合并
-# The panel's draft trial runs in a child process: on unix only, tokio gains process / io-util, merged with the line above
+# 面板只在 unix 上编进去（见 src/lib.rs）：诊断用子进程试跑草稿配置，给 tokio 补 process / io-util，特性与上面那一行
+# 合并；配置的摘要用 sha2
+# The panel is built on unix alone (see src/lib.rs): its draft trial runs in a child process, so
+# tokio gains process / io-util, merged with the line above; sha2 digests the configuration
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["process", "io-util"] }
+sha2 = "0.10"
 
 # 智能流控在 Windows 上读内存：系统的、本进程的、所在作业对象的限制
 # Smart flow control reads memory on Windows: the system's, this process's and its job object's limits
