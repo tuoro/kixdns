@@ -25,7 +25,7 @@ use webpki_roots::TLS_SERVER_ROOTS;
 /// RFC 8305 第 5 节的 Connection Attempt Delay：一个尝试这么久还没连上，就起下一个 / The Connection
 /// Attempt Delay of RFC 8305 section 5: an attempt not through after this long has the next one
 /// started
-const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+pub(super) const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// 用 `attempt` 连上 `addresses` 里的一个（RFC 8305 第 4、5 节）：地址按族交替排开，第一个地址那一族在前；起一个尝试，
 /// 它过了 [`ATTEMPT_DELAY`] 还没连上、或者失败了，就接着起下一个，先连上的那个用，别的放弃；都失败时按失败的先后列出每个

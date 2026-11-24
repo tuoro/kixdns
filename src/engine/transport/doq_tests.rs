@@ -8,7 +8,6 @@ use crate::engine::transport::stream::{DotMultiplexer, TcpMultiplexer};
 use crate::engine::transport::test_support::*;
 use crate::engine::transport::udp::UdpClient;
 use quinn::Endpoint as QuicEndpoint;
-use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -149,9 +148,8 @@ fn doq_response_short_message_does_not_panic() {
 /// session ticket, a resumed connection uses 0-RTT before the mark and not after it
 #[tokio::test]
 async fn doq_skips_0rtt_once_it_was_rejected() {
-    let (mut server, mut client_tls) = localhost_tls(&[b"doq"]);
+    let (mut server, client_tls) = localhost_tls(&[b"doq"]);
     server.max_early_data_size = u32::MAX;
-    client_tls.enable_early_data = true;
     let addr = spawn_doq_upstream(server, Duration::ZERO, |_, _| {
         DoqReply::Answer(Duration::ZERO)
     })
@@ -182,9 +180,8 @@ async fn doq_skips_0rtt_once_it_was_rejected() {
 /// that made the connection used to be sent again, and those riding it failed
 #[tokio::test]
 async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
-    let (mut accepting, mut client_tls) = localhost_tls(&[b"doq"]);
+    let (mut accepting, client_tls) = localhost_tls(&[b"doq"]);
     accepting.max_early_data_size = u32::MAX;
-    client_tls.enable_early_data = true;
     // 同一张证书的另一台上游：不认别人发的票据，早期数据也不收
     // Another upstream with the same certificate: it knows no ticket another gave, and
     // takes no early data
@@ -210,7 +207,7 @@ async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
     // 上一次完整握手连上的是第二台，它后来换了票据的密钥，不认先前的票据：0-RTT 发往它，被拒
     // The last full handshake reached the second, which has since changed its ticket keys and
     // knows no earlier ticket: 0-RTT goes to it and is rejected
-    *client.zero_rtt.reached.lock() = Some(second);
+    *client.zero_rtt.reached.lock() = Some((second, Duration::ZERO));
     let (made_it, rode_it) = tokio::join!(
         client.send(&a, Duration::from_secs(2)),
         client.send(&b, Duration::from_secs(2)),
@@ -385,9 +382,11 @@ fn doq_runtime_aging(
     keepalive_ms: u64,
     aging: Aging,
 ) -> Arc<DoqRuntime> {
-    let crypto = QuicClientConfig::try_from(client_tls).expect("quic client crypto");
-    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(doq_transport(keepalive_ms, 0).expect("transport")));
+    let config = doq_client_config(
+        client_tls,
+        doq_transport(keepalive_ms, 0).expect("transport"),
+    )
+    .expect("quic client config");
     let mut endpoint_v4 =
         QuicEndpoint::client("127.0.0.1:0".parse().unwrap()).expect("bind the DoQ client");
     endpoint_v4.set_default_client_config(config.clone());
@@ -835,19 +834,18 @@ async fn loopback_names() -> (crate::engine::test_support::Upstream, Arc<Bootstr
     (server, bootstrap)
 }
 
-/// 一个端口上只有 ::1 有 DoQ 上游，127.0.0.1 上同一个端口的 UDP 收下握手却从不读；`early_data` 时上游收早期数据、
-/// 客户端发早期数据。给出端口、客户端的 TLS 设置和那个不回应的 socket；IPv6 环回不可用时是 None
+/// 一个端口上只有 ::1 有 DoQ 上游，127.0.0.1 上同一个端口的 UDP 收下握手却从不读；`early_data` 时上游收早期数据。
+/// 给出端口、客户端的 TLS 设置和那个不回应的 socket；IPv6 环回不可用时是 None
 /// A port with a DoQ upstream on ::1 alone, UDP on the same port of 127.0.0.1 taking the
-/// handshakes and never reading them; with `early_data` the upstream takes early data and the
-/// client sends it. Gives the port, the client's TLS settings and the socket that never answers;
-/// None with IPv6 loopback unavailable
+/// handshakes and never reading them; with `early_data` the upstream takes early data. Gives
+/// the port, the client's TLS settings and the socket that never answers; None with IPv6
+/// loopback unavailable
 fn answering_on_ipv6_alone(early_data: bool) -> Option<(u16, ClientConfig, std::net::UdpSocket)> {
     let answer = |_: usize, _: &str| DoqReply::Answer(Duration::ZERO);
     for _ in 0..20 {
-        let (mut server, mut client_tls) = localhost_tls(&[b"doq"]);
+        let (mut server, client_tls) = localhost_tls(&[b"doq"]);
         if early_data {
             server.max_early_data_size = u32::MAX;
-            client_tls.enable_early_data = true;
         }
         let v6 = spawn_doq_upstream_on(
             "[::1]:0".parse().unwrap(),
@@ -931,9 +929,8 @@ async fn zero_rtt_goes_to_the_address_the_last_handshake_reached() {
 /// 0-RTT off until a restart too
 #[tokio::test]
 async fn a_0rtt_handshake_never_answered_leaves_0rtt_on() {
-    let (mut server, mut client_tls) = localhost_tls(&[b"doq"]);
+    let (mut server, client_tls) = localhost_tls(&[b"doq"]);
     server.max_early_data_size = u32::MAX;
-    client_tls.enable_early_data = true;
     let crypto =
         quinn::crypto::rustls::QuicServerConfig::try_from(server).expect("quic server crypto");
     let endpoint = QuicEndpoint::server(
@@ -994,6 +991,151 @@ async fn a_0rtt_handshake_never_answered_leaves_0rtt_on() {
     client.pooled.store(None);
     let resumed = client.get_or_connect(&target).await.expect("connect");
     assert!(resumed.used_0rtt, "0-RTT stays on");
+}
+
+/// 0-RTT 的连接上游回了握手，一个回答却慢：这个查询超时，0-RTT 照用，重连还用 0-RTT。以前这样的超时把这个上游的 0-RTT
+/// 关到重启，长期运行几乎必然碰上一次
+/// A connection whose 0-RTT handshake the upstream answered, and one slow answer on it: the query
+/// times out, 0-RTT stays on and a reconnect uses it again. Such a timeout used to switch 0-RTT
+/// off for the upstream until a restart, which a long run all but surely meets once
+#[tokio::test]
+async fn a_slow_answer_over_0rtt_leaves_0rtt_on() {
+    let (mut server, client_tls) = localhost_tls(&[b"doq"]);
+    server.max_early_data_size = u32::MAX;
+    let addr = spawn_doq_upstream(server, Duration::ZERO, |_, label| {
+        if label == "slow" {
+            DoqReply::Silence
+        } else {
+            DoqReply::Answer(Duration::ZERO)
+        }
+    })
+    .await;
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, true);
+    let target = parse_doq_target(&client.upstream).expect("doq target");
+    client
+        .send(&udp_test_query("first.example"), Duration::from_secs(2))
+        .await
+        .expect("a full handshake");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.pooled.store(None);
+    let query = udp_test_query("slow.example");
+    let (slow, answered) = tokio::join!(client.send(&query, Duration::from_millis(300)), async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client
+            .pooled
+            .load_full()
+            .is_some_and(|pooled| pooled.used_0rtt && pooled.conn.handshake_data().is_some())
+    });
+    let err = slow.expect_err("the upstream never answers `slow`");
+    assert!(format!("{err:#}").contains("doq timeout"), "{err:#}");
+    assert!(
+        answered,
+        "`slow` went out over 0-RTT, the handshake answered"
+    );
+    assert!(
+        !client.zero_rtt.rejected.load(Ordering::Relaxed),
+        "a slow answer says nothing about 0-RTT"
+    );
+    client.pooled.store(None);
+    let resumed = client.get_or_connect(&target).await.expect("connect");
+    assert!(resumed.used_0rtt, "a reconnect uses 0-RTT again");
+}
+
+/// 全局关了 0-RTT、这个上游写着 `0rtt=true`：重连用 0-RTT。以前 TLS 照全局设置不提出早期数据，按上游开的 0-RTT 从来
+/// 用不上
+/// 0-RTT off globally and `0rtt=true` written on this upstream: a reconnect uses 0-RTT. TLS used
+/// to follow the global setting and offer no early data, so 0-RTT switched on for an upstream was
+/// never used
+#[tokio::test]
+async fn an_upstream_uses_0rtt_with_it_off_globally() {
+    let (mut server, client_tls) = localhost_tls(&[b"doq"]);
+    server.max_early_data_size = u32::MAX;
+    let addr = spawn_doq_upstream(server, Duration::ZERO, |_, _| {
+        DoqReply::Answer(Duration::ZERO)
+    })
+    .await;
+    let client = doq_test_client(format!("{addr}?sni=localhost&0rtt=true"), client_tls, false);
+    client
+        .send(&udp_test_query("first.example"), Duration::from_secs(2))
+        .await
+        .expect("a full handshake");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.pooled.store(None);
+    client
+        .send(&udp_test_query("second.example"), Duration::from_secs(2))
+        .await
+        .expect("the reconnect is answered");
+    let pooled = client.pooled.load_full().expect("a pooled connection");
+    assert!(pooled.used_0rtt, "the reconnect used 0-RTT");
+}
+
+/// 上一次完整握手连上的 127.0.0.1 后来不回应了，::1 还通：重连照常把 0-RTT 发往 127.0.0.1，握手到期（[`answer_within`]）
+/// 没回就关掉这条连接、忘掉这个地址，查询换一条完整握手的连接重发，错开 [`ATTEMPT_DELAY`] 连上 ::1 答上，不等满自己的
+/// 期限。以前 0-RTT 的连接当场算连上，别的地址轮不到，查询等满时限才失败
+/// 127.0.0.1, which the last full handshake reached, has since gone quiet, while ::1 still answers:
+/// the reconnect sends 0-RTT to 127.0.0.1 as ever, and with its handshake unanswered by the
+/// deadline ([`answer_within`]) the connection is closed and the address forgotten, the query sent
+/// again on a connection shaking hands in full, which reaches ::1 an [`ATTEMPT_DELAY`] later and
+/// is answered, well short of the query's own limit. A 0-RTT connection used to count as made at
+/// once, no other address got a turn, and the query failed at its limit
+#[tokio::test]
+async fn a_0rtt_reconnect_to_an_address_gone_quiet_moves_on() {
+    let (_server, bootstrap) = loopback_names().await;
+    let Some((port, client_tls, _silent)) = answering_on_ipv6_alone(true) else {
+        eprintln!("skipped: IPv6 loopback unavailable on this host");
+        return;
+    };
+    let client = DoqMuxClient::new(
+        Arc::from(format!("upstream.test:{port}?sni=localhost")),
+        doq_test_runtime_through(client_tls, true, bootstrap),
+        Arc::default(),
+    );
+    client
+        .send(&udp_test_query("first.example"), Duration::from_secs(2))
+        .await
+        .expect("the full handshake reaches ::1");
+    // 等会话票据到 / The session ticket arrives
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let quiet = SocketAddr::from(([127, 0, 0, 1], port));
+    *client.zero_rtt.reached.lock() = Some((quiet, Duration::ZERO));
+    client.pooled.store(None);
+    let started = tokio::time::Instant::now();
+    client
+        .send(&udp_test_query("second.example"), Duration::from_secs(3))
+        .await
+        .expect("sent again and answered by ::1");
+    let elapsed = started.elapsed();
+    let expected = answer_within(Duration::ZERO) + ATTEMPT_DELAY;
+    assert!(
+        (expected..expected + Duration::from_millis(400)).contains(&elapsed),
+        "answered after {elapsed:?}"
+    );
+    let reached = client.zero_rtt.reached.lock().map(|(address, _)| address);
+    assert!(
+        reached.is_some_and(|address| address.is_ipv6()),
+        "{reached:?}"
+    );
+    assert!(
+        !client.zero_rtt.rejected.load(Ordering::Relaxed),
+        "0-RTT stays on"
+    );
+}
+
+/// 0-RTT 握手的期限至少两个 [`ATTEMPT_DELAY`]，往返时间长的链路上是三个往返：600 ms 往返的链路上，回得了握手的地址不会
+/// 被当成不通
+/// A 0-RTT handshake's deadline is two [`ATTEMPT_DELAY`]s at least, and three round trips on a
+/// slow path: with a 600 ms round trip, an address that answers the handshake is not taken for
+/// down
+#[test]
+fn a_0rtt_handshake_has_longer_to_answer_on_a_slow_path() {
+    assert_eq!(answer_within(Duration::ZERO), 2 * ATTEMPT_DELAY);
+    assert_eq!(
+        answer_within(Duration::from_millis(600)),
+        Duration::from_millis(1800)
+    );
 }
 
 /// 写成主机名的 TCP、DoT、DoQ 上游经 Bootstrap 解析：`upstream.test` 只有本机的 bootstrap 服务器认得，
