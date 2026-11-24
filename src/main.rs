@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -235,6 +235,7 @@ mod allocator_tuning {
     }
 }
 use tracing::{error, info};
+use tracing_subscriber::fmt::time::FormatTime as _;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use kixdns::config::load_config_with_source;
@@ -311,13 +312,15 @@ struct RunArgs {
 fn main() {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     allocator_tuning::apply();
-    // 先装 panic 钩子再做任何事：journald 只按每行开头的 `<N>` 定优先级，而默认 panic 输出和
-    // `Termination` 打印的 `Error: …` 都没有前缀，会被记成 info（6），面板只看 ≤3 的错误过滤器
-    // 恰好把“为什么没启动”这一行藏掉。
-    // Install the panic hook before anything else: journald assigns priority only from a
-    // leading `<N>` per line, and neither the default panic output nor the `Error: …` that
-    // `Termination` prints carries one, so both land at info (6) and the panel's ≤3 error
-    // filter hides exactly the line that explains why KixDNS did not start.
+    // 先装 panic 钩子再做任何事：默认 panic 输出和 `Termination` 打印的 `Error: …` 都有好几行，没有优先级也没有时间。
+    // journald 只按每行开头的 `<N>` 定优先级，不带的记成 info（6）；面板读 procd 写的日志文件时，级别取时间后面的第一个词，
+    // 认不出的也当 info。面板只看 error 的过滤器就恰好把“为什么没启动”藏掉（见 [`StderrLog`]）。
+    // Install the panic hook before anything else: the default panic output and the
+    // `Error: …` that `Termination` prints both run over several lines with neither priority
+    // nor time. journald assigns priority only from a leading `<N>` per line, a line without
+    // one landing at info (6); the panel reading the log file procd writes takes the first word
+    // after the time as the level, anything else as info too. Either way the panel's error
+    // filter hides exactly what explains why KixDNS did not start (see [`StderrLog`]).
     install_panic_hook();
     if let Err(err) = real_main() {
         let _ = write!(std::io::stderr(), "{}", fatal_report(&err));
@@ -703,47 +706,86 @@ impl<W: std::fmt::Write> std::fmt::Write for Record<W> {
     }
 }
 
-/// 不经日志订阅器、直接写到 stderr 的一条 journald 日志（致命错误、panic）：和事件一样每行带 `priority`（见
-/// [`LineBreak::Prefixed`]），以换行结尾
-/// A journald record written straight to stderr rather than through the subscriber (a fatal
-/// error, a panic): each line carries `priority` as an event's do (see
-/// [`LineBreak::Prefixed`]), and a line break ends it
-fn journal_record(priority: u8, text: &str) -> String {
-    let mut out = String::new();
-    // 写进 String 不会失败 / Writing to a String does not fail
-    let _ = Record::begin(&mut out, LineBreak::Prefixed(priority)).and_then(|mut record| {
-        std::fmt::Write::write_str(&mut record, text)?;
-        record.end()
-    });
-    out
+/// 致命错误和 panic 不经日志订阅器、直接写到 stderr；stderr 不是终端时它们写成的那种日志
+/// A fatal error and a panic are written straight to stderr rather than through the
+/// subscriber; when stderr is not a terminal, the kind of log record they make there
+#[derive(Clone, Copy)]
+enum StderrLog {
+    /// journald：每行带这条日志的优先级（见 [`LineBreak::Prefixed`]）
+    /// journald: every line carries the record's priority (see [`LineBreak::Prefixed`])
+    Journald,
+    /// 别的（OpenWrt 上 procd 写的日志文件）：和事件一样只占一行，UTC 时间、`ERROR`、消息（见 [`plain_log_format`]）
+    /// Anything else (the log file procd writes on `OpenWrt`): one line alone as an event
+    /// takes, the UTC time, `ERROR`, the message (see [`plain_log_format`])
+    Plain,
 }
 
-/// `{err:#}` 把整条 cause 链用 `: ` 接起来，journald 在一条 err 日志里看得到完整原因；原因跨几行的每行都是 err
-/// `{err:#}` joins the whole cause chain with `: `, so journald has the full reason in one err
-/// record; a reason running over several lines is err on every one
-fn fatal_record(err: &anyhow::Error) -> String {
-    journal_record(3, &format!("fatal: {err:#}"))
-}
+impl StderrLog {
+    /// stderr 接到哪：终端时是 None，照 Rust 原本的写法（`Error: {err:?}`、默认 panic 钩子带 backtrace 提示），不改排查习惯
+    /// Where stderr goes: None on a terminal, which keeps the way Rust writes them
+    /// (`Error: {err:?}`, the default panic hook with its backtrace hint), so troubleshooting
+    /// habits still work
+    fn of_stderr() -> Option<Self> {
+        if std::io::stderr().is_terminal() {
+            None
+        } else if stdout_is_journald() {
+            Some(Self::Journald)
+        } else {
+            Some(Self::Plain)
+        }
+    }
 
-/// 终端下保持 Rust `Termination` 原本的 `Error: {err:?}` 输出，不改变旧有排查习惯。两种都以换行结尾
-/// On a terminal keep the `Error: {err:?}` output Rust's `Termination` used to print, so
-/// existing troubleshooting habits still work. Either ends in a line break
-fn fatal_report(err: &anyhow::Error) -> String {
-    if stdout_is_journald() {
-        fatal_record(err)
-    } else {
-        format!("Error: {err:?}\n")
+    /// 以换行结尾的一条日志：journald 下优先级是 `priority`；写进文件时级别是 ERROR，事件里最高的一级
+    /// A record ended by a line break: under journald at `priority`; in a file at ERROR, the
+    /// highest level an event has
+    fn record(self, priority: u8, text: &str) -> String {
+        let mut out = String::new();
+        // 写进 String 不会失败 / Writing to a String does not fail
+        let _ = match self {
+            Self::Journald => Record::begin(&mut out, LineBreak::Prefixed(priority)),
+            Self::Plain => Record::begin(&mut out, LineBreak::Escaped).and_then(|mut record| {
+                fmt::time::UtcTime::rfc_3339()
+                    .format_time(&mut fmt::format::Writer::new(&mut record))?;
+                std::fmt::Write::write_str(&mut record, " ERROR ")?;
+                Ok(record)
+            }),
+        }
+        .and_then(|mut record| {
+            std::fmt::Write::write_str(&mut record, text)?;
+            record.end()
+        });
+        out
     }
 }
 
-/// panic 用 crit（2）：它比普通 err 更严重，release 配置下紧接着就是 abort。
-/// A panic is crit (2): worse than an ordinary err, and under the release profile it is
-/// immediately followed by abort.
-fn panic_record(location: Option<&std::panic::Location<'_>>, message: &str) -> String {
+/// 致命错误是一条 err（3）日志：`{err:#}` 把整条 cause 链用 `: ` 接起来，一条日志里看得到完整原因
+/// A fatal error is one err (3) record: `{err:#}` joins the whole cause chain with `: `, so the
+/// full reason is in one record
+fn fatal_record(log: StderrLog, err: &anyhow::Error) -> String {
+    log.record(3, &format!("fatal: {err:#}"))
+}
+
+/// 写到 stderr 的致命错误，以换行结尾（见 [`StderrLog::of_stderr`]）
+/// The fatal error written to stderr, ended by a line break (see [`StderrLog::of_stderr`])
+fn fatal_report(err: &anyhow::Error) -> String {
+    match StderrLog::of_stderr() {
+        Some(log) => fatal_record(log, err),
+        None => format!("Error: {err:?}\n"),
+    }
+}
+
+/// panic 是一条 crit（2）日志：它比普通 err 更严重，release 配置下紧接着就是 abort。
+/// A panic is one crit (2) record: worse than an ordinary err, and under the release profile
+/// it is immediately followed by abort.
+fn panic_record(
+    log: StderrLog,
+    location: Option<&std::panic::Location<'_>>,
+    message: &str,
+) -> String {
     let at = location
         .map(|at| format!(" at {}:{}:{}", at.file(), at.line(), at.column()))
         .unwrap_or_default();
-    journal_record(2, &format!("panicked{at}: {message}"))
+    log.record(2, &format!("panicked{at}: {message}"))
 }
 
 /// `panic!` 的载荷只有 `&str`（字面量）和 `String`（格式化）两种常见形态，其余无法呈现。
@@ -759,18 +801,17 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
     }
 }
 
-/// 只在 journald 下接管：终端里仍交给原钩子，保留带 backtrace 提示的标准输出。
-/// Only takes over under journald; on a terminal the previous hook keeps the standard
-/// output with its backtrace hint.
+/// stderr 不是终端时接管，写成一条日志（见 [`StderrLog`]）；终端里仍交给原钩子，保留带 backtrace 提示的标准输出。
+/// Takes over when stderr is not a terminal, writing one log record (see [`StderrLog`]); on
+/// a terminal the previous hook keeps the standard output with its backtrace hint.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if stdout_is_journald() {
-            let record = panic_record(info.location(), panic_message(info.payload()));
+    std::panic::set_hook(Box::new(move |info| match StderrLog::of_stderr() {
+        Some(log) => {
+            let record = panic_record(log, info.location(), panic_message(info.payload()));
             let _ = write!(std::io::stderr(), "{record}");
-        } else {
-            previous(info);
         }
+        None => previous(info),
     }));
 }
 
@@ -976,17 +1017,18 @@ mod tests {
     /// `an_event_over_several_lines_is_one_record`).
     #[test]
     fn a_fatal_error_is_one_err_record_with_cause_chain() {
+        let journald = super::StderrLog::Journald;
         let err = anyhow::anyhow!("No such file or directory")
             .context("read /nonexistent.json")
             .context("load initial config");
         assert_eq!(
-            super::fatal_record(&err),
+            super::fatal_record(journald, &err),
             "<3>fatal: load initial config: read /nonexistent.json: No such file or directory\n"
         );
 
         let err = anyhow::anyhow!("first line\nsecond line\n").context("outer");
         assert_eq!(
-            super::fatal_record(&err),
+            super::fatal_record(journald, &err),
             "<3>fatal: outer: first line\n<3>second line\n"
         );
 
@@ -994,14 +1036,55 @@ mod tests {
         assert!(terminal.starts_with("outer"), "{terminal}");
     }
 
+    /// 不接 journald 也不是终端时（OpenWrt 上 procd 写的日志文件），致命错误和 panic 和事件一样只占一行：
+    /// UTC 时间开头，第二个词是 ERROR，里面的换行写成 `\n`。以前致命错误是 `Error: {err:?}` 好几行，panic 交给默认钩子，
+    /// 面板认不出级别和时间
+    /// Neither under journald nor on a terminal (the log file procd writes on `OpenWrt`), a
+    /// fatal error and a panic take one line alone as an event does: the UTC time first, ERROR
+    /// the second word, the line breaks within written `\n`. A fatal error used to be
+    /// `Error: {err:?}` over several lines and a panic went to the default hook, the panel
+    /// reading neither level nor time
+    #[test]
+    fn without_journald_a_fatal_error_and_a_panic_are_one_line() {
+        let plain = super::StderrLog::Plain;
+        let location = std::panic::Location::caller();
+        for (record, text) in [
+            (
+                super::fatal_record(
+                    plain,
+                    &anyhow::anyhow!("regex parse error:\n    (\n    ^\n").context("outer"),
+                ),
+                "fatal: outer: regex parse error:\\n    (\\n    ^".to_owned(),
+            ),
+            (
+                super::panic_record(plain, Some(location), "index out of bounds\nmore"),
+                format!(
+                    "panicked at {}:{}:{}: index out of bounds\\nmore",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                ),
+            ),
+        ] {
+            assert_eq!(record.lines().count(), 1, "{record}");
+            let (time, rest) = record.split_once(' ').unwrap();
+            assert!(
+                time.len() >= 20 && time.as_bytes()[4] == b'-' && time.ends_with('Z'),
+                "{record}"
+            );
+            assert_eq!(rest, format!("ERROR {text}\n"));
+        }
+    }
+
     /// panic 是一条 `<2>panicked at file:line:col: message` 日志，消息跨几行时每行都带 `<2>`。
     /// A panic is one `<2>panicked at file:line:col: message` record, a message over several
     /// lines carrying `<2>` on every one.
     #[test]
     fn a_panic_is_one_crit_record() {
+        let journald = super::StderrLog::Journald;
         let location = std::panic::Location::caller();
         assert_eq!(
-            super::panic_record(Some(location), "index out of bounds\nmore"),
+            super::panic_record(journald, Some(location), "index out of bounds\nmore"),
             format!(
                 "<2>panicked at {}:{}:{}: index out of bounds\n<2>more\n",
                 location.file(),
@@ -1009,7 +1092,10 @@ mod tests {
                 location.column()
             )
         );
-        assert_eq!(super::panic_record(None, "boom"), "<2>panicked: boom\n");
+        assert_eq!(
+            super::panic_record(journald, None, "boom"),
+            "<2>panicked: boom\n"
+        );
     }
 
     /// `panic!("literal")` 和 `panic!("{}", value)` 的载荷类型不同，两种都要能取出消息。

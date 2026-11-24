@@ -151,26 +151,8 @@ pub(crate) fn write_static_reply(
             } else {
                 &[]
             };
-            for address in addresses {
-                match (qtype, address) {
-                    (RecordType::A | RecordType::ANY, IpAddr::V4(address)) => {
-                        push_address(
-                            &mut reply,
-                            RecordType::A,
-                            StaticAnswer::DEFAULT_TTL,
-                            &address.octets(),
-                        );
-                    }
-                    (RecordType::AAAA | RecordType::ANY, IpAddr::V6(address)) => {
-                        push_address(
-                            &mut reply,
-                            RecordType::AAAA,
-                            StaticAnswer::DEFAULT_TTL,
-                            &address.octets(),
-                        );
-                    }
-                    _ => continue,
-                }
+            for address in StaticRecords::addresses_for(addresses, qtype) {
+                push_address(&mut reply, StaticAnswer::DEFAULT_TTL, &address);
                 written += 1;
             }
         }
@@ -178,17 +160,9 @@ pub(crate) fn write_static_reply(
             for record in records {
                 if record.dns_class != DNSClass::IN
                     || !is_question_name(&record.name, &query[QUESTION_AT..name_end])
+                    || !push_address(&mut reply, record.ttl, &record.data)
                 {
                     return None;
-                }
-                match &record.data {
-                    RData::A(A(address)) => {
-                        push_address(&mut reply, RecordType::A, record.ttl, &address.octets());
-                    }
-                    RData::AAAA(AAAA(address)) => {
-                        push_address(&mut reply, RecordType::AAAA, record.ttl, &address.octets());
-                    }
-                    _ => return None,
                 }
                 written += 1;
             }
@@ -198,8 +172,15 @@ pub(crate) fn write_static_reply(
     Some(Bytes::from(reply))
 }
 
-/// 一条地址记录：主人是指回问题名的指针 / An address record, its owner a pointer back at the question name
-fn push_address(reply: &mut Vec<u8>, kind: RecordType, ttl: u32, address: &[u8]) {
+/// 一条地址记录，主人是指回问题名的指针；`data` 不是 A、AAAA 时什么也不写，交回 false
+/// An address record, its owner a pointer back at the question name; nothing is written, and
+/// false comes back, when `data` is no A or AAAA
+fn push_address(reply: &mut Vec<u8>, ttl: u32, data: &RData) -> bool {
+    let (kind, address) = match data {
+        RData::A(A(address)) => (RecordType::A, &address.octets()[..]),
+        RData::AAAA(AAAA(address)) => (RecordType::AAAA, &address.octets()[..]),
+        _ => return false,
+    };
     reply.extend_from_slice(&[0xC0, 0x0C]);
     reply.extend_from_slice(&u16::from(kind).to_be_bytes());
     reply.extend_from_slice(&u16::from(DNSClass::IN).to_be_bytes());
@@ -210,6 +191,7 @@ fn push_address(reply: &mut Vec<u8>, kind: RecordType, ttl: u32, address: &[u8])
             .to_be_bytes(),
     );
     reply.extend_from_slice(address);
+    true
 }
 
 /// `name` 就是线上这个（没压缩的）问题名，不分大小写 / `name` is this uncompressed question name on the wire,
@@ -297,6 +279,26 @@ impl StaticAnswer {
 }
 
 impl StaticRecords {
+    /// static_ip_response 的地址 `addresses`（见 [`Self::Addresses`]）里给问 `qtype` 的查询的，按记录数据给出：只给问的
+    /// 地址族，ANY 都给。快速路径直接写的和 [`Self::of`] 做出的记录都照它挑
+    /// Those of a static_ip_response's `addresses` (see [`Self::Addresses`]) that a query for
+    /// `qtype` gets, as record data: the family asked alone, both for ANY. What the fast path
+    /// writes directly and the records [`Self::of`] makes are both picked by it
+    pub(crate) fn addresses_for(
+        addresses: &[IpAddr],
+        qtype: RecordType,
+    ) -> impl Iterator<Item = RData> + '_ {
+        addresses
+            .iter()
+            .filter_map(move |address| match (qtype, address) {
+                (RecordType::A | RecordType::ANY, IpAddr::V4(v4)) => Some(RData::A(A(*v4))),
+                (RecordType::AAAA | RecordType::ANY, IpAddr::V6(v6)) => {
+                    Some(RData::AAAA(AAAA(*v6)))
+                }
+                _ => None,
+            })
+    }
+
     /// 给问 `qname` 的 `qtype`、`qclass` 的查询的记录，都指回问题名：地址只给问的地址族（ANY 都给），TXT 只答 TXT 和 ANY
     /// 查询，别的类型回 NODATA；只给 IN 和 ANY 类的问题（见 [`has_static_records`]）。问题名读不出来的，和装不进这个名字的
     /// 应答的 TXT（见 [`txt_size_problem`]），不管问什么都回 SERVFAIL
@@ -324,15 +326,7 @@ impl StaticRecords {
             return (ResponseCode::NoError, Vec::new());
         }
         let records = match self {
-            Self::Addresses(addresses) => addresses
-                .iter()
-                .filter_map(|address| match (qtype, address) {
-                    (RecordType::A | RecordType::ANY, IpAddr::V4(v4)) => Some(RData::A(A(*v4))),
-                    (RecordType::AAAA | RecordType::ANY, IpAddr::V6(v6)) => {
-                        Some(RData::AAAA(AAAA(*v6)))
-                    }
-                    _ => None,
-                })
+            Self::Addresses(addresses) => Self::addresses_for(addresses, qtype)
                 .map(|rdata| Record::from_rdata(name.clone(), StaticAnswer::DEFAULT_TTL, rdata))
                 .collect(),
             Self::Cname { target, ttl } => vec![Record::from_rdata(

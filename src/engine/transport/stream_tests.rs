@@ -464,7 +464,7 @@ async fn dot_connect_and_handshake_are_bounded_by_the_request_budget() {
     // DoT 同理，卡住的是 TLS 握手：accept 后沉默的上游不能钉死请求。
     let addr = silent_tcp_listener().await;
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(build_tls_client_config().expect("tls config")),
     );
     let started = tokio::time::Instant::now();
@@ -493,7 +493,7 @@ async fn a_dot_handshake_outlives_the_query_that_started_it() {
     let (addr, accepted) =
         crate::engine::test_support::slow_front(upstream, Duration::from_millis(300)).await;
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(client_tls),
     );
     let raced = timeout(
@@ -577,7 +577,7 @@ async fn a_connection_made_for_a_cancelled_query_closes_with_the_upstream() {
         let _ = closed_tx.send(());
     });
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(client_tls),
     );
     let raced = timeout(
@@ -604,7 +604,7 @@ async fn a_connection_left_waiting_and_closed_meanwhile_is_made_again() {
     let (addr, accepted) =
         front_closing_the_first(upstream, Some(Duration::from_millis(150))).await;
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(client_tls),
     );
     let raced = timeout(
@@ -631,7 +631,7 @@ async fn a_failure_left_waiting_past_its_backoff_does_not_fail_the_next_query() 
     let upstream = spawn_stream_upstream(Some(server)).await;
     let (addr, accepted) = front_closing_the_first(upstream, None).await;
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(client_tls),
     );
     let raced = timeout(
@@ -669,7 +669,7 @@ async fn a_failed_connect_backs_off_before_the_next() {
         }
     });
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(build_tls_client_config().expect("tls config")),
     );
     let query = udp_test_query("refused.example");
@@ -1089,7 +1089,7 @@ async fn dot_test_client() -> DotMuxClient {
     let (server, client_tls) = localhost_tls(&[]);
     let addr = spawn_stream_upstream(Some(server)).await;
     DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(client_tls),
     )
 }
@@ -1459,7 +1459,7 @@ async fn dot_reaches_an_ipv6_literal_upstream() {
         return;
     };
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://[::1]:{}", addr.port())),
+        Arc::from(format!("[::1]:{}", addr.port())),
         Arc::new(client_tls),
     );
     client
@@ -1486,7 +1486,7 @@ async fn a_stuck_dot_write_ends_at_the_deadline() {
         read_to_close(held).await;
     });
     let client = DotMuxClient::new(
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Arc::new(client_tls),
     );
     assert_a_stuck_write_ends_at_the_deadline(&client, read_now, peer).await;
@@ -1616,7 +1616,7 @@ async fn an_idle_dot_connection_closes_by_itself_with_close_notify() {
     });
     let client = DotMuxClient::with_shared(
         (Arc::new(client_tls), Bootstrap::system()),
-        Arc::from(format!("dot://{addr}?sni=localhost")),
+        Arc::from(format!("{addr}?sni=localhost")),
         Aging {
             idle: Some(Duration::from_millis(100)),
             ..Aging::for_tests()
