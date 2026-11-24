@@ -7,8 +7,6 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
-
 use bytes::Bytes;
 
 use hickory_proto::op::{Message, ResponseCode};
@@ -77,10 +75,11 @@ pub struct CacheKeys {
     pub requester: RequesterKey,
 }
 
-/// Pre-parsed data from handle_packet_fast to avoid re-parsing: the query as the quick parse
-/// read it and the pipeline picked, for this very packet (see `Engine::answer_after_fast_path`)
-/// 来自 handle_packet_fast 的预解析数据，避免重新解析：快速解析读出的查询和选中的 pipeline，是这一个包的（见
-/// `Engine::answer_after_fast_path`）
+/// A query read already, so as not to parse it again: the query as `handle_packet_fast` or
+/// `Engine::handle_packet` read it and the pipeline picked, for this very packet (see
+/// `Engine::handle_packet_internal_with_pre_parsed`)
+/// 读好的查询，不必再解析一遍：`handle_packet_fast` 或 `Engine::handle_packet` 读出的查询和选中的 pipeline，是这一个包的
+/// （见 `Engine::handle_packet_internal_with_pre_parsed`）
 #[derive(Clone)]
 pub struct PreParsedData {
     head: RequestHead,
@@ -687,24 +686,18 @@ impl Engine {
         observer.request_finished(ctx, &outcome);
     }
 
-    /// 快速路径：同步地答查询。Ok(Some) 是当场答上了（`Direct`、`CacheHit`），或者要等上游、交给异步路径（`AsyncNeeded`，
-    /// 带着读出的查询和选中的 pipeline）；Ok(None) 是快速解析读不了这个查询，由完整路径从头读；Err 只在不支持的 EDNS 版本
-    /// 的 BADVERS 写不出来时，监听器回 SERVFAIL
-    /// Fast path: answer a query synchronously. Ok(Some) when it is answered on the spot
+    /// 快速路径：同步地答查询。Some 是当场答上了（`Direct`、`CacheHit`），或者要等上游、交给异步路径（`AsyncNeeded`，带着
+    /// 读出的查询和选中的 pipeline）；None 是快速解析读不了这个查询，由完整路径从头读
+    /// Fast path: answer a query synchronously. Some when it is answered on the spot
     /// (`Direct`, `CacheHit`), or waits on an upstream and goes on to the async path
-    /// (`AsyncNeeded`, with the query as read and the pipeline picked); Ok(None) when the quick
-    /// parse cannot read the query, which the full path reads from scratch; Err only when the
-    /// BADVERS for an unsupported EDNS version cannot be written, the listener answering SERVFAIL
+    /// (`AsyncNeeded`, with the query as read and the pipeline picked); None when the quick
+    /// parse cannot read the query, which the full path reads from scratch
     /// Every answer goes back with what it copies from the query as the client wrote it
     /// (see `proto_utils::reply_as_asked`), and the observer is lent that same answer
     /// 每个回答照抄查询的部分都照客户端的写法发回（见 `proto_utils::reply_as_asked`），出借给
     /// 观察者的也是这同一份
     #[inline]
-    pub fn handle_packet_fast(
-        &self,
-        packet: &[u8],
-        peer: SocketAddr,
-    ) -> anyhow::Result<Option<FastPathResponse>> {
+    pub fn handle_packet_fast(&self, packet: &[u8], peer: SocketAddr) -> Option<FastPathResponse> {
         let peer = client_address(peer);
         // 这个请求的时刻只读这一次：查缓存、算 TTL、上报都用它，答完才再读一次算耗时
         // The request's moment is read once, here: the cache lookup, the TTL and the report all use
@@ -713,13 +706,8 @@ impl Engine {
         // Quick parsing, avoiding full Message parsing and massive allocations / 快速解析，避免完整 Message 解析和大量分配
         // Use stack buffer to avoid String allocation / 使用栈上缓冲区避免 String 分配
         let mut qname_buf = [0u8; 256];
-        let q = match parse_quick(packet, &mut qname_buf) {
-            Some(q) => q,
-            None => {
-                // Quick parse failed, fallback to async path / 快速解析失败，回退到异步路径
-                return Ok(None);
-            }
-        };
+        // 快速解析读不了的交给完整路径 / What the quick parse cannot read goes to the full path
+        let q = parse_quick(packet, &mut qname_buf)?;
         // Observer: requests answered here are reported in one batch at the
         // answering site; requests that fall through are reported by the async path.
         // 观察者：在此应答的请求在应答处一次性上报；回落的请求由异步路径上报。
@@ -758,7 +746,7 @@ impl Engine {
         // than as if it were version 0
         if q.edns_version != 0 {
             let reply = crate::proto_utils::reply_as_asked(
-                crate::proto_utils::badvers_response(packet).context("build BADVERS response")?,
+                crate::proto_utils::badvers_response(packet, q.question_end),
                 packet,
             );
             if let Some(observer) = observed {
@@ -777,7 +765,7 @@ impl Engine {
             // 和完整路径一样记一条响应日志，pipeline 是选中的那个
             // A response record as the full path writes, with the pipeline picked
             response_log(pipeline_opt).answered(&reply);
-            return Ok(Some(FastPathResponse::Direct(reply)));
+            return Some(FastPathResponse::Direct(reply));
         }
 
         let requester = Requester {
@@ -878,7 +866,7 @@ impl Engine {
                         );
                     }
                     log.answered(&reply);
-                    return Ok(Some(FastPathResponse::Direct(reply)));
+                    return Some(FastPathResponse::Direct(reply));
                 }
                 // 其余过期的（不能再用的、要先等上游的）留给异步路径：那里的查找选中的是同一份，由它决定。在这里删掉，那次
                 // 查找就会退到一份更宽、更旧的应答上，而上游已不再把它给这个请求方
@@ -934,7 +922,7 @@ impl Engine {
                     let mut log = response_log(pipeline);
                     log.info.served_from_cache(&hit);
                     log.answered(&reply);
-                    return Ok(Some(if echoed {
+                    return Some(if echoed {
                         FastPathResponse::Direct(reply)
                     } else {
                         FastPathResponse::CacheHit {
@@ -942,7 +930,7 @@ impl Engine {
                             tx_id: q.tx_id,
                             elapsed_secs,
                         }
-                    }));
+                    });
                 }
             }
 
@@ -987,11 +975,11 @@ impl Engine {
             let (next, hop) = if let Some(record) = cached {
                 match &record.entry.decision {
                     Decision::Static { rcode, answers } => {
-                        return Ok(answer_static(
+                        return answer_static(
                             *rcode,
                             answers,
                             FastPathAnswer::CachedRules { record: &record },
-                        ));
+                        );
                     }
                     Decision::Jump { pipeline: target } => (
                         cfg.pipeline(target),
@@ -1042,7 +1030,7 @@ impl Engine {
                                 rcode,
                                 answers,
                             };
-                            return Ok(finish_static(reply, answer));
+                            return finish_static(reply, answer);
                         }
                         let (rcode, answers) = action.records(qname_str, qtype, qclass);
                         let answer = FastPathAnswer::StaticRule {
@@ -1050,7 +1038,7 @@ impl Engine {
                             rcode,
                             answers: answers.len(),
                         };
-                        return Ok(answer_static(rcode, &answers, answer));
+                        return answer_static(rcode, &answers, answer);
                     }
                     None => break,
                 }
@@ -1070,30 +1058,86 @@ impl Engine {
         // Cache miss, need async processing / 缓存未命中，需要异步处理
         // Return AsyncNeeded with pre-parsed data to avoid re-parsing in handle_packet
         // 返回 AsyncNeeded 包含预解析数据，避免在 handle_packet 中重新解析
-        Ok(Some(FastPathResponse::AsyncNeeded(PreParsedData {
+        Some(FastPathResponse::AsyncNeeded(PreParsedData {
             head: RequestHead::quick(&q, name_of(pipeline_opt)),
             state: arc_swap::Guard::into_inner(state),
-        })))
+        }))
     }
 
-    pub async fn handle_packet(&self, packet: &[u8], peer: SocketAddr) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, None, None, None)
-            .await
+    /// 客户端的查询走完整路径，从头读：读不了的是 [`UnreadableQuery`]，监听器据此回 FORMERR（见
+    /// `Engine::answer_after_fast_path`）；读得了的照 [`Self::handle_packet_internal_with_pre_parsed`] 作答
+    /// The full path for a client's query, read from scratch: one that cannot be read is an
+    /// [`UnreadableQuery`], which the listener answers FORMERR (see
+    /// `Engine::answer_after_fast_path`); one that can is answered as
+    /// [`Self::handle_packet_internal_with_pre_parsed`] answers it
+    pub async fn handle_packet(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+    ) -> Result<Bytes, UnreadableQuery> {
+        let state = self.state.load_full();
+        let head = self.read_request(packet, client_address(peer).ip(), &state.pipeline)?;
+        Ok(self
+            .handle_packet_internal_with_pre_parsed(packet, peer, PreParsedData { head, state })
+            .await)
     }
 
-    /// 快速路径读过的查询走完整路径：`pre_parsed` 是 `handle_packet_fast` 为这同一个包给的，不再解析一遍。三个监听器都经
-    /// `Engine::answer_after_fast_path` 从这里进来
-    /// The full path for a query the fast path read: `pre_parsed` is what `handle_packet_fast`
-    /// gave for this very packet, with no second parse. All three listeners come in here through
+    /// 读好的客户端查询走完整路径：`pre_parsed` 是这同一个包读出来的请求和选中它的 pipeline 的那份配置（`handle_packet_fast`
+    /// 给的，或者 [`Self::handle_packet`] 刚读的），不再解析一遍。客户端总拿到应答：以错误结束的请求（跳转上限、流控没让转发等，
+    /// 见 `decide`）回 SERVFAIL，没有回音在客户端看来就是超时，stub 解析器会重试（RFC 1035）。每个应答都带着它的客户端该看到的
+    /// ECS 选项、照客户端写法的照抄部分离开（见 `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的
+    /// 处理。三个监听器都经 `Engine::answer_after_fast_path` 从这里进来
+    /// The full path for a client's query that has been read: `pre_parsed` is the request read
+    /// from this very packet and the configuration that picked its pipeline (given by
+    /// `handle_packet_fast`, or just read by [`Self::handle_packet`]), with no second parse. The
+    /// client always gets an answer: a request that ended in an error (the jump limit, flow
+    /// control keeping a forward from waiting, see `decide`) is answered SERVFAIL, silence being
+    /// a timeout to the client, which the stub resolver retries (RFC 1035). Every reply leaves
+    /// with the ECS option its client should see, and with what it copies from the query as the
+    /// client wrote it (see `proto_utils::reply_as_asked`); waiters were handed the reply before
+    /// this and do the same for their own clients. All three listeners come in here through
     /// `Engine::answer_after_fast_path`
     pub async fn handle_packet_internal_with_pre_parsed(
         &self,
         packet: &[u8],
         peer: SocketAddr,
         pre_parsed: PreParsedData,
+    ) -> Bytes {
+        let PreParsedData { head, state } = pre_parsed;
+        let answered = self.answer(packet, peer, &state, &head, None).await;
+        let reply = answered
+            .result
+            .unwrap_or_else(|_| crate::proto_utils::servfail_reply(packet));
+        let reply = crate::proto_utils::reply_as_asked(
+            phases::client_reply(reply, head.client_ecs.as_ref(), answered.echo_scope),
+            packet,
+        );
+        answered.journal.finish(&Ok(reply.clone()));
+        reply
+    }
+
+    /// 后台刷新：照配置 `state` 重放 `packet`，更新的是 `target`（见 `refresh::spawn_background_refresh`）。刷新不查缓存，总是去问
+    /// 上游；它照原请求重放，沿着规则走到哪里就写在哪里的键下，和客户端请求一样，路线没变时就是原请求查过的那个槽位；不上报缓存
+    /// 命中、不记应答日志。结果原样交回（见 `renewing`），失败由 refresh.rs 记下
+    /// A background refresh: `packet` replayed under the configuration `state`, renewing
+    /// `target` (see `refresh::spawn_background_refresh`). A refresh looks up no cache and always
+    /// asks upstream; replaying the original request, it writes under the keys of wherever the
+    /// rules lead it, as a client request does, which is the slot the original request looked up
+    /// while the route is the same; it reports no cache hit and writes no response record. What
+    /// it comes to goes back as it is (see `renewing`), a failure for refresh.rs to note
+    pub(crate) async fn handle_refresh(
+        &self,
+        packet: &[u8],
+        peer: SocketAddr,
+        target: RefreshTarget,
+        state: Arc<EngineInner>,
     ) -> anyhow::Result<Bytes> {
-        self.handle_packet_internal(packet, peer, Some(pre_parsed), None, None)
-            .await
+        let head = self.read_request(packet, client_address(peer).ip(), &state.pipeline)?;
+        let answered = self
+            .answer(packet, peer, &state, &head, Some(&target))
+            .await;
+        answered.journal.finish(&answered.result);
+        answered.result
     }
 
     /// 在响应缓存里找能直接回答这个请求的应答：新鲜的立刻给；过期的按 serve_stale 的设置
@@ -1190,92 +1234,78 @@ impl Engine {
         still_refreshing
     }
 
-    /// Internal handle_packet implementation / 内部 handle_packet 实现
-    ///
-    /// pre_parsed: Optional pre-parsed data from handle_packet_fast to avoid re-parsing
-    /// pre_parsed: 来自 handle_packet_fast 的可选预解析数据，避免重新解析
-    ///
-    /// refresh：后台刷新时它要更新的条目，有它就是后台刷新。刷新不查缓存，总是去问上游；它照原请求重放，沿着规则走到哪里
-    /// 就写在哪里的键下，和客户端请求一样，路线没变时就是原请求查过的那个槽位；不上报缓存命中、不记应答日志；失败原样交回，
-    /// 由 refresh.rs 记录
-    /// refresh: for a background refresh, the entry it renews, and the request is one exactly
-    /// when it is given. A refresh looks up no cache and always asks upstream; replaying the
-    /// original request, it writes under the keys of wherever the rules lead it, as a client
-    /// request does, which is the slot the original request looked up while the route is the
-    /// same; it reports no cache hit and writes no response record; a failure comes back as it
-    /// is, for refresh.rs to note
-    pub(crate) async fn handle_packet_internal(
-        &self,
-        packet: &[u8],
+    /// 读好的请求 `head` 照配置 `state` 作答（见 [`Self::decide`]）：交回得出的结果，和还没收尾的记录，由入口照它交回去的样子
+    /// 收尾。请求从选 pipeline 到响应动作、写缓存都用这同一份配置：选中它的那份（快速路径选的、刚读的），后台刷新是写下它
+    /// 要更新的条目的那份。`refresh` 是后台刷新要更新的条目，有它就是后台刷新（见 [`Self::handle_refresh`]），它的结果在这里
+    /// 定下（见 [`renewing`]）
+    /// Answer the request `head` as read under the configuration `state` (see
+    /// [`Self::decide`]): what it came to goes back with the records not yet finished, for the
+    /// entry to finish by what it hands back. A request uses this one configuration from picking
+    /// its pipeline through response actions and cache writes: the one that picked it (on the
+    /// fast path, or just read), for a background refresh the one its renewed entry was written
+    /// under. `refresh` is the entry a background refresh renews, the request being one exactly
+    /// when it is given (see [`Self::handle_refresh`]), and what it comes to is settled here
+    /// (see [`renewing`])
+    async fn answer<'a>(
+        &'a self,
+        packet: &'a [u8],
         peer: SocketAddr,
-        pre_parsed: Option<PreParsedData>,
-        refresh: Option<RefreshTarget>,
-        state_override: Option<Arc<EngineInner>>,
-    ) -> anyhow::Result<Bytes> {
+        state: &'a Arc<EngineInner>,
+        head: &'a RequestHead,
+        refresh: Option<&'a RefreshTarget>,
+    ) -> Answered<'a> {
         let peer = client_address(peer);
         let background_refresh = refresh.is_some();
         // Track requests and inflight concurrency for diagnostics. / 跟踪请求和进行中的并发以进行诊断
         let request_id = next_request_id();
-        // A request uses one immutable configuration snapshot from selection
-        // through response actions and cache writes. Background refresh passes
-        // the snapshot that produced its cache key via `state_override`, and the
-        // fast path the one that selected its pipeline via `pre_parsed`.
-        let (state, head) = match pre_parsed {
-            Some(pre) => (pre.state, pre.head),
-            None => {
-                let state = state_override.unwrap_or_else(|| self.state.load_full());
-                let head = self.read_request(packet, peer, &state.pipeline)?;
-                (state, head)
-            }
-        };
         // A refresh replays its request's ECS from the key the cache kept, as an option
         // nobody can read does not survive into the replayed packet (see
         // `RefreshTarget::client_ecs`)
         // 刷新按缓存留下的键重放请求的 ECS：读不懂的选项进不了重放的包（见
         // `RefreshTarget::client_ecs`）
         let client_ecs = refresh
-            .as_ref()
             .and_then(|target| target.client_ecs)
             .or(head.client_ecs);
         let start = Instant::now();
-        let mut response_log = ResponseLog::new(
-            &head.qname,
-            head.qtype,
-            peer,
-            head.pipeline_id.clone(),
-            start,
-            background_refresh,
-        );
-
-        // Observer handle for this request: borrows the parsed query and
-        // reports request_finished when dropped, so cancelled requests
-        // (listener timeouts drop the future) are reported as well.
-        // 本请求的观察者句柄：借用已解析的查询，drop 时上报 request_finished，
-        // 因此被取消的请求（监听器超时会丢弃 future）同样会上报。
-        let mut observed = self.observer.as_deref().map(|observer| {
-            ObservedRequest::new(
-                observer,
-                RequestContext {
-                    request_id,
-                    listener_label: &self.listener_label,
-                    client: peer,
-                    // A refresh is the engine's own query, whichever listener's request scheduled it.
-                    // 刷新是引擎自己的查询，与安排它的请求来自哪个监听器无关。
-                    transport: if background_refresh {
-                        None
-                    } else {
-                        self.client_transport
+        let mut journal = Journal {
+            // Observer handle for this request: borrows the parsed query and
+            // reports request_finished when dropped, so cancelled requests
+            // (listener timeouts drop the future) are reported as well.
+            // 本请求的观察者句柄：借用已解析的查询，drop 时上报 request_finished，
+            // 因此被取消的请求（监听器超时会丢弃 future）同样会上报。
+            observed: self.observer.as_deref().map(|observer| {
+                ObservedRequest::new(
+                    observer,
+                    RequestContext {
+                        request_id,
+                        listener_label: &self.listener_label,
+                        client: peer,
+                        // A refresh is the engine's own query, whichever listener's request scheduled it.
+                        // 刷新是引擎自己的查询，与安排它的请求来自哪个监听器无关。
+                        transport: if background_refresh {
+                            None
+                        } else {
+                            self.client_transport
+                        },
+                        qname: &head.qname,
+                        qtype: head.qtype,
+                        qclass: head.qclass,
+                        background_refresh,
+                        started: start,
+                        reported_at_once: false,
                     },
-                    qname: &head.qname,
-                    qtype: head.qtype,
-                    qclass: head.qclass,
-                    background_refresh,
-                    started: start,
-                    reported_at_once: false,
-                },
-            )
-        });
-        if let Some(observed) = &observed {
+                )
+            }),
+            log: ResponseLog::new(
+                &head.qname,
+                head.qtype,
+                peer,
+                head.pipeline_id.clone(),
+                start,
+                background_refresh,
+            ),
+        };
+        if let Some(observed) = &journal.observed {
             observed.observer.request_started(&observed.ctx);
             observed
                 .observer
@@ -1283,7 +1313,7 @@ impl Engine {
         }
 
         let request = Request {
-            state: &state,
+            state,
             packet,
             qname: &head.qname,
             qtype: head.qtype,
@@ -1291,6 +1321,7 @@ impl Engine {
             tx_id: head.tx_id,
             flags: head.flags,
             edns_version: head.edns_version,
+            question_end: head.question_end,
             peer,
             // Who is asking, as far as rules and ECS can tell / 规则和 ECS 能分辨的请求方
             requester: Requester {
@@ -1299,15 +1330,16 @@ impl Engine {
                 ecs: client_ecs,
             },
             start,
-            refresh: refresh.as_ref(),
-            observed: observed
+            refresh,
+            observed: journal
+                .observed
                 .as_ref()
                 .map(|observed| (observed.observer, &observed.ctx)),
         };
         let pipeline = state.pipeline.pipeline(&head.pipeline_id);
         let mut route = Route::new(self, &request, &head.pipeline_id, pipeline);
         let result = self
-            .decide(&request, pipeline, &mut route, &mut response_log.info)
+            .decide(&request, pipeline, &mut route, &mut journal.log.info)
             .await;
 
         // 刷新的结果只在这里定下：一路上它和客户端请求一样作答、写缓存，被刷新的那份留不留，到这里一次决定（见
@@ -1315,7 +1347,7 @@ impl Engine {
         // What a refresh comes to is settled here alone: on the way it answers and caches as a
         // client request does, and whether the answer it renews stays is decided here once (see
         // `renewing`)
-        let result = match request.refresh {
+        let result = match refresh {
             Some(target) => result
                 .and_then(renewing)
                 .inspect(|_| request.drop_refreshed(self, target)),
@@ -1338,33 +1370,14 @@ impl Engine {
                 phases::for_waiters(bytes, &request.requester, &route.trail, route.echo_floor)
             });
         }
-        // Every reply leaves with the ECS option its client should see, and with what it
-        // copies from the query as the client wrote it (see `proto_utils::reply_as_asked`);
-        // waiters were handed the reply before this and do the same for their own clients.
-        // A request that ended in an error answers its client SERVFAIL, which the client
-        // must get rather than silence, a missing reply being a timeout to it; the stub
-        // resolver retries (RFC 1035)
-        // 每个应答都带着它的客户端该看到的 ECS 选项、照客户端写法的照抄部分离开（见
-        // `proto_utils::reply_as_asked`）；等待者在这之前拿到应答，各自为自己的客户端做同样的处理。
-        // 以错误结束的请求给它的客户端回 SERVFAIL：客户端得拿到确定的应答，没有回音在它看来就是超时；
-        // stub 解析器会重试（RFC 1035）
-        let result = if background_refresh {
-            result
-        } else {
-            let at_least = route
-                .echo_floor
-                .max(route.trail.echo_scope(&request.requester.ecs_view()));
-            let reply = result.unwrap_or_else(|_| crate::proto_utils::servfail_reply(packet));
-            Ok(crate::proto_utils::reply_as_asked(
-                phases::client_reply(reply, client_ecs.as_ref(), at_least),
-                packet,
-            ))
-        };
-        response_log.finish(&result);
-        if let Some(observed) = observed.as_mut() {
-            observed.finish(&result);
+        let echo_scope = route
+            .echo_floor
+            .max(route.trail.echo_scope(&request.requester.ecs_view()));
+        Answered {
+            result,
+            echo_scope,
+            journal,
         }
-        result
     }
 
     /// 读出请求的问题，选好 pipeline：先快速解析，读不了再完整解析，还读不了就是 [`UnreadableQuery`]
@@ -1373,12 +1386,12 @@ impl Engine {
     fn read_request(
         &self,
         packet: &[u8],
-        peer: SocketAddr,
+        client: IpAddr,
         cfg: &RuntimePipelineConfig,
-    ) -> anyhow::Result<RequestHead> {
+    ) -> Result<RequestHead, UnreadableQuery> {
         let pipeline_of = |head: (&str, RecordType, DNSClass, bool)| {
             let (qname, qtype, qclass, edns_present) = head;
-            self.pick_pipeline(cfg, qname, qtype, qclass, peer.ip(), edns_present)
+            self.pick_pipeline(cfg, qname, qtype, qclass, client, edns_present)
                 .map_or_else(|| Arc::from(NO_PIPELINE), |pipeline| pipeline.id.clone())
         };
         let mut qname_buf = [0u8; 256];
@@ -1391,12 +1404,9 @@ impl Engine {
             ));
             return Ok(RequestHead::quick(&q, pipeline_id));
         }
-        anyhow::ensure!(
-            crate::proto_utils::question_name_end(packet).is_some(),
-            UnreadableQuery
-        );
-        let req = Message::from_bytes(packet).context(UnreadableQuery)?;
-        let question = req.queries.first().context(UnreadableQuery)?;
+        let name_end = crate::proto_utils::question_name_end(packet).ok_or(UnreadableQuery)?;
+        let req = Message::from_bytes(packet).map_err(|_| UnreadableQuery)?;
+        let question = req.queries.first().ok_or(UnreadableQuery)?;
         // The text parse_quick would have built / parse_quick 会拼出的同一段文本
         let qname: Arc<str> = Arc::from(crate::proto_utils::name_text(question.name()));
         let (qtype, qclass) = (question.query_type(), question.query_class());
@@ -1410,6 +1420,10 @@ impl Engine {
             flags: crate::proto_utils::QueryFlags::of(packet),
             edns_present,
             edns_version: crate::proto_utils::edns_version(packet).unwrap_or(0),
+            // 照 `question_name_end` 读得出的问题名不压缩，hickory 读到的是同一个名字，类型和类别跟在它后面
+            // A question name `question_name_end` reads is uncompressed, the same name hickory
+            // read, with the type and the class after it
+            question_end: name_end + 4,
             client_ecs: crate::proto_utils::client_subnet(packet),
         })
     }
@@ -1442,10 +1456,11 @@ impl Engine {
     }
 
     /// 决定怎么回答 `request`：不支持的 EDNS 版本回 BADVERS；查缓存；然后沿着规则走（跳转、continue、静态应答、转发），
-    /// 直到得出应答。每个出口都在这里，收尾在 `handle_packet_internal`
+    /// 直到得出应答。每个出口都在这里，收尾在 [`Self::answer`] 和交回结果的入口
     /// Decide how to answer `request`: BADVERS for an unsupported EDNS version; the cache; then
     /// along the rules (jumps, continues, static answers, forwards) until an answer comes out.
-    /// Every exit is here, the finishing in `handle_packet_internal`
+    /// Every exit is here, the finishing in [`Self::answer`] and the entry handing the outcome
+    /// back
     async fn decide(
         &self,
         request: &Request<'_>,
@@ -1460,7 +1475,10 @@ impl Engine {
         // RFC 6891 第 6.1.3 节，和快速路径一样：不支持的 EDNS 版本回 BADVERS，快速解析读不了的查询（结尾多了
         // 字节、名字要转义）也一样
         if request.edns_version != 0 {
-            return crate::proto_utils::badvers_response(packet).context("build BADVERS response");
+            return Ok(crate::proto_utils::badvers_response(
+                packet,
+                request.question_end,
+            ));
         }
         let background_refresh = request.refresh.is_some();
         // A background refresh looks up no cache / 后台刷新不查缓存
@@ -1508,12 +1526,12 @@ impl Engine {
                     crate::warn_sparse!("max jump limit reached");
                     // How many jumps a request has left depends on the way it
                     // came, which no key carries, so this SERVFAIL is its own
-                    // (see `handle_packet_internal`): a waiter on its held entry
+                    // (see `Engine::answer`): a waiter on its held entry
                     // may have jumps to spare, so the entry goes rather than hand
                     // it over, and it is not cached for a request that enters
                     // this pipeline directly.
                     // 请求还能跳几次取决于它一路怎么来的，键里没有这一项，所以这个
-                    // SERVFAIL 只属于它（见 `handle_packet_internal`）：等在持有条目上的
+                    // SERVFAIL 只属于它（见 `Engine::answer`）：等在持有条目上的
                     // 请求可能还有余量，所以放掉条目，不把它交出去；也不缓存给直接进入
                     // 这个 pipeline 的请求。
                     info.upstream = Some(Source::Static);
@@ -1625,7 +1643,7 @@ impl Engine {
                         // 这次转发没以应答结束。后台刷新没有要应答的客户端：上游失败了就到此为止，失败原样交回，由
                         // refresh.rs 记录。客户端请求只剩流控没让等的这一种（见 `UpstreamFailure::withheld`）：上游失败、
                         // 应答读不了都已经在转发里化成了过期应答、SERVFAIL 或 miss 动作的结果。它是这台设备自己的事，
-                        // 这个请求只给自己回 SERVFAIL，不交给等在它条目上的别的请求（见 `handle_packet_internal`）；
+                        // 这个请求只给自己回 SERVFAIL，不交给等在它条目上的别的请求（见 `Engine::answer`）；
                         // 也不逐个记警告，拦着的时候每秒可以有几万个
                         // The forward ended without an answer. A background refresh answers no
                         // client: once the upstream failed it ends there, the failure coming back
@@ -1635,7 +1653,7 @@ impl Engine {
                         // read has become a stale answer, SERVFAIL or the miss actions' outcome
                         // within the forward. It is the device's own affair, so the request answers
                         // SERVFAIL to itself alone and not to the requests waiting on its entry (see
-                        // `handle_packet_internal`); nor is a warning logged for each, held back
+                        // `Engine::answer`); nor is a warning logged for each, held back
                         // there being tens of thousands a second
                         Err(e) => {
                             if !background_refresh {
@@ -1799,6 +1817,37 @@ impl std::fmt::Display for UnreadableQuery {
 
 impl std::error::Error for UnreadableQuery {}
 
+/// 一个请求的记录：观察者句柄和应答日志。收尾时记下请求的结局；没收尾就丢掉的（请求被取消）照样上报
+/// A request's records: the observer handle and the response log. Finishing notes how the
+/// request ended; dropped unfinished (the request cancelled), they report all the same
+struct Journal<'a> {
+    observed: Option<ObservedRequest<'a>>,
+    log: ResponseLog<'a>,
+}
+
+impl Journal<'_> {
+    /// 记下请求以 `result` 结束：客户端的请求是交给客户端的应答，后台刷新是它得出的结果
+    /// Note that the request ended in `result`: for a client's request the reply its client
+    /// gets, for a background refresh what it came to
+    fn finish(mut self, result: &anyhow::Result<Bytes>) {
+        if let Some(observed) = self.observed.as_mut() {
+            observed.finish(result);
+        }
+        self.log.finish(result);
+    }
+}
+
+/// 走完规则的请求（见 `Engine::answer`）：得出的结果，客户端的应答至少依赖它的 ECS 的多少位（见
+/// `phases::client_reply`），和还没收尾的记录
+/// A request through the rules (see `Engine::answer`): what it came to, how many bits of the
+/// client's ECS its reply depends on at least (see `phases::client_reply`), and the records
+/// not yet finished
+struct Answered<'a> {
+    result: anyhow::Result<Bytes>,
+    echo_scope: u8,
+    journal: Journal<'a>,
+}
+
 /// 读出来的请求和选中的 pipeline（见 `Engine::read_request`）；快速路径读过的照样交给异步路径（见 [`PreParsedData`]）
 /// The request as read, and the pipeline picked (see `Engine::read_request`); what the fast
 /// path read goes on to the async path as it is (see [`PreParsedData`])
@@ -1812,6 +1861,8 @@ struct RequestHead {
     edns_present: bool,
     /// 请求 OPT 里的 EDNS 版本，没有 OPT 时为 0 / The EDNS version in the request's OPT, 0 without one
     edns_version: u8,
+    /// 问题段在哪里结束 / Where the question section ends
+    question_end: usize,
     client_ecs: Option<crate::ecs::EcsKey>,
     pipeline_id: Arc<str>,
 }
@@ -1827,6 +1878,7 @@ impl RequestHead {
             flags: q.flags,
             edns_present: q.edns_present,
             edns_version: q.edns_version,
+            question_end: q.question_end,
             client_ecs: q.client_subnet,
             pipeline_id,
         }
@@ -1849,6 +1901,8 @@ pub(crate) struct Request<'a> {
     /// 请求 OPT 里的 EDNS 版本，没有 OPT 时为 0 / The EDNS version in the request's OPT, 0
     /// without one
     pub(crate) edns_version: u8,
+    /// 问题段在 `packet` 里哪里结束 / Where the question section ends in `packet`
+    pub(crate) question_end: usize,
     pub(crate) peer: SocketAddr,
     /// Who is asking (address, EDNS, the client's own ECS) / 谁在问（地址、EDNS、客户端自己的 ECS）
     pub(crate) requester: Requester,
@@ -2386,12 +2440,11 @@ mod tests {
         let new_key = slot_in(engine.state.load().cache_namespace("main"));
 
         let response = engine
-            .handle_packet_internal(
+            .handle_refresh(
                 &request,
                 "127.0.0.1:53000".parse().unwrap(),
-                None,
-                Some(engine.refresh_of(old_key)),
-                Some(old_state),
+                engine.refresh_of(old_key),
+                old_state,
             )
             .await
             .expect("complete request from old snapshot");
@@ -2443,12 +2496,11 @@ mod tests {
             std::time::Instant::now(),
         );
         engine
-            .handle_packet_internal(
+            .handle_refresh(
                 &request,
                 "127.0.0.1:53000".parse().unwrap(),
-                None,
-                Some(renewed),
-                None,
+                renewed,
+                engine.state.load_full(),
             )
             .await
             .expect("refreshed");
@@ -2526,7 +2578,7 @@ mod tests {
         ));
         let packet = request.to_vec().unwrap();
         let peer: SocketAddr = "10.0.0.1:53000".parse().unwrap();
-        let Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) =
+        let Some(FastPathResponse::AsyncNeeded(pre_parsed)) =
             engine.handle_packet_fast(&packet, peer)
         else {
             panic!("a miss goes on to the async path");
@@ -2535,8 +2587,7 @@ mod tests {
         engine.reload(config("new"));
         let answer = engine
             .handle_packet_internal_with_pre_parsed(&packet, peer, pre_parsed)
-            .await
-            .expect("answered");
+            .await;
         let answer = Message::from_bytes(&answer).expect("parse answer");
         assert!(matches!(
             answer.answers.first().map(|record| &record.data),
@@ -2582,10 +2633,15 @@ mod tests {
         // 重载只改跳转目标：入口 pipeline 的规则没变 / The reload changes only the jump target: the
         // entry pipeline's rules stay as they were
         engine.reload(jump_config(&upstream.address, "192.0.2.2"));
+        let pre_parsed = PreParsedData {
+            head: engine
+                .read_request(&request, peer.ip(), &old_state.pipeline)
+                .expect("a query"),
+            state: old_state,
+        };
         let response = engine
-            .handle_packet_internal(&request, peer, None, None, Some(old_state))
-            .await
-            .expect("complete forwarded request with response jump");
+            .handle_packet_internal_with_pre_parsed(&request, peer, pre_parsed)
+            .await;
         // The jump must execute the target pipeline of the request snapshot
         // (192.0.2.1), not the reloaded one (192.0.2.2).
         assert_eq!(
@@ -3055,7 +3111,7 @@ mod tests {
 
     /// 应答里的第一个 A 记录，请求必须得到了应答 / The first A record in the reply a request
     /// must have got
-    fn first_a_record(response: anyhow::Result<Bytes>) -> Option<std::net::Ipv4Addr> {
+    fn first_a_record(response: Result<Bytes, UnreadableQuery>) -> Option<std::net::Ipv4Addr> {
         support::first_a(&response.expect("answer"))
     }
 
@@ -3594,12 +3650,11 @@ mod tests {
 
         let refreshed = tokio::time::timeout(
             Duration::from_secs(5),
-            engine.handle_packet_internal(
+            engine.handle_refresh(
                 &example_query(),
                 "10.0.0.1:53000".parse().unwrap(),
-                None,
-                Some(engine.refresh_of(key)),
-                None,
+                engine.refresh_of(key),
+                engine.state.load_full(),
             ),
         )
         .await
@@ -4056,8 +4111,7 @@ mod tests {
             edns.set_version(version);
             request.edns = Some(edns);
             let packet = request.to_vec().unwrap();
-            let Ok(Some(FastPathResponse::Direct(reply))) =
-                engine.handle_packet_fast(&packet, peer)
+            let Some(FastPathResponse::Direct(reply)) = engine.handle_packet_fast(&packet, peer)
             else {
                 panic!("version {version}: answered on the fast path");
             };
@@ -4114,7 +4168,7 @@ mod tests {
                 packet.extend_from_slice(trailing);
                 let case = format!("{label:?} + {trailing:?}, version {version}");
                 assert!(
-                    matches!(engine.handle_packet_fast(&packet, peer), Ok(None)),
+                    engine.handle_packet_fast(&packet, peer).is_none(),
                     "{case}: the fast parser leaves it to the full path"
                 );
                 let reply = engine.handle_packet(&packet, peer).await.expect(&case);
@@ -4165,10 +4219,7 @@ mod tests {
                 qtype,
             ));
 
-            let response = match engine
-                .handle_packet_fast(&request.to_vec().unwrap(), peer)
-                .expect("fast path")
-            {
+            let response = match engine.handle_packet_fast(&request.to_vec().unwrap(), peer) {
                 Some(FastPathResponse::Direct(bytes)) => Message::from_bytes(&bytes).unwrap(),
                 other => panic!("expected direct fast-path response, got {other:?}"),
             };
@@ -4230,10 +4281,7 @@ mod tests {
             RecordType::A,
         ));
 
-        let response = match engine
-            .handle_packet_fast(&request.to_vec().unwrap(), peer)
-            .expect("fast path")
-        {
+        let response = match engine.handle_packet_fast(&request.to_vec().unwrap(), peer) {
             Some(FastPathResponse::Direct(bytes)) => Message::from_bytes(&bytes).unwrap(),
             other => panic!("expected direct fast-path response, got {other:?}"),
         };
@@ -4540,7 +4588,7 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:5300".parse().expect("peer");
         let packet = query_for("a.test");
         let full = engine.handle_packet(&packet, peer);
-        let Ok(Some(FastPathResponse::AsyncNeeded(pre_parsed))) =
+        let Some(FastPathResponse::AsyncNeeded(pre_parsed)) =
             engine.handle_packet_fast(&packet, peer)
         else {
             panic!("the fast path leaves a forward to the async path");
@@ -4954,7 +5002,7 @@ mod tests {
         packet.extend_from_slice(b"\x06expire\x03com\x00\x00\x01\x00\x01");
 
         let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let fast_res = engine.handle_packet_fast(&packet, peer).unwrap();
+        let fast_res = engine.handle_packet_fast(&packet, peer);
 
         // Assert: Expired cache should NOT be served — should fall through to AsyncNeeded
         // (None means parse_quick failed; AsyncNeeded means "parsed OK, need upstream query")
@@ -5091,9 +5139,7 @@ mod tests {
 
         let packet = stale_com_query();
         let peer = "127.0.0.1:12345".parse().unwrap();
-        engine
-            .handle_packet_fast(&packet, peer)
-            .expect("parse query");
+        engine.handle_packet_fast(&packet, peer);
 
         assert!(
             engine.cached(dedupe_hash).is_some(),
@@ -5550,8 +5596,7 @@ mod tests {
                 qtype,
             ));
             let packet = query.to_vec().unwrap();
-            let Ok(Some(FastPathResponse::Direct(reply))) =
-                engine.handle_packet_fast(&packet, peer)
+            let Some(FastPathResponse::Direct(reply)) = engine.handle_packet_fast(&packet, peer)
             else {
                 panic!("{name} is answered on the spot");
             };
@@ -5686,7 +5731,7 @@ mod tests {
             (None, true, false),
         ] {
             put_rule_answer(&engine, None, rules, decided_by_rule);
-            let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+            let answered = engine.handle_packet_fast(&ip_test_query(), peer);
             assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
             let (seen, decided) = observer.0.lock().unwrap().pop().unwrap();
             assert_eq!(decided, expected, "{rules:?}");
@@ -5703,13 +5748,13 @@ mod tests {
         let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
         let expired = Some(Instant::now() - Duration::from_secs(1));
         let key = put_rule_answer(&engine, expired, Some(&["block"]), true);
-        let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+        let answered = engine.handle_packet_fast(&ip_test_query(), peer);
         assert!(matches!(answered, Some(FastPathResponse::AsyncNeeded(_))));
         assert!(engine.rule_cache.get(key).is_some());
 
         let valid = Some(Instant::now() + Duration::from_secs(60));
         let key = put_rule_answer(&engine, valid, Some(&["block"]), true);
-        let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+        let answered = engine.handle_packet_fast(&ip_test_query(), peer);
         assert!(matches!(answered, Some(FastPathResponse::Direct(_))));
         assert!(engine.rule_cache.get(key).is_some());
     }
@@ -5725,7 +5770,7 @@ mod tests {
         let mut record = engine.rule_cache.get(key).unwrap();
         Arc::make_mut(&mut record).entry.qname = "other.test".as_bytes().into();
         engine.rule_cache.insert(key, record);
-        let answered = engine.handle_packet_fast(&ip_test_query(), peer).unwrap();
+        let answered = engine.handle_packet_fast(&ip_test_query(), peer);
         assert!(matches!(answered, Some(FastPathResponse::AsyncNeeded(_))));
     }
 
@@ -5782,11 +5827,11 @@ mod tests {
         let mut packet = stale_com_query();
         packet[2] = 0x01;
         let peer = SocketAddr::from(([10, 0, 0, 1], 53000));
-        let Ok(Some(FastPathResponse::CacheHit {
+        let Some(FastPathResponse::CacheHit {
             cached,
             tx_id,
             elapsed_secs,
-        })) = engine.handle_packet_fast(&packet, peer)
+        }) = engine.handle_packet_fast(&packet, peer)
         else {
             panic!("a fresh answer in the cache is a fast-path hit");
         };
@@ -6098,12 +6143,11 @@ mod tests {
     async fn refresh(engine: &Engine, cache_hash: u64) -> anyhow::Result<Bytes> {
         let peer = "127.0.0.1:12345".parse().unwrap();
         engine
-            .handle_packet_internal(
+            .handle_refresh(
                 &stale_com_query(),
                 peer,
-                None,
-                Some(engine.refresh_of(cache_hash)),
-                None,
+                engine.refresh_of(cache_hash),
+                engine.state.load_full(),
             )
             .await
     }
@@ -7890,7 +7934,7 @@ mod requester_scope_tests {
 
     /// 应答里的第一个 A 记录，请求必须得到了应答 / The first A record in the reply a request
     /// must have got
-    fn first_a(response: anyhow::Result<Bytes>) -> Option<Ipv4Addr> {
+    fn first_a(response: Result<Bytes, UnreadableQuery>) -> Option<Ipv4Addr> {
         support::first_a(&response.expect("answer"))
     }
 
@@ -8247,7 +8291,7 @@ mod requester_scope_tests {
         // 快速路径查的是同一个键 / The fast path looks up the same key
         for (client, expected) in [("10.0.0.1", SINK), ("10.0.0.2", NORMAL)] {
             let peer: SocketAddr = format!("{client}:53000").parse().unwrap();
-            let Ok(Some(FastPathResponse::CacheHit { cached, .. })) =
+            let Some(FastPathResponse::CacheHit { cached, .. }) =
                 engine.handle_packet_fast(&query(false), peer)
             else {
                 panic!("{client}: the fast path must find its own cached answer");
@@ -8784,7 +8828,7 @@ mod requester_scope_tests {
             if fast_path {
                 assert!(matches!(
                     engine.handle_packet_fast(&query(true), peer),
-                    Ok(Some(FastPathResponse::CacheHit { .. }))
+                    Some(FastPathResponse::CacheHit { .. })
                 ));
             } else {
                 assert_eq!(ask(&engine, "10.0.0.1", true).await, Some(OTHER));

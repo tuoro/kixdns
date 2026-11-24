@@ -2368,12 +2368,11 @@ mod refresh_failure_reply_tests {
         let client: SocketAddr = CLIENT.parse().unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
-            engine.handle_packet_internal(
+            engine.handle_refresh(
                 &query().to_vec().unwrap(),
                 client,
-                None,
-                Some(engine.refresh_of(key)),
-                Some(state),
+                engine.refresh_of(key),
+                state,
             ),
         )
         .await

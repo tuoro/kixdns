@@ -712,16 +712,19 @@ async fn a_refresh_is_asked_for_nobody() {
                 .map(|n| {
                     let engine = Arc::clone(&engine);
                     let packet = query(&format!("n{n}.{zone}"));
-                    let refresh = refresh.then(|| engine.refresh_of(0));
                     tokio::spawn(async move {
-                        engine
-                            .handle_packet_internal(&packet, device, None, refresh, None)
-                            .await
+                        if refresh {
+                            let target = engine.refresh_of(0);
+                            let state = engine.state.load_full();
+                            let _ = engine.handle_refresh(&packet, device, target, state).await;
+                        } else {
+                            let _ = engine.handle_packet(&packet, device).await;
+                        }
                     })
                 })
                 .collect();
             for one in made {
-                let _ = one.await.unwrap();
+                one.await.unwrap();
             }
         }
     };
@@ -961,10 +964,10 @@ async fn a_forward_kept_back_after_a_response_jump_logs_no_warning() {
     );
 }
 
-/// 响应动作里的转发被流控拦下时，这个请求出错（只给自己回 SERVFAIL，见 `Engine::handle_packet_internal`），而不是拿一个
+/// 响应动作里的转发被流控拦下时，这个请求出错（只给自己回 SERVFAIL，见 `Engine::answer`），而不是拿一个
 /// SERVFAIL 当结果交给等着的别的请求：这台设备在这个上游上被拦住以后，替它做的响应动作转发交回的是流控的失败
 /// With a forward among the response actions kept back by flow control the request fails
-/// (answering SERVFAIL to itself alone, see `Engine::handle_packet_internal`), instead of a
+/// (answering SERVFAIL to itself alone, see `Engine::answer`), instead of a
 /// SERVFAIL being taken as the outcome and handed to the other requests waiting: once the
 /// device is held back from the upstream, a response action's forward made for it gives back
 /// flow control's failure

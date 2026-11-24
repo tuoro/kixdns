@@ -19,6 +19,8 @@ pub struct QuickQuery<'a> {
     /// 问题之外还决定应答的查询位（见 [`QueryFlags`]）/ The query bits besides the question that
     /// decide the answer (see [`QueryFlags`])
     pub flags: QueryFlags,
+    /// 问题段在哪里结束 / Where the question section ends
+    pub question_end: usize,
 }
 
 /// 问题之外还决定应答的查询位：RD（要求递归）、CD（不做验证，RFC 4035 第 3.2.2 节）和 EDNS 的 DO
@@ -230,6 +232,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
     let qclass = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
     pos += 4;
+    let question_end = pos;
 
     // 5. Validate every declared Additional record and detect EDNS.
     // Fail closed before cache/static fast paths on any malformed wire structure.
@@ -292,6 +295,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         edns_version,
         client_subnet,
         flags: QueryFlags::new(packet[2] & 0x01 != 0, packet[3] & 0x10 != 0, dnssec_ok),
+        question_end,
     })
 }
 
@@ -418,16 +422,14 @@ pub(crate) fn edns_version(packet: &[u8]) -> Option<u8> {
 }
 
 /// 请求的 EDNS 版本不受支持时的回答（RFC 6891 第 6.1.3 节）：RCODE 为 BADVERS（16：头部写低 4 位的
-/// 0，OPT 里的扩展 RCODE 写 1），OPT 写 KixDNS 支持的版本 0，问题段照抄。请求读不出问题段时为 None。
+/// 0，OPT 里的扩展 RCODE 写 1），OPT 写 KixDNS 支持的版本 0，问题段照抄。`question_end` 是读请求时
+/// 得出的问题段结束位置（见 [`QuickQuery::question_end`]）。
 /// The answer when the request's EDNS version is not supported (RFC 6891 section 6.1.3):
 /// RCODE BADVERS (16: 0 in the header's low 4 bits, extended RCODE 1 in the OPT), an OPT
-/// carrying version 0, the one KixDNS supports, and the question copied. None when the
-/// question cannot be read.
-pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
-    let question_end = strict_name_end(query, 12)?.checked_add(4)?;
-    if question_end > query.len() {
-        return None;
-    }
+/// carrying version 0, the one KixDNS supports, and the question copied. `question_end` is
+/// where the question section ends, found as the request was read (see
+/// [`QuickQuery::question_end`]).
+pub fn badvers_response(query: &[u8], question_end: usize) -> Bytes {
     let mut out = Vec::with_capacity(question_end + 11);
     out.extend_from_slice(&query[..2]);
     // QR、操作码 QUERY，照抄 RD；RA，照抄 CD / QR, opcode QUERY, RD copied; RA, CD copied
@@ -438,7 +440,7 @@ pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
     out.extend_from_slice(&query[12..question_end]);
     // 扩展 RCODE 1 / Extended RCODE 1
     push_opt(&mut out, 1, false, &[]);
-    Some(Bytes::from(out))
+    Bytes::from(out)
 }
 
 /// Whether `response` answers `query`. RFC 1035 section 4.1.1: a reply has QR set
@@ -3394,7 +3396,7 @@ mod tests {
         let plain_query = edns_message(Query, None);
         let edns_query = edns_message(Query, Some(true));
         // BADVERS: extended RCODE 1 in the OPT / BADVERS：OPT 里的扩展 RCODE 为 1
-        let badvers = badvers_response(&edns_query).unwrap();
+        let badvers = badvers_response(&edns_query, question_name_end(&edns_query).unwrap() + 4);
         assert_eq!(edns_as_asked(badvers.clone(), &plain_query), badvers);
         let signed_with_opt = signed(edns_message(Response, Some(false)));
         assert_eq!(

@@ -39,7 +39,7 @@ async fn a_question_name_pointing_into_the_header_is_not_forwarded() {
     for target in [0, 2, 11] {
         let packet = pointing_at(target);
         assert!(
-            matches!(engine.handle_packet_fast(&packet, peer()), Ok(None)),
+            engine.handle_packet_fast(&packet, peer()).is_none(),
             "pointer to {target}: the fast path does not read it"
         );
         let full = tokio::time::timeout(

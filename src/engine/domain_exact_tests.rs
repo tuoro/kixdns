@@ -58,10 +58,7 @@ async fn full_path(engine: &Engine, packet: &[u8]) -> Option<Ipv4Addr> {
 /// byte, which the fast path leaves to the full one
 async fn both_paths(engine: &Engine, name: &str) -> [Option<Ipv4Addr>; 2] {
     let packet = query(name, b"");
-    let fast = match engine
-        .handle_packet_fast(&packet, peer())
-        .expect("fast path")
-    {
+    let fast = match engine.handle_packet_fast(&packet, peer()) {
         Some(crate::engine::FastPathResponse::Direct(reply)) => first_a(&reply),
         other => panic!("a static answer is direct, got {other:?}"),
     };

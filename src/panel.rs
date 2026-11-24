@@ -2150,7 +2150,10 @@ async fn run_diagnostic(
                 );
             }
         };
-    let response = match result.and_then(|bytes| Message::from_vec(&bytes).map_err(Into::into)) {
+    let response = match result
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| Message::from_vec(&bytes).map_err(Into::into))
+    {
         Ok(response) => response,
         Err(error) => {
             return (
@@ -4932,9 +4935,7 @@ mod diagnostic_tests {
             hickory_proto::rr::RecordType::A,
         ));
         assert!(matches!(
-            engine
-                .handle_packet_fast(&query.to_vec().unwrap(), peer)
-                .unwrap(),
+            engine.handle_packet_fast(&query.to_vec().unwrap(), peer),
             Some(FastPathResponse::Direct(_))
         ));
         assert_eq!(metrics.requests_total.load(Ordering::Relaxed), 1);
@@ -4992,7 +4993,7 @@ mod diagnostic_tests {
         let query = query.to_vec().unwrap();
         engine.handle_packet(&query, peer).await.unwrap();
         assert!(matches!(
-            engine.handle_packet_fast(&query, peer).unwrap(),
+            engine.handle_packet_fast(&query, peer),
             Some(FastPathResponse::CacheHit { .. })
         ));
         assert_eq!(metrics.requests_total.load(Ordering::Relaxed), 2);
@@ -5037,7 +5038,7 @@ mod diagnostic_tests {
         use crate::engine::FastPathResponse;
 
         let peer: std::net::SocketAddr = "192.0.2.7:53000".parse().unwrap();
-        let pre_parsed = match engine.handle_packet_fast(packet, peer).unwrap() {
+        let pre_parsed = match engine.handle_packet_fast(packet, peer) {
             Some(FastPathResponse::AsyncNeeded(pre_parsed)) => Some(pre_parsed),
             Some(_) => return,
             None => None,
