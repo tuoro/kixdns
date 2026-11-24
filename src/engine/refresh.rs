@@ -322,12 +322,12 @@ pub fn spawn_background_refresh(
         // 端口无关 — 下游仅消费 .ip()。
         let peer_addr = std::net::SocketAddr::new(requester.address, 53);
 
-        // The refresh renews its entry under the configuration that wrote it. Together with
-        // the original peer_ip, this ensures the background refresh both writes to the
-        // correct cache slot AND injects the correct ECS (RFC 7871).
+        // 刷新照发起它的那次命中 load 的配置快照更新条目。配合原始 peer_ip，确保后台刷新既写入
+        // 正确的缓存槽，又注入正确的 ECS (RFC 7871)。
         //
-        // 刷新照写下条目的那份配置更新它。配合原始 peer_ip，确保后台刷新既写入正确的缓存槽，
-        // 又注入正确的 ECS (RFC 7871)。
+        // The refresh renews its entry under the configuration snapshot the hit that started it
+        // loaded. Together with the original peer_ip, this ensures the background refresh both
+        // writes to the correct cache slot AND injects the correct ECS (RFC 7871).
         let result = engine
             .handle_refresh(&packet, peer_addr, target, state)
             .await;
