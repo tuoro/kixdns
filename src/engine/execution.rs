@@ -792,7 +792,7 @@ impl Engine {
             // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
             let cache_namespace = state.cache_namespace(pipeline_id);
             let requester_key = pipeline.map_or(RequesterKey::NONE, |p| {
-                p.requester.key(requester, Some(&self.geoip_manager))
+                p.requester.key(requester, &self.geoip_manager)
             });
             let slot = Self::cache_slot(
                 cache_namespace,
@@ -2109,8 +2109,7 @@ impl Route {
         let keys = request.keys(
             pipeline_id,
             &pipeline.map_or(RequesterKey::NONE, |p| {
-                p.requester
-                    .key(request.requester, Some(&engine.geoip_manager))
+                p.requester.key(request.requester, &engine.geoip_manager)
             }),
         );
         Self {
@@ -2167,8 +2166,7 @@ impl Route {
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
             &p.id,
-            &p.requester
-                .key(request.requester, Some(&engine.geoip_manager)),
+            &p.requester.key(request.requester, &engine.geoip_manager),
         );
         true
     }
