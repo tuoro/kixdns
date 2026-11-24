@@ -14,10 +14,7 @@ use crate::cache_store::{CacheStore, Op};
 use crate::ecs_scope::EcsView;
 use crate::engine::refresh::RefreshTarget;
 use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::geoip::GeoIpManager;
-use crate::matcher::geosite::GeoSiteManager;
 use crate::observe::{ClientTransport, ConfigLoaded, ConfigReloadFailed, EngineObserver};
-use parking_lot::RwLock;
 
 use super::bootstrap::Bootstrap;
 use super::concurrency::{FlowControlState, PermitManager};
@@ -50,9 +47,10 @@ pub struct Engine {
     pub(crate) running_settings: Arc<crate::config::GlobalSettings>,
     // Serialises reloads so the stored state, the generation and the
     // config_loaded event of one reload cannot interleave with another's. It
-    // also keeps where the Geo data came from, which only a reload changes.
+    // also keeps where the Geo data in the state came from, which only a reload
+    // changes.
     // 串行化重载，使一次重载的状态存储、代数分配与 config_loaded 事件不与另一次交错；
-    // 同时保管 Geo 数据的来源，只有重载会改它。
+    // 同时保管状态里的 Geo 数据的来源，只有重载会改它。
     pub(crate) reload_lock: Arc<Mutex<GeoSources>>,
     // Geo 数据眼下的问题（见 `Engine::geo_data_warnings`）/ What is wrong with the Geo data right
     // now (see `Engine::geo_data_warnings`)
@@ -79,11 +77,6 @@ pub struct Engine {
     pub permit_manager: Arc<PermitManager>,
     // Adaptive flow control state (None when flow control is disabled) / 自适应流控状态（禁用流控时为None）
     pub flow_control_state: Option<Arc<FlowControlState>>,
-    // GeoIP manager for geographic IP-based routing / GeoIP 管理器用于基于地理位置的 IP 路由
-    pub geoip_manager: Arc<RwLock<GeoIpManager>>,
-    // GeoSite manager for domain category-based routing / GeoSite 管理器用于域名分类路由
-    // 使用 RwLock 允许并发读操作，写操作独占 / Uses RwLock for concurrent reads, exclusive writes
-    pub geosite_manager: Arc<RwLock<GeoSiteManager>>,
 }
 
 /// Configures and constructs an [`Engine`]. Obtain one via [`Engine::builder`].
@@ -189,15 +182,9 @@ impl Engine {
         // and kept no longer: its `Cached::outlived` does not look at the store's kept
         let rule_cache = Arc::new(CacheStore::new(10_000, std::time::Duration::ZERO));
 
-        let geoip_manager = Arc::new(RwLock::new(GeoIpManager::default()));
-        let geosite_manager = Arc::new(RwLock::new(GeoSiteManager::default()));
-        let state = Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg)));
-        let geo_sources = GeoSources::load(
-            &state.load_full().pipeline,
-            &geosite_manager,
-            &geoip_manager,
-            &state,
-        );
+        // 状态带着配置用到的 Geo 数据开始 / The state starts with the Geo data the configuration uses
+        let geo_sources = GeoSources::load(EngineInner::new(cfg));
+        let state = geo_sources.state();
 
         let permit_manager = Arc::new(PermitManager::new());
         let flow_control_state = settings.flow_control_enabled.then(|| {
@@ -291,10 +278,6 @@ impl Engine {
             refresh_failures: Arc::default(),
             permit_manager,
             flow_control_state,
-            // GeoIP manager / GeoIP 管理器
-            geoip_manager,
-            // GeoSite manager / GeoSite 管理器
-            geosite_manager,
         })
     }
 

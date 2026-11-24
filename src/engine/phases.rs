@@ -824,7 +824,7 @@ impl<'a> Forwarding<'a> {
                 decision.response_actions_on_match,
                 |msg, answered| {
                     rules::response_matches(
-                        self.engine,
+                        &request.state.geo,
                         decision.response_matchers,
                         &request.facts(),
                         answered,
@@ -993,7 +993,7 @@ impl<'a> Forwarding<'a> {
         response.upstream = Some(Source::Upstream(Arc::clone(&upstream)));
         let matched = checked
             || rules::response_matches(
-                self.engine,
+                &request.state.geo,
                 decision.response_matchers,
                 &request.facts(),
                 &upstream,

@@ -22,15 +22,15 @@ use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_ans
 use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
 
 /// `cfg` 给从 `listener_label` 进来的请求 `facts` 选的 pipeline：第一条命中的 pipeline_select，都不命中时是第一个
-/// pipeline；匹配器要用 Geo 数据时才拿读锁（见 `GeoManagers`）
+/// pipeline；匹配器按 Geo 数据 `geo` 判断（见 `GeoManagers`）
 /// The pipeline `cfg` picks for request `facts` come in at `listener_label`: that of the first
-/// pipeline_select matching, the first pipeline when none does; a matcher read-locks Geo data
-/// only to use it (see `GeoManagers`)
+/// pipeline_select matching, the first pipeline when none does; matchers judge by the Geo data
+/// `geo` (see `GeoManagers`)
 pub fn select_pipeline<'a>(
     cfg: &'a RuntimePipelineConfig,
     listener_label: &str,
     facts: &RequestFacts<'_>,
-    geo: GeoManagers<'_>,
+    geo: &GeoManagers,
 ) -> Option<&'a RuntimePipeline> {
     for rule in &cfg.pipeline_select {
         let matched = eval_match_chain(
@@ -84,15 +84,16 @@ impl<'a> RuleEvaluationContext<'a> {
 }
 
 impl Engine {
-    /// `pipeline` 对请求 `facts` 在规则缓存里的问题，按规则对请求方的判定（见 [`RuleQuestion`]）。规则的决定从不取决于
-    /// ECS：规则缓存的判定只有请求匹配器的那些（见 `RuntimePipeline::rule_requester`），它们只看请求的事实
+    /// `pipeline` 对请求 `facts` 在规则缓存里的问题，按规则对请求方的判定（见 [`RuleQuestion`]），命名空间和判定都按
+    /// 状态 `state`。规则的决定从不取决于 ECS：规则缓存的判定只有请求匹配器的那些（见 `RuntimePipeline::rule_requester`），
+    /// 它们只看请求的事实
     /// The rule cache question of `pipeline` for request `facts`, by how the rules judge the
-    /// requester (see [`RuleQuestion`]). Rule decisions never depend on ECS: the rule cache
-    /// judges by the request matchers alone (see `RuntimePipeline::rule_requester`), which read
-    /// the request's facts and nothing more
+    /// requester (see [`RuleQuestion`]), the namespace and the judgement both by the state
+    /// `state`. Rule decisions never depend on ECS: the rule cache judges by the request
+    /// matchers alone (see `RuntimePipeline::rule_requester`), which read the request's facts
+    /// and nothing more
     pub(crate) fn rule_question<'a>(
-        &self,
-        cache_namespace: u64,
+        state: &EngineInner,
         pipeline: &'a RuntimePipeline,
         facts: &RequestFacts<'a>,
     ) -> RuleQuestion<'a> {
@@ -102,12 +103,12 @@ impl Engine {
             ecs: None,
         };
         RuleQuestion::new(
-            cache_namespace,
+            state.cache_namespace(&pipeline.id),
             &pipeline.id,
             facts.qname,
             facts.qtype,
             facts.qclass,
-            pipeline.rule_requester.key(requester, &self.geoip_manager),
+            pipeline.rule_requester.key(requester, &state.geo.geoip),
         )
     }
 
@@ -165,7 +166,7 @@ impl Engine {
             ..
         } = *request;
         // 1. Check Rule Cache
-        let question = self.rule_question(state.cache_namespace(&pipeline.id), pipeline, facts);
+        let question = Self::rule_question(state, pipeline, facts);
         // Resuming after a continue, this evaluation does not give the pipeline's decision
         // for the name, so it neither reads nor writes the rule cache. A background refresh
         // evaluates the whole pipeline: it does not read the cache but still writes its
@@ -285,7 +286,7 @@ impl Engine {
         let candidate_indices: SmallVec<[usize; 32]> = pipeline.index.get_candidates(qname, qtype);
 
         // 3. Execute Rules
-        let geo = self.geo();
+        let geo = &state.geo;
 
         'rules: for idx in candidate_indices {
             // continue 越过的规则和它之前的都已经求值过 / The rule a continue passed and those
@@ -461,7 +462,7 @@ impl Engine {
 pub(crate) fn fast_static_match<'a>(
     pipeline: &'a RuntimePipeline,
     facts: &RequestFacts<'_>,
-    geo: GeoManagers<'_>,
+    geo: &GeoManagers,
 ) -> Option<(&'a PrecomputedAction, &'a str)> {
     let last = pipeline.last_precomputed?;
     let candidates = pipeline.index.get_candidates(facts.qname, facts.qtype);
