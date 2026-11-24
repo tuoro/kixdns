@@ -216,9 +216,9 @@ impl std::fmt::Display for ConnectFailed {
 
 impl std::error::Error for ConnectFailed {}
 
-/// 建一条连接最多花多久（解析名字、TCP 或 QUIC 握手、TLS 握手）/ The most a connect may take
-/// (resolving the name, the TCP or QUIC handshake, the TLS one)
-const CONNECT_BUDGET: Duration = Duration::from_secs(5);
+/// 建一条连接最多花多久（解析名字、TCP 或 QUIC 握手、TLS 握手），经 reqwest 的 DoH 也是 / The most a connect may
+/// take (resolving the name, the TCP or QUIC handshake, the TLS one), DoH through reqwest's too
+pub(super) const CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// 建连第一次失败以后退避多久 / How long to back off after a first failed connect
 pub(super) const CONNECT_BACKOFF: Duration = Duration::from_millis(250);
 /// 建连接连失败时退避最多多久 / The longest backing off after failed connects in a row

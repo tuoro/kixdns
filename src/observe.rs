@@ -887,7 +887,10 @@ impl EngineObserver for TracingObserver {
                 .rcode
                 .map(|rcode| tracing::field::display(rcode_name(rcode.into()))),
             truncated = event.truncated,
-            error = event.error.map(tracing::field::display),
+            // 连同原因链，和别处记的上游错误一样；字段只在这条日志开着时才求值
+            // With its cause chain, as upstream errors are logged elsewhere; the field is worked
+            // out only while this event is enabled
+            error = event.error.map(|e| tracing::field::display(format!("{e:#}"))),
             "upstream result"
         );
     }
@@ -931,13 +934,13 @@ mod tests {
     use super::*;
 
     /// 参考观察者的日志里，请求的响应码连同 OPT 里的高位：BADVERS 的头部低 4 位是 0，只看头部就记成 NOERROR；决定的
-    /// 内容各成一个字段，响应码写助记名（NXDOMAIN），不是 hickory 的 Debug（`NXDomain`）
+    /// 内容各成一个字段，响应码写助记名（NXDOMAIN），不是 hickory 的 Debug（`NXDomain`）；上游的错误连同原因链
     /// The reference observer logs a request's response code with the high bits from the OPT:
     /// BADVERS has 0 in the header's low four bits, and the header alone logs it as NOERROR; what
     /// a decision decides goes in fields of its own, the response code as its mnemonic
-    /// (NXDOMAIN), not hickory's Debug (`NXDomain`)
+    /// (NXDOMAIN), not hickory's Debug (`NXDomain`); an upstream's error with its cause chain
     #[test]
-    fn the_observer_log_names_the_whole_response_code() {
+    fn the_observer_log_names_the_whole_response_code_and_error() {
         use hickory_proto::op::{Message, MessageType, OpCode, Query};
         use hickory_proto::rr::Name;
         use tracing_subscriber::layer::SubscriberExt;
@@ -1004,12 +1007,29 @@ mod tests {
                     },
                 },
             );
+            TracingObserver.upstream_result(
+                &ctx,
+                &UpstreamResult {
+                    upstream: "1.1.1.1:53",
+                    transport: Transport::Udp,
+                    via: Transport::Tcp,
+                    outcome: UpstreamOutcome::Error,
+                    latency: Duration::from_millis(3),
+                    rcode: None,
+                    truncated: None,
+                    error: Some(&anyhow::anyhow!("connection refused").context("TCP fallback")),
+                },
+            );
         });
         let output = String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<&str> = output.lines().collect();
-        assert_eq!(lines.len(), 2, "{output}");
+        assert_eq!(lines.len(), 3, "{output}");
         assert!(lines[0].contains(" rcode=BADVERS "), "{output}");
         assert!(lines[1].contains(" rcode=NXDOMAIN answers=0"), "{output}");
+        assert!(
+            lines[2].ends_with(" error=TCP fallback: connection refused"),
+            "{output}"
+        );
     }
 
     #[test]

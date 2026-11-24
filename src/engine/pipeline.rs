@@ -105,9 +105,7 @@ impl Engine {
             qname,
             qtype,
             qclass,
-            pipeline
-                .rule_requester
-                .key(requester, Some(&self.geoip_manager)),
+            pipeline.rule_requester.key(requester, &self.geoip_manager),
         )
     }
 
@@ -426,7 +424,14 @@ impl Engine {
                             });
                         }
                         Action::Log { level } => {
-                            super::rules::log_match(level.as_deref(), &rule.name, qname, client_ip);
+                            super::rules::log_match(
+                                level.as_deref(),
+                                &pipeline.id,
+                                &rule.name,
+                                qname,
+                                qtype,
+                                client_ip,
+                            );
                             *logged = true;
                         }
                         Action::StaticTxtResponse { text, ttl } => {
