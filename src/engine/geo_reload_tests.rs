@@ -1018,13 +1018,14 @@ async fn geo_data_warnings_say_what_is_missing_or_unreadable() {
     assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
-/// 数据文件经符号链接改指到监视不上的地方（目录不存在）以后，Geo 数据的问题里说它在那里监视不上，指回监视得上的地方以后
-/// 这句话去掉，和配置文件的 `watch_error` 一样。说的是这一个文件：别的文件监视得好好的，不会把它去掉
+/// 数据文件经符号链接改指到监视不上的地方（目录不存在）以后，Geo 数据的问题里说它在那里监视不上、改动由下一次热重载读，
+/// 指回监视得上的地方以后这句话去掉，和配置文件的 `watch_error` 一样。说的是这一个文件：别的文件监视得好好的，不会把它
+/// 去掉
 /// Once a data file is pointed, through a symlink, somewhere that cannot be watched (a
-/// directory that does not exist), the Geo data's problems say it cannot be watched there, and
-/// once it points back somewhere watchable the sentence goes, as the configuration file's
-/// `watch_error` does. It speaks of that one file: another file being watched well does not
-/// take it away
+/// directory that does not exist), the Geo data's problems say it cannot be watched there,
+/// changes being read by the next hot reload, and once it points back somewhere watchable the
+/// sentence goes, as the configuration file's `watch_error` does. It speaks of that one file:
+/// another file being watched well does not take it away
 #[cfg(unix)]
 #[tokio::test]
 async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
@@ -1050,10 +1051,7 @@ async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
     assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 
     point_at(&dir.path().join("missing").join("first.dat"));
-    let said = format!(
-        "GeoSite data file {} cannot be watched where it now leads",
-        first.display()
-    );
+    let said = partly_watched("GeoSite data file", &first);
     let unwatched = || {
         engine
             .geo_data_warnings()
@@ -1077,6 +1075,149 @@ async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
     })
     .await;
     assert!(engine.geo().geosite.matches("ads", "x.first.test"));
+}
+
+/// 状态里说 `what` `path` 有位置监视不上的那句话的开头（后面是为什么）/ The start of the status's
+/// sentence saying `what` `path` has places that cannot be watched (why follows)
+#[cfg(unix)]
+fn partly_watched(what: &str, path: &Path) -> String {
+    format!(
+        "{what} {} cannot be watched everywhere it leads, changes there are read at the next configuration reload: ",
+        path.display()
+    )
+}
+
+/// `link` 经符号链接指向 `dir` 下还不存在的目录里的同名文件，给出那个文件 / `link` leads, through a
+/// symlink, to the file of its name in a directory under `dir` not there yet, which is given back
+#[cfg(unix)]
+fn link_into_a_missing_directory(dir: &Path, link: &Path) -> std::path::PathBuf {
+    let target = dir.join("missing").join(link.file_name().unwrap());
+    std::os::unix::fs::symlink(&target, link).unwrap();
+    target
+}
+
+/// 启动时 GeoSite 数据文件经符号链接指向还不存在的目录：链接所在的目录监视得上，目录里的文件出现却看不到。状态里说它
+/// 有位置监视不上、改动由下一次热重载读；目录建好、文件写进去以后，配置不变的热重载读进来，这句话跟着去掉。以前只要链接
+/// 所在的目录监视得上就当监视着：状态只说它不存在，热重载也不读，直到重启
+/// At startup a GeoSite data file leads, through a symlink, into a directory not there yet:
+/// the link's directory is watched, yet the file showing up in that directory is not seen. The
+/// status says it has places that cannot be watched, changes being read by the next hot
+/// reload; once the directory is made and the file written, a hot reload with the
+/// configuration unchanged reads it in, and the sentence goes. It used to count as watched as
+/// long as the link's directory was: the status only said it did not exist, and hot reloads did
+/// not read it either, until a restart
+#[cfg(unix)]
+#[tokio::test]
+async fn a_geosite_file_partly_watched_at_startup_is_read_by_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("conf");
+    std::fs::create_dir(&conf).unwrap();
+    let site = conf.join("geosite.dat");
+    let target = link_into_a_missing_directory(dir.path(), &site);
+    let engine = engine(geosite_config(&[&site], "ads"));
+    let warnings = engine.geo_data_warnings();
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert_eq!(
+        warnings[0],
+        format!("GeoSite data file {} does not exist", site.display())
+    );
+    assert!(
+        warnings[1].starts_with(&partly_watched("GeoSite data file", &site)),
+        "{warnings:?}"
+    );
+
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, geosite_dat(&[("ads", "ads.test")])).unwrap();
+    engine.reload(geosite_config(&[&site], "ads"));
+    assert_eq!(ask(&engine, "x.ads.test").await, Some(MATCHED));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+}
+
+/// GeoIP 数据文件走同一套：启动时经符号链接指向还不存在的目录，状态里说它有位置监视不上；文件出现以后配置不变的热重载
+/// 读进来
+/// The GeoIP data file goes the same way: leading at startup, through a symlink, into a
+/// directory not there yet, it is said to have places that cannot be watched; once the file
+/// shows up a hot reload with the configuration unchanged reads it in
+#[cfg(unix)]
+#[tokio::test]
+async fn a_geoip_file_partly_watched_at_startup_is_read_by_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("conf");
+    std::fs::create_dir(&conf).unwrap();
+    let data = conf.join("geoip.json");
+    let target = link_into_a_missing_directory(dir.path(), &data);
+    let cfg = || {
+        config(
+            json!({ "geoip_dat_path": data.to_str().unwrap() }),
+            json!({ "type": "geoip_country", "country_codes": ["TESTNET"] }),
+        )
+    };
+    let client: SocketAddr = "198.51.100.7:53000".parse().unwrap();
+    let engine = engine(cfg());
+    let warnings = engine.geo_data_warnings();
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert!(
+        warnings[1].starts_with(&partly_watched("GeoIP data file", &data)),
+        "{warnings:?}"
+    );
+    assert_eq!(ask_from(&engine, "a.test", client).await, Some(OTHER));
+
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::write(
+        &target,
+        r#"{"entries":[{"country_code":"TESTNET","ips":["198.51.100.0/24"]}]}"#,
+    )
+    .unwrap();
+    engine.reload(cfg());
+    assert_eq!(ask_from(&engine, "b.test", client).await, Some(MATCHED));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+}
+
+/// 运行中数据文件经符号链接改指到还不存在的目录里：监视报它有位置监视不上，那个目录建好、文件写进去以后，配置不变的热
+/// 重载读进来。以前这时状态里说它监视不上，热重载却当它监视着、不读，新文件直到重启都用不上
+/// A data file pointed while running, through a symlink, into a directory not there yet: the
+/// watch reports it has places that cannot be watched, and once that directory is made and the
+/// file written, a hot reload with the configuration unchanged reads it in. The status used to
+/// say it could not be watched there while hot reloads took it as watched and did not read it,
+/// so the new file went unused until a restart
+#[cfg(unix)]
+#[tokio::test]
+async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_a_reload() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let (conf, good) = (dir.path().join("conf"), dir.path().join("good"));
+    std::fs::create_dir(&conf).unwrap();
+    std::fs::create_dir(&good).unwrap();
+    std::fs::write(
+        good.join("geosite.dat"),
+        geosite_dat(&[("ads", "good.test")]),
+    )
+    .unwrap();
+    let site = conf.join("geosite.dat");
+    symlink(good.join("geosite.dat"), &site).unwrap();
+    let engine = engine(geosite_config(&[&site], "ads"));
+    assert_eq!(ask(&engine, "x.good.test").await, Some(MATCHED));
+
+    let target = dir.path().join("missing").join("geosite.dat");
+    symlink(&target, conf.join("geosite.dat.tmp")).unwrap();
+    std::fs::rename(conf.join("geosite.dat.tmp"), &site).unwrap();
+    let said = partly_watched("GeoSite data file", &site);
+    wait_for(
+        "the status says geosite.dat cannot be watched there",
+        || {
+            engine
+                .geo_data_warnings()
+                .iter()
+                .any(|sentence| sentence.starts_with(&said))
+        },
+    )
+    .await;
+
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, geosite_dat(&[("ads", "later.test")])).unwrap();
+    engine.reload(geosite_config(&[&site], "ads"));
+    assert_eq!(ask(&engine, "x.later.test").await, Some(MATCHED));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
 /// 配置了却不存在、读不了的 Geo 数据文件和 MMDB 记成错误：默认日志级别是 error，记成 warn 的话没开面板时谁也看不到。
