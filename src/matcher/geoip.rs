@@ -1,3 +1,4 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,7 +46,7 @@ pub struct V2RayGeoIPList {
 
 /// 一段连续的地址，两端都含：u32 是 IPv4，u128 是 IPv6
 /// A run of addresses, both ends included: u32 for IPv4, u128 for IPv6
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 struct AddrRange<T> {
     start: T,
     end: T,
@@ -98,12 +99,21 @@ impl<T: Bound> AddrRange<T> {
 struct GeoIpTagIndex {
     ipv4_ranges: Vec<AddrRange<u32>>,
     ipv6_ranges: Vec<AddrRange<u128>>,
+    /// 合并好的网段的指纹，[`Self::finalize`] 时算出：同样的网段不论怎么写、按什么先后写都是这个数（见
+    /// [`GeoIpManager::fingerprints`]）
+    /// The fingerprint of the merged ranges, worked out by [`Self::finalize`]: the same networks
+    /// give this number however and in whatever order they are written (see
+    /// [`GeoIpManager::fingerprints`])
+    fingerprint: u64,
 }
 
 impl GeoIpTagIndex {
     fn finalize(&mut self) {
         AddrRange::merge(&mut self.ipv4_ranges);
         AddrRange::merge(&mut self.ipv6_ranges);
+        let mut hasher = DefaultHasher::new();
+        (&self.ipv4_ranges, &self.ipv6_ranges).hash(&mut hasher);
+        self.fingerprint = hasher.finish();
     }
 
     #[inline]
@@ -162,6 +172,42 @@ impl ParsedGeoIp {
     }
 }
 
+/// 一个 GeoIP 管理器里的数据的指纹：每个标签的网段的，和 MMDB 的（见 [`GeoIpManager::fingerprints`]）
+/// The fingerprints of the data in a GeoIP manager: each tag's networks', and the MMDB's (see
+/// [`GeoIpManager::fingerprints`])
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeoIpFingerprints {
+    tags: FxHashMap<Arc<str>, u64>,
+    mmdb: Option<u64>,
+}
+
+impl GeoIpFingerprints {
+    /// 判断 `tag`（大写）用的数据的指纹，和判断时一样：有 MMDB 时国家代码看 MMDB（见
+    /// [`GeoIpManager::matches_any_tag`]），没有数据时为 None
+    /// The fingerprint of the data `tag` (uppercase) is judged by, as it is judged: with an
+    /// MMDB a country code goes by the MMDB (see [`GeoIpManager::matches_any_tag`]); None
+    /// without data
+    pub fn of(&self, tag: &str) -> Option<u64> {
+        match self.mmdb {
+            Some(mmdb) if is_country_tag(tag) => Some(mmdb),
+            _ => self.tags.get(tag).copied(),
+        }
+    }
+
+    /// 测试用：标签 `tags` 的网段各有这些指纹，没有 MMDB / For tests: the networks of tags `tags`
+    /// with these fingerprints, and no MMDB
+    #[cfg(test)]
+    pub(crate) fn of_tags(tags: &[(&str, u64)]) -> Self {
+        Self {
+            tags: tags
+                .iter()
+                .map(|&(tag, print)| (Arc::from(tag), print))
+                .collect(),
+            mmdb: None,
+        }
+    }
+}
+
 /// 默认的管理器没有 MMDB、也没有标签 / The default manager has no MMDB and no tags
 #[derive(Default)]
 pub struct GeoIpManager {
@@ -186,6 +232,10 @@ pub struct GeoIpManager {
 /// its insert, and grew past a hundred MiB with the distinct addresses asked about.
 struct Mmdb {
     reader: maxminddb::Reader<Vec<u8>>,
+    /// 文件内容的指纹：同样的库再读一遍还是这个数（见 [`GeoIpManager::fingerprints`]）/ The
+    /// fingerprint of the file's content, the same number for the same database read again (see
+    /// [`GeoIpManager::fingerprints`])
+    fingerprint: u64,
     /// 数据记录在文件里的位置 → 国家代码 / A data record's offset in the file → its country code
     countries: FxHashMap<usize, Option<Arc<str>>>,
     /// 读的是哪个文件、读的时候那个文件什么样 / Which file was read, and what it was like then
@@ -214,7 +264,11 @@ impl FileStamp {
 
 impl Mmdb {
     fn open(path: &str, file: FileStamp) -> Result<Self, maxminddb::MaxMindDbError> {
-        let reader = maxminddb::Reader::open_readfile(path)?;
+        let content = std::fs::read(path)?;
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let reader = maxminddb::Reader::from_source(content)?;
         let mut countries = FxHashMap::default();
         if let Err(e) = Self::index(&reader, &mut countries) {
             // 没解到的记录查询时当场解，结果不变 / Records left out are decoded when asked about, with the same result
@@ -222,6 +276,7 @@ impl Mmdb {
         }
         Ok(Self {
             reader,
+            fingerprint,
             countries,
             file,
         })
@@ -334,6 +389,21 @@ impl GeoIpManager {
         Self {
             mmdb: self.mmdb.clone(),
             tag_indexes: FxHashMap::default(),
+        }
+    }
+
+    /// 眼下的数据的指纹：数据真换了样子才变，读它的 pipeline 跟着换缓存命名空间（见 `engine::geo::GeoGeneration`）
+    /// The fingerprints of the data right now, changing only once the data really changes, and
+    /// the pipelines reading it move to a new cache namespace with them (see
+    /// `engine::geo::GeoGeneration`)
+    pub fn fingerprints(&self) -> GeoIpFingerprints {
+        GeoIpFingerprints {
+            tags: self
+                .tag_indexes
+                .iter()
+                .map(|(tag, index)| (Arc::clone(tag), index.fingerprint))
+                .collect(),
+            mmdb: self.mmdb.as_ref().map(|mmdb| mmdb.fingerprint),
         }
     }
 
@@ -1175,6 +1245,7 @@ mod tests {
                     end: u128::MAX - 6,
                 },
             ],
+            fingerprint: 0,
         };
         index.finalize();
         assert_eq!(
@@ -1208,6 +1279,7 @@ mod tests {
                 AddrRange { start: 45, end: 70 },
                 AddrRange { start: 40, end: 55 },
             ],
+            fingerprint: 0,
         };
         index.finalize();
         assert_eq!(index.range_count(), 2);

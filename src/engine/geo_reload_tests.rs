@@ -480,11 +480,11 @@ async fn a_hot_reload_reads_an_mmdb_replaced_in_place() {
     assert_eq!(ask_from(&engine, "after.test", client).await, Some(MATCHED));
 }
 
-/// 存在却读不了的 MMDB，文件不换就不再读：别的配置改了的热重载不让 GeoIP 数据换代，用到它的 pipeline 留着缓存；换成读得
+/// 存在却读不了的 MMDB，文件不换就不再读：别的配置改了的热重载不动 GeoIP 数据的指纹，用到它的 pipeline 留着缓存；换成读得
 /// 了的，下一次热重载就读进来。在用的库被换成读不了的，那一次热重载读它、留着在用的，之后也不再读。以前读不了的和不存在的
 /// 一样记成缺着的，文件又在，每次热重载都重读一遍、换一代，等于清掉这些 pipeline 的缓存
 /// An MMDB that is there yet cannot be read is not read again until the file changes: a hot
-/// reload changing other parts of the configuration leaves the GeoIP data's generation, and
+/// reload changing other parts of the configuration leaves the GeoIP data's fingerprints, and
 /// the caches of the pipelines using it, alone; once it is replaced by a readable one, the next
 /// hot reload reads it in. When the database in use is replaced by an unreadable one, that one
 /// hot reload reads it and keeps the database in use, and later ones do not read it again. An
@@ -505,7 +505,7 @@ async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
         cfg.settings.default_upstream = upstream.to_string();
         cfg
     };
-    let generation = |engine: &Engine| engine.reload_lock.lock().generation().ip;
+    let generation = |engine: &Engine| engine.reload_lock.lock().generation();
     let client: SocketAddr = "198.51.100.7:53000".parse().unwrap();
     let engine = engine(cfg("127.0.0.1:9"));
     let unreadable = generation(&engine);
@@ -518,7 +518,7 @@ async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
     std::fs::write(&source, entries).unwrap();
     crate::matcher::geoip_converter::convert_dat_to_mmdb(&source, &mmdb, None).unwrap();
     engine.reload(cfg("127.0.0.1:9"));
-    assert!(generation(&engine) > unreadable, "a readable database");
+    assert_ne!(generation(&engine), unreadable, "a readable database");
     assert_eq!(ask_from(&engine, "a.test", client).await, Some(MATCHED));
 
     replace(&mmdb, b"broken again");

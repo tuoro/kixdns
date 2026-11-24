@@ -347,7 +347,7 @@ impl EngineInner {
             hasher.finish()
         };
         Self {
-            cache_namespaces: with_geo(&cfg, &config_namespaces, geo),
+            cache_namespaces: with_geo(&cfg, &config_namespaces, &geo),
             config_namespaces,
             geo,
             no_pipeline_namespace,
@@ -360,7 +360,7 @@ impl EngineInner {
     /// Moves the namespaces to Geo data generation `geo` in place (see [`Self::at_geo`]),
     /// for a new state not stored yet
     pub(crate) fn set_geo(&mut self, geo: GeoGeneration) {
-        self.cache_namespaces = with_geo(&self.pipeline, &self.config_namespaces, geo);
+        self.cache_namespaces = with_geo(&self.pipeline, &self.config_namespaces, &geo);
         self.geo = geo;
     }
 
@@ -380,7 +380,7 @@ impl EngineInner {
             return Arc::clone(self);
         }
         Arc::new(Self {
-            cache_namespaces: with_geo(&self.pipeline, &self.config_namespaces, geo),
+            cache_namespaces: with_geo(&self.pipeline, &self.config_namespaces, &geo),
             config_namespaces: self.config_namespaces.clone(),
             geo,
             no_pipeline_namespace: self.no_pipeline_namespace,
@@ -398,12 +398,12 @@ impl EngineInner {
     }
 }
 
-/// 配置指纹加上各 pipeline 用到的 Geo 数据的代数 / The configuration fingerprints combined with the
-/// generations of the Geo data each pipeline uses
+/// 配置指纹加上各 pipeline 读的 Geo 标签的数据的指纹 / The configuration fingerprints combined with
+/// the fingerprints of the data of the Geo tags each pipeline reads
 fn with_geo(
     cfg: &RuntimePipelineConfig,
     config_namespaces: &FxHashMap<Arc<str>, u64>,
-    geo: GeoGeneration,
+    geo: &GeoGeneration,
 ) -> FxHashMap<Arc<str>, u64> {
     cfg.pipelines
         .iter()
@@ -412,15 +412,13 @@ fn with_geo(
                 .get(&pipeline.id)
                 .copied()
                 .unwrap_or_default();
-            let uses = pipeline.geo_data;
-            let namespace = if uses.site || uses.ip {
+            let namespace = if pipeline.geo_data.is_empty() {
+                base
+            } else {
                 let mut hasher = DefaultHasher::new();
                 base.hash(&mut hasher);
-                uses.site.then_some(geo.site).hash(&mut hasher);
-                uses.ip.then_some(geo.ip).hash(&mut hasher);
+                geo.hash_into(&pipeline.geo_data, &mut hasher);
                 hasher.finish()
-            } else {
-                base
             };
             (pipeline.id.clone(), namespace)
         })

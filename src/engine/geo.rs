@@ -4,10 +4,10 @@
 //! hot reload loads it again, and moves the file watches to the new files, only when the part
 //! of the configuration that decides what is loaded changed.
 
+use std::hash::{Hash, Hasher};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use tracing::{error, info, warn};
@@ -15,11 +15,12 @@ use tracing::{error, info, warn};
 use super::Engine;
 use super::types::EngineInner;
 use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
-use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::geoip::{FileStamp, GeoIpManager, is_country_tag};
+use crate::matcher::geoip::{FileStamp, GeoIpFingerprints, GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, Swapped, parsed_provides_any};
+use crate::matcher::{GeoData, RuntimePipelineConfig};
 use crate::watcher::{FileWatch, PendingWatch};
 use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
 #[derive(Debug, PartialEq, Eq)]
@@ -116,53 +117,77 @@ impl Unwatched {
     }
 }
 
-/// 两种 Geo 数据各自换过几次：缓存命名空间算上它，数据一换，用到它的 pipeline 就换命名空间（见
-/// `EngineInner::at_geo`）
-/// How many times each kind of Geo data has been swapped: cache namespaces take it in, so
-/// once the data is swapped the pipelines that use it move to a new namespace (see
-/// `EngineInner::at_geo`)
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// 两个管理器里每个标签的数据现在的指纹（见 `TagMatchers::fingerprint`、[`GeoIpFingerprints`]）。缓存命名空间算上
+/// pipeline 读的那几个标签的（见 `EngineInner::at_geo`）：一个标签的数据真换了样子，读它的 pipeline 换命名空间；别的标签
+/// 换了、同一份数据又读了一遍（热重载多用了一个标签、监视到文件被重写了一遍），这些 pipeline 都留着缓存
+/// The fingerprint of each tag's data in the two managers right now (see
+/// `TagMatchers::fingerprint` and [`GeoIpFingerprints`]). Cache namespaces take in those of the
+/// tags a pipeline reads (see `EngineInner::at_geo`): once a tag's data really changes, the
+/// pipelines reading it move to a new namespace; with other tags changing, or the same data
+/// read again (a hot reload using one tag more, a watched file written over the same), those
+/// pipelines keep their caches
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GeoGeneration {
-    pub(crate) site: u64,
-    pub(crate) ip: u64,
+    site: FxHashMap<String, u64>,
+    ip: GeoIpFingerprints,
 }
 
-/// 数据换进管理器以后，代数加一，引擎状态换成这一代的命名空间
-/// After data is swapped into a manager, its generation goes up by one and the engine
-/// state moves to that generation's namespaces
+impl GeoGeneration {
+    /// `uses` 里的标签各自的数据的指纹，没有数据的算 None，写进 `hasher` / The fingerprints of the
+    /// data of each tag of `uses`, None for one without data, written into `hasher`
+    pub(crate) fn hash_into(&self, uses: &GeoData, hasher: &mut impl Hasher) {
+        for tag in &uses.site {
+            self.site.get(&**tag).hash(hasher);
+        }
+        for tag in &uses.ip {
+            self.ip.of(tag).hash(hasher);
+        }
+    }
+
+    /// 测试用：GeoSite 标签 `site` 和 GeoIP 标签 `ip` 的数据各有这些指纹 / For tests: the data of
+    /// GeoSite tags `site` and GeoIP tags `ip` with these fingerprints
+    #[cfg(test)]
+    pub(crate) fn of_tags(site: &[(&str, u64)], ip: &[(&str, u64)]) -> Self {
+        Self {
+            site: site
+                .iter()
+                .map(|&(tag, print)| (tag.to_owned(), print))
+                .collect(),
+            ip: GeoIpFingerprints::of_tags(ip),
+        }
+    }
+}
+
+/// 数据换进管理器以后，引擎状态换成按新指纹算的命名空间
+/// After data is swapped into a manager, the engine state moves to the namespaces of the new
+/// fingerprints
 #[derive(Clone)]
 struct Rotation {
-    site: Arc<AtomicU64>,
-    ip: Arc<AtomicU64>,
+    geosite: Arc<RwLock<GeoSiteManager>>,
+    geoip: Arc<RwLock<GeoIpManager>>,
     state: Arc<ArcSwap<EngineInner>>,
 }
 
 impl Rotation {
     fn generation(&self) -> GeoGeneration {
         GeoGeneration {
-            site: self.site.load(Ordering::SeqCst),
-            ip: self.ip.load(Ordering::SeqCst),
+            site: self.geosite.read().fingerprints(),
+            ip: self.geoip.read().fingerprints(),
         }
     }
 
-    /// `counter` 那种数据刚换进管理器 / The data `counter` counts was just swapped into its manager
-    fn swapped(&self, counter: &AtomicU64) {
-        // 数据先换、代数后加：拿到新命名空间的请求读到的一定是新数据。换状态用 rcu，同时有配置重载存进新状态时重来一遍，
-        // 不会把它盖回去；重载那边存的时候也读一遍代数（见 `Engine::apply_config`）
-        // The data first, the generation after: a request that gets the new namespace
-        // reads the new data. The state is swapped with rcu, which starts over when a
-        // configuration reload stores a new state meanwhile instead of overwriting it; the
-        // reload reads the generation as it stores too (see `Engine::apply_config`)
-        counter.fetch_add(1, Ordering::SeqCst);
+    /// 数据刚换进管理器 / Data was just swapped into a manager
+    fn swapped(&self) {
+        // 数据先换、指纹后读：拿到新命名空间的请求读到的一定是新数据。换状态用 rcu，同时有配置重载、或者另一种数据换了、
+        // 存进新状态时重来一遍，重读一遍指纹，不会把它盖回去；重载那边存的时候也读一遍指纹（见 `Engine::apply_config`）。
+        // 指纹都没变时状态原样不动
+        // The data first, the fingerprints after: a request that gets the new namespace reads
+        // the new data. The state is swapped with rcu, which starts over, reading the
+        // fingerprints again, when a configuration reload or the other kind of data stores a
+        // new state meanwhile instead of overwriting it; the reload reads the fingerprints as
+        // it stores too (see `Engine::apply_config`). With no fingerprint changed the state
+        // stays as it is
         self.state.rcu(|state| state.at_geo(self.generation()));
-    }
-
-    fn site_swapped(&self) {
-        self.swapped(&self.site);
-    }
-
-    fn ip_swapped(&self) {
-        self.swapped(&self.ip);
     }
 }
 
@@ -317,9 +342,9 @@ pub(crate) struct GeoSources {
 }
 
 impl GeoSources {
-    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件；数据每换一次，`state` 换成新一代的命名空间
+    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件；数据每换一次，`state` 换成按新指纹算的命名空间
     /// Loads the Geo data `cfg` uses into the two managers and watches its files; every
-    /// time the data is swapped, `state` moves to the new generation's namespaces
+    /// time the data is swapped, `state` moves to the namespaces of the new fingerprints
     pub(crate) fn load(
         cfg: &RuntimePipelineConfig,
         geosite: &Arc<RwLock<GeoSiteManager>>,
@@ -327,8 +352,8 @@ impl GeoSources {
         state: &Arc<ArcSwap<EngineInner>>,
     ) -> Self {
         let rotation = Rotation {
-            site: Arc::default(),
-            ip: Arc::default(),
+            geosite: Arc::clone(geosite),
+            geoip: Arc::clone(geoip),
             state: Arc::clone(state),
         };
         let status = Arc::default();
@@ -340,7 +365,7 @@ impl GeoSources {
         }
     }
 
-    /// 两种 Geo 数据现在的代数 / The two kinds of Geo data's generations now
+    /// 每个标签的数据现在的指纹 / The fingerprint of each tag's data now
     pub(crate) fn generation(&self) -> GeoGeneration {
         self.rotation.generation()
     }
@@ -540,7 +565,7 @@ fn load_geosite(
     problems.tags = (!files.is_empty())
         .then(|| unprovided_geosite_tags(&missing_tags))
         .flatten();
-    rotation.site_swapped();
+    rotation.swapped();
 
     // 状态在监视开始之前写好：监视线程之后写进来的不会被它盖掉 / The status is written before the
     // watch starts, so what the watch thread writes later is not overwritten by it
@@ -556,7 +581,7 @@ fn load_geosite(
         &status.site,
         move |path| {
             if reload_geosite_file(&manager, path, &tags, &watching.site) {
-                rotation.site_swapped();
+                rotation.swapped();
             }
         },
     );
@@ -741,7 +766,7 @@ fn load_geoip(
         |tag: &String| spec.dat_path.is_some() || (spec.db_path.is_some() && is_country_tag(tag));
     let missing_tags: Vec<String> = missing_tags.into_iter().filter(given_data).collect();
     problems.tags = unprovided_geoip_tags(&missing_tags);
-    rotation.ip_swapped();
+    rotation.swapped();
 
     // 状态在监视开始之前写好，和 GeoSite 一样 / The status is written before the watch starts, as for GeoSite
     *status.ip.lock() = problems;
@@ -755,7 +780,7 @@ fn load_geoip(
         &status.ip,
         move |path| {
             if reload_geoip_file(&manager, path, &dat_tags, &watching.ip) {
-                rotation.ip_swapped();
+                rotation.swapped();
             }
         },
     );
@@ -820,6 +845,7 @@ fn reload_geoip_file(
 mod tests {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
@@ -915,9 +941,13 @@ mod tests {
         );
     }
 
-    /// 换数据时把代数加一、换命名空间的引擎状态：一份什么规则都没有的配置的 / The engine state a swap
-    /// moves to the next generation's namespaces: that of a configuration without rules
-    fn rotation() -> Rotation {
+    /// 换数据时按 `geosite`、`geoip` 的新指纹换命名空间的引擎状态：一份什么规则都没有的配置的 / The
+    /// engine state a swap moves to the namespaces of the new fingerprints of `geosite` and
+    /// `geoip`: that of a configuration without rules
+    fn rotation(
+        geosite: &Arc<RwLock<GeoSiteManager>>,
+        geoip: &Arc<RwLock<GeoIpManager>>,
+    ) -> Rotation {
         let cfg = RuntimePipelineConfig::from_config(
             serde_json::from_value(serde_json::json!({
                 "settings": { "default_upstream": "127.0.0.1:9" },
@@ -927,8 +957,8 @@ mod tests {
         )
         .unwrap();
         Rotation {
-            site: Arc::default(),
-            ip: Arc::default(),
+            geosite: Arc::clone(geosite),
+            geoip: Arc::clone(geoip),
             state: Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg))),
         }
     }
@@ -969,7 +999,7 @@ mod tests {
             logged: Arc::clone(&logged),
             under_lock: Arc::clone(&under_lock),
         });
-        let rotation = rotation();
+        let rotation = rotation(&geosite, &geoip);
         let ip_path = ip.to_str().unwrap();
         tracing::subscriber::with_default(subscriber, || {
             // 监视一装上就停下，它的线程不会在这期间写数据 / Each watch is stopped as soon as it is

@@ -241,18 +241,16 @@ impl RuleReads {
                 ResponsePhase::parts(rule.response_phase.as_deref());
             // 请求匹配器读的 GeoIP 只按客户端地址判断，不算（见 [`GeoData`]）/ The GeoIP request
             // matchers read judges the client address alone and does not count (see [`GeoData`])
-            reads.geo.site |= rule
+            let request = rule
                 .matchers
                 .iter()
-                .any(|m| matches!(m.matcher.geo_tags(), Some(GeoTags::Site(_))));
-            for tags in response_matchers
-                .iter()
                 .filter_map(|m| m.matcher.geo_tags())
-            {
-                match tags {
-                    GeoTags::Site(_) => reads.geo.site = true,
-                    GeoTags::Ip(_) => reads.geo.ip = true,
-                }
+                .filter(|tags| matches!(tags, GeoTags::Site(_)));
+            let response = response_matchers
+                .iter()
+                .filter_map(|m| m.matcher.geo_tags());
+            for tags in request.chain(response) {
+                reads.geo.add(tags);
             }
             for m in rule.matchers.iter() {
                 let test = match &m.matcher {
@@ -426,9 +424,11 @@ pub(super) fn fill_requester_scopes(
         // checks' jumps get; the answers a request-phase jump gets are cached under the
         // target's keys (see `engine::execution::Route::enter`), so the data the target reads
         // does not move this namespace
-        pipeline.geo_data = through
-            .iter()
-            .fold(rule_reads.geo, |geo, &reached| geo.with(reads[reached].geo));
+        let mut geo = rule_reads.geo.clone();
+        for &reached in &through {
+            geo.extend(&reads[reached].geo);
+        }
+        pipeline.geo_data = geo;
         pipeline.answered_through = through;
     }
 }
