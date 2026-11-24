@@ -188,7 +188,7 @@ impl Engine {
         let rule_cache = Arc::new(CacheStore::new(10_000, std::time::Duration::ZERO));
 
         // 状态带着配置用到的 Geo 数据开始 / The state starts with the Geo data the configuration uses
-        let geo_sources = GeoSources::load(EngineInner::new(cfg));
+        let geo_sources = GeoSources::load(cfg);
         let state = geo_sources.state();
 
         let permit_manager = Arc::new(PermitManager::new());
