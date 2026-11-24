@@ -207,183 +207,181 @@ impl RefreshFailures {
 /// watermark
 pub(crate) const REFRESHES_AT_ONCE: usize = 128;
 
-/// spawn_background_refresh spawns a task to refresh a DNS record in the background.
-///
-/// 防止无限循环的保护措施：
-/// Protection against infinite loops:
-/// 1. 打得上刷新标记才刷新（`RefreshingGuard::try_new`）
-/// 2. 后台请求带着它要更新的条目（`RefreshTarget`），不查缓存
-/// 3. RefreshingGuard 确保刷新标记在任务完成后被清除
-///
-/// `requester` is who sent the request that triggered this refresh: its real address
-/// (not loopback), whether it sent EDNS, and its own ECS, so that ECS (RFC 7871) and
-/// pipeline selection go as they did for that request.
-///
-/// `requester` 是触发刷新的那个请求的发送方：它的真实地址（不是回环地址）、带没带 EDNS、它自己的
-/// ECS，这样 ECS（RFC 7871）和 pipeline 选择都和那个请求一样。
-///
-/// `renewed` is the cached answer to renew, in slot `slot`: its question
-/// (pipeline, name, type, class) is the one replayed.
-/// `renewed` 是槽位 `slot` 里要更新的那份应答：重放的就是它的问题（pipeline、名字、类型、类别）。
-pub fn spawn_background_refresh(
-    engine: &Engine,
-    state: &Arc<EngineInner>,
-    renewed: &Arc<crate::cache::CacheEntry>,
-    slot: u64,
-    requester: Requester,
-) {
-    let qname = renewed.qname.as_ref();
-    let qtype = RecordType::from(renewed.qtype);
-    let qclass = DNSClass::from(renewed.qclass);
-    // 先打上刷新标记，打不上就是已经有人在刷新（见 `RefreshingGuard::try_new`）；guard 在任务
-    // 结束时清掉标记，下面提前返回时也一样
-    // Set the refresh mark first; failing that, someone is refreshing already (see
-    // `RefreshingGuard::try_new`). The guard clears the mark when the task ends, and on
-    // the early return below too
-    let mark = RefreshTarget::mark_of(slot, &renewed.reach);
-    // 这份应答刚刷新失败过：复查时间之内不再刷新（RFC 8767 第 5 节），故障期间不必每次命中都去问坏掉的上游
-    // This answer's refresh failed lately: no refresh within the recheck time (RFC 8767
-    // section 5), so a broken upstream is not asked on every hit during an outage
-    if engine
-        .refresh_failures
-        .failed_recently(mark, renewed.fetched_at)
-    {
-        return;
-    }
-    // 已经在刷新的只读一下就认出来，不去抢写锁；同时在刷新的够多了，这次先不刷新（见 `REFRESHES_AT_ONCE`）
-    // One already being refreshed is told by a read, without contending for the write lock;
-    // with enough being refreshed at once, this one waits for a later hit (see
-    // `REFRESHES_AT_ONCE`)
-    if engine.refreshing.contains_key(&mark) || engine.refreshing.len() >= REFRESHES_AT_ONCE {
-        return;
-    }
-    let Some(guard) = RefreshingGuard::try_new(&engine.refreshing, mark) else {
-        return;
-    };
-    let state = Arc::clone(state);
-    let target = RefreshTarget::new(
-        slot,
-        renewed.pipeline_id.clone(),
-        renewed.reach.clone(),
-        renewed.fetched_at,
-    )
-    .with_client_ecs(requester.ecs);
-
-    // Step 1: Construct standard DNS query packet
-    // 步骤 1：构造标准 DNS 查询包
-    // Replay the request as its client sent it, as far as routing, ECS and the cache
-    // can tell: from the same address, with or without EDNS, with the client's own
-    // ECS and its query bits (see `QueryFlags`). Pipeline selection and rules can
-    // depend on the first two, a forward without `ecs` passes the ECS upstream, the
-    // query bits change the answer and are part of its key, and the answer is
-    // stored in the slot the request looked up.
-    // 按客户端发来的样子重放，以路由、ECS 和缓存能分辨的为限：同一个地址，带或不带 EDNS，带着
-    // 客户端自己的 ECS 和它的查询位（见 `QueryFlags`）。pipeline 的选择和规则都可能取决于前两项，
-    // 不写 `ecs` 的转发会把 ECS 转给上游，查询位会改变应答、也是它的键的一部分，而应答会存进请求
-    // 查过的那个槽位。
-    let packet = match engine.construct_dns_packet(
-        qname,
-        qtype,
-        qclass,
-        requester.edns,
-        requester.ecs.as_ref(),
-        renewed.flags,
+impl Engine {
+    /// 为槽位 `slot` 里的 `renewed` 发起后台刷新：后台任务照配置 `state` 重放它的问题（pipeline、名字、类型、类别），更新的就是
+    /// 它。`requester` 是触发刷新的那个请求的发送方：它的真实地址（不是回环地址）、带没带 EDNS、它自己的 ECS，这样 ECS（RFC
+    /// 7871）和 pipeline 选择都和那个请求一样。同一份应答同时只刷新一次：打得上刷新标记才刷新（见 `RefreshingGuard`），任务
+    /// 结束时清掉标记；刷新带着它要更新的条目（见 `RefreshTarget`），不查缓存、不在 inflight 表里登记也不等别人。什么时候该
+    /// 刷新由调用的一方判断（见 `RefreshCheck`、`phases::serve_stale`）
+    /// Start a background refresh of `renewed` in slot `slot`: a background task replays its
+    /// question (pipeline, name, type, class) under the configuration `state`, renewing it.
+    /// `requester` is who sent the request that triggered this refresh: its real address (not
+    /// loopback), whether it sent EDNS, and its own ECS, so that ECS (RFC 7871) and pipeline
+    /// selection go as they did for that request. One answer is refreshed once at a time: only
+    /// when the refresh mark can be set (see `RefreshingGuard`), the task clearing it when it
+    /// ends; the refresh carries the entry it renews (see `RefreshTarget`), looks up no cache,
+    /// and neither registers in the inflight map nor waits on it. When one is due the caller
+    /// judges (see `RefreshCheck`, `phases::serve_stale`)
+    pub(crate) fn spawn_background_refresh(
+        &self,
+        state: &Arc<EngineInner>,
+        renewed: &Arc<CacheEntry>,
+        slot: u64,
+        requester: Requester,
     ) {
-        Ok(pkt) => pkt,
-        Err(e) => {
-            error!(
-                event = "background_refresh_construct_packet_failed",
-                qname = %qname,
-                qtype = ?qtype,
-                error = %format_args!("{e:#}"),
-                "Failed to construct DNS packet for background refresh"
-            );
+        let qname = renewed.qname.as_ref();
+        let qtype = RecordType::from(renewed.qtype);
+        let qclass = DNSClass::from(renewed.qclass);
+        // 先打上刷新标记，打不上就是已经有人在刷新（见 `RefreshingGuard::try_new`）；guard 在任务
+        // 结束时清掉标记，下面提前返回时也一样
+        // Set the refresh mark first; failing that, someone is refreshing already (see
+        // `RefreshingGuard::try_new`). The guard clears the mark when the task ends, and on
+        // the early return below too
+        let mark = RefreshTarget::mark_of(slot, &renewed.reach);
+        // 这份应答刚刷新失败过：复查时间之内不再刷新（RFC 8767 第 5 节），故障期间不必每次命中都去问坏掉的上游
+        // This answer's refresh failed lately: no refresh within the recheck time (RFC 8767
+        // section 5), so a broken upstream is not asked on every hit during an outage
+        if self
+            .refresh_failures
+            .failed_recently(mark, renewed.fetched_at)
+        {
             return;
         }
-    };
-
-    // Step 2: Spawn the background task, which holds the refresh mark's guard
-    // 步骤 2：生成后台任务，刷新标记的 guard 交给它
-    let engine = engine.clone();
-    let fetched_at = renewed.fetched_at;
-    let settings = &state.pipeline.settings;
-    let renew_on_failure = settings.serve_stale && settings.serve_stale_ttl_reset;
-    let renewed = Arc::clone(renewed);
-
-    tokio::spawn(async move {
-        // Move guard into the async task so it clears when task completes
-        // 将 guard 移动到异步任务中，这样任务完成时会清除标记
-        let _guard = guard;
-
-        // Use original client peer IP for correct ECS injection (RFC 7871) and pipeline selection.
-        // Port is irrelevant — only .ip() is consumed downstream.
-        //
-        // 使用原始客户端 peer IP 确保正确的 ECS 注入 (RFC 7871) 和 pipeline 选择。
-        // 端口无关 — 下游仅消费 .ip()。
-        let peer_addr = std::net::SocketAddr::new(requester.address, 53);
-
-        // 刷新照发起它的那次命中 load 的配置快照更新条目。配合原始 peer_ip，确保后台刷新既写入
-        // 正确的缓存槽，又注入正确的 ECS (RFC 7871)。
-        //
-        // The refresh renews its entry under the configuration snapshot the hit that started it
-        // loaded. Together with the original peer_ip, this ensures the background refresh both
-        // writes to the correct cache slot AND injects the correct ECS (RFC 7871).
-        let result = engine
-            .handle_refresh(&packet, peer_addr, target, state)
-            .await;
-
-        match result {
-            Ok(_resp_bytes) => {
-                debug!(
-                    event = "background_refresh_success",
-                    qname = %renewed.qname,
-                    qtype = ?qtype,
-                    pipeline_id = %renewed.pipeline_id,
-                    "Background refresh completed successfully"
-                );
-            }
-            // The refresh mark is released as soon as the task ends, failure or not. A
-            // stale hit starts a refresh only while the mark is clear, and with
-            // serve_stale_client_timeout_ms the request then waits for that refresh, so
-            // holding the mark for a backoff would leave it waiting for a refresh that
-            // never starts. The backoff lives in `RefreshFailures` instead, which a stale
-            // hit checks before it waits.
-            // 无论成败，任务一结束就释放刷新标记。过期命中只在标记空闲时才发起刷新，
-            // 开着 serve_stale_client_timeout_ms 时请求随后就等这次刷新；退避期间占着
-            // 标记，请求等的就是一个根本没有发起的刷新。退避因此另记在 `RefreshFailures`
-            // 里，过期命中在等之前先查它。
-            Err(e) => {
-                // 标记放开之前记下：看到标记放开的请求也就看得到这次失败
-                // Noted before the mark is let go: a request that sees the mark gone sees
-                // this failure too
-                engine.refresh_failures.record(mark, fetched_at);
-                // 开着 serve_stale_ttl_reset 时，过期的这份应答从这次失败起重新算还能续用多久（见
-                // `CacheEntry::clone_with_refreshed_ttl`）：上游一直取不到新的，就一直有旧的可给。以前每交出一次过期
-                // 应答都重新算，故障期间每次命中都要拿一次写锁、换一个槽位
-                // With serve_stale_ttl_reset on, the stale answer counts how long it may still be
-                // served afresh from this failure (see `CacheEntry::clone_with_refreshed_ttl`):
-                // while the upstream gives nothing new, the old one stays to give. It used to count
-                // afresh on every stale answer served, every hit in an outage taking a write lock
-                // and a new slot
-                if renew_on_failure && !renewed.is_fresh() {
-                    engine.cache_replace(slot, &renewed, renewed.clone_with_refreshed_ttl());
-                }
-                // 上游出故障时每个快到期、过期的名字都刷新失败一次，一秒能有上百条，所以隔一阵才记一条
-                // With an upstream down every name near or past its expiry fails a refresh, a
-                // hundred a second and more, so one is logged in a while
-                crate::warn_sparse!(
-                    event = "background_refresh_failed",
-                    qname = %renewed.qname,
-                    qtype = ?qtype,
-                    pipeline_id = %renewed.pipeline_id,
-                    error = %format_args!("{e:#}"),
-                    "Background refresh failed"
-                );
-            }
+        // 已经在刷新的只读一下就认出来，不去抢写锁；同时在刷新的够多了，这次先不刷新（见 `REFRESHES_AT_ONCE`）
+        // One already being refreshed is told by a read, without contending for the write lock;
+        // with enough being refreshed at once, this one waits for a later hit (see
+        // `REFRESHES_AT_ONCE`)
+        if self.refreshing.contains_key(&mark) || self.refreshing.len() >= REFRESHES_AT_ONCE {
+            return;
         }
-        // _guard dropped here, automatically clearing the refresh mark
-        // _guard 在此处 drop，自动清除刷新标记
-    });
+        let Some(guard) = RefreshingGuard::try_new(&self.refreshing, mark) else {
+            return;
+        };
+        let state = Arc::clone(state);
+        let target = RefreshTarget::new(
+            slot,
+            renewed.pipeline_id.clone(),
+            renewed.reach.clone(),
+            renewed.fetched_at,
+        )
+        .with_client_ecs(requester.ecs);
+
+        // Step 1: Construct standard DNS query packet
+        // 步骤 1：构造标准 DNS 查询包
+        // Replay the request as its client sent it, as far as routing, ECS and the cache
+        // can tell: from the same address, with or without EDNS, with the client's own
+        // ECS and its query bits (see `QueryFlags`). Pipeline selection and rules can
+        // depend on the first two, a forward without `ecs` passes the ECS upstream, the
+        // query bits change the answer and are part of its key, and the answer is
+        // stored in the slot the request looked up.
+        // 按客户端发来的样子重放，以路由、ECS 和缓存能分辨的为限：同一个地址，带或不带 EDNS，带着
+        // 客户端自己的 ECS 和它的查询位（见 `QueryFlags`）。pipeline 的选择和规则都可能取决于前两项，
+        // 不写 `ecs` 的转发会把 ECS 转给上游，查询位会改变应答、也是它的键的一部分，而应答会存进请求
+        // 查过的那个槽位。
+        let packet = match self.construct_dns_packet(
+            qname,
+            qtype,
+            qclass,
+            requester.edns,
+            requester.ecs.as_ref(),
+            renewed.flags,
+        ) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                error!(
+                    event = "background_refresh_construct_packet_failed",
+                    qname = %qname,
+                    qtype = ?qtype,
+                    error = %format_args!("{e:#}"),
+                    "Failed to construct DNS packet for background refresh"
+                );
+                return;
+            }
+        };
+
+        // Step 2: Spawn the background task, which holds the refresh mark's guard
+        // 步骤 2：生成后台任务，刷新标记的 guard 交给它
+        let engine = self.clone();
+        let fetched_at = renewed.fetched_at;
+        let settings = &state.pipeline.settings;
+        let renew_on_failure = settings.serve_stale && settings.serve_stale_ttl_reset;
+        let renewed = Arc::clone(renewed);
+
+        tokio::spawn(async move {
+            // Move guard into the async task so it clears when task completes
+            // 将 guard 移动到异步任务中，这样任务完成时会清除标记
+            let _guard = guard;
+
+            // Use original client peer IP for correct ECS injection (RFC 7871) and pipeline selection.
+            // Port is irrelevant — only .ip() is consumed downstream.
+            //
+            // 使用原始客户端 peer IP 确保正确的 ECS 注入 (RFC 7871) 和 pipeline 选择。
+            // 端口无关 — 下游仅消费 .ip()。
+            let peer_addr = std::net::SocketAddr::new(requester.address, 53);
+
+            // 刷新照发起它的那次命中 load 的配置快照更新条目。配合原始 peer_ip，确保后台刷新既写入
+            // 正确的缓存槽，又注入正确的 ECS (RFC 7871)。
+            //
+            // The refresh renews its entry under the configuration snapshot the hit that started it
+            // loaded. Together with the original peer_ip, this ensures the background refresh both
+            // writes to the correct cache slot AND injects the correct ECS (RFC 7871).
+            let result = engine
+                .handle_refresh(&packet, peer_addr, target, state)
+                .await;
+
+            match result {
+                Ok(_resp_bytes) => {
+                    debug!(
+                        event = "background_refresh_success",
+                        qname = %renewed.qname,
+                        qtype = ?qtype,
+                        pipeline_id = %renewed.pipeline_id,
+                        "Background refresh completed successfully"
+                    );
+                }
+                // The refresh mark is released as soon as the task ends, failure or not. A
+                // stale hit starts a refresh only while the mark is clear, and with
+                // serve_stale_client_timeout_ms the request then waits for that refresh, so
+                // holding the mark for a backoff would leave it waiting for a refresh that
+                // never starts. The backoff lives in `RefreshFailures` instead, which a stale
+                // hit checks before it waits.
+                // 无论成败，任务一结束就释放刷新标记。过期命中只在标记空闲时才发起刷新，
+                // 开着 serve_stale_client_timeout_ms 时请求随后就等这次刷新；退避期间占着
+                // 标记，请求等的就是一个根本没有发起的刷新。退避因此另记在 `RefreshFailures`
+                // 里，过期命中在等之前先查它。
+                Err(e) => {
+                    // 标记放开之前记下：看到标记放开的请求也就看得到这次失败
+                    // Noted before the mark is let go: a request that sees the mark gone sees
+                    // this failure too
+                    engine.refresh_failures.record(mark, fetched_at);
+                    // 开着 serve_stale_ttl_reset 时，过期的这份应答从这次失败起重新算还能续用多久（见
+                    // `CacheEntry::clone_with_refreshed_ttl`）：上游一直取不到新的，就一直有旧的可给。以前每交出一次过期
+                    // 应答都重新算，故障期间每次命中都要拿一次写锁、换一个槽位
+                    // With serve_stale_ttl_reset on, the stale answer counts how long it may still be
+                    // served afresh from this failure (see `CacheEntry::clone_with_refreshed_ttl`):
+                    // while the upstream gives nothing new, the old one stays to give. It used to count
+                    // afresh on every stale answer served, every hit in an outage taking a write lock
+                    // and a new slot
+                    if renew_on_failure && !renewed.is_fresh() {
+                        engine.cache_replace(slot, &renewed, renewed.clone_with_refreshed_ttl());
+                    }
+                    // 上游出故障时每个快到期、过期的名字都刷新失败一次，一秒能有上百条，所以隔一阵才记一条
+                    // With an upstream down every name near or past its expiry fails a refresh, a
+                    // hundred a second and more, so one is logged in a while
+                    crate::warn_sparse!(
+                        event = "background_refresh_failed",
+                        qname = %renewed.qname,
+                        qtype = ?qtype,
+                        pipeline_id = %renewed.pipeline_id,
+                        error = %format_args!("{e:#}"),
+                        "Background refresh failed"
+                    );
+                }
+            }
+            // _guard dropped here, automatically clearing the refresh mark
+            // _guard 在此处 drop，自动清除刷新标记
+        });
+    }
 }
 
 #[cfg(test)]

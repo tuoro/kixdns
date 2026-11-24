@@ -711,32 +711,16 @@ impl Engine {
             let pipeline_id = pipeline.map_or(NO_PIPELINE, |pipeline| &*pipeline.id);
 
             // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
-            let cache_namespace = state.cache_namespace(pipeline_id);
-            let slot = KeyedQuestion {
-                namespace: cache_namespace,
+            let asked = CachedQuestion {
+                qname: qname_str,
                 pipeline_id,
-                qname: q.qname.as_bytes(),
-                qtype,
-                qclass,
+                qtype: q.qtype,
+                qclass: q.qclass,
                 flags: q.flags,
-                requester: pipeline.map_or(RequesterKey::NONE, |p| {
-                    p.requester.key(requester, &state.geo.geoip)
-                }),
-                client_ecs: q.client_subnet,
-            }
-            .slot();
+            };
+            let slot = state.question(pipeline, &asked, requester).slot();
 
-            if let Some(hit) = self.cache_get(
-                slot,
-                &view,
-                &CachedQuestion {
-                    qname: qname_str,
-                    pipeline_id,
-                    qtype: q.qtype,
-                    qclass: q.qclass,
-                    flags: q.flags,
-                },
-            ) {
+            if let Some(hit) = self.cache_get(slot, &view, &asked) {
                 let elapsed_secs = crate::proto_utils::saturating_u64_to_u32(
                     start.saturating_duration_since(hit.inserted_at).as_secs(),
                 );
@@ -1025,11 +1009,11 @@ impl Engine {
         reply
     }
 
-    /// 后台刷新：照配置 `state` 重放 `packet`，更新的是 `target`（见 `refresh::spawn_background_refresh`）。刷新不查缓存，总是去问
+    /// 后台刷新：照配置 `state` 重放 `packet`，更新的是 `target`（见 [`Self::spawn_background_refresh`]）。刷新不查缓存，总是去问
     /// 上游；它照原请求重放，沿着规则走到哪里就写在哪里的键下，和客户端请求一样，路线没变时就是原请求查过的那个槽位；不上报缓存
     /// 命中、不记应答日志。结果原样交回（见 `renewing`），失败由 refresh.rs 记下
     /// A background refresh: `packet` replayed under the configuration `state`, renewing
-    /// `target` (see `refresh::spawn_background_refresh`). A refresh looks up no cache and always
+    /// `target` (see [`Self::spawn_background_refresh`]). A refresh looks up no cache and always
     /// asks upstream; replaying the original request, it writes under the keys of wherever the
     /// rules lead it, as a client request does, which is the slot the original request looked up
     /// while the route is the same; it reports no cache hit and writes no response record. What
@@ -1362,9 +1346,7 @@ impl Engine {
         let background_refresh = request.refresh.is_some();
         // A background refresh looks up no cache / 后台刷新不查缓存
         if !background_refresh
-            && let Some(answer) = self
-                .answer_from_cache(&request.lookup(&route.pipeline, route.keys.slot), info)
-                .await
+            && let Some(answer) = self.answer_from_cache(&route.lookup(request), info).await
         {
             return Ok(answer);
         }
@@ -1452,12 +1434,8 @@ impl Engine {
                     // the keys stay, and the lookup under them has missed already
                     if route.enter(request, p)
                         && !background_refresh
-                        && let Some(answer) = self
-                            .answer_from_cache(
-                                &request.lookup(&route.pipeline, route.keys.slot),
-                                info,
-                            )
-                            .await
+                        && let Some(answer) =
+                            self.answer_from_cache(&route.lookup(request), info).await
                     {
                         return Ok(answer);
                     }
@@ -1581,24 +1559,6 @@ impl Engine {
             "Triggering background refresh for cached entry"
         );
         self.spawn_background_refresh(state, renewed, slot, requester);
-    }
-
-    /// 为槽位 `slot` 里的 `renewed` 发起后台刷新，照 `requester` 的样子重放请求（见
-    /// `refresh::spawn_background_refresh`）。同一份应答同时只刷新一次（刷新标记，见 `RefreshingGuard`）；刷新不查缓存、
-    /// 不在 inflight 表里登记也不等别人；什么时候该刷新由调用的一方判断（见 `RefreshCheck`、`phases::serve_stale`）
-    /// Start a background refresh of `renewed` in slot `slot`, replaying the request as
-    /// `requester` sent it (see `refresh::spawn_background_refresh`). One answer is refreshed
-    /// once at a time (the refresh mark, see `RefreshingGuard`); a refresh looks up no cache, and
-    /// neither registers in the inflight map nor waits on it; when one is due the caller judges
-    /// (see `RefreshCheck`, `phases::serve_stale`)
-    pub(crate) fn spawn_background_refresh(
-        &self,
-        state: &Arc<EngineInner>,
-        renewed: &Arc<CacheEntry>,
-        slot: u64,
-        requester: Requester,
-    ) {
-        crate::engine::refresh::spawn_background_refresh(self, state, renewed, slot, requester)
     }
 
     /// Construct standard DNS query packet using hickory_proto
@@ -1849,10 +1809,11 @@ impl Request<'_> {
         }
     }
 
-    /// 这个请求在 `pipeline` 下、命名空间 `namespace` 里的问题，请求方部分是 `requester`（见 [`KeyedQuestion`]）：请求的
-    /// 键都照它算
+    /// 这个请求在 `pipeline` 下、命名空间 `namespace` 里的问题，请求方部分是 `requester`（见 [`KeyedQuestion`]）：路线照算
+    /// 键时的这两样拼回它（见 `Route::question`）
     /// This request's question under `pipeline`, in namespace `namespace`, with `requester` as
-    /// the requester's part (see [`KeyedQuestion`]): the request's keys are all computed from it
+    /// the requester's part (see [`KeyedQuestion`]): a route puts it back together from those
+    /// two as its keys were computed (see `Route::question`)
     pub(crate) fn question<'q>(
         &'q self,
         pipeline: &'q str,
@@ -1875,10 +1836,8 @@ impl Request<'_> {
     /// This request's keys under the pipeline of id `id` (`pipeline` being it, None when none was
     /// picked): requesters told apart by its rules
     fn keys(&self, id: &str, pipeline: Option<&crate::matcher::RuntimePipeline>) -> CacheKeys {
-        let requester = pipeline.map_or(RequesterKey::NONE, |p| {
-            p.requester.key(self.requester, &self.state.geo.geoip)
-        });
-        self.question(id, self.state.cache_namespace(id), requester)
+        self.state
+            .question(pipeline, &self.cached_question(id), self.requester)
             .keys()
     }
 
@@ -2104,6 +2063,13 @@ impl Route {
     /// registers and waits under in the inflight map
     pub(crate) fn question<'q>(&'q self, request: &'q Request<'_>) -> KeyedQuestion<'q> {
         request.question(&self.key_pipeline, self.keys.namespace, self.keys.requester)
+    }
+
+    /// 在这条路线的键下查 `request` 的应答：槽位属于 `key_pipeline`，两样一起交出
+    /// Looking up `request`'s answer under this route's keys: the slot belongs to
+    /// `key_pipeline`, and the two go out together
+    pub(crate) fn lookup<'s>(&'s self, request: &'s Request<'_>) -> phases::CacheLookupContext<'s> {
+        request.lookup(&self.key_pipeline, self.keys.slot)
     }
 
     /// 排第 `rule` 的规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，求值从它的下一条接着走
