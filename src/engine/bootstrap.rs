@@ -237,19 +237,27 @@ impl Through {
 
     /// `server` 对 `query` 答的地址和各自的 TTL。一份查询过了这次问的时限（[`ASK_BUDGET`]）的三分之一还没有回答就再发
     /// 一份，和还没答过的上游一样（见 `upstream::hedge_timeout`）；前面发的照样等着，谁的回答先到用谁的（见
-    /// [`UdpExchange`]）：丢了一个包的查询不用等满整个时限
+    /// [`UdpExchange`]）：丢了一个包的查询不用等满整个时限。一份发不出去也不让这次问失败，记下来，到了时候照样再发，和 UDP
+    /// 转发一样（见 `upstream::forward_udp_smart`）
     /// The addresses `server` answers `query` with, and their TTLs. A copy left unanswered for a
     /// third of the asking's time limit ([`ASK_BUDGET`]) has another sent, as for an upstream yet to
     /// answer (see `upstream::hedge_timeout`); the earlier ones are still waited for, the first
     /// reply to come being used (see [`UdpExchange`]): a query with a packet lost does not wait
-    /// out the whole limit
+    /// out the whole limit. Nor does a copy that cannot be sent fail the asking: it is logged, and
+    /// another goes when the time comes, as UDP forwarding does (see `upstream::forward_udp_smart`)
     async fn records(&self, server: &str, query: &[u8]) -> anyhow::Result<Vec<(IpAddr, u32)>> {
         let resend_after = super::upstream::hedge_timeout(ASK_BUDGET);
         let mut exchange = UdpExchange::new(&self.udp, query, server);
         let reply = loop {
-            exchange.send(()).await?;
-            if let Ok(Some((reply, ()))) = timeout(resend_after, exchange.reply()).await {
-                break reply?;
+            if let Err(error) = exchange.send(()).await {
+                debug!(server, %error, "bootstrap query not sent, sending again later");
+            }
+            match timeout(resend_after, exchange.reply()).await {
+                Ok(Some((reply, ()))) => break reply?,
+                // 一份也没在等（都没发出去）：到了时候再发 / No copy waited for (none went out): another goes
+                // when the time comes
+                Ok(None) => tokio::time::sleep(resend_after).await,
+                Err(_) => {}
             }
         };
         Ok(Message::from_vec(&reply)?
@@ -400,6 +408,25 @@ mod tests {
         .expect("well within the time limit");
         assert_eq!(addresses.unwrap(), ["127.0.0.1:853".parse().unwrap()]);
         assert_eq!(asked_a.load(Ordering::SeqCst), 2, "sent once more");
+    }
+
+    /// 一份查询发不出去（这里是 socket 的 ID 一时都被占着）不让这次问失败：到了再发的时候照样再发一份，问到地址
+    /// A query that cannot be sent (every ID of the socket taken for a moment, here) does not fail
+    /// the asking: another copy goes when the time to send again comes, and is answered
+    #[tokio::test]
+    async fn a_query_that_cannot_be_sent_is_sent_again_later() {
+        let server = loopback_bootstrap(300).await;
+        let udp = Arc::new(UdpClient::new(1).expect("UDP client"));
+        let bootstrap = Bootstrap::new(&server.address, Arc::clone(&udp));
+        udp.hold_every_id_for_tests();
+        let asking = tokio::spawn(async move { bootstrap.addresses("upstream.test", 853).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        udp.free_ids_for_tests();
+        let addresses = timeout(Duration::from_millis(1500), asking)
+            .await
+            .expect("well within the time limit")
+            .expect("the asking task");
+        assert_eq!(addresses.unwrap().len(), 2);
     }
 
     /// 只答 A、不答 AAAA 的服务器（或者反过来）给的地址照用，不等丢了的那个。以前两种都要答，等满整个时限后失败
