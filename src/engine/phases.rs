@@ -741,9 +741,9 @@ impl<'a> Forwarding<'a> {
         let (request, decision) = (self.request, self.decision);
         crate::engine::upstream::forward_upstream(
             self.engine,
+            &request.state.pipeline.settings,
             &self.packet,
             decision.upstream,
-            request.state.pipeline.upstream_timeout(),
             decision.transport,
             decision.pre_split_upstreams,
             request.observed,

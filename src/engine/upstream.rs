@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures::future::select;
+use futures::future::{Either, select};
 use hickory_proto::op::ResponseCode;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -254,68 +254,6 @@ pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys
     keys
 }
 
-/// 双发的一路失败以后，在剩下的 `remaining` 里等另一路；返回另一路的应答和它的传输
-/// After one leg of a dual send failed, wait up to `remaining` for the other; returns
-/// the other leg's answer and its transport
-async fn fallback_after_primary_failure(
-    other_task: AbortOnDropHandle<anyhow::Result<Bytes>>,
-    remaining: Duration,
-    primary_label: &'static str,
-    primary_err: anyhow::Error,
-    primary_is_task_error: bool,
-    other: Transport,
-) -> anyhow::Result<(Bytes, Transport)> {
-    let other_label = other.label();
-    if remaining.is_zero() {
-        other_task.abort();
-        if primary_is_task_error {
-            return Err(anyhow::anyhow!(
-                "{} task error: {}",
-                primary_label,
-                primary_err
-            ));
-        }
-        return Err(anyhow::anyhow!(
-            "{} failed and no time left for {}: {}",
-            primary_label,
-            other_label,
-            primary_err
-        ));
-    }
-
-    let prefix = if primary_is_task_error {
-        "task error"
-    } else {
-        "failed"
-    };
-    match timeout(remaining, other_task).await {
-        Ok(Ok(Ok(bytes))) => Ok((bytes, other)),
-        Ok(Ok(Err(other_err))) => Err(anyhow::anyhow!(
-            "{} {}: {}; {} failed: {}",
-            primary_label,
-            prefix,
-            primary_err,
-            other_label,
-            other_err
-        )),
-        Ok(Err(join_err)) => Err(anyhow::anyhow!(
-            "{} {}: {}; {} task error: {}",
-            primary_label,
-            prefix,
-            primary_err,
-            other_label,
-            join_err
-        )),
-        Err(_) => Err(anyhow::anyhow!(
-            "{} {}: {}; {} timed out",
-            primary_label,
-            prefix,
-            primary_err,
-            other_label
-        )),
-    }
-}
-
 /// Send both TCP and UDP concurrently, return first successful response (hedged request),
 /// with the transport that carried it.
 /// 同时发送 TCP 和 UDP，返回第一个成功响应（对冲请求），以及带回它的传输。
@@ -364,84 +302,59 @@ async fn forward_tcp_udp_dual(
     }));
 
     let start = std::time::Instant::now();
-
-    // Wait for first successful response / 等待第一个成功响应
-    let first = select(udp_task, tcp_task).await;
+    // 任务出错（panic）也算这一路失败 / A task failing (a panic) counts as its leg failing
+    let flatten = |joined: Result<anyhow::Result<Bytes>, tokio::task::JoinError>| {
+        joined.unwrap_or_else(|error| Err(error.into()))
+    };
+    // 先结束的那一路的传输和结果，另一路的传输和它的任务 / The transport and outcome of the leg
+    // through first, the other leg's transport and its task
+    let ((first, outcome), (other, other_task)) = match select(udp_task, tcp_task).await {
+        Either::Left((outcome, tcp_task)) => {
+            ((Transport::Udp, outcome), (Transport::Tcp, tcp_task))
+        }
+        Either::Right((outcome, udp_task)) => {
+            ((Transport::Tcp, outcome), (Transport::Udp, udp_task))
+        }
+    };
     let remaining = timeout_dur.saturating_sub(start.elapsed());
-    match first {
-        futures::future::Either::Left((result, mut tcp_task)) => match result {
-            // A truncated UDP answer does not win: the TCP leg is asking the same upstream
-            // for the full answer, so wait for it, and fall back to the truncated answer only
-            // if it fails.
-            // 截断的 UDP 应答不算赢：TCP 那一路正在向同一个上游要完整应答，所以等它；它失败了才
-            // 退回这个截断的应答。
-            Ok(Ok(bytes)) if crate::proto_utils::truncated_response(&bytes) => {
-                match timeout(remaining, &mut tcp_task).await {
-                    Ok(Ok(Ok(full))) => Ok((full, Transport::Tcp)),
-                    other => {
-                        if other.is_err() {
-                            tcp_task.abort();
-                        }
-                        debug!(event = "tc_udp_answer_kept", upstream = %addr, "tcp leg gave no answer, keeping the truncated udp answer");
-                        Ok((bytes, Transport::Udp))
-                    }
+    // 另一路在剩下的时间里的结果；用不着它时句柄随之丢掉，那一路就此取消 / The other leg's outcome in
+    // the time left; with no use for it the handle is dropped, cancelling that leg
+    let other_outcome = async move {
+        timeout(remaining, other_task)
+            .await
+            .map_err(|_| anyhow::anyhow!("no reply within {}ms", timeout_dur.as_millis()))
+            .and_then(flatten)
+    };
+    match flatten(outcome) {
+        // A truncated UDP answer does not win: the TCP leg is asking the same upstream
+        // for the full answer, so wait for it, and fall back to the truncated answer only
+        // if it fails.
+        // 截断的 UDP 应答不算赢：TCP 那一路正在向同一个上游要完整应答，所以等它；它失败了才
+        // 退回这个截断的应答。
+        Ok(bytes) if first == Transport::Udp && crate::proto_utils::truncated_response(&bytes) => {
+            match other_outcome.await {
+                Ok(full) => Ok((full, Transport::Tcp)),
+                Err(error) => {
+                    debug!(event = "tc_udp_answer_kept", upstream = %addr, error = %format_args!("{error:#}"), "tcp leg gave no answer, keeping the truncated udp answer");
+                    Ok((bytes, Transport::Udp))
                 }
             }
-            Ok(Ok(bytes)) => {
-                tcp_task.abort();
-                Ok((bytes, Transport::Udp))
-            }
-            Ok(Err(err)) => {
-                fallback_after_primary_failure(
-                    tcp_task,
-                    remaining,
-                    "udp",
-                    err,
-                    false,
-                    Transport::Tcp,
-                )
-                .await
-            }
-            Err(join_err) => {
-                fallback_after_primary_failure(
-                    tcp_task,
-                    remaining,
-                    "udp",
-                    anyhow::anyhow!(join_err),
-                    true,
-                    Transport::Tcp,
-                )
-                .await
-            }
-        },
-        futures::future::Either::Right((result, udp_task)) => match result {
-            Ok(Ok(bytes)) => {
-                udp_task.abort();
-                Ok((bytes, Transport::Tcp))
-            }
-            Ok(Err(err)) => {
-                fallback_after_primary_failure(
-                    udp_task,
-                    remaining,
-                    "tcp",
-                    err,
-                    false,
-                    Transport::Udp,
-                )
-                .await
-            }
-            Err(join_err) => {
-                fallback_after_primary_failure(
-                    udp_task,
-                    remaining,
-                    "tcp",
-                    anyhow::anyhow!(join_err),
-                    true,
-                    Transport::Udp,
-                )
-                .await
-            }
-        },
+        }
+        Ok(bytes) => Ok((bytes, first)),
+        // 两路都没问到时原因写成 `udp: …; tcp: …`，和 UDP 转发改用 TCP 时一样（见 [`forward_udp_smart`]）
+        // With neither leg answered the cause reads `udp: …; tcp: …`, as when a UDP forward turns
+        // to TCP (see [`forward_udp_smart`])
+        Err(first_error) => {
+            let other_error = match other_outcome.await {
+                Ok(bytes) => return Ok((bytes, other)),
+                Err(error) => error,
+            };
+            let (udp, tcp) = match first {
+                Transport::Udp => (first_error, other_error),
+                _ => (other_error, first_error),
+            };
+            Err(anyhow::anyhow!("udp: {udp:#}; tcp: {tcp:#}"))
+        }
     }
 }
 
@@ -469,6 +382,13 @@ type Upstreams = smallvec::SmallVec<[Arc<str>; 4]>;
 /// Before the reply is handed back, the TTL of every record is brought into
 /// `min_ttl..=cache_max_ttl`, so a client keeps an answer as long as the cache does.
 ///
+/// `settings` 是请求自己那份配置的设置：时限（`upstream_timeout_ms`）、`min_ttl` 和 `enable_tcp_fallback` 都照它。跨过
+/// 重载的请求照它开始时的配置问、收 TTL，和它写进的缓存命名空间是同一份配置
+/// `settings` are those of the request's own configuration: the timeout
+/// (`upstream_timeout_ms`), `min_ttl` and `enable_tcp_fallback` all go by them. A request across
+/// a reload asks and brings TTLs in by the configuration it started with, the very one whose
+/// cache namespace it writes into
+///
 /// 几个上游一起问时，刚回过 429、正在暂停的 DoH 上游这次不问（见 [`without_paused`]）。
 /// When several upstreams are asked together, a DoH upstream that answered 429 a moment
 /// ago and is paused is not asked this time (see [`without_paused`]).
@@ -483,14 +403,15 @@ type Upstreams = smallvec::SmallVec<[Arc<str>; 4]>;
 /// upstream failing (see [`UpstreamFailure::withheld`]).
 pub async fn forward_upstream(
     engine: &Engine,
+    settings: &crate::config::GlobalSettings,
     packet: &[u8],
     upstream: &str,
-    timeout_dur: Duration,
     transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
     asker: Option<std::net::IpAddr>,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
+    let timeout_dur = Duration::from_millis(settings.upstream_timeout_ms);
     let asking = match (asker, &engine.flow_control_state) {
         (Some(client), Some(flow)) => {
             match engine
@@ -509,13 +430,7 @@ pub async fn forward_upstream(
         let reply = crate::proto_utils::reply_without_aa(
             crate::proto_utils::reply_without_hop_options(reply),
         );
-        // 用当前配置的 min_ttl，而不是请求开始时那份：改 min_ttl 会轮换所有缓存命名空间，一个跨过重载
-        // 的应答只会交给它自己的客户端
-        // min_ttl comes from the current configuration rather than the request's own:
-        // changing it rotates every cache namespace, so a reply in flight across a
-        // reload reaches only its own client
-        let floor = engine.state.load().pipeline.settings.min_ttl;
-        crate::proto_utils::reply_within_ttls(reply, floor, engine.ttl_cap())
+        crate::proto_utils::reply_within_ttls(reply, settings.min_ttl, engine.ttl_cap())
     };
     // 固定在这里，两条路等的是同一份 / Pinned here, both paths waiting on the one copy
     let mut forward = std::pin::pin!(forward_upstream_as_is(
@@ -526,6 +441,7 @@ pub async fn forward_upstream(
         transport,
         pre_split_upstreams,
         observed,
+        settings.enable_tcp_fallback,
     ));
     let forwarded = match asking {
         // 流控的等待（定时器、这次等待的记录）单独在堆上分配：放在这里的话，没开流控时每个等上游的查询也得替它留着地方
@@ -616,7 +532,9 @@ pub(crate) fn is_failure_reply_packet(reply: &[u8]) -> bool {
         .is_some_and(|flags| matches!(flags & 0x0f, 2 | 5))
 }
 
-/// [`forward_upstream`] 少了两头把关的部分 / [`forward_upstream`] short of its guards at both ends
+/// [`forward_upstream`] 少了两头把关的部分；`tcp_fallback` 是请求那份配置的 `enable_tcp_fallback` / [`forward_upstream`]
+/// short of its guards at both ends; `tcp_fallback` is the `enable_tcp_fallback` of the
+/// request's configuration
 async fn forward_upstream_as_is(
     engine: &Engine,
     packet: &[u8],
@@ -625,6 +543,7 @@ async fn forward_upstream_as_is(
     default_transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
+    tcp_fallback: bool,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
     // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
     // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
@@ -656,10 +575,7 @@ async fn forward_upstream_as_is(
         let start = std::time::Instant::now();
         // `via` is the transport that actually carried the answer (UDP may fall
         // back to TCP) / `via` 为实际带回答案的传输（UDP 可能回退到 TCP）
-        let tcp = UdpTcpFallback {
-            retry_truncated: true,
-            on_failure: true,
-        };
+        let tcp = UdpTcpFallback::new(tcp_fallback, true);
         let (res, via) =
             send_to_upstream(engine, packet, addr, timeout_dur, transport_for_addr, tcp).await;
         let dur = start.elapsed();
@@ -750,10 +666,7 @@ async fn forward_upstream_as_is(
             // A truncated answer is still fetched again over TCP: the batch's TCP
             // upstreams do not give this upstream's full answer.
             // 截断的应答照样用 TCP 重取：同批的 TCP 上游给不出这个上游的完整应答。
-            let tcp = UdpTcpFallback {
-                retry_truncated: true,
-                on_failure: !has_tcp_task,
-            };
+            let tcp = UdpTcpFallback::new(tcp_fallback, !has_tcp_task);
             let (res, via) = send_to_upstream(
                 &engine,
                 &packet,
@@ -1151,18 +1064,31 @@ pub(crate) fn hedge_timeout(timeout_dur: Duration) -> Duration {
     timeout_dur / 3
 }
 
-/// When the UDP forwarder turns to TCP, on top of `enable_tcp_fallback`. A truncated
-/// answer and a failed UDP exchange are separate cases: a batch that already sends TCP to
-/// other upstreams still needs this upstream's full answer, but should not add a TCP
-/// attempt for a UDP failure.
-/// UDP 转发在 `enable_tcp_fallback` 之外何时改用 TCP。截断的应答和 UDP 失败是两回事：同批里已经
-/// 有别的上游走 TCP 时，这个上游的完整应答照样要取，但 UDP 失败时不再另加一次 TCP 尝试。
+/// UDP 转发何时改用 TCP。截断的应答和 UDP 失败是两回事：同批里已经有别的上游走 TCP 时，这个上游的完整应答照样要取，
+/// 但 UDP 失败时不再另加一次 TCP 尝试。
+/// When the UDP forwarder turns to TCP. A truncated answer and a failed UDP exchange are
+/// separate cases: a batch that already sends TCP to other upstreams still needs this
+/// upstream's full answer, but should not add a TCP attempt for a UDP failure.
 #[derive(Clone, Copy)]
 struct UdpTcpFallback {
     /// Fetch a truncated answer again over TCP / 截断的应答用 TCP 重取
     retry_truncated: bool,
     /// Try TCP when every UDP attempt failed / UDP 全部失败时试 TCP
     on_failure: bool,
+}
+
+impl UdpTcpFallback {
+    /// 照请求那份配置的 `enable_tcp_fallback`：开着时截断的应答用 TCP 重取，`on_failure` 时 UDP 全部失败也试 TCP；
+    /// 关着时两样都不做
+    /// By the `enable_tcp_fallback` of the request's configuration: on, a truncated answer is
+    /// fetched again over TCP, and with `on_failure` TCP is tried when every UDP attempt failed;
+    /// off, neither
+    fn new(enable_tcp_fallback: bool, on_failure: bool) -> Self {
+        Self {
+            retry_truncated: enable_tcp_fallback,
+            on_failure: enable_tcp_fallback && on_failure,
+        }
+    }
 }
 
 /// UDP forwarder with a resend and TCP fallback for better tail latency. Returns the answer
@@ -1181,11 +1107,6 @@ async fn forward_udp_smart(
     timeout_dur: Duration,
     tcp: UdpTcpFallback,
 ) -> anyhow::Result<(Bytes, Transport)> {
-    // 获取 TCP fallback 配置（Copy bool 值，避免持有 Guard 跨 await）
-    // Get TCP fallback config (Copy bool value to avoid holding Guard across await)
-    let enable_tcp_fallback = engine.state.load().pipeline.settings.enable_tcp_fallback;
-    let retry_truncated = tcp.retry_truncated && enable_tcp_fallback;
-    let fallback_on_failure = tcp.on_failure && enable_tcp_fallback;
     // 最后一次失败的原因：UDP 没问到时它就是 UDP 的失败原因 / The last failure's cause, which is UDP's
     // when UDP gets no answer
     let mut why = None;
@@ -1208,7 +1129,7 @@ async fn forward_udp_smart(
     // answer still has this truncated one rather than a SERVFAIL
     let answered = async |bytes: Bytes| {
         // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
-        if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
+        if tcp.retry_truncated && crate::proto_utils::truncated_response(&bytes) {
             debug!(event = "tc_flag_fallback", upstream = %upstream, "udp response truncated, retrying with tcp");
             return over_tcp(engine, packet, upstream, timeout_dur)
                 .await
@@ -1261,7 +1182,7 @@ async fn forward_udp_smart(
     // go, failed on receiving or was unanswered by the deadline, each noting why
     let udp = why.expect("UDP gave no answer without a failure");
 
-    if fallback_on_failure {
+    if tcp.on_failure {
         // Both UDP queries failed, try TCP fallback before failing.
         debug!(event = "udp_forward_fallback_tcp", upstream = %upstream, "falling back to tcp");
         return over_tcp(engine, packet, upstream, timeout_dur)
@@ -1576,16 +1497,20 @@ mod tests {
         assert_eq!(transport, Transport::Doq);
     }
 
-    fn build_test_engine(enable_tcp_fallback: bool) -> Engine {
-        let settings = GlobalSettings {
+    /// 测试引擎的设置 / The settings of a test engine
+    fn test_settings(enable_tcp_fallback: bool) -> GlobalSettings {
+        GlobalSettings {
             default_upstream: "127.0.0.1:0".to_string(),
             enable_tcp_fallback,
             udp_pool_size: 1,
             tcp_pool_size: 1,
             ..GlobalSettings::default()
-        };
+        }
+    }
+
+    fn build_test_engine(enable_tcp_fallback: bool) -> Engine {
         let runtime = RuntimePipelineConfig {
-            settings,
+            settings: test_settings(enable_tcp_fallback),
             pipeline_select: Vec::new(),
             pipelines: Vec::new(),
             pipeline_id_index: FxHashMap::default(),
@@ -2042,12 +1967,8 @@ mod tests {
         // whether the caller lets a UDP failure try TCP)
         for (enabled, on_failure) in [(true, true), (true, false), (false, true)] {
             let settings = GlobalSettings {
-                default_upstream: "127.0.0.1:0".to_string(),
-                enable_tcp_fallback: enabled,
                 flow_control_enabled: true,
-                udp_pool_size: 1,
-                tcp_pool_size: 1,
-                ..GlobalSettings::default()
+                ..test_settings(enabled)
             };
             let engine = Engine::new(
                 RuntimePipelineConfig {
@@ -2068,10 +1989,7 @@ mod tests {
                 &addr,
                 Duration::from_millis(450),
                 Transport::Udp,
-                UdpTcpFallback {
-                    retry_truncated: true,
-                    on_failure,
-                },
+                UdpTcpFallback::new(enabled, on_failure),
             )
             .await;
             let over_tcp = enabled && on_failure;
@@ -2085,6 +2003,33 @@ mod tests {
                 "{enabled} {on_failure}: the exchange over TCP is timed"
             );
         }
+    }
+
+    /// 双发的两路都没问到时，原因里两路各有一句、带着完整的原因链，写成 `udp: …; tcp: …`，和 UDP 转发改用 TCP 时一样；
+    /// 到时限还没结束的那一路写等了多久。这里 TCP 那一路连接被拒、先结束，UDP 那一路一直没有回答
+    /// With neither leg of a dual send answered, the cause has a sentence for each leg with its
+    /// whole chain, written `udp: …; tcp: …` as when a UDP forward turns to TCP; the leg not through
+    /// by the timeout says how long it was waited for. Here the TCP leg is refused and through
+    /// first, while the UDP leg never gets a reply
+    #[tokio::test]
+    async fn a_dual_send_failing_on_both_legs_names_each_with_its_cause() {
+        let engine = build_test_engine(true);
+        let addr = dual_upstream(DualLeg::Absent, DualLeg::Absent).await;
+        let packet = build_dns_query_packet("example.com");
+        let (result, _) = send_to_upstream(
+            &engine,
+            &packet,
+            &addr,
+            Duration::from_millis(300),
+            Transport::TcpUdp,
+            UdpTcpFallback::new(true, true),
+        )
+        .await;
+        let err = format!("{:#}", result.expect_err("neither leg answers"));
+        let tcp = err
+            .strip_prefix("udp: no reply within 300ms; tcp: ")
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(tcp.contains("refused"), "{err}");
     }
 
     /// 双发的这次转发被放弃时（外层的时限先到、几个上游竞速它输了），它的两路也跟着停：不再重发，不再占着在途的
@@ -2170,9 +2115,12 @@ mod tests {
         ] {
             let err = forward_upstream(
                 &engine,
+                &GlobalSettings {
+                    upstream_timeout_ms: 2000,
+                    ..test_settings(false)
+                },
                 &packet,
                 &upstream,
-                Duration::from_secs(2),
                 Transport::Udp,
                 None,
                 None,
@@ -2224,9 +2172,12 @@ mod tests {
         ] {
             let err = forward_upstream(
                 &engine,
+                &GlobalSettings {
+                    upstream_timeout_ms: 300,
+                    ..test_settings(false)
+                },
                 &packet,
                 &upstreams.map(String::as_str).join(","),
-                Duration::from_millis(300),
                 Transport::Udp,
                 None,
                 None,
@@ -2245,11 +2196,12 @@ mod tests {
         }
     }
 
-    /// UDP 没问到时说得出为什么（这里是等了多久也没有回答）；改用 TCP 也没问到时两样都说。以前只说「all udp attempts
-    /// failed」，改用 TCP 的只交出 TCP 的原因
+    /// UDP 没问到时说得出为什么（这里是等了多久也没有回答）；改用 TCP 也没问到时两样都说。改不改用 TCP 照传进来的设置，
+    /// 也就是请求那份配置的。以前只说「all udp attempts failed」，改用 TCP 的只交出 TCP 的原因
     /// UDP getting no answer says why (how long it waited without a reply, here); with TCP tried
-    /// as well and failing, both are said. It used to say "all udp attempts failed" alone, and a
-    /// TCP fallback handed out TCP's cause alone
+    /// as well and failing, both are said. Whether TCP is tried goes by the settings passed in,
+    /// those of the request's configuration. It used to say "all udp attempts failed" alone, and
+    /// a TCP fallback handed out TCP's cause alone
     #[tokio::test]
     async fn a_udp_failure_says_why_and_so_does_its_tcp_fallback() {
         // UDP 收下不回，TCP 连不上 / UDP takes queries without answering, TCP refuses
@@ -2257,12 +2209,17 @@ mod tests {
         drop(tcp);
         let packet = build_dns_query_packet("example.com.");
         for (fallback, udp) in [(false, ""), (true, "udp: ")] {
-            let engine = build_test_engine(fallback);
+            // 引擎自己的设置和这次相反：照的是传进来的那份 / The engine's own setting is the opposite:
+            // the one passed in is what counts
+            let engine = build_test_engine(!fallback);
             let err = forward_upstream(
                 &engine,
+                &GlobalSettings {
+                    upstream_timeout_ms: 300,
+                    ..test_settings(fallback)
+                },
                 &packet,
                 &addr.to_string(),
-                Duration::from_millis(300),
                 Transport::Udp,
                 None,
                 None,
