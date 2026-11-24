@@ -278,13 +278,7 @@ impl UdpClient {
                 .set_only_v6(true)
                 .context("set UDP pool socket IPV6_V6ONLY")?;
         }
-        // Set buffer sizes to 4MB to prevent packet loss under load
-        if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
-            warn!("failed to set udp recv buffer size: {}", e);
-        }
-        if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
-            warn!("failed to set udp send buffer size: {}", e);
-        }
+        crate::socket_utils::set_udp_buffers(&socket);
         socket
             .bind(&bind_addr.into())
             .context("bind UDP pool socket")?;
