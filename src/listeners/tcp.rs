@@ -4,7 +4,7 @@
 
 use crate::engine::{Engine, OnTheSpot};
 use crate::observe::ClientTransport;
-use crate::proto_utils::servfail_reply;
+use crate::proto_utils::{MAX_QUERY_LEN, servfail_reply};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -80,19 +80,41 @@ pub(super) const TCP_READ_CHUNK: usize = 4096;
 /// once this much has gathered, without waiting for the rest of the batch
 const TCP_ANSWERS_FLUSH: usize = 16 * 1024;
 
-/// 从读进来的字节里取出下一个完整的消息（不带长度前缀），拷成单独的一份；还不完整时没有。查询只有几十到几百字节，拷出来
-/// 不费事：在途的查询不再钉住整块读缓冲，读缓冲留在原地接着用，不必每读一轮都另分配一块
-/// Takes the next complete message (without its length prefix) out of the bytes read, copied
-/// into a piece of its own; none while it is still incomplete. A query is a few tens to hundreds
-/// of bytes and cheap to copy: the queries in flight no longer pin the whole read buffer, which
-/// stays where it is for the next reads instead of a new one being allocated each round
-fn take_tcp_message(received: &mut bytes::BytesMut) -> Option<bytes::Bytes> {
+/// 读进来的字节里的下一个消息（见 [`take_tcp_message`]）/ The next message in the bytes read (see
+/// [`take_tcp_message`])
+enum TcpMessage {
+    /// 收全了，不带长度前缀，拷成单独的一份 / Complete, without its length prefix, copied into a
+    /// piece of its own
+    Message(bytes::Bytes),
+    /// 还差这么多字节才收全 / This many bytes short of complete
+    Missing(usize),
+    /// 声明的长度超过 [`MAX_QUERY_LEN`]：没有这么长的查询，不等它、也不答它 / Declaring more than
+    /// [`MAX_QUERY_LEN`]: no query is this long, and it is neither waited for nor answered
+    TooLong,
+}
+
+/// 从读进来的字节里取出下一个消息；长度前缀只在这里读。查询只有几十到几百字节，拷出来不费事：在途的查询不钉住整块读缓冲，
+/// 读缓冲留在原地接着用，不必每读一轮都另分配一块
+/// Takes the next message out of the bytes read; the length prefix is read here alone. A query
+/// is a few tens to hundreds of bytes and cheap to copy: the queries in flight do not pin the
+/// whole read buffer, which stays where it is for the next reads instead of a new one being
+/// allocated each round
+fn take_tcp_message(received: &mut bytes::BytesMut) -> TcpMessage {
     use bytes::Buf;
 
-    let len = u16::from_be_bytes(received.get(..2)?.try_into().ok()?) as usize;
-    let message = bytes::Bytes::copy_from_slice(received.get(2..2 + len)?);
+    let Some(&prefix) = received.first_chunk::<2>() else {
+        return TcpMessage::Missing(2 - received.len());
+    };
+    let len = usize::from(u16::from_be_bytes(prefix));
+    if len > MAX_QUERY_LEN {
+        return TcpMessage::TooLong;
+    }
+    let Some(body) = received.get(2..2 + len) else {
+        return TcpMessage::Missing(2 + len - received.len());
+    };
+    let message = bytes::Bytes::copy_from_slice(body);
     received.advance(2 + len);
-    Some(message)
+    TcpMessage::Message(message)
 }
 
 /// 能放进一个 TCP 消息的回答：长度前缀只有两个字节（RFC 1035 第 4.2.2 节），超过 65535 字节的换成这个查询的 SERVFAIL（见
@@ -159,10 +181,18 @@ pub(super) async fn serve_tcp_conn(
         // 收掉已经答完的 / Reap the ones already answered
         while pending.try_join_next().is_some() {}
 
-        // 读进来的完整消息一个个处理：当场能答的排进 answers，要等上游的交给单独的任务，答完就回
+        // 读进来的完整消息一个个处理：当场能答的排进 answers，要等上游的交给单独的任务，答完就回；剩下的不完整时记下还差
+        // 多少，声明得太长时关掉连接
         // Every complete message read is handled in turn: what is answered on the spot is
-        // queued in answers, and what waits on an upstream goes to its own task, answered when done
-        while let Some(packet_bytes) = take_tcp_message(&mut received) {
+        // queued in answers, and what waits on an upstream goes to its own task, answered when
+        // done; what is left incomplete notes how much it is short, and one declared too long
+        // closes the connection
+        let missing = loop {
+            let packet_bytes = match take_tcp_message(&mut received) {
+                TcpMessage::Message(packet_bytes) => packet_bytes,
+                TcpMessage::Missing(missing) => break missing,
+                TcpMessage::TooLong => break 'connection,
+            };
             waiting = None;
             let async_needed = match engine.on_the_spot(&packet_bytes, peer, &mut spot) {
                 OnTheSpot::Reply => {
@@ -207,10 +237,11 @@ pub(super) async fn serve_tcp_conn(
                     .await;
                 write_tcp_answer(&writer, &packet_bytes, &answer).await;
             });
-        }
+        };
         write_tcp_answers(&writer, &mut answers).await;
 
         // 读更多：至少要够把当前这个消息读完 / Read more: at least enough to finish the current message
+        received.reserve(missing.max(TCP_READ_CHUNK));
         let in_body = received.len() >= 2;
         // 等下一个查询、手上还有查询在等上游回答时不算空闲：读不设时限，等哪个答完再重新算，空闲从再没有查询要等的那一刻
         // 起算。以前照样计时，上游慢时等回答的那段时间里再来的查询躺在接收缓冲里没人读，答完一关连接就丢了。半截消息的
@@ -229,16 +260,6 @@ pub(super) async fn serve_tcp_conn(
                 deadline
             }
         });
-        let missing = match received.get(..2) {
-            Some(prefix) => match u16::from_be_bytes([prefix[0], prefix[1]]) as usize {
-                // 没有这么长的查询（见 MAX_QUERY_LEN）：不为它留 64 KiB，关掉连接 / No query is this
-                // long (see MAX_QUERY_LEN): no 64 KiB is set aside for it, and the connection closes
-                len if len > crate::proto_utils::MAX_QUERY_LEN => break,
-                len => 2 + len - received.len(),
-            },
-            None => 2 - received.len(),
-        };
-        received.reserve(missing.max(TCP_READ_CHUNK));
         // 空闲超时、半截消息超时、对方读到头或出错：不再读，还在处理的查询写完回答后关闭连接，
         // 释放任务与文件描述符
         // Idle timeout, a half-sent message timing out, the peer's end of stream or an error:
