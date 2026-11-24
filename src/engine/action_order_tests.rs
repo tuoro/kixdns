@@ -225,3 +225,33 @@ async fn a_log_before_the_continues_logs_a_query_once() {
     assert_eq!(logged, 1);
     assert_eq!(upstream.queries(), 3, "each forward asked once");
 }
+
+/// 回答阶段的一串动作里写几个 forward 都照写的执行，一个接一个问，最后一个问到的应答作数。以前第五个起每个查询都回
+/// SERVFAIL，配置检查却不报
+/// However many forwards an answer-phase list writes, each runs as written, asking one after
+/// another, and the reply the last one gets stands. From the fifth on every query used to get
+/// SERVFAIL, the configuration check reporting nothing
+#[tokio::test]
+async fn every_forward_an_answer_list_writes_runs() {
+    let checked = answering_upstream(UPSTREAM, 60).await;
+    let last = answering_upstream(STATIC, 60).await;
+    let forward = |upstream: &str| json!({ "type": "forward", "upstream": upstream });
+    let mut answer_actions: Vec<Value> = (0..5).map(|_| forward(&checked.address)).collect();
+    answer_actions.push(forward(&last.address));
+    let engine = engine_from(json!({
+        "settings": counting_settings(json!({})),
+        "pipelines": [{ "id": "main", "rules": [{
+            "name": "all", "matchers": [{ "type": "any" }],
+            "actions": [forward(&checked.address)],
+            "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
+            "response_actions_on_match": answer_actions
+        }]}]
+    }));
+    assert_eq!(first_a(&ask(&engine, &query(), peer()).await), Some(STATIC));
+    assert_eq!(
+        checked.queries(),
+        6,
+        "the rule's forward and five in the list"
+    );
+    assert_eq!(last.queries(), 1);
+}

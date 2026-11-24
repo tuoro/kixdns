@@ -387,8 +387,6 @@ async fn run_response_actions(
 ) -> anyhow::Result<ResponseActionResult> {
     let request = ctx.request;
     let (qname, qtype) = (request.qname.as_ref(), request.qtype);
-    const MAX_RESPONSE_FORWARDS: usize = 4;
-    let mut forward_attempts = 0usize;
 
     for action in ctx.actions {
         if let Some(answer) = action.static_answer() {
@@ -447,20 +445,6 @@ async fn run_response_actions(
                 pre_split_upstreams,
                 upstream_shared: _,
             } => {
-                forward_attempts += 1;
-                if forward_attempts > MAX_RESPONSE_FORWARDS {
-                    crate::warn_sparse!(
-                        event = "response_action_limit",
-                        qname = %qname,
-                        qtype = ?qtype,
-                        client_ip = %request.peer.ip(),
-                        pipeline = %ctx.pipeline_id,
-                        rule = %ctx.rule_name,
-                        "response actions exceeded forward limit"
-                    );
-                    return Ok(servfail(request));
-                }
-
                 // 手上应答记的来源（`udp:1.1.1.1:53`）不是能发查询的地址，所以没写 upstream 时和请求
                 // 阶段一样用 default_upstream
                 // Where the answer in hand came from (`udp:1.1.1.1:53`) is no address to query,
