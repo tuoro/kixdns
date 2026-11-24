@@ -210,24 +210,35 @@ async fn a_handshake_has_its_own_attempt_delay() {
     assert_eq!(*dialled.lock().unwrap(), [a, b]);
 }
 
-/// 到了建连的期限还没连上：已经失败的照列，还在连的记成多久没回应，看得出是哪些地址。以前外层的时限先到，连过的地址和
-/// 攒下的失败一起丢掉，只剩「connect timeout after 5000ms」（DoQ 握手不回的那种见 doq 的测试
+/// 到了建连的期限还没连上：已经失败的照列，还没连上地址的记成多久没回应，连上了地址、握手没回的记成连上用了多久、握手多久没回应，
+/// 看得出是哪些地址、卡在哪一步。以前外层的时限先到，连过的地址和攒下的失败一起丢掉，只剩「connect timeout after 5000ms」；后来
+/// 握手没回的也只记成多久没回应，和 SYN 没回的分不开（DoQ 握手不回的那种见 doq 的测试
 /// `a_doq_handshake_left_unanswered_names_the_address`）
-/// Not through by the connect's deadline: those failed are reported as ever and those still
-/// connecting as unanswered for so long, showing which addresses they were. The outer time limit
-/// used to come first, dropping the addresses dialled along with the failures gathered, leaving
-/// "connect timeout after 5000ms" alone (see the DoQ test
-/// `a_doq_handshake_left_unanswered_names_the_address` for a DoQ handshake never answered)
+/// Not through by the connect's deadline: those failed are reported as ever, those yet to reach
+/// their address as unanswered for so long, and one through to its address with the handshake
+/// unanswered as connected after so long and the handshake unanswered for so long, showing which
+/// addresses they were and where each stuck. The outer time limit used to come first, dropping
+/// the addresses dialled along with the failures gathered, leaving "connect timeout after 5000ms"
+/// alone; a handshake unanswered was later reported as unanswered for so long alone, not told
+/// apart from a SYN unanswered (see the DoQ test `a_doq_handshake_left_unanswered_names_the_address`
+/// for a DoQ handshake never answered)
 #[tokio::test(start_paused = true)]
 async fn attempts_still_connecting_at_the_deadline_are_named() {
     let [a, b, c]: [SocketAddr; 3] =
-        ["192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:53"].map(|address| address.parse().unwrap());
+        ["192.0.2.1:53", "192.0.2.2:53", "192.0.2.3:853"].map(|address| address.parse().unwrap());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let refused_at_b = |address| async move {
+    // a 不回，b 拒绝，c 100 ms 连上、握手不回 / a never answers, b refuses, c is reached in 100 ms and
+    // never answers its handshake
+    let reach = |address| async move {
         anyhow::ensure!(address != b, "refused");
-        std::future::pending::<anyhow::Result<()>>().await
+        if address == a {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(address)
     };
-    let failed = staggered(vec![a, b, c], deadline, refused_at_b, future::ok)
+    let shake = |_| std::future::pending::<anyhow::Result<()>>();
+    let failed = staggered(vec![a, b, c], deadline, reach, shake)
         .await
         .expect_err("none connects");
     // a 一开始就连，b 过了 ATTEMPT_DELAY 才连、马上失败，c 紧跟着连 / a is dialled at once, b after
@@ -235,7 +246,8 @@ async fn attempts_still_connecting_at_the_deadline_are_named() {
     assert_eq!(
         failed.to_string(),
         format!(
-            "connect {b}: refused; connect {a}: no answer in 1000ms; connect {c}: no answer in 750ms"
+            "connect {b}: refused; connect {a}: no answer in 1000ms; \
+             connect {c}: connected after 100ms, handshake no answer in 650ms"
         )
     );
 }
