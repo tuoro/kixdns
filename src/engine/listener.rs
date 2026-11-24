@@ -77,7 +77,7 @@ impl Engine {
             }
         } else {
             match proto_utils::header_reply(packet) {
-                Some(refused) => refused,
+                Some(reply) => reply,
                 None => return OnTheSpot::Drop,
             }
         };
@@ -123,10 +123,15 @@ impl Engine {
                 debug!("{listener} query cannot be read, answering FORMERR");
                 proto_utils::formerr_reply(packet)
             }
+            // 每个监听器各算各的节流：UDP 上一直在超时，TCP、DoH 的超时照样看得见 / Each listener
+            // throttles on its own: with UDP timing out all the time, TCP and DoH timeouts still show
             Err(_) => {
                 crate::warn_sparse!(
+                    per listener;
                     timeout_ms,
                     upstream_timeout_ms = self.get_upstream_timeout_ms(),
+                    qname = %question_text(packet).unwrap_or_default(),
+                    client_ip = %peer.ip(),
                     "{listener} request timeout"
                 );
                 proto_utils::servfail_reply(packet)
@@ -143,4 +148,14 @@ impl Engine {
             None => "DNS",
         }
     }
+}
+
+/// 日志里的问题名：第一个问题的名字，写法同 [`proto_utils::name_text`]，读不出时没有。只在记日志时读
+/// The question name for the logs: the first question's, written as [`proto_utils::name_text`]
+/// writes it, and none when it cannot be read. It is read only when logging
+fn question_text(packet: &[u8]) -> Option<String> {
+    use hickory_proto::rr::Name;
+    use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
+    let name = Name::read(&mut BinDecoder::new(packet).clone(12)).ok()?;
+    Some(proto_utils::name_text(&name))
 }
