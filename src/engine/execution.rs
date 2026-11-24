@@ -1489,7 +1489,7 @@ impl Engine {
                 ),
                 None => {
                     anyhow::ensure!(
-                        crate::proto_utils::question_name_readable(packet),
+                        crate::proto_utils::question_name_end(packet).is_some(),
                         "unreadable question name"
                     );
                     let req = Message::from_bytes(packet).context("parse request")?;
