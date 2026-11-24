@@ -1079,6 +1079,7 @@ async fn a_data_file_leading_where_nothing_can_be_watched_is_reported() {
 
 /// 状态里说 `what` `path` 有位置监视不上的那句话的开头（后面是为什么）/ The start of the status's
 /// sentence saying `what` `path` has places that cannot be watched (why follows)
+#[cfg(unix)]
 fn partly_watched(what: &str, path: &Path) -> String {
     format!(
         "{what} {} cannot be watched everywhere it leads, changes there are read at the next configuration reload: ",
