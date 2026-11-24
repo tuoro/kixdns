@@ -278,7 +278,7 @@ fn only_pipelines_reading_the_changed_tag_change_namespace() {
               "response_actions_on_match": answer }
         ])
     };
-    let state = std::sync::Arc::new(EngineInner::new(runtime(json!({
+    let cfg = runtime(json!({
         "settings": settings(json!({
             "geosite_data_paths": ["/data/geosite.dat"],
             "geoip_dat_path": "/data/geoip.json"
@@ -316,7 +316,8 @@ fn only_pipelines_reading_the_changed_tag_change_namespace() {
                   "response_actions_on_match": answer }
             ]}
         ]
-    }))));
+    }));
+    let state = Arc::new(EngineInner::new(cfg, GeoManagers::default()));
     let names = [
         "site",
         "other_site",

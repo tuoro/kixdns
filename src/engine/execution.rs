@@ -270,7 +270,6 @@ impl Engine {
         source: Option<&str>,
     ) {
         let pool_keys = super::upstream::pool_keys(&new_cfg);
-        let inner = EngineInner::new(new_cfg);
         // Store, generation and event stay together under the reload lock, so
         // the reported generation is the one this reload allocated.
         // 存储、代数与事件在重载锁内一起完成，事件中的代数就是本次分配的值。
@@ -279,11 +278,11 @@ impl Engine {
         // serve_stale takes effect on reload, and how long an answer may be served stale
         // decides how long it stays past its TTL
         self.cache
-            .set_kept(super::phases::kept_past_ttl(&inner.pipeline.settings));
+            .set_kept(super::phases::kept_past_ttl(&new_cfg.settings));
         // 新配置连同它要的 Geo 数据一起存进状态，新规则从第一个请求起就用新的标签和文件
         // The new configuration goes into the state with the Geo data it needs, so the new
         // rules find the new tags and files from their first query
-        geo_sources.follow(inner);
+        geo_sources.follow(new_cfg);
         let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.report_config_loaded(generation, path, source);
         // 新配置不再用到的上游，连接池就此丢掉。此前它们一直留到重启：TCP 和 DoT 连接开着，
