@@ -35,6 +35,8 @@ pub struct BoundListeners {
     udp: Vec<BoundUdp>,
     tcp: Vec<TcpListener>,
     doh: Option<BoundDoh>,
+    /// 配了的入站 DoH 为什么没起来 / Why the inbound DoH configured did not start
+    doh_error: Option<String>,
 }
 
 /// 绑定好、证书也读好了的入站 DoH：`[::]` 时 IPv4、IPv6 各一个监听口（见 [`bind_tcp_listeners`]），共用一份证书
@@ -63,9 +65,10 @@ impl BoundListeners {
 
         let tcp = bind_tcp_listeners(bind_tcp)?;
 
-        // 入站 DoH 只在配置了 bind_doh 时开：绑不上、证书读不了只记错误，DNS 照常答
+        // 入站 DoH 只在配置了 bind_doh 时开：绑不上、证书读不了只记错误、留下原因（见 [`Self::doh_error`]），DNS 照常答
         // Inbound DoH only with bind_doh configured: failing to bind or to read the certificate
-        // is only logged, and DNS answers as usual
+        // is only logged, the reason kept (see [`Self::doh_error`]), and DNS answers as usual
+        let mut doh_error = None;
         let doh = doh.and_then(|doh| {
             let bound = bind_tcp_listeners(doh.bind).and_then(|listeners| {
                 Ok(BoundDoh {
@@ -75,12 +78,29 @@ impl BoundListeners {
                 })
             });
             bound
-                .inspect(|bound| info!(addr = %doh.bind, doh_path = %bound.path, "DoH server listening"))
-                .inspect_err(|err| error!(addr = %doh.bind, error = %format!("{err:#}"), "DoH server cannot start"))
+                .inspect(
+                    |bound| info!(addr = %doh.bind, doh_path = %bound.path, "DoH server listening"),
+                )
+                .map_err(|err| {
+                    let error = format!("{err:#}");
+                    error!(addr = %doh.bind, %error, "DoH server cannot start");
+                    doh_error = Some(error);
+                })
                 .ok()
         });
 
-        Ok(Self { udp, tcp, doh })
+        Ok(Self {
+            udp,
+            tcp,
+            doh,
+            doh_error,
+        })
+    }
+
+    /// 配了的入站 DoH 为什么没起来，带着原因链；起来了或没配时为 None / Why the inbound DoH
+    /// configured did not start, with the cause chain; None when it started or none is configured
+    pub fn doh_error(&self) -> Option<&str> {
+        self.doh_error.as_deref()
     }
 
     /// 开始答 / Starts answering

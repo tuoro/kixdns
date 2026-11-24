@@ -13,10 +13,10 @@
 //! [`BUSY_AT`]: super::transport::BUSY_AT
 
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{Context as TaskContext, Poll, Waker, ready};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwapOption;
@@ -29,16 +29,16 @@ use rustls::pki_types::ServerName;
 use url::{Host, Url};
 
 use super::bootstrap::Bootstrap;
-use super::transport::{Connect, InFlight, StillOpen, connect_tcp, least_busy};
+use super::transport::{Aging, Connect, InFlight, Wear, connect_tcp, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
 pub(crate) type H2Sender = SendRequest<Bytes>;
 
-/// 连接空闲这么久就不再用，和 reqwest 连接池的空闲时限（`pool_idle_timeout`）一样：家用路由器的 NAT 会
-/// 悄悄忘掉空闲久了的 TCP 连接，在那样的连接上发的请求只会等到超时
-/// A connection idle this long is not used again, the same limit as the reqwest pool's
-/// (`pool_idle_timeout`): a home router's NAT quietly forgets TCP connections idle that long,
-/// and a request sent on one would only wait for its timeout
+/// 连接空闲这么久就关掉（见 `transport::Aging`），和 reqwest 连接池的空闲时限（`pool_idle_timeout`）一样：家用路由器的
+/// NAT 会悄悄忘掉空闲久了的 TCP 连接，在那样的连接上发的请求只会等到超时
+/// A connection idle this long is closed (see `transport::Aging`), the same limit as the reqwest
+/// pool's (`pool_idle_timeout`): a home router's NAT quietly forgets TCP connections idle that
+/// long, and a request sent on one would only wait for its timeout
 pub(crate) const DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// 连接的接收窗口，DoQ 的连接和经 reqwest 的 HTTP/2 也用它（见 `transport::doq_transport`、
@@ -55,17 +55,18 @@ pub(super) const CONNECTION_WINDOW: u32 = 1 << 20;
 /// 一条打开的连接 / One open connection
 struct H2Conn {
     sender: H2Sender,
-    /// 最后一次用它时离 `H2Link::epoch` 多少毫秒 / When it was last used, in milliseconds since `H2Link::epoch`
-    last_used_ms: AtomicU64,
+    /// 用它的请求都记上自己的期限，它的看守任务按它老化（见 [`watch`]）/ Every request using it notes its
+    /// deadline here, and its watching task ages it by this (see [`watch`])
+    wear: Arc<Wear>,
 }
 
 /// 一个连接位：最多一条连接 / One connection slot: at most one connection
 struct Slot {
+    /// 位上的连接，建连的任务建好了放进来 / The slot's connection, put here by the connecting task once made
     conn: ArcSwapOption<H2Conn>,
-    /// 在建的连接、建连失败以后的退避（见 [`Connect`]）；连上了对方没选 h2 时是 None / The connection
-    /// being made and the backing off after a failed connect (see [`Connect`]); None when the
-    /// peer connected did not pick h2
-    connecting: tokio::sync::Mutex<Connect<Option<H2Sender>>>,
+    /// 在建的连接、建连失败以后的退避（见 [`Connect`]）/ The connection being made and the backing off
+    /// after a failed connect (see [`Connect`])
+    connecting: parking_lot::Mutex<Connect>,
     /// 这个位上还没答完的请求数 / Requests on this slot not yet answered
     in_flight: AtomicUsize,
 }
@@ -75,11 +76,12 @@ struct Slot {
 /// One DoH upstream's HTTP/2 connections: a slot per worker thread, normally only the first in
 /// use (see [`BUSY_AT`](super::transport::BUSY_AT))
 pub(crate) struct H2Link {
-    slots: Box<[Slot]>,
+    slots: Box<[Arc<Slot>]>,
     /// 这个上游握手时没选 h2：之后的请求都交给 reqwest / This upstream did not pick h2 in the handshake: later requests all go to reqwest
-    no_h2: AtomicBool,
-    epoch: Instant,
-    idle_timeout: Duration,
+    no_h2: Arc<AtomicBool>,
+    /// 连接怎样老化：不限最长存活，空闲 [`DOH_IDLE_TIMEOUT`]（测试里可以改短）/ How connections age: no
+    /// longest life, idle for [`DOH_IDLE_TIMEOUT`] (shorter in some tests)
+    aging: Aging,
 }
 
 impl H2Link {
@@ -87,76 +89,95 @@ impl H2Link {
     pub(crate) fn new(idle_timeout: Duration, connections: usize) -> Self {
         Self {
             slots: (0..connections.max(1))
-                .map(|_| Slot {
-                    conn: ArcSwapOption::empty(),
-                    connecting: tokio::sync::Mutex::new(Connect::default()),
-                    in_flight: AtomicUsize::new(0),
+                .map(|_| {
+                    Arc::new(Slot {
+                        conn: ArcSwapOption::empty(),
+                        connecting: parking_lot::Mutex::default(),
+                        in_flight: AtomicUsize::new(0),
+                    })
                 })
                 .collect(),
-            no_h2: AtomicBool::new(false),
-            epoch: Instant::now(),
-            idle_timeout,
+            no_h2: Arc::default(),
+            aging: Aging::new(Duration::ZERO, idle_timeout),
         }
     }
 
-    fn now_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// `slot` 上还能用的现有连接：能接着开流、也没空闲太久 / The connection on `slot` if it is still usable: open to new streams and not idle too long
-    fn usable(&self, slot: &Slot, now: u64) -> Option<H2Sender> {
+    /// `slot` 上还能接着开流的现有连接，记上用它的请求的期限 `deadline`；空闲太久的看守任务已经把它从位上拿掉了（见
+    /// [`watch`]）
+    /// The connection on `slot` if it is still open to new streams, noted with the deadline
+    /// `deadline` of the request using it; one idle too long has been taken off the slot by its
+    /// watching task already (see [`watch`])
+    fn usable(slot: &Slot, deadline: tokio::time::Instant) -> Option<H2Sender> {
         let conn = slot.conn.load_full()?;
-        let idle =
-            Duration::from_millis(now.saturating_sub(conn.last_used_ms.load(Ordering::Relaxed)));
-        if idle >= self.idle_timeout {
-            return None;
-        }
         let sender = open_to_new_streams(&conn.sender)?;
-        conn.last_used_ms.store(now, Ordering::Relaxed);
+        conn.wear.note(deadline);
         Some(sender)
     }
 
-    /// 发请求用的发送端和它占着的连接位：位上有能用的连接就用它，没有就连一条。请求答完（或放弃）之前一直
-    /// 拿着 [`InFlight`]。上游没选 h2 时是 None，交给 reqwest
+    /// 发请求用的发送端和它占着的连接位：位上有能用的连接就用它，没有就等一条新的（见 [`Connect`]：建连的任务建好了放到
+    /// 位上，这个请求再取用；等来的连接在取用之前就没了时不再等下一条）。请求答完（或放弃）之前一直拿着 [`InFlight`]。上游
+    /// 没选 h2 时是 None，交给 reqwest。`deadline` 是这个请求的期限
     /// The sender for a request and the slot it holds: the slot's connection when usable, a new
-    /// one otherwise. The [`InFlight`] is kept until the request is answered (or given up). None
-    /// when the upstream did not pick h2, for reqwest to handle
+    /// one waited for otherwise (see [`Connect`]: the connecting task puts it on the slot once
+    /// made, and this request takes it from there; a connection waited for and gone before it
+    /// could be taken is not followed by a wait for another). The [`InFlight`] is kept until the
+    /// request is answered (or given up). None when the upstream did not pick h2, for reqwest to
+    /// handle. `deadline` is the request's
     pub(crate) async fn sender(
         &self,
         url: &Url,
         tls: &Arc<ClientConfig>,
         bootstrap: &Arc<Bootstrap>,
+        deadline: tokio::time::Instant,
     ) -> anyhow::Result<Option<(H2Sender, InFlight<'_>)>> {
-        if self.no_h2.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
         let slot = least_busy(&self.slots, |slot| slot.in_flight.load(Ordering::Relaxed));
         let in_flight = InFlight::enter(&slot.in_flight);
-        if let Some(sender) = self.usable(slot, self.now_ms()) {
-            return Ok(Some((sender, in_flight)));
-        }
-        let mut connecting = slot.connecting.lock().await;
-        // 等锁的时候别的请求可能已经连好了 / Another request may have connected while this one waited for the lock
-        if let Some(sender) = self.usable(slot, self.now_ms()) {
-            return Ok(Some((sender, in_flight)));
-        }
-        let made = connecting.finish(|| {
-            let (url, tls, bootstrap) = (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
-            async move { connect(&url, &tls, &bootstrap).await }
-        });
-        match made.await? {
-            Some(sender) => {
-                slot.conn.store(Some(Arc::new(H2Conn {
-                    sender: sender.clone(),
-                    last_used_ms: AtomicU64::new(self.now_ms()),
-                })));
-                Ok(Some((sender, in_flight)))
+        for waited in [false, true] {
+            if self.no_h2.load(Ordering::Relaxed) {
+                return Ok(None);
             }
-            None => {
-                self.no_h2.store(true, Ordering::Relaxed);
-                Ok(None)
+            if let Some(sender) = Self::usable(slot, deadline) {
+                return Ok(Some((sender, in_flight)));
             }
+            if waited {
+                break;
+            }
+            let attempt = {
+                let mut connecting = slot.connecting.lock();
+                // 别的请求的连接可能刚放到位上 / Another request's connection may have just been put on the slot
+                if let Some(sender) = Self::usable(slot, deadline) {
+                    return Ok(Some((sender, in_flight)));
+                }
+                connecting.attempt(|| {
+                    let (url, tls, bootstrap) =
+                        (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
+                    let (slot, no_h2, aging) =
+                        (Arc::clone(slot), Arc::clone(&self.no_h2), self.aging);
+                    async move {
+                        match connect(&url, &tls, &bootstrap).await? {
+                            Some(sender) => {
+                                let wear = Arc::new(Wear::new());
+                                let conn = Arc::new(H2Conn {
+                                    sender,
+                                    wear: Arc::clone(&wear),
+                                });
+                                tokio::spawn(watch(
+                                    Arc::downgrade(&slot),
+                                    Arc::downgrade(&conn),
+                                    wear,
+                                    aging,
+                                ));
+                                slot.conn.store(Some(conn));
+                            }
+                            None => no_h2.store(true, Ordering::Relaxed),
+                        }
+                        Ok(())
+                    }
+                })?
+            };
+            attempt.await?;
         }
+        anyhow::bail!("doh connection closed as soon as it was made")
     }
 
     /// 现在有没有一条直连的连接 / Whether a direct connection is open now
@@ -190,12 +211,26 @@ impl H2Link {
     }
 }
 
-/// 建好以后放着的连接：对方没选 h2 时没有连接可查；有的话要还能开新流 / A connection left waiting:
-/// with no h2 picked there is none to check; with one, it has to be open to new streams
-impl StillOpen for Option<H2Sender> {
-    fn still_open(&mut self) -> bool {
-        self.as_ref()
-            .is_none_or(|sender| open_to_new_streams(sender).is_some())
+/// 看着位 `slot` 上的连接 `conn`，用旧了（见 [`Aging`]）就从位上拿掉：接着来的请求另连一条，它自己在还没答完的请求都答完以后
+/// 关掉（h2 在最后一个发送端放下、流都结束时发 GOAWAY）。这之前它已经从位上换下去了（断了、连续出错重建）、或者位已经不在了，
+/// 就什么都不做
+/// Watches the connection `conn` on the slot `slot` and takes it off the slot once worn (see
+/// [`Aging`]): requests coming next connect again, and it closes by itself once the requests
+/// still unanswered on it are through (h2 sends a GOAWAY once its last sender is let go and its
+/// streams are over). One replaced on the slot before then (gone, rebuilt after repeated errors),
+/// or a slot gone, is left alone
+async fn watch(slot: Weak<Slot>, conn: Weak<H2Conn>, wear: Arc<Wear>, aging: Aging) {
+    let why = aging.worn(&wear).await;
+    if let (Some(slot), Some(conn)) = (slot.upgrade(), conn.upgrade()) {
+        slot.conn.rcu(|current| {
+            current
+                .clone()
+                .filter(|current| !Arc::ptr_eq(current, &conn))
+        });
+        tracing::debug!(
+            why,
+            "DoH HTTP/2 connection worn, closing it once its requests are done"
+        );
     }
 }
 
@@ -233,8 +268,8 @@ async fn connect(
 
 /// 一条连接上记着多少个取消了的请求、各记多久。请求被放弃时（时限先到、几个上游竞速它输了）流被取消，上游的回答
 /// 可能已经在路上：回答落在还记着的流上就悄悄丢掉；落在忘掉的流上，h2 每一帧都记一次「对方出错」，这个数只增不减，
-/// 到 1024 就把连接断开。h2 默认只记 10 个（记 30 秒），和 UDP 上游一起问、每次都慢一步的 DoH 上游，每个回答都落在
-/// 忘掉的流上，一千来个查询连接就断一次。迟到的回答一般几百毫秒内就到，所以记 2 秒、最多记 16384 个：一条连接每秒
+/// 到 1024 就把连接断开。h2 默认只记 10 个（记 30 秒），照这样，和 UDP 上游一起问、每次都慢一步的 DoH 上游，每个回答都
+/// 落在忘掉的流上，一千来个查询连接就断一次。迟到的回答一般几百毫秒内就到，所以记 2 秒、最多记 16384 个：一条连接每秒
 /// 取消八千个请求以内都记得住；记满时每个占几百字节，一条连接几兆。超出的照旧算数，那道 1024 的上限留着兜底
 /// How many cancelled requests a connection remembers, and for how long each. A request given
 /// up (a deadline that came first, a race between upstreams lost) has its stream cancelled while
@@ -242,8 +277,8 @@ async fn connect(
 /// dropped quietly; one landing on a forgotten stream has h2 count each frame as an error by the
 /// peer, in a count that only grows, and at 1024 the connection is ended. h2 remembers 10 by
 /// default (for 30 seconds), so a DoH upstream asked along with a UDP one and always a step
-/// slower had every answer land on a forgotten stream, and its connection ended every thousand
-/// queries or so. Late answers mostly arrive within a few hundred milliseconds, so each is
+/// slower would have every answer land on a forgotten stream, its connection ending every
+/// thousand queries or so. Late answers mostly arrive within a few hundred milliseconds, so each is
 /// remembered for 2 seconds and at most 16384 are: up to eight thousand requests cancelled a
 /// second on one connection are all remembered, at a few hundred bytes each when full, a few
 /// megabytes a connection. Any beyond that count as before, and the limit of 1024 stays as the
