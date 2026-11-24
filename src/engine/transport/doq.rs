@@ -4,8 +4,8 @@
 
 use super::address::{DoqTarget, parse_doq_target};
 use super::connect::{
-    Aging, Connect, ConnectionPool, InFlight, UpstreamPools, Wear, build_tls_client_config, forget,
-    staggered,
+    ATTEMPT_DELAY, Aging, Connect, ConnectionPool, InFlight, UpstreamPools, Wear,
+    build_tls_client_config, forget, staggered,
 };
 use super::{MAX_DNS_MESSAGE_SIZE, retry_budget};
 use crate::engine::bootstrap::Bootstrap;
@@ -33,6 +33,8 @@ struct DoqRuntime {
     aging: Aging,
     /// 上游的主机名怎样解析（见 [`Bootstrap`]）/ How upstream host names are resolved (see [`Bootstrap`])
     bootstrap: Arc<Bootstrap>,
+    /// 全局的 0-RTT 设置，上游没写 `0rtt` 时照它 / The global 0-RTT setting, followed by the
+    /// upstreams not writing `0rtt`
     enable_0rtt: bool,
     /// 0-RTT 的安全提示只在真正用上 0-RTT 时打印一次
     /// Prints the 0-RTT security notice once, and only if 0-RTT is really used
@@ -136,16 +138,37 @@ pub struct DoqMuxClient {
 /// learned, the others need not each fail and sit out a timeout to learn again
 #[derive(Default)]
 struct ZeroRtt {
-    /// 上游拒绝了 0-RTT，或者上游回了握手的 0-RTT 连接上超时：到重启都不再用（见 [`DoqMuxClient::disable_zero_rtt`]）
-    /// The upstream rejected 0-RTT, or a 0-RTT connection timed out with its handshake answered:
-    /// it is not used again until a restart (see [`DoqMuxClient::disable_zero_rtt`])
+    /// 上游拒绝了 0-RTT：到重启都不再用（见 [`DoqMuxClient::disable_zero_rtt`]）/ The upstream
+    /// rejected 0-RTT: it is not used again until a restart (see [`DoqMuxClient::disable_zero_rtt`])
     rejected: AtomicBool,
-    /// 上一次完整握手连上的地址，0-RTT 只发往它：恢复会话的连接当场就算连上，连的地址不通也看不出来，错开建连就轮不到
-    /// 别的地址
-    /// The address the last full handshake reached, the only one 0-RTT goes to: a resumed
-    /// connection counts as made at once, its address dead or not, so a staggered connect would
-    /// never get to the other addresses
-    reached: parking_lot::Mutex<Option<SocketAddr>>,
+    /// 上一次完整握手连上的地址和那次握手的往返时间，0-RTT 只发往它：恢复会话的连接当场就算连上，错开建连轮不到别的地址，
+    /// 所以地址不通要靠握手的期限看出来（见 [`answer_within`]）
+    /// The address the last full handshake reached and that handshake's round trip, the only
+    /// address 0-RTT goes to: a resumed connection counts as made at once, a staggered connect
+    /// never getting to the other addresses, so a dead address shows by the handshake's deadline
+    /// (see [`answer_within`])
+    reached: parking_lot::Mutex<Option<(SocketAddr, Duration)>>,
+}
+
+impl ZeroRtt {
+    /// 发往 `address` 的 0-RTT 握手上游一直没回：这个地址不通，和 0-RTT 无关，忘掉它，下一次建连在几个地址上错开着完整握手
+    /// The 0-RTT handshake sent to `address` was never answered: the address is down, which says
+    /// nothing about 0-RTT, and it is forgotten, the next connect shaking hands in full staggered
+    /// over the addresses
+    fn address_down(&self, address: SocketAddr) {
+        self.reached.lock().take_if(|(at, _)| *at == address);
+    }
+}
+
+/// 用了 0-RTT 的连接，上游最晚多久要回握手：两个 [`ATTEMPT_DELAY`]，上一次完整握手往返时间（`rtt`）的三倍更长时照它，
+/// 丢一个包也来得及。到时没回的连接关掉，等在上面的查询在剩下的预算里换一条完整握手的连接重发（见 [`DoqMuxClient::watch`]）
+/// How long the upstream has to answer the handshake of a connection that used 0-RTT: two
+/// [`ATTEMPT_DELAY`]s, or three times the last full handshake's round trip (`rtt`) when longer,
+/// time enough for a packet lost. A connection unanswered by then is closed, and the queries
+/// waiting on it are sent again within what is left of their budgets on a connection shaking
+/// hands in full (see [`DoqMuxClient::watch`])
+fn answer_within(rtt: Duration) -> Duration {
+    (2 * ATTEMPT_DELAY).max(3 * rtt)
 }
 
 /// 新建的一条 DoQ 连接，和它有没有用 0-RTT / A DoQ connection newly made, and whether it used 0-RTT
@@ -174,6 +197,30 @@ struct DoqConn {
     /// Answers read on it. A query timing out looks whether this grew meanwhile: if so the
     /// connection kept answering and only this one is slow, so it is not replaced
     answers: AtomicU64,
+}
+
+impl DoqConn {
+    /// 用了 0-RTT，上游却什么都还没回：握手没回，也没关掉它 / Made with 0-RTT, and nothing from the
+    /// upstream yet: no answer to its handshake, nor a close
+    fn unanswered(&self) -> bool {
+        self.used_0rtt
+            && self.conn.handshake_data().is_none()
+            && !self
+                .conn
+                .close_reason()
+                .as_ref()
+                .is_some_and(closed_by_peer)
+    }
+}
+
+/// 连接是被对端关闭、重置的 / The connection was closed or reset by the peer
+fn closed_by_peer(err: &quinn::ConnectionError) -> bool {
+    matches!(
+        err,
+        quinn::ConnectionError::ApplicationClosed(_)
+            | quinn::ConnectionError::ConnectionClosed(_)
+            | quinn::ConnectionError::Reset
+    )
 }
 
 /// DoQ 连接的传输参数。查询都是我们开的流，一个流问一个（RFC 9250 第 4.2 节），所以：
@@ -221,6 +268,26 @@ fn doq_transport(
     Ok(transport)
 }
 
+/// DoQ 连接的设置：`tls` 加上 ALPN `doq`，`transport` 见 [`doq_transport`]。TLS 一律可以提出早期数据，用不用 0-RTT
+/// 由每次建连按上游的设置定（见 [`DoqMuxClient::zero_rtt_retry_allowed`]）：TLS 照全局设置的话，全局关、按上游开的
+/// 0-RTT 就从来用不上
+/// The settings of DoQ connections: `tls` with ALPN `doq`, and `transport` (see
+/// [`doq_transport`]). TLS may always offer early data, whether 0-RTT is used being decided on
+/// each connect by the upstream's setting (see [`DoqMuxClient::zero_rtt_retry_allowed`]): with
+/// TLS following the global setting, 0-RTT switched off globally and on for an upstream would
+/// never be used
+fn doq_client_config(
+    mut tls: rustls::ClientConfig,
+    transport: QuicTransportConfig,
+) -> anyhow::Result<quinn::ClientConfig> {
+    tls.alpn_protocols = vec![b"doq".to_vec()];
+    tls.enable_early_data = true;
+    let crypto = QuicClientConfig::try_from(tls).context("build quic client config")?;
+    let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
+}
+
 /// DoQ 连接最长用多久：30 分钟 / How long a DoQ connection may live: 30 minutes
 const DOQ_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
@@ -238,16 +305,10 @@ impl DoqClient {
         enable_0rtt: bool,
         bootstrap: Arc<Bootstrap>,
     ) -> anyhow::Result<Self> {
-        let mut tls = build_tls_client_config()?;
-        tls.alpn_protocols = vec![b"doq".to_vec()];
-        tls.enable_early_data = enable_0rtt;
-
-        let quic_crypto = QuicClientConfig::try_from(tls).context("build quic client config")?;
-        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
-        client_config.transport_config(Arc::new(doq_transport(
-            keepalive_interval_ms,
-            idle_timeout_secs,
-        )?));
+        let client_config = doq_client_config(
+            build_tls_client_config()?,
+            doq_transport(keepalive_interval_ms, idle_timeout_secs)?,
+        )?;
 
         let mut endpoint_v4 = QuicEndpoint::client("0.0.0.0:0".parse()?)?;
         endpoint_v4.set_default_client_config(client_config.clone());
@@ -393,15 +454,33 @@ impl DoqMuxClient {
                     return Ok(bytes);
                 }
                 Ok(Err(failure)) => {
+                    // 0-RTT 的握手上游一直没回、连接就没了（握手到期或者别的查询超时关掉的，见 `watch`）：地址不通，
+                    // 和 0-RTT 无关。quinn 在握手完成前没了的连接上照样报 `ZeroRttRejected`，所以先看这个
+                    // The 0-RTT handshake never answered by the upstream and the connection gone
+                    // (closed at the handshake's deadline or by another query timing out, see
+                    // `watch`): the address is down, which says nothing about 0-RTT. quinn says
+                    // `ZeroRttRejected` on a connection gone before its handshake completed as
+                    // well, so this is looked at first
+                    let unanswered = pooled.unanswered();
                     // 连接没了才换；流被重置、回答不合协议是这一个查询的事，连接照用
                     // Only a connection that is gone is replaced; a stream reset or a malformed
                     // answer is this one query's matter, and the connection stays in use
-                    let gone = Self::connection_gone(&failure);
+                    let gone = unanswered || Self::connection_gone(&failure);
                     if gone {
                         forget(&self.pooled, &pooled);
                     }
                     let retry = if !allow_retry {
                         false
+                    } else if unanswered {
+                        // 没回握手的那个地址已经忘掉，新连接完整握手、在几个地址上错开着连
+                        // The silent address forgotten, the fresh connection shakes hands in
+                        // full staggered over the addresses
+                        debug!(
+                            upstream = %self.upstream,
+                            error = %failure,
+                            "DoQ 0-RTT handshake unanswered, retrying with a full handshake"
+                        );
+                        true
                     } else if Self::early_data_refused(&failure)
                         || (used_0rtt
                             && self.zero_rtt_retry_allowed(target)
@@ -437,20 +516,15 @@ impl DoqMuxClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(_) => {
-                    // 用了 0-RTT 的连接上超时：上游连握手都没回的，是这个地址不通，和 0-RTT 无关，忘掉这个地址，下一次
-                    // 建连几个地址照常错开着完整握手；握手回了的，算 0-RTT 的嫌疑，往后不再用。普通连接上的超时只是这次
-                    // 回答慢。预算已经用完，不再重试
-                    // A timeout on a connection that used 0-RTT: with its handshake never answered,
-                    // the address is down, which says nothing about 0-RTT, and it is forgotten, the
-                    // next connect shaking hands in full staggered over the addresses as ever; with
-                    // the handshake answered, 0-RTT is under suspicion and not used from then on. On
-                    // a normal connection it is just a slow answer. The budget is spent, so there is
-                    // no retry
-                    if pooled.used_0rtt && pooled.conn.handshake_data().is_none() {
-                        let address = pooled.conn.remote_address();
-                        self.zero_rtt.reached.lock().take_if(|at| *at == address);
-                    } else if used_0rtt {
-                        self.disable_zero_rtt();
+                    // 超时而上游连 0-RTT 的握手都没回：是这个地址不通（见 [`ZeroRtt::address_down`]）。别的超时只是这次
+                    // 回答慢，和 0-RTT 无关：0-RTT 被拒绝时 quinn 报的是 `ZeroRttRejected`，由上面那一支处理。预算
+                    // 已经用完，不再重试
+                    // A timeout with the 0-RTT handshake never answered by the upstream: the
+                    // address is down (see [`ZeroRtt::address_down`]). Any other timeout is just
+                    // a slow answer, which says nothing about 0-RTT: 0-RTT refused, quinn says
+                    // `ZeroRttRejected`, handled above. The budget is spent, so there is no retry
+                    if pooled.unanswered() {
+                        self.zero_rtt.address_down(pooled.conn.remote_address());
                     }
                     // 这期间连接上没读到过别的回答（多半死了或者卡住了）才换：从池里拿掉、关掉它，和 TCP、DoT 复位连接
                     // 一样。它上面别的查询马上失败，取自池里的按连接没了换一条新连接重发，不用干等到各自的期限
@@ -623,14 +697,19 @@ impl DoqMuxClient {
                 Arc::clone(&self.runtime),
                 Arc::clone(&self.upstream),
                 target.clone(),
-                zero_rtt_at,
+                zero_rtt_at.map(|(address, _)| address),
                 deadline,
             );
             async move {
                 let NewDoqConn { conn, used_0rtt } = made.await?;
-                if !used_0rtt {
-                    *zero_rtt.reached.lock() = Some(conn.remote_address());
-                }
+                // 用了 0-RTT 的，握手到期没回就关掉（见 [`answer_within`]）/ One that used 0-RTT is
+                // closed when its handshake goes unanswered past the deadline (see [`answer_within`])
+                let answer_by = if used_0rtt {
+                    zero_rtt_at.map(|(_, rtt)| tokio::time::Instant::now() + answer_within(rtt))
+                } else {
+                    *zero_rtt.reached.lock() = Some((conn.remote_address(), conn.rtt()));
+                    None
+                };
                 let pooled = Arc::new(DoqConn {
                     conn,
                     used_0rtt,
@@ -638,7 +717,9 @@ impl DoqMuxClient {
                     answers: AtomicU64::new(0),
                 });
                 pool.store(Some(Arc::clone(&pooled)));
-                tokio::spawn(Self::watch(pooled, pool, aging, stop, upstream));
+                tokio::spawn(Self::watch(
+                    pooled, pool, aging, stop, upstream, zero_rtt, answer_by,
+                ));
                 Ok(())
             }
         };
@@ -650,24 +731,45 @@ impl DoqMuxClient {
     }
 
     /// 看着池里的一条连接直到它走：关了（上游关的，或者查询判它卡住了关的）就从池里拿掉；用旧了（见 [`Aging`]）也拿掉，
-    /// 接着来的查询另建一条，它上面的查询都过了期限再关；客户端被丢掉时马上关。keepalive 让上游看它一直在用，不由这里关的话，
-    /// 没人用的连接会一直开着
+    /// 接着来的查询另建一条，它上面的查询都过了期限再关；客户端被丢掉时马上关；用了 0-RTT 而到 `answer_by` 上游还没回
+    /// 握手时，忘掉这个地址（见 [`ZeroRtt::address_down`]）、马上关，它上面的查询换一条新连接重发。keepalive 让上游看它一直
+    /// 在用，不由这里关的话，没人用的连接会一直开着
     /// Watches a pooled connection until it goes: closed (by the upstream, or by a query that
     /// found it stalled), it is taken out of the pool; worn (see [`Aging`]), it is taken out too,
     /// queries coming next make another, and it closes once the queries on it are past their
-    /// deadlines; with the client dropped it closes at once. Its keepalive has the upstream see it
-    /// in use all along, so a connection nobody uses would stay open were it not closed here
+    /// deadlines; with the client dropped it closes at once; made with 0-RTT and its handshake
+    /// unanswered by the upstream at `answer_by`, its address is forgotten (see
+    /// [`ZeroRtt::address_down`]) and it closes at once, the queries on it sent again on a fresh
+    /// one. Its keepalive has the upstream see it in use all along, so a connection nobody uses
+    /// would stay open were it not closed here
     async fn watch(
         pooled: Arc<DoqConn>,
         pool: Arc<ArcSwapOption<DoqConn>>,
         aging: Aging,
         stop: CancellationToken,
         upstream: Arc<str>,
+        zero_rtt: Arc<ZeroRtt>,
+        answer_by: Option<tokio::time::Instant>,
     ) {
+        let unanswered = async {
+            match answer_by {
+                Some(by) => tokio::time::sleep_until(by).await,
+                None => std::future::pending().await,
+            }
+            if !pooled.unanswered() {
+                std::future::pending::<()>().await;
+            }
+        };
         let worn = tokio::select! {
             () = stop.cancelled() => None,
             _ = pooled.conn.closed() => None,
             why = aging.worn(&pooled.wear) => Some(why),
+            () = unanswered => {
+                let address = pooled.conn.remote_address();
+                debug!(upstream = %upstream, %address, "DoQ 0-RTT handshake unanswered, closing the connection");
+                zero_rtt.address_down(address);
+                None
+            }
         };
         forget(&pool, &pooled);
         if let Some(why) = worn {
@@ -697,22 +799,13 @@ impl DoqMuxClient {
     /// having nothing to do with 0-RTT. It takes no `&self`, so a test can drive
     /// it with real quinn error values.
     fn zero_rtt_likely_rejected(failure: &DoqFailure) -> bool {
-        fn peer_ended_it(err: &quinn::ConnectionError) -> bool {
-            matches!(
-                err,
-                quinn::ConnectionError::ApplicationClosed(_)
-                    | quinn::ConnectionError::ConnectionClosed(_)
-                    | quinn::ConnectionError::Reset
-            )
-        }
-
         match failure {
-            DoqFailure::OpenStream(err) => peer_ended_it(err),
+            DoqFailure::OpenStream(err) => closed_by_peer(err),
             DoqFailure::Write(quinn::WriteError::ZeroRttRejected) => true,
-            DoqFailure::Write(quinn::WriteError::ConnectionLost(err)) => peer_ended_it(err),
+            DoqFailure::Write(quinn::WriteError::ConnectionLost(err)) => closed_by_peer(err),
             DoqFailure::Read(quinn::ReadToEndError::Read(err)) => match err {
                 quinn::ReadError::ZeroRttRejected => true,
-                quinn::ReadError::ConnectionLost(err) => peer_ended_it(err),
+                quinn::ReadError::ConnectionLost(err) => closed_by_peer(err),
                 _ => false,
             },
             _ => false,
@@ -720,11 +813,14 @@ impl DoqMuxClient {
     }
 
     /// quinn 明说这个查询发出去的是早期数据、被上游拒收了。只有 0-RTT 期间开的流才会报这个，所以不管这条连接是不是
-    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次，搭在别的查询建的连接上的也一样
+    /// 这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次，搭在别的查询建的连接上的也一样。握手完成以前就没了的
+    /// 连接上 quinn 也这么报，上游没回握手的由调用方先挑出来（见 [`DoqConn::unanswered`]）
     /// quinn says outright that what this query sent was early data the upstream refused. Only
     /// a stream opened during 0-RTT is told so, and whether or not this query made the
     /// connection it is to be sent again on one without 0-RTT, one riding a connection another
-    /// query made included
+    /// query made included. quinn says so too on a connection gone before its handshake
+    /// completed, those the upstream never answered being told apart first by the caller (see
+    /// [`DoqConn::unanswered`])
     fn early_data_refused(failure: &DoqFailure) -> bool {
         matches!(
             failure,
@@ -775,11 +871,16 @@ impl DoqMuxClient {
         }
     }
     /// 建一条到 `target` 的连接，最晚到建连的期限 `deadline`；连接和用没用 0-RTT。几个地址错开着连（见 [`staggered`]），
-    /// 握手失败了马上连下一个。给了 `zero_rtt_at` 而它在解析出的地址里时，它排最前、在它上面先试 0-RTT，别的地址完整握手
+    /// 握手失败了马上连下一个。给了 `zero_rtt_at` 而它在解析出的地址里时，它排最前、在它上面先试 0-RTT：用得上就当场
+    /// 连上，别的地址不再连，这个地址通不通要看握手的期限（见 [`answer_within`]）；用不上（没有会话票据）就在它上面完整握手，
+    /// 和别的地址照常错开
     /// Connects to `target` by the connect's `deadline`; the connection and whether 0-RTT was
     /// used. Several addresses are connected to staggered (see [`staggered`]), a failed handshake
     /// moving on to the next at once. With `zero_rtt_at` given and among the addresses resolved,
-    /// it comes first and tries 0-RTT first, the other addresses shaking hands in full
+    /// it comes first and tries 0-RTT first: possible, the connection is made at once and no other
+    /// address dialled, the handshake's deadline telling whether this one is up (see
+    /// [`answer_within`]); not possible (no session ticket), it shakes hands in full there,
+    /// staggered with the others as usual
     async fn connect_new(
         runtime: Arc<DoqRuntime>,
         upstream: Arc<str>,
@@ -846,11 +947,11 @@ impl DoqMuxClient {
             });
             match connecting.into_0rtt() {
                 Ok((conn, _zero_rtt_accepted)) => {
-                    // 0-RTT 连接已建立。某些 DoQ 服务器（如阿里 DNS）会拒绝 0-RTT 数据，被拒绝、或者握手回了还超时，
-                    // 就为此上游禁用 0-RTT（见 `send_with_retry`）
+                    // 0-RTT 连接已建立。某些 DoQ 服务器（如阿里 DNS）会拒绝 0-RTT 数据，被拒绝就为此上游禁用 0-RTT
+                    // （见 `send_with_retry`）
                     // 0-RTT connection established. Some DoQ servers (e.g. Alibaba DNS) reject
-                    // 0-RTT data; once rejected, or timing out with the handshake answered, 0-RTT
-                    // is disabled for this upstream (see `send_with_retry`)
+                    // 0-RTT data; once rejected, 0-RTT is disabled for this upstream (see
+                    // `send_with_retry`)
                     debug!(
                         upstream = %upstream,
                         "DoQ 0-RTT connection established"
