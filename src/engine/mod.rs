@@ -109,7 +109,7 @@ pub mod utils;
 
 pub use concurrency::PermitManager;
 pub use core::{Engine, EngineBuilder};
-pub use execution::PreParsedData;
+pub use execution::{PreParsedData, UnreadableQuery};
 pub use listener::{OnTheSpot, write_cache_hit};
 pub use pipeline::select_pipeline;
 pub use types::{EngineInner, FastPathResponse};

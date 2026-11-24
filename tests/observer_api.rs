@@ -20,7 +20,7 @@ use hickory_proto::serialize::binary::BinDecodable;
 
 use kixdns::config::{Transport, parse_config};
 use kixdns::doh_server::{DohCertificate, run_doh};
-use kixdns::engine::{Engine, FastPathResponse};
+use kixdns::engine::{Engine, FastPathResponse, UnreadableQuery};
 use kixdns::matcher::RuntimePipelineConfig;
 use kixdns::observe::{
     CacheHit, CacheHitKind, ClientTransport, ConfigLoaded, ConfigReloadFailed, DecisionDetail,
@@ -834,9 +834,7 @@ async fn a_request_says_when_it_started_and_how_it_is_reported() {
         .await
         .unwrap();
     let slow = Instant::now();
-    let fast = engine
-        .handle_packet_fast(&query("a.cached.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("a.cached.test"), peer());
     assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
     let after = Instant::now();
 
@@ -926,9 +924,7 @@ async fn an_observer_can_take_a_cache_hit_whole() {
     assert!(observer.whole.lock().unwrap().is_empty());
     assert_eq!(observer.started.lock().unwrap().len(), 1);
 
-    let fast = engine
-        .handle_packet_fast(&query("a.cached.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("a.cached.test"), peer());
     assert!(matches!(fast, Some(FastPathResponse::CacheHit { .. })));
     assert_eq!(
         *observer.whole.lock().unwrap(),
@@ -949,9 +945,7 @@ async fn an_observer_can_take_a_cache_hit_whole() {
         "no separate events"
     );
 
-    let fast = engine
-        .handle_packet_fast(&query("b.blocked.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("b.blocked.test"), peer());
     assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     assert_eq!(observer.whole.lock().unwrap().len(), 1);
     assert_eq!(observer.started.lock().unwrap().len(), 2);
@@ -1028,9 +1022,7 @@ async fn an_observer_can_take_a_rule_answer_whole() {
         "id": "main",
         "rules": [{ "name": "ip", "matchers": [{ "type": "any" }], "actions": answer }]
     }]));
-    let fast = engine
-        .handle_packet_fast(&query("a.ip.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("a.ip.test"), peer());
     assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     assert_eq!(
         *observer.whole.lock().unwrap(),
@@ -1061,16 +1053,12 @@ async fn an_observer_can_take_a_rule_answer_whole() {
         .unwrap();
     assert!(observer.whole.lock().unwrap().is_empty());
     assert_eq!(observer.started.lock().unwrap().len(), 1);
-    let fast = engine
-        .handle_packet_fast(&query("b.ip.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("b.ip.test"), peer());
     assert!(
         matches!(fast, Some(FastPathResponse::AsyncNeeded(_))),
         "another name is not cached"
     );
-    let fast = engine
-        .handle_packet_fast(&query("a.ip.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("a.ip.test"), peer());
     assert!(!matches!(fast, Some(FastPathResponse::AsyncNeeded(_))));
     assert_eq!(
         observer.started.lock().unwrap().len(),
@@ -1108,9 +1096,7 @@ async fn a_rules_addresses_are_counted_for_the_type_asked() {
     })
     .to_string();
     let (engine, recorder) = observed_engine(&raw);
-    let fast = engine
-        .handle_packet_fast(&query("a.ip.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("a.ip.test"), peer());
     assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     let answers: Vec<usize> = recorder
         .drain()
@@ -1198,9 +1184,7 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
 
     // Fast path, compiled static rule for a name not in the response cache
     // 快速路径：响应缓存中没有的名字命中编译后的静态规则
-    let fast = engine
-        .handle_packet_fast(&query("b.blocked.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("b.blocked.test"), peer());
     assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     let events = recorder.drain();
     let id = request_id_for(&events, "b.blocked.test");
@@ -1241,9 +1225,7 @@ async fn static_rule_is_reported_on_slow_and_fast_paths() {
     // cache answers it, looked at before the compiled rules as on the full path
     // 快速路径再问完整路径答过的名字：规则直接给的应答开着 min_ttl 也不进响应缓存，由完整路径存进规则缓存的决定作答，
     // 和完整路径一样先看规则缓存、再看编译后的规则
-    let fast = engine
-        .handle_packet_fast(&query("a.blocked.test"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("a.blocked.test"), peer());
     assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     let events = recorder.drain();
     let id = request_id_for(&events, "a.blocked.test");
@@ -1447,9 +1429,7 @@ async fn rule_cache_hits_replay_matched_rules() {
 
     // The fast path reaches the same rule cache entry and replays it too
     // 快速路径到达同一规则缓存条目并同样回放
-    let fast = engine
-        .handle_packet_fast(&query("x.example"), peer())
-        .unwrap();
+    let fast = engine.handle_packet_fast(&query("x.example"), peer());
     assert!(matches!(fast, Some(FastPathResponse::Direct(_))));
     let events = recorder.drain();
     let id = request_id_for(&events, "x.example");
@@ -2491,17 +2471,15 @@ async fn request_finished_lends_the_response_the_engine_produced() {
         .handle_packet(&query("slow.example"), peer())
         .await
         .unwrap();
-    let Some(FastPathResponse::Direct(fast)) = engine
-        .handle_packet_fast(&query("fast.example"), peer())
-        .unwrap()
+    let Some(FastPathResponse::Direct(fast)) =
+        engine.handle_packet_fast(&query("fast.example"), peer())
     else {
         panic!("a static rule must answer on the fast path");
     };
     // Asked another way, the static answer is lent as it goes to that client
     // 换一种问法，静态回答按发给那个客户端的样子出借
-    let Some(FastPathResponse::Direct(otherwise)) = engine
-        .handle_packet_fast(&query_asked_otherwise("Other.EXAMPLE", true), peer())
-        .unwrap()
+    let Some(FastPathResponse::Direct(otherwise)) =
+        engine.handle_packet_fast(&query_asked_otherwise("Other.EXAMPLE", true), peer())
     else {
         panic!("a static rule must answer on the fast path");
     };
@@ -2542,9 +2520,8 @@ async fn request_finished_lends_the_response_the_engine_produced() {
         .handle_packet(&query("cached.example"), peer())
         .await
         .unwrap();
-    let Some(FastPathResponse::CacheHit { cached, .. }) = engine
-        .handle_packet_fast(&query("cached.example"), peer())
-        .unwrap()
+    let Some(FastPathResponse::CacheHit { cached, .. }) =
+        engine.handle_packet_fast(&query("cached.example"), peer())
     else {
         panic!("the second query must be a fast-path cache hit");
     };
@@ -2572,9 +2549,7 @@ async fn request_finished_lends_the_response_the_engine_produced() {
     // 换一种问法，缓存里的应答按发给那个客户端的样子出借（DO=1 就是另一个缓存键了）
     let Some(FastPathResponse::CacheHit {
         cached: otherwise, ..
-    }) = engine
-        .handle_packet_fast(&query_asked_otherwise("CACHED.Example", false), peer())
-        .unwrap()
+    }) = engine.handle_packet_fast(&query_asked_otherwise("CACHED.Example", false), peer())
     else {
         panic!("a query asked another way must be a fast-path cache hit");
     };
@@ -2728,7 +2703,7 @@ async fn cache_hits_name_the_upstream_whose_answer_was_cached() {
         .unwrap();
     assert!(matches!(
         engine.handle_packet_fast(&query("cached.example"), peer()),
-        Ok(Some(FastPathResponse::CacheHit { .. }))
+        Some(FastPathResponse::CacheHit { .. })
     ));
     let sources = recorder.cache_sources();
     assert_eq!(sources.len(), 2, "{sources:#?}");
@@ -3000,8 +2975,8 @@ async fn start_leader_and_follower(
     recorder: &Recorder,
     held: &HeldUpstream,
 ) -> (
-    tokio::task::JoinHandle<anyhow::Result<bytes::Bytes>>,
-    tokio::task::JoinHandle<anyhow::Result<bytes::Bytes>>,
+    tokio::task::JoinHandle<Result<bytes::Bytes, UnreadableQuery>>,
+    tokio::task::JoinHandle<Result<bytes::Bytes, UnreadableQuery>>,
 ) {
     let send = |client: &str| {
         let engine = engine.clone();
@@ -3130,7 +3105,7 @@ async fn a_tagged_handle_reports_its_transport_on_both_paths() {
         .unwrap();
     assert!(matches!(
         tcp.handle_packet_fast(&query("tagged.example"), peer()),
-        Ok(Some(FastPathResponse::Direct(_)))
+        Some(FastPathResponse::Direct(_))
     ));
     // The handle it was cloned from is untouched.
     // 被克隆的原句柄不受影响。
@@ -3373,7 +3348,7 @@ async fn a_jump_followed_on_the_fast_path_is_reported_as_on_the_full_path() {
 
     assert!(matches!(
         engine.handle_packet_fast(&query("jumped.example"), peer()),
-        Ok(Some(FastPathResponse::CacheHit { .. }))
+        Some(FastPathResponse::CacheHit { .. })
     ));
     let events = recorder.drain();
     assert_eq!(
@@ -3862,7 +3837,7 @@ async fn ask_then_hit_on_both_paths(engine: &Engine, qnames: [&str; 2]) {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     for qname in qnames {
         engine.handle_packet(&query(qname), peer()).await.unwrap();
-        engine.handle_packet_fast(&query(qname), peer()).unwrap();
+        engine.handle_packet_fast(&query(qname), peer());
     }
 }
 

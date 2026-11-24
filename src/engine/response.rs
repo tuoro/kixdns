@@ -379,9 +379,9 @@ pub(crate) fn make_static_txt_answer(
     (ResponseCode::NoError, vec![record])
 }
 
-/// 静态应答带的 TTL：它的记录里最小的那个，没有记录时为 None（见 `phases::static_ttl`）
+/// 静态应答带的 TTL：它的记录里最小的那个，没有记录时为 None（见 `Route::static_ttl`）
 /// The TTL a static answer carries: the least of its records', None without records (see
-/// `phases::static_ttl`)
+/// `Route::static_ttl`)
 pub(crate) fn least_ttl(records: &[Record]) -> Option<u32> {
     records.iter().map(|record| record.ttl).min()
 }

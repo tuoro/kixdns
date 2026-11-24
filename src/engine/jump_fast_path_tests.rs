@@ -53,10 +53,7 @@ fn engine_with(settings: Value, pipelines: Value) -> Engine {
 /// 快速路径给出的应答；交给异步路径时为 None / The answer the fast path gives; None when it
 /// hands the request to the async path
 fn fast_answer(engine: &Engine, name: &str) -> Option<Vec<u8>> {
-    match engine
-        .handle_packet_fast(&query(name), peer())
-        .expect("fast path")
-    {
+    match engine.handle_packet_fast(&query(name), peer()) {
         Some(FastPathResponse::Direct(reply)) => Some(reply.to_vec()),
         Some(FastPathResponse::CacheHit { cached, .. }) => Some(cached.to_vec()),
         Some(FastPathResponse::AsyncNeeded(_)) => None,

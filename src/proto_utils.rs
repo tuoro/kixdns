@@ -19,6 +19,8 @@ pub struct QuickQuery<'a> {
     /// 问题之外还决定应答的查询位（见 [`QueryFlags`]）/ The query bits besides the question that
     /// decide the answer (see [`QueryFlags`])
     pub flags: QueryFlags,
+    /// 问题段在哪里结束 / Where the question section ends
+    pub question_end: usize,
 }
 
 /// 问题之外还决定应答的查询位：RD（要求递归）、CD（不做验证，RFC 4035 第 3.2.2 节）和 EDNS 的 DO
@@ -179,6 +181,12 @@ pub fn header_reply(packet: &[u8]) -> Option<Bytes> {
 /// DNS 报文头的长度 / The length of a DNS header
 const HEADER_LEN: usize = 12;
 
+/// 记录类型 SOA、OPT（RFC 6891）和 TSIG（RFC 8945）/ The record types SOA, OPT (RFC 6891) and TSIG
+/// (RFC 8945)
+const SOA: u16 = 6;
+const OPT: u16 = 41;
+const TSIG: u16 = 250;
+
 /// 一个名字编码出来最多这么多字节，连同压缩指针跳过去读到的部分（RFC 1035 第 2.3.4 节）。读名字的每个函数都守
 /// 这一条
 /// The most bytes a name takes encoded, what a compression pointer leads to included (RFC
@@ -215,73 +223,52 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
     // 1. Transaction ID / 事务ID
     let tx_id = u16::from_be_bytes([packet[0], packet[1]]);
 
-    // 2. Counts / 计数
-    let ar_count = u16::from_be_bytes([packet[10], packet[11]]);
-
-    // 3. 问题名照 `question_name_end` 读，文本照 `plain_name_text` 拼 / The question name, read as
+    // 2. 问题名照 `question_name_end` 读，文本照 `plain_name_text` 拼 / The question name, read as
     // `question_name_end` reads it, its text built as `plain_name_text` builds it
     let mut pos = question_name_end(packet)?;
     let qname = plain_name_text(&packet[HEADER_LEN..pos - 1], buf)?;
 
-    // 4. QType / 查询类型
+    // 3. QType / 查询类型
     if packet.len() < pos + 4 {
         return None;
     }
     let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
     let qclass = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]);
     pos += 4;
+    let question_end = pos;
 
-    // 5. Validate every declared Additional record and detect EDNS.
-    // Fail closed before cache/static fast paths on any malformed wire structure.
-    //
-    // Trade-off vs the old fast-path scan: this always walks the full Additional
-    // section and rejects trailing data, where the old code broke early on OPT and
-    // tolerated truncation. Full validation is required so malformed packets cannot
-    // reach cache/static paths; the cost is bounded by ARCOUNT records.
-    //
-    // 权衡：总是遍历完整 Additional 段并拒绝尾随数据（旧代码找到 OPT 即提前退出、容忍截断）。
-    // 完整校验是为了让畸形包无法到达 cache/static 路径；成本以 ARCOUNT 记录数为界。
-    let mut edns_present = false;
-    let mut edns_version = 0;
-    let mut dnssec_ok = false;
-    let mut client_subnet = None;
-    let mut ar_pos = pos;
-    for _ in 0..ar_count {
-        let owner_start = ar_pos;
-        let next_pos = strict_name_end(packet, ar_pos)?;
-        let fixed_end = next_pos.checked_add(10)?;
-        if fixed_end > packet.len() {
-            return None;
+    // 4. Additional 段的记录都要读得出（见 [`Records`]），恰好填满报文，不许有尾随的字节：读不了的留给完整路径，不让它
+    // 到缓存和静态应答那里。有 OPT 时它的选项要完整、ECS 要合规，不合规的留给 `Engine::on_the_spot` 回 FORMERR
+    // 4. Every Additional record must be readable (see [`Records`]), and together they must fill
+    // the message exactly, with no trailing bytes: one that cannot be read is left to the full
+    // path, kept from the cache and the static answers. An OPT must have whole options and a
+    // proper ECS, an improper one being left for `Engine::on_the_spot` to answer FORMERR
+    let (mut end, mut opt) = (pos, None);
+    for record in Records::after_questions(packet, pos) {
+        let record = record.ok()?;
+        end = record.rdata.end;
+        if record.rr_type == OPT {
+            opt = Some(record);
         }
-
-        let rr_type = u16::from_be_bytes([packet[next_pos], packet[next_pos + 1]]);
-        let rd_len = u16::from_be_bytes([packet[next_pos + 8], packet[next_pos + 9]]) as usize;
-        let rdata_end = fixed_end.checked_add(rd_len)?;
-        if rdata_end > packet.len() {
-            return None;
-        }
-
-        if rr_type == 41 {
-            // RFC 6891: OPT owner name must be the root and only one OPT is valid.
-            if edns_present || packet.get(owner_start) != Some(&0) {
-                return None;
-            }
-            edns_options(packet, fixed_end..rdata_end)
-                .all(|option| option.is_ok())
-                .then_some(())?;
-            edns_present = true;
-            // TTL 字段依次是扩展 RCODE、版本和标志 / The TTL field holds the extended RCODE, the version and the flags
-            edns_version = packet[next_pos + 5];
-            dnssec_ok = packet[next_pos + 6] & 0x80 != 0;
-            // ECS 不合规的查询留给 `Engine::on_the_spot` 回 FORMERR / A query with an improper ECS is left
-            // for `Engine::on_the_spot` to answer FORMERR
-            client_subnet = query_subnet(packet, fixed_end..rdata_end).ok()?;
-        }
-        ar_pos = rdata_end;
     }
-    if ar_pos != packet.len() {
+    // 最后一条之前的记录都在报文之内（不然读不出下一条），这样最后一条也在，OPT 的选项读得了
+    // The records before the last lie inside the message (or the next could not be read), so
+    // with this the last does too, and the OPT's options can be read
+    if end != packet.len() {
         return None;
     }
+    let edns_present = opt.is_some();
+    let (edns_version, dnssec_ok, client_subnet) = match opt {
+        // TTL 字段依次是扩展 RCODE、版本和标志；选项读不了时 `query_subnet` 也是 Err / The TTL field
+        // holds the extended RCODE, the version and the flags; `query_subnet` is Err for options
+        // that cannot be read too
+        Some(opt) => (
+            packet[opt.ttl_at() + 1],
+            packet[opt.ttl_at() + 2] & 0x80 != 0,
+            query_subnet(packet, opt.rdata).ok()?,
+        ),
+        None => (0, false, None),
+    };
 
     Some(QuickQuery {
         tx_id,
@@ -292,6 +279,7 @@ pub fn parse_quick<'a>(packet: &[u8], buf: &'a mut [u8]) -> Option<QuickQuery<'a
         edns_version,
         client_subnet,
         flags: QueryFlags::new(packet[2] & 0x01 != 0, packet[3] & 0x10 != 0, dnssec_ok),
+        question_end,
     })
 }
 
@@ -418,16 +406,14 @@ pub(crate) fn edns_version(packet: &[u8]) -> Option<u8> {
 }
 
 /// 请求的 EDNS 版本不受支持时的回答（RFC 6891 第 6.1.3 节）：RCODE 为 BADVERS（16：头部写低 4 位的
-/// 0，OPT 里的扩展 RCODE 写 1），OPT 写 KixDNS 支持的版本 0，问题段照抄。请求读不出问题段时为 None。
+/// 0，OPT 里的扩展 RCODE 写 1），OPT 写 KixDNS 支持的版本 0，问题段照抄。`question_end` 是读请求时
+/// 得出的问题段结束位置（见 [`QuickQuery::question_end`]）。
 /// The answer when the request's EDNS version is not supported (RFC 6891 section 6.1.3):
 /// RCODE BADVERS (16: 0 in the header's low 4 bits, extended RCODE 1 in the OPT), an OPT
-/// carrying version 0, the one KixDNS supports, and the question copied. None when the
-/// question cannot be read.
-pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
-    let question_end = strict_name_end(query, 12)?.checked_add(4)?;
-    if question_end > query.len() {
-        return None;
-    }
+/// carrying version 0, the one KixDNS supports, and the question copied. `question_end` is
+/// where the question section ends, found as the request was read (see
+/// [`QuickQuery::question_end`]).
+pub fn badvers_response(query: &[u8], question_end: usize) -> Bytes {
     let mut out = Vec::with_capacity(question_end + 11);
     out.extend_from_slice(&query[..2]);
     // QR、操作码 QUERY，照抄 RD；RA，照抄 CD / QR, opcode QUERY, RD copied; RA, CD copied
@@ -438,7 +424,7 @@ pub fn badvers_response(query: &[u8]) -> Option<Bytes> {
     out.extend_from_slice(&query[12..question_end]);
     // 扩展 RCODE 1 / Extended RCODE 1
     push_opt(&mut out, 1, false, &[]);
-    Some(Bytes::from(out))
+    Bytes::from(out)
 }
 
 /// Whether `response` answers `query`. RFC 1035 section 4.1.1: a reply has QR set
@@ -532,9 +518,12 @@ pub(crate) fn reply_as_asked_knowing(
 /// [`reply_as_asked`]，查询的 DO 位（见 [`asked_dnssec_ok`]）已经找过 / [`reply_as_asked`] with the query's
 /// DO bit (see [`asked_dnssec_ok`]) looked for already
 fn shaped_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bool>, ()>) -> Bytes {
-    // 应答的记录只走一遍：问题名的写法和 RD、CD 位改的都是原位的字节，记录的位置不动，后面找 OPT 用的就是这一遍
-    // The reply's records are walked once: the question name's spelling and the RD and CD
-    // bits change bytes in place without moving any record, so the OPT is taken from this walk
+    // 应答的记录只走一遍：问题名的写法和 RD、CD、AD 位改的都是原位的字节，记录的位置不动，后面找 OPT 用的就是这一遍。
+    // 这几样连同 DO 位都改在同一份上：头一样要改的在应答还有别处持有时复制一份，之后的就是独占的，原地改
+    // The reply's records are walked once: the question name's spelling and the RD, CD and AD
+    // bits change bytes in place without moving any record, so the OPT is taken from this walk.
+    // These and the DO bit are all changed in one copy: the first change copies the reply when
+    // something else holds it too, and the copy, held alone, takes the rest in place
     let walk = walk_records(&reply);
     // TSIG 的 MAC 盖着整个报文（RFC 8945 第 4.3 节），改哪一位签名都失效：签过的应答原样交出
     // A TSIG's MAC covers the whole message (RFC 8945 section 4.3) and any change breaks
@@ -557,11 +546,12 @@ fn asked_dnssec_ok(query: &[u8]) -> Result<Option<bool>, ()> {
 
 /// 应答的 RD 位（RFC 1035 第 4.1.1 节）和 CD 位（RFC 4035 第 3.2.2 节）照抄查询的。查询既没带 AD
 /// 也没带 DO 时应答不带 AD（RFC 6840 第 5.8 节）：转发时 AD 一律是带着的（见 [`query_asking_ad`]），
-/// 所以缓存里的应答带着上游验证的结论，交给每个客户端时再按它自己问的样子去掉
+/// 所以缓存里的应答带着上游验证的结论，交给每个客户端时再按它自己问的样子去掉。只有一处持有应答时原地改，不复制
 /// The reply with the query's RD bit (RFC 1035 section 4.1.1) and CD bit (RFC 4035
 /// section 3.2.2). When the query has neither AD nor DO the reply carries no AD (RFC 6840
 /// section 5.8): forwards always ask with AD (see [`query_asking_ad`]), so a cached reply
-/// carries what the upstream validated, and each client has it taken off as it asked
+/// carries what the upstream validated, and each client has it taken off as it asked. Changed
+/// in place, uncopied, when nothing else holds the reply
 fn header_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bool>, ()>) -> Bytes {
     if reply.len() < 12 || query.len() < 12 {
         return reply;
@@ -572,10 +562,10 @@ fn header_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bo
     if reply[2] & 0x01 == rd && reply[3] & 0x10 == cd && reply[3] & 0x20 == ad {
         return reply;
     }
-    let mut copy = BytesMut::from(&reply[..]);
-    copy[2] = (copy[2] & !0x01) | rd;
-    copy[3] = (copy[3] & !0x30) | cd | ad;
-    copy.freeze()
+    let mut reply = BytesMut::from(reply);
+    reply[2] = (reply[2] & !0x01) | rd;
+    reply[3] = (reply[3] & !0x30) | cd | ad;
+    reply.freeze()
 }
 
 /// 发给上游的查询带上 AD 位（RFC 6840 第 5.7 节：带 AD 表示听得懂应答里的 AD），验证型上游给的应答就带着
@@ -596,17 +586,17 @@ pub(crate) fn query_asking_ad(query: std::borrow::Cow<'_, [u8]>) -> std::borrow:
 }
 
 /// 上游应答去掉 AA 位：AA 说的是作答的服务器是权威（RFC 1035 第 4.1.1 节），KixDNS 转交别人的数据，
-/// 从缓存里取出的更不是。签过名的应答不改
+/// 从缓存里取出的更不是。签过名的应答不改；只有一处持有应答时原地改，不复制
 /// An upstream reply without its AA bit: AA says the responding server is an authority
 /// (RFC 1035 section 4.1.1), and KixDNS hands on others' data, less so from its cache. A
-/// signed reply is left alone
+/// signed reply is left alone; one nothing else holds is changed in place, uncopied
 pub(crate) fn reply_without_aa(reply: Bytes) -> Bytes {
     if reply.len() < 12 || reply[2] & 0x04 == 0 || last_record_is_tsig(&reply) {
         return reply;
     }
-    let mut copy = BytesMut::from(&reply[..]);
-    copy[2] &= !0x04;
-    copy.freeze()
+    let mut reply = BytesMut::from(reply);
+    reply[2] &= !0x04;
+    reply.freeze()
 }
 
 /// 应答的 EDNS 跟着查询走（RFC 6891）：查询带 OPT，应答就带（第 6.1.1 节），没有时在末尾补一条；
@@ -637,17 +627,19 @@ fn edns_as_asked_with(
     let Ok(opt) = opt else {
         return reply;
     };
-    let changed = match (asked_dnssec_ok, opt) {
+    let resized = match (asked_dnssec_ok, opt) {
         (Some(dnssec_ok), None) => with_opt(&reply, dnssec_ok, &[]),
-        (Some(dnssec_ok), Some(opt)) => (opt.dnssec_ok(&reply) != dnssec_ok).then(|| {
-            let mut copy = reply.to_vec();
-            copy[opt.extended_rcode_at + 2] ^= 0x80;
-            copy
-        }),
+        // DO 位是原位的一位：只有一处持有应答时原地改 / The DO bit is one bit in place: changed in
+        // place when nothing else holds the reply
+        (Some(dnssec_ok), Some(opt)) if opt.dnssec_ok(&reply) != dnssec_ok => {
+            let mut reply = BytesMut::from(reply);
+            reply[opt.extended_rcode_at + 2] ^= 0x80;
+            return reply.freeze();
+        }
         (None, Some(opt)) if reply[opt.extended_rcode_at] == 0 => without_opt(&reply, &opt),
-        (None, _) => None,
+        _ => None,
     };
-    changed.map_or(reply, Bytes::from)
+    resized.map_or(reply, Bytes::from)
 }
 
 /// 末尾补一条 OPT 的报文（扩展 RCODE 0，见 [`push_opt`]），带着选项 `options`。读不出或最后
@@ -706,14 +698,16 @@ fn without_opt(message: &[u8], opt: &OptRecord) -> Option<Vec<u8>> {
 /// 应答的问题名照客户端发来的写法（RFC 1035 第 4.1.1 节：问题段由查询照抄）。两者忽略大小写
 /// 相同（RFC 4343）而写法不同时，把查询里的名字抄进应答：缓存里存的、合并的在途查询拿到的
 /// 都是别的客户端问的写法，静态回答写的是小写，有的上游也会改写大小写，而用 0x20 打乱大小写
-/// 的客户端要核对它。名字不同、或者读不出不压缩的名字时原样返回；写法本来就一样时不复制。
+/// 的客户端要核对它。名字不同、或者读不出不压缩的名字时原样返回；写法本来就一样时不复制。只有一处持有应答时
+/// 名字原地抄进去，应答不复制。
 /// The reply with its question name written as the client wrote it (RFC 1035 section
 /// 4.1.1: the question is copied from the query). When the two are equal ignoring case
 /// (RFC 4343) but written differently, the query's name is copied into the reply: a
 /// cached answer or one handed to a merged inflight query carries another client's
 /// spelling, a static answer is written in lowercase, some upstreams rewrite the case,
 /// and a client randomizing the case (0x20) checks it. Another name, or one that cannot
-/// be read uncompressed, leaves the reply as it is; so does the same spelling, uncopied.
+/// be read uncompressed, leaves the reply as it is; so does the same spelling, uncopied. The
+/// name is copied in place, the reply uncopied, when nothing else holds it.
 fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     let Some(end) = question_name_end(query) else {
         return reply;
@@ -725,9 +719,9 @@ fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     {
         return reply;
     }
-    let mut copy = BytesMut::from(&reply[..]);
-    copy[12..end].copy_from_slice(asked);
-    copy.freeze()
+    let mut reply = BytesMut::from(reply);
+    reply[12..end].copy_from_slice(asked);
+    reply.freeze()
 }
 
 /// 第一个问题名结束的位置，照 [`strict_name_end`] 读；没有问题段或者名字读不了时为 None，名字之后的类型和类别在不在报文
@@ -804,35 +798,152 @@ fn skip_questions(packet: &[u8], count: usize) -> Option<usize> {
     })
 }
 
-/// 报文里 `start` 处的一条记录：属主名之后的 10 个固定字节必须在报文之内，RDATA 只算出范围、
-/// 不检查它是否超出报文，要不要查由调用方定
-/// One record of a message, at `start`: the 10 fixed bytes after its owner name must be
-/// inside the message; the RDATA's range is only worked out, not checked against the
-/// message's end, which the caller checks or not
+/// `start` 处那条记录的头：固定字段（类型、类别、TTL、RDLENGTH）的开头、类型和 RDATA 的范围。属主名读不了、固定字段
+/// 超出报文时为 None；RDATA 只算出范围、不检查它是否超出报文，要不要查由调用方定（超出的那条之后读不出下一条）
+/// The head of the record at `start`: where its fixed fields (type, class, TTL, RDLENGTH)
+/// start, its type and the range of its RDATA. None when the owner name cannot be read or the
+/// fixed fields run past the message; the RDATA's range is only worked out, not checked against
+/// the message's end, which the caller checks or not (no record can be read after one running
+/// past it)
+fn record_head(packet: &[u8], start: usize) -> Option<(usize, u16, std::ops::Range<usize>)> {
+    let fixed = strict_name_end(packet, start)?;
+    let header = packet.get(fixed..fixed.checked_add(10)?)?;
+    let rdata_start = fixed + 10;
+    let rd_len = usize::from(u16::from_be_bytes([header[8], header[9]]));
+    Some((
+        fixed,
+        u16::from_be_bytes([header[0], header[1]]),
+        rdata_start..rdata_start.checked_add(rd_len)?,
+    ))
+}
+
+/// 报文里的一条记录，由 [`Records`] 依次给出（RDATA 的范围见 [`record_head`]）
+/// One record of a message, as [`Records`] gives them in turn (for the RDATA's range see
+/// [`record_head`])
 struct RecordAt {
+    /// 所在的段：1 Answer、2 Authority、3 Additional（同 [`section_count`] 的下标）/ The section it is
+    /// in: 1 Answer, 2 Authority, 3 Additional (as [`section_count`] numbers them)
+    section: usize,
+    /// 记录开头（属主名）的偏移 / Offset of the record's start (its owner name)
+    start: usize,
     /// 固定字段（类型、类别、TTL、RDLENGTH）的开头 / Start of the fixed fields (type, class, TTL, RDLENGTH)
     fixed: usize,
     rr_type: u16,
     rdata: std::ops::Range<usize>,
 }
 
-fn record_at(packet: &[u8], start: usize) -> Option<RecordAt> {
-    let fixed = strict_name_end(packet, start)?;
-    let header = packet.get(fixed..fixed.checked_add(10)?)?;
-    let rdata_start = fixed + 10;
-    let rd_len = u16::from_be_bytes([header[8], header[9]]) as usize;
-    Some(RecordAt {
-        fixed,
-        rr_type: u16::from_be_bytes([header[0], header[1]]),
-        rdata: rdata_start..rdata_start.checked_add(rd_len)?,
-    })
+impl RecordAt {
+    /// TTL 字段的偏移；OPT 的这个字段依次是扩展 RCODE、版本和标志 / Offset of the TTL field, which in an
+    /// OPT holds the extended RCODE, the version and the flags
+    fn ttl_at(&self) -> usize {
+        self.fixed + 4
+    }
+
+    /// 这条记录的 TTL，照 [`received_ttl`] 读 / This record's TTL, read as [`received_ttl`] reads it
+    fn ttl(&self, packet: &[u8]) -> u32 {
+        let at = self.ttl_at();
+        received_ttl(u32::from_be_bytes(packet[at..at + 4].try_into().unwrap()))
+    }
 }
 
-/// 走到报文 Additional 段里的 OPT 记录。报文结构不对、OPT 不止一条或出现在 Additional
-/// 以外时为 Err（RFC 6891 第 6.1.1 节：这样的报文是 FORMERR）。
-/// Walk a message to the OPT record in its Additional section. Err when the
-/// message is malformed, or has more than one OPT record or one outside
-/// Additional (RFC 6891 section 6.1.1: such a message is FORMERR).
+/// 报文里的记录，依次给出（见 [`RecordAt`]），名字照 [`strict_name_end`] 读。OPT 的规矩只写在这里：只在 Additional 段、
+/// 最多一条（RFC 6891 第 6.1.1 节）、属主是根名（第 6.1.2 节）。快速解析、结构检查、找 OPT、读应答的 TTL 都走它，对报文
+/// 读不读得了、哪条 OPT 算数看法一样。读不出的记录和不守规矩的 OPT 给出一个 Err，之后就结束
+/// The records of a message, in turn (see [`RecordAt`]), names read as [`strict_name_end`] reads
+/// them. The rules for OPT are written here alone: in Additional only, at most one (RFC 6891
+/// section 6.1.1), owned by the root (section 6.1.2). The quick parse, the structure check,
+/// finding the OPT and reading a reply's TTLs all go through it, and agree on whether a message
+/// can be read and which OPT counts. A record that cannot be read, or an OPT breaking the rules,
+/// gives one Err, and then the records end
+struct Records<'a> {
+    packet: &'a [u8],
+    /// 下一条记录的开头 / Where the next record starts
+    pos: usize,
+    /// 下一条是第几条（从 0 起）/ Which record, from 0, comes next
+    index: usize,
+    /// Answer、Authority、Additional 三段各在第几条之前结束 / Before which record each of Answer,
+    /// Authority and Additional ends
+    ends: [usize; 3],
+    opt_seen: bool,
+}
+
+impl<'a> Records<'a> {
+    /// 报文的记录，从问题段之后开始；报文不足 12 字节，或者问题段读不出（名字读不了、超出报文）时为 None
+    /// A message's records, from after its questions; None for a message under 12 bytes, or with
+    /// questions that cannot be read (a name that cannot, or one running past the message)
+    #[inline]
+    fn of(packet: &'a [u8]) -> Option<Self> {
+        if packet.len() < HEADER_LEN {
+            return None;
+        }
+        let pos = skip_questions(packet, section_count(packet, 0))?;
+        (pos <= packet.len()).then(|| Self::after_questions(packet, pos))
+    }
+
+    /// 从 `pos` 起的记录，问题段调用方读过，读到 `pos` 为止；报文至少 12 字节
+    /// The records from `pos` on, the caller having read the questions as far as `pos`; the
+    /// message holds at least 12 bytes
+    #[inline]
+    fn after_questions(packet: &'a [u8], pos: usize) -> Self {
+        let answer = section_count(packet, 1);
+        let authority = answer + section_count(packet, 2);
+        Self {
+            packet,
+            pos,
+            index: 0,
+            ends: [answer, authority, authority + section_count(packet, 3)],
+            opt_seen: false,
+        }
+    }
+
+    #[inline]
+    fn read(&mut self) -> Result<RecordAt, ()> {
+        let start = self.pos;
+        let (fixed, rr_type, rdata) = record_head(self.packet, start).ok_or(())?;
+        let section =
+            1 + usize::from(self.index >= self.ends[0]) + usize::from(self.index >= self.ends[1]);
+        if rr_type == OPT {
+            if section != 3 || self.opt_seen || self.packet[start] != 0 {
+                return Err(());
+            }
+            self.opt_seen = true;
+        }
+        self.pos = rdata.end;
+        Ok(RecordAt {
+            section,
+            start,
+            fixed,
+            rr_type,
+            rdata,
+        })
+    }
+}
+
+impl Iterator for Records<'_> {
+    type Item = Result<RecordAt, ()>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.ends[2] {
+            return None;
+        }
+        let record = self.read();
+        // 读不出的那条之后就结束 / Nothing comes after one that cannot be read
+        self.index = if record.is_ok() {
+            self.index + 1
+        } else {
+            self.ends[2]
+        };
+        Some(record)
+    }
+}
+
+/// 走到报文 Additional 段里的 OPT 记录。报文的记录读不了、有一条的 RDATA 超出报文，或者 OPT 不守规矩（不止一条、出现在
+/// Additional 以外、属主不是根名，见 [`Records`]）时为 Err（RFC 6891 第 6.1.1 节：这样的报文是 FORMERR）。
+/// Walk a message to the OPT record in its Additional section. Err when the message's records
+/// cannot be read, one has RDATA running past the message, or the OPT breaks the rules (more than
+/// one, one outside Additional, an owner other than the root, see [`Records`]; RFC 6891 section
+/// 6.1.1: such a message is FORMERR).
 fn find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
     walk_records(packet).opt
 }
@@ -851,46 +962,39 @@ fn walk_records(packet: &[u8]) -> RecordsWalk {
         opt: Err(()),
         last_is_tsig: false,
     };
-    if packet.len() < 12 {
-        return UNREADABLE;
-    }
-    let before_additional = section_count(packet, 1) + section_count(packet, 2);
-    let records = before_additional + section_count(packet, 3);
-    let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
+    let Some(records) = Records::of(packet) else {
         return UNREADABLE;
     };
-    let mut opt = Ok(None);
-    let mut last_type = None;
-    for index in 0..records {
-        let Some(record) = record_at(packet, pos) else {
+    let (mut opt, mut last) = (Ok(None), None);
+    for record in records {
+        let Ok(record) = record else {
             return UNREADABLE;
         };
-        // RDATA 超出报文的记录让 OPT 读不成；最后一条这样的记录照样算作最后一条（原来如此）
-        // A record whose RDATA runs past the message leaves the OPT unreadable; as the last
-        // record it still counts as the last one (as it always has)
+        // RDATA 超出报文的记录让 OPT 读不成；它之后读不出下一条，是最后一条的话照样算作最后一条
+        // A record whose RDATA runs past the message leaves the OPT unreadable; no record can
+        // be read after it, and as the last one it still counts as the last
         if record.rdata.end > packet.len() {
             opt = Err(());
-        } else if record.rr_type == 41
+        } else if record.rr_type == OPT
             && let Ok(found) = &mut opt
         {
-            if index < before_additional || found.is_some() {
-                opt = Err(());
-            } else {
-                *found = Some(OptRecord {
-                    start: pos,
-                    extended_rcode_at: record.fixed + 4,
-                    rdlen_at: record.fixed + 8,
-                    rdata: record.rdata.clone(),
-                    last: index + 1 == records,
-                });
-            }
+            *found = Some(OptRecord {
+                start: record.start,
+                extended_rcode_at: record.ttl_at(),
+                rdlen_at: record.fixed + 8,
+                rdata: record.rdata.clone(),
+                last: false,
+            });
         }
-        last_type = Some(record.rr_type);
-        pos = record.rdata.end;
+        last = Some(record);
+    }
+    // 后面没有记录的 OPT 是最后一条 / An OPT with no record after it is the last
+    if let (Ok(Some(found)), Some(last)) = (&mut opt, &last) {
+        found.last = found.start == last.start;
     }
     RecordsWalk {
         opt,
-        last_is_tsig: last_type == Some(250),
+        last_is_tsig: last.is_some_and(|last| last.rr_type == TSIG),
     }
 }
 
@@ -1299,17 +1403,17 @@ fn padding_added(message: &[u8], block: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 给缓存里的应答换上回显客户端自己 ECS 的选项，作用范围为 `scope`（RFC 7871 第 7.2.2 节：
-/// 查询带 ECS，应答就要带），取代它原有的 ECS 选项；应答没有 OPT 时补一条。报文读不出来、
-/// OPT 后面还有记录（见 `OptRecord::last`），或者最后一条记录是 TSIG（OPT 不能排在它后面）
-/// 时为 None。
-/// Give a cached reply an option echoing the client's own ECS with `scope`
-/// (RFC 7871 section 7.2.2: a query with ECS gets a reply with it), in place of
-/// any ECS option it has, adding an OPT record when the reply has none. None
-/// when the message cannot be read, records follow its OPT (see
-/// `OptRecord::last`), or its last record is a TSIG, which OPT may not follow.
+/// 报文换上 `subnet` 的 ECS 选项，作用范围为 `scope`，取代它原有的 ECS 选项；没有 OPT 时补一条。交给带 ECS 的客户端的
+/// 应答回显它自己的子网（RFC 7871 第 7.2.2 节：查询带 ECS，应答就要带），转发出去的查询带上要发的子网（`scope` 为 0）。
+/// 报文读不出来、OPT 后面还有记录（见 `OptRecord::last`），或者最后一条记录是 TSIG（OPT 不能排在它后面）时为 None。
+/// The message with an ECS option for `subnet` with `scope`, in place of any ECS option it has,
+/// an OPT added when it has none. A reply for a client that sent ECS echoes the client's own
+/// subnet (RFC 7871 section 7.2.2: a query with ECS gets a reply with it), and a query going
+/// upstream carries the subnet to send (`scope` 0). None when the message cannot be read,
+/// records follow its OPT (see `OptRecord::last`), or its last record is a TSIG, which OPT may
+/// not follow.
 pub(crate) fn with_ecs_echo(
-    stored: &[u8],
+    message: &[u8],
     subnet: &crate::ecs::EcsKey,
     scope: u8,
 ) -> Option<Vec<u8>> {
@@ -1322,49 +1426,59 @@ pub(crate) fn with_ecs_echo(
     option.push(scope);
     option.extend_from_slice(address);
 
-    match find_opt(stored).ok()? {
+    match find_opt(message).ok()? {
         // See `OptRecord::last` / 见 `OptRecord::last`
         Some(opt) if !opt.last => None,
         Some(opt) => {
             // 已有的 ECS 选项换成这一个 / An ECS option already there is replaced by this one
-            let kept = match ecs_option(stored, opt.rdata.clone()).ok()? {
+            let kept = match ecs_option(message, opt.rdata.clone()).ok()? {
                 Some(existing) => existing.bytes,
                 None => opt.rdata.end..opt.rdata.end,
             };
             let rd_len = u16::try_from(opt.rdata.len() - kept.len() + option.len()).ok()?;
-            let mut out = Vec::with_capacity(stored.len() + option.len());
-            out.extend_from_slice(&stored[..kept.start]);
-            out.extend_from_slice(&stored[kept.end..opt.rdata.end]);
+            let mut out = Vec::with_capacity(message.len() + option.len());
+            out.extend_from_slice(&message[..kept.start]);
+            out.extend_from_slice(&message[kept.end..opt.rdata.end]);
             out.extend_from_slice(&option);
-            out.extend_from_slice(&stored[opt.rdata.end..]);
+            out.extend_from_slice(&message[opt.rdata.end..]);
             out[opt.rdlen_at..opt.rdlen_at + 2].copy_from_slice(&rd_len.to_be_bytes());
             Some(out)
         }
-        None => with_opt(stored, false, &option),
+        None => with_opt(message, false, &option),
     }
 }
 
-/// 同 `with_ecs_echo`，它不肯改写时（OPT 后面还有记录）改由 hickory 读出整个报文、换上回显
-/// 再重新编码（OPT 放到最后）。读不了、写不出，或者最后一条记录是 TSIG 时为 None。
-/// As `with_ecs_echo`, falling back, where that declines (records after the OPT),
-/// to reading the whole message with hickory, setting the echo and encoding it
-/// again (OPT last). None when it cannot be read or written, or its last record
-/// is a TSIG.
-pub(crate) fn echo_ecs(stored: &[u8], subnet: &crate::ecs::EcsKey, scope: u8) -> Option<Vec<u8>> {
-    with_ecs_echo(stored, subnet, scope).or_else(|| rewrite_ecs(stored, Some((subnet, scope))))
+/// 同 `with_ecs_echo`，它不肯改写时（OPT 后面还有记录）改由 hickory 读出整个报文、换上 ECS 再重新编码（OPT 放到最后）。
+/// 读不了、写不出，或者最后一条记录是 TSIG（改了签名就不对了）时为 None。
+/// As `with_ecs_echo`, falling back, where that declines (records after the OPT), to reading the
+/// whole message with hickory, setting the ECS and encoding it again (OPT last). None when it
+/// cannot be read or written, or its last record is a TSIG, whose signature a change would break.
+pub(crate) fn echo_ecs(message: &[u8], subnet: &crate::ecs::EcsKey, scope: u8) -> Option<Vec<u8>> {
+    with_ecs_echo(message, subnet, scope).or_else(|| rewrite_ecs(message, Some((subnet, scope))))
 }
 
-/// 应答去掉 ECS 选项后交给客户端：`without_ecs` 去不掉时（OPT 后面还有记录）改由 hickory
-/// 重新编码。都不行时原样交回。
-/// The reply without its ECS option, for a client: where `without_ecs` cannot take
-/// it out (records after the OPT), hickory encodes it again. Handed back as it is
-/// when neither can.
-pub(crate) fn ecs_removed(reply: Bytes) -> Bytes {
-    without_ecs(reply).unwrap_or_else(|kept| rewrite_ecs(&kept, None).map_or(kept, Bytes::from))
+/// 去掉 ECS 选项的报文：交给没带 ECS 的客户端的应答（RFC 7871 第 7.2.2 节），以及 `clear` 转发出去的查询。OPT 是最后
+/// 一条记录时从它里面剪掉（见 `without_options`），后面还有记录、或者照线上格式读不了时由 hickory 重新编码（见
+/// `rewrite_ecs`）。没有 ECS 选项、或者去不掉（hickory 也读不了、最后一条是 TSIG）时为 None
+/// The message without its ECS option: a reply for a client that sent no ECS (RFC 7871 section
+/// 7.2.2), and a query a `clear` forward sends. Cut out of the OPT when that is the last record
+/// (see `without_options`); encoded again by hickory when records follow it, or when it cannot
+/// be read on the wire (see `rewrite_ecs`). None when there is no ECS option, or it cannot be
+/// taken out (hickory cannot read the message either, or its last record is a TSIG)
+pub(crate) fn ecs_removed(message: &[u8]) -> Option<Vec<u8>> {
+    match find_opt(message) {
+        Ok(None) => None,
+        Ok(Some(opt)) if opt.last => {
+            without_options(message, &opt, &[8]).unwrap_or_else(|()| rewrite_ecs(message, None))
+        }
+        Ok(Some(opt)) if matches!(ecs_option(message, opt.rdata.clone()), Ok(None)) => None,
+        _ => rewrite_ecs(message, None),
+    }
 }
 
-/// 用 hickory 改写报文里的 ECS 选项：`echo` 为 Some 时换成这个回显，None 时去掉
-/// Rewrite a message's ECS option through hickory: the echo `echo` names, or none
+/// 用 hickory 改写报文里的 ECS 选项：`echo` 为 Some 时换成它，None 时去掉；去掉时没有 ECS 选项为 None
+/// Rewrite a message's ECS option through hickory: to the one `echo` names, or none; None when
+/// it is to be taken out and there is none
 fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Option<Vec<u8>> {
     use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode};
     if last_record_is_tsig(message) {
@@ -1380,7 +1494,9 @@ fn rewrite_ecs(message: &[u8], echo: Option<(&crate::ecs::EcsKey, u8)>) -> Optio
             );
         }
         None => {
-            msg.edns.as_mut()?.options_mut().remove(EdnsCode::Subnet);
+            let options = msg.edns.as_mut()?.options_mut();
+            options.get(EdnsCode::Subnet)?;
+            options.remove(EdnsCode::Subnet);
         }
     }
     msg.to_vec().ok()
@@ -1400,15 +1516,12 @@ pub(crate) fn last_record_is_tsig(packet: &[u8]) -> bool {
 /// the emitted sections yields the exact valid boundary so the response stays
 /// within RFC 1035 §4.2.1 record boundaries.
 fn valid_message_len(packet: &[u8]) -> Option<usize> {
-    if packet.len() < 12 {
-        return None;
+    let records = Records::of(packet)?;
+    let mut end = records.pos;
+    for record in records {
+        end = record.ok()?.rdata.end;
     }
-
-    let mut pos = skip_questions(packet, section_count(packet, 0))?;
-    for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
-        pos = record_at(packet, pos)?.rdata.end;
-    }
-    (pos <= packet.len()).then_some(pos)
+    (end <= packet.len()).then_some(end)
 }
 
 /// 快速解析响应包，仅提取 RCODE、TC 标志和 TTL 范围 / Quick parse response packet, extracting only RCODE, TC flag and TTL range
@@ -1421,90 +1534,24 @@ pub struct QuickResponse {
     pub truncated: bool,
 }
 
-/// Extract negative caching TTL from SOA in the authority section at the wire level (RFC 2308 §5).
-/// Returns min(SOA.minimum, SOA.record_ttl), or None if no SOA is found or parsing fails.
-/// This avoids a full `Message::from_bytes` parse for the common negative-response path.
-///
-/// 在 wire 层级从 authority 的 SOA 记录提取负缓存 TTL (RFC 2308 §5)。
-/// 返回 min(SOA.minimum, SOA.record_ttl)，无 SOA 或解析失败时返回 None。
-/// 避免对常见的否定响应路径进行完整的 `Message::from_bytes` 解析。
-///
-/// SAFETY: Reads raw DNS wire format. All bounds are checked. Returns None on any parse error.
-/// 安全性：读取原始 DNS wire 格式。所有边界均已检查。解析错误时返回 None。
-fn extract_soa_negative_ttl_wire(packet: &[u8], qd_count: u16, ns_count: u16) -> Option<u32> {
-    let packet_len = packet.len();
-    let mut pos = 12usize; // Start after header / 从 header 之后开始
-
-    // Skip Question section / 跳过 Question 部分
-    for _ in 0..qd_count {
-        pos = strict_name_end(packet, pos)?;
-        pos += 4; // QTYPE(2) + QCLASS(2)
-        if pos > packet_len {
-            return None;
-        }
+/// SOA 记录 `soa` 给的否定缓存 TTL：min(SOA 的 MINIMUM, 这条记录的 TTL)（RFC 2308 第 5 节）；RDATA 读不出时为 None
+/// The negative caching TTL the SOA record `soa` gives: min(the SOA's MINIMUM, the record's own
+/// TTL) (RFC 2308 section 5); None when its RDATA cannot be read
+fn soa_negative_ttl(packet: &[u8], soa: &RecordAt) -> Option<u32> {
+    if soa.rdata.end > packet.len() {
+        return None;
     }
-
-    soa_negative_ttl_at(packet, pos, ns_count)
-}
-
-/// `pos` 是 Authority 段的开头 / `pos` is where the Authority section starts
-fn soa_negative_ttl_at(packet: &[u8], mut pos: usize, ns_count: u16) -> Option<u32> {
-    let packet_len = packet.len();
-
-    // Walk Authority section looking for SOA (type 6) / 遍历 Authority 部分查找 SOA (type 6)
-    for _ in 0..ns_count {
-        pos = strict_name_end(packet, pos)?;
-        if pos + 10 > packet_len {
-            return None;
-        }
-        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-        let ttl = received_ttl(u32::from_be_bytes([
-            packet[pos + 4],
-            packet[pos + 5],
-            packet[pos + 6],
-            packet[pos + 7],
-        ]));
-        let rdlength = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-        pos += 10; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
-
-        if rtype == 6 {
-            // SOA record found — extract MINIMUM field from rdata
-            // SOA rdata: MNAME RNAME SERIAL(4) REFRESH(4) RETRY(4) EXPIRE(4) MINIMUM(4)
-            // SOA 记录 — 从 rdata 提取 MINIMUM 字段
-            let rdata_end = pos + rdlength;
-            if rdata_end > packet_len {
-                return None;
-            }
-            // Skip MNAME (domain name in rdata, may use compression pointers)
-            // 跳过 MNAME（rdata 中的域名，可能使用压缩指针）
-            let after_mname = strict_name_end(packet, pos)?;
-            // Skip RNAME (domain name in rdata)
-            // 跳过 RNAME（rdata 中的域名）
-            let after_rname = strict_name_end(packet, after_mname)?;
-            // 5 × u32 = 20 bytes: SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM
-            let fixed_fields_start = after_rname;
-            if fixed_fields_start + 20 > rdata_end {
-                return None;
-            }
-            // MINIMUM is the last 4 bytes of the fixed fields
-            // MINIMUM 是固定字段的最后 4 字节
-            // MINIMUM serves as the negative answer's TTL, so it is read as one too
-            // MINIMUM 用作否定应答的 TTL，所以也按 TTL 读
-            let minimum = received_ttl(u32::from_be_bytes([
-                packet[fixed_fields_start + 16],
-                packet[fixed_fields_start + 17],
-                packet[fixed_fields_start + 18],
-                packet[fixed_fields_start + 19],
-            ]));
-            // RFC 2308 §5: negative TTL = min(SOA.minimum, SOA.ttl)
-            return Some(minimum.min(ttl));
-        }
-
-        // Skip rdata for non-SOA records / 跳过非 SOA 记录的 rdata
-        pos += rdlength;
+    // MNAME、RNAME，然后是 SERIAL、REFRESH、RETRY、EXPIRE、MINIMUM 五个 32 位字段
+    // MNAME, RNAME, then five 32-bit fields: SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM
+    let after_rname = strict_name_end(packet, strict_name_end(packet, soa.rdata.start)?)?;
+    if after_rname + 20 > soa.rdata.end {
+        return None;
     }
-
-    None
+    // MINIMUM 用作否定应答的 TTL，所以也按 TTL 读 / MINIMUM serves as the negative answer's TTL, so
+    // it is read as one too
+    let minimum = &packet[after_rname + 16..after_rname + 20];
+    let minimum = received_ttl(u32::from_be_bytes(minimum.try_into().unwrap()));
+    Some(minimum.min(soa.ttl(packet)))
 }
 
 /// 应答的记录结构经得起完整走一遍，可以照快速解析的结果缓存：
@@ -1537,46 +1584,21 @@ pub(crate) fn well_formed_reply(packet: &[u8]) -> bool {
 }
 
 fn well_formed_records(packet: &[u8]) -> Option<()> {
-    let count = |at: usize| {
-        packet
-            .get(at..at + 2)
-            .map(|n| u16::from_be_bytes([n[0], n[1]]) as usize)
-    };
-    let (before_additional, additional) = (count(6)? + count(8)?, count(10)?);
-    let mut pos = 12usize;
-    for _ in 0..count(4)? {
-        pos = strict_name_end(packet, pos)?.checked_add(4)?;
-        if pos > packet.len() {
+    for record in Records::of(packet)? {
+        let record = record.ok()?;
+        if record.rdata.end > packet.len() {
             return None;
         }
-    }
-    let mut opt_seen = false;
-    for index in 0..before_additional + additional {
-        let owner = pos;
-        pos = strict_name_end(packet, pos)?;
-        let fixed_end = pos.checked_add(10)?;
-        let header = packet.get(pos..fixed_end)?;
-        let rr_type = u16::from_be_bytes([header[0], header[1]]);
-        let rd_len = u16::from_be_bytes([header[8], header[9]]) as usize;
-        let rdata = fixed_end..fixed_end.checked_add(rd_len)?;
-        if rdata.end > packet.len() {
-            return None;
-        }
-        if rr_type == 41 {
-            if index < before_additional || opt_seen || packet[owner] != 0 {
-                return None;
-            }
-            opt_seen = true;
+        if record.rr_type == OPT {
             // 选项结构不对时 `ecs_option` 也是 Err / `ecs_option` is Err for malformed options too
-            match ecs_option(packet, rdata.clone()) {
+            match ecs_option(packet, record.rdata) {
                 Ok(None) => {}
                 Ok(Some(ecs)) if ecs.is_well_formed(packet) => {}
                 _ => return None,
             }
         } else {
-            well_formed_rdata(packet, rr_type, rdata.clone())?;
+            well_formed_rdata(packet, record.rr_type, record.rdata)?;
         }
-        pos = rdata.end;
     }
     Some(())
 }
@@ -1678,103 +1700,82 @@ pub(crate) fn received_ttl(raw: u32) -> u32 {
 }
 
 pub fn parse_response_quick(packet: &[u8]) -> Option<QuickResponse> {
-    if packet.len() < 12 {
+    if packet.len() < HEADER_LEN {
         return None;
     }
+    // Byte 2: QR(1) Opcode(4) AA(1) TC(1) RD(1); byte 3: RA(1) Z(3) RCODE(4)
+    // 字节 2：QR(1) Opcode(4) AA(1) TC(1) RD(1)；字节 3：RA(1) Z(3) RCODE(4)
+    let truncated = packet[2] & 0x02 != 0;
+    let answers = section_count(packet, 1);
+    let Some(records) = Records::of(packet) else {
+        // 问题段读不出：没有回答的照报文头的 RCODE 算、TTL 记 0，有回答的读不了
+        // The questions cannot be read: one without answers goes by the header's RCODE with a
+        // TTL of 0, one with answers cannot be read
+        return (answers == 0).then(|| QuickResponse {
+            rcode: hickory_proto::op::ResponseCode::from(0, packet[3] & 0x0F),
+            min_ttl: 0,
+            truncated,
+        });
+    };
+    // 问的类型：第一个问题的 / The type asked: the first question's
+    let asked = (answers > 0)
+        .then(|| question_name_end(packet))
+        .flatten()
+        .map(|end| u16::from_be_bytes([packet[end], packet[end + 1]]));
 
-    // 1. Flags (Byte 2-3) / 标志位（字节 2-3）
-    // Byte 2: QR(1) Opcode(4) AA(1) TC(1) RD(1)
-    // Byte 3: RA(1) Z(3) RCODE(4)
-    let flags_byte2 = packet[2];
-    let truncated = (flags_byte2 & 0x02) != 0; // TC bit at position 1
+    // 记录只走一遍：回答段的 TTL、Authority 段的第一条 SOA、Additional 段的 OPT
+    // The records are walked once: the answers' TTLs, the first SOA in Authority, the OPT in
+    // Additional
+    let (mut min_ttl, mut only_aliases, mut answered) = (u32::MAX, true, 0);
+    let (mut soa, mut opt, mut whole) = (None, None, true);
+    for record in records {
+        let Ok(record) = record else {
+            // 回答读不完就读不了这份应答；回答之后的读不了，只是 OPT 读不成（同 [`find_opt`]）
+            // A reply whose answers cannot all be read cannot be read; past them, it only leaves
+            // the OPT unreadable (as in [`find_opt`])
+            if answered < answers {
+                return None;
+            }
+            whole = false;
+            break;
+        };
+        whole &= record.rdata.end <= packet.len();
+        match (record.section, record.rr_type) {
+            (1, rr_type) => {
+                answered += 1;
+                only_aliases &= only_points_elsewhere(rr_type, asked);
+                min_ttl = min_ttl.min(record.ttl(packet));
+            }
+            (2, SOA) if soa.is_none() => soa = Some(record),
+            (3, OPT) => opt = Some(record.ttl_at()),
+            _ => {}
+        }
+    }
 
     // RFC 6891 section 6.1.3: the OPT's extended RCODE holds the upper 8 bits of the
     // 12-bit RCODE, the header the lower 4
     // RFC 6891 第 6.1.3 节：12 位 RCODE 的高 8 位在 OPT 的扩展 RCODE 里，低 4 位在头部
-    let extended_rcode = match find_opt(packet) {
-        Ok(Some(opt)) => packet[opt.extended_rcode_at],
+    let extended_rcode = match opt {
+        Some(at) if whole => packet[at],
         _ => 0,
     };
     let rcode = hickory_proto::op::ResponseCode::from(extended_rcode, packet[3] & 0x0F);
-
-    // 2. Counts / 计数
-    let qd_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let an_count = u16::from_be_bytes([packet[6], packet[7]]);
-    let ns_count = u16::from_be_bytes([packet[8], packet[9]]);
-
-    if an_count == 0 {
-        // RFC 2308 §5: For negative responses (NXDOMAIN/NODATA), the negative
-        // cache TTL is min(SOA.minimum, SOA.ttl) from the authority section.
-        // If no SOA is present, return TTL=0 (must not be cached per RFC 2308 §4).
-        //
-        // RFC 2308 §5: 对于否定响应 (NXDOMAIN/NODATA)，负缓存 TTL 为 authority 中
-        // SOA 的 min(SOA.minimum, SOA.ttl)。无 SOA 时返回 TTL=0（按 RFC 2308 §4 不可缓存）。
-        let ttl = (ns_count > 0)
-            .then(|| extract_soa_negative_ttl_wire(packet, qd_count, ns_count))
-            .flatten()
-            .unwrap_or(0);
-        return Some(QuickResponse {
-            rcode,
-            min_ttl: ttl,
-            truncated,
-        });
-    }
-
-    let mut pos = 12;
-    let packet_len = packet.len();
-    let mut asked = None;
-
-    // Skip Questions / 跳过问题部分
-    for _ in 0..qd_count {
-        // Skip Name / 跳过名称
-        pos = strict_name_end(packet, pos)?;
-        // Skip Type(2) + Class(2) / 跳过类型(2) + 类别(2)
-        if pos + 4 > packet_len {
-            return None;
-        }
-        asked.get_or_insert(u16::from_be_bytes([packet[pos], packet[pos + 1]]));
-        pos += 4;
-    }
-
-    // 至少有一条应答记录（上面已返回 an_count 为 0 的情况），所以它会被下面设过
-    // There is at least one answer record (an_count 0 returned above), so it gets set below
-    let mut min_ttl = u32::MAX;
-    let mut only_aliases = true;
-
-    // Scan Answers / 扫描应答部分
-    for _ in 0..an_count {
-        // Skip Name / 跳过名称
-        pos = strict_name_end(packet, pos)?;
-
-        if pos + 10 > packet_len {
-            return None;
-        }
-
-        // Type(2) Class(2) TTL(4) RDLen(2) / 类型(2) 类别(2) TTL(4) 数据长度(2)
-        // Offset 0: Type / 偏移量 0：类型
-        // Offset 2: Class / 偏移量 2：类别
-        // Offset 4: TTL / 偏移量 4：TTL
-        // Offset 8: RDLen / 偏移量 8：数据长度
-
-        only_aliases &=
-            only_points_elsewhere(u16::from_be_bytes([packet[pos], packet[pos + 1]]), asked);
-        let ttl = received_ttl(u32::from_be_bytes([
-            packet[pos + 4],
-            packet[pos + 5],
-            packet[pos + 6],
-            packet[pos + 7],
-        ]));
-        min_ttl = min_ttl.min(ttl);
-
-        let rd_len = u16::from_be_bytes([packet[pos + 8], packet[pos + 9]]) as usize;
-        pos += 10 + rd_len;
-    }
-
-    if says_no_despite_answers(rcode, only_aliases) {
-        let negative = soa_negative_ttl_at(packet, pos, ns_count).unwrap_or(0);
-        min_ttl = min_ttl.min(negative);
-    }
-
+    // RFC 2308 §5: the negative caching TTL is min(SOA.minimum, SOA.ttl) from the authority
+    // section; with no SOA it is 0, and the answer must not be cached (§4)
+    // RFC 2308 §5：否定缓存 TTL 为 authority 中 SOA 的 min(SOA.minimum, SOA.ttl)；无 SOA 时为 0，按 §4 不可缓存
+    let negative = || {
+        soa.as_ref()
+            .and_then(|soa| soa_negative_ttl(packet, soa))
+            .unwrap_or(0)
+    };
+    let min_ttl = if answers == 0 {
+        // NXDOMAIN 和 NODATA / NXDOMAIN and NODATA
+        negative()
+    } else if says_no_despite_answers(rcode, only_aliases) {
+        min_ttl.min(negative())
+    } else {
+        min_ttl
+    };
     Some(QuickResponse {
         rcode,
         min_ttl,
@@ -2101,11 +2102,13 @@ pub(crate) fn extend_aged(buf: &mut BytesMut, cached: &[u8], elapsed: u32) {
 }
 
 /// 依次走到报文里每条记录的 TTL 字段；OPT（类型 41）伪记录跳过，见 [`map_record_ttls`]。自己不借着报文，所以边走边改 TTL
-/// 也行。遇到读不出的记录就停；RDATA 超出报文的那条也给出它的 TTL，到它为止（原来如此）
+/// 也行，这是它不走 [`Records`] 的缘故；类型 41 的都跳过，也用不着 OPT 的规矩。遇到读不出的记录就停；RDATA 超出报文的那条
+/// 也给出它的 TTL，到它为止
 /// Walks to the TTL field of each record of a message in turn; OPT (type 41) pseudo-records are
 /// skipped, see [`map_record_ttls`]. It holds no borrow of the message, so TTLs may be changed
-/// along the way. It stops at a record that cannot be read; one whose RDATA runs past the
-/// message still gives its TTL and is the last (as it always has been)
+/// along the way, which is why it does not go through [`Records`]; skipping every type 41, it
+/// needs no rules for OPT either. It stops at a record that cannot be read; one whose RDATA runs
+/// past the message still gives its TTL and is the last
 struct TtlFields {
     pos: usize,
     records: usize,
@@ -2127,18 +2130,18 @@ impl TtlFields {
 
     fn next(&mut self, packet: &[u8]) -> Option<usize> {
         while self.records > 0 {
-            let Some(record) = record_at(packet, self.pos) else {
+            let Some((fixed, rr_type, rdata)) = record_head(packet, self.pos) else {
                 self.records = 0;
                 return None;
             };
-            self.records = if record.rdata.end > packet.len() {
+            self.records = if rdata.end > packet.len() {
                 0
             } else {
                 self.records - 1
             };
-            self.pos = record.rdata.end;
-            if record.rr_type != 41 {
-                return Some(record.fixed + 4);
+            self.pos = rdata.end;
+            if rr_type != OPT {
+                return Some(fixed + 4);
             }
         }
         None
@@ -2532,20 +2535,18 @@ mod tests {
         assert_eq!(packet[cut_ttl..cut_ttl + 4], 7u32.to_be_bytes());
     }
 
-    /// 问题段在报文末尾被截断、又没有记录时，`find_opt` 不报错，只说没有 OPT；有记录时报错。
-    /// 这是现有的行为，记录遍历合并后照旧
-    /// With the question section cut at the end of the message and no records, `find_opt`
-    /// reports no OPT rather than an error; with a record it is an error. This is the
-    /// current behaviour, kept as it is by the shared record walk
+    /// 问题段在报文末尾被截断时报文的记录读不了：不论有没有记录，`find_opt` 都报错（见 `Records::of`）
+    /// With the question section cut at the end of the message its records cannot be read:
+    /// with records or without, `find_opt` is an error (see `Records::of`)
     #[test]
-    fn a_cut_question_without_records_finds_no_opt() {
+    fn a_cut_question_leaves_the_records_unreadable() {
         let cut = |counts: [u16; 4]| {
             let mut packet = header_with(counts);
             packet.extend_from_slice(&A_TEST);
             packet.extend_from_slice(&[0, 1]);
             packet
         };
-        assert!(matches!(find_opt(&cut([1, 0, 0, 0])), Ok(None)));
+        assert!(find_opt(&cut([1, 0, 0, 0])).is_err());
         assert!(find_opt(&cut([1, 0, 0, 1])).is_err());
     }
 
@@ -3294,6 +3295,42 @@ mod tests {
         msg.to_vec().unwrap()
     }
 
+    /// 照查询规整时问题名的写法、RD、AD 和 DO 位都改在同一份上：只有一处持有的应答原地改，一次也不复制；还有别处持有的
+    /// 只复制一次，原来那份不动
+    /// Shaping a reply as asked changes the question name's spelling and the RD, AD and DO bits
+    /// in one copy: a reply nothing else holds is changed in place, never copied; one held
+    /// elsewhere too is copied once, the original left as it was
+    #[test]
+    fn shaping_changes_one_copy_in_place() {
+        use hickory_proto::op::MessageType::{Query, Response};
+        // 应答带 RD 和 AD、DO 为 0；查询把名字写成 Example，不带 RD 和 AD，DO 为 1 / The reply carries RD
+        // and AD with DO 0; the query spells the name Example, without RD or AD, with DO 1
+        let mut reply = edns_message(Response, Some(false));
+        reply[2] |= 0x01;
+        reply[3] |= 0x20;
+        let mut query = edns_message(Query, Some(true));
+        query[13] = b'E';
+        query[2] &= !0x01;
+        // 查询带 DO，AD 留着 / With DO in the query AD stays
+        let mut expected = reply.clone();
+        expected[13] = b'E';
+        expected[2] &= !0x01;
+        let opt = find_opt(&expected).unwrap().unwrap();
+        expected[opt.extended_rcode_at + 2] |= 0x80;
+
+        let unique = Bytes::from(reply.clone());
+        let at = unique.as_ptr();
+        let shaped = reply_as_asked(unique, &query);
+        assert_eq!(shaped, expected);
+        assert_eq!(shaped.as_ptr(), at, "changed in place");
+
+        let held = Bytes::from(reply.clone());
+        let shaped = reply_as_asked(held.clone(), &query);
+        assert_eq!(shaped, expected);
+        assert_ne!(shaped.as_ptr(), held.as_ptr());
+        assert_eq!(held, reply, "the held reply is left as it was");
+    }
+
     /// 应答带不带 OPT、DO 位是什么（None：没有 OPT）/ Whether a reply has an OPT and its DO bit
     fn reply_edns(reply: &[u8]) -> Option<bool> {
         Message::from_vec(reply)
@@ -3394,7 +3431,7 @@ mod tests {
         let plain_query = edns_message(Query, None);
         let edns_query = edns_message(Query, Some(true));
         // BADVERS: extended RCODE 1 in the OPT / BADVERS：OPT 里的扩展 RCODE 为 1
-        let badvers = badvers_response(&edns_query).unwrap();
+        let badvers = badvers_response(&edns_query, question_name_end(&edns_query).unwrap() + 4);
         assert_eq!(edns_as_asked(badvers.clone(), &plain_query), badvers);
         let signed_with_opt = signed(edns_message(Response, Some(false)));
         assert_eq!(
@@ -4108,6 +4145,60 @@ mod tests {
             misplaced[9] = 1;
             misplaced[11] = 0;
             assert_eq!(reply_ecs(&misplaced), (ReplyEcs::Unreadable, false));
+            // 当作回答：回答读不完，整份应答都读不了 / Counted as an answer: the answers cannot all
+            // be read, and neither can the reply
+            let mut answered = packet.clone();
+            answered[7] = 2;
+            answered[11] = 0;
+            assert_eq!(reply_ecs(&answered), (ReplyEcs::Unreadable, false));
+            assert!(parse_response_quick(&answered).is_none());
+        }
+
+        /// 属主不是根名的 OPT 不算数（RFC 6891 第 6.1.2 节），快速解析、结构检查和找 OPT 都这样看（见 `Records`），和 hickory
+        /// 一样：快速解析不收这样的查询，结构检查不认这样的应答，找 OPT 也读不成，从中读不出 EDNS 版本、DO 位、ECS 和扩展 RCODE
+        /// An OPT owned by other than the root counts for nothing (RFC 6891 section 6.1.2), and the
+        /// quick parse, the structure check and finding the OPT all see it so (see `Records`), as
+        /// hickory does: the quick parse takes no such query, the structure check passes no such
+        /// reply, and finding the OPT fails, reading no EDNS version, DO bit, ECS or extended RCODE
+        /// from it
+        #[test]
+        fn an_opt_owned_by_other_than_the_root_counts_nowhere() {
+            // 根名的那个 0 换成标签 a 再接根：OPT 是最后一条，后面没有指针要挪 / The root's 0 becomes the
+            // label a and the root: the OPT is the last record, with no pointer after it to move
+            let owned_by_a = |message: &[u8]| {
+                let start = find_opt(message).unwrap().unwrap().start;
+                [&message[..start], &[1, b'a', 0], &message[start + 1..]].concat()
+            };
+            let mut query = with_raw_options(query_with_opt(), &ECS);
+            let opt = find_opt(&query).unwrap().unwrap();
+            query[opt.extended_rcode_at + 2] |= 0x80;
+            let mut buf = [0u8; 256];
+            assert!(parse_quick(&query, &mut buf).is_some_and(|q| q.flags.dnssec_ok()));
+            assert_eq!(edns_version(&query), Some(0));
+            let query = owned_by_a(&query);
+            assert!(Message::from_vec(&query).is_err());
+            assert!(parse_quick(&query, &mut buf).is_none());
+            assert!(find_opt(&query).is_err());
+            assert_eq!(edns_version(&query), None);
+            assert!(!QueryFlags::of(&query).dnssec_ok());
+            assert!(client_subnet(&query).is_some_and(|key| key.is_opaque()));
+
+            // 扩展 RCODE 写 1（BADVERS）的应答 / A reply with extended RCODE 1 (BADVERS)
+            let mut reply = reply(true, Some(("198.51.100.0", 24, 24)), false);
+            let opt = find_opt(&reply).unwrap().unwrap();
+            reply[opt.extended_rcode_at] = 1;
+            assert!(well_formed_reply(&reply));
+            // BADVERS 和 BADSIG 同是 16 / BADVERS and BADSIG are both 16
+            assert_eq!(u16::from(parse_response_quick(&reply).unwrap().rcode), 16);
+            let reply = owned_by_a(&reply);
+            assert!(!well_formed_reply(&reply));
+            assert_eq!(
+                parse_response_quick(&reply).unwrap().rcode,
+                ResponseCode::NoError
+            );
+            assert_eq!(reply_ecs(&reply), (ReplyEcs::Unreadable, false));
+            let reply = Bytes::from(reply);
+            assert_eq!(without_ecs(reply.clone()), Err(reply));
         }
 
         #[test]
@@ -4222,10 +4313,7 @@ mod tests {
         #[test]
         fn short_messages_are_left_alone() {
             for short in [Vec::new(), vec![0u8; 5], vec![0u8; 11]] {
-                assert_eq!(
-                    ecs_removed(Bytes::from(short.clone())),
-                    Bytes::from(short.clone())
-                );
+                assert_eq!(ecs_removed(&short), None);
                 assert_eq!(echo_ecs(&short, &subnet("203.0.113.0", 24), 0), None);
                 assert!(!last_record_is_tsig(&short));
             }
@@ -4454,67 +4542,63 @@ mod tests {
     }
 }
 
-/// 一遍走完记录（[`walk_records`]）和原来分开走的两遍结论一样：原来的两个函数原样留在这里对照，
-/// 拿一批真实形状的报文和它们截断、改字节、改计数以后的样子逐个比
-/// One walk over the records ([`walk_records`]) concludes what the two separate walks used
-/// to: the two former functions stay here as they were, and each of a set of real-shaped
-/// messages, truncated, with bytes changed and with counts changed, is compared
+/// 一遍走完记录（[`walk_records`]，走在 [`Records`] 上）和照下标逐条读的另一份写法结论一样：拿一批真实形状的报文和它们
+/// 截断、改字节、改计数以后的样子逐个比
+/// One walk over the records ([`walk_records`], on [`Records`]) concludes what another writing,
+/// reading record by record by index, does: each of a set of real-shaped messages, truncated,
+/// with bytes changed and with counts changed, is compared
 #[cfg(test)]
 mod one_walk_tests {
     use super::*;
     use hickory_proto::op::{Edns, MessageType, OpCode, Query};
     use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-    // 原来的 find_opt / The former find_opt
-    fn reference_find_opt(packet: &[u8]) -> Result<Option<OptRecord>, ()> {
+    /// 照下标读出的 OPT 和最后一条是不是 TSIG：记录读不了、OPT 不在 Additional、不止一条或者属主不是根名时 OPT 读不成，
+    /// 最后一条也不算 TSIG；RDATA 超出报文的记录让 OPT 读不成，是最后一条的话照样算
+    /// The OPT, and whether the last record is a TSIG, read by index: with a record that cannot
+    /// be read, or an OPT outside Additional, more than one or owned by other than the root, the
+    /// OPT cannot be read and the last record is no TSIG; a record whose RDATA runs past the
+    /// message leaves the OPT unreadable, and still counts as the last
+    fn reference_walk(packet: &[u8]) -> (Result<Option<OptRecord>, ()>, bool) {
         if packet.len() < 12 {
-            return Err(());
+            return (Err(()), false);
         }
         let before_additional = section_count(packet, 1) + section_count(packet, 2);
         let records = before_additional + section_count(packet, 3);
-        let mut pos = skip_questions(packet, section_count(packet, 0)).ok_or(())?;
-        let mut found = None;
+        let Some(mut pos) =
+            skip_questions(packet, section_count(packet, 0)).filter(|&pos| pos <= packet.len())
+        else {
+            return (Err(()), false);
+        };
+        let (mut found, mut cut, mut last_type) = (None, false, None);
         for index in 0..records {
-            let record = record_at(packet, pos).ok_or(())?;
-            if record.rdata.end > packet.len() {
-                return Err(());
-            }
-            if record.rr_type == 41 {
-                if index < before_additional || found.is_some() {
-                    return Err(());
+            let Some(fixed) = strict_name_end(packet, pos) else {
+                return (Err(()), false);
+            };
+            let Some(header) = packet.get(fixed..fixed + 10) else {
+                return (Err(()), false);
+            };
+            let rr_type = u16::from_be_bytes([header[0], header[1]]);
+            let rdata =
+                fixed + 10..fixed + 10 + u16::from_be_bytes([header[8], header[9]]) as usize;
+            if rr_type == 41 {
+                if index < before_additional || found.is_some() || packet[pos] != 0 {
+                    return (Err(()), false);
                 }
                 found = Some(OptRecord {
                     start: pos,
-                    extended_rcode_at: record.fixed + 4,
-                    rdlen_at: record.fixed + 8,
-                    rdata: record.rdata.clone(),
+                    extended_rcode_at: fixed + 4,
+                    rdlen_at: fixed + 8,
+                    rdata: rdata.clone(),
                     last: index + 1 == records,
                 });
             }
-            pos = record.rdata.end;
+            cut |= rdata.end > packet.len();
+            last_type = Some(rr_type);
+            pos = rdata.end;
         }
-        Ok(found)
-    }
-
-    // 原来的 last_record_is_tsig / The former last_record_is_tsig
-    fn reference_last_record_is_tsig(packet: &[u8]) -> bool {
-        if packet.len() < 12 {
-            return false;
-        }
-        let Some(mut pos) = skip_questions(packet, section_count(packet, 0)) else {
-            return false;
-        };
-        let mut last_type = None;
-        for _ in 0..(1..4).map(|index| section_count(packet, index)).sum() {
-            // 最后一条的 RDATA 超出报文也照样算（原来如此）/ A last record whose RDATA runs
-            // past the message still counts (as it always has)
-            let Some(record) = record_at(packet, pos) else {
-                return false;
-            };
-            last_type = Some(record.rr_type);
-            pos = record.rdata.end;
-        }
-        last_type == Some(250)
+        let opt = if cut { Err(()) } else { Ok(found) };
+        (opt, last_type == Some(250))
     }
 
     /// 真实形状的报文：查询和应答、带不带 OPT、几条回答、CNAME 链带压缩指针、Authority 段、末尾的 TSIG
@@ -4611,15 +4695,14 @@ mod one_walk_tests {
     }
 
     #[test]
-    fn one_walk_concludes_what_the_two_walks_did() {
+    fn one_walk_concludes_what_reading_by_index_does() {
         let messages = variants();
         assert!(messages.len() > 5000);
         for message in &messages {
             let walk = walk_records(message);
-            assert_eq!(walk.opt, reference_find_opt(message), "{message:?}");
             assert_eq!(
-                walk.last_is_tsig,
-                reference_last_record_is_tsig(message),
+                (walk.opt, walk.last_is_tsig),
+                reference_walk(message),
                 "{message:?}"
             );
         }
@@ -4646,7 +4729,7 @@ mod one_walk_tests {
         for reply in &messages {
             for query in &queries {
                 let reply = Bytes::from(reply.clone());
-                let expected = if reference_last_record_is_tsig(&reply) {
+                let expected = if reference_walk(&reply).1 {
                     reply.clone()
                 } else {
                     edns_as_asked(

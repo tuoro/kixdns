@@ -33,11 +33,11 @@ pub enum Decision {
         pre_split_upstreams: Option<std::sync::Arc<Vec<std::sync::Arc<str>>>>,
         response_phase: Option<Arc<ResponsePhase>>,
         rule_name: Arc<str>,
-        /// 作出决策的规则在它的规则组里排第几（从 0 起）；没有规则作出决策时为 None。它 continue 以后按这个
-        /// 位置跳过它，不按名字：名字只是标签，两条规则可以同名
+        /// 作出决策的规则在它的规则组里排第几（从 0 起）；没有规则作出决策时为 None。它 continue 以后求值从这个
+        /// 位置的下一条接着走（见 `Route::resume_at`），不按名字找它：名字只是标签，两条规则可以同名
         /// The place in its pipeline (from 0) of the rule that decided; None when no rule did.
-        /// Once it continues it is skipped by this place, not by name: a name is a label, and
-        /// two rules may share one
+        /// Once it continues, evaluation resumes at the place after this one (see
+        /// `Route::resume_at`), not by its name: a name is a label, and two rules may share one
         rule_index: Option<usize>,
         /// 没写协议前缀的上游用的传输；写了前缀（`tcp://`、`https://` 这些）的照前缀（见 `upstream::forward_upstream`）
         /// The transport of an upstream written without a scheme; one written with a scheme
@@ -92,8 +92,8 @@ pub enum ResponseActionResult {
     Static {
         bytes: Bytes,
         rcode: ResponseCode,
-        /// 它带的 TTL：记录里最小的，没有记录时为 None（见 `phases::static_ttl`）/ The TTL it
-        /// carries: the least of its records', None without records (see `phases::static_ttl`)
+        /// 它带的 TTL：记录里最小的，没有记录时为 None（见 `Route::static_ttl`）/ The TTL it
+        /// carries: the least of its records', None without records (see `Route::static_ttl`)
         ttl: Option<u32>,
         source: &'static str,
     },
@@ -149,8 +149,9 @@ pub struct RuleCacheEntry {
     /// 决策是为哪个请求方做的（以键区分到的程度为限）
     pub requester: RequesterKey,
     pub decision: Decision,
-    /// Expiration time based on DNS TTL / 基于 DNS TTL 的过期时间
-    pub expires_at: Option<Instant>,
+    /// 过期的时刻：写入以后 [`RULE_CACHE_MAX_AGE`] / When it expires: [`RULE_CACHE_MAX_AGE`]
+    /// after it was written
+    pub expires_at: Instant,
 }
 
 /// Rule cache value: the cached decision plus the request-phase rules whose
@@ -169,18 +170,19 @@ pub struct RuleCacheRecord {
     pub decided_by_rule: bool,
 }
 
-/// 规则缓存里的决策最多用这么久，不论决策本身的 TTL。键已经跟着配置和 Geo 数据走（命名空间见
-/// `EngineInner::at_geo`，请求方的判定见 `RequesterScope`），这个上限让一条决策过一阵就重新求值，只问过一次的
-/// 名字占着的地方也由清扫收回
-/// The longest a rule cache decision serves, whatever its own TTL. The keys already follow
-/// the configuration and the Geo data (the namespaces see `EngineInner::at_geo`, the
-/// judgement of the requester `RequesterScope`); this bound has a decision evaluated again
+/// 规则缓存里的每个决策都用这么久。决策只取决于配置、Geo 数据和规则对请求方的判定，键已经跟着它们走（命名空间见
+/// `EngineInner::at_geo`，请求方的判定见 `RequesterScope`）；静态应答记录的 TTL 是写给客户端的，规则下次求值给的还是
+/// 同一份，不必照它过期。这个时限让一条决策过一阵就重新求值，只问过一次的名字占着的地方也由清扫收回
+/// How long every rule cache decision serves. A decision depends on the configuration, the Geo
+/// data and how the rules judge the requester alone, and the keys already follow them (the
+/// namespaces see `EngineInner::at_geo`, the judgement of the requester `RequesterScope`); the
+/// TTL of a static answer's records is written for the client, the rules giving the same answer
+/// when evaluated again, and is nothing to expire by. This limit has a decision evaluated again
 /// after a while, and the room a name asked once takes is reclaimed by the sweep
 pub(crate) const RULE_CACHE_MAX_AGE: Duration = Duration::from_secs(60);
 
-/// 每条记录计重 1；`expires_at` 已经含了 `RULE_CACHE_MAX_AGE`，按它判断过期
-/// Each record weighs 1; `expires_at` already includes `RULE_CACHE_MAX_AGE`, so it
-/// decides when a record is outlived
+/// 每条记录计重 1，到 `expires_at` 就过期（见 [`RULE_CACHE_MAX_AGE`]）
+/// Each record weighs 1 and is outlived at `expires_at` (see [`RULE_CACHE_MAX_AGE`])
 impl Cached for Arc<RuleCacheRecord> {
     fn weight(&self) -> u32 {
         1
@@ -241,7 +243,7 @@ impl RuleCacheEntry {
     pub(crate) fn new(
         question: &RuleQuestion<'_>,
         decision: Decision,
-        expires_at: Option<Instant>,
+        expires_at: Instant,
     ) -> Self {
         Self {
             pipeline_id: Arc::clone(question.pipeline_id),
@@ -269,7 +271,7 @@ impl RuleCacheEntry {
     /// 在 `now` 这一刻还有效 / Still valid at `now`
     #[inline]
     pub fn is_valid_at(&self, now: Instant) -> bool {
-        self.expires_at.is_none_or(|expires| now <= expires)
+        now <= self.expires_at
     }
 }
 
@@ -493,7 +495,7 @@ async fn run_response_actions(
                     packet,
                     &upstream_addr,
                     request.state.pipeline.upstream_timeout(),
-                    Some(use_transport),
+                    use_transport,
                     pre_split_upstreams.as_ref(),
                     request.observed,
                     request.asker(),
@@ -513,12 +515,12 @@ async fn run_response_actions(
                         ctx.trail.record_failure(sent_ecs);
                         // 流控没让等的失败是这台设备自己的事（见 `UpstreamFailure::withheld`）：原样交回，这个
                         // 请求只给自己回 SERVFAIL，它登记的条目随之放下，不把 SERVFAIL 交给等着的别的请求（见
-                        // `Engine::handle_packet_internal`）
+                        // `Engine::answer`）
                         // A failure with flow control keeping the query from waiting is the
                         // device's own affair (see `UpstreamFailure::withheld`): it goes back
                         // as it is, the request answering SERVFAIL to itself alone, and the
                         // entries it registered go with it, no SERVFAIL being handed to the other
-                        // requests waiting (see `Engine::handle_packet_internal`)
+                        // requests waiting (see `Engine::answer`)
                         if UpstreamFailure::was_withheld(&err) {
                             tracing::debug!(
                                 event = "response_action_withheld",

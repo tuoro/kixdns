@@ -257,10 +257,7 @@ async fn a_failure_counts_only_against_the_answer_that_failed() {
 /// A stale answer the fast path gave: the reply's ID, its first record's address and TTL; None
 /// when it was left to the async path
 fn stale_on_the_fast_path(engine: &Engine) -> Option<(u16, Ipv4Addr, u32)> {
-    match engine
-        .handle_packet_fast(&query(), peer())
-        .expect("the fast path reads it")
-    {
+    match engine.handle_packet_fast(&query(), peer()) {
         Some(crate::engine::FastPathResponse::Direct(reply)) => {
             let address = first_a(&reply).expect("an A record");
             let reply = Message::from_vec(&reply).expect("a whole reply");

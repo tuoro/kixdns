@@ -41,6 +41,97 @@ pub fn accept_retry_delay(err: &io::Error) -> Duration {
     }
 }
 
+/// UDP socket 收发缓冲平时的大小：监听口和上游的 UDP 池都设成这么大，负载高时不至于丢包
+/// The usual size of a UDP socket's send and receive buffers, set on the listening sockets and
+/// the upstream UDP pool alike so that load does not drop datagrams
+pub const UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// 系统不许 [`UDP_BUFFER_SIZE`] 时退到的大小：FreeBSD 默认的 `kern.ipc.maxsockbuf` 只有 2 MiB
+/// The size fallen back to where the system refuses [`UDP_BUFFER_SIZE`]: FreeBSD's default
+/// `kern.ipc.maxsockbuf` is 2 MiB
+const UDP_BUFFER_FALLBACK: usize = 1024 * 1024;
+
+/// 把 UDP socket 的收发缓冲设成 [`UDP_BUFFER_SIZE`]；系统不许就退到 [`UDP_BUFFER_FALLBACK`]，再不许就留着系统默认的。
+/// 不许时整个进程只记一条 warn：上游的 UDP 池每发几十个查询就换一个 socket，每个都记就一直在记
+/// Sets a UDP socket's send and receive buffers to [`UDP_BUFFER_SIZE`]; where the system refuses
+/// that, to [`UDP_BUFFER_FALLBACK`], and failing that the system's default stays. A refusal logs
+/// one warn for the whole process: the upstream UDP pool replaces a socket every few dozen
+/// queries, and logging each would log all along
+pub fn set_udp_buffers(socket: &Socket) {
+    static REFUSED: std::sync::Once = std::sync::Once::new();
+    set_udp_buffer(&REFUSED, "receive", |size| {
+        socket.set_recv_buffer_size(size)
+    });
+    set_udp_buffer(&REFUSED, "send", |size| socket.set_send_buffer_size(size));
+}
+
+/// 用 `set` 设 `side` 那一边的缓冲（见 [`set_udp_buffers`]），不许时经 `refused` 只记一次
+/// Sets the `side` buffer through `set` (see [`set_udp_buffers`]), a refusal logged once through
+/// `refused`
+fn set_udp_buffer(refused: &std::sync::Once, side: &str, set: impl Fn(usize) -> io::Result<()>) {
+    let Err(error) = set(UDP_BUFFER_SIZE) else {
+        return;
+    };
+    let using = if set(UDP_BUFFER_FALLBACK).is_ok() {
+        "1 MiB"
+    } else {
+        "the system's default"
+    };
+    refused.call_once(|| {
+        tracing::warn!(%error, "the system refuses a 4 MiB UDP {side} buffer, using {using}");
+    });
+}
+
+#[cfg(test)]
+mod udp_buffer_tests {
+    use super::*;
+
+    /// 系统不许 4 MiB 时退到 1 MiB，1 MiB 也不许就留着系统默认的；不许只记一条 warn，多少个 socket 都一样
+    /// Where the system refuses 4 MiB it falls back to 1 MiB, and with 1 MiB refused too the
+    /// system's default stays; a refusal logs one warn, however many sockets there are
+    #[test]
+    fn a_refused_udp_buffer_falls_back_and_is_logged_once() {
+        let tried = std::sync::Mutex::new(Vec::new());
+        let allowing = |most: usize| {
+            let tried = &tried;
+            move |size: usize| {
+                tried.lock().unwrap().push(size);
+                if size <= most {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("no buffer space"))
+                }
+            }
+        };
+        let refused = std::sync::Once::new();
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        set_udp_buffer(&refused, "receive", allowing(UDP_BUFFER_SIZE));
+        set_udp_buffer(&refused, "receive", allowing(2 * 1024 * 1024));
+        set_udp_buffer(&refused, "send", allowing(0));
+        set_udp_buffer(&refused, "receive", allowing(2 * 1024 * 1024));
+        drop(guard);
+        assert_eq!(
+            *tried.lock().unwrap(),
+            [
+                UDP_BUFFER_SIZE,
+                UDP_BUFFER_SIZE,
+                UDP_BUFFER_FALLBACK,
+                UDP_BUFFER_SIZE,
+                UDP_BUFFER_FALLBACK,
+                UDP_BUFFER_SIZE,
+                UDP_BUFFER_FALLBACK
+            ]
+        );
+        let lines = warnings.lines();
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(
+            lines[0].contains("refuses a 4 MiB UDP receive buffer, using 1 MiB"),
+            "{}",
+            lines[0]
+        );
+    }
+}
+
 /// 内核会不会把同一个端口上收到的报文分给绑在上面的几个 UDP socket：Linux 的 SO_REUSEPORT、FreeBSD 的 SO_REUSEPORT_LB
 /// 按来源哈希分；macOS、OpenBSD、NetBSD 的 SO_REUSEPORT 只让几个 socket 绑上同一个端口，单播报文都进其中一个，Windows
 /// 没有这样的选项。分不了的系统上几个 worker 各绑一个 socket 只会有一个在干活，所以共用一个
@@ -89,11 +180,15 @@ pub fn spread_datagrams(_socket: &Socket) -> io::Result<()> {
     Ok(())
 }
 
-/// 这个 socket 因为接收缓冲满丢过多少报文；读不到时是 None
-/// How many datagrams this socket has dropped for a full receive buffer; None when that cannot be read
+/// 这个 socket 的 SO_MEMINFO：按 `SK_MEMINFO_*` 排的各项内存计数，只要到丢包数这一项，内核按给的长度填；读不到时是
+/// None。丢包数和接收缓冲都从这一次读里取
+/// This socket's SO_MEMINFO: its memory counts in `SK_MEMINFO_*` order, only as far as the drops,
+/// the kernel filling what the length allows; None when it cannot be read. The drops and the
+/// receive buffer are both taken from this one read
 #[cfg(target_os = "linux")]
-pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
-    // 只要到丢包这一项，内核按给的长度填 / Only as far as the drops; the kernel fills what the length allows
+fn udp_meminfo(
+    socket: &tokio::net::UdpSocket,
+) -> Option<[u32; libc::SK_MEMINFO_DROPS as usize + 1]> {
     let mut info = [0u32; libc::SK_MEMINFO_DROPS as usize + 1];
     let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
     // SAFETY: the buffer and its length are valid for the call, which only writes within them
@@ -106,7 +201,14 @@ pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
             &mut len,
         )
     };
-    (ret == 0).then(|| info[libc::SK_MEMINFO_DROPS as usize])
+    (ret == 0).then_some(info)
+}
+
+/// 这个 socket 因为接收缓冲满丢过多少报文；读不到时是 None
+/// How many datagrams this socket has dropped for a full receive buffer; None when that cannot be read
+#[cfg(target_os = "linux")]
+pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
+    udp_meminfo(socket).map(|info| info[libc::SK_MEMINFO_DROPS as usize])
 }
 
 /// 这个 socket 的接收缓冲现在记着多少字节、最多记多少（内核翻过倍的大小）；读不到时是 None
@@ -114,19 +216,7 @@ pub fn udp_receive_drops(socket: &tokio::net::UdpSocket) -> Option<u32> {
 /// kernel doubled); None when that cannot be read
 #[cfg(target_os = "linux")]
 pub fn udp_receive_queue(socket: &tokio::net::UdpSocket) -> Option<(u32, u32)> {
-    let mut info = [0u32; libc::SK_MEMINFO_RCVBUF as usize + 1];
-    let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
-    // SAFETY: the buffer and its length are valid for the call, which only writes within them
-    let ret = unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_MEMINFO,
-            info.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    (ret == 0).then(|| {
+    udp_meminfo(socket).map(|info| {
         (
             info[libc::SK_MEMINFO_RMEM_ALLOC as usize],
             info[libc::SK_MEMINFO_RCVBUF as usize],
