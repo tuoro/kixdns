@@ -250,7 +250,7 @@ const REFRESH_EDNS_PAYLOAD: u16 = 1232;
 fn request_timeout_ms(settings: &crate::config::GlobalSettings) -> u64 {
     settings
         .request_timeout_ms
-        .unwrap_or(settings.upstream_timeout_ms * 5 / 2)
+        .unwrap_or(settings.default_request_timeout_ms())
 }
 
 impl Engine {
