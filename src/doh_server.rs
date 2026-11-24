@@ -232,7 +232,11 @@ pub async fn run_doh(
                         .await;
                 }
                 Ok(Err(e)) => {
-                    crate::warn_sparse!(error = %e, "DoH TLS handshake failed");
+                    crate::warn_sparse!(
+                        event = "doh_tls_handshake_failed",
+                        error = %e,
+                        "DoH TLS handshake failed"
+                    );
                 }
                 Err(_) => {
                     // Quiet, like a silent DNS-over-TCP client timing out: a flood of
