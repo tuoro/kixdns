@@ -80,16 +80,21 @@ impl std::fmt::Display for DoqFailure {
 }
 
 impl std::error::Error for DoqFailure {
-    /// 保住 quinn 的 source 链：类型化到这里就被拍平成字符串的话，日志里就只
-    /// 剩 Display 那一行了。
-    /// Keeps quinn's source chain: flattening to a string at this boundary
-    /// would leave the log with nothing but the Display line.
+    /// Display 已经写出了 quinn 的错误（`ReadToEndError` 的还连着里面的 `ReadError`），这里只给它没写出的那一层：连接没了时
+    /// quinn 只写「connection lost」，为什么没了在里面的 `ConnectionError` 里。别的都写全了，没有下一层。两边都给的话，
+    /// `{:#}` 里同一句要重复两三遍
+    /// Display has written quinn's error out already (`ReadToEndError`'s with the `ReadError`
+    /// inside it), and this gives only the layer it leaves out: with the connection lost quinn
+    /// writes "connection lost" alone, why it was lost being in the `ConnectionError` inside.
+    /// Everything else is written out in full, with no layer below. Given on both sides, `{:#}`
+    /// would repeat the one sentence two or three times
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::OpenStream(err) => Some(err),
-            Self::Write(err) => Some(err),
-            Self::Read(err) => Some(err),
-            Self::Protocol(_) => None,
+            Self::Write(quinn::WriteError::ConnectionLost(err))
+            | Self::Read(quinn::ReadToEndError::Read(quinn::ReadError::ConnectionLost(err))) => {
+                Some(err)
+            }
+            _ => None,
         }
     }
 }
@@ -296,11 +301,11 @@ fn doq_transport(
 }
 
 /// DoQ 连接的设置：`tls` 加上 ALPN `doq`，`transport` 见 [`doq_transport`]。TLS 一律可以提出早期数据，用不用 0-RTT
-/// 由每次建连按上游的设置定（见 [`DoqMuxClient::zero_rtt_retry_allowed`]）：TLS 照全局设置的话，全局关、按上游开的
+/// 由每次建连按上游的设置定（见 [`DoqMuxClient::zero_rtt_allowed`]）：TLS 照全局设置的话，全局关、按上游开的
 /// 0-RTT 就从来用不上
 /// The settings of DoQ connections: `tls` with ALPN `doq`, and `transport` (see
 /// [`doq_transport`]). TLS may always offer early data, whether 0-RTT is used being decided on
-/// each connect by the upstream's setting (see [`DoqMuxClient::zero_rtt_retry_allowed`]): with
+/// each connect by the upstream's setting (see [`DoqMuxClient::zero_rtt_allowed`]): with
 /// TLS following the global setting, 0-RTT switched off globally and on for an upstream would
 /// never be used
 fn doq_client_config(
@@ -714,7 +719,7 @@ impl DoqMuxClient {
             // 0-RTT 还允许时，发往上一次完整握手连上的地址 / With 0-RTT still allowed, it goes to the
             // address the last full handshake reached
             let zero_rtt_at = self
-                .zero_rtt_retry_allowed(target)
+                .zero_rtt_allowed(target)
                 .then(|| *self.zero_rtt.reached.lock())
                 .flatten();
             let made = Self::connect_new(
@@ -857,10 +862,10 @@ impl DoqMuxClient {
         )
     }
 
-    /// 在这条连接上是否还允许关掉 0-RTT 重试：配置开着、且还没被标记过拒绝
-    /// Whether a 0-RTT retry is still allowed here: enabled by configuration and
-    /// not already marked as rejected
-    fn zero_rtt_retry_allowed(&self, target: &DoqTarget) -> bool {
+    /// 建连时可不可以用 0-RTT：上游写的 `0rtt` 优先，没写照全局设置，而且上游没拒绝过
+    /// Whether a connect may use 0-RTT: the upstream's `0rtt` first, else the global setting, and
+    /// never refused by the upstream
+    fn zero_rtt_allowed(&self, target: &DoqTarget) -> bool {
         target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt)
             && !self.zero_rtt.rejected.load(Ordering::Relaxed)
     }

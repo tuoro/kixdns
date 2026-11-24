@@ -16,6 +16,47 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+/// DoQ 失败的原因在 `{:#}` 里每一句只出现一次，连接没了的写着为什么没了。以前 Display 写出了 quinn 的错误、source 又给一遍
+/// （quinn 的 `ReadToEndError` 自己也是这样），于是「timed out: timed out」，「0-RTT rejected」连写三遍
+/// A DoQ failure's causes each come once in `{:#}`, a connection lost saying why. Display used to
+/// write quinn's error out with source giving it again (as quinn's `ReadToEndError` does itself),
+/// so "timed out: timed out", and "0-RTT rejected" three times over
+#[test]
+fn a_doq_failure_names_each_cause_once() {
+    use quinn::{ConnectionError, ReadError, ReadToEndError, WriteError};
+    let closed = || {
+        ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(0),
+            reason: bytes::Bytes::from_static(b"closing"),
+        })
+    };
+    let rendered = |failure| format!("{:#}", anyhow::Error::new(failure));
+    assert_eq!(
+        rendered(DoqFailure::OpenStream(ConnectionError::TimedOut)),
+        "doq open stream failed: timed out"
+    );
+    assert_eq!(
+        rendered(DoqFailure::Write(WriteError::ConnectionLost(closed()))),
+        "doq send query failed: connection lost: closed by peer: closing (code 0)"
+    );
+    assert_eq!(
+        rendered(DoqFailure::Read(ReadToEndError::Read(
+            ReadError::ZeroRttRejected
+        ))),
+        "doq read response failed: read error: 0-RTT rejected"
+    );
+    assert_eq!(
+        rendered(DoqFailure::Read(ReadToEndError::Read(
+            ReadError::ConnectionLost(closed())
+        ))),
+        "doq read response failed: read error: connection lost: closed by peer: closing (code 0)"
+    );
+    assert_eq!(
+        rendered(DoqFailure::Read(ReadToEndError::TooLong)),
+        "doq read response failed: stream too long"
+    );
+}
+
 /// 0-RTT 的安全提示曾在构造 DoQ 客户端时打印，而客户端在任何配置下都会构造，
 /// 于是没有任何 DoQ 上游的部署每次启动也会看到它。
 /// The 0-RTT security notice used to be printed when the DoQ client was
