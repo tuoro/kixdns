@@ -250,7 +250,7 @@ const REFRESH_EDNS_PAYLOAD: u16 = 1232;
 fn request_timeout_ms(settings: &crate::config::GlobalSettings) -> u64 {
     settings
         .request_timeout_ms
-        .unwrap_or(settings.upstream_timeout_ms * 5 / 2)
+        .unwrap_or(settings.default_request_timeout_ms())
 }
 
 impl Engine {
@@ -792,7 +792,7 @@ impl Engine {
             // 1. Check Response Cache (L2) / 1. 检查响应缓存（L2）
             let cache_namespace = state.cache_namespace(pipeline_id);
             let requester_key = pipeline.map_or(RequesterKey::NONE, |p| {
-                p.requester.key(requester, Some(&self.geoip_manager))
+                p.requester.key(requester, &self.geoip_manager)
             });
             let slot = Self::cache_slot(
                 cache_namespace,
@@ -2060,17 +2060,19 @@ pub(crate) struct Route {
     /// take another way to another answer. A request-phase jump into another pipeline,
     /// changing the keys, starts again from None: what is given there is given to the requests
     /// entering there directly too
-    pub(crate) answer_ttl: Option<u32>,
-    /// 上游失败以后 miss 动作接手了（见 `phases::Forwarding::act`）：此后规则给出的静态应答只是这一次请求的兜底，不是这个
-    /// 问题的应答，不缓存（见 `Route::static_ttl`）。转发拿到的应答照常缓存：故障期间备用上游的回答也是这个问题的回答。
-    /// 请求阶段跳进别的 pipeline 以后和 `answer_ttl` 一样从头记
-    /// The miss actions took over after an upstream failure (see `phases::Forwarding::act`): a
-    /// static answer the rules give from here on is a fallback for this request, not the
-    /// answer to the question, and is not cached (see `Route::static_ttl`). An answer a forward
-    /// fetches is cached as usual: a backup upstream's answer during the failure answers the
-    /// question all the same. A request-phase jump into another pipeline starts it afresh, as
-    /// `answer_ttl`
-    pub(crate) fell_back: bool,
+    answer_ttl: Option<u32>,
+    /// 回答检查据上游失败做了决定（见 `Route::went_by`）：上游没有回答、miss 动作接手了，或者回答检查看到的是失败应答（见
+    /// `upstream::is_failure_reply`）。此后规则给出的静态应答只是这一次请求的兜底，不是这个问题的应答，不缓存（见
+    /// `Route::static_ttl`）。转发拿到的应答照常缓存：故障期间备用上游的回答也是这个问题的回答。请求阶段跳进别的 pipeline
+    /// 以后和 `answer_ttl` 一样从头记
+    /// An answer check decided on an upstream failure (see `Route::went_by`): the upstream gave
+    /// no answer and the miss actions took over, or the check saw a failure reply (see
+    /// `upstream::is_failure_reply`). A static answer the rules give from here on is a fallback
+    /// for this request, not the answer to the question, and is not cached (see
+    /// `Route::static_ttl`). An answer a forward fetches is cached as usual: a backup upstream's
+    /// answer during the failure answers the question all the same. A request-phase jump into
+    /// another pipeline starts it afresh, as `answer_ttl`
+    fell_back: bool,
     /// The forwards the request passed in the current pipeline, each with the ECS it sent
     /// and whom its reply applies to; every answer the request caches applies to the
     /// requesters all of them admit (see `CacheEntry::reach`). A forward adds its own here.
@@ -2107,8 +2109,7 @@ impl Route {
         let keys = request.keys(
             pipeline_id,
             &pipeline.map_or(RequesterKey::NONE, |p| {
-                p.requester
-                    .key(request.requester, Some(&engine.geoip_manager))
+                p.requester.key(request.requester, &engine.geoip_manager)
             }),
         );
         Self {
@@ -2165,8 +2166,7 @@ impl Route {
         // The keys follow the pipeline / 键随 pipeline 改变
         self.keys = request.keys(
             &p.id,
-            &p.requester
-                .key(request.requester, Some(&engine.geoip_manager)),
+            &p.requester.key(request.requester, &engine.geoip_manager),
         );
         true
     }
@@ -2179,11 +2179,19 @@ impl Route {
         self.resume_at = rule + 1;
     }
 
-    /// 回答检查据一份能在缓存里留 `ttl` 秒的上游应答做了决定：记进 `answer_ttl`，此后缓存的应答最多留这么久
-    /// An answer check decided on an upstream answer that may stay in the cache `ttl` seconds:
-    /// noted in `answer_ttl`, no answer cached from here on staying longer
-    pub(crate) fn went_by(&mut self, ttl: u32) {
-        self.answer_ttl = Some(self.answer_ttl.map_or(ttl, |before| before.min(ttl)));
+    /// 回答检查做了决定，据的是一份能在缓存里留 `ttl` 秒的上游回答（`Some(ttl)`）：记进 `answer_ttl`，此后缓存的应答最多
+    /// 留这么久；或者据的是上游失败（None）：记进 `fell_back`，此后规则给出的静态应答是兜底
+    /// An answer check decided, going by an upstream answer that may stay in the cache `ttl`
+    /// seconds (`Some(ttl)`): noted in `answer_ttl`, no answer cached from here on staying
+    /// longer; or going by an upstream failure (None): noted in `fell_back`, a static answer the
+    /// rules give from here on being a fallback
+    pub(crate) fn went_by(&mut self, ttl: Option<u32>) {
+        match ttl {
+            Some(ttl) => {
+                self.answer_ttl = Some(self.answer_ttl.map_or(ttl, |before| before.min(ttl)));
+            }
+            None => self.fell_back = true,
+        }
     }
 
     /// 规则给出的静态应答要缓存多久（再经 [`Self::cache`] 收进 `answer_ttl` 以内）。`carried` 是它带的 TTL（记录里最小的，

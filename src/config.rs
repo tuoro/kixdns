@@ -98,7 +98,11 @@ pub struct GlobalSettings {
     /// 包含 hedge + TCP fallback 的总超时时间。如果未设置，自动计算为 upstream_timeout_ms * 2.5
     /// Total timeout including hedge + TCP fallback. If not set, auto-calculated as upstream_timeout_ms * 2.5
     pub request_timeout_ms: Option<u64>,
-    /// 响应阶段 Pipeline 跳转上限。 / Response phase pipeline jump limit
+    /// 一个查询最多跳转几次 Pipeline：请求阶段规则的跳转最多这么多次，回答动作的头一次跳转起（连同之后规则级的跳转）
+    /// 另算这么多次，不超过 [`MAX_JUMP_LIMIT`]
+    /// How many pipeline jumps a query may make: the request phase's rules this many, and from an
+    /// answer action's first jump on (the rule-level jumps after it included) this many again, at
+    /// most [`MAX_JUMP_LIMIT`]
     pub response_jump_limit: u32,
     /// UDP 上游连接池大小。 / UDP upstream connection pool size
     pub udp_pool_size: usize,
@@ -709,6 +713,70 @@ pub const MAX_DASHMAP_SHARDS: usize = 65_536;
 /// kernel down
 pub const MAX_POOL_SIZE: usize = 1024;
 
+/// `response_jump_limit` 的上限。每跳一次都要再走一遍目标的规则（快速路径还要记下这一跳），几个 Pipeline 互相跳转时，
+/// 一个查询要跳满上限才回 SERVFAIL：上限是五百万时一个查询要 7.8 秒、六百多 MB。64 次远多于正经配置串起来的
+/// Pipeline，跳满也只是把规则多走几十遍。超过的按它截断（见 [`GlobalSettings::hold_to_limits`]）
+/// The most `response_jump_limit` may be. Each jump runs the target's rules again (and the fast
+/// path keeps a record of it), and with pipelines jumping to each other a query jumps the whole
+/// limit before it answers SERVFAIL: at five million one query takes 7.8 seconds and over six
+/// hundred MB. 64 jumps are far more than any sound configuration chains pipelines, and jumping
+/// them all is no more than running the rules some tens of times. More is held to it (see
+/// [`GlobalSettings::hold_to_limits`])
+pub const MAX_JUMP_LIMIT: u32 = 64;
+
+/// 有上限的设置，每项写一次：字段和它的上限。说哪些超了的 `over_limits`（算 [`problems`]）和把它们截到上限的
+/// `hold_to_limits` 都由这张表生成
+/// The settings with a limit, each written once: the field and its limit. Both `over_limits`
+/// (among [`problems`]), telling which are over, and `hold_to_limits`, holding them to their
+/// limits, are made from this table
+macro_rules! limited_settings {
+    ($($setting:ident: $most:expr),* $(,)?) => {
+        impl GlobalSettings {
+            /// 超过上限的设置（见 `limited_settings!`），每项一句，值不动。它们算 [`problems`]：启动时记一条错误、按上限照常
+            /// 起来（见 [`Self::hold_to_limits`]），没有上限时能用的配置（`tcp_pool_size: 2048`）升级以后照样起得来；重载和
+            /// 面板保存拒绝
+            /// The settings over their limits (see `limited_settings!`), a sentence each, the
+            /// values left as they are. They count among [`problems`]: startup logs an error and
+            /// starts at the limit (see [`Self::hold_to_limits`]), so a configuration that worked
+            /// before there were limits (`tcp_pool_size: 2048`) still starts after an upgrade,
+            /// while a reload and a panel save refuse it
+            fn over_limits(&self) -> Vec<String> {
+                let mut over = Vec::new();
+                $(
+                    if self.$setting > $most {
+                        over.push(format!(
+                            "settings.{}: {} is more than {most}, the most it may be; startup uses {most} instead",
+                            stringify!($setting),
+                            self.$setting,
+                            most = $most,
+                        ));
+                    }
+                )*
+                over
+            }
+
+            /// 把超过上限的设置截到上限（见 `limited_settings!`；说它们的是 `over_limits`，算 [`problems`]）。编译配置时
+            /// 先截（见 `RuntimePipelineConfig::from_config`）
+            /// Holds the settings over their limits to them (see `limited_settings!`;
+            /// `over_limits` names them, among [`problems`]). Compiling a configuration holds
+            /// them first (see `RuntimePipelineConfig::from_config`)
+            pub fn hold_to_limits(&mut self) {
+                $(self.$setting = self.$setting.min($most);)*
+            }
+        }
+    };
+}
+
+limited_settings!(
+    dashmap_shards: MAX_DASHMAP_SHARDS,
+    udp_pool_size: MAX_POOL_SIZE,
+    tcp_pool_size: MAX_POOL_SIZE,
+    doh_pool_size: MAX_POOL_SIZE,
+    dot_pool_size: MAX_POOL_SIZE,
+    doq_pool_size: MAX_POOL_SIZE,
+    response_jump_limit: MAX_JUMP_LIMIT,
+);
+
 impl GlobalSettings {
     /// 和 `running`（进程启动时的设置）相比，改了以后要重启 KixDNS 才生效的设置名。这些设置只在启动时
     /// 读一次：监听地址、连接池、各传输的连接参数、缓存容量、自动限流；其余设置重载即生效。这里逐项列出
@@ -794,33 +862,47 @@ impl GlobalSettings {
 
     /// Parse the listener addresses and check the DoH prerequisites the way
     /// server startup does; a configuration that fails here cannot be served.
-    /// Both the server and [`validate`] call this.
+    /// Both the server and [`validate`] call this. Each error starts with the
+    /// setting it is about, as `settings.bind_udp: "localhost:53" …`.
     /// 按服务器启动的方式解析监听地址并检查 DoH 前置条件；此处失败的配置无法启动。
-    /// 服务器与 [`validate`] 都调用它。
+    /// 服务器与 [`validate`] 都调用它。每个错误开头写着说的是哪个设置，如 `settings.bind_udp: "localhost:53" …`。
     pub fn listeners(&self) -> anyhow::Result<ListenerConfig> {
-        let udp: SocketAddr = self.bind_udp.parse().context("parse bind addr")?;
-        let tcp: SocketAddr = self.bind_tcp.parse().context("parse tcp bind addr")?;
+        let address = |setting: &str, value: &str| {
+            value.parse::<SocketAddr>().with_context(|| {
+                format!("settings.{setting}: \"{value}\" is not an IP address and port")
+            })
+        };
+        let udp = address("bind_udp", &self.bind_udp)?;
+        let tcp = address("bind_tcp", &self.bind_tcp)?;
         let doh = match &self.bind_doh {
             Some(bind_doh) => {
-                let bind: SocketAddr = bind_doh.parse().context("parse doh bind addr")?;
-                let tls_cert = self
-                    .doh_tls_cert
-                    .clone()
-                    .context("doh_tls_cert is required when bind_doh is set")?;
-                let tls_key = self
-                    .doh_tls_key
-                    .clone()
-                    .context("doh_tls_key is required when bind_doh is set")?;
+                let required = |setting: &str, value: &Option<String>| {
+                    value.clone().with_context(|| {
+                        format!(
+                            "settings.{setting}: not set, though settings.bind_doh is \"{bind_doh}\" and DoH needs it"
+                        )
+                    })
+                };
                 Some(DohListenerConfig {
-                    bind,
-                    tls_cert,
-                    tls_key,
+                    bind: address("bind_doh", bind_doh)?,
+                    tls_cert: required("doh_tls_cert", &self.doh_tls_cert)?,
+                    tls_key: required("doh_tls_key", &self.doh_tls_key)?,
                     path: self.doh_path.clone(),
                 })
             }
             None => None,
         };
         Ok(ListenerConfig { udp, tcp, doh })
+    }
+
+    /// 不写 `request_timeout_ms` 时的整体超时（毫秒）：上游超时的两倍半，三分之一处重发、等满一段、失败了再用 TCP 等一段，
+    /// 再留一点余量；算出来超出 u64 时取 u64::MAX
+    /// The overall timeout (milliseconds) when `request_timeout_ms` is not written: two and a
+    /// half upstream timeouts, for the resend at a third, a whole wait, one more over TCP on
+    /// failure and a little margin; u64::MAX when that is more than a u64 holds
+    pub(crate) fn default_request_timeout_ms(&self) -> u64 {
+        let upstream = self.upstream_timeout_ms;
+        upstream.saturating_mul(2).saturating_add(upstream / 2)
     }
 
     /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
@@ -842,66 +924,29 @@ impl GlobalSettings {
             .unwrap_or_else(|| Arc::from(self.default_upstream.as_str()))
     }
 
-    /// 分片数和连接池超过上限的（见 [`MAX_DASHMAP_SHARDS`]、[`MAX_POOL_SIZE`]），每项一句，值不动。它们算
-    /// [`problems`]：启动时记一条错误、按上限照常起来（见 [`Self::hold_to_limits`]），没有上限时能用的配置
-    /// （`tcp_pool_size: 2048`）升级以后照样起得来；重载和面板保存拒绝
-    /// The shard count and the connection pools over their limits (see [`MAX_DASHMAP_SHARDS`],
-    /// [`MAX_POOL_SIZE`]), a sentence each, the values left as they are. They count among
-    /// [`problems`]: startup logs an error and starts at the limit (see [`Self::hold_to_limits`]),
-    /// so a configuration that worked before there were limits (`tcp_pool_size: 2048`) still
-    /// starts after an upgrade, while a reload and a panel save refuse it
-    fn over_limits(&self) -> impl Iterator<Item = String> {
-        [
-            ("dashmap_shards", self.dashmap_shards, MAX_DASHMAP_SHARDS),
-            ("udp_pool_size", self.udp_pool_size, MAX_POOL_SIZE),
-            ("tcp_pool_size", self.tcp_pool_size, MAX_POOL_SIZE),
-            ("doh_pool_size", self.doh_pool_size, MAX_POOL_SIZE),
-            ("dot_pool_size", self.dot_pool_size, MAX_POOL_SIZE),
-            ("doq_pool_size", self.doq_pool_size, MAX_POOL_SIZE),
-        ]
-        .into_iter()
-        .filter(|&(_, value, most)| value > most)
-        .map(|(setting, value, most)| {
-            format!(
-                "settings.{setting}: {value} is more than {most}, the most it may be; startup uses {most} instead"
-            )
-        })
-    }
-
-    /// 把超过上限的分片数和连接池截到上限（见 [`MAX_DASHMAP_SHARDS`]、[`MAX_POOL_SIZE`]；说它们的是 `over_limits`，算
-    /// [`problems`]）。编译配置时先截（见 `RuntimePipelineConfig::from_config`）
-    /// Holds the shard count and the connection pools over their limits to them (see
-    /// [`MAX_DASHMAP_SHARDS`], [`MAX_POOL_SIZE`]; `over_limits` names them, among [`problems`]).
-    /// Compiling a configuration holds them first (see `RuntimePipelineConfig::from_config`)
-    pub fn hold_to_limits(&mut self) {
-        self.dashmap_shards = self.dashmap_shards.min(MAX_DASHMAP_SHARDS);
-        for pool in [
-            &mut self.udp_pool_size,
-            &mut self.tcp_pool_size,
-            &mut self.doh_pool_size,
-            &mut self.dot_pool_size,
-            &mut self.doq_pool_size,
-        ] {
-            *pool = (*pool).min(MAX_POOL_SIZE);
-        }
-    }
-
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
-    /// 启动、热重载和面板校验都经过这里
+    /// 启动、热重载和面板校验都经过这里。每个错误是一行英文，开头写着设置和它的值，如 `settings.cache_capacity: 0 …`，
+    /// 和 [`problems`] 的写法一样
     /// Whether the settings make sense on their own: their ranges, how they relate, and the few read
     /// only at startup that must agree with what building the engine needs. The first step of
-    /// compiling a configuration, which startup, hot reloads and panel validation all go through
+    /// compiling a configuration, which startup, hot reloads and panel validation all go through.
+    /// Each error is a line in English starting with the setting and its value, as
+    /// `settings.cache_capacity: 0 …`, written as [`problems`] are
     pub fn validate(&self) -> anyhow::Result<()> {
         // Validate cache_capacity configuration
         if self.cache_capacity == 0 {
-            anyhow::bail!("cache_capacity must be greater than 0");
+            anyhow::bail!(
+                "settings.cache_capacity: 0 leaves the cache no room for any answer; it must be greater than 0"
+            );
         }
         // cache_max_ttl = 0 会让每条应答的缓存 TTL 归零，等于静默关掉缓存，
         // 与 cache_capacity = 0 同样不是有效配置。
         // cache_max_ttl = 0 clamps every entry's TTL to zero, silently disabling
         // the cache, which is no more a valid configuration than cache_capacity = 0.
         if self.cache_max_ttl == 0 {
-            anyhow::bail!("cache_max_ttl must be greater than 0");
+            anyhow::bail!(
+                "settings.cache_max_ttl: 0 holds the TTL of every answer cached to 0, leaving the cache unused; it must be greater than 0"
+            );
         }
         // 阈值是条目 TTL 的百分比，刷新条件是剩余 TTL 低于它。取 100 时阈值等于
         // 条目自身的 TTL，任何时间一过就满足，和超过 100 一样每次缓存命中都触发
@@ -913,7 +958,7 @@ impl GlobalSettings {
         // the client's full load. Use cache_background_refresh to turn it off.
         if self.cache_refresh_threshold_percent >= 100 {
             anyhow::bail!(
-                "cache_refresh_threshold_percent must be below 100 (at 100 every cache hit refreshes upstream), got {}",
+                "settings.cache_refresh_threshold_percent: {} makes every cache hit refresh upstream; it must be below 100",
                 self.cache_refresh_threshold_percent
             );
         }
@@ -924,7 +969,9 @@ impl GlobalSettings {
         // is issued, so no query can ever be answered. It does not mean "no
         // limit"; leaving request_timeout_ms unset is what derives a budget.
         if self.upstream_timeout_ms == 0 {
-            anyhow::bail!("upstream_timeout_ms must be greater than 0");
+            anyhow::bail!(
+                "settings.upstream_timeout_ms: 0 expires every upstream request as it is sent; it must be greater than 0"
+            );
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
         // 收下，到下次重启内核就起不来。DashMap 要求分片数是大于 1 的 2 的幂，不是的从来起不来；分片太多、连接池太大
@@ -938,7 +985,7 @@ impl GlobalSettings {
         let shards = self.dashmap_shards;
         if shards != 0 && !(shards.is_power_of_two() && shards >= 2) {
             anyhow::bail!(
-                "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
+                "settings.dashmap_shards: {shards} is neither 0 (the default) nor a power of two from 2 to {MAX_DASHMAP_SHARDS}"
             );
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
@@ -946,7 +993,7 @@ impl GlobalSettings {
             && quinn::IdleTimeout::try_from(std::time::Duration::from_secs(doq_idle)).is_err()
         {
             anyhow::bail!(
-                "doq_connection_idle_timeout_seconds is more than QUIC can carry, got {doq_idle}"
+                "settings.doq_connection_idle_timeout_seconds: {doq_idle} is more than QUIC can carry"
             );
         }
 
@@ -956,8 +1003,7 @@ impl GlobalSettings {
             && request_timeout < self.upstream_timeout_ms
         {
             anyhow::bail!(
-                "Configuration error: request_timeout_ms ({request_timeout}) must be >= upstream_timeout_ms ({upstream})\n\
-                 配置错误: request_timeout_ms ({request_timeout}) 必须大于等于 upstream_timeout_ms ({upstream})",
+                "settings.request_timeout_ms: {request_timeout} is less than settings.upstream_timeout_ms ({upstream}); it must be at least that",
                 upstream = self.upstream_timeout_ms
             );
         }
@@ -1317,7 +1363,8 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 /// 超时，没设 bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），还有规则用到、
 /// 却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
 /// 不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制通道 `config` 结果的
-/// `warnings` 列出它们，配置每生效一次各记一条 warn。以前只记 warn，默认日志级别看不到，校验也不说
+/// `warnings` 列出它们，配置每生效一次各记一条 warn。每条和 [`problems`] 一样，开头写着说的是哪个设置或哪个匹配器的路径。
+/// 以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
 /// [`RETIRED_SETTINGS`]) and the background refresh rule, a matcher written empty that so never
 /// matches (see `AnyMatcher::written_empty`), a cache so large it may take a lot of memory, an
@@ -1329,16 +1376,17 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 /// [`problems`]; they are found as the configuration compiles (see
 /// `RuntimePipelineConfig::warnings`), listed in the validation answer and as `warnings` in the
 /// control channel's `config` result, and each is logged as a warn every time the configuration
-/// takes effect. They used to be logged only, out of sight at the default log level, and
-/// validation said nothing of them
+/// takes effect. Each starts, as [`problems`] do, with the path of the setting or matcher it is
+/// about. They used to be logged only, out of sight at the default log level, and validation
+/// said nothing of them
 pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     let mut found = Vec::new();
     if cfg.background_refresh_rule.is_some() {
-        found.push("background_refresh_rule has no effect: a background refresh replays the original request through its own rules; the entry can be removed".to_owned());
+        found.push("background_refresh_rule: has no effect, as a background refresh replays the original request through its own rules; the entry can be removed".to_owned());
     }
     for key in cfg.unread_keys.iter().filter(|key| retired(key)) {
         found.push(format!(
-            "{key} is no longer read and has no effect; the entry can be removed"
+            "{key}: no longer read, so it has no effect; the entry can be removed"
         ));
     }
     let settings = &cfg.settings;
@@ -1352,7 +1400,7 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     // A UDP forward resends at a third of the upstream timeout, waits it out and on failure
     // waits once more over TCP: an overall timeout under two and a half of them may cut that short
     if let Some(request_timeout) = settings.request_timeout_ms
-        && request_timeout < settings.upstream_timeout_ms * 5 / 2
+        && request_timeout < settings.default_request_timeout_ms()
     {
         found.push(format!(
             "settings.request_timeout_ms: {request_timeout} is under 2.5 times upstream_timeout_ms ({}), which may cut the resend and the TCP fallback short",
@@ -1395,7 +1443,7 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
             })
     {
         found.push(format!(
-            "settings.bootstrap is unset, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
+            "settings.bootstrap: not set, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
         ));
     }
     for (place, entry) in entries(cfg) {
@@ -1427,7 +1475,7 @@ pub(crate) fn geo_tags_without_data(
     let mut found = Vec::new();
     if settings.geosite_data_paths.is_empty() && !geosite.is_empty() {
         found.push(format!(
-            "GeoSite tags {} have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does",
+            "settings.geosite_data_paths: empty, so the GeoSite tags {} have no data to match against: geo_site never matches them and geo_site_not always does",
             geosite.join(", ")
         ));
     }
@@ -1444,7 +1492,7 @@ pub(crate) fn geo_tags_without_data(
             None => " and neither is settings.geoip_db_path",
         };
         found.push(format!(
-            "GeoIP tags {} have no data to match against: settings.geoip_dat_path is not set{mmdb}, so geoip_country never matches them",
+            "settings.geoip_dat_path: not set{mmdb}, so the GeoIP tags {} have no data to match against: geoip_country never matches them",
             unanswered.join(", ")
         ));
     }
@@ -2008,7 +2056,7 @@ fn rule_problems(
         } = action
         {
             report(format!(
-                "ecs ip \"{ip}\" is not an IP address, so no ECS is sent"
+                "ecs ip \"{ip}\" is not an IP address, so no subnet is set and the client's own ECS, if any, goes upstream"
             ));
         }
         match action {
@@ -2435,7 +2483,7 @@ mod validation_tests {
             });
             super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
                 .iter()
-                .any(|warning| warning.starts_with("settings.bootstrap is unset"))
+                .any(|warning| warning.starts_with("settings.bootstrap: not set"))
         };
         let udp = serde_json::json!({ "default_upstream": "1.1.1.1:53" });
         let forward =
@@ -2615,11 +2663,11 @@ mod validation_tests {
         for (settings, cause) in [
             (
                 serde_json::json!({ "bind_udp": "0.0.0.0:5353x" }),
-                "parse bind addr",
+                "settings.bind_udp: \"0.0.0.0:5353x\" is not an IP address and port",
             ),
             (
                 serde_json::json!({ "bind_doh": "0.0.0.0:443" }),
-                "doh_tls_cert is required when bind_doh is set",
+                "settings.doh_tls_cert: not set",
             ),
         ] {
             let config = serde_json::json!({ "settings": settings, "pipelines": [] });
@@ -2627,6 +2675,119 @@ mod validation_tests {
                 .expect_err("refused");
             assert!(format!("{err:#}").contains(cause), "{err:#}");
         }
+    }
+
+    /// 设置本身说不通时，错误是一行英文，开头写着设置和它的值，和配置问题的写法一样：监听地址、DoH 的前提、取值范围和
+    /// 相互关系都是，看得出是哪个设置、写的什么；没有换行，journald 不会拆成两条
+    /// Settings that make no sense on their own are refused with a line in English starting with
+    /// the setting and its value, as configuration problems are written: the listener addresses,
+    /// the DoH prerequisites, the ranges and how settings relate alike, so that which setting it
+    /// is and what it says can be seen; with no line break, journald keeps it one entry
+    #[test]
+    fn settings_errors_start_with_the_setting_and_its_value() {
+        let doh = |more: serde_json::Value| {
+            let mut settings = serde_json::json!({ "bind_doh": "0.0.0.0:443" });
+            settings
+                .as_object_mut()
+                .unwrap()
+                .extend(more.as_object().unwrap().clone());
+            settings
+        };
+        for (settings, error) in [
+            (
+                serde_json::json!({ "bind_udp": "localhost:53" }),
+                "settings.bind_udp: \"localhost:53\" is not an IP address and port: invalid socket address syntax",
+            ),
+            (
+                serde_json::json!({ "bind_tcp": "0.0.0.0" }),
+                "settings.bind_tcp: \"0.0.0.0\" is not an IP address and port: invalid socket address syntax",
+            ),
+            (
+                serde_json::json!({ "bind_doh": ":443", "doh_tls_cert": "c.pem", "doh_tls_key": "k.pem" }),
+                "settings.bind_doh: \":443\" is not an IP address and port: invalid socket address syntax",
+            ),
+            (
+                doh(serde_json::json!({ "doh_tls_key": "k.pem" })),
+                "settings.doh_tls_cert: not set, though settings.bind_doh is \"0.0.0.0:443\" and DoH needs it",
+            ),
+            (
+                doh(serde_json::json!({ "doh_tls_cert": "c.pem" })),
+                "settings.doh_tls_key: not set, though settings.bind_doh is \"0.0.0.0:443\" and DoH needs it",
+            ),
+            (
+                serde_json::json!({ "cache_capacity": 0 }),
+                "settings.cache_capacity: 0 leaves the cache no room for any answer; it must be greater than 0",
+            ),
+            (
+                serde_json::json!({ "cache_max_ttl": 0 }),
+                "settings.cache_max_ttl: 0 holds the TTL of every answer cached to 0, leaving the cache unused; it must be greater than 0",
+            ),
+            (
+                serde_json::json!({ "cache_refresh_threshold_percent": 100 }),
+                "settings.cache_refresh_threshold_percent: 100 makes every cache hit refresh upstream; it must be below 100",
+            ),
+            (
+                serde_json::json!({ "upstream_timeout_ms": 0 }),
+                "settings.upstream_timeout_ms: 0 expires every upstream request as it is sent; it must be greater than 0",
+            ),
+            (
+                serde_json::json!({ "dashmap_shards": 3 }),
+                "settings.dashmap_shards: 3 is neither 0 (the default) nor a power of two from 2 to 65536",
+            ),
+            (
+                serde_json::json!({ "doq_connection_idle_timeout_seconds": u64::MAX }),
+                "settings.doq_connection_idle_timeout_seconds: 18446744073709551615 is more than QUIC can carry",
+            ),
+            (
+                serde_json::json!({ "upstream_timeout_ms": 2000, "request_timeout_ms": 1000 }),
+                "settings.request_timeout_ms: 1000 is less than settings.upstream_timeout_ms (2000); it must be at least that",
+            ),
+        ] {
+            let config = serde_json::json!({ "settings": settings, "pipelines": [] });
+            let refused = super::compile(super::parse_config(&config.to_string()).expect("parses"))
+                .expect_err("refused");
+            let refused = format!("{refused:#}");
+            assert!(refused.ends_with(error), "{refused}");
+            assert!(!refused.contains('\n'), "{refused}");
+        }
+    }
+
+    /// 不写 request_timeout_ms 时整体超时是上游超时的两倍半，算出来超出 u64 时取 u64::MAX；比它短的 request_timeout_ms
+    /// 算一条警告，大到这样的上游超时也照样比，不会溢出
+    /// The overall timeout without request_timeout_ms is two and a half upstream timeouts, u64::MAX
+    /// when that is more than a u64 holds; a request_timeout_ms under it is a warning, an upstream
+    /// timeout that large compared all the same, with no overflow
+    #[test]
+    fn the_default_request_timeout_is_two_and_a_half_upstream_timeouts() {
+        let settings =
+            |upstream_timeout_ms: u64, request_timeout_ms: Option<u64>| super::GlobalSettings {
+                upstream_timeout_ms,
+                request_timeout_ms,
+                ..super::GlobalSettings::default()
+            };
+        for (upstream, request) in [
+            (9000, 22_500),
+            (3, 7),
+            (u64::MAX / 2, u64::MAX),
+            (u64::MAX, u64::MAX),
+        ] {
+            assert_eq!(
+                settings(upstream, None).default_request_timeout_ms(),
+                request,
+                "{upstream}"
+            );
+        }
+        let warned = |request_timeout_ms: u64| {
+            let config = super::PipelineConfig {
+                settings: settings(u64::MAX, Some(request_timeout_ms)),
+                ..serde_json::from_value::<super::PipelineConfig>(serde_json::json!({})).unwrap()
+            };
+            super::warnings(&config)
+                .iter()
+                .any(|warning| warning.starts_with("settings.request_timeout_ms:"))
+        };
+        assert!(warned(u64::MAX - 1));
+        assert!(!warned(u64::MAX));
     }
 
     /// 内核不读的键按路径报出来：拼错的设置、写错名字的匹配器（`matcher` 少了 s，规则就没有匹配器，匹配所有查询）、
@@ -2898,22 +3059,31 @@ mod validation_tests {
         );
     }
 
-    /// 分片数和连接池超过上限时，启动照常起来、按上限用，算一条配置问题（启动时记错误），重载和面板保存拒绝。以前编译
-    /// 直接失败：没有上限时能用的 `tcp_pool_size: 2048` 升级以后内核起不来
-    /// A shard count or connection pool over its limit starts as usual at the limit and counts as
-    /// a configuration problem (logged as an error at startup), which a reload and a panel save
-    /// refuse. Compiling used to fail outright: a `tcp_pool_size: 2048` that worked before there
-    /// were limits kept the kernel from starting after an upgrade
+    /// 分片数、连接池和跳转上限超过上限时，启动照常起来、按上限用，算一条配置问题（启动时记错误），重载和面板保存拒绝：
+    /// 没有上限时能用的 `tcp_pool_size: 2048` 升级以后照样起得来，互相跳转的两个 Pipeline 写上五百万的跳转上限，一个查询
+    /// 也只跳 64 次
+    /// A shard count, connection pool or jump limit over its limit starts as usual at the limit
+    /// and counts as a configuration problem (logged as an error at startup), which a reload and a
+    /// panel save refuse: a `tcp_pool_size: 2048` that worked before there were limits still
+    /// starts after an upgrade, and with a jump limit of five million two pipelines jumping to
+    /// each other still take a query no more than 64 jumps
     #[tokio::test]
     async fn settings_over_their_limits_start_held_to_them() {
-        use super::{MAX_DASHMAP_SHARDS, MAX_POOL_SIZE};
+        use super::{MAX_DASHMAP_SHARDS, MAX_JUMP_LIMIT, MAX_POOL_SIZE};
+        let (shards, pools, jumps) = (
+            MAX_DASHMAP_SHARDS as u64,
+            MAX_POOL_SIZE as u64,
+            u64::from(MAX_JUMP_LIMIT),
+        );
         for (setting, over, most) in [
-            ("dashmap_shards", MAX_DASHMAP_SHARDS * 2, MAX_DASHMAP_SHARDS),
-            ("udp_pool_size", usize::MAX, MAX_POOL_SIZE),
-            ("tcp_pool_size", 2048, MAX_POOL_SIZE),
-            ("doh_pool_size", 2048, MAX_POOL_SIZE),
-            ("dot_pool_size", MAX_POOL_SIZE + 1, MAX_POOL_SIZE),
-            ("doq_pool_size", 2048, MAX_POOL_SIZE),
+            ("dashmap_shards", shards * 2, shards),
+            ("udp_pool_size", u64::MAX, pools),
+            ("tcp_pool_size", 2048, pools),
+            ("doh_pool_size", 2048, pools),
+            ("dot_pool_size", pools + 1, pools),
+            ("doq_pool_size", 2048, pools),
+            ("response_jump_limit", 5_000_000, jumps),
+            ("response_jump_limit", jumps + 1, jumps),
         ] {
             let config = serde_json::json!({
                 "settings": { "default_upstream": "1.1.1.1:53", setting: over },
@@ -3724,7 +3894,7 @@ mod validation_tests {
         assert_eq!(
             runtime.warnings,
             [
-                "GeoSite tags cn have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does"
+                "settings.geosite_data_paths: empty, so the GeoSite tags cn have no data to match against: geo_site never matches them and geo_site_not always does"
             ]
         );
     }
