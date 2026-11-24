@@ -115,11 +115,11 @@ async fn the_fast_path_follows_a_jump_the_rule_cache_keeps() {
             { "id": "domestic", "rules": [rule("all", any(), json!({ "type": "forward", "upstream": upstream.address }))] }
         ]),
     );
-    engine
-        .geosite_manager
-        .write()
-        .load_from_v2ray_string(r#"{"entries":[{"tag":"cn","domains":["domain:example.cn"]}]}"#)
+    let mut cn = crate::matcher::geosite::GeoSiteManager::default();
+    cn.load_from_v2ray_string(r#"{"entries":[{"tag":"cn","domains":["domain:example.cn"]}]}"#)
         .expect("load geosite");
+    let cn = std::sync::Arc::new(cn);
+    engine.change_geo(|geo| geo.geosite = std::sync::Arc::clone(&cn));
     ask(&engine, &query("www.example.cn."), peer()).await;
     let reply = fast_answer(&engine, "www.example.cn.").expect("answered on the fast path");
     assert_eq!(first_a(&reply), Some(UPSTREAM));
