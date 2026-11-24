@@ -705,14 +705,19 @@ pub const MAX_DASHMAP_SHARDS: usize = 65_536;
 pub const MAX_POOL_SIZE: usize = 1024;
 
 /// `response_jump_limit` 的上限。每跳一次都要再走一遍目标的规则（快速路径还要记下这一跳），几个 Pipeline 互相跳转时，
-/// 一个查询要跳满上限才回 SERVFAIL：上限是五百万时一个查询要 7.8 秒、六百多 MB。64 次远多于正经配置串起来的
-/// Pipeline，跳满也只是把规则多走几十遍。超过的按它截断（见 [`GlobalSettings::hold_to_limits`]）
+/// 一个查询要跳满上限才回 SERVFAIL：上限是五百万时一个查询要 7.8 秒、六百多 MB。回答阶段绕圈更贵：跳过去的规则又转发，
+/// 每跳一次再问一次上游，跳满 64 次的查询问了上游 65 次。64 次远多于正经配置串起来的 Pipeline，请求阶段跳满也只是把
+/// 规则多走几十遍；绕成圈的跳转在配置生效时报一条告警（见 [`warnings`]）。超过的按它截断（见
+/// [`GlobalSettings::hold_to_limits`]）
 /// The most `response_jump_limit` may be. Each jump runs the target's rules again (and the fast
 /// path keeps a record of it), and with pipelines jumping to each other a query jumps the whole
 /// limit before it answers SERVFAIL: at five million one query takes 7.8 seconds and over six
-/// hundred MB. 64 jumps are far more than any sound configuration chains pipelines, and jumping
-/// them all is no more than running the rules some tens of times. More is held to it (see
-/// [`GlobalSettings::hold_to_limits`])
+/// hundred MB. Going round in the answer phase costs more: the rules jumped to forward again,
+/// asking an upstream once more on every jump, and a query that jumps all 64 times has asked
+/// upstreams 65 times. 64 jumps are far more than any sound configuration chains pipelines, and
+/// in the request phase jumping them all is no more than running the rules some tens of times;
+/// jumps that go round in a circle are warned about as the configuration takes effect (see
+/// [`warnings`]). More is held to it (see [`GlobalSettings::hold_to_limits`])
 pub const MAX_JUMP_LIMIT: u32 = 64;
 
 /// 有上限的设置，每项写一次：字段和它的上限。说哪些超了的 `over_limits`（算 [`problems`]）和把它们截到上限的
@@ -1366,24 +1371,25 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 
 /// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，值写成空而
 /// 永远不命中的匹配器（见 `AnyMatcher::written_empty`），大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体
-/// 超时，没设 bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），还有规则用到、
-/// 却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
+/// 超时，没设 bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），绕成圈的跳转（见
+/// [`jump_cycles`]），还有规则用到、却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
 /// 不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制通道 `config` 结果的
-/// `warnings` 列出它们，配置每生效一次各记一条 warn。每条和 [`problems`] 一样，开头写着说的是哪个设置或哪个匹配器的路径。
+/// `warnings` 列出它们，配置每生效一次各记一条 warn。每条和 [`problems`] 一样，开头写着说的是哪个设置、匹配器或规则的路径。
 /// 以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
 /// [`RETIRED_SETTINGS`]) and the background refresh rule, a matcher written empty that so never
 /// matches (see `AnyMatcher::written_empty`), a cache so large it may take a lot of memory, an
 /// overall timeout too short for the resend and the TCP fallback, upstreams written with a host name
 /// while bootstrap is unset (resolving comes back round should the system resolver be KixDNS
-/// itself, see `engine::bootstrap`), and Geo tags rules use with no data configured to read them
-/// from (which tags rules use is known once they compile, see [`geo_tags_without_data`]).
+/// itself, see `engine::bootstrap`), jumps that go round in a circle (see [`jump_cycles`]), and
+/// Geo tags rules use with no data configured to read them from (which tags rules use is known
+/// once they compile, see [`geo_tags_without_data`]).
 /// Startup, reloads and the panel's validation refuse none of them, nor do they count among
 /// [`problems`]; they are found as the configuration compiles (see
 /// `RuntimePipelineConfig::warnings`), listed in the validation answer and as `warnings` in the
 /// control channel's `config` result, and each is logged as a warn every time the configuration
-/// takes effect. Each starts, as [`problems`] do, with the path of the setting or matcher it is
-/// about. They used to be logged only, out of sight at the default log level, and validation
+/// takes effect. Each starts, as [`problems`] do, with the path of the setting, matcher or rule
+/// it is about. They used to be logged only, out of sight at the default log level, and validation
 /// said nothing of them
 pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
     let mut found = Vec::new();
@@ -1456,6 +1462,95 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
         for (within, matcher) in entry.matchers() {
             if let Some(warning) = matcher.warning() {
                 found.push(format!("{place}.{within}: {warning}"));
+            }
+        }
+    }
+    found.extend(jump_cycles(cfg));
+    found
+}
+
+/// 绕成圈的 jump_to_pipeline，每个圈在合上它的那条规则报一条 [`warnings`]：从这条规则跳过去，一路跳下去能回到它所在的
+/// pipeline。规则的跳转和回答动作的跳转都算。规则有匹配条件，不一定每个查询都绕得上，所以只告警、不拒绝；绕上的查询跳满
+/// `response_jump_limit` 才回 SERVFAIL，回答阶段每跳一次还要再问一次上游（见 [`MAX_JUMP_LIMIT`]）
+/// The jump_to_pipeline actions that go round in a circle, each circle one of the [`warnings`]
+/// at the rule that closes it: jumping on from that rule comes back round to its own pipeline.
+/// Rule jumps and answer-action jumps alike count. Rules have matchers, so not every query need
+/// go round, which is why this warns and refuses nothing; a query that does jumps the whole
+/// `response_jump_limit` before it is answered SERVFAIL, and in the answer phase asks an upstream
+/// again on every jump (see [`MAX_JUMP_LIMIT`])
+fn jump_cycles(cfg: &PipelineConfig) -> Vec<String> {
+    // 一个 id 写了几次时跳转找到最后那个，和运行时一样（见 `RuntimePipelineConfig::pipeline`）；跳到不存在的
+    // pipeline 是一条 [`problems`]，不算在这里 / With an id written several times a jump finds the
+    // last, as at run time (see `RuntimePipelineConfig::pipeline`); a jump to a pipeline that does
+    // not exist is one of the [`problems`] and counts for nothing here
+    let by_id: rustc_hash::FxHashMap<&str, usize> = cfg
+        .pipelines
+        .iter()
+        .enumerate()
+        .map(|(i, pipeline)| (pipeline.id.as_str(), i))
+        .collect();
+    // 每个 pipeline 的跳转：（规则序号，目标），一条规则跳到同一个目标的只算一次
+    // Each pipeline's jumps: (rule index, target), a rule jumping to one target counted once
+    let jumps: Vec<Vec<(usize, usize)>> = cfg
+        .pipelines
+        .iter()
+        .map(|pipeline| {
+            let mut jumps = Vec::new();
+            for (j, rule) in pipeline.rules.iter().enumerate() {
+                for action in rule
+                    .actions
+                    .iter()
+                    .chain(&rule.response_actions_on_match)
+                    .chain(&rule.response_actions_on_miss)
+                {
+                    if let Action::JumpToPipeline { pipeline } = action
+                        && let Some(&target) = by_id.get(&**pipeline)
+                    {
+                        jumps.push((j, target));
+                    }
+                }
+            }
+            jumps.sort_unstable();
+            jumps.dedup();
+            jumps
+        })
+        .collect();
+    // 深度优先地走：跳到还在路上的 pipeline 就合上一个圈。路用栈记着，不递归，pipeline 再多也不会把栈用完
+    // Depth first: a jump to a pipeline still on the path closes a circle. The path is a stack
+    // of its own rather than recursion, so no number of pipelines runs out of stack
+    #[derive(Clone, Copy, PartialEq)]
+    enum Visit {
+        Not,
+        OnPath,
+        Done,
+    }
+    let mut visit = vec![Visit::Not; jumps.len()];
+    let mut found = Vec::new();
+    for root in 0..jumps.len() {
+        if visit[root] != Visit::Not {
+            continue;
+        }
+        visit[root] = Visit::OnPath;
+        // 路上的 pipeline，和它下一个要看的跳转 / The pipelines on the path, each with its next jump to look at
+        let mut path = vec![(root, 0)];
+        while let Some((at, next)) = path.last_mut() {
+            let at = *at;
+            let Some(&(rule, target)) = jumps[at].get(*next) else {
+                visit[at] = Visit::Done;
+                path.pop();
+                continue;
+            };
+            *next += 1;
+            match visit[target] {
+                Visit::Not => {
+                    visit[target] = Visit::OnPath;
+                    path.push((target, 0));
+                }
+                Visit::OnPath => found.push(format!(
+                    "pipelines[{at}].rules[{rule}]: jumping to \"{}\" comes back round to \"{}\", so a query that keeps going round is answered SERVFAIL once it has jumped response_jump_limit times, and in the answer phase asks an upstream again on every jump",
+                    cfg.pipelines[target].id, cfg.pipelines[at].id
+                )),
+                Visit::Done => {}
             }
         }
     }
@@ -2690,6 +2785,141 @@ mod validation_tests {
                 "pipelines[0].rules[1].matchers[0]: geoip_country with no country code never matches",
                 "pipelines[0].rules[2].response_matchers[0]: response_answer_ip_geoip_country with no country code never matches",
             ]
+        );
+    }
+
+    /// 跳转绕成的圈在合上它的规则报一条告警：请求阶段的跳转和回答动作的跳转连起来也算，跳回自己的也算；一个圈只报一次，
+    /// 不成圈的（一条链、两条路汇到一处、跳到不存在的 pipeline）不报。配置照样通过校验。以前一条都不报，回答阶段绕圈的
+    /// 查询每跳一次问一次上游，跳满上限才 SERVFAIL
+    /// A circle of jumps is warned about at the rule that closes it: request-phase jumps and
+    /// answer-action jumps joined up count, as does a jump back to its own pipeline; each circle
+    /// once, and nothing for what is no circle (a chain, two ways meeting at one pipeline, a jump
+    /// to a pipeline that does not exist). The configuration still passes validation. None used to
+    /// be raised, and a query going round in the answer phase asked an upstream on every jump
+    /// until the limit answered SERVFAIL
+    #[test]
+    fn jumps_that_come_back_round_are_a_warning() {
+        let any = serde_json::json!([{ "type": "any" }]);
+        let jump = |to: &str| serde_json::json!([{ "type": "jump_to_pipeline", "pipeline": to }]);
+        let forward = serde_json::json!([{ "type": "forward" }]);
+        let pipeline = |id: &str, rules: Vec<serde_json::Value>| serde_json::json!({ "id": id, "rules": rules });
+        let warned = |pipelines: Vec<serde_json::Value>| {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": pipelines
+            });
+            let report = super::validate(&config.to_string()).expect("a circle is no problem");
+            report
+                .warnings
+                .into_iter()
+                .filter(|warning| warning.contains("comes back round"))
+                .collect::<Vec<_>>()
+        };
+        let back = |place: &str, to: &str, from: &str| {
+            format!(
+                "{place}: jumping to \"{to}\" comes back round to \"{from}\", so a query that keeps going round is answered SERVFAIL once it has jumped response_jump_limit times, and in the answer phase asks an upstream again on every jump"
+            )
+        };
+
+        // a 的规则跳到 b，b 的回答动作跳回 a / a's rule jumps to b, and b's answer action back to a
+        assert_eq!(
+            warned(vec![
+                pipeline("a", vec![rule("to b", any.clone(), jump("b"))]),
+                pipeline(
+                    "b",
+                    vec![serde_json::json!({
+                        "name": "back",
+                        "matchers": any,
+                        "actions": forward,
+                        "response_matchers": [{ "type": "response_rcode", "value": "SERVFAIL" }],
+                        "response_actions_on_match": jump("a"),
+                        "response_actions_on_miss": jump("a")
+                    })]
+                ),
+            ]),
+            [back("pipelines[1].rules[0]", "a", "b")]
+        );
+        // 跳回自己 / A jump back to its own pipeline
+        assert_eq!(
+            warned(vec![pipeline(
+                "a",
+                vec![
+                    rule("ok", any.clone(), forward.clone()),
+                    rule("again", any.clone(), jump("a"))
+                ]
+            )]),
+            [back("pipelines[0].rules[1]", "a", "a")]
+        );
+        // 两个圈经过同一个 pipeline，各在合上它的规则报 / Two circles through one pipeline, each
+        // at the rule that closes it
+        assert_eq!(
+            warned(vec![
+                pipeline("a", vec![rule("to b", any.clone(), jump("b"))]),
+                pipeline(
+                    "b",
+                    vec![
+                        rule("to c", any.clone(), jump("c")),
+                        rule("back", any.clone(), jump("a"))
+                    ]
+                ),
+                pipeline("c", vec![rule("back", any.clone(), jump("a"))]),
+            ]),
+            [
+                back("pipelines[2].rules[0]", "a", "c"),
+                back("pipelines[1].rules[1]", "a", "b"),
+            ]
+        );
+        // 一条链、两条路汇到 d、跳到不存在的 pipeline：都不成圈 / A chain, two ways meeting at d,
+        // a jump to a pipeline that does not exist: no circle
+        let done = pipeline("d", vec![rule("done", any.clone(), forward.clone())]);
+        assert_eq!(
+            warned(vec![
+                pipeline("a", vec![rule("to b", any.clone(), jump("b"))]),
+                pipeline("b", vec![rule("to c", any.clone(), jump("c"))]),
+                pipeline(
+                    "c",
+                    vec![
+                        rule(
+                            "to d",
+                            serde_json::json!([{ "type": "domain_suffix", "value": ".example" }]),
+                            jump("d")
+                        ),
+                        rule("to d too", any.clone(), jump("d"))
+                    ]
+                ),
+                done.clone(),
+            ]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            warned(vec![
+                pipeline(
+                    "a",
+                    vec![
+                        rule(
+                            "to b",
+                            serde_json::json!([{ "type": "domain_suffix", "value": ".example" }]),
+                            jump("b")
+                        ),
+                        rule("to c", any.clone(), jump("c"))
+                    ]
+                ),
+                pipeline("b", vec![rule("to d", any.clone(), jump("d"))]),
+                pipeline("c", vec![rule("to d", any.clone(), jump("d"))]),
+                done,
+            ]),
+            Vec::<String>::new()
+        );
+        let config = serde_json::json!({
+            "settings": { "default_upstream": "1.1.1.1:53" },
+            "pipelines": [pipeline("a", vec![rule("gone", any.clone(), jump("gone"))])]
+        });
+        let parsed = super::parse_config(&config.to_string()).expect("parses");
+        assert!(
+            !super::warnings(&parsed)
+                .iter()
+                .any(|warning| warning.contains("comes back round")),
+            "a jump to a pipeline that does not exist is a problem, not a circle"
         );
     }
 
