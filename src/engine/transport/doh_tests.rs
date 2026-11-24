@@ -3,7 +3,7 @@
 use super::*;
 use crate::engine::bootstrap::Bootstrap;
 use crate::engine::test_support::{DohReply, http_ok, spawn_doh_upstream};
-use crate::engine::transport::connect::{KEEPALIVE_INTERVAL, KEEPALIVE_TIME};
+use crate::engine::transport::connect::{CONNECT_BUDGET, KEEPALIVE_INTERVAL, KEEPALIVE_TIME};
 use crate::engine::transport::test_support::*;
 use bytes::Bytes;
 use reqwest::Client as DohHttpClient;
@@ -367,6 +367,52 @@ async fn a_failed_doh_connect_is_neither_sent_again_nor_counted() {
             "the pool is not rebuilt (direct = {direct})"
         );
     }
+}
+
+/// TCP 连上了、TLS 握手却一直不答的 DoH 上游，直连和经 reqwest 都一样：建连到 [`CONNECT_BUDGET`] 就算没连上，不重发，
+/// 也不算进重建连接池的门槛，不用等满请求自己的时限
+/// A DoH upstream taking the TCP connection and never answering the TLS handshake, directly or
+/// through reqwest alike: the connect counts as no connection at [`CONNECT_BUDGET`], is not sent
+/// again and does not count toward rebuilding the pool, without the request's own limit running out
+#[tokio::test]
+async fn a_doh_handshake_left_unanswered_is_not_counted() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("https://{}/dns-query", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::Relaxed);
+            held.push(stream);
+        }
+    });
+    let budget = CONNECT_BUDGET + Duration::from_secs(2);
+    let ask = |direct: bool| {
+        let upstream = upstream.as_str();
+        async move {
+            let mut client = DohClient::new(8, 1, Bootstrap::system()).expect("build doh client");
+            if !direct {
+                client.reqwest_only_for_tests();
+            }
+            let started = tokio::time::Instant::now();
+            client
+                .send(&doh_test_query("silent"), upstream, budget)
+                .await
+                .expect_err("no connection");
+            assert_eq!(
+                client.rebuilds(upstream),
+                0,
+                "the pool is not rebuilt (direct = {direct})"
+            );
+            assert!(
+                started.elapsed() < budget,
+                "given up at the connect's limit (direct = {direct})"
+            );
+        }
+    };
+    futures::future::join(ask(true), ask(false)).await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 2, "connected once each");
 }
 
 /// 经 reqwest 的 DoH 连接和别的 TCP 连接一样保活（见 [`KEEPALIVE_TIME`]）：连上以后到这个进程里找出那条连接的
