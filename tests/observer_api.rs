@@ -3839,10 +3839,10 @@ fn background_refreshes(events: &[Event], qname: &str) -> usize {
         .count()
 }
 
-/// 后台刷新只给上游来的应答：缓存里的静态应答命中时不发起刷新，完整路径和快速路径一样。同一份
+/// 规则直接给出的静态应答不进响应缓存，再问时也就不发起后台刷新，完整路径和快速路径一样。同一份
 /// 设置下，上游来的应答照常刷新，说明刷新时机确实到了。
-/// A background refresh is only for answers from an upstream: a static answer in the
-/// cache starts none when hit, on the full and the fast path alike. With the same
+/// A static answer the rules give outright stays out of the response cache, so asking
+/// again starts no background refresh, on the full and the fast path alike. With the same
 /// settings an upstream's answer is refreshed, so the refresh was due.
 #[tokio::test]
 async fn a_cached_static_answer_starts_no_background_refresh() {
@@ -3850,7 +3850,7 @@ async fn a_cached_static_answer_starts_no_background_refresh() {
     let raw = serde_json::json!({
         "settings": {
             "default_upstream": "127.0.0.1:9",
-            // 静态应答按 min_ttl 写进缓存 / A static answer is cached for min_ttl
+            // 开着 min_ttl 也不缓存规则直接给出的 / Not cached for min_ttl either
             "min_ttl": 60,
             "cache_background_refresh": true,
             "cache_refresh_threshold_percent": 99,

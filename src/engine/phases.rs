@@ -141,22 +141,22 @@ pub(crate) fn kept_past_ttl(settings: &GlobalSettings) -> Duration {
 }
 
 /// 过期还能用的 `hit`（见 [`Age::Stale`]）是不是现在就交出去、按哪种上报：没开 serve_stale_client_timeout_ms
-/// 时马上交出；规则自己给出的应答没有上游可等，也马上交出（它的刷新照样发起，见 `serve_stale`）；别的先等上游（见
-/// `Engine::answer_from_cache`），只有这份应答刚刷新失败过的不等（RFC 8767 第 5 节，见 `REFRESH_FAILURE_RECHECK`）。
-/// 查缓存和快速路径都按这一处判断
+/// 时马上交出；开着的先等上游（见 `Engine::answer_from_cache`），只有这份应答刚刷新失败过的不等（RFC 8767 第 5 节，见
+/// `REFRESH_FAILURE_RECHECK`）。规则据上游应答给出的也一样等：它的刷新照样去问上游、把规则重新走一遍。查缓存和快速路径
+/// 都按这一处判断
 /// Whether `hit`, past its TTL and still of use (see [`Age::Stale`]), goes out right now, and
-/// reported as what: at once with serve_stale_client_timeout_ms off; at once too for an
-/// answer the rules gave, with no upstream to wait for (its refresh starts all the same, see
-/// `serve_stale`); any other waits on the upstream first (see `Engine::answer_from_cache`), and
-/// only an answer whose refresh failed lately does not wait (RFC 8767 section 5, see
-/// `REFRESH_FAILURE_RECHECK`). The cache lookup and the fast path both go by this alone
+/// reported as what: at once with serve_stale_client_timeout_ms off; with it on it waits on
+/// the upstream first (see `Engine::answer_from_cache`), and only an answer whose refresh
+/// failed lately does not wait (RFC 8767 section 5, see `REFRESH_FAILURE_RECHECK`). One the
+/// rules gave by an upstream answer waits alike: its refresh asks the upstream all the same
+/// and runs the rules again. The cache lookup and the fast path both go by this alone
 pub(crate) fn stale_at_once(
     engine: &Engine,
     settings: &GlobalSettings,
     slot: u64,
     hit: &CacheEntry,
 ) -> Option<CacheHitKind> {
-    if settings.serve_stale_client_timeout_ms == 0 || hit.upstream.is_none() {
+    if settings.serve_stale_client_timeout_ms == 0 {
         Some(CacheHitKind::Stale)
     } else if failed_lately(engine, slot, hit) {
         Some(CacheHitKind::StaleUpstreamFailure)
