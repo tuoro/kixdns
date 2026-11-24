@@ -96,24 +96,47 @@ impl ConfigWatch {
 pub(crate) struct PendingWatch {
     watcher: RecommendedWatcher,
     targets: Targets,
+    /// 装的时候有位置监视不上的文件，和为什么（见 [`PendingWatch::uncovered`]）/ The files with places
+    /// that could not be watched when installed, and why (see [`PendingWatch::uncovered`])
+    uncovered: Uncovered,
     tx: Sender<Message>,
     rx: Receiver<Message>,
 }
 
 impl PendingWatch {
-    /// 开始监视 `paths`（见 [`Targets`]）/ Starts watching `paths` (see [`Targets`])
+    /// 开始监视 `paths`（见 [`Targets`]）。有位置监视不上的文件各记一条 error，见 [`PendingWatch::uncovered`]
+    /// Starts watching `paths` (see [`Targets`]). A file with places that cannot be watched is
+    /// logged as an error, see [`PendingWatch::uncovered`]
     pub(crate) fn new(paths: &[PathBuf]) -> notify::Result<Self> {
         let (tx, rx) = mpsc::channel();
         let events = tx.clone();
-        let (watcher, targets) = Targets::watch(paths, move |event| {
+        let (watcher, targets, uncovered) = Targets::watch(paths, move |event| {
             let _ = events.send(Message::Event(event));
         })?;
+        for (path, err) in &uncovered {
+            error!(path = %path.display(), error = %err, "cannot watch every place the file leads, changes there go unseen");
+        }
         Ok(Self {
             watcher,
             targets,
+            uncovered,
             tx,
             rx,
         })
+    }
+
+    /// 装的时候有位置监视不上的文件：配置里写的路径，和为什么（那里的变化看不到）。比如符号链接指向的目录还不存在：链接
+    /// 所在的目录监视着，链接换了指向看得到，目录建好以后里面的文件出现了却看不到。开始以后文件重新解析时监视得怎样经
+    /// [`PendingWatch::start_reporting`] 的 `on_watch` 报
+    /// The files with places that could not be watched when installed: the path as configured,
+    /// and why (changes there go unseen). A symlink into a directory not there yet, say: the
+    /// link's directory is watched, so the link pointing elsewhere is seen, yet once the
+    /// directory is made the file showing up in it is not. How a file is watched as it is
+    /// resolved again after the start goes to `on_watch` of [`PendingWatch::start_reporting`]
+    pub(crate) fn uncovered(&self) -> impl Iterator<Item = (&Path, &notify::Error)> {
+        self.uncovered
+            .iter()
+            .map(|(path, err)| (path.as_path(), err))
     }
 
     /// 在名为 `name` 的线程上把每次变化交给 `on_change`，参数是配置里写的那个路径，直到返回的
@@ -129,11 +152,13 @@ impl PendingWatch {
     }
 
     /// 同 [`PendingWatch::start`]，每次回调之前文件重新解析、监视跟着换以后，把它监视得怎样交给 `on_watch`：参数是
-    /// 配置里写的路径，和它新的位置为什么监视不上（那里的变化看不到；这时也记一条 error），都监视上了是 None
+    /// 配置里写的路径，和它新的位置为什么监视不上（那里的变化看不到；这时也记一条 error），都监视上了是 None。开始之前
+    /// 监视得怎样见 [`PendingWatch::uncovered`]
     /// As [`PendingWatch::start`], and each time a file is resolved again before its callback,
     /// with the watches following, how it is watched goes to `on_watch`: the path as configured,
     /// and why its new places cannot be watched (changes there go unseen; an error is logged
-    /// too), None when every one is
+    /// too), None when every one is. How it is watched before the start, see
+    /// [`PendingWatch::uncovered`]
     pub(crate) fn start_reporting(
         self,
         name: &str,
@@ -145,6 +170,7 @@ impl PendingWatch {
             targets,
             tx,
             rx,
+            ..
         } = self;
         let files: Vec<&Path> = targets
             .files
@@ -222,19 +248,26 @@ struct Target {
     points: Vec<PathBuf>,
 }
 
+/// 有位置监视不上的文件：配置里写的路径，和为什么 / The files with places that cannot be watched:
+/// the path as configured, and why
+type Uncovered = Vec<(PathBuf, notify::Error)>;
+
 impl Targets {
-    /// 监视 `paths`，事件交给 `handler`。一个文件的监视点所在的目录一个都监视不了时报错
-    /// Watches `paths`, sending events to `handler`. An error when none of a file's watch
-    /// point directories can be watched
+    /// 监视 `paths`，事件交给 `handler`，并给出有监视点所在的目录监视不了的文件和为什么。一个文件的监视点所在的目录一个
+    /// 都监视不了时报错
+    /// Watches `paths`, sending events to `handler`, and gives the files with a watch point
+    /// directory that cannot be watched, and why. An error when none of a file's watch point
+    /// directories can be watched
     fn watch(
         paths: &[PathBuf],
         handler: impl notify::EventHandler,
-    ) -> notify::Result<(RecommendedWatcher, Self)> {
+    ) -> notify::Result<(RecommendedWatcher, Self, Uncovered)> {
         let mut watcher = RecommendedWatcher::new(handler, Config::default())?;
         let mut targets = Self {
             files: Vec::with_capacity(paths.len()),
             dirs: HashMap::new(),
         };
+        let mut uncovered = Vec::new();
         for path in paths {
             if targets
                 .files
@@ -254,15 +287,17 @@ impl Targets {
                     }
                 }
             }
-            if let (false, Some(err)) = (watched, first_error) {
-                return Err(err);
+            match (watched, first_error) {
+                (false, Some(err)) => return Err(err),
+                (true, Some(err)) => uncovered.push((path.clone(), err)),
+                _ => {}
             }
             targets.files.push(Target {
                 configured: path.clone(),
                 points,
             });
         }
-        Ok((watcher, targets))
+        Ok((watcher, targets, uncovered))
     }
 
     /// 多一个监视点用 `dir`，头一个时开始监视它 / One more watch point uses `dir`; the first starts watching it
@@ -298,17 +333,17 @@ impl Targets {
         let points = watch_points(&self.files[index].configured).map_err(notify::Error::io)?;
         // 先装新的再撤旧的，两边都用着的目录不会断开 / The new watches go in before the old come out,
         // so a directory both use is never dropped
-        let mut unwatched = None;
+        let mut uncovered = None;
         for dir in points.iter().filter_map(|point| point.parent()) {
             if let Err(err) = self.add_dir(watcher, dir) {
-                unwatched.get_or_insert(err);
+                uncovered.get_or_insert(err);
             }
         }
         let old = std::mem::replace(&mut self.files[index].points, points);
         for dir in old.iter().filter_map(|point| point.parent()) {
             self.remove_dir(watcher, dir);
         }
-        unwatched.map_or(Ok(()), Err)
+        uncovered.map_or(Ok(()), Err)
     }
 
     /// 监视点在 `paths` 里的文件 / The files with a watch point among `paths`
@@ -747,6 +782,7 @@ mod tests {
             mut targets,
             tx,
             rx,
+            ..
         } = PendingWatch::new(&files).expect("watch");
         let rescan = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
         tx.send(Message::Event(Ok(rescan))).unwrap();
@@ -1030,7 +1066,7 @@ mod tests {
         }
         let configured = real.join("conf/data.json.link");
         symlink(real.join("old/data.json"), &configured).unwrap();
-        let (mut watcher, mut targets) =
+        let (mut watcher, mut targets, _) =
             Targets::watch(std::slice::from_ref(&configured), |_| {}).expect("watch");
         let dirs = |targets: &Targets| {
             let mut dirs: Vec<PathBuf> = targets.dirs.keys().cloned().collect();
@@ -1047,6 +1083,32 @@ mod tests {
             targets.files[0].points,
             [configured.clone(), real.join("new/data.json")]
         );
+    }
+
+    /// 装监视的时候符号链接就指向不存在的目录：链接所在的目录监视得上，监视照样装好，这个文件带着为什么列在
+    /// `uncovered` 里，都监视得上的文件不在。以前只要有一个监视点装上就当监视着，监视不上的那些谁也不知道
+    /// A symlink leading into a directory not there when the watch is installed: the link's
+    /// directory can be watched, so the watch is installed all the same, and the file is listed
+    /// in `uncovered` with why, while a file watched everywhere is not. It used to count as
+    /// watched once any of its watch points went in, the others unknown to anyone
+    #[cfg(unix)]
+    #[test]
+    fn a_file_partly_watched_from_the_start_is_uncovered() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let conf = root.path().join("conf");
+        std::fs::create_dir(&conf).unwrap();
+        let (linked, plain) = (conf.join("linked.json"), conf.join("plain.json"));
+        std::os::unix::fs::symlink(root.path().join("missing/linked.json"), &linked).unwrap();
+        std::fs::write(&plain, "plain").unwrap();
+
+        let pending = PendingWatch::new(&[linked.clone(), plain]).expect("watch");
+        let uncovered: Vec<(&Path, String)> = pending
+            .uncovered()
+            .map(|(path, err)| (path, err.to_string()))
+            .collect();
+        assert_eq!(uncovered.len(), 1, "{uncovered:?}");
+        assert_eq!(uncovered[0].0, linked);
+        assert!(uncovered[0].1.contains("missing"), "{uncovered:?}");
     }
 
     /// 符号链接改指向一个监视不上的地方（目录不存在）以后，`on_watch` 拿到为什么（另记一条 error），又指回监视得上的
