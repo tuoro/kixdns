@@ -575,16 +575,8 @@ impl Rule {
             return;
         }
 
-        // 每种传输一组，各组按这里的顺序排进合并后的列表 / One set per transport, each going
-        // into the merged list in this order
-        const SCHEMES: [(Transport, &str); 6] = [
-            (Transport::Tcp, "tcp"),
-            (Transport::Udp, "udp"),
-            (Transport::TcpUdp, "tcp+udp"),
-            (Transport::Doh, "doh"),
-            (Transport::Dot, "dot"),
-            (Transport::Doq, "doq"),
-        ];
+        // 每种传输一组，各组按 `Transport::ALL` 的顺序排进合并后的列表 / One set per transport, each
+        // going into the merged list in the order of `Transport::ALL`
         let mut sets: [FxHashSet<String>; 6] = Default::default();
 
         for action in &self.actions {
@@ -602,18 +594,18 @@ impl Rule {
                     // without one or for one it does not know. An upstream asked over TCP and
                     // UDP at once is recorded once and still asked both ways after the merge
                     let (address, transport) = parse_upstream_addr(addr, action_transport);
-                    let slot = SCHEMES
-                        .iter()
-                        .position(|(scheme_transport, _)| *scheme_transport == transport)
-                        .expect("every transport has a set");
-                    sets[slot].insert(format!("{}://{address}", SCHEMES[slot].1));
+                    sets[transport as usize].insert(format!("{}://{address}", transport.label()));
                 }
             }
         }
 
-        let all_upstreams: Vec<Arc<str>> = sets
+        let all_upstreams: Vec<Arc<str>> = Transport::ALL
             .iter()
-            .flat_map(|set| set.iter().map(|s| Arc::from(s.as_str())))
+            .flat_map(|&transport| {
+                sets[transport as usize]
+                    .iter()
+                    .map(|s| Arc::from(s.as_str()))
+            })
             .collect();
 
         if all_upstreams.is_empty() {
@@ -627,12 +619,12 @@ impl Rule {
             tracing::debug!(
                 rule = %self.name,
                 forward_count,
-                tcp_count = sets[0].len(),
-                udp_count = sets[1].len(),
-                tcp_udp_count = sets[2].len(),
-                doh_count = sets[3].len(),
-                dot_count = sets[4].len(),
-                doq_count = sets[5].len(),
+                tcp_count = sets[Transport::Tcp as usize].len(),
+                udp_count = sets[Transport::Udp as usize].len(),
+                tcp_udp_count = sets[Transport::TcpUdp as usize].len(),
+                doh_count = sets[Transport::Doh as usize].len(),
+                dot_count = sets[Transport::Dot as usize].len(),
+                doq_count = sets[Transport::Doq as usize].len(),
                 total_upstreams = all_upstreams.len(),
                 "pre-computed merged forward actions with transport-specific deduplication"
             );
@@ -1026,6 +1018,55 @@ pub enum Transport {
     Doq,
 }
 
+impl Transport {
+    /// 每种传输，按合并的转发给上游分组的顺序（见 [`Rule::compute_merged_forward`]）/ Every transport, in
+    /// the order a merged forward groups its upstreams by (see [`Rule::compute_merged_forward`])
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Tcp,
+        Self::Udp,
+        Self::TcpUdp,
+        Self::Doh,
+        Self::Dot,
+        Self::Doq,
+    ];
+
+    /// 传输的名字：上游地址的前缀（`tcp://1.1.1.1:53`）和作答上游的名字（`tcp:1.1.1.1:53`，见 [`split_answered`]）都这样
+    /// 写，写出来的和读回去的（见 [`Self::from_label`]）是这同一份
+    /// The transport's name, as an upstream address's prefix (`tcp://1.1.1.1:53`) and an
+    /// answering upstream's name (`tcp:1.1.1.1:53`, see [`split_answered`]) write it alike, the
+    /// one table both writing and reading (see [`Self::from_label`]) go by
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Tcp => "tcp",
+            Self::TcpUdp => "tcp+udp",
+            Self::Doh => "doh",
+            Self::Dot => "dot",
+            Self::Doq => "doq",
+        }
+    }
+
+    /// 名字是 `label` 的传输（见 [`Self::label`]），不分大小写；前缀另外还认 udp+tcp、https、tls、quic。不认识的为 None
+    /// （[`parse_upstream_addr`] 这时用默认传输）
+    /// The transport named `label` (see [`Self::label`]), in any case; a prefix may also be
+    /// udp+tcp, https, tls or quic. None for one it does not know ([`parse_upstream_addr`] then
+    /// takes the default transport)
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        const ALIASES: [(&str, Transport); 4] = [
+            ("udp+tcp", Transport::TcpUdp),
+            ("https", Transport::Doh),
+            ("tls", Transport::Dot),
+            ("quic", Transport::Doq),
+        ];
+        // 每个转发都要看一次，不为大小写分配内存 / Every forward looks once, so case costs no allocation
+        Self::ALL
+            .into_iter()
+            .map(|transport| (transport.label(), transport))
+            .chain(ALIASES)
+            .find_map(|(name, transport)| label.eq_ignore_ascii_case(name).then_some(transport))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchOperator {
@@ -1301,7 +1342,7 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
         found.push(format!("settings.default_upstream: {NO_UPSTREAM}"));
     }
     for upstream in split_upstreams(&cfg.settings.default_upstream) {
-        if let Some(problem) = crate::engine::upstream::upstream_problem(upstream, Transport::Udp) {
+        if let Some(problem) = upstream_problem(upstream, Transport::Udp) {
             found.push(format!("settings.default_upstream: {problem}"));
         }
     }
@@ -1374,19 +1415,20 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
 
 /// 照样加载、照写的做，却值得知道的写法：不再起作用的旧设置（见 [`RETIRED_SETTINGS`]）和后台刷新专用规则，值写成空而
 /// 永远不命中的匹配器（见 `AnyMatcher::written_empty`），大得可能占掉很多内存的缓存，短得来不及重发和改用 TCP 的整体
-/// 超时，没设 bootstrap 却有写成主机名的上游（系统的解析器要是 KixDNS 自己，解析就绕回来，见 `engine::bootstrap`），绕成圈的跳转（见
-/// [`jump_cycles`]），还有规则用到、却没配可读的数据的 Geo 标签（规则编译以后才知道用到哪些，见 [`geo_tags_without_data`]）。启动、重载和面板的校验都
+/// 超时，绕成圈的跳转（见 [`jump_cycles`]），还有规则编译以后才知道的两种：没设 bootstrap 却有写成主机名的上游（系统的解析器
+/// 要是 KixDNS 自己，解析就绕回来，见 [`host_names_without_bootstrap`]），规则用到、却没配可读的数据的 Geo 标签（见
+/// [`geo_tags_without_data`]）。启动、重载和面板的校验都
 /// 不拒绝，也不算 [`problems`]；编译时找出来（见 `RuntimePipelineConfig::warnings`），校验的回答和控制通道 `config` 结果的
 /// `warnings` 列出它们，配置每生效一次各记一条 warn。每条和 [`problems`] 一样，开头写着说的是哪个设置、匹配器或规则的路径。
 /// 以前只记 warn，默认日志级别看不到，校验也不说
 /// What loads and runs as written yet is worth knowing: settings no longer in effect (see
 /// [`RETIRED_SETTINGS`]) and the background refresh rule, a matcher written empty that so never
 /// matches (see `AnyMatcher::written_empty`), a cache so large it may take a lot of memory, an
-/// overall timeout too short for the resend and the TCP fallback, upstreams written with a host name
+/// overall timeout too short for the resend and the TCP fallback, jumps that go round in a circle
+/// (see [`jump_cycles`]), and two known once the rules compile: upstreams written with a host name
 /// while bootstrap is unset (resolving comes back round should the system resolver be KixDNS
-/// itself, see `engine::bootstrap`), jumps that go round in a circle (see [`jump_cycles`]), and
-/// Geo tags rules use with no data configured to read them from (which tags rules use is known
-/// once they compile, see [`geo_tags_without_data`]).
+/// itself, see [`host_names_without_bootstrap`]), and Geo tags rules use with no data configured
+/// to read them from (see [`geo_tags_without_data`]).
 /// Startup, reloads and the panel's validation refuse none of them, nor do they count among
 /// [`problems`]; they are found as the configuration compiles (see
 /// `RuntimePipelineConfig::warnings`), listed in the validation answer and as `warnings` in the
@@ -1420,45 +1462,6 @@ pub fn warnings(cfg: &PipelineConfig) -> Vec<String> {
         found.push(format!(
             "settings.request_timeout_ms: {request_timeout} is under 2.5 times upstream_timeout_ms ({}), which may cut the resend and the TCP fallback short",
             settings.upstream_timeout_ms
-        ));
-    }
-    // 没设 bootstrap 时，写成主机名的上游交给系统的解析器解析（见 `engine::bootstrap`）。不写 upstream 的 forward 问的是
-    // 默认上游，按它自己的 transport 连 / Without bootstrap, upstreams written with a host name are
-    // resolved by the system resolver (see `engine::bootstrap`). A forward naming no upstream asks
-    // the default one, connected to by its own transport
-    let forwards = cfg
-        .pipelines
-        .iter()
-        .flat_map(|pipeline| &pipeline.rules)
-        .flat_map(|rule| {
-            rule.actions
-                .iter()
-                .chain(&rule.response_actions_on_match)
-                .chain(&rule.response_actions_on_miss)
-        })
-        .filter_map(|action| match action {
-            Action::Forward {
-                upstream,
-                transport,
-                ..
-            } => Some((
-                upstream.as_deref().unwrap_or(&settings.default_upstream),
-                transport.unwrap_or(Transport::Udp),
-            )),
-            _ => None,
-        });
-    if !names_an_address(&settings.bootstrap)
-        && let Some(host) = std::iter::once((settings.default_upstream.as_str(), Transport::Udp))
-            .chain(forwards)
-            .flat_map(|(upstreams, transport)| {
-                split_upstreams(upstreams).map(move |upstream| (upstream, transport))
-            })
-            .find_map(|(upstream, transport)| {
-                crate::engine::upstream::host_name(upstream, transport)
-            })
-    {
-        found.push(format!(
-            "settings.bootstrap: not set, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
         ));
     }
     for (place, entry) in entries(cfg) {
@@ -1601,6 +1604,30 @@ pub(crate) fn geo_tags_without_data(
         ));
     }
     found
+}
+
+/// 没设 bootstrap、却有写成主机名的上游时的那条 [`warnings`]：这些名字交给系统的解析器（见 `engine::bootstrap`），它要是
+/// KixDNS 自己，解析就绕回来问 KixDNS，上游连不上。上游是 `runtime` 可能转发到的每一个，和转发时一样算（见
+/// `engine::upstream::upstreams`）；不写 upstream 的 forward 问的是默认上游，按它自己的 transport 连
+/// The one of the [`warnings`] for upstreams written with a host name while bootstrap is unset:
+/// those names go to the system resolver (see `engine::bootstrap`), and should that be KixDNS
+/// itself, resolving one comes back round to KixDNS and the upstream cannot be reached. The
+/// upstreams are every one `runtime` may forward to, worked out as a forward does (see
+/// `engine::upstream::upstreams`); a forward naming no upstream asks the default one, connected
+/// to by its own transport
+pub(crate) fn host_names_without_bootstrap(
+    runtime: &crate::matcher::RuntimePipelineConfig,
+) -> Option<String> {
+    if names_an_address(&runtime.settings.bootstrap) {
+        return None;
+    }
+    let host = crate::engine::upstream::upstreams(runtime)
+        .into_iter()
+        .filter_map(|(address, transport)| crate::engine::transport::host_name(address, transport))
+        .min()?;
+    Some(format!(
+        "settings.bootstrap: not set, so upstream host names such as \"{host}\" are resolved by the system resolver; should that be KixDNS itself, resolving one comes back round to KixDNS and the upstream cannot be reached: set bootstrap to plain DNS servers written as IP:port"
+    ))
 }
 
 /// 以前有、后来删掉的设置：老配置里留着的照样能读，各算一条 [`warnings`]（配置每生效一次列出来、记一条 warn），不算
@@ -1810,7 +1837,14 @@ fn names_an_address(upstreams: &str) -> bool {
     split_upstreams(upstreams).next().is_some()
 }
 
-/// 一个上游去掉 `传输://` 前缀的地址和问它用的传输：前缀不认识（见 [`transport_for_scheme`]）或者没有前缀时用
+/// 上游地址的前缀（`tcp://` 里的 `tcp`）和它后面的部分，没有前缀时为 None。上游带不带前缀、带的是什么，都只这样看
+/// An upstream address's prefix (the `tcp` of `tcp://`) and what follows it, None without one.
+/// Whether an upstream has a prefix, and which, is only ever told so
+pub(crate) fn split_scheme(upstream: &str) -> Option<(&str, &str)> {
+    upstream.split_once("://")
+}
+
+/// 一个上游去掉 `传输://` 前缀的地址和问它用的传输：前缀不认识（见 [`Transport::from_label`]）或者没有前缀时用
 /// `default_transport`
 /// - "tcp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Tcp)
 /// - "https://dns.example.com/dns-query" -> ("dns.example.com/dns-query", Transport::Doh)
@@ -1818,38 +1852,32 @@ fn names_an_address(upstreams: &str) -> bool {
 ///
 /// The address of one upstream short of its `transport://` prefix, and the transport it is
 /// asked over: `default_transport` for a prefix it does not know (see
-/// [`transport_for_scheme`]) or none
+/// [`Transport::from_label`]) or none
 pub(crate) fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Transport) {
-    match addr.split_once("://") {
+    match split_scheme(addr) {
         Some((scheme, address)) => (
             address,
-            transport_for_scheme(scheme).unwrap_or(default_transport),
+            Transport::from_label(scheme).unwrap_or(default_transport),
         ),
         None => (addr, default_transport),
     }
 }
 
-/// 上游地址前缀对应的传输，不分大小写；不认识的前缀为 None（[`parse_upstream_addr`] 这时用默认传输）
-/// The transport an upstream prefix names, in any case; None for a prefix it does not know
-/// ([`parse_upstream_addr`] then takes the default transport)
-pub(crate) fn transport_for_scheme(scheme: &str) -> Option<Transport> {
-    // 每个转发都要看一次，不为大小写分配内存 / Every forward looks once, so case costs no allocation
-    let is = |name: &str| scheme.eq_ignore_ascii_case(name);
-    Some(if is("tcp") {
-        Transport::Tcp
-    } else if is("udp") {
-        Transport::Udp
-    } else if is("tcp+udp") || is("udp+tcp") {
-        Transport::TcpUdp
-    } else if is("doh") || is("https") {
-        Transport::Doh
-    } else if is("dot") || is("tls") {
-        Transport::Dot
-    } else if is("doq") || is("quic") {
-        Transport::Doq
-    } else {
-        return None;
-    })
+/// 一个上游写得对不对：前缀认识，地址是它的传输读得懂的。说明为什么不对
+/// Whether one upstream is written right: a known prefix, and an address its transport can
+/// read. Says why not
+fn upstream_problem(upstream: &str, default_transport: Transport) -> Option<String> {
+    if let Some((scheme, _)) = split_scheme(upstream)
+        && Transport::from_label(scheme).is_none()
+    {
+        return Some(format!(
+            "upstream \"{upstream}\" starts with an unknown prefix \"{scheme}://\""
+        ));
+    }
+    let (address, transport) = parse_upstream_addr(upstream, default_transport);
+    crate::engine::transport::check_upstream_address(address, transport)
+        .err()
+        .map(|error| format!("upstream \"{upstream}\" is not usable: {error:#}"))
 }
 
 /// 一串上游各自的地址（去掉前缀），`PermitManager::note_answer_took` 就是按它记的 / The address
@@ -1859,17 +1887,26 @@ pub(crate) fn upstream_addresses(upstreams: &str) -> impl Iterator<Item = &str> 
     split_upstreams(upstreams).map(|upstream| parse_upstream_addr(upstream, Transport::Udp).0)
 }
 
-/// 上游名字（`udp:1.1.1.1:53`，见 `engine::upstream::upstream_label`）里的地址：去掉前面的传输名。回答检查拿它和
-/// 配置里写的上游地址比（见 `RuntimeResponseMatcher::UpstreamEquals`）。不带传输名的原样返回
-/// The address in an upstream's name (`udp:1.1.1.1:53`, see `engine::upstream::upstream_label`):
-/// the name less its transport. The answer check compares it with the upstream addresses a
-/// configuration writes (see `RuntimeResponseMatcher::UpstreamEquals`). One without a
-/// transport comes back as it is
+/// 作答上游的名字（`udp:1.1.1.1:53`，见 `engine::upstream::upstream_label`）里的传输和地址，传输名照
+/// [`Transport::label`] 读。不带传输名的，传输为 None，地址是整个名字
+/// The transport and the address in an answering upstream's name (`udp:1.1.1.1:53`, see
+/// `engine::upstream::upstream_label`), the transport's name read by [`Transport::label`]. One
+/// without a transport's name has None for it, the address being the whole name
+pub(crate) fn split_answered(name: &str) -> (Option<Transport>, &str) {
+    name.split_once(':')
+        .and_then(|(label, address)| {
+            Transport::from_label(label).map(|transport| (Some(transport), address))
+        })
+        .unwrap_or((None, name))
+}
+
+/// 作答上游的名字里的地址（见 [`split_answered`]）。回答检查拿它和配置里写的上游地址比（见
+/// `RuntimeResponseMatcher::UpstreamEquals`）
+/// The address in an answering upstream's name (see [`split_answered`]). The answer check
+/// compares it with the upstream addresses a configuration writes (see
+/// `RuntimeResponseMatcher::UpstreamEquals`)
 pub(crate) fn answered_address(name: &str) -> &str {
-    ["udp:", "tcp:", "doh:", "dot:", "doq:"]
-        .iter()
-        .find_map(|transport| name.strip_prefix(transport))
-        .unwrap_or(name)
+    split_answered(name).1
 }
 
 /// `log` 动作认的级别 / The levels a `log` action takes
@@ -2236,10 +2273,9 @@ fn rule_problems(
                     report(NO_UPSTREAM.to_string());
                 }
                 for upstream in split_upstreams(upstreams) {
-                    if let Some(problem) = crate::engine::upstream::upstream_problem(
-                        upstream,
-                        transport.unwrap_or(Transport::Udp),
-                    ) {
+                    if let Some(problem) =
+                        upstream_problem(upstream, transport.unwrap_or(Transport::Udp))
+                    {
                         report(problem);
                     }
                 }
@@ -2708,7 +2744,10 @@ mod validation_tests {
                 "settings": settings,
                 "pipelines": [{ "id": "main", "rules": [rule("r", any.clone(), actions)] }]
             });
-            super::warnings(&super::parse_config(&config.to_string()).expect("parses"))
+            let config = super::parse_config(&config.to_string()).expect("parses");
+            crate::matcher::RuntimePipelineConfig::from_config(config)
+                .expect("compiles")
+                .warnings
                 .iter()
                 .any(|warning| warning.starts_with("settings.bootstrap: not set"))
         };

@@ -9,7 +9,6 @@ use bytes::Bytes;
 
 use crate::config::{Action, Transport};
 use crate::engine::rules::{Decision, ResponseActionResult, RuleCacheRecord};
-use crate::engine::upstream::has_transport_prefix;
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
     RequestStatus, RuleCacheLookup, RuleEvaluated, RuleMatched, RulePhase,
@@ -87,26 +86,7 @@ impl Drop for ObservedRequest<'_> {
 /// 缓存条目来源上游的地址，写法与 UpstreamResult::upstream 一致。条目记录的是
 /// forward_upstream 拼出的 `{传输}:{地址}`，传输部分不含冒号；规则生成的条目没有来源。
 pub(crate) fn cached_source(upstream: Option<&str>) -> Option<&str> {
-    upstream.map(|label| split_upstream_label(label).0)
-}
-
-/// The address and the transport in a `{transport}:{address}` label that
-/// `forward_upstream` builds; the transport part names the transport that
-/// carried the answer and never contains a colon.
-/// `forward_upstream` 拼出的 `{传输}:{地址}` 里的地址和传输；传输是实际送回应答的那种，不含冒号。
-fn split_upstream_label(label: &str) -> (&str, Option<Transport>) {
-    let Some((carrier, address)) = label.split_once(':') else {
-        return (label, None);
-    };
-    let transport = match carrier {
-        "udp" => Some(Transport::Udp),
-        "tcp" => Some(Transport::Tcp),
-        "doh" => Some(Transport::Doh),
-        "dot" => Some(Transport::Dot),
-        "doq" => Some(Transport::Doq),
-        _ => None,
-    };
-    (address, transport)
+    upstream.map(|label| crate::config::split_answered(label).1)
 }
 
 /// Kind of a request-phase decision.
@@ -145,7 +125,7 @@ pub(crate) fn decision_detail(decision: &Decision) -> DecisionDetail<'_> {
 pub(crate) fn reported_transport(upstream: &str, transport: Transport) -> Option<Transport> {
     (!upstream
         .split(',')
-        .any(|addr| has_transport_prefix(addr.trim())))
+        .any(|addr| crate::config::split_scheme(addr.trim()).is_some()))
     .then_some(transport)
 }
 
@@ -192,7 +172,7 @@ pub(crate) fn report_response_decision(
             // 写实际送回应答的那种传输：配置的传输管不到带前缀的地址，也管不到改走 TCP 的情况
             // The transport that carried the answer: the configured one says nothing about a
             // prefixed address or a fallback to TCP
-            let (upstream, transport) = split_upstream_label(&answer.upstream);
+            let (transport, upstream) = crate::config::split_answered(&answer.upstream);
             DecisionDetail::Forward {
                 upstream,
                 transport,

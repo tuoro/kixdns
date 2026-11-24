@@ -635,6 +635,9 @@ impl RuntimePipelineConfig {
             &runtime.geoip_tags(),
         );
         runtime.warnings.extend(geo);
+        runtime
+            .warnings
+            .extend(config::host_names_without_bootstrap(&runtime));
         Ok(runtime)
     }
 
