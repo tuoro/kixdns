@@ -114,13 +114,14 @@ impl Unwatched {
 }
 
 /// 两种 Geo 数据眼下的问题：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（留着先前读进来的数据）、
-/// 装不上的监视、规则用到却没有数据提供的标签。启动、热重载和监视到文件变了时跟着更新，面板经控制通道读（见
-/// [`Engine::geo_data_warnings`]）
+/// 装不上的监视和改了指向以后监视不上的文件、规则用到却没有数据提供的标签。启动、热重载和监视到文件变了时跟着更新，面板经
+/// 控制通道读（见 [`Engine::geo_data_warnings`]）
 /// What is wrong with the two kinds of Geo data right now: configured files that are missing
 /// or cannot be read, files that read yet have none of the tags rules use any more (the data
-/// read from them before staying), watches that cannot be installed, and tags rules use that
-/// no data provides. Kept up to date at startup, on hot reloads and as watched files change,
-/// and read by the panel over the control channel (see [`Engine::geo_data_warnings`])
+/// read from them before staying), watches that cannot be installed and files that cannot be
+/// watched where they came to lead, and tags rules use that no data provides. Kept up to date
+/// at startup, on hot reloads and as watched files change, and read by the panel over the
+/// control channel (see [`Engine::geo_data_warnings`])
 #[derive(Default)]
 pub(crate) struct GeoStatus {
     site: Mutex<DataStatus>,
@@ -136,6 +137,9 @@ struct DataStatus {
     files: Vec<(PathBuf, String)>,
     /// 监视装不上时说它的那句话 / The sentence saying the watch could not be installed, when it could not
     watch: Option<String>,
+    /// 监视着的文件改了指向、新的地方监视不上的，各带说它的那句话 / The watched files that came to lead
+    /// somewhere that cannot be watched, each with the sentence saying so
+    unwatched: Vec<(PathBuf, String)>,
     /// 规则用到、却没有数据提供的标签，说它们的那句话 / The sentence naming the tags rules use that no data provides
     tags: Option<String>,
 }
@@ -160,10 +164,7 @@ impl DataStatus {
     }
 
     fn file(&mut self, path: &Path, said: String) {
-        match self.files.iter_mut().find(|(file, _)| file == path) {
-            Some((_, was)) => *was = said,
-            None => self.files.push((path.to_path_buf(), said)),
-        }
+        say(&mut self.files, path, said);
     }
 
     /// `what` 的监视因为 `err` 装不上 / The watch on `what` could not be installed because of `err`
@@ -171,6 +172,24 @@ impl DataStatus {
         self.watch = Some(format!(
             "{what} cannot be watched for changes, which are read at the next configuration reload: {err}"
         ));
+    }
+
+    /// 监视着的 `what` `path` 改了指向，新的地方因为 `err` 监视不上（见 `PendingWatch::start_reporting`）；是 None 时
+    /// 都监视上了
+    /// Watched `what` `path` came to lead somewhere that cannot be watched because of `err` (see
+    /// `PendingWatch::start_reporting`); None when every place is watched
+    fn watched(&mut self, what: &str, path: &Path, err: Option<&notify::Error>) {
+        match err {
+            Some(err) => say(
+                &mut self.unwatched,
+                path,
+                format!(
+                    "{what} {} cannot be watched where it now leads, changes there go unseen: {err}",
+                    path.display()
+                ),
+            ),
+            None => self.unwatched.retain(|(file, _)| file != path),
+        }
     }
 
     /// 有没有一句说 `path` 的 / Whether a sentence says something of `path`
@@ -185,21 +204,34 @@ impl DataStatus {
 
     fn sentences(&self) -> impl Iterator<Item = &str> {
         let files = self.files.iter().map(|(_, said)| said.as_str());
+        let unwatched = self.unwatched.iter().map(|(_, said)| said.as_str());
         files
             .chain(self.watch.as_deref())
+            .chain(unwatched)
             .chain(self.tags.as_deref())
+    }
+}
+
+/// `said` 换掉 `sentences` 里说 `path` 的那句，没有就排到最后 / `said` takes the place of the one of
+/// `sentences` saying something of `path`, or goes last when there is none
+fn say(sentences: &mut Vec<(PathBuf, String)>, path: &Path, said: String) {
+    match sentences.iter_mut().find(|(file, _)| file == path) {
+        Some((_, was)) => *was = said,
+        None => sentences.push((path.to_path_buf(), said)),
     }
 }
 
 impl Engine {
     /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（只有它提供的
-    /// 标签留着先前读进来的数据，重启以后就没有了）、装不上的文件监视、规则用到却没有数据提供的标签（这样的规则
-    /// geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到文件变了时跟着更新
+    /// 标签留着先前读进来的数据，重启以后就没有了）、装不上的文件监视、改了指向以后监视不上的文件、规则用到却没有数据提供
+    /// 的标签（这样的规则 geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到
+    /// 文件变了时跟着更新
     /// What is wrong with the Geo data right now, a sentence each: configured files that are
     /// missing or cannot be read, files that read yet have none of the tags rules use any more
     /// (the tags only they provide keeping the data read from them before, gone after a
-    /// restart), file watches that cannot be installed, and tags rules use that no data
-    /// provides (geo_site and geoip_country never match them, and geo_site_not always does).
+    /// restart), file watches that cannot be installed, files that cannot be watched where they
+    /// came to lead, and tags rules use that no data provides (geo_site and geoip_country never
+    /// match them, and geo_site_not always does).
     /// Empty when nothing is wrong. Kept up to date at startup, on hot reloads and as watched
     /// files change
     pub fn geo_data_warnings(&self) -> Vec<String> {
@@ -366,11 +398,14 @@ fn store(state: &ArcSwap<EngineInner>, change: impl Fn(&mut GeoManagers)) {
     });
 }
 
-/// 一种 Geo 数据的监视：它的文件在日志里怎么叫、监视线程叫什么、问题写进状态的哪一格、监视到文件变了怎么读
-/// The watch of one kind of Geo data: what the log calls its files, what the watch thread is
-/// called, which part of the status takes its problems, and how a changed file is read
+/// 一种 Geo 数据的监视：它的文件（全部和一个）在日志里怎么叫、监视线程叫什么、问题写进状态的哪一格、监视到文件变了
+/// 怎么读
+/// The watch of one kind of Geo data: what the log calls its files (all of them, and one),
+/// what the watch thread is called, which part of the status takes its problems, and how a
+/// changed file is read
 struct Kind {
     files: &'static str,
+    file: &'static str,
     thread: &'static str,
     status: fn(&GeoStatus) -> &Mutex<DataStatus>,
     reload: fn(&ArcSwap<EngineInner>, &Path, &[String], &Mutex<DataStatus>),
@@ -378,6 +413,7 @@ struct Kind {
 
 const GEOSITE: Kind = Kind {
     files: "GeoSite data files",
+    file: "GeoSite data file",
     thread: "geosite-watch",
     status: |status| &status.site,
     reload: reload_geosite_file,
@@ -385,6 +421,7 @@ const GEOSITE: Kind = Kind {
 
 const GEOIP: Kind = Kind {
     files: "GeoIP data file",
+    file: "GeoIP data file",
     thread: "geoip-watch",
     status: |status| &status.ip,
     reload: reload_geoip_file,
@@ -418,14 +455,16 @@ impl<S> Pending<S> {
         status: &Arc<GeoStatus>,
     ) -> Loaded<S> {
         *(kind.status)(status).lock() = self.problems;
-        let (reload, of) = (kind.reload, kind.status);
-        let (state, watching, tags) = (Arc::clone(state), Arc::clone(status), self.tags);
+        let (reload, of, file) = (kind.reload, kind.status, kind.file);
+        let (state, tags) = (Arc::clone(state), self.tags);
+        let (changed, watching) = (Arc::clone(status), Arc::clone(status));
         let watch = start_watch(
             self.watch,
             kind.files,
             kind.thread,
             of(status),
-            move |path| reload(&state, path, &tags, of(&watching)),
+            move |path| reload(&state, path, &tags, of(&changed)),
+            move |path, err| of(&watching).lock().watched(file, path, err),
         );
         Loaded {
             spec: self.spec,
@@ -469,18 +508,21 @@ fn pending_watch(
     }
 }
 
-/// 起线程处理监视到的变化；起不了线程就记一条错误，写进 `status`
-/// Starts the thread that handles watched changes; when it cannot start an error is logged and
-/// written to `status`
+/// 起线程处理监视到的变化，文件每次改了指向以后监视得怎样交给 `on_watch`（见 [`PendingWatch::start_reporting`]）；
+/// 起不了线程就记一条错误，写进 `status`
+/// Starts the thread that handles watched changes, how a file is watched each time it is
+/// resolved again going to `on_watch` (see [`PendingWatch::start_reporting`]); when it cannot
+/// start an error is logged and written to `status`
 fn start_watch(
     pending: Option<PendingWatch>,
     what: &str,
     name: &str,
     status: &Mutex<DataStatus>,
     on_change: impl FnMut(&Path) + Send + 'static,
+    on_watch: impl FnMut(&Path, Option<&notify::Error>) + Send + 'static,
 ) -> Option<FileWatch> {
     pending?
-        .start(name, on_change)
+        .start_reporting(name, on_change, on_watch)
         .inspect_err(|err| {
             error!(name, error = %err, "cannot start the data file watcher, the files are read again at the next configuration reload");
             status.lock().not_watched(what, err);
