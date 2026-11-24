@@ -1,8 +1,8 @@
 //! 回答检查以后缓存的应答不比这一路上回答检查据过的上游应答在缓存里留得久（见 `Route::answer_ttl`）：回答检查的动作给出的，
 //! 或者回答检查在上游的应答上 continue、跳转以后给出的，静态应答和转发拿到的应答都一样。静态应答按它带的 TTL 缓存，即记录里
 //! 最小的；不带记录的没有自己的 TTL，就按那些应答里最短的。规则直接给出的不进响应缓存，规则下次照样直接给出；上游失败以后兜底
-//! 给出的静态应答也不进，那只是那一次请求的，改问备用上游拿到的回答照常缓存。按「谁在问」给的静态应答照样缓存，槽位按规则对
-//! 请求方的判定分开。
+//! 给出的静态应答也不进，那只是那一次请求的，改问备用上游拿到的回答照常缓存；回答检查看到的失败应答也算上游失败。按「谁在问」
+//! 给的静态应答照样缓存，槽位按规则对请求方的判定分开。
 //! An answer cached after an answer check stays no longer than the upstream answers the
 //! checks on the way went by may stay in the cache (see `Route::answer_ttl`): given by an
 //! answer check's actions, or after an answer check continued or jumped on an upstream's
@@ -11,17 +11,20 @@
 //! and goes by the least of those answers. One the rules give outright stays out of the
 //! response cache, the rules giving it again outright; so does a static answer given as a
 //! fallback after an upstream failure, which is for that one request, while a backup
-//! upstream's answer is cached as usual. A static answer given by who is asking is cached all
-//! the same, its slot kept apart by how the rules judge the requester.
+//! upstream's answer is cached as usual; a failure reply an answer check sees counts as an
+//! upstream failure too. A static answer given by who is asking is cached all the same, its
+//! slot kept apart by how the rules judge the requester.
 
 use std::net::Ipv4Addr;
 
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
-use crate::engine::test_support::{answering_upstream, ask, engine_from, first_a, peer};
+use crate::engine::test_support::{
+    answering_rcode, answering_upstream, ask, engine_from, first_a, peer,
+};
 
 /// 上游的回答 / The upstream's answer
 const UPSTREAM_ANSWER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
@@ -317,6 +320,78 @@ async fn a_backup_upstreams_answer_after_a_failure_is_cached() {
     }
 }
 
+/// 回答检查看到上游回了失败应答（SERVFAIL、REFUSED；只问一个上游时它回的，几个上游一起问、都回了失败应答时最先收到的）
+/// 也算上游失败，和上游没回答时一样：改问备用上游拿到的回答照常缓存，回答检查的动作转发的、continue 以后的规则转发的、
+/// 跳去的 pipeline 转发的（面板「上游回 SERVFAIL 或 REFUSED 时改问」的备用组就是这样）都一样。此前的回答检查据过上游
+/// 回答的，照样不比它留得久。以前失败应答当作 TTL 为 0 的回答据过，此后的应答一律不进缓存，故障期间每个请求都先等失败的
+/// 上游
+/// A failure reply the answer check sees (SERVFAIL, REFUSED; the one upstream's when one is
+/// asked, the first received when several asked together all reply with a failure) counts as
+/// an upstream failure, as when the upstream gives no answer: a backup upstream's answer is
+/// cached as usual, forwarded by the check's actions, by a rule after its continue or by the
+/// pipeline it jumps to (as the panel's fallback group for 「上游回 SERVFAIL 或 REFUSED 时改问」
+/// does) alike. With an earlier answer check having gone by an upstream answer, it stays no
+/// longer than that answer all the same. A failure reply used to be gone by as an answer of
+/// TTL 0, no answer after it cached, every request during the failure waiting on the failing
+/// upstream first
+#[tokio::test]
+async fn a_backup_upstreams_answer_after_a_failure_reply_is_cached() {
+    let servfail = answering_rcode(ResponseCode::ServFail).await.address;
+    let refused = answering_rcode(ResponseCode::Refused).await.address;
+    let checked_first = answering_upstream(UPSTREAM_ANSWER, 60).await.address;
+    let backup = answering_upstream(FORWARDED, 600).await.address;
+    let forward = json!([{ "type": "forward", "upstream": backup }]);
+    for failing in [
+        servfail.clone(),
+        refused.clone(),
+        format!("{servfail},{refused}"),
+    ] {
+        let paths = [
+            (
+                "the check's own forward",
+                json!([{ "id": "main", "rules": [checked(&failing, forward.clone())] }]),
+                600,
+            ),
+            (
+                "a rule after a continue",
+                json!([{ "id": "main", "rules": [
+                    checked(&failing, json!([{ "type": "continue" }])),
+                    rule("backup", any(), forward.clone()),
+                ]}]),
+                600,
+            ),
+            (
+                "a pipeline jumped to",
+                json!([
+                    { "id": "main", "rules": [checked(
+                        &failing,
+                        json!([{ "type": "jump_to_pipeline", "pipeline": "backup" }]),
+                    )]},
+                    { "id": "backup", "rules": [rule("backup", any(), forward.clone())] },
+                ]),
+                600,
+            ),
+            (
+                "the check's own forward after a check",
+                json!([{ "id": "main", "rules": [
+                    checked(&checked_first, json!([{ "type": "continue" }])),
+                    checked(&failing, forward.clone()),
+                ]}]),
+                60,
+            ),
+        ];
+        for (path, pipelines, cached) in paths {
+            let engine = engine_with(&json!({}), pipelines);
+            assert_eq!(
+                first_a(&ask(&engine, &query(), peer()).await),
+                Some(FORWARDED),
+                "{path} on {failing}"
+            );
+            assert_eq!(cached_ttls(&engine), [cached], "{path} on {failing}");
+        }
+    }
+}
+
 /// 上游失败以后 miss 动作 continue 了，后面的规则即使又据一份上游应答做了决定，给出的静态应答也只是这一次请求的兜底，不进缓存
 /// （见 `Route::fell_back`）：缓存了的话，上游恢复了还一直用到条目到期
 /// After the miss actions continued on an upstream failure, a static answer a later rule gives
@@ -386,14 +461,16 @@ async fn a_static_answer_the_rules_give_outright_is_not_cached() {
 }
 
 /// 上游失败以后兜底给出的静态应答交给这一次请求，不进缓存：miss 动作直接给的、miss 动作 continue 到下一条规则给的、miss
-/// 动作跳到别的规则组给的都一样。上游恢复以后，下一个请求拿到的是上游的回答。以前按 min_ttl 缓存，这段时间里所有请求方都拿
-/// 兜底的那个
+/// 动作跳到别的规则组给的、回答检查看到失败应答时它的动作给的都一样。上游恢复以后，下一个请求拿到的是上游的回答。以前按
+/// min_ttl 缓存，这段时间里所有请求方都拿兜底的那个
 /// A static answer given as a fallback after an upstream failure goes to this request and
-/// stays out of the cache, whether the miss actions give it, a rule after their continue, or
-/// a pipeline they jump to. Once the upstream is back, the next request gets its answer. It
-/// used to be cached for min_ttl, every requester getting the fallback meanwhile
+/// stays out of the cache, whether the miss actions give it, a rule after their continue, a
+/// pipeline they jump to, or the answer check's actions on a failure reply. Once the upstream
+/// is back, the next request gets its answer. It used to be cached for min_ttl, every
+/// requester getting the fallback meanwhile
 #[tokio::test]
 async fn a_static_fallback_after_an_upstream_failure_is_not_cached() {
+    let servfail = answering_rcode(ResponseCode::ServFail).await.address;
     let fallback = json!([{ "type": "static_ip_response", "ip": STATIC.to_string() }]);
     let failing = |on_miss: Value| {
         let mut rule = rule(
@@ -424,6 +501,10 @@ async fn a_static_fallback_after_an_upstream_failure_is_not_cached() {
                 ]},
                 { "id": "fallback", "rules": [rule("fallback", any(), fallback.clone())] },
             ]),
+        ),
+        (
+            "the check's actions on a failure reply",
+            json!([{ "id": "main", "rules": [checked(&servfail, fallback.clone())] }]),
         ),
     ];
     for (path, pipelines) in paths {
