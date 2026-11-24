@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::config::{Action, Transport, run_until};
+use crate::config::{Action, Transport};
 use crate::engine::rules::{Decision, ResponseActionResult, RuleCacheRecord};
 use crate::observe::{
     DecisionDetail, DecisionKind, DecisionMade, EngineObserver, RequestContext, RequestOutcome,
@@ -241,27 +241,20 @@ fn answer_count(message: &[u8]) -> usize {
     })
 }
 
-/// 回答阶段一串动作作出的决定的种类，按作决定的那个动作分：执行到它这串就到此为止（见 [`Action::ends_response`]），
-/// 和执行时一样。一个都没有（空的，只有 log、forward 的）时沿用手上的应答，算 Forward
-/// The kind of decision a response-phase action list makes, by the action deciding it: the
-/// list ends once that one runs (see [`Action::ends_response`]), as when it runs. With none
-/// (an empty list, or only logs and forwards) the answer in hand stays, which counts as
-/// `Forward`
+/// 回答阶段一串动作作出的决定的种类，按作决定的那个动作分（见 [`Action::response_decision`]），和执行时一样。一个都没有
+/// （空的，只有 log、forward 的）时沿用手上的应答，算 Forward
+/// The kind of decision a response-phase action list makes, by the action deciding it (see
+/// [`Action::response_decision`]), as when it runs. With none (an empty list, or only logs and
+/// forwards) the answer in hand stays, which counts as `Forward`
 pub(crate) fn response_decision_kind(actions: &[Action]) -> DecisionKind {
-    match run_until(actions, Action::ends_response).last() {
+    match Action::response_decision(actions) {
+        None | Some(Action::Allow) => DecisionKind::Forward,
         Some(Action::Continue) => DecisionKind::Continue,
         Some(Action::JumpToPipeline { .. }) => DecisionKind::Jump,
-        Some(
-            Action::StaticResponse { .. }
-            | Action::StaticIpResponse { .. }
-            | Action::StaticCnameResponse { .. }
-            | Action::StaticTxtResponse { .. }
-            | Action::Deny
-            | Action::ReplaceTxtResponse { .. },
-        ) => DecisionKind::Static,
-        None | Some(Action::Log { .. } | Action::Forward { .. } | Action::Allow) => {
-            DecisionKind::Forward
-        }
+        // 别的作决定的动作都给静态应答：static_*、deny 和 replace_txt_response
+        // Every other deciding action gives a static answer: the static_* ones, deny and
+        // replace_txt_response
+        Some(_) => DecisionKind::Static,
     }
 }
 
