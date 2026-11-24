@@ -57,7 +57,7 @@ version 可省略。settings、pipeline_select 和 pipelines 省略时分别使�
 | serve_stale_ttl | 30 | 过期响应中写入的 TTL。 |
 | serve_stale_expire_ttl | 86400 | 允许返回过期条目的最大时间，单位秒；0 表示不限制过期时间。 |
 | serve_stale_ttl_reset | false | 过期应答的后台刷新失败以后，从这次失败起重新算它还能续用多久：上游一直取不到新的、又一直有人问的名字，就一直交出过期应答，不受 serve_stale_expire_ttl 限制（对应 Unbound 的 serve-expired-ttl-reset，那边默认也关）。以前默认开，而且每交出一次过期应答就重新算一次。 |
-| serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游最多指定毫秒数，并受 request_timeout_ms 剩余预算截断，保证过期应答来得及返回。这次刷新失败时不再等满，马上返回过期数据；规则自己给出的过期应答没有上游可等，也马上返回。 |
+| serve_stale_client_timeout_ms | 0 | 0 表示立即返回过期数据；大于 0 时先尝试上游最多指定毫秒数，并受 request_timeout_ms 剩余预算截断，保证过期应答来得及返回。这次刷新失败时不再等满，马上返回过期数据。规则据上游应答给出的过期应答也一样等，它的刷新会把规则重新走一遍。 |
 | geoip_db_path | null | MaxMind MMDB 路径。 |
 | geoip_dat_path | null | V2Ray GeoIP 数据文件路径：可以是 protobuf `.dat`，也可以是下文说明的兼容 JSON。 |
 | geosite_data_paths | [] | V2Ray GeoSite .dat 或 JSON 路径列表；支持多个文件。几个文件声明同一个标签时，用排在后面的文件里的。两种格式都只读规则用到的标签，规则一个都没用到时文件不读也不监控。 |
