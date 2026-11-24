@@ -203,3 +203,21 @@ pub(super) async fn kept_then_dropped(
         .await
         .expect("the connection closes once its pool is dropped");
 }
+
+/// `err` 里 `connect {addr}: connected after Mms, handshake no answer in Nms` 的 M 和 N / M and N of
+/// `connect {addr}: connected after Mms, handshake no answer in Nms` in `err`
+pub(super) fn handshake_unanswered_at(err: &str, addr: SocketAddr) -> (u64, u64) {
+    /// `text` 里 `before` 后面的毫秒数和它后面的文字 / The milliseconds after `before` in `text`, and
+    /// the text after them
+    fn ms<'a>(text: &'a str, before: &str) -> Option<(u64, &'a str)> {
+        let (_, rest) = text.split_once(before)?;
+        let (ms, rest) = rest.split_once("ms")?;
+        Some((ms.parse().ok()?, rest))
+    }
+    ms(err, &format!("connect {addr}: connected after "))
+        .and_then(|(connected, rest)| {
+            let (unanswered, _) = ms(rest, ", handshake no answer in ")?;
+            Some((connected, unanswered))
+        })
+        .unwrap_or_else(|| panic!("{err}"))
+}

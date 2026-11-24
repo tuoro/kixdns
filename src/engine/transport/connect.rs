@@ -31,9 +31,10 @@ pub(super) const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 /// 在前；起一个尝试，它过了 [`ATTEMPT_DELAY`] 还没连上地址、或者失败了，就接着起下一个；连上了地址的，从那一刻起再给握手一个
 /// [`ATTEMPT_DELAY`]，下一个才起：高往返的链路上 TCP 连上以后 TLS 还要一两个往返，和 TCP 算在同一个间隔里的话，每次建连都会
 /// 多起几路握手。先握手完的那个用，别的放弃；都失败时按失败的先后列出每个地址和它的失败，日志里看得出连过哪些。到了建连的期限
-/// `deadline`（见 [`Connect::attempt`]）还没连上时，已经失败的照列，还在连的记成「多久没回应」：黑洞地址、丢掉的 SYN、不回的
-/// TLS 或 DoQ 握手都是这样，原因里看得出是哪些地址。TCP、DoT、直连的 DoH 和 DoQ 都这样连（见 [`connect_tcp`]，DoQ 的握手
-/// 整个算在 `reach` 里）：前面的地址不回应时，后面的不用等到建连的时限才轮到
+/// `deadline`（见 [`Connect::attempt`]）还没连上时，已经失败的照列，还没连上地址的记成「多久没回应」，连上了地址、握手还没完的
+/// 记成「连上用了多久、握手多久没回应」：黑洞地址、丢掉的 SYN、不回的 DoQ 握手是前一种，接下 TCP 连接却不回 TLS 握手的是后一种，
+/// 原因里看得出是哪些地址、卡在哪一步。TCP、DoT、直连的 DoH 和 DoQ 都这样连（见 [`connect_tcp`]，DoQ 的握手整个算在 `reach`
+/// 里）：前面的地址不回应时，后面的不用等到建连的时限才轮到
 /// Connects through `reach` to one of `addresses` and then does `handshake` on it (RFC 8305
 /// sections 4 and 5): the addresses alternate by family, the first address's family first; one
 /// attempt is started, and once it has not reached its address after [`ATTEMPT_DELAY`], or has
@@ -43,9 +44,12 @@ pub(super) const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 /// interval with TCP it would have every connect start a few handshakes more. The first through
 /// its handshake is used and the rest given up; with all failed every address is reported with
 /// its failure, in the order they failed, so a log shows what was dialled. Not through by the
-/// connect's `deadline` (see [`Connect::attempt`]), those failed are reported as ever and those
-/// still connecting as unanswered for so long: so for an address that is a black hole, a SYN
-/// dropped, a TLS or DoQ handshake never answered, the cause shows which addresses they were.
+/// connect's `deadline` (see [`Connect::attempt`]), those failed are reported as ever, those yet
+/// to reach their address as unanswered for so long, and those through to it with the handshake
+/// still going as connected after so long and the handshake unanswered for so long: an address
+/// that is a black hole, a SYN dropped, a DoQ handshake never answered are the first, a TCP
+/// connection taken and its TLS handshake never answered the second, so the cause shows which
+/// addresses they were and where each stuck.
 /// TCP, DoT, direct DoH and DoQ all connect so (see [`connect_tcp`]; DoQ's handshake is all in
 /// `reach`): with an early address not answering, the later ones have their turn well within
 /// the connect's time limit
@@ -60,33 +64,35 @@ where
     H: Future<Output = anyhow::Result<T>>,
 {
     use futures::StreamExt;
+    use futures::future::Either;
 
-    // 有个尝试连上了地址、开始握手 / An attempt has reached its address and begun its handshake
-    let reached = tokio::sync::Notify::new();
+    /// 一个尝试走完的那一步 / The step an attempt got through
+    enum Step<C, T> {
+        /// 连上了地址，接着握手 / Its address reached, the handshake next
+        Reached(C),
+        /// 握手完了 / Through its handshake
+        Through(T),
+    }
+
     let mut waiting = interleaved(addresses).into_iter();
     let mut attempts = futures::stream::FuturesUnordered::new();
-    // 起过的尝试：地址和起的时候，有了结果的是 None / The attempts started: the address and when,
-    // None once it has an outcome
+    // 起过的尝试：地址、起的时候和连上地址的时候，有了结果的是 None / The attempts started: the address,
+    // when, and when it reached the address; None once it has an outcome
     let mut started = Vec::new();
     let mut failed = Vec::new();
     // 下一个地址最早什么时候连 / When the next address is dialled at the earliest
     let mut next_at = tokio::time::Instant::now();
-    let (reach, handshake, reached) = (&reach, &handshake, &reached);
+    let (reach, handshake) = (&reach, &handshake);
     loop {
         let now = tokio::time::Instant::now();
         if now >= next_at
             && let Some(address) = waiting.next()
         {
             let at = started.len();
-            started.push(Some((address, now)));
-            attempts.push(async move {
-                let outcome = async {
-                    let connection = reach(address).await?;
-                    reached.notify_one();
-                    handshake(connection).await
-                };
-                (at, outcome.await)
-            });
+            started.push(Some((address, now, None)));
+            attempts.push(Either::Left(async move {
+                (at, reach(address).await.map(Step::Reached))
+            }));
             next_at = now + ATTEMPT_DELAY;
         }
         if attempts.is_empty() && waiting.as_slice().is_empty() {
@@ -95,22 +101,39 @@ where
         }
         tokio::select! {
             Some((at, outcome)) = attempts.next() => {
-                let (address, _) = started[at].take().expect("one outcome per attempt");
+                let now = tokio::time::Instant::now();
                 match outcome {
-                    Ok(connected) => return Ok(connected),
+                    Ok(Step::Reached(connection)) => {
+                        if let Some((_, _, reached)) = &mut started[at] {
+                            *reached = Some(now);
+                        }
+                        next_at = now + ATTEMPT_DELAY;
+                        attempts.push(Either::Right(async move {
+                            (at, handshake(connection).await.map(Step::Through))
+                        }));
+                    }
+                    Ok(Step::Through(connected)) => return Ok(connected),
                     Err(error) => {
+                        let (address, ..) = started[at].take().expect("one outcome per attempt");
                         failed.push(format!("connect {address}: {error:#}"));
-                        next_at = tokio::time::Instant::now();
+                        next_at = now;
                     }
                 }
             }
-            () = reached.notified() => next_at = tokio::time::Instant::now() + ATTEMPT_DELAY,
             () = tokio::time::sleep_until(next_at), if !waiting.as_slice().is_empty() => {}
             () = tokio::time::sleep_until(deadline) => {
-                failed.extend(started.iter().flatten().map(|(address, since)| {
-                    let waited = since.elapsed().as_millis();
-                    format!("connect {address}: no answer in {waited}ms")
-                }));
+                let pending = started.iter().flatten().map(|&(address, since, reached)| {
+                    let waited = |from: tokio::time::Instant| from.elapsed().as_millis();
+                    match reached {
+                        None => format!("connect {address}: no answer in {}ms", waited(since)),
+                        Some(at) => format!(
+                            "connect {address}: connected after {}ms, handshake no answer in {}ms",
+                            (at - since).as_millis(),
+                            waited(at)
+                        ),
+                    }
+                });
+                failed.extend(pending);
                 anyhow::bail!("{}", failed.join("; "));
             }
         }

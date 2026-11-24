@@ -483,10 +483,11 @@ async fn dot_connect_and_handshake_are_bounded_by_the_request_budget() {
 }
 
 /// DoT 上游收下 TCP 连接、TLS 握手却一直不回（中间设备吞掉带 SNI 的 ClientHello 常是这样）：到建连的时限失败，原因里
-/// 写着连的是哪个地址、多久没回应
+/// 写着连的是哪个地址、TCP 连上用了多久、握手多久没回应。以前只写多久没回应，和 SYN 没回的分不开
 /// A DoT upstream taking the TCP connection and never answering the TLS handshake (as a
 /// middlebox swallowing a ClientHello with SNI often does) fails at the connect's time limit,
-/// its cause naming the address dialled and how long it went unanswered
+/// its cause naming the address dialled, how long TCP took and how long the handshake went
+/// unanswered. It used to say how long it went unanswered alone, as for a SYN unanswered
 #[tokio::test]
 async fn a_dot_handshake_left_unanswered_names_the_address() {
     let addr = silent_tcp_listener().await;
@@ -498,12 +499,9 @@ async fn a_dot_handshake_left_unanswered_names_the_address() {
         "{:#}",
         client.connect_for_tests().await.expect_err("no handshake")
     );
-    let waited = err
-        .split_once(&format!("connect {addr}: no answer in "))
-        .and_then(|(_, rest)| rest.split_once("ms"))
-        .and_then(|(ms, _)| ms.parse::<u64>().ok())
-        .unwrap_or_else(|| panic!("{err}"));
-    assert!((4900..5500).contains(&waited), "{err}");
+    let (connected, unanswered) = handshake_unanswered_at(&err, addr);
+    assert!(connected < 100, "{err}");
+    assert!((4900..5500).contains(&(connected + unanswered)), "{err}");
 }
 
 /// 名字解析出两个地址，127.0.0.1 上同一个端口收下 TCP 连接、TLS 握手却从不回，::1 上是 DoT 上游：握手算在每个地址的
