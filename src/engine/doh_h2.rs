@@ -29,7 +29,7 @@ use rustls::pki_types::ServerName;
 use url::{Host, Url};
 
 use super::bootstrap::Bootstrap;
-use super::transport::{Connect, InFlight, StillOpen, connect_tcp, least_busy};
+use super::transport::{Connect, InFlight, connect_tcp, least_busy};
 
 /// 请求的发送端 / The sending half requests go through
 pub(crate) type H2Sender = SendRequest<Bytes>;
@@ -61,11 +61,11 @@ struct H2Conn {
 
 /// 一个连接位：最多一条连接 / One connection slot: at most one connection
 struct Slot {
+    /// 位上的连接，建连的任务建好了放进来 / The slot's connection, put here by the connecting task once made
     conn: ArcSwapOption<H2Conn>,
-    /// 在建的连接、建连失败以后的退避（见 [`Connect`]）；连上了对方没选 h2 时是 None / The connection
-    /// being made and the backing off after a failed connect (see [`Connect`]); None when the
-    /// peer connected did not pick h2
-    connecting: tokio::sync::Mutex<Connect<Option<H2Sender>>>,
+    /// 在建的连接、建连失败以后的退避（见 [`Connect`]）/ The connection being made and the backing off
+    /// after a failed connect (see [`Connect`])
+    connecting: parking_lot::Mutex<Connect>,
     /// 这个位上还没答完的请求数 / Requests on this slot not yet answered
     in_flight: AtomicUsize,
 }
@@ -75,9 +75,9 @@ struct Slot {
 /// One DoH upstream's HTTP/2 connections: a slot per worker thread, normally only the first in
 /// use (see [`BUSY_AT`](super::transport::BUSY_AT))
 pub(crate) struct H2Link {
-    slots: Box<[Slot]>,
+    slots: Box<[Arc<Slot>]>,
     /// 这个上游握手时没选 h2：之后的请求都交给 reqwest / This upstream did not pick h2 in the handshake: later requests all go to reqwest
-    no_h2: AtomicBool,
+    no_h2: Arc<AtomicBool>,
     epoch: Instant,
     idle_timeout: Duration,
 }
@@ -87,20 +87,22 @@ impl H2Link {
     pub(crate) fn new(idle_timeout: Duration, connections: usize) -> Self {
         Self {
             slots: (0..connections.max(1))
-                .map(|_| Slot {
-                    conn: ArcSwapOption::empty(),
-                    connecting: tokio::sync::Mutex::new(Connect::default()),
-                    in_flight: AtomicUsize::new(0),
+                .map(|_| {
+                    Arc::new(Slot {
+                        conn: ArcSwapOption::empty(),
+                        connecting: parking_lot::Mutex::default(),
+                        in_flight: AtomicUsize::new(0),
+                    })
                 })
                 .collect(),
-            no_h2: AtomicBool::new(false),
+            no_h2: Arc::default(),
             epoch: Instant::now(),
             idle_timeout,
         }
     }
 
     fn now_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+        millis_since(self.epoch)
     }
 
     /// `slot` 上还能用的现有连接：能接着开流、也没空闲太久 / The connection on `slot` if it is still usable: open to new streams and not idle too long
@@ -116,47 +118,59 @@ impl H2Link {
         Some(sender)
     }
 
-    /// 发请求用的发送端和它占着的连接位：位上有能用的连接就用它，没有就连一条。请求答完（或放弃）之前一直
-    /// 拿着 [`InFlight`]。上游没选 h2 时是 None，交给 reqwest
+    /// 发请求用的发送端和它占着的连接位：位上有能用的连接就用它，没有就等一条新的（见 [`Connect`]：建连的任务建好了放到
+    /// 位上，这个请求再取用；等来的连接在取用之前就没了时不再等下一条）。请求答完（或放弃）之前一直拿着 [`InFlight`]。上游
+    /// 没选 h2 时是 None，交给 reqwest
     /// The sender for a request and the slot it holds: the slot's connection when usable, a new
-    /// one otherwise. The [`InFlight`] is kept until the request is answered (or given up). None
-    /// when the upstream did not pick h2, for reqwest to handle
+    /// one waited for otherwise (see [`Connect`]: the connecting task puts it on the slot once
+    /// made, and this request takes it from there; a connection waited for and gone before it
+    /// could be taken is not followed by a wait for another). The [`InFlight`] is kept until the
+    /// request is answered (or given up). None when the upstream did not pick h2, for reqwest to
+    /// handle
     pub(crate) async fn sender(
         &self,
         url: &Url,
         tls: &Arc<ClientConfig>,
         bootstrap: &Arc<Bootstrap>,
     ) -> anyhow::Result<Option<(H2Sender, InFlight<'_>)>> {
-        if self.no_h2.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
         let slot = least_busy(&self.slots, |slot| slot.in_flight.load(Ordering::Relaxed));
         let in_flight = InFlight::enter(&slot.in_flight);
-        if let Some(sender) = self.usable(slot, self.now_ms()) {
-            return Ok(Some((sender, in_flight)));
-        }
-        let mut connecting = slot.connecting.lock().await;
-        // 等锁的时候别的请求可能已经连好了 / Another request may have connected while this one waited for the lock
-        if let Some(sender) = self.usable(slot, self.now_ms()) {
-            return Ok(Some((sender, in_flight)));
-        }
-        let made = connecting.finish(|| {
-            let (url, tls, bootstrap) = (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
-            async move { connect(&url, &tls, &bootstrap).await }
-        });
-        match made.await? {
-            Some(sender) => {
-                slot.conn.store(Some(Arc::new(H2Conn {
-                    sender: sender.clone(),
-                    last_used_ms: AtomicU64::new(self.now_ms()),
-                })));
-                Ok(Some((sender, in_flight)))
+        for waited in [false, true] {
+            if self.no_h2.load(Ordering::Relaxed) {
+                return Ok(None);
             }
-            None => {
-                self.no_h2.store(true, Ordering::Relaxed);
-                Ok(None)
+            if let Some(sender) = self.usable(slot, self.now_ms()) {
+                return Ok(Some((sender, in_flight)));
             }
+            if waited {
+                break;
+            }
+            let attempt = {
+                let mut connecting = slot.connecting.lock();
+                // 别的请求的连接可能刚放到位上 / Another request's connection may have just been put on the slot
+                if let Some(sender) = self.usable(slot, self.now_ms()) {
+                    return Ok(Some((sender, in_flight)));
+                }
+                connecting.attempt(|| {
+                    let (url, tls, bootstrap) =
+                        (url.clone(), Arc::clone(tls), Arc::clone(bootstrap));
+                    let (slot, no_h2, epoch) =
+                        (Arc::clone(slot), Arc::clone(&self.no_h2), self.epoch);
+                    async move {
+                        match connect(&url, &tls, &bootstrap).await? {
+                            Some(sender) => slot.conn.store(Some(Arc::new(H2Conn {
+                                sender,
+                                last_used_ms: AtomicU64::new(millis_since(epoch)),
+                            }))),
+                            None => no_h2.store(true, Ordering::Relaxed),
+                        }
+                        Ok(())
+                    }
+                })?
+            };
+            attempt.await?;
         }
+        anyhow::bail!("doh connection closed as soon as it was made")
     }
 
     /// 现在有没有一条直连的连接 / Whether a direct connection is open now
@@ -190,13 +204,9 @@ impl H2Link {
     }
 }
 
-/// 建好以后放着的连接：对方没选 h2 时没有连接可查；有的话要还能开新流 / A connection left waiting:
-/// with no h2 picked there is none to check; with one, it has to be open to new streams
-impl StillOpen for Option<H2Sender> {
-    fn still_open(&mut self) -> bool {
-        self.as_ref()
-            .is_none_or(|sender| open_to_new_streams(sender).is_some())
-    }
+/// 从 `epoch` 到现在的毫秒数 / Milliseconds from `epoch` to now
+fn millis_since(epoch: Instant) -> u64 {
+    u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// 连上 `url`：TCP 和 TCP、DoT 上游一样经 `transport::connect_tcp` 连（主机名交给 `bootstrap` 解析，几个地址错开着连），
