@@ -156,7 +156,7 @@ async fn doq_skips_0rtt_once_it_was_rejected() {
         DoqReply::Answer(Duration::ZERO)
     })
     .await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, true);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, true);
     let target = parse_doq_target(&client.upstream).expect("doq target");
     // 第一条连接完整握手，拿到会话票据 / The first connection shakes hands in full and gets a ticket
     client
@@ -198,18 +198,14 @@ async fn queries_riding_a_connection_whose_0rtt_is_rejected_are_sent_again() {
     // 先从第一台拿到允许早期数据的票据（票据按服务器名存，两台同名）
     // A ticket allowing early data comes from the first (tickets are kept by server name,
     // which the two share)
-    let ticket = doq_test_client(
-        format!("doq://{first}?sni=localhost"),
-        client_tls.clone(),
-        true,
-    );
+    let ticket = doq_test_client(format!("{first}?sni=localhost"), client_tls.clone(), true);
     ticket
         .send(&udp_test_query("first.example"), Duration::from_secs(2))
         .await
         .expect("the first upstream answers");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let client = doq_test_client(format!("doq://{second}?sni=localhost"), client_tls, true);
+    let client = doq_test_client(format!("{second}?sni=localhost"), client_tls, true);
     let (a, b) = (udp_test_query("a.example"), udp_test_query("b.example"));
     // 上一次完整握手连上的是第二台，它后来换了票据的密钥，不认先前的票据：0-RTT 发往它，被拒
     // The last full handshake reached the second, which has since changed its ticket keys and
@@ -419,7 +415,7 @@ fn doq_runtime_aging(
 async fn a_doq_answer_to_another_question_fails_the_query() {
     let (server, client_tls) = localhost_tls(&[b"doq"]);
     let addr = spawn_doq_upstream(server, Duration::ZERO, |_, _| DoqReply::AnotherQuestion).await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     let err = client
         .send(&udp_test_query("swap.example"), Duration::from_secs(2))
         .await
@@ -464,7 +460,7 @@ async fn a_doq_upstream_cannot_open_streams_to_us() {
         let _ = send.stopped().await;
         (uni, bi)
     });
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     client
         .send(&udp_test_query("streams.example"), Duration::from_secs(3))
         .await
@@ -484,7 +480,7 @@ async fn a_doq_upstream_cannot_open_streams_to_us() {
 async fn doq_replaces_a_pooled_connection_the_server_already_closed() {
     let (server, client_tls) = localhost_tls(&[b"doq"]);
     let addr = spawn_doq_upstream(server, Duration::ZERO, |_, _| DoqReply::AnswerThenClose).await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     client
         .send(&udp_test_query("first.example"), Duration::from_secs(2))
         .await
@@ -535,7 +531,7 @@ async fn an_abandoned_doq_query_is_cancelled_with_request_cancelled() {
         // 连接要留到读完错误码 / The connection stays until the error code is read
         let _ = (endpoint, conn);
     });
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     // 外层先放弃（竞速时别的上游先答了），连接还在用 / Given up from outside (another upstream
     // answering first in a race), with the connection still in use
     let raced = timeout(
@@ -569,7 +565,7 @@ async fn doq_retries_once_when_the_pooled_connection_dies_under_the_query() {
         }
     })
     .await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     client
         .send(&udp_test_query("first.example"), Duration::from_secs(2))
         .await
@@ -609,7 +605,7 @@ async fn doq_does_not_retry_without_the_budget_for_it() {
         }
     })
     .await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     client
         .send(&udp_test_query("first.example"), Duration::from_secs(2))
         .await
@@ -642,7 +638,7 @@ async fn a_doq_timeout_without_0rtt_leaves_0rtt_on() {
         }
     })
     .await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, true);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, true);
     let result = client
         .send(&udp_test_query("slow.example"), Duration::from_millis(300))
         .await;
@@ -675,7 +671,7 @@ async fn a_doq_connection_is_replaced_only_when_it_failed() {
             _ => DoqReply::Answer(Duration::ZERO),
         })
         .await;
-        let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+        let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
         client
             .send(&udp_test_query("warm.example"), Duration::from_secs(2))
             .await
@@ -723,7 +719,7 @@ async fn a_stalled_doq_connection_is_closed_and_its_queries_sent_again() {
         _ => DoqReply::Answer(Duration::ZERO),
     })
     .await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     client
         .send(&udp_test_query("warm.example"), Duration::from_secs(2))
         .await
@@ -761,7 +757,7 @@ async fn doq_handshake_and_answer_share_one_budget() {
         DoqReply::Answer(Duration::from_millis(250))
     })
     .await;
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     let started = tokio::time::Instant::now();
     let result = client
         .send(
@@ -788,7 +784,7 @@ async fn a_doq_handshake_left_unanswered_names_the_address() {
     let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = silent.local_addr().unwrap();
     let (_, client_tls) = localhost_tls(&[b"doq"]);
-    let client = doq_test_client(format!("doq://{addr}?sni=localhost"), client_tls, false);
+    let client = doq_test_client(format!("{addr}?sni=localhost"), client_tls, false);
     let budget = crate::engine::transport::connect::CONNECT_BUDGET + Duration::from_secs(2);
     let err = client
         .send(&udp_test_query("silent.example"), budget)
@@ -818,7 +814,7 @@ async fn doq_reaches_an_ipv6_literal_upstream() {
         return;
     };
     let client = doq_test_client(
-        format!("doq://[::1]:{}?sni=localhost", addr.port()),
+        format!("[::1]:{}?sni=localhost", addr.port()),
         client_tls,
         false,
     );
@@ -1033,7 +1029,7 @@ async fn named_tcp_dot_and_doq_upstreams_are_resolved_through_bootstrap() {
     let doq = spawn_doq_upstream(doq_server, Duration::ZERO, answer).await;
     let runtime = Arc::into_inner(doq_test_runtime(doq_client, false)).expect("one owner");
     DoqMuxClient::new(
-        Arc::from(format!("doq://upstream.test:{}", doq.port())),
+        Arc::from(format!("upstream.test:{}", doq.port())),
         Arc::new(DoqRuntime {
             bootstrap,
             ..runtime
