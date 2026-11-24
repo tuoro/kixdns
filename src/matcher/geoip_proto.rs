@@ -1,16 +1,19 @@
-//! V2Ray .dat 文件的 protobuf 结构定义。
-//!
-//! 使用 Google 官方 protobuf 库 (prost) 解析,与 dae 的 pkg/geodata
-//! (google.golang.org/protobuf) 对齐,替代手写 wire 解析。手写解析对
-//! 字段顺序、未知字段、多字节 tag 的假设脆弱,任何 .dat 格式变体都会
-//! 导致静默错位或错误网段。
+//! V2Ray GeoIP .dat 文件里条目的 protobuf 结构，用 prost 按 protobuf 的规矩解：字段不论先后，不认识的字段按线上类型
+//! 跳过，长度越出消息就是坏数据。文件顶层的 `repeated GeoIP entry = 1` 不交给 prost 一次解完，而是一个个条目读（见
+//! `GeoIpManager::parse_dat_entries`），不把整个文件读进内存
+//! The protobuf structures of the entries in a V2Ray GeoIP .dat file, decoded by protobuf's
+//! rules with prost: fields come in any order, unknown fields are skipped by wire type, and a
+//! length running past its message means broken data. The file's top level, `repeated GeoIP
+//! entry = 1`, is not handed to prost whole but read entry by entry (see
+//! `GeoIpManager::parse_dat_entries`), without reading the whole file into memory
 
 use prost::Message;
 
-/// GeoIPList:V2Ray .dat 顶层结构,`repeated GeoIP entry = 1`。运行时按条目读（见
-/// `GeoIpManager::parse_dat_file`），只有测试拿它写 .dat
-/// GeoIPList: the top level of a V2Ray .dat, `repeated GeoIP entry = 1`. The runtime reads
-/// entry by entry (see `GeoIpManager::parse_dat_file`); only tests write a .dat with it
+/// GeoIPList：V2Ray .dat 的顶层结构，`repeated GeoIP entry = 1`。运行时不用它，按条目读（见
+/// `GeoIpManager::parse_dat_entries`）；只有测试拿它写 .dat
+/// GeoIPList: the top level of a V2Ray .dat, `repeated GeoIP entry = 1`. The runtime does not
+/// use it and reads entry by entry (see `GeoIpManager::parse_dat_entries`); only tests write a
+/// .dat with it
 #[cfg(test)]
 #[derive(Clone, PartialEq, Message)]
 pub struct GeoIPList {
@@ -18,7 +21,8 @@ pub struct GeoIPList {
     pub entry: Vec<GeoIP>,
 }
 
-/// GeoIP:单个国家条目,`string country_code = 1; repeated CIDR cidr = 2`
+/// GeoIP：一个国家或标签的条目，`string country_code = 1; repeated CIDR cidr = 2`
+/// GeoIP: the entry of one country or tag, `string country_code = 1; repeated CIDR cidr = 2`
 #[derive(Clone, PartialEq, Message)]
 pub struct GeoIP {
     #[prost(string, tag = "1")]
@@ -36,7 +40,8 @@ pub struct GeoIPCode {
     pub country_code: String,
 }
 
-/// Cidr:`bytes ip = 1; uint32 prefix = 2`(ip 为 4 字节 IPv4 或 16 字节 IPv6)
+/// Cidr：`bytes ip = 1; uint32 prefix = 2`（ip 是 4 字节的 IPv4 或 16 字节的 IPv6）
+/// Cidr: `bytes ip = 1; uint32 prefix = 2` (ip is 4 bytes of IPv4 or 16 of IPv6)
 #[derive(Clone, PartialEq, Message)]
 pub struct Cidr {
     #[prost(bytes, tag = "1")]

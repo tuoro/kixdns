@@ -11,6 +11,7 @@ use tracing::debug;
 
 use super::Engine;
 use super::concurrency::GaveUp;
+use super::transport::UdpExchange;
 use crate::config::Transport;
 use crate::observe::{
     UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
@@ -329,9 +330,6 @@ pub(crate) fn pool_keys(cfg: &crate::matcher::RuntimePipelineConfig) -> PoolKeys
     keys
 }
 
-/// Hedge 超时除数：第一次尝试使用 1/N 的时间，为 TCP fallback 预留时间 / Hedge timeout divisor: first attempt uses 1/N of the budget to reserve time for TCP fallback
-const HEDGE_TIMEOUT_DIVISOR: u32 = 3;
-
 /// 双发的一路失败以后，在剩下的 `remaining` 里等另一路；返回另一路的应答和它的传输
 /// After one leg of a dual send failed, wait up to `remaining` for the other; returns
 /// the other leg's answer and its transport
@@ -523,6 +521,10 @@ async fn forward_tcp_udp_dual(
     }
 }
 
+/// 一个规则的上游，通常一两个，放得下时不分配内存 / A rule's upstreams, usually one or two, which
+/// take no allocation while they fit
+type Upstreams = smallvec::SmallVec<[Arc<str>; 4]>;
+
 /// Forward DNS request to multiple upstreams concurrently (Happy Eyeballs / Hedged Request)
 /// 并发转发 DNS 请求到多个上游 (Happy Eyeballs / Hedged Request)
 ///
@@ -546,10 +548,6 @@ async fn forward_tcp_udp_dual(
 /// 几个上游一起问时，刚回过 429、正在暂停的 DoH 上游这次不问（见 [`without_paused`]）。
 /// When several upstreams are asked together, a DoH upstream that answered 429 a moment
 /// ago and is paused is not asked this time (see [`without_paused`]).
-/// 一个规则的上游，通常一两个，放得下时不分配内存 / A rule's upstreams, usually one or two, which
-/// take no allocation while they fit
-type Upstreams = smallvec::SmallVec<[Arc<str>; 4]>;
-
 ///
 /// `asker` 是替谁问的（后台刷新不替谁问，是 None）。开了流控时：这台设备最近在这个上游上的等待多半没等到回答，这一次
 /// 不问（见 `PermitManager::ask`）；问了的卡住了、这台设备留着等的又已经够多，不等了（见 `Asking::wait`）。两样都算上游
@@ -793,11 +791,11 @@ async fn forward_upstream_as_is(
     // `UpstreamFailure::reply`)
     let mut first_failure_reply: Option<(Bytes, Arc<str>)> = None;
     // 最先收到的截断应答：它是传输层用 TCP 也取不到完整应答时留下的（见 `forward_udp_smart`），只在别的上游都给不出
-    // 完整应答时交回，客户端看到 TC 自己改用 TCP。以前它和完整应答一样先到先赢，把还在路上的完整应答取消掉
+    // 完整应答时交回，客户端看到 TC 自己改用 TCP：先到的截断应答不取消还在路上的完整应答
     // The first truncated answer received: what the transport was left with when TCP could
     // not fetch the whole answer either (see `forward_udp_smart`). It goes back only when no
-    // other upstream gives a whole answer, the client turning to TCP itself on seeing TC. It
-    // used to win like a whole answer by coming first, cancelling a whole one still on its way
+    // other upstream gives a whole answer, the client turning to TCP itself on seeing TC: coming
+    // first, it does not cancel a whole answer still on its way
     let mut first_truncated: Option<(Bytes, Arc<str>)> = None;
 
     // If any TCP/TCP+UDP upstream is present, a failed UDP attempt does not fall back to TCP, to
@@ -967,13 +965,12 @@ fn failed_outcome(err: &anyhow::Error) -> UpstreamOutcome {
 
 /// 一次转发报给观察者的尝试：每次 `upstream_attempt` 都配一次 `upstream_result`。丢掉时还没报结果的报成
 /// [`UpstreamOutcome::Aborted`]：一组上游里别的先答了、任务没交回结果，或者整个转发半路被放下（请求被取消、流控不等了）。
-/// 以前只有前两种报了，请求被取消时这些尝试有开头没结果。没有观察者时什么也不记
+/// 没有观察者时什么也不记
 /// The attempts of one forward reported to the observer: every `upstream_attempt` gets one
 /// `upstream_result`. Dropped, it reports those still without a result as
 /// [`UpstreamOutcome::Aborted`]: another upstream of the set answered first, a task never
 /// handed its result back, or the whole forward was dropped halfway (the request cancelled,
-/// flow control waiting no more). Only the first two used to be reported, and a cancelled
-/// request left its attempts begun with no result. Without an observer nothing is kept
+/// flow control waiting no more). Without an observer nothing is kept
 struct Attempts<'a> {
     observed: Observed<'a>,
     /// 每次尝试的上游、传输和开始的时候，报了结果的是 None / Each attempt's upstream, transport
@@ -1241,11 +1238,16 @@ fn note_round_trip(
     }
 }
 
-/// The point by which an upstream should have answered: the budget of a UDP
-/// query's first attempt, after which it is retried.
-/// 上游应当已经应答的时间点：UDP 查询第一次尝试的时间预算，过了就重试。
+/// 上游应当已经回答的时间点，上游时限的三分之一：还没等到过一个上游的回答时，它的 UDP 查询等这么久没有回答就重发，等到过
+/// 的也最多等这么久（见 `PermitManager::resend_after`）；开了流控时，查询等这么久还没有回答算卡住（见
+/// `PermitManager::stuck_after`）。bootstrap 的查询也这样重发
+/// The point by which an upstream should have answered, a third of its timeout: with no answer
+/// from an upstream yet, a UDP query to it goes unanswered this long before it is sent again, and
+/// with answers seen this long at most (see `PermitManager::resend_after`); with flow control on,
+/// a query unanswered this long counts as stuck (see `PermitManager::stuck_after`). Bootstrap's
+/// queries are sent again so too
 pub(crate) fn hedge_timeout(timeout_dur: Duration) -> Duration {
-    timeout_dur / HEDGE_TIMEOUT_DIVISOR
+    timeout_dur / 3
 }
 
 /// When the UDP forwarder turns to TCP, on top of `enable_tcp_fallback`. A truncated
@@ -1266,14 +1268,11 @@ struct UdpTcpFallback {
 /// with the transport that carried it: UDP, or TCP after a TC-bit retry or a UDP-failure
 /// fallback. With no reply by the time this upstream's answers are due (see
 /// `PermitManager::resend_after`) the query is sent again, and from then on whichever of the two
-/// is answered first is used, for the whole of the timeout: the first query stays registered, so
-/// its reply is taken should it arrive only after the resend. It used to be given up as the
-/// resend went out: an upstream slower than the resend had every query wait a resend's interval
-/// more for the reply to the resend, and answered once more for nothing.
+/// is answered first is used, for the whole of the timeout: the first copy stays registered, so
+/// its reply is taken should it arrive only after the resend (see `UdpExchange`).
 /// 带重发和 TCP 回退的 UDP 转发。返回应答和实际带回它的传输：UDP，或 TC/失败回退后的 TCP。过了这个上游该有回答的
-/// 时候（见 `PermitManager::resend_after`）还没有回答就把查询再发一次，此后一整个时限里，两次谁的回答先到用谁的：第一次的
-/// 查询一直登记着，它的回答在重发以后才到也照样收下。以前重发的那一刻就不等它了：回答比重发慢的上游，每个查询都要
-/// 多等一个重发的间隔才拿到重发那一次的回答，上游还白白多答一次。
+/// 时候（见 `PermitManager::resend_after`）还没有回答就把查询再发一次，此后一整个时限里，两份谁的回答先到用谁的：第一份
+/// 一直登记着，它的回答在重发以后才到也照样收下（见 `UdpExchange`）。
 async fn forward_udp_smart(
     engine: &Engine,
     packet: &[u8],
@@ -1297,11 +1296,11 @@ async fn forward_udp_smart(
         );
     };
     // UDP 带回来的应答：截断的改用 TCP 重取，TCP 拿不到完整应答时交回截断的这份，客户端看到 TC 自己会改用 TCP，
-    // 和双发一样；别的原样交回。以前 TCP 一失败整次查询就失败（上游的 TCP 被挡住时，每个大应答都成了 SERVFAIL）
+    // 和双发一样；别的原样交回。上游的 TCP 被挡住时，大应答照样有截断的这份，不成 SERVFAIL
     // A reply UDP brought back: a truncated one is fetched again over TCP, and when TCP gives no
     // full answer the truncated one goes back, the client turning to TCP itself on seeing TC, as
-    // a dual send does; any other goes back as it is. A TCP failure used to fail the whole query
-    // (with the upstream's TCP blocked, every large answer became a SERVFAIL)
+    // a dual send does; any other goes back as it is. With the upstream's TCP blocked, a large
+    // answer still has this truncated one rather than a SERVFAIL
     let answered = async |bytes: Bytes| {
         // RFC 1035: TC (Truncated) flag, read from the header / 从报头读 TC 标志
         if retry_truncated && crate::proto_utils::truncated_response(&bytes) {
@@ -1316,81 +1315,37 @@ async fn forward_udp_smart(
         Ok((bytes, Transport::Udp))
     };
 
-    // 第一次：等到该有回答的时候（见 `PermitManager::resend_after`），后面留给重发和 TCP / The first
-    // query: waited for until an answer was due (see `PermitManager::resend_after`), the rest being
-    // left for the resend and TCP
+    // 第一份等到该有回答的时候（见 `PermitManager::resend_after`），还没有回答就再发一份，两份谁的回答先到用谁的，一直等满
+    // 时限（见 `UdpExchange`）；再不行留给 TCP
+    // The first copy is waited for until an answer is due (see `PermitManager::resend_after`);
+    // with no reply by then another is sent, and whichever of the two is answered first is used,
+    // for the whole of the timeout (see `UdpExchange`); failing that, TCP is left
     let first_wait = engine.permit_manager.resend_after(upstream, timeout_dur);
-    let first_sent = sent_if_timed(engine);
-    let mut first = match engine.udp_client.begin(packet, upstream).await {
-        Ok(sent) => Some(sent),
-        Err(error) => {
-            failed(1, first_wait, &error);
-            None
+    let mut exchange = UdpExchange::new(&engine.udp_client, packet, upstream);
+    for (attempt, wait) in [(1, first_wait), (2, timeout_dur)] {
+        if let Err(error) = exchange.send(sent_if_timed(engine)).await {
+            failed(attempt, wait, &error);
         }
-    };
-    if let Some(sent) = first.as_mut() {
-        match tokio::time::timeout(first_wait, sent.reply()).await {
-            Ok(reply) => {
-                note_round_trip(engine, upstream, timeout_dur, first_sent, &reply);
-                match reply {
-                    Ok(bytes) => return answered(bytes).await,
-                    Err(error) => {
-                        failed(1, first_wait, &error);
-                        first = None;
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, exchange.reply()).await {
+                Ok(Some((reply, sent))) => {
+                    // 上游回答要多久，记的是等到回答的那一份从发出到收到 / How long the upstream
+                    // takes is noted from the sending of the copy answered to its reply
+                    note_round_trip(engine, upstream, timeout_dur, sent, &reply);
+                    match reply {
+                        Ok(bytes) => return answered(bytes).await,
+                        Err(error) => failed(attempt, wait, &error),
                     }
                 }
-            }
-            // 还没有回答：接着等它，同时重发 / No reply yet: it is waited for still, and the query
-            // is sent again
-            Err(_) => failed(1, first_wait, &anyhow::anyhow!("upstream timeout")),
-        }
-    }
-
-    // 重发，然后两次谁的回答先到用谁的。重发的这一段单独在堆上分配：回答按时来的查询走不到这里，不必为它预留地方
-    // The resend, and then whichever of the two is answered first. This stretch is allocated
-    // on its own: a query answered in time never gets here, and reserves no room for it
-    let resent = Box::pin(async {
-        let second_sent = sent_if_timed(engine);
-        let mut second = match engine.udp_client.begin(packet, upstream).await {
-            Ok(sent) => Some(sent),
-            Err(error) => {
-                failed(2, timeout_dur, &error);
-                None
-            }
-        };
-        let deadline = tokio::time::sleep(timeout_dur);
-        tokio::pin!(deadline);
-        while first.is_some() || second.is_some() {
-            let (reply, sent) = tokio::select! {
-                reply = async { first.as_mut().expect("still waited for").reply().await },
-                    if first.is_some() =>
-                {
-                    first = None;
-                    (reply, first_sent)
+                // 一份也没在等了 / No copy waited for any more
+                Ok(None) => break,
+                Err(_) => {
+                    failed(attempt, wait, &anyhow::anyhow!("upstream timeout"));
+                    break;
                 }
-                reply = async { second.as_mut().expect("still waited for").reply().await },
-                    if second.is_some() =>
-                {
-                    second = None;
-                    (reply, second_sent)
-                }
-                _ = &mut deadline => {
-                    failed(2, timeout_dur, &anyhow::anyhow!("upstream timeout"));
-                    return None;
-                }
-            };
-            // 上游回答要多久，记的是等到回答的那一次从发出到收到 / How long the upstream takes is
-            // noted from the sending of the query that was answered to its reply
-            note_round_trip(engine, upstream, timeout_dur, sent, &reply);
-            match reply {
-                Ok(bytes) => return Some(bytes),
-                Err(error) => failed(2, timeout_dur, &error),
             }
         }
-        None
-    });
-    if let Some(bytes) = resent.await {
-        return answered(bytes).await;
     }
 
     if fallback_on_failure {
