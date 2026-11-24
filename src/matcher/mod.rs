@@ -1,4 +1,5 @@
 pub mod advanced_rule;
+mod dat_reader;
 pub mod geoip;
 pub mod geoip_converter;
 mod geoip_proto;
@@ -62,16 +63,14 @@ impl TxtMatchMode {
 // ============================================================================
 
 /// 配置里写的域名值，按名字文本的写法存（见 `proto_utils::name_text`）：转小写，去掉结尾的点。
-/// 名字文本不带结尾的点，写了点的值以前永远匹配不上。只有一个点的值保持原样。
+/// 名字文本不带结尾的点，写了点的值以前永远匹配不上。单独一个点是根，名字文本是空的
 /// A domain value from the configuration, kept the way name text is written (see
 /// `proto_utils::name_text`): lowercased, without the trailing dot. Name text carries no
-/// trailing dot, so a value written with one used to match nothing. A lone dot stays as it is.
+/// trailing dot, so a value written with one used to match nothing. A lone dot is the root,
+/// whose name text is empty
 pub(crate) fn domain_value(value: &str) -> Arc<str> {
     let value = value.to_ascii_lowercase();
-    match value.strip_suffix('.') {
-        Some(head) if !head.is_empty() => Arc::from(head),
-        _ => Arc::from(value),
-    }
+    Arc::from(value.strip_suffix('.').unwrap_or(&value))
 }
 
 /// 规则写的 GeoSite 标签，转成小写存：数据文件里的标签读进来就转小写（见 `geosite`），在这里转一次，每个查询就不用
@@ -449,6 +448,7 @@ impl RuntimePipelineConfig {
     /// that cannot be compiled is reported with its place, a path like
     /// `pipelines[0].rules[2].matchers[1]` as for the keys not read
     pub fn from_config(mut cfg: PipelineConfig) -> anyhow::Result<Self> {
+        cfg.settings.hold_to_limits();
         cfg.settings.validate()?;
         let warnings = config::warnings(&cfg);
         // 默认上游有几个时同时问 / Several default upstreams are asked at once
@@ -700,6 +700,10 @@ impl RuntimeMatcher {
     fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
         Ok(match m {
             config::Matcher::Any => RuntimeMatcher::Any,
+            // 规则看不到是哪个入口收的查询 / A rule does not see which entry took the query
+            config::Matcher::ListenerLabel { .. } => {
+                anyhow::bail!("listener_label works in pipeline_select only")
+            }
             config::Matcher::DomainSuffix { value } => RuntimeMatcher::DomainSuffix {
                 value: domain_value(&value),
             },
@@ -824,28 +828,13 @@ impl<'a> GeoManagers<'a> {
 }
 
 impl RuntimePipelineSelectorMatcher {
-    fn from_config(m: config::PipelineSelectorMatcher) -> anyhow::Result<Self> {
-        use config::{Matcher, PipelineSelectorMatcher as Selector};
-        let request = match m {
-            Selector::ListenerLabel { value } => {
-                return Ok(Self::ListenerLabel {
-                    value: Arc::from(value),
-                });
-            }
-            Selector::ClientIp { cidr } => Matcher::ClientIp { cidr },
-            Selector::DomainSuffix { value } => Matcher::DomainSuffix { value },
-            Selector::DomainExact { value } => Matcher::DomainExact { value },
-            Selector::DomainRegex { value } => Matcher::DomainRegex { value },
-            Selector::Any => Matcher::Any,
-            Selector::Qclass { value } => Matcher::Qclass { value },
-            Selector::EdnsPresent { expect } => Matcher::EdnsPresent { expect },
-            Selector::GeoSite { value } => Matcher::GeoSite { value },
-            Selector::GeoSiteNot { value } => Matcher::GeoSiteNot { value },
-            Selector::GeoipCountry { country_codes } => Matcher::GeoipCountry { country_codes },
-            Selector::GeoipPrivate { expect } => Matcher::GeoipPrivate { expect },
-            Selector::Qtype { value } => Matcher::Qtype { value },
-        };
-        RuntimeMatcher::from_config(request).map(Self::Request)
+    fn from_config(m: config::Matcher) -> anyhow::Result<Self> {
+        match m {
+            config::Matcher::ListenerLabel { value } => Ok(Self::ListenerLabel {
+                value: Arc::from(value),
+            }),
+            request => RuntimeMatcher::from_config(request).map(Self::Request),
+        }
     }
 
     /// 读的 Geo 数据 / The Geo data it reads
@@ -1822,7 +1811,7 @@ mod tests {
             build(serde_json::json!({ "dashmap_shards": shards }))
                 .unwrap_or_else(|error| panic!("dashmap_shards {shards}: {error:#}"));
         }
-        for shards in [1usize, 3, MAX_DASHMAP_SHARDS * 2] {
+        for shards in [1usize, 3] {
             let refused = build(serde_json::json!({ "dashmap_shards": shards }))
                 .err()
                 .unwrap_or_else(|| panic!("dashmap_shards {shards} must be refused"));
@@ -1842,14 +1831,6 @@ mod tests {
                 .collect(),
         ))
         .expect("every pool at its largest");
-        for pool in pools {
-            for size in [MAX_POOL_SIZE + 1, usize::MAX] {
-                let refused = build(serde_json::json!({ pool: size }))
-                    .err()
-                    .unwrap_or_else(|| panic!("{pool} {size} must be refused"));
-                assert!(refused.to_string().contains(pool), "{refused}");
-            }
-        }
         build(serde_json::json!({ "doq_connection_idle_timeout_seconds": 86_400 }))
             .expect("a day of DoQ idle time");
         let refused = build(serde_json::json!({ "doq_connection_idle_timeout_seconds": u64::MAX }))

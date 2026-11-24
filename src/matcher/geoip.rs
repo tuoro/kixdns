@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,6 +7,8 @@ use anyhow::Context;
 use prost::Message;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
+
+use super::dat_reader::DatReader;
 
 /// MaxMind GeoLite2-Country 数据库结构，字符串直接借用数据库里的字节
 /// MaxMind GeoLite2-Country database structure, its strings borrowed from the database's bytes
@@ -120,9 +120,14 @@ impl GeoIpTagIndex {
     }
 }
 
-/// 一个数据文件解析出的 GeoIP 索引，已 finalize，尚未进入管理器
-/// GeoIP indexes parsed out of one data file, already finalised and not yet
-/// applied to a manager
+/// 一个数据文件解析出的 GeoIP 索引，尚未进入管理器。读取、解码、建索引、finalize 都在解析时、管理器的锁外做完，
+/// 调用方只在把它换进去时短暂持写锁（见 [`GeoIpManager::apply_parsed`]）。finalize 是整个重载里最重的一段：要排序
+/// 并合并每个标签的全部网段
+/// GeoIP indexes parsed out of one data file, not yet applied to a manager. Reading,
+/// decoding, building the indexes and finalising are all done while parsing, outside the
+/// manager's lock, and callers hold the write lock only while swapping them in (see
+/// [`GeoIpManager::apply_parsed`]). Finalising is the heaviest part of a reload: it sorts and
+/// merges every tag's networks
 pub struct ParsedGeoIp {
     tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex>,
     count: usize,
@@ -416,44 +421,27 @@ impl GeoIpManager {
         Ok(self.apply_parsed(parsed))
     }
 
-    /// 解析 .dat 文件里的每个标签，不触碰管理器状态；测试用，运行时只解析规则用到的（见 [`Self::parse_file`]）
-    /// Parse every tag of a .dat file without touching manager state; for tests, as at run time
-    /// only the tags rules use are parsed (see [`Self::parse_file`])
-    ///
-    /// 读取、解码、建索引、finalize 全在这里完成，与 [`Self::apply_parsed`]
-    /// 配合：调用方在锁外解析，只在替换数据时短暂持写锁。finalize 必须留在
-    /// 这一侧——它要排序并合并每个 tag 的全部网段，是整个重载里最重的一段，
-    /// 只把读取和解码搬出去拿不到多少。
-    /// Reading, decoding, building the indexes and finalising all happen here.
-    /// It pairs with [`Self::apply_parsed`]: callers parse outside the lock and
-    /// hold the write lock only while swapping data in. Finalising has to stay
-    /// on this side, since sorting and merging every tag's ranges is the
-    /// heaviest part of a reload and moving only the read and the decode would
-    /// leave most of it behind.
+    /// 解析 .dat 文件里的每个标签，测试用；运行时只解析规则用到的（见 [`Self::parse_file`]）
+    /// Parse every tag of a .dat file, for tests; at run time only the tags rules use are
+    /// parsed (see [`Self::parse_file`])
     #[cfg(test)]
     pub fn parse_dat_file(path: &Path) -> anyhow::Result<ParsedGeoIp> {
         Self::parse_dat_entries(path, &|_| true)
     }
 
-    /// 解析 .dat 文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）。按条目顺序读，不把整个
-    /// 文件读进内存：每个条目先只解国家代码，要的条目才整个解，一百多万个网段里规则只用到几个标签时，
-    /// 别的标签既不解也不留。
-    /// 使用 Google 标准 protobuf 库 (prost) 解码条目，与 dae pkg/geodata 对齐：手写 wire 解析假设
-    /// 字段顺序固定、无未知字段，任何 .dat 格式变体都会产生静默错位或错误网段。
+    /// 解析 .dat 文件里 `wanted` 认可的条目（参数是大写的国家代码或标签）。顶层在这里一个个条目读，不把整个文件读进
+    /// 内存：每个条目先只解国家代码，要的条目才整个解，一百多万个网段里规则只用到几个标签时，别的标签既不解也不留。
+    /// 条目交给 prost 按 protobuf 的规矩解（见 `geoip_proto`）
     /// Parses the entries of a .dat file that `wanted` accepts (given the uppercase country code
-    /// or tag). The file is read entry by entry rather than into memory whole: each entry's
-    /// country code is decoded first and only wanted entries are decoded whole, so when rules use
-    /// a few tags out of over a million networks the other tags are neither decoded nor kept.
-    /// Entries are decoded with Google's standard protobuf library (prost), in line with dae's
-    /// pkg/geodata: hand-written wire parsing assumes a fixed field order and no unknown fields,
-    /// and any .dat variant would silently shift fields or yield wrong networks.
+    /// or tag). The top level is read here entry by entry rather than into memory whole: each
+    /// entry's country code is decoded first and only wanted entries are decoded whole, so when
+    /// rules use a few tags out of over a million networks the other tags are neither decoded
+    /// nor kept. Entries are decoded by protobuf's rules with prost (see `geoip_proto`)
     fn parse_dat_entries(
         path: &Path,
         wanted: &dyn Fn(&str) -> bool,
     ) -> anyhow::Result<ParsedGeoIp> {
-        let file = File::open(path)?;
-        let mut remaining = file.metadata()?.len();
-        let mut file = BufReader::with_capacity(64 * 1024, file);
+        let mut file = DatReader::open(path)?;
         // 一个条目的内容，各条目轮流使用 / One entry's bytes, reused for every entry
         let mut entry = Vec::new();
         let mut tag_indexes: FxHashMap<Arc<str>, GeoIpTagIndex> = FxHashMap::default();
@@ -461,37 +449,13 @@ impl GeoIpManager {
         let mut ipv4_count = 0;
         let mut ipv6_count = 0;
 
-        // GeoIPList 顶层只有 `repeated GeoIP entry = 1`，别的字段跳过
-        // GeoIPList holds only `repeated GeoIP entry = 1` at the top; other fields are skipped
-        while remaining > 0 {
-            let key = read_varint(&mut file, &mut remaining)?;
-            let (field, wire_type) = (key >> 3, key & 0x7);
-            let len = match wire_type {
-                0 => {
-                    read_varint(&mut file, &mut remaining)?;
-                    continue;
-                }
-                1 => 8,
-                2 => read_varint(&mut file, &mut remaining)?,
-                5 => 4,
-                other => anyhow::bail!("invalid wire type {other} in .dat file"),
-            };
-            anyhow::ensure!(
-                field != 1 || wire_type == 2,
-                "invalid wire type {wire_type} for a GeoIP entry"
-            );
-            anyhow::ensure!(
-                len <= remaining,
-                "truncated .dat file: a field needs {len} bytes, {remaining} left"
-            );
-            remaining -= len;
-            if field != 1 {
-                file.seek_relative(i64::try_from(len)?)?;
-                continue;
-            }
-            entry.clear();
-            entry.resize(usize::try_from(len)?, 0);
-            file.read_exact(&mut entry)?;
+        // GeoIPList 顶层只有 `repeated GeoIP entry = 1`，别的字段跳过。条目越出文件时整份文件拒绝（见
+        // `DatReader::next_field`）
+        // GeoIPList holds only `repeated GeoIP entry = 1` at the top; other fields are skipped.
+        // An entry running past the file gets the whole file rejected (see
+        // `DatReader::next_field`)
+        while let Some(len) = file.next_field(1, file.end())? {
+            file.read(&mut entry, len)?;
 
             // 先只解国家代码（其余字段跳过不解），要的条目才整个解
             // Decode the country code alone first (other fields are skipped undecoded), and
@@ -505,6 +469,7 @@ impl GeoIpManager {
             }
             let geoip = super::geoip_proto::GeoIP::decode(entry.as_slice())
                 .context("failed to decode a geoip.dat entry")?;
+            let mut skipped = Skipped::default();
             for cidr in geoip.cidr {
                 match cidr.ip.len() {
                     4 => {
@@ -538,11 +503,10 @@ impl GeoIpManager {
                         count += 1;
                         ipv6_count += 1;
                     }
-                    len => {
-                        tracing::debug!(len, "skipping a GeoIP CIDR with an unsupported IP length");
-                    }
+                    len => skipped.add(|| format!("an address of {len} bytes")),
                 }
             }
+            skipped.warn(&country_code, ".dat file");
         }
 
         for index in tag_indexes.values_mut() {
@@ -685,29 +649,35 @@ impl GeoIpManager {
             if tag.is_empty() || !wanted(&tag) {
                 continue;
             }
-            let index = get_or_insert_tag_index(&mut tag_indexes, &tag);
-
+            let mut skipped = Skipped::default();
             for ip_str in &geoip.ips {
-                match json_network(ip_str) {
-                    Some(ipnet::IpNet::V4(v4net)) => {
+                let Some(net) = json_network(ip_str) else {
+                    skipped.add(|| ip_str.clone());
+                    continue;
+                };
+                // 标签的索引在读出第一个网段时才建，和 .dat 一样：一个网段都读不出来的标签不算文件提供了
+                // A tag's index is made with its first network read, as for .dat: a tag none of
+                // whose networks can be read does not count as provided by the file
+                let index = get_or_insert_tag_index(&mut tag_indexes, &tag);
+                match net {
+                    ipnet::IpNet::V4(v4net) => {
                         index.ipv4_ranges.push(AddrRange {
                             start: u32::from(v4net.network()),
                             end: u32::from(v4net.broadcast()),
                         });
-                        count += 1;
                         ipv4_count += 1;
                     }
-                    Some(ipnet::IpNet::V6(v6net)) => {
+                    ipnet::IpNet::V6(v6net) => {
                         index.ipv6_ranges.push(AddrRange {
                             start: u128::from(v6net.network()),
                             end: u128::from(v6net.broadcast()),
                         });
-                        count += 1;
                         ipv6_count += 1;
                     }
-                    None => {}
                 }
+                count += 1;
             }
+            skipped.warn(&tag, "JSON file");
         }
 
         for index in tag_indexes.values_mut() {
@@ -737,24 +707,30 @@ fn json_network(text: &str) -> Option<ipnet::IpNet> {
         .or_else(|| text.parse::<IpAddr>().ok().map(ipnet::IpNet::from))
 }
 
-/// 从 `file` 读一个 protobuf 变长整数，`remaining` 是文件里还剩的字节数
-/// Reads a protobuf varint from `file`, `remaining` being the bytes left in the file
-fn read_varint(file: &mut impl Read, remaining: &mut u64) -> anyhow::Result<u64> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        anyhow::ensure!(
-            *remaining > 0,
-            "truncated .dat file: a varint runs past the end"
-        );
-        let mut byte = [0u8];
-        file.read_exact(&mut byte)?;
-        *remaining -= 1;
-        value |= u64::from(byte[0] & 0x7F) << shift;
-        if byte[0] & 0x80 == 0 {
-            return Ok(value);
+/// 一个条目里读不出来、跳过的网段：几条，第一条是什么。跳过的记一条告警，不然标签照样在，用它的规则却悄悄地少了这些
+/// 网段，和 GeoSite 一样（见 `GeoSiteManager::convert_v2ray_to_entries`）
+/// The networks of one entry that cannot be read and are skipped: how many, and what the
+/// first was. Those skipped make one warning, or the tag stays with the rules using it quietly
+/// missing them, as for GeoSite (see `GeoSiteManager::convert_v2ray_to_entries`)
+#[derive(Default)]
+struct Skipped {
+    count: usize,
+    first: Option<String>,
+}
+
+impl Skipped {
+    fn add(&mut self, network: impl FnOnce() -> String) {
+        self.count += 1;
+        self.first.get_or_insert_with(network);
+    }
+
+    /// 有跳过的就记一条告警 / Logs a warning when any were skipped
+    fn warn(self, tag: &str, source: &str) {
+        if let Some(example) = self.first {
+            tracing::warn!(tag, skipped = self.count, example = %example, source,
+                "skipped GeoIP networks that cannot be read");
         }
     }
-    anyhow::bail!("invalid varint in .dat file")
 }
 
 fn get_or_insert_tag_index<'a>(
@@ -1349,6 +1325,71 @@ mod tests {
                 manager.matches_any_tag(ip.parse().unwrap(), &hosts),
                 expected,
                 "{ip}"
+            );
+        }
+    }
+
+    /// 读不出来的网段跳过，按条目各记一条告警，说跳过了几条、第一条是什么，别的网段照常：JSON 里前缀超过位宽的、写错的、
+    /// 带空格的，.dat 里地址不是 4 或 16 字节的。一个网段都读不出来的标签不算文件提供了，用它的规则什么都不匹配，
+    /// 和文件里没有这个标签一样
+    /// Networks that cannot be read are skipped with one warning for each entry, saying how many
+    /// and what the first was, the other networks loading as usual: in JSON one whose prefix is
+    /// wider than the address, one written wrong, one with a space; in a .dat an address that is
+    /// not 4 or 16 bytes. A tag none of whose networks can be read does not count as provided by
+    /// the file, so rules using it match nothing, as when the file lacks the tag
+    #[test]
+    fn networks_that_cannot_be_read_are_warned_about() {
+        use prost::Message;
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("geoip.json");
+        std::fs::write(
+            &json,
+            r#"{"entries":[
+                {"country_code":"SOME","ips":["192.0.2.0/24","198.51.100.0/33"," 203.0.113.0/24"]},
+                {"country_code":"NONE","ips":["10.0.0.0/8x","bogus"]}
+            ]}"#,
+        )
+        .unwrap();
+        let dat = dir.path().join("geoip.dat");
+        let cidr = |ip: Vec<u8>, prefix| super::super::geoip_proto::Cidr { ip, prefix };
+        let list = super::super::geoip_proto::GeoIPList {
+            entry: vec![super::super::geoip_proto::GeoIP {
+                country_code: "SOME".to_string(),
+                cidr: vec![
+                    cidr(vec![192, 0, 2, 0], 24),
+                    cidr(vec![198, 51, 100, 0, 0], 24),
+                ],
+            }],
+        };
+        std::fs::write(&dat, list.encode_to_vec()).unwrap();
+
+        let (warnings, guard) = crate::engine::test_support::Warnings::capture();
+        let from_json = GeoIpManager::parse_file(&json, &tags(&["some", "none"])).unwrap();
+        let from_dat = GeoIpManager::parse_file(&dat, &tags(&["some"])).unwrap();
+        drop(guard);
+        for parsed in [from_json, from_dat] {
+            assert_eq!(parsed.tag_count(), 1);
+            let mut manager = GeoIpManager::default();
+            manager.apply_parsed(parsed);
+            assert!(manager.matches_tag("192.0.2.1".parse().unwrap(), "SOME"));
+            assert!(!manager.matches_tag("203.0.113.1".parse().unwrap(), "SOME"));
+        }
+        let lines = warnings.lines();
+        let skipped: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("skipped GeoIP networks that cannot be read"))
+            .collect();
+        assert_eq!(skipped.len(), 3, "{lines:#?}");
+        for (line, (tag, count, example)) in skipped.iter().zip([
+            ("SOME", 2, "198.51.100.0/33"),
+            ("NONE", 2, "10.0.0.0/8x"),
+            ("SOME", 1, "an address of 5 bytes"),
+        ]) {
+            assert!(
+                line.contains(tag)
+                    && line.contains(&format!("skipped={count}"))
+                    && line.contains(example),
+                "{line}"
             );
         }
     }

@@ -5,9 +5,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use kixdns::config::{
-    Action, Matcher, PipelineSelectorMatcher, ResponseMatcher, parse_config, refuse_problems,
-};
+use kixdns::config::{Action, Matcher, ResponseMatcher, parse_config, refuse_problems};
 use serde::de::DeserializeOwned;
 
 /// 中英文两份配置参考，各自三张类型表的标题 / The two configuration references and the headings of their three type tables
@@ -71,19 +69,18 @@ fn accepted<T: DeserializeOwned>() -> BTreeSet<String> {
 
 #[test]
 fn documented_type_names_are_the_accepted_ones() {
-    let selector = accepted::<PipelineSelectorMatcher>();
-    let request = accepted::<Matcher>();
     for (path, [requests, responses, actions]) in DOCS {
         let doc = read(path);
-        // 请求匹配器表同时说 Pipeline selector 和请求规则：规则认表里除 listener_label 之外的全部
-        // The request matcher table covers the pipeline selector and request rules alike: rules accept all of it but listener_label
-        let table = table_types(&doc, requests);
-        assert_eq!(table, selector, "{path}: {requests}");
-        let rules: BTreeSet<String> = table
-            .into_iter()
-            .filter(|name| name != "listener_label")
-            .collect();
-        assert_eq!(rules, request, "{path}: request rules");
+        // 请求匹配器表同时说 Pipeline selector 和请求规则，两边读的是同一套；写在规则里的 listener_label 编译不过（见
+        // config 的测试）
+        // The request matcher table covers the pipeline selector and request rules alike, both
+        // reading the one set; a listener_label written in a rule does not compile (see the
+        // config tests)
+        assert_eq!(
+            table_types(&doc, requests),
+            accepted::<Matcher>(),
+            "{path}: {requests}"
+        );
         assert_eq!(
             table_types(&doc, responses),
             accepted::<ResponseMatcher>(),
@@ -94,6 +91,29 @@ fn documented_type_names_are_the_accepted_ones() {
             accepted::<Action>(),
             "{path}: {actions}"
         );
+    }
+}
+
+/// 全局设置表和程序认的设置一一对应：`GlobalSettings::default()` 写出来的每个设置在两份文档的表里各有一行，表里也没有
+/// 不存在的设置。以前 doh_health_check_error_threshold 一直没写进表里
+/// The global settings tables match the settings the program reads one for one: every setting
+/// `GlobalSettings::default()` writes out has a row in the tables of both documents, and the
+/// tables hold none that does not exist. doh_health_check_error_threshold used to be missing
+#[test]
+fn every_setting_has_a_row_in_the_settings_tables() {
+    let settings: BTreeSet<String> =
+        serde_json::to_value(kixdns::config::GlobalSettings::default())
+            .expect("settings serialize")
+            .as_object()
+            .expect("settings are an object")
+            .keys()
+            .cloned()
+            .collect();
+    for (path, heading) in [
+        ("docs/configuration.md", "### 全局设置"),
+        ("docs/configuration.en.md", "### Global settings"),
+    ] {
+        assert_eq!(table_types(&read(path), heading), settings, "{path}");
     }
 }
 

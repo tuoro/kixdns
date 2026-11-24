@@ -131,10 +131,6 @@ pub struct RuleIndex {
 }
 
 impl RuleIndex {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// 「且」连起来的规则只在每个条件都成立时命中，记在哪个条件下都不会漏掉它；记在最挑的那个下，它当候选的次数最少：
     /// 先看精确的名字，再看后缀，最后看类型。以前记在第一个能记的条件下，写成「qtype A 且后缀 example.com」的规则，
     /// 每个 A 查询都要求值一遍
@@ -168,15 +164,11 @@ impl RuleIndex {
         .push(rule_idx);
     }
 
-    /// Get candidate rule indices into provided SmallVec to avoid allocation
-    /// SmallVec<[usize; 32]> keeps up to 32 candidates on stack (typical case)
-    pub fn get_candidates_into(
-        &self,
-        qname: &str,
-        qtype: RecordType,
-        out: &mut SmallVec<[usize; 32]>,
-    ) {
-        out.extend_from_slice(&self.always_check);
+    /// 可能命中 `qname`、`qtype` 的规则，按规则顺序排好、去掉重复；一般不超过 32 条，放在栈上
+    /// The rules that can match `qname` and `qtype`, in rule order without duplicates; there
+    /// are 32 at most as a rule, kept on the stack
+    pub fn get_candidates(&self, qname: &str, qtype: RecordType) -> SmallVec<[usize; 32]> {
+        let mut out = SmallVec::from_slice(&self.always_check);
 
         if let Some(indices) = self.domain_exact.get(qname) {
             out.extend_from_slice(indices);
@@ -200,12 +192,7 @@ impl RuleIndex {
 
         out.sort_unstable();
         out.dedup();
-    }
-
-    pub fn get_candidates(&self, qname: &str, qtype: RecordType) -> SmallVec<[usize; 32]> {
-        let mut candidates = SmallVec::new();
-        self.get_candidates_into(qname, qtype, &mut candidates);
-        candidates
+        out
     }
 }
 
@@ -215,7 +202,7 @@ pub fn compile_pipelines(cfg: &RuntimePipelineConfig) -> Vec<CompiledPipeline> {
 
 fn compile_pipeline(p: &RuntimePipeline) -> CompiledPipeline {
     let mut rules = Vec::with_capacity(p.rules.len());
-    let mut index = RuleIndex::new();
+    let mut index = RuleIndex::default();
 
     for (idx, rule) in p.rules.iter().enumerate() {
         let compiled = compile_rule(rule);
@@ -307,8 +294,8 @@ pub(crate) fn fast_static_match_with_rule<'a>(
 ) -> Option<(&'a PrecomputedAction, &'a str)> {
     let last = pipeline.last_precomputed?;
     let candidates = pipeline.index.get_candidates(facts.qname, facts.qtype);
-    // 候选按规则顺序排好（见 `RuleIndex::get_candidates_into`）/ Candidates come in rule order (see
-    // `RuleIndex::get_candidates_into`)
+    // 候选按规则顺序排好（见 `RuleIndex::get_candidates`）/ Candidates come in rule order (see
+    // `RuleIndex::get_candidates`)
     for idx in candidates.into_iter().take_while(|&idx| idx <= last) {
         let rule = &pipeline.rules[idx];
         let matched = eval_match_chain(

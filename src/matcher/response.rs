@@ -174,15 +174,17 @@ impl RuntimeResponseMatcher {
                 let mode = TxtMatchMode::from_str(&mode)?;
                 let regex = match mode {
                     TxtMatchMode::Regex => {
-                        // ReDoS保护: 限制正则表达式大小 / ReDoS protection: limit regex size
+                        // 写法最长 1000 字节，编译后的大小和域名正则一个上限（见 `limited_regex`）：两样都是为了
+                        // 不让一条正则占掉太多内存。Rust 的正则不回溯，匹配的时间只随文字长度线性增长，用不着防
+                        // 回溯爆炸。字符类不像域名正则那样改成 ASCII：TXT 里本来就可以写任意文字，照写的编译
+                        // At most 1000 bytes as written, and within the compiled limit domain regexes
+                        // have (see `limited_regex`): both keep one regex from taking too much
+                        // memory. Rust's regexes do not backtrack, and matching takes time linear in
+                        // the text, so there is no catastrophic backtracking to guard against. Its
+                        // classes are not made ASCII as a domain regex's are: TXT may hold any text,
+                        // so it compiles as written
                         const MAX_TXT_REGEX_LEN: usize = 1000;
                         regex_within(&value, MAX_TXT_REGEX_LEN)?;
-                        // 编译后的大小和域名正则一个上限。以前限在 1000 字节，`.`、`\d+` 都编译不过。
-                        // 字符类不像域名正则那样改成 ASCII：TXT 里本来就可以写任意文字，照写的编译
-                        // The compiled size gets the limit domain regexes have. It was held to
-                        // 1000 bytes, which `.` or `\d+` already exceed. Its classes are not made
-                        // ASCII as a domain regex's are: TXT may hold any text, so it compiles as
-                        // written
                         Some(
                             limited_regex(&value)
                                 .map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?,
