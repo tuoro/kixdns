@@ -686,27 +686,29 @@ pub struct DohListenerConfig {
 }
 
 /// `dashmap_shards` 的上限。每个分片启动时就占六百来字节（缓存行对齐的锁，加上容量摊到每片至少一条时的四格小表），
-/// 65536 片四十来 MB；以前没有上限时写过的 2048、4096 都在里面，以前的 1024 让它们升级以后起不来。再翻一倍就是八十来
-/// MB，同时在途的查询也用不了那么多片
+/// 65536 片四十来 MB，再翻一倍就是八十来 MB，同时在途的查询也用不了那么多片。超过的按它截断（见
+/// [`GlobalSettings::hold_to_limits`]）
 /// The most `dashmap_shards` may be. Each shard takes some six hundred bytes from startup (a
 /// cache-padded lock and a four-slot table, the capacity spread to at least one entry a
-/// shard), so 65536 shards are some forty MB; the 2048 and 4096 written before there was a
-/// limit fit, where the former 1024 kept them from starting after an upgrade. Twice as many is
-/// some eighty MB, more shards than the queries in flight together could ever use
+/// shard), so 65536 shards are some forty MB, and twice as many some eighty MB, more shards
+/// than the queries in flight together could ever use. More is held to it (see
+/// [`GlobalSettings::hold_to_limits`])
 pub const MAX_DASHMAP_SHARDS: usize = 65_536;
 
 /// 每个连接池（`udp_pool_size`、`tcp_pool_size`、`doh_pool_size`、`dot_pool_size`、`doq_pool_size`）最多多大，
 /// 默认值最大的也只有 64。UDP 池启动时就给每个地址族各开这么多 socket，两族最多 2048 个，在文档里的 systemd 服务和
-/// 面板的 OpenWrt 包设的 65536 个描述符以内；其余的池给每个上游备好这么多客户端。以前不设上限：多到开不出来的 socket，
-/// 热重载和面板保存照样收下，下次启动才起不来；大到 2^64 的数建池时分配不出内存，内核直接退出
+/// 面板的 OpenWrt 包设的 65536 个描述符以内；其余的池给每个上游备好这么多客户端。超过的按它截断（见
+/// [`GlobalSettings::hold_to_limits`]）。以前不设上限：多到开不出来的 socket，热重载和面板保存照样收下，下次启动才起
+/// 不来；大到 2^64 的数建池时分配不出内存，内核直接退出
 /// How large each connection pool (`udp_pool_size`, `tcp_pool_size`, `doh_pool_size`,
 /// `dot_pool_size`, `doq_pool_size`) may be, the largest default being 64. The UDP pool opens
 /// this many sockets per address family at startup, at most 2048 for both, within the 65536
 /// descriptors the systemd service in the docs and the panel's `OpenWrt` package allow; the
-/// other pools set up this many clients per upstream. There used to be no limit: more sockets
-/// than could be opened were accepted by a hot reload and a panel save and failed only at the
-/// next start, and a number as large as 2^64 could not be allocated as the pool was built,
-/// taking the kernel down
+/// other pools set up this many clients per upstream. More is held to it (see
+/// [`GlobalSettings::hold_to_limits`]). There used to be no limit: more sockets than could be
+/// opened were accepted by a hot reload and a panel save and failed only at the next start,
+/// and a number as large as 2^64 could not be allocated as the pool was built, taking the
+/// kernel down
 pub const MAX_POOL_SIZE: usize = 1024;
 
 impl GlobalSettings {
@@ -842,6 +844,39 @@ impl GlobalSettings {
             .unwrap_or_else(|| Arc::from(self.default_upstream.as_str()))
     }
 
+    /// 分片数和连接池超过上限的截到上限（见 [`MAX_DASHMAP_SHARDS`]、[`MAX_POOL_SIZE`]），说出截了哪些。截过的算
+    /// [`problems`]：启动时记一条错误、按上限照常起来，没有上限时能用的配置（`tcp_pool_size: 2048`）升级以后照样起得来；
+    /// 重载和面板保存拒绝。编译配置时先截（见 `RuntimePipelineConfig::from_config`）
+    /// Holds the shard count and the connection pools over their limits to them (see
+    /// [`MAX_DASHMAP_SHARDS`], [`MAX_POOL_SIZE`]), saying which it held. Each counts among
+    /// [`problems`]: startup logs an error and starts at the limit, so a configuration that
+    /// worked before there were limits (`tcp_pool_size: 2048`) still starts after an upgrade,
+    /// while a reload and a panel save refuse it. Compiling a configuration holds them first
+    /// (see `RuntimePipelineConfig::from_config`)
+    pub fn hold_to_limits(&mut self) -> Vec<String> {
+        let mut held = Vec::new();
+        for (setting, value, most) in [
+            (
+                "dashmap_shards",
+                &mut self.dashmap_shards,
+                MAX_DASHMAP_SHARDS,
+            ),
+            ("udp_pool_size", &mut self.udp_pool_size, MAX_POOL_SIZE),
+            ("tcp_pool_size", &mut self.tcp_pool_size, MAX_POOL_SIZE),
+            ("doh_pool_size", &mut self.doh_pool_size, MAX_POOL_SIZE),
+            ("dot_pool_size", &mut self.dot_pool_size, MAX_POOL_SIZE),
+            ("doq_pool_size", &mut self.doq_pool_size, MAX_POOL_SIZE),
+        ] {
+            if *value > most {
+                held.push(format!(
+                    "settings.{setting}: {value} is more than {most}, the most it may be, so {most} is used"
+                ));
+                *value = most;
+            }
+        }
+        held
+    }
+
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
     /// 启动、热重载和面板校验都经过这里
     /// Whether the settings make sense on their own: their ranges, how they relate, and the few read
@@ -883,30 +918,19 @@ impl GlobalSettings {
             anyhow::bail!("upstream_timeout_ms must be greater than 0");
         }
         // 只在启动时读的设置，校验得和建引擎时的前提一致：校验放过了、建引擎时才出错的值，热重载和面板保存都会
-        // 收下，到下次重启内核就起不来。DashMap 要求分片数大于 1；分片太多、连接池太大，一次就要分配太多（见
-        // `MAX_DASHMAP_SHARDS`、`MAX_POOL_SIZE`）
+        // 收下，到下次重启内核就起不来。DashMap 要求分片数是大于 1 的 2 的幂，不是的从来起不来；分片太多、连接池太大
+        // 一次就要分配太多，那是按上限截断（见 `hold_to_limits`）
         // Settings read only at startup are checked against what building the engine needs: a value
         // the check lets through and the build then fails on is accepted by a hot reload and a panel
-        // save, and the kernel does not start at the next restart. DashMap needs more than one
-        // shard, and too many shards or too large a pool take too much at once (see
-        // `MAX_DASHMAP_SHARDS`, `MAX_POOL_SIZE`)
+        // save, and the kernel does not start at the next restart. DashMap needs a power of two
+        // above 1 for its shards, and with any other number it never started; too many shards or
+        // too large a pool take too much at once, which is held to the limits instead (see
+        // `hold_to_limits`)
         let shards = self.dashmap_shards;
-        if shards != 0 && !(shards.is_power_of_two() && (2..=MAX_DASHMAP_SHARDS).contains(&shards))
-        {
+        if shards != 0 && !(shards.is_power_of_two() && shards >= 2) {
             anyhow::bail!(
                 "dashmap_shards must be 0 (the default) or a power of two from 2 to {MAX_DASHMAP_SHARDS}, got {shards}"
             );
-        }
-        for (setting, size) in [
-            ("udp_pool_size", self.udp_pool_size),
-            ("tcp_pool_size", self.tcp_pool_size),
-            ("doh_pool_size", self.doh_pool_size),
-            ("dot_pool_size", self.dot_pool_size),
-            ("doq_pool_size", self.doq_pool_size),
-        ] {
-            if size > MAX_POOL_SIZE {
-                anyhow::bail!("{setting} must be at most {MAX_POOL_SIZE}, got {size}");
-            }
         }
         let doq_idle = self.doq_connection_idle_timeout_seconds;
         if doq_idle > 0
@@ -1230,6 +1254,7 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
             cfg.settings.doh_path
         ));
     }
+    found.extend(cfg.settings.clone().hold_to_limits());
     // 一个 id 写了几次，在它第一次出现的地方报一次 / An id written several times is raised once,
     // where it first appears
     let mut written: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
@@ -2817,6 +2842,46 @@ mod validation_tests {
             problems_of(suffix),
             ["pipelines[0].rules[0].matchers[0]: domain_suffix \".\" matches every name"]
         );
+    }
+
+    /// 分片数和连接池超过上限时，启动照常起来、按上限用，算一条配置问题（启动时记错误），重载和面板保存拒绝。以前编译
+    /// 直接失败：没有上限时能用的 `tcp_pool_size: 2048` 升级以后内核起不来
+    /// A shard count or connection pool over its limit starts as usual at the limit and counts as
+    /// a configuration problem (logged as an error at startup), which a reload and a panel save
+    /// refuse. Compiling used to fail outright: a `tcp_pool_size: 2048` that worked before there
+    /// were limits kept the kernel from starting after an upgrade
+    #[tokio::test]
+    async fn settings_over_their_limits_start_held_to_them() {
+        use super::{MAX_DASHMAP_SHARDS, MAX_POOL_SIZE};
+        for (setting, over, most) in [
+            ("dashmap_shards", MAX_DASHMAP_SHARDS * 2, MAX_DASHMAP_SHARDS),
+            ("udp_pool_size", usize::MAX, MAX_POOL_SIZE),
+            ("tcp_pool_size", 2048, MAX_POOL_SIZE),
+            ("doh_pool_size", 2048, MAX_POOL_SIZE),
+            ("dot_pool_size", MAX_POOL_SIZE + 1, MAX_POOL_SIZE),
+            ("doq_pool_size", 2048, MAX_POOL_SIZE),
+        ] {
+            let config = serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53", setting: over },
+                "pipelines": []
+            });
+            let parsed = super::parse_config(&config.to_string()).expect("parses");
+            assert_eq!(
+                super::problems(&parsed),
+                [format!(
+                    "settings.{setting}: {over} is more than {most}, the most it may be, so {most} is used"
+                )]
+            );
+            let runtime = crate::matcher::RuntimePipelineConfig::from_config(parsed.clone())
+                .unwrap_or_else(|error| panic!("{setting} {over} starts: {error:#}"));
+            assert_eq!(
+                serde_json::to_value(&runtime.settings).unwrap()[setting],
+                most,
+                "{setting}"
+            );
+            crate::engine::Engine::new(runtime, "test".to_string()).expect("engine builds");
+            super::compile(parsed).expect_err("a reload refuses it");
+        }
     }
 
     /// ECS 没写前缀时的默认值：from_client_ip 是 IPv4 24、IPv6 56，static 是 24
