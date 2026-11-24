@@ -10,9 +10,19 @@ on:
 permissions:
   contents: write
 
+# PR 上新的提交取消旧的检查；推到 main 的每次都跑完
+# On a pull request a new commit cancels the older checks; every push to main runs to the end
+concurrency:
+  group: build-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # 正式构建出的是发版用的二进制，只在推到 main 和手动触发时跑；PR 上由 cross-check 只编译、不出产物
+  # The release builds make the binaries a release ships, so they run on pushes to main and by
+  # hand; on a pull request cross-check compiles for each platform without building artifacts
   build-windows:
     name: Build Windows ${{ matrix.arch }} gnullvm
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -80,6 +90,7 @@ jobs:
 
   build-linux:
     name: Build Linux ${{ matrix.arch }} ${{ matrix.toolset }}
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -154,6 +165,7 @@ jobs:
 
   build-freebsd:
     name: Build FreeBSD ${{ matrix.arch }} (cross)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -229,39 +241,14 @@ jobs:
         with:
           files: dist/kixdns-freebsd-${{ matrix.arch }}
 
-  test-linux:
-    name: Test Linux (unit + DoH integration)
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run unit tests
-        run: cargo test --lib
-
-      - name: Run listener integration tests
-        run: cargo test --bin kixdns
-
-      - name: Run DoH integration tests
-        run: cargo test --test doh_integration
-
-      - name: Run response log tests
-        run: cargo test --test response_log
-
-      - name: Run observer API tests
-        run: cargo test --test observer_api
-
-      - name: Run listener port test
-        run: cargo test --test listener_port
-
-      - name: Run memory reading test
-        run: cargo test --test memory_reading
-
-  lint-linux:
-    name: Lint (clippy + fmt)
+  # 各平台只在那个平台上编译的代码（cfg(windows)、BSD、musl/arm64），在 Linux 上用 zig 交叉编译跑 clippy：几分钟，
+  # 不出产物。Linux 本身的 clippy 和测试在 panel-release.yml 的 Verify 里
+  # The code each platform alone compiles (cfg(windows), BSD, musl/arm64), checked with clippy
+  # cross-compiled through zig on Linux: a few minutes and no artifacts. Linux's own clippy and
+  # tests are in Verify, panel-release.yml
+  cross-check:
+    name: Cross check (Windows, FreeBSD, arm64 musl)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
@@ -270,13 +257,30 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
+          targets: x86_64-pc-windows-gnu, x86_64-unknown-freebsd, aarch64-unknown-linux-musl
 
-      - name: Check formatting
-        run: cargo fmt --check
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
 
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.24.1
+
+      - name: Cache build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy for Windows
+        run: cargo-zigbuild clippy --locked --target x86_64-pc-windows-gnu --lib --bins -- -D warnings
+
+      - name: Clippy for FreeBSD
+        run: cargo-zigbuild clippy --locked --target x86_64-unknown-freebsd --lib --bins -- -D warnings
+
+      - name: Clippy for arm64 musl
+        run: cargo-zigbuild clippy --locked --target aarch64-unknown-linux-musl --lib --bins -- -D warnings
 
   audit-linux:
     name: Audit dependencies (RustSec)

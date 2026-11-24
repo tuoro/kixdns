@@ -55,9 +55,7 @@ fn query(labels: &[&[u8]], trailing: &[u8]) -> Vec<u8> {
 /// Ask as a listener does: the full path only when the fast path cannot answer; the
 /// address in the reply, and whether the fast path could read the query
 async fn ask(engine: &Engine, packet: &[u8]) -> (Option<Ipv4Addr>, bool) {
-    let fast = engine
-        .handle_packet_fast(packet, peer())
-        .expect("fast path");
+    let fast = engine.handle_packet_fast(packet, peer());
     let read_fast = fast.is_some();
     let reply = match fast {
         Some(crate::engine::FastPathResponse::Direct(reply)) => reply,

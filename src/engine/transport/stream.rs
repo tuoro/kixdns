@@ -632,7 +632,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                         Some(e.remove())
                     }
                     entry::Entry::Occupied(_) => {
-                        crate::warn_sparse!(target = T::LOG_TARGET, upstream = %upstream, resp_id, "{} response does not answer the query, dropped", T::NAME);
+                        crate::warn_sparse!(per upstream; target = T::LOG_TARGET, upstream = %upstream, resp_id, "{} response does not answer the query, dropped", T::NAME);
                         None
                     }
                     entry::Entry::Vacant(_) => {

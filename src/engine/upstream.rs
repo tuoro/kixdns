@@ -138,14 +138,18 @@ pub(crate) fn is_failure_reply(rcode: ResponseCode) -> bool {
     matches!(rcode, ResponseCode::ServFail | ResponseCode::Refused) || u16::from(rcode) >= 16
 }
 
-/// A background refresh does not cache a failure reply (see [`is_failure_reply`]),
-/// which a rule with a single upstream gets back as its answer: it would replace the
-/// answer cached under the same key, and a lookup never serves such an entry as
-/// stale. The refresh gets an error here instead of caching it, and the cached
-/// answer stays.
-/// 后台刷新不缓存失败应答（见 [`is_failure_reply`]；只有一个上游的规则会把它当作应答
-/// 拿回来）：它会替换掉同一个键下缓存的应答，而查缓存时这样的条目不会被当作旧结果返回。
-/// 刷新在这里拿到一个错误，不缓存它，缓存的应答保留。
+/// A background refresh takes a failure reply (see [`is_failure_reply`]), which a rule with
+/// a single upstream gets back as its answer, as a failed attempt, as it takes an upstream
+/// that does not answer. The cache never takes such a reply (see
+/// `Engine::insert_dns_cache_entry`), and a refresh ending on a REFUSED or an extended RCODE
+/// as its answer would count as a success (see `execution::renewing`, which turns away a
+/// SERVFAIL alone): the answer it renews would be dropped with nothing in its place, and the
+/// failure neither noted nor backed off. The refresh gets an error here instead, and the
+/// cached answer stays (renewed with serve_stale_ttl_reset on).
+/// 后台刷新把失败应答（见 [`is_failure_reply`]；只有一个上游的规则会把它当作应答拿回来）当作一次失败的尝试，和上游
+/// 不回答一样。缓存从来不收这样的应答（见 `Engine::insert_dns_cache_entry`），刷新要是以 REFUSED 或扩展 RCODE 作答
+/// 结束，就算成功（见 `execution::renewing`，它只拒 SERVFAIL）：被刷新的那份随之去掉，却没有新的顶上，这次失败也
+/// 不记下、不退避。刷新在这里拿到一个错误，缓存的应答保留（开着 serve_stale_ttl_reset 时还续期）。
 pub(crate) fn reject_failure_reply_on_refresh(
     background_refresh: bool,
     reply: &[u8],
@@ -562,7 +566,7 @@ pub async fn forward_upstream(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    transport: Option<Transport>,
+    transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
     asker: Option<std::net::IpAddr>,
@@ -698,13 +702,10 @@ async fn forward_upstream_as_is(
     packet: &[u8],
     upstream: &str,
     timeout_dur: Duration,
-    transport: Option<Transport>,
+    default_transport: Transport,
     pre_split_upstreams: Option<&std::sync::Arc<Vec<std::sync::Arc<str>>>>,
     observed: Observed<'_>,
 ) -> anyhow::Result<(Bytes, Arc<str>)> {
-    // 如果 transport 为 None，使用默认 UDP
-    let default_transport = transport.unwrap_or(Transport::Udp);
-
     // 使用预分割数据或动态分割 / Use pre-split data or dynamic splitting
     // 使用 Arc<str> 避免克隆 / Use Arc<str> to avoid cloning
     let upstreams: Upstreams = if let Some(pre_split) = pre_split_upstreams {
@@ -772,7 +773,7 @@ async fn forward_upstream_as_is(
                 if outcome == UpstreamOutcome::Throttled {
                     tracing::debug!(upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream throttled");
                 } else {
-                    crate::warn_sparse!(upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
+                    crate::warn_sparse!(per up; upstream=%up, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "single upstream call failed");
                 }
                 return Err(UpstreamFailure::error(err));
             }
@@ -881,7 +882,7 @@ async fn forward_upstream_as_is(
                         if outcome == UpstreamOutcome::Throttled {
                             tracing::debug!(upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream throttled, waiting for others");
                         } else {
-                            crate::warn_sparse!(upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
+                            crate::warn_sparse!(per up_proto; upstream=%up_proto, error=%format_args!("{err:#}"), elapsed_ns = dur.as_nanos() as u64, "upstream call failed, waiting for others");
                         }
                         last_err = Some(err);
                     }
@@ -2239,7 +2240,7 @@ mod tests {
                 &packet,
                 &upstream,
                 Duration::from_secs(2),
-                None,
+                Transport::Udp,
                 None,
                 None,
                 None,
@@ -2421,12 +2422,11 @@ mod refresh_failure_reply_tests {
         let client: SocketAddr = CLIENT.parse().unwrap();
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
-            engine.handle_packet_internal(
+            engine.handle_refresh(
                 &query().to_vec().unwrap(),
                 client,
-                None,
-                Some(engine.refresh_of(key)),
-                Some(state),
+                engine.refresh_of(key),
+                state,
             ),
         )
         .await

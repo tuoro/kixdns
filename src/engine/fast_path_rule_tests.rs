@@ -48,10 +48,7 @@ fn forward_nowhere() -> Value {
 /// 快速路径给出的应答码；交给异步路径时为 None / The response code the fast path answers; None
 /// when it hands the request to the async path
 fn fast_rcode(engine: &Engine, name: &str) -> Option<ResponseCode> {
-    match engine
-        .handle_packet_fast(&query(name), peer())
-        .expect("fast path")
-    {
+    match engine.handle_packet_fast(&query(name), peer()) {
         Some(FastPathResponse::Direct(reply)) => {
             Some(Message::from_vec(&reply).unwrap().metadata.response_code)
         }

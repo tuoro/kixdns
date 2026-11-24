@@ -619,7 +619,7 @@ async fn the_fast_path_hands_out_no_other_clients_subnet() {
     let by_peer = engine(forward_all(&up.address, from_client_ip()));
     reply(&by_peer, "198.51.100.7", None).await;
     match by_peer.handle_packet_fast(&query(None), peer("203.0.113.9")) {
-        Ok(Some(FastPathResponse::CacheHit { cached, .. })) => {
+        Some(FastPathResponse::CacheHit { cached, .. }) => {
             assert_eq!(first_a(&cached), v4("198.51.100.0"));
             assert_eq!(reply_ecs(&cached), None);
         }
@@ -633,7 +633,7 @@ async fn the_fast_path_hands_out_no_other_clients_subnet() {
     reply(&passing, "10.0.0.1", None).await;
     assert!(matches!(
         passing.handle_packet_fast(&query(Some(("198.51.100.0", 24))), peer("10.0.0.1")),
-        Ok(Some(FastPathResponse::AsyncNeeded(_)))
+        Some(FastPathResponse::AsyncNeeded(_))
     ));
     assert_eq!(
         ask(&passing, "10.0.0.1", Some(("198.51.100.0", 24))).await,
@@ -952,7 +952,7 @@ async fn a_client_with_ecs_is_answered_on_the_fast_path_with_its_echo() {
     ] }]));
     reply(&engine, "10.0.0.1", Some(("198.51.100.0", 24))).await;
     match engine.handle_packet_fast(&query(Some(("198.51.7.0", 24))), peer("10.0.0.2")) {
-        Ok(Some(FastPathResponse::Direct(reply))) => {
+        Some(FastPathResponse::Direct(reply)) => {
             assert_eq!(first_a(&reply), v4("198.51.100.0"));
             assert_eq!(reply_ecs(&reply), Some((ip("198.51.7.0"), 24, 16)));
             assert_eq!(Message::from_bytes(&reply).unwrap().metadata.id, 0xBEEF);
@@ -973,7 +973,7 @@ async fn a_client_with_ecs_is_answered_on_the_fast_path_with_its_echo() {
         )));
     blocked.edns = Some(edns);
     match engine.handle_packet_fast(&blocked.to_vec().unwrap(), peer("10.0.0.3")) {
-        Ok(Some(FastPathResponse::Direct(reply))) => {
+        Some(FastPathResponse::Direct(reply)) => {
             assert_eq!(first_a(&reply), v4("0.0.0.0"));
             assert_eq!(reply_ecs(&reply), Some((ip("203.0.113.0"), 24, 0)));
         }
@@ -1523,7 +1523,7 @@ async fn the_echo_is_written_when_records_follow_the_opt() {
     reply(&plain, "10.0.0.1", None).await;
     assert!(matches!(
         plain.handle_packet_fast(&query(None), peer("10.0.0.1")),
-        Ok(Some(crate::engine::FastPathResponse::CacheHit { .. }))
+        Some(crate::engine::FastPathResponse::CacheHit { .. })
     ));
 }
 

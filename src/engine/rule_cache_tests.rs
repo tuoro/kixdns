@@ -53,7 +53,7 @@ async fn clients_judged_alike_share_a_rule_decision_with_background_refresh_on()
     assert!(
         matches!(
             engine.handle_packet_fast(&query(), "10.0.0.2:53000".parse().unwrap()),
-            Ok(Some(FastPathResponse::Direct(_)))
+            Some(FastPathResponse::Direct(_))
         ),
         "the rule cache answers another client"
     );

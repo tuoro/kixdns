@@ -731,6 +731,7 @@ impl DohClient {
             }
         }
         crate::warn_sparse!(
+            per upstream;
             upstream = upstream,
             consecutive_errors = count,
             threshold = self.health_error_threshold,
