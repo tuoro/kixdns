@@ -297,3 +297,65 @@ fn a_refused_configuration_lists_every_problem() {
     );
     assert_eq!(reload["problems"], every_problem);
 }
+
+/// `config` 结果说出起不来的和没有数据的：入站 DoH 的证书读不了时 `doh_error` 写着原因，DNS 照常答；配置的 GeoSite
+/// 数据文件不存在时 `data_warnings` 说它不存在，规则用到的标签也就没有数据。写成空的 geo_site_not 算一条问题，不在
+/// 那些标签里列一个空名字（以前写成「GeoSite tags , cn」）
+/// The `config` result says what cannot start and what has no data: with the inbound DoH's
+/// certificate unreadable `doh_error` gives the reason, DNS answering as usual; with a configured
+/// GeoSite data file missing `data_warnings` says it is not there, and that the tags rules use so
+/// have no data. A geo_site_not written empty is a problem and lists no empty name among those
+/// tags (it used to say "GeoSite tags , cn")
+#[test]
+fn the_config_result_says_why_doh_is_off_and_which_geo_data_is_missing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let geosite = dir.path().join("geosite.dat");
+    let rule = |name: &str, kind: &str, value: &str| {
+        serde_json::json!({
+            "name": name,
+            "matchers": [{ "type": kind, "value": value }],
+            "actions": [{ "type": "allow" }],
+        })
+    };
+    let mut config = config_of(serde_json::json!([{ "id": "main", "rules": [
+        rule("cn", "geo_site", "cn"),
+        rule("empty", "geo_site_not", ""),
+    ] }]));
+    let settings = config["settings"].as_object_mut().unwrap();
+    for (setting, value) in [
+        (
+            "bind_doh",
+            serde_json::json!(format!("127.0.0.1:{}", free_port())),
+        ),
+        (
+            "doh_tls_cert",
+            serde_json::json!(dir.path().join("cert.pem")),
+        ),
+        ("doh_tls_key", serde_json::json!(dir.path().join("key.pem"))),
+        ("geosite_data_paths", serde_json::json!([geosite])),
+    ] {
+        settings.insert(setting.to_owned(), value);
+    }
+    let (_kernel, _, control) = start(dir.path(), &config);
+    let (status, active) = get(&control, "/v1/config/active");
+    assert_eq!(status, 200, "{active}");
+    let doh_error = active["doh_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{active}"));
+    assert!(doh_error.contains("cert"), "{doh_error}");
+    assert_eq!(
+        active["data_warnings"],
+        serde_json::json!([
+            format!("GeoSite data file {} does not exist", geosite.display()),
+            "GeoSite tags cn are in no data file: geo_site never matches them and geo_site_not always does",
+        ]),
+        "{active}"
+    );
+    assert_eq!(
+        active["problems"],
+        serde_json::json!([
+            "pipelines[0].rules[1].matchers[0]: geo_site_not \"\" matches every name"
+        ]),
+        "{active}"
+    );
+}
