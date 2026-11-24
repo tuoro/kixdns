@@ -36,15 +36,7 @@ pub enum ForwardResult {
     Success(Bytes),
     /// Request needs to continue (e.g. Action::Continue)
     /// Boxed to reduce enum size (ResponseContext is ~256 bytes)
-    /// `answer_ttl`：回答检查看的那份上游应答在缓存里能留多久，此后据它给出的静态应答都不超过这么久（见
-    /// `Route::answer_ttl`）；miss 动作在上游失败以后做的 continue 手里没有应答，是 0
-    /// `answer_ttl`: how long the upstream answer the answer check read may stay in the cache,
-    /// which no static answer given by it from here on outlasts (see `Route::answer_ttl`); 0 for
-    /// a continue the miss actions made after an upstream failure, with no answer in hand
-    Continue {
-        ctx: Box<Option<ResponseContext>>,
-        answer_ttl: u32,
-    },
+    Continue { ctx: Box<Option<ResponseContext>> },
     /// 响应动作跳到 `pipeline`：请求在那里接着走规则，转发照原样发出这次转发发出的 `packet`，它带的 ECS 是 `carried`；应答
     /// 照旧缓存在跳转前这个 pipeline 的键下（见 `Route::jumped`、`Route::key_pipeline`）。这次转发登记的条目留给请求（见
     /// `Route::held_inflight`），等它拿到最终的应答再交出去
@@ -52,12 +44,11 @@ pub enum ForwardResult {
     /// forwards sending `packet`, what this forward sent, as it is, with `carried` as its ECS;
     /// answers are still cached under the key of this pipeline, the one jumped from (see
     /// `Route::jumped`, `Route::key_pipeline`). The entry this forward registered stays with the request (see
-    /// `Route::held_inflight`) and is handed the final answer. `answer_ttl` as on Continue
+    /// `Route::held_inflight`) and is handed the final answer
     Jump {
         pipeline: Arc<str>,
         packet: Bytes,
         carried: ForwardEcs,
-        answer_ttl: u32,
     },
 }
 use hickory_proto::serialize::binary::BinDecodable;
@@ -338,17 +329,17 @@ fn ttl_to_cache(engine: &Engine, own_ttl: u64, min_ttl: Duration) -> u32 {
     proto_utils::saturating_u64_to_u32(own_ttl.max(min_ttl.as_secs())).min(engine.ttl_cap())
 }
 
-/// 缓存留一份静态应答多久。它是规则据一份上游应答给出的，那份应答在缓存里能留 `answer_ttl` 秒（见 `ttl_to_cache`）：
-/// 过了这么久上游可能答得不一样了，规则也就可能给出别的，所以它留得不比那份应答久。它带的 TTL（`carried`，记录里最小的，
+/// 缓存留一份静态应答多久。它是规则据上游应答给出的，那些应答在缓存里最多都能留 `answer_ttl` 秒（见 `ttl_to_cache`、
+/// `Route::answer_ttl`）：过了这么久上游可能答得不一样了，规则也就可能给出别的，所以它留得不比那些应答久。它带的 TTL（`carried`，记录里最小的，
 /// 见 `least_ttl`）更短时按它带的；不带记录的（deny 的 REFUSED、static_response、问的类型没有记录时的 NODATA）没有自己的
 /// TTL，就留 `answer_ttl`。规则直接给出的、上游失败以后兜底给出的不据哪份应答，`answer_ttl` 是 0，不缓存。请求阶段和响应阶段
 /// 都照这一处算。min_ttl 只抬上游回答的 TTL，不抬规则写的：抬了缓存时间、记录却不抬，缓存里的记录 TTL 先走完，交出去的就是
 /// TTL 为 0 的记录。以前带记录的不看那份应答，写死的 300 秒比来源的 TTL 长时答错；不带记录的按 min_ttl，默认为 0 时不缓存，
 /// 防重绑定的 deny 每次都要再问上游
-/// How long the cache keeps a static answer. The rules gave it by an upstream answer that
-/// may stay in the cache for `answer_ttl` seconds (see `ttl_to_cache`): after that the
-/// upstream may answer otherwise and the rules give something else, so it stays no longer
-/// than that answer. The TTL it carries (`carried`, the least of its records', see
+/// How long the cache keeps a static answer. The rules gave it by upstream answers that may
+/// all stay in the cache for `answer_ttl` seconds (see `ttl_to_cache`, `Route::answer_ttl`):
+/// after that the upstream may answer otherwise and the rules give something else, so it
+/// stays no longer than those answers. The TTL it carries (`carried`, the least of its records', see
 /// `least_ttl`) goes when shorter; one without records (deny's REFUSED, static_response, the
 /// NODATA of a type with no records) has no TTL of its own and stays for `answer_ttl`. One
 /// the rules give outright, or as a fallback after an upstream failure, goes by no answer:
@@ -502,10 +493,10 @@ pub struct StaticDecisionContext<'a> {
     /// (see `Route::trail`)
     /// 应答适用于谁：请求在它之前经过的转发（见 `Route::trail`）
     pub reach: &'a EcsReach,
-    /// 它所依据的那份上游应答在缓存里能留多久（见 `Route::answer_ttl`、`static_ttl`）：取决于上游应答的缓存起来，下次
+    /// 它所依据的上游应答在缓存里最多能留多久（见 `Route::answer_ttl`、`static_ttl`）：取决于上游应答的缓存起来，下次
     /// 不必再问上游。别的都是 0、不缓存：规则直接给出的，规则下次照样直接给出（快速路径、规则缓存），不用问谁，从响应缓存拿
     /// 的话查询日志和规则计数就记不到这条规则，它的 log 动作也不执行；上游失败以后兜底给出的只是这一次请求的
-    /// How long the upstream answer it goes by may stay in the cache (see `Route::answer_ttl`,
+    /// How long the upstream answers it goes by may all stay in the cache (see `Route::answer_ttl`,
     /// `static_ttl`): one depending on an upstream's answer is cached so the upstream need not
     /// be asked next time. Anything else has 0 and is not cached: one the rules give outright
     /// they give again outright (the fast path, the rule cache) with nobody to ask, and taken
@@ -1173,13 +1164,14 @@ impl<'a> Forwarding<'a> {
     }
 
     /// 执行 `actions`：带着回答检查看过的上游应答 `ctx`，或者上游失败以后不带，那时给出的结果是兜底（刷新到不了那里，
-    /// 见 [`Self::settle`]）。据应答给出的静态应答、continue 或跳转以后给出的，都不比那份应答在缓存里留得久（见
-    /// `static_ttl`）；兜底的不据哪份应答，不缓存
+    /// 见 [`Self::settle`]）。据应答给出的静态应答、continue 或跳转以后给出的，都不比这一路上回答检查据过的哪份应答在缓存里
+    /// 留得久（见 `Route::answer_ttl`、`static_ttl`）；兜底的不据哪份应答，不缓存，此后给出的也都不缓存
     /// Run `actions`: with the upstream answer `ctx` the answer check read, or without one after
     /// an upstream failure, when what they give is a fallback (a refresh never gets there, see
     /// [`Self::settle`]). A static answer given by the answer, or after a continue or a jump on
-    /// it, stays in the cache no longer than that answer may (see `static_ttl`); a fallback goes
-    /// by no answer and is not cached
+    /// it, stays in the cache no longer than any answer the checks on the way went by may (see
+    /// `Route::answer_ttl`, `static_ttl`); a fallback goes by no answer and is not cached, nor is
+    /// anything given after it
     async fn act(
         mut self,
         actions: &'a [Action],
@@ -1189,9 +1181,9 @@ impl<'a> Forwarding<'a> {
     ) -> anyhow::Result<ForwardResult> {
         let request = self.request;
         let min_ttl = request.state.pipeline.min_ttl();
-        let answer_ttl = ctx.as_ref().map_or(0, |ctx| {
+        let answer_ttl = self.route.went_by(ctx.as_ref().map_or(0, |ctx| {
             ttl_to_cache(self.engine, extract_ttl(&ctx.msg), min_ttl)
-        });
+        }));
         let ctx = rules::ApplyResponseActionsContext {
             engine: self.engine,
             request,
@@ -1254,7 +1246,6 @@ impl<'a> Forwarding<'a> {
                     pipeline,
                     packet: Bytes::copy_from_slice(&self.packet),
                     carried: self.forward_ecs,
-                    answer_ttl,
                 })
             }
             ResponseActionResult::Continue { ctx } => {
@@ -1270,10 +1261,7 @@ impl<'a> Forwarding<'a> {
                 // 那一条的等待者自己转发。以前上游失败以后在这里 defuse 守卫，条目留在表里却
                 // 没人持有，下一条转发会一直等它到监听器超时。
                 self.keep_for_request();
-                Ok(ForwardResult::Continue {
-                    ctx: Box::new(ctx),
-                    answer_ttl,
-                })
+                Ok(ForwardResult::Continue { ctx: Box::new(ctx) })
             }
         }
     }
