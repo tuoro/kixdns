@@ -2410,7 +2410,7 @@ fn rule_problems(
     {
         report(problem);
     }
-    use crate::engine::response::txt_size_problem;
+    use crate::engine::response::txt_problem;
     use crate::matcher::static_cname_target;
     use crate::matcher::static_ips;
 
@@ -2488,9 +2488,9 @@ fn rule_problems(
                 report(format!("cname target \"{target}\" is not a domain name"));
             }
             Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text, .. } => {
-                // 按最长的名字算（见 `txt_size_problem`）/ Reckoned with the longest name (see
-                // `txt_size_problem`)
-                if let Some(problem) = txt_size_problem(text) {
+                // 按最长的名字算（见 `txt_problem`）/ Reckoned with the longest name (see
+                // `txt_problem`)
+                if let Some(problem) = txt_problem(text) {
                     report(problem);
                 }
             }

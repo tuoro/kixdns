@@ -187,14 +187,7 @@ impl Bootstrap {
             return Ok(vec![SocketAddr::new(ip, port)]);
         }
         let Some(through) = &self.through else {
-            let resolved = timeout(ASK_BUDGET, tokio::net::lookup_host((host, port)))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("resolve {host}: no answer in {}ms", ASK_BUDGET.as_millis())
-                })?;
-            return Ok(resolved
-                .with_context(|| format!("resolve {host}"))?
-                .collect());
+            return system_addresses(host, port).await;
         };
         Ok(through
             .lookup(host)
@@ -203,6 +196,19 @@ impl Bootstrap {
             .map(|&ip| SocketAddr::new(ip, port))
             .collect())
     }
+}
+
+/// 系统的解析器给的 `host` 在端口 `port` 上的地址，最多等 [`ASK_BUDGET`] / The addresses of `host`
+/// at port `port` from the system resolver, waited for [`ASK_BUDGET`] at most
+async fn system_addresses(host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+    let resolved = timeout(ASK_BUDGET, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("resolve {host}: no answer in {}ms", ASK_BUDGET.as_millis())
+        })?;
+    Ok(resolved
+        .with_context(|| format!("resolve {host}"))?
+        .collect())
 }
 
 impl Through {
@@ -379,16 +385,48 @@ impl Through {
     }
 }
 
-/// reqwest 用的解析器，主机名交给 [`Bootstrap`]，端口由 reqwest 按 URL 补上 / The resolver reqwest
-/// uses, host names going to [`Bootstrap`], the port filled in by reqwest from the URL
+/// reqwest 用的解析器，端口由 reqwest 按 URL 补上：上游的主机名交给 [`Bootstrap`]；代理的主机名（`proxies`）交给系统的
+/// 解析器，和别的程序读代理环境变量时一样。reqwest 经代理连上游时只在本机解析代理（上游的名字在 CONNECT 里由代理解析），
+/// 代理不是上游，bootstrap 的服务器未必认得它（局域网里的名字、hosts 文件里的）；NO_PROXY 里的上游 reqwest 直连，照常经
+/// [`Bootstrap`] 解析
+/// The resolver reqwest uses, the port filled in by reqwest from the URL: upstream host names go
+/// to [`Bootstrap`]; the proxies' host names (`proxies`) to the system resolver, as for any
+/// program reading the proxy environment variables. Connecting through a proxy, reqwest resolves
+/// only the proxy here (the upstream's name, in the CONNECT, the proxy resolves), and a proxy is
+/// no upstream, which the bootstrap servers may well not know (a LAN name, one from the hosts
+/// file); an upstream in NO_PROXY reqwest connects to directly, resolved through [`Bootstrap`] as
+/// usual
 #[derive(Clone)]
-pub(crate) struct Resolver(pub(crate) Arc<Bootstrap>);
+pub(crate) struct Resolver {
+    /// 上游的主机名怎样解析，直连的 DoH 也用它 / How upstream host names are resolved, by direct DoH too
+    pub(crate) bootstrap: Arc<Bootstrap>,
+    /// 代理环境变量里写的代理主机名（见 `doh_h2::proxy_hosts`）/ The proxies' host names the proxy
+    /// environment variables write (see `doh_h2::proxy_hosts`)
+    proxies: Arc<[Box<str>]>,
+}
+
+impl Resolver {
+    pub(crate) fn new(bootstrap: Arc<Bootstrap>, proxies: impl Into<Arc<[Box<str>]>>) -> Self {
+        Self {
+            bootstrap,
+            proxies: proxies.into(),
+        }
+    }
+}
 
 impl reqwest::dns::Resolve for Resolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let (bootstrap, host) = (Arc::clone(&self.0), name.as_str().to_owned());
+        let host = name.as_str().to_owned();
+        let proxy = self
+            .proxies
+            .iter()
+            .any(|proxy| proxy.eq_ignore_ascii_case(&host));
+        let bootstrap = Arc::clone(&self.bootstrap);
         Box::pin(async move {
-            let addresses = bootstrap.addresses(&host, 0).await?;
+            let addresses = match proxy {
+                true => system_addresses(&host, 0).await?,
+                false => bootstrap.addresses(&host, 0).await?,
+            };
             Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -430,6 +468,37 @@ mod tests {
         tokio::time::pause();
         tokio::time::advance(by).await;
         tokio::time::resume();
+    }
+
+    /// reqwest 经代理连上游时只在本机解析代理：代理的主机名交给系统的解析器，上游的照常问 bootstrap。`localhost`
+    /// 是代理（大小写不论），系统解析出环回地址，bootstrap 服务器一个查询也没收到；`upstream.test` 问了 bootstrap。
+    /// 以前代理的名字也问 bootstrap，它的服务器未必认得
+    /// Through a proxy reqwest resolves only the proxy here: the proxy's host name goes to the
+    /// system resolver, an upstream's to bootstrap as usual. `localhost` being the proxy (in any
+    /// case), the system gives loopback addresses and the bootstrap server gets no query;
+    /// `upstream.test` is asked of bootstrap. The proxy's name used to be asked of bootstrap too,
+    /// whose servers may well not know it
+    #[tokio::test]
+    async fn a_proxy_is_resolved_by_the_system_resolver() {
+        use reqwest::dns::Resolve;
+        let server = loopback_bootstrap(300).await;
+        let resolver = Resolver::new(through(&server.address), vec![Box::from("localhost")]);
+        let resolve = |name: &str| resolver.resolve(name.parse().expect("a host name"));
+        let proxy: Vec<SocketAddr> = resolve("LocalHost")
+            .await
+            .expect("the system resolves localhost")
+            .collect();
+        assert!(
+            !proxy.is_empty() && proxy.iter().all(|address| address.ip().is_loopback()),
+            "{proxy:?}"
+        );
+        assert_eq!(server.queries(), 0, "the proxy is not asked of bootstrap");
+        let upstream: Vec<SocketAddr> = resolve("upstream.test")
+            .await
+            .expect("bootstrap resolves the upstream")
+            .collect();
+        assert_eq!(upstream.len(), 2, "{upstream:?}");
+        assert_eq!(server.queries(), 2, "A and AAAA asked of bootstrap");
     }
 
     /// 问到的地址 IPv4 在前，TTL 没过就不再问。写成 IP 的不用问

@@ -254,7 +254,7 @@ impl DohClient {
         health_error_threshold: usize,
         bootstrap: Arc<Bootstrap>,
     ) -> anyhow::Result<Self> {
-        let resolver = Resolver(bootstrap);
+        let resolver = Resolver::new(bootstrap, doh_h2::proxy_hosts());
         Ok(Self {
             upstreams: DashMap::with_hasher(FxBuildHasher),
             pool_max_idle_per_host,
@@ -636,7 +636,7 @@ impl DohClient {
                     deadline,
                     state
                         .h2
-                        .sender(url, &self.tls_h2, &self.resolver.0, deadline),
+                        .sender(url, &self.tls_h2, &self.resolver.bootstrap, deadline),
                 )
                 .await
                 .unwrap_or_else(|_| {
