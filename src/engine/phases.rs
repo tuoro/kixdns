@@ -1014,11 +1014,7 @@ impl<'a> Forwarding<'a> {
     fn upstream_failed(&mut self, e: anyhow::Error, response: &mut ResponseInfo) -> ForwardResult {
         let (request, decision, route) = (self.request, self.decision, &*self.route);
         let withheld = UpstreamFailure::was_withheld(&e);
-        let cached = check_cache_after_failure(
-            self.engine,
-            &request.lookup(&route.key_pipeline, route.keys.slot),
-            response,
-        );
+        let cached = check_cache_after_failure(self.engine, &route.lookup(request), response);
         let answer = match cached {
             Some(cached) => {
                 if withheld {
