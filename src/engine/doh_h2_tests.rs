@@ -723,6 +723,83 @@ async fn an_idle_connection_is_not_reused() {
     assert_eq!(upstream.connections.load(Ordering::SeqCst), 2);
 }
 
+/// 每个查询第一次发都被上游复位（像服务器关掉空闲连接、GOAWAY 赶上请求时那样），重试才答上：答上了，连续错误数就清零，
+/// 查询再多也不重建连接池，一直用着第一条连接
+/// Every query has its first send reset by the upstream (as when a server closes an idle
+/// connection, or a GOAWAY crosses a request) and is answered by its retry: an answer clears the
+/// errors in a row, so however many such queries come the pool is never rebuilt and the first
+/// connection stays in use
+#[tokio::test]
+async fn a_query_answered_by_its_retry_clears_the_errors_in_a_row() {
+    let (acceptor, cert) = tls_acceptor(&[b"h2"]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = TlsUpstream {
+        addr: listener.local_addr().unwrap(),
+        cert,
+        connections: Arc::new(AtomicUsize::new(0)),
+        seen: Arc::default(),
+    };
+    let connections = Arc::clone(&upstream.connections);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            connections.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let tls = acceptor.accept(tcp).await.unwrap();
+                let mut conn = h2::server::handshake(tls).await.unwrap();
+                let mut asked = 0;
+                while let Some(accepted) = conn.accept().await {
+                    let (request, mut respond) = accepted.unwrap();
+                    asked += 1;
+                    if asked % 2 == 1 {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    } else {
+                        tokio::spawn(answer_after(request, respond, Duration::ZERO));
+                    }
+                }
+            });
+        }
+    });
+    let threshold = 3;
+    let client = upstream.client(threshold);
+    let url = upstream.url("");
+    for id in 0..2 * threshold as u16 {
+        assert_eq!(ask(&client, &url, id).await.unwrap()[..2], id.to_be_bytes());
+    }
+    assert_eq!(client.rebuilds(&url), 0, "never rebuilt");
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+}
+
+/// 等直连的连接也算在请求的时限里，握手比时限还慢时这次没连上：不重试，也不算进重建连接池的门槛，这时没有哪条建好的
+/// 连接坏了。连接照样建完，下一个请求用上
+/// The wait for the direct connection counts against the request's limit, and with the handshake
+/// slower than that the request has no connection: no retry, and nothing counted toward
+/// rebuilding the pool, no connection made being broken. The connection is made all the same,
+/// for the next request
+#[tokio::test]
+async fn a_handshake_slower_than_the_request_is_not_counted() {
+    let upstream = spawn_upstream(&[b"h2"], None, |q| dns_ok(echo(q))).await;
+    let client = upstream.client(1);
+    let (front, accepted) =
+        super::test_support::slow_front(upstream.addr, Duration::from_millis(300)).await;
+    let url = format!("https://{front}/dns-query");
+    let err = client
+        .send(&query(1), &url, Duration::from_millis(100))
+        .await
+        .expect_err("no connection in time");
+    assert!(
+        format!("{err:#}").contains("no connection to the doh upstream"),
+        "{err:#}"
+    );
+    assert_eq!(client.rebuilds(&url), 0, "not counted");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        ask(&client, &url, 2).await.unwrap()[..2],
+        2u16.to_be_bytes()
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "one connection made");
+}
+
 /// 连续出错到阈值重建时，直连的连接也一起丢掉，下一个请求重新连
 /// When repeated errors reach the threshold and rebuild, the direct connection goes too and the
 /// next request connects again

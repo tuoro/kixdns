@@ -2377,6 +2377,14 @@ impl DohClient {
             .is_some_and(|state| state.h2.is_connected())
     }
 
+    /// 测试里看 `upstream` 的连接池重建过几次 / In tests, how many times `upstream`'s pool has been rebuilt
+    #[cfg(test)]
+    pub(crate) fn rebuilds(&self, upstream: &str) -> u64 {
+        self.upstreams
+            .get(upstream)
+            .map_or(0, |state| state.generation.load(Ordering::Acquire))
+    }
+
     /// 测试里改短连接的空闲时限 / In tests, shorten how long a connection may sit idle
     #[cfg(test)]
     pub(crate) fn set_idle_timeout_for_tests(&mut self, idle: Duration) {
@@ -2563,24 +2571,18 @@ impl DohClient {
 
         let start = tokio::time::Instant::now();
         let generation = state.generation.load(Ordering::Acquire);
-        let result = match self
+        let mut result = self
             .send_once(&state, packet, url, uri, host, timeout_dur)
-            .await
+            .await;
+        if let Err(err) = &result
+            && is_transport_error(err)
         {
-            Ok(bytes) => {
-                state.consecutive_errors.store(0, Ordering::Release);
-                return Ok(restore_query_id(packet, bytes));
-            }
-            Err(err) if is_transport_error(&err) => {
-                // TRANSPARENT RETRY: DNS queries are semantically idempotent, so a
-                // single retry is safe. record_error() may rebuild the pool first;
-                // the retry then loads the fresh client (new connections).
-                // 透明重试：DNS 查询语义幂等，单次重试安全。
-                // record_error() 可能先重建连接池，重试时加载新客户端（新连接）。
-                let rebuilt = self.record_error(upstream, &state, generation);
-                let Some(remaining) = retry_budget(timeout_dur, start) else {
-                    return Err(err);
-                };
+            // 透明重试：DNS 查询语义幂等，单次重试安全。record_error() 可能先重建连接池，重试时就用新客户端（新连接）
+            // Transparent retry: DNS queries are semantically idempotent, so a single retry is
+            // safe. record_error() may rebuild the pool first, the retry then using the fresh
+            // client (new connections)
+            let rebuilt = self.record_error(upstream, &state, generation);
+            if let Some(remaining) = retry_budget(timeout_dur, start) {
                 debug!(
                     upstream = upstream,
                     error = %err,
@@ -2588,17 +2590,25 @@ impl DohClient {
                     retry_timeout_ms = remaining.as_millis() as u64,
                     "DoH transport error, performing transparent retry"
                 );
-                self.send_once(&state, packet, url, uri, host, remaining)
-                    .await
+                result = self
+                    .send_once(&state, packet, url, uri, host, remaining)
+                    .await;
             }
-            Err(e) => Err(e),
-        };
-        // 429，不管是第一次还是重试时回的：这个上游暂停一会儿
-        // A 429, whether to the first send or to the retry: the upstream pauses for a while
-        if let Err(err) = &result
-            && let Some(throttle) = throttle_of(err)
-        {
-            self.pause(upstream, &state, throttle);
+        }
+        match &result {
+            // 答上了，第一次就答上还是重试才答上都一样：连续错误数清零。服务器关掉空闲的连接、GOAWAY 赶上请求，都是第一次
+            // 失败、重试答上，这样的不该一次次攒到重建
+            // Answered, whether at once or by the retry: the errors in a row are cleared. A server
+            // closing an idle connection, or a GOAWAY crossing a request, fails the first send and
+            // has the retry answered, which must not add up to a rebuild
+            Ok(_) => state.consecutive_errors.store(0, Ordering::Release),
+            // 429，不管是第一次还是重试时回的：这个上游暂停一会儿
+            // A 429, whether to the first send or to the retry: the upstream pauses for a while
+            Err(err) => {
+                if let Some(throttle) = throttle_of(err) {
+                    self.pause(upstream, &state, throttle);
+                }
+            }
         }
         result.map(|bytes| restore_query_id(packet, bytes))
     }
@@ -2663,8 +2673,16 @@ impl DohClient {
         })
     }
 
-    /// Single attempt: send the request and read the body within a timeout.
-    /// 单次尝试：在超时内发送请求并读取响应体
+    /// 问一次，最多 `timeout_dur`：握手时选了 h2 的上游先等直连的连接，再在上面发请求、读回答；别的经 reqwest。等连接用掉的
+    /// 时间算在这一次里，等不到算没连上（见 [`DohNotConnected`]）：握手慢说明不了哪条建好的连接坏了。连上以后请求本身超时
+    /// 才是传输错误，可以重试（见 [`is_transport_error`]）；正文迟迟不来也算在这个时限里
+    /// Asks once, within `timeout_dur`: an upstream that picked h2 first waits for its direct
+    /// connection, then sends the request on it and reads the answer; any other goes through
+    /// reqwest. The wait for the connection counts against this one budget, and running out there
+    /// is no connection (see [`DohNotConnected`]): a slow handshake says nothing of a connection
+    /// made being broken. Once connected, the request itself timing out is a transport error,
+    /// open to a retry (see [`is_transport_error`]); a body slow to come counts against the same
+    /// limit
     async fn send_once(
         &self,
         state: &DohUpstream,
@@ -2674,24 +2692,33 @@ impl DohClient {
         host_override: Option<&str>,
         timeout_dur: Duration,
     ) -> anyhow::Result<Bytes> {
-        // Wrap entire operation (send + read body) in a single timeout to prevent
-        // hanging if the server sends headers but delays the body.
-        // 将整个操作（发送 + 读取响应体）包裹在单个超时中，
-        // 防止服务器发送头信息但延迟响应体时挂起。
-        let result = timeout(timeout_dur, async {
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let direct = match uri {
+            Some(uri) => {
+                let connected = tokio::time::timeout_at(
+                    deadline,
+                    state.h2.sender(url, &self.tls_h2, &self.resolver.0),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!(
+                        "doh connect timeout after {}ms",
+                        timeout_dur.as_millis()
+                    ))
+                })
+                .context(DohNotConnected)?;
+                connected.map(|sender| (uri, sender))
+            }
+            None => None,
+        };
+        let answered = tokio::time::timeout_at(deadline, async {
             // 握手时选了 h2 的上游直接经 h2 发，请求和 reqwest 经 HTTP/2 发的一样：同样的方法、地址和头。覆盖的 Host
             // 就是 :authority，不另带 Host 头（见 [`DohTarget::uri`]）。content-length 是 hyper 和 reqwest 自己补的，h2 不补
             // An upstream that picked h2 is asked straight through h2, with the request reqwest
             // would send over HTTP/2: the same method, address and headers. A Host override is the
             // :authority, with no Host header (see [`DohTarget::uri`]). hyper and reqwest add
             // content-length themselves, h2 does not
-            if let Some(uri) = uri
-                && let Some((sender, _in_flight)) = state
-                    .h2
-                    .sender(url, &self.tls_h2, &self.resolver.0)
-                    .await
-                    .context(DohNotConnected)?
-            {
+            if let Some((uri, (sender, _in_flight))) = direct {
                 let request = hyper::Request::post(uri.clone())
                     .header(ACCEPT, DOH_MEDIA_TYPE)
                     .header(CONTENT_TYPE, DOH_MEDIA_TYPE)
@@ -2704,10 +2731,8 @@ impl DohClient {
                 return doh_answer(packet, resp).await;
             }
 
-            // load_full() returns an owned Arc<Client>, keeping the Future Send across
-            // await points (an ArcSwap Guard would not). The Arc is cheap to hold.
-            // load_full() 返回 owned Arc<Client>，保持 Future 跨 await 点 Send
-            // （ArcSwap 的 Guard 不满足）。持有 Arc 很廉价。
+            // load_full() 给出自己拿着的 Arc<Client>，跨 await 也是 Send（ArcSwap 的 Guard 不是）
+            // load_full() gives an Arc<Client> of its own, Send across awaits (an ArcSwap Guard is not)
             let client = state.client.load_full();
             let mut req = client
                 .post(url.clone())
@@ -2721,27 +2746,24 @@ impl DohClient {
             doh_answer(packet, hyper::Response::from(resp)).await
         })
         .await;
-
-        // 超时算传输层错误，可以重试；内层的错误照原样交出：发送、IO、正文出错可以重试，
-        // DohAnswerError、DohNotConnected 不行（见 `is_transport_error`）
-        // A timeout is a transport error and can be retried; inner errors go out as they
-        // are: send, IO and body errors can be retried, a DohAnswerError or DohNotConnected
-        // cannot (see `is_transport_error`)
-        result.map_err(|_elapsed| anyhow::anyhow!("doh request timeout"))?
+        // 内层的错误照原样交出：发送、IO、正文出错可以重试，DohAnswerError、DohNotConnected 不行
+        // Inner errors go out as they are: send, IO and body errors can be retried, a
+        // DohAnswerError or DohNotConnected cannot
+        answered.map_err(|_elapsed| anyhow::anyhow!("doh request timeout"))?
     }
 
     /// 记下 `upstream` 一个传输错误，出错的请求是在第 `generation` 代开始的。连续错误数到了阈值就换一代：清掉直连的
     /// 连接，重建 reqwest 客户端（丢掉它的连接池），计数清零。换了代返回 true。同一批断掉的请求一起报错时只换一次：换代
-    /// 用比较交换，只有一个请求换得成；已经换过代以后，旧连接上迟到的错误不算。以前每数到阈值就重建一次，一百个在途
-    /// 请求一起超时就要重建三十来次，还把重试刚连上的新连接一次次拆掉
+    /// 用比较交换，只有一个请求换得成；已经换过代以后，旧连接上迟到的错误不算。一百个在途请求一起超时也只重建一次，
+    /// 不会把重试刚连上的新连接一次次拆掉
     /// Records a transport error of `upstream`, from a request started under generation
     /// `generation`. Once errors in a row reach the threshold the generation moves on: the direct
     /// connections are dropped, the reqwest client rebuilt (dropping its pool), and the count
     /// cleared; true when it moved on. Requests broken together, erring together, move it once:
     /// the move is a compare-and-swap only one of them wins, and once it has moved, errors
-    /// arriving late from the old connections do not count. Every count up to the threshold used
-    /// to rebuild, some thirty rebuilds for a hundred requests in flight timing out together,
-    /// each one tearing down the connection the retries had just made
+    /// arriving late from the old connections do not count. A hundred requests in flight timing
+    /// out together rebuild once, never tearing down again and again the connections the retries
+    /// have just made
     fn record_error(&self, upstream: &str, state: &DohUpstream, generation: u64) -> bool {
         if state.generation.load(Ordering::Acquire) != generation {
             return false;
@@ -2822,11 +2844,6 @@ fn restore_query_id(packet: &[u8], response: Bytes) -> Bytes {
     restored.freeze()
 }
 
-/// Read a DoH answer body, at most one DNS message long. A server sending without
-/// end used to have every byte kept until the request timed out, gigabytes for a
-/// single answer.
-/// 读 DoH 回答的正文，最多一条 DNS 消息那么长。以前一个不停往回发的服务器发多少就收多少，直到请求超时，
-/// 一个回答就能占掉几个 GB。
 /// 上游的 HTTP 应答里的 DNS 回答。直连 HTTP/2 和 reqwest 两种发法的应答都在这里检查：429 记下暂停多久，
 /// 别的错误状态、不是 DNS 消息的媒体类型、太长的正文、答的不是这个问题，都算用不了的回答
 /// The DNS answer in an upstream's HTTP response. Responses to both ways of sending, the direct
@@ -2882,6 +2899,9 @@ where
     Ok(body)
 }
 
+/// 读 DoH 回答的正文，最多一条 DNS 消息那么长：读到比这还长就不再往下读，算用不了的回答，不等服务器发完
+/// Reads a DoH answer body, one DNS message long at most: once it runs longer, reading stops and
+/// it is an unusable answer, without waiting for the server to finish sending
 async fn read_doh_body<B>(mut body: B) -> anyhow::Result<Bytes>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
@@ -2926,15 +2946,13 @@ where
 }
 
 /// 传输层错误：在建好的连接上收发时出的错，超时也算，连接死了多半就是这样；不是用不了的回答（见 [`DohAnswerError`]），也不是
-/// 没连上（见 [`DohNotConnected`]，reqwest 的建连错误也是）。只有它重发一次（DoH 查询语义幂等），算进重建连接池的门槛。
-/// 以前没连上也算：上游不通时每个请求都去重建一次连接池，可池里没有坏掉的连接可丢，reqwest 还要再连一次
+/// 没连上（见 [`DohNotConnected`]，reqwest 的建连错误也是）。只有它重发一次（DoH 查询语义幂等），算进重建连接池的门槛：
+/// 没连上时池里没有坏掉的连接可丢
 /// A transport-level error: one sending or receiving on a connection made, a timeout included,
 /// which is mostly how a dead connection shows; neither an unusable answer (see
 /// [`DohAnswerError`]) nor no connection (see [`DohNotConnected`], reqwest's connect errors too).
 /// Only such an error is sent again once (DoH queries are semantically idempotent) and counts
-/// toward rebuilding the pool. No connection used to count as well: with the upstream
-/// unreachable every request went to rebuild the pool, which held no broken connection to drop,
-/// and reqwest connected once more
+/// toward rebuilding the pool: with no connection, the pool holds no broken one to drop
 fn is_transport_error(err: &anyhow::Error) -> bool {
     err.downcast_ref::<DohAnswerError>().is_none()
         && err.downcast_ref::<DohNotConnected>().is_none()
