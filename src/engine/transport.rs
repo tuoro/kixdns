@@ -1237,31 +1237,33 @@ struct Pending {
     tx: oneshot::Sender<anyhow::Result<Bytes>>,
 }
 
-/// 一条连接上排着要写出去的帧。查询登记时把帧放进来，连接的写入任务被叫醒后先让一轮，再把这一轮里
-/// 排进来的帧一次写出去。查询自己不写：以前每个查询拿着连接锁各写一次，一个查询一次系统调用、DoT 还要
-/// 一个 TLS 记录；写到一半被取消（外层超时先到、多上游竞速输了被 abort）时，还会把半条帧留在连接上
-/// The frames queued for writing on one connection. A query puts its frame here when it
-/// registers; once woken, the connection's writer yields one round and then writes the frames
-/// queued during that round at once. Queries do not write themselves: each used to write under
-/// the connection lock, one system call per query and for DoT one TLS record, and a write
-/// cancelled part way (the outer timeout first, or the loser of a multi-upstream race aborted)
-/// left half a frame on the connection
+/// 一条连接上排着要写出去的帧，各带着它的查询改写过的 ID。查询登记时把帧放进来，连接的写入任务被叫醒后先让一轮，再把这一轮
+/// 里排进来、查询还在等的帧一次写出去（见 [`write_frames`]）。查询自己不写：一个查询一次系统调用、DoT 一个 TLS 记录太贵，
+/// 写到一半被取消（外层超时先到、多上游竞速输了被 abort）还会把半条帧留在连接上
+/// The frames queued for writing on one connection, each with its query's rewritten ID. A query
+/// puts its frame here when it registers; once woken, the connection's writer yields one round
+/// and then writes at once the frames queued during that round whose queries still wait (see
+/// [`write_frames`]). Queries do not write themselves: a system call per query, and for DoT a TLS
+/// record, cost too much, and a write cancelled part way (the outer timeout first, or the loser of
+/// a multi-upstream race aborted) would leave half a frame on the connection
 #[derive(Default)]
 struct WriteQueue {
-    frames: parking_lot::Mutex<BytesMut>,
+    queued: parking_lot::Mutex<Vec<(u16, Bytes)>>,
     wake: tokio::sync::Notify,
 }
 
 impl WriteQueue {
-    /// 排进一帧，叫醒写入任务 / Queues a frame and wakes the writer
-    fn push(&self, frame: &[u8]) {
-        self.frames.lock().extend_from_slice(frame);
+    /// 排进 ID 为 `id` 的查询的帧 `frame`，叫醒写入任务 / Queues `frame`, the frame of the query whose ID
+    /// is `id`, and wakes the writer
+    fn push(&self, id: u16, frame: Bytes) {
+        self.queued.lock().push((id, frame));
         self.wake.notify_one();
     }
 
-    /// 取走排着的全部帧，换进 `batch` 里那块空缓冲 / Takes every queued frame, leaving the empty buffer in `batch` in their place
-    fn take(&self, batch: &mut BytesMut) {
-        std::mem::swap(batch, &mut *self.frames.lock());
+    /// 取走排着的全部帧，换进 `taken` 里那个空的 / Takes every queued frame, leaving the empty one in
+    /// `taken` in their place
+    fn take(&self, taken: &mut Vec<(u16, Bytes)>) {
+        std::mem::swap(taken, &mut *self.queued.lock());
     }
 }
 
@@ -1283,23 +1285,36 @@ async fn yield_one_round() {
     .await;
 }
 
-/// 把 `queue` 里排着的帧写到 `writer`，直到写失败，给出那次失败 / Writes the frames queued on `queue`
-/// to `writer` until a write fails, giving that failure
+/// 把 `queue` 里排着的帧写到 `writer`，直到写失败，给出那次失败。`waited(ID, 帧)` 说这一帧的查询还等不等：已经放弃了的
+/// （时限到了、竞速输了）不写，上游不用白答，写不出去时排着的帧也不会越积越多地全写给它
+/// Writes the frames queued on `queue` to `writer` until a write fails, giving that failure.
+/// `waited(ID, frame)` says whether the frame's query still waits: one given up already (its
+/// deadline past, a race lost) is not written, so the upstream answers nothing for nobody, and a
+/// backlog built up while writes were stuck does not all go to it
 ///
 /// 叫醒以后先让一轮再取（见 [`yield_one_round`]）：tokio 让刚被叫醒的任务插到最前面先跑，不让的话，
 /// 第一个查询一叫醒写入任务，它就只写这一帧，一个查询写一次
 /// Once woken it yields one round before taking the frames (see [`yield_one_round`]): tokio runs
 /// a task it was just woken for first, so without the yield the first query to wake the writer
 /// would be written alone, one write per query
-async fn write_frames<W>(mut writer: W, queue: &WriteQueue) -> std::io::Error
+async fn write_frames<W>(
+    mut writer: W,
+    queue: &WriteQueue,
+    waited: impl Fn(u16, &Bytes) -> bool,
+) -> std::io::Error
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut batch = BytesMut::new();
+    let (mut taken, mut batch) = (Vec::new(), BytesMut::new());
     loop {
         queue.wake.notified().await;
         yield_one_round().await;
-        queue.take(&mut batch);
+        queue.take(&mut taken);
+        for (id, frame) in taken.drain(..) {
+            if waited(id, &frame) {
+                batch.extend_from_slice(&frame);
+            }
+        }
         if batch.is_empty() {
             continue;
         }
@@ -1607,7 +1622,14 @@ impl<T: StreamTransport> StreamMuxClient<T> {
         let wires = wires.clone();
         tokio::spawn(async move {
             let failed = async {
-                let mut writing = std::pin::pin!(write_frames(&mut writer, &queue));
+                // 帧的查询还登记着、还在等：同一个 ID 后来的查询的帧是另一份 / The frame's query is still
+                // registered and waiting: a later query on the same ID has a frame of its own
+                let waited = |id, frame: &Bytes| {
+                    wires.pending.get(&id).is_some_and(|pending| {
+                        pending.frame.as_ptr() == frame.as_ptr() && !pending.tx.is_closed()
+                    })
+                };
+                let mut writing = std::pin::pin!(write_frames(&mut writer, &queue, waited));
                 let why = tokio::select! {
                     () = cancel_token.cancelled() => return None,
                     err = &mut writing => return Some(err),
@@ -1831,7 +1853,7 @@ impl<T: StreamTransport> StreamMuxClient<T> {
                     frame: frame.clone(),
                     tx,
                 });
-                queue.push(&frame);
+                queue.push(cand, frame);
                 break cand;
             }
 
@@ -4015,17 +4037,26 @@ mod tests {
             .connect_for_tests()
             .await
             .expect("connect to the test peer");
-        // 排进比两头的缓冲加起来还多的字节，写入停在 await 上
-        // Queue more bytes than both ends' buffers hold, so the writer parks on an await
-        client
-            .wires
-            .slot
-            .lock()
-            .live
-            .as_ref()
-            .expect("connected")
-            .queue
-            .push(&vec![0u8; 32 << 20]);
+        // 排进比两头的缓冲加起来还多的字节，当作一个还在等的查询的帧，写入停在 await 上
+        // Queue more bytes than both ends' buffers hold, as the frame of a query still waiting, so
+        // the writer parks on an await
+        let blob = Bytes::from(vec![0u8; 32 << 20]);
+        let (tx, _waiting) = oneshot::channel();
+        let queue = {
+            let slot = client.wires.slot.lock();
+            let live = slot.live.as_ref().expect("connected");
+            client.wires.pending.insert(
+                0,
+                Pending {
+                    original_id: 0,
+                    generation: live.generation,
+                    frame: blob.clone(),
+                    tx,
+                },
+            );
+            Arc::clone(&live.queue)
+        };
+        queue.push(0, blob);
         let err = client
             .send(&udp_test_query("stuck.example"), Duration::from_millis(500))
             .await
@@ -4106,9 +4137,9 @@ mod tests {
             writes: Arc::clone(&writes),
         };
         let draining = Arc::clone(&queue);
-        tokio::spawn(async move { write_frames(writer, &draining).await });
+        tokio::spawn(async move { write_frames(writer, &draining, |_, _| true).await });
         // 先写一帧，写入任务写完转回去等着 / One frame first, after which the writer is back to waiting
-        queue.push(&[0, 1, 9]);
+        queue.push(9, Bytes::from_static(&[0, 1, 9]));
         server_io.read_exact(&mut [0u8; 3]).await.unwrap();
         let before = writes.load(Ordering::SeqCst);
         // 排完帧的任务接着等，和查询排完帧等回答一样 / The tasks keep waiting once their frames are
@@ -4119,7 +4150,7 @@ mod tests {
                 .map(|index| {
                     let queue = Arc::clone(&queuing);
                     tokio::spawn(async move {
-                        queue.push(&[0, 1, index]);
+                        queue.push(u16::from(index), Bytes::copy_from_slice(&[0, 1, index]));
                         std::future::pending::<()>().await
                     })
                 })
@@ -4134,6 +4165,47 @@ mod tests {
         assert!(
             (0..8u8).all(|index| written.chunks(3).any(|frame| frame == [0, 1, index])),
             "every frame is written whole: {written:?}"
+        );
+    }
+
+    /// 帧还没写出去，它的查询就放弃了（时限先到、竞速输了）：这一帧不写，上游不用白答；还在等的照写
+    /// A query giving up (its deadline first, a race lost) before its frame is written has the
+    /// frame left unwritten, so the upstream answers nothing for nobody; the frames still waited
+    /// for are written as ever
+    #[tokio::test]
+    async fn a_frame_whose_query_gave_up_is_not_written() {
+        let client = TcpMuxClient::new(Arc::from("127.0.0.1:9"));
+        let queue = Arc::new(WriteQueue::default());
+        client.wires.slot.lock().live = Some(planted(Arc::clone(&queue)));
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        TcpMuxClient::spawn_writer(
+            &client.wires,
+            ours,
+            queue,
+            Arc::new(Wear::new()),
+            CancellationToken::new(),
+            1,
+        );
+        // 两个查询在写入任务醒来之前登记好，第一个随即放弃 / Both queries register before the writer
+        // wakes, and the first gives up at once
+        let (gave_up, given_up) = oneshot::channel();
+        client
+            .register(&udp_test_query("given-up.example"), far_off(), gave_up)
+            .await
+            .expect("registered");
+        drop(given_up);
+        let (waits, _waiting) = oneshot::channel();
+        client
+            .register(&udp_test_query("waited.example"), far_off(), waits)
+            .await
+            .expect("registered");
+        let written = read_frame(&mut theirs).await.expect("a frame written");
+        assert_eq!(first_label(&written), "waited");
+        assert!(
+            timeout(Duration::from_millis(100), read_frame(&mut theirs))
+                .await
+                .is_err(),
+            "nothing more is written"
         );
     }
 
@@ -4181,7 +4253,8 @@ mod tests {
             written_at: Arc::clone(&written_at),
         };
         let draining = Arc::clone(&queue);
-        let writing = tokio::spawn(async move { write_frames(writer, &draining).await });
+        let writing =
+            tokio::spawn(async move { write_frames(writer, &draining, |_, _| true).await });
         // 一直有活的任务：每圈记一次数，让一轮再来 / A task that always has work: it counts each turn and yields a round
         let counting = Arc::clone(&turns);
         let busy = tokio::spawn(async move {
@@ -4195,7 +4268,7 @@ mod tests {
             let (queuing, counted) = (Arc::clone(&queue), Arc::clone(&turns));
             let pushed_at = tokio::spawn(async move {
                 let at = counted.load(Ordering::SeqCst);
-                queuing.push(&[0, 1, 2]);
+                queuing.push(2, Bytes::from_static(&[0, 1, 2]));
                 at
             })
             .await
