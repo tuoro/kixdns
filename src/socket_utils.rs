@@ -920,10 +920,6 @@ pub mod udp_batch {
             unsafe { local_in(&hdr) }
         }
 
-        pub fn len(&self) -> usize {
-            self.count
-        }
-
         pub fn is_empty(&self) -> bool {
             self.count == 0
         }
@@ -946,8 +942,8 @@ pub mod udp_batch {
     }
 
     impl Replies {
-        /// 下一个回答写进这里；一批最多 `BATCH` 个（见 `is_full`）
-        /// The next reply is written here; a batch holds at most `BATCH` (see `is_full`)
+        /// 下一个回答写进这里；一批最多 `BATCH` 个
+        /// The next reply is written here; a batch holds at most `BATCH`
         pub fn next_buf(&mut self) -> &mut BytesMut {
             &mut self.bufs[self.peers.len()]
         }
@@ -968,11 +964,6 @@ pub mod udp_batch {
 
         pub fn is_empty(&self) -> bool {
             self.peers.is_empty()
-        }
-
-        /// 一批已经放满 / The batch holds as many as it can
-        pub fn is_full(&self) -> bool {
-            self.peers.len() == BATCH
         }
 
         pub fn clear(&mut self) {

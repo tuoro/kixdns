@@ -127,7 +127,10 @@ fn hand_over_udp_reply(idx: usize, inflight: &UdpInflightMap, reply: &mut [u8], 
             "UDP response address mismatch, possible spoofing or routing anomaly"
         );
     } else if !crate::proto_utils::answers_query(query, reply) {
+        // 按上游分开算：这里 `src` 就是问的那个上游，键不会比上游多 / Counted per upstream: `src` is
+        // the upstream asked here, so there are no more keys than upstreams
         crate::warn_sparse!(
+            per src;
             socket_idx = idx,
             response_id = id,
             upstream = %src,

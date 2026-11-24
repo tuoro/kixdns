@@ -482,14 +482,14 @@ pub(crate) fn answers_query(query: &[u8], response: &[u8]) -> bool {
 
 /// 交给客户端的应答，按标准要求照抄查询的部分都照 `query` 写：问题名的写法（见
 /// [`question_as_asked`]）、RD 和 CD 位（见 [`header_as_asked`]）、带不带 OPT 和 DO 位（见
-/// [`edns_as_asked`]）。缓存里的、合并的在途查询拿到的应答都是别的客户端问的样子，KixDNS 自己
+/// [`edns_as_asked_with`]）。缓存里的、合并的在途查询拿到的应答都是别的客户端问的样子，KixDNS 自己
 /// 构造的回答（静态回答、SERVFAIL）也不一定照抄了这些。什么都不用改时不复制；TSIG 签过的应答
 /// 原样返回：它不进缓存，也不交给等待者（见 `Engine::insert_dns_cache_entry`、
 /// `InflightCleanupGuard::hand_over`），所以只会是这个客户端自己那次转发拿到的。
 /// The reply for a client, with what the standards have copied from the query
 /// written as `query` has it: the question name's spelling (see
 /// [`question_as_asked`]), the RD and CD bits (see [`header_as_asked`]), and whether an
-/// OPT comes back and its DO bit (see [`edns_as_asked`]). An answer from the cache or
+/// OPT comes back and its DO bit (see [`edns_as_asked_with`]). An answer from the cache or
 /// handed to a merged inflight query is shaped as another client asked, and answers
 /// KixDNS builds itself (static answers, SERVFAIL) do not always copy these either.
 /// Nothing is copied when nothing changes, and a TSIG-signed reply is returned as it is:
@@ -600,14 +600,9 @@ pub(crate) fn reply_without_aa(reply: Bytes) -> Bytes {
     reply.freeze()
 }
 
-/// 应答的 EDNS 跟着查询走（RFC 6891）：查询带 OPT，应答就带（第 6.1.1 节），没有时在末尾补一条；
-/// 查询不带，应答就不带（第 7 节），有就去掉；DO 位照抄查询（RFC 3225 第 3 节）。应答的 OPT 带着
-/// 扩展 RCODE 时不去掉，去掉就改了 RCODE；读不出的报文、TSIG 签过的应答原样返回。
-/// The reply's EDNS following the query (RFC 6891): a query with an OPT gets one back
-/// (section 6.1.1), appended when the reply has none; a query without gets none
-/// (section 7), so one is taken out; the DO bit is the query's (RFC 3225 section 3).
-/// An OPT carrying an extended RCODE stays, since taking it out would change the
-/// RCODE; a message that cannot be read, or a reply signed with TSIG, is left as it is.
+/// [`edns_as_asked_with`]，应答的记录和查询的 DO 位自己找，TSIG 签过的应答原样返回 / [`edns_as_asked_with`]
+/// walking the reply's records and looking for the query's DO bit itself, a reply signed with TSIG
+/// left as it is
 #[cfg(test)]
 fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     let walk = walk_records(&reply);
@@ -617,10 +612,17 @@ fn edns_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     edns_as_asked_with(reply, asked_dnssec_ok(query), &walk)
 }
 
-/// [`edns_as_asked`]，应答的记录（`walk`，见 [`walk_records`]）和查询的 DO 位（[`asked_dnssec_ok`]）都已经
-/// 找过，TSIG 签过的应答调用方已经排除 / [`edns_as_asked`] with the reply's records (`walk`, see
-/// [`walk_records`]) walked and the query's DO bit (see [`asked_dnssec_ok`]) looked for already,
-/// the caller having left out a reply signed with TSIG
+/// 应答的 EDNS 跟着查询走（RFC 6891）：查询带 OPT，应答就带（第 6.1.1 节），没有时在末尾补一条；
+/// 查询不带，应答就不带（第 7 节），有就去掉；DO 位照抄查询（RFC 3225 第 3 节）。应答的 OPT 带着
+/// 扩展 RCODE 时不去掉，去掉就改了 RCODE；读不出的报文原样返回。应答的记录（`walk`，见 [`walk_records`]）
+/// 和查询的 DO 位（见 [`asked_dnssec_ok`]）调用方已经找过，TSIG 签过的应答调用方已经排除。
+/// The reply's EDNS following the query (RFC 6891): a query with an OPT gets one back
+/// (section 6.1.1), appended when the reply has none; a query without gets none
+/// (section 7), so one is taken out; the DO bit is the query's (RFC 3225 section 3).
+/// An OPT carrying an extended RCODE stays, since taking it out would change the
+/// RCODE; a message that cannot be read is left as it is. The caller has walked the
+/// reply's records (`walk`, see [`walk_records`]) and looked for the query's DO bit
+/// (see [`asked_dnssec_ok`]) already, and left out a reply signed with TSIG.
 fn edns_as_asked_with(
     reply: Bytes,
     asked_dnssec_ok: Result<Option<bool>, ()>,

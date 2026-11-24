@@ -1,25 +1,26 @@
-//! 回答检查以后缓存的应答不比这一路上回答检查据过的上游应答在缓存里留得久（见 `Route::answer_ttl`）：回答检查的动作给出的，
-//! 或者回答检查在上游的应答上 continue、跳转以后给出的，静态应答和转发拿到的应答都一样。静态应答按它带的 TTL 缓存，即记录里
-//! 最小的；不带记录的没有自己的 TTL，就按那些应答里最短的。规则直接给出的不进响应缓存，规则下次照样直接给出；上游失败以后兜底
-//! 给出的静态应答也不进，那只是那一次请求的，改问备用上游拿到的回答照常缓存；回答检查看到的失败应答也算上游失败。按「谁在问」
-//! 给的静态应答照样缓存，槽位按规则对请求方的判定分开。
-//! An answer cached after an answer check stays no longer than the upstream answers the
-//! checks on the way went by may stay in the cache (see `Route::answer_ttl`): given by an
-//! answer check's actions, or after an answer check continued or jumped on an upstream's
-//! answer, static answers and answers fetched by forwards alike. A static answer is cached for
-//! the TTL it carries, the least of its records'; one without records has no TTL of its own
-//! and goes by the least of those answers. One the rules give outright stays out of the
-//! response cache, the rules giving it again outright; so does a static answer given as a
-//! fallback after an upstream failure, which is for that one request, while a backup
-//! upstream's answer is cached as usual; a failure reply an answer check sees counts as an
-//! upstream failure too. A static answer given by who is asking is cached all the same, its
-//! slot kept apart by how the rules judge the requester.
+//! 回答检查以后缓存的应答不比这一路上回答检查据过的上游应答的 TTL（收进 min_ttl 到 cache_max_ttl 之间）留得久，交出去的
+//! 记录也不比它长（见 `Route::answer_ttl`）：回答检查的动作给出的，或者回答检查在上游的应答上 continue、跳转以后给出的，
+//! 静态应答和转发拿到的应答都一样。静态应答按它带的 TTL 缓存，即记录里最小的；不带记录的没有自己的 TTL，就按那些应答里最短
+//! 的。规则直接给出的不进响应缓存，规则下次照样直接给出；上游失败以后兜底给出的静态应答也不进，那只是那一次请求的，改问备用
+//! 上游拿到的回答照常缓存；回答检查看到的失败应答也算上游失败。按「谁在问」给的静态应答照样缓存，槽位按规则对请求方的判定分开。
+//! An answer cached after an answer check stays no longer, and carries no record longer, than
+//! the TTLs of the upstream answers the checks on the way went by, brought into min_ttl to
+//! cache_max_ttl (see `Route::answer_ttl`): given by an answer check's actions, or after an
+//! answer check continued or jumped on an upstream's answer, static answers and answers
+//! fetched by forwards alike. A static answer is cached for the TTL it carries, the least of
+//! its records'; one without records has no TTL of its own and goes by the least of those
+//! answers. One the rules give outright stays out of the response cache, the rules giving it
+//! again outright; so does a static answer given as a fallback after an upstream failure,
+//! which is for that one request, while a backup upstream's answer is cached as usual; a
+//! failure reply an answer check sees counts as an upstream failure too. A static answer given
+//! by who is asking is cached all the same, its slot kept apart by how the rules judge the
+//! requester.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::SOA;
+use hickory_proto::rr::rdata::{A, CNAME, SOA};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use serde_json::{Value, json};
@@ -294,17 +295,20 @@ async fn an_answer_forwarded_after_a_check_is_cached_no_longer_than_the_checked_
     }
 }
 
-/// 回答检查以后交出去的应答，记录 TTL 也不比回答检查据的那份上游回答在缓存里留得久：客户端、同时等着它的请求拿到的，和缓存里
+/// 回答检查以后交出去的应答，每条记录的 TTL 都不比回答检查据的那份上游回答的 TTL 长（记录里最短的那个比它短时也一样，见
+/// `every_record_after_a_check_goes_out_no_longer_than_the_checked_answer`）：客户端、同时等着它的请求拿到的，和缓存里
 /// 存的、之后命中缓存交出的是同一份，客户端留它的时间和缓存一样长。回答检查的动作转发的、continue 以后的规则转发的、跳去的
 /// pipeline 转发的、规则给的静态应答都一样。以前只封了条目的 TTL，记录照原样交出：据 60 秒的回答转发拿到 3600 秒的，客户端
 /// 和等待者拿 3600，命中缓存交出 3599，条目却 60 秒就过期
-/// An answer going out after an answer check carries no record TTL longer than the upstream
-/// answer the check went by may stay in the cache: the client and the requests waiting on it
-/// get the copy the cache keeps and later serves, the client keeping it as long as the cache
-/// does. Forwarded by the check's actions, by a rule after its continue or by the pipeline it
-/// jumps to, or a static answer of the rules, alike. Only the entry's TTL used to be bounded
-/// and the records went out as they were: forwarding to an answer of 3600 seconds on one of
-/// 60, the client and the waiters got 3600 and a cache hit 3599, while the entry expired at 60
+/// An answer going out after an answer check carries no record TTL longer than the TTL of the
+/// upstream answer the check went by (nor when the least of its records is shorter, see
+/// `every_record_after_a_check_goes_out_no_longer_than_the_checked_answer`): the client and
+/// the requests waiting on it get the copy the cache keeps and later serves, the client keeping
+/// it as long as the cache does. Forwarded by the check's actions, by a rule after its continue
+/// or by the pipeline it jumps to, or a static answer of the rules, alike. Only the entry's TTL
+/// used to be bounded and the records went out as they were: forwarding to an answer of 3600
+/// seconds on one of 60, the client and the waiters got 3600 and a cache hit 3599, while the
+/// entry expired at 60
 #[tokio::test]
 async fn an_answer_after_a_check_goes_out_with_ttls_no_longer_than_the_checked_answer() {
     // 回答晚一点到，同时问的第二个请求等在第一个登记的条目上 / The answer comes a little late, so the
@@ -376,44 +380,125 @@ async fn an_answer_after_a_check_goes_out_with_ttls_no_longer_than_the_checked_a
     }
 }
 
-/// 回答检查据的是否定应答时，此后的应答照那份应答在缓存里能留多久封顶：它的负缓存 TTL 出自 SOA 的 minimum（在 RDATA 里，
-/// 上游把关时不改写）比 min_ttl 短，min_ttl 照样抬它，那份否定应答自己就在缓存里留 min_ttl 这么久，据它做的决定也一样，此后
-/// 交出去的记录不封到 min_ttl 以下（每条记录都收进 min_ttl 到 cache_max_ttl 之间）
-/// After an answer check on a negative answer, what answers next is bounded by how long that
-/// answer may stay in the cache: its negative TTL comes from the SOA's minimum (in the RDATA,
-/// which the upstream guards leave as it is) and is shorter than min_ttl, which raises it all
-/// the same, so the negative answer itself stays in the cache for min_ttl and so does a
-/// decision taken on it, the records going out after it not being brought below min_ttl (every
-/// record being brought into min_ttl to cache_max_ttl)
+/// 回答检查据的是否定应答时，此后的应答照那份应答的 TTL 封顶，那个 TTL 和每条记录的一样收进 min_ttl 到 cache_max_ttl
+/// 之间：负缓存 TTL 出自 SOA 的 minimum（在 RDATA 里，上游把关时不改写）比 min_ttl 短，min_ttl 照样抬它，那份否定应答
+/// 自己就在缓存里留 min_ttl 这么久，据它做的决定也一样；没有 SOA 的否定应答没有可依据的 TTL，自己不进缓存（RFC 2308 第
+/// 4 节），据它做的决定也照 min_ttl 算。此后交出去的记录都不封到 min_ttl 以下。min_ttl 为 0 时没有 SOA 的那份 TTL 就是
+/// 0，此后的应答不缓存，记录交出去也是 0。以前没有 SOA 的一律按 0 算，开着 min_ttl 也把后面的记录压到 0、不缓存
+/// After an answer check on a negative answer, what answers next is bounded by that answer's
+/// TTL, brought into min_ttl to cache_max_ttl as every record's is: its negative TTL comes
+/// from the SOA's minimum (in the RDATA, which the upstream guards leave as it is) and is
+/// shorter than min_ttl, which raises it all the same, so the negative answer itself stays in
+/// the cache for min_ttl and so does a decision taken on it; a negative answer without SOA has
+/// no TTL to go by and stays out of the cache itself (RFC 2308 section 4), a decision taken on
+/// it going by min_ttl all the same. No record going out after it is brought below min_ttl.
+/// With min_ttl 0 the one without SOA has a TTL of 0, nothing after it is cached and its
+/// records go out with 0. One without SOA used to count as 0 whatever min_ttl, the records
+/// after it brought down to 0 and left uncached with min_ttl on
 #[tokio::test]
-async fn an_answer_after_a_check_on_a_short_negative_answer_keeps_min_ttl() {
-    let negative = upstream(|query| {
-        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
-        reply.metadata.recursion_desired = query.metadata.recursion_desired;
-        reply.metadata.response_code = ResponseCode::NXDomain;
-        reply.add_queries(query.queries.iter().cloned());
-        let zone = Name::from_ascii("test.").unwrap();
-        reply.add_authority(Record::from_rdata(
-            zone.clone(),
-            300,
-            RData::SOA(SOA::new(zone.clone(), zone, 1, 3600, 900, 1_209_600, 5)),
-        ));
-        vec![(Duration::ZERO, reply.to_vec().unwrap())]
-    })
-    .await
-    .address;
+async fn an_answer_after_a_check_on_a_negative_answer_keeps_min_ttl() {
     let then = answering_upstream(FORWARDED, 3600).await.address;
-    let engine = engine_with(
-        &json!({ "min_ttl": 60 }),
-        json!([{ "id": "main", "rules": [
-            checked(&negative, json!([{ "type": "continue" }])),
-            rule("forward", any(), json!([{ "type": "forward", "upstream": then }])),
-        ]}]),
-    );
-    let reply = ask(&engine, &query(), peer()).await;
-    assert_eq!(first_a(&reply), Some(FORWARDED));
-    assert_eq!(record_ttls(&reply), [60]);
-    assert_eq!(cached_ttls(&engine), [60]);
+    for (soa, min_ttl, carried) in [(true, 60, 60), (false, 60, 60), (false, 0, 0)] {
+        let negative = upstream(move |query| {
+            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            reply.metadata.recursion_desired = query.metadata.recursion_desired;
+            reply.metadata.response_code = ResponseCode::NXDomain;
+            reply.add_queries(query.queries.iter().cloned());
+            if soa {
+                let zone = Name::from_ascii("test.").unwrap();
+                reply.add_authority(Record::from_rdata(
+                    zone.clone(),
+                    300,
+                    RData::SOA(SOA::new(zone.clone(), zone, 1, 3600, 900, 1_209_600, 5)),
+                ));
+            }
+            vec![(Duration::ZERO, reply.to_vec().unwrap())]
+        })
+        .await
+        .address;
+        let engine = engine_with(
+            &json!({ "min_ttl": min_ttl }),
+            json!([{ "id": "main", "rules": [
+                checked(&negative, json!([{ "type": "continue" }])),
+                rule("forward", any(), json!([{ "type": "forward", "upstream": then }])),
+            ]}]),
+        );
+        let reply = ask(&engine, &query(), peer()).await;
+        let case = format!("SOA {soa}, min_ttl {min_ttl}");
+        assert_eq!(first_a(&reply), Some(FORWARDED), "{case}");
+        assert_eq!(record_ttls(&reply), [carried], "{case}");
+        assert_eq!(
+            cached_ttls(&engine),
+            Vec::from_iter((carried > 0).then_some(carried)),
+            "{case}"
+        );
+    }
+}
+
+/// 回答检查以后交出去的每条记录都封到回答检查据的那份回答的 TTL，不论这份应答记录里最短的那个比它短还是长：短 A 记录旁边
+/// 的长 CNAME、没有 SOA 的否定应答（不进缓存）带的别名都一样，缓存里存的、命中缓存交出的也是封过的。以前只在记录里最短的
+/// 那个比它长时才封：300 秒的回答检查之后拿到 3600 秒的 CNAME 和 60 秒的 A，客户端照原样拿 [3600, 60]，按记录集缓存的
+/// 下游留着这条 CNAME 3600 秒
+/// Every record going out after an answer check is brought down to the TTL of the answer the
+/// check went by, whether the least of this answer's records is shorter than that or longer:
+/// a long CNAME next to a short A record and the aliases of a negative answer without SOA
+/// (which stays out of the cache) alike, as are what the cache keeps and serves on a hit. They
+/// used to be brought down only when the least of the records was longer: after a check on an
+/// answer of 300 seconds, a CNAME of 3600 and an A of 60 went to the client as [3600, 60], a
+/// downstream caching by record set keeping the CNAME for 3600 seconds
+#[tokio::test]
+async fn every_record_after_a_check_goes_out_no_longer_than_the_checked_answer() {
+    let checked_at = answering_upstream(UPSTREAM_ANSWER, 300).await.address;
+    let cases = [
+        (ResponseCode::NoError, true, vec![300, 60]),
+        (ResponseCode::NXDomain, false, vec![300]),
+    ];
+    for (rcode, with_address, carried) in cases {
+        let then = upstream(move |query| {
+            let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            reply.metadata.recursion_desired = query.metadata.recursion_desired;
+            reply.metadata.response_code = rcode;
+            reply.add_queries(query.queries.iter().cloned());
+            let alias = Name::from_ascii("alias.test.").unwrap();
+            reply.add_answer(Record::from_rdata(
+                query.queries[0].name().clone(),
+                3600,
+                RData::CNAME(CNAME(alias.clone())),
+            ));
+            if with_address {
+                reply.add_answer(Record::from_rdata(alias, 60, RData::A(A(FORWARDED))));
+            }
+            vec![(Duration::ZERO, reply.to_vec().unwrap())]
+        })
+        .await
+        .address;
+        let engine = engine_with(
+            &json!({}),
+            json!([{ "id": "main", "rules": [
+                checked(&checked_at, json!([{ "type": "continue" }])),
+                rule("forward", any(), json!([{ "type": "forward", "upstream": then }])),
+            ]}]),
+        );
+        let reply = ask(&engine, &query(), peer()).await;
+        assert_eq!(record_ttls(&reply), carried, "{rcode}");
+        let cached = if with_address {
+            vec![carried.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(cached_record_ttls(&engine), cached, "{rcode}");
+        if with_address {
+            let hit = ask(&engine, &query(), peer()).await;
+            assert!(
+                record_ttls(&hit)
+                    .iter()
+                    .zip(&carried)
+                    .all(|(hit, at_most)| hit <= at_most),
+                "{:?} from the cache",
+                record_ttls(&hit)
+            );
+        }
+    }
 }
 
 /// 上游失败以后改问备用上游拿到的回答照常缓存：miss 动作转发的、miss 动作 continue 以后的规则转发的都一样，故障期间的请求
