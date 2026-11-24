@@ -247,16 +247,19 @@ pub struct Pipeline {
 }
 
 /// 一次转发问的上游，读配置时就备好：写出来的那串（流控、日志和应答的来源按它认，写回配置也是它，一字不改），和照它
-/// 拆好的各个（见 [`split_upstreams`]），转发时不再拆，也不为它分配内存
+/// 拆好的各个（见 [`split_upstreams`]），转发时不再拆，也不为它分配内存。两样只由 [`ForwardTarget::new`] 一起备好，
+/// 拆好的总是那串拆出来的
 /// The upstreams a forward asks, made ready as the configuration is read: the list as written
 /// (by which flow control, the logs and an answer's source know it, and what is written back
 /// into the configuration, unchanged), and each upstream split from it (see
-/// [`split_upstreams`]), so that a forward neither splits nor allocates for it
+/// [`split_upstreams`]), so that a forward neither splits nor allocates for it. Only
+/// [`ForwardTarget::new`] makes the two, together, so what is split is always what that list
+/// splits into
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(from = "String", into = "String")]
 pub struct ForwardTarget {
-    pub upstream: Arc<str>,
-    pub pre_split_upstreams: Arc<Vec<Arc<str>>>,
+    upstream: Arc<str>,
+    upstreams: Arc<[Arc<str>]>,
 }
 
 impl ForwardTarget {
@@ -264,13 +267,23 @@ impl ForwardTarget {
     pub(crate) fn new(upstream: &str) -> Self {
         Self {
             upstream: Arc::from(upstream),
-            pre_split_upstreams: Arc::new(split_upstreams(upstream).map(Arc::from).collect()),
+            upstreams: split_upstreams(upstream).map(Arc::from).collect(),
         }
+    }
+
+    /// 写出来的那串 / The list as written
+    pub(crate) fn upstream(&self) -> &Arc<str> {
+        &self.upstream
+    }
+
+    /// 照那串拆好的各个上游 / Each upstream split from that list
+    pub(crate) fn upstreams(&self) -> &[Arc<str>] {
+        &self.upstreams
     }
 
     /// 拆得出至少一个地址 / Splits into at least one address
     pub(crate) fn names_an_address(&self) -> bool {
-        !self.pre_split_upstreams.is_empty()
+        !self.upstreams.is_empty()
     }
 }
 
@@ -734,7 +747,7 @@ impl Rule {
             } = action
             {
                 let action_transport = transport.unwrap_or(Transport::Udp);
-                for addr in upstream.pre_split_upstreams.iter() {
+                for addr in upstream.upstreams() {
                     // 前缀照单个转发那样认，没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的
                     // 上游只记一份，合并后仍然双发
                     // The prefix is read as for a single forward, the action's transport taken
@@ -746,13 +759,9 @@ impl Rule {
             }
         }
 
-        let all_upstreams: Vec<Arc<str>> = Transport::ALL
+        let all_upstreams: Vec<&str> = Transport::ALL
             .iter()
-            .flat_map(|&transport| {
-                sets[transport as usize]
-                    .iter()
-                    .map(|s| Arc::from(s.as_str()))
-            })
+            .flat_map(|&transport| sets[transport as usize].iter().map(String::as_str))
             .collect();
 
         if all_upstreams.is_empty() {
@@ -775,16 +784,8 @@ impl Rule {
                 total_upstreams = all_upstreams.len(),
                 "pre-computed merged forward actions with transport-specific deduplication"
             );
-            let merged_str: String = all_upstreams
-                .iter()
-                .map(|s| s.as_ref())
-                .collect::<Vec<_>>()
-                .join(",");
             self.merged_forward = Some(MergedForward {
-                target: ForwardTarget {
-                    upstream: Arc::from(merged_str.as_str()),
-                    pre_split_upstreams: Arc::new(all_upstreams),
-                },
+                target: ForwardTarget::new(&all_upstreams.join(",")),
                 // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
                 // at startup `problems` logs an error
                 ecs: self.shared_forward_ecs().ok().flatten().cloned(),
@@ -1080,8 +1081,11 @@ impl GlobalSettings {
     /// [`Action::Forward`]) when it writes some, `default_upstream` when it writes none or the
     /// forward is no action's (no rule deciding, an allow). The request phase's forwards and the
     /// answer phase's alike pick by it
-    pub(crate) fn forward_target(&self, written: Option<&ForwardTarget>) -> ForwardTarget {
-        written.unwrap_or(&self.default_upstream).clone()
+    pub(crate) fn forward_target<'a>(
+        &'a self,
+        written: Option<&'a ForwardTarget>,
+    ) -> &'a ForwardTarget {
+        written.unwrap_or(&self.default_upstream)
     }
 
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
@@ -1556,7 +1560,7 @@ pub fn problems(cfg: &PipelineConfig) -> Vec<String> {
     if !cfg.settings.default_upstream.names_an_address() {
         found.push(format!("settings.default_upstream: {NO_UPSTREAM}"));
     }
-    for upstream in cfg.settings.default_upstream.pre_split_upstreams.iter() {
+    for upstream in cfg.settings.default_upstream.upstreams() {
         if let Some(problem) = upstream_problem(upstream, Transport::Udp) {
             found.push(format!("settings.default_upstream: {problem}"));
         }
@@ -2496,7 +2500,7 @@ fn rule_problems(
                 if !upstreams.names_an_address() && !skipped_when_empty {
                     report(NO_UPSTREAM.to_string());
                 }
-                for upstream in upstreams.pre_split_upstreams.iter() {
+                for upstream in upstreams.upstreams() {
                     if let Some(problem) =
                         upstream_problem(upstream, transport.unwrap_or(Transport::Udp))
                     {
@@ -2653,7 +2657,7 @@ mod merged_forward_tests {
             .merged_forward
             .expect("several forwards merge")
             .target
-            .pre_split_upstreams
+            .upstreams()
             .iter()
             .map(|upstream| upstream.to_string())
             .collect();
@@ -2688,10 +2692,10 @@ mod merged_forward_tests {
             .merged_forward
             .as_ref()
             .expect("several forwards merge");
-        assert_eq!(merged.target.pre_split_upstreams.len(), 3);
+        assert_eq!(merged.target.upstreams().len(), 3);
         assert!(matches!(
             &rule.actions[0],
-            super::Action::Forward { upstream: Some(target), .. } if target.pre_split_upstreams.len() == 2
+            super::Action::Forward { upstream: Some(target), .. } if target.upstreams().len() == 2
         ));
     }
 
@@ -2803,11 +2807,11 @@ mod merged_forward_tests {
         let merged = rule.merged_forward.expect("several forwards merge");
         let list: Vec<String> = merged
             .target
-            .pre_split_upstreams
+            .upstreams()
             .iter()
             .map(|upstream| upstream.to_string())
             .collect();
-        assert_eq!(merged.target.upstream.as_ref(), list.join(","));
+        assert_eq!(merged.target.upstream().as_ref(), list.join(","));
         let mut groups: Vec<&str> = list
             .iter()
             .map(|upstream| upstream.split("://").next().unwrap())
@@ -4280,8 +4284,8 @@ mod validation_tests {
                 panic!("a forward with an upstream")
             };
             for target in [&read.settings.default_upstream, forward] {
-                assert_eq!(&*target.upstream, written);
-                let each: Vec<&str> = target.pre_split_upstreams.iter().map(|u| &**u).collect();
+                assert_eq!(&**target.upstream(), written);
+                let each: Vec<&str> = target.upstreams().iter().map(|u| &**u).collect();
                 assert_eq!(each, split, "{written:?}");
             }
             let back = serde_json::to_value(&read).expect("writes");
@@ -4319,7 +4323,8 @@ mod validation_tests {
         assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
         assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
         assert_eq!(
-            &*settings.default_upstream.upstream, "1.1.1.1:53",
+            &**settings.default_upstream.upstream(),
+            "1.1.1.1:53",
             "default_upstream"
         );
         assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");

@@ -350,22 +350,20 @@ impl Engine {
                             // written before has run, as with a single forward. The merged forward used to
                             // be given before any action ran, and the log of such a rule never did
                             let (target, transport, ecs) = match &rule.merged_forward {
-                                Some(merged) => {
-                                    (merged.target.clone(), Transport::Udp, merged.ecs.clone())
-                                }
+                                Some(merged) => (&merged.target, Transport::Udp, &merged.ecs),
                                 None => (
                                     state.pipeline.settings.forward_target(upstream.as_ref()),
                                     transport.unwrap_or(Transport::Udp),
-                                    ecs.clone(),
+                                    ecs,
                                 ),
                             };
                             return Some(Decision::Forward {
-                                target,
+                                target: target.clone(),
                                 response_phase: rule.response_phase.clone(),
                                 rule_name: rule.name.clone(),
                                 rule_index: Some(idx),
                                 transport,
-                                ecs,
+                                ecs: ecs.clone(),
                                 allow_reuse: false,
                             });
                         }
@@ -864,15 +862,15 @@ mod rule_cache_policy_tests {
             }
         };
         let shared = |one: &(ForwardTarget, Arc<str>), other: &(ForwardTarget, Arc<str>)| {
-            Arc::ptr_eq(&one.0.upstream, &other.0.upstream)
-                && Arc::ptr_eq(&one.0.pre_split_upstreams, &other.0.pre_split_upstreams)
+            Arc::ptr_eq(one.0.upstream(), other.0.upstream())
+                && std::ptr::eq(one.0.upstreams(), other.0.upstreams())
         };
         let first = target_of("a.named.example");
-        assert_eq!(&*first.0.upstream, "127.0.0.1:10");
+        assert_eq!(&**first.0.upstream(), "127.0.0.1:10");
         assert!(shared(&first, &target_of("b.named.example")));
         let default = target_of("a.other.example");
         assert_eq!(
-            (&*default.0.upstream, &*default.1),
+            (&**default.0.upstream(), &*default.1),
             ("127.0.0.1:9", "default")
         );
         let again = target_of("b.other.example");

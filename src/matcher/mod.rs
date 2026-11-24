@@ -1851,7 +1851,7 @@ mod tests {
         let split_ahead = |actions: &[Action]| match &actions[0] {
             Action::Forward { upstream, .. } => upstream.as_ref().map(|target| {
                 target
-                    .pre_split_upstreams
+                    .upstreams()
                     .iter()
                     .map(|u| u.to_string())
                     .collect::<Vec<_>>()

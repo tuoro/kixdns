@@ -108,8 +108,8 @@ pub(crate) fn decision_detail(decision: &Decision) -> DecisionDetail<'_> {
         Decision::Forward {
             target, transport, ..
         } => DecisionDetail::Forward {
-            upstream: &target.upstream,
-            transport: reported_transport(&target.upstream, *transport),
+            upstream: target.upstream(),
+            transport: reported_transport(target.upstream(), *transport),
         },
         Decision::Jump { pipeline } => DecisionDetail::Jump { pipeline },
     }

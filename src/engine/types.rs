@@ -777,11 +777,7 @@ mod tests {
     #[test]
     fn namespace_is_stable_for_identical_configuration() {
         let first = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        let mut second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        // Derived data is deliberately excluded from the semantic fingerprint.
-        // Mutating it must not rotate a cache namespace.
-        second.settings.default_upstream.pre_split_upstreams =
-            std::sync::Arc::new(vec![std::sync::Arc::from("derived")]);
+        let second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
 
         assert_eq!(
             build_cache_namespaces(&first),

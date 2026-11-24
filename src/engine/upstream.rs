@@ -229,7 +229,7 @@ pub(crate) fn upstreams(
     std::iter::once((default, None))
         .chain(forwards)
         .flat_map(|(upstreams, transport)| {
-            upstreams.pre_split_upstreams.iter().map(move |upstream| {
+            upstreams.upstreams().iter().map(move |upstream| {
                 parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp))
             })
         })
@@ -415,7 +415,7 @@ pub async fn forward_upstream(
         (Some(client), Some(flow)) => {
             match engine
                 .permit_manager
-                .ask(flow, client, &target.upstream, timeout_dur)
+                .ask(flow, client, target.upstream(), timeout_dur)
             {
                 Some(asking) => Some(asking),
                 None => return Err(UpstreamFailure::withheld(Withheld::NotAsked)),
@@ -435,7 +435,7 @@ pub async fn forward_upstream(
     let mut forward = std::pin::pin!(forward_upstream_as_is(
         engine,
         &packet,
-        &target.pre_split_upstreams,
+        target.upstreams(),
         timeout_dur,
         transport,
         observed,
