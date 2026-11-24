@@ -1474,9 +1474,9 @@ impl Engine {
 
         let cfg = &request.state.pipeline;
         let response_jump_limit = cfg.settings.response_jump_limit as usize;
-        // 求值 `pipeline` 的规则，跳过 `skip` 里的（continue 越过的那些）
-        // Evaluate the rules of `pipeline`, skipping those in `skip` (the ones a continue passed)
-        let evaluate = |pipeline: &crate::matcher::RuntimePipeline, skip: Option<&[usize]>| {
+        // 从第 `resume_at` 条规则起求值 `pipeline`（见 `Route::resume_at`）
+        // Evaluate `pipeline` from its rule at `resume_at` on (see `Route::resume_at`)
+        let evaluate = |pipeline: &crate::matcher::RuntimePipeline, resume_at: usize| {
             self.apply_rules(
                 request.state,
                 pipeline,
@@ -1486,14 +1486,14 @@ impl Engine {
                     request.qtype,
                     request.qclass,
                     request.requester.edns,
-                    skip,
+                    resume_at,
                     background_refresh,
                 )
                 .with_observed(request.observed),
             )
         };
         let mut decision = match pipeline {
-            Some(p) => evaluate(p, None),
+            Some(p) => evaluate(p, route.resume_at),
             None => {
                 let decision = Decision::default_forward(&cfg.settings);
                 if let Some((observer, ctx)) = request.observed {
@@ -1555,7 +1555,7 @@ impl Engine {
                 {
                     return Ok(answer);
                 }
-                decision = evaluate(p, None);
+                decision = evaluate(p, route.resume_at);
             }
 
             match decision {
@@ -1600,14 +1600,17 @@ impl Engine {
                     match forwarded {
                         Ok(phases::ForwardResult::Success(bytes)) => return Ok(bytes),
                         Ok(phases::ForwardResult::Continue { ctx }) => {
-                            route.continued(*ctx, rule_index);
-                            // 只有规则的回答检查会 continue，所以请求在配置里的某个 pipeline 里
-                            // Only a rule's answer check continues, so the request is in a
-                            // pipeline of the configuration
+                            // 只有规则的回答检查会 continue，所以作出决定的是配置里某个 pipeline 的一条规则
+                            // Only a rule's answer check continues, so a rule of a pipeline of
+                            // the configuration made the decision
+                            route.continued(
+                                *ctx,
+                                rule_index.expect("only a rule's answer check continues"),
+                            );
                             let pipeline = cfg
                                 .pipeline(&route.pipeline)
                                 .expect("a rule of the pipeline continued");
-                            decision = evaluate(pipeline, Some(&route.skip_rules));
+                            decision = evaluate(pipeline, route.resume_at);
                             continue 'decision_loop;
                         }
                         Ok(phases::ForwardResult::Jump {
@@ -1968,8 +1971,13 @@ pub(crate) struct Route {
     /// cached under the key of the pipeline jumped from (see `phases::ForwardResult::Jump`)
     pub(crate) key_pipeline: Arc<str>,
     pub(crate) keys: CacheKeys,
-    /// continue 越过的规则，下一轮求值跳过它们 / The rules a continue passed, which the next evaluation skips
-    skip_rules: crate::engine::pipeline::Continued,
+    /// 在当前 pipeline 里从第几条规则（从 0 起）接着求值：规则 continue 以后是它的下一条，它和它之前的规则都已经求值过、
+    /// 没有作出这个请求的决定，不再执行一遍（它们的 log 动作也不再记一次）；0 是从头求值，进了别的 pipeline 也从 0 起
+    /// The place (from 0) of the rule in the current pipeline evaluation resumes at: after a
+    /// rule continued, the one after it, that rule and those before it having been evaluated
+    /// already without deciding the request, and run no second time (nor their log actions
+    /// logging again); 0 to evaluate from the start, as on entering another pipeline
+    resume_at: usize,
     /// 规则越过、留着给后面的 `allow` 复用的应答 / The answer a rule continued past, kept for a later `allow`
     pub(crate) reused_response: Option<ResponseContext>,
     /// 响应阶段跳转以后：转发照原样发出的包，不再按 `ecs` 改写，和它带的 ECS / After a response-phase
@@ -2049,7 +2057,7 @@ impl Route {
             pipeline: Arc::clone(pipeline_id),
             key_pipeline: Arc::clone(pipeline_id),
             keys,
-            skip_rules: crate::engine::pipeline::Continued::new(),
+            resume_at: 0,
             reused_response: None,
             jumped: None,
             jumps_left: request.state.pipeline.settings.response_jump_limit as usize,
@@ -2073,7 +2081,7 @@ impl Route {
         p: &crate::matcher::RuntimePipeline,
     ) -> bool {
         self.pipeline = p.id.clone();
-        self.skip_rules.clear();
+        self.resume_at = 0;
         // 留着复用的应答属于取到它的那个 pipeline：那边的转发、按那边的 ECS 拿到的。
         // 带过来交给这里的 allow，就会写进这个 pipeline 的键，之后直接进入这里的请求
         // 也会拿到它。
@@ -2105,12 +2113,12 @@ impl Route {
         true
     }
 
-    /// 规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，`rule` 下一轮不再求值
-    /// A rule continued past this answer: `reused` is kept for a later `allow`, and `rule` is
-    /// not evaluated again
-    fn continued(&mut self, reused: Option<ResponseContext>, rule: Option<usize>) {
+    /// 排第 `rule` 的规则越过了这个应答（continue）：`reused` 留给后面的 `allow`，求值从它的下一条接着走
+    /// The rule at `rule` continued past this answer: `reused` is kept for a later `allow`, and
+    /// evaluation resumes at the rule after it
+    fn continued(&mut self, reused: Option<ResponseContext>, rule: usize) {
         self.reused_response = reused;
-        self.skip_rules.extend(rule);
+        self.resume_at = rule + 1;
     }
 
     /// 回答检查据一份能在缓存里留 `ttl` 秒的上游应答做了决定：记进 `answer_ttl`，此后缓存的应答最多留这么久
@@ -4363,7 +4371,7 @@ mod tests {
                 hickory_proto::rr::RecordType::A,
                 hickory_proto::rr::DNSClass::IN,
                 false,
-                None,
+                0,
                 false, // background_refresh
             ),
         );
@@ -4411,7 +4419,7 @@ mod tests {
                 hickory_proto::rr::RecordType::A,
                 hickory_proto::rr::DNSClass::IN,
                 false,
-                None,
+                0,
                 false, // background_refresh
             ),
         );
@@ -4464,7 +4472,7 @@ mod tests {
                 hickory_proto::rr::RecordType::A,
                 hickory_proto::rr::DNSClass::IN,
                 false,
-                None,
+                0,
                 false, // background_refresh
             ),
         );
@@ -4498,7 +4506,7 @@ mod tests {
                 hickory_proto::rr::RecordType::A,
                 hickory_proto::rr::DNSClass::IN,
                 false,
-                None,
+                0,
                 false, // background_refresh
             ),
         );
@@ -6760,7 +6768,7 @@ mod tests {
                             RecordType::A,
                             DNSClass::IN,
                             false,
-                            None,
+                            0,
                             true,
                         ),
                     );
