@@ -4346,11 +4346,11 @@ mod tests {
         );
     }
 
-    /// 指标的 rcode 标签和配置、查询日志里的写法一样：NOERROR、NXDOMAIN 这样的助记名，扩展 RCODE 16 是 BADVERS，
-    /// 没有名字的写成 RCODE 加数字。以前用 hickory 的 Debug，写成 `NoError`，16 成了 BADSIG
+    /// 指标的 rcode 标签和配置、查询日志里的写法一样：NOERROR、NXDOMAIN 这样的助记名，扩展 RCODE 16 是 BADVERS、
+    /// 23 是 BADCOOKIE，没有名字的写成 RCODE 加数字。以前用 hickory 的 Debug，写成 `NoError`，16 成了 BADSIG
     /// The metrics' rcode labels are spelt as in the config and the query log: mnemonics such as
-    /// NOERROR and NXDOMAIN, the extended RCODE 16 being BADVERS, and one without a name RCODE and
-    /// its number. hickory's Debug used to write them, as `NoError`, and 16 as BADSIG
+    /// NOERROR and NXDOMAIN, the extended RCODE 16 being BADVERS and 23 BADCOOKIE, and one without a
+    /// name RCODE and its number. hickory's Debug used to write them, as `NoError`, and 16 as BADSIG
     #[test]
     fn rcode_labels_are_spelt_as_in_the_config() {
         use crate::config::Transport;
@@ -4362,6 +4362,7 @@ mod tests {
             ResponseCode::NoError,
             ResponseCode::ServFail,
             ResponseCode::from(1, 0),
+            ResponseCode::from(1, 7),
             ResponseCode::from(0xFF, 0xF),
         ] {
             metrics.upstream_result(
@@ -4381,7 +4382,7 @@ mod tests {
         labels.sort_unstable();
         assert_eq!(
             labels,
-            ["BADVERS", "NOERROR", "RCODE4095", "SERVFAIL"],
+            ["BADCOOKIE", "BADVERS", "NOERROR", "RCODE4095", "SERVFAIL"],
             "{output}"
         );
     }

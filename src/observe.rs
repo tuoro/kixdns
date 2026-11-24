@@ -683,12 +683,14 @@ pub struct TracingObserver;
 const TRACE_TARGET: &str = "kixdns::observe";
 
 /// 响应码的助记名，和配置里写的一样（NOERROR、NXDOMAIN……），RFC 6895 里到 NOTZONE 为止的每一个都有；头部加上 OPT
-/// 的 16 只会是 BADVERS（TSIG 的 BADSIG 写在 TSIG 记录里，头部是 NOTAUTH）；其余写成 `RCODE` 加数字。查询日志、响应
-/// 日志、指标和诊断都用它，不用 hickory 的 Debug（`NoError`）或 Display（`No Error`），那两种不是固定的写法
+/// 能写出的扩展码是 16 BADVERS 和 23 BADCOOKIE（RFC 7873）：17 到 22 和 BADSIG（也是 16）只写在 TSIG、TKEY 记录里，
+/// 头部是 NOTAUTH 之类；其余写成 `RCODE` 加数字。查询日志、响应日志、指标、诊断和观察者的日志都用它，不用 hickory 的
+/// Debug（`NoError`）或 Display（`No Error`），那两种不是固定的写法
 /// The mnemonic of a response code, as written in the config (NOERROR, NXDOMAIN, …), for each
-/// of RFC 6895's up to NOTZONE; 16 from the header and an OPT together can only be BADVERS
-/// (TSIG's BADSIG goes in the TSIG record, with NOTAUTH in the header); any other is `RCODE`
-/// and its number. The query log, the response log, the metrics and the diagnostics all use
+/// of RFC 6895's up to NOTZONE; the extended codes the header and an OPT together can carry are
+/// 16, BADVERS, and 23, BADCOOKIE (RFC 7873): 17 to 22 and BADSIG (16 too) go in TSIG and TKEY
+/// records alone, with NOTAUTH or the like in the header; any other is `RCODE` and its number.
+/// The query log, the response log, the metrics, the diagnostics and the observer's log all use
 /// it rather than hickory's Debug (`NoError`) or Display (`No Error`), neither a fixed spelling
 pub(crate) fn rcode_name(code: u16) -> Cow<'static, str> {
     const NAMES: [&str; 11] = [
@@ -697,20 +699,12 @@ pub(crate) fn rcode_name(code: u16) -> Cow<'static, str> {
     ];
     match code {
         16 => Cow::Borrowed("BADVERS"),
+        23 => Cow::Borrowed("BADCOOKIE"),
         _ => NAMES.get(usize::from(code)).map_or_else(
             || Cow::Owned(format!("RCODE{code}")),
             |name| Cow::Borrowed(*name),
         ),
     }
-}
-
-/// Response code from a DNS header: the low four bits of byte 3. The
-/// extended bits an OPT record may carry are not read; this is a log field,
-/// not a parser.
-pub(crate) fn header_rcode(message: &[u8]) -> Option<ResponseCode> {
-    message
-        .get(3)
-        .map(|flags| ResponseCode::from(0, flags & 0x0F))
 }
 
 impl EngineObserver for TracingObserver {
@@ -737,10 +731,12 @@ impl EngineObserver for TracingObserver {
             request_id = ctx.request_id,
             status = ?outcome.status,
             latency_us = outcome.latency.as_micros() as u64,
+            // 连同 OPT 里的高位：只看头部的低 4 位，BADVERS 就成了 NOERROR / With the high bits
+            // from the OPT: the header's low four bits alone make BADVERS a NOERROR
             rcode = outcome
                 .response
-                .and_then(header_rcode)
-                .map(|rcode| tracing::field::display(rcode_name(rcode.into()))),
+                .and_then(crate::proto_utils::parse_response_quick)
+                .map(|response| tracing::field::display(rcode_name(response.rcode.into()))),
             response_bytes = outcome.response.map(<[u8]>::len),
             error = outcome.error,
             "request finished"
@@ -798,6 +794,18 @@ impl EngineObserver for TracingObserver {
     }
 
     fn decision_made(&self, ctx: &RequestContext<'_>, event: &DecisionMade<'_>) {
+        // 决定的内容各写成一个字段，响应码和别的事件一样写助记名 / What was decided goes in fields of
+        // its own, the response code as its mnemonic like the other events'
+        let (rcode, answers, upstream, transport, jump_to) = match event.detail {
+            DecisionDetail::Static { rcode, answers } => {
+                (Some(rcode), Some(answers), None, None, None)
+            }
+            DecisionDetail::Forward {
+                upstream,
+                transport,
+            } => (None, None, Some(upstream), transport, None),
+            DecisionDetail::Jump { pipeline } => (None, None, None, None, Some(pipeline)),
+        };
         tracing::debug!(
             target: TRACE_TARGET,
             event = "decision_made",
@@ -805,7 +813,11 @@ impl EngineObserver for TracingObserver {
             pipeline = event.pipeline,
             rule = event.rule,
             phase = ?event.phase,
-            detail = ?event.detail,
+            rcode = rcode.map(|rcode| tracing::field::display(rcode_name(rcode.into()))),
+            answers,
+            upstream,
+            transport = transport.map(tracing::field::debug),
+            jump_to,
             "decision made"
         );
     }
@@ -918,17 +930,92 @@ impl EngineObserver for TracingObserver {
 mod tests {
     use super::*;
 
+    /// 参考观察者的日志里，请求的响应码连同 OPT 里的高位：BADVERS 的头部低 4 位是 0，只看头部就记成 NOERROR；决定的
+    /// 内容各成一个字段，响应码写助记名（NXDOMAIN），不是 hickory 的 Debug（`NXDomain`）
+    /// The reference observer logs a request's response code with the high bits from the OPT:
+    /// BADVERS has 0 in the header's low four bits, and the header alone logs it as NOERROR; what
+    /// a decision decides goes in fields of its own, the response code as its mnemonic
+    /// (NXDOMAIN), not hickory's Debug (`NXDomain`)
     #[test]
-    fn header_rcode_reads_the_low_four_bits_of_byte_three() {
-        assert_eq!(
-            header_rcode(&[0x12, 0x34, 0x81, 0x83]),
-            Some(ResponseCode::NXDomain)
+    fn the_observer_log_names_the_whole_response_code() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query};
+        use hickory_proto::rr::Name;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Written(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Written {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let badvers = crate::proto_utils::badvers_response(&query.to_vec().unwrap()).unwrap();
+        let ctx = RequestContext {
+            request_id: 7,
+            listener_label: "default",
+            client: "127.0.0.1:53000".parse().unwrap(),
+            transport: Some(ClientTransport::Udp),
+            qname: "example.com",
+            qtype: RecordType::A,
+            qclass: DNSClass::IN,
+            background_refresh: false,
+            started: std::time::Instant::now(),
+            reported_at_once: false,
+        };
+        let written = Written::default();
+        let writer = written.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone()),
         );
-        assert_eq!(
-            header_rcode(&[0x12, 0x34, 0x85, 0xF0]),
-            Some(ResponseCode::NoError)
-        );
-        assert_eq!(header_rcode(&[0x12, 0x34, 0x81]), None);
+        tracing::subscriber::with_default(subscriber, || {
+            TracingObserver.request_finished(
+                &ctx,
+                &RequestOutcome {
+                    latency: Duration::from_millis(4),
+                    status: RequestStatus::Completed,
+                    response: Some(&badvers),
+                    error: None,
+                },
+            );
+            TracingObserver.decision_made(
+                &ctx,
+                &DecisionMade {
+                    pipeline: "main",
+                    rule: Some("static"),
+                    phase: RulePhase::Request,
+                    detail: DecisionDetail::Static {
+                        rcode: ResponseCode::NXDomain,
+                        answers: 0,
+                    },
+                },
+            );
+        });
+        let output = String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "{output}");
+        assert!(lines[0].contains(" rcode=BADVERS "), "{output}");
+        assert!(lines[1].contains(" rcode=NXDOMAIN answers=0"), "{output}");
+    }
+
+    #[test]
+    fn rcode_name_names_the_codes_a_header_and_an_opt_carry() {
+        assert_eq!(rcode_name(ResponseCode::NXDomain.into()), "NXDOMAIN");
+        assert_eq!(rcode_name(ResponseCode::from(1, 0).into()), "BADVERS");
+        assert_eq!(rcode_name(ResponseCode::from(1, 7).into()), "BADCOOKIE");
+        assert_eq!(rcode_name(17), "RCODE17");
     }
 
     #[test]
