@@ -69,7 +69,16 @@ pub struct PreParsedData {
     /// (see `Engine::answer_after_fast_path`). A hot reload in between changes none of it: the
     /// new configuration may lack the pipeline this one picked, and the waits within the request
     /// are bounded by this configuration
-    pub(super) state: Arc<EngineInner>,
+    state: Arc<EngineInner>,
+}
+
+impl PreParsedData {
+    /// 选出这个请求的 pipeline 的那份配置的全局设置（见 `state`）
+    /// The global settings of the configuration that picked this request's pipeline (see
+    /// `state`)
+    pub(super) fn settings(&self) -> &crate::config::GlobalSettings {
+        &self.state.pipeline.settings
+    }
 }
 /// 配置快照太大，不打出来 / The configuration snapshot is too large to print
 impl std::fmt::Debug for PreParsedData {
@@ -216,23 +225,6 @@ fn report_compiled_rule(
 /// answer back. It comes off the remaining request budget so the wait never
 /// runs right up to the deadline and loses the race with the outer timeout.
 const STALE_SERVE_RESERVE: Duration = Duration::from_millis(20);
-
-/// 整体请求超时：显式配置优先，否则按 upstream_timeout_ms 的 2.5 倍推导
-/// （hedge 1/3 + 全量 1 倍 + TCP 回落 1 倍，再留一点余量）。
-/// The overall request timeout: the configured value when set, otherwise 2.5
-/// times upstream_timeout_ms (hedge at a third, a full attempt, a TCP fallback
-/// and a little margin).
-///
-/// 单独成函数是为了让持有配置快照的调用方按同一份快照推导，不必再 load 一次
-/// 状态，也不会出现两处各算一遍而慢慢算岔。
-/// It is a function so a caller already holding a config snapshot derives from
-/// that same snapshot instead of loading state again, and so the derivation
-/// never drifts between two copies.
-pub(super) fn request_timeout_ms(settings: &crate::config::GlobalSettings) -> u64 {
-    settings
-        .request_timeout_ms
-        .unwrap_or(settings.default_request_timeout_ms())
-}
 
 impl Engine {
     /// Reload configuration and update compiled pipelines / 重新加载配置并更新编译后的管线
@@ -1086,7 +1078,7 @@ impl Engine {
         // at T, so roughly 2.33T in the worst case. Cutting at T ends
         // refreshes that would have landed and downgrades a fresh
         // answer to a stale one for nothing.
-        let budget = Duration::from_millis(request_timeout_ms(settings));
+        let budget = Duration::from_millis(settings.request_budget_ms());
         let client_timeout = Duration::from_millis(settings.serve_stale_client_timeout_ms).min(
             budget
                 .saturating_sub(lookup.request.start.elapsed())

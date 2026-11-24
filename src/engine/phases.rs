@@ -948,12 +948,7 @@ impl<'a> Forwarding<'a> {
     ) -> anyhow::Result<ForwardResult> {
         let (request, decision) = (self.request, self.decision);
         let (ctx, checked) = match answer {
-            Answer::Plain {
-                raw,
-                upstream,
-                rcode,
-                ttl,
-            } => return Ok(self.cache_reply(raw, upstream, rcode, ttl, response)),
+            Answer::Plain { .. } => return Ok(self.cache_reply(answer, response)),
             Answer::Read(ctx) => (ctx, false),
             Answer::Checked(ctx) => (ctx, true),
         };
@@ -989,28 +984,32 @@ impl<'a> Forwarding<'a> {
             }
         });
         if actions.is_empty() {
-            let (rcode, ttl) = (ctx.msg.metadata.response_code, extract_ttl(&ctx.msg));
-            return Ok(self.cache_reply(ctx.raw, ctx.upstream, rcode, ttl, response));
+            return Ok(self.cache_reply(Answer::Read(ctx), response));
         }
         response.upstream = Some(Source::Upstream(Arc::clone(&ctx.upstream)));
         self.act(actions, Some(ctx), response).await
     }
 
-    /// 上游的应答 `raw` 就是结果：按它自己的 TTL `ttl` 写进缓存（见 `ttl_to_cache`），回答检查 continue 或跳转以后转发拿到的
+    /// 上游的应答 `answer` 就是结果：按它自己的 TTL 写进缓存（见 `ttl_to_cache`），回答检查 continue 或跳转以后转发拿到的
     /// 也不比这一路上回答检查据过的应答留得久（见 `Route::cache`），交给等在这次转发登记的条目上的请求
-    /// The upstream's reply `raw` is the outcome: cached by its own TTL `ttl` (see
-    /// `ttl_to_cache`), one fetched after an answer check continued or jumped staying no longer
-    /// than the answers the checks on the way went by (see `Route::cache`), and handed to the
-    /// requests waiting on the entry this forward registered
-    fn cache_reply(
-        &mut self,
-        raw: Bytes,
-        upstream: Arc<str>,
-        rcode: ResponseCode,
-        ttl: u64,
-        response: &mut ResponseInfo,
-    ) -> ForwardResult {
+    /// The upstream's reply `answer` is the outcome: cached by its own TTL (see `ttl_to_cache`),
+    /// one fetched after an answer check continued or jumped staying no longer than the answers
+    /// the checks on the way went by (see `Route::cache`), and handed to the requests waiting on
+    /// the entry this forward registered
+    fn cache_reply(&mut self, answer: Answer, response: &mut ResponseInfo) -> ForwardResult {
         let (engine, request) = (self.engine, self.request);
+        let (raw, upstream, rcode, ttl) = match answer {
+            Answer::Plain {
+                raw,
+                upstream,
+                rcode,
+                ttl,
+            } => (raw, upstream, rcode, ttl),
+            Answer::Read(ctx) | Answer::Checked(ctx) => {
+                let (rcode, ttl) = (ctx.msg.metadata.response_code, extract_ttl(&ctx.msg));
+                (ctx.raw, ctx.upstream, rcode, ttl)
+            }
+        };
         response.upstream = Some(Source::Upstream(Arc::clone(&upstream)));
         let ttl = ttl_to_cache(engine, ttl, request.state.pipeline.min_ttl());
         let raw = self
@@ -1147,8 +1146,7 @@ impl<'a> Forwarding<'a> {
                 // reject_failure_reply_on_refresh)
                 // 响应动作转发拿到的应答（见 reject_failure_reply_on_refresh）
                 reject_failure_reply_on_refresh(request.refresh.is_some(), &ctx.raw)?;
-                let (rcode, ttl) = (ctx.msg.metadata.response_code, extract_ttl(&ctx.msg));
-                Ok(self.cache_reply(ctx.raw, ctx.upstream, rcode, ttl, response))
+                Ok(self.cache_reply(Answer::Read(ctx), response))
             }
             ResponseActionResult::Static { bytes, rcode, ttl } => {
                 // 上游失败以后 miss 动作给的静态应答只是这一次请求的兜底，不是这个问题的应答，不缓存（见

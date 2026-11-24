@@ -8,6 +8,7 @@
 //! 让内核起不来的配置写成一条日志。像 OpenWrt 上 procd 那样把输出写进文件（既不是终端也不是 journald）跑真程序：
 //! 致命错误和事件一样只占一行，UTC 时间开头、第二个词是 ERROR，面板读这个文件时只看 error 也看得到内核为什么没起来。
 
+use std::net::{Ipv4Addr, UdpSocket};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -124,4 +125,43 @@ fn a_fatal_error_lists_the_problems_as_a_reload_does() {
     assert_eq!(lines.len(), 1, "{logged}");
     let fatal = format!(" ERROR fatal: {refused:#}").replace('\n', "\\n");
     assert!(lines[0].ends_with(&fatal), "{logged}");
+}
+
+/// 配置里有问题、UDP 端口又被占着时，只记绑不上的那条致命错误：内核没起来，没有哪一行说问题「照样加载」
+/// A configuration with a problem whose UDP port is taken logs the fatal error of the bind
+/// alone: the kernel not having started, no line says the problem was loaded all the same
+#[test]
+fn a_taken_port_logs_the_bind_alone_not_a_problem_loaded() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config = dir.path().join("config.json");
+    let log = dir.path().join("kixdns.log");
+    let port = free_port();
+    let _held = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    // 内核绑这个端口时得到的错误 / The error the kernel gets binding this port
+    let taken = UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap_err();
+    std::fs::write(
+        &config,
+        serde_json::json!({
+            "settings": {
+                "bind_udp": format!("127.0.0.1:{port}"),
+                "bind_tcp": format!("127.0.0.1:{port}"),
+                "default_upstream": "127.0.0.1:9",
+            },
+            "pipelines": [{
+                "id": "main",
+                "rules": [{
+                    "name": "misspelt",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [{ "type": "static_response", "rcode": "WHATEVER" }],
+                }],
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let logged = run_to_the_end(&config, &log);
+    let lines = logged.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{logged}");
+    assert!(lines[0].contains(" ERROR fatal: bind "), "{logged}");
+    assert!(lines[0].ends_with(&taken.to_string()), "{logged}");
 }
