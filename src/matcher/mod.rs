@@ -1225,19 +1225,19 @@ mod tests {
             .expect("build runtime config")
             .warnings
         };
-        let geosite = "GeoSite tags ads, cn have no data to match against: settings.geosite_data_paths is empty, so geo_site never matches them and geo_site_not always does";
+        let geosite = "settings.geosite_data_paths: empty, so the GeoSite tags ads, cn have no data to match against: geo_site never matches them and geo_site_not always does";
         assert_eq!(
             warnings(serde_json::json!({})),
             [
                 geosite,
-                "GeoIP tags CLOUDFLARE, CN have no data to match against: settings.geoip_dat_path is not set and neither is settings.geoip_db_path, so geoip_country never matches them"
+                "settings.geoip_dat_path: not set and neither is settings.geoip_db_path, so the GeoIP tags CLOUDFLARE, CN have no data to match against: geoip_country never matches them"
             ]
         );
         assert_eq!(
             warnings(serde_json::json!({ "geoip_db_path": "/data/country.mmdb" })),
             [
                 geosite,
-                "GeoIP tags CLOUDFLARE have no data to match against: settings.geoip_dat_path is not set, and settings.geoip_db_path answers two-letter country codes alone, so geoip_country never matches them"
+                "settings.geoip_dat_path: not set, and settings.geoip_db_path answers two-letter country codes alone, so the GeoIP tags CLOUDFLARE have no data to match against: geoip_country never matches them"
             ]
         );
         assert!(

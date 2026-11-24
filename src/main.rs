@@ -417,7 +417,7 @@ async fn run_dns_server(
     for problem in &problems {
         error!(%problem, "configuration problem, loaded as before; a reload or a save from the panel refuses it");
     }
-    let cfg = RuntimePipelineConfig::from_config(cfg).context("compile matchers")?;
+    let cfg = RuntimePipelineConfig::from_config(cfg).context("compile configuration")?;
     // Listener addresses and DoH prerequisites, checked exactly as
     // config::validate does / 监听地址与 DoH 前置条件，检查方式与 config::validate 一致
     let listeners = cfg.settings.listeners()?;
@@ -452,7 +452,7 @@ async fn run_dns_server(
     // inbound DoH did not start (`doh_error`)
     #[cfg(unix)]
     if let Some(metrics) = &panel_metrics {
-        metrics.startup_problems(problems);
+        metrics.startup_problems(&problems);
         if let Some(error) = bound.doh_error() {
             metrics.doh_not_started(error.to_owned());
         }
