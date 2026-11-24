@@ -9,55 +9,17 @@
 //! 不落地列出来）；以及对校验通过的配置的回答。在真的程序上开控制通道，逐个核对回答的状态码、错误码和说明。
 #![cfg(unix)]
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{Kernel, control_answers, free_port};
+use common::{control_get, control_request, free_port, start_with_control};
 
 /// 发一个 POST，读完整个回答，返回状态码和 JSON 正文。`head` 是另加的请求头（每行以 `\r\n` 结尾）
 /// Send one POST and read the whole answer, returning its status and JSON body. `head`
 /// holds the extra request headers, each line ending in `\r\n`
 fn post(control: &Path, path: &str, head: &str, body: &[u8]) -> (u16, serde_json::Value) {
-    request(control, "POST", path, head, body)
-}
-
-/// 发一个 GET，读完整个回答 / Send one GET and read the whole answer
-fn get(control: &Path, path: &str) -> (u16, serde_json::Value) {
-    request(control, "GET", path, "", b"")
-}
-
-fn request(
-    control: &Path,
-    method: &str,
-    path: &str,
-    head: &str,
-    body: &[u8],
-) -> (u16, serde_json::Value) {
-    let mut stream = UnixStream::connect(control).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
-    let request =
-        format!("{method} {path} HTTP/1.1\r\nHost: kixdns\r\nConnection: close\r\n{head}\r\n");
-    stream.write_all(request.as_bytes()).unwrap();
-    // 正文太大时，服务端读到上限就回答、关掉连接，后面写不进去不算错
-    // With a body too large the server answers and closes once it reaches the limit, so
-    // a write failing after that is no error
-    let _ = stream.write_all(body);
-    let mut answer = Vec::new();
-    let _ = stream.read_to_end(&mut answer);
-    let text = String::from_utf8_lossy(&answer);
-    let (head, body) = text.split_once("\r\n\r\n").expect("a whole answer");
-    let status = head
-        .split(' ')
-        .nth(1)
-        .and_then(|code| code.parse().ok())
-        .expect("a status line");
-    (status, serde_json::from_str(body).expect("a JSON body"))
+    control_request(control, "POST", path, head, body)
 }
 
 /// 带 Content-Length 的正文 / A body with its Content-Length
@@ -94,42 +56,10 @@ fn config_of(pipelines: serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// 在 `dir` 里写下 `config`，起一个读它、开着控制通道的内核，等控制通道应答；返回内核、配置文件和控制通道
-/// Write `config` in `dir`, start a kernel reading it with its control socket, and wait for the
-/// socket to answer; returns the kernel, the configuration file and the control socket
-fn start(
-    dir: &Path,
-    config: &serde_json::Value,
-) -> (Kernel, std::path::PathBuf, std::path::PathBuf) {
-    let control = dir.join("control.sock");
-    let config_path = dir.join("config.json");
-    std::fs::write(&config_path, config.to_string()).unwrap();
-    let kernel = Kernel(
-        Command::new(env!("CARGO_BIN_EXE_kixdns"))
-            .args(["run", "--config"])
-            .arg(&config_path)
-            .arg("--admin-socket")
-            .arg(&control)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let started = Instant::now();
-    while !control_answers(&control) {
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "kernel did not start"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    (kernel, config_path, control)
-}
-
 #[test]
 fn the_control_socket_answers_bodies_it_cannot_use_in_its_own_words() {
     let dir = tempfile::TempDir::new().unwrap();
-    let (_kernel, _, control) = start(
+    let (_kernel, _, control) = start_with_control(
         dir.path(),
         &config_of(serde_json::json!([{ "id": "main", "rules": [] }])),
     );
@@ -245,7 +175,7 @@ fn a_refused_configuration_lists_every_problem() {
     let main =
         |rules: Vec<serde_json::Value>| serde_json::json!([{ "id": "main", "rules": rules }]);
     let mut config = config_of(main(vec![]));
-    let (_kernel, config_path, control) = start(dir.path(), &config);
+    let (_kernel, config_path, control) = start_with_control(dir.path(), &config);
     let rules = (0..30)
         .map(|n| {
             serde_json::json!({
@@ -277,7 +207,7 @@ fn a_refused_configuration_lists_every_problem() {
     std::fs::rename(&staged, &config_path).unwrap();
     let started = Instant::now();
     let active = loop {
-        let (status, active) = get(&control, "/v1/config/active");
+        let (status, active) = control_get(&control, "/v1/config/active");
         assert_eq!(status, 200, "{active}");
         if active["reload_sequence"] != 0 {
             break active;
@@ -336,8 +266,8 @@ fn the_config_result_says_why_doh_is_off_and_which_geo_data_is_missing() {
     ] {
         settings.insert(setting.to_owned(), value);
     }
-    let (_kernel, _, control) = start(dir.path(), &config);
-    let (status, active) = get(&control, "/v1/config/active");
+    let (_kernel, _, control) = start_with_control(dir.path(), &config);
+    let (status, active) = control_get(&control, "/v1/config/active");
     assert_eq!(status, 200, "{active}");
     let doh_error = active["doh_error"]
         .as_str()
