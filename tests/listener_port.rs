@@ -7,7 +7,7 @@
 //!
 //! 内核最先占住监听端口，占不到时说清楚。内核的上游 socket 由系统挑端口，以前它们在绑定监听口之前打开，
 //! 系统分配范围里的监听口可能正好被挑走，内核就起不来了。
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
@@ -130,9 +130,12 @@ fn exit_of(kernel: &mut Kernel, dir: &Path) -> std::process::ExitStatus {
     }
 }
 
-/// 系统分配范围里只空出比最大的上游池多四分之一的端口，监听口是其中一个：上游 socket 要是先开，多半会挑走它
+/// 系统分配范围里只空出比最大的上游池多四分之一的端口，监听口是其中一个：上游 socket 要是先开，多半会挑走它。
+/// 分配范围从 /proc 读，只在 Linux 上测
 /// With only a quarter more ports of the system's range free than the largest upstream pool, the listening
-/// port among them, upstream sockets would mostly take it, were they opened first
+/// port among them, upstream sockets would mostly take it, were they opened first. The range is
+/// read from /proc, so this runs on Linux alone
+#[cfg(target_os = "linux")]
 #[test]
 fn a_listening_port_in_the_system_range_is_not_taken_by_upstream_sockets() {
     let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
