@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use super::types::EngineInner;
 use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
 use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::geoip::{GeoIpManager, is_country_tag};
+use crate::matcher::geoip::{FileStamp, GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, Swapped, parsed_provides_any};
 use crate::watcher::{FileWatch, PendingWatch};
 use parking_lot::RwLock;
@@ -76,17 +76,41 @@ impl GeoIpSpec {
 /// 按一份 spec 加载的数据从哪来、谁在监视 / Where the data loaded for a spec came from, and what watches it
 struct Loaded<S> {
     spec: S,
-    /// 配置了、加载时却不存在或读不了的文件：没有监视，再次热重载时它们在了就重新加载
-    /// Configured files that were missing or could not be read when loading: they are not
-    /// watched, and a later hot reload loads again once they are there
-    missing: Vec<PathBuf>,
+    /// 加载时看过、没有监视的文件：配置了却不存在的数据文件，以及 MMDB（读不了时照样算）。再次热重载时有哪个换了
+    /// 样子就重新加载；还是那个样子的，存在却读不了的也一样，读出来的数据不会不同，就不重新加载
+    /// The files looked at when loading that nothing watches: configured data files that were
+    /// missing, and the MMDB (one that could not be read included). A later hot reload loads
+    /// again once any of them looks otherwise; while each looks the same, one there yet
+    /// unreadable included, reading again would give the same data, so nothing is loaded again
+    unwatched: Vec<Unwatched>,
     watch: Option<FileWatch>,
 }
 
 impl<S: PartialEq> Loaded<S> {
     /// 按 `spec` 加载的数据是否就是现在这份 / Whether loading for `spec` would give the data already loaded
     fn is_current(&self, spec: &S) -> bool {
-        self.spec == *spec && !self.missing.iter().any(|path| path.exists())
+        self.spec == *spec && self.unwatched.iter().all(Unwatched::unchanged)
+    }
+}
+
+/// 没有监视的文件，和加载时它什么样（不存在时是 None）/ A file nothing watches, and what it looked
+/// like when loading (None when it was missing)
+struct Unwatched {
+    path: PathBuf,
+    seen: Option<FileStamp>,
+}
+
+impl Unwatched {
+    /// `path` 现在的样子，在读它之前看：读的时候换了，下次热重载照样看得出来 / What `path` looks like
+    /// now, looked at before it is read: one replaced meanwhile is still noticed by the next hot reload
+    fn now(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let seen = FileStamp::of(&path).ok();
+        Self { path, seen }
+    }
+
+    fn unchanged(&self) -> bool {
+        FileStamp::of(&self.path).ok() == self.seen
     }
 }
 
@@ -197,13 +221,7 @@ impl GeoSources {
             self.geosite = load_geosite(spec, geosite, &self.rotation);
         }
         let spec = GeoIpSpec::of(cfg);
-        // MMDB 不被监视：热重载时它换过了也要重新读（见 `GeoIpManager::mmdb_replaced`）/ The MMDB is not
-        // watched: a hot reload reads it again once it was replaced (see `GeoIpManager::mmdb_replaced`)
-        let mmdb_replaced = spec
-            .db_path
-            .as_deref()
-            .is_some_and(|path| geoip.read().mmdb_replaced(path));
-        if !self.geoip.is_current(&spec) || mmdb_replaced {
+        if !self.geoip.is_current(&spec) {
             info!(tags = ?spec.tags, db_path = ?spec.db_path, dat_path = ?spec.dat_path, "GeoIP data follows the new configuration");
             self.geoip.watch = None;
             let in_use = self.geoip.spec.dat_path.clone();
@@ -245,13 +263,13 @@ fn load_geosite(
     shared: &Arc<RwLock<GeoSiteManager>>,
     rotation: &Rotation,
 ) -> Loaded<GeoSiteSpec> {
-    let mut missing = Vec::new();
+    let mut unwatched = Vec::new();
     let mut files = Vec::new();
     for path_str in &spec.paths {
         let path = PathBuf::from(path_str);
         if !path.exists() {
             warn!(path = %path.display(), "GeoSite data file not found, skipping");
-            missing.push(path);
+            unwatched.push(Unwatched::now(path));
         } else if spec.tags.is_empty() {
             // 数据文件只读规则用到的标签，一个都没用到就不必读，也不必监视
             // A data file is read only for the tags rules use; with none used it is neither
@@ -335,7 +353,7 @@ fn load_geosite(
     });
     Loaded {
         spec,
-        missing,
+        unwatched,
         watch,
     }
 }
@@ -407,14 +425,14 @@ fn load_geoip(
     shared: &Arc<RwLock<GeoIpManager>>,
     rotation: &Rotation,
 ) -> Loaded<GeoIpSpec> {
-    let mut missing = Vec::new();
     let mut fresh = GeoIpManager::default();
-    // 读不了的 MMDB 等下次重载再读，告警 use_mmdb 自己记 / An MMDB that cannot be read waits for a
-    // later reload, use_mmdb logging the warning itself
-    if let Some(db_path) = &spec.db_path
-        && !fresh.use_mmdb(db_path, &shared.read())
-    {
-        missing.push(PathBuf::from(db_path));
+    // MMDB 不被监视，换了样子由热重载读（见 `Loaded::unwatched`）；读不了时告警 use_mmdb 自己记
+    // The MMDB is not watched, a hot reload reading it once it looks otherwise (see
+    // `Loaded::unwatched`); when it cannot be read use_mmdb logs the warning itself
+    let mut unwatched = Vec::new();
+    if let Some(db_path) = &spec.db_path {
+        unwatched.push(Unwatched::now(db_path));
+        fresh.use_mmdb(db_path, &shared.read());
     }
 
     // MMDB 加载上了，国家代码就只查它（见 GeoIpManager::matches_any_tag），数据文件只读其余的标签
@@ -435,7 +453,7 @@ fn load_geoip(
             files.push(path);
         } else {
             warn!(path = %path.display(), "GeoIP data file not found, skipping");
-            missing.push(path);
+            unwatched.push(Unwatched::now(path));
         }
     }
 
@@ -485,7 +503,7 @@ fn load_geoip(
     });
     Loaded {
         spec,
-        missing,
+        unwatched,
         watch,
     }
 }

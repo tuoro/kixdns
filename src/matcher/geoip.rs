@@ -190,14 +190,14 @@ struct Mmdb {
 /// 一个文件的路径、长度和修改时间：三样都没变，就当内容没变 / A file's path, length and modification
 /// time: with all three unchanged, its content counts as unchanged
 #[derive(Debug, PartialEq, Eq)]
-struct FileStamp {
+pub(crate) struct FileStamp {
     path: PathBuf,
     len: u64,
     modified: Option<SystemTime>,
 }
 
 impl FileStamp {
-    fn of(path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn of(path: &Path) -> std::io::Result<Self> {
         let meta = std::fs::metadata(path)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -282,16 +282,17 @@ fn record_country<'a>(found: &maxminddb::LookupResult<'a, Vec<u8>>) -> Option<&'
 impl GeoIpManager {
     /// 用 `path` 的 MMDB。`current` 在用的正是这个文件、文件也没变（路径、长度、修改时间都一样）时共用它那份，不再
     /// 读一遍：以前只改了规则用的标签也要把整个库（约 10 MB）再读一遍、每个网段再走一遍，旧库还占着内存。读不了
-    /// （不存在、正被替换、写坏了）时，`current` 用的是同一个路径就留着它那份，返回 false，由调用方等下次重载再读：
-    /// 以前换进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直不按 MMDB 判断，直到重启
+    /// （不存在、正被替换、写坏了）时，`current` 用的是同一个路径就留着它那份，返回 false；文件换了样子以后的热重载
+    /// 再读它（见 `engine::geo` 的 `Loaded`）。以前换进去的是没有 MMDB 的管理器，文件又在，之后国家代码就一直不按
+    /// MMDB 判断，直到重启
     /// Uses the MMDB at `path`. When `current` uses that very file and the file is unchanged
     /// (same path, length and modification time) its data is shared rather than read again: a
     /// change to nothing but the tags rules use used to read the whole database (some 10 MB) and
     /// walk every network again while the old one still held memory. When it cannot be read
     /// (missing, being replaced, broken) the data `current` has from the same path stays, and
-    /// false tells the caller to read it on a later reload: a manager with no MMDB used to be
-    /// swapped in, and with the file still there country codes were no longer judged by the MMDB
-    /// until a restart
+    /// it gives false; the hot reload after the file looks otherwise reads it again (see
+    /// `Loaded` in `engine::geo`). A manager with no MMDB used to be swapped in, and with the
+    /// file still there country codes were no longer judged by the MMDB until a restart
     pub fn use_mmdb(&mut self, path: &str, current: &Self) -> bool {
         let file = FileStamp::of(Path::new(path));
         let in_use = current.mmdb.as_ref();
@@ -318,21 +319,6 @@ impl GeoIpManager {
                 false
             }
         }
-    }
-
-    /// 读进来的 MMDB 换过了：`path` 现在是另一个样子的文件（路径、长度、修改时间有一样不同，见 [`Self::use_mmdb`]）。热重载
-    /// 靠它知道要重读：MMDB 不被监视，以前配置里的 GeoIP 设置没变就不再读它，原地换上的新库要等重启才用上。没读进来过的不算，
-    /// 那是还缺着的文件，另有地方等它出现
-    /// Whether the MMDB read in was replaced: `path` is now a file that looks otherwise (path,
-    /// length or modification time differ, see [`Self::use_mmdb`]). A hot reload learns from it to
-    /// read it again: it is not watched, and it used not to be read again while the
-    /// configuration's GeoIP settings stayed the same, a new database put in place going unused
-    /// until a restart. One never read in does not count: that is a file still missing, waited for
-    /// elsewhere
-    pub fn mmdb_replaced(&self, path: &str) -> bool {
-        self.mmdb
-            .as_ref()
-            .is_some_and(|mmdb| FileStamp::of(Path::new(path)).is_ok_and(|file| file != mmdb.file))
     }
 
     /// 和这个管理器用同一份 MMDB、还没有标签的管理器：监视到数据文件变了时，新的标签在它上面、锁外装好，写锁下只把整个
