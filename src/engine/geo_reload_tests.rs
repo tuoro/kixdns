@@ -537,6 +537,16 @@ async fn an_unreadable_mmdb_is_read_again_only_once_it_changes() {
     );
 }
 
+/// 状态里说 `what` `path` 读得出来、却没有规则用到的标签了，`tags` 留着先前的数据的那句话
+/// The status's sentence saying `what` `path` reads yet has none of the tags rules use, with
+/// `tags` keeping the data from before
+fn kept_sentence(what: &str, path: &Path, tags: &str) -> String {
+    format!(
+        "{what} {} now has none of the tags rules use; the data read from it before stays for {tags} until it changes again",
+        path.display()
+    )
+}
+
 /// GeoIP .dat 内容：一个标签一个 IPv4 网段 / GeoIP .dat content: one tag with one IPv4 network
 fn geoip_dat(tag: &str, network: [u8; 4], prefix: u8) -> Vec<u8> {
     // CIDR { ip, prefix (varint) }
@@ -564,10 +574,13 @@ async fn keeps_answering(
     }
 }
 
-/// GeoSite 数据文件被换成空文件（下载失败、磁盘写满会留下这样的文件），规则用到的标签照旧在：
-/// 以前空文件被当成没有任何标签的合法数据读进去，规则一下子全不命中。
+/// GeoSite 数据文件被换成空文件（下载失败、磁盘写满会留下这样的文件），规则用到的标签照旧在，Geo 数据的问题里说一句，
+/// 免得下次重启时规则不再命中、事先没有一点预兆；文件写好、读进来以后那句话跟着去掉。以前空文件被当成没有任何标签的
+/// 合法数据读进去，规则一下子全不命中。
 /// A GeoSite data file replaced by an empty one (what a failed download or a full disk leaves
-/// behind) keeps the tags rules use: the empty file used to be read as valid data with no
+/// behind) keeps the tags rules use, and the Geo data's problems say so, lest the next restart
+/// leave the rules no longer matching with nothing to warn of it; once the file is written
+/// right and read in, the sentence goes. The empty file used to be read as valid data with no
 /// tags, and the rules stopped matching at once.
 #[tokio::test]
 async fn an_empty_geosite_file_keeps_the_tags_in_use() {
@@ -579,6 +592,11 @@ async fn an_empty_geosite_file_keeps_the_tags_in_use() {
     assert_eq!(ask(&engine, "first.geo.test").await, Some(MATCHED));
 
     replace(&path, b"");
+    let kept = [kept_sentence("GeoSite data file", &path, "testa")];
+    wait_for("the status must say the data stays", || {
+        engine.geo_data_warnings() == kept
+    })
+    .await;
     keeps_answering(
         &engine,
         peer,
@@ -588,7 +606,8 @@ async fn an_empty_geosite_file_keeps_the_tags_in_use() {
     )
     .await;
 
-    // 文件再写好时照常读进来 / A good file written again is read in as usual
+    // 文件再写好时照常读进来，那句话跟着去掉 / A good file written again is read in as usual,
+    // and the sentence goes
     replace(&path, &geosite_dat(&[("testa", "geo2.test")]));
     let manager = &engine.geosite_manager;
     wait_for("the good file must be read", || {
@@ -596,6 +615,7 @@ async fn an_empty_geosite_file_keeps_the_tags_in_use() {
     })
     .await;
     assert!(!manager.read().matches("testa", "x.geo.test"));
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
 /// 两个数据文件都提供一个标签时排在后面的说了算；它被换成空文件以后，这个标签用前面那个文件的数据，和全部重新读一遍
@@ -630,6 +650,10 @@ async fn an_emptied_geosite_file_hands_a_shared_tag_back() {
     assert!(
         manager.matches("only", "x.only.test"),
         "a tag only the emptied file provided keeps the data in use"
+    );
+    assert_eq!(
+        engine.geo_data_warnings(),
+        [kept_sentence("GeoSite data file", &last, "only")]
     );
 }
 
@@ -670,10 +694,15 @@ async fn a_reload_reading_an_emptied_geosite_file_hands_a_shared_tag_back() {
         manager.matches("only", "x.only.test"),
         "a tag only the emptied file provided keeps the data in use"
     );
+    assert_eq!(
+        engine.geo_data_warnings(),
+        [kept_sentence("GeoSite data file", &last, "only")]
+    );
 }
 
-/// GeoIP 的 .dat 数据文件被换成空文件，规则用到的标签照旧在，和 GeoSite 一样
-/// A GeoIP .dat data file replaced by an empty one keeps the tags rules use, as for GeoSite
+/// GeoIP 的 .dat 数据文件被换成空文件，规则用到的标签照旧在，Geo 数据的问题里说一句，和 GeoSite 一样
+/// A GeoIP .dat data file replaced by an empty one keeps the tags rules use, and the Geo data's
+/// problems say so, as for GeoSite
 #[tokio::test]
 async fn an_empty_geoip_file_keeps_the_tags_in_use() {
     let dir = tempfile::tempdir().unwrap();
@@ -687,6 +716,11 @@ async fn an_empty_geoip_file_keeps_the_tags_in_use() {
     assert_eq!(ask_from(&engine, "first.test", peer).await, Some(MATCHED));
 
     replace(&path, b"");
+    let kept = [kept_sentence("GeoIP data file", &path, "TESTNET")];
+    wait_for("the status must say the data stays", || {
+        engine.geo_data_warnings() == kept
+    })
+    .await;
     keeps_answering(
         &engine,
         peer,
@@ -705,6 +739,7 @@ async fn an_empty_geoip_file_keeps_the_tags_in_use() {
             .matches_any_tag("198.51.100.1".parse().unwrap(), &tags)
     })
     .await;
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
 /// 数据文件已经成了空文件，在用的数据靠监视那一层留着。这时热重载改了要读的 Geo 数据（多了一个文件），所有文件
@@ -740,11 +775,22 @@ async fn a_reload_reading_an_empty_geosite_file_keeps_the_tags_still_in_use() {
         !engine.geosite_manager.read().has_tag("testb"),
         "only tags the rules use are kept"
     );
+    assert_eq!(
+        engine.geo_data_warnings(),
+        [kept_sentence("GeoSite data file", &path, "testa")]
+    );
 
-    // 写坏了一半的文件（读不出来）也一样 / The same for a file written halfway (unreadable)
+    // 写坏了一半的文件（读不出来）也一样，状态里说的是它读不了 / The same for a file written
+    // halfway (unreadable), the status saying it cannot be read
     replace(&path, &geosite_dat(&[("testa", "geo.test")])[..5]);
     engine.reload(geosite_config(&[&other, &path], "testa"));
     assert_eq!(ask(&engine, "third.geo.test").await, Some(MATCHED));
+    let warnings = engine.geo_data_warnings();
+    let unreadable = format!("GeoSite data file {} cannot be read: ", path.display());
+    assert!(
+        warnings.len() == 1 && warnings[0].starts_with(&unreadable),
+        "{warnings:?}"
+    );
 
     // 文件再写好时照常读进来 / A good file written again is read in as usual
     replace(&path, &geosite_dat(&[("testa", "geo2.test")]));
@@ -777,6 +823,14 @@ async fn a_reload_reading_an_empty_geoip_file_keeps_the_tags_still_in_use() {
     replace(&path, b"");
     engine.reload(using(&["TESTNET", "ELSEWHERE"]));
     assert_eq!(ask_from(&engine, "second.test", peer).await, Some(MATCHED));
+    assert_eq!(
+        engine.geo_data_warnings(),
+        [
+            kept_sentence("GeoIP data file", &path, "TESTNET"),
+            "GeoIP tags ELSEWHERE are in no GeoIP data: geoip_country never matches them"
+                .to_string(),
+        ]
+    );
 
     replace(&path, &geoip_dat("TESTNET", [198, 51, 100, 0], 24));
     let manager = &engine.geoip_manager;

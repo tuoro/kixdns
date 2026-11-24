@@ -166,12 +166,14 @@ impl Rotation {
     }
 }
 
-/// 两种 Geo 数据眼下的问题：配置了却不存在或读不了的文件、装不上的监视、规则用到却没有数据提供的标签。启动、热重载和
-/// 监视到文件变了时跟着更新，面板经控制通道读（见 [`Engine::geo_data_warnings`]）
+/// 两种 Geo 数据眼下的问题：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（留着先前读进来的数据）、
+/// 装不上的监视、规则用到却没有数据提供的标签。启动、热重载和监视到文件变了时跟着更新，面板经控制通道读（见
+/// [`Engine::geo_data_warnings`]）
 /// What is wrong with the two kinds of Geo data right now: configured files that are missing
-/// or cannot be read, watches that cannot be installed, and tags rules use that no data
-/// provides. Kept up to date at startup, on hot reloads and as watched files change, and read
-/// by the panel over the control channel (see [`Engine::geo_data_warnings`])
+/// or cannot be read, files that read yet have none of the tags rules use any more (the data
+/// read from them before staying), watches that cannot be installed, and tags rules use that
+/// no data provides. Kept up to date at startup, on hot reloads and as watched files change,
+/// and read by the panel over the control channel (see [`Engine::geo_data_warnings`])
 #[derive(Default)]
 pub(crate) struct GeoStatus {
     site: Mutex<DataStatus>,
@@ -181,7 +183,9 @@ pub(crate) struct GeoStatus {
 /// 一种 Geo 数据的问题，每样一句话 / What is wrong with one kind of Geo data, a sentence each
 #[derive(Default)]
 struct DataStatus {
-    /// 读不进来的文件，各带说它的那句话 / The files that could not be read in, each with the sentence saying so
+    /// 读不进来的文件，和读得出来却没有规则用到的标签了的文件，各带说它的那句话 / The files that could not be
+    /// read in, and those that read yet have none of the tags rules use any more, each with the
+    /// sentence saying so
     files: Vec<(PathBuf, String)>,
     /// 监视装不上时说它的那句话 / The sentence saying the watch could not be installed, when it could not
     watch: Option<String>,
@@ -222,6 +226,11 @@ impl DataStatus {
         ));
     }
 
+    /// 有没有一句说 `path` 的 / Whether a sentence says something of `path`
+    fn has(&self, path: &Path) -> bool {
+        self.files.iter().any(|(file, _)| file == path)
+    }
+
     /// `path` 读进来了 / `path` was read in
     fn read(&mut self, path: &Path) {
         self.files.retain(|(file, _)| file != path);
@@ -236,14 +245,16 @@ impl DataStatus {
 }
 
 impl Engine {
-    /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、装不上的文件监视、规则用到却没有数据提供的标签
-    /// （这样的规则 geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到
-    /// 文件变了时跟着更新
+    /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（只有它提供的
+    /// 标签留着先前读进来的数据，重启以后就没有了）、装不上的文件监视、规则用到却没有数据提供的标签（这样的规则
+    /// geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到文件变了时跟着更新
     /// What is wrong with the Geo data right now, a sentence each: configured files that are
-    /// missing or cannot be read, file watches that cannot be installed, and tags rules use
-    /// that no data provides (geo_site and geoip_country never match them, and geo_site_not
-    /// always does). Empty when nothing is wrong. Kept up to date at startup, on hot reloads and
-    /// as watched files change
+    /// missing or cannot be read, files that read yet have none of the tags rules use any more
+    /// (the tags only they provide keeping the data read from them before, gone after a
+    /// restart), file watches that cannot be installed, and tags rules use that no data
+    /// provides (geo_site and geoip_country never match them, and geo_site_not always does).
+    /// Empty when nothing is wrong. Kept up to date at startup, on hot reloads and as watched
+    /// files change
     pub fn geo_data_warnings(&self) -> Vec<String> {
         let (site, ip) = (self.geo_status.site.lock(), self.geo_status.ip.lock());
         site.sentences()
@@ -276,6 +287,23 @@ fn unprovided_geoip_tags(missing: &[String]) -> Option<String> {
             missing.join(", ")
         )
     })
+}
+
+/// `what`（比如 GeoSite data file）`path` 读得出来，却没有一个规则用到的标签了（多半是空文件或写坏了的文件），只有它
+/// 提供的 `kept` 这几个留着先前从它读进来的数据：记一条错误，给出状态里说它的那句话。文件下次改好、读进来时这句话跟着
+/// 去掉；不说的话，下次重启这几个标签就没有数据，规则不再命中，事先没有一点预兆
+/// `what` (GeoSite data file, say) `path` reads, yet has none of the tags rules use any more
+/// (most likely an empty or broken file), and the tags `kept`, which it alone provided, keep the
+/// data read from it before: logs an error, giving the status's sentence saying so. The
+/// sentence goes once the file is put right and read in; unsaid, the next restart would leave
+/// those tags without data and their rules no longer matching, with nothing to warn of it
+fn kept_from(what: &str, path: &Path, kept: &[String]) -> String {
+    error!(what, path = %path.display(), tags = ?kept, "data file now has none of the tags rules use, keeping the data read from it before");
+    format!(
+        "{what} {} now has none of the tags rules use; the data read from it before stays for {} until it changes again",
+        path.display(),
+        kept.join(", ")
+    )
 }
 
 /// 两个管理器里现在的 Geo 数据从哪来；只在重载锁下使用（见 `Engine::reload_lock`）
@@ -479,23 +507,33 @@ fn load_geosite(
     // is released, and the old data is freed outside it too
     let (old, kept, missing_tags) = {
         let mut in_use = shared.write();
-        let kept: Vec<(&PathBuf, Swapped)> = gave_nothing
+        let kept: Vec<(&PathBuf, Vec<String>, Swapped)> = gave_nothing
             .into_iter()
             .filter_map(|path| {
                 let taken = in_use.take_source(path, &unprovided);
                 // 这份文件在 `fresh` 里什么都没提供，没有要交出去的标签 / The file provides nothing
                 // in `fresh`, so there are no tags to hand over
-                (!taken.is_empty())
-                    .then(|| (path, fresh.swap_source(path, taken, Vec::new(), false)))
+                (!taken.is_empty()).then(|| {
+                    let tags = taken.iter().map(|(tag, _)| tag.clone()).collect();
+                    (
+                        path,
+                        tags,
+                        fresh.swap_source(path, taken, Vec::new(), false),
+                    )
+                })
             })
             .collect();
         let missing_tags = fresh.missing_tags(&spec.tags);
         (mem::replace(&mut *in_use, fresh), kept, missing_tags)
     };
     drop(old);
-    for (path, swapped) in kept {
-        let tags = swapped.finish();
-        warn!(path = %path.display(), tags, "GeoSite data file now has none of the tags rules use, keeping the data in use");
+    for (path, tags, swapped) in kept {
+        swapped.finish();
+        // 读不了的文件已经有一句说它读不了 / An unreadable file has a sentence saying so already
+        if !problems.has(path) {
+            let said = kept_from("GeoSite data file", path, &tags);
+            problems.file(path, said);
+        }
     }
     // 没有要读的文件时不算，配置的告警已经说了（见 `config::geo_tags_without_data`）/ Not with no
     // file to read: the configuration's warnings say so already (see `config::geo_tags_without_data`)
@@ -565,22 +603,32 @@ fn reload_geosite_file(
         }
     };
     status.lock().read(path);
-    let handovers = manager.read().handovers(path, &parsed);
     // 新读出来一个规则用到的标签都没有：多半是空文件或写坏了的文件（下载失败、磁盘写满）。只有它提供的标签换掉会让用
-    // 它们的规则一下子全不命中，所以留着正在用的数据，等文件下次改动；别的文件也提供的标签照常交给那个文件，和全部
-    // 重新读一遍一样。没有要交出去的标签时什么都不变。以前整份留着，别的文件明明还提供着的标签也一直用这份的旧数据
+    // 它们的规则一下子全不命中，所以留着正在用的数据，等文件下次改动，状态里也说一句；别的文件也提供的标签照常交给那个
+    // 文件，和全部重新读一遍一样。没有要交出去的标签时什么都不变。以前整份留着，别的文件明明还提供着的标签也一直用这份的
+    // 旧数据
     // The new read has none of the tags rules use: most likely an empty or broken file (a
     // failed download, a full disk). Dropping the tags only it provides would stop the rules
-    // using them matching at once, so they keep the data in use until the file changes again;
-    // the tags another file provides too go over to that file as usual, as a full load would
-    // have it. With none to hand over nothing changes. It used to be kept whole, so a tag
-    // another file still provided went on with this file's old data
+    // using them matching at once, so they keep the data in use until the file changes again,
+    // and the status says so; the tags another file provides too go over to that file as
+    // usual, as a full load would have it. With none to hand over nothing changes. It used to
+    // be kept whole, so a tag another file still provided went on with this file's old data
     let gives_none = !parsed_provides_any(&parsed, tags);
-    if gives_none {
-        warn!(path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data only it provided");
-        if handovers.is_empty() {
-            return false;
-        }
+    let (handovers, kept) = {
+        let manager = manager.read();
+        let kept = if gives_none {
+            manager.provided_only_by(path)
+        } else {
+            Vec::new()
+        };
+        (manager.handovers(path, &parsed), kept)
+    };
+    if !kept.is_empty() {
+        let said = kept_from("GeoSite data file", path, &kept);
+        status.lock().file(path, said);
+    }
+    if gives_none && handovers.is_empty() {
+        return false;
     }
     let handed_over = GeoSiteManager::read_handovers(handovers);
     let mut manager = manager.write();
@@ -673,15 +721,18 @@ fn load_geoip(
         .filter(|path| in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path()));
     let (old, kept, missing_tags) = {
         let mut current = shared.write();
-        let kept = gave_nothing.map_or(0, |_| fresh.keep_tags_of(&mut current, &dat_tags));
+        let kept = gave_nothing.map(|_| fresh.keep_tags_of(&mut current, &dat_tags));
         let missing_tags = fresh.missing_tags(&spec.tags);
         (mem::replace(&mut *current, fresh), kept, missing_tags)
     };
     drop(old);
-    if let Some(path) = gave_nothing
-        && kept > 0
+    // 读不了的文件已经有一句说它读不了 / An unreadable file has a sentence saying so already
+    if let (Some(path), Some(kept)) = (gave_nothing, kept)
+        && !kept.is_empty()
+        && !problems.has(path)
     {
-        warn!(path = %path.display(), tags = kept, "GeoIP data file now has none of the tags rules use, keeping the data in use");
+        let said = kept_from("GeoIP data file", path, &kept);
+        problems.file(path, said);
     }
     // 配置里没给数据的标签不算，配置的告警已经说了（见 `config::geo_tags_without_data`）/ Tags the
     // configuration gives no data for do not count: its warnings say so already (see
@@ -744,11 +795,16 @@ fn reload_geoip_file(
     };
     status.lock().read(path);
     // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
-    // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
-    // none of them any more, most likely a broken file, so the data in use stays
-    if parsed.tag_count() == 0 && manager.read().tag_count() > 0 {
-        warn!(path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
-        return false;
+    // 留着正在用的数据，状态里说一句 / As for GeoSite: the file gave tags rules use until now
+    // and has none of them any more, most likely a broken file, so the data in use stays, and
+    // the status says so
+    if parsed.tag_count() == 0 {
+        let kept = manager.read().tags();
+        if !kept.is_empty() {
+            let said = kept_from("GeoIP data file", path, &kept);
+            status.lock().file(path, said);
+            return false;
+        }
     }
     let mut fresh = manager.read().sharing_mmdb();
     let count = fresh.apply_parsed(parsed);

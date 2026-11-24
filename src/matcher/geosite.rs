@@ -604,6 +604,27 @@ impl GeoSiteManager {
             .collect()
     }
 
+    /// 数据文件 `path` 眼下说了算、别的文件都不提供的标签：它重新读出来一个规则用到的标签都没有时，留着它的数据的就是
+    /// 这些（见 `engine::geo` 的 `reload_geosite_file`）
+    /// The tags data file `path` decides right now that no other file provides: when reading it
+    /// again gives none of the tags rules use, these are the ones keeping its data (see
+    /// `reload_geosite_file` in `engine::geo`)
+    pub fn provided_only_by(&self, path: &Path) -> Vec<String> {
+        let key = Self::source_key(path);
+        let Some(place) = self.sources.iter().position(|(source, _)| *source == key) else {
+            return Vec::new();
+        };
+        self.sources[place]
+            .1
+            .iter()
+            .filter(|tag| {
+                !self.later_source_provides(place, tag)
+                    && self.earlier_source_providing(place, tag).is_none()
+            })
+            .cloned()
+            .collect()
+    }
+
     /// 把数据文件 `path` 眼下说了算的标签里、属于 `tags`（不分大小写）的拿出来，连同它们的数据。重新读这个文件
     /// 什么都没读出来时，用它把在用的数据带进新建的管理器（见 `engine::geo` 的 `load_geosite`）。拿走以后
     /// 这个管理器不再完整，只该被换掉
