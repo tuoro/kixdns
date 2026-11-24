@@ -112,16 +112,79 @@ fn push_key_parts(buffer: &mut String, parts: &[&str]) {
     }
 }
 
-/// 统计键的头两段：规则的项是 pipeline 和规则名，上游的项是地址和传输（响应码的项是地址和响应码）
-/// A metric key's first two parts: a pipeline and a rule name for a rule's series, an address
-/// and a transport for an upstream's (an address and a response code for a response code's)
-fn leading_parts(key: &str) -> Option<(&str, &str)> {
-    let (first, rest) = key.split_once('\0')?;
-    Some((
-        first,
-        rest.split_once('\0').map_or(rest, |(second, _)| second),
-    ))
+/// 统计键的头 `parts` 段，连着中间的 `\0`；段数不够时是整个键 / A metric key's first `parts` parts,
+/// with the `\0` between them; the whole key when it has no more
+fn leading(key: &str, parts: usize) -> &str {
+    key.match_indices('\0')
+        .nth(parts - 1)
+        .map_or(key, |(end, _)| &key[..end])
 }
+
+/// 一组统计项按配置里的什么名字去留（见 [`ConfiguredNames`]）/ By what name of the configuration a set
+/// of series stays or goes (see [`ConfiguredNames`])
+#[derive(Clone, Copy)]
+enum NamedBy {
+    /// 键就是 pipeline 的 id / The key is a pipeline's id
+    Pipeline,
+    /// 键的头两段是 pipeline 和规则名 / The key's first two parts are a pipeline and a rule name
+    Rule,
+    /// 键的头两段是上游的地址和传输 / The key's first two parts are an upstream's address and transport
+    Upstream,
+    /// 键的头一段是上游的地址：响应码不分传输 / The key's first part is an upstream's address:
+    /// response codes do not tell transports apart
+    Address,
+}
+
+/// 当前配置有的 pipeline、规则和上游（见 `ConfigLoaded`），统计项按它们去留（见 [`Series`]）
+/// The pipelines, rules and upstreams the current configuration has (see `ConfigLoaded`), by
+/// which series stay or go (see [`Series`])
+struct ConfiguredNames {
+    pipelines: FxHashSet<Box<str>>,
+    /// `pipeline\0规则名` / `pipeline\0rule name`
+    rules: FxHashSet<Box<str>>,
+    /// `地址\0传输` / `address\0transport`
+    upstreams: FxHashSet<Box<str>>,
+    addresses: FxHashSet<Box<str>>,
+}
+
+impl ConfiguredNames {
+    fn of(config: &ConfigLoaded<'_>) -> Self {
+        let joined = |first: &str, second: &str| Box::from(format!("{first}\0{second}"));
+        Self {
+            pipelines: config.pipelines.iter().map(|&id| Box::from(id)).collect(),
+            rules: config
+                .rules
+                .iter()
+                .map(|&(pipeline, rule)| joined(pipeline, rule))
+                .collect(),
+            upstreams: config
+                .upstreams
+                .iter()
+                .map(|&(address, transport)| joined(address, transport_label(transport)))
+                .collect(),
+            addresses: config
+                .upstreams
+                .iter()
+                .map(|&(address, _)| Box::from(address))
+                .collect(),
+        }
+    }
+
+    /// 键为 `key`、按 `by` 去留的统计项，这份配置里还有没有 / Whether this configuration still
+    /// has the series under `key` that stays or goes `by`
+    fn have(&self, by: NamedBy, key: &str) -> bool {
+        match by {
+            NamedBy::Pipeline => self.pipelines.contains(key),
+            NamedBy::Rule => self.rules.contains(leading(key, 2)),
+            NamedBy::Upstream => self.upstreams.contains(leading(key, 2)),
+            NamedBy::Address => self.addresses.contains(leading(key, 1)),
+        }
+    }
+}
+
+/// [`PanelMetrics::series_names`] 的锁：新的统计项在它里面加，名字也在它里面换 / The guard of
+/// [`PanelMetrics::series_names`]: new series are added under it, and the names changed
+type SeriesLock<'a> = MutexGuard<'a, Option<ConfiguredNames>>;
 
 #[derive(Clone, Default)]
 struct ActiveConfig {
@@ -504,25 +567,27 @@ impl RequestLatency {
 
 /// 按名字分的一组统计项（每个 Pipeline、规则、上游各一项）。键只由配置里的名字、固定标签和上游回的
 /// 响应码拼成，不来自客户端，所以用快的 FxHash 也没人能凑出冲突。计数只读表、不加锁；头一次出现的统计项
-/// 才在 `metric_series_insert_lock` 里复制整张表、加上自己再换上去。表里存的是 `Arc`，经旧表和新表计的
+/// 才在 `series_names` 的锁里复制整张表、加上自己再换上去。表里存的是 `Arc`，经旧表和新表计的
 /// 是同一个数。
 /// Series keyed by name (one per pipeline, rule or upstream). Keys are made only of names in the
 /// config, fixed labels and the response codes upstreams return, never of anything a client sends, so
 /// the fast FxHash leaves nobody a way to force collisions.
 /// Counting only reads the table and takes no lock; a series seen for the first time copies the table
-/// under `metric_series_insert_lock`, adds itself and swaps the copy in. The table holds `Arc`s, so
+/// under the lock of `series_names`, adds itself and swaps the copy in. The table holds `Arc`s, so
 /// counts made through the old table and the new one land on the same value.
 ///
 /// 统计项跟着配置走：换配置时，配置里已经没有的 pipeline、规则和上游的项去掉，还在的不管多久没计数都留着（见
-/// [`PanelMetrics::keep_series_of`]）。改了名的规则、换掉的上游不会一直留在表里和导出里，表也不会被它们占满、让
-/// 新规则的计数加不进去。以前按上一代配置里计没计过数去留，两次挨着保存就清掉了还在配置里的规则的累计计数
+/// [`PanelMetrics::keep_series_of`]）；配置里没有的名字也不加新项，用旧配置开始的请求换了配置才报上来的计数不会
+/// 把去掉的项又加回来。改了名的规则、换掉的上游不会一直留在表里和导出里，表也不会被它们占满、让新规则的计数加不进去
 /// Series follow the configuration: when it changes, those of the pipelines, rules and upstreams
 /// it no longer has go, and the rest stay however long they went without a count (see
-/// [`PanelMetrics::keep_series_of`]). Renamed rules and replaced upstreams do not stay in the
-/// table and the export for good, nor fill the table so that new rules' counts find no room.
-/// Whether a series counted in the previous configuration used to decide, so two saves in a row
-/// cleared the counts of rules still in the configuration
+/// [`PanelMetrics::keep_series_of`]); nor is a series added for a name it does not have, so a
+/// count from a request begun under the old configuration and reported after the change does
+/// not bring back a series that went. Renamed rules and replaced upstreams do not stay in the
+/// table and the export for good, nor fill the table so that new rules' counts find no room
 struct Series<V> {
+    /// 按什么名字去留 / By what name it stays or goes
+    by: NamedBy,
     table: ArcSwap<FxHashMap<Arc<str>, Arc<V>>>,
     /// 加不进表的统计项（键太长，或表满了），每项只算一次丢弃（见 [`PanelMetrics::drop_series`]）；和表一样跟着
     /// 配置走
@@ -532,16 +597,15 @@ struct Series<V> {
     dropped: ArcSwap<FxHashSet<Arc<str>>>,
 }
 
-impl<V> Default for Series<V> {
-    fn default() -> Self {
+impl<V> Series<V> {
+    fn named_by(by: NamedBy) -> Self {
         Self {
+            by,
             table: ArcSwap::from_pointee(FxHashMap::default()),
             dropped: ArcSwap::from_pointee(FxHashSet::default()),
         }
     }
-}
 
-impl<V> Series<V> {
     /// 把 `key` 那一项交给 `update`；没有这一项时为 None / Hands the series under `key` to
     /// `update`; None when there is none
     #[inline]
@@ -558,11 +622,10 @@ impl<V> Series<V> {
         self.table.load_full()
     }
 
-    /// 加上头一次计数的一项。`_locked` 是 `metric_series_insert_lock` 的锁：两个新项不会各拿一份旧表、互相覆盖
-    /// Adds a series counting for the first time. `_locked` is the guard of
-    /// `metric_series_insert_lock`: two new series never each copy the old table and overwrite
-    /// each other
-    fn insert(&self, _locked: &MutexGuard<'_, ()>, key: &str, value: V) {
+    /// 加上头一次计数的一项。`_locked` 是 `series_names` 的锁：两个新项不会各拿一份旧表、互相覆盖
+    /// Adds a series counting for the first time. `_locked` is the guard of `series_names`: two
+    /// new series never each copy the old table and overwrite each other
+    fn insert(&self, _locked: &SeriesLock<'_>, key: &str, value: V) {
         let mut table = (**self.table.load()).clone();
         table.insert(Arc::from(key), Arc::new(value));
         self.table.store(Arc::new(table));
@@ -588,7 +651,7 @@ impl<V> Series<V> {
     /// 重来一遍
     /// Keeps only the series `keep` accepts, under the lock [`Self::insert`] takes. The same goes
     /// for those noted as dropped, done over should [`Self::note_dropped`] change them meanwhile
-    fn retain(&self, _locked: &MutexGuard<'_, ()>, keep: impl Fn(&str) -> bool) {
+    fn retain(&self, _locked: &SeriesLock<'_>, keep: impl Fn(&str) -> bool) {
         let kept = self
             .table
             .load()
@@ -746,7 +809,10 @@ pub struct PanelMetrics {
     rule_matches: Series<ThreadCount>,
     upstream_attempts: Series<ThreadCount>,
     upstream_results: Series<ThreadCount>,
-    metric_series_insert_lock: Mutex<()>,
+    /// 当前配置有的名字，还没有配置报上来时为 None；新的统计项在它的锁里加（见 [`Series`]）/ The names the
+    /// current configuration has, None until a configuration is reported; new series are added
+    /// under its lock (see [`Series`])
+    series_names: Mutex<Option<ConfiguredNames>>,
     /// 加不进表的统计项有几个，每项只算一次（见 [`Series::note_dropped`]）/ How many series found no
     /// room in their table, each counted once (see [`Series::note_dropped`])
     metric_series_dropped: AtomicU64,
@@ -783,15 +849,15 @@ impl Default for PanelMetrics {
             requests_failed: ThreadCount::default(),
             requests_cancelled: ThreadCount::default(),
             request_latency: RequestLatency::default(),
-            upstream_latency: Series::default(),
-            upstream_response_latency: Series::default(),
-            upstream_rcodes: Series::default(),
-            upstream_via: Series::default(),
-            pipeline_hits: Series::default(),
-            rule_matches: Series::default(),
-            upstream_attempts: Series::default(),
-            upstream_results: Series::default(),
-            metric_series_insert_lock: Mutex::new(()),
+            upstream_latency: Series::named_by(NamedBy::Upstream),
+            upstream_response_latency: Series::named_by(NamedBy::Upstream),
+            upstream_rcodes: Series::named_by(NamedBy::Address),
+            upstream_via: Series::named_by(NamedBy::Upstream),
+            pipeline_hits: Series::named_by(NamedBy::Pipeline),
+            rule_matches: Series::named_by(NamedBy::Rule),
+            upstream_attempts: Series::named_by(NamedBy::Upstream),
+            upstream_results: Series::named_by(NamedBy::Upstream),
+            series_names: Mutex::new(None),
             metric_series_dropped: AtomicU64::new(0),
             reload_success: AtomicU64::new(0),
             reload_failure: AtomicU64::new(0),
@@ -966,11 +1032,11 @@ impl PanelMetrics {
         });
     }
 
-    /// 把 `key` 那一项交给 `update`。头一次出现的统计项在锁里加上；键太长或这一组已满时不加，算作丢弃（见
-    /// [`Self::drop_series`]）。
+    /// 把 `key` 那一项交给 `update`。头一次出现的统计项在锁里加上，当前配置里没有这个名字时不加（见 [`Series`]）；键
+    /// 太长或这一组已满时不加，算作丢弃（见 [`Self::drop_series`]）。
     /// Hands the series under `key` to `update`. A series seen for the first time is added under the
-    /// lock; a key too long or a full set adds nothing and is counted as dropped (see
-    /// [`Self::drop_series`]).
+    /// lock, unless the current configuration lacks its name (see [`Series`]); a key too long or a
+    /// full set adds nothing and is counted as dropped (see [`Self::drop_series`]).
     #[inline]
     fn update_series<V: Default>(&self, series: &Series<V>, key: &str, update: impl Fn(&V)) {
         if series.with(key, &update).is_some() {
@@ -986,9 +1052,18 @@ impl PanelMetrics {
             self.drop_series(series, key);
             return;
         }
-        let locked = self.metric_series_insert_lock.lock();
+        let locked = self.series_names.lock();
         // 等锁的时候别的线程可能已经加上了 / Another thread may have added it while this one waited
         if series.with(key, &update).is_some() {
+            return;
+        }
+        // 配置里没有的名字不加：换配置以前开始的请求还在报的，是刚去掉的项 / A name the configuration
+        // does not have is not added: what a request begun before the change still reports is a
+        // series just taken out
+        if locked
+            .as_ref()
+            .is_some_and(|names| !names.have(series.by, key))
+        {
             return;
         }
         if series.len() >= MAX_METRIC_SERIES_PER_MAP {
@@ -1011,45 +1086,29 @@ impl PanelMetrics {
         }
     }
 
-    /// 每组统计里只留下 `config` 还有的 pipeline、规则和上游的项（见 [`Series`]）。上游的项按地址和传输留，响应码的项
-    /// 不分传输，只按地址
+    /// 每组统计里只留下 `config` 还有的 pipeline、规则和上游的项，此后也只给这些名字加新项（见 [`Series`]）。上游的项
+    /// 按地址和传输留，响应码的项不分传输，只按地址
     /// Keeps in every set only the series of the pipelines, rules and upstreams `config` still
-    /// has (see [`Series`]). An upstream's series are kept by its address and transport, those of
-    /// response codes, which do not tell transports apart, by its address alone
+    /// has, and from then on adds new series for those names alone (see [`Series`]). An
+    /// upstream's series are kept by its address and transport, those of response codes, which
+    /// do not tell transports apart, by its address alone
     fn keep_series_of(&self, config: &ConfigLoaded<'_>) {
-        let pipelines: FxHashSet<&str> = config.pipelines.iter().copied().collect();
-        let rules: FxHashSet<(&str, &str)> = config.rules.iter().copied().collect();
-        let upstreams: FxHashSet<(&str, &str)> = config
-            .upstreams
-            .iter()
-            .map(|&(address, transport)| (address, transport_label(transport)))
-            .collect();
-        let addresses: FxHashSet<&str> = config
-            .upstreams
-            .iter()
-            .map(|&(address, _)| address)
-            .collect();
-        let named_by = |names: &FxHashSet<(&str, &str)>, key: &str| {
-            leading_parts(key).is_some_and(|parts| names.contains(&parts))
-        };
-        let locked = self.metric_series_insert_lock.lock();
-        self.pipeline_hits
-            .retain(&locked, |pipeline| pipelines.contains(pipeline));
-        self.rule_matches
-            .retain(&locked, |key| named_by(&rules, key));
-        self.upstream_rcodes.retain(&locked, |key| {
-            leading_parts(key).is_some_and(|(address, _)| addresses.contains(address))
-        });
-        for series in [&self.upstream_latency, &self.upstream_response_latency] {
-            series.retain(&locked, |key| named_by(&upstreams, key));
-        }
+        let names = ConfiguredNames::of(config);
+        let mut locked = self.series_names.lock();
         for series in [
+            &self.pipeline_hits,
+            &self.rule_matches,
+            &self.upstream_rcodes,
             &self.upstream_via,
             &self.upstream_attempts,
             &self.upstream_results,
         ] {
-            series.retain(&locked, |key| named_by(&upstreams, key));
+            series.retain(&locked, |key| names.have(series.by, key));
         }
+        for series in [&self.upstream_latency, &self.upstream_response_latency] {
+            series.retain(&locked, |key| names.have(series.by, key));
+        }
+        *locked = Some(names);
     }
 
     fn record_reload_failure(&self, error: &str) {
@@ -3535,6 +3594,116 @@ mod tests {
         );
     }
 
+    /// 换配置以前开始的请求，换了配置才报上来的计数，不把去掉的 pipeline、规则和上游的项加回来，导出里也没有；配置里还有
+    /// 的照常计。还没有配置报上来时什么名字都计。以前这样的计数新建了表项，导出里重新出现已经删掉的上游的几行（尝试数为
+    /// 0），一直留到下次换配置
+    /// Counts reported after a change by requests begun before it do not bring back the series of
+    /// the pipelines, rules and upstreams that went, nor do they show in the export; what the
+    /// configuration still has counts as usual. Before any configuration is reported every name
+    /// counts. Such counts used to add series afresh, the export showing the rows of an upstream
+    /// already taken out again (with no attempts) until the next change
+    #[test]
+    fn counts_reported_after_a_change_do_not_bring_back_what_went() {
+        use crate::config::Transport;
+        use crate::observe::{ConfigLoaded, EngineObserver, UpstreamAttempt, UpstreamOutcome};
+        use hickory_proto::op::ResponseCode;
+        let metrics = PanelMetrics::default();
+        let load = |generation, pipelines: &[&str], upstreams: &[(&str, Transport)]| {
+            metrics.config_loaded(&ConfigLoaded {
+                path: None,
+                generation,
+                source: Some("{}"),
+                restart_pending: &[],
+                warnings: &[],
+                pipelines,
+                rules: &[("main", "r")],
+                upstreams,
+            })
+        };
+        let count = |series: &super::Series<super::ThreadCount>, key: &str| {
+            series.with(key, |counter| counter.load(Ordering::Relaxed))
+        };
+        let ctx = request(1, "127.0.0.1:5353", "example.com");
+        let ask = |upstream| {
+            metrics.upstream_attempt(
+                &ctx,
+                &UpstreamAttempt {
+                    upstream,
+                    transport: Transport::Udp,
+                },
+            );
+            metrics.upstream_result(
+                &ctx,
+                &crate::observe::UpstreamResult {
+                    upstream,
+                    ..udp_result(
+                        UpstreamOutcome::Success,
+                        Transport::Udp,
+                        Some(ResponseCode::NoError),
+                        5,
+                    )
+                },
+            );
+            metrics.record_rule_match("main", "r", "request");
+        };
+        let (kept, gone) = ("192.0.2.1:53", "192.0.2.2:53");
+        metrics.record_pipeline_hit("before");
+        assert_eq!(count(&metrics.pipeline_hits, "before"), Some(1));
+
+        load(
+            1,
+            &["main", "old"],
+            &[(kept, Transport::Udp), (gone, Transport::Udp)],
+        );
+        ask(kept);
+        ask(gone);
+        metrics.record_pipeline_hit("old");
+        load(2, &["main"], &[(kept, Transport::Udp)]);
+        // 用第一份配置开始的请求，换了配置才报 / Requests begun under the first configuration,
+        // reporting after the change
+        ask(gone);
+        ask(kept);
+        metrics.record_pipeline_hit("old");
+        metrics.record_rule_match("old", "r", "request");
+
+        assert_eq!(
+            count(&metrics.upstream_attempts, &format!("{gone}\0udp")),
+            None
+        );
+        assert_eq!(
+            count(&metrics.upstream_results, &format!("{gone}\0udp\0success")),
+            None
+        );
+        assert!(
+            !metrics
+                .upstream_rcodes
+                .snapshot()
+                .keys()
+                .any(|key| key.starts_with(gone))
+        );
+        assert!(
+            metrics
+                .upstream_latency
+                .with(&format!("{gone}\0udp"), |_| ())
+                .is_none()
+        );
+        assert_eq!(count(&metrics.pipeline_hits, "old"), None);
+        assert_eq!(count(&metrics.rule_matches, "old\0r\0request"), None);
+        assert_eq!(
+            count(&metrics.upstream_attempts, &format!("{kept}\0udp")),
+            Some(2)
+        );
+        assert_eq!(count(&metrics.rule_matches, "main\0r\0request"), Some(4));
+        let mut output = String::new();
+        super::append_map(
+            &mut output,
+            "kixdns_upstream_attempts_total",
+            &metrics.upstream_attempts,
+            &["upstream", "transport"],
+        );
+        assert!(output.contains(kept) && !output.contains(gone), "{output}");
+    }
+
     /// 代数照引擎报的记，第一次加载就是代数 1 的那次，带不带原文都一样：它不算重载，重载次数和序号不动；之后每次加载
     /// 都是重载。以前面板自己数代数，第一次加载还按带没带原文分两种判断
     /// The generation is the one the engine gives, and the first load is the one at generation
@@ -3778,7 +3947,7 @@ mod tests {
         for index in 0..MAX_METRIC_SERIES_PER_MAP {
             metrics.record_pipeline_hit(&format!("pipeline-{index}"));
         }
-        let held = metrics.metric_series_insert_lock.lock();
+        let held = metrics.series_names.lock();
         let (done, counted) = std::sync::mpsc::channel();
         let counting = std::sync::Arc::clone(&metrics);
         let worker = std::thread::spawn(move || {
@@ -4021,8 +4190,8 @@ mod tests {
             source: Some(source),
             restart_pending: &[],
             warnings: &[],
-            pipelines: &[],
-            rules: &[],
+            pipelines: &["main"],
+            rules: &[("main", "forward-all")],
             upstreams: &[],
         });
         {
