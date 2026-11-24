@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 
 use crate::cache::{CacheEntry, CachedQuestion};
 use crate::ecs_scope::EcsReach;
-use crate::matcher::advanced_rule::{PrecomputedAction, PrecomputedAnswer};
+use crate::matcher::advanced_rule::{PrecomputedAction, StaticAnswer, StaticRecords};
 use crate::matcher::{Requester, RequesterKey, RuntimePipelineConfig};
 use crate::observe::{
     CacheHit, CacheHitKind, DecisionDetail, DecisionKind, DecisionMade, EngineObserver,
@@ -915,21 +915,18 @@ impl Engine {
                             target,
                         },
                     ),
-                    Some((PrecomputedAction::Answer(action), rule_name)) => {
+                    Some((PrecomputedAction::Answer(answer), rule_name)) => {
                         // 规则按配置直接答的不做记录，写不了的才走下面 / What a rule answers straight from the config
                         // makes no records; only what cannot be written goes on below
-                        let direct = match action {
-                            PrecomputedAnswer::Static { rcode } => {
+                        let direct = match answer {
+                            StaticAnswer::Rcode(rcode) => {
                                 Some((*rcode, StaticAddresses::Configured(&[], qtype)))
                             }
-                            PrecomputedAnswer::StaticIp {
-                                addresses: Some(addresses),
-                                ..
-                            } => Some((
+                            StaticAnswer::Records(StaticRecords::Addresses(addresses)) => Some((
                                 ResponseCode::NoError,
                                 StaticAddresses::Configured(addresses, qtype),
                             )),
-                            _ => None,
+                            StaticAnswer::Records(_) => None,
                         };
                         if let Some((rcode, addresses)) = direct
                             && let Some(reply) = write_static_reply(packet, rcode, addresses)
@@ -942,7 +939,7 @@ impl Engine {
                             };
                             return finish_static(reply, answer);
                         }
-                        let (rcode, answers) = action.records(qname_str, qtype, qclass);
+                        let (rcode, answers) = answer.records(qname_str, qtype, qclass);
                         let answer = FastPathAnswer::StaticRule {
                             rule: rule_name,
                             rcode,
@@ -3904,6 +3901,25 @@ mod tests {
     use std::net::Ipv4Addr;
     use tokio::time::Duration;
 
+    /// `static_ip_response` 写成 `ips` 时给这个查询的 RCODE 和记录（见 `StaticAnswer::records`）/ The RCODE and
+    /// records a `static_ip_response` written as `ips` gives this query (see `StaticAnswer::records`)
+    fn make_static_ip_answer(
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+        ips: &str,
+    ) -> (ResponseCode, Vec<Record>) {
+        StaticAnswer::addresses(ips).records(qname, qtype, qclass)
+    }
+
+    /// 照 `raw` 读出、编好的动作（见 `Action::compile_answer`）/ The action `raw` reads as, compiled
+    /// (see `Action::compile_answer`)
+    fn compiled(raw: serde_json::Value) -> Action {
+        let mut action: Action = serde_json::from_value(raw).expect("an action");
+        action.compile_answer();
+        action
+    }
+
     #[test]
     fn make_static_ip_answer_returns_ipv4_record() {
         // Arrange: Define test domain and IPv4 address
@@ -4252,6 +4268,63 @@ mod tests {
                 assert_eq!(cname.0, Name::from_str("origin.example.").unwrap());
             }
             other => panic!("unexpected static CNAME answer: {other:?}"),
+        }
+    }
+
+    /// 第一个动作是哪种作答动作，快速路径都当场答，和完整路径给的一样：静态 TXT 照它的 TTL，写错的 rcode 照完整路径回
+    /// NXDOMAIN（配置检查报过）。以前这两种留给完整路径，快速路径只认 static_response（rcode 写对的）、static_ip_response、
+    /// static_cname_response 和 deny
+    /// Whichever answering action comes first, the fast path answers on the spot, with what the
+    /// full path gives: a static TXT by its TTL, a misspelt rcode NXDOMAIN as on the full path
+    /// (the configuration check reports it). These two used to be left to the full path, the fast
+    /// path taking only static_response (spelt right), static_ip_response, static_cname_response
+    /// and deny
+    #[tokio::test]
+    async fn every_answering_action_is_answered_on_the_fast_path() {
+        for (action, qtype, rcode, ttls) in [
+            (
+                serde_json::json!({ "type": "static_txt_response", "text": "hello", "ttl": 90 }),
+                RecordType::TXT,
+                ResponseCode::NoError,
+                vec![90],
+            ),
+            (
+                serde_json::json!({ "type": "static_response", "rcode": "NXDOMAN" }),
+                RecordType::A,
+                ResponseCode::NXDomain,
+                vec![],
+            ),
+        ] {
+            let engine = engine_from(serde_json::json!({
+                "settings": { "default_upstream": "1.1.1.1:53" },
+                "pipelines": [{ "id": "static", "rules": [{
+                    "name": "static",
+                    "matchers": [{ "type": "any" }],
+                    "actions": [action]
+                }]}]
+            }));
+            let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
+            request.metadata.recursion_desired = true;
+            request.add_query(Query::query(
+                Name::from_str("static.example").unwrap(),
+                qtype,
+            ));
+            let packet = request.to_vec().unwrap();
+            let peer = "127.0.0.1:53000".parse().unwrap();
+            let fast = match engine.handle_packet_fast(&packet, peer) {
+                Some(FastPathResponse::Direct(bytes)) => Message::from_bytes(&bytes).unwrap(),
+                other => panic!("{action}: expected a direct answer, got {other:?}"),
+            };
+            let full =
+                Message::from_bytes(&engine.handle_packet(&packet, peer).await.unwrap()).unwrap();
+            for response in [&fast, &full] {
+                assert_eq!(response.metadata.response_code, rcode, "{action}");
+                assert_eq!(
+                    response.answers.iter().map(|r| r.ttl).collect::<Vec<_>>(),
+                    ttls,
+                    "{action}"
+                );
+            }
         }
     }
 
@@ -4641,9 +4714,7 @@ mod tests {
         let engine = build_test_engine();
         let actions = [
             Action::Allow,
-            Action::StaticIpResponse {
-                ip: "192.0.2.9".to_string(),
-            },
+            compiled(serde_json::json!({ "type": "static_ip_response", "ip": "192.0.2.9" })),
         ];
         let packet = query_packet("example.com", RecordType::A);
         let asked = asked(&engine, "example.com", RecordType::A, &packet);
@@ -4753,9 +4824,10 @@ mod tests {
     async fn response_actions_static_ip_filters_answers_by_query_type() {
         // Arrange: Build test engine with a multi-address static IP response action
         let engine = build_test_engine();
-        let actions = [Action::StaticIpResponse {
-            ip: "192.0.2.1,2001:db8::1,192.0.2.2".to_string(),
-        }];
+        let actions = [compiled(serde_json::json!({
+            "type": "static_ip_response",
+            "ip": "192.0.2.1,2001:db8::1,192.0.2.2"
+        }))];
         let run = async |qtype: RecordType| {
             let asked = asked(
                 &engine,
@@ -4824,10 +4896,11 @@ mod tests {
     #[tokio::test]
     async fn response_actions_static_cname_returns_configured_alias() {
         let engine = build_test_engine();
-        let actions = [Action::StaticCnameResponse {
-            target: "origin.example.".to_string(),
-            ttl: Some(60),
-        }];
+        let actions = [compiled(serde_json::json!({
+            "type": "static_cname_response",
+            "target": "origin.example.",
+            "ttl": 60
+        }))];
         let packet = query_packet("alias.example", RecordType::A);
         let asked = asked(&engine, "alias.example", RecordType::A, &packet);
         let request = asked.request();
@@ -5321,7 +5394,6 @@ mod tests {
     /// For this query, what is written as bytes is byte for byte what hickory builds and shaping then does.
     /// What cannot be written (None) goes the old way, which is right too. Gives how many were compared
     fn static_reply_agrees(packet: &[u8]) -> usize {
-        use super::super::response::make_static_ip_answer;
         const ANSWERS: [(ResponseCode, &str); 8] = [
             (ResponseCode::NoError, ""),
             (ResponseCode::NXDomain, ""),
@@ -5564,8 +5636,8 @@ mod tests {
         // 配置里的地址读一次就留着，不用每个查询读 / The config's addresses are read once and kept, not for every query
         let state = engine.state.load_full();
         assert!(matches!(
-            state.pipeline.pipelines[0].rules[0].precomputed,
-            Some(PrecomputedAction::Answer(PrecomputedAnswer::StaticIp { addresses: Some(ref addresses), .. })) if addresses.len() == 2
+            state.pipeline.pipelines[0].rules[0].precomputed(),
+            Some(PrecomputedAction::Answer(StaticAnswer::Records(StaticRecords::Addresses(addresses)))) if addresses.len() == 2
         ));
         let a = ask("A.Ip.Test.", RecordType::A);
         assert_eq!(a.metadata.response_code, ResponseCode::NoError);

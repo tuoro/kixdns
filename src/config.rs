@@ -9,6 +9,7 @@ use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::matcher::RuntimePipelineConfig;
+use crate::matcher::advanced_rule::StaticAnswer;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PipelineConfig {
@@ -435,25 +436,41 @@ pub enum Action {
     /// 记录日志，level可选：trace/debug/info/warn/error / Log action, level options: trace/debug/info/warn/error
     Log { level: Option<String> },
     /// 固定响应rcode（如 NXDOMAIN/NOERROR）。 / Static response rcode (e.g., NXDOMAIN/NOERROR)
-    StaticResponse { rcode: String },
+    StaticResponse {
+        rcode: String,
+        /// 编好的应答（见 [`Action::compile_answer`]）/ The answer compiled (see [`Action::compile_answer`])
+        #[serde(skip)]
+        answer: StaticAnswer,
+    },
     /// 返回一个或逗号分隔的多个固定 IPv4/IPv6 地址。 / Return one or more comma-separated static IPv4/IPv6 addresses.
-    StaticIpResponse { ip: String },
+    StaticIpResponse {
+        ip: String,
+        /// 编好的应答（见 [`Action::compile_answer`]）/ The answer compiled (see [`Action::compile_answer`])
+        #[serde(skip)]
+        answer: StaticAnswer,
+    },
     /// 返回固定 CNAME 记录。 / Return a static CNAME record.
     StaticCnameResponse {
         /// CNAME 目标域名 / Canonical target domain name
         target: String,
-        /// TTL (可选，默认 300) / TTL (optional, default 300)
+        /// TTL（可选，默认 [`StaticAnswer::DEFAULT_TTL`]）/ TTL (optional, [`StaticAnswer::DEFAULT_TTL`] by default)
         #[serde(default)]
         ttl: Option<u32>,
+        /// 编好的应答（见 [`Action::compile_answer`]）/ The answer compiled (see [`Action::compile_answer`])
+        #[serde(skip)]
+        answer: StaticAnswer,
     },
     /// 返回固定 TXT 记录。支持单个字符串或字符串数组。 / Return static TXT record. Supports single string or string array.
     StaticTxtResponse {
         /// TXT 记录内容 / TXT record content
         #[serde(deserialize_with = "deserialize_txt_text")]
         text: Vec<String>,
-        /// TTL (可选，默认 300) / TTL (optional, default 300)
+        /// TTL（可选，默认 [`StaticAnswer::DEFAULT_TTL`]）/ TTL (optional, [`StaticAnswer::DEFAULT_TTL`] by default)
         #[serde(default)]
         ttl: Option<u32>,
+        /// 编好的应答（见 [`Action::compile_answer`]）/ The answer compiled (see [`Action::compile_answer`])
+        #[serde(skip)]
+        answer: StaticAnswer,
     },
     /// 跳转到指定 Pipeline 继续处理。目标名字读进来就是共用的一份，每次跳转不再各复制一份
     /// Jump to specified Pipeline to continue processing. The target's name is read in as one
@@ -493,6 +510,10 @@ pub enum Action {
         /// 新的 TXT 内容 / New TXT content
         #[serde(deserialize_with = "deserialize_txt_text")]
         text: Vec<String>,
+        /// 换成的应答，编好的（见 [`Action::compile_answer`]）/ The answer it replaces with,
+        /// compiled (see [`Action::compile_answer`])
+        #[serde(skip)]
+        answer: StaticAnswer,
     },
 }
 
@@ -512,6 +533,46 @@ impl Action {
                 split_upstreams(upstream_str).map(Arc::from).collect(),
             ));
             *upstream_shared = Some(Arc::from(upstream_str.as_str()));
+        }
+    }
+
+    /// 把作答动作写的应答编好存在它身上（配置加载时调用）：RCODE、地址、CNAME 目标、TXT 文本和 TTL 都读好，每个查询照它给
+    /// 记录（见 [`StaticAnswer`]）
+    /// Compile the answer an answering action writes and keep it on the action (called at
+    /// config load): the RCODE, addresses, CNAME target, TXT text and TTL read once, every query
+    /// given its records by it (see [`StaticAnswer`])
+    pub fn compile_answer(&mut self) {
+        match self {
+            Action::StaticResponse { rcode, answer } => *answer = StaticAnswer::rcode(rcode),
+            Action::StaticIpResponse { ip, answer } => *answer = StaticAnswer::addresses(ip),
+            Action::StaticCnameResponse {
+                target,
+                ttl,
+                answer,
+            } => *answer = StaticAnswer::cname(target, *ttl),
+            Action::StaticTxtResponse { text, ttl, answer } => {
+                *answer = StaticAnswer::txt(text, *ttl);
+            }
+            Action::ReplaceTxtResponse { text, answer } => *answer = StaticAnswer::txt(text, None),
+            _ => {}
+        }
+    }
+
+    /// 这个动作作答时给的静态应答（static_response、static_ip_response、static_cname_response、static_txt_response、
+    /// deny），别的动作为 None。replace_txt_response 不算：它要换掉手上的应答，没有就不作答
+    /// The static answer this action gives when it answers (static_response,
+    /// static_ip_response, static_cname_response, static_txt_response, deny), None for any other
+    /// action. replace_txt_response does not count: it replaces the answer in hand, and with none
+    /// it gives no answer
+    pub fn static_answer(&self) -> Option<&StaticAnswer> {
+        static DENY: StaticAnswer = StaticAnswer::DENY;
+        match self {
+            Action::StaticResponse { answer, .. }
+            | Action::StaticIpResponse { answer, .. }
+            | Action::StaticCnameResponse { answer, .. }
+            | Action::StaticTxtResponse { answer, .. } => Some(answer),
+            Action::Deny => Some(&DENY),
+            _ => None,
         }
     }
 }
@@ -2219,7 +2280,8 @@ fn rule_problems(
     {
         report(problem);
     }
-    use crate::engine::response::{static_cname_target, txt_size_problem};
+    use crate::engine::response::txt_size_problem;
+    use crate::matcher::static_cname_target;
     use crate::matcher::static_ips;
 
     let forwards = rule
@@ -2280,12 +2342,14 @@ fn rule_problems(
                     }
                 }
             }
-            Action::StaticResponse { rcode } if crate::matcher::parse_rcode(rcode).is_none() => {
+            Action::StaticResponse { rcode, .. }
+                if crate::matcher::parse_rcode(rcode).is_none() =>
+            {
                 report(format!(
                     "rcode \"{rcode}\" is none of NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED"
                 ));
             }
-            Action::StaticIpResponse { ip } if static_ips(ip).is_none() => {
+            Action::StaticIpResponse { ip, .. } if static_ips(ip).is_none() => {
                 report(format!(
                     "ip \"{ip}\" is not a comma-separated list of IP addresses"
                 ));
@@ -2293,7 +2357,7 @@ fn rule_problems(
             Action::StaticCnameResponse { target, .. } if static_cname_target(target).is_none() => {
                 report(format!("cname target \"{target}\" is not a domain name"));
             }
-            Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text } => {
+            Action::StaticTxtResponse { text, .. } | Action::ReplaceTxtResponse { text, .. } => {
                 // 不知道会问什么名字，按最短的根名字算 / What will be asked is unknown, so the
                 // shortest name, the root, is taken
                 if let Some(problem) = txt_size_problem(text, 1) {

@@ -2,41 +2,116 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::RecordType;
+use hickory_proto::rr::{Name, RecordType};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
 use crate::matcher::{RuntimeMatcher, RuntimeRule};
-use crate::matcher::{domain_suffix_index_key, parse_rcode, static_ips};
+use crate::matcher::{domain_suffix_index_key, parse_rcode, static_cname_target, static_ips};
 
-/// 规则当场作出的决定：照配置写好的应答，或跳到另一个 pipeline，快速路径跟过去在那里接着查
-/// What a rule decides on the spot: an answer as the configuration writes it, or a jump to
-/// another pipeline, which the fast path follows to go on looking there
-#[derive(Debug, Clone)]
-pub enum PrecomputedAction {
-    Answer(PrecomputedAnswer),
-    Jump(Arc<str>),
+/// 规则当场作出的决定：它第一个动作编好的静态应答（见 `Action::static_answer`），或跳到另一个 pipeline，快速路径跟过去在
+/// 那里接着查
+/// What a rule decides on the spot: the static answer its first action compiled to (see
+/// `Action::static_answer`), or a jump to another pipeline, which the fast path follows to go on
+/// looking there
+#[derive(Debug, Clone, Copy)]
+pub enum PrecomputedAction<'a> {
+    Answer(&'a StaticAnswer),
+    Jump(&'a Arc<str>),
 }
 
-/// 照配置写好、当场就能给的应答；它给一个查询的记录由引擎做（见 `engine::response`）/ An answer as the
-/// configuration writes it, ready on the spot; the engine makes the records it gives a query
-/// (see `engine::response`)
+impl RuntimeRule {
+    /// 这条规则当场作出的决定：第一个动作是作答动作或跳转时就是它，别的（转发、先记日志的）为 None，交给完整路径
+    /// What this rule decides on the spot: its first action when that answers or jumps, None
+    /// otherwise (a forward, one logging first), left to the full path
+    pub fn precomputed(&self) -> Option<PrecomputedAction<'_>> {
+        let first = self.actions.first()?;
+        match first {
+            Action::JumpToPipeline { pipeline } => Some(PrecomputedAction::Jump(pipeline)),
+            _ => first.static_answer().map(PrecomputedAction::Answer),
+        }
+    }
+}
+
+/// 作答动作照配置写好的静态应答，配置加载时编好、存在动作上（见 `Action::compile_answer`）。快速路径、请求阶段、回答阶段
+/// 都照它给一个查询的 RCODE 和记录（见 `engine::response`），每个查询不再读一遍配置里的文本
+/// The static answer an answering action writes, compiled at config load and kept on the
+/// action (see `Action::compile_answer`). The fast path, the request phase and the response
+/// phase all give a query its RCODE and records by it (see `engine::response`), no query reading
+/// the configuration's text again
 #[derive(Debug, Clone)]
-pub enum PrecomputedAnswer {
-    Static {
-        rcode: ResponseCode,
-    },
-    StaticIp {
-        ip: String,
-        /// `ip` 读出的地址，每个查询不用再读一遍；读不出来时为 None / The addresses `ip` holds, so no query reads it
-        /// again; None when it cannot be read
-        addresses: Option<Box<[IpAddr]>>,
-    },
-    StaticCname {
-        target: String,
-        ttl: u32,
-    },
+pub enum StaticAnswer {
+    /// 只有 RCODE、不带记录：static_response、deny（REFUSED），以及写的地址或 CNAME 目标读不出来时的 SERVFAIL（配置检查
+    /// 报过）
+    /// An RCODE alone, with no records: static_response, deny (REFUSED), and the SERVFAIL of an
+    /// address or CNAME target that cannot be read (which the configuration check reports)
+    Rcode(ResponseCode),
+    /// 按问题给的记录 / Records given by the question
+    Records(StaticRecords),
+}
+
+/// 静态应答按问题给的记录 / The records a static answer gives by the question
+#[derive(Debug, Clone)]
+pub enum StaticRecords {
+    /// static_ip_response 的地址，按问的类型挑 / A static_ip_response's addresses, picked by the
+    /// type asked
+    Addresses(Box<[IpAddr]>),
+    /// static_cname_response 的目标 / A static_cname_response's target
+    Cname { target: Name, ttl: u32 },
+    /// static_txt_response 的文本，replace_txt_response 换成的也是它 / A static_txt_response's
+    /// text, which replace_txt_response replaces the answer with too
+    Txt { text: Box<[String]>, ttl: u32 },
+}
+
+/// 没编过的动作答 SERVFAIL：动作在配置加载时编好（见 `Action::compile_answer`），反序列化出来时还没有
+/// An action not compiled answers SERVFAIL: actions are compiled at config load (see
+/// `Action::compile_answer`), and not yet when deserialized
+impl Default for StaticAnswer {
+    fn default() -> Self {
+        Self::Rcode(ResponseCode::ServFail)
+    }
+}
+
+impl StaticAnswer {
+    /// 静态记录不写 TTL 时用的 TTL，static_ip_response 的地址也是它 / The TTL of static records
+    /// written without one, and of static_ip_response's addresses
+    pub const DEFAULT_TTL: u32 = 300;
+
+    /// deny 的应答 / What deny answers
+    pub const DENY: Self = Self::Rcode(ResponseCode::Refused);
+
+    /// static_response 的应答；读不出来的 RCODE 按 NXDOMAIN / What static_response answers; an
+    /// RCODE that cannot be read as NXDOMAIN
+    pub fn rcode(rcode: &str) -> Self {
+        Self::Rcode(parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain))
+    }
+
+    /// static_ip_response 的应答 / What static_ip_response answers
+    pub fn addresses(ips: &str) -> Self {
+        static_ips(ips).map_or(Self::Rcode(ResponseCode::ServFail), |addresses| {
+            Self::Records(StaticRecords::Addresses(addresses.into_boxed_slice()))
+        })
+    }
+
+    /// static_cname_response 的应答 / What static_cname_response answers
+    pub fn cname(target: &str, ttl: Option<u32>) -> Self {
+        static_cname_target(target).map_or(Self::Rcode(ResponseCode::ServFail), |target| {
+            Self::Records(StaticRecords::Cname {
+                target,
+                ttl: ttl.unwrap_or(Self::DEFAULT_TTL),
+            })
+        })
+    }
+
+    /// static_txt_response 和 replace_txt_response 的应答 / What static_txt_response and
+    /// replace_txt_response answer
+    pub fn txt(text: &[String], ttl: Option<u32>) -> Self {
+        Self::Records(StaticRecords::Txt {
+            text: text.into(),
+            ttl: ttl.unwrap_or(Self::DEFAULT_TTL),
+        })
+    }
 }
 
 /// 一个条件能让规则记在索引的哪一格 / Where in the index a condition can file a rule
@@ -152,31 +227,4 @@ impl RuleIndex {
         out.dedup();
         out
     }
-}
-
-/// 规则当场作出的决定：第一个动作是照配置写好的应答或跳转时就是它，别的（转发、先记日志的）为 None
-/// What a rule decides on the spot: its first action when that is an answer as the
-/// configuration writes it or a jump, None otherwise (a forward, one logging first)
-pub(super) fn precompute_action(actions: &[Action]) -> Option<PrecomputedAction> {
-    let answer = match actions.first()? {
-        Action::StaticResponse { rcode } => PrecomputedAnswer::Static {
-            rcode: parse_rcode(rcode)?,
-        },
-        Action::StaticIpResponse { ip } => PrecomputedAnswer::StaticIp {
-            ip: ip.clone(),
-            addresses: static_ips(ip).map(Vec::into_boxed_slice),
-        },
-        Action::StaticCnameResponse { target, ttl } => PrecomputedAnswer::StaticCname {
-            target: target.clone(),
-            ttl: ttl.unwrap_or(300),
-        },
-        Action::Deny => PrecomputedAnswer::Static {
-            rcode: ResponseCode::Refused,
-        },
-        Action::JumpToPipeline { pipeline } => {
-            return Some(PrecomputedAction::Jump(Arc::clone(pipeline)));
-        }
-        _ => return None,
-    };
-    Some(PrecomputedAction::Answer(answer))
 }
