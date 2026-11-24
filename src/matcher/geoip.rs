@@ -739,8 +739,8 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-/// `geoip_private`、`response_answer_ip_geoip_private` 和 ECS 都算作内网的地址，只有这一份（ECS 另外再算一个转换前缀，见
-/// `ecs::is_private_ip`）。连过去到的是本机、本地网络或运营商的内部网络，或者哪儿也到不了的地址：
+/// `geoip_private`、`response_answer_ip_geoip_private` 和 ECS 都算作内网的地址，只有这一份（ECS 另外再算一个转换前缀和基准测试
+/// 网段，见 `ecs::is_private_ip`）。连过去到的是本机、本地网络或运营商的内部网络，或者哪儿也到不了的地址：
 /// - IPv4：RFC 1918 私有网段，运营商级 NAT 的共享地址 100.64.0.0/10（RFC 6598，Tailscale 也用它），回环，链路本地，
 ///   「本网络」0.0.0.0/8，IETF 协议分配 192.0.0.0/24（RFC 6890，DS-Lite 等的内部地址），受限广播 255.255.255.255。
 ///   0.0.0.0/8 和 `::` 一样不是哪台主机的地址（RFC 791），连 0.0.0.0 在 Linux、macOS 上连的是本机，回答它和回答
@@ -751,11 +751,11 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
 ///   的写法）：连过去，转换网关连的就是那个 IPv4 地址，嵌着内网地址的照样能拿来重绑定，嵌着公网地址的是 DNS64 的
 ///   寻常回答
 ///
-/// 基准测试的 198.18.0.0/15（RFC 2544）不算：它是 Clash、mihomo 等 fake-ip 的默认网段，算进去的话，转给 fake-ip 上游的
-/// 查询，回答都会被防重绑定的规则拦下。文档用的网段（192.0.2.0/24 这些）也不算：不可全球路由，却也不在哪个内网里
+/// 基准测试的 198.18.0.0/15（RFC 2544）不算（ECS 另外排除它）：它是 Clash、mihomo 等 fake-ip 的默认网段，算进去的话，
+/// 转给 fake-ip 上游的查询，回答都会被防重绑定的规则拦下。文档用的网段（192.0.2.0/24 这些）也不算：不可全球路由，却也不在哪个内网里
 /// The addresses `geoip_private`, `response_answer_ip_geoip_private` and ECS count as local
-/// network ones, this one list alone (ECS counts one translation prefix more, see
-/// `ecs::is_private_ip`). Connecting to them reaches this machine, the local network or the
+/// network ones, this one list alone (ECS counts one translation prefix and the benchmarking
+/// range more, see `ecs::is_private_ip`). Connecting to them reaches this machine, the local network or the
 /// operator's internal network, or nowhere at all:
 /// - IPv4: the RFC 1918 private networks, carrier-grade NAT's shared space 100.64.0.0/10
 ///   (RFC 6598, which Tailscale uses too), loopback, link-local, "this network" 0.0.0.0/8,
@@ -771,8 +771,8 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
 ///   translator connects to that IPv4 address, so one embedding a local address rebinds all
 ///   the same, while one embedding a public address is an ordinary DNS64 answer
 ///
-/// Benchmarking's 198.18.0.0/15 (RFC 2544) does not count: it is the default fake-ip range of
-/// Clash, mihomo and the like, and counted, every answer to a query forwarded to a fake-ip
+/// Benchmarking's 198.18.0.0/15 (RFC 2544) does not count (ECS leaves it out separately): it
+/// is the default fake-ip range of Clash, mihomo and the like, and counted, every answer to a query forwarded to a fake-ip
 /// upstream would be stopped by anti-rebinding rules. Nor do the documentation networks
 /// (192.0.2.0/24 and the like): not globally routable, yet not on any local network either
 #[inline]
