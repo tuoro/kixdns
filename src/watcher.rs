@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::config;
 use crate::engine::Engine;
@@ -481,6 +481,17 @@ fn pump(
             Some(burst) => rx.recv_timeout(burst.due().saturating_duration_since(Instant::now())),
         };
         match message {
+            // 漏了事件（比如 inotify 的队列满了）时 notify 报一个不带路径的 Rescan：什么都可能改过，每个文件都当写完了
+            // When events were missed (inotify's queue overflowing, say) notify reports a Rescan
+            // naming no path: anything may have changed, and every file counts as written
+            Ok(Message::Event(Ok(event))) if event.need_rescan() => {
+                error!("the file watcher missed events, reading every watched file again");
+                let now = Instant::now();
+                let burst = burst.get_or_insert_with(|| Burst::new(now));
+                for index in 0..targets.files.len() {
+                    burst.note(index, now + Change::Written.settle(close_reported));
+                }
+            }
             Ok(Message::Event(Ok(event))) => {
                 let Some((change, paths)) = Change::of(&event) else {
                     continue;
@@ -492,8 +503,10 @@ fn pump(
                         .note(index, now + change.settle(close_reported));
                 }
             }
+            // 出了错，改动可能就看不到了；默认日志级别是 error，记成 warn 谁也看不到 / After an error
+            // changes may go unseen; the default log level is error, and a warn would show nowhere
             Ok(Message::Event(Err(err))) => {
-                warn!(error = %err, "watcher event error");
+                error!(error = %err, "file watcher error, changes may go unseen");
             }
             // 只有一阵改动在等时才会超时 / Only a burst being waited for times out
             Err(RecvTimeoutError::Timeout) => {
@@ -700,6 +713,73 @@ mod tests {
             Change::of(&both),
             Some((Change::Written, std::slice::from_ref(&to)))
         );
+    }
+
+    /// notify 漏了事件（比如 inotify 的队列满了）时报的 Rescan 不带路径：什么都可能改过，每个文件都回调一次，记一条
+    /// error；notify 报的错也记 error。以前 Rescan 当成无关的事件丢掉，期间的改动不重载、什么也不记，报的错只记 warn，
+    /// 默认日志级别下看不到
+    /// The Rescan notify reports when events were missed (inotify's queue overflowing, say)
+    /// names no path: anything may have changed, so every file is called back once and an
+    /// error is logged; an error notify reports is logged as an error too. A Rescan used to be
+    /// dropped as no concern, the changes meanwhile never read again with not a word logged,
+    /// and an error was a warn, unseen at the default log level
+    #[test]
+    fn a_rescan_calls_every_file_back_and_errors_are_logged() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        struct Errors(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Errors {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::ERROR {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 不建这两个文件，免得真的事件也回调它们 / The files are not created, so that no real
+        // event calls them back too
+        let files = [dir.path().join("a.json"), dir.path().join("b.json")];
+        let PendingWatch {
+            mut watcher,
+            mut targets,
+            tx,
+            rx,
+        } = PendingWatch::new(&files).expect("watch");
+        let rescan = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        tx.send(Message::Event(Ok(rescan))).unwrap();
+        tx.send(Message::Event(Err(notify::Error::generic("broken"))))
+            .unwrap();
+        // 一个都不回调时也停得下来 / Stops even when nothing is called back
+        let stop = tx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            let _ = stop.send(Message::Stop);
+        });
+
+        let errors = std::sync::Arc::default();
+        let subscriber =
+            tracing_subscriber::registry().with(Errors(std::sync::Arc::clone(&errors)));
+        let mut called = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            pump(
+                &mut watcher,
+                &mut targets,
+                &rx,
+                |path| {
+                    called.push(path.to_path_buf());
+                    if called.len() == files.len() {
+                        let _ = tx.send(Message::Stop);
+                    }
+                },
+                |_, _| {},
+            );
+        });
+        called.sort();
+        assert_eq!(called, files);
+        assert_eq!(errors.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     /// 一阵改动等到每个文件都安静下来：写着的文件晚，其它文件早安静了也得等它；它写完了就按它的时刻；
