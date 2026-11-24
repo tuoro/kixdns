@@ -482,6 +482,79 @@ async fn dot_connect_and_handshake_are_bounded_by_the_request_budget() {
     );
 }
 
+/// DoT 上游收下 TCP 连接、TLS 握手却一直不回（中间设备吞掉带 SNI 的 ClientHello 常是这样）：到建连的时限失败，原因里
+/// 写着连的是哪个地址、多久没回应
+/// A DoT upstream taking the TCP connection and never answering the TLS handshake (as a
+/// middlebox swallowing a ClientHello with SNI often does) fails at the connect's time limit,
+/// its cause naming the address dialled and how long it went unanswered
+#[tokio::test]
+async fn a_dot_handshake_left_unanswered_names_the_address() {
+    let addr = silent_tcp_listener().await;
+    let client = DotMuxClient::new(
+        Arc::from(format!("{addr}?sni=localhost")),
+        Arc::new(build_tls_client_config().expect("tls config")),
+    );
+    let err = format!(
+        "{:#}",
+        client.connect_for_tests().await.expect_err("no handshake")
+    );
+    let waited = err
+        .split_once(&format!("connect {addr}: no answer in "))
+        .and_then(|(_, rest)| rest.split_once("ms"))
+        .and_then(|(ms, _)| ms.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("{err}"));
+    assert!((4900..5500).contains(&waited), "{err}");
+}
+
+/// 名字解析出两个地址，127.0.0.1 上同一个端口收下 TCP 连接、TLS 握手却从不回，::1 上是 DoT 上游：握手算在每个地址的
+/// 尝试里，过了 `ATTEMPT_DELAY` 就连 ::1，连同握手连上，查询答得上
+/// A name resolving to two addresses, the same port of 127.0.0.1 taking the TCP connection and
+/// never answering the TLS handshake, with a DoT upstream on ::1: the handshake is part of each
+/// address's attempt, so ::1 is dialled after `ATTEMPT_DELAY`, connected handshake and all, and
+/// the query is answered
+#[tokio::test]
+async fn a_dot_handshake_not_answered_moves_on_to_the_next_address() {
+    let names = crate::engine::test_support::loopback_bootstrap(300).await;
+    let bootstrap = Bootstrap::new(
+        &names.address,
+        Arc::new(crate::engine::transport::UdpClient::new(1).expect("UDP client")),
+    );
+    let (server, client_tls) = localhost_tls(&[]);
+    let mut port = None;
+    for _ in 0..20 {
+        let Some(v6) = spawn_stream_upstream_on("[::1]:0", Some(server.clone()), None).await else {
+            eprintln!("skipped: IPv6 loopback unavailable on this host");
+            return;
+        };
+        if let Ok(silent) = tokio::net::TcpListener::bind(("127.0.0.1", v6.port())).await {
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = silent.accept().await {
+                    held.push(stream);
+                }
+            });
+            port = Some(v6.port());
+            break;
+        }
+    }
+    let port = port.expect("a port free on both loopbacks");
+    let client = DotMuxClient::with_shared(
+        (Arc::new(client_tls), bootstrap),
+        Arc::from(format!("upstream.test:{port}?sni=localhost")),
+        Aging::for_tests(),
+    );
+    let started = tokio::time::Instant::now();
+    client
+        .send(&udp_test_query("named.example"), Duration::from_secs(2))
+        .await
+        .expect("the second address answers");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "answered after {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn a_dot_handshake_outlives_the_query_that_started_it() {
     // 发起建连的查询在 TLS 握手做完前被取消了（竞速时别的上游先答完），握手照样做完，下一个查询直接用上，不另建
@@ -678,9 +751,13 @@ async fn a_failed_connect_backs_off_before_the_next() {
         .send(&query, Duration::from_secs(1))
         .await
         .expect_err("still backing off");
+    // 退避期间的错误照样说着上次为什么失败 / The error while backing off still tells why the last one failed
+    let backing_off = backing_off.to_string();
     assert!(
-        backing_off.to_string().contains("failed lately"),
-        "{backing_off:#}"
+        backing_off.starts_with("connect failed ")
+            && backing_off.contains(&format!("connect {addr}: tls handshake failed"))
+            && backing_off.contains("trying again in"),
+        "{backing_off}"
     );
     assert_eq!(
         accepted.load(Ordering::Relaxed),

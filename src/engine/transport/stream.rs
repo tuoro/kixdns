@@ -77,7 +77,7 @@ impl StreamTransport for Tcp {
         upstream: &str,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<(Self::Read, OwnedWriteHalf)> {
-        let stream = connect_tcp(bootstrap, upstream, deadline)
+        let stream = connect_tcp(bootstrap, upstream, deadline, |stream| async { Ok(stream) })
             .await
             .map_err(|e| anyhow::anyhow!("tcp connect failed: {e:#}"))?;
         let (read, write) = stream.into_split();
@@ -1070,13 +1070,15 @@ impl StreamTransport for Dot {
     ) -> anyhow::Result<(Self::Read, Self::Write)> {
         let target = parse_dot_target(upstream)?;
         let server_name = build_server_name(&target.sni)?;
-        let stream = connect_tcp(bootstrap, &target.connect_addr, deadline)
-            .await
-            .map_err(|e| anyhow::anyhow!("dot connect failed: {e:#}"))?;
-        let tls_stream = TlsConnector::from(tls_config.clone())
-            .connect(server_name, stream)
-            .await
-            .context("dot tls handshake failed")?;
+        let tls = TlsConnector::from(tls_config.clone());
+        // TLS 握手算在每个地址的尝试里（见 `connect_tcp`）/ The TLS handshake is part of each address's
+        // attempt (see `connect_tcp`)
+        let tls_stream = connect_tcp(bootstrap, &target.connect_addr, deadline, |stream| {
+            let handshake = tls.connect(server_name.clone(), stream);
+            async { handshake.await.context("tls handshake failed") }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("dot connect failed: {e:#}"))?;
         Ok(tokio::io::split(tls_stream))
     }
 }

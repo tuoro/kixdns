@@ -226,12 +226,14 @@ async fn watch(slot: Weak<Slot>, conn: Weak<H2Conn>, wear: Arc<Wear>, aging: Agi
     }
 }
 
-/// 连上 `url`：TCP 和 TCP、DoT 上游一样经 `transport::connect_tcp` 连（主机名交给 `bootstrap` 解析，几个地址错开着连，
-/// 最晚到建连的期限 `deadline`），TLS 握手报 h2 和 http/1.1。对方选了 h2 就做 HTTP/2 握手，把连接交给后台任务；没选时是 None
-/// Connects to `url`: TCP through `transport::connect_tcp`, as TCP and DoT upstreams are (the
-/// host name resolved by `bootstrap`, several addresses connected to staggered, by the connect's
-/// `deadline`), a TLS handshake offering h2 and http/1.1. When the peer picks h2 the HTTP/2
-/// handshake follows and a background task drives the connection; otherwise None
+/// 连上 `url`：和 TCP、DoT 上游一样经 `transport::connect_tcp` 连（主机名交给 `bootstrap` 解析，几个地址错开着连，
+/// 最晚到建连的期限 `deadline`），每个地址的尝试连同 TLS 握手，握手报 h2 和 http/1.1。对方选了 h2 就做 HTTP/2 握手，把
+/// 连接交给后台任务；没选时是 None
+/// Connects to `url` through `transport::connect_tcp`, as TCP and DoT upstreams are (the host
+/// name resolved by `bootstrap`, several addresses connected to staggered, by the connect's
+/// `deadline`), each address's attempt taking in the TLS handshake, which offers h2 and
+/// http/1.1. When the peer picks h2 the HTTP/2 handshake follows and a background task drives
+/// the connection; otherwise None
 async fn connect(
     url: &Url,
     tls: &Arc<ClientConfig>,
@@ -245,18 +247,20 @@ async fn connect(
         Host::Ipv6(ip) => ServerName::IpAddress(std::net::IpAddr::V6(*ip).into()),
     };
     let port = url.port_or_known_default().context("doh url has no port")?;
+    let tls = tokio_rustls::TlsConnector::from(Arc::clone(tls));
     // 主机写成 URL 里的样子，IPv6 带着方括号 / The host as a URL writes it, an IPv6 one in brackets
-    let tcp = connect_tcp(bootstrap, &format!("{host}:{port}"), deadline)
-        .await
-        .context("doh connect failed")?;
-    let stream = tokio_rustls::TlsConnector::from(Arc::clone(tls))
-        .connect(server_name, tcp)
-        .await
-        .context("doh tls handshake failed")?;
-    if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
-        return Ok(None);
-    }
-    handshake(stream).await.map(Some)
+    connect_tcp(bootstrap, &format!("{host}:{port}"), deadline, |tcp| {
+        let tls_handshake = tls.connect(server_name.clone(), tcp);
+        async {
+            let stream = tls_handshake.await.context("tls handshake failed")?;
+            if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
+                return Ok(None);
+            }
+            handshake(stream).await.map(Some)
+        }
+    })
+    .await
+    .context("doh connect failed")
 }
 
 /// 一条连接上记着多少个取消了的请求、各记多久。请求被放弃时（时限先到、几个上游竞速它输了）流被取消，上游的回答

@@ -368,14 +368,17 @@ async fn a_failed_doh_connect_is_neither_sent_again_nor_counted() {
 }
 
 /// TCP 连上了、TLS 握手却一直不答的 DoH 上游，直连和经 reqwest 都一样：建连到 [`CONNECT_BUDGET`] 就算没连上，不重发，
-/// 也不算进重建连接池的门槛，不用等满请求自己的时限
+/// 也不算进重建连接池的门槛，不用等满请求自己的时限。直连的握手算在连这个地址的尝试里，原因写着连的是哪个地址、多久没回应
 /// A DoH upstream taking the TCP connection and never answering the TLS handshake, directly or
 /// through reqwest alike: the connect counts as no connection at [`CONNECT_BUDGET`], is not sent
-/// again and does not count toward rebuilding the pool, without the request's own limit running out
+/// again and does not count toward rebuilding the pool, without the request's own limit running
+/// out. A direct handshake is part of the attempt at the address, so the cause names the address
+/// dialled and how long it went unanswered
 #[tokio::test]
 async fn a_doh_handshake_left_unanswered_is_not_counted() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream = format!("{}/dns-query", listener.local_addr().unwrap());
+    let address = listener.local_addr().unwrap();
+    let upstream = format!("{address}/dns-query");
     let accepted = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&accepted);
     tokio::spawn(async move {
@@ -394,10 +397,17 @@ async fn a_doh_handshake_left_unanswered_is_not_counted() {
                 client.reqwest_only_for_tests();
             }
             let started = tokio::time::Instant::now();
-            client
+            let err = client
                 .send(&doh_test_query("silent"), upstream, budget)
                 .await
                 .expect_err("no connection");
+            if direct {
+                let err = format!("{err:#}");
+                assert!(
+                    err.contains(&format!("connect {address}: no answer in ")),
+                    "{err}"
+                );
+            }
             assert_eq!(
                 client.rebuilds(upstream),
                 0,
