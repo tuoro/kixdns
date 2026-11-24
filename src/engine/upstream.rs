@@ -2236,7 +2236,7 @@ mod tests {
                 &packet,
                 &upstream,
                 Duration::from_secs(2),
-                None,
+                Transport::Udp,
                 None,
                 None,
                 None,
