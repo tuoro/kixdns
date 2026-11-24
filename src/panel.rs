@@ -179,14 +179,14 @@ struct ActiveConfig {
     loaded_at_unix: u64,
     last_reload_success: bool,
     last_reload_error: Option<String>,
-    /// 上一次重载拒掉配置的原因（见 `config::Problems`：配置问题、说不通的设置、编译不了的匹配器），每条截到
-    /// [`MAX_ERROR_LENGTH`]，一条不落；`last_reload_error` 是它们连起来的一句，截到同样长，原因多了就列不全。重载成功
-    /// 或者因为别的原因失败时为空
+    /// 上一次重载拒掉配置的原因（见 `config::Problems`：配置问题、监听地址和 DoH 的前提、说不通的设置、编译不了的
+    /// 匹配器），每条截到 [`MAX_ERROR_LENGTH`]，一条不落；`last_reload_error` 是它们连起来的一句，截到同样长，原因多了
+    /// 就列不全。重载成功或者因为别的原因失败时为空
     /// What the last reload refused the configuration for (see `config::Problems`: its problems,
-    /// settings that make no sense, matchers that do not compile), each cut to
-    /// [`MAX_ERROR_LENGTH`], none left out; `last_reload_error` is them joined into one sentence and
-    /// cut to the same length, which leaves some out when there are many. Empty when the reload
-    /// succeeded or failed for another reason
+    /// the listener addresses and DoH prerequisites, settings that make no sense, matchers that do
+    /// not compile), each cut to [`MAX_ERROR_LENGTH`], none left out; `last_reload_error` is them
+    /// joined into one sentence and cut to the same length, which leaves some out when there are
+    /// many. Empty when the reload succeeded or failed for another reason
     last_reload_problems: Vec<String>,
     /// 当前配置改了、但要重启才生效的设置（见 `ConfigLoaded::restart_pending`）
     /// Settings the current configuration changes that take a restart to apply (see
@@ -2285,11 +2285,13 @@ fn request_invalid(what: &str, error: impl std::fmt::Display) -> Rejection {
 }
 
 /// 配置用不了：422，`message` 是错误连同原因链，截到 [`MAX_ERROR_LENGTH`]；编译时被拒的，`problems` 逐条列出拒掉的
-/// 原因（见 `config::Problems`：配置问题、说不通的设置、编译不了的匹配器），每条截到同样长，一条不落，别的错误时为空
+/// 原因（见 `config::Problems`：配置问题、监听地址和 DoH 的前提、说不通的设置、编译不了的匹配器），每条截到同样长，
+/// 一条不落，别的错误时为空
 /// A configuration that cannot be used: 422, `message` the error with its cause chain, cut to
 /// [`MAX_ERROR_LENGTH`]; when compiling refused it, `problems` lists the reasons one by one (see
-/// `config::Problems`: its problems, settings that make no sense, matchers that do not compile),
-/// each cut to the same length and none left out, empty for any other error
+/// `config::Problems`: its problems, the listener addresses and DoH prerequisites, settings that
+/// make no sense, matchers that do not compile), each cut to the same length and none left out,
+/// empty for any other error
 fn config_invalid(error: &anyhow::Error) -> Rejection {
     let mut body = error_json(
         "config_invalid",
