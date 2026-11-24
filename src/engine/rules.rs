@@ -60,15 +60,39 @@ impl Decision {
     /// 没有规则作出决策时：用 UDP 转发给默认上游 / When no rule decides: forwarded over UDP to
     /// the default upstream
     pub(crate) fn default_forward(settings: &crate::config::GlobalSettings) -> Self {
+        Self::to_default_upstream(settings, Arc::clone(&DEFAULT_RULE_NAME), None)
+    }
+
+    /// 排第 `rule_index` 的规则 `rule_name` 的 `allow`：和没有规则作出决策时一样转发给默认上游，continue 之后复用规则越过的
+    /// 应答（见 `Route::reused_response`）
+    /// The `allow` of rule `rule_name` at `rule_index`: forwarded to the default upstream as
+    /// when no rule decides, reusing the answer a rule continued past after a continue (see
+    /// `Route::reused_response`)
+    pub(crate) fn allow(
+        settings: &crate::config::GlobalSettings,
+        rule_name: Arc<str>,
+        rule_index: usize,
+    ) -> Self {
+        Self::to_default_upstream(settings, rule_name, Some(rule_index))
+    }
+
+    /// 用 UDP 转发给默认上游，记在 `rule_name` 下；规则（排第 `rule_index`）的 allow 复用越过的应答，没有规则作出决策时不复用
+    /// Forwarded over UDP to the default upstream, under `rule_name`; a rule's allow (at
+    /// `rule_index`) reuses the answer continued past, the default with no rule deciding does not
+    fn to_default_upstream(
+        settings: &crate::config::GlobalSettings,
+        rule_name: Arc<str>,
+        rule_index: Option<usize>,
+    ) -> Self {
         Decision::Forward {
             upstream: settings.default_upstream_arc(),
             pre_split_upstreams: settings.default_upstream_pre_split.clone(),
             response_phase: None,
-            rule_name: Arc::clone(&DEFAULT_RULE_NAME),
-            rule_index: None,
+            rule_name,
+            rule_index,
             transport: Transport::Udp,
             ecs: None,
-            allow_reuse: false,
+            allow_reuse: rule_index.is_some(),
         }
     }
 }
@@ -565,11 +589,6 @@ async fn run_response_actions(
     })
 }
 
-/// 响应动作照请求给出的静态应答，带着它记录里最小的 TTL：照线上格式从客户端的查询写（见 `response::static_reply`），不为它
-/// 解析请求
-/// A static answer the response actions give for the request, with the least TTL of its records:
-/// written on the wire from the client's query (see `response::static_reply`), with no parse of
-/// the request for it
 /// 执行 log 动作：按 `level`（trace、debug、warn、error，别的和不写都是 info）记下命中的 Pipeline 和规则、查询名、查询类型
 /// 和客户端地址
 /// Runs a log action: records the pipeline and rule that matched, the query name, the query type
@@ -601,6 +620,11 @@ pub(crate) fn log_match(
     }
 }
 
+/// 响应动作照请求给出的静态应答，带着它记录里最小的 TTL：照线上格式从客户端的查询写（见 `response::static_reply`），不为它
+/// 解析请求
+/// A static answer the response actions give for the request, with the least TTL of its records:
+/// written on the wire from the client's query (see `response::static_reply`), with no parse of
+/// the request for it
 fn static_answer(
     request: &Request<'_>,
     rcode: ResponseCode,

@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::{DNSClass, RecordType};
 use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
@@ -85,26 +84,29 @@ impl<'a> RuleEvaluationContext<'a> {
 }
 
 impl Engine {
-    /// `pipeline` 对这个问题、按规则对 `requester` 的判定在规则缓存里的问题（见 [`RuleQuestion`]）。规则的决定从不取决于
-    /// ECS：规则缓存的判定只有请求匹配器的那些（见 `RuntimePipeline::rule_requester`）
-    /// The rule cache question of `pipeline` for this question, by how the rules judge
-    /// `requester` (see [`RuleQuestion`]). Rule decisions never depend on ECS: the rule cache
-    /// judges by the request matchers alone (see `RuntimePipeline::rule_requester`)
+    /// `pipeline` 对请求 `facts` 在规则缓存里的问题，按规则对请求方的判定（见 [`RuleQuestion`]）。规则的决定从不取决于
+    /// ECS：规则缓存的判定只有请求匹配器的那些（见 `RuntimePipeline::rule_requester`），它们只看请求的事实
+    /// The rule cache question of `pipeline` for request `facts`, by how the rules judge the
+    /// requester (see [`RuleQuestion`]). Rule decisions never depend on ECS: the rule cache
+    /// judges by the request matchers alone (see `RuntimePipeline::rule_requester`), which read
+    /// the request's facts and nothing more
     pub(crate) fn rule_question<'a>(
         &self,
         cache_namespace: u64,
         pipeline: &'a RuntimePipeline,
-        qname: &'a str,
-        qtype: RecordType,
-        qclass: DNSClass,
-        requester: Requester,
+        facts: &RequestFacts<'a>,
     ) -> RuleQuestion<'a> {
+        let requester = Requester {
+            address: facts.client_ip,
+            edns: facts.edns_present,
+            ecs: None,
+        };
         RuleQuestion::new(
             cache_namespace,
             &pipeline.id,
-            qname,
-            qtype,
-            qclass,
+            facts.qname,
+            facts.qtype,
+            facts.qclass,
             pipeline.rule_requester.key(requester, &self.geoip_manager),
         )
     }
@@ -163,18 +165,7 @@ impl Engine {
             ..
         } = *request;
         // 1. Check Rule Cache
-        let question = self.rule_question(
-            state.cache_namespace(&pipeline.id),
-            pipeline,
-            facts.qname,
-            facts.qtype,
-            facts.qclass,
-            Requester {
-                address: facts.client_ip,
-                edns: facts.edns_present,
-                ecs: None,
-            },
-        );
+        let question = self.rule_question(state.cache_namespace(&pipeline.id), pipeline, facts);
         // Resuming after a continue, this evaluation does not give the pipeline's decision
         // for the name, so it neither reads nor writes the rule cache. A background refresh
         // evaluates the whole pipeline: it does not read the cache but still writes its
@@ -356,17 +347,11 @@ impl Engine {
                             return Some(d);
                         }
                         Action::Allow => {
-                            let d = Decision::Forward {
-                                upstream: state.pipeline.settings.default_upstream_arc(),
-                                pre_split_upstreams: None,
-                                response_phase: None,
-                                rule_name: rule.name.clone(),
-                                rule_index: Some(idx),
-                                transport: Transport::Udp,
-                                ecs: None,
-                                allow_reuse: true,
-                            };
-                            return Some(d);
+                            return Some(Decision::allow(
+                                &state.pipeline.settings,
+                                rule.name.clone(),
+                                idx,
+                            ));
                         }
                         Action::Deny => {
                             let d = Decision::Static {

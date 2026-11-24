@@ -75,7 +75,7 @@ DoH 上游回 429 Too Many Requests 时，只在它开始暂停那一刻记一�
 内部后台刷新和中间转发尝试也不计入。`cache_hit` 仅在响应缓存提供应答时为真；
 旧的 `cache` 字段已移除，因为它曾表示“结果可缓存”，改名后含义会静默翻转。
 RCODE 取自实际应答，应答无法解析为 DNS 时省略。
-失败或取消且没有应答的请求使用 `event="dns_request_finished"` 和 `status`，不猜测 RCODE。
+取消了、没有应答的请求使用 `event="dns_request_finished"` 和 `status`，不猜测 RCODE（以错误结束的请求回 SERVFAIL，照样记 `dns_response`）。
 并发合并的跟随请求标为 `upstream="inflight"`，因为共享结果不携带原请求的上游身份。
 
 旧日志没有 `cache_hit`，其中 `cache=true` 可能表示上游应答可缓存，部分响应路径也未记录。
