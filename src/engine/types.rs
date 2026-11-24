@@ -1,8 +1,9 @@
+use crate::cache::CachedQuestion;
 use crate::config::{Action, EcsMode, GlobalSettings, MatchOperator};
 use crate::ecs::EcsKey;
 use crate::engine::Engine;
 use crate::matcher::{
-    GeoManagers, RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline,
+    GeoManagers, Requester, RequesterKey, ResponsePhase, RuntimeMatcher, RuntimePipeline,
     RuntimePipelineConfig, RuntimeResponseMatcher,
 };
 use crate::proto_utils::QueryFlags;
@@ -25,13 +26,13 @@ pub type InflightMap = DashMap<u64, InflightEntry, FxBuildHasher>;
 /// requests then forwarding themselves (see `InflightCleanupGuard`)
 pub type InflightResult = Option<Bytes>;
 
-/// 一个请求在一个 pipeline 下问的问题：算它的响应缓存槽位和 inflight 键用到的全部输入（见 [`Self::keys`]）。请求（见
-/// `Request::question`）和快速路径都只照它算键，转发也照路线算键时的那一份在 inflight 表里登记、等待（见
+/// 一个请求在一个 pipeline 下问的问题：算它的响应缓存槽位和 inflight 键用到的全部输入（见 [`Self::keys`]）。请求和快速路径
+/// 都只照它算键（见 `EngineInner::question`），转发也照路线算键时的那一份在 inflight 表里登记、等待（见
 /// `Route::question`）。键只是这些输入的哈希，带了密钥也难免有两个不同问题落在同一个键上；所以登记时把问题存进条目，等待
 /// 之前先核对（见 `InflightEntry::asks`），对不上就自己转发
 /// The question a request asks under one pipeline: everything its response cache slot and its
-/// inflight key are computed from (see [`Self::keys`]). The request (see `Request::question`)
-/// and the fast path compute keys from it alone, and a forward registers and waits in the
+/// inflight key are computed from (see [`Self::keys`]). The request and the fast path compute
+/// keys from it alone (see `EngineInner::question`), and a forward registers and waits in the
 /// inflight map under the one its route's keys came from (see `Route::question`). The key is
 /// only a hash of these, keyed or not, and two different questions may still land on one key;
 /// the question is therefore stored in the entry when it is registered and checked before
@@ -341,7 +342,8 @@ mod inflight_entry_tests {
 /// - `Direct`: already has correct TXID and can be sent as-is.
 /// - `CacheHit`: carries cached bytes (with an old TXID) and the request TXID to patch.
 ///   Also includes how long it sat in the cache, to age its TTLs (RFC 1035 §5.2).
-/// - `AsyncNeeded`: cache miss, needs async processing. Contains pre-parsed data to avoid re-parsing.
+/// - `AsyncNeeded`: not answered on the spot, goes on to the async path with what the fast path
+///   read, parsed no second time.
 #[derive(Debug, Clone)]
 pub enum FastPathResponse {
     Direct(Bytes),
@@ -351,9 +353,12 @@ pub enum FastPathResponse {
         /// Whole seconds it sat in the cache, for TTL calculation / 在缓存里停留的整秒数，用于计算 TTL
         elapsed_secs: u32,
     },
-    /// Cache miss, needs async processing, with what the fast path already parsed and the
-    /// pipeline it picked, to pass on to `handle_packet_full`.
-    /// 缓存未命中，需要异步处理；带着快速路径已经解析出的内容和选好的 pipeline，交给 `handle_packet_full`。
+    /// 快速路径答不上（要问上游、要先等上游的过期应答、跳到了头，或者规则当场决定不了）：交给异步路径，带着读好的查询、
+    /// 选中的 pipeline 和选它的那份配置，不再解析一遍（见 `Engine::handle_packet_full`）
+    /// Not answered on the fast path (an upstream to ask, a stale answer to wait on the upstream
+    /// first, the jumps followed as far as they go, or rules that cannot decide on the spot): on
+    /// to the async path with the query as read, the pipeline picked and the configuration that
+    /// picked it, parsed no second time (see `Engine::handle_packet_full`)
     AsyncNeeded(super::PreParsedData),
 }
 
@@ -430,6 +435,32 @@ impl EngineInner {
             .get(pipeline_id)
             .copied()
             .unwrap_or(self.no_pipeline_namespace)
+    }
+
+    /// `requester` 在 `asked` 所属的 pipeline（`pipeline` 是它，选不到时为 None）下问的问题（见 [`KeyedQuestion`]）：命名
+    /// 空间是这份配置给那个 pipeline 的，请求方部分按它的规则分辨 `requester`。快速路径和请求的键都照它算
+    /// The question `requester` asks under the pipeline `asked` is of (`pipeline` being it, None
+    /// when none was picked; see [`KeyedQuestion`]): the namespace this configuration gives that
+    /// pipeline, the requester's part as its rules tell `requester` apart. The fast path and
+    /// the request compute their keys from it
+    pub(crate) fn question<'q>(
+        &self,
+        pipeline: Option<&RuntimePipeline>,
+        asked: &CachedQuestion<'q>,
+        requester: Requester,
+    ) -> KeyedQuestion<'q> {
+        KeyedQuestion {
+            namespace: self.cache_namespace(asked.pipeline_id),
+            pipeline_id: asked.pipeline_id,
+            qname: asked.qname.as_bytes(),
+            qtype: RecordType::from(asked.qtype),
+            qclass: DNSClass::from(asked.qclass),
+            flags: asked.flags,
+            requester: pipeline.map_or(RequesterKey::NONE, |p| {
+                p.requester.key(requester, &self.geo.geoip)
+            }),
+            client_ecs: requester.ecs,
+        }
     }
 }
 
