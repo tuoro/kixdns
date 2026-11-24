@@ -592,21 +592,12 @@ impl Rule {
             {
                 let action_transport = transport.unwrap_or(Transport::Udp);
                 for addr in split_upstreams(upstream) {
-                    // 前缀照单个转发那样认（不分大小写，见 `upstream::parse_upstream_addr`），
-                    // 没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的上游只记一份，
-                    // 合并后仍然双发
-                    // The prefix is read as for a single forward (ignoring case, see
-                    // `upstream::parse_upstream_addr`), the action's transport taken without
-                    // one or for one it does not know. An upstream asked over TCP and UDP at
-                    // once is recorded once and still asked both ways after the merge
-                    let (address, transport) = match addr.find("://") {
-                        Some(idx) => (
-                            &addr[idx + 3..],
-                            crate::engine::upstream::transport_for_scheme(&addr[..idx])
-                                .unwrap_or(action_transport),
-                        ),
-                        None => (addr, action_transport),
-                    };
+                    // 前缀照单个转发那样认，没有前缀或前缀不认识时用这个动作的传输。TCP 和 UDP 双发的
+                    // 上游只记一份，合并后仍然双发
+                    // The prefix is read as for a single forward, the action's transport taken
+                    // without one or for one it does not know. An upstream asked over TCP and
+                    // UDP at once is recorded once and still asked both ways after the merge
+                    let (address, transport) = parse_upstream_addr(addr, action_transport);
                     let slot = SCHEMES
                         .iter()
                         .position(|(scheme_transport, _)| *scheme_transport == transport)
@@ -1645,8 +1636,8 @@ const MERGED_ECS_DIFFER: &str = "its forward actions are asked together as one f
 /// 一个上游也没写：每个查询都会失败 / Not a single upstream written: every query would fail
 const NO_UPSTREAM: &str = "no upstream is written, so every query it gets would fail";
 
-/// 逗号分隔的上游，和转发时的拆法一样 / Comma-separated upstreams, split as a forward splits them
-fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
+/// 逗号分隔的上游，转发时就这样拆 / Comma-separated upstreams, split as a forward splits them
+pub(crate) fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
     upstreams
         .split(',')
         .map(str::trim)
@@ -1656,6 +1647,68 @@ fn split_upstreams(upstreams: &str) -> impl Iterator<Item = &str> {
 /// 拆得出至少一个地址 / Splits into at least one address
 fn names_an_address(upstreams: &str) -> bool {
     split_upstreams(upstreams).next().is_some()
+}
+
+/// 一个上游去掉 `传输://` 前缀的地址和问它用的传输：前缀不认识（见 [`transport_for_scheme`]）或者没有前缀时用
+/// `default_transport`
+/// - "tcp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Tcp)
+/// - "https://dns.example.com/dns-query" -> ("dns.example.com/dns-query", Transport::Doh)
+/// - "1.1.1.1:53" -> ("1.1.1.1:53", default_transport)
+///
+/// The address of one upstream short of its `transport://` prefix, and the transport it is
+/// asked over: `default_transport` for a prefix it does not know (see
+/// [`transport_for_scheme`]) or none
+pub(crate) fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Transport) {
+    match addr.split_once("://") {
+        Some((scheme, address)) => (
+            address,
+            transport_for_scheme(scheme).unwrap_or(default_transport),
+        ),
+        None => (addr, default_transport),
+    }
+}
+
+/// 上游地址前缀对应的传输，不分大小写；不认识的前缀为 None（[`parse_upstream_addr`] 这时用默认传输）
+/// The transport an upstream prefix names, in any case; None for a prefix it does not know
+/// ([`parse_upstream_addr`] then takes the default transport)
+pub(crate) fn transport_for_scheme(scheme: &str) -> Option<Transport> {
+    // 每个转发都要看一次，不为大小写分配内存 / Every forward looks once, so case costs no allocation
+    let is = |name: &str| scheme.eq_ignore_ascii_case(name);
+    Some(if is("tcp") {
+        Transport::Tcp
+    } else if is("udp") {
+        Transport::Udp
+    } else if is("tcp+udp") || is("udp+tcp") {
+        Transport::TcpUdp
+    } else if is("doh") || is("https") {
+        Transport::Doh
+    } else if is("dot") || is("tls") {
+        Transport::Dot
+    } else if is("doq") || is("quic") {
+        Transport::Doq
+    } else {
+        return None;
+    })
+}
+
+/// 一串上游各自的地址（去掉前缀），`PermitManager::note_answer_took` 就是按它记的 / The address
+/// (short of its prefix) of each of a list of upstreams, which is what
+/// `PermitManager::note_answer_took` notes by
+pub(crate) fn upstream_addresses(upstreams: &str) -> impl Iterator<Item = &str> {
+    split_upstreams(upstreams).map(|upstream| parse_upstream_addr(upstream, Transport::Udp).0)
+}
+
+/// 上游名字（`udp:1.1.1.1:53`，见 `engine::upstream::upstream_label`）里的地址：去掉前面的传输名。回答检查拿它和
+/// 配置里写的上游地址比（见 `RuntimeResponseMatcher::UpstreamEquals`）。不带传输名的原样返回
+/// The address in an upstream's name (`udp:1.1.1.1:53`, see `engine::upstream::upstream_label`):
+/// the name less its transport. The answer check compares it with the upstream addresses a
+/// configuration writes (see `RuntimeResponseMatcher::UpstreamEquals`). One without a
+/// transport comes back as it is
+pub(crate) fn answered_address(name: &str) -> &str {
+    ["udp:", "tcp:", "doh:", "dot:", "doq:"]
+        .iter()
+        .find_map(|transport| name.strip_prefix(transport))
+        .unwrap_or(name)
 }
 
 /// `log` 动作认的级别 / The levels a `log` action takes
@@ -1968,7 +2021,8 @@ fn rule_problems(
     {
         report(problem);
     }
-    use crate::engine::response::{static_cname_target, static_ips, txt_size_problem};
+    use crate::engine::response::{static_cname_target, txt_size_problem};
+    use crate::matcher::static_ips;
 
     let forwards = rule
         .actions

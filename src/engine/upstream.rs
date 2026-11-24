@@ -12,7 +12,7 @@ use tracing::debug;
 use super::Engine;
 use super::concurrency::GaveUp;
 use super::transport::UdpExchange;
-use crate::config::Transport;
+use crate::config::{Transport, parse_upstream_addr, split_upstreams, transport_for_scheme};
 use crate::observe::{
     UpstreamAttempt, UpstreamOutcome, UpstreamResult, UpstreamSkipReason, UpstreamSkipped,
 };
@@ -172,30 +172,6 @@ pub(crate) fn has_transport_prefix(addr: &str) -> bool {
     addr.contains("://")
 }
 
-/// Parse upstream address with optional protocol prefix.
-/// 解析带有可选协议前缀的 upstream 地址。
-///
-/// Returns (address_without_prefix, transport).
-/// 返回 (去除前缀的地址, 传输协议)。
-///
-/// Examples:
-/// - "tcp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Tcp)
-/// - "udp://1.1.1.1:53" -> ("1.1.1.1:53", Transport::Udp)
-/// - "dot://1.1.1.1:853" -> ("1.1.1.1:853", Transport::Dot)
-/// - "doq://dns.example.com:853" -> ("dns.example.com:853", Transport::Doq)
-/// - "doh://dns.example.com/dns-query" -> ("dns.example.com/dns-query", Transport::Doh)
-/// - "https://dns.example.com/dns-query" -> ("dns.example.com/dns-query", Transport::Doh)
-/// - "1.1.1.1:53" -> ("1.1.1.1:53", default_transport)
-fn parse_upstream_addr(addr: &str, default_transport: Transport) -> (&str, Transport) {
-    if let Some(idx) = addr.find("://") {
-        let address = &addr[idx + 3..];
-        let transport = transport_for_scheme(&addr[..idx]).unwrap_or(default_transport);
-        (address, transport)
-    } else {
-        (addr, default_transport)
-    }
-}
-
 /// `cfg` 里经 TCP 问的上游地址（去掉前缀，见 [`upstreams`]），启动时据此预热连接；`tcp` 和 `tcp_udp` 算 TCP
 /// The addresses (short of their prefix, see [`upstreams`]) of the upstreams `cfg` asks over
 /// TCP, whose connections are warmed up at startup; `tcp` and `tcp_udp` count as TCP
@@ -207,40 +183,6 @@ pub(crate) fn tcp_upstreams(
         .filter(|(_, transport)| matches!(transport, Transport::Tcp | Transport::TcpUdp))
         .map(|(address, _)| address.to_owned())
         .collect()
-}
-
-/// 规则里写的一串上游各自的地址（去掉前缀），`PermitManager::note_answer_took` 就是按它记的 / The address
-/// (short of its prefix) of each of the upstreams a rule writes, which is what
-/// `PermitManager::note_answer_took` notes by
-pub(crate) fn addresses(upstream: &str) -> impl Iterator<Item = &str> {
-    upstream
-        .split(',')
-        .map(str::trim)
-        .filter(|member| !member.is_empty())
-        .map(|member| parse_upstream_addr(member, Transport::Udp).0)
-}
-
-/// 上游地址前缀对应的传输；不认识的前缀为 None（[`parse_upstream_addr`] 这时用默认传输）
-/// The transport an upstream prefix names; None for a prefix it does not know
-/// ([`parse_upstream_addr`] then takes the default transport)
-pub(crate) fn transport_for_scheme(scheme: &str) -> Option<Transport> {
-    // 每个转发都要看一次，不为大小写分配内存 / Every forward looks once, so case costs no allocation
-    let is = |name: &str| scheme.eq_ignore_ascii_case(name);
-    Some(if is("tcp") {
-        Transport::Tcp
-    } else if is("udp") {
-        Transport::Udp
-    } else if is("tcp+udp") || is("udp+tcp") {
-        Transport::TcpUdp
-    } else if is("doh") || is("https") {
-        Transport::Doh
-    } else if is("dot") || is("tls") {
-        Transport::Dot
-    } else if is("doq") || is("quic") {
-        Transport::Doq
-    } else {
-        return None;
-    })
 }
 
 /// 一个上游写得对不对：前缀认识，地址是它的传输读得懂的。说明为什么不对。
@@ -305,13 +247,9 @@ pub(crate) fn upstreams(
     std::iter::once((default, None))
         .chain(forwards)
         .flat_map(|(upstreams, transport)| {
-            upstreams
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(move |upstream| {
-                    parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp))
-                })
+            split_upstreams(upstreams).map(move |upstream| {
+                parse_upstream_addr(upstream, transport.unwrap_or(Transport::Udp))
+            })
         })
         .collect()
 }
@@ -714,11 +652,8 @@ async fn forward_upstream_as_is(
         // 单个上游：直接转发 / Single upstream: direct forward
         smallvec::smallvec![std::sync::Arc::from(upstream)]
     } else {
-        upstream
-            .split(',')
-            .map(|s| s.trim())
+        split_upstreams(upstream)
             .map(std::sync::Arc::from)
-            .filter(|s: &std::sync::Arc<str>| !s.is_empty())
             .collect()
     };
     // 剩下一个上游时，它走下面只有一个上游的那条路，和只写了这一个上游一样
@@ -1143,19 +1078,6 @@ fn transport_label(via: Transport) -> &'static str {
         Transport::Dot => "dot",
         Transport::Doq => "doq",
     }
-}
-
-/// 上游名字（`udp:1.1.1.1:53`，见 [`upstream_label`]）里的地址：去掉前面的传输名。回答检查拿它和配置里写的
-/// 上游地址比（见 `RuntimeResponseMatcher::UpstreamEquals`）。不带传输名的原样返回
-/// The address in an upstream's name (`udp:1.1.1.1:53`, see [`upstream_label`]): the name less
-/// its transport. The answer check compares it with the upstream addresses a configuration
-/// writes (see `RuntimeResponseMatcher::UpstreamEquals`). One without a transport comes back
-/// as it is
-pub(crate) fn answered_address(label: &str) -> &str {
-    ["udp:", "tcp:", "doh:", "dot:", "doq:"]
-        .iter()
-        .find_map(|transport| label.strip_prefix(transport))
-        .unwrap_or(label)
 }
 
 /// 记住的上游名字最多这么多个，配置里写不了这么多；再多的现算，不记 / The most upstream names kept,

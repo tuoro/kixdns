@@ -15,9 +15,7 @@ use smallvec::SmallVec;
 
 use crate::cache::{CacheEntry, CachedQuestion};
 use crate::ecs_scope::EcsReach;
-use crate::matcher::advanced_rule::{
-    PrecomputedAction, PrecomputedAnswer, fast_static_match_with_rule,
-};
+use crate::matcher::advanced_rule::{PrecomputedAction, PrecomputedAnswer};
 use crate::matcher::{Requester, RequesterKey, RuntimePipelineConfig};
 use crate::observe::{
     CacheHit, CacheHitKind, DecisionDetail, DecisionKind, DecisionMade, EngineObserver,
@@ -29,7 +27,7 @@ use super::concurrency::PermitGuard;
 use super::core::Engine;
 use super::observation::{ObservedRequest, report_decision, report_rule_cache_hit};
 use super::phases;
-use super::pipeline::{NO_PIPELINE, RuleEvaluationContext, select_pipeline};
+use super::pipeline::{NO_PIPELINE, RuleEvaluationContext, fast_static_match, select_pipeline};
 use super::refresh::{RefreshCheck, RefreshTarget};
 use super::response::{StaticAddresses, static_reply, write_static_reply};
 use super::response_log::{ResponseInfo, ResponseLog, Source};
@@ -981,8 +979,8 @@ impl Engine {
             } else {
                 // 3. 规则：第一条命中的规则当场作出的决定
                 // 3. The rules: what the first rule matching decides on the spot
-                let matched = pipeline
-                    .and_then(|pipeline| fast_static_match_with_rule(pipeline, &facts, self.geo()));
+                let matched =
+                    pipeline.and_then(|pipeline| fast_static_match(pipeline, &facts, self.geo()));
                 match matched {
                     Some((PrecomputedAction::Jump(target), rule)) => (
                         cfg.pipeline(target),
@@ -5382,7 +5380,7 @@ mod tests {
             let addresses = if ips.is_empty() {
                 Vec::new()
             } else {
-                crate::engine::static_ips(ips).unwrap()
+                crate::matcher::static_ips(ips).unwrap()
             };
             let old = || {
                 let built = super::super::response::hickory_static_reply(
@@ -6699,8 +6697,6 @@ mod tests {
     /// `category-ads-all` in front the fast path let go of every query.
     #[tokio::test]
     async fn the_fast_path_agrees_with_the_full_rule_path_on_geoip_and_geosite() {
-        use crate::matcher::advanced_rule::fast_static_match_with_rule;
-
         let forward = |name: &str, matchers: serde_json::Value| {
             serde_json::json!({
                 "name": name,
@@ -6790,7 +6786,7 @@ mod tests {
                         &facts,
                         &RuleEvaluationContext::new(0, true),
                     );
-                    let fast = fast_static_match_with_rule(pipeline, &facts, engine.geo());
+                    let fast = fast_static_match(pipeline, &facts, engine.geo());
                     let agrees = match (&fast, &full) {
                         // 快速路径只把转发交出去 / The fast path hands on forwards only
                         (None, full) => !matches!(full, Decision::Static { .. }),
@@ -6817,17 +6813,6 @@ mod tests {
         assert!(disagreements.is_empty(), "{disagreements:#?}");
     }
 
-    /// 测试 fast_static_match 不会跳过不可预计算的规则
-    ///
-    /// 这是一个回归测试，用于验证以下场景：
-    /// - 规则1：domain_regex("^_acme") → forward（不可预计算）
-    /// - 规则2：domain_suffix("mydomain.com") → static_ip（可预计算）
-    /// - 查询：_acme-challenge.mydomain.com
-    ///
-    /// 预期行为：第一条规则应该生效（forward），而不是第二条规则（static_ip）
-    ///
-    /// 修复前：fast_static_match 会跳过不可预计算的规则，直接返回可预计算的规则结果
-    /// 修复后：fast_static_match 在遇到第一个匹配但不可预计算的规则时放弃快速路径
     /// 快速路径只求值到最后一条能当场作答的规则：再往后不论哪条命中都交给完整路径，在这里求值它们（正则、GeoIP）是白算；
     /// 一条这样的规则都没有的 pipeline，快速路径什么都不求值
     /// The fast path evaluates rules up to the last one it can answer on the spot: whichever
@@ -6858,11 +6843,14 @@ mod tests {
         assert_eq!(runtime.pipelines[1].last_precomputed, None);
     }
 
+    /// 快速路径不越过当场决定不了的规则：第一条命中的「domain_regex ^_acme → forward」连同规则顺序留给完整路径，
+    /// 后面的「domain_suffix mydomain.com → static_ip」不替它作答；只命中后一条的名字照常当场作答
+    /// The fast path does not pass over a rule it cannot decide on the spot: the first rule
+    /// matching, "domain_regex ^_acme → forward", is left to the full path with the rule order,
+    /// and the later "domain_suffix mydomain.com → static_ip" does not answer for it; a name
+    /// matching the latter alone is answered on the spot as usual
     #[test]
     fn test_fast_static_match_preserves_rule_order() {
-        use crate::matcher::advanced_rule::fast_static_match;
-
-        // Arrange: 构建一个配置，模拟用户的问题场景
         let raw = serde_json::json!({
             "settings": { "default_upstream": "1.1.1.1:53" },
             "pipelines": [
@@ -6883,50 +6871,25 @@ mod tests {
                 }
             ]
         });
-
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        let pipeline = &runtime.pipelines[0];
+        let geo = crate::matcher::GeoManagers::empty();
 
-        // Act: 调用 fast_static_match 查询 _acme-challenge.mydomain.com
-        let result = fast_static_match(
-            &runtime.pipelines[0],
-            "_acme-challenge.mydomain.com",
-            hickory_proto::rr::RecordType::TXT,
-            hickory_proto::rr::DNSClass::IN,
-            "127.0.0.1".parse().unwrap(),
-            false,
-        );
+        let acme = crate::matcher::RequestFacts {
+            qtype: RecordType::TXT,
+            ..crate::matcher::RequestFacts::a_query("_acme-challenge.mydomain.com")
+        };
+        assert!(fast_static_match(pipeline, &acme, geo).is_none());
 
-        // Assert: fast_static_match 应该返回 None
-        // 原因：第一条规则（domain_regex("^_acme")）匹配但不可预计算，
-        // 所以 fast_static_match 应该放弃快速路径，让规则走正常路径
-        assert!(
-            result.is_none(),
-            "fast_static_match 应该返回 None，因为第一个匹配的规则不可预计算"
-        );
-
-        // 验证：如果查询一个只匹配第二条规则的域名，应该返回静态 IP
-        let result2 = fast_static_match(
-            &runtime.pipelines[0],
-            "other.mydomain.com",
-            hickory_proto::rr::RecordType::A,
-            hickory_proto::rr::DNSClass::IN,
-            "127.0.0.1".parse().unwrap(),
-            false,
-        );
-
-        assert!(
-            result2.is_some(),
-            "fast_static_match 应该返回 Some，因为第一个匹配的规则可预计算"
-        );
-
-        // 验证返回的是静态 IP 决策
-        match result2.unwrap() {
-            Decision::Static { rcode, answers } => {
+        let other = crate::matcher::RequestFacts::a_query("other.mydomain.com");
+        match fast_static_match(pipeline, &other, geo) {
+            Some((PrecomputedAction::Answer(answer), "mydomain-static")) => {
+                let (rcode, answers) = answer.records(other.qname, other.qtype, other.qclass);
                 assert_eq!(rcode, ResponseCode::NoError);
-                assert!(!answers.is_empty(), "应该有静态 IP 答案");
+                assert!(!answers.is_empty());
             }
-            _ => panic!("应该返回 Static 决策"),
+            decided => panic!("{decided:?}"),
         }
     }
 }

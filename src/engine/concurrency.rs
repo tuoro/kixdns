@@ -1605,7 +1605,7 @@ impl PermitManager {
     /// long, queries with no answer hold memory a while longer. Neither refuses a new query
     pub fn stuck_after(&self, upstream: &str, limit: Duration) -> Duration {
         let slowest = self.answer_time.slowest().map(|all| {
-            super::upstream::addresses(upstream)
+            crate::config::upstream_addresses(upstream)
                 .map(|address| {
                     self.answer_time_of
                         .get(address)

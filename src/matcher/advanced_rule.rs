@@ -2,14 +2,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::{DNSClass, Record, RecordType};
+use hickory_proto::rr::RecordType;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::config::{Action, MatchOperator};
-use crate::engine::{make_static_cname_answer, make_static_ip_answer, static_ips};
-use crate::matcher::{GeoManagers, RequestFacts, RuntimeMatcher, RuntimePipeline, RuntimeRule};
-use crate::matcher::{domain_suffix_index_key, eval_match_chain, parse_rcode};
+use crate::matcher::{RuntimeMatcher, RuntimeRule};
+use crate::matcher::{domain_suffix_index_key, parse_rcode, static_ips};
 
 /// 规则当场作出的决定：照配置写好的应答，或跳到另一个 pipeline，快速路径跟过去在那里接着查
 /// What a rule decides on the spot: an answer as the configuration writes it, or a jump to
@@ -20,7 +19,9 @@ pub enum PrecomputedAction {
     Jump(Arc<str>),
 }
 
-/// 照配置写好、当场就能给的应答 / An answer as the configuration writes it, ready on the spot
+/// 照配置写好、当场就能给的应答；它给一个查询的记录由引擎做（见 `engine::response`）/ An answer as the
+/// configuration writes it, ready on the spot; the engine makes the records it gives a query
+/// (see `engine::response`)
 #[derive(Debug, Clone)]
 pub enum PrecomputedAnswer {
     Static {
@@ -36,24 +37,6 @@ pub enum PrecomputedAnswer {
         target: String,
         ttl: u32,
     },
-}
-
-impl PrecomputedAnswer {
-    /// 这个应答对这个查询给的应答码和记录 / The response code and records this answer gives this query
-    pub(crate) fn records(
-        &self,
-        qname: &str,
-        qtype: RecordType,
-        qclass: DNSClass,
-    ) -> (ResponseCode, Vec<Record>) {
-        match self {
-            Self::Static { rcode } => (*rcode, Vec::new()),
-            Self::StaticIp { ip, .. } => make_static_ip_answer(qname, qtype, qclass, ip),
-            Self::StaticCname { target, ttl } => {
-                make_static_cname_answer(qname, qclass, target, *ttl)
-            }
-        }
-    }
 }
 
 /// 一个条件能让规则记在索引的哪一格 / Where in the index a condition can file a rule
@@ -196,72 +179,4 @@ pub(super) fn precompute_action(actions: &[Action]) -> Option<PrecomputedAction>
         _ => return None,
     };
     Some(PrecomputedAction::Answer(answer))
-}
-
-/// Test-only shorthand for [`fast_static_match_with_rule`] without the rule name
-/// and without Geo data.
-#[cfg(test)]
-pub(crate) fn fast_static_match(
-    pipeline: &RuntimePipeline,
-    qname: &str,
-    qtype: RecordType,
-    qclass: DNSClass,
-    client_ip: IpAddr,
-    edns_present: bool,
-) -> Option<crate::engine::Decision> {
-    use crate::engine::Decision;
-    fast_static_match_with_rule(
-        pipeline,
-        &RequestFacts {
-            qname,
-            qtype,
-            qclass,
-            client_ip,
-            edns_present,
-        },
-        GeoManagers::empty(),
-    )
-    .map(|(action, _)| match action {
-        PrecomputedAction::Answer(answer) => {
-            let (rcode, answers) = answer.records(qname, qtype, qclass);
-            Decision::Static { rcode, answers }
-        }
-        PrecomputedAction::Jump(pipeline) => Decision::Jump {
-            pipeline: Arc::clone(pipeline),
-        },
-    })
-}
-
-/// Like [`fast_static_match`], giving the matched rule's action instead of a decision, so that a
-/// caller who can answer from it need not make the records, and the name of that rule.
-/// 同 [`fast_static_match`]，但给出命中规则的动作而不是决策（能直接按动作回答的就不必做记录），以及规则名。
-pub(crate) fn fast_static_match_with_rule<'a>(
-    pipeline: &'a RuntimePipeline,
-    facts: &RequestFacts<'_>,
-    geo: GeoManagers<'_>,
-) -> Option<(&'a PrecomputedAction, &'a str)> {
-    let last = pipeline.last_precomputed?;
-    let candidates = pipeline.index.get_candidates(facts.qname, facts.qtype);
-    // 候选按规则顺序排好（见 `RuleIndex::get_candidates`）/ Candidates come in rule order (see
-    // `RuleIndex::get_candidates`)
-    for idx in candidates.into_iter().take_while(|&idx| idx <= last) {
-        let rule = &pipeline.rules[idx];
-        let matched = eval_match_chain(
-            &rule.matchers,
-            |m| m.operator,
-            |m| m.matcher.matches(facts, geo),
-        );
-        if matched {
-            // 第一条命中的规则定下结果：不能当场决定的（转发、先记日志的）连同规则顺序一起留给完整路径，
-            // 「domain_regex → forward」不会被后面的「domain_suffix → static_ip」越过
-            // The first rule matching settles it: one that does not decide on the spot (a
-            // forward, one logging first) is left to the full path with the rule order, so a
-            // "domain_regex → forward" is not passed over for a later "domain_suffix → static_ip"
-            return rule
-                .precomputed
-                .as_ref()
-                .map(|action| (action, &*rule.name));
-        }
-    }
-    None
 }

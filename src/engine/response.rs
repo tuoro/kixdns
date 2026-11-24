@@ -9,6 +9,8 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use tracing::warn;
 
+use crate::matcher::advanced_rule::PrecomputedAnswer;
+use crate::matcher::static_ips;
 use crate::proto_utils::received_ttl;
 
 /// 照查询 `packet`（问 `qname` 的 `qtype`、`qclass`）写的静态应答，RCODE 为 `rcode`、带着 `answers`：先照线上格式写（见
@@ -259,13 +261,6 @@ pub(crate) fn make_static_ip_answer(
     (ResponseCode::NoError, answers)
 }
 
-/// `static_ip_response` 的地址：逗号分隔的 IPv4/IPv6 地址，有一个读不出来就是 None
-/// The addresses of a `static_ip_response`: comma-separated IPv4/IPv6 addresses;
-/// None when any of them cannot be read
-pub(crate) fn static_ips(ips: &str) -> Option<Vec<IpAddr>> {
-    ips.split(',').map(|ip| ip.trim().parse().ok()).collect()
-}
-
 /// `static_cname_response` 的目标域名；空的或读不出来就是 None
 /// The target of a `static_cname_response`; None when empty or unreadable
 pub(crate) fn static_cname_target(target: &str) -> Option<Name> {
@@ -346,6 +341,25 @@ pub(crate) fn make_static_cname_answer(
 
     let record = Record::from_rdata(name, ttl, RData::CNAME(CNAME(target)));
     (ResponseCode::NoError, vec![record])
+}
+
+impl PrecomputedAnswer {
+    /// 这个应答对这个查询给的应答码和记录，和完整路径按动作做的一样 / The response code and records
+    /// this answer gives this query, made as the full path makes them from the action
+    pub(crate) fn records(
+        &self,
+        qname: &str,
+        qtype: RecordType,
+        qclass: DNSClass,
+    ) -> (ResponseCode, Vec<Record>) {
+        match self {
+            Self::Static { rcode } => (*rcode, Vec::new()),
+            Self::StaticIp { ip, .. } => make_static_ip_answer(qname, qtype, qclass, ip),
+            Self::StaticCname { target, ttl } => {
+                make_static_cname_answer(qname, qclass, target, *ttl)
+            }
+        }
+    }
 }
 
 /// 创建静态TXT记录响应 / Create static TXT record response
