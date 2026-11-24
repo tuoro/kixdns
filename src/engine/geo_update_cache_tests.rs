@@ -13,7 +13,7 @@ use hickory_proto::rr::{Name, RecordType};
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
-use crate::engine::geo_reload_tests::{field, replace, wait_for};
+use crate::engine::geo_reload_tests::{field, geosite_dat, replace, wait_for};
 use crate::engine::test_support::{answering_upstream, ask, ask_like_a_listener, first_a};
 use crate::matcher::RuntimePipelineConfig;
 
@@ -94,12 +94,10 @@ fn namespace(engine: &Engine, pipeline: &str) -> u64 {
 }
 
 /// 等新数据读进来（`landed`）、`pipeline` 也换了命名空间。数据先换、命名空间后换，两样都成立时，新命名空间里只有
-/// 按新数据得出的东西。只看命名空间不够：一次替换文件会有不止一个监视事件，同样的内容再读一遍也换一次命名空间
+/// 按新数据得出的东西
 /// Waits for the new data to be read in (`landed`) and for `pipeline` to move to a new
 /// namespace. The data goes first and the namespace after, so once both hold the new
-/// namespace holds only what the new data gave. The namespace alone is not enough: one file
-/// replacement brings more than one watch event, and reading the same content again moves
-/// the namespace once more
+/// namespace holds only what the new data gave
 async fn wait_for_new_namespace(
     engine: &Engine,
     pipeline: &str,
@@ -245,27 +243,36 @@ async fn a_geoip_update_drops_cached_answers_judged_by_the_old_networks() {
     );
 }
 
-/// 只有用到这份数据的 Pipeline 换命名空间：自己的规则用到的，或者回答检查跳过去的 Pipeline 用到的（那里拿到的应答缓存
-/// 在它的键下）。请求阶段跳过去的不算：应答缓存在目标的键下，跳转前的 Pipeline 只存跳转这个决定。GeoSite 换代不动只用
-/// GeoIP 的和什么都不用的 Pipeline，GeoIP 换代反过来；只按客户端地址判断 GeoIP 国家的 Pipeline 也不动（见下一个测试）。
-/// 直接换代看命名空间，不经文件监视：macOS 的 FSEvents 在开始监视后不久会补报此前新建文件的事件，两份数据都重读一遍，
-/// 等文件更新的那段时间里另一份数据也换了代
-/// Only the pipelines that use the data change namespace: through their own rules, or through
-/// a pipeline their answer checks jump to (the answers got there are cached under their key).
-/// A request-phase jump does not count: the answers are cached under the target's key, and the
-/// pipeline jumped from keeps only the decision to jump. A new GeoSite generation leaves
-/// pipelines using only GeoIP or nothing alone, and a new GeoIP generation the other way round;
-/// a pipeline judging only the client address's GeoIP country is left alone too (see the next
-/// test). The generations move directly, not through the file watch: macOS FSEvents reports
-/// the creation of files made just before the watch began shortly after it begins, both kinds
-/// of data are read again, and the other kind moves to a new generation while a file update is
-/// waited for
+/// 只有读到换了的那个标签的 Pipeline 换命名空间：自己的规则读的，或者回答检查跳过去的 Pipeline 读的（那里拿到的应答缓存
+/// 在它的键下）。请求阶段跳过去的不算：应答缓存在目标的键下，跳转前的 Pipeline 只存跳转这个决定。GeoSite 的 ads 换了不动
+/// 读别的 GeoSite 标签的、只用 GeoIP 的和什么都不用的 Pipeline，GeoIP 的标签换了也只动读它的；只按客户端地址判断 GeoIP
+/// 国家的 Pipeline 也不动（见下一个测试）。直接给出指纹看命名空间，不经文件监视：macOS 的 FSEvents 在开始监视后不久会补报
+/// 此前新建文件的事件，等文件更新的那段时间里两份数据都会重读
+/// Only the pipelines reading the very tag that changed move to a new namespace: through their
+/// own rules, or through a pipeline their answer checks jump to (the answers got there are
+/// cached under their key). A request-phase jump does not count: the answers are cached under
+/// the target's key, and the pipeline jumped from keeps only the decision to jump. GeoSite's
+/// ads changing leaves pipelines reading other GeoSite tags, only GeoIP or nothing alone, and a
+/// GeoIP tag changing moves only the pipelines reading it; a pipeline judging only the client
+/// address's GeoIP country is left alone too (see the next test). The fingerprints are given
+/// directly, not through the file watch: macOS FSEvents reports the creation of files made
+/// just before the watch began shortly after it begins, and both kinds of data are read again
+/// while a file update is waited for
 #[test]
-fn only_pipelines_that_use_the_data_change_namespace() {
+fn only_pipelines_reading_the_changed_tag_change_namespace() {
     use crate::engine::geo::GeoGeneration;
     use crate::engine::types::EngineInner;
     let answer = json!([{ "type": "static_ip_response", "ip": OTHER.to_string() }]);
     let forward = json!([{ "type": "forward", "upstream": "127.0.0.1:9" }]);
+    let answer_ip = |tag: &str| {
+        json!([
+            { "name": "c", "matchers": [{ "type": "any" }], "actions": forward,
+              "response_matchers": [
+                  { "type": "response_answer_ip_geoip_country", "country_codes": [tag] }
+              ],
+              "response_actions_on_match": answer }
+        ])
+    };
     let state = std::sync::Arc::new(EngineInner::new(runtime(json!({
         "settings": settings(json!({
             "geosite_data_paths": ["/data/geosite.dat"],
@@ -274,6 +281,9 @@ fn only_pipelines_that_use_the_data_change_namespace() {
         "pipelines": [
             { "id": "site", "rules": [
                 { "name": "a", "matchers": [{ "type": "geo_site", "value": "ads" }], "actions": answer }
+            ]},
+            { "id": "other_site", "rules": [
+                { "name": "a", "matchers": [{ "type": "geo_site", "value": "cn" }], "actions": answer }
             ]},
             { "id": "jumps", "rules": [
                 { "name": "b", "matchers": [{ "type": "any" }],
@@ -284,13 +294,8 @@ fn only_pipelines_that_use_the_data_change_namespace() {
                   "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
                   "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "site" }] }
             ]},
-            { "id": "ip", "rules": [
-                { "name": "c", "matchers": [{ "type": "any" }], "actions": forward,
-                  "response_matchers": [
-                      { "type": "response_answer_ip_geoip_country", "country_codes": ["TESTNET"] }
-                  ],
-                  "response_actions_on_match": answer }
-            ]},
+            { "id": "ip", "rules": answer_ip("TESTNET") },
+            { "id": "other_ip", "rules": answer_ip("OTHERNET") },
             { "id": "plain", "rules": [
                 { "name": "d", "matchers": [{ "type": "any" }], "actions": answer }
             ]},
@@ -309,15 +314,17 @@ fn only_pipelines_that_use_the_data_change_namespace() {
     }))));
     let names = [
         "site",
+        "other_site",
         "jumps",
         "answer_jumps",
         "answer_site",
         "ip",
+        "other_ip",
         "plain",
         "client",
     ];
-    // 从第 0 代换到 `geo`，换了命名空间的 pipeline / The pipelines whose namespace changes from
-    // generation 0 to `geo`
+    // 从没有数据换到 `geo` 的指纹，换了命名空间的 pipeline / The pipelines whose namespace changes
+    // from no data to the fingerprints `geo`
     let moved = |geo: GeoGeneration| {
         let after = state.at_geo(geo);
         names
@@ -326,15 +333,91 @@ fn only_pipelines_that_use_the_data_change_namespace() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        moved(GeoGeneration { site: 1, ip: 0 }),
+        moved(GeoGeneration::of_tags(&[("ads", 1)], &[])),
         ["site", "answer_jumps", "answer_site"],
-        "a GeoSite update"
+        "a GeoSite update of ads"
     );
     assert_eq!(
-        moved(GeoGeneration { site: 0, ip: 1 }),
-        ["ip"],
-        "a GeoIP update"
+        moved(GeoGeneration::of_tags(&[("cn", 1)], &[])),
+        ["other_site"],
+        "a GeoSite update of cn"
     );
+    assert_eq!(
+        moved(GeoGeneration::of_tags(&[], &[("TESTNET", 1)])),
+        ["ip"],
+        "a GeoIP update of TESTNET"
+    );
+}
+
+/// 热重载只多用了一个标签（加了一个读 ads 的 pipeline）：读 cn 的 main 读的还是同一份数据，不换命名空间，上游给它的应答
+/// 留在缓存里。数据文件只改了 ads 时 main 也不换；改了 cn，main 才换
+/// A hot reload using one tag more (a pipeline reading ads added): main, reading cn, reads the
+/// very same data, keeps its namespace, and the upstream's answer stays in its cache. With the
+/// data file changing ads alone main stays put too; once cn changes, main moves
+#[tokio::test]
+async fn a_reload_using_one_tag_more_leaves_pipelines_reading_other_tags_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("geosite.dat");
+    let lists = |cn: &str, ads: &str| geosite_dat(&[("cn", cn), ("ads", ads)]);
+    std::fs::write(&data, lists("cn.example", "ads.example")).unwrap();
+    let up = answering_upstream(UPSTREAM, 3600).await;
+    let config = |with_ads: bool| {
+        let mut pipelines = vec![json!({ "id": "main", "rules": [
+            { "name": "cn", "matchers": [{ "type": "geo_site", "value": "cn" }],
+              "actions": [{ "type": "static_ip_response", "ip": MATCHED.to_string() }] },
+            { "name": "rest", "matchers": [],
+              "actions": [{ "type": "forward", "upstream": up.address }] }
+        ] })];
+        if with_ads {
+            pipelines.push(json!({ "id": "blocked", "rules": [
+                { "name": "ads", "matchers": [{ "type": "geo_site", "value": "ads" }],
+                  "actions": [{ "type": "static_ip_response", "ip": OTHER.to_string() }] }
+            ] }));
+        }
+        runtime(json!({
+            "settings": settings(json!({ "geosite_data_paths": [data.to_str().unwrap()] })),
+            "pipelines": pipelines
+        }))
+    };
+    let engine = Engine::new(config(false), "test".to_string()).expect("engine");
+    assert_eq!(
+        both_paths(&engine, "www.example").await,
+        [Some(UPSTREAM); 2]
+    );
+    assert_eq!(up.queries(), 1);
+
+    let main = namespace(&engine, "main");
+    engine.reload(config(true));
+    assert!(
+        listed("x.ads.example", true)(&engine),
+        "the reload read ads in"
+    );
+    assert_eq!(namespace(&engine, "main"), main, "main reads cn alone");
+    assert_eq!(
+        both_paths(&engine, "www.example").await,
+        [Some(UPSTREAM); 2]
+    );
+    assert_eq!(up.queries(), 1, "the upstream's answer stayed in the cache");
+
+    // blocked 读 ads，它换了命名空间，说明新数据已经换进来、命名空间也算过了 / blocked reads ads,
+    // so its namespace moving tells the new data is in and the namespaces worked out
+    let blocked = namespace(&engine, "blocked");
+    replace(&data, &lists("cn.example", "tracker.example"));
+    wait_for_new_namespace(
+        &engine,
+        "blocked",
+        blocked,
+        listed("x.tracker.example", true),
+    )
+    .await;
+    assert_eq!(namespace(&engine, "main"), main, "only ads changed");
+
+    replace(&data, &lists("www.example", "tracker.example"));
+    wait_for_new_namespace(&engine, "main", main, |engine| {
+        engine.geosite_manager.read().matches("cn", "www.example")
+    })
+    .await;
+    assert_eq!(both_paths(&engine, "www.example").await, [Some(MATCHED); 2]);
 }
 
 /// 面板按内容给 Geo 数据和拦截列表的文件起名，每次更新都换一个文件、重载一次配置。用到 GeoSite 的 pipeline 照样换命名空间、

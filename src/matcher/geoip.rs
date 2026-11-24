@@ -1,3 +1,4 @@
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,7 +46,7 @@ pub struct V2RayGeoIPList {
 
 /// 一段连续的地址，两端都含：u32 是 IPv4，u128 是 IPv6
 /// A run of addresses, both ends included: u32 for IPv4, u128 for IPv6
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 struct AddrRange<T> {
     start: T,
     end: T,
@@ -98,12 +99,21 @@ impl<T: Bound> AddrRange<T> {
 struct GeoIpTagIndex {
     ipv4_ranges: Vec<AddrRange<u32>>,
     ipv6_ranges: Vec<AddrRange<u128>>,
+    /// 合并好的网段的指纹，[`Self::finalize`] 时算出：同样的网段不论怎么写、按什么先后写都是这个数（见
+    /// [`GeoIpManager::fingerprints`]）
+    /// The fingerprint of the merged ranges, worked out by [`Self::finalize`]: the same networks
+    /// give this number however and in whatever order they are written (see
+    /// [`GeoIpManager::fingerprints`])
+    fingerprint: u64,
 }
 
 impl GeoIpTagIndex {
     fn finalize(&mut self) {
         AddrRange::merge(&mut self.ipv4_ranges);
         AddrRange::merge(&mut self.ipv6_ranges);
+        let mut hasher = DefaultHasher::new();
+        (&self.ipv4_ranges, &self.ipv6_ranges).hash(&mut hasher);
+        self.fingerprint = hasher.finish();
     }
 
     #[inline]
@@ -162,6 +172,42 @@ impl ParsedGeoIp {
     }
 }
 
+/// 一个 GeoIP 管理器里的数据的指纹：每个标签的网段的，和 MMDB 的（见 [`GeoIpManager::fingerprints`]）
+/// The fingerprints of the data in a GeoIP manager: each tag's networks', and the MMDB's (see
+/// [`GeoIpManager::fingerprints`])
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeoIpFingerprints {
+    tags: FxHashMap<Arc<str>, u64>,
+    mmdb: Option<u64>,
+}
+
+impl GeoIpFingerprints {
+    /// 判断 `tag`（大写）用的数据的指纹，和判断时一样：有 MMDB 时国家代码看 MMDB（见
+    /// [`GeoIpManager::matches_any_tag`]），没有数据时为 None
+    /// The fingerprint of the data `tag` (uppercase) is judged by, as it is judged: with an
+    /// MMDB a country code goes by the MMDB (see [`GeoIpManager::matches_any_tag`]); None
+    /// without data
+    pub fn of(&self, tag: &str) -> Option<u64> {
+        match self.mmdb {
+            Some(mmdb) if is_country_tag(tag) => Some(mmdb),
+            _ => self.tags.get(tag).copied(),
+        }
+    }
+
+    /// 测试用：标签 `tags` 的网段各有这些指纹，没有 MMDB / For tests: the networks of tags `tags`
+    /// with these fingerprints, and no MMDB
+    #[cfg(test)]
+    pub(crate) fn of_tags(tags: &[(&str, u64)]) -> Self {
+        Self {
+            tags: tags
+                .iter()
+                .map(|&(tag, print)| (Arc::from(tag), print))
+                .collect(),
+            mmdb: None,
+        }
+    }
+}
+
 /// 默认的管理器没有 MMDB、也没有标签 / The default manager has no MMDB and no tags
 #[derive(Default)]
 pub struct GeoIpManager {
@@ -186,6 +232,10 @@ pub struct GeoIpManager {
 /// its insert, and grew past a hundred MiB with the distinct addresses asked about.
 struct Mmdb {
     reader: maxminddb::Reader<Vec<u8>>,
+    /// 文件内容的指纹：同样的库再读一遍还是这个数（见 [`GeoIpManager::fingerprints`]）/ The
+    /// fingerprint of the file's content, the same number for the same database read again (see
+    /// [`GeoIpManager::fingerprints`])
+    fingerprint: u64,
     /// 数据记录在文件里的位置 → 国家代码 / A data record's offset in the file → its country code
     countries: FxHashMap<usize, Option<Arc<str>>>,
     /// 读的是哪个文件、读的时候那个文件什么样 / Which file was read, and what it was like then
@@ -214,7 +264,11 @@ impl FileStamp {
 
 impl Mmdb {
     fn open(path: &str, file: FileStamp) -> Result<Self, maxminddb::MaxMindDbError> {
-        let reader = maxminddb::Reader::open_readfile(path)?;
+        let content = std::fs::read(path)?;
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let reader = maxminddb::Reader::from_source(content)?;
         let mut countries = FxHashMap::default();
         if let Err(e) = Self::index(&reader, &mut countries) {
             // 没解到的记录查询时当场解，结果不变 / Records left out are decoded when asked about, with the same result
@@ -222,6 +276,7 @@ impl Mmdb {
         }
         Ok(Self {
             reader,
+            fingerprint,
             countries,
             file,
         })
@@ -334,6 +389,21 @@ impl GeoIpManager {
         Self {
             mmdb: self.mmdb.clone(),
             tag_indexes: FxHashMap::default(),
+        }
+    }
+
+    /// 眼下的数据的指纹：数据真换了样子才变，读它的 pipeline 跟着换缓存命名空间（见 `engine::geo::GeoGeneration`）
+    /// The fingerprints of the data right now, changing only once the data really changes, and
+    /// the pipelines reading it move to a new cache namespace with them (see
+    /// `engine::geo::GeoGeneration`)
+    pub fn fingerprints(&self) -> GeoIpFingerprints {
+        GeoIpFingerprints {
+            tags: self
+                .tag_indexes
+                .iter()
+                .map(|(tag, index)| (Arc::clone(tag), index.fingerprint))
+                .collect(),
+            mmdb: self.mmdb.as_ref().map(|mmdb| mmdb.fingerprint),
         }
     }
 
@@ -507,18 +577,18 @@ impl GeoIpManager {
         })
     }
 
-    /// 数据文件给出的标签数（只算规则用到的那些）/ How many tags the data file gives (only those rules use)
-    pub fn tag_count(&self) -> usize {
-        self.tag_indexes.len()
+    /// 数据文件给出的标签（只有规则用到的那些）/ The tags the data file gives (only those rules use)
+    pub fn tags(&self) -> Vec<String> {
+        self.tag_indexes.keys().map(|tag| tag.to_string()).collect()
     }
 
-    /// 把 `in_use` 里属于 `tags`（不分大小写）的标签连同数据搬过来，给出搬了几个。重新读数据文件什么都没读出来
+    /// 把 `in_use` 里属于 `tags`（不分大小写）的标签连同数据搬过来，给出搬过来的标签。重新读数据文件什么都没读出来
     /// 时，用它把在用的数据带进新建的管理器（见 `engine::geo` 的 `load_geoip`）；`in_use` 之后只该被换掉
-    /// Moves the tags among `tags` (ignoring case) over from `in_use`, data and all, giving how
-    /// many moved. When reading the data file again gives nothing, this carries the data in use
+    /// Moves the tags among `tags` (ignoring case) over from `in_use`, data and all, giving the
+    /// tags moved. When reading the data file again gives nothing, this carries the data in use
     /// into the manager being built (see `load_geoip` in `engine::geo`); `in_use` is only to be
     /// replaced afterwards
-    pub fn keep_tags_of(&mut self, in_use: &mut GeoIpManager, tags: &[String]) -> usize {
+    pub fn keep_tags_of(&mut self, in_use: &mut GeoIpManager, tags: &[String]) -> Vec<String> {
         let kept: Vec<Arc<str>> = in_use
             .tag_indexes
             .keys()
@@ -530,7 +600,7 @@ impl GeoIpManager {
                 self.tag_indexes.insert(Arc::clone(tag), index);
             }
         }
-        kept.len()
+        kept.iter().map(|tag| tag.to_string()).collect()
     }
 
     /// 用解析结果整体替换索引
@@ -739,8 +809,8 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
     tag.len() == 2 && tag.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
-/// `geoip_private`、`response_answer_ip_geoip_private` 和 ECS 都算作内网的地址，只有这一份（ECS 另外再算一个转换前缀，见
-/// `ecs::is_private_ip`）。连过去到的是本机、本地网络或运营商的内部网络，或者哪儿也到不了的地址：
+/// `geoip_private`、`response_answer_ip_geoip_private` 和 ECS 都算作内网的地址，只有这一份（ECS 另外再算一个转换前缀和基准测试
+/// 网段，见 `ecs::is_private_ip`）。连过去到的是本机、本地网络或运营商的内部网络，或者哪儿也到不了的地址：
 /// - IPv4：RFC 1918 私有网段，运营商级 NAT 的共享地址 100.64.0.0/10（RFC 6598，Tailscale 也用它），回环，链路本地，
 ///   「本网络」0.0.0.0/8，IETF 协议分配 192.0.0.0/24（RFC 6890，DS-Lite 等的内部地址），受限广播 255.255.255.255。
 ///   0.0.0.0/8 和 `::` 一样不是哪台主机的地址（RFC 791），连 0.0.0.0 在 Linux、macOS 上连的是本机，回答它和回答
@@ -751,11 +821,11 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
 ///   的写法）：连过去，转换网关连的就是那个 IPv4 地址，嵌着内网地址的照样能拿来重绑定，嵌着公网地址的是 DNS64 的
 ///   寻常回答
 ///
-/// 基准测试的 198.18.0.0/15（RFC 2544）不算：它是 Clash、mihomo 等 fake-ip 的默认网段，算进去的话，转给 fake-ip 上游的
-/// 查询，回答都会被防重绑定的规则拦下。文档用的网段（192.0.2.0/24 这些）也不算：不可全球路由，却也不在哪个内网里
+/// 基准测试的 198.18.0.0/15（RFC 2544）不算（ECS 另外排除它）：它是 Clash、mihomo 等 fake-ip 的默认网段，算进去的话，
+/// 转给 fake-ip 上游的查询，回答都会被防重绑定的规则拦下。文档用的网段（192.0.2.0/24 这些）也不算：不可全球路由，却也不在哪个内网里
 /// The addresses `geoip_private`, `response_answer_ip_geoip_private` and ECS count as local
-/// network ones, this one list alone (ECS counts one translation prefix more, see
-/// `ecs::is_private_ip`). Connecting to them reaches this machine, the local network or the
+/// network ones, this one list alone (ECS counts one translation prefix and the benchmarking
+/// range more, see `ecs::is_private_ip`). Connecting to them reaches this machine, the local network or the
 /// operator's internal network, or nowhere at all:
 /// - IPv4: the RFC 1918 private networks, carrier-grade NAT's shared space 100.64.0.0/10
 ///   (RFC 6598, which Tailscale uses too), loopback, link-local, "this network" 0.0.0.0/8,
@@ -771,8 +841,8 @@ pub(crate) fn is_country_tag(tag: &str) -> bool {
 ///   translator connects to that IPv4 address, so one embedding a local address rebinds all
 ///   the same, while one embedding a public address is an ordinary DNS64 answer
 ///
-/// Benchmarking's 198.18.0.0/15 (RFC 2544) does not count: it is the default fake-ip range of
-/// Clash, mihomo and the like, and counted, every answer to a query forwarded to a fake-ip
+/// Benchmarking's 198.18.0.0/15 (RFC 2544) does not count (ECS leaves it out separately): it
+/// is the default fake-ip range of Clash, mihomo and the like, and counted, every answer to a query forwarded to a fake-ip
 /// upstream would be stopped by anti-rebinding rules. Nor do the documentation networks
 /// (192.0.2.0/24 and the like): not globally routable, yet not on any local network either
 #[inline]
@@ -1175,6 +1245,7 @@ mod tests {
                     end: u128::MAX - 6,
                 },
             ],
+            fingerprint: 0,
         };
         index.finalize();
         assert_eq!(
@@ -1208,6 +1279,7 @@ mod tests {
                 AddrRange { start: 45, end: 70 },
                 AddrRange { start: 40, end: 55 },
             ],
+            fingerprint: 0,
         };
         index.finalize();
         assert_eq!(index.range_count(), 2);

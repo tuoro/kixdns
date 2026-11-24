@@ -8,8 +8,8 @@ mod pattern;
 mod requester;
 mod response;
 
-pub(crate) use pattern::regex_within;
 use pattern::*;
+pub(crate) use pattern::{capitals_warning, regex_within};
 use requester::*;
 pub use requester::{Requester, RequesterKey, RequesterScope, RequesterTest};
 pub use response::{RuntimeResponseMatcher, RuntimeResponseMatcherWithOp};
@@ -265,15 +265,17 @@ pub struct RuntimePipeline {
     /// jump are kept whatever the pipeline: the fast path answers repeated blocked queries from the
     /// former and follows the latter to look in its target.
     pub matches_regex: bool,
-    /// 缓存在这个 pipeline 键下的应答和规则决定取决于哪些 Geo 数据：它自己的规则读的，和 [`Self::answered_through`] 里的
-    /// pipeline 的规则读的。请求阶段跳过去的应答缓存在目标的键下，跟着目标的命名空间走。数据换了，按旧数据缓存的应答和
-    /// 规则决定就不能再用，这个 pipeline 换缓存命名空间（见 `EngineInner::at_geo`）
+    /// 缓存在这个 pipeline 键下的应答和规则决定取决于哪些 Geo 数据：它自己的规则读的标签，和 [`Self::answered_through`]
+    /// 里的 pipeline 的规则读的。请求阶段跳过去的应答缓存在目标的键下，跟着目标的命名空间走。其中哪个标签的数据换了，按
+    /// 旧数据缓存的应答和规则决定就不能再用，这个 pipeline 换缓存命名空间；别的标签换了它不跟着换（见
+    /// `EngineInner::at_geo`）
     /// Which Geo data the answers and rule decisions cached under this pipeline's keys depend
-    /// on: what its own rules read, and what the rules of the pipelines in
+    /// on: the tags its own rules read, and those the rules of the pipelines in
     /// [`Self::answered_through`] read. The answers a request-phase jump gets are cached under
-    /// the target's keys and go with the target's namespace. Once that data changes, answers
-    /// and rule decisions cached with the old data are no longer valid, and the pipeline moves
-    /// to a new cache namespace (see `EngineInner::at_geo`)
+    /// the target's keys and go with the target's namespace. Once the data of any of those tags
+    /// changes, answers and rule decisions cached with the old data are no longer valid, and the
+    /// pipeline moves to a new cache namespace; other tags changing leave it where it is (see
+    /// `EngineInner::at_geo`)
     pub geo_data: GeoData,
     /// 经回答检查的跳转能到达的 pipeline（在 `RuntimePipelineConfig::pipelines` 里的下标），以及从那里再跳到的：跳过去
     /// 拿到的应答缓存在这个 pipeline 的键下，所以它们的配置也算进这个 pipeline 的缓存命名空间（见
@@ -286,27 +288,49 @@ pub struct RuntimePipeline {
     pub answered_through: Vec<usize>,
 }
 
-/// 规则读的 Geo 数据 / The Geo data rules read
+/// 规则读的 Geo 数据：两种数据各读哪些标签（编译好的写法，排好序、不重复），由匹配器读的 Geo 数据（见 [`GeoTags`]）得出
 ///
 /// 按客户端地址的 GeoIP 国家判断的规则不算：缓存的键带着客户端那次判断的结果（见 [`RequesterScope`]），数据换了，
 /// 判断结果跟着变，查到的就是另一个条目。
+/// The Geo data rules read: the tags of either kind they read (as compiled, sorted, each
+/// once), from the Geo data their matchers read (see [`GeoTags`])
+///
 /// Rules judging the client address's GeoIP country do not count: cache keys carry the
 /// result of that judgement for the client (see [`RequesterScope`]), so when the data
 /// changes the result changes with it and the lookup finds another entry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GeoData {
     /// GeoSite 名单：请求域名在不在里面 / GeoSite lists: whether the request's name is in them
-    pub site: bool,
+    pub site: Vec<Arc<str>>,
     /// GeoIP 网段：回答里的地址在不在里面 / GeoIP networks: whether the addresses in the answer are in them
-    pub ip: bool,
+    pub ip: Vec<Arc<str>>,
 }
 
 impl GeoData {
-    fn with(self, other: Self) -> Self {
-        Self {
-            site: self.site || other.site,
-            ip: self.ip || other.ip,
+    /// 一个标签都不读 / Reading no tag at all
+    pub fn is_empty(&self) -> bool {
+        self.site.is_empty() && self.ip.is_empty()
+    }
+
+    /// 加上一个匹配器读的 / With what one matcher reads added
+    fn add(&mut self, tags: GeoTags<'_>) {
+        let (into, tags) = match tags {
+            GeoTags::Site(tag) => (&mut self.site, std::slice::from_ref(tag)),
+            GeoTags::Ip(tags) => (&mut self.ip, tags),
+        };
+        for tag in tags {
+            if let Err(place) = into.binary_search(tag) {
+                into.insert(place, Arc::clone(tag));
+            }
         }
+    }
+
+    /// 加上 `other` 读的 / With what `other` reads added
+    fn extend(&mut self, other: &Self) {
+        for tag in &other.site {
+            self.add(GeoTags::Site(tag));
+        }
+        self.add(GeoTags::Ip(&other.ip));
     }
 }
 
@@ -1579,6 +1603,54 @@ mod tests {
                     err.contains(cause) && err.contains(pattern) && !err.contains("0-9A-Za-z_"),
                     "{pattern}, matcher {which}: {err}"
                 );
+            }
+        }
+    }
+
+    /// 域名正则里不在 `(?i)` 下写成大写的字母照写永远命不中（规则看到的名字是小写的），三种域名正则都记一条警告，说在哪、
+    /// 是哪一段：带大写的字面量，只取大写字母的字符类。`(?i)` 下的、字符类里也有别的字符的不算。以前配置不提示，这样的
+    /// 规则悄悄地从不命中
+    /// Capitals in a domain regex outside `(?i)` never match as written (the names rules see are
+    /// lowercase), and each of the three domain regexes gets a warning saying where and which
+    /// part: a literal holding a capital, a class taking capitals alone. Those under `(?i)`, and
+    /// classes taking other characters too, do not count. The configuration used to say
+    /// nothing, and such a rule silently never matched
+    #[test]
+    fn capitals_in_a_domain_regex_are_warned_about() {
+        let places = [
+            ("pipelines[0].rules[0].matchers[0]", "domain_regex"),
+            ("pipeline_select[0].matchers[0]", "domain_regex"),
+            (
+                "pipelines[0].rules[0].response_matchers[0]",
+                "request_domain_regex",
+            ),
+        ];
+        for (pattern, capitals) in [
+            (r"^Ads\.example$", r#""Ads\.example""#),
+            (r"^(?:ads|Track)\.[A-Z]+$", r#""Track", "[A-Z]""#),
+            (r"^\x41\d$", r#""A""#),
+            (r"^(?-u:[A-Z])x$", r#""(?-u:[A-Z])""#),
+        ] {
+            assert_eq!(domain_regex_matchers(pattern)("ads.example"), [false; 3]);
+            for (config, (place, kind)) in domain_regex_configs(pattern).into_iter().zip(places) {
+                let warnings = runtime_of(config).unwrap().warnings;
+                assert_eq!(
+                    warnings,
+                    [format!(
+                        "{place}: {kind} \"{pattern}\": the capitals in {capitals} never match, as the names rules see are lowercase; write them in lowercase or under (?i)"
+                    )],
+                    "{pattern}"
+                );
+            }
+        }
+        for pattern in [
+            r"(?i)^Ads\.example$",
+            r"^ads\.(?i:EXAMPLE)$",
+            r"^[A-Z0-9]+\.example$",
+            r"^\w+\.example$",
+        ] {
+            for config in domain_regex_configs(pattern) {
+                assert!(runtime_of(config).unwrap().warnings.is_empty(), "{pattern}");
             }
         }
     }

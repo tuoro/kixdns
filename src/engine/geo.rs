@@ -4,10 +4,10 @@
 //! hot reload loads it again, and moves the file watches to the new files, only when the part
 //! of the configuration that decides what is loaded changed.
 
+use std::hash::{Hash, Hasher};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use tracing::{error, info, warn};
@@ -15,11 +15,12 @@ use tracing::{error, info, warn};
 use super::Engine;
 use super::types::EngineInner;
 use super::utils::{extract_geoip_tags_from_config, extract_geosite_tags_from_config};
-use crate::matcher::RuntimePipelineConfig;
-use crate::matcher::geoip::{FileStamp, GeoIpManager, is_country_tag};
+use crate::matcher::geoip::{FileStamp, GeoIpFingerprints, GeoIpManager, is_country_tag};
 use crate::matcher::geosite::{GeoSiteManager, Swapped, parsed_provides_any};
+use crate::matcher::{GeoData, RuntimePipelineConfig};
 use crate::watcher::{FileWatch, PendingWatch};
 use parking_lot::{Mutex, RwLock};
+use rustc_hash::FxHashMap;
 
 /// 配置里决定加载哪些 GeoSite 数据的部分 / The part of a configuration that decides which GeoSite data is loaded
 #[derive(Debug, PartialEq, Eq)]
@@ -116,62 +117,88 @@ impl Unwatched {
     }
 }
 
-/// 两种 Geo 数据各自换过几次：缓存命名空间算上它，数据一换，用到它的 pipeline 就换命名空间（见
-/// `EngineInner::at_geo`）
-/// How many times each kind of Geo data has been swapped: cache namespaces take it in, so
-/// once the data is swapped the pipelines that use it move to a new namespace (see
-/// `EngineInner::at_geo`)
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// 两个管理器里每个标签的数据现在的指纹（见 `TagMatchers::fingerprint`、[`GeoIpFingerprints`]）。缓存命名空间算上
+/// pipeline 读的那几个标签的（见 `EngineInner::at_geo`）：一个标签的数据真换了样子，读它的 pipeline 换命名空间；别的标签
+/// 换了、同一份数据又读了一遍（热重载多用了一个标签、监视到文件被重写了一遍），这些 pipeline 都留着缓存
+/// The fingerprint of each tag's data in the two managers right now (see
+/// `TagMatchers::fingerprint` and [`GeoIpFingerprints`]). Cache namespaces take in those of the
+/// tags a pipeline reads (see `EngineInner::at_geo`): once a tag's data really changes, the
+/// pipelines reading it move to a new namespace; with other tags changing, or the same data
+/// read again (a hot reload using one tag more, a watched file written over the same), those
+/// pipelines keep their caches
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GeoGeneration {
-    pub(crate) site: u64,
-    pub(crate) ip: u64,
+    site: FxHashMap<String, u64>,
+    ip: GeoIpFingerprints,
 }
 
-/// 数据换进管理器以后，代数加一，引擎状态换成这一代的命名空间
-/// After data is swapped into a manager, its generation goes up by one and the engine
-/// state moves to that generation's namespaces
+impl GeoGeneration {
+    /// `uses` 里的标签各自的数据的指纹，没有数据的算 None，写进 `hasher` / The fingerprints of the
+    /// data of each tag of `uses`, None for one without data, written into `hasher`
+    pub(crate) fn hash_into(&self, uses: &GeoData, hasher: &mut impl Hasher) {
+        for tag in &uses.site {
+            self.site.get(&**tag).hash(hasher);
+        }
+        for tag in &uses.ip {
+            self.ip.of(tag).hash(hasher);
+        }
+    }
+
+    /// 测试用：GeoSite 标签 `site` 和 GeoIP 标签 `ip` 的数据各有这些指纹 / For tests: the data of
+    /// GeoSite tags `site` and GeoIP tags `ip` with these fingerprints
+    #[cfg(test)]
+    pub(crate) fn of_tags(site: &[(&str, u64)], ip: &[(&str, u64)]) -> Self {
+        Self {
+            site: site
+                .iter()
+                .map(|&(tag, print)| (tag.to_owned(), print))
+                .collect(),
+            ip: GeoIpFingerprints::of_tags(ip),
+        }
+    }
+}
+
+/// 数据换进管理器以后，引擎状态换成按新指纹算的命名空间
+/// After data is swapped into a manager, the engine state moves to the namespaces of the new
+/// fingerprints
 #[derive(Clone)]
 struct Rotation {
-    site: Arc<AtomicU64>,
-    ip: Arc<AtomicU64>,
+    geosite: Arc<RwLock<GeoSiteManager>>,
+    geoip: Arc<RwLock<GeoIpManager>>,
     state: Arc<ArcSwap<EngineInner>>,
 }
 
 impl Rotation {
     fn generation(&self) -> GeoGeneration {
         GeoGeneration {
-            site: self.site.load(Ordering::SeqCst),
-            ip: self.ip.load(Ordering::SeqCst),
+            site: self.geosite.read().fingerprints(),
+            ip: self.geoip.read().fingerprints(),
         }
     }
 
-    /// `counter` 那种数据刚换进管理器 / The data `counter` counts was just swapped into its manager
-    fn swapped(&self, counter: &AtomicU64) {
-        // 数据先换、代数后加：拿到新命名空间的请求读到的一定是新数据。换状态用 rcu，同时有配置重载存进新状态时重来一遍，
-        // 不会把它盖回去；重载那边存的时候也读一遍代数（见 `Engine::apply_config`）
-        // The data first, the generation after: a request that gets the new namespace
-        // reads the new data. The state is swapped with rcu, which starts over when a
-        // configuration reload stores a new state meanwhile instead of overwriting it; the
-        // reload reads the generation as it stores too (see `Engine::apply_config`)
-        counter.fetch_add(1, Ordering::SeqCst);
+    /// 数据刚换进管理器 / Data was just swapped into a manager
+    fn swapped(&self) {
+        // 数据先换、指纹后读：拿到新命名空间的请求读到的一定是新数据。换状态用 rcu，同时有配置重载、或者另一种数据换了、
+        // 存进新状态时重来一遍，重读一遍指纹，不会把它盖回去；重载那边存的时候也读一遍指纹（见 `Engine::apply_config`）。
+        // 指纹都没变时状态原样不动
+        // The data first, the fingerprints after: a request that gets the new namespace reads
+        // the new data. The state is swapped with rcu, which starts over, reading the
+        // fingerprints again, when a configuration reload or the other kind of data stores a
+        // new state meanwhile instead of overwriting it; the reload reads the fingerprints as
+        // it stores too (see `Engine::apply_config`). With no fingerprint changed the state
+        // stays as it is
         self.state.rcu(|state| state.at_geo(self.generation()));
-    }
-
-    fn site_swapped(&self) {
-        self.swapped(&self.site);
-    }
-
-    fn ip_swapped(&self) {
-        self.swapped(&self.ip);
     }
 }
 
-/// 两种 Geo 数据眼下的问题：配置了却不存在或读不了的文件、装不上的监视、规则用到却没有数据提供的标签。启动、热重载和
-/// 监视到文件变了时跟着更新，面板经控制通道读（见 [`Engine::geo_data_warnings`]）
+/// 两种 Geo 数据眼下的问题：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（留着先前读进来的数据）、
+/// 装不上的监视、规则用到却没有数据提供的标签。启动、热重载和监视到文件变了时跟着更新，面板经控制通道读（见
+/// [`Engine::geo_data_warnings`]）
 /// What is wrong with the two kinds of Geo data right now: configured files that are missing
-/// or cannot be read, watches that cannot be installed, and tags rules use that no data
-/// provides. Kept up to date at startup, on hot reloads and as watched files change, and read
-/// by the panel over the control channel (see [`Engine::geo_data_warnings`])
+/// or cannot be read, files that read yet have none of the tags rules use any more (the data
+/// read from them before staying), watches that cannot be installed, and tags rules use that
+/// no data provides. Kept up to date at startup, on hot reloads and as watched files change,
+/// and read by the panel over the control channel (see [`Engine::geo_data_warnings`])
 #[derive(Default)]
 pub(crate) struct GeoStatus {
     site: Mutex<DataStatus>,
@@ -181,7 +208,9 @@ pub(crate) struct GeoStatus {
 /// 一种 Geo 数据的问题，每样一句话 / What is wrong with one kind of Geo data, a sentence each
 #[derive(Default)]
 struct DataStatus {
-    /// 读不进来的文件，各带说它的那句话 / The files that could not be read in, each with the sentence saying so
+    /// 读不进来的文件，和读得出来却没有规则用到的标签了的文件，各带说它的那句话 / The files that could not be
+    /// read in, and those that read yet have none of the tags rules use any more, each with the
+    /// sentence saying so
     files: Vec<(PathBuf, String)>,
     /// 监视装不上时说它的那句话 / The sentence saying the watch could not be installed, when it could not
     watch: Option<String>,
@@ -222,6 +251,11 @@ impl DataStatus {
         ));
     }
 
+    /// 有没有一句说 `path` 的 / Whether a sentence says something of `path`
+    fn has(&self, path: &Path) -> bool {
+        self.files.iter().any(|(file, _)| file == path)
+    }
+
     /// `path` 读进来了 / `path` was read in
     fn read(&mut self, path: &Path) {
         self.files.retain(|(file, _)| file != path);
@@ -236,14 +270,16 @@ impl DataStatus {
 }
 
 impl Engine {
-    /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、装不上的文件监视、规则用到却没有数据提供的标签
-    /// （这样的规则 geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到
-    /// 文件变了时跟着更新
+    /// Geo 数据眼下的问题，一样一句话：配置了却不存在或读不了的文件、读得出来却没有规则用到的标签了的文件（只有它提供的
+    /// 标签留着先前读进来的数据，重启以后就没有了）、装不上的文件监视、规则用到却没有数据提供的标签（这样的规则
+    /// geo_site、geoip_country 永不命中，geo_site_not 总命中）。没有问题时是空的。启动、热重载和监视到文件变了时跟着更新
     /// What is wrong with the Geo data right now, a sentence each: configured files that are
-    /// missing or cannot be read, file watches that cannot be installed, and tags rules use
-    /// that no data provides (geo_site and geoip_country never match them, and geo_site_not
-    /// always does). Empty when nothing is wrong. Kept up to date at startup, on hot reloads and
-    /// as watched files change
+    /// missing or cannot be read, files that read yet have none of the tags rules use any more
+    /// (the tags only they provide keeping the data read from them before, gone after a
+    /// restart), file watches that cannot be installed, and tags rules use that no data
+    /// provides (geo_site and geoip_country never match them, and geo_site_not always does).
+    /// Empty when nothing is wrong. Kept up to date at startup, on hot reloads and as watched
+    /// files change
     pub fn geo_data_warnings(&self) -> Vec<String> {
         let (site, ip) = (self.geo_status.site.lock(), self.geo_status.ip.lock());
         site.sentences()
@@ -278,6 +314,23 @@ fn unprovided_geoip_tags(missing: &[String]) -> Option<String> {
     })
 }
 
+/// `what`（比如 GeoSite data file）`path` 读得出来，却没有一个规则用到的标签了（多半是空文件或写坏了的文件），只有它
+/// 提供的 `kept` 这几个留着先前从它读进来的数据：记一条错误，给出状态里说它的那句话。文件下次改好、读进来时这句话跟着
+/// 去掉；不说的话，下次重启这几个标签就没有数据，规则不再命中，事先没有一点预兆
+/// `what` (GeoSite data file, say) `path` reads, yet has none of the tags rules use any more
+/// (most likely an empty or broken file), and the tags `kept`, which it alone provided, keep the
+/// data read from it before: logs an error, giving the status's sentence saying so. The
+/// sentence goes once the file is put right and read in; unsaid, the next restart would leave
+/// those tags without data and their rules no longer matching, with nothing to warn of it
+fn kept_from(what: &str, path: &Path, kept: &[String]) -> String {
+    error!(what, path = %path.display(), tags = ?kept, "data file now has none of the tags rules use, keeping the data read from it before");
+    format!(
+        "{what} {} now has none of the tags rules use; the data read from it before stays for {} until it changes again",
+        path.display(),
+        kept.join(", ")
+    )
+}
+
 /// 两个管理器里现在的 Geo 数据从哪来；只在重载锁下使用（见 `Engine::reload_lock`）
 /// Where the Geo data now in the two managers came from; used only under the reload lock
 /// (see `Engine::reload_lock`)
@@ -289,9 +342,9 @@ pub(crate) struct GeoSources {
 }
 
 impl GeoSources {
-    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件；数据每换一次，`state` 换成新一代的命名空间
+    /// 把 `cfg` 用到的 Geo 数据装进两个管理器，并监视它的文件；数据每换一次，`state` 换成按新指纹算的命名空间
     /// Loads the Geo data `cfg` uses into the two managers and watches its files; every
-    /// time the data is swapped, `state` moves to the new generation's namespaces
+    /// time the data is swapped, `state` moves to the namespaces of the new fingerprints
     pub(crate) fn load(
         cfg: &RuntimePipelineConfig,
         geosite: &Arc<RwLock<GeoSiteManager>>,
@@ -299,8 +352,8 @@ impl GeoSources {
         state: &Arc<ArcSwap<EngineInner>>,
     ) -> Self {
         let rotation = Rotation {
-            site: Arc::default(),
-            ip: Arc::default(),
+            geosite: Arc::clone(geosite),
+            geoip: Arc::clone(geoip),
             state: Arc::clone(state),
         };
         let status = Arc::default();
@@ -312,7 +365,7 @@ impl GeoSources {
         }
     }
 
-    /// 两种 Geo 数据现在的代数 / The two kinds of Geo data's generations now
+    /// 每个标签的数据现在的指纹 / The fingerprint of each tag's data now
     pub(crate) fn generation(&self) -> GeoGeneration {
         self.rotation.generation()
     }
@@ -479,30 +532,40 @@ fn load_geosite(
     // is released, and the old data is freed outside it too
     let (old, kept, missing_tags) = {
         let mut in_use = shared.write();
-        let kept: Vec<(&PathBuf, Swapped)> = gave_nothing
+        let kept: Vec<(&PathBuf, Vec<String>, Swapped)> = gave_nothing
             .into_iter()
             .filter_map(|path| {
                 let taken = in_use.take_source(path, &unprovided);
                 // 这份文件在 `fresh` 里什么都没提供，没有要交出去的标签 / The file provides nothing
                 // in `fresh`, so there are no tags to hand over
-                (!taken.is_empty())
-                    .then(|| (path, fresh.swap_source(path, taken, Vec::new(), false)))
+                (!taken.is_empty()).then(|| {
+                    let tags = taken.iter().map(|(tag, _)| tag.clone()).collect();
+                    (
+                        path,
+                        tags,
+                        fresh.swap_source(path, taken, Vec::new(), false),
+                    )
+                })
             })
             .collect();
         let missing_tags = fresh.missing_tags(&spec.tags);
         (mem::replace(&mut *in_use, fresh), kept, missing_tags)
     };
     drop(old);
-    for (path, swapped) in kept {
-        let tags = swapped.finish();
-        warn!(path = %path.display(), tags, "GeoSite data file now has none of the tags rules use, keeping the data in use");
+    for (path, tags, swapped) in kept {
+        swapped.finish();
+        // 读不了的文件已经有一句说它读不了 / An unreadable file has a sentence saying so already
+        if !problems.has(path) {
+            let said = kept_from("GeoSite data file", path, &tags);
+            problems.file(path, said);
+        }
     }
     // 没有要读的文件时不算，配置的告警已经说了（见 `config::geo_tags_without_data`）/ Not with no
     // file to read: the configuration's warnings say so already (see `config::geo_tags_without_data`)
     problems.tags = (!files.is_empty())
         .then(|| unprovided_geosite_tags(&missing_tags))
         .flatten();
-    rotation.site_swapped();
+    rotation.swapped();
 
     // 状态在监视开始之前写好：监视线程之后写进来的不会被它盖掉 / The status is written before the
     // watch starts, so what the watch thread writes later is not overwritten by it
@@ -518,7 +581,7 @@ fn load_geosite(
         &status.site,
         move |path| {
             if reload_geosite_file(&manager, path, &tags, &watching.site) {
-                rotation.site_swapped();
+                rotation.swapped();
             }
         },
     );
@@ -565,22 +628,32 @@ fn reload_geosite_file(
         }
     };
     status.lock().read(path);
-    let handovers = manager.read().handovers(path, &parsed);
     // 新读出来一个规则用到的标签都没有：多半是空文件或写坏了的文件（下载失败、磁盘写满）。只有它提供的标签换掉会让用
-    // 它们的规则一下子全不命中，所以留着正在用的数据，等文件下次改动；别的文件也提供的标签照常交给那个文件，和全部
-    // 重新读一遍一样。没有要交出去的标签时什么都不变。以前整份留着，别的文件明明还提供着的标签也一直用这份的旧数据
+    // 它们的规则一下子全不命中，所以留着正在用的数据，等文件下次改动，状态里也说一句；别的文件也提供的标签照常交给那个
+    // 文件，和全部重新读一遍一样。没有要交出去的标签时什么都不变。以前整份留着，别的文件明明还提供着的标签也一直用这份的
+    // 旧数据
     // The new read has none of the tags rules use: most likely an empty or broken file (a
     // failed download, a full disk). Dropping the tags only it provides would stop the rules
-    // using them matching at once, so they keep the data in use until the file changes again;
-    // the tags another file provides too go over to that file as usual, as a full load would
-    // have it. With none to hand over nothing changes. It used to be kept whole, so a tag
-    // another file still provided went on with this file's old data
+    // using them matching at once, so they keep the data in use until the file changes again,
+    // and the status says so; the tags another file provides too go over to that file as
+    // usual, as a full load would have it. With none to hand over nothing changes. It used to
+    // be kept whole, so a tag another file still provided went on with this file's old data
     let gives_none = !parsed_provides_any(&parsed, tags);
-    if gives_none {
-        warn!(path = %path.display(), "GeoSite data file now has none of the tags rules use, keeping the data only it provided");
-        if handovers.is_empty() {
-            return false;
-        }
+    let (handovers, kept) = {
+        let manager = manager.read();
+        let kept = if gives_none {
+            manager.provided_only_by(path)
+        } else {
+            Vec::new()
+        };
+        (manager.handovers(path, &parsed), kept)
+    };
+    if !kept.is_empty() {
+        let said = kept_from("GeoSite data file", path, &kept);
+        status.lock().file(path, said);
+    }
+    if gives_none && handovers.is_empty() {
+        return false;
     }
     let handed_over = GeoSiteManager::read_handovers(handovers);
     let mut manager = manager.write();
@@ -673,15 +746,18 @@ fn load_geoip(
         .filter(|path| in_use.is_some_and(|in_use| Path::new(in_use) == path.as_path()));
     let (old, kept, missing_tags) = {
         let mut current = shared.write();
-        let kept = gave_nothing.map_or(0, |_| fresh.keep_tags_of(&mut current, &dat_tags));
+        let kept = gave_nothing.map(|_| fresh.keep_tags_of(&mut current, &dat_tags));
         let missing_tags = fresh.missing_tags(&spec.tags);
         (mem::replace(&mut *current, fresh), kept, missing_tags)
     };
     drop(old);
-    if let Some(path) = gave_nothing
-        && kept > 0
+    // 读不了的文件已经有一句说它读不了 / An unreadable file has a sentence saying so already
+    if let (Some(path), Some(kept)) = (gave_nothing, kept)
+        && !kept.is_empty()
+        && !problems.has(path)
     {
-        warn!(path = %path.display(), tags = kept, "GeoIP data file now has none of the tags rules use, keeping the data in use");
+        let said = kept_from("GeoIP data file", path, &kept);
+        problems.file(path, said);
     }
     // 配置里没给数据的标签不算，配置的告警已经说了（见 `config::geo_tags_without_data`）/ Tags the
     // configuration gives no data for do not count: its warnings say so already (see
@@ -690,7 +766,7 @@ fn load_geoip(
         |tag: &String| spec.dat_path.is_some() || (spec.db_path.is_some() && is_country_tag(tag));
     let missing_tags: Vec<String> = missing_tags.into_iter().filter(given_data).collect();
     problems.tags = unprovided_geoip_tags(&missing_tags);
-    rotation.ip_swapped();
+    rotation.swapped();
 
     // 状态在监视开始之前写好，和 GeoSite 一样 / The status is written before the watch starts, as for GeoSite
     *status.ip.lock() = problems;
@@ -704,7 +780,7 @@ fn load_geoip(
         &status.ip,
         move |path| {
             if reload_geoip_file(&manager, path, &dat_tags, &watching.ip) {
-                rotation.ip_swapped();
+                rotation.swapped();
             }
         },
     );
@@ -744,11 +820,16 @@ fn reload_geoip_file(
     };
     status.lock().read(path);
     // 和 GeoSite 一样：规则用到的标签这份文件此前给着、现在一个都没有了，多半是文件坏了，
-    // 留着正在用的数据 / As for GeoSite: the file gave tags rules use until now and has
-    // none of them any more, most likely a broken file, so the data in use stays
-    if parsed.tag_count() == 0 && manager.read().tag_count() > 0 {
-        warn!(path = %path.display(), "GeoIP data file now has none of the tags rules use, keeping the data in use");
-        return false;
+    // 留着正在用的数据，状态里说一句 / As for GeoSite: the file gave tags rules use until now
+    // and has none of them any more, most likely a broken file, so the data in use stays, and
+    // the status says so
+    if parsed.tag_count() == 0 {
+        let kept = manager.read().tags();
+        if !kept.is_empty() {
+            let said = kept_from("GeoIP data file", path, &kept);
+            status.lock().file(path, said);
+            return false;
+        }
     }
     let mut fresh = manager.read().sharing_mmdb();
     let count = fresh.apply_parsed(parsed);
@@ -764,6 +845,7 @@ fn reload_geoip_file(
 mod tests {
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
@@ -859,9 +941,13 @@ mod tests {
         );
     }
 
-    /// 换数据时把代数加一、换命名空间的引擎状态：一份什么规则都没有的配置的 / The engine state a swap
-    /// moves to the next generation's namespaces: that of a configuration without rules
-    fn rotation() -> Rotation {
+    /// 换数据时按 `geosite`、`geoip` 的新指纹换命名空间的引擎状态：一份什么规则都没有的配置的 / The
+    /// engine state a swap moves to the namespaces of the new fingerprints of `geosite` and
+    /// `geoip`: that of a configuration without rules
+    fn rotation(
+        geosite: &Arc<RwLock<GeoSiteManager>>,
+        geoip: &Arc<RwLock<GeoIpManager>>,
+    ) -> Rotation {
         let cfg = RuntimePipelineConfig::from_config(
             serde_json::from_value(serde_json::json!({
                 "settings": { "default_upstream": "127.0.0.1:9" },
@@ -871,8 +957,8 @@ mod tests {
         )
         .unwrap();
         Rotation {
-            site: Arc::default(),
-            ip: Arc::default(),
+            geosite: Arc::clone(geosite),
+            geoip: Arc::clone(geoip),
             state: Arc::new(ArcSwap::from_pointee(EngineInner::new(cfg))),
         }
     }
@@ -913,7 +999,7 @@ mod tests {
             logged: Arc::clone(&logged),
             under_lock: Arc::clone(&under_lock),
         });
-        let rotation = rotation();
+        let rotation = rotation(&geosite, &geoip);
         let ip_path = ip.to_str().unwrap();
         tracing::subscriber::with_default(subscriber, || {
             // 监视一装上就停下，它的线程不会在这期间写数据 / Each watch is stopped as soon as it is

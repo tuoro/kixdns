@@ -281,6 +281,12 @@ async fn udp_static_fast_path_rejects_non_query_and_malformed_additional_records
     invalid_pointer[11] = 1;
     invalid_pointer.extend_from_slice(&[0xC0, 0xFF, 0, 16, 0, 1, 0, 0, 0, 0, 0, 0]);
 
+    // 属主是 a. 的 OPT（RFC 6891 第 6.1.2 节要求根名）：记录的走法和 hickory 都不认 / An OPT owned by
+    // a. (RFC 6891 section 6.1.2 asks for the root): neither the record walk nor hickory takes it
+    let mut opt_off_the_root = dns_query();
+    opt_off_the_root[11] = 1;
+    opt_off_the_root.extend_from_slice(&[1, b'a', 0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0]);
+
     let mut response_buf = [0u8; 512];
     client.send_to(&qr_response, server_addr).await.unwrap();
     assert!(
@@ -296,6 +302,7 @@ async fn udp_static_fast_path_rejects_non_query_and_malformed_additional_records
         ("missing Additional RR", missing_additional),
         ("truncated EDNS RDATA", truncated_edns),
         ("invalid Additional compression pointer", invalid_pointer),
+        ("OPT owned by other than the root", opt_off_the_root),
     ] {
         client.send_to(&packet, server_addr).await.unwrap();
         let (len, _) =

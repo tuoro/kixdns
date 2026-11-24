@@ -227,18 +227,24 @@ pub(crate) fn set_ecs_option(msg: &mut Message, subnet: ClientSubnet) {
     edns.options_mut().insert(EdnsOption::Subnet(subnet));
 }
 
-/// ECS 不带给上游的客户端地址：`geoip_private` 算作内网的那些（见 `geoip::is_private_ip`，两边只用这一份），再加上
-/// 本地用的转换前缀 64:ff9b:1::/48（RFC 8215）整个：它不可全球路由，不论嵌着哪个 IPv4 地址，拿它算出的子网都说明不了
-/// 客户端在哪里。`geoip_private` 那边只看它嵌着的地址：嵌着公网地址的是 DNS64 的寻常回答，不算内网
+/// ECS 不带给上游的客户端地址：`geoip_private` 算作内网的那些（见 `geoip::is_private_ip`，两边只用这一份），再加上两段
+/// 不可全球路由、拿它算出的子网说明不了客户端在哪里的地址：本地用的转换前缀 64:ff9b:1::/48（RFC 8215）整个，不论嵌着
+/// 哪个 IPv4 地址；基准测试的 198.18.0.0/15（RFC 2544）。`geoip_private` 不算这两段，理由都在回答上：64:ff9b:1::/48
+/// 嵌着公网地址的是 DNS64 的寻常回答，198.18.0.0/15 是 fake-ip 上游的寻常回答
 /// The client addresses ECS does not carry upstream: those `geoip_private` counts as local
-/// network ones (see `geoip::is_private_ip`, the one list both use), and the local-use
-/// translation prefix 64:ff9b:1::/48 (RFC 8215) whole: it is not globally routable, and
-/// whatever IPv4 address it embeds, a subnet worked out from it says nothing about where the
-/// client is. `geoip_private` looks at the address it embeds alone: one embedding a public
-/// address is an ordinary DNS64 answer, no local one
+/// network ones (see `geoip::is_private_ip`, the one list both use), and two ranges more that
+/// are not globally routable, so a subnet worked out from one says nothing about where the
+/// client is: the local-use translation prefix 64:ff9b:1::/48 (RFC 8215) whole, whatever IPv4
+/// address it embeds, and benchmarking's 198.18.0.0/15 (RFC 2544). `geoip_private` counts
+/// neither, for reasons that lie in answers: one of 64:ff9b:1::/48 embedding a public address
+/// is an ordinary DNS64 answer, and one of 198.18.0.0/15 an ordinary answer of a fake-ip
+/// upstream
 pub(crate) fn is_private_ip(ip: &IpAddr) -> bool {
     crate::matcher::geoip::is_private_ip(*ip)
-        || matches!(ip, IpAddr::V6(v6) if v6.segments()[..3] == [0x64, 0xff9b, 1])
+        || match ip {
+            IpAddr::V4(v4) => matches!(v4.octets(), [198, b, ..] if b & 0xfe == 18),
+            IpAddr::V6(v6) => v6.segments()[..3] == [0x64, 0xff9b, 1],
+        }
 }
 
 // ============================================================================
@@ -814,9 +820,15 @@ mod tests {
             prefix_v6: 56,
         };
 
-        // RFC 1918 private — should not inject
-        // RFC 1918 私有地址 — 不应注入
-        for ip in ["10.0.0.1", "172.16.0.1", "192.168.1.1", "127.0.0.1"] {
+        // RFC 1918 私有地址、回环，和基准测试网段 — 不应注入
+        // RFC 1918 private, loopback and the benchmarking range — should not inject
+        for ip in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "198.18.0.1",
+        ] {
             let peer: IpAddr = ip.parse().unwrap();
             let result = apply_ecs(&query, &mode, peer);
             assert!(
@@ -904,9 +916,16 @@ mod tests {
         assert!(is_private_ip(&"fd00::1".parse::<IpAddr>().unwrap()));
         assert!(is_private_ip(&"fe80::1".parse::<IpAddr>().unwrap()));
 
-        // 运营商级 NAT、站点本地，和本地用的转换前缀里嵌着公网地址的 / Carrier-grade NAT, site-local,
-        // and the local-use translation prefix embedding a public address
-        for address in ["100.64.0.1", "fec0::1", "64:ff9b:1::808:808"] {
+        // 运营商级 NAT、站点本地、本地用的转换前缀里嵌着公网地址的，和基准测试网段的两头 / Carrier-grade
+        // NAT, site-local, the local-use translation prefix embedding a public address, and either
+        // end of the benchmarking range
+        for address in [
+            "100.64.0.1",
+            "fec0::1",
+            "64:ff9b:1::808:808",
+            "198.18.0.0",
+            "198.19.255.255",
+        ] {
             assert!(is_private_ip(&address.parse().unwrap()), "{address}");
         }
 
@@ -915,9 +934,9 @@ mod tests {
             &"2001:4860:4860::8888".parse::<IpAddr>().unwrap()
         ));
         assert!(!is_private_ip(&"64:ff9b::808:808".parse().unwrap()));
-        // fake-ip 的默认网段，和 `geoip_private` 一样不算 / fake-ip's default range, not counted, as
-        // for `geoip_private`
-        assert!(!is_private_ip(&"198.18.0.1".parse().unwrap()));
+        // 基准测试网段两边紧挨着的 / Those right outside the benchmarking range
+        assert!(!is_private_ip(&"198.17.255.255".parse().unwrap()));
+        assert!(!is_private_ip(&"198.20.0.0".parse().unwrap()));
         assert!(!is_private_ip(
             &"2606:4700::1111".parse::<IpAddr>().unwrap()
         ));
@@ -995,6 +1014,7 @@ mod tests {
             own("10.1.2.0", 24),
             own("fd00:1::", 48),
             own("127.0.0.0", 8),
+            own("198.18.0.0", 24),
             // IPv4 映射形式的网段，私有的和公网的都不发 / IPv4-mapped networks, private and public alike
             own("::ffff:10.1.2.0", 120),
             own("::ffff:203.0.113.0", 120),

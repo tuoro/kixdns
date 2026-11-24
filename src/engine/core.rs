@@ -473,10 +473,18 @@ impl Engine {
     }
 
     /// Report to the observer that reloading `path` failed with `error` and
-    /// the previous configuration stays active.
-    pub fn notify_config_reload_failed(&self, path: &Path, error: &str) {
+    /// the previous configuration stays active: the error with its cause chain
+    /// and, when it refused the configuration for its problems, each of them
+    /// (see `config::Problems`).
+    /// 告诉观察者重载 `path` 因为 `error` 失败、之前的配置还在用：错误连同原因链，因为配置有问题被拒时还有逐条的问题
+    /// （见 `config::Problems`）。
+    pub fn notify_config_reload_failed(&self, path: &Path, error: &anyhow::Error) {
         if let Some(observer) = &self.observer {
-            observer.config_reload_failed(&ConfigReloadFailed { path, error });
+            observer.config_reload_failed(&ConfigReloadFailed {
+                path,
+                error: &format!("{error:#}"),
+                problems: crate::config::Problems::of(error),
+            });
         }
     }
 }

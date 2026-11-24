@@ -2035,12 +2035,12 @@ impl TakenPage {
     }
 }
 
-/// 响应码和回答记录（只取记录的数据部分，最多 8 条）；解析不了就只读包头的响应码。
+/// 响应码和回答记录（只取记录的数据部分，最多 8 条）；解析不了就只读响应码（连同 OPT 里的高位）。
 /// 结构过得了 [`crate::proto_utils::well_formed_reply`]（缓存靠的也是它）、前 8 条回答都是地址或名字的应答自己读：
 /// 地址直接写出来，名字交给 hickory 的 `Name` 读，写出来和 hickory 整份解析的一字不差，省下整份解析；
 /// 别的照旧整份解析
 /// The response code and the answer records (data only, at most eight); when the message cannot be
-/// parsed, only the header's response code is read. A reply whose structure passes
+/// parsed, only the response code is read (with the high bits from the OPT). A reply whose structure passes
 /// [`crate::proto_utils::well_formed_reply`] (which the cache relies on too) and whose first eight answers
 /// are addresses or names is read here: addresses are written directly and names read by hickory's
 /// `Name`, word for word what hickory's whole parse writes, without that parse; anything else is still
@@ -2069,7 +2069,10 @@ fn read_whole_response(bytes: &[u8]) -> (Option<ResponseCode>, Answers) {
                 })
                 .collect(),
         ),
-        Err(_) => (crate::observe::header_rcode(bytes), Answers::new()),
+        Err(_) => (
+            crate::proto_utils::parse_response_quick(bytes).map(|response| response.rcode),
+            Answers::new(),
+        ),
     }
 }
 
@@ -2792,7 +2795,8 @@ mod tests {
                 },
             );
         }
-        // 只有六个字节，读不出；报文头说 NXDOMAIN / Six bytes only, unreadable; the header says NXDOMAIN
+        // 只有六个字节，连报文头都不全：不是应答，读不出响应码 / Six bytes only, not even a whole
+        // header: no reply, and no response code is read from it
         finish(
             &log,
             &request,
@@ -2817,7 +2821,7 @@ mod tests {
             );
             assert_eq!(step["result"], outcomes[index % outcomes.len()].1, "{step}");
         }
-        assert_eq!(entry["rcode"], "NXDOMAIN", "{entry}");
+        assert!(entry["rcode"].is_null(), "{entry}");
         assert!(
             entry["answers"].as_array().is_none_or(Vec::is_empty),
             "{entry}"
@@ -4621,6 +4625,25 @@ mod tests {
             }
         }
         assert!(read_here > 5_000, "{read_here} intact replies read here");
+    }
+
+    /// hickory 读不了的应答，响应码照样连同 OPT 里的高位读：BADVERS 的头部低 4 位是 0，只看头部就成了 NOERROR
+    /// A reply hickory cannot read still has its response code read with the high bits from the OPT:
+    /// BADVERS has 0 in the header's low four bits, and the header alone makes it NOERROR
+    #[test]
+    fn an_unreadable_reply_keeps_its_extended_response_code() {
+        #[rustfmt::skip]
+        let reply = [
+            0, 7, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 1,
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
+            // 地址只有 3 个字节的 A 记录 / An A record with a three-byte address
+            0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 3, 1, 2, 3,
+            // OPT，扩展 RCODE 1 / The OPT, extended RCODE 1
+            0, 0, 41, 4, 0xD0, 1, 0, 0, 0, 0, 0,
+        ];
+        assert!(Message::from_vec(&reply).is_err());
+        // 16，BADVERS / 16, BADVERS
+        assert_eq!(read_whole_response(&reply).0.map(u16::from), Some(16));
     }
 
     /// IPv4 地址一位位写出来，和 `Display` 写的一字不差 / An IPv4 address written digit by digit reads exactly
