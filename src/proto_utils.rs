@@ -516,9 +516,12 @@ pub(crate) fn reply_as_asked_knowing(
 /// [`reply_as_asked`]，查询的 DO 位（见 [`asked_dnssec_ok`]）已经找过 / [`reply_as_asked`] with the query's
 /// DO bit (see [`asked_dnssec_ok`]) looked for already
 fn shaped_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bool>, ()>) -> Bytes {
-    // 应答的记录只走一遍：问题名的写法和 RD、CD 位改的都是原位的字节，记录的位置不动，后面找 OPT 用的就是这一遍
-    // The reply's records are walked once: the question name's spelling and the RD and CD
-    // bits change bytes in place without moving any record, so the OPT is taken from this walk
+    // 应答的记录只走一遍：问题名的写法和 RD、CD、AD 位改的都是原位的字节，记录的位置不动，后面找 OPT 用的就是这一遍。
+    // 这几样连同 DO 位都改在同一份上：头一样要改的在应答还有别处持有时复制一份，之后的就是独占的，原地改
+    // The reply's records are walked once: the question name's spelling and the RD, CD and AD
+    // bits change bytes in place without moving any record, so the OPT is taken from this walk.
+    // These and the DO bit are all changed in one copy: the first change copies the reply when
+    // something else holds it too, and the copy, held alone, takes the rest in place
     let walk = walk_records(&reply);
     // TSIG 的 MAC 盖着整个报文（RFC 8945 第 4.3 节），改哪一位签名都失效：签过的应答原样交出
     // A TSIG's MAC covers the whole message (RFC 8945 section 4.3) and any change breaks
@@ -541,11 +544,12 @@ fn asked_dnssec_ok(query: &[u8]) -> Result<Option<bool>, ()> {
 
 /// 应答的 RD 位（RFC 1035 第 4.1.1 节）和 CD 位（RFC 4035 第 3.2.2 节）照抄查询的。查询既没带 AD
 /// 也没带 DO 时应答不带 AD（RFC 6840 第 5.8 节）：转发时 AD 一律是带着的（见 [`query_asking_ad`]），
-/// 所以缓存里的应答带着上游验证的结论，交给每个客户端时再按它自己问的样子去掉
+/// 所以缓存里的应答带着上游验证的结论，交给每个客户端时再按它自己问的样子去掉。只有一处持有应答时原地改，不复制
 /// The reply with the query's RD bit (RFC 1035 section 4.1.1) and CD bit (RFC 4035
 /// section 3.2.2). When the query has neither AD nor DO the reply carries no AD (RFC 6840
 /// section 5.8): forwards always ask with AD (see [`query_asking_ad`]), so a cached reply
-/// carries what the upstream validated, and each client has it taken off as it asked
+/// carries what the upstream validated, and each client has it taken off as it asked. Changed
+/// in place, uncopied, when nothing else holds the reply
 fn header_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bool>, ()>) -> Bytes {
     if reply.len() < 12 || query.len() < 12 {
         return reply;
@@ -556,10 +560,10 @@ fn header_as_asked(reply: Bytes, query: &[u8], asked_dnssec_ok: Result<Option<bo
     if reply[2] & 0x01 == rd && reply[3] & 0x10 == cd && reply[3] & 0x20 == ad {
         return reply;
     }
-    let mut copy = BytesMut::from(&reply[..]);
-    copy[2] = (copy[2] & !0x01) | rd;
-    copy[3] = (copy[3] & !0x30) | cd | ad;
-    copy.freeze()
+    let mut reply = BytesMut::from(reply);
+    reply[2] = (reply[2] & !0x01) | rd;
+    reply[3] = (reply[3] & !0x30) | cd | ad;
+    reply.freeze()
 }
 
 /// 发给上游的查询带上 AD 位（RFC 6840 第 5.7 节：带 AD 表示听得懂应答里的 AD），验证型上游给的应答就带着
@@ -580,17 +584,17 @@ pub(crate) fn query_asking_ad(query: std::borrow::Cow<'_, [u8]>) -> std::borrow:
 }
 
 /// 上游应答去掉 AA 位：AA 说的是作答的服务器是权威（RFC 1035 第 4.1.1 节），KixDNS 转交别人的数据，
-/// 从缓存里取出的更不是。签过名的应答不改
+/// 从缓存里取出的更不是。签过名的应答不改；只有一处持有应答时原地改，不复制
 /// An upstream reply without its AA bit: AA says the responding server is an authority
 /// (RFC 1035 section 4.1.1), and KixDNS hands on others' data, less so from its cache. A
-/// signed reply is left alone
+/// signed reply is left alone; one nothing else holds is changed in place, uncopied
 pub(crate) fn reply_without_aa(reply: Bytes) -> Bytes {
     if reply.len() < 12 || reply[2] & 0x04 == 0 || last_record_is_tsig(&reply) {
         return reply;
     }
-    let mut copy = BytesMut::from(&reply[..]);
-    copy[2] &= !0x04;
-    copy.freeze()
+    let mut reply = BytesMut::from(reply);
+    reply[2] &= !0x04;
+    reply.freeze()
 }
 
 /// 应答的 EDNS 跟着查询走（RFC 6891）：查询带 OPT，应答就带（第 6.1.1 节），没有时在末尾补一条；
@@ -621,17 +625,19 @@ fn edns_as_asked_with(
     let Ok(opt) = opt else {
         return reply;
     };
-    let changed = match (asked_dnssec_ok, opt) {
+    let resized = match (asked_dnssec_ok, opt) {
         (Some(dnssec_ok), None) => with_opt(&reply, dnssec_ok, &[]),
-        (Some(dnssec_ok), Some(opt)) => (opt.dnssec_ok(&reply) != dnssec_ok).then(|| {
-            let mut copy = reply.to_vec();
-            copy[opt.extended_rcode_at + 2] ^= 0x80;
-            copy
-        }),
+        // DO 位是原位的一位：只有一处持有应答时原地改 / The DO bit is one bit in place: changed in
+        // place when nothing else holds the reply
+        (Some(dnssec_ok), Some(opt)) if opt.dnssec_ok(&reply) != dnssec_ok => {
+            let mut reply = BytesMut::from(reply);
+            reply[opt.extended_rcode_at + 2] ^= 0x80;
+            return reply.freeze();
+        }
         (None, Some(opt)) if reply[opt.extended_rcode_at] == 0 => without_opt(&reply, &opt),
-        (None, _) => None,
+        _ => None,
     };
-    changed.map_or(reply, Bytes::from)
+    resized.map_or(reply, Bytes::from)
 }
 
 /// 末尾补一条 OPT 的报文（扩展 RCODE 0，见 [`push_opt`]），带着选项 `options`。读不出或最后
@@ -690,14 +696,16 @@ fn without_opt(message: &[u8], opt: &OptRecord) -> Option<Vec<u8>> {
 /// 应答的问题名照客户端发来的写法（RFC 1035 第 4.1.1 节：问题段由查询照抄）。两者忽略大小写
 /// 相同（RFC 4343）而写法不同时，把查询里的名字抄进应答：缓存里存的、合并的在途查询拿到的
 /// 都是别的客户端问的写法，静态回答写的是小写，有的上游也会改写大小写，而用 0x20 打乱大小写
-/// 的客户端要核对它。名字不同、或者读不出不压缩的名字时原样返回；写法本来就一样时不复制。
+/// 的客户端要核对它。名字不同、或者读不出不压缩的名字时原样返回；写法本来就一样时不复制。只有一处持有应答时
+/// 名字原地抄进去，应答不复制。
 /// The reply with its question name written as the client wrote it (RFC 1035 section
 /// 4.1.1: the question is copied from the query). When the two are equal ignoring case
 /// (RFC 4343) but written differently, the query's name is copied into the reply: a
 /// cached answer or one handed to a merged inflight query carries another client's
 /// spelling, a static answer is written in lowercase, some upstreams rewrite the case,
 /// and a client randomizing the case (0x20) checks it. Another name, or one that cannot
-/// be read uncompressed, leaves the reply as it is; so does the same spelling, uncopied.
+/// be read uncompressed, leaves the reply as it is; so does the same spelling, uncopied. The
+/// name is copied in place, the reply uncopied, when nothing else holds it.
 fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     let Some(end) = question_name_end(query) else {
         return reply;
@@ -709,9 +717,9 @@ fn question_as_asked(reply: Bytes, query: &[u8]) -> Bytes {
     {
         return reply;
     }
-    let mut copy = BytesMut::from(&reply[..]);
-    copy[12..end].copy_from_slice(asked);
-    copy.freeze()
+    let mut reply = BytesMut::from(reply);
+    reply[12..end].copy_from_slice(asked);
+    reply.freeze()
 }
 
 /// 第一个问题名结束的位置，照 [`strict_name_end`] 读；没有问题段或者名字读不了时为 None，名字之后的类型和类别在不在报文
@@ -3271,6 +3279,42 @@ mod tests {
             msg.set_edns(opt);
         }
         msg.to_vec().unwrap()
+    }
+
+    /// 照查询规整时问题名的写法、RD、AD 和 DO 位都改在同一份上：只有一处持有的应答原地改，一次也不复制；还有别处持有的
+    /// 只复制一次，原来那份不动
+    /// Shaping a reply as asked changes the question name's spelling and the RD, AD and DO bits
+    /// in one copy: a reply nothing else holds is changed in place, never copied; one held
+    /// elsewhere too is copied once, the original left as it was
+    #[test]
+    fn shaping_changes_one_copy_in_place() {
+        use hickory_proto::op::MessageType::{Query, Response};
+        // 应答带 RD 和 AD、DO 为 0；查询把名字写成 Example，不带 RD 和 AD，DO 为 1 / The reply carries RD
+        // and AD with DO 0; the query spells the name Example, without RD or AD, with DO 1
+        let mut reply = edns_message(Response, Some(false));
+        reply[2] |= 0x01;
+        reply[3] |= 0x20;
+        let mut query = edns_message(Query, Some(true));
+        query[13] = b'E';
+        query[2] &= !0x01;
+        // 查询带 DO，AD 留着 / With DO in the query AD stays
+        let mut expected = reply.clone();
+        expected[13] = b'E';
+        expected[2] &= !0x01;
+        let opt = find_opt(&expected).unwrap().unwrap();
+        expected[opt.extended_rcode_at + 2] |= 0x80;
+
+        let unique = Bytes::from(reply.clone());
+        let at = unique.as_ptr();
+        let shaped = reply_as_asked(unique, &query);
+        assert_eq!(shaped, expected);
+        assert_eq!(shaped.as_ptr(), at, "changed in place");
+
+        let held = Bytes::from(reply.clone());
+        let shaped = reply_as_asked(held.clone(), &query);
+        assert_eq!(shaped, expected);
+        assert_ne!(shaped.as_ptr(), held.as_ptr());
+        assert_eq!(held, reply, "the held reply is left as it was");
     }
 
     /// 应答带不带 OPT、DO 位是什么（None：没有 OPT）/ Whether a reply has an OPT and its DO bit
