@@ -591,15 +591,23 @@ impl Action {
     /// `engine::rules`): every action but log and forward (the reply it gets replaces the
     /// answer in hand, and the actions after it run on). However many forwards a list writes,
     /// each runs as written
-    pub(crate) fn ends_response(&self) -> bool {
+    fn ends_response(&self) -> bool {
         !matches!(self, Action::Log { .. } | Action::Forward { .. })
+    }
+
+    /// 回答阶段一串动作里作决定的那个：第一个不是 log、forward 的（见 [`Action::ends_response`]），一个都没有时为
+    /// None，手上的应答照旧
+    /// The action deciding a response-phase list: the first that is neither log nor forward
+    /// (see [`Action::ends_response`]), None when there is none and the answer in hand stays
+    pub(crate) fn response_decision(actions: &[Action]) -> Option<&Action> {
+        actions.iter().find(|action| action.ends_response())
     }
 }
 
 /// `actions` 里执行得到的：按写的顺序到第一个 `ends` 的为止（含它）
 /// The part of `actions` that runs: in the order written, up to and including the first that
 /// `ends`
-pub(crate) fn run_until(actions: &[Action], ends: fn(&Action) -> bool) -> &[Action] {
+fn run_until(actions: &[Action], ends: fn(&Action) -> bool) -> &[Action] {
     let end = actions
         .iter()
         .position(ends)
@@ -626,7 +634,7 @@ impl Rule {
     /// nor do their jumps go anywhere
     pub(crate) fn actions_run(&self) -> impl Iterator<Item = &Action> {
         let request = run_until(&self.actions, Action::ends_request);
-        let forwards = matches!(request.last(), Some(Action::Forward { .. }));
+        let forwards = matches!(self.request_decision(), Some(Action::Forward { .. }));
         let response = [
             &self.response_actions_on_match,
             &self.response_actions_on_miss,

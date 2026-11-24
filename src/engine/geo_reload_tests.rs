@@ -1220,6 +1220,57 @@ async fn a_data_file_pointed_where_it_is_partly_watched_is_read_by_a_reload() {
     assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
 }
 
+/// 启动时 GeoSite 数据文件经符号链接指向还不存在的目录；目录建好、文件写进去、链接照原样重建（`ln -sfn` 那样）以后，
+/// 监视重新解析它，那个目录监视上，文件读进来，状态里不再说它监视不上。之后文件原地改写，监视照样读进来：状态说它都监
+/// 视着，它就真的都监视着
+/// At startup a GeoSite data file leads, through a symlink, into a directory not there yet;
+/// once the directory is made, the file written and the link made anew as it was (as
+/// `ln -sfn` does), the watch resolves it again, that directory is watched, the file is read in
+/// and the status no longer says it cannot be watched. The file edited in place afterwards is
+/// read in by the watch as well: when the status says it is watched everywhere, it is
+#[cfg(unix)]
+#[tokio::test]
+async fn a_geosite_file_partly_watched_at_startup_is_watched_once_its_link_is_made_anew() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = dir.path().join("conf");
+    std::fs::create_dir(&conf).unwrap();
+    let site = conf.join("geosite.dat");
+    let target = link_into_a_missing_directory(dir.path(), &site);
+    let engine = engine(geosite_config(&[&site], "ads"));
+    let said = partly_watched("GeoSite data file", &site);
+    assert!(
+        engine
+            .geo_data_warnings()
+            .iter()
+            .any(|sentence| sentence.starts_with(&said)),
+        "{:?}",
+        engine.geo_data_warnings()
+    );
+
+    std::fs::create_dir(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, geosite_dat(&[("ads", "first.test")])).unwrap();
+    let tmp = conf.join("geosite.dat.tmp");
+    std::os::unix::fs::symlink(&target, &tmp).unwrap();
+    std::fs::rename(&tmp, &site).unwrap();
+    wait_for(
+        "the watch reads the file once the link is made anew",
+        || engine.geo().geosite.matches("ads", "x.first.test"),
+    )
+    .await;
+    wait_for(
+        "the status says nothing once it is watched everywhere",
+        || engine.geo_data_warnings().is_empty(),
+    )
+    .await;
+
+    std::fs::write(&target, geosite_dat(&[("ads", "second.test")])).unwrap();
+    wait_for("the watch reads the file edited in place", || {
+        engine.geo().geosite.matches("ads", "x.second.test")
+    })
+    .await;
+    assert_eq!(engine.geo_data_warnings(), Vec::<String>::new());
+}
+
 /// 配置了却不存在、读不了的 Geo 数据文件和 MMDB 记成错误：默认日志级别是 error，记成 warn 的话没开面板时谁也看不到。
 /// 以前都记成 warn
 /// Geo data files and an MMDB that are configured yet not there or unreadable are logged as
