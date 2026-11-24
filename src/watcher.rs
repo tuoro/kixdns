@@ -51,16 +51,19 @@ impl ConfigWatch {
         self.start_reporting(engine, |_| {})
     }
 
-    /// 同 [`ConfigWatch::start`]，每次重载之前文件重新解析、监视跟着换，监视得怎样交给 `on_watch`：新的地方为什么监视
-    /// 不上，都监视上了是 None（见 [`PendingWatch::start_reporting`]）
-    /// As [`ConfigWatch::start`], and before each reload, as the file is resolved again with the
-    /// watches following, how it is watched goes to `on_watch`: why its new places cannot be
-    /// watched, None when every one is (see [`PendingWatch::start_reporting`])
+    /// 同 [`ConfigWatch::start`]，监视得怎样交给 `on_watch`：为什么有位置监视不上，都监视上了是 None。开始时报一次装的
+    /// 时候的（见 [`PendingWatch::uncovered`]），之后每次重载之前文件重新解析、监视跟着换，再报一次（见
+    /// [`PendingWatch::start_reporting`]）
+    /// As [`ConfigWatch::start`], with how the file is watched going to `on_watch`: why some of
+    /// its places cannot be watched, None when every one is. It is reported once at the start, as
+    /// installed (see [`PendingWatch::uncovered`]), and again before each reload, as the file is
+    /// resolved again with the watches following (see [`PendingWatch::start_reporting`])
     pub fn start_reporting(
         self,
         engine: Engine,
         mut on_watch: impl FnMut(Option<&notify::Error>) + Send + 'static,
     ) -> notify::Result<FileWatch> {
+        on_watch(self.0.uncovered().next().map(|(_, err)| err));
         self.0
             .start_reporting("config-watcher", move |path| {
                 // 启动时只记错误、照样加载的那些写法，重载时拒绝（见 config::compile）
@@ -1130,6 +1133,43 @@ mod tests {
         assert_eq!(uncovered.len(), 1, "{uncovered:?}");
         assert_eq!(uncovered[0].0, linked);
         assert!(uncovered[0].1.contains("missing"), "{uncovered:?}");
+    }
+
+    /// 配置文件装监视的时候就有位置监视不上（符号链接指向不存在的目录），开始时就经 `on_watch` 报出来，和后来改了指向
+    /// 监视不上一样，面板的 `watch_error` 也就写着；都监视得上时报 None
+    /// A configuration file with places that cannot be watched when the watch is installed (a
+    /// symlink into a directory not there) is reported to `on_watch` at the start, as when it
+    /// later comes to lead somewhere unwatchable, so the panel's `watch_error` says so too; one
+    /// watched everywhere is reported None
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_config_file_partly_watched_from_the_start_is_reported_at_the_start() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let conf = root.path().join("conf");
+        std::fs::create_dir(&conf).unwrap();
+        let (linked, plain) = (conf.join("linked.json"), conf.join("plain.json"));
+        std::os::unix::fs::symlink(root.path().join("missing/linked.json"), &linked).unwrap();
+        std::fs::write(&plain, "{}").unwrap();
+        let engine =
+            crate::engine::test_support::engine_from(serde_json::json!({ "pipelines": [] }));
+
+        for (path, uncovered) in [(linked, true), (plain, false)] {
+            let (tx, rx) = mpsc::channel();
+            let _watch = ConfigWatch::new(&path)
+                .expect("watch")
+                .start_reporting(engine.clone(), move |watched| {
+                    let _ = tx.send(watched.map(ToString::to_string));
+                })
+                .expect("start");
+            let reported = rx.try_recv().expect("reported at the start");
+            assert_eq!(
+                reported
+                    .as_deref()
+                    .is_some_and(|why| why.contains("missing")),
+                uncovered,
+                "{path:?}: {reported:?}"
+            );
+        }
     }
 
     /// 符号链接改指向一个监视不上的地方（目录不存在）以后，`on_watch` 拿到为什么（另记一条 error），又指回监视得上的
