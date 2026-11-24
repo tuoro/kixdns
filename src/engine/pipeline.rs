@@ -1,14 +1,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use hickory_proto::op::ResponseCode;
 use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
 use crate::matcher::advanced_rule::PrecomputedAction;
 use crate::matcher::{
     GeoManagers, RequestFacts, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
-    parse_rcode,
 };
 
 use super::core::Engine;
@@ -18,7 +16,6 @@ use super::observation::{
 use super::rules::Decision;
 use super::rules::{RULE_CACHE_MAX_AGE, RuleCacheEntry, RuleCacheRecord, RuleQuestion};
 use super::types::EngineInner;
-use super::{make_static_cname_answer, make_static_ip_answer, make_static_txt_answer};
 use crate::observe::{RuleCacheLookup, RuleEvaluated, RulePhase};
 
 /// `cfg` 给从 `listener_label` 进来的请求 `facts` 选的 pipeline：第一条命中的 pipeline_select，都不命中时是第一个
@@ -321,26 +318,11 @@ impl Engine {
                     matched_rules.push(rule.name.clone());
                 }
                 for action in &rule.actions {
+                    if let Some(answer) = action.static_answer() {
+                        let (rcode, answers) = answer.records(qname, qtype, qclass);
+                        return Some(Decision::Static { rcode, answers });
+                    }
                     match action {
-                        Action::StaticResponse { rcode } => {
-                            let code = parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain);
-                            let d = Decision::Static {
-                                rcode: code,
-                                answers: Vec::new(),
-                            };
-                            return Some(d);
-                        }
-                        Action::StaticIpResponse { ip } => {
-                            let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
-                            let d = Decision::Static { rcode, answers };
-                            return Some(d);
-                        }
-                        Action::StaticCnameResponse { target, ttl } => {
-                            let (rcode, answers) =
-                                make_static_cname_answer(qname, qclass, target, ttl.unwrap_or(300));
-                            let d = Decision::Static { rcode, answers };
-                            return Some(d);
-                        }
                         Action::JumpToPipeline { pipeline: target } => {
                             let d = Decision::Jump {
                                 pipeline: Arc::clone(target),
@@ -352,13 +334,6 @@ impl Engine {
                                 &state.pipeline.settings,
                                 rule.name.clone(),
                             ));
-                        }
-                        Action::Deny => {
-                            let d = Decision::Static {
-                                rcode: ResponseCode::Refused,
-                                answers: Vec::new(),
-                            };
-                            return Some(d);
                         }
                         Action::Forward {
                             upstream,
@@ -419,23 +394,17 @@ impl Engine {
                             );
                             *logged = true;
                         }
-                        Action::StaticTxtResponse { text, ttl } => {
-                            // 和响应阶段一样：装不进一条记录的文本回 SERVFAIL
-                            // As in the response phase: text that does not fit a record is
-                            // answered SERVFAIL
-                            let (rcode, answers) = make_static_txt_answer(
-                                qname,
-                                qtype,
-                                qclass,
-                                text,
-                                ttl.unwrap_or(300),
-                            );
-                            return Some(Decision::Static { rcode, answers });
-                        }
-                        // 请求阶段手上没有应答可换：这一个动作什么也不做，规则后面的动作照常执行
-                        // In the request phase there is no answer in hand to replace: this action
-                        // does nothing, and the rule's actions after it run as usual
-                        Action::ReplaceTxtResponse { .. } => {}
+                        // 请求阶段手上没有应答可换，replace_txt_response 什么也不做，规则后面的动作照常执行；作答的动作
+                        // 上面已经答了
+                        // In the request phase there is no answer in hand to replace:
+                        // replace_txt_response does nothing, and the rule's actions after it run as
+                        // usual; the answering actions have answered above
+                        Action::ReplaceTxtResponse { .. }
+                        | Action::StaticResponse { .. }
+                        | Action::StaticIpResponse { .. }
+                        | Action::StaticCnameResponse { .. }
+                        | Action::StaticTxtResponse { .. }
+                        | Action::Deny => {}
                         Action::Continue => {
                             continue 'rules;
                         }
@@ -463,7 +432,7 @@ pub(crate) fn fast_static_match<'a>(
     pipeline: &'a RuntimePipeline,
     facts: &RequestFacts<'_>,
     geo: &GeoManagers,
-) -> Option<(&'a PrecomputedAction, &'a str)> {
+) -> Option<(PrecomputedAction<'a>, &'a str)> {
     let last = pipeline.last_precomputed?;
     let candidates = pipeline.index.get_candidates(facts.qname, facts.qtype);
     // 候选按规则顺序排好（见 `RuleIndex::get_candidates`）/ Candidates come in rule order (see
@@ -479,9 +448,7 @@ pub(crate) fn fast_static_match<'a>(
             )
         })?;
     let rule = &pipeline.rules[idx];
-    rule.precomputed
-        .as_ref()
-        .map(|action| (action, &*rule.name))
+    rule.precomputed().map(|action| (action, &*rule.name))
 }
 
 #[cfg(test)]

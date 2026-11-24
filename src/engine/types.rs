@@ -635,13 +635,13 @@ fn hash_action(action: &Action, hasher: &mut impl Hasher) {
     discriminant(action).hash(hasher);
     match action {
         Action::Log { level } => level.hash(hasher),
-        Action::StaticResponse { rcode } => rcode.hash(hasher),
-        Action::StaticIpResponse { ip } => ip.hash(hasher),
-        Action::StaticCnameResponse { target, ttl } => {
+        Action::StaticResponse { rcode, .. } => rcode.hash(hasher),
+        Action::StaticIpResponse { ip, .. } => ip.hash(hasher),
+        Action::StaticCnameResponse { target, ttl, .. } => {
             target.hash(hasher);
             ttl.hash(hasher);
         }
-        Action::StaticTxtResponse { text, ttl } => {
+        Action::StaticTxtResponse { text, ttl, .. } => {
             text.hash(hasher);
             ttl.hash(hasher);
         }
@@ -656,7 +656,7 @@ fn hash_action(action: &Action, hasher: &mut impl Hasher) {
             transport.hash(hasher);
             hash_ecs_mode(ecs.as_ref(), hasher);
         }
-        Action::ReplaceTxtResponse { text } => text.hash(hasher),
+        Action::ReplaceTxtResponse { text, .. } => text.hash(hasher),
         Action::Allow | Action::Deny | Action::Continue => {}
     }
 }

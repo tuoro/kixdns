@@ -12,14 +12,12 @@ use crate::cache_store::Cached;
 use crate::config::{Action, Transport};
 use crate::engine::core::Engine;
 use crate::engine::execution::Request;
-use crate::engine::response::{
-    least_ttl, make_static_cname_answer, make_static_ip_answer, make_static_txt_answer,
-    static_reply,
-};
+use crate::engine::response::{least_ttl, static_reply};
 use crate::engine::upstream::UpstreamFailure;
+use crate::matcher::advanced_rule::StaticAnswer;
 use crate::matcher::eval_match_chain;
 use crate::matcher::{GeoManagers, RuntimeResponseMatcherWithOp};
-use crate::matcher::{RequestFacts, RequesterKey, ResponsePhase, parse_rcode};
+use crate::matcher::{RequestFacts, RequesterKey, ResponsePhase};
 
 #[derive(Debug, Clone)]
 pub enum Decision {
@@ -388,11 +386,14 @@ async fn run_response_actions(
     mut ctx: ApplyResponseActionsContext<'_>,
 ) -> anyhow::Result<ResponseActionResult> {
     let request = ctx.request;
-    let (qname, qtype, qclass) = (request.qname.as_ref(), request.qtype, request.qclass);
+    let (qname, qtype) = (request.qname.as_ref(), request.qtype);
     const MAX_RESPONSE_FORWARDS: usize = 4;
     let mut forward_attempts = 0usize;
 
     for action in ctx.actions {
+        if let Some(answer) = action.static_answer() {
+            return Ok(static_answer(request, answer));
+        }
         match action {
             Action::Log { level } => {
                 log_match(
@@ -403,24 +404,6 @@ async fn run_response_actions(
                     qtype,
                     request.peer.ip(),
                 );
-            }
-            Action::StaticResponse { rcode } => {
-                let code = parse_rcode(rcode).unwrap_or(ResponseCode::NXDomain);
-                return Ok(static_answer(request, code, &[]));
-            }
-            Action::StaticIpResponse { ip } => {
-                let (rcode, answers) = make_static_ip_answer(qname, qtype, qclass, ip);
-                return Ok(static_answer(request, rcode, &answers));
-            }
-            Action::StaticCnameResponse { target, ttl } => {
-                let (rcode, answers) =
-                    make_static_cname_answer(qname, qclass, target, ttl.unwrap_or(300));
-                return Ok(static_answer(request, rcode, &answers));
-            }
-            Action::StaticTxtResponse { text, ttl } => {
-                let (rcode, answers) =
-                    make_static_txt_answer(qname, qtype, qclass, text, ttl.unwrap_or(300));
-                return Ok(static_answer(request, rcode, &answers));
             }
             Action::JumpToPipeline { pipeline } => {
                 if ctx.remaining_jumps == 0 {
@@ -434,9 +417,6 @@ async fn run_response_actions(
             // 和所有动作执行完一样：有应答就交出它，没有就 SERVFAIL
             // As when every action has run: the answer if there is one, SERVFAIL if not
             Action::Allow => break,
-            Action::Deny => {
-                return Ok(static_answer(request, ResponseCode::Refused, &[]));
-            }
             Action::Continue => {
                 return Ok(ResponseActionResult::Continue { ctx: ctx.ctx_opt });
             }
@@ -448,13 +428,18 @@ async fn run_response_actions(
             // with NOERROR, and SERVFAIL when it does not fit. None of this used to be looked at,
             // an A query getting the TXT record too, and an upstream's NXDOMAIN keeping it. With
             // no answer in hand (after an upstream failure) there is nothing to replace: SERVFAIL
-            Action::ReplaceTxtResponse { text } => {
+            Action::ReplaceTxtResponse { answer, .. } => {
                 if ctx.ctx_opt.is_none() {
                     return Ok(servfail(request));
                 }
-                let (rcode, answers) = make_static_txt_answer(qname, qtype, qclass, text, 300);
-                return Ok(static_answer(request, rcode, &answers));
+                return Ok(static_answer(request, answer));
             }
+            // 上面已经答了 / Answered above
+            Action::StaticResponse { .. }
+            | Action::StaticIpResponse { .. }
+            | Action::StaticCnameResponse { .. }
+            | Action::StaticTxtResponse { .. }
+            | Action::Deny => {}
             Action::Forward {
                 upstream,
                 transport,
@@ -609,25 +594,22 @@ pub(crate) fn log_match(
     }
 }
 
-/// 响应动作照请求给出的静态应答，带着它记录里最小的 TTL：照线上格式从客户端的查询写（见 `response::static_reply`），不为它
-/// 解析请求
-/// A static answer the response actions give for the request, with the least TTL of its records:
-/// written on the wire from the client's query (see `response::static_reply`), with no parse of
-/// the request for it
-fn static_answer(
-    request: &Request<'_>,
-    rcode: ResponseCode,
-    answers: &[Record],
-) -> ResponseActionResult {
+/// 响应动作照请求给出的静态应答 `answer`（见 `StaticAnswer::records`），带着它记录里最小的 TTL：照线上格式从客户端的查询
+/// 写（见 `response::static_reply`），不为它解析请求
+/// The static answer `answer` the response actions give for the request (see
+/// `StaticAnswer::records`), with the least TTL of its records: written on the wire from the
+/// client's query (see `response::static_reply`), with no parse of the request for it
+fn static_answer(request: &Request<'_>, answer: &StaticAnswer) -> ResponseActionResult {
+    let (rcode, answers) = answer.records(request.qname, request.qtype, request.qclass);
     ResponseActionResult::Static {
-        ttl: least_ttl(answers),
+        ttl: least_ttl(&answers),
         bytes: static_reply(
             request.packet,
             request.qname,
             request.qtype,
             request.qclass,
             rcode,
-            answers,
+            &answers,
         ),
         rcode,
     }

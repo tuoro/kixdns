@@ -394,11 +394,6 @@ pub struct RuntimeRule {
     /// matches
     pub matchers: Vec<RuntimeMatcherWithOp>,
     pub actions: Vec<Action>,
-    /// 规则当场作出的决定（照配置写好的应答或跳转），快速路径命中它就直接作答或跟过去；别的规则为 None，交给完整路径
-    /// What the rule decides on the spot (an answer as the configuration writes it, or a jump),
-    /// which the fast path answers with or follows once the rule matches; None for any other
-    /// rule, left to the full path
-    pub precomputed: Option<advanced_rule::PrecomputedAction>,
     /// 回答检查：响应匹配器和两种结果下的动作，决策带上的就是这一份；没有响应阶段的规则为 None，决策也就什么都不用带。
     /// 以前规则另存一份响应匹配器和动作，和它一模一样
     /// The answer check, the response matchers and the actions for either result, which is
@@ -550,12 +545,14 @@ impl RuntimePipelineConfig {
                     r.response_actions_on_match,
                     r.response_actions_on_miss,
                 );
-                // 预处理所有 Forward action 的 upstream 字段（性能优化）/ Pre-process all Forward upstreams (performance optimization)
-                actions
-                    .iter_mut()
-                    .chain(&mut on_match)
-                    .chain(&mut on_miss)
-                    .for_each(Action::pre_split_upstreams);
+                // 转发的上游先拆好，作答动作的静态应答先编好，每个查询不再读一遍（见 `Action::pre_split_upstreams`、
+                // `Action::compile_answer`）/ The forwards' upstreams split and the answering actions'
+                // static answers compiled now, so no query reads them again (see
+                // `Action::pre_split_upstreams`, `Action::compile_answer`)
+                for action in actions.iter_mut().chain(&mut on_match).chain(&mut on_miss) {
+                    action.pre_split_upstreams();
+                    action.compile_answer();
+                }
                 let response_phase =
                     (!(response_matchers.is_empty() && on_match.is_empty() && on_miss.is_empty()))
                         .then(|| {
@@ -568,7 +565,6 @@ impl RuntimePipelineConfig {
                 rules.push(RuntimeRule {
                     name: Arc::from(r.name),
                     matchers,
-                    precomputed: advanced_rule::precompute_action(&actions),
                     actions,
                     response_phase,
                     merged_forward: r.merged_forward,
@@ -583,7 +579,7 @@ impl RuntimePipelineConfig {
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
                 index: advanced_rule::RuleIndex::of(&rules),
-                last_precomputed: rules.iter().rposition(|rule| rule.precomputed.is_some()),
+                last_precomputed: rules.iter().rposition(|rule| rule.precomputed().is_some()),
                 rules,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 requester: RequesterScope::default(),
@@ -1048,6 +1044,16 @@ pub(crate) fn parse_rcode(rcode: &str) -> Option<ResponseCode> {
 /// None when any of them cannot be read
 pub(crate) fn static_ips(ips: &str) -> Option<Vec<IpAddr>> {
     ips.split(',').map(|ip| ip.trim().parse().ok()).collect()
+}
+
+/// `static_cname_response` 的目标域名；空的或读不出来就是 None
+/// The target of a `static_cname_response`; None when empty or unreadable
+pub(crate) fn static_cname_target(target: &str) -> Option<hickory_proto::rr::Name> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    <hickory_proto::rr::Name as std::str::FromStr>::from_str(target).ok()
 }
 
 /// `qtype`、`response_type` 写的类型：hickory 认得的名字（HTTPS、SVCB、CAA、ANY……），或者 RFC 3597 的 `TYPEnnn`。以前只认
