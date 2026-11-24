@@ -242,18 +242,22 @@ fn ip(text: &str) -> IpAddr {
     text.parse().unwrap()
 }
 
-/// `from_client_ip` 把 0.0.0.0 当作内网地址，255.255.255.255 不当作（`geoip_private` 两个都当作，见
-/// `private_address_tests`）：
-/// - 来源地址是 0.0.0.0 时不加 ECS，是 255.255.255.255 时加它的 /24；
-/// - 公网客户端自己带的 0.0.0.0/8 不发给上游，换成来源地址的子网；255.255.255.0/24 原样转发。
+/// `from_client_ip` 和 `geoip_private` 一样把 0.0.0.0 和 255.255.255.255 都当作内网地址（见 `private_address_tests`）：
+/// - 来源地址是 0.0.0.0、255.255.255.255 时都不加 ECS；
+/// - 公网客户端自己带的 0.0.0.0/8 不发给上游，换成来源地址的子网；255.255.255.0/24 不是广播地址，原样转发。
 ///
-/// `from_client_ip` counts 0.0.0.0 as a local network address and 255.255.255.255 not
-/// (`geoip_private` counts both, see `private_address_tests`):
-/// - a source address of 0.0.0.0 gets no ECS, one of 255.255.255.255 its /24;
+/// 以前 ECS 不把 255.255.255.255 当作内网地址，来源地址是它时给上游发 255.255.255.0/24
+/// `from_client_ip` counts both 0.0.0.0 and 255.255.255.255 as local network addresses, as
+/// `geoip_private` does (see `private_address_tests`):
+/// - a source address of 0.0.0.0 or 255.255.255.255 gets no ECS;
 /// - a public client's own 0.0.0.0/8 does not go upstream and the source address's
-///   subnet goes instead, while its own 255.255.255.0/24 goes on as it is.
+///   subnet goes instead, while its own 255.255.255.0/24, no broadcast address, goes on as
+///   it is.
+///
+/// ECS used not to count 255.255.255.255 as a local one, sending 255.255.255.0/24 upstream
+/// for that source address
 #[tokio::test]
-async fn from_client_ip_counts_0_0_0_0_as_private_but_not_255_255_255_255() {
+async fn from_client_ip_counts_0_0_0_0_and_255_255_255_255_as_private() {
     let up = upstream(Echo::Nothing).await;
     // 每个请求一个新引擎：不带 ECS 的应答会给所有子网共用（见 `a_reply_without_ecs_is_shared_by_every_client_subnet`）
     // A fresh engine per request: an answer without ECS is shared by every subnet (see
@@ -271,7 +275,7 @@ async fn from_client_ip_counts_0_0_0_0_as_private_but_not_255_255_255_255() {
         seen(&up),
         [
             None,
-            Some((ip("255.255.255.0"), 24)),
+            None,
             Some((ip("198.51.100.0"), 24)),
             Some((ip("255.255.255.0"), 24)),
         ]
@@ -279,15 +283,14 @@ async fn from_client_ip_counts_0_0_0_0_as_private_but_not_255_255_255_255() {
 }
 
 /// `from_client_ip` 不把不可全球路由的地址算成公网子网发给上游（RFC 6890）：运营商级 NAT 和 Tailscale 用的
-/// 100.64.0.0/10、基准测试用的 198.18.0.0/15、IETF 协议分配用的 192.0.0.0/24、「本网络」0.0.0.0/8，IPv6 的
-/// 100::/64 和 64:ff9b:1::/48。拿它们算出的子网说明不了客户端在哪里，还把内部编址漏给上游。以前这些都当公网
-/// 子网发出去；公网地址照常发
+/// 100.64.0.0/10、IETF 协议分配用的 192.0.0.0/24、「本网络」0.0.0.0/8，IPv6 的 100::/64 和 64:ff9b:1::/48。拿它们
+/// 算出的子网说明不了客户端在哪里，还把内部编址漏给上游。以前这些都当公网子网发出去；公网地址照常发
 /// `from_client_ip` does not send an address that is not globally routable upstream as a
-/// public subnet (RFC 6890): 100.64.0.0/10 of carrier-grade NAT and Tailscale, 198.18.0.0/15
-/// for benchmarking, 192.0.0.0/24 for IETF protocol assignments, "this network" 0.0.0.0/8,
-/// and IPv6's 100::/64 and 64:ff9b:1::/48. A subnet taken from them says nothing about where
-/// the client is and leaks internal addressing upstream. They all used to go out as public
-/// subnets; a public address still does
+/// public subnet (RFC 6890): 100.64.0.0/10 of carrier-grade NAT and Tailscale, 192.0.0.0/24
+/// for IETF protocol assignments, "this network" 0.0.0.0/8, and IPv6's 100::/64 and
+/// 64:ff9b:1::/48. A subnet taken from them says nothing about where the client is and leaks
+/// internal addressing upstream. They all used to go out as public subnets; a public address
+/// still does
 #[tokio::test]
 async fn from_client_ip_keeps_addresses_that_are_not_globally_routable() {
     let up = upstream(Echo::Nothing).await;
@@ -295,8 +298,6 @@ async fn from_client_ip_keeps_addresses_that_are_not_globally_routable() {
     for client in [
         "100.64.12.34",
         "100.127.255.1",
-        "198.18.5.5",
-        "198.19.0.1",
         "192.0.0.8",
         "0.1.2.3",
         "100::1",
@@ -306,14 +307,14 @@ async fn from_client_ip_keeps_addresses_that_are_not_globally_routable() {
         let engine = engine(forward_all(&up.address, from_client_ip()));
         reply_from(&engine, SocketAddr::new(ip(client), 53000), None).await;
     }
-    let mut expected = vec![None; 8];
+    let mut expected = vec![None; 6];
     expected.push(Some((ip("203.0.113.0"), 24)));
     // 客户端自己带的这些网段也当作私有网段（RFC 7871 第 11.3 节）：公网客户端照样发来源地址的子网。以前原样或截短
     // 发给上游
     // Such a network in the client's own ECS counts as a private one too (RFC 7871 section
     // 11.3): a public client sends its source address's subnet as usual. It used to go
     // upstream as it was or cut short
-    for own in [("100.64.1.0", 24), ("198.18.0.1", 32), ("64:ff9b:1::", 48)] {
+    for own in [("100.64.1.0", 24), ("192.0.0.8", 32), ("64:ff9b:1::", 48)] {
         let engine = engine(forward_all(&up.address, from_client_ip()));
         reply(&engine, "198.51.100.7", Some(own)).await;
         expected.push(Some((ip("198.51.100.0"), 24)));
