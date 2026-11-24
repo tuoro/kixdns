@@ -245,15 +245,16 @@ async fn a_geoip_update_drops_cached_answers_judged_by_the_old_networks() {
     );
 }
 
-/// 只有读到换了的那个标签的 Pipeline 换命名空间：自己的规则读的，或者回答检查跳过去的 Pipeline 读的（那里拿到的应答缓存
-/// 在它的键下）。请求阶段跳过去的不算：应答缓存在目标的键下，跳转前的 Pipeline 只存跳转这个决定。GeoSite 的 ads 换了不动
-/// 读别的 GeoSite 标签的、只用 GeoIP 的和什么都不用的 Pipeline，GeoIP 的标签换了也只动读它的；只按客户端地址判断 GeoIP
-/// 国家的 Pipeline 也不动（见下一个测试）。直接给出数据看命名空间，不经文件监视：macOS 的 FSEvents 在开始监视后不久会补报
-/// 此前新建文件的事件，等文件更新的那段时间里两份数据都会重读
+/// 只有读到换了的那个标签的 Pipeline 换命名空间：自己的规则读的，或者回答检查跳过去的、回答检查 continue 以后规则跳过去的
+/// Pipeline 读的（那里拿到的应答缓存在它的键下）。还没据过上游的回答时请求阶段跳过去的不算：应答缓存在目标的键下，跳转前
+/// 的 Pipeline 只存跳转这个决定。GeoSite 的 ads 换了不动读别的 GeoSite 标签的、只用 GeoIP 的和什么都不用的 Pipeline，
+/// GeoIP 的标签换了也只动读它的；只按客户端地址判断 GeoIP 国家的 Pipeline 也不动（见下一个测试）。直接给出数据看命名空间，
+/// 不经文件监视：macOS 的 FSEvents 在开始监视后不久会补报此前新建文件的事件，等文件更新的那段时间里两份数据都会重读
 /// Only the pipelines reading the very tag that changed move to a new namespace: through their
-/// own rules, or through a pipeline their answer checks jump to (the answers got there are
-/// cached under their key). A request-phase jump does not count: the answers are cached under
-/// the target's key, and the pipeline jumped from keeps only the decision to jump. GeoSite's
+/// own rules, or through a pipeline their answer checks jump to, or their rules jump to after an
+/// answer check continued (the answers got there are cached under their key). A request-phase
+/// jump made before any upstream's answer was gone by does not count: the answers are cached
+/// under the target's key, and the pipeline jumped from keeps only the decision to jump. GeoSite's
 /// ads changing leaves pipelines reading other GeoSite tags, only GeoIP or nothing alone, and a
 /// GeoIP tag changing moves only the pipelines reading it; a pipeline judging only the client
 /// address's GeoIP country is left alone too (see the next test). The data is given directly,
@@ -299,6 +300,13 @@ fn only_pipelines_reading_the_changed_tag_change_namespace() {
                   "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
                   "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "site" }] }
             ]},
+            { "id": "continued_jumps", "rules": [
+                { "name": "h", "matchers": [{ "type": "any" }], "actions": forward,
+                  "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
+                  "response_actions_on_match": [{ "type": "continue" }] },
+                { "name": "i", "matchers": [{ "type": "any" }],
+                  "actions": [{ "type": "jump_to_pipeline", "pipeline": "site" }] }
+            ]},
             { "id": "ip", "rules": answer_ip("TESTNET") },
             { "id": "other_ip", "rules": answer_ip("OTHERNET") },
             { "id": "plain", "rules": [
@@ -322,6 +330,7 @@ fn only_pipelines_reading_the_changed_tag_change_namespace() {
         "other_site",
         "jumps",
         "answer_jumps",
+        "continued_jumps",
         "answer_site",
         "ip",
         "other_ip",
@@ -366,7 +375,7 @@ fn only_pipelines_reading_the_changed_tag_change_namespace() {
     };
     assert_eq!(
         moved(site("ads")),
-        ["site", "answer_jumps", "answer_site"],
+        ["site", "answer_jumps", "continued_jumps", "answer_site"],
         "a GeoSite update of ads"
     );
     assert_eq!(moved(site("cn")), ["other_site"], "a GeoSite update of cn");
