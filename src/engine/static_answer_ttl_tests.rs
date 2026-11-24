@@ -19,13 +19,15 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::rr::rdata::SOA;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use serde_json::{Value, json};
 
 use crate::engine::Engine;
 use crate::engine::test_support::{
     answering_rcode, answering_upstream, answering_upstream_after, ask, engine_from, first_a, peer,
+    upstream,
 };
 
 /// 上游的回答 / The upstream's answer
@@ -372,6 +374,46 @@ async fn an_answer_after_a_check_goes_out_with_ttls_no_longer_than_the_checked_a
             record_ttls(&hit)
         );
     }
+}
+
+/// 回答检查据的是否定应答时，此后的应答照那份应答在缓存里能留多久封顶：它的负缓存 TTL 出自 SOA 的 minimum（在 RDATA 里，
+/// 上游把关时不改写）比 min_ttl 短，min_ttl 照样抬它，那份否定应答自己就在缓存里留 min_ttl 这么久，据它做的决定也一样，此后
+/// 交出去的记录不封到 min_ttl 以下（每条记录都收进 min_ttl 到 cache_max_ttl 之间）
+/// After an answer check on a negative answer, what answers next is bounded by how long that
+/// answer may stay in the cache: its negative TTL comes from the SOA's minimum (in the RDATA,
+/// which the upstream guards leave as it is) and is shorter than min_ttl, which raises it all
+/// the same, so the negative answer itself stays in the cache for min_ttl and so does a
+/// decision taken on it, the records going out after it not being brought below min_ttl (every
+/// record being brought into min_ttl to cache_max_ttl)
+#[tokio::test]
+async fn an_answer_after_a_check_on_a_short_negative_answer_keeps_min_ttl() {
+    let negative = upstream(|query| {
+        let mut reply = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+        reply.metadata.recursion_desired = query.metadata.recursion_desired;
+        reply.metadata.response_code = ResponseCode::NXDomain;
+        reply.add_queries(query.queries.iter().cloned());
+        let zone = Name::from_ascii("test.").unwrap();
+        reply.add_authority(Record::from_rdata(
+            zone.clone(),
+            300,
+            RData::SOA(SOA::new(zone.clone(), zone, 1, 3600, 900, 1_209_600, 5)),
+        ));
+        vec![(Duration::ZERO, reply.to_vec().unwrap())]
+    })
+    .await
+    .address;
+    let then = answering_upstream(FORWARDED, 3600).await.address;
+    let engine = engine_with(
+        &json!({ "min_ttl": 60 }),
+        json!([{ "id": "main", "rules": [
+            checked(&negative, json!([{ "type": "continue" }])),
+            rule("forward", any(), json!([{ "type": "forward", "upstream": then }])),
+        ]}]),
+    );
+    let reply = ask(&engine, &query(), peer()).await;
+    assert_eq!(first_a(&reply), Some(FORWARDED));
+    assert_eq!(record_ttls(&reply), [60]);
+    assert_eq!(cached_ttls(&engine), [60]);
 }
 
 /// 上游失败以后改问备用上游拿到的回答照常缓存：miss 动作转发的、miss 动作 continue 以后的规则转发的都一样，故障期间的请求
