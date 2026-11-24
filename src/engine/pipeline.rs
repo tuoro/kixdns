@@ -6,7 +6,6 @@ use hickory_proto::rr::{DNSClass, RecordType};
 use smallvec::SmallVec;
 
 use crate::config::{Action, Transport};
-use crate::matcher::advanced_rule::CompiledPipeline;
 use crate::matcher::{
     GeoManagers, RequestFacts, Requester, RuntimePipeline, RuntimePipelineConfig, eval_match_chain,
     parse_rcode,
@@ -88,20 +87,6 @@ impl<'a> RuleEvaluationContext<'a> {
 }
 
 impl Engine {
-    /// id 为 `pipeline_id` 的 pipeline 编译好的样子，和 `RuntimePipelineConfig::pipeline` 按同一个索引找：配置里有的
-    /// pipeline 都有，找到的就是同一个
-    /// The compiled form of the pipeline whose id is `pipeline_id`, found by the same index as
-    /// `RuntimePipelineConfig::pipeline`: every pipeline of the configuration has one, and the
-    /// one found is the same pipeline
-    pub(crate) fn compiled_for<'a>(
-        &self,
-        state: &'a EngineInner,
-        pipeline_id: &str,
-    ) -> Option<&'a CompiledPipeline> {
-        let &idx = state.pipeline.pipeline_id_index.get(pipeline_id)?;
-        Some(&state.compiled_pipelines[idx])
-    }
-
     /// `pipeline` 对这个问题、按规则对 `requester` 的判定在规则缓存里的问题（见 [`RuleQuestion`]）。规则的决定从不取决于
     /// ECS：规则缓存的判定只有请求匹配器的那些（见 `RuntimePipeline::rule_requester`）
     /// The rule cache question of `pipeline` for this question, by how the rules judge
@@ -326,25 +311,17 @@ impl Engine {
             ..
         } = *facts;
         let skip_rules = request.skip_rules;
-        // 2. Candidate Selection: every pipeline is compiled with its configuration (see
-        // `compiled_for`), and its index gives every rule that can match (see
-        // `RuleIndex::add_rule`). Without it no rule would match, the request going past
-        // blocking rules to the default upstream, which is why there is no stand-in for it
-        // 2. 候选规则：每个 pipeline 都和它的配置一起编译过（见 `compiled_for`），它的索引给出所有可能命中的规则（见
-        // `RuleIndex::add_rule`）。没有它的话没有规则命中，请求绕过拦截规则去问默认上游，所以不给它找替代
+        // 2. Candidate Selection: the pipeline's index gives every rule that can match (see
+        // `RuleIndex::add_rule`)
+        // 2. 候选规则：pipeline 的索引给出所有可能命中的规则（见 `RuleIndex::add_rule`）
         // SmallVec<[usize; 32]> avoids heap allocation for typical rule sets (<= 32 candidates)
-        let candidate_indices: SmallVec<[usize; 32]> = self
-            .compiled_for(state, &pipeline.id)
-            .expect("every pipeline is compiled with its configuration")
-            .index
-            .get_candidates(qname, qtype);
+        let candidate_indices: SmallVec<[usize; 32]> = pipeline.index.get_candidates(qname, qtype);
 
         // 3. Execute Rules
         let geo = self.geo();
 
         'rules: for idx in candidate_indices {
-            // 候选出自这个 pipeline 自己的索引，同一份配置里编译出来的 / The candidates come from this
-            // pipeline's own index, compiled from the same configuration
+            // 候选出自这个 pipeline 自己的索引 / The candidates come from this pipeline's own index
             let rule = &pipeline.rules[idx];
             if skip_rules.is_some_and(|set| set.contains(&idx)) {
                 continue;

@@ -731,9 +731,9 @@ impl Engine {
         let qclass = DNSClass::from(q.qclass);
         let qtype = hickory_proto::rr::RecordType::from(q.qtype);
         let qname_str = q.qname;
-        // 选 pipeline、求值编译规则都看这一份，GeoIP、GeoSite 数据和完整路径一样读（见 `CompiledRule::matchers`）
-        // Choosing the pipeline and evaluating the compiled rules both look at this one, reading
-        // the GeoIP and GeoSite data as the full path does (see `CompiledRule::matchers`)
+        // 选 pipeline、求值规则都看这一份，GeoIP、GeoSite 数据和完整路径一样读（见 `RuntimeRule::matchers`）
+        // Choosing the pipeline and evaluating the rules both look at this one, reading the GeoIP
+        // and GeoSite data as the full path does (see `RuntimeRule::matchers`)
         let facts = crate::matcher::RequestFacts {
             qname: qname_str,
             qtype,
@@ -999,11 +999,10 @@ impl Engine {
                     Decision::Forward { .. } => break,
                 }
             } else {
-                // 3. 编译规则：第一条命中的规则当场作出的决定
-                // 3. Compiled rules: what the first rule matching decides on the spot
-                let matched = self
-                    .compiled_for(&state, pipeline_id)
-                    .and_then(|compiled| fast_static_match_with_rule(compiled, &facts, self.geo()));
+                // 3. 规则：第一条命中的规则当场作出的决定
+                // 3. The rules: what the first rule matching decides on the spot
+                let matched = pipeline
+                    .and_then(|pipeline| fast_static_match_with_rule(pipeline, &facts, self.geo()));
                 match matched {
                     Some((PrecomputedAction::Jump(target), rule)) => (
                         cfg.pipeline(target),
@@ -5471,9 +5470,8 @@ mod tests {
         };
         // 配置里的地址读一次就留着，不用每个查询读 / The config's addresses are read once and kept, not for every query
         let state = engine.state.load_full();
-        let compiled = engine.compiled_for(&state, "main").unwrap();
         assert!(matches!(
-            compiled.rules[0].precomputed,
+            state.pipeline.pipelines[0].rules[0].precomputed,
             Some(PrecomputedAction::Answer(PrecomputedAnswer::StaticIp { addresses: Some(ref addresses), .. })) if addresses.len() == 2
         ));
         let a = ask("A.Ip.Test.", RecordType::A);
@@ -6665,7 +6663,6 @@ mod tests {
                 .expect("load geosite");
             let state = engine.state.load_full();
             let pipeline = &state.pipeline.pipelines[0];
-            let compiled = engine.compiled_for(&state, "main").expect("compiled");
 
             for client in ["198.51.100.7", "203.0.113.9", "10.0.0.1"] {
                 for domain in ["example.com", "example.cn"] {
@@ -6681,7 +6678,7 @@ mod tests {
                         &facts,
                         &RuleEvaluationContext::new(None, true),
                     );
-                    let fast = fast_static_match_with_rule(compiled, &facts, engine.geo());
+                    let fast = fast_static_match_with_rule(pipeline, &facts, engine.geo());
                     let agrees = match (&fast, &full) {
                         // 快速路径只把转发交出去 / The fast path hands on forwards only
                         (None, full) => !matches!(full, Decision::Static { .. }),
@@ -6726,7 +6723,6 @@ mod tests {
     /// is wasted; for a pipeline with no such rule the fast path evaluates nothing
     #[test]
     fn the_fast_path_stops_at_the_last_rule_it_can_answer() {
-        use crate::matcher::advanced_rule::compile_pipelines;
         let rule = |name: &str, matcher: serde_json::Value, action: serde_json::Value| serde_json::json!({ "name": name, "matchers": [matcher], "actions": [action] });
         let forward = serde_json::json!({ "type": "forward", "upstream": "223.5.5.5:53" });
         let refuse = serde_json::json!({ "type": "deny" });
@@ -6745,15 +6741,14 @@ mod tests {
             ]
         });
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
-        let compiled =
-            compile_pipelines(&RuntimePipelineConfig::from_config(cfg).expect("runtime config"));
-        assert_eq!(compiled[0].last_precomputed, Some(1));
-        assert_eq!(compiled[1].last_precomputed, None);
+        let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
+        assert_eq!(runtime.pipelines[0].last_precomputed, Some(1));
+        assert_eq!(runtime.pipelines[1].last_precomputed, None);
     }
 
     #[test]
     fn test_fast_static_match_preserves_rule_order() {
-        use crate::matcher::advanced_rule::{compile_pipelines, fast_static_match};
+        use crate::matcher::advanced_rule::fast_static_match;
 
         // Arrange: 构建一个配置，模拟用户的问题场景
         let raw = serde_json::json!({
@@ -6779,11 +6774,10 @@ mod tests {
 
         let cfg: crate::config::PipelineConfig = serde_json::from_value(raw).expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        let compiled = compile_pipelines(&runtime);
 
         // Act: 调用 fast_static_match 查询 _acme-challenge.mydomain.com
         let result = fast_static_match(
-            &compiled[0],
+            &runtime.pipelines[0],
             "_acme-challenge.mydomain.com",
             hickory_proto::rr::RecordType::TXT,
             hickory_proto::rr::DNSClass::IN,
@@ -6801,7 +6795,7 @@ mod tests {
 
         // 验证：如果查询一个只匹配第二条规则的域名，应该返回静态 IP
         let result2 = fast_static_match(
-            &compiled[0],
+            &runtime.pipelines[0],
             "other.mydomain.com",
             hickory_proto::rr::RecordType::A,
             hickory_proto::rr::DNSClass::IN,

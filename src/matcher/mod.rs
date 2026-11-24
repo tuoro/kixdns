@@ -242,6 +242,17 @@ pub struct RuntimePipelineConfig {
 pub struct RuntimePipeline {
     pub id: Arc<str>,
     pub rules: Vec<RuntimeRule>,
+    /// 规则的索引：给出可能命中一个请求的每条规则（见 `RuleIndex::add_rule`），快速路径和完整路径都从这里找候选
+    /// The rules' index, giving every rule that can match a request (see `RuleIndex::add_rule`),
+    /// where the fast path and the full path both find their candidates
+    pub index: advanced_rule::RuleIndex,
+    /// 能当场决定的（见 [`RuntimeRule::precomputed`]）最后一条规则的位置，一条都没有时为 None。快速路径求值候选规则到
+    /// 这里为止：再往后不论哪条命中都只能交给完整路径，在快速路径上求值它们（正则、GeoIP）是白算一遍
+    /// Where the last rule that decides on the spot (see [`RuntimeRule::precomputed`]) is, None
+    /// when there is none. The fast path evaluates candidate rules up to here: whichever matches
+    /// beyond it goes to the full path anyway, and evaluating them on the fast path (a regex,
+    /// GeoIP) would be work done twice
+    pub last_precomputed: Option<usize>,
     /// How the answer can depend on the requester: through this pipeline's rules,
     /// the rules along the response-jump paths its answer checks start, and, when
     /// an answer check continues, the pipelines its rules jump to. Response cache,
@@ -370,10 +381,18 @@ impl<'a> GeoTags<'a> {
 #[derive(Debug, Clone)]
 pub struct RuntimeRule {
     pub name: Arc<str>,
-    /// 请求匹配器，快速路径的规则共用这一份（见 `advanced_rule::CompiledRule`）
-    /// The request matchers, shared with the fast path's rule (see `advanced_rule::CompiledRule`)
-    pub matchers: Arc<[RuntimeMatcherWithOp]>,
+    /// 请求匹配器：快速路径和完整路径都按这一份、同一个判断（[`RuntimeMatcher::matches`]）求值，两条路径对规则是否命中
+    /// 从不分歧
+    /// The request matchers: the fast path and the full path both evaluate these, judged the
+    /// same way ([`RuntimeMatcher::matches`]), so the two never disagree on whether a rule
+    /// matches
+    pub matchers: Vec<RuntimeMatcherWithOp>,
     pub actions: Vec<Action>,
+    /// 规则当场作出的决定（照配置写好的应答或跳转），快速路径命中它就直接作答或跟过去；别的规则为 None，交给完整路径
+    /// What the rule decides on the spot (an answer as the configuration writes it, or a jump),
+    /// which the fast path answers with or follows once the rule matches; None for any other
+    /// rule, left to the full path
+    pub precomputed: Option<advanced_rule::PrecomputedAction>,
     /// 回答检查：响应匹配器和两种结果下的动作，决策带上的就是这一份；没有响应阶段的规则为 None，决策也就什么都不用带。
     /// 以前规则另存一份响应匹配器和动作，和它一模一样
     /// The answer check, the response matchers and the actions for either result, which is
@@ -542,7 +561,8 @@ impl RuntimePipelineConfig {
                         });
                 rules.push(RuntimeRule {
                     name: Arc::from(r.name),
-                    matchers: matchers.into(),
+                    matchers,
+                    precomputed: advanced_rule::precompute_action(&actions),
                     actions,
                     response_phase,
                     merged_forward: r.merged_forward,
@@ -556,6 +576,8 @@ impl RuntimePipelineConfig {
                 .any(|m| matches!(m.matcher, RuntimeMatcher::DomainRegex { .. }));
             pipelines.push(RuntimePipeline {
                 id: Arc::from(p.id),
+                index: advanced_rule::RuleIndex::of(&rules),
+                last_precomputed: rules.iter().rposition(|rule| rule.precomputed.is_some()),
                 rules,
                 // Filled in below, once every pipeline is known / 所有 pipeline 都建好后在下面填入
                 requester: RequesterScope::default(),
@@ -2338,8 +2360,7 @@ mod tests {
         }))
         .expect("parse config");
         let runtime = RuntimePipelineConfig::from_config(cfg).expect("runtime config");
-        let compiled = crate::matcher::advanced_rule::compile_pipelines(&runtime);
-        let index = &compiled[0].index.domain_suffix;
+        let index = &runtime.pipelines[0].index.domain_suffix;
         assert_eq!(index.get("dotted.test").map(Vec::as_slice), Some(&[0][..]));
         assert_eq!(index.get("plain.test").map(Vec::as_slice), Some(&[1][..]));
         assert!(!index.contains_key(".dotted.test"));
