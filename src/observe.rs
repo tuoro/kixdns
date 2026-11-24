@@ -653,6 +653,12 @@ pub struct ConfigReloadFailed<'a> {
     pub path: &'a Path,
     /// Human-readable error including its cause chain.
     pub error: &'a str,
+    /// The configuration problems the reload was refused for, a sentence
+    /// each, all of them (see `config::Problems`); `error` holds them joined.
+    /// Empty when the reload failed for another reason.
+    /// 重载因为配置有问题被拒时的那些问题，每条一句，一条不落（见 `config::Problems`）；`error` 是它们连起来的一句。
+    /// 因为别的原因失败时为空。
+    pub problems: &'a [String],
 }
 
 /// Observer that ignores every event. Installing it is equivalent to
@@ -1058,6 +1064,7 @@ mod tests {
             observer.config_reload_failed(&ConfigReloadFailed {
                 path: Path::new("config/pipeline.json"),
                 error: "invalid json",
+                problems: &[],
             });
         }
     }
