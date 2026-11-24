@@ -319,21 +319,30 @@ impl RuntimeResponseMatcher {
         }
     }
 
-    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
+    /// 读的 Geo 数据（`response_answer_ip_geoip_private` 不读）/ The Geo data it reads
+    /// (`response_answer_ip_geoip_private` reads none)
     #[inline]
-    pub const fn needs_geosite(&self) -> bool {
-        matches!(
-            self,
-            Self::ResponseRequestDomainGeoSite { .. }
-                | Self::ResponseRequestDomainGeoSiteNot { .. }
-        )
+    pub fn geo_tags(&self) -> Option<GeoTags<'_>> {
+        match self {
+            Self::ResponseRequestDomainGeoSite { value }
+            | Self::ResponseRequestDomainGeoSiteNot { value } => Some(GeoTags::Site(value)),
+            Self::ResponseAnswerIpGeoipCountry { country_codes } => {
+                Some(GeoTags::Ip(country_codes))
+            }
+            _ => None,
+        }
     }
 
-    /// 要不要 GeoIP 数据（`response_answer_ip_geoip_private` 不要）/ Whether it needs GeoIP data
-    /// (`response_answer_ip_geoip_private` does not)
+    /// 要不要 GeoSite 数据 / Whether it needs GeoSite data
     #[inline]
-    pub const fn needs_geoip(&self) -> bool {
-        matches!(self, Self::ResponseAnswerIpGeoipCountry { .. })
+    pub fn needs_geosite(&self) -> bool {
+        matches!(self.geo_tags(), Some(GeoTags::Site(_)))
+    }
+
+    /// 要不要 GeoIP 数据 / Whether it needs GeoIP data
+    #[inline]
+    pub fn needs_geoip(&self) -> bool {
+        matches!(self.geo_tags(), Some(GeoTags::Ip(_)))
     }
 }
 
