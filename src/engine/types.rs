@@ -652,17 +652,30 @@ fn hash_ecs_mode(mode: Option<&EcsMode>, hasher: &mut impl Hasher) {
     }
 }
 
+/// 每个动作的字段都写全：新加的字段不说清进不进命名空间就编不过。编好的应答（`answer`）是由写出来的那几项得出的，
+/// 算了那几项就算了它
+/// Every action's fields are spelled out, so a field added later does not compile without
+/// saying whether it enters the namespace. The compiled answer (`answer`) derives from the
+/// fields written, and counts through them
 fn hash_action(action: &Action, hasher: &mut impl Hasher) {
     discriminant(action).hash(hasher);
     match action {
         Action::Log { level } => level.hash(hasher),
-        Action::StaticResponse { rcode, .. } => rcode.hash(hasher),
-        Action::StaticIpResponse { ip, .. } => ip.hash(hasher),
-        Action::StaticCnameResponse { target, ttl, .. } => {
+        Action::StaticResponse { rcode, answer: _ } => rcode.hash(hasher),
+        Action::StaticIpResponse { ip, answer: _ } => ip.hash(hasher),
+        Action::StaticCnameResponse {
+            target,
+            ttl,
+            answer: _,
+        } => {
             target.hash(hasher);
             ttl.hash(hasher);
         }
-        Action::StaticTxtResponse { text, ttl, .. } => {
+        Action::StaticTxtResponse {
+            text,
+            ttl,
+            answer: _,
+        } => {
             text.hash(hasher);
             ttl.hash(hasher);
         }
@@ -671,13 +684,12 @@ fn hash_action(action: &Action, hasher: &mut impl Hasher) {
             upstream,
             transport,
             ecs,
-            ..
         } => {
             upstream.hash(hasher);
             transport.hash(hasher);
             hash_ecs_mode(ecs.as_ref(), hasher);
         }
-        Action::ReplaceTxtResponse { text, .. } => text.hash(hasher),
+        Action::ReplaceTxtResponse { text, answer: _ } => text.hash(hasher),
         Action::Allow | Action::Deny | Action::Continue => {}
     }
 }
@@ -777,11 +789,7 @@ mod tests {
     #[test]
     fn namespace_is_stable_for_identical_configuration() {
         let first = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        let mut second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
-        // Derived data is deliberately excluded from the semantic fingerprint.
-        // Mutating it must not rotate a cache namespace.
-        second.settings.default_upstream.pre_split_upstreams =
-            std::sync::Arc::new(vec![std::sync::Arc::from("derived")]);
+        let second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
 
         assert_eq!(
             build_cache_namespaces(&first),

@@ -1,6 +1,7 @@
-//! DoQ（RFC 9250）：每个上游一池 QUIC 连接，一个查询一个流；可以用 0-RTT，被拒绝以后不再用
+//! DoQ（RFC 9250）：每个上游一池 QUIC 连接，一个查询一个流；可以用 0-RTT，早期数据被拒的查询在握手完了的同一条连接上重发
 //! DoQ (RFC 9250): a pool of QUIC connections per upstream, a stream per query; 0-RTT is used
-//! where allowed and dropped once rejected
+//! where allowed, a query whose early data was rejected sent again on the same connection once
+//! its handshake is through
 
 use super::address::{DoqTarget, parse_doq_target};
 use super::connect::{
@@ -19,7 +20,7 @@ use quinn::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -143,9 +144,6 @@ pub struct DoqMuxClient {
 /// learned, the others need not each fail and sit out a timeout to learn again
 #[derive(Default)]
 struct ZeroRtt {
-    /// 上游拒绝了 0-RTT：到重启都不再用（见 [`DoqMuxClient::disable_zero_rtt`]）/ The upstream
-    /// rejected 0-RTT: it is not used again until a restart (see [`DoqMuxClient::disable_zero_rtt`])
-    rejected: AtomicBool,
     /// 上一次完整握手连上的地址和那次握手的往返时间，0-RTT 只发往它：恢复会话的连接当场就算连上，错开建连轮不到别的地址，
     /// 所以地址不通要靠握手的期限看出来（见 [`answer_within`]）
     /// The address the last full handshake reached and that handshake's round trip, the only
@@ -510,11 +508,13 @@ impl DoqMuxClient {
                         );
                         true
                     } else if Self::early_data_refused(&failure) {
-                        self.disable_zero_rtt();
+                        // 连接还在池里，重发取的就是它，握手已经完了
+                        // The connection stays pooled, the resend taking it, its handshake
+                        // through
                         debug!(
                             upstream = %self.upstream,
                             error = %failure,
-                            "DoQ 0-RTT rejected, retrying without 0-RTT"
+                            "DoQ 0-RTT rejected, sending again on the same connection"
                         );
                         true
                     } else if reused && gone {
@@ -823,15 +823,22 @@ impl DoqMuxClient {
         pooled.close();
     }
 
-    /// 上游回了握手、却不收这个查询发出去的早期数据：quinn 明说 `ZeroRttRejected`。只有 0-RTT 期间开的流才会报这个，所以
-    /// 不管这条连接是不是这个查询自己建的，它都该换一条不带 0-RTT 的连接再发一次，搭在别的查询建的连接上的也一样。0-RTT 被
-    /// 接受以前就没了的连接上 quinn 也这么报，上游没回握手的由调用方先挑出来（见 [`DoqConn::unanswered`]）
+    /// 上游回了握手、却不收这个查询发出去的早期数据：quinn 明说 `ZeroRttRejected`，不分上游不收早期数据还是不认这张票据
+    /// （它重启过、换了票据的密钥、anycast 换了实例）。quinn 在握手完了时才报，只报给 0-RTT 期间开的流，连接照用：不管它是不是
+    /// 这个查询自己建的，查询都在它上面重发，搭在别的查询建的连接上的也一样，比不用 0-RTT 不多花往返。0-RTT 也照用：不认票据的上游
+    /// 在这条连接上发来新票据，下一条连接用它；不收早期数据的上游发的票据不许早期数据，之后就不提出。0-RTT 被接受以前就没了的连接上
+    /// quinn 也这么报，上游没回握手的由调用方先挑出来（见 [`DoqConn::unanswered`]）
     /// The upstream answered the handshake but took no early data this query sent: quinn says
-    /// `ZeroRttRejected` outright. Only a stream opened during 0-RTT is told so, and whether or
-    /// not this query made the connection it is to be sent again on one without 0-RTT, one
-    /// riding a connection another query made included. quinn says so too on a connection gone
-    /// before its 0-RTT was accepted, those whose handshake the upstream never answered being
-    /// told apart first by the caller (see [`DoqConn::unanswered`])
+    /// `ZeroRttRejected` outright, whether the upstream takes no early data or knows no such
+    /// ticket (restarted, its ticket keys changed, another anycast instance). quinn says so once
+    /// the handshake is through, and only to a stream opened during 0-RTT, the connection staying
+    /// in use: whether or not this query made it, the query is sent again on it, one riding a
+    /// connection another query made included, at no round trip more than without 0-RTT. 0-RTT
+    /// stays in use too: an upstream knowing no such ticket sends a new one on this connection,
+    /// which the next connection uses, and the tickets of an upstream taking no early data allow
+    /// none, so no more is offered. quinn says so too on a connection gone before its 0-RTT was
+    /// accepted, those whose handshake the upstream never answered being told apart first by the
+    /// caller (see [`DoqConn::unanswered`])
     fn early_data_refused(failure: &DoqFailure) -> bool {
         matches!(
             failure,
@@ -862,25 +869,12 @@ impl DoqMuxClient {
         )
     }
 
-    /// 建连时可不可以用 0-RTT：上游写的 `0rtt` 优先，没写照全局设置，而且上游没拒绝过
-    /// Whether a connect may use 0-RTT: the upstream's `0rtt` first, else the global setting, and
-    /// never refused by the upstream
+    /// 建连时可不可以用 0-RTT：上游写的 `0rtt` 优先，没写照全局设置
+    /// Whether a connect may use 0-RTT: the upstream's `0rtt` first, else the global setting
     fn zero_rtt_allowed(&self, target: &DoqTarget) -> bool {
         target.enable_0rtt.unwrap_or(self.runtime.enable_0rtt)
-            && !self.zero_rtt.rejected.load(Ordering::Relaxed)
     }
 
-    /// 给这个上游关掉 0-RTT；查和改是同一步，同时来的几个里只有一个记 warn
-    /// Switch 0-RTT off for this upstream; checking and setting is one step, so of
-    /// several arriving at once only one logs the warn
-    fn disable_zero_rtt(&self) {
-        if !self.zero_rtt.rejected.swap(true, Ordering::Relaxed) {
-            warn!(
-                upstream = %self.upstream,
-                "DoQ 0-RTT rejected, disabling 0-RTT for this upstream until restart"
-            );
-        }
-    }
     /// 建一条到 `target` 的连接，最晚到建连的期限 `deadline`；连接和用没用 0-RTT。几个地址错开着连（见 [`staggered`]），
     /// 握手失败了马上连下一个。给了 `zero_rtt_at` 而它在解析出的地址里时，它排最前、在它上面先试 0-RTT：用得上就当场
     /// 连上，别的地址不再连，这个地址通不通要看握手的期限（见 [`answer_within`]）；用不上（没有会话票据）就在它上面完整握手，
@@ -960,11 +954,11 @@ impl DoqMuxClient {
             });
             match connecting.into_0rtt() {
                 Ok((conn, _zero_rtt_accepted)) => {
-                    // 0-RTT 连接已建立。某些 DoQ 服务器（如阿里 DNS）会拒绝 0-RTT 数据，被拒绝就为此上游禁用 0-RTT
-                    // （见 `send_with_retry`）
-                    // 0-RTT connection established. Some DoQ servers (e.g. Alibaba DNS) reject
-                    // 0-RTT data; once rejected, 0-RTT is disabled for this upstream (see
-                    // `send_with_retry`)
+                    // 0-RTT 连接已建立。上游不收这些早期数据时，查询在这条连接握手完了以后重发（见
+                    // [`DoqMuxClient::early_data_refused`]）
+                    // 0-RTT connection established. With the upstream taking none of this early
+                    // data, the queries are sent again on it once its handshake is through (see
+                    // [`DoqMuxClient::early_data_refused`])
                     debug!(
                         upstream = %upstream,
                         "DoQ 0-RTT connection established"

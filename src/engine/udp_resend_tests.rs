@@ -21,6 +21,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::BinDecodable;
 use serde_json::json;
 
+use crate::config::ForwardTarget;
 use crate::engine::Engine;
 use crate::engine::test_support::{ask, counting_settings, engine_from, first_a, peer};
 
@@ -177,6 +178,8 @@ async fn a_reply_to_the_first_query_is_timed_from_the_first_send() {
     let engine = engine(&upstream, true);
     let reply = ask(&engine, &query("late.test."), peer()).await;
     assert_eq!(first_a(&reply), Some(ANSWER));
-    let stuck_after = engine.permit_manager.stuck_after(&upstream, LIMIT);
+    let stuck_after = engine
+        .permit_manager
+        .stuck_after(&ForwardTarget::new(&upstream), LIMIT);
     assert!(stuck_after >= 2 * (LIMIT / 3), "{stuck_after:?}");
 }

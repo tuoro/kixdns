@@ -17,6 +17,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use serde_json::json;
 
+use crate::config::ForwardTarget;
 use crate::engine::Engine;
 use crate::engine::test_support::{
     self as support, Upstream, Warnings, answering_upstream, ask, counting_settings, engine_from,
@@ -440,9 +441,10 @@ async fn an_answer_won_by_resending_is_noted_by_its_own_exchange() {
     }
     // 记的要是查询一共等了多久，头一个的 300 多毫秒让这里至少是 600 毫秒 / Had how long each query
     // waited been noted, the first one's 300-odd ms would make this 600 ms at least
-    let stuck_after = engine
-        .permit_manager
-        .stuck_after(&answers_second_try.address, Duration::from_millis(900));
+    let stuck_after = engine.permit_manager.stuck_after(
+        &ForwardTarget::new(&answers_second_try.address),
+        Duration::from_millis(900),
+    );
     assert!(stuck_after < Duration::from_millis(600), "{stuck_after:?}");
 }
 
@@ -484,7 +486,8 @@ async fn a_slow_upstream_is_not_stuck_once_its_answers_arrive() {
     let good = answering_upstream(ANSWER, 300).await;
     let engine = engine(&slow, &good, true, LIMIT.as_millis() as u64);
     know_answers_are_quick(&engine).await;
-    let stuck_after = || engine.permit_manager.stuck_after(&slow.address, LIMIT);
+    let slow_target = ForwardTarget::new(&slow.address);
+    let stuck_after = || engine.permit_manager.stuck_after(&slow_target, LIMIT);
     let quick = stuck_after();
     let outcomes = |asked: Vec<tokio::task::JoinHandle<(Duration, ResponseCode)>>| async {
         let (mut answered, mut gave_up) = (0, 0);
@@ -572,8 +575,8 @@ async fn a_slow_upstreams_failure_replies_are_judged_by_its_own_answers() {
     let limit = Duration::from_millis(2000);
     let manager = &engine.permit_manager;
     let (of_good, of_slow) = (
-        manager.stuck_after(&good.address, limit),
-        manager.stuck_after(&slow.address, limit),
+        manager.stuck_after(&ForwardTarget::new(&good.address), limit),
+        manager.stuck_after(&ForwardTarget::new(&slow.address), limit),
     );
     assert!(
         of_slow >= Duration::from_millis(500),
@@ -729,10 +732,11 @@ async fn a_refresh_is_asked_for_nobody() {
         }
     };
     let flow = engine.flow_control_state.as_ref().expect("flow control");
+    let dead_target = ForwardTarget::new(&dead.address);
     let asked = || {
         engine
             .permit_manager
-            .ask(flow, device.ip(), &dead.address, Duration::from_millis(150))
+            .ask(flow, device.ip(), &dead_target, Duration::from_millis(150))
             .is_some()
     };
     // 规则自己的转发 / The rule's own forward
