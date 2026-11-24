@@ -62,7 +62,7 @@ Linux 和 FreeBSD 上每个 UDP worker 一个 socket，内核把报文分给它�
 
 ## 日志和响应统计
 
-日志订阅器默认输出文本。不接 journald 时（终端，或 OpenWrt 上 procd 写的日志文件）每行是 UTC 的 RFC 3339 时间（以 Z 结尾）、级别和消息；接 journald 时时间和优先级由 journald 记，行里的时间按系统本地时区。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
+日志订阅器默认输出文本。不接 journald 时（终端，或 OpenWrt 上 procd 写的日志文件）每行是 UTC 的 RFC 3339 时间（以 Z 结尾）、级别和消息；接 journald 时时间和优先级由 journald 记，行里的时间按系统本地时区。一条日志里带的换行（比如正则写错时重载失败的原因有好几行）：不接 journald 时写成 `\n`，一条日志只占一行；接 journald 时每行开头都是这条日志的优先级。默认过滤级别是 error；--debug 或 RUST_LOG 环境变量可以改变它。代码没有配置 JSON 日志输出。
 
 DoH 上游回 429 Too Many Requests 时，只在它开始暂停那一刻记一条 warn，写着上游、暂停秒数和是不是照 Retry-After 定的（见配置文档）；暂停中再回的 429，以及这期间没问它的转发，只在 debug 级别记录。
 
