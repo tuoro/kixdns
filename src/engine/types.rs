@@ -391,8 +391,8 @@ impl EngineInner {
     }
 }
 
-/// 配置指纹加上各 pipeline 读的 Geo 标签的数据的指纹 / The configuration fingerprints combined with
-/// the fingerprints of the data of the Geo tags each pipeline reads
+/// 配置指纹加上各 pipeline 读的 Geo 标签的数据的代数 / The configuration fingerprints combined with
+/// the generations of the data of the Geo tags each pipeline reads
 fn with_geo(
     cfg: &RuntimePipelineConfig,
     config_namespaces: &FxHashMap<Arc<str>, u64>,

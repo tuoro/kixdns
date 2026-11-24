@@ -707,11 +707,21 @@ impl<'a> UdpAnswering<'a> {
     }
 
     /// 逐个收：不等待地收一个报文，和它的回答发给谁、从哪个地址发出。要本机地址时才用 recvmsg 连同它一起收，别的
-    /// 时候只收对端；没有报文时是 `WouldBlock`
+    /// 时候只收对端；没有报文时是 `WouldBlock`。`buf` 要放得下整个报文（见 [`ONE_BY_ONE_RECV_SIZE`]），给出的长度
+    /// 到 `MAX_QUERY_LEN` 为止，更长的截到这里，和批量收一样
     /// Receiving one by one: takes a datagram without waiting, along with whom its reply goes to
     /// and the address it leaves from. Only with local addresses wanted does recvmsg take one
-    /// along, otherwise just the peer is taken; `WouldBlock` when there is none
+    /// along, otherwise just the peer is taken; `WouldBlock` when there is none. `buf` must hold
+    /// the whole datagram (see [`ONE_BY_ONE_RECV_SIZE`]), and the length given stops at
+    /// `MAX_QUERY_LEN`, a longer one cut there as in the batched receive
     fn try_recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, ReplyTo)> {
+        let (len, to) = self.try_recv_whole(buf)?;
+        Ok((len.min(crate::proto_utils::MAX_QUERY_LEN), to))
+    }
+
+    /// 同 [`Self::try_recv`]，给出的是整个报文的长度 / The same as [`Self::try_recv`], giving the
+    /// whole datagram's length
+    fn try_recv_whole(&self, buf: &mut [u8]) -> std::io::Result<(usize, ReplyTo)> {
         #[cfg(unix)]
         if self.local_addresses {
             use std::os::fd::AsRawFd;
@@ -1149,6 +1159,14 @@ fn recv_buffer_holds(socket: &UdpSocket) -> usize {
 /// 逐个收的循环一轮答多少个 / How many the loop receiving one by one answers per turn
 const ONE_BY_ONE_TURN: usize = 32;
 
+/// 逐个收的接收缓冲，每个 worker 一块，放得下最长的 UDP 报文。Windows 上报文比缓冲长时 recv 报 WSAEMSGSIZE，既不给长度
+/// 也不给对端，查询就答不了；收全了再截到 `MAX_QUERY_LEN`，各平台都和批量收一样答 FORMERR
+/// The receive buffer of the loop receiving one by one, one per worker, holding the longest
+/// UDP datagram. On Windows a datagram longer than the buffer makes recv fail with WSAEMSGSIZE,
+/// giving neither length nor peer, so the query could not be answered; taken whole and then
+/// cut to `MAX_QUERY_LEN`, it gets FORMERR on every platform as in the batched receive
+const ONE_BY_ONE_RECV_SIZE: usize = 1 << 16;
+
 /// 逐个收的循环过载时按设备轮流，给没有 recvmmsg 的系统用：读是一个一个的非阻塞接收
 /// Devices taking turns under overload in the loop receiving one by one, for systems without
 /// recvmmsg: reading takes one non-blocking receive at a time
@@ -1259,7 +1277,7 @@ async fn receive_one_by_one_reading_drops(
     engine: &Arc<Engine>,
     reads_drops: bool,
 ) -> ! {
-    let mut buf = vec![0; crate::proto_utils::MAX_QUERY_LEN];
+    let mut buf = vec![0; ONE_BY_ONE_RECV_SIZE];
     // 复用发送缓冲区：缓存命中时在这里改 TTL 和 TXID，避免每包堆分配 / Reuse send buffer to patch TTLs and the TXID on cache hits, avoiding per-packet heap allocation
     let mut reply = BytesMut::with_capacity(512);
     // 这个循环从不说自己在忙，转发回来的回答都直接发 / This loop never says it is busy, so replies
