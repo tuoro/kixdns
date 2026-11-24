@@ -1309,12 +1309,15 @@ impl Engine {
     /// pre_parsed: Optional pre-parsed data from handle_packet_fast to avoid re-parsing
     /// pre_parsed: 来自 handle_packet_fast 的可选预解析数据，避免重新解析
     ///
-    /// refresh：后台刷新时它要更新的条目，有它就是后台刷新。刷新不查缓存，总是去问上游；写进这个条目的槽位，即原请求查过
-    /// 的那个；不上报缓存命中、不记应答日志；失败原样交回，由 refresh.rs 记录
+    /// refresh：后台刷新时它要更新的条目，有它就是后台刷新。刷新不查缓存，总是去问上游；它照原请求重放，沿着规则走到哪里
+    /// 就写在哪里的键下，和客户端请求一样，路线没变时就是原请求查过的那个槽位；不上报缓存命中、不记应答日志；失败原样交回，
+    /// 由 refresh.rs 记录
     /// refresh: for a background refresh, the entry it renews, and the request is one exactly
-    /// when it is given. A refresh looks up no cache and always asks upstream; it writes into
-    /// that entry's slot, the one the original request looked up; it reports no cache hit and
-    /// writes no response record; a failure comes back as it is, for refresh.rs to note
+    /// when it is given. A refresh looks up no cache and always asks upstream; replaying the
+    /// original request, it writes under the keys of wherever the rules lead it, as a client
+    /// request does, which is the slot the original request looked up while the route is the
+    /// same; it reports no cache hit and writes no response record; a failure comes back as it
+    /// is, for refresh.rs to note
     pub(crate) async fn handle_packet_internal(
         &self,
         packet: &[u8],
@@ -2126,25 +2129,21 @@ pub(crate) struct Route {
 }
 
 impl Route {
-    /// 从选中的 `pipeline_id` 出发（`pipeline` 是它，选不到时为 None）。刷新写进它要更新的条目的槽位
-    /// Starting from the picked `pipeline_id` (`pipeline` being it, None when none was picked).
-    /// A refresh writes into the slot of the entry it renews
+    /// 从选中的 `pipeline_id` 出发（`pipeline` 是它，选不到时为 None）
+    /// Starting from the picked `pipeline_id` (`pipeline` being it, None when none was picked)
     fn new(
         engine: &Engine,
         request: &Request<'_>,
         pipeline_id: &Arc<str>,
         pipeline: Option<&crate::matcher::RuntimePipeline>,
     ) -> Self {
-        let mut keys = request.keys(
+        let keys = request.keys(
             pipeline_id,
             &pipeline.map_or(RequesterKey::NONE, |p| {
                 p.requester
                     .key(request.requester, Some(&engine.geoip_manager))
             }),
         );
-        if let Some(target) = request.refresh {
-            keys.slot = target.slot;
-        }
         Self {
             pipeline: Arc::clone(pipeline_id),
             key_pipeline: Arc::clone(pipeline_id),
@@ -2392,42 +2391,35 @@ mod tests {
             "test".to_string(),
         )
         .expect("create engine");
-        let old_state = engine.state.load_full();
-        let old_namespace = old_state.cache_namespace("main");
-        let old_key = Engine::cache_keys(
-            old_namespace,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-
-        engine.reload(runtime_with_static_ip(&upstream, "192.0.2.2"));
-        let new_namespace = engine.state.load().cache_namespace("main");
-        let new_key = Engine::cache_keys(
-            new_namespace,
-            "main",
-            b"example.com",
-            RecordType::A,
-            DNSClass::IN,
-            crate::proto_utils::QueryFlags::RECURSIVE,
-            &RequesterKey::NONE,
-            None,
-        )
-        .slot;
-
         let mut request = Message::new(0xCAFE, MessageType::Query, OpCode::Query);
         request.add_query(Query::query(
             Name::from_str("example.com").unwrap(),
             RecordType::A,
         ));
+        let request = request.to_vec().unwrap();
+        // 刷新重放的查询算出的槽位 / The slot the query a refresh replays works out to
+        let slot_in = |namespace| {
+            Engine::cache_keys(
+                namespace,
+                "main",
+                b"example.com",
+                RecordType::A,
+                DNSClass::IN,
+                crate::proto_utils::QueryFlags::of(&request),
+                &RequesterKey::NONE,
+                None,
+            )
+            .slot
+        };
+        let old_state = engine.state.load_full();
+        let old_key = slot_in(old_state.cache_namespace("main"));
+
+        engine.reload(runtime_with_static_ip(&upstream, "192.0.2.2"));
+        let new_key = slot_in(engine.state.load().cache_namespace("main"));
+
         let response = engine
             .handle_packet_internal(
-                &request.to_vec().unwrap(),
+                &request,
                 "127.0.0.1:53000".parse().unwrap(),
                 None,
                 Some(engine.refresh_of(old_key)),
@@ -2445,6 +2437,61 @@ mod tests {
         assert!(
             engine.cached(new_key).is_none(),
             "work from the old snapshot must not populate the active generation"
+        );
+    }
+
+    /// 刷新照客户端请求的样子把应答写在它这一路的键下，查这个问题的请求就在那里找到它，不论被刷新的条目在哪个槽位。这里
+    /// 条目在请求阶段跳转的目标下，而刷新这次没有跳过去（请求阶段的规则据实时更新的 Geo 数据改了主意，比如）。以前刷新把
+    /// 槽位改成条目的：应答连同入口 pipeline 的问题落在目标的槽位里，查这个问题的请求谁也不去那里找
+    /// A refresh writes its answer under the keys of the way it goes, as a client request does,
+    /// and a request asking the question finds it there, whichever slot the renewed entry is in.
+    /// Here the entry is under the target of a request-phase jump, which the refresh does not
+    /// make this time (the request-phase rules changing their mind on live Geo data, say). A
+    /// refresh used to take the entry's slot for its own: the answer, with the entry pipeline's
+    /// question, landed in the target's slot, where no request asking that question looks
+    #[tokio::test]
+    async fn a_refresh_caches_its_answer_where_its_route_leads() {
+        let upstream = answering_upstream("192.0.2.9".parse().unwrap(), 300).await;
+        let engine = Engine::new(runtime_with_upstream(&upstream.address), "test".to_string())
+            .expect("create engine");
+        let request = example_query();
+        let slot_of = |pipeline| {
+            Engine::cache_keys(
+                engine.state.load().cache_namespace(pipeline),
+                pipeline,
+                b"example.com",
+                RecordType::A,
+                DNSClass::IN,
+                crate::proto_utils::QueryFlags::of(&request),
+                &RequesterKey::NONE,
+                None,
+            )
+            .slot
+        };
+        let renewed = RefreshTarget::new(
+            slot_of("target"),
+            Arc::from("target"),
+            Default::default(),
+            std::time::Instant::now(),
+        );
+        engine
+            .handle_packet_internal(
+                &request,
+                "127.0.0.1:53000".parse().unwrap(),
+                None,
+                Some(renewed),
+                None,
+            )
+            .await
+            .expect("refreshed");
+
+        assert!(engine.cached(slot_of("target")).is_none());
+        assert!(engine.cached(slot_of("main")).is_some());
+        support::ask(&engine, &request, "127.0.0.1:53000".parse().unwrap()).await;
+        assert_eq!(
+            upstream.queries(),
+            1,
+            "the request found the refreshed answer"
         );
     }
 
