@@ -511,7 +511,9 @@ impl RuntimePipelineConfig {
         let mut refused = Vec::new();
         config::Problems::gather(&mut refused, cfg.settings.validate());
         let warnings = config::warnings(&cfg);
-        // 默认上游有几个时同时问 / Several default upstreams are asked at once
+        // 默认上游先拆好，和 forward 写的一样每个查询不再拆（见 `GlobalSettings::pre_split_default_upstream`）
+        // The default upstreams split now, so that no query splits them, as with those a forward
+        // writes (see `GlobalSettings::pre_split_default_upstream`)
         cfg.settings.pre_split_default_upstream();
 
         let mut pipelines = Vec::new();
@@ -635,8 +637,6 @@ impl RuntimePipelineConfig {
         }
 
         config::Problems::refuse(refused)?;
-        cfg.settings.default_upstream_shared =
-            Some(Arc::from(cfg.settings.default_upstream.as_str()));
 
         // Build O(1) pipeline id lookup index / 构建 O(1) pipeline id 查找索引
         let pipeline_id_index: FxHashMap<Arc<str>, usize> = pipelines
@@ -1853,12 +1853,13 @@ mod tests {
         .expect("build runtime config");
         let rule = &config.pipelines[0].rules[0];
         let split_ahead = |actions: &[Action]| match &actions[0] {
-            Action::Forward {
-                pre_split_upstreams,
-                ..
-            } => pre_split_upstreams
-                .as_ref()
-                .map(|list| list.iter().map(|u| u.to_string()).collect::<Vec<_>>()),
+            Action::Forward { target, .. } => target.as_ref().map(|target| {
+                target
+                    .pre_split_upstreams
+                    .iter()
+                    .map(|u| u.to_string())
+                    .collect::<Vec<_>>()
+            }),
             other => panic!("{other:?}"),
         };
         assert_eq!(

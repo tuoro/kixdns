@@ -79,12 +79,10 @@ pub struct GlobalSettings {
     pub dashmap_shards: usize,
     /// 默认上游DNS。 / Default upstream DNS
     pub default_upstream: String,
-    /// 预分割的默认上游列表（性能优化） / Pre-split default upstream list (performance optimization)
+    /// `default_upstream` 备好的样子（见 [`ForwardTarget`]），配置加载时算 / `default_upstream` made ready
+    /// (see [`ForwardTarget`]), worked out at config load
     #[serde(skip)]
-    pub default_upstream_pre_split: Option<Arc<Vec<Arc<str>>>>,
-    /// `default_upstream` 的一份共用的副本（性能优化） / A shared copy of `default_upstream` (performance optimization)
-    #[serde(skip)]
-    pub default_upstream_shared: Option<Arc<str>>,
+    pub default_target: Option<ForwardTarget>,
     /// 解析写成主机名的上游（TCP、DoT、DoH、DoQ）用的明文 DNS 服务器，逗号分隔的 `IP:端口`，同时问、取先答的；
     /// 空的（默认）就交给系统的解析器，系统的解析器要是 KixDNS 自己，解析就会绕回来（见 `engine::bootstrap`）
     /// The plain DNS servers that resolve the upstreams written with a host name (TCP, DoT, DoH,
@@ -195,8 +193,7 @@ impl Default for GlobalSettings {
             // RFC 8484 用的路径 / The path RFC 8484 uses
             doh_path: "/dns-query".to_string(),
             default_upstream: "1.1.1.1:53".to_string(),
-            default_upstream_pre_split: None,
-            default_upstream_shared: None,
+            default_target: None,
             bootstrap: String::new(),
             // 9 秒：DoQ 服务器（特别是阿里 DNS）可能要等更久才回，和 idoq 库的建议一致
             // 9 seconds: DoQ servers (Alibaba DNS especially) may take longer to answer, as the
@@ -253,18 +250,36 @@ pub struct Pipeline {
     pub ecs: Option<EcsMode>,
 }
 
+/// 一次转发问的上游，配置加载时备好：写出来的那串（流控、日志和应答的来源按它认），和照它拆好的各个（见
+/// [`split_upstreams`]），转发时不再拆，也不为它分配内存
+/// The upstreams a forward asks, made ready at config load: the list as written (by which flow
+/// control, the logs and an answer's source know it), and each upstream split from it (see
+/// [`split_upstreams`]), so that a forward neither splits nor allocates for it
+#[derive(Debug, Clone)]
+pub struct ForwardTarget {
+    pub upstream: Arc<str>,
+    pub pre_split_upstreams: Arc<Vec<Arc<str>>>,
+}
+
+impl ForwardTarget {
+    /// 照写出来的上游列表 `upstream` 备好 / Made ready from the upstream list `upstream` as written
+    pub(crate) fn new(upstream: &str) -> Self {
+        Self {
+            upstream: Arc::from(upstream),
+            pre_split_upstreams: Arc::new(split_upstreams(upstream).map(Arc::from).collect()),
+        }
+    }
+}
+
 /// Pre-computed merged upstream list for rules with multiple Forward actions.
 /// Computed at config load time to avoid per-request allocation of 5 FxHashSets + format!/join.
 /// 多 Forward action 规则的预计算合并上游列表。
 /// 在配置加载时计算，避免每请求分配 5 个 FxHashSet + format!/join。
 #[derive(Debug, Clone)]
 pub struct MergedForward {
-    /// Comma-joined upstream string (for Decision::Forward.upstream)
-    /// 逗号连接的上游字符串（用于 Decision::Forward.upstream）
-    pub upstream_str: Arc<str>,
-    /// Pre-split upstream list with transport prefixes (for Decision::Forward.pre_split_upstreams)
-    /// 预分割的带协议前缀的上游列表（用于 Decision::Forward.pre_split_upstreams）
-    pub upstream_list: Arc<Vec<Arc<str>>>,
+    /// 合并后问的上游，每个都带着协议前缀 / The upstreams asked once merged, each with its
+    /// transport prefix
+    pub target: ForwardTarget,
     /// 合并后这一次转发发出的 ECS：几个 forward 的 ecs 写得一样时就是它，写得不一样时为 None，
     /// 和不写 ecs 一样（见 `Rule::shared_forward_ecs`）
     /// The ECS this one merged forward sends: the forwards' ecs when they all write the
@@ -496,12 +511,12 @@ pub enum Action {
         /// EDNS Client Subnet (RFC 7871) request rewriting, default None = no modification.
         #[serde(default)]
         ecs: Option<EcsMode>,
-        /// 预分割的 upstream 列表（性能优化）/ Pre-split upstream list (performance optimization)
+        /// `upstream` 备好的样子（见 [`ForwardTarget`]），配置加载时算；没写 upstream 时为 None，问的是
+        /// `default_upstream`（见 [`GlobalSettings::forward_target`]）
+        /// `upstream` made ready (see [`ForwardTarget`]), worked out at config load; None without
+        /// an upstream, `default_upstream` being asked (see [`GlobalSettings::forward_target`])
         #[serde(skip)]
-        pre_split_upstreams: Option<Arc<Vec<Arc<str>>>>,
-        /// `upstream` 的一份共用的副本（性能优化）/ A shared copy of `upstream` (performance optimization)
-        #[serde(skip)]
-        upstream_shared: Option<Arc<str>>,
+        target: Option<ForwardTarget>,
     },
     /// 继续匹配后续规则。响应阶段会复用当前响应结果。 / Continue matching subsequent rules. Response phase will reuse current response result
     Continue,
@@ -519,20 +534,14 @@ pub enum Action {
 
 /// Action 辅助函数 / Action helper functions
 impl Action {
-    /// 预分割 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split upstream string for performance (call during config loading)
-    #[inline]
+    /// 把 forward 写的上游备好（见 [`ForwardTarget`]，配置加载时调用）/ Make ready the upstreams a
+    /// forward writes (see [`ForwardTarget`], called at config load)
     pub fn pre_split_upstreams(&mut self) {
         if let Action::Forward {
-            upstream: Some(upstream_str),
-            pre_split_upstreams,
-            upstream_shared,
-            ..
+            upstream, target, ..
         } = self
         {
-            *pre_split_upstreams = Some(Arc::new(
-                split_upstreams(upstream_str).map(Arc::from).collect(),
-            ));
-            *upstream_shared = Some(Arc::from(upstream_str.as_str()));
+            *target = upstream.as_deref().map(ForwardTarget::new);
         }
     }
 
@@ -749,8 +758,10 @@ impl Rule {
                 .collect::<Vec<_>>()
                 .join(",");
             self.merged_forward = Some(MergedForward {
-                upstream_str: Arc::from(merged_str.as_str()),
-                upstream_list: Arc::new(all_upstreams),
+                target: ForwardTarget {
+                    upstream: Arc::from(merged_str.as_str()),
+                    pre_split_upstreams: Arc::new(all_upstreams),
+                },
                 // 写得不一样时不发，启动时 `problems` 记一条错误 / None when they differ;
                 // at startup `problems` logs an error
                 ecs: self.shared_forward_ecs().ok().flatten().cloned(),
@@ -917,8 +928,7 @@ impl GlobalSettings {
             reload: [
                 min_ttl,
                 default_upstream,
-                default_upstream_pre_split,
-                default_upstream_shared,
+                default_target,
                 upstream_timeout_ms,
                 request_timeout_ms,
                 response_jump_limit,
@@ -1034,23 +1044,23 @@ impl GlobalSettings {
         upstream.saturating_mul(2).saturating_add(upstream / 2)
     }
 
-    /// 预分割默认 upstream 字符串以优化性能（在配置加载时调用）/ Pre-split default upstream string for performance (call during config loading)
-    #[inline]
+    /// 把 `default_upstream` 备好（见 [`ForwardTarget`]，配置加载时调用）/ Make `default_upstream`
+    /// ready (see [`ForwardTarget`], called at config load)
     pub fn pre_split_default_upstream(&mut self) {
-        let split: Vec<Arc<str>> = split_upstreams(&self.default_upstream)
-            .map(Arc::from)
-            .collect();
-        if split.len() > 1 {
-            self.default_upstream_pre_split = Some(Arc::new(split));
-        }
+        self.default_target = Some(ForwardTarget::new(&self.default_upstream));
     }
 
-    /// `default_upstream`，配置加载时算好的那份，转发不用为它分配内存 / `default_upstream`, the copy
-    /// made at config load, so that a forward allocates nothing for it
-    pub(crate) fn default_upstream_arc(&self) -> Arc<str> {
-        self.default_upstream_shared
-            .clone()
-            .unwrap_or_else(|| Arc::from(self.default_upstream.as_str()))
+    /// 一次转发问的上游：forward 自己写了的（`written`，见 [`Action::Forward`]）就是它们，没写、或者不是 forward 写的
+    /// （没有规则作决定、allow）是 `default_upstream`。请求阶段和回答阶段的 forward 都照它挑
+    /// The upstreams a forward asks: those the forward writes (`written`, see
+    /// [`Action::Forward`]) when it writes some, `default_upstream` when it writes none or the
+    /// forward is no action's (no rule deciding, an allow). The request phase's forwards and the
+    /// answer phase's alike pick by it
+    pub(crate) fn forward_target(&self, written: Option<&ForwardTarget>) -> ForwardTarget {
+        written
+            .or(self.default_target.as_ref())
+            .cloned()
+            .unwrap_or_else(|| ForwardTarget::new(&self.default_upstream))
     }
 
     /// 设置自身是否说得通：取值范围、相互之间的关系，以及只在启动时读、却得和建引擎时的前提一致的那几项。编译配置的第一步，
@@ -2620,7 +2630,8 @@ mod merged_forward_tests {
         let mut list: Vec<String> = rule
             .merged_forward
             .expect("several forwards merge")
-            .upstream_list
+            .target
+            .pre_split_upstreams
             .iter()
             .map(|upstream| upstream.to_string())
             .collect();
@@ -2655,10 +2666,10 @@ mod merged_forward_tests {
             .merged_forward
             .as_ref()
             .expect("several forwards merge");
-        assert_eq!(merged.upstream_list.len(), 3);
+        assert_eq!(merged.target.pre_split_upstreams.len(), 3);
         assert!(matches!(
             &rule.actions[0],
-            super::Action::Forward { pre_split_upstreams: Some(split), .. } if split.len() == 2
+            super::Action::Forward { target: Some(target), .. } if target.pre_split_upstreams.len() == 2
         ));
     }
 
@@ -2769,11 +2780,12 @@ mod merged_forward_tests {
         rule.compute_merged_forward();
         let merged = rule.merged_forward.expect("several forwards merge");
         let list: Vec<String> = merged
-            .upstream_list
+            .target
+            .pre_split_upstreams
             .iter()
             .map(|upstream| upstream.to_string())
             .collect();
-        assert_eq!(merged.upstream_str.as_ref(), list.join(","));
+        assert_eq!(merged.target.upstream.as_ref(), list.join(","));
         let mut groups: Vec<&str> = list
             .iter()
             .map(|upstream| upstream.split("://").next().unwrap())
@@ -4214,31 +4226,33 @@ mod validation_tests {
         );
     }
 
-    /// 默认上游写了几个时，编译配置时就拆好（各项去掉空白、空项跳过）；只有一个时不拆
-    /// Several default upstreams are split as the configuration compiles (each trimmed,
-    /// empty ones skipped); a single one is not
+    /// 默认上游编译配置时就拆好（各项去掉空白、空项跳过），写了一个也拆，和 forward 写的上游一样
+    /// The default upstreams are split as the configuration compiles (each trimmed, empty ones
+    /// skipped), a single one too, as with the upstreams a forward writes
     #[test]
-    fn several_default_upstreams_are_split_ahead() {
+    fn default_upstreams_are_split_ahead() {
         let split = |default_upstream: &str| {
             let config = serde_json::json!({
                 "settings": { "default_upstream": default_upstream },
                 "pipelines": [{ "id": "main", "rules": [] }]
             });
-            super::compile(super::parse_config(&config.to_string()).expect("parses"))
+            let target = super::compile(super::parse_config(&config.to_string()).expect("parses"))
                 .expect("compiles")
                 .settings
-                .default_upstream_pre_split
-                .map(|list| {
-                    list.iter()
-                        .map(|upstream| upstream.to_string())
-                        .collect::<Vec<_>>()
-                })
+                .default_target
+                .expect("made ready");
+            assert_eq!(&*target.upstream, default_upstream);
+            target
+                .pre_split_upstreams
+                .iter()
+                .map(|upstream| upstream.to_string())
+                .collect::<Vec<_>>()
         };
         assert_eq!(
             split(" 1.1.1.1:53 ,, 8.8.8.8:53"),
-            Some(vec!["1.1.1.1:53".to_string(), "8.8.8.8:53".to_string()])
+            ["1.1.1.1:53", "8.8.8.8:53"]
         );
-        assert_eq!(split("1.1.1.1:53"), None);
+        assert_eq!(split(" 1.1.1.1:53 "), ["1.1.1.1:53"]);
     }
 
     /// 配置里不写的设置读进来就是 `GlobalSettings::default()` 给的；每个默认值逐个钉在这里，文档和面板的基础设置都照
@@ -4267,10 +4281,7 @@ mod validation_tests {
         assert_eq!(settings.cache_max_ttl, 86400, "cache_max_ttl");
         assert_eq!(settings.dashmap_shards, 0, "dashmap_shards");
         assert_eq!(settings.default_upstream, "1.1.1.1:53", "default_upstream");
-        assert!(
-            settings.default_upstream_pre_split.is_none(),
-            "default_upstream_pre_split"
-        );
+        assert!(settings.default_target.is_none(), "default_target");
         assert_eq!(settings.upstream_timeout_ms, 9000, "upstream_timeout_ms");
         assert_eq!(settings.request_timeout_ms, None, "request_timeout_ms");
         assert_eq!(settings.response_jump_limit, 10, "response_jump_limit");

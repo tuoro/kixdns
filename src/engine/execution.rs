@@ -1438,8 +1438,7 @@ impl Engine {
                     ));
                 }
                 Decision::Forward {
-                    upstream,
-                    pre_split_upstreams,
+                    target,
                     response_phase,
                     rule_name,
                     rule_index,
@@ -1452,8 +1451,7 @@ impl Engine {
                         request,
                         route,
                         phases::ForwardDecision {
-                            upstream: &upstream,
-                            pre_split_upstreams: pre_split_upstreams.as_ref(),
+                            target: &target,
                             rule_name: &rule_name,
                             response: response_phase.as_deref(),
                             transport,
@@ -4428,14 +4426,14 @@ mod tests {
         // Assert: Verify Forward action returns correct upstream and matchers
         match decision2 {
             Decision::Forward {
-                upstream,
+                target,
                 response_phase,
                 ..
             } => {
                 let (response_matchers, _, _) =
                     crate::matcher::ResponsePhase::parts(response_phase.as_deref());
                 assert_eq!(
-                    upstream.as_ref(),
+                    target.upstream.as_ref(),
                     "8.8.8.8:53",
                     "Forward should use configured upstream"
                 );
@@ -4473,8 +4471,8 @@ mod tests {
 
         // Assert: Verify Allow action forwards to default upstream
         match decision3 {
-            Decision::Forward { upstream, .. } => assert_eq!(
-                upstream.as_ref(),
+            Decision::Forward { target, .. } => assert_eq!(
+                target.upstream.as_ref(),
                 "1.2.3.4:53",
                 "Allow should forward to default upstream"
             ),

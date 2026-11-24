@@ -336,11 +336,10 @@ impl Engine {
                             ));
                         }
                         Action::Forward {
-                            upstream,
                             transport,
                             ecs,
-                            pre_split_upstreams,
-                            upstream_shared,
+                            target,
+                            ..
                         } => {
                             // 规则写了几个 forward 时，轮到头一个就照配置加载时合并好的一起问（见
                             // `Rule::compute_merged_forward`），每个上游的传输写在它自己的地址里，没写前缀的用 UDP；
@@ -351,30 +350,18 @@ impl Engine {
                             // transport written in its own address, UDP for one without a scheme; a log
                             // written before has run, as with a single forward. The merged forward used to
                             // be given before any action ran, and the log of such a rule never did
-                            let (upstream, pre_split_upstreams, transport, ecs) =
-                                match &rule.merged_forward {
-                                    Some(merged) => (
-                                        merged.upstream_str.clone(),
-                                        Some(merged.upstream_list.clone()),
-                                        Transport::Udp,
-                                        merged.ecs.clone(),
-                                    ),
-                                    None => (
-                                        match (upstream_shared, upstream) {
-                                            (Some(shared), _) => Arc::clone(shared),
-                                            (None, Some(upstream)) => Arc::from(upstream.as_str()),
-                                            (None, None) => {
-                                                state.pipeline.settings.default_upstream_arc()
-                                            }
-                                        },
-                                        pre_split_upstreams.clone(),
-                                        transport.unwrap_or(Transport::Udp),
-                                        ecs.clone(),
-                                    ),
-                                };
+                            let (target, transport, ecs) = match &rule.merged_forward {
+                                Some(merged) => {
+                                    (merged.target.clone(), Transport::Udp, merged.ecs.clone())
+                                }
+                                None => (
+                                    state.pipeline.settings.forward_target(target.as_ref()),
+                                    transport.unwrap_or(Transport::Udp),
+                                    ecs.clone(),
+                                ),
+                            };
                             return Some(Decision::Forward {
-                                upstream,
-                                pre_split_upstreams,
+                                target,
                                 response_phase: rule.response_phase.clone(),
                                 rule_name: rule.name.clone(),
                                 rule_index: Some(idx),
@@ -617,6 +604,7 @@ mod rule_cache_policy_tests {
     use hickory_proto::rr::{DNSClass, RecordType};
 
     use super::RuleEvaluationContext;
+    use crate::config::ForwardTarget;
     use crate::engine::Engine;
     use crate::engine::rules::{Decision, RULE_CACHE_MAX_AGE, calculate_rule_hash};
     use crate::engine::test_support::engine_from;
@@ -840,43 +828,58 @@ mod rule_cache_policy_tests {
         assert_eq!(kinds, ["forward", "jump", "static", "static", "static"]);
     }
 
-    /// 规则和默认上游的决策共用配置加载时算好的那份上游名字，每次决策不再各分配一份
-    /// Decisions by a rule and by the default upstream share the upstream name made at config
-    /// load, rather than allocating one each
+    /// 规则和默认上游的决策共用配置加载时备好的那份上游名字和拆好的列表，每次决策不再各分配一份；不写 upstream 的
+    /// forward 用的是默认上游备好的那份
+    /// Decisions by a rule and by the default upstream share the upstream name and split list
+    /// made at config load, rather than allocating them each; a forward writing no upstream uses
+    /// those of the default upstream
     #[tokio::test]
     async fn decisions_share_one_copy_of_their_upstream() {
         let engine = engine_from(serde_json::json!({
             "settings": { "default_upstream": "127.0.0.1:9" },
             "pipelines": [{
                 "id": "main",
-                "rules": [{
-                    "name": "named",
-                    "matchers": [{ "type": "domain_suffix", "value": "named.example" }],
-                    "actions": [{ "type": "forward", "upstream": "127.0.0.1:10" }]
-                }]
+                "rules": [
+                    {
+                        "name": "named",
+                        "matchers": [{ "type": "domain_suffix", "value": "named.example" }],
+                        "actions": [{ "type": "forward", "upstream": "127.0.0.1:10" }]
+                    },
+                    {
+                        "name": "bare",
+                        "matchers": [{ "type": "domain_suffix", "value": "bare.example" }],
+                        "actions": [{ "type": "forward" }]
+                    }
+                ]
             }]
         }));
         let state = engine.state.load_full();
         let pipeline = &state.pipeline.pipelines[0];
-        let upstream_of = |name: &str| {
+        let target_of = |name: &str| {
             let request = RuleEvaluationContext::new(0, false);
             match engine.apply_rules(&state, pipeline, &RequestFacts::a_query(name), &request) {
                 Decision::Forward {
-                    upstream,
-                    rule_name,
-                    ..
-                } => (upstream, rule_name),
+                    target, rule_name, ..
+                } => (target, rule_name),
                 _ => panic!("every name here forwards"),
             }
         };
-        let first = upstream_of("a.named.example");
-        assert_eq!(&*first.0, "127.0.0.1:10");
-        assert!(Arc::ptr_eq(&first.0, &upstream_of("b.named.example").0));
-        let default = upstream_of("a.other.example");
-        assert_eq!((&*default.0, &*default.1), ("127.0.0.1:9", "default"));
-        let again = upstream_of("b.other.example");
-        assert!(Arc::ptr_eq(&default.0, &again.0));
+        let shared = |one: &(ForwardTarget, Arc<str>), other: &(ForwardTarget, Arc<str>)| {
+            Arc::ptr_eq(&one.0.upstream, &other.0.upstream)
+                && Arc::ptr_eq(&one.0.pre_split_upstreams, &other.0.pre_split_upstreams)
+        };
+        let first = target_of("a.named.example");
+        assert_eq!(&*first.0.upstream, "127.0.0.1:10");
+        assert!(shared(&first, &target_of("b.named.example")));
+        let default = target_of("a.other.example");
+        assert_eq!(
+            (&*default.0.upstream, &*default.1),
+            ("127.0.0.1:9", "default")
+        );
+        let again = target_of("b.other.example");
+        assert!(shared(&default, &again));
         assert!(Arc::ptr_eq(&default.1, &again.1));
+        assert!(shared(&default, &target_of("a.bare.example")));
     }
 
     /// 转发在规则缓存里只受 `RULE_CACHE_MAX_AGE` 限制，带不带响应阶段、min_ttl 是多少都一样。以前带响应阶段的按 min_ttl

@@ -515,8 +515,7 @@ fn hash_global_settings_semantics(settings: &GlobalSettings, hasher: &mut impl H
     let GlobalSettings {
         min_ttl,
         default_upstream,
-        default_upstream_pre_split: _,
-        default_upstream_shared: _,
+        default_target: _,
         response_jump_limit,
         // 怎样用缓存（等上游多久、过期了还续用多久、提前多久刷新），不改变缓存里的应答：改了不让缓存换代。以前算了进去，
         // 在面板上调一下超时或预取的百分比，响应缓存和规则缓存就全都冷掉，上游被一下子问一遍
@@ -734,7 +733,6 @@ mod tests {
     use super::build_cache_namespaces;
     use crate::config::PipelineConfig;
     use crate::matcher::RuntimePipelineConfig;
-    use std::sync::Arc;
 
     fn runtime_config(first_upstream: &str, second_upstream: &str) -> RuntimePipelineConfig {
         let raw = serde_json::json!({
@@ -783,7 +781,7 @@ mod tests {
         let mut second = runtime_config("8.8.8.8:53", "9.9.9.9:53");
         // Derived data is deliberately excluded from the semantic fingerprint.
         // Mutating it must not rotate a cache namespace.
-        second.settings.default_upstream_pre_split = Some(Arc::new(vec![Arc::from("derived")]));
+        second.settings.default_target = Some(crate::config::ForwardTarget::new("derived"));
 
         assert_eq!(
             build_cache_namespaces(&first),
