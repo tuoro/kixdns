@@ -885,6 +885,31 @@ fn a_proxy_keeps_everything_on_reqwest() {
     assert!(!proxy_configured_in(env(&[("HTTPS_PROXY", "")])));
 }
 
+/// 代理的主机名从 https 和 all 代理的环境变量里读：带用户名密码的、没写协议的都读得出主机，http 代理不算，读不懂的
+/// 跳过（见 `bootstrap::Resolver`）
+/// The proxies' host names come from the https and all proxy variables: one with a user and
+/// password and one without a scheme give their hosts alike, an http proxy does not count, and
+/// one that cannot be read is skipped (see `bootstrap::Resolver`)
+#[test]
+fn proxy_hosts_come_from_the_https_and_all_proxies() {
+    let env = |name: &str| {
+        [
+            ("HTTPS_PROXY", "http://user:secret@proxy.lan:3128"),
+            ("https_proxy", "not a proxy"),
+            ("ALL_PROXY", "localhost:7890"),
+            ("all_proxy", "socks5://127.0.0.1:1080"),
+            ("HTTP_PROXY", "http://plain.lan:3128"),
+        ]
+        .iter()
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| std::ffi::OsString::from(value))
+    };
+    assert_eq!(
+        doh_h2::proxy_hosts_in(env),
+        ["proxy.lan", "localhost", "127.0.0.1"].map(Box::<str>::from)
+    );
+}
+
 /// 一条不走 TLS 的 HTTP/2 连接，中间隔着一段线路：客户端取消请求的帧（RST_STREAM）在路上丢掉，上游不知道请求被
 /// 取消，`after` 之后照样作答。真实网络上，取消和已经在路上的回答交错时客户端看到的就是这样：回答落在一个自己已经
 /// 取消的流上

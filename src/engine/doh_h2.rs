@@ -396,9 +396,36 @@ pub(crate) fn proxy_configured() -> bool {
     proxy_configured_in(|name| std::env::var_os(name))
 }
 
+/// reqwest 让 https 请求走代理时读的环境变量 / The environment variables reqwest reads for a proxy
+/// to send https requests through
+const PROXY_VARIABLES: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+
 /// [`proxy_configured`]，环境变量从 `var` 读 / [`proxy_configured`] with the environment read through `var`
 pub(crate) fn proxy_configured_in(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+    PROXY_VARIABLES
         .iter()
         .any(|name| var(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// 代理环境变量里写的代理的主机名（见 `bootstrap::Resolver`）/ The host names of the proxies the
+/// proxy environment variables write (see `bootstrap::Resolver`)
+pub(crate) fn proxy_hosts() -> Vec<Box<str>> {
+    proxy_hosts_in(|name| std::env::var_os(name))
+}
+
+/// [`proxy_hosts`]，环境变量从 `var` 读；没写协议的（`proxy:3128`）照 reqwest 当 http / [`proxy_hosts`]
+/// with the environment read through `var`; one written without a scheme (`proxy:3128`) taken
+/// for http as reqwest does
+pub(crate) fn proxy_hosts_in(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Box<str>> {
+    PROXY_VARIABLES
+        .iter()
+        .filter_map(|name| {
+            let value = var(name)?.into_string().ok()?;
+            let uri = match value.contains("://") {
+                true => value.parse::<hyper::Uri>(),
+                false => format!("http://{value}").parse(),
+            };
+            Some(uri.ok()?.host()?.into())
+        })
+        .collect()
 }
