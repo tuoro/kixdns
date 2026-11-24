@@ -1,9 +1,16 @@
-//! DoH (DNS over HTTPS) inbound server — RFC 8484
+//! 入站 DoH（DNS over HTTPS，RFC 8484）服务
 //!
-//! 架构：TLS terminator → HTTP/2 或 HTTP/1.1 handler（按 TLS 握手时协商的 ALPN）→ Engine 入口
-//! 完全复用 Engine 的 `handle_packet_fast` / `handle_packet_internal_with_pre_parsed`，
-//! 不重复任何 DNS 处理逻辑。
+//! 架构：TLS 终结 → HTTP/2 或 HTTP/1.1 处理（按 TLS 握手时协商的 ALPN）→ Engine 入口。DNS 报文和 UDP、TCP 走同一个
+//! 入口：先由 `Engine::on_the_spot` 当场作答，答不了的交给 `Engine::answer_after_fast_path`，不重复任何 DNS 处理逻辑。
 //! TLS 证书/私钥文件变更时热更新 acceptor（如 acme 续期），失败保持旧证书。
+//!
+//! The inbound DoH (DNS over HTTPS, RFC 8484) server
+//!
+//! Layout: TLS termination → an HTTP/2 or HTTP/1.1 handler (by the ALPN agreed in the TLS
+//! handshake) → the Engine's entry. A DNS message takes the same entry as over UDP and TCP:
+//! `Engine::on_the_spot` answers it on the spot when it can, and `Engine::answer_after_fast_path`
+//! when it cannot, with no DNS handling of its own. The TLS acceptor is reloaded when the
+//! certificate or key file changes (an ACME renewal, say), the old certificate kept on failure.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
