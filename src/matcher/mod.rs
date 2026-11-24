@@ -273,12 +273,15 @@ pub struct RuntimePipeline {
     /// jump are kept whatever the pipeline: the fast path answers repeated blocked queries from the
     /// former and follows the latter to look in its target.
     pub matches_regex: bool,
-    /// 这个 pipeline 的应答取决于哪些 Geo 数据：它自己的规则、它跳到的 pipeline 的规则读的。数据换了，按旧数据缓存的
-    /// 应答和规则决定就不能再用，这个 pipeline 换缓存命名空间（见 `EngineInner::at_geo`）
-    /// Which Geo data this pipeline's answers depend on: what its own rules and those of the
-    /// pipelines it jumps to read. Once that data changes, answers and rule decisions cached
-    /// with the old data are no longer valid, and the pipeline moves to a new cache namespace
-    /// (see `EngineInner::at_geo`)
+    /// 缓存在这个 pipeline 键下的应答和规则决定取决于哪些 Geo 数据：它自己的规则读的，和 [`Self::answered_through`] 里的
+    /// pipeline 的规则读的。请求阶段跳过去的应答缓存在目标的键下，跟着目标的命名空间走。数据换了，按旧数据缓存的应答和
+    /// 规则决定就不能再用，这个 pipeline 换缓存命名空间（见 `EngineInner::at_geo`）
+    /// Which Geo data the answers and rule decisions cached under this pipeline's keys depend
+    /// on: what its own rules read, and what the rules of the pipelines in
+    /// [`Self::answered_through`] read. The answers a request-phase jump gets are cached under
+    /// the target's keys and go with the target's namespace. Once that data changes, answers
+    /// and rule decisions cached with the old data are no longer valid, and the pipeline moves
+    /// to a new cache namespace (see `EngineInner::at_geo`)
     pub geo_data: GeoData,
     /// 经回答检查的跳转能到达的 pipeline（在 `RuntimePipelineConfig::pipelines` 里的下标），以及从那里再跳到的：跳过去
     /// 拿到的应答缓存在这个 pipeline 的键下，所以它们的配置也算进这个 pipeline 的缓存命名空间（见

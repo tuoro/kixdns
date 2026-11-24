@@ -245,89 +245,96 @@ async fn a_geoip_update_drops_cached_answers_judged_by_the_old_networks() {
     );
 }
 
-/// 只有用到这份数据的 Pipeline 换命名空间：自己的规则用到的，或者跳转过去的 Pipeline 用到的。GeoSite 更新不动只用
-/// GeoIP 的和什么都不用的 Pipeline，GeoIP 更新反过来；只按客户端地址判断 GeoIP 国家的 Pipeline 也不动（见下一个测试）
-/// Only the pipelines that use the data change namespace: through their own rules, or
-/// through a pipeline they jump to. A GeoSite update leaves pipelines using only GeoIP or
-/// nothing alone, and a GeoIP update the other way round; a pipeline judging only the
-/// client address's GeoIP country is left alone too (see the next test)
-#[tokio::test]
-async fn only_pipelines_that_use_the_data_change_namespace() {
-    let dir = tempfile::tempdir().unwrap();
-    let site = dir.path().join("geosite.dat");
-    let ip = dir.path().join("geoip.json");
-    let networks =
-        |net: &str| format!(r#"{{"entries":[{{"country_code":"TESTNET","ips":["{net}"]}}]}}"#);
-    std::fs::write(&site, ads(&["ads.example"])).unwrap();
-    std::fs::write(&ip, networks("198.51.100.0/24")).unwrap();
+/// 只有用到这份数据的 Pipeline 换命名空间：自己的规则用到的，或者回答检查跳过去的 Pipeline 用到的（那里拿到的应答缓存
+/// 在它的键下）。请求阶段跳过去的不算：应答缓存在目标的键下，跳转前的 Pipeline 只存跳转这个决定。GeoSite 换代不动只用
+/// GeoIP 的和什么都不用的 Pipeline，GeoIP 换代反过来；只按客户端地址判断 GeoIP 国家的 Pipeline 也不动（见下一个测试）。
+/// 直接换代看命名空间，不经文件监视：macOS 的 FSEvents 在开始监视后不久会补报此前新建文件的事件，两份数据都重读一遍，
+/// 等文件更新的那段时间里另一份数据也换了代
+/// Only the pipelines that use the data change namespace: through their own rules, or through
+/// a pipeline their answer checks jump to (the answers got there are cached under their key).
+/// A request-phase jump does not count: the answers are cached under the target's key, and the
+/// pipeline jumped from keeps only the decision to jump. A new GeoSite generation leaves
+/// pipelines using only GeoIP or nothing alone, and a new GeoIP generation the other way round;
+/// a pipeline judging only the client address's GeoIP country is left alone too (see the next
+/// test). The generations move directly, not through the file watch: macOS FSEvents reports
+/// the creation of files made just before the watch began shortly after it begins, both kinds
+/// of data are read again, and the other kind moves to a new generation while a file update is
+/// waited for
+#[test]
+fn only_pipelines_that_use_the_data_change_namespace() {
+    use crate::engine::geo::GeoGeneration;
+    use crate::engine::types::EngineInner;
     let answer = json!([{ "type": "static_ip_response", "ip": OTHER.to_string() }]);
-    let engine = Engine::new(
-        runtime(json!({
-            "settings": settings(json!({
-                "geosite_data_paths": [site.to_str().unwrap()],
-                "geoip_dat_path": ip.to_str().unwrap()
-            })),
-            "pipelines": [
-                { "id": "site", "rules": [
-                    { "name": "a", "matchers": [{ "type": "geo_site", "value": "ads" }], "actions": answer }
-                ]},
-                { "id": "jumps", "rules": [
-                    { "name": "b", "matchers": [{ "type": "any" }],
-                      "actions": [{ "type": "jump_to_pipeline", "pipeline": "site" }] }
-                ]},
-                { "id": "ip", "rules": [
-                    { "name": "c", "matchers": [{ "type": "any" }],
-                      "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
-                      "response_matchers": [
-                          { "type": "response_answer_ip_geoip_country", "country_codes": ["TESTNET"] }
-                      ],
-                      "response_actions_on_match": answer }
-                ]},
-                { "id": "plain", "rules": [
-                    { "name": "d", "matchers": [{ "type": "any" }], "actions": answer }
-                ]},
-                { "id": "client", "rules": [
-                    { "name": "e", "matchers": [{ "type": "geoip_country", "country_codes": ["TESTNET"] }],
-                      "actions": answer }
-                ]},
-                { "id": "answer_site", "rules": [
-                    { "name": "f", "matchers": [{ "type": "any" }],
-                      "actions": [{ "type": "forward", "upstream": "127.0.0.1:9" }],
-                      "response_matchers": [
-                          { "type": "response_request_domain_geo_site_not", "value": "ads" }
-                      ],
-                      "response_actions_on_match": answer }
-                ]}
-            ]
+    let forward = json!([{ "type": "forward", "upstream": "127.0.0.1:9" }]);
+    let state = std::sync::Arc::new(EngineInner::new(runtime(json!({
+        "settings": settings(json!({
+            "geosite_data_paths": ["/data/geosite.dat"],
+            "geoip_dat_path": "/data/geoip.json"
         })),
-        "test".to_string(),
-    )
-    .expect("engine");
-    let names = ["site", "jumps", "answer_site", "ip", "plain", "client"];
-    let all = || names.map(|pipeline| (pipeline, namespace(&engine, pipeline)));
-    // 换了命名空间的 pipeline / The pipelines whose namespace changed
-    let moved = |before: &[(&'static str, u64); 6], after: &[(&'static str, u64); 6]| {
-        before
-            .iter()
-            .zip(after)
-            .filter(|(old, new)| old.1 != new.1)
-            .map(|(old, _)| old.0)
+        "pipelines": [
+            { "id": "site", "rules": [
+                { "name": "a", "matchers": [{ "type": "geo_site", "value": "ads" }], "actions": answer }
+            ]},
+            { "id": "jumps", "rules": [
+                { "name": "b", "matchers": [{ "type": "any" }],
+                  "actions": [{ "type": "jump_to_pipeline", "pipeline": "site" }] }
+            ]},
+            { "id": "answer_jumps", "rules": [
+                { "name": "g", "matchers": [{ "type": "any" }], "actions": forward,
+                  "response_matchers": [{ "type": "response_rcode", "value": "NOERROR" }],
+                  "response_actions_on_match": [{ "type": "jump_to_pipeline", "pipeline": "site" }] }
+            ]},
+            { "id": "ip", "rules": [
+                { "name": "c", "matchers": [{ "type": "any" }], "actions": forward,
+                  "response_matchers": [
+                      { "type": "response_answer_ip_geoip_country", "country_codes": ["TESTNET"] }
+                  ],
+                  "response_actions_on_match": answer }
+            ]},
+            { "id": "plain", "rules": [
+                { "name": "d", "matchers": [{ "type": "any" }], "actions": answer }
+            ]},
+            { "id": "client", "rules": [
+                { "name": "e", "matchers": [{ "type": "geoip_country", "country_codes": ["TESTNET"] }],
+                  "actions": answer }
+            ]},
+            { "id": "answer_site", "rules": [
+                { "name": "f", "matchers": [{ "type": "any" }], "actions": forward,
+                  "response_matchers": [
+                      { "type": "response_request_domain_geo_site_not", "value": "ads" }
+                  ],
+                  "response_actions_on_match": answer }
+            ]}
+        ]
+    }))));
+    let names = [
+        "site",
+        "jumps",
+        "answer_jumps",
+        "answer_site",
+        "ip",
+        "plain",
+        "client",
+    ];
+    // 从第 0 代换到 `geo`，换了命名空间的 pipeline / The pipelines whose namespace changes from
+    // generation 0 to `geo`
+    let moved = |geo: GeoGeneration| {
+        let after = state.at_geo(geo);
+        names
+            .into_iter()
+            .filter(|&pipeline| state.cache_namespace(pipeline) != after.cache_namespace(pipeline))
             .collect::<Vec<_>>()
     };
-
-    let start = all();
-    replace(&site, &ads(&["ads.example", "more.example"]));
-    wait_for_new_namespace(&engine, "site", start[0].1, listed("more.example", true)).await;
-    let after_site = all();
     assert_eq!(
-        moved(&start, &after_site),
-        ["site", "jumps", "answer_site"],
+        moved(GeoGeneration { site: 1, ip: 0 }),
+        ["site", "answer_jumps", "answer_site"],
         "a GeoSite update"
     );
-
-    replace(&ip, networks("192.0.2.0/24").as_bytes());
-    wait_for_new_namespace(&engine, "ip", after_site[3].1, in_testnet("192.0.2.1")).await;
-    assert_eq!(moved(&after_site, &all()), ["ip"], "a GeoIP update");
+    assert_eq!(
+        moved(GeoGeneration { site: 0, ip: 1 }),
+        ["ip"],
+        "a GeoIP update"
+    );
 }
 
 /// 面板按内容给 Geo 数据和拦截列表的文件起名，每次更新都换一个文件、重载一次配置。用到 GeoSite 的 pipeline 照样换命名空间、

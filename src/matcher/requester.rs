@@ -416,26 +416,24 @@ pub(super) fn fill_requester_scopes(
             reachable_pipelines(reads, pipeline_id_index, targets)
         })
         .collect();
-    for (idx, (((pipeline, scope), rule_reads), through)) in pipelines
+    let scopes = requester_scopes(reads, pipeline_id_index, &answered_through);
+    for (((pipeline, scope), rule_reads), through) in pipelines
         .iter_mut()
-        .zip(requester_scopes(
-            reads,
-            pipeline_id_index,
-            &answered_through,
-        ))
+        .zip(scopes)
         .zip(reads)
-        .zip(answered_through.clone())
-        .enumerate()
+        .zip(answered_through)
     {
         pipeline.requester = scope;
-        pipeline.answered_through = through;
         pipeline.rule_requester = rule_reads.request_matchers.clone();
-        // 跳转过去的 pipeline 的应答也缓存在这个 pipeline 的键下 / Answers of the pipelines it jumps to are
-        // cached under this pipeline's keys as well
-        pipeline.geo_data = reachable_pipelines(reads, pipeline_id_index, [idx])
-            .into_iter()
-            .fold(GeoData::default(), |geo, reached| {
-                geo.with(reads[reached].geo)
-            });
+        // 这个 pipeline 的键下缓存的是它自己的规则给的，和回答检查跳过去拿到的；请求阶段跳过去的应答缓存在目标的键下
+        // （见 `engine::execution::Route::enter`），不随目标读的数据换命名空间
+        // Cached under this pipeline's keys are what its own rules give and what its answer
+        // checks' jumps get; the answers a request-phase jump gets are cached under the
+        // target's keys (see `engine::execution::Route::enter`), so the data the target reads
+        // does not move this namespace
+        pipeline.geo_data = through
+            .iter()
+            .fold(rule_reads.geo, |geo, &reached| geo.with(reads[reached].geo));
+        pipeline.answered_through = through;
     }
 }
